@@ -28,7 +28,7 @@ use uc_net::sender::{Sender, SenderConfig};
 /// which is entirely the consensus agent's job now, M4 carry #5). A dropped
 /// receiver just makes `try_send` fail `Disconnected`, which the receiver
 /// treats identically to a full channel (counted, never a hang or panic).
-fn unrouted_consensus() -> mpsc::SyncSender<NetEvent> {
+pub fn unrouted_consensus() -> mpsc::SyncSender<NetEvent> {
     let (tx, _rx) = mpsc::sync_channel(64);
     tx
 }

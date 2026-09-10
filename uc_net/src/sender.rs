@@ -28,11 +28,11 @@ use uc_protocol::v2::crypto::CRYPTO_OVERHEAD;
 #[cfg(test)]
 use uc_protocol::v2::datagram::read_snap_begin_body;
 use uc_protocol::v2::datagram::{
-    DATAGRAM_HEADER_LEN, DGRAM_KIND_DATA, DGRAM_KIND_HEARTBEAT, DGRAM_KIND_SNAP_BEGIN,
-    DGRAM_KIND_SNAP_CHUNK, DGRAM_KIND_SNAP_REDIRECT, DatagramHeader, MTU_DEFAULT,
-    SNAP_BEGIN_FIXED_LEN, SNAP_BEGIN_LAYOUT_V4, SNAP_REDIRECT_BODY_LEN, SnapBeginBody,
-    SnapRedirectBody, SnapRequestBody, write_datagram_header, write_snap_begin_body,
-    write_snap_redirect_body,
+    DATAGRAM_HEADER_LEN, DGRAM_KIND_DATA, DGRAM_KIND_HEARTBEAT, DGRAM_KIND_PROBE,
+    DGRAM_KIND_SNAP_BEGIN, DGRAM_KIND_SNAP_CHUNK, DGRAM_KIND_SNAP_REDIRECT, DatagramHeader,
+    MTU_DEFAULT, PROBE_RUNG_LEN, SNAP_BEGIN_FIXED_LEN, SNAP_BEGIN_LAYOUT_V4,
+    SNAP_REDIRECT_BODY_LEN, SnapBeginBody, SnapRedirectBody, SnapRequestBody,
+    write_datagram_header, write_probe_rung, write_snap_begin_body, write_snap_redirect_body,
 };
 use uc_protocol::v2::frame::{
     FRAME_ALIGNMENT, FRAME_TYPE_PADDING, HEADER_LEN, align_frame_len, read_header,
@@ -41,6 +41,7 @@ use uc_protocol::v2::frame::{
 use crate::TermHandle;
 use crate::fault::FaultSocket;
 use crate::flow::FlowControl;
+use crate::probe::ProbeTable;
 use crate::receiver::PeerIds;
 
 /// Datagrams a single served NAK may replay from the journal before yielding
@@ -456,6 +457,11 @@ pub struct SenderStats {
     /// mirrored into the cnc band by `refresh_peer_obs`, since a PERSISTENT
     /// failure (crypto on, no key/session ever) is silent from outside.
     pub seal_failures: AtomicU64,
+    /// Jumbo spec §5.1: `PROBE` datagrams put on the wire (one per rung per
+    /// due peer per pass). A probe that could not be sealed is NOT counted
+    /// here — it lands in the probe table's `unsent` instead, so this counter
+    /// is strictly "how much discovery traffic this node emitted".
+    pub probes_sent: AtomicU64,
 }
 
 pub struct Sender {
@@ -579,6 +585,9 @@ pub struct Sender {
     /// then — `assemble_snap` returns before it looks).
     peer_ids_src: Option<PeerIds>,
     peer_ids_gen: u64,
+    /// Jumbo spec §5.1: the discovery ledger shared with the receiver and
+    /// the node. `None` = this sender does not probe (harness senders).
+    probe: Option<Arc<ProbeTable>>,
 }
 
 /// M8 (Task 17): everything the SEND path needs to run with crypto on, taken
@@ -747,6 +756,7 @@ impl Sender {
                 .unwrap_or_default(),
             peer_ids_gen: peer_ids_src.as_ref().map(PeerIds::generation).unwrap_or(0),
             peer_ids_src,
+            probe: None,
         }
     }
 
@@ -803,8 +813,75 @@ impl Sender {
         self.replay = Some(journal);
     }
 
+    /// Jumbo spec §5.1: probe the peers in `table` on its cadence. The table's
+    /// peer set is the node's to maintain (`ProbeTable::set_peers`).
+    pub fn set_probe_table(&mut self, table: Arc<ProbeTable>) {
+        self.probe = Some(table);
+    }
+
     fn now_ns(&self) -> u64 {
         self.base.elapsed().as_nanos() as u64
+    }
+
+    /// One pass of the ladder: every peer the table says is due gets one
+    /// PROBE per rung still above its verified size. Pairwise-sealed like a
+    /// snapshot chunk; a probe that cannot be sealed yet (no session) is
+    /// counted in the table's `unsent`, never in `seal_failures`.
+    fn send_due_probes(&mut self) -> bool {
+        let Some(table) = self.probe.clone() else {
+            return false;
+        };
+        let now = self.now_ns();
+        let due = table.due(now);
+        if due.is_empty() {
+            return false;
+        }
+        let overhead = DATAGRAM_HEADER_LEN + self.cfg.crypto_overhead();
+        for (peer, rungs) in due {
+            for rung in rungs {
+                let body_len = rung as usize - overhead;
+                debug_assert!(body_len >= PROBE_RUNG_LEN);
+                let mut body = vec![0u8; body_len];
+                write_probe_rung(&mut body, rung);
+                if self.assemble_probe(peer, &body) {
+                    let _ = self.sock.send_to(&self.scratch, peer);
+                    self.stats.probes_sent.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    table.note_unsent();
+                }
+            }
+        }
+        true
+    }
+
+    /// `assemble_snap` for a PROBE, except that a seal failure is the
+    /// table's `unsent`, not `seal_failures` (a probe before the handshake
+    /// completes is expected, not a defect an alert should see).
+    fn assemble_probe(&mut self, peer: SocketAddr, body: &[u8]) -> bool {
+        self.scratch.clear();
+        self.scratch.resize(DATAGRAM_HEADER_LEN, 0);
+        write_datagram_header(
+            &mut self.scratch,
+            &DatagramHeader {
+                position: 0,
+                leadership_term_id: self.term.load(Ordering::Relaxed),
+                kind: DGRAM_KIND_PROBE,
+                flags: 0,
+                key_epoch: 0,
+            },
+        );
+        self.scratch.extend_from_slice(body);
+        if self.crypto.is_none() {
+            return true;
+        }
+        let Some(&peer_id) = self.peer_ids.get(&peer) else {
+            return false;
+        };
+        let crypto = self.crypto.as_mut().expect("checked Some just above");
+        let now_ns = crypto.now_ns();
+        crypto
+            .seal(DGRAM_KIND_PROBE, Some(peer_id), &mut self.scratch, now_ns)
+            .is_ok()
     }
 
     /// One duty cycle: drain control, serve one NAK, stream up to
@@ -948,6 +1025,13 @@ impl Sender {
                     self.refresh_peer_obs();
                 }
             }
+            did = true;
+        }
+
+        // Jumbo spec §5.1: probes go out whatever this node's role — a
+        // follower's path matters as much as the leader's — so this runs
+        // BEFORE the leader-role gate below.
+        if self.send_due_probes() {
             did = true;
         }
 

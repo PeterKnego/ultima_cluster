@@ -34,24 +34,27 @@ use uc_protocol::v2::datagram::{
     APPEND_POSITION_BODY_LEN, AppendPositionBody, ConfigProposalBody, ConfigReplyBody,
     DATAGRAM_HEADER_LEN, DGRAM_KIND_APPEND_POSITION, DGRAM_KIND_COMMIT_POSITION,
     DGRAM_KIND_CONFIG_PROPOSAL, DGRAM_KIND_CONFIG_REPLY, DGRAM_KIND_DATA, DGRAM_KIND_HEARTBEAT,
-    DGRAM_KIND_NAK, DGRAM_KIND_READ_PROBE, DGRAM_KIND_READ_PROBE_ACK, DGRAM_KIND_REQUEST_VOTE,
-    DGRAM_KIND_SNAP_BEGIN, DGRAM_KIND_SNAP_CHUNK, DGRAM_KIND_SNAP_DONE, DGRAM_KIND_SNAP_NAK,
-    DGRAM_KIND_SNAP_REDIRECT, DGRAM_KIND_SNAP_REQUEST, DGRAM_KIND_STATUS, DGRAM_KIND_TERM_MAP,
-    DGRAM_KIND_VOTE, DatagramHeader, MAX_TERM_MAP_WIRE_ENTRIES, NAK_BODY_LEN, NakBody,
-    REQUEST_VOTE_BODY_LEN, RequestVoteBody, SNAP_BEGIN_FIXED_LEN, SNAP_BEGIN_LAYOUT_V4,
-    SNAP_NAK_BODY_LEN, SNAP_REQUEST_BODY_LEN, STATUS_BODY_LEN, SnapBeginBody, SnapNakBody,
-    SnapRequestBody, StatusBody, TermMapEntryWire, VOTE_BODY_LEN, VoteBody,
+    DGRAM_KIND_NAK, DGRAM_KIND_PROBE, DGRAM_KIND_PROBE_ACK, DGRAM_KIND_READ_PROBE,
+    DGRAM_KIND_READ_PROBE_ACK, DGRAM_KIND_REQUEST_VOTE, DGRAM_KIND_SNAP_BEGIN,
+    DGRAM_KIND_SNAP_CHUNK, DGRAM_KIND_SNAP_DONE, DGRAM_KIND_SNAP_NAK, DGRAM_KIND_SNAP_REDIRECT,
+    DGRAM_KIND_SNAP_REQUEST, DGRAM_KIND_STATUS, DGRAM_KIND_TERM_MAP, DGRAM_KIND_VOTE,
+    DatagramHeader, MAX_TERM_MAP_WIRE_ENTRIES, NAK_BODY_LEN, NakBody, PROBE_ACK_BODY_LEN,
+    ProbeAckBody, REQUEST_VOTE_BODY_LEN, RequestVoteBody, SNAP_BEGIN_FIXED_LEN,
+    SNAP_BEGIN_LAYOUT_V4, SNAP_NAK_BODY_LEN, SNAP_REQUEST_BODY_LEN, STATUS_BODY_LEN, SnapBeginBody,
+    SnapNakBody, SnapRequestBody, StatusBody, TermMapEntryWire, VOTE_BODY_LEN, VoteBody,
     read_append_position_body, read_config_proposal_body, read_config_reply_body,
-    read_datagram_header, read_nak_body, read_read_probe_body, read_request_vote_body,
-    read_snap_begin_body, read_snap_nak_body, read_snap_redirect_body, read_snap_request_body,
-    read_status_body, read_term_map_body, read_vote_body, write_append_position_body,
-    write_datagram_header, write_nak_body, write_snap_begin_body, write_snap_nak_body,
-    write_snap_request_body, write_status_body,
+    read_datagram_header, read_nak_body, read_probe_ack_body, read_probe_rung,
+    read_read_probe_body, read_request_vote_body, read_snap_begin_body, read_snap_nak_body,
+    read_snap_redirect_body, read_snap_request_body, read_status_body, read_term_map_body,
+    read_vote_body, write_append_position_body, write_datagram_header, write_nak_body,
+    write_probe_ack_body, write_snap_begin_body, write_snap_nak_body, write_snap_request_body,
+    write_status_body,
 };
 use uc_protocol::v2::frame::{self, FRAME_TYPE_PADDING, HEADER_LEN, align_frame_len};
 
 use crate::TermHandle;
 use crate::fault::FaultSocket;
+use crate::probe::ProbeTable;
 use crate::rebuild::{NakConfig, NakTimer, Rebuilt};
 use crate::sender::{CLUSTER_ARTIFACT_ID, CtrlMsg};
 
@@ -717,6 +720,19 @@ pub struct FollowerStats {
     /// the operator's verb is re-runnable — but it is why an accepted
     /// `uc2ctl snapshot fetch` can quietly do nothing.
     pub snap_fetch_busy: AtomicU64,
+    /// Jumbo spec §4.2: `PROBE`s this node credited and answered with a
+    /// `PROBE_ACK` — the proof a path of that size reaches THIS node.
+    pub probes_answered: AtomicU64,
+    /// Jumbo spec §4.2: `PROBE_ACK`s recorded in the probe table. The
+    /// sender's `probes_sent` less this (over a settled cluster) is how much
+    /// of the ladder the path refuses to carry, which is the normal outcome
+    /// for every rung above a peer's real MTU.
+    pub probe_acks: AtomicU64,
+    /// Jumbo spec §4.2: `PROBE`s whose wire length did not equal the rung
+    /// they claim — truncated, reassembled from fragments, or simply lying.
+    /// Never credited: only a datagram that arrived WHOLE at its claimed size
+    /// proves the path carries that size.
+    pub probes_wrong_length: AtomicU64,
 }
 
 /// What `set_snapshot_intake` wires in for a COMPLETED inbound session
@@ -1116,6 +1132,13 @@ pub struct FollowerReceiver {
     /// grown into an unbounded-memory vector by a flood of forged source
     /// addresses.
     cleartext_peer_log: HashMap<SocketAddr, u64>,
+    /// Jumbo spec §5.1: the discovery ledger (acks land here; probes are
+    /// answered with `own_min_rung` from here). `None` = harness receiver.
+    probe: Option<Arc<ProbeTable>>,
+    /// The WIRE length of the datagram `on_datagram` is currently handling —
+    /// the sealed length, before `crypto_admit` opened it. A PROBE is credited
+    /// only if this equals the rung it claims (spec §4.2).
+    last_wire_len: usize,
 }
 
 /// M14c: the id a session announces next — the lowest id in `declared`
@@ -1315,6 +1338,8 @@ impl FollowerReceiver {
             peer_ids_src,
             hs_route,
             cleartext_peer_log: HashMap::new(),
+            probe: None,
+            last_wire_len: 0,
         }
     }
 
@@ -1637,6 +1662,11 @@ impl FollowerReceiver {
                 _ => None,
             };
             if let Some((n, from)) = got {
+                // Jumbo spec §4.2: the SEALED wire length, captured before
+                // `crypto_admit` can shorten it — a `PROBE` is credited only
+                // when what arrived is exactly the rung it claims, and that is
+                // a fact about the datagram as the path delivered it.
+                self.last_wire_len = n;
                 // M8 (Task 11): decrypt (or diagnose/drop) BEFORE on_datagram
                 // ever sees the bytes — see `crypto_admit`'s doc. `Some(len)`
                 // = admitted, plaintext, `buf[..len]` is what `on_datagram`
@@ -1860,6 +1890,63 @@ impl FollowerReceiver {
         true
     }
 
+    /// Jumbo spec §5.1: record acks (and answer probes) into `table` — the
+    /// same ledger the sender agent probes from. Without this call the two
+    /// probe kinds are silently ignored, which is what every unit test and
+    /// the wire-level harnesses get.
+    pub fn set_probe_table(&mut self, table: Arc<ProbeTable>) {
+        self.probe = Some(table);
+    }
+
+    /// Jumbo spec §4.2: the two discovery kinds. A `PROBE` that arrived WHOLE
+    /// at the size it claims is answered with this node's own minimum (so one
+    /// exchange carries both directions of the pair's view); a `PROBE_ACK`
+    /// raises the sender's ledger entry for that peer.
+    fn on_probe(&mut self, kind: u8, body: &[u8], from: SocketAddr) {
+        let Some(table) = self.probe.clone() else {
+            return; // no ledger: a harness receiver ignores probes
+        };
+        if kind == DGRAM_KIND_PROBE {
+            let Some(rung) = read_probe_rung(body) else {
+                self.stats.dropped_malformed.fetch_add(1, Ordering::Relaxed);
+                return;
+            };
+            if self.last_wire_len != rung as usize {
+                // Truncated, reassembled, or lying: not a proof of the path.
+                self.stats
+                    .probes_wrong_length
+                    .fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            let ack = ProbeAckBody {
+                rung,
+                own_min_rung: table.own_min_rung(),
+            };
+            let mut d = vec![0u8; DATAGRAM_HEADER_LEN + PROBE_ACK_BODY_LEN];
+            write_datagram_header(
+                &mut d,
+                &DatagramHeader {
+                    position: 0,
+                    leadership_term_id: self.term.load(Ordering::Relaxed),
+                    kind: DGRAM_KIND_PROBE_ACK,
+                    flags: 0,
+                    key_epoch: 0,
+                },
+            );
+            write_probe_ack_body(&mut d[DATAGRAM_HEADER_LEN..], &ack);
+            if self.seal_and_send(from, DGRAM_KIND_PROBE_ACK, &mut d) {
+                self.stats.probes_answered.fetch_add(1, Ordering::Relaxed);
+            }
+        } else {
+            let Some(ack) = read_probe_ack_body(body) else {
+                self.stats.dropped_malformed.fetch_add(1, Ordering::Relaxed);
+                return;
+            };
+            table.on_ack(from, ack.rung, ack.own_min_rung);
+            self.stats.probe_acks.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     fn on_datagram(&mut self, d: &[u8], from: SocketAddr) {
         use Ordering::Relaxed;
         if d.len() < DATAGRAM_HEADER_LEN {
@@ -1872,6 +1959,13 @@ impl FollowerReceiver {
             self.stats.dropped_malformed.fetch_add(1, Relaxed);
             return;
         };
+        // Jumbo spec §4.2: probes are term-independent (a path is a path
+        // whoever leads) and never touch the data plane, so they are handled
+        // before the term filter below.
+        if matches!(h.kind, DGRAM_KIND_PROBE | DGRAM_KIND_PROBE_ACK) {
+            self.on_probe(h.kind, &d[DATAGRAM_HEADER_LEN..], from);
+            return;
+        }
         // Consensus kinds (5–11) are forwarded RAW to the consensus agent — no
         // data-plane term filter, since a higher-term RequestVote MUST reach
         // the SM. `DGRAM_KIND_COMMIT_POSITION` routes as `CommitGossip`; the

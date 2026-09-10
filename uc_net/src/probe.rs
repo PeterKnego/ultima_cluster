@@ -79,14 +79,46 @@ impl ProbeTable {
     /// The peers whose next probe is due at `now_ns`, each with the rungs
     /// still above its `verified`. Bumps `attempts` and schedules the next
     /// due time, so a caller that sends what it is handed needs nothing else.
+    ///
+    /// A peer is DONE — and drops out of every later pass — only once BOTH
+    /// halves of the pair have nothing left to tell each other: our probes
+    /// reached its top rung, and the minimum it advertises back is no lower
+    /// than what we verified. Both halves are needed, because `advertised` is
+    /// only ever refreshed by an ack and an ack only ever comes back for a
+    /// probe WE send. Stopping on `verified` alone latches whatever the peer
+    /// happened to know at that instant, forever:
+    ///
+    /// * A peer that answered our first pass necessarily answered it before it
+    ///   had verified anything itself, so its `own_min_rung` on that ack is 0.
+    /// * A peer answering mid-ladder advertises a rung it has since climbed
+    ///   past — a STALE-LOW value, and the one the loopback test caught under
+    ///   load (`uc_net/tests/probe.rs`).
+    ///
+    /// Either way `table_min` (spec §5.3, the leader's commit rule) takes
+    /// `min(verified, advertised)` and refuses a zero, so a latched
+    /// advertisement means the cluster never raises its MTU at all. When the
+    /// ladder has no rung left ABOVE `verified`, the pass re-sends the verified
+    /// rung instead: one datagram per slow tick, purely to draw a fresh ack.
+    ///
+    /// A GENUINELY asymmetric peer — one whose own minimum is legitimately
+    /// below our path to it, because it has a narrow peer of its own — is
+    /// therefore probed for as long as that stays true, at `slow_ns`. That is
+    /// the intended cost, and it is also what re-discovers a path that later
+    /// improves.
     pub fn due(&self, now_ns: u64) -> Vec<(SocketAddr, Vec<u32>)> {
         let mut out = Vec::new();
         let mut g = self.peers.lock().unwrap();
         for (&addr, p) in g.iter_mut() {
-            if p.verified as usize >= MTU_BOUND || now_ns < p.next_due_ns {
+            let resolved = p.verified as usize >= MTU_BOUND && p.advertised >= p.verified;
+            if resolved || now_ns < p.next_due_ns {
                 continue;
             }
-            let rungs: Vec<u32> = RUNGS.iter().copied().filter(|&r| r > p.verified).collect();
+            let mut rungs: Vec<u32> = RUNGS.iter().copied().filter(|&r| r > p.verified).collect();
+            if rungs.is_empty() {
+                // Top rung verified, the peer's own view still behind it: ask
+                // again at the size we know the path carries.
+                rungs.push(p.verified);
+            }
             p.attempts += 1;
             let step = if p.attempts < self.cadence.fast_attempts {
                 self.cadence.fast_ns
@@ -185,7 +217,10 @@ mod tests {
         t.on_ack(a(1), 8832, 0);
         assert_eq!(t.get(a(1)).unwrap().verified, 8832);
         assert_eq!(t.due(10), vec![(a(1), vec![8960])]);
-        t.on_ack(a(1), 8960, 8832);
+        // Fully resolved: top rung verified AND the peer's own minimum is no
+        // lower (Task 4 sharpened the rule — see `due`; the value here was
+        // 8832, an advertisement the pair would still be reconciling).
+        t.on_ack(a(1), 8960, 8960);
         assert!(t.due(1_000).is_empty(), "resolved: probing stops");
         // A lower late ack never lowers; a non-rung is ignored.
         t.on_ack(a(1), 1408, 8832);
@@ -194,6 +229,33 @@ mod tests {
         // An ack from a stranger is ignored.
         t.on_ack(a(9), 8960, 8960);
         assert!(t.get(a(9)).is_none());
+    }
+
+    /// Task 4 (found by `uc_net/tests/probe.rs`): a peer whose top rung is
+    /// verified but whose advertisement is still BEHIND it must keep being
+    /// probed. Both latches are real — a fresh cluster's first exchange
+    /// necessarily carries `own_min_rung() == 0`, and a mid-ladder answer
+    /// carries a rung the peer has since climbed past — and either one leaves
+    /// `table_min` (spec §5.3) permanently low or `None`.
+    #[test]
+    fn a_peer_whose_advertisement_is_behind_is_still_probed_at_its_verified_rung() {
+        let t = ProbeTable::new(fast());
+        t.set_peers(&[a(1)]);
+        t.due(0);
+        t.on_ack(a(1), MTU_BOUND as u32, 0); // the peer had verified nothing yet
+        assert_eq!(
+            t.due(1_000),
+            vec![(a(1), vec![MTU_BOUND as u32])],
+            "top rung verified, advertisement unknown: re-ask at the verified size"
+        );
+        t.on_ack(a(1), MTU_BOUND as u32, 8832); // mid-ladder: stale-low
+        assert_eq!(
+            t.due(2_000),
+            vec![(a(1), vec![MTU_BOUND as u32])],
+            "advertisement still below what we verified: keep asking"
+        );
+        t.on_ack(a(1), MTU_BOUND as u32, MTU_BOUND as u32);
+        assert!(t.due(3_000).is_empty(), "resolved: probing stops");
     }
 
     #[test]
