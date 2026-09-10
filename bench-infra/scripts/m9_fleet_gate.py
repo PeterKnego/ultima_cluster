@@ -97,7 +97,8 @@ def render_config(node_id, bind, instance_dir, members):
         f'instance_dir = "{instance_dir}"',
         f'app_id = "{APP}"',
         "buffer_bytes = 4194304",
-        "max_payload = 256",
+        # Jumbo (2.12.0): `max_payload` is refused by name — the payload
+        # ceiling is discovered from the path MTU and committed cluster-wide.
         "journal_segment_bytes = 16384",
         "",
         "[purge]",
@@ -259,7 +260,7 @@ REFUSALS = [
     # (name, extra/replacement body, substring the refusal MUST contain)
     ("unknown-key",       "buffer_bytez = 4096",                 "buffer_bytez"),
     ("buffer-not-pow2",   "buffer_bytes = 4097",                 "buffer_bytes"),
-    ("payload-over-mtu",  "max_payload = 65536",                 "max_payload"),
+    ("max-payload-retired", "max_payload = 65536",               "max_payload"),
     ("election-window",   "election_timeout_min_ns = 400000000", "election_timeout"),
 ]
 

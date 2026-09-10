@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 // `Instant` is now used only by test-side deadlines (`mod tests`, below) —
@@ -31,6 +31,7 @@ use uc_log::state::{
 };
 use uc_net::TermHandle;
 use uc_net::fault::{FaultConfig, FaultSocket, PartitionHandle};
+use uc_net::probe::{ProbeCadence, ProbeTable};
 use uc_net::receiver::{
     CryptoIntake, FollowerConfig, FollowerReceiver, HandshakeDatagram, IntakeMode, NetEvent,
     PeerIds, RefusalKind, SnapFetch,
@@ -74,10 +75,11 @@ use uc_protocol::v2::datagram::{
     DATAGRAM_HEADER_LEN, DGRAM_KIND_COMMIT_POSITION, DGRAM_KIND_CONFIG_PROPOSAL,
     DGRAM_KIND_CONFIG_REPLY, DGRAM_KIND_READ_PROBE, DGRAM_KIND_READ_PROBE_ACK,
     DGRAM_KIND_REQUEST_VOTE, DGRAM_KIND_TERM_MAP, DGRAM_KIND_VOTE, DatagramHeader,
-    MAX_TERM_MAP_WIRE_ENTRIES, READ_PROBE_BODY_LEN, REQUEST_VOTE_BODY_LEN, ReadProbeBody,
-    RequestVoteBody, TERM_MAP_ENTRY_LEN, TERM_MAP_HEADER_LEN, TermMapEntryWire, VOTE_BODY_LEN,
-    VoteBody, write_config_proposal_body, write_config_reply_body, write_datagram_header,
-    write_read_probe_body, write_request_vote_body, write_term_map_body, write_vote_body,
+    MAX_TERM_MAP_WIRE_ENTRIES, MTU_DEFAULT, READ_PROBE_BODY_LEN, REQUEST_VOTE_BODY_LEN,
+    ReadProbeBody, RequestVoteBody, TERM_MAP_ENTRY_LEN, TERM_MAP_HEADER_LEN, TermMapEntryWire,
+    VOTE_BODY_LEN, VoteBody, is_rung, payload_ceiling, write_config_proposal_body,
+    write_config_reply_body, write_datagram_header, write_read_probe_body, write_request_vote_body,
+    write_term_map_body, write_vote_body,
 };
 use uc_protocol::v2::schedule::{
     MAX_SCHEDULE_ENTRIES, SCHEDULE_ENTRY_LEN, SCHEDULE_HEADER_LEN, ScheduleRule,
@@ -485,22 +487,22 @@ pub const REASON_SNAPSHOT_NO_LEARNER: u32 = 49;
 /// node's log has caught up to it.
 pub const REASON_SNAPSHOT_ABOVE_DURABLE: u32 = 50;
 
-/// The encoded table does not fit THIS node's `max_payload`, so the leader
-/// could not append it. Distinct from [`REASON_SCHEDULE_DECODE`] on purpose:
-/// until 2026-09-08 this case was reported as 42, telling the operator "the
-/// staged file is not a decodable schedule table" about a file that decodes
-/// perfectly — sending them to inspect their TOML when the actual fix is one
-/// node-local config value. Found by the time-and-timers fleet gate, whose
-/// row e applies a full `MAX_SCHEDULE_ENTRIES` table and was refused on every
-/// arm against the then-default `max_payload` of 512.
+/// The encoded table does not fit this node's LIVE payload ceiling, so the
+/// leader could not append it. Distinct from [`REASON_SCHEDULE_DECODE`] on
+/// purpose: until 2026-09-08 this case was reported as 42, telling the
+/// operator "the staged file is not a decodable schedule table" about a file
+/// that decodes perfectly — sending them to inspect their TOML when the
+/// actual fix was one node-local config value. Found by the
+/// time-and-timers fleet gate, whose row e applies a full
+/// `MAX_SCHEDULE_ENTRIES` table and was refused on every arm against the
+/// then-default `max_payload` of 512.
 ///
-/// `preflight` now refuses such a `max_payload` at STARTUP
-/// (`PayloadTooSmallForScheduleTable`), so on a node that booted this reason
-/// is reachable only where the two can still disagree: a node started before
-/// that check existed, or one whose config was hand-edited below the floor.
-/// It is kept rather than assumed unreachable — the comment this replaces
-/// claimed exactly that, reasoning about the fixed 1344 B TRANSPORT ceiling
-/// while the code tested `max_payload`, a node-local RUNTIME knob.
+/// Since jumbo (2.12.0) there is no node-local knob to get wrong: the ceiling
+/// is `payload_ceiling(committed rung, crypto)` and even the BASELINE rung's
+/// 1312 B (crypto on) carries a full `MAX_SCHEDULE_ENTRIES` table. The reason
+/// is kept because it is the honest report for the one window that remains —
+/// a leader whose live door has not yet been raised, or a future table cap
+/// larger than the baseline carries.
 pub const REASON_SCHEDULE_TOO_LARGE: u32 = 51;
 
 /// Why [`Consensus::command_snapshot`] refused to append a `SNAPSHOT` frame.
@@ -922,6 +924,9 @@ pub struct Node {
     /// `uc2-cluster` agent publishes into. Exposed via
     /// [`Node::cluster_view`].
     cluster_view: Arc<ClusterView>,
+    /// Jumbo spec §5.1: the same discovery ledger the three agents share,
+    /// kept here so in-process tests can inspect what each path resolved to.
+    probe_table: Arc<ProbeTable>,
     // Held for the node's life: the instance flock and the IPC ring mmaps.
     _instance: InstanceDir,
     _rings: Rings,
@@ -1122,6 +1127,26 @@ impl Node {
             Arc::clone(&cnc),
             cfg.max_payload,
         )?);
+
+        // Jumbo spec §5.1: ONE discovery ledger for the three agents that
+        // take part — the sender (sends the due probes), the receiver
+        // (answers a peer's and records our acks) and the consensus agent
+        // (the leader's commit rule, §5.3).
+        let probe_table = ProbeTable::new(ProbeCadence::default());
+        // Spec §7.1: the committed rung, republished here by the consensus
+        // agent so the sender's packing budget follows it without reading the
+        // view.
+        let live_mtu = Arc::new(AtomicUsize::new(MTU_DEFAULT));
+        // The door starts at the BASELINE rung's ceiling whatever the bound
+        // (spec §7.1) — every cluster starts at 1408 and only a committed
+        // `datagram_mtu` raises it. Set BEFORE any agent runs and before a
+        // service or client can read the page, so nobody ever observes the
+        // word at zero or the appender at the bound.
+        buffer.set_payload_ceiling(
+            cfg.max_payload
+                .min(payload_ceiling(MTU_DEFAULT, crypto.is_some())),
+        );
+        cnc.store_payload_ceiling(buffer.payload_ceiling() as u64);
 
         // 5. Durable output-progress marker (Task 12) → mirror onto the page for
         // attaching parties. `state.output_progress()` is whatever the output
@@ -1378,11 +1403,21 @@ impl Node {
             }),
         );
         sender.set_replay_source(journal);
+        // Jumbo spec §5.1: seed the ledger's peer set BEFORE either agent is
+        // given the table. `own_min_rung()` answers `MTU_BOUND` for an EMPTY
+        // peer map (a solo cluster's path is loopback), and a PROBE_ACK the
+        // receiver sent in that window would advertise the top rung to a peer
+        // whose leader can commit it — irreversibly, since `datagram_mtu` is
+        // monotone in the cluster FSM. The list is the same voters + learners
+        // minus self that `set_members` takes below.
+        probe_table.set_peers(&sender_members);
         // Ruling P14: who may ask this node for a snapshot set. Seeded at
         // boot rather than only from `CtrlMsg::SetPeers`, which arrives on
         // config ADOPTION — a learner that never sees a reconfiguration would
         // otherwise refuse every fetch it exists to serve.
         sender.set_members(sender_members);
+        sender.set_probe_table(Arc::clone(&probe_table));
+        sender.set_live_mtu(Arc::clone(&live_mtu));
         // M6 Task 6 / M14c: snapshot session wiring. `snap_root` holds one
         // `snapshots/<id>/` per declared FSM (created in `create_rings`);
         // `incoming_snapshot` is the node-internal signal the receiver raises on
@@ -1552,6 +1587,10 @@ impl Node {
             net_tx,
             receiver_crypto,
         );
+        // Jumbo spec §5.1: the same ledger — the receiver answers a peer's
+        // PROBE and records the acks our own probes draw back. Its peer set
+        // was seeded above, before the sender got the table.
+        receiver.set_probe_table(Arc::clone(&probe_table));
         // Cloned: the consensus agent keeps its own producer half to drive
         // `CtrlMsg::SetPeers` (M7 config adoption, `Consensus::exec`).
         receiver.set_sender_route(ctrl_tx.clone());
@@ -1885,6 +1924,10 @@ impl Node {
             state,
             cnc: Arc::clone(&cnc),
             buffer: Arc::clone(&buffer),
+            probe_table: Arc::clone(&probe_table),
+            live_mtu: Arc::clone(&live_mtu),
+            crypto_on: crypto.is_some(),
+            next_mtu_check_ns: 0,
             appender: None,
             next_corr: 0,
             pending_ingress: None,
@@ -2088,6 +2131,7 @@ impl Node {
             purge_enabled: !matches!(cfg.purge, PurgePolicy::Disabled),
             journal_segment_bytes: cfg.journal_segment_bytes,
             cluster_view,
+            probe_table,
             _instance: instance,
             _rings: rings,
             // Stop order: consensus first (stops writing the term handle), then
@@ -2143,6 +2187,31 @@ impl Node {
     /// `uc2-cluster` agent independently of the lag policy.
     pub fn cluster_view(&self) -> &ClusterView {
         &self.cluster_view
+    }
+
+    /// Jumbo spec §7.1: the committed datagram rung this node applies.
+    /// [`MTU_DEFAULT`] (1408, the baseline every cluster starts from) both for
+    /// the unset sentinel `0` and for any value that is not a ladder rung — a
+    /// snapshot artifact installs cluster state by fiat, so the clamp lives at
+    /// the point of use, not only at `validate`.
+    pub fn datagram_mtu(&self) -> u32 {
+        match self.cluster_view().datagram_mtu.load(Ordering::Acquire) {
+            0 => MTU_DEFAULT as u32,
+            r if !is_rung(r) => MTU_DEFAULT as u32,
+            r => r,
+        }
+    }
+
+    /// Jumbo spec §7.1: the LIVE command payload ceiling — what a client may
+    /// submit right now — as published on the cnc page (offset 3984).
+    pub fn payload_ceiling(&self) -> usize {
+        self.cnc.payload_ceiling() as usize
+    }
+
+    /// Jumbo spec §5.1: the path-MTU discovery ledger this node's sender,
+    /// receiver and consensus agents share.
+    pub fn probe_table(&self) -> Arc<ProbeTable> {
+        Arc::clone(&self.probe_table)
     }
 
     /// M8 (Task 12): the newest node-to-node group-key epoch this node has
@@ -2803,6 +2872,22 @@ struct Consensus {
     /// cluster state.
     buffer_bytes: u64,
     max_payload: usize,
+    /// Jumbo spec §5.1/§5.3: the shared discovery ledger. Read by the
+    /// leader's commit rule (`maybe_commit_datagram_mtu`) and re-seeded on
+    /// every adopted membership (`rebuild_net_for_config`).
+    probe_table: Arc<ProbeTable>,
+    /// Jumbo spec §7.1: the cell the sender agent reads its packing budget
+    /// from. Written by `refresh_from_view` when the committed rung moves.
+    live_mtu: Arc<AtomicUsize>,
+    /// Jumbo spec §7.1: whether this node's node-to-node datagrams are
+    /// sealed, so the ceiling derivation can subtract the tag. Node-local and
+    /// fixed at boot (`[crypto]` is a per-host explicit choice, all-or-nothing
+    /// per cluster).
+    crypto_on: bool,
+    /// Jumbo spec §5.3: the monotonic instant the leader may next evaluate
+    /// the commit rule. `0` = never evaluated. Compared against
+    /// `pass_mono_ns`, so an idle pass costs one `u64` compare.
+    next_mtu_check_ns: u64,
     /// M14a (spec §5.2): the FSM term — `Some(fsm_lag)` when at least one
     /// service is declared, `None` (inert) for a `none_for_tests` node.
     /// Computed once at boot (`crate::services::fsm_lag_eff`) from the
@@ -3530,6 +3615,13 @@ impl Consensus {
         // deadline exactly as a client frame would.
         if serving && !hold_clients {
             did |= self.maybe_issue_cadence_snapshot();
+        }
+        // 3a''. Jumbo spec §5.3: the leader's datagram-MTU commit rule. Under
+        // the same gate as the cadence snapshot and for the same reason — it
+        // appends a leader-issued CLUSTER frame, which must not land between
+        // two due timers.
+        if serving && !hold_clients {
+            did |= self.maybe_commit_datagram_mtu();
         }
         if serving && !hold_clients {
             did |= self.drain_ingress();
@@ -4467,6 +4559,10 @@ impl Consensus {
             .filter(|(id, _)| *id != self.id)
             .map(|(_, a)| addr_of(*a))
             .collect();
+        // Jumbo spec §5.1: the ledger follows membership — a new peer starts
+        // unresolved and due now, a removed one is forgotten (and stops
+        // holding `table_min` open).
+        self.probe_table.set_peers(&members);
         let _ = self.sender_ctrl.send(CtrlMsg::SetPeers {
             followers,
             learners,
@@ -5517,6 +5613,62 @@ impl Consensus {
         }
     }
 
+    /// Jumbo spec §5.3: while leading, once EVERY member (voters and
+    /// learners, minus self) has answered, commit `min over the table` when it
+    /// exceeds the committed rung. Evaluated at most every 100 ms — on any
+    /// other pass this is one `u64` compare and nothing else, which is the
+    /// whole of its cost on the consensus hot loop.
+    ///
+    /// Raise-only, deliberately: `min` BELOW the committed rung is a path that
+    /// degraded, and lowering it cluster-wide would have to shrink a door
+    /// clients have already been told about. The FSM refuses a lowering
+    /// `Settings` anyway (`datagram_mtu` is monotone there); plan 2 reports the
+    /// degraded path rather than acting on it.
+    fn maybe_commit_datagram_mtu(&mut self) -> bool {
+        if self.pass_mono_ns < self.next_mtu_check_ns {
+            return false;
+        }
+        self.next_mtu_check_ns = self.pass_mono_ns + 100_000_000;
+        let view_position = self.cluster_view.position.load(Ordering::Acquire);
+        if self.last_cluster_append > view_position {
+            return false; // single-in-flight: a CLUSTER command is above commit
+        }
+        let committed = self.cluster_view.datagram_mtu.load(Ordering::Acquire);
+        let membership = self.cluster_view.membership();
+        let members: Vec<SocketAddr> = membership
+            .voters
+            .iter()
+            .chain(membership.learners.iter())
+            .filter(|(id, _)| *id != self.id)
+            .map(|(_, a)| addr_of(*a))
+            .collect();
+        let Some(min) = self.probe_table.table_min(&members) else {
+            return false; // someone has not answered yet
+        };
+        if min <= committed.max(MTU_DEFAULT as u32) {
+            return false; // nothing to raise (a lower min is a degraded path — plan 2 reports it)
+        }
+        let mut settings = self.cluster_view.to_state().settings;
+        settings.datagram_mtu = min;
+        let cmd = ClusterCommand::Settings(settings);
+        if self.validate_cluster_command(&cmd).is_err() {
+            return false;
+        }
+        match self.append_cluster_frame(&cmd) {
+            Ok(position) => {
+                crate::obs_event!(
+                    Info,
+                    "datagram_mtu_proposed",
+                    node = self.id as u64,
+                    datagram_mtu = min as u64,
+                    position = position
+                );
+                true
+            }
+            Err(_) => false, // WouldOverrun: next check
+        }
+    }
+
     /// Spec §5.5's second trigger: the leader appends a `SNAPSHOT` frame once
     /// `settings.snapshot.interval_bytes` of log has accrued since the last
     /// instant it commanded, flagged per `settings.snapshot.target`.
@@ -5846,6 +5998,43 @@ impl Consensus {
             // door that moved and a page that says otherwise is exactly the
             // confusion an operator debugs a stalled cluster with.
             self.cnc.store_admission_bytes(adm_eff);
+        }
+        // Jumbo spec §7.1: the committed rung → the appender's door, the
+        // client-facing cnc word, and the sender's packing budget. `0` is the
+        // unset sentinel and means the baseline rung.
+        //
+        // A value that is neither `0` nor a ladder rung is treated as the
+        // baseline and reported once: the FSM's `validate` refuses one at the
+        // door, but a snapshot artifact installs cluster state by FIAT, so
+        // the clamp belongs at the point of use as well.
+        let raw = self.cluster_view.datagram_mtu.load(Ordering::Acquire);
+        let rung = match raw {
+            0 => MTU_DEFAULT,
+            r if is_rung(r) => r as usize,
+            r => {
+                crate::obs_event!(
+                    Warn,
+                    "datagram_mtu_not_a_rung",
+                    node = self.id as u64,
+                    datagram_mtu = r as u64
+                );
+                MTU_DEFAULT
+            }
+        };
+        if rung != self.live_mtu.load(Ordering::Relaxed) {
+            let ceiling = self.max_payload.min(payload_ceiling(rung, self.crypto_on));
+            // Order: door and cnc word first, then the sender's budget — a
+            // client may see the wider door only once the appender takes it.
+            self.buffer.set_payload_ceiling(ceiling);
+            self.cnc.store_payload_ceiling(ceiling as u64);
+            self.live_mtu.store(rung, Ordering::Release);
+            crate::obs_event!(
+                Info,
+                "payload_ceiling_adopted",
+                node = self.id as u64,
+                datagram_mtu = rung as u64,
+                ceiling = ceiling as u64
+            );
         }
         // Coordinated-snapshot spec §5.5/§6: the snapshot cadence and its
         // target, cached HERE (once, on the pass a CLUSTER frame committed)
@@ -9956,6 +10145,15 @@ mod tests {
             state,
             cnc: Arc::clone(&cnc),
             buffer,
+            // Jumbo: no peers wired in this harness — a table with an empty
+            // peer set makes `table_min(&[])` `Some(MTU_BOUND)`, but the
+            // harness's membership is a single voter (itself), so the commit
+            // rule sees an empty member list and the whole path is inert
+            // unless a test seeds the ledger itself.
+            probe_table: ProbeTable::new(ProbeCadence::default()),
+            live_mtu: Arc::new(AtomicUsize::new(MTU_DEFAULT)),
+            crypto_on: false,
+            next_mtu_check_ns: 0,
             appender: None,
             next_corr: 0,
             pending_ingress: None,

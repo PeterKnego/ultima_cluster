@@ -260,6 +260,16 @@ fn ingress_ring_submission_reaches_commit_and_non_leader_redirects() {
     let ring = uc_protocol::ring::mpsc::MpscRing::open(&dir.path().join("ingress.ring")).unwrap();
     let (prod, _) = ring.into_split();
 
+    // Jumbo (2.12.0): a SOLO cluster's leader commits the top rung on one of
+    // its first passes — `ProbeTable::table_min` over an empty member set is
+    // the loopback bound, so there is nothing to discover and the rule fires
+    // at once. That puts a `CLUSTER` frame on the log at a position this test
+    // cannot predict, so wait for it to have landed before sampling
+    // `commit0`; afterwards `min == committed` and no further one is
+    // appended, which is what makes the position read below the CLIENT's
+    // frame.
+    wait_until(|| node.datagram_mtu() == uc_protocol::v2::datagram::MTU_BOUND as u32);
+
     let commit0 = node.counters().commit.load_acquire();
     prod.try_write(MSG_V2_SUBMIT, 0, extra_client(7, 1), b"hello-ring")
         .unwrap();

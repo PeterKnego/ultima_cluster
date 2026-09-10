@@ -40,7 +40,6 @@ use uc_service::{
 
 const APP: &str = "m9-gate";
 const BUFFER_BYTES: usize = 1 << 22;
-const MAX_PAYLOAD: usize = 256;
 const SEGMENT_BYTES: u64 = 16 * 1024;
 /// The cluster's snapshot CADENCE (coordinated-snapshot spec §5.5/§6): the
 /// leader commands an instant every this many bytes of appended log. Written
@@ -487,7 +486,7 @@ fn write_config(
 ) {
     let mut s = format!(
         "id = {id}\nbind = \"{addr}\"\ninstance_dir = \"{}\"\napp_id = \"{APP}\"\n\
-         buffer_bytes = {BUFFER_BYTES}\nmax_payload = {MAX_PAYLOAD}\n\
+         buffer_bytes = {BUFFER_BYTES}\n\
          journal_segment_bytes = {SEGMENT_BYTES}\n\n\
          [purge]\nbelow_snapshot_slack_bytes = {PURGE_SLACK_BYTES}\n\n\
          [settings]\nsnapshot_interval_bytes = {SNAPSHOT_INTERVAL_BYTES}\n\n",
@@ -825,7 +824,9 @@ fn check_refusals(bin: &Path, root: &Path, members: &[(NodeId, SocketAddr)]) -> 
             "buffer_bytes",
         ),
         (
-            "payload-over-mtu",
+            // Jumbo (2.12.0): the key is retired, refused by name. The row
+            // still asserts the refusal NAMES the field.
+            "max-payload-retired",
             format!("{base}max_payload = 65536\n{member_block}"),
             "max_payload",
         ),

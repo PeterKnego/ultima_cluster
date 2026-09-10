@@ -241,8 +241,12 @@ struct NodeConfigFile {
     learners: Vec<Member>,
     #[serde(default = "default_buffer_bytes")]
     buffer_bytes: usize,
-    #[serde(default = "default_max_payload")]
-    max_payload: usize,
+    /// Jumbo spec §7.4 retired this key: the payload ceiling is DISCOVERED
+    /// from the path MTU between nodes and committed cluster-wide. Accepted
+    /// by serde ONLY so the loader can refuse it by name (exactly like
+    /// `admission_bytes` above/below) rather than as an unknown key.
+    #[serde(default)]
+    max_payload: Option<usize>,
     /// The cluster FSM (spec §3.3, §6) moved this cluster-wide: accepted by
     /// serde ONLY so the loader can refuse it by name and point at
     /// `[settings]`/`uc2ctl settings apply` — the real value never comes
@@ -290,36 +294,6 @@ struct NodeConfigFile {
 fn default_buffer_bytes() -> usize {
     1 << 26 // 64 MiB — a production default, not the examples' 4 MiB
 }
-/// Test seam: the shipped default, so `preflight`'s regression guard can
-/// assert the default satisfies its own checks rather than hard-coding a copy
-/// of the number that would drift.
-#[cfg(test)]
-pub(crate) fn default_max_payload_for_test() -> usize {
-    default_max_payload()
-}
-
-fn default_max_payload() -> usize {
-    // DERIVED from the transport budget, never a literal — see
-    // `uc_protocol::v2::datagram::max_payload_for_mtu`. A max-size frame plus
-    // its headers (and the crypto tag) must fit ONE datagram; `uc_net`'s
-    // Sender asserts it at construction.
-    //
-    // History, because both directions have bitten: the original 1 MiB default
-    // was ~700x over the MTU budget and panicked the daemon on first boot
-    // (adf72ba). Its replacement, a flat 512 B, was safe but arbitrary — and
-    // too SMALL to carry a full `MAX_SCHEDULE_ENTRIES` schedule table (1072 B),
-    // so a DEFAULT node silently capped `uc2ctl schedule apply` at 15 of the
-    // advertised 32 entries and refused the rest as an undecodable file
-    // (found by the 2026-09-08 time-and-timers fleet gate).
-    //
-    // Deriving it fixes both and keeps fixing them: the value tracks the path
-    // budget, so a larger `MTU_DEFAULT` (AWS EC2 and GCP both support ~9000 B
-    // jumbo frames, where this yields 8928) widens the default instead of
-    // leaving a small constant to be rediscovered. `preflight` checks BOTH
-    // bounds against whatever the operator actually configured.
-    uc_protocol::v2::datagram::MAX_PAYLOAD_DEFAULT
-}
-
 fn default_admission_bytes() -> u64 {
     256 * 1024
 }
@@ -597,6 +571,18 @@ pub fn parse_str_with_env(
         });
     }
 
+    // Jumbo spec §7.4: the ceiling is discovered from the path, not stated.
+    if f.max_payload.is_some() {
+        return Err(ConfigError::Invalid {
+            field: "max_payload",
+            detail: "max_payload is no longer configurable (2.12.0): the command payload \
+                     ceiling is discovered from the path MTU between nodes and committed \
+                     cluster-wide. Delete the line. To REQUIRE jumbo frames, set \
+                     force_jumbo_frames = true instead."
+                .into(),
+        });
+    }
+
     let purge = match f.purge {
         Some(p) => PurgePolicy::BelowSnapshot {
             slack_bytes: p.below_snapshot_slack_bytes,
@@ -828,7 +814,13 @@ pub fn parse_str_with_env(
             instance_dir: f.instance_dir,
             app_id: f.app_id,
             buffer_bytes: f.buffer_bytes,
-            max_payload: f.max_payload,
+            // The BOUND (jumbo spec §7.2): what the buffer is sized for; the
+            // live door is the committed rung's ceiling. `f.max_payload` is
+            // refused above whenever present.
+            max_payload: uc_protocol::v2::datagram::payload_ceiling(
+                uc_protocol::v2::datagram::MTU_BOUND,
+                matches!(crypto, CryptoConfig::Enabled { .. }),
+            ),
             // `f.admission_bytes` is refused above whenever present — the
             // file no longer supplies this value, only the code default
             // (task 5 reads the replicated `settings_genesis`/live setting
@@ -1627,6 +1619,47 @@ level = "info"
             "{e}"
         );
         assert!(e.to_string().contains("uc2ctl settings apply"), "{e}");
+    }
+
+    /// Jumbo spec §7.4: the ceiling is DISCOVERED. A `max_payload` key is
+    /// refused by name, pointing at discovery and at `force_jumbo_frames`.
+    #[test]
+    fn max_payload_is_refused_by_name_pointing_at_discovery() {
+        // Bare key before the first `[table]` header, same reason as above.
+        let toml = format!("max_payload = 1312\n{MINIMAL}");
+        let e = load_str(&toml).unwrap_err();
+        assert!(
+            matches!(
+                e,
+                ConfigError::Invalid {
+                    field: "max_payload",
+                    ..
+                }
+            ),
+            "{e}"
+        );
+        assert!(e.to_string().contains("discover"), "{e}");
+        assert!(e.to_string().contains("force_jumbo_frames"), "{e}");
+    }
+
+    /// Jumbo spec §7.2: without the key, `NodeConfig::max_payload` is the
+    /// BOUND — the top rung's ceiling for this node's crypto mode. It is what
+    /// the log buffer is SIZED for; the live door starts at the baseline
+    /// rung's ceiling and only `refresh_from_view` raises it.
+    #[test]
+    fn max_payload_bound_is_derived_from_the_top_rung_and_the_crypto_mode() {
+        use uc_protocol::v2::datagram::{MTU_BOUND, payload_ceiling};
+        let (cfg, _) = load_str(MINIMAL).unwrap(); // MINIMAL has [crypto] enabled = false
+        assert_eq!(cfg.max_payload, payload_ceiling(MTU_BOUND, false));
+        assert_eq!(cfg.max_payload, 8896);
+        let on = MINIMAL.replace(
+            "[crypto]\nenabled = false",
+            "[crypto]\nenabled = true\nkey_path = \"/etc/uc2/node.key\"\n\
+             allowlist_path = \"/etc/uc2/allowlist.toml\"",
+        );
+        let (cfg, _) = load_str(&on).unwrap();
+        assert_eq!(cfg.max_payload, payload_ceiling(MTU_BOUND, true));
+        assert_eq!(cfg.max_payload, 8864);
     }
 
     /// `[settings]` is optional; absent, `settings_genesis` is exactly
