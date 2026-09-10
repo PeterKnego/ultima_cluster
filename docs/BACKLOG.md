@@ -341,8 +341,11 @@ the next production caller can reach for. Six call sites, not the five this
 list named: `uc_gateway/src/edge.rs` reads `max_payload` the same way and was
 missed. The three attach doors answer `None` with `CncError::BadHeader`;
 `uc2ctl` refuses admin signing by name and skips its leftover-page
-cross-check. Pinned by a test that forces the torn window deterministically
-instead of waiting on the ~1-in-6 crashtest race.
+cross-check. Pinned by two tests that force the torn window deterministically
+instead of waiting on the ~1-in-6 crashtest race — one per half of the window
+(magic zeroed; magic present, crc not yet written). The second half was missed
+by the first version of the fix and caught in review; `try_meta` checks the
+crc32 like `validate` does.
 
 Record: `docs/releases.md`, "Known issue at release" → its **FIXED after the
 tag** paragraph.

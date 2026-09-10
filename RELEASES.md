@@ -114,7 +114,8 @@ on a fleet 2026-09-07/08.
 - **Known issue at release:** `uc2ctl`, a client attach or a service attach
   that lands exactly on a node's restart can panic (`CncPage::meta()` asserts
   a header a restarting node is rewriting). Nothing is written or lost;
-  re-running works. Not a regression; fix tracked in the backlog. →
+  re-running works. Not a regression. **Fixed on `main` for 2.12.0** (see
+  that section above). →
   [engineering record](docs/releases.md)
 - **Performance:** both gates ran on 4 × `c6id.2xlarge`, 2026-09-07/08,
   against bars pre-committed before any run; **no bar was moved**. Three rows

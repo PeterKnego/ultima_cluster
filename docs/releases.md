@@ -1048,10 +1048,12 @@ and 3/3 as a pair (~41 s), but the full 15-test suite fails about **1 run in
 identical bind-`:0`-then-drop probe, but instrumenting all four across six full
 runs found **0 duplicate ports in ~162 probes**.
 
-**The fix, when it is taken:** a fallible `try_meta() -> Option<CncMeta>` (or
-`Result`), with the five call sites handling a transient `None`, keeping
-`meta()` for heap-backed pages where the invariant is real. Tracked in
-`docs/BACKLOG.md`.
+**The fix, when it is taken** *(superseded — kept as written; what shipped
+differs on three counts: `meta()` was replaced, not kept; there were six call
+sites, not five; and the fix also checks the crc — see the next paragraph)*:
+a fallible `try_meta() -> Option<CncMeta>` (or `Result`), with the five call
+sites handling a transient `None`, keeping `meta()` for heap-backed pages
+where the invariant is real. Tracked in `docs/BACKLOG.md`.
 
 **FIXED after the tag, on `main`, for `2.12.0`.** `meta()` is gone and
 `try_meta() -> Option<CncMeta>` replaces it — a signature change, not an
@@ -1067,12 +1069,23 @@ with a named "the node is restarting — retry" refusal, and `uc2ctl`'s
 leftover-page cross-check by skipping the check, matching the posture its own
 `Err(e)` arm already had for an unreadable page. The record above counts five
 call sites; there were **six** — `uc_gateway/src/edge.rs:785` reads
-`max_payload` off the page the same way, and was missed. Pinned by
-`try_meta_reports_a_header_rewritten_under_the_reader` in `uc_log/src/cnc.rs`,
-which forces the window deterministically (zero the magic through a second fd
-on the shared mapping, after a successful `open_file`) rather than waiting on
-the ~1-in-6 race; against the old `meta()` that test panics at
-`uc_log/src/cnc.rs:965`, which was watched before the fix was written.
+`max_payload` off the page the same way, and was missed. Pinned by two tests
+in `uc_log/src/cnc.rs` that force the window deterministically (write through
+a second fd on the shared mapping, after a successful `open_file`) rather than
+waiting on the ~1-in-6 race. The window has **two halves**, and the first
+version of this fix caught only one:
+`try_meta_reports_a_header_rewritten_under_the_reader` zeroes the magic (the
+punch-hole half), and against the old `meta()` it panics at
+`uc_log/src/cnc.rs:965` — watched before the fix was written.
+`try_meta_rejects_a_half_written_header_behind_a_valid_magic` zeroes
+everything AFTER the magic: `write_cnc_header` stores the magic first and
+`init` stores the crc last, so a magic-only check in between returned a real
+`CncMeta` with `instance_id = 0` and `max_payload = 0` — a zero payload door
+for a client, and for a service an `instance_id` its next liveness probe
+contradicts. Found by the review of the first fix; `try_meta` now verifies
+the crc32 exactly as `validate` does, which makes it `validate`'s fallible
+twin rather than `try_instance_id`'s (the hot-path probe that deliberately
+skips the crc).
 
 **Still unexplained, and deliberately not claimed as fixed by the above:** the
 58-minute HANG. This panic explains the failure, not a stall — every wait in
