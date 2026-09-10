@@ -453,7 +453,8 @@ pub const REASON_SETTINGS_DIGEST: u32 = 44;
 /// reached a node the file was never staged on, or it was already consumed.
 pub const REASON_SETTINGS_MISSING: u32 = 45;
 /// The staged bytes are not a decodable `Settings` record
-/// (`decode_settings` is total: exact length, known version, known target).
+/// (`decode_settings` is total: a known version at that version's EXACT
+/// length — v1 or v2 since the jumbo flag day — and a known target).
 pub const REASON_SETTINGS_DECODE: u32 = 46;
 /// The record decodes but `ClusterFsm::validate` refuses it — a field outside
 /// the bounds every replica checks. Produced by

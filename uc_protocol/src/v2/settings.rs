@@ -203,9 +203,10 @@ mod tests {
         assert!(decode_settings(&[]).is_none());
         let mut out = Vec::new();
         encode_settings(&Settings::genesis_default(), &mut out);
-        let mut v2 = out.clone();
-        v2[0] = 3;
-        assert!(decode_settings(&v2).is_none());
+        // `2` is a REAL version now, so the unknown-version case is `3`.
+        let mut v3 = out.clone();
+        v3[0] = 3;
+        assert!(decode_settings(&v3).is_none());
         let mut t9 = out.clone();
         t9[28] = 9;
         assert!(decode_settings(&t9).is_none());

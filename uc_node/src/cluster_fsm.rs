@@ -403,8 +403,9 @@ impl RawStateMachine for ClusterFsm {
 
 /// The frozen image: magic ‖ version u32 ‖ applied u64 ‖ table_position u64
 /// ‖ settings_position u64 ‖ membership (u32 len ‖ encode_config) ‖ table
-/// (u32 len ‖ encode_schedule_table) ‖ settings (SETTINGS_LEN) ‖ crc32 of
-/// everything before it. The codec for this layout lives in
+/// (u32 len ‖ encode_schedule_table) ‖ settings (one whole record — the
+/// decoder accepts a v1 or a v2 one, `SETTINGS_LEN_V1` or `SETTINGS_LEN`) ‖
+/// crc32 of everything before it. The codec for this layout lives in
 /// `uc_protocol::v2::cluster_image` (plan 3, spec §4.8) — this impl owns only
 /// the state ⇄ `ClusterImageParts` conversion and the two membership/table
 /// records' own codecs (`config`/`schedule`), which the leaf does not know
@@ -488,7 +489,7 @@ impl SnapshotStateMachine for ClusterFsm {
 pub struct ClusterView {
     pub position: AtomicU64,
     /// Spec §9: `uc2_settings_position`, the frame-END of the last Settings
-    /// command applied (0 = the genesis record). An atomic beside the four
+    /// command applied (0 = the genesis record). An atomic beside the five
     /// settings scalars, for the same reason they are: `/metrics` reads it
     /// at SCRAPE time with one load and no lock, so nothing about this gauge
     /// costs the consensus pass anything.
@@ -559,7 +560,7 @@ impl ClusterView {
         self.inner.lock().unwrap().clone()
     }
 
-    /// The view as a [`ClusterState`] — the inner clone plus the four scalar
+    /// The view as a [`ClusterState`] — the inner clone plus the five scalar
     /// atomics, with `applied` taken from `position`.
     ///
     /// This is what the leader's PRE-APPEND check runs `ClusterFsm::validate`
@@ -567,8 +568,8 @@ impl ClusterView {
     /// from the newest COMMITTED state it can see, so a command it accepts is
     /// one every replica's apply loop will also accept — and there is exactly
     /// ONE acceptance function, never a parallel node-side reimplementation of
-    /// it. A read of the four atomics can straddle a concurrent `publish`
-    /// (they are stored one at a time), which costs nothing here: the four are
+    /// it. A read of the five atomics can straddle a concurrent `publish`
+    /// (they are stored one at a time), which costs nothing here: the five are
     /// only ever bounds-checked, and the authoritative decision is the apply
     /// loop's on the committed state.
     pub fn to_state(&self) -> ClusterState {

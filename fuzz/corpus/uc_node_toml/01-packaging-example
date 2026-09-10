@@ -76,12 +76,20 @@ addr = "10.0.0.12:9100"
 # path. See docs/benchmarks/uc2-m11-gate-2026-08-20.md, row 3b.
 # buffer_bytes = 67108864
 
-# Largest single command payload. Default 512.
+# Largest single command payload. DERIVED by default from the path budget —
+# 1312 B at the built-in 1408 B MTU — not a fixed number.
 #
-# A max-size frame plus its headers — and the crypto tag when encryption is on —
-# must fit ONE datagram; the node does not fragment. Raising this past the MTU
-# budget is a startup refusal.
-# max_payload = 512
+# A max-size frame plus its headers, and the crypto tag when encryption is on,
+# must fit ONE datagram; the node does not fragment. Both bounds are checked at
+# STARTUP and refused by name:
+#   too BIG   — past the MTU budget (the node would panic in the sender)
+#   too SMALL — below what a full 32-entry schedule table needs (1072 B), which
+#               would let `uc2ctl schedule apply` refuse valid tables
+#
+# Leave it unset unless you have a reason. The default follows the MTU, so a
+# build with a larger MTU (AWS EC2 and GCP both support ~9000 B jumbo frames)
+# widens it automatically rather than pinning a small value.
+# max_payload = 1312
 
 # NOTE: admission_bytes moved. Since the cluster FSM (2.11.0) the ingress
 # admission budget is a REPLICATED setting, not a per-host one: a top-level
