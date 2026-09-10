@@ -191,8 +191,13 @@ The wire assumes the path carries **1408-byte UDP payloads without
 fragmentation** — comfortable headroom on any standard 1500-MTU path, but worth
 checking on overlays, VPNs, and tunnels that shrink the effective MTU. Related:
 a max-size frame plus its headers (and the crypto tag, when encryption is on)
-must fit that budget, because the node does not fragment frames. Raising
-`max_payload` past it is a startup refusal that states the exact byte need.
+must fit that budget, because the node does not fragment frames. There is no
+key that raises it by hand: `max_payload` is **refused by name** since 2.12.0
+(pending), and the ceiling is discovered instead — every node probes the path
+to every other, and the leader commits the largest datagram size the whole
+cluster has proven (see [Wire protocol](../reference/wire-protocol.md) and
+[Limits](../reference/limits.md#hard-limits)). A cluster on a standard path
+stays at the 1408 B baseline.
 
 ## Give every node a durable instance directory
 

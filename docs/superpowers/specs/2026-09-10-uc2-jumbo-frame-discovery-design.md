@@ -547,3 +547,21 @@ Written before the tag, per the release rule:
    `MIN_FSM_LAG_BYTES` (as far as 8928 B at the top rung), never down. See
    `uc_protocol::v2::settings::MIN_FSM_LAG_BYTES`'s doc comment for the
    as-built wording.
+4. **§5.3: an empty member set yields no commit — a solo cluster stays at the
+   baseline; discovery starts when the first peer joins.**
+   `ProbeTable::table_min(&[])` returns `None`, not `Some(MTU_BOUND)`. An
+   empty set is *no evidence*, not universal evidence: a one-node cluster has
+   measured nothing, and the rung is monotone in the FSM, so a top-rung commit
+   on zero measurements is irreversible. It would break the grow-from-one path
+   — start one node, `add-learner`, promote — on any standard-MTU network,
+   because the joiner's snapshot chunks would be cut at the leader's 8960 B
+   budget and never arrive, leaving a wipe as the only remedy.
+   (`own_min_rung()` is unchanged: it still answers `MTU_BOUND` for an empty
+   peer map, which is why §5.1's boot ordering seeds the peer set before either
+   agent is given the table.)
+5. **§7.1/§7.3 name the wrong agent as the writer.** They say the cluster
+   agent writes `live_rung` and the cnc word at 3984; as built the
+   **consensus** agent writes both, in `Consensus::refresh_from_view` — the
+   cluster agent publishes the view and the consensus agent reads it, which is
+   what keeps the appender's door and the door's writer on one thread.
+   `docs/reference/cnc-page.md` already documents it that way.
