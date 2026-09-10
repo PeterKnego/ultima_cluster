@@ -92,6 +92,24 @@ fn await_verified(p: &Peer, peer: SocketAddr, want: u32, secs: u64) {
     }
 }
 
+/// The other half of the pair's view: what `peer` told us ITS own minimum is.
+/// A latched `advertised` is invisible in `verified` alone, and it is what
+/// `table_min` — the leader's commit rule — actually refuses on.
+fn await_advertised(p: &Peer, peer: SocketAddr, want: u32, secs: u64) {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    loop {
+        let got = p.table.get(peer).map(|e| e.advertised).unwrap_or(0);
+        if got == want {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "advertised by {peer} = {got}, wanted {want}"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
 #[test]
 fn an_uncapped_loopback_path_verifies_the_top_rung_both_ways() {
     let a = spawn_peer("a", FaultConfig::default());
@@ -102,11 +120,7 @@ fn an_uncapped_loopback_path_verifies_the_top_rung_both_ways() {
     await_verified(&b, a.addr, MTU_BOUND as u32, 5);
     assert_eq!(a.table.own_min_rung(), MTU_BOUND as u32);
     // b's ack carried its own minimum, so a's table knows b's view too.
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while a.table.get(b.addr).unwrap().advertised != MTU_BOUND as u32 {
-        assert!(Instant::now() < deadline);
-        std::thread::sleep(Duration::from_millis(5));
-    }
+    await_advertised(&a, b.addr, MTU_BOUND as u32, 5);
     assert_eq!(a.table.table_min(&[b.addr]), Some(MTU_BOUND as u32));
 }
 
@@ -126,6 +140,14 @@ fn a_path_capped_at_8832_verifies_exactly_8832() {
     std::thread::sleep(Duration::from_millis(100));
     assert_eq!(a.table.get(b.addr).unwrap().verified, 8832);
     assert_eq!(a.table.own_min_rung(), 8832);
+    // A CAPPED path must still converge on the advertised half: every rung
+    // above 8832 is dropped, so the only datagram that can carry an ack back
+    // is a re-probe at the verified rung. Without one this stays 0 and the
+    // leader's commit rule (`table_min`) is `None` forever.
+    await_advertised(&a, b.addr, 8832, 5);
+    await_advertised(&b, a.addr, 8832, 5);
+    assert_eq!(a.table.table_min(&[b.addr]), Some(8832));
+    assert_eq!(b.table.table_min(&[a.addr]), Some(8832));
 }
 
 /// The cap applies to what THIS side sends. A narrow path in one direction
@@ -145,10 +167,12 @@ fn an_asymmetric_cap_shows_up_in_the_advertised_minimum() {
     b.table.set_peers(&[a.addr]);
     await_verified(&b, a.addr, MTU_BOUND as u32, 5); // b → a is wide
     await_verified(&a, b.addr, 1408, 5); // a → b is narrow
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while b.table.get(a.addr).unwrap().advertised != 1408 {
-        assert!(Instant::now() < deadline, "b never learned a's minimum");
-        std::thread::sleep(Duration::from_millis(5));
-    }
+    await_advertised(&b, a.addr, 1408, 5);
     assert_eq!(b.table.table_min(&[a.addr]), Some(1408));
+    // And symmetrically on the NARROW side: a's only deliverable probe is a
+    // re-probe at 1408, and b answers it with its own (wide) minimum. Both
+    // ends must reach a `Some` — a's was permanently `None` before the
+    // re-probe covered capped paths as well as the top rung.
+    await_advertised(&a, b.addr, MTU_BOUND as u32, 5);
+    assert_eq!(a.table.table_min(&[b.addr]), Some(1408));
 }

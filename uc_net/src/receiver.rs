@@ -1865,7 +1865,8 @@ impl FollowerReceiver {
 
     /// M8 (Task 17): the send-side counterpart of `crypto_admit` — the ONE
     /// place this receiver's own outgoing datagrams are sealed. Every caller
-    /// (`NAK`, `STATUS`, `APPEND_POSITION`, `SNAP_NAK`, `SNAP_DONE`) is
+    /// (`NAK`, `STATUS`, `APPEND_POSITION`, `SNAP_NAK`, `SNAP_DONE`, and the
+    /// jumbo `PROBE_ACK`) is
     /// `Scope::Pairwise`; `seal_pairwise_control` itself refuses anything
     /// else, so a future group-scope kind routed through here fails loudly in
     /// the counter rather than being sealed the wrong way.

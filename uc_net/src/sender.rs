@@ -844,8 +844,13 @@ impl Sender {
                 let mut body = vec![0u8; body_len];
                 write_probe_rung(&mut body, rung);
                 if self.assemble_probe(peer, &body) {
-                    let _ = self.sock.send_to(&self.scratch, peer);
-                    self.stats.probes_sent.fetch_add(1, Ordering::Relaxed);
+                    // Only a send the OS accepted is "put on the wire": with DF
+                    // set, an over-MTU probe fails EMSGSIZE synchronously right
+                    // here, and counting it would make `probes_sent` claim
+                    // traffic that never left the host.
+                    if self.sock.send_to(&self.scratch, peer).is_ok() {
+                        self.stats.probes_sent.fetch_add(1, Ordering::Relaxed);
+                    }
                 } else {
                     table.note_unsent();
                 }
@@ -871,6 +876,11 @@ impl Sender {
             },
         );
         self.scratch.extend_from_slice(body);
+        debug_assert!(
+            matches!(Transport::scope_of(DGRAM_KIND_PROBE), Scope::Pairwise),
+            "assemble_probe seals with an explicit peer, which is only correct \
+             for Scope::Pairwise kinds; DGRAM_KIND_PROBE is not one"
+        );
         if self.crypto.is_none() {
             return true;
         }

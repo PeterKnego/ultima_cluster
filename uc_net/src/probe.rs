@@ -96,15 +96,23 @@ impl ProbeTable {
     ///
     /// Either way `table_min` (spec §5.3, the leader's commit rule) takes
     /// `min(verified, advertised)` and refuses a zero, so a latched
-    /// advertisement means the cluster never raises its MTU at all. When the
-    /// ladder has no rung left ABOVE `verified`, the pass re-sends the verified
-    /// rung instead: one datagram per slow tick, purely to draw a fresh ack.
+    /// advertisement means the cluster never raises its MTU at all.
     ///
-    /// A GENUINELY asymmetric peer — one whose own minimum is legitimately
-    /// below our path to it, because it has a narrow peer of its own — is
-    /// therefore probed for as long as that stays true, at `slow_ns`. That is
-    /// the intended cost, and it is also what re-discovers a path that later
-    /// improves.
+    /// So whenever the advertisement is behind what we verified, the pass
+    /// APPENDS the verified rung to the rungs it was going to try anyway —
+    /// not only when the ladder has nothing left above it. On a CAPPED path
+    /// that distinction is the whole feature: every rung above `verified` is
+    /// exactly a size that path drops, so without the appended rung no ack can
+    /// ever come back and `advertised` never refreshes. The refresh rung goes
+    /// LAST, so the freshest advertisement is the one that lands last.
+    ///
+    /// Cost, per slow tick, while a peer's advertisement stays behind: one
+    /// extra datagram of a size the path is already known to carry — three
+    /// instead of two on a 1408-capped path, two instead of one on an
+    /// 8832-capped one. A GENUINELY asymmetric peer — one whose own minimum is
+    /// legitimately below our path to it, because it has a narrow peer of its
+    /// own — pays that for as long as that stays true. It is also what
+    /// re-discovers a path that later improves.
     pub fn due(&self, now_ns: u64) -> Vec<(SocketAddr, Vec<u32>)> {
         let mut out = Vec::new();
         let mut g = self.peers.lock().unwrap();
@@ -114,9 +122,10 @@ impl ProbeTable {
                 continue;
             }
             let mut rungs: Vec<u32> = RUNGS.iter().copied().filter(|&r| r > p.verified).collect();
-            if rungs.is_empty() {
-                // Top rung verified, the peer's own view still behind it: ask
-                // again at the size we know the path carries.
+            if p.verified > 0 && p.advertised < p.verified {
+                // The peer's view of its own path is behind ours of it: ask
+                // again at the size we know the path carries. On a capped path
+                // this is the ONLY rung in the pass that can be delivered.
                 rungs.push(p.verified);
             }
             p.attempts += 1;
@@ -214,7 +223,10 @@ mod tests {
         let t = ProbeTable::new(fast());
         t.set_peers(&[a(1)]);
         t.due(0);
-        t.on_ack(a(1), 8832, 0);
+        // A LEVEL advertisement (`own_min_rung` == the rung it acked), so this
+        // test stays about narrowing alone — the refresh rung a peer whose
+        // advertisement is behind also gets has its own test below.
+        t.on_ack(a(1), 8832, 8832);
         assert_eq!(t.get(a(1)).unwrap().verified, 8832);
         assert_eq!(t.due(10), vec![(a(1), vec![8960])]);
         // Fully resolved: top rung verified AND the peer's own minimum is no
@@ -231,12 +243,12 @@ mod tests {
         assert!(t.get(a(9)).is_none());
     }
 
-    /// Task 4 (found by `uc_net/tests/probe.rs`): a peer whose top rung is
-    /// verified but whose advertisement is still BEHIND it must keep being
-    /// probed. Both latches are real — a fresh cluster's first exchange
-    /// necessarily carries `own_min_rung() == 0`, and a mid-ladder answer
-    /// carries a rung the peer has since climbed past — and either one leaves
-    /// `table_min` (spec §5.3) permanently low or `None`.
+    /// Task 4 (found by `uc_net/tests/probe.rs`): a peer whose advertisement is
+    /// BEHIND what we verified must keep being probed at the verified rung.
+    /// Both latches are real — a fresh cluster's first exchange necessarily
+    /// carries `own_min_rung() == 0`, and a mid-ladder answer carries a rung
+    /// the peer has since climbed past — and either one leaves `table_min`
+    /// (spec §5.3) permanently low or `None`.
     #[test]
     fn a_peer_whose_advertisement_is_behind_is_still_probed_at_its_verified_rung() {
         let t = ProbeTable::new(fast());
@@ -256,6 +268,31 @@ mod tests {
         );
         t.on_ack(a(1), MTU_BOUND as u32, MTU_BOUND as u32);
         assert!(t.due(3_000).is_empty(), "resolved: probing stops");
+    }
+
+    /// The same rule on a CAPPED path — the case the whole feature exists for,
+    /// and the one where it actually bites: every rung ABOVE `verified` is a
+    /// size the path drops, so the appended verified rung is the only datagram
+    /// in the pass that can draw an ack back at all. Without it `advertised`
+    /// stays 0 forever and this peer's `table_min` is permanently `None`.
+    #[test]
+    fn a_capped_path_is_re_probed_at_its_verified_rung_too_not_only_at_the_top() {
+        let t = ProbeTable::new(fast());
+        t.set_peers(&[a(1)]);
+        t.due(0);
+        t.on_ack(a(1), 8832, 0); // 8960 was dropped by the path; nobody has acked us yet
+        assert_eq!(
+            t.due(1_000),
+            vec![(a(1), vec![8960, 8832])],
+            "the untried rung above, THEN the verified rung — freshest ack last"
+        );
+        t.on_ack(a(1), 8832, 8832); // the peer's view caught up
+        assert_eq!(
+            t.due(2_000),
+            vec![(a(1), vec![8960])],
+            "advertisement level: only the untried rung above is left"
+        );
+        assert_eq!(t.table_min(&[a(1)]), Some(8832));
     }
 
     #[test]
