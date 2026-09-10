@@ -210,6 +210,10 @@ pub struct NodeConfig {
     pub app_id: String,
     /// Ring capacity in bytes; power of two.
     pub buffer_bytes: usize,
+    /// The payload BOUND this node's log buffer is sized for (jumbo spec
+    /// §7.2) — `payload_ceiling(MTU_BOUND, crypto)` from `node.toml`; tests
+    /// pass small values with small buffers. The live door is
+    /// `min(this, payload_ceiling(committed rung, crypto))`.
     pub max_payload: usize,
     /// Ingress admission budget in bytes (`append - commit` backpressure gate,
     /// wired in Task 7). Default `256 * 1024`.
@@ -504,6 +508,24 @@ pub const REASON_SNAPSHOT_ABOVE_DURABLE: u32 = 50;
 /// a leader whose live door has not yet been raised, or a future table cap
 /// larger than the baseline carries.
 pub const REASON_SCHEDULE_TOO_LARGE: u32 = 51;
+
+/// Jumbo spec §7.1: the datagram rung a committed `Settings::datagram_mtu`
+/// word means, and whether it had to be clamped to get there.
+///
+/// `0` is the unset sentinel: every cluster starts at the baseline rung. A
+/// value that is neither `0` nor a ladder rung ALSO reads as the baseline —
+/// the cluster FSM's `validate` refuses one at the door, but a snapshot
+/// artifact installs cluster state by FIAT, so the clamp has to live at the
+/// point of use as well. The `bool` is `true` exactly in that case, so the
+/// one caller that can log says so once and [`Node::datagram_mtu`] stays a
+/// plain read.
+fn committed_rung(raw: u32) -> (u32, bool) {
+    match raw {
+        0 => (MTU_DEFAULT as u32, false),
+        r if is_rung(r) => (r, false),
+        _ => (MTU_DEFAULT as u32, true),
+    }
+}
 
 /// Why [`Consensus::command_snapshot`] refused to append a `SNAPSHOT` frame.
 ///
@@ -1862,8 +1884,18 @@ impl Node {
 
         // M14a (spec §5.2): the FSM term the door + report ceiling share —
         // computed once at boot from the static declared set + lag policy.
-        let fsm_lag_eff =
-            crate::services::fsm_lag_eff(&cfg.services, cfg.buffer_bytes as u64, cfg.max_payload);
+        // Jumbo spec §7.1/§7.2: `buffer.payload_ceiling()`, NOT
+        // `cfg.max_payload`. Under `FsmLag::Lockstep` the door is "one frame
+        // past the FSMs", and the only frame that can be appended is a
+        // LIVE-CEILING frame — feeding the bound here would open a lockstep
+        // door ~6.6x wider than one appendable frame on a cluster still at
+        // the baseline rung. The door was set to the baseline ceiling above,
+        // before any agent ran, so this reads exactly that.
+        let fsm_lag_eff = crate::services::fsm_lag_eff(
+            &cfg.services,
+            cfg.buffer_bytes as u64,
+            buffer.payload_ceiling(),
+        );
 
         // Time-and-timers §6: the per-row timer counters, shared between the
         // consensus agent (the only writer) and `Node::observability`.
@@ -2195,11 +2227,7 @@ impl Node {
     /// snapshot artifact installs cluster state by fiat, so the clamp lives at
     /// the point of use, not only at `validate`.
     pub fn datagram_mtu(&self) -> u32 {
-        match self.cluster_view().datagram_mtu.load(Ordering::Acquire) {
-            0 => MTU_DEFAULT as u32,
-            r if !is_rung(r) => MTU_DEFAULT as u32,
-            r => r,
-        }
+        committed_rung(self.cluster_view().datagram_mtu.load(Ordering::Acquire)).0
     }
 
     /// Jumbo spec §7.1: the LIVE command payload ceiling — what a client may
@@ -5940,6 +5968,40 @@ impl Consensus {
             self.arm_table_from_view(&inner);
             self.last_armed_table_position = inner.table_position;
         }
+        // Jumbo spec §7.1: the committed rung → the appender's door, the
+        // client-facing cnc word, and the sender's packing budget. `0` is the
+        // unset sentinel and means the baseline rung.
+        //
+        // A value that is neither `0` nor a ladder rung is treated as the
+        // baseline and reported once: the FSM's `validate` refuses one at the
+        // door, but a snapshot artifact installs cluster state by FIAT, so
+        // the clamp belongs at the point of use as well.
+        let raw = self.cluster_view.datagram_mtu.load(Ordering::Acquire);
+        let (rung, clamped) = committed_rung(raw);
+        let rung = rung as usize;
+        if clamped {
+            crate::obs_event!(
+                Warn,
+                "datagram_mtu_not_a_rung",
+                node = self.id as u64,
+                datagram_mtu = raw as u64
+            );
+        }
+        if rung != self.live_mtu.load(Ordering::Relaxed) {
+            let ceiling = self.max_payload.min(payload_ceiling(rung, self.crypto_on));
+            // Order: door and cnc word first, then the sender's budget — a
+            // client may see the wider door only once the appender takes it.
+            self.buffer.set_payload_ceiling(ceiling);
+            self.cnc.store_payload_ceiling(ceiling as u64);
+            self.live_mtu.store(rung, Ordering::Release);
+            crate::obs_event!(
+                Info,
+                "payload_ceiling_adopted",
+                node = self.id as u64,
+                datagram_mtu = rung as u64,
+                ceiling = ceiling as u64
+            );
+        }
         // The two node-local clamps (spec §4.4): the record carries a
         // cluster-wide INTENT, and each node bounds it against its own ring at
         // USE, never at apply — so a host with a smaller buffer clamps rather
@@ -5960,23 +6022,39 @@ impl Consensus {
         // asked to be narrow, and still lets an operator revert an explicit
         // setting to the default by applying a record with `0`.
         if self.fsm_lag_eff.is_some() {
+            // Jumbo spec §7.1/§7.2: the one-frame FLOOR every arm of this
+            // computation rests on is one LIVE-CEILING frame, never one
+            // BOUND-sized frame — the ceiling is the largest payload
+            // `Appender::append` will accept, so it is the largest frame that
+            // can exist on this log right now. The jumbo block ABOVE has
+            // already set the ceiling for this pass (and both run on the
+            // consensus thread, which is also the appender's, so no frame can
+            // land between the two). Feeding the bound instead silently
+            // widened a lockstep door from one 1408-rung frame to one
+            // 8960-rung frame — ~6.6x — on a cluster that had not raised its
+            // rung at all.
+            let one_frame_ceiling = self.buffer.payload_ceiling();
             let lag = self.cluster_view.fsm_lag_bytes.load(Ordering::Acquire);
             let (lag_eff, page) = if lag == 0 {
                 (
                     crate::services::fsm_lag_eff(
                         &self.services,
                         self.buffer_bytes,
-                        self.max_payload,
+                        one_frame_ceiling,
                     ),
                     self.services.page_lag_value(self.buffer_bytes),
                 )
             } else {
                 (
-                    crate::services::fsm_lag_from_setting(lag, self.buffer_bytes, self.max_payload),
+                    crate::services::fsm_lag_from_setting(
+                        lag,
+                        self.buffer_bytes,
+                        one_frame_ceiling,
+                    ),
                     crate::services::page_lag_from_setting(
                         lag,
                         self.buffer_bytes,
-                        self.max_payload,
+                        one_frame_ceiling,
                     ),
                 )
             };
@@ -5998,43 +6076,6 @@ impl Consensus {
             // door that moved and a page that says otherwise is exactly the
             // confusion an operator debugs a stalled cluster with.
             self.cnc.store_admission_bytes(adm_eff);
-        }
-        // Jumbo spec §7.1: the committed rung → the appender's door, the
-        // client-facing cnc word, and the sender's packing budget. `0` is the
-        // unset sentinel and means the baseline rung.
-        //
-        // A value that is neither `0` nor a ladder rung is treated as the
-        // baseline and reported once: the FSM's `validate` refuses one at the
-        // door, but a snapshot artifact installs cluster state by FIAT, so
-        // the clamp belongs at the point of use as well.
-        let raw = self.cluster_view.datagram_mtu.load(Ordering::Acquire);
-        let rung = match raw {
-            0 => MTU_DEFAULT,
-            r if is_rung(r) => r as usize,
-            r => {
-                crate::obs_event!(
-                    Warn,
-                    "datagram_mtu_not_a_rung",
-                    node = self.id as u64,
-                    datagram_mtu = r as u64
-                );
-                MTU_DEFAULT
-            }
-        };
-        if rung != self.live_mtu.load(Ordering::Relaxed) {
-            let ceiling = self.max_payload.min(payload_ceiling(rung, self.crypto_on));
-            // Order: door and cnc word first, then the sender's budget — a
-            // client may see the wider door only once the appender takes it.
-            self.buffer.set_payload_ceiling(ceiling);
-            self.cnc.store_payload_ceiling(ceiling as u64);
-            self.live_mtu.store(rung, Ordering::Release);
-            crate::obs_event!(
-                Info,
-                "payload_ceiling_adopted",
-                node = self.id as u64,
-                datagram_mtu = rung as u64,
-                ceiling = ceiling as u64
-            );
         }
         // Coordinated-snapshot spec §5.5/§6: the snapshot cadence and its
         // target, cached HERE (once, on the pass a CLUSTER frame committed)
@@ -11169,6 +11210,303 @@ mod tests {
             h.cons.cnc.fsm_lag_bytes(),
             0,
             "the page's lockstep sentinel"
+        );
+    }
+
+    // ---- jumbo (spec §5.3/§7.1): the leader's commit rule, the clamp, and
+    // the lockstep door ----
+
+    use uc_protocol::v2::datagram::MTU_BOUND;
+
+    /// The harness's genesis membership is voters `{0, 1, 2}` and this node is
+    /// 1, so these two addresses are what `maybe_commit_datagram_mtu` asks the
+    /// probe table about.
+    fn mtu_peers(h: &Harness) -> Vec<SocketAddr> {
+        vec![h.cons.id_to_addr[&0], h.cons.id_to_addr[&2]]
+    }
+
+    /// Every address in `peers` answers a probe at `verified` and advertises
+    /// `advertised` — both halves, which is what `ProbeTable::table_min`
+    /// requires before the leader can see a minimum at all. The peer set is
+    /// REPLACED first (`set_peers` forgets an address no longer listed), so a
+    /// caller can model a path that degraded by re-seeding from empty.
+    fn all_answer(h: &Harness, peers: &[SocketAddr], verified: u32, advertised: u32) {
+        h.cons.probe_table.set_peers(&[]);
+        h.cons.probe_table.set_peers(peers);
+        for &p in peers {
+            h.cons.probe_table.on_ack(p, verified, advertised);
+        }
+    }
+
+    /// Spec §5.3: the rule is evaluated at most every 100 ms. The signal that
+    /// the early return fired — rather than the rule running and declining —
+    /// is that the next-check deadline did NOT move.
+    #[test]
+    fn the_commit_rule_is_evaluated_at_most_every_100ms() {
+        let mut h = harness();
+        drive_to_serving_leader(&mut h);
+        let peers = mtu_peers(&h);
+        all_answer(&h, &peers, MTU_BOUND as u32, MTU_BOUND as u32);
+
+        h.cons.next_mtu_check_ns = 0;
+        h.cons.pass_mono_ns = 1_000;
+        assert!(h.cons.maybe_commit_datagram_mtu(), "first pass proposes");
+        let deadline = h.cons.next_mtu_check_ns;
+        assert_eq!(deadline, 1_000 + 100_000_000);
+
+        // 1 ms later: not evaluated at all.
+        h.cons.pass_mono_ns = 2_000_000;
+        assert!(!h.cons.maybe_commit_datagram_mtu());
+        assert_eq!(
+            h.cons.next_mtu_check_ns, deadline,
+            "the throttle returned before touching the deadline"
+        );
+    }
+
+    /// Spec §4.4/§5.3: SINGLE IN FLIGHT. The rule shares the one gate every
+    /// other `CLUSTER` command uses, so it cannot stack a second proposal on
+    /// top of one that has not committed — even once the throttle has expired.
+    #[test]
+    fn the_commit_rule_holds_while_its_own_frame_is_above_commit() {
+        let mut h = harness();
+        drive_to_serving_leader(&mut h);
+        let peers = mtu_peers(&h);
+        all_answer(&h, &peers, MTU_BOUND as u32, MTU_BOUND as u32);
+
+        h.cons.pass_mono_ns = 1_000;
+        assert!(h.cons.maybe_commit_datagram_mtu());
+        let first = h.cons.last_cluster_append;
+        assert!(
+            first > h.cons.cluster_view.position.load(Ordering::Acquire),
+            "the proposal is above commit"
+        );
+
+        h.cons.pass_mono_ns += 200_000_000; // past the throttle
+        assert!(!h.cons.maybe_commit_datagram_mtu(), "single in flight");
+        assert_eq!(h.cons.last_cluster_append, first, "nothing was appended");
+    }
+
+    /// Spec §5.3: EVERY member, voters and LEARNERS alike. A learner is
+    /// replicated to over the same path a voter is, so a learner behind a
+    /// narrow hop bounds the cluster's rung exactly as a voter would — and a
+    /// rule that skipped learners would commit a rung one member cannot carry.
+    #[test]
+    fn the_commit_rule_counts_learners_not_just_voters() {
+        let mut h = harness();
+        drive_to_serving_leader(&mut h);
+        // Put a learner in the COMMITTED membership (published by fiat — this
+        // harness has no reconfiguration path).
+        let learner: SocketAddr = "127.0.0.1:9199".parse().unwrap();
+        let mut st = h.cons.cluster_view.to_state();
+        st.membership.learners.push((7, addr_to_pair(learner)));
+        h.cons.cluster_view.publish(&st);
+
+        let voters = mtu_peers(&h);
+        all_answer(&h, &voters, MTU_BOUND as u32, MTU_BOUND as u32);
+        h.cons.pass_mono_ns = 1_000;
+        assert!(
+            !h.cons.maybe_commit_datagram_mtu(),
+            "both VOTERS answered, but the learner has not"
+        );
+
+        let mut all = voters.clone();
+        all.push(learner);
+        all_answer(&h, &all, MTU_BOUND as u32, MTU_BOUND as u32);
+        h.cons.pass_mono_ns += 200_000_000;
+        assert!(h.cons.maybe_commit_datagram_mtu(), "now every member has");
+    }
+
+    /// Spec §5.3: raise-only. `min` at or below the committed rung is a
+    /// no-op — nothing to raise when it is equal, and a LOWER `min` is a path
+    /// that degraded, which plan 2 reports rather than acts on (the FSM
+    /// refuses a lowering `Settings` anyway).
+    #[test]
+    fn the_commit_rule_never_lowers_and_never_re_proposes() {
+        let mut h = harness();
+        drive_to_serving_leader(&mut h);
+        let peers = mtu_peers(&h);
+
+        all_answer(&h, &peers, MTU_DEFAULT as u32, MTU_DEFAULT as u32);
+        h.cons.pass_mono_ns = 1_000;
+        assert!(
+            !h.cons.maybe_commit_datagram_mtu(),
+            "min IS the baseline: nothing to raise"
+        );
+
+        all_answer(&h, &peers, MTU_BOUND as u32, MTU_BOUND as u32);
+        h.cons.pass_mono_ns += 200_000_000;
+        assert!(h.cons.maybe_commit_datagram_mtu());
+        let end = h.cons.last_cluster_append;
+        h.commit_through(end);
+        h.cons.do_work();
+        assert_eq!(
+            h.cons.cluster_view.datagram_mtu.load(Ordering::Acquire),
+            MTU_BOUND as u32
+        );
+
+        // Committed. The same minimum must not be proposed again...
+        h.cons.pass_mono_ns += 200_000_000;
+        h.cons.next_mtu_check_ns = 0;
+        assert!(!h.cons.maybe_commit_datagram_mtu(), "min == committed");
+
+        // ...and neither must a DEGRADED one.
+        all_answer(&h, &peers, 8832, 8832);
+        h.cons.pass_mono_ns += 200_000_000;
+        h.cons.next_mtu_check_ns = 0;
+        assert!(!h.cons.maybe_commit_datagram_mtu(), "raise-only");
+    }
+
+    /// Spec §5.3: the proposal carries the table MINIMUM (not this node's own
+    /// path, not the top rung) and leaves every other replicated setting
+    /// exactly as committed — it is a `Settings` command, so a rule that built
+    /// one from anything but the current state would silently revert whatever
+    /// an operator last applied.
+    #[test]
+    fn the_commit_rule_proposes_the_table_minimum_and_changes_nothing_else() {
+        let mut h = harness_with_settings(Settings {
+            admission_bytes: 4096,
+            snapshot_interval_bytes: 1 << 20,
+            ..Settings::genesis_default()
+        });
+        drive_to_serving_leader(&mut h);
+        let peers = mtu_peers(&h);
+        // One peer's path is capped one rung down: 8832 is the minimum.
+        h.cons.probe_table.set_peers(&peers);
+        h.cons
+            .probe_table
+            .on_ack(peers[0], MTU_BOUND as u32, MTU_BOUND as u32);
+        h.cons.probe_table.on_ack(peers[1], 8832, 8832);
+
+        h.cons.pass_mono_ns = 1_000;
+        assert!(h.cons.maybe_commit_datagram_mtu());
+        let end = h.cons.last_cluster_append;
+        h.commit_through(end);
+        h.cons.do_work();
+
+        let st = h.cons.cluster_view.to_state();
+        assert_eq!(
+            st.settings.datagram_mtu, 8832,
+            "the table minimum, not 8960"
+        );
+        assert_eq!(st.settings.admission_bytes, 4096, "untouched");
+        assert_eq!(st.settings.snapshot_interval_bytes, 1 << 20, "untouched");
+    }
+
+    /// Spec §7.1: the clamp, as arithmetic. `0` means the baseline; so does a
+    /// word no `validate` would ever have accepted, because a snapshot
+    /// artifact installs cluster state by fiat and there is no door on that
+    /// path.
+    #[test]
+    fn a_datagram_mtu_word_that_is_not_a_rung_reads_as_the_baseline() {
+        assert_eq!(committed_rung(0), (MTU_DEFAULT as u32, false));
+        assert_eq!(
+            committed_rung(MTU_DEFAULT as u32),
+            (MTU_DEFAULT as u32, false)
+        );
+        assert_eq!(committed_rung(8832), (8832, false));
+        assert_eq!(committed_rung(MTU_BOUND as u32), (MTU_BOUND as u32, false));
+        for bogus in [1u32, 1500, 9000, u32::MAX] {
+            assert_eq!(
+                committed_rung(bogus),
+                (MTU_DEFAULT as u32, true),
+                "{bogus} is not a rung"
+            );
+        }
+    }
+
+    /// Spec §7.1, the same clamp WIRED: a non-rung word must not reach the
+    /// appender's door, the client-facing cnc word, or the sender's budget.
+    #[test]
+    fn a_non_rung_datagram_mtu_leaves_every_door_at_the_baseline() {
+        let mut h = harness();
+        h.cons.crypto_on = false;
+        // Installed by fiat, the way a snapshot artifact would.
+        h.cons
+            .cluster_view
+            .datagram_mtu
+            .store(1500, Ordering::Release);
+        // Force the block to run: an unequal `live_mtu`, and a view position
+        // the pass has not seen.
+        h.cons.live_mtu.store(0, Ordering::Relaxed);
+        h.cons.view_position_seen = u64::MAX;
+        h.cons.refresh_from_view();
+
+        let baseline = h.cons.max_payload.min(payload_ceiling(MTU_DEFAULT, false));
+        assert_eq!(h.cons.live_mtu.load(Ordering::Relaxed), MTU_DEFAULT);
+        assert_eq!(h.cons.buffer.payload_ceiling(), baseline);
+        assert_eq!(h.cons.cnc.payload_ceiling(), baseline as u64);
+    }
+
+    /// Review round 1, Important 2: under `FsmLag::Lockstep` the door is "at
+    /// most ONE FRAME past the FSMs", and since jumbo the only frame that can
+    /// be appended is a LIVE-CEILING frame. Feeding `NodeConfig::max_payload`
+    /// — which is now the BOUND, `payload_ceiling(MTU_BOUND, crypto)` = 8896 —
+    /// made "one frame" mean 8928 bytes on a cluster whose largest possible
+    /// frame is 1376: a silent ~6.5x loosening of the tightest pacing policy
+    /// UC offers, on every node, from the moment jumbo shipped.
+    ///
+    /// Both halves matter. The first assert fails against the bound; the
+    /// second pins that the floor RISES with the rung, in the SAME
+    /// `refresh_from_view` — which is why the jumbo block sits above the lag
+    /// block rather than below it.
+    #[test]
+    fn the_lockstep_door_follows_the_live_ceiling_not_the_bound() {
+        let mut h = harness();
+        h.cons.services = crate::services::ServicesConfig::from_names(
+            &["kv"],
+            Some(crate::services::FsmLag::Lockstep),
+        )
+        .unwrap();
+        h.cons.crypto_on = false;
+        // What `start_with` does before any agent runs: the door at the
+        // BASELINE rung's ceiling, the floor one such frame.
+        let baseline = h.cons.max_payload.min(payload_ceiling(MTU_DEFAULT, false));
+        assert_eq!(
+            baseline, 1344,
+            "the harness's bound (4096) must be ABOVE the baseline ceiling, \
+             or this test cannot tell the two inputs apart"
+        );
+        h.cons.buffer.set_payload_ceiling(baseline);
+        h.cons.live_mtu.store(MTU_DEFAULT, Ordering::Relaxed);
+        h.cons.fsm_lag_eff = crate::services::fsm_lag_eff(&h.cons.services, 1 << 16, baseline);
+        assert_eq!(h.cons.fsm_lag_eff, Some(1376), "one BASELINE-ceiling frame");
+
+        drive_to_serving_leader(&mut h);
+        // A committed CLUSTER frame, so `refresh_from_view` re-runs its
+        // arithmetic. The rung does not move here.
+        let end = h
+            .cons
+            .append_cluster_frame(&ClusterCommand::Settings(Settings::genesis_default()))
+            .unwrap();
+        h.commit_through(end);
+        h.cons.do_work();
+        assert_eq!(
+            h.cons.fsm_lag_eff,
+            Some(1376),
+            "still one BASELINE-ceiling frame — feeding the BOUND gives 4128"
+        );
+
+        // Now the rung moves. The ceiling and the floor rise together.
+        let mut settings = h.cons.cluster_view.to_state().settings;
+        settings.datagram_mtu = MTU_BOUND as u32;
+        let end = h
+            .cons
+            .append_cluster_frame(&ClusterCommand::Settings(settings))
+            .unwrap();
+        h.commit_through(end);
+        h.cons.do_work();
+        let live = h.cons.max_payload.min(payload_ceiling(MTU_BOUND, false));
+        assert_eq!(live, 4096, "capped by this harness's bound");
+        assert_eq!(h.cons.buffer.payload_ceiling(), live);
+        assert_eq!(
+            h.cons.fsm_lag_eff,
+            Some(4128),
+            "one LIVE-ceiling frame, raised in the SAME pass that raised the ceiling"
+        );
+        assert_eq!(
+            h.cons.cnc.fsm_lag_bytes(),
+            0,
+            "the page keeps its lockstep sentinel"
         );
     }
 

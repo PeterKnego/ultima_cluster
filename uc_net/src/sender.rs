@@ -859,14 +859,18 @@ impl Sender {
     /// snapshot chunk; a probe that cannot be sealed yet (no session) is
     /// counted in the table's `unsent`, never in `seal_failures`.
     fn send_due_probes(&mut self) -> bool {
-        let Some(table) = self.probe.clone() else {
-            return false;
+        // The idle path costs ONE Relaxed load and nothing else: borrow the
+        // table for the `due` check (no `Arc` refcount RMW), and clone only on
+        // the rare pass that actually has probes to send — the loop below
+        // needs an owned handle because it calls `&mut self` methods.
+        let due = match self.probe.as_ref() {
+            None => return false,
+            Some(t) => t.due(self.now_ns()),
         };
-        let now = self.now_ns();
-        let due = table.due(now);
         if due.is_empty() {
             return false;
         }
+        let table = self.probe.clone().expect("checked above");
         let overhead = DATAGRAM_HEADER_LEN + self.cfg.crypto_overhead();
         for (peer, rungs) in due {
             for rung in rungs {

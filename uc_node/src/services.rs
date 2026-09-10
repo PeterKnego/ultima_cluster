@@ -345,6 +345,9 @@ pub fn parse_fsm_lag(field: &str, s: &str) -> Result<FsmLag, String> {
 /// The door/ceiling term (spec §5.2): the byte bound, or one max-size frame
 /// under lockstep ("at most one frame past the FSMs"). `None` ⇔ nothing
 /// declared ⇔ no FSM term at all.
+///
+/// `max_payload` here is the caller's LIVE payload ceiling, not its
+/// configured bound — see [`one_frame`].
 pub fn fsm_lag_eff(
     services: &ServicesConfig,
     buffer_bytes: u64,
@@ -397,6 +400,17 @@ pub fn fsm_lag_from_setting(setting: u64, buffer_bytes: u64, max_payload: usize)
 
 /// One max-size frame ON THIS HOST: the lockstep sentinel's value, and the
 /// FLOOR every finite byte bound is clamped up to.
+///
+/// Since jumbo (spec §7.1/§7.2) "max-size" means the LIVE payload ceiling —
+/// `min(bound, payload_ceiling(committed rung, crypto))`, what
+/// `Appender::append` will actually accept right now — and NOT
+/// `NodeConfig::max_payload`, which is the bound the ring is SIZED for
+/// (`payload_ceiling(MTU_BOUND, crypto)`, 8896/8864). The two are the same
+/// number only once the cluster has committed the top rung. Every caller in
+/// `node.rs` passes `buffer.payload_ceiling()`; passing the bound instead
+/// opens a lockstep door ~6.6x wider than one appendable frame on a cluster
+/// still at the 1408 B baseline, which is not "at most one frame past the
+/// FSMs" in any sense.
 ///
 /// It is the minimum survivable runway. `report_ceiling` caps this node's
 /// attested frontier at `min_applied + lag`, commit is the quorum-th such
@@ -685,6 +699,69 @@ mod tests {
             ),
             Some(64)
         );
+    }
+
+    /// Jumbo spec §7.1/§7.2: under `FsmLag::Lockstep` the door is ONE
+    /// LIVE-CEILING frame, so it moves with the committed rung — it does NOT
+    /// sit at one BOUND-sized frame from boot.
+    ///
+    /// The numbers are the whole point. `NodeConfig::max_payload` is now
+    /// `payload_ceiling(MTU_BOUND, crypto)` (8896 / 8864), while a cluster
+    /// that has not raised its rung admits `payload_ceiling(MTU_DEFAULT,
+    /// crypto)` (1344 / 1312). Feeding the bound here would call 8928 bytes
+    /// of lag "at most one frame" on a log whose largest possible frame is
+    /// 1376 — a ~6.5x silent loosening of the tightest pacing policy UC
+    /// offers, on every node, from the moment jumbo shipped. `node.rs` feeds
+    /// `buffer.payload_ceiling()`; this pins what that has to yield at both
+    /// ends of the ladder.
+    #[test]
+    fn the_lockstep_floor_is_one_live_ceiling_frame_at_each_rung() {
+        use uc_protocol::v2::datagram::{MTU_BOUND, MTU_DEFAULT, payload_ceiling};
+        let b = 4u64 << 20;
+        let lockstep = ServicesConfig::from_names(&["a"], Some(FsmLag::Lockstep)).unwrap();
+        let floor = |ceiling: usize| Some(align_frame_len(HEADER_LEN + ceiling) as u64);
+
+        // Crypto OFF: 1344 at the baseline rung, 8896 at the top.
+        assert_eq!(payload_ceiling(MTU_DEFAULT, false), 1344);
+        assert_eq!(payload_ceiling(MTU_BOUND, false), 8896);
+        assert_eq!(
+            fsm_lag_eff(&lockstep, b, payload_ceiling(MTU_DEFAULT, false)),
+            floor(1344)
+        );
+        assert_eq!(fsm_lag_eff(&lockstep, b, 1344), Some(1376));
+        assert_eq!(
+            fsm_lag_eff(&lockstep, b, payload_ceiling(MTU_BOUND, false)),
+            floor(8896)
+        );
+        assert_eq!(fsm_lag_eff(&lockstep, b, 8896), Some(8928));
+
+        // Crypto ON: the tag takes the ceiling one aligned step down at both
+        // rungs, so the frame is one alignment step smaller too.
+        assert_eq!(payload_ceiling(MTU_DEFAULT, true), 1312);
+        assert_eq!(payload_ceiling(MTU_BOUND, true), 8864);
+        assert_eq!(
+            fsm_lag_eff(&lockstep, b, payload_ceiling(MTU_DEFAULT, true)),
+            floor(1312)
+        );
+        assert_eq!(fsm_lag_eff(&lockstep, b, 1312), Some(1344));
+        assert_eq!(
+            fsm_lag_eff(&lockstep, b, payload_ceiling(MTU_BOUND, true)),
+            floor(8864)
+        );
+        assert_eq!(fsm_lag_eff(&lockstep, b, 8864), Some(8896));
+
+        // The same term is the FLOOR every finite byte bound is clamped up
+        // to, so the replicated-settings path moves with the rung too.
+        assert_eq!(fsm_lag_from_setting(1, b, 1344), Some(1376));
+        assert_eq!(fsm_lag_from_setting(1, b, 8896), Some(8928));
+        assert_eq!(fsm_lag_from_setting(2048, b, 1344), Some(2048));
+        assert_eq!(
+            fsm_lag_from_setting(2048, b, 8896),
+            Some(8928),
+            "a bound below one live frame is raised, not honoured"
+        );
+        assert_eq!(page_lag_from_setting(2048, b, 1344), 2048);
+        assert_eq!(page_lag_from_setting(2048, b, 8896), 8928);
     }
 
     /// Cluster-FSM settings (spec §6): the effective-lag arithmetic over a
