@@ -72,7 +72,13 @@ impl ProtocolVersion {
 // (`SNAP_BEGIN_LAYOUT_V2_RETIRED`). As with 0.6.0 this alters only the snapshot-
 // session body; the flag day rests on the standing operational rule, not a
 // version gate.
-pub const CURRENT: ProtocolVersion = ProtocolVersion::new(0, 7, 0);
+// 0.8.0 (jumbo frames, spec §4.2): two new pairwise datagram kinds,
+// `DGRAM_KIND_PROBE = 24` (a path-MTU probe padded to the rung it tests) and
+// `DGRAM_KIND_PROBE_ACK = 25` (the rung acknowledged plus the responder's own
+// verified minimum). No existing layout changes. A 0.7.0 peer counts both as
+// unknown kinds and drops them, so a mixed cluster never raises its ceiling —
+// safe, and unsupported anyway (flag-day rule). Ships in `2.12.0`.
+pub const CURRENT: ProtocolVersion = ProtocolVersion::new(0, 8, 0);
 pub const MIN_COMPATIBLE: ProtocolVersion = ProtocolVersion::new(0, 1, 0);
 
 #[cfg(test)]
@@ -109,7 +115,7 @@ mod tests {
     }
 
     #[test]
-    fn current_is_the_fsm_identity_wire() {
-        assert_eq!(CURRENT, ProtocolVersion::new(0, 7, 0));
+    fn current_is_the_jumbo_frame_wire() {
+        assert_eq!(CURRENT, ProtocolVersion::new(0, 8, 0));
     }
 }

@@ -54,6 +54,49 @@ const _: () = assert!(
         <= MAX_PAYLOAD_DEFAULT
 );
 
+/// Jumbo spec §4.1: the fixed ladder of UC datagram sizes discovery tests,
+/// smallest first. `RUNGS[0]` is `MTU_DEFAULT`, the baseline every cluster
+/// starts from; 8832 fits GCP (8896 B) over IPv4 and both clouds over IPv6;
+/// 8960 fits AWS (9001 B) over IPv4. FROZEN once shipped: a new fabric adds
+/// a rung, it never renumbers one.
+pub const RUNGS: [u32; 3] = [1408, 8832, 8960];
+/// The largest datagram UC will ever send — `RUNGS`' last entry. Sizes the
+/// sender's scratch buffers and bounds a single frame.
+pub const MTU_BOUND: usize = RUNGS[RUNGS.len() - 1] as usize;
+/// What `force_jumbo_frames` demands: the lowest rung both clouds carry on
+/// both address families (spec §4.1).
+pub const JUMBO_MIN_RUNG: u32 = 8832;
+const _: () = assert!(RUNGS[0] as usize == MTU_DEFAULT);
+const _: () = assert!(RUNGS[0] < RUNGS[1] && RUNGS[1] < RUNGS[2]);
+
+/// Is `v` one of the ladder's rungs? The only values `Settings::datagram_mtu`
+/// may carry besides `0`.
+pub const fn is_rung(v: u32) -> bool {
+    let mut i = 0;
+    while i < RUNGS.len() {
+        if RUNGS[i] == v {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// The command payload ceiling at a given datagram size, for either crypto
+/// mode — [`max_payload_for_mtu`]'s crypto-aware sibling (that one is the
+/// crypto-ON figure, used where a single crypto-safe default is wanted).
+pub const fn payload_ceiling(rung: usize, crypto_on: bool) -> usize {
+    let overhead = if crypto_on {
+        crate::v2::crypto::CRYPTO_OVERHEAD
+    } else {
+        0
+    };
+    let budget = rung - DATAGRAM_HEADER_LEN - overhead;
+    let aligned = budget & !(crate::v2::frame::FRAME_ALIGNMENT - 1);
+    aligned - crate::v2::frame::HEADER_LEN
+}
+const _: () = assert!(payload_ceiling(MTU_DEFAULT, true) == MAX_PAYLOAD_DEFAULT);
+
 pub const OFF_DGRAM_POSITION: usize = 0; // u64 LE — meaning depends on kind
 pub const OFF_DGRAM_TERM_ID: usize = 8; // u32 LE — leadership_term_id
 pub const OFF_DGRAM_KIND: usize = 12; // u8
@@ -429,6 +472,61 @@ pub const DGRAM_KIND_SNAP_REQUEST: u8 = 22;
 /// waiting on a fetch) with a redirect to a learner that can. Body =
 /// [`SnapRedirectBody`]; the joiner sends its `SNAP_REQUEST` there.
 pub const DGRAM_KIND_SNAP_REDIRECT: u8 = 23;
+
+/// Jumbo spec §4.2: a path-MTU probe. Body = `rung: u32 LE` followed by zero
+/// padding so the WHOLE datagram (sealed length, with crypto on) is exactly
+/// `rung` bytes. A responder credits it only if the received length equals
+/// `rung` — a fragmented-and-reassembled or truncated arrival is not a proof.
+/// `Scope::Pairwise`. Header `position` is unused (zero).
+pub const DGRAM_KIND_PROBE: u8 = 24;
+/// Jumbo spec §4.2: the answer. Body = [`ProbeAckBody`]: the rung being
+/// acknowledged plus the responder's OWN verified minimum over its peers, so
+/// the leader learns every pair's result without a second exchange.
+/// `Scope::Pairwise`.
+pub const DGRAM_KIND_PROBE_ACK: u8 = 25;
+
+/// The fixed prefix of a `PROBE` body: the rung, `u32 LE`. Everything after it
+/// is padding and carries nothing.
+pub const PROBE_RUNG_LEN: usize = 4;
+
+pub fn write_probe_rung(buf: &mut [u8], rung: u32) {
+    buf[0..4].copy_from_slice(&rung.to_le_bytes());
+}
+
+/// The rung a `PROBE` body claims, or `None` if the body is shorter than
+/// [`PROBE_RUNG_LEN`]. The LENGTH check against that claim is the receiver's.
+pub fn read_probe_rung(buf: &[u8]) -> Option<u32> {
+    if buf.len() < PROBE_RUNG_LEN {
+        return None;
+    }
+    Some(u32::from_le_bytes(buf[0..4].try_into().unwrap()))
+}
+
+pub const PROBE_ACK_BODY_LEN: usize = 8;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProbeAckBody {
+    /// The rung of the probe this acknowledges.
+    pub rung: u32,
+    /// The responder's own verified minimum over ITS configured peers
+    /// (spec §5.2); `0` while any of them is unresolved.
+    pub own_min_rung: u32,
+}
+
+pub fn write_probe_ack_body(buf: &mut [u8], b: &ProbeAckBody) {
+    buf[0..4].copy_from_slice(&b.rung.to_le_bytes());
+    buf[4..8].copy_from_slice(&b.own_min_rung.to_le_bytes());
+}
+
+pub fn read_probe_ack_body(buf: &[u8]) -> Option<ProbeAckBody> {
+    if buf.len() < PROBE_ACK_BODY_LEN {
+        return None;
+    }
+    Some(ProbeAckBody {
+        rung: u32::from_le_bytes(buf[0..4].try_into().unwrap()),
+        own_min_rung: u32::from_le_bytes(buf[4..8].try_into().unwrap()),
+    })
+}
 
 pub const SNAP_NAK_BODY_LEN: usize = 16;
 
@@ -1224,5 +1322,54 @@ mod tests {
         // third documented failure mode; must not panic on slicing)
         assert!(read_term_map_body(&buf[..TERM_MAP_HEADER_LEN - 1], &mut out).is_none());
         assert!(read_term_map_body(&[], &mut out).is_none());
+    }
+
+    /// FROZEN once shipped (jumbo spec §4.1): the ladder, the bound, and the
+    /// ceilings the table in the spec promises for each rung.
+    #[test]
+    fn rungs_and_ceilings_are_pinned() {
+        assert_eq!(RUNGS, [1408, 8832, 8960]);
+        assert_eq!(RUNGS[0] as usize, MTU_DEFAULT);
+        assert_eq!(MTU_BOUND, 8960);
+        assert_eq!(JUMBO_MIN_RUNG, 8832);
+        assert!(is_rung(1408) && is_rung(8832) && is_rung(8960));
+        assert!(!is_rung(0) && !is_rung(1500) && !is_rung(9001));
+        // crypto-off / crypto-on ceilings, spec §4.1 table
+        assert_eq!(payload_ceiling(1408, false), 1344);
+        assert_eq!(payload_ceiling(1408, true), 1312);
+        assert_eq!(payload_ceiling(8832, false), 8768);
+        assert_eq!(payload_ceiling(8832, true), 8736);
+        assert_eq!(payload_ceiling(8960, false), 8896);
+        assert_eq!(payload_ceiling(8960, true), 8864);
+        // The crypto-on figure at the baseline IS today's default.
+        assert_eq!(payload_ceiling(MTU_DEFAULT, true), MAX_PAYLOAD_DEFAULT);
+        assert_eq!(
+            payload_ceiling(MTU_DEFAULT, true),
+            max_payload_for_mtu(MTU_DEFAULT)
+        );
+    }
+
+    /// FROZEN once shipped (jumbo spec §4.2): kind numbers and both bodies,
+    /// with absolute wire pins like `control_bodies_roundtrip`.
+    #[test]
+    fn probe_kinds_and_bodies_are_pinned() {
+        assert_eq!(DGRAM_KIND_PROBE, 24);
+        assert_eq!(DGRAM_KIND_PROBE_ACK, 25);
+        assert_eq!(PROBE_RUNG_LEN, 4);
+        assert_eq!(PROBE_ACK_BODY_LEN, 8);
+        let mut b = [0u8; PROBE_RUNG_LEN];
+        write_probe_rung(&mut b, 8832);
+        assert_eq!(b, [0x80, 0x22, 0, 0]); // 8832 = 0x2280 LE
+        assert_eq!(read_probe_rung(&b), Some(8832));
+        assert_eq!(read_probe_rung(&b[..3]), None);
+        let a = ProbeAckBody {
+            rung: 8960,
+            own_min_rung: 1408,
+        };
+        let mut buf = [0u8; PROBE_ACK_BODY_LEN];
+        write_probe_ack_body(&mut buf, &a);
+        assert_eq!(read_probe_ack_body(&buf), Some(a));
+        assert_eq!(buf, [0, 0x23, 0, 0, 0x80, 0x05, 0, 0]); // 8960 = 0x2300, 1408 = 0x0580
+        assert_eq!(read_probe_ack_body(&buf[..7]), None);
     }
 }

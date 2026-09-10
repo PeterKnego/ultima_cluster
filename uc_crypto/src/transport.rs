@@ -150,10 +150,11 @@ use uc_protocol::v2::crypto::{DGRAM_KIND_HS_INIT, DGRAM_KIND_HS_KEY, DGRAM_KIND_
 use uc_protocol::v2::datagram::{
     DATAGRAM_HEADER_LEN, DGRAM_KIND_APPEND_POSITION, DGRAM_KIND_COMMIT_POSITION,
     DGRAM_KIND_CONFIG_PROPOSAL, DGRAM_KIND_CONFIG_REPLY, DGRAM_KIND_DATA, DGRAM_KIND_HEARTBEAT,
-    DGRAM_KIND_NAK, DGRAM_KIND_READ_PROBE, DGRAM_KIND_READ_PROBE_ACK, DGRAM_KIND_REQUEST_VOTE,
-    DGRAM_KIND_SNAP_BEGIN, DGRAM_KIND_SNAP_CHUNK, DGRAM_KIND_SNAP_DONE, DGRAM_KIND_SNAP_NAK,
-    DGRAM_KIND_SNAP_REDIRECT, DGRAM_KIND_SNAP_REQUEST, DGRAM_KIND_STATUS, DGRAM_KIND_TERM_MAP,
-    DGRAM_KIND_VOTE, OFF_DGRAM_KEY_EPOCH, read_datagram_header,
+    DGRAM_KIND_NAK, DGRAM_KIND_PROBE, DGRAM_KIND_PROBE_ACK, DGRAM_KIND_READ_PROBE,
+    DGRAM_KIND_READ_PROBE_ACK, DGRAM_KIND_REQUEST_VOTE, DGRAM_KIND_SNAP_BEGIN,
+    DGRAM_KIND_SNAP_CHUNK, DGRAM_KIND_SNAP_DONE, DGRAM_KIND_SNAP_NAK, DGRAM_KIND_SNAP_REDIRECT,
+    DGRAM_KIND_SNAP_REQUEST, DGRAM_KIND_STATUS, DGRAM_KIND_TERM_MAP, DGRAM_KIND_VOTE,
+    OFF_DGRAM_KEY_EPOCH, read_datagram_header,
 };
 use zeroize::Zeroizing;
 
@@ -322,7 +323,12 @@ impl Transport {
             | DGRAM_KIND_SNAP_REQUEST
             | DGRAM_KIND_SNAP_REDIRECT
             | DGRAM_KIND_CONFIG_PROPOSAL
-            | DGRAM_KIND_CONFIG_REPLY => Scope::Pairwise,
+            | DGRAM_KIND_CONFIG_REPLY
+            // Jumbo spec §4.2: a probe is one-to-one, and its ack must be
+            // authenticated so a forged ack cannot raise the ceiling. Named
+            // here (the catch-all already says Pairwise) to keep the inventory.
+            | DGRAM_KIND_PROBE
+            | DGRAM_KIND_PROBE_ACK => Scope::Pairwise,
 
             // Bootstrap: no session exists yet, so neither AEAD scope
             // applies — see [`Scope::Unsealed`]'s doc. Named explicitly
@@ -1815,6 +1821,14 @@ mod tests {
         assert_eq!(Transport::scope_of(DGRAM_KIND_HS_INIT), Scope::Unsealed);
         assert_eq!(Transport::scope_of(DGRAM_KIND_HS_RESP), Scope::Unsealed);
         assert_eq!(Transport::scope_of(DGRAM_KIND_HS_KEY), Scope::Pairwise);
+    }
+
+    #[test]
+    fn probe_kinds_are_pairwise() {
+        // Jumbo spec §4.2: a probe is one-to-one, and its ack must be
+        // authenticated so a forged ack cannot raise the ceiling.
+        assert_eq!(Transport::scope_of(DGRAM_KIND_PROBE), Scope::Pairwise);
+        assert_eq!(Transport::scope_of(DGRAM_KIND_PROBE_ACK), Scope::Pairwise);
     }
 
     #[test]
