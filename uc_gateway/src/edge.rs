@@ -130,8 +130,9 @@ use crate::watch::LeaderWatch;
 
 /// The node's control page under an instance directory. Same well-known name
 /// `uc_node::InstanceDir` writes and `uc_client::Engine` opens; the edge
-/// opens it a second time purely to learn the node's `max_payload`, which the
-/// `Engine` inherits but does not expose.
+/// opens it a second time purely to read the node's live payload ceiling
+/// (and its `max_payload` header bound as a fallback), which the `Engine`
+/// follows but does not expose.
 const CNC_FILE: &str = "cnc2.dat";
 
 /// The `Sessioned` response tag, mirrored from `uc_service::session` — the
@@ -349,9 +350,13 @@ struct Shared {
     /// Reference instant for `Conn::last_write_ns`, so the status timer costs
     /// one `u64` per connection instead of a locked `Instant`.
     t0: Instant,
-    /// The node's own payload bound, read off the cnc page. Enforced here,
-    /// before `try_submit`, so an oversized frame never touches the ring.
-    max_payload: usize,
+    /// The node's control page, held open for the LIVE ceiling word. Read per
+    /// frame by [`Shared::live_max_payload`].
+    cnc: Arc<CncPage>,
+    /// Jumbo spec §7.3: the cnc header's `max_payload` — the BOUND the node
+    /// sized its buffers for, read once at start. Only a fallback, for a page
+    /// that carries no live ceiling word (cnc 3.1) and reads 0 there.
+    header_max_payload: usize,
     /// The total outstanding grant this edge will hand out across every
     /// connection — [`budget_for`] of the `Engine` window. Fixed at start;
     /// what moves is how it is divided.
@@ -400,6 +405,17 @@ impl Shared {
 
     fn stopping(&self) -> bool {
         self.stop.load(Ordering::Relaxed)
+    }
+
+    /// Jumbo spec §7.3: the node's LIVE command payload ceiling, one Acquire
+    /// load off the cnc page. Read per frame, never cached — an edge started
+    /// before the cluster raised its ceiling must widen its door with it. A
+    /// 3.1-era page (0 here) falls back to the header bound.
+    fn live_max_payload(&self) -> usize {
+        match self.cnc.payload_ceiling() {
+            0 => self.header_max_payload,
+            c => c as usize,
+        }
     }
 
     /// The `REDIRECT`/`LEADER_CHANGED` target for a node id, if we know its
@@ -776,17 +792,18 @@ impl Edge {
     pub fn start(cfg: EdgeConfig) -> Result<Edge, EdgeError> {
         cfg.validate()?;
 
-        // The node's own payload bound. `Engine` inherits it internally but
+        // The node's own payload ceiling. `Engine` follows it internally but
         // does not expose it, and the edge needs the number *before*
         // `try_submit` so an oversized frame is refused without ever reaching
-        // the ingress ring (spec §4.3).
+        // the ingress ring (spec §4.3). The page is KEPT (jumbo spec §7.3):
+        // the ceiling is live, so the edge reads it per frame rather than
+        // copying it here.
         let cnc = CncPage::open_file(&cfg.instance_dir.join(CNC_FILE), &cfg.app_id)
             .map_err(|e| EdgeError::Attach(ClientError::from(e)))?;
-        let max_payload = cnc
+        let header_max_payload = cnc
             .try_meta()
             .ok_or_else(|| EdgeError::Attach(ClientError::from(uc_log::cnc::CncError::BadHeader)))?
             .max_payload as usize;
-        drop(cnc);
 
         let (send, poll) = Engine::attach(
             &cfg.instance_dir,
@@ -819,7 +836,8 @@ impl Edge {
             stats: StatCells::default(),
             stop: AtomicBool::new(false),
             t0: Instant::now(),
-            max_payload,
+            cnc,
+            header_max_payload,
             budget,
             live: AtomicU32::new(0),
             regrant: AtomicBool::new(false),
@@ -1315,17 +1333,17 @@ fn dispatch(
 
     // The envelope rides inside the node's payload budget, so it counts.
     //
-    // This check is redundant by design: the `Engine` inherits the same bound
-    // from the cnc page and refuses an oversized payload itself
+    // This check is redundant by design: the `Engine` reads the same live cnc
+    // ceiling and refuses an oversized payload itself
     // (`uc_client/src/engine.rs`, `SendHalf::send`), and the arm below handles
     // that refusal identically. It is kept as belt-and-braces because the
     // spec's wording is a *guarantee about the ring* ("payload > the node's
-    // max_payload → refused before touching the ring"), and a guarantee that
+    // ceiling → refused before touching the ring"), and a guarantee that
     // holds only because some other crate's private ordering happens to check
     // first is not one this edge can make. Both paths write the same frame.
     let envelope = shared.cfg.session_envelope && !is_query;
     let wire_len = payload.len() + if envelope { SESSION_HEADER_LEN } else { 0 };
-    if wire_len > shared.max_payload {
+    if wire_len > shared.live_max_payload() {
         // Terminal for the client — `RemoteClient` maps this reason to a hard
         // error and never re-sends. The ring is never touched.
         shared.write_retry(conn, h.seq, RETRY_PAYLOAD_TOO_LARGE, 0);

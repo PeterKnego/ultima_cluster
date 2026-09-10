@@ -74,14 +74,19 @@ pub struct EngineConfig {
     pub request_timeout: Duration,
     /// Client-side payload cap, checked before the ring write so an oversized
     /// submit fails loud here instead of being silently dropped downstream.
-    /// `None` (the default) INHERITS the attached node's own bound —
-    /// the `max_payload` of `cnc.try_meta()` — at `Engine::attach` time; `Some(n)` is an
-    /// explicit override. Inheriting matters because the node's bound is
-    /// typically MTU-bounded (a few hundred bytes — well under the ring's own
+    /// `None` (the default) follows the attached node's LIVE ceiling (the cnc
+    /// `payload_ceiling` word, read per submit), so a client attached before
+    /// the cluster raised its ceiling sees the raise; `Some(n)` pins the door
+    /// — the dev-time check the jumbo how-to describes. A page that predates
+    /// the word (cnc 3.1) reads 0 there and falls back to the header's
+    /// `max_payload` bound, taken once at `Engine::attach`.
+    ///
+    /// Following the node matters because its ceiling is MTU-bounded (a
+    /// thousand-odd bytes at the baseline rung — well under the ring's own
     /// ~64 KiB `TooLarge` ceiling): without it, a submit that clears the
-    /// ring's door but exceeds the node's own `max_payload` is silently
-    /// dropped by the node rather than rejected here, and the caller only
-    /// finds out via the request timing out.
+    /// ring's door but exceeds the node's own ceiling is silently dropped by
+    /// the node rather than rejected here, and the caller only finds out via
+    /// the request timing out.
     pub max_payload: Option<usize>,
     /// Refuse `try_submit`/`try_query` when the node's `NODE_FLAG_CAN_SERVE`
     /// is clear (`SubmitError::NotServing`) instead of free-running into a
@@ -210,7 +215,14 @@ struct Shared {
     restart: Mutex<Option<(u128, u128)>>,
     t0: Instant,
     timeout_ns: u64,
+    /// The caller's explicit door OVERRIDE (`EngineConfig::max_payload`), or
+    /// `None` to follow the node's live cnc ceiling per submit.
     max_payload: Option<usize>,
+    /// Jumbo spec §7.3: the cnc header's `max_payload` — the BOUND the node
+    /// sized its buffers for, read once at attach. Only a fallback: it is the
+    /// door solely for a page that carries no live ceiling word (cnc 3.1, or
+    /// a synthetic harness page), which reads 0 there.
+    header_max_payload: usize,
     serving_gate: bool,
     /// M14b: bit `i` set ⇔ FSM `i` exists on the attached node. A page
     /// reading 0 (a harness node) folds to `0b1`.
@@ -351,10 +363,12 @@ impl Engine {
         // would have raised rather than panicking the attaching process.
         let meta = cnc.try_meta().ok_or(uc_log::cnc::CncError::BadHeader)?;
         let instance_id = meta.instance_id;
-        // Door default: explicit `Some` overrides; `None` inherits the
-        // attached node's own bound from the cnc page (see EngineConfig::
-        // max_payload's doc for why this matters).
-        let max_payload = cfg.max_payload.or(Some(meta.max_payload as usize));
+        // Door: an explicit `Some` pins it; `None` follows the node's LIVE
+        // ceiling word, read per submit (see `EngineConfig::max_payload`).
+        // The header bound comes along as the fallback for a page with no
+        // ceiling word.
+        let max_payload = cfg.max_payload;
+        let header_max_payload = meta.max_payload as usize;
         let (ingress, _ic) = MpscRing::open(&instance_dir.join(INGRESS_RING))?.into_split();
         let (query, _qc) = MpscRing::open(&instance_dir.join(QUERY_RING))?.into_split();
         // M14b: which FSMs exist here. A page reading 0 is a harness node
@@ -412,6 +426,7 @@ impl Engine {
             t0: Instant::now(),
             timeout_ns: cfg.request_timeout.as_nanos() as u64,
             max_payload,
+            header_max_payload,
             serving_gate: cfg.serving_gate,
             declared,
             names,
@@ -461,9 +476,16 @@ impl SendHalf {
         // The cap describes the WIRE payload (deviation 6): a query carries
         // its one-byte service id.
         let wire_len = bytes.len() + usize::from(prefix.is_some());
-        if let Some(max) = s.max_payload
-            && wire_len > max
-        {
+        let max = match s.max_payload {
+            Some(m) => m,
+            // Jumbo spec §7.3: the node's LIVE ceiling, one Acquire load. A
+            // 3.1-era page (0 here) falls back to the header bound.
+            None => match s.cnc.payload_ceiling() {
+                0 => s.header_max_payload,
+                c => c as usize,
+            },
+        };
+        if wire_len > max {
             return Err(SubmitError::PayloadTooLarge { len: wire_len, max });
         }
         let deadline_ns = s.t0.elapsed().as_nanos() as u64 + s.timeout_ns;

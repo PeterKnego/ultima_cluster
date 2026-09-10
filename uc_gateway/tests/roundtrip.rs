@@ -235,3 +235,59 @@ fn an_oversized_submit_is_refused_with_payload_too_large() {
     node.stop();
     svc.stop();
 }
+
+/// Jumbo spec §7.3: the edge's door is the node's LIVE cnc ceiling word, read
+/// per frame — an edge started BEFORE the cluster raised its ceiling refuses
+/// what the old ceiling refused and accepts what the new one allows, without
+/// being restarted.
+#[test]
+fn the_edge_door_follows_the_live_cnc_ceiling() {
+    let root = common::tempdir();
+    let (node, dir) = common::start_single_node(root.path());
+    let svc = ServiceBuilder::new(
+        ServiceConfig::new(&dir, common::APP),
+        Sessioned::new(RegisterSm::default(), SessionConfig::default()),
+    )
+    .start()
+    .unwrap();
+    common::await_serving(&node, 10);
+
+    // One ordinary write, and the wire length the edge measures it at: the
+    // session envelope rides inside the node's payload budget.
+    let cmd = enc(&Cmd::Write(7));
+    let wire = cmd.len() + 16;
+
+    // Shut the door one byte below that frame, BEFORE the edge starts — so
+    // the edge's attach-time header bound (256, the rig's `max_payload`)
+    // differs from the live word and only reading the live word can refuse.
+    let page = uc_log::cnc::CncPage::open_file(&dir.join("cnc2.dat"), common::APP).unwrap();
+    common::park_payload_ceiling(&node, &page, wire as u64 - 1);
+
+    let edge = Edge::start(edge_config(&dir, true)).unwrap();
+    let client = RemoteClient::connect(remote_config(&edge)).unwrap();
+
+    let err = client.submit(&cmd).unwrap().wait().unwrap_err();
+    assert!(
+        matches!(err, uc_remote::RemoteError::PayloadTooLarge),
+        "expected a terminal PayloadTooLarge below the live ceiling, got {err:?}"
+    );
+    assert_eq!(
+        edge.stats().submits,
+        0,
+        "the refused frame never reached the ring"
+    );
+
+    // The ceiling moves under the live edge: the same frame now goes through,
+    // all the way to the node and back.
+    page.store_payload_ceiling(256);
+    let r = client.submit(&cmd).unwrap().wait().unwrap();
+    assert_eq!(dec(&r.bytes), CmdResp::WriteAck);
+    assert_eq!(edge.stats().submits, 1);
+
+    client.shutdown();
+    edge.stop();
+    // `Edge::stop` joins every thread it started — hold it to that.
+    common::assert_no_gateway_threads();
+    node.stop();
+    svc.stop();
+}

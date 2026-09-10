@@ -64,6 +64,20 @@ fn make_instance_two_fsms(dir: &Path, app_id: &str) {
     BroadcastRing::create(&dir.join("egress_node.broadcast"), MIB, 128).unwrap();
 }
 
+/// A synthetic dir whose rings accept records big enough for the live-ceiling
+/// test's 200-byte submits (`make_instance`'s 128-byte record cap would refuse
+/// one in the RING, which would hide what that test is about), and whose cnc
+/// page handle is returned so the test can move the ceiling word under an
+/// already-attached engine.
+fn make_instance_wide(dir: &Path, app_id: &str) -> std::sync::Arc<CncPage> {
+    let page = CncPage::create_file(&dir.join("cnc2.dat"), &meta(app_id)).unwrap();
+    MpscRing::create(&dir.join("ingress.ring"), MIB, 512).unwrap();
+    MpscRing::create(&dir.join("query.ring"), MIB, 512).unwrap();
+    BroadcastRing::create(&dir.join("egress_service.0.broadcast"), MIB, 512).unwrap();
+    BroadcastRing::create(&dir.join("egress_node.broadcast"), MIB, 512).unwrap();
+    page
+}
+
 /// Egress producer for FSM `id`'s ring.
 fn egress_for(dir: &Path, id: u8) -> uc_protocol::ring::BroadcastProducer {
     BroadcastRing::open(&dir.join(format!("egress_service.{id}.broadcast")))
@@ -196,10 +210,12 @@ fn payload_too_large_fails_loud_at_the_door() {
 }
 
 #[test]
-fn max_payload_defaults_to_the_attached_nodes_cnc_bound() {
-    // cfg().max_payload is None (inherit); the synthetic cnc's max_payload is
-    // 256 (see `meta`) — a 300-byte submit must fail loud at attach-derived
-    // bound, not be silently accepted (and later dropped by a real node).
+fn max_payload_falls_back_to_the_cnc_header_bound() {
+    // cfg().max_payload is None, so the door is the node's LIVE ceiling word —
+    // and a synthetic page (like any cnc 3.1-era page) reads 0 there, which
+    // falls back to the header's `max_payload`, 256 (see `meta`). A 300-byte
+    // submit must fail loud at that bound, not be silently accepted (and later
+    // dropped by a real node).
     let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     make_instance(dir.path(), "eng-inherit", 1 << 20, 1 << 20);
     let (s, _p) = Engine::attach(dir.path(), "eng-inherit", cfg()).unwrap();
@@ -208,6 +224,45 @@ fn max_payload_defaults_to_the_attached_nodes_cnc_bound() {
         other => panic!("{other:?}"),
     }
     assert_eq!(s.inflight(), 0, "refused submit must not hold a slot");
+}
+
+/// Jumbo spec §7.3: the submit door follows the LIVE cnc ceiling word, read
+/// once per submit — so a client that attached BEFORE the cluster raised its
+/// ceiling sees the raise without reattaching. An explicit `max_payload` still
+/// pins the door regardless of what the page says.
+#[test]
+fn the_submit_door_follows_the_live_cnc_word() {
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let page = make_instance_wide(dir.path(), "eng-live");
+    page.store_payload_ceiling(128);
+
+    let (s, _p) = Engine::attach(dir.path(), "eng-live", cfg()).unwrap();
+    match s.try_submit(1, &[0u8; 200]) {
+        Err(SubmitError::PayloadTooLarge { len: 200, max: 128 }) => {}
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(s.inflight(), 0, "refused submit must not hold a slot");
+
+    // The ceiling moves under the already-attached engine.
+    page.store_payload_ceiling(256);
+    s.try_submit(2, &[0u8; 200])
+        .expect("the raised ceiling opens the door for a live client");
+
+    // An explicit override wins over the page in both directions: the page
+    // says 256, the caller said 64, and 64 is the door.
+    let (o, _po) = Engine::attach(
+        dir.path(),
+        "eng-live",
+        EngineConfig {
+            max_payload: Some(64),
+            ..cfg()
+        },
+    )
+    .unwrap();
+    match o.try_submit(3, &[0u8; 200]) {
+        Err(SubmitError::PayloadTooLarge { len: 200, max: 64 }) => {}
+        other => panic!("{other:?}"),
+    }
 }
 
 // Consistency is exercised indirectly here — try_query isn't hit by the
