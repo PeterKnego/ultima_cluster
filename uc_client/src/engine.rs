@@ -374,6 +374,13 @@ impl Engine {
         // does not synthesize a name).
         let names = cnc.service_names();
         let raw = cnc.services_declared();
+        // Names with no declared set is the node MID-BOOT (between its
+        // `create_file` and `store_services_declared`), not a harness page:
+        // the `(0, _) => 0b1` fold below would pin this client to FSM 0 for
+        // life on a node that is about to declare more. Refuse by name.
+        if raw == 0 && names.iter().any(Option::is_some) {
+            return Err(ClientError::NodeBooting);
+        }
         let masked = raw & ((1u64 << CNC_MAX_SERVICES) - 1);
         let declared = match (raw, masked) {
             (0, _) => 0b1,
@@ -1103,6 +1110,33 @@ mod tests {
         BroadcastRing::create(&dir.join(egress_service_ring(0)), MIB, 128).unwrap();
         BroadcastRing::create(&dir.join(egress_service_ring(1)), MIB, 128).unwrap();
         BroadcastRing::create(&dir.join(EGRESS_NODE), MIB, 128).unwrap();
+    }
+
+    /// Names on line 7 with `services_declared == 0` is the node mid-boot
+    /// (between `create_file` and `store_services_declared`), not a harness
+    /// page; folding it to FSM 0 would leave this client believing a
+    /// two-FSM node has one FSM for the attachment's life. Refuse by name.
+    #[test]
+    fn names_present_with_declared_zero_is_refused_as_booting() {
+        let dir = tempfile::tempdir_in(scratch_base()).unwrap();
+        let mut services = [None; uc_protocol::v2::cnc::CNC_MAX_SERVICES];
+        services[0] = Some(FsmName::parse("kv").unwrap());
+        services[1] = Some(FsmName::parse("orders").unwrap());
+        let m = uc_log::cnc::CncMeta {
+            services,
+            ..meta("boot-gap")
+        };
+        let _page = uc_log::cnc::CncPage::create_file(&dir.path().join(CNC_FILE), &m).unwrap();
+        // No `store_services_declared`: the node has not got there yet. The
+        // ingress/query rings exist (attach opens them before it reads the
+        // declared set), so the refusal is the gap's, not a missing file's.
+        const MIB: u64 = 1 << 20;
+        MpscRing::create(&dir.path().join(INGRESS_RING), MIB, 128).unwrap();
+        MpscRing::create(&dir.path().join(QUERY_RING), MIB, 256).unwrap();
+        match Engine::attach(dir.path(), "boot-gap", EngineConfig::default()) {
+            Err(ClientError::NodeBooting) => {}
+            other => panic!("expected NodeBooting, got {:?}", other.err()),
+        }
     }
 
     /// cnc 3.1: a page with real names on line 7 resolves `fsm(name)` to the

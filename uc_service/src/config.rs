@@ -90,6 +90,19 @@ pub enum ServiceError {
          []); the node's page carries no names — is the node older than cnc 3.1?"
     )]
     UnknownFsmNoNames { name: String },
+    /// The node is mid-boot: its page carries FSM names on line 7 but
+    /// `services_declared` still reads 0. `create_file` publishes a complete,
+    /// crc-valid header (names included) and the node stores the declared set
+    /// and lag policy a few statements later; a page with names and no
+    /// declared set exists ONLY in that gap — a configured node always
+    /// declares a nonzero set, and a harness page has no names. Attaching on
+    /// it would read the harness `(0, _) => Off` lag arm and fix `LagMode::Off`
+    /// for the attachment's life, silently, on a lockstep cluster.
+    #[error(
+        "the node is still initialising its cnc page (FSM names published, \
+         declared set not yet) — it is booting; retry the attach"
+    )]
+    NodeBooting,
     /// M14a: another live process holds `service.<row>.lock`.
     #[error(
         "another process already holds FSM {name:?} at row {row} on this \

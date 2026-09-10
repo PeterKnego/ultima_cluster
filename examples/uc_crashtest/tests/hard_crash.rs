@@ -178,6 +178,9 @@ fn submit_cmd(conn: &mut Conn, cmd: &Cmd, deadline: Instant) -> SubmitOutcome {
             // only a fresh attach can.
             Err(ClientError::InstanceRestart { .. })
             | Err(ClientError::Cnc(_))
+            // `NodeBooting` is attach-only; unreachable from a submit, and
+            // indeterminate is the answer that cannot fake "not committed".
+            | Err(ClientError::NodeBooting)
             | Err(ClientError::Ring(_))
             | Err(ClientError::Timeout(_))
             | Err(ClientError::ResponseOverwritten) => {
@@ -224,6 +227,9 @@ fn submit_all_cmd(conn: &mut Conn, cmd: &Cmd, deadline: Instant) -> SubmitOutcom
             // doc for why this matters specifically for a node restart.
             Err(ClientError::InstanceRestart { .. })
             | Err(ClientError::Cnc(_))
+            // `NodeBooting` is attach-only; unreachable from a submit, and
+            // indeterminate is the answer that cannot fake "not committed".
+            | Err(ClientError::NodeBooting)
             | Err(ClientError::Ring(_))
             | Err(ClientError::Timeout(_))
             | Err(ClientError::ResponseOverwritten) => {
@@ -277,6 +283,9 @@ fn submit_mixed(conn: &mut Conn, id: u8, cmd: &MixedCmd, deadline: Instant) -> S
             }
             Err(ClientError::InstanceRestart { .. })
             | Err(ClientError::Cnc(_))
+            // `NodeBooting` is attach-only; unreachable from a submit, and
+            // indeterminate is the answer that cannot fake "not committed".
+            | Err(ClientError::NodeBooting)
             | Err(ClientError::Ring(_))
             | Err(ClientError::Timeout(_))
             | Err(ClientError::ResponseOverwritten) => {
@@ -316,6 +325,9 @@ fn read_leader(conn: &mut Conn, deadline: Instant) -> ReadOutcome {
             // `ResponseOverwritten` also drop the client here.
             Err(ClientError::InstanceRestart { .. })
             | Err(ClientError::Cnc(_))
+            // `NodeBooting` is attach-only; unreachable from a submit, and
+            // indeterminate is the answer that cannot fake "not committed".
+            | Err(ClientError::NodeBooting)
             | Err(ClientError::Ring(_)) => {
                 conn.drop_client();
                 std::thread::sleep(Duration::from_millis(20));
@@ -525,6 +537,9 @@ fn worker2(
                             }
                             Err(ClientError::InstanceRestart { .. })
                             | Err(ClientError::Cnc(_))
+                            // `NodeBooting` is attach-only; unreachable from a submit, and
+                            // indeterminate is the answer that cannot fake "not committed".
+                            | Err(ClientError::NodeBooting)
                             | Err(ClientError::Ring(_)) => {
                                 conn.drop_client();
                                 std::thread::sleep(Duration::from_millis(20));
@@ -1450,6 +1465,9 @@ fn submit_cmd_multi(conn: &mut MultiConn, cmd: &Cmd, deadline: Instant) -> Submi
             }
             Err(ClientError::InstanceRestart { .. })
             | Err(ClientError::Cnc(_))
+            // `NodeBooting` is attach-only; unreachable from a submit, and
+            // indeterminate is the answer that cannot fake "not committed".
+            | Err(ClientError::NodeBooting)
             | Err(ClientError::Ring(_)) => {
                 conn.drop_client();
                 return SubmitOutcome::Indeterminate;
@@ -1494,6 +1512,9 @@ fn read_leader_multi(conn: &mut MultiConn, deadline: Instant) -> ReadOutcome {
             Err(ClientError::Retry) => std::thread::sleep(Duration::from_millis(15)),
             Err(ClientError::InstanceRestart { .. })
             | Err(ClientError::Cnc(_))
+            // `NodeBooting` is attach-only; unreachable from a submit, and
+            // indeterminate is the answer that cannot fake "not committed".
+            | Err(ClientError::NodeBooting)
             | Err(ClientError::Ring(_)) => {
                 conn.drop_client();
                 std::thread::sleep(Duration::from_millis(20));
@@ -2020,6 +2041,9 @@ fn timer_report_until_ok(dir: &Path, deadline: Instant) -> TimerReport {
                 }
                 Err(ClientError::InstanceRestart { .. })
                 | Err(ClientError::Cnc(_))
+                // `NodeBooting` is attach-only; unreachable from a submit, and
+                // indeterminate is the answer that cannot fake "not committed".
+                | Err(ClientError::NodeBooting)
                 | Err(ClientError::Ring(_))
                 | Err(ClientError::Timeout(_))
                 | Err(ClientError::ResponseOverwritten) => conn.drop_client(),

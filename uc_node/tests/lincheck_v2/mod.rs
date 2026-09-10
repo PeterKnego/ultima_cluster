@@ -1824,7 +1824,11 @@ pub fn submit_cmd<C: serde::Serialize, R: serde::de::DeserializeOwned>(
             // stale) client on a restart/attach fault so the next op reconnects.
             Err(ClientError::InstanceRestart { .. })
             | Err(ClientError::Cnc(_))
-            | Err(ClientError::Ring(_)) => {
+            | Err(ClientError::Ring(_))
+            // `NodeBooting` is attach-only and cannot come back from a submit;
+            // if it ever did, indeterminate is the answer that cannot fake a
+            // "not committed" and double-apply on retry.
+            | Err(ClientError::NodeBooting) => {
                 conn.drop_client();
                 return SubmitOutcome::Indeterminate;
             }
@@ -1882,7 +1886,11 @@ pub fn submit_all_cmd<C: serde::Serialize, R: serde::de::DeserializeOwned>(
             // Maybe-committed → indeterminate, NEVER retried.
             Err(ClientError::InstanceRestart { .. })
             | Err(ClientError::Cnc(_))
-            | Err(ClientError::Ring(_)) => {
+            | Err(ClientError::Ring(_))
+            // `NodeBooting` is attach-only and cannot come back from a submit;
+            // if it ever did, indeterminate is the answer that cannot fake a
+            // "not committed" and double-apply on retry.
+            | Err(ClientError::NodeBooting) => {
                 conn.drop_client();
                 return SubmitOutcome::Indeterminate;
             }
@@ -1940,7 +1948,11 @@ pub fn submit_cmd_to<C: serde::Serialize, R: serde::de::DeserializeOwned>(
             // Maybe-committed → indeterminate, NEVER retried.
             Err(ClientError::InstanceRestart { .. })
             | Err(ClientError::Cnc(_))
-            | Err(ClientError::Ring(_)) => {
+            | Err(ClientError::Ring(_))
+            // `NodeBooting` is attach-only and cannot come back from a submit;
+            // if it ever did, indeterminate is the answer that cannot fake a
+            // "not committed" and double-apply on retry.
+            | Err(ClientError::NodeBooting) => {
                 conn.drop_client();
                 return SubmitOutcome::Indeterminate;
             }
@@ -1989,7 +2001,11 @@ pub fn read_leader<Q: serde::Serialize, QR: serde::de::DeserializeOwned>(
             },
             Err(ClientError::Retry) => std::thread::sleep(Duration::from_millis(15)),
             Err(ClientError::InstanceRestart { .. }) | Err(ClientError::Cnc(_))
-            | Err(ClientError::Ring(_)) => {
+            | Err(ClientError::Ring(_))
+            // `NodeBooting` is attach-only and cannot come back from a submit;
+            // if it ever did, indeterminate is the answer that cannot fake a
+            // "not committed" and double-apply on retry.
+            | Err(ClientError::NodeBooting) => {
                 conn.drop_client();
                 std::thread::sleep(Duration::from_millis(20));
             }
@@ -2040,7 +2056,11 @@ pub fn read_leader_on<Q: serde::Serialize, QR: serde::de::DeserializeOwned>(
             Err(ClientError::Retry) => std::thread::sleep(Duration::from_millis(15)),
             Err(ClientError::InstanceRestart { .. })
             | Err(ClientError::Cnc(_))
-            | Err(ClientError::Ring(_)) => {
+            | Err(ClientError::Ring(_))
+            // `NodeBooting` is attach-only and cannot come back from a submit;
+            // if it ever did, indeterminate is the answer that cannot fake a
+            // "not committed" and double-apply on retry.
+            | Err(ClientError::NodeBooting) => {
                 conn.drop_client();
                 std::thread::sleep(Duration::from_millis(20));
             }

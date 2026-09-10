@@ -87,6 +87,17 @@ pub enum ClientError {
     /// and no in-range id is either.
     #[error("service id {id} is not declared on this node (declared set 0b{declared:b})")]
     ServiceNotDeclared { id: u8, declared: u64 },
+    /// The node is mid-boot: the page carries FSM names on line 7 but
+    /// `services_declared` still reads 0 — a state that exists only between
+    /// the node's `create_file` and its `store_services_declared` (a
+    /// configured node always declares a nonzero set; a harness page has no
+    /// names). Folding it to FSM 0 would leave this client believing a
+    /// multi-FSM node has one FSM for the attachment's life.
+    #[error(
+        "the node is still initialising its cnc page (FSM names published, \
+         declared set not yet) — it is booting; retry the attach"
+    )]
+    NodeBooting,
     /// cnc 3.1: `name` is not declared on the attached node's line 7 —
     /// [`crate::SendHalf::fsm`]/[`crate::Client::fsm`]/
     /// [`crate::PipelinedClient::fsm`] resolve a name to its row and refuse

@@ -83,7 +83,19 @@ pub(crate) fn attach<S: RawStateMachine>(
     // `services_declared == 0` and no names declared) rings row 0 for
     // whoever attaches — the pre-M14c multi-service-oblivious contract.
     let names = cnc.service_names();
-    let harness = cnc.services_declared() == 0 && names.iter().all(Option::is_none);
+    let raw_declared = cnc.services_declared();
+    let any_named = names.iter().any(Option::is_some);
+    // Names with no declared set is the node MID-BOOT — `create_file` has
+    // published the header (names included) and `store_services_declared`
+    // has not run yet. No configured node publishes that pair and no harness
+    // page has names, so it is unambiguous. Refuse rather than fall into the
+    // harness arm below, which would fix `LagMode::Off` for this attachment's
+    // life. The node stores `fsm_lag_bytes` BEFORE `services_declared`, so a
+    // nonzero declared set also proves the lag policy is already published.
+    if raw_declared == 0 && any_named {
+        return Err(ServiceError::NodeBooting);
+    }
+    let harness = raw_declared == 0 && !any_named;
     let row: u8 = if harness {
         0
     } else {
@@ -310,5 +322,103 @@ mod tests {
         assert_eq!(p.services_declared(), 0);
         assert_eq!(p.fsm_lag_bytes(), 0);
         assert_eq!(lag_mode_for(&p), LagMode::Off);
+    }
+
+    // ---- the boot gap (2026-09-10 review of the cnc meta() fix) ----
+
+    struct CountSm;
+    impl crate::traits::RawStateMachine for CountSm {
+        const NAME: &'static str = "count";
+        fn apply(&mut self, _ctx: &mut crate::ApplyCtx, _cmd: &[u8], _out: &mut Vec<u8>) {}
+        fn query(&self, _q: &[u8], _out: &mut Vec<u8>) {}
+        fn last_applied(&self) -> Option<u64> {
+            None
+        }
+    }
+
+    /// Real disk under the cargo target tree (CLAUDE.md's scratch rule).
+    fn scratch() -> tempfile::TempDir {
+        let base = std::env::current_exe()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        tempfile::tempdir_in(base).unwrap()
+    }
+
+    /// A page exactly as a booting node leaves it between `create_file` (a
+    /// complete, crc-valid header with names on line 7) and its
+    /// `store_services_declared`: the declared word still reads 0.
+    fn file_page(
+        dir: &std::path::Path,
+        names: &[&str],
+        declared: Option<u64>,
+    ) -> std::sync::Arc<CncPage> {
+        let mut services = [None; uc_protocol::v2::cnc::CNC_MAX_SERVICES];
+        for (i, n) in names.iter().enumerate() {
+            services[i] = Some(uc_protocol::identity::FsmName::parse(n).unwrap());
+        }
+        let page = CncPage::create_file(
+            &dir.join("cnc2.dat"),
+            &CncMeta {
+                node_id: 1,
+                instance_id: 7,
+                app_id: "boot-gap".into(),
+                buffer_bytes: 1 << 20,
+                max_payload: 256,
+                services,
+            },
+        )
+        .unwrap();
+        if let Some(d) = declared {
+            page.store_services_declared(d);
+        }
+        page
+    }
+
+    fn try_attach(dir: &std::path::Path) -> Option<crate::config::ServiceError> {
+        let cfg = crate::config::ServiceConfig::new(dir, "boot-gap");
+        super::attach(&cfg, CountSm, false).err()
+    }
+
+    /// Names on line 7 with `services_declared == 0` is a page no configured
+    /// node ever publishes and no harness page ever has: it is the node
+    /// mid-boot. Attaching then would fix `LagMode::Off` for the service's
+    /// life (`lag_mode_for`'s harness arm), so it must be refused by name.
+    #[test]
+    fn names_present_with_declared_zero_is_refused_as_booting() {
+        let dir = scratch();
+        let _page = file_page(dir.path(), &["count"], None);
+        match try_attach(dir.path()) {
+            Some(crate::config::ServiceError::NodeBooting) => {}
+            other => panic!("expected NodeBooting, got {other:?}"),
+        }
+    }
+
+    /// The discriminator is exactly that pair. The same page with the
+    /// declared word published is a real one-FSM node (it fails later, on
+    /// the rings this scratch dir does not have — anything but `NodeBooting`),
+    /// and a harness page (no names, declared 0) is not booting either.
+    #[test]
+    fn a_published_declared_set_or_a_harness_page_is_not_booting() {
+        let dir = scratch();
+        let _page = file_page(dir.path(), &["count"], Some(0b1));
+        assert!(
+            !matches!(
+                try_attach(dir.path()),
+                Some(crate::config::ServiceError::NodeBooting)
+            ),
+            "a published declared set is not the boot gap"
+        );
+
+        let dir = scratch();
+        let _page = file_page(dir.path(), &[], None);
+        assert!(
+            !matches!(
+                try_attach(dir.path()),
+                Some(crate::config::ServiceError::NodeBooting)
+            ),
+            "a harness page (no names, declared 0) is not the boot gap"
+        );
     }
 }

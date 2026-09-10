@@ -1089,8 +1089,18 @@ impl Node {
 
         // M14a: the declared set and the lag policy, published ONCE, before
         // any agent runs; services and clients read them from the page.
-        cnc.store_services_declared(cfg.services.declared());
+        //
+        // Lag BEFORE declared, deliberately. A service can attach between
+        // `create_file` (a complete header, names on line 7) and these two
+        // stores; it refuses a page with names and `services_declared == 0`
+        // as "booting" (`uc_service::attach`). That check can only cover the
+        // gap if a nonzero declared set implies the lag policy is already on
+        // the page — otherwise the sub-window between the two stores reads as
+        // a legitimate lockstep config (`fsm_lag_bytes == 0`) and cannot be
+        // told apart. Both stores are Release and the reader's loads Acquire,
+        // so observing the declared set orders the lag word before it.
         cnc.store_fsm_lag_bytes(cfg.services.page_lag_value(cfg.buffer_bytes as u64));
+        cnc.store_services_declared(cfg.services.declared());
 
         // 4. Log buffer file: reuse the existing file when it already matches the
         // configured capacity (preserves ring bytes below `durable` across a
