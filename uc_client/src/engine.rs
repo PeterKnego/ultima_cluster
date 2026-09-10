@@ -75,7 +75,7 @@ pub struct EngineConfig {
     /// Client-side payload cap, checked before the ring write so an oversized
     /// submit fails loud here instead of being silently dropped downstream.
     /// `None` (the default) INHERITS the attached node's own bound —
-    /// `cnc.try_meta().max_payload` — at `Engine::attach` time; `Some(n)` is an
+    /// the `max_payload` of `cnc.try_meta()` — at `Engine::attach` time; `Some(n)` is an
     /// explicit override. Inheriting matters because the node's bound is
     /// typically MTU-bounded (a few hundred bytes — well under the ring's own
     /// ~64 KiB `TooLarge` ceiling): without it, a submit that clears the

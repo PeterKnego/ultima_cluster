@@ -3042,7 +3042,7 @@ struct Consensus {
     /// M12b final review (C1): the `app_id` admin HMAC tags are bound to —
     /// `NodeConfig::app_id`, this node's own boot-time state, for the same
     /// reason as [`Self::admin_instance_id`]. Owned once at start rather
-    /// than re-allocated out of `CncPage::meta()` on every request.
+    /// than re-allocated out of `CncPage::try_meta()` on every request.
     admin_app_id: String,
     /// M12b (spec §5.3): the append-only admin audit file, opened at node
     /// start and written by this agent alone. Every admin request's answer is
@@ -6865,7 +6865,7 @@ impl Consensus {
     ///
     /// **The binding values come from this node's own boot-time state**
     /// ([`Self::admin_instance_id`] / [`Self::admin_app_id`]), never from
-    /// `CncPage::meta()`. That is what makes the restart half of the argument
+    /// `CncPage::try_meta()`. That is what makes the restart half of the argument
     /// above sound: the cnc page is a writable file, so an actor with
     /// instance-dir write access could otherwise put a captured
     /// `instance_id` back on the page after a restart and replay the capture

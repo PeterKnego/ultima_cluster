@@ -959,22 +959,44 @@ impl CncPage {
     }
 
     /// Decode the header + app_id back into an owned `CncMeta`, or `None` when
-    /// the header does not currently read as a valid v2 cnc page.
+    /// the header is not, right now, a COMPLETE valid v2 cnc header.
     ///
     /// **Fallible on purpose, and it must stay that way.** For a file-backed
     /// page this maps memory ANOTHER process owns: a restarting node
     /// re-initialises the page in place (see [`Self::create_file`]'s doc), so a
-    /// reader that passed `open_file`'s validation can still observe a zeroed or
-    /// half-written header microseconds later. Open-time validation cannot close
-    /// that — the bytes change after the check — so this returns `None` for the
-    /// torn window rather than panicking, exactly as [`Self::try_instance_id`]
-    /// has since M5. Callers treat `None` as "the node is restarting": a typed
-    /// refusal at an attach door, a re-probe on a polling path — never an
-    /// `unwrap` outside tests, where the page is heap-backed and the invariant
-    /// is real.
+    /// reader that passed `open_file`'s validation can still observe the rewrite
+    /// in progress microseconds later. Open-time validation cannot close that —
+    /// the bytes change after the check — so this returns `None` rather than
+    /// panicking.
+    ///
+    /// The window has TWO halves, and the magic catches only one. The punch-hole
+    /// zeroes the page (magic gone → `None`); then `write_cnc_header` stores the
+    /// magic FIRST and `init` stores the crc LAST, so between them the page reads
+    /// as a valid magic over zeroed fields — `instance_id = 0`, `max_payload =
+    /// 0`, an empty `app_id`. Handing that back as a `CncMeta` would give a
+    /// client a zero payload door and a service an `instance_id` its next
+    /// liveness probe contradicts. So this checks the crc32 exactly as
+    /// `open_file`'s validation does: the crc is written last, so a matching
+    /// crc is the proof the header is complete. That makes this the fallible
+    /// twin of that validation, NOT of [`Self::try_instance_id`] — the latter is a per-cycle
+    /// hot-path probe that deliberately skips the crc and documents its own
+    /// mid-write residual; this is attach-time, where the hash is free.
+    ///
+    /// Callers treat `None` as "the node is restarting": a typed refusal at an
+    /// attach door, a re-probe on a polling path — never an `unwrap` outside
+    /// tests, where the page is heap-backed and the invariant is real.
     pub fn try_meta(&self) -> Option<CncMeta> {
         let page = self.page();
         let header = cnc::read_cnc_header(page)?;
+        let crc_expected = crc32fast::hash(&page[..CNC_OFF_HEADER_CRC]);
+        let crc_actual = u32::from_le_bytes(
+            page[CNC_OFF_HEADER_CRC..CNC_OFF_HEADER_CRC + 4]
+                .try_into()
+                .ok()?,
+        );
+        if crc_actual != crc_expected {
+            return None;
+        }
         Some(CncMeta {
             node_id: header.node_id,
             instance_id: header.instance_id,
@@ -996,7 +1018,7 @@ impl CncPage {
     /// rewritten (a node restart truncates the file to zero, `set_len`s it back,
     /// then rewrites the header in place; a concurrent reader can catch that torn
     /// window as a zeroed / partial page) or the page is otherwise not a valid v2
-    /// cnc page. Unlike [`Self::meta`] it NEVER panics and does NOT check the
+    /// cnc page. Unlike [`Self::try_meta`] it does NOT check the
     /// crc32 (this is a per-cycle probe, not an attach-time validation): callers
     /// treat `None` as "instance changing / unavailable" and re-probe next cycle
     /// rather than trusting a torn value. A `Some(id)` may still be a mid-write
@@ -1427,6 +1449,32 @@ mod tests {
             reader.try_meta().is_none(),
             "a torn header must decode as None, not panic"
         );
+    }
+
+    /// The OTHER half of the rewrite window. `write_cnc_header` stores the
+    /// magic FIRST and `init` stores the crc LAST, so between them a reader
+    /// sees a valid magic over zeroed fields — `instance_id = 0`,
+    /// `max_payload = 0`, an empty `app_id`. A magic-only check hands that
+    /// back as a real `CncMeta`; only the crc, written last, proves the header
+    /// is complete.
+    #[test]
+    #[cfg_attr(miri, ignore)] // real cnc file, mmap'd
+    fn try_meta_rejects_a_half_written_header_behind_a_valid_magic() {
+        use std::os::unix::fs::FileExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("cnc2.dat");
+        let _writer = CncPage::create_file(&p, &test_meta()).unwrap();
+        let reader = CncPage::open_file(&p, "test-app").unwrap();
+
+        // Zero every header byte after the magic, crc word included: the page
+        // exactly as it stands after the magic store and before the field and
+        // crc stores of a restart's `init`.
+        let f = std::fs::OpenOptions::new().write(true).open(&p).unwrap();
+        f.write_at(&[0u8; CNC_OFF_HEADER_CRC + 4 - 8], 8).unwrap();
+
+        let m = reader.try_meta();
+        assert!(m.is_none(), "half-written header decoded as {m:?}");
     }
 
     #[test]

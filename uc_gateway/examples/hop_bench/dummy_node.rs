@@ -43,7 +43,7 @@ pub struct Args {
     pub app_id: String,
     #[arg(long, default_value_t = 0)]
     pub node_id: u32,
-    /// Published `cnc.try_meta().max_payload` — the door an attaching `Engine`
+    /// Published as the `max_payload` of `cnc.try_meta()` — the door an attaching `Engine`
     /// inherits when its own `max_payload` is `None`.
     #[arg(long, default_value_t = 512)]
     pub max_payload: u32,

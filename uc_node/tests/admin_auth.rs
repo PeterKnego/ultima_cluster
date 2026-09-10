@@ -928,14 +928,20 @@ fn a_capture_replayed_after_a_restart_is_refused() {
 
 /// Test-only: overwrite the cnc page header's `instance_id` (two LE `u64`
 /// halves at `CNC_OFF_INSTANCE_LO` / `CNC_OFF_INSTANCE_HI`) by `pwrite`ing
-/// into `cnc2.dat` directly. See
-/// `a_capture_replayed_after_a_restart_is_refused` for why this models a real
-/// attacker capability rather than a testing shortcut.
+/// into `cnc2.dat` directly, then re-stamp the header crc32 so the page
+/// still reads as valid. The crc is an integrity word over bytes the same
+/// actor can write, not a credential — an attacker with directory write
+/// access recomputes it for free, so a forgery that left it stale would be
+/// LESS capable than the one this test models, and the refusal it proves
+/// must not rest on it. See `a_capture_replayed_after_a_restart_is_refused`
+/// for why this models a real attacker capability rather than a testing
+/// shortcut.
 fn forge_instance_id(instance_dir: &std::path::Path, instance_id: u128) {
     use std::os::unix::fs::FileExt;
-    use uc_protocol::v2::cnc::{CNC_OFF_INSTANCE_HI, CNC_OFF_INSTANCE_LO};
+    use uc_protocol::v2::cnc::{CNC_OFF_HEADER_CRC, CNC_OFF_INSTANCE_HI, CNC_OFF_INSTANCE_LO};
 
     let f = std::fs::OpenOptions::new()
+        .read(true)
         .write(true)
         .open(instance_dir.join("cnc2.dat"))
         .expect("open cnc2.dat for the forgery");
@@ -949,6 +955,14 @@ fn forge_instance_id(instance_dir: &std::path::Path, instance_id: u128) {
         CNC_OFF_INSTANCE_HI as u64,
     )
     .expect("write instance_id hi");
+    let mut covered = [0u8; CNC_OFF_HEADER_CRC];
+    f.read_exact_at(&mut covered, 0)
+        .expect("read the crc-covered header band");
+    f.write_all_at(
+        &crc32fast::hash(&covered).to_le_bytes(),
+        CNC_OFF_HEADER_CRC as u64,
+    )
+    .expect("re-stamp the header crc");
 }
 
 /// The point of verifying FIRST: a follower must refuse an unauthenticated
