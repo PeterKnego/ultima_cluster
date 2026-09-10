@@ -153,10 +153,8 @@ replaces:
 |---|---|
 | `bind` must equal this node's own `members` entry | A leader elects, but followers never advance `durable` or `commit` — datagrams arrive from a source address matching no member. |
 | `instance_dir` must not be on a RAM-backed filesystem | Every `fsync` is a silent no-op; the cluster appears to work and loses committed data on power loss. |
-| `max_payload` must fit one datagram | A max-size frame plus headers and any crypto tag must fit the MTU; the node does not fragment. Oversized values panic inside the sender at construction. |
-| `max_payload` must carry a full schedule table | **Since 2.11.0.** A `MAX_SCHEDULE_ENTRIES` (32) table encodes to a 1072-byte `CLUSTER` frame body, so a smaller `max_payload` silently caps `uc2ctl schedule apply` at fewer entries and refuses the rest. Refused by name at startup with the byte figures and the entry count this node would accept. The default satisfies it; a pinned value below it does not. |
+| `max_payload` is refused by name | **Retired since `2.12.0` pending** (jumbo-frame MTU discovery): the payload ceiling is discovered per cluster, not pinned in `node.toml` — the two checks this key used to satisfy (fit one datagram, carry a full schedule table) are gone with it, the second now a compile-time assert against the baseline ceiling. The refusal names `force_jumbo_frames` (a plan-2 key, not yet present) as where a per-cluster override will live. |
 | `buffer_bytes` must be a power of two | Ring geometry. |
-| `max_payload` must be well under `buffer_bytes` | A payload approaching the ring size cannot be buffered for retransmit. |
 | this node's `id` must appear in `members` or `learners` | A node not in its own cluster. |
 | `members` and `learners` must be disjoint, ids unique | Ambiguous role and peer-band aliasing. |
 | at most 8 members total | The control page's per-peer band holds 8 slots; enforced on the wire too. |
@@ -228,18 +226,20 @@ Log ring buffer capacity. Must be a power of two. This much disk is reserved
 at startup (see [Instance directory](instance-directory.md#on-disk-footprint));
 a node that cannot reserve it refuses to start.
 
-**`max_payload: usize`**
-Maximum payload size. **Optional, and best left unset**: the default is
-DERIVED from the path budget rather than being a fixed number —
-`uc_protocol::v2::datagram::max_payload_for_mtu(MTU_DEFAULT)`, which is
-**1312 B** at the built-in 1408 B MTU and would be ~8928 B on a 9000 B
-jumbo-frame path. Deriving it means the value follows the MTU instead of
-pinning a small number a larger path would waste, and it is the crypto-SAFE
-figure: the crypto-off command ceiling (1344 B) needs 1416 B of datagram with
-wire crypto enabled, over the MTU, so a node defaulted to it would refuse to
-start on exactly the clusters that turn crypto on. Both bounds — too big for
-the datagram, too small for a schedule table — are checked at startup and
-refused by name.
+**`max_payload`** — **retired, `2.12.0` pending.** Refused by name at
+startup. The payload ceiling this key used to pin is now DISCOVERED per
+cluster: every node probes every peer up the rung ladder `RUNGS = [1408,
+8832, 8960]`, and the leader commits `min` over every member's probed path
+through the replicated Settings record, monotonically (never lowers). Every
+node applies the committed rung at commit — the sender's budget, the
+appender's door, and the live cnc `payload_ceiling` word every client and the
+gateway edge reads per submit ([cnc page](cnc-page.md#counters-and-status)).
+A fresh cluster starts at the `MTU_DEFAULT = 1408` B baseline rung (1344 B
+crypto-off / 1312 B crypto-on) and rises toward `MTU_BOUND = 8960` B (8896 B /
+8864 B) only once every path has proven it, never before. See
+[the jumbo-frame discovery spec](../superpowers/specs/2026-09-10-uc2-jumbo-frame-discovery-design.md)
+(plan 2 adds an operator override, `force_jumbo_frames`, not present in this
+release).
 
 **`admission_bytes_default: u64`**
 The **fallback** ingress admission budget in bytes — the `append - commit`

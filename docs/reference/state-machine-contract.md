@@ -399,10 +399,14 @@ reproducing the exact pre-freeze table.
 ## Payload ceiling
 
 A command's serialized bytes must fit in one datagram: the wire budget is
-`MTU_DEFAULT = 1408` bytes (`uc_protocol::v2::datagram::MTU_DEFAULT`, not
-operator-configurable) minus the datagram and frame headers, which leaves
-roughly **1.3 KB** for the frame payload. This applies identically to both
-tiers — raw bytes or a typed command's encoded form — and is enforced before
-the frame ever reaches the ring (`max_payload`, checked at `try_submit`).
-There is no chunking; a command that does not fit in one datagram is refused,
-not split.
+`MTU_DEFAULT = 1408` bytes (`uc_protocol::v2::datagram::MTU_DEFAULT`) minus
+the datagram and frame headers, which leaves roughly **1.3 KB** for the frame
+payload at that baseline rung. `2.12.0` (pending): the ceiling is
+**discovered per cluster** from the rung ladder `RUNGS = [1408, 8832, 8960]`
+and can rise as high as `MTU_BOUND = 8960` once every path has proven it, so
+"roughly 1.3 KB" is the floor a fresh cluster starts from, not a fixed cap —
+see [Limits § Hard limits](limits.md#hard-limits). This applies identically
+to both tiers — raw bytes or a typed command's encoded form — and is enforced
+before the frame ever reaches the ring against the live `payload_ceiling`,
+checked at `try_submit`. There is no chunking; a command that does not fit in
+one datagram is refused, not split.

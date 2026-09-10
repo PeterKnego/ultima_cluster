@@ -268,28 +268,34 @@ the [gate record](../benchmarks/uc2-m12-gate-2026-08-22.md#clean-discipline-re-r
 
 ## Payload ceiling
 
-A command's serialized bytes must fit in one UDP datagram on the node side.
-The node's own startup preflight (`uc_node::preflight`,
-`PreflightError::PayloadExceedsMtu`) refuses a configured `max_payload` that
-doesn't fit, with the arithmetic spelled out:
+A command's serialized bytes must fit in one UDP datagram on the node side —
+never chunked. The arithmetic:
 
 ```
-need = align_frame_len(max_payload + HEADER_LEN) + DATAGRAM_HEADER_LEN + crypto_overhead
-refused if need > MTU_DEFAULT
+need = align_frame_len(payload_ceiling + HEADER_LEN) + DATAGRAM_HEADER_LEN + crypto_overhead
+refused if need > rung
 ```
 
 — `HEADER_LEN = 32` and `FRAME_ALIGNMENT = 32` (`uc_protocol::v2::frame`,
 `align_frame_len` rounds up to the next 32-byte multiple), `DATAGRAM_HEADER_LEN
-= 16` and `MTU_DEFAULT = 1408` (`uc_protocol::v2::datagram`, not
-operator-configurable), and `crypto_overhead` is `0` unless wire crypto (M8)
-is enabled. Solving that with crypto off gives a hard ceiling of
-**`max_payload <= 1344` bytes** (`1344 + 32 = 1376`, already 32-aligned;
+= 16`, and `crypto_overhead` is `0` unless wire crypto (M8) is enabled.
+Solving that at the `MTU_DEFAULT = 1408` B baseline rung with crypto off gives
+**`payload_ceiling <= 1344` bytes** (`1344 + 32 = 1376`, already 32-aligned;
 `1376 + 16 = 1392 <= 1408`; one byte more pushes the aligned frame to `1408`,
 for a `need` of `1424`) — the "roughly 1.3 KB" figure elsewhere on this page.
-A `SUBMIT`/`QUERY` whose enveloped body exceeds the node's actual configured
-`max_payload` (which may be set lower than this ceiling) is refused with
-`RETRY{PAYLOAD_TOO_LARGE, retry_after_us: 0}` before it ever reaches the
-ring — there is no chunking.
+
+Through `2.11.0` this ceiling was a fixed `node.toml` `max_payload` value,
+checked at startup by `uc_node::preflight` (`PreflightError::PayloadExceedsMtu`).
+**Since `2.12.0` (pending)** the `max_payload` key is retired (refused by
+name) and the ceiling is **discovered per cluster**: every node probes every
+peer up the rung ladder `RUNGS = [1408, 8832, 8960]`, the leader commits
+`min` over every member's probed path (monotone, never lowers), and the live
+value rides the cnc page's `payload_ceiling` word
+([cnc page](cnc-page.md#counters-and-status)) — a client and the gateway edge
+both read it per submit rather than trusting a fixed config value. A
+`SUBMIT`/`QUERY` whose enveloped body exceeds the node's live
+`payload_ceiling` is refused with `RETRY{PAYLOAD_TOO_LARGE, retry_after_us:
+0}` before it ever reaches the ring — there is no chunking.
 
 ## The session envelope
 

@@ -37,14 +37,18 @@ pub const FSM_LAG_LOCKSTEP: u64 = u64::MAX;
 /// COMMIT. Operators who want the tightest possible pacing want
 /// [`FSM_LAG_LOCKSTEP`], which is a barrier rather than a byte bound.
 ///
-/// This is the CLUSTER-WIDE bound, so it must hold on every host and cannot
-/// read any host's `max_payload`: it is the largest aligned frame the UDP
-/// data plane can carry at all (`MTU_DEFAULT - DATAGRAM_HEADER_LEN`, floored
-/// to `FRAME_ALIGNMENT`) = 1376 B. A host whose own `max_payload` is smaller
-/// clamps up to its own one-frame floor at the point of use
-/// (`uc_node::services::fsm_lag_from_setting`), per spec §4.4; this constant
-/// is only what the leader's pre-append `validate` refuses BELOW, so an
-/// operator is told rather than silently clamped.
+/// This is the CLUSTER-WIDE bound, floored to the baseline rung, so it must
+/// hold on every host at the WORST case: it is the largest aligned frame the
+/// UDP data plane can carry at the `MTU_DEFAULT` baseline rung
+/// (`MTU_DEFAULT - DATAGRAM_HEADER_LEN`, floored to `FRAME_ALIGNMENT`) =
+/// 1376 B. A host's own one-frame floor at the point of use
+/// (`uc_node::services::fsm_lag_from_setting`) now clamps against that host's
+/// LIVE discovered `payload_ceiling` (jumbo-frame MTU discovery, spec §7.2),
+/// not a fixed `max_payload` — on a jumbo cluster that live ceiling can be
+/// larger than this constant, so the per-host clamp can go UP relative to it
+/// (up to 8928 B at the top rung), never down. This constant is only what the
+/// leader's pre-append `validate` refuses BELOW, so an operator is told
+/// rather than silently clamped.
 pub const MIN_FSM_LAG_BYTES: u64 = ((crate::v2::datagram::MTU_DEFAULT
     - crate::v2::datagram::DATAGRAM_HEADER_LEN)
     & !(crate::v2::frame::FRAME_ALIGNMENT - 1)) as u64;

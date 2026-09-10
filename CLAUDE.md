@@ -395,23 +395,29 @@ one log stream (#11); the release-ledger line (#5) is process, not code
   authenticated admin request to the leader over the node↔node UDP plane, so
   `[admin] auth = "hmac"` authenticates cluster-wide only when paired with
   `[crypto].enabled = true`.
-- **Command payload ceiling: ≤ 1344 B crypto-off / ≤ 1312 B crypto-on**
-  — **a property of the UDP data plane, not of the design.** One command
-  must fit one datagram, and `MTU_DEFAULT = 1408`
-  (`uc_protocol::v2::datagram`) is sized to clear a 1500 B Ethernet path
-  without IP fragmentation. The arithmetic is
-  `docs/security/attack-surface.md` §3 and it is pure transport geometry:
-  1408 less the 16 B datagram header less the 32 B frame header, floored to
+- **Command payload ceiling: discovered per cluster** — 1344 B crypto-off /
+  1312 B crypto-on at the 1408 B baseline rung every cluster starts from, up
+  to 8896 / 8864 at the 8960 B rung once every path has proven it (`2.12.0`,
+  spec `docs/superpowers/specs/2026-09-10-uc2-jumbo-frame-discovery-design.md`).
+  The arithmetic is unchanged (`payload_ceiling(rung, crypto)`); what moved is
+  that the rung is committed cluster data, not a source constant, and
+  `max_payload` is no longer a `node.toml` key. One command must fit one
+  datagram, and `MTU_DEFAULT = 1408` (`uc_protocol::v2::datagram`) is sized
+  to clear a 1500 B Ethernet path without IP fragmentation; `MTU_BOUND =
+  8960` is the top of the ladder `RUNGS = [1408, 8832, 8960]`. The arithmetic
+  (`docs/security/attack-surface.md` §3) is pure transport geometry: 1408
+  less the 16 B datagram header less the 32 B frame header, floored to
   `FRAME_ALIGNMENT = 32` → 1344; crypto's `CRYPTO_OVERHEAD = 24` (8 B
-  counter + 16 B GCM tag) takes the next aligned step down → 1312.
-  (Aeron, whose 1408 UC inherited, lands on the same 1344 — it is the top
-  `MESSAGE_LENGTH` in `aeron-io/benchmarks`.) There is no runtime knob — it
-  is a source constant, and `preflight` refuses above it. Treat the number as
-  transport-derived: a different transport (jumbo frames, or an OS-bypass
-  fabric such as EFA/SRD, whose messages are far larger) would move or
-  remove it, at the cost of a wire flag day. `bincode` is `NoLimit`; the
-  typed tier's decode is bounded by the payload cap and serde's 1 MiB
-  pre-allocation cap, not by the codec.
+  counter + 16 B GCM tag) takes the next aligned step down → 1312; the same
+  arithmetic at the 8960 B top rung gives 8896 / 8864. (Aeron, whose 1408 UC
+  inherited, lands on the same 1344 — it is the top `MESSAGE_LENGTH` in
+  `aeron-io/benchmarks`.) The rung a cluster runs at is discovered (a
+  do-not-fragment `PROBE`/`PROBE_ACK` pair up the ladder, committed through
+  the replicated Settings record, monotone — never lowers) and lives in the
+  cnc page's live `payload_ceiling` word, not a source constant;
+  `max_payload` is retired from `node.toml`, refused by name. `bincode` is
+  `NoLimit`; the typed tier's decode is bounded by the payload cap and
+  serde's 1 MiB pre-allocation cap, not by the codec.
 - **Purge is OFF by default** (`PurgePolicy::Disabled`), and since
   `2.11.0` a purge floor moves only on a **complete snapshot set**
   at one commanded instant (`uc2ctl snapshot`, or the replicated

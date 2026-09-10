@@ -193,9 +193,10 @@ Two version numbers are deliberately *outside* this policy, because semver's
 "a minor bump is safe" contract is the wrong promise for them:
 
 - **The node-to-node wire protocol** (`uc_protocol::version::CURRENT`,
-  currently `0.7.0` — see [wire protocol](wire-protocol.md)).
-- **The `cnc.dat` page layout** (`CNC_V2_VERSION`, currently cnc 3.1 — see
-  [the cnc control page](cnc-page.md)).
+  currently `0.7.0`, `0.8.0` pending (`2.12.0`, jumbo-frame MTU discovery) —
+  see [wire protocol](wire-protocol.md)).
+- **The `cnc.dat` page layout** (`CNC_V2_VERSION`, currently cnc 3.1, `3.2`
+  pending (`2.12.0`) — see [the cnc control page](cnc-page.md)).
 
 A change to either is a **flag day**: every node in a cluster is stopped and
 restarted on the new version together. Mixed-version operation is not
@@ -225,6 +226,22 @@ change is a flag day regardless of the digit.
   a `0.6.0` peer's frames still *parse* on a `0.7.0` node and mean something
   different, so mixing versions is not merely unsupported, it is unsound.
   Upgrade every node together.
+
+### The pending `2.12.0` flag day
+
+Jumbo-frame MTU discovery is a further, separate flag day: wire `0.7.0` →
+`0.8.0` and cnc `3.1` → `3.2`. Two new **pairwise** datagram kinds, `PROBE`
+(24) and `PROBE_ACK` (25) ([wire protocol](wire-protocol.md#probe--probe_ack-bodies-wire-080-2120-pending)),
+and one new live cnc word, `payload_ceiling` at offset 3984
+([cnc page](cnc-page.md#counters-and-status)) — no existing wire layout
+changes, unlike `2.11.0`'s relaid log frame header. The replicated Settings
+record gains a new field, `datagram_mtu: u32` (`0` = the baseline rung); a
+`0.7.0`/v1 Settings record is still **accepted on read** (it decodes with
+`datagram_mtu` defaulting to `0`), so no instance directory needs a wipe for
+this flag day alone. `node.toml`'s `max_payload` key is **refused by name**
+as of this flag day, pointing at discovery. As with every prior bump, mixed
+versions are unsupported: stop every node before starting any node on the
+new build.
 
 ## The one-way door: one tier per type
 

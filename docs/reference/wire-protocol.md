@@ -10,8 +10,8 @@ self-locating header is in [Architecture](../ARCHITECTURE.md).
 
 | Constant | Value |
 |---|---|
-| `version::CURRENT` | `0.7.0` |
-| cnc page version | 3.1 (FSM identity + log time, 2.11 pending: the name + hash line at boot, the version word at attach, `log_time_ns`, per-row `timers_pending`) |
+| `version::CURRENT` | `0.7.0` (`0.8.0`, `2.12.0` pending: two new pairwise kinds for jumbo-frame MTU discovery, `PROBE` (24) and `PROBE_ACK` (25); no existing layout changes) |
+| cnc page version | 3.1 (FSM identity + log time, 2.11 pending: the name + hash line at boot, the version word at attach, `log_time_ns`, per-row `timers_pending`) (3.2, `2.12.0` pending: a live `payload_ceiling` word) |
 
 The cnc page carries its own version gate, `CNC_V2_VERSION`, which is
 independent of this one. cnc 3.1 changed the same-host shmem layout only
@@ -48,7 +48,7 @@ a protocol mismatch is refused.
 | | |
 |---|---|
 | `DATAGRAM_HEADER_LEN` | 16 B |
-| `MTU_DEFAULT` | 1408 B |
+| `MTU_DEFAULT` | 1408 B — the baseline rung every cluster starts from; the ladder is `RUNGS` (`2.12.0` pending, see [Limits](limits.md#hard-limits)) |
 
 The header is authenticated as AAD when wire crypto is enabled, and carries a
 `key_epoch` field for the group key.
@@ -81,6 +81,8 @@ The header is authenticated as AAD when wire crypto is enabled, and carries a
 | 15 | `SNAP_DONE` | pairwise |
 | 22 | `SNAP_REQUEST` | pairwise |
 | 23 | `SNAP_REDIRECT` | pairwise |
+| 24 | `PROBE` | pairwise (`0.8.0`, `2.12.0` pending — jumbo-frame MTU discovery) |
+| 25 | `PROBE_ACK` | pairwise (`0.8.0`, `2.12.0` pending — jumbo-frame MTU discovery) |
 
 Kind **21** was `SNAP_TABLE` — the schedule table carried beside a session —
 and is **retired** (`DGRAM_KIND_SNAP_TABLE_RETIRED`). The table now rides the
@@ -195,6 +197,38 @@ joiner then sends its `SNAP_REQUEST` to the named learner. A redirect naming
 a node the joiner does not know is dropped and recorded
 (`snapshot_redirect_unknown`).
 
+#### `PROBE` / `PROBE_ACK` bodies (wire 0.8.0, `2.12.0` pending)
+
+Jumbo-frame MTU discovery: a node sends a `PROBE` at one rung of
+`RUNGS = [1408, 8832, 8960]` to a peer, and the peer's do-not-fragment socket
+either delivers it whole or drops it — there is no partial receipt to
+misread. Both bodies are **exact-length**, not minimum-length.
+
+`PROBE`: `rung: u32 LE` followed by zero padding out to exactly `rung` bytes
+total body length. The receiver credits the probe only when the received
+length equals the rung field — a shorter arrival (fragmented, or truncated by
+a smaller path MTU somewhere on the route) is silently uncredited, which is
+the discovery signal.
+
+| bytes | field | width | meaning |
+|---|---|---|---|
+| 0..4 | `rung` | u32 | the rung under test; also the body's total length |
+| 4.. | padding | — | zero, out to `rung` bytes |
+
+`PROBE_ACK`: 8 bytes, `rung: u32 ‖ own_min_rung: u32`.
+
+| bytes | field | width | meaning |
+|---|---|---|---|
+| 0..4 | `rung` | u32 | echoes the `PROBE`'s rung |
+| 4..8 | `own_min_rung` | u32 | the acking peer's own verified minimum across all its peers, so the prober learns a transitive floor, not just the one path |
+
+Both kinds are pairwise and sealed per destination like any other pairwise
+kind when wire crypto is enabled. Cadence, the stop condition, and the
+leader's commit rule over the probed rungs are
+[the jumbo-frame discovery spec](../superpowers/specs/2026-09-10-uc2-jumbo-frame-discovery-design.md)
+§5.1–5.3 (see its "Errata (plan 1, as built)" section for two corrections to
+§5.1's stop condition and cadence).
+
 ### Administration
 
 | Kind | Name | Scope |
@@ -239,8 +273,11 @@ wrap; padding fills exactly to it.
 | 20 | reserved | u32 | written as zero |
 | 24 | `time_ns` | u64 LE | **the leader's stamp**: ns since the Unix epoch, non-decreasing along the log |
 
-The header is still 32 bytes, and the payload ceiling is unchanged (1344 B
-crypto-off / 1312 B crypto-on). `2.11.0` **relaid** it rather than growing it:
+The header is still 32 bytes, and the header's own size did not change the
+payload ceiling: 1344 B crypto-off / 1312 B crypto-on at the 1408 B baseline
+rung, up to 8896 B / 8864 B at the 8960 B top rung once every path in the
+cluster has proven it (`2.12.0` pending — the ceiling is discovered, not a
+source constant; see [Limits](limits.md#hard-limits)). `2.11.0` **relaid** it rather than growing it:
 through `0.6.0` the two id fields were `session_id: u64` and
 `correlation_id: u64`, of which the client only ever filled 32 bits each, so
 narrowing them to `client_id: u32` + `seq: u32` freed exactly the 8 bytes
@@ -297,7 +334,9 @@ otherwise the kind plus the payload slice. Per kind:
 | `3` Settings | `SETTINGS_LEN = 29` bytes exactly: `version u32 = 1 ‖ fsm_lag_bytes u64 ‖ admission_bytes u64 ‖ snapshot_interval_bytes u64 ‖ snapshot_target u8`. `0` in any u64 means "derive at use"; `fsm_lag_bytes = u64::MAX` (`FSM_LAG_LOCKSTEP`) means lockstep; `snapshot_target` is `0` = all, `1` = learners. No trailing bytes are tolerated | `uc_protocol::v2::settings` |
 
 The largest of the three is the table at 1064 B, inside the 1312 B crypto-on
-payload ceiling, so a `CLUSTER` frame always fits one datagram
+ceiling at the 1408 B baseline rung — the floor the ceiling only rises from
+once a jumbo path is discovered (`2.12.0` pending; up to 8864 B crypto-on at
+the top rung) — so a `CLUSTER` frame always fits one datagram
 ([Limits](limits.md#hard-limits)).
 
 **Two consumers, one frame.** Every FSM's apply loop yields a `CLUSTER` frame,
@@ -389,8 +428,10 @@ Each entry, `SCHEDULE_ENTRY_LEN = 33`:
 | 25..33 | `b` | u64 LE — `every`: `anchor_ns`; **must be zero** for `at` and `once` |
 
 A full table is `8 + 32 × 33 = 1064` bytes; with the 8-byte `CLUSTER` prefix
-that is 1072 B of payload, inside the 1312 B crypto-on ceiling, so the frame
-always fits one datagram ([Limits](limits.md#hard-limits)).
+that is 1072 B of payload, inside the 1312 B crypto-on ceiling at the 1408 B
+baseline rung (`2.12.0` pending: up to 8864 B crypto-on once a jumbo path is
+discovered), so the frame always fits one datagram
+([Limits](limits.md#hard-limits)).
 
 The decoder refuses — returns `None`, never panics or allocates from a
 peer-supplied length — on a short buffer, a version other than `1`, a `count`

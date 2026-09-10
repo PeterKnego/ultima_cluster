@@ -516,3 +516,34 @@ Written before the tag, per the release rule:
 - **Making the rung the operator's choice.** Rejected in §3.
 - **A remote-protocol advertisement of the ceiling.** `RemoteClient` warns on
   the standard threshold alone; a protocol v2 is a separate backlog item.
+
+## Errata (plan 1, as built)
+
+1. **§5.1's stop condition is incomplete.** As shipped, probing a peer does
+   not stop merely when `verified == MTU_BOUND`: it stops only when
+   `verified == MTU_BOUND` **and** that peer's advertised minimum
+   (`own_min_rung`, §5.2/§5.3) has also caught up to the top rung. Until
+   both hold, the node keeps re-probing that peer — at its already-verified
+   rung, not from scratch — because an ack's `own_min_rung` is the *only*
+   way the leader learns a peer's own minimum: the leader has no other
+   channel to that fact, so it can only learn it from acks to its own
+   probes. On a cluster with one permanently narrow path this means every
+   node keeps probing every peer at the 30 s cadence forever (2–3
+   datagrams per 30 s per peer) — an accepted cost, not a bug.
+2. **A rejoin case §5.1 does not mention.** A `PROBE` received from a peer
+   the node had backed off on (i.e. was probing at the 30 s cadence)
+   resets the node's cadence toward that peer back to the 1 s/five-attempt
+   schedule. This is what makes a rejoining member's MTU raise land in
+   seconds rather than waiting out the full 30 s backoff window.
+3. **§7.2's `MIN_FSM_LAG_BYTES` framing needs a correction.** The lockstep
+   `fsm_lag` one-frame floor follows the **live, discovered** ceiling, not
+   the fixed `MTU_DEFAULT`-derived `MIN_FSM_LAG_BYTES` bound described
+   there. `MIN_FSM_LAG_BYTES` (1376 B) remains the cluster-wide floor the
+   leader's `validate` refuses below — it must hold at the worst case,
+   every cluster's baseline rung — but a host's own one-frame clamp at the
+   point of use (`uc_node::services::fsm_lag_from_setting`) reads that
+   host's live `payload_ceiling`, not a fixed `max_payload`. On a jumbo
+   cluster this means the per-host clamp can go **up** relative to
+   `MIN_FSM_LAG_BYTES` (as far as 8928 B at the top rung), never down. See
+   `uc_protocol::v2::settings::MIN_FSM_LAG_BYTES`'s doc comment for the
+   as-built wording.

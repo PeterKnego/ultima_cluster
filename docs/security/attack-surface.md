@@ -64,16 +64,27 @@ copying an example actually reads it.
 ## 3. The command payload ceiling
 
 A command travels in **one datagram** — the node does not fragment frames. With
-`MTU_DEFAULT = 1408` (not configurable) and `DATAGRAM_HEADER_LEN = 16`, the
-frame header at `HEADER_LEN = 32` rounded up to `FRAME_ALIGNMENT = 32`:
+`MTU_DEFAULT = 1408` (the baseline rung; `2.12.0` pending: the effective
+ceiling is **discovered per cluster** from the rung ladder `RUNGS = [1408,
+8832, 8960]`, `MTU_BOUND = 8960`, not an operator dial — see [Wire protocol §
+`PROBE` /
+`PROBE_ACK`](../reference/wire-protocol.md#probe--probe_ack-bodies-wire-080-2120-pending))
+and `DATAGRAM_HEADER_LEN = 16`, the frame header at `HEADER_LEN = 32` rounded
+up to `FRAME_ALIGNMENT = 32`:
 
-- **crypto off — `max_payload` ≤ 1344 bytes**
-- **crypto on — `max_payload` ≤ 1312 bytes** (`CRYPTO_OVERHEAD = 24`: an 8-byte
-  counter plus a 16-byte GCM tag)
+- **crypto off** — ≤ 1344 bytes at the baseline rung, up to ≤ 8896 bytes at
+  the top rung once every path has proven it
+- **crypto on** — ≤ 1312 bytes at the baseline rung, up to ≤ 8864 bytes at the
+  top rung (`CRYPTO_OVERHEAD = 24`: an 8-byte counter plus a 16-byte GCM tag)
 
-`uc_node::preflight::check_semantics` computes exactly this and refuses to
-start with `PayloadExceedsMtu`, naming the number of bytes the configured value
-would need. The default in `packaging/node.example.toml` is 512.
+Through `2.11.0` this ceiling was pinned by a `node.toml` `max_payload` key,
+checked at startup preflight (`uc_node::preflight::check_semantics`,
+refusing with `PayloadExceedsMtu` naming the byte figures) — that key is
+**retired since `2.12.0` pending, refused by name**, and preflight no longer
+has an MTU check to make: the leader commits the cluster's discovered
+ceiling into the replicated Settings record, and every node applies it at
+commit (the sender's budget, the appender's door, and the live cnc
+`payload_ceiling` word every submit reads).
 
 ## 4. What this page deliberately does not list
 
