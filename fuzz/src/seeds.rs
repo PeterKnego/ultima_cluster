@@ -1573,8 +1573,10 @@ pub fn uc_service_snapshot_envelope() -> Vec<Seed> {
 }
 
 /// `uc_protocol_settings` — the replicated settings record (cluster-FSM spec
-/// §6): the genesis default, a non-default encoding, and the three refusals
-/// the decoder owes: a wrong length, an unknown version, an unknown target.
+/// §6, jumbo spec §5.5): the genesis default, a non-default encoding, the
+/// version-1 shape a `2.11.0` node wrote (still accepted), and the three
+/// refusals the decoder owes: a wrong length, an unknown version, an unknown
+/// target.
 pub fn uc_protocol_settings() -> Vec<Seed> {
     use uc_protocol::v2::settings::*;
 
@@ -1590,9 +1592,18 @@ pub fn uc_protocol_settings() -> Vec<Seed> {
         admission_bytes: 4 << 20,
         snapshot_interval_bytes: 1 << 30,
         snapshot_target: Target::Learners,
+        datagram_mtu: 8960,
     });
+    // The version-1 shape `2.11.0` wrote — a live corpus value, not a
+    // refusal: it decodes with `datagram_mtu = 0` (jumbo spec §5.5).
+    let v1 = {
+        let mut v = genesis.clone();
+        v.truncate(SETTINGS_LEN_V1);
+        v[0] = 1;
+        v
+    };
     let mut bad_version = genesis.clone();
-    bad_version[0] = 2;
+    bad_version[0] = 3;
     let mut bad_target = genesis.clone();
     bad_target[28] = 9;
     let mut trailing = genesis.clone();
@@ -1605,5 +1616,6 @@ pub fn uc_protocol_settings() -> Vec<Seed> {
         Seed::fixed("04-bad-target", bad_target),
         Seed::fixed("05-trailing-byte", trailing),
         Seed::fixed("06-short", vec![0u8; 4]),
+        Seed::fixed("07-version-1", v1),
     ]
 }

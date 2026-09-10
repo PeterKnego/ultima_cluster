@@ -281,12 +281,17 @@ uc2ctl settings show --instance-dir <DIR> --app-id <ID>
 ```
 
 ```
-position=8192 admission_bytes=262144 fsm_lag=16MiB snapshot_interval_bytes=0 snapshot_target=all
+position=8192 admission_bytes=262144 fsm_lag=16MiB snapshot_interval_bytes=0 snapshot_target=all datagram_mtu=0 (baseline)
 ```
 
 `fsm_lag` renders as `default` (the record's `0`), `lockstep`, a whole-MiB
-count, or a raw byte count when it is neither. A node with no cluster artifact
-yet prints `no cluster artifact yet`.
+count, or a raw byte count when it is neither. `datagram_mtu` (2.12 pending)
+is the committed datagram rung: `0 (baseline)` is the `MTU_DEFAULT` every
+cluster starts from, and a rung the leader's path-MTU discovery committed
+prints as `(discovered)`. It is **leader-owned** — naming it in a `settings
+apply` file is refused as an unknown key, and the cluster FSM keeps the
+committed rung monotone, so an ordinary apply can never lower it. A node with
+no cluster artifact yet prints `no cluster artifact yet`.
 
 ### `snapshot`
 

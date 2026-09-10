@@ -6,11 +6,15 @@
 //! as a `CLUSTER kind=Settings` payload and inside the cluster FSM's image.
 //! `core` + `alloc` (the encoder appends into a `Vec<u8>`), like `v2::schedule`.
 
-/// Encoding version, first word of the payload. Bumped when the layout
-/// changes; a reader refuses any version it does not know.
-pub const SETTINGS_VERSION: u32 = 1;
-/// The exact encoded length — no trailing bytes are tolerated.
-pub const SETTINGS_LEN: usize = 4 + 8 + 8 + 8 + 1;
+/// Encoding version, first word of the payload. `2` since the jumbo flag day
+/// (`datagram_mtu`); a reader ACCEPTS `1` (the `2.11.0` shape, mapped to
+/// `datagram_mtu = 0`) because cluster artifacts and committed frames written
+/// by `2.11.0` persist across the upgrade — jumbo spec §5.5.
+pub const SETTINGS_VERSION: u32 = 2;
+/// The exact encoded length of a version-2 record — no trailing bytes.
+pub const SETTINGS_LEN: usize = 4 + 8 + 8 + 8 + 1 + 4;
+/// The exact length of a version-1 record, accepted on decode only.
+pub const SETTINGS_LEN_V1: usize = 4 + 8 + 8 + 8 + 1;
 /// `fsm_lag_bytes` value meaning lockstep.
 ///
 /// NOT the cnc page's `0` sentinel: in THIS record `0` already means "derive
@@ -66,6 +70,11 @@ pub struct Settings {
     /// `0` = on demand only (plan 2 reads it; plan 1 carries it).
     pub snapshot_interval_bytes: u64,
     pub snapshot_target: Target,
+    /// Jumbo spec §5.5: the committed datagram rung (`uc_protocol::v2::
+    /// datagram::RUNGS`), `0` = the baseline `MTU_DEFAULT`. Leader-owned:
+    /// written by discovery, never by an operator file; the FSM keeps it
+    /// monotone (`max(committed, incoming)`).
+    pub datagram_mtu: u32,
 }
 
 impl Settings {
@@ -75,6 +84,7 @@ impl Settings {
             admission_bytes: 0,
             snapshot_interval_bytes: 0,
             snapshot_target: Target::All,
+            datagram_mtu: 0,
         }
     }
 }
@@ -85,19 +95,24 @@ pub fn encode_settings(s: &Settings, out: &mut Vec<u8>) {
     out.extend_from_slice(&s.admission_bytes.to_le_bytes());
     out.extend_from_slice(&s.snapshot_interval_bytes.to_le_bytes());
     out.push(s.snapshot_target as u8);
+    out.extend_from_slice(&s.datagram_mtu.to_le_bytes());
 }
 
-/// Total: `None` on any length other than [`SETTINGS_LEN`], an unknown
-/// version, or an unknown target byte. The exact-length check up front makes
-/// every subsequent slice index infallible.
+/// Total: `None` on any (version, length) pair other than the two this
+/// reader knows — `(1, SETTINGS_LEN_V1)` and `(2, SETTINGS_LEN)` — or an
+/// unknown target byte. The length is EXACT PER VERSION, so a v1 header with
+/// a v2 length (or the reverse) is refused rather than read as a prefix; the
+/// pair check up front makes every subsequent slice index infallible.
 pub fn decode_settings(buf: &[u8]) -> Option<Settings> {
-    if buf.len() != SETTINGS_LEN {
+    if buf.len() < 4 {
         return None;
     }
     let version = u32::from_le_bytes(buf[0..4].try_into().unwrap());
-    if version != SETTINGS_VERSION {
-        return None;
-    }
+    let datagram_mtu = match (version, buf.len()) {
+        (1, SETTINGS_LEN_V1) => 0,
+        (2, SETTINGS_LEN) => u32::from_le_bytes(buf[29..33].try_into().unwrap()),
+        _ => return None,
+    };
     let fsm_lag_bytes = u64::from_le_bytes(buf[4..12].try_into().unwrap());
     let admission_bytes = u64::from_le_bytes(buf[12..20].try_into().unwrap());
     let snapshot_interval_bytes = u64::from_le_bytes(buf[20..28].try_into().unwrap());
@@ -111,6 +126,7 @@ pub fn decode_settings(buf: &[u8]) -> Option<Settings> {
         admission_bytes,
         snapshot_interval_bytes,
         snapshot_target,
+        datagram_mtu,
     })
 }
 
@@ -125,10 +141,12 @@ mod tests {
 
     #[test]
     fn settings_layout_is_frozen() {
-        // FROZEN once shipped (spec §6/§7): version u32 @0, fsm_lag_bytes u64 @4,
-        // admission_bytes u64 @12, snapshot_interval_bytes u64 @20, target u8 @28.
-        assert_eq!(SETTINGS_VERSION, 1);
-        assert_eq!(SETTINGS_LEN, 29);
+        // FROZEN once shipped (cluster-FSM spec §6/§7, jumbo spec §5.5):
+        // version u32 @0, fsm_lag_bytes u64 @4, admission_bytes u64 @12,
+        // snapshot_interval_bytes u64 @20, target u8 @28, datagram_mtu u32 @29.
+        assert_eq!(SETTINGS_VERSION, 2);
+        assert_eq!(SETTINGS_LEN, 33);
+        assert_eq!(SETTINGS_LEN_V1, 29);
         // The lockstep sentinel is a WORD VALUE in this record, not the cnc
         // page's `0` — `0` here is already "derive the default at use".
         assert_eq!(FSM_LAG_LOCKSTEP, u64::MAX);
@@ -143,13 +161,41 @@ mod tests {
             admission_bytes: 4 << 20,
             snapshot_interval_bytes: 1 << 30,
             snapshot_target: Target::Learners,
+            datagram_mtu: 8960,
         };
         let mut out = Vec::new();
         encode_settings(&s, &mut out);
         assert_eq!(out.len(), SETTINGS_LEN);
-        assert_eq!(&out[0..4], &1u32.to_le_bytes());
+        assert_eq!(&out[0..4], &2u32.to_le_bytes());
         assert_eq!(out[28], 1);
+        assert_eq!(&out[29..33], &8960u32.to_le_bytes());
         assert_eq!(decode_settings(&out), Some(s));
+    }
+
+    /// Jumbo spec §5.5: the first flag day in which a cluster artifact and
+    /// committed CLUSTER frames persist across the upgrade. A v1 record
+    /// decodes, with the new field at its baseline meaning.
+    #[test]
+    fn a_version_1_record_decodes_with_datagram_mtu_zero() {
+        let mut v1 = Vec::new();
+        v1.extend_from_slice(&1u32.to_le_bytes());
+        v1.extend_from_slice(&(16u64 << 20).to_le_bytes());
+        v1.extend_from_slice(&(4u64 << 20).to_le_bytes());
+        v1.extend_from_slice(&(1u64 << 30).to_le_bytes());
+        v1.push(1);
+        assert_eq!(v1.len(), SETTINGS_LEN_V1);
+        let s = decode_settings(&v1).expect("v1 decodes");
+        assert_eq!(s.datagram_mtu, 0);
+        assert_eq!(s.fsm_lag_bytes, 16 << 20);
+        assert_eq!(s.snapshot_target, Target::Learners);
+        // A v1 header with a v2 length (or the reverse) is refused: the
+        // length is exact per version.
+        v1.extend_from_slice(&[0, 0, 0, 0]);
+        assert!(decode_settings(&v1).is_none());
+        let mut short_v2 = Vec::new();
+        encode_settings(&Settings::genesis_default(), &mut short_v2);
+        short_v2.truncate(SETTINGS_LEN_V1);
+        assert!(decode_settings(&short_v2).is_none());
     }
 
     #[test]
@@ -158,7 +204,7 @@ mod tests {
         let mut out = Vec::new();
         encode_settings(&Settings::genesis_default(), &mut out);
         let mut v2 = out.clone();
-        v2[0] = 2;
+        v2[0] = 3;
         assert!(decode_settings(&v2).is_none());
         let mut t9 = out.clone();
         t9[28] = 9;
@@ -174,5 +220,6 @@ mod tests {
         assert_eq!(d.admission_bytes, 0);
         assert_eq!(d.snapshot_interval_bytes, 0);
         assert_eq!(d.snapshot_target, Target::All);
+        assert_eq!(d.datagram_mtu, 0);
     }
 }

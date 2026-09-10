@@ -10,7 +10,7 @@
 
 use std::io::{Read, Write};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 use uc_consensus::config::{ClusterConfig, ProposeError};
 use uc_protocol::v2::cluster_image::{
@@ -269,6 +269,10 @@ impl ClusterFsm {
                 Ok(())
             }
             ClusterCommand::Settings(s) => {
+                // Jumbo spec §5.5: 0 (baseline) or a ladder rung, nothing else.
+                if s.datagram_mtu != 0 && !uc_protocol::v2::datagram::is_rung(s.datagram_mtu) {
+                    return Err(ClusterRefusal::SettingsBounds("datagram_mtu"));
+                }
                 if s.admission_bytes == u64::MAX {
                     return Err(ClusterRefusal::SettingsBounds("admission_bytes"));
                 }
@@ -367,7 +371,12 @@ impl RawStateMachine for ClusterFsm {
                 self.state.table_position = ctx.position;
             }
             ClusterCommand::Settings(s) => {
+                // Jumbo spec §5.5: the rung is monotone in the FSM itself, so
+                // an operator record (absent keys = 0) cannot lower it, and
+                // every replica computes the same value.
+                let keep = self.state.settings.datagram_mtu.max(s.datagram_mtu);
                 self.state.settings = s;
+                self.state.settings.datagram_mtu = keep;
                 self.state.settings_position = ctx.position;
             }
         }
@@ -488,6 +497,10 @@ pub struct ClusterView {
     pub fsm_lag_bytes: AtomicU64,
     pub snapshot_interval_bytes: AtomicU64,
     pub snapshot_target: AtomicU8,
+    /// Jumbo spec §5.5: the committed datagram rung (`0` = baseline). Beside
+    /// the other settings scalars for the same reason — the sender agent
+    /// reads it per pass with one load and no lock.
+    pub datagram_mtu: AtomicU32,
     inner: Mutex<ClusterViewInner>,
 }
 
@@ -507,6 +520,7 @@ impl ClusterView {
             fsm_lag_bytes: AtomicU64::new(0),
             snapshot_interval_bytes: AtomicU64::new(0),
             snapshot_target: AtomicU8::new(0),
+            datagram_mtu: AtomicU32::new(0),
             inner: Mutex::new(ClusterViewInner {
                 membership: genesis.membership.clone(),
                 table: genesis.table.clone(),
@@ -536,6 +550,8 @@ impl ClusterView {
             .store(st.settings.snapshot_interval_bytes, Ordering::Release);
         self.snapshot_target
             .store(st.settings.snapshot_target as u8, Ordering::Release);
+        self.datagram_mtu
+            .store(st.settings.datagram_mtu, Ordering::Release);
         self.position.store(st.applied, Ordering::Release);
     }
 
@@ -569,6 +585,7 @@ impl ClusterView {
                     1 => uc_protocol::v2::settings::Target::Learners,
                     _ => uc_protocol::v2::settings::Target::All,
                 },
+                datagram_mtu: self.datagram_mtu.load(Ordering::Acquire),
             },
             settings_position: self.settings_position.load(Ordering::Acquire),
             applied: self.position.load(Ordering::Acquire),
@@ -853,6 +870,83 @@ mod tests {
         assert!(f.validate(&with_lag(16 << 20)).is_ok());
     }
 
+    /// Jumbo spec §5.5: `datagram_mtu` must be 0 or a rung.
+    #[test]
+    fn settings_datagram_mtu_must_be_a_rung() {
+        let fsm = ClusterFsm::new(ClusterState::genesis_empty(), Vec::new());
+        let mut s = Settings::genesis_default();
+        s.datagram_mtu = 1500;
+        assert_eq!(
+            fsm.validate_replicated(&ClusterCommand::Settings(s)),
+            Err(ClusterRefusal::SettingsBounds("datagram_mtu"))
+        );
+        assert_eq!(
+            fsm.validate_replicated(&ClusterCommand::Settings(s))
+                .unwrap_err()
+                .reason_code(),
+            47
+        );
+        s.datagram_mtu = 8832;
+        assert!(
+            fsm.validate_replicated(&ClusterCommand::Settings(s))
+                .is_ok()
+        );
+        s.datagram_mtu = 0;
+        assert!(
+            fsm.validate_replicated(&ClusterCommand::Settings(s))
+                .is_ok()
+        );
+    }
+
+    /// Jumbo spec §5.5: the FSM keeps the rung monotone — an operator's
+    /// `settings apply` (whose absent keys encode as 0) cannot lower it.
+    #[test]
+    fn settings_apply_never_lowers_datagram_mtu() {
+        let mut fsm = ClusterFsm::new(ClusterState::genesis_empty(), Vec::new());
+        let mut out = Vec::new();
+        let mut raise = Settings::genesis_default();
+        raise.datagram_mtu = 8960;
+        fsm.apply(
+            &mut ApplyCtx::for_sm::<ClusterFsm>(64),
+            &body(&ClusterCommand::Settings(raise)),
+            &mut out,
+        );
+        assert_eq!(out, [0]);
+        assert_eq!(fsm.state().settings.datagram_mtu, 8960);
+        // An operator record with datagram_mtu = 0 and a new admission value.
+        let mut op = Settings::genesis_default();
+        op.admission_bytes = 4096;
+        fsm.apply(
+            &mut ApplyCtx::for_sm::<ClusterFsm>(128),
+            &body(&ClusterCommand::Settings(op)),
+            &mut out,
+        );
+        assert_eq!(out, [0]);
+        assert_eq!(
+            fsm.state().settings.admission_bytes,
+            4096,
+            "the operator's field landed"
+        );
+        assert_eq!(
+            fsm.state().settings.datagram_mtu,
+            8960,
+            "the rung did not move"
+        );
+        // A lower rung is likewise kept at the max.
+        let mut lower = op;
+        lower.datagram_mtu = 8832;
+        fsm.apply(
+            &mut ApplyCtx::for_sm::<ClusterFsm>(192),
+            &body(&ClusterCommand::Settings(lower)),
+            &mut out,
+        );
+        assert_eq!(fsm.state().settings.datagram_mtu, 8960);
+        // And the monotone value is what reaches the view (Task 2 reads it).
+        let view = ClusterView::new(fsm.state());
+        assert_eq!(view.datagram_mtu.load(Ordering::Acquire), 8960);
+        assert_eq!(view.to_state().settings.datagram_mtu, 8960);
+    }
+
     /// Spec §9: `settings_position` is `table_position`'s twin — set by the
     /// Settings command's own frame-END, untouched by any other kind, and
     /// carried on the image, so a restarted node (and a joiner installing the
@@ -1002,6 +1096,7 @@ mod tests {
             admission_bytes: 4096,
             snapshot_interval_bytes: 1 << 30,
             snapshot_target: uc_protocol::v2::settings::Target::Learners,
+            datagram_mtu: 8832,
         };
         let v = ClusterView::new(&st);
         assert_eq!(v.to_state(), st);

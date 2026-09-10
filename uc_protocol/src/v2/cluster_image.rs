@@ -4,8 +4,9 @@
 //! The cluster FSM's frozen snapshot image codec (cluster-FSM spec §4.7,
 //! §4.8): magic ‖ version u32 ‖ applied u64 ‖ table_position u64 ‖
 //! settings_position u64 ‖ membership (u32 len ‖ bytes) ‖ table (u32 len ‖
-//! bytes) ‖ settings (fixed [`SETTINGS_LEN`]) ‖ crc32 of everything before
-//! it.
+//! bytes) ‖ settings (one whole [`SETTINGS_LEN`] or [`SETTINGS_LEN_V1`]
+//! record — the record is self-versioned and exact-length per version) ‖
+//! crc32 of everything before it.
 //!
 //! Moved out of `uc_node::cluster_fsm` (plan 3, spec §4.8) so a fuzz target
 //! can reach the decoder without pulling in `ClusterFsm` — a below-floor
@@ -26,7 +27,7 @@
 //! that dispatch for no gain — the image codec's own job is only the outer
 //! framing and the CRC.
 
-use super::settings::SETTINGS_LEN;
+use super::settings::{SETTINGS_LEN, SETTINGS_LEN_V1};
 
 pub const CLUSTER_IMAGE_MAGIC: &[u8; 8] = b"UCCLUST1";
 /// The image layout's version, refused by [`decode_cluster_image`] when
@@ -49,9 +50,9 @@ const FIXED_HEADER_LEN: usize = 8 + 4 + 8 + 8 + 8;
 /// `uc_node::cluster_fsm`'s prior `ML_OFFSET`.
 pub const MEMBERSHIP_LEN_OFFSET: usize = FIXED_HEADER_LEN;
 /// The smallest possible total image: the fixed header, two zero-length
-/// prefixes, a zero-length settings record (never actually zero — settings
-/// is fixed-length — kept only for the length floor check) and the CRC.
-const MIN_IMAGE_LEN: usize = FIXED_HEADER_LEN + 4 + 4 + SETTINGS_LEN + 4;
+/// prefixes, the SHORTEST settings record a decode accepts ([`SETTINGS_LEN_V1`]
+/// — a `2.11.0` artifact carries one, jumbo spec §5.5) and the CRC.
+const MIN_IMAGE_LEN: usize = FIXED_HEADER_LEN + 4 + 4 + SETTINGS_LEN_V1 + 4;
 
 /// The three replicated records inside a cluster image, plus the two
 /// positions that ride alongside them (spec §4.2, §4.8). `membership` and
@@ -159,11 +160,12 @@ pub fn decode_cluster_image(buf: &[u8]) -> Option<ClusterImageParts<'_>> {
     o += 4;
     let table = o.checked_add(tl).and_then(|end| body.get(o..end))?;
     o += tl;
-    // `settings::decode_settings` is itself exact-length (no trailing bytes
-    // tolerated), so require the remainder to be exactly `SETTINGS_LEN`
-    // rather than handing the caller a slice that could run past `body`'s
-    // end.
-    if o.checked_add(SETTINGS_LEN) != Some(body.len()) {
+    // The settings record is self-versioned and exact-length per version
+    // (`settings::decode_settings`): the remainder must be exactly one v1 or
+    // one v2 record — never a slice that could run past `body`'s end. A
+    // 2.11.0 artifact carries v1 — jumbo spec §5.5.
+    let rest = body.len().checked_sub(o)?;
+    if rest != SETTINGS_LEN && rest != SETTINGS_LEN_V1 {
         return None;
     }
     let settings = &body[o..];
@@ -203,9 +205,12 @@ mod tests {
     ///                  nt=0u16(2) = 22 bytes, all zero
     ///   table len      8u32, then `encode_schedule_table` of an empty
     ///                  table: version=1u32(4) ‖ count=0u32(4) = 8 bytes
-    ///   settings       `encode_settings(Settings::genesis_default())`:
+    ///   settings       the VERSION-1 settings record `2.11.0` wrote:
     ///                  version=1u32(4) ‖ fsm_lag=0u64(8) ‖ admission=0u64(8)
-    ///                  ‖ snapshot_interval=0u64(8) ‖ target=All=0u8(1) = 29 B
+    ///                  ‖ snapshot_interval=0u64(8) ‖ target=All=0u8(1) = 29 B.
+    ///                  `encode_settings` writes v2 (33 B) since the jumbo
+    ///                  flag day, so the fixture's tail is built by
+    ///                  `v1_settings_blob` — jumbo spec §5.5.
     ///   crc32          0x9D3283FF LE, of everything above
     #[rustfmt::skip]
     const PLAN1_FIXTURE: &[u8] = &[
@@ -243,6 +248,21 @@ mod tests {
         0xFF, 0x83, 0x32, 0x9D,
     ];
 
+    /// The 29-byte VERSION-1 settings record a `2.11.0` node wrote — the tail
+    /// of every cluster artifact that survives the jumbo flag day, and the
+    /// tail [`PLAN1_FIXTURE`] pins. Hand-built because `encode_settings` now
+    /// emits v2; jumbo spec §5.5.
+    fn v1_settings_blob() -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(&1u32.to_le_bytes());
+        v.extend_from_slice(&0u64.to_le_bytes());
+        v.extend_from_slice(&0u64.to_le_bytes());
+        v.extend_from_slice(&0u64.to_le_bytes());
+        v.push(0); // Target::All
+        assert_eq!(v.len(), SETTINGS_LEN_V1);
+        v
+    }
+
     fn genesis_parts() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
         use super::super::config::{WireConfig, encode_config};
         use super::super::schedule::{ScheduleTable, encode_schedule_table};
@@ -270,7 +290,11 @@ mod tests {
 
     #[test]
     fn cluster_image_roundtrips_and_layout_is_frozen() {
-        let (membership, table, settings) = genesis_parts();
+        let (membership, table, _) = genesis_parts();
+        // The OUTER framing is what this fixture freezes; the settings tail
+        // inside it is the v1 record `2.11.0` wrote, which this codec must
+        // still frame and decode after the jumbo flag day (§5.5).
+        let settings = v1_settings_blob();
         let parts = ClusterImageParts {
             applied: 500,
             table_position: 0,
@@ -298,6 +322,58 @@ mod tests {
         // And the fixture itself installs, pinning that a plan-1-era
         // artifact still loads under this leaf.
         assert_eq!(decode_cluster_image(PLAN1_FIXTURE), Some(parts));
+    }
+
+    /// Jumbo spec §5.5: a `2.11.0` artifact's tail is a 29-byte v1 settings
+    /// record and must keep framing and decoding — with the new field at its
+    /// baseline meaning — while a v2 tail (33 B) frames alongside it. Any
+    /// OTHER remainder is refused: the length is exact per version, so a
+    /// truncated or padded tail can never be read as a prefix.
+    #[test]
+    fn a_v1_settings_tail_still_frames_and_an_off_length_tail_is_refused() {
+        use super::super::settings::decode_settings;
+
+        let (membership, table, v2) = genesis_parts();
+        let v1 = v1_settings_blob();
+        for tail in [&v1, &v2] {
+            let parts = ClusterImageParts {
+                applied: 640,
+                table_position: 0,
+                settings_position: 320,
+                membership: &membership,
+                table: &table,
+                settings: tail,
+            };
+            let mut img = Vec::new();
+            encode_cluster_image(&parts, &mut img).expect("well under u32::MAX");
+            let d = decode_cluster_image(&img).expect("both record versions frame");
+            assert_eq!(d.settings.len(), tail.len());
+            assert_eq!(decode_settings(d.settings).unwrap().datagram_mtu, 0);
+        }
+        assert_eq!(v1.len(), 29);
+        assert_eq!(v2.len(), 33);
+
+        // 31 bytes: neither version's length. The CRC is correct — this is
+        // the framing check refusing it, not corruption.
+        for bad_len in [28usize, 31, 34] {
+            let mut tail = v2.clone();
+            tail.resize(bad_len, 0);
+            let parts = ClusterImageParts {
+                applied: 640,
+                table_position: 0,
+                settings_position: 320,
+                membership: &membership,
+                table: &table,
+                settings: &tail,
+            };
+            let mut img = Vec::new();
+            encode_cluster_image(&parts, &mut img).expect("well under u32::MAX");
+            assert_eq!(
+                decode_cluster_image(&img),
+                None,
+                "a {bad_len}-byte settings tail is neither version's exact length"
+            );
+        }
     }
 
     #[test]

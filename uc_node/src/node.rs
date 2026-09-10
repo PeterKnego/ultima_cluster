@@ -566,8 +566,12 @@ impl std::fmt::Display for SnapshotRefusal {
     }
 }
 
-/// Plan 1 (spec §6): the longest a staged settings file can be. `Settings` is
-/// fixed-width, so this is exact — anything else is refused unread.
+/// Plan 1 (spec §6): the longest a staged settings file can be. The record is
+/// fixed-width per version, so the CURRENT version's length is the cap —
+/// anything longer is refused unread. A shorter file is not refused here: a
+/// v1 record (29 B, jumbo spec §5.5) is still a legal payload and
+/// `decode_settings` is the one that rules on the exact (version, length)
+/// pair.
 const MAX_SETTINGS_BYTES: u64 = uc_protocol::v2::settings::SETTINGS_LEN as u64;
 
 /// What [`read_staged`] found at a staged admin payload's path.
@@ -7078,7 +7082,7 @@ impl Consensus {
                 (0, 0, position)
             }
             Err(AppendError::WouldOverrun) => (2, 0, view_position),
-            // Unreachable: `SETTINGS_LEN` is 29 bytes. Refused rather than
+            // Unreachable: `SETTINGS_LEN` is 33 bytes. Refused rather than
             // retried, for `apply_schedule_table`'s reason.
             Err(AppendError::PayloadTooLarge) => self.refuse_settings(REASON_SETTINGS_DECODE),
         }

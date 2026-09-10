@@ -97,6 +97,12 @@ pub fn parse_settings(toml_text: &str) -> Result<Settings, String> {
         fsm_lag_bytes,
         snapshot_interval_bytes: file.snapshot_interval_bytes.unwrap_or(0),
         snapshot_target,
+        // Jumbo spec §5.5: the datagram rung is LEADER-owned — written by
+        // discovery, never by an operator file, and `deny_unknown_fields`
+        // refuses a `datagram_mtu` key outright. Staging `0` is what makes
+        // an ordinary `settings apply` a no-op for it: the cluster FSM keeps
+        // the committed rung monotone, so a zero here cannot lower it.
+        datagram_mtu: 0,
     })
 }
 
@@ -205,10 +211,18 @@ pub fn show(common: &CommonArgs) -> anyhow::Result<()> {
         Target::All => "all",
         Target::Learners => "learners",
     };
+    // Jumbo spec §5.5: `0` is not "unset", it is the BASELINE `MTU_DEFAULT`
+    // every cluster starts from — printed by name so an operator reading the
+    // line never has to know that.
+    let rung = if settings.datagram_mtu == 0 {
+        "baseline"
+    } else {
+        "discovered"
+    };
     println!(
         "position={position} admission_bytes={} fsm_lag={fsm_lag} \
-         snapshot_interval_bytes={} snapshot_target={target}",
-        settings.admission_bytes, settings.snapshot_interval_bytes
+         snapshot_interval_bytes={} snapshot_target={target} datagram_mtu={} ({rung})",
+        settings.admission_bytes, settings.snapshot_interval_bytes, settings.datagram_mtu
     );
     Ok(())
 }
@@ -230,6 +244,7 @@ mod tests {
                 fsm_lag_bytes: FSM_LAG_LOCKSTEP,
                 snapshot_interval_bytes: 10,
                 snapshot_target: Target::Learners,
+                datagram_mtu: 0,
             }
         );
         assert_eq!(parse_settings("").unwrap(), Settings::genesis_default());
@@ -264,6 +279,16 @@ mod tests {
             s.fsm_lag_bytes < uc_protocol::v2::settings::MIN_FSM_LAG_BYTES,
             "the value this test is about must be below the door's bound"
         );
+    }
+
+    /// Jumbo spec §5.5: the rung is leader-owned; an operator file cannot name it.
+    #[test]
+    fn datagram_mtu_is_not_an_operator_key() {
+        let e = parse_settings("datagram_mtu = 8960\n").unwrap_err();
+        assert!(e.to_string().contains("datagram_mtu"), "{e}");
+        // And what `apply` stages carries the baseline, never a rung an
+        // operator smuggled in.
+        assert_eq!(parse_settings("").unwrap().datagram_mtu, 0);
     }
 
     #[test]

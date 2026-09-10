@@ -811,6 +811,10 @@ pub fn parse_str_with_env(
                 admission_bytes: s.admission_bytes.unwrap_or(0),
                 snapshot_interval_bytes: s.snapshot_interval_bytes.unwrap_or(0),
                 snapshot_target,
+                // Jumbo spec §5.5: leader-owned, written by discovery only —
+                // `[settings]` seeds genesis at the baseline and there is no
+                // operator key for it (`deny_unknown_fields` refuses one).
+                datagram_mtu: 0,
             }
         }
     };
