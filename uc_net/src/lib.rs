@@ -34,6 +34,7 @@ pub(crate) mod crypto_testkit;
 
 pub mod fault;
 pub mod flow;
+pub mod probe;
 pub mod rebuild;
 pub mod receiver;
 pub mod sender;
