@@ -16,6 +16,7 @@ uc_protocol = { path = "../uc_protocol", version = "2.11.0" }
 uc_log = { path = "../uc_log", version = "2.11.0" }
 uc_crypto = { path = "../uc_crypto", version = "2.11.0" }
 uc_journal = { workspace = true }
+libc = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

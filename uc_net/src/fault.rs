@@ -59,6 +59,11 @@ pub struct FaultConfig {
     /// bytes at an arbitrary later time. Zero (the default) costs nothing:
     /// no history is even recorded when this is 0.
     pub replay_per_million: u32,
+    /// Jumbo spec §10: a send longer than this is dropped whole, the way a
+    /// DF'd datagram is lost at a hop narrower than it — the in-process stand-in
+    /// for a small-MTU path. `usize::MAX` (the default) = no cap. Checked
+    /// before the seeded rolls so it consumes no RNG draw.
+    pub max_datagram: usize,
 }
 
 impl Default for FaultConfig {
@@ -70,6 +75,7 @@ impl Default for FaultConfig {
             reorder_per_million: 0,
             corrupt_per_million: 0,
             replay_per_million: 0,
+            max_datagram: usize::MAX,
         }
     }
 }
@@ -220,6 +226,9 @@ impl FaultSocket {
                 return Ok(());
             }
         }
+        if buf.len() > self.cfg.max_datagram {
+            return Ok(()); // lost at a narrow hop (jumbo spec §10)
+        }
         if self.cfg.drop_per_million > 0 && self.rng.chance(self.cfg.drop_per_million) {
             return Ok(()); // dropped on the wire
         }
@@ -343,6 +352,27 @@ mod tests {
             }
         }
         got
+    }
+
+    /// Jumbo spec §10: a capped "path" drops anything longer, the way a DF'd
+    /// datagram vanishes at a narrow hop — deterministically, consuming no RNG
+    /// draw, so a seeded run's drop/dup/reorder sequence is unchanged.
+    #[test]
+    fn max_datagram_drops_longer_sends_without_touching_the_rng() {
+        let rx = UdpSocket::bind("127.0.0.1:0").unwrap();
+        rx.set_nonblocking(true).unwrap();
+        let to = rx.local_addr().unwrap();
+        let mut tx = FaultSocket::bind("127.0.0.1:0").unwrap();
+        tx.set_faults(FaultConfig {
+            max_datagram: 1408,
+            ..FaultConfig::default()
+        });
+        tx.send_to(&vec![1u8; 1408], to).unwrap(); // at the cap: passes
+        tx.send_to(&vec![2u8; 1409], to).unwrap(); // over: dropped
+        tx.send_to(&vec![3u8; 8960], to).unwrap(); // over: dropped
+        let got = recv_all(&FaultSocket::from_socket(rx).unwrap(), 1);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].len(), 1408);
     }
 
     #[test]

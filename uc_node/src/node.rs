@@ -963,6 +963,12 @@ impl Node {
             None => UdpSocket::bind(cfg.bind)?,
         };
         let self_addr = sock.local_addr()?;
+        // Jumbo spec §4.3: do-not-fragment on the one node socket (all three
+        // FaultSocket clones share it). An oversize send fails with EMSGSIZE
+        // instead of fragmenting silently; a probe that is acked was carried
+        // whole. Applied to an injected test socket too — the tests are where
+        // the DF behaviour is proven.
+        uc_net::sockopt::set_dont_fragment(&sock)?;
 
         // 1. flock FIRST — one node per instance dir. A contended lock (a live
         // node already owns this dir) surfaces as an io error whose Display
