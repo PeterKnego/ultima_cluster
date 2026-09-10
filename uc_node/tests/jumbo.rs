@@ -266,15 +266,11 @@ fn the_ceiling_holds_at_baseline_while_one_member_is_silent() {
         );
     }
 
-    // The deadline covers the SLOW cadence deliberately. A peer that never
-    // answers exhausts the 5 fast attempts and backs off to `slow_ns`
-    // (30 s), so once the third node comes up the raise lands either within
-    // ~1 s (the fast window had an attempt left) or ~31 s (it did not) —
-    // measured at both on this box, from the same source. That is the
-    // product's behaviour for a member that joins late, not a harness
-    // artefact; the assertion is that the rung DOES rise, bounded.
+    // Task 8b: a rejoining peer's own PROBE is proof of life and resets our
+    // cadence toward it, so the raise lands in seconds rather than waiting
+    // out the slow cadence's up-to-31 s tick.
     nodes.push(fleet.start(2, FaultConfig::default()));
-    await_rung(&nodes, 8960, 60);
+    await_rung(&nodes, 8960, 20);
     stop_all(nodes);
 }
 

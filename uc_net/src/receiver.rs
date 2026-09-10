@@ -1919,6 +1919,9 @@ impl FollowerReceiver {
                     .fetch_add(1, Ordering::Relaxed);
                 return;
             }
+            // Task 8b: a probe is proof of life — pull a backed-off peer back
+            // to the fast cadence.
+            table.on_peer_seen(from);
             let ack = ProbeAckBody {
                 rung,
                 own_min_rung: table.own_min_rung(),

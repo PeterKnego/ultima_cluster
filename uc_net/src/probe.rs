@@ -202,6 +202,24 @@ impl ProbeTable {
         }
     }
 
+    /// Task 8b: a PROBE received from `from` is proof the peer is alive. If we
+    /// had backed off on it (slow cadence, unresolved), restart its fast ladder
+    /// now so a rejoining member's raise lands in seconds. A peer still on the
+    /// fast cadence, a resolved peer, or an unknown address is a no-op — two
+    /// nodes booting together must not keep resetting each other.
+    pub fn on_peer_seen(&self, from: SocketAddr) {
+        let mut g = self.peers.lock().unwrap();
+        let Some(p) = g.get_mut(&from) else {
+            return;
+        };
+        if Self::resolved(p) || p.attempts < self.cadence.fast_attempts {
+            return;
+        }
+        p.attempts = 0;
+        p.next_due_ns = 0;
+        self.publish_earliest(&g);
+    }
+
     /// Spec §5.2: min over peers of `verified`; 0 while any peer is
     /// unresolved; `MTU_BOUND` for a node with no peers (a solo cluster's
     /// path is loopback).
@@ -417,5 +435,33 @@ mod tests {
         assert_eq!(t.get(a(1)).unwrap().verified, 8960);
         assert!(t.get(a(2)).is_none());
         assert_eq!(t.get(a(3)).unwrap(), PeerProbe::default());
+    }
+
+    /// Task 8b: a PROBE from a peer we had backed off on is proof of life —
+    /// pull it back to the fast cadence so a rejoining member's raise lands
+    /// in seconds, not at the next 30 s tick.
+    #[test]
+    fn a_probe_from_a_backed_off_peer_resets_its_cadence() {
+        let t = ProbeTable::new(fast());
+        t.set_peers(&[a(1)]);
+        t.due(0); // attempt 1 (fast)
+        t.due(10); // attempt 2 → now on the slow cadence, next due at 110
+        assert!(t.due(50).is_empty(), "slow cadence: not due yet");
+        t.on_peer_seen(a(1));
+        assert_eq!(t.get(a(1)).unwrap().attempts, 0);
+        assert_eq!(t.due(50).len(), 1, "reset: due now");
+        // A peer still on the fast cadence is left alone.
+        let t2 = ProbeTable::new(fast());
+        t2.set_peers(&[a(2)]);
+        t2.due(0);
+        let before = t2.get(a(2)).unwrap();
+        t2.on_peer_seen(a(2));
+        assert_eq!(t2.get(a(2)).unwrap(), before, "fast cadence: no reset");
+        // A resolved peer and a stranger are no-ops.
+        t2.on_ack(a(2), 8960, 8960);
+        t2.on_peer_seen(a(2));
+        assert!(t2.due(1_000).is_empty(), "resolved stays resolved");
+        t2.on_peer_seen(a(9));
+        assert!(t2.get(a(9)).is_none());
     }
 }
