@@ -26,6 +26,18 @@ analyses, wire-version mechanics, upgrade remedies — is
   with the typed refusal it would have given had the page been bad at open
   time. Recorded as a known issue at
   [2.11.0](docs/releases.md#known-issue-at-release-cncpagemeta-panics-on-a-page-a-live-writer-re-initialised).
+- **Fixed: a service or client attaching while a node boots could adopt the
+  wrong lag policy or FSM set for life.** The node publishes its cnc header
+  (FSM names included) a few statements before the declared set and lag
+  policy; an attacher landing in that gap read the harness signature
+  (`services_declared == 0`) and fixed `LagMode::Off` — unbounded, on a
+  lockstep cluster — or a one-FSM view of a multi-FSM node, with no fail-stop
+  ever firing because the `instance_id` was correct. Names with no declared
+  set is a page no configured node publishes and no harness page has, so both
+  doors now refuse it by name (`ServiceError::NodeBooting` /
+  `ClientError::NodeBooting` — retry), and the node stores the lag policy
+  BEFORE the declared set so a published set implies a published policy.
+  Found by review of the `CncPage::meta()` fix; pre-existing since 2.8.0.
 - **Performance:** the fleet A/B (`m14_fleet_gate.py` rows a/b/e, this tree
   vs its pre-change parent commit) is **pre-committed and not yet run** —
   [the gate doc](docs/benchmarks/uc2-log-clock-gate-2026-09-08.md).

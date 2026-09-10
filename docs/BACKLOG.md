@@ -350,6 +350,25 @@ crc32 like `validate` does.
 Record: `docs/releases.md`, "Known issue at release" → its **FIXED after the
 tag** paragraph.
 
+**Same family, found by the review of that fix (2026-09-10), also fixed for
+`2.12.0`:** the boot gap. `create_file` publishes a complete, crc-valid header
+(names on line 7); `store_services_declared` and `store_fsm_lag_bytes` land
+three statements later, outside the crc. A service attaching in between read
+names-present with `services_declared == 0` — the harness signature — and
+`lag_mode_for`'s `(0, _) => Off` arm fixed `LagMode::Off` for its life, on a
+lockstep cluster, with the correct `instance_id` so no fail-stop ever fired;
+a client folded the same page to "FSM 0 only". Names with no declared set is
+unambiguous (a configured node always declares a nonzero set; a harness page
+has no names), so both doors refuse it as `NodeBooting`; and the node now
+stores lag BEFORE declared, so a published set implies a published policy —
+without that, the sub-window between the two stores reads as a legitimate
+lockstep config and cannot be told apart. Pinned at both doors by tests that
+build the mid-boot page (names, no declared word) and assert the named
+refusal, plus a control that a published set and a harness page are not
+refused. The store-order half is a memory-ordering argument (Release stores,
+Acquire loads), not a test: two adjacent stores cannot be raced
+deterministically.
+
 ### FSM identity — name the state machine, not the slot (was item 2)
 
 Taken up 2026-09-01, IMPLEMENTED 2026-09-02, merged to `main` 2026-09-04.

@@ -1087,6 +1087,26 @@ the crc32 exactly as `validate` does, which makes it `validate`'s fallible
 twin rather than `try_instance_id`'s (the hot-path probe that deliberately
 skips the crc).
 
+**And the boot gap, same family, same review (2026-09-10).** Two boot-once
+words live OUTSIDE the crc and are stored after it: `node.rs` runs
+`create_file` (a complete header, names on line 7), then
+`store_services_declared` and `store_fsm_lag_bytes` three statements later. A
+service attaching in that gap passed `try_meta` with the real `instance_id`,
+saw names with `services_declared == 0`, and `lag_mode_for`'s harness arm
+`(0, _) => Off` fixed `LagMode::Off` for the attachment's life — an unbounded
+FSM on a lockstep cluster, invisible: the cluster-wide lag check lives on the
+snapshot path, and the restart detector keys on an `instance_id` that was
+correct. `Engine::attach`'s `(0, _) => 0b1` fold gave a client a one-FSM view
+of a multi-FSM node the same way. Names with no declared set is a page no
+configured node publishes and no harness page has, so it uniquely means
+mid-boot: both doors refuse it as `NodeBooting` ("retry"). That check covers
+the whole gap only if a nonzero declared set implies the lag word is already
+on the page, so the node now stores lag BEFORE declared (Release stores,
+Acquire loads); the sub-window between the two stores otherwise reads as a
+legitimate lockstep config. Pinned at both doors by tests that build the
+mid-boot page and assert the named refusal, with controls for a published
+set and a harness page. Pre-existing since M14a (`2.8.0`).
+
 **Still unexplained, and deliberately not claimed as fixed by the above:** the
 58-minute HANG. This panic explains the failure, not a stall — every wait in
 the test body is deadlined (30 s settle, 60 s final read). Three waits are NOT
