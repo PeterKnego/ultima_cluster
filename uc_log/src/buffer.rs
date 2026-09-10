@@ -162,6 +162,10 @@ impl LogBuffer {
     #[inline]
     pub fn set_payload_ceiling(&self, v: usize) {
         debug_assert!(v <= self.max_payload, "ceiling above the bound");
+        // The `Release` is decorative: this writer and `Appender::append` are
+        // the same consensus thread, and the word is standalone (it publishes
+        // no other memory), so no ordering is being established — which is why
+        // every door loads it `Relaxed`.
         self.payload_ceiling
             .store(v.min(self.max_payload), Ordering::Release);
     }

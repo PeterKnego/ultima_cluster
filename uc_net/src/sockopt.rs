@@ -9,14 +9,25 @@
 //! acked was carried WHOLE, and a data send that does not fit is a counted
 //! failure rather than a silent fragment (one lost fragment loses the whole
 //! datagram, which surfaces as a mystery NAK storm).
+//!
+//! **Linux and Android only.** The three options this needs
+//! (`IP_MTU_DISCOVER`, `IPV6_MTU_DISCOVER`, `IPV6_DONTFRAG`) exist in the
+//! `libc` crate for those targets alone, and DF is load-bearing rather than
+//! decorative here: without it the kernel fragments and a probe is acked for
+//! a size the path does not carry, so discovery over-reports. Every other OS
+//! therefore gets an `ErrorKind::Unsupported` error, which `Node::start_with`
+//! propagates — a node on such a host refuses to start, BY NAME, instead of
+//! running with a silently unsound ladder.
 
 use std::io;
 use std::net::UdpSocket;
+#[cfg(any(target_os = "linux", target_os = "android"))]
 use std::os::fd::AsRawFd;
 
 /// Set DF on `sock` for its address family: `IP_MTU_DISCOVER =
 /// IP_PMTUDISC_DO` for IPv4, `IPV6_MTU_DISCOVER = IPV6_PMTUDISC_DO` plus
 /// `IPV6_DONTFRAG = 1` for IPv6.
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub fn set_dont_fragment(sock: &UdpSocket) -> io::Result<()> {
     let fd = sock.as_raw_fd();
     let v6 = sock.local_addr()?.is_ipv6();
@@ -39,7 +50,19 @@ pub fn set_dont_fragment(sock: &UdpSocket) -> io::Result<()> {
     Ok(())
 }
 
+/// The non-Linux arm of [`set_dont_fragment`]: refuse, by name. See the
+/// module doc — running without DF would over-report the path.
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+pub fn set_dont_fragment(_sock: &UdpSocket) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "do-not-fragment is not available on this OS; path-MTU discovery would \
+         over-report the path (jumbo spec §4.3)",
+    ))
+}
+
 /// Read back `IP_MTU_DISCOVER` / `IPV6_MTU_DISCOVER` (tests, diagnostics).
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub fn mtu_discover(sock: &UdpSocket) -> io::Result<libc::c_int> {
     let fd = sock.as_raw_fd();
     let (level, name) = if sock.local_addr()?.is_ipv6() {
@@ -66,6 +89,7 @@ pub fn mtu_discover(sock: &UdpSocket) -> io::Result<libc::c_int> {
     Ok(v)
 }
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn setsockopt(
     fd: i32,
     level: libc::c_int,
@@ -88,7 +112,7 @@ fn setsockopt(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
 mod tests {
     use super::*;
 
@@ -112,4 +136,19 @@ mod tests {
     // a datagram over it is refused with EMSGSIZE with or without DF). The
     // behaviour is proven on the fleet's 1500 B arm (spec §10 row b); these
     // tests pin only that the option is set.
+}
+
+/// The other arm's one property: a refusal, not a silent success. NOTE: this
+/// module compiles only on a non-Linux target, and the repo has no such
+/// toolchain — it is written but never built here.
+#[cfg(all(test, not(any(target_os = "linux", target_os = "android"))))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn df_is_refused_by_name_off_linux() {
+        let s = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let e = set_dont_fragment(&s).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::Unsupported);
+    }
 }

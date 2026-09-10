@@ -68,6 +68,10 @@ pub const MTU_BOUND: usize = RUNGS[RUNGS.len() - 1] as usize;
 pub const JUMBO_MIN_RUNG: u32 = 8832;
 const _: () = assert!(RUNGS[0] as usize == MTU_DEFAULT);
 const _: () = assert!(RUNGS[0] < RUNGS[1] && RUNGS[1] < RUNGS[2]);
+// `force_jumbo_frames` (plan 2) keys a startup gate on this rung, and the
+// ladder is what a node can ever verify — a `JUMBO_MIN_RUNG` off the ladder
+// would make that gate unsatisfiable.
+const _: () = assert!(is_rung(JUMBO_MIN_RUNG));
 
 /// Is `v` one of the ladder's rungs? The only values `Settings::datagram_mtu`
 /// may carry besides `0`.

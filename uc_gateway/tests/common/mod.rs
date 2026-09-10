@@ -92,31 +92,17 @@ pub fn await_serving(node: &Node, secs: u64) {
     }
 }
 
-/// Jumbo spec §5.3: a solo leader has no peer to probe, so its probe-table
-/// minimum is the ladder's top rung and it commits `MTU_BOUND` within ~100 ms
-/// of leading. That commit RE-STORES the cnc ceiling word (`refresh_from_view`
-/// is change-gated, so exactly once), which would stomp a value a test wrote
-/// first. Park `value` in the word and return only once the rung is terminal
-/// AND the value has survived a settle window — after that no raise is
-/// possible (the commit rule is raise-only and already at the top), so the
-/// word stays the test's.
-pub fn park_payload_ceiling(node: &Node, page: &uc_log::cnc::CncPage, value: u64) {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        page.store_payload_ceiling(value);
-        std::thread::sleep(Duration::from_millis(50));
-        if node.datagram_mtu() == uc_protocol::v2::datagram::MTU_BOUND as u32
-            && page.payload_ceiling() == value
-        {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the node never settled on the top rung (datagram_mtu = {}, ceiling = {})",
-            node.datagram_mtu(),
-            page.payload_ceiling()
-        );
-    }
+/// Put `value` in the cnc ceiling word and leave it there.
+///
+/// Jumbo spec §5.3 erratum 4: a solo leader's `ProbeTable::table_min` over an
+/// empty member set is `None`, so it never commits a raise — the node writes
+/// the word once, at boot, before any agent runs, and `refresh_from_view`'s
+/// ceiling store is gated on the committed rung actually moving. So after
+/// `await_serving` a plain store is terminal: nothing re-stores it. (Before
+/// the erratum this had to race a top-rung commit that landed ~100 ms into
+/// leadership.)
+pub fn park_payload_ceiling(page: &uc_log::cnc::CncPage, value: u64) {
+    page.store_payload_ceiling(value);
 }
 
 /// The state machine every multi-node rig runs: the shared `RegisterSm` under

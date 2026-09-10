@@ -1019,6 +1019,7 @@ dependencies = [
 name = "uc_net"
 version = "2.11.0"
 dependencies = [
+ "libc",
  "uc_crypto",
  "uc_journal",
  "uc_log",

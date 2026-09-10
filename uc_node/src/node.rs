@@ -10186,10 +10186,10 @@ mod tests {
             state,
             cnc: Arc::clone(&cnc),
             buffer,
-            // Jumbo: no peers wired in this harness — a table with an empty
-            // peer set makes `table_min(&[])` `Some(MTU_BOUND)`, but the
-            // harness's membership is a single voter (itself), so the commit
-            // rule sees an empty member list and the whole path is inert
+            // Jumbo: no peers wired in this harness. The harness's membership
+            // is a single voter (itself), so the commit rule sees an EMPTY
+            // member list, and `table_min(&[])` is `None` (spec erratum 4:
+            // no evidence, not universal evidence) — the whole path is inert
             // unless a test seeds the ledger itself.
             probe_table: ProbeTable::new(ProbeCadence::default()),
             live_mtu: Arc::new(AtomicUsize::new(MTU_DEFAULT)),
@@ -11156,7 +11156,10 @@ mod tests {
 
         // I1: a bound the DOOR accepts (above `MIN_FSM_LAG_BYTES`, the
         // cluster-wide constant) but that is still below ONE FRAME on this
-        // host — the harness runs an out-of-MTU `max_payload = 4096` — is
+        // host — the harness runs `max_payload = 4096`, which since jumbo is
+        // INSIDE the bound (`payload_ceiling(MTU_BOUND, crypto)` = 8896) and
+        // is this harness's live ceiling, since nothing here lowers it to the
+        // baseline the way `Node::start_with` does — is
         // clamped UP at use, both in the door and in the page. Below one
         // frame the report ceiling can sit inside the next frame forever, so
         // there is no such thing as honouring this value.

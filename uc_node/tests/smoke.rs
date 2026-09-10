@@ -260,15 +260,23 @@ fn ingress_ring_submission_reaches_commit_and_non_leader_redirects() {
     let ring = uc_protocol::ring::mpsc::MpscRing::open(&dir.path().join("ingress.ring")).unwrap();
     let (prod, _) = ring.into_split();
 
-    // Jumbo (2.12.0): a SOLO cluster's leader commits the top rung on one of
-    // its first passes — `ProbeTable::table_min` over an empty member set is
-    // the loopback bound, so there is nothing to discover and the rule fires
-    // at once. That puts a `CLUSTER` frame on the log at a position this test
-    // cannot predict, so wait for it to have landed before sampling
-    // `commit0`; afterwards `min == committed` and no further one is
-    // appended, which is what makes the position read below the CLIENT's
-    // frame.
-    wait_until(|| node.datagram_mtu() == uc_protocol::v2::datagram::MTU_BOUND as u32);
+    // Jumbo (2.12.0), spec erratum 4: a SOLO cluster STAYS at the baseline.
+    // `ProbeTable::table_min` over an empty member set is `None` — no
+    // evidence, not universal evidence — so the leader's commit rule never
+    // fires and no `CLUSTER` frame lands at an unpredictable position between
+    // `commit0` and the client's frame below. Settle first and assert the
+    // baseline held, which is the property: a one-node cluster must not
+    // commit a rung it has measured nothing about, because the FSM's rung is
+    // monotone and a later `add-learner` on a 1500 B path could never be
+    // caught up.
+    let baseline = uc_protocol::v2::datagram::MTU_DEFAULT as u32;
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(node.datagram_mtu(), baseline, "solo: no raise, ever");
+    assert_eq!(
+        node.payload_ceiling(),
+        256,
+        "the baseline ceiling, clamped by this rig's max_payload"
+    );
 
     let commit0 = node.counters().commit.load_acquire();
     prod.try_write(MSG_V2_SUBMIT, 0, extra_client(7, 1), b"hello-ring")

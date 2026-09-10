@@ -335,7 +335,8 @@ def render_config(node_id, bind, metrics_bind, instance_dir, members):
         f'instance_dir = "{instance_dir}"',
         f'app_id = "{APP}"',
         "buffer_bytes = 67108864",     # 64 MiB — production-shaped; fleet run 2 proved 4 MiB churns elections under the m5 pump
-        "max_payload = 256",
+        # Jumbo (2.12.0): `max_payload` is refused by name — the payload
+        # ceiling is discovered from the path MTU and committed cluster-wide.
         "journal_segment_bytes = 67108864",  # 64 MiB — fleet run 2: 16 KiB segments rolled ~kHz under load;
         # the journal holds an fd per segment, so the daemons EMFILE-fail-stopped in 15-90s (1011
         # segments on disk). Production default sizing + the packaged unit\'s nofile limit fix it.

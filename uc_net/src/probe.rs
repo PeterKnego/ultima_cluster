@@ -53,9 +53,12 @@ pub struct ProbeTable {
     /// resolved-ness, and read WITHOUT the lock by [`ProbeTable::due`] —
     /// which the sender's busy loop calls every pass, and which must
     /// therefore cost one `Relaxed` load and nothing else on the overwhelming
-    /// majority of passes. A stale-high reading cannot happen (the store is
-    /// under the lock and only ever lowered by a writer that then holds it);
-    /// a stale-LOW reading costs one needless lock, never a missed probe.
+    /// majority of passes. A stale-HIGH reading is bounded by cache coherence
+    /// — `on_peer_seen`/`set_peers` lower this from the receiver thread and the
+    /// sender's `Relaxed` load may see the older, higher value for a few
+    /// coherence cycles — so it costs at most one extra pass before the probe
+    /// goes out, never a lost probe. A stale-LOW reading costs one needless
+    /// lock, and likewise never misses one.
     earliest_due_ns: AtomicU64,
 }
 
@@ -231,10 +234,23 @@ impl ProbeTable {
         g.values().map(|p| p.verified).min().unwrap_or(0)
     }
 
-    /// Spec §5.3: the leader's table minimum over `members` — `Some` only when
-    /// every member has an entry whose `verified` and `advertised` are both
-    /// non-zero (every pair answered). An empty `members` is `Some(MTU_BOUND)`.
+    /// Spec §5.3 (erratum 4): the leader's table minimum over `members` —
+    /// `Some` only when every member has an entry whose `verified` and
+    /// `advertised` are both non-zero (every pair answered).
+    ///
+    /// An EMPTY `members` is `None`: no evidence, not universal evidence. A
+    /// solo cluster has measured nothing, so it stays at the baseline door
+    /// until a peer joins and is probed. The alternative — answering
+    /// `MTU_BOUND` because the only path is loopback — would have a one-node
+    /// cluster commit the top rung on zero measurements, and the FSM's rung is
+    /// MONOTONE: the grow-from-one path (start one node, `add-learner`,
+    /// promote) would then wedge on a standard-MTU network, the joiner's
+    /// snapshot chunks cut at the leader's 8960 B budget and never arriving,
+    /// with a wipe as the only remedy.
     pub fn table_min(&self, members: &[SocketAddr]) -> Option<u32> {
+        if members.is_empty() {
+            return None;
+        }
         let g = self.peers.lock().unwrap();
         let mut min = MTU_BOUND as u32;
         for m in members {
@@ -423,7 +439,15 @@ mod tests {
         );
         // A member not in the table (never set as a peer) blocks the rule.
         assert_eq!(t.table_min(&[a(1), a(2), a(3)]), None);
-        assert_eq!(t.table_min(&[]), Some(MTU_BOUND as u32));
+        // An EMPTY member set is NO evidence, not universal evidence: a solo
+        // cluster must stay at the baseline door until a peer joins and is
+        // probed. `Some(MTU_BOUND)` here would let a one-node cluster commit
+        // the top rung on zero measurements — irreversibly, the FSM's rung
+        // being monotone — and the grow-from-one path (start one node,
+        // `add-learner`, promote) would then wedge on a standard-MTU network:
+        // the joiner's snapshot chunks are cut at the leader's 8960 B budget
+        // and never arrive, with a wipe as the only remedy.
+        assert_eq!(t.table_min(&[]), None);
     }
 
     #[test]

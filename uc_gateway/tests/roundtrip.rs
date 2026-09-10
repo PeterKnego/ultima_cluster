@@ -261,7 +261,7 @@ fn the_edge_door_follows_the_live_cnc_ceiling() {
     // the edge's attach-time header bound (256, the rig's `max_payload`)
     // differs from the live word and only reading the live word can refuse.
     let page = uc_log::cnc::CncPage::open_file(&dir.join("cnc2.dat"), common::APP).unwrap();
-    common::park_payload_ceiling(&node, &page, wire as u64 - 1);
+    common::park_payload_ceiling(&page, wire as u64 - 1);
 
     let edge = Edge::start(edge_config(&dir, true)).unwrap();
     let client = RemoteClient::connect(remote_config(&edge)).unwrap();
