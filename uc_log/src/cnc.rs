@@ -25,10 +25,11 @@ use uc_protocol::v2::cnc::{
     self, CNC_MAX_PEER_SLOTS, CNC_MAX_SERVICES, CNC_OFF_ADMIN_AUTH, CNC_OFF_ADMIN_REQ,
     CNC_OFF_ADMIN_RESP, CNC_OFF_ADMISSION_BYTES, CNC_OFF_APPEND, CNC_OFF_ARCHIVE_FIRST_BASE,
     CNC_OFF_CONFIG_PENDING, CNC_OFF_CONFIG_VERSION, CNC_OFF_FREE_DISK_BYTES, CNC_OFF_FSM_LAG_BYTES,
-    CNC_OFF_HEADER_CRC, CNC_OFF_INGRESS_HOLES_SKIPPED, CNC_OFF_LOG_TIME_NS, CNC_OFF_PEER_SLOTS,
-    CNC_OFF_QUERY_HOLES_SKIPPED, CNC_OFF_SEAL_FAILURES, CNC_OFF_SERVICE_APPLIED,
-    CNC_OFF_SERVICE_SLOTS, CNC_OFF_SERVICE_SNAPSHOT_POS, CNC_OFF_SERVICES_DECLARED, CNC_OFF_TERM,
-    CNC_PAGE_LEN, CNC_PEER_SLOT_STRIDE, CNC_SERVICE_SLOT_STRIDE, CNC_SVC_STATUS_ATTACHED,
+    CNC_OFF_HEADER_CRC, CNC_OFF_INGRESS_HOLES_SKIPPED, CNC_OFF_LOG_TIME_NS,
+    CNC_OFF_PAYLOAD_CEILING, CNC_OFF_PEER_SLOTS, CNC_OFF_QUERY_HOLES_SKIPPED,
+    CNC_OFF_SEAL_FAILURES, CNC_OFF_SERVICE_APPLIED, CNC_OFF_SERVICE_SLOTS,
+    CNC_OFF_SERVICE_SNAPSHOT_POS, CNC_OFF_SERVICES_DECLARED, CNC_OFF_TERM, CNC_PAGE_LEN,
+    CNC_PEER_SLOT_STRIDE, CNC_SERVICE_SLOT_STRIDE, CNC_SVC_STATUS_ATTACHED,
     CNC_SVC_STATUS_INCARNATION_SHIFT, CNC_V2_VERSION, CncHeader,
 };
 
@@ -809,6 +810,21 @@ impl CncPage {
         unsafe { (*ptr).store(v, Ordering::Release) }
     }
 
+    /// Jumbo spec §7.3: the live command payload ceiling. Bare `AtomicU64` at
+    /// 3984 — third word of the 3968 line, same reasoning as its neighbours.
+    pub fn payload_ceiling(&self) -> u64 {
+        // SAFETY: offset 3984, size 8, 8-byte aligned (3984 % 8 == 0).
+        let ptr = unsafe { self.region.ptr_at(CNC_OFF_PAYLOAD_CEILING) as *const AtomicU64 };
+        unsafe { (*ptr).load(Ordering::Acquire) }
+    }
+
+    /// Writer: the consensus agent, on change only.
+    pub fn store_payload_ceiling(&self, v: u64) {
+        // SAFETY: offset 3984, size 8, 8-byte aligned. See the getter.
+        let ptr = unsafe { self.region.ptr_at(CNC_OFF_PAYLOAD_CEILING) as *const AtomicU64 };
+        unsafe { (*ptr).store(v, Ordering::Release) }
+    }
+
     /// M7: config pending (1 = uncommitted, 0 = stable).
     pub fn config_pending(&self) -> u64 {
         // SAFETY: offset 3520, size 8.
@@ -1214,6 +1230,8 @@ mod tests {
         );
         assert_eq!(CNC_OFF_INGRESS_HOLES_SKIPPED + 64, 4032);
         const { assert!(CNC_OFF_INGRESS_HOLES_SKIPPED + 64 <= CNC_PAGE_LEN) };
+        // Jumbo (cnc 3.2): the live payload ceiling, third word of the 3968 line.
+        assert_eq!(cnc::CNC_OFF_PAYLOAD_CEILING, 3984);
         // M14a: the boot-once pair and page 2.
         assert_eq!(cnc::CNC_OFF_SERVICES_DECLARED, 4032);
         assert_eq!(cnc::CNC_OFF_FSM_LAG_BYTES, 4040);
@@ -1732,6 +1750,24 @@ mod tests {
             u64::from_le_bytes(raw[3976..3984].try_into().unwrap()),
             7,
             "offset pin: the value must live at 3976 exactly"
+        );
+    }
+
+    #[test]
+    fn payload_ceiling_roundtrip_and_offset_pin() {
+        let page = CncPage::heap(&test_meta());
+        assert_eq!(
+            page.payload_ceiling(),
+            0,
+            "fresh page: the node stores it at boot"
+        );
+        page.store_payload_ceiling(8864);
+        assert_eq!(page.payload_ceiling(), 8864);
+        let raw = page.page();
+        assert_eq!(
+            u64::from_le_bytes(raw[3984..3992].try_into().unwrap()),
+            8864,
+            "offset pin: the value must live at 3984 exactly"
         );
     }
 

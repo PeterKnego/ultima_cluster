@@ -16,7 +16,7 @@
 
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 use uc_protocol::v2::frame::{
     self, CLUSTER_BODY_PREFIX_LEN, ClusterKind, FRAME_TYPE_CLUSTER, FRAME_TYPE_MESSAGE,
@@ -76,6 +76,10 @@ pub struct LogBuffer {
     capacity: u64,
     mask: u64,
     max_payload: usize,
+    /// Jumbo spec §7.1: the LIVE door `Appender::append`/`append_cluster`
+    /// refuse above. Starts equal to `max_payload` (the bound); the node
+    /// lowers it to the negotiated baseline before any agent runs.
+    payload_ceiling: AtomicUsize,
     /// The shared cnc v2 page: the buffer's position counters
     /// ([`LogCounters`]) live cast onto it (`cnc.counters()`), so every
     /// process mapping the page coordinates over the same atomics (M5).
@@ -115,6 +119,7 @@ impl LogBuffer {
             capacity,
             mask: capacity - 1,
             max_payload,
+            payload_ceiling: AtomicUsize::new(max_payload),
             cnc,
         }
     }
@@ -138,9 +143,27 @@ impl LogBuffer {
         &self.cnc
     }
 
+    /// The BOUND: the largest payload this buffer is sized for (capacity ≥
+    /// 4× its max claim). Since jumbo, NOT the door — see [`Self::payload_ceiling`].
     #[inline]
     pub fn max_payload(&self) -> usize {
         self.max_payload
+    }
+
+    /// Jumbo spec §7.1: the LIVE door `Appender::append` refuses above —
+    /// `min(bound, payload_ceiling(committed rung, crypto))`, stored by the
+    /// node when the committed rung moves. Starts equal to the bound; the
+    /// node lowers it to the baseline before any agent runs.
+    #[inline]
+    pub fn payload_ceiling(&self) -> usize {
+        self.payload_ceiling.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub fn set_payload_ceiling(&self, v: usize) {
+        debug_assert!(v <= self.max_payload, "ceiling above the bound");
+        self.payload_ceiling
+            .store(v.min(self.max_payload), Ordering::Release);
     }
 
     /// Create (or truncate) the buffer file at `capacity` bytes and map it.
@@ -605,7 +628,7 @@ impl Appender {
     /// Append one message frame; returns its position. `WouldOverrun` is
     /// retryable (backpressure), `PayloadTooLarge` is not.
     pub fn append(&mut self, client_id: u32, seq: u32, payload: &[u8]) -> Result<u64, AppendError> {
-        if payload.len() > self.buffer.max_payload {
+        if payload.len() > self.buffer.payload_ceiling.load(Ordering::Relaxed) {
             return Err(AppendError::PayloadTooLarge);
         }
         let total = HEADER_LEN + payload.len();
@@ -756,7 +779,7 @@ impl Appender {
         payload: &[u8],
     ) -> Result<u64, AppendError> {
         let body_len = CLUSTER_BODY_PREFIX_LEN + payload.len();
-        if body_len > self.buffer.max_payload {
+        if body_len > self.buffer.payload_ceiling.load(Ordering::Relaxed) {
             return Err(AppendError::PayloadTooLarge);
         }
         let total = HEADER_LEN + body_len;
@@ -1004,6 +1027,32 @@ mod tests {
             256, // max_payload for tests
         ));
         (b, cnc)
+    }
+
+    /// Jumbo spec §7.1/§7.2: `max_payload` is the BOUND (buffer sizing); the
+    /// live ceiling starts equal to it and the appender refuses above the
+    /// CEILING, not the bound.
+    #[test]
+    fn the_appender_refuses_above_the_live_ceiling_not_the_bound() {
+        let (b, cnc) = buf();
+        assert_eq!(b.payload_ceiling(), 256, "ceiling starts at the bound");
+        let mut app = Appender::new(Arc::clone(&b), 1, 0);
+        assert!(app.append(1, 1, &[0u8; 200]).is_ok());
+        b.set_payload_ceiling(128);
+        assert_eq!(
+            app.append(1, 2, &[0u8; 200]).unwrap_err(),
+            AppendError::PayloadTooLarge
+        );
+        assert!(app.append(1, 3, &[0u8; 128]).is_ok());
+        assert_eq!(
+            app.append_cluster(1, ClusterKind::Settings, &[0u8; 121])
+                .unwrap_err(),
+            AppendError::PayloadTooLarge,
+            "8 B prefix + 121 > 128"
+        );
+        b.set_payload_ceiling(256);
+        assert!(app.append(1, 4, &[0u8; 200]).is_ok());
+        let _ = cnc;
     }
 
     /// Controller ruling R3: `appender_for_test` primes the counters at

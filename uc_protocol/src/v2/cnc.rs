@@ -26,9 +26,10 @@
 //!                       advertised_limit, naks_served_plus_replay) 8 × 256 B
 //! 3456  config/admin/observability band: config_version, config_pending,
 //!       admin_req, admin_resp, admission_bytes, seal_failures,
-//!       free_disk_bytes (each field's own doc comment below pins its exact
-//!       offset and "next free" note — this line is deliberately not kept
-//!       byte-exact, to stop it drifting stale again as fields land)
+//!       free_disk_bytes, payload_ceiling (each field's own doc comment below
+//!       pins its exact offset and "next free" note — this line is
+//!       deliberately not kept byte-exact, to stop it drifting stale again as
+//!       fields land)
 //! 4032  services_declared / fsm_lag_bytes (node, boot-once)
 //! 4096  ServiceSlot[8] (per service: status, applied, epoch, output_completed,
 //!       snapshot_pos, heartbeat_ns, lag_waits, reserved) 8 × 512 B
@@ -56,7 +57,11 @@ pub const CNC_PAGE_LEN: usize = 8192;
 /// VERSION (`version_compatible` fails: its own minor is lower than the
 /// page's), and a 3.1 attacher on a 3.0 page finds no names — it refuses by
 /// name instead. Flag day by policy (`docs/reference/semver-policy.md`).
-pub const CNC_V2_VERSION: u32 = (3 << 24) | (1 << 16);
+///
+/// 3.2 (jumbo): the live payload ceiling word at 3984. A 3.1 attacher
+/// refuses by version, and a 3.2 attacher on a 3.1 page reads 0 there and
+/// treats it as the header bound.
+pub const CNC_V2_VERSION: u32 = (3 << 24) | (2 << 16);
 
 // ---- header (byte offsets) ------------------------------------------------
 pub const CNC_OFF_MAGIC: usize = 0; // [u8; 8]
@@ -258,6 +263,21 @@ const _: () = assert!(CNC_OFF_INGRESS_HOLES_SKIPPED + 64 <= CNC_PAGE_LEN);
 pub const CNC_OFF_QUERY_HOLES_SKIPPED: usize = 3976;
 const _: () = assert!(CNC_OFF_QUERY_HOLES_SKIPPED + 8 <= CNC_PAGE_LEN);
 const _: () = assert!(CNC_OFF_QUERY_HOLES_SKIPPED == CNC_OFF_INGRESS_HOLES_SKIPPED + 8);
+
+/// Jumbo spec §7.3 (cnc 3.2): the LIVE command payload ceiling in bytes —
+/// `payload_ceiling(committed rung, crypto)` — what a client may submit right
+/// now. Third `u64` of the 3968 line (3968 and 3976 are the hole counters).
+/// Writer: the consensus agent, on change only (at boot, and when the
+/// committed `Settings::datagram_mtu` moves); readers: every attached client
+/// and the gateway edge, one `Acquire` load per submit. Shares the line
+/// legitimately: all three words are written a handful of times per
+/// process lifetime, so there is no hot writer to false-share against —
+/// unlike the 4032 line, whose `log_time_ns` moves every frame. The header's
+/// `max_payload` (offset 112) is now the BOUND the buffer is sized for, not
+/// the door.
+pub const CNC_OFF_PAYLOAD_CEILING: usize = 3984;
+const _: () = assert!(CNC_OFF_PAYLOAD_CEILING == CNC_OFF_QUERY_HOLES_SKIPPED + 8);
+const _: () = assert!(CNC_OFF_PAYLOAD_CEILING + 8 <= CNC_OFF_INGRESS_HOLES_SKIPPED + 64);
 
 // M14a: the boot-once pair on page 1's last line. Both are written ONCE by
 // the node at startup (`Node::start_with`, before any agent runs) and read
@@ -541,8 +561,8 @@ mod tests {
         write_cnc_header(&mut page, &h, "kv");
         // magic
         assert_eq!(&page[0..8], b"UC2CNC\0\0");
-        // version = (3<<24)|(1<<16) = 0x0301_0000 -> LE [0,0,1,3]
-        assert_eq!(&page[8..12], &[0x00, 0x00, 0x01, 0x03]);
+        // version = (3<<24)|(2<<16) = 0x0302_0000 -> LE [0,0,2,3]
+        assert_eq!(&page[8..12], &[0x00, 0x00, 0x02, 0x03]);
         // node_id = 7 -> LE [7,0,0,0]
         assert_eq!(&page[12..16], &[7, 0, 0, 0]);
     }
@@ -741,6 +761,14 @@ mod tests {
         assert_eq!(CNC_OFF_INGRESS_HOLES_SKIPPED % 64, 0);
         const { assert!(CNC_OFF_QUERY_HOLES_SKIPPED + 8 <= CNC_OFF_INGRESS_HOLES_SKIPPED + 64) };
         assert_eq!(CNC_OFF_INGRESS_HOLES_SKIPPED + 64, 4032);
+        // Jumbo (cnc 3.2, FROZEN): the live command payload ceiling, third
+        // word of the 3968 line — a line whose other two words are on-change
+        // diagnostics, so a client reading this per submit never false-shares
+        // against a hot writer (the 4032 line's log_time_ns is rewritten every
+        // frame).
+        assert_eq!(CNC_OFF_PAYLOAD_CEILING, 3984);
+        assert_eq!(CNC_OFF_PAYLOAD_CEILING, CNC_OFF_QUERY_HOLES_SKIPPED + 8);
+        const { assert!(CNC_OFF_PAYLOAD_CEILING + 8 <= CNC_OFF_INGRESS_HOLES_SKIPPED + 64) };
         // M14a: the last page-1 line is the boot-once pair the node writes at
         // startup — services_declared and fsm_lag_bytes share it exactly as the
         // M13 holes pair shares 3968 (one writer, two plain AtomicU64s).
@@ -783,7 +811,8 @@ mod tests {
         assert_eq!(CNC_SVC_STATUS_ATTACHED, 1 << 8);
         // FSM identity (cnc 3.1): version word in the status line, name +
         // hash on the once-reserved line 7. Both inside the 512 B slot.
-        assert_eq!(CNC_V2_VERSION, (3 << 24) | (1 << 16));
+        // cnc 3.2: the live payload ceiling word (jumbo).
+        assert_eq!(CNC_V2_VERSION, (3 << 24) | (2 << 16));
         assert_eq!(CNC_SVC_OFF_VERSION, 8);
         assert_eq!(CNC_SVC_OFF_NAME, 448);
         assert_eq!(CNC_SVC_NAME_LEN, 32);
