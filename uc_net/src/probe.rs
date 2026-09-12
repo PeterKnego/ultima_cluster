@@ -305,15 +305,19 @@ impl ProbeTable {
         Some(min)
     }
 
-    /// A round for `peer` that put nothing on the wire: no pairwise session
-    /// yet, or every rung the round tried had its size refused. Counts the
-    /// miss AND gives the peer its attempt back, so an attempt is only ever
-    /// spent on a datagram that actually went out — the refund mechanism
-    /// itself is carried from plan 1's final review; calling this AT MOST
-    /// ONCE per round (never once per rung) is new to the jumbo-discovery
-    /// task that added `emsgsize_over` and `probe_emsgsize` — see the
-    /// caller, `Sender::send_due_probes`, for why a per-rung call would
-    /// over-decrement.
+    /// A round for `peer` whose rungs the KERNEL never saw: no pairwise
+    /// session yet, so every rung was skipped at assembly. Counts the miss AND
+    /// gives the peer its attempt back, so the ladder is not consumed by the
+    /// crypto handshake's own latency. Call this AT MOST ONCE per round, never
+    /// once per rung — see the caller, `Sender::send_due_probes`, for why a
+    /// per-rung call would over-decrement.
+    ///
+    /// A rung the kernel REFUSED for size (`EMSGSIZE`, DF set) is NOT this
+    /// case and must not be refunded (review fix 3): it is a proven fact about
+    /// this host's own interface MTU, as conclusive as a remote drop. Refunding
+    /// it held such a peer below `fast_attempts` forever, so
+    /// [`ProbeTable::narrow_peers`] never reported it and the jumbo join gate
+    /// pended indefinitely instead of refusing by name.
     ///
     /// Why a decrement and not "don't count until sent": `due()` bumps
     /// `attempts` and schedules the next deadline before the caller knows

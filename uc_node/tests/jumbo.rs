@@ -470,9 +470,10 @@ fn the_force_gate_refuses_a_silent_peer() {
 /// learns the committed 8960 through the cluster FSM exactly as it would from
 /// an artifact or a snapshot session. Behind a 1408 cap its probes at the
 /// BASELINE rung still land and are acked, so every peer ANSWERS at 1408 —
-/// proven degradation, which review fix 1 refuses at once, with no window.
-/// (The cap must stay at or above 1408 for that reason: a lower cap would make
-/// the peers SILENT instead, which by design never refuses.)
+/// and once its fast ladder is spent (five 1 s rounds, which is why this test
+/// takes ~5 s rather than ~1 s) that answer is PROVEN degradation and the gate
+/// refuses. The cap must stay at or above 1408: a lower one would make the
+/// peers SILENT instead, which by design never refuses.
 ///
 /// Expect one `consensus fatal (fail-stop)` panic on stderr.
 #[test]

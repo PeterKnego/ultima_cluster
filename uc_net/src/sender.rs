@@ -914,10 +914,25 @@ impl Sender {
             // outcomes (the whole point of probing several sizes at once is
             // to find the boundary between them): the smaller rungs on a
             // capped path routinely succeed while the larger ones EMSGSIZE.
-            // One real send is a real attempt; only a round that put NOTHING
-            // on the wire (no session yet, or every rung refused for size)
-            // gives the attempt back.
+            //
+            // Two reasons a round can put nothing on the wire, and only ONE of
+            // them gives the attempt back (review fix 3):
+            //
+            // - No pairwise session yet: the handshake is still running, and
+            //   nothing has been learned about the path. Transient — refund,
+            //   once for the round, so the ladder is not consumed by the
+            //   crypto handshake's own latency.
+            // - The KERNEL refused every rung for size (`EMSGSIZE`, with DF
+            //   set): this host's own interface MTU cannot carry them. That is
+            //   a PROVEN local fact, as conclusive as a remote drop, so the
+            //   attempt is SPENT. Refunding it left a peer below
+            //   `fast_attempts` forever, which kept `ProbeTable::narrow_peers`
+            //   from ever reporting it and made a `Joining` gate pend
+            //   indefinitely — withholding spec §5.4's named refusal from the
+            //   single likeliest misconfiguration, a host whose interface MTU
+            //   was never raised.
             let mut sent_any = false;
+            let mut kernel_refused = false;
             for rung in rungs {
                 let body_len = rung as usize - overhead;
                 debug_assert!(body_len >= PROBE_RUNG_LEN);
@@ -936,15 +951,16 @@ impl Sender {
                         Err(e) => {
                             if e.raw_os_error() == Some(libc::EMSGSIZE) {
                                 self.stats.probe_emsgsize.fetch_add(1, Ordering::Relaxed);
+                                kernel_refused = true;
                             }
                         }
                     }
                 }
             }
-            if !sent_any {
-                // Neither a session-less peer (every rung skipped assembly)
-                // nor an all-EMSGSIZE round ever left the host: give the
-                // round's one attempt back, same call either way.
+            if !sent_any && !kernel_refused {
+                // Nothing left the host AND the kernel never saw a byte of it:
+                // a session-less peer, every rung skipped at assembly. Give
+                // the round's one attempt back, once for the round.
                 table.note_unsent_for(peer);
             }
         }
@@ -2274,18 +2290,18 @@ mod tests {
         );
     }
 
-    /// The other half of the give-back property: a round where EVERY rung
-    /// EMSGSIZEs (`emsgsize_over` below the smallest rung) puts NOTHING on
-    /// the wire, so `send_due_probes` must give the round's one attempt back
-    /// exactly ONCE — not once per rung. A per-rung `note_unsent_for` call
-    /// (the shape this task's brief sketched, and a regression this test is
-    /// built to catch) would decrement `attempts` three times against
-    /// `due()`'s single increment, saturating to 0 the same as the correct
-    /// answer — so this test also pins `unsent()` at exactly 1 (one round,
-    /// not one per rung), which the saturating attempts value alone cannot
-    /// distinguish.
+    /// Review fix 3: a round where EVERY rung EMSGSIZEs (`emsgsize_over`
+    /// below the smallest rung) SPENDS its attempt, and is not refunded.
+    ///
+    /// The kernel refusing a size is this host's own interface MTU, proven —
+    /// not the transient "no session yet" case `note_unsent_for` exists for.
+    /// Refunding it kept such a peer below `fast_attempts` forever, so
+    /// [`ProbeTable::narrow_peers`] never reported it and the jumbo join gate
+    /// pended indefinitely (503, never serving, never refusing) instead of
+    /// naming the misconfiguration. Five rounds now take the peer past the
+    /// fast ladder, which is what lets the gate refuse by name.
     #[test]
-    fn an_all_refused_probe_round_gives_back_exactly_one_attempt() {
+    fn an_all_emsgsize_probe_round_spends_its_attempt() {
         let b = jumbo_buffer();
         let fake = Fake::new();
         let mut sock = FaultSocket::bind("127.0.0.1:0").unwrap();
@@ -2306,14 +2322,23 @@ mod tests {
             term_handle(9),
             always_leader(),
         );
-        let t = ProbeTable::new(ProbeCadence::default());
+        // A zero-interval fast ladder: every round is due again immediately,
+        // so the walk below costs no wall time. `fast_attempts` is what the
+        // gate's predicate reads, and it is the default's shape that matters,
+        // not its 1 s spacing.
+        let cadence = ProbeCadence {
+            fast_ns: 0,
+            fast_attempts: 3,
+            slow_ns: 0,
+        };
+        let t = ProbeTable::new(cadence);
         t.set_peers(&[fake.addr()]);
         s.set_probe_table(Arc::clone(&t));
         s.do_work();
         assert_eq!(
             t.get(fake.addr()).unwrap().attempts,
-            0,
-            "the round's one attempt was given back, not spent"
+            1,
+            "the kernel's refusal is a spent attempt, not a give-back"
         );
         assert_eq!(
             s.stats().probe_emsgsize.load(Ordering::Relaxed),
@@ -2321,7 +2346,57 @@ mod tests {
             "every rung in the round refused for size"
         );
         assert_eq!(s.stats().emsgsize.load(Ordering::Relaxed), 0);
-        assert_eq!(t.unsent(), 1, "one refused ROUND, not one per refused rung");
+        assert_eq!(t.unsent(), 0, "nothing to give back: the kernel saw it");
+
+        // And the ladder therefore RUNS OUT, which is the whole point: only a
+        // peer past `fast_attempts` can be reported as narrow, and only then
+        // can the join gate refuse by name. (`next_due_ns` is driven off the
+        // sender's own clock, so walk the rounds by making each one due.)
+        for _ in 1..cadence.fast_attempts {
+            s.do_work();
+        }
+        let p = t.get(fake.addr()).unwrap();
+        assert_eq!(
+            p.attempts, cadence.fast_attempts,
+            "the fast ladder is spent"
+        );
+        assert_eq!(p.verified, 0, "nothing was ever proven about the path");
+    }
+
+    /// The case `note_unsent_for` DOES exist for, pinned beside the one above
+    /// so the two can never be conflated again: with crypto on and no pairwise
+    /// session for this peer, every rung is skipped at assembly, the kernel
+    /// never sees a byte, and the round's one attempt is given back — exactly
+    /// once, not once per rung (`unsent()` counts rounds). A ladder consumed by
+    /// the handshake's own latency would back a healthy peer off to the 30 s
+    /// cadence before the first probe ever went out.
+    #[test]
+    fn a_probe_round_with_no_session_still_gives_its_attempt_back() {
+        // `sender_with_crypto_n` carries an EMPTY `PeerIds` map, so a PAIRWISE
+        // probe cannot resolve a NodeId: `assemble_probe` returns false.
+        let (mut s, followers) = sender_with_crypto_n(1);
+        let peer = followers[0].addr();
+        let t = ProbeTable::new(ProbeCadence::default());
+        t.set_peers(&[peer]);
+        s.set_probe_table(Arc::clone(&t));
+        s.do_work();
+
+        assert_eq!(
+            t.get(peer).unwrap().attempts,
+            0,
+            "no session yet is transient: the attempt is refunded"
+        );
+        assert_eq!(t.unsent(), 1, "one refused ROUND, not one per rung");
+        assert_eq!(
+            s.stats().probes_sent.load(Ordering::Relaxed),
+            0,
+            "nothing went out"
+        );
+        assert_eq!(
+            s.stats().probe_emsgsize.load(Ordering::Relaxed),
+            0,
+            "and the kernel never refused anything — it was never asked"
+        );
     }
 
     #[test]

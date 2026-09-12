@@ -584,15 +584,18 @@ const JUMBO_GATE_POLL_NS: u64 = 100_000_000;
 ///   the recovered artifact, the archive walk's replay, or an installed
 ///   snapshot — and takes precedence over `Forcing` (spec §6), which it also
 ///   subsumes: every rung above the baseline is at or above `JUMBO_MIN_RUNG`,
-///   so proving one proves the other. It refuses ONLY a peer that ANSWERED
-///   below the committed rung, and does so at once (no window): the rung only
-///   commits once every member has advertised it, so an answered-narrow path
-///   is proven degradation. A peer that has answered NOTHING is a liveness
-///   matter — a member that is down, slow, or still replaying a cold start —
-///   and must never fail-stop this node: it merely holds `can_serve` false
-///   until some path proves the rung. Before that rule, restarting a survivor
-///   of a degraded jumbo cluster could never prove the rung to the dead member
-///   and crash-looped under `Restart=on-failure`.
+///   so proving one proves the other. It refuses ONLY a peer whose path is
+///   PROVEN narrower than the committed rung — it answered, and its fast
+///   ladder is spent, so the larger rungs were actually tried
+///   (`ProbeTable::narrow_peers`). There is no window because the ladder IS
+///   the settle. Two states deliberately do not refuse, and each one cost a
+///   review round: a peer that has answered NOTHING is a liveness matter (a
+///   member that is down, slow, or still replaying a cold start), and a peer
+///   still inside its fast ladder is MID-DISCOVERY — `verified == RUNGS[0]`
+///   with the jumbo rungs in flight is what healthy discovery looks like.
+///   Both merely hold `can_serve` false until some path proves the rung.
+///   Refusing either fail-stopped healthy nodes, which under
+///   `Restart=on-failure` is a crash loop.
 ///
 /// `deadline_ns == 0` means NOT YET ARMED: the gate is installed outside the
 /// window in `do_work` where `pass_mono_ns` is current (construction, and
@@ -608,8 +611,9 @@ enum JumboGate {
     },
     /// Spec §5.4: a committed rung above the baseline exists; this node must
     /// prove it carries it before it serves. No window and no deadline — it
-    /// refuses an ANSWERED-narrow path immediately and waits out silence
-    /// indefinitely.
+    /// refuses a path PROVEN narrow (answered, and past its fast ladder) and
+    /// waits indefinitely on anything less conclusive: silence, or a peer
+    /// still working through its ladder.
     Joining {
         committed: u32,
     },
@@ -6563,12 +6567,19 @@ impl Consensus {
 
     /// Spec §5.4: the cluster has committed `committed` and some peer has
     /// ANSWERED a probe below it — proven degradation, refused at once with no
-    /// window (review fix 1; silence is handled by waiting, not by refusing).
-    /// `narrow` is non-empty and ordered by member id, so the refusal names
-    /// the lowest-id offender and lists them all.
+    /// window — the fast ladder having run out IS the settle (silence, and a
+    /// peer still inside its ladder, are handled by waiting). `narrow` is
+    /// non-empty and ordered by member id, so the refusal names the lowest-id
+    /// offender and lists them all.
     ///
-    /// The remedy is the path: the log already holds frames this node cannot
-    /// receive, so joining anyway would stall commit rather than serve reads.
+    /// The refusal names BOTH possible causes, because this node cannot tell
+    /// them apart: the peer's path may be narrow, or THIS host's own interface
+    /// MTU may be too small to put the larger rungs on the wire at all (an
+    /// `EMSGSIZE` round spends its attempt exactly so this case reaches the
+    /// refusal instead of pending forever — `ProbeTable::note_unsent_for`).
+    /// Either way the remedy is a path: the log already holds frames this node
+    /// cannot receive, so joining anyway would stall commit rather than serve
+    /// reads.
     #[inline(never)]
     fn jumbo_join_fail_stop(&self, committed: u32, narrow: &[(NodeId, u32)]) -> ! {
         let list = Self::jumbo_offender_list(narrow);
@@ -6584,11 +6595,13 @@ impl Consensus {
         );
         panic!(
             "consensus fatal (fail-stop): PathBelowCommittedMtu peer={peer} committed={committed} \
-             carried={carried} — this cluster committed a {committed} B datagram budget and the \
-             path to member {peer} answered at {carried} B, so the log already holds frames this \
-             node cannot receive. Fix the path MTU to at least {committed} B end to end (see \
-             docs/how-to/jumbo-frames.md) and restart; the rung is monotone and will not come back \
-             down. Peers that answered below {committed} (id:carried): {list}"
+             carried={carried} — this cluster committed a {committed} B datagram budget and this \
+             node could only get {carried} B to member {peer}: either the path between them is \
+             narrower than {committed} B, or THIS host's own interface MTU cannot carry it (the \
+             kernel refused the larger probes for size). Check `ip link` on both ends and the \
+             VPC/subnet MTU, then restart; the rung is monotone and will not come back down. The \
+             log already holds frames this node cannot receive, which is why it refuses to join \
+             rather than stalling commit. Peers short of {committed} (id:carried): {list}"
         );
     }
 
