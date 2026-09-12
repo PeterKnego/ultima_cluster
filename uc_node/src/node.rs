@@ -6358,10 +6358,14 @@ impl Consensus {
     ///
     /// Answers `true` for a passed gate and for no gate at all — one `Option`
     /// test, which is the steady-state cost. While a gate is pending it reads
-    /// the probe table's own minimum (one lock, off the steady path) and, at
-    /// the window, fail-stops the consensus agent by name: the agent's failed
-    /// flag is what `uc2-node`'s monitor loop turns into `agent_failstopped`
-    /// and exit 1, exactly as the ring and archive fail-stops do.
+    /// the probe table (one lock, off the steady path, at most every
+    /// [`JUMBO_GATE_POLL_NS`]) and fail-stops the consensus agent by name when
+    /// that gate's refusing condition holds: for `Forcing`, any peer short of
+    /// the rung once [`JUMBO_GATE_WINDOW`] has elapsed; for `Joining`, a peer
+    /// past its fast ladder still answering below the committed rung, with no
+    /// window at all. The agent's failed flag is what `uc2-node`'s monitor loop
+    /// turns into `agent_failstopped` and exit 1, exactly as the ring and
+    /// archive fail-stops do.
     fn check_jumbo_gate(&mut self) -> bool {
         let Some(gate) = self.jumbo_gate else {
             return true;
@@ -6377,6 +6381,10 @@ impl Consensus {
         }
         self.jumbo_check_ns = self.pass_mono_ns + JUMBO_GATE_POLL_NS;
         match gate {
+            // Unreachable — the early return above handles it. Kept as a real
+            // arm rather than `unreachable!()`: a gate state that can serve
+            // must never be able to panic the consensus agent, whatever a
+            // later edit does to the order of these checks.
             JumboGate::Passed => true,
             // Spec §6. An EMPTY peer map answers `MTU_BOUND`
             // (`ProbeTable::own_min_rung`), so a solo node passes on its first
@@ -6400,13 +6408,17 @@ impl Consensus {
                 }
                 false
             }
-            // Spec §5.4, as amended by review fix 1: an ANSWERED-narrow path
-            // refuses AT ONCE (it is proven degradation — the rung only
-            // committed because every member advertised it), and silence never
-            // refuses at all (a down, slow or still-replaying member is a
-            // liveness matter, covered by the §9 alerts). Passing this also
-            // satisfies a `Forcing` gate it replaced: every rung above the
-            // baseline is at or above `JUMBO_MIN_RUNG`.
+            // Spec §5.4, as amended by review fixes 1 and 2: this gate
+            // refuses only a peer whose path is PROVEN narrower than the
+            // committed rung — it answered, and its fast ladder is spent, so
+            // the jumbo rungs were tried and did not land
+            // (`ProbeTable::narrow_peers`). There is no window: the ladder IS
+            // the settle. Silence never refuses (a down, slow or
+            // still-replaying member is a liveness matter, covered by the §9
+            // alerts), and neither does the ordinary mid-ladder state of a
+            // healthy peer, which is what fix 2 had to correct. Passing this
+            // also satisfies a `Forcing` gate it replaced: every rung above
+            // the baseline is at or above `JUMBO_MIN_RUNG`.
             JumboGate::Joining { committed } => {
                 let proven = self.probe_table.own_min_rung();
                 if proven >= committed {
@@ -6459,15 +6471,32 @@ impl Consensus {
         out
     }
 
-    /// The peers that ANSWERED below `want`, i.e. [`Self::jumbo_offenders`]
-    /// minus the silent ones. Spec §5.4's refusal (review fix 1) keys on this:
-    /// a peer whose `verified` is 0 has told us nothing about its path, and
-    /// treating "no answer yet" as "path too narrow" fail-stopped healthy
-    /// nodes whenever a configured member was merely down or slow.
+    /// Spec §5.4's refusing set, by MEMBER ID: the peers
+    /// [`ProbeTable::narrow_peers`] reports as proven-narrow (answered, below
+    /// `want`, and past their fast ladder — the predicate lives there because
+    /// the cadence does), mapped through the membership and re-sorted by id so
+    /// the refusal names the same first offender on every node.
+    ///
+    /// Two states are deliberately NOT in here, and each one cost a review
+    /// round: a SILENT peer (`verified == 0`) has told us nothing about its
+    /// path, and a peer still inside its fast ladder is mid-discovery —
+    /// `verified == RUNGS[0]` with the jumbo rungs in flight is what healthy
+    /// discovery looks like. Treating either as degradation fail-stops healthy
+    /// nodes.
     #[inline(never)]
     fn jumbo_narrow_peers(&self, want: u32) -> Vec<(NodeId, u32)> {
-        let mut out = self.jumbo_offenders(want);
-        out.retain(|(_, carried)| *carried > 0);
+        let mut out: Vec<(NodeId, u32)> = self
+            .probe_table
+            .narrow_peers(want)
+            .into_iter()
+            .map(|(addr, carried)| {
+                (
+                    self.addr_to_id.get(&addr).copied().unwrap_or(u32::MAX),
+                    carried,
+                )
+            })
+            .collect();
+        out.sort_unstable();
         out
     }
 
@@ -11994,6 +12023,17 @@ mod tests {
         h.cons.do_work();
     }
 
+    /// Spend every peer's fast ladder, the way five seconds of real probe
+    /// rounds do: spec §5.4 refuses a narrow path only once the jumbo rungs
+    /// have actually been TRIED, and `ProbeTable::due` is what counts the
+    /// attempts. The peers keep whatever `verified` they were given.
+    fn spend_fast_ladder(h: &Harness) {
+        let cadence = uc_net::probe::ProbeCadence::default();
+        for i in 0..=cadence.fast_attempts as u64 {
+            h.cons.probe_table.due(i * 2 * cadence.fast_ns);
+        }
+    }
+
     /// Publish a committed rung by fiat and force the next pass to re-read the
     /// view — what a restarted node's archive walk (or an installed snapshot)
     /// does for real.
@@ -12143,23 +12183,77 @@ mod tests {
     }
 
     /// Spec §5.4: a committed rung this node cannot carry, PROVEN — the peers
-    /// answered, at the baseline — refuses AT ONCE, in the same pass that arms
-    /// the gate. There is no window (review fix 1): the rung only committed
-    /// because every member advertised it, so an answered-narrow path is
-    /// degradation that will not cure itself, and the refusal names the rung,
-    /// the peer and what it carried.
+    /// answered at the baseline and their fast ladders are spent, so the jumbo
+    /// rungs were tried and did not land. That is degradation which will not
+    /// cure itself, so there is no window beyond the ladder: the refusal fires
+    /// on the first pass that sees the state, naming the rung, the peer and
+    /// what it carried.
     #[test]
     #[should_panic(expected = "PathBelowCommittedMtu peer=0 committed=8960 carried=1408")]
-    fn an_answered_narrow_path_refuses_the_join_at_once() {
+    fn an_answered_narrow_path_past_the_fast_ladder_refuses_the_join() {
         let mut h = harness();
         drive_to_serving_leader(&mut h);
         let peers = mtu_peers(&h);
         all_answer(&h, &peers, MTU_DEFAULT as u32, MTU_DEFAULT as u32);
+        spend_fast_ladder(&h);
 
         // The rung arrives, committed: what a restarted node's archive walk
-        // replays into the view. Arming and refusing are the same pass.
+        // replays into the view.
         publish_committed_rung(&mut h, MTU_BOUND as u32);
         pass_checking_the_gate(&mut h);
+    }
+
+    /// Spec §5.4, review fix 2 — the defect that ruling closed. A peer that has
+    /// answered the BASELINE rung while the jumbo rungs are still in flight is
+    /// mid-discovery, not degraded: `RUNGS[0]` is itself a probed rung, a round
+    /// puts one datagram per rung above `verified` on the wire, and `verified`
+    /// rises per ack as each lands. A restarting node learns the committed rung
+    /// from the cluster replay at an arbitrary point in that ladder, so
+    /// refusing this state fail-stopped healthy nodes — and under
+    /// `Restart=on-failure` it crash-looped.
+    #[test]
+    fn a_mid_ladder_answer_holds_serving_but_never_refuses() {
+        let mut h = harness();
+        drive_to_serving_leader(&mut h);
+        let peers = mtu_peers(&h);
+        // One round has gone out and the baseline ack came back. The fast
+        // ladder has four attempts left.
+        h.cons.probe_table.set_peers(&peers);
+        h.cons.probe_table.due(0);
+        for &peer in &peers {
+            h.cons
+                .probe_table
+                .on_ack(peer, MTU_DEFAULT as u32, MTU_DEFAULT as u32);
+        }
+        publish_committed_rung(&mut h, MTU_BOUND as u32);
+        pass_checking_the_gate(&mut h);
+
+        assert_eq!(
+            h.cons.jumbo_gate,
+            Some(JumboGate::Joining { committed: 8960 }),
+            "the gate arms — this node has not proven the rung"
+        );
+        assert!(
+            !h.cons.can_serve_flag.load(Ordering::Acquire),
+            "and holds serving while discovery runs"
+        );
+        // Reaching here at all is the proof: `check_jumbo_gate` panics on a
+        // PROVEN narrow path, and a mid-ladder answer is not one.
+        for _ in 0..3 {
+            h.cons.pass_mono_ns += 1_000_000_000;
+            h.cons.jumbo_check_ns = 0;
+            assert!(!h.cons.check_jumbo_gate(), "pending, not refused");
+        }
+        // The jumbo ack lands and the gate clears, which is what happens on a
+        // healthy restart.
+        for &peer in &peers {
+            h.cons
+                .probe_table
+                .on_ack(peer, MTU_BOUND as u32, MTU_BOUND as u32);
+        }
+        pass_checking_the_gate(&mut h);
+        assert_eq!(h.cons.jumbo_gate, Some(JumboGate::Passed));
+        assert!(h.cons.can_serve_flag.load(Ordering::Acquire));
     }
 
     /// Spec §5.4 as amended by review fix 1, and the defect it closes: a peer
@@ -12200,9 +12294,11 @@ mod tests {
             "and it keeps replicating and voting"
         );
 
-        // An hour of silence is still not a refusal. (`check_jumbo_gate`
-        // panics on an answered-narrow peer; reaching this assert at all is
-        // the proof that silence does not.)
+        // An hour of silence is still not a refusal — not even once the fast
+        // ladder is long spent. (`check_jumbo_gate` panics on a proven-narrow
+        // peer; reaching this assert at all is the proof that silence is not
+        // one.)
+        spend_fast_ladder(&h);
         for _ in 0..4 {
             h.cons.pass_mono_ns += 900_000_000_000;
             h.cons.jumbo_check_ns = 0;

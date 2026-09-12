@@ -518,3 +518,65 @@ fn a_restart_below_the_committed_rung_refuses_to_join() {
     drop(restarted);
     stop_all(nodes);
 }
+
+/// Spec §5.4's other half, and the case review fix 2 exists for: a HEALTHY
+/// restart onto a jumbo cluster must just work. The node learns the committed
+/// 8960 from the cluster replay at an arbitrary point in its own probe ladder —
+/// typically with peers still silent or answering only the baseline rung — so a
+/// gate that refused either state would fail-stop a node whose paths are
+/// perfectly fine, and under systemd's `Restart=on-failure` it would crash-loop.
+///
+/// `can_serve` is deliberately NOT the assertion: `ElectionSm::serving` is
+/// LEADER-only in UC, so a restarted follower never reports it, gate or no gate.
+/// What the gate controls — and all it controls — is the pending flag that
+/// masks `can_serve` and `/readyz`, so the test asserts that it CLEARS (the
+/// gate passed, i.e. the node proved the rung and would serve if elected) and
+/// that the consensus agent never fail-stopped.
+#[test]
+fn a_healthy_restart_on_a_jumbo_cluster_does_not_refuse() {
+    let _g = serialize();
+    let buf = uc_node::obs::log::capture_for_tests();
+    let (mut fleet, mut nodes) = spawn_cluster(3, FaultConfig::default());
+    let leader = await_single_leader(&nodes, 10);
+    await_rung(&nodes, 8960, 20);
+
+    let victim = (leader + 1) % 3;
+    nodes.remove(victim).stop();
+    fleet.rebind(victim);
+    let restarted = fleet.start(victim, FaultConfig::default());
+
+    // Two things must both become true, and neither may be read before the
+    // other: the node ADOPTS the committed rung (the cluster replay reaches
+    // it — before that there is no gate to clear, so a bare pending check
+    // would pass vacuously), and the gate then CLEARS. The first round of
+    // probes is due immediately, so this is a ~1 s wait.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        assert!(
+            !consensus_failed(&restarted),
+            "a healthy restart must never fail-stop\n--- capture buffer ---\n{}--- end ---",
+            String::from_utf8(buf.lock().unwrap().clone()).unwrap()
+        );
+        let pending = restarted
+            .observability()
+            .jumbo_gate_pending
+            .load(Ordering::Acquire);
+        if restarted.datagram_mtu() == 8960 && !pending {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "restart never converged: rung {}, gate pending {pending}",
+            restarted.datagram_mtu()
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let text = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+    assert!(
+        !text.contains("path_below_committed_mtu"),
+        "no refusal anywhere: {text}"
+    );
+
+    nodes.push(restarted);
+    stop_all(nodes);
+}

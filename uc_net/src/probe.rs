@@ -240,6 +240,42 @@ impl ProbeTable {
         g.values().map(|p| p.verified).min().unwrap_or(0)
     }
 
+    /// Jumbo spec §5.4: the peers whose path is PROVEN narrower than
+    /// `committed` — `0 < verified < committed` AND the peer is past its fast
+    /// ladder (`attempts >= cadence.fast_attempts`). Sorted by address, so the
+    /// answer is stable across calls and across nodes.
+    ///
+    /// Both halves are load-bearing, and the second one is the whole reason
+    /// this lives on the table rather than in the node:
+    ///
+    /// - `verified == 0` is SILENCE — a member that is down, slow, or still
+    ///   replaying a cold start. Nothing is known about its path, so it is
+    ///   never narrow at any attempt count.
+    /// - `verified` BELOW `committed` is the ordinary MID-LADDER state of a
+    ///   perfectly healthy peer: [`RUNGS`] starts at `MTU_DEFAULT`, a round
+    ///   puts one datagram per rung above `verified` on the wire, and
+    ///   [`ProbeTable::on_ack`] raises `verified` as each ack arrives — so
+    ///   `verified == 1408` with the two jumbo rungs still in flight is what
+    ///   discovery looks like while it is working, and one lost probe or ack
+    ///   holds that state for a full tick. A caller that treated it as
+    ///   degradation would fail-stop healthy nodes; the fast ladder having run
+    ///   out is what turns "not proven yet" into "tried and failed".
+    ///
+    /// The cadence is private to this type, which is why the predicate is here
+    /// and not at the call site.
+    pub fn narrow_peers(&self, committed: u32) -> Vec<(SocketAddr, u32)> {
+        let g = self.peers.lock().unwrap();
+        let mut out: Vec<(SocketAddr, u32)> = g
+            .iter()
+            .filter(|(_, p)| {
+                p.verified > 0 && p.verified < committed && p.attempts >= self.cadence.fast_attempts
+            })
+            .map(|(&addr, p)| (addr, p.verified))
+            .collect();
+        out.sort_unstable();
+        out
+    }
+
     /// Spec §5.3 (erratum 4): the leader's table minimum over `members` —
     /// `Some` only when every member has an entry whose `verified` and
     /// `advertised` are both non-zero (every pair answered).
@@ -315,6 +351,68 @@ mod tests {
             fast_attempts: 2,
             slow_ns: 100,
         }
+    }
+
+    /// Jumbo spec §5.4: what counts as a PROVEN narrow path. The mid-ladder
+    /// case (second assert) is the one that matters — treating it as
+    /// degradation fail-stopped a healthy restarting node, because
+    /// `verified == RUNGS[0]` with the jumbo rungs still in flight is what
+    /// normal discovery looks like.
+    #[test]
+    fn narrow_peers_needs_an_answer_and_a_spent_fast_ladder() {
+        let t = ProbeTable::new(fast()); // fast_attempts = 2
+        let (p1, p2) = (a(7001), a(7002));
+        t.set_peers(&[p1, p2]);
+
+        // Nothing answered yet: silence is never narrow.
+        assert!(t.narrow_peers(8960).is_empty());
+        t.due(0); // attempts = 1
+        t.due(1_000); // attempts = 2 — ladder spent, still silent
+        assert!(
+            t.narrow_peers(8960).is_empty(),
+            "a peer that answered NOTHING is never narrow, at any attempt count"
+        );
+
+        // p1 answers the baseline rung, mid-ladder.
+        let t = ProbeTable::new(fast());
+        t.set_peers(&[p1, p2]);
+        t.due(0); // attempts = 1, inside the fast ladder
+        t.on_ack(p1, 1408, 1408);
+        assert!(
+            t.narrow_peers(8960).is_empty(),
+            "verified = 1408 with attempts = 1 is MID-DISCOVERY, not degraded"
+        );
+
+        // One more round spends the fast ladder: now it is a proven fact.
+        t.due(1_000); // attempts = 2 == fast_attempts
+        assert_eq!(
+            t.narrow_peers(8960),
+            vec![(p1, 1408)],
+            "past the fast ladder, an answer below the rung is degradation"
+        );
+
+        // A peer at or above `committed` is never narrow.
+        t.on_ack(p1, 8960, 8960);
+        assert!(t.narrow_peers(8960).is_empty(), "8960 >= committed");
+        t.on_ack(p2, 8960, 8960);
+        assert!(
+            t.narrow_peers(8832).is_empty(),
+            "above committed either way"
+        );
+    }
+
+    /// Sorted by address, so "the first offender" is the same peer on every
+    /// call and on every node.
+    #[test]
+    fn narrow_peers_is_sorted_by_address() {
+        let t = ProbeTable::new(fast());
+        let (hi, lo) = (a(7100), a(7010));
+        t.set_peers(&[hi, lo]);
+        t.due(0);
+        t.due(1_000);
+        t.on_ack(hi, 1408, 1408);
+        t.on_ack(lo, 8832, 8832);
+        assert_eq!(t.narrow_peers(8960), vec![(lo, 8832), (hi, 1408)]);
     }
 
     /// Errata-adjacent (final review, plan 1): a probe that never left the host
