@@ -604,9 +604,18 @@ Written before the tag, per the release rule:
      restart of a 3-voter cluster with one dead host became an outage on a
      cluster that still had quorum, and the `lin_v2` capstones (kill the leader,
      wait for a serving survivor) had no servable node at all. Silence is no
-     evidence; the hazard the pass defers is the runtime degradation
-     `Uc2PathBelowMtu` already covers, and a returning member runs its own
-     `Joining` check, so every live pair is tested from at least one side.
+     evidence. The RESIDUAL, stated rather than waved at (review round 3,
+     minor 3): an unproven pass may leave a node serving that cannot carry the
+     committed rung, and only the LOCAL case is alerted — if this host's own
+     interface MTU is the narrow element, its large sends fail `EMSGSIZE` and
+     `Uc2PathBelowMtu` (critical) fires; a REMOTE narrow path produces no local
+     `EMSGSIZE` at all unless the route returns ICMP frag-needed and the kernel
+     lowers the path MTU, so it surfaces as a wedged replication path (that
+     peer's reported durable position stuck, `uc2_peer_replication_lag_bytes`
+     climbing, commit stalled if it is in the quorum) rather than as an alert.
+     A returning member runs its own `Joining` check, which tests the pair from
+     its side only if its probes resolve before it adopts the rung — one whose
+     archive already holds the rung can pass on `no_evidence` too.
      What DOES hold serving is a peer ANSWERING below the rung — discovery in
      flight — and that hold is bounded by `JUMBO_GATE_WINDOW` (30 s, the same
      constant the force gate uses; `reason = window_expired`). A PROVEN-narrow

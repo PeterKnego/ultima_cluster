@@ -273,7 +273,17 @@ verify rather than a build:
   which resolves within a probe ladder — and that hold is bounded at 30 s
   (`reason = window_expired`). A peer that answered once and then stopped
   answering is treated as silent, not narrow: the refusal needs a CURRENT answer
-  at a rung below the committed one. `uc2ctl remove <dead-id>` is accepted while
+  at a rung below the committed one. **The residual of an unproven pass**: the
+  node may serve without having proven the rung. If the narrow element is its own
+  interface MTU, its first large send fails `EMSGSIZE` and the critical
+  `Uc2PathBelowMtu` fires; if it is a REMOTE path, there is no local `EMSGSIZE`
+  to alert on (absent an ICMP frag-needed that lowers the path MTU) and the
+  symptom is a wedged replication path instead — that peer's reported durable
+  position stuck and `uc2_peer_replication_lag_bytes` climbing, with commit
+  stalled if it is in the quorum. So on an unexplained one-peer replication
+  stall on a jumbo cluster, check `uc2_probe_min_mtu_bytes` and the
+  `jumbo_join_gate_passed_unproven` records before anything else.
+  `uc2ctl remove <dead-id>` is accepted while
   a gate is pending — admin handling keys on the leader flag, not on the gate.
   `uc2_jumbo_gate_pending` is `1` on a held node, which is what separates this
   from `Uc2LeaderNotServing`'s other cause (an uncommitted `NewTerm`). Under

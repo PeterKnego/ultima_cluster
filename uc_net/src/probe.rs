@@ -50,10 +50,14 @@ pub struct PeerProbe {
     /// and failed". [`ProbeTable::note_unsent_for`] gives one back.
     pub attempts: u32,
     /// LATCHED once [`ProbeTable::due`] has handed out the whole fast ladder
-    /// for this peer (`attempts >= cadence.fast_attempts`), and cleared only
-    /// by [`ProbeTable::set_peers`] FORGETTING the peer — the one event that
-    /// makes it new again (it comes back as `Default`). A retained peer keeps
-    /// the latch across a membership change, exactly as it keeps `verified`.
+    /// for this peer (`attempts >= cadence.fast_attempts`). Two things clear
+    /// it: [`ProbeTable::set_peers`] FORGETTING the peer — the one event that
+    /// makes it new again (it comes back as `Default`) — and
+    /// [`ProbeTable::note_unsent_for`] giving back the very round that earned
+    /// it, because a round that put nothing on the wire is not a round that
+    /// tried. A latch earned by earlier rounds that DID go out is never given
+    /// back, and a retained peer keeps it across a membership change, exactly
+    /// as it keeps `verified`.
     /// [`ProbeTable::narrow_peers`] reads THIS, not the live
     /// `attempts` comparison, because [`ProbeTable::on_peer_seen`] resets
     /// `attempts` to 0: a peer whose ladder was spent could be pulled back
@@ -380,11 +384,13 @@ impl ProbeTable {
         out
     }
 
-    /// Is any peer ANSWERING below `committed` — `0 < verified < committed`,
-    /// whatever its ladder state? The join gate's "is there anything to wait
-    /// for" test (jumbo spec §5.4).
+    /// Is any peer ANSWERING below `committed` — `0 < verified < committed`
+    /// AND still answering ([`PeerProbe::rounds_since_ack`] ≤ 1, the same
+    /// freshness test [`ProbeTable::narrow_peers`] applies)? The join gate's
+    /// "is there anything to wait for" test (jumbo spec §5.4).
     ///
-    /// `false` means every peer short of the rung is SILENT, and silence is no
+    /// `false` means every peer short of the rung is SILENT — it never
+    /// answered, or it answered once and has since stopped — and silence is no
     /// evidence: there is nothing a longer hold can turn into a verdict, so the
     /// gate passes rather than holding `can_serve` down. That matters for
     /// availability, not tidiness — holding on silence meant that on a jumbo
@@ -393,12 +399,24 @@ impl ProbeTable {
     /// the leader every second and then wait for a serving survivor) had no
     /// servable node for the whole window.
     ///
+    /// The freshness half is not symmetry for its own sake (review round 3,
+    /// Important): WITHOUT it, a peer that acked 1408 and then went stale — the
+    /// crypto-restart state this whole rule exists for — keeps `verified = 1408`
+    /// forever, so the gate held `can_serve` false for the full
+    /// `JUMBO_GATE_WINDOW` and reinstated that same 30 s hold on a different
+    /// race ordering (a node that learns the committed rung AFTER the acks
+    /// landed, which is exactly the `verified: 1408, advertised: 8960` ledger
+    /// the failing run showed).
+    ///
     /// `true` is the genuine MID-LADDER state — a peer answered the baseline
     /// and its jumbo rungs are still in flight — which is worth holding for,
-    /// briefly, because it resolves one way or the other within a ladder.
+    /// briefly, because it resolves one way or the other within a ladder. Such
+    /// a peer answers the refresh rung EVERY round (see [`ProbeTable::due`]),
+    /// so the freshness test never shortens a legitimate hold.
     pub fn answered_below(&self, committed: u32) -> bool {
         let g = self.peers.lock().unwrap();
-        g.values().any(|p| p.verified > 0 && p.verified < committed)
+        g.values()
+            .any(|p| p.verified > 0 && p.verified < committed && p.rounds_since_ack <= 1)
     }
 
     /// Spec §5.3 (erratum 4): the leader's table minimum over `members` —
@@ -464,14 +482,24 @@ impl ProbeTable {
         self.unsent.fetch_add(1, Ordering::Relaxed);
         let mut g = self.peers.lock().unwrap();
         if let Some(p) = g.get_mut(&peer) {
-            p.attempts = p.attempts.saturating_sub(1);
             // A round that put NOTHING on the wire is not a round that tried,
             // so it gives back the ladder LATCH as well as the attempt: the
             // latch must mean "the higher rungs actually went out and went
-            // unacked". `due()` has already counted this round in
-            // `rounds_since_ack`, which is deliberate — a refunded round is
-            // still a round in which the peer did not answer.
-            p.spent_fast_ladder = p.attempts >= self.cadence.fast_attempts;
+            // unacked". Only when THIS round is the one that earned it, though
+            // (review round 3, minor 1): a plain assignment would also clear a
+            // latch earned by earlier real rounds, because `on_peer_seen` puts
+            // `attempts` back to 0 on a live-but-still-narrow peer — which is
+            // the very regression the latch was introduced to prevent.
+            // `attempts` equal to the threshold means this round is the one that
+            // crossed it, so the ladder has at most `fast_attempts - 1` rounds
+            // that actually went out.
+            if p.attempts == self.cadence.fast_attempts {
+                p.spent_fast_ladder = false;
+            }
+            p.attempts = p.attempts.saturating_sub(1);
+            // `due()` has already counted this round in `rounds_since_ack`,
+            // which is deliberate — a refunded round is still a round in which
+            // the peer did not answer.
             p.next_due_ns = now_ns + self.cadence.fast_ns;
         }
         self.publish_earliest(&g);
@@ -583,8 +611,10 @@ mod tests {
             "two rounds with no answer: silence, which never refuses"
         );
         assert!(
-            t.answered_below(8960),
-            "the join gate still knows it answered below the rung once"
+            !t.answered_below(8960),
+            "and the join gate treats it as silent too (review round 3, \
+             Important): an ack this peer has outlived must not hold \
+             `can_serve` down for the window either"
         );
 
         // And it comes back: the refresh rung is acked again, so the path's
@@ -735,6 +765,19 @@ mod tests {
             t.narrow_peers(8960),
             vec![(a(1), 1408)],
             "so the peer stays proven-narrow"
+        );
+
+        // Review round 3, minor 1: and a REFUNDED round after that reset does
+        // not clear it either. `note_unsent_for` gives back only the round that
+        // EARNED the latch; with `attempts` back at 0 a plain assignment would
+        // wipe a latch earned by rounds that really went out — which is the
+        // on_peer_seen regression again, by another route.
+        let now = 20;
+        assert_eq!(t.due(now).len(), 1, "the reset made it due");
+        t.note_unsent_for(a(1), now);
+        assert!(
+            t.get(a(1)).unwrap().spent_fast_ladder,
+            "a latch earned by rounds that went out survives a later refund"
         );
 
         // Forgetting the peer is the one thing that makes it new again.

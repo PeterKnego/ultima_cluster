@@ -258,9 +258,20 @@ Three things to know about it:
   holding for 30 s left it at `/readyz` 503 until the dead member came back, so
   a rolling restart (or a capstone that kills the leader and then waits for a
   serving survivor) had no servable node at all, on a cluster that still had
-  quorum. What the pass defers is a *runtime* degradation, which
-  `Uc2PathBelowMtu` reports on a serving node; and a returning member runs its
-  own join check, so every live pair is still tested from at least one side.
+  quorum. **What the pass gives up, stated plainly**: this node may be serving
+  without having proven it can carry the committed rung, and the two shapes of
+  that are not equally visible. If the narrowness is THIS host's own interface
+  MTU, its own sends fail locally with `EMSGSIZE` as soon as a large frame has
+  to go out — `uc2_send_emsgsize_total` climbs and the critical
+  `Uc2PathBelowMtu` fires. If the narrowness is a REMOTE path, there is no local
+  `EMSGSIZE` (unless the route returns ICMP frag-needed and the kernel lowers
+  the path MTU), so it does not alert: it shows up as a replication path that
+  never makes progress — that peer's reported durable position stuck, its
+  `uc2_peer_replication_lag_bytes` climbing, commit stalled if it is in the
+  quorum. The residual is real, and the compensating facts are weaker than "it
+  is covered": a returning member runs its own join check, which catches the
+  pair from its side *if* its own probes resolve before it adopts the rung — a
+  member whose archive already holds the rung can pass on `no_evidence` too.
 - **A peer ANSWERING below the rung does hold serving, briefly.** That is
   discovery in flight — the baseline ack has landed and the jumbo rungs have
   not — and it resolves one way or the other within a probe ladder (five

@@ -12596,16 +12596,72 @@ mod tests {
         h.cons.jumbo_check_ns = 0;
         assert!(!h.cons.check_jumbo_gate());
 
-        // The window runs out with the other peer still mid-ladder: PASS.
+        // The window runs out with the other peer still mid-ladder: PASS, and
+        // the record says WHICH pass this was (review round 3, minor 2). No
+        // unit test in this module swaps the obs sink, so the capture is this
+        // test's alone (other tests may add noise lines to it).
+        let buf = crate::obs::log::capture_for_tests();
         h.cons.pass_mono_ns = deadline;
         h.cons.jumbo_check_ns = 0;
         assert!(
             h.cons.check_jumbo_gate(),
             "at the window, an unproven hold passes rather than holding forever"
         );
+        let text = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        crate::obs::log::stderr_for_tests();
         assert_eq!(h.cons.jumbo_gate, Some(JumboGate::Passed));
+        assert!(
+            text.contains(r#""event":"jumbo_join_gate_passed_unproven""#)
+                && text.contains(r#""reason":"window_expired","waited_secs":30"#),
+            "the window pass is recorded as one, with the wait it actually \
+             waited: {text}"
+        );
         pass_checking_the_gate(&mut h);
         assert!(h.cons.can_serve_flag.load(Ordering::Acquire));
+        assert!(!h.cons.jumbo_gate_pending.load(Ordering::Acquire));
+    }
+
+    /// Review round 3, Important: the freshness rule has to cover the HOLD as
+    /// well as the refusal. A peer that acked 1408 and then went stale — a
+    /// killed member, or one restarted under wire crypto whose pairwise session
+    /// no longer opens our sealed probes — keeps `verified = 1408` forever, so
+    /// an `answered_below` without a freshness test held `can_serve` false for
+    /// the whole 30 s window. That reinstates the availability failure this
+    /// commit exists to remove, on the race ordering where the acks land BEFORE
+    /// the node learns the committed rung (`verified: 1408, advertised: 8960`,
+    /// the ledger the failing capstone run actually showed). A stale-acked peer
+    /// is SILENT: it neither refuses nor holds.
+    #[test]
+    fn a_stale_acked_peer_neither_refuses_nor_holds_the_join_gate() {
+        let mut h = harness();
+        drive_to_serving_leader(&mut h);
+        let peers = mtu_peers(&h);
+        // Both peers acked the baseline, then stopped answering: rounds keep
+        // going out (the ladder spends) and nothing comes back.
+        all_answer(&h, &peers, MTU_DEFAULT as u32, MTU_DEFAULT as u32);
+        spend_fast_ladder(&h);
+        publish_committed_rung(&mut h, MTU_BOUND as u32);
+
+        let buf = crate::obs::log::capture_for_tests();
+        pass_checking_the_gate(&mut h);
+        let text = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        crate::obs::log::stderr_for_tests();
+
+        // Reaching here at all is half the proof: a spent ladder plus an ack
+        // below the rung WOULD be a fail-stop if the ack were current.
+        assert_eq!(
+            h.cons.jumbo_gate,
+            Some(JumboGate::Passed),
+            "an outlived ack is silence: no refusal, and no hold either"
+        );
+        assert!(
+            text.contains(r#""reason":"no_evidence""#),
+            "and it passes as a no-evidence pass, not a 30 s one: {text}"
+        );
+        assert!(
+            h.cons.can_serve_flag.load(Ordering::Acquire),
+            "the node serves instead of sitting at 503 for the window"
+        );
         assert!(!h.cons.jumbo_gate_pending.load(Ordering::Acquire));
     }
 

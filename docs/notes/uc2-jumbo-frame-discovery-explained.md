@@ -278,10 +278,17 @@ has spent its fast probe ladder. Both halves matter:
   because `own_min_rung` is a minimum over *all* configured peers. That makes a
   rolling restart an outage on a cluster that still has quorum, and it is how
   the `lin_v2` capstones (kill the leader, then wait for a serving survivor)
-  ended up with no servable node at all. Silence is no evidence either way;
-  what the pass defers is the runtime degradation `Uc2PathBelowMtu` already
-  reports, and a returning member runs its own join check, so every live pair is
-  still tested from at least one side. `uc2ctl remove <dead-id>` is accepted
+  ended up with no servable node at all. Silence is no evidence either way, and
+  the residual deserves stating: an unproven pass can leave a node serving that
+  cannot carry the rung. If the narrow element is the node's OWN interface MTU,
+  its large sends fail `EMSGSIZE` and `Uc2PathBelowMtu` (critical) fires. If it
+  is a REMOTE path, nothing alerts — there is no local `EMSGSIZE` unless the
+  route returns ICMP frag-needed — and the symptom is a replication path that
+  never progresses (that peer stuck, `uc2_peer_replication_lag_bytes` climbing,
+  commit stalled if it is a voter). A returning member's own join check covers
+  the pair from its side only when its probes resolve before it adopts the rung;
+  one whose archive already holds the rung passes on `no_evidence` too.
+  `uc2ctl remove <dead-id>` is accepted
   while a gate is pending — admin handling keys on the leader flag, not on the
   gate. What DOES hold serving is a peer ANSWERING below the rung: discovery in
   flight, bounded at `JUMBO_GATE_WINDOW` (30 s, `reason = window_expired`).
