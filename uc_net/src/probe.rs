@@ -384,39 +384,25 @@ impl ProbeTable {
         out
     }
 
-    /// Is any peer ANSWERING below `committed` — `0 < verified < committed`
-    /// AND still answering ([`PeerProbe::rounds_since_ack`] ≤ 1, the same
-    /// freshness test [`ProbeTable::narrow_peers`] applies)? The join gate's
-    /// "is there anything to wait for" test (jumbo spec §5.4).
+    /// Jumbo spec §5.4 (as rebuilt around a quorum): how many of `members`
+    /// have PROVEN `committed` — this node's probe to them was acked at or
+    /// above it. The join gate counts VOTERS here and passes once they form
+    /// a quorum with the node itself, so the list is the caller's to choose;
+    /// an address with no entry counts for nothing, as does silence or an
+    /// answer below the rung.
     ///
-    /// `false` means every peer short of the rung is SILENT — it never
-    /// answered, or it answered once and has since stopped — and silence is no
-    /// evidence: there is nothing a longer hold can turn into a verdict, so the
-    /// gate passes rather than holding `can_serve` down. That matters for
-    /// availability, not tidiness — holding on silence meant that on a jumbo
-    /// cluster with one member down, a restarted survivor could not serve at
-    /// all until the dead member returned, and the lin_v2 capstones (which kill
-    /// the leader every second and then wait for a serving survivor) had no
-    /// servable node for the whole window.
-    ///
-    /// The freshness half is not symmetry for its own sake (review round 3,
-    /// Important): WITHOUT it, a peer that acked 1408 and then went stale — the
-    /// crypto-restart state this whole rule exists for — keeps `verified = 1408`
-    /// forever, so the gate held `can_serve` false for the full
-    /// `JUMBO_GATE_WINDOW` and reinstated that same 30 s hold on a different
-    /// race ordering (a node that learns the committed rung AFTER the acks
-    /// landed, which is exactly the `verified: 1408, advertised: 8960` ledger
-    /// the failing run showed).
-    ///
-    /// `true` is the genuine MID-LADDER state — a peer answered the baseline
-    /// and its jumbo rungs are still in flight — which is worth holding for,
-    /// briefly, because it resolves one way or the other within a ladder. Such
-    /// a peer answers the refresh rung EVERY round (see [`ProbeTable::due`]),
-    /// so the freshness test never shortens a legitimate hold.
-    pub fn answered_below(&self, committed: u32) -> bool {
+    /// No freshness test, deliberately, and the asymmetry with
+    /// [`ProbeTable::narrow_peers`] is the point: "the path carried 8960" is
+    /// a fact about the path that a later silence (the peer died, its
+    /// session went stale) does not undo, whereas "the path carries only
+    /// 1408" is a claim about NOW that the same silence turns into no
+    /// evidence. A proof is kept exactly as `verified` is kept.
+    pub fn proven_count(&self, committed: u32, members: &[SocketAddr]) -> usize {
         let g = self.peers.lock().unwrap();
-        g.values()
-            .any(|p| p.verified > 0 && p.verified < committed && p.rounds_since_ack <= 1)
+        members
+            .iter()
+            .filter(|m| g.get(m).is_some_and(|p| p.verified >= committed))
+            .count()
     }
 
     /// Spec §5.3 (erratum 4): the leader's table minimum over `members` —
@@ -610,11 +596,11 @@ mod tests {
             t.narrow_peers(8960).is_empty(),
             "two rounds with no answer: silence, which never refuses"
         );
-        assert!(
-            !t.answered_below(8960),
-            "and the join gate treats it as silent too (review round 3, \
-             Important): an ack this peer has outlived must not hold \
-             `can_serve` down for the window either"
+        assert_eq!(
+            t.proven_count(8960, &[a(1)]),
+            0,
+            "and an outlived 1408 ack is no proof of 8960 either: the join \
+             gate counts it toward nothing"
         );
 
         // And it comes back: the refresh rung is acked again, so the path's
@@ -665,26 +651,50 @@ mod tests {
         assert_eq!(t.narrow_peers(8960), vec![(a(1), 1408)]);
     }
 
-    /// `answered_below` is the join gate's "is there anything to wait for"
-    /// test: silence is not, a mid-ladder answer is.
+    /// The join gate's quorum count (spec §5.4 as rebuilt): how many of
+    /// `members` have PROVEN `committed` — acked at or above it. Only the
+    /// listed members count (a learner, or a peer no longer in the config,
+    /// is not in the list), silence and a below-rung answer count for
+    /// nothing, and a proof does not need to be fresh: a path that carried
+    /// the rung once is a path that carries it, unlike a narrow verdict,
+    /// which is a claim about now.
     #[test]
-    fn answered_below_separates_silence_from_a_mid_ladder_answer() {
+    fn proven_count_counts_only_the_listed_members_at_or_above_the_rung() {
         let t = ProbeTable::new(fast());
-        t.set_peers(&[a(1), a(2)]);
-        assert!(!t.answered_below(8960), "both silent: nothing to wait for");
+        let (v1, v2, learner) = (a(1), a(2), a(3));
+        t.set_peers(&[v1, v2, learner]);
+        assert_eq!(t.proven_count(8960, &[v1, v2]), 0, "all silent");
         t.due(0);
+        t.on_ack(v1, 1408, 1408);
+        assert_eq!(
+            t.proven_count(8960, &[v1, v2]),
+            0,
+            "below the rung is not proof"
+        );
+        t.on_ack(v1, 8960, 8960);
+        assert_eq!(t.proven_count(8960, &[v1, v2]), 1, "v1 proved it");
+        t.on_ack(learner, 8960, 8960);
+        assert_eq!(
+            t.proven_count(8960, &[v1, v2]),
+            1,
+            "a proof from a peer not in the list does not count"
+        );
+        assert_eq!(
+            t.proven_count(8832, &[v1, v2]),
+            1,
+            "at or above a lower rung too"
+        );
         t.due(10);
-        assert!(
-            !t.answered_below(8960),
-            "a spent ladder does not turn silence into evidence"
+        t.due(110);
+        t.due(210);
+        assert_eq!(
+            t.proven_count(8960, &[v1, v2]),
+            1,
+            "a proof is not outlived by later silence"
         );
-        t.on_ack(a(1), 1408, 1408);
-        assert!(t.answered_below(8960), "a(1) answered below the rung");
-        t.on_ack(a(1), 8960, 8960);
-        assert!(
-            !t.answered_below(8960),
-            "at the rung, and a(2) has still said nothing"
-        );
+        t.on_ack(v2, 8960, 8960);
+        assert_eq!(t.proven_count(8960, &[v1, v2]), 2);
+        assert_eq!(t.proven_count(8960, &[]), 0, "nobody listed, nobody proven");
     }
 
     /// Sorted by address, so "the first offender" is the same peer on every

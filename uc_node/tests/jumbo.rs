@@ -581,3 +581,81 @@ fn a_healthy_restart_on_a_jumbo_cluster_does_not_refuse() {
     nodes.push(restarted);
     stop_all(nodes);
 }
+
+/// Spec §5.4 as rebuilt around a quorum — the case that decided its shape. A
+/// jumbo cluster of three has one member DOWN, which it tolerates: two of
+/// three is a quorum and the leader keeps serving. Restarting one of the two
+/// survivors must not turn that into an outage: the restarted node cannot
+/// prove the rung to the dead member (nothing answers on its port), and the
+/// first shipped gate held it at `/readyz` 503 until the dead host returned;
+/// the unproven pass that replaced the hold let it serve, but on no evidence
+/// at all. Under the quorum rule it proves the rung to the OTHER survivor,
+/// self + 1 = 2 of 3, and passes WITH proof — the log records the quorum.
+///
+/// The dead member's address is re-bound to a socket nothing ever reads, so
+/// its probes vanish exactly as they would on a host that is off: silence,
+/// not an ICMP refusal.
+#[test]
+fn a_survivor_restarted_with_one_member_down_passes_on_a_proven_quorum() {
+    let _g = serialize();
+    let buf = uc_node::obs::log::capture_for_tests();
+    let (mut fleet, mut nodes) = spawn_cluster(3, FaultConfig::default());
+    let leader = await_single_leader(&nodes, 10);
+    await_rung(&nodes, 8960, 20);
+
+    // One follower dies and stays dead; its port is held silent.
+    let dead = (leader + 1) % 3;
+    let victim = (leader + 2) % 3;
+    let (hi, lo) = (dead.max(victim), dead.min(victim));
+    let n_hi = nodes.remove(hi);
+    let n_lo = nodes.remove(lo);
+    let (dead_node, victim_node) = if hi == dead { (n_hi, n_lo) } else { (n_lo, n_hi) };
+    dead_node.stop();
+    fleet.rebind(dead);
+    assert_eq!(nodes.len(), 1, "only the leader is left running");
+
+    // The other follower restarts against its own instance dir.
+    victim_node.stop();
+    fleet.rebind(victim);
+    let restarted = fleet.start(victim, FaultConfig::default());
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        assert!(
+            !consensus_failed(&restarted),
+            "a restart beside a dead member must never fail-stop\n--- capture buffer ---\n{}--- end ---",
+            String::from_utf8(buf.lock().unwrap().clone()).unwrap()
+        );
+        let pending = restarted
+            .observability()
+            .jumbo_gate_pending
+            .load(Ordering::Acquire);
+        if restarted.datagram_mtu() == 8960 && !pending {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "restart never converged beside a dead member: rung {}, gate pending {pending}",
+            restarted.datagram_mtu()
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let text = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+    assert!(
+        !text.contains("path_below_committed_mtu"),
+        "no refusal anywhere: {text}"
+    );
+    assert!(
+        text.contains(r#""event":"jumbo_gate_passed""#)
+            && text.contains(r#""proven_voters":1,"voters":3"#),
+        "the pass is made on a proven quorum of one peer plus self, not on \
+         silence: {text}"
+    );
+    assert!(
+        nodes[0].can_serve(),
+        "and the leader served throughout"
+    );
+
+    nodes.push(restarted);
+    stop_all(nodes);
+}
