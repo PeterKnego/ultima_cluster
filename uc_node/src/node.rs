@@ -75,11 +75,11 @@ use uc_protocol::v2::datagram::{
     DATAGRAM_HEADER_LEN, DGRAM_KIND_COMMIT_POSITION, DGRAM_KIND_CONFIG_PROPOSAL,
     DGRAM_KIND_CONFIG_REPLY, DGRAM_KIND_READ_PROBE, DGRAM_KIND_READ_PROBE_ACK,
     DGRAM_KIND_REQUEST_VOTE, DGRAM_KIND_TERM_MAP, DGRAM_KIND_VOTE, DatagramHeader,
-    MAX_TERM_MAP_WIRE_ENTRIES, MTU_DEFAULT, READ_PROBE_BODY_LEN, REQUEST_VOTE_BODY_LEN,
-    ReadProbeBody, RequestVoteBody, TERM_MAP_ENTRY_LEN, TERM_MAP_HEADER_LEN, TermMapEntryWire,
-    VOTE_BODY_LEN, VoteBody, is_rung, payload_ceiling, write_config_proposal_body,
-    write_config_reply_body, write_datagram_header, write_read_probe_body, write_request_vote_body,
-    write_term_map_body, write_vote_body,
+    MAX_PAYLOAD_DEFAULT, MAX_TERM_MAP_WIRE_ENTRIES, MTU_DEFAULT, READ_PROBE_BODY_LEN,
+    REQUEST_VOTE_BODY_LEN, ReadProbeBody, RequestVoteBody, TERM_MAP_ENTRY_LEN, TERM_MAP_HEADER_LEN,
+    TermMapEntryWire, VOTE_BODY_LEN, VoteBody, is_rung, payload_ceiling,
+    write_config_proposal_body, write_config_reply_body, write_datagram_header,
+    write_read_probe_body, write_request_vote_body, write_term_map_body, write_vote_body,
 };
 use uc_protocol::v2::schedule::{
     MAX_SCHEDULE_ENTRIES, SCHEDULE_ENTRY_LEN, SCHEDULE_HEADER_LEN, ScheduleRule,
@@ -519,7 +519,11 @@ pub const REASON_SCHEDULE_TOO_LARGE: u32 = 51;
 /// point of use as well. The `bool` is `true` exactly in that case, so the
 /// one caller that can log says so once and [`Node::datagram_mtu`] stays a
 /// plain read.
-fn committed_rung(raw: u32) -> (u32, bool) {
+///
+/// `pub(crate)` for the exporter (jumbo spec §9): `ObsSources::datagram_mtu`
+/// renders `uc2_datagram_mtu_bytes` through this same clamp rather than
+/// re-deriving it, so the scrape and the appender's door cannot disagree.
+pub(crate) fn committed_rung(raw: u32) -> (u32, bool) {
     match raw {
         0 => (MTU_DEFAULT as u32, false),
         r if is_rung(r) => (r, false),
@@ -881,6 +885,11 @@ pub struct Node {
     /// computed once at boot from `crate::services::fsm_lag_eff`.
     fsm_door: Option<u64>,
     buffer: Arc<LogBuffer>,
+    /// Jumbo spec §9: frames this node appended above the STANDARD ceiling
+    /// (`MAX_PAYLOAD_DEFAULT`), shared with the consensus agent that bumps it
+    /// and handed on by `observability()` as
+    /// `uc2_commands_over_standard_total`.
+    commands_over_standard: Arc<AtomicU64>,
     truncations: Arc<AtomicU64>,
     /// M6 Task 8: count of wipe-and-rejoins (NoCommonPrefix → truncate-to-0). A
     /// subset of `truncations` (a wipe is also a truncate), tracked separately for
@@ -1303,6 +1312,8 @@ impl Node {
         let intake_gate = Arc::new(AtomicBool::new(!boot_awaiting_reconcile));
         let truncations = Arc::new(AtomicU64::new(0));
         let wipes = Arc::new(AtomicU64::new(0));
+        // Jumbo spec §9: the ops-side view of the §8 developer warning.
+        let commands_over_standard = Arc::new(AtomicU64::new(0));
         let reports_implausible = Arc::new(AtomicU64::new(0));
         let reports_unattested = Arc::new(AtomicU64::new(0));
         // M8 (Task 12): the newest group epoch this node has minted, mirrored
@@ -2034,6 +2045,7 @@ impl Node {
             intake_gate: Arc::clone(&intake_gate),
             truncations: Arc::clone(&truncations),
             wipes: Arc::clone(&wipes),
+            commands_over_standard: Arc::clone(&commands_over_standard),
             reports_implausible: Arc::clone(&reports_implausible),
             clock: crate::log_clock::LogClock::new(),
             durable_seen: durable,
@@ -2144,6 +2156,7 @@ impl Node {
             admission_bytes: cfg.admission_bytes_default,
             fsm_door: fsm_lag_eff,
             buffer,
+            commands_over_standard,
             truncations,
             wipes,
             timer_stats,
@@ -2583,6 +2596,8 @@ impl Node {
             log_clock_smear_ns: Arc::clone(&self.log_clock_smear_pub),
             schedule_apply_refused: Arc::clone(&self.schedule_refused),
             cluster_view: Arc::clone(&self.cluster_view),
+            probe: Arc::clone(&self.probe_table),
+            commands_over_standard: Arc::clone(&self.commands_over_standard),
             reports_unattested: Arc::clone(&self.reports_unattested),
             reports_implausible: Arc::clone(&self.reports_implausible),
             crypto_handshake_failures: Arc::clone(&self.crypto_handshake_failures),
@@ -3060,6 +3075,11 @@ struct Consensus {
     leader_flag: Arc<AtomicBool>,
     can_serve_flag: Arc<AtomicBool>,
     intake_gate: Arc<AtomicBool>,
+    /// Jumbo spec §9: frames appended above the STANDARD ceiling
+    /// (`MAX_PAYLOAD_DEFAULT`) — one compare against a CONSTANT per append,
+    /// on the two leader append paths. Shared with the `Node` handle for
+    /// observability.
+    commands_over_standard: Arc<AtomicU64>,
     truncations: Arc<AtomicU64>,
     /// M6 Task 8: wipe-and-rejoin count (NoCommonPrefix → truncate-to-0), bumped
     /// on `Action::CountWipe`. Shared with the `Node` handle for observability.
@@ -5251,6 +5271,7 @@ impl Consensus {
         match app.append(0, self.next_corr, payload) {
             Ok(_) => {
                 self.next_corr = self.next_corr.wrapping_add(1);
+                self.count_over_standard(payload.len());
                 true
             }
             Err(AppendError::WouldOverrun) => false,
@@ -5691,9 +5712,61 @@ impl Consensus {
                     datagram_mtu = min as u64,
                     position = position
                 );
+                self.audit_datagram_mtu(min, position);
                 true
             }
             Err(_) => false, // WouldOverrun: next check
+        }
+    }
+
+    /// Spec §9: audit a DISCOVERY commit as `settings_apply`, `source =
+    /// "discovery"`.
+    ///
+    /// This is the one record in `audit.jsonl` no admin request produced: the
+    /// rung is replicated through the same `Settings` record `uc2ctl settings
+    /// apply` writes, so an operator reading the file would otherwise find a
+    /// settings change with nobody's name on it and no way to tell the two
+    /// apart. `actor` is `"node"` because nothing was authenticated and there
+    /// is no one to attest; `id` carries the rung and `config_version` the
+    /// frame-END position, which is what ties the line back to the log.
+    ///
+    /// Written AFTER the append, not before (the one deliberate departure
+    /// from `crate::audit`'s record-before-respond rule): there is no answer
+    /// to withhold, and the position the record reports only exists once the
+    /// frame is placed. A failed write is therefore a loud `error` event, not
+    /// a refusal — the commit has already happened and unwinding it is not
+    /// something consensus can do. Cost: one `write` + one `sync_data`, at
+    /// most once per 100 ms throttle window and in practice a handful of times
+    /// in a cluster's life (the rung is monotone and has three rungs).
+    fn audit_datagram_mtu(&mut self, rung: u32, position: u64) {
+        let rec = AuditRecord {
+            ts_ns: crate::obs::metrics::now_unix_ns(),
+            actor: "node",
+            origin: AuditOrigin::Local,
+            op: 7,
+            op_name: op_name(7),
+            id: rung,
+            addr: None,
+            seq: 0,
+            nonce: 0,
+            outcome: AuditOutcome::Accepted,
+            reason: 0,
+            config_version: position,
+            detail: None,
+            source: crate::audit::SOURCE_DISCOVERY,
+        };
+        if let Err(e) = self.audit.record(&rec) {
+            let err = e.to_string();
+            crate::obs_event!(
+                Error,
+                "admin_audit_failed",
+                node = self.id as u64,
+                seq = 0u64,
+                nonce = 0u64,
+                op = 7u64,
+                status = 0u64,
+                err = err.as_str(),
+            );
         }
     }
 
@@ -6274,9 +6347,29 @@ impl Consensus {
             return false;
         };
         match app.append(client_id, local_seq, payload) {
-            Ok(_) => true,
+            Ok(_) => {
+                self.count_over_standard(payload.len());
+                true
+            }
             Err(AppendError::WouldOverrun) => false,
             Err(AppendError::PayloadTooLarge) => true, // consumed (dropped)
+        }
+    }
+
+    /// Jumbo spec §9: the ops-side view of the §8 developer warning. One
+    /// compare per APPENDED frame against a CONSTANT — not against the live
+    /// ceiling: the question this counter answers is "does this deployment
+    /// depend on jumbo-frame support", and the standard ceiling is the same
+    /// number on every cluster, so a cluster that later raises its rung does
+    /// not silently re-baseline its own answer.
+    ///
+    /// Called only on the `Ok` arm of the two leader append paths: a payload
+    /// the live door refused never entered the log, and counting it would
+    /// report a dependency the log does not have.
+    #[inline(always)]
+    fn count_over_standard(&self, payload_len: usize) {
+        if payload_len > MAX_PAYLOAD_DEFAULT {
+            self.commands_over_standard.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -7798,6 +7891,10 @@ impl Consensus {
             outcome: AuditOutcome::from_wire(status, reason),
             reason,
             config_version: version,
+            // Every record written through here answers somebody. The one
+            // record in the file that does not is discovery's own
+            // `settings_apply` (jumbo spec §9) — see `audit_datagram_mtu`.
+            source: crate::audit::SOURCE_OPERATOR,
         };
         match self.audit.record(&rec) {
             Ok(()) => (status, reason),
@@ -10263,6 +10360,7 @@ mod tests {
             leader_flag: Arc::new(AtomicBool::new(false)),
             can_serve_flag: Arc::new(AtomicBool::new(false)),
             intake_gate,
+            commands_over_standard: Arc::new(AtomicU64::new(0)),
             truncations: Arc::new(AtomicU64::new(0)),
             wipes: Arc::new(AtomicU64::new(0)),
             reports_implausible: Arc::new(AtomicU64::new(0)),
@@ -11266,6 +11364,53 @@ mod tests {
         );
     }
 
+    /// Spec §9: a DISCOVERY commit is AUDITED, as `settings_apply` with
+    /// `source = "discovery"`. It changes the replicated settings record just
+    /// as `uc2ctl settings apply` does, but no operator asked for it — so the
+    /// file has to let a reader tell the two apart, rather than showing an
+    /// unexplained settings change with nobody's name on it.
+    #[test]
+    fn a_discovery_commit_is_audited_as_a_settings_apply_from_discovery() {
+        let mut h = harness();
+        drive_to_serving_leader(&mut h);
+        let before = std::fs::read_to_string(h.cons.audit.path()).unwrap_or_default();
+        assert!(before.is_empty(), "no admin op has run: {before}");
+        let peers = mtu_peers(&h);
+        all_answer(&h, &peers, MTU_BOUND as u32, MTU_BOUND as u32);
+
+        h.cons.next_mtu_check_ns = 0;
+        assert!(h.cons.maybe_commit_datagram_mtu(), "the rule proposes");
+
+        let text = std::fs::read_to_string(h.cons.audit.path()).unwrap();
+        assert_eq!(text.lines().count(), 1, "exactly one record: {text}");
+        assert!(
+            text.contains(r#""op":7,"op_name":"settings_apply""#),
+            "{text}"
+        );
+        assert!(text.contains(r#""source":"discovery""#), "{text}");
+        assert!(
+            text.contains(r#""outcome":"accepted","reason":0"#),
+            "{text}"
+        );
+        assert!(
+            text.contains(r#""actor":"node""#),
+            "nobody signed this one: {text}"
+        );
+        // The rung it committed, and the frame-END position it committed at —
+        // the two numbers a reader needs to tie the line to the log.
+        assert!(
+            text.contains(&format!(r#""id":{}"#, MTU_BOUND)),
+            "the rung: {text}"
+        );
+        assert!(
+            text.contains(&format!(
+                r#""config_version":{}"#,
+                h.cons.last_cluster_append
+            )),
+            "the frame-END position: {text}"
+        );
+    }
+
     /// Spec §4.4/§5.3: SINGLE IN FLIGHT. The rule shares the one gate every
     /// other `CLUSTER` command uses, so it cannot stack a second proposal on
     /// top of one that has not committed — even once the throttle has expired.
@@ -11511,6 +11656,48 @@ mod tests {
             0,
             "the page keeps its lockstep sentinel"
         );
+    }
+
+    /// Spec §9: an appended frame above the STANDARD ceiling (1312) is
+    /// counted, whatever this cluster's live ceiling is — the counter is the
+    /// ops-side view of the §8 developer warning ("this deployment now
+    /// depends on jumbo-frame support"), so it compares against the CONSTANT
+    /// every cluster shares, never against the local door.
+    ///
+    /// The harness's live ceiling is its 4096 B bound (nothing here lowers it
+    /// to the baseline the way `start_with` does), which is what lets one
+    /// test append on both sides of 1312 without touching a rung.
+    #[test]
+    fn a_frame_above_the_standard_ceiling_is_counted() {
+        let mut h = harness();
+        drive_to_serving_leader(&mut h);
+        let counter = Arc::clone(&h.cons.commands_over_standard);
+        let c = || counter.load(Ordering::Relaxed);
+
+        assert!(h.cons.try_append(&[0u8; 1300]));
+        assert_eq!(c(), 0, "under the standard ceiling");
+        assert!(h.cons.try_append(&[0u8; MAX_PAYLOAD_DEFAULT]));
+        assert_eq!(c(), 0, "AT the standard ceiling is not above it");
+        assert!(h.cons.try_append(&[0u8; MAX_PAYLOAD_DEFAULT + 1]));
+        assert_eq!(c(), 1, "one byte over counts");
+        assert!(h.cons.try_append(&[0u8; 2000]));
+        assert_eq!(c(), 2);
+
+        // The client-ring path (`try_append_client`) is the one real clients
+        // use; the in-process queue above is the harness's. Both count.
+        assert!(h.cons.try_append_client(7, 1, &[0u8; 2000]));
+        assert_eq!(c(), 3, "the ring path counts too");
+        assert!(h.cons.try_append_client(7, 2, &[0u8; 8]));
+        assert_eq!(c(), 3);
+
+        // A payload the live door REFUSES is not an appended frame, so it is
+        // not counted — the counter reports what went into the log, not what
+        // was attempted.
+        assert!(
+            h.cons.try_append(&[0u8; 4097]),
+            "consumed (dropped), not held"
+        );
+        assert_eq!(c(), 3, "PayloadTooLarge appended nothing");
     }
 
     /// Spec §4.4: SINGLE IN FLIGHT. A second staged apply while the previous

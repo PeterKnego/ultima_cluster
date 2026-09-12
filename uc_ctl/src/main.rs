@@ -901,6 +901,22 @@ fn run_status(a: &StatusArgs) -> anyhow::Result<()> {
         "services: declared={ids:?} fsm_lag={lag_desc} log_time_ns={}",
         cnc.log_time_ns()
     );
+    // Jumbo spec §9. The rung comes from the COMMITTED artifact (the same
+    // reader `settings show` uses) and the ceiling from the LIVE cnc word, so
+    // the two halves cannot disagree with what clients and the appender see.
+    // A read failure degrades to the baseline reading rather than aborting,
+    // for the reason `schedule_position` above degrades to `?`: `status` is
+    // the command an operator runs when something is wrong.
+    println!(
+        "{}",
+        ceiling_line(
+            cnc.payload_ceiling(),
+            uc_node::cluster_agent::read_committed_settings(&a.common.instance_dir)
+                .ok()
+                .flatten()
+                .map(|(_, s)| s.datagram_mtu),
+        )
+    );
     let now_ns = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
@@ -1144,6 +1160,30 @@ fn run_gen_admin_key(a: &GenAdminKeyArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Jumbo spec §9: `status`'s ceiling line — the live command payload ceiling
+/// plus the datagram rung it came from, and whether that rung was ever
+/// DISCOVERED or is still the baseline every cluster starts from.
+///
+/// `committed` is the `Settings::datagram_mtu` word out of the newest cluster
+/// artifact, or `None` when there is no artifact yet (or it could not be
+/// read). `0` in that word is the unset sentinel, so both shapes read
+/// `baseline` — exactly the clamp `uc_node`'s appender applies, kept a pure
+/// function here so a test can pin all three cases without an instance
+/// directory.
+///
+/// Deliberately NOT on this line: `uc2_commands_over_standard_total`, the
+/// third thing spec §9 names. It is an in-process counter on the node's
+/// consensus agent, not a cnc word, and `uc2ctl` does not scrape `/metrics` —
+/// publishing it here would cost a cnc page word, which is a flag day. It
+/// lives in `/metrics` alone.
+fn ceiling_line(ceiling: u64, committed: Option<u32>) -> String {
+    let (rung, origin) = match committed {
+        Some(r) if r != 0 => (r, "discovered"),
+        _ => (uc_protocol::v2::datagram::MTU_DEFAULT as u32, "baseline"),
+    };
+    format!("ceiling: {ceiling} B (rung {rung}, {origin})")
+}
+
 /// One field's value out of a flat, single-line JSON object, as decoded
 /// text (`"ops-alice"` -> `ops-alice`, `20` -> `20`, `null` -> `null`).
 /// `None` on anything that doesn't look like `"key":value` — this is a
@@ -1271,6 +1311,28 @@ mod tests {
     // cannot make sense of must come back `None` (so the caller falls back
     // to printing the raw line with a `?` marker) rather than a silently
     // truncated value.
+
+    /// Jumbo spec §9: `status`'s ceiling line reports the LIVE ceiling and
+    /// says whether its rung was discovered or is still the baseline. No
+    /// artifact and the unset sentinel are the same answer — `baseline`, not
+    /// "rung 0" — and only a real committed rung reads `discovered`.
+    #[test]
+    fn the_ceiling_line_distinguishes_a_discovered_rung_from_the_baseline() {
+        assert_eq!(
+            ceiling_line(1344, None),
+            "ceiling: 1344 B (rung 1408, baseline)",
+            "no cluster artifact yet"
+        );
+        assert_eq!(
+            ceiling_line(1344, Some(0)),
+            "ceiling: 1344 B (rung 1408, baseline)",
+            "0 is the unset sentinel, not a rung"
+        );
+        assert_eq!(
+            ceiling_line(8896, Some(8960)),
+            "ceiling: 8896 B (rung 8960, discovered)"
+        );
+    }
 
     /// Coordinated-snapshot plan 2 Task 7: pin the 48-50 band's names — the
     /// snapshot refusal reasons a `uc2ctl snapshot`/`snapshot fetch` caller

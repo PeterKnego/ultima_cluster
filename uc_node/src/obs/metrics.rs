@@ -93,6 +93,17 @@ pub const CONTRACT_SERIES: &[&str] = &[
     "uc2_log_time_ns",
     "uc2_log_time_lag_seconds",
     "uc2_log_clock_smear_ns",
+    // Jumbo frames (spec §9): the discovered ceiling and the ladder's
+    // activity. The first three are the door this cluster is actually
+    // serving; the last four are how it got there and whether the paths
+    // still carry it.
+    "uc2_datagram_mtu_bytes",
+    "uc2_payload_ceiling_bytes",
+    "uc2_probe_min_mtu_bytes",
+    "uc2_probe_sent_total",
+    "uc2_probe_acked_total",
+    "uc2_send_emsgsize_total",
+    "uc2_commands_over_standard_total",
     "uc2_output_completed_bytes",
     "uc2_output_progress_bytes",
     "uc_node_snapshot_floor_bytes",
@@ -828,6 +839,54 @@ fn push_service_families(out: &mut String, s: &ObsSources, commit: u64, now: u64
         "Per node: nanoseconds of a backward step of THIS node's wall clock that its log clock is still retiring by running 500 ppm slow (spec 2026-09-08 §5.3). On the leader this is the log's clock; on a follower it is the clock that node would lead with after a failover — every node's clock is a candidate leader clock, so it is reported everywhere. The log clock is AHEAD of wall time while this is nonzero, so uc2_log_time_lag_seconds reads 0 — this gauge is the only sign of a smear.",
         s.log_clock_smear_ns.load(Ordering::Relaxed),
     );
+
+    // Jumbo frames (spec §9). The rung and the ceiling come off the same two
+    // sources every other reader uses — the committed cluster view and the
+    // cnc word — so a scrape can never disagree with what the appender
+    // enforces. The four counters are the agents' own cells, read here and
+    // published nowhere else.
+    push_gauge(
+        out,
+        "uc2_datagram_mtu_bytes",
+        "The committed datagram rung this node applies (jumbo spec §5.3); 1408 = the baseline every cluster starts from. Must agree cluster-wide once caught up.",
+        s.datagram_mtu() as u64,
+    );
+    push_gauge(
+        out,
+        "uc2_payload_ceiling_bytes",
+        "The live command payload ceiling in bytes — min(this node's max_payload bound, payload_ceiling(committed rung, crypto)), the same value clients read from the cnc page.",
+        s.cnc.payload_ceiling(),
+    );
+    push_gauge(
+        out,
+        "uc2_probe_min_mtu_bytes",
+        "This node's own verified minimum over its PEERS (jumbo spec §5.2); 0 while any peer is unresolved, and 8960 (MTU_BOUND) on a node with no peers at all, whose only path is loopback. The leader's commit rule consults the stricter table minimum, which also requires every member's advertised half.",
+        s.probe.own_min_rung() as u64,
+    );
+    push_counter(
+        out,
+        "uc2_probe_sent_total",
+        "PROBE datagrams this node put on the wire (jumbo spec §5.1). A round that put nothing on the wire — no pairwise crypto session yet, or every rung refused for size — is not counted here.",
+        s.sender.probes_sent.load(Ordering::Relaxed),
+    );
+    push_counter(
+        out,
+        "uc2_probe_acked_total",
+        "PROBE_ACK datagrams this node received and credited into its probe table.",
+        s.receiver.probe_acks.load(Ordering::Relaxed),
+    );
+    push_counter(
+        out,
+        "uc2_send_emsgsize_total",
+        "Non-probe datagrams the kernel refused for size under do-not-fragment: a path that degraded BELOW the committed rung, which the rung itself never lowers. Must be 0 (alert: Uc2PathBelowMtu). Probe refusals are counted separately and are a normal part of the ladder.",
+        s.sender.emsgsize.load(Ordering::Relaxed),
+    );
+    push_counter(
+        out,
+        "uc2_commands_over_standard_total",
+        "Frames this node appended above the standard 1312 B ceiling: nonzero means this deployment now depends on jumbo-frame support (jumbo spec §8). Leader-only by construction — only a leader appends — so read it summed across the fleet.",
+        s.commands_over_standard.load(Ordering::Relaxed),
+    );
 }
 
 /// Render the full M10 series contract over one snapshot of `s`'s `Arc`s
@@ -1485,6 +1544,8 @@ mod tests {
             log_clock_smear_ns: Arc::new(AtomicU64::new(0)),
             schedule_apply_refused: Arc::new(AtomicU64::new(0)),
             cluster_view: test_cluster_view(),
+            probe: uc_net::probe::ProbeTable::new(uc_net::probe::ProbeCadence::default()),
+            commands_over_standard: Arc::new(AtomicU64::new(0)),
             reports_unattested: Arc::new(AtomicU64::new(0)),
             reports_implausible: Arc::new(AtomicU64::new(0)),
             crypto_handshake_failures: Arc::new(AtomicU64::new(0)),
@@ -1620,7 +1681,7 @@ mod tests {
     fn the_contract_has_the_number_of_families_the_docs_state() {
         assert_eq!(
             CONTRACT_SERIES.len(),
-            100,
+            107,
             "if this is intentional, update the family count in \
              docs/how-to/monitor-a-cluster.md in the same commit"
         );
@@ -2025,6 +2086,8 @@ mod tests {
             log_clock_smear_ns: Arc::new(AtomicU64::new(0)),
             schedule_apply_refused: Arc::new(AtomicU64::new(0)),
             cluster_view: test_cluster_view(),
+            probe: uc_net::probe::ProbeTable::new(uc_net::probe::ProbeCadence::default()),
+            commands_over_standard: Arc::new(AtomicU64::new(0)),
             reports_unattested: Arc::new(AtomicU64::new(0)),
             reports_implausible: Arc::new(AtomicU64::new(0)),
             crypto_handshake_failures: Arc::new(AtomicU64::new(0)),

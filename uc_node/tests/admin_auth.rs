@@ -578,6 +578,10 @@ fn hmac_policy_accepts_a_valid_signature() {
     assert_eq!(field(&line, "origin"), "local");
     assert_eq!(field(&line, "op"), OP_ADD_LEARNER.to_string());
     assert_eq!(field(&line, "config_version"), "1", "{line}");
+    // Jumbo spec §9: an admin op is an OPERATOR's record. The node writes
+    // `settings_apply` lines of its own when path-MTU discovery raises the
+    // rung, and this field is what separates the two.
+    assert_eq!(field(&line, "source"), "operator", "{line}");
 
     c.stop();
 }

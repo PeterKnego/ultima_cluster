@@ -78,6 +78,18 @@ pub struct ObsSources {
     /// the consensus pass the way `schedule_table_position` is, because that
     /// pass is a measured hot path and a scrape is not.
     pub cluster_view: Arc<crate::cluster_fsm::ClusterView>,
+    /// Jumbo spec §9: this node's path-MTU probe ledger — the SAME
+    /// allocation the sender and receiver agents write through, read at
+    /// scrape time for `uc2_probe_min_mtu_bytes`. The two probe/ack COUNTERS
+    /// are not here: they already live on `sender`/`receiver`, and a second
+    /// copy of a number is a second thing that can be wrong.
+    pub probe: Arc<uc_net::probe::ProbeTable>,
+    /// Jumbo spec §9: frames this node has APPENDED above the standard
+    /// `MAX_PAYLOAD_DEFAULT` ceiling (`uc2_commands_over_standard_total`).
+    /// Leader-only by construction — only a leader appends — and therefore
+    /// cumulative per TERM-run on this node, not cluster-wide: a reader sums
+    /// across the fleet. The ops-side view of the spec §8 developer warning.
+    pub commands_over_standard: Arc<AtomicU64>,
     pub reports_unattested: Arc<AtomicU64>,
     pub reports_implausible: Arc<AtomicU64>,
     pub crypto_handshake_failures: Arc<AtomicU64>,
@@ -123,6 +135,22 @@ pub struct ObsSources {
     pub agents: Vec<(&'static str, Arc<AtomicBool>)>,
 }
 
+impl ObsSources {
+    /// Jumbo spec §9: the committed datagram rung this node applies — the
+    /// SAME reading [`crate::node::Node::datagram_mtu`] answers, through the
+    /// same clamp, off the same `ClusterView` word. A scrape can therefore
+    /// never disagree with the door the appender enforces; the unset
+    /// sentinel and a non-rung word both read as the baseline.
+    pub fn datagram_mtu(&self) -> u32 {
+        crate::node::committed_rung(
+            self.cluster_view
+                .datagram_mtu
+                .load(std::sync::atomic::Ordering::Acquire),
+        )
+        .0
+    }
+}
+
 #[cfg(any(test, fuzzing))]
 impl ObsSources {
     /// A fully-formed `ObsSources` over a HEAP-backed cnc page and fresh
@@ -160,6 +188,8 @@ impl ObsSources {
             cluster_view: Arc::new(crate::cluster_fsm::ClusterView::new(
                 &crate::cluster_fsm::ClusterState::genesis_empty(),
             )),
+            probe: uc_net::probe::ProbeTable::new(uc_net::probe::ProbeCadence::default()),
+            commands_over_standard: Arc::new(AtomicU64::new(0)),
             reports_unattested: Arc::new(AtomicU64::new(0)),
             reports_implausible: Arc::new(AtomicU64::new(0)),
             crypto_handshake_failures: Arc::new(AtomicU64::new(0)),

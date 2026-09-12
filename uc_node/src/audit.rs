@@ -19,8 +19,15 @@
 //! *fresh* decision is recorded before that decision is published.
 //!
 //! ```json
-//! {"ts_ns":1755600000000000000,"event":"admin_op","actor":"ops-alice","origin":"local","op":1,"op_name":"add_learner","id":4,"addr":"10.0.0.4:9100","seq":12,"nonce":880,"outcome":"accepted","reason":0,"config_version":7,"detail":null}
+//! {"ts_ns":1755600000000000000,"event":"admin_op","actor":"ops-alice","origin":"local","op":1,"op_name":"add_learner","id":4,"addr":"10.0.0.4:9100","seq":12,"nonce":880,"outcome":"accepted","reason":0,"config_version":7,"detail":null,"source":"operator"}
 //! ```
+//!
+//! **Not every record is an admin request.** Jumbo spec §9: when path-MTU
+//! discovery raises the cluster's committed datagram rung, the LEADER writes
+//! a `settings_apply` record of its own — same op, same file, `source`
+//! `"discovery"` rather than `"operator"` and `actor` `"node"`. It is the one
+//! record in the file nobody asked for, and the reason the `source` field
+//! exists.
 //!
 //! Key order is fixed and is a contract, exactly as for
 //! [`crate::obs::log`] — the two share one formatter
@@ -134,6 +141,11 @@ impl AuditOrigin {
 /// flag and `config_version` the instant's position P (or the newest complete
 /// set's, on a refusal); for `snapshot_fetch`, `id` is the learner's id,
 /// `ip`/`port` pack the position, and `config_version` is that position.
+///
+/// For the DISCOVERY `settings_apply` (`source = "discovery"`, jumbo spec §9)
+/// there is no signed staged file and no operator: `id` carries the datagram
+/// rung the leader committed, `addr` is null, `seq`/`nonce` are 0, and
+/// `config_version` is the proposing frame's END position.
 pub fn op_name(op: u32) -> &'static str {
     match op {
         1 => "add_learner",
@@ -155,7 +167,7 @@ pub fn op_name(op: u32) -> &'static str {
 pub struct AuditRecord<'a> {
     /// Unix nanoseconds (`crate::obs::metrics::now_unix_ns`).
     pub ts_ns: u64,
-    /// Who the node can attest asked for this. One of exactly four shapes:
+    /// Who the node can attest asked for this. One of exactly five shapes:
     /// the admin key name that signed the request under
     /// [`uc_crypto::admin::AdminPolicy::Hmac`]; `"unverified"` when an
     /// `Hmac` policy could NOT authenticate the request (missing, bad,
@@ -163,7 +175,10 @@ pub struct AuditRecord<'a> {
     /// the node could not verify, or an audit reader could be steered by an
     /// attacker's own choice of key name); `"filesystem"` under
     /// `Filesystem` (nothing was authenticated — the directory permissions
-    /// were the boundary); `"peer:<id>"` for a proposal a peer forwarded.
+    /// were the boundary); `"peer:<id>"` for a proposal a peer forwarded; and
+    /// `"node"` on the one record nobody asked for — the discovery
+    /// `settings_apply` (`source = "discovery"`), where there is no requester
+    /// to attest at all.
     pub actor: &'a str,
     pub origin: AuditOrigin,
     /// The raw wire op code.
@@ -193,7 +208,26 @@ pub struct AuditRecord<'a> {
     /// renders as `null`) on every other op, so the record's key SET is the
     /// same on every line and only its values differ.
     pub detail: Option<&'a str>,
+    /// Jumbo spec §9: WHO decided this record's op should happen — `"operator"`
+    /// for every admin request (the node answered somebody), `"discovery"` for
+    /// a `settings_apply` the node wrote itself because path-MTU discovery
+    /// raised the committed rung. Without it a discovery commit is an
+    /// unexplained settings change with nobody's name on it, and `actor`
+    /// cannot carry the distinction: it attests WHO, and on a discovery line
+    /// there is no who.
+    ///
+    /// The file's 13th key, added LAST so every byte before it is unchanged.
+    /// `uc2ctl audit` and the `admin_auth` test reader both look fields up by
+    /// name, so the addition is additive for them.
+    pub source: &'static str,
 }
+
+/// [`AuditRecord::source`] for a record the node answered somebody for.
+pub const SOURCE_OPERATOR: &str = "operator";
+
+/// [`AuditRecord::source`] for the `settings_apply` record path-MTU discovery
+/// writes on its own (jumbo spec §9).
+pub const SOURCE_DISCOVERY: &str = "discovery";
 
 /// The append-only admin audit file. Opened once at node start and owned by
 /// the consensus agent (the only writer).
@@ -263,7 +297,7 @@ impl AuditLog {
 
 /// The record's fields, in the one order both the file line and the obs
 /// mirror use. `addr` is `null` when the op carries no address.
-fn fields<'a>(r: &'a AuditRecord<'a>, addr: Option<&'a str>) -> [Field<'a>; 12] {
+fn fields<'a>(r: &'a AuditRecord<'a>, addr: Option<&'a str>) -> [Field<'a>; 13] {
     [
         Field {
             key: "actor",
@@ -319,6 +353,10 @@ fn fields<'a>(r: &'a AuditRecord<'a>, addr: Option<&'a str>) -> [Field<'a>; 12] 
                 None => FieldValue::Null,
             },
         },
+        Field {
+            key: "source",
+            value: FieldValue::Str(r.source),
+        },
     ]
 }
 
@@ -365,6 +403,7 @@ mod tests {
             reason: 0,
             config_version: 7,
             detail: None,
+            source: SOURCE_OPERATOR,
         }
     }
 
@@ -379,7 +418,33 @@ mod tests {
             "{\"ts_ns\":1755600000000000000,\"event\":\"admin_op\",\"actor\":\"ops-alice\",\
              \"origin\":\"local\",\"op\":1,\"op_name\":\"add_learner\",\"id\":4,\
              \"addr\":\"10.0.0.4:9100\",\"seq\":12,\"nonce\":880,\"outcome\":\"accepted\",\
-             \"reason\":0,\"config_version\":7,\"detail\":null}\n"
+             \"reason\":0,\"config_version\":7,\"detail\":null,\"source\":\"operator\"}\n"
+        );
+    }
+
+    /// Jumbo spec §9: the discovery record's shape — `settings_apply` that no
+    /// operator requested. `source` is the only field that says so, and the
+    /// key sits LAST so every byte before it matches an operator line.
+    #[test]
+    fn a_discovery_record_names_its_source_and_changes_nothing_before_it() {
+        let dir = tempdir();
+        let mut a = AuditLog::open(dir.path()).unwrap();
+        let mut r = rec(0);
+        r.actor = "node";
+        r.op = 7;
+        r.op_name = op_name(7);
+        r.addr = None;
+        r.nonce = 0;
+        r.source = SOURCE_DISCOVERY;
+        a.record(&r).unwrap();
+        let text = std::fs::read_to_string(a.path()).unwrap();
+        assert!(
+            text.contains(r#""op":7,"op_name":"settings_apply""#),
+            "{text}"
+        );
+        assert!(
+            text.ends_with(",\"detail\":null,\"source\":\"discovery\"}\n"),
+            "{text}"
         );
     }
 

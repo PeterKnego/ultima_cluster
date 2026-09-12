@@ -91,6 +91,8 @@ fn synthetic_server() -> (ObsServer, ObsSources) {
         cluster_view: Arc::new(uc_node::ClusterView::new(
             &uc_node::ClusterState::genesis_empty(),
         )),
+        probe: uc_net::probe::ProbeTable::new(uc_net::probe::ProbeCadence::default()),
+        commands_over_standard: Arc::new(AtomicU64::new(0)),
         reports_unattested: Arc::new(AtomicU64::new(0)),
         reports_implausible: Arc::new(AtomicU64::new(0)),
         crypto_handshake_failures: Arc::new(AtomicU64::new(0)),
@@ -357,6 +359,66 @@ fn a_real_single_node_cluster_serves_and_becomes_ready() {
     node.stop();
 }
 
+/// Jumbo spec §9: a node whose `max_payload` does NOT itself cap the live
+/// door — the top of the configurable range (`payload_ceiling(MTU_BOUND)`),
+/// the value a real deployment's `node.toml` carries — so the scrape reads
+/// the BASELINE RUNG's own ceiling rather than this fixture's node-local
+/// knob (`config_for`'s 256). Sole voter, exactly like [`single_node`].
+fn single_node_at_the_baseline_ceiling(instance_dir: &std::path::Path) -> Node {
+    let sock = UdpSocket::bind("127.0.0.1:0").expect("bind");
+    let addr = sock.local_addr().unwrap();
+    let mut cfg = config_for(addr, instance_dir.to_path_buf());
+    cfg.max_payload =
+        uc_protocol::v2::datagram::payload_ceiling(uc_protocol::v2::datagram::MTU_BOUND, false);
+    let node = Node::start_with_socket(cfg, sock).expect("start");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !node.can_serve() {
+        assert!(Instant::now() < deadline, "sole voter never became leader");
+        std::thread::yield_now();
+    }
+    node
+}
+
+/// Jumbo spec §9: the discovery series are present on a fresh single-node
+/// cluster, with the BASELINE values (errata 4: a solo cluster does not
+/// raise — it has measured nothing).
+#[test]
+fn the_jumbo_series_report_the_baseline_on_a_solo_node() {
+    let dir = tempfile::Builder::new()
+        .prefix("uc2-obs-jumbo-")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("tempdir");
+    let instance_dir = dir.path().join("n0");
+
+    let node = single_node_at_the_baseline_ceiling(&instance_dir);
+    let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let srv = ObsServer::serve(node.observability(), bind).expect("obs server binds");
+    let (code, body) = get(srv.local_addr(), "/metrics");
+    assert_eq!(code, 200);
+
+    assert!(body.contains("\nuc2_datagram_mtu_bytes 1408\n"), "{body}");
+    assert!(
+        body.contains("\nuc2_payload_ceiling_bytes 1344\n"),
+        "{body}"
+    );
+    // No peers: `own_min_rung` answers `MTU_BOUND` for an empty map (errata
+    // 4's parenthetical — a solo cluster's only path is loopback), so this
+    // is 8960 and NOT 0. `table_min`, which is what the leader's COMMIT rule
+    // consults, is the half that stays `None` here, which is why the
+    // committed rung above is still the baseline.
+    assert!(body.contains("\nuc2_probe_min_mtu_bytes 8960\n"), "{body}");
+    assert!(body.contains("\nuc2_probe_sent_total 0\n"), "{body}");
+    assert!(body.contains("\nuc2_probe_acked_total 0\n"), "{body}");
+    assert!(body.contains("\nuc2_send_emsgsize_total 0\n"), "{body}");
+    assert!(
+        body.contains("\nuc2_commands_over_standard_total 0\n"),
+        "{body}"
+    );
+
+    srv.stop();
+    node.stop();
+}
+
 #[test]
 fn timer_and_log_time_families_are_in_the_contract() {
     for name in [
@@ -368,6 +430,15 @@ fn timer_and_log_time_families_are_in_the_contract() {
         // Cluster FSM (spec §9): the cluster row's own two positions.
         "uc2_cluster_fsm_position",
         "uc2_settings_position",
+        // Jumbo spec §9: the seven discovery series two alert rules and two
+        // fleet-gate bars name verbatim.
+        "uc2_datagram_mtu_bytes",
+        "uc2_payload_ceiling_bytes",
+        "uc2_probe_min_mtu_bytes",
+        "uc2_probe_sent_total",
+        "uc2_probe_acked_total",
+        "uc2_send_emsgsize_total",
+        "uc2_commands_over_standard_total",
     ] {
         assert!(
             uc_node::obs::metrics::CONTRACT_SERIES.contains(&name),
