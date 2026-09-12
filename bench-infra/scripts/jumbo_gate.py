@@ -4,7 +4,7 @@
 """Jumbo-frame path-MTU discovery — fleet gate driver.
 
 The pre-committed bars this driver adjudicates live in
-`docs/benchmarks/uc2-jumbo-frame-discovery-gate-TEMPLATE.md` (renamed to
+`docs/benchmarks/uc2-jumbo-frame-discovery-gate-2026-09-12.md` (renamed to
 `-<run date>.md` when it actually runs), copied VERBATIM from
 `docs/superpowers/specs/2026-09-10-uc2-jumbo-frame-discovery-design.md` §10,
 with the two plan-1 errata folded in (errata 1: a permanently narrow path
@@ -849,7 +849,7 @@ def run_arm_e(args):
     reimplementation; this driver only reads its paired-delta output and
     formats `report_row_e`."""
     print("row e reuses bench-infra/scripts/m5_fleet_gate.py's own runner; "
-          "see docs/benchmarks/uc2-jumbo-frame-discovery-gate-TEMPLATE.md "
+          "see docs/benchmarks/uc2-jumbo-frame-discovery-gate-2026-09-12.md "
           "'When this gate is run' for the exact invocation. Not run by this "
           "task.")
 

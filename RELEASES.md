@@ -25,9 +25,10 @@ written.**
   sizes (`RUNGS = [1408, 8832, 8960]`) with do-not-fragment set, the leader
   commits the minimum over all pairs through the replicated `Settings` record
   once every member has proven it, and every node moves its doors at that
-  commit — so a cluster on a cloud jumbo fabric carries **8896 B** commands
-  (8864 B with wire crypto) instead of 1344 B / 1312 B, and a cluster on an
-  ordinary 1500 B path keeps the baseline and behaves exactly as before. The
+  commit — so a cluster on a 9001 B path such as AWS carries **8896 B**
+  commands (8864 B with wire crypto) instead of 1344 B / 1312 B, one on an
+  8896 B fabric such as GCP lands on the 8832 rung (8768 / 8736), and a cluster
+  on an ordinary 1500 B path keeps the baseline and behaves exactly as before. The
   number is monotone and never lowers (a committed frame is a permanent
   obligation on every future leader), `max_payload` is gone from `node.toml`,
   the optional new `force_jumbo_frames` makes a jumbo path a startup
@@ -79,7 +80,7 @@ written.**
   `force_jumbo_frames` refusals, the soak plateau that decides whether the
   runbook *recommends* jumbo, and two no-bar cost rows) are committed with
   every result cell reading UNRUN, driver `bench-infra/scripts/jumbo_gate.py`
-  — [the jumbo gate doc](docs/benchmarks/uc2-jumbo-frame-discovery-gate-TEMPLATE.md).
+  — [the jumbo gate doc](docs/benchmarks/uc2-jumbo-frame-discovery-gate-2026-09-12.md).
   The log clock's fleet A/B (`m14_fleet_gate.py` rows a/b/e, this tree vs its
   pre-change parent commit) is likewise pre-committed and unrun —
   [the log-clock gate doc](docs/benchmarks/uc2-log-clock-gate-2026-09-08.md).

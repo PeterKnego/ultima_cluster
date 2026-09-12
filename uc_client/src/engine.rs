@@ -123,16 +123,22 @@ pub enum Consistency {
 
 /// Jumbo spec §8: the remedy clause the developer notification carries.
 ///
-/// The same advice is spelled out inline in five other places, and they cannot
-/// be folded into this constant: four are `thiserror` `#[error("…")]` format
-/// strings, which take a string LITERAL and cannot interpolate a `const`
+/// The same advice is spelled out inline in five other places
 /// (`SubmitError::PayloadTooLarge` below, `crate::ClientError::PayloadTooLarge`,
-/// `uc_remote::RemoteError::PayloadTooLarge`), and the fifth is in another
-/// crate with no shared runtime dependency to host a constant
-/// (`uc_gateway::Edge::warn_payload_too_large`'s `remedy` field — `uc_remote`
-/// depends on `uc_protocol` only as a dev-dependency, and `uc_obs` is a log
-/// format crate, not a place for product copy). Hand-writing `Display` to get
-/// one constant would cost more than the duplication.
+/// `uc_remote::{RemoteError::PayloadTooLarge, engine::JUMBO_REMEDY}`, and
+/// `uc_gateway::Edge::warn_payload_too_large`'s `remedy` field), and they stay
+/// hand-written for two reasons — NOT because `thiserror` cannot take a
+/// constant, which it can (a trailing format argument):
+///
+/// * **No crate can host a constant all five reach.** `uc_remote` takes
+///   `uc_protocol` as a dev-dependency only and `uc_obs` as its sole runtime UC
+///   dependency (it is the crate a third-party remote client copies), and
+///   `uc_obs` is a log-format leaf, not a place for product copy. So a constant
+///   shared ACROSS `uc_client`/`uc_remote`/`uc_gateway` has nowhere to live.
+/// * **The texts are deliberately different per tier, not copies.** This one is
+///   the full developer notification; `SubmitError`'s is a shortened variant;
+///   `uc_remote`'s omits the clause about what this cluster carries, because
+///   protocol v1 never tells a remote client the ceiling.
 ///
 /// Drift is not silent, which is what makes leaving them acceptable: every copy
 /// is pinned by a test asserting the `force_jumbo_frames` token in the rendered

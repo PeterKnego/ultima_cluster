@@ -44,7 +44,7 @@ elsewhere) and the **monotonic log clock** (`uc_node::log_clock`; a backward
 wall step is smeared at 500 ppm instead of freezing the log's clock, and the
 consensus pass takes one clock read instead of two — no flag-day surface of
 its own). Both fleet gates are pre-committed and **UNRUN**
-(`docs/benchmarks/uc2-jumbo-frame-discovery-gate-TEMPLATE.md`,
+(`docs/benchmarks/uc2-jumbo-frame-discovery-gate-2026-09-12.md`,
 `uc2-log-clock-gate-2026-09-08.md`) — quote no number from either. The
 workspace version is still `2.11.0`: the bump, the tag and the publish all
 happen in `docs/how-to/cut-a-release.md`, not in the feature work. The

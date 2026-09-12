@@ -961,9 +961,12 @@ impl Sender {
                 }
             }
             if !sent_any && !kernel_refused {
-                // Nothing left the host AND the kernel never saw a byte of it:
-                // a session-less peer, every rung skipped at assembly. Give
-                // the round's one attempt back, once for the round.
+                // Nothing left the host and no rung was refused for SIZE: a
+                // session-less peer (every rung skipped at assembly — the usual
+                // case), or every assembled rung failed on some other errno
+                // (`ENOBUFS`, a transient route error), neither of which says
+                // anything about the path. Give the round's one attempt back,
+                // once for the round.
                 table.note_unsent_for(peer);
             }
         }

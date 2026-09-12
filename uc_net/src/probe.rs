@@ -63,10 +63,13 @@ pub struct PeerProbe {
 pub struct ProbeTable {
     cadence: ProbeCadence,
     peers: Mutex<HashMap<SocketAddr, PeerProbe>>,
-    /// Rounds a [`ProbeTable::due`] call scheduled that were skipped at
-    /// ASSEMBLY — i.e. that were given their attempt back by
-    /// [`ProbeTable::note_unsent_for`], which today means "no pairwise crypto
-    /// session for this peer yet". ROUND-scoped, not rung-scoped: a round
+    /// Rounds a [`ProbeTable::due`] call scheduled that were given their
+    /// attempt back by [`ProbeTable::note_unsent_for`] — i.e. rounds where
+    /// nothing left the host and no rung was refused by the kernel for SIZE:
+    /// every rung was skipped at assembly (no pairwise crypto session for this
+    /// peer yet — the usual case), **or** every rung was assembled and its
+    /// `send_to` failed for a reason other than `EMSGSIZE` (`ENOBUFS`,
+    /// `EPERM`, a transient route error). ROUND-scoped, not rung-scoped: a round
     /// tries every rung above a peer's `verified` size at once, and one
     /// give-back covers however many of those rungs never left the host, so
     /// this counts "how many rounds needed the give-back", not "how many
@@ -370,9 +373,10 @@ impl ProbeTable {
         self.publish_earliest(&g);
     }
 
-    /// Rounds skipped at assembly and given their attempt back — see the
-    /// `unsent` field's doc: ROUND-scoped, not rung-scoped, and a
-    /// kernel-refused round is NOT one of these.
+    /// Rounds that were given their attempt back — skipped at assembly, or
+    /// assembled and failed for a reason other than `EMSGSIZE`. See the
+    /// `unsent` field's doc: ROUND-scoped, not rung-scoped, and a round the
+    /// kernel refused for SIZE is NOT one of these.
     pub fn unsent(&self) -> u64 {
         self.unsent.load(Ordering::Relaxed)
     }

@@ -267,8 +267,9 @@ fn the_submit_door_follows_the_live_cnc_word() {
     // ...and ABOVE the page, which is the direction the override-below case
     // cannot prove: the page says 128, the caller said 512, and a 200-byte
     // submit is ACCEPTED. That is what makes the override a door of its own
-    // rather than a `min` with the page (the CI pin in the jumbo how-to relies
-    // on it being able to sit under OR over the live ceiling).
+    // rather than a `min` with the page — worth pinning in both directions even
+    // though the one documented use (the jumbo how-to's CI pin at
+    // `MAX_PAYLOAD_DEFAULT`) only ever sits UNDER the live ceiling.
     page.store_payload_ceiling(128);
     let (a, _pa) = Engine::attach(
         dir.path(),

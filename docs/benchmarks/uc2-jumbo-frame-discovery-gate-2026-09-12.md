@@ -1,11 +1,13 @@
-# uc2 jumbo-frame discovery gate — TEMPLATE, no fleet run yet
+# uc2 jumbo-frame discovery gate — bars committed, no fleet run yet
 
 **Date:** 2026-09-12 (bars committed). **Fleet run: NOT RUN — no fleet spend
 has happened for this gate.** This file is the pre-commitment plan 2 Task 5
-writes; it is renamed to
-`docs/benchmarks/uc2-jumbo-frame-discovery-gate-<run date>.md` when a fleet
-run actually adjudicates it. Every result cell below reads **UNRUN** until
-that rename happens.
+writes; the date in its name is the date the bars were committed, which is the
+repo's convention for an unrun gate (`uc2-log-clock-gate-2026-09-08.md` is the
+nearest example). If a run lands on a different date, rename the file to that
+date and repoint the links in `RELEASES.md`, `docs/releases.md`,
+`docs/VERIFICATION.md`, `CLAUDE.md` and `bench-infra/scripts/jumbo_gate.py`.
+Every result cell below reads **UNRUN** until a run fills them in.
 
 > **Decide rule committed before any run.** This document's bar table is
 > committed, with every result cell **UNRUN**, before any fleet run against
@@ -14,8 +16,9 @@ that rename happens.
 > since (FSM identity, time-and-timers, the log-clock gate). Nothing in the
 > bar table may be edited to match a result: a run that misses a bar is
 > recorded as a **FAIL** and the bar is **kept, unmoved**. This document
-> itself is a placeholder — its own commit message says so — and must not
-> be read as "gated" until a fleet run fills in the results table below.
+> itself is a PRE-COMMITMENT, not a record — its own commit message says so —
+> and must not be read as "gated" until a fleet run fills in the results table
+> below.
 
 ## What the gate measures
 

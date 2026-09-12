@@ -22,7 +22,7 @@ requested by the maintainer 2026-09-08.
 | plans | [plan 1](superpowers/plans/2026-09-10-uc2-jumbo-frame-discovery-plan1.md) (discovery, Settings v2, the live ceiling), [plan 2](superpowers/plans/2026-09-12-uc2-jumbo-frame-discovery-plan2.md) (the gates, observability, proof, docs) | [the plan](superpowers/plans/2026-09-08-uc2-monotonic-log-clock.md) |
 | explainer | [Jumbo frames and path-MTU discovery, explained](notes/uc2-jumbo-frame-discovery-explained.md) | [Log time and timers § the log clock](notes/uc2-log-time-and-timers-explained.md#the-log-clock) |
 | how-to | [Run a cluster on jumbo frames](how-to/jumbo-frames.md) | — (no operator surface) |
-| gate doc | [jumbo gate](benchmarks/uc2-jumbo-frame-discovery-gate-TEMPLATE.md) — **pre-committed, UNRUN** | [log-clock gate](benchmarks/uc2-log-clock-gate-2026-09-08.md) — **pre-committed, UNRUN** |
+| gate doc | [jumbo gate](benchmarks/uc2-jumbo-frame-discovery-gate-2026-09-12.md) — **pre-committed, UNRUN** | [log-clock gate](benchmarks/uc2-log-clock-gate-2026-09-08.md) — **pre-committed, UNRUN** |
 | flag-day surface | wire `0.8.0` (two datagram kinds), cnc `3.2` (one word), `Settings` v2, `max_payload` retired | none |
 
 ### Jumbo-frame discovery
@@ -146,7 +146,7 @@ fails by name, counted (`uc2_send_emsgsize_total`) and alerted
 (`Uc2PathBelowMtu`); and a **node host must run Linux or Android**, because the
 three DF socket options exist in `libc` for those targets only and probing
 without them would over-report a path — `set_dont_fragment` returns
-`io::ErrorKind::Unsupported` elsewhere and `Node::start` propagates it, so a
+`io::ErrorKind::Unsupported` elsewhere and `Node::start_with` propagates it, so a
 macOS or BSD box can no longer run a `uc2-node` (the client and service crates
 are unaffected). Both are written up in
 [Upgrade a cluster § 2.12.0](how-to/upgrade-a-cluster.md#wire--cnc-change-in-2120-jumbo-frames-080-cnc-32).
@@ -219,8 +219,9 @@ completeness cross-check still passes; and `bench-infra/scripts/jumbo_gate.py
 envelope-map brief's soak plateau, which decides only whether the runbook
 *recommends* jumbo; both `force_jumbo_frames` refusals inside the 30 s window;
 and two reported-no-bar cost rows), every result cell reading UNRUN, in
-[the gate doc](benchmarks/uc2-jumbo-frame-discovery-gate-TEMPLATE.md). It is
-renamed to a dated filename when a run adjudicates it.
+[the gate doc](benchmarks/uc2-jumbo-frame-discovery-gate-2026-09-12.md), whose
+date is the date the bars were committed (the repo's convention for an unrun
+gate).
 
 ### The monotonic log clock
 
@@ -229,7 +230,8 @@ ns counter, that works both on Arm in Intel").
 
 **What changed.**
 
-`pass_clock()` (`uc_node/src/node.rs:3297`) no longer reads
+`pass_clock()` (`uc_node/src/node.rs:3581`, with the `apply-profile` twin at
+`:3589`) no longer reads
 `SystemTime::now()`. It reads a private module, `uc_node::log_clock`, whose
 value is `CLOCK_MONOTONIC` (`std::time::Instant`) plus a sampled epoch
 offset (`REALTIME − MONOTONIC`, bracketed and re-sampled every 1 s;
@@ -318,7 +320,7 @@ has; every row that needs a run says so.
 | `release.yml` (build, SBOM, cosign, image) | — | pending |
 | the per-task gate the feature branches ran: `cargo fmt --all -- --check`, four `clippy` invocations, `cargo test --workspace --exclude uc_node`, and the thirteen `uc_node` suites plus its lib | last run 2026-09-12 on the jumbo plan-2 head: fmt clean, clippy clean, 83 `test result: ok` lines outside `uc_node`, and 318 lib + 13 suites green | **green locally** — a dev box, and not the whole `docs/VERIFICATION.md` surface |
 | the rest of the proof surface (`docs/VERIFICATION.md`): the lin capstones, hard-crash, Elle, loom, Lean + conformance, fuzz smoke | no whole-tree release pass yet — the release procedure's own step | pending |
-| jumbo fleet gate (rows a–f) | [`benchmarks/uc2-jumbo-frame-discovery-gate-TEMPLATE.md`](benchmarks/uc2-jumbo-frame-discovery-gate-TEMPLATE.md) | **UNRUN** — bars committed 2026-09-12, every result cell reads UNRUN; the file is renamed to a dated one when a run adjudicates it |
+| jumbo fleet gate (rows a–f) | [`benchmarks/uc2-jumbo-frame-discovery-gate-2026-09-12.md`](benchmarks/uc2-jumbo-frame-discovery-gate-2026-09-12.md) | **UNRUN** — bars committed 2026-09-12 (the date in the filename), every result cell reads UNRUN |
 | log-clock fleet A/B (`m14_fleet_gate.py` rows a/b/e) | [`benchmarks/uc2-log-clock-gate-2026-09-08.md`](benchmarks/uc2-log-clock-gate-2026-09-08.md) | **UNRUN** — bars committed 2026-09-08; the dev-box smoke in that doc is smoke, not a bar |
 | the M10 alert tier, with the two new jumbo rules | `scripts/m10_alert_fire.sh` (synthetic scenarios `mtu_discovery_stalled`, `path_below_mtu`) | **green locally** 2026-09-12, 25/25 rules fire under promtool — a local tier, not a fleet result |
 | artifact integrity (`sha256sum -c`) | — | pending |
