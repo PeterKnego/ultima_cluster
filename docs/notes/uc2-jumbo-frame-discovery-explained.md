@@ -233,11 +233,18 @@ traffic emitted" stays readable on exactly the narrow path where it matters.
 recorded in the spec.)
 
 `Uc2MtuDiscoveryStalled` keys on `uc2_probe_min_mtu_bytes >
-uc2_datagram_mtu_bytes` for 60 s precisely because a legitimately narrow
-cluster never satisfies it: a narrow peer pins *every* node's own minimum too,
-so the two gauges agree. The alert fires when *this* node has proven more than
-the cluster has committed — i.e. some *other* member is the one holding
-discovery back. (`uc2_probe_min_mtu_bytes` reads `0` while any peer is
+uc2_datagram_mtu_bytes` for 60 s. The alert fires when *this* node has proven
+more than the cluster has committed — i.e. some *other* member is the one
+holding discovery back. Whether it fires on a legitimately narrow cluster
+depends on **where** the narrowness is. A narrow **member** — one host whose
+interface MTU is low — never fires it, because that member is a peer of every
+other node, so it pins every node's own minimum too and the two gauges agree
+everywhere. A single narrow **path** between two members does fire it,
+permanently, on every node that is not on that path. A–B narrow (a bad switch
+port, a tunnel, one peering leg) with A–C and B–C jumbo leaves C's own minimum
+at the jumbo rung while the committed rung stays at the baseline — a cluster at
+its correct rung, with C alerting every 60 s forever. Fix the link, or silence
+the rule for that node. (`uc2_probe_min_mtu_bytes` reads `0` while any peer is
 unresolved, and also on a node with no peers at all: `0` means "nothing is
 proven", one encoding for one state.)
 

@@ -207,7 +207,9 @@ role, leader or follower — until every configured peer has proven the
 8832 B rung. Then it logs `jumbo_gate_passed` and serves.
 
 If 30 s (`JUMBO_GATE_WINDOW`, not configurable) elapses first, the node
-fail-stops with exit code 1 and one of two named refusals:
+fail-stops with exit code 1 and one of two named refusals — **provided the
+cluster has not already committed a jumbo rung**. If it has, the join gate (§6)
+takes precedence and passes after 30 s of silence, logging `jumbo_join_gate_passed_unproven` instead.
 
 | refusal | what it means | what to do |
 |---|---|---|

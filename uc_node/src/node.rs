@@ -606,7 +606,9 @@ const JUMBO_GATE_POLL_NS: u64 = 100_000_000;
 ///   back `can_serve = false` / `/readyz` 503 until the dead member returned,
 ///   which is worse than the crash loop the hold replaced. At the deadline the
 ///   gate passes unproven with one `Warn` record naming the silent members;
-///   the hazard it defers is the runtime-degradation class the spec already
+///   when this happens on silence, the subsumption over `Forcing` does not
+///   hold, since an unproven peer was not tested against `JUMBO_MIN_RUNG`.
+///   The hazard it defers is the runtime-degradation class the spec already
 ///   accepts and `Uc2PathBelowMtu` covers, and a returning member runs its own
 ///   `Joining` check, so every live pair is still tested from at least one
 ///   side.
