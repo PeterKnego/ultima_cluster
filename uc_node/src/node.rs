@@ -10705,11 +10705,16 @@ mod tests {
             state,
             cnc: Arc::clone(&cnc),
             buffer,
-            // Jumbo: no peers wired in this harness. The harness's membership
-            // is a single voter (itself), so the commit rule sees an EMPTY
-            // member list, and `table_min(&[])` is `None` (spec erratum 4:
-            // no evidence, not universal evidence) — the whole path is inert
-            // unless a test seeds the ledger itself.
+            // Jumbo: an EMPTY ledger, never given a peer set. The harness's
+            // membership is three voters (0, 1, 2 — this agent is 1), so the
+            // commit rule does build a two-address member list; it is
+            // `table_min` that misses, because this table holds no entry for
+            // either address and `table_min` answers `None` on the first miss
+            // (no evidence, not universal evidence — spec erratum 4 is the same
+            // principle applied to an empty member set). So the whole jumbo
+            // path is inert here unless a test seeds the ledger itself, which
+            // `the_commit_rule_proposes_the_table_minimum_and_changes_nothing_else`
+            // does.
             probe_table: ProbeTable::new(ProbeCadence::default()),
             live_mtu: Arc::new(AtomicUsize::new(MTU_DEFAULT)),
             crypto_on: false,

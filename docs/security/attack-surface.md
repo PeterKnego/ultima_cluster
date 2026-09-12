@@ -7,9 +7,12 @@ inventory. [Self-assessment](self-assessment.md) records what was found in it.
 
 "Fuzz target" names a real target in [`fuzz/fuzz_targets/`](/fuzz) — there are
 **twenty-four** (the newest, `uc_protocol_probe`, arrived with jumbo-frame MTU
-discovery, `2.12.0`; the four before it — `uc_protocol_timer_frame`,
-`uc_protocol_sched_record`, `uc_protocol_schedule_table` and
-`uc_node_cluster_artifact` — with `2.11.0`),
+discovery, `2.12.0`; the **eight** before it — `uc_protocol_timer_frame`,
+`uc_protocol_sched_record`, `uc_protocol_schedule_table`,
+`uc_protocol_cluster_frame`, `uc_protocol_settings`,
+`uc_protocol_cluster_image`, `uc_node_cluster_artifact` and
+`uc_service_snapshot_envelope` — with `2.11.0`, which took the tier from 15 to
+23),
 each run for 600 s per night with an asserted execution floor
 ([VERIFICATION §7](/docs/VERIFICATION.md#7-fuzzing-decoders-total-on-untrusted-bytes),
 [`fuzz/README.md`](/fuzz/README.md)).

@@ -107,7 +107,11 @@ const OUT_RING_DERIVED_CAP: usize = 4 << 20;
 
 /// Jumbo spec §8: the remedy clause the notification carries. `RemoteError`'s
 /// text spells the same sentence out inline, because `thiserror`'s format
-/// strings cannot interpolate a constant.
+/// strings cannot interpolate a constant; `uc_client::engine::JUMBO_REMEDY`
+/// carries the full list of copies and why they stay hand-written (there is no
+/// shared runtime dependency between this crate and `uc_client` to host one
+/// constant). Every copy is pinned by a test asserting the
+/// `force_jumbo_frames` token, so the wording cannot drift silently.
 const JUMBO_REMEDY: &str = "every deployment will need jumbo-frame support on all node paths: \
                             set force_jumbo_frames = true in node.toml so a cluster without it \
                             refuses to start instead of failing at submit";

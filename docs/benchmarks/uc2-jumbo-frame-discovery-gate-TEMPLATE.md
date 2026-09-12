@@ -213,9 +213,13 @@ arm — read it before reading anything else** (fix round 1, plan 2 Task 5
 review): `jumbo_gate.py --fleet --arms ...` exits **0** only when every
 requested arm produced a passing `Verdict`; **1 (FAIL)** when any requested
 arm's `Verdict` missed its bar (a bar miss, or row c's pre-arm blackhole
-probe aborting); **2 (NOT RUN)** when at least one requested arm produced no
-`Verdict` at all (a print-only stub, per this driver's current scope) and
-none of the others FAILED. FAIL always outranks NOT RUN, which always
+probe aborting — which now includes a host whose `/metrics` never answered at
+all, not only one stuck at the baseline); **3 (NOT RUN)** when at least one
+requested arm produced no `Verdict` at all (a print-only stub, per this
+driver's current scope) and none of the others FAILED. NOT RUN is **3, not
+2**, because argparse exits **2** on a usage error (a bad `--arms`, an unknown
+flag) and a wrapper reading `$?` must not confuse "you typed it wrong" with "an
+arm produced no verdict". FAIL always outranks NOT RUN, which always
 outranks PASS (`exit_code_for_results`, pinned by `--selftest`), so a CI
 step or a human reading only `$?` can never mistake a stub run for a pass —
 which is exactly the confusion the fix exists to close. Every invocation

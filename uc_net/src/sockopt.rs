@@ -72,8 +72,11 @@ pub fn mtu_discover(sock: &UdpSocket) -> io::Result<libc::c_int> {
     };
     let mut v: libc::c_int = 0;
     let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
-    // SAFETY: `v` and `len` are valid for the duration of the call and sized
-    // for a c_int option.
+    // SAFETY: `fd` is borrowed from `sock: &UdpSocket` and is open for the
+    // whole call — the socket cannot be dropped while that reference lives, and
+    // nothing here closes it. `v` and `len` are live locals, and `len` holds
+    // exactly `size_of::<c_int>()`, which is the width `getsockopt` writes for
+    // these two option names.
     let rc = unsafe {
         libc::getsockopt(
             fd,
@@ -96,7 +99,11 @@ fn setsockopt(
     name: libc::c_int,
     value: libc::c_int,
 ) -> io::Result<()> {
-    // SAFETY: `value` outlives the call; the length matches its type.
+    // SAFETY: `fd` comes from the caller's `&UdpSocket` (the only caller is
+    // `set_dont_fragment`, which holds that borrow across this call), so it is a
+    // valid, open descriptor and is not closed here. `value` is a live local
+    // that outlives the call, and the length passed is exactly its own type's
+    // size.
     let rc = unsafe {
         libc::setsockopt(
             fd,

@@ -263,6 +263,24 @@ fn the_submit_door_follows_the_live_cnc_word() {
         Err(SubmitError::PayloadTooLarge { len: 200, max: 64 }) => {}
         other => panic!("{other:?}"),
     }
+
+    // ...and ABOVE the page, which is the direction the override-below case
+    // cannot prove: the page says 128, the caller said 512, and a 200-byte
+    // submit is ACCEPTED. That is what makes the override a door of its own
+    // rather than a `min` with the page (the CI pin in the jumbo how-to relies
+    // on it being able to sit under OR over the live ceiling).
+    page.store_payload_ceiling(128);
+    let (a, _pa) = Engine::attach(
+        dir.path(),
+        "eng-live",
+        EngineConfig {
+            max_payload: Some(512),
+            ..cfg()
+        },
+    )
+    .unwrap();
+    a.try_submit(4, &[0u8; 200])
+        .expect("an override above the page's ceiling opens the door");
 }
 
 // Consistency is exercised indirectly here — try_query isn't hit by the

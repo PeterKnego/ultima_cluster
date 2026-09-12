@@ -898,14 +898,17 @@ impl Sender {
         // table for the `due` check (no `Arc` refcount RMW), and clone only on
         // the rare pass that actually has probes to send — the loop below
         // needs an owned handle because it calls `&mut self` methods.
-        let due = match self.probe.as_ref() {
-            None => return false,
-            Some(t) => t.due(self.now_ns()),
+        let Some(table) = self.probe.as_ref() else {
+            return false;
         };
+        let due = table.due(self.now_ns());
         if due.is_empty() {
             return false;
         }
-        let table = self.probe.clone().expect("checked above");
+        // Owned handle for the loop below, which calls `&mut self` methods; the
+        // borrow above ends here, so there is no second `Option` check and no
+        // panicking `expect` to justify.
+        let table = Arc::clone(table);
         let overhead = DATAGRAM_HEADER_LEN + self.cfg.crypto_overhead();
         for (peer, rungs) in due {
             // `due()` bumps this peer's `attempts` ONCE for the whole round,

@@ -32,6 +32,10 @@ impl Default for ProbeCadence {
     }
 }
 
+/// What this node knows about ONE peer's path (spec §5.1–§5.2): the two rungs
+/// that make the pair resolvable and the cadence bookkeeping that gets them
+/// there. `Default` is the "fresh peer" state — nothing verified, nothing
+/// advertised, due immediately.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct PeerProbe {
     /// The largest rung this node's probe to the peer was acked at; 0 = none.
@@ -39,19 +43,40 @@ pub struct PeerProbe {
     /// The peer's own minimum, from its latest ack (spec §5.2); 0 = unknown
     /// or the peer itself is unresolved.
     pub advertised: u32,
+    /// Probe rounds [`ProbeTable::due`] has handed out for this peer since it
+    /// was last reset, whether or not they were answered. Compared against
+    /// [`ProbeCadence::fast_attempts`] to pick the cadence, and by
+    /// [`ProbeTable::narrow_peers`] to tell "not proven yet" from "tried and
+    /// failed". [`ProbeTable::note_unsent_for`] gives one back.
     pub attempts: u32,
+    /// When the next round for this peer is due, on the caller's clock. `0`
+    /// means "now" — the value a fresh, reset or refunded peer carries.
     pub next_due_ns: u64,
 }
 
+/// The discovery ledger: one per node, shared by the three agents that touch
+/// it (module docs). Holds a [`PeerProbe`] per configured peer plus the
+/// lock-free `earliest_due_ns` fast path the sender's busy loop reads every
+/// pass. Every mutator republishes that word under the `peers` lock, so the
+/// only rule a caller has to keep is the one
+/// [`ProbeTable::note_unsent_for`] states: at most one give-back per round.
 pub struct ProbeTable {
     cadence: ProbeCadence,
     peers: Mutex<HashMap<SocketAddr, PeerProbe>>,
-    /// Rounds a [`ProbeTable::due`] call scheduled that put NOTHING on the
-    /// wire — ROUND-scoped, not rung-scoped: a round tries every rung above
-    /// a peer's `verified` size at once, and one call to
-    /// [`ProbeTable::note_unsent_for`] covers however many of those rungs
-    /// never left the host, so this counts "how many rounds needed the
-    /// give-back", not "how many individual probes were refused".
+    /// Rounds a [`ProbeTable::due`] call scheduled that were skipped at
+    /// ASSEMBLY — i.e. that were given their attempt back by
+    /// [`ProbeTable::note_unsent_for`], which today means "no pairwise crypto
+    /// session for this peer yet". ROUND-scoped, not rung-scoped: a round
+    /// tries every rung above a peer's `verified` size at once, and one
+    /// give-back covers however many of those rungs never left the host, so
+    /// this counts "how many rounds needed the give-back", not "how many
+    /// individual probes were refused".
+    ///
+    /// Deliberately NOT "rounds that put nothing on the wire": a round the
+    /// kernel refused for size (`EMSGSIZE`) also puts nothing on the wire, and
+    /// is no longer counted here, because it SPENDS its attempt rather than
+    /// being refunded (see [`ProbeTable::note_unsent_for`]). That refusal has
+    /// its own counter on the sender's stats.
     unsent: AtomicU64,
     /// The soonest `next_due_ns` over the UNRESOLVED peers, or `u64::MAX`
     /// when every peer is resolved (or there are none). Maintained under
@@ -69,6 +94,12 @@ pub struct ProbeTable {
 }
 
 impl ProbeTable {
+    /// An empty table on `cadence`. Returned in an `Arc` because the three
+    /// agents share one instance; seed the peer set with
+    /// [`ProbeTable::set_peers`] BEFORE handing the table to either agent —
+    /// [`ProbeTable::own_min_rung`] answers `MTU_BOUND` for an empty map
+    /// (nothing to compare), and a transient too-high advertisement would be
+    /// committed irreversibly by the monotone commit rule.
     pub fn new(cadence: ProbeCadence) -> Arc<ProbeTable> {
         Arc::new(ProbeTable {
             cadence,
@@ -115,10 +146,15 @@ impl ProbeTable {
         p.verified as usize >= MTU_BOUND && p.advertised >= p.verified
     }
 
+    /// The configured peer set, in no particular order — a snapshot, so a
+    /// membership change can land before the caller reads it.
     pub fn peers(&self) -> Vec<SocketAddr> {
         self.peers.lock().unwrap().keys().copied().collect()
     }
 
+    /// This node's ledger entry for one peer, or `None` if that address is not
+    /// in the current member set. A copy, not a handle: read it once per
+    /// decision rather than re-reading fields expecting them to agree.
     pub fn get(&self, peer: SocketAddr) -> Option<PeerProbe> {
         self.peers.lock().unwrap().get(&peer).copied()
     }
@@ -334,8 +370,9 @@ impl ProbeTable {
         self.publish_earliest(&g);
     }
 
-    /// Rounds that put nothing on the wire — see the `unsent` field's doc:
-    /// ROUND-scoped, not rung-scoped.
+    /// Rounds skipped at assembly and given their attempt back — see the
+    /// `unsent` field's doc: ROUND-scoped, not rung-scoped, and a
+    /// kernel-refused round is NOT one of these.
     pub fn unsent(&self) -> u64 {
         self.unsent.load(Ordering::Relaxed)
     }

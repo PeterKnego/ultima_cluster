@@ -87,9 +87,14 @@ ROW_D_JOIN_REASON = "path_below_committed_mtu"   # named for completeness only �
 # "not run" must be distinct from "passed" — see `exit_code_for_results`).
 # FAIL takes precedence over NOT-RUN, which takes precedence over PASS, so a
 # wrapper reading `$?` alone still gets the worst finding across every arm.
+#
+# NOT-RUN is 3, not 2, deliberately: argparse exits 2 on a USAGE error (a bad
+# `--arms`, an unknown flag), so a 2 would have made "you typed it wrong" and
+# "an arm produced no verdict" the same code to any wrapper reading `$?`.
 EXIT_PASS = 0
 EXIT_FAIL = 1
-EXIT_NOT_RUN = 2
+EXIT_USAGE = 2  # argparse's own, never returned by this driver
+EXIT_NOT_RUN = 3
 
 METRICS_PORT_DEFAULT = tt.METRICS_PORT_DEFAULT
 
@@ -290,19 +295,45 @@ def verdict_row_c(plateau_delta_pct, rung_throughput_delta_pct, rung_p99_delta_p
 
 
 def check_blackhole_probe(observed_mtu_by_node, window_secs=ROW_C_BLACKHOLE_WINDOW_SECS,
-                           min_rung=JUMBO_MIN_RUNG, baseline=MTU_DEFAULT):
+                           min_rung=JUMBO_MIN_RUNG, baseline=MTU_DEFAULT,
+                           expected=None):
     """Row c's pre-arm gate (spec §10 closing paragraph): with do-not-fragment
     in place (§4.3), UC's own probe ladder IS the path-MTU blackhole probe.
     `observed_mtu_by_node`: `{name: mtu_bytes}` sampled after `window_secs`.
     Returns `(ok, message)`; `ok=False` means "ABORT THE ARM LOUDLY" — a
     jumbo arm whose nodes still report the baseline after the window is not
     a slow-converging cluster, it is infrastructure that never carried jumbo
-    at all, and running the soak on it would silently measure the baseline."""
-    stuck = {n: v for n, v in observed_mtu_by_node.items() if v < min_rung}
-    if stuck:
-        return False, (f"ABORT: after {window_secs:.0f}s, {stuck} still below the jumbo "
-                       f"rung {min_rung} (baseline {baseline}) — the arm's path is a "
-                       "blackhole, not a slow cluster; do not run the soak")
+    at all, and running the soak on it would silently measure the baseline.
+
+    `expected`: every host name the arm SHOULD have heard from (row c passes
+    its whole host list). A name absent from `observed_mtu_by_node` — or
+    present with `None` — never answered `/metrics` at all: a crashed node, a
+    wedged one, an unreachable host. That is a FAILURE, not a pass. Judging
+    only what was PRESENT (the shape this had before) let such a host drop out
+    of the stuck set entirely, so a two-of-three arm with one dead node read
+    as "every node cleared the rung" and the soak ran on it. An empty
+    measurement is likewise an abort: nothing reporting is not everything
+    passing."""
+    names = list(expected) if expected is not None else list(observed_mtu_by_node)
+    missing = sorted(n for n in names if observed_mtu_by_node.get(n) is None)
+    stuck = {n: v for n, v in observed_mtu_by_node.items()
+             if v is not None and v < min_rung}
+    if not names:
+        return False, (f"ABORT: after {window_secs:.0f}s, no host reported "
+                       "uc2_datagram_mtu_bytes at all — nothing was measured; "
+                       "do not run the soak")
+    if missing or stuck:
+        why = []
+        if missing:
+            why.append(f"{missing} never reported uc2_datagram_mtu_bytes "
+                       "(/metrics unreachable — a dead or wedged node, not a "
+                       "narrow path)")
+        if stuck:
+            why.append(f"{stuck} still below the jumbo rung {min_rung} "
+                       f"(baseline {baseline}) — the arm's path is a blackhole, "
+                       "not a slow cluster")
+        return False, (f"ABORT: after {window_secs:.0f}s, " + "; ".join(why)
+                       + "; do not run the soak")
     return True, f"every node cleared {min_rung} within {window_secs:.0f}s: {observed_mtu_by_node}"
 
 
@@ -403,8 +434,10 @@ def exit_code_for_results(results):
     Precedence, worst finding wins, so `$?` alone carries the whole story:
 
         any Verdict with passed=False  -> EXIT_FAIL (1)
-        else any arm is None           -> EXIT_NOT_RUN (2)
+        else any arm is None           -> EXIT_NOT_RUN (3)
         else (every arm passed, or none were requested) -> EXIT_PASS (0)
+
+    2 is argparse's usage-error code and is never returned here.
     """
     if any(v is not None and not v.passed for v in results.values()):
         return EXIT_FAIL
@@ -543,6 +576,21 @@ def selftest():
     ok, msg = check_blackhole_probe({"n0": TOP_RUNG, "n1": MTU_DEFAULT})
     check("blackhole probe aborts", ok, False)
     check("blackhole probe message says ABORT", msg.startswith("ABORT"), True)
+    # A host whose /metrics never answered is absent from `observed`: without
+    # `expected` it silently left the stuck set, so a dead node read as a pass.
+    ok, msg = check_blackhole_probe({"n0": TOP_RUNG}, expected=["n0", "n1"])
+    check("blackhole probe aborts on an unreachable host", ok, False)
+    check("unreachable host is named", "'n1'" in msg, True)
+    check("unreachable message says unreachable", "unreachable" in msg, True)
+    ok, _ = check_blackhole_probe({"n0": TOP_RUNG, "n1": TOP_RUNG},
+                                  expected=["n0", "n1"])
+    check("blackhole probe clears with every expected host", ok, True)
+    ok, msg = check_blackhole_probe({"n0": None}, expected=["n0"])
+    check("a None reading counts as unreachable", ok, False)
+    ok, msg = check_blackhole_probe({}, expected=[])
+    check("an empty measurement aborts", ok, False)
+    check("empty measurement says nothing was measured",
+          "nothing was measured" in msg, True)
 
     # ---------------------------------------------------------------- row d
     def refusal(reason, elapsed, peer):
@@ -592,6 +640,11 @@ def selftest():
     check("exit code: fail beats not-run",
           exit_code_for_results({"a": fail_v, "b": None}), EXIT_FAIL)
     check("exit code labels distinct", len({EXIT_PASS, EXIT_FAIL, EXIT_NOT_RUN}), 3)
+    # argparse exits 2 on a usage error, so no verdict code may collide with it.
+    check("not-run does not collide with argparse's usage code",
+          EXIT_NOT_RUN != EXIT_USAGE, True)
+    check("no verdict code is argparse's usage code",
+          EXIT_USAGE in {EXIT_PASS, EXIT_FAIL, EXIT_NOT_RUN}, False)
 
     # A stub arm (returns None, per the fix-round finding that b/c/d/e/f
     # print-only stubs must never be mistaken for a pass) must map to
@@ -757,7 +810,13 @@ def run_arm_c(hosts, args, window_secs=ROW_C_BLACKHOLE_WINDOW_SECS, min_rung=JUM
         if len(observed) == len(hosts) and all(v >= min_rung for v in observed.values()):
             break
         time.sleep(1.0)
-    ok, msg = check_blackhole_probe(observed, window_secs=window_secs, min_rung=min_rung)
+    # `expected` is the arm's WHOLE host list, not just the hosts that
+    # answered: a host whose /metrics never answers is absent from `observed`,
+    # and without this it would be absent from the stuck set too — i.e. a dead
+    # node would read as a pass.
+    ok, msg = check_blackhole_probe(observed, window_secs=window_secs,
+                                    min_rung=min_rung,
+                                    expected=[h.public_ip for h in hosts])
     if not ok:
         print(f"[FAIL] row c blackhole probe (pre-arm) — {msg}", flush=True)
         return Verdict("c blackhole probe (pre-arm)", False, msg)
@@ -825,9 +884,11 @@ def main():
         epilog="Exit codes: 0 = every requested arm PASSED (or none were "
                "requested); 1 = FAIL — at least one requested arm's Verdict "
                "had passed=False (a bar was missed, or row c's pre-arm "
-               "blackhole probe aborted); 2 = NOT RUN — at least one "
+               "blackhole probe aborted); 3 = NOT RUN — at least one "
                "requested arm produced no Verdict (a print-only stub) and "
-               "none FAILED. FAIL always outranks NOT RUN, which always "
+               "none FAILED. 2 is argparse's USAGE error (a bad --arms, an "
+               "unknown flag) and is never a gate verdict, which is why NOT "
+               "RUN is 3. FAIL always outranks NOT RUN, which always "
                "outranks PASS, so a wrapper reading $? alone gets the worst "
                "finding across every requested arm — see exit_code_for_results.",
         formatter_class=argparse.RawDescriptionHelpFormatter,

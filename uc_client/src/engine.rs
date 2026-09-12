@@ -121,9 +121,24 @@ pub enum Consistency {
     Snapshot,
 }
 
-/// Jumbo spec §8: the remedy clause the developer notification carries. The
-/// refusal texts spell the same sentence out inline, because `thiserror`'s
-/// format strings cannot interpolate a constant.
+/// Jumbo spec §8: the remedy clause the developer notification carries.
+///
+/// The same advice is spelled out inline in five other places, and they cannot
+/// be folded into this constant: four are `thiserror` `#[error("…")]` format
+/// strings, which take a string LITERAL and cannot interpolate a `const`
+/// (`SubmitError::PayloadTooLarge` below, `crate::ClientError::PayloadTooLarge`,
+/// `uc_remote::RemoteError::PayloadTooLarge`), and the fifth is in another
+/// crate with no shared runtime dependency to host a constant
+/// (`uc_gateway::Edge::warn_payload_too_large`'s `remedy` field — `uc_remote`
+/// depends on `uc_protocol` only as a dev-dependency, and `uc_obs` is a log
+/// format crate, not a place for product copy). Hand-writing `Display` to get
+/// one constant would cost more than the duplication.
+///
+/// Drift is not silent, which is what makes leaving them acceptable: every copy
+/// is pinned by a test asserting the `force_jumbo_frames` token in the rendered
+/// text — `uc_client/tests/engine_synthetic.rs` (the notification, the
+/// `SubmitError` text and the mapped `ClientError`),
+/// `uc_remote/tests/engine_fake_edge.rs` and `uc_gateway/tests/roundtrip.rs`.
 pub(crate) const JUMBO_REMEDY: &str = "this cluster carries it, but every deployment will need \
                                        jumbo-frame support on all node paths: set \
                                        force_jumbo_frames = true in node.toml so a cluster \
