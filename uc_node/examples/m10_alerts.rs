@@ -420,6 +420,7 @@ fn synthetic_sources_named(node_id: u32, name: Option<FsmName>) -> ObsSources {
             ("archive", Arc::new(AtomicBool::new(false))),
             ("cluster", Arc::new(AtomicBool::new(false))),
         ],
+        jumbo_gate_pending: Arc::new(AtomicBool::new(false)),
     }
 }
 

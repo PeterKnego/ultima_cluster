@@ -424,6 +424,13 @@ fn the_force_gate_refuses_a_path_too_narrow() {
             !n.can_serve(),
             "a node that never proved its paths must not serve"
         );
+        // And the readiness signal the obs layer reads (review fix 2) — proof
+        // that a REAL gated node, not just a synthetic `ObsSources`, makes
+        // `/readyz` refuse.
+        assert!(
+            n.observability().jumbo_gate_pending.load(Ordering::Acquire),
+            "/readyz must see the pending gate"
+        );
     }
     // Dropped, not stopped: `stop()` joins the agent threads and re-raises the
     // panic that killed the consensus one. The drop path swallows it (and
@@ -461,8 +468,11 @@ fn the_force_gate_refuses_a_silent_peer() {
 ///
 /// The restarted member keeps its instance dir, so it recovers its own log and
 /// learns the committed 8960 through the cluster FSM exactly as it would from
-/// an artifact or a snapshot session; behind a 1408 cap it can verify only the
-/// baseline rung, so the gate's deadline finds it short.
+/// an artifact or a snapshot session. Behind a 1408 cap its probes at the
+/// BASELINE rung still land and are acked, so every peer ANSWERS at 1408 —
+/// proven degradation, which review fix 1 refuses at once, with no window.
+/// (The cap must stay at or above 1408 for that reason: a lower cap would make
+/// the peers SILENT instead, which by design never refuses.)
 ///
 /// Expect one `consensus fatal (fail-stop)` panic on stderr.
 #[test]
@@ -488,6 +498,14 @@ fn a_restart_below_the_committed_rung_refuses_to_join() {
     );
 
     await_agent_failstop(&[&restarted], &buf, "path_below_committed_mtu", 45);
+    // The peer ANSWERED at the baseline rung — that is what makes this a proven
+    // narrow path rather than silence, and silence would (by design) never
+    // refuse. Pinned so the test cannot start passing for the wrong reason.
+    let text = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+    assert!(
+        text.contains(r#""carried":1408,"committed":8960"#),
+        "the refusal must name the ANSWERED rung: {text}"
+    );
     assert!(
         !restarted.can_serve(),
         "a node below the committed rung must not serve"

@@ -1070,6 +1070,10 @@ addr = "10.0.0.1:9100"
             ("UC2_MEMBERS", "x@10.0.0.1:9100", "UC2_MEMBERS"),
             ("UC2_MEMBERS", "0@not-an-addr", "UC2_MEMBERS"),
             ("UC2_MEMBERS", "0@10.0.0.1:9100,", "UC2_MEMBERS"),
+            // The table's only BOOL (jumbo spec §6): `yes` is not one of the
+            // four accepted spellings, and a permissive parse would read it as
+            // `false` — starting the node the operator asked to be refused.
+            ("UC2_FORCE_JUMBO_FRAMES", "yes", "UC2_FORCE_JUMBO_FRAMES"),
         ] {
             let err = parse_str_with_env(MINIMAL, env_of(&[(var, value)]))
                 .expect_err(&format!("{var}={value} must be refused"));

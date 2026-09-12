@@ -253,6 +253,21 @@ fn readyz(sources: &ObsSources) -> (u16, &'static str, String) {
         return (503, "text/plain", format!("agent {name} fail-stopped\n"));
     }
 
+    // Jumbo spec §6: a node holding a startup gate does not answer readiness,
+    // whatever its role. Checked before the role logic below, which refuses a
+    // clear CAN_SERVE bit only for a leader — a gated FOLLOWER would otherwise
+    // read as ready while `Node::can_serve` says it is not. Deliberately NOT
+    // "503 whenever !can_serve": that would change readiness for every
+    // follower in the fleet.
+    if sources.jumbo_gate_pending.load(Ordering::Acquire) {
+        return (
+            503,
+            "text/plain",
+            "jumbo startup gate pending: this node has not proven the cluster's datagram rung\n"
+                .to_string(),
+        );
+    }
+
     let status = sources.cnc.status();
     let flags = status.flags.load_acquire();
     let is_leader = flags & NODE_FLAG_LEADER != 0;

@@ -112,6 +112,7 @@ fn synthetic_server() -> (ObsServer, ObsSources) {
             ("archive", Arc::new(AtomicBool::new(false))),
             ("cluster", Arc::new(AtomicBool::new(false))),
         ],
+        jumbo_gate_pending: Arc::new(AtomicBool::new(false)),
     };
 
     let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -168,6 +169,52 @@ fn an_elected_but_not_serving_leader_is_not_ready() {
         200,
         "liveness must NOT flap on 0x01"
     );
+    srv.stop();
+}
+
+/// Jumbo spec §6, review fix 2: a node holding a startup gate "does not
+/// answer readiness" — whatever its role. The role logic below the gate check
+/// refuses a clear `CAN_SERVE` bit only for a LEADER, so a gated FOLLOWER used
+/// to answer `200 ok role=follower can_serve=false` for the whole window,
+/// which would have had a load balancer send it traffic it cannot take.
+///
+/// Liveness is deliberately unaffected: a gated node is alive, it is just not
+/// ready.
+#[test]
+fn a_node_holding_a_jumbo_gate_is_not_ready_even_as_a_follower() {
+    let (srv, sources) = synthetic_server();
+    sources
+        .cnc
+        .status()
+        .node_heartbeat_ns
+        .store_release(now_unix_ns());
+    sources
+        .cnc
+        .status()
+        .service_heartbeat_ns
+        .store_release(now_unix_ns());
+    // A healthy FOLLOWER: no LEADER bit, no CAN_SERVE bit — the shape that
+    // answered 200 before the fix.
+    sources.cnc.status().flags.store_release(0);
+    assert_eq!(
+        get(srv.local_addr(), "/readyz").0,
+        200,
+        "a follower with fresh heartbeats is ready when no gate is pending"
+    );
+
+    sources.jumbo_gate_pending.store(true, Ordering::Release);
+    let (code, body) = get(srv.local_addr(), "/readyz");
+    assert_eq!(code, 503, "a gated node is not ready: {body}");
+    assert!(body.contains("jumbo"), "the body names the reason: {body}");
+    assert_eq!(
+        get(srv.local_addr(), "/healthz").0,
+        200,
+        "a gated node is ALIVE — it just isn't ready"
+    );
+
+    // And readiness comes back when the gate passes.
+    sources.jumbo_gate_pending.store(false, Ordering::Release);
+    assert_eq!(get(srv.local_addr(), "/readyz").0, 200);
     srv.stop();
 }
 

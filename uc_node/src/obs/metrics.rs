@@ -1577,6 +1577,7 @@ mod tests {
                 ("archive", Arc::new(AtomicBool::new(false))),
                 ("cluster", Arc::new(AtomicBool::new(false))),
             ],
+            jumbo_gate_pending: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -2119,6 +2120,7 @@ mod tests {
                 ("archive", Arc::new(AtomicBool::new(false))),
                 ("cluster", Arc::new(AtomicBool::new(false))),
             ],
+            jumbo_gate_pending: Arc::new(AtomicBool::new(false)),
         };
 
         let text = render_prometheus(&s);

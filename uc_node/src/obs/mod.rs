@@ -133,6 +133,15 @@ pub struct ObsSources {
     /// cluster FSM; it is labelled like its four siblings, without the
     /// `uc2-` thread-name prefix.
     pub agents: Vec<(&'static str, Arc<AtomicBool>)>,
+    /// Jumbo spec §6: is a startup gate PENDING on this node? Set by the
+    /// consensus agent every pass while it holds `can_serve` down, cleared
+    /// when the gate passes, never set when none is installed.
+    ///
+    /// `/readyz` needs its own signal here: it refuses a clear cnc
+    /// `CAN_SERVE` bit only for a LEADER (an elected leader whose NewTerm has
+    /// not committed), so without this a gated FOLLOWER answered
+    /// `200 ok role=follower can_serve=false` for the whole window.
+    pub jumbo_gate_pending: Arc<AtomicBool>,
 }
 
 impl ObsSources {
@@ -209,6 +218,7 @@ impl ObsSources {
                 ("archive", Arc::new(AtomicBool::new(false))),
                 ("cluster", Arc::new(AtomicBool::new(false))),
             ],
+            jumbo_gate_pending: Arc::new(AtomicBool::new(false)),
         }
     }
 }

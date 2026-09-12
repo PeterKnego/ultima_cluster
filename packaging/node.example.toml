@@ -95,6 +95,14 @@ addr = "10.0.0.12:9100"
 # See docs/how-to/jumbo-frames.md.
 # force_jumbo_frames = false
 
+# Independent of the flag above, and not configurable: once a cluster has
+# COMMITTED a jumbo rung, a node whose path to some member ANSWERS below it
+# refuses to start at once (exit 1, `path_below_committed_mtu`), naming that
+# member — the log already holds frames it cannot receive, so the remedy is the
+# path. A member that answers NOTHING (down, slow, still replaying) never
+# refuses anything: the node keeps replicating and voting, and simply does not
+# serve until some path proves the rung.
+
 # NOTE: admission_bytes moved. Since the cluster FSM (2.11.0) the ingress
 # admission budget is a REPLICATED setting, not a per-host one: a top-level
 # `admission_bytes` here is refused BY NAME at startup, pointing at
