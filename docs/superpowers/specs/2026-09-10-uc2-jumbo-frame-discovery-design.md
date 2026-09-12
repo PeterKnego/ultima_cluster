@@ -593,18 +593,35 @@ Written before the tag, per the release rule:
      still replaying) says nothing about its path, so it only **holds
      serving** — `can_serve` false, `/readyz` 503.
      A node restarting into a degraded cluster keeps replicating and voting
-     instead of crash-looping under `systemd Restart=on-failure`. That hold is
-     **bounded by `JUMBO_GATE_WINDOW`** (30 s, the same constant the force gate
-     uses): if the window passes with no peer ever proven narrow, the join gate
-     **passes unproven** — it serves and emits one `Warn`
-     `jumbo_join_gate_passed_unproven` naming the silent members and the
-     committed rung. An unbounded hold made a rolling restart of a 3-voter
-     cluster with one dead host an outage (either survivor came back `/readyz`
-     503 until the dead host returned) on a cluster that still had quorum;
-     silence is no evidence, the hazard the pass defers is the runtime
-     degradation `Uc2PathBelowMtu` already covers, and a returning member runs
-     its own `Joining` check, so every live pair is tested from at least one
-     side. A PROVEN-narrow peer still refuses immediately, with no window.
+     instead of crash-looping under `systemd Restart=on-failure`. Silence does
+     not even HOLD: when every peer short of the rung is silent the gate
+     **passes unproven at once**, emitting one `Warn`
+     `jumbo_join_gate_passed_unproven` (`reason = no_evidence`) naming the
+     silent members and the committed rung. Holding on silence was tried first,
+     bounded by `JUMBO_GATE_WINDOW`, and is an availability bug in its own
+     right: `own_min_rung` is a minimum over ALL configured peers, so a
+     restarted node could not serve while any member was down — a rolling
+     restart of a 3-voter cluster with one dead host became an outage on a
+     cluster that still had quorum, and the `lin_v2` capstones (kill the leader,
+     wait for a serving survivor) had no servable node at all. Silence is no
+     evidence; the hazard the pass defers is the runtime degradation
+     `Uc2PathBelowMtu` already covers, and a returning member runs its own
+     `Joining` check, so every live pair is tested from at least one side.
+     What DOES hold serving is a peer ANSWERING below the rung — discovery in
+     flight — and that hold is bounded by `JUMBO_GATE_WINDOW` (30 s, the same
+     constant the force gate uses; `reason = window_expired`). A PROVEN-narrow
+     peer still refuses immediately, with no window.
+   - **The refusal needs CURRENT evidence, which is why every round carries the
+     refresh rung.** `ProbeTable::due` appends the already-verified rung to
+     every round of an unresolved peer (not only when its advertisement is
+     behind), and `narrow_peers` requires an ack within the last round or two
+     (`PeerProbe::rounds_since_ack`). Without that, a peer that acked the
+     baseline once and then STOPPED answering — a killed member, or, under
+     `[crypto] enabled = true`, a restarted one whose pairwise session is stale
+     so every sealed probe to it is dropped — was indistinguishable from a path
+     that carries 1408 and drops 8832, and §5.4 fail-stopped a healthy node on
+     loopback for it (caught by `lin_v2
+     linearizable_under_failover_with_crypto`).
    - **`force_jumbo_frames` keeps its 30 s window** (`JUMBO_GATE_WINDOW`) and
      fail-stops as specified; what changed is that `/readyz` answers 503 while
      **any** gate is pending, in **any** role, rather than only for a leader

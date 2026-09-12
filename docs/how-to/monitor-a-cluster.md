@@ -458,9 +458,10 @@ that node.
 `payload_ceiling_adopted` (info, every node, when the doors move),
 `datagram_mtu_not_a_rung` (warn — a rung off the ladder arrived in an
 installed artifact and was clamped), `jumbo_join_gate_armed` (warn) /
-`jumbo_gate_passed` (info) / `jumbo_join_gate_passed_unproven` (warn — the
-join gate's 30 s hold ran out with its peers still silent, so the node serves
-without having proven the rung; the silent member ids are on the record), and
+`jumbo_gate_passed` (info) / `jumbo_join_gate_passed_unproven` (warn — the node
+serves without having proven the rung, either because every peer short of it is
+SILENT (`reason = no_evidence`, at once) or because a mid-ladder hold ran out
+(`reason = window_expired`, 30 s); the silent member ids are on the record), and
 the three fail-stop refusals
 `jumbo_path_too_narrow` / `jumbo_peer_silent` / `path_below_committed_mtu`
 (error). A client over the standard ceiling emits

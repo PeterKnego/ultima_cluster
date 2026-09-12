@@ -191,22 +191,29 @@ three of them are the kind of thing an operator will otherwise read as a defect:
    into the exported counter would make "discovery traffic emitted" unreadable on
    exactly the narrow path where it matters, and a refused probe is an expected
    part of the ladder there. §9's parenthetical is superseded.
-7. **The join gate has no window on its REFUSAL, silence never refuses, and the
-   hold silence causes is bounded at 30 s.** It fail-stops only
-   a peer that *answered* below the committed rung **and** has spent its fast
+7. **The join gate has no window on its REFUSAL, and silence neither refuses
+   nor holds.** It fail-stops only
+   a peer that is *answering* below the committed rung **and** has spent its fast
    ladder — `verified == 1408` with the jumbo rungs in flight is the *healthy*
    mid-ladder state, and an earlier iteration that refused on it fail-stopped
    healthy nodes into a `systemd Restart=on-failure` crash loop. A silent peer
-   only holds serving, and only for `JUMBO_GATE_WINDOW` (30 s, the force gate's
-   constant): at the deadline, with nothing proven narrow, the gate **passes
-   unproven** and logs one warn `jumbo_join_gate_passed_unproven` naming the
-   silent members. Holding forever was the first iteration and it was wrong in
-   the other direction — `own_min_rung` is a minimum over *all* configured peers,
-   so one dead host made every survivor's restart a 503 until it returned,
-   turning a rolling restart into an outage on a cluster that still had quorum.
-   Silence is no evidence; what the pass defers is the runtime degradation
-   `Uc2PathBelowMtu` already reports, and a returning member runs its own join
-   check, so every live pair is tested from at least one side. One rule follows and
+   passes the gate outright (one warn `jumbo_join_gate_passed_unproven`,
+   `reason = no_evidence`, naming the silent members): holding on silence was
+   tried, bounded at `JUMBO_GATE_WINDOW`, and is an availability bug of its own —
+   `own_min_rung` is a minimum over *all* configured peers, so one dead host made
+   every survivor's restart a 503 until it returned, turning a rolling restart
+   into an outage on a cluster that still had quorum and leaving the `lin_v2`
+   capstones with no servable node at all. Silence is no evidence; what the pass
+   defers is the runtime degradation `Uc2PathBelowMtu` already reports, and a
+   returning member runs its own join check, so every live pair is tested from at
+   least one side. What does hold serving — bounded at 30 s,
+   `reason = window_expired` — is a peer ANSWERING below the rung. And the
+   refusal needs CURRENT evidence: every round carries the already-verified
+   *refresh* rung and `narrow_peers` requires an ack within the last round or
+   two, because a peer that answered once and then stopped (a killed member, or
+   a restarted one whose pairwise crypto session is stale) is otherwise
+   indistinguishable from a narrow path — which fail-stopped a healthy node on
+   loopback until this rule landed. One rule follows and
    is not in the spec: a probe the **kernel refused for size spends its attempt**
    (a proven local fact, unlike the transient "no session yet", which is
    refunded) — otherwise a host whose own interface MTU is too small would pend

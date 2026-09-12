@@ -6464,19 +6464,23 @@ impl Consensus {
             // also satisfies a `Forcing` gate it replaced: every rung above
             // the baseline is at or above `JUMBO_MIN_RUNG`.
             //
-            // Review round 4, Important 2: the HOLD is bounded by
+            // Review round 4, Important 2 and its follow-up: the HOLD is for
+            // MID-LADDER evidence only, and it is bounded by
             // `JUMBO_GATE_WINDOW` — the same 30 s the force gate uses, not a
             // second constant. `own_min_rung` is a minimum over ALL configured
-            // peers, so one silent member held a perfectly healthy voter
-            // un-ready forever: on 3 voters with one dead host, restarting
-            // either survivor left it `can_serve = false` / `/readyz` 503 until
-            // the dead host came back, turning a rolling restart into an outage
-            // on a cluster that still had quorum. Silence is NO EVIDENCE, so
-            // holding on it indefinitely buys nothing; the hazard the pass
-            // defers is the runtime-degradation class the spec already accepts
-            // and `Uc2PathBelowMtu` reports, and a returning member runs its
-            // own `Joining` check, so every live pair is tested from at least
-            // one side. A PROVEN-narrow peer still refuses immediately, with no
+            // peers, so holding until it reaches the rung held a perfectly
+            // healthy voter un-ready whenever a member was merely down: on 3
+            // voters with one dead host, restarting either survivor left it
+            // `can_serve = false` / `/readyz` 503 until the dead host came back,
+            // turning a rolling restart into an outage on a cluster that still
+            // had quorum — and the lin_v2 capstones, which kill the leader
+            // every second and then wait for a serving survivor, had no
+            // servable node at all. Silence is NO EVIDENCE, so it does not hold
+            // the gate even briefly; the hazard the pass defers is the
+            // runtime-degradation class the spec already accepts and
+            // `Uc2PathBelowMtu` reports, and a returning member runs its own
+            // `Joining` check, so every live pair is tested from at least one
+            // side. A PROVEN-narrow peer still refuses immediately, with no
             // window at all — that is checked first, and stays that way.
             JumboGate::Joining {
                 committed,
@@ -6491,6 +6495,19 @@ impl Consensus {
                 if !narrow.is_empty() {
                     self.jumbo_join_fail_stop(committed, &narrow);
                 }
+                // Nothing is proven narrow. Is there anything a longer hold
+                // could turn into a verdict? Only a peer that is ANSWERING
+                // below the rung (mid-ladder) — silence cannot, and holding on
+                // it costs availability, not safety: on a jumbo cluster with
+                // one member down, a restarted survivor could not serve until
+                // the dead member came back, which is how the lin_v2 capstones
+                // ended up with no servable node at all (they kill the leader
+                // every second and then wait for a serving survivor). Silence
+                // therefore passes the gate at once, loudly.
+                if !self.probe_table.answered_below(committed) {
+                    self.pass_jumbo_gate_unproven(committed, proven, "no_evidence", 0);
+                    return true;
+                }
                 match deadline_ns {
                     0 => {
                         self.jumbo_gate = Some(JumboGate::Joining {
@@ -6500,7 +6517,12 @@ impl Consensus {
                         false
                     }
                     d if self.pass_mono_ns >= d => {
-                        self.pass_jumbo_gate_unproven(committed, proven);
+                        self.pass_jumbo_gate_unproven(
+                            committed,
+                            proven,
+                            "window_expired",
+                            JUMBO_GATE_WINDOW.as_secs(),
+                        );
                         true
                     }
                     _ => false,
@@ -6519,7 +6541,13 @@ impl Consensus {
     ///
     /// Never panics, by construction — that is the whole point of it.
     #[inline(never)]
-    fn pass_jumbo_gate_unproven(&mut self, committed: u32, proven: u32) {
+    fn pass_jumbo_gate_unproven(
+        &mut self,
+        committed: u32,
+        proven: u32,
+        reason: &'static str,
+        waited_secs: u64,
+    ) {
         let offenders = self.jumbo_offenders(committed);
         let silent = Self::jumbo_offender_list(
             &offenders
@@ -6536,7 +6564,8 @@ impl Consensus {
             node = self.id as u64,
             committed = committed as u64,
             proven = proven as u64,
-            waited_secs = JUMBO_GATE_WINDOW.as_secs(),
+            reason = reason,
+            waited_secs = waited_secs,
             silent = silent.as_str(),
             offenders = list.as_str()
         );
@@ -12164,6 +12193,23 @@ mod tests {
         }
     }
 
+    /// `spend_fast_ladder` for a NARROW path rather than a silent one: every
+    /// round goes out AND the peer answers the refresh rung, which is what the
+    /// real ladder does on a path that carries `rung` and drops the rungs above
+    /// it. `ProbeTable::narrow_peers` requires that current answer — a peer that
+    /// answered once and then went quiet is silent, not narrow (the
+    /// crypto-restart regression), so a test that only spends the ladder models
+    /// a DEAD peer and must not expect a refusal.
+    fn spend_fast_ladder_answering(h: &Harness, peers: &[SocketAddr], rung: u32) {
+        let cadence = uc_net::probe::ProbeCadence::default();
+        for i in 0..=cadence.fast_attempts as u64 {
+            h.cons.probe_table.due(i * 2 * cadence.fast_ns);
+            for &p in peers {
+                h.cons.probe_table.on_ack(p, rung, rung);
+            }
+        }
+    }
+
     /// Publish a committed rung by fiat and force the next pass to re-read the
     /// view — what a restarted node's archive walk (or an installed snapshot)
     /// does for real.
@@ -12365,7 +12411,10 @@ mod tests {
         drive_to_serving_leader(&mut h);
         let peers = mtu_peers(&h);
         all_answer(&h, &peers, MTU_DEFAULT as u32, MTU_DEFAULT as u32);
-        spend_fast_ladder(&h);
+        // Every round goes out and the peers keep answering the refresh rung —
+        // a path that carries 1408 and drops the jumbo rungs. The ANSWERING
+        // half is load-bearing now: a peer that stopped answering is silent.
+        spend_fast_ladder_answering(&h, &peers, MTU_DEFAULT as u32);
 
         // The rung arrives, committed: what a restarted node's archive walk
         // replays into the view.
@@ -12431,70 +12480,108 @@ mod tests {
         assert!(h.cons.can_serve_flag.load(Ordering::Acquire));
     }
 
-    /// Spec §5.4 as amended by review fix 1, and the defect it closes: a peer
-    /// that has answered NOTHING must never fail-stop this node. `own_min_rung`
-    /// is a minimum over ALL peers and an unanswered peer contributes 0, so the
-    /// original 5 s window refused a node whenever a configured member was
-    /// merely down, slow, or still replaying a cold start — including when
-    /// restarting a survivor of a degraded jumbo cluster, which can NEVER prove
-    /// the rung to the dead member and crash-looped under
-    /// `Restart=on-failure`.
+    /// Spec §5.4 as amended by review fix 1, by review round 4's Important 2,
+    /// and by the CRITICAL regression that followed it: a peer that has
+    /// answered NOTHING must never fail-stop this node AND must not hold it out
+    /// of service either. `own_min_rung` is a minimum over ALL configured peers
+    /// and an unanswered peer contributes 0, so:
     ///
-    /// Silence holds `can_serve` false (this node genuinely has not proven the
-    /// budget) and nothing else: the node still replicates and votes, so the
-    /// cluster keeps its quorum, and the gate clears the moment a path proves
-    /// the rung.
+    /// - the original 5 s window REFUSED a node whenever a member was merely
+    ///   down, slow or still replaying (a crash loop under
+    ///   `Restart=on-failure`);
+    /// - holding instead — even bounded at `JUMBO_GATE_WINDOW` — made a
+    ///   restarted node un-servable for 30 s whenever a member was down. That
+    ///   is an availability outage on a cluster that still has quorum, and it
+    ///   is what broke the lin_v2 capstones: they kill the leader, wait for a
+    ///   serving survivor, and a survivor whose gate had armed could not prove
+    ///   the rung to the dead node, so there was no servable node at all.
     ///
-    /// Review round 4, Important 2 — the HOLD IS BOUNDED. `own_min_rung` is a
-    /// minimum over ALL configured peers, so an unbounded hold made one dead
-    /// member hold a healthy voter un-ready forever: on 3 voters with one host
-    /// down, restarting either survivor left it `can_serve = false` / `/readyz`
-    /// 503 until the dead host came back, which turns a rolling restart into an
-    /// outage on a cluster that still has quorum. At `JUMBO_GATE_WINDOW` the
-    /// gate passes UNPROVEN and says so once; it still never panics.
+    /// Silence is NO EVIDENCE in either direction, so it neither refuses nor
+    /// holds: the gate passes UNPROVEN on the first pass that sees it, says so
+    /// once, and the node serves. What that gives up is covered by
+    /// `Uc2PathBelowMtu` at runtime, and a returning member runs its own join
+    /// check.
     #[test]
-    fn silent_peers_hold_serving_then_pass_unproven_at_the_window() {
+    fn silent_peers_pass_the_join_gate_unproven_rather_than_holding_serving() {
         let mut h = harness();
         drive_to_serving_leader(&mut h);
         let peers = mtu_peers(&h);
         h.cons.probe_table.set_peers(&peers); // nobody has answered anything
+        // …and their ladders are long spent, which is the state that USED to
+        // make silence refuse (review fix 1) and then hold (Important 2).
+        spend_fast_ladder(&h);
+        publish_committed_rung(&mut h, MTU_BOUND as u32);
+
+        // No unit test in this module swaps the obs sink, so the capture is
+        // this test's alone (other tests may add noise lines to it).
+        let buf = crate::obs::log::capture_for_tests();
+        pass_checking_the_gate(&mut h);
+        let text = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        crate::obs::log::stderr_for_tests();
+
+        assert_eq!(
+            h.cons.jumbo_gate,
+            Some(JumboGate::Passed),
+            "the raise armed the gate and total silence passed it at once"
+        );
+        assert!(
+            text.contains(r#""event":"jumbo_join_gate_armed""#),
+            "the arm is still recorded: {text}"
+        );
+        assert!(
+            text.contains(r#""event":"jumbo_join_gate_passed_unproven""#)
+                && text.contains(r#""reason":"no_evidence","waited_secs":0"#),
+            "and so is the unproven pass, as a no-evidence one that waited for \
+             nothing: {text}"
+        );
+        assert!(
+            text.contains(r#""committed":8960"#) && text.contains(r#""silent":"0:0,2:0""#),
+            "naming the committed rung and every silent member id: {text}"
+        );
+        assert!(
+            h.cons.can_serve_flag.load(Ordering::Acquire),
+            "and the node serves rather than sitting at 503 until a dead member returns"
+        );
+        assert!(cnc_can_serve(&h));
+        assert!(!h.cons.jumbo_gate_pending.load(Ordering::Acquire));
+        assert!(h.cons.leader_flag.load(Ordering::Acquire));
+    }
+
+    /// The bounded half of review round 4's Important 2, which survives the
+    /// regression fix: a MID-LADDER peer — one that answered BELOW the rung and
+    /// whose ladder is not spent — is real evidence in progress, so it holds
+    /// serving. That hold is what `JUMBO_GATE_WINDOW` bounds: if the peer never
+    /// resolves and never becomes proven-narrow (its answers stop), the gate
+    /// passes unproven at the deadline instead of holding forever.
+    #[test]
+    fn a_mid_ladder_peer_holds_serving_until_the_window_then_passes_unproven() {
+        let mut h = harness();
+        drive_to_serving_leader(&mut h);
+        let peers = mtu_peers(&h);
+        // Both peers answered the baseline: mid-ladder, the healthy shape of
+        // discovery with the jumbo rungs still in flight.
+        all_answer(&h, &peers, MTU_DEFAULT as u32, MTU_DEFAULT as u32);
         publish_committed_rung(&mut h, MTU_BOUND as u32);
         pass_checking_the_gate(&mut h);
 
-        assert!(
-            matches!(
-                h.cons.jumbo_gate,
-                Some(JumboGate::Joining {
-                    committed: 8960,
-                    ..
-                })
-            ),
-            "the raise armed the join gate"
-        );
-        assert!(
-            !h.cons.can_serve_flag.load(Ordering::Acquire),
-            "a node that has not proven the committed rung must not serve"
-        );
-        assert!(!cnc_can_serve(&h));
-        assert!(h.cons.jumbo_gate_pending.load(Ordering::Acquire));
-        assert!(
-            h.cons.leader_flag.load(Ordering::Acquire),
-            "and it keeps replicating and voting"
-        );
-
-        // Silence is never a REFUSAL, not even once the fast ladder is long
-        // spent. (`check_jumbo_gate` panics on a proven-narrow peer; reaching
-        // the asserts below at all is the proof that silence is not one.) The
-        // window is armed on the pass above, so walk up to just inside it.
-        spend_fast_ladder(&h);
         let deadline = match h.cons.jumbo_gate {
-            Some(JumboGate::Joining { deadline_ns, .. }) => deadline_ns,
-            g => panic!("expected an armed Joining gate, got {g:?}"),
+            Some(JumboGate::Joining {
+                committed: 8960,
+                deadline_ns,
+            }) => deadline_ns,
+            g => panic!("expected an armed Joining gate at 8960, got {g:?}"),
         };
         assert!(
             deadline > 0,
             "the window armed on the first evaluating pass"
         );
+        assert!(
+            !h.cons.can_serve_flag.load(Ordering::Acquire),
+            "a mid-ladder answer below the rung holds serving"
+        );
+        assert!(!cnc_can_serve(&h));
+        assert!(h.cons.jumbo_gate_pending.load(Ordering::Acquire));
+
         h.cons.pass_mono_ns = deadline - 1;
         h.cons.jumbo_check_ns = 0;
         assert!(
@@ -12502,17 +12589,14 @@ mod tests {
             "one ns short of the window: still holding, still not refused"
         );
 
-        // One peer answering is not enough — the minimum is over all peers.
+        // One peer proving the rung is not enough — the minimum is over all.
         h.cons
             .probe_table
             .on_ack(peers[0], MTU_BOUND as u32, MTU_BOUND as u32);
         h.cons.jumbo_check_ns = 0;
         assert!(!h.cons.check_jumbo_gate());
 
-        // The window runs out with the other peer still silent: PASS, loudly.
-        // No unit test in this module swaps the obs sink, so the capture is
-        // this test's alone (other tests may add noise lines to it).
-        let buf = crate::obs::log::capture_for_tests();
+        // The window runs out with the other peer still mid-ladder: PASS.
         h.cons.pass_mono_ns = deadline;
         h.cons.jumbo_check_ns = 0;
         assert!(
@@ -12520,27 +12604,14 @@ mod tests {
             "at the window, an unproven hold passes rather than holding forever"
         );
         assert_eq!(h.cons.jumbo_gate, Some(JumboGate::Passed));
-        let text = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
-        crate::obs::log::stderr_for_tests();
-        assert!(
-            text.contains(r#""event":"jumbo_join_gate_passed_unproven""#),
-            "the pass must be recorded: {text}"
-        );
-        assert!(
-            text.contains(r#""committed":8960"#) && text.contains(r#""silent":"2:0""#),
-            "naming the committed rung and the silent member ids: {text}"
-        );
-
-        // And a full pass publishes it: serving, and `/readyz` no longer 503s.
         pass_checking_the_gate(&mut h);
         assert!(h.cons.can_serve_flag.load(Ordering::Acquire));
-        assert!(cnc_can_serve(&h));
         assert!(!h.cons.jumbo_gate_pending.load(Ordering::Acquire));
     }
 
-    /// The other half of review round 4's Important 2: bounding the SILENCE
-    /// hold must not soften the refusal. A peer that is proven narrow — it
-    /// answered, and its fast ladder is spent — still fail-stops the node
+    /// The other half of review round 4's Important 2: bounding the hold must
+    /// not soften the refusal. A peer that is proven narrow — it is ANSWERING
+    /// below the rung and its fast ladder is spent — still fail-stops the node
     /// IMMEDIATELY, with no window, including when it only becomes provable
     /// late in the hold.
     #[test]
@@ -12549,7 +12620,9 @@ mod tests {
         let mut h = harness();
         drive_to_serving_leader(&mut h);
         let peers = mtu_peers(&h);
-        h.cons.probe_table.set_peers(&peers); // silent for now
+        // Mid-ladder to begin with, so the gate holds instead of passing on
+        // silence; one round has gone out and the baseline ack came back.
+        all_answer(&h, &peers, MTU_DEFAULT as u32, MTU_DEFAULT as u32);
         publish_committed_rung(&mut h, MTU_BOUND as u32);
         pass_checking_the_gate(&mut h);
         let deadline = match h.cons.jumbo_gate {
@@ -12557,14 +12630,17 @@ mod tests {
             g => panic!("expected an armed Joining gate, got {g:?}"),
         };
 
-        // Most of the window goes by on silence alone — no refusal.
+        // Most of the window goes by mid-ladder — no refusal.
         h.cons.pass_mono_ns = deadline - 1_000_000_000;
         h.cons.jumbo_check_ns = 0;
-        assert!(!h.cons.check_jumbo_gate(), "silence holds, never refuses");
+        assert!(
+            !h.cons.check_jumbo_gate(),
+            "mid-ladder holds, never refuses"
+        );
 
-        // Then a peer answers the baseline and its ladder runs out: proven.
-        all_answer(&h, &peers, MTU_DEFAULT as u32, MTU_DEFAULT as u32);
-        spend_fast_ladder(&h);
+        // Then the ladder runs out while the peers keep answering the refresh
+        // rung and nothing above it: proven narrow, refused on the spot.
+        spend_fast_ladder_answering(&h, &peers, MTU_DEFAULT as u32);
         h.cons.jumbo_check_ns = 0;
         h.cons.check_jumbo_gate();
     }
@@ -12588,8 +12664,10 @@ mod tests {
         // is re-seeded (what a membership change does), so nothing is ANSWERED
         // at the new rung and the gate holds rather than refusing — an
         // answered-narrow path would refuse instead, which is the test above.
-        h.cons.probe_table.set_peers(&[]);
-        h.cons.probe_table.set_peers(&peers);
+        // The peers are re-answered at 8832 (mid-ladder against the new rung):
+        // silence would PASS the gate unproven rather than hold it, which is
+        // `silent_peers_pass_the_join_gate_unproven_rather_than_holding_serving`.
+        all_answer(&h, &peers, 8832, 8832);
         publish_committed_rung(&mut h, MTU_BOUND as u32);
         pass_checking_the_gate(&mut h);
         assert!(
@@ -12674,10 +12752,9 @@ mod tests {
         assert!(!h.cons.check_jumbo_gate(), "the force gate is pending");
 
         publish_committed_rung(&mut h, MTU_BOUND as u32);
-        // The peers have answered nothing above the baseline here, so the join
-        // gate arms but does not refuse — `all_answer` below is what clears it.
-        h.cons.probe_table.set_peers(&[]);
-        h.cons.probe_table.set_peers(&peers);
+        // The peers have answered the baseline and nothing above it, and their
+        // ladders are not spent: mid-ladder, so the join gate arms and HOLDS
+        // rather than refusing — `all_answer` below is what clears it.
         pass_checking_the_gate(&mut h);
         assert!(
             matches!(

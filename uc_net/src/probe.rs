@@ -62,6 +62,20 @@ pub struct PeerProbe {
     /// arrived. A latch is a statement about what WAS tried, which is what
     /// the predicate means.
     pub spent_fast_ladder: bool,
+    /// Rounds [`ProbeTable::due`] has issued since this peer last ACKED
+    /// anything; `0` means it answered during (or after) the newest round.
+    /// [`ProbeTable::narrow_peers`] requires this to be at most 1, which is
+    /// what makes its verdict a statement about the path NOW rather than about
+    /// an ack that arrived once and was then outlived by the peer itself.
+    ///
+    /// The regression that bought this field: under `[crypto] enabled = true`,
+    /// a peer that acked the baseline rung and was then restarted (the
+    /// lin_v2/crypto capstone kills the leader every second) has a stale
+    /// pairwise session, so every later sealed probe to it is dropped and
+    /// nothing is ever acked again. With only `verified`/`spent_fast_ladder`
+    /// to go on, that reads EXACTLY like a path that carries 1408 and drops
+    /// 8832 — and §5.4 fail-stopped a healthy node on loopback for it.
+    pub rounds_since_ack: u32,
     /// When the next round for this peer is due, on the caller's clock. `0`
     /// means "now" — the value a fresh or reset peer carries. A REFUNDED
     /// round ([`ProbeTable::note_unsent_for`]) is rescheduled one `fast_ns`
@@ -229,19 +243,26 @@ impl ProbeTable {
                 continue;
             }
             let mut rungs: Vec<u32> = RUNGS.iter().copied().filter(|&r| r > p.verified).collect();
-            if p.verified > 0 && p.advertised < p.verified {
-                // The peer's view of its own path is behind ours of it: ask
-                // again at the size we know the path carries. On a capped path
-                // this is the ONLY rung in the pass that can be delivered.
+            if p.verified > 0 {
+                // The REFRESH rung, sent on EVERY round of an unresolved peer
+                // (not only when its advertisement is behind): it is the only
+                // rung in the round a capped path can deliver, so it is both
+                // how `advertised` refreshes and — since the crypto-restart
+                // regression — the LIVENESS evidence `narrow_peers` requires.
+                // Without it, "the jumbo rungs went unanswered" cannot be told
+                // apart from "this peer answers nothing at all", and a peer
+                // that acked the baseline once and then restarted (a fresh
+                // pairwise session; every sealed probe dropped) read as a
+                // proven-narrow path and fail-stopped a healthy node.
                 rungs.push(p.verified);
             }
             p.attempts += 1;
+            p.rounds_since_ack = p.rounds_since_ack.saturating_add(1);
             // The LATCH (review minor 6): "this peer's fast ladder has been
-            // handed out" is a fact about the past, so it is recorded here and
-            // cleared only by `set_peers`. A refund lowers `attempts` without
-            // unlatching — the rounds WERE issued, and a peer that never got a
-            // datagram out has `verified == 0`, which `narrow_peers` never
-            // reports whatever the latch says.
+            // handed out" is a fact about the past, so it is recorded here.
+            // `note_unsent_for` clears it again for a round that put NOTHING on
+            // the wire — a round that was never tried is not a round that
+            // failed — and `set_peers` clears it by forgetting the peer.
             p.spent_fast_ladder |= p.attempts >= self.cadence.fast_attempts;
             let step = if p.attempts < self.cadence.fast_attempts {
                 self.cadence.fast_ns
@@ -266,6 +287,9 @@ impl ProbeTable {
         if let Some(p) = g.get_mut(&from) {
             p.verified = p.verified.max(rung);
             p.advertised = own_min_rung;
+            // This peer is answering NOW, which is what `narrow_peers` needs
+            // before it calls a path narrow (see `rounds_since_ack`).
+            p.rounds_since_ack = 0;
             // An ack can RESOLVE this peer, which takes its deadline out of
             // the fast path's minimum (and, when it was the last unresolved
             // peer, closes the door for good).
@@ -330,15 +354,51 @@ impl ProbeTable {
     /// still narrow, so a live comparison could be cleared between two of the
     /// node's 100 ms gate polls and push the §5.4 refusal out by another
     /// ladder every time a `PROBE` arrived.
+    ///
+    /// A THIRD half, bought by the crypto regression this predicate caused:
+    /// the evidence must be CURRENT ([`PeerProbe::rounds_since_ack`] ≤ 1 —
+    /// the peer acked the refresh rung in the newest round or the one before
+    /// it). A peer that acked once and then stopped answering altogether — a
+    /// killed member, a restarted one whose pairwise session is stale, a path
+    /// that went away — is not a narrow path, it is a silent one, and silence
+    /// never refuses. Every round of an unresolved peer carries the refresh
+    /// rung precisely so a genuinely narrow path KEEPS answering and stays
+    /// reportable (see [`ProbeTable::due`]).
     pub fn narrow_peers(&self, committed: u32) -> Vec<(SocketAddr, u32)> {
         let g = self.peers.lock().unwrap();
         let mut out: Vec<(SocketAddr, u32)> = g
             .iter()
-            .filter(|(_, p)| p.verified > 0 && p.verified < committed && p.spent_fast_ladder)
+            .filter(|(_, p)| {
+                p.verified > 0
+                    && p.verified < committed
+                    && p.spent_fast_ladder
+                    && p.rounds_since_ack <= 1
+            })
             .map(|(&addr, p)| (addr, p.verified))
             .collect();
         out.sort_unstable();
         out
+    }
+
+    /// Is any peer ANSWERING below `committed` — `0 < verified < committed`,
+    /// whatever its ladder state? The join gate's "is there anything to wait
+    /// for" test (jumbo spec §5.4).
+    ///
+    /// `false` means every peer short of the rung is SILENT, and silence is no
+    /// evidence: there is nothing a longer hold can turn into a verdict, so the
+    /// gate passes rather than holding `can_serve` down. That matters for
+    /// availability, not tidiness — holding on silence meant that on a jumbo
+    /// cluster with one member down, a restarted survivor could not serve at
+    /// all until the dead member returned, and the lin_v2 capstones (which kill
+    /// the leader every second and then wait for a serving survivor) had no
+    /// servable node for the whole window.
+    ///
+    /// `true` is the genuine MID-LADDER state — a peer answered the baseline
+    /// and its jumbo rungs are still in flight — which is worth holding for,
+    /// briefly, because it resolves one way or the other within a ladder.
+    pub fn answered_below(&self, committed: u32) -> bool {
+        let g = self.peers.lock().unwrap();
+        g.values().any(|p| p.verified > 0 && p.verified < committed)
     }
 
     /// Spec §5.3 (erratum 4): the leader's table minimum over `members` —
@@ -405,6 +465,13 @@ impl ProbeTable {
         let mut g = self.peers.lock().unwrap();
         if let Some(p) = g.get_mut(&peer) {
             p.attempts = p.attempts.saturating_sub(1);
+            // A round that put NOTHING on the wire is not a round that tried,
+            // so it gives back the ladder LATCH as well as the attempt: the
+            // latch must mean "the higher rungs actually went out and went
+            // unacked". `due()` has already counted this round in
+            // `rounds_since_ack`, which is deliberate — a refunded round is
+            // still a round in which the peer did not answer.
+            p.spent_fast_ladder = p.attempts >= self.cadence.fast_attempts;
             p.next_due_ns = now_ns + self.cadence.fast_ns;
         }
         self.publish_earliest(&g);
@@ -480,6 +547,113 @@ mod tests {
         assert!(
             t.narrow_peers(8832).is_empty(),
             "above committed either way"
+        );
+    }
+
+    /// The CRITICAL regression the fix wave shipped and this closes: a peer
+    /// that answered the baseline rung once and then stopped answering
+    /// ALTOGETHER is silent, not narrow. Under `[crypto] enabled = true` a
+    /// restarted member is exactly that — a stale pairwise session means every
+    /// later sealed probe is dropped — and `narrow_peers` reported it, so §5.4
+    /// fail-stopped a healthy node on loopback
+    /// (`lin_v2 linearizable_under_failover_with_crypto`).
+    ///
+    /// The discriminator is `rounds_since_ack`: a genuinely narrow path keeps
+    /// acking the refresh rung every round, a gone one does not.
+    #[test]
+    fn a_peer_that_stopped_answering_is_silent_not_narrow() {
+        let t = ProbeTable::new(fast()); // fast_attempts = 2
+        t.set_peers(&[a(1)]);
+        t.due(0);
+        t.on_ack(a(1), 1408, 8960); // the only ack this peer will ever send
+        t.due(10); // ladder spent, and the peer answered in the round before
+        assert_eq!(
+            t.narrow_peers(8960),
+            vec![(a(1), 1408)],
+            "fresh evidence: it is answering at 1408 while 8832/8960 go unacked"
+        );
+
+        // It goes away (killed, restarted under a new session, path gone), so
+        // the next round goes unanswered too and the verdict must lapse — the
+        // evidence window is "acked in the newest round or the one before it".
+        // (The ladder is spent, so rounds are on the SLOW cadence now.)
+        t.due(110);
+        assert!(
+            t.narrow_peers(8960).is_empty(),
+            "two rounds with no answer: silence, which never refuses"
+        );
+        assert!(
+            t.answered_below(8960),
+            "the join gate still knows it answered below the rung once"
+        );
+
+        // And it comes back: the refresh rung is acked again, so the path's
+        // narrowness is a current fact once more.
+        t.on_ack(a(1), 1408, 8960);
+        assert_eq!(t.narrow_peers(8960), vec![(a(1), 1408)]);
+    }
+
+    /// The coordinator's required test, with the mechanism the diagnosis
+    /// actually needed: rounds that put NOTHING on the wire (no pairwise
+    /// session yet — every rung skipped at assembly) never make a peer narrow,
+    /// however many of them pass, because they give back the ladder latch as
+    /// well as the attempt. Rounds that DO go out, against a peer that keeps
+    /// answering the refresh rung, do.
+    #[test]
+    fn refunded_rounds_never_make_a_peer_narrow() {
+        let t = ProbeTable::new(fast()); // fast_attempts = 2, fast_ns = 10
+        t.set_peers(&[a(1)]);
+        // One round landed before the session went away, so the peer HAS
+        // answered the baseline: `verified > 0`, the first half of the
+        // predicate. Everything after this is a session-less refund.
+        t.due(0);
+        t.on_ack(a(1), 1408, 8960);
+        let mut now = 10;
+        for round in 0..8 {
+            assert_eq!(t.due(now).len(), 1, "round {round} is due");
+            t.note_unsent_for(a(1), now);
+            assert!(
+                !t.get(a(1)).unwrap().spent_fast_ladder,
+                "round {round}: a round that put nothing on the wire is not a \
+                 round that tried, so the latch is given back with the attempt"
+            );
+            assert!(
+                t.narrow_peers(8960).is_empty(),
+                "round {round}: never narrow on rounds that never went out"
+            );
+            now += fast().fast_ns;
+        }
+
+        // The handshake completes: rounds go out for real and the peer keeps
+        // answering only the baseline. NOW it is a proven narrow path.
+        for _ in 0..fast().fast_attempts {
+            t.due(now);
+            t.on_ack(a(1), 1408, 8960);
+            now += fast().fast_ns;
+        }
+        assert!(t.get(a(1)).unwrap().spent_fast_ladder);
+        assert_eq!(t.narrow_peers(8960), vec![(a(1), 1408)]);
+    }
+
+    /// `answered_below` is the join gate's "is there anything to wait for"
+    /// test: silence is not, a mid-ladder answer is.
+    #[test]
+    fn answered_below_separates_silence_from_a_mid_ladder_answer() {
+        let t = ProbeTable::new(fast());
+        t.set_peers(&[a(1), a(2)]);
+        assert!(!t.answered_below(8960), "both silent: nothing to wait for");
+        t.due(0);
+        t.due(10);
+        assert!(
+            !t.answered_below(8960),
+            "a spent ladder does not turn silence into evidence"
+        );
+        t.on_ack(a(1), 1408, 1408);
+        assert!(t.answered_below(8960), "a(1) answered below the rung");
+        t.on_ack(a(1), 8960, 8960);
+        assert!(
+            !t.answered_below(8960),
+            "at the rung, and a(2) has still said nothing"
         );
     }
 
@@ -592,7 +766,10 @@ mod tests {
         // advertisement is behind also gets has its own test below.
         t.on_ack(a(1), 8832, 8832);
         assert_eq!(t.get(a(1)).unwrap().verified, 8832);
-        assert_eq!(t.due(10), vec![(a(1), vec![8960])]);
+        // The untried rung above, then the REFRESH rung — which every round of
+        // an unresolved peer now carries, level advertisement or not: it is the
+        // liveness evidence `narrow_peers` requires (see `due`).
+        assert_eq!(t.due(10), vec![(a(1), vec![8960, 8832])]);
         // Fully resolved: top rung verified AND the peer's own minimum is no
         // lower (Task 4 sharpened the rule — see `due`; the value here was
         // 8832, an advertisement the pair would still be reconciling).
@@ -653,8 +830,10 @@ mod tests {
         t.on_ack(a(1), 8832, 8832); // the peer's view caught up
         assert_eq!(
             t.due(2_000),
-            vec![(a(1), vec![8960])],
-            "advertisement level: only the untried rung above is left"
+            vec![(a(1), vec![8960, 8832])],
+            "advertisement level, but the refresh rung still rides every round: \
+             it is the only datagram a capped path can answer, and that answer \
+             is what keeps this peer reportable as narrow"
         );
         assert_eq!(t.table_min(&[a(1)]), Some(8832));
     }

@@ -264,18 +264,19 @@ verify rather than a build:
   Fix the MTU and restart: the remedy is never a wipe, because nothing in the
   instance directory is wrong. A member that answers *nothing* (down, slow,
   replaying) never refuses anything — the node keeps replicating and voting and
-  simply holds serving (`/readyz` 503) until some path proves the rung, and that
-  hold is **bounded at 30 s**: with no peer ever proving narrow, the gate then
-  **passes unproven**, the node serves, and it logs one warn record
-  `jumbo_join_gate_passed_unproven` naming the silent member ids. So a **rolling
-  restart on a cluster with one dead host is not an outage**: each restarted
-  survivor holds for at most 30 s (≈1 s when the paths are healthy) and then
-  serves, rather than waiting for the dead member to return. To clear it at
-  once, `uc2ctl remove <dead-id>` is accepted while a gate is pending — admin
-  handling keys on the leader flag, not on the gate — and removing the member
-  takes it out of the minimum. `uc2_jumbo_gate_pending` is `1` on a held node,
-  which is what separates this from `Uc2LeaderNotServing`'s other cause (an
-  uncommitted `NewTerm`). Under
+  does not hold serving at all: if every member short of the rung is SILENT the
+  gate **passes unproven** at once (one warn record
+  `jumbo_join_gate_passed_unproven`, `reason = no_evidence`, naming the silent
+  member ids), so a **rolling restart on a cluster with one dead host is not an
+  outage** and a restarted survivor can serve immediately. Only a member that is
+  ANSWERING below the rung holds serving (`/readyz` 503) — discovery in flight,
+  which resolves within a probe ladder — and that hold is bounded at 30 s
+  (`reason = window_expired`). A peer that answered once and then stopped
+  answering is treated as silent, not narrow: the refusal needs a CURRENT answer
+  at a rung below the committed one. `uc2ctl remove <dead-id>` is accepted while
+  a gate is pending — admin handling keys on the leader flag, not on the gate.
+  `uc2_jumbo_gate_pending` is `1` on a held node, which is what separates this
+  from `Uc2LeaderNotServing`'s other cause (an uncommitted `NewTerm`). Under
   `force_jumbo_frames` the same gate fail-stops after 30 s instead, as
   `jumbo_path_too_narrow` (a peer answered below 8832) or `jumbo_peer_silent`
   (a liveness fact, not an MTU one: start the member). Details and remedies:

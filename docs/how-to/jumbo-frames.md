@@ -247,30 +247,37 @@ Three things to know about it:
   node cannot receive; nothing in its instance directory is wrong. Fix the
   MTU — on the peer's path *or on this host's own interface*, which the node
   cannot distinguish, hence the two-cause wording — and restart.
-- **Silence never refuses, and the hold it causes is bounded at 30 s.** A
-  member that is down, slow, or still replaying answers nothing, and nothing is
-  known about its path, so it is never "narrow". The gate only *holds serving*
-  — the node keeps replicating and voting, so restarting one survivor of a
-  degraded cluster does not crash-loop. If 30 s (`JUMBO_GATE_WINDOW`, the same
-  constant the force gate uses) passes with no peer ever proving narrow, the
-  gate **passes unproven**: the node starts serving and logs one warn record,
-  `jumbo_join_gate_passed_unproven`, naming the silent member ids and the
-  committed rung. Silence is no evidence, and a node that held on it forever
-  would turn a rolling restart into an outage — on 3 voters with one host down,
-  restarting either survivor would leave it `/readyz` 503 until the dead host
-  came back, on a cluster that still has quorum. What the pass defers is a
-  *runtime* degradation, which `Uc2PathBelowMtu` reports on a serving node; and
-  a returning member runs its own join check, so every live pair is still
-  tested from at least one side. A healthy restart clears the gate in ~1 s, so
-  the window is invisible in the normal case. A PROVEN-narrow peer still
-  refuses immediately, with no window at all.
+- **Silence neither refuses nor holds.** A member that is down, slow, or still
+  replaying answers nothing, and nothing is known about its path — so it is
+  never "narrow", and it is not something waiting can turn into a verdict
+  either. If every member short of the rung is silent, the gate **passes
+  unproven** on the spot: the node serves and logs one warn record,
+  `jumbo_join_gate_passed_unproven` (`reason = no_evidence`), naming the silent
+  member ids and the committed rung. Holding instead was an availability bug in
+  both of its earlier forms — refusing crash-looped a restarted survivor, and
+  holding for 30 s left it at `/readyz` 503 until the dead member came back, so
+  a rolling restart (or a capstone that kills the leader and then waits for a
+  serving survivor) had no servable node at all, on a cluster that still had
+  quorum. What the pass defers is a *runtime* degradation, which
+  `Uc2PathBelowMtu` reports on a serving node; and a returning member runs its
+  own join check, so every live pair is still tested from at least one side.
+- **A peer ANSWERING below the rung does hold serving, briefly.** That is
+  discovery in flight — the baseline ack has landed and the jumbo rungs have
+  not — and it resolves one way or the other within a probe ladder (five
+  attempts, ~5 s): either the jumbo ack lands and the gate passes, or the ladder
+  runs out and the node refuses by name. That hold is bounded at 30 s
+  (`JUMBO_GATE_WINDOW`, the same constant the force gate uses), after which the
+  gate passes unproven with `reason = window_expired`.
+- **A peer that answered once and then went quiet is silent, not narrow.** The
+  refusal needs CURRENT evidence: every probe round carries one datagram at the
+  rung the path is already known to carry, and a peer is only refused while it
+  keeps answering that one while the larger rungs go unanswered. A killed
+  member, a restarted one (under wire crypto its pairwise session is stale, so
+  every sealed probe to it is dropped), or a path that went away all stop
+  answering altogether, and none of them is a narrow path.
 - **A dead member does not have to be waited out.** `uc2ctl remove <dead-id>`
   is accepted while a gate is pending — admin handling keys on the leader flag,
-  not on the gate — and removing the member clears it at once, because
-  discovery's minimum is over the *configured* member set.
-- **A healthy restart clears it in about a second.** A peer still inside its
-  fast probe ladder is mid-discovery, not degraded; only a peer that has spent
-  that ladder (five attempts, ~5 s) and still answers low is refused.
+  not on the gate — and removing the member takes it out of discovery's minimum.
 
 `Uc2PathBelowMtu` (`increase(uc2_send_emsgsize_total[5m]) > 0`) is the
 runtime face of the same condition on a *running* node: a path degraded below
