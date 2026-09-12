@@ -25,10 +25,37 @@ precision — bar since restated; the coordinated-snapshot arm's introduction
 cost, since absorbed), four inconclusive (rate bars an order of magnitude below
 the rig's variance — the driver now judges paired deltas). The known issue
 shipped as recorded — `CncPage::meta()` can panic on a page a restarting node
-rewrites — and is **fixed on `main` for `2.12.0`** (`meta()` replaced by a
-fallible `try_meta()`; `docs/BACKLOG.md` § Shipped). `2.10.0` was one log stream, `UC2_*` env
+rewrites — and is **fixed for `2.12.0`** (`meta()` replaced by a
+fallible `try_meta()`, plus the boot-gap attach refusal found reviewing it;
+`docs/BACKLOG.md` § Shipped). `2.10.0` was one log stream, `UC2_*` env
 overrides, `uc_obs`, the `ultima_db` removal and the Broadcast-ring
 memory-ordering fix; `2.9.0` the `uc_*` crate rename.
+
+**Pending: `2.12.0` — NOT tagged, NOT published, neither gate run.** Two
+features on one flag day, wire `0.7.0` → `0.8.0` and cnc `3.1` → `3.2`:
+**jumbo-frame discovery** (the command payload ceiling is measured from the
+paths between nodes and committed cluster-wide, monotone — `RUNGS = [1408,
+8832, 8960]`, `PROBE`/`PROBE_ACK` kinds 24/25, the live ceiling word at cnc
+offset 3984, `Settings` v2's `datagram_mtu`, `max_payload` retired from
+`node.toml` and refused by name, the optional `force_jumbo_frames` gate, a
+below-the-committed-rung join refusal, and do-not-fragment on the replication
+socket — which makes a node **Linux/Android-only**, refused by name
+elsewhere) and the **monotonic log clock** (`uc_node::log_clock`; a backward
+wall step is smeared at 500 ppm instead of freezing the log's clock, and the
+consensus pass takes one clock read instead of two — no flag-day surface of
+its own). Both fleet gates are pre-committed and **UNRUN**
+(`docs/benchmarks/uc2-jumbo-frame-discovery-gate-TEMPLATE.md`,
+`uc2-log-clock-gate-2026-09-08.md`) — quote no number from either. The
+workspace version is still `2.11.0`: the bump, the tag and the publish all
+happen in `docs/how-to/cut-a-release.md`, not in the feature work. The
+release writeup is in `RELEASES.md` and `docs/releases.md`; the explainer is
+`docs/notes/uc2-jumbo-frame-discovery-explained.md`, the how-to
+`docs/how-to/jumbo-frames.md`, and the spec
+`docs/superpowers/specs/2026-09-10-uc2-jumbo-frame-discovery-design.md` (read
+its two "Errata … as built" sections before the body — seven errata, and the
+three an operator is most likely to misread are the forever-climbing
+`uc2_probe_sent_total` on a narrow cluster, the solo cluster that never
+raises, and the join gate that never refuses a silent peer).
 **M14c2 is the last feature milestone; milestones M1–M14 are all complete**, each
 closed by a fleet-proven gate doc under `docs/benchmarks/` (bars are
 pre-committed before any run; a miss is recorded as FAIL and keeps the bar —
@@ -68,12 +95,12 @@ Next up, now that `2.11.0` is tagged and published: (1) bound the three
 unbounded waits in `examples/uc_crashtest/tests/remote_lin.rs` that turned a
 flaky failure into a 58-minute nightly hang on 2026-09-08 — the open half of
 `docs/BACKLOG.md`'s newest item, whose other half (`CncPage::meta()`) is
-fixed on `main`; (2) `2.12.0`, which
-carries the monotonic log clock (`uc_node::log_clock`, spec
-`docs/superpowers/specs/2026-09-08-uc2-monotonic-log-clock-design.md`; fleet
-A/B pre-committed, unrun) and is the natural home for **jumbo frames** —
-raising `MTU_DEFAULT` is a wire
-flag day, so it pairs with whatever else moves the wire; (3) a fleet re-run of
+fixed; (2) **run the two `2.12.0` fleet gates and cut the release** — the
+jumbo gate's six rows (`bench-infra/scripts/jumbo_gate.py`; rows a/b/d need a
+fleet whose interface MTU ansible can force between 9001 and 1500, row c is
+the soak that decides whether the runbook *recommends* jumbo, rows e/f carry
+no bar) and the log clock's A/B, then `docs/how-to/cut-a-release.md`; the
+feature code, the docs and the writeup are all written; (3) a fleet re-run of
 the time-and-timers rows a/b/e under the paired statistic, and of row c under
 its restated bar. The cluster FSM / coordinated snapshots spec is
 `docs/superpowers/specs/2026-09-05-uc2-cluster-fsm-and-coordinated-snapshot-design.md`
@@ -169,8 +196,12 @@ one log stream (#11); the release-ledger line (#5) is process, not code
 
 ### Standing facts that bind new work
 
-- **The wire protocol SHIPPED is 0.7.0** (`2.11.0`, cnc `3.1`; next bullet).
-  Before it, `0.6.0` changed `SNAP_BEGIN` only; a `0.5.0` sender's session is refused by name,
+- **The wire protocol SHIPPED is 0.7.0** (`2.11.0`, cnc `3.1`; next bullet);
+  **`0.8.0` + cnc `3.2` are implemented and UNRELEASED** in the pending
+  `2.12.0` (two pairwise datagram kinds, 24/25, and one cnc word at 3984 — no
+  layout change either side, so a `0.7.0` peer drops the probes and such a
+  cluster simply never raises its ceiling).
+  Before 0.7.0, `0.6.0` changed `SNAP_BEGIN` only; a `0.5.0` sender's session is refused by name,
   so a mixed cluster stalls a joiner rather than installing half a set); the
   node↔node wire and the `cnc.dat` page layout are **flag days, never
   mixed-version** — a 0.4.0 peer's durable report reads as unattested and is
@@ -465,7 +496,8 @@ one log stream (#11); the release-ledger line (#5) is process, not code
   proofs + conformance, loom (log-buffer frame visibility, the MPSC ring's
   per-record commit, and the Broadcast ring's seqlock read barrier — the last
   found and fixed a real weak-memory defect when it was written, 2026-08-31),
-  15 fuzz targets (23 on the `2.11.0` branch), Miri (pure decoders + `uc_remote`'s
+  **24** fuzz targets (15 before `2.11.0`, which added eight; `uc_protocol_probe`
+  is the pending `2.12.0`'s), Miri (pure decoders + `uc_remote`'s
   Vec-backed SPSC internals; the mmap'd IPC rings are out of Miri's reach).
 - **`cargo fmt` is ENFORCED** since 2026-08-31: `cargo fmt --all -- --check`
   is the first step of `ci.yml`'s `test` job, so workspace drift is zero and

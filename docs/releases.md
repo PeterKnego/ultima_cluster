@@ -1,15 +1,233 @@
 # ultima_cluster releases
 
-## 2.12.0 (unreleased) — the monotonic log clock
+## 2.12.0 (unreleased) — jumbo frames, and the monotonic log clock
+
+**Two features on one flag day: wire `0.7.0` → `0.8.0` and cnc `3.1` → `3.2`.**
+Baseline for both: the tagged `v2.11.0` (wire `0.7.0`, cnc `3.1`) — the log clock
+landed on `main` first, and the jumbo branch points at `main` after it. **Not
+tagged, not published, and neither feature's fleet gate has been run** as this
+entry is written: every number below that is not a source constant is a bar, not
+a measurement.
+
+Neither was a ranked `docs/BACKLOG.md` direction. Jumbo frames stood in
+CLAUDE.md's "Next up" as the natural home for a wire flag day, and it answers one
+of direction 1's open questions — whether the command payload ceiling is a real
+adoption blocker — while leaving that direction's other half (a remote-protocol
+v2 that advertises the ceiling to a `uc_remote` client) open. The log clock was
+requested by the maintainer 2026-09-08.
+
+| | jumbo-frame discovery | the monotonic log clock |
+|---|---|---|
+| spec | [`…2026-09-10-uc2-jumbo-frame-discovery-design.md`](superpowers/specs/2026-09-10-uc2-jumbo-frame-discovery-design.md) (read both "Errata … as built" sections) | [`…2026-09-08-uc2-monotonic-log-clock-design.md`](superpowers/specs/2026-09-08-uc2-monotonic-log-clock-design.md) |
+| plans | [plan 1](superpowers/plans/2026-09-10-uc2-jumbo-frame-discovery-plan1.md) (discovery, Settings v2, the live ceiling), [plan 2](superpowers/plans/2026-09-12-uc2-jumbo-frame-discovery-plan2.md) (the gates, observability, proof, docs) | [the plan](superpowers/plans/2026-09-08-uc2-monotonic-log-clock.md) |
+| explainer | [Jumbo frames and path-MTU discovery, explained](notes/uc2-jumbo-frame-discovery-explained.md) | [Log time and timers § the log clock](notes/uc2-log-time-and-timers-explained.md#the-log-clock) |
+| how-to | [Run a cluster on jumbo frames](how-to/jumbo-frames.md) | — (no operator surface) |
+| gate doc | [jumbo gate](benchmarks/uc2-jumbo-frame-discovery-gate-TEMPLATE.md) — **pre-committed, UNRUN** | [log-clock gate](benchmarks/uc2-log-clock-gate-2026-09-08.md) — **pre-committed, UNRUN** |
+| flag-day surface | wire `0.8.0` (two datagram kinds), cnc `3.2` (one word), `Settings` v2, `max_payload` retired | none |
+
+### Jumbo-frame discovery
+
+**The problem.** One command must fit one datagram, and the datagram size was a
+source constant sized for a 1500 B Ethernet path (`MTU_DEFAULT = 1408`), so the
+command payload ceiling was 1344 B crypto-off / 1312 B crypto-on. The clouds UC
+is deployed on carry roughly six times that (AWS 9001 B, GCP 8896 B). Raising
+`MTU_DEFAULT` would have been a one-line change and the wrong one: every cluster
+whose paths carry only 1500 B would then send datagrams its own network cannot
+deliver. So the ceiling has to follow what the paths actually carry, which means
+measuring them.
+
+**Why the value is cluster-wide, and why it only ever rises.** A command is
+admitted on one node and shipped by another, so a per-node ceiling admits
+commands the leader cannot replicate; and a committed frame is a permanent
+obligation on *every* future leader to *every* future member — as live `DATA`, as
+a NAK repair, and as the tail a snapshot session replays after an artifact
+install. The sound value is therefore the minimum over **all pairs**, including
+follower-to-follower paths no leader sends on today, and it can only ever go
+**up** within a cluster's life: there is no mechanism to un-append a frame the
+cluster has decided it cannot carry.
+
+**What changed, by layer.**
+
+- **`uc_protocol::v2::datagram`** — a fixed ladder, not a search:
+  `RUNGS = [1408, 8832, 8960]`, `MTU_BOUND = 8960` (the largest datagram UC will
+  ever send), `JUMBO_MIN_RUNG = 8832`, `is_rung` (a closed-set check a follower's
+  apply can make — an arbitrary discovered integer could not be distinguished
+  from a forged one), and `payload_ceiling(rung, crypto_on)`, which is the old
+  arithmetic with the rung made a variable: the rung, less the 16 B datagram
+  header, less `CRYPTO_OVERHEAD = 24` when crypto is on, floored to
+  `FRAME_ALIGNMENT = 32`, less the 32 B frame header → 1344/1312 at the baseline,
+  8768/8736 at 8832, 8896/8864 at 8960. Two new datagram kinds,
+  `DGRAM_KIND_PROBE = 24` and `DGRAM_KIND_PROBE_ACK = 25`, both
+  `Scope::Pairwise`, which is the whole of **wire `0.8.0`**: no layout change, so
+  a `0.7.0` peer drops the two kinds as unknown and such a cluster simply never
+  raises (still unsupported — stop every node before starting any node).
+- **`uc_protocol::v2::settings`** — the replicated `Settings` record grows one
+  `u32`, `datagram_mtu`: `SETTINGS_VERSION = 2`, `SETTINGS_LEN` 29 → 33
+  (`SETTINGS_LEN_V1` kept). A version-1 record still decodes, reading
+  `datagram_mtu = 0` as "the baseline rung" — which is why this flag day needs no
+  instance-directory wipe, the first flag day where that had to be said, because
+  the cluster FSM shipped in `2.11.0` and committed `CLUSTER` frames and a
+  cluster artifact now survive an upgrade.
+- **`uc_node::cluster_fsm`** — the FSM stores `max(committed, incoming)`, so the
+  value is monotone in the *state machine*, not merely in the proposer, and
+  `validate_replicated` refuses a non-rung. It is **not operator-writable**:
+  `uc2ctl settings apply`'s file schema refuses a `datagram_mtu` key
+  (`deny_unknown_fields`) and stages `0`, which the monotone rule cannot read as
+  a lowering, and `node.toml`'s `[settings]` has no such field either — because
+  an operator's number is a claim and discovery's number is a measurement.
+- **`uc_net::sockopt`** — `set_dont_fragment` sets `IP_MTU_DISCOVER =
+  IP_PMTUDISC_DO` (IPv4) or `IPV6_MTU_DISCOVER = IPV6_PMTUDISC_DO` plus
+  `IPV6_DONTFRAG` (IPv6) once at bind. Without DF a probe proves nothing (the
+  kernel splits it, the peer reassembles, and the ack over-reports the path), and
+  DF is the right data-plane posture independently: an oversize send fails
+  locally with `EMSGSIZE` instead of turning one lost fragment into an
+  unexplained NAK storm.
+- **`uc_net::probe`** — `ProbeTable`, one shared per-peer ledger for the three
+  agents that touch it: `verified` (what our probes proved) and `advertised`
+  (what the peer's acks said about *its* own minimum) per peer, a cadence of five
+  1 s attempts then 30 s, `own_min_rung()` (the smallest verified rung over our
+  peers, `0` for any unresolved one), `table_min()` (the leader's commit input),
+  `narrow_peers()` (the join gate's predicate) and `on_peer_seen()` (the rejoin
+  reset). The sender sends due probes and packs to the live rung; the receiver
+  answers them **ahead of the term filter** on purpose — a path is a path
+  whatever the term — and credits an arrival only when the received length equals
+  the claimed rung.
+- **`uc_protocol::v2::cnc` + `uc_log`, cnc `3.2`** — a live `payload_ceiling`
+  `u64` at offset **3984**, written by the **consensus** agent, read per submit by
+  every client and by the gateway edge; `LogBuffer::set_payload_ceiling` is the
+  appender's own door.
+- **`uc_node`'s consensus agent** — `refresh_from_view` moves three doors in one
+  pass (the sender's datagram budget, the appender's payload door, the cnc word)
+  and logs `payload_ceiling_adopted`, so a client attached *before* a raise sees
+  it without reattaching. The leader appends one `CLUSTER kind = 3` Settings
+  frame when every current member has an entry and the table's minimum exceeds
+  the committed rung — one cluster command in flight, like every other — and
+  writes an audit `settings_apply` record with `source = "discovery"`, the first
+  audit record with no requester.
+- **The two startup gates** — `force_jumbo_frames` (default `false`, env
+  `UC2_FORCE_JUMBO_FRAMES`) demands every peer prove `JUMBO_MIN_RUNG` and
+  fail-stops after `JUMBO_GATE_WINDOW = 30 s` with `jumbo_path_too_narrow` or
+  `jumbo_peer_silent`; the **join** gate arms itself whenever a node learns of a
+  committed rung above what it has proven, and fail-stops
+  `path_below_committed_mtu` naming the peer and both rungs. While either gate is
+  pending the node holds `can_serve` false (the in-process flag and the cnc bit)
+  and `/readyz` answers 503 in **any** role.
+- **The clients** — `uc_client::Engine` reads the live cnc word per submit rather
+  than a value captured at attach; `uc_remote` warns at `STANDARD_PAYLOAD` and
+  caps its *derived* default out-ring at 4 MiB (`OUT_RING_DERIVED_CAP`, so
+  deriving from the jumbo bound does not grow every remote client's default
+  reservation 8×). Both tiers emit one warn-level `command_over_standard_ceiling`
+  line per client the first time a command exceeds the 1312 B standard ceiling —
+  the dev-box trap is that loopback's MTU is 65 536, so a 4 KB command works
+  there and fails in production, which is why the notification fires on
+  **success**.
+- **Observability** — seven new series (`uc2_datagram_mtu_bytes`,
+  `uc2_payload_ceiling_bytes`, `uc2_probe_min_mtu_bytes`, `uc2_probe_sent_total`,
+  `uc2_probe_acked_total`, `uc2_send_emsgsize_total`,
+  `uc2_commands_over_standard_total`), two alerts (`Uc2MtuDiscoveryStalled`
+  warning, `Uc2PathBelowMtu` critical) and a `ceiling:` line on `uc2ctl status`.
+
+**The operator-visible break: `max_payload` is retired.** A `node.toml` that
+still sets it refuses to start, by name:
+
+```
+max_payload is no longer configurable (2.12.0): the command payload ceiling is
+discovered from the path MTU between nodes and committed cluster-wide. Delete
+the line. To REQUIRE jumbo frames, set force_jumbo_frames = true instead.
+```
+
+There is no replacement key — the ceiling is discovered and replicated — so the
+upgrade edit is a deletion on every host that set it, whatever the value.
+`NodeConfig::max_payload` survives as a library field, but its meaning is now the
+derived **bound** (the top rung's ceiling for this crypto mode) rather than an
+operator's door. Two behaviour changes travel with it: a path below **1436 B
+(IPv4) / 1456 B (IPv6)** that worked by fragmenting UC's baseline datagrams now
+fails by name, counted (`uc2_send_emsgsize_total`) and alerted
+(`Uc2PathBelowMtu`); and a **node host must run Linux or Android**, because the
+three DF socket options exist in `libc` for those targets only and probing
+without them would over-report a path — `set_dont_fragment` returns
+`io::ErrorKind::Unsupported` elsewhere and `Node::start` propagates it, so a
+macOS or BSD box can no longer run a `uc2-node` (the client and service crates
+are unaffected). Both are written up in
+[Upgrade a cluster § 2.12.0](how-to/upgrade-a-cluster.md#wire--cnc-change-in-2120-jumbo-frames-080-cnc-32).
+
+**Seven spec errata, all recorded in the spec's two "as built" sections**, and
+three of them are the kind of thing an operator will otherwise read as a defect:
+
+1. **Probing a peer does not stop at `verified == MTU_BOUND`** — it stops only
+   when that peer's *advertised* minimum has caught up too, because an ack's
+   `own_min_rung` is the only channel through which a peer's own minimum reaches
+   us. On a cluster with one permanently narrow path, every node therefore keeps
+   probing every peer at the 30 s cadence **forever** (2–3 datagrams per 30 s per
+   peer) and `uc2_probe_sent_total` climbs slowly without bound. Accepted cost,
+   not a leak.
+2. **A `PROBE` received from a peer we had backed off on resets our cadence**
+   to the fast ladder, which is what makes a rejoining member's raise land in
+   seconds rather than up to 30 s later.
+3. **The lockstep `fsm_lag` one-frame floor follows the *live* ceiling**, not the
+   fixed `MIN_FSM_LAG_BYTES` bound — so on a jumbo cluster a host's own clamp can
+   go *up*, never down. `MIN_FSM_LAG_BYTES` stays the cluster-wide floor the
+   leader's `validate` refuses below, because it must hold at every cluster's
+   baseline.
+4. **A solo cluster never raises.** `ProbeTable::table_min(&[])` answers `None`:
+   an empty member set is *no evidence*, not universal evidence. Otherwise the
+   grow-from-one path (start one node, `add-learner`, promote) on an ordinary
+   1500 B network would commit an irreversible top-rung raise and the joiner's
+   snapshot chunks, cut at the leader's 8960 B budget, would never arrive. The
+   one-sided consequence: `own_min_rung()` answers `MTU_BOUND` for an empty peer
+   map, so **`force_jumbo_frames` passes immediately on a one-node cluster** — it
+   is a multi-node guarantee.
+5. **The consensus agent writes the live rung and the cnc word**, not the cluster
+   agent as §7.1/§7.3 said — which is what keeps the appender's door and the
+   door's writer on one thread.
+6. **`uc2_probe_sent_total` counts only probes that left the host.** The two ways
+   a round can put nothing on the wire are counted elsewhere and deliberately
+   unexported: a kernel size refusal in the sender's `probe_emsgsize`, a round
+   with no pairwise crypto session yet in `ProbeTable::unsent()`. Folding them
+   into the exported counter would make "discovery traffic emitted" unreadable on
+   exactly the narrow path where it matters, and a refused probe is an expected
+   part of the ladder there. §9's parenthetical is superseded.
+7. **The join gate has no window, and silence never refuses.** It fail-stops only
+   a peer that *answered* below the committed rung **and** has spent its fast
+   ladder — `verified == 1408` with the jumbo rungs in flight is the *healthy*
+   mid-ladder state, and an earlier iteration that refused on it fail-stopped
+   healthy nodes into a `systemd Restart=on-failure` crash loop. A silent peer
+   only holds serving, indefinitely if need be, so a three-node cluster that
+   tolerates one dead member can still restart a survivor. One rule follows and
+   is not in the spec: a probe the **kernel refused for size spends its attempt**
+   (a proven local fact, unlike the transient "no session yet", which is
+   refunded) — otherwise a host whose own interface MTU is too small would pend
+   at 503 forever instead of refusing by name, and since the gate cannot tell
+   that case from a narrow peer, `path_below_committed_mtu`'s text names both
+   causes.
+
+**Acceptance.** In-process, on this tree: `uc_node/tests/jumbo.rs` drives a
+three-node loopback cluster (convergence at the top rung, a capped path that
+stays at the baseline, a silent member, a client attached before the raise, the
+healthy restart, and the two fail-stop refusals) with `FaultConfig::max_datagram`
+standing in for a narrow path, and `uc_net`'s own `emsgsize_over` knob models a
+kernel that refuses a rung for size (the all-refused and mixed rounds are pinned
+in `uc_net/src/sender.rs`'s tests); `uc_protocol_probe` joins the fuzz tier (24
+targets, nine of them added since `2.10.0`); both new alert
+rules have `RULE_BUILDERS` entries and synthetic scenarios
+(`mtu_discovery_stalled`, `path_below_mtu`) so `scripts/m10_alert_fire.sh`'s
+completeness cross-check still passes; and `bench-infra/scripts/jumbo_gate.py
+--selftest` pins the driver's row arithmetic with no fleet or ssh.
+**The fleet gate is pre-committed and UNRUN** — six rows (convergence within
+10 s of the last node's start; a 1500 B arm that must never raise, with
+`uc2_send_emsgsize_total == 0` and `uc2_probe_sent_total` expected to climb; the
+envelope-map brief's soak plateau, which decides only whether the runbook
+*recommends* jumbo; both `force_jumbo_frames` refusals inside the 30 s window;
+and two reported-no-bar cost rows), every result cell reading UNRUN, in
+[the gate doc](benchmarks/uc2-jumbo-frame-discovery-gate-TEMPLATE.md). It is
+renamed to a dated filename when a run adjudicates it.
+
+### The monotonic log clock
 
 Requested by the maintainer 2026-09-08 ("a fast, monotonic, wall-clock-anchored
-ns counter, that works both on Arm in Intel"); not a ranked `docs/BACKLOG.md`
-item. Spec
-[`docs/superpowers/specs/2026-09-08-uc2-monotonic-log-clock-design.md`](superpowers/specs/2026-09-08-uc2-monotonic-log-clock-design.md).
-Baseline: local `main` / worktree `claude-2` at the tagged `v2.11.0` (wire
-`0.7.0`, cnc `3.1`).
+ns counter, that works both on Arm in Intel").
 
-### What changed
+**What changed.**
 
 `pass_clock()` (`uc_node/src/node.rs:3297`) no longer reads
 `SystemTime::now()`. It reads a private module, `uc_node::log_clock`, whose
@@ -43,15 +261,69 @@ only the leader's clock ever reaches the log — a follower still writes
 frames verbatim and stamps nothing; it runs its own clock only so it is
 ready to lead.
 
-### Acceptance
-
-**Fleet A/B, unrun.** The bars are pre-committed in
+**Acceptance: fleet A/B, unrun.** The bars are pre-committed in
 [the gate doc](benchmarks/uc2-log-clock-gate-2026-09-08.md): `m14_fleet_gate.py`
 rows a/b/e, this tree vs. its pre-change parent commit, on the same rig, same
 day, after a same-source rebuild control run records that day's resolution
 (the M14b lesson — 1.12 % on 2026-09-07). No fleet run has happened yet; the
 dev-box `m12_gate --arm direct` smoke is recorded in the gate doc as smoke,
 never as a bar (CLAUDE.md's benchmarking discipline).
+
+### Fixed after the `2.11.0` tag
+
+Both fixes landed between the log clock and the jumbo work, and both are in the
+same family: a reader decoding the cnc page of a node that is (re)starting
+underneath it.
+The full analysis — the fix, the six call sites, the two halves of the torn
+window, and the boot gap found by reviewing the first fix — is written up under
+`2.11.0`, where the panic shipped as a recorded known issue:
+[Known issue at release: `CncPage::meta()` panics on a page a live writer
+re-initialised](#known-issue-at-release-cncpagemeta-panics-on-a-page-a-live-writer-re-initialised).
+In short:
+
+- **`CncPage::meta()` is replaced by a fallible `try_meta()`** (`bbfc1e9`, with
+  the crc half caught in review and fixed in `f162ccc`). The old method ended in
+  an `expect` that holds only for a page *this* process constructed; a restarting
+  node re-initialises a shared mmap underneath every attached reader, so `uc2ctl
+  status`, a client `Engine::attach`, a service attach or the gateway edge could
+  abort instead of refusing. Every call site now answers with the typed refusal it
+  would have given had the page been bad at open time. Pinned by two tests that
+  force the window deterministically through a second fd rather than waiting on
+  the ~1-in-6 race.
+- **The boot gap refuses instead of mis-configuring** (`2142fb2`). Two boot-once
+  words live outside the crc and were stored *after* the header, so an attacher
+  landing in that gap read FSM names with `services_declared == 0` — the harness
+  signature — and fixed `LagMode::Off` (unbounded, on a lockstep cluster) or a
+  one-FSM view of a multi-FSM node, for the attachment's life, with no fail-stop
+  because the `instance_id` was correct. Names with no declared set uniquely means
+  mid-boot, so both doors refuse it as `NodeBooting` ("retry"), and the node now
+  stores the lag policy **before** the declared set so a published set implies a
+  published policy. Pre-existing since `2.8.0`.
+
+**Still open, deliberately not claimed as fixed:** the three unbounded waits in
+`examples/uc_crashtest/tests/remote_lin.rs` that turned the flaky panic into a
+58-minute nightly hang on 2026-09-08 (`docs/BACKLOG.md`). Bounding them is a
+diagnosability fix, not a cure, and it is not in this release.
+
+### Release evidence
+
+**Nothing has been run on a fleet for this release, and nothing is tagged or
+published.** The table below is the shape the `2.11.0` entry's own evidence table
+has; every row that needs a run says so.
+
+| what | evidence | result |
+|---|---|---|
+| `ci.yml` (fmt gate, clippy, workspace tests, MSRV 1.89) | — | pending |
+| `docs.yml` (rustdoc, link check) | — | pending |
+| `release.yml` (build, SBOM, cosign, image) | — | pending |
+| the per-task gate the feature branches ran: `cargo fmt --all -- --check`, four `clippy` invocations, `cargo test --workspace --exclude uc_node`, and the thirteen `uc_node` suites plus its lib | last run 2026-09-12 on the jumbo plan-2 head: fmt clean, clippy clean, 83 `test result: ok` lines outside `uc_node`, and 318 lib + 13 suites green | **green locally** — a dev box, and not the whole `docs/VERIFICATION.md` surface |
+| the rest of the proof surface (`docs/VERIFICATION.md`): the lin capstones, hard-crash, Elle, loom, Lean + conformance, fuzz smoke | no whole-tree release pass yet — the release procedure's own step | pending |
+| jumbo fleet gate (rows a–f) | [`benchmarks/uc2-jumbo-frame-discovery-gate-TEMPLATE.md`](benchmarks/uc2-jumbo-frame-discovery-gate-TEMPLATE.md) | **UNRUN** — bars committed 2026-09-12, every result cell reads UNRUN; the file is renamed to a dated one when a run adjudicates it |
+| log-clock fleet A/B (`m14_fleet_gate.py` rows a/b/e) | [`benchmarks/uc2-log-clock-gate-2026-09-08.md`](benchmarks/uc2-log-clock-gate-2026-09-08.md) | **UNRUN** — bars committed 2026-09-08; the dev-box smoke in that doc is smoke, not a bar |
+| the M10 alert tier, with the two new jumbo rules | `scripts/m10_alert_fire.sh` (synthetic scenarios `mtu_discovery_stalled`, `path_below_mtu`) | **green locally** 2026-09-12, 25/25 rules fire under promtool — a local tier, not a fleet result |
+| artifact integrity (`sha256sum -c`) | — | pending |
+| artifact provenance (`cosign verify-blob`) | — | pending |
+| crates.io (13 crates, `uc_service` before `uc_node`) | — | pending |
 
 ## v2.11.0 — 2026-09-08 — FSM identity, log time, the cluster FSM, and coordinated snapshots
 

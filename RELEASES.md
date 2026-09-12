@@ -7,8 +7,43 @@ analyses, wire-version mechanics, upgrade remedies — is
 (pre-committed bars, fleet runs) are in
 [`docs/benchmarks/`](docs/benchmarks).
 
-## 2.12.0 (unreleased)
+## 2.12.0 (unreleased) — jumbo frames, and the monotonic log clock
 
+Two features on one flag day. The command payload ceiling stops being a source
+constant and becomes a **measurement of the paths between nodes**, committed
+cluster-wide; and the leader's log-time stamp moves onto a monotonic clock, so a
+backward wall-clock step no longer freezes the log's time. Wire `0.7.0` →
+`0.8.0` and cnc `3.1` → `3.2`, together: **stop every node before starting any
+node**, and delete `max_payload` from every `node.toml` first — the key is
+retired and refused by name. Step-by-step:
+[Upgrade a cluster § 2.12.0](docs/how-to/upgrade-a-cluster.md#wire--cnc-change-in-2120-jumbo-frames-080-cnc-32).
+No instance directory needs clearing. **Not tagged and not published as this is
+written.**
+
+- **Jumbo frames: the command payload ceiling is discovered from the network,
+  not configured.** Every node probes every peer up a fixed ladder of datagram
+  sizes (`RUNGS = [1408, 8832, 8960]`) with do-not-fragment set, the leader
+  commits the minimum over all pairs through the replicated `Settings` record
+  once every member has proven it, and every node moves its doors at that
+  commit — so a cluster on a cloud jumbo fabric carries **8896 B** commands
+  (8864 B with wire crypto) instead of 1344 B / 1312 B, and a cluster on an
+  ordinary 1500 B path keeps the baseline and behaves exactly as before. The
+  number is monotone and never lowers (a committed frame is a permanent
+  obligation on every future leader), `max_payload` is gone from `node.toml`,
+  the optional new `force_jumbo_frames` makes a jumbo path a startup
+  requirement, and a node that cannot carry the committed rung refuses to join
+  by name instead of replicating what it cannot ship. Seven new `/metrics`
+  series, two new alerts, and one warning per client the first time a command
+  goes above the standard 1312 B ceiling — so a 4 KB command that works on a dev
+  box's loopback (MTU 65 536) does not surprise anyone in production. A node host must now run **Linux** (or
+  Android): the do-not-fragment socket options exist for those targets only,
+  and probing without them would over-report a path, so `uc2-node` refuses to
+  start elsewhere by name.
+  → [Jumbo frames and path-MTU discovery, explained](docs/notes/uc2-jumbo-frame-discovery-explained.md) ·
+  [Run a cluster on jumbo frames](docs/how-to/jumbo-frames.md) ·
+  [Limits § hard limits](docs/reference/limits.md#hard-limits) ·
+  [Wire protocol](docs/reference/wire-protocol.md) ·
+  [spec](docs/superpowers/specs/2026-09-10-uc2-jumbo-frame-discovery-design.md)
 - **Monotonic log clock.** The leader's log-time stamp comes from
   `CLOCK_MONOTONIC` plus a sampled epoch offset: a backward NTP step slows
   the log clock (500 ppm) instead of freezing it, and the consensus pass
@@ -38,9 +73,16 @@ analyses, wire-version mechanics, upgrade remedies — is
   `ClientError::NodeBooting` — retry), and the node stores the lag policy
   BEFORE the declared set so a published set implies a published policy.
   Found by review of the `CncPage::meta()` fix; pre-existing since 2.8.0.
-- **Performance:** the fleet A/B (`m14_fleet_gate.py` rows a/b/e, this tree
-  vs its pre-change parent commit) is **pre-committed and not yet run** —
-  [the gate doc](docs/benchmarks/uc2-log-clock-gate-2026-09-08.md).
+- **Performance: two gate docs, both pre-committed, neither run.** No number in
+  this release has been measured on a fleet. The jumbo gate's six rows
+  (convergence at the top rung, a 1500 B arm that must never raise, the
+  `force_jumbo_frames` refusals, the soak plateau that decides whether the
+  runbook *recommends* jumbo, and two no-bar cost rows) are committed with
+  every result cell reading UNRUN, driver `bench-infra/scripts/jumbo_gate.py`
+  — [the jumbo gate doc](docs/benchmarks/uc2-jumbo-frame-discovery-gate-TEMPLATE.md).
+  The log clock's fleet A/B (`m14_fleet_gate.py` rows a/b/e, this tree vs its
+  pre-change parent commit) is likewise pre-committed and unrun —
+  [the log-clock gate doc](docs/benchmarks/uc2-log-clock-gate-2026-09-08.md).
 
 ## v2.11.0 — 2026-09-08 — FSM identity, log time, the cluster FSM, and coordinated snapshots
 
