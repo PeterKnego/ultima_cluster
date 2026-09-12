@@ -288,20 +288,8 @@ fn capture_stderr(child: &mut Child, tag: &'static str) -> Arc<Mutex<String>> {
     buf
 }
 
-/// Poll `child.try_wait()` up to `timeout`. `None` on timeout (still
-/// running).
-fn poll_exit(child: &mut Child, timeout: Duration) -> Option<std::process::ExitStatus> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if let Ok(Some(status)) = child.try_wait() {
-            return Some(status);
-        }
-        if Instant::now() >= deadline {
-            return None;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-}
+// `poll_exit` (poll `try_wait()` up to a timeout) moved to `common` so
+// `Reap::drop` can share it; the two call sites below use it unchanged.
 
 // ------------------------------------------------------- the choreography
 //

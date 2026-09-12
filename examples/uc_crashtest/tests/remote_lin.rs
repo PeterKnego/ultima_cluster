@@ -136,6 +136,19 @@ const LOAD: Duration = Duration::from_secs(20);
 const THROTTLE: Duration = Duration::from_millis(40);
 /// How often the leader's node+service are SIGKILLed and respawned.
 const CHAOS_PERIOD: Duration = Duration::from_secs(3);
+/// How long a worker may take to return once `stop` is set. A worker checks
+/// the flag once per op, and one op is bounded by the remote client's 15 s
+/// `request_timeout` plus a 2 s `connect_timeout` per member on a
+/// reconnect (three members), plus the `THROTTLE` — under 25 s by
+/// construction. Ninety seconds is more than three of those, so a worker
+/// still running at the deadline is wedged inside the client, not slow.
+/// Before this bound the join was the first of the three places a
+/// 60-minute nightly cancellation could live (`docs/BACKLOG.md`).
+const WORKER_JOIN_BUDGET: Duration = Duration::from_secs(90);
+/// How long the chaos thread may take to return once `stop` is set. Its
+/// longest step is `kill_and_restart`'s 15 s `await_fresh_instance`, plus a
+/// `SUPERVISE_TICK`; sixty seconds is four of those.
+const CHAOS_JOIN_BUDGET: Duration = Duration::from_secs(60);
 /// How often the gateway supervisor looks for an exited edge. Must be well
 /// under `CHAOS_PERIOD` — a faulted edge is a gateway that has to come back
 /// before the next kill, not after it.
@@ -1096,17 +1109,16 @@ fn remote_lin_once(seed: u64, envelope: bool) {
     std::thread::sleep(LOAD);
     stop.store(true, Ordering::Relaxed);
 
+    // Bounded joins (backlog, 2026-09-08): a worker or the chaos thread that
+    // does not come back after `stop` fails HERE, naming itself, instead of
+    // holding the binary until the nightly job's 60-minute cancellation.
+    // The budgets are derived at the constants; each is several times the
+    // longest single blocking step inside the thread it bounds.
     let mut outs = Vec::with_capacity(WORKERS as usize);
-    for h in handles {
-        match h.join() {
-            Ok(o) => outs.push(o),
-            Err(e) => std::panic::resume_unwind(e),
-        }
+    for (w, h) in handles.into_iter().enumerate() {
+        outs.push(join_within(h, &format!("worker {w}"), WORKER_JOIN_BUDGET));
     }
-    let report = match chaos.join() {
-        Ok(r) => r,
-        Err(e) => std::panic::resume_unwind(e),
-    };
+    let report = join_within(chaos, "chaos thread", CHAOS_JOIN_BUDGET);
 
     // --- 5. Let the cluster settle, with the supervisor still running: the
     // last kill may have been moments ago, and the final read below needs a

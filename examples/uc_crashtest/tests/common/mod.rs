@@ -180,10 +180,70 @@ pub fn assert_crypto_epoch_active(instance_dir: &Path, timeout: Duration) {
 /// hard-crash-then-restart the fault loop wants.
 pub struct Reap(pub Child);
 
+/// How long `Reap::drop` waits for a SIGKILLed child to be reapable. A
+/// killed process is reapable as soon as the kernel has torn it down —
+/// milliseconds, normally — and the only thing that can hold it past that is
+/// an uninterruptible kernel-side sleep (a `D`-state wait on I/O). Thirty
+/// seconds is far past any such stall this harness has seen; past it, a
+/// `wait()` that has not returned is a wait that will not return, and the
+/// drop reports the pid and abandons the zombie rather than holding the test
+/// binary — and with it a nightly job — to its 60-minute cancellation.
+pub const REAP_TIMEOUT: Duration = Duration::from_secs(30);
+
 impl Drop for Reap {
     fn drop(&mut self) {
         let _ = self.0.kill();
-        let _ = self.0.wait();
+        if poll_exit(&mut self.0, REAP_TIMEOUT).is_none() {
+            eprintln!(
+                "[common] child pid {} did not become reapable within {:?} after SIGKILL — \
+                 abandoning it unreaped (a kernel-side stall, not a test defect; the test \
+                 binary's exit reaps it)",
+                self.0.id(),
+                REAP_TIMEOUT
+            );
+        }
+    }
+}
+
+/// Poll `child.try_wait()` up to `timeout`. `None` on timeout (still
+/// running). Never blocks in `wait()`, so it cannot deadlock behind a full
+/// stdio pipe or a kernel-side stall — the same reason `enospc.rs` used it
+/// for the fail-stop assertions, now shared with `Reap::drop`.
+pub fn poll_exit(child: &mut Child, timeout: Duration) -> Option<std::process::ExitStatus> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Ok(Some(status)) = child.try_wait() {
+            return Some(status);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// `JoinHandle::join` with a deadline: returns the thread's value, re-raises
+/// its panic, or panics naming `label` once `timeout` has passed with the
+/// thread still running. The thread is abandoned in that case (there is no
+/// portable way to cancel it), which is fine — the panic ends the test and
+/// the process exit ends the thread. What matters is that the failure has a
+/// LOCATION and a label, where an unbounded `join()` had neither: the
+/// 2026-09-08 nightly spent its whole 60-minute budget inside one and was
+/// cancelled, taking every other job's evidence with it.
+pub fn join_within<T>(handle: std::thread::JoinHandle<T>, label: &str, timeout: Duration) -> T {
+    let started = Instant::now();
+    while !handle.is_finished() {
+        assert!(
+            started.elapsed() < timeout,
+            "{label} did not finish within {timeout:?} of being asked to stop — a wait \
+             inside it is unbounded; failing here with a location instead of letting the \
+             job's timeout cancel the whole run"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    match handle.join() {
+        Ok(v) => v,
+        Err(e) => std::panic::resume_unwind(e),
     }
 }
 
@@ -490,5 +550,65 @@ pub fn read_until_ok(client: &Client, deadline: Instant) -> Option<u64> {
             }
             Err(e) => panic!("read failed: {e}"),
         }
+    }
+}
+
+/// The bounded waits (backlog item "Bound the three unbounded waits in
+/// `remote_lin.rs`", 2026-09-08): every one of these must FAIL WITH A
+/// LOCATION rather than hold a nightly job to its 60-minute cancellation.
+#[cfg(test)]
+mod bounded_wait_tests {
+    use super::*;
+
+    #[test]
+    fn join_within_returns_a_finished_threads_value() {
+        let h = std::thread::spawn(|| 7u32);
+        assert_eq!(join_within(h, "seven", Duration::from_secs(5)), 7);
+    }
+
+    #[test]
+    #[should_panic(expected = "sleeper did not finish within 100ms")]
+    fn join_within_panics_with_the_label_on_a_stuck_thread() {
+        let h = std::thread::spawn(|| std::thread::sleep(Duration::from_secs(3)));
+        join_within(h, "sleeper", Duration::from_millis(100));
+    }
+
+    #[test]
+    #[should_panic(expected = "the thread's own panic")]
+    fn join_within_propagates_the_threads_panic() {
+        let h = std::thread::spawn(|| panic!("the thread's own panic"));
+        join_within(h, "panicker", Duration::from_secs(5));
+    }
+
+    #[test]
+    fn a_reap_of_a_live_child_returns_promptly() {
+        let child = Command::new("sleep")
+            .arg("60")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn sleep");
+        let started = Instant::now();
+        drop(Reap(child));
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "SIGKILL + bounded reap took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn poll_exit_reports_an_exited_child_and_times_out_on_a_live_one() {
+        let mut done = Command::new("true").spawn().expect("spawn true");
+        assert!(poll_exit(&mut done, Duration::from_secs(5)).is_some());
+        let mut live = Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn sleep");
+        let started = Instant::now();
+        assert!(poll_exit(&mut live, Duration::from_millis(200)).is_none());
+        assert!(started.elapsed() < Duration::from_secs(2));
+        drop(Reap(live));
     }
 }

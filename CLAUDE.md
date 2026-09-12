@@ -92,11 +92,11 @@ rate-limit note is now measured on both runs: crates.io limits **new crate
 names** hard and new *versions* barely at all, so `2.9.0`'s twelve new
 names took 62 minutes and `2.10.0`'s one took 59 seconds.)
 
-Next up, now that `2.11.0` is tagged and published: (1) bound the three
-unbounded waits in `examples/uc_crashtest/tests/remote_lin.rs` that turned a
-flaky failure into a 58-minute nightly hang on 2026-09-08 — the open half of
-`docs/BACKLOG.md`'s newest item, whose other half (`CncPage::meta()`) is
-fixed; (2) **run the two `2.12.0` fleet gates and cut the release** — the
+Next up, now that `2.11.0` is tagged and published: (1) ~~bound the three
+unbounded waits in `examples/uc_crashtest/tests/remote_lin.rs`~~ — DONE
+2026-09-12 (`common::join_within`, a 30 s `Reap::drop`; the 58-minute hang of
+2026-09-08 is still unexplained, it just fails with a name now); (2) **run the
+two `2.12.0` fleet gates and cut the release** — the
 jumbo gate's six rows (`bench-infra/scripts/jumbo_gate.py`; rows a/b/d need a
 fleet whose interface MTU ansible can force between 9001 and 1500, row c is
 the soak that decides whether the runbook *recommends* jumbo, rows e/f carry

@@ -82,6 +82,13 @@ written.**
   `ClientError::NodeBooting` — retry), and the node stores the lag policy
   BEFORE the declared set so a published set implies a published policy.
   Found by review of the `CncPage::meta()` fix; pre-existing since 2.8.0.
+- **Fixed: the multi-process crash tests can no longer hang a nightly for an
+  hour.** Three waits in the remote lincheck capstone had no deadline (the
+  worker and chaos thread joins, and the child reap every crash suite
+  shares), which is how a flaky failure became a 58-minute cancelled run on
+  2026-09-08. Each is bounded now and fails naming the thread or process
+  that did not return. Diagnosability only: the hang's cause is still
+  unexplained. [Engineering record](docs/releases.md#2120-unreleased--jumbo-frames-and-the-monotonic-log-clock).
 - **Performance: two gate docs, both pre-committed, neither run.** No number in
   this release has been measured on a fleet. The jumbo gate's six rows
   (convergence at the top rung, a 1500 B arm that must never raise, the

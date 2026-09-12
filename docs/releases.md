@@ -343,10 +343,16 @@ In short:
   stores the lag policy **before** the declared set so a published set implies a
   published policy. Pre-existing since `2.8.0`.
 
-**Still open, deliberately not claimed as fixed:** the three unbounded waits in
-`examples/uc_crashtest/tests/remote_lin.rs` that turned the flaky panic into a
-58-minute nightly hang on 2026-09-08 (`docs/BACKLOG.md`). Bounding them is a
-diagnosability fix, not a cure, and it is not in this release.
+**The three unbounded waits in `examples/uc_crashtest/tests/remote_lin.rs`
+that turned the flaky panic into a 58-minute nightly hang on 2026-09-08 are
+BOUNDED in this release** (2026-09-12, `docs/BACKLOG.md`'s first entry): the
+worker and chaos joins through `common::join_within` (90 s / 60 s after
+`stop`, panicking with the thread's label), and every crashtest suite's
+`Reap::drop` through a 30 s `poll_exit` that reports the pid and abandons a
+child that never becomes reapable instead of blocking in `wait()`. This is a
+diagnosability fix, not a cure: the hang's cause is still unexplained, and the
+next occurrence now fails with a name and a location instead of cancelling
+the whole nightly.
 
 ### Release evidence
 
@@ -1424,8 +1430,9 @@ set and a harness page. Pre-existing since M14a (`2.8.0`).
 
 **Still unexplained, and deliberately not claimed as fixed by the above:** the
 58-minute HANG. This panic explains the failure, not a stall — every wait in
-the test body is deadlined (30 s settle, 60 s final read). Three waits are NOT
-bounded and are the only places a 60-minute stall can live: the worker
+the test body is deadlined (30 s settle, 60 s final read). Three waits were
+NOT bounded (they are since 2026-09-12 — see the `2.12.0` section's fixed-bugs
+list) and were the only places a 60-minute stall could live: the worker
 `join()`, the chaos `join()`, and `Reap::drop`'s `kill(); wait()`, which
 returns immediately for a SIGKILLed child unless it is in uninterruptible
 sleep. Bounding those would make the next occurrence fail fast WITH a location

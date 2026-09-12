@@ -1,20 +1,33 @@
 # Backlog — candidate directions after M14
 
-## Bound the three unbounded waits in `remote_lin.rs`
+## Bound the three unbounded waits in `remote_lin.rs` — DONE for `2.12.0`
 
 **Added 2026-09-08**, from the fleet-gate follow-up (see `docs/releases.md`,
-"Known issue at release"). The worker `join()`, the chaos `join()` and
-`Reap::drop`'s `kill(); wait()` in `examples/uc_crashtest/tests/remote_lin.rs`
-are the only waits in that test body without a deadline, and so the only places
-a 60-minute stall can live. They are why the 2026-09-08 nightly spent its whole
-budget and was cancelled instead of failing fast — that run took every other
-nightly job's evidence down with it. Bounding them is a **diagnosability** fix:
-the next occurrence fails with a location instead of a cancellation.
+"Known issue at release"); **taken up and bounded 2026-09-12.** The worker
+`join()`, the chaos `join()` and `Reap::drop`'s `kill(); wait()` in
+`examples/uc_crashtest/tests/remote_lin.rs` were the only waits in that test
+body without a deadline, and so the only places a 60-minute stall could live.
+They are why the 2026-09-08 nightly spent its whole budget and was cancelled
+instead of failing fast — that run took every other nightly job's evidence
+down with it. Bounding them is a **diagnosability** fix: the next occurrence
+fails with a location instead of a cancellation.
+
+As built: `common::join_within(handle, label, timeout)` polls
+`JoinHandle::is_finished` and panics naming the label at the deadline (the
+thread is abandoned; the panic ends the test and the process exit ends the
+thread) — workers get 90 s and the chaos thread 60 s after `stop`, each
+several times its longest single blocking step, derived at the constants
+`WORKER_JOIN_BUDGET` / `CHAOS_JOIN_BUDGET`. `Reap::drop` now uses the
+`poll_exit` idiom that `enospc.rs` already had (moved to `common`) with a
+30 s `REAP_TIMEOUT`, then reports the pid and abandons the child rather than
+blocking in `wait()`. Every crashtest suite shares `Reap`, so all of them get
+the bounded reap. Five tests in `common` pin the helpers.
 
 This was the second half of the `CncPage::meta()` item; the first half is
 fixed — see the [Shipped](#shipped-since-this-list-was-written) section's
-first entry. Fixing the panic does **not** explain the hang, and was never claimed
-to — that is exactly why this half stays open.
+first entry. **Neither half explains the hang**, and neither claims to: this
+one makes the next occurrence fail with a name and a location, which is what
+it takes to find the cause.
 
 *Written 2026-09-01 against `v2.10.0`. Status: a ranked list of options, not
 a plan. Nothing here is scheduled; the maintainer picks. Every item cites the
@@ -335,7 +348,8 @@ without a new argument:
 Kept per this page's preamble — an item that is taken up gets its line updated
 rather than deleted, so the reasoning stays re-checkable. The last two are in
 `2.11.0` and the first in `2.12.0`; what remains open from them is item 2
-above, plus the `remote_lin.rs` waits at the top of this page.
+above. The `remote_lin.rs` waits at the top of this page are bounded as of
+2026-09-12 (the hang itself remains unexplained).
 
 ### `CncPage::meta()` must not panic on a page a live writer re-initialised — FIXED for `2.12.0`
 
