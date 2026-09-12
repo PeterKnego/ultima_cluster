@@ -37,9 +37,12 @@ Plan 2
 ([`2026-09-12-uc2-jumbo-frame-discovery-plan2.md`](../superpowers/plans/2026-09-12-uc2-jumbo-frame-discovery-plan2.md))
 adds `force_jumbo_frames` (a startup fail-stop gate), the join-time
 `path_below_committed_mtu` refusal, the developer notification, the seven
-`uc2_*` metric series, two alerts, a fuzz target, and — this task — the
-pre-committed gate itself. Plain-language explainer: none yet (Task 6/7);
-until then this section and the spec are the source.
+`uc2_*` metric series (eight, after the review added
+`uc2_jumbo_gate_pending`), two alerts, a fuzz target, and — this task — the
+pre-committed gate itself. Plain-language explainer: [Jumbo frames and
+path-MTU discovery,
+explained](../notes/uc2-jumbo-frame-discovery-explained.md); the spec and
+this section are the normative source for the numbers.
 
 **Two facts plan 1 learned that this gate must respect, carried forward
 from the spec's own "Errata (plan 1, as built)" section:**

@@ -591,9 +591,20 @@ Written before the tag, per the release rule:
      fail-stop healthy nodes.
    - **Silence never refuses.** A peer that has answered nothing (down, slow,
      still replaying) says nothing about its path, so it only **holds
-     serving** — `can_serve` false, `/readyz` 503 — indefinitely if need be.
+     serving** — `can_serve` false, `/readyz` 503.
      A node restarting into a degraded cluster keeps replicating and voting
-     instead of crash-looping under `systemd Restart=on-failure`.
+     instead of crash-looping under `systemd Restart=on-failure`. That hold is
+     **bounded by `JUMBO_GATE_WINDOW`** (30 s, the same constant the force gate
+     uses): if the window passes with no peer ever proven narrow, the join gate
+     **passes unproven** — it serves and emits one `Warn`
+     `jumbo_join_gate_passed_unproven` naming the silent members and the
+     committed rung. An unbounded hold made a rolling restart of a 3-voter
+     cluster with one dead host an outage (either survivor came back `/readyz`
+     503 until the dead host returned) on a cluster that still had quorum;
+     silence is no evidence, the hazard the pass defers is the runtime
+     degradation `Uc2PathBelowMtu` already covers, and a returning member runs
+     its own `Joining` check, so every live pair is tested from at least one
+     side. A PROVEN-narrow peer still refuses immediately, with no window.
    - **`force_jumbo_frames` keeps its 30 s window** (`JUMBO_GATE_WINDOW`) and
      fail-stops as specified; what changed is that `/readyz` answers 503 while
      **any** gate is pending, in **any** role, rather than only for a leader

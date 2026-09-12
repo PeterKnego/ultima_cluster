@@ -318,10 +318,16 @@ groups:
     # `uc2_probe_min_mtu_bytes` is its own verified minimum over its peers and
     # `uc2_datagram_mtu_bytes` is the rung the leader committed, so a gap that
     # persists means some OTHER member is holding discovery back — silent, or
-    # on a narrower path. Not an error: a cluster that legitimately cannot do
-    # better than the baseline never raises this, because a narrow peer pins
-    # every node's own minimum too (errata 1). The 60 s window clears the
-    # ordinary case, where the gap exists for the 1-3 s discovery takes.
+    # on a narrower path. Not an error. Whether a cluster that cannot beat the
+    # baseline raises this depends on WHERE the narrowness is: a narrow MEMBER
+    # (one host's interface MTU) never raises it, because that member is a peer
+    # of every node and pins every node's own minimum too; a single narrow PATH
+    # between two members raises it permanently on every node NOT on that path
+    # (A-B narrow, A-C and B-C jumbo -> C has proven the jumbo rung while the
+    # committed rung stays at the baseline, on a cluster that is at its correct
+    # rung). Fix the link, or silence this rule for that node. The 60 s window
+    # clears the ordinary case, where the gap exists for the 1-3 s discovery
+    # takes.
     expr: uc2_probe_min_mtu_bytes > uc2_datagram_mtu_bytes
     for: 60s
     labels:

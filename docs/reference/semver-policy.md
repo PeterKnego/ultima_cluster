@@ -104,6 +104,26 @@ Consistency, SubmitError}`) are in the same position and are covered too.
   `timers_rearmed` was retired before shipping) and two new `uc2ctl status` fields
   (`log_time_ns=`,
   per-row `timers_pending=`) follow the same "added, not renamed" convention.
+- **Jumbo-frame discovery (2.12 pending) adds to the two operator-facing
+  line formats, additively.** `audit.jsonl` gains a **13th key**, `source`
+  (`"operator"` on every admin request, `"discovery"` on the `settings_apply`
+  a node writes itself when the committed rung rises), appended LAST so every
+  byte before it is unchanged. The audit line's key ORDER is a contract
+  (`uc_node::audit`, which shares one formatter with `uc_node::obs::log`), and
+  the rule that makes a 13th key a minor change rather than a breaking one is:
+  **keys are appended, never reordered, renamed or removed**, and a reader
+  looks fields up by name — `uc2ctl audit` and the test readers do. `uc_node`
+  is not in the promised-surface table, so this is not semver-governed API, but
+  the audit file is an operator interface in practice and is held to that rule,
+  exactly as the metric series contract is ("families are added, not
+  renamed"). New metric families (`uc2_datagram_mtu_bytes`,
+  `uc2_payload_ceiling_bytes`, `uc2_probe_min_mtu_bytes`,
+  `uc2_probe_sent_total`, `uc2_probe_acked_total`, `uc2_send_emsgsize_total`,
+  `uc2_commands_over_standard_total`, `uc2_jumbo_gate_pending`), two alert
+  rules and the jumbo `[log]` records follow the same convention. The
+  `node.toml` side is not additive — `max_payload` is **refused by name** and
+  `force_jumbo_frames` is the optional new key — and rides the flag day
+  described below.
 - **The monotonic log clock (2.12 pending) adds one metric family and one
   `[log]` record, both additive**: the `uc2_log_clock_smear_ns` gauge
   (per-node, not leader-gated — ns of a backward wall-clock step still being

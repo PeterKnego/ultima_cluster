@@ -15,6 +15,29 @@ Why it works this way, and why the value is cluster-wide and monotone:
 explained](../notes/uc2-jumbo-frame-discovery-explained.md). This page is the
 task.
 
+## Before you start: this is a one-way door
+
+The committed rung is **monotone** and there is no opt-out — no config key
+lowers it, and no operator command un-commits it. On a fabric that carries
+jumbo frames, the upgrade therefore commits the cluster to 8832/8960 B as soon
+as two members have probed each other, with no further decision from you.
+
+From that moment, **no member on a narrower path can ever join**. A node whose
+path to some member answers below the committed rung fail-stops with
+`path_below_committed_mtu` ([§6](#6-when-a-node-refuses-to-join)) — by design:
+the log already holds frames it cannot receive. A cross-region learner behind
+1500 B peering, a DR site over a tunnel, a laptop on a VPN — none of them can
+be added later, for the life of the cluster, and the only remedy is a new
+cluster.
+
+If you know you will need a narrower member eventually, **keep one narrow path
+in the cluster from the start** — that is the only opt-out the design offers.
+The minimum over all pairs is what gets committed, so one member on a 1500 B
+path holds the whole cluster at the baseline
+([§4](#4-when-the-cluster-stays-at-the-baseline)) and every future member can
+still join. There is no way to get a jumbo ceiling *and* keep narrow members
+admissible.
+
 ## Before you start: a node runs on Linux
 
 Discovery depends on setting the do-not-fragment bit on the replication
@@ -120,6 +143,7 @@ is this node's buffer bound, not the cluster's rung.
 | `uc2_probe_sent_total` / `uc2_probe_acked_total` | flat once every peer has resolved |
 | `uc2_send_emsgsize_total` | **0**, always |
 | `uc2_commands_over_standard_total` | however many commands over 1312 B this leader has appended |
+| `uc2_jumbo_gate_pending` | **0** — `1` means this node is held by a startup gate (§5, §6) and is not serving |
 
 `uc2ctl settings show` prints the committed record including `datagram_mtu`,
 and each discovery commit is in `audit.jsonl` as a `settings_apply` with
@@ -150,9 +174,19 @@ Two readings are normal and must not be chased:
 
 `Uc2MtuDiscoveryStalled` (`uc2_probe_min_mtu_bytes > uc2_datagram_mtu_bytes`
 for 60 s) is the alert for "this node has proven more than the cluster has
-committed" — i.e. some *other* member is holding discovery back. A cluster
-that legitimately cannot beat the baseline never fires it, because a narrow
-peer pins every node's own minimum too.
+committed" — i.e. some *other* member is holding discovery back. Whether a
+cluster that cannot beat the baseline fires it depends on **where** the
+narrowness is:
+
+- **A narrow member** — one host whose interface MTU is low — never fires it.
+  That member is a peer of every other node, so it pins every node's own
+  minimum too and the two gauges agree everywhere.
+- **A narrow path between two members** does fire it, permanently, on every
+  node that is not on that path. A–B narrow (a bad switch port, a tunnel, one
+  peering leg) with A–C and B–C jumbo leaves C's own minimum at the jumbo rung
+  while the committed rung stays at the baseline — a cluster at its correct
+  rung, with C alerting every 60 s forever. Fix the link, or silence the rule
+  for that node.
 
 ## 5. Require a jumbo path at startup
 
@@ -187,8 +221,9 @@ Two caveats:
   passing solo node as proof of a jumbo fabric.
 - A forced **leader** that is still gated will trip `Uc2LeaderNotServing`,
   whose summary names both causes (an uncommitted `NewTerm` frame, or a
-  pending jumbo gate). Check `uc2_datagram_mtu_bytes` /
-  `uc2_probe_min_mtu_bytes` before assuming the former.
+  pending jumbo gate). `uc2_jumbo_gate_pending = 1` tells them apart
+  outright; `uc2_datagram_mtu_bytes` / `uc2_probe_min_mtu_bytes` say how far
+  discovery got.
 
 ## 6. When a node refuses to join
 
@@ -210,11 +245,27 @@ Three things to know about it:
   node cannot receive; nothing in its instance directory is wrong. Fix the
   MTU — on the peer's path *or on this host's own interface*, which the node
   cannot distinguish, hence the two-cause wording — and restart.
-- **Silence never refuses.** A member that is down, slow, or still replaying
-  answers nothing, and nothing is known about its path, so it is never
-  "narrow". The gate then only *holds serving*, indefinitely if need be: the
-  node keeps replicating and voting, so restarting one survivor of a degraded
-  cluster does not crash-loop. There is no join window.
+- **Silence never refuses, and the hold it causes is bounded at 30 s.** A
+  member that is down, slow, or still replaying answers nothing, and nothing is
+  known about its path, so it is never "narrow". The gate only *holds serving*
+  — the node keeps replicating and voting, so restarting one survivor of a
+  degraded cluster does not crash-loop. If 30 s (`JUMBO_GATE_WINDOW`, the same
+  constant the force gate uses) passes with no peer ever proving narrow, the
+  gate **passes unproven**: the node starts serving and logs one warn record,
+  `jumbo_join_gate_passed_unproven`, naming the silent member ids and the
+  committed rung. Silence is no evidence, and a node that held on it forever
+  would turn a rolling restart into an outage — on 3 voters with one host down,
+  restarting either survivor would leave it `/readyz` 503 until the dead host
+  came back, on a cluster that still has quorum. What the pass defers is a
+  *runtime* degradation, which `Uc2PathBelowMtu` reports on a serving node; and
+  a returning member runs its own join check, so every live pair is still
+  tested from at least one side. A healthy restart clears the gate in ~1 s, so
+  the window is invisible in the normal case. A PROVEN-narrow peer still
+  refuses immediately, with no window at all.
+- **A dead member does not have to be waited out.** `uc2ctl remove <dead-id>`
+  is accepted while a gate is pending — admin handling keys on the leader flag,
+  not on the gate — and removing the member clears it at once, because
+  discovery's minimum is over the *configured* member set.
 - **A healthy restart clears it in about a second.** A peer still inside its
   fast probe ladder is mid-discovery, not degraded; only a peer that has spent
   that ladder (five attempts, ~5 s) and still answers low is refused.
@@ -286,7 +337,7 @@ this deployment now depends on jumbo-frame support.
 - [Upgrade a cluster](upgrade-a-cluster.md#wire--cnc-change-in-2120-jumbo-frames-080-cnc-32)
   — the `2.12.0` flag day: no wipe, delete `max_payload`, the DF behaviour
   change.
-- [Monitor a cluster](monitor-a-cluster.md) — where the seven series and the
+- [Monitor a cluster](monitor-a-cluster.md) — where the eight series and the
   two alert rules sit among the rest.
 - [Limits](../reference/limits.md#hard-limits) — the ceiling rows as a ladder.
 - [Threat model](../security/threat-model.md) — why a jumbo cluster on an

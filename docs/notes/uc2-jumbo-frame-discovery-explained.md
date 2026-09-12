@@ -168,6 +168,18 @@ compare), so **`force_jumbo_frames` passes immediately on a solo node** —
 there is no peer whose path could be narrow. The flag cannot deliver its
 promise on a one-node cluster; it is a multi-node guarantee.
 
+**A jumbo commit is a one-way door for future members, too.** Nobody chooses
+it and nothing un-chooses it: on a fabric that carries jumbo frames the cluster
+commits as soon as two members have probed each other, and from that moment a
+node whose path to some member is narrower cannot ever join — it fail-stops
+`path_below_committed_mtu`, by design, because the log already holds frames it
+cannot receive. A cross-region learner over 1500 B peering, a DR site behind a
+tunnel: not addable later, for the life of the cluster, with a new cluster as
+the only remedy. The only opt-out the design offers is to keep one narrow path
+in the cluster from the start, which holds the whole cluster at the baseline
+(the minimum is over all pairs) and keeps every future member admissible. There
+is no way to have both.
+
 **A rung never comes back down.** There is no re-probe-and-lower path. A path
 that degrades below the committed rung is an *outage*, not a new ceiling:
 `uc2_send_emsgsize_total` climbs and `Uc2PathBelowMtu` fires, and a node
@@ -239,19 +251,32 @@ must not pretend otherwise. They differ in who asks for them and in what
 |---|---|---|
 | who turns it on | the operator, per host (env: `UC2_FORCE_JUMBO_FRAMES`) | nobody — it arms itself whenever a node learns of a committed rung above the baseline it has not proven |
 | what it demands | every peer proves `JUMBO_MIN_RUNG = 8832` | this node's own minimum reaches the **committed** rung |
-| while pending | holds `can_serve` false and answers `/readyz` with 503 — in **any** role, not just leader | the same |
+| while pending | holds `can_serve` false and answers `/readyz` with 503 — in **any** role, not just leader; a held LEADER also appends no client command, fires no timer and confirms no linearizable read, so the hold is not merely advisory | the same; `uc2_jumbo_gate_pending` is `1` |
 | on proof | `jumbo_gate_passed`, serving begins | the same |
-| on failure | after `JUMBO_GATE_WINDOW = 30 s`, fail-stop: `jumbo_path_too_narrow` (a peer answered below the rung) or `jumbo_peer_silent` (no peer answer at all — worded as the liveness fact it is) | fail-stop `path_below_committed_mtu`, naming the peer and both rungs |
+| on failure | after `JUMBO_GATE_WINDOW = 30 s`, fail-stop: `jumbo_path_too_narrow` (a peer answered below the rung) or `jumbo_peer_silent` (no peer answer at all — worded as the liveness fact it is) | fail-stop `path_below_committed_mtu` the moment a peer is PROVEN narrow, naming the peer and both rungs — no window |
+| on nothing proven either way | (the silent case is a failure above) | at the same 30 s window it **passes unproven** and warns `jumbo_join_gate_passed_unproven`: silence is no evidence, and an unbounded hold made a rolling restart an outage |
 
-**There is no join window, and silence never refuses.** The join gate
-fail-stops only on a peer that *answered* below the committed rung **and** has
-spent its fast probe ladder. Both halves matter:
+**The join gate's refusal has no window, and silence never refuses.** The join
+gate fail-stops only on a peer that *answered* below the committed rung **and**
+has spent its fast probe ladder. Both halves matter:
 
 - `verified == 0` is silence — a member that is down, slow, or still
   replaying a cold start. Nothing is known about its path, so it is never
-  "narrow". Silence only holds serving, indefinitely if need be; the node
-  keeps replicating and voting. A three-node cluster that tolerates one dead
-  member today can still restart a survivor.
+  "narrow". Silence only holds serving; the node keeps replicating and voting,
+  so a three-node cluster that tolerates one dead member today can still
+  restart a survivor. That hold is **bounded at `JUMBO_GATE_WINDOW` (30 s)**,
+  the same constant the force gate uses: at the deadline, with nothing ever
+  proven narrow, the gate passes *unproven* and says so once
+  (`jumbo_join_gate_passed_unproven`, warn, naming the silent members). Holding
+  forever was the first iteration of this fix and it was wrong in the other
+  direction — `own_min_rung` is a minimum over *all* configured peers, so one
+  dead host left every restarted survivor at `/readyz` 503 until it came back,
+  which makes a rolling restart an outage on a cluster that still has quorum.
+  Silence is no evidence either way; what the pass defers is the runtime
+  degradation `Uc2PathBelowMtu` already reports, and a returning member runs
+  its own join check, so every live pair is still tested from at least one
+  side. `uc2ctl remove <dead-id>` clears a pending gate immediately — admin
+  handling keys on the leader flag, not on the gate.
 - `verified` *below* the committed rung is also the ordinary **mid-ladder**
   state of a perfectly healthy peer: the ladder starts at 1408 and
   `verified` advances ack by ack, so `verified == 1408` with the jumbo rungs

@@ -657,7 +657,18 @@ over-report a path, so `uc2-node` refuses to start anywhere else, by name
 not fleets: a macOS or BSD machine can no longer run a node, though the client
 and service crates are unaffected.
 
-**After the flag day**, nothing is required of the operator. Each node probes
+**After the flag day**, nothing is required of the operator — but one decision
+is made for you, irreversibly: on a fabric that carries jumbo frames, the
+cluster commits a jumbo rung as soon as two members have probed each other, the
+rung is monotone with no opt-out, and from then on **no member whose path is
+narrower can ever join** (`path_below_committed_mtu`, by design) — so a
+cross-region learner over 1500 B peering becomes impossible for the life of the
+cluster, with a new cluster as the only remedy. If you will need a narrower
+member later, keep one narrow path in the cluster from the start; that is the
+only opt-out, and [Run a cluster on jumbo
+frames](jumbo-frames.md#before-you-start-this-is-a-one-way-door) explains it.
+
+Each node probes
 its peers on boot and on every membership change; the leader commits the
 minimum once every member has answered, and every node applies it at commit.
 Verify with `uc2ctl status`'s `ceiling:` line and the

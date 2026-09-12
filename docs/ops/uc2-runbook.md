@@ -248,9 +248,14 @@ verify rather than a build:
   uc2_datagram_mtu_bytes` for 60 s). This node proved more than the cluster
   committed, so some *other* member is holding discovery back: read
   `uc2_probe_min_mtu_bytes` on every node — `1408` names the node whose path to
-  a peer is narrow, `0` names one with a peer that has not answered at all. A
-  cluster that legitimately cannot beat the baseline never fires this, because
-  a narrow peer pins every node's own minimum too.
+  a peer is narrow, `0` names one with a peer that has not answered at all.
+  Whether a cluster that cannot beat the baseline fires this depends on where
+  the narrowness is: a narrow **member** (one host's interface MTU) never fires
+  it, because it pins every node's own minimum too; a single narrow **path**
+  between two members fires it permanently on every node NOT on that path (A–B
+  narrow, A–C and B–C jumbo → C has proven the jumbo rung while the committed
+  rung stays at the baseline, on a cluster that is at its correct rung). Fix the
+  link, or silence the rule for that node.
 - **A node refuses to start with `path_below_committed_mtu`, or will not
   serve.** The cluster has committed a jumbo rung and this node's path to some
   member answered below it — either that path is narrow or **this host's own
@@ -259,7 +264,18 @@ verify rather than a build:
   Fix the MTU and restart: the remedy is never a wipe, because nothing in the
   instance directory is wrong. A member that answers *nothing* (down, slow,
   replaying) never refuses anything — the node keeps replicating and voting and
-  simply holds serving (`/readyz` 503) until some path proves the rung. Under
+  simply holds serving (`/readyz` 503) until some path proves the rung, and that
+  hold is **bounded at 30 s**: with no peer ever proving narrow, the gate then
+  **passes unproven**, the node serves, and it logs one warn record
+  `jumbo_join_gate_passed_unproven` naming the silent member ids. So a **rolling
+  restart on a cluster with one dead host is not an outage**: each restarted
+  survivor holds for at most 30 s (≈1 s when the paths are healthy) and then
+  serves, rather than waiting for the dead member to return. To clear it at
+  once, `uc2ctl remove <dead-id>` is accepted while a gate is pending — admin
+  handling keys on the leader flag, not on the gate — and removing the member
+  takes it out of the minimum. `uc2_jumbo_gate_pending` is `1` on a held node,
+  which is what separates this from `Uc2LeaderNotServing`'s other cause (an
+  uncommitted `NewTerm`). Under
   `force_jumbo_frames` the same gate fail-stops after 30 s instead, as
   `jumbo_path_too_narrow` (a peer answered below 8832) or `jumbo_peer_silent`
   (a liveness fact, not an MTU one: start the member). Details and remedies:

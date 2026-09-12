@@ -55,7 +55,7 @@ scrape_configs:
 ```
 
 `/metrics` serves `text/plain; version=0.0.4` — standard Prometheus text
-exposition. The full series contract — 107 families — is the
+exposition. The full series contract — 108 families — is the
 `CONTRACT_SERIES` array in
 [`uc_node/src/obs/metrics.rs`](../../uc_node/src/obs/metrics.rs); a test
 pins every family in that array against what the renderer actually emits, so
@@ -420,7 +420,7 @@ agent names each one in a `snapshot_session_refused` record as it happens.
 Jumbo-frame discovery measures the datagram size every path between members
 carries and commits the minimum as a replicated setting; the task guide is
 [Run a cluster on jumbo frames](jumbo-frames.md) and the argument is
-[the explainer](../notes/uc2-jumbo-frame-discovery-explained.md). Seven
+[the explainer](../notes/uc2-jumbo-frame-discovery-explained.md). Eight
 families:
 
 | family | type | labels | meaning |
@@ -432,6 +432,7 @@ families:
 | `uc2_probe_acked_total` | counter | none | `PROBE_ACK`s received and credited |
 | `uc2_send_emsgsize_total` | counter | none | **non-probe** datagrams the kernel refused for size under do-not-fragment: a path below the committed rung. Must be `0` |
 | `uc2_commands_over_standard_total` | counter | none | frames appended above the standard 1312 B ceiling — nonzero means this deployment now depends on jumbo support. **Leader-only by construction** (only a leader appends), so read it summed across the fleet |
+| `uc2_jumbo_gate_pending` | gauge | none | `1` while a **startup gate** is pending: this node replicates and votes but does not serve (`/readyz` 503), because `force_jumbo_frames` is set and a peer has not proven the rung, or because the cluster committed a rung this node has not proven. `0` once it passes, and `0` on a node with no gate. This is the series that tells `Uc2LeaderNotServing`'s two causes apart |
 
 **Probe counters that never flatten are not a leak.** A peer is resolved only
 when this node has verified the top rung *and* that peer's own advertised
@@ -442,14 +443,25 @@ cadence forever: 2–3 datagrams per 30 s per peer. Accepted cost.
 **Two alert rules**, `Uc2MtuDiscoveryStalled` (warning, `for: 60s`, on
 `uc2_probe_min_mtu_bytes > uc2_datagram_mtu_bytes`) and `Uc2PathBelowMtu`
 (critical, on `increase(uc2_send_emsgsize_total[5m]) > 0`) — both in the table
-below. Neither fires on a cluster that legitimately cannot beat the baseline:
-a narrow peer pins every node's own minimum too, so the two gauges agree.
+below. `Uc2PathBelowMtu` does not fire on a cluster that legitimately cannot
+beat the baseline: nothing is ever sent above the committed rung.
+`Uc2MtuDiscoveryStalled` depends on *where* the narrowness is. A cluster whose
+narrow element is a **member** — one host's interface MTU — never fires it,
+because that member pins every node's own minimum too and the two gauges agree.
+A single narrow **path** between two members (a bad switch port, a tunnel, one
+peering leg) does fire it, permanently, on every node *not* on that path: A–B
+narrow with A–C and B–C jumbo leaves C's own minimum at the jumbo rung while
+the committed rung stays at the baseline. Fix the link, or silence the rule for
+that node.
 
 **Records.** `datagram_mtu_proposed` (info, leader, per raise),
 `payload_ceiling_adopted` (info, every node, when the doors move),
 `datagram_mtu_not_a_rung` (warn — a rung off the ladder arrived in an
 installed artifact and was clamped), `jumbo_join_gate_armed` (warn) /
-`jumbo_gate_passed` (info), and the three fail-stop refusals
+`jumbo_gate_passed` (info) / `jumbo_join_gate_passed_unproven` (warn — the
+join gate's 30 s hold ran out with its peers still silent, so the node serves
+without having proven the rung; the silent member ids are on the record), and
+the three fail-stop refusals
 `jumbo_path_too_narrow` / `jumbo_peer_silent` / `path_below_committed_mtu`
 (error). A client over the standard ceiling emits
 `command_over_standard_ceiling` (warn, once per client) from whichever

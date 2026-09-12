@@ -111,7 +111,9 @@ cluster has decided it cannot carry.
   committed rung above what it has proven, and fail-stops
   `path_below_committed_mtu` naming the peer and both rungs. While either gate is
   pending the node holds `can_serve` false (the in-process flag and the cnc bit)
-  and `/readyz` answers 503 in **any** role.
+  and `/readyz` answers 503 in **any** role; a held LEADER also appends no client
+  command, fires no timer and confirms no linearizable read, so the hold is not
+  merely advisory, and `uc2_jumbo_gate_pending` exports it.
 - **The clients** — `uc_client::Engine` reads the live cnc word per submit rather
   than a value captured at attach; `uc_remote` warns at `STANDARD_PAYLOAD` and
   caps its *derived* default out-ring at 4 MiB (`OUT_RING_DERIVED_CAP`, so
@@ -121,10 +123,12 @@ cluster has decided it cannot carry.
   the dev-box trap is that loopback's MTU is 65 536, so a 4 KB command works
   there and fails in production, which is why the notification fires on
   **success**.
-- **Observability** — seven new series (`uc2_datagram_mtu_bytes`,
+- **Observability** — eight new series (`uc2_datagram_mtu_bytes`,
   `uc2_payload_ceiling_bytes`, `uc2_probe_min_mtu_bytes`, `uc2_probe_sent_total`,
   `uc2_probe_acked_total`, `uc2_send_emsgsize_total`,
-  `uc2_commands_over_standard_total`), two alerts (`Uc2MtuDiscoveryStalled`
+  `uc2_commands_over_standard_total`, and `uc2_jumbo_gate_pending` — `1` while a
+  startup gate holds this node, which is what separates `Uc2LeaderNotServing`'s
+  two causes), two alerts (`Uc2MtuDiscoveryStalled`
   warning, `Uc2PathBelowMtu` critical) and a `ceiling:` line on `uc2ctl status`.
 
 **The operator-visible break: `max_payload` is retired.** A `node.toml` that
@@ -187,13 +191,22 @@ three of them are the kind of thing an operator will otherwise read as a defect:
    into the exported counter would make "discovery traffic emitted" unreadable on
    exactly the narrow path where it matters, and a refused probe is an expected
    part of the ladder there. §9's parenthetical is superseded.
-7. **The join gate has no window, and silence never refuses.** It fail-stops only
+7. **The join gate has no window on its REFUSAL, silence never refuses, and the
+   hold silence causes is bounded at 30 s.** It fail-stops only
    a peer that *answered* below the committed rung **and** has spent its fast
    ladder — `verified == 1408` with the jumbo rungs in flight is the *healthy*
    mid-ladder state, and an earlier iteration that refused on it fail-stopped
    healthy nodes into a `systemd Restart=on-failure` crash loop. A silent peer
-   only holds serving, indefinitely if need be, so a three-node cluster that
-   tolerates one dead member can still restart a survivor. One rule follows and
+   only holds serving, and only for `JUMBO_GATE_WINDOW` (30 s, the force gate's
+   constant): at the deadline, with nothing proven narrow, the gate **passes
+   unproven** and logs one warn `jumbo_join_gate_passed_unproven` naming the
+   silent members. Holding forever was the first iteration and it was wrong in
+   the other direction — `own_min_rung` is a minimum over *all* configured peers,
+   so one dead host made every survivor's restart a 503 until it returned,
+   turning a rolling restart into an outage on a cluster that still had quorum.
+   Silence is no evidence; what the pass defers is the runtime degradation
+   `Uc2PathBelowMtu` already reports, and a returning member runs its own join
+   check, so every live pair is tested from at least one side. One rule follows and
    is not in the spec: a probe the **kernel refused for size spends its attempt**
    (a proven local fact, unlike the transient "no session yet", which is
    refunded) — otherwise a host whose own interface MTU is too small would pend

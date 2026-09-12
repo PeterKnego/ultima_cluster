@@ -33,8 +33,11 @@ written.**
   obligation on every future leader), `max_payload` is gone from `node.toml`,
   the optional new `force_jumbo_frames` makes a jumbo path a startup
   requirement, and a node that cannot carry the committed rung refuses to join
-  by name instead of replicating what it cannot ship. Seven new `/metrics`
-  series, two new alerts, and one warning per client the first time a command
+  by name instead of replicating what it cannot ship. **The raise is a one-way
+  door**: the committed rung never lowers and has no opt-out, so from the first
+  jumbo commit no member on a narrower path can ever join — an operator who will
+  need one later keeps a narrow path in the cluster from the start. Eight new
+  `/metrics` series, two new alerts, and one warning per client the first time a command
   goes above the standard 1312 B ceiling — so a 4 KB command that works on a dev
   box's loopback (MTU 65 536) does not surprise anyone in production. A node host must now run **Linux** (or
   Android): the do-not-fragment socket options exist for those targets only,
