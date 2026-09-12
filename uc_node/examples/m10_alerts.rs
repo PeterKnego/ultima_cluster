@@ -71,6 +71,8 @@ const ALL_SCENARIOS: &[&str] = &[
     "snapshot_stalled",
     "standby_snapshot_stalled",
     "snapshot_set_diverged",
+    "mtu_discovery_stalled",
+    "path_below_mtu",
 ];
 
 // ------------------------------------------------------------------ CLI
@@ -201,6 +203,8 @@ fn run_scenario(name: &str, scratch_root: &Path) -> (SeriesFile, Disclosure) {
         "snapshot_stalled" => scenario_snapshot_stalled(),
         "standby_snapshot_stalled" => scenario_standby_snapshot_stalled(),
         "snapshot_set_diverged" => scenario_snapshot_set_diverged(),
+        "mtu_discovery_stalled" => scenario_mtu_discovery_stalled(),
+        "path_below_mtu" => scenario_path_below_mtu(),
         other => panic!("unknown scenario {other:?} — one of {ALL_SCENARIOS:?}"),
     }
 }
@@ -1637,6 +1641,102 @@ fn scenario_snapshot_set_diverged() -> (SeriesFile, Disclosure) {
                      set. Both positions render through the real encoder; two DISTINCT values \
                      across instances is exactly what Uc2SnapshotSetDiverged's count_values \
                      idiom detects."
+                .into(),
+        },
+    )
+}
+
+// ----------------------------------------------------------- scenario 21
+
+/// Uc2MtuDiscoveryStalled — **synthetic, disclosed**: a single synthetic
+/// `ObsSources` with one peer added to the REAL `uc_net::probe::ProbeTable`
+/// and immediately acked at the top rung, while the `ClusterView` stays at
+/// genesis (unset, so `datagram_mtu()` reads the 1408 B baseline). This node
+/// has PROVEN 8832 B over its one peer but the cluster has committed nothing
+/// above the baseline — exactly the persistent gap the rule exists to catch.
+/// Producing it for real needs a multi-node cluster mid-ladder with one
+/// member silently withholding its own advertisement (or never joining the
+/// commit rule's quorum), an order of magnitude larger than this rule's
+/// share of the harness; same synthetic-state/real-transition budget as
+/// `schedule_diverged`. The table and the exporter are both real — only the
+/// peer set and its one ack are injected.
+fn scenario_mtu_discovery_stalled() -> (SeriesFile, Disclosure) {
+    let sources = synthetic_sources(0);
+    let peer: SocketAddr = "127.0.0.1:19000".parse().unwrap();
+    sources.probe.set_peers(&[peer]);
+    // This node's probe to the peer has verified the top rung; the peer's
+    // own advertised minimum is passed back too (spec §5.2's ack shape), so
+    // `own_min_rung()` — this node's minimum over its peers — reads 8832
+    // while `datagram_mtu()` stays at the unraised baseline.
+    sources.probe.on_ack(peer, 8832, 8832);
+
+    let srv = ObsServer::serve(sources.clone(), "127.0.0.1:0".parse().unwrap()).expect("bind");
+    let addr = srv.local_addr();
+    let mut sf = SeriesFile::new();
+    for _ in 0..3 {
+        sf.record_round(
+            "n0",
+            &scrape(addr),
+            &["uc2_probe_min_mtu_bytes", "uc2_datagram_mtu_bytes"],
+        );
+        thread::sleep(Duration::from_millis(200));
+    }
+    srv.stop();
+
+    (
+        sf,
+        Disclosure {
+            scenario: "mtu_discovery_stalled",
+            rules: &["Uc2MtuDiscoveryStalled"],
+            state: "synthetic",
+            method: "synthetic ObsSources: one peer added to the real ProbeTable and acked at \
+                     the top rung (verified=8832, own_min_rung=8832), while the ClusterView \
+                     stays at genesis so uc2_datagram_mtu_bytes reads the unset-sentinel \
+                     default, 1408. uc2_probe_min_mtu_bytes renders through the real \
+                     own_min_rung() (peers is non-empty, so this is NOT the solo-cluster 0 \
+                     reading) — 8832 > 1408 is exactly Uc2MtuDiscoveryStalled's predicate."
+                .into(),
+        },
+    )
+}
+
+// ----------------------------------------------------------- scenario 22
+
+/// Uc2PathBelowMtu — **synthetic, disclosed**: `sender.emsgsize` bumped
+/// directly (the real trigger — a route or NIC change that drops a path's
+/// MTU below the rung the cluster already committed — can't be honestly
+/// hosted in-process); rendered through the real exporter. `probe_emsgsize`
+/// (a separate counter, spec §5.1) is left untouched, so this exercises only
+/// the non-probe counter the rule keys on.
+fn scenario_path_below_mtu() -> (SeriesFile, Disclosure) {
+    let sources = synthetic_sources(0);
+    let srv = ObsServer::serve(sources.clone(), "127.0.0.1:0".parse().unwrap()).expect("bind");
+    let addr = srv.local_addr();
+
+    let families = ["uc2_send_emsgsize_total"];
+    let mut sf = SeriesFile::new();
+    sf.record_round("n0", &scrape(addr), &families); // baseline, 0
+
+    sources.sender.emsgsize.fetch_add(3, Ordering::Relaxed);
+    thread::sleep(Duration::from_millis(200));
+    for _ in 0..3 {
+        sf.record_round("n0", &scrape(addr), &families); // bumped, held
+        thread::sleep(Duration::from_millis(200));
+    }
+    srv.stop();
+
+    (
+        sf,
+        Disclosure {
+            scenario: "path_below_mtu",
+            rules: &["Uc2PathBelowMtu"],
+            state: "synthetic",
+            method: "synthetic ObsSources: sender.emsgsize bumped directly by 3 after one \
+                     baseline scrape (the real trigger — a path degrading below the committed \
+                     rung under do-not-fragment — can't be honestly hosted in-process); \
+                     rendered through the real exporter. probe_emsgsize is untouched, so this \
+                     is the non-probe counter alone, matching the rule's own note that probe \
+                     refusals are counted separately."
                 .into(),
         },
     )

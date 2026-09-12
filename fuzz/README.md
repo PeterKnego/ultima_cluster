@@ -173,6 +173,7 @@ growth.
 | `uc_gateway_toml` | `uc_gateway::config_file::parse_str` — the gateway's whole named-refusal path (it runs `EdgeConfig::validate` itself). |
 | `uc_node_http` | `uc_node::obs::http::route_raw` — the unauthenticated `/metrics` + `/healthz` + `/readyz` request parser. |
 | `uc_node_cluster_artifact` | `uc_node::ClusterFsm::install_snapshot` — the cluster IMAGE (cluster-FSM spec §4.7, §11), which a below-floor joiner installs BY FIAT off a snapshot session and a restarting node reads off disk. CRC32 is a checksum, not a MAC, so every length-prefixed read behind it is attacker-chosen; the target calls the decoder twice per input, once at position 0 and once at the position the image itself claims, so a mutated-but-valid image gets past the position gate. |
+| `uc_protocol_probe` | `uc_protocol::v2::datagram`'s jumbo-frame path-MTU probe codecs (spec §4.2): `read_probe_rung` (the `PROBE` body's 4-byte rung prefix, total on any slice) and `read_probe_ack_body`/`write_probe_ack_body` (the 8-byte `PROBE_ACK` body — a decoded value must round-trip through re-encoding). `Scope::Pairwise`, so both are reached by any peer that can send a UDP datagram, before any commit-rule logic sees the result. |
 
 ## `cfg(fuzzing)` seams
 

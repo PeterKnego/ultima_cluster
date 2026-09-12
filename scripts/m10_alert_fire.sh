@@ -276,6 +276,8 @@ RULE_META = {
     "Uc2SnapshotStalled": {"severity": "warning", "real": False, "scenario": "snapshot_stalled"},
     "Uc2StandbySnapshotStalled": {"severity": "warning", "real": False, "scenario": "standby_snapshot_stalled"},
     "Uc2SnapshotSetDiverged": {"severity": "warning", "real": False, "scenario": "snapshot_set_diverged"},
+    "Uc2MtuDiscoveryStalled": {"severity": "warning", "real": False, "scenario": "mtu_discovery_stalled"},
+    "Uc2PathBelowMtu": {"severity": "critical", "real": False, "scenario": "path_below_mtu"},
 }
 
 
@@ -663,6 +665,40 @@ def build_Uc2SnapshotSetDiverged():
     return r
 
 
+def build_Uc2MtuDiscoveryStalled():
+    # Jumbo spec §9: `uc2_probe_min_mtu_bytes > uc2_datagram_mtu_bytes`, a
+    # plain two-series LEVEL comparison on ONE instance (no `and`, no
+    # `count_values` — just a bare `>`) — the same shape as
+    # build_Uc2DiskLow, over the jumbo gauges instead. The scenario's own
+    # rung (8832) held above the genesis-baseline rung (1408) the whole
+    # window is exactly the "proved more than committed" gap this rule
+    # exists to catch; `labels_from` is the LHS (the min-mtu row), same
+    # convention as every other bare comparison here.
+    rows = load_scenario("mtu_discovery_stalled")
+    min_row = select(rows, "uc2_probe_min_mtu_bytes", {})
+    committed_row = select(rows, "uc2_datagram_mtu_bytes", {})
+    r = new_rule("warning", labels_from=min_row)
+    add_hold_last(r, min_row, "uc2_probe_min_mtu_bytes", 60)
+    add_hold_last(r, committed_row, "uc2_datagram_mtu_bytes", 60)
+    r["eval_time"] = total_for(60)[0]
+    return r
+
+
+def build_Uc2PathBelowMtu():
+    # Jumbo spec §9/§4.3: `increase(uc2_send_emsgsize_total[5m]) > 0`, a
+    # DELTA rule with no `for:` clause (fires the instant the range window
+    # sees the jump) — same `for: 0` posture and same add_literal policy as
+    # build_Uc2UnattestedReports, over the jumbo counter instead. The
+    # scenario's real 0->3 transition lands verbatim inside the 5m range at
+    # eval_time.
+    rows = load_scenario("path_below_mtu")
+    row = select(rows, "uc2_send_emsgsize_total", {})
+    r = new_rule("critical", labels_from=row)
+    add_literal(r, row, "uc2_send_emsgsize_total", 300)
+    r["eval_time"] = (len(row["values"]) - 1) * INTERVAL
+    return r
+
+
 RULE_BUILDERS = {
     "Uc2AgentDead": build_Uc2AgentDead,
     "Uc2NoLeader": build_Uc2NoLeader,
@@ -687,6 +723,8 @@ RULE_BUILDERS = {
     "Uc2SnapshotStalled": build_Uc2SnapshotStalled,
     "Uc2StandbySnapshotStalled": build_Uc2StandbySnapshotStalled,
     "Uc2SnapshotSetDiverged": build_Uc2SnapshotSetDiverged,
+    "Uc2MtuDiscoveryStalled": build_Uc2MtuDiscoveryStalled,
+    "Uc2PathBelowMtu": build_Uc2PathBelowMtu,
 }
 
 # Task 5 completeness cross-check: parse every `alert:` name straight out of

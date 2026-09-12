@@ -76,20 +76,32 @@ addr = "10.0.0.12:9100"
 # path. See docs/benchmarks/uc2-m11-gate-2026-08-20.md, row 3b.
 # buffer_bytes = 67108864
 
-# Largest single command payload. DERIVED by default from the path budget —
-# 1312 B at the built-in 1408 B MTU — not a fixed number.
+# max_payload is RETIRED since 2.12.0 and refused BY NAME at startup: the
+# command payload ceiling is now DISCOVERED per cluster from the path MTU
+# between nodes (probed on boot and on every membership change), not a
+# node.toml key.
+
+# Require jumbo frames. Default false, which is the safe posture: the cluster
+# starts at the 1408 B baseline and rises only once every member has proven a
+# larger path, so a standard-MTU network behaves exactly as it always did.
 #
-# A max-size frame plus its headers, and the crypto tag when encryption is on,
-# must fit ONE datagram; the node does not fragment. Both bounds are checked at
-# STARTUP and refused by name:
-#   too BIG   — past the MTU budget (the node would panic in the sender)
-#   too SMALL — below what a full 32-entry schedule table needs (1072 B), which
-#               would let `uc2ctl schedule apply` refuse valid tables
-#
-# Leave it unset unless you have a reason. The default follows the MTU, so a
-# build with a larger MTU (AWS EC2 and GCP both support ~9000 B jumbo frames)
-# widens it automatically rather than pinning a small value.
-# max_payload = 1312
+# true makes discovery a STARTUP GATE for an application whose commands do not
+# fit the standard ceiling (1344 B / 1312 B with crypto): this node refuses to
+# serve — /readyz answers 503 — until it has proven an 8832 B path to every
+# configured member, and after 30 s it FAIL-STOPS (exit 1) naming the first
+# member that fell short, distinguishing "answered, too small" from "never
+# answered". Better that than a cluster that starts and refuses those commands
+# one at a time at submit. Env override UC2_FORCE_JUMBO_FRAMES=1.
+# See docs/how-to/jumbo-frames.md.
+# force_jumbo_frames = false
+
+# Independent of the flag above, and not configurable: once a cluster has
+# COMMITTED a jumbo rung, a node whose path to some member ANSWERS below it
+# refuses to start at once (exit 1, `path_below_committed_mtu`), naming that
+# member — the log already holds frames it cannot receive, so the remedy is the
+# path. A member that answers NOTHING (down, slow, still replaying) never
+# refuses anything: the node keeps replicating and voting, and simply does not
+# serve until some path proves the rung.
 
 # NOTE: admission_bytes moved. Since the cluster FSM (2.11.0) the ingress
 # admission budget is a REPLICATED setting, not a per-host one: a top-level

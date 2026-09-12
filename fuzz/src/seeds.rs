@@ -1619,3 +1619,35 @@ pub fn uc_protocol_settings() -> Vec<Seed> {
         Seed::fixed("07-version-1", v1),
     ]
 }
+
+/// `uc_protocol_probe` — the jumbo spec §4.2 path-MTU probe codecs:
+/// `read_probe_rung` (a `PROBE` body's 4-byte rung prefix) and
+/// `read_probe_ack_body`/`write_probe_ack_body` (the 8-byte `PROBE_ACK`
+/// body). A baseline and a top-rung probe body, a resolved ("level") ack, an
+/// unresolved (`own_min_rung = 0`) ack, and a body shorter than either
+/// decoder's minimum length — the totality edge both decoders must answer
+/// `None` on rather than panic.
+pub fn uc_protocol_probe() -> Vec<Seed> {
+    let mut baseline_rung = vec![0u8; PROBE_RUNG_LEN];
+    write_probe_rung(&mut baseline_rung, RUNGS[0]);
+
+    let mut top_rung = vec![0u8; PROBE_RUNG_LEN];
+    write_probe_rung(&mut top_rung, RUNGS[RUNGS.len() - 1]);
+
+    let mut level_ack = vec![0u8; PROBE_ACK_BODY_LEN];
+    write_probe_ack_body(&mut level_ack, &ProbeAckBody { rung: 8832, own_min_rung: 8832 });
+
+    let mut zero_own_min_ack = vec![0u8; PROBE_ACK_BODY_LEN];
+    write_probe_ack_body(
+        &mut zero_own_min_ack,
+        &ProbeAckBody { rung: RUNGS[0], own_min_rung: 0 },
+    );
+
+    vec![
+        Seed::fixed("01-baseline-rung", baseline_rung),
+        Seed::fixed("02-top-rung", top_rung),
+        Seed::fixed("03-level-ack", level_ack),
+        Seed::fixed("04-zero-own-min-ack", zero_own_min_ack),
+        Seed::fixed("05-too-short", vec![0u8; 3]),
+    ]
+}

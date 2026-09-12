@@ -92,5 +92,6 @@ fn main() -> std::io::Result<()> {
     write_target(root, "uc_node_toml", seeds::uc_node_toml())?;
     write_target(root, "uc_gateway_toml", seeds::uc_gateway_toml())?;
     write_target(root, "uc_node_http", seeds::uc_node_http())?;
+    write_target(root, "uc_protocol_probe", seeds::uc_protocol_probe())?;
     Ok(())
 }

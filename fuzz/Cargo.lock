@@ -930,6 +930,7 @@ dependencies = [
  "serde",
  "thiserror",
  "uc_log",
+ "uc_obs",
  "uc_protocol",
 ]
 
@@ -1073,6 +1074,7 @@ version = "2.11.0"
 dependencies = [
  "bytes",
  "thiserror",
+ "uc_obs",
 ]
 
 [[package]]

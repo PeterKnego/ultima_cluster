@@ -665,7 +665,7 @@ failure in Rust, but on a node it is a fail-stop: the datagram path runs on the
 receiver agent and `apply` runs on the service's apply thread, so a panic there
 takes the process down. Availability is the thing being defended here.
 
-### The twenty-three targets
+### The twenty-four targets
 
 | Target | Seam, and why its input is untrusted |
 |---|---|
@@ -692,6 +692,7 @@ takes the process down. Availability is the thing being defended here.
 | `uc_node_http` | `uc_node::obs::http::route_raw` — the **unauthenticated** `/metrics` + `/healthz` + `/readyz` request parser. |
 | `uc_service_snapshot_envelope` | coordinated snapshots — `uc_service::snapshots::decode_snapshot_envelope`, the 16-byte `ULTSNAP1` header every artifact file now begins with. A pure decoder, total on any slice, and the one check standing between a renamed or mis-copied artifact and an install that would silently leave a span of frames unapplied. |
 | `uc_node_cluster_artifact` | `ClusterFsm::install_snapshot` — the cluster IMAGE a below-floor joiner installs **by fiat** off a snapshot session, and a restarting node reads off disk. CRC32 is a checksum, not a MAC, so every length-prefixed read behind it is attacker-chosen. |
+| `uc_protocol_probe` | jumbo spec §4.2 — `uc_protocol::v2::datagram`'s path-MTU probe codecs, `read_probe_rung` and `read_probe_ack_body`/`write_probe_ack_body`. `Scope::Pairwise`: reached by any peer that can put a UDP datagram on the wire, ahead of the commit rule that consumes the result. |
 
 ### Method
 

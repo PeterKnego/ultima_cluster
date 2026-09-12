@@ -13,10 +13,18 @@ groups:
     labels: { severity: critical }
     annotations: { summary: "no node reports leadership — election cannot complete" }
   - alert: Uc2LeaderNotServing
+    # Jumbo spec §6, carried from Task 2's review: `uc2_can_serve` is now
+    # ALSO masked off while this node's own jumbo gate is pending (a forced
+    # raise waiting on every member's probe, or a joiner waiting on its
+    # first proof) — the exact same clause `publish_status` already used for
+    # the NewTerm-uncommitted case, so this rule cannot tell the two causes
+    # apart from the outside. `jumbo_gate_pending` is an in-process
+    # `AtomicBool`, not an exported series, so there is no PromQL guard to
+    # add here; naming both causes in the summary is the fix.
     expr: uc2_is_leader == 1 and uc2_can_serve == 0
     for: 30s
     labels: { severity: critical }
-    annotations: { summary: "{{ $labels.instance }} elected but its NewTerm frame is not quorum-committed (flags 0x01)" }
+    annotations: { summary: "{{ $labels.instance }} elected but not serving — either its NewTerm frame is not yet quorum-committed (flags 0x01), or its jumbo MTU gate is pending (a forced raise or a join proof still in flight, jumbo spec §6); check uc2_datagram_mtu_bytes/uc2_probe_min_mtu_bytes before assuming the former" }
   - alert: Uc2ServiceWedged
     expr: uc_service_heartbeat_age_seconds{service=""} > 5 and uc_node_heartbeat_age_seconds < 3
     for: 1m
@@ -305,3 +313,32 @@ groups:
     for: 60s
     labels: { severity: warning }
     annotations: { summary: "nodes disagree on the newest COMPLETE snapshot set's position — one node's purge floor is at a different point than another's; a node behind is either still catching up (transient) or stuck (check uc2_snapshot_row_incomplete_total and uc2ctl snapshot show on it)" }
+  - alert: Uc2MtuDiscoveryStalled
+    # Jumbo spec §9. This node has PROVEN more than the cluster has COMMITTED:
+    # `uc2_probe_min_mtu_bytes` is its own verified minimum over its peers and
+    # `uc2_datagram_mtu_bytes` is the rung the leader committed, so a gap that
+    # persists means some OTHER member is holding discovery back — silent, or
+    # on a narrower path. Not an error: a cluster that legitimately cannot do
+    # better than the baseline never raises this, because a narrow peer pins
+    # every node's own minimum too (errata 1). The 60 s window clears the
+    # ordinary case, where the gap exists for the 1-3 s discovery takes.
+    expr: uc2_probe_min_mtu_bytes > uc2_datagram_mtu_bytes
+    for: 60s
+    labels:
+      severity: warning
+    annotations:
+      summary: "MTU discovery stalled on {{ $labels.instance }}"
+      description: "This node proved {{ $value }} B but the cluster still commits a smaller rung; a peer is silent or narrower. Check uc2_probe_min_mtu_bytes on every member."
+
+  - alert: Uc2PathBelowMtu
+    # Jumbo spec §9/§4.3: with do-not-fragment set, a datagram the route cannot
+    # carry fails locally with EMSGSIZE instead of fragmenting. Any increase
+    # means a path degraded below the rung the cluster committed (or below the
+    # 1408 B baseline) — the runtime face of the outage §5.4 refuses at
+    # startup. Probe refusals are counted separately and never fire this.
+    expr: increase(uc2_send_emsgsize_total[5m]) > 0
+    labels:
+      severity: critical
+    annotations:
+      summary: "A path on {{ $labels.instance }} cannot carry the committed MTU"
+      description: "{{ $value }} datagrams were refused for size in 5m. The committed rung is monotone: fix the path (MTU/jumbo support) — the cluster cannot lower it."
