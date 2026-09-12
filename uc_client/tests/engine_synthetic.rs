@@ -909,3 +909,106 @@ fn out_of_range_declared_bits_are_masked_off_when_something_in_range_remains() {
     send.try_submit_all(1, b"x")
         .expect("the masked set is what the engine awaits");
 }
+
+/// A synthetic dir whose rings accept a jumbo-sized record (the §8 warning
+/// test submits a 2001-byte command, which `make_instance_wide`'s 512-byte
+/// record cap would refuse in the RING — hiding what the test is about).
+fn make_instance_jumbo(dir: &Path, app_id: &str) -> std::sync::Arc<CncPage> {
+    let page = CncPage::create_file(&dir.join("cnc2.dat"), &meta(app_id)).unwrap();
+    MpscRing::create(&dir.join("ingress.ring"), MIB, 16 * 1024).unwrap();
+    MpscRing::create(&dir.join("query.ring"), MIB, 16 * 1024).unwrap();
+    BroadcastRing::create(&dir.join("egress_service.0.broadcast"), MIB, 16 * 1024).unwrap();
+    BroadcastRing::create(&dir.join("egress_node.broadcast"), MIB, 16 * 1024).unwrap();
+    page
+}
+
+/// Jumbo spec §8: a command above the STANDARD ceiling warns once per client,
+/// even when this cluster carries it — a dev box's loopback carries 65 536 B,
+/// so the 4 KB command that works here fails on a 1500 B production path.
+///
+/// The capture sink is process-global, and so is the event: two other clients
+/// in this binary could legitimately add lines of their own. So the count is
+/// taken over the `len` value THIS test submits (2001 B, which no other test
+/// here sends), the same "assert on content, never on emptiness" discipline
+/// `uc_obs::log`'s own tests use.
+#[test]
+fn a_command_above_the_standard_ceiling_warns_once() {
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let page = make_instance_jumbo(dir.path(), "eng-warn");
+    page.store_payload_ceiling(8864); // a cluster that DOES carry it
+
+    let buf = uc_obs::log::capture_for_tests();
+    let (s, _p) = Engine::attach(dir.path(), "eng-warn", cfg()).unwrap();
+    s.try_submit(1, &[0u8; 2001]).unwrap();
+    s.try_submit(2, &[0u8; 2001]).unwrap();
+
+    // A second client on the same page: its own latch, so its first oversized
+    // command (a different length, so it is counted separately) warns again —
+    // the latch is per client, not per process.
+    let (s2, _p2) = Engine::attach(dir.path(), "eng-warn", cfg()).unwrap();
+    s2.try_submit(3, &[0u8; 2002]).unwrap();
+    // At or below the standard ceiling: silent.
+    s2.try_submit(4, &[0u8; 1312]).unwrap();
+
+    let text = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+    uc_obs::log::stderr_for_tests();
+
+    let lines: Vec<&str> = text
+        .lines()
+        .filter(|l| l.contains(r#""event":"command_over_standard_ceiling""#))
+        .collect();
+    let mine: Vec<&&str> = lines
+        .iter()
+        .filter(|l| l.contains(r#""len":2001"#))
+        .collect();
+    assert_eq!(
+        mine.len(),
+        1,
+        "once per client, not once per command: {lines:?}"
+    );
+    assert!(mine[0].contains(r#""level":"warn""#), "{}", mine[0]);
+    assert!(
+        mine[0].contains(r#""standard":1312"#) && mine[0].contains(r#""ceiling":8864"#),
+        "the record names the standard and this cluster's ceiling: {}",
+        mine[0]
+    );
+    assert!(
+        mine[0].contains("force_jumbo_frames"),
+        "the record names the remedy: {}",
+        mine[0]
+    );
+    assert_eq!(
+        lines.iter().filter(|l| l.contains(r#""len":2002"#)).count(),
+        1,
+        "the second client's own latch warns once too: {lines:?}"
+    );
+    assert!(
+        !lines.iter().any(|l| l.contains(r#""len":1312"#)),
+        "at the standard ceiling the client is silent: {lines:?}"
+    );
+}
+
+/// Jumbo spec §8: the refusal's text carries the remedy, not just the number —
+/// in both the door error and the `ClientError` the pipelined tier maps it to.
+#[test]
+fn payload_too_large_names_the_remedy() {
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let page = make_instance_jumbo(dir.path(), "eng-remedy");
+    page.store_payload_ceiling(1312);
+    let (s, _p) = Engine::attach(dir.path(), "eng-remedy", cfg()).unwrap();
+
+    let e = s.try_submit(1, &[0u8; 2000]).unwrap_err();
+    let text = e.to_string();
+    assert!(text.contains("2000") && text.contains("1312"), "{text}");
+    assert!(text.contains("force_jumbo_frames"), "the remedy: {text}");
+
+    let mapped = uc_client::ClientError::PayloadTooLarge {
+        len: 2000,
+        max: 1312,
+    }
+    .to_string();
+    assert!(
+        mapped.contains("2000") && mapped.contains("1312") && mapped.contains("force_jumbo_frames"),
+        "{mapped}"
+    );
+}

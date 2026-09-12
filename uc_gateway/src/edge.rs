@@ -357,6 +357,11 @@ struct Shared {
     /// sized its buffers for, read once at start. Only a fallback, for a page
     /// that carries no live ceiling word (cnc 3.1) and reads 0 there.
     header_max_payload: usize,
+    /// Jumbo spec §8: this edge has already logged an oversized SUBMIT. Once
+    /// per edge, not once per frame: the remedy is a deployment-wide fact, and
+    /// a client that keeps re-sending an oversized command would otherwise
+    /// write a line per attempt.
+    warned_payload_too_large: AtomicBool,
     /// The total outstanding grant this edge will hand out across every
     /// connection — [`budget_for`] of the `Engine` window. Fixed at start;
     /// what moves is how it is divided.
@@ -415,6 +420,24 @@ impl Shared {
         match self.cnc.payload_ceiling() {
             0 => self.header_max_payload,
             c => c as usize,
+        }
+    }
+
+    /// Jumbo spec §8: an oversized SUBMIT, logged with the remedy the operator
+    /// actually needs — once per edge (see `warned_payload_too_large`). The
+    /// wire answer is unchanged: `RETRY{PAYLOAD_TOO_LARGE}`, terminal.
+    fn warn_payload_too_large(&self, wire_len: usize, max: usize) {
+        if !self.warned_payload_too_large.load(Ordering::Relaxed)
+            && !self.warned_payload_too_large.swap(true, Ordering::Relaxed)
+        {
+            uc_obs::obs_event!(
+                Warn,
+                "payload_too_large",
+                len = wire_len as u64,
+                max = max as u64,
+                remedy = "if every node path carries jumbo frames, set force_jumbo_frames = true \
+                          in node.toml",
+            );
         }
     }
 
@@ -838,6 +861,7 @@ impl Edge {
             t0: Instant::now(),
             cnc,
             header_max_payload,
+            warned_payload_too_large: AtomicBool::new(false),
             budget,
             live: AtomicU32::new(0),
             regrant: AtomicBool::new(false),
@@ -1343,9 +1367,11 @@ fn dispatch(
     // first is not one this edge can make. Both paths write the same frame.
     let envelope = shared.cfg.session_envelope && !is_query;
     let wire_len = payload.len() + if envelope { SESSION_HEADER_LEN } else { 0 };
-    if wire_len > shared.live_max_payload() {
+    let live_max = shared.live_max_payload();
+    if wire_len > live_max {
         // Terminal for the client — `RemoteClient` maps this reason to a hard
         // error and never re-sends. The ring is never touched.
+        shared.warn_payload_too_large(wire_len, live_max);
         shared.write_retry(conn, h.seq, RETRY_PAYLOAD_TOO_LARGE, 0);
         return !conn.is_closed();
     }
@@ -1484,7 +1510,10 @@ fn dispatch(
                 }
                 return !conn.is_closed();
             }
-            Err(SubmitError::PayloadTooLarge { .. }) => {
+            Err(SubmitError::PayloadTooLarge { len, max }) => {
+                // The redundant twin of the door check above (see its comment);
+                // the same one-per-edge warning, whichever path caught it.
+                shared.warn_payload_too_large(len, max);
                 if conn.unreserve(corr) {
                     shared.write_retry(conn, h.seq, RETRY_PAYLOAD_TOO_LARGE, 0);
                 }

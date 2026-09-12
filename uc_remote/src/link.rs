@@ -248,6 +248,11 @@ pub(crate) struct Link {
     /// The current connection has answered something only a serving edge can
     /// answer. Until then the writer sends ONE frame (probe-before-flush).
     proven: AtomicBool,
+    /// Jumbo spec §8: this client has already warned about a command above the
+    /// STANDARD ceiling. One warning per client, not per command — the point is
+    /// to teach the developer a dependency, and a line per submit would bury it
+    /// (and put a `stderr` write on the submit path).
+    pub(crate) warned_over_standard: AtomicBool,
     /// The single seq written while unproven; `0` = none.
     probe_seq: AtomicU64,
     /// **The writer's re-send scan starts here**: the lowest seq whose frame
@@ -303,6 +308,7 @@ impl Link {
             generation: AtomicU64::new(0),
             acked_seq: AtomicU64::new(0),
             proven: AtomicBool::new(false),
+            warned_over_standard: AtomicBool::new(false),
             probe_seq: AtomicU64::new(0),
             oldest_unreclaimed: AtomicU64::new(1),
             stats,

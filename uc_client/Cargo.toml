@@ -16,6 +16,9 @@ categories.workspace = true
 [dependencies]
 uc_protocol = { path = "../uc_protocol", version = "2.11.0" }
 uc_log = { path = "../uc_log", version = "2.11.0" }
+# Jumbo spec §8: the developer notification. `uc_obs` is a dependency-free
+# std-only leaf, so the SDK's "small dep set" posture holds.
+uc_obs = { path = "../uc_obs", version = "2.11.0" }
 bytes = { workspace = true }
 serde = { workspace = true }
 bincode = { workspace = true }

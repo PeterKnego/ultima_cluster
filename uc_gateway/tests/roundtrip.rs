@@ -211,10 +211,35 @@ fn an_oversized_submit_is_refused_with_payload_too_large() {
 
     // The rig's node caps `max_payload` at 256 bytes.
     let big = vec![0u8; 4096];
+    let buf = uc_obs::log::capture_for_tests();
     let err = client.submit(&big).unwrap().wait().unwrap_err();
+    // Jumbo spec §8: the refusal is logged once per edge, with the remedy —
+    // a positive containment assertion, never an emptiness one: the capture
+    // sink is process-global and a real node is running beside this test.
+    let text = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+    uc_obs::log::stderr_for_tests();
+    // 4112 = the 4096-byte command plus the 16-byte session envelope, which
+    // rides inside the node's budget and so counts at this door. The `len` is
+    // also what picks THIS test's record out of the buffer: a sibling test in
+    // this binary refuses an oversized frame of its own, and with the sink
+    // installed its line lands here too.
+    let line = text
+        .lines()
+        .find(|l| l.contains(r#""event":"payload_too_large""#) && l.contains(r#""len":4112"#))
+        .unwrap_or_else(|| panic!("no payload_too_large record for 4112 bytes: {text}"));
+    assert!(
+        line.contains(r#""max":256"#) && line.contains("force_jumbo_frames"),
+        "the edge's refusal names the ceiling and the remedy: {line}"
+    );
     assert!(
         matches!(err, uc_remote::RemoteError::PayloadTooLarge),
         "expected a terminal PayloadTooLarge, got {err:?}"
+    );
+    // The error the caller sees carries the remedy too.
+    assert!(
+        err.to_string().contains("force_jumbo_frames"),
+        "{}",
+        err.to_string()
     );
 
     // The connection survives it: a normal write still round-trips.

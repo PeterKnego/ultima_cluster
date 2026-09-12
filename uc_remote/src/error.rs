@@ -54,7 +54,10 @@ pub enum RemoteError {
     #[error("outcome unknown: the edge timed the request out")]
     Unknown,
     /// The payload exceeds what the node accepts. Never re-sent.
-    #[error("payload too large")]
+    #[error(
+        "payload too large: above the cluster's payload ceiling; if every node path carries jumbo \
+         frames, set force_jumbo_frames = true in node.toml"
+    )]
     PayloadTooLarge,
     /// The request's `request_timeout` budget ran out.
     #[error("request timed out")]

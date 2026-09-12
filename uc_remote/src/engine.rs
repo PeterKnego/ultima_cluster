@@ -49,6 +49,7 @@ use std::cell::Cell;
 use std::fmt;
 use std::marker::PhantomData;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -56,6 +57,36 @@ use bytes::Bytes;
 use crate::completion::OutcomeTag;
 use crate::error::RemoteError;
 use crate::link::Link;
+
+// -------------------------------------------------------------- ceilings
+
+// Three numbers `uc_protocol::v2::datagram` owns, copied here on purpose:
+// this is the crate a third-party remote client COPIES, so it must build
+// without the node's protocol crate. `uc_protocol` is a **dev**-dependency,
+// and `ceiling_tests::the_local_ceilings_match_uc_protocol` pins all three
+// against it — if that test fails, the wire moved and these must follow.
+
+/// The payload a command may carry over the baseline `MTU_DEFAULT` path with
+/// crypto off — `payload_ceiling(MTU_DEFAULT, false)`. The floor every
+/// cluster clears, whatever its discovered MTU.
+pub const BASELINE_PAYLOAD_CEILING: usize = 1344;
+
+/// The payload a command may carry on the top jumbo rung with crypto off —
+/// `payload_ceiling(MTU_BOUND, false)`, the most any cluster can ever accept.
+/// Sizes the outgoing ring, which must hold a window of max-size frames.
+pub const BOUND_PAYLOAD_CEILING: usize = 8896;
+
+/// The STANDARD ceiling: `MAX_PAYLOAD_DEFAULT`, the baseline path with crypto
+/// ON — the one size that holds on any cluster, and so the threshold the
+/// developer notification (jumbo spec §8) warns above.
+pub const STANDARD_PAYLOAD: usize = 1312;
+
+/// Jumbo spec §8: the remedy clause the notification carries. `RemoteError`'s
+/// text spells the same sentence out inline, because `thiserror`'s format
+/// strings cannot interpolate a constant.
+const JUMBO_REMEDY: &str = "every deployment will need jumbo-frame support on all node paths: \
+                            set force_jumbo_frames = true in node.toml so a cluster without it \
+                            refuses to start instead of failing at submit";
 
 // ---------------------------------------------------------------- config
 
@@ -128,13 +159,21 @@ pub struct RemoteConfig {
     /// to get a definite answer. `false` surfaces [`RemoteError::Unknown`].
     pub resend_on_unknown: bool,
     /// Bytes reserved for the outgoing frame ring. `None` derives it:
-    /// `max_inflight x (HEADER_LEN + 1344)`, floored at `MAX_FRAME_LEN` and
-    /// rounded up to a power of two — big enough for a full window of
-    /// max-payload commands (the node's 1344-byte ceiling, see
-    /// `docs/reference/remote-protocol.md`) and for any single frame this wire
-    /// admits. A `try_submit` whose frame does not fit the free space is
+    /// `max_inflight x (HEADER_LEN + BOUND_PAYLOAD_CEILING)` (see
+    /// [`BOUND_PAYLOAD_CEILING`]), floored at
+    /// `MAX_FRAME_LEN` and rounded up to a power of two — big enough for a full
+    /// window of max-payload commands (since 2.12.0 the node's ceiling is
+    /// discovered, and the most it can ever be is the top jumbo rung's 8896 B,
+    /// see `docs/reference/remote-protocol.md`) and for any single frame this
+    /// wire admits. A `try_submit` whose frame does not fit the free space is
     /// `Backpressure`; one that could never fit the whole ring is
     /// `PayloadTooLarge`.
+    ///
+    /// **That derivation is generous on purpose, and it is not free**: at the
+    /// default `max_inflight` of 1024 it reserves 16 MiB (the power-of-two step
+    /// above `1024 x 8920`) where the pre-2.12.0 baseline reserved 2 MiB. A
+    /// client that knows its commands stay small should say so — set this
+    /// explicitly, or lower `max_inflight`.
     pub out_ring_bytes: Option<usize>,
     /// Bytes reserved for the completion queue's body arena. `None` derives
     /// it: `max_inflight x 256`, floored at `MAX_FRAME_LEN`, rounded up to a
@@ -214,7 +253,9 @@ impl RemoteConfig {
     /// power-of-two rounding.
     pub(crate) fn out_ring_bytes_resolved(&self) -> usize {
         self.out_ring_bytes.unwrap_or_else(|| {
-            let per = crate::frame::HEADER_LEN + 1344;
+            // Jumbo spec §7.4: a window of MAX-size commands, and since 2.12.0
+            // the max is the top rung's ceiling, not the baseline's.
+            let per = crate::frame::HEADER_LEN + BOUND_PAYLOAD_CEILING;
             (self.max_inflight as usize)
                 .saturating_mul(per)
                 .max(crate::frame::MAX_FRAME_LEN as usize)
@@ -530,6 +571,27 @@ impl RemoteSendHalf {
         // is backpressure, and `stage_frame` is what tells the two apart.
         if need > MAX_FRAME_LEN as usize || need > out.capacity() {
             return Err(SubmitError::PayloadTooLarge);
+        }
+        // Jumbo spec §8: the dev trap — loopback carries 65 536 B and a 1500 B
+        // production path does not, so a command the cluster behind this edge
+        // accepts today can fail at deployment. Warn on SUCCESS, once per
+        // client. No `ceiling` field: protocol v1 advertises none, so this tier
+        // does not know what the cluster's discovered ceiling is.
+        //
+        // Hot-path cost: one compare against a constant (short-circuiting for
+        // every command at or below the standard ceiling), then one `Relaxed`
+        // load; the RMW happens only on the one call that latches.
+        if bytes.len() > STANDARD_PAYLOAD
+            && !link.warned_over_standard.load(Ordering::Relaxed)
+            && !link.warned_over_standard.swap(true, Ordering::Relaxed)
+        {
+            uc_obs::obs_event!(
+                Warn,
+                "command_over_standard_ceiling",
+                len = bytes.len() as u64,
+                standard = STANDARD_PAYLOAD as u64,
+                remedy = JUMBO_REMEDY,
+            );
         }
         let seq = self.next_seq.get();
         // The admission rule (see `admissible`) and the slot this seq lands
@@ -870,5 +932,44 @@ mod window_tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod ceiling_tests {
+    use super::{BASELINE_PAYLOAD_CEILING, BOUND_PAYLOAD_CEILING, RemoteConfig, STANDARD_PAYLOAD};
+
+    /// Jumbo spec §7.4: the inflight ring must hold a window of MAX-size
+    /// commands, which is the BOUND's crypto-off ceiling since 2.12.0.
+    #[test]
+    fn the_out_ring_is_sized_for_a_jumbo_window() {
+        let c = RemoteConfig {
+            max_inflight: 8,
+            out_ring_bytes: None,
+            ..RemoteConfig::default()
+        };
+        assert!(
+            c.out_ring_bytes_resolved() >= 8 * (crate::frame::HEADER_LEN + BOUND_PAYLOAD_CEILING),
+            "{} bytes is below a window of eight jumbo frames",
+            c.out_ring_bytes_resolved()
+        );
+    }
+
+    /// `uc_remote` carries its own copies of three numbers `uc_protocol` owns,
+    /// because a third-party remote client copies this crate and must not need
+    /// the node's protocol crate. A DEV-dependency pins them so they cannot
+    /// drift: if this fails, the wire changed and these constants must follow.
+    #[test]
+    fn the_local_ceilings_match_uc_protocol() {
+        use uc_protocol::v2::datagram::{
+            MAX_PAYLOAD_DEFAULT, MTU_BOUND, MTU_DEFAULT, payload_ceiling,
+        };
+        assert_eq!(
+            BASELINE_PAYLOAD_CEILING,
+            payload_ceiling(MTU_DEFAULT, false)
+        );
+        assert_eq!(BOUND_PAYLOAD_CEILING, payload_ceiling(MTU_BOUND, false));
+        assert_eq!(STANDARD_PAYLOAD, MAX_PAYLOAD_DEFAULT);
+        assert_eq!(STANDARD_PAYLOAD, payload_ceiling(MTU_DEFAULT, true));
     }
 }

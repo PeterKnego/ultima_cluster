@@ -16,7 +16,15 @@ description = "ultima_cluster remote protocol v1 (framed TCP) and the Rust remot
 [dependencies]
 bytes = { workspace = true }
 thiserror = { workspace = true }
+# Jumbo spec §8: the developer notification. `uc_obs` is a dependency-free
+# std-only leaf, which is the only reason this crate — the one a third-party
+# remote client COPIES — may take a UC dependency at all.
+uc_obs = { path = "../uc_obs", version = "2.11.0" }
 
 [dev-dependencies]
 serde = { workspace = true }
 bincode = { workspace = true }
+# DEV-only, and deliberately so: `uc_remote` must not need the node's protocol
+# crate at runtime (see `BASELINE_PAYLOAD_CEILING`). This pins its local copies
+# of the two wire ceilings against the crate that owns them.
+uc_protocol = { path = "../uc_protocol", version = "2.11.0" }

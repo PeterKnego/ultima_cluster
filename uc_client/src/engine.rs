@@ -43,6 +43,7 @@ use uc_protocol::ring::{
     BroadcastConsumer, BroadcastRing, MpscProducer, MpscRing, RecordHeader, RingError,
 };
 use uc_protocol::v2::cnc::{CNC_MAX_SERVICES, NODE_FLAG_CAN_SERVE};
+use uc_protocol::v2::datagram::MAX_PAYLOAD_DEFAULT;
 use uc_protocol::v2::ipc::{
     FLAG_V2_IS_QUERY, FLAG_V2_LINEARIZABLE, MSG_V2_BAD_SERVICE, MSG_V2_NOT_LEADER, MSG_V2_QUERY,
     MSG_V2_RESPONSE, MSG_V2_RETRY, MSG_V2_SUBMIT, client_from_extra, extra_client,
@@ -120,6 +121,14 @@ pub enum Consistency {
     Snapshot,
 }
 
+/// Jumbo spec §8: the remedy clause the developer notification carries. The
+/// refusal texts spell the same sentence out inline, because `thiserror`'s
+/// format strings cannot interpolate a constant.
+pub(crate) const JUMBO_REMEDY: &str = "this cluster carries it, but every deployment will need \
+                                       jumbo-frame support on all node paths: set \
+                                       force_jumbo_frames = true in node.toml so a cluster \
+                                       without it refuses to start instead of failing at submit";
+
 /// Why a `try_submit`/`try_query` call was refused at the door. Refusal here
 /// means the slot was never claimed (or was claimed and SUCCESSFULLY
 /// released) — the caller's window/backpressure accounting is unaffected. A
@@ -133,7 +142,13 @@ pub enum SubmitError {
     Backpressure,
     #[error("node is not a serving leader (CAN_SERVE clear)")]
     NotServing,
-    #[error("payload too large: {len} > {max}")]
+    /// Jumbo spec §8: the text names the remedy, not just the number — a
+    /// ceiling below what the command needs is usually a path without
+    /// jumbo-frame support, not a command that must shrink.
+    #[error(
+        "payload too large: {len} > {max} (this cluster's ceiling); if every node path carries \
+         jumbo frames, set force_jumbo_frames = true in node.toml"
+    )]
     PayloadTooLarge { len: usize, max: usize },
     #[error("node instance restarted: attached {attached:#x}, now {current:#x}")]
     InstanceRestart { attached: u128, current: u128 },
@@ -223,6 +238,11 @@ struct Shared {
     /// door solely for a page that carries no live ceiling word (cnc 3.1, or
     /// a synthetic harness page), which reads 0 there.
     header_max_payload: usize,
+    /// Jumbo spec §8: this client has already warned about a command above the
+    /// STANDARD ceiling. One warning per client, not per command — the point
+    /// is to teach the developer a dependency, and a line per submit would
+    /// bury it (and cost a `stderr` write on the submit path).
+    warned_over_standard: AtomicBool,
     serving_gate: bool,
     /// M14b: bit `i` set ⇔ FSM `i` exists on the attached node. A page
     /// reading 0 (a harness node) folds to `0b1`.
@@ -427,6 +447,7 @@ impl Engine {
             timeout_ns: cfg.request_timeout.as_nanos() as u64,
             max_payload,
             header_max_payload,
+            warned_over_standard: AtomicBool::new(false),
             serving_gate: cfg.serving_gate,
             declared,
             names,
@@ -487,6 +508,28 @@ impl SendHalf {
         };
         if wire_len > max {
             return Err(SubmitError::PayloadTooLarge { len: wire_len, max });
+        }
+        // Jumbo spec §8: the dev trap — loopback carries 65 536 B and a 1500 B
+        // production path does not, so a command this cluster accepts today can
+        // fail at deployment. Warn on SUCCESS, once per client, so the
+        // developer learns the dependency HERE rather than at deployment.
+        //
+        // Hot-path cost, in order: one compare against a constant (which
+        // short-circuits for every command at or below the standard ceiling,
+        // i.e. every command on a cluster that never raised its MTU), then one
+        // `Relaxed` load, and the RMW only on the one call that latches.
+        if wire_len > MAX_PAYLOAD_DEFAULT
+            && !s.warned_over_standard.load(Ordering::Relaxed)
+            && !s.warned_over_standard.swap(true, Ordering::Relaxed)
+        {
+            uc_obs::obs_event!(
+                Warn,
+                "command_over_standard_ceiling",
+                len = wire_len as u64,
+                standard = MAX_PAYLOAD_DEFAULT as u64,
+                ceiling = max as u64,
+                remedy = JUMBO_REMEDY,
+            );
         }
         let deadline_ns = s.t0.elapsed().as_nanos() as u64 + s.timeout_ns;
         let seq = s

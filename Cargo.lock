@@ -1271,6 +1271,7 @@ dependencies = [
  "uc_log",
  "uc_net",
  "uc_node",
+ "uc_obs",
  "uc_protocol",
  "uc_service",
 ]
@@ -1477,6 +1478,8 @@ dependencies = [
  "bytes",
  "serde",
  "thiserror",
+ "uc_obs",
+ "uc_protocol",
 ]
 
 [[package]]

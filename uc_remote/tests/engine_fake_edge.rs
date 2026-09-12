@@ -1501,3 +1501,68 @@ fn a_dial_pass_over_unanswering_members_is_swept_and_interruptible() {
         "shutdown mid-pass must be prompt"
     );
 }
+
+/// Jumbo spec §8: the remote tier warns once per client on a command above the
+/// STANDARD ceiling, on SUCCESS — the edge's node may well carry it, but every
+/// deployment needs jumbo frames on all node paths before it does. The record
+/// omits `ceiling`: protocol v1 advertises none.
+///
+/// The capture sink and the event are both process-global (other tests in this
+/// binary submit oversized payloads of their own), so the count is taken over
+/// the `len` value THIS test sends — the "assert on content, never on
+/// emptiness" discipline `uc_obs::log`'s own tests use.
+#[test]
+fn a_command_above_the_standard_ceiling_warns_once() {
+    let edge = FakeEdge::spawn(Behaviour {
+        credits: 4,
+        ..Default::default()
+    });
+    let buf = uc_obs::log::capture_for_tests();
+    let (send, mut poll) = RemoteEngine::connect(cfg(vec![edge.addr.clone()])).unwrap();
+    let got = run_submits(&send, &mut poll, 2, |_| vec![7u8; 2001]);
+    assert_eq!(got.len(), 2, "both oversized commands went through");
+    // At or below the standard ceiling: silent.
+    let got = run_submits(&send, &mut poll, 1, |_| vec![7u8; 1312]);
+    assert_eq!(got.len(), 1);
+
+    let text = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+    uc_obs::log::stderr_for_tests();
+    let lines: Vec<&str> = text
+        .lines()
+        .filter(|l| l.contains(r#""event":"command_over_standard_ceiling""#))
+        .collect();
+    let mine: Vec<&&str> = lines
+        .iter()
+        .filter(|l| l.contains(r#""len":2001"#))
+        .collect();
+    assert_eq!(
+        mine.len(),
+        1,
+        "once per client, not once per command: {lines:?}"
+    );
+    assert!(mine[0].contains(r#""level":"warn""#), "{}", mine[0]);
+    assert!(mine[0].contains(r#""standard":1312"#), "{}", mine[0]);
+    assert!(
+        mine[0].contains("force_jumbo_frames"),
+        "the record names the remedy: {}",
+        mine[0]
+    );
+    assert!(
+        !mine[0].contains("ceiling\":"),
+        "protocol v1 advertises no ceiling, so the record must not claim one: {}",
+        mine[0]
+    );
+    assert!(
+        !lines.iter().any(|l| l.contains(r#""len":1312"#)),
+        "at the standard ceiling the client is silent: {lines:?}"
+    );
+    send.shutdown();
+}
+
+/// Jumbo spec §8: the node's refusal, relayed to the caller, names the remedy
+/// rather than only the fact.
+#[test]
+fn the_payload_too_large_error_names_the_remedy() {
+    let text = uc_remote::RemoteError::PayloadTooLarge.to_string();
+    assert!(text.contains("force_jumbo_frames"), "{text}");
+}
