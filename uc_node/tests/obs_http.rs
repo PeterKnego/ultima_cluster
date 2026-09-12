@@ -401,12 +401,15 @@ fn the_jumbo_series_report_the_baseline_on_a_solo_node() {
         body.contains("\nuc2_payload_ceiling_bytes 1344\n"),
         "{body}"
     );
-    // No peers: `own_min_rung` answers `MTU_BOUND` for an empty map (errata
-    // 4's parenthetical — a solo cluster's only path is loopback), so this
-    // is 8960 and NOT 0. `table_min`, which is what the leader's COMMIT rule
-    // consults, is the half that stays `None` here, which is why the
-    // committed rung above is still the baseline.
-    assert!(body.contains("\nuc2_probe_min_mtu_bytes 8960\n"), "{body}");
+    // NOTHING IS PROVEN on a solo cluster — it has measured no path at all —
+    // and the series' one encoding of that is 0. `ProbeTable::own_min_rung`
+    // answers `MTU_BOUND` for an empty peer map (errata 4's parenthetical,
+    // which the commit rule's neighbourhood depends on), but that is a
+    // helper's internal convention: publishing it would make a one-node
+    // cluster indistinguishable from a cluster that genuinely verified the
+    // top rung, and would leave `Uc2MtuDiscoveryStalled` (probe_min >
+    // datagram_mtu) firing forever on every single-node deployment.
+    assert!(body.contains("\nuc2_probe_min_mtu_bytes 0\n"), "{body}");
     assert!(body.contains("\nuc2_probe_sent_total 0\n"), "{body}");
     assert!(body.contains("\nuc2_probe_acked_total 0\n"), "{body}");
     assert!(body.contains("\nuc2_send_emsgsize_total 0\n"), "{body}");

@@ -901,12 +901,15 @@ fn run_status(a: &StatusArgs) -> anyhow::Result<()> {
         "services: declared={ids:?} fsm_lag={lag_desc} log_time_ns={}",
         cnc.log_time_ns()
     );
-    // Jumbo spec §9. The rung comes from the COMMITTED artifact (the same
-    // reader `settings show` uses) and the ceiling from the LIVE cnc word, so
-    // the two halves cannot disagree with what clients and the appender see.
-    // A read failure degrades to the baseline reading rather than aborting,
-    // for the reason `schedule_position` above degrades to `?`: `status` is
-    // the command an operator runs when something is wrong.
+    // Jumbo spec §9. The ceiling comes from the LIVE cnc word — the value
+    // clients and the appender both use — and the rung from the COMMITTED
+    // artifact (the same reader `settings show` uses). The artifact LAGS: it
+    // is written only at a coordinated snapshot instant, so `ceiling_line`
+    // reconciles the two halves rather than trusting the artifact blindly (fix
+    // round 1, Important 1 — see its doc). A read failure degrades to the same
+    // reconciliation rather than aborting, for the reason `schedule_position`
+    // above degrades to `?`: `status` is the command an operator runs when
+    // something is wrong.
     println!(
         "{}",
         ceiling_line(
@@ -1166,10 +1169,26 @@ fn run_gen_admin_key(a: &GenAdminKeyArgs) -> anyhow::Result<()> {
 ///
 /// `committed` is the `Settings::datagram_mtu` word out of the newest cluster
 /// artifact, or `None` when there is no artifact yet (or it could not be
-/// read). `0` in that word is the unset sentinel, so both shapes read
-/// `baseline` — exactly the clamp `uc_node`'s appender applies, kept a pure
-/// function here so a test can pin all three cases without an instance
-/// directory.
+/// read). `0` in that word is the unset sentinel — exactly the clamp
+/// `uc_node`'s appender applies. Kept a pure function so a test can pin every
+/// case without an instance directory.
+///
+/// **The artifact is not a live reader** (fix round 1, Important 1):
+/// `read_committed_settings` recovers only from `snapshots/cluster/
+/// *.ultcluster`, and those are written only at coordinated snapshot instants,
+/// whose default cadence (`snapshot_interval_bytes = 0`) is
+/// operator-commanded only. A default cluster can therefore discover and
+/// commit 8960 with no artifact to read it out of. The LIVE cnc ceiling settles
+/// it: the node-local `max_payload` bound only ever caps the ceiling DOWNWARD,
+/// so a ceiling above what the baseline rung can carry (1344 B, crypto off) is
+/// proof that a higher rung committed. In that case the line says `discovered`
+/// and marks the rung as INFERRED rather than read — it never states a number
+/// it did not read.
+///
+/// The `min(...)` hint (fix round 1, Minor 6): when the ceiling is below what
+/// the rung allows even with crypto on, the binding half is this node's own
+/// `max_payload`, not the cluster's rung. An operator reading a small ceiling
+/// beside a large rung would otherwise read it as a discovery failure.
 ///
 /// Deliberately NOT on this line: `uc2_commands_over_standard_total`, the
 /// third thing spec §9 names. It is an in-process counter on the node's
@@ -1177,11 +1196,35 @@ fn run_gen_admin_key(a: &GenAdminKeyArgs) -> anyhow::Result<()> {
 /// publishing it here would cost a cnc page word, which is a flag day. It
 /// lives in `/metrics` alone.
 fn ceiling_line(ceiling: u64, committed: Option<u32>) -> String {
-    let (rung, origin) = match committed {
-        Some(r) if r != 0 => (r, "discovered"),
-        _ => (uc_protocol::v2::datagram::MTU_DEFAULT as u32, "baseline"),
-    };
-    format!("ceiling: {ceiling} B (rung {rung}, {origin})")
+    use uc_protocol::v2::datagram::{MTU_DEFAULT, payload_ceiling};
+
+    // The smallest ceiling `rung` can produce (crypto on) — anything below it
+    // is this node's own bound, never the rung's.
+    let node_local_capped = |rung: u32| ceiling < payload_ceiling(rung as usize, true) as u64;
+    let hint = " — capped by this node's own max_payload, not by the rung";
+
+    match committed {
+        Some(r) if r != 0 => format!(
+            "ceiling: {ceiling} B (rung {r}, discovered){}",
+            if node_local_capped(r) { hint } else { "" }
+        ),
+        // No artifact, or one that still says baseline, against a ceiling the
+        // baseline rung cannot carry.
+        _ if ceiling > payload_ceiling(MTU_DEFAULT, false) as u64 => format!(
+            "ceiling: {ceiling} B (rung >{}, discovered — inferred from the ceiling; \
+             no committed cluster artifact to read the rung from)",
+            MTU_DEFAULT
+        ),
+        _ => format!(
+            "ceiling: {ceiling} B (rung {}, baseline){}",
+            MTU_DEFAULT,
+            if node_local_capped(MTU_DEFAULT as u32) {
+                hint
+            } else {
+                ""
+            }
+        ),
+    }
 }
 
 /// One field's value out of a flat, single-line JSON object, as decoded
@@ -1262,8 +1305,18 @@ fn format_audit_line(line: &str) -> Option<String> {
     let outcome = json_field(line, "outcome")?;
     let reason = json_field(line, "reason")?;
     let cfg = json_field(line, "config_version")?;
+    // Jumbo spec §9: `source` separates an operator's request from the
+    // `settings_apply` record path-MTU discovery writes on its own. Rendered
+    // only when it is NOT `operator` — the common line must not grow a column
+    // that never varies — and `?`-free on purpose: a record written by a
+    // pre-2.12 node has no `source` key, and this reader is what an operator
+    // uses to read an old file.
+    let src = match json_field(line, "source") {
+        Some(s) if s != "operator" => format!("  src={s}"),
+        _ => String::new(),
+    };
     Some(format!(
-        "{ts}  {actor}  {origin}  {op_name}  {id}  {addr}  {outcome}({reason})  cfg={cfg}"
+        "{ts}  {actor}  {origin}  {op_name}  {id}  {addr}  {outcome}({reason})  cfg={cfg}{src}"
     ))
 }
 
@@ -1332,6 +1385,50 @@ mod tests {
             ceiling_line(8896, Some(8960)),
             "ceiling: 8896 B (rung 8960, discovered)"
         );
+    }
+
+    /// Review fix round 1, Important 1: the artifact is NOT a live reader.
+    /// `read_committed_settings` recovers only from
+    /// `snapshots/cluster/*.ultcluster`, and those are written only at
+    /// coordinated snapshot instants — whose default cadence
+    /// (`snapshot_interval_bytes = 0`) is "operator-commanded only". So a
+    /// default cluster that discovers and commits 8960 has no artifact to read
+    /// the rung out of, and the line must not then assert the BASELINE against
+    /// a ceiling that disproves it. A ceiling above the baseline rung's own
+    /// maximum (1344 B, crypto off) is proof a higher rung committed; the line
+    /// says `discovered`, marks the rung as inferred rather than read, and
+    /// never states a number it did not read.
+    #[test]
+    fn the_ceiling_line_infers_a_discovered_rung_when_the_artifact_is_behind() {
+        let line = ceiling_line(8896, None);
+        assert!(line.contains("discovered"), "{line}");
+        assert!(line.contains("inferred"), "{line}");
+        assert!(!line.contains("baseline)"), "{line}");
+        assert!(!line.contains("rung 1408"), "it did not read 1408: {line}");
+        // The same inference off a STALE artifact that still says baseline.
+        assert_eq!(ceiling_line(8896, Some(0)), line);
+        // 1344 is exactly what the baseline rung carries crypto-off, so it
+        // proves nothing and the line stays `baseline`.
+        assert!(ceiling_line(1344, None).contains("baseline"));
+    }
+
+    /// Review fix round 1, Minor 6: when this node's own `max_payload` caps
+    /// below what the committed rung allows, the node-local bound is the
+    /// binding half — the same `min(...)` the metric's help string spells out.
+    /// Say so, or an operator reads the small number as a discovery failure.
+    #[test]
+    fn the_ceiling_line_names_the_node_local_bound_when_it_is_the_binding_half() {
+        let capped = ceiling_line(4096, Some(8960));
+        assert!(capped.contains("rung 8960, discovered"), "{capped}");
+        assert!(capped.contains("max_payload"), "{capped}");
+        // The rung's own ceiling, crypto off: nothing node-local binds.
+        assert!(!ceiling_line(8896, Some(8960)).contains("max_payload"));
+        // Crypto ON at the top rung lands on 8864, which is the rung's
+        // ceiling for that cluster and NOT a node-local cap.
+        assert!(!ceiling_line(8864, Some(8960)).contains("max_payload"));
+        // The baseline, crypto on: 1312 is the rung's ceiling, not a cap.
+        assert!(!ceiling_line(1312, None).contains("max_payload"));
+        assert!(ceiling_line(256, None).contains("max_payload"));
     }
 
     /// Coordinated-snapshot plan 2 Task 7: pin the 48-50 band's names — the
@@ -1528,5 +1625,29 @@ mod tests {
         // silently wrong.
         let line = r#"{"ts_ns":1,"actor":"ops\qalice","origin":"local","op_name":"add_learner","id":4,"addr":null,"outcome":"accepted","reason":0,"config_version":1}"#;
         assert_eq!(format_audit_line(line), None);
+    }
+
+    /// Review fix round 1, Minor 3: jumbo spec §9 put a record in
+    /// `audit.jsonl` that no operator asked for — path-MTU discovery's own
+    /// `settings_apply`. The summarized rendering has to SAY so; `actor=node`
+    /// alone is a convention a reader has to already know. `operator`, the
+    /// overwhelming majority, stays silent so the common line does not grow a
+    /// column that never varies.
+    #[test]
+    fn format_audit_line_marks_a_record_no_operator_asked_for() {
+        let base = r#"{"ts_ns":1,"actor":"node","origin":"local","op_name":"settings_apply","id":8960,"addr":null,"outcome":"accepted","reason":0,"config_version":4096"#;
+        let discovery = format!("{base},\"detail\":null,\"source\":\"discovery\"}}");
+        let rendered = format_audit_line(&discovery).expect("a well-formed line");
+        assert!(rendered.contains("src=discovery"), "{rendered}");
+
+        let operator = format!("{base},\"detail\":null,\"source\":\"operator\"}}");
+        let rendered = format_audit_line(&operator).expect("a well-formed line");
+        assert!(!rendered.contains("src="), "{rendered}");
+
+        // A line from a pre-2.12 node has no `source` key at all and must
+        // still render — this reader is what an operator uses to read an OLD
+        // file.
+        let legacy = format!("{base},\"detail\":null}}");
+        assert!(format_audit_line(&legacy).is_some(), "{legacy}");
     }
 }

@@ -857,11 +857,23 @@ fn push_service_families(out: &mut String, s: &ObsSources, commit: u64, now: u64
         "The live command payload ceiling in bytes — min(this node's max_payload bound, payload_ceiling(committed rung, crypto)), the same value clients read from the cnc page.",
         s.cnc.payload_ceiling(),
     );
+    // ONE encoding of "nothing is proven", which is 0. `own_min_rung` answers
+    // MTU_BOUND for an empty peer map — errata 4's parenthetical, which the
+    // commit rule's neighbourhood depends on and which stays exactly as it is
+    // — but that is the helper's internal convention, not this series'
+    // contract: exported raw it would make a solo cluster (which has measured
+    // nothing) read identically to one that genuinely verified the top rung,
+    // and would leave `Uc2MtuDiscoveryStalled` firing forever on every
+    // one-node deployment.
     push_gauge(
         out,
         "uc2_probe_min_mtu_bytes",
-        "This node's own verified minimum over its PEERS (jumbo spec §5.2); 0 while any peer is unresolved, and 8960 (MTU_BOUND) on a node with no peers at all, whose only path is loopback. The leader's commit rule consults the stricter table minimum, which also requires every member's advertised half.",
-        s.probe.own_min_rung() as u64,
+        "This node's own verified minimum over its PEERS (jumbo spec §5.2). 0 means NOTHING IS PROVEN — either this node has no peers (a solo cluster has measured no path) or some peer is still unresolved. The leader's commit rule consults the stricter table minimum, which also requires every member's advertised half.",
+        if s.probe.peers().is_empty() {
+            0
+        } else {
+            s.probe.own_min_rung() as u64
+        },
     );
     push_counter(
         out,
