@@ -46,6 +46,12 @@ pub struct PeerProbe {
 pub struct ProbeTable {
     cadence: ProbeCadence,
     peers: Mutex<HashMap<SocketAddr, PeerProbe>>,
+    /// Rounds a [`ProbeTable::due`] call scheduled that put NOTHING on the
+    /// wire — ROUND-scoped, not rung-scoped: a round tries every rung above
+    /// a peer's `verified` size at once, and one call to
+    /// [`ProbeTable::note_unsent_for`] covers however many of those rungs
+    /// never left the host, so this counts "how many rounds needed the
+    /// give-back", not "how many individual probes were refused".
     unsent: AtomicU64,
     /// The soonest `next_due_ns` over the UNRESOLVED peers, or `u64::MAX`
     /// when every peer is resolved (or there are none). Maintained under
@@ -263,10 +269,15 @@ impl ProbeTable {
         Some(min)
     }
 
-    /// A probe for `peer` that never left the host: no pairwise session yet, or
-    /// the kernel refused its size. Counts the miss AND gives the peer its
-    /// attempt back, so an attempt is only ever spent on a datagram that
-    /// actually went out (final review, plan 1).
+    /// A round for `peer` that put nothing on the wire: no pairwise session
+    /// yet, or every rung the round tried had its size refused. Counts the
+    /// miss AND gives the peer its attempt back, so an attempt is only ever
+    /// spent on a datagram that actually went out — the refund mechanism
+    /// itself is carried from plan 1's final review; calling this AT MOST
+    /// ONCE per round (never once per rung) is new to the jumbo-discovery
+    /// task that added `emsgsize_over` and `probe_emsgsize` — see the
+    /// caller, `Sender::send_due_probes`, for why a per-rung call would
+    /// over-decrement.
     ///
     /// Why a decrement and not "don't count until sent": `due()` bumps
     /// `attempts` and schedules the next deadline before the caller knows
@@ -283,6 +294,8 @@ impl ProbeTable {
         self.publish_earliest(&g);
     }
 
+    /// Rounds that put nothing on the wire — see the `unsent` field's doc:
+    /// ROUND-scoped, not rung-scoped.
     pub fn unsent(&self) -> u64 {
         self.unsent.load(Ordering::Relaxed)
     }

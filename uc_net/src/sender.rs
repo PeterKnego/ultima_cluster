@@ -2096,6 +2096,7 @@ mod tests {
     use uc_log::cnc::{CncMeta, CncPage};
     use uc_log::region::Region;
     use uc_protocol::v2::crypto::{COUNTER_LEN, TAG_LEN, read_counter};
+    use uc_protocol::v2::datagram::RUNGS;
     use uc_protocol::v2::datagram::{read_datagram_header, read_snap_redirect_body};
     use uc_protocol::v2::frame::{
         FRAME_TYPE_MESSAGE, FrameHeader, HEADER_LEN, OFF_TYPE, read_header,
@@ -2252,17 +2253,75 @@ mod tests {
         s.do_work();
         assert_eq!(s.stats().emsgsize.load(Ordering::Relaxed), 1);
         // A probe past the cap: counted in `probe_emsgsize`, NOT `emsgsize`.
+        // MIXED round: RUNGS = [1408, 8832, 8960] and `emsgsize_over: 1408`
+        // (the cap check is strict `>`), so the 1408 rung sends and the other
+        // two EMSGSIZE — this pins the ZERO-REFUND half only (something DID
+        // go out this round, so `due()`'s one `attempts` bump must survive
+        // untouched, not just be "at least" preserved). The all-refused half
+        // (nothing goes out, the refund fires exactly once) is a separate
+        // test below.
         let t = ProbeTable::new(ProbeCadence::default());
         t.set_peers(&[fake.addr()]);
         s.set_probe_table(Arc::clone(&t));
         s.do_work();
-        assert!(t.get(fake.addr()).unwrap().attempts >= 1);
-        assert!(s.stats().probe_emsgsize.load(Ordering::Relaxed) >= 1);
+        assert_eq!(t.get(fake.addr()).unwrap().attempts, 1, "zero-refund half");
+        assert_eq!(s.stats().probe_emsgsize.load(Ordering::Relaxed), 2);
+        assert_eq!(t.unsent(), 0, "something went out: no refund this round");
         assert_eq!(
             s.stats().emsgsize.load(Ordering::Relaxed),
             1,
             "unchanged by probes"
         );
+    }
+
+    /// The other half of the give-back property: a round where EVERY rung
+    /// EMSGSIZEs (`emsgsize_over` below the smallest rung) puts NOTHING on
+    /// the wire, so `send_due_probes` must give the round's one attempt back
+    /// exactly ONCE — not once per rung. A per-rung `note_unsent_for` call
+    /// (the shape this task's brief sketched, and a regression this test is
+    /// built to catch) would decrement `attempts` three times against
+    /// `due()`'s single increment, saturating to 0 the same as the correct
+    /// answer — so this test also pins `unsent()` at exactly 1 (one round,
+    /// not one per rung), which the saturating attempts value alone cannot
+    /// distinguish.
+    #[test]
+    fn an_all_refused_probe_round_gives_back_exactly_one_attempt() {
+        let b = jumbo_buffer();
+        let fake = Fake::new();
+        let mut sock = FaultSocket::bind("127.0.0.1:0").unwrap();
+        sock.set_faults(FaultConfig {
+            emsgsize_over: 100, // below every RUNGS entry: the whole round refuses
+            ..FaultConfig::default()
+        });
+        let (_tx, rx) = mpsc::sync_channel(1024);
+        let mut cfg = SenderConfig::new(9);
+        cfg.heartbeat_ns = u64::MAX;
+        let mut s = Sender::new(
+            Arc::clone(&b),
+            sock,
+            vec![fake.addr()],
+            3,
+            rx,
+            cfg,
+            term_handle(9),
+            always_leader(),
+        );
+        let t = ProbeTable::new(ProbeCadence::default());
+        t.set_peers(&[fake.addr()]);
+        s.set_probe_table(Arc::clone(&t));
+        s.do_work();
+        assert_eq!(
+            t.get(fake.addr()).unwrap().attempts,
+            0,
+            "the round's one attempt was given back, not spent"
+        );
+        assert_eq!(
+            s.stats().probe_emsgsize.load(Ordering::Relaxed),
+            RUNGS.len() as u64,
+            "every rung in the round refused for size"
+        );
+        assert_eq!(s.stats().emsgsize.load(Ordering::Relaxed), 0);
+        assert_eq!(t.unsent(), 1, "one refused ROUND, not one per refused rung");
     }
 
     #[test]
