@@ -44,13 +44,15 @@ import math
 import statistics
 import sys
 import time
+import types
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 import m6_fleet_gate as m6  # noqa: E402
 import m12_fleet_gate as m12  # noqa: E402
 import tt_fleet_gate as tt  # noqa: E402
-from m12_fleet_gate import ssh, start_unit, kill_unit, tail_log, Verdict  # noqa: E402
+import m14_fleet_gate as m14  # noqa: E402
+from m12_fleet_gate import ssh, start_unit, kill_unit, tail_log, truncate_log, Verdict  # noqa: E402
 
 # ------------------------------------------------------------------ knobs
 #
@@ -70,6 +72,11 @@ ROW_A_MIN_NODES = 2                 # errata 4: a solo cluster never raises
 
 ROW_B_RUNG_BAR_PCT = -3.0           # row b: 64 B throughput within -3%
 ROW_B_MIN_PAIRS = 5                 # row b: "minimum 5 pairs"
+ROW_B_NARROW_MTU = 1500             # row b/d: the interface MTU forced by ssh
+ROW_B_SAMPLE_SECS = 60.0            # row b: how long the three series are sampled
+ROW_B_PRELIM_REPS = 4               # row b: base-tree reps that fix the pair count
+ROW_B_PAIRS_MAX_DEFAULT = 12        # row b: cap on what required_pairs may ask for
+ROW_D_POLL_SECS = 45.0              # row d: how long to wait for a refusal (bar is 30)
 
 ROW_C_PLATEAU_BAR_PCT = 15.0        # envelope-map brief §6: >= 15% over standard
 ROW_C_RUNG_BAR_PCT = 3.0            # envelope-map brief §6: within -3% (magnitude)
@@ -131,6 +138,42 @@ def required_pairs(observed_n, observed_stat_pct, target_stat_pct, min_pairs=5):
         return min_pairs
     needed = math.ceil(observed_n * (observed_stat_pct / target_stat_pct) ** 2)
     return max(needed, min_pairs)
+
+
+def spread_stat_pct(rates):
+    """The base tree's own arm-to-arm spread as a percentage: sem / mean. This
+    is the `observed_stat_pct` that `required_pairs` turns into a pair count
+    (the 2026-08-31 lesson: fix the count from what the rig actually did,
+    never from a hoped-for noise figure)."""
+    if len(rates) < 2:
+        return None
+    mean = statistics.fmean(rates)
+    if mean <= 0:
+        return None
+    sem = statistics.stdev(rates) / math.sqrt(len(rates))
+    return 100.0 * sem / mean
+
+
+def paired_delta_pct(base_rate, head_rate):
+    """One interleaved pair's delta, head relative to base, in percent."""
+    return 100.0 * (head_rate - base_rate) / base_rate
+
+
+def refusal_from_log(text, reasons):
+    """The FIRST obs record in `text` whose `event` is one of `reasons`, as
+    `(reason, ts_ns, peer)` — or `None`. The daemon writes one JSON object per
+    line (`uc_obs`); a fail-stop's reason record carries `peer`."""
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        if rec.get("event") in reasons:
+            return rec["event"], int(rec.get("ts_ns", 0)), str(rec.get("peer", ""))
+    return None
 
 
 def paired_stats(deltas_pct):
@@ -652,6 +695,27 @@ def selftest():
     check("exit code: a single stub arm alone is NOT-RUN",
           exit_code_for_results({"b": None}), EXIT_NOT_RUN)
 
+    # Row b's fleet helpers (the run, 2026-09-12): the base spread that fixes
+    # the pair count, the per-pair delta, and the refusal-record reader row d
+    # shares.
+    check("spread_stat_pct: identical rates spread 0",
+          spread_stat_pct([100.0, 100.0, 100.0, 100.0]), 0.0)
+    check("spread_stat_pct: one rate is no spread", spread_stat_pct([100.0]), None)
+    sp = spread_stat_pct([90.0, 110.0, 100.0, 100.0])
+    check("spread_stat_pct: sem/mean in percent (sem 4.08 of mean 100)",
+          round(sp, 2), 4.08)
+    check("paired_delta_pct: head 97 of base 100 is -3", paired_delta_pct(100.0, 97.0), -3.0)
+    log = ('{"ts_ns":1,"level":"info","event":"became_follower","node":0,"term":1}\n'
+           'garbage line\n'
+           '{"ts_ns":31000000000,"level":"error","event":"jumbo_path_too_narrow",'
+           '"node":0,"peer":2,"carried":1408,"required":8832,"waited_secs":30}\n'
+           '{"ts_ns":32000000000,"level":"error","event":"agent_failstopped","agent":"uc2-consensus"}\n')
+    check("refusal_from_log: first matching record, with peer",
+          refusal_from_log(log, (ROW_D_FORCE_REASON_NARROW, ROW_D_FORCE_REASON_SILENT)),
+          (ROW_D_FORCE_REASON_NARROW, 31000000000, "2"))
+    check("refusal_from_log: nothing matching is None",
+          refusal_from_log(log, ("some_other_event",)), None)
+
     for f in fails:
         print(f"SELFTEST FAIL {f}")
     print(f"SELFTEST: {len(fails)} failure(s)")
@@ -729,6 +793,78 @@ def force_interface_mtu(host, iface, mtu):
         raise RuntimeError(f"set mtu {mtu} on {host.public_ip}/{iface}: {r.stderr}")
 
 
+def build_uc_node(hosts):
+    """The ansible provision builds only the gate EXAMPLES; the jumbo rows
+    run the real `uc2-node` daemon (a node.toml is the only way to set
+    `force_jumbo_frames`), so build it once per host, on the host, from the
+    rsynced head tree — the same discipline `m14.prepare_base_tree` uses."""
+    env = "sudo env CARGO_HOME=/opt/bench/.cargo RUSTUP_HOME=/opt/bench/.rustup"
+    for h in hosts:
+        cmd = (f"{env} {m6.SshHost.CARGO} build --release "
+               f"--manifest-path {m6.SshHost.UC_SRC}/Cargo.toml -p uc_node --bin uc2-node "
+               f"&& test -x {h.gate} && sha256sum {h.gate} && echo NODE-OK")
+        r = ssh(h, cmd, label="build-node", timeout=1800)
+        if "NODE-OK" not in (r.stdout or ""):
+            raise RuntimeError(f"uc2-node build on {h.public_ip}: {(r.stderr or r.stdout)[-2000:]}")
+        print(f"INFO uc2-node on {h.public_ip}: " + (r.stdout or "").strip().splitlines()[-2],
+              flush=True)
+
+
+def stop_jumbo_cluster(hosts):
+    for h in hosts:
+        kill_unit(h, "jumbo-node")
+
+
+def start_jumbo_cluster(hosts, args, force=False, skip=()):
+    """A FRESH cluster of real `uc2-node` daemons on `hosts` (instance dirs
+    wiped), every member in every node.toml, the units in `skip` (by index)
+    never started — row d's silent arm. Returns the controller wall-clock
+    ns at which the last unit was started."""
+    members = [(idx, f"{h.private_ip}:19200") for idx, h in enumerate(hosts)]
+    last_start_ns = 0
+    for idx, h in enumerate(hosts):
+        cfg = f"{h.dir}/node.toml"
+        body = render_node_toml(idx, members[idx][1], h.dir, members, force_jumbo_frames=force,
+                                metrics_addr=f"{h.private_ip}:{METRICS_PORT_DEFAULT}")
+        ssh(h, f"sudo rm -rf {h.dir} && sudo mkdir -p {h.dir} && "
+               f"sudo tee {cfg} >/dev/null <<'JCFG'\n{body}\nJCFG",
+            label="write-config")
+        truncate_log(h, "jumbo-node")
+        if idx in skip:
+            print(f"INFO n{idx} ({h.public_ip}) deliberately NOT started", flush=True)
+            continue
+        start_unit(h, "jumbo-node", ["--config", cfg], nofile=True)
+        last_start_ns = time.time_ns()
+    return last_start_ns
+
+
+def sample_series(hosts, names, secs, period=1.0):
+    """Every host's `names` gauges/counters, sampled every `period` for
+    `secs`: `{name: {public_ip: [values...]}}`. A scrape that does not answer
+    contributes nothing for that tick (so a series is never padded with a
+    made-up value) and is counted in `misses`."""
+    out = {n: {h.public_ip: [] for h in hosts} for n in names}
+    misses = 0
+    deadline = time.time() + secs
+    while time.time() < deadline:
+        for h in hosts:
+            m = scrape_prom(h)
+            if not m:
+                misses += 1
+                continue
+            for n in names:
+                v = read_gauge(m, n)
+                if v is not None:
+                    out[n][h.public_ip].append(int(v))
+        time.sleep(period)
+    return out, misses
+
+
+def host_mtu(host, iface):
+    r = ssh(host, f"cat /sys/class/net/{iface}/mtu", label="mtu")
+    return int((r.stdout or "0").strip() or 0)
+
+
 def run_arm_a(hosts, args):
     """Row a: 3 reps, every node's `uc2_datagram_mtu_bytes` == 8960 within
     10s of the last node's start. Needs >= 2 members (errata 4)."""
@@ -736,18 +872,8 @@ def run_arm_a(hosts, args):
         raise SystemExit(f"row a needs >= {ROW_A_MIN_NODES} nodes (errata 4)")
     reps = []
     for i in range(ROW_A_MIN_REPS):
-        for h in hosts:
-            kill_unit(h, "jumbo-node")
-        members = [(idx, f"{h.private_ip}:19200") for idx, h in enumerate(hosts)]
-        last_start_ns = 0
-        for idx, h in enumerate(hosts):
-            cfg = f"{h.dir}/node.toml"
-            body = render_node_toml(idx, members[idx][1], h.dir, members,
-                                     metrics_addr=f"{h.private_ip}:{METRICS_PORT_DEFAULT}")
-            ssh(h, f"sudo mkdir -p {h.dir} && sudo tee {cfg} >/dev/null <<'JCFG'\n{body}\nJCFG",
-                label="write-config")
-            start_unit(h, "jumbo-node", [args.uc_node_bin, "--config", cfg])
-            last_start_ns = time.time_ns()
+        stop_jumbo_cluster(hosts)
+        last_start_ns = start_jumbo_cluster(hosts, args)
         deadline = time.time() + ROW_A_ADOPTION_WINDOW_SECS
         nodes = {}
         while time.time() < deadline and len(nodes) < len(hosts):
@@ -756,49 +882,201 @@ def run_arm_a(hosts, args):
                     continue
                 m = scrape_prom(h)
                 v = read_gauge(m, "uc2_datagram_mtu_bytes")
-                if v is not None:
+                if v is not None and int(v) == TOP_RUNG:
                     nodes[h.public_ip] = {"mtu_bytes": int(v), "observed_ns": time.time_ns()}
             time.sleep(0.5)
+        # A node that never reached the top rung inside the window is
+        # recorded with whatever it last read, so the verdict names it.
+        for h in hosts:
+            if h.public_ip not in nodes:
+                m = scrape_prom(h)
+                v = read_gauge(m, "uc2_datagram_mtu_bytes")
+                nodes[h.public_ip] = {"mtu_bytes": int(v) if v is not None else -1,
+                                      "observed_ns": time.time_ns()}
+        print(f"INFO row a rep{i + 1}: " + ", ".join(
+            f"{ip}={n['mtu_bytes']}@+{(n['observed_ns'] - last_start_ns) / 1e9:.1f}s"
+            for ip, n in nodes.items()), flush=True)
         reps.append({"last_start_ns": last_start_ns, "nodes": nodes})
+    stop_jumbo_cluster(hosts)
     print("ROW-A-JSON " + json.dumps(reps), flush=True)
     v = verdict_row_a(reps)
     print(f"[{'PASS' if v.passed else 'FAIL'}] {v.row} — {v.detail}")
     return v
 
 
+def m14_namespace(args):
+    """The argparse fields `m14_fleet_gate`'s rate-arm path reads
+    (`setup_fleet`, `one_arm` -> `run_rate_arm`), with this driver's values.
+    `no_sync`: the provision already rsynced the head tree; `m12.prepare_host`
+    (inside `setup_fleet`) builds its gate examples on the host."""
+    return types.SimpleNamespace(
+        hosts=args.hosts, ssh_user=args.ssh_user, ssh_key=args.ssh_key,
+        no_sync=True, local_tree=args.local_tree, payload=64, inflight=4096, pin=False,
+    )
+
+
+def paired_64b(head_voters, base_voters, ns, pairs, label):
+    """`pairs` interleaved base/head n1 arms (64 B, direct client on the
+    leader host), the m14 driver's own `one_arm` each time — fresh cluster
+    per arm, so no mixed-version cluster ever exists. Odd pairs run base
+    first, even pairs head first, so a drift across the run lands on both.
+    Returns (base_rates, head_rates, deltas_pct)."""
+    base_rates, head_rates, deltas = [], [], []
+    for k in range(1, pairs + 1):
+        order = (("base", base_voters), ("head", head_voters)) if k % 2 else \
+                (("head", head_voters), ("base", base_voters))
+        got = {}
+        for arm, voters in order:
+            with m14.tt_disabled():
+                d = m14.one_arm(voters, ns, f"{label} {arm} n1 pair{k}", [(0, 0)], None, {},
+                                [], fan_in=False, check=False)
+            got[arm] = m14.rate_of(d)
+        base_rates.append(got["base"])
+        head_rates.append(got["head"])
+        deltas.append(paired_delta_pct(got["base"], got["head"]))
+        print(f"INFO {label} pair{k}: base {got['base']:.0f} head {got['head']:.0f} "
+              f"delta {deltas[-1]:+.3f}%", flush=True)
+    return base_rates, head_rates, deltas
+
+
 def run_arm_b(hosts, args):
-    """Row b: the 1500 B arm (spec §10 row b, errata 1). Procedure (gate
-    doc, "When this gate is run" step 2): `force_interface_mtu(h, iface,
-    1500)` on every host, restart the cluster from cold, then sample
-    `uc2_datagram_mtu_bytes` / `uc2_send_emsgsize_total` / `uc2_probe_sent_total`
-    off `scrape_prom` for the run's duration and pass them, together with a
-    preliminary base-tree spread measurement and the interleaved 64 B paired
-    deltas, to `verdict_row_b`. Not implemented as an unattended one-shot
-    here (it needs `--iface`, a base-tree checkout to interleave against,
-    and a live throughput driver) — see the gate doc's step 2 for the exact
-    sequence; this stub exists so `--arms b` names a real function rather
-    than silently falling through."""
-    print("row b: see the gate doc's 'When this gate is run' step 2 "
-         "(force_interface_mtu + scrape_prom sampling + a base-tree-paired "
-         "64 B throughput run, fed to verdict_row_b). Not run by this task.")
+    """Row b: the 1500 B arm (spec §10 row b, errata 1). Force every host's
+    replication interface to 1500, restart the real-daemon cluster from
+    cold, sample `uc2_datagram_mtu_bytes` / `uc2_send_emsgsize_total` /
+    `uc2_probe_sent_total` for `ROW_B_SAMPLE_SECS`, then — with the
+    interface still at 1500 — the 64 B paired throughput against the
+    pre-jumbo base tree: `ROW_B_PRELIM_REPS` base-only arms fix the pair
+    count through `required_pairs` (floor `ROW_B_MIN_PAIRS`, cap
+    `--pairs-max`), then that many interleaved pairs. The interface MTU is
+    restored to what it was in a `finally`."""
+    if not args.base_tree:
+        raise SystemExit("row b needs --base-tree <pre-jumbo checkout> for its paired 64 B arm")
+    iface = args.iface or m12.detect_iface(hosts[0])
+    original = {h.public_ip: host_mtu(h, iface) for h in hosts}
+    print(f"INFO row b: iface {iface}, provisioned MTU {original}", flush=True)
+    try:
+        for h in hosts:
+            force_interface_mtu(h, iface, ROW_B_NARROW_MTU)
+        stop_jumbo_cluster(hosts)
+        start_jumbo_cluster(hosts, args)
+        names = ("uc2_datagram_mtu_bytes", "uc2_send_emsgsize_total", "uc2_probe_sent_total")
+        series, misses = sample_series(hosts, names, ROW_B_SAMPLE_SECS)
+        stop_jumbo_cluster(hosts)
+        mtu_samples = [v for vs in series["uc2_datagram_mtu_bytes"].values() for v in vs]
+        emsg_samples = [v for vs in series["uc2_send_emsgsize_total"].values() for v in vs]
+        # Errata 1's clause is per node; the verdict takes ONE series, so
+        # the fleet-wide sum is what is judged (non-decreasing and rising
+        # iff every node's is, since each is a monotone counter).
+        per_node = [vs for vs in series["uc2_probe_sent_total"].values() if vs]
+        n_min = min((len(vs) for vs in per_node), default=0)
+        probe_series = [sum(vs[i] for vs in per_node) for i in range(n_min)]
+        print(f"INFO row b: {len(mtu_samples)} mtu samples, {misses} scrape misses, "
+              f"probe_sent fleet-wide {probe_series[:1]}->{probe_series[-1:]}", flush=True)
+        print("ROW-B-SERIES-JSON " + json.dumps(series), flush=True)
+
+        # The paired 64 B arm, on m12_gate clusters (the same client and
+        # cluster shape every rate gate uses), head tree vs base tree.
+        ns = m14_namespace(args)
+        m14_hosts, head_voters, _ = m14.setup_fleet(ns)
+        m14.prepare_base_tree(m14_hosts, args.base_tree)
+        base_voters = m14.base_fleet_hosts(ns)[:3]
+        prelim = []
+        for k in range(1, ROW_B_PRELIM_REPS + 1):
+            with m14.tt_disabled():
+                d = m14.one_arm(base_voters, ns, f"row b prelim base n1 rep{k}", [(0, 0)],
+                                None, {}, [], fan_in=False, check=False)
+            prelim.append(m14.rate_of(d))
+        stat = spread_stat_pct(prelim)
+        need = required_pairs(len(prelim), stat, abs(ROW_B_RUNG_BAR_PCT), ROW_B_MIN_PAIRS)
+        pairs = min(need, args.pairs_max)
+        print(f"INFO row b: base prelim {[round(r) for r in prelim]} spread {stat:.3f}% -> "
+              f"need {need} pairs, running {pairs} (cap {args.pairs_max})", flush=True)
+        base_rates, head_rates, deltas = paired_64b(head_voters, base_voters, ns, pairs, "row b")
+        print("ROW-B-PAIRS-JSON " + json.dumps({"prelim": prelim, "base": base_rates,
+                                                  "head": head_rates, "deltas_pct": deltas}),
+              flush=True)
+        v = verdict_row_b(mtu_samples, emsg_samples, probe_series, deltas, len(prelim), stat)
+        print(f"[{'PASS' if v.passed else 'FAIL'}] {v.row} — {v.detail}")
+        return v
+    finally:
+        for h in hosts:
+            if original.get(h.public_ip):
+                force_interface_mtu(h, iface, original[h.public_ip])
+        print(f"INFO row b: iface {iface} restored to {original}", flush=True)
+
+
+def await_refusals(hosts, live, start_ns, secs=ROW_D_POLL_SECS):
+    """Poll each live host's unit log until every one carries a force-gate
+    refusal record or `secs` elapse. `elapsed_secs` is measured from the
+    controller's start instant to the record's own `ts_ns` (host wall
+    clock; the fleet runs chrony, so the skew is milliseconds against a
+    30 s bar)."""
+    reasons = (ROW_D_FORCE_REASON_NARROW, ROW_D_FORCE_REASON_SILENT)
+    found = {}
+    deadline = time.time() + secs
+    while time.time() < deadline and len(found) < len(live):
+        for idx in live:
+            if idx in found:
+                continue
+            got = refusal_from_log(tail_log(hosts[idx], "jumbo-node", lines=400), reasons)
+            if got:
+                reason, ts_ns, peer = got
+                found[idx] = {"reason": reason, "elapsed_secs": (ts_ns - start_ns) / 1e9,
+                              "peer": peer}
+                print(f"INFO n{idx}: {reason} peer={peer} at +{found[idx]['elapsed_secs']:.1f}s",
+                      flush=True)
+        time.sleep(1.0)
+    return {f"n{idx}": r for idx, r in found.items()}
+
+
+def run_arm_d(hosts, args):
+    """Row d: the two `force_jumbo_frames` arms (spec §10 row d). Arm 1: all
+    three nodes forced, interface at 1500 -> every node refuses
+    `jumbo_path_too_narrow` naming a peer. Arm 2: interface restored, two
+    nodes forced, the third never started -> both refuse
+    `jumbo_peer_silent` naming it. A fresh cluster each arm; the MTU is
+    restored in a `finally`."""
+    if len(hosts) < 3:
+        raise SystemExit("row d needs 3 nodes")
+    hosts = hosts[:3]
+    iface = args.iface or m12.detect_iface(hosts[0])
+    original = {h.public_ip: host_mtu(h, iface) for h in hosts}
+    try:
+        for h in hosts:
+            force_interface_mtu(h, iface, ROW_B_NARROW_MTU)
+        stop_jumbo_cluster(hosts)
+        start_ns = start_jumbo_cluster(hosts, args, force=True)
+        force_arm = await_refusals(hosts, [0, 1, 2], start_ns)
+        stop_jumbo_cluster(hosts)
+        for h in hosts:
+            force_interface_mtu(h, iface, original[h.public_ip])
+        start_ns = start_jumbo_cluster(hosts, args, force=True, skip=(2,))
+        silent_arm = await_refusals(hosts, [0, 1], start_ns)
+        stop_jumbo_cluster(hosts)
+    finally:
+        for h in hosts:
+            if original.get(h.public_ip):
+                force_interface_mtu(h, iface, original[h.public_ip])
+    print("ROW-D-JSON " + json.dumps({"force_1500": force_arm, "silent_9001": silent_arm}),
+          flush=True)
+    v = verdict_row_d(force_arm, silent_arm)
+    print(f"[{'PASS' if v.passed else 'FAIL'}] {v.row} — {v.detail}")
+    return v
 
 
 def run_arm_c(hosts, args, window_secs=ROW_C_BLACKHOLE_WINDOW_SECS, min_rung=JUMBO_MIN_RUNG):
     """Row c: the envelope-map brief's own soak (spec §10 row c).
 
-    Fix round 1 (Important 2): the pre-arm blackhole probe is the ONE part
-    of this arm that is real, wired first, before any soak work — a stub
-    that only printed the procedure (as the rest of this arm still does)
-    left "abort loudly" reachable only from `--selftest`, which is exactly
-    the failure mode the brief's blackhole-probe requirement exists to
-    prevent. This function actually samples every host's
-    `uc2_datagram_mtu_bytes` over `window_secs` and calls
-    `check_blackhole_probe`; a jumbo arm that never clears the jumbo
-    minimum returns a FAIL `Verdict` (which reaches the process exit code
-    via `exit_code_for_results` — see `main`) instead of falling through to
-    the soak. The soak orchestration itself (spec §10 row c / the brief's
-    §3-§5) stays a stub: it is its own multi-hour driver, not a
-    systemd-run one-liner, and is out of this task's scope."""
+    The pre-arm blackhole probe is real and wired first: this samples every
+    host's `uc2_datagram_mtu_bytes` over `window_secs` on a fresh cluster
+    and calls `check_blackhole_probe`; a jumbo arm that never clears the
+    jumbo minimum returns a FAIL `Verdict` (reaching the exit code via
+    `exit_code_for_results`) instead of falling through. The soak beyond it
+    is the brief's own multi-rung instrument (`uc_node/examples/envelope_map.rs`),
+    which does not exist in the tree, so this arm returns NOT-RUN after the
+    probe; the gate doc records that as such."""
+    stop_jumbo_cluster(hosts)
+    start_jumbo_cluster(hosts, args)
     deadline = time.time() + window_secs
     observed = {}
     while time.time() < deadline:
@@ -810,6 +1088,7 @@ def run_arm_c(hosts, args, window_secs=ROW_C_BLACKHOLE_WINDOW_SECS, min_rung=JUM
         if len(observed) == len(hosts) and all(v >= min_rung for v in observed.values()):
             break
         time.sleep(1.0)
+    stop_jumbo_cluster(hosts)
     # `expected` is the arm's WHOLE host list, not just the hosts that
     # answered: a host whose /metrics never answers is absent from `observed`,
     # and without this it would be absent from the stuck set too — i.e. a dead
@@ -821,25 +1100,9 @@ def run_arm_c(hosts, args, window_secs=ROW_C_BLACKHOLE_WINDOW_SECS, min_rung=JUM
         print(f"[FAIL] row c blackhole probe (pre-arm) — {msg}", flush=True)
         return Verdict("c blackhole probe (pre-arm)", False, msg)
     print(f"[OK] row c blackhole probe (pre-arm) — {msg}", flush=True)
-    print("row c: blackhole probe cleared; the envelope-map brief's own soak "
-         "is not implemented as an unattended one-shot here — see the gate "
-         "doc's 'When this gate is run' step 3. Not run by this task.")
+    print("row c: blackhole probe cleared; the envelope-map brief's soak instrument "
+          "(uc_node/examples/envelope_map.rs) does not exist, so the soak is NOT RUN.")
     return None  # NOT-RUN: the probe is real; the soak beyond it is not.
-
-
-def run_arm_d(hosts, args):
-    """Row d: the two `force_jumbo_frames` arms (spec §10 row d). Procedure
-    (gate doc step 4): render `node.toml` with `force_jumbo_frames = true`
-    on the 1500 B arm (all three nodes) and again on the 9001 arm with the
-    third node never started; read each fail-stopped node's reason/elapsed/
-    peer off its exit log (`jumbo_path_too_narrow`/`jumbo_peer_silent`, the
-    as-built `snake_case` strings — see this doc's row d note), and feed
-    both arms to `verdict_row_d`. Not implemented as an unattended one-shot
-    here (it needs two separate cluster provisions); see the gate doc's
-    step 4."""
-    print("row d: see the gate doc's 'When this gate is run' step 4 "
-         "(force_jumbo_frames on both arms, exit-log reasons fed to "
-         "verdict_row_d). Not run by this task.")
 
 
 def run_arm_e(args):
@@ -904,6 +1167,16 @@ def main():
     ap.add_argument("--ssh-key", default="/home/claude/.ssh/id_ed25519")
     ap.add_argument("--uc-node-bin", default=UC_NODE_BUILT_DEFAULT,
                     help="path to the real uc2-node binary on the fleet hosts")
+    ap.add_argument("--iface", default="",
+                    help="replication interface on the hosts (else detected from the default route)")
+    ap.add_argument("--base-tree", default="",
+                    help="row b: local checkout of the pre-jumbo tree, rsynced and built on "
+                         "the hosts beside the head tree (m14_fleet_gate's --base-tree)")
+    ap.add_argument("--local-tree", default=str(Path(__file__).resolve().parent.parent.parent))
+    ap.add_argument("--pairs-max", type=int, default=ROW_B_PAIRS_MAX_DEFAULT,
+                    help="row b: cap on the interleaved pair count required_pairs may ask for")
+    ap.add_argument("--no-build", action="store_true",
+                    help="skip building uc2-node on the hosts (already built this session)")
     a = ap.parse_args()
 
     if a.selftest:
@@ -922,9 +1195,15 @@ def main():
     # discovery nor fails when no fleet state exists.
     hosts = None
     if ARMS_NEEDING_HOSTS.intersection(arms):
-        hosts = m6.build_fleet_hosts(m12.BUILT_GATE, a.ssh_user, a.ssh_key, a.hosts,
-                                     count=a.nodes, unit_prefix=m12.UNIT_PREFIX,
-                                     remote_root=m12.REMOTE_ROOT, probe_bin=m12.BUILT_PROBE)
+        # `gate_bin` is the real daemon: `start_unit` runs `host.gate <args>`,
+        # so the units below are `uc2-node --config <node.toml>`. (The first
+        # revision passed m12_gate here and the daemon path as an ARGUMENT,
+        # which would have run the gate example with a stray positional.)
+        hosts = m6.build_fleet_hosts(a.uc_node_bin, a.ssh_user, a.ssh_key, a.hosts,
+                                     count=a.nodes, unit_prefix="jumbo",
+                                     remote_root="/opt/bench/jumbo", probe_bin=m12.BUILT_PROBE)
+        if not a.no_build:
+            build_uc_node(hosts)
 
     # Important 1 (fix round 1): collect every requested arm's outcome and
     # let it reach the exit code — a runner that returns `None` (a
