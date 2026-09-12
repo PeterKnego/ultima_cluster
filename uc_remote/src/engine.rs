@@ -79,7 +79,31 @@ pub const BOUND_PAYLOAD_CEILING: usize = 8896;
 /// The STANDARD ceiling: `MAX_PAYLOAD_DEFAULT`, the baseline path with crypto
 /// ON — the one size that holds on any cluster, and so the threshold the
 /// developer notification (jumbo spec §8) warns above.
+///
+/// **The comparison is against the bare command**, which is all this tier
+/// knows: with the edge's session envelope on, the node's door sees 16 more
+/// bytes than the client sent (`client_id ++ seq`), and protocol v1 does not
+/// tell a client whether that envelope is on. So a command within 16 B of this
+/// threshold can cross the standard ceiling AT THE NODE without warning here.
+/// Comparing against `STANDARD_PAYLOAD - 16` instead would over-warn every
+/// raw-pass-through client, which is the worse error: the warning exists to
+/// teach a developer a deployment dependency, and a false one teaches nothing.
 pub const STANDARD_PAYLOAD: usize = 1312;
+
+/// Ceiling on the DERIVED default outgoing-ring size (an explicit
+/// `RemoteConfig::out_ring_bytes` is never capped). `max_inflight` defaults to
+/// 1024, so sizing a full window of max-size jumbo frames would reserve 16 MiB
+/// in every remote client — an 8x footprint regression on the 2 MiB the
+/// baseline-sized derivation used to reserve, paid by a CLIENT crate whose
+/// whole point is to be cheap to embed. 4 MiB still buys 470 max-size commands
+/// in flight (and ~3000 of a 1344 B workload), and it cannot turn a jumbo
+/// command into a permanent refusal: `SubmitError::PayloadTooLarge` keys on the
+/// ring's CAPACITY (`need > out.capacity()`), not its occupancy, and 8920 B is
+/// three orders of magnitude under this. A client that wants the full
+/// 1024-deep jumbo window sets `out_ring_bytes` explicitly; otherwise a full
+/// ring is `Backpressure`, which `try_submit` reports and
+/// `RemoteClient::enqueue` parks on.
+const OUT_RING_DERIVED_CAP: usize = 4 << 20;
 
 /// Jumbo spec §8: the remedy clause the notification carries. `RemoteError`'s
 /// text spells the same sentence out inline, because `thiserror`'s format
@@ -169,11 +193,16 @@ pub struct RemoteConfig {
     /// `Backpressure`; one that could never fit the whole ring is
     /// `PayloadTooLarge`.
     ///
-    /// **That derivation is generous on purpose, and it is not free**: at the
-    /// default `max_inflight` of 1024 it reserves 16 MiB (the power-of-two step
-    /// above `1024 x 8920`) where the pre-2.12.0 baseline reserved 2 MiB. A
-    /// client that knows its commands stay small should say so — set this
-    /// explicitly, or lower `max_inflight`.
+    /// **The derived value is capped at 4 MiB** (`OUT_RING_DERIVED_CAP`):
+    /// unclamped, the default `max_inflight` of 1024 against a max-size jumbo
+    /// frame would reserve 16 MiB in every client, 8x what the pre-2.12.0
+    /// baseline-sized derivation reserved. 4 MiB holds 470 max-size (8896 B)
+    /// commands in flight, or about 3000 of a 1344 B workload, so below roughly
+    /// 8920 B average command size the cap is invisible. Two ways to raise it:
+    /// set this field explicitly (an explicit value is never capped), or size
+    /// the window with `max_inflight`. Hitting the cap costs `Backpressure`,
+    /// never `PayloadTooLarge` — that refusal keys on the ring's capacity, not
+    /// on how full it is.
     pub out_ring_bytes: Option<usize>,
     /// Bytes reserved for the completion queue's body arena. `None` derives
     /// it: `max_inflight x 256`, floored at `MAX_FRAME_LEN`, rounded up to a
@@ -256,8 +285,13 @@ impl RemoteConfig {
             // Jumbo spec §7.4: a window of MAX-size commands, and since 2.12.0
             // the max is the top rung's ceiling, not the baseline's.
             let per = crate::frame::HEADER_LEN + BOUND_PAYLOAD_CEILING;
+            // `min` BEFORE `max`, deliberately: the cap bounds the derived
+            // window's footprint ([`OUT_RING_DERIVED_CAP`]), and the
+            // `MAX_FRAME_LEN` floor is applied after it so the cap can never
+            // clamp below "room for any single frame this wire admits".
             (self.max_inflight as usize)
                 .saturating_mul(per)
+                .min(OUT_RING_DERIVED_CAP)
                 .max(crate::frame::MAX_FRAME_LEN as usize)
         })
     }
@@ -937,7 +971,10 @@ mod window_tests {
 
 #[cfg(test)]
 mod ceiling_tests {
-    use super::{BASELINE_PAYLOAD_CEILING, BOUND_PAYLOAD_CEILING, RemoteConfig, STANDARD_PAYLOAD};
+    use super::{
+        BASELINE_PAYLOAD_CEILING, BOUND_PAYLOAD_CEILING, OUT_RING_DERIVED_CAP, RemoteConfig,
+        STANDARD_PAYLOAD,
+    };
 
     /// Jumbo spec §7.4: the inflight ring must hold a window of MAX-size
     /// commands, which is the BOUND's crypto-off ceiling since 2.12.0.
@@ -953,6 +990,46 @@ mod ceiling_tests {
             "{} bytes is below a window of eight jumbo frames",
             c.out_ring_bytes_resolved()
         );
+    }
+
+    /// The derived default is CAPPED: `max_inflight`'s default of 1024 against
+    /// a max-size jumbo frame would reserve 16 MiB in every remote client, an
+    /// 8x footprint regression over the pre-2.12.0 2 MiB. The cap buys 470
+    /// max-size commands in flight and is invisible below ~8920 B average
+    /// command size; the knob that lifts it is an explicit `out_ring_bytes`.
+    #[test]
+    fn the_derived_default_is_capped_at_four_mib() {
+        let c = RemoteConfig {
+            out_ring_bytes: None,
+            ..RemoteConfig::default()
+        };
+        assert_eq!(c.max_inflight, 1024, "the default this test is about");
+        assert_eq!(
+            c.out_ring_bytes_resolved(),
+            OUT_RING_DERIVED_CAP,
+            "the default window must not reserve the full 16 MiB"
+        );
+        assert_eq!(OUT_RING_DERIVED_CAP, 4 << 20);
+    }
+
+    /// The cap can never clamp below the existing `MAX_FRAME_LEN` floor: even
+    /// `max_inflight: 1` keeps room for any single frame this wire admits, a
+    /// max-size jumbo command very much included.
+    #[test]
+    fn a_single_max_size_frame_still_fits_at_a_window_of_one() {
+        let c = RemoteConfig {
+            max_inflight: 1,
+            out_ring_bytes: None,
+            ..RemoteConfig::default()
+        };
+        let resolved = c.out_ring_bytes_resolved();
+        assert_eq!(
+            resolved,
+            crate::frame::MAX_FRAME_LEN as usize,
+            "the floor, not the cap, decides here"
+        );
+        assert!(resolved >= crate::frame::HEADER_LEN + BOUND_PAYLOAD_CEILING);
+        assert!(resolved <= OUT_RING_DERIVED_CAP);
     }
 
     /// `uc_remote` carries its own copies of three numbers `uc_protocol` owns,
