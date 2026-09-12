@@ -30,8 +30,8 @@ Field names match the `NodeConfig` fields below. Four differ in shape:
 | `[[members]]` / `[[learners]]` tables of `id` + `addr` | `Vec<(NodeId, SocketAddr)>` |
 | `[purge]` with `below_snapshot_slack_bytes` — absent means disabled | `PurgePolicy` |
 | `[crypto]` with `enabled` (required), `key_path`, `allowlist_path`, optional `rotation_interval_ns` / `rotation_bytes` | `CryptoConfig` |
-| `[services]` with `names` — **required**, no default (FSM identity, 2.11 pending) | `ServicesConfig` |
-| `[settings]` with `admission_bytes`, `fsm_lag` (a string), `snapshot_interval_bytes`, `snapshot_target` — optional; the **genesis seed** for the cluster's replicated settings record (the cluster FSM, 2.11 pending) | `Settings` (`NodeConfig::settings_genesis`) |
+| `[services]` with `names` — **required**, no default (FSM identity, 2.11.0) | `ServicesConfig` |
+| `[settings]` with `admission_bytes`, `fsm_lag` (a string), `snapshot_interval_bytes`, `snapshot_target` — optional; the **genesis seed** for the cluster's replicated settings record (the cluster FSM, 2.11.0) | `Settings` (`NodeConfig::settings_genesis`) |
 
 Two keys exist only in the file and have no `NodeConfig` field:
 
@@ -79,7 +79,7 @@ structured-event vocabulary, see
 ### `[services]`
 
 M14a: which state-machine processes (FSMs) this node hosts, and how far apart
-they may drift. **Required since FSM identity (2.11 pending, spec §4.1): a
+they may drift. **Required since FSM identity (2.11.0, spec §4.1): a
 `node.toml` without `[services]` refuses to start by name** — the same
 explicit-choice rule `[crypto]` and `[admin]` have had since 2.6.0. There is
 no default set: absent used to mean `ids = [0]`; now a node names every FSM
@@ -101,7 +101,7 @@ and [the FSM identity explainer](../notes/uc2-fsm-identity-and-deterministic-ids
 replaced by services.names (FSM identity): list the FSM names in row order,
 e.g. names = ["kv", "orders"]`.
 
-`fsm_lag` **moved out of this section** with the cluster FSM (2.11 pending):
+`fsm_lag` **moved out of this section** with the cluster FSM (2.11.0):
 it is a cluster-wide policy, so it lives in the replicated settings record and
 is seeded by [`[settings]`](#settings) below. A `fsm_lag` under `[services]`
 is refused by name, pointing at `uc2ctl settings apply`.
@@ -112,7 +112,7 @@ The `uc_` prefix is reserved because UC's own cluster FSM declares
 
 ### `[settings]`
 
-The cluster FSM (2.11 pending, spec §6): the four **cluster-wide** policies
+The cluster FSM (2.11.0, spec §6): the four **cluster-wide** policies
 that used to live per host. This section is a **genesis seed only** — it is
 read when the instance directory is fresh and there is no settings record
 yet, and ignored from the first `CLUSTER` frame onward, exactly as
@@ -153,7 +153,7 @@ replaces:
 |---|---|
 | `bind` must equal this node's own `members` entry | A leader elects, but followers never advance `durable` or `commit` — datagrams arrive from a source address matching no member. |
 | `instance_dir` must not be on a RAM-backed filesystem | Every `fsync` is a silent no-op; the cluster appears to work and loses committed data on power loss. |
-| `max_payload` is refused by name | **Retired since `2.12.0` pending** (jumbo-frame MTU discovery): the payload ceiling is discovered per cluster, not pinned in `node.toml` — the two checks this key used to satisfy (fit one datagram, carry a full schedule table) are gone with it, the second now a compile-time assert against the baseline ceiling. The refusal names `force_jumbo_frames` (a plan-2 key, not yet present) as where a per-cluster override will live. |
+| `max_payload` is refused by name | **Retired since `2.12.0`** (jumbo-frame MTU discovery): the payload ceiling is discovered per cluster, not pinned in `node.toml` — the two checks this key used to satisfy (fit one datagram, carry a full schedule table) are gone with it, the second now a compile-time assert against the baseline ceiling. The refusal points at [`force_jumbo_frames`](#policies) for operators who need to *require* a jumbo path. |
 | `buffer_bytes` must be a power of two | Ring geometry. |
 | this node's `id` must appear in `members` or `learners` | A node not in its own cluster. |
 | `members` and `learners` must be disjoint, ids unique | Ambiguous role and peer-band aliasing. |
@@ -163,17 +163,17 @@ replaces:
 | unknown keys inside `[log]`/`[metrics]` are refused, by name, like every other section | M9 accepted anything inside these two sections unvalidated; M10 defines their schema, so a typo there is now caught the same way as everywhere else. |
 | `[crypto]` section must be present | M12b (spec §3.3): `enabled` is an **explicit choice**, not absent-means-off like `[purge]` — an absent section is `ConfigError::CryptoChoiceRequired`, so a `node.toml` cannot silently run cleartext by omission. `enabled = false` must not also carry `key_path`/`allowlist_path`; `enabled = true` requires both. |
 | `[admin]` section must be present | M12b (spec §3.3, §5.1): `auth` is likewise an explicit choice — an absent section is `ConfigError::AdminChoiceRequired`. `auth = "hmac"` requires at least one uniquely-named entry in `keys`; `auth = "none"` requires `keys` to be empty; `request_ttl_ms` (default 30000) must be `>= 1000` under either mode. |
-| `[services]` section must be present | FSM identity (2.11 pending, spec §4.1): there is no default FSM set — a `node.toml` must name every row, the same explicit-choice posture as `[crypto]`/`[admin]`. |
+| `[services]` section must be present | FSM identity (2.11.0, spec §4.1): there is no default FSM set — a `node.toml` must name every row, the same explicit-choice posture as `[crypto]`/`[admin]`. |
 | `services.ids` is refused, pointing at `names` | FSM identity: `ids` was the pre-identity field; there is no shim — rewrite as `names = ["<fsm>", ...]` in row order. |
 | `services.names` must not be empty | FSM identity: an explicitly-empty list would leave no FSM declared; there is no default to fall back to. |
 | `services.names` entries must be valid FSM names | FSM identity: `1..=32` bytes of lowercase ASCII letters, digits, `_`, `-`, starting with a letter — the same rule the state-machine trait's `const NAME` is checked against at compile time. |
 | `services.names` must not contain a duplicate name | FSM identity: a repeated name would double-attach one row, or leave a service unable to tell which row it found. |
 | `services.names` entries must number at most 8 | FSM identity (was `services.ids` entries must be `< 8`): the cnc page's per-service band holds 8 slots. |
-| `services.names` entries must not start with `uc_` | The cluster FSM (2.11 pending, spec §4.1): `uc_` is reserved for UC's own internal state machines (`uc_cluster`), so a user FSM cannot collide with one. |
-| `services.fsm_lag` is refused, pointing at `[settings]` | The cluster FSM (2.11 pending, spec §6): the lag policy is cluster-wide, so it moved into the replicated settings record — `put fsm_lag under [settings] to seed genesis, and change it with uc2ctl settings apply`. |
+| `services.names` entries must not start with `uc_` | The cluster FSM (2.11.0, spec §4.1): `uc_` is reserved for UC's own internal state machines (`uc_cluster`), so a user FSM cannot collide with one. |
+| `services.fsm_lag` is refused, pointing at `[settings]` | The cluster FSM (2.11.0, spec §6): the lag policy is cluster-wide, so it moved into the replicated settings record — `put fsm_lag under [settings] to seed genesis, and change it with uc2ctl settings apply`. |
 | top-level `admission_bytes` is refused, pointing at `[settings]` | The same change: the admission window is cluster-wide, and its effective value used to change silently on failover. |
 | `settings.fsm_lag` must parse | M14a's rule, now on the seed: an unparsable string (wrong suffix, spaces, a fraction) is refused by name rather than silently falling back to the derived bound. |
-| `settings.snapshot_target` must be `"all"` or `"learners"` | The cluster FSM (2.11 pending): an unknown target would silently pick one. |
+| `settings.snapshot_target` must be `"all"` or `"learners"` | The cluster FSM (2.11.0): an unknown target would silently pick one. |
 
 The RAM-backed-filesystem refusal has two override channels, and **neither is
 silent** — the override suppresses the refusal, never the notice, and the
@@ -237,20 +237,20 @@ gateway edge reads per submit ([cnc page](cnc-page.md#counters-and-status)).
 A fresh cluster starts at the `MTU_DEFAULT = 1408` B baseline rung (1344 B
 crypto-off / 1312 B crypto-on) and rises toward `MTU_BOUND = 8960` B (8896 B /
 8864 B) only once every path has proven it, never before. See
-[the jumbo-frame discovery spec](../superpowers/specs/2026-09-10-uc2-jumbo-frame-discovery-design.md)
-(plan 2 adds an operator override, `force_jumbo_frames`, not present in this
-release).
+[Run a cluster on jumbo frames](../how-to/jumbo-frames.md) for the operator's
+path, and [`force_jumbo_frames`](#policies) below for the one knob this
+feature does add.
 
 **`admission_bytes_default: u64`**
 The **fallback** ingress admission budget in bytes — the `append - commit`
 backpressure gate — used while the replicated `Settings::admission_bytes`
 still reads `0` ("derive at use"). Renamed from `admission_bytes` by the
-cluster FSM (2.11 pending), which moved the live value cluster-wide. The
+cluster FSM (2.11.0), which moved the live value cluster-wide. The
 effective value is published on the cnc page at offset 3712 (since wire
 protocol 0.3.0) and re-published whenever the committed setting moves.
 
 **`settings_genesis: Settings`**
-The cluster FSM (2.11 pending): the [`[settings]`](#settings) seed, installed
+The cluster FSM (2.11.0): the [`[settings]`](#settings) seed, installed
 as the cluster FSM's genesis image on a fresh instance directory and ignored
 thereafter.
 
@@ -273,7 +273,7 @@ Journal purge policy. Default `PurgePolicy::Disabled`. The enabled form is
 Snapshots shorten a service restart only together with purge: reconstruction
 installs an artifact only when the journal no longer covers the start
 position (`uc_service/src/replay.rs`); with purge off it replays the whole
-journal. There is no per-service snapshot policy since 2.11 (pending) —
+journal. There is no per-service snapshot policy since 2.11.0 —
 the retired `SnapshotPolicy` is gone and a snapshot is taken at a **coordinated instant**,
 commanded with [`uc2ctl snapshot`](uc2ctl.md#snapshot) or by the replicated
 `snapshot_interval_bytes` cadence below.
@@ -288,6 +288,33 @@ the daemon prints nothing extra either way, unlike `[admin]`'s `auth = "none"`
 boot warning. The enabled form carries the private key path and the allowlist
 path.
 To turn it on, see [Encrypt traffic between nodes](../how-to/encrypt-node-traffic.md).
+
+**`force_jumbo_frames: bool`** — `2.12.0`, default `false`.
+Turns path-MTU discovery into a **startup gate**. With it set, the node runs
+its agents, replicates and votes as usual, but holds `can_serve` false and
+answers `/readyz` with 503 — in **any** role, not just leader — until every
+configured peer has proven the `JUMBO_MIN_RUNG = 8832` B datagram rung. It then
+logs `jumbo_gate_passed` and serves. If 30 s (`JUMBO_GATE_WINDOW`, a constant)
+elapses first the node **fail-stops** (exit 1) with one of two named refusals:
+`jumbo_path_too_narrow`, when a peer answered below the rung, or
+`jumbo_peer_silent`, when a peer never answered at all — a liveness fact, and
+worded as one. Both name the first offending member id and list every one.
+
+It exists for an application whose commands do not fit the standard ceiling:
+without it such a cluster starts, serves, and refuses those commands one at a
+time at submit. Default `false` is the safe posture — a cluster on a 1500 B
+network behaves exactly as it always did. Env override
+`UC2_FORCE_JUMBO_FRAMES` (one of `1`/`true`/`0`/`false`; deploy-varying on
+purpose, since the same image runs on a jumbo fabric and on a dev box). **On a
+one-node cluster the gate passes immediately**, because there is no peer whose
+path could be narrow; it is a multi-node guarantee. See
+[Run a cluster on jumbo frames](../how-to/jumbo-frames.md#5-require-a-jumbo-path-at-startup).
+
+Independent of this key, and not configurable: once a cluster has **committed**
+a jumbo rung, a node whose path to some member *answers* below it fail-stops at
+startup with `path_below_committed_mtu` rather than joining — the log already
+holds frames it cannot receive. A member that answers nothing never refuses
+anything; the node keeps replicating and voting and simply does not serve.
 
 **`faults: FaultConfig`**
 Fault-injection configuration, used by the simulation and test harnesses.
@@ -315,6 +342,7 @@ They exist so one immutable image can run every node of a cluster: see
 | `UC2_MEMBERS` | `[[members]]` | `id@host:port` pairs, comma-separated: `0@10.0.0.1:9100,1@10.0.0.2:9100`. **Replaces** the table, never merges — a membership list must agree cluster-wide, so a half-overridden one is never what anyone means. |
 | `UC2_LOG_LEVEL` | `[log] level` | `error` \| `warn` \| `info` |
 | `UC2_METRICS_BIND` | `[metrics] bind` | `host:port`. Setting it **creates** the section, so a file with no `[metrics]` still gets an endpoint. |
+| `UC2_FORCE_JUMBO_FRAMES` | `force_jumbo_frames` | `1` \| `true` \| `0` \| `false` — nothing else (`2.12.0`). Deploy-varying: the same image runs where the gate is wanted and where it is not. Anything else is refused by name rather than read as `false`. |
 | `UC2_GATEWAY_INSTANCE_DIR` | gateway `[local] instance_dir` | a path |
 | `UC2_GATEWAY_APP_ID` | gateway `[local] app_id` | a string |
 | `UC2_GATEWAY_LISTEN` | gateway `[local] listen` | `host:port` |

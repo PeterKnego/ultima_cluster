@@ -2,7 +2,7 @@
 
 By default a node's journal grows forever: purging is off, and an unpurged
 cluster is always safe. To bound it you need a **complete snapshot set** to
-purge below — and since 2.11 (pending) a set is something the cluster takes
+purge below — and since 2.11.0 a set is something the cluster takes
 together, at one log position, on command.
 
 This is also a prerequisite for reconfiguring a cluster under sustained write
@@ -118,7 +118,7 @@ silently stops all purging" case loud, and
 `snapshot.target = learners` cluster watch `Uc2StandbySnapshotStalled` on the
 learners instead: the leader is a voter there, and its own set is *supposed*
 not to complete until `uc2ctl snapshot fetch` runs —
-see [Monitor a cluster § The snapshot families](monitor-a-cluster.md#the-snapshot-families-211-pending).
+see [Monitor a cluster § The snapshot families](monitor-a-cluster.md#the-snapshot-families-2110).
 
 ## What happens to a node that falls below the floor
 

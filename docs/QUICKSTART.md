@@ -238,7 +238,7 @@ Four rules are worth carrying away from that file:
 - **`[services]`, `[crypto]` and `[admin]` are required sections.** Since
   `v2.6.0` an absent `[crypto]`/`[admin]` is a startup refusal that names it,
   never a silent default; `[services]` joined them in the FSM identity work
-  (`2.11` pending) — there is no default FSM set any more, a node names
+  (`2.11.0`) — there is no default FSM set any more, a node names
   every FSM it hosts or does not start. A `node.toml` written for `v2.5.0`
   will not start until both older choices are written down, and one written
   before FSM identity needs `[services] names = [...]` added — see
@@ -337,8 +337,7 @@ would diverge. See
 on this frame, the deterministic substitute for a clock a state machine may not
 read; `ctx.ids()` mints deterministic IDs; `ctx.schedule(id, at_ns)` asks for a
 callback into a provided `on_timer(&mut self, ctx, ev)`, which `CounterSm` does
-not implement because it does not need one. All three arrived with `2.11.0`
-(pending) — see
+not implement because it does not need one. All three arrived with `2.11.0` — see
 [Log time and timers, explained](/docs/notes/uc2-log-time-and-timers-explained.md)
 and
 [the FSM identity explainer](/docs/notes/uc2-fsm-identity-and-deterministic-ids-explained.md).

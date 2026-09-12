@@ -565,3 +565,45 @@ Written before the tag, per the release rule:
    cluster agent publishes the view and the consensus agent reads it, which is
    what keeps the appender's door and the door's writer on one thread.
    `docs/reference/cnc-page.md` already documents it that way.
+
+## Errata (plan 2, as built)
+
+6. **§9's probe-counter parenthetical is superseded.** §9 says
+   `uc2_probe_sent_total` "includes EMSGSIZE'd probes in `sent`". As built it
+   counts only probes that **left the host**: a round that put nothing on the
+   wire — no pairwise session yet, or every rung refused by the kernel for
+   size — is counted separately, in an unexported `probe_emsgsize` counter on
+   the sender's stats. Folding the two together would make "discovery traffic
+   emitted" unreadable on exactly the narrow path where it matters, and a
+   refused probe is an expected part of the ladder there. `/metrics` therefore
+   matches §9's table (one counter), with the narrower meaning its help string
+   states.
+7. **§5.4/§6's join gate, as built: no window, and silence never refuses.**
+   The spec describes a settle window (five attempts, ~5 s, or the 30 s gate
+   window under `force_jumbo_frames`) after which `own_min_rung < R` is a
+   fail-stop. Three corrections:
+   - The **join** gate (a committed rung this node has not proven) has **no
+     window at all**. It refuses only a peer that ANSWERED below the committed
+     rung **and** has spent its fast probe ladder
+     (`ProbeTable::narrow_peers`) — proven degradation needs no timer. A peer
+     still inside its fast ladder is mid-discovery: `verified == 1408` with
+     the jumbo rungs in flight is the healthy state, and refusing it would
+     fail-stop healthy nodes.
+   - **Silence never refuses.** A peer that has answered nothing (down, slow,
+     still replaying) says nothing about its path, so it only **holds
+     serving** — `can_serve` false, `/readyz` 503 — indefinitely if need be.
+     A node restarting into a degraded cluster keeps replicating and voting
+     instead of crash-looping under `systemd Restart=on-failure`.
+   - **`force_jumbo_frames` keeps its 30 s window** (`JUMBO_GATE_WINDOW`) and
+     fail-stops as specified; what changed is that `/readyz` answers 503 while
+     **any** gate is pending, in **any** role, rather than only for a leader
+     whose `CAN_SERVE` bit is clear.
+   One rule follows from the same reasoning and is not in the spec: a probe
+   the **kernel refused for size SPENDS its attempt** (it is a proven local
+   fact, unlike the transient "no pairwise session yet", which is refunded).
+   Without it, a host whose own interface MTU is too small never reaches the
+   fast-ladder threshold, so `narrow_peers` never reports it and the gate pends
+   forever at 503 instead of refusing by name. Because the gate cannot tell a
+   narrow peer path from a too-small local MTU, `path_below_committed_mtu`'s
+   text names **both** causes.
+

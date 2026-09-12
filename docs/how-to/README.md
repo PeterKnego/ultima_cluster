@@ -33,6 +33,10 @@ keeping the disk from filling once they are there.
 - [Monitor a cluster](monitor-a-cluster.md) — Prometheus scraping, the alert
   rules, the Grafana dashboard, the `/healthz`/`/readyz` probes, and the
   structured-event vocabulary.
+- [Run a cluster on jumbo frames](jumbo-frames.md) — raise the command payload
+  ceiling from ~1.3 KB to ~8.8 KB by giving the nodes a jumbo fabric: UC
+  discovers the rest, there is no MTU key, and `force_jumbo_frames` turns the
+  discovery into a startup gate. Also why a node now runs on Linux only.
 - [Run work on a schedule](run-work-on-a-schedule.md) — the replicated schedule
   table: write the TOML, apply it against the leader, confirm every node
   adopted the same one, and what a restart or a rebuilt node does to it. UTC

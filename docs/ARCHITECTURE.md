@@ -264,7 +264,7 @@ oneshots — the client matcher correlates off the ring.
   for the raw bytes-in/bytes-out tier underneath it and when to reach for it
   directly.
 - **`SnapshotStateMachine`** *(optional)* — enables journal purge. Since
-  `2.11.0` (unreleased) a snapshot is taken at a **coordinated instant**: a
+  `2.11.0` a snapshot is taken at a **coordinated instant**: a
   `SNAPSHOT` frame the leader appends, at whose frame-end position P every
   declared FSM and UC's own cluster FSM freeze together, so a node's snapshot
   "set" is one log position. A node below the purge floor (crashed service,

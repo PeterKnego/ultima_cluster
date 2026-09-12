@@ -11,13 +11,13 @@ self-locating header is in [Architecture](../ARCHITECTURE.md).
 | Constant | Value |
 |---|---|
 | `version::CURRENT` | `0.7.0` (`0.8.0`, `2.12.0` pending: two new pairwise kinds for jumbo-frame MTU discovery, `PROBE` (24) and `PROBE_ACK` (25); no existing layout changes) |
-| cnc page version | 3.1 (FSM identity + log time, 2.11 pending: the name + hash line at boot, the version word at attach, `log_time_ns`, per-row `timers_pending`) (3.2, `2.12.0` pending: a live `payload_ceiling` word) |
+| cnc page version | 3.1 (FSM identity + log time, 2.11.0: the name + hash line at boot, the version word at attach, `log_time_ns`, per-row `timers_pending`) (3.2, `2.12.0` pending: a live `payload_ceiling` word) |
 
 The cnc page carries its own version gate, `CNC_V2_VERSION`, which is
 independent of this one. cnc 3.1 changed the same-host shmem layout only
 (the once-reserved slot line 7, plus two previously-unused words —
 `log_time_ns` and the per-row `timers_pending`). The UDP datagram format
-moved to 0.7.0 for **four features** shipping on the same unreleased `2.11.0`
+moved to 0.7.0 for **four features** shipping on the same `2.11.0`
 flag day. FSM identity: `SNAP_BEGIN` swapped its `services_declared` bitmask
 for a per-row identity-hash array plus a per-row version array. Log time and
 timers: the log frame header was **relaid** to carry a leader-written
@@ -33,8 +33,8 @@ byte-identical to 0.6.0. `CURRENT` is
 documentary and is not itself checked on any receive path (see
 `version.rs`); the two version lines remain independent of each other.
 
-None of `0.7.0`'s intermediate shapes ever shipped — the whole of `2.11.0` is
-one unreleased flag day — but every retired number is **reserved, never
+None of `0.7.0`'s intermediate shapes ever shipped — the whole of `2.11.0` was
+one flag day — but every retired number is **reserved, never
 reassigned**: `FRAME_TYPE_SCHEDULE_TABLE_RETIRED = 6`,
 `DGRAM_KIND_SNAP_TABLE_RETIRED = 21`, `SNAP_BEGIN_LAYOUT_V3 = 2`.
 
@@ -142,7 +142,7 @@ unchanged.
 
 #### One session, one position (wire 0.7.0)
 
-Since coordinated snapshot instants (2.11 pending) a session ships **one
+Since coordinated snapshot instants (2.11.0) a session ships **one
 set**, and a set is the artifacts at **one** instant: every `SNAP_BEGIN` of a
 session must carry the same `snapshot_pos`, and a session whose `BEGIN`s
 disagree is refused outright and counted as

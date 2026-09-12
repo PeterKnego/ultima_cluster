@@ -51,7 +51,7 @@ fails otherwise. This is a wrong-cluster guard, not a credential — it is
 checked, but it proves nothing about who is asking.
 
 Every **mutating** admin-band command (`add-learner`, `promote`, `demote`,
-`remove-learner`, `remove-voter`, and — since 2.11 pending — `schedule apply`,
+`remove-learner`, `remove-voter`, and — since 2.11.0 — `schedule apply`,
 `settings apply`, `snapshot` and `snapshot fetch`)
 additionally takes (M12b, `v2.6.0`):
 
@@ -87,7 +87,7 @@ Sub-commands are: `add-learner`, `promote`, `demote`, `remove-learner`,
 `remove-voter`, `schedule apply`, `schedule show`, `settings apply`,
 `settings show`, `snapshot`, `snapshot fetch`, `snapshot show`, `status`.
 
-Every mutating one is a **cluster-FSM command** since 2.11 (pending): the
+Every mutating one is a **cluster-FSM command** since 2.11.0: the
 reconfiguration ops append `CLUSTER kind = 1` (Membership), `schedule apply`
 appends `CLUSTER kind = 2`, and `settings apply` appends `CLUSTER kind = 3`.
 The operator-facing surface is unchanged; what changed is that one internal
@@ -134,7 +134,7 @@ Permanently removes a voter. The id is tombstoned. Wire op `5`.
 
 ### `schedule apply`
 
-Replicated schedule table (2.11 pending). Parse a TOML file of recurrences,
+Replicated schedule table (2.11.0). Parse a TOML file of recurrences,
 stage it, sign its digest, and apply it. Wire op `6`.
 
 ```
@@ -233,7 +233,7 @@ row prints as `0x…`.
 
 ### `settings apply`
 
-The cluster's **replicated settings record** (2.11 pending, cluster-FSM spec
+The cluster's **replicated settings record** (2.11.0, cluster-FSM spec
 §6). Wire op `7`. `schedule apply`'s shape verbatim: parse a TOML file, encode
 it, stage it at `<instance_dir>/settings.pending` (mode `0600`, fsync, rename),
 and sign the first ten bytes of its SHA-256 into the request's `id`/`ip`/`port`
@@ -295,7 +295,7 @@ no cluster artifact yet prints `no cluster artifact yet`.
 
 ### `snapshot`
 
-Command a **coordinated snapshot instant** (2.11 pending, coordinated-snapshot
+Command a **coordinated snapshot instant** (2.11.0, coordinated-snapshot
 spec §5). Wire op `8`, leader-only. The leader appends a `SNAPSHOT` frame; its
 frame-end position **P** is the instant, and every declared row plus the
 cluster FSM freezes there, having applied everything below it. When they have
@@ -335,7 +335,7 @@ carrying P (or the newest complete set's position, on a refusal).
 
 ### `snapshot fetch`
 
-Pull a learner's complete set onto **this** node, store-only (2.11 pending,
+Pull a learner's complete set onto **this** node, store-only (2.11.0,
 spec §5.7 item 5). Wire op `9`. **Node-local**: it is never forwarded, so it
 always acts on the node `--instance-dir` names, whoever leads. This is the
 return path for a standby instant — a voter that did not freeze still needs
@@ -418,15 +418,16 @@ Output fields:
 
 | Field | Meaning |
 |---|---|
-| `config` | the adopted config version, whether a change is pending, and — since the schedule table (2.11 pending) — `schedule_position=<n>`, the frame-end position of the committed schedule table, read from this node's newest **cluster artifact** (`snapshots/cluster/`) since the cluster FSM. `none` = no artifact yet, or an artifact holding no table; `?` = the artifact could not be read — a read error, not "no table", and it degrades to `?` rather than aborting so one unreadable file never takes the role/log/service lines down with it. It is the same number `uc2_schedule_table_position` exports and must be identical on every node once caught up |
+| `config` | the adopted config version, whether a change is pending, and — since the schedule table (2.11.0) — `schedule_position=<n>`, the frame-end position of the committed schedule table, read from this node's newest **cluster artifact** (`snapshots/cluster/`) since the cluster FSM. `none` = no artifact yet, or an artifact holding no table; `?` = the artifact could not be read — a read error, not "no table", and it degrades to `?` rather than aborting so one unreadable file never takes the role/log/service lines down with it. It is the same number `uc2_schedule_table_position` exports and must be identical on every node once caught up |
+| `ceiling` | jumbo frames (`2.12.0`): the live command payload ceiling in bytes, from the cnc word at offset 3984, plus the datagram rung it came from and whether that rung is `baseline` (1408) or `discovered`. The rung is read from this node's newest **cluster artifact**; with the default snapshot cadence (`0`) there may be none yet, so a ceiling the baseline rung cannot produce prints as `rung >1408, discovered — inferred from the ceiling`, saying plainly that the rung was inferred rather than read. A trailing `— capped by this node's own max_payload, not by the rung` means the binding half is this host's buffer bound, not the cluster's rung. `uc2_commands_over_standard_total` is deliberately **not** here: it is an in-process counter, not a cnc word, and lives in `/metrics` alone |
 | `leader` | `NODE_FLAG_LEADER` is set |
 | `can_serve` | `NODE_FLAG_CAN_SERVE` is set |
 | `term` | current term |
 | `leader_hint` | the id this node believes leads; `unknown` when the raw value is `u64::MAX` |
 | `log: commit / durable / append` | the three log counters, in bytes |
 | `members` | one line per occupied peer slot: `id`, `role`, `reported_durable`, and a staleness marker when `commit - reported_durable` exceeds the admission window |
-| `services` | the declared id list (cnc 4032's bitmask), the lag policy, and — since log time and timers (2.11 pending) — `log_time_ns=<n>`, the log's clock read from cnc `4048`, in **raw nanoseconds since the Unix epoch**. It is not formatted as RFC 3339: the binary carries no date formatter, and the raw value is what the `uc2_log_time_ns` metric and the cnc word both hold. `0` means no leader has stamped anything this page generation — `fsm_lag=lockstep` or `fsm_lag=<N> bytes` (cnc 4040). A node started for a harness (`ServicesConfig::none_for_tests`) prints `declared=[] fsm_lag=n/a` and no rows: with nothing declared there is no lag policy to report, even though cnc 4040 still holds a resolved bound (since **2.8.1**; earlier releases printed that bound, or `lockstep` when it happened to read 0) |
-| per-FSM rows | one line per **declared** row, attached or not, in this order: `row=`, `name=` (the row's declared FSM name, node-written at boot, cnc 3.1), `version=` (the attached service's packed version, or the literal `unversioned` if the packed value is 0 — unattached or an FSM that never set `const VERSION`), `hash=0x...` (the row's identity hash, cnc 3.1), `attached=` (the slot's ATTACHED bit), `epoch=` (incarnations since this node booted), `incarnation=` (the status word's counter), `applied=`, `lag=` (`commit − applied`), `snapshot_pos=`, `heartbeat_age=` (`never` if that FSM has not stamped since boot), `timers_pending=` (that row's pending scheduled timers, cnc slot line 7 `+488`) — `name=`/`version=`/`hash=` are new since FSM identity and `timers_pending=` since log time and timers, both 2.11 pending; earlier releases printed only `attached=... epoch=... incarnation=...` |
+| `services` | the declared id list (cnc 4032's bitmask), the lag policy, and — since log time and timers (2.11.0) — `log_time_ns=<n>`, the log's clock read from cnc `4048`, in **raw nanoseconds since the Unix epoch**. It is not formatted as RFC 3339: the binary carries no date formatter, and the raw value is what the `uc2_log_time_ns` metric and the cnc word both hold. `0` means no leader has stamped anything this page generation — `fsm_lag=lockstep` or `fsm_lag=<N> bytes` (cnc 4040). A node started for a harness (`ServicesConfig::none_for_tests`) prints `declared=[] fsm_lag=n/a` and no rows: with nothing declared there is no lag policy to report, even though cnc 4040 still holds a resolved bound (since **2.8.1**; earlier releases printed that bound, or `lockstep` when it happened to read 0) |
+| per-FSM rows | one line per **declared** row, attached or not, in this order: `row=`, `name=` (the row's declared FSM name, node-written at boot, cnc 3.1), `version=` (the attached service's packed version, or the literal `unversioned` if the packed value is 0 — unattached or an FSM that never set `const VERSION`), `hash=0x...` (the row's identity hash, cnc 3.1), `attached=` (the slot's ATTACHED bit), `epoch=` (incarnations since this node booted), `incarnation=` (the status word's counter), `applied=`, `lag=` (`commit − applied`), `snapshot_pos=`, `heartbeat_age=` (`never` if that FSM has not stamped since boot), `timers_pending=` (that row's pending scheduled timers, cnc slot line 7 `+488`) — `name=`/`version=`/`hash=` are new since FSM identity and `timers_pending=` since log time and timers, both 2.11.0; earlier releases printed only `attached=... epoch=... incarnation=...` |
 
 ## Offline commands
 
@@ -631,10 +632,10 @@ defensive catch-all; 20–24 (M12b, `v2.6.0`) are admin-authentication
 refusals (`uc_node::REASON_AUTH_*` / `REASON_AUDIT_FAILED`) — produced only
 under `[admin] auth = "hmac"`, and disjoint from the `ProposeError` band so a
 caller can tell "the cluster refused this change" from "the cluster refused
-to believe this was you" without consulting the policy. 40–43 (2.11 pending)
+to believe this was you" without consulting the policy. 40–43 (2.11.0)
 are `schedule apply`'s own refusals (`uc_node::REASON_SCHEDULE_*`) and 44–47
-(2.11 pending) are `settings apply`'s (`uc_node::REASON_SETTINGS_*`), each in
-its own band for the same reason. 48–50 (2.11 pending) are the coordinated-snapshot
+(2.11.0) are `settings apply`'s (`uc_node::REASON_SETTINGS_*`), each in
+its own band for the same reason. 48–50 (2.11.0) are the coordinated-snapshot
 ops' own (`uc_node::REASON_SNAPSHOT_*`), split across `snapshot` (48, 49) and
 `snapshot fetch` (50).
 

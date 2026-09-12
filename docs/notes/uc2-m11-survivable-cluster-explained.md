@@ -23,7 +23,7 @@ then `snapshots/` — resting on two monotonicity facts:
 - the newest snapshot position only advances (publishes are atomic
   tmp+rename, retention keeps every artifact at or above the durably-persisted
   floor — the newest two, until coordinated snapshot instants moved retention
-  to the node in 2.11 pending — and purge only ever runs below a
+  to the node in 2.11.0 — and purge only ever runs below a
   durably-persisted floor that some retained snapshot covers).
 
 So a snapshot set copied *after* the journal always covers any purge that

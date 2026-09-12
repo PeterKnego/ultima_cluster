@@ -73,7 +73,7 @@ services: declared=[0, 1] fsm_lag=8192 bytes
   row=1 name=orders version=unversioned hash=0x3f0e7c9a2b8d1f45 attached=false epoch=0 incarnation=0 applied=0 lag=1048576 snapshot_pos=0 heartbeat_age=never
 ```
 
-(`name=`/`version=`/`hash=` are new since FSM identity, 2.11 pending; earlier
+(`name=`/`version=`/`hash=` are new since FSM identity, 2.11.0; earlier
 releases printed `id=` where `row=` now is, and no `name=`/`version=`/
 `hash=` fields.)
 

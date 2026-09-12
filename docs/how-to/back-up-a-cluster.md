@@ -151,7 +151,7 @@ Verify:
    journal with no `snapshots/` directory at all is FSM 0's hole (the one id
    every node declares).
 5. Checks every `snapshots/<id>/snap-<pos>.ultsnap`'s **16-byte envelope**
-   (2.11 pending): the file must start with `ULTSNAP1` followed by the
+   (2.11.0): the file must start with `ULTSNAP1` followed by the
    position it was built at, and that position must equal the one in its
    name. A file that is too short, has the wrong magic, or was built at a
    different position than it claims is a `corrupt snapshot artifact`
@@ -204,7 +204,7 @@ does everything else: a fresh `cnc2.dat` and `instance_id`, config/vote/term
 recovery from the copied `state/`, and — if this id is a minority of a still-
 healthy quorum — rejoin and repair over the ordinary replication path.
 
-**One thing a restore cannot bring back** (2.11 pending): if the backup was
+**One thing a restore cannot bring back** (2.11.0): if the backup was
 taken *before* the node's current snapshot floor, the restored node comes up
 believing in a floor whose artifacts are not on its disk. It replicates and
 serves normally — but it cannot **serve a joiner** at that floor, so it

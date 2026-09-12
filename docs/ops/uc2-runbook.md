@@ -73,7 +73,7 @@ verify rather than a build:
   grown lag now means nothing is being appended, not a clock step. The
   per-node smear gauge (`uc2_log_clock_smear_ns`) and the `log_clock_step`
   record are covered in
-  [Monitor a cluster § The log clock and the timer families](../how-to/monitor-a-cluster.md#the-log-clock-and-the-timer-families-211-pending),
+  [Monitor a cluster § The log clock and the timer families](../how-to/monitor-a-cluster.md#the-log-clock-and-the-timer-families-2110),
   not repeated here. Per-row timer counters are `uc2_timers_pending`,
   `uc2_timers_fired_total` and `uc2_timers_late_total`; `uc2_timers_pending` is
   the **leader's** count and a follower exports `0`, because the timer heap is
@@ -96,7 +96,7 @@ verify rather than a build:
   reason code) and `schedule_staged_file_kept` (the append succeeded but the
   staged file — `schedules.pending` or `settings.pending`, named in the `file`
   field — could not be deleted; remove it by hand). Since the cluster FSM
-  (2.11 pending) this alert is **narrow**: the table is state applied at
+  (2.11.0) this alert is **narrow**: the table is state applied at
   commit, so there is no `state/schedules.state` crash window, no
   revert-on-truncation, no wipe keep-alive signature, and a below-floor join
   is not a cause — the snapshot session carries the cluster FSM's own artifact
@@ -111,6 +111,29 @@ verify rather than a build:
   `settings_apply`). `[settings]` in `node.toml` seeds genesis only. Both
   `show` commands read a **file**, so they lag the live view and say
   `no cluster artifact yet` until the first snapshot instant completes.
+- **What command size can this cluster carry?** `uc2ctl status` prints one
+  `ceiling:` line — `ceiling: 8864 B (rung 8960, discovered)` or
+  `ceiling: 1344 B (rung 1408, baseline)`. The ceiling is the live cnc word at
+  offset 3984 and the rung is read from this node's newest cluster artifact;
+  with the default snapshot cadence (`0`, instants are commanded) there may be
+  no artifact yet, in which case the line **infers** `discovered` from a
+  ceiling the baseline rung cannot produce and says so. A trailing
+  `— capped by this node's own max_payload, not by the rung` means the binding
+  half is this host's buffer bound, not the cluster's rung. In `/metrics`:
+  `uc2_datagram_mtu_bytes` (the committed rung, identical cluster-wide once
+  caught up), `uc2_payload_ceiling_bytes`, `uc2_probe_min_mtu_bytes` (this
+  node's own proven minimum; `0` = nothing proven, including on a solo node),
+  `uc2_probe_sent_total`/`uc2_probe_acked_total`, `uc2_send_emsgsize_total`
+  (must be 0) and `uc2_commands_over_standard_total` (frames appended above
+  the standard 1312 B ceiling — leader-only, so sum it across the fleet).
+  Records: `datagram_mtu_proposed` (leader, per raise) and
+  `payload_ceiling_adopted` (every node). A discovery commit is in
+  `audit.jsonl` as a `settings_apply` with `source = "discovery"`, `actor =
+  "node"` — the one audit line no admin request produced. **Probe traffic that
+  never stops is normal on a narrow cluster**: a peer resolves only when the
+  top rung is verified *and* its advertised minimum has caught up, so one
+  permanently narrow path means 2–3 probe datagrams per 30 s per peer forever.
+  See [Run a cluster on jumbo frames](../how-to/jumbo-frames.md).
 - **What snapshot set is this node holding?** `uc2ctl snapshot show` prints
   each declared row's newest artifact position, the cluster row's, and
   `set=<P>` — the newest position present in **all** of them, which is the
@@ -126,7 +149,7 @@ verify rather than a build:
   replace hardware; **signed admin requests** (`--admin-key`,
   `gen-admin-key`, the `auth_*`/`audit_failed` reason codes) and reading
   `uc2ctl audit` (M12b, `v2.6.0`). *Was §6.*
-- **Apply a schedule table** (2.11 pending):
+- **Apply a schedule table** (2.11.0):
   `uc2ctl schedule apply <file.toml> --instance-dir D --app-id A [--admin-key K]`
   parses the TOML, stages the encoded bytes as `<instance_dir>/schedules.pending`
   (mode `0600`, fsync, rename), and sends admin op `6` carrying that file's
@@ -152,7 +175,7 @@ verify rather than a build:
   an artifact appears at a snapshot **instant** — so on a cluster that is not
   snapshotting yet they say `no cluster artifact yet` and
   `uc2_schedule_table_position` from `/metrics` is the live reading.
-- **Take a snapshot** (2.11 pending): `uc2ctl snapshot --instance-dir D
+- **Take a snapshot** (2.11.0): `uc2ctl snapshot --instance-dir D
   --app-id A [--admin-key K] [--standby]` (admin op `8`, audited as
   `snapshot`). **Run it against the leader** — a follower answers `retry` (status `2`);
   `uc2ctl status`'s `leader_hint` says where — and it prints `instant=<P>`, the frame-end position every
@@ -198,7 +221,7 @@ verify rather than a build:
 
 ## When something is wrong
 
-- **A node refuses to start with `cluster_artifact_corrupt`** (2.11 pending).
+- **A node refuses to start with `cluster_artifact_corrupt`** (2.11.0).
   The `uc2-cluster` agent found its newest `snapshots/cluster/snap-<pos>.ultcluster`
   and the image failed a check — magic, version, CRC32, or a bounds check
   inside it. The node fail-stops rather than starting: silently rolling the
@@ -206,7 +229,7 @@ verify rather than a build:
   would be worse than not starting. **The record names the file.** Remove
   exactly that file and restart. The node recovers from the artifact beneath
   it and replays the gap from the journal, so nothing is lost — **when there
-  is one**: since coordinated snapshot instants (2.11 pending) retention is
+  is one**: since coordinated snapshot instants (2.11.0) retention is
   the node's and keeps the set at the persisted floor plus everything newer,
   so an older artifact exists whenever a newer instant has completed since the
   floor was last persisted, and does not when the corrupt file *is* the floor
@@ -215,6 +238,32 @@ verify rather than a build:
   [wipe-and-rejoin](../how-to/recover-from-quorum-loss.md), which rebuilds the
   cluster row from a peer's snapshot session. Never edit an artifact in place;
   the CRC is over the whole image.
+- **`Uc2PathBelowMtu` fires** (`increase(uc2_send_emsgsize_total[5m]) > 0`).
+  With do-not-fragment set, the kernel refused a datagram for size: a path has
+  degraded below the rung the cluster committed, or below the 1408 B baseline.
+  The committed rung is **monotone and cannot be lowered**, so the only remedy
+  is the path — check `ip link` on both ends and the VPC/subnet MTU. Probe
+  refusals are counted separately and never fire this rule.
+- **`Uc2MtuDiscoveryStalled` fires** (`uc2_probe_min_mtu_bytes >
+  uc2_datagram_mtu_bytes` for 60 s). This node proved more than the cluster
+  committed, so some *other* member is holding discovery back: read
+  `uc2_probe_min_mtu_bytes` on every node — `1408` names the node whose path to
+  a peer is narrow, `0` names one with a peer that has not answered at all. A
+  cluster that legitimately cannot beat the baseline never fires this, because
+  a narrow peer pins every node's own minimum too.
+- **A node refuses to start with `path_below_committed_mtu`, or will not
+  serve.** The cluster has committed a jumbo rung and this node's path to some
+  member answered below it — either that path is narrow or **this host's own
+  interface MTU** cannot carry the rung (the kernel refused the larger probes
+  for size); the node cannot tell the two apart, so the refusal names both.
+  Fix the MTU and restart: the remedy is never a wipe, because nothing in the
+  instance directory is wrong. A member that answers *nothing* (down, slow,
+  replaying) never refuses anything — the node keeps replicating and voting and
+  simply holds serving (`/readyz` 503) until some path proves the rung. Under
+  `force_jumbo_frames` the same gate fail-stops after 30 s instead, as
+  `jumbo_path_too_narrow` (a peer answered below 8832) or `jumbo_peer_silent`
+  (a liveness fact, not an MTU one: start the member). Details and remedies:
+  [Run a cluster on jumbo frames](../how-to/jumbo-frames.md#6-when-a-node-refuses-to-join).
 - [Diagnose a node that is not serving](../how-to/diagnose-a-node.md) — reading
   a live node's control page. *Was §3's procedural half.*
 - [Change cluster membership: read the audit log](../how-to/change-cluster-membership.md#read-the-audit-log)
@@ -234,7 +283,7 @@ verify rather than a build:
   owner, and its durability class, including the per-declared-FSM files since
   M14 (`svc_query.<id>.ring`, `egress_service.<id>.broadcast`,
   `service.<id>.lock`, `snapshots/<id>/`) and, since log time and timers
-  (2.11 pending), `svc_sched.<id>.ring` — the first per-row ring the **node**
+  (2.11.0), `svc_sched.<id>.ring` — the first per-row ring the **node**
   consumes (service → node: schedule, cancel and consumed requests). It takes
   the per-row reservation from 5 MiB to 6 MiB. Since the cluster FSM (2.11
   pending) `svc_sched.<id>.ring` is written **only by a leading node's
@@ -250,22 +299,28 @@ verify rather than a build:
 - [The cnc control page](../reference/cnc-page.md) — the pinned layout, field by
   field, including cnc 3.1's per-slot name/hash line (7) and version word
   (line 0, word 1) added for FSM identity, plus the two words log time added
-  in the same page version (2.11 pending): `log_time_ns` at page 1 offset
+  in the same page version (2.11.0): `log_time_ns` at page 1 offset
   `4048` (written by the **archive agent**, never lowered — the highest leader
   stamp recorded, and what a new leader seeds its clamp from) and
   `timers_pending` at slot line 7 `+488` (written by the **consensus agent**,
   republished every pass). Decoding them raw: they are plain LE `u64`s, so
   `od -A d -t u8 -j 4048 -N 8 cnc2.dat` reads the log clock in nanoseconds and
-  `-j $((4096 + 512*ROW + 488))` reads a row's pending-timer count. *Was §3's
+  `-j $((4096 + 512*ROW + 488))` reads a row's pending-timer count. cnc **3.2**
+  (jumbo frames, `2.12.0`) adds one more live word in the same band:
+  `payload_ceiling` at offset **3984** (consensus-agent-written, re-published
+  when the committed datagram rung moves; `od -A d -t u8 -j 3984 -N 8`), which
+  is the door every client and the gateway edge reads per submit. *Was §3's
   field tables.* Raw-offset walkthrough:
   [Diagnose a node → Which FSM is holding the cluster up?](../how-to/diagnose-a-node.md#which-fsm-is-holding-the-cluster-up)
 - [`uc2ctl`](../reference/uc2ctl.md) — sub-commands, arguments, response
   statuses, refusal reasons. `status`'s `services:` line gained
   `log_time_ns=<ns>` (raw nanoseconds since the Unix epoch, not RFC 3339 —
   there is no formatter in the binary) and each per-FSM row gained
-  `timers_pending=<n>`, both since log time and timers (2.11 pending); the
+  `timers_pending=<n>`, both since log time and timers (2.11.0); the
   `config:` line gained `schedule_position=<n>` and the sub-command list gained
-  `schedule apply` / `schedule show` with reason codes 40–43.
+  `schedule apply` / `schedule show` with reason codes 40–43. Jumbo frames
+  (`2.12.0`) add a `ceiling:` line — the live payload ceiling, its datagram
+  rung, and whether that rung is `baseline` or `discovered`.
 - [Monitor a cluster → The per-FSM families](../how-to/monitor-a-cluster.md#the-per-fsm-families-m14)
   — which metric families carry a `service` label, what the unlabeled
   aggregate means now, and the declared-set drift query. `Uc2ServiceIdentityDrift`

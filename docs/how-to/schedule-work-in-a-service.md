@@ -106,7 +106,7 @@ timer that re-arms itself.
 ## Decide whether you need `Timed<S>`
 
 **The node layer delivers at-least-once.** The node's timer heap is
-**leader-only** (the cluster FSM, 2.11 pending): a demoted leader discards it,
+**leader-only** (the cluster FSM, 2.11.0): a demoted leader discards it,
 and a newly promoted one rebuilds it from your service's re-announce of its own
 pending set plus the cluster's schedule table. An instance that was in flight
 when the old leader lost leadership is still in that pending set, so the new
@@ -152,7 +152,7 @@ attempt fails to compile.
 
 `uc2_timers_pending`, `uc2_timers_fired_total` and `uc2_timers_late_total` are
 exported per row; see
-[Monitor a cluster](monitor-a-cluster.md#the-log-clock-and-the-timer-families-211-pending).
+[Monitor a cluster](monitor-a-cluster.md#the-log-clock-and-the-timer-families-2110).
 `uc2_timers_pending` is the **leader's** count and a follower exports `0`, so
 do not alert on the fleet disagreeing about it — that is the healthy reading.
 (`uc2_timers_rearmed_total` (retired) existed in an earlier draft of this

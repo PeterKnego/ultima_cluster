@@ -429,5 +429,5 @@ path the spec left to a phase 2.
   — commanding an instant, setting a cadence, and turning purge on.
 - [`uc2ctl` § `snapshot`](../reference/uc2ctl.md#snapshot) — the three verbs
   and their refusals.
-- [Monitor a cluster § The snapshot families](../how-to/monitor-a-cluster.md#the-snapshot-families-211-pending)
+- [Monitor a cluster § The snapshot families](../how-to/monitor-a-cluster.md#the-snapshot-families-2110)
   — the eight families, the three alerts, and the records.

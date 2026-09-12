@@ -164,7 +164,7 @@ replays the journal instead rebuilds the same maps by re-running `apply`.
 Both paths end at the same state, by construction.
 
 The node's own heap is *not* persisted anywhere, and since the cluster FSM
-(2.11 pending) it exists **only on the leader**. It is a cache of what the
+(2.11.0) it exists **only on the leader**. It is a cache of what the
 services know: everything in it is reconstructible from cluster data a new
 leader already holds — its service's own pending set and the cluster's schedule
 table — so a follower keeps none. Its service writes nothing to the schedule
@@ -276,7 +276,7 @@ and that door is deliberately left open rather than walked through now.
 ### How a table becomes a set of ticks
 
 The table is a frame on the log, exactly like the cluster config is — and
-since the cluster FSM (2.11 pending) it *is* a cluster config, in the literal
+since the cluster FSM (2.11.0) it *is* a cluster config, in the literal
 sense: both are commands to one internal state machine, carried by one frame
 type. `FRAME_TYPE_CLUSTER = 4` with `kind = 2` carries the encoded table — an
 8-byte header plus one 33-byte entry per rule, at most

@@ -43,7 +43,7 @@ only FSM a remote client can reach, because the remote protocol stays v1 and
 its `SUBMIT`/`QUERY` frames carry no service selector
 (`uc_remote/src/frame.rs:19`, spec §6.4).
 
-**Since FSM identity (2.11 pending):** `[services] ids` is `[services]
+**Since FSM identity (2.11.0):** `[services] ids` is `[services]
 names`, and a service no longer states which id it is — it attaches by
 scanning the node's declared names for its own `const NAME`. The row (list
 index) still means exactly what it means below — "id 0" above is now "row
@@ -263,7 +263,7 @@ shortens a service restart only together with purge — reconstruction installs
 an artifact only when the journal no longer covers the start position
 (`uc_service/src/replay.rs`); with purge off it replays the whole journal.
 
-**What 2.11 (pending) changed about the set.** Everything above still
+**What 2.11.0 changed about the set.** Everything above still
 describes the session's shape, but the *set* it ships is no longer the
 lowest-common-floor of N independently-timed artifacts. `SnapshotPolicy` and
 its per-service `interval_bytes` are **removed**; a snapshot is taken at a

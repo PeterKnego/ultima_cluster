@@ -7,7 +7,7 @@ sweep — without a cron box outside the cluster deciding when.
 The mechanism is the **replicated schedule table**: a small table of
 recurrences that lives in the log, is applied identically by every node, rides
 the snapshot session to a joiner, and fires into your state machine's
-`on_timer`. Since the cluster FSM (2.11 pending) the table is a record inside
+`on_timer`. Since the cluster FSM (2.11.0) the table is a record inside
 the node's own internal state machine — applied at commit, snapshotted in the
 cluster artifact — which is why the paragraphs below say "applied" where an
 earlier draft said "adopted from the archive walk". Nothing in the procedure
@@ -93,7 +93,7 @@ fsm=orders id=1001 rule=at 14:00:00
 caught up. The Prometheus equivalent — and the right thing to alert on — is
 `uc2_schedule_table_position`, with `Uc2ScheduleTableDiverged` firing when
 nodes disagree. See
-[Monitor a cluster](monitor-a-cluster.md#the-log-clock-and-the-timer-families-211-pending).
+[Monitor a cluster](monitor-a-cluster.md#the-log-clock-and-the-timer-families-2110).
 
 `schedule show` reads the node's newest **cluster artifact**
 (`snapshots/cluster/`), not the staged file. That is a file beside the running

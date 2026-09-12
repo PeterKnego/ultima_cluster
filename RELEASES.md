@@ -80,7 +80,7 @@ on a fleet 2026-09-07/08.
   [Schedule work inside a state machine](docs/how-to/schedule-work-in-a-service.md) ·
   [State-machine contract § Timers](docs/reference/state-machine-contract.md#timers-on_timer-and-timeds) ·
   [Wire protocol § Log frames](docs/reference/wire-protocol.md#log-frames) ·
-  [Monitor a cluster § log clock and timers](docs/how-to/monitor-a-cluster.md#the-log-clock-and-the-timer-families-211-pending)
+  [Monitor a cluster § log clock and timers](docs/how-to/monitor-a-cluster.md#the-log-clock-and-the-timer-families-2110)
 - **A replicated schedule table** (`uc2ctl`, `uc_node`): operators declare
   recurrences — `every` with an anchor, `at` (daily, UTC), `once` — in a TOML
   file and apply it with one signed, leader-only command; ticks fire through
@@ -113,7 +113,7 @@ on a fleet 2026-09-07/08.
   [Keep the journal from growing without bound](docs/how-to/bound-journal-growth.md) ·
   [`uc2ctl` § `snapshot`](docs/reference/uc2ctl.md#snapshot) · [§ `snapshot fetch`](docs/reference/uc2ctl.md#snapshot-fetch) ·
   [Instance directory § The artifact envelope](docs/reference/instance-directory.md#the-artifact-envelope-and-who-deletes-artifacts) ·
-  [Monitor a cluster § snapshot families](docs/how-to/monitor-a-cluster.md#the-snapshot-families-211-pending)
+  [Monitor a cluster § snapshot families](docs/how-to/monitor-a-cluster.md#the-snapshot-families-2110)
 - **Fixed:** a restarted ex-leader could run one config version behind
   forever ([Verification § sim](docs/VERIFICATION.md#2-deterministic-simulation));
   a learner joining below a still-climbing purge floor could wedge, and a
@@ -165,7 +165,7 @@ and — only if pinned — `max_payload` at least 1072 or, better, unset. The
 `SnapshotPolicy` is deleted, pre-envelope snapshot artifacts are refused by
 name (clear a dev box's `snapshots/` once), and `uc_node` now depends on
 `uc_service`, which flips the crates.io publish order. Details, in the
-imperative: [Upgrade a cluster § 2.11](docs/how-to/upgrade-a-cluster.md#wire--cnc-change-in-211-pending-fsm-identity-log-time-and-the-cluster-fsm-070-cnc-31) ·
+imperative: [Upgrade a cluster § 2.11](docs/how-to/upgrade-a-cluster.md#wire--cnc-change-in-2110-fsm-identity-log-time-and-the-cluster-fsm-070-cnc-31) ·
 [Instance directory § Files](docs/reference/instance-directory.md#files) ·
 [§ Limits](docs/reference/instance-directory.md#limits) ·
 [Back up a cluster § Verify](docs/how-to/back-up-a-cluster.md#verify-before-you-trust-it) ·

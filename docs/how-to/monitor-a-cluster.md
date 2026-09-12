@@ -101,7 +101,7 @@ consumer position that does not decode (`IngressRingCorrupt`). See
 
 ### The per-FSM families (M14)
 
-Since FSM identity (2.11 pending), the labels below carry the FSM's name too.
+Since FSM identity (2.11.0), the labels below carry the FSM's name too.
 A node runs one FSM per declared row (`[services] names`), and every
 service family carries a `service="<name>",row="<r>"` label pair per
 declared row (before FSM identity this was `service="<id>"` alone — the
@@ -114,7 +114,7 @@ existing dashboards' grouping keys by row still work):
 itself: `uc_services_declared` (the bitmask — bit *k* = row *k*) and
 `uc2_fsm_lag_bytes` (the lag bound; **0 means lockstep**).
 
-**Two new gauges per row (FSM identity, 2.11 pending), exported from the cnc
+**Two new gauges per row (FSM identity, 2.11.0), exported from the cnc
 slot band**: `uc2_service_identity_hash{service="<name>",row="<r>"}` (the
 FNV-1a 64 of the row's declared name — an exact float64 sample: 64-bit
 integers up to 2^53 round-trip losslessly on the wire, and any two real
@@ -155,7 +155,7 @@ per-node condition — `count(count_values("v", uc_services_declared))` is `1`
 on a healthy cluster and `> 1` the moment two nodes disagree. The dashboard
 ships it as the "Declared sets agreeing" stat.
 
-**Since FSM identity (2.11 pending), the same class of drift *does* have
+**Since FSM identity (2.11.0), the same class of drift *does* have
 dedicated alert rules**, keyed on the two new gauges above, because they
 carry per-row identity rather than a set-membership bit:
 `Uc2ServiceIdentityDrift` — `count by (row) (count_values("hash",
@@ -169,7 +169,7 @@ above, **not** a bare `count by (row) (uc2_service_identity_hash) > 1` —
 that counts *series* (one per node instance), not distinct values, and pages
 permanently on any multi-node cluster.
 
-### The log clock and the timer families (2.11 pending)
+### The log clock and the timer families (2.11.0)
 
 Since log time and timers, every log frame carries a leader-written timestamp
 and a state machine can schedule callbacks on it
@@ -183,7 +183,7 @@ replicated schedule table — plus four **off-contract** timing families
 | `uc2_log_time_ns` | gauge | none | the highest leader stamp the archive on **this** node has recorded: the log's clock, in ns since the Unix epoch. Identical on every node once caught up |
 | `uc2_log_time_lag_seconds` | gauge | none | **leader only** (rendered `0` on followers): wall clock minus `uc2_log_time_ns`, floored at 0. Since 2.12.0 a backward wall-clock step no longer parks this (the log clock smears instead — see `uc2_log_clock_smear_ns` below); it grows only when nothing is being appended |
 | `uc2_log_clock_smear_ns` | gauge | none | **per node** (a follower's value is the clock it would lead with): ns of a backward wall-clock step that node's log clock is still retiring by running 500 ppm slow (spec 2026-09-08 §5.3). Every node's clock is a candidate leader clock, so this is reported everywhere, not gated on leadership. On the leader, nonzero means the log clock is AHEAD of wall time, so `uc2_log_time_lag_seconds` reads `0` — this gauge is the only visible sign of a smear in progress |
-| `uc2_timers_pending` | gauge | `service`, `row` | pending scheduled timers for that row **on the leader**. The timer heap is leader-only since the cluster FSM (2.11 pending), so a follower always exports `0` — that is the healthy reading, not a gap, and there is deliberately no divergence alert over this family |
+| `uc2_timers_pending` | gauge | `service`, `row` | pending scheduled timers for that row **on the leader**. The timer heap is leader-only since the cluster FSM (2.11.0), so a follower always exports `0` — that is the healthy reading, not a gap, and there is deliberately no divergence alert over this family |
 | `uc2_timers_fired_total` | counter | `service`, `row` | `TIMER` frames this node appended **as leader** for that row |
 | `uc2_timers_late_total` | counter | `service`, `row` | fires whose stamp exceeded their deadline (post-failover, or a deadline already in the past when scheduled) |
 | `uc2_timer_lateness_ns` | histogram | `service`, `row` | **off-contract** (see below): wall-clock lateness of every `TIMER` frame this node appended **as leader** for that row — the pass clock minus the fired deadline, i.e. how far past its deadline the pass that *placed* the frame ran. Not the on-the-wire `time_ns - deadline_ns`, which is `0` for every on-time fire by construction. Companion gauge `uc2_timer_lateness_ns_max` |
@@ -248,7 +248,7 @@ cluster-wide rather than per node: only the leader appends timer frames, so if
 the node holding the odd table wins an election, every scheduled recurrence in
 the cluster stops.
 
-Since the cluster FSM (2.11 pending) this is a **narrow** alert, because the
+Since the cluster FSM (2.11.0) this is a **narrow** alert, because the
 mechanisms that used to make it fire are gone:
 
 - there is no `state/schedules.state` and no `ScheduleRecord` (retired), so
@@ -295,14 +295,14 @@ its four siblings without the thread-name prefix).
 
 | Event | Level | Fields | Means, and what to do |
 |---|---|---|---|
-| `schedule_table_adopted` | info | `node`, `position`, `entries`, `source` | this node's cluster FSM applied a table at `position` holding `entries` that name a declared row. `source` is `"cluster_fsm"` — the single path since 2.11 (pending), whether the command arrived off the log, off a journal replay, or inside an installed cluster artifact. Nothing to do; this is the healthy signal |
+| `schedule_table_adopted` | info | `node`, `position`, `entries`, `source` | this node's cluster FSM applied a table at `position` holding `entries` that name a declared row. `source` is `"cluster_fsm"` — the single path since 2.11.0, whether the command arrived off the log, off a journal replay, or inside an installed cluster artifact. Nothing to do; this is the healthy signal |
 | `schedule_apply_refused` | warn | `node`, `reason` | an `uc2ctl schedule apply` was refused; `reason` is the same 40–43 code [`uc2ctl` prints](../reference/uc2ctl.md#refusal-reasons). Read the code, fix the file or re-run against the leader. Retries (a follower's, or the leader's single-in-flight one) are **not** refusals and do not appear here |
 | `schedule_staged_file_kept` | warn | `node`, `position`, `file`, `err` | the command *was* appended, but the staged file could not be deleted afterwards. `file` names which — `schedules.pending` or `settings.pending`, since both apply ops share this path. Deleting it is what normally makes a re-presented request refuse `schedule_missing`/`settings_missing` instead of appending the same payload a second time — remove the file by hand |
 | `settings_apply_refused` | warn | `node`, `reason` | a `uc2ctl settings apply` was refused; `reason` is the same 44–47 code [`uc2ctl` prints](../reference/uc2ctl.md#refusal-reasons) |
 | `cluster_command_applied` | info | `position`, `kind`, `accepted`, `reason` | this node's cluster FSM applied a `CLUSTER` command at frame-end `position`. `kind` is `1` Membership / `2` ScheduleTable / `3` Settings; `accepted` is `1` or `0`, with `reason` naming the refusal code when it is `0`. A refusal here is **deterministic and identical on every node** — it is the FSM's own validation, not a node-local judgement |
 | `cluster_artifact_installed` | info | `position`, `path` | a snapshot session's cluster artifact was installed by fiat at `position`; this node now holds the cluster's membership, schedule table and settings as of that position, before its purge floor advances |
 
-### The snapshot families (2.11 pending)
+### The snapshot families (2.11.0)
 
 Since coordinated snapshot instants, a snapshot is something the whole cluster
 takes at one log position **P** on the leader's command
@@ -397,7 +397,7 @@ about the set's position, so it was mixing two instants) and
 `uc2_snapshot_refused_fetch_expired_total` (a straggling answer to a
 `snapshot fetch` this node had already given up on — nothing is stored or
 installed, and the verb is simply re-runnable). All five are in
-`CONTRACT_SERIES` and counted in the 100 above. Any of them non-zero means a joiner is stuck; the consensus
+`CONTRACT_SERIES` and counted in the 107 above. Any of them non-zero means a joiner is stuck; the consensus
 agent names each one in a `snapshot_session_refused` record as it happens.
 
 **Eleven record names** go with the families, six at info and five at warn
@@ -414,6 +414,47 @@ agent names each one in a `snapshot_session_refused` record as it happens.
 | `snapshot_fetch_requested` / `snapshot_fetch_stored` | info | `node`, `from`, `position` | a `uc2ctl snapshot fetch` was sent to learner `from`, and later landed. The pair brackets the pull |
 | `snapshot_fetch_timeout` | warn | `node`, `from`, `position` | the pull got no answer inside the 60 s intake deadline. Nothing was stored; re-run the verb |
 | `snapshot_redirect_followed` / `snapshot_redirect_unknown` | info / warn | `node`, `from`, `position` | this joiner was redirected to node `from` for the set at `position` and followed it — or was redirected to a node it does not know, which it dropped. The **sending** side has no record of its own (the redirect leaves `uc_net`, which carries no logging dependency); its witness is the leader's `snap_redirects` counter |
+
+### The path-MTU families (2.12.0)
+
+Jumbo-frame discovery measures the datagram size every path between members
+carries and commits the minimum as a replicated setting; the task guide is
+[Run a cluster on jumbo frames](jumbo-frames.md) and the argument is
+[the explainer](../notes/uc2-jumbo-frame-discovery-explained.md). Seven
+families:
+
+| family | type | labels | meaning |
+|---|---|---|---|
+| `uc2_datagram_mtu_bytes` | gauge | none | the committed rung this node applies; `1408` is the baseline every cluster starts from. **Must agree cluster-wide** once caught up |
+| `uc2_payload_ceiling_bytes` | gauge | none | the live command payload ceiling — `min(this node's bound, payload_ceiling(rung, crypto))`, the same value clients read from the cnc page at offset 3984 |
+| `uc2_probe_min_mtu_bytes` | gauge | none | this node's own verified minimum over its **peers**. `0` means **nothing is proven**: either a peer is still unresolved, or this node has no peers at all (a solo cluster has measured no path) |
+| `uc2_probe_sent_total` | counter | none | `PROBE` datagrams put on the wire. A round that put nothing on the wire — no pairwise session yet, or every rung refused for size — is not counted here |
+| `uc2_probe_acked_total` | counter | none | `PROBE_ACK`s received and credited |
+| `uc2_send_emsgsize_total` | counter | none | **non-probe** datagrams the kernel refused for size under do-not-fragment: a path below the committed rung. Must be `0` |
+| `uc2_commands_over_standard_total` | counter | none | frames appended above the standard 1312 B ceiling — nonzero means this deployment now depends on jumbo support. **Leader-only by construction** (only a leader appends), so read it summed across the fleet |
+
+**Probe counters that never flatten are not a leak.** A peer is resolved only
+when this node has verified the top rung *and* that peer's own advertised
+minimum has caught up, and an ack is the only channel for the second fact — so
+a cluster with one permanently narrow path re-probes every peer at the 30 s
+cadence forever: 2–3 datagrams per 30 s per peer. Accepted cost.
+
+**Two alert rules**, `Uc2MtuDiscoveryStalled` (warning, `for: 60s`, on
+`uc2_probe_min_mtu_bytes > uc2_datagram_mtu_bytes`) and `Uc2PathBelowMtu`
+(critical, on `increase(uc2_send_emsgsize_total[5m]) > 0`) — both in the table
+below. Neither fires on a cluster that legitimately cannot beat the baseline:
+a narrow peer pins every node's own minimum too, so the two gauges agree.
+
+**Records.** `datagram_mtu_proposed` (info, leader, per raise),
+`payload_ceiling_adopted` (info, every node, when the doors move),
+`datagram_mtu_not_a_rung` (warn — a rung off the ladder arrived in an
+installed artifact and was clamped), `jumbo_join_gate_armed` (warn) /
+`jumbo_gate_passed` (info), and the three fail-stop refusals
+`jumbo_path_too_narrow` / `jumbo_peer_silent` / `path_below_committed_mtu`
+(error). A client over the standard ceiling emits
+`command_over_standard_ceiling` (warn, once per client) from whichever
+process submitted it — including `uc2-gateway`, whose edge submits through the
+same local client.
 
 ## Install the alert rules
 
@@ -445,7 +486,7 @@ table:
 |---|---|---|
 | `Uc2AgentDead` | any polling agent's `uc2_agent_alive` reads 0 | critical |
 | `Uc2NoLeader` | no node reports `uc2_is_leader == 1`, 30s sustained | critical |
-| `Uc2LeaderNotServing` | a node is leader but `can_serve == 0` — the `0x01` flags state | critical |
+| `Uc2LeaderNotServing` | a node is leader but `can_serve == 0` — either its `NewTerm` frame is not yet quorum-committed (the `0x01` flags state) or a jumbo MTU gate is pending (2.12.0; check `uc2_datagram_mtu_bytes`/`uc2_probe_min_mtu_bytes` before assuming the former) | critical |
 | `Uc2ServiceWedged` | service heartbeat stale while the node heartbeat is fresh — the apply loop, not the cluster, is stuck | critical |
 | `Uc2ReplicationStalled` | append is advancing but commit is not, for 1m — no quorum acknowledging | critical |
 | `Uc2PeerNeverHeard` | a peer's reported-durable position has sat at 0 for 2m — usually the bind-address mismatch, not a network fault | warning |
@@ -459,11 +500,13 @@ table:
 | `Uc2DiskLow` | `uc2_free_disk_bytes` has sat below 4 journal segments' worth of free space for 2m — the archive fail-stops at `ENOSPC`; purge or grow the disk | warning |
 | `Uc2ServiceAbsent` | a declared FSM's `uc_service_attached` has read 0 for 30s — it was never started, or it stopped. Admission is closed and this node's durable report is capped at the lag bound, so the cluster stalls by design until it attaches | critical |
 | `Uc2ServicePinnedAtLagBound` | a declared FSM that **is attached** has had its `uc_service_lag_bytes` at or above `uc2_fsm_lag_bytes` for 30s in bounded mode — that FSM is running, just slower than the log, and is pacing the whole cluster | warning |
-| `Uc2ServiceIdentityDrift` (FSM identity, 2.11 pending) | two nodes disagree on row `r`'s declared FSM name (its exported hash differs) — a config edit landed on some hosts and not others, or in a different order; the row's SNAP_BEGIN sessions will refuse each other the moment one runs | critical |
-| `Uc2ServiceVersionDrift` (FSM identity, 2.11 pending) | two nodes' attached services at row `r` report different non-zero packed versions — a rolling upgrade in progress, or a mis-deployed binary; refused on the snapshot path, **not** prevented on the live commit path (§7) | warning |
-| `Uc2SnapshotStalled` (coordinated snapshots, 2.11 pending) | this node has commanded **full** snapshot instants at least twice in 30m with no complete set landing — one FSM is silently stopping all purging | warning |
-| `Uc2StandbySnapshotStalled` (coordinated snapshots, 2.11 pending) | this **learner** has acted on standby snapshot instants at least twice in 30m with no complete set landing — one of its rows is silently stopping the standby set. Cannot fire on a voter (a voter exports `uc2_snapshot_standby_instant_position = 0`) | warning |
-| `Uc2SnapshotSetDiverged` (coordinated snapshots, 2.11 pending) | nodes disagree on the newest complete snapshot set's position, i.e. on their purge floors, for 60s | warning |
+| `Uc2ServiceIdentityDrift` (FSM identity, 2.11.0) | two nodes disagree on row `r`'s declared FSM name (its exported hash differs) — a config edit landed on some hosts and not others, or in a different order; the row's SNAP_BEGIN sessions will refuse each other the moment one runs | critical |
+| `Uc2ServiceVersionDrift` (FSM identity, 2.11.0) | two nodes' attached services at row `r` report different non-zero packed versions — a rolling upgrade in progress, or a mis-deployed binary; refused on the snapshot path, **not** prevented on the live commit path (§7) | warning |
+| `Uc2SnapshotStalled` (coordinated snapshots, 2.11.0) | this node has commanded **full** snapshot instants at least twice in 30m with no complete set landing — one FSM is silently stopping all purging | warning |
+| `Uc2StandbySnapshotStalled` (coordinated snapshots, 2.11.0) | this **learner** has acted on standby snapshot instants at least twice in 30m with no complete set landing — one of its rows is silently stopping the standby set. Cannot fire on a voter (a voter exports `uc2_snapshot_standby_instant_position = 0`) | warning |
+| `Uc2SnapshotSetDiverged` (coordinated snapshots, 2.11.0) | nodes disagree on the newest complete snapshot set's position, i.e. on their purge floors, for 60s | warning |
+| `Uc2MtuDiscoveryStalled` (jumbo frames, 2.12.0) | this node has proven a larger datagram path than the cluster has committed, for 60s — some *other* member is holding discovery back, silent or narrower. Read `uc2_probe_min_mtu_bytes` on every node | warning |
+| `Uc2PathBelowMtu` (jumbo frames, 2.12.0) | the kernel refused a non-probe datagram for size in the last 5m: a path degraded below the committed rung (or below the 1408 B baseline). The rung is monotone and cannot be lowered — fix the path | critical |
 
 The per-peer band (`uc2_peer_reported_durable_bytes`, `uc2_peer_replication_lag_bytes`) is leader-authoritative — only the leader receives `AppendPosition` reports, so a follower's own scrape always reads 0 for every peer regardless of health (see [Diagnose a node](diagnose-a-node.md)); `Uc2PeerNeverHeard` and `Uc2PeerLagging` are scoped to `uc2_is_leader == 1` for exactly this reason, and the dashboard's per-peer panel does the same.
 

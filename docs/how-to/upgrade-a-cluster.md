@@ -335,7 +335,7 @@ sections above apply, and there is no migration or extra rollback step. Run the
 same flag day anyway: it is the procedure this system supports, and it gives
 you the same measured downtime number.
 
-## Wire + cnc change in 2.11 (pending): FSM identity, log time and the cluster FSM (`0.7.0`, cnc `3.1`)
+## Wire + cnc change in 2.11.0: FSM identity, log time and the cluster FSM (`0.7.0`, cnc `3.1`)
 
 Five features share this flag day, because all five were implemented before
 the release was cut:
@@ -439,6 +439,11 @@ max-size frame plus the GCM tag no longer fits one datagram.
 The example config no longer suggests a value. This is the one 2.11.0 edit
 that only bites hosts that opted into pinning: a `node.toml` that never
 mentioned `max_payload` needs no change.
+
+**If you are going straight to `2.12.0`, ignore the pinning advice above**:
+the key is retired there and refused by name on *every* host that still
+carries it, whatever its value. Delete the line — see [the `2.12.0`
+section](#wire--cnc-change-in-2120-jumbo-frames-080-cnc-32) below.
 
 **The `admission_bytes` and `fsm_lag` edit, required on every host that sets
 either.** Both are cluster-wide policies now, so both are **refused by name**
@@ -579,6 +584,88 @@ advancing on every node, `uc2_log_time_lag_seconds` should sit near zero on
 the leader (the `Uc2LogTimeFrozen` rule fires above 5 s for 30 s), and
 `uc2ctl status` prints `log_time_ns=` plus a `timers_pending=` field on each
 per-FSM row.
+
+## Wire + cnc change in 2.12.0: jumbo frames (`0.8.0`, cnc `3.2`)
+
+Two features share this flag day. **Jumbo-frame MTU discovery** moves the
+wire and the control page; the **monotonic log clock** rides along with no
+flag-day surface of its own (no wire field, no cnc word, no config key — a
+backward wall-clock step is now smeared at 500 ppm instead of freezing the
+log's clock, which narrows `Uc2LogTimeFrozen`'s meaning to "nothing is being
+appended" and adds the `uc2_log_clock_smear_ns` gauge and the `log_clock_step`
+record; see [Monitor a
+cluster](monitor-a-cluster.md#the-log-clock-and-the-timer-families-2110)).
+
+**Wire 0.7.0 → 0.8.0: two new datagram kinds, no layout change.** `PROBE`
+(24) and `PROBE_ACK` (25), both pairwise, carry the path-MTU ladder. Every
+other datagram is byte-identical to `0.7.0`. A `0.7.0` peer counts the two
+kinds as unknown and drops them, so a mixed cluster simply never raises its
+ceiling — safe, but still unsupported: **stop every node before starting any
+node**, as with every other flag day. The `Settings` record inside a `CLUSTER`
+frame grows one `u32` (`datagram_mtu`), taking `SETTINGS_LEN` from 29 to 33.
+
+**cnc 3.1 → 3.2: one new word, same-host restart.** `payload_ceiling` at
+offset 3984 (`u64`, written by the consensus agent, read per submit by every
+client and by the gateway edge) is the cluster's live command ceiling. A 3.1
+attacher refuses by version, exactly as the 3.0 → 3.1 bump described, so each
+host's clients, services and gateway restart with its node.
+
+**No wipe, and this is the first flag day where that needed saying.** The
+cluster FSM shipped in `2.11.0`, so a cluster artifact and committed `CLUSTER`
+frames now survive an upgrade. A **version 1** `Settings` record — the 29 B
+`2.11.0` shape — is still accepted on read and maps to `datagram_mtu = 0`,
+which means "the baseline rung". Nothing in `snapshots/cluster/` needs
+clearing and no instance directory needs rebuilding.
+
+**The `max_payload` edit, required on every host that still sets it.** The key
+is retired and refused by name:
+
+```
+max_payload is no longer configurable (2.12.0): the command payload ceiling is
+discovered from the path MTU between nodes and committed cluster-wide. Delete
+the line. To REQUIRE jumbo frames, set force_jumbo_frames = true instead.
+```
+
+Delete it from every `node.toml` before the flag day — whatever its value, and
+whether or not it was at the default. There is no replacement key: the ceiling
+is discovered per cluster and replicated, starting at the 1408 B baseline rung
+(1344 B crypto-off / 1312 B crypto-on) and rising only once every path between
+members has proven a larger one. The optional new key is
+`force_jumbo_frames` (default `false`), which turns that discovery into a
+startup gate — see [Run a cluster on jumbo frames](jumbo-frames.md).
+
+**The behaviour change to check for before the flag day: do-not-fragment.**
+The replication socket now sets DF (`IP_MTU_DISCOVER` / `IPV6_MTU_DISCOVER` +
+`IPV6_DONTFRAG`), so a datagram the route cannot carry fails locally with
+`EMSGSIZE` instead of being fragmented. **A path below 1436 B (IPv4) or
+1456 B (IPv6) that works today by fragmenting UC's 1408 B baseline datagrams
+will fail by name after the upgrade** — `uc2_send_emsgsize_total` rises and
+`Uc2PathBelowMtu` fires. That is deliberate (one lost fragment loses the whole
+datagram, and the loss surfaces as an unexplained NAK storm), but it is worth
+proving the baseline first, from each node to each peer:
+
+```sh
+# -s 1408 puts 1436 B on the wire (1408 + 8 ICMP + 20 IPv4) — the same wire
+# size as UC's 1408 B baseline datagram. -M do sets do-not-fragment.
+ping -M do -s 1408 -c 3 <peer>
+```
+
+**A node host must run Linux (or Android).** The three DF socket options exist
+in `libc` for those targets only, and running without DF would make discovery
+over-report a path, so `uc2-node` refuses to start anywhere else, by name
+(`do-not-fragment is not available on this OS`). This bites development boxes,
+not fleets: a macOS or BSD machine can no longer run a node, though the client
+and service crates are unaffected.
+
+**After the flag day**, nothing is required of the operator. Each node probes
+its peers on boot and on every membership change; the leader commits the
+minimum once every member has answered, and every node applies it at commit.
+Verify with `uc2ctl status`'s `ceiling:` line and the
+`uc2_datagram_mtu_bytes` / `uc2_probe_min_mtu_bytes` gauges. A cluster on an
+ordinary 1500 B network stays at the baseline and behaves exactly as it did
+before, which is the intended outcome rather than a failure. A **one-node**
+cluster also stays at the baseline: an empty member set is no evidence, so
+discovery begins when the first peer joins.
 
 ## Where to go next
 

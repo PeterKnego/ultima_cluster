@@ -156,7 +156,7 @@ durable config record owns membership, and a restart with an edited `members`
 list has no effect. To change membership on a running cluster, use `uc2ctl` —
 see [Change cluster membership](change-cluster-membership.md).
 
-`[services]` (M14; **required** since FSM identity, 2.11 pending — spec §4.1)
+`[services]` (M14; **required** since FSM identity, 2.11.0 — spec §4.1)
 declares which state-machine processes this node hosts, by name:
 `names = ["kv", "orders"]`, row = list index. There is no default any more —
 absent used to mean `ids = [0]`; a `node.toml` without `[services]` now
@@ -289,7 +289,7 @@ must implement.
 
 Since M14, run **one service process per declared `[services]` name**, each
 attaching by its own `S::NAME` (a harness binary that hosts more than one FSM
-type takes `--fsm <name>` to pick which; since FSM identity, 2.11 pending,
+type takes `--fsm <name>` to pick which; since FSM identity, 2.11.0,
 there is no `--service-id` any more — a production service that links one
 state machine needs no flag at all, it attaches by the name compiled into
 it), and supervise all of them the same way. A declared name with no process

@@ -90,7 +90,7 @@ Consistency, SubmitError}`) are in the same position and are covered too.
   The metric series contract is not itself in the promised-surface table —
   `uc_node::obs` is listed as not promised — but it is treated as an
   operator interface in practice: families are added, not renamed.
-- **Log time and timers (2.11 pending) add to `uc_service` additively**, on
+- **Log time and timers (2.11.0) add to `uc_service` additively**, on
   top of FSM identity's already-breaking trait change: `ApplyCtx` gains
   `time_ns` and `term` (it is `#[non_exhaustive]` for exactly this) plus
   `schedule`/`cancel`/`timers`; `TimerReq` and `TimerEvent` are new types; a
@@ -148,7 +148,7 @@ API for downstream code. They may change in any release:
 
 | Crate | Not promised |
 |---|---|
-| `uc_protocol` | all of it — `ring` (the lock-free ring buffers — not the `ring` crypto crate that `deny.toml` bans), `v2`, `magic`, `error_codes`, `version`, `identity` (FSM identity, 2.11 pending — `FsmName`, `FsmIdentity`, `fnv1a_64`, packed version). It is the wire spec, governed by the flag-day rule below, not by semver. `2.11.0` also **relays `FrameHeader`** (`session_id`/`correlation_id: u64` become `client_id`/`seq: u32` plus `time_ns: u64`) and adds `FRAME_TYPE_TIMER`, `TimerBody`, `MSG_V2_SCHED` and `SchedRecord` — a breaking Rust change on an unpromised item, and a flag day on the wire. |
+| `uc_protocol` | all of it — `ring` (the lock-free ring buffers — not the `ring` crypto crate that `deny.toml` bans), `v2`, `magic`, `error_codes`, `version`, `identity` (FSM identity, 2.11.0 — `FsmName`, `FsmIdentity`, `fnv1a_64`, packed version). It is the wire spec, governed by the flag-day rule below, not by semver. `2.11.0` also **relays `FrameHeader`** (`session_id`/`correlation_id: u64` become `client_id`/`seq: u32` plus `time_ns: u64`) and adds `FRAME_TYPE_TIMER`, `TimerBody`, `MSG_V2_SCHED` and `SchedRecord` — a breaking Rust change on an unpromised item, and a flag day on the wire. |
 | `uc_log` | `agent`, `archive`, `buffer`, `cnc`, `counters`, `reader`, `region`, `state`, `writer` |
 | `uc_consensus` | `commit`, `config`, `election`, `reconcile` |
 | `uc_net` | `fault`, `flow`, `rebuild`, `receiver`, `sender`. **`2.8.0` changed these signatures, in a minor release** — see the note below. |
@@ -331,7 +331,7 @@ The break, under the rule above, is real:
   and its `ids` key is refused outright, pointing at `names`.
 
 Two later changes in the same release ride **this same carve-out**, because
-they are the same kind of break in the same unreleased flag day:
+they are the same kind of break in the same flag day:
 
 - the retired `uc_service::SnapshotPolicy` and `ServiceConfig::snapshot_policy` are
   **removed** — removing a promised type is a MAJOR change under the rule

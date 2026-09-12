@@ -47,15 +47,29 @@ invites. Run both through the gate discipline.
 
 - **Why first:** it exercises the whole M8–M14 surface the way a user would,
   and it settles two questions the docs cannot settle on their own:
-  - whether the **command payload ceiling** (≤ 1344 B crypto-off / ≤ 1312 B
-    crypto-on, one command per datagram — `docs/security/attack-surface.md`
-    §3, `CLAUDE.md` standing facts) is a real adoption blocker. Moving it is
-    a wire flag day (fragmented commands, jumbo frames, or an OS-bypass
-    fabric), so it needs a workload to justify it.
+  - ~~whether the **command payload ceiling** is a real adoption blocker~~ —
+    **ANSWERED by jumbo-frame MTU discovery (`2.12.0`)**, without waiting for
+    a workload. The ceiling is no longer one number: it is discovered per
+    cluster from the path MTU between members (`RUNGS = [1408, 8832, 8960]`)
+    and committed through the replicated `Settings` record, so a cluster on a
+    jumbo fabric carries ≤ 8896 B crypto-off / ≤ 8864 B crypto-on, and one on
+    an ordinary 1500 B path keeps the old ≤ 1344 B / ≤ 1312 B. Of the three
+    ways of moving it this item named, the jumbo one is taken; **fragmenting a
+    command across datagrams stays out of scope** (a command above the
+    discovered ceiling is refused, never split), and an OS-bypass fabric is
+    still a hypothesis. What a workload could still settle is whether ~8.8 KB
+    is enough — see [the
+    explainer](notes/uc2-jumbo-frame-discovery-explained.md) and [the
+    how-to](how-to/jumbo-frames.md).
   - whether the **remote protocol needs a v2**: `SUBMIT`/`QUERY` carry no
     FSM selector, so a remote client reaches only FSM 0
     (`docs/superpowers/specs/2026-08-21-uc2-multi-service-design.md` §11 "Out
-    of scope"; `docs/releases.md` 2.8.0 entry).
+    of scope"; `docs/releases.md` 2.8.0 entry). **This half stands**, and
+    `2.12.0` added a second thing a v2 would carry: protocol v1 advertises no
+    payload ceiling, so a `uc_remote` client cannot know the cluster's
+    discovered one — it warns on the standard 1312 B threshold alone, and
+    measures the bare command while the node's door sees the session
+    envelope's extra 16 B.
 - **Cost:** moderate. **Output:** a backlog grounded in use, plus the two
   decisions above.
 - **Status 2026-09-01: brainstormed and PARKED** — decisions (KV store,
@@ -77,7 +91,7 @@ direction rather than a footnote to a finished one. The references that used
 to point at "§ 2a" for these residuals now point here.*
 
 - ~~**A restarted node under-ships the table for one window**~~ (plan 3
-  residual a) — **CLOSED by the cluster FSM (2.11 pending), plan 1.** The
+  residual a) — **CLOSED by the cluster FSM (2.11.0), plan 1.** The
   cause was structural: the table was shipped by a **live read** of the
   shipping node's memory, gated on the cnc commit counter, which is
   deliberately not primed at boot. Both the read and the gate are gone. The
@@ -407,7 +421,7 @@ instants (`uc2ctl snapshot --standby`) and the `uc2ctl snapshot fetch` return
 path come with it —
 [`docs/notes/uc2-cluster-fsm-explained.md` § Instants](notes/uc2-cluster-fsm-explained.md#instants-one-position-one-set).
 
-**Superseded before shipping, in the same unreleased `2.11.0`**: the cluster
+**Superseded before shipping, inside the same `2.11.0` release**: the cluster
 FSM took over both carries; the retired `FRAME_TYPE_SCHEDULE_TABLE = 6` and
 `SNAP_TABLE` kind 21 are both **retired** here. The frame becomes
 `CLUSTER kind = 2` and the table rides

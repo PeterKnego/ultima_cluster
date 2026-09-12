@@ -123,7 +123,7 @@ replay: [Keep the journal from growing without bound](bound-journal-growth.md).
 declared FSM, so a learner declaring `[services] names` with more than one
 row rebuilds every FSM below the floor, not only row 0. The learner's
 declared names must match the sender's exactly, **in the same order**
-(FSM identity, 2.11 pending: a positional check, not a set check — the same
+(FSM identity, 2.11.0: a positional check, not a set check — the same
 names in a different order are refused too) — a source whose per-row identity
 hashes do not agree with the learner's own, row for row, is refused **by
 name** before a session opens (`identity mismatch`, naming the row and both
@@ -133,9 +133,9 @@ a purged-cluster learner's `min_applied` at 0 and made `promote` refuse
 `NotCaughtUp` forever; M14c fixed it — [Upgrade a cluster § wire change in
 2.8.0](upgrade-a-cluster.md); FSM identity replaced the underlying
 set-membership bitmask with the positional, by-name check — [Upgrade a
-cluster § wire + cnc change in 2.11](upgrade-a-cluster.md#wire--cnc-change-in-211-pending-fsm-identity-log-time-and-the-cluster-fsm-070-cnc-31).)
+cluster § wire + cnc change in 2.11](upgrade-a-cluster.md#wire--cnc-change-in-2110-fsm-identity-log-time-and-the-cluster-fsm-070-cnc-31).)
 
-**A floor that keeps climbing while the learner joins** (2.11 pending) is
+**A floor that keeps climbing while the learner joins** (2.11.0) is
 handled, not a wedge: if the leader purges past what the learner has
 fetched since its first snapshot install, the next session's floor is
 adopted over the learner's non-empty journal (the prefix it held is
@@ -145,7 +145,7 @@ service logs `replay waits for snapshot artifact` once per wait. Before
 this, the learner stayed at its first floor forever and one FSM row could
 die with `SnapshotRequired`.
 
-**Since coordinated snapshot instants** (2.11 pending) a session ships one
+**Since coordinated snapshot instants** (2.11.0) a session ships one
 **set** at one position: every row's artifact and the cluster FSM's, all
 tagged with the same P, because the leader commanded a single `SNAPSHOT`
 frame that every row froze at. A node that cannot assemble such a set

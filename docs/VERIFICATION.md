@@ -23,12 +23,13 @@ record it summarizes; where the two disagree, the dated record wins.
 |---|---|---|
 | **Lean 4 proofs** | Machine-checked | Consensus safety kernels; election safety and log matching over an N-node protocol model |
 | **Conformance rig** | Executable, exhaustive-by-sampling | That the Lean model and the real Rust agree, vector by vector |
-| **Deterministic simulation** | Checked under seeded fuzz | Nine whole-cluster safety invariants under fault injection |
+| **Deterministic simulation** | Checked under seeded fuzz | Twelve whole-cluster safety invariants under fault injection |
+| **In-process fault layer** | Checked on real nodes, deterministically | Datagram-size faults on the real transport: path-MTU discovery, both jumbo startup gates, and a client seeing a raised ceiling (`2.12.0`) |
 | **WGL lincheck capstones** | Checked on real processes | Linearizability of a register under leader kills, crashes, partitions, purge — single- and two-FSM |
 | **Elle** | Checked on real processes | Transactional safety (serializable and strict), single- and two-FSM — plus a mutation tier proving the harness has teeth |
 | **Multi-process crashtest** | Checked on real processes | Recovery correctness under `SIGKILL` mid-load — single- and two-FSM |
 | **loom** | Exhaustive over interleavings | The frame-visibility memory protocol, the MPSC ring's per-record commit protocol, **and the Broadcast ring's seqlock read barrier** |
-| **Fuzzing (libFuzzer)** | Checked under coverage-guided input search | Totality of the twenty decoders that see bytes the process did not write |
+| **Fuzzing (libFuzzer)** | Checked under coverage-guided input search | Totality of the twenty-four decoders that see bytes the process did not write |
 | **Miri** | Checked under a symbolic interpreter | Undefined behaviour in the pure wire/journal decoders and `uc_remote`'s Vec-backed SPSC internals (**not** the file-backed rings) |
 | **Veil** | Bug-hunting only — **never the record** | Bounded model checking of the election and reconfiguration planes |
 | **`log_clock` unit suite** | Ordinary unit tests | The monotonic log clock's pure arithmetic (`uc_node::log_clock`): steady state, forward-step adoption, backward-step smear and full retirement, tolerance, multiple resamples against a smear in flight (`a_smear_in_flight_is_not_re_reported_and_the_gauge_counts_down`: one step reported, the remaining-smear gauge strictly falling, no undershoot, over 3 000 resamples), a seeded-random step sequence, and `bracket_sample`/`resample_slow` against the real clock — 17 tests, `cargo test -p uc_node --lib log_clock` |
@@ -361,6 +362,56 @@ reverted; it is not a shipped feature flag.
 cargo test -p uc_sim                          # standard tier
 cargo test -p uc_sim --features sim-heavy     # 1000-seed fuzz
 cargo test -p uc_sim --features mutation-testing --test scenarios window_slide  # red twin
+```
+
+### The in-process fault layer — and the one thing the sim cannot see (2.12.0)
+
+`uc_sim` models loss, duplication, reordering, corruption and replay, but it
+does **not model datagram size**: every datagram in the simulated world is a
+message, not a byte count. So path-MTU discovery — jumbo frames, `2.12.0` —
+cannot be adjudicated there, and this is stated rather than papered over. The
+rung itself is ordinary replicated `Settings` data whose FSM-versus-kernel
+invariants `inv12` already sweeps; what the sim cannot reach is the measuring.
+
+It is proved instead on **real nodes over the real transport**, with two
+size-aware faults added to `uc_net::fault::FaultConfig`:
+
+- **`max_datagram`** — a send longer than this is dropped whole, the way a
+  do-not-fragment datagram vanishes at a hop that cannot carry it. The
+  stand-in for a narrow *path*.
+- **`emsgsize_over`** — a send longer than this fails with `EMSGSIZE` instead
+  of leaving the host. The stand-in for the *local* refusal when the route's
+  MTU is already known.
+
+Both are checked before the seeded rolls, so neither consumes an RNG draw and
+neither perturbs an existing scenario's seed.
+
+`uc_node/tests/jumbo.rs` runs three real loopback nodes per case (loopback
+carries 65 536 B, so an uncapped cluster resolves at the ladder's top rung) and
+pins, with the cap standing in for the narrow hop:
+
+| test | what it proves |
+|---|---|
+| `discovery_lands_on_the_capped_rung_on_every_node` | every node commits exactly the capped rung — the committed value is the minimum over paths, not a local guess |
+| `an_uncapped_loopback_cluster_reaches_the_top_rung` | the ladder walks all the way up when nothing blocks it |
+| `the_ceiling_holds_at_baseline_while_one_member_is_silent` | one unanswered member pins the cluster at the baseline: an unresolved peer is *no evidence*, never optimism |
+| `a_client_attached_before_the_raise_sees_it` | a client attached before the raise submits a jumbo command after it, through the live cnc `payload_ceiling` word |
+| `the_force_gate_refuses_a_path_too_narrow` / `..._a_silent_peer` | `force_jumbo_frames` fail-stops by name, and the two refusals are distinguished: a peer that answered too small vs. one that never answered |
+| `a_restart_below_the_committed_rung_refuses_to_join` | a node restarting against a committed rung its path cannot carry refuses by name instead of joining |
+| `a_healthy_restart_on_a_jumbo_cluster_does_not_refuse` | the companion negative: a mid-ladder peer is *not* degradation, so an ordinary restart serves instead of crash-looping |
+
+The last pair is the proof that matters most, because the defect it pins was a
+state-classification bug found twice in review: a peer whose jumbo ack has
+simply not landed yet looks exactly like a narrow one unless the predicate also
+asks whether its fast probe ladder has been spent. The deterministic red for it
+is the unit tier (`uc_net::probe`'s
+`narrow_peers_needs_an_answer_and_a_spent_fast_ladder` and `uc_node::node`'s
+`a_mid_ladder_answer_holds_serving_but_never_refuses`); on loopback the acks
+land microseconds apart, so the integration test is a guard, not the oracle —
+stated here so the proof is not read as stronger than it is.
+
+```bash
+cargo test -p uc_node --test jumbo
 ```
 
 ---
@@ -972,6 +1023,18 @@ The most important section, and the one most projects omit.
   arm: instants under load (A/B'd per M14a), a below-floor join with the
   shipper restarted mid-window, and freeze duration against observed commit
   pause on a deliberately large state, all-nodes then `--standby`.
+- **The sim does not model datagram size, so path-MTU discovery is not
+  adjudicated there** (`2.12.0`, §2's closing subsection). `uc_sim` carries
+  messages, not byte counts: loss, duplication, reordering, corruption and
+  replay are modelled, "too large for this path" is not. The rung is ordinary
+  replicated `Settings` data — `inv12` sweeps its FSM-versus-kernel
+  relationship like any other — but the **measuring** (the ladder, the commit
+  rule, the two startup gates) is proved by `uc_node/tests/jumbo.rs` over the
+  real transport with `FaultConfig::{max_datagram, emsgsize_over}` and by the
+  unit tier. The fleet arm is pre-committed and **unrun**
+  (`docs/benchmarks/uc2-jumbo-frame-discovery-gate-TEMPLATE.md`). Stated here
+  because "the sim covers the transport" would otherwise be read to include
+  it.
 - **"The instant completed on the first attempt" is not constructible as a
   watched red.** `instant_completes_first_try`'s bar and `learner.rs`'s
   `attempt == 1` fire only on a regression of ruling P10 (a replayed span
@@ -1112,7 +1175,7 @@ The most important section, and the one most projects omit.
     is not a correctness substitute, and **row e has still not been
     re-measured**. The pinning run above did not address it, and the residual
     14.3 % spread is undiagnosed.
-- **FSM identity (2.11 pending)**: named rows, replacing M14's numbered-set
+- **FSM identity (2.11.0)**: named rows, replacing M14's numbered-set
   bitmask (spec `docs/superpowers/specs/2026-09-02-uc2-fsm-identity-design.md`).
   The existing multi-service proof surface above (the seven two-FSM
   capstones, `elle_quiet_two_fsm`) now runs with **named** FSMs via

@@ -32,7 +32,7 @@ blanket impl makes it also `RawStateMachine`.
 /// `apply` the committed frame payload exactly as it sits in the log buffer
 /// and reuses `out` across calls — no decode, no allocation in steady state.
 pub trait RawStateMachine: Send + 'static {
-    /// The FSM's identity, declared in code (FSM identity, 2.11 pending).
+    /// The FSM's identity, declared in code (FSM identity, 2.11.0).
     const NAME: &'static str;
     /// Packed semantic version of this FSM's logic; `0` = unversioned.
     const VERSION: u32 = 0;
@@ -49,7 +49,7 @@ pub trait RawStateMachine: Send + 'static {
     fn last_applied(&self) -> Option<u64>;
 
     /// A timer this FSM scheduled has reached its position on the log.
-    /// PROVIDED, default no-op (log time and timers, 2.11 pending).
+    /// PROVIDED, default no-op (log time and timers, 2.11.0).
     fn on_timer(&mut self, ctx: &mut ApplyCtx, ev: TimerEvent) {}
     /// Framework hook: the pending instances a wrapper holds, re-announced
     /// to the node after attach and after replay. PROVIDED, default empty.
@@ -84,13 +84,13 @@ neither signature takes `async`.
 ## `ApplyCtx`: position, time, term, identity
 
 `apply` receives `&mut ApplyCtx` rather than a bare `position: u64` (FSM
-identity, 2.11 pending). It is `#[non_exhaustive]`, built once per frame by
+identity, 2.11.0). It is `#[non_exhaustive]`, built once per frame by
 the apply loop, by journal replay and by snapshot tail-replay, and it carries:
 
 | item | what it is |
 |---|---|
 | `ctx.position: u64` | the frame's absolute byte position — the idempotency key, exactly what `position` used to be |
-| `ctx.time_ns: u64` | **the leader's stamp on this frame**: ns since the Unix epoch, non-decreasing along the log, identical on every replica. This is your `now()` (log time and timers, 2.11 pending) |
+| `ctx.time_ns: u64` | **the leader's stamp on this frame**: ns since the Unix epoch, non-decreasing along the log, identical on every replica. This is your `now()` (log time and timers, 2.11.0) |
 | `ctx.term: u32` | the frame's `leadership_term_id` |
 | `ctx.ids()` | an `IdGen` for this apply call: deterministic IDs from `(position, identity, an ordinal that resets every call)` |
 | `ctx.schedule(id, at_ns)` / `ctx.cancel(id)` | ask for / withdraw a timer (log time and timers) |
@@ -148,7 +148,7 @@ That is what sets the row's **snapshot-capability bit** on the cnc page, and
 that lacks it — a row started with plain `start()` would ignore the frame, so
 the set could never complete and the purge floor would never move.
 
-**When `freeze()` is called is no longer your decision** (2.11 pending). The
+**When `freeze()` is called is no longer your decision** (2.11.0). The
 per-service `SnapshotPolicy { interval_bytes }` is **retired**: a snapshot is
 now taken at a **coordinated instant**, a `SNAPSHOT` frame the leader appends,
 at whose frame-end position **P** every declared row and the cluster FSM
