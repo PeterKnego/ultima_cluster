@@ -295,7 +295,9 @@ its agents, replicates and votes as usual, but holds `can_serve` false and
 answers `/readyz` with 503 — in **any** role, not just leader — until every
 configured peer has proven the `JUMBO_MIN_RUNG = 8832` B datagram rung. It then
 logs `jumbo_gate_passed` and serves. If 30 s (`JUMBO_GATE_WINDOW`, a constant)
-elapses first the node **fail-stops** (exit 1) with one of two named refusals:
+elapses first the node **fail-stops** (exit 1) with one of two named refusals
+— on a cluster that has not yet committed a jumbo rung; once it has, the join
+gate below takes precedence and never fail-stops on silence:
 `jumbo_path_too_narrow`, when a peer answered below the rung, or
 `jumbo_peer_silent`, when a peer never answered at all — a liveness fact, and
 worded as one. Both name the first offending member id and list every one.
@@ -314,7 +316,11 @@ Independent of this key, and not configurable: once a cluster has **committed**
 a jumbo rung, a node whose path to some member *answers* below it fail-stops at
 startup with `path_below_committed_mtu` rather than joining — the log already
 holds frames it cannot receive. A member that answers nothing never refuses
-anything; the node keeps replicating and voting and simply does not serve.
+anything; the node keeps replicating and voting, and serves once a quorum of
+voters (one voter, for a learner) has proven the rung to it — so a single dead
+member does not hold a restarted survivor, while a hold that outlasts
+discovery is logged every 30 s (`jumbo_join_gate_holding`) and alerted after
+5 min (`Uc2JumboGateHeld`).
 
 **`faults: FaultConfig`**
 Fault-injection configuration, used by the simulation and test harnesses.

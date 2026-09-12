@@ -257,11 +257,11 @@ must not pretend otherwise. They differ in who asks for them and in what
 | | `force_jumbo_frames = true` (spec §6) | the join gate (spec §5.4) |
 |---|---|---|
 | who turns it on | the operator, per host (env: `UC2_FORCE_JUMBO_FRAMES`) | nobody — it arms itself whenever a node learns of a committed rung above the baseline it has not proven |
-| what it demands | every peer proves `JUMBO_MIN_RUNG = 8832` | the voters this node has proven the **committed** rung to form a quorum with it (a joining learner: a majority of the voters) |
+| what it demands | every peer proves `JUMBO_MIN_RUNG = 8832` | the voters this node has proven the **committed** rung to form a quorum with it (a joining learner: one proven voter) |
 | while pending | holds `can_serve` false and answers `/readyz` with 503 — in **any** role, not just leader; a held LEADER also appends no client command, fires no timer and confirms no linearizable read, so the hold is not merely advisory | the same; `uc2_jumbo_gate_pending` is `1` |
-| on proof | `jumbo_gate_passed`, serving begins | the same |
+| on proof | `jumbo_gate_passed` (`gate = force`), serving begins | `jumbo_gate_passed` (`gate = join`, with `proven_voters`/`voters`/`self_vote`), serving begins |
 | on failure | after `JUMBO_GATE_WINDOW = 30 s`, fail-stop: `jumbo_path_too_narrow` (a peer answered below the rung) or `jumbo_peer_silent` (no peer answer at all — worded as the liveness fact it is) | fail-stop `path_below_committed_mtu` the moment a peer is PROVEN narrow, naming the peer and both rungs — no window |
-| on nothing proven either way | (the silent case is a failure above) | HOLDS — silence, a peer still mid-ladder, or an outlived ack — with no window, until a quorum of voters has proven the rung |
+| on nothing proven either way | (the silent case is a failure above) | HOLDS — silence, a peer still mid-ladder, or an outlived ack — with no window, until a quorum of voters has proven the rung; says so every 30 s (`jumbo_join_gate_holding`, warn) and raises `Uc2JumboGateHeld` after 5 min, in any role |
 
 **The join gate's refusal has no window, silence never refuses, and the pass
 is a quorum.** The join gate fail-stops only on a peer that *answered* below
@@ -274,18 +274,25 @@ else. Each part matters:
   "narrow" — and it is not something a timer can turn into a verdict either,
   so the gate does not wait *on it*: it waits for a **quorum**. Self plus one
   proven voter on three voters, self plus two on four or five; a joining
-  learner has no vote and needs a plain majority of the voters; a learner
-  peer's proof counts for nothing, as its ack counts for nothing at commit.
-  Why that is the right condition: proof is a probe ack over the same UDP
-  plane replication uses, from a voter, so a node that cannot get one from a
-  quorum of voters cannot get commit acks from them either — and serving is
-  leader-only in UC, so a timed pass would let it do nothing. Why it needs no
+  learner has no vote and needs no quorum for anything, so it passes on one
+  proven voter; a learner peer's proof counts for nothing, as its ack counts
+  for nothing at commit. Why that is the right condition: proof is a probe
+  ack over the same UDP plane replication uses, from a voter, and durable
+  reports and votes are pairwise-sealed exactly like probes, so a node that
+  cannot get a probe ack from a quorum of voters cannot get their commit acks
+  or votes either — and serving is leader-only in UC, so a timed pass would
+  let it do nothing. Why it is not silent: a holding gate writes
+  `jumbo_join_gate_holding` every 30 s with the terms it is short of and the
+  members short of the rung, and `Uc2JumboGateHeld` fires after five minutes
+  in any role — a held follower or learner is as visible as a held leader.
+  Why it needs no
   timer to stay available: the dead-host outage that once argued for one
   (one dead voter out of three holding every restarted survivor at `/readyz`
   503 until it came back — the shape that left the `lin_v2` capstones, which
   kill the leader and then wait for a serving survivor, with no servable node)
   cannot happen, because the survivors *are* the quorum; the restarted one
-  proves the rung to the other within a probe round. Two earlier iterations
+  proves the rung to the other within a probe round (up to the 30 s slow
+  cadence if its fast ladder was already spent). Two earlier iterations
   were availability bugs in opposite directions — refusing on silence
   crash-looped a restarted survivor, holding on *every* peer made a dead host
   an outage — and the unproven pass that briefly replaced them gave up the
@@ -295,8 +302,8 @@ else. Each part matters:
   answering it at the baseline, spends its ladder, and refuses by name.
   `uc2ctl remove <dead-id>` is accepted
   while a gate is pending — admin handling keys on the leader flag, not on the
-  gate. A peer ANSWERING below the rung holds serving the same way: discovery
-  in flight, resolved within its ladder.
+  gate. A peer ANSWERING below the rung is discovery in flight, resolved
+  within its ladder — not a hold of its own; only the missing quorum holds.
 - **An ack that has been outlived proves nothing.** The refusal needs a CURRENT
   answer, so every round of an unresolved peer carries one datagram at the rung
   already verified (the refresh rung) and `narrow_peers` requires an ack within

@@ -267,27 +267,38 @@ verify rather than a build:
   and it does not let the node serve on its own either: the gate **holds**
   (`/readyz` 503, `uc2_jumbo_gate_pending = 1`) until the voters this node has
   proven the rung to form a **quorum with it** — self plus one on three
-  voters, self plus two on four or five; a joining learner has no vote of its
-  own and needs a plain majority of the voters — and then passes with proof
-  (`jumbo_gate_passed`, with `proven_voters`/`voters` on the record). There is
-  no timer, and none is needed: a node that cannot get a probe ack from a
-  quorum of voters cannot get commit acks from them either. So a **rolling
-  restart on a cluster with one dead host is not an outage**: the restarted
-  survivor proves the rung to the other survivor within a probe round and
-  serves. A member ANSWERING below the rung holds serving the same way while
-  its ladder runs (~5 s), then refuses by name. A peer that answered once and
-  then stopped answering is treated as silent, not narrow: the refusal needs a
-  CURRENT answer at a rung below the committed one, and an outlived 1408 ack
-  is no proof of 8960 either. On a hold that does not clear, the
-  `jumbo_join_gate_armed` record names the committed rung; check
-  `uc2_probe_min_mtu_bytes` and which voters are up before anything else.
+  voters, self plus two on four or five; a joining **learner** has no vote
+  and needs no quorum, so it passes on ONE proven voter — and then passes
+  with proof (`jumbo_gate_passed`, `gate = join`, with
+  `proven_voters`/`voters`/`self_vote` on the record). There is no timer, and
+  none is needed: durable reports and votes are pairwise-sealed exactly like
+  probes, so a node that cannot get a probe ack from a quorum of voters
+  cannot get their commit acks or votes either. So a **rolling restart on a
+  cluster with a single dead host is not an outage**: the restarted survivor
+  proves the rung to the other survivor within a probe round (1 s on the
+  fast ladder; up to 30 s on the slow cadence once the ladder is spent) and
+  serves. A member ANSWERING below the rung does not hold on its own either —
+  only the missing quorum holds — and once its ladder runs out (~5 s) it
+  refuses by name. A peer that answered once and then stopped answering is
+  treated as silent, not narrow: the refusal needs a CURRENT answer at a rung
+  below the committed one, and an outlived 1408 ack is no proof of 8960
+  either. **A hold that does not clear is not silent**: every 30 s the node
+  writes `jumbo_join_gate_holding` (warn) with the committed rung, the quorum
+  terms it is short of and every member short of the rung (`id:carried`,
+  `0` = silent), and `Uc2JumboGateHeld` (warning) fires after 5 min in any
+  role. Read that record first, then `uc2_probe_min_mtu_bytes` on the
+  members it names; with wire crypto on, a member whose pairwise session
+  never came up looks exactly like a dead one here, so check
+  `uc_crypto_handshake_failures_total` too.
   `uc2ctl remove <dead-id>` is accepted while
   a gate is pending — admin handling keys on the leader flag, not on the gate.
-  `uc2_jumbo_gate_pending` is `1` on a held node, which is what separates this
-  from `Uc2LeaderNotServing`'s other cause (an uncommitted `NewTerm`). Under
-  `force_jumbo_frames` the same gate fail-stops after 30 s instead, as
-  `jumbo_path_too_narrow` (a peer answered below 8832) or `jumbo_peer_silent`
-  (a liveness fact, not an MTU one: start the member). Details and remedies:
+  `uc2_jumbo_gate_pending` is `1` on a held node, and `Uc2LeaderNotServing`
+  excludes that case, so a held leader raises `Uc2JumboGateHeld` and nothing
+  else. `force_jumbo_frames` on such a cluster changes none of this: the join
+  gate takes precedence, so a silent member is a hold, never a
+  `jumbo_peer_silent` fail-stop (that refusal, and `jumbo_path_too_narrow`
+  after 30 s, belong to a cluster that has NOT committed a jumbo rung yet).
+  Details and remedies:
   [Run a cluster on jumbo frames](../how-to/jumbo-frames.md#6-when-a-node-refuses-to-join).
 - [Diagnose a node that is not serving](../how-to/diagnose-a-node.md) — reading
   a live node's control page. *Was §3's procedural half.*

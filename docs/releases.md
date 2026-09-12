@@ -127,9 +127,11 @@ cluster has decided it cannot carry.
   `uc2_payload_ceiling_bytes`, `uc2_probe_min_mtu_bytes`, `uc2_probe_sent_total`,
   `uc2_probe_acked_total`, `uc2_send_emsgsize_total`,
   `uc2_commands_over_standard_total`, and `uc2_jumbo_gate_pending` — `1` while a
-  startup gate holds this node, which is what separates `Uc2LeaderNotServing`'s
-  two causes), two alerts (`Uc2MtuDiscoveryStalled`
-  warning, `Uc2PathBelowMtu` critical) and a `ceiling:` line on `uc2ctl status`.
+  startup gate holds this node), three alerts (`Uc2MtuDiscoveryStalled`
+  warning, `Uc2PathBelowMtu` critical, `Uc2JumboGateHeld` warning — a gate
+  held for 5 min in any role; `Uc2LeaderNotServing` now excludes a held gate,
+  so its one meaning is an uncommitted `NewTerm`) and a `ceiling:` line on
+  `uc2ctl status`.
 
 **The operator-visible break: `max_payload` is retired.** A `node.toml` that
 still sets it refuses to start, by name:
@@ -198,13 +200,17 @@ three of them are the kind of thing an operator will otherwise read as a defect:
    mid-ladder state, and an earlier iteration that refused on it fail-stopped
    healthy nodes into a `systemd Restart=on-failure` crash loop. It passes once
    the voters this node's probes have proven the committed rung to form a
-   quorum **with it** (`proven + self_vote > voters / 2`, the commit tracker's
-   arithmetic; a joining learner has no self vote and needs a plain majority
-   of the voters; a learner peer's proof counts for nothing), logged as
-   `jumbo_gate_passed` with `proven_voters`/`voters`. Otherwise it holds, with
-   no timer — proof is a probe ack over the plane replication uses, from a
-   voter, so a node that cannot get one from a quorum cannot get commit acks
-   either, and serving is leader-only. The history behind that shape, in
+   quorum **with it** (`proven + 1 > voters / 2`, the commit tracker's
+   arithmetic; a joining learner has no vote and needs no quorum, so it passes
+   on one proven voter; a learner peer's proof counts for nothing), logged as
+   `jumbo_gate_passed` (`gate = join`) with
+   `proven_voters`/`voters`/`self_vote`. Otherwise it holds, with no timer —
+   proof is a probe ack over the plane replication uses, from a voter, and
+   durable reports and votes are pairwise-sealed like probes, so a node that
+   cannot get a probe ack from a quorum cannot get their commit acks or votes
+   either, and serving is leader-only — but with a voice:
+   `jumbo_join_gate_holding` (warn) every 30 s naming the members short of the
+   rung, and `Uc2JumboGateHeld` after 5 min. The history behind that shape, in
    order: holding until `own_min_rung` (a minimum over *all* configured peers)
    reached the rung made one dead host turn every survivor's restart into a
    503 until it returned — a rolling restart became an outage on a cluster
@@ -215,12 +221,13 @@ three of them are the kind of thing an operator will otherwise read as a defect:
    while it was down joined and served, alerted only as a lagging peer; the
    quorum rule (2026-09-12, the maintainer's call) keeps the availability —
    the survivors *are* the quorum, so a restarted one proves the rung to the
-   other within a probe round — and restores the promise: that member finds
+   other within a probe round, up to the 30 s slow cadence once its fast
+   ladder is spent — and restores the promise: that member finds
    every voter answering at the baseline, spends its ladder, and refuses by
    name. `jumbo_join_gate_passed_unproven`, `ProbeTable::answered_below` and
    the join gate's deadline are retired; `JUMBO_GATE_WINDOW` is the force
-   gate's alone. What also holds serving is a peer ANSWERING below the rung,
-   discovery in flight, resolved within its ladder. And the
+   gate's alone. A peer ANSWERING below the rung is discovery in flight,
+   resolved within its ladder, not a hold of its own. And the
    refusal needs CURRENT evidence: every round carries the already-verified
    *refresh* rung and `narrow_peers` requires an ack within the last round or
    two, because a peer that answered once and then stopped (a killed member, or
@@ -356,7 +363,7 @@ has; every row that needs a run says so.
 | the rest of the proof surface (`docs/VERIFICATION.md`): the lin capstones, hard-crash, Elle, loom, Lean + conformance, fuzz smoke | no whole-tree release pass yet — the release procedure's own step | pending |
 | jumbo fleet gate (rows a–f) | [`benchmarks/uc2-jumbo-frame-discovery-gate-2026-09-12.md`](benchmarks/uc2-jumbo-frame-discovery-gate-2026-09-12.md) | **UNRUN** — bars committed 2026-09-12 (the date in the filename), every result cell reads UNRUN |
 | log-clock fleet A/B (`m14_fleet_gate.py` rows a/b/e) | [`benchmarks/uc2-log-clock-gate-2026-09-08.md`](benchmarks/uc2-log-clock-gate-2026-09-08.md) | **UNRUN** — bars committed 2026-09-08; the dev-box smoke in that doc is smoke, not a bar |
-| the M10 alert tier, with the two new jumbo rules | `scripts/m10_alert_fire.sh` (synthetic scenarios `mtu_discovery_stalled`, `path_below_mtu`) | **green locally** 2026-09-12, 25/25 rules fire under promtool — a local tier, not a fleet result |
+| the M10 alert tier, with the three new jumbo rules | `scripts/m10_alert_fire.sh` (synthetic scenarios `mtu_discovery_stalled`, `path_below_mtu`, `jumbo_gate_held`) | **green locally** 2026-09-12, 26/26 rules fire under promtool — a local tier, not a fleet result |
 | artifact integrity (`sha256sum -c`) | — | pending |
 | artifact provenance (`cosign verify-blob`) | — | pending |
 | crates.io (13 crates, `uc_service` before `uc_node`) | — | pending |

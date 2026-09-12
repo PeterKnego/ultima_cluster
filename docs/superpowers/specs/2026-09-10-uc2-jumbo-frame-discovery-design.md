@@ -578,10 +578,11 @@ Written before the tag, per the release rule:
    refused probe is an expected part of the ladder there. `/metrics` therefore
    matches §9's table (one counter), with the narrower meaning its help string
    states.
-7. **§5.4/§6's join gate, as built: no window, and silence never refuses.**
+7. **§5.4/§6's join gate, as built: no window, silence never refuses, and
+   the pass is a QUORUM of voters.**
    The spec describes a settle window (five attempts, ~5 s, or the 30 s gate
    window under `force_jumbo_frames`) after which `own_min_rung < R` is a
-   fail-stop. Three corrections:
+   fail-stop. Four corrections:
    - The **join** gate (a committed rung this node has not proven) has **no
      window at all**. It refuses only a peer that ANSWERED below the committed
      rung **and** has spent its fast probe ladder
@@ -595,15 +596,29 @@ Written before the tag, per the release rule:
      narrow; a node restarting into a degraded cluster keeps replicating and
      voting instead of crash-looping under `systemd Restart=on-failure`. The
      gate PASSES once the voters this node's probes have proven the committed
-     rung to form a quorum with it — `proven + self_vote > voters / 2`, the
-     commit tracker's arithmetic; a joining learner has no self vote and
-     needs a plain majority of the voters; a learner peer's proof counts for
-     nothing — recorded as `jumbo_gate_passed` with `proven_voters`/`voters`.
-     Otherwise it HOLDS `can_serve` false, `/readyz` 503, with **no window**:
-     proof is a probe ack over the same UDP plane replication uses, from a
-     voter, so a node that cannot get one from a quorum of voters cannot get
-     commit acks from them either, and serving is leader-only, so a timed pass
-     would let it do nothing. The as-built history this replaces: holding on
+     rung to form a quorum with it — `proven + 1 > voters / 2`, the commit
+     tracker's arithmetic; a joining LEARNER has no vote and needs no quorum,
+     so it passes on ONE proven voter (a majority would hold a standby that
+     can reach only the leader at `/readyz` 503 forever, for a guarantee it
+     can never use); a learner peer's proof counts for nothing — recorded as
+     `jumbo_gate_passed` (`gate = join`) with
+     `proven_voters`/`voters`/`self_vote`. Otherwise it HOLDS `can_serve`
+     false, `/readyz` 503, with **no window** but with a VOICE:
+     `jumbo_join_gate_holding` (`Warn`) every `JUMBO_GATE_HOLD_LOG_NS = 30 s`
+     naming the terms and every member short of the rung, and the
+     `uc2_jumbo_gate_pending` gauge it holds at `1`, which the new
+     `Uc2JumboGateHeld` (warning, `for: 5m`, any role) alerts on and which
+     `Uc2LeaderNotServing` now EXCLUDES (`and uc2_jumbo_gate_pending == 0`), so
+     the two causes that rule used to conflate are two rules — 26 rules, up
+     from 25. Why no timer: proof is a probe ack over the same UDP plane
+     replication uses, from a voter, and `APPEND_POSITION` and `VOTE` are
+     pairwise-sealed exactly as `PROBE` is, so a node that cannot get a probe
+     ack from a quorum of voters cannot get their commit acks or votes either,
+     and serving is leader-only, so a timed pass would let it do nothing. Under
+     `force_jumbo_frames` on such a cluster the join rule is the one that
+     runs, and it is NOT the force gate's every-member rule: a silent voter
+     outside the quorum, or any learner, may be unproven when the node starts
+     serving. The as-built history this replaces: holding on
      silence until `own_min_rung` (a minimum over ALL configured peers) reached
      the rung made a restarted node un-servable while ANY member was down — a
      rolling restart of a 3-voter cluster with one dead host became an outage
@@ -616,15 +631,17 @@ Written before the tag, per the release rule:
      previously-proven member whose path degraded while it was down joined and
      served, alerted only as a lagging peer. The quorum rule keeps the
      availability (the survivors ARE the quorum, so the restarted one proves
-     the rung to the other within a probe round) and restores the promise
+     the rung to the other within a probe round — up to the 30 s slow cadence
+     once its fast ladder is spent) and restores the promise
      (that member finds every voter answering at the baseline, spends its
      ladder, and refuses by name). `jumbo_join_gate_passed_unproven`,
      `ProbeTable::answered_below` and `Joining`'s deadline are retired;
-     `JUMBO_GATE_WINDOW` is the force gate's alone. What holds serving besides
-     silence is a peer ANSWERING below the rung — discovery in flight — and a
-     PROVEN-narrow peer still refuses immediately, checked BEFORE the quorum
-     on every poll, so a proven quorum never excuses a member this node
-     provably cannot carry the rung to.
+     `JUMBO_GATE_WINDOW` is the force gate's alone. A peer ANSWERING below the
+     rung is discovery in flight, not a hold of its own (only the missing
+     quorum holds), and a PROVEN-narrow peer — voter or learner — still
+     refuses immediately, checked BEFORE the quorum on every poll, so a proven
+     quorum never excuses a member this node provably cannot carry the rung
+     to.
    - **The refusal needs CURRENT evidence, which is why every round carries the
      refresh rung.** `ProbeTable::due` appends the already-verified rung to
      every round of an unresolved peer (not only when its advertisement is

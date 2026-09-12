@@ -255,18 +255,26 @@ Three things to know about it:
   the hold is proof from enough voters: the gate passes once the voters this
   node's probes have proven the committed rung to form a **quorum with this
   node** — self plus one on three voters, self plus two on four or five. A
-  joining learner has no vote of its own, so it needs a plain majority of the
-  voters; a learner peer's proof counts for nothing, as its ack counts for
-  nothing at commit. The pass is logged as `jumbo_gate_passed` with
-  `proven_voters` and `voters` on the record. There is **no timer**, and none
-  is needed: proof is a probe ack over the same UDP plane replication uses,
-  from a voter, so a node that cannot get one from a quorum of voters cannot
-  get commit acks from them either, and serving is leader-only — a timed pass
-  would let it do nothing. The outage that once argued for a timer — one dead
-  voter out of three holding every restarted survivor at `/readyz` 503 until
-  it came back — cannot happen under this rule, because the two survivors
-  *are* the quorum: the restarted one proves the rung to the other within a
-  probe round and serves. The earlier iterations were the two availability
+  joining **learner** has no vote and needs no quorum for anything (its
+  frames come from the leader, a voter), so it passes on **one** proven
+  voter; a learner peer's proof counts for nothing, as its ack counts for
+  nothing at commit. The pass is logged as `jumbo_gate_passed` (`gate =
+  join`) with `proven_voters`, `voters` and `self_vote` on the record. There
+  is **no timer**, and none is needed: proof is a probe ack over the same UDP
+  plane replication uses, from a voter, and durable reports and votes are
+  pairwise-sealed exactly like probes, so a node that cannot get a probe ack
+  from a quorum of voters cannot get their commit acks or votes either, and
+  serving is leader-only — a timed pass would let it do nothing. The outage
+  that once argued for a timer — one dead voter out of three holding every
+  restarted survivor at `/readyz` 503 until it came back — cannot happen
+  under this rule, because the two survivors *are* the quorum: the restarted
+  one proves the rung to the other within a probe round (1 s on the fast
+  ladder, up to the 30 s slow cadence once that ladder is spent) and serves.
+  **A hold that does not clear has a voice**: every 30 s the node logs
+  `jumbo_join_gate_holding` (warn) naming the committed rung, the quorum terms
+  it is short of and every member short of the rung, and after five minutes
+  `Uc2JumboGateHeld` fires — in any role, so a held follower or learner is as
+  visible as a held leader. The earlier iterations were the two availability
   bugs this rule was built to avoid (refusing on silence crash-looped a
   restarted survivor; holding on *every* peer made a dead host an outage), and
   the unproven pass that briefly replaced them gave up the spec's promise: a
@@ -275,11 +283,12 @@ Three things to know about it:
   mislabelled `Uc2PeerLagging` where a named refusal belonged. Under the
   quorum rule that member finds every voter answering it at the baseline,
   spends its ladder, and refuses by name (§6's remedy).
-- **A peer ANSWERING below the rung holds serving the same way.** That is
-  discovery in flight — the baseline ack has landed and the jumbo rungs have
-  not — and it resolves one way or the other within a probe ladder (five
-  attempts, ~5 s): either the jumbo ack lands (and, with a quorum proven, the
-  gate passes), or the ladder runs out and the node refuses by name.
+- **A peer ANSWERING below the rung is discovery in flight, not a hold of
+  its own.** The baseline ack has landed and the jumbo rungs have not; only
+  the missing quorum holds serving, so a mid-ladder peer outside a proven
+  quorum delays nothing. It resolves one way or the other within a probe
+  ladder (five attempts, ~5 s): either the jumbo ack lands, or the ladder
+  runs out and the node refuses by name.
 - **A peer that answered once and then went quiet is silent, not narrow.** The
   refusal needs CURRENT evidence: every probe round carries one datagram at the
   rung the path is already known to carry, and a peer is only refused while it

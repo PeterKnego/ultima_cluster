@@ -432,7 +432,7 @@ families:
 | `uc2_probe_acked_total` | counter | none | `PROBE_ACK`s received and credited |
 | `uc2_send_emsgsize_total` | counter | none | **non-probe** datagrams the kernel refused for size under do-not-fragment: a path below the committed rung. Must be `0` |
 | `uc2_commands_over_standard_total` | counter | none | frames appended above the standard 1312 B ceiling — nonzero means this deployment now depends on jumbo support. **Leader-only by construction** (only a leader appends), so read it summed across the fleet |
-| `uc2_jumbo_gate_pending` | gauge | none | `1` while a **startup gate** is pending: this node replicates and votes but does not serve (`/readyz` 503), because `force_jumbo_frames` is set and a peer has not proven the rung, or because the cluster committed a rung this node has not proven. `0` once it passes, and `0` on a node with no gate. This is the series that tells `Uc2LeaderNotServing`'s two causes apart |
+| `uc2_jumbo_gate_pending` | gauge | none | `1` while a **startup gate** is pending: this node replicates and votes but does not serve (`/readyz` 503), because `force_jumbo_frames` is set and a peer has not proven the rung, or because the cluster committed a rung this node has not proven. `0` once it passes, and `0` on a node with no gate. `Uc2JumboGateHeld` fires on it after 5 min, in any role, and `Uc2LeaderNotServing` excludes it, so a held leader raises exactly one alert |
 
 **Probe counters that never flatten are not a leak.** A peer is resolved only
 when this node has verified the top rung *and* that peer's own advertised
@@ -458,11 +458,14 @@ that node.
 `payload_ceiling_adopted` (info, every node, when the doors move),
 `datagram_mtu_not_a_rung` (warn — a rung off the ladder arrived in an
 installed artifact and was clamped), `jumbo_join_gate_armed` (warn) /
-`jumbo_gate_passed` (info — on the join path it carries `proven_voters` and
-`voters`, the quorum the pass was made on; a join gate never passes on
-silence or on a timer, it holds until a quorum of voters has proven the rung,
-with `uc2_jumbo_gate_pending = 1` meanwhile), and the three fail-stop
-refusals
+`jumbo_gate_passed` (info, `gate = force | join`; on the join path it carries
+`proven_voters`, `voters` and `self_vote`, the terms the pass was made on; a
+join gate never passes on silence or on a timer, it holds until a quorum of
+voters — one voter, for a learner — has proven the rung) /
+`jumbo_join_gate_holding` (warn, every 30 s while a join gate holds: the
+committed rung, the terms it is short of and every member short of the rung
+as `id:carried`, `0` = silent; `uc2_jumbo_gate_pending = 1` meanwhile), and
+the three fail-stop refusals
 `jumbo_path_too_narrow` / `jumbo_peer_silent` / `path_below_committed_mtu`
 (error). A client over the standard ceiling emits
 `command_over_standard_ceiling` (warn, once per client) from whichever
@@ -499,7 +502,7 @@ table:
 |---|---|---|
 | `Uc2AgentDead` | any polling agent's `uc2_agent_alive` reads 0 | critical |
 | `Uc2NoLeader` | no node reports `uc2_is_leader == 1`, 30s sustained | critical |
-| `Uc2LeaderNotServing` | a node is leader but `can_serve == 0` — either its `NewTerm` frame is not yet quorum-committed (the `0x01` flags state) or a jumbo MTU gate is pending (2.12.0; check `uc2_datagram_mtu_bytes`/`uc2_probe_min_mtu_bytes` before assuming the former) | critical |
+| `Uc2LeaderNotServing` | a node is leader but `can_serve == 0` with no jumbo gate pending — its `NewTerm` frame is not yet quorum-committed (the `0x01` flags state); a pending gate is excluded (2.12.0) and raises `Uc2JumboGateHeld` instead | critical |
 | `Uc2ServiceWedged` | service heartbeat stale while the node heartbeat is fresh — the apply loop, not the cluster, is stuck | critical |
 | `Uc2ReplicationStalled` | append is advancing but commit is not, for 1m — no quorum acknowledging | critical |
 | `Uc2PeerNeverHeard` | a peer's reported-durable position has sat at 0 for 2m — usually the bind-address mismatch, not a network fault | warning |
@@ -520,6 +523,7 @@ table:
 | `Uc2SnapshotSetDiverged` (coordinated snapshots, 2.11.0) | nodes disagree on the newest complete snapshot set's position, i.e. on their purge floors, for 60s | warning |
 | `Uc2MtuDiscoveryStalled` (jumbo frames, 2.12.0) | this node has proven a larger datagram path than the cluster has committed, for 60s — some *other* member is holding discovery back, silent or narrower. Read `uc2_probe_min_mtu_bytes` on every node | warning |
 | `Uc2PathBelowMtu` (jumbo frames, 2.12.0) | the kernel refused a non-probe datagram for size in the last 5m: a path degraded below the committed rung (or below the 1408 B baseline). The rung is monotone and cannot be lowered — fix the path | critical |
+| `Uc2JumboGateHeld` (jumbo frames, 2.12.0) | this node has held a startup gate for 5m — `/readyz` 503 in any role: it has not proven the committed rung to a quorum of voters (one voter, for a learner). Read its `jumbo_join_gate_holding` records for the members short of the rung, then `uc2_probe_min_mtu_bytes` on those; with wire crypto on, a member whose pairwise session never came up looks like a dead one here | warning |
 
 The per-peer band (`uc2_peer_reported_durable_bytes`, `uc2_peer_replication_lag_bytes`) is leader-authoritative — only the leader receives `AppendPosition` reports, so a follower's own scrape always reads 0 for every peer regardless of health (see [Diagnose a node](diagnose-a-node.md)); `Uc2PeerNeverHeard` and `Uc2PeerLagging` are scoped to `uc2_is_leader == 1` for exactly this reason, and the dashboard's per-peer panel does the same.
 

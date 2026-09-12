@@ -609,7 +609,11 @@ fn a_survivor_restarted_with_one_member_down_passes_on_a_proven_quorum() {
     let (hi, lo) = (dead.max(victim), dead.min(victim));
     let n_hi = nodes.remove(hi);
     let n_lo = nodes.remove(lo);
-    let (dead_node, victim_node) = if hi == dead { (n_hi, n_lo) } else { (n_lo, n_hi) };
+    let (dead_node, victim_node) = if hi == dead {
+        (n_hi, n_lo)
+    } else {
+        (n_lo, n_hi)
+    };
     dead_node.stop();
     fleet.rebind(dead);
     assert_eq!(nodes.len(), 1, "only the leader is left running");
@@ -651,9 +655,13 @@ fn a_survivor_restarted_with_one_member_down_passes_on_a_proven_quorum() {
         "the pass is made on a proven quorum of one peer plus self, not on \
          silence: {text}"
     );
+    // The node that stayed up is untouched. Not `can_serve()`: the restarted
+    // node's first RequestVote at a higher term can legitimately step the
+    // lone leader down for one election, and that is not this test's
+    // subject — "no outage" is carried by the restarted node converging.
     assert!(
-        nodes[0].can_serve(),
-        "and the leader served throughout"
+        !consensus_failed(&nodes[0]),
+        "the node that stayed up never fail-stopped"
     );
 
     nodes.push(restarted);

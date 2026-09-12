@@ -13,18 +13,16 @@ groups:
     labels: { severity: critical }
     annotations: { summary: "no node reports leadership — election cannot complete" }
   - alert: Uc2LeaderNotServing
-    # Jumbo spec §6, carried from Task 2's review: `uc2_can_serve` is now
-    # ALSO masked off while this node's own jumbo gate is pending (a forced
-    # raise waiting on every member's probe, or a joiner waiting on its
-    # first proof) — the exact same clause `publish_status` already used for
-    # the NewTerm-uncommitted case, so this rule cannot tell the two causes
-    # apart from the outside. `jumbo_gate_pending` is an in-process
-    # `AtomicBool`, not an exported series, so there is no PromQL guard to
-    # add here; naming both causes in the summary is the fix.
-    expr: uc2_is_leader == 1 and uc2_can_serve == 0
+    # Jumbo spec §6: `uc2_can_serve` is ALSO masked off while this node's own
+    # jumbo gate is pending — the same clause `publish_status` uses for the
+    # NewTerm-uncommitted case. `uc2_jumbo_gate_pending` (a contract gauge
+    # since plan 2's review) is the guard that tells the two apart: a held
+    # gate is `Uc2JumboGateHeld`'s business, in any role, so this rule keeps
+    # its one meaning — an elected leader whose NewTerm is not committing.
+    expr: uc2_is_leader == 1 and uc2_can_serve == 0 and uc2_jumbo_gate_pending == 0
     for: 30s
     labels: { severity: critical }
-    annotations: { summary: "{{ $labels.instance }} elected but not serving — either its NewTerm frame is not yet quorum-committed (flags 0x01), or its jumbo MTU gate is pending (a forced raise or a join proof still in flight, jumbo spec §6); check uc2_datagram_mtu_bytes/uc2_probe_min_mtu_bytes before assuming the former" }
+    annotations: { summary: "{{ $labels.instance }} elected but not serving — its NewTerm frame is not yet quorum-committed (flags 0x01); a pending jumbo gate is excluded here and raises Uc2JumboGateHeld instead" }
   - alert: Uc2ServiceWedged
     expr: uc_service_heartbeat_age_seconds{service=""} > 5 and uc_node_heartbeat_age_seconds < 3
     for: 1m
@@ -348,3 +346,21 @@ groups:
     annotations:
       summary: "A path on {{ $labels.instance }} cannot carry the committed MTU"
       description: "{{ $value }} datagrams were refused for size in 5m. The committed rung is monotone: fix the path (MTU/jumbo support) — the cluster cannot lower it."
+
+  - alert: Uc2JumboGateHeld
+    # Jumbo spec §5.4/§6: this node holds a startup gate — `/readyz` 503 in
+    # ANY role, and a leader appends nothing. The join gate has NO timer (it
+    # passes only once a quorum of voters has proven the committed rung, or
+    # one voter for a learner), so a hold that outlasts discovery's fast
+    # ladder is a member that is down, a path that is narrow, or — under wire
+    # crypto — a pairwise session that never came up; the node's own
+    # `jumbo_join_gate_holding` records (every 30 s) name the members short
+    # of the rung. A force gate holds at most 30 s before it fail-stops, so
+    # this rule is about the join gate. 5m clears every healthy restart.
+    expr: uc2_jumbo_gate_pending == 1
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "{{ $labels.instance }} has held its jumbo startup gate for 5m"
+      description: "This node has not proven the cluster's committed datagram rung to a quorum of voters (one voter, for a learner) and is not ready. Read its jumbo_join_gate_holding log records for the members short of the rung, then uc2_probe_min_mtu_bytes on those members; with wire crypto on, check uc_crypto_handshake_failures_total too."

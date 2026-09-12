@@ -78,8 +78,9 @@ which underwent its own fix rounds after the plan was written
 Task 2 rulings; `task-2-report.md` §"The Important — refuse only a peer past
 its fast ladder") — as built, it refuses **only** a peer that **answered**
 below the committed rung **and** has spent its fast ladder (~5 attempts);
-a silent peer never fail-stops there, it only holds `can_serve` false
-indefinitely (`JOIN_CHECK_WINDOW` from the original plan was deleted).
+a silent peer never fail-stops there, it only holds `can_serve` false until a
+quorum of voters has proven the rung (`JOIN_CHECK_WINDOW` from the original
+plan was deleted; the quorum pass replaced a later unproven pass).
 Row d's own two arms are both `force_jumbo_frames` (`Forcing`) arms; neither
 exercises `Joining`/`path_below_committed_mtu`, so that gate's as-built
 behaviour changes nothing about row d's bar — it is recorded here only so a

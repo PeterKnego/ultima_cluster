@@ -278,6 +278,7 @@ RULE_META = {
     "Uc2SnapshotSetDiverged": {"severity": "warning", "real": False, "scenario": "snapshot_set_diverged"},
     "Uc2MtuDiscoveryStalled": {"severity": "warning", "real": False, "scenario": "mtu_discovery_stalled"},
     "Uc2PathBelowMtu": {"severity": "critical", "real": False, "scenario": "path_below_mtu"},
+    "Uc2JumboGateHeld": {"severity": "warning", "real": False, "scenario": "jumbo_gate_held"},
 }
 
 
@@ -300,12 +301,18 @@ def build_Uc2NoLeader():
 
 
 def build_Uc2LeaderNotServing():
+    # Quorum join gate (2.12.0): the rule now carries a third `and` term,
+    # `uc2_jumbo_gate_pending == 0`, so a held gate raises Uc2JumboGateHeld
+    # instead of this. The scenario scrapes that gauge too (it reads 0 on a
+    # synthetic source with no gate), held flat like the other two.
     rows = load_scenario("leader_not_serving")
     leader_row = select(rows, "uc2_is_leader", {})
     serve_row = select(rows, "uc2_can_serve", {})
+    gate_row = select(rows, "uc2_jumbo_gate_pending", {})
     r = new_rule("critical", labels_from=leader_row)  # LHS of `and`
     add_hold_last(r, leader_row, "uc2_is_leader", 30)
     add_hold_last(r, serve_row, "uc2_can_serve", 30)
+    add_hold_last(r, gate_row, "uc2_jumbo_gate_pending", 30)
     r["eval_time"] = total_for(30)[0]
     return r
 
@@ -699,6 +706,19 @@ def build_Uc2PathBelowMtu():
     return r
 
 
+def build_Uc2JumboGateHeld():
+    # Quorum join gate (2.12.0): `uc2_jumbo_gate_pending == 1` for 5m, a
+    # one-series LEVEL rule with a long `for:` — the same shape as
+    # build_Uc2PurgeStalled over the gate gauge. The scenario's flag is held
+    # at 1 across the whole window; `labels_from` is the only series.
+    rows = load_scenario("jumbo_gate_held")
+    row = select(rows, "uc2_jumbo_gate_pending", {})
+    r = new_rule("warning", labels_from=row)
+    add_hold_last(r, row, "uc2_jumbo_gate_pending", 300)
+    r["eval_time"] = total_for(300)[0]
+    return r
+
+
 RULE_BUILDERS = {
     "Uc2AgentDead": build_Uc2AgentDead,
     "Uc2NoLeader": build_Uc2NoLeader,
@@ -725,6 +745,7 @@ RULE_BUILDERS = {
     "Uc2SnapshotSetDiverged": build_Uc2SnapshotSetDiverged,
     "Uc2MtuDiscoveryStalled": build_Uc2MtuDiscoveryStalled,
     "Uc2PathBelowMtu": build_Uc2PathBelowMtu,
+    "Uc2JumboGateHeld": build_Uc2JumboGateHeld,
 }
 
 # Task 5 completeness cross-check: parse every `alert:` name straight out of

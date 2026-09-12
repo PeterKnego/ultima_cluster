@@ -34,13 +34,15 @@ written.**
   the optional new `force_jumbo_frames` makes a jumbo path a startup
   requirement, and a node that cannot carry the committed rung refuses to join
   by name instead of replicating what it cannot ship (one that has not yet
-  proven it holds `/readyz` at 503 until a quorum of voters has — so a dead
-  member never blocks a survivor's restart, and a member whose path shrank
-  while it was down is refused, not quietly served). **The raise is a one-way
+  proven it holds `/readyz` at 503 until a quorum of voters has, or one voter
+  for a learner — so a single dead member never blocks a survivor's restart,
+  a member whose path shrank while it was down is refused rather than quietly
+  served, and a hold that outlasts discovery logs why every 30 s and alerts
+  after 5 min). **The raise is a one-way
   door**: the committed rung never lowers and has no opt-out, so from the first
   jumbo commit no member on a narrower path can ever join — an operator who will
   need one later keeps a narrow path in the cluster from the start. Eight new
-  `/metrics` series, two new alerts, and one warning per client the first time a command
+  `/metrics` series, three new alerts, and one warning per client the first time a command
   goes above the standard 1312 B ceiling — so a 4 KB command that works on a dev
   box's loopback (MTU 65 536) does not surprise anyone in production. A node host must now run **Linux** (or
   Android): the do-not-fragment socket options exist for those targets only,

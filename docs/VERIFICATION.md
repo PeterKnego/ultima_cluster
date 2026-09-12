@@ -415,11 +415,18 @@ own deterministic reds are in the same unit tier: `uc_net::probe`'s
 `uc_node::node`'s `silence_holds_the_join_gate_until_a_quorum_of_voters_proves_the_rung`,
 `a_two_voter_cluster_needs_the_other_voter_proven`,
 `a_four_voter_cluster_needs_two_proven_peers`,
-`a_joining_learner_needs_a_majority_of_voters_without_its_own_vote` and
-`a_learner_peers_proof_does_not_count_toward_the_quorum`, plus the ordering
-guard `a_proven_narrow_peer_refuses_even_when_the_other_voters_are_a_proven_quorum`
-(which the shipped gate already satisfied, and which pins that the refusal is
-checked before the quorum on every poll).
+`a_joining_learner_needs_one_proven_voter_not_a_majority`,
+`a_learner_peers_proof_does_not_count_toward_the_quorum` and
+`a_holding_join_gate_says_so_on_a_slow_cadence`, plus two ordering guards
+that the shipped gate already satisfied and that pin the refusal being
+checked before the quorum on every poll, for a voter and for a learner peer:
+`a_proven_narrow_peer_refuses_even_when_the_other_voters_are_a_proven_quorum`
+and `a_narrow_learner_peer_refuses_even_under_a_proven_quorum`. One more
+guard passed on first run by design: `uc_net::probe`'s
+`a_proof_at_a_lower_rung_survives_the_peer_going_silent` pins that
+`proven_count` applies NO freshness test, at the one rung (8832) where a
+proven peer keeps being probed and so can age — the mutation it catches is a
+future "make proofs expire", not a defect in this branch.
 
 ```bash
 cargo test -p uc_node --test jumbo

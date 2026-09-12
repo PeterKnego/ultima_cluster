@@ -73,6 +73,7 @@ const ALL_SCENARIOS: &[&str] = &[
     "snapshot_set_diverged",
     "mtu_discovery_stalled",
     "path_below_mtu",
+    "jumbo_gate_held",
 ];
 
 // ------------------------------------------------------------------ CLI
@@ -205,6 +206,7 @@ fn run_scenario(name: &str, scratch_root: &Path) -> (SeriesFile, Disclosure) {
         "snapshot_set_diverged" => scenario_snapshot_set_diverged(),
         "mtu_discovery_stalled" => scenario_mtu_discovery_stalled(),
         "path_below_mtu" => scenario_path_below_mtu(),
+        "jumbo_gate_held" => scenario_jumbo_gate_held(),
         other => panic!("unknown scenario {other:?} — one of {ALL_SCENARIOS:?}"),
     }
 }
@@ -523,7 +525,11 @@ fn scenario_leader_not_serving() -> (SeriesFile, Disclosure) {
     let addr = srv.local_addr();
     let mut sf = SeriesFile::new();
     for _ in 0..3 {
-        sf.record_round("n0", &scrape(addr), &["uc2_is_leader", "uc2_can_serve"]);
+        sf.record_round(
+            "n0",
+            &scrape(addr),
+            &["uc2_is_leader", "uc2_can_serve", "uc2_jumbo_gate_pending"],
+        );
         thread::sleep(Duration::from_millis(200));
     }
     srv.stop();
@@ -1737,6 +1743,42 @@ fn scenario_path_below_mtu() -> (SeriesFile, Disclosure) {
                      rendered through the real exporter. probe_emsgsize is untouched, so this \
                      is the non-probe counter alone, matching the rule's own note that probe \
                      refusals are counted separately."
+                .into(),
+        },
+    )
+}
+
+// ----------------------------------------------------------- scenario 23
+
+/// Uc2JumboGateHeld — **synthetic, disclosed**: `jumbo_gate_pending` set
+/// directly and held (the real trigger — a node restarted onto a jumbo
+/// cluster whose voters cannot prove the rung to it for five minutes —
+/// needs a multi-node cluster with a majority of voters down or narrow,
+/// well outside this harness's per-rule budget); rendered through the real
+/// exporter, where the gauge is a contract series.
+fn scenario_jumbo_gate_held() -> (SeriesFile, Disclosure) {
+    let sources = synthetic_sources(0);
+    sources.jumbo_gate_pending.store(true, Ordering::Release);
+    let srv = ObsServer::serve(sources.clone(), "127.0.0.1:0".parse().unwrap()).expect("bind");
+    let addr = srv.local_addr();
+    let mut sf = SeriesFile::new();
+    for _ in 0..3 {
+        sf.record_round("n0", &scrape(addr), &["uc2_jumbo_gate_pending"]);
+        thread::sleep(Duration::from_millis(200));
+    }
+    srv.stop();
+
+    (
+        sf,
+        Disclosure {
+            scenario: "jumbo_gate_held",
+            rules: &["Uc2JumboGateHeld"],
+            state: "synthetic",
+            method: "synthetic ObsSources: the jumbo_gate_pending flag stored true directly \
+                     (the real trigger — a restarted node whose voters cannot prove the \
+                     committed rung to it — can't be honestly hosted in-process at the \
+                     rule's 5m sustain), rendered through the real exporter as \
+                     uc2_jumbo_gate_pending = 1 and held."
                 .into(),
         },
     )

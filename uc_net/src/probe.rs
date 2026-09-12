@@ -684,17 +684,46 @@ mod tests {
             1,
             "at or above a lower rung too"
         );
-        t.due(10);
-        t.due(110);
-        t.due(210);
-        assert_eq!(
-            t.proven_count(8960, &[v1, v2]),
-            1,
-            "a proof is not outlived by later silence"
-        );
         t.on_ack(v2, 8960, 8960);
         assert_eq!(t.proven_count(8960, &[v1, v2]), 2);
         assert_eq!(t.proven_count(8960, &[]), 0, "nobody listed, nobody proven");
+    }
+
+    /// A proof is not outlived by later silence — and the test has to be
+    /// built where that is reachable. A peer acked at the TOP rung is
+    /// `resolved` and never issued another round, so its `rounds_since_ack`
+    /// cannot age; a peer proven at 8832 on a cluster whose committed rung is
+    /// 8832 keeps getting rounds (it is short of `MTU_BOUND`), and if it then
+    /// dies those rounds go unanswered. `narrow_peers` lets that verdict lapse
+    /// (a narrow claim is about now); `proven_count` must NOT (the path
+    /// carried 8832 once, so it carries 8832).
+    #[test]
+    fn a_proof_at_a_lower_rung_survives_the_peer_going_silent() {
+        let t = ProbeTable::new(fast()); // fast_attempts = 2, fast_ns = 10
+        t.set_peers(&[a(1)]);
+        t.due(0);
+        t.on_ack(a(1), 8832, 8832);
+        assert_eq!(t.proven_count(8832, &[a(1)]), 1);
+        assert_eq!(t.get(a(1)).unwrap().rounds_since_ack, 0);
+        // The peer dies: three more rounds go out (the 8960 rung is still in
+        // flight for it) and nothing comes back.
+        t.due(10);
+        t.due(20);
+        t.due(120);
+        assert!(
+            t.get(a(1)).unwrap().rounds_since_ack > 1,
+            "the rounds really aged the peer past the freshness window"
+        );
+        assert_eq!(
+            t.proven_count(8832, &[a(1)]),
+            1,
+            "a proof at the committed rung is kept, however stale the ack"
+        );
+        assert_eq!(
+            t.proven_count(8960, &[a(1)]),
+            0,
+            "and it is still no proof of a HIGHER rung"
+        );
     }
 
     /// Sorted by address, so "the first offender" is the same peer on every
