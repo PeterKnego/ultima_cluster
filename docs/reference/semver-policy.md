@@ -164,7 +164,7 @@ promised" means in practice: **`2.8.0` (M14c) changed those public signatures
 in a minor release**, deliberately, because one log now feeds N FSMs and a
 session ships one artifact per declared id rather than one per session.
 
-| item | ≤ `2.7.0` | `2.8.0` | `2.11.0` pending (FSM identity) |
+| item | ≤ `2.7.0` | `2.8.0` | `2.11.0` (FSM identity) |
 |---|---|---|---|
 | `sender::SnapshotSource` | `Arc<dyn Fn() -> Option<(u64, PathBuf, u64, Vec<u8>)>>` | `Arc<dyn Fn() -> Option<SnapshotSet>>` | unchanged |
 | `sender::SnapshotSet` / `sender::SnapArtifact` | did not exist | the set (`services_declared`, `config`, one `SnapArtifact` per declared id) | unchanged (identity/version ride on `SnapBeginBody`, not this seam) |
@@ -207,8 +207,9 @@ cluster stalls commits rather than making unsound ones. The procedure is
 [Upgrade a cluster](../how-to/upgrade-a-cluster.md); it applies whether or
 not the crate version's major digit moved.
 
-**The pending `2.11.0` is the latest flag day on both lines**, and it carries
-**two** features at once: wire `0.6.0` → `0.7.0` and cnc `3.0` → `3.1`,
+**`2.11.0` shipped the most recent RELEASED flag day on both lines** (the
+next one, `2.12.0`, is below), and it carried **two** wire-and-page features at
+once: wire `0.6.0` → `0.7.0` and cnc `3.0` → `3.1`,
 bundled as one combined flag day per the standing rule that a cnc layout
 change is a flag day regardless of the digit.
 

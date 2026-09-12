@@ -285,8 +285,8 @@ verify rather than a build:
   `service.<id>.lock`, `snapshots/<id>/`) and, since log time and timers
   (2.11.0), `svc_sched.<id>.ring` — the first per-row ring the **node**
   consumes (service → node: schedule, cancel and consumed requests). It takes
-  the per-row reservation from 5 MiB to 6 MiB. Since the cluster FSM (2.11
-  pending) `svc_sched.<id>.ring` is written **only by a leading node's
+  the per-row reservation from 5 MiB to 6 MiB. Since the cluster FSM (2.11.0)
+  `svc_sched.<id>.ring` is written **only by a leading node's
   service** and drained only while leading. The same release adds
   `snapshots/cluster/` (durable — `snap-<pos>.ultcluster`, the cluster FSM's
   own artifact holding membership, the schedule table and the settings record

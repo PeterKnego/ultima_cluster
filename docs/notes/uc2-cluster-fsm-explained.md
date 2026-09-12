@@ -90,7 +90,8 @@ FRAME_TYPE_CLUSTER = 4        (reuses the retired CONFIG's number)
 body: kind: u8 ‖ reserved [u8; 7] ‖ payload
   kind 1 = Membership     payload = the ClusterConfig encoding CONFIG carried
   kind 2 = ScheduleTable  payload = encode_schedule_table (≤ 1064 B)
-  kind 3 = Settings       payload = the 29-byte Settings record
+  kind 3 = Settings       payload = the Settings record (33 B since 2.12.0;
+                                    a 29-byte v1 record still decodes)
 ```
 
 The log is a **broadcast** log — it carries no service id and does no routing

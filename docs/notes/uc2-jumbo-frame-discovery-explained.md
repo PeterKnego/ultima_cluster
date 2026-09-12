@@ -212,6 +212,14 @@ The healthy narrow reading is:
 | `uc2_probe_sent_total` | rising slowly, forever | flat once every peer resolves |
 | `uc2_send_emsgsize_total` | `0` | `0` |
 
+One counting rule belongs with that table: **probes the kernel refused are
+not in `uc2_probe_sent_total`.** That counter counts datagrams that left the
+host; a round that was refused for size — or that found no pairwise crypto
+session yet — is counted separately and deliberately unexported, so "discovery
+traffic emitted" stays readable on exactly the narrow path where it matters.
+(Spec §9's parenthetical says otherwise and is superseded; the erratum is
+recorded in the spec.)
+
 `Uc2MtuDiscoveryStalled` keys on `uc2_probe_min_mtu_bytes >
 uc2_datagram_mtu_bytes` for 60 s precisely because a legitimately narrow
 cluster never satisfies it: a narrow peer pins *every* node's own minimum too,
@@ -285,7 +293,7 @@ crypto-on baseline, which holds on any cluster. The node's own view of the
 same fact is `uc2_commands_over_standard_total`, counted where frames are
 appended — leader-only by construction, so read it summed across the fleet.
 
-Three sharp edges in that warning, all real:
+Two sharp edges in that warning, both real:
 
 - **A jumbo command relayed through `uc2-gateway` emits the line in the
   gateway's log too**, because the edge submits through `uc_client::Engine`
@@ -296,10 +304,6 @@ Three sharp edges in that warning, all real:
   command plus 16 bytes when the edge's session envelope is on. A command
   within 16 B of the threshold can therefore cross it at the node without
   ever warning at the remote client.
-- **Probes the kernel refused are not in `uc2_probe_sent_total`.** That
-  counter counts datagrams that left the host; refusals are counted
-  separately and deliberately unexported. (Spec §9's parenthetical says
-  otherwise and is superseded — the erratum is recorded in the spec.)
 
 ## The security posture, in one paragraph
 
