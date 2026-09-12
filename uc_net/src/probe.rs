@@ -263,8 +263,24 @@ impl ProbeTable {
         Some(min)
     }
 
-    pub fn note_unsent(&self) {
+    /// A probe for `peer` that never left the host: no pairwise session yet, or
+    /// the kernel refused its size. Counts the miss AND gives the peer its
+    /// attempt back, so an attempt is only ever spent on a datagram that
+    /// actually went out (final review, plan 1).
+    ///
+    /// Why a decrement and not "don't count until sent": `due()` bumps
+    /// `attempts` and schedules the next deadline before the caller knows
+    /// whether the send succeeds, and moving that bookkeeping after the send
+    /// would put the mutex back on the send path — the one thing plan 1's
+    /// fast path removed.
+    pub fn note_unsent_for(&self, peer: SocketAddr) {
         self.unsent.fetch_add(1, Ordering::Relaxed);
+        let mut g = self.peers.lock().unwrap();
+        if let Some(p) = g.get_mut(&peer) {
+            p.attempts = p.attempts.saturating_sub(1);
+            p.next_due_ns = 0;
+        }
+        self.publish_earliest(&g);
     }
 
     pub fn unsent(&self) -> u64 {
@@ -286,6 +302,26 @@ mod tests {
             fast_attempts: 2,
             slow_ns: 100,
         }
+    }
+
+    /// Errata-adjacent (final review, plan 1): a probe that never left the host
+    /// — no pairwise session yet — must not spend one of the five fast
+    /// attempts, or a peer whose handshake takes longer than the fast window
+    /// is on the 30 s cadence before its first probe ever goes out.
+    #[test]
+    fn an_unsent_probe_does_not_spend_a_fast_attempt() {
+        let t = ProbeTable::new(fast()); // fast_attempts: 2, fast_ns: 10
+        t.set_peers(&[a(1)]);
+        for _ in 0..4 {
+            let due = t.due(0);
+            assert_eq!(due.len(), 1, "still due: nothing was ever sent");
+            t.note_unsent_for(a(1));
+        }
+        assert_eq!(t.get(a(1)).unwrap().attempts, 0);
+        assert_eq!(t.unsent(), 4);
+        // Once a probe DOES go out, the cadence advances as before.
+        t.due(0);
+        assert_eq!(t.get(a(1)).unwrap().attempts, 1);
     }
 
     #[test]

@@ -462,6 +462,15 @@ pub struct SenderStats {
     /// here — it lands in the probe table's `unsent` instead, so this counter
     /// is strictly "how much discovery traffic this node emitted".
     pub probes_sent: AtomicU64,
+    /// Jumbo spec §9: non-probe datagrams the kernel refused for size
+    /// (`EMSGSIZE` under do-not-fragment). Must be 0 on a healthy cluster —
+    /// `Uc2PathBelowMtu` fires on any increase, because it means a path
+    /// degraded below the rung the cluster committed.
+    pub emsgsize: AtomicU64,
+    /// Jumbo spec §9: the same, for PROBE datagrams, where it is EXPECTED —
+    /// probing a rung the local route cannot carry is how the ladder finds the
+    /// ceiling. Kept separate so the alert's counter stays clean.
+    pub probe_emsgsize: AtomicU64,
 }
 
 pub struct Sender {
@@ -854,6 +863,32 @@ impl Sender {
         self.base.elapsed().as_nanos() as u64
     }
 
+    /// One datagram out, counting the one error that means "this path cannot
+    /// carry this size" (jumbo spec §9). Every other error stays ignored, as
+    /// before: a reliable-UDP sender's job is to keep going and let NAK repair
+    /// fill the hole.
+    ///
+    /// Takes `sock`/`stats` as explicit disjoint fields (not a `&mut self`
+    /// method) so a caller can hold `buf = &self.scratch` at the same time —
+    /// a method taking the whole `self` would conflict with that borrow.
+    #[inline]
+    fn send_counted(
+        sock: &mut FaultSocket,
+        stats: &SenderStats,
+        buf: &[u8],
+        to: SocketAddr,
+    ) -> bool {
+        match sock.send_to(buf, to) {
+            Ok(()) => true,
+            Err(e) => {
+                if e.raw_os_error() == Some(libc::EMSGSIZE) {
+                    stats.emsgsize.fetch_add(1, Ordering::Relaxed);
+                }
+                false
+            }
+        }
+    }
+
     /// One pass of the ladder: every peer the table says is due gets one
     /// PROBE per rung still above its verified size. Pairwise-sealed like a
     /// snapshot chunk; a probe that cannot be sealed yet (no session) is
@@ -873,6 +908,16 @@ impl Sender {
         let table = self.probe.clone().expect("checked above");
         let overhead = DATAGRAM_HEADER_LEN + self.cfg.crypto_overhead();
         for (peer, rungs) in due {
+            // `due()` bumps this peer's `attempts` ONCE for the whole round,
+            // not once per rung — so the give-back below must also fire at
+            // most once per round. A round mixes independent per-rung
+            // outcomes (the whole point of probing several sizes at once is
+            // to find the boundary between them): the smaller rungs on a
+            // capped path routinely succeed while the larger ones EMSGSIZE.
+            // One real send is a real attempt; only a round that put NOTHING
+            // on the wire (no session yet, or every rung refused for size)
+            // gives the attempt back.
+            let mut sent_any = false;
             for rung in rungs {
                 let body_len = rung as usize - overhead;
                 debug_assert!(body_len >= PROBE_RUNG_LEN);
@@ -883,12 +928,24 @@ impl Sender {
                     // set, an over-MTU probe fails EMSGSIZE synchronously right
                     // here, and counting it would make `probes_sent` claim
                     // traffic that never left the host.
-                    if self.sock.send_to(&self.scratch, peer).is_ok() {
-                        self.stats.probes_sent.fetch_add(1, Ordering::Relaxed);
+                    match self.sock.send_to(&self.scratch, peer) {
+                        Ok(()) => {
+                            self.stats.probes_sent.fetch_add(1, Ordering::Relaxed);
+                            sent_any = true;
+                        }
+                        Err(e) => {
+                            if e.raw_os_error() == Some(libc::EMSGSIZE) {
+                                self.stats.probe_emsgsize.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
                     }
-                } else {
-                    table.note_unsent();
                 }
+            }
+            if !sent_any {
+                // Neither a session-less peer (every rung skipped assembly)
+                // nor an all-EMSGSIZE round ever left the host: give the
+                // round's one attempt back, same call either way.
+                table.note_unsent_for(peer);
             }
         }
         true
@@ -1178,7 +1235,7 @@ impl Sender {
             // condition doesn't spin — the next heartbeat simply retries.
             if self.assemble(append, DGRAM_KIND_HEARTBEAT, 0) {
                 for &to in &self.followers {
-                    let _ = self.sock.send_to(&self.scratch, to);
+                    Self::send_counted(&mut self.sock, &self.stats, &self.scratch, to);
                 }
                 // CommitPosition gossip (spec §6, on-advance + the 100 ms floor) is
                 // the consensus agent's job now (`Action::GossipCommit`) — the
@@ -1308,7 +1365,7 @@ impl Sender {
             return;
         }
         for &to in &self.followers {
-            let _ = self.sock.send_to(&self.scratch, to);
+            Self::send_counted(&mut self.sock, &self.stats, &self.scratch, to);
             self.stats.datagrams.fetch_add(1, Ordering::Relaxed);
             self.stats
                 .bytes
@@ -1331,7 +1388,7 @@ impl Sender {
                     // frontier stays put and it re-NAKs, same as any other
                     // lost datagram.
                     if self.assemble(p, DGRAM_KIND_DATA, r.bytes) {
-                        let _ = self.sock.send_to(&self.scratch, to);
+                        Self::send_counted(&mut self.sock, &self.stats, &self.scratch, to);
                         self.stats.datagrams.fetch_add(1, Ordering::Relaxed);
                         self.stats
                             .bytes
@@ -1609,7 +1666,7 @@ impl Sender {
             },
         );
         if self.assemble_snap(to, 0, DGRAM_KIND_SNAP_REDIRECT, &body) {
-            let _ = self.sock.send_to(&self.scratch, to);
+            Self::send_counted(&mut self.sock, &self.stats, &self.scratch, to);
             self.stats.snap_redirects.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -1779,7 +1836,7 @@ impl Sender {
             // already takes on this path.
             return 0;
         }
-        let _ = self.sock.send_to(&self.scratch, sess.peer);
+        Self::send_counted(&mut self.sock, &self.stats, &self.scratch, sess.peer);
         self.stats.snap_chunks.fetch_add(1, Ordering::Relaxed);
         if is_nak {
             self.stats.snap_chunk_naks.fetch_add(1, Ordering::Relaxed);
@@ -1821,7 +1878,7 @@ impl Sender {
         if !self.assemble_snap(peer, 0, DGRAM_KIND_SNAP_BEGIN, &body) {
             return false;
         }
-        let _ = self.sock.send_to(&self.scratch, peer);
+        Self::send_counted(&mut self.sock, &self.stats, &self.scratch, peer);
         true
     }
 
@@ -1937,7 +1994,7 @@ impl Sender {
         if !self.seal_scratch(DGRAM_KIND_DATA) {
             return; // dropped: the follower re-NAKs, same as any lost datagram
         }
-        let _ = self.sock.send_to(&self.scratch, to);
+        Self::send_counted(&mut self.sock, &self.stats, &self.scratch, to);
         self.stats.datagrams.fetch_add(1, Ordering::Relaxed);
         self.stats
             .bytes
@@ -2031,6 +2088,8 @@ pub(crate) fn chunk_frames(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fault::FaultConfig;
+    use crate::probe::ProbeCadence;
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
     use uc_log::buffer::Appender;
@@ -2152,6 +2211,58 @@ mod tests {
             always_leader(),
         );
         (s, tx)
+    }
+
+    /// Jumbo spec §9: a DATA send the kernel refuses for size counts in
+    /// `emsgsize`; a PROBE send refused the same way counts in
+    /// `probe_emsgsize` instead — the two must never share a counter, since
+    /// one means "a committed path degraded" and the other is the ladder
+    /// finding a peer's ceiling by design.
+    ///
+    /// `sender_to` builds its own `FaultSocket` with no faults setter
+    /// exposed on `Sender` — this test builds the `Sender` inline instead,
+    /// with a `FaultSocket` whose faults are set before construction (no
+    /// production API exists, or should exist, purely to inject test
+    /// faults after the fact).
+    #[test]
+    fn an_emsgsize_send_is_counted_and_probe_emsgsize_is_separate() {
+        let b = jumbo_buffer();
+        let fake = Fake::new();
+        let mut sock = FaultSocket::bind("127.0.0.1:0").unwrap();
+        sock.set_faults(FaultConfig {
+            emsgsize_over: 1408,
+            ..FaultConfig::default()
+        });
+        let (_tx, rx) = mpsc::sync_channel(1024);
+        let mut cfg = SenderConfig::new(9);
+        cfg.heartbeat_ns = u64::MAX;
+        let mut s = Sender::new(
+            Arc::clone(&b),
+            sock,
+            vec![fake.addr()],
+            3,
+            rx,
+            cfg,
+            term_handle(9),
+            always_leader(),
+        );
+        // A DATA datagram past the cap: counted in `emsgsize`.
+        let mut a = Appender::new(Arc::clone(&b), 9, 0);
+        a.append(4, 0, &[0u8; 4096]).unwrap();
+        s.do_work();
+        assert_eq!(s.stats().emsgsize.load(Ordering::Relaxed), 1);
+        // A probe past the cap: counted in `probe_emsgsize`, NOT `emsgsize`.
+        let t = ProbeTable::new(ProbeCadence::default());
+        t.set_peers(&[fake.addr()]);
+        s.set_probe_table(Arc::clone(&t));
+        s.do_work();
+        assert!(t.get(fake.addr()).unwrap().attempts >= 1);
+        assert!(s.stats().probe_emsgsize.load(Ordering::Relaxed) >= 1);
+        assert_eq!(
+            s.stats().emsgsize.load(Ordering::Relaxed),
+            1,
+            "unchanged by probes"
+        );
     }
 
     #[test]

@@ -64,6 +64,13 @@ pub struct FaultConfig {
     /// for a small-MTU path. `usize::MAX` (the default) = no cap. Checked
     /// before the seeded rolls so it consumes no RNG draw.
     pub max_datagram: usize,
+    /// Jumbo spec §9's stand-in for a DF'd send the kernel refuses: a datagram
+    /// longer than this fails with `EMSGSIZE` instead of being sent. The mirror
+    /// of [`FaultConfig::max_datagram`], which models the silent loss at a
+    /// downstream hop; this one models the LOCAL refusal when the route's MTU
+    /// is already known. `usize::MAX` (the default) = no cap. Checked before the
+    /// seeded rolls, so it consumes no RNG draw.
+    pub emsgsize_over: usize,
 }
 
 impl Default for FaultConfig {
@@ -76,6 +83,7 @@ impl Default for FaultConfig {
             corrupt_per_million: 0,
             replay_per_million: 0,
             max_datagram: usize::MAX,
+            emsgsize_over: usize::MAX,
         }
     }
 }
@@ -228,6 +236,9 @@ impl FaultSocket {
         }
         if buf.len() > self.cfg.max_datagram {
             return Ok(()); // lost at a narrow hop (jumbo spec §10)
+        }
+        if buf.len() > self.cfg.emsgsize_over {
+            return Err(io::Error::from_raw_os_error(libc::EMSGSIZE));
         }
         if self.cfg.drop_per_million > 0 && self.rng.chance(self.cfg.drop_per_million) {
             return Ok(()); // dropped on the wire
