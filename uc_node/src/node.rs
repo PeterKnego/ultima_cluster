@@ -675,7 +675,8 @@ struct JumboQuorum {
     /// Voters (other than this node) whose path this node has proven the
     /// committed rung to.
     proven_voters: usize,
-    /// Voters in the committed membership, this node included when it is one.
+    /// Voter ids in the committed membership, this node included when it is
+    /// one — the commit tracker's denominator.
     voters: usize,
     /// `1` if this node is a voter, `0` for a learner (or a removed node).
     self_vote: usize,
@@ -6550,10 +6551,11 @@ impl Consensus {
 
     /// The `Joining` gate's quorum test (spec §5.4 as rebuilt), evaluated over
     /// `self.peers` — the kernel's current voters minus self, the same set an
-    /// append needs acks from — through `id_to_addr` (deduplicated, so two
-    /// ids that a broken config maps to one address cannot count one path
-    /// twice), and the node's own vote only if the kernel's config says it
-    /// is a voter. Two rules, by role:
+    /// append needs acks from — and the node's own vote only if the kernel's
+    /// config says it is a voter. The DENOMINATOR is voter ids, exactly the
+    /// commit tracker's; the NUMERATOR is proven distinct addresses, so two
+    /// ids that a broken config maps to one address count one path once and
+    /// the gate errs strict, never loose. Two rules, by role:
     ///
     /// - A VOTER passes when `proven + 1 > voters / 2` — the commit tracker's
     ///   majority. It cannot get a probe ack from fewer voters than it needs
@@ -6587,7 +6589,7 @@ impl Consensus {
         voter_addrs.dedup();
         let proven_voters = self.probe_table.proven_count(committed, &voter_addrs);
         let self_vote = usize::from(self.sm.config().is_voter(self.id));
-        let voters = voter_addrs.len() + self_vote;
+        let voters = self.peers.len() + self_vote;
         let passes = if self_vote == 1 {
             proven_voters + 1 > voters / 2
         } else {
@@ -9106,6 +9108,12 @@ impl Consensus {
         self.snapshot_last_commanded = 0;
         self.snapshot_last_commanded_standby = false;
         self.can_serve_flag.store(false, Ordering::Release);
+        // Jumbo: the third directly-read atomic. `/readyz` and the
+        // `uc2_jumbo_gate_pending` gauge read it without the `halt_removed`
+        // mask, and `do_work` never runs again to refresh it, so a node
+        // removed mid-hold would otherwise export a held gate for the life
+        // of the process (and `Uc2JumboGateHeld` would blame the rung).
+        self.jumbo_gate_pending.store(false, Ordering::Release);
         // Veil §5 discharge, observation 1 (the parked-reads liveness
         // blemish): `do_work` short-circuits every SUBSEQUENT cycle, so a
         // read still parked here would never reach its deadline RETRY — the
@@ -13002,6 +13010,13 @@ mod tests {
     /// WHY `/readyz` is 503. Not on every poll (10 Hz), and not before the
     /// first interval has elapsed — a healthy restart that proves the rung in
     /// a second must not log a hold at all.
+    ///
+    /// The CADENCE is pinned on `jumbo_hold_log_ns`, the deadline the logging
+    /// pass re-seeds, not on counting records: the obs capture buffer is
+    /// process-global and sibling tests that hold a gate for 60 s legitimately
+    /// write the same record while this test runs, so an absence or an exact
+    /// count in that buffer is a race, not a proof. The buffer is used only
+    /// for the record's SHAPE.
     #[test]
     fn a_holding_join_gate_says_so_on_a_slow_cadence() {
         let mut h = harness();
@@ -13010,39 +13025,90 @@ mod tests {
         h.cons.probe_table.set_peers(&peers);
         spend_fast_ladder(&h);
         publish_committed_rung(&mut h, MTU_BOUND as u32);
+        assert_eq!(h.cons.jumbo_hold_log_ns, 0, "reset on arm");
 
-        let buf = crate::obs::log::capture_for_tests();
         pass_checking_the_gate(&mut h);
-        // A few polls inside the first interval: no hold record yet.
+        let first_deadline = h.cons.pass_mono_ns + JUMBO_GATE_HOLD_LOG_NS;
+        assert_eq!(
+            h.cons.jumbo_hold_log_ns, first_deadline,
+            "the first holding poll starts the interval and logs nothing"
+        );
+        // A few polls inside the first interval: the deadline does not move,
+        // which is the same thing as "no record" (a record re-seeds it).
         for _ in 0..3 {
             h.cons.pass_mono_ns += JUMBO_GATE_POLL_NS;
             h.cons.jumbo_check_ns = 0;
             assert!(!h.cons.check_jumbo_gate());
+            assert_eq!(
+                h.cons.jumbo_hold_log_ns, first_deadline,
+                "inside the interval"
+            );
         }
-        let text = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
-        assert!(
-            !text.contains("jumbo_join_gate_holding"),
-            "no hold record inside the first interval: {text}"
-        );
 
-        // The interval elapses: exactly one record, with the terms.
-        h.cons.pass_mono_ns += JUMBO_GATE_HOLD_LOG_NS;
+        // The interval elapses: one record, and the deadline moves a whole
+        // interval forward from THIS pass's clock — so the very next poll,
+        // one tick later, is inside the new interval again.
+        let buf = crate::obs::log::capture_for_tests();
+        h.cons.pass_mono_ns = first_deadline;
         h.cons.jumbo_check_ns = 0;
         assert!(!h.cons.check_jumbo_gate());
-        h.cons.jumbo_check_ns = 0;
-        assert!(!h.cons.check_jumbo_gate());
+        let second_deadline = first_deadline + JUMBO_GATE_HOLD_LOG_NS;
+        assert_eq!(
+            h.cons.jumbo_hold_log_ns, second_deadline,
+            "re-seeded by the log"
+        );
         let text = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
         crate::obs::log::stderr_for_tests();
-        assert_eq!(
-            text.matches(r#""event":"jumbo_join_gate_holding""#).count(),
-            1,
-            "one record per interval, not one per poll: {text}"
-        );
         assert!(
-            text.contains(r#""committed":8960,"proven_voters":0,"voters":3,"self_vote":1"#)
+            text.contains(r#""event":"jumbo_join_gate_holding""#)
+                && text.contains(r#""committed":8960,"proven_voters":0,"voters":3,"self_vote":1"#)
                 && text.contains(r#""offenders":"0:0,2:0""#),
             "the record carries the quorum terms and the members short of the rung: {text}"
         );
+        h.cons.pass_mono_ns += JUMBO_GATE_POLL_NS;
+        h.cons.jumbo_check_ns = 0;
+        assert!(!h.cons.check_jumbo_gate());
+        assert_eq!(
+            h.cons.jumbo_hold_log_ns, second_deadline,
+            "one tick later: no re-seed"
+        );
+
+        // A second interval, measured from the pass that logged — a deadline
+        // that accumulated from the PREVIOUS deadline would read the same
+        // here, so the poll lands late by one tick to tell the two apart.
+        h.cons.pass_mono_ns = second_deadline + JUMBO_GATE_POLL_NS;
+        h.cons.jumbo_check_ns = 0;
+        assert!(!h.cons.check_jumbo_gate());
+        assert_eq!(
+            h.cons.jumbo_hold_log_ns,
+            second_deadline + JUMBO_GATE_POLL_NS + JUMBO_GATE_HOLD_LOG_NS,
+            "the deadline is re-seeded from the logging pass's clock, not accumulated"
+        );
+    }
+
+    /// A REMOVED node is parked, not gated: `halt` must clear the pending
+    /// flag along with the leader and serving flags it already clears,
+    /// because `/readyz` and the `uc2_jumbo_gate_pending` gauge read the
+    /// atomic directly and `do_work` never runs again to refresh it. Left
+    /// set, a node removed mid-hold would export a held gate for the life of
+    /// the process and `Uc2JumboGateHeld` would point the operator at a rung
+    /// problem instead of at the removal.
+    #[test]
+    fn halt_clears_a_pending_join_gate() {
+        let mut h = harness();
+        drive_to_serving_leader(&mut h);
+        let peers = mtu_peers(&h);
+        h.cons.probe_table.set_peers(&peers);
+        publish_committed_rung(&mut h, MTU_BOUND as u32);
+        pass_checking_the_gate(&mut h);
+        assert!(h.cons.jumbo_gate_pending.load(Ordering::Acquire), "holding");
+
+        h.cons.halt();
+        assert!(
+            !h.cons.jumbo_gate_pending.load(Ordering::Acquire),
+            "a halted node is not a held one"
+        );
+        assert!(!h.cons.can_serve_flag.load(Ordering::Acquire));
     }
 
     /// A LEARNER peer's proof counts for nothing: quorum is a fact about

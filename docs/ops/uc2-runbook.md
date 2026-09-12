@@ -294,10 +294,14 @@ verify rather than a build:
   a gate is pending — admin handling keys on the leader flag, not on the gate.
   `uc2_jumbo_gate_pending` is `1` on a held node, and `Uc2LeaderNotServing`
   excludes that case, so a held leader raises `Uc2JumboGateHeld` and nothing
-  else. `force_jumbo_frames` on such a cluster changes none of this: the join
-  gate takes precedence, so a silent member is a hold, never a
-  `jumbo_peer_silent` fail-stop (that refusal, and `jumbo_path_too_narrow`
-  after 30 s, belong to a cluster that has NOT committed a jumbo rung yet).
+  else. `force_jumbo_frames` changes none of this once THIS node has learned
+  the committed rung: from then on the join gate takes precedence, so a
+  silent member is a hold, never a `jumbo_peer_silent` fail-stop. Before it
+  has (a replay that has not reached the `CLUSTER` frame, a fresh joiner
+  waiting on its snapshot) a forced node runs the force gate's rule and can
+  fail-stop `jumbo_peer_silent` / `jumbo_path_too_narrow` at 30 s. A learner's
+  one proven voter need not be the leader, whose path its frames actually
+  cross: a silent leader is not tested by a learner's pass.
   Details and remedies:
   [Run a cluster on jumbo frames](../how-to/jumbo-frames.md#6-when-a-node-refuses-to-join).
 - [Diagnose a node that is not serving](../how-to/diagnose-a-node.md) — reading

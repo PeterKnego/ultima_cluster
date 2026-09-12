@@ -296,8 +296,8 @@ answers `/readyz` with 503 — in **any** role, not just leader — until every
 configured peer has proven the `JUMBO_MIN_RUNG = 8832` B datagram rung. It then
 logs `jumbo_gate_passed` and serves. If 30 s (`JUMBO_GATE_WINDOW`, a constant)
 elapses first the node **fail-stops** (exit 1) with one of two named refusals
-— on a cluster that has not yet committed a jumbo rung; once it has, the join
-gate below takes precedence and never fail-stops on silence:
+— unless this node has already learned a committed jumbo rung, in which case
+the join gate below takes precedence and never fail-stops on silence:
 `jumbo_path_too_narrow`, when a peer answered below the rung, or
 `jumbo_peer_silent`, when a peer never answered at all — a liveness fact, and
 worded as one. Both name the first offending member id and list every one.

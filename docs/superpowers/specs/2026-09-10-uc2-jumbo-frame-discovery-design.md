@@ -615,10 +615,13 @@ Written before the tag, per the release rule:
      pairwise-sealed exactly as `PROBE` is, so a node that cannot get a probe
      ack from a quorum of voters cannot get their commit acks or votes either,
      and serving is leader-only, so a timed pass would let it do nothing. Under
-     `force_jumbo_frames` on such a cluster the join rule is the one that
-     runs, and it is NOT the force gate's every-member rule: a silent voter
-     outside the quorum, or any learner, may be unproven when the node starts
-     serving. The as-built history this replaces: holding on
+     `force_jumbo_frames`, once THIS node has learned the committed rung
+     (the precedence is per node and edge-triggered on the raise) the join
+     rule is the one that runs, and it is NOT the force gate's every-member
+     rule: a silent voter outside the quorum, or any learner, may be unproven
+     when the node starts serving; before the rung is learned the force
+     gate's 30 s rule still applies. A learner's one proven voter need not
+     be the leader. The as-built history this replaces: holding on
      silence until `own_min_rung` (a minimum over ALL configured peers) reached
      the rung made a restarted node un-servable while ANY member was down — a
      rolling restart of a 3-voter cluster with one dead host became an outage

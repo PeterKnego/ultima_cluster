@@ -207,11 +207,15 @@ role, leader or follower — until every configured peer has proven the
 8832 B rung. Then it logs `jumbo_gate_passed` and serves.
 
 If 30 s (`JUMBO_GATE_WINDOW`, not configurable) elapses first, the node
-fail-stops with exit code 1 and one of two named refusals — **provided the
-cluster has not already committed a jumbo rung**. If it has, the join gate (§6)
-takes precedence: it holds until a quorum of voters has proven the committed
-rung and never fail-stops on silence, so a silent peer on such a cluster is a
-hold, not `jumbo_peer_silent`.
+fail-stops with exit code 1 and one of two named refusals — **unless this node
+has already learned a committed jumbo rung**. Once it has (from its own
+cluster artifact at boot, the archive replay, or an installed snapshot), the
+join gate (§6) takes precedence: it holds until a quorum of voters has proven
+the committed rung and never fail-stops on silence, so a silent peer is then a
+hold, not `jumbo_peer_silent`. The precedence is per node and starts when the
+rung is learned: a forced node that has not yet reached the `CLUSTER` frame
+in its replay, or a fresh joiner still waiting on its snapshot session, runs
+the force gate's rule and its 30 s window until then.
 
 | refusal | what it means | what to do |
 |---|---|---|
@@ -223,10 +227,10 @@ Two caveats:
 - **On a one-node cluster the gate passes immediately**, because there is no
   peer whose path could be narrow. It is a multi-node guarantee; do not read a
   passing solo node as proof of a jumbo fabric.
-- A forced **leader** that is still gated will trip `Uc2LeaderNotServing`,
-  whose summary names both causes (an uncommitted `NewTerm` frame, or a
-  pending jumbo gate). `uc2_jumbo_gate_pending = 1` tells them apart
-  outright; `uc2_datagram_mtu_bytes` / `uc2_probe_min_mtu_bytes` say how far
+- A gated node — leader or not — raises `Uc2JumboGateHeld` after five
+  minutes, and `Uc2LeaderNotServing` excludes a pending gate, so a gated
+  leader raises exactly that one alert.
+  `uc2_datagram_mtu_bytes` / `uc2_probe_min_mtu_bytes` say how far
   discovery got.
 
 ## 6. When a node refuses to join
@@ -259,7 +263,11 @@ Three things to know about it:
   frames come from the leader, a voter), so it passes on **one** proven
   voter; a learner peer's proof counts for nothing, as its ack counts for
   nothing at commit. The pass is logged as `jumbo_gate_passed` (`gate =
-  join`) with `proven_voters`, `voters` and `self_vote` on the record. There
+  join`) with `proven_voters`, `voters` and `self_vote` on the record. The
+  one voter a learner proves need not be the leader, whose path is the one
+  its frames actually cross — a learner proven to another voter serves
+  `/readyz` 200 with the leader's path untested if the leader is silent; if
+  the leader is answering below the rung, the refusal catches it. There
   is **no timer**, and none is needed: proof is a probe ack over the same UDP
   plane replication uses, from a voter, and durable reports and votes are
   pairwise-sealed exactly like probes, so a node that cannot get a probe ack
