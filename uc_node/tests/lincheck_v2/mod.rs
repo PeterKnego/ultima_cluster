@@ -344,6 +344,7 @@ fn make_config<SM: SnapshotStateMachine>(
         max_payload: 256,
         admission_bytes_default: 256 * 1024,
         settings_genesis: uc_protocol::v2::settings::Settings::genesis_default(),
+        force_jumbo_frames: false,
         election_timeout_min_ns: timeout_min_ns,
         election_timeout_max_ns: timeout_max_ns,
         seed: seed_for(id as usize),

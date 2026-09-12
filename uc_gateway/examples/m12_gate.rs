@@ -924,6 +924,7 @@ fn node_config(
             snapshot_interval_bytes,
             ..uc_protocol::v2::settings::Settings::genesis_default()
         },
+        force_jumbo_frames: false,
         election_timeout_min_ns: ELECTION_TIMEOUT_MIN_NS,
         election_timeout_max_ns: ELECTION_TIMEOUT_MAX_NS,
         seed: seed_for(id),

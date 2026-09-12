@@ -583,6 +583,7 @@ fn make_config(
         max_payload: MAX_PAYLOAD,
         admission_bytes_default: admission_bytes,
         settings_genesis: uc_protocol::v2::settings::Settings::genesis_default(),
+        force_jumbo_frames: false,
         election_timeout_min_ns: 150_000_000,
         election_timeout_max_ns: 300_000_000,
         seed,

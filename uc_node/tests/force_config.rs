@@ -39,6 +39,7 @@ fn config_for(id: u32, addr: SocketAddr, instance_dir: PathBuf) -> NodeConfig {
         max_payload: 256,
         admission_bytes_default: 256 * 1024,
         settings_genesis: uc_protocol::v2::settings::Settings::genesis_default(),
+        force_jumbo_frames: false,
         election_timeout_min_ns: 150_000_000,
         election_timeout_max_ns: 300_000_000,
         seed: 0x1122_3344_5566_7788,

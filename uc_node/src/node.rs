@@ -74,7 +74,7 @@ use uc_protocol::v2::datagram::{
     CONFIG_PROPOSAL_BODY_LEN, CONFIG_REPLY_BODY_LEN, ConfigProposalBody, ConfigReplyBody,
     DATAGRAM_HEADER_LEN, DGRAM_KIND_COMMIT_POSITION, DGRAM_KIND_CONFIG_PROPOSAL,
     DGRAM_KIND_CONFIG_REPLY, DGRAM_KIND_READ_PROBE, DGRAM_KIND_READ_PROBE_ACK,
-    DGRAM_KIND_REQUEST_VOTE, DGRAM_KIND_TERM_MAP, DGRAM_KIND_VOTE, DatagramHeader,
+    DGRAM_KIND_REQUEST_VOTE, DGRAM_KIND_TERM_MAP, DGRAM_KIND_VOTE, DatagramHeader, JUMBO_MIN_RUNG,
     MAX_PAYLOAD_DEFAULT, MAX_TERM_MAP_WIRE_ENTRIES, MTU_DEFAULT, READ_PROBE_BODY_LEN,
     REQUEST_VOTE_BODY_LEN, ReadProbeBody, RequestVoteBody, TERM_MAP_ENTRY_LEN, TERM_MAP_HEADER_LEN,
     TermMapEntryWire, VOTE_BODY_LEN, VoteBody, is_rung, payload_ceiling,
@@ -254,6 +254,18 @@ pub struct NodeConfig {
     /// (`ServicesConfig::validate`) — a bad bound is a named startup refusal
     /// before any file is created.
     pub services: ServicesConfig,
+    /// Jumbo spec §6: make discovery a STARTUP GATE. `false` (the default) is
+    /// today's behaviour — a cluster starts at the baseline rung and rises
+    /// only when every member proves a larger path. `true` holds `can_serve`
+    /// false until this node has proven [`JUMBO_MIN_RUNG`] to every configured
+    /// member, and fail-stops the consensus agent by name
+    /// ([`JUMBO_GATE_WINDOW`]) if it cannot — for an application whose
+    /// commands do not fit the standard ceiling, a cluster that cannot carry
+    /// them must not start.
+    ///
+    /// `[crypto]`-shaped per-host config, not a wire flag day: a cluster may
+    /// run it on some hosts and not others (each gates only itself).
+    pub force_jumbo_frames: bool,
     /// The cluster FSM (spec §3.3, §6): the replicated `Settings` record's
     /// genesis value, seeded from `[settings]` in `node.toml`
     /// (`config_file::SettingsSection`) — absent means
@@ -529,6 +541,61 @@ pub(crate) fn committed_rung(raw: u32) -> (u32, bool) {
         r if is_rung(r) => (r, false),
         _ => (MTU_DEFAULT as u32, true),
     }
+}
+
+/// Jumbo spec §6: how long `force_jumbo_frames` holds serving open, waiting
+/// for every configured member to prove [`JUMBO_MIN_RUNG`], before the node
+/// fail-stops by name. A constant, not a knob (spec §12) — an operator who
+/// wants a different answer wants a different flag value.
+pub const JUMBO_GATE_WINDOW: Duration = Duration::from_secs(30);
+
+/// Jumbo spec §5.4: how long a node that has just learned a committed rung
+/// above the baseline gets to prove it carries it. The ladder's own settle
+/// time — five 1 s attempts per peer (`ProbeCadence`) — so a healthy path is
+/// verified several times over inside it, and a path that is not never will be.
+pub const JOIN_CHECK_WINDOW: Duration = Duration::from_secs(5);
+
+/// Jumbo spec §6 and §5.4: the two startup gates, as one piece of state on the
+/// consensus agent.
+///
+/// Both are ONE-SHOT. Once [`JumboGate::Passed`], a pass pays one `match` arm
+/// and nothing else — no probe-table lock, no clock read, no allocation — and
+/// a node reaches it within seconds of boot (or, with neither gate installed,
+/// never holds one at all: the field is an `Option`).
+///
+/// The two differ in what they are protecting:
+///
+/// - `Forcing` is the operator's declaration that this deployment's commands
+///   do not fit the standard ceiling. Nothing about the cluster's state says
+///   so, so the gate is armed at construction from `node.toml` and is about
+///   this node's own paths only.
+/// - `Joining` is a fact the CLUSTER has already committed: some rung above
+///   the baseline is the agreed datagram budget, and the log may already hold
+///   frames this node cannot receive. It is armed from the committed view —
+///   the recovered artifact, the archive walk's replay, or an installed
+///   snapshot — and takes precedence over `Forcing` (spec §6), which it also
+///   subsumes: every rung above the baseline is at or above `JUMBO_MIN_RUNG`,
+///   so proving one proves the other.
+///
+/// `deadline_ns == 0` means NOT YET ARMED: both gates are installed outside
+/// the window in `do_work` where `pass_mono_ns` is current (construction, and
+/// `refresh_from_view`, which runs before the pass's one clock read), so the
+/// deadline is computed on the first pass that evaluates the gate rather than
+/// from a second clock read of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JumboGate {
+    /// `force_jumbo_frames`: hold `can_serve` false until every peer has
+    /// proven [`JUMBO_MIN_RUNG`], or fail-stop at the window.
+    Forcing {
+        deadline_ns: u64,
+    },
+    /// Spec §5.4: a committed rung above the baseline exists; this node must
+    /// prove it carries it before it serves, or fail-stop.
+    Joining {
+        committed: u32,
+        deadline_ns: u64,
+    },
+    Passed,
 }
 
 /// Why [`Consensus::command_snapshot`] refused to append a `SNAPSHOT` frame.
@@ -1971,6 +2038,17 @@ impl Node {
             live_mtu: Arc::clone(&live_mtu),
             crypto_on: crypto.is_some(),
             next_mtu_check_ns: 0,
+            // Jumbo spec §6. Armed here and not from the recovered view: a
+            // node whose instance dir already holds a jumbo rung arms
+            // `Joining` instead, on its first `refresh_from_view` (the live
+            // rung starts at the baseline, so any committed rung above it is
+            // that pass's raise edge).
+            jumbo_gate: if cfg.force_jumbo_frames {
+                Some(JumboGate::Forcing { deadline_ns: 0 })
+            } else {
+                None
+            },
+            jumbo_gate_open: true,
             appender: None,
             next_corr: 0,
             pending_ingress: None,
@@ -2931,6 +3009,16 @@ struct Consensus {
     /// the commit rule. `0` = never evaluated. Compared against
     /// `pass_mono_ns`, so an idle pass costs one `u64` compare.
     next_mtu_check_ns: u64,
+    /// Jumbo spec §6/§5.4: the startup gate, or `None` when this node holds
+    /// neither (the default: no `force_jumbo_frames`, no committed rung above
+    /// the baseline). See [`JumboGate`].
+    jumbo_gate: Option<JumboGate>,
+    /// What [`Consensus::check_jumbo_gate`] answered THIS pass, so step 6's
+    /// `publish_status` masks the cnc `CAN_SERVE` bit exactly as step 5 masked
+    /// the in-process flag — otherwise `/readyz` would answer 200 for a node
+    /// that `Node::can_serve` reports as not serving. `true` whenever no gate
+    /// is installed.
+    jumbo_gate_open: bool,
     /// M14a (spec §5.2): the FSM term — `Some(fsm_lag)` when at least one
     /// service is declared, `None` (inert) for a `none_for_tests` node.
     /// Computed once at boot (`crate::services::fsm_lag_eff`) from the
@@ -3707,8 +3795,17 @@ impl Consensus {
         // here: the SM's own `serving` field is never cleared by step-down (it
         // has no reason to be), so an unconditional store would re-publish
         // `true` for `Node::can_serve()` the very cycle it just halted.
-        self.can_serve_flag
-            .store(!self.halt_removed && self.sm.can_serve(), Ordering::Release);
+        //
+        // Jumbo spec §6/§5.4: and off the startup gate, for the same reason —
+        // a node that has not proven it can carry the cluster's datagram
+        // budget must not take commands. One `Option` test once the gate has
+        // passed (or when none was installed at all).
+        let jumbo_ok = self.check_jumbo_gate();
+        self.jumbo_gate_open = jumbo_ok;
+        self.can_serve_flag.store(
+            jumbo_ok && !self.halt_removed && self.sm.can_serve(),
+            Ordering::Release,
+        );
 
         // 6. Publish the node's status onto the shared cnc page for cross-process
         // attachers (service, clients). `term` + `flags` reflect the SM every
@@ -4885,7 +4982,12 @@ impl Consensus {
             if self.leader_flag.load(Ordering::Relaxed) {
                 flags |= NODE_FLAG_LEADER;
             }
-            if self.sm.can_serve() {
+            // Jumbo spec §6: masked off the startup gate exactly as
+            // `can_serve_flag` is in step 5 (`jumbo_gate_open` is THIS pass's
+            // answer — step 5 runs before this), so `/readyz` refuses while a
+            // gate is pending instead of advertising a node that
+            // `Node::can_serve` already reports as not serving.
+            if self.jumbo_gate_open && self.sm.can_serve() {
                 flags |= NODE_FLAG_CAN_SERVE;
             }
         }
@@ -6074,6 +6176,35 @@ impl Consensus {
                 datagram_mtu = rung as u64,
                 ceiling = ceiling as u64
             );
+            // Jumbo spec §5.4: a rung the CLUSTER has committed and this node
+            // has not PROVEN is a join refusal, not a door it may open.
+            //
+            // Edge-triggered on the raise — which is every way a node can
+            // learn one: the recovered artifact (the live rung starts at the
+            // baseline, so the first pass sees the raise), the archive walk's
+            // replay after a restart, and the artifact a snapshot session
+            // installs. Edge-triggering is also what keeps this off a healthy
+            // node: an ordinary discovery commit is made only once every
+            // member has ADVERTISED the rung, this node included, so its own
+            // minimum is already at or above what it is adopting; and a later
+            // membership change that leaves a fresh peer unresolved — which
+            // does drop `own_min_rung` to 0 — moves no rung and so arms
+            // nothing.
+            let own = self.probe_table.own_min_rung();
+            if rung > MTU_DEFAULT && own < rung as u32 {
+                self.jumbo_gate = Some(JumboGate::Joining {
+                    committed: rung as u32,
+                    deadline_ns: 0,
+                });
+                crate::obs_event!(
+                    Warn,
+                    "jumbo_join_gate_armed",
+                    node = self.id as u64,
+                    committed = rung as u64,
+                    proven = own as u64,
+                    window_secs = JOIN_CHECK_WINDOW.as_secs()
+                );
+            }
         }
         // The two node-local clamps (spec §4.4): the record carries a
         // cluster-wide INTENT, and each node bounds it against its own ring at
@@ -6183,6 +6314,202 @@ impl Consensus {
     /// which `uc2-node`'s main loop reports as `agent_failstopped` before
     /// exiting 1 for systemd to restart. The rings are volatile, so the
     /// restarted node starts clean.
+    /// Jumbo spec §6/§5.4: may this node serve, given its startup gate?
+    ///
+    /// Answers `true` for a passed gate and for no gate at all — one `Option`
+    /// test, which is the steady-state cost. While a gate is pending it reads
+    /// the probe table's own minimum (one lock, off the steady path) and, at
+    /// the window, fail-stops the consensus agent by name: the agent's failed
+    /// flag is what `uc2-node`'s monitor loop turns into `agent_failstopped`
+    /// and exit 1, exactly as the ring and archive fail-stops do.
+    fn check_jumbo_gate(&mut self) -> bool {
+        let Some(gate) = self.jumbo_gate else {
+            return true;
+        };
+        match gate {
+            JumboGate::Passed => true,
+            // Spec §6. An EMPTY peer map answers `MTU_BOUND`
+            // (`ProbeTable::own_min_rung`), so a solo node passes on its first
+            // pass — correctly: it has no peer whose path could be narrow.
+            JumboGate::Forcing { deadline_ns } => {
+                let proven = self.probe_table.own_min_rung();
+                if proven >= JUMBO_MIN_RUNG {
+                    self.jumbo_gate = Some(JumboGate::Passed);
+                    crate::obs_event!(
+                        Info,
+                        "jumbo_gate_passed",
+                        node = self.id as u64,
+                        proven = proven as u64,
+                        required = JUMBO_MIN_RUNG as u64
+                    );
+                    return true;
+                }
+                match deadline_ns {
+                    0 => {
+                        self.jumbo_gate = Some(JumboGate::Forcing {
+                            deadline_ns: self.pass_mono_ns + JUMBO_GATE_WINDOW.as_nanos() as u64,
+                        });
+                    }
+                    d if self.pass_mono_ns >= d => {
+                        self.jumbo_force_fail_stop(JUMBO_GATE_WINDOW);
+                    }
+                    _ => {}
+                }
+                false
+            }
+            // Spec §5.4. Passing this also satisfies a `Forcing` gate it
+            // replaced: every rung above the baseline is at or above
+            // `JUMBO_MIN_RUNG`, so `proven >= committed` proves both.
+            JumboGate::Joining {
+                committed,
+                deadline_ns,
+            } => {
+                let proven = self.probe_table.own_min_rung();
+                if proven >= committed {
+                    self.jumbo_gate = Some(JumboGate::Passed);
+                    crate::obs_event!(
+                        Info,
+                        "jumbo_gate_passed",
+                        node = self.id as u64,
+                        proven = proven as u64,
+                        required = committed as u64
+                    );
+                    return true;
+                }
+                match deadline_ns {
+                    0 => {
+                        self.jumbo_gate = Some(JumboGate::Joining {
+                            committed,
+                            deadline_ns: self.pass_mono_ns + JOIN_CHECK_WINDOW.as_nanos() as u64,
+                        });
+                    }
+                    d if self.pass_mono_ns >= d => {
+                        self.jumbo_join_fail_stop(committed, JOIN_CHECK_WINDOW);
+                    }
+                    _ => {}
+                }
+                false
+            }
+        }
+    }
+
+    /// Every peer that falls short of `want`, as `(member id, verified rung)`,
+    /// ordered by member id — so "the first offender" is the same peer on
+    /// every node and on every run. A peer the membership maps to no id is
+    /// reported as `u32::MAX` and sorts last, which cannot happen for a
+    /// configured member and is not worth a second code path.
+    #[inline(never)]
+    fn jumbo_offenders(&self, want: u32) -> Vec<(NodeId, u32)> {
+        let mut out: Vec<(NodeId, u32)> = self
+            .probe_table
+            .peers()
+            .into_iter()
+            .filter_map(|addr| {
+                let p = self.probe_table.get(addr)?;
+                (p.verified < want).then(|| {
+                    (
+                        self.addr_to_id.get(&addr).copied().unwrap_or(u32::MAX),
+                        p.verified,
+                    )
+                })
+            })
+            .collect();
+        out.sort_unstable();
+        out
+    }
+
+    /// `id:carried` for every offender, for the log line — the refusal names
+    /// the first, but an operator fixing the fabric needs all of them.
+    fn jumbo_offender_list(offenders: &[(NodeId, u32)]) -> String {
+        offenders
+            .iter()
+            .map(|(id, carried)| format!("{id}:{carried}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    /// Spec §6: `force_jumbo_frames` is set, the window has expired, and some
+    /// peer has not proven [`JUMBO_MIN_RUNG`]. Two refusals, picked by the
+    /// FIRST offender: a peer that answered nothing at all is a LIVENESS fact
+    /// (`jumbo_peer_silent`) and nothing is known about its MTU; a peer that
+    /// answered below the rung is a path fact (`jumbo_path_too_narrow`).
+    #[inline(never)]
+    fn jumbo_force_fail_stop(&self, waited: Duration) -> ! {
+        let offenders = self.jumbo_offenders(JUMBO_MIN_RUNG);
+        let list = Self::jumbo_offender_list(&offenders);
+        let waited_secs = waited.as_secs();
+        // `own_min_rung` is below the rung, so there is at least one — but a
+        // report that panics while explaining a panic is no report at all.
+        let (peer, carried) = offenders.first().copied().unwrap_or((u32::MAX, 0));
+        if carried == 0 {
+            crate::obs_event!(
+                Error,
+                "jumbo_peer_silent",
+                node = self.id as u64,
+                peer = peer as u64,
+                waited_secs = waited_secs,
+                required = JUMBO_MIN_RUNG as u64,
+                offenders = list.as_str()
+            );
+            panic!(
+                "consensus fatal (fail-stop): JumboPeerSilent peer={peer} waited_secs={waited_secs} \
+                 — force_jumbo_frames is set and member {peer} never answered a probe at any rung, \
+                 so nothing is known about its path. This is a LIVENESS failure, not an MTU one: \
+                 start the member, or fix what is dropping UC's traffic to it, then restart this \
+                 node. Peers short of {JUMBO_MIN_RUNG} (id:carried): {list}"
+            );
+        }
+        crate::obs_event!(
+            Error,
+            "jumbo_path_too_narrow",
+            node = self.id as u64,
+            peer = peer as u64,
+            carried = carried as u64,
+            required = JUMBO_MIN_RUNG as u64,
+            waited_secs = waited_secs,
+            offenders = list.as_str()
+        );
+        panic!(
+            "consensus fatal (fail-stop): JumboPathTooNarrow peer={peer} carried={carried} \
+             required={JUMBO_MIN_RUNG} — force_jumbo_frames is set and the path to member {peer} \
+             carries only {carried} B datagrams. Raise the interface/path MTU to at least \
+             {JUMBO_MIN_RUNG} B end to end (see docs/how-to/jumbo-frames.md), or unset \
+             force_jumbo_frames to run at the discovered rung. Peers short of {JUMBO_MIN_RUNG} \
+             (id:carried): {list}"
+        );
+    }
+
+    /// Spec §5.4: the cluster has committed `committed` and this node cannot
+    /// carry it to every member. One refusal, `path_below_committed_mtu`,
+    /// naming the first peer that fell short (`carried = 0` = never answered).
+    /// The remedy is the path: the log already holds frames this node cannot
+    /// receive, so joining anyway would stall commit rather than serve reads.
+    #[inline(never)]
+    fn jumbo_join_fail_stop(&self, committed: u32, waited: Duration) -> ! {
+        let offenders = self.jumbo_offenders(committed);
+        let list = Self::jumbo_offender_list(&offenders);
+        let waited_secs = waited.as_secs();
+        let (peer, carried) = offenders.first().copied().unwrap_or((u32::MAX, 0));
+        crate::obs_event!(
+            Error,
+            "path_below_committed_mtu",
+            node = self.id as u64,
+            peer = peer as u64,
+            carried = carried as u64,
+            committed = committed as u64,
+            waited_secs = waited_secs,
+            offenders = list.as_str()
+        );
+        panic!(
+            "consensus fatal (fail-stop): PathBelowCommittedMtu peer={peer} committed={committed} \
+             carried={carried} — this cluster committed a {committed} B datagram budget and the \
+             path to member {peer} carries {carried} B (0 = never answered), so the log already \
+             holds frames this node cannot receive. Fix the path MTU to at least {committed} B end \
+             to end (see docs/how-to/jumbo-frames.md) and restart; the rung is monotone and will \
+             not come back down. Peers short of {committed} (id:carried): {list}"
+        );
+    }
+
     fn ring_error_fail_stop(&self, e: &RingError, ring: &'static str) {
         match e {
             RingError::Wedged { position } => {
@@ -10292,6 +10619,8 @@ mod tests {
             live_mtu: Arc::new(AtomicUsize::new(MTU_DEFAULT)),
             crypto_on: false,
             next_mtu_check_ns: 0,
+            jumbo_gate: None,
+            jumbo_gate_open: true,
             appender: None,
             next_corr: 0,
             pending_ingress: None,
@@ -11583,6 +11912,282 @@ mod tests {
         assert_eq!(h.cons.live_mtu.load(Ordering::Relaxed), MTU_DEFAULT);
         assert_eq!(h.cons.buffer.payload_ceiling(), baseline);
         assert_eq!(h.cons.cnc.payload_ceiling(), baseline as u64);
+    }
+
+    // ---- jumbo (spec §6/§5.4): the two startup gates ----
+
+    /// Is the cnc page's `CAN_SERVE` bit set? `/readyz` reads THIS, not
+    /// `Node::can_serve`, so both have to move together.
+    fn cnc_can_serve(h: &Harness) -> bool {
+        h.cons.cnc.status().flags.load_acquire() & NODE_FLAG_CAN_SERVE != 0
+    }
+
+    /// Arm the force gate the way `Consensus::start_with` does for a
+    /// `node.toml` carrying `force_jumbo_frames = true`.
+    fn arm_force_gate(h: &mut Harness) {
+        h.cons.jumbo_gate = Some(JumboGate::Forcing { deadline_ns: 0 });
+    }
+
+    /// Spec §6: the gate holds SERVING — not the leader flag, not the SM —
+    /// until every peer has proven `JUMBO_MIN_RUNG`, and both the in-process
+    /// flag and the cnc bit move together.
+    #[test]
+    fn the_force_gate_holds_serving_until_every_peer_proves_the_rung() {
+        let mut h = harness();
+        drive_to_serving_leader(&mut h);
+        let peers = mtu_peers(&h);
+        h.cons.probe_table.set_peers(&peers);
+        arm_force_gate(&mut h);
+
+        h.cons.do_work();
+        assert!(
+            !h.cons.can_serve_flag.load(Ordering::Acquire),
+            "gate pending"
+        );
+        assert!(!cnc_can_serve(&h), "the cnc bit follows the flag");
+        assert!(
+            h.cons.leader_flag.load(Ordering::Acquire),
+            "the gate must not touch leadership"
+        );
+        assert!(h.cons.sm.can_serve(), "nor the SM's own view");
+
+        // One peer short is still short (`own_min_rung` is a MIN).
+        h.cons
+            .probe_table
+            .on_ack(peers[0], JUMBO_MIN_RUNG, JUMBO_MIN_RUNG);
+        h.cons.do_work();
+        assert!(
+            !h.cons.can_serve_flag.load(Ordering::Acquire),
+            "one peer short"
+        );
+
+        h.cons
+            .probe_table
+            .on_ack(peers[1], JUMBO_MIN_RUNG, JUMBO_MIN_RUNG);
+        h.cons.do_work();
+        assert_eq!(h.cons.jumbo_gate, Some(JumboGate::Passed));
+        assert!(h.cons.can_serve_flag.load(Ordering::Acquire), "gate passed");
+        assert!(cnc_can_serve(&h));
+
+        // One-shot: a path that degrades later does NOT re-close a passed
+        // gate (spec §6 is a STARTUP gate; a degraded path is §9's alert).
+        h.cons.probe_table.set_peers(&[]);
+        h.cons.probe_table.set_peers(&peers);
+        h.cons.do_work();
+        assert_eq!(h.cons.jumbo_gate, Some(JumboGate::Passed));
+        assert!(h.cons.can_serve_flag.load(Ordering::Acquire));
+    }
+
+    /// Spec §6 + `ProbeTable::own_min_rung`: a SOLO node passes at once. It has
+    /// no peer whose path could be narrow, and the flag must not make a
+    /// one-node cluster unstartable.
+    #[test]
+    fn a_solo_node_passes_the_force_gate_at_once() {
+        let mut h = harness();
+        drive_to_serving_leader(&mut h);
+        h.cons.probe_table.set_peers(&[]);
+        arm_force_gate(&mut h);
+
+        h.cons.do_work();
+        assert_eq!(h.cons.jumbo_gate, Some(JumboGate::Passed));
+        assert!(h.cons.can_serve_flag.load(Ordering::Acquire));
+    }
+
+    /// Spec §6: the window is what turns a pending gate into a refusal, and
+    /// the deadline is taken from the pass's one monotonic reading.
+    #[test]
+    fn the_force_gate_arms_its_window_on_the_first_pass_that_evaluates_it() {
+        let mut h = harness();
+        let peers = mtu_peers(&h);
+        h.cons.probe_table.set_peers(&peers);
+        arm_force_gate(&mut h);
+
+        h.cons.pass_mono_ns = 7_000;
+        assert!(!h.cons.check_jumbo_gate(), "pending");
+        assert_eq!(
+            h.cons.jumbo_gate,
+            Some(JumboGate::Forcing {
+                deadline_ns: 7_000 + 30_000_000_000
+            }),
+            "armed from pass_mono_ns, not from a clock read of its own"
+        );
+        // A second pass inside the window neither re-arms nor refuses.
+        h.cons.pass_mono_ns += 29_000_000_000;
+        assert!(!h.cons.check_jumbo_gate());
+        assert_eq!(
+            h.cons.jumbo_gate,
+            Some(JumboGate::Forcing {
+                deadline_ns: 7_000 + 30_000_000_000
+            })
+        );
+    }
+
+    /// Spec §6: every peer answered, all of them below the rung → a PATH fact,
+    /// naming the lowest-id offender and listing every one of them.
+    #[test]
+    #[should_panic(expected = "JumboPathTooNarrow peer=0 carried=1408 required=8832")]
+    fn the_force_gate_refuses_a_path_that_carries_only_the_baseline() {
+        let mut h = harness();
+        let peers = mtu_peers(&h);
+        all_answer(&h, &peers, MTU_DEFAULT as u32, MTU_DEFAULT as u32);
+        arm_force_gate(&mut h);
+
+        h.cons.pass_mono_ns = 1_000;
+        assert!(!h.cons.check_jumbo_gate(), "pending, window armed");
+        h.cons.pass_mono_ns += 30_000_000_000;
+        h.cons.check_jumbo_gate();
+    }
+
+    /// Spec §6: a peer that answered NOTHING is a liveness fact, and it is the
+    /// first offender that picks the refusal — peer 0 carries the rung here, so
+    /// the silent peer 2 is the one named.
+    #[test]
+    #[should_panic(expected = "JumboPeerSilent peer=2 waited_secs=30")]
+    fn the_force_gate_refuses_a_silent_peer_as_a_liveness_fact() {
+        let mut h = harness();
+        let peers = mtu_peers(&h);
+        h.cons.probe_table.set_peers(&peers);
+        h.cons
+            .probe_table
+            .on_ack(peers[0], MTU_BOUND as u32, MTU_BOUND as u32);
+        arm_force_gate(&mut h);
+
+        h.cons.pass_mono_ns = 1_000;
+        assert!(!h.cons.check_jumbo_gate());
+        h.cons.pass_mono_ns += 30_000_000_000;
+        h.cons.check_jumbo_gate();
+    }
+
+    /// Spec §5.4: a committed rung this node has NOT proven arms the join gate
+    /// — on the raise edge, from the committed view, whatever put it there
+    /// (artifact, archive walk, snapshot) — and the refusal names the rung.
+    #[test]
+    #[should_panic(expected = "PathBelowCommittedMtu peer=0 committed=8960 carried=1408")]
+    fn a_committed_rung_this_node_cannot_carry_refuses_the_join() {
+        let mut h = harness();
+        drive_to_serving_leader(&mut h);
+        let peers = mtu_peers(&h);
+        all_answer(&h, &peers, MTU_DEFAULT as u32, MTU_DEFAULT as u32);
+
+        // The rung arrives, committed: what a restarted node's archive walk
+        // replays into the view.
+        let mut st = h.cons.cluster_view.to_state();
+        st.settings.datagram_mtu = MTU_BOUND as u32;
+        h.cons.cluster_view.publish(&st);
+        h.cons.view_position_seen = u64::MAX;
+        h.cons.do_work();
+        assert!(
+            matches!(
+                h.cons.jumbo_gate,
+                Some(JumboGate::Joining {
+                    committed: 8960,
+                    ..
+                })
+            ),
+            "the raise armed the join gate: {:?}",
+            h.cons.jumbo_gate
+        );
+        assert!(
+            !h.cons.can_serve_flag.load(Ordering::Acquire),
+            "a node below the committed rung must not serve"
+        );
+        assert!(!cnc_can_serve(&h));
+
+        h.cons.pass_mono_ns += 5_000_000_000;
+        h.cons.check_jumbo_gate();
+    }
+
+    /// Spec §5.4, the half that matters more: the ORDINARY discovery commit
+    /// arms NOTHING. The leader raises the rung only once every member has
+    /// advertised it, so an adopting node's own minimum is already at or above
+    /// what it adopts — and a gate that fired here would fail-stop a healthy
+    /// cluster the first time it discovered a jumbo path.
+    #[test]
+    fn a_raise_this_node_has_already_proven_arms_no_gate() {
+        let mut h = harness();
+        drive_to_serving_leader(&mut h);
+        let peers = mtu_peers(&h);
+        all_answer(&h, &peers, MTU_BOUND as u32, MTU_BOUND as u32);
+
+        let mut st = h.cons.cluster_view.to_state();
+        st.settings.datagram_mtu = MTU_BOUND as u32;
+        h.cons.cluster_view.publish(&st);
+        h.cons.view_position_seen = u64::MAX;
+        h.cons.do_work();
+
+        assert_eq!(h.cons.jumbo_gate, None, "no gate on a proven raise");
+        assert!(
+            h.cons.can_serve_flag.load(Ordering::Acquire),
+            "still serving"
+        );
+        assert!(cnc_can_serve(&h));
+    }
+
+    /// Spec §5.4, the other half: a MEMBERSHIP CHANGE after the raise drops
+    /// `own_min_rung` to 0 (a fresh peer is unresolved until it answers) while
+    /// moving no rung — so it arms nothing either. Without the raise edge this
+    /// is the case that would fail-stop every healthy voter five seconds after
+    /// an `add-learner` on a jumbo cluster.
+    #[test]
+    fn a_membership_change_after_the_raise_arms_no_gate() {
+        let mut h = harness();
+        drive_to_serving_leader(&mut h);
+        let peers = mtu_peers(&h);
+        all_answer(&h, &peers, MTU_BOUND as u32, MTU_BOUND as u32);
+        let mut st = h.cons.cluster_view.to_state();
+        st.settings.datagram_mtu = MTU_BOUND as u32;
+        h.cons.cluster_view.publish(&st);
+        h.cons.view_position_seen = u64::MAX;
+        h.cons.do_work();
+        assert_eq!(h.cons.jumbo_gate, None);
+
+        // A learner joins behind a path nobody has probed yet.
+        let mut with_learner = peers.clone();
+        with_learner.push("127.0.0.1:9199".parse().unwrap());
+        h.cons.probe_table.set_peers(&with_learner);
+        assert_eq!(h.cons.probe_table.own_min_rung(), 0, "unresolved peer");
+        h.cons.view_position_seen = u64::MAX;
+        h.cons.do_work();
+
+        assert_eq!(h.cons.jumbo_gate, None, "no rung moved, so no gate");
+        assert!(
+            h.cons.can_serve_flag.load(Ordering::Acquire),
+            "still serving"
+        );
+    }
+
+    /// Spec §6: `PathBelowCommittedMtu` "still applies under the flag and takes
+    /// precedence". The join gate REPLACES a pending force gate (its window is
+    /// the shorter one, and its rung is the stricter fact), and passing it
+    /// satisfies both — every rung above the baseline is at or above
+    /// `JUMBO_MIN_RUNG`.
+    #[test]
+    fn the_join_gate_takes_precedence_over_the_force_gate() {
+        let mut h = harness();
+        drive_to_serving_leader(&mut h);
+        let peers = mtu_peers(&h);
+        all_answer(&h, &peers, MTU_DEFAULT as u32, MTU_DEFAULT as u32);
+        arm_force_gate(&mut h);
+        h.cons.pass_mono_ns = 1_000;
+        assert!(!h.cons.check_jumbo_gate(), "the force gate is pending");
+
+        let mut st = h.cons.cluster_view.to_state();
+        st.settings.datagram_mtu = MTU_BOUND as u32;
+        h.cons.cluster_view.publish(&st);
+        h.cons.view_position_seen = u64::MAX;
+        h.cons.do_work();
+        assert!(
+            matches!(h.cons.jumbo_gate, Some(JumboGate::Joining { .. })),
+            "the join gate replaced it: {:?}",
+            h.cons.jumbo_gate
+        );
+
+        // Proving the committed rung passes the gate outright — there is no
+        // second window to sit out.
+        all_answer(&h, &peers, MTU_BOUND as u32, MTU_BOUND as u32);
+        h.cons.do_work();
+        assert_eq!(h.cons.jumbo_gate, Some(JumboGate::Passed));
+        assert!(h.cons.can_serve_flag.load(Ordering::Acquire));
     }
 
     /// Review round 1, Important 2: under `FsmLag::Lockstep` the door is "at
@@ -14634,6 +15239,7 @@ mod tests {
             max_payload: 256,
             admission_bytes_default: 256 * 1024,
             settings_genesis: uc_protocol::v2::settings::Settings::genesis_default(),
+            force_jumbo_frames: false,
             election_timeout_min_ns: 20_000_000,
             election_timeout_max_ns: 40_000_000,
             seed: 1,

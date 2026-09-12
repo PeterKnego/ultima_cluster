@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Peter Knego
 
-//! Jumbo spec §10, in-process items (a), (b), (e): discovery lands on the
+//! Jumbo spec §10, in-process items (a) through (e): discovery lands on the
 //! capped rung on every node; the ceiling never rises while one member is
-//! silent; a client attached before the raise sees it.
+//! silent; a client attached before the raise sees it; and — plan 2 — the two
+//! startup gates, `force_jumbo_frames` (spec §6) and the committed-rung join
+//! refusal (spec §5.4), each fail-stopping the consensus agent by name.
 //!
 //! Three real loopback nodes per test (harness shaped after
 //! `query_barrier.rs`), with [`FaultConfig::max_datagram`] standing in for a
@@ -13,6 +15,8 @@
 
 use std::net::{SocketAddr, UdpSocket};
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -76,6 +80,7 @@ fn make_config(
     seed: u64,
     addr: SocketAddr,
     faults: FaultConfig,
+    force_jumbo_frames: bool,
 ) -> NodeConfig {
     NodeConfig {
         id,
@@ -87,6 +92,7 @@ fn make_config(
         max_payload: MAX_PAYLOAD,
         admission_bytes_default: 256 * 1024,
         settings_genesis: uc_protocol::v2::settings::Settings::genesis_default(),
+        force_jumbo_frames,
         election_timeout_min_ns: 150_000_000,
         election_timeout_max_ns: 300_000_000,
         seed,
@@ -134,6 +140,11 @@ fn bind_fleet(n: usize) -> Fleet {
 
 impl Fleet {
     fn start(&mut self, i: usize, faults: FaultConfig) -> Node {
+        self.start_forced(i, faults, false)
+    }
+
+    /// `force` is jumbo spec §6's `force_jumbo_frames`.
+    fn start_forced(&mut self, i: usize, faults: FaultConfig, force: bool) -> Node {
         let sock = self.socks[i].take().expect("socket already handed out");
         let addr = self.members[i].1;
         let seed = 0xA1B2_C3D4_5566_7788 ^ (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
@@ -144,8 +155,18 @@ impl Fleet {
             seed,
             addr,
             faults,
+            force,
         );
         Node::start_with_socket(cfg, sock).expect("start")
+    }
+
+    /// Re-bind member `i`'s ORIGINAL address after its node was stopped, so
+    /// the same member can be started again against the same instance dir —
+    /// what a restart is. UDP has no TIME_WAIT, so the port is free the
+    /// moment the old socket is dropped.
+    fn rebind(&mut self, i: usize) {
+        assert!(self.socks[i].is_none(), "member {i} was never started");
+        self.socks[i] = Some(UdpSocket::bind(self.members[i].1).expect("rebind"));
     }
 }
 
@@ -312,5 +333,170 @@ fn a_client_attached_before_the_raise_sees_it() {
 
     client.shutdown();
     svc.stop();
+    stop_all(nodes);
+}
+
+// --------------------------------------------------- plan 2: the two gates
+
+/// The three gate tests below share the process-global `uc_obs` capture sink
+/// ([`uc_node::obs::log::capture_for_tests`]), so only one may hold it at a
+/// time — same discipline as `obs_log.rs`'s `serialize()`. It also keeps three
+/// 3-node clusters from running at once beside the four discovery tests above.
+static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+fn serialize() -> MutexGuard<'static, ()> {
+    TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Has this node's consensus agent fail-stopped? The agent's panic sets its
+/// `finished` flag from a drop guard inside the worker thread — the SAME flag
+/// `uc2-node`'s monitor loop turns into `agent_failstopped` + exit 1 — so this
+/// is exactly what the daemon sees.
+fn consensus_failed(n: &Node) -> bool {
+    n.observability()
+        .agents
+        .iter()
+        .find(|(name, _)| *name == "consensus")
+        .map(|(_, flag)| flag.load(Ordering::Acquire))
+        .expect("a node always has a consensus agent")
+}
+
+/// Wait until every node in `nodes` has fail-stopped its consensus agent AND
+/// the named refusal has landed in the capture buffer.
+///
+/// Both halves matter: the flag alone would pass for any panic in that agent,
+/// and the log record alone would pass for a record some OTHER node emitted.
+/// The panic message itself goes to the agent thread's stderr and is not
+/// reachable from the process, which is why the gate emits the reason as an
+/// `obs_event!(Error, …)` first — that record is the machine-readable half.
+fn await_agent_failstop(nodes: &[&Node], buf: &Arc<Mutex<Vec<u8>>>, reason: &str, secs: u64) {
+    let needle = format!("\"event\":\"{reason}\"");
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    loop {
+        let text = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        if nodes.iter().all(|n| consensus_failed(n)) && text.contains(&needle) {
+            return;
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "{reason} never fired on all {} nodes within {secs}s (failed: {:?})\
+                 \n--- capture buffer ---\n{text}--- end capture buffer ---",
+                nodes.len(),
+                nodes
+                    .iter()
+                    .map(|n| consensus_failed(n))
+                    .collect::<Vec<_>>(),
+            );
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+/// Spec §10(c)/§6: under `force_jumbo_frames`, a path that cannot carry
+/// `JUMBO_MIN_RUNG` fail-stops the node BY NAME within the window — and the
+/// node never serves in the meantime, which is the half that makes the gate
+/// worth having (a node that served first and died later would have taken
+/// commands it could not replicate).
+///
+/// The cap is the baseline rung itself, so the 1408 probe IS acked and the two
+/// jumbo probes are not: every peer answered, too small. That is
+/// `jumbo_path_too_narrow`, not `jumbo_peer_silent`.
+///
+/// Expect three `consensus fatal (fail-stop)` panics on stderr: that is the
+/// agent dying as designed, one line per node.
+#[test]
+fn the_force_gate_refuses_a_path_too_narrow() {
+    let _g = serialize();
+    let buf = uc_node::obs::log::capture_for_tests();
+    let mut fleet = bind_fleet(3);
+    let faults = FaultConfig {
+        max_datagram: 1408,
+        ..FaultConfig::default()
+    };
+    let nodes: Vec<Node> = (0..3)
+        .map(|i| fleet.start_forced(i, faults, true))
+        .collect();
+
+    let refs: Vec<&Node> = nodes.iter().collect();
+    await_agent_failstop(&refs, &buf, "jumbo_path_too_narrow", 45);
+    for n in &nodes {
+        assert!(
+            !n.can_serve(),
+            "a node that never proved its paths must not serve"
+        );
+    }
+    // Dropped, not stopped: `stop()` joins the agent threads and re-raises the
+    // panic that killed the consensus one. The drop path swallows it (and
+    // still joins every thread).
+    drop(nodes);
+}
+
+/// Spec §10(c)/§6: a member that never answers is a LIVENESS fact and is
+/// worded as one — `jumbo_peer_silent`, naming the member and how long it was
+/// waited for, rather than claiming anything about its path MTU (nothing is
+/// known about it).
+///
+/// The third member's socket stays bound and unserved, so the two live nodes
+/// have a peer that provably never answers. They elect a leader between them
+/// (2 of 3 is a quorum) and still refuse to serve.
+///
+/// Expect two `consensus fatal (fail-stop)` panics on stderr.
+#[test]
+fn the_force_gate_refuses_a_silent_peer() {
+    let _g = serialize();
+    let buf = uc_node::obs::log::capture_for_tests();
+    let mut fleet = bind_fleet(3);
+    let nodes: Vec<Node> = (0..2)
+        .map(|i| fleet.start_forced(i, FaultConfig::default(), true))
+        .collect();
+
+    let refs: Vec<&Node> = nodes.iter().collect();
+    await_agent_failstop(&refs, &buf, "jumbo_peer_silent", 45);
+    drop(nodes);
+}
+
+/// Spec §10(d)/§5.4: a node whose path is narrower than the rung the cluster
+/// already committed refuses to JOIN rather than serving and stalling commit
+/// — the log already holds frames it cannot receive.
+///
+/// The restarted member keeps its instance dir, so it recovers its own log and
+/// learns the committed 8960 through the cluster FSM exactly as it would from
+/// an artifact or a snapshot session; behind a 1408 cap it can verify only the
+/// baseline rung, so the gate's deadline finds it short.
+///
+/// Expect one `consensus fatal (fail-stop)` panic on stderr.
+#[test]
+fn a_restart_below_the_committed_rung_refuses_to_join() {
+    let _g = serialize();
+    let buf = uc_node::obs::log::capture_for_tests();
+    // Three nodes on an uncapped loopback commit 8960 (plan 1's proof).
+    let (mut fleet, mut nodes) = spawn_cluster(3, FaultConfig::default());
+    let leader = await_single_leader(&nodes, 10);
+    await_rung(&nodes, 8960, 20);
+
+    // Restart a FOLLOWER, so the surviving two keep both the quorum and the
+    // leadership they already have.
+    let victim = (leader + 1) % 3;
+    nodes.remove(victim).stop();
+    fleet.rebind(victim);
+    let restarted = fleet.start(
+        victim,
+        FaultConfig {
+            max_datagram: 1408,
+            ..FaultConfig::default()
+        },
+    );
+
+    await_agent_failstop(&[&restarted], &buf, "path_below_committed_mtu", 45);
+    assert!(
+        !restarted.can_serve(),
+        "a node below the committed rung must not serve"
+    );
+    // The two that stayed up are untouched: one gate firing on a joiner must
+    // never take the cluster with it.
+    for n in &nodes {
+        assert!(!consensus_failed(n), "a live node fail-stopped too");
+    }
+    drop(restarted);
     stop_all(nodes);
 }

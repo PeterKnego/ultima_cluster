@@ -77,6 +77,7 @@ fn node_config(dir: &Path, app_id: &str) -> NodeConfig {
         max_payload: 256,
         admission_bytes_default: 256 * 1024,
         settings_genesis: uc_protocol::v2::settings::Settings::genesis_default(),
+        force_jumbo_frames: false,
         election_timeout_min_ns: 50_000_000,
         election_timeout_max_ns: 100_000_000,
         seed: 1,

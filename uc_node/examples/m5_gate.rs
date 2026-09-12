@@ -438,6 +438,7 @@ fn node_config<S: RawStateMachine>(
         max_payload: NODE_MAX_PAYLOAD,
         admission_bytes_default: admission_bytes,
         settings_genesis: uc_protocol::v2::settings::Settings::genesis_default(),
+        force_jumbo_frames: false,
         election_timeout_min_ns: ELECTION_TIMEOUT_MIN_NS,
         election_timeout_max_ns: ELECTION_TIMEOUT_MAX_NS,
         seed: seed_for(id),

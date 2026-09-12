@@ -311,6 +311,7 @@ fn make_config(
             snapshot_interval_bytes: SNAPSHOT_INTERVAL_BYTES,
             ..uc_protocol::v2::settings::Settings::genesis_default()
         },
+        force_jumbo_frames: false,
         election_timeout_min_ns: 150_000_000,
         election_timeout_max_ns: 300_000_000,
         seed: seed_for(id),

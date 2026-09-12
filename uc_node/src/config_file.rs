@@ -253,6 +253,10 @@ struct NodeConfigFile {
     /// from here (see [`default_admission_bytes`]).
     #[serde(default)]
     admission_bytes: Option<u64>,
+    /// Jumbo spec §6: make discovery a startup gate (default `false`). Env
+    /// override `UC2_FORCE_JUMBO_FRAMES`.
+    #[serde(default)]
+    force_jumbo_frames: bool,
     #[serde(default = "default_election_min_ns")]
     election_timeout_min_ns: u64,
     #[serde(default = "default_election_max_ns")]
@@ -396,6 +400,10 @@ pub const ENV_OVERRIDES: &[(&str, &str)] = &[
     ("UC2_MEMBERS", "members"),
     ("UC2_LOG_LEVEL", "log.level"),
     ("UC2_METRICS_BIND", "metrics.bind"),
+    // Jumbo spec §6. Deploy-varying by the twelve-factor test: the same image
+    // runs on a jumbo fabric where the gate is wanted and on a dev box or a
+    // 1500 B network where it is not.
+    ("UC2_FORCE_JUMBO_FRAMES", "force_jumbo_frames"),
 ];
 
 /// Build the `Invalid` refusal for an env var that did not parse. It names
@@ -406,6 +414,19 @@ fn env_invalid(var: &'static str, field: &'static str, value: &str, expected: &s
     ConfigError::Invalid {
         field,
         detail: format!("{var}=\"{value}\" is not {expected}"),
+    }
+}
+
+/// The accepted spellings of a BOOL override (jumbo spec §6 brought the
+/// first one). Deliberately NOT `"yes"`/`"on"`/`"TRUE"`: a small closed set
+/// refused by name beats a permissive parse whose near-miss silently reads as
+/// `false` — which for `force_jumbo_frames` would start the very node the
+/// operator asked to be refused.
+fn env_bool(var: &'static str, field: &'static str, value: &str) -> Result<bool, ConfigError> {
+    match value {
+        "1" | "true" => Ok(true),
+        "0" | "false" => Ok(false),
+        _ => Err(env_invalid(var, field, value, "1, true, 0 or false")),
     }
 }
 
@@ -476,6 +497,10 @@ fn apply_env_overrides(
         })?;
         f.metrics = Some(MetricsSectionFile { bind: Some(bind) });
         note("UC2_METRICS_BIND", &v);
+    }
+    if let Some(v) = env("UC2_FORCE_JUMBO_FRAMES") {
+        f.force_jumbo_frames = env_bool("UC2_FORCE_JUMBO_FRAMES", "force_jumbo_frames", &v)?;
+        note("UC2_FORCE_JUMBO_FRAMES", &v);
     }
     Ok(())
 }
@@ -835,6 +860,8 @@ pub fn parse_str_with_env(
             crypto,
             services,
             settings_genesis,
+            // Jumbo spec §6: off unless the file or the environment says so.
+            force_jumbo_frames: f.force_jumbo_frames,
         },
         StartupOptions {
             allow_volatile_fs: f.allow_volatile_fs,
@@ -1660,6 +1687,45 @@ level = "info"
         let (cfg, _) = load_str(&on).unwrap();
         assert_eq!(cfg.max_payload, payload_ceiling(MTU_BOUND, true));
         assert_eq!(cfg.max_payload, 8864);
+    }
+
+    /// Jumbo spec §6: the key and its env override, default false. The first
+    /// BOOL in [`ENV_OVERRIDES`], so the accepted spellings are pinned here:
+    /// `1`/`true`/`0`/`false`, and anything else is refused BY NAME rather
+    /// than silently read as false (which would turn a typo into a node that
+    /// starts and serves on a narrow path — the exact outcome the flag
+    /// exists to prevent).
+    #[test]
+    fn force_jumbo_frames_defaults_false_and_takes_an_env_override() {
+        let (cfg, _) = load_str(MINIMAL).unwrap();
+        assert!(!cfg.force_jumbo_frames, "absent means off");
+
+        // Bare key before the first `[table]` header, same reason as the
+        // `max_payload` test above.
+        let toml = format!("force_jumbo_frames = true\n{MINIMAL}");
+        let (cfg, _) = load_str(&toml).unwrap();
+        assert!(cfg.force_jumbo_frames, "the file's value");
+
+        for (set, want) in [("1", true), ("true", true), ("0", false), ("false", false)] {
+            let (cfg, _) =
+                parse_str_with_env(MINIMAL, env_of(&[("UC2_FORCE_JUMBO_FRAMES", set)])).unwrap();
+            assert_eq!(cfg.force_jumbo_frames, want, "UC2_FORCE_JUMBO_FRAMES={set}");
+        }
+        // And it OVERRIDES the file either way, like every other override.
+        let toml = format!("force_jumbo_frames = true\n{MINIMAL}");
+        let (cfg, _) =
+            parse_str_with_env(&toml, env_of(&[("UC2_FORCE_JUMBO_FRAMES", "0")])).unwrap();
+        assert!(!cfg.force_jumbo_frames, "the environment wins");
+
+        for bad in ["yes please", "", "TRUE ", "2"] {
+            let e = parse_str_with_env(MINIMAL, env_of(&[("UC2_FORCE_JUMBO_FRAMES", bad)]))
+                .expect_err(&format!("{bad:?} must be refused"));
+            assert!(
+                e.to_string().contains("UC2_FORCE_JUMBO_FRAMES"),
+                "refused by NAME: {e}"
+            );
+            assert!(matches!(e, ConfigError::Invalid { .. }), "{e:?}");
+        }
     }
 
     /// `[settings]` is optional; absent, `settings_genesis` is exactly
