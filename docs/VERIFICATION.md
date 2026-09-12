@@ -399,16 +399,27 @@ pins, with the cap standing in for the narrow hop:
 | `the_force_gate_refuses_a_path_too_narrow` / `..._a_silent_peer` | `force_jumbo_frames` fail-stops by name, and the two refusals are distinguished: a peer that answered too small vs. one that never answered |
 | `a_restart_below_the_committed_rung_refuses_to_join` | a node restarting against a committed rung its path cannot carry refuses by name instead of joining |
 | `a_healthy_restart_on_a_jumbo_cluster_does_not_refuse` | the companion negative: a mid-ladder peer is *not* degradation, so an ordinary restart serves instead of crash-looping |
+| `a_survivor_restarted_with_one_member_down_passes_on_a_proven_quorum` | the join gate's pass is a QUORUM of voters, never silence or a timer: a survivor restarted beside a dead member proves the rung to the other survivor (self + 1 of 3) and serves, and the record says so (`proven_voters`/`voters`) — watched red against the unproven pass it replaced |
 
-The last pair is the proof that matters most, because the defect it pins was a
-state-classification bug found twice in review: a peer whose jumbo ack has
+The refusal pair is the proof that matters most, because the defect it pins was
+a state-classification bug found twice in review: a peer whose jumbo ack has
 simply not landed yet looks exactly like a narrow one unless the predicate also
 asks whether its fast probe ladder has been spent. The deterministic red for it
 is the unit tier (`uc_net::probe`'s
 `narrow_peers_needs_an_answer_and_a_spent_fast_ladder` and `uc_node::node`'s
 `a_mid_ladder_answer_holds_serving_but_never_refuses`); on loopback the acks
 land microseconds apart, so the integration test is a guard, not the oracle —
-stated here so the proof is not read as stronger than it is.
+stated here so the proof is not read as stronger than it is. The quorum rule's
+own deterministic reds are in the same unit tier: `uc_net::probe`'s
+`proven_count_counts_only_the_listed_members_at_or_above_the_rung` and
+`uc_node::node`'s `silence_holds_the_join_gate_until_a_quorum_of_voters_proves_the_rung`,
+`a_two_voter_cluster_needs_the_other_voter_proven`,
+`a_four_voter_cluster_needs_two_proven_peers`,
+`a_joining_learner_needs_a_majority_of_voters_without_its_own_vote` and
+`a_learner_peers_proof_does_not_count_toward_the_quorum`, plus the ordering
+guard `a_proven_narrow_peer_refuses_even_when_the_other_voters_are_a_proven_quorum`
+(which the shipped gate already satisfied, and which pins that the refusal is
+checked before the quorum on every poll).
 
 ```bash
 cargo test -p uc_node --test jumbo

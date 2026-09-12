@@ -55,7 +55,8 @@ release writeup is in `RELEASES.md` and `docs/releases.md`; the explainer is
 its two "Errata … as built" sections before the body — seven errata, and the
 three an operator is most likely to misread are the forever-climbing
 `uc2_probe_sent_total` on a narrow cluster, the solo cluster that never
-raises, and the join gate that never refuses a silent peer).
+raises, and the join gate that never refuses a silent peer — it holds until a
+quorum of voters has proven the rung, with no timer).
 **M14c2 is the last feature milestone; milestones M1–M14 are all complete**, each
 closed by a fleet-proven gate doc under `docs/benchmarks/` (bars are
 pre-committed before any run; a miss is recorded as FAIL and keeps the bar —

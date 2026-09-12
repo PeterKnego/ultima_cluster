@@ -257,41 +257,46 @@ must not pretend otherwise. They differ in who asks for them and in what
 | | `force_jumbo_frames = true` (spec §6) | the join gate (spec §5.4) |
 |---|---|---|
 | who turns it on | the operator, per host (env: `UC2_FORCE_JUMBO_FRAMES`) | nobody — it arms itself whenever a node learns of a committed rung above the baseline it has not proven |
-| what it demands | every peer proves `JUMBO_MIN_RUNG = 8832` | this node's own minimum reaches the **committed** rung |
+| what it demands | every peer proves `JUMBO_MIN_RUNG = 8832` | the voters this node has proven the **committed** rung to form a quorum with it (a joining learner: a majority of the voters) |
 | while pending | holds `can_serve` false and answers `/readyz` with 503 — in **any** role, not just leader; a held LEADER also appends no client command, fires no timer and confirms no linearizable read, so the hold is not merely advisory | the same; `uc2_jumbo_gate_pending` is `1` |
 | on proof | `jumbo_gate_passed`, serving begins | the same |
 | on failure | after `JUMBO_GATE_WINDOW = 30 s`, fail-stop: `jumbo_path_too_narrow` (a peer answered below the rung) or `jumbo_peer_silent` (no peer answer at all — worded as the liveness fact it is) | fail-stop `path_below_committed_mtu` the moment a peer is PROVEN narrow, naming the peer and both rungs — no window |
-| on nothing proven either way | (the silent case is a failure above) | SILENCE passes the gate at once, warning `jumbo_join_gate_passed_unproven` (`reason = no_evidence`); a peer still ANSWERING below the rung holds serving, bounded at the same 30 s window (`reason = window_expired`) |
+| on nothing proven either way | (the silent case is a failure above) | HOLDS — silence, a peer still mid-ladder, or an outlived ack — with no window, until a quorum of voters has proven the rung |
 
-**The join gate's refusal has no window, and silence never refuses.** The join
-gate fail-stops only on a peer that *answered* below the committed rung **and**
-has spent its fast probe ladder. Both halves matter:
+**The join gate's refusal has no window, silence never refuses, and the pass
+is a quorum.** The join gate fail-stops only on a peer that *answered* below
+the committed rung **and** has spent its fast probe ladder; it passes once the
+voters it has proven the rung to form a quorum with it; it holds on anything
+else. Each part matters:
 
 - `verified == 0` is silence — a member that is down, slow, or still
   replaying a cold start. Nothing is known about its path, so it is never
-  "narrow" — and it does not HOLD the gate either. When every peer short of the
-  rung is silent, the gate passes *unproven* on the spot and says so once
-  (`jumbo_join_gate_passed_unproven`, warn, `reason = no_evidence`, naming the
-  silent members). Both earlier iterations were availability bugs, in opposite
-  directions: refusing crash-looped a restarted survivor, and holding — even
-  bounded at 30 s — left it at `/readyz` 503 until the dead member came back,
-  because `own_min_rung` is a minimum over *all* configured peers. That makes a
-  rolling restart an outage on a cluster that still has quorum, and it is how
-  the `lin_v2` capstones (kill the leader, then wait for a serving survivor)
-  ended up with no servable node at all. Silence is no evidence either way, and
-  the residual deserves stating: an unproven pass can leave a node serving that
-  cannot carry the rung. If the narrow element is the node's OWN interface MTU,
-  its large sends fail `EMSGSIZE` and `Uc2PathBelowMtu` (critical) fires. If it
-  is a REMOTE path, nothing alerts — there is no local `EMSGSIZE` unless the
-  route returns ICMP frag-needed — and the symptom is a replication path that
-  never progresses (that peer stuck, `uc2_peer_replication_lag_bytes` climbing,
-  commit stalled if it is a voter). A returning member's own join check covers
-  the pair from its side only when its probes resolve before it adopts the rung;
-  one whose archive already holds the rung passes on `no_evidence` too.
+  "narrow" — and it is not something a timer can turn into a verdict either,
+  so the gate does not wait *on it*: it waits for a **quorum**. Self plus one
+  proven voter on three voters, self plus two on four or five; a joining
+  learner has no vote and needs a plain majority of the voters; a learner
+  peer's proof counts for nothing, as its ack counts for nothing at commit.
+  Why that is the right condition: proof is a probe ack over the same UDP
+  plane replication uses, from a voter, so a node that cannot get one from a
+  quorum of voters cannot get commit acks from them either — and serving is
+  leader-only in UC, so a timed pass would let it do nothing. Why it needs no
+  timer to stay available: the dead-host outage that once argued for one
+  (one dead voter out of three holding every restarted survivor at `/readyz`
+  503 until it came back — the shape that left the `lin_v2` capstones, which
+  kill the leader and then wait for a serving survivor, with no servable node)
+  cannot happen, because the survivors *are* the quorum; the restarted one
+  proves the rung to the other within a probe round. Two earlier iterations
+  were availability bugs in opposite directions — refusing on silence
+  crash-looped a restarted survivor, holding on *every* peer made a dead host
+  an outage — and the unproven pass that briefly replaced them gave up the
+  spec's promise: a previously-proven member whose path degraded while it was
+  down joined and served, leaving a mislabelled lagging-peer alert where a
+  named refusal belonged. Under the quorum rule that member finds every voter
+  answering it at the baseline, spends its ladder, and refuses by name.
   `uc2ctl remove <dead-id>` is accepted
   while a gate is pending — admin handling keys on the leader flag, not on the
-  gate. What DOES hold serving is a peer ANSWERING below the rung: discovery in
-  flight, bounded at `JUMBO_GATE_WINDOW` (30 s, `reason = window_expired`).
+  gate. A peer ANSWERING below the rung holds serving the same way: discovery
+  in flight, resolved within its ladder.
 - **An ack that has been outlived proves nothing.** The refusal needs a CURRENT
   answer, so every round of an unresolved peer carries one datagram at the rung
   already verified (the refresh rung) and `narrow_peers` requires an ack within

@@ -589,37 +589,42 @@ Written before the tag, per the release rule:
      still inside its fast ladder is mid-discovery: `verified == 1408` with
      the jumbo rungs in flight is the healthy state, and refusing it would
      fail-stop healthy nodes.
-   - **Silence never refuses.** A peer that has answered nothing (down, slow,
-     still replaying) says nothing about its path, so it only **holds
-     serving** — `can_serve` false, `/readyz` 503.
-     A node restarting into a degraded cluster keeps replicating and voting
-     instead of crash-looping under `systemd Restart=on-failure`. Silence does
-     not even HOLD: when every peer short of the rung is silent the gate
-     **passes unproven at once**, emitting one `Warn`
-     `jumbo_join_gate_passed_unproven` (`reason = no_evidence`) naming the
-     silent members and the committed rung. Holding on silence was tried first,
-     bounded by `JUMBO_GATE_WINDOW`, and is an availability bug in its own
-     right: `own_min_rung` is a minimum over ALL configured peers, so a
-     restarted node could not serve while any member was down — a rolling
-     restart of a 3-voter cluster with one dead host became an outage on a
-     cluster that still had quorum, and the `lin_v2` capstones (kill the leader,
-     wait for a serving survivor) had no servable node at all. Silence is no
-     evidence. The RESIDUAL, stated rather than waved at (review round 3,
-     minor 3): an unproven pass may leave a node serving that cannot carry the
-     committed rung, and only the LOCAL case is alerted — if this host's own
-     interface MTU is the narrow element, its large sends fail `EMSGSIZE` and
-     `Uc2PathBelowMtu` (critical) fires; a REMOTE narrow path produces no local
-     `EMSGSIZE` at all unless the route returns ICMP frag-needed and the kernel
-     lowers the path MTU, so it surfaces as a wedged replication path (that
-     peer's reported durable position stuck, `uc2_peer_replication_lag_bytes`
-     climbing, commit stalled if it is in the quorum) rather than as an alert.
-     A returning member runs its own `Joining` check, which tests the pair from
-     its side only if its probes resolve before it adopts the rung — one whose
-     archive already holds the rung can pass on `no_evidence` too.
-     What DOES hold serving is a peer ANSWERING below the rung — discovery in
-     flight — and that hold is bounded by `JUMBO_GATE_WINDOW` (30 s, the same
-     constant the force gate uses; `reason = window_expired`). A PROVEN-narrow
-     peer still refuses immediately, with no window.
+   - **Silence never refuses, and the pass is a QUORUM (amended
+     2026-09-12, the maintainer's call).** A peer that has answered nothing
+     (down, slow, still replaying) says nothing about its path, so it is never
+     narrow; a node restarting into a degraded cluster keeps replicating and
+     voting instead of crash-looping under `systemd Restart=on-failure`. The
+     gate PASSES once the voters this node's probes have proven the committed
+     rung to form a quorum with it — `proven + self_vote > voters / 2`, the
+     commit tracker's arithmetic; a joining learner has no self vote and
+     needs a plain majority of the voters; a learner peer's proof counts for
+     nothing — recorded as `jumbo_gate_passed` with `proven_voters`/`voters`.
+     Otherwise it HOLDS `can_serve` false, `/readyz` 503, with **no window**:
+     proof is a probe ack over the same UDP plane replication uses, from a
+     voter, so a node that cannot get one from a quorum of voters cannot get
+     commit acks from them either, and serving is leader-only, so a timed pass
+     would let it do nothing. The as-built history this replaces: holding on
+     silence until `own_min_rung` (a minimum over ALL configured peers) reached
+     the rung made a restarted node un-servable while ANY member was down — a
+     rolling restart of a 3-voter cluster with one dead host became an outage
+     on a cluster that still had quorum, and the `lin_v2` capstones (kill the
+     leader, wait for a serving survivor) had no servable node at all; the
+     review's fix was an **unproven pass** at once on silence
+     (`jumbo_join_gate_passed_unproven`, `reason = no_evidence`, or
+     `window_expired` after `JUMBO_GATE_WINDOW` on a mid-ladder hold), which
+     restored availability but gave up this section's promise — a
+     previously-proven member whose path degraded while it was down joined and
+     served, alerted only as a lagging peer. The quorum rule keeps the
+     availability (the survivors ARE the quorum, so the restarted one proves
+     the rung to the other within a probe round) and restores the promise
+     (that member finds every voter answering at the baseline, spends its
+     ladder, and refuses by name). `jumbo_join_gate_passed_unproven`,
+     `ProbeTable::answered_below` and `Joining`'s deadline are retired;
+     `JUMBO_GATE_WINDOW` is the force gate's alone. What holds serving besides
+     silence is a peer ANSWERING below the rung — discovery in flight — and a
+     PROVEN-narrow peer still refuses immediately, checked BEFORE the quorum
+     on every poll, so a proven quorum never excuses a member this node
+     provably cannot carry the rung to.
    - **The refusal needs CURRENT evidence, which is why every round carries the
      refresh rung.** `ProbeTable::due` appends the already-verified rung to
      every round of an unresolved peer (not only when its advertisement is

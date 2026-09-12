@@ -458,11 +458,11 @@ that node.
 `payload_ceiling_adopted` (info, every node, when the doors move),
 `datagram_mtu_not_a_rung` (warn — a rung off the ladder arrived in an
 installed artifact and was clamped), `jumbo_join_gate_armed` (warn) /
-`jumbo_gate_passed` (info) / `jumbo_join_gate_passed_unproven` (warn — the node
-serves without having proven the rung, either because every peer short of it is
-SILENT (`reason = no_evidence`, at once) or because a mid-ladder hold ran out
-(`reason = window_expired`, 30 s); the silent member ids are on the record), and
-the three fail-stop refusals
+`jumbo_gate_passed` (info — on the join path it carries `proven_voters` and
+`voters`, the quorum the pass was made on; a join gate never passes on
+silence or on a timer, it holds until a quorum of voters has proven the rung,
+with `uc2_jumbo_gate_pending = 1` meanwhile), and the three fail-stop
+refusals
 `jumbo_path_too_narrow` / `jumbo_peer_silent` / `path_below_committed_mtu`
 (error). A client over the standard ceiling emits
 `command_over_standard_ceiling` (warn, once per client) from whichever

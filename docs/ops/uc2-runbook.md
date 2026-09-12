@@ -263,26 +263,24 @@ verify rather than a build:
   for size); the node cannot tell the two apart, so the refusal names both.
   Fix the MTU and restart: the remedy is never a wipe, because nothing in the
   instance directory is wrong. A member that answers *nothing* (down, slow,
-  replaying) never refuses anything — the node keeps replicating and voting and
-  does not hold serving at all: if every member short of the rung is SILENT the
-  gate **passes unproven** at once (one warn record
-  `jumbo_join_gate_passed_unproven`, `reason = no_evidence`, naming the silent
-  member ids), so a **rolling restart on a cluster with one dead host is not an
-  outage** and a restarted survivor can serve immediately. Only a member that is
-  ANSWERING below the rung holds serving (`/readyz` 503) — discovery in flight,
-  which resolves within a probe ladder — and that hold is bounded at 30 s
-  (`reason = window_expired`). A peer that answered once and then stopped
-  answering is treated as silent, not narrow: the refusal needs a CURRENT answer
-  at a rung below the committed one. **The residual of an unproven pass**: the
-  node may serve without having proven the rung. If the narrow element is its own
-  interface MTU, its first large send fails `EMSGSIZE` and the critical
-  `Uc2PathBelowMtu` fires; if it is a REMOTE path, there is no local `EMSGSIZE`
-  to alert on (absent an ICMP frag-needed that lowers the path MTU) and the
-  symptom is a wedged replication path instead — that peer's reported durable
-  position stuck and `uc2_peer_replication_lag_bytes` climbing, with commit
-  stalled if it is in the quorum. So on an unexplained one-peer replication
-  stall on a jumbo cluster, check `uc2_probe_min_mtu_bytes` and the
-  `jumbo_join_gate_passed_unproven` records before anything else.
+  replaying) never refuses anything — the node keeps replicating and voting —
+  and it does not let the node serve on its own either: the gate **holds**
+  (`/readyz` 503, `uc2_jumbo_gate_pending = 1`) until the voters this node has
+  proven the rung to form a **quorum with it** — self plus one on three
+  voters, self plus two on four or five; a joining learner has no vote of its
+  own and needs a plain majority of the voters — and then passes with proof
+  (`jumbo_gate_passed`, with `proven_voters`/`voters` on the record). There is
+  no timer, and none is needed: a node that cannot get a probe ack from a
+  quorum of voters cannot get commit acks from them either. So a **rolling
+  restart on a cluster with one dead host is not an outage**: the restarted
+  survivor proves the rung to the other survivor within a probe round and
+  serves. A member ANSWERING below the rung holds serving the same way while
+  its ladder runs (~5 s), then refuses by name. A peer that answered once and
+  then stopped answering is treated as silent, not narrow: the refusal needs a
+  CURRENT answer at a rung below the committed one, and an outlived 1408 ack
+  is no proof of 8960 either. On a hold that does not clear, the
+  `jumbo_join_gate_armed` record names the committed rung; check
+  `uc2_probe_min_mtu_bytes` and which voters are up before anything else.
   `uc2ctl remove <dead-id>` is accepted while
   a gate is pending — admin handling keys on the leader flag, not on the gate.
   `uc2_jumbo_gate_pending` is `1` on a held node, which is what separates this

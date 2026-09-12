@@ -191,35 +191,43 @@ three of them are the kind of thing an operator will otherwise read as a defect:
    into the exported counter would make "discovery traffic emitted" unreadable on
    exactly the narrow path where it matters, and a refused probe is an expected
    part of the ladder there. §9's parenthetical is superseded.
-7. **The join gate has no window on its REFUSAL, and silence neither refuses
-   nor holds.** It fail-stops only
+7. **The join gate has no window on its REFUSAL, silence never refuses, and
+   the PASS is a quorum of voters.** It fail-stops only
    a peer that is *answering* below the committed rung **and** has spent its fast
    ladder — `verified == 1408` with the jumbo rungs in flight is the *healthy*
    mid-ladder state, and an earlier iteration that refused on it fail-stopped
-   healthy nodes into a `systemd Restart=on-failure` crash loop. A silent peer
-   passes the gate outright (one warn `jumbo_join_gate_passed_unproven`,
-   `reason = no_evidence`, naming the silent members): holding on silence was
-   tried, bounded at `JUMBO_GATE_WINDOW`, and is an availability bug of its own —
-   `own_min_rung` is a minimum over *all* configured peers, so one dead host made
-   every survivor's restart a 503 until it returned, turning a rolling restart
-   into an outage on a cluster that still had quorum and leaving the `lin_v2`
-   capstones with no servable node at all. Silence is no evidence. The residual
-   is stated rather than waved at: an unproven pass may serve a node that cannot
-   carry the rung, and only the LOCAL-interface case alerts — its own large sends
-   fail `EMSGSIZE` and `Uc2PathBelowMtu` (critical) fires — while a REMOTE narrow
-   path produces no local `EMSGSIZE` (absent ICMP frag-needed) and surfaces as a
-   wedged replication path: that peer stuck, `uc2_peer_replication_lag_bytes`
-   climbing, commit stalled if it is in the quorum. A returning member's own join
-   check catches the pair from its side only if its probes resolve before it
-   adopts the rung; one whose archive already holds the rung can pass on
-   `no_evidence` too. What does hold serving — bounded at 30 s,
-   `reason = window_expired` — is a peer ANSWERING below the rung. And the
+   healthy nodes into a `systemd Restart=on-failure` crash loop. It passes once
+   the voters this node's probes have proven the committed rung to form a
+   quorum **with it** (`proven + self_vote > voters / 2`, the commit tracker's
+   arithmetic; a joining learner has no self vote and needs a plain majority
+   of the voters; a learner peer's proof counts for nothing), logged as
+   `jumbo_gate_passed` with `proven_voters`/`voters`. Otherwise it holds, with
+   no timer — proof is a probe ack over the plane replication uses, from a
+   voter, so a node that cannot get one from a quorum cannot get commit acks
+   either, and serving is leader-only. The history behind that shape, in
+   order: holding until `own_min_rung` (a minimum over *all* configured peers)
+   reached the rung made one dead host turn every survivor's restart into a
+   503 until it returned — a rolling restart became an outage on a cluster
+   that still had quorum, and the `lin_v2` capstones had no servable node at
+   all; the review then passed the gate **unproven** at once on silence
+   (`jumbo_join_gate_passed_unproven`), which kept the availability but gave
+   up §5.4's promise, since a previously-proven member whose path degraded
+   while it was down joined and served, alerted only as a lagging peer; the
+   quorum rule (2026-09-12, the maintainer's call) keeps the availability —
+   the survivors *are* the quorum, so a restarted one proves the rung to the
+   other within a probe round — and restores the promise: that member finds
+   every voter answering at the baseline, spends its ladder, and refuses by
+   name. `jumbo_join_gate_passed_unproven`, `ProbeTable::answered_below` and
+   the join gate's deadline are retired; `JUMBO_GATE_WINDOW` is the force
+   gate's alone. What also holds serving is a peer ANSWERING below the rung,
+   discovery in flight, resolved within its ladder. And the
    refusal needs CURRENT evidence: every round carries the already-verified
    *refresh* rung and `narrow_peers` requires an ack within the last round or
    two, because a peer that answered once and then stopped (a killed member, or
    a restarted one whose pairwise crypto session is stale) is otherwise
    indistinguishable from a narrow path — which fail-stopped a healthy node on
-   loopback until this rule landed. One rule follows and
+   loopback until this rule landed (such an outlived 1408 ack is no proof of
+   8960 either, so it counts toward nothing). One rule follows and
    is not in the spec: a probe the **kernel refused for size spends its attempt**
    (a proven local fact, unlike the transient "no session yet", which is
    refunded) — otherwise a host whose own interface MTU is too small would pend

@@ -209,7 +209,9 @@ role, leader or follower — until every configured peer has proven the
 If 30 s (`JUMBO_GATE_WINDOW`, not configurable) elapses first, the node
 fail-stops with exit code 1 and one of two named refusals — **provided the
 cluster has not already committed a jumbo rung**. If it has, the join gate (§6)
-takes precedence and passes after 30 s of silence, logging `jumbo_join_gate_passed_unproven` instead.
+takes precedence: it holds until a quorum of voters has proven the committed
+rung and never fail-stops on silence, so a silent peer on such a cluster is a
+hold, not `jumbo_peer_silent`.
 
 | refusal | what it means | what to do |
 |---|---|---|
@@ -247,38 +249,37 @@ Three things to know about it:
   node cannot receive; nothing in its instance directory is wrong. Fix the
   MTU — on the peer's path *or on this host's own interface*, which the node
   cannot distinguish, hence the two-cause wording — and restart.
-- **Silence neither refuses nor holds.** A member that is down, slow, or still
-  replaying answers nothing, and nothing is known about its path — so it is
-  never "narrow", and it is not something waiting can turn into a verdict
-  either. If every member short of the rung is silent, the gate **passes
-  unproven** on the spot: the node serves and logs one warn record,
-  `jumbo_join_gate_passed_unproven` (`reason = no_evidence`), naming the silent
-  member ids and the committed rung. Holding instead was an availability bug in
-  both of its earlier forms — refusing crash-looped a restarted survivor, and
-  holding for 30 s left it at `/readyz` 503 until the dead member came back, so
-  a rolling restart (or a capstone that kills the leader and then waits for a
-  serving survivor) had no servable node at all, on a cluster that still had
-  quorum. **What the pass gives up, stated plainly**: this node may be serving
-  without having proven it can carry the committed rung, and the two shapes of
-  that are not equally visible. If the narrowness is THIS host's own interface
-  MTU, its own sends fail locally with `EMSGSIZE` as soon as a large frame has
-  to go out — `uc2_send_emsgsize_total` climbs and the critical
-  `Uc2PathBelowMtu` fires. If the narrowness is a REMOTE path, there is no local
-  `EMSGSIZE` (unless the route returns ICMP frag-needed and the kernel lowers
-  the path MTU), so it does not alert: it shows up as a replication path that
-  never makes progress — that peer's reported durable position stuck, its
-  `uc2_peer_replication_lag_bytes` climbing, commit stalled if it is in the
-  quorum. The residual is real, and the compensating facts are weaker than "it
-  is covered": a returning member runs its own join check, which catches the
-  pair from its side *if* its own probes resolve before it adopts the rung — a
-  member whose archive already holds the rung can pass on `no_evidence` too.
-- **A peer ANSWERING below the rung does hold serving, briefly.** That is
+- **Silence never refuses, and never passes either — the gate passes on a
+  quorum.** A member that is down, slow, or still replaying answers nothing,
+  and nothing is known about its path — so it is never "narrow". What ends
+  the hold is proof from enough voters: the gate passes once the voters this
+  node's probes have proven the committed rung to form a **quorum with this
+  node** — self plus one on three voters, self plus two on four or five. A
+  joining learner has no vote of its own, so it needs a plain majority of the
+  voters; a learner peer's proof counts for nothing, as its ack counts for
+  nothing at commit. The pass is logged as `jumbo_gate_passed` with
+  `proven_voters` and `voters` on the record. There is **no timer**, and none
+  is needed: proof is a probe ack over the same UDP plane replication uses,
+  from a voter, so a node that cannot get one from a quorum of voters cannot
+  get commit acks from them either, and serving is leader-only — a timed pass
+  would let it do nothing. The outage that once argued for a timer — one dead
+  voter out of three holding every restarted survivor at `/readyz` 503 until
+  it came back — cannot happen under this rule, because the two survivors
+  *are* the quorum: the restarted one proves the rung to the other within a
+  probe round and serves. The earlier iterations were the two availability
+  bugs this rule was built to avoid (refusing on silence crash-looped a
+  restarted survivor; holding on *every* peer made a dead host an outage), and
+  the unproven pass that briefly replaced them gave up the spec's promise: a
+  previously-proven member whose path degraded while it was down — a shrunk
+  interface MTU, the likeliest misconfiguration — joined and served, leaving a
+  mislabelled `Uc2PeerLagging` where a named refusal belonged. Under the
+  quorum rule that member finds every voter answering it at the baseline,
+  spends its ladder, and refuses by name (§6's remedy).
+- **A peer ANSWERING below the rung holds serving the same way.** That is
   discovery in flight — the baseline ack has landed and the jumbo rungs have
   not — and it resolves one way or the other within a probe ladder (five
-  attempts, ~5 s): either the jumbo ack lands and the gate passes, or the ladder
-  runs out and the node refuses by name. That hold is bounded at 30 s
-  (`JUMBO_GATE_WINDOW`, the same constant the force gate uses), after which the
-  gate passes unproven with `reason = window_expired`.
+  attempts, ~5 s): either the jumbo ack lands (and, with a quorum proven, the
+  gate passes), or the ladder runs out and the node refuses by name.
 - **A peer that answered once and then went quiet is silent, not narrow.** The
   refusal needs CURRENT evidence: every probe round carries one datagram at the
   rung the path is already known to carry, and a peer is only refused while it

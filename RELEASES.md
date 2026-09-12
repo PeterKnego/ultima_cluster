@@ -33,7 +33,10 @@ written.**
   obligation on every future leader), `max_payload` is gone from `node.toml`,
   the optional new `force_jumbo_frames` makes a jumbo path a startup
   requirement, and a node that cannot carry the committed rung refuses to join
-  by name instead of replicating what it cannot ship. **The raise is a one-way
+  by name instead of replicating what it cannot ship (one that has not yet
+  proven it holds `/readyz` at 503 until a quorum of voters has — so a dead
+  member never blocks a survivor's restart, and a member whose path shrank
+  while it was down is refused, not quietly served). **The raise is a one-way
   door**: the committed rung never lowers and has no opt-out, so from the first
   jumbo commit no member on a narrower path can ever join — an operator who will
   need one later keeps a narrow path in the cluster from the start. Eight new
