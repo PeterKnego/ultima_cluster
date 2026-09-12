@@ -46,11 +46,27 @@ pub struct PeerProbe {
     /// Probe rounds [`ProbeTable::due`] has handed out for this peer since it
     /// was last reset, whether or not they were answered. Compared against
     /// [`ProbeCadence::fast_attempts`] to pick the cadence, and by
-    /// [`ProbeTable::narrow_peers`] to tell "not proven yet" from "tried and
-    /// failed". [`ProbeTable::note_unsent_for`] gives one back.
+    /// [`PeerProbe::spent_fast_ladder`] to tell "not proven yet" from "tried
+    /// and failed". [`ProbeTable::note_unsent_for`] gives one back.
     pub attempts: u32,
+    /// LATCHED once [`ProbeTable::due`] has handed out the whole fast ladder
+    /// for this peer (`attempts >= cadence.fast_attempts`), and cleared only
+    /// by [`ProbeTable::set_peers`] FORGETTING the peer — the one event that
+    /// makes it new again (it comes back as `Default`). A retained peer keeps
+    /// the latch across a membership change, exactly as it keeps `verified`.
+    /// [`ProbeTable::narrow_peers`] reads THIS, not the live
+    /// `attempts` comparison, because [`ProbeTable::on_peer_seen`] resets
+    /// `attempts` to 0: a peer whose ladder was spent could be pulled back
+    /// under the threshold between two 100 ms gate polls, which delayed the
+    /// §5.4 refusal by another ladder's worth of seconds each time a `PROBE`
+    /// arrived. A latch is a statement about what WAS tried, which is what
+    /// the predicate means.
+    pub spent_fast_ladder: bool,
     /// When the next round for this peer is due, on the caller's clock. `0`
-    /// means "now" — the value a fresh, reset or refunded peer carries.
+    /// means "now" — the value a fresh or reset peer carries. A REFUNDED
+    /// round ([`ProbeTable::note_unsent_for`]) is rescheduled one `fast_ns`
+    /// tick out instead, so a session-less or dead peer cannot turn the
+    /// sender's pass into a busy loop.
     pub next_due_ns: u64,
 }
 
@@ -220,6 +236,13 @@ impl ProbeTable {
                 rungs.push(p.verified);
             }
             p.attempts += 1;
+            // The LATCH (review minor 6): "this peer's fast ladder has been
+            // handed out" is a fact about the past, so it is recorded here and
+            // cleared only by `set_peers`. A refund lowers `attempts` without
+            // unlatching — the rounds WERE issued, and a peer that never got a
+            // datagram out has `verified == 0`, which `narrow_peers` never
+            // reports whatever the latch says.
+            p.spent_fast_ladder |= p.attempts >= self.cadence.fast_attempts;
             let step = if p.attempts < self.cadence.fast_attempts {
                 self.cadence.fast_ns
             } else {
@@ -281,8 +304,9 @@ impl ProbeTable {
 
     /// Jumbo spec §5.4: the peers whose path is PROVEN narrower than
     /// `committed` — `0 < verified < committed` AND the peer is past its fast
-    /// ladder (`attempts >= cadence.fast_attempts`). Sorted by address, so the
-    /// answer is stable across calls and across nodes.
+    /// ladder ([`PeerProbe::spent_fast_ladder`], a latch rather than a live
+    /// `attempts` comparison: see that field for why). Sorted by address, so
+    /// the answer is stable across calls and across nodes.
     ///
     /// Both halves are load-bearing, and the second one is the whole reason
     /// this lives on the table rather than in the node:
@@ -301,14 +325,16 @@ impl ProbeTable {
     ///   out is what turns "not proven yet" into "tried and failed".
     ///
     /// The cadence is private to this type, which is why the predicate is here
-    /// and not at the call site.
+    /// and not at the call site — and why the spent-ladder half is a LATCH:
+    /// `on_peer_seen` puts `attempts` back to 0 on a peer that is alive but
+    /// still narrow, so a live comparison could be cleared between two of the
+    /// node's 100 ms gate polls and push the §5.4 refusal out by another
+    /// ladder every time a `PROBE` arrived.
     pub fn narrow_peers(&self, committed: u32) -> Vec<(SocketAddr, u32)> {
         let g = self.peers.lock().unwrap();
         let mut out: Vec<(SocketAddr, u32)> = g
             .iter()
-            .filter(|(_, p)| {
-                p.verified > 0 && p.verified < committed && p.attempts >= self.cadence.fast_attempts
-            })
+            .filter(|(_, p)| p.verified > 0 && p.verified < committed && p.spent_fast_ladder)
             .map(|(&addr, p)| (addr, p.verified))
             .collect();
         out.sort_unstable();
@@ -363,12 +389,23 @@ impl ProbeTable {
     /// whether the send succeeds, and moving that bookkeeping after the send
     /// would put the mutex back on the send path — the one thing plan 1's
     /// fast path removed.
-    pub fn note_unsent_for(&self, peer: SocketAddr) {
+    ///
+    /// `now_ns` is the SENDER PASS's clock reading (the same one it handed
+    /// `due`), and the peer stays SCHEDULED on it: the refunded round comes
+    /// back one `fast_ns` tick later, never immediately. An earlier revision
+    /// set `next_due_ns = 0` here, which republished `earliest_due_ns = 0` and
+    /// so handed the peer straight back to the very next sender pass: with
+    /// `[crypto] enabled = true` that made EVERY pass of the handshake (and
+    /// every pass for as long as a peer stayed down) take the table mutex
+    /// twice, allocate two `Vec`s, walk the peer map and attempt three
+    /// `assemble_probe`s, while `unsent()` climbed by millions per second and
+    /// stopped meaning anything. Refund the attempt, keep the cadence.
+    pub fn note_unsent_for(&self, peer: SocketAddr, now_ns: u64) {
         self.unsent.fetch_add(1, Ordering::Relaxed);
         let mut g = self.peers.lock().unwrap();
         if let Some(p) = g.get_mut(&peer) {
             p.attempts = p.attempts.saturating_sub(1);
-            p.next_due_ns = 0;
+            p.next_due_ns = now_ns + self.cadence.fast_ns;
         }
         self.publish_earliest(&g);
     }
@@ -468,16 +505,69 @@ mod tests {
     fn an_unsent_probe_does_not_spend_a_fast_attempt() {
         let t = ProbeTable::new(fast()); // fast_attempts: 2, fast_ns: 10
         t.set_peers(&[a(1)]);
-        for _ in 0..4 {
-            let due = t.due(0);
+        let mut now = 0;
+        for round in 0..4 {
+            let due = t.due(now);
             assert_eq!(due.len(), 1, "still due: nothing was ever sent");
-            t.note_unsent_for(a(1));
+            t.note_unsent_for(a(1), now);
+            // The attempt is REFUNDED but the peer stays SCHEDULED: the round
+            // comes back one fast tick later, not on the very next sender pass.
+            // Setting `next_due_ns = 0` here turned a session-less or dead peer
+            // into a per-pass busy loop — two mutex acquisitions, two `Vec`s
+            // and three `assemble_probe`s every pass, forever.
+            assert!(
+                t.due(now).is_empty(),
+                "round {round}: refunded, not re-due at the same instant"
+            );
+            assert!(
+                t.due(now + fast().fast_ns - 1).is_empty(),
+                "round {round}: nor anywhere inside the fast tick"
+            );
+            assert_eq!(
+                t.earliest_due_ns(),
+                now + fast().fast_ns,
+                "round {round}: the published fast path agrees"
+            );
+            now += fast().fast_ns;
         }
         assert_eq!(t.get(a(1)).unwrap().attempts, 0);
         assert_eq!(t.unsent(), 4);
         // Once a probe DOES go out, the cadence advances as before.
-        t.due(0);
+        t.due(now);
         assert_eq!(t.get(a(1)).unwrap().attempts, 1);
+    }
+
+    /// Review minor 6: the spent-ladder half of `narrow_peers` is a LATCH, so
+    /// an `on_peer_seen` reset (a `PROBE` from a live but still-narrow peer)
+    /// cannot take a proven-narrow peer back out of the refusing set. Before
+    /// the latch this cleared the predicate for another whole ladder each time
+    /// a probe arrived, delaying §5.4's refusal by ~5 s a round.
+    #[test]
+    fn a_spent_fast_ladder_latches_through_an_on_peer_seen_reset() {
+        let t = ProbeTable::new(fast()); // fast_attempts = 2
+        t.set_peers(&[a(1)]);
+        t.due(0);
+        t.on_ack(a(1), 1408, 1408);
+        t.due(10); // attempts = 2: the ladder is spent
+        assert_eq!(t.narrow_peers(8960), vec![(a(1), 1408)]);
+
+        t.on_peer_seen(a(1)); // alive — back to the fast cadence
+        assert_eq!(t.get(a(1)).unwrap().attempts, 0, "the cadence did reset");
+        assert!(
+            t.get(a(1)).unwrap().spent_fast_ladder,
+            "but the fact that the ladder was tried is latched"
+        );
+        assert_eq!(
+            t.narrow_peers(8960),
+            vec![(a(1), 1408)],
+            "so the peer stays proven-narrow"
+        );
+
+        // Forgetting the peer is the one thing that makes it new again.
+        t.set_peers(&[]);
+        t.set_peers(&[a(1)]);
+        assert_eq!(t.get(a(1)).unwrap(), PeerProbe::default());
+        assert!(t.narrow_peers(8960).is_empty());
     }
 
     #[test]

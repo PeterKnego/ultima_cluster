@@ -104,6 +104,7 @@ pub const CONTRACT_SERIES: &[&str] = &[
     "uc2_probe_acked_total",
     "uc2_send_emsgsize_total",
     "uc2_commands_over_standard_total",
+    "uc2_jumbo_gate_pending",
     "uc2_output_completed_bytes",
     "uc2_output_progress_bytes",
     "uc_node_snapshot_floor_bytes",
@@ -899,6 +900,17 @@ fn push_service_families(out: &mut String, s: &ObsSources, commit: u64, now: u64
         "Frames this node appended above the standard 1312 B ceiling: nonzero means this deployment now depends on jumbo-frame support (jumbo spec §8). Leader-only by construction — only a leader appends — so read it summed across the fleet.",
         s.commands_over_standard.load(Ordering::Relaxed),
     );
+    // Review minor 9: the same `AtomicBool` `/readyz` reads, as a gauge, so a
+    // HELD node is visible fleet-wide and `Uc2LeaderNotServing` can tell its
+    // two causes apart (an uncommitted `NewTerm` vs. a pending jumbo gate). No
+    // new cnc word: the flag is process-local state the consensus agent
+    // publishes into `ObsSources` every pass.
+    push_gauge(
+        out,
+        "uc2_jumbo_gate_pending",
+        "1 while a jumbo startup gate is PENDING on this node — it is replicating and voting but not serving (`/readyz` 503), either because force_jumbo_frames is set and a peer has not proven the rung, or because the cluster committed a rung this node has not proven yet (jumbo spec §6/§5.4). 0 once the gate passes, and 0 on a node with no gate installed.",
+        u64::from(s.jumbo_gate_pending.load(Ordering::Acquire)),
+    );
 }
 
 /// Render the full M10 series contract over one snapshot of `s`'s `Arc`s
@@ -1630,6 +1642,26 @@ mod tests {
         assert!(CONTRACT_SERIES.contains(&"uc2_log_clock_smear_ns"));
     }
 
+    /// Review minor 9: the jumbo startup gate, as a gauge — the same
+    /// `AtomicBool` `/readyz` keys on, so a HELD node is visible fleet-wide and
+    /// `Uc2LeaderNotServing`'s two causes can be told apart. No new cnc word.
+    #[test]
+    fn the_jumbo_gate_pending_gauge_renders_the_flag_both_ways() {
+        let s = synthetic_sources();
+        assert!(
+            render_prometheus(&s).contains("\nuc2_jumbo_gate_pending 0\n"),
+            "a node with no gate reads 0"
+        );
+        s.jumbo_gate_pending.store(true, Ordering::Release);
+        let text = render_prometheus(&s);
+        assert!(
+            text.contains("\n# TYPE uc2_jumbo_gate_pending gauge\n"),
+            "{text}"
+        );
+        assert!(text.contains("\nuc2_jumbo_gate_pending 1\n"), "{text}");
+        assert!(CONTRACT_SERIES.contains(&"uc2_jumbo_gate_pending"));
+    }
+
     /// Final wave M5 (parked as T8): [`SnapshotFreezeStats`]'s edge detection
     /// is subtle enough that a regression would only show up on a fleet run —
     /// the reset-on-instant-advance, the no-double-count-on-equal-values
@@ -1694,7 +1726,7 @@ mod tests {
     fn the_contract_has_the_number_of_families_the_docs_state() {
         assert_eq!(
             CONTRACT_SERIES.len(),
-            107,
+            108,
             "if this is intentional, update the family count in \
              docs/how-to/monitor-a-cluster.md in the same commit"
         );

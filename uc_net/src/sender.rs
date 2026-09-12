@@ -901,7 +901,11 @@ impl Sender {
         let Some(table) = self.probe.as_ref() else {
             return false;
         };
-        let due = table.due(self.now_ns());
+        // One clock read for the whole pass: `due` schedules off it, and so
+        // does the give-back below — a refunded round must come back one fast
+        // tick later, not on the next pass (`ProbeTable::note_unsent_for`).
+        let now_ns = self.now_ns();
+        let due = table.due(now_ns);
         if due.is_empty() {
             return false;
         }
@@ -966,8 +970,9 @@ impl Sender {
                 // case), or every assembled rung failed on some other errno
                 // (`ENOBUFS`, a transient route error), neither of which says
                 // anything about the path. Give the round's one attempt back,
-                // once for the round.
-                table.note_unsent_for(peer);
+                // once for the round — and on THIS pass's clock, so the peer
+                // stays on its fast cadence instead of coming back every pass.
+                table.note_unsent_for(peer, now_ns);
             }
         }
         true
@@ -2402,6 +2407,21 @@ mod tests {
             s.stats().probe_emsgsize.load(Ordering::Relaxed),
             0,
             "and the kernel never refused anything — it was never asked"
+        );
+
+        // Review round 4, Important 1: the refund must not make the peer due
+        // AGAIN on the very next pass. It did, through `next_due_ns = 0`, and
+        // with crypto on that is every pass of the handshake — two mutex
+        // acquisitions, two `Vec`s and three `assemble_probe`s per pass, with
+        // `unsent()` climbing by millions per second. The default cadence's
+        // `fast_ns` is 1 s, so these back-to-back passes must do nothing.
+        for _ in 0..64 {
+            s.do_work();
+        }
+        assert_eq!(
+            t.unsent(),
+            1,
+            "the refunded round is rescheduled one fast tick out, not re-run every pass"
         );
     }
 
