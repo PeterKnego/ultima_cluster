@@ -83,6 +83,14 @@ ROW_D_FORCE_REASON_SILENT = "jumbo_peer_silent"
 ROW_D_JOIN_REASON = "path_below_committed_mtu"   # named for completeness only —
                                                   # row d does not exercise this gate
 
+# Process exit codes (fix round 1: a verdict must reach the exit code, and
+# "not run" must be distinct from "passed" — see `exit_code_for_results`).
+# FAIL takes precedence over NOT-RUN, which takes precedence over PASS, so a
+# wrapper reading `$?` alone still gets the worst finding across every arm.
+EXIT_PASS = 0
+EXIT_FAIL = 1
+EXIT_NOT_RUN = 2
+
 METRICS_PORT_DEFAULT = tt.METRICS_PORT_DEFAULT
 
 # Jumbo needs a REAL `uc2-node` daemon configured by a TOML file, not a gate
@@ -377,6 +385,47 @@ def report_row_f(ratio_pct, control_ratio_pct):
            "REPORTED, NO BAR")
 
 
+# ============================================================== exit code
+#
+# Fix round 1 (Important 1): no arm's verdict used to reach the process exit
+# code, so `--fleet --arms b,c,d` (three print-only stubs) and `--arms a`
+# with a genuine miss were both invisible to `$?` — a wrapper or a human
+# reading only the exit code could not tell a no-op stub run from a passing
+# gate. `exit_code_for_results` is the pure mapping from "one outcome per
+# requested arm" to a process exit code, so `--selftest` can pin the mapping
+# itself with no fleet involved.
+
+def exit_code_for_results(results):
+    """`results`: `{arm: Verdict | None}`, one entry per REQUESTED arm.
+    `None` means "no verdict was produced" (a stub, or a probe that aborted
+    before producing one) — NOT-RUN, distinct from both PASS and FAIL.
+
+    Precedence, worst finding wins, so `$?` alone carries the whole story:
+
+        any Verdict with passed=False  -> EXIT_FAIL (1)
+        else any arm is None           -> EXIT_NOT_RUN (2)
+        else (every arm passed, or none were requested) -> EXIT_PASS (0)
+    """
+    if any(v is not None and not v.passed for v in results.values()):
+        return EXIT_FAIL
+    if any(v is None for v in results.values()):
+        return EXIT_NOT_RUN
+    return EXIT_PASS
+
+
+def print_summary(results):
+    print("\nJUMBO GATE — SUMMARY")
+    for arm, v in sorted(results.items()):
+        if v is None:
+            print(f"  [NOT RUN] arm {arm}")
+        else:
+            print(f"  [{'PASS' if v.passed else 'FAIL'}] arm {arm}: {v.row} — {v.detail}")
+    code = exit_code_for_results(results)
+    label = {EXIT_PASS: "PASS", EXIT_FAIL: "FAIL", EXIT_NOT_RUN: "NOT RUN"}[code]
+    print(f"RESULT: {label} (exit {code})")
+    return code
+
+
 # ================================================================ selftest
 
 def selftest():
@@ -527,6 +576,29 @@ def selftest():
     check("row d missing a node in the force arm",
           verdict_row_d({k: v for k, v in list(force_ok.items())[:2]}, silent_ok).passed, False)
 
+    # ------------------------------------------------------- exit code
+    # Fix round 1 (Important 1): the mapping from per-arm results to a
+    # process exit code, pinned directly — a FAIL verdict anywhere maps to
+    # 1, a NOT-RUN (None) anywhere (with no FAIL) maps to 2, and an
+    # all-pass (or empty) result set maps to 0. FAIL beats NOT-RUN beats
+    # PASS, so the worst finding always wins the exit code.
+    pass_v = Verdict("x", True, "ok")
+    fail_v = Verdict("y", False, "bad")
+    check("exit code: all pass", exit_code_for_results({"a": pass_v, "e": pass_v}), EXIT_PASS)
+    check("exit code: no arms requested", exit_code_for_results({}), EXIT_PASS)
+    check("exit code: one fail", exit_code_for_results({"a": pass_v, "b": fail_v}), EXIT_FAIL)
+    check("exit code: one not-run, no fail", exit_code_for_results({"a": pass_v, "b": None}), EXIT_NOT_RUN)
+    check("exit code: all not-run", exit_code_for_results({"b": None, "c": None}), EXIT_NOT_RUN)
+    check("exit code: fail beats not-run",
+          exit_code_for_results({"a": fail_v, "b": None}), EXIT_FAIL)
+    check("exit code labels distinct", len({EXIT_PASS, EXIT_FAIL, EXIT_NOT_RUN}), 3)
+
+    # A stub arm (returns None, per the fix-round finding that b/c/d/e/f
+    # print-only stubs must never be mistaken for a pass) must map to
+    # NOT-RUN on its own, with no other arms requested.
+    check("exit code: a single stub arm alone is NOT-RUN",
+          exit_code_for_results({"b": None}), EXIT_NOT_RUN)
+
     for f in fails:
         print(f"SELFTEST FAIL {f}")
     print(f"SELFTEST: {len(fails)} failure(s)")
@@ -658,18 +730,42 @@ def run_arm_b(hosts, args):
          "64 B throughput run, fed to verdict_row_b). Not run by this task.")
 
 
-def run_arm_c(hosts, args):
-    """Row c: the envelope-map brief's own soak (spec §10 row c). Procedure
-    (gate doc step 3): `check_blackhole_probe` first (abort loudly if the
-    jumbo arm never clears 8832 within 30 s), then the brief's own soak on
-    both the jumbo and standard arms, feeding the plateau delta and the 64 B
-    rung's throughput/p99 deltas to `verdict_row_c`. Not implemented as an
-    unattended one-shot here — the brief's soak procedure (§3-§5) is its own
-    multi-hour driver, not a systemd-run one-liner; see the gate doc's step
-    3."""
-    print("row c: see the gate doc's 'When this gate is run' step 3 "
-         "(check_blackhole_probe, then the envelope-map brief's own soak, "
-         "fed to verdict_row_c). Not run by this task.")
+def run_arm_c(hosts, args, window_secs=ROW_C_BLACKHOLE_WINDOW_SECS, min_rung=JUMBO_MIN_RUNG):
+    """Row c: the envelope-map brief's own soak (spec §10 row c).
+
+    Fix round 1 (Important 2): the pre-arm blackhole probe is the ONE part
+    of this arm that is real, wired first, before any soak work — a stub
+    that only printed the procedure (as the rest of this arm still does)
+    left "abort loudly" reachable only from `--selftest`, which is exactly
+    the failure mode the brief's blackhole-probe requirement exists to
+    prevent. This function actually samples every host's
+    `uc2_datagram_mtu_bytes` over `window_secs` and calls
+    `check_blackhole_probe`; a jumbo arm that never clears the jumbo
+    minimum returns a FAIL `Verdict` (which reaches the process exit code
+    via `exit_code_for_results` — see `main`) instead of falling through to
+    the soak. The soak orchestration itself (spec §10 row c / the brief's
+    §3-§5) stays a stub: it is its own multi-hour driver, not a
+    systemd-run one-liner, and is out of this task's scope."""
+    deadline = time.time() + window_secs
+    observed = {}
+    while time.time() < deadline:
+        for h in hosts:
+            m = scrape_prom(h)
+            v = read_gauge(m, "uc2_datagram_mtu_bytes")
+            if v is not None:
+                observed[h.public_ip] = int(v)
+        if len(observed) == len(hosts) and all(v >= min_rung for v in observed.values()):
+            break
+        time.sleep(1.0)
+    ok, msg = check_blackhole_probe(observed, window_secs=window_secs, min_rung=min_rung)
+    if not ok:
+        print(f"[FAIL] row c blackhole probe (pre-arm) — {msg}", flush=True)
+        return Verdict("c blackhole probe (pre-arm)", False, msg)
+    print(f"[OK] row c blackhole probe (pre-arm) — {msg}", flush=True)
+    print("row c: blackhole probe cleared; the envelope-map brief's own soak "
+         "is not implemented as an unattended one-shot here — see the gate "
+         "doc's 'When this gate is run' step 3. Not run by this task.")
+    return None  # NOT-RUN: the probe is real; the soak beyond it is not.
 
 
 def run_arm_d(hosts, args):
@@ -716,8 +812,26 @@ ARM_RUNNERS = {
 }
 
 
+# Arms b/c/d need real fleet hosts (a node.toml, a systemd unit, a
+# /metrics scrape); e/f run a local/dev-box harness against binaries the
+# caller names and need no host discovery at all — so `--fleet --arms f`
+# must not pay for (or require) terraform state it will never use.
+ARMS_NEEDING_HOSTS = frozenset({"a", "b", "c", "d"})
+
+
 def main():
-    ap = argparse.ArgumentParser(description="Jumbo-frame discovery fleet gate driver")
+    ap = argparse.ArgumentParser(
+        description="Jumbo-frame discovery fleet gate driver",
+        epilog="Exit codes: 0 = every requested arm PASSED (or none were "
+               "requested); 1 = FAIL — at least one requested arm's Verdict "
+               "had passed=False (a bar was missed, or row c's pre-arm "
+               "blackhole probe aborted); 2 = NOT RUN — at least one "
+               "requested arm produced no Verdict (a print-only stub) and "
+               "none FAILED. FAIL always outranks NOT RUN, which always "
+               "outranks PASS, so a wrapper reading $? alone gets the worst "
+               "finding across every requested arm — see exit_code_for_results.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     ap.add_argument("--selftest", action="store_true",
                     help="adjudicate canned inputs through the row arithmetic and exit "
                          "(no fleet, no ssh, no cargo)")
@@ -739,20 +853,30 @@ def main():
     unknown = [x for x in arms if x not in ("a", "b", "c", "d", "e", "f")]
     if unknown:
         ap.error(f"unknown arm(s): {unknown} (valid: a,b,c,d,e,f)")
+    if not arms:
+        ap.error("--fleet requires --arms (comma-separated subset of: a,b,c,d,e,f)")
 
-    hosts = m6.build_fleet_hosts(m12.BUILT_GATE, a.ssh_user, a.ssh_key, a.hosts,
-                                 count=a.nodes, unit_prefix=m12.UNIT_PREFIX,
-                                 remote_root=m12.REMOTE_ROOT, probe_bin=m12.BUILT_PROBE)
+    # MINOR (fix round 1): skip host discovery entirely when no requested
+    # arm needs it, so `--fleet --arms f` neither pays for terraform-output
+    # discovery nor fails when no fleet state exists.
+    hosts = None
+    if ARMS_NEEDING_HOSTS.intersection(arms):
+        hosts = m6.build_fleet_hosts(m12.BUILT_GATE, a.ssh_user, a.ssh_key, a.hosts,
+                                     count=a.nodes, unit_prefix=m12.UNIT_PREFIX,
+                                     remote_root=m12.REMOTE_ROOT, probe_bin=m12.BUILT_PROBE)
+
+    # Important 1 (fix round 1): collect every requested arm's outcome and
+    # let it reach the exit code — a runner that returns `None` (a
+    # print-only stub, or row c's probe having nothing further to run) is
+    # NOT-RUN, distinct from both PASS and FAIL; a runner that returns a
+    # `Verdict` contributes its `passed` bit. Previously no return value was
+    # ever inspected, so a stub run and a passing gate both exited 0.
+    results = {}
     for arm in arms:
-        runner = ARM_RUNNERS.get(arm)
-        if runner is None:
-            print(f"arm {arm} is not implemented in this driver yet — see the gate "
-                 "doc's 'When this gate is run' for its procedure", flush=True)
-            continue
-        if arm in ("e", "f"):
-            runner(a)
-        else:
-            runner(hosts, a)
+        runner = ARM_RUNNERS[arm]
+        results[arm] = runner(a) if arm in ("e", "f") else runner(hosts, a)
+
+    sys.exit(print_summary(results))
 
 
 if __name__ == "__main__":

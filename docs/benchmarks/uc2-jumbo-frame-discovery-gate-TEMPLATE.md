@@ -208,6 +208,20 @@ section and the bar table's result column is updated to point here.
 
 ## When this gate is run
 
+**The driver's exit code carries the worst finding across every requested
+arm — read it before reading anything else** (fix round 1, plan 2 Task 5
+review): `jumbo_gate.py --fleet --arms ...` exits **0** only when every
+requested arm produced a passing `Verdict`; **1 (FAIL)** when any requested
+arm's `Verdict` missed its bar (a bar miss, or row c's pre-arm blackhole
+probe aborting); **2 (NOT RUN)** when at least one requested arm produced no
+`Verdict` at all (a print-only stub, per this driver's current scope) and
+none of the others FAILED. FAIL always outranks NOT RUN, which always
+outranks PASS (`exit_code_for_results`, pinned by `--selftest`), so a CI
+step or a human reading only `$?` can never mistake a stub run for a pass —
+which is exactly the confusion the fix exists to close. Every invocation
+also prints a `JUMBO GATE — SUMMARY` block naming each requested arm's
+outcome (`[PASS]`/`[FAIL]`/`[NOT RUN]`) before exiting.
+
 1. **Row a.** Provision 3 voters on the fleet's jumbo-MTU (9001) shape,
    start all three from cold with `force_jumbo_frames = false`, and record
    every node's `uc2_datagram_mtu_bytes` sampled at least once a second from
@@ -228,12 +242,18 @@ section and the bar table's result column is updated to point here.
    preliminary run to measure the base tree's own spread, then
    `required_pairs(...)` more pairs (floor 5) to resolve the −3 % bar.
    Feed all four into `verdict_row_b`.
-3. **Row c.** Run the envelope-map brief's own soak procedure (its §3-§5)
-   on the AWS/9001 arm and the standard/1408 arm, having FIRST confirmed
-   with `check_blackhole_probe` (sample every node's
-   `uc2_datagram_mtu_bytes` 30 s after start) that the jumbo arm actually
-   cleared 8832 — abort loudly and re-provision if not. Feed the two arms'
-   plateau and 64 B rung numbers into `verdict_row_c`.
+3. **Row c.** `run_arm_c` runs the pre-arm blackhole probe FOR REAL as its
+   first step (fix round 1, Important 2 — this is wired, not a stub):
+   it samples every node's `uc2_datagram_mtu_bytes` for up to 30 s and calls
+   `check_blackhole_probe`; a jumbo arm that never clears 8832 returns a
+   FAIL `Verdict` naming the offending host(s) and the arm stops there —
+   `jumbo_gate.py --fleet --arms c ...` exits 1, never silently proceeding
+   to the soak on a blackholed path. Once the probe clears, run the
+   envelope-map brief's own soak procedure (its §3-§5) on the AWS/9001 arm
+   and the standard/1408 arm by hand (this part of the arm is still a
+   stub — it prints the procedure and returns no `Verdict`, i.e. NOT RUN,
+   not a pass) and feed the two arms' plateau and 64 B rung numbers into
+   `verdict_row_c`.
 4. **Row d.** Arm 1: all three nodes, `force_jumbo_frames = true`, on the
    1500 B path; record each node's fail-stop reason, elapsed time from
    start, and named peer from its `obs_event!` line / exit log. Arm 2: two
