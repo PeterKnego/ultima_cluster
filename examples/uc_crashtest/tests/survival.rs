@@ -183,12 +183,14 @@ struct CasLoad {
 impl CasLoad {
     /// Stop the loop and join it — panics (propagated) if the loop itself
     /// panicked, i.e. if it ever observed an unexpected `CasResult(false)`.
+    /// Bounded (backlog 2026-09-08, alongside `remote_lin.rs`'s): each CAS
+    /// is deadlined at 10 s through `submit_until_ok`, so 60 s after `stop`
+    /// a loop still running is wedged, and this fails naming it instead of
+    /// holding the `survival` job to its 30-minute cancellation.
     fn stop_and_join(mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        if let Some(h) = self.handle.take()
-            && let Err(e) = h.join()
-        {
-            panic::resume_unwind(e);
+        if let Some(h) = self.handle.take() {
+            join_within(h, "CAS-chain load", Duration::from_secs(60));
         }
     }
 }

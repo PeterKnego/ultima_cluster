@@ -15,9 +15,11 @@ fails with a location instead of a cancellation.
 As built: `common::join_within(handle, label, timeout)` polls
 `JoinHandle::is_finished` and panics naming the label at the deadline (the
 thread is abandoned; the panic ends the test and the process exit ends the
-thread) — workers get 90 s and the chaos thread 60 s after `stop`, each
+thread) — workers get 90 s and the chaos thread 150 s after `stop`, each
 several times its longest single blocking step, derived at the constants
-`WORKER_JOIN_BUDGET` / `CHAOS_JOIN_BUDGET`. `Reap::drop` now uses the
+`WORKER_JOIN_BUDGET` / `CHAOS_JOIN_BUDGET` (the chaos budget composes with
+two bounded reaps plus the restart wait). The hard-crash and survival suites'
+own worker joins take the same helper at 60 s. `Reap::drop` now uses the
 `poll_exit` idiom that `enospc.rs` already had (moved to `common`) with a
 30 s `REAP_TIMEOUT`, then reports the pid and abandons the child rather than
 blocking in `wait()`. Every crashtest suite shares `Reap`, so all of them get

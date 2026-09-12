@@ -194,10 +194,15 @@ impl Drop for Reap {
     fn drop(&mut self) {
         let _ = self.0.kill();
         if poll_exit(&mut self.0, REAP_TIMEOUT).is_none() {
-            eprintln!(
+            // `writeln!` with the result dropped, not `eprintln!`: this runs
+            // in a `Drop` that may be unwinding, and `eprintln!` panics on a
+            // stderr write failure — a double panic is an abort.
+            use std::io::Write;
+            let _ = writeln!(
+                std::io::stderr(),
                 "[common] child pid {} did not become reapable within {:?} after SIGKILL — \
-                 abandoning it unreaped (a kernel-side stall, not a test defect; the test \
-                 binary's exit reaps it)",
+                 abandoning it (still running in the kernel's eyes: a D-state stall, not a \
+                 test defect; init reaps it after this binary exits)",
                 self.0.id(),
                 REAP_TIMEOUT
             );

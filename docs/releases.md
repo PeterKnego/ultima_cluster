@@ -314,9 +314,10 @@ never as a bar (CLAUDE.md's benchmarking discipline).
 
 ### Fixed after the `2.11.0` tag
 
-Both fixes landed between the log clock and the jumbo work, and both are in the
-same family: a reader decoding the cnc page of a node that is (re)starting
-underneath it.
+The first two fixes landed between the log clock and the jumbo work, and both
+are in the same family: a reader decoding the cnc page of a node that is
+(re)starting underneath it. The third, the bounded test-harness waits, is the
+other half of the same nightly investigation.
 The full analysis — the fix, the six call sites, the two halves of the torn
 window, and the boot gap found by reviewing the first fix — is written up under
 `2.11.0`, where the panic shipped as a recorded known issue:
@@ -346,10 +347,13 @@ In short:
 **The three unbounded waits in `examples/uc_crashtest/tests/remote_lin.rs`
 that turned the flaky panic into a 58-minute nightly hang on 2026-09-08 are
 BOUNDED in this release** (2026-09-12, `docs/BACKLOG.md`'s first entry): the
-worker and chaos joins through `common::join_within` (90 s / 60 s after
-`stop`, panicking with the thread's label), and every crashtest suite's
-`Reap::drop` through a 30 s `poll_exit` that reports the pid and abandons a
-child that never becomes reapable instead of blocking in `wait()`. This is a
+worker and chaos joins through `common::join_within` (90 s / 150 s after
+`stop`, panicking with the thread's label — the chaos budget sits above two
+bounded reaps plus the 15 s restart wait, so a stalled reap is blamed on the
+reap, not the thread), the hard-crash and survival suites' own worker joins
+through the same helper (60 s), and every crashtest suite's `Reap::drop`
+through a 30 s `poll_exit` that reports the pid and abandons a child that
+never becomes reapable instead of blocking in `wait()`. This is a
 diagnosability fix, not a cure: the hang's cause is still unexplained, and the
 next occurrence now fails with a name and a location instead of cancelling
 the whole nightly.
@@ -1431,8 +1435,9 @@ set and a harness page. Pre-existing since M14a (`2.8.0`).
 **Still unexplained, and deliberately not claimed as fixed by the above:** the
 58-minute HANG. This panic explains the failure, not a stall — every wait in
 the test body is deadlined (30 s settle, 60 s final read). Three waits were
-NOT bounded (they are since 2026-09-12 — see the `2.12.0` section's fixed-bugs
-list) and were the only places a 60-minute stall could live: the worker
+NOT bounded (they are since 2026-09-12 — see
+[Fixed after the `2.11.0` tag](#fixed-after-the-2110-tag)) and were the only
+places a 60-minute stall could live: the worker
 `join()`, the chaos `join()`, and `Reap::drop`'s `kill(); wait()`, which
 returns immediately for a SIGKILLed child unless it is in uninterruptible
 sleep. Bounding those would make the next occurrence fail fast WITH a location

@@ -645,11 +645,16 @@ fn spawn_workers2(
         .collect()
 }
 
+/// Bounded (backlog 2026-09-08, alongside `remote_lin.rs`'s): every op in
+/// `worker`/`worker2` is deadlined at 15 s (`submit_cmd`/`read_leader`) on
+/// top of the 1.5 s client timeout, so a worker still running 60 s after
+/// `stop` is wedged, and this fails naming it instead of holding the
+/// nightly's `crashtest` job to its 60-minute cancellation.
+const WORKER_JOIN_BUDGET: Duration = Duration::from_secs(60);
+
 fn join_workers(handles: Vec<std::thread::JoinHandle<()>>) {
-    for h in handles {
-        if let Err(e) = h.join() {
-            std::panic::resume_unwind(e);
-        }
+    for (w, h) in handles.into_iter().enumerate() {
+        join_within(h, &format!("worker {w}"), WORKER_JOIN_BUDGET);
     }
 }
 
@@ -2199,9 +2204,9 @@ fn two_fsm_timer_service_sigkill() {
 
     std::thread::sleep(Duration::from_secs(1));
     stop.store(true, Ordering::Relaxed);
-    if let Err(e) = handle.join() {
-        std::panic::resume_unwind(e);
-    }
+    // Every op in the mixed loop is deadlined at 10 s; bounded like
+    // `join_workers`.
+    join_within(handle, "mixed timer/register worker", WORKER_JOIN_BUDGET);
 
     let report = timer_report_until_ok(&inst, Instant::now() + Duration::from_secs(30));
     let stats = assert_timer_report("two_fsm_timer_service_sigkill", &report, &[]);
