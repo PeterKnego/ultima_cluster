@@ -87,12 +87,13 @@ invites. Run both through the gate discipline.
     envelope's extra 16 B.
 - **Cost:** moderate. **Output:** a backlog grounded in use, plus the two
   decisions above.
-- **Status 2026-09-01: brainstormed and PARKED** — decisions (KV store,
-  Go in a separate repo, docs-sufficiency bar, clean-room build, op set,
-  wire format, state machine) are recorded in
-  `docs/superpowers/specs/2026-09-01-uc2-dogfood-kv-and-go-client-brief.md`;
-  the maintainer paused to add features to UC first. Resume from that
-  brief's "Where the design stopped".
+- **Status 2026-09-13: TAKEN UP as a wayfinder map** (issue tracker,
+  label `wayfinder:map`), rescoped as a two-track experience assessment —
+  a clean-room builder and a clean-room operator on a real fleet, UC
+  frozen at 2.12.0. Charter with all eighteen charting decisions:
+  `docs/superpowers/specs/2026-09-13-uc2-dogfood-kv-charter.md`; the Go
+  client is **out of scope** for this map. The 2026-09-01 brief's
+  decisions stand except its wire format, withdrawn.
 
 ### 2. Schedule-table and timer follow-ons
 

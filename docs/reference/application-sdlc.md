@@ -76,6 +76,14 @@ For these, the standard is: property-based tests as the everyday gate, with form
 
 ## 5. Rollout Phase
 
+> **Status at 2.12.0.** This section describes the target, not the current
+> release. A rolling upgrade of an application is not yet supported: a state
+> machine's `VERSION` is compared for equality on the snapshot path only, two
+> versions on the live commit path are not detected, and an application
+> upgrade today is a flag day. Rolling upgrades are planned for a coming
+> release (`docs/BACKLOG.md` item 3, "Rolling upgrades and leadership
+> transfer").
+
 - **Canary first.** New state machine versions deploy to a non-voting learner node before promotion to voter status.
 - **Mixed-version tolerance.** Every change must specify whether the cluster can run mixed versions during rollout, and for how long.
 - **Rollback plan.** Documented and tested — not just "redeploy old binary," but what happens to state written by the new version if rolled back.
