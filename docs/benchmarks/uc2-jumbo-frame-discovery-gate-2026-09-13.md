@@ -15,7 +15,9 @@ pre-committed pair rule asked for 29 pairs, 12 were run, the paired mean sits
 0.8 pp below the bar inside a ±15 pp band) — recorded as the driver's FAIL,
 bar unmoved; row **c** NOT RUN (its blackhole probe cleared; the soak's
 instrument was never built — the maintainer's call, 2026-09-12); rows **e**
-and **f** reported, no bar.
+and **f** reported, no bar. The driver's own exit verdicts: `--arms a,c,d`
+→ `RESULT: NOT RUN (exit 3)` (row c's stub outranks the two passes);
+`--arms b` → `RESULT: FAIL (exit 1)`.
 
 > **Decide rule committed before any run.** This document's bar table is
 > committed, with every result cell **UNRUN**, before any fleet run against
@@ -236,8 +238,14 @@ two builds of the same source at two different absolute paths (sha256
 ### Row a
 
 **PASS.** Three cold starts from wiped instance dirs; every node reported
-`uc2_datagram_mtu_bytes = 8960` within the window, and the adoption times
-were identical across reps to a tenth of a second:
+`uc2_datagram_mtu_bytes = 8960` within the window. The times below are
+**upper bounds set by the harness, not adoption instants**: the driver
+scrapes the three hosts sequentially, one ssh round trip (~1.6 s) each, and
+every node was already at 8960 on the *first* scrape of the loop — so the
+three columns are one, two and three round trips after the last start, which
+is also why they repeat across reps. What the run shows is that all three
+nodes had adopted the top rung within ~1.7 s of the last node's start; where
+inside that window each one adopted, this harness cannot say.
 
 | rep | node0 | node1 | node2 |
 |---|---|---|---|
@@ -245,9 +253,7 @@ were identical across reps to a tenth of a second:
 | 2 | +1.7 s | +3.3 s | +4.8 s |
 | 3 | +1.7 s | +3.4 s | +4.9 s |
 
-(times from the last node's start; node0 adopts first because it is the
-leader and commits the raise, and the followers adopt it through the cluster
-FSM as the frame commits).
+(times from the last node's start, each an upper bound as explained above).
 
 ### Row b
 
@@ -265,9 +271,19 @@ predicted, not a leak.
 is not moved.** The pre-committed rule fixes the pair count from the base
 tree's own spread: four base-only prelim reps read 1 600 937 / 1 417 225 /
 1 101 075 / 1 556 142 ops/s (sem/mean **7.96 %**), so `required_pairs`
-asked for **29**; the run's cap was 12. Twelve interleaved pairs (base first
-on odd pairs) on `m12_gate` clusters, 64 B, direct client on the leader host,
-the driver's standard 2 s warm-up / 8 s window:
+asked for **29**. **Twelve were run, and that cap is a deviation to own,
+not a property of the procedure:** the pre-committed step 2(d) has only a
+floor of 5, and the `--pairs-max` default of 12 was added by the driver
+commit made for this run (`cf2ab77`), chosen for fleet time (~2 min per
+pair) and not raised when the prelim spread turned out to call for 29. The
+verdict's "need ≥ 29" is computed from the spread independently of the cap,
+so the shortfall is stated truthfully; a re-run with `--pairs-max 29` (~1 h
+of fleet time) is what it would take to give this clause a verdict. On the
+observed sem, 29 pairs would land near 4.9 pp — likely still inconclusive
+against a 3 % bar, but that is a projection, not a measurement. Twelve
+interleaved pairs (base first on odd pairs) on `m12_gate` clusters, 64 B,
+direct client on the leader host, the driver's standard 2 s warm-up / 8 s
+window:
 
 | pair | base | head | delta |
 |---|---|---|---|
@@ -286,13 +302,14 @@ the driver's standard 2 s warm-up / 8 s window:
 
 Paired mean **−3.81 %**, sem **7.62 pp** (2·sem = 15.2 pp). The mean sits
 0.8 pp below the −3 % bar, inside 2·sem by a factor of ~19. The base tree
-alone spans 1.10–2.00 M ops/s across its 16 reads on this rig, the same
-15–43 % arm-to-arm spread the 2.11.0 time-and-timers gate hit. This is not a
-pass and not a demonstrated regression: the rig cannot resolve a −3 % rate
-bar at 12 pairs, and the pre-committed rule says so rather than letting a
-noisy mean through. It is the same class of finding as the 2.11.0 gates'
-rows a/b/e (bar question #1 for the maintainer, still open). The driver's
-verdict text is the honest one: `only 12 pair(s), need >= 29`.
+alone spans 1.10–2.00 M ops/s across its 16 reads on this rig, in the same
+family as the 15–43 % arm-to-arm spread the 2.11.0 time-and-timers gate hit.
+This is not a pass and not a demonstrated regression: at 12 pairs the rig
+did not resolve a −3 % rate bar, and the pre-committed rule says so rather
+than letting a noisy mean through. Unlike the log clock's bar (0.27 %,
+unreachable at this spread — see that gate doc), a 3 % bar at 29 pairs is a
+feasible run that simply was not made. The driver's verdict text is the
+honest one: `only 12 pair(s), need >= 29`.
 
 ### Row c
 
@@ -320,11 +337,19 @@ fail-stopped `jumbo_peer_silent`, both naming node 2.
 | 9001 − one | n1 | `jumbo_peer_silent` | 2 | +29.9 s |
 
 **Reading the elapsed column.** It is measured from the *last* unit's start
-to the refusal record's own `ts_ns`; the units are started one ssh round trip
-apart (~6 s), so each node fired at its **own** 30 s window and the
-last-started node reads 29.9 s. A reading of 30.1 s here would be an artefact
-of the reference point, not a bar miss — worth knowing before anyone re-runs
-this row on a slower control path.
+to the refusal record's own `ts_ns`. The units are started one ssh round
+trip apart (~6 s), so n0's and n1's readings understate their own age by
+roughly 12 and 6 s: each node fired at its **own** 30 s window, which is the
+product's `JUMBO_GATE_WINDOW`, armed at the first consensus pass. For the
+*last*-started node the reference is its own start to within the
+`systemd-run` return, so its 29.9 s is a real reading against a bar that is
+exactly the product's own window — the clause has no headroom by
+construction and is a boundary check the harness resolves to about ±0.1 s.
+A 30.1 s reading for n0 or n1 would be the reference artefact; for the last
+node it would be a genuine miss. What row d proves, and what its PASS means,
+is that both refusals fire **by name, at the window, naming the right
+peer** on every node; the "within 30 s" clause is met at the boundary, and a
+re-run on a slower control path should read it with that in mind.
 
 ### Row e
 
@@ -354,8 +379,10 @@ standing rule it carries no bar.
   a narrow path pins the rung with no EMSGSIZE and no probe leak (b's
   functional clauses). Those are the feature's correctness claims on a real
   fabric, and they hold.
-- The rig cannot resolve a −3 % rate bar (b) — the standing bar question from
-  the 2.11.0 gates, unchanged by this run.
+- Row b's −3 % rate bar was not resolved at the 12 pairs run (29 were
+  called for); a 29-pair re-run is feasible and was not made. The log clock's
+  0.27 % bar is the one this rig's spread cannot reach at any practical rep
+  count — the standing bar question from the 2.11.0 gates, unchanged.
 - Whether the runbook should *recommend* jumbo (c) is unanswered; the
   runbook keeps jumbo as a knob.
 

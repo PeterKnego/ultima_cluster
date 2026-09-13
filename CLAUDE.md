@@ -46,10 +46,12 @@ consensus pass takes one clock read instead of two — no flag-day surface of
 its own). **Both fleet gates RAN 2026-09-13** on 4 × c6id.2xlarge
 (`docs/benchmarks/uc2-jumbo-frame-discovery-gate-2026-09-13.md`,
 `uc2-log-clock-gate-2026-09-08.md`): jumbo rows a and d PASS, row b's
-functional clauses hold, and BOTH rate bars (jumbo b's −3 %, the log clock's
-A/B) are **inconclusive** — the rig's 40–50 % arm-to-arm spread is an order
-of magnitude above them, the 2.11.0 gates' open bar question, unchanged; row
-c was NOT RUN (no soak instrument; jumbo stays a knob). No bar was moved. The
+functional clauses hold, and both rate bars are **inconclusive** for
+different reasons — jumbo b's −3 % was run at 12 of the 29 pairs its rule
+called for (a feasible re-run), while the log clock's 0.27 % bar sits under
+per-arm sems of 3.4–19 % (the 2.11.0 gates' open bar question, unchanged);
+row c was NOT RUN (no soak instrument; jumbo stays a knob). No bar was moved.
+B-lite's disposition is undetermined, not closed. The
 workspace version is still `2.11.0`: the bump, the tag and the publish all
 happen in `docs/how-to/cut-a-release.md`, not in the feature work. The
 release writeup is in `RELEASES.md` and `docs/releases.md`; the explainer is

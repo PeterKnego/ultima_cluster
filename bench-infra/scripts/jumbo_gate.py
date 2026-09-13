@@ -861,8 +861,14 @@ def sample_series(hosts, names, secs, period=1.0):
 
 
 def host_mtu(host, iface):
+    """The interface's current MTU, or a loud failure — never a silent 0: the
+    rows' `finally` blocks restore the MTU from this reading, and a falsy
+    placeholder would leave a host at 1500 for every later arm."""
     r = ssh(host, f"cat /sys/class/net/{iface}/mtu", label="mtu")
-    return int((r.stdout or "0").strip() or 0)
+    text = (r.stdout or "").strip()
+    if r.returncode != 0 or not text.isdigit():
+        raise RuntimeError(f"could not read {iface}'s MTU on {host.public_ip}: {r.stderr or text!r}")
+    return int(text)
 
 
 def run_arm_a(hosts, args):
@@ -964,12 +970,21 @@ def run_arm_b(hosts, args):
         stop_jumbo_cluster(hosts)
         mtu_samples = [v for vs in series["uc2_datagram_mtu_bytes"].values() for v in vs]
         emsg_samples = [v for vs in series["uc2_send_emsgsize_total"].values() for v in vs]
-        # Errata 1's clause is per node; the verdict takes ONE series, so
-        # the fleet-wide sum is what is judged (non-decreasing and rising
-        # iff every node's is, since each is a monotone counter).
-        per_node = [vs for vs in series["uc2_probe_sent_total"].values() if vs]
-        n_min = min((len(vs) for vs in per_node), default=0)
-        probe_series = [sum(vs[i] for vs in per_node) for i in range(n_min)]
+        # Errata 1's clause is PER NODE and the verdict takes ONE series. A
+        # fleet-wide sum is non-decreasing iff every node's is, but it can
+        # RISE while one node's series is flat — the very anomaly clause 3
+        # exists to catch — so judge each node first and hand the verdict
+        # the first offending node's series if there is one, else the sum.
+        per_node = {ip: vs for ip, vs in series["uc2_probe_sent_total"].items() if vs}
+        flat = {ip: vs for ip, vs in per_node.items()
+                if len(vs) >= 2 and (any(b < a for a, b in zip(vs, vs[1:])) or vs[-1] <= vs[0])}
+        if flat:
+            ip, vs = sorted(flat.items())[0]
+            print(f"INFO row b: uc2_probe_sent_total NOT climbing on {ip}: {vs}", flush=True)
+            probe_series = vs
+        else:
+            n_min = min((len(vs) for vs in per_node.values()), default=0)
+            probe_series = [sum(vs[i] for vs in per_node.values()) for i in range(n_min)]
         print(f"INFO row b: {len(mtu_samples)} mtu samples, {misses} scrape misses, "
               f"probe_sent fleet-wide {probe_series[:1]}->{probe_series[-1:]}", flush=True)
         print("ROW-B-SERIES-JSON " + json.dumps(series), flush=True)
@@ -1000,7 +1015,7 @@ def run_arm_b(hosts, args):
         return v
     finally:
         for h in hosts:
-            if original.get(h.public_ip):
+            if original.get(h.public_ip) is not None:
                 force_interface_mtu(h, iface, original[h.public_ip])
         print(f"INFO row b: iface {iface} restored to {original}", flush=True)
 
@@ -1055,7 +1070,7 @@ def run_arm_d(hosts, args):
         stop_jumbo_cluster(hosts)
     finally:
         for h in hosts:
-            if original.get(h.public_ip):
+            if original.get(h.public_ip) is not None:
                 force_interface_mtu(h, iface, original[h.public_ip])
     print("ROW-D-JSON " + json.dumps({"force_1500": force_arm, "silent_9001": silent_arm}),
           flush=True)

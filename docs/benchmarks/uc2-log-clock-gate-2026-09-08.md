@@ -213,9 +213,10 @@ arms under `tt_disabled()`, exactly as in 2.11.0.
 | all 12 pairs | | | | **−1.56 %** | **6.53 pp** |
 
 Driver verdict: `[FAIL] inconclusive (noisy run)`, worst arm delta −8.42 %,
-worst sem 19.06 %, against R = 0.27 %. Per-arm arm-to-arm spread is 42–48 %
-on BOTH trees (the base tree's own n1 reads 1.11–1.81 M across three reps),
-so the sem is 40–70× the bar. Spec §8's three readings are each a claim
+worst sem 19.06 %, against R = 0.27 %. Per-arm arm-to-arm spread ranges
+from 9 % (`pair`) to 48 % (`n1`) across the two trees (the base tree's own
+n1 reads 1.11–1.81 M across three reps), so the per-arm sem is 14–71× the
+bar. Spec §8's three readings are each a claim
 about where the delta sits relative to R; none can be made: the data is
 equally consistent with the 2.2 % ceiling and with zero, which is what the
 dev-box smoke below also said. This is the same finding the 2.11.0
@@ -223,9 +224,11 @@ time-and-timers gate recorded for its rows a/b/e (15–43 % spread against a
 1.12 % bar) and the same open bar question (#1) for the maintainer: a rate
 bar an order of magnitude below the rig's variance cannot be resolved by
 adding reps at this rig's spread (resolving 19 % down to 0.27 % would need
-~10⁴ reps per arm). The bar is not moved. The feature ships on behaviour
-(rows b and c), which is spec §8's "within the resolution" *disposition* —
-B-lite closed — without that disposition's throughput *claim* being made.
+~10⁴ reps per arm). The bar is not moved. The feature ships on rows b and c,
+which are independent behavioural bars; **B-lite's disposition is
+undetermined** — it is exactly what the three readings disagree about, the
+data supports none of them, and the question stays open for the maintainer
+rather than being closed by the absence of a measurement.
 
 One harness lesson from the first attempt, worth the runbook: the driver's
 `rsync -a` preserves source mtimes, and a fresh checkout's files all carry

@@ -256,15 +256,17 @@ completeness cross-check still passes; and `bench-infra/scripts/jumbo_gate.py
 --selftest` pins the driver's row arithmetic with no fleet or ssh.
 **The fleet gate RAN on 2026-09-13** (4 × c6id.2xlarge, the 2.11.0 shape;
 bars committed 2026-09-12, file renamed to the run date). Row a PASS —
-every node at 8960 within 5 s of the last start, three cold starts,
-adoption times identical to a tenth of a second; row d PASS — all three
+every node at 8960 on the harness's first scrape after the last start,
+i.e. within ~1.7 s, three cold starts; row d PASS — all three
 nodes `jumbo_path_too_narrow` on the 1500 B arm, both live nodes
 `jumbo_peer_silent` naming the third on the 9001-minus-one arm, each at its
 node's own 30 s window; row b's functional clauses hold — rung 1408 on every
 sample, `uc2_send_emsgsize_total` 0, `uc2_probe_sent_total` 53 → 501 over
 60 s (errata 1) — and its −3 % throughput clause is **inconclusive**
-(29 pairs required from the base tree's 7.96 % spread, 12 run; paired mean
-−3.81 %, sem 7.62 pp; recorded as the driver's FAIL, bar unmoved); row c NOT
+(29 pairs required from the base tree's 7.96 % spread, 12 run under a
+`--pairs-max` cap the run's driver commit added for fleet time — a feasible
+re-run; paired mean −3.81 %, sem 7.62 pp; recorded as the driver's FAIL, bar
+unmoved); row c NOT
 RUN (blackhole probe cleared; the envelope-map brief's soak instrument was
 never built — the maintainer's call); row e reported −1.23 % (sem 4.53 pp,
 3 pairs); row f reported −2.29 % against a −0.68 % control, one outlier run.
@@ -319,8 +321,9 @@ measured head only, a deviation the doc now records), resolution on the day
 0.27 %. Over 12 pairs the mean is −1.56 % with a sem of 6.53 pp; per arm the
 sem is 3.4–19 % against a 0.27 % bar. None of spec §8's three readings can
 be claimed; the feature ships on behaviour (rows b and c of the gate doc),
-the bar is unmoved, and the standing bar question from 2.11.0 (a rate bar an
-order of magnitude below the rig's variance) is unchanged.
+B-lite's disposition stays undetermined, the bar is unmoved, and the standing
+bar question from 2.11.0 (a rate bar an order of magnitude below the rig's
+variance) is unchanged.
 [The gate doc](benchmarks/uc2-log-clock-gate-2026-09-08.md) has the per-arm
 table.
 

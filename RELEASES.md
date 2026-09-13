@@ -91,15 +91,17 @@ written.**
   still unexplained.
   [Engineering record](docs/releases.md#fixed-after-the-2110-tag).
 - **Performance: both gates ran on a fleet on 2026-09-13; no bar was moved.**
-  Jumbo: discovery converges on the top rung within 5 s of the last node's
-  start on every rep (row a, PASS); the `force_jumbo_frames` gate refuses by
+  Jumbo: discovery converges on the top rung within ~2 s of the last node's
+  start on every rep (row a, PASS — the harness's first scrape already found
+  every node there); the `force_jumbo_frames` gate refuses by
   name on both arms, each node at its own 30 s window (row d, PASS); a
   1500 B path pins the rung at 1408 with zero `EMSGSIZE` and a probe counter
   that keeps climbing as documented (row b's functional clauses hold). Row b's
   −3 % throughput bar and the log clock's fleet A/B are both
-  **inconclusive**: the rig's arm-to-arm spread (40–50 % per arm) is an order
-  of magnitude above the bars, the same finding as the 2.11.0 gates, recorded
-  as such and not as a pass. Row c (whether the runbook should *recommend*
+  **inconclusive**, recorded as such and not as a pass: row b ran 12 of the
+  29 pairs its own rule called for (a feasible re-run that was not made), and
+  the log clock's 0.27 % bar sits under per-arm spreads of 9–48 %, the same
+  finding as the 2.11.0 gates. Row c (whether the runbook should *recommend*
   jumbo) was not run — its soak instrument was never built — so jumbo stays a
   documented knob. Rows e and f are reported with no bar.
   [Jumbo gate doc](docs/benchmarks/uc2-jumbo-frame-discovery-gate-2026-09-13.md) ·
