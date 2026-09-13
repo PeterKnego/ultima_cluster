@@ -1,8 +1,10 @@
-# uc2 log-clock gate — SKELETON, no fleet run yet
+# uc2 log-clock gate — bars committed 2026-09-08, fleet row run 2026-09-13
 
-**Date:** 2026-09-08 (bars committed). **Fleet run: NOT RUN — user-gated.**
-The maintainer has not green-lit fleet spend for this gate; row a's result
-cell stays "not run" until that happens, per the honest-failure protocol.
+**Date:** 2026-09-08 (bars committed). **Fleet run: 2026-09-13**, on the
+same fleet trip as the jumbo gate; row a's result is **inconclusive** (the
+rig cannot resolve the bar) and is recorded as such under the
+honest-failure protocol — see [Results](#row-a-fleet-run-2026-09-13). The
+filename keeps the bars' date: the run did not change them.
 
 > **Decide rule committed before any run.** This document's bar table is
 > committed, with every result cell filled with either a real result (rows
@@ -72,14 +74,13 @@ Two claims need a fleet to test, and row a exists for exactly those — spec
 
 ## The bar
 
-Pre-committed. Row a is the only fleet row and is **user-gated**: it costs a
-fleet trip and is not run until the maintainer green-lights this gate. Rows
-b–d are dev-box-legal and have already been run (this document is not a pure
-skeleton for those three).
+Pre-committed. Row a is the only fleet row; it was user-gated and ran on
+2026-09-13 once the maintainer green-lit the fleet trip. Rows b–d are
+dev-box-legal and were run before that.
 
 | row | what | bar (pre-committed) | result |
 |---|---|---|---|
-| a | **fleet A/B**: `m14_fleet_gate.py` rows a/b/e (steady window, `WARMUP_SECS, MEASURE_SECS = 2, 8`), this tree vs its parent commit (`10c014d`, the last commit before Task 1's code), on the same rig, same day, after a same-source rebuild control run FIRST to record the day's resolution (the M14b lesson; 1.12 % on 2026-09-07) | three readings, each a result (spec §8, reproduced above): **gain outside the resolution** (ceiling 2.2 %) → A is a perf win, consensus is the limiter, B-lite gets its own spec; **within the resolution** → null for throughput, ships on behaviour alone, B-lite closed; **regression outside the resolution** → FAIL, does not ship until the cause is found (`objdump -d -C` both binaries' `do_work`) | **not run — fleet, user-gated** |
+| a | **fleet A/B**: `m14_fleet_gate.py` rows a/b/e (steady window, `WARMUP_SECS, MEASURE_SECS = 2, 8`), this tree vs its parent commit (`10c014d`, the last commit before Task 1's code), on the same rig, same day, after a same-source rebuild control run FIRST to record the day's resolution (the M14b lesson; 1.12 % on 2026-09-07) | three readings, each a result (spec §8, reproduced above): **gain outside the resolution** (ceiling 2.2 %) → A is a perf win, consensus is the limiter, B-lite gets its own spec; **within the resolution** → null for throughput, ships on behaviour alone, B-lite closed; **regression outside the resolution** → FAIL, does not ship until the cause is found (`objdump -d -C` both binaries' `do_work`) | **RUN 2026-09-13 — INCONCLUSIVE**: none of the three readings is claimable; per-arm sem 3.4–19 % against R = 0.27 % ([fleet results](#row-a-fleet-run-2026-09-13)) |
 | b | **codegen sanity**: count of `clock_gettime`/`__vdso_clock_gettime` call sites reachable from `m5_gate`, this tree vs parent, `objdump -d -C \| grep -c` (the time-and-timers row-d playbook) | strictly fewer in this tree | **filled in by Task 2, step 6 (controller rulings R1/R2): parent = 2, HEAD = 2 — not lower.** Both sites are libstd's shared `Timespec::now` (the one function every `Instant`/`SystemTime` read routes through) plus `m5_gate::await_single_leader` in the harness; a static call-site count cannot see per-pass frequency — diagnostic, not a bar (ruling R2); the acceptance bar is row a |
 | c | **behaviour**: `cargo test -p uc_node --lib log_clock` — steady state, forward adopted, backward smeared at 500 ppm and fully retired at 2 000 s/s, monotone under 20 000 seeded random steps, PLUS `a_backward_step_publishes_a_falling_smear_gauge_and_is_drained_once` (`node.rs`) | all green | **filled in by Task 1: 15 passed (11 planned + 4 added in review). Re-run 2026-09-08 to confirm (`CARGO_TARGET_DIR=$HOME/.cache/cargo-target-logclock`): the same test filter also incidentally matches one unrelated test whose name contains the substring `log_clock` (`obs::metrics::tests::log_clock_smear_gauge_renders_the_published_value`, Task 3's gauge test). **Updated by the fix-wave (2026-09-08, C1/I2): the resample baseline bug (C1) added two tests to the module — a multi-resample convergence test (`a_smear_in_flight_is_not_re_reported_and_the_gauge_counts_down`, an independent-wall model asserting exactly one step over 3000 resamples and a strictly-falling remaining-smear gauge) and a small-forward-step-during-a-smear test — bringing the `log_clock` module's own unit count to 17/17 green. `cargo test -p uc_node --lib log_clock` (substring match, so it also still picks up the one incidental `obs` gauge test) now reads `test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 276 filtered out`. Separately, the node-level test named in this row's "what" column drives the same corrected decision through `Consensus::publish_status` via the new `LogClock::inject_sample` test seam (its name does not contain the substring `log_clock`, so it is not part of that 18 and must be run by name — see the fix-wave report). No alert-tier scenario exists for the smear in this release (spec errata bullet 8); that gap is a `docs/BACKLOG.md` item, not this row's job.** |
 | d | **dev-box SMOKE, not a gate**: `m12_gate --arm direct --secs 8` alternated A/B/B/A/A/B on an idle box, private target dirs, sha256 of each binary recorded | reported, **no bar** (CLAUDE.md: a local rate is smoke; the same dip measured 7× spanned 0–18 % on a dev box) | **filled in by step 2 below — see [Results](#results)** |
@@ -178,6 +179,64 @@ the binary actually produces in this mode. This is not a different harness,
 only a different grep.
 
 ## Results
+
+### Row a, fleet run 2026-09-13
+
+**INCONCLUSIVE — the rig cannot resolve the bar; no reading claimed, bar
+unmoved.** Run on the same fleet trip as the jumbo gate
+([`uc2-jumbo-frame-discovery-gate-2026-09-13.md`](uc2-jumbo-frame-discovery-gate-2026-09-13.md)):
+4 × c6id.2xlarge, us-east-1a, chrony `Normal`, `/opt/bench` ext4 on
+instance-store NVMe. Head `e2a5e57` (this feature's merge commit; `m12_gate`
+sha256 `19b529420b5e…`) vs base `10c014d` (`m12_gate` `5192e79560bf…`), each
+rsynced and built on the hosts. Resolution on the day **R = 0.27 %**
+(`hop1_ab.sh` on node0, 6 reps, two builds of the same source at different
+absolute paths — distinct binaries, sha256 `e7f1aa4e88df…`/`065455d293b0…`).
+Calibration K = 500 (0.447 × n1); the 76 row-c divergence checks all agree.
+
+**Deviation from the procedure as written, recorded rather than worked
+around.** Step 2's command says `--rows abe --base-tree …`, but
+`m14_fleet_gate.py` honours `--base-tree` only under `--tt-rows` (in `main()`,
+`prepare_base_tree` sits inside `if a.tt_rows`), so that command would have
+measured the head tree alone. The run used `--tt-rows a --timed
+--metrics-port 0 --base-tree … --resolution-pct 0.27 --ab-reps 3`, the
+driver's interleaved paired A/B over its four rate arms — the same
+construction the 2.11.0 time-and-timers gate ran. Consequence: head arms run
+`Timed<..>`-wrapped services (`--timed` is mandatory for `tt-rows a`), base
+arms under `tt_disabled()`, exactly as in 2.11.0.
+
+| arm | base (ops/s, 3 reps) | head (ops/s, 3 reps) | paired deltas | mean | sem |
+|---|---|---|---|---|---|
+| n1 | 1 105 083 / 1 772 168 / 1 807 694 | 1 330 963 / 1 704 656 / 1 050 292 | +20.4 / −3.8 / −41.9 % | −8.42 % | 18.1 pp |
+| n2eq | 1 524 529 / 1 390 290 / 980 183 | 1 456 270 / 1 130 026 / 1 262 005 | −4.5 / −18.7 / +28.8 % | +1.85 % | 14.1 pp |
+| slow1 | 802 214 / 757 402 / 599 082 | 792 540 / 502 648 / 793 009 | −1.2 / −33.6 / +32.4 % | −0.82 % | 19.1 pp |
+| pair | 716 423 / 800 234 / 734 144 | 721 182 / 760 363 / 791 028 | +0.7 / −5.0 / +7.7 % | +1.14 % | 3.7 pp |
+| all 12 pairs | | | | **−1.56 %** | **6.53 pp** |
+
+Driver verdict: `[FAIL] inconclusive (noisy run)`, worst arm delta −8.42 %,
+worst sem 19.06 %, against R = 0.27 %. Per-arm arm-to-arm spread is 42–48 %
+on BOTH trees (the base tree's own n1 reads 1.11–1.81 M across three reps),
+so the sem is 40–70× the bar. Spec §8's three readings are each a claim
+about where the delta sits relative to R; none can be made: the data is
+equally consistent with the 2.2 % ceiling and with zero, which is what the
+dev-box smoke below also said. This is the same finding the 2.11.0
+time-and-timers gate recorded for its rows a/b/e (15–43 % spread against a
+1.12 % bar) and the same open bar question (#1) for the maintainer: a rate
+bar an order of magnitude below the rig's variance cannot be resolved by
+adding reps at this rig's spread (resolving 19 % down to 0.27 % would need
+~10⁴ reps per arm). The bar is not moved. The feature ships on behaviour
+(rows b and c), which is spec §8's "within the resolution" *disposition* —
+B-lite closed — without that disposition's throughput *claim* being made.
+
+One harness lesson from the first attempt, worth the runbook: the driver's
+`rsync -a` preserves source mtimes, and a fresh checkout's files all carry
+the checkout instant — older than the hosts' last cargo build of the
+previously synced tree — so cargo judged `uc_log` fresh and linked the OLD
+object against the NEW `uc_client`, which failed to compile (`no method
+named meta`). Touching the local checkout's sources before the rsync
+(`find … -name '*.rs' -o -name '*.toml' -exec touch {} +`) is the fix; the
+run record has the full diagnosis.
+
+### Row d, dev-box smoke (2026-09-08)
 
 **RUN 2026-09-08 on the dev box (idle: load 0.18–0.19 at start; a short
 load-average bump to ~5 immediately after the two release builds settled

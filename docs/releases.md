@@ -22,7 +22,7 @@ requested by the maintainer 2026-09-08.
 | plans | [plan 1](superpowers/plans/2026-09-10-uc2-jumbo-frame-discovery-plan1.md) (discovery, Settings v2, the live ceiling), [plan 2](superpowers/plans/2026-09-12-uc2-jumbo-frame-discovery-plan2.md) (the gates, observability, proof, docs) | [the plan](superpowers/plans/2026-09-08-uc2-monotonic-log-clock.md) |
 | explainer | [Jumbo frames and path-MTU discovery, explained](notes/uc2-jumbo-frame-discovery-explained.md) | [Log time and timers § the log clock](notes/uc2-log-time-and-timers-explained.md#the-log-clock) |
 | how-to | [Run a cluster on jumbo frames](how-to/jumbo-frames.md) | — (no operator surface) |
-| gate doc | [jumbo gate](benchmarks/uc2-jumbo-frame-discovery-gate-2026-09-12.md) — **pre-committed, UNRUN** | [log-clock gate](benchmarks/uc2-log-clock-gate-2026-09-08.md) — **pre-committed, UNRUN** |
+| gate doc | [jumbo gate](benchmarks/uc2-jumbo-frame-discovery-gate-2026-09-13.md) — **ran 2026-09-13**: a, d PASS; b functional clauses hold, throughput inconclusive; c NOT RUN; e, f reported | [log-clock gate](benchmarks/uc2-log-clock-gate-2026-09-08.md) — **ran 2026-09-13**: inconclusive (rig variance ≫ bar), ships on behaviour |
 | flag-day surface | wire `0.8.0` (two datagram kinds), cnc `3.2` (one word), `Settings` v2, `max_payload` retired | none |
 
 ### Jumbo-frame discovery
@@ -254,15 +254,22 @@ rules have `RULE_BUILDERS` entries and synthetic scenarios
 (`mtu_discovery_stalled`, `path_below_mtu`) so `scripts/m10_alert_fire.sh`'s
 completeness cross-check still passes; and `bench-infra/scripts/jumbo_gate.py
 --selftest` pins the driver's row arithmetic with no fleet or ssh.
-**The fleet gate is pre-committed and UNRUN** — six rows (convergence within
-10 s of the last node's start; a 1500 B arm that must never raise, with
-`uc2_send_emsgsize_total == 0` and `uc2_probe_sent_total` expected to climb; the
-envelope-map brief's soak plateau, which decides only whether the runbook
-*recommends* jumbo; both `force_jumbo_frames` refusals inside the 30 s window;
-and two reported-no-bar cost rows), every result cell reading UNRUN, in
-[the gate doc](benchmarks/uc2-jumbo-frame-discovery-gate-2026-09-12.md), whose
-date is the date the bars were committed (the repo's convention for an unrun
-gate).
+**The fleet gate RAN on 2026-09-13** (4 × c6id.2xlarge, the 2.11.0 shape;
+bars committed 2026-09-12, file renamed to the run date). Row a PASS —
+every node at 8960 within 5 s of the last start, three cold starts,
+adoption times identical to a tenth of a second; row d PASS — all three
+nodes `jumbo_path_too_narrow` on the 1500 B arm, both live nodes
+`jumbo_peer_silent` naming the third on the 9001-minus-one arm, each at its
+node's own 30 s window; row b's functional clauses hold — rung 1408 on every
+sample, `uc2_send_emsgsize_total` 0, `uc2_probe_sent_total` 53 → 501 over
+60 s (errata 1) — and its −3 % throughput clause is **inconclusive**
+(29 pairs required from the base tree's 7.96 % spread, 12 run; paired mean
+−3.81 %, sem 7.62 pp; recorded as the driver's FAIL, bar unmoved); row c NOT
+RUN (blackhole probe cleared; the envelope-map brief's soak instrument was
+never built — the maintainer's call); row e reported −1.23 % (sem 4.53 pp,
+3 pairs); row f reported −2.29 % against a −0.68 % control, one outlier run.
+Resolution on the day 0.27 %. Full record in
+[the gate doc](benchmarks/uc2-jumbo-frame-discovery-gate-2026-09-13.md).
 
 ### The monotonic log clock
 
@@ -304,13 +311,18 @@ only the leader's clock ever reaches the log — a follower still writes
 frames verbatim and stamps nothing; it runs its own clock only so it is
 ready to lead.
 
-**Acceptance: fleet A/B, unrun.** The bars are pre-committed in
-[the gate doc](benchmarks/uc2-log-clock-gate-2026-09-08.md): `m14_fleet_gate.py`
-rows a/b/e, this tree vs. its pre-change parent commit, on the same rig, same
-day, after a same-source rebuild control run records that day's resolution
-(the M14b lesson — 1.12 % on 2026-09-07). No fleet run has happened yet; the
-dev-box `m12_gate --arm direct` smoke is recorded in the gate doc as smoke,
-never as a bar (CLAUDE.md's benchmarking discipline).
+**Acceptance: fleet A/B RAN 2026-09-13 — inconclusive.** Head `e2a5e57` vs
+base `10c014d` on the same 4 × c6id.2xlarge rig, interleaved paired arms
+(`m14_fleet_gate.py --tt-rows a`, the same construction as the 2.11.0
+time-and-timers run — the gate doc's `--rows abe` command would have
+measured head only, a deviation the doc now records), resolution on the day
+0.27 %. Over 12 pairs the mean is −1.56 % with a sem of 6.53 pp; per arm the
+sem is 3.4–19 % against a 0.27 % bar. None of spec §8's three readings can
+be claimed; the feature ships on behaviour (rows b and c of the gate doc),
+the bar is unmoved, and the standing bar question from 2.11.0 (a rate bar an
+order of magnitude below the rig's variance) is unchanged.
+[The gate doc](benchmarks/uc2-log-clock-gate-2026-09-08.md) has the per-arm
+table.
 
 ### Fixed after the `2.11.0` tag
 
@@ -371,8 +383,8 @@ has; every row that needs a run says so.
 | `release.yml` (build, SBOM, cosign, image) | — | pending |
 | the per-task gate the feature branches ran: `cargo fmt --all -- --check`, four `clippy` invocations, `cargo test --workspace --exclude uc_node`, and the thirteen `uc_node` suites plus its lib | last run 2026-09-12 on the jumbo plan-2 head: fmt clean, clippy clean, 83 `test result: ok` lines outside `uc_node`, and 318 lib + 13 suites green | **green locally** — a dev box, and not the whole `docs/VERIFICATION.md` surface |
 | the rest of the proof surface (`docs/VERIFICATION.md`): the lin capstones, hard-crash, Elle, loom, Lean + conformance, fuzz smoke | no whole-tree release pass yet — the release procedure's own step | pending |
-| jumbo fleet gate (rows a–f) | [`benchmarks/uc2-jumbo-frame-discovery-gate-2026-09-12.md`](benchmarks/uc2-jumbo-frame-discovery-gate-2026-09-12.md) | **UNRUN** — bars committed 2026-09-12 (the date in the filename), every result cell reads UNRUN |
-| log-clock fleet A/B (`m14_fleet_gate.py` rows a/b/e) | [`benchmarks/uc2-log-clock-gate-2026-09-08.md`](benchmarks/uc2-log-clock-gate-2026-09-08.md) | **UNRUN** — bars committed 2026-09-08; the dev-box smoke in that doc is smoke, not a bar |
+| jumbo fleet gate (rows a–f) | [`benchmarks/uc2-jumbo-frame-discovery-gate-2026-09-13.md`](benchmarks/uc2-jumbo-frame-discovery-gate-2026-09-13.md) | **RAN 2026-09-13** — a PASS, d PASS, b functional clauses hold / throughput inconclusive (12 of 29 pairs), c NOT RUN, e and f reported; no bar moved |
+| log-clock fleet A/B (`m14_fleet_gate.py` tt-row a) | [`benchmarks/uc2-log-clock-gate-2026-09-08.md`](benchmarks/uc2-log-clock-gate-2026-09-08.md) | **RAN 2026-09-13** — inconclusive: per-arm sem 3.4–19 % vs R = 0.27 %; ships on behaviour, bar unmoved |
 | the M10 alert tier, with the three new jumbo rules | `scripts/m10_alert_fire.sh` (synthetic scenarios `mtu_discovery_stalled`, `path_below_mtu`, `jumbo_gate_held`) | **green locally** 2026-09-12, 26/26 rules fire under promtool — a local tier, not a fleet result |
 | artifact integrity (`sha256sum -c`) | — | pending |
 | artifact provenance (`cosign verify-blob`) | — | pending |

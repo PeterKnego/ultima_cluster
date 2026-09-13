@@ -1049,8 +1049,10 @@ The most important section, and the one most projects omit.
   relationship like any other — but the **measuring** (the ladder, the commit
   rule, the two startup gates) is proved by `uc_node/tests/jumbo.rs` over the
   real transport with `FaultConfig::{max_datagram, emsgsize_over}` and by the
-  unit tier. The fleet arm is pre-committed and **unrun**
-  (`docs/benchmarks/uc2-jumbo-frame-discovery-gate-2026-09-12.md`). Stated here
+  unit tier. The fleet arm **ran 2026-09-13**
+  (`docs/benchmarks/uc2-jumbo-frame-discovery-gate-2026-09-13.md`: discovery
+  converges, the force gate refuses by name on both arms, a narrow path pins
+  the rung; the rate clause is inconclusive on that rig). Stated here
   because "the sim covers the transport" would otherwise be read to include
   it.
 - **"The instant completed on the first attempt" is not constructible as a

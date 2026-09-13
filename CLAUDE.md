@@ -43,9 +43,13 @@ socket — which makes a node **Linux/Android-only**, refused by name
 elsewhere) and the **monotonic log clock** (`uc_node::log_clock`; a backward
 wall step is smeared at 500 ppm instead of freezing the log's clock, and the
 consensus pass takes one clock read instead of two — no flag-day surface of
-its own). Both fleet gates are pre-committed and **UNRUN**
-(`docs/benchmarks/uc2-jumbo-frame-discovery-gate-2026-09-12.md`,
-`uc2-log-clock-gate-2026-09-08.md`) — quote no number from either. The
+its own). **Both fleet gates RAN 2026-09-13** on 4 × c6id.2xlarge
+(`docs/benchmarks/uc2-jumbo-frame-discovery-gate-2026-09-13.md`,
+`uc2-log-clock-gate-2026-09-08.md`): jumbo rows a and d PASS, row b's
+functional clauses hold, and BOTH rate bars (jumbo b's −3 %, the log clock's
+A/B) are **inconclusive** — the rig's 40–50 % arm-to-arm spread is an order
+of magnitude above them, the 2.11.0 gates' open bar question, unchanged; row
+c was NOT RUN (no soak instrument; jumbo stays a knob). No bar was moved. The
 workspace version is still `2.11.0`: the bump, the tag and the publish all
 happen in `docs/how-to/cut-a-release.md`, not in the feature work. The
 release writeup is in `RELEASES.md` and `docs/releases.md`; the explainer is
@@ -96,12 +100,12 @@ Next up, now that `2.11.0` is tagged and published: (1) ~~bound the three
 unbounded waits in `examples/uc_crashtest/tests/remote_lin.rs`~~ — DONE
 2026-09-12 (`common::join_within`, a 30 s `Reap::drop`; the 58-minute hang of
 2026-09-08 is still unexplained, it just fails with a name now); (2) **run the
-two `2.12.0` fleet gates and cut the release** — the
-jumbo gate's six rows (`bench-infra/scripts/jumbo_gate.py`; rows a/b/d need a
-fleet whose interface MTU ansible can force between 9001 and 1500, row c is
-the soak that decides whether the runbook *recommends* jumbo, rows e/f carry
-no bar) and the log clock's A/B, then `docs/how-to/cut-a-release.md`; the
-feature code, the docs and the writeup are all written; (3) a fleet re-run of
+two `2.12.0` fleet gates and cut the release** — ~~the gates~~ RAN
+2026-09-13 (both gate docs carry the results; the jumbo driver's rows b/d are
+real now and force the interface MTU over ssh; row c stays NOT RUN for want
+of the soak instrument); what remains is `docs/how-to/cut-a-release.md`, and
+the standing bar question — two more rate bars an order of magnitude below
+the rig's variance — for the maintainer; (3) a fleet re-run of
 the time-and-timers rows a/b/e under the paired statistic, and of row c under
 its restated bar. The cluster FSM / coordinated snapshots spec is
 `docs/superpowers/specs/2026-09-05-uc2-cluster-fsm-and-coordinated-snapshot-design.md`

@@ -1,13 +1,21 @@
-# uc2 jumbo-frame discovery gate — bars committed, no fleet run yet
+# uc2 jumbo-frame discovery gate — run 2026-09-13
 
-**Date:** 2026-09-12 (bars committed). **Fleet run: NOT RUN — no fleet spend
-has happened for this gate.** This file is the pre-commitment plan 2 Task 5
-writes; the date in its name is the date the bars were committed, which is the
-repo's convention for an unrun gate (`uc2-log-clock-gate-2026-09-08.md` is the
-nearest example). If a run lands on a different date, rename the file to that
-date and repoint the links in `RELEASES.md`, `docs/releases.md`,
-`docs/VERIFICATION.md`, `CLAUDE.md` and `bench-infra/scripts/jumbo_gate.py`.
-Every result cell below reads **UNRUN** until a run fills them in.
+**Bars committed:** 2026-09-12 (as `…-gate-2026-09-12.md`, the pre-commitment
+plan 2 Task 5 wrote). **Fleet run: 2026-09-13**, 4 × c6id.2xlarge, us-east-1a
+(the 2.11.0 gates' shape), driver `bench-infra/scripts/jumbo_gate.py` at
+`cf2ab77` (rows b and d implemented for the run; the pre-commitment's versions
+were print-only stubs). The file was renamed to the run date and its links
+repointed, as the pre-commitment said to do. Every result cell below now
+points into [Results](#results); the bar column is byte-identical to the
+pre-commitment.
+
+**Verdicts in one line:** rows **a** and **d** PASS; row **b**'s three
+functional clauses hold and its throughput clause is **inconclusive** (the
+pre-committed pair rule asked for 29 pairs, 12 were run, the paired mean sits
+0.8 pp below the bar inside a ±15 pp band) — recorded as the driver's FAIL,
+bar unmoved; row **c** NOT RUN (its blackhole probe cleared; the soak's
+instrument was never built — the maintainer's call, 2026-09-12); rows **e**
+and **f** reported, no bar.
 
 > **Decide rule committed before any run.** This document's bar table is
 > committed, with every result cell **UNRUN**, before any fleet run against
@@ -111,12 +119,12 @@ Rows e and f are **reported, no bar**.
 
 | row | arm | bar | result |
 |---|---|---|---|
-| a | AWS, 3 voters, interface MTU 9001 as provisioned | every node reports `uc2_datagram_mtu_bytes = 8960` within 10 s of the last node's start, 3 of 3 reps (errata 4: needs >= 2 nodes before any raise is observable) | **UNRUN** |
-| b | 1500 B path (interface MTU forced to 1500 by ansible on the same fleet) | rung stays 1408 on every node; `uc2_send_emsgsize_total = 0` throughout; `uc2_probe_sent_total` keeps CLIMBING throughout (errata 1 — not a leak); 64 B throughput paired delta against the base tree within −3 %, pair count fixed from the base tree's observed spread per the 2026-08-31 lesson, minimum 5 pairs | **UNRUN** |
-| c | the envelope-map brief's §6 disposition, run as written on the AWS arm | jumbo soak plateau ≥ 15 % over standard **and** the jumbo 64 B rung within −3 % of standard (throughput and p99) — this decides whether the runbook *recommends* jumbo, not whether the feature ships | **UNRUN** |
-| d | force gate on the 1500 B arm; then one node held down on the 9001 arm | all three nodes refuse **`jumbo_path_too_narrow`** within 30 s naming a peer; the two live nodes refuse **`jumbo_peer_silent`** naming the third | **UNRUN** |
-| e | appender relaxed load | `apply_bench`-style isolated A/B is the wrong harness (the appender is leader ingress); `m5_gate` on the fleet, standard arm, paired against the base tree — reported, **no bar**: rate bars for a one-load change cannot be resolved by this rig (the FSM-identity gate's row a straddled the same bar), and the number is recorded for the next gate to pair against | **UNRUN** |
-| f | client-hop cost of the per-submit cnc load | `scripts/hop1_ab.sh` with its same-source rebuild control, dev-box **smoke**, reported with the control's resolution, **no bar** | **UNRUN** |
+| a | AWS, 3 voters, interface MTU 9001 as provisioned | every node reports `uc2_datagram_mtu_bytes = 8960` within 10 s of the last node's start, 3 of 3 reps (errata 4: needs >= 2 nodes before any raise is observable) | **PASS** — 3/3 reps, every node at 8960 by +4.9 s ([results](#row-a)) |
+| b | 1500 B path (interface MTU forced to 1500 by ansible on the same fleet) | rung stays 1408 on every node; `uc2_send_emsgsize_total = 0` throughout; `uc2_probe_sent_total` keeps CLIMBING throughout (errata 1 — not a leak); 64 B throughput paired delta against the base tree within −3 %, pair count fixed from the base tree's observed spread per the 2026-08-31 lesson, minimum 5 pairs | functional clauses **HOLD**; throughput clause **INCONCLUSIVE** (driver: FAIL, "only 12 pairs, need ≥ 29"; mean −3.81 %, sem 7.62 pp) — bar unmoved ([results](#row-b)) |
+| c | the envelope-map brief's §6 disposition, run as written on the AWS arm | jumbo soak plateau ≥ 15 % over standard **and** the jumbo 64 B rung within −3 % of standard (throughput and p99) — this decides whether the runbook *recommends* jumbo, not whether the feature ships | **NOT RUN** — blackhole probe cleared (all nodes 8960 within 30 s); the soak's instrument does not exist ([results](#row-c)) |
+| d | force gate on the 1500 B arm; then one node held down on the 9001 arm | all three nodes refuse **`jumbo_path_too_narrow`** within 30 s naming a peer; the two live nodes refuse **`jumbo_peer_silent`** naming the third | **PASS** — 3/3 and 2/2, every refusal at its node's own 30 s window ([results](#row-d)) |
+| e | appender relaxed load | `apply_bench`-style isolated A/B is the wrong harness (the appender is leader ingress); `m5_gate` on the fleet, standard arm, paired against the base tree — reported, **no bar**: rate bars for a one-load change cannot be resolved by this rig (the FSM-identity gate's row a straddled the same bar), and the number is recorded for the next gate to pair against | **REPORTED** — −1.23 % (sem 4.53 pp, 3 pairs) ([results](#row-e)) |
+| f | client-hop cost of the per-submit cnc load | `scripts/hop1_ab.sh` with its same-source rebuild control, dev-box **smoke**, reported with the control's resolution, **no bar** | **REPORTED** — −2.29 % against a −0.68 % control, ranges overlap ([results](#row-f)) |
 
 Row c carries a path-MTU blackhole probe before the arm, as the envelope-map
 brief requires: with do-not-fragment in place (spec §4.3) that probe is
@@ -209,9 +217,147 @@ harness's build-to-build resolution before trusting any delta against it).
 
 ## Results
 
-**NOT RUN.** No fleet trip has happened for this gate. Every row above
-reads UNRUN; do not read any row as adjudicated until a run fills in this
-section and the bar table's result column is updated to point here.
+**Run 2026-09-13.** Fleet: 4 × c6id.2xlarge, us-east-1a, on-demand, cluster
+placement group, journals on instance-store NVMe (`/opt/bench` ext4), chrony
+in `Normal` on every host; interface `ens5` at MTU **9001** as provisioned.
+Head tree: `main` at `3d5c585` (jumbo + the quorum join gate + the bounded
+crashtest waits, on top of the log clock), rsynced to `/opt/bench/uc`;
+`uc2-node` built on each host, sha256 `f275f60a7ab6…` on all four. Base
+tree for rows b and e: `f46db43`, the last commit before jumbo, at
+`/opt/bench/uc-base`. Full transcript: the controller's
+`~/scratch/fleet-2026-09-13/` (`RUN-RECORD.md`, `jumbo-acd.log`,
+`jumbo-b.log`, `rowe.log`, `rowf.log`, `hop1-ab.log`).
+
+**Resolution on the day: 0.27 %** — `scripts/hop1_ab.sh` on node0, 6 reps,
+two builds of the same source at two different absolute paths (sha256
+`e7f1aa4e88df…` vs `065455d293b0…`, distinct — the 2026-09-07 lesson), A mean
+2 542 881 vs B mean 2 549 773 resp/s, ranges overlap.
+
+### Row a
+
+**PASS.** Three cold starts from wiped instance dirs; every node reported
+`uc2_datagram_mtu_bytes = 8960` within the window, and the adoption times
+were identical across reps to a tenth of a second:
+
+| rep | node0 | node1 | node2 |
+|---|---|---|---|
+| 1 | +1.7 s | +3.3 s | +4.9 s |
+| 2 | +1.7 s | +3.3 s | +4.8 s |
+| 3 | +1.7 s | +3.4 s | +4.9 s |
+
+(times from the last node's start; node0 adopts first because it is the
+leader and commits the raise, and the followers adopt it through the cluster
+FSM as the frame commits).
+
+### Row b
+
+Interface `ens5` forced to **1500** on all three voters for the whole row
+(driver `force_interface_mtu`, restored to 9001 afterwards and verified).
+
+**Functional clauses — all three HOLD.** Over a 60 s sample on a fresh
+real-daemon cluster (33 samples, 0 scrape misses): `uc2_datagram_mtu_bytes`
+read **1408** on every sample of every node; `uc2_send_emsgsize_total` read
+**0** throughout; `uc2_probe_sent_total` climbed fleet-wide from **53 to
+501** and never went flat — errata 1's "a narrow path probes forever" as
+predicted, not a leak.
+
+**Throughput clause — INCONCLUSIVE, recorded as the driver's FAIL; the bar
+is not moved.** The pre-committed rule fixes the pair count from the base
+tree's own spread: four base-only prelim reps read 1 600 937 / 1 417 225 /
+1 101 075 / 1 556 142 ops/s (sem/mean **7.96 %**), so `required_pairs`
+asked for **29**; the run's cap was 12. Twelve interleaved pairs (base first
+on odd pairs) on `m12_gate` clusters, 64 B, direct client on the leader host,
+the driver's standard 2 s warm-up / 8 s window:
+
+| pair | base | head | delta |
+|---|---|---|---|
+| 1 | 1 996 504 | 1 006 282 | −49.6 % |
+| 2 | 1 238 318 | 1 742 156 | +40.7 % |
+| 3 | 1 144 442 | 1 009 673 | −11.8 % |
+| 4 | 1 538 236 | 959 321 | −37.6 % |
+| 5 | 1 249 496 | 1 489 307 | +19.2 % |
+| 6 | 1 656 554 | 2 019 138 | +21.9 % |
+| 7 | 1 843 960 | 1 339 429 | −27.4 % |
+| 8 | 1 458 862 | 1 301 701 | −10.8 % |
+| 9 | 1 225 742 | 1 162 843 | −5.1 % |
+| 10 | 1 445 260 | 1 429 036 | −1.1 % |
+| 11 | 1 289 862 | 1 233 851 | −4.3 % |
+| 12 | 1 148 397 | 1 381 224 | +20.3 % |
+
+Paired mean **−3.81 %**, sem **7.62 pp** (2·sem = 15.2 pp). The mean sits
+0.8 pp below the −3 % bar, inside 2·sem by a factor of ~19. The base tree
+alone spans 1.10–2.00 M ops/s across its 16 reads on this rig, the same
+15–43 % arm-to-arm spread the 2.11.0 time-and-timers gate hit. This is not a
+pass and not a demonstrated regression: the rig cannot resolve a −3 % rate
+bar at 12 pairs, and the pre-committed rule says so rather than letting a
+noisy mean through. It is the same class of finding as the 2.11.0 gates'
+rows a/b/e (bar question #1 for the maintainer, still open). The driver's
+verdict text is the honest one: `only 12 pair(s), need >= 29`.
+
+### Row c
+
+**NOT RUN.** The pre-arm blackhole probe ran for real on a fresh cluster: all
+three nodes cleared the jumbo minimum inside the 30 s window (every one read
+8960). The soak beyond it is the envelope-map brief's own multi-rung
+instrument (`uc_node/examples/envelope_map.rs`, brief §3), which was never
+built; the maintainer chose on 2026-09-12 to record the row as NOT RUN rather
+than build it inside the release, since the row decides only whether the
+runbook *recommends* jumbo. Jumbo stays a documented knob.
+
+### Row d
+
+**PASS.** Arm 1 (`force_jumbo_frames = true` on all three, `ens5` at 1500):
+n0, n1, n2 fail-stopped `jumbo_path_too_narrow` naming peers 1, 0, 0. Arm 2
+(`ens5` back at 9001, two nodes forced, the third never started): n0 and n1
+fail-stopped `jumbo_peer_silent`, both naming node 2.
+
+| arm | node | reason | named peer | elapsed |
+|---|---|---|---|---|
+| 1500 | n0 | `jumbo_path_too_narrow` | 1 | +18.1 s |
+| 1500 | n1 | `jumbo_path_too_narrow` | 0 | +23.9 s |
+| 1500 | n2 | `jumbo_path_too_narrow` | 0 | +29.9 s |
+| 9001 − one | n0 | `jumbo_peer_silent` | 2 | +23.9 s |
+| 9001 − one | n1 | `jumbo_peer_silent` | 2 | +29.9 s |
+
+**Reading the elapsed column.** It is measured from the *last* unit's start
+to the refusal record's own `ts_ns`; the units are started one ssh round trip
+apart (~6 s), so each node fired at its **own** 30 s window and the
+last-started node reads 29.9 s. A reading of 30.1 s here would be an artefact
+of the reference point, not a bar miss — worth knowing before anyone re-runs
+this row on a slower control path.
+
+### Row e
+
+**Reported, no bar.** `m5_gate` standard arm (admission 64 KiB, inflight
+4096, 15 s, 64 B), head vs the pre-jumbo base tree, three interleaved pairs
+(head/base/base/head/base/head): head 1 007 403 / 1 008 652 / 973 162, base
+1 063 229 / 935 632 / 1 038 034 ops/s; paired delta **−1.23 %**, sem
+4.53 pp, against the day's 0.27 % resolution. Recorded for the next gate to
+pair against. (The `m5_gate` binary's own `RESULT` line reads FAIL on every
+run of *both* trees — that is the 2026-08-15 M5 engine bar it carries, not
+this row's question.)
+
+### Row f
+
+**Dev-box smoke, no bar.** `scripts/hop1_ab.sh`, 6 reps, 64 B, sink = A.
+Control (A = base `f46db43` vs A2 = the same source built at a different
+path): **−0.68 %**, ranges overlap. Row f (A vs B = head): **−2.29 %**,
+ranges overlap; A mean 5 703 244, B mean 5 572 458 resp/s, with one of B's
+six runs an outlier at 4 870 812 against 5.59–5.76 M on the other five.
+About three times the control's resolution, with an outlier: the per-submit
+cnc load's cost is not resolvable from this smoke, and per CLAUDE.md's
+standing rule it carries no bar.
+
+### What this run changes, and what it does not
+
+- Discovery converges (a), the force gate refuses by name on both arms (d),
+  a narrow path pins the rung with no EMSGSIZE and no probe leak (b's
+  functional clauses). Those are the feature's correctness claims on a real
+  fabric, and they hold.
+- The rig cannot resolve a −3 % rate bar (b) — the standing bar question from
+  the 2.11.0 gates, unchanged by this run.
+- Whether the runbook should *recommend* jumbo (c) is unanswered; the
+  runbook keeps jumbo as a knob.
 
 ## When this gate is run
 

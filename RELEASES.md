@@ -90,16 +90,20 @@ written.**
   2026-09-08. Each is bounded now. Diagnosability only: the hang's cause is
   still unexplained.
   [Engineering record](docs/releases.md#fixed-after-the-2110-tag).
-- **Performance: two gate docs, both pre-committed, neither run.** No number in
-  this release has been measured on a fleet. The jumbo gate's six rows
-  (convergence at the top rung, a 1500 B arm that must never raise, the
-  `force_jumbo_frames` refusals, the soak plateau that decides whether the
-  runbook *recommends* jumbo, and two no-bar cost rows) are committed with
-  every result cell reading UNRUN, driver `bench-infra/scripts/jumbo_gate.py`
-  — [the jumbo gate doc](docs/benchmarks/uc2-jumbo-frame-discovery-gate-2026-09-12.md).
-  The log clock's fleet A/B (`m14_fleet_gate.py` rows a/b/e, this tree vs its
-  pre-change parent commit) is likewise pre-committed and unrun —
-  [the log-clock gate doc](docs/benchmarks/uc2-log-clock-gate-2026-09-08.md).
+- **Performance: both gates ran on a fleet on 2026-09-13; no bar was moved.**
+  Jumbo: discovery converges on the top rung within 5 s of the last node's
+  start on every rep (row a, PASS); the `force_jumbo_frames` gate refuses by
+  name on both arms, each node at its own 30 s window (row d, PASS); a
+  1500 B path pins the rung at 1408 with zero `EMSGSIZE` and a probe counter
+  that keeps climbing as documented (row b's functional clauses hold). Row b's
+  −3 % throughput bar and the log clock's fleet A/B are both
+  **inconclusive**: the rig's arm-to-arm spread (40–50 % per arm) is an order
+  of magnitude above the bars, the same finding as the 2.11.0 gates, recorded
+  as such and not as a pass. Row c (whether the runbook should *recommend*
+  jumbo) was not run — its soak instrument was never built — so jumbo stays a
+  documented knob. Rows e and f are reported with no bar.
+  [Jumbo gate doc](docs/benchmarks/uc2-jumbo-frame-discovery-gate-2026-09-13.md) ·
+  [log-clock gate doc](docs/benchmarks/uc2-log-clock-gate-2026-09-08.md).
 
 ## v2.11.0 — 2026-09-08 — FSM identity, log time, the cluster FSM, and coordinated snapshots
 
