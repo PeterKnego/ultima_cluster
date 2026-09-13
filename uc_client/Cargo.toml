@@ -14,11 +14,11 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-uc_protocol = { path = "../uc_protocol", version = "2.11.0" }
-uc_log = { path = "../uc_log", version = "2.11.0" }
+uc_protocol = { path = "../uc_protocol", version = "2.12.0" }
+uc_log = { path = "../uc_log", version = "2.12.0" }
 # Jumbo spec §8: the developer notification. `uc_obs` is a dependency-free
 # std-only leaf, so the SDK's "small dep set" posture holds.
-uc_obs = { path = "../uc_obs", version = "2.11.0" }
+uc_obs = { path = "../uc_obs", version = "2.12.0" }
 bytes = { workspace = true }
 serde = { workspace = true }
 bincode = { workspace = true }
@@ -33,5 +33,5 @@ thiserror = { workspace = true }
 # manifest instead (standard idiom for a dev-only test-time-only dependency).
 uc_node = { path = "../uc_node" }
 uc_service = { path = "../uc_service" }
-uc_net = { path = "../uc_net", version = "2.11.0" }
+uc_net = { path = "../uc_net", version = "2.12.0" }
 tempfile = { workspace = true }

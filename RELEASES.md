@@ -7,7 +7,7 @@ analyses, wire-version mechanics, upgrade remedies — is
 (pre-committed bars, fleet runs) are in
 [`docs/benchmarks/`](docs/benchmarks).
 
-## 2.12.0 (unreleased) — jumbo frames, and the monotonic log clock
+## v2.12.0 — 2026-09-13 — jumbo frames, and the monotonic log clock
 
 Two features on one flag day. The command payload ceiling stops being a source
 constant and becomes a **measurement of the paths between nodes**, committed
@@ -17,8 +17,7 @@ backward wall-clock step no longer freezes the log's time. Wire `0.7.0` →
 node**, and delete `max_payload` from every `node.toml` first — the key is
 retired and refused by name. Step-by-step:
 [Upgrade a cluster § 2.12.0](docs/how-to/upgrade-a-cluster.md#wire--cnc-change-in-2120-jumbo-frames-080-cnc-32).
-No instance directory needs clearing. **Not tagged and not published as this is
-written.**
+No instance directory needs clearing.
 
 - **Jumbo frames: the command payload ceiling is discovered from the network,
   not configured.** Every node probes every peer up a fixed ladder of datagram

@@ -31,7 +31,8 @@ fallible `try_meta()`, plus the boot-gap attach refusal found reviewing it;
 overrides, `uc_obs`, the `ultima_db` removal and the Broadcast-ring
 memory-ordering fix; `2.9.0` the `uc_*` crate rename.
 
-**Pending: `2.12.0` — NOT tagged, NOT published, neither gate run.** Two
+**Pending: `2.12.0` — version bumped, writeup and gates done, tag and
+publish still ahead** (`docs/how-to/cut-a-release.md` §2–§7). Two
 features on one flag day, wire `0.7.0` → `0.8.0` and cnc `3.1` → `3.2`:
 **jumbo-frame discovery** (the command payload ceiling is measured from the
 paths between nodes and committed cluster-wide, monotone — `RUNGS = [1408,
@@ -52,8 +53,8 @@ called for (a feasible re-run), while the log clock's 0.27 % bar sits under
 per-arm sems of 3.4–19 % (the 2.11.0 gates' open bar question, unchanged);
 row c was NOT RUN (no soak instrument; jumbo stays a knob). No bar was moved.
 B-lite's disposition is undetermined, not closed. The
-workspace version is still `2.11.0`: the bump, the tag and the publish all
-happen in `docs/how-to/cut-a-release.md`, not in the feature work. The
+workspace version is `2.12.0` since 2026-09-13 (the bump is §1 of
+`docs/how-to/cut-a-release.md`; the tag and the publish are §4–§6). The
 release writeup is in `RELEASES.md` and `docs/releases.md`; the explainer is
 `docs/notes/uc2-jumbo-frame-discovery-explained.md`, the how-to
 `docs/how-to/jumbo-frames.md`, and the spec
@@ -238,7 +239,7 @@ one log stream (#11); the release-ledger line (#5) is process, not code
     reads its clock **once per pass** and stamps every frame
     `max(now, last)` inside `uc_log::Appender`, so the log's time never
     goes backwards; `ctx.time_ns` is the FSM's deterministic "now" and
-    `query` gets none. Since the (unreleased) `2.12.0` that read is
+    `query` gets none. Since `2.12.0` that read is
     `CLOCK_MONOTONIC` plus a sampled epoch offset (`uc_node::log_clock`): a
     backward wall step is smeared at 500 ppm, never frozen — spec
     `docs/superpowers/specs/2026-09-08-uc2-monotonic-log-clock-design.md`.

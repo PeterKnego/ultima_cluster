@@ -1,13 +1,13 @@
 # ultima_cluster releases
 
-## 2.12.0 (unreleased) — jumbo frames, and the monotonic log clock
+## v2.12.0 — 2026-09-13 — jumbo frames, and the monotonic log clock
 
 **Two features on one flag day: wire `0.7.0` → `0.8.0` and cnc `3.1` → `3.2`.**
 Baseline for both: the tagged `v2.11.0` (wire `0.7.0`, cnc `3.1`) — the log clock
-landed on `main` first, and the jumbo branch points at `main` after it. **Not
-tagged, not published, and neither feature's fleet gate has been run** as this
-entry is written: every number below that is not a source constant is a bar, not
-a measurement.
+landed on `main` first, and the jumbo branch points at `main` after it. Both
+fleet gates ran on 2026-09-13 (the evidence table at the end of this entry):
+every number below that is neither a source constant nor in a gate doc's
+Results section is a bar, not a measurement.
 
 Neither was a ranked `docs/BACKLOG.md` direction. Jumbo frames stood in
 CLAUDE.md's "Next up" as the natural home for a wire flag day, and it answers one
@@ -375,9 +375,9 @@ the whole nightly.
 
 ### Release evidence
 
-**Nothing has been run on a fleet for this release, and nothing is tagged or
-published.** The table below is the shape the `2.11.0` entry's own evidence table
-has; every row that needs a run says so.
+The table below is the shape the `2.11.0` entry's own evidence table has;
+every row that needs a run says so, and the post-tag rows are filled at tag
+time.
 
 | what | evidence | result |
 |---|---|---|
