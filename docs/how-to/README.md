@@ -76,6 +76,9 @@ something is wrong" below.
 
 ## Building on it
 
+Read [the SDLC standard for applications](../reference/application-sdlc.md)
+first: it is the lifecycle every page below is a step of.
+
 - [Write a service binary](write-a-service-binary.md) — the lifecycle template
   for the half that runs your state machine: signal handling, apply-agent
   supervision, and why leaving either out fails quietly.

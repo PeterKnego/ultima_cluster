@@ -31,6 +31,10 @@ What a service binary is written against.
 - [The state-machine contract](state-machine-contract.md) — the two tiers
   (`RawStateMachine`/`StateMachine`), their exact signatures, the
   byte-identity promise, and the `out`-buffer discipline.
+- [SDLC standard for applications](application-sdlc.md) — the lifecycle an
+  application on UC is held to: the design note, the determinism rules,
+  schema and snapshot versioning, the test pyramid, rollout and rollback,
+  and the observability a feature must expose before it is production-ready.
 
 ## Compatibility
 

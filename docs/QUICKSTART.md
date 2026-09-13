@@ -464,6 +464,9 @@ it, and refuses to publish anything if it does not print `PASS`.
   control planes, the apply path.
 - **[VERIFICATION.md](/docs/VERIFICATION.md)** — what is proved, what is
   checked, what is only bug-hunted, and what is not verified at all.
+- **[SDLC standard for applications](/docs/reference/application-sdlc.md)** —
+  the lifecycle an application on UC is held to, from the design note to
+  the upgrade playbook; read it before the two pages below.
 - **[Write a service binary](/docs/how-to/write-a-service-binary.md)** — your
   state machine, in its own process, attached to a node.
 - **[The state-machine contract](/docs/reference/state-machine-contract.md)** —
