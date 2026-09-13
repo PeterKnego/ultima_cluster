@@ -397,14 +397,15 @@ time.
 | `ci.yml` (fmt gate, clippy, workspace tests, MSRV 1.89, deny, publish-check) | run `34746045116` on `83ea36b`, the release-prep head (its predecessor `34745808399` on the bump commit failed on two pre-existing defects, both fixed in that head: the daemon's SIGTERM-during-boot race and publish-check's stale leaf list) | success |
 | `docs.yml` (rustdoc, link check) | run `34746045127` on `83ea36b` | success |
 | `release.yml` dry run (build ×2, SBOM, `release-smoke`; no signing, no publish) | dispatch run `34745808415` on `7b578b0` (the bump commit; the two later commits touch the daemon's signal registration and `ci.yml` only) | success |
-| `release.yml` on the tag (release, image, cosign) | — | pending the tag |
+| `release.yml` on the tag (release, image, cosign) | run `34772128239` on tag `v2.12.0` (`a5c42a8`) | success — the first tag push, run `34748330260`, built and smoked clean but its `release` job hit three GitHub 5xx responses creating the release object, and both job re-runs then sat queued nine hours with no job scheduled; the tag was deleted and re-pushed to get a fresh run |
 | the per-task gate the feature branches ran: `cargo fmt --all -- --check`, four `clippy` invocations, `cargo test --workspace --exclude uc_node`, and the thirteen `uc_node` suites plus its lib | last run 2026-09-12 on the jumbo plan-2 head: fmt clean, clippy clean, 83 `test result: ok` lines outside `uc_node`, and 318 lib + 13 suites green | **green locally** — a dev box, and not the whole `docs/VERIFICATION.md` surface |
 | the rest of the proof surface (`docs/VERIFICATION.md`): the lin capstones, hard-crash, Elle, loom, Lean + conformance, fuzz smoke | no whole-tree release pass yet — the release procedure's own step | pending |
 | jumbo fleet gate (rows a–f) | [`benchmarks/uc2-jumbo-frame-discovery-gate-2026-09-13.md`](benchmarks/uc2-jumbo-frame-discovery-gate-2026-09-13.md) | **RAN 2026-09-13** — a PASS, d PASS, b functional clauses hold / throughput inconclusive (12 of 29 pairs), c NOT RUN, e and f reported; no bar moved |
 | log-clock fleet A/B (`m14_fleet_gate.py` tt-row a) | [`benchmarks/uc2-log-clock-gate-2026-09-08.md`](benchmarks/uc2-log-clock-gate-2026-09-08.md) | **RAN 2026-09-13** — inconclusive: per-arm sem 3.4–19 % vs R = 0.27 %; ships on behaviour, bar unmoved |
 | the M10 alert tier, with the three new jumbo rules | `scripts/m10_alert_fire.sh` (synthetic scenarios `mtu_discovery_stalled`, `path_below_mtu`, `jumbo_gate_held`) | **green locally** 2026-09-12, 26/26 rules fire under promtool — a local tier, not a fleet result |
-| artifact integrity (`sha256sum -c`) | — | pending |
-| artifact provenance (`cosign verify-blob`) | — | pending |
+| artifact integrity (`sha256sum -c`) | `cut-a-release.md` §5, run 2026-09-13 from a clean directory against the downloaded release assets | **OK** — all three archives (x86_64, aarch64, SBOM) |
+| artifact provenance (`cosign verify-blob`, `cosign verify`) | same §5 run, identity pinned to `…/release.yml@refs/tags/v.*` at the GitHub OIDC issuer | **Verified OK** — both tarball bundles, `SHA256SUMS`, and the image `ghcr.io/peterknego/uc2:2.12.0` |
+| release quickstart, from the unpacked tarball | same §5 run: `packaging/quickstart-local.sh` — three nodes, three services, three gateways, an election, two committed writes and a linearizable read | **PASS**; `uc2-node`, `uc2ctl` and `uc2-gateway` each print `2.12.0` for `--version`, which closes the gateway gap 2.10.0 shipped with |
 | crates.io (13 crates, `uc_service` before `uc_node`) | — | pending |
 
 ## v2.11.0 — 2026-09-08 — FSM identity, log time, the cluster FSM, and coordinated snapshots
