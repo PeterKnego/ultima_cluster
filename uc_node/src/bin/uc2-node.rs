@@ -106,6 +106,26 @@ fn main() -> ExitCode {
     let id = cfg.id;
     let bind = cfg.bind;
     let instance_dir = cfg.instance_dir.clone();
+
+    // The stop flag is installed BEFORE the node exists. It used to be
+    // registered after `Node::start_with` returned, which left a window —
+    // from the cnc page's creation inside `start_with` (the moment a
+    // supervisor or a test can see the node "started") to the registration —
+    // in which SIGTERM took its default action: the daemon died by signal
+    // (exit status 143 under systemd, `unix_wait_status(15)` to a test)
+    // instead of draining and exiting 0. `systemctl stop` racing a start,
+    // or `daemon_refusals`' SIGTERM-on-first-sight test, hit it about once
+    // in 25 runs. The flag is only read by the main loop below, so a signal
+    // caught during boot simply makes the first pass exit through the same
+    // drain path a signal caught later does.
+    let stop = Arc::new(AtomicBool::new(false));
+    for sig in [signal_hook::consts::SIGTERM, signal_hook::consts::SIGINT] {
+        if let Err(e) = signal_hook::flag::register(sig, Arc::clone(&stop)) {
+            eprintln!("uc2-node: cannot install signal handler: {e}");
+            return ExitCode::from(1);
+        }
+    }
+
     let node = match Node::start_with(
         cfg,
         StartOpts {
@@ -146,15 +166,6 @@ fn main() -> ExitCode {
                 node.stop();
                 return ExitCode::from(1);
             }
-        }
-    }
-
-    let stop = Arc::new(AtomicBool::new(false));
-    for sig in [signal_hook::consts::SIGTERM, signal_hook::consts::SIGINT] {
-        if let Err(e) = signal_hook::flag::register(sig, Arc::clone(&stop)) {
-            eprintln!("uc2-node: cannot install signal handler: {e}");
-            node.stop();
-            return ExitCode::from(1);
         }
     }
 

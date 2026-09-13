@@ -81,6 +81,14 @@ No instance directory needs clearing.
   `ClientError::NodeBooting` — retry), and the node stores the lag policy
   BEFORE the declared set so a published set implies a published policy.
   Found by review of the `CncPage::meta()` fix; pre-existing since 2.8.0.
+- **Fixed: a stop signal during `uc2-node`'s own startup no longer kills it
+  by signal.** The daemon registered its `SIGTERM`/`SIGINT` handler only
+  after the node had started, so a `systemctl stop` that raced a start (or
+  a supervisor that signalled on first sight of the cnc page) hit the
+  default action and the process died with status 143 instead of draining
+  and exiting 0. The handler is registered before the node starts; a signal
+  caught during boot exits through the same drain path. Found by CI on the
+  release commit, reproduced locally at about one run in twenty-five.
 - **Fixed: a wedged worker in the multi-process crash tests now fails by
   name instead of hanging a nightly for an hour.** The remote lincheck
   capstone's worker and chaos-thread joins, the hard-crash and survival

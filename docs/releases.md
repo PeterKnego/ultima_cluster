@@ -373,6 +373,19 @@ diagnosability fix, not a cure: the hang's cause is still unexplained, and the
 next occurrence now fails with a name and a location instead of cancelling
 the whole nightly.
 
+**`uc2-node` registers its stop signal before the node starts** (2026-09-13,
+found by CI on the release-prep commit). The `SIGTERM`/`SIGINT` flag was
+registered after `Node::start_with` returned, which left a window — from the
+cnc page's creation inside `start_with`, the moment a supervisor or a test can
+see the node as started, to the registration — in which a signal took its
+default action and the daemon died by signal (status 143 under systemd;
+`unix_wait_status(15)` to `daemon_refusals`' SIGTERM-on-first-sight test,
+which had flaked once during the jumbo work and was noted as pre-existing).
+Reproduced locally at 1 failure in 25 runs before the fix; 0 in 25 after (the
+whole seven-test suite each time). The flag is only read by the main loop, so
+a signal caught during boot makes the first pass exit through the ordinary
+drain path. Pre-existing since M9 (`2.3.0`), the daemon's first release.
+
 ### Release evidence
 
 The table below is the shape the `2.11.0` entry's own evidence table has;
