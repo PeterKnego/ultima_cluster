@@ -394,9 +394,10 @@ time.
 
 | what | evidence | result |
 |---|---|---|
-| `ci.yml` (fmt gate, clippy, workspace tests, MSRV 1.89) | — | pending |
-| `docs.yml` (rustdoc, link check) | — | pending |
-| `release.yml` (build, SBOM, cosign, image) | — | pending |
+| `ci.yml` (fmt gate, clippy, workspace tests, MSRV 1.89, deny, publish-check) | run `34746045116` on `83ea36b`, the release-prep head (its predecessor `34745808399` on the bump commit failed on two pre-existing defects, both fixed in that head: the daemon's SIGTERM-during-boot race and publish-check's stale leaf list) | success |
+| `docs.yml` (rustdoc, link check) | run `34746045127` on `83ea36b` | success |
+| `release.yml` dry run (build ×2, SBOM, `release-smoke`; no signing, no publish) | dispatch run `34745808415` on `7b578b0` (the bump commit; the two later commits touch the daemon's signal registration and `ci.yml` only) | success |
+| `release.yml` on the tag (release, image, cosign) | — | pending the tag |
 | the per-task gate the feature branches ran: `cargo fmt --all -- --check`, four `clippy` invocations, `cargo test --workspace --exclude uc_node`, and the thirteen `uc_node` suites plus its lib | last run 2026-09-12 on the jumbo plan-2 head: fmt clean, clippy clean, 83 `test result: ok` lines outside `uc_node`, and 318 lib + 13 suites green | **green locally** — a dev box, and not the whole `docs/VERIFICATION.md` surface |
 | the rest of the proof surface (`docs/VERIFICATION.md`): the lin capstones, hard-crash, Elle, loom, Lean + conformance, fuzz smoke | no whole-tree release pass yet — the release procedure's own step | pending |
 | jumbo fleet gate (rows a–f) | [`benchmarks/uc2-jumbo-frame-discovery-gate-2026-09-13.md`](benchmarks/uc2-jumbo-frame-discovery-gate-2026-09-13.md) | **RAN 2026-09-13** — a PASS, d PASS, b functional clauses hold / throughput inconclusive (12 of 29 pairs), c NOT RUN, e and f reported; no bar moved |
