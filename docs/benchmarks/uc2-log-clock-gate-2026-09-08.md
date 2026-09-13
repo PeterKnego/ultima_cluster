@@ -6,6 +6,10 @@ rig cannot resolve the bar) and is recorded as such under the
 honest-failure protocol — see [Results](#row-a-fleet-run-2026-09-13). The
 filename keeps the bars' date: the run did not change them.
 
+**Shipped in `2.12.0`**, tagged 2026-09-13 at `a5c42a8`; all 13 crates
+published the same day. The feature ships on its behaviour, not on this bar:
+row a stays inconclusive and the bar stays where it was committed.
+
 > **Decide rule committed before any run.** This document's bar table is
 > committed, with every result cell filled with either a real result (rows
 > b, c, d — all off-fleet) or "not run" (row a), **before** any fleet run

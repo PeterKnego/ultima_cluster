@@ -14,12 +14,17 @@ took those names in the `uc2_*` → `uc_*` rename (see `RELEASES.md`), so a
 pre-rename commit or doc naming them means the deleted v1 crate, not this
 code.
 
-**Current version: `2.11.0`** — tagged 2026-09-08 at `ff0f5b6`: FSM identity,
+**Current version: `2.12.0`** — tagged 2026-09-13 at `a5c42a8`: jumbo-frame
+discovery and the monotonic log clock, one flag day (wire `0.7.0` → `0.8.0`,
+cnc `3.1` → `3.2`); the next block is what it shipped and how it was gated.
+All 13 crates published to crates.io the same day in 68 s, zero retries, so
+`2.12.0` is the newest crates.io version.
+
+`2.11.0` — tagged 2026-09-08 at `ff0f5b6`: FSM identity,
 log time and timers, the replicated schedule table, the cluster FSM, and
 coordinated snapshot instants, one flag day (wire `0.6.0` → `0.7.0`, cnc
 `3.0` → `3.1`). All 13 crates published to crates.io the same
-day (`cut-a-release.md` §6, `uc_service` now before `uc_node`), so `2.11.0`
-is the newest crates.io version. Both fleet gates ran 2026-09-07/08 and every row is
+day (`cut-a-release.md` §6, `uc_service` now before `uc_node`). Both fleet gates ran 2026-09-07/08 and every row is
 recorded in its gate doc with no bar moved: three PASS, two honest FAIL (timer
 precision — bar since restated; the coordinated-snapshot arm's introduction
 cost, since absorbed), four inconclusive (rate bars an order of magnitude below
@@ -31,8 +36,9 @@ fallible `try_meta()`, plus the boot-gap attach refusal found reviewing it;
 overrides, `uc_obs`, the `ultima_db` removal and the Broadcast-ring
 memory-ordering fix; `2.9.0` the `uc_*` crate rename.
 
-**Pending: `2.12.0` — version bumped, writeup and gates done, tag and
-publish still ahead** (`docs/how-to/cut-a-release.md` §2–§7). Two
+**`2.12.0` — RELEASED 2026-09-13** (tag `v2.12.0` at `a5c42a8`; the whole of
+`docs/how-to/cut-a-release.md` §1–§7 is done, artifacts verified and all 13
+crates live). Two
 features on one flag day, wire `0.7.0` → `0.8.0` and cnc `3.1` → `3.2`:
 **jumbo-frame discovery** (the command payload ceiling is measured from the
 paths between nodes and committed cluster-wide, monotone — `RUNGS = [1408,
@@ -52,9 +58,13 @@ different reasons — jumbo b's −3 % was run at 12 of the 29 pairs its rule
 called for (a feasible re-run), while the log clock's 0.27 % bar sits under
 per-arm sems of 3.4–19 % (the 2.11.0 gates' open bar question, unchanged);
 row c was NOT RUN (no soak instrument; jumbo stays a knob). No bar was moved.
-B-lite's disposition is undetermined, not closed. The
-workspace version is `2.12.0` since 2026-09-13 (the bump is §1 of
-`docs/how-to/cut-a-release.md`; the tag and the publish are §4–§6). The
+B-lite's disposition is undetermined, not closed. The tag's own
+run wedged once: the first `v2.12.0` push built and smoked clean, then its
+publish job hit three GitHub 5xx responses creating the release object and
+both job re-runs sat queued for nine hours with no job scheduled — the tag was
+deleted and re-pushed, and run `34772128239` published it. Deleting a pushed
+tag is safe ONLY while no release object references it and nothing is on
+crates.io yet; after §6 it is not. The
 release writeup is in `RELEASES.md` and `docs/releases.md`; the explainer is
 `docs/notes/uc2-jumbo-frame-discovery-explained.md`, the how-to
 `docs/how-to/jumbo-frames.md`, and the spec
@@ -99,18 +109,20 @@ rate-limit note is now measured on both runs: crates.io limits **new crate
 names** hard and new *versions* barely at all, so `2.9.0`'s twelve new
 names took 62 minutes and `2.10.0`'s one took 59 seconds.)
 
-Next up, now that `2.11.0` is tagged and published: (1) ~~bound the three
-unbounded waits in `examples/uc_crashtest/tests/remote_lin.rs`~~ — DONE
-2026-09-12 (`common::join_within`, a 30 s `Reap::drop`; the 58-minute hang of
-2026-09-08 is still unexplained, it just fails with a name now); (2) **run the
-two `2.12.0` fleet gates and cut the release** — ~~the gates~~ RAN
-2026-09-13 (both gate docs carry the results; the jumbo driver's rows b/d are
-real now and force the interface MTU over ssh; row c stays NOT RUN for want
-of the soak instrument); what remains is `docs/how-to/cut-a-release.md`, and
-the standing bar question — two more rate bars an order of magnitude below
-the rig's variance — for the maintainer; (3) a fleet re-run of
-the time-and-timers rows a/b/e under the paired statistic, and of row c under
-its restated bar. The cluster FSM / coordinated snapshots spec is
+Next up, now that `2.12.0` is tagged and published: (1) **the standing bar
+question** — the `2.12.0` gates added two more rate bars an order of magnitude
+below the rig's variance, so four bars across two releases are now unadjudicable
+as written; how to construct a rate bar this rig can actually rule on is a
+maintainer decision, not a run; (2) a feasible **re-run of jumbo row b at the
+29 pairs its own rule calls for** — the 2026-09-13 run judged 12, which is why
+its −3 % is inconclusive rather than a verdict; (3) **row c's soak instrument**,
+which does not exist, so that row stays NOT RUN and jumbo stays a knob; (4) a
+fleet re-run of the time-and-timers rows a/b/e under the paired statistic, and
+of row c under its restated bar; (5) **B-lite's disposition**, still
+undetermined. Two carried-over unknowns, neither blocking: the 58-minute
+`remote_lin` hang of 2026-09-08 is still unexplained (it fails with a name now,
+since `common::join_within` and the 30 s `Reap::drop` landed 2026-09-12), and
+`nightly.yml` has still never run on a tag commit. The cluster FSM / coordinated snapshots spec is
 `docs/superpowers/specs/2026-09-05-uc2-cluster-fsm-and-coordinated-snapshot-design.md`
 (read its two "Errata … as built" sections before the body); its three plans
 (`docs/superpowers/plans/2026-09-06-uc2-cluster-fsm-plan1.md`,
@@ -165,12 +177,12 @@ loops). The other ranked directions, each with the
 doc that first recorded it, are in `docs/BACKLOG.md` (update its line when
 an item is taken up or dropped). `2.10.0` shipped 2026-08-31 (tag
 `v2.10.0`, all 13 crates published; the release-evidence table is at the
-top of `docs/releases.md`). It left two items open, neither a blocker:
-`nightly.yml` has never run on the tag commit, and `uc2-gateway` shipped
-without a `--version` flag while `uc2-node` and `uc2ctl` have one — the
-second is **fixed on `main`** (clap emits `--version` only under
-`#[command(version)]`; a unit test now guards it) and lands in the next
-release. M14c2 is done — the two-FSM capstones
+top of `docs/releases.md`). It left two items open, neither a blocker.
+`uc2-gateway` shipping without a `--version` flag while `uc2-node` and
+`uc2ctl` had one is **CLOSED**: clap emits `--version` only under
+`#[command(version)]`, a unit test guards it, and the `2.12.0` release
+tarball's own §5 run has all three binaries printing `2.12.0`.
+`nightly.yml` having never run on a tag commit is still open. M14c2 is done — the two-FSM capstones
 (`lin_v2 two_fsm*`, `lin_partition_v2`, the two hard-crash scenarios, the
 Elle `quiet_two_fsm` pass), the lockstep verdict (an operating-envelope
 fact, not a defect) and the `--pin` fleet rig shipped as `2.8.1`. The rig's
@@ -204,11 +216,10 @@ one log stream (#11); the release-ledger line (#5) is process, not code
 
 ### Standing facts that bind new work
 
-- **The wire protocol SHIPPED is 0.7.0** (`2.11.0`, cnc `3.1`; next bullet);
-  **`0.8.0` + cnc `3.2` are implemented and UNRELEASED** in the pending
-  `2.12.0` (two pairwise datagram kinds, 24/25, and one cnc word at 3984 — no
-  layout change either side, so a `0.7.0` peer drops the probes and such a
-  cluster simply never raises its ceiling).
+- **The wire protocol SHIPPED is 0.8.0** (`2.12.0`, cnc `3.2`) — two pairwise
+  datagram kinds, 24/25, and one cnc word at 3984, with no layout change
+  either side, so a `0.7.0` peer drops the probes and such a cluster simply
+  never raises its ceiling. `0.7.0` + cnc `3.1` was `2.11.0`.
   Before 0.7.0, `0.6.0` changed `SNAP_BEGIN` only; a `0.5.0` sender's session is refused by name,
   so a mixed cluster stalls a joiner rather than installing half a set); the
   node↔node wire and the `cnc.dat` page layout are **flag days, never

@@ -19,6 +19,12 @@ and **f** reported, no bar. The driver's own exit verdicts: `--arms a,c,d`
 → `RESULT: NOT RUN (exit 3)` (row c's stub outranks the two passes);
 `--arms b` → `RESULT: FAIL (exit 1)`.
 
+**Shipped in `2.12.0`**, tagged 2026-09-13 at `a5c42a8`; all 13 crates
+published the same day. This gate's verdicts are what the release shipped on:
+no bar was moved, row b's throughput clause and row c stay open exactly as
+recorded above, and `docs/releases.md`'s 2.12.0 release-evidence table links
+back here.
+
 > **Decide rule committed before any run.** This document's bar table is
 > committed, with every result cell **UNRUN**, before any fleet run against
 > it — the honest-failure protocol carried forward from

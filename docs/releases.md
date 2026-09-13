@@ -406,7 +406,7 @@ time.
 | artifact integrity (`sha256sum -c`) | `cut-a-release.md` §5, run 2026-09-13 from a clean directory against the downloaded release assets | **OK** — all three archives (x86_64, aarch64, SBOM) |
 | artifact provenance (`cosign verify-blob`, `cosign verify`) | same §5 run, identity pinned to `…/release.yml@refs/tags/v.*` at the GitHub OIDC issuer | **Verified OK** — both tarball bundles, `SHA256SUMS`, and the image `ghcr.io/peterknego/uc2:2.12.0` |
 | release quickstart, from the unpacked tarball | same §5 run: `packaging/quickstart-local.sh` — three nodes, three services, three gateways, an election, two committed writes and a linearizable read | **PASS**; `uc2-node`, `uc2ctl` and `uc2-gateway` each print `2.12.0` for `--version`, which closes the gateway gap 2.10.0 shipped with |
-| crates.io (13 crates, `uc_service` before `uc_node`) | — | pending |
+| crates.io (13 crates, `uc_service` before `uc_node`) | `cut-a-release.md` §6, run 2026-09-13 in dependency order, each crate's sparse-index entry confirmed before the next | **all 13 live at 2.12.0 in 68 s**, zero retries — no new crate name in this release, so the new-name rate limit that cost `2.9.0` 62 minutes never applied |
 
 ## v2.11.0 — 2026-09-08 — FSM identity, log time, the cluster FSM, and coordinated snapshots
 
