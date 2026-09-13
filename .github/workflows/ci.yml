@@ -177,17 +177,22 @@ jobs:
           -p uc_journal -p uc_protocol -p uc_obs -p uc_crypto -p uc_log
           -p uc_consensus -p uc_net -p uc_client -p uc_service -p uc_node
           -p uc_remote -p uc_gateway -p uc_ctl
-      # The 5 leaves (no path dependencies of their own: uc_journal,
-      # uc_protocol, uc_obs, uc_remote, uc_consensus) are the only crates that can
-      # be `cargo publish --dry-run`'d before anything is actually on
-      # crates.io — every other crate's path deps can't resolve from the
-      # real registry yet. The real, sequential, manual publish order for a
-      # release is `docs/how-to/cut-a-release.md` (M12c Task 4); this job
-      # only smoke-tests that packaging itself still works.
-      - name: cargo publish --dry-run (the 5 dependency-free leaves)
+      # The 4 leaves (no path dependencies of their own: uc_journal,
+      # uc_protocol, uc_obs, uc_consensus) are the only crates that can be
+      # `cargo publish --dry-run`'d before anything is actually on crates.io
+      # — every other crate's path deps can't resolve from the real registry
+      # yet. `uc_remote` was in this list until 2.12.0's version bump: it has
+      # depended on `uc_obs` since 2.10.0, so its dry-run resolves
+      # `uc_obs = "^<new>"` against the registry and can only pass AFTER that
+      # version is published — the bump commit's CI failed on exactly that
+      # (2026-09-13), and it had passed on 2.11.0 only because that push
+      # landed after the publish. It is still packaged in the batched step
+      # above. The real, sequential, manual publish order for a release is
+      # `docs/how-to/cut-a-release.md` (M12c Task 4); this job only
+      # smoke-tests that packaging itself still works.
+      - name: cargo publish --dry-run (the 4 dependency-free leaves)
         run: |
           cargo publish --dry-run -p uc_journal
           cargo publish --dry-run -p uc_protocol
           cargo publish --dry-run -p uc_obs
-          cargo publish --dry-run -p uc_remote
           cargo publish --dry-run -p uc_consensus
