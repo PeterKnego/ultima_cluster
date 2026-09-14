@@ -1,7 +1,7 @@
 # Rolling upgrades — what it would take to make the wire and the cnc page backward compatible
 
-*Written 2026-09-13 against the pending `2.12.0` tree (wire `0.8.0`, cnc
-`3.2`). The question: what would it take for `ultima_cluster` to be upgraded
+*Written 2026-09-13 against the `2.12.0` tree (wire `0.8.0`, cnc `3.2`;
+released the same day, tag `v2.12.0`). The question: what would it take for `ultima_cluster` to be upgraded
 one node at a time instead of on a flag day? Repo evidence is cited by
 `path:line` (line numbers as of the tree this was written on) or commit; external claims cite the first-party page they were read from.
 Anything not checked is marked "not verified". Status: an assessment, not a

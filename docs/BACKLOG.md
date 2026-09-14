@@ -215,6 +215,16 @@ deferred by name:
   the gap between "deployable" and "operable at scale".
 - **Cost:** high — both items touch consensus and are a wire flag day
   themselves.
+- **Researched 2026-09-13/14, tracked as
+  [#31](https://github.com/PeterKnego/ultima_cluster/issues/31)** — the
+  version-negotiation item only. `docs/notes/uc2-rolling-upgrade-compatibility-assessment.md`
+  inventories every compatibility surface and recommends a committed,
+  monotone cluster **wire level** in the Settings record (the jumbo-rung
+  shape; the kernel and Lean model untouched), with the next flag day
+  reserving the carriers so it is the last one of the 0.x line for additive
+  changes. `docs/notes/uc2-aeron-cluster-upgrade-model.md` is the
+  comparator: Aeron Cluster has no supported rolling upgrade and no
+  committed level. Leadership transfer is not covered by either note.
 
 ### 4. Geo — async cross-region learner with a stale-read mode
 
