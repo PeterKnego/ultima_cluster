@@ -10,7 +10,7 @@ only in persona:
 
 | | builder | operator |
 |---|---|---|
-| directory | `~/ultima/kv-dogfood/` | `~/ultima/kv-ops/` |
+| directory | `~/ultima/kv_store/` | `~/ultima/kv-ops/` |
 | persona rules | `CLAUDE.md` (builder) | `CLAUDE.md` (operator) |
 | task input, handed over later | `BRIEF.md` (ticket "Write the builder's brief") | `CARD.md` + `HOSTS.md` per scenario (ticket "Design the operator scenario cards") |
 | `docs-snapshot/` | the published-docs tier at `main` commit `1b47f4e`, 92 files | same |
@@ -69,7 +69,7 @@ read that no wall can remove: walls 2 and 3 both name it.
 
 ```sh
 # builder: after BRIEF.md has been placed in the directory
-cd ~/ultima/kv-dogfood && claude
+cd ~/ultima/kv_store && claude
 # operator: after CARD.md and HOSTS.md have been placed
 cd ~/ultima/kv-ops && claude
 ```
@@ -77,7 +77,7 @@ cd ~/ultima/kv-ops && claude
 Start it from a **fresh terminal**, not from inside a session that has
 `ultima_cluster` open. Claude Code keys project memory and transcripts on
 the working directory, so each sandbox gets its own empty memory and its
-own transcript directory (`~/.claude/projects/-home-claude-ultima-kv-dogfood/`
+own transcript directory (`~/.claude/projects/-home-claude-ultima-kv_store/`
 and `…-kv-ops/`). There is no user-level `~/.claude/CLAUDE.md` on this
 machine, and the user-level `settings.json` carries no UC knowledge
 (checked 2026-09-14). The five user-level skills (`pinchtab`, `quint-*`,
@@ -89,7 +89,7 @@ depend on it.
 ## Auditing a run (the maintainer's step, always, before reading the ledger)
 
 ```sh
-scripts/dogfood_audit.py --sandbox ~/ultima/kv-dogfood      # exit 0 CLEAN, 1 VOID/JUDGE, 2 no transcripts
+scripts/dogfood_audit.py --sandbox ~/ultima/kv_store      # exit 0 CLEAN, 1 VOID/JUDGE, 2 no transcripts
 scripts/dogfood_audit.py --sandbox ~/ultima/kv-ops --json    # machine-readable
 ```
 

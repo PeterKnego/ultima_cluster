@@ -31,8 +31,8 @@ rules in the sandbox's `.claude/settings.json` are the hard wall for the
 Read tool only, and this audit is the wall for the rest.
 
 Usage:
-  scripts/dogfood_audit.py --sandbox ~/ultima/kv-dogfood \
-      [--project ~/.claude/projects/-home-claude-ultima-kv-dogfood] \
+  scripts/dogfood_audit.py --sandbox ~/ultima/kv_store \
+      [--project ~/.claude/projects/-home-claude-ultima-kv_store] \
       [--session <uuid>] [--json]
 
 The project directory defaults to Claude Code's encoding of the sandbox
