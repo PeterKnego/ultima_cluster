@@ -12,8 +12,9 @@ terms that are easy to say loosely and expensive to mean loosely.
 **Published docs**:
 What a stranger who found UC on crates.io or the release page is pointed
 to: the user-facing tier (README, QUICKSTART, RELEASES,
-SECURITY, `docs/how-to`, `docs/reference`, `docs/ops`, `docs/notes`,
-`docs/security`), everything under `packaging/`, the rustdoc of the
+SECURITY, `docs/QUICKSTART.md`, `docs/ARCHITECTURE.md`, `docs/how-to`,
+`docs/reference`, `docs/ops`, `docs/notes`, `docs/security`, `docs/images`),
+everything under `packaging/`, the rustdoc of the
 published crates, and the `examples/counter` source. Not the engineering
 record (`docs/superpowers`, `docs/benchmarks`, `docs/releases.md`,
 `docs/VERIFICATION.md`, `docs/BACKLOG.md`, `docs/agents`, `CLAUDE.md`), not
