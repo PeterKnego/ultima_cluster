@@ -18,7 +18,10 @@ SUCCEEDED. Verdicts:
            as a discipline breach.
   JUDGE  — no FORBIDDEN read, but OUTSIDE reads exist for the maintainer to
            judge (a `cat /etc/os-release` is harmless, `cat ~/.bash_history`
-           is not).
+           is not), or TEXT: an off-sandbox or forbidden path the persona
+           WROTE into a file through a here-document (a ledger entry naming
+           `~/.cargo/registry/src` is harmless; a script that reads it and is
+           run later is not — judge the file it went into).
   CLEAN  — nothing off the sandbox but toolchain/OS paths.
 Exit status: 0 CLEAN, 1 anything else, 2 no transcripts.
 
@@ -46,6 +49,7 @@ import json
 import os
 import re
 import sys
+import tempfile
 from pathlib import Path
 
 # Paths the clean-room rule names outright. Matching any of these is
@@ -96,29 +100,62 @@ def project_dir_for(sandbox: Path) -> Path:
 
 # The harness gives each session a private scratchpad at
 # `$TMPDIR/claude-<uid>/<encoded project>/<session>/scratchpad`; on a box whose
-# TMPDIR points at real disk it can land under a FORBIDDEN prefix such as
-# `~/scratch`. Files the session itself writes there are not reads of anything.
-def scratchpad_re(sandbox: Path) -> re.Pattern:
-    return re.compile(r"/claude-\d+/" + re.escape(encode_project(sandbox)) + r"/[0-9a-f-]+/scratchpad(/|$)")
+# TMPDIR points at real disk it can land under `~/scratch`, which is FORBIDDEN
+# for a different reason (the rustdoc build's cargo source lives there).
+# Files the session itself writes to its own scratchpad are not reads of
+# anything, so that one path — anchored to a known temp root, THIS uid, and
+# the session ids actually being audited — is exempt from the `/scratch`
+# pattern only. It never exempts any other FORBIDDEN pattern, so a crafted
+# scratchpad-shaped directory under a source repo stays FORBIDDEN.
+SCRATCH_PATTERN = r"/scratch(/|$)"
 
 
-# A here-document fed to a WRITE (`cat > f <<EOF`, `cat >> f <<EOF`,
+def scratchpad_re(sandbox: Path, session_ids: list[str]) -> re.Pattern:
+    roots = {"/tmp", os.path.expanduser("~/scratch/tmp"), tempfile.gettempdir()}
+    roots |= {os.path.realpath(r) for r in list(roots)}
+    root_alt = "|".join(re.escape(r.rstrip("/")) for r in sorted(roots))
+    sid_alt = "|".join(re.escape(x) for x in session_ids) or "(?!)"
+    return re.compile(rf"^(?:{root_alt})/claude-{os.getuid()}/{re.escape(encode_project(sandbox))}/(?:{sid_alt})/scratchpad(/|$)")
+
+
+# A here-document fed to a WRITE (`cat > f <<EOF`, `cat <<EOF > f`,
 # `tee f <<EOF`) is data on its way into a file, not a command; path-like
 # tokens inside it (a ledger entry naming `~/.cargo/registry/src`, a README's
-# `/home/you/...`) are text, not reads. A here-document fed to anything else
-# (`bash <<EOF`, `python3 - <<EOF`) is executed and stays tokenised.
-HEREDOC_RE = re.compile(r"<<-?\s*(['\"]?)(\w+)\1[^\n]*\n(.*?)\n\2(?=\n|$)", re.S)
-WRITE_HEREDOC_LINE_RE = re.compile(r"(^|[;&|]\s*|\n\s*)(cat\s*>{1,2}\s*\S+|tee\s+(-a\s+)?\S+)\s*<<", re.M)
+# `/home/you/...`) are text the persona wrote, not reads. Those tokens are NOT
+# dropped: they are tokenised separately and reported as TEXT for the
+# maintainer to judge (a script written into a file and run later is the case
+# that must stay visible). A here-document fed to anything else (`bash <<EOF`,
+# `python3 - <<EOF`), or whose header line also pipes or chains (`tee f <<EOF
+# | bash`), is executed and stays in the command proper.
+# Group 1 = the `-` of `<<-` (then leading tabs before the terminator are
+# allowed, as in the shell); group 2 = quote; group 3 = delimiter; group 4 =
+# the rest of the header line; group 5 = the body.
+HEREDOC_RE = re.compile(r"<<(-?)\s*(['\"]?)(\w+)\2([^\n]*)\n(.*?)\n(?(1)\t*)\3(?=\n|$)", re.S)
+# Form A: `cat > f <<EOF` / `cat >> f <<EOF` / `tee [-a] f <<EOF`, tail empty.
+# Form B: `cat <<EOF > f` — bare `cat`, the redirect in the tail.
+# Anything else on the header line (a pipe, `;`, `&&`) means the body may be
+# executed, so it stays in the command proper.
+WRITE_HEAD_A_RE = re.compile(r"(^|[;&|]\s*)(cat\s*>{1,2}\s*\S+|tee\s+(-a\s+)?\S+)\s*$")
+WRITE_HEAD_B_RE = re.compile(r"(^|[;&|]\s*)cat\s*$")
+TAIL_EMPTY_RE = re.compile(r"^\s*$")
+TAIL_REDIRECT_RE = re.compile(r"^\s*>{1,2}\s*\S+\s*$")
 
 
-def strip_write_heredocs(cmd: str) -> str:
+def split_write_heredocs(cmd: str) -> tuple[str, list[str]]:
+    """(command with write-heredoc bodies removed, [those bodies])."""
+    bodies: list[str] = []
+
     def repl(m: re.Match) -> str:
         start = cmd.rfind("\n", 0, m.start()) + 1
-        lead = cmd[start:m.start() + 2]
-        if WRITE_HEREDOC_LINE_RE.search(lead):
-            return m.group(0)[: m.end(2) - m.start()] + "\n" + m.group(2)
+        lead, tail = cmd[start:m.start()], m.group(4)
+        form_a = WRITE_HEAD_A_RE.search(lead) and TAIL_EMPTY_RE.match(tail)
+        form_b = WRITE_HEAD_B_RE.search(lead) and TAIL_REDIRECT_RE.match(tail)
+        if form_a or form_b:
+            bodies.append(m.group(5))
+            return m.group(0)[: m.end(4) - m.start()] + "\n" + m.group(3)
         return m.group(0)
-    return HEREDOC_RE.sub(repl, cmd)
+
+    return HEREDOC_RE.sub(repl, cmd), bodies
 
 
 DENIAL_RE = re.compile(r"denied|not allowed|permission", re.I)
@@ -166,9 +203,12 @@ def paths_from(name: str, inp: dict) -> list[tuple[str, str]]:
         if isinstance(pat, str) and pat.startswith(("/", "~", ".")):
             out.append((pat, "Glob.pattern"))
     if name == "Bash":
-        cmd = strip_write_heredocs(inp.get("command") or "")
+        cmd, bodies = split_write_heredocs(inp.get("command") or "")
         for m in BASH_PATH_RE.finditer(cmd):
             out.append((m.group(1), "Bash"))
+        for body in bodies:
+            for m in BASH_PATH_RE.finditer(body):
+                out.append((m.group(1), "Bash-text"))
     if name == "Agent":
         # a subagent's own reads are in its own transcript; but a prompt that
         # names a forbidden path is itself a leak worth seeing
@@ -178,15 +218,15 @@ def paths_from(name: str, inp: dict) -> list[tuple[str, str]]:
     return out
 
 
-def classify(raw: str, sandbox: Path, cwd_hint: Path) -> tuple[str, str]:
+def classify(raw: str, sandbox: Path, cwd_hint: Path, scratch_re: re.Pattern) -> tuple[str, str]:
     p = os.path.expanduser(raw)
     if not p.startswith("/"):
         p = str((cwd_hint / p))
     p = os.path.normpath(p)
-    if scratchpad_re(sandbox).search(p):
-        return "BENIGN", p
     for pat in FORBIDDEN_PATTERNS:
         if re.search(pat, p):
+            if pat == SCRATCH_PATTERN and scratch_re.match(p):
+                return "BENIGN", p
             return "FORBIDDEN", p
     try:
         Path(p).relative_to(sandbox)
@@ -219,7 +259,9 @@ def main() -> int:
         print(f"no transcripts under {project}", file=sys.stderr)
         return 2
 
-    findings: dict[str, list[dict]] = {"FORBIDDEN": [], "OUTSIDE": [], "BENIGN": [], "INSIDE": []}
+    session_ids = sorted({f.stem for f in files} | {q.name for f in files for q in f.parents if re.fullmatch(r"[0-9a-f-]{36}", q.name)})
+    scratch_re = scratchpad_re(sandbox, session_ids)
+    findings: dict[str, list[dict]] = {"FORBIDDEN": [], "OUTSIDE": [], "TEXT": [], "BENIGN": [], "INSIDE": []}
     counts = {"tool_uses": 0, "files": len(files)}
     for f in files:
         uses, results = scan(f)
@@ -227,7 +269,9 @@ def main() -> int:
             counts["tool_uses"] += 1
             outcome = results.get(tid, "no-result")
             for raw, how in paths_from(name, inp):
-                cls, p = classify(raw, sandbox, sandbox)
+                cls, p = classify(raw, sandbox, sandbox, scratch_re)
+                if how == "Bash-text" and cls in ("FORBIDDEN", "OUTSIDE"):
+                    cls = "TEXT"  # written into a file, not read; the maintainer judges
                 findings[cls].append({"path": p, "raw": raw, "how": how, "file": f.name,
                                       "line": line_no, "outcome": outcome})
 
@@ -245,26 +289,26 @@ def main() -> int:
         verdict = "VOID"
     elif findings["FORBIDDEN"]:
         verdict = "BREACH"
-    elif [r for r in findings["OUTSIDE"] if r["outcome"] != "denied"]:
+    elif [r for r in findings["OUTSIDE"] + findings["TEXT"] if r["outcome"] != "denied"]:
         verdict = "JUDGE"
     else:
         verdict = "CLEAN"
     if a.json:
         print(json.dumps({"verdict": verdict, "sandbox": str(sandbox), "project": str(project),
                           "counts": counts, "forbidden": uniq(findings["FORBIDDEN"]),
-                          "outside": uniq(findings["OUTSIDE"]),
+                          "outside": uniq(findings["OUTSIDE"]), "text": uniq(findings["TEXT"]),
                           "inside_paths": len(uniq(findings["INSIDE"]))}, indent=2))
     else:
         print(f"sandbox : {sandbox}\nproject : {project}\ntranscripts: {counts['files']}  tool uses: {counts['tool_uses']}")
         print(f"inside  : {len(uniq(findings['INSIDE']))} distinct paths   benign off-root: {len(uniq(findings['BENIGN']))}")
-        for cls in ("FORBIDDEN", "OUTSIDE"):
+        for cls in ("FORBIDDEN", "OUTSIDE", "TEXT"):
             rows = uniq(findings[cls])
             print(f"\n{cls}: {len(rows)}")
             for r in rows:
                 print(f"  [{r['outcome']:9}] {r['path']}   via {r['how']}   ({r['file']}:{r['line']})")
         tail = {"VOID": "  — a forbidden read SUCCEEDED; the run's findings are void",
                 "BREACH": "  — forbidden reads were attempted, all denied; run stands, breach recorded",
-                "JUDGE": "  — judge the OUTSIDE reads", "CLEAN": ""}[verdict]
+                "JUDGE": "  — judge the OUTSIDE reads and the TEXT the persona wrote", "CLEAN": ""}[verdict]
         print(f"\nVERDICT: {verdict}{tail}")
     return 0 if verdict == "CLEAN" else 1
 
