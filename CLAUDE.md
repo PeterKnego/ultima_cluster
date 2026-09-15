@@ -956,3 +956,18 @@ a parallel prose copy of the release history.
   (`ultima-db`, `dashmap`, `hashbrown`), four CI/nightly/docs steps, and
   `uc_service`'s only crates.io coupling. Do not reintroduce it: a service
   supplies its own `StateMachine`, and UC prescribes no store.
+
+## Agent skills
+
+### Issue tracker
+
+GitHub Issues on `PeterKnego/ultima_cluster`, via the `gh` CLI; `docs/BACKLOG.md`
+remains the ranked-direction register. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+The five canonical roles, unchanged. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context: one root `CONTEXT.md` plus `docs/adr/`. See `docs/agents/domain.md`.
