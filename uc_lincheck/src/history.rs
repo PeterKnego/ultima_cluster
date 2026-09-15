@@ -7,32 +7,46 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 pub use crate::model::{Op, RegResp};
 
-/// Observed outcome of one operation.
+/// Observed outcome of one operation, generic over the model's response
+/// type. [`Outcome`] is the register instance every capstone uses.
 #[derive(Clone, Debug)]
-pub enum Outcome {
+pub enum GenOutcome<R> {
     /// Committed and the response was observed; must linearize with this response.
-    Ok(RegResp),
+    Ok(R),
     /// May or may not have committed; response not observed.
     Indeterminate,
 }
 
+/// The register history's outcome (`RegResp`-typed).
+pub type Outcome = GenOutcome<RegResp>;
+
+/// One recorded operation, generic over the model's op and response types.
+/// [`Entry`] is the register instance.
 #[derive(Clone, Debug)]
-pub struct Entry {
+pub struct GenEntry<O, R> {
     #[allow(dead_code)]
     pub client: u32,
-    pub op: Op,
+    pub op: O,
     pub invoke: u64,
     pub ret: u64,
-    pub outcome: Outcome,
+    pub outcome: GenOutcome<R>,
 }
+
+/// The register history's entry (`Op`/`RegResp`-typed).
+pub type Entry = GenEntry<Op, RegResp>;
 
 /// Records entries from concurrent workers and stamps the global sequence.
-pub struct History {
+/// Generic over the model's op and response types; [`History`] is the
+/// register instance.
+pub struct GenHistory<O, R> {
     seq: AtomicU64,
-    entries: Mutex<Vec<Entry>>,
+    entries: Mutex<Vec<GenEntry<O, R>>>,
 }
 
-impl Default for History {
+/// The register history recorder.
+pub type History = GenHistory<Op, RegResp>;
+
+impl<O, R> Default for GenHistory<O, R> {
     fn default() -> Self {
         Self {
             seq: AtomicU64::new(0),
@@ -41,15 +55,15 @@ impl Default for History {
     }
 }
 
-impl History {
+impl<O: Clone, R: Clone> GenHistory<O, R> {
     /// Stamp an invoke; call right before firing the op.
     pub fn invoke(&self) -> u64 {
         self.seq.fetch_add(1, Ordering::Relaxed)
     }
     /// Stamp a return and record the completed entry.
-    pub fn record(&self, client: u32, op: Op, invoke: u64, outcome: Outcome) {
+    pub fn record(&self, client: u32, op: O, invoke: u64, outcome: GenOutcome<R>) {
         let ret = self.seq.fetch_add(1, Ordering::Relaxed);
-        self.entries.lock().unwrap().push(Entry {
+        self.entries.lock().unwrap().push(GenEntry {
             client,
             op,
             invoke,
@@ -58,20 +72,20 @@ impl History {
         });
     }
     /// Consume the recorded entries.
-    pub fn into_entries(self) -> Vec<Entry> {
+    pub fn into_entries(self) -> Vec<GenEntry<O, R>> {
         self.entries.into_inner().unwrap()
     }
     /// Clone the entries recorded so far (for the in-progress liveness check,
     /// which must read the history without consuming it).
-    pub fn snapshot(&self) -> Vec<Entry> {
+    pub fn snapshot(&self) -> Vec<GenEntry<O, R>> {
         self.entries.lock().unwrap().clone()
     }
     /// Count of Ok outcomes (for the liveness gate).
     #[allow(dead_code)]
-    pub fn ok_count(entries: &[Entry]) -> usize {
+    pub fn ok_count(entries: &[GenEntry<O, R>]) -> usize {
         entries
             .iter()
-            .filter(|e| matches!(e.outcome, Outcome::Ok(_)))
+            .filter(|e| matches!(e.outcome, GenOutcome::Ok(_)))
             .count()
     }
 }

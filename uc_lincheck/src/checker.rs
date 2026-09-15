@@ -1,4 +1,6 @@
 //! Generic Wing-Gong-Lowe linearizability checker over a `Model`. Pure.
+//! `check_model` is the generic entry; `check_register*` are it at
+//! `RegisterModel`.
 //!
 //! Search: repeatedly linearize a real-time-eligible "frontier" op (one whose
 //! `invoke` is <= the minimum `ret` of the remaining ops), apply it to the
@@ -14,8 +16,8 @@
 
 use std::collections::HashSet;
 
-use crate::history::{Entry, Outcome};
-use crate::model::{Model, Op, RegResp, RegisterModel};
+use crate::history::{Entry, GenEntry, GenOutcome};
+use crate::model::{Model, RegisterModel};
 
 #[derive(Debug, PartialEq)]
 pub enum Verdict {
@@ -25,9 +27,9 @@ pub enum Verdict {
 }
 
 /// Internal normalized op: (op, observed-response-or-None, invoke, ret).
-struct NOp {
-    op: Op,
-    observed: Option<RegResp>, // None = indeterminate (response unconstrained)
+struct NOp<O, R> {
+    op: O,
+    observed: Option<R>, // None = indeterminate (response unconstrained)
     invoke: u64,
     ret: u64,
 }
@@ -55,18 +57,28 @@ pub fn check_register_with_budget(entries: &[Entry], budget: u64) -> Verdict {
 /// workload generates, so a capstone that goes Inconclusive gets fixed by
 /// guessing. Callers print this beside the verdict.
 pub fn check_register_reporting(entries: &[Entry], budget: u64) -> (Verdict, u64) {
+    check_model::<RegisterModel>(entries, budget)
+}
+
+/// The generic entry point: check a history against ANY [`Model`], with
+/// the same search, the same indeterminate-op rules and the same budget
+/// semantics as [`check_register_reporting`] (which is this function at
+/// `RegisterModel`). Added for the dogfood adjudication harness, whose
+/// per-key model has a Delete the register lacks; the register capstones
+/// are unchanged by it.
+pub fn check_model<M: Model>(entries: &[GenEntry<M::Op, M::Resp>], budget: u64) -> (Verdict, u64) {
     // Normalize: drop indeterminate reads (no information); map outcomes.
-    let mut ops: Vec<NOp> = Vec::new();
+    let mut ops: Vec<NOp<M::Op, M::Resp>> = Vec::new();
     for e in entries {
-        match (&e.op, &e.outcome) {
-            (Op::Read, Outcome::Indeterminate) => continue, // drop
-            (_, Outcome::Indeterminate) => ops.push(NOp {
+        match &e.outcome {
+            GenOutcome::Indeterminate if M::is_read(&e.op) => continue, // drop
+            GenOutcome::Indeterminate => ops.push(NOp {
                 op: e.op.clone(),
                 observed: None,
                 invoke: e.invoke,
                 ret: u64::MAX,
             }),
-            (_, Outcome::Ok(r)) => ops.push(NOp {
+            GenOutcome::Ok(r) => ops.push(NOp {
                 op: e.op.clone(),
                 observed: Some(r.clone()),
                 invoke: e.invoke,
@@ -76,12 +88,12 @@ pub fn check_register_reporting(entries: &[Entry], budget: u64) -> (Verdict, u64
     }
     let n = ops.len();
     let mut remaining: Vec<bool> = vec![true; n];
-    let mut visited: HashSet<(Vec<bool>, Option<u64>)> = HashSet::new();
+    let mut visited: HashSet<(Vec<bool>, M::State)> = HashSet::new();
     let mut budget_left = budget;
-    let res = search::<RegisterModel>(
+    let res = search::<M>(
         &ops,
         &mut remaining,
-        RegisterModel::init(),
+        M::init(),
         &mut visited,
         &mut budget_left,
     );
@@ -100,11 +112,11 @@ enum SearchResult {
     BudgetExceeded,
 }
 
-fn search<M: Model<State = Option<u64>, Op = Op, Resp = RegResp>>(
-    ops: &[NOp],
+fn search<M: Model>(
+    ops: &[NOp<M::Op, M::Resp>],
     remaining: &mut Vec<bool>,
-    state: Option<u64>,
-    visited: &mut HashSet<(Vec<bool>, Option<u64>)>,
+    state: M::State,
+    visited: &mut HashSet<(Vec<bool>, M::State)>,
     budget: &mut u64,
 ) -> SearchResult {
     if *budget == 0 {
@@ -121,7 +133,7 @@ fn search<M: Model<State = Option<u64>, Op = Op, Resp = RegResp>>(
     // Memo: skip (remaining-set, model-state) we've already PROVEN unlinearizable.
     // We only cache a key after a *complete* exploration (below) — never a
     // budget-truncated one — so a memo hit always means a real dead end.
-    let key = (remaining.clone(), state);
+    let key = (remaining.clone(), state.clone());
     if visited.contains(&key) {
         return SearchResult::NoLinearization;
     }
@@ -159,7 +171,7 @@ fn search<M: Model<State = Option<u64>, Op = Op, Resp = RegResp>>(
         // Option 2: indeterminate op may be dropped (never committed).
         if ops[i].observed.is_none() {
             remaining[i] = false;
-            match search::<M>(ops, remaining, state, visited, budget) {
+            match search::<M>(ops, remaining, state.clone(), visited, budget) {
                 SearchResult::Ok => {
                     remaining[i] = true;
                     return SearchResult::Ok;
@@ -270,6 +282,95 @@ mod tests {
             e(0, Op::Read, 3, 4, Outcome::Ok(RegResp::Value(Some(1)))),
         ];
         assert_eq!(check_register(&h), Verdict::Linearizable);
+    }
+
+    /// A second model, to prove `check_model` is generic and not the
+    /// register in disguise: a register with a Delete. The dogfood KV's
+    /// per-key model has this shape.
+    struct DelModel;
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum DOp {
+        Put(u64),
+        Get,
+        Del,
+    }
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum DResp {
+        Ack,
+        Val(Option<u64>),
+        Deleted(bool),
+    }
+    impl Model for DelModel {
+        type State = Option<u64>;
+        type Op = DOp;
+        type Resp = DResp;
+        fn init() -> Option<u64> {
+            None
+        }
+        fn is_read(op: &DOp) -> bool {
+            matches!(op, DOp::Get)
+        }
+        fn step(state: &Option<u64>, op: &DOp) -> (Option<u64>, DResp) {
+            match op {
+                DOp::Put(v) => (Some(*v), DResp::Ack),
+                DOp::Get => (*state, DResp::Val(*state)),
+                DOp::Del => (None, DResp::Deleted(state.is_some())),
+            }
+        }
+    }
+    fn d(
+        client: u32,
+        op: DOp,
+        invoke: u64,
+        ret: u64,
+        outcome: GenOutcome<DResp>,
+    ) -> GenEntry<DOp, DResp> {
+        GenEntry {
+            client,
+            op,
+            invoke,
+            ret,
+            outcome,
+        }
+    }
+
+    #[test]
+    fn generic_model_delete_then_stale_read_is_violation() {
+        // put(1); del -> true; get -> Some(1)  (non-overlapping): impossible.
+        let h = vec![
+            d(0, DOp::Put(1), 0, 1, GenOutcome::Ok(DResp::Ack)),
+            d(0, DOp::Del, 2, 3, GenOutcome::Ok(DResp::Deleted(true))),
+            d(1, DOp::Get, 4, 5, GenOutcome::Ok(DResp::Val(Some(1)))),
+        ];
+        assert_eq!(
+            check_model::<DelModel>(&h, DEFAULT_BUDGET).0,
+            Verdict::Violation
+        );
+        // The same with the read overlapping the delete is fine.
+        let h2 = vec![
+            d(0, DOp::Put(1), 0, 1, GenOutcome::Ok(DResp::Ack)),
+            d(0, DOp::Del, 2, 6, GenOutcome::Ok(DResp::Deleted(true))),
+            d(1, DOp::Get, 3, 5, GenOutcome::Ok(DResp::Val(Some(1)))),
+        ];
+        assert_eq!(
+            check_model::<DelModel>(&h2, DEFAULT_BUDGET).0,
+            Verdict::Linearizable
+        );
+    }
+
+    #[test]
+    fn generic_model_drops_indeterminate_reads_but_keeps_indeterminate_deletes() {
+        // An indeterminate delete may explain a later `None`.
+        let h = vec![
+            d(0, DOp::Put(1), 0, 1, GenOutcome::Ok(DResp::Ack)),
+            d(1, DOp::Get, 2, u64::MAX, GenOutcome::Indeterminate),
+            d(2, DOp::Del, 3, u64::MAX, GenOutcome::Indeterminate),
+            d(0, DOp::Get, 4, 5, GenOutcome::Ok(DResp::Val(None))),
+        ];
+        assert_eq!(
+            check_model::<DelModel>(&h, DEFAULT_BUDGET).0,
+            Verdict::Linearizable
+        );
     }
 
     #[test]

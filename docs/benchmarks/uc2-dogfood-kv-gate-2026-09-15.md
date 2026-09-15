@@ -126,7 +126,12 @@ their titles here are placeholders for the card titles #21 issues.
 
 Run by the adjudication harness (ticket #20) against the builder's service
 binary through `uc_remote`, with the builder's wire format plugged in as an
-encoding adapter. Outcomes per convention 4; reps per convention 5.
+encoding adapter. Outcomes per convention 4; reps per convention 5. The
+harness is `examples/uc_adjudicate` (`uc2-adjudicate wgl`/`elle`/`diverge`/
+`diff-snapshots`/`known-keys`/`rate`); its README states the adapter contract
+and the two findings its development runs produced. These result cells stay
+UNRUN until the #24 adjudication fills them; harness-development smoke runs are
+not gate runs.
 
 | row | clause | bar | result |
 |---|---|---|---|

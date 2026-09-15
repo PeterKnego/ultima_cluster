@@ -1,0 +1,39 @@
+[package]
+name = "uc_adjudicate"
+description = "Dogfood adjudication harness: runs the repo's checkers (WGL, Elle, snapshot churn, state divergence) against a third-party service binary as a black box, through uc_remote"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+keywords.workspace = true
+categories.workspace = true
+publish = false
+
+[[bin]]
+name = "uc2-adjudicate"
+path = "src/main.rs"
+
+[dependencies]
+# The checkers: `checker::check_model` (WGL over any `Model`), the generic
+# history recorder, the Elle EDN recorder, and the register SM's command
+# types for the register arm.
+uc_lincheck = { path = "../../uc_lincheck" }
+# The only path to the cluster under test: the framed-TCP remote protocol
+# through a `uc2-gateway`. `frame`/`conn` are used directly by the pinned
+# query client (`diverge`), which must NOT hop to the leader.
+uc_remote   = { path = "../../uc_remote", version = "2.12.0" }
+# Reading a spawned node's control page (leader flags, service slot words,
+# archive first base) — maintainer-side observation, the same file `uc2ctl
+# status` reads.
+uc_log      = { path = "../../uc_log", version = "2.12.0" }
+uc_protocol = { path = "../../uc_protocol", version = "2.12.0" }
+clap        = { workspace = true }
+anyhow      = { workspace = true }
+rand        = { workspace = true }
+bincode     = { workspace = true }
+serde       = { workspace = true }
+bytes       = { workspace = true }
+hdrhistogram = { workspace = true }

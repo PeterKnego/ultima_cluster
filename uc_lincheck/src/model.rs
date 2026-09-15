@@ -10,6 +10,11 @@ pub trait Model {
     type Resp: Clone + Eq + std::fmt::Debug;
     fn init() -> Self::State;
     fn step(state: &Self::State, op: &Self::Op) -> (Self::State, Self::Resp);
+    /// `true` for an op that never changes the state. The checker drops an
+    /// INDETERMINATE read before searching (it carries no information),
+    /// while an indeterminate mutation stays in as an optional op — so the
+    /// model, not the checker, has to say which is which.
+    fn is_read(op: &Self::Op) -> bool;
 }
 
 /// Abstract op against the CAS register (shared with `history`).
@@ -37,6 +42,9 @@ impl Model for RegisterModel {
     type Resp = RegResp;
     fn init() -> Option<u64> {
         None
+    }
+    fn is_read(op: &Op) -> bool {
+        matches!(op, Op::Read)
     }
     fn step(state: &Option<u64>, op: &Op) -> (Option<u64>, RegResp) {
         match op {
