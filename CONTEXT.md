@@ -37,8 +37,9 @@ _Avoid_: admin, SRE, user
 **Clean-room**:
 The discipline under which a builder or operator works: a sandbox holding
 only the published docs, the release, and rustdoc, with the transcript
-audited for reads outside it. A forbidden read that succeeds voids the run;
-any other read off the sandbox is judged by the maintainer.
+audited for reads outside it. A forbidden read that succeeds voids the run; one that
+was denied is recorded as a breach; any other read off the sandbox is
+judged by the maintainer.
 _Avoid_: blind, black-box, from scratch
 
 **Friction ledger**:

@@ -44,7 +44,10 @@ These were decided on ticket #19 and apply wherever a row is silent.
    (a forbidden read succeeded) makes the row **VOID**, not FAIL: a
    voided run is not a measurement, and it is re-run from a fresh
    sandbox. This is the `CONTEXT.md` *Clean-room* rule as corrected
-   2026-09-15.
+   2026-09-15. A VOID on a builder run voids that run's B1 row only;
+   B2/B3/B4 cells already measured against its binary stay as
+   measurements of that binary, are marked "from a voided run", and are
+   re-taken against the re-run's binary before they count.
 2. **A maintainer intervention is a docs-sufficiency FAIL.** The charter
    lets a persona stop at a block with no assumption to proceed on and
    hand the question to the maintainer. Each such answered block **fails
@@ -53,13 +56,18 @@ These were decided on ticket #19 and apply wherever a row is silent.
    the rows downstream (B2–B4) are still measured; "the docs fell short
    here" and "the thing built is wrong" are separate findings.
 3. **A friction-ledger assumption that later fails a capstone is a
-   blocking doc defect.** Ticket #24 traces every B2 failure to either a
-   builder assumption (→ fails B1 for that run too) or a product defect
+   blocking doc defect.** The adjudication — ticket #24 for v1, and for
+   v2 the same pass with Elle added, which ticket #25's resolution names —
+   traces every B2 failure to either a builder assumption (→ fails B1 for that run too) or a product defect
    (→ fails B2 only, becomes a repo issue). The two rows may disagree;
-   that is the point of separating them.
+   that is the point of separating them. Because clause (iv) of a B1 row
+   depends on this tracing, a B1 cell is finalised only after its run's
+   adjudication, not at the end of the run.
 4. **Correctness rows have four outcomes only:** PASS / FAIL / NOT RUN /
    VOID. There is **no "inconclusive"** on a correctness row; that word is
-   reserved for rate rows, and this gate bars no rate.
+   reserved for rate rows, and this gate bars no rate. A multi-seed row
+   rolls up as: any seed FAIL → FAIL; else any seed NOT RUN → NOT RUN
+   (re-run the seeds that did not measure); else PASS.
 5. **Rep counts are fixed here, not on the day:** 5 seeds for each WGL
    clause, 5 Elle passes, matching the hard-crash test and
    `scripts/elle_check.sh` respectively.
@@ -153,6 +161,20 @@ expects a documented absence), and whether a rolling swap was attempted.
 **If a rolling attempt diverged the cluster, B4.i FAILs and B1'-7 records a
 blocking doc defect**, because the docs did not prevent it.
 
+### B5 — ledger resolution (appended 2026-09-15, under convention 6)
+
+Charter decision 5 puts "every ledger item resolved" inside docs
+sufficiency. It cannot be a clause of a run row — resolution happens after
+the run, in the triage tickets — so it is its own row, adjudicated when
+the deliverables ticket (#30) closes. An item is **resolved** when it has
+landed on `main` as a doc fix, an API fix, an accepted limit recorded in
+the experience report, or a product ticket (the charter's Destination).
+
+| row | measure | bar | result |
+|---|---|---|---|
+| B5-builder | every item on the builder's ledger (v1 and v2 runs) | **100 %** resolved; the cell lists the count per outcome kind | UNRUN |
+| B5-operator | every item on the operator's ledger (all three sessions) | **100 %** resolved; the cell lists the count per outcome kind | UNRUN |
+
 ## Results
 
 Every cell above reads UNRUN. Fill cells in place with the run date, the
@@ -165,4 +187,5 @@ harness's output, the ledger delta), never by editing the bar column.
   after #25 and its adjudication.
 - B1'-1 … B1'-3 and B3-v1 in the first operator session (#26); B1'-4 …
   B1'-6 in the second (#27); B1'-7, B4 and B3-v2 in the third (#28).
+- B5 when the deliverables ticket (#30) closes.
 - Anything appended under convention 6 says when, in its own row.
