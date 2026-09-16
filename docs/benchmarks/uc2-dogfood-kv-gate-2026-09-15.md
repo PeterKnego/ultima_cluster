@@ -99,7 +99,7 @@ Pre-committed 2026-09-15. Cells read **UNRUN** until filled.
 
 | row | run | bar | result |
 |---|---|---|---|
-| B1-v1 | Builder builds KV v1 (Put/Get/Delete/CAS, sessioned, opaque values, must survive purge, must fit the ceiling) from `~/ultima/kv_store` | (i) the builder declares done; (ii) `scripts/dogfood_audit.py --sandbox ~/ultima/kv_store` passes under convention 1; (iii) **zero maintainer interventions** (convention 2); (iv) no ledger assumption is traced to a B2-v1 failure (convention 3). Ledger item count **reported, not barred** | UNRUN |
+| B1-v1 | Builder builds KV v1 (Put/Get/Delete/CAS, sessioned, opaque values, must survive purge, must fit the ceiling) from `~/ultima/kv_store` | (i) the builder declares done; (ii) `scripts/dogfood_audit.py --sandbox ~/ultima/kv_store` passes under convention 1; (iii) **zero maintainer interventions** (convention 2); (iv) no ledger assumption is traced to a B2-v1 failure (convention 3). Ledger item count **reported, not barred** | **PASS** (2026-09-16). (i) builder declared done (#23); (ii) audit exits VOID on ONE hit — `df -T /home/claude/scratch`, a filesystem-metadata stat that reads no file content — JUDGED benign (no forbidden content seen), run stands; the OUTSIDE reads are all the builder's own cluster state (`~/uc2-kv`), its own build artifacts (`~/.cache/cargo-target`) and OS/toolchain; the script over-classifies pure-stat commands (known tooling limitation); (iii) zero interventions (#23); (iv) the one B2-v1 failure (B2-v1.iii) traces to product defect #32, NOT a builder assumption. 16 ledger items reported (#23) |
 | B1-v2 | Builder extends to KV v2 (Append, the list kind, a `VERSION` bump) | same four clauses against the v2 run's transcript and B2-v2 | UNRUN |
 
 ### B1' — docs sufficiency, operator (one sub-row per scenario card)
@@ -135,9 +135,9 @@ not gate runs.
 
 | row | clause | bar | result |
 |---|---|---|---|
-| B2-v1.i | per-key WGL linearizability through `uc_remote` under leader kills | **Linearizable** on every key, all 5 seeds | UNRUN |
-| B2-v1.ii | acked-write loss | **0** acknowledged writes lost, all 5 seeds | UNRUN |
-| B2-v1.iii | snapshot + purge churn | **Linearizable**, all 5 seeds, **and** ≥ 1 snapshot install observed on a restarted or joining service per seed — a seed with no install is **NOT RUN**, not PASS | UNRUN |
+| B2-v1.i | per-key WGL linearizability through `uc_remote` under leader kills | **Linearizable** on every key, all 5 seeds | **PASS** (2026-09-16). 5/5 seeds, every key Linearizable, 27 leader kills total; `uc2-adjudicate wgl --adapter kv-v1` on the 2.12.0 tarball binaries against the builder's `kv-service` (app HEAD `9e82e84`) |
+| B2-v1.ii | acked-write loss | **0** acknowledged writes lost, all 5 seeds | **PASS** (2026-09-16). 0 acknowledged writes lost across all 10 runs (5 wgl + 5 churn) |
+| B2-v1.iii | snapshot + purge churn | **Linearizable**, all 5 seeds, **and** ≥ 1 snapshot install observed on a restarted or joining service per seed — a seed with no install is **NOT RUN**, not PASS | **FAIL** (2026-09-16), traced to **product defect #32** (not a builder assumption). 5/5 seeds: per-key **Linearizable** and ≥1 snapshot install observed on every seed (6–9 service installs), but a UC node **fail-stops** (`IngressRingCorrupt`) under the coordinated instant + ingress load, so the run is not a clean PASS. The KV is correct; the platform is not. Honest FAIL, bar unmoved; re-runnable at the baseline rung on a fleet to disambiguate the jumbo correlation (#32) |
 | B2-v2.i | per-key WGL under leader kills, v2 binary | as B2-v1.i | UNRUN |
 | B2-v2.ii | acked-write loss, v2 binary | as B2-v1.ii | UNRUN |
 | B2-v2.iii | snapshot + purge churn, v2 binary | as B2-v1.iii | UNRUN |
