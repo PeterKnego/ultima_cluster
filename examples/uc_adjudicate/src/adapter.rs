@@ -146,12 +146,13 @@ pub trait Adapter: Send + Sync {
 pub fn by_name(name: &str) -> Option<Box<dyn Adapter>> {
     match name {
         "kv-v1" => Some(Box::new(crate::kv_v1::KvV1)),
+        "kv-v2" => Some(Box::new(crate::kv_v2::KvV2)),
         "register" => Some(Box::new(crate::register::Register)),
         _ => None,
     }
 }
 
-pub const ADAPTER_NAMES: &[&str] = &["kv-v1", "register"];
+pub const ADAPTER_NAMES: &[&str] = &["kv-v1", "kv-v2", "register"];
 
 #[cfg(test)]
 mod tests {

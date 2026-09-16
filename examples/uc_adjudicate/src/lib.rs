@@ -17,6 +17,7 @@ pub mod diverge;
 pub mod elle;
 pub mod known_keys;
 pub mod kv_v1;
+pub mod kv_v2;
 pub mod pinned;
 pub mod rate;
 pub mod register;
