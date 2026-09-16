@@ -9,7 +9,8 @@ commands; every `terraform apply` is the maintainer's explicit approval gate.
 
 ## What it provisions
 
-The var-set is `bench-infra/operator-fleet.aws.tfvars`, driving the existing
+The var-set is `bench-infra/example.operator-fleet.tfvars` (copied to a
+gitignored `operator-fleet.tfvars` before filling the IP and keys), driving the existing
 `bench-infra/terraform` AWS module unchanged (the heterogeneous fleet rides
 `voter_count` + `client_instance_type`, already in the module):
 
@@ -35,12 +36,13 @@ up with `terraform apply` directly.
 ```bash
 cd bench-infra
 set -a; . ./.env; set +a          # AWS creds; terraform fails without them (aws + hcloud)
+cp example.operator-fleet.tfvars operator-fleet.tfvars   # then fill the IP + keys (gitignored)
 
 # 1. PLAN — the maintainer's approval artifact. Read-only; safe to run.
-terraform -chdir=terraform plan -var-file=../operator-fleet.aws.tfvars
+terraform -chdir=terraform plan -var-file=../operator-fleet.tfvars
 
 # 2. APPLY — ONLY on the maintainer's explicit go (charter decision 13).
-terraform -chdir=terraform apply -var-file=../operator-fleet.aws.tfvars
+terraform -chdir=terraform apply -var-file=../operator-fleet.tfvars
 
 # 3. Hand the operator their hosts (see "SSH handover" below).
 terraform -chdir=terraform output -json nodes
@@ -48,7 +50,7 @@ terraform -chdir=terraform output -json nodes
 # ... operator session runs ...
 
 # 4. DESTROY at session end, always.
-terraform -chdir=terraform destroy -var-file=../operator-fleet.aws.tfvars
+terraform -chdir=terraform destroy -var-file=../operator-fleet.tfvars
 
 # 5. LEAK CHECK — account-wide, independent of the local state file.
 python3 scripts/dogfood_fleet_leak_check.py            # exit 0 = clean, 1 = a leak to destroy

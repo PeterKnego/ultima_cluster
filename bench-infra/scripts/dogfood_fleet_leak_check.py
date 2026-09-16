@@ -51,7 +51,7 @@ def main() -> int:
     print(f"LEAK: {len(found)} instance(s) tagged owner={args.owner} in {args.region} — destroy them:")
     for iid, itype, state, launched, name in found:
         print(f"  {iid}  {itype:14} {state:12} {launched}  {name}")
-    print("\nRemedy: `terraform -chdir=bench-infra/terraform destroy -var-file=../operator-fleet.aws.tfvars`")
+    print("\nRemedy: `terraform -chdir=bench-infra/terraform destroy -var-file=../operator-fleet.tfvars`")
     print("or, if the state file is gone, terminate by id after confirming they are this fleet's.")
     return 1
 

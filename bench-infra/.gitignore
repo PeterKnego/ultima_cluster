@@ -7,6 +7,7 @@ terraform/.terraform.lock.hcl
 terraform.tfvars.*
 !example.tfvars
 !example.aws.tfvars
+!example.operator-fleet.tfvars
 crash.log
 
 # Generated inventory & SSH
