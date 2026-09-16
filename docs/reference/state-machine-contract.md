@@ -89,7 +89,7 @@ the apply loop, by journal replay and by snapshot tail-replay, and it carries:
 
 | item | what it is |
 |---|---|
-| `ctx.position: u64` | the frame's absolute byte position — the idempotency key, exactly what `position` used to be |
+| `ctx.position: u64` | the frame's absolute byte position — the idempotency key, exactly what `position` used to be. **Never `0` for a user command**: the log opens with the leader's `NEW_TERM` frame, so the first applied command sits at a position ≥ 32, which is why `0` is a safe "no position" sentinel |
 | `ctx.time_ns: u64` | **the leader's stamp on this frame**: ns since the Unix epoch, non-decreasing along the log, identical on every replica. This is your `now()` (log time and timers, 2.11.0) |
 | `ctx.term: u32` | the frame's `leadership_term_id` |
 | `ctx.ids()` | an `IdGen` for this apply call: deterministic IDs from `(position, identity, an ordinal that resets every call)` |

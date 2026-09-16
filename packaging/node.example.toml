@@ -56,6 +56,14 @@ id = 2
 addr = "10.0.0.12:9100"
 
 # ---------------------------------------------------------------- optional
+#
+# TOML BINDS A BARE KEY TO THE PRECEDING TABLE. Every top-level optional key
+# below (buffer_bytes, force_jumbo_frames, election_timeout_*, seed,
+# journal_segment_bytes, allow_volatile_fs) is shown here for documentation,
+# but if you uncomment one where it sits — after [[members]] or [crypto] — it
+# is parsed as a field of THAT table and the node refuses to start. Place any
+# top-level key you enable ABOVE the first table header (before the first
+# [[members]]), with the other top-level keys (id/bind/instance_dir/app_id).
 
 # Replicated-to but never counted: no vote, no quorum slot, no flow-control
 # window. Ids must be disjoint from [[members]]. Default: none.
