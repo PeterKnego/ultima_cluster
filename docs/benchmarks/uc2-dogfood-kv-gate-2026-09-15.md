@@ -114,9 +114,9 @@ their titles here are placeholders for the card titles #21 issues.
 
 | row | scenario (charter 14) | card text (pasted at issue) | result |
 |---|---|---|---|
-| B1'-1 | provision + deploy 3 nodes from the tarball | _(not yet issued)_ | UNRUN |
-| B1'-2 | deploy the KV service; prove a write through the gateway | _(not yet issued)_ | UNRUN |
-| B1'-3 | stand up monitoring; confirm the alert rules load | _(not yet issued)_ | UNRUN |
+| B1'-1 | provision + deploy 3 nodes from the tarball | **Card 1 — Bring up the cluster.** Goal: from `release/`, stand up a three-node cluster across the hosts in `HOSTS.md`. Success: the three nodes form one cluster and one reports as the serving leader | UNRUN |
+| B1'-2 | deploy the KV service; prove a write through the gateway | **Card 2 — Prove it serves.** Goal: deploy the `kv` service from `app/` to every node and make the store reachable to a remote client. Success: a value written through one gateway reads back unchanged through a *different* gateway | UNRUN |
+| B1'-3 | stand up monitoring; confirm the alert rules load | **Card 3 — See the cluster.** Goal: stand up Prometheus and Grafana on the observer host and point them at the cluster. Success: every shipped alert rule loads and evaluates healthy in Prometheus, and the shipped dashboard renders the cluster's live metrics | UNRUN |
 | B1'-4 | diagnose injected faults (one per exercise; maintainer-injected, blind) | _(not yet issued)_ | UNRUN |
 | B1'-5 | membership change: add learner, promote, remove voter | _(not yet issued)_ | UNRUN |
 | B1'-6 | backup / verify / restore | _(not yet issued)_ | UNRUN |
