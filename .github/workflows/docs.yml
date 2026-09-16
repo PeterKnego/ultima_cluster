@@ -48,11 +48,11 @@ jobs:
         run: python3 scripts/check_doc_links.py
 
       # --lib drops the bins (uc2ctl is an operator CLI, not an API), and the
-      # two example crates are excluded outright.
+      # three example crates are excluded outright.
       - name: Build rustdoc
         run: >
           cargo doc --workspace --no-deps --lib
-          --exclude counter --exclude uc_crashtest
+          --exclude counter --exclude uc_crashtest --exclude uc_adjudicate
 
       - name: Install the landing page
         run: cp .github/pages/index.html target/doc/index.html
