@@ -1,0 +1,1717 @@
+Wed Sep 16 07:11:47 PM UTC 2026
+INFO voters ['54.234.141.82', '3.80.127.214', '3.85.123.227']; arms ['A', 'B', 'C', 'D', 'A2']; ladder [1, 2, 4, 8, 16, 64, 256]; secs 20; reps at 1,2 = 3
+INFO [build 54.234.141.82] sudo env CARGO_HOME=/opt/bench/.cargo RUSTUP_HOME=/opt/bench/.rustup /opt/bench/.cargo/bin/cargo build --release --manifest-path /opt/bench/uc/Cargo.toml -p uc_node --example m6_gate && sudo env CARGO_HOME=/opt/bench/.cargo RUSTUP_HOME=/opt/bench/.rustup /opt/bench/.cargo/bin/cargo build --release --manifest-path /opt/bench/uc/Cargo.toml -p uc_gateway --example m12_gate && sudo mkdir -p /opt/bench/m12 && echo FSTYPE=$(stat -f -c %T /opt/bench/m12) && echo PREPARED
+INFO [systemctl 54.234.141.82] sudo systemctl kill --signal=SIGKILL m12-node 2>/dev/null; sudo systemctl stop m12-node 2>/dev/null; sudo systemctl reset-failed m12-node 2>/dev/null; true
+INFO [systemctl 54.234.141.82] sudo systemctl kill --signal=SIGKILL m12-service 2>/dev/null; sudo systemctl stop m12-service 2>/dev/null; sudo systemctl reset-failed m12-service 2>/dev/null; true
+INFO [systemctl 54.234.141.82] sudo systemctl kill --signal=SIGKILL m12-edge 2>/dev/null; sudo systemctl stop m12-edge 2>/dev/null; sudo systemctl reset-failed m12-edge 2>/dev/null; true
+INFO [systemctl 54.234.141.82] sudo systemctl kill --signal=SIGKILL m12-rttsrv 2>/dev/null; sudo systemctl stop m12-rttsrv 2>/dev/null; sudo systemctl reset-failed m12-rttsrv 2>/dev/null; true
+INFO [build 3.80.127.214] sudo env CARGO_HOME=/opt/bench/.cargo RUSTUP_HOME=/opt/bench/.rustup /opt/bench/.cargo/bin/cargo build --release --manifest-path /opt/bench/uc/Cargo.toml -p uc_node --example m6_gate && sudo env CARGO_HOME=/opt/bench/.cargo RUSTUP_HOME=/opt/bench/.rustup /opt/bench/.cargo/bin/cargo build --release --manifest-path /opt/bench/uc/Cargo.toml -p uc_gateway --example m12_gate && sudo mkdir -p /opt/bench/m12 && echo FSTYPE=$(stat -f -c %T /opt/bench/m12) && echo PREPARED
+INFO [systemctl 3.80.127.214] sudo systemctl kill --signal=SIGKILL m12-node 2>/dev/null; sudo systemctl stop m12-node 2>/dev/null; sudo systemctl reset-failed m12-node 2>/dev/null; true
+INFO [systemctl 3.80.127.214] sudo systemctl kill --signal=SIGKILL m12-service 2>/dev/null; sudo systemctl stop m12-service 2>/dev/null; sudo systemctl reset-failed m12-service 2>/dev/null; true
+INFO [systemctl 3.80.127.214] sudo systemctl kill --signal=SIGKILL m12-edge 2>/dev/null; sudo systemctl stop m12-edge 2>/dev/null; sudo systemctl reset-failed m12-edge 2>/dev/null; true
+INFO [systemctl 3.80.127.214] sudo systemctl kill --signal=SIGKILL m12-rttsrv 2>/dev/null; sudo systemctl stop m12-rttsrv 2>/dev/null; sudo systemctl reset-failed m12-rttsrv 2>/dev/null; true
+INFO [build 3.85.123.227] sudo env CARGO_HOME=/opt/bench/.cargo RUSTUP_HOME=/opt/bench/.rustup /opt/bench/.cargo/bin/cargo build --release --manifest-path /opt/bench/uc/Cargo.toml -p uc_node --example m6_gate && sudo env CARGO_HOME=/opt/bench/.cargo RUSTUP_HOME=/opt/bench/.rustup /opt/bench/.cargo/bin/cargo build --release --manifest-path /opt/bench/uc/Cargo.toml -p uc_gateway --example m12_gate && sudo mkdir -p /opt/bench/m12 && echo FSTYPE=$(stat -f -c %T /opt/bench/m12) && echo PREPARED
+INFO [systemctl 3.85.123.227] sudo systemctl kill --signal=SIGKILL m12-node 2>/dev/null; sudo systemctl stop m12-node 2>/dev/null; sudo systemctl reset-failed m12-node 2>/dev/null; true
+INFO [systemctl 3.85.123.227] sudo systemctl kill --signal=SIGKILL m12-service 2>/dev/null; sudo systemctl stop m12-service 2>/dev/null; sudo systemctl reset-failed m12-service 2>/dev/null; true
+INFO [systemctl 3.85.123.227] sudo systemctl kill --signal=SIGKILL m12-edge 2>/dev/null; sudo systemctl stop m12-edge 2>/dev/null; sudo systemctl reset-failed m12-edge 2>/dev/null; true
+INFO [systemctl 3.85.123.227] sudo systemctl kill --signal=SIGKILL m12-rttsrv 2>/dev/null; sudo systemctl stop m12-rttsrv 2>/dev/null; sudo systemctl reset-failed m12-rttsrv 2>/dev/null; true
+INFO [lscpu 54.234.141.82] lscpu -p=CPU,CORE
+INFO [lscpu 3.80.127.214] lscpu -p=CPU,CORE
+INFO [lscpu 3.85.123.227] lscpu -p=CPU,CORE
+INFO [rsync 54.234.141.82] /home/claude/scratch/rtt-udp-mini/ -> /opt/bench/rtt-udp-mini/
+INFO [build 54.234.141.82] sudo env CARGO_HOME=/opt/bench/.cargo RUSTUP_HOME=/opt/bench/.rustup /opt/bench/.cargo/bin/cargo build --release --manifest-path /opt/bench/rtt-udp-mini/Cargo.toml && test -x /opt/bench/rtt-udp-mini/target/release/network-rtt-udp && echo RTT-BUILT
+INFO [rsync 3.80.127.214] /home/claude/scratch/rtt-udp-mini/ -> /opt/bench/rtt-udp-mini/
+INFO [build 3.80.127.214] sudo env CARGO_HOME=/opt/bench/.cargo RUSTUP_HOME=/opt/bench/.rustup /opt/bench/.cargo/bin/cargo build --release --manifest-path /opt/bench/rtt-udp-mini/Cargo.toml && test -x /opt/bench/rtt-udp-mini/target/release/network-rtt-udp && echo RTT-BUILT
+INFO [systemctl 3.80.127.214] sudo systemctl kill --signal=SIGKILL m12-rttsrv 2>/dev/null; sudo systemctl stop m12-rttsrv 2>/dev/null; sudo systemctl reset-failed m12-rttsrv 2>/dev/null; true
+INFO [systemd-run 3.80.127.214] sudo systemd-run --unit=m12-rttsrv --collect -p TimeoutStopSec=1 --setenv=RTT_MODE=server --setenv=RTT_UDP_PORT=9101 -p StandardOutput=append:/opt/bench/m12-rttsrv.log -p StandardError=append:/opt/bench/m12-rttsrv.log /opt/bench/rtt-udp-mini/target/release/network-rtt-udp
+INFO [rtt 54.234.141.82] sudo env RTT_MODE=client RTT_HOST=10.10.1.11 RTT_UDP_PORT=9101 RTT_ITERATIONS=200000 RTT_WARMUP=20000 RTT_PAYLOAD_BYTES=64 /opt/bench/rtt-udp-mini/target/release/network-rtt-udp
+  [rtt-before] {"language":"rust","focus_area":"network-rtt","experiment":"udp","metric":"rtt_p50","value":33542,"unit":"ns","samples":200000}
+  [rtt-before] {"language":"rust","focus_area":"network-rtt","experiment":"udp","metric":"rtt_p99","value":43267,"unit":"ns","samples":200000}
+  [rtt-before] {"language":"rust","focus_area":"network-rtt","experiment":"udp","metric":"rtt_mean","value":33939.86224,"unit":"ns","samples":200000}
+INFO [systemctl 3.80.127.214] sudo systemctl kill --signal=SIGKILL m12-rttsrv 2>/dev/null; sudo systemctl stop m12-rttsrv 2>/dev/null; sudo systemctl reset-failed m12-rttsrv 2>/dev/null; true
+RTT-JSON {"when": "before", "p50_ns": 33542, "samples": 200000, "p99_ns": 43267, "mean_ns": 33939.86224}
+
+=== ARM A: consistent / unpinned / sleep-apply ===
+INFO [ssh 54.234.141.82] sudo rm -rf /opt/bench/m12/n0 && sudo mkdir -p /opt/bench/m12/n0
+INFO [ssh 3.80.127.214] sudo rm -rf /opt/bench/m12/n1 && sudo mkdir -p /opt/bench/m12/n1
+INFO [ssh 3.85.123.227] sudo rm -rf /opt/bench/m12/n2 && sudo mkdir -p /opt/bench/m12/n2
+INFO [systemctl 54.234.141.82] sudo systemctl kill --signal=SIGKILL m12-node 2>/dev/null; sudo systemctl stop m12-node 2>/dev/null; sudo systemctl reset-failed m12-node 2>/dev/null; true
+INFO [systemd-run 54.234.141.82] sudo systemd-run --unit=m12-node --collect -p TimeoutStopSec=1 -p LimitNOFILE=65536 -p StandardOutput=append:/opt/bench/m12-node.log -p StandardError=append:/opt/bench/m12-node.log /opt/bench/uc/target/release/examples/m12_gate node --id 0 --bind 10.10.1.10:19100 --instance-dir /opt/bench/m12/n0 --members 0@10.10.1.10:19100,1@10.10.1.11:19100,2@10.10.1.12:19100 --app-id m12-gate --admission-kib 256 --services count
+INFO [systemctl 3.80.127.214] sudo systemctl kill --signal=SIGKILL m12-node 2>/dev/null; sudo systemctl stop m12-node 2>/dev/null; sudo systemctl reset-failed m12-node 2>/dev/null; true
+INFO [systemd-run 3.80.127.214] sudo systemd-run --unit=m12-node --collect -p TimeoutStopSec=1 -p LimitNOFILE=65536 -p StandardOutput=append:/opt/bench/m12-node.log -p StandardError=append:/opt/bench/m12-node.log /opt/bench/uc/target/release/examples/m12_gate node --id 1 --bind 10.10.1.11:19100 --instance-dir /opt/bench/m12/n1 --members 0@10.10.1.10:19100,1@10.10.1.11:19100,2@10.10.1.12:19100 --app-id m12-gate --admission-kib 256 --services count
+INFO [systemctl 3.85.123.227] sudo systemctl kill --signal=SIGKILL m12-node 2>/dev/null; sudo systemctl stop m12-node 2>/dev/null; sudo systemctl reset-failed m12-node 2>/dev/null; true
+INFO [systemd-run 3.85.123.227] sudo systemd-run --unit=m12-node --collect -p TimeoutStopSec=1 -p LimitNOFILE=65536 -p StandardOutput=append:/opt/bench/m12-node.log -p StandardError=append:/opt/bench/m12-node.log /opt/bench/uc/target/release/examples/m12_gate node --id 2 --bind 10.10.1.12:19100 --instance-dir /opt/bench/m12/n2 --members 0@10.10.1.10:19100,1@10.10.1.11:19100,2@10.10.1.12:19100 --app-id m12-gate --admission-kib 256 --services count
+INFO [ssh 54.234.141.82] sudo rm -f /opt/bench/m12-service.log
+INFO [systemctl 54.234.141.82] sudo systemctl kill --signal=SIGKILL m12-service 2>/dev/null; sudo systemctl stop m12-service 2>/dev/null; sudo systemctl reset-failed m12-service 2>/dev/null; true
+INFO [systemd-run 54.234.141.82] sudo systemd-run --unit=m12-service --collect -p TimeoutStopSec=1 -p StandardOutput=append:/opt/bench/m12-service.log -p StandardError=append:/opt/bench/m12-service.log /opt/bench/uc/target/release/examples/m12_gate service --instance-dir /opt/bench/m12/n0 --app-id m12-gate --envelope off --fsm count
+INFO [ssh 3.80.127.214] sudo rm -f /opt/bench/m12-service.log
+INFO [systemctl 3.80.127.214] sudo systemctl kill --signal=SIGKILL m12-service 2>/dev/null; sudo systemctl stop m12-service 2>/dev/null; sudo systemctl reset-failed m12-service 2>/dev/null; true
+INFO [systemd-run 3.80.127.214] sudo systemd-run --unit=m12-service --collect -p TimeoutStopSec=1 -p StandardOutput=append:/opt/bench/m12-service.log -p StandardError=append:/opt/bench/m12-service.log /opt/bench/uc/target/release/examples/m12_gate service --instance-dir /opt/bench/m12/n1 --app-id m12-gate --envelope off --fsm count
+INFO [ssh 3.85.123.227] sudo rm -f /opt/bench/m12-service.log
+INFO [systemctl 3.85.123.227] sudo systemctl kill --signal=SIGKILL m12-service 2>/dev/null; sudo systemctl stop m12-service 2>/dev/null; sudo systemctl reset-failed m12-service 2>/dev/null; true
+INFO [systemd-run 3.85.123.227] sudo systemd-run --unit=m12-service --collect -p TimeoutStopSec=1 -p StandardOutput=append:/opt/bench/m12-service.log -p StandardError=append:/opt/bench/m12-service.log /opt/bench/uc/target/release/examples/m12_gate service --instance-dir /opt/bench/m12/n2 --app-id m12-gate --envelope off --fsm count
+INFO [iface 54.234.141.82] IFACE=$(ip -o route get 8.8.8.8 2>/dev/null | sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -n1); if [ -z "$IFACE" ]; then for i in $(ls /sys/class/net 2>/dev/null | grep -v '^lo$'); do st=$(cat /sys/class/net/$i/operstate 2>/dev/null); if [ "$st" = up ]; then IFACE=$i; break; fi; done; fi; echo IFACE=$IFACE
+INFO arm A: leader n0 (54.234.141.82), NIC ens5
+
+INFO --- arm A inflight=1 rep=1/3 ---
+INFO [ssh 54.234.141.82] sudo /opt/bench/uc/target/release/examples/m12_gate client-direct --instance-dir /opt/bench/m12/n0 --app-id m12-gate --secs 20 --payload 64 --inflight 1 --envelope off --poll-idle spin --warmup-secs 2 --measure-secs 16
+INFO [ssh 54.234.141.82] cat /proc/net/dev  # NIC sample for ens5, ~1 Hz while the client runs
+  [svc inflight=1] m12_gate client-direct: 20 s, payload 64, inflight 1, envelope off, poll-idle Spin
+  [svc inflight=1] 
+  [svc inflight=1] ================ uc2 M12a gate: direct (Engine) ================
+  [svc inflight=1] sends                 : 115246
+  [svc inflight=1] responses             : 115246
+  [svc inflight=1] not FRESH (envelope)  : 0
+  [svc inflight=1] not_leader / retried  : 0 / 0
+  [svc inflight=1] dup / overwritten     : 0 / 0
+  [svc inflight=1] in-flight at end      : 0
+  [svc inflight=1] lost (timeout/error)  : 0
+  [svc inflight=1] elapsed (drain-incl.) : 20.000 s
+  [svc inflight=1] responses/s           : 5762
+  [svc inflight=1] p50                   : 0.209 ms
+  [svc inflight=1] p90                   : 0.222 ms
+  [svc inflight=1] p95                   : 0.226 ms
+  [svc inflight=1] p99                   : 0.328 ms
+  [svc inflight=1] max                   : 8.430 ms
+  [svc inflight=1] (m5 reference bar, informational only: responses/s >= 400000 && p50 <= 1.0 ms — this harness's own bar is the gateway/direct RATIO, printed below)
+  [svc inflight=1] reference bar: FAIL (not this harness's gate)
+  [svc inflight=1] ============================================================================
+  [svc inflight=1] RESULT {"arm":"direct","responses_per_sec":5762.3,"payload":64,"inflight":1,"secs":20,"sends":115246,"responses":115246,"lost":0,"not_fresh":0,"inflight_at_end":0,"p50_ms":0.209,"p90_ms":0.222,"p95_ms":0.226,"p99_ms":0.328,"max_ms":8.430,"elapsed_secs":20.000,"window_rps":5791.1,"window_responses":92657,"fan_in":false,"declared":1}
+SVCTIME-JSON {"inflight": 1, "resp_per_sec": 5762.3, "window_rps": 5791.1, "responses": 115246, "p50_ms": 0.209, "p90_ms": 0.222, "p95_ms": 0.226, "p99_ms": 0.328, "max_ms": 8.43, "lost": 0, "retried": null, "not_leader": null, "bytes_per_command": 661.7074692033285, "pkts_per_command": 6.094882600880167, "arm": "A", "arm_label": "consistent / unpinned / sleep-apply", "rep": 1, "leader": 0, "pinned": false, "node_env": {}, "service_env": {}}
+
+INFO --- arm A inflight=1 rep=2/3 ---
+INFO [ssh 54.234.141.82] sudo /opt/bench/uc/target/release/examples/m12_gate client-direct --instance-dir /opt/bench/m12/n0 --app-id m12-gate --secs 20 --payload 64 --inflight 1 --envelope off --poll-idle spin --warmup-secs 2 --measure-secs 16
+INFO [ssh 54.234.141.82] cat /proc/net/dev  # NIC sample for ens5, ~1 Hz while the client runs
+  [svc inflight=1] m12_gate client-direct: 20 s, payload 64, inflight 1, envelope off, poll-idle Spin
+  [svc inflight=1] 
+  [svc inflight=1] ================ uc2 M12a gate: direct (Engine) ================
+  [svc inflight=1] sends                 : 120743
+  [svc inflight=1] responses             : 120743
+  [svc inflight=1] not FRESH (envelope)  : 0
+  [svc inflight=1] not_leader / retried  : 0 / 0
+  [svc inflight=1] dup / overwritten     : 0 / 0
+  [svc inflight=1] in-flight at end      : 0
+  [svc inflight=1] lost (timeout/error)  : 0
+  [svc inflight=1] elapsed (drain-incl.) : 20.000 s
+  [svc inflight=1] responses/s           : 6037
+  [svc inflight=1] p50                   : 0.123 ms
+  [svc inflight=1] p90                   : 0.219 ms
+  [svc inflight=1] p95                   : 0.221 ms
+  [svc inflight=1] p99                   : 0.289 ms
+  [svc inflight=1] max                   : 17.842 ms
+  [svc inflight=1] (m5 reference bar, informational only: responses/s >= 400000 && p50 <= 1.0 ms — this harness's own bar is the gateway/direct RATIO, printed below)
+  [svc inflight=1] reference bar: FAIL (not this harness's gate)
+  [svc inflight=1] ============================================================================
+  [svc inflight=1] RESULT {"arm":"direct","responses_per_sec":6037.1,"payload":64,"inflight":1,"secs":20,"sends":120743,"responses":120743,"lost":0,"not_fresh":0,"inflight_at_end":0,"p50_ms":0.123,"p90_ms":0.219,"p95_ms":0.221,"p99_ms":0.289,"max_ms":17.842,"elapsed_secs":20.000,"window_rps":6080.1,"window_responses":97281,"fan_in":false,"declared":1}
+SVCTIME-JSON {"inflight": 1, "resp_per_sec": 6037.1, "window_rps": 6080.1, "responses": 120743, "p50_ms": 0.123, "p90_ms": 0.219, "p95_ms": 0.221, "p99_ms": 0.289, "max_ms": 17.842, "lost": 0, "retried": null, "not_leader": null, "bytes_per_command": 652.6748717943095, "pkts_per_command": 6.011443915744723, "arm": "A", "arm_label": "consistent / unpinned / sleep-apply", "rep": 2, "leader": 0, "pinned": false, "node_env": {}, "service_env": {}}
+
+INFO --- arm A inflight=1 rep=3/3 ---
+INFO [ssh 54.234.141.82] sudo /opt/bench/uc/target/release/examples/m12_gate client-direct --instance-dir /opt/bench/m12/n0 --app-id m12-gate --secs 20 --payload 64 --inflight 1 --envelope off --poll-idle spin --warmup-secs 2 --measure-secs 16
+INFO [ssh 54.234.141.82] cat /proc/net/dev  # NIC sample for ens5, ~1 Hz while the client runs
+  [svc inflight=1] m12_gate client-direct: 20 s, payload 64, inflight 1, envelope off, poll-idle Spin
+  [svc inflight=1] 
+  [svc inflight=1] ================ uc2 M12a gate: direct (Engine) ================
+  [svc inflight=1] sends                 : 122984
+  [svc inflight=1] responses             : 122984
+  [svc inflight=1] not FRESH (envelope)  : 0
+  [svc inflight=1] not_leader / retried  : 0 / 0
+  [svc inflight=1] dup / overwritten     : 0 / 0
+  [svc inflight=1] in-flight at end      : 0
+  [svc inflight=1] lost (timeout/error)  : 0
+  [svc inflight=1] elapsed (drain-incl.) : 20.000 s
+  [svc inflight=1] responses/s           : 6149
+  [svc inflight=1] p50                   : 0.117 ms
+  [svc inflight=1] p90                   : 0.218 ms
+  [svc inflight=1] p95                   : 0.220 ms
+  [svc inflight=1] p99                   : 0.325 ms
+  [svc inflight=1] max                   : 17.154 ms
+  [svc inflight=1] (m5 reference bar, informational only: responses/s >= 400000 && p50 <= 1.0 ms — this harness's own bar is the gateway/direct RATIO, printed below)
+  [svc inflight=1] reference bar: FAIL (not this harness's gate)
+  [svc inflight=1] ============================================================================
+  [svc inflight=1] RESULT {"arm":"direct","responses_per_sec":6149.1,"payload":64,"inflight":1,"secs":20,"sends":122984,"responses":122984,"lost":0,"not_fresh":0,"inflight_at_end":0,"p50_ms":0.117,"p90_ms":0.218,"p95_ms":0.220,"p99_ms":0.325,"max_ms":17.154,"elapsed_secs":20.000,"window_rps":6207.5,"window_responses":99320,"fan_in":false,"declared":1}
+SVCTIME-JSON {"inflight": 1, "resp_per_sec": 6149.1, "window_rps": 6207.5, "responses": 122984, "p50_ms": 0.117, "p90_ms": 0.218, "p95_ms": 0.22, "p99_ms": 0.325, "max_ms": 17.154, "lost": 0, "retried": null, "not_leader": null, "bytes_per_command": 632.0880053829325, "pkts_per_command": 5.821880243728367, "arm": "A", "arm_label": "consistent / unpinned / sleep-apply", "rep": 3, "leader": 0, "pinned": false, "node_env": {}, "service_env": {}}
+
+INFO --- arm A inflight=2 rep=1/3 ---
+INFO [ssh 54.234.141.82] sudo /opt/bench/uc/target/release/examples/m12_gate client-direct --instance-dir /opt/bench/m12/n0 --app-id m12-gate --secs 20 --payload 64 --inflight 2 --envelope off --poll-idle spin --warmup-secs 2 --measure-secs 16
+INFO [ssh 54.234.141.82] cat /proc/net/dev  # NIC sample for ens5, ~1 Hz while the client runs
+  [svc inflight=2] m12_gate client-direct: 20 s, payload 64, inflight 2, envelope off, poll-idle Spin
+  [svc inflight=2] 
+  [svc inflight=2] ================ uc2 M12a gate: direct (Engine) ================
+  [svc inflight=2] sends                 : 211985
+  [svc inflight=2] responses             : 211985
+  [svc inflight=2] not FRESH (envelope)  : 0
+  [svc inflight=2] not_leader / retried  : 0 / 0
+  [svc inflight=2] dup / overwritten     : 0 / 0
+  [svc inflight=2] in-flight at end      : 0
+  [svc inflight=2] lost (timeout/error)  : 0
+  [svc inflight=2] elapsed (drain-incl.) : 20.000 s
+  [svc inflight=2] responses/s           : 10599
+  [svc inflight=2] p50                   : 0.216 ms
+  [svc inflight=2] p90                   : 0.222 ms
+  [svc inflight=2] p95                   : 0.230 ms
+  [svc inflight=2] p99                   : 0.329 ms
+  [svc inflight=2] max                   : 22.020 ms
+  [svc inflight=2] (m5 reference bar, informational only: responses/s >= 400000 && p50 <= 1.0 ms — this harness's own bar is the gateway/direct RATIO, printed below)
+  [svc inflight=2] reference bar: FAIL (not this harness's gate)
+  [svc inflight=2] ============================================================================
+  [svc inflight=2] RESULT {"arm":"direct","responses_per_sec":10599.2,"payload":64,"inflight":2,"secs":20,"sends":211985,"responses":211985,"lost":0,"not_fresh":0,"inflight_at_end":0,"p50_ms":0.216,"p90_ms":0.222,"p95_ms":0.230,"p99_ms":0.329,"max_ms":22.020,"elapsed_secs":20.000,"window_rps":10537.1,"window_responses":168594,"fan_in":false,"declared":1}
+SVCTIME-JSON {"inflight": 2, "resp_per_sec": 10599.2, "window_rps": 10537.1, "responses": 211985, "p50_ms": 0.216, "p90_ms": 0.222, "p95_ms": 0.23, "p99_ms": 0.329, "max_ms": 22.02, "lost": 0, "retried": null, "not_leader": null, "bytes_per_command": 559.435757975534, "pkts_per_command": 4.6992074232599315, "arm": "A", "arm_label": "consistent / unpinned / sleep-apply", "rep": 1, "leader": 0, "pinned": false, "node_env": {}, "service_env": {}}
+
+INFO --- arm A inflight=2 rep=2/3 ---
+INFO [ssh 54.234.141.82] sudo /opt/bench/uc/target/release/examples/m12_gate client-direct --instance-dir /opt/bench/m12/n0 --app-id m12-gate --secs 20 --payload 64 --inflight 2 --envelope off --poll-idle spin --warmup-secs 2 --measure-secs 16
+INFO [ssh 54.234.141.82] cat /proc/net/dev  # NIC sample for ens5, ~1 Hz while the client runs
+  [svc inflight=2] m12_gate client-direct: 20 s, payload 64, inflight 2, envelope off, poll-idle Spin
+  [svc inflight=2] 
+  [svc inflight=2] ================ uc2 M12a gate: direct (Engine) ================
+  [svc inflight=2] sends                 : 204513
+  [svc inflight=2] responses             : 204513
+  [svc inflight=2] not FRESH (envelope)  : 0
+  [svc inflight=2] not_leader / retried  : 0 / 0
+  [svc inflight=2] dup / overwritten     : 0 / 0
+  [svc inflight=2] in-flight at end      : 0
+  [svc inflight=2] lost (timeout/error)  : 0
+  [svc inflight=2] elapsed (drain-incl.) : 20.000 s
+  [svc inflight=2] responses/s           : 10226
+  [svc inflight=2] p50                   : 0.216 ms
+  [svc inflight=2] p90                   : 0.222 ms
+  [svc inflight=2] p95                   : 0.231 ms
+  [svc inflight=2] p99                   : 0.341 ms
+  [svc inflight=2] max                   : 23.167 ms
+  [svc inflight=2] (m5 reference bar, informational only: responses/s >= 400000 && p50 <= 1.0 ms — this harness's own bar is the gateway/direct RATIO, printed below)
+  [svc inflight=2] reference bar: FAIL (not this harness's gate)
+  [svc inflight=2] ============================================================================
+  [svc inflight=2] RESULT {"arm":"direct","responses_per_sec":10225.6,"payload":64,"inflight":2,"secs":20,"sends":204513,"responses":204513,"lost":0,"not_fresh":0,"inflight_at_end":0,"p50_ms":0.216,"p90_ms":0.222,"p95_ms":0.231,"p99_ms":0.341,"max_ms":23.167,"elapsed_secs":20.000,"window_rps":10224.5,"window_responses":163592,"fan_in":false,"declared":1}
+SVCTIME-JSON {"inflight": 2, "resp_per_sec": 10225.6, "window_rps": 10224.5, "responses": 204513, "p50_ms": 0.216, "p90_ms": 0.222, "p95_ms": 0.231, "p99_ms": 0.341, "max_ms": 23.167, "lost": 0, "retried": null, "not_leader": null, "bytes_per_command": 590.2070720809215, "pkts_per_command": 4.945677292465683, "arm": "A", "arm_label": "consistent / unpinned / sleep-apply", "rep": 2, "leader": 0, "pinned": false, "node_env": {}, "service_env": {}}
+
+INFO --- arm A inflight=2 rep=3/3 ---
+INFO [ssh 54.234.141.82] sudo /opt/bench/uc/target/release/examples/m12_gate client-direct --instance-dir /opt/bench/m12/n0 --app-id m12-gate --secs 20 --payload 64 --inflight 2 --envelope off --poll-idle spin --warmup-secs 2 --measure-secs 16
+INFO [ssh 54.234.141.82] cat /proc/net/dev  # NIC sample for ens5, ~1 Hz while the client runs
+  [svc inflight=2] m12_gate client-direct: 20 s, payload 64, inflight 2, envelope off, poll-idle Spin
+  [svc inflight=2] 
+  [svc inflight=2] ================ uc2 M12a gate: direct (Engine) ================
+  [svc inflight=2] sends                 : 204169
+  [svc inflight=2] responses             : 204169
+  [svc inflight=2] not FRESH (envelope)  : 0
+  [svc inflight=2] not_leader / retried  : 0 / 0
+  [svc inflight=2] dup / overwritten     : 0 / 0
+  [svc inflight=2] in-flight at end      : 0
+  [svc inflight=2] lost (timeout/error)  : 0
+  [svc inflight=2] elapsed (drain-incl.) : 20.000 s
+  [svc inflight=2] responses/s           : 10208
+  [svc inflight=2] p50                   : 0.216 ms
+  [svc inflight=2] p90                   : 0.225 ms
+  [svc inflight=2] p95                   : 0.318 ms
+  [svc inflight=2] p99                   : 0.542 ms
+  [svc inflight=2] max                   : 7.516 ms
+  [svc inflight=2] (m5 reference bar, informational only: responses/s >= 400000 && p50 <= 1.0 ms — this harness's own bar is the gateway/direct RATIO, printed below)
+  [svc inflight=2] reference bar: FAIL (not this harness's gate)
+  [svc inflight=2] ============================================================================
+  [svc inflight=2] RESULT {"arm":"direct","responses_per_sec":10208.4,"payload":64,"inflight":2,"secs":20,"sends":204169,"responses":204169,"lost":0,"not_fresh":0,"inflight_at_end":0,"p50_ms":0.216,"p90_ms":0.225,"p95_ms":0.318,"p99_ms":0.542,"max_ms":7.516,"elapsed_secs":20.000,"window_rps":10109.5,"window_responses":161752,"fan_in":false,"declared":1}
+SVCTIME-JSON {"inflight": 2, "resp_per_sec": 10208.4, "window_rps": 10109.5, "responses": 204169, "p50_ms": 0.216, "p90_ms": 0.225, "p95_ms": 0.318, "p99_ms": 0.542, "max_ms": 7.516, "lost": 0, "retried": null, "not_leader": null, "bytes_per_command": 573.5114035211988, "pkts_per_command": 4.844749997934733, "arm": "A", "arm_label": "consistent / unpinned / sleep-apply", "rep": 3, "leader": 0, "pinned": false, "node_env": {}, "service_env": {}}
+
+INFO --- arm A inflight=4 rep=1/1 ---
+INFO [ssh 54.234.141.82] sudo /opt/bench/uc/target/release/examples/m12_gate client-direct --instance-dir /opt/bench/m12/n0 --app-id m12-gate --secs 20 --payload 64 --inflight 4 --envelope off --poll-idle spin --warmup-secs 2 --measure-secs 16
+INFO [ssh 54.234.141.82] cat /proc/net/dev  # NIC sample for ens5, ~1 Hz while the client runs
+  [svc inflight=4] m12_gate client-direct: 20 s, payload 64, inflight 4, envelope off, poll-idle Spin
+  [svc inflight=4] 
+  [svc inflight=4] ================ uc2 M12a gate: direct (Engine) ================
+  [svc inflight=4] sends                 : 357686
+  [svc inflight=4] responses             : 357686
+  [svc inflight=4] not FRESH (envelope)  : 0
+  [svc inflight=4] not_leader / retried  : 0 / 0
+  [svc inflight=4] dup / overwritten     : 0 / 0
+  [svc inflight=4] in-flight at end      : 0
+  [svc inflight=4] lost (timeout/error)  : 0
+  [svc inflight=4] elapsed (drain-incl.) : 20.000 s
+  [svc inflight=4] responses/s           : 17884
+  [svc inflight=4] p50                   : 0.220 ms
+  [svc inflight=4] p90                   : 0.234 ms
+  [svc inflight=4] p95                   : 0.322 ms
+  [svc inflight=4] p99                   : 0.554 ms
+  [svc inflight=4] max                   : 6.541 ms
+  [svc inflight=4] (m5 reference bar, informational only: responses/s >= 400000 && p50 <= 1.0 ms — this harness's own bar is the gateway/direct RATIO, printed below)
+  [svc inflight=4] reference bar: FAIL (not this harness's gate)
+  [svc inflight=4] ============================================================================
+  [svc inflight=4] RESULT {"arm":"direct","responses_per_sec":17884.2,"payload":64,"inflight":4,"secs":20,"sends":357686,"responses":357686,"lost":0,"not_fresh":0,"inflight_at_end":0,"p50_ms":0.220,"p90_ms":0.234,"p95_ms":0.322,"p99_ms":0.554,"max_ms":6.541,"elapsed_secs":20.000,"window_rps":18083.4,"window_responses":289334,"fan_in":false,"declared":1}
+SVCTIME-JSON {"inflight": 4, "resp_per_sec": 17884.2, "window_rps": 18083.4, "responses": 357686, "p50_ms": 0.22, "p90_ms": 0.234, "p95_ms": 0.322, "p99_ms": 0.554, "max_ms": 6.541, "lost": 0, "retried": null, "not_leader": null, "bytes_per_command": 529.1485036162483, "pkts_per_command": 4.000281276675604, "arm": "A", "arm_label": "consistent / unpinned / sleep-apply", "rep": 1, "leader": 0, "pinned": false, "node_env": {}, "service_env": {}}
+
+INFO --- arm A inflight=8 rep=1/1 ---
+INFO [ssh 54.234.141.82] sudo /opt/bench/uc/target/release/examples/m12_gate client-direct --instance-dir /opt/bench/m12/n0 --app-id m12-gate --secs 20 --payload 64 --inflight 8 --envelope off --poll-idle spin --warmup-secs 2 --measure-secs 16
+INFO [ssh 54.234.141.82] cat /proc/net/dev  # NIC sample for ens5, ~1 Hz while the client runs
+  [svc inflight=8] m12_gate client-direct: 20 s, payload 64, inflight 8, envelope off, poll-idle Spin
+  [svc inflight=8] 
+  [svc inflight=8] ================ uc2 M12a gate: direct (Engine) ================
+  [svc inflight=8] sends                 : 689345
+  [svc inflight=8] responses             : 689345
+  [svc inflight=8] not FRESH (envelope)  : 0
+  [svc inflight=8] not_leader / retried  : 0 / 0
+  [svc inflight=8] dup / overwritten     : 0 / 0
+  [svc inflight=8] in-flight at end      : 0
+  [svc inflight=8] lost (timeout/error)  : 0
+  [svc inflight=8] elapsed (drain-incl.) : 20.000 s
+  [svc inflight=8] responses/s           : 34467
+  [svc inflight=8] p50                   : 0.220 ms
+  [svc inflight=8] p90                   : 0.321 ms
+  [svc inflight=8] p95                   : 0.330 ms
+  [svc inflight=8] p99                   : 0.354 ms
+  [svc inflight=8] max                   : 6.185 ms
+  [svc inflight=8] (m5 reference bar, informational only: responses/s >= 400000 && p50 <= 1.0 ms — this harness's own bar is the gateway/direct RATIO, printed below)
+  [svc inflight=8] reference bar: FAIL (not this harness's gate)
+  [svc inflight=8] ============================================================================
+  [svc inflight=8] RESULT {"arm":"direct","responses_per_sec":34466.9,"payload":64,"inflight":8,"secs":20,"sends":689345,"responses":689345,"lost":0,"not_fresh":0,"inflight_at_end":0,"p50_ms":0.220,"p90_ms":0.321,"p95_ms":0.330,"p99_ms":0.354,"max_ms":6.185,"elapsed_secs":20.000,"window_rps":34436.9,"window_responses":550990,"fan_in":false,"declared":1}
+SVCTIME-JSON {"inflight": 8, "resp_per_sec": 34466.9, "window_rps": 34436.9, "responses": 689345, "p50_ms": 0.22, "p90_ms": 0.321, "p95_ms": 0.33, "p99_ms": 0.354, "max_ms": 6.185, "lost": 0, "retried": null, "not_leader": null, "bytes_per_command": 404.4727929168142, "pkts_per_command": 2.2451061676819815, "arm": "A", "arm_label": "consistent / unpinned / sleep-apply", "rep": 1, "leader": 0, "pinned": false, "node_env": {}, "service_env": {}}
+
+INFO --- arm A inflight=16 rep=1/1 ---
+INFO [ssh 54.234.141.82] sudo /opt/bench/uc/target/release/examples/m12_gate client-direct --instance-dir /opt/bench/m12/n0 --app-id m12-gate --secs 20 --payload 64 --inflight 16 --envelope off --poll-idle spin --warmup-secs 2 --measure-secs 16
+INFO [ssh 54.234.141.82] cat /proc/net/dev  # NIC sample for ens5, ~1 Hz while the client runs
+  [svc inflight=16] m12_gate client-direct: 20 s, payload 64, inflight 16, envelope off, poll-idle Spin
+  [svc inflight=16] 
+  [svc inflight=16] ================ uc2 M12a gate: direct (Engine) ================
+  [svc inflight=16] sends                 : 1200327
+  [svc inflight=16] responses             : 1200327
+  [svc inflight=16] not FRESH (envelope)  : 0
+  [svc inflight=16] not_leader / retried  : 0 / 0
+  [svc inflight=16] dup / overwritten     : 0 / 0
+  [svc inflight=16] in-flight at end      : 0
+  [svc inflight=16] lost (timeout/error)  : 0
+  [svc inflight=16] elapsed (drain-incl.) : 20.000 s
+  [svc inflight=16] responses/s           : 60016
+  [svc inflight=16] p50                   : 0.232 ms
+  [svc inflight=16] p90                   : 0.341 ms
+  [svc inflight=16] p95                   : 0.348 ms
+  [svc inflight=16] p99                   : 0.408 ms
+  [svc inflight=16] max                   : 24.904 ms
+  [svc inflight=16] (m5 reference bar, informational only: responses/s >= 400000 && p50 <= 1.0 ms — this harness's own bar is the gateway/direct RATIO, printed below)
+  [svc inflight=16] reference bar: FAIL (not this harness's gate)
+  [svc inflight=16] ============================================================================
+  [svc inflight=16] RESULT {"arm":"direct","responses_per_sec":60015.8,"payload":64,"inflight":16,"secs":20,"sends":1200327,"responses":1200327,"lost":0,"not_fresh":0,"inflight_at_end":0,"p50_ms":0.232,"p90_ms":0.341,"p95_ms":0.348,"p99_ms":0.408,"max_ms":24.904,"elapsed_secs":20.000,"window_rps":60227.2,"window_responses":963636,"fan_in":false,"declared":1}
+SVCTIME-JSON {"inflight": 16, "resp_per_sec": 60015.8, "window_rps": 60227.2, "responses": 1200327, "p50_ms": 0.232, "p90_ms": 0.341, "p95_ms": 0.348, "p99_ms": 0.408, "max_ms": 24.904, "lost": 0, "retried": null, "not_leader": null, "bytes_per_command": 349.89845901467334, "pkts_per_command": 1.337632440839767, "arm": "A", "arm_label": "consistent / unpinned / sleep-apply", "rep": 1, "leader": 0, "pinned": false, "node_env": {}, "service_env": {}}
+
+INFO --- arm A inflight=64 rep=1/1 ---
+INFO [ssh 54.234.141.82] sudo /opt/bench/uc/target/release/examples/m12_gate client-direct --instance-dir /opt/bench/m12/n0 --app-id m12-gate --secs 20 --payload 64 --inflight 64 --envelope off --poll-idle spin --warmup-secs 2 --measure-secs 16
+INFO [ssh 54.234.141.82] cat /proc/net/dev  # NIC sample for ens5, ~1 Hz while the client runs
+  [svc inflight=64] m12_gate client-direct: 20 s, payload 64, inflight 64, envelope off, poll-idle Spin
+  [svc inflight=64] 
+  [svc inflight=64] ================ uc2 M12a gate: direct (Engine) ================
+  [svc inflight=64] sends                 : 3485109
+  [svc inflight=64] responses             : 3485109
+  [svc inflight=64] not FRESH (envelope)  : 0
+  [svc inflight=64] not_leader / retried  : 0 / 0
+  [svc inflight=64] dup / overwritten     : 0 / 0
+  [svc inflight=64] in-flight at end      : 0
+  [svc inflight=64] lost (timeout/error)  : 0
+  [svc inflight=64] elapsed (drain-incl.) : 20.000 s
+  [svc inflight=64] responses/s           : 174253
+  [svc inflight=64] p50                   : 0.355 ms
+  [svc inflight=64] p90                   : 0.385 ms
+  [svc inflight=64] p95                   : 0.427 ms
+  [svc inflight=64] p99                   : 0.518 ms
+  [svc inflight=64] max                   : 14.565 ms
+  [svc inflight=64] (m5 reference bar, informational only: responses/s >= 400000 && p50 <= 1.0 ms — this harness's own bar is the gateway/direct RATIO, printed below)
+  [svc inflight=64] reference bar: FAIL (not this harness's gate)
+  [svc inflight=64] ============================================================================
+  [svc inflight=64] RESULT {"arm":"direct","responses_per_sec":174252.8,"payload":64,"inflight":64,"secs":20,"sends":3485109,"responses":3485109,"lost":0,"not_fresh":0,"inflight_at_end":0,"p50_ms":0.355,"p90_ms":0.385,"p95_ms":0.427,"p99_ms":0.518,"max_ms":14.565,"elapsed_secs":20.000,"window_rps":172672.4,"window_responses":2762758,"fan_in":false,"declared":1}
+SVCTIME-JSON {"inflight": 64, "resp_per_sec": 174252.8, "window_rps": 172672.4, "responses": 3485109, "p50_ms": 0.355, "p90_ms": 0.385, "p95_ms": 0.427, "p99_ms": 0.518, "max_ms": 14.565, "lost": 0, "retried": null, "not_leader": null, "bytes_per_command": 281.06022214303266, "pkts_per_command": 0.4395105503520468, "arm": "A", "arm_label": "consistent / unpinned / sleep-apply", "rep": 1, "leader": 0, "pinned": false, "node_env": {}, "service_env": {}}
+
+INFO --- arm A inflight=256 rep=1/1 ---
+INFO [ssh 54.234.141.82] sudo /opt/bench/uc/target/release/examples/m12_gate client-direct --instance-dir /opt/bench/m12/n0 --app-id m12-gate --secs 20 --payload 64 --inflight 256 --envelope off --poll-idle spin --warmup-secs 2 --measure-secs 16
+INFO [ssh 54.234.141.82] cat /proc/net/dev  # NIC sample for ens5, ~1 Hz while the client runs
+  [svc inflight=256] m12_gate client-direct: 20 s, payload 64, inflight 256, envelope off, poll-idle Spin
+  [svc inflight=256] 
+  [svc inflight=256] ================ uc2 M12a gate: direct (Engine) ================
+  [svc inflight=256] sends                 : 11444878
+  [svc inflight=256] responses             : 11444878
+  [svc inflight=256] not FRESH (envelope)  : 0
+  [svc inflight=256] not_leader / retried  : 0 / 0
+  [svc inflight=256] dup / overwritten     : 0 / 0
+  [svc inflight=256] in-flight at end      : 0
+  [svc inflight=256] lost (timeout/error)  : 0
+  [svc inflight=256] elapsed (drain-incl.) : 20.000 s
+  [svc inflight=256] responses/s           : 572231
+  [svc inflight=256] p50                   : 0.428 ms
+  [svc inflight=256] p90                   : 0.502 ms
+  [svc inflight=256] p95                   : 0.565 ms
+  [svc inflight=256] p99                   : 1.203 ms
+  [svc inflight=256] max                   : 73.400 ms
+  [svc inflight=256] (m5 reference bar, informational only: responses/s >= 400000 && p50 <= 1.0 ms — this harness's own bar is the gateway/direct RATIO, printed below)
+  [svc inflight=256] reference bar: PASS
+  [svc inflight=256] ============================================================================
+  [svc inflight=256] RESULT {"arm":"direct","responses_per_sec":572231.5,"payload":64,"inflight":256,"secs":20,"sends":11444878,"responses":11444878,"lost":0,"not_fresh":0,"inflight_at_end":0,"p50_ms":0.428,"p90_ms":0.502,"p95_ms":0.565,"p99_ms":1.203,"max_ms":73.400,"elapsed_secs":20.000,"window_rps":572284.4,"window_responses":9156551,"fan_in":false,"declared":1}
+SVCTIME-JSON {"inflight": 256, "resp_per_sec": 572231.5, "window_rps": 572284.4, "responses": 11444878, "p50_ms": 0.428, "p90_ms": 0.502, "p95_ms": 0.565, "p99_ms": 1.203, "max_ms": 73.4, "lost": 0, "retried": null, "not_leader": null, "bytes_per_command": 273.14891330361786, "pkts_per_command": 0.24501544180982937, "arm": "A", "arm_label": "consistent / unpinned / sleep-apply", "rep": 1, "leader": 0, "pinned": false, "node_env": {}, "service_env": {}}
+INFO [systemctl 54.234.141.82] sudo systemctl kill --signal=SIGKILL m12-edge 2>/dev/null; sudo systemctl stop m12-edge 2>/dev/null; sudo systemctl reset-failed m12-edge 2>/dev/null; true
+INFO [systemctl 54.234.141.82] sudo systemctl kill --signal=SIGKILL m12-service 2>/dev/null; sudo systemctl stop m12-service 2>/dev/null; sudo systemctl reset-failed m12-service 2>/dev/null; true
+INFO [systemctl 54.234.141.82] sudo systemctl kill --signal=SIGKILL m12-node 2>/dev/null; sudo systemctl stop m12-node 2>/dev/null; sudo systemctl reset-failed m12-node 2>/dev/null; true
+INFO [systemctl 3.80.127.214] sudo systemctl kill --signal=SIGKILL m12-edge 2>/dev/null; sudo systemctl stop m12-edge 2>/dev/null; sudo systemctl reset-failed m12-edge 2>/dev/null; true
+INFO [systemctl 3.80.127.214] sudo systemctl kill --signal=SIGKILL m12-service 2>/dev/null; sudo systemctl stop m12-service 2>/dev/null; sudo systemctl reset-failed m12-service 2>/dev/null; true
+INFO [systemctl 3.80.127.214] sudo systemctl kill --signal=SIGKILL m12-node 2>/dev/null; sudo systemctl stop m12-node 2>/dev/null; sudo systemctl reset-failed m12-node 2>/dev/null; true
+INFO [systemctl 3.85.123.227] sudo systemctl kill --signal=SIGKILL m12-edge 2>/dev/null; sudo systemctl stop m12-edge 2>/dev/null; sudo systemctl reset-failed m12-edge 2>/dev/null; true
+INFO [systemctl 3.85.123.227] sudo systemctl kill --signal=SIGKILL m12-service 2>/dev/null; sudo systemctl stop m12-service 2>/dev/null; sudo systemctl reset-failed m12-service 2>/dev/null; true
+INFO [systemctl 3.85.123.227] sudo systemctl kill --signal=SIGKILL m12-node 2>/dev/null; sudo systemctl stop m12-node 2>/dev/null; sudo systemctl reset-failed m12-node 2>/dev/null; true
+
+=== ARM B: consistent / pinned / sleep-apply ===
+INFO [ssh 54.234.141.82] sudo rm -rf /opt/bench/m12/n0 && sudo mkdir -p /opt/bench/m12/n0
+INFO [ssh 3.80.127.214] sudo rm -rf /opt/bench/m12/n1 && sudo mkdir -p /opt/bench/m12/n1
+INFO [ssh 3.85.123.227] sudo rm -rf /opt/bench/m12/n2 && sudo mkdir -p /opt/bench/m12/n2
+INFO [systemctl 54.234.141.82] sudo systemctl kill --signal=SIGKILL m12-node 2>/dev/null; sudo systemctl stop m12-node 2>/dev/null; sudo systemctl reset-failed m12-node 2>/dev/null; true
+INFO [systemd-run 54.234.141.82] sudo systemd-run --unit=m12-node --collect -p TimeoutStopSec=1 -p LimitNOFILE=65536 -p CPUAffinity=0,1,4,5 -p StandardOutput=append:/opt/bench/m12-node.log -p StandardError=append:/opt/bench/m12-node.log /opt/bench/uc/target/release/examples/m12_gate node --id 0 --bind 10.10.1.10:19100 --instance-dir /opt/bench/m12/n0 --members 0@10.10.1.10:19100,1@10.10.1.11:19100,2@10.10.1.12:19100 --app-id m12-gate --admission-kib 256 --services count
+INFO [systemctl 3.80.127.214] sudo systemctl kill --signal=SIGKILL m12-node 2>/dev/null; sudo systemctl stop m12-node 2>/dev/null; sudo systemctl reset-failed m12-node 2>/dev/null; true
+INFO [systemd-run 3.80.127.214] sudo systemd-run --unit=m12-node --collect -p TimeoutStopSec=1 -p LimitNOFILE=65536 -p CPUAffinity=0,1,4,5 -p StandardOutput=append:/opt/bench/m12-node.log -p StandardError=append:/opt/bench/m12-node.log /opt/bench/uc/target/release/examples/m12_gate node --id 1 --bind 10.10.1.11:19100 --instance-dir /opt/bench/m12/n1 --members 0@10.10.1.10:19100,1@10.10.1.11:19100,2@10.10.1.12:19100 --app-id m12-gate --admission-kib 256 --services count
+INFO [systemctl 3.85.123.227] sudo systemctl kill --signal=SIGKILL m12-node 2>/dev/null; sudo systemctl stop m12-node 2>/dev/null; sudo systemctl reset-failed m12-node 2>/dev/null; true
+INFO [systemd-run 3.85.123.227] sudo systemd-run --unit=m12-node --collect -p TimeoutStopSec=1 -p LimitNOFILE=65536 -p CPUAffinity=0,1,4,5 -p StandardOutput=append:/opt/bench/m12-node.log -p StandardError=append:/opt/bench/m12-node.log /opt/bench/uc/target/release/examples/m12_gate node --id 2 --bind 10.10.1.12:19100 --instance-dir /opt/bench/m12/n2 --members 0@10.10.1.10:19100,1@10.10.1.11:19100,2@10.10.1.12:19100 --app-id m12-gate --admission-kib 256 --services count
+INFO [ssh 54.234.141.82] sudo rm -f /opt/bench/m12-service.log
+INFO [systemctl 54.234.141.82] sudo systemctl kill --signal=SIGKILL m12-service 2>/dev/null; sudo systemctl stop m12-service 2>/dev/null; sudo systemctl reset-failed m12-service 2>/dev/null; true
+INFO [systemd-run 54.234.141.82] sudo systemd-run --unit=m12-service --collect -p TimeoutStopSec=1 -p CPUAffinity=2 -p StandardOutput=append:/opt/bench/m12-service.log -p StandardError=append:/opt/bench/m12-service.log /opt/bench/uc/target/release/examples/m12_gate service --instance-dir /opt/bench/m12/n0 --app-id m12-gate --envelope off --fsm count
+INFO [ssh 3.80.127.214] sudo rm -f /opt/bench/m12-service.log
+INFO [systemctl 3.80.127.214] sudo systemctl kill --signal=SIGKILL m12-service 2>/dev/null; sudo systemctl stop m12-service 2>/dev/null; sudo systemctl reset-failed m12-service 2>/dev/null; true
+INFO [systemd-run 3.80.127.214] sudo systemd-run --unit=m12-service --collect -p TimeoutStopSec=1 -p CPUAffinity=2 -p StandardOutput=append:/opt/bench/m12-service.log -p StandardError=append:/opt/bench/m12-service.log /opt/bench/uc/target/release/examples/m12_gate service --instance-dir /opt/bench/m12/n1 --app-id m12-gate --envelope off --fsm count
+INFO [ssh 3.85.123.227] sudo rm -f /opt/bench/m12-service.log
+INFO [systemctl 3.85.123.227] sudo systemctl kill --signal=SIGKILL m12-service 2>/dev/null; sudo systemctl stop m12-service 2>/dev/null; sudo systemctl reset-failed m12-service 2>/dev/null; true
+INFO [systemd-run 3.85.123.227] sudo systemd-run --unit=m12-service --collect -p TimeoutStopSec=1 -p CPUAffinity=2 -p StandardOutput=append:/opt/bench/m12-service.log -p StandardError=append:/opt/bench/m12-service.log /opt/bench/uc/target/release/examples/m12_gate service --instance-dir /opt/bench/m12/n2 --app-id m12-gate --envelope off --fsm count
+INFO [iface 54.234.141.82] IFACE=$(ip -o route get 8.8.8.8 2>/dev/null | sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -n1); if [ -z "$IFACE" ]; then for i in $(ls /sys/class/net 2>/dev/null | grep -v '^lo$'); do st=$(cat /sys/class/net/$i/operstate 2>/dev/null); if [ "$st" = up ]; then IFACE=$i; break; fi; done; fi; echo IFACE=$IFACE
+INFO arm B: leader n0 (54.234.141.82), NIC ens5
+
+INFO --- arm B inflight=1 rep=1/3 ---
+INFO [ssh 54.234.141.82] sudo taskset -c 3,7 /opt/bench/uc/target/release/examples/m12_gate client-direct --instance-dir /opt/bench/m12/n0 --app-id m12-gate --secs 20 --payload 64 --inflight 1 --envelope off --poll-idle spin --warmup-secs 2 --measure-secs 16
+INFO [ssh 54.234.141.82] cat /proc/net/dev  # NIC sample for ens5, ~1 Hz while the client runs
+  [svc inflight=1] m12_gate client-direct: 20 s, payload 64, inflight 1, envelope off, poll-idle Spin
+  [svc inflight=1] 
+  [svc inflight=1] ================ uc2 M12a gate: direct (Engine) ================
+  [svc inflight=1] sends                 : 162625
+  [svc inflight=1] responses             : 162625
+  [svc inflight=1] not FRESH (envelope)  : 0
+  [svc inflight=1] not_leader / retried  : 0 / 0
+  [svc inflight=1] dup / overwritten     : 0 / 0
+  [svc inflight=1] in-flight at end      : 0
+  [svc inflight=1] lost (timeout/error)  : 0
+  [svc inflight=1] elapsed (drain-incl.) : 20.000 s
+  [svc inflight=1] responses/s           : 8131
+  [svc inflight=1] p50                   : 0.109 ms
+  [svc inflight=1] p90                   : 0.187 ms
+  [svc inflight=1] p95                   : 0.214 ms
+  [svc inflight=1] p99                   : 0.222 ms
+  [svc inflight=1] max                   : 3.164 ms
+  [svc inflight=1] (m5 reference bar, informational only: responses/s >= 400000 && p50 <= 1.0 ms — this harness's own bar is the gateway/direct RATIO, printed below)
+  [svc inflight=1] reference bar: FAIL (not this harness's gate)
+  [svc inflight=1] ============================================================================
+  [svc inflight=1] RESULT {"arm":"direct","responses_per_sec":8131.2,"payload":64,"inflight":1,"secs":20,"sends":162625,"responses":162625,"lost":0,"not_fresh":0,"inflight_at_end":0,"p50_ms":0.109,"p90_ms":0.187,"p95_ms":0.214,"p99_ms":0.222,"max_ms":3.164,"elapsed_secs":20.000,"window_rps":8140.5,"window_responses":130248,"fan_in":false,"declared":1}
+SVCTIME-JSON {"inflight": 1, "resp_per_sec": 8131.2, "window_rps": 8140.5, "responses": 162625, "p50_ms": 0.109, "p90_ms": 0.187, "p95_ms": 0.214, "p99_ms": 0.222, "max_ms": 3.164, "lost": 0, "retried": null, "not_leader": null, "bytes_per_command": 657.7338992080851, "pkts_per_command": 6.056643669601292, "arm": "B", "arm_label": "consistent / pinned / sleep-apply", "rep": 1, "leader": 0, "pinned": true, "node_env": {}, "service_env": {}}
+
+INFO --- arm B inflight=1 rep=2/3 ---
+INFO [ssh 54.234.141.82] sudo taskset -c 3,7 /opt/bench/uc/target/release/examples/m12_gate client-direct --instance-dir /opt/bench/m12/n0 --app-id m12-gate --secs 20 --payload 64 --inflight 1 --envelope off --poll-idle spin --warmup-secs 2 --measure-secs 16
+INFO [ssh 54.234.141.82] cat /proc/net/dev  # NIC sample for ens5, ~1 Hz while the client runs
+  [svc inflight=1] m12_gate client-direct: 20 s, payload 64, inflight 1, envelope off, poll-idle Spin
+  [svc inflight=1] 
+  [svc inflight=1] ================ uc2 M12a gate: direct (Engine) ================
+  [svc inflight=1] sends                 : 159583
+  [svc inflight=1] responses             : 159583
+  [svc inflight=1] not FRESH (envelope)  : 0
+  [svc inflight=1] not_leader / retried  : 0 / 0
+  [svc inflight=1] dup / overwritten     : 0 / 0
+  [svc inflight=1] in-flight at end      : 0
+  [svc inflight=1] lost (timeout/error)  : 0
+  [svc inflight=1] elapsed (drain-incl.) : 20.000 s
+  [svc inflight=1] responses/s           : 7979
+  [svc inflight=1] p50                   : 0.109 ms
+  [svc inflight=1] p90                   : 0.209 ms
+  [svc inflight=1] p95                   : 0.214 ms
+  [svc inflight=1] p99                   : 0.225 ms
+  [svc inflight=1] max                   : 17.138 ms
+  [svc inflight=1] (m5 reference bar, informational only: responses/s >= 400000 && p50 <= 1.0 ms — this harness's own bar is the gateway/direct RATIO, printed below)
+  [svc inflight=1] reference bar: FAIL (not this harness's gate)
+  [svc inflight=1] ============================================================================
+  [svc inflight=1] RESULT {"arm":"direct","responses_per_sec":7979.1,"payload":64,"inflight":1,"secs":20,"sends":159583,"responses":159583,"lost":0,"not_fresh":0,"inflight_at_end":0,"p50_ms":0.109,"p90_ms":0.209,"p95_ms":0.214,"p99_ms":0.225,"max_ms":17.138,"elapsed_secs":20.000,"window_rps":7941.2,"window_responses":127059,"fan_in":false,"declared":1}
+SVCTIME-JSON {"inflight": 1, "resp_per_sec": 7979.1, "window_rps": 7941.2, "responses": 159583, "p50_ms": 0.109, "p90_ms": 0.209, "p95_ms": 0.214, "p99_ms": 0.225, "max_ms": 17.138, "lost": 0, "retried": null, "not_leader": null, "bytes_per_command": 640.4345412976941, "pkts_per_command": 5.897567220266258, "arm": "B", "arm_label": "consistent / pinned / sleep-apply", "rep": 2, "leader": 0, "pinned": true, "node_env": {}, "service_env": {}}
+
+INFO --- arm B inflight=1 rep=3/3 ---
+INFO [ssh 54.234.141.82] sudo taskset -c 3,7 /opt/bench/uc/target/release/examples/m12_gate client-direct --instance-dir /opt/bench/m12/n0 --app-id m12-gate --secs 20 --payload 64 --inflight 1 --envelope off --poll-idle spin --warmup-secs 2 --measure-secs 16
+INFO [ssh 54.234.141.82] cat /proc/net/dev  # NIC sample for ens5, ~1 Hz while the client runs
+  [svc inflight=1] m12_gate client-direct: 20 s, payload 64, inflight 1, envelope off, poll-idle Spin
+  [svc inflight=1] 
+  [svc inflight=1] ================ uc2 M12a gate: direct (Engine) ================
+  [svc inflight=1] sends                 : 160950
+  [svc inflight=1] responses             : 160950
+  [svc inflight=1] not FRESH (envelope)  : 0
+  [svc inflight=1] not_leader / retried  : 0 / 0
+  [svc inflight=1] dup / overwritten     : 0 / 0
+  [svc inflight=1] in-flight at end      : 0
+  [svc inflight=1] lost (timeout/error)  : 0
+  [svc inflight=1] elapsed (drain-incl.) : 20.000 s
+  [svc inflight=1] responses/s           : 8047
+  [svc inflight=1] p50                   : 0.109 ms
+  [svc inflight=1] p90                   : 0.194 ms
+  [svc inflight=1] p95                   : 0.214 ms
+  [svc inflight=1] p99                   : 0.223 ms
+  [svc inflight=1] max                   : 21.463 ms
+  [svc inflight=1] (m5 reference bar, informational only: responses/s >= 400000 && p50 <= 1.0 ms — this harness's own bar is the gateway/direct RATIO, printed below)
+  [svc inflight=1] reference bar: FAIL (not this harness's gate)
+  [svc inflight=1] ============================================================================
+  [svc inflight=1] RESULT {"arm":"direct","responses_per_sec":8047.5,"payload":64,"inflight":1,"secs":20,"sends":160950,"responses":160950,"lost":0,"not_fresh":0,"inflight_at_end":0,"p50_ms":0.109,"p90_ms":0.194,"p95_ms":0.214,"p99_ms":0.223,"max_ms":21.463,"elapsed_secs":20.000,"window_rps":8053.9,"window_responses":128862,"fan_in":false,"declared":1}
+SVCTIME-JSON {"inflight": 1, "resp_per_sec": 8047.5, "window_rps": 8053.9, "responses": 160950, "p50_ms": 0.109, "p90_ms": 0.194, "p95_ms": 0.214, "p99_ms": 0.223, "max_ms": 21.463, "lost": 0, "retried": null, "not_leader": null, "bytes_per_command": 652.4379556843951, "pkts_per_command": 6.007883770544844, "arm": "B", "arm_label": "consistent / pinned / sleep-apply", "rep": 3, "leader": 0, "pinned": true, "node_env": {}, "service_env": {}}
+
+INFO --- arm B inflight=2 rep=1/3 ---
+INFO [ssh 54.234.141.82] sudo taskset -c 3,7 /opt/bench/uc/target/release/examples/m12_gate client-direct --instance-dir /opt/bench/m12/n0 --app-id m12-gate --secs 20 --payload 64 --inflight 2 --envelope off --poll-idle spin --warmup-secs 2 --measure-secs 16
+INFO [ssh 54.234.141.82] cat /proc/net/dev  # NIC sample for ens5, ~1 Hz while the client runs
+  [svc inflight=2] m12_gate client-direct: 20 s, payload 64, inflight 2, envelope off, poll-idle Spin
+  [svc inflight=2] 
+  [svc inflight=2] ================ uc2 M12a gate: direct (Engine) ================
+  [svc inflight=2] sends                 : 267127
+  [svc inflight=2] responses             : 267127
+  [svc inflight=2] not FRESH (envelope)  : 0
+  [svc inflight=2] not_leader / retried  : 0 / 0
+  [svc inflight=2] dup / overwritten     : 0 / 0
+  [svc inflight=2] in-flight at end      : 0
+  [svc inflight=2] lost (timeout/error)  : 0
+  [svc inflight=2] elapsed (drain-incl.) : 20.000 s
+  [svc inflight=2] responses/s           : 13356
+  [svc inflight=2] p50                   : 0.111 ms
+  [svc inflight=2] p90                   : 0.217 ms
+  [svc inflight=2] p95                   : 0.220 ms
+  [svc inflight=2] p99                   : 0.286 ms
+  [svc inflight=2] max                   : 17.678 ms
+  [svc inflight=2] (m5 reference bar, informational only: responses/s >= 400000 && p50 <= 1.0 ms — this harness's own bar is the gateway/direct RATIO, printed below)
+  [svc inflight=2] reference bar: FAIL (not this harness's gate)
+  [svc inflight=2] ============================================================================
+  [svc inflight=2] RESULT {"arm":"direct","responses_per_sec":13356.3,"payload":64,"inflight":2,"secs":20,"sends":267127,"responses":267127,"lost":0,"not_fresh":0,"inflight_at_end":0,"p50_ms":0.111,"p90_ms":0.217,"p95_ms":0.220,"p99_ms":0.286,"max_ms":17.678,"elapsed_secs":20.000,"window_rps":13249.9,"window_responses":211999,"fan_in":false,"declared":1}
+SVCTIME-JSON {"inflight": 2, "resp_per_sec": 13356.3, "window_rps": 13249.9, "responses": 267127, "p50_ms": 0.111, "p90_ms": 0.217, "p95_ms": 0.22, "p99_ms": 0.286, "max_ms": 17.678, "lost": 0, "retried": null, "not_leader": null, "bytes_per_command": 548.2352491532434, "pkts_per_command": 4.426618038453407, "arm": "B", "arm_label": "consistent / pinned / sleep-apply", "rep": 1, "leader": 0, "pinned": true, "node_env": {}, "service_env": {}}
+
+INFO --- arm B inflight=2 rep=2/3 ---
+INFO [ssh 54.234.141.82] sudo taskset -c 3,7 /opt/bench/uc/target/release/examples/m12_gate client-direct --instance-dir /opt/bench/m12/n0 --app-id m12-gate --secs 20 --payload 64 --inflight 2 --envelope off --poll-idle spin --warmup-secs 2 --measure-secs 16
+INFO [ssh 54.234.141.82] cat /proc/net/dev  # NIC sample for ens5, ~1 Hz while the client runs
+  [svc inflight=2] m12_gate client-direct: 20 s, payload 64, inflight 2, envelope off, poll-idle Spin
+  [svc inflight=2] 
+  [svc inflight=2] ================ uc2 M12a gate: direct (Engine) ================
+  [svc inflight=2] sends                 : 267962
+  [svc inflight=2] responses             : 267962
+  [svc inflight=2] not FRESH (envelope)  : 0
+  [svc inflight=2] not_leader / retried  : 0 / 0
+  [svc inflight=2] dup / overwritten     : 0 / 0
+  [svc inflight=2] in-flight at end      : 0
+  [svc inflight=2] lost (timeout/error)  : 0
+  [svc inflight=2] elapsed (drain-incl.) : 20.000 s
+  [svc inflight=2] responses/s           : 13398
+  [svc inflight=2] p50                   : 0.112 ms
+  [svc inflight=2] p90                   : 0.216 ms
+  [svc inflight=2] p95                   : 0.219 ms
+  [svc inflight=2] p99                   : 0.229 ms
+  [svc inflight=2] max                   : 17.531 ms
+  [svc inflight=2] (m5 reference bar, informational only: responses/s >= 400000 && p50 <= 1.0 ms — this harness's own bar is the gateway/direct RATIO, printed below)
+  [svc inflight=2] reference bar: FAIL (not this harness's gate)
+  [svc inflight=2] ============================================================================
+  [svc inflight=2] RESULT {"arm":"direct","responses_per_sec":13398.1,"payload":64,"inflight":2,"secs":20,"sends":267962,"responses":267962,"lost":0,"not_fresh":0,"inflight_at_end":0,"p50_ms":0.112,"p90_ms":0.216,"p95_ms":0.219,"p99_ms":0.229,"max_ms":17.531,"elapsed_secs":20.000,"window_rps":13401.6,"window_responses":214426,"fan_in":false,"declared":1}
+SVCTIME-JSON {"inflight": 2, "resp_per_sec": 13398.1, "window_rps": 13401.6, "responses": 267962, "p50_ms": 0.112, "p90_ms": 0.216, "p95_ms": 0.219, "p99_ms": 0.229, "max_ms": 17.531, "lost": 0, "retried": null, "not_leader": null, "bytes_per_command": 541.0772560743767, "pkts_per_command": 4.340999142249415, "arm": "B", "arm_label": "consistent / pinned / sleep-apply", "rep": 2, "leader": 0, "pinned": true, "node_env": {}, "service_env": {}}
+
+INFO --- arm B inflight=2 rep=3/3 ---
+INFO [ssh 54.234.141.82] sudo taskset -c 3,7 /opt/bench/uc/target/release/examples/m12_gate client-direct --instance-dir /opt/bench/m12/n0 --app-id m12-gate --secs 20 --payload 64 --inflight 2 --envelope off --poll-idle spin --warmup-secs 2 --measure-secs 16
+INFO [ssh 54.234.141.82] cat /proc/net/dev  # NIC sample for ens5, ~1 Hz while the client runs
+  [svc inflight=2] m12_gate client-direct: 20 s, payload 64, inflight 2, envelope off, poll-idle Spin
+  [svc inflight=2] 
+  [svc inflight=2] ================ uc2 M12a gate: direct (Engine) ================
+  [svc inflight=2] sends                 : 270738
+  [svc inflight=2] responses             : 270738
+  [svc inflight=2] not FRESH (envelope)  : 0
+  [svc inflight=2] not_leader / retried  : 0 / 0
+  [svc inflight=2] dup / overwritten     : 0 / 0
+  [svc inflight=2] in-flight at end      : 0
+  [svc inflight=2] lost (timeout/error)  : 0
+  [svc inflight=2] elapsed (drain-incl.) : 20.000 s
+  [svc inflight=2] responses/s           : 13537
+  [svc inflight=2] p50                   : 0.111 ms
+  [svc inflight=2] p90                   : 0.216 ms
+  [svc inflight=2] p95                   : 0.219 ms
+  [svc inflight=2] p99                   : 0.229 ms
+  [svc inflight=2] max                   : 14.107 ms
+  [svc inflight=2] (m5 reference bar, informational only: responses/s >= 400000 && p50 <= 1.0 ms — this harness's own bar is the gateway/direct RATIO, printed below)
+  [svc inflight=2] reference bar: FAIL (not this harness's gate)
+  [svc inflight=2] ============================================================================
+  [svc inflight=2] RESULT {"arm":"direct","responses_per_sec":13536.8,"payload":64,"inflight":2,"secs":20,"sends":270738,"responses":270738,"lost":0,"not_fresh":0,"inflight_at_end":0,"p50_ms":0.111,"p90_ms":0.216,"p95_ms":0.219,"p99_ms":0.229,"max_ms":14.107,"elapsed_secs":20.000,"window_rps":13630.3,"window_responses":218085,"fan_in":false,"declared":1}
+SVCTIME-JSON {"inflight": 2, "resp_per_sec": 13536.8, "window_rps": 13630.3, "responses": 270738, "p50_ms": 0.111, "p90_ms": 0.216, "p95_ms": 0.219, "p99_ms": 0.229, "max_ms": 14.107, "lost": 0, "retried": null, "not_leader": null, "bytes_per_command": 537.2113648090793, "pkts_per_command": 4.216744067883894, "arm": "B", "arm_label": "consistent / pinned / sleep-apply", "rep": 3, "leader": 0, "pinned": true, "node_env": {}, "service_env": {}}
+
+INFO --- arm B inflight=4 rep=1/1 ---
+INFO [ssh 54.234.141.82] sudo taskset -c 3,7 /opt/bench/uc/target/release/examples/m12_gate client-direct --instance-dir /opt/bench/m12/n0 --app-id m12-gate --secs 20 --payload 64 --inflight 4 --envelope off --poll-idle spin --warmup-secs 2 --measure-secs 16
+INFO [ssh 54.234.141.82] cat /proc/net/dev  # NIC sample for ens5, ~1 Hz while the client runs
+  [svc inflight=4] m12_gate client-direct: 20 s, payload 64, inflight 4, envelope off, poll-idle Spin
+  [svc inflight=4] 
+  [svc inflight=4] ================ uc2 M12a gate: direct (Engine) ================
+  [svc inflight=4] sends                 : 455136
+  [svc inflight=4] responses             : 455136
+  [svc inflight=4] not FRESH (envelope)  : 0
+  [svc inflight=4] not_leader / retried  : 0 / 0
+  [svc inflight=4] dup / overwritten     : 0 / 0
+  [svc inflight=4] in-flight at end      : 0
+  [svc inflight=4] lost (timeout/error)  : 0
+  [svc inflight=4] elapsed (drain-incl.) : 20.000 s
+  [svc inflight=4] responses/s           : 22757
+  [svc inflight=4] p50                   : 0.213 ms
+  [svc inflight=4] p90                   : 0.220 ms
+  [svc inflight=4] p95                   : 0.224 ms
+  [svc inflight=4] p99                   : 0.324 ms
+  [svc inflight=4] max                   : 5.554 ms
+  [svc inflight=4] (m5 reference bar, informational only: responses/s >= 400000 && p50 <= 1.0 ms — this harness's own bar is the gateway/direct RATIO, printed below)
+  [svc inflight=4] reference bar: FAIL (not this harness's gate)
+  [svc inflight=4] ============================================================================
+  [svc inflight=4] RESULT {"arm":"direct","responses_per_sec":22756.6,"payload":64,"inflight":4,"secs":20,"sends":455136,"responses":455136,"lost":0,"not_fresh":0,"inflight_at_end":0,"p50_ms":0.213,"p90_ms":0.220,"p95_ms":0.224,"p99_ms":0.324,"max_ms":5.554,"elapsed_secs":20.000,"window_rps":22678.8,"window_responses":362860,"fan_in":false,"declared":1}
+SVCTIME-JSON {"inflight": 4, "resp_per_sec": 22756.6, "window_rps": 22678.8, "responses": 455136, "p50_ms": 0.213, "p90_ms": 0.22, "p95_ms": 0.224, "p99_ms": 0.324, "max_ms": 5.554, "lost": 0, "retried": null, "not_leader": null, "bytes_per_command": 457.38681527051915, "pkts_per_command": 3.057703469251673, "arm": "B", "arm_label": "consistent / pinned / sleep-apply", "rep": 1, "leader": 0, "pinned": true, "node_env": {}, "service_env": {}}
+
+INFO --- arm B inflight=8 rep=1/1 ---
+INFO [ssh 54.234.141.82] sudo taskset -c 3,7 /opt/bench/uc/target/release/examples/m12_gate client-direct --instance-dir /opt/bench/m12/n0 --app-id m12-gate --secs 20 --payload 64 --inflight 8 --envelope off --poll-idle spin --warmup-secs 2 --measure-secs 16
+INFO [ssh 54.234.141.82] cat /proc/net/dev  # NIC sample for ens5, ~1 Hz while the client runs
+  [svc inflight=8] m12_gate client-direct: 20 s, payload 64, inflight 8, envelope off, poll-idle Spin
+  [svc inflight=8] 
+  [svc inflight=8] ================ uc2 M12a gate: direct (Engine) ================
+  [svc inflight=8] sends                 : 756027
+  [svc inflight=8] responses             : 756027
+  [svc inflight=8] not FRESH (envelope)  : 0
+  [svc inflight=8] not_leader / retried  : 0 / 0
+  [svc inflight=8] dup / overwritten     : 0 / 0
+  [svc inflight=8] in-flight at end      : 0
+  [svc inflight=8] lost (timeout/error)  : 0
+  [svc inflight=8] elapsed (drain-incl.) : 20.000 s
+  [svc inflight=8] responses/s           : 37801
+  [svc inflight=8] p50                   : 0.217 ms
+  [svc inflight=8] p90                   : 0.229 ms
+  [svc inflight=8] p95                   : 0.320 ms
+  [svc inflight=8] p99                   : 0.330 ms
+  [svc inflight=8] max                   : 10.641 ms
+  [svc inflight=8] (m5 reference bar, informational only: responses/s >= 400000 && p50 <= 1.0 ms — this harness's own bar is the gateway/direct RATIO, printed below)
+  [svc inflight=8] reference bar: FAIL (not this harness's gate)
+  [svc inflight=8] ============================================================================
+  [svc inflight=8] RESULT {"arm":"direct","responses_per_sec":37801.1,"payload":64,"inflight":8,"secs":20,"sends":756027,"responses":756027,"lost":0,"not_fresh":0,"inflight_at_end":0,"p50_ms":0.217,"p90_ms":0.229,"p95_ms":0.320,"p99_ms":0.330,"max_ms":10.641,"elapsed_secs":20.000,"window_rps":37949.2,"window_responses":607188,"fan_in":false,"declared":1}
+SVCTIME-JSON {"inflight": 8, "resp_per_sec": 37801.1, "window_rps": 37949.2, "responses": 756027, "p50_ms": 0.217, "p90_ms": 0.229, "p95_ms": 0.32, "p99_ms": 0.33, "max_ms": 10.641, "lost": 0, "retried": null, "not_leader": null, "bytes_per_command": 398.95707991997756, "pkts_per_command": 2.1591835178235543, "arm": "B", "arm_label": "consistent / pinned / sleep-apply", "rep": 1, "leader": 0, "pinned": true, "node_env": {}, "service_env": {}}
+
+INFO --- arm B inflight=16 rep=1/1 ---
+INFO [ssh 54.234.141.82] sudo taskset -c 3,7 /opt/bench/uc/target/release/examples/m12_gate client-direct --instance-dir /opt/bench/m12/n0 --app-id m12-gate --secs 20 --payload 64 --inflight 16 --envelope off --poll-idle spin --warmup-secs 2 --measure-secs 16
+INFO [ssh 54.234.141.82] cat /proc/net/dev  # NIC sample for ens5, ~1 Hz while the client runs
+  [svc inflight=16] m12_gate client-direct: 20 s, payload 64, inflight 16, envelope off, poll-idle Spin
+  [svc inflight=16] 
+  [svc inflight=16] ================ uc2 M12a gate: direct (Engine) ================
+  [svc inflight=16] sends                 : 1349143
+  [svc inflight=16] responses             : 1349143
+  [svc inflight=16] not FRESH (envelope)  : 0
+  [svc inflight=16] not_leader / retried  : 0 / 0
+  [svc inflight=16] dup / overwritten     : 0 / 0
+  [svc inflight=16] in-flight at end      : 0
+  [svc inflight=16] lost (timeout/error)  : 0
+  [svc inflight=16] elapsed (drain-incl.) : 20.000 s
+  [svc inflight=16] responses/s           : 67457
+  [svc inflight=16] p50                   : 0.222 ms
+  [svc inflight=16] p90                   : 0.325 ms
+  [svc inflight=16] p95                   : 0.331 ms
+  [svc inflight=16] p99                   : 0.439 ms
+  [svc inflight=16] max                   : 19.333 ms
+  [svc inflight=16] (m5 reference bar, informational only: responses/s >= 400000 && p50 <= 1.0 ms — this harness's own bar is the gateway/direct RATIO, printed below)
+  [svc inflight=16] reference bar: FAIL (not this harness's gate)
+  [svc inflight=16] ============================================================================
+  [svc inflight=16] RESULT {"arm":"direct","responses_per_sec":67456.6,"payload":64,"inflight":16,"secs":20,"sends":1349143,"responses":1349143,"lost":0,"not_fresh":0,"inflight_at_end":0,"p50_ms":0.222,"p90_ms":0.325,"p95_ms":0.331,"p99_ms":0.439,"max_ms":19.333,"elapsed_secs":20.000,"window_rps":67707.5,"window_responses":1083320,"fan_in":false,"declared":1}
+SVCTIME-JSON {"inflight": 16, "resp_per_sec": 67456.6, "window_rps": 67707.5, "responses": 1349143, "p50_ms": 0.222, "p90_ms": 0.325, "p95_ms": 0.331, "p99_ms": 0.439, "max_ms": 19.333, "lost": 0, "retried": null, "not_leader": null, "bytes_per_command": 336.9947618211538, "pkts_per_command": 1.1540505249831794, "arm": "B", "arm_label": "consistent / pinned / sleep-apply", "rep": 1, "leader": 0, "pinned": true, "node_env": {}, "service_env": {}}
+
+INFO --- arm B inflight=64 rep=1/1 ---
+INFO [ssh 54.234.141.82] sudo taskset -c 3,7 /opt/bench/uc/target/release/examples/m12_gate client-direct --instance-dir /opt/bench/m12/n0 --app-id m12-gate --secs 20 --payload 64 --inflight 64 --envelope off --poll-idle spin --warmup-secs 2 --measure-secs 16
+INFO [ssh 54.234.141.82] cat /proc/net/dev  # NIC sample for ens5, ~1 Hz while the client runs
+  [svc inflight=64] m12_gate client-direct: 20 s, payload 64, inflight 64, envelope off, poll-idle Spin
+  [svc inflight=64] 
+  [svc inflight=64] ================ uc2 M12a gate: direct (Engine) ================
+  [svc inflight=64] sends                 : 3838202
+  [svc inflight=64] responses             : 3838202
+  [svc inflight=64] not FRESH (envelope)  : 0
+  [svc inflight=64] not_leader / retried  : 0 / 0
+  [svc inflight=64] dup / overwritten     : 0 / 0
+  [svc inflight=64] in-flight at end      : 0
+  [svc inflight=64] lost (timeout/error)  : 0
+  [svc inflight=64] elapsed (drain-incl.) : 20.000 s
+  [svc inflight=64] responses/s           : 191908
+  [svc inflight=64] p50                   : 0.345 ms
+  [svc inflight=64] p90                   : 0.358 ms
+  [svc inflight=64] p95                   : 0.365 ms
+  [svc inflight=64] p99                   : 0.471 ms
+  [svc inflight=64] max                   : 13.083 ms
+  [svc inflight=64] (m5 reference bar, informational only: responses/s >= 400000 && p50 <= 1.0 ms — this harness's own bar is the gateway/direct RATIO, printed below)
+  [svc inflight=64] reference bar: FAIL (not this harness's gate)
+  [svc inflight=64] ============================================================================
+  [svc inflight=64] RESULT {"arm":"direct","responses_per_sec":191907.7,"payload":64,"inflight":64,"secs":20,"sends":3838202,"responses":3838202,"lost":0,"not_fresh":0,"inflight_at_end":0,"p50_ms":0.345,"p90_ms":0.358,"p95_ms":0.365,"p99_ms":0.471,"max_ms":13.083,"elapsed_secs":20.000,"window_rps":189648.2,"window_responses":3034371,"fan_in":false,"declared":1}
+SVCTIME-JSON {"inflight": 64, "resp_per_sec": 191907.7, "window_rps": 189648.2, "responses": 3838202, "p50_ms": 0.345, "p90_ms": 0.358, "p95_ms": 0.365, "p99_ms": 0.471, "max_ms": 13.083, "lost": 0, "retried": null, "not_leader": null, "bytes_per_command": 286.90544057192136, "pkts_per_command": 0.4157220541323342, "arm": "B", "arm_label": "consistent / pinned / sleep-apply", "rep": 1, "leader": 0, "pinned": true, "node_env": {}, "service_env": {}}
+
+INFO --- arm B inflight=256 rep=1/1 ---
+INFO [ssh 54.234.141.82] sudo taskset -c 3,7 /opt/bench/uc/target/release/examples/m12_gate client-direct --instance-dir /opt/bench/m12/n0 --app-id m12-gate --secs 20 --payload 64 --inflight 256 --envelope off --poll-idle spin --warmup-secs 2 --measure-secs 16
+INFO [ssh 54.234.141.82] cat /proc/net/dev  # NIC sample for ens5, ~1 Hz while the client runs
+  [svc inflight=256] m12_gate client-direct: 20 s, payload 64, inflight 256, envelope off, poll-idle Spin
+  [svc inflight=256] 
+  [svc inflight=256] ================ uc2 M12a gate: direct (Engine) ================
+  [svc inflight=256] sends                 : 12894181
+  [svc inflight=256] responses             : 12894181
+  [svc inflight=256] not FRESH (envelope)  : 0
+  [svc inflight=256] not_leader / retried  : 0 / 0
+  [svc inflight=256] dup / overwritten     : 0 / 0
+  [svc inflight=256] in-flight at end      : 0
+  [svc inflight=256] lost (timeout/error)  : 0
+  [svc inflight=256] elapsed (drain-incl.) : 20.000 s
+  [svc inflight=256] responses/s           : 644701
+  [svc inflight=256] p50                   : 0.358 ms
+  [svc inflight=256] p90                   : 0.450 ms
+  [svc inflight=256] p95                   : 0.460 ms
+  [svc inflight=256] p99                   : 0.565 ms
+  [svc inflight=256] max                   : 11.944 ms
+  [svc inflight=256] (m5 reference bar, informational only: responses/s >= 400000 && p50 <= 1.0 ms — this harness's own bar is the gateway/direct RATIO, printed below)
+  [svc inflight=256] reference bar: PASS
+  [svc inflight=256] ============================================================================
+  [svc inflight=256] RESULT {"arm":"direct","responses_per_sec":644701.3,"payload":64,"inflight":256,"secs":20,"sends":12894181,"responses":12894181,"lost":0,"not_fresh":0,"inflight_at_end":0,"p50_ms":0.358,"p90_ms":0.450,"p95_ms":0.460,"p99_ms":0.565,"max_ms":11.944,"elapsed_secs":20.000,"window_rps":639696.8,"window_responses":10235149,"fan_in":false,"declared":1}
+SVCTIME-JSON {"inflight": 256, "resp_per_sec": 644701.3, "window_rps": 639696.8, "responses": 12894181, "p50_ms": 0.358, "p90_ms": 0.45, "p95_ms": 0.46, "p99_ms": 0.565, "max_ms": 11.944, "lost": 0, "retried": null, "not_leader": null, "bytes_per_command": 268.2542382698956, "pkts_per_command": 0.220740271430813, "arm": "B", "arm_label": "consistent / pinned / sleep-apply", "rep": 1, "leader": 0, "pinned": true, "node_env": {}, "service_env": {}}
+INFO [systemctl 54.234.141.82] sudo systemctl kill --signal=SIGKILL m12-edge 2>/dev/null; sudo systemctl stop m12-edge 2>/dev/null; sudo systemctl reset-failed m12-edge 2>/dev/null; true
+INFO [systemctl 54.234.141.82] sudo systemctl kill --signal=SIGKILL m12-service 2>/dev/null; sudo systemctl stop m12-service 2>/dev/null; sudo systemctl reset-failed m12-service 2>/dev/null; true
+INFO [systemctl 54.234.141.82] sudo systemctl kill --signal=SIGKILL m12-node 2>/dev/null; sudo systemctl stop m12-node 2>/dev/null; sudo systemctl reset-failed m12-node 2>/dev/null; true
+INFO [systemctl 3.80.127.214] sudo systemctl kill --signal=SIGKILL m12-edge 2>/dev/null; sudo systemctl stop m12-edge 2>/dev/null; sudo systemctl reset-failed m12-edge 2>/dev/null; true
+INFO [systemctl 3.80.127.214] sudo systemctl kill --signal=SIGKILL m12-service 2>/dev/null; sudo systemctl stop m12-service 2>/dev/null; sudo systemctl reset-failed m12-service 2>/dev/null; true
+INFO [systemctl 3.80.127.214] sudo systemctl kill --signal=SIGKILL m12-node 2>/dev/null; sudo systemctl stop m12-node 2>/dev/null; sudo systemctl reset-failed m12-node 2>/dev/null; true
+INFO [systemctl 3.85.123.227] sudo systemctl kill --signal=SIGKILL m12-edge 2>/dev/null; sudo systemctl stop m12-edge 2>/dev/null; sudo systemctl reset-failed m12-edge 2>/dev/null; true
+INFO [systemctl 3.85.123.227] sudo systemctl kill --signal=SIGKILL m12-service 2>/dev/null; sudo systemctl stop m12-service 2>/dev/null; sudo systemctl reset-failed m12-service 2>/dev/null; true
+INFO [systemctl 3.85.123.227] sudo systemctl kill --signal=SIGKILL m12-node 2>/dev/null; sudo systemctl stop m12-node 2>/dev/null; sudo systemctl reset-failed m12-node 2>/dev/null; true
+
+=== ARM C: consistent / pinned / spin-apply ===
+INFO [ssh 54.234.141.82] sudo rm -rf /opt/bench/m12/n0 && sudo mkdir -p /opt/bench/m12/n0
+INFO [ssh 3.80.127.214] sudo rm -rf /opt/bench/m12/n1 && sudo mkdir -p /opt/bench/m12/n1
+INFO [ssh 3.85.123.227] sudo rm -rf /opt/bench/m12/n2 && sudo mkdir -p /opt/bench/m12/n2
+INFO [systemctl 54.234.141.82] sudo systemctl kill --signal=SIGKILL m12-node 2>/dev/null; sudo systemctl stop m12-node 2>/dev/null; sudo systemctl reset-failed m12-node 2>/dev/null; true
+INFO [systemd-run 54.234.141.82] sudo systemd-run --unit=m12-node --collect -p TimeoutStopSec=1 -p LimitNOFILE=65536 -p CPUAffinity=0,1,4,5 -p StandardOutput=append:/opt/bench/m12-node.log -p StandardError=append:/opt/bench/m12-node.log /opt/bench/uc/target/release/examples/m12_gate node --id 0 --bind 10.10.1.10:19100 --instance-dir /opt/bench/m12/n0 --members 0@10.10.1.10:19100,1@10.10.1.11:19100,2@10.10.1.12:19100 --app-id m12-gate --admission-kib 256 --services count
+INFO [systemctl 3.80.127.214] sudo systemctl kill --signal=SIGKILL m12-node 2>/dev/null; sudo systemctl stop m12-node 2>/dev/null; sudo systemctl reset-failed m12-node 2>/dev/null; true
+INFO [systemd-run 3.80.127.214] sudo systemd-run --unit=m12-node --collect -p TimeoutStopSec=1 -p LimitNOFILE=65536 -p CPUAffinity=0,1,4,5 -p StandardOutput=append:/opt/bench/m12-node.log -p StandardError=append:/opt/bench/m12-node.log /opt/bench/uc/target/release/examples/m12_gate node --id 1 --bind 10.10.1.11:19100 --instance-dir /opt/bench/m12/n1 --members 0@10.10.1.10:19100,1@10.10.1.11:19100,2@10.10.1.12:19100 --app-id m12-gate --admission-kib 256 --services count
+INFO [systemctl 3.85.123.227] sudo systemctl kill --signal=SIGKILL m12-node 2>/dev/null; sudo systemctl stop m12-node 2>/dev/null; sudo systemctl reset-failed m12-node 2>/dev/null; true
+INFO [systemd-run 3.85.123.227] sudo systemd-run --unit=m12-node --collect -p TimeoutStopSec=1 -p LimitNOFILE=65536 -p CPUAffinity=0,1,4,5 -p StandardOutput=append:/opt/bench/m12-node.log -p StandardError=append:/opt/bench/m12-node.log /opt/bench/uc/target/release/examples/m12_gate node --id 2 --bind 10.10.1.12:19100 --instance-dir /opt/bench/m12/n2 --members 0@10.10.1.10:19100,1@10.10.1.11:19100,2@10.10.1.12:19100 --app-id m12-gate --admission-kib 256 --services count
+INFO [ssh 54.234.141.82] sudo rm -f /opt/bench/m12-service.log
+INFO [systemctl 54.234.141.82] sudo systemctl kill --signal=SIGKILL m12-service 2>/dev/null; sudo systemctl stop m12-service 2>/dev/null; sudo systemctl reset-failed m12-service 2>/dev/null; true
+INFO [systemd-run 54.234.141.82] sudo systemd-run --unit=m12-service --collect --setenv=UC2_APPLY_IDLE=spin -p TimeoutStopSec=1 -p CPUAffinity=2 -p StandardOutput=append:/opt/bench/m12-service.log -p StandardError=append:/opt/bench/m12-service.log /opt/bench/uc/target/release/examples/m12_gate service --instance-dir /opt/bench/m12/n0 --app-id m12-gate --envelope off --fsm count
+INFO [ssh 3.80.127.214] sudo rm -f /opt/bench/m12-service.log
+INFO [systemctl 3.80.127.214] sudo systemctl kill --signal=SIGKILL m12-service 2>/dev/null; sudo systemctl stop m12-service 2>/dev/null; sudo systemctl reset-failed m12-service 2>/dev/null; true
+INFO [systemd-run 3.80.127.214] sudo systemd-run --unit=m12-service --collect --setenv=UC2_APPLY_IDLE=spin -p TimeoutStopSec=1 -p CPUAffinity=2 -p StandardOutput=append:/opt/bench/m12-service.log -p StandardError=append:/opt/bench/m12-service.log /opt/bench/uc/target/release/examples/m12_gate service --instance-dir /opt/bench/m12/n1 --app-id m12-gate --envelope off --fsm count
+INFO [ssh 3.85.123.227] sudo rm -f /opt/bench/m12-service.log
+INFO [systemctl 3.85.123.227] sudo systemctl kill --signal=SIGKILL m12-service 2>/dev/null; sudo systemctl stop m12-service 2>/dev/null; sudo systemctl reset-failed m12-service 2>/dev/null; true
+INFO [systemd-run 3.85.123.227] sudo systemd-run --unit=m12-service --collect --setenv=UC2_APPLY_IDLE=spin -p TimeoutStopSec=1 -p CPUAffinity=2 -p StandardOutput=append:/opt/bench/m12-service.log -p StandardError=append:/opt/bench/m12-service.log /opt/bench/uc/target/release/examples/m12_gate service --instance-dir /opt/bench/m12/n2 --app-id m12-gate --envelope off --fsm count
+INFO [iface 54.234.141.82] IFACE=$(ip -o route get 8.8.8.8 2>/dev/null | sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -n1); if [ -z "$IFACE" ]; then for i in $(ls /sys/class/net 2>/dev/null | grep -v '^lo$'); do st=$(cat /sys/class/net/$i/operstate 2>/dev/null); if [ "$st" = up ]; then IFACE=$i; break; fi; done; fi; echo IFACE=$IFACE
+INFO arm C: leader n0 (54.234.141.82), NIC ens5
+
+INFO --- arm C inflight=1 rep=1/3 ---
+INFO [ssh 54.234.141.82] sudo taskset -c 3,7 /opt/bench/uc/target/release/examples/m12_gate client-direct --instance-dir /opt/bench/m12/n0 --app-id m12-gate --secs 20 --payload 64 --inflight 1 --envelope off --poll-idle spin --warmup-secs 2 --measure-secs 16
+INFO [ssh 54.234.141.82] cat /proc/net/dev  # NIC sample for ens5, ~1 Hz while the client runs
+  [svc inflight=1] m12_gate client-direct: 20 s, payload 64, inflight 1, envelope off, poll-idle Spin
+  [svc inflight=1] 
+  [svc inflight=1] ================ uc2 M12a gate: direct (Engine) ================
+  [svc inflight=1] sends                 : 180571
+  [svc inflight=1] responses             : 180571
+  [svc inflight=1] not FRESH (envelope)  : 0
+  [svc inflight=1] not_leader / retried  : 0 / 0
+  [svc inflight=1] dup / overwritten     : 0 / 0
+  [svc inflight=1] in-flight at end      : 0
+  [svc inflight=1] lost (timeout/error)  : 0
+  [svc inflight=1] elapsed (drain-incl.) : 20.000 s
+  [svc inflight=1] responses/s           : 9029
+  [svc inflight=1] p50                   : 0.105 ms
+  [svc inflight=1] p90                   : 0.117 ms
+  [svc inflight=1] p95                   : 0.144 ms
+  [svc inflight=1] p99                   : 0.204 ms
+  [svc inflight=1] max                   : 13.353 ms
+  [svc inflight=1] (m5 reference bar, informational only: responses/s >= 400000 && p50 <= 1.0 ms — this harness's own bar is the gateway/direct RATIO, printed below)
+  [svc inflight=1] reference bar: FAIL (not this harness's gate)
+  [svc inflight=1] ============================================================================
+  [svc inflight=1] RESULT {"arm":"direct","responses_per_sec":9028.5,"payload":64,"inflight":1,"secs":20,"sends":180571,"responses":180571,"lost":0,"not_fresh":0,"inflight_at_end":0,"p50_ms":0.105,"p90_ms":0.117,"p95_ms":0.144,"p99_ms":0.204,"max_ms":13.353,"elapsed_secs":20.000,"window_rps":9015.7,"window_responses":144251,"fan_in":false,"declared":1}
+SVCTIME-JSON {"inflight": 1, "resp_per_sec": 9028.5, "window_rps": 9015.7, "responses": 180571, "p50_ms": 0.105, "p90_ms": 0.117, "p95_ms": 0.144, "p99_ms": 0.204, "max_ms": 13.353, "lost": 0, "retried": null, "not_leader": null, "bytes_per_command": 659.7396099226528, "pkts_per_command": 6.074776758299837, "arm": "C", "arm_label": "consistent / pinned / spin-apply", "rep": 1, "leader": 0, "pinned": true, "node_env": {}, "service_env": {"UC2_APPLY_IDLE": "spin"}}
+
+INFO --- arm C inflight=1 rep=2/3 ---
+INFO [ssh 54.234.141.82] sudo taskset -c 3,7 /opt/bench/uc/target/release/examples/m12_gate client-direct --instance-dir /opt/bench/m12/n0 --app-id m12-gate --secs 20 --payload 64 --inflight 1 --envelope off --poll-idle spin --warmup-secs 2 --measure-secs 16
+INFO [ssh 54.234.141.82] cat /proc/net/dev  # NIC sample for ens5, ~1 Hz while the client runs
+  [svc inflight=1] m12_gate client-direct: 20 s, payload 64, inflight 1, envelope off, poll-idle Spin
+  [svc inflight=1] 
+  [svc inflight=1] ================ uc2 M12a gate: direct (Engine) ================
+  [svc inflight=1] sends                 : 179469
+  [svc inflight=1] responses             : 179469
+  [svc inflight=1] not FRESH (envelope)  : 0
+  [svc inflight=1] not_leader / retried  : 0 / 0
+  [svc inflight=1] dup / overwritten     : 0 / 0
+  [svc inflight=1] in-flight at end      : 0
+  [svc inflight=1] lost (timeout/error)  : 0
+  [svc inflight=1] elapsed (drain-incl.) : 20.000 s
+  [svc inflight=1] responses/s           : 8973
+  [svc inflight=1] p50                   : 0.105 ms
+  [svc inflight=1] p90                   : 0.121 ms
+  [svc inflight=1] p95                   : 0.146 ms
+  [svc inflight=1] p99                   : 0.175 ms
+  [svc inflight=1] max                   : 21.086 ms
+  [svc inflight=1] (m5 reference bar, informational only: responses/s >= 400000 && p50 <= 1.0 ms — this harness's own bar is the gateway/direct RATIO, printed below)
+  [svc inflight=1] reference bar: FAIL (not this harness's gate)
+  [svc inflight=1] ============================================================================
+  [svc inflight=1] RESULT {"arm":"direct","responses_per_sec":8973.4,"payload":64,"inflight":1,"secs":20,"sends":179469,"responses":179469,"lost":0,"not_fresh":0,"inflight_at_end":0,"p50_ms":0.105,"p90_ms":0.121,"p95_ms":0.146,"p99_ms":0.175,"max_ms":21.086,"elapsed_secs":20.000,"window_rps":8988.7,"window_responses":143819,"fan_in":false,"declared":1}
+SVCTIME-JSON {"inflight": 1, "resp_per_sec": 8973.4, "window_rps": 8988.7, "responses": 179469, "p50_ms": 0.105, "p90_ms": 0.121, "p95_ms": 0.146, "p99_ms": 0.175, "max_ms": 21.086, "lost": 0, "retried": null, "not_leader": null, "bytes_per_command": 651.9931965816118, "pkts_per_command": 6.00347400872883, "arm": "C", "arm_label": "consistent / pinned / spin-apply", "rep": 2, "leader": 0, "pinned": true, "node_env": {}, "service_env": {"UC2_APPLY_IDLE": "spin"}}
+
+INFO --- arm C inflight=1 rep=3/3 ---
+INFO [ssh 54.234.141.82] sudo taskset -c 3,7 /opt/bench/uc/target/release/examples/m12_gate client-direct --instance-dir /opt/bench/m12/n0 --app-id m12-gate --secs 20 --payload 64 --inflight 1 --envelope off --poll-idle spin --warmup-secs 2 --measure-secs 16
+INFO [ssh 54.234.141.82] cat /proc/net/dev  # NIC sample for ens5, ~1 Hz while the client runs
+  [svc inflight=1] m12_gate client-direct: 20 s, payload 64, inflight 1, envelope off, poll-idle Spin
+  [svc inflight=1] 
+  [svc inflight=1] ================ uc2 M12a gate: direct (Engine) ================
+  [svc inflight=1] sends                 : 177024
+  [svc inflight=1] responses             : 177024
+  [svc inflight=1] not FRESH (envelope)  : 0
+  [svc inflight=1] not_leader / retried  : 0 / 0
+  [svc inflight=1] dup / overwritten     : 0 / 0
+  [svc inflight=1] in-flight at end      : 0
+  [svc inflight=1] lost (timeout/error)  : 0
+  [svc inflight=1] elapsed (drain-incl.) : 20.000 s
+  [svc inflight=1] responses/s           : 8851
+  [svc inflight=1] p50                   : 0.105 ms
+  [svc inflight=1] p90                   : 0.117 ms
+  [svc inflight=1] p95                   : 0.146 ms
+  [svc inflight=1] p99                   : 0.176 ms
+  [svc inflight=1] max                   : 20.709 ms
+  [svc inflight=1] (m5 reference bar, informational only: responses/s >= 400000 && p50 <= 1.0 ms — this harness's own bar is the gateway/direct RATIO, printed below)
+  [svc inflight=1] reference bar: FAIL (not this harness's gate)
+  [svc inflight=1] ============================================================================
+  [svc inflight=1] RESULT {"arm":"direct","responses_per_sec":8851.2,"payload":64,"inflight":1,"secs":20,"sends":177024,"responses":177024,"lost":0,"not_fresh":0,"inflight_at_end":0,"p50_ms":0.105,"p90_ms":0.117,"p95_ms":0.146,"p99_ms":0.176,"max_ms":20.709,"elapsed_secs":20.000,"window_rps":8792.9,"window_responses":140686,"fan_in":false,"declared":1}
+SVCTIME-JSON {"inflight": 1, "resp_per_sec": 8851.2, "window_rps": 8792.9, "responses": 177024, "p50_ms": 0.105, "p90_ms": 0.117, "p95_ms": 0.146, "p99_ms": 0.176, "max_ms": 20.709, "lost": 0, "retried": null, "not_leader": null, "bytes_per_command": 654.978135598499, "pkts_per_command": 6.0310029300571575, "arm": "C", "arm_label": "consistent / pinned / spin-apply", "rep": 3, "leader": 0, "pinned": true, "node_env": {}, "service_env": {"UC2_APPLY_IDLE": "spin"}}
+
+INFO --- arm C inflight=2 rep=1/3 ---
+INFO [ssh 54.234.141.82] sudo taskset -c 3,7 /opt/bench/uc/target/release/examples/m12_gate client-direct --instance-dir /opt/bench/m12/n0 --app-id m12-gate --secs 20 --payload 64 --inflight 2 --envelope off --poll-idle spin --warmup-secs 2 --measure-secs 16
+INFO [ssh 54.234.141.82] cat /proc/net/dev  # NIC sample for ens5, ~1 Hz while the client runs
+  [svc inflight=2] m12_gate client-direct: 20 s, payload 64, inflight 2, envelope off, poll-idle Spin
+  [svc inflight=2] 
+  [svc inflight=2] ================ uc2 M12a gate: direct (Engine) ================
+  [svc inflight=2] sends                 : 308462
+  [svc inflight=2] responses             : 308462
+  [svc inflight=2] not FRESH (envelope)  : 0
+  [svc inflight=2] not_leader / retried  : 0 / 0
+  [svc inflight=2] dup / overwritten     : 0 / 0
+  [svc inflight=2] in-flight at end      : 0
+  [svc inflight=2] lost (timeout/error)  : 0
+  [svc inflight=2] elapsed (drain-incl.) : 20.000 s
+  [svc inflight=2] responses/s           : 15423
+  [svc inflight=2] p50                   : 0.118 ms
+  [svc inflight=2] p90                   : 0.160 ms
+  [svc inflight=2] p95                   : 0.185 ms
+  [svc inflight=2] p99                   : 0.218 ms
+  [svc inflight=2] max                   : 20.005 ms
+  [svc inflight=2] (m5 reference bar, informational only: responses/s >= 400000 && p50 <= 1.0 ms — this harness's own bar is the gateway/direct RATIO, printed below)
+  [svc inflight=2] reference bar: FAIL (not this harness's gate)
+  [svc inflight=2] ============================================================================
+  [svc inflight=2] RESULT {"arm":"direct","responses_per_sec":15423.0,"payload":64,"inflight":2,"secs":20,"sends":308462,"responses":308462,"lost":0,"not_fresh":0,"inflight_at_end":0,"p50_ms":0.118,"p90_ms":0.160,"p95_ms":0.185,"p99_ms":0.218,"max_ms":20.005,"elapsed_secs":20.000,"window_rps":15256.8,"window_responses":244108,"fan_in":false,"declared":1}
+SVCTIME-JSON {"inflight": 2, "resp_per_sec": 15423.0, "window_rps": 15256.8, "responses": 308462, "p50_ms": 0.118, "p90_ms": 0.16, "p95_ms": 0.185, "p99_ms": 0.218, "max_ms": 20.005, "lost": 0, "retried": null, "not_leader": null, "bytes_per_command": 606.7674305056916, "pkts_per_command": 5.4730617471583045, "arm": "C", "arm_label": "consistent / pinned / spin-apply", "rep": 1, "leader": 0, "pinned": true, "node_env": {}, "service_env": {"UC2_APPLY_IDLE": "spin"}}
+
+INFO --- arm C inflight=2 rep=2/3 ---
+INFO [ssh 54.234.141.82] sudo taskset -c 3,7 /opt/bench/uc/target/release/examples/m12_gate client-direct --instance-dir /opt/bench/m12/n0 --app-id m12-gate --secs 20 --payload 64 --inflight 2 --envelope off --poll-idle spin --warmup-secs 2 --measure-secs 16
+INFO [ssh 54.234.141.82] cat /proc/net/dev  # NIC sample for ens5, ~1 Hz while the client runs
+  [svc inflight=2] m12_gate client-direct: 20 s, payload 64, inflight 2, envelope off, poll-idle Spin
+  [svc inflight=2] 
+  [svc inflight=2] ================ uc2 M12a gate: direct (Engine) ================
+  [svc inflight=2] sends                 : 313067
+  [svc inflight=2] responses             : 313067
+  [svc inflight=2] not FRESH (envelope)  : 0
+  [svc inflight=2] not_leader / retried  : 0 / 0
+  [svc inflight=2] dup / overwritten     : 0 / 0
+  [svc inflight=2] in-flight at end      : 0
+  [svc inflight=2] lost (timeout/error)  : 0
+  [svc inflight=2] elapsed (drain-incl.) : 20.000 s
+  [svc inflight=2] responses/s           : 15653
+  [svc inflight=2] p50                   : 0.116 ms
+  [svc inflight=2] p90                   : 0.162 ms
+  [svc inflight=2] p95                   : 0.190 ms
+  [svc inflight=2] p99                   : 0.219 ms
+  [svc inflight=2] max                   : 13.492 ms
+  [svc inflight=2] (m5 reference bar, informational only: responses/s >= 400000 && p50 <= 1.0 ms — this harness's own bar is the gateway/direct RATIO, printed below)
+  [svc inflight=2] reference bar: FAIL (not this harness's gate)
+  [svc inflight=2] ============================================================================
+  [svc inflight=2] RESULT {"arm":"direct","responses_per_sec":15653.3,"payload":64,"inflight":2,"secs":20,"sends":313067,"responses":313067,"lost":0,"not_fresh":0,"inflight_at_end":0,"p50_ms":0.116,"p90_ms":0.162,"p95_ms":0.190,"p99_ms":0.219,"max_ms":13.492,"elapsed_secs":20.000,"window_rps":15517.7,"window_responses":248283,"fan_in":false,"declared":1}
+SVCTIME-JSON {"inflight": 2, "resp_per_sec": 15653.3, "window_rps": 15517.7, "responses": 313067, "p50_ms": 0.116, "p90_ms": 0.162, "p95_ms": 0.19, "p99_ms": 0.219, "max_ms": 13.492, "lost": 0, "retried": null, "not_leader": null, "bytes_per_command": 621.3977435054937, "pkts_per_command": 5.490150111117176, "arm": "C", "arm_label": "consistent / pinned / spin-apply", "rep": 2, "leader": 0, "pinned": true, "node_env": {}, "service_env": {"UC2_APPLY_IDLE": "spin"}}
+
+INFO --- arm C inflight=2 rep=3/3 ---
+INFO [ssh 54.234.141.82] sudo taskset -c 3,7 /opt/bench/uc/target/release/examples/m12_gate client-direct --instance-dir /opt/bench/m12/n0 --app-id m12-gate --secs 20 --payload 64 --inflight 2 --envelope off --poll-idle spin --warmup-secs 2 --measure-secs 16
+INFO [ssh 54.234.141.82] cat /proc/net/dev  # NIC sample for ens5, ~1 Hz while the client runs
+  [svc inflight=2] m12_gate client-direct: 20 s, payload 64, inflight 2, envelope off, poll-idle Spin
+  [svc inflight=2] 
+  [svc inflight=2] ================ uc2 M12a gate: direct (Engine) ================
+  [svc inflight=2] sends                 : 304745
+  [svc inflight=2] responses             : 304745
+  [svc inflight=2] not FRESH (envelope)  : 0
+  [svc inflight=2] not_leader / retried  : 0 / 0
+  [svc inflight=2] dup / overwritten     : 0 / 0
+  [svc inflight=2] in-flight at end      : 0
+  [svc inflight=2] lost (timeout/error)  : 0
+  [svc inflight=2] elapsed (drain-incl.) : 20.000 s
+  [svc inflight=2] responses/s           : 15237
+  [svc inflight=2] p50                   : 0.118 ms
+  [svc inflight=2] p90                   : 0.162 ms
+  [svc inflight=2] p95                   : 0.200 ms
+  [svc inflight=2] p99                   : 0.225 ms
+  [svc inflight=2] max                   : 10.404 ms
+  [svc inflight=2] (m5 reference bar, informational only: responses/s >= 400000 && p50 <= 1.0 ms — this harness's own bar is the gateway/direct RATIO, printed below)
+  [svc inflight=2] reference bar: FAIL (not this harness's gate)
+  [svc inflight=2] ============================================================================
+  [svc inflight=2] RESULT {"arm":"direct","responses_per_sec":15237.2,"payload":64,"inflight":2,"secs":20,"sends":304745,"responses":304745,"lost":0,"not_fresh":0,"inflight_at_end":0,"p50_ms":0.118,"p90_ms":0.162,"p95_ms":0.200,"p99_ms":0.225,"max_ms":10.404,"elapsed_secs":20.000,"window_rps":15341.7,"window_responses":245467,"fan_in":false,"declared":1}
+SVCTIME-JSON {"inflight": 2, "resp_per_sec": 15237.2, "window_rps": 15341.7, "responses": 304745, "p50_ms": 0.118, "p90_ms": 0.162, "p95_ms": 0.2, "p99_ms": 0.225, "max_ms": 10.404, "lost": 0, "retried": null, "not_leader": null, "bytes_per_command": 644.0576743690841, "pkts_per_command": 5.8808230519943345, "arm": "C", "arm_label": "consistent / pinned / spin-apply", "rep": 3, "leader": 0, "pinned": true, "node_env": {}, "service_env": {"UC2_APPLY_IDLE": "spin"}}
+
+INFO --- arm C inflight=4 rep=1/1 ---
+INFO [ssh 54.234.141.82] sudo taskset -c 3,7 /opt/bench/uc/target/release/examples/m12_gate client-direct --instance-dir /opt/bench/m12/n0 --app-id m12-gate --secs 20 --payload 64 --inflight 4 --envelope off --poll-idle spin --warmup-secs 2 --measure-secs 16
+INFO [ssh 54.234.141.82] cat /proc/net/dev  # NIC sample for ens5, ~1 Hz while the client runs
+  [svc inflight=4] m12_gate client-direct: 20 s, payload 64, inflight 4, envelope off, poll-idle Spin
+  [svc inflight=4] 
+  [svc inflight=4] ================ uc2 M12a gate: direct (Engine) ================
+  [svc inflight=4] sends                 : 537578
+  [svc inflight=4] responses             : 537578
+  [svc inflight=4] not FRESH (envelope)  : 0
+  [svc inflight=4] not_leader / retried  : 0 / 0
+  [svc inflight=4] dup / overwritten     : 0 / 0
+  [svc inflight=4] in-flight at end      : 0
+  [svc inflight=4] lost (timeout/error)  : 0
+  [svc inflight=4] elapsed (drain-incl.) : 20.000 s
+  [svc inflight=4] responses/s           : 26879
+  [svc inflight=4] p50                   : 0.145 ms
+  [svc inflight=4] p90                   : 0.186 ms
+  [svc inflight=4] p95                   : 0.205 ms
+  [svc inflight=4] p99                   : 0.249 ms
+  [svc inflight=4] max                   : 10.338 ms
+  [svc inflight=4] (m5 reference bar, informational only: responses/s >= 400000 && p50 <= 1.0 ms — this harness's own bar is the gateway/direct RATIO, printed below)
+  [svc inflight=4] reference bar: FAIL (not this harness's gate)
+  [svc inflight=4] ============================================================================
+  [svc inflight=4] RESULT {"arm":"direct","responses_per_sec":26878.7,"payload":64,"inflight":4,"secs":20,"sends":537578,"responses":537578,"lost":0,"not_fresh":0,"inflight_at_end":0,"p50_ms":0.145,"p90_ms":0.186,"p95_ms":0.205,"p99_ms":0.249,"max_ms":10.338,"elapsed_secs":20.000,"window_rps":26895.2,"window_responses":430324,"fan_in":false,"declared":1}
+SVCTIME-JSON {"inflight": 4, "resp_per_sec": 26878.7, "window_rps": 26895.2, "responses": 537578, "p50_ms": 0.145, "p90_ms": 0.186, "p95_ms": 0.205, "p99_ms": 0.249, "max_ms": 10.338, "lost": 0, "retried": null, "not_leader": null, "bytes_per_command": 513.4912503511783, "pkts_per_command": 3.971779830947614, "arm": "C", "arm_label": "consistent / pinned / spin-apply", "rep": 1, "leader": 0, "pinned": true, "node_env": {}, "service_env": {"UC2_APPLY_IDLE": "spin"}}
+
+INFO --- arm C inflight=8 rep=1/1 ---
+INFO [ssh 54.234.141.82] sudo taskset -c 3,7 /opt/bench/uc/target/release/examples/m12_gate client-direct --instance-dir /opt/bench/m12/n0 --app-id m12-gate --secs 20 --payload 64 --inflight 8 --envelope off --poll-idle spin --warmup-secs 2 --measure-secs 16
+INFO [ssh 54.234.141.82] cat /proc/net/dev  # NIC sample for ens5, ~1 Hz while the client runs
+  [svc inflight=8] m12_gate client-direct: 20 s, payload 64, inflight 8, envelope off, poll-idle Spin
+  [svc inflight=8] 
+  [svc inflight=8] ================ uc2 M12a gate: direct (Engine) ================
+  [svc inflight=8] sends                 : 943251
+  [svc inflight=8] responses             : 943251
+  [svc inflight=8] not FRESH (envelope)  : 0
+  [svc inflight=8] not_leader / retried  : 0 / 0
+  [svc inflight=8] dup / overwritten     : 0 / 0
+  [svc inflight=8] in-flight at end      : 0
+  [svc inflight=8] lost (timeout/error)  : 0
+  [svc inflight=8] elapsed (drain-incl.) : 20.000 s
+  [svc inflight=8] responses/s           : 47162
+  [svc inflight=8] p50                   : 0.155 ms
+  [svc inflight=8] p90                   : 0.209 ms
+  [svc inflight=8] p95                   : 0.232 ms
+  [svc inflight=8] p99                   : 0.268 ms
+  [svc inflight=8] max                   : 22.364 ms
+  [svc inflight=8] (m5 reference bar, informational only: responses/s >= 400000 && p50 <= 1.0 ms — this harness's own bar is the gateway/direct RATIO, printed below)
+  [svc inflight=8] reference bar: FAIL (not this harness's gate)
+  [svc inflight=8] ============================================================================
+  [svc inflight=8] RESULT {"arm":"direct","responses_per_sec":47162.4,"payload":64,"inflight":8,"secs":20,"sends":943251,"responses":943251,"lost":0,"not_fresh":0,"inflight_at_end":0,"p50_ms":0.155,"p90_ms":0.209,"p95_ms":0.232,"p99_ms":0.268,"max_ms":22.364,"elapsed_secs":20.000,"window_rps":46910.9,"window_responses":750574,"fan_in":false,"declared":1}
+SVCTIME-JSON {"inflight": 8, "resp_per_sec": 47162.4, "window_rps": 46910.9, "responses": 943251, "p50_ms": 0.155, "p90_ms": 0.209, "p95_ms": 0.232, "p99_ms": 0.268, "max_ms": 22.364, "lost": 0, "retried": null, "not_leader": null, "bytes_per_command": 407.8363345971274, "pkts_per_command": 2.363905038853424, "arm": "C", "arm_label": "consistent / pinned / spin-apply", "rep": 1, "leader": 0, "pinned": true, "node_env": {}, "service_env": {"UC2_APPLY_IDLE": "spin"}}
+
+INFO --- arm C inflight=16 rep=1/1 ---
+INFO [ssh 54.234.141.82] sudo taskset -c 3,7 /opt/bench/uc/target/release/examples/m12_gate client-direct --instance-dir /opt/bench/m12/n0 --app-id m12-gate --secs 20 --payload 64 --inflight 16 --envelope off --poll-idle spin --warmup-secs 2 --measure-secs 16
+INFO [ssh 54.234.141.82] cat /proc/net/dev  # NIC sample for ens5, ~1 Hz while the client runs
+  [svc inflight=16] m12_gate client-direct: 20 s, payload 64, inflight 16, envelope off, poll-idle Spin
+  [svc inflight=16] 
+  [svc inflight=16] ================ uc2 M12a gate: direct (Engine) ================
+  [svc inflight=16] sends                 : 1700834
+  [svc inflight=16] responses             : 1700834
+  [svc inflight=16] not FRESH (envelope)  : 0
+  [svc inflight=16] not_leader / retried  : 0 / 0
+  [svc inflight=16] dup / overwritten     : 0 / 0
+  [svc inflight=16] in-flight at end      : 0
+  [svc inflight=16] lost (timeout/error)  : 0
+  [svc inflight=16] elapsed (drain-incl.) : 20.000 s
+  [svc inflight=16] responses/s           : 85041
+  [svc inflight=16] p50                   : 0.175 ms
+  [svc inflight=16] p90                   : 0.234 ms
+  [svc inflight=16] p95                   : 0.250 ms
+  [svc inflight=16] p99                   : 0.285 ms
+  [svc inflight=16] max                   : 11.469 ms
+  [svc inflight=16] (m5 reference bar, informational only: responses/s >= 400000 && p50 <= 1.0 ms — this harness's own bar is the gateway/direct RATIO, printed below)
+  [svc inflight=16] reference bar: FAIL (not this harness's gate)
+  [svc inflight=16] ============================================================================
+  [svc inflight=16] RESULT {"arm":"direct","responses_per_sec":85041.5,"payload":64,"inflight":16,"secs":20,"sends":1700834,"responses":1700834,"lost":0,"not_fresh":0,"inflight_at_end":0,"p50_ms":0.175,"p90_ms":0.234,"p95_ms":0.250,"p99_ms":0.285,"max_ms":11.469,"elapsed_secs":20.000,"window_rps":85079.2,"window_responses":1361268,"fan_in":false,"declared":1}
+SVCTIME-JSON {"inflight": 16, "resp_per_sec": 85041.5, "window_rps": 85079.2, "responses": 1700834, "p50_ms": 0.175, "p90_ms": 0.234, "p95_ms": 0.25, "p99_ms": 0.285, "max_ms": 11.469, "lost": 0, "retried": null, "not_leader": null, "bytes_per_command": 342.554917807548, "pkts_per_command": 1.279789653312486, "arm": "C", "arm_label": "consistent / pinned / spin-apply", "rep": 1, "leader": 0, "pinned": true, "node_env": {}, "service_env": {"UC2_APPLY_IDLE": "spin"}}
+
+INFO --- arm C inflight=64 rep=1/1 ---
+INFO [ssh 54.234.141.82] sudo taskset -c 3,7 /opt/bench/uc/target/release/examples/m12_gate client-direct --instance-dir /opt/bench/m12/n0 --app-id m12-gate --secs 20 --payload 64 --inflight 64 --envelope off --poll-idle spin --warmup-secs 2 --measure-secs 16
+INFO [ssh 54.234.141.82] cat /proc/net/dev  # NIC sample for ens5, ~1 Hz while the client runs
+  [svc inflight=64] m12_gate client-direct: 20 s, payload 64, inflight 64, envelope off, poll-idle Spin
+  [svc inflight=64] 
+  [svc inflight=64] ================ uc2 M12a gate: direct (Engine) ================
+  [svc inflight=64] sends                 : 4210709
+  [svc inflight=64] responses             : 4210709
+  [svc inflight=64] not FRESH (envelope)  : 0
+  [svc inflight=64] not_leader / retried  : 0 / 0
+  [svc inflight=64] dup / overwritten     : 0 / 0
+  [svc inflight=64] in-flight at end      : 0
+  [svc inflight=64] lost (timeout/error)  : 0
+  [svc inflight=64] elapsed (drain-incl.) : 20.000 s
+  [svc inflight=64] responses/s           : 210533
+  [svc inflight=64] p50                   : 0.288 ms
+  [svc inflight=64] p90                   : 0.312 ms
+  [svc inflight=64] p95                   : 0.324 ms
+  [svc inflight=64] p99                   : 0.414 ms
+  [svc inflight=64] max                   : 14.410 ms
+  [svc inflight=64] (m5 reference bar, informational only: responses/s >= 400000 && p50 <= 1.0 ms — this harness's own bar is the gateway/direct RATIO, printed below)
+  [svc inflight=64] reference bar: FAIL (not this harness's gate)
+  [svc inflight=64] ============================================================================
+  [svc inflight=64] RESULT {"arm":"direct","responses_per_sec":210533.1,"payload":64,"inflight":64,"secs":20,"sends":4210709,"responses":4210709,"lost":0,"not_fresh":0,"inflight_at_end":0,"p50_ms":0.288,"p90_ms":0.312,"p95_ms":0.324,"p99_ms":0.414,"max_ms":14.410,"elapsed_secs":20.000,"window_rps":208952.0,"window_responses":3343232,"fan_in":false,"declared":1}
+SVCTIME-JSON {"inflight": 64, "resp_per_sec": 210533.1, "window_rps": 208952.0, "responses": 4210709, "p50_ms": 0.288, "p90_ms": 0.312, "p95_ms": 0.324, "p99_ms": 0.414, "max_ms": 14.41, "lost": 0, "retried": null, "not_leader": null, "bytes_per_command": 276.65041605798683, "pkts_per_command": 0.30474736321284357, "arm": "C", "arm_label": "consistent / pinned / spin-apply", "rep": 1, "leader": 0, "pinned": true, "node_env": {}, "service_env": {"UC2_APPLY_IDLE": "spin"}}
+
+INFO --- arm C inflight=256 rep=1/1 ---
+INFO [ssh 54.234.141.82] sudo taskset -c 3,7 /opt/bench/uc/target/release/examples/m12_gate client-direct --instance-dir /opt/bench/m12/n0 --app-id m12-gate --secs 20 --payload 64 --inflight 256 --envelope off --poll-idle spin --warmup-secs 2 --measure-secs 16
+INFO [ssh 54.234.141.82] cat /proc/net/dev  # NIC sample for ens5, ~1 Hz while the client runs
+  [svc inflight=256] m12_gate client-direct: 20 s, payload 64, inflight 256, envelope off, poll-idle Spin
+  [svc inflight=256] 
+  [svc inflight=256] ================ uc2 M12a gate: direct (Engine) ================
+  [svc inflight=256] sends                 : 14142110
+  [svc inflight=256] responses             : 14142110
+  [svc inflight=256] not FRESH (envelope)  : 0
+  [svc inflight=256] not_leader / retried  : 0 / 0
+  [svc inflight=256] dup / overwritten     : 0 / 0
+  [svc inflight=256] in-flight at end      : 0
+  [svc inflight=256] lost (timeout/error)  : 0
+  [svc inflight=256] elapsed (drain-incl.) : 20.000 s
+  [svc inflight=256] responses/s           : 707095
+  [svc inflight=256] p50                   : 0.335 ms
+  [svc inflight=256] p90                   : 0.378 ms
+  [svc inflight=256] p95                   : 0.400 ms
+  [svc inflight=256] p99                   : 0.496 ms
+  [svc inflight=256] max                   : 14.418 ms
+  [svc inflight=256] (m5 reference bar, informational only: responses/s >= 400000 && p50 <= 1.0 ms — this harness's own bar is the gateway/direct RATIO, printed below)
+  [svc inflight=256] reference bar: PASS
+  [svc inflight=256] ============================================================================
+  [svc inflight=256] RESULT {"arm":"direct","responses_per_sec":707095.0,"payload":64,"inflight":256,"secs":20,"sends":14142110,"responses":14142110,"lost":0,"not_fresh":0,"inflight_at_end":0,"p50_ms":0.335,"p90_ms":0.378,"p95_ms":0.400,"p99_ms":0.496,"max_ms":14.418,"elapsed_secs":20.000,"window_rps":698223.6,"window_responses":11171577,"fan_in":false,"declared":1}
+SVCTIME-JSON {"inflight": 256, "resp_per_sec": 707095.0, "window_rps": 698223.6, "responses": 14142110, "p50_ms": 0.335, "p90_ms": 0.378, "p95_ms": 0.4, "p99_ms": 0.496, "max_ms": 14.418, "lost": 0, "retried": null, "not_leader": null, "bytes_per_command": 266.61694597353596, "pkts_per_command": 0.21457176828770064, "arm": "C", "arm_label": "consistent / pinned / spin-apply", "rep": 1, "leader": 0, "pinned": true, "node_env": {}, "service_env": {"UC2_APPLY_IDLE": "spin"}}
+INFO [systemctl 54.234.141.82] sudo systemctl kill --signal=SIGKILL m12-edge 2>/dev/null; sudo systemctl stop m12-edge 2>/dev/null; sudo systemctl reset-failed m12-edge 2>/dev/null; true
+INFO [systemctl 54.234.141.82] sudo systemctl kill --signal=SIGKILL m12-service 2>/dev/null; sudo systemctl stop m12-service 2>/dev/null; sudo systemctl reset-failed m12-service 2>/dev/null; true
+INFO [systemctl 54.234.141.82] sudo systemctl kill --signal=SIGKILL m12-node 2>/dev/null; sudo systemctl stop m12-node 2>/dev/null; sudo systemctl reset-failed m12-node 2>/dev/null; true
+INFO [systemctl 3.80.127.214] sudo systemctl kill --signal=SIGKILL m12-edge 2>/dev/null; sudo systemctl stop m12-edge 2>/dev/null; sudo systemctl reset-failed m12-edge 2>/dev/null; true
+INFO [systemctl 3.80.127.214] sudo systemctl kill --signal=SIGKILL m12-service 2>/dev/null; sudo systemctl stop m12-service 2>/dev/null; sudo systemctl reset-failed m12-service 2>/dev/null; true
+INFO [systemctl 3.80.127.214] sudo systemctl kill --signal=SIGKILL m12-node 2>/dev/null; sudo systemctl stop m12-node 2>/dev/null; sudo systemctl reset-failed m12-node 2>/dev/null; true
+INFO [systemctl 3.85.123.227] sudo systemctl kill --signal=SIGKILL m12-edge 2>/dev/null; sudo systemctl stop m12-edge 2>/dev/null; sudo systemctl reset-failed m12-edge 2>/dev/null; true
+INFO [systemctl 3.85.123.227] sudo systemctl kill --signal=SIGKILL m12-service 2>/dev/null; sudo systemctl stop m12-service 2>/dev/null; sudo systemctl reset-failed m12-service 2>/dev/null; true
+INFO [systemctl 3.85.123.227] sudo systemctl kill --signal=SIGKILL m12-node 2>/dev/null; sudo systemctl stop m12-node 2>/dev/null; sudo systemctl reset-failed m12-node 2>/dev/null; true
+
+=== ARM D: eventual(1ms) / pinned / spin-apply ===
+INFO [ssh 54.234.141.82] sudo rm -rf /opt/bench/m12/n0 && sudo mkdir -p /opt/bench/m12/n0
+INFO [ssh 3.80.127.214] sudo rm -rf /opt/bench/m12/n1 && sudo mkdir -p /opt/bench/m12/n1
+INFO [ssh 3.85.123.227] sudo rm -rf /opt/bench/m12/n2 && sudo mkdir -p /opt/bench/m12/n2
+INFO [systemctl 54.234.141.82] sudo systemctl kill --signal=SIGKILL m12-node 2>/dev/null; sudo systemctl stop m12-node 2>/dev/null; sudo systemctl reset-failed m12-node 2>/dev/null; true
+INFO [systemd-run 54.234.141.82] sudo systemd-run --unit=m12-node --collect --setenv=UC2_JOURNAL_DURABILITY=eventual --setenv=UC2_JOURNAL_EVENTUAL_FSYNC_MS=1 -p TimeoutStopSec=1 -p LimitNOFILE=65536 -p CPUAffinity=0,1,4,5 -p StandardOutput=append:/opt/bench/m12-node.log -p StandardError=append:/opt/bench/m12-node.log /opt/bench/uc/target/release/examples/m12_gate node --id 0 --bind 10.10.1.10:19100 --instance-dir /opt/bench/m12/n0 --members 0@10.10.1.10:19100,1@10.10.1.11:19100,2@10.10.1.12:19100 --app-id m12-gate --admission-kib 256 --services count
+INFO [systemctl 3.80.127.214] sudo systemctl kill --signal=SIGKILL m12-node 2>/dev/null; sudo systemctl stop m12-node 2>/dev/null; sudo systemctl reset-failed m12-node 2>/dev/null; true
+INFO [systemd-run 3.80.127.214] sudo systemd-run --unit=m12-node --collect --setenv=UC2_JOURNAL_DURABILITY=eventual --setenv=UC2_JOURNAL_EVENTUAL_FSYNC_MS=1 -p TimeoutStopSec=1 -p LimitNOFILE=65536 -p CPUAffinity=0,1,4,5 -p StandardOutput=append:/opt/bench/m12-node.log -p StandardError=append:/opt/bench/m12-node.log /opt/bench/uc/target/release/examples/m12_gate node --id 1 --bind 10.10.1.11:19100 --instance-dir /opt/bench/m12/n1 --members 0@10.10.1.10:19100,1@10.10.1.11:19100,2@10.10.1.12:19100 --app-id m12-gate --admission-kib 256 --services count
+INFO [systemctl 3.85.123.227] sudo systemctl kill --signal=SIGKILL m12-node 2>/dev/null; sudo systemctl stop m12-node 2>/dev/null; sudo systemctl reset-failed m12-node 2>/dev/null; true
+INFO [systemd-run 3.85.123.227] sudo systemd-run --unit=m12-node --collect --setenv=UC2_JOURNAL_DURABILITY=eventual --setenv=UC2_JOURNAL_EVENTUAL_FSYNC_MS=1 -p TimeoutStopSec=1 -p LimitNOFILE=65536 -p CPUAffinity=0,1,4,5 -p StandardOutput=append:/opt/bench/m12-node.log -p StandardError=append:/opt/bench/m12-node.log /opt/bench/uc/target/release/examples/m12_gate node --id 2 --bind 10.10.1.12:19100 --instance-dir /opt/bench/m12/n2 --members 0@10.10.1.10:19100,1@10.10.1.11:19100,2@10.10.1.12:19100 --app-id m12-gate --admission-kib 256 --services count
+INFO [ssh 54.234.141.82] sudo rm -f /opt/bench/m12-service.log
+INFO [systemctl 54.234.141.82] sudo systemctl kill --signal=SIGKILL m12-service 2>/dev/null; sudo systemctl stop m12-service 2>/dev/null; sudo systemctl reset-failed m12-service 2>/dev/null; true
+INFO [systemd-run 54.234.141.82] sudo systemd-run --unit=m12-service --collect --setenv=UC2_APPLY_IDLE=spin -p TimeoutStopSec=1 -p CPUAffinity=2 -p StandardOutput=append:/opt/bench/m12-service.log -p StandardError=append:/opt/bench/m12-service.log /opt/bench/uc/target/release/examples/m12_gate service --instance-dir /opt/bench/m12/n0 --app-id m12-gate --envelope off --fsm count
+INFO [ssh 3.80.127.214] sudo rm -f /opt/bench/m12-service.log
+INFO [systemctl 3.80.127.214] sudo systemctl kill --signal=SIGKILL m12-service 2>/dev/null; sudo systemctl stop m12-service 2>/dev/null; sudo systemctl reset-failed m12-service 2>/dev/null; true
+INFO [systemd-run 3.80.127.214] sudo systemd-run --unit=m12-service --collect --setenv=UC2_APPLY_IDLE=spin -p TimeoutStopSec=1 -p CPUAffinity=2 -p StandardOutput=append:/opt/bench/m12-service.log -p StandardError=append:/opt/bench/m12-service.log /opt/bench/uc/target/release/examples/m12_gate service --instance-dir /opt/bench/m12/n1 --app-id m12-gate --envelope off --fsm count
+INFO [ssh 3.85.123.227] sudo rm -f /opt/bench/m12-service.log
+INFO [systemctl 3.85.123.227] sudo systemctl kill --signal=SIGKILL m12-service 2>/dev/null; sudo systemctl stop m12-service 2>/dev/null; sudo systemctl reset-failed m12-service 2>/dev/null; true
+INFO [systemd-run 3.85.123.227] sudo systemd-run --unit=m12-service --collect --setenv=UC2_APPLY_IDLE=spin -p TimeoutStopSec=1 -p CPUAffinity=2 -p StandardOutput=append:/opt/bench/m12-service.log -p StandardError=append:/opt/bench/m12-service.log /opt/bench/uc/target/release/examples/m12_gate service --instance-dir /opt/bench/m12/n2 --app-id m12-gate --envelope off --fsm count
+INFO [iface 54.234.141.82] IFACE=$(ip -o route get 8.8.8.8 2>/dev/null | sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -n1); if [ -z "$IFACE" ]; then for i in $(ls /sys/class/net 2>/dev/null | grep -v '^lo$'); do st=$(cat /sys/class/net/$i/operstate 2>/dev/null); if [ "$st" = up ]; then IFACE=$i; break; fi; done; fi; echo IFACE=$IFACE
+INFO arm D: leader n0 (54.234.141.82), NIC ens5
+
+INFO --- arm D inflight=1 rep=1/3 ---
+INFO [ssh 54.234.141.82] sudo taskset -c 3,7 /opt/bench/uc/target/release/examples/m12_gate client-direct --instance-dir /opt/bench/m12/n0 --app-id m12-gate --secs 20 --payload 64 --inflight 1 --envelope off --poll-idle spin --warmup-secs 2 --measure-secs 16
+INFO [ssh 54.234.141.82] cat /proc/net/dev  # NIC sample for ens5, ~1 Hz while the client runs
+  [svc inflight=1] m12_gate client-direct: 20 s, payload 64, inflight 1, envelope off, poll-idle Spin
+  [svc inflight=1] 
+  [svc inflight=1] ================ uc2 M12a gate: direct (Engine) ================
+  [svc inflight=1] sends                 : 241962
+  [svc inflight=1] responses             : 241962
+  [svc inflight=1] not FRESH (envelope)  : 0
+  [svc inflight=1] not_leader / retried  : 0 / 0
+  [svc inflight=1] dup / overwritten     : 0 / 0
+  [svc inflight=1] in-flight at end      : 0
+  [svc inflight=1] lost (timeout/error)  : 0
+  [svc inflight=1] elapsed (drain-incl.) : 20.000 s
+  [svc inflight=1] responses/s           : 12098
+  [svc inflight=1] p50                   : 0.077 ms
+  [svc inflight=1] p90                   : 0.098 ms
+  [svc inflight=1] p95                   : 0.102 ms
+  [svc inflight=1] p99                   : 0.131 ms
+  [svc inflight=1] max                   : 11.919 ms
+  [svc inflight=1] (m5 reference bar, informational only: responses/s >= 400000 && p50 <= 1.0 ms — this harness's own bar is the gateway/direct RATIO, printed below)
+  [svc inflight=1] reference bar: FAIL (not this harness's gate)
+  [svc inflight=1] ============================================================================
+  [svc inflight=1] RESULT {"arm":"direct","responses_per_sec":12098.1,"payload":64,"inflight":1,"secs":20,"sends":241962,"responses":241962,"lost":0,"not_fresh":0,"inflight_at_end":0,"p50_ms":0.077,"p90_ms":0.098,"p95_ms":0.102,"p99_ms":0.131,"max_ms":11.919,"elapsed_secs":20.000,"window_rps":12157.1,"window_responses":194514,"fan_in":false,"declared":1}
+SVCTIME-JSON {"inflight": 1, "resp_per_sec": 12098.1, "window_rps": 12157.1, "responses": 241962, "p50_ms": 0.077, "p90_ms": 0.098, "p95_ms": 0.102, "p99_ms": 0.131, "max_ms": 11.919, "lost": 0, "retried": null, "not_leader": null, "bytes_per_command": 655.8768784916788, "pkts_per_command": 6.038407625901385, "arm": "D", "arm_label": "eventual(1ms) / pinned / spin-apply", "rep": 1, "leader": 0, "pinned": true, "node_env": {"UC2_JOURNAL_DURABILITY": "eventual", "UC2_JOURNAL_EVENTUAL_FSYNC_MS": "1"}, "service_env": {"UC2_APPLY_IDLE": "spin"}}
+
+INFO --- arm D inflight=1 rep=2/3 ---
+INFO [ssh 54.234.141.82] sudo taskset -c 3,7 /opt/bench/uc/target/release/examples/m12_gate client-direct --instance-dir /opt/bench/m12/n0 --app-id m12-gate --secs 20 --payload 64 --inflight 1 --envelope off --poll-idle spin --warmup-secs 2 --measure-secs 16
+INFO [ssh 54.234.141.82] cat /proc/net/dev  # NIC sample for ens5, ~1 Hz while the client runs
+  [svc inflight=1] m12_gate client-direct: 20 s, payload 64, inflight 1, envelope off, poll-idle Spin
+  [svc inflight=1] 
+  [svc inflight=1] ================ uc2 M12a gate: direct (Engine) ================
+  [svc inflight=1] sends                 : 233479
+  [svc inflight=1] responses             : 233479
+  [svc inflight=1] not FRESH (envelope)  : 0
+  [svc inflight=1] not_leader / retried  : 0 / 0
+  [svc inflight=1] dup / overwritten     : 0 / 0
+  [svc inflight=1] in-flight at end      : 0
+  [svc inflight=1] lost (timeout/error)  : 0
+  [svc inflight=1] elapsed (drain-incl.) : 20.000 s
+  [svc inflight=1] responses/s           : 11674
+  [svc inflight=1] p50                   : 0.076 ms
+  [svc inflight=1] p90                   : 0.099 ms
+  [svc inflight=1] p95                   : 0.109 ms
+  [svc inflight=1] p99                   : 0.159 ms
+  [svc inflight=1] max                   : 14.909 ms
+  [svc inflight=1] (m5 reference bar, informational only: responses/s >= 400000 && p50 <= 1.0 ms — this harness's own bar is the gateway/direct RATIO, printed below)
+  [svc inflight=1] reference bar: FAIL (not this harness's gate)
+  [svc inflight=1] ============================================================================
+  [svc inflight=1] RESULT {"arm":"direct","responses_per_sec":11673.9,"payload":64,"inflight":1,"secs":20,"sends":233479,"responses":233479,"lost":0,"not_fresh":0,"inflight_at_end":0,"p50_ms":0.076,"p90_ms":0.099,"p95_ms":0.109,"p99_ms":0.159,"max_ms":14.909,"elapsed_secs":20.000,"window_rps":11687.2,"window_responses":186995,"fan_in":false,"declared":1}
+SVCTIME-JSON {"inflight": 1, "resp_per_sec": 11673.9, "window_rps": 11687.2, "responses": 233479, "p50_ms": 0.076, "p90_ms": 0.099, "p95_ms": 0.109, "p99_ms": 0.159, "max_ms": 14.909, "lost": 0, "retried": null, "not_leader": null, "bytes_per_command": 663.9821023036891, "pkts_per_command": 6.112981930126327, "arm": "D", "arm_label": "eventual(1ms) / pinned / spin-apply", "rep": 2, "leader": 0, "pinned": true, "node_env": {"UC2_JOURNAL_DURABILITY": "eventual", "UC2_JOURNAL_EVENTUAL_FSYNC_MS": "1"}, "service_env": {"UC2_APPLY_IDLE": "spin"}}
+
+INFO --- arm D inflight=1 rep=3/3 ---
+INFO [ssh 54.234.141.82] sudo taskset -c 3,7 /opt/bench/uc/target/release/examples/m12_gate client-direct --instance-dir /opt/bench/m12/n0 --app-id m12-gate --secs 20 --payload 64 --inflight 1 --envelope off --poll-idle spin --warmup-secs 2 --measure-secs 16
+INFO [ssh 54.234.141.82] cat /proc/net/dev  # NIC sample for ens5, ~1 Hz while the client runs
+  [svc inflight=1] m12_gate client-direct: 20 s, payload 64, inflight 1, envelope off, poll-idle Spin
+  [svc inflight=1] 
+  [svc inflight=1] ================ uc2 M12a gate: direct (Engine) ================
+  [svc inflight=1] sends                 : 236154
+  [svc inflight=1] responses             : 236154
+  [svc inflight=1] not FRESH (envelope)  : 0
+  [svc inflight=1] not_leader / retried  : 0 / 0
+  [svc inflight=1] dup / overwritten     : 0 / 0
+  [svc inflight=1] in-flight at end      : 0
+  [svc inflight=1] lost (timeout/error)  : 0
+  [svc inflight=1] elapsed (drain-incl.) : 20.000 s
+  [svc inflight=1] responses/s           : 11808
+  [svc inflight=1] p50                   : 0.078 ms
+  [svc inflight=1] p90                   : 0.098 ms
+  [svc inflight=1] p95                   : 0.107 ms
+  [svc inflight=1] p99                   : 0.150 ms
+  [svc inflight=1] max                   : 37.487 ms
+  [svc inflight=1] (m5 reference bar, informational only: responses/s >= 400000 && p50 <= 1.0 ms — this harness's own bar is the gateway/direct RATIO, printed below)
+  [svc inflight=1] reference bar: FAIL (not this harness's gate)
+  [svc inflight=1] ============================================================================
+  [svc inflight=1] RESULT {"arm":"direct","responses_per_sec":11807.7,"payload":64,"inflight":1,"secs":20,"sends":236154,"responses":236154,"lost":0,"not_fresh":0,"inflight_at_end":0,"p50_ms":0.078,"p90_ms":0.098,"p95_ms":0.107,"p99_ms":0.150,"max_ms":37.487,"elapsed_secs":20.000,"window_rps":11791.7,"window_responses":188667,"fan_in":false,"declared":1}
+SVCTIME-JSON {"inflight": 1, "resp_per_sec": 11807.7, "window_rps": 11791.7, "responses": 236154, "p50_ms": 0.078, "p90_ms": 0.098, "p95_ms": 0.107, "p99_ms": 0.15, "max_ms": 37.487, "lost": 0, "retried": null, "not_leader": null, "bytes_per_command": 646.689595798199, "pkts_per_command": 5.953850459582478, "arm": "D", "arm_label": "eventual(1ms) / pinned / spin-apply", "rep": 3, "leader": 0, "pinned": true, "node_env": {"UC2_JOURNAL_DURABILITY": "eventual", "UC2_JOURNAL_EVENTUAL_FSYNC_MS": "1"}, "service_env": {"UC2_APPLY_IDLE": "spin"}}
+
+INFO --- arm D inflight=2 rep=1/3 ---
+INFO [ssh 54.234.141.82] sudo taskset -c 3,7 /opt/bench/uc/target/release/examples/m12_gate client-direct --instance-dir /opt/bench/m12/n0 --app-id m12-gate --secs 20 --payload 64 --inflight 2 --envelope off --poll-idle spin --warmup-secs 2 --measure-secs 16
+INFO [ssh 54.234.141.82] cat /proc/net/dev  # NIC sample for ens5, ~1 Hz while the client runs
+  [svc inflight=2] m12_gate client-direct: 20 s, payload 64, inflight 2, envelope off, poll-idle Spin
+  [svc inflight=2] 
+  [svc inflight=2] ================ uc2 M12a gate: direct (Engine) ================
+  [svc inflight=2] sends                 : 406485
+  [svc inflight=2] responses             : 406485
+  [svc inflight=2] not FRESH (envelope)  : 0
+  [svc inflight=2] not_leader / retried  : 0 / 0
+  [svc inflight=2] dup / overwritten     : 0 / 0
+  [svc inflight=2] in-flight at end      : 0
+  [svc inflight=2] lost (timeout/error)  : 0
+  [svc inflight=2] elapsed (drain-incl.) : 20.000 s
+  [svc inflight=2] responses/s           : 20324
+  [svc inflight=2] p50                   : 0.096 ms
+  [svc inflight=2] p90                   : 0.114 ms
+  [svc inflight=2] p95                   : 0.132 ms
+  [svc inflight=2] p99                   : 0.185 ms
+  [svc inflight=2] max                   : 18.711 ms
+  [svc inflight=2] (m5 reference bar, informational only: responses/s >= 400000 && p50 <= 1.0 ms — this harness's own bar is the gateway/direct RATIO, printed below)
+  [svc inflight=2] reference bar: FAIL (not this harness's gate)
+  [svc inflight=2] ============================================================================
+  [svc inflight=2] RESULT {"arm":"direct","responses_per_sec":20324.2,"payload":64,"inflight":2,"secs":20,"sends":406485,"responses":406485,"lost":0,"not_fresh":0,"inflight_at_end":0,"p50_ms":0.096,"p90_ms":0.114,"p95_ms":0.132,"p99_ms":0.185,"max_ms":18.711,"elapsed_secs":20.000,"window_rps":20396.7,"window_responses":326347,"fan_in":false,"declared":1}
+SVCTIME-JSON {"inflight": 2, "resp_per_sec": 20324.2, "window_rps": 20396.7, "responses": 406485, "p50_ms": 0.096, "p90_ms": 0.114, "p95_ms": 0.132, "p99_ms": 0.185, "max_ms": 18.711, "lost": 0, "retried": null, "not_leader": null, "bytes_per_command": 543.6947627248674, "pkts_per_command": 4.321999799640828, "arm": "D", "arm_label": "eventual(1ms) / pinned / spin-apply", "rep": 1, "leader": 0, "pinned": true, "node_env": {"UC2_JOURNAL_DURABILITY": "eventual", "UC2_JOURNAL_EVENTUAL_FSYNC_MS": "1"}, "service_env": {"UC2_APPLY_IDLE": "spin"}}
+
+INFO --- arm D inflight=2 rep=2/3 ---
+INFO [ssh 54.234.141.82] sudo taskset -c 3,7 /opt/bench/uc/target/release/examples/m12_gate client-direct --instance-dir /opt/bench/m12/n0 --app-id m12-gate --secs 20 --payload 64 --inflight 2 --envelope off --poll-idle spin --warmup-secs 2 --measure-secs 16
+INFO [ssh 54.234.141.82] cat /proc/net/dev  # NIC sample for ens5, ~1 Hz while the client runs
+  [svc inflight=2] m12_gate client-direct: 20 s, payload 64, inflight 2, envelope off, poll-idle Spin
+  [svc inflight=2] 
+  [svc inflight=2] ================ uc2 M12a gate: direct (Engine) ================
+  [svc inflight=2] sends                 : 407865
+  [svc inflight=2] responses             : 407865
+  [svc inflight=2] not FRESH (envelope)  : 0
+  [svc inflight=2] not_leader / retried  : 0 / 0
+  [svc inflight=2] dup / overwritten     : 0 / 0
+  [svc inflight=2] in-flight at end      : 0
+  [svc inflight=2] lost (timeout/error)  : 0
+  [svc inflight=2] elapsed (drain-incl.) : 20.000 s
+  [svc inflight=2] responses/s           : 20393
+  [svc inflight=2] p50                   : 0.097 ms
+  [svc inflight=2] p90                   : 0.114 ms
+  [svc inflight=2] p95                   : 0.132 ms
+  [svc inflight=2] p99                   : 0.181 ms
+  [svc inflight=2] max                   : 15.696 ms
+  [svc inflight=2] (m5 reference bar, informational only: responses/s >= 400000 && p50 <= 1.0 ms — this harness's own bar is the gateway/direct RATIO, printed below)
+  [svc inflight=2] reference bar: FAIL (not this harness's gate)
+  [svc inflight=2] ============================================================================
+  [svc inflight=2] RESULT {"arm":"direct","responses_per_sec":20393.2,"payload":64,"inflight":2,"secs":20,"sends":407865,"responses":407865,"lost":0,"not_fresh":0,"inflight_at_end":0,"p50_ms":0.097,"p90_ms":0.114,"p95_ms":0.132,"p99_ms":0.181,"max_ms":15.696,"elapsed_secs":20.000,"window_rps":20354.8,"window_responses":325677,"fan_in":false,"declared":1}
+SVCTIME-JSON {"inflight": 2, "resp_per_sec": 20393.2, "window_rps": 20354.8, "responses": 407865, "p50_ms": 0.097, "p90_ms": 0.114, "p95_ms": 0.132, "p99_ms": 0.181, "max_ms": 15.696, "lost": 0, "retried": null, "not_leader": null, "bytes_per_command": 565.9043232064197, "pkts_per_command": 4.654782654320199, "arm": "D", "arm_label": "eventual(1ms) / pinned / spin-apply", "rep": 2, "leader": 0, "pinned": true, "node_env": {"UC2_JOURNAL_DURABILITY": "eventual", "UC2_JOURNAL_EVENTUAL_FSYNC_MS": "1"}, "service_env": {"UC2_APPLY_IDLE": "spin"}}
+
+INFO --- arm D inflight=2 rep=3/3 ---
+INFO [ssh 54.234.141.82] sudo taskset -c 3,7 /opt/bench/uc/target/release/examples/m12_gate client-direct --instance-dir /opt/bench/m12/n0 --app-id m12-gate --secs 20 --payload 64 --inflight 2 --envelope off --poll-idle spin --warmup-secs 2 --measure-secs 16
+INFO [ssh 54.234.141.82] cat /proc/net/dev  # NIC sample for ens5, ~1 Hz while the client runs
+  [svc inflight=2] m12_gate client-direct: 20 s, payload 64, inflight 2, envelope off, poll-idle Spin
+  [svc inflight=2] 
+  [svc inflight=2] ================ uc2 M12a gate: direct (Engine) ================
+  [svc inflight=2] sends                 : 417581
+  [svc inflight=2] responses             : 417581
+  [svc inflight=2] not FRESH (envelope)  : 0
+  [svc inflight=2] not_leader / retried  : 0 / 0
+  [svc inflight=2] dup / overwritten     : 0 / 0
+  [svc inflight=2] in-flight at end      : 0
+  [svc inflight=2] lost (timeout/error)  : 0
+  [svc inflight=2] elapsed (drain-incl.) : 20.000 s
+  [svc inflight=2] responses/s           : 20879
+  [svc inflight=2] p50                   : 0.096 ms
+  [svc inflight=2] p90                   : 0.113 ms
+  [svc inflight=2] p95                   : 0.128 ms
+  [svc inflight=2] p99                   : 0.167 ms
+  [svc inflight=2] max                   : 13.976 ms
+  [svc inflight=2] (m5 reference bar, informational only: responses/s >= 400000 && p50 <= 1.0 ms — this harness's own bar is the gateway/direct RATIO, printed below)
+  [svc inflight=2] reference bar: FAIL (not this harness's gate)
+  [svc inflight=2] ============================================================================
+  [svc inflight=2] RESULT {"arm":"direct","responses_per_sec":20879.0,"payload":64,"inflight":2,"secs":20,"sends":417581,"responses":417581,"lost":0,"not_fresh":0,"inflight_at_end":0,"p50_ms":0.096,"p90_ms":0.113,"p95_ms":0.128,"p99_ms":0.167,"max_ms":13.976,"elapsed_secs":20.000,"window_rps":20782.6,"window_responses":332521,"fan_in":false,"declared":1}
+SVCTIME-JSON {"inflight": 2, "resp_per_sec": 20879.0, "window_rps": 20782.6, "responses": 417581, "p50_ms": 0.096, "p90_ms": 0.113, "p95_ms": 0.128, "p99_ms": 0.167, "max_ms": 13.976, "lost": 0, "retried": null, "not_leader": null, "bytes_per_command": 562.7991591958328, "pkts_per_command": 4.634474561734852, "arm": "D", "arm_label": "eventual(1ms) / pinned / spin-apply", "rep": 3, "leader": 0, "pinned": true, "node_env": {"UC2_JOURNAL_DURABILITY": "eventual", "UC2_JOURNAL_EVENTUAL_FSYNC_MS": "1"}, "service_env": {"UC2_APPLY_IDLE": "spin"}}
+
+INFO --- arm D inflight=4 rep=1/1 ---
+INFO [ssh 54.234.141.82] sudo taskset -c 3,7 /opt/bench/uc/target/release/examples/m12_gate client-direct --instance-dir /opt/bench/m12/n0 --app-id m12-gate --secs 20 --payload 64 --inflight 4 --envelope off --poll-idle spin --warmup-secs 2 --measure-secs 16
+INFO [ssh 54.234.141.82] cat /proc/net/dev  # NIC sample for ens5, ~1 Hz while the client runs
+  [svc inflight=4] m12_gate client-direct: 20 s, payload 64, inflight 4, envelope off, poll-idle Spin
+  [svc inflight=4] 
+  [svc inflight=4] ================ uc2 M12a gate: direct (Engine) ================
+  [svc inflight=4] sends                 : 757052
+  [svc inflight=4] responses             : 757052
+  [svc inflight=4] not FRESH (envelope)  : 0
+  [svc inflight=4] not_leader / retried  : 0 / 0
+  [svc inflight=4] dup / overwritten     : 0 / 0
+  [svc inflight=4] in-flight at end      : 0
+  [svc inflight=4] lost (timeout/error)  : 0
+  [svc inflight=4] elapsed (drain-incl.) : 20.000 s
+  [svc inflight=4] responses/s           : 37852
+  [svc inflight=4] p50                   : 0.098 ms
+  [svc inflight=4] p90                   : 0.132 ms
+  [svc inflight=4] p95                   : 0.147 ms
+  [svc inflight=4] p99                   : 0.182 ms
+  [svc inflight=4] max                   : 12.886 ms
+  [svc inflight=4] (m5 reference bar, informational only: responses/s >= 400000 && p50 <= 1.0 ms — this harness's own bar is the gateway/direct RATIO, printed below)
+  [svc inflight=4] reference bar: FAIL (not this harness's gate)
+  [svc inflight=4] ============================================================================
+  [svc inflight=4] RESULT {"arm":"direct","responses_per_sec":37852.5,"payload":64,"inflight":4,"secs":20,"sends":757052,"responses":757052,"lost":0,"not_fresh":0,"inflight_at_end":0,"p50_ms":0.098,"p90_ms":0.132,"p95_ms":0.147,"p99_ms":0.182,"max_ms":12.886,"elapsed_secs":20.000,"window_rps":37613.9,"window_responses":601822,"fan_in":false,"declared":1}
+SVCTIME-JSON {"inflight": 4, "resp_per_sec": 37852.5, "window_rps": 37613.9, "responses": 757052, "p50_ms": 0.098, "p90_ms": 0.132, "p95_ms": 0.147, "p99_ms": 0.182, "max_ms": 12.886, "lost": 0, "retried": null, "not_leader": null, "bytes_per_command": 467.32036875355845, "pkts_per_command": 3.2883609913429375, "arm": "D", "arm_label": "eventual(1ms) / pinned / spin-apply", "rep": 1, "leader": 0, "pinned": true, "node_env": {"UC2_JOURNAL_DURABILITY": "eventual", "UC2_JOURNAL_EVENTUAL_FSYNC_MS": "1"}, "service_env": {"UC2_APPLY_IDLE": "spin"}}
+
+INFO --- arm D inflight=8 rep=1/1 ---
+INFO [ssh 54.234.141.82] sudo taskset -c 3,7 /opt/bench/uc/target/release/examples/m12_gate client-direct --instance-dir /opt/bench/m12/n0 --app-id m12-gate --secs 20 --payload 64 --inflight 8 --envelope off --poll-idle spin --warmup-secs 2 --measure-secs 16
+INFO [ssh 54.234.141.82] cat /proc/net/dev  # NIC sample for ens5, ~1 Hz while the client runs
+  [svc inflight=8] m12_gate client-direct: 20 s, payload 64, inflight 8, envelope off, poll-idle Spin
+  [svc inflight=8] 
+  [svc inflight=8] ================ uc2 M12a gate: direct (Engine) ================
+  [svc inflight=8] sends                 : 1397289
+  [svc inflight=8] responses             : 1397289
+  [svc inflight=8] not FRESH (envelope)  : 0
+  [svc inflight=8] not_leader / retried  : 0 / 0
+  [svc inflight=8] dup / overwritten     : 0 / 0
+  [svc inflight=8] in-flight at end      : 0
+  [svc inflight=8] lost (timeout/error)  : 0
+  [svc inflight=8] elapsed (drain-incl.) : 20.000 s
+  [svc inflight=8] responses/s           : 69864
+  [svc inflight=8] p50                   : 0.104 ms
+  [svc inflight=8] p90                   : 0.147 ms
+  [svc inflight=8] p95                   : 0.162 ms
+  [svc inflight=8] p99                   : 0.207 ms
+  [svc inflight=8] max                   : 10.191 ms
+  [svc inflight=8] (m5 reference bar, informational only: responses/s >= 400000 && p50 <= 1.0 ms — this harness's own bar is the gateway/direct RATIO, printed below)
+  [svc inflight=8] reference bar: FAIL (not this harness's gate)
+  [svc inflight=8] ============================================================================
+  [svc inflight=8] RESULT {"arm":"direct","responses_per_sec":69864.1,"payload":64,"inflight":8,"secs":20,"sends":1397289,"responses":1397289,"lost":0,"not_fresh":0,"inflight_at_end":0,"p50_ms":0.104,"p90_ms":0.147,"p95_ms":0.162,"p99_ms":0.207,"max_ms":10.191,"elapsed_secs":20.000,"window_rps":70293.9,"window_responses":1124703,"fan_in":false,"declared":1}
+SVCTIME-JSON {"inflight": 8, "resp_per_sec": 69864.1, "window_rps": 70293.9, "responses": 1397289, "p50_ms": 0.104, "p90_ms": 0.147, "p95_ms": 0.162, "p99_ms": 0.207, "max_ms": 10.191, "lost": 0, "retried": null, "not_leader": null, "bytes_per_command": 385.16194147328974, "pkts_per_command": 1.9999423134661887, "arm": "D", "arm_label": "eventual(1ms) / pinned / spin-apply", "rep": 1, "leader": 0, "pinned": true, "node_env": {"UC2_JOURNAL_DURABILITY": "eventual", "UC2_JOURNAL_EVENTUAL_FSYNC_MS": "1"}, "service_env": {"UC2_APPLY_IDLE": "spin"}}
+
+INFO --- arm D inflight=16 rep=1/1 ---
+INFO [ssh 54.234.141.82] sudo taskset -c 3,7 /opt/bench/uc/target/release/examples/m12_gate client-direct --instance-dir /opt/bench/m12/n0 --app-id m12-gate --secs 20 --payload 64 --inflight 16 --envelope off --poll-idle spin --warmup-secs 2 --measure-secs 16
+INFO [ssh 54.234.141.82] cat /proc/net/dev  # NIC sample for ens5, ~1 Hz while the client runs
+  [svc inflight=16] m12_gate client-direct: 20 s, payload 64, inflight 16, envelope off, poll-idle Spin
+  [svc inflight=16] 
+  [svc inflight=16] ================ uc2 M12a gate: direct (Engine) ================
+  [svc inflight=16] sends                 : 2592663
+  [svc inflight=16] responses             : 2592663
+  [svc inflight=16] not FRESH (envelope)  : 0
+  [svc inflight=16] not_leader / retried  : 0 / 0
+  [svc inflight=16] dup / overwritten     : 0 / 0
+  [svc inflight=16] in-flight at end      : 0
+  [svc inflight=16] lost (timeout/error)  : 0
+  [svc inflight=16] elapsed (drain-incl.) : 20.000 s
+  [svc inflight=16] responses/s           : 129633
+  [svc inflight=16] p50                   : 0.113 ms
+  [svc inflight=16] p90                   : 0.153 ms
+  [svc inflight=16] p95                   : 0.173 ms
+  [svc inflight=16] p99                   : 0.218 ms
+  [svc inflight=16] max                   : 10.207 ms
+  [svc inflight=16] (m5 reference bar, informational only: responses/s >= 400000 && p50 <= 1.0 ms — this harness's own bar is the gateway/direct RATIO, printed below)
+  [svc inflight=16] reference bar: FAIL (not this harness's gate)
+  [svc inflight=16] ============================================================================
+  [svc inflight=16] RESULT {"arm":"direct","responses_per_sec":129632.7,"payload":64,"inflight":16,"secs":20,"sends":2592663,"responses":2592663,"lost":0,"not_fresh":0,"inflight_at_end":0,"p50_ms":0.113,"p90_ms":0.153,"p95_ms":0.173,"p99_ms":0.218,"max_ms":10.207,"elapsed_secs":20.000,"window_rps":129570.4,"window_responses":2073126,"fan_in":false,"declared":1}
+SVCTIME-JSON {"inflight": 16, "resp_per_sec": 129632.7, "window_rps": 129570.4, "responses": 2592663, "p50_ms": 0.113, "p90_ms": 0.153, "p95_ms": 0.173, "p99_ms": 0.218, "max_ms": 10.207, "lost": 0, "retried": null, "not_leader": null, "bytes_per_command": 332.214141259207, "pkts_per_command": 1.1438635413248208, "arm": "D", "arm_label": "eventual(1ms) / pinned / spin-apply", "rep": 1, "leader": 0, "pinned": true, "node_env": {"UC2_JOURNAL_DURABILITY": "eventual", "UC2_JOURNAL_EVENTUAL_FSYNC_MS": "1"}, "service_env": {"UC2_APPLY_IDLE": "spin"}}
+
+INFO --- arm D inflight=64 rep=1/1 ---
+INFO [ssh 54.234.141.82] sudo taskset -c 3,7 /opt/bench/uc/target/release/examples/m12_gate client-direct --instance-dir /opt/bench/m12/n0 --app-id m12-gate --secs 20 --payload 64 --inflight 64 --envelope off --poll-idle spin --warmup-secs 2 --measure-secs 16
+INFO [ssh 54.234.141.82] cat /proc/net/dev  # NIC sample for ens5, ~1 Hz while the client runs
+  [svc inflight=64] m12_gate client-direct: 20 s, payload 64, inflight 64, envelope off, poll-idle Spin
+  [svc inflight=64] 
+  [svc inflight=64] ================ uc2 M12a gate: direct (Engine) ================
+  [svc inflight=64] sends                 : 7935306
+  [svc inflight=64] responses             : 7935306
+  [svc inflight=64] not FRESH (envelope)  : 0
+  [svc inflight=64] not_leader / retried  : 0 / 0
+  [svc inflight=64] dup / overwritten     : 0 / 0
+  [svc inflight=64] in-flight at end      : 0
+  [svc inflight=64] lost (timeout/error)  : 0
+  [svc inflight=64] elapsed (drain-incl.) : 20.000 s
+  [svc inflight=64] responses/s           : 396764
+  [svc inflight=64] p50                   : 0.147 ms
+  [svc inflight=64] p90                   : 0.216 ms
+  [svc inflight=64] p95                   : 0.246 ms
+  [svc inflight=64] p99                   : 0.308 ms
+  [svc inflight=64] max                   : 8.204 ms
+  [svc inflight=64] (m5 reference bar, informational only: responses/s >= 400000 && p50 <= 1.0 ms — this harness's own bar is the gateway/direct RATIO, printed below)
+  [svc inflight=64] reference bar: FAIL (not this harness's gate)
+  [svc inflight=64] ============================================================================
+  [svc inflight=64] RESULT {"arm":"direct","responses_per_sec":396763.8,"payload":64,"inflight":64,"secs":20,"sends":7935306,"responses":7935306,"lost":0,"not_fresh":0,"inflight_at_end":0,"p50_ms":0.147,"p90_ms":0.216,"p95_ms":0.246,"p99_ms":0.308,"max_ms":8.204,"elapsed_secs":20.000,"window_rps":392239.4,"window_responses":6275830,"fan_in":false,"declared":1}
+SVCTIME-JSON {"inflight": 64, "resp_per_sec": 396763.8, "window_rps": 392239.4, "responses": 7935306, "p50_ms": 0.147, "p90_ms": 0.216, "p95_ms": 0.246, "p99_ms": 0.308, "max_ms": 8.204, "lost": 0, "retried": null, "not_leader": null, "bytes_per_command": 284.0750400304603, "pkts_per_command": 0.39464830922680266, "arm": "D", "arm_label": "eventual(1ms) / pinned / spin-apply", "rep": 1, "leader": 0, "pinned": true, "node_env": {"UC2_JOURNAL_DURABILITY": "eventual", "UC2_JOURNAL_EVENTUAL_FSYNC_MS": "1"}, "service_env": {"UC2_APPLY_IDLE": "spin"}}
+
+INFO --- arm D inflight=256 rep=1/1 ---
+INFO [ssh 54.234.141.82] sudo taskset -c 3,7 /opt/bench/uc/target/release/examples/m12_gate client-direct --instance-dir /opt/bench/m12/n0 --app-id m12-gate --secs 20 --payload 64 --inflight 256 --envelope off --poll-idle spin --warmup-secs 2 --measure-secs 16
+INFO [ssh 54.234.141.82] cat /proc/net/dev  # NIC sample for ens5, ~1 Hz while the client runs
+  [svc inflight=256] m12_gate client-direct: 20 s, payload 64, inflight 256, envelope off, poll-idle Spin
+  [svc inflight=256] 
+  [svc inflight=256] ================ uc2 M12a gate: direct (Engine) ================
+  [svc inflight=256] sends                 : 20097363
+  [svc inflight=256] responses             : 20097363
+  [svc inflight=256] not FRESH (envelope)  : 0
+  [svc inflight=256] not_leader / retried  : 0 / 0
+  [svc inflight=256] dup / overwritten     : 0 / 0
+  [svc inflight=256] in-flight at end      : 0
+  [svc inflight=256] lost (timeout/error)  : 0
+  [svc inflight=256] elapsed (drain-incl.) : 20.000 s
+  [svc inflight=256] responses/s           : 1004861
+  [svc inflight=256] p50                   : 0.217 ms
+  [svc inflight=256] p90                   : 0.351 ms
+  [svc inflight=256] p95                   : 0.381 ms
+  [svc inflight=256] p99                   : 0.462 ms
+  [svc inflight=256] max                   : 10.346 ms
+  [svc inflight=256] (m5 reference bar, informational only: responses/s >= 400000 && p50 <= 1.0 ms — this harness's own bar is the gateway/direct RATIO, printed below)
+  [svc inflight=256] reference bar: PASS
+  [svc inflight=256] ============================================================================
+  [svc inflight=256] RESULT {"arm":"direct","responses_per_sec":1004860.6,"payload":64,"inflight":256,"secs":20,"sends":20097363,"responses":20097363,"lost":0,"not_fresh":0,"inflight_at_end":0,"p50_ms":0.217,"p90_ms":0.351,"p95_ms":0.381,"p99_ms":0.462,"max_ms":10.346,"elapsed_secs":20.000,"window_rps":1019474.0,"window_responses":16311584,"fan_in":false,"declared":1}
+SVCTIME-JSON {"inflight": 256, "resp_per_sec": 1004860.6, "window_rps": 1019474.0, "responses": 20097363, "p50_ms": 0.217, "p90_ms": 0.351, "p95_ms": 0.381, "p99_ms": 0.462, "max_ms": 10.346, "lost": 0, "retried": null, "not_leader": null, "bytes_per_command": 276.878635269929, "pkts_per_command": 0.16301662334401915, "arm": "D", "arm_label": "eventual(1ms) / pinned / spin-apply", "rep": 1, "leader": 0, "pinned": true, "node_env": {"UC2_JOURNAL_DURABILITY": "eventual", "UC2_JOURNAL_EVENTUAL_FSYNC_MS": "1"}, "service_env": {"UC2_APPLY_IDLE": "spin"}}
+INFO [systemctl 54.234.141.82] sudo systemctl kill --signal=SIGKILL m12-edge 2>/dev/null; sudo systemctl stop m12-edge 2>/dev/null; sudo systemctl reset-failed m12-edge 2>/dev/null; true
+INFO [systemctl 54.234.141.82] sudo systemctl kill --signal=SIGKILL m12-service 2>/dev/null; sudo systemctl stop m12-service 2>/dev/null; sudo systemctl reset-failed m12-service 2>/dev/null; true
+INFO [systemctl 54.234.141.82] sudo systemctl kill --signal=SIGKILL m12-node 2>/dev/null; sudo systemctl stop m12-node 2>/dev/null; sudo systemctl reset-failed m12-node 2>/dev/null; true
+INFO [systemctl 3.80.127.214] sudo systemctl kill --signal=SIGKILL m12-edge 2>/dev/null; sudo systemctl stop m12-edge 2>/dev/null; sudo systemctl reset-failed m12-edge 2>/dev/null; true
+INFO [systemctl 3.80.127.214] sudo systemctl kill --signal=SIGKILL m12-service 2>/dev/null; sudo systemctl stop m12-service 2>/dev/null; sudo systemctl reset-failed m12-service 2>/dev/null; true
+INFO [systemctl 3.80.127.214] sudo systemctl kill --signal=SIGKILL m12-node 2>/dev/null; sudo systemctl stop m12-node 2>/dev/null; sudo systemctl reset-failed m12-node 2>/dev/null; true
+INFO [systemctl 3.85.123.227] sudo systemctl kill --signal=SIGKILL m12-edge 2>/dev/null; sudo systemctl stop m12-edge 2>/dev/null; sudo systemctl reset-failed m12-edge 2>/dev/null; true
+INFO [systemctl 3.85.123.227] sudo systemctl kill --signal=SIGKILL m12-service 2>/dev/null; sudo systemctl stop m12-service 2>/dev/null; sudo systemctl reset-failed m12-service 2>/dev/null; true
+INFO [systemctl 3.85.123.227] sudo systemctl kill --signal=SIGKILL m12-node 2>/dev/null; sudo systemctl stop m12-node 2>/dev/null; sudo systemctl reset-failed m12-node 2>/dev/null; true
+
+=== ARM A2: consistent / unpinned / sleep-apply (drift bracket) ===
+INFO [ssh 54.234.141.82] sudo rm -rf /opt/bench/m12/n0 && sudo mkdir -p /opt/bench/m12/n0
+INFO [ssh 3.80.127.214] sudo rm -rf /opt/bench/m12/n1 && sudo mkdir -p /opt/bench/m12/n1
+INFO [ssh 3.85.123.227] sudo rm -rf /opt/bench/m12/n2 && sudo mkdir -p /opt/bench/m12/n2
+INFO [systemctl 54.234.141.82] sudo systemctl kill --signal=SIGKILL m12-node 2>/dev/null; sudo systemctl stop m12-node 2>/dev/null; sudo systemctl reset-failed m12-node 2>/dev/null; true
+INFO [systemd-run 54.234.141.82] sudo systemd-run --unit=m12-node --collect -p TimeoutStopSec=1 -p LimitNOFILE=65536 -p StandardOutput=append:/opt/bench/m12-node.log -p StandardError=append:/opt/bench/m12-node.log /opt/bench/uc/target/release/examples/m12_gate node --id 0 --bind 10.10.1.10:19100 --instance-dir /opt/bench/m12/n0 --members 0@10.10.1.10:19100,1@10.10.1.11:19100,2@10.10.1.12:19100 --app-id m12-gate --admission-kib 256 --services count
+INFO [systemctl 3.80.127.214] sudo systemctl kill --signal=SIGKILL m12-node 2>/dev/null; sudo systemctl stop m12-node 2>/dev/null; sudo systemctl reset-failed m12-node 2>/dev/null; true
+INFO [systemd-run 3.80.127.214] sudo systemd-run --unit=m12-node --collect -p TimeoutStopSec=1 -p LimitNOFILE=65536 -p StandardOutput=append:/opt/bench/m12-node.log -p StandardError=append:/opt/bench/m12-node.log /opt/bench/uc/target/release/examples/m12_gate node --id 1 --bind 10.10.1.11:19100 --instance-dir /opt/bench/m12/n1 --members 0@10.10.1.10:19100,1@10.10.1.11:19100,2@10.10.1.12:19100 --app-id m12-gate --admission-kib 256 --services count
+INFO [systemctl 3.85.123.227] sudo systemctl kill --signal=SIGKILL m12-node 2>/dev/null; sudo systemctl stop m12-node 2>/dev/null; sudo systemctl reset-failed m12-node 2>/dev/null; true
+INFO [systemd-run 3.85.123.227] sudo systemd-run --unit=m12-node --collect -p TimeoutStopSec=1 -p LimitNOFILE=65536 -p StandardOutput=append:/opt/bench/m12-node.log -p StandardError=append:/opt/bench/m12-node.log /opt/bench/uc/target/release/examples/m12_gate node --id 2 --bind 10.10.1.12:19100 --instance-dir /opt/bench/m12/n2 --members 0@10.10.1.10:19100,1@10.10.1.11:19100,2@10.10.1.12:19100 --app-id m12-gate --admission-kib 256 --services count
+INFO [ssh 54.234.141.82] sudo rm -f /opt/bench/m12-service.log
+INFO [systemctl 54.234.141.82] sudo systemctl kill --signal=SIGKILL m12-service 2>/dev/null; sudo systemctl stop m12-service 2>/dev/null; sudo systemctl reset-failed m12-service 2>/dev/null; true
+INFO [systemd-run 54.234.141.82] sudo systemd-run --unit=m12-service --collect -p TimeoutStopSec=1 -p StandardOutput=append:/opt/bench/m12-service.log -p StandardError=append:/opt/bench/m12-service.log /opt/bench/uc/target/release/examples/m12_gate service --instance-dir /opt/bench/m12/n0 --app-id m12-gate --envelope off --fsm count
+INFO [ssh 3.80.127.214] sudo rm -f /opt/bench/m12-service.log
+INFO [systemctl 3.80.127.214] sudo systemctl kill --signal=SIGKILL m12-service 2>/dev/null; sudo systemctl stop m12-service 2>/dev/null; sudo systemctl reset-failed m12-service 2>/dev/null; true
+INFO [systemd-run 3.80.127.214] sudo systemd-run --unit=m12-service --collect -p TimeoutStopSec=1 -p StandardOutput=append:/opt/bench/m12-service.log -p StandardError=append:/opt/bench/m12-service.log /opt/bench/uc/target/release/examples/m12_gate service --instance-dir /opt/bench/m12/n1 --app-id m12-gate --envelope off --fsm count
+INFO [ssh 3.85.123.227] sudo rm -f /opt/bench/m12-service.log
+INFO [systemctl 3.85.123.227] sudo systemctl kill --signal=SIGKILL m12-service 2>/dev/null; sudo systemctl stop m12-service 2>/dev/null; sudo systemctl reset-failed m12-service 2>/dev/null; true
+INFO [systemd-run 3.85.123.227] sudo systemd-run --unit=m12-service --collect -p TimeoutStopSec=1 -p StandardOutput=append:/opt/bench/m12-service.log -p StandardError=append:/opt/bench/m12-service.log /opt/bench/uc/target/release/examples/m12_gate service --instance-dir /opt/bench/m12/n2 --app-id m12-gate --envelope off --fsm count
+INFO [iface 54.234.141.82] IFACE=$(ip -o route get 8.8.8.8 2>/dev/null | sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -n1); if [ -z "$IFACE" ]; then for i in $(ls /sys/class/net 2>/dev/null | grep -v '^lo$'); do st=$(cat /sys/class/net/$i/operstate 2>/dev/null); if [ "$st" = up ]; then IFACE=$i; break; fi; done; fi; echo IFACE=$IFACE
+INFO arm A2: leader n0 (54.234.141.82), NIC ens5
+
+INFO --- arm A2 inflight=1 rep=1/3 ---
+INFO [ssh 54.234.141.82] sudo /opt/bench/uc/target/release/examples/m12_gate client-direct --instance-dir /opt/bench/m12/n0 --app-id m12-gate --secs 20 --payload 64 --inflight 1 --envelope off --poll-idle spin --warmup-secs 2 --measure-secs 16
+INFO [ssh 54.234.141.82] cat /proc/net/dev  # NIC sample for ens5, ~1 Hz while the client runs
+  [svc inflight=1] m12_gate client-direct: 20 s, payload 64, inflight 1, envelope off, poll-idle Spin
+  [svc inflight=1] 
+  [svc inflight=1] ================ uc2 M12a gate: direct (Engine) ================
+  [svc inflight=1] sends                 : 125597
+  [svc inflight=1] responses             : 125597
+  [svc inflight=1] not FRESH (envelope)  : 0
+  [svc inflight=1] not_leader / retried  : 0 / 0
+  [svc inflight=1] dup / overwritten     : 0 / 0
+  [svc inflight=1] in-flight at end      : 0
+  [svc inflight=1] lost (timeout/error)  : 0
+  [svc inflight=1] elapsed (drain-incl.) : 20.000 s
+  [svc inflight=1] responses/s           : 6280
+  [svc inflight=1] p50                   : 0.112 ms
+  [svc inflight=1] p90                   : 0.218 ms
+  [svc inflight=1] p95                   : 0.221 ms
+  [svc inflight=1] p99                   : 0.326 ms
+  [svc inflight=1] max                   : 8.946 ms
+  [svc inflight=1] (m5 reference bar, informational only: responses/s >= 400000 && p50 <= 1.0 ms — this harness's own bar is the gateway/direct RATIO, printed below)
+  [svc inflight=1] reference bar: FAIL (not this harness's gate)
+  [svc inflight=1] ============================================================================
+  [svc inflight=1] RESULT {"arm":"direct","responses_per_sec":6279.8,"payload":64,"inflight":1,"secs":20,"sends":125597,"responses":125597,"lost":0,"not_fresh":0,"inflight_at_end":0,"p50_ms":0.112,"p90_ms":0.218,"p95_ms":0.221,"p99_ms":0.326,"max_ms":8.946,"elapsed_secs":20.000,"window_rps":6266.8,"window_responses":100269,"fan_in":false,"declared":1}
+SVCTIME-JSON {"inflight": 1, "resp_per_sec": 6279.8, "window_rps": 6266.8, "responses": 125597, "p50_ms": 0.112, "p90_ms": 0.218, "p95_ms": 0.221, "p99_ms": 0.326, "max_ms": 8.946, "lost": 0, "retried": null, "not_leader": null, "bytes_per_command": 659.4840088208099, "pkts_per_command": 6.073988407287622, "arm": "A2", "arm_label": "consistent / unpinned / sleep-apply (drift bracket)", "rep": 1, "leader": 0, "pinned": false, "node_env": {}, "service_env": {}}
+
+INFO --- arm A2 inflight=1 rep=2/3 ---
+INFO [ssh 54.234.141.82] sudo /opt/bench/uc/target/release/examples/m12_gate client-direct --instance-dir /opt/bench/m12/n0 --app-id m12-gate --secs 20 --payload 64 --inflight 1 --envelope off --poll-idle spin --warmup-secs 2 --measure-secs 16
+INFO [ssh 54.234.141.82] cat /proc/net/dev  # NIC sample for ens5, ~1 Hz while the client runs
+  [svc inflight=1] m12_gate client-direct: 20 s, payload 64, inflight 1, envelope off, poll-idle Spin
+  [svc inflight=1] 
+  [svc inflight=1] ================ uc2 M12a gate: direct (Engine) ================
+  [svc inflight=1] sends                 : 127226
+  [svc inflight=1] responses             : 127226
+  [svc inflight=1] not FRESH (envelope)  : 0
+  [svc inflight=1] not_leader / retried  : 0 / 0
+  [svc inflight=1] dup / overwritten     : 0 / 0
+  [svc inflight=1] in-flight at end      : 0
+  [svc inflight=1] lost (timeout/error)  : 0
+  [svc inflight=1] elapsed (drain-incl.) : 20.000 s
+  [svc inflight=1] responses/s           : 6361
+  [svc inflight=1] p50                   : 0.113 ms
+  [svc inflight=1] p90                   : 0.221 ms
+  [svc inflight=1] p95                   : 0.224 ms
+  [svc inflight=1] p99                   : 0.297 ms
+  [svc inflight=1] max                   : 31.048 ms
+  [svc inflight=1] (m5 reference bar, informational only: responses/s >= 400000 && p50 <= 1.0 ms — this harness's own bar is the gateway/direct RATIO, printed below)
+  [svc inflight=1] reference bar: FAIL (not this harness's gate)
+  [svc inflight=1] ============================================================================
+  [svc inflight=1] RESULT {"arm":"direct","responses_per_sec":6361.3,"payload":64,"inflight":1,"secs":20,"sends":127226,"responses":127226,"lost":0,"not_fresh":0,"inflight_at_end":0,"p50_ms":0.113,"p90_ms":0.221,"p95_ms":0.224,"p99_ms":0.297,"max_ms":31.048,"elapsed_secs":20.000,"window_rps":6458.2,"window_responses":103331,"fan_in":false,"declared":1}
+SVCTIME-JSON {"inflight": 1, "resp_per_sec": 6361.3, "window_rps": 6458.2, "responses": 127226, "p50_ms": 0.113, "p90_ms": 0.221, "p95_ms": 0.224, "p99_ms": 0.297, "max_ms": 31.048, "lost": 0, "retried": null, "not_leader": null, "bytes_per_command": 666.9344912152272, "pkts_per_command": 6.142411171701887, "arm": "A2", "arm_label": "consistent / unpinned / sleep-apply (drift bracket)", "rep": 2, "leader": 0, "pinned": false, "node_env": {}, "service_env": {}}
+
+INFO --- arm A2 inflight=1 rep=3/3 ---
+INFO [ssh 54.234.141.82] sudo /opt/bench/uc/target/release/examples/m12_gate client-direct --instance-dir /opt/bench/m12/n0 --app-id m12-gate --secs 20 --payload 64 --inflight 1 --envelope off --poll-idle spin --warmup-secs 2 --measure-secs 16
+INFO [ssh 54.234.141.82] cat /proc/net/dev  # NIC sample for ens5, ~1 Hz while the client runs
+  [svc inflight=1] m12_gate client-direct: 20 s, payload 64, inflight 1, envelope off, poll-idle Spin
+  [svc inflight=1] 
+  [svc inflight=1] ================ uc2 M12a gate: direct (Engine) ================
+  [svc inflight=1] sends                 : 136612
+  [svc inflight=1] responses             : 136612
+  [svc inflight=1] not FRESH (envelope)  : 0
+  [svc inflight=1] not_leader / retried  : 0 / 0
+  [svc inflight=1] dup / overwritten     : 0 / 0
+  [svc inflight=1] in-flight at end      : 0
+  [svc inflight=1] lost (timeout/error)  : 0
+  [svc inflight=1] elapsed (drain-incl.) : 20.000 s
+  [svc inflight=1] responses/s           : 6831
+  [svc inflight=1] p50                   : 0.109 ms
+  [svc inflight=1] p90                   : 0.217 ms
+  [svc inflight=1] p95                   : 0.218 ms
+  [svc inflight=1] p99                   : 0.228 ms
+  [svc inflight=1] max                   : 10.060 ms
+  [svc inflight=1] (m5 reference bar, informational only: responses/s >= 400000 && p50 <= 1.0 ms — this harness's own bar is the gateway/direct RATIO, printed below)
+  [svc inflight=1] reference bar: FAIL (not this harness's gate)
+  [svc inflight=1] ============================================================================
+  [svc inflight=1] RESULT {"arm":"direct","responses_per_sec":6830.6,"payload":64,"inflight":1,"secs":20,"sends":136612,"responses":136612,"lost":0,"not_fresh":0,"inflight_at_end":0,"p50_ms":0.109,"p90_ms":0.217,"p95_ms":0.218,"p99_ms":0.228,"max_ms":10.060,"elapsed_secs":20.000,"window_rps":6820.8,"window_responses":109133,"fan_in":false,"declared":1}
+SVCTIME-JSON {"inflight": 1, "resp_per_sec": 6830.6, "window_rps": 6820.8, "responses": 136612, "p50_ms": 0.109, "p90_ms": 0.217, "p95_ms": 0.218, "p99_ms": 0.228, "max_ms": 10.06, "lost": 0, "retried": null, "not_leader": null, "bytes_per_command": 646.7217642414242, "pkts_per_command": 5.956104989888621, "arm": "A2", "arm_label": "consistent / unpinned / sleep-apply (drift bracket)", "rep": 3, "leader": 0, "pinned": false, "node_env": {}, "service_env": {}}
+
+INFO --- arm A2 inflight=2 rep=1/3 ---
+INFO [ssh 54.234.141.82] sudo /opt/bench/uc/target/release/examples/m12_gate client-direct --instance-dir /opt/bench/m12/n0 --app-id m12-gate --secs 20 --payload 64 --inflight 2 --envelope off --poll-idle spin --warmup-secs 2 --measure-secs 16
+INFO [ssh 54.234.141.82] cat /proc/net/dev  # NIC sample for ens5, ~1 Hz while the client runs
+  [svc inflight=2] m12_gate client-direct: 20 s, payload 64, inflight 2, envelope off, poll-idle Spin
+  [svc inflight=2] 
+  [svc inflight=2] ================ uc2 M12a gate: direct (Engine) ================
+  [svc inflight=2] sends                 : 216789
+  [svc inflight=2] responses             : 216789
+  [svc inflight=2] not FRESH (envelope)  : 0
+  [svc inflight=2] not_leader / retried  : 0 / 0
+  [svc inflight=2] dup / overwritten     : 0 / 0
+  [svc inflight=2] in-flight at end      : 0
+  [svc inflight=2] lost (timeout/error)  : 0
+  [svc inflight=2] elapsed (drain-incl.) : 20.000 s
+  [svc inflight=2] responses/s           : 10839
+  [svc inflight=2] p50                   : 0.217 ms
+  [svc inflight=2] p90                   : 0.221 ms
+  [svc inflight=2] p95                   : 0.233 ms
+  [svc inflight=2] p99                   : 0.329 ms
+  [svc inflight=2] max                   : 19.087 ms
+  [svc inflight=2] (m5 reference bar, informational only: responses/s >= 400000 && p50 <= 1.0 ms — this harness's own bar is the gateway/direct RATIO, printed below)
+  [svc inflight=2] reference bar: FAIL (not this harness's gate)
+  [svc inflight=2] ============================================================================
+  [svc inflight=2] RESULT {"arm":"direct","responses_per_sec":10839.4,"payload":64,"inflight":2,"secs":20,"sends":216789,"responses":216789,"lost":0,"not_fresh":0,"inflight_at_end":0,"p50_ms":0.217,"p90_ms":0.221,"p95_ms":0.233,"p99_ms":0.329,"max_ms":19.087,"elapsed_secs":20.000,"window_rps":10850.1,"window_responses":173601,"fan_in":false,"declared":1}
+SVCTIME-JSON {"inflight": 2, "resp_per_sec": 10839.4, "window_rps": 10850.1, "responses": 216789, "p50_ms": 0.217, "p90_ms": 0.221, "p95_ms": 0.233, "p99_ms": 0.329, "max_ms": 19.087, "lost": 0, "retried": null, "not_leader": null, "bytes_per_command": 561.9451490275698, "pkts_per_command": 4.604949885757895, "arm": "A2", "arm_label": "consistent / unpinned / sleep-apply (drift bracket)", "rep": 1, "leader": 0, "pinned": false, "node_env": {}, "service_env": {}}
+
+INFO --- arm A2 inflight=2 rep=2/3 ---
+INFO [ssh 54.234.141.82] sudo /opt/bench/uc/target/release/examples/m12_gate client-direct --instance-dir /opt/bench/m12/n0 --app-id m12-gate --secs 20 --payload 64 --inflight 2 --envelope off --poll-idle spin --warmup-secs 2 --measure-secs 16
+INFO [ssh 54.234.141.82] cat /proc/net/dev  # NIC sample for ens5, ~1 Hz while the client runs
+  [svc inflight=2] m12_gate client-direct: 20 s, payload 64, inflight 2, envelope off, poll-idle Spin
+  [svc inflight=2] 
+  [svc inflight=2] ================ uc2 M12a gate: direct (Engine) ================
+  [svc inflight=2] sends                 : 212327
+  [svc inflight=2] responses             : 212327
+  [svc inflight=2] not FRESH (envelope)  : 0
+  [svc inflight=2] not_leader / retried  : 0 / 0
+  [svc inflight=2] dup / overwritten     : 0 / 0
+  [svc inflight=2] in-flight at end      : 0
+  [svc inflight=2] lost (timeout/error)  : 0
+  [svc inflight=2] elapsed (drain-incl.) : 20.000 s
+  [svc inflight=2] responses/s           : 10616
+  [svc inflight=2] p50                   : 0.217 ms
+  [svc inflight=2] p90                   : 0.223 ms
+  [svc inflight=2] p95                   : 0.235 ms
+  [svc inflight=2] p99                   : 0.329 ms
+  [svc inflight=2] max                   : 19.366 ms
+  [svc inflight=2] (m5 reference bar, informational only: responses/s >= 400000 && p50 <= 1.0 ms — this harness's own bar is the gateway/direct RATIO, printed below)
+  [svc inflight=2] reference bar: FAIL (not this harness's gate)
+  [svc inflight=2] ============================================================================
+  [svc inflight=2] RESULT {"arm":"direct","responses_per_sec":10616.3,"payload":64,"inflight":2,"secs":20,"sends":212327,"responses":212327,"lost":0,"not_fresh":0,"inflight_at_end":0,"p50_ms":0.217,"p90_ms":0.223,"p95_ms":0.235,"p99_ms":0.329,"max_ms":19.366,"elapsed_secs":20.000,"window_rps":10737.9,"window_responses":171806,"fan_in":false,"declared":1}
+SVCTIME-JSON {"inflight": 2, "resp_per_sec": 10616.3, "window_rps": 10737.9, "responses": 212327, "p50_ms": 0.217, "p90_ms": 0.223, "p95_ms": 0.235, "p99_ms": 0.329, "max_ms": 19.366, "lost": 0, "retried": null, "not_leader": null, "bytes_per_command": 564.8247007662803, "pkts_per_command": 4.617172333223938, "arm": "A2", "arm_label": "consistent / unpinned / sleep-apply (drift bracket)", "rep": 2, "leader": 0, "pinned": false, "node_env": {}, "service_env": {}}
+
+INFO --- arm A2 inflight=2 rep=3/3 ---
+INFO [ssh 54.234.141.82] sudo /opt/bench/uc/target/release/examples/m12_gate client-direct --instance-dir /opt/bench/m12/n0 --app-id m12-gate --secs 20 --payload 64 --inflight 2 --envelope off --poll-idle spin --warmup-secs 2 --measure-secs 16
+INFO [ssh 54.234.141.82] cat /proc/net/dev  # NIC sample for ens5, ~1 Hz while the client runs
+  [svc inflight=2] m12_gate client-direct: 20 s, payload 64, inflight 2, envelope off, poll-idle Spin
+  [svc inflight=2] 
+  [svc inflight=2] ================ uc2 M12a gate: direct (Engine) ================
+  [svc inflight=2] sends                 : 220096
+  [svc inflight=2] responses             : 220096
+  [svc inflight=2] not FRESH (envelope)  : 0
+  [svc inflight=2] not_leader / retried  : 0 / 0
+  [svc inflight=2] dup / overwritten     : 0 / 0
+  [svc inflight=2] in-flight at end      : 0
+  [svc inflight=2] lost (timeout/error)  : 0
+  [svc inflight=2] elapsed (drain-incl.) : 20.000 s
+  [svc inflight=2] responses/s           : 11005
+  [svc inflight=2] p50                   : 0.216 ms
+  [svc inflight=2] p90                   : 0.226 ms
+  [svc inflight=2] p95                   : 0.231 ms
+  [svc inflight=2] p99                   : 0.326 ms
+  [svc inflight=2] max                   : 6.337 ms
+  [svc inflight=2] (m5 reference bar, informational only: responses/s >= 400000 && p50 <= 1.0 ms — this harness's own bar is the gateway/direct RATIO, printed below)
+  [svc inflight=2] reference bar: FAIL (not this harness's gate)
+  [svc inflight=2] ============================================================================
+  [svc inflight=2] RESULT {"arm":"direct","responses_per_sec":11004.7,"payload":64,"inflight":2,"secs":20,"sends":220096,"responses":220096,"lost":0,"not_fresh":0,"inflight_at_end":0,"p50_ms":0.216,"p90_ms":0.226,"p95_ms":0.231,"p99_ms":0.326,"max_ms":6.337,"elapsed_secs":20.000,"window_rps":10928.4,"window_responses":174854,"fan_in":false,"declared":1}
+SVCTIME-JSON {"inflight": 2, "resp_per_sec": 11004.7, "window_rps": 10928.4, "responses": 220096, "p50_ms": 0.216, "p90_ms": 0.226, "p95_ms": 0.231, "p99_ms": 0.326, "max_ms": 6.337, "lost": 0, "retried": null, "not_leader": null, "bytes_per_command": 529.3668107368703, "pkts_per_command": 4.195917967681111, "arm": "A2", "arm_label": "consistent / unpinned / sleep-apply (drift bracket)", "rep": 3, "leader": 0, "pinned": false, "node_env": {}, "service_env": {}}
+
+INFO --- arm A2 inflight=4 rep=1/1 ---
+INFO [ssh 54.234.141.82] sudo /opt/bench/uc/target/release/examples/m12_gate client-direct --instance-dir /opt/bench/m12/n0 --app-id m12-gate --secs 20 --payload 64 --inflight 4 --envelope off --poll-idle spin --warmup-secs 2 --measure-secs 16
+INFO [ssh 54.234.141.82] cat /proc/net/dev  # NIC sample for ens5, ~1 Hz while the client runs
+  [svc inflight=4] m12_gate client-direct: 20 s, payload 64, inflight 4, envelope off, poll-idle Spin
+  [svc inflight=4] 
+  [svc inflight=4] ================ uc2 M12a gate: direct (Engine) ================
+  [svc inflight=4] sends                 : 401877
+  [svc inflight=4] responses             : 401877
+  [svc inflight=4] not FRESH (envelope)  : 0
+  [svc inflight=4] not_leader / retried  : 0 / 0
+  [svc inflight=4] dup / overwritten     : 0 / 0
+  [svc inflight=4] in-flight at end      : 0
+  [svc inflight=4] lost (timeout/error)  : 0
+  [svc inflight=4] elapsed (drain-incl.) : 20.000 s
+  [svc inflight=4] responses/s           : 20094
+  [svc inflight=4] p50                   : 0.218 ms
+  [svc inflight=4] p90                   : 0.228 ms
+  [svc inflight=4] p95                   : 0.234 ms
+  [svc inflight=4] p99                   : 0.332 ms
+  [svc inflight=4] max                   : 5.992 ms
+  [svc inflight=4] (m5 reference bar, informational only: responses/s >= 400000 && p50 <= 1.0 ms — this harness's own bar is the gateway/direct RATIO, printed below)
+  [svc inflight=4] reference bar: FAIL (not this harness's gate)
+  [svc inflight=4] ============================================================================
+  [svc inflight=4] RESULT {"arm":"direct","responses_per_sec":20093.7,"payload":64,"inflight":4,"secs":20,"sends":401877,"responses":401877,"lost":0,"not_fresh":0,"inflight_at_end":0,"p50_ms":0.218,"p90_ms":0.228,"p95_ms":0.234,"p99_ms":0.332,"max_ms":5.992,"elapsed_secs":20.000,"window_rps":20003.2,"window_responses":320052,"fan_in":false,"declared":1}
+SVCTIME-JSON {"inflight": 4, "resp_per_sec": 20093.7, "window_rps": 20003.2, "responses": 401877, "p50_ms": 0.218, "p90_ms": 0.228, "p95_ms": 0.234, "p99_ms": 0.332, "max_ms": 5.992, "lost": 0, "retried": null, "not_leader": null, "bytes_per_command": 471.2960857884237, "pkts_per_command": 3.2228694473948063, "arm": "A2", "arm_label": "consistent / unpinned / sleep-apply (drift bracket)", "rep": 1, "leader": 0, "pinned": false, "node_env": {}, "service_env": {}}
+
+INFO --- arm A2 inflight=8 rep=1/1 ---
+INFO [ssh 54.234.141.82] sudo /opt/bench/uc/target/release/examples/m12_gate client-direct --instance-dir /opt/bench/m12/n0 --app-id m12-gate --secs 20 --payload 64 --inflight 8 --envelope off --poll-idle spin --warmup-secs 2 --measure-secs 16
+INFO [ssh 54.234.141.82] cat /proc/net/dev  # NIC sample for ens5, ~1 Hz while the client runs
+  [svc inflight=8] m12_gate client-direct: 20 s, payload 64, inflight 8, envelope off, poll-idle Spin
+  [svc inflight=8] 
+  [svc inflight=8] ================ uc2 M12a gate: direct (Engine) ================
+  [svc inflight=8] sends                 : 697348
+  [svc inflight=8] responses             : 697348
+  [svc inflight=8] not FRESH (envelope)  : 0
+  [svc inflight=8] not_leader / retried  : 0 / 0
+  [svc inflight=8] dup / overwritten     : 0 / 0
+  [svc inflight=8] in-flight at end      : 0
+  [svc inflight=8] lost (timeout/error)  : 0
+  [svc inflight=8] elapsed (drain-incl.) : 20.000 s
+  [svc inflight=8] responses/s           : 34867
+  [svc inflight=8] p50                   : 0.220 ms
+  [svc inflight=8] p90                   : 0.328 ms
+  [svc inflight=8] p95                   : 0.331 ms
+  [svc inflight=8] p99                   : 0.342 ms
+  [svc inflight=8] max                   : 22.774 ms
+  [svc inflight=8] (m5 reference bar, informational only: responses/s >= 400000 && p50 <= 1.0 ms — this harness's own bar is the gateway/direct RATIO, printed below)
+  [svc inflight=8] reference bar: FAIL (not this harness's gate)
+  [svc inflight=8] ============================================================================
+  [svc inflight=8] RESULT {"arm":"direct","responses_per_sec":34867.2,"payload":64,"inflight":8,"secs":20,"sends":697348,"responses":697348,"lost":0,"not_fresh":0,"inflight_at_end":0,"p50_ms":0.220,"p90_ms":0.328,"p95_ms":0.331,"p99_ms":0.342,"max_ms":22.774,"elapsed_secs":20.000,"window_rps":34814.6,"window_responses":557033,"fan_in":false,"declared":1}
+SVCTIME-JSON {"inflight": 8, "resp_per_sec": 34867.2, "window_rps": 34814.6, "responses": 697348, "p50_ms": 0.22, "p90_ms": 0.328, "p95_ms": 0.331, "p99_ms": 0.342, "max_ms": 22.774, "lost": 0, "retried": null, "not_leader": null, "bytes_per_command": 387.03159479444173, "pkts_per_command": 1.97084131672674, "arm": "A2", "arm_label": "consistent / unpinned / sleep-apply (drift bracket)", "rep": 1, "leader": 0, "pinned": false, "node_env": {}, "service_env": {}}
+
+INFO --- arm A2 inflight=16 rep=1/1 ---
+INFO [ssh 54.234.141.82] sudo /opt/bench/uc/target/release/examples/m12_gate client-direct --instance-dir /opt/bench/m12/n0 --app-id m12-gate --secs 20 --payload 64 --inflight 16 --envelope off --poll-idle spin --warmup-secs 2 --measure-secs 16
+INFO [ssh 54.234.141.82] cat /proc/net/dev  # NIC sample for ens5, ~1 Hz while the client runs
+  [svc inflight=16] m12_gate client-direct: 20 s, payload 64, inflight 16, envelope off, poll-idle Spin
+  [svc inflight=16] 
+  [svc inflight=16] ================ uc2 M12a gate: direct (Engine) ================
+  [svc inflight=16] sends                 : 1218504
+  [svc inflight=16] responses             : 1218504
+  [svc inflight=16] not FRESH (envelope)  : 0
+  [svc inflight=16] not_leader / retried  : 0 / 0
+  [svc inflight=16] dup / overwritten     : 0 / 0
+  [svc inflight=16] in-flight at end      : 0
+  [svc inflight=16] lost (timeout/error)  : 0
+  [svc inflight=16] elapsed (drain-incl.) : 20.000 s
+  [svc inflight=16] responses/s           : 60925
+  [svc inflight=16] p50                   : 0.229 ms
+  [svc inflight=16] p90                   : 0.335 ms
+  [svc inflight=16] p95                   : 0.340 ms
+  [svc inflight=16] p99                   : 0.393 ms
+  [svc inflight=16] max                   : 24.527 ms
+  [svc inflight=16] (m5 reference bar, informational only: responses/s >= 400000 && p50 <= 1.0 ms — this harness's own bar is the gateway/direct RATIO, printed below)
+  [svc inflight=16] reference bar: FAIL (not this harness's gate)
+  [svc inflight=16] ============================================================================
+  [svc inflight=16] RESULT {"arm":"direct","responses_per_sec":60924.7,"payload":64,"inflight":16,"secs":20,"sends":1218504,"responses":1218504,"lost":0,"not_fresh":0,"inflight_at_end":0,"p50_ms":0.229,"p90_ms":0.335,"p95_ms":0.340,"p99_ms":0.393,"max_ms":24.527,"elapsed_secs":20.000,"window_rps":60884.2,"window_responses":974148,"fan_in":false,"declared":1}
+SVCTIME-JSON {"inflight": 16, "resp_per_sec": 60924.7, "window_rps": 60884.2, "responses": 1218504, "p50_ms": 0.229, "p90_ms": 0.335, "p95_ms": 0.34, "p99_ms": 0.393, "max_ms": 24.527, "lost": 0, "retried": null, "not_leader": null, "bytes_per_command": 341.38523674160825, "pkts_per_command": 1.2556695980421324, "arm": "A2", "arm_label": "consistent / unpinned / sleep-apply (drift bracket)", "rep": 1, "leader": 0, "pinned": false, "node_env": {}, "service_env": {}}
+
+INFO --- arm A2 inflight=64 rep=1/1 ---
+INFO [ssh 54.234.141.82] sudo /opt/bench/uc/target/release/examples/m12_gate client-direct --instance-dir /opt/bench/m12/n0 --app-id m12-gate --secs 20 --payload 64 --inflight 64 --envelope off --poll-idle spin --warmup-secs 2 --measure-secs 16
+INFO [ssh 54.234.141.82] cat /proc/net/dev  # NIC sample for ens5, ~1 Hz while the client runs
+  [svc inflight=64] m12_gate client-direct: 20 s, payload 64, inflight 64, envelope off, poll-idle Spin
+  [svc inflight=64] 
+  [svc inflight=64] ================ uc2 M12a gate: direct (Engine) ================
+  [svc inflight=64] sends                 : 3579170
+  [svc inflight=64] responses             : 3579170
+  [svc inflight=64] not FRESH (envelope)  : 0
+  [svc inflight=64] not_leader / retried  : 0 / 0
+  [svc inflight=64] dup / overwritten     : 0 / 0
+  [svc inflight=64] in-flight at end      : 0
+  [svc inflight=64] lost (timeout/error)  : 0
+  [svc inflight=64] elapsed (drain-incl.) : 20.000 s
+  [svc inflight=64] responses/s           : 178956
+  [svc inflight=64] p50                   : 0.352 ms
+  [svc inflight=64] p90                   : 0.373 ms
+  [svc inflight=64] p95                   : 0.413 ms
+  [svc inflight=64] p99                   : 0.492 ms
+  [svc inflight=64] max                   : 13.296 ms
+  [svc inflight=64] (m5 reference bar, informational only: responses/s >= 400000 && p50 <= 1.0 ms — this harness's own bar is the gateway/direct RATIO, printed below)
+  [svc inflight=64] reference bar: FAIL (not this harness's gate)
+  [svc inflight=64] ============================================================================
+  [svc inflight=64] RESULT {"arm":"direct","responses_per_sec":178956.3,"payload":64,"inflight":64,"secs":20,"sends":3579170,"responses":3579170,"lost":0,"not_fresh":0,"inflight_at_end":0,"p50_ms":0.352,"p90_ms":0.373,"p95_ms":0.413,"p99_ms":0.492,"max_ms":13.296,"elapsed_secs":20.000,"window_rps":178404.1,"window_responses":2854466,"fan_in":false,"declared":1}
+SVCTIME-JSON {"inflight": 64, "resp_per_sec": 178956.3, "window_rps": 178404.1, "responses": 3579170, "p50_ms": 0.352, "p90_ms": 0.373, "p95_ms": 0.413, "p99_ms": 0.492, "max_ms": 13.296, "lost": 0, "retried": null, "not_leader": null, "bytes_per_command": 288.0036756050125, "pkts_per_command": 0.43052862944260495, "arm": "A2", "arm_label": "consistent / unpinned / sleep-apply (drift bracket)", "rep": 1, "leader": 0, "pinned": false, "node_env": {}, "service_env": {}}
+
+INFO --- arm A2 inflight=256 rep=1/1 ---
+INFO [ssh 54.234.141.82] sudo /opt/bench/uc/target/release/examples/m12_gate client-direct --instance-dir /opt/bench/m12/n0 --app-id m12-gate --secs 20 --payload 64 --inflight 256 --envelope off --poll-idle spin --warmup-secs 2 --measure-secs 16
+INFO [ssh 54.234.141.82] cat /proc/net/dev  # NIC sample for ens5, ~1 Hz while the client runs
+  [svc inflight=256] m12_gate client-direct: 20 s, payload 64, inflight 256, envelope off, poll-idle Spin
+  [svc inflight=256] 
+  [svc inflight=256] ================ uc2 M12a gate: direct (Engine) ================
+  [svc inflight=256] sends                 : 11843998
+  [svc inflight=256] responses             : 11843998
+  [svc inflight=256] not FRESH (envelope)  : 0
+  [svc inflight=256] not_leader / retried  : 0 / 0
+  [svc inflight=256] dup / overwritten     : 0 / 0
+  [svc inflight=256] in-flight at end      : 0
+  [svc inflight=256] lost (timeout/error)  : 0
+  [svc inflight=256] elapsed (drain-incl.) : 20.000 s
+  [svc inflight=256] responses/s           : 592191
+  [svc inflight=256] p50                   : 0.416 ms
+  [svc inflight=256] p90                   : 0.497 ms
+  [svc inflight=256] p95                   : 0.533 ms
+  [svc inflight=256] p99                   : 0.899 ms
+  [svc inflight=256] max                   : 10.117 ms
+  [svc inflight=256] (m5 reference bar, informational only: responses/s >= 400000 && p50 <= 1.0 ms — this harness's own bar is the gateway/direct RATIO, printed below)
+  [svc inflight=256] reference bar: PASS
+  [svc inflight=256] ============================================================================
+  [svc inflight=256] RESULT {"arm":"direct","responses_per_sec":592191.1,"payload":64,"inflight":256,"secs":20,"sends":11843998,"responses":11843998,"lost":0,"not_fresh":0,"inflight_at_end":0,"p50_ms":0.416,"p90_ms":0.497,"p95_ms":0.533,"p99_ms":0.899,"max_ms":10.117,"elapsed_secs":20.000,"window_rps":605814.7,"window_responses":9693035,"fan_in":false,"declared":1}
+SVCTIME-JSON {"inflight": 256, "resp_per_sec": 592191.1, "window_rps": 605814.7, "responses": 11843998, "p50_ms": 0.416, "p90_ms": 0.497, "p95_ms": 0.533, "p99_ms": 0.899, "max_ms": 10.117, "lost": 0, "retried": null, "not_leader": null, "bytes_per_command": 276.4038898422979, "pkts_per_command": 0.21053733572165836, "arm": "A2", "arm_label": "consistent / unpinned / sleep-apply (drift bracket)", "rep": 1, "leader": 0, "pinned": false, "node_env": {}, "service_env": {}}
+INFO [systemctl 54.234.141.82] sudo systemctl kill --signal=SIGKILL m12-edge 2>/dev/null; sudo systemctl stop m12-edge 2>/dev/null; sudo systemctl reset-failed m12-edge 2>/dev/null; true
+INFO [systemctl 54.234.141.82] sudo systemctl kill --signal=SIGKILL m12-service 2>/dev/null; sudo systemctl stop m12-service 2>/dev/null; sudo systemctl reset-failed m12-service 2>/dev/null; true
+INFO [systemctl 54.234.141.82] sudo systemctl kill --signal=SIGKILL m12-node 2>/dev/null; sudo systemctl stop m12-node 2>/dev/null; sudo systemctl reset-failed m12-node 2>/dev/null; true
+INFO [systemctl 3.80.127.214] sudo systemctl kill --signal=SIGKILL m12-edge 2>/dev/null; sudo systemctl stop m12-edge 2>/dev/null; sudo systemctl reset-failed m12-edge 2>/dev/null; true
+INFO [systemctl 3.80.127.214] sudo systemctl kill --signal=SIGKILL m12-service 2>/dev/null; sudo systemctl stop m12-service 2>/dev/null; sudo systemctl reset-failed m12-service 2>/dev/null; true
+INFO [systemctl 3.80.127.214] sudo systemctl kill --signal=SIGKILL m12-node 2>/dev/null; sudo systemctl stop m12-node 2>/dev/null; sudo systemctl reset-failed m12-node 2>/dev/null; true
+INFO [systemctl 3.85.123.227] sudo systemctl kill --signal=SIGKILL m12-edge 2>/dev/null; sudo systemctl stop m12-edge 2>/dev/null; sudo systemctl reset-failed m12-edge 2>/dev/null; true
+INFO [systemctl 3.85.123.227] sudo systemctl kill --signal=SIGKILL m12-service 2>/dev/null; sudo systemctl stop m12-service 2>/dev/null; sudo systemctl reset-failed m12-service 2>/dev/null; true
+INFO [systemctl 3.85.123.227] sudo systemctl kill --signal=SIGKILL m12-node 2>/dev/null; sudo systemctl stop m12-node 2>/dev/null; sudo systemctl reset-failed m12-node 2>/dev/null; true
+INFO [systemctl 54.234.141.82] sudo systemctl kill --signal=SIGKILL m12-edge 2>/dev/null; sudo systemctl stop m12-edge 2>/dev/null; sudo systemctl reset-failed m12-edge 2>/dev/null; true
+INFO [systemctl 54.234.141.82] sudo systemctl kill --signal=SIGKILL m12-service 2>/dev/null; sudo systemctl stop m12-service 2>/dev/null; sudo systemctl reset-failed m12-service 2>/dev/null; true
+INFO [systemctl 54.234.141.82] sudo systemctl kill --signal=SIGKILL m12-node 2>/dev/null; sudo systemctl stop m12-node 2>/dev/null; sudo systemctl reset-failed m12-node 2>/dev/null; true
+INFO [systemctl 3.80.127.214] sudo systemctl kill --signal=SIGKILL m12-edge 2>/dev/null; sudo systemctl stop m12-edge 2>/dev/null; sudo systemctl reset-failed m12-edge 2>/dev/null; true
+INFO [systemctl 3.80.127.214] sudo systemctl kill --signal=SIGKILL m12-service 2>/dev/null; sudo systemctl stop m12-service 2>/dev/null; sudo systemctl reset-failed m12-service 2>/dev/null; true
+INFO [systemctl 3.80.127.214] sudo systemctl kill --signal=SIGKILL m12-node 2>/dev/null; sudo systemctl stop m12-node 2>/dev/null; sudo systemctl reset-failed m12-node 2>/dev/null; true
+INFO [systemctl 3.85.123.227] sudo systemctl kill --signal=SIGKILL m12-edge 2>/dev/null; sudo systemctl stop m12-edge 2>/dev/null; sudo systemctl reset-failed m12-edge 2>/dev/null; true
+INFO [systemctl 3.85.123.227] sudo systemctl kill --signal=SIGKILL m12-service 2>/dev/null; sudo systemctl stop m12-service 2>/dev/null; sudo systemctl reset-failed m12-service 2>/dev/null; true
+INFO [systemctl 3.85.123.227] sudo systemctl kill --signal=SIGKILL m12-node 2>/dev/null; sudo systemctl stop m12-node 2>/dev/null; sudo systemctl reset-failed m12-node 2>/dev/null; true
+INFO [systemctl 3.80.127.214] sudo systemctl kill --signal=SIGKILL m12-rttsrv 2>/dev/null; sudo systemctl stop m12-rttsrv 2>/dev/null; sudo systemctl reset-failed m12-rttsrv 2>/dev/null; true
+INFO [systemd-run 3.80.127.214] sudo systemd-run --unit=m12-rttsrv --collect -p TimeoutStopSec=1 --setenv=RTT_MODE=server --setenv=RTT_UDP_PORT=9101 -p StandardOutput=append:/opt/bench/m12-rttsrv.log -p StandardError=append:/opt/bench/m12-rttsrv.log /opt/bench/rtt-udp-mini/target/release/network-rtt-udp
+INFO [rtt 54.234.141.82] sudo env RTT_MODE=client RTT_HOST=10.10.1.11 RTT_UDP_PORT=9101 RTT_ITERATIONS=200000 RTT_WARMUP=20000 RTT_PAYLOAD_BYTES=64 /opt/bench/rtt-udp-mini/target/release/network-rtt-udp
+  [rtt-after] {"language":"rust","focus_area":"network-rtt","experiment":"udp","metric":"rtt_p50","value":33264,"unit":"ns","samples":200000}
+  [rtt-after] {"language":"rust","focus_area":"network-rtt","experiment":"udp","metric":"rtt_p99","value":40860,"unit":"ns","samples":200000}
+  [rtt-after] {"language":"rust","focus_area":"network-rtt","experiment":"udp","metric":"rtt_mean","value":33608.96394,"unit":"ns","samples":200000}
+INFO [systemctl 3.80.127.214] sudo systemctl kill --signal=SIGKILL m12-rttsrv 2>/dev/null; sudo systemctl stop m12-rttsrv 2>/dev/null; sudo systemctl reset-failed m12-rttsrv 2>/dev/null; true
+RTT-JSON {"when": "after", "p50_ns": 33264, "samples": 200000, "p99_ns": 40860, "mean_ns": 33608.96394}
+
+
+SERVICE-TIME REPORT — closed-loop round trip through commit + apply + response
+(p50/p90/p99 in ms; inflight 1 = service time, no queueing)
+
+  arm inflight rep     resp/s      p50      p90      p99      max  lost   B/cmd  pkt/cmd
+    A        1   1       5762    0.209    0.222    0.328    8.430     0   661.7    6.095
+    A        1   2       6037    0.123    0.219    0.289   17.842     0   652.7    6.011
+    A        1   3       6149    0.117    0.218    0.325   17.154     0   632.1    5.822
+    A        2   1      10599    0.216    0.222    0.329   22.020     0   559.4    4.699
+    A        2   2      10226    0.216    0.222    0.341   23.167     0   590.2    4.946
+    A        2   3      10208    0.216    0.225    0.542    7.516     0   573.5    4.845
+    A        4   1      17884    0.220    0.234    0.554    6.541     0   529.1    4.000
+    A        8   1      34467    0.220    0.321    0.354    6.185     0   404.5    2.245
+    A       16   1      60016    0.232    0.341    0.408   24.904     0   349.9    1.338
+    A       64   1     174253    0.355    0.385    0.518   14.565     0   281.1    0.440
+    A      256   1     572232    0.428    0.502    1.203   73.400     0   273.1    0.245
+    B        1   1       8131    0.109    0.187    0.222    3.164     0   657.7    6.057
+    B        1   2       7979    0.109    0.209    0.225   17.138     0   640.4    5.898
+    B        1   3       8048    0.109    0.194    0.223   21.463     0   652.4    6.008
+    B        2   1      13356    0.111    0.217    0.286   17.678     0   548.2    4.427
+    B        2   2      13398    0.112    0.216    0.229   17.531     0   541.1    4.341
+    B        2   3      13537    0.111    0.216    0.229   14.107     0   537.2    4.217
+    B        4   1      22757    0.213    0.220    0.324    5.554     0   457.4    3.058
+    B        8   1      37801    0.217    0.229    0.330   10.641     0   399.0    2.159
+    B       16   1      67457    0.222    0.325    0.439   19.333     0   337.0    1.154
+    B       64   1     191908    0.345    0.358    0.471   13.083     0   286.9    0.416
+    B      256   1     644701    0.358    0.450    0.565   11.944     0   268.3    0.221
+    C        1   1       9028    0.105    0.117    0.204   13.353     0   659.7    6.075
+    C        1   2       8973    0.105    0.121    0.175   21.086     0   652.0    6.003
+    C        1   3       8851    0.105    0.117    0.176   20.709     0   655.0    6.031
+    C        2   1      15423    0.118    0.160    0.218   20.005     0   606.8    5.473
+    C        2   2      15653    0.116    0.162    0.219   13.492     0   621.4    5.490
+    C        2   3      15237    0.118    0.162    0.225   10.404     0   644.1    5.881
+    C        4   1      26879    0.145    0.186    0.249   10.338     0   513.5    3.972
+    C        8   1      47162    0.155    0.209    0.268   22.364     0   407.8    2.364
+    C       16   1      85042    0.175    0.234    0.285   11.469     0   342.6    1.280
+    C       64   1     210533    0.288    0.312    0.414   14.410     0   276.7    0.305
+    C      256   1     707095    0.335    0.378    0.496   14.418     0   266.6    0.215
+    D        1   1      12098    0.077    0.098    0.131   11.919     0   655.9    6.038
+    D        1   2      11674    0.076    0.099    0.159   14.909     0   664.0    6.113
+    D        1   3      11808    0.078    0.098    0.150   37.487     0   646.7    5.954
+    D        2   1      20324    0.096    0.114    0.185   18.711     0   543.7    4.322
+    D        2   2      20393    0.097    0.114    0.181   15.696     0   565.9    4.655
+    D        2   3      20879    0.096    0.113    0.167   13.976     0   562.8    4.634
+    D        4   1      37852    0.098    0.132    0.182   12.886     0   467.3    3.288
+    D        8   1      69864    0.104    0.147    0.207   10.191     0   385.2    2.000
+    D       16   1     129633    0.113    0.153    0.218   10.207     0   332.2    1.144
+    D       64   1     396764    0.147    0.216    0.308    8.204     0   284.1    0.395
+    D      256   1    1004861    0.217    0.351    0.462   10.346     0   276.9    0.163
+   A2        1   1       6280    0.112    0.218    0.326    8.946     0   659.5    6.074
+   A2        1   2       6361    0.113    0.221    0.297   31.048     0   666.9    6.142
+   A2        1   3       6831    0.109    0.217    0.228   10.060     0   646.7    5.956
+   A2        2   1      10839    0.217    0.221    0.329   19.087     0   561.9    4.605
+   A2        2   2      10616    0.217    0.223    0.329   19.366     0   564.8    4.617
+   A2        2   3      11005    0.216    0.226    0.326    6.337     0   529.4    4.196
+   A2        4   1      20094    0.218    0.228    0.332    5.992     0   471.3    3.223
+   A2        8   1      34867    0.220    0.328    0.342   22.774     0   387.0    1.971
+   A2       16   1      60925    0.229    0.335    0.393   24.527     0   341.4    1.256
+   A2       64   1     178956    0.352    0.373    0.492   13.296     0   288.0    0.431
+   A2      256   1     592191    0.416    0.497    0.899   10.117     0   276.4    0.211
+
+SERVICE TIME AT INFLIGHT 1 (median of reps, µs):
+    A consistent / unpinned / sleep-apply                  p50    123.0  p90    219.0  p99    325.0  (n=3, p50 spread 92.0)
+    B consistent / pinned / sleep-apply                    p50    109.0  p90    194.0  p99    223.0  (n=3, p50 spread 0.0)
+    C consistent / pinned / spin-apply                     p50    105.0  p90    117.0  p99    176.0  (n=3, p50 spread 0.0)
+    D eventual(1ms) / pinned / spin-apply                  p50     77.0  p90     98.0  p99    150.0  (n=3, p50 spread 2.0)
+   A2 consistent / unpinned / sleep-apply (drift bracket)  p50    112.0  p90    218.0  p99    297.0  (n=3, p50 spread 4.0)
+
+SUBTRACTIONS (p50, µs):
+  A−B =     14.0 µs   (placement / SMT-sibling noise)
+  B−C =      4.0 µs   (the service apply agent's 50 µs idle sleep)
+  C−D =     28.0 µs   (the quorum fdatasync on the commit path)
+  A−A2 =     11.0 µs   (drift bracket — same arm, first vs last)
+
+RAW UDP ROUND TRIP, same fleet (network-rtt-udp, 64 B, one in flight, unpinned):
+  before: p50    33.5 µs  p99    43.3 µs  mean    33.9 µs  (n=200000)
+   after: p50    33.3 µs  p99    40.9 µs  mean    33.6 µs  (n=200000)
+
+  Wire share, upper bound: one raw round trip is 33.5 µs of arm D's 77.0 µs p50 = 44 %. The commit path crosses the wire once per position (DATA out, APPEND_POSITION back), so a faster transport can recover at most that share; what splits the rest is the net-decomp brief's WIRE(P) instrument, not this run.
+
+INFO wrote /home/claude/ultima/ultima_cluster/bench-out/service-time-2026-09-16/points.jsonl and summary.json
+exit=0

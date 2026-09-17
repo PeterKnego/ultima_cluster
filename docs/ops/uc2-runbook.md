@@ -52,6 +52,31 @@ verify rather than a build:
   faulted-exit/restart contract when a node's instance restarts underneath a
   running gateway.
 
+### Placing the processes on cores
+
+Two deploy-time choices move the commit path's own latency more than any
+transport setting, both measured closed-loop at inflight 1 on 8-vCPU
+`c6id.2xlarge` hosts
+([the service-time record](../benchmarks/uc2-service-time-2026-09-16.md)):
+
+- **Pin the node and the service to disjoint physical cores.** Unpinned,
+  the shipped path read p50 123 µs with a 92 µs spread across repeats;
+  pinned, 109 µs with no spread, and 41 µs less mean. On an 8-vCPU host
+  whose SMT siblings are `(0,4) (1,5) (2,6) (3,7)`, the rig's layout is the
+  node on `0,1,4,5` (both threads of two cores, one per busy-spin agent
+  pair), the service on `2`, and clients or a gateway on `3,7` — as
+  `CPUAffinity=` on the systemd units. Check the sibling map with
+  `lscpu -p=CPU,CORE` first; a wrong map pins agents onto each other's
+  siblings and costs throughput.
+- **Let the service's apply agent spin instead of sleep.** The apply
+  agent's default idle is a 50 µs sleep, which at low load lands on about
+  half of all responses as a second mode ~100 µs above the first.
+  `UC2_APPLY_IDLE=spin` in the service's environment removes it (p90 194 →
+  117 µs on that record) for one pegged core per service; `yield` is the
+  cheaper middle. Set it per service process, not cluster-wide — it is a
+  capacity decision for that host. See
+  [the environment switches](../reference/configuration.md#environment-switches).
+
 ## Observing a cluster
 
 - [Monitor a cluster](../how-to/monitor-a-cluster.md) — enabling

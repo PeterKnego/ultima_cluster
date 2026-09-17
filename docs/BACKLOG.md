@@ -288,8 +288,48 @@ All framed by the docs as characterisation, not defects:
   §10 "Out of scope / deferred"), the Rung B time-based leader lease
   (`docs/superpowers/specs/2026-07-24-uc2-leader-lease-design.md`,
   discharged for the LAN goal; only for WAN reads).
+- **The service-time record (2026-09-16,
+  `docs/benchmarks/uc2-service-time-2026-09-16.md`)** measured the commit
+  path's own round trip for the first time: shipped p50 123 µs on
+  c6id.2xlarge, of which the apply agent's 50 µs idle sleep is a bimodal
+  second mode (77 µs at p90, removed by `UC2_APPLY_IDLE=spin`), thread
+  placement 41 µs of mean, fsync 27 µs, and the wire at most 33.5 µs.
+  **Candidate that follows from it:** make the apply agent's default idle a
+  spin → yield → sleep ladder (the `uc_client` wait shape), gated by an
+  `apply_bench` A/B plus a re-run of that record's arms A and C; and a
+  paced open-loop mode for `m12_gate client-direct` so "p99 at N msg/s
+  offered" can be stated in the same terms Adaptive's cluster benchmarks
+  use. Kernel bypass and the net-decomp brief's WIRE(P) instrument are
+  declined by the same record (the whole round trip is 33.5 µs).
 - **Why not first:** no user is asking for more than the current ceiling;
   every number here is a fleet characterisation with its caveats disclosed.
+- **Inspect `ABTRDA3` (recorded 2026-09-16)** —
+  <https://github.com/ASherjil/ABTRDA3>, a C++20 kernel-bypass L2 library
+  with one four-call ring API (`acquire`/`commit`, `tryReceive`/`release`)
+  over five interchangeable backends: Solarflare `ef_vi` (CTPIO), DPDK,
+  mlx5 verbs (`RAW_PACKET` QP), AF_XDP (zero-copy + busy-poll) and
+  `PACKET_MMAP`. The transport is a template parameter chosen from TOML, so
+  the same reflector loop is measured on every backend. Its
+  `docs/Benchmarks.md` is eleven 24 h one-frame-in-flight RTT soaks on one
+  isolated-core i9-11900K rig (`rdtscp`, HdrHistogram, ports DAC-looped, no
+  switch): `ef_vi` 1.866 µs median / 3.306 µs max over 44.3 B samples;
+  verbs 2.426 µs and DPDK 3.5–3.6 µs on ConnectX-4 Lx and X2522; AF_XDP
+  6.2 µs on mlx5 and 10.5 µs on i40e (DPDK on i40e sits at 9.0 µs, the
+  silicon floor); a consumer I225-V at 13.4 µs with the flattest tail in
+  the campaign. Its `docs/Known_driver_issues.md` is a symptom → mechanism
+  → evidence catalogue (stock `i40e` silently no-ops AF_XDP busy-poll; a
+  gapless `SCHED_FIFO` poll strands RX under NAPI deferral; `igc` cannot
+  ping-pong AF_XDP at all; the 2.5GBASE-T PHY costs more than 1 GbE). What
+  to take from it for UC: (a) the measurement discipline — 24 h soaks,
+  P99.999 as the headline, warm-up discarded, IRQ steering proven rather
+  than assumed — against our own fleet-gate method; (b) whether an AF_XDP or
+  DPDK path under `uc_net`'s reliable-UDP could shave the per-hop wire cost
+  the fleet gates pay through kernel sockets, and what fraction of UC's
+  commit latency that is; (c) the driver-defect list as a checklist before
+  any bypass experiment on the c6id fleet (ENA has none of these NICs, so
+  the numbers do not transfer — the method does). Isolated transport
+  ladders belong in the sibling `hi-perf-cmp` grid; only a UC-budget-share
+  measurement belongs here.
 
 ### 7. External review
 

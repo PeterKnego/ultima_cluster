@@ -1,10 +1,17 @@
 # UC v2 — Commit-path network-share decomposition: measurement brief
 
 **Date:** 2026-08-02
-**Status:** Draft brief, written as a session handoff — **not yet reviewed, no
-measurement approved or run.** The §2 thresholds become a pre-commitment when
-this file is committed unchanged ahead of the first fleet run; they may be
-adjusted in review before that run, never after seeing data.
+**Status:** Draft brief, written as a session handoff — never ratified, and
+the §3 instrument was never built. **Clause (K) was closed by a bound on
+2026-09-16** without it: the service-time run
+(`docs/benchmarks/uc2-service-time-2026-09-16.md`) measured one raw UDP
+round trip on the same fleet at 33.5 µs p50 against a no-fsync commit p50 of
+77 µs and a shipped p50 of 123 µs, so WIRE can be at most 33.5 µs — under
+(K-lat)'s 80 µs absolute leg regardless of share. Kernel bypass is
+**measured, declined** for the c6id/ENA fleet class. **Clause (L) stays
+open** (it turns on syscall share, which that run does not measure) and
+its upside is bounded by the same 33.5 µs. The §2 thresholds are quoted in
+that doc as the standing draft; nothing below was edited after data.
 **Motivation:** Bound, with measurement rather than argument, what any faster
 network technology could possibly buy UC — before building any of it. The
 triggering question was "would DPDK or AWS EFA help?"; this brief exists so

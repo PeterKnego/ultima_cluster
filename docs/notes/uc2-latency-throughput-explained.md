@@ -182,11 +182,17 @@ saturates. Anything above the BDP is pure latency.
 
 ## What this note does not claim
 
-- **There is no v2 service-time decomposition.** No document breaks a commit
-  into its RTT / fdatasync / IPC terms. Every latency number in the record
-  is an end-to-end measurement at a stated offered load. Claims of the form
-  "UC's floor is mostly X" are unsupported until someone runs that
-  measurement.
+- **The v2 service-time decomposition is partial, and dated.** Until
+  2026-09-16 no document broke a commit into its RTT / fdatasync / IPC
+  terms; every latency number in the record was an end-to-end measurement
+  at a stated offered load. The service-time run of that date
+  (`../benchmarks/uc2-service-time-2026-09-16.md`) now bounds the terms on
+  4 × c6id.2xlarge at inflight 1: shipped p50 123 µs, of which fsync is
+  27 µs, the service's idle sleep a second mode worth 77 µs at p90, thread
+  placement 41 µs of mean, and the wire at most 33.5 µs (one raw round
+  trip). What that run does not split is the ~43 µs of agent hand-off
+  latency left once fsync and the sleep are removed; claims finer than that
+  are still unsupported.
 - **The rates above are each from one run on that run's hardware**, mostly
   c6id.2xlarge in 2026-07/08 at earlier releases. The *shape* — the law, the
   two regimes, the knobs — is what this note is about; the absolute rates
