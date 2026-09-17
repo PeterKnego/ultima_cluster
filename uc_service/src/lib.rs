@@ -81,9 +81,58 @@ pub use crate::traits::{
 };
 
 /// Default idle strategy for the apply thread: a short sleep between empty
-/// cycles (a busy-spin knob comes later). Background-grade politeness that
-/// still keeps sub-ms apply latency under load.
+/// cycles. Background-grade politeness that still keeps sub-ms apply latency
+/// under load. `UC2_APPLY_IDLE` overrides it per process (see
+/// [`apply_idle_from_env`]); the snapshot builder always uses this default.
 const APPLY_IDLE: IdleStrategy = IdleStrategy::Sleep(Duration::from_micros(50));
+
+/// The apply agent's idle strategy from `UC2_APPLY_IDLE`, or [`APPLY_IDLE`]
+/// when unset. Accepted values: `spin` (never park — one core per service,
+/// lowest latency), `yield` (the node agents' posture), `sleep:<micros>`
+/// (the default shape at another cadence). Anything else is refused by name
+/// rather than guessed: a typo must not silently run the default.
+///
+/// Why an env override and not a config key: this is a deploy-varying,
+/// per-host choice in the same family as `UC2_JOURNAL_DURABILITY` (a core
+/// pegged per service is a capacity decision, not a cluster property), and
+/// the first consumer is the 2026-09-16 service-time measurement's labelled
+/// diagnostic arm.
+fn apply_idle_from_env() -> Result<IdleStrategy, ServiceError> {
+    match std::env::var("UC2_APPLY_IDLE") {
+        Err(std::env::VarError::NotPresent) => Ok(APPLY_IDLE),
+        Err(e) => Err(ServiceError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("UC2_APPLY_IDLE unreadable: {e}"),
+        ))),
+        Ok(v) => parse_apply_idle(&v).map_err(|msg| {
+            ServiceError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, msg))
+        }),
+    }
+}
+
+/// Pure parser behind [`apply_idle_from_env`], so the accepted grammar is
+/// unit-testable without touching the process environment.
+fn parse_apply_idle(v: &str) -> Result<IdleStrategy, String> {
+    let v = v.trim().to_ascii_lowercase();
+    match v.as_str() {
+        "" => Ok(APPLY_IDLE),
+        "spin" | "busy-spin" | "busyspin" => Ok(IdleStrategy::BusySpin),
+        "yield" => Ok(IdleStrategy::Yield),
+        other => match other.strip_prefix("sleep:") {
+            Some(us) => match us.parse::<u64>() {
+                Ok(us) if us > 0 => Ok(IdleStrategy::Sleep(Duration::from_micros(us))),
+                _ => Err(format!(
+                    "UC2_APPLY_IDLE={v:?} invalid: `sleep:<micros>` needs a positive \
+                     integer of microseconds; refusing to guess"
+                )),
+            },
+            None => Err(format!(
+                "UC2_APPLY_IDLE={v:?} unrecognized (expected `spin`, `yield` or \
+                 `sleep:<micros>`); refusing to guess an idle strategy"
+            )),
+        },
+    }
+}
 /// Idle strategy for the output thread (Task 12): side effects are leader-only
 /// and inherently bursty (commit-triggered), so the same short-sleep cadence
 /// as apply is plenty responsive without spinning a core for a mostly-idle
@@ -192,8 +241,9 @@ impl<S: RawStateMachine, O: RawOutputHandler<S>> ServiceBuilder<S, O> {
             // teardown than the apply thread it depends on for `state: &S`.
             agents.push(output_agent);
         }
+        let apply_idle = apply_idle_from_env()?;
         let apply_agent =
-            AgentRunner::spawn("uc2-apply", APPLY_IDLE, move || apply_cycle(&mut state))?;
+            AgentRunner::spawn("uc2-apply", apply_idle, move || apply_cycle(&mut state))?;
         agents.push(apply_agent);
 
         Ok(Service {
@@ -321,8 +371,9 @@ impl<S: RawStateMachine, O: RawOutputHandler<S>> ServiceBuilder<S, O> {
             builder_cycle(&mut builder_state)
         })?;
 
+        let apply_idle = apply_idle_from_env()?;
         let apply_agent =
-            AgentRunner::spawn("uc2-apply", APPLY_IDLE, move || apply_cycle(&mut state))?;
+            AgentRunner::spawn("uc2-apply", apply_idle, move || apply_cycle(&mut state))?;
         agents.push(apply_agent);
         // Builder pushed LAST: `Service::stop`'s loop stops agents in
         // insertion order, so the builder is joined last — any build already
@@ -459,5 +510,39 @@ impl<S: RawStateMachine> Service<S> {
     /// (relevant once later tasks add graceful-stop publishes).
     pub fn crash(self) {
         drop(self.agents);
+    }
+}
+
+#[cfg(test)]
+mod apply_idle_tests {
+    use super::{APPLY_IDLE, parse_apply_idle};
+    use std::time::Duration;
+    use uc_log::agent::IdleStrategy;
+
+    #[test]
+    fn unset_and_empty_keep_the_default() {
+        assert_eq!(parse_apply_idle("").unwrap(), APPLY_IDLE);
+        assert_eq!(parse_apply_idle("  ").unwrap(), APPLY_IDLE);
+    }
+
+    #[test]
+    fn the_three_shapes_parse() {
+        assert_eq!(parse_apply_idle("spin").unwrap(), IdleStrategy::BusySpin);
+        assert_eq!(parse_apply_idle("SPIN").unwrap(), IdleStrategy::BusySpin);
+        assert_eq!(parse_apply_idle("yield").unwrap(), IdleStrategy::Yield);
+        assert_eq!(
+            parse_apply_idle("sleep:5").unwrap(),
+            IdleStrategy::Sleep(Duration::from_micros(5))
+        );
+    }
+
+    #[test]
+    fn a_typo_is_refused_by_name_not_defaulted() {
+        let e = parse_apply_idle("spinn").unwrap_err();
+        assert!(e.contains("UC2_APPLY_IDLE=\"spinn\" unrecognized"), "{e}");
+        let e = parse_apply_idle("sleep:0").unwrap_err();
+        assert!(e.contains("positive"), "{e}");
+        let e = parse_apply_idle("sleep:abc").unwrap_err();
+        assert!(e.contains("positive"), "{e}");
     }
 }

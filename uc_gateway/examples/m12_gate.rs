@@ -349,6 +349,19 @@ struct ClientDirectArgs {
     /// M14d row d: print `TL` per-second completion buckets.
     #[arg(long, default_value_t = false)]
     timeline: bool,
+    /// Service-time measurement (2026-09-16): what the poll thread does when a
+    /// poll returns nothing. `sleep` (the default, unchanged) parks 20 µs,
+    /// which at inflight 1 pads every round trip by the kernel's timer slack;
+    /// `spin` never parks, so the client observes the cluster, not itself.
+    #[arg(long, value_enum, default_value_t = PollIdle::Sleep)]
+    poll_idle: PollIdle,
+}
+
+/// See `ClientDirectArgs::poll_idle`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum PollIdle {
+    Sleep,
+    Spin,
 }
 
 #[derive(clap::Args)]
@@ -1098,6 +1111,7 @@ fn run_fsms_arm(
         warmup_secs: 1,
         measure_secs: secs.saturating_sub(2),
         timeline: false,
+        spin_poll: false,
     };
     let stats = run_client_measurement(&dirs[leader], APP_ID, secs, payload, inflight, None, &opts);
     print_report("fsms (fan-in, 2 FSMs)", &stats);
@@ -1192,6 +1206,10 @@ struct MeasureOpts {
     /// Independent of `measure_secs`: the timeline is served by a fixed
     /// per-second bucket array, not by the window's completion-timestamp Vec.
     timeline: bool,
+    /// `--poll-idle spin`: the poll thread spins instead of sleeping 20 µs on
+    /// an empty poll. `false` (the `Default`) is the pre-2026-09-16 behaviour,
+    /// so every existing arm is unchanged.
+    spin_poll: bool,
 }
 
 /// Completions inside `[warmup, warmup + measure)` and their rate. Pure, so
@@ -1384,6 +1402,7 @@ fn run_client_measurement(
             let done_ns = done_ns.clone();
             let buckets = buckets.clone();
             let fan_in = opts.fan_in;
+            let spin_poll = opts.spin_poll;
             move || {
                 // Common bookkeeping for one completed op (`Response`, or a
                 // fan-in `Responses` where every part arrived): latency,
@@ -1448,7 +1467,11 @@ fn run_client_measurement(
                         resolved.fetch_add(1, Ordering::Relaxed);
                     });
                     if n == 0 {
-                        thread::sleep(Duration::from_micros(20));
+                        if spin_poll {
+                            std::hint::spin_loop();
+                        } else {
+                            thread::sleep(Duration::from_micros(20));
+                        }
                     }
                 }
             }
@@ -2392,17 +2415,19 @@ fn run_client_direct_role(a: ClientDirectArgs) -> anyhow::Result<()> {
 
     let session_client_id = envelope_on.then(fresh_client_id);
     println!(
-        "m12_gate client-direct: {} s, payload {}, inflight {}, envelope {}",
+        "m12_gate client-direct: {} s, payload {}, inflight {}, envelope {}, poll-idle {:?}",
         a.secs,
         a.payload,
         a.inflight,
-        if envelope_on { "on" } else { "off" }
+        if envelope_on { "on" } else { "off" },
+        a.poll_idle
     );
     let opts = MeasureOpts {
         fan_in: a.fan_in,
         warmup_secs: a.warmup_secs,
         measure_secs: a.measure_secs,
         timeline: a.timeline,
+        spin_poll: a.poll_idle == PollIdle::Spin,
     };
     let stats = run_client_measurement(
         &a.instance_dir,

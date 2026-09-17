@@ -381,6 +381,7 @@ the volatile-filesystem and `admin auth = "none"` boot warnings.
 | Variable | Read by | Effect |
 |---|---|---|
 | `UC2_CLIENT_TIMEOUT_MS` | `uc_client` | Client request timeout, in milliseconds. |
+| `UC2_APPLY_IDLE` | `uc_service` | The apply agent's idle strategy: `spin` (never park — one core per service, lowest response latency), `yield`, or `sleep:<micros>`. Unset keeps the shipped `Sleep(50 µs)`; anything else is refused by name at service start. Per-process and deploy-varying: pegging a core per service is a capacity decision, not cluster state. Added 2026-09-16 for the service-time measurement (`docs/benchmarks/uc2-service-time-2026-09-16.md`). |
 | `UC2_CRYPTO` | test and gate harnesses | `1` boots harness clusters with crypto enabled. Not read by `Node::start`; production nodes are configured through `NodeConfig::crypto`. |
 | `UC2_MUTATION` | `uc_node`, `mutation-testing` feature only | Selects an injected consensus bug. Compiled out of the default build. |
 | `CARGO_TARGET_TMPDIR` | test harnesses | Root for test instance directories. |
