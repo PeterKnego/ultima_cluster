@@ -18,17 +18,74 @@ pub enum IdleStrategy {
     Yield,
     /// Sleep between empty cycles (background-grade agents).
     Sleep(Duration),
+    /// A ladder over the runner's consecutive-idle streak: the first `spins`
+    /// empty cycles spin, the next `yields` yield, every one after that
+    /// sleeps `sleep`. A productive cycle resets the streak. The shape is
+    /// `uc_client`'s wait ladder; the difference is that the sleep rung does
+    /// NOT ramp, so an agent that has been quiet for seconds still wakes
+    /// within one `sleep` plus timer slack — the same bound a plain
+    /// [`IdleStrategy::Sleep`] gives, which is what keeps sparse traffic from
+    /// regressing when this replaces one.
+    ///
+    /// Why it exists (2026-09-16 service-time record): a flat 50 µs sleep on
+    /// the service's apply agent landed on roughly half of all responses at
+    /// low load as a second mode ~100 µs above the first. The ladder keeps
+    /// the agent awake across one client round trip after each frame, so a
+    /// steady low-rate stream never meets the sleep, while a truly idle
+    /// service falls back to sleeping within a millisecond or so.
+    Backoff {
+        spins: u32,
+        yields: u32,
+        sleep: Duration,
+    },
 }
 
 impl IdleStrategy {
+    /// One idle step. `streak` is the number of consecutive empty cycles so
+    /// far, counting this one from 1; only [`IdleStrategy::Backoff`] reads it.
     #[inline]
-    pub fn idle(&self) {
+    pub fn idle(&self, streak: u64) {
         match self {
             IdleStrategy::BusySpin => std::hint::spin_loop(),
             IdleStrategy::Yield => std::thread::yield_now(),
             IdleStrategy::Sleep(d) => std::thread::sleep(*d),
+            IdleStrategy::Backoff { sleep, .. } => match self.backoff_rung(streak) {
+                BackoffRung::Spin => std::hint::spin_loop(),
+                BackoffRung::Yield => std::thread::yield_now(),
+                BackoffRung::Sleep => std::thread::sleep(*sleep),
+            },
         }
     }
+
+    /// Which rung of a [`IdleStrategy::Backoff`] ladder `streak` lands on.
+    /// Pure, so the boundaries are unit-testable; the other variants report
+    /// their own single behaviour.
+    #[inline]
+    pub fn backoff_rung(&self, streak: u64) -> BackoffRung {
+        match self {
+            IdleStrategy::BusySpin => BackoffRung::Spin,
+            IdleStrategy::Yield => BackoffRung::Yield,
+            IdleStrategy::Sleep(_) => BackoffRung::Sleep,
+            IdleStrategy::Backoff { spins, yields, .. } => {
+                if streak <= u64::from(*spins) {
+                    BackoffRung::Spin
+                } else if streak <= u64::from(*spins) + u64::from(*yields) {
+                    BackoffRung::Yield
+                } else {
+                    BackoffRung::Sleep
+                }
+            }
+        }
+    }
+}
+
+/// The three behaviours an idle step can take (see
+/// [`IdleStrategy::backoff_rung`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackoffRung {
+    Spin,
+    Yield,
+    Sleep,
 }
 
 pub struct AgentRunner {
@@ -68,9 +125,15 @@ impl AgentRunner {
             .name(name.to_string())
             .spawn(move || {
                 let _guard = FinishedGuard(finished_flag);
+                // Consecutive empty cycles; only `Backoff` reads it. One
+                // register op per cycle, outside the work closure's body.
+                let mut streak: u64 = 0;
                 while !stop_flag.load(Ordering::Relaxed) {
-                    if !work() {
-                        idle.idle();
+                    if work() {
+                        streak = 0;
+                    } else {
+                        streak = streak.saturating_add(1);
+                        idle.idle(streak);
                     }
                 }
             })?;
@@ -130,6 +193,80 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn backoff_rungs_follow_the_streak_and_reset_on_work() {
+        let b = IdleStrategy::Backoff {
+            spins: 3,
+            yields: 2,
+            sleep: Duration::from_micros(50),
+        };
+        let rungs: Vec<_> = (1..=7).map(|s| b.backoff_rung(s)).collect();
+        assert_eq!(
+            rungs,
+            [
+                BackoffRung::Spin,
+                BackoffRung::Spin,
+                BackoffRung::Spin,
+                BackoffRung::Yield,
+                BackoffRung::Yield,
+                BackoffRung::Sleep,
+                BackoffRung::Sleep,
+            ]
+        );
+        // The runner resets the streak on a productive cycle: model that by
+        // asking rung 1 again after a "work" — it is a spin, not a sleep.
+        assert_eq!(b.backoff_rung(1), BackoffRung::Spin);
+        // Zero-width rungs collapse cleanly.
+        let no_spin = IdleStrategy::Backoff {
+            spins: 0,
+            yields: 1,
+            sleep: Duration::from_micros(1),
+        };
+        assert_eq!(no_spin.backoff_rung(1), BackoffRung::Yield);
+        assert_eq!(no_spin.backoff_rung(2), BackoffRung::Sleep);
+    }
+
+    #[test]
+    fn non_backoff_variants_ignore_the_streak() {
+        for s in [1, 10, u64::MAX] {
+            assert_eq!(IdleStrategy::BusySpin.backoff_rung(s), BackoffRung::Spin);
+            assert_eq!(IdleStrategy::Yield.backoff_rung(s), BackoffRung::Yield);
+            assert_eq!(
+                IdleStrategy::Sleep(Duration::from_micros(1)).backoff_rung(s),
+                BackoffRung::Sleep
+            );
+        }
+    }
+
+    #[test]
+    fn a_backoff_runner_reaches_its_sleep_rung_and_still_stops() {
+        // Spawn a runner whose work never makes progress, with a ladder short
+        // enough to fall through to the sleep rung within the test, and
+        // prove it stops cleanly from there (the sleep must not starve the
+        // stop flag).
+        let cycles = Arc::new(AtomicU64::new(0));
+        let c = Arc::clone(&cycles);
+        let r = AgentRunner::spawn(
+            "backoff-idle",
+            IdleStrategy::Backoff {
+                spins: 2,
+                yields: 2,
+                sleep: Duration::from_micros(200),
+            },
+            move || {
+                c.fetch_add(1, Ordering::Relaxed);
+                false
+            },
+        )
+        .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while cycles.load(Ordering::Relaxed) < 20 {
+            assert!(std::time::Instant::now() < deadline, "runner never cycled");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        r.stop();
+    }
 
     #[test]
     fn runner_drives_work_and_stops_cleanly() {

@@ -80,17 +80,38 @@ pub use crate::traits::{
     SnapshotStateMachine, StateMachine, TimerEvent, TimerReq, TypedOutput,
 };
 
-/// Default idle strategy for the apply thread: a short sleep between empty
-/// cycles. Background-grade politeness that still keeps sub-ms apply latency
-/// under load. `UC2_APPLY_IDLE` overrides it per process (see
-/// [`apply_idle_from_env`]); the snapshot builder always uses this default.
-const APPLY_IDLE: IdleStrategy = IdleStrategy::Sleep(Duration::from_micros(50));
+/// Default idle strategy for the apply thread: `uc_client`'s wait-ladder
+/// shape — spin, then yield, then the 50 µs sleep that was the whole strategy
+/// before 2026-09-16. The sleep rung does not ramp, so a service quiet for
+/// seconds still wakes within 50 µs plus timer slack, exactly as before; what
+/// changed is that a steady low-rate stream no longer meets the sleep at all.
+///
+/// Sizing: the 2026-09-16 service-time record
+/// (`docs/benchmarks/uc2-service-time-2026-09-16.md`) found the flat sleep
+/// landing on about half of all responses at low load as a second mode
+/// ~100 µs above the first — a closed-loop client's round trip is ~100 µs on
+/// that fleet, so the agent has to stay awake at least that long after each
+/// frame. 2 000 spins is a few microseconds; 1 024 yields is 0.3–0.7 ms on
+/// an otherwise idle core (yield returns in ~0.3–0.7 µs there), several
+/// round trips of cover, and bounded under oversubscription (a yield burns a
+/// slice, but only 1 024 of them before the sleep). `UC2_APPLY_IDLE`
+/// overrides it per process ([`apply_idle_from_env`]).
+const APPLY_IDLE: IdleStrategy = IdleStrategy::Backoff {
+    spins: 2_000,
+    yields: 1_024,
+    sleep: Duration::from_micros(50),
+};
+/// The snapshot builder's idle: the plain sleep. It is a background agent
+/// whose work arrives at snapshot instants, not per frame, so the ladder's
+/// awake window would buy it nothing and cost a core after every build.
+const BUILDER_IDLE: IdleStrategy = IdleStrategy::Sleep(Duration::from_micros(50));
 
 /// The apply agent's idle strategy from `UC2_APPLY_IDLE`, or [`APPLY_IDLE`]
-/// when unset. Accepted values: `spin` (never park — one core per service,
-/// lowest latency), `yield` (the node agents' posture), `sleep:<micros>`
-/// (the default shape at another cadence). Anything else is refused by name
-/// rather than guessed: a typo must not silently run the default.
+/// when unset. Accepted values: `backoff` (the default ladder, spelled out),
+/// `spin` (never park — one core per service, lowest latency), `yield` (the
+/// node agents' posture), `sleep:<micros>` (the pre-2026-09-16 shape at a
+/// chosen cadence). Anything else is refused by name rather than guessed: a
+/// typo must not silently run the default.
 ///
 /// Why an env override and not a config key: this is a deploy-varying,
 /// per-host choice in the same family as `UC2_JOURNAL_DURABILITY` (a core
@@ -115,7 +136,7 @@ fn apply_idle_from_env() -> Result<IdleStrategy, ServiceError> {
 fn parse_apply_idle(v: &str) -> Result<IdleStrategy, String> {
     let v = v.trim().to_ascii_lowercase();
     match v.as_str() {
-        "" => Ok(APPLY_IDLE),
+        "" | "backoff" => Ok(APPLY_IDLE),
         "spin" | "busy-spin" | "busyspin" => Ok(IdleStrategy::BusySpin),
         "yield" => Ok(IdleStrategy::Yield),
         other => match other.strip_prefix("sleep:") {
@@ -127,8 +148,8 @@ fn parse_apply_idle(v: &str) -> Result<IdleStrategy, String> {
                 )),
             },
             None => Err(format!(
-                "UC2_APPLY_IDLE={v:?} unrecognized (expected `spin`, `yield` or \
-                 `sleep:<micros>`); refusing to guess an idle strategy"
+                "UC2_APPLY_IDLE={v:?} unrecognized (expected `backoff`, `spin`, `yield` \
+                 or `sleep:<micros>`); refusing to guess an idle strategy"
             )),
         },
     }
@@ -367,7 +388,7 @@ impl<S: RawStateMachine, O: RawOutputHandler<S>> ServiceBuilder<S, O> {
             busy,
             service_id,
         };
-        let builder_agent = AgentRunner::spawn("uc2-snapshot-builder", APPLY_IDLE, move || {
+        let builder_agent = AgentRunner::spawn("uc2-snapshot-builder", BUILDER_IDLE, move || {
             builder_cycle(&mut builder_state)
         })?;
 
@@ -523,6 +544,18 @@ mod apply_idle_tests {
     fn unset_and_empty_keep_the_default() {
         assert_eq!(parse_apply_idle("").unwrap(), APPLY_IDLE);
         assert_eq!(parse_apply_idle("  ").unwrap(), APPLY_IDLE);
+    }
+
+    #[test]
+    fn the_default_is_the_backoff_ladder_and_backoff_spells_it() {
+        // The service-time record's second mode was the flat sleep; the
+        // default must be the ladder, and `backoff` must name it explicitly.
+        assert!(
+            matches!(APPLY_IDLE, IdleStrategy::Backoff { .. }),
+            "{APPLY_IDLE:?}"
+        );
+        assert_eq!(parse_apply_idle("backoff").unwrap(), APPLY_IDLE);
+        assert_eq!(parse_apply_idle("").unwrap(), APPLY_IDLE);
     }
 
     #[test]

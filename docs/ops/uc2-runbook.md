@@ -68,13 +68,17 @@ transport setting, both measured closed-loop at inflight 1 on 8-vCPU
   `CPUAffinity=` on the systemd units. Check the sibling map with
   `lscpu -p=CPU,CORE` first; a wrong map pins agents onto each other's
   siblings and costs throughput.
-- **Let the service's apply agent spin instead of sleep.** The apply
-  agent's default idle is a 50 µs sleep, which at low load lands on about
-  half of all responses as a second mode ~100 µs above the first.
-  `UC2_APPLY_IDLE=spin` in the service's environment removes it (p90 194 →
-  117 µs on that record) for one pegged core per service; `yield` is the
-  cheaper middle. Set it per service process, not cluster-wide — it is a
-  capacity decision for that host. See
+- **The service's apply agent idles on a ladder since that record.** Up to
+  `2.12.0` its idle was a flat 50 µs sleep, which at low load landed on
+  about half of all responses as a second mode ~100 µs above the first
+  (p90 194 µs against p50 109 on that record; 117 µs with the sleep gone).
+  The default is now spin → yield → the same 50 µs sleep, which keeps the
+  agent awake across a client round trip after each frame and costs
+  nothing when the service is truly idle or fully busy. `UC2_APPLY_IDLE=spin`
+  in the service's environment still buys the last few microseconds for one
+  pegged core per service, and `sleep:50` restores the old posture. Set it
+  per service process, not cluster-wide — it is a capacity decision for
+  that host. See
   [the environment switches](../reference/configuration.md#environment-switches).
 
 ## Observing a cluster
