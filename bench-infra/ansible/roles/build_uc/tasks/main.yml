@@ -8,6 +8,7 @@
       - "--exclude=.git"
       - "--exclude=bench-out"
       - "--exclude=bench-infra"   # don't ship .env secret or .terraform bloat
+      - "--exclude=proofs/.lake"  # the Lean build cache: 9 GB on 2026-09-17, tripled a provisioning to ~65 min; nothing on a fleet host reads it
   when: uc_src_mode == "rsync"
 
 - name: (git mode) Clone UC at pinned ref

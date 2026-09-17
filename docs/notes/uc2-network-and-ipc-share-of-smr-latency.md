@@ -120,6 +120,11 @@ closed loop at inflight 1, five arms):
 | pinned + apply agent spins (`UC2_APPLY_IDLE=spin`) | 111 µs | 105 µs | 117 µs |
 | pinned + spin + fsync off the path (eventual, 1 ms) | 85 µs | 77 µs | 98 µs |
 
+The service's idle sleep became a spin → yield → sleep ladder by default the
+next day (`2be3d6f`); re-measured 2026-09-17, the shipped unpinned posture
+reads mean 114 / p50 105 / p90 118 µs, with the pinned-and-spinning arm as
+the cross-fleet anchor (record §4.5).
+
 Raw UDP round trip on the same fleet: 33.5 µs p50. So the wire is at most
 44 % of the no-fsync path and at most 29 % of the shipped p50; fsync is
 27 µs; the service's idle sleep is a second mode worth 77 µs at p90; and

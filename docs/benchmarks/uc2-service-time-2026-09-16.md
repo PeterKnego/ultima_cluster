@@ -1,7 +1,7 @@
 # UC v2 service time — closed-loop round trip through commit + apply + response
 
 **Date:** 2026-09-16 (pre-registered before the fleet run; **RAN the same
-day**, 4 × `c6id.2xlarge`, us-east-1 cluster placement group, 55 points,
+day**, re-run with the ladder default 2026-09-17 — §4.5; 4 × `c6id.2xlarge`, us-east-1 cluster placement group, 55 points,
 0 lost, driver exit 0; raw output in `bench-out/service-time-2026-09-16/`).
 **Status:** measurement row, **no bar**. Nothing here passes or fails; the
 output is a number UC has never published and the three subtractions it
@@ -266,15 +266,70 @@ one rep; the 1 ms lumps did not regress the tail the way the 50 ms default
 did in the parity doc. (4) Drift 9–11 µs, smaller than every effect
 claimed. (5) 64 B only. (6) No dev-box number above.
 
+### 4.5 Re-run with the ladder as the default — 2026-09-17
+
+The reading in §4.4 (2) led to a product change the same week: the apply
+agent's idle strategy became a spin → yield → sleep ladder (commit
+`2be3d6f`; `uc_log::IdleStrategy::Backoff`, `uc_service::APPLY_IDLE` = spin
+2 000 / yield 1 024 / sleep 50 µs, no ramp). Its gate was two-sided: the
+apply hop under load, where the agent should never idle, and this record's
+low-load arms, where the second mode lives.
+
+**Apply hop, dev-box A/B** (`scripts/apply_ab.sh 425eb2c 2be3d6f`, bounded,
+one FSM, four runs per arm; a ratio, never a number): base 21.21 M
+frames/s, head 21.91 M, head-rebuilt 21.93 M — **+3.3 %**, against a
+rebuild resolution of 0.10 % and a worst sem of 0.10 %, driver-bound guard
+clear. "Outside resolution", in the faster direction: the paced driver
+still lets the agent idle briefly whenever it catches the appender, and the
+ladder spins through those gaps. Recorded as a dev-box reading, not a
+claim.
+
+**Low-load arms, fleet re-run.** Fresh 4 × `c6id.2xlarge` fleet (different
+physical placement: raw UDP round trip 26.7 µs p50 before and 26.8 after,
+against 33.5 on 2026-09-16), arms A, C and A′ only, same driver, same
+reps. The driver's arm-A label still reads "sleep-apply"; the binary
+carried the ladder default.
+
+| arm | posture | 2026-09-16 (flat sleep) mean / p50 / p90 / p99 | 2026-09-17 (ladder) mean / p50 / p90 / p99 |
+|---|---|---|---|
+| A | shipped, unpinned | 166 / 123 / 219 / 325 µs | **114 / 105 / 118 / 265 µs** |
+| C | pinned + `UC2_APPLY_IDLE=spin` | 111 / 105 / 117 / 176 µs | 111 / 103 / 118 / 191 µs |
+| A′ | = A, run last | 157 / 112 / 218 / 297 µs | 117 / 105 / 123 / 249 µs |
+
+Inflight 256, zero lost: A 632 k/s at p50 0.351 ms (572 k / 0.428 the day
+before), C 725 k/s at 0.330 ms (707 k / 0.335).
+
+Reading:
+
+1. **The second mode is gone under the shipped posture.** Unpinned, no env
+   var, arm A's p90 fell from 219 to 118 µs and its mean from 166 to
+   114 µs. p50 moved 18 µs, which is the sleep's share of the median plus a
+   little placement.
+2. **Arm C is the cross-fleet anchor.** It did not have the sleep on either
+   day and reads within 2 µs at p50 and 1 µs at p90 across the two fleets,
+   so the 7 µs shorter wire today is not what moved A. The comparison
+   between the two A rows is the ladder, to within that anchor's spread.
+3. **What the env var still buys over the default is the tail, and it is
+   placement, not idling.** Today A and C agree at p50 and p90; C's p99 is
+   191 against A's 265, and C is the pinned arm. `UC2_APPLY_IDLE=spin` on
+   an unpinned service is not expected to close that gap; pinning is.
+4. **Drift bracket** 0 µs at p50, 5 µs at p90: inside every claim above.
+
+Threat 6 restated for this run: the dev-box shape check of the same change
+halved this box's inflight-1 p50 (146 → 72 µs, fsync off the path); it is
+listed as wiring proof and no local number is in the tables.
+
+Raw output: `bench-out/service-time-2026-09-17-ladder/`.
+
 ## 5. What the number feeds
 
 - The Aeron comparison in `docs/notes/uc2-network-and-ipc-share-of-smr-latency.md`
   gets a like-for-like row: UC's inflight-1 p50 against Aeron's 100 k
   msg/s p50 (95 µs OSS, 76 µs Premium on c6in.16xlarge; 85 µs OSS on
   c3-highcpu-88), with the fsync posture of each stated.
-- Arm C's delta decides whether `UC2_APPLY_IDLE=spin` is worth documenting
-  as an operator option (a core per service for N µs) or worth making the
-  default under some condition.
+- Arm C's delta decided the apply agent's default: it is the spin → yield →
+  sleep ladder since `2be3d6f` (§4.5), and `UC2_APPLY_IDLE` remains the
+  per-service override.
 - Arm D's wire share, with the raw RTT, is the prior the net-decomp brief's
   clause (K-lat) will be tested against, and says whether building that
   instrument is worth a fleet session of its own.
