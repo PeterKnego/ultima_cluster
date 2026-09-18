@@ -75,7 +75,7 @@ carrying forward:
   `SnapshotStateMachine` author at examples that ship no snapshot code —
   `examples/counter` is typed-tier, no snapshots, no sessions. The builder had
   to infer the artifact-envelope contract from prose. **Merging the KV store as
-  `examples/kv` is the fix**: it is the first shipped
+  `examples/kv` is the fix**: it is the first shipped user-facing
   `SnapshotStateMachine` + `Sessioned` worked example.
 
 The remaining items are prose gaps (dependency versions unknowable behind
@@ -90,7 +90,7 @@ fix is out of this effort's scope:
 
 - **A remote client cannot read a follower's replica (L21).** `RemoteClient`
   follows the leader hint and hops to the leader, so `digest` and every read go
-  to the leader. Per-replica reads are a remote-protocol-v2 concern (an FSM
+  to the leader. Per-replica reads are a concern for a future remote-protocol version (an FSM
   selector, an advertised ceiling), which the charter rules out of scope. The
   KV store exposes the gap; it does not close it.
 - **rustdoc `[source]` links reach crate source (L1)** — a boundary the

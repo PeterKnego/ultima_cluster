@@ -17,7 +17,7 @@ stranger can follow. The proof is a worked example now in the tree, and the
 friction the dogfood hit is filed as fixes and tickets.
 
 - **`examples/kv`: a replicated key-value store, merged in-tree.** The first
-  shipped `SnapshotStateMachine` + `Sessioned` worked example — coordinated
+  shipped user-facing `SnapshotStateMachine` + `Sessioned` worked example — coordinated
   snapshots, exactly-once over a remote hop, a two-shape v2 that reads v1
   images, and real-cluster tests including the flag-day upgrade.
   [`examples/kv`](examples/kv).
