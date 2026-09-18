@@ -17,7 +17,13 @@ restarts, with a journal you can bound with one command. A key is one of two
   a `uc2-node` (one per node).
 - `kv` — the command-line client, over TCP through any `uc2-gateway`, from
   anywhere.
-- `kv-load` — a bulk loader used by the tests and the numbers below.
+- `kv-load` — a bulk loader used by the tests and the numbers below. It is
+  the throughput tool, so it drives `uc_remote`'s lock-free `RemoteEngine`
+  halves directly (a window of `try_submit`s drained by `poll`); the `kv` CLI
+  uses the blocking `RemoteClient` because one request per invocation is
+  exactly that client's job. If you copy one of these for your own client,
+  copy the one that matches your shape — see
+  `docs/how-to/run-a-gateway.md` § "Which client do I want?".
 - `WIRE-FORMAT.md` — every byte, for a client in another language.
 - `docs/DESIGN.md` — the design note the platform's SDLC standard asks for.
 

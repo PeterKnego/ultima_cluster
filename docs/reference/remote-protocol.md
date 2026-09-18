@@ -416,6 +416,14 @@ of halves ([`RemoteEngine::connect`]), not a separate implementation. What the
 wire requires of any client is only what the sections above say: the credit
 rule, the ordered re-send, the probe before flush, and the liveness clocks.
 
+The two are not interchangeable for throughput, though. `RemoteClient` pays a
+lock on the send half, an allocation and a condvar wakeup per request that the
+halves do not, and a caller that waits on each `Ticket` in turn is bounded by
+its concurrency over the round-trip latency. Use the blocking client for one
+request at a time and the engine halves when the rate matters; the choice is
+laid out in
+[Run a gateway § Which client do I want?](../how-to/run-a-gateway.md#which-client-do-i-want).
+
 ## What this page does not cover
 
 `uc_gateway::Edge`'s side of failover (the not-serving latch, the leader

@@ -99,6 +99,18 @@ impl Ticket {
 
 /// A connected remote client. `Send + Sync`; share it behind an `Arc` or a
 /// reference — every method takes `&self`.
+///
+/// **This is the convenient client, not the fast one.** It is a thin blocking
+/// layer over the [`RemoteEngine`] halves: each request costs a lock on the
+/// send half, an `Arc` allocation for its [`Ticket`], and a condvar wakeup
+/// when the answer lands, and a caller that waits on each ticket in turn is
+/// bounded by its concurrency divided by the round-trip latency. That is the
+/// right trade for one request at a time — a CLI, a handler that waits on
+/// each call. For throughput, either keep a **window of tickets** in flight
+/// (`submit` many, then `wait` them in order) or drive the lock-free halves
+/// directly with [`RemoteSendHalf::try_submit`] and [`RemotePollHalf::poll`];
+/// `examples/kv/src/bin/kv-load.rs` is the worked example. Do not benchmark
+/// the platform through this type and conclude the state machine is slow.
 pub struct RemoteClient {
     send: Mutex<RemoteSendHalf>,
     wait: RemoteWaitHandle,

@@ -133,6 +133,25 @@ every connection and exits `0`. There's no drain step to wait for — a
 gateway carries no state a stop could lose; in-flight requests fail over to
 another edge the same way a mid-request node crash would.
 
+## Which client do I want?
+
+`uc_remote` ships two clients for the same wire, and the convenient one is
+the slow one. Pick by what you are building:
+
+| You are building | Use | Why |
+|---|---|---|
+| **one request, then its answer** — a CLI, a request handler that waits on each call | `RemoteClient`: `submit()` / `query()` → `Ticket::wait()` | The simplest API. Each call is one round trip, so throughput is bounded by your concurrency divided by the round-trip latency; a single caller on a cross-host cluster sees a few hundred to a few thousand requests per second, and that is expected, not a fault |
+| **throughput from one thread** — a loader, a replayer, a batch job | `RemoteClient` with a **window of tickets**: `submit()` many, then `wait()` them in order | Pipelines the round trips. Still pays a lock on the send half, an allocation and a condvar wakeup **per request** |
+| **the platform's rate** — a service front end, a benchmark, anything measured in ops/s | `RemoteEngine::connect` → `RemoteSendHalf::try_submit` + `RemotePollHalf::poll` | Lock-free: no per-request allocation, lock or wakeup. `try_submit` returns `Backpressure` when the window is full (the request is not consumed — drain completions and retry). The worked example is `examples/kv/src/bin/kv-load.rs` |
+
+The blocking client is a thin layer over the engine halves, not a separate
+implementation, so failover, redirects and the credit rule behave identically
+in all three rows. The measured gap between the two at matched in-flight depth
+is tracked in
+[#43](https://github.com/PeterKnego/ultima_cluster/issues/43). Do not benchmark
+the platform through `RemoteClient` and conclude the state machine is slow —
+the dogfood did exactly that ([builder report](../notes/uc2-dogfood-kv-builder-report.md)).
+
 ## What a client sees on failover
 
 A conforming client (`uc_remote`'s `RemoteEngine` halves or the `RemoteClient`
