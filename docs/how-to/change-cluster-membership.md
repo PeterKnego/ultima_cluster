@@ -162,6 +162,14 @@ joiner to a learner that can, and the joiner asks there:
 
 Two independent changes, in order.
 
+First, the new host must already be running `uc2-node` on its own config.
+Give it a `node.toml` with its own `id` and `bind`, its own `instance_dir`, and
+the same `app_id`, `[services]`, `[crypto]` and `[admin]` as the rest of the
+cluster — and a `[[members]]` list that names every current member **and
+itself**, since the joining node dials those addresses to catch up. Start
+`uc2-node` (and its service and gateway) there. Then, on an existing node, add
+it to the committed membership:
+
 ```bash
 uc2ctl add-learner --instance-dir D --app-id A --id 4 --addr 10.0.0.14:9100
 ```

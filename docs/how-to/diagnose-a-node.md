@@ -152,6 +152,43 @@ Compare `archive_first_base` (1344) with `node_snapshot_floor` (1216).
 If purging is meant to be on, see
 [Keep the journal from growing without bound](bound-journal-growth.md).
 
+## A voter is down, unreachable, or lost its disk
+
+A cluster keeps serving as long as a quorum is healthy, so one lost voter does
+not stop writes — which is exactly why it is easy to miss. **On a lightly
+loaded cluster the shipped alerts can stay quiet through a lost voter or a
+partition** (their lag thresholds only trip under load; see
+[#40](https://github.com/PeterKnego/ultima_cluster/issues/40)). Do not trust a
+green dashboard for membership health: read the leader's `members` band
+directly.
+
+```bash
+uc2ctl status --instance-dir D --app-id A | sed -n '/members:/,$p'
+```
+
+A voter whose `reported_durable` has stopped advancing (or reads 0) is not
+keeping up. Which of three cases you are in decides the fix:
+
+- **The node is down** (process or host stopped). Its series simply go stale —
+  Prometheus shows no `0`, because a dead node exports nothing. Restart it:
+  `systemctl start uc2-node` (then the service and gateway). It rejoins,
+  installs a snapshot if it fell below the floor, tail-replays, and catches up.
+- **The node is alive but unreachable** (a partition). The other voters see its
+  `reported_durable` stall; it sees itself lose contact. No data action is
+  needed — fix the network path and it reconverges. Note a returning
+  partitioned voter can **depose the current leader** (a term jump) as it
+  rejoins; that is normal, and no committed write is lost.
+- **The node lost its disk or instance directory.** It cannot rejoin from
+  nothing. Either restore a backup onto a fresh instance directory under the
+  **same id** ([Back up a cluster](back-up-a-cluster.md)), or, if you have no
+  backup, wipe and rejoin the id as a fresh voter
+  ([Change cluster membership](change-cluster-membership.md)) — the node
+  installs a snapshot and tail-replays rather than reading the purged prefix.
+
+If a **majority** of voters is down or unreachable, the cluster has lost quorum
+and stops committing; that is a different procedure —
+[Recover from quorum loss](recover-from-quorum-loss.md).
+
 ## Is the disk about to fill?
 
 Read `free_disk_bytes` at offset 3840, or scrape `uc2_free_disk_bytes` if

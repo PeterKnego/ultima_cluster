@@ -577,11 +577,13 @@ schema version 39. It declares one templated datasource variable,
 Prometheus datasource at import time, and every panel's query rides that
 variable rather than a hardcoded datasource id.
 
-Six panels: commit/apply lag, cluster throughput, per-peer replication lag,
-a cluster stat row (term, leader elected, every agent alive, config
-version), heartbeat ages, and repair/drop counters (NAKs sent, replay
-datagrams, receiver drops). Each is a straight PromQL expression over
-contract series — nothing pre-aggregated beyond what the query itself does.
+Thirteen panels in two rows. A **Cluster** row of nine: commit/apply lag,
+throughput, per-peer replication lag, four stat panels (term, a leader elected,
+every agent alive, config version), heartbeat ages, and repair/drop counters
+(NAKs sent, replay datagrams, receiver drops). A **Services (per FSM)** row of
+four: per-FSM apply lag against the bound, per-FSM heartbeat age, every declared
+FSM attached, and declared sets agreeing. Each is a straight PromQL expression
+over contract series — nothing pre-aggregated beyond what the query itself does.
 
 ## The probe endpoints
 
