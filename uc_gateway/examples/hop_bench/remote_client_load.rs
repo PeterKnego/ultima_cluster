@@ -142,7 +142,11 @@ pub fn run(a: Args) -> anyhow::Result<()> {
         a.inflight,
         &[
             ("conns", a.conns.to_string()),
-            ("mode", mode.to_string()),
+            // `report` splices extras into the RESULT line verbatim, so a
+            // STRING value must carry its own quotes or the line is not
+            // valid JSON and every consumer silently reads the point as
+            // "the client died".
+            ("mode", format!("\"{mode}\"")),
             ("waiters", a.waiters.to_string()),
         ],
     );
