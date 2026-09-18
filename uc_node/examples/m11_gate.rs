@@ -24,7 +24,7 @@
 //!
 //! Real subprocesses throughout: `cargo test`/`cargo build` shell-outs for
 //! rows 1-3, the real `uc2-node`/`uc2ctl` daemon/CLI binaries (built on
-//! demand — see `examples/uc_crashtest/tests/enospc.rs`'s doc for why
+//! demand — see `testing/uc_crashtest/tests/enospc.rs`'s doc for why
 //! `CARGO_BIN_EXE_*` doesn't reach an `examples/` binary here either, since
 //! this file lives in the SAME package as `uc2-node` but is still an
 //! `examples/` target) for row 4's live scrape and row 5's smoke, and
@@ -535,7 +535,7 @@ fn try_scrape(addr: SocketAddr) -> Option<String> {
 }
 
 /// Drain a piped child stream on a background thread so a full pipe can never
-/// deadlock the child (same concern `examples/uc_crashtest/tests/enospc.rs`'s
+/// deadlock the child (same concern `testing/uc_crashtest/tests/enospc.rs`'s
 /// `capture_stderr` names) — this row doesn't need the daemon's own log text.
 fn drain_in_background<R: Read + Send + 'static>(mut r: R) {
     std::thread::spawn(move || {
@@ -1010,7 +1010,7 @@ fn open_cnc(dir: &Path, app: &str) -> Option<Arc<CncPage>> {
 
 /// Build (once, cached) a package's own `[[bin]]` target on demand and
 /// return its executable path — the hand-rolled `cargo build
-/// --message-format=json` scan `examples/uc_crashtest/tests/enospc.rs` uses
+/// --message-format=json` scan `testing/uc_crashtest/tests/enospc.rs` uses
 /// for the identical reason: `CARGO_BIN_EXE_<name>` is not set for an
 /// `examples/` target, only for integration tests/benchmarks.
 fn build_bin(cache: &'static OnceLock<PathBuf>, pkg: &str, bin: &str, release: bool) -> PathBuf {

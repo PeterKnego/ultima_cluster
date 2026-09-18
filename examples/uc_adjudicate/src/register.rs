@@ -1,4 +1,4 @@
-//! The register adapter: `examples/uc_crashtest`'s `uc_crashtest-service`
+//! The register adapter: `testing/uc_crashtest`'s `uc_crashtest-service`
 //! running `Sessioned<RegisterSm>` (`--sessioned`), the reference SM every
 //! repo capstone already adjudicates. Its purpose here is the B3 paired
 //! rate arm and a with-teeth self-check of the harness against a known-good
@@ -8,7 +8,7 @@
 //!
 //! Wire: bincode (standard config) of `uc_lincheck::register::{Cmd, CmdResp}`
 //! for commands, `()` → `Option<u64>` for the read — exactly what
-//! `examples/uc_crashtest/tests/remote_lin.rs` sends.
+//! `testing/uc_crashtest/tests/remote_lin.rs` sends.
 
 use uc_lincheck::register::{Cmd, CmdResp};
 

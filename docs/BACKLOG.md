@@ -5,7 +5,7 @@
 **Added 2026-09-08**, from the fleet-gate follow-up (see `docs/releases.md`,
 "Known issue at release"); **taken up and bounded 2026-09-12.** The worker
 `join()`, the chaos `join()` and `Reap::drop`'s `kill(); wait()` in
-`examples/uc_crashtest/tests/remote_lin.rs` were the only waits in that test
+`testing/uc_crashtest/tests/remote_lin.rs` were the only waits in that test
 body without a deadline, and so the only places a 60-minute stall could live.
 They are why the 2026-09-08 nightly spent its whole budget and was cancelled
 instead of failing fast — that run took every other nightly job's evidence

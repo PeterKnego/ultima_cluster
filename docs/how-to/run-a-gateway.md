@@ -242,7 +242,7 @@ dead node hears `UNKNOWN` sooner and re-sends somewhere useful sooner;
 comes back `replayed` or applies exactly once. Longer means a genuinely slow
 but *live* request is less likely to be called `UNKNOWN` prematurely. Since
 the resend is safe and the alternative is a stalled client, err short. (The
-same reasoning is why `examples/uc_crashtest`'s gateway binary runs with a
+same reasoning is why `testing/uc_crashtest`'s gateway binary runs with a
 2 s deadline against a test that kills a node every few seconds.)
 
 A client sees this as: the request resolves `UNKNOWN` after

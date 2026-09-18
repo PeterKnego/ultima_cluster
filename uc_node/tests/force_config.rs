@@ -4,7 +4,7 @@
 //! M11 Task 4: `uc_node::recovery::force_single_member` — the unit layer
 //! (refusals + the version/position math). The quorum-loss e2e (3-node
 //! cluster, SIGKILL two, force, restart, repair) lives in
-//! `examples/uc_crashtest/tests/survival.rs`, behind `survival-tests`
+//! `testing/uc_crashtest/tests/survival.rs`, behind `survival-tests`
 //! (multi-process, out of scope for this in-process suite).
 
 use std::net::{SocketAddr, UdpSocket};

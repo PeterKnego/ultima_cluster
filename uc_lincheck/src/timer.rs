@@ -358,7 +358,7 @@ pub struct TimerStats {
 
 /// The timer oracle, shared by the in-process capstone
 /// (`uc_node/tests/lin_v2.rs`) and the multi-process SIGKILL scenario
-/// (`examples/uc_crashtest/tests/hard_crash.rs`) so neither can drift from the
+/// (`testing/uc_crashtest/tests/hard_crash.rs`) so neither can drift from the
 /// other. Panics with a located message on the first violation; the
 /// cross-replica identity check lives in the capstone, which is the only
 /// caller holding several reports.

@@ -565,7 +565,7 @@ journal segments' worth — chosen because that is the fail-stop the archive
 actually hits: any write or fsync error on the journal, `ENOSPC` included,
 halts the writer, the archive agent panics, and the daemon exits 1 for
 systemd to restart. This is *asserted*, not merely documented — see
-`examples/uc_crashtest/tests/enospc.rs`. Purging (or growing the disk) before
+`testing/uc_crashtest/tests/enospc.rs`. Purging (or growing the disk) before
 this alert escalates is the whole point of watching it; see
 [Keep the journal from growing without bound](bound-journal-growth.md).
 

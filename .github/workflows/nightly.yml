@@ -137,7 +137,7 @@ jobs:
         run: cargo test -p counter --features quickstart-tests --test quickstart_local -- --nocapture
 
   # M8 Task 15: the same suite with wire crypto Enabled on every node the
-  # crashtest bins spawn (UC2_CRYPTO=1 — see examples/uc_crashtest/tests/
+  # crashtest bins spawn (UC2_CRYPTO=1 — see testing/uc_crashtest/tests/
   # common/mod.rs). A separate job (not a matrix leg on `crashtest`) so a
   # crypto-specific regression is never conflated with a cleartext one, same
   # rationale as every other split in this file.
@@ -175,7 +175,7 @@ jobs:
       # filesystem (scripts/enospc_fixture.sh) needs sudo for mkfs/mount/
       # chown, which ubuntu-latest has (unlike the dev box this was
       # authored on -- see the fixture script's `sudo -n true` probe and
-      # examples/uc_crashtest/tests/enospc.rs's module doc). The sudo-free
+      # testing/uc_crashtest/tests/enospc.rs's module doc). The sudo-free
       # `write_denied_drives_the_same_failstop_chain` sibling in the same
       # test file runs unconditionally once the feature is on, with or
       # without the fixture step below.

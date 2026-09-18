@@ -204,7 +204,7 @@ it reaches zero. The journal writer **fail-stops** on any write or fsync `io`
 error — `ENOSPC` included — which halts the archive agent, logs
 `agent_failstopped`, and exits the daemon with code 1 for systemd to restart.
 This is loud and asserted by design, not a silent degradation: see
-`examples/uc_crashtest/tests/enospc.rs`. Recovery is exactly "free the space,
+`testing/uc_crashtest/tests/enospc.rs`. Recovery is exactly "free the space,
 then let systemd restart it" — no special procedure; the node rejoins by
 replaying its journal, the same as any other clean restart.
 

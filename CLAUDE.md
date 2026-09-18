@@ -673,9 +673,13 @@ Workspace crates:
   (`Cmd`/`CmdResp`/`RegisterSm: uc_service::StateMachine`). One source of truth
   shared by the in-process lincheck capstone (`uc_node/tests/lin_v2.rs`) and the
   multi-process hard-crash test.
-- `examples/uc_crashtest` — multi-process test harness: reference bins (node +
+- `testing/uc_crashtest` — multi-process test harness: reference bins (node +
   service halves over a shared instance_dir) + the hard-crash tests behind the
   `hard-crash-tests` feature. The real `kill -9` path for reconstruction validation.
+  **`testing/` is internal harnesses, `examples/` is teaching material** — a
+  crate that spawns processes and SIGKILLs them is not a pattern to copy, so it
+  does not live beside `counter` and `kv` ([`testing/README.md`](testing/README.md)).
+  Package names are unaffected by the directory, so `-p uc_crashtest` is unchanged.
 - `uc_journal` — segmented append journal + `StableValue`. In-tree workspace
   member (moved in from `ultima_db`; full history preserved).
 
@@ -869,7 +873,7 @@ Correctness is proven at three levels: the deterministic sim (`uc_sim`, safety
 invariants + seeded fuzz), the WGL lincheck capstones (`uc_node/tests/lin_v2.rs`
 under failover AND purge/snapshot churn; `lin_partition_v2.rs` under
 partition/quorum-loss — all driving the untouched `uc_lincheck` checker), and the
-multi-process SIGKILL crashtest (`examples/uc_crashtest`).
+multi-process SIGKILL crashtest (`testing/uc_crashtest`).
 
 ## Code conventions
 

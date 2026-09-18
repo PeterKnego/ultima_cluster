@@ -203,7 +203,7 @@ Also outside the promise:
   `uc_gateway/test-util` (`Edge::fault_for_tests`),
   `uc_protocol/uc-bench-probes`, `uc_journal/bench-support`,
   `uc_node/mutation-testing` and `uc_consensus/mutation-testing`.
-- **`uc_sim`, `uc_lincheck`, `examples/counter`, `examples/uc_crashtest`.**
+- **`uc_sim`, `uc_lincheck`, `examples/counter`, `testing/uc_crashtest`.**
   These are `publish = false`: the proof and teaching apparatus, not the
   product. Nothing in them is API, and they are not on crates.io.
 

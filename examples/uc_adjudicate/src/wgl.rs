@@ -2,7 +2,7 @@
 //! kills, the acked-write-loss oracle, and (with `churn`) snapshot + purge
 //! churn with the install observation the gate's row iii demands.
 //!
-//! Shape: `examples/uc_crashtest/tests/remote_lin.rs`, generalised — N
+//! Shape: `testing/uc_crashtest/tests/remote_lin.rs`, generalised — N
 //! workers each with a `RemoteClient`, a chaos thread that SIGKILLs the
 //! serving leader every `kill_period` and supervises respawns, one
 //! `GenHistory<KvOp, KvResp>` PER KEY (the checker sees one register at a

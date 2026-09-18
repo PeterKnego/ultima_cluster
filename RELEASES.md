@@ -467,7 +467,7 @@ deferrals M14c left open. The coverage record, with what is still open:
 - **`SIGKILL` with two FSMs** — `two_fsm_service_sigkill` kills and respawns
   one FSM's process under load; `two_fsm_node_sigkill` kills the node and both
   services together and brings them all back
-  ([`examples/uc_crashtest/tests/hard_crash.rs`](examples/uc_crashtest/tests/hard_crash.rs)).
+  ([`testing/uc_crashtest/tests/hard_crash.rs`](testing/uc_crashtest/tests/hard_crash.rs)).
   Real processes, real `kill -9`; every FSM history linearizable and the
   equivalence oracle at zero across every restart.
 - **Elle runs with two FSMs** — a new `quiet_two_fsm` pass records **one

@@ -31,7 +31,7 @@
 //! daemons are built on demand via `cargo build -p <pkg> --bin <bin>
 //! --message-format=json`, whose emitted artifact path is parsed out by hand
 //! (the technique `escargot` automates; copied from
-//! `examples/uc_crashtest/tests/enospc.rs` so this crate needs no new
+//! `testing/uc_crashtest/tests/enospc.rs` so this crate needs no new
 //! dev-dependency).
 #![cfg(feature = "quickstart-tests")]
 

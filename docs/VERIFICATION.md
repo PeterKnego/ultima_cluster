@@ -457,8 +457,8 @@ as `Indeterminate` in both histories rather than silently taken from FSM 0.
 | `two_fsm_slow` | `uc_node/tests/lin_v2.rs` | a fast FSM beside `Slow<RegisterSm, 200>` (200 µs/apply), bounded |
 | `two_fsm_slow_lockstep` | `uc_node/tests/lin_v2.rs` | the same pair in lockstep |
 | `minority_partition_and_heal_two_fsm` | `uc_node/tests/lin_partition_v2.rs` | minority partition, quorum loss and heal, per-FSM WGL before and after |
-| `two_fsm_service_sigkill` | `examples/uc_crashtest/tests/hard_crash.rs` | §5 — FSM 1's process `SIGKILL`ed mid-load |
-| `two_fsm_node_sigkill` | `examples/uc_crashtest/tests/hard_crash.rs` | §5 — the node and both services killed together |
+| `two_fsm_service_sigkill` | `testing/uc_crashtest/tests/hard_crash.rs` | §5 — FSM 1's process `SIGKILL`ed mid-load |
+| `two_fsm_node_sigkill` | `testing/uc_crashtest/tests/hard_crash.rs` | §5 — the node and both services killed together |
 | `two_fsm_timer_churn_under_failover` | `uc_node/tests/lin_v2.rs` | `2.11.0` — row 1 is `Timed<TimerSm>` under sustained schedule/cancel churn plus node kills forcing leader changes with instances in flight; every node's `fired`/`scheduled`/`cancelled` record must agree (replication equivalence) and pass the shared `uc_lincheck::timer::assert_timer_report` oracle |
 
 Two more tests keep those honest rather than adding coverage of their own:
@@ -624,7 +624,7 @@ build is byte-identical and the read-path mutation is `#[cfg]`-shadowed out.
 
 ## 5. Multi-process hard crash
 
-**Location:** [`examples/uc_crashtest/`](/examples/uc_crashtest)
+**Location:** [`testing/uc_crashtest/`](/testing/uc_crashtest)
 
 Real node and service processes, `SIGKILL`ed mid-load. Recovery is required to
 stay linearizable — not merely to start up.
@@ -1140,7 +1140,7 @@ The most important section, and the one most projects omit.
     `two_fsm_slow`, `two_fsm_slow_lockstep` (`uc_node/tests/lin_v2.rs`),
     `minority_partition_and_heal_two_fsm`
     (`uc_node/tests/lin_partition_v2.rs`), and `two_fsm_service_sigkill` /
-    `two_fsm_node_sigkill` (`examples/uc_crashtest/tests/hard_crash.rs`).
+    `two_fsm_node_sigkill` (`testing/uc_crashtest/tests/hard_crash.rs`).
     Each checks **one WGL history per FSM** with the untouched `uc_lincheck`
     checker (§3, §5).
   - **The replication-equivalence oracle** — every `submit_all`'s per-FSM
@@ -1230,7 +1230,7 @@ The most important section, and the one most projects omit.
     **`sigkill_mid_config_window` and `leader_node_sigkill_recovery_multi`
     failed reproducibly on this box, including on the pristine pre-FSM-identity
     base commit with none of this work's changes applied** (verified by a
-    stash round-trip against `examples/uc_crashtest`, which this work does
+    stash round-trip against `testing/uc_crashtest`, which this work does
     not touch), both with the same `cnc attach error: No such file or
     directory` after a real SIGKILL + respawn under a tight
     `UC2_CLIENT_TIMEOUT_MS=1500`. This is a pre-existing flake

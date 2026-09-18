@@ -18,7 +18,7 @@ everything under `packaging/`, the rustdoc of the
 published crates, and the `examples/counter` source. Not the engineering
 record (`docs/superpowers`, `docs/benchmarks`, `docs/releases.md`,
 `docs/VERIFICATION.md`, `docs/BACKLOG.md`, `docs/agents`, `CLAUDE.md`), not
-crate source, not test apparatus such as `examples/uc_crashtest`. For
+crate source, not test apparatus such as `testing/uc_crashtest`. For
 a clean-room run it is a snapshot: the docs from `main` at the commit the
 sandbox was assembled, the binaries and crates from the release under test.
 _Avoid_: the docs, everything in docs/, the repo
