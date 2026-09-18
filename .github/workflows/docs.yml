@@ -52,7 +52,7 @@ jobs:
       - name: Build rustdoc
         run: >
           cargo doc --workspace --no-deps --lib
-          --exclude counter --exclude uc_crashtest --exclude uc_adjudicate
+          --exclude counter --exclude kv_store --exclude uc_crashtest --exclude uc_adjudicate
 
       - name: Install the landing page
         run: cp .github/pages/index.html target/doc/index.html

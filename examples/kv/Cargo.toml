@@ -1,0 +1,47 @@
+[package]
+name = "kv_store"
+description = "The replicated key-value store dogfood app: kv-service (the service half) and kv (a remote CLI client) built on the ultima_cluster SDK — the worked example for docs/tutorials/build-an-application.md"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+keywords.workspace = true
+categories.workspace = true
+publish = false
+
+# The service half: the KV state machine attached to a uc2-node.
+[[bin]]
+name = "kv-service"
+path = "src/bin/kv-service.rs"
+
+# The remote CLI client: talks TCP to a uc2-gateway via uc_remote.
+[[bin]]
+name = "kv"
+path = "src/bin/kv.rs"
+
+# A load generator for the throughput/latency arm.
+[[bin]]
+name = "kv-load"
+path = "src/bin/kv-load.rs"
+
+[features]
+# The three-node cluster tests spawn the release binaries and take tens of
+# seconds; opt in with `cargo test --features cluster-tests`.
+cluster-tests = []
+
+[dependencies]
+uc_service = { path = "../../uc_service", version = "2.12.0" }
+uc_remote  = { path = "../../uc_remote", version = "2.12.0" }
+bytes       = { workspace = true }
+im          = "15"
+clap        = { workspace = true }
+anyhow      = { workspace = true }
+signal-hook = { workspace = true }
+
+[dev-dependencies]
+proptest = "1"
+tempfile = { workspace = true }
+libc     = { workspace = true }
