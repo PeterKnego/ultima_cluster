@@ -178,14 +178,16 @@ safely. Wait, or reduce write load, and try again.
 
 ## Remove a voter
 
-You cannot remove a voter directly. Demote it first:
+Remove a voter directly:
 
 ```bash
-uc2ctl demote        --instance-dir D --app-id A --id 4
-uc2ctl remove-learner --instance-dir D --app-id A --id 4
+uc2ctl remove-voter --instance-dir D --app-id A --id 4
 ```
 
-Removal tombstones the id permanently.
+The change is a reconfiguration like any other, so a healthy quorum must be
+able to commit it. Demoting the voter to a learner first (`uc2ctl demote`,
+then `remove-learner`) is also accepted but is not required. Removal
+tombstones the id permanently.
 
 ## Resize the cluster
 

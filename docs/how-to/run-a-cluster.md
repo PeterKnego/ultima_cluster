@@ -118,6 +118,9 @@ addr = "10.0.0.11:9100"
 id = 2
 addr = "10.0.0.12:9100"
 
+[services]
+names = ["myapp"]
+
 [crypto]
 enabled = false
 
