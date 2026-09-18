@@ -32,6 +32,7 @@ mod dummy_edge;
 mod dummy_node;
 mod engine_load;
 mod local;
+mod remote_client_load;
 mod remote_load;
 mod stats;
 
@@ -62,6 +63,11 @@ enum Role {
     Blaster(blaster::Args),
     /// Hop-3 driver: N real remote clients on the `RemoteEngine` halves.
     RemoteLoad(remote_load::Args),
+    /// Hop-3 driver: N real remote clients on the blocking `RemoteClient`
+    /// (per-call waiters, or a window of tickets) — the twin of `remote-load`
+    /// for the developer-facing client, isolating the wrapper's per-request
+    /// lock, allocation and condvar wakeup (#43 step 2).
+    RemoteClientLoad(remote_client_load::Args),
     /// Hop-3 sink: TCP server answering every SUBMIT immediately. Parks until killed.
     DummyEdge(dummy_edge::Args),
     /// Dev-box smoke: run the composition matrix with subprocesses.
@@ -154,6 +160,7 @@ fn main() -> anyhow::Result<()> {
         Role::Edge(a) => run_edge(a),
         Role::Blaster(a) => blaster::run(a),
         Role::RemoteLoad(a) => remote_load::run(a),
+        Role::RemoteClientLoad(a) => remote_client_load::run(a),
         Role::DummyEdge(a) => dummy_edge::run(a),
         Role::Local(a) => local::run(a),
     }

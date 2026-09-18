@@ -325,6 +325,38 @@ def tcp_ladder(S, C, a, points, arm_label, hop, sink_unit, gateway, driver):
         extra={"hop": hop, "inflight": a.inflight, "n": 1, "driver": driver, "ref": True}))
 
 
+def remote_client_ladder(S, C, a, points, sink_unit, gateway):
+    """#43 step 2: the blocking `RemoteClient` — the developer-facing client —
+    against the same sink as arm C, in the two shapes developers use.
+    `window` is depth-matched to `remote-load` (same --inflight, same conns
+    ladder): the fair engine-vs-blocking comparison. `per-call` is one request
+    in flight per waiter thread, the shape a request handler falls into: it
+    shows the latency-bound ceiling a caller sees without a window."""
+    base = ["remote-client-load", "--gateways", gateway, "--app-id", HOP_APP,
+            "--secs", str(a.secs), "--payload", str(a.payload)]
+    for n in ladder(a.conns):
+        points.append(run_point(
+            f"C2 hop3 remote-client(window)→dummy-edge conns={n} inflight={a.conn_inflight}", S, C,
+            base + ["--mode", "window", "--inflight", str(a.conn_inflight), "--conns", str(n)],
+            "remote-client", a.secs, a, edge_unit=sink_unit,
+            extra={"hop": "3c", "inflight": a.conn_inflight, "n": n,
+                   "driver": "remote-client", "mode": "window"}))
+    points.append(run_point(
+        f"C2 hop3 remote-client(window)→dummy-edge conns=1 inflight={a.inflight} (deep ref)", S, C,
+        base + ["--mode", "window", "--inflight", str(a.inflight), "--conns", "1"],
+        "remote-client", a.secs, a, edge_unit=sink_unit,
+        extra={"hop": "3c", "inflight": a.inflight, "n": 1,
+               "driver": "remote-client", "mode": "window", "ref": True}))
+    for w in (1, 4, 16, 64):
+        points.append(run_point(
+            f"C3 hop3 remote-client(per-call)→dummy-edge conns=1 waiters={w}", S, C,
+            base + ["--mode", "per-call", "--waiters", str(w),
+                    "--inflight", str(a.conn_inflight), "--conns", "1"],
+            "remote-client", a.secs, a, edge_unit=sink_unit,
+            extra={"hop": "3c", "inflight": a.conn_inflight, "n": 1,
+                   "driver": "remote-client", "mode": "per-call", "waiters": w}))
+
+
 def arm_hop3(S, C, a, points):
     start_dummy_edge(S, a, credits=max(a.inflight, a.conn_inflight))
     gw = f"{S.private_ip}:{DUMMY_EDGE_PORT}"
@@ -342,6 +374,9 @@ def arm_hop3(S, C, a, points):
                 "blaster", a.secs, a, edge_unit="hb-dedge",
                 extra={"hop": "3f", "inflight": a.conn_inflight, "n": 1, "driver": "blaster", "batch": batch}))
         tcp_ladder(S, C, a, points, "C hop3 remote→dummy-edge", "3", "hb-dedge", gw, "remote")
+        # #43 step 2: the blocking client on the same sink, depth-matched
+        # (window) and in the per-call shape.
+        remote_client_ladder(S, C, a, points, "hb-dedge", gw)
     finally:
         kill_unit(S, "hb-dedge")
 
@@ -870,10 +905,14 @@ def main():
                                      probe_bin=m12.BUILT_PROBE)
     prep_idx = [int(x) for x in a.prepare_hosts.split(",")] if a.prepare_hosts else list(range(len(hop_hosts)))
     prep = [hop_hosts[i] for i in prep_idx]
+    # `--no-sync` means "skip the rsync + build" (its own help text), so it
+    # must skip `prepare_host` too — that IS the build. Without this, a run
+    # against hosts that already carry the binary still tries an on-host
+    # cargo build and fails on a toolchain-free host.
     if not a.no_sync:
         sync_tree(prep, a.local_tree)
-    for h in prep:
-        prepare_host(h)
+        for h in prep:
+            prepare_host(h)
     for h in hop_hosts:
         for u in ("hb-dnode", "hb-dedge", "hb-edge", "hb-client", "node", "service", "edge"):
             kill_unit(h, u)
