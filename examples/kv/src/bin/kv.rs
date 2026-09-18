@@ -96,6 +96,9 @@ fn parse_bytes(s: &str, hex: bool, what: &str) -> Result<Vec<u8>, Fail> {
         return Ok(s.as_bytes().to_vec());
     }
     let s = s.trim();
+    if !s.is_ascii() {
+        return Err(Fail::Args(format!("{what}: non-hex characters")));
+    }
     if !s.len().is_multiple_of(2) {
         return Err(Fail::Args(format!("{what}: odd-length hex")));
     }
