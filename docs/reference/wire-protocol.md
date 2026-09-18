@@ -10,8 +10,8 @@ self-locating header is in [Architecture](../ARCHITECTURE.md).
 
 | Constant | Value |
 |---|---|
-| `version::CURRENT` | `0.7.0` (`0.8.0`, `2.12.0` pending: two new pairwise kinds for jumbo-frame MTU discovery, `PROBE` (24) and `PROBE_ACK` (25); no existing layout changes) |
-| cnc page version | 3.1 (FSM identity + log time, 2.11.0: the name + hash line at boot, the version word at attach, `log_time_ns`, per-row `timers_pending`) (3.2, `2.12.0` pending: a live `payload_ceiling` word) |
+| `version::CURRENT` | `0.7.0` (`0.8.0`, since `2.12.0`, two new pairwise kinds for jumbo-frame MTU discovery, `PROBE` (24) and `PROBE_ACK` (25); no existing layout changes) |
+| cnc page version | 3.1 (FSM identity + log time, 2.11.0: the name + hash line at boot, the version word at attach, `log_time_ns`, per-row `timers_pending`) (3.2, since `2.12.0`, a live `payload_ceiling` word) |
 
 The cnc page carries its own version gate, `CNC_V2_VERSION`, which is
 independent of this one. cnc 3.1 changed the same-host shmem layout only
@@ -48,7 +48,7 @@ a protocol mismatch is refused.
 | | |
 |---|---|
 | `DATAGRAM_HEADER_LEN` | 16 B |
-| `MTU_DEFAULT` | 1408 B — the baseline rung every cluster starts from; the ladder is `RUNGS` (`2.12.0` pending, see [Limits](limits.md#hard-limits)) |
+| `MTU_DEFAULT` | 1408 B — the baseline rung every cluster starts from; the ladder is `RUNGS` (`2.12.0`, see [Limits](limits.md#hard-limits)) |
 
 The header is authenticated as AAD when wire crypto is enabled, and carries a
 `key_epoch` field for the group key.
@@ -81,8 +81,8 @@ The header is authenticated as AAD when wire crypto is enabled, and carries a
 | 15 | `SNAP_DONE` | pairwise |
 | 22 | `SNAP_REQUEST` | pairwise |
 | 23 | `SNAP_REDIRECT` | pairwise |
-| 24 | `PROBE` | pairwise (`0.8.0`, `2.12.0` pending — jumbo-frame MTU discovery) |
-| 25 | `PROBE_ACK` | pairwise (`0.8.0`, `2.12.0` pending — jumbo-frame MTU discovery) |
+| 24 | `PROBE` | pairwise (`0.8.0`, `2.12.0` — jumbo-frame MTU discovery) |
+| 25 | `PROBE_ACK` | pairwise (`0.8.0`, `2.12.0` — jumbo-frame MTU discovery) |
 
 Kind **21** was `SNAP_TABLE` — the schedule table carried beside a session —
 and is **retired** (`DGRAM_KIND_SNAP_TABLE_RETIRED`). The table now rides the
@@ -197,7 +197,7 @@ joiner then sends its `SNAP_REQUEST` to the named learner. A redirect naming
 a node the joiner does not know is dropped and recorded
 (`snapshot_redirect_unknown`).
 
-#### `PROBE` / `PROBE_ACK` bodies (wire 0.8.0, `2.12.0` pending)
+#### `PROBE` / `PROBE_ACK` bodies (wire 0.8.0, `2.12.0`)
 
 Jumbo-frame MTU discovery: a node sends a `PROBE` at one rung of
 `RUNGS = [1408, 8832, 8960]` to a peer, and the peer's do-not-fragment socket
@@ -276,7 +276,7 @@ wrap; padding fills exactly to it.
 The header is still 32 bytes, and the header's own size did not change the
 payload ceiling: 1344 B crypto-off / 1312 B crypto-on at the 1408 B baseline
 rung, up to 8896 B / 8864 B at the 8960 B top rung once every path in the
-cluster has proven it (`2.12.0` pending — the ceiling is discovered, not a
+cluster has proven it (`2.12.0` — the ceiling is discovered, not a
 source constant; see [Limits](limits.md#hard-limits)). `2.11.0` **relaid** it rather than growing it:
 through `0.6.0` the two id fields were `session_id: u64` and
 `correlation_id: u64`, of which the client only ever filled 32 bits each, so
@@ -331,11 +331,11 @@ otherwise the kind plus the payload slice. Per kind:
 |---|---|---|
 | `1` Membership | the `ClusterConfig` encoding `CONFIG` carried through `0.6.0`, unchanged | `uc_protocol::v2::config` |
 | `2` ScheduleTable | the whole table — an 8-byte header plus `count × 33` bytes, at most `MAX_SCHEDULE_ENTRIES = 32`, so **≤ 1064 B**. Layout below | `uc_protocol::v2::schedule` |
-| `3` Settings | `SETTINGS_LEN = 33` bytes exactly (**`2.12.0` pending**; was 29 through `2.11.0`): `version u32 = 2 ‖ fsm_lag_bytes u64 @4 ‖ admission_bytes u64 @12 ‖ snapshot_interval_bytes u64 @20 ‖ snapshot_target u8 @28 ‖ datagram_mtu u32 @29`. `0` in any u64 means "derive at use"; `fsm_lag_bytes = u64::MAX` (`FSM_LAG_LOCKSTEP`) means lockstep; `snapshot_target` is `0` = all, `1` = learners; `datagram_mtu` is `0` (= the `MTU_DEFAULT` baseline) or a member of `RUNGS`, discovered and monotone, never operator-written. A **version `1`** record — 29 B, `SETTINGS_LEN_V1`, the `2.11.0` shape — is still ACCEPTED on read and maps to `datagram_mtu = 0`, because the cluster artifact and committed `CLUSTER` frames survive the upgrade; an encoder always writes version 2. No trailing bytes are tolerated, and no other `(version, len)` pair decodes | `uc_protocol::v2::settings` |
+| `3` Settings | `SETTINGS_LEN = 33` bytes exactly (**`2.12.0`**; was 29 through `2.11.0`): `version u32 = 2 ‖ fsm_lag_bytes u64 @4 ‖ admission_bytes u64 @12 ‖ snapshot_interval_bytes u64 @20 ‖ snapshot_target u8 @28 ‖ datagram_mtu u32 @29`. `0` in any u64 means "derive at use"; `fsm_lag_bytes = u64::MAX` (`FSM_LAG_LOCKSTEP`) means lockstep; `snapshot_target` is `0` = all, `1` = learners; `datagram_mtu` is `0` (= the `MTU_DEFAULT` baseline) or a member of `RUNGS`, discovered and monotone, never operator-written. A **version `1`** record — 29 B, `SETTINGS_LEN_V1`, the `2.11.0` shape — is still ACCEPTED on read and maps to `datagram_mtu = 0`, because the cluster artifact and committed `CLUSTER` frames survive the upgrade; an encoder always writes version 2. No trailing bytes are tolerated, and no other `(version, len)` pair decodes | `uc_protocol::v2::settings` |
 
 The largest of the three is the table at 1064 B, inside the 1312 B crypto-on
 ceiling at the 1408 B baseline rung — the floor the ceiling only rises from
-once a jumbo path is discovered (`2.12.0` pending; up to 8864 B crypto-on at
+once a jumbo path is discovered (`2.12.0`; up to 8864 B crypto-on at
 the top rung) — so a `CLUSTER` frame always fits one datagram
 ([Limits](limits.md#hard-limits)).
 
@@ -429,7 +429,7 @@ Each entry, `SCHEDULE_ENTRY_LEN = 33`:
 
 A full table is `8 + 32 × 33 = 1064` bytes; with the 8-byte `CLUSTER` prefix
 that is 1072 B of payload, inside the 1312 B crypto-on ceiling at the 1408 B
-baseline rung (`2.12.0` pending: up to 8864 B crypto-on once a jumbo path is
+baseline rung (since `2.12.0`, up to 8864 B crypto-on once a jumbo path is
 discovered), so the frame always fits one datagram
 ([Limits](limits.md#hard-limits)).
 

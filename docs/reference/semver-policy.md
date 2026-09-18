@@ -248,11 +248,11 @@ change is a flag day regardless of the digit.
   different, so mixing versions is not merely unsupported, it is unsound.
   Upgrade every node together.
 
-### The pending `2.12.0` flag day
+### The `2.12.0` flag day
 
 Jumbo-frame MTU discovery is a further, separate flag day: wire `0.7.0` →
 `0.8.0` and cnc `3.1` → `3.2`. Two new **pairwise** datagram kinds, `PROBE`
-(24) and `PROBE_ACK` (25) ([wire protocol](wire-protocol.md#probe--probe_ack-bodies-wire-080-2120-pending)),
+(24) and `PROBE_ACK` (25) ([wire protocol](wire-protocol.md#probe--probe_ack-bodies-wire-080-2120)),
 and one new live cnc word, `payload_ceiling` at offset 3984
 ([cnc page](cnc-page.md#counters-and-status)) — no existing wire layout
 changes, unlike `2.11.0`'s relaid log frame header. The replicated Settings

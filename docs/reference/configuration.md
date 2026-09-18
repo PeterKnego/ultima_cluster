@@ -226,7 +226,7 @@ Log ring buffer capacity. Must be a power of two. This much disk is reserved
 at startup (see [Instance directory](instance-directory.md#on-disk-footprint));
 a node that cannot reserve it refuses to start.
 
-**`max_payload`** — **retired, `2.12.0` pending.** Refused by name at
+**`max_payload`** — **retired in `2.12.0`.** Refused by name at
 startup. The payload ceiling this key used to pin is now DISCOVERED per
 cluster: every node probes every peer up the rung ladder `RUNGS = [1408,
 8832, 8960]`, and the leader commits `min` over every member's probed path
