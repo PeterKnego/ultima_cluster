@@ -121,9 +121,18 @@ Recorded, not fixed: a v1 client reading a v2 list key fails with an "outcome
 unknowable" exit code, so old clients must be upgraded before any list is
 created (L48); a fresh cluster starts mid-term (L7); two critical alerts fire
 for one absent-service fact (L32); and remote reads always reach the leader
-(the same remote-protocol-v2 boundary the builder recorded). These are the
-cost of the operating envelope at 2.12.0, documented so an operator meets them
-in the docs rather than in production.
+(the same remote-protocol-v2 boundary the builder recorded). A handful of
+smaller warts are recorded in the ledger and left as they are: `status` prints
+a row's id where its name would read better (L6); a rejoined node given a new
+id needs its peers' gateway member maps updated by hand (L26); a running node
+survives a full disk, because the M11 preallocation makes the fault a boot
+refusal rather than a mid-run failure (L27); the `Uc2ServiceAbsent` remedy is
+simply to restart the service, and a harmless `service_detached` line follows
+each successful reattach (L34); the `kv-service` crash message can blame the
+node when the real cause is a wrong path (L37); and a planned learner pages
+`Uc2ServiceAbsent` in the window before its own service starts (L42). These are
+the cost of the operating envelope at 2.12.0, documented so an operator meets
+them in the docs rather than in production.
 
 ## The verdict
 

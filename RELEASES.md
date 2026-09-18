@@ -7,6 +7,40 @@ analyses, wire-version mechanics, upgrade remedies — is
 (pre-committed bars, fleet runs) are in
 [`docs/benchmarks/`](docs/benchmarks).
 
+## Unreleased
+
+**The application lifecycle, documented end to end.** A clean-room dogfood — one
+agent building a real service on UC from the published docs alone, a second
+operating a real fleet through faults, reconfiguration, and an upgrade — drove
+the documentation from a set of per-milestone gate docs to a lifecycle a
+stranger can follow. The proof is a worked example now in the tree, and the
+friction the dogfood hit is filed as fixes and tickets.
+
+- **`examples/kv`: a replicated key-value store, merged in-tree.** The first
+  shipped `SnapshotStateMachine` + `Sessioned` worked example — coordinated
+  snapshots, exactly-once over a remote hop, a two-shape v2 that reads v1
+  images, and real-cluster tests including the flag-day upgrade.
+  [`examples/kv`](examples/kv).
+- **A lifecycle tutorial.**
+  [Build an application](docs/tutorials/build-an-application.md) walks design →
+  build → test → package → deploy → operate → upgrade with the KV store as the
+  worked example — the empty Diátaxis tutorial slot, filled.
+- **An application-upgrade how-to.**
+  [Upgrade an application](docs/how-to/upgrade-an-application.md): the flag-day
+  procedure at 2.12.0, what to back up first (the rollback artifact does not
+  survive the upgrade), and why a rolling swap is not safe yet.
+- **Two experience reports** —
+  [builder](docs/notes/uc2-dogfood-kv-builder-report.md) and
+  [operator](docs/notes/uc2-dogfood-kv-operator-report.md) — the honest account
+  of building and running UC from the docs alone: both buildable and operable,
+  with the friction concentrated in the upgrade story and in observability.
+- **Reference and how-to fixes** from the two friction ledgers: the stale
+  "2.12.0 pending" annotations swept now that 2.12.0 has shipped, a
+  voter-down / partition / lost-disk diagnosis section, response and
+  `Sessioned`-envelope payload limits, the dashboard's real panel inventory, and
+  the new member's config — plus product tickets for the observability and
+  packaging gaps the dogfood surfaced (#33–#42).
+
 ## v2.12.0 — 2026-09-13 — jumbo frames, and the monotonic log clock
 
 Two features on one flag day. The command payload ceiling stops being a source
