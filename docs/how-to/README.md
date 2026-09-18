@@ -77,11 +77,18 @@ something is wrong" below.
 ## Building on it
 
 Read [the SDLC standard for applications](../reference/application-sdlc.md)
-first: it is the lifecycle every page below is a step of.
+first: it is the lifecycle every page below is a step of. The
+[Build an application](../tutorials/build-an-application.md) tutorial walks that
+whole lifecycle end to end with a worked example (`examples/kv`); the pages
+below are its individual steps in depth.
 
 - [Write a service binary](write-a-service-binary.md) — the lifecycle template
   for the half that runs your state machine: signal handling, apply-agent
   supervision, and why leaving either out fails quietly.
+- [Upgrade an application](upgrade-an-application.md) — move a running cluster
+  from one application version to the next: the flag-day procedure at 2.12.0,
+  what to back up first (the rollback artifact does not survive the upgrade),
+  and why a rolling swap is not safe yet.
 - [Schedule work inside a state machine](schedule-work-in-a-service.md) — name
   your FSM, give it a deterministic clock, ask to be woken with
   `ctx.schedule`, handle it in `on_timer`, and decide whether you need
