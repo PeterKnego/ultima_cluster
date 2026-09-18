@@ -19,6 +19,14 @@ the node never opens the port. See
 [`packaging/node.example.toml`](../../packaging/node.example.toml) for the
 annotated copy.
 
+The endpoint serves three paths. `/metrics` is the Prometheus scrape;
+`/healthz` reports that the node process is alive; and `/readyz` reports that
+the node can *serve*. `/readyz` keys on `can_serve`, not on the leader flag, so
+a node whose service has not attached yet — the nodes are up but no
+`kv-service` has been started — reports **not ready** even though the cluster
+is healthy at the node layer. Expect `/readyz` to turn 200 only once a service
+is attached and caught up, not after the cluster alone comes up.
+
 A bind failure (port already held, say) is a **runtime failure, exit 1** —
 the same retried-by-systemd class as any other post-preflight startup error,
 not the config-refusal exit 2. See
@@ -40,6 +48,10 @@ numbers, peer addresses and ids, and counters. No application data, no
 command bytes, no client identities ever appear on it.
 
 ## Scrape it with Prometheus
+
+Install Prometheus and Grafana however you normally would — your OS package
+manager, or their upstream distributions. This guide *configures* them; it does
+not package them, and nothing in the release tarball installs them for you.
 
 One target per node, all on port 9600 (or whatever `bind` you chose):
 
