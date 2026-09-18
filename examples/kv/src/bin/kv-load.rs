@@ -14,7 +14,10 @@ use kv_store::wire::{self, GetReply, WriteReply};
 use uc_remote::{Consistency, RemoteClient, RemoteConfig, Ticket};
 
 #[derive(Parser)]
-#[command(name = "kv-load", about = "Loads N keys into a kv cluster through its gateways")]
+#[command(
+    name = "kv-load",
+    about = "Loads N keys into a kv cluster through its gateways"
+)]
 struct Args {
     #[arg(long, value_delimiter = ',', required = true)]
     gateways: Vec<String>,
@@ -47,7 +50,11 @@ fn value_for(i: u64, n: usize) -> Vec<u8> {
 
 fn main() -> anyhow::Result<()> {
     let a = Args::parse();
-    anyhow::ensure!(a.value_bytes <= wire::MAX_VALUE, "--value-bytes > {}", wire::MAX_VALUE);
+    anyhow::ensure!(
+        a.value_bytes <= wire::MAX_VALUE,
+        "--value-bytes > {}",
+        wire::MAX_VALUE
+    );
     let client = RemoteClient::connect(RemoteConfig {
         app_id: a.app_id.clone(),
         members: a.gateways.clone(),
@@ -60,19 +67,20 @@ fn main() -> anyhow::Result<()> {
     let mut inflight: VecDeque<(u64, Ticket)> = VecDeque::new();
     let mut bytes = 0u64;
     let mut replayed = 0u64;
-    let drain = |inflight: &mut VecDeque<(u64, Ticket)>, replayed: &mut u64| -> anyhow::Result<()> {
-        if let Some((i, t)) = inflight.pop_front() {
-            let r = t.wait()?;
-            if r.replayed {
-                *replayed += 1;
+    let drain =
+        |inflight: &mut VecDeque<(u64, Ticket)>, replayed: &mut u64| -> anyhow::Result<()> {
+            if let Some((i, t)) = inflight.pop_front() {
+                let r = t.wait()?;
+                if r.replayed {
+                    *replayed += 1;
+                }
+                match wire::decode_write_reply(&r.bytes)? {
+                    WriteReply::Ok { .. } => {}
+                    other => anyhow::bail!("key {i}: unexpected reply {other:?}"),
+                }
             }
-            match wire::decode_write_reply(&r.bytes)? {
-                WriteReply::Ok { .. } => {}
-                other => anyhow::bail!("key {i}: unexpected reply {other:?}"),
-            }
-        }
-        Ok(())
-    };
+            Ok(())
+        };
     for i in 0..a.keys {
         let key = format!("load:{}:{i}", a.prefix);
         let val = value_for(i, a.value_bytes);
@@ -106,9 +114,13 @@ fn main() -> anyhow::Result<()> {
     let mut i = 0;
     while i < a.keys {
         let key = format!("load:{}:{i}", a.prefix);
-        let r = client.query(&wire::encode_get(key.as_bytes()), Consistency::Linearizable)?.wait()?;
+        let r = client
+            .query(&wire::encode_get(key.as_bytes()), Consistency::Linearizable)?
+            .wait()?;
         match wire::decode_get_reply(&r.bytes)? {
-            GetReply::Found { value, .. } if value[..] == value_for(i, a.value_bytes)[..] => checked += 1,
+            GetReply::Found { value, .. } if value[..] == value_for(i, a.value_bytes)[..] => {
+                checked += 1
+            }
             other => anyhow::bail!("key {key}: verify failed: {other:?}"),
         }
         i += step;

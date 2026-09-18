@@ -74,31 +74,51 @@ pub const BAD_TRAILING: u8 = 6;
 /// A decoded command, borrowing from the frame.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command<'a> {
-    Put { key: &'a [u8], value: &'a [u8] },
-    Delete { key: &'a [u8] },
-    Cas { key: &'a [u8], expected: u64, value: &'a [u8] },
+    Put {
+        key: &'a [u8],
+        value: &'a [u8],
+    },
+    Delete {
+        key: &'a [u8],
+    },
+    Cas {
+        key: &'a [u8],
+        expected: u64,
+        value: &'a [u8],
+    },
     /// v2.
-    Append { key: &'a [u8], value: &'a [u8] },
+    Append {
+        key: &'a [u8],
+        value: &'a [u8],
+    },
 }
 
 /// A decoded query, borrowing from the frame.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Query<'a> {
-    Get { key: &'a [u8] },
+    Get {
+        key: &'a [u8],
+    },
     Digest,
     /// v2.
-    List { key: &'a [u8] },
+    List {
+        key: &'a [u8],
+    },
 }
 
 /// What a client sees back from a `Put`/`Delete`/`CAS`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WriteReply {
     /// `Put`/`CAS`: the new version. `Delete`: the version that was removed.
-    Ok { version: u64 },
+    Ok {
+        version: u64,
+    },
     /// `Delete` of an absent key.
     NotFound,
     /// `CAS` whose expectation did not hold; `current` is `0` when absent.
-    VersionMismatch { current: u64 },
+    VersionMismatch {
+        current: u64,
+    },
     BadRequest(u8),
     /// v2: the key is a list.
     WrongShape,
@@ -107,7 +127,10 @@ pub enum WriteReply {
 /// What a client sees back from a `Get`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GetReply {
-    Found { version: u64, value: Bytes },
+    Found {
+        version: u64,
+        value: Bytes,
+    },
     NotFound,
     BadRequest(u8),
     /// v2: the key is a list.
@@ -118,18 +141,26 @@ pub enum GetReply {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AppendReply {
     /// The list's new version and length.
-    Ok { version: u64, len: u32 },
+    Ok {
+        version: u64,
+        len: u32,
+    },
     /// The key is a value.
     WrongShape,
     /// The list is at a cap; `len` is its unchanged length.
-    ListFull { len: u32 },
+    ListFull {
+        len: u32,
+    },
     BadRequest(u8),
 }
 
 /// v2: what a client sees back from a `List`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ListReply {
-    Found { version: u64, items: Vec<Bytes> },
+    Found {
+        version: u64,
+        items: Vec<Bytes>,
+    },
     NotFound,
     /// The key is a value.
     WrongShape,
@@ -181,10 +212,18 @@ impl std::error::Error for WireError {}
 // ---------------------------------------------------------------- encoders (client side)
 
 fn check_key(key: &[u8]) -> Result<(), WireError> {
-    if key.is_empty() || key.len() > MAX_KEY { Err(WireError::KeyLen(key.len())) } else { Ok(()) }
+    if key.is_empty() || key.len() > MAX_KEY {
+        Err(WireError::KeyLen(key.len()))
+    } else {
+        Ok(())
+    }
 }
 fn check_value(value: &[u8]) -> Result<(), WireError> {
-    if value.len() > MAX_VALUE { Err(WireError::ValueLen(value.len())) } else { Ok(()) }
+    if value.len() > MAX_VALUE {
+        Err(WireError::ValueLen(value.len()))
+    } else {
+        Ok(())
+    }
 }
 
 fn head(op: u8, key: &[u8], extra: usize) -> Vec<u8> {
@@ -243,12 +282,24 @@ pub fn encode_digest() -> Vec<u8> {
 }
 
 /// Panicking conveniences for callers that already checked the sizes (tests).
-pub fn encode_put(key: &[u8], value: &[u8]) -> Vec<u8> { try_encode_put(key, value).expect("sizes checked") }
-pub fn encode_delete(key: &[u8]) -> Vec<u8> { try_encode_delete(key).expect("sizes checked") }
-pub fn encode_cas(key: &[u8], expected: u64, value: &[u8]) -> Vec<u8> { try_encode_cas(key, expected, value).expect("sizes checked") }
-pub fn encode_get(key: &[u8]) -> Vec<u8> { try_encode_get(key).expect("sizes checked") }
-pub fn encode_append(key: &[u8], value: &[u8]) -> Vec<u8> { try_encode_append(key, value).expect("sizes checked") }
-pub fn encode_list(key: &[u8]) -> Vec<u8> { try_encode_list(key).expect("sizes checked") }
+pub fn encode_put(key: &[u8], value: &[u8]) -> Vec<u8> {
+    try_encode_put(key, value).expect("sizes checked")
+}
+pub fn encode_delete(key: &[u8]) -> Vec<u8> {
+    try_encode_delete(key).expect("sizes checked")
+}
+pub fn encode_cas(key: &[u8], expected: u64, value: &[u8]) -> Vec<u8> {
+    try_encode_cas(key, expected, value).expect("sizes checked")
+}
+pub fn encode_get(key: &[u8]) -> Vec<u8> {
+    try_encode_get(key).expect("sizes checked")
+}
+pub fn encode_append(key: &[u8], value: &[u8]) -> Vec<u8> {
+    try_encode_append(key, value).expect("sizes checked")
+}
+pub fn encode_list(key: &[u8]) -> Vec<u8> {
+    try_encode_list(key).expect("sizes checked")
+}
 
 // ---------------------------------------------------------------- decoders (state-machine side)
 
@@ -289,7 +340,11 @@ fn take_u64(rest: &[u8]) -> Result<(u64, &[u8]), u8> {
 }
 
 fn take_value(rest: &[u8]) -> Result<&[u8], u8> {
-    if rest.len() > MAX_VALUE { Err(BAD_VALUE_LEN) } else { Ok(rest) }
+    if rest.len() > MAX_VALUE {
+        Err(BAD_VALUE_LEN)
+    } else {
+        Ok(rest)
+    }
 }
 
 pub fn decode_command(frame: &[u8]) -> Result<Command<'_>, u8> {
@@ -297,7 +352,10 @@ pub fn decode_command(frame: &[u8]) -> Result<Command<'_>, u8> {
     match op {
         OP_PUT => {
             let (key, rest) = take_key(rest)?;
-            Ok(Command::Put { key, value: take_value(rest)? })
+            Ok(Command::Put {
+                key,
+                value: take_value(rest)?,
+            })
         }
         OP_DELETE => {
             let (key, rest) = take_key(rest)?;
@@ -309,11 +367,18 @@ pub fn decode_command(frame: &[u8]) -> Result<Command<'_>, u8> {
         OP_CAS => {
             let (key, rest) = take_key(rest)?;
             let (expected, rest) = take_u64(rest)?;
-            Ok(Command::Cas { key, expected, value: take_value(rest)? })
+            Ok(Command::Cas {
+                key,
+                expected,
+                value: take_value(rest)?,
+            })
         }
         OP_APPEND => {
             let (key, rest) = take_key(rest)?;
-            Ok(Command::Append { key, value: take_value(rest)? })
+            Ok(Command::Append {
+                key,
+                value: take_value(rest)?,
+            })
         }
         _ => Err(BAD_UNKNOWN_OP),
     }
@@ -374,9 +439,13 @@ fn reply_u64(b: &[u8]) -> Option<u64> {
 pub fn decode_write_reply(b: &[u8]) -> Result<WriteReply, WireError> {
     let bad = || WireError::BadReply(b.first().copied());
     match b.first().copied() {
-        Some(ST_OK) => Ok(WriteReply::Ok { version: reply_u64(&b[1..]).ok_or_else(bad)? }),
+        Some(ST_OK) => Ok(WriteReply::Ok {
+            version: reply_u64(&b[1..]).ok_or_else(bad)?,
+        }),
         Some(ST_NOT_FOUND) => Ok(WriteReply::NotFound),
-        Some(ST_VERSION_MISMATCH) => Ok(WriteReply::VersionMismatch { current: reply_u64(&b[1..]).ok_or_else(bad)? }),
+        Some(ST_VERSION_MISMATCH) => Ok(WriteReply::VersionMismatch {
+            current: reply_u64(&b[1..]).ok_or_else(bad)?,
+        }),
         Some(ST_BAD_REQUEST) => Ok(WriteReply::BadRequest(*b.get(1).ok_or_else(bad)?)),
         Some(ST_WRONG_SHAPE) => Ok(WriteReply::WrongShape),
         _ => Err(bad()),
@@ -386,11 +455,19 @@ pub fn decode_write_reply(b: &[u8]) -> Result<WriteReply, WireError> {
 /// v2.
 pub fn decode_append_reply(b: &[u8]) -> Result<AppendReply, WireError> {
     let bad = || WireError::BadReply(b.first().copied());
-    let u32_at = |o: usize| -> Option<u32> { b.get(o..o + 4).map(|x| u32::from_le_bytes([x[0], x[1], x[2], x[3]])) };
+    let u32_at = |o: usize| -> Option<u32> {
+        b.get(o..o + 4)
+            .map(|x| u32::from_le_bytes([x[0], x[1], x[2], x[3]]))
+    };
     match b.first().copied() {
-        Some(ST_OK) => Ok(AppendReply::Ok { version: reply_u64(&b[1..]).ok_or_else(bad)?, len: u32_at(9).ok_or_else(bad)? }),
+        Some(ST_OK) => Ok(AppendReply::Ok {
+            version: reply_u64(&b[1..]).ok_or_else(bad)?,
+            len: u32_at(9).ok_or_else(bad)?,
+        }),
         Some(ST_WRONG_SHAPE) => Ok(AppendReply::WrongShape),
-        Some(ST_LIST_FULL) => Ok(AppendReply::ListFull { len: u32_at(1).ok_or_else(bad)? }),
+        Some(ST_LIST_FULL) => Ok(AppendReply::ListFull {
+            len: u32_at(1).ok_or_else(bad)?,
+        }),
         Some(ST_BAD_REQUEST) => Ok(AppendReply::BadRequest(*b.get(1).ok_or_else(bad)?)),
         _ => Err(bad()),
     }
@@ -402,11 +479,17 @@ pub fn decode_list_reply(b: &[u8]) -> Result<ListReply, WireError> {
     match b.first().copied() {
         Some(ST_OK) => {
             let version = reply_u64(&b[1..]).ok_or_else(bad)?;
-            let count = b.get(9..13).map(|x| u32::from_le_bytes([x[0], x[1], x[2], x[3]])).ok_or_else(bad)? as usize;
+            let count = b
+                .get(9..13)
+                .map(|x| u32::from_le_bytes([x[0], x[1], x[2], x[3]]))
+                .ok_or_else(bad)? as usize;
             let mut items = Vec::with_capacity(count.min(MAX_LIST_LEN));
             let mut off = 13;
             for _ in 0..count {
-                let n = b.get(off..off + 4).map(|x| u32::from_le_bytes([x[0], x[1], x[2], x[3]])).ok_or_else(bad)? as usize;
+                let n = b
+                    .get(off..off + 4)
+                    .map(|x| u32::from_le_bytes([x[0], x[1], x[2], x[3]]))
+                    .ok_or_else(bad)? as usize;
                 off += 4;
                 items.push(Bytes::copy_from_slice(b.get(off..off + n).ok_or_else(bad)?));
                 off += n;
@@ -428,7 +511,10 @@ pub fn decode_get_reply(b: &[u8]) -> Result<GetReply, WireError> {
     match b.first().copied() {
         Some(ST_OK) => {
             let version = reply_u64(&b[1..]).ok_or_else(bad)?;
-            Ok(GetReply::Found { version, value: Bytes::copy_from_slice(&b[9..]) })
+            Ok(GetReply::Found {
+                version,
+                value: Bytes::copy_from_slice(&b[9..]),
+            })
         }
         Some(ST_NOT_FOUND) => Ok(GetReply::NotFound),
         Some(ST_BAD_REQUEST) => Ok(GetReply::BadRequest(*b.get(1).ok_or_else(bad)?)),

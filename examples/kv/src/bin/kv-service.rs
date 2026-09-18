@@ -16,8 +16,8 @@
 //! (restart it), 2 bad arguments.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use clap::Parser;
@@ -25,7 +25,10 @@ use kv_store::KvSm;
 use uc_service::{RawStateMachine, ServiceBuilder, ServiceConfig, SessionConfig, Sessioned};
 
 #[derive(Parser)]
-#[command(name = "kv-service", about = "Runs the kv state machine against a local uc2-node")]
+#[command(
+    name = "kv-service",
+    about = "Runs the kv state machine against a local uc2-node"
+)]
 struct Args {
     /// The instance directory of the node to attach to.
     #[arg(long)]

@@ -4,7 +4,7 @@
 
 use bytes::Bytes;
 use kv_store::wire::{self, AppendReply, GetReply, ListReply, WriteReply};
-use kv_store::{KvSm, KV_VERSION};
+use kv_store::{KV_VERSION, KvSm};
 use proptest::prelude::*;
 use uc_service::{ApplyCtx, RawStateMachine, SnapshotStateMachine};
 
@@ -42,9 +42,16 @@ fn b(s: &[u8]) -> Bytes {
 
 #[test]
 fn version_moved_to_2_0_0() {
-    assert_eq!(KV_VERSION, 0x0200_0000, "pack_version(2,0,0): major:8 ‖ minor:8 ‖ patch:16");
+    assert_eq!(
+        KV_VERSION, 0x0200_0000,
+        "pack_version(2,0,0): major:8 ‖ minor:8 ‖ patch:16"
+    );
     assert_eq!(<KvSm as RawStateMachine>::VERSION, KV_VERSION);
-    assert_eq!(<KvSm as RawStateMachine>::NAME, "kv", "the name must not move: it is the row's identity");
+    assert_eq!(
+        <KvSm as RawStateMachine>::NAME,
+        "kv",
+        "the name must not move: it is the row's identity"
+    );
 }
 
 // ---------------------------------------------------------------- append / list
@@ -53,10 +60,34 @@ fn version_moved_to_2_0_0() {
 fn append_builds_an_ordered_list_and_list_reads_it() {
     let mut sm = KvSm::default();
     assert_eq!(list(&sm, b"l"), ListReply::NotFound);
-    assert_eq!(append(&mut sm, pos(0), b"l", b"a"), AppendReply::Ok { version: pos(0), len: 1 });
-    assert_eq!(append(&mut sm, pos(1), b"l", b""), AppendReply::Ok { version: pos(1), len: 2 });
-    assert_eq!(append(&mut sm, pos(2), b"l", b"c"), AppendReply::Ok { version: pos(2), len: 3 });
-    assert_eq!(list(&sm, b"l"), ListReply::Found { version: pos(2), items: vec![b(b"a"), b(b""), b(b"c")] });
+    assert_eq!(
+        append(&mut sm, pos(0), b"l", b"a"),
+        AppendReply::Ok {
+            version: pos(0),
+            len: 1
+        }
+    );
+    assert_eq!(
+        append(&mut sm, pos(1), b"l", b""),
+        AppendReply::Ok {
+            version: pos(1),
+            len: 2
+        }
+    );
+    assert_eq!(
+        append(&mut sm, pos(2), b"l", b"c"),
+        AppendReply::Ok {
+            version: pos(2),
+            len: 3
+        }
+    );
+    assert_eq!(
+        list(&sm, b"l"),
+        ListReply::Found {
+            version: pos(2),
+            items: vec![b(b"a"), b(b""), b(b"c")]
+        }
+    );
     // The version of a list is the position of its last append.
     assert_eq!(sm.last_applied(), Some(pos(2)));
 }
@@ -68,19 +99,55 @@ fn shapes_are_strict_except_delete() {
     append(&mut sm, pos(1), b"l", b"x");
     // Wrong-shape operations are refused and change nothing.
     assert_eq!(append(&mut sm, pos(2), b"v", b"y"), AppendReply::WrongShape);
-    assert_eq!(get(&sm, b"v"), GetReply::Found { version: pos(0), value: b(b"x") });
-    assert_eq!(write(&mut sm, pos(3), &wire::encode_put(b"l", b"y")), WriteReply::WrongShape);
-    assert_eq!(write(&mut sm, pos(4), &wire::encode_cas(b"l", pos(1), b"y")), WriteReply::WrongShape);
-    assert_eq!(write(&mut sm, pos(5), &wire::encode_cas(b"l", 0, b"y")), WriteReply::WrongShape);
+    assert_eq!(
+        get(&sm, b"v"),
+        GetReply::Found {
+            version: pos(0),
+            value: b(b"x")
+        }
+    );
+    assert_eq!(
+        write(&mut sm, pos(3), &wire::encode_put(b"l", b"y")),
+        WriteReply::WrongShape
+    );
+    assert_eq!(
+        write(&mut sm, pos(4), &wire::encode_cas(b"l", pos(1), b"y")),
+        WriteReply::WrongShape
+    );
+    assert_eq!(
+        write(&mut sm, pos(5), &wire::encode_cas(b"l", 0, b"y")),
+        WriteReply::WrongShape
+    );
     assert_eq!(get(&sm, b"l"), GetReply::WrongShape);
     assert_eq!(list(&sm, b"v"), ListReply::WrongShape);
-    assert_eq!(list(&sm, b"l"), ListReply::Found { version: pos(1), items: vec![b(b"x")] });
+    assert_eq!(
+        list(&sm, b"l"),
+        ListReply::Found {
+            version: pos(1),
+            items: vec![b(b"x")]
+        }
+    );
     assert_eq!(digest(&sm).count, 2);
     // Delete removes either shape, reporting its version; the key can then take the other shape.
-    assert_eq!(write(&mut sm, pos(6), &wire::encode_delete(b"l")), WriteReply::Ok { version: pos(1) });
-    assert_eq!(write(&mut sm, pos(7), &wire::encode_put(b"l", b"now-a-value")), WriteReply::Ok { version: pos(7) });
-    assert_eq!(write(&mut sm, pos(8), &wire::encode_delete(b"v")), WriteReply::Ok { version: pos(0) });
-    assert_eq!(append(&mut sm, pos(9), b"v", b"now-a-list"), AppendReply::Ok { version: pos(9), len: 1 });
+    assert_eq!(
+        write(&mut sm, pos(6), &wire::encode_delete(b"l")),
+        WriteReply::Ok { version: pos(1) }
+    );
+    assert_eq!(
+        write(&mut sm, pos(7), &wire::encode_put(b"l", b"now-a-value")),
+        WriteReply::Ok { version: pos(7) }
+    );
+    assert_eq!(
+        write(&mut sm, pos(8), &wire::encode_delete(b"v")),
+        WriteReply::Ok { version: pos(0) }
+    );
+    assert_eq!(
+        append(&mut sm, pos(9), b"v", b"now-a-list"),
+        AppendReply::Ok {
+            version: pos(9),
+            len: 1
+        }
+    );
     assert_eq!(sm.last_applied(), Some(pos(9)));
 }
 
@@ -89,27 +156,51 @@ fn list_caps_are_enforced() {
     let mut sm = KvSm::default();
     // Element count cap.
     for i in 0..wire::MAX_LIST_LEN as u64 {
-        assert!(matches!(append(&mut sm, pos(i), b"n", b"x"), AppendReply::Ok { .. }));
+        assert!(matches!(
+            append(&mut sm, pos(i), b"n", b"x"),
+            AppendReply::Ok { .. }
+        ));
     }
     let p = pos(wire::MAX_LIST_LEN as u64);
-    assert_eq!(append(&mut sm, p, b"n", b"x"), AppendReply::ListFull { len: wire::MAX_LIST_LEN as u32 });
+    assert_eq!(
+        append(&mut sm, p, b"n", b"x"),
+        AppendReply::ListFull {
+            len: wire::MAX_LIST_LEN as u32
+        }
+    );
     assert_eq!(list(&sm, b"n").len(), wire::MAX_LIST_LEN);
     // Byte cap: MAX_LIST_BYTES / MAX_VALUE full-size elements fit, one more does not.
     let full = vec![b'z'; wire::MAX_VALUE];
     let n = wire::MAX_LIST_BYTES / wire::MAX_VALUE;
     for i in 0..n as u64 {
-        assert!(matches!(append(&mut sm, p + 32 * (i + 1), b"bytes", &full), AppendReply::Ok { .. }), "element {i}");
+        assert!(
+            matches!(
+                append(&mut sm, p + 32 * (i + 1), b"bytes", &full),
+                AppendReply::Ok { .. }
+            ),
+            "element {i}"
+        );
     }
-    assert_eq!(append(&mut sm, p + 32 * (n as u64 + 1), b"bytes", b"1"), AppendReply::ListFull { len: n as u32 });
+    assert_eq!(
+        append(&mut sm, p + 32 * (n as u64 + 1), b"bytes", b"1"),
+        AppendReply::ListFull { len: n as u32 }
+    );
     // Element size is the same as a value's.
     let mut frame = vec![wire::FORMAT_VERSION, wire::OP_APPEND, 1, 0, b'k'];
     frame.extend_from_slice(&vec![b'v'; wire::MAX_VALUE + 1]);
-    assert_eq!(wire::decode_append_reply(&apply(&mut sm, p + 32 * 100, &frame)).unwrap(), AppendReply::BadRequest(wire::BAD_VALUE_LEN));
+    assert_eq!(
+        wire::decode_append_reply(&apply(&mut sm, p + 32 * 100, &frame)).unwrap(),
+        AppendReply::BadRequest(wire::BAD_VALUE_LEN)
+    );
     assert!(wire::try_encode_append(b"k", &vec![0u8; wire::MAX_VALUE + 1]).is_err());
     // The largest list reply fits well under the 1 MiB remote frame ceiling.
     let worst = 1 + 8 + 4 + wire::MAX_LIST_LEN * 4 + wire::MAX_LIST_BYTES;
     assert!(worst < 1 << 20, "{worst}");
-    assert_eq!(wire::encode_append(b"k", &full).len(), 4 + 1 + wire::MAX_VALUE, "same framing as PUT");
+    assert_eq!(
+        wire::encode_append(b"k", &full).len(),
+        4 + 1 + wire::MAX_VALUE,
+        "same framing as PUT"
+    );
 }
 
 #[test]
@@ -118,7 +209,10 @@ fn v1_commands_are_unchanged_on_the_wire() {
     // sm_invariants.rs pins their semantics; this pins their encoding).
     assert_eq!(wire::encode_put(b"k", b"v"), [1, 1, 1, 0, b'k', b'v']);
     assert_eq!(wire::encode_delete(b"k"), [1, 2, 1, 0, b'k']);
-    assert_eq!(wire::encode_cas(b"k", 7, b"v"), [1, 3, 1, 0, b'k', 7, 0, 0, 0, 0, 0, 0, 0, b'v']);
+    assert_eq!(
+        wire::encode_cas(b"k", 7, b"v"),
+        [1, 3, 1, 0, b'k', 7, 0, 0, 0, 0, 0, 0, 0, b'v']
+    );
     assert_eq!(wire::encode_get(b"k"), [1, 1, 1, 0, b'k']);
     assert_eq!(wire::encode_digest(), [1, 2]);
     assert_eq!(wire::encode_append(b"k", b"v"), [1, 4, 1, 0, b'k', b'v']);
@@ -139,14 +233,23 @@ fn v2_image_round_trips_lists_and_is_version_2() {
     KvSm::stream_snapshot(h, &mut img).unwrap();
     assert_eq!(&img[..4], &2u32.to_le_bytes(), "image_version 2");
     let mut fresh = KvSm::default();
-    assert_eq!(fresh.install_snapshot(at + 64, &mut &img[..]).unwrap(), at + 64);
+    assert_eq!(
+        fresh.install_snapshot(at + 64, &mut &img[..]).unwrap(),
+        at + 64
+    );
     assert_eq!(fresh.last_applied(), Some(at));
     assert_eq!(digest(&fresh), digest(&sm));
     assert_eq!(fresh.recompute_digest(), digest(&sm).digest);
     assert_eq!(list(&fresh, b"l"), list(&sm, b"l"));
     assert_eq!(get(&fresh, b"v"), get(&sm, b"v"));
     // Shape survives: appending after install continues the list.
-    assert_eq!(append(&mut fresh, at + 64, b"l", b"four"), AppendReply::Ok { version: at + 64, len: 4 });
+    assert_eq!(
+        append(&mut fresh, at + 64, b"l", b"four"),
+        AppendReply::Ok {
+            version: at + 64,
+            len: 4
+        }
+    );
 }
 
 /// THE old-image test: `tests/fixtures/v1-golden.kvimage` was written by the
@@ -154,10 +257,27 @@ fn v2_image_round_trips_lists_and_is_version_2() {
 /// sm_invariants.rs; `v1-golden.meta` records what it froze.
 #[test]
 fn a_v1_image_installs_into_a_v2_binary_with_the_right_state() {
-    let img = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/v1-golden.kvimage")).unwrap();
-    assert_eq!(&img[..4], &1u32.to_le_bytes(), "the fixture really is a v1 image");
-    let meta = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/v1-golden.meta")).unwrap();
-    let field = |k: &str| meta.lines().find_map(|l| l.strip_prefix(&format!("{k}="))).unwrap().to_string();
+    let img = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/v1-golden.kvimage"
+    ))
+    .unwrap();
+    assert_eq!(
+        &img[..4],
+        &1u32.to_le_bytes(),
+        "the fixture really is a v1 image"
+    );
+    let meta = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/v1-golden.meta"
+    ))
+    .unwrap();
+    let field = |k: &str| {
+        meta.lines()
+            .find_map(|l| l.strip_prefix(&format!("{k}=")))
+            .unwrap()
+            .to_string()
+    };
     let frozen_at: u64 = field("frozen_at").parse().unwrap();
     let count: u64 = field("count").parse().unwrap();
     let want_digest = u64::from_str_radix(field("digest").trim_start_matches("0x"), 16).unwrap();
@@ -165,21 +285,66 @@ fn a_v1_image_installs_into_a_v2_binary_with_the_right_state() {
     let mut sm = KvSm::default();
     let p = frozen_at + 64;
     assert_eq!(sm.install_snapshot(p, &mut &img[..]).unwrap(), p);
-    assert_eq!(sm.last_applied(), Some(frozen_at), "cursor from the v1 image");
+    assert_eq!(
+        sm.last_applied(),
+        Some(frozen_at),
+        "cursor from the v1 image"
+    );
     let d = digest(&sm);
     assert_eq!(d.count, count);
-    assert_eq!(d.digest, want_digest, "v2 must hash v1 value entries exactly as v1 did");
+    assert_eq!(
+        d.digest, want_digest,
+        "v2 must hash v1 value entries exactly as v1 did"
+    );
     assert_eq!(sm.recompute_digest(), want_digest);
     // Spot-check contents against what the golden script did.
-    assert_eq!(get(&sm, b"key001"), GetReply::Found { version: pos(68), value: b(b"cas-ok") });
-    assert_eq!(get(&sm, b"key000"), GetReply::NotFound, "deleted in the script");
-    assert_eq!(get(&sm, b"key002"), GetReply::Found { version: pos(2), value: b(&2u32.to_le_bytes()) });
-    assert_eq!(get(&sm, b"fresh"), GetReply::Found { version: pos(69), value: b(b"created") });
-    assert_eq!(get(&sm, &[0u8; 256]), GetReply::Found { version: pos(71), value: b(&[0xffu8; 1024]) });
+    assert_eq!(
+        get(&sm, b"key001"),
+        GetReply::Found {
+            version: pos(68),
+            value: b(b"cas-ok")
+        }
+    );
+    assert_eq!(
+        get(&sm, b"key000"),
+        GetReply::NotFound,
+        "deleted in the script"
+    );
+    assert_eq!(
+        get(&sm, b"key002"),
+        GetReply::Found {
+            version: pos(2),
+            value: b(&2u32.to_le_bytes())
+        }
+    );
+    assert_eq!(
+        get(&sm, b"fresh"),
+        GetReply::Found {
+            version: pos(69),
+            value: b(b"created")
+        }
+    );
+    assert_eq!(
+        get(&sm, &[0u8; 256]),
+        GetReply::Found {
+            version: pos(71),
+            value: b(&[0xffu8; 1024])
+        }
+    );
     // Every v1 entry is a value: list-read refuses it, and the store keeps working in v2 terms.
     assert_eq!(list(&sm, b"key001"), ListReply::WrongShape);
-    assert_eq!(append(&mut sm, p, b"new-list", b"after-upgrade"), AppendReply::Ok { version: p, len: 1 });
-    assert_eq!(write(&mut sm, p + 32, &wire::encode_cas(b"key001", pos(68), b"cas-still-works")), WriteReply::Ok { version: p + 32 });
+    assert_eq!(
+        append(&mut sm, p, b"new-list", b"after-upgrade"),
+        AppendReply::Ok { version: p, len: 1 }
+    );
+    assert_eq!(
+        write(
+            &mut sm,
+            p + 32,
+            &wire::encode_cas(b"key001", pos(68), b"cas-still-works")
+        ),
+        WriteReply::Ok { version: p + 32 }
+    );
     // And what v2 writes back is a v2 image that reproduces this state.
     let (h, at) = sm.freeze().unwrap();
     let mut img2 = Vec::new();
@@ -192,7 +357,11 @@ fn a_v1_image_installs_into_a_v2_binary_with_the_right_state() {
 
 #[test]
 fn a_v1_image_with_a_bad_digest_is_still_refused() {
-    let mut img = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/v1-golden.kvimage")).unwrap();
+    let mut img = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/v1-golden.kvimage"
+    ))
+    .unwrap();
     let last = img.len() - 1;
     img[last] ^= 1;
     let mut sm = KvSm::default();

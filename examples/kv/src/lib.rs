@@ -102,7 +102,10 @@ fn entry_hash(key: &[u8], e: &Entry) -> u64 {
             let ver = e.version.to_le_bytes();
             let n = (items.len() as u32).to_le_bytes();
             parts.extend_from_slice(&[b"L", &kl, key, &ver, &n]);
-            let lens: Vec<[u8; 4]> = items.iter().map(|i| (i.len() as u32).to_le_bytes()).collect();
+            let lens: Vec<[u8; 4]> = items
+                .iter()
+                .map(|i| (i.len() as u32).to_le_bytes())
+                .collect();
             for (i, l) in items.iter().zip(&lens) {
                 parts.push(l);
                 parts.push(i);
@@ -175,9 +178,18 @@ impl RawStateMachine for KvSm {
         debug_assert!(position != 0, "a command applied at log position 0");
         match wire::decode_command(cmd) {
             Ok(Command::Put { key, value }) => match self.map.get(key) {
-                Some(Entry { shape: Shape::List(_), .. }) => wire::put_status(out, wire::ST_WRONG_SHAPE),
+                Some(Entry {
+                    shape: Shape::List(_),
+                    ..
+                }) => wire::put_status(out, wire::ST_WRONG_SHAPE),
                 _ => {
-                    self.insert(key, Entry { version: position, shape: Shape::Value(Bytes::copy_from_slice(value)) });
+                    self.insert(
+                        key,
+                        Entry {
+                            version: position,
+                            shape: Shape::Value(Bytes::copy_from_slice(value)),
+                        },
+                    );
                     wire::put_status_u64(out, wire::ST_OK, position);
                 }
             },
@@ -185,12 +197,25 @@ impl RawStateMachine for KvSm {
                 Some(old) => wire::put_status_u64(out, wire::ST_OK, old.version),
                 None => wire::put_status(out, wire::ST_NOT_FOUND),
             },
-            Ok(Command::Cas { key, expected, value }) => match self.map.get(key) {
-                Some(Entry { shape: Shape::List(_), .. }) => wire::put_status(out, wire::ST_WRONG_SHAPE),
+            Ok(Command::Cas {
+                key,
+                expected,
+                value,
+            }) => match self.map.get(key) {
+                Some(Entry {
+                    shape: Shape::List(_),
+                    ..
+                }) => wire::put_status(out, wire::ST_WRONG_SHAPE),
                 cur => {
                     let current = cur.map(|e| e.version).unwrap_or(0);
                     if current == expected {
-                        self.insert(key, Entry { version: position, shape: Shape::Value(Bytes::copy_from_slice(value)) });
+                        self.insert(
+                            key,
+                            Entry {
+                                version: position,
+                                shape: Shape::Value(Bytes::copy_from_slice(value)),
+                            },
+                        );
                         wire::put_status_u64(out, wire::ST_OK, position);
                     } else {
                         wire::put_status_u64(out, wire::ST_VERSION_MISMATCH, current);
@@ -199,8 +224,14 @@ impl RawStateMachine for KvSm {
             },
             Ok(Command::Append { key, value }) => {
                 let items = match self.map.get(key) {
-                    Some(Entry { shape: Shape::List(items), .. }) => items.clone(),
-                    Some(Entry { shape: Shape::Value(_), .. }) => {
+                    Some(Entry {
+                        shape: Shape::List(items),
+                        ..
+                    }) => items.clone(),
+                    Some(Entry {
+                        shape: Shape::Value(_),
+                        ..
+                    }) => {
                         wire::put_status(out, wire::ST_WRONG_SHAPE);
                         self.last_applied = Some(position);
                         return;
@@ -215,7 +246,13 @@ impl RawStateMachine for KvSm {
                     let mut items = items;
                     items.push_back(Bytes::copy_from_slice(value));
                     let len = items.len() as u32;
-                    self.insert(key, Entry { version: position, shape: Shape::List(items) });
+                    self.insert(
+                        key,
+                        Entry {
+                            version: position,
+                            shape: Shape::List(items),
+                        },
+                    );
                     wire::put_status_u64(out, wire::ST_OK, position);
                     out.extend_from_slice(&len.to_le_bytes());
                 }
@@ -229,16 +266,28 @@ impl RawStateMachine for KvSm {
     fn query(&self, q: &[u8], out: &mut Vec<u8>) {
         match wire::decode_query(q) {
             Ok(Query::Get { key }) => match self.map.get(key) {
-                Some(Entry { version, shape: Shape::Value(v) }) => {
+                Some(Entry {
+                    version,
+                    shape: Shape::Value(v),
+                }) => {
                     wire::put_status_u64(out, wire::ST_OK, *version);
                     out.extend_from_slice(v);
                 }
-                Some(Entry { shape: Shape::List(_), .. }) => wire::put_status(out, wire::ST_WRONG_SHAPE),
+                Some(Entry {
+                    shape: Shape::List(_),
+                    ..
+                }) => wire::put_status(out, wire::ST_WRONG_SHAPE),
                 None => wire::put_status(out, wire::ST_NOT_FOUND),
             },
             Ok(Query::List { key }) => match self.map.get(key) {
-                Some(Entry { version, shape: Shape::List(items) }) => write_list(out, *version, items),
-                Some(Entry { shape: Shape::Value(_), .. }) => wire::put_status(out, wire::ST_WRONG_SHAPE),
+                Some(Entry {
+                    version,
+                    shape: Shape::List(items),
+                }) => write_list(out, *version, items),
+                Some(Entry {
+                    shape: Shape::Value(_),
+                    ..
+                }) => wire::put_status(out, wire::ST_WRONG_SHAPE),
                 None => wire::put_status(out, wire::ST_NOT_FOUND),
             },
             Ok(Query::Digest) => {
@@ -278,9 +327,16 @@ fn read_u16(r: &mut impl Read) -> Result<u16, SnapshotError> {
     r.read_exact(&mut b).map_err(SnapshotError::Io)?;
     Ok(u16::from_le_bytes(b))
 }
-fn read_blob(r: &mut impl Read, len: usize, max: usize, what: &str) -> Result<Bytes, SnapshotError> {
+fn read_blob(
+    r: &mut impl Read,
+    len: usize,
+    max: usize,
+    what: &str,
+) -> Result<Bytes, SnapshotError> {
     if len > max {
-        return Err(SnapshotError::Codec(format!("{what} length {len} exceeds {max}")));
+        return Err(SnapshotError::Codec(format!(
+            "{what} length {len} exceeds {max}"
+        )));
     }
     let mut v = vec![0u8; len];
     r.read_exact(&mut v).map_err(SnapshotError::Io)?;
@@ -292,7 +348,11 @@ impl SnapshotStateMachine for KvSm {
 
     /// O(1): clone the persistent map (shared structure, no copy).
     fn freeze(&self) -> Result<(Frozen, u64), SnapshotError> {
-        let h = Frozen { map: self.map.clone(), last_applied: self.last_applied, digest: self.digest };
+        let h = Frozen {
+            map: self.map.clone(),
+            last_applied: self.last_applied,
+            digest: self.digest,
+        };
         Ok((h, self.last_applied.unwrap_or(0)))
     }
 
@@ -304,9 +364,11 @@ impl SnapshotStateMachine for KvSm {
         let mut w = BufWriter::new(dst);
         let io = SnapshotError::Io;
         w.write_all(&IMAGE_VERSION.to_le_bytes()).map_err(io)?;
-        w.write_all(&h.last_applied.unwrap_or(NO_CURSOR).to_le_bytes()).map_err(io)?;
+        w.write_all(&h.last_applied.unwrap_or(NO_CURSOR).to_le_bytes())
+            .map_err(io)?;
         w.write_all(&h.digest.to_le_bytes()).map_err(io)?;
-        w.write_all(&(h.map.len() as u64).to_le_bytes()).map_err(io)?;
+        w.write_all(&(h.map.len() as u64).to_le_bytes())
+            .map_err(io)?;
         for (k, e) in h.map.iter() {
             w.write_all(&(k.len() as u16).to_le_bytes()).map_err(io)?;
             w.write_all(k).map_err(io)?;
@@ -319,7 +381,8 @@ impl SnapshotStateMachine for KvSm {
                 }
                 Shape::List(items) => {
                     w.write_all(&[SHAPE_LIST]).map_err(io)?;
-                    w.write_all(&(items.len() as u32).to_le_bytes()).map_err(io)?;
+                    w.write_all(&(items.len() as u32).to_le_bytes())
+                        .map_err(io)?;
                     for i in items {
                         w.write_all(&(i.len() as u32).to_le_bytes()).map_err(io)?;
                         w.write_all(i).map_err(io)?;
@@ -335,7 +398,11 @@ impl SnapshotStateMachine for KvSm {
     /// unless the whole image decodes and its digest verifies.
     ///
     /// Reads image version 1 (v1: every entry a value, no shape byte) and 2.
-    fn install_snapshot(&mut self, position: u64, src: &mut dyn Read) -> Result<u64, SnapshotError> {
+    fn install_snapshot(
+        &mut self,
+        position: u64,
+        src: &mut dyn Read,
+    ) -> Result<u64, SnapshotError> {
         let mut r = BufReader::new(src);
         let image_version = read_u32(&mut r)?;
         if image_version != IMAGE_VERSION_V1 && image_version != IMAGE_VERSION_V2 {
@@ -344,11 +411,17 @@ impl SnapshotStateMachine for KvSm {
             )));
         }
         let cursor = read_u64(&mut r)?;
-        let cursor = if cursor == NO_CURSOR { None } else { Some(cursor) };
+        let cursor = if cursor == NO_CURSOR {
+            None
+        } else {
+            Some(cursor)
+        };
         if let Some(c) = cursor
             && c >= position
         {
-            return Err(SnapshotError::Codec(format!("image cursor {c} is not below the artifact tag {position}: mis-tagged artifact")));
+            return Err(SnapshotError::Codec(format!(
+                "image cursor {c} is not below the artifact tag {position}: mis-tagged artifact"
+            )));
         }
         let digest = read_u64(&mut r)?;
         let count = read_u64(&mut r)?;
@@ -356,7 +429,9 @@ impl SnapshotStateMachine for KvSm {
         for i in 0..count {
             let kl = read_u16(&mut r)? as usize;
             if kl == 0 || kl > wire::MAX_KEY {
-                return Err(SnapshotError::Codec(format!("entry {i}: key length {kl} out of range")));
+                return Err(SnapshotError::Codec(format!(
+                    "entry {i}: key length {kl} out of range"
+                )));
             }
             let key = read_blob(&mut r, kl, wire::MAX_KEY, "key")?;
             let version = read_u64(&mut r)?;
@@ -375,7 +450,10 @@ impl SnapshotStateMachine for KvSm {
                 SHAPE_LIST => {
                     let n = read_u32(&mut r)? as usize;
                     if n > wire::MAX_LIST_LEN {
-                        return Err(SnapshotError::Codec(format!("entry {i}: list length {n} exceeds {}", wire::MAX_LIST_LEN)));
+                        return Err(SnapshotError::Codec(format!(
+                            "entry {i}: list length {n} exceeds {}",
+                            wire::MAX_LIST_LEN
+                        )));
                     }
                     let mut items = Vector::new();
                     let mut total = 0usize;
@@ -383,24 +461,35 @@ impl SnapshotStateMachine for KvSm {
                         let l = read_u32(&mut r)? as usize;
                         total += l;
                         if total > wire::MAX_LIST_BYTES {
-                            return Err(SnapshotError::Codec(format!("entry {i}: list bytes exceed {}", wire::MAX_LIST_BYTES)));
+                            return Err(SnapshotError::Codec(format!(
+                                "entry {i}: list bytes exceed {}",
+                                wire::MAX_LIST_BYTES
+                            )));
                         }
                         items.push_back(read_blob(&mut r, l, wire::MAX_VALUE, "list element")?);
                     }
                     Shape::List(items)
                 }
-                other => return Err(SnapshotError::Codec(format!("entry {i}: unknown shape byte {other}"))),
+                other => {
+                    return Err(SnapshotError::Codec(format!(
+                        "entry {i}: unknown shape byte {other}"
+                    )));
+                }
             };
             if map.insert(key, Entry { version, shape }).is_some() {
                 return Err(SnapshotError::Codec(format!("entry {i}: duplicate key")));
             }
         }
         if !r.fill_buf().map_err(SnapshotError::Io)?.is_empty() {
-            return Err(SnapshotError::Codec("trailing bytes after the last entry".into()));
+            return Err(SnapshotError::Codec(
+                "trailing bytes after the last entry".into(),
+            ));
         }
         let recomputed = Self::digest_of(&map);
         if recomputed != digest {
-            return Err(SnapshotError::Codec(format!("image digest {digest:#018x} != recomputed {recomputed:#018x}")));
+            return Err(SnapshotError::Codec(format!(
+                "image digest {digest:#018x} != recomputed {recomputed:#018x}"
+            )));
         }
         self.map = map;
         self.digest = digest;

@@ -14,7 +14,10 @@ use kv_store::wire::{self, AppendReply, GetReply, ListReply, WriteReply};
 use uc_remote::{Consistency, RemoteClient, RemoteConfig, RemoteError, RemoteResponse};
 
 #[derive(Parser)]
-#[command(name = "kv", about = "Key-value operations against a kv cluster, through its gateways")]
+#[command(
+    name = "kv",
+    about = "Key-value operations against a kv cluster, through its gateways"
+)]
 struct Args {
     /// Every gateway's address, comma-separated: `host:port[,host:port…]`.
     /// List them all; the client dials in order and follows redirects.
@@ -98,7 +101,10 @@ fn parse_bytes(s: &str, hex: bool, what: &str) -> Result<Vec<u8>, Fail> {
     }
     (0..s.len())
         .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|e| Fail::Args(format!("{what}: bad hex: {e}"))))
+        .map(|i| {
+            u8::from_str_radix(&s[i..i + 2], 16)
+                .map_err(|e| Fail::Args(format!("{what}: bad hex: {e}")))
+        })
         .collect()
 }
 
@@ -139,18 +145,33 @@ fn connect(args: &Args, deadline: Instant) -> Result<RemoteClient, Fail> {
 }
 
 fn remaining(deadline: Instant) -> Duration {
-    deadline.saturating_duration_since(Instant::now()).max(Duration::from_secs(1))
+    deadline
+        .saturating_duration_since(Instant::now())
+        .max(Duration::from_secs(1))
 }
 
 fn submit(client: &RemoteClient, cmd: &[u8], deadline: Instant) -> Result<RemoteResponse, Fail> {
     let ticket = client.submit(cmd).map_err(|e| Fail::Run(e.to_string()))?;
-    ticket.wait_timeout(remaining(deadline)).map_err(|e| Fail::Run(e.to_string()))
+    ticket
+        .wait_timeout(remaining(deadline))
+        .map_err(|e| Fail::Run(e.to_string()))
 }
 
-fn query(client: &RemoteClient, q: &[u8], linearizable: bool, deadline: Instant) -> Result<RemoteResponse, Fail> {
-    let c = if linearizable { Consistency::Linearizable } else { Consistency::Snapshot };
+fn query(
+    client: &RemoteClient,
+    q: &[u8],
+    linearizable: bool,
+    deadline: Instant,
+) -> Result<RemoteResponse, Fail> {
+    let c = if linearizable {
+        Consistency::Linearizable
+    } else {
+        Consistency::Snapshot
+    };
     let ticket = client.query(q, c).map_err(|e| Fail::Run(e.to_string()))?;
-    ticket.wait_timeout(remaining(deadline)).map_err(|e| Fail::Run(e.to_string()))
+    ticket
+        .wait_timeout(remaining(deadline))
+        .map_err(|e| Fail::Run(e.to_string()))
 }
 
 fn bad(reason: u8) -> Fail {
@@ -169,27 +190,40 @@ fn bad(reason: u8) -> Fail {
 fn write_outcome(resp: &RemoteResponse, what: &str) -> Result<(), Fail> {
     match wire::decode_write_reply(&resp.bytes).map_err(|e| Fail::Run(e.to_string()))? {
         WriteReply::Ok { version } => {
-            println!("ok {what}version={version} position={} replayed={}", resp.position, resp.replayed);
+            println!(
+                "ok {what}version={version} position={} replayed={}",
+                resp.position, resp.replayed
+            );
             Ok(())
         }
-        WriteReply::NotFound => Err(Fail::Negative(format!("not_found position={} replayed={}", resp.position, resp.replayed))),
+        WriteReply::NotFound => Err(Fail::Negative(format!(
+            "not_found position={} replayed={}",
+            resp.position, resp.replayed
+        ))),
         WriteReply::VersionMismatch { current } => Err(Fail::Negative(format!(
             "version_mismatch current={current} position={} replayed={}",
             resp.position, resp.replayed
         ))),
         WriteReply::BadRequest(r) => Err(bad(r)),
-        WriteReply::WrongShape => Err(Fail::Negative(format!("wrong_shape (the key is a list) position={} replayed={}", resp.position, resp.replayed))),
+        WriteReply::WrongShape => Err(Fail::Negative(format!(
+            "wrong_shape (the key is a list) position={} replayed={}",
+            resp.position, resp.replayed
+        ))),
     }
 }
 
 fn run(args: &Args) -> Result<(), Fail> {
     for g in &args.gateways {
         if g.trim().is_empty() || !g.contains(':') {
-            return Err(Fail::Args(format!("--gateways entry {g:?} is not a host:port address")));
+            return Err(Fail::Args(format!(
+                "--gateways entry {g:?} is not a host:port address"
+            )));
         }
     }
     if args.timeout_secs == 0 {
-        return Err(Fail::Args("--timeout-secs must be greater than zero".into()));
+        return Err(Fail::Args(
+            "--timeout-secs must be greater than zero".into(),
+        ));
     }
     let wire_err = |e: wire::WireError| Fail::Args(e.to_string());
 
@@ -212,10 +246,17 @@ fn run(args: &Args) -> Result<(), Fail> {
             let k = parse_bytes(key, args.hex, "KEY")?;
             Req::Write(wire::try_encode_delete(&k).map_err(wire_err)?, "deleted_")
         }
-        Sub::Cas { key, value, version } => {
+        Sub::Cas {
+            key,
+            value,
+            version,
+        } => {
             let k = parse_bytes(key, args.hex, "KEY")?;
             let v = parse_bytes(value, args.hex, "VALUE")?;
-            Req::Write(wire::try_encode_cas(&k, *version, &v).map_err(wire_err)?, "")
+            Req::Write(
+                wire::try_encode_cas(&k, *version, &v).map_err(wire_err)?,
+                "",
+            )
         }
         Sub::Get { key, linearizable } => {
             let k = parse_bytes(key, args.hex, "KEY")?;
@@ -249,18 +290,29 @@ fn run(args: &Args) -> Result<(), Fail> {
                 }
                 GetReply::NotFound => Err(Fail::Negative("not_found".into())),
                 GetReply::BadRequest(r) => Err(bad(r)),
-                GetReply::WrongShape => Err(Fail::Negative("wrong_shape (the key is a list; use `list`)".into())),
+                GetReply::WrongShape => Err(Fail::Negative(
+                    "wrong_shape (the key is a list; use `list`)".into(),
+                )),
             }
         }
         Req::Append(frame) => {
             let resp = submit(&client, &frame, deadline)?;
             match wire::decode_append_reply(&resp.bytes).map_err(|e| Fail::Run(e.to_string()))? {
                 AppendReply::Ok { version, len } => {
-                    println!("ok version={version} len={len} position={} replayed={}", resp.position, resp.replayed);
+                    println!(
+                        "ok version={version} len={len} position={} replayed={}",
+                        resp.position, resp.replayed
+                    );
                     Ok(())
                 }
-                AppendReply::WrongShape => Err(Fail::Negative(format!("wrong_shape (the key is a value) position={} replayed={}", resp.position, resp.replayed))),
-                AppendReply::ListFull { len } => Err(Fail::Negative(format!("list_full len={len} position={} replayed={}", resp.position, resp.replayed))),
+                AppendReply::WrongShape => Err(Fail::Negative(format!(
+                    "wrong_shape (the key is a value) position={} replayed={}",
+                    resp.position, resp.replayed
+                ))),
+                AppendReply::ListFull { len } => Err(Fail::Negative(format!(
+                    "list_full len={len} position={} replayed={}",
+                    resp.position, resp.replayed
+                ))),
                 AppendReply::BadRequest(r) => Err(bad(r)),
             }
         }
@@ -275,15 +327,22 @@ fn run(args: &Args) -> Result<(), Fail> {
                     Ok(())
                 }
                 ListReply::NotFound => Err(Fail::Negative("not_found".into())),
-                ListReply::WrongShape => Err(Fail::Negative("wrong_shape (the key is a value; use `get`)".into())),
+                ListReply::WrongShape => Err(Fail::Negative(
+                    "wrong_shape (the key is a value; use `get`)".into(),
+                )),
                 ListReply::BadRequest(r) => Err(bad(r)),
             }
         }
         Req::Digest(lin) => {
             let resp = query(&client, &wire::encode_digest(), lin, deadline)?;
             let d = wire::decode_digest_reply(&resp.bytes).map_err(|e| Fail::Run(e.to_string()))?;
-            println!("count={} digest={:#018x} last_applied={} via={}", d.count, d.digest, d.last_applied,
-                client.connected_addr().unwrap_or_default());
+            println!(
+                "count={} digest={:#018x} last_applied={} via={}",
+                d.count,
+                d.digest,
+                d.last_applied,
+                client.connected_addr().unwrap_or_default()
+            );
             Ok(())
         }
     })();
