@@ -1556,6 +1556,7 @@ dependencies = [
  "crc32fast",
  "fs2",
  "hdrhistogram",
+ "kv_store",
  "libc",
  "memmap2",
  "rand",

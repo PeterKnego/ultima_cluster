@@ -16,6 +16,8 @@
 //! no `HashMap`, no panic on any input. Everything here is a pure function
 //! of the committed log.
 
+#[doc(hidden)]
+pub mod bench;
 pub mod wire;
 
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
@@ -91,7 +93,7 @@ pub fn fnv1a64(parts: &[&[u8]]) -> u64 {
 
 /// A value entry hashes exactly as in v1 (so a v1 image's digest verifies);
 /// a list entry is domain-separated by a leading `b"L"`.
-fn entry_hash(key: &[u8], e: &Entry) -> u64 {
+pub(crate) fn entry_hash(key: &[u8], e: &Entry) -> u64 {
     match &e.shape {
         Shape::Value(v) => fnv1a64(&[
             &(key.len() as u16).to_le_bytes(),
@@ -309,6 +311,51 @@ impl RawStateMachine for KvSm {
     }
 }
 
+/// Writes a v2 image (`WIRE-FORMAT.md` § 5) from any exact-size iterator of
+/// entries: `KvSm::stream_snapshot` and the `bench` module's std-map twins
+/// share it. The entry count is taken from the iterator, so the header and
+/// the body cannot disagree. Entries are written in iteration order: the
+/// ordered maps produce byte-identical images for the same state, a hash
+/// map the same entries in its own order (the digest is order-independent,
+/// so every arm installs any arm's image).
+pub fn write_image<'a>(
+    dst: &mut dyn Write,
+    last_applied: Option<u64>,
+    digest: u64,
+    entries: impl ExactSizeIterator<Item = (&'a Bytes, &'a Entry)>,
+) -> Result<(), SnapshotError> {
+    let mut w = BufWriter::new(dst);
+    let io = SnapshotError::Io;
+    w.write_all(&IMAGE_VERSION.to_le_bytes()).map_err(io)?;
+    w.write_all(&last_applied.unwrap_or(NO_CURSOR).to_le_bytes())
+        .map_err(io)?;
+    w.write_all(&digest.to_le_bytes()).map_err(io)?;
+    w.write_all(&(entries.len() as u64).to_le_bytes())
+        .map_err(io)?;
+    for (k, e) in entries {
+        w.write_all(&(k.len() as u16).to_le_bytes()).map_err(io)?;
+        w.write_all(k).map_err(io)?;
+        w.write_all(&e.version.to_le_bytes()).map_err(io)?;
+        match &e.shape {
+            Shape::Value(v) => {
+                w.write_all(&[SHAPE_VALUE]).map_err(io)?;
+                w.write_all(&(v.len() as u32).to_le_bytes()).map_err(io)?;
+                w.write_all(v).map_err(io)?;
+            }
+            Shape::List(items) => {
+                w.write_all(&[SHAPE_LIST]).map_err(io)?;
+                w.write_all(&(items.len() as u32).to_le_bytes())
+                    .map_err(io)?;
+                for i in items {
+                    w.write_all(&(i.len() as u32).to_le_bytes()).map_err(io)?;
+                    w.write_all(i).map_err(io)?;
+                }
+            }
+        }
+    }
+    w.flush().map_err(io)
+}
+
 /// A frozen view: an O(1) `Arc` clone of the map plus the two scalars —
 /// exactly the "clone an `Arc`" shape `state-machine-contract.md` § Snapshots
 /// asks for. The O(n) copy happens instead on the FIRST write after a freeze
@@ -369,36 +416,7 @@ impl SnapshotStateMachine for KvSm {
     /// entry = `key_len u16 ‖ key ‖ version u64 ‖ shape u8 ‖ body`, body =
     /// value: `len u32 ‖ bytes`; list: `count u32 ‖ (len u32 ‖ bytes)…`.
     fn stream_snapshot(h: Frozen, dst: &mut dyn Write) -> Result<(), SnapshotError> {
-        let mut w = BufWriter::new(dst);
-        let io = SnapshotError::Io;
-        w.write_all(&IMAGE_VERSION.to_le_bytes()).map_err(io)?;
-        w.write_all(&h.last_applied.unwrap_or(NO_CURSOR).to_le_bytes())
-            .map_err(io)?;
-        w.write_all(&h.digest.to_le_bytes()).map_err(io)?;
-        w.write_all(&(h.map.len() as u64).to_le_bytes())
-            .map_err(io)?;
-        for (k, e) in h.map.iter() {
-            w.write_all(&(k.len() as u16).to_le_bytes()).map_err(io)?;
-            w.write_all(k).map_err(io)?;
-            w.write_all(&e.version.to_le_bytes()).map_err(io)?;
-            match &e.shape {
-                Shape::Value(v) => {
-                    w.write_all(&[SHAPE_VALUE]).map_err(io)?;
-                    w.write_all(&(v.len() as u32).to_le_bytes()).map_err(io)?;
-                    w.write_all(v).map_err(io)?;
-                }
-                Shape::List(items) => {
-                    w.write_all(&[SHAPE_LIST]).map_err(io)?;
-                    w.write_all(&(items.len() as u32).to_le_bytes())
-                        .map_err(io)?;
-                    for i in items {
-                        w.write_all(&(i.len() as u32).to_le_bytes()).map_err(io)?;
-                        w.write_all(i).map_err(io)?;
-                    }
-                }
-            }
-        }
-        w.flush().map_err(io)
+        write_image(dst, h.last_applied, h.digest, h.map.iter())
     }
 
     /// `position` is the exclusive frontier P; the cursor restored is the

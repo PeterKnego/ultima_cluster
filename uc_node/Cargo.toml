@@ -70,6 +70,11 @@ uc_lincheck = { path = "../uc_lincheck", default-features = false, features = ["
 # so a `version =` here would make `cargo package` demand it from the registry.
 # No dependency cycle: `uc_sim` does not depend on `uc_node`.
 uc_sim = { path = "../uc_sim" }
+# apply_bench's `--sm kv|kv-btree|kv-hash` arms run `examples/kv`'s state
+# machine (and its PUT path over std maps) as the FSM under the hop. Same
+# unversioned idiom as `uc_lincheck`: `kv_store` is `publish = false`. No
+# cycle: `kv_store` depends on `uc_service` and `uc_remote`, not `uc_node`.
+kv_store = { path = "../examples/kv" }
 serde = { workspace = true }
 bincode = { workspace = true }
 tempfile = { workspace = true }

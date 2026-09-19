@@ -27,6 +27,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use clap::Parser;
+use kv_store::KvSm;
+use kv_store::bench::{KvBTree, KvHash};
+use kv_store::wire as kv_wire;
 use uc_log::buffer::{AppendError, Appender, LogBuffer};
 use uc_log::cnc::{CncMeta, CncPage, unpack_service_status};
 use uc_node::ServicesConfig;
@@ -71,12 +74,48 @@ struct Args {
     /// Driver pacing: never let `append - min(applied)` exceed this (default buffer/2).
     #[arg(long)]
     window: Option<u64>,
+    /// Which state machine every row runs: `raw` (the counting baseline),
+    /// `kv` (`examples/kv`'s `KvSm` on `Arc<BTreeMap>`), `kv-btree` or
+    /// `kv-hash` (the same PUT path over `std` maps). The kv arms are fed
+    /// real `PUT` frames whose key cycles over `--keys` distinct keys.
+    #[arg(long, default_value = "raw")]
+    sm: String,
+    /// Distinct keys the kv arms cycle over (8-byte keys, `n % keys`).
+    #[arg(long, default_value_t = 100_000)]
+    keys: u64,
+}
+
+/// Bytes of a kv `PUT` frame that are not the value: format byte, op byte,
+/// `key_len: u16`, then the 8-byte key the driver patches per frame.
+const KV_PUT_HEAD: usize = 4 + KV_KEY_LEN;
+const KV_KEY_LEN: usize = 8;
+
+/// The `PUT` frame template the driver patches: key bytes at
+/// `KV_PUT_HEAD - KV_KEY_LEN..KV_PUT_HEAD`, the value fills the rest of
+/// `payload_len`. Encoded by `examples/kv`'s own encoder so the bytes are
+/// exactly what a client sends.
+fn kv_put_template(payload_len: usize) -> Vec<u8> {
+    debug_assert!(payload_len >= KV_PUT_HEAD, "main() guards --payload first");
+    let value = vec![0x42u8; payload_len - KV_PUT_HEAD];
+    let f = kv_wire::encode_put(&[0u8; KV_KEY_LEN], &value);
+    debug_assert_eq!(f.len(), payload_len);
+    f
+}
+
+#[inline]
+fn kv_patch_key(frame: &mut [u8], n: u64, keys: u64) {
+    frame[KV_PUT_HEAD - KV_KEY_LEN..KV_PUT_HEAD].copy_from_slice(&(n % keys).to_le_bytes());
 }
 
 /// Raw-tier counter: no decode, no allocation — the cheapest legal SM, so the
 /// hop's own cost (the barrier, the loop, the egress publish) is what shows.
+///
+/// The frame counter lives in the `TaggedRaw` wrapper since the `--sm` arms
+/// landed (every arm needs one), so this SM only stamps the position and
+/// publishes an 8-byte response: per frame that is the same three operations
+/// the pre-`--sm` `RawCount` did (count, stamp, publish), split across the
+/// two structs rather than doubled.
 struct RawCount {
-    frames: u64,
     last: Option<u64>,
 }
 
@@ -84,12 +123,11 @@ impl RawStateMachine for RawCount {
     const NAME: &'static str = "raw";
 
     fn apply(&mut self, ctx: &mut ApplyCtx, _cmd: &[u8], out: &mut Vec<u8>) {
-        self.frames += 1;
         self.last = Some(ctx.position);
-        out.extend_from_slice(&self.frames.to_le_bytes());
+        out.extend_from_slice(&ctx.position.to_le_bytes());
     }
     fn query(&self, _q: &[u8], out: &mut Vec<u8>) {
-        out.extend_from_slice(&self.frames.to_le_bytes());
+        out.extend_from_slice(&self.last.unwrap_or(0).to_le_bytes());
     }
     fn last_applied(&self) -> Option<u64> {
         self.last
@@ -104,17 +142,32 @@ impl RawStateMachine for RawCount {
 /// for the raw tier, local to this bench (spec §3.3 "one type, one row" is
 /// for a real service; a hop-isolation harness legitimately runs one type at
 /// every row).
-struct TaggedRaw<const ROW: u8>(RawCount);
-impl<const ROW: u8> RawStateMachine for TaggedRaw<ROW> {
+///
+/// Generic over the inner SM since the `--sm` arms landed; the wrapper
+/// counts frames itself so the sweep check below works for every arm
+/// (`KvSm` answers an empty query with a decode error, not a count).
+struct TaggedRaw<const ROW: u8, S: RawStateMachine> {
+    inner: S,
+    frames: u64,
+}
+impl<const ROW: u8, S: RawStateMachine> RawStateMachine for TaggedRaw<ROW, S> {
     const NAME: &'static str = uc_service::tagged::TAGGED_NAMES[ROW as usize];
     fn apply(&mut self, ctx: &mut ApplyCtx, cmd: &[u8], out: &mut Vec<u8>) {
-        self.0.apply(ctx, cmd, out)
+        self.frames += 1;
+        self.inner.apply(ctx, cmd, out)
     }
+    /// An empty query answers the wrapper's own frame count; anything else
+    /// is the inner SM's (the kv arms' `DIGEST`, which the end-of-run
+    /// content check uses).
     fn query(&self, q: &[u8], out: &mut Vec<u8>) {
-        self.0.query(q, out)
+        if q.is_empty() {
+            out.extend_from_slice(&self.frames.to_le_bytes());
+        } else {
+            self.inner.query(q, out)
+        }
     }
     fn last_applied(&self) -> Option<u64> {
-        self.0.last_applied()
+        self.inner.last_applied()
     }
 }
 
@@ -124,13 +177,26 @@ impl<const ROW: u8> RawStateMachine for TaggedRaw<ROW> {
 /// this trait rather than in a homogeneously-typed `Vec`.
 trait BenchService {
     fn query_frames(&self) -> u64;
+    /// The kv arms' `DIGEST` answer: `(len, digest)`, or `None` if the inner
+    /// SM did not answer `ST_OK` (the raw arm has no such query).
+    fn query_kv(&self) -> Option<(u64, u64)>;
     fn stop(self: Box<Self>);
 }
-impl<const ROW: u8> BenchService for uc_service::Service<TaggedRaw<ROW>> {
+impl<const ROW: u8, S: RawStateMachine> BenchService for uc_service::Service<TaggedRaw<ROW, S>> {
     fn query_frames(&self) -> u64 {
         let mut out = Vec::new();
         self.query_raw(&[], &mut out);
         u64::from_le_bytes(out[..8].try_into().unwrap())
+    }
+    fn query_kv(&self) -> Option<(u64, u64)> {
+        let mut out = Vec::new();
+        self.query_raw(&kv_wire::encode_digest(), &mut out);
+        if out.len() < 25 || out[0] != kv_wire::ST_OK {
+            return None;
+        }
+        let len = u64::from_le_bytes(out[1..9].try_into().unwrap());
+        let digest = u64::from_le_bytes(out[9..17].try_into().unwrap());
+        Some((len, digest))
     }
     fn stop(self: Box<Self>) {
         (*self).stop();
@@ -272,22 +338,113 @@ fn main() -> anyhow::Result<()> {
     // generic on `TaggedRaw`) can't be a runtime value — `id` selects which
     // monomorphization to spawn.
     let mut services: Vec<Box<dyn BenchService>> = Vec::new();
+    let kv_arm = a.sm != "raw";
+    if kv_arm {
+        anyhow::ensure!(
+            a.payload >= KV_PUT_HEAD,
+            "--payload must be >= {KV_PUT_HEAD} for the kv arms"
+        );
+        anyhow::ensure!(a.keys >= 1, "--keys must be >= 1");
+    }
+    // One monomorphization per (row, arm): `ROW` is a const generic and the
+    // arm picks the inner type, so both are fixed here at spawn time.
+    macro_rules! spawn_rows {
+        ($cfg:expr, $mk:expr, $id:expr) => {{
+            let make = $mk;
+            let b: Box<dyn BenchService> = match $id {
+                0 => Box::new(
+                    ServiceBuilder::new(
+                        $cfg,
+                        TaggedRaw::<0, _> {
+                            inner: make(),
+                            frames: 0,
+                        },
+                    )
+                    .start()?,
+                ),
+                1 => Box::new(
+                    ServiceBuilder::new(
+                        $cfg,
+                        TaggedRaw::<1, _> {
+                            inner: make(),
+                            frames: 0,
+                        },
+                    )
+                    .start()?,
+                ),
+                2 => Box::new(
+                    ServiceBuilder::new(
+                        $cfg,
+                        TaggedRaw::<2, _> {
+                            inner: make(),
+                            frames: 0,
+                        },
+                    )
+                    .start()?,
+                ),
+                3 => Box::new(
+                    ServiceBuilder::new(
+                        $cfg,
+                        TaggedRaw::<3, _> {
+                            inner: make(),
+                            frames: 0,
+                        },
+                    )
+                    .start()?,
+                ),
+                4 => Box::new(
+                    ServiceBuilder::new(
+                        $cfg,
+                        TaggedRaw::<4, _> {
+                            inner: make(),
+                            frames: 0,
+                        },
+                    )
+                    .start()?,
+                ),
+                5 => Box::new(
+                    ServiceBuilder::new(
+                        $cfg,
+                        TaggedRaw::<5, _> {
+                            inner: make(),
+                            frames: 0,
+                        },
+                    )
+                    .start()?,
+                ),
+                6 => Box::new(
+                    ServiceBuilder::new(
+                        $cfg,
+                        TaggedRaw::<6, _> {
+                            inner: make(),
+                            frames: 0,
+                        },
+                    )
+                    .start()?,
+                ),
+                7 => Box::new(
+                    ServiceBuilder::new(
+                        $cfg,
+                        TaggedRaw::<7, _> {
+                            inner: make(),
+                            frames: 0,
+                        },
+                    )
+                    .start()?,
+                ),
+                _ => unreachable!("--fsms is bounds-checked to 1..=8 above"),
+            };
+            b
+        }};
+    }
     for id in 0..a.fsms {
         let cfg = ServiceConfig::new(&a.root, APP);
-        let raw = RawCount {
-            frames: 0,
-            last: None,
-        };
-        let svc: Box<dyn BenchService> = match id {
-            0 => Box::new(ServiceBuilder::new(cfg, TaggedRaw::<0>(raw)).start()?),
-            1 => Box::new(ServiceBuilder::new(cfg, TaggedRaw::<1>(raw)).start()?),
-            2 => Box::new(ServiceBuilder::new(cfg, TaggedRaw::<2>(raw)).start()?),
-            3 => Box::new(ServiceBuilder::new(cfg, TaggedRaw::<3>(raw)).start()?),
-            4 => Box::new(ServiceBuilder::new(cfg, TaggedRaw::<4>(raw)).start()?),
-            5 => Box::new(ServiceBuilder::new(cfg, TaggedRaw::<5>(raw)).start()?),
-            6 => Box::new(ServiceBuilder::new(cfg, TaggedRaw::<6>(raw)).start()?),
-            7 => Box::new(ServiceBuilder::new(cfg, TaggedRaw::<7>(raw)).start()?),
-            _ => unreachable!("--fsms is bounds-checked to 1..=8 above"),
+        let svc: Box<dyn BenchService> = match a.sm.as_str() {
+            "raw" => spawn_rows!(cfg, || RawCount { last: None }, id),
+            "kv" => spawn_rows!(cfg, KvSm::default, id),
+            "kv-btree" => spawn_rows!(cfg, KvBTree::default, id),
+            "kv-hash" => spawn_rows!(cfg, KvHash::default, id),
+            m => anyhow::bail!("--sm must be raw|kv|kv-btree|kv-hash, got {m}"),
         };
         services.push(svc);
     }
@@ -311,14 +468,22 @@ fn main() -> anyhow::Result<()> {
         let stop = Arc::clone(&stop);
         let appended = Arc::clone(&appended);
         let (fsms, batch, payload_len) = (a.fsms, a.batch, a.payload);
+        let (kv_arm, keys) = (kv_arm, a.keys);
         std::thread::Builder::new()
             .name("apply-bench-driver".into())
             .spawn(move || {
                 let mut app = Appender::new(buffer, 1, 0);
-                let payload = vec![0x42u8; payload_len];
+                let mut payload = if kv_arm {
+                    kv_put_template(payload_len)
+                } else {
+                    vec![0x42u8; payload_len]
+                };
                 let mut n = 0u64;
                 let mut stalls = 0u64;
                 while !stop.load(Ordering::Relaxed) {
+                    if kv_arm {
+                        kv_patch_key(&mut payload, n, keys);
+                    }
                     match app.append(0, n as u32, &payload) {
                         Ok(_) => {
                             n += 1;
@@ -371,8 +536,8 @@ fn main() -> anyhow::Result<()> {
     let stalls = driver.join().expect("driver");
 
     println!(
-        "== apply_bench: {} FSM(s), mode={} lag={} payload={} frame={} batch={} window={} secs={:.2} (SMOKE, not a gate) ==",
-        a.fsms, a.mode, lag, a.payload, frame, a.batch, window, elapsed
+        "== apply_bench: {} FSM(s), sm={} keys={} mode={} lag={} payload={} frame={} batch={} window={} secs={:.2} (SMOKE, not a gate) ==",
+        a.fsms, a.sm, a.keys, a.mode, lag, a.payload, frame, a.batch, window, elapsed
     );
     let mut per = Vec::new();
     for id in 0..a.fsms as usize {
@@ -408,6 +573,7 @@ fn main() -> anyhow::Result<()> {
     // The SM's own count: proves the cursor sweep applied every frame (not
     // just advanced past them). `total` covers warmup too, so compare against
     // the total applied bytes / frame.
+    let mut content_ok = true;
     for (id, s) in services.iter().enumerate() {
         let sm_frames = s.query_frames();
         let swept = cnc.service_slot(id).applied.load_acquire() / frame;
@@ -415,6 +581,22 @@ fn main() -> anyhow::Result<()> {
             "fsm={id} sm_frames={sm_frames} swept_frames={swept}{}",
             if sm_frames == swept { "" } else { " MISMATCH" }
         );
+        // Content check for the kv arms: every frame was a PUT to key
+        // `n % keys`, so the map must hold exactly min(frames, keys) entries.
+        // Counting apply calls cannot see a frame that decoded to
+        // BAD_REQUEST (the cursor still moves); the map's length can.
+        if kv_arm {
+            let want = sm_frames.min(a.keys);
+            match s.query_kv() {
+                Some((len, digest)) if len == want && digest != 0 => {
+                    println!("fsm={id} kv_len={len} kv_digest={digest:#x} (content OK)");
+                }
+                got => {
+                    content_ok = false;
+                    println!("fsm={id} kv content CHECK FAILED: want len={want}, got {got:?}");
+                }
+            }
+        }
     }
     for s in services {
         s.stop();
@@ -422,12 +604,33 @@ fn main() -> anyhow::Result<()> {
     drop(rings);
     drop(dir); // releases `instance.lock` before the dir goes away
     let _ = std::fs::remove_dir_all(&a.root);
+    anyhow::ensure!(content_ok, "a kv arm did not hold the state its frames put");
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::render_apply_json;
+    use super::{KV_KEY_LEN, KV_PUT_HEAD, kv_patch_key, kv_put_template, render_apply_json};
+    use kv_store::wire::{Command, decode_command};
+
+    /// The driver's patched template must decode, through `examples/kv`'s
+    /// own decoder, as a PUT of the cycled key with the value filling the
+    /// rest of `--payload` — otherwise the kv arms measure a BAD_REQUEST
+    /// path, not a map insert.
+    #[test]
+    fn kv_put_template_decodes_as_put_of_the_patched_key() {
+        let mut f = kv_put_template(64);
+        assert_eq!(f.len(), 64);
+        kv_patch_key(&mut f, 100_007, 100_000);
+        match decode_command(&f) {
+            Ok(Command::Put { key, value }) => {
+                assert_eq!(key, &7u64.to_le_bytes());
+                assert_eq!(key.len(), KV_KEY_LEN);
+                assert_eq!(value.len(), 64 - KV_PUT_HEAD);
+            }
+            other => panic!("not a PUT: {other:?}"),
+        }
+    }
 
     /// Pins the exact bytes of the line `scripts/apply_ab.sh` parses.
     ///
