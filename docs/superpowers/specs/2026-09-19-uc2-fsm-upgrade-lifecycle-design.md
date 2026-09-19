@@ -718,7 +718,7 @@ broke.**
 
 Both are independent of the lifecycle work and could ship on their own.
 
-**(1) The typed tier discards `bytes_read`.** All three decode sites
+**(1) The typed tier discards `bytes_read`** — filed as [#49]. All three decode sites
 (`uc_service/src/traits.rs:326, 336, 484`) destructure as `let (cmd, _) = ...`,
 and `decode_from_slice` does not require consuming the buffer. Per Appendix A,
 **four of the five measured silent misparses leave `bytes_read < len`** and
@@ -782,7 +782,7 @@ first means Track 2 arrives with its proof already in the tree.
 
 | # | deliverable | kind | depends on |
 |---|---|---|---|
-| 0 | `bytes_read` length check at the three decode sites (§9.1) | **code, separable** | — |
+| 0 | `bytes_read` length check at the three decode sites (§9.1, [#49]) | **code, separable** | — |
 | 1 | §2.1 axes, §2.4 taxonomy, §2.2 common origin, §2.5 version-as-input, §3 stages → folded into `application-sdlc.md` | docs | — |
 | 2 | §5 conventions, including §5.7's codec guidance | docs | 1 |
 | 3 | Corpus format + trimmed export (§6.1) | code | — |
@@ -882,3 +882,4 @@ directions where both are meaningful. Source:
 [#38]: https://github.com/PeterKnego/ultima_cluster/issues/38
 [#41]: https://github.com/PeterKnego/ultima_cluster/issues/41
 [#42]: https://github.com/PeterKnego/ultima_cluster/issues/42
+[#49]: https://github.com/PeterKnego/ultima_cluster/issues/49
