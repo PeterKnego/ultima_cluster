@@ -29,4 +29,5 @@ clap = { workspace = true }
 [dev-dependencies]
 uc_lincheck = { path = "../uc_lincheck" }
 uc_client = { path = "../uc_client" }
+uc_net = { path = "../uc_net", version = "2.12.0" }
 tempfile = { workspace = true }
