@@ -93,6 +93,9 @@ below are its individual steps in depth.
   your FSM, give it a deterministic clock, ask to be woken with
   `ctx.schedule`, handle it in `on_timer`, and decide whether you need
   `Timed<S>` for exactly-once delivery.
+- [Diff replay an FSM change](diff-replay.md) — replay a snapshot plus a log
+  span through the old and the new build, diff everything they did, and
+  confirm the differences are the ones you meant.
 - [Cut a release](cut-a-release.md) — for maintainers: the tag, what the
   release workflow proves before it publishes anything, how to verify the
   signed artifacts as a stranger would, and the manual crates.io order.

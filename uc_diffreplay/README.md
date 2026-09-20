@@ -47,3 +47,25 @@ client id and no arm ever matches. `examples/kv/tests/corpora/put-then-delete/
 intent.toml` is the worked example.
 
 Spec: `docs/superpowers/specs/2026-09-19-uc2-fsm-upgrade-lifecycle-design.md`.
+
+## The trace an app binary writes
+
+JSON, `uc_diffreplay::trace::Trace`: `row`, `version`, `origin`, `end`,
+`projection_at_origin`, `projection_at_end`, and `entries[]` of
+`{ pos, kind: "Message" | { "Timer": { id, deadline_ns, table } }, tag, response, sched[] }`.
+`tag` is the first 32 bytes of the command payload — an app-defined
+discriminant, opaque to the harness; `tag_offset` in the declaration says
+where the app's own bytes start. A non-Rust app produces the same JSON and
+takes part in every mode.
+
+## Running the tests
+
+The e2e and reconstruction tests shell out to prebuilt binaries and hard-assert
+they exist, so build them first:
+
+    cargo build -p uc_lincheck --features replay-bin --bin register-replay
+    cargo build -p uc_diffreplay
+
+(the second one is what `examples/kv`'s `regression_corpora` test needs). Then
+
+    cargo test -p uc_diffreplay -p uc_service -p uc_lincheck -p kv_store
