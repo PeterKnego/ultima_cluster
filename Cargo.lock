@@ -1444,6 +1444,7 @@ name = "uc_diffreplay"
 version = "2.12.0"
 dependencies = [
  "anyhow",
+ "bincode",
  "clap",
  "serde",
  "serde_json",
@@ -1452,6 +1453,7 @@ dependencies = [
  "uc_client",
  "uc_journal",
  "uc_lincheck",
+ "uc_log",
  "uc_net",
  "uc_node",
  "uc_protocol",

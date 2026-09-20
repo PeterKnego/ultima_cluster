@@ -30,4 +30,10 @@ clap = { workspace = true }
 uc_lincheck = { path = "../uc_lincheck" }
 uc_client = { path = "../uc_client" }
 uc_net = { path = "../uc_net", version = "2.12.0" }
+# `tests/reconstruction.rs` only: the cnc page carries the one observable that
+# says a reattached service has finished reconstructing (`service_slot(i)
+# .applied`), and `bincode` pins the command tag the declaration names ("00" =
+# `Cmd::Write`) to the codec the client actually encodes with.
+uc_log = { path = "../uc_log", version = "2.12.0" }
+bincode = { workspace = true }
 tempfile = { workspace = true }
