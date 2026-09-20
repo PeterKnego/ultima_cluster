@@ -16,7 +16,7 @@ To read a live page while diagnosing a node, see
 | Offset | Size | Field | Notes |
 |---|---|---|---|
 | 0 | 8 B | magic | `UC2CNC\0\0` |
-| 8 | u32 LE | version | `CNC_V2_VERSION` = `(3 << 24) \| (1 << 16)` (cnc 3.1, FSM identity + log time, 2.11.0); `(3 << 24) \| (2 << 16)` (cnc 3.2, `payload_ceiling`, `2.12.0`) |
+| 8 | u32 LE | version | `CNC_V2_VERSION` = `(3 << 24) \| (1 << 16)` (cnc 3.1, FSM identity + log time, 2.11.0); `(3 << 24) \| (2 << 16)` (cnc 3.2, `payload_ceiling`, `2.12.0`); `(3 << 24) \| (3 << 16)` (cnc 3.3, `upgrade_origin`/`pinned_version`, FSM upgrade lifecycle) |
 | 12 | u32 LE | node id | |
 | 16 | u64 LE | instance id, low | changes on every node restart |
 | 24 | u64 LE | instance id, high | |
@@ -121,6 +121,8 @@ Fields within a slot (each its own 64 B line, one writer):
 |---|---|---|
 | 0 | `status` (line 0, word 0) — `service_id` (bits 0..8) \| attached (bit 8) \| **snapshot-capable (bit 9)** \| incarnation (bits 32..64) | service, at attach / clean detach |
 | 8 | `version` (line 0, word 1) — packed FSM version (low 32 bits); `0` = unversioned/absent | service, at attach (cnc 3.1, FSM identity) |
+| 16 | `upgrade_origin` (line 0, word 2) — u64, the row's pinned origin position; `0` = no pin | **node** (`uc2-cluster` agent), republished on every view publish — cnc 3.3, FSM upgrade lifecycle |
+| 24 | `pinned_version` (line 0, word 3) — u64, low 32 = packed version the pin names | **node** (`uc2-cluster` agent), stored BEFORE `upgrade_origin` — cnc 3.3 |
 | 64 | `applied` | service apply agent |
 | 128 | `epoch` | service, `fetch_add` at attach |
 | 192 | `output_completed` | service output agent |
@@ -134,8 +136,13 @@ Fields within a slot (each its own 64 B line, one writer):
 
 A slot whose `status` reads `0` has never been attached this page generation.
 The node re-creates the page at every boot, so incarnation and epoch restart
-at 0 with the node. Line 7 (`name`/`identity_hash`) breaks the "one writer
-per line, and it's the service" pattern the other seven lines follow: it is
+at 0 with the node. Line 0 (`status`/`version`) breaks the "one writer per
+line" pattern first (cnc 3.3): the service still owns `status`/`version` at
+attach/detach, but `upgrade_origin`/`pinned_version` are node-written,
+republished by the `uc2-cluster` agent on every view publish — a second
+writer on the line, each word still with exactly one writer. Line 7
+(`name`/`identity_hash`) breaks the "one writer per line, and it's the
+service" pattern the other six lines follow: it is
 written once by the **node** at boot, before any service attaches, from
 `[services] names` — a service finds its row by scanning these eight name
 lines for its own `S::NAME` rather than being told its row. `uc2ctl status`

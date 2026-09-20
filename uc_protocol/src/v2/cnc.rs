@@ -61,7 +61,9 @@ pub const CNC_PAGE_LEN: usize = 8192;
 /// 3.2 (jumbo): the live payload ceiling word at 3984. A 3.1 attacher
 /// refuses by version, and a 3.2 attacher on a 3.1 page reads 0 there and
 /// treats it as the header bound.
-pub const CNC_V2_VERSION: u32 = (3 << 24) | (2 << 16);
+///
+/// 3.3 (plan B1): `upgrade_origin`/`pinned_version` at slot +16/+24.
+pub const CNC_V2_VERSION: u32 = (3 << 24) | (3 << 16);
 
 // ---- header (byte offsets) ------------------------------------------------
 pub const CNC_OFF_MAGIC: usize = 0; // [u8; 8]
@@ -319,6 +321,8 @@ const _: () = assert!(
 //   +0   status          u64 = service_id (bits 0..8) | attached (bit 8)
 //                              | incarnation (bits 32..64)    writer: service (attach/detach)
 //   +8   version         u64 (low 32 = packed FSM version)   writer: service (attach)
+//   +16  upgrade_origin  u64 position (0 = no pin)             writer: node (cluster agent)
+//   +24  pinned_version  u64 (low 32 = packed version)         writer: node (cluster agent)
 //   +64  applied         u64 position                          writer: service apply agent
 //   +128 epoch           u64 (attach-time fetch_add, AcqRel)   writer: service (attach)
 //   +192 output_completed u64 position                         writer: service output agent
@@ -355,6 +359,17 @@ pub const CNC_SVC_STATUS_INCARNATION_SHIFT: u32 = 32;
 /// cnc 3.1: the attached service's packed version (`identity::pack_version`),
 /// low 32 bits of the status line's second word. `0` = unversioned/absent.
 pub const CNC_SVC_OFF_VERSION: usize = 8;
+/// FSM upgrade lifecycle (spec §2.5, §3 S4; cnc 3.3): the row's newest
+/// `UpgradePin`, republished from cluster-FSM state by the `uc2-cluster`
+/// agent on every view publish — node-written, a second writer on the
+/// status line (the service writes `status`/`version` at attach; each word
+/// still has exactly one writer). `0` = no pin. A service reads them at
+/// attach (plan B2): a non-zero origin whose version equals its own
+/// `VERSION` means "install `snap-<origin>` unconditionally"; a version
+/// that differs is an attach refusal.
+pub const CNC_SVC_OFF_UPGRADE_ORIGIN: usize = 16;
+/// Low 32 bits = the packed version the pin names (`identity::pack_version`).
+pub const CNC_SVC_OFF_PINNED_VERSION: usize = 24;
 /// cnc 3.1: line 7 — the row's FSM name, NUL-padded to 32 B, then its hash,
 /// then (time-and-timers) its pending-timer count, then (coordinated-
 /// snapshot spec §9) its last freeze duration.
@@ -566,8 +581,8 @@ mod tests {
         write_cnc_header(&mut page, &h, "kv");
         // magic
         assert_eq!(&page[0..8], b"UC2CNC\0\0");
-        // version = (3<<24)|(2<<16) = 0x0302_0000 -> LE [0,0,2,3]
-        assert_eq!(&page[8..12], &[0x00, 0x00, 0x02, 0x03]);
+        // version = (3<<24)|(3<<16) = 0x0303_0000 -> LE [0,0,3,3]
+        assert_eq!(&page[8..12], &[0x00, 0x00, 0x03, 0x03]);
         // node_id = 7 -> LE [7,0,0,0]
         assert_eq!(&page[12..16], &[7, 0, 0, 0]);
     }
@@ -817,7 +832,17 @@ mod tests {
         // FSM identity (cnc 3.1): version word in the status line, name +
         // hash on the once-reserved line 7. Both inside the 512 B slot.
         // cnc 3.2: the live payload ceiling word (jumbo).
-        assert_eq!(CNC_V2_VERSION, (3 << 24) | (2 << 16));
+        // cnc 3.3 (plan B1): the row's pin words on the STATUS line, node-written.
+        assert_eq!(CNC_V2_VERSION, (3 << 24) | (3 << 16));
+        assert_eq!(CNC_SVC_OFF_UPGRADE_ORIGIN, 16);
+        assert_eq!(CNC_SVC_OFF_PINNED_VERSION, 24);
+        assert_eq!(CNC_SVC_OFF_UPGRADE_ORIGIN, CNC_SVC_OFF_VERSION + 8);
+        const {
+            assert!(
+                CNC_SVC_OFF_PINNED_VERSION + 8 <= 64,
+                "inside the status line"
+            )
+        };
         assert_eq!(CNC_SVC_OFF_VERSION, 8);
         assert_eq!(CNC_SVC_OFF_NAME, 448);
         assert_eq!(CNC_SVC_NAME_LEN, 32);

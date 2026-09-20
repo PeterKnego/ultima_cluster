@@ -170,12 +170,18 @@ pub fn pack_naks_plus_replay(naks_served: u32, replay_datagrams: u32) -> u64 {
 }
 
 /// cnc 3.1: the slot's line 0 — `status` (word 0) and the attached service's
-/// packed version (word 1). One writer (the service, at attach/detach).
+/// packed version (word 1). cnc 3.3 (plan B1) adds two more words to the
+/// same line, `upgrade_origin`/`pinned_version` — a second writer on the
+/// line: the service still owns `status`/`version` (attach/detach), the
+/// node's `uc2-cluster` agent owns the pin words (republished on every view
+/// publish), and each word still has exactly one writer.
 #[repr(C)]
 pub struct ServiceStatusLine {
     status: AtomicU64,
     version: AtomicU64,
-    _pad: [u64; 6],
+    upgrade_origin: AtomicU64,
+    pinned_version: AtomicU64,
+    _pad: [u64; 4],
 }
 impl ServiceStatusLine {
     pub fn load_acquire(&self) -> u64 {
@@ -190,9 +196,28 @@ impl ServiceStatusLine {
     pub fn store_version(&self, v: u32) {
         self.version.store(v as u64, Ordering::Release)
     }
+    /// The row's pinned origin (cnc 3.3, spec §3 S4); `0` = no pin.
+    pub fn upgrade_origin(&self) -> u64 {
+        self.upgrade_origin.load(Ordering::Acquire)
+    }
+    pub fn pinned_version(&self) -> u32 {
+        self.pinned_version.load(Ordering::Acquire) as u32
+    }
+    /// Version FIRST, origin LAST with `Release`: a reader that `Acquire`s
+    /// a non-zero origin sees the version that goes with it.
+    pub fn store_pin(&self, origin: u64, version: u32) {
+        self.pinned_version.store(version as u64, Ordering::Release);
+        self.upgrade_origin.store(origin, Ordering::Release);
+    }
 }
 const _: () = assert!(std::mem::size_of::<ServiceStatusLine>() == 64);
 const _: () = assert!(std::mem::offset_of!(ServiceStatusLine, version) == cnc::CNC_SVC_OFF_VERSION);
+const _: () = assert!(
+    std::mem::offset_of!(ServiceStatusLine, upgrade_origin) == cnc::CNC_SVC_OFF_UPGRADE_ORIGIN
+);
+const _: () = assert!(
+    std::mem::offset_of!(ServiceStatusLine, pinned_version) == cnc::CNC_SVC_OFF_PINNED_VERSION
+);
 
 /// cnc 3.1: the slot's line 7 — the row's name (NUL-padded) and its FNV-1a
 /// hash, written ONCE by the node in `init`, before the header is published,
@@ -1871,6 +1896,23 @@ mod tests {
         assert_eq!(
             u64::from_le_bytes(raw[off..off + 8].try_into().unwrap()),
             4096
+        );
+    }
+
+    #[test]
+    fn pin_words_are_zero_at_init_and_store_version_before_origin() {
+        let page = CncPage::heap(&test_meta());
+        let s = &page.service_slot(2).status;
+        assert_eq!((s.upgrade_origin(), s.pinned_version()), (0, 0));
+        s.store_pin(8192, 0x0102_0003);
+        assert_eq!(
+            (s.upgrade_origin(), s.pinned_version()),
+            (8192, 0x0102_0003)
+        );
+        assert_eq!(
+            page.service_slot(1).status.upgrade_origin(),
+            0,
+            "slots are independent"
         );
     }
 
