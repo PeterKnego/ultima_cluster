@@ -1,9 +1,10 @@
 # FSM upgrade lifecycle — design
 
-**Status:** revision 4 — open questions **decided** 2026-09-20 (§10); §4
-rewritten around the diff → attribute → confirm loop; ready for the
-maintainer's read-through before planning. **Dates:** drafted 2026-09-19,
-decisions and §4 rewrite 2026-09-20.
+**Status:** revision 5 — open questions **decided** 2026-09-20 (§10); §4
+rewritten around the diff → attribute → confirm loop; §6.5 adds the two
+further applications of diff replay (bug fixing, live nondeterminism
+detection). Approved for planning. **Dates:** drafted 2026-09-19, decisions,
+§4 rewrite and §6.5 2026-09-20.
 **Tree:** worktree `fsm-upgrade-lifecycle`, branched from `main` @ `47e74e4`
 (UC 2.12.0).
 
@@ -30,6 +31,12 @@ well-defined and complete (§4).
 > — on different FSMs, then comparing the differences in their snapshots,
 > outputs and logs. The name for the technique, the harness that runs it (§6),
 > and the mode of that harness that compares two versions (§6.2).
+>
+> Three applications, one loop (§6.5): **upgrading** (v_old vs v_new, the
+> declared intent is the change), **bug fixing** (v_buggy vs v_fixed on the
+> corpus that triggers it, the declared intent is "this and nothing else"),
+> and **live determinism** (N instances of the same version, at every
+> coordinated snapshot instant, the declared intent is empty).
 
 An application built on UC has no supported way to move its state machine from
 version N to version N+1 other than a flag day, and no tooling to run diff
@@ -84,6 +91,10 @@ The work splits into **three deliverables** (§10 Q5). This spec is the first.
   artifact envelope's version stamp (§9.1).
 - **Tooling**: the diff replay harness — corpus format, three modes,
   black-box execution (§6) — and a skill that drives it (§8).
+- **Diff replay beyond upgrades** (§6.5): the bug-fix corpus and its
+  regression convention; and **live nondeterminism detection** — node-side
+  artifact hashes reported through the log as a `SnapshotReport` cluster
+  record, compared at apply on every node, the minority replica named.
 
 Everything here is **codec-agnostic**: the pin does not read the payload, the
 harness compares bytes and query answers, the taxonomy is about shapes of
@@ -372,6 +383,15 @@ whole point is that the *sequence* matters.
 With the pin history in the cluster FSM, "which version built `snap-<P>`?" is
 answerable for any retained artifact: the pin in effect at P. §9.1 adds the
 envelope stamp that lets the artifact answer it for itself.
+
+**Also decided (§6.5.2): the `SnapshotReport` cluster record, `CLUSTER kind =
+5`.** Same flag day, same FSM. Payload `row: u8 ‖ count: u8 ‖ reserved [u8; 6]
+‖ position: u64 ‖ count × (node_id: u32 ‖ hash: u64)`: the vector of
+node-side artifact hashes the leader collected for `(row, P)`. Applied at
+commit on every node; the cluster FSM computes the verdict deterministically
+— all equal, or a majority with a named minority — and holds it in state. It
+is the live form of diff replay's `determinism` mode, and the mechanism behind
+the how-to's manual `sha256sum` step.
 
 **What this deliberately does not buy:** faithful genesis replay. Even with a
 complete version history in the log, replaying `[0,Q]` correctly would require
@@ -842,6 +862,15 @@ ordering — the same discipline the image itself already needs. `examples/kv`
 ships one, so the first worked example of a `SnapshotStateMachine` is also the
 first worked example of a projection.
 
+### 5.9 Keep a regression corpus
+
+A bug that needed a particular input to trigger is fixed by diff replay
+(§6.5.1), and the corpus that reproduced it — artifact, span, and the
+declaration "position X now does Y, nothing else changes" — is kept and
+replayed under every future version. Corpora live beside the FSM's tests
+(the library crate of §5.3 has a natural place for them); a corpus without its
+declaration is a recording, not a test.
+
 ---
 
 ## 6. Tooling: the diff replay harness
@@ -858,18 +887,21 @@ those exist, and is carried alongside by hand until then.
 
 No new capture mechanism is needed; what is wanted is *trimming*, and [#42]
 already notes that backup copies the 64 MiB preallocation file, so the trimming
-work is independently justified.
+work is independently justified. The export takes either an explicit
+`--from P --to Q` or `--around <pos>` — the nearest complete set at or below
+`pos` plus a span through it — which is the smallest reproducing input for a
+bug at `pos` by construction (§6.5.1).
 
 Note that §1.4 bounds the corpus: it always starts from a real artifact, never
 from position 0. That makes the harness cheaper as well as more honest.
 
 ### 6.2 Three modes
 
-| mode | setup | catches |
-|---|---|---|
-| **`determinism`** | one build, **two processes**, same corpus | ambient clock, RNG, `HashMap` iteration order — *for free*, since Rust randomizes `RandomState` per process, so two processes already disagree if the FSM depends on hash order |
-| **`upgrade`** | two builds, same corpus; projections diffed at P (post-install) and at Q (post-apply) | axis-H breakage, semantic drift, id-stream drift, the migration delta (§4.4) |
-| **`reconstruction`** | one build, **two start states**: genesis-replay (or continue-from-X) vs. install-artifact-at-P + tail-replay | the §2.3 counterfactuals |
+| mode | setup | catches | live deployment |
+|---|---|---|---|
+| **`determinism`** | one build, **two processes**, same corpus | ambient clock, RNG, `HashMap` iteration order — *for free*, since Rust randomizes `RandomState` per process, so two processes already disagree if the FSM depends on hash order | **snapshot-hash comparison at every instant** (§6.5.2) — N nodes instead of two processes |
+| **`upgrade`** | two builds, same corpus; projections diffed at P (post-install) and at Q (post-apply) | axis-H breakage, semantic drift, id-stream drift, the migration delta (§4.4) | `Shadow<Old, New>` on a learner (§7, phase 2) |
+| **`reconstruction`** | one build, **two start states**: genesis-replay (or continue-from-X) vs. install-artifact-at-P + tail-replay | the §2.3 counterfactuals | — (the attach refusal of S4 *is* the live form) |
 
 That the determinism check falls out as a degenerate case is the main argument
 for this shape. It also makes [#38]'s item 2 (a determinism *lint*) largely
@@ -912,6 +944,102 @@ state diffs of §4.4, each entry carrying its §4.5 attribution (hunk, or
 absent). On failure, the first failing entry with both versions' values on
 the offending surface. The report is the artifact the developer — or the
 skill — reasons over; it is designed to be read, not just checked.
+
+### 6.5 Diff replay beyond upgrades
+
+The loop of §4.1 does not care *why* two FSMs are being compared. Two further
+applications fall out, and naming them here is what keeps the harness from
+growing three bespoke tools.
+
+| | origin | inputs | compared FSMs | declared intent |
+|---|---|---|---|---|
+| **upgrade** | pinned artifact at P | span P→Q | v_old vs v_new | the intended change |
+| **bug fix** | the set before the trigger | span containing the trigger | v_buggy vs v_fixed | "position X now does Y; **nothing else changes**" |
+| **live determinism** | the last instant | the live log | N instances of the *same* version | **empty** — any diff is a defect |
+
+#### 6.5.1 Bug fixing
+
+A bug that needs a particular input to trigger is, by definition,
+reproducible from a corpus: `uc2ctl corpus export --around <pos>` (§6.1)
+captures the smallest one. Diff replay in `upgrade` mode with v_buggy and
+v_fixed, and the narrowest possible declaration, gives the cleanest use of the
+§4.6 gate: the intended delta is one entry, so *any other entry is collateral
+change* and fails as undeclared.
+
+Three consequences:
+
+- **The corpus becomes a regression test** (§5.9) — replayed under every
+  future version, the declared behaviour must hold. This is [#38]'s "golden
+  replay" item, now with a purpose and a place.
+- **Non-reproduction is a finding.** Replay is deterministic by construction,
+  so a bug that does not reproduce from its own corpus is *evidence of
+  nondeterminism* — hand it to §6.5.2. The two applications are each other's
+  fallback.
+- **Repair is a migration.** The code fix corrects the future; state already
+  corrupted by the bug needs a repair step, which is an S3 shim, checked by the
+  state diff at P (§4.4). The lifecycle already has the slot.
+
+#### 6.5.2 Live nondeterminism detection
+
+Every instance of a row on every node started from the same origin and applied
+the same log, so at every coordinated snapshot instant their artifacts at P
+**must be byte-identical**. Today nothing checks: `Uc2SnapshotSetDiverged`
+(`packaging/prometheus/uc2-alerts.yml:300`) compares the newest complete set's
+*position* across nodes — a purge-floor check — and the upgrade how-to's
+"hashes identically everywhere" (`upgrade-an-application.md:84-86`) is a
+manual `sha256sum` per node over ssh. The check exists as a procedure an
+operator remembers, not as a mechanism.
+
+**The mechanism, decided:**
+
+1. **Hash at stream time, node-side.** `builder_agent` already streams the
+   service's bytes into the artifact; hashing as it streams costs no extra
+   I/O, and the node is the right party — a service should not grade its own
+   image. The hash covers the payload; the envelope's fields are identical
+   across nodes anyway.
+2. **Follower → leader datagram.** A new pairwise kind (the `PROBE`/
+   `PROBE_ACK` shape, next free number after 25) carries `(row, P, hash)` to
+   the leader when a node's artifact completes.
+3. **The leader appends one record.** Once a quorum has reported for
+   `(row, P)`, or on a timeout, the leader appends a single `SnapshotReport`
+   (`CLUSTER kind = 5`, §2.5) carrying the whole `(node, hash)` vector.
+   Leader-only and single-in-flight, like every cluster record.
+4. **The verdict is computed at apply, on every node.** The cluster FSM
+   compares the vector deterministically: all equal → agreed; otherwise, with
+   N ≥ 3, the **majority hash names the minority node**. The verdict lives in
+   FSM state, so it is replicated and auditable, and rides the cluster
+   artifact.
+5. **Out:** gauge `uc2_snapshot_hash_mismatch{row}` (the count of nodes off
+   the majority at the newest reported instant), obs event
+   `snapshot_hash_diverged` naming the row, position and node, and an alert
+   `Uc2SnapshotHashDiverged`.
+
+**Why through the log rather than metrics alone.** A metrics-only version —
+each node exports `uc2_snapshot_hash{row, position}` and an alert uses the
+`count_values` idiom `Uc2ServiceIdentityDrift` already uses — costs no flag
+day and is worth shipping as a complement. But it is external, not durable,
+and cannot name the minority; the log path is self-contained, survives the
+metrics stack, and lands in the same FSM as `UpgradePin`. The metrics form is
+the alerting surface; the log form is the record.
+
+**Two things stated plainly:**
+
+- **The image must be canonical**, or every node hashes differently with
+  identical logical state. That is not a false positive: an image that
+  iterates a `HashMap` is *itself* the defect (it breaks S7's confirmation
+  too). §5.8's discipline already demands it; this enforces it.
+- **On mismatch: report, do not fail-stop.** A single node cannot know it is
+  the wrong one, and stopping a replica on the strength of a hash the cluster
+  only just noticed disagrees is the wrong reflex. The minority is named; the
+  operator decides. A fail-stop policy can be added later as an explicit
+  opt-in once the check has a track record.
+
+Hash function: 64-bit is enough for *accidental* divergence (the threat model
+already excludes a malicious member); which function is a plan detail.
+
+This is the cheapest determinism evidence the platform will ever produce: it
+runs on production traffic, at every instant, with no test corpus and no
+second binary, and it is the `determinism` mode of §6.2 deployed to N nodes.
 
 ---
 
@@ -1089,6 +1217,8 @@ written to them.
 | 7 | `ULTSNAP2` envelope stamp + `install_snapshot` cross-check (§9.1) | code | 5 |
 | 8 | `reconstruction` mode **part 2** — verify the refusal, empty and durable shapes (§6.2) | code | 4, 6 |
 | 9 | Skill (§8) — declaration drafting, attribution, state-diff judgement | skill | 1, 4b |
+| 12 | `--around <pos>` corpus export (§6.1); regression-corpus convention + a worked example in `examples/kv` (§5.9, §6.5.1) | code + docs | 3 |
+| 13 | Live nondeterminism detection (§6.5.2): node-side hash at stream time; follower→leader report datagram; `SnapshotReport` kind 5 + per-`(row, P)` verdict in the cluster FSM; gauge, obs event, alert; the metrics-only complement | code, **flag day** | 5 |
 | 10 | White-box mode + `Shadow` (§7) — phase 2 | code | 4, §5.3 |
 | 11 | Learner shadow deployment — phase 2 | docs + ops | 10 |
 
@@ -1125,7 +1255,8 @@ Read and quoted in this tree (worktree `fsm-upgrade-lifecycle`, `main` @ `47e74e
 - `uc_protocol/src/identity.rs:151` — `pack_version`; `hash()` is over the name only.
 - `examples/kv/src/wire.rs:13,312` and `examples/kv/src/lib.rs:66-68` — the command version tag and snapshot image dual-read.
 - `examples/kv/tests/cluster.rs:541` — `upgrade_v1_to_v2_flag_day`, which skips unless v1 binaries are staged by hand.
-- `packaging/prometheus/uc2-alerts.yml:178` — `Uc2ServiceVersionDrift`.
+- `packaging/prometheus/uc2-alerts.yml:178` — `Uc2ServiceVersionDrift`; `:300` — `Uc2SnapshotSetDiverged` compares set *position*, not content.
+- `docs/how-to/upgrade-an-application.md:84-86` — the cross-replica hash check is a manual `sha256sum` per node.
 - `Cargo.toml:38` / `Cargo.lock` — `bincode = "2"`, locked at `2.0.1`.
 - `docs/reference/application-sdlc.md`, `docs/how-to/upgrade-an-application.md` — read in full.
 - `.superpowers/SBE vs serde+bincode 2 — Handover Doc.md` — read in full; §5.7 responds to it.
