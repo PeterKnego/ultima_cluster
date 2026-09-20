@@ -21,9 +21,14 @@
 //! `v2::settings`: no I/O, no `sha2` — `crc32fast` is already a dependency of
 //! this crate.
 //!
-//! The byte layout is unchanged from the plan-1/plan-2 `ClusterFsm::freeze`
-//! this replaces — see `cluster_image_roundtrips_and_layout_is_frozen`'s
-//! fixture, captured from the pre-move `freeze` output.
+//! Layout v1 IS the byte layout the plan-1/plan-2 `ClusterFsm::freeze` this
+//! module replaced produced — see `cluster_image_roundtrips_and_layout_is_frozen`'s
+//! `PLAN1_FIXTURE`, captured from that pre-move `freeze` output. It is now
+//! **read-only compatibility**: `encode_cluster_image` always emits v2,
+//! which appends the two length-prefixed pin and report blobs after the
+//! settings record, so a fresh artifact no longer reproduces that fixture
+//! byte for byte. The fixture still has to DECODE, because a node restarting
+//! across the `2.13.0` flag day reads its own pre-upgrade artifact off disk.
 //!
 //! `membership`, `table` and `settings` are returned as opaque byte slices,
 //! not decoded here: the caller (`uc_node::cluster_fsm`) already owns
@@ -188,8 +193,20 @@ pub fn decode_cluster_image(buf: &[u8]) -> Option<ClusterImageParts<'_>> {
         // record, self-versioned and exact-length per version
         // (`settings::decode_settings`) — never a slice that could run past
         // `body`'s end. A 2.11.0 artifact carries v1 — jumbo spec §5.5.
+        // Size it by ITS OWN version word, exactly as the v2 branch does,
+        // and require the remainder to be that length and nothing else.
+        // Accepting `rest == SETTINGS_LEN || rest == SETTINGS_LEN_V1`
+        // without consulting the word would admit a 33-byte tail that says
+        // `version = 1`: `decode_settings` would then read a 29-byte record
+        // and the 4 trailing bytes would vanish on re-encode, so decode and
+        // re-encode would not round-trip for an input we accepted.
+        let sl = match u32_at(o)? {
+            1 => SETTINGS_LEN_V1,
+            2 => SETTINGS_LEN,
+            _ => return None,
+        };
         let rest = body.len().checked_sub(o)?;
-        if rest != SETTINGS_LEN && rest != SETTINGS_LEN_V1 {
+        if rest != sl {
             return None;
         }
         (&body[o..], &body[body.len()..], &body[body.len()..])
@@ -447,6 +464,52 @@ mod tests {
                 "a {bad_len}-byte settings tail is neither version's exact length"
             );
         }
+    }
+
+    /// The v1 branch sizes the settings tail by the record's OWN version
+    /// word, not by "either accepted length": a v1-FRAMED image whose
+    /// 33-byte tail claims `version = 1` is not a v1 record padded with
+    /// four bytes, it is a length the codec cannot re-encode, so it is
+    /// refused rather than silently truncated to 29.
+    #[test]
+    fn a_v1_image_whose_33_byte_tail_claims_version_1_is_refused() {
+        let (membership, table, _) = genesis_parts();
+        let mut tail = v1_settings_blob();
+        tail.resize(SETTINGS_LEN, 0); // 33 bytes, version word still 1
+        assert_eq!(tail.len(), SETTINGS_LEN);
+        assert_eq!(&tail[0..4], &1u32.to_le_bytes());
+
+        let frame_v1 = |settings: &[u8]| -> Vec<u8> {
+            // Hand-framed as a VERSION-1 image (encode_cluster_image only
+            // emits v2), so the tail reaches the v1 branch.
+            let mut body = Vec::new();
+            body.extend_from_slice(CLUSTER_IMAGE_MAGIC);
+            body.extend_from_slice(&1u32.to_le_bytes());
+            body.extend_from_slice(&640u64.to_le_bytes()); // applied
+            body.extend_from_slice(&0u64.to_le_bytes()); // table_position
+            body.extend_from_slice(&320u64.to_le_bytes()); // settings_position
+            body.extend_from_slice(&(membership.len() as u32).to_le_bytes());
+            body.extend_from_slice(&membership);
+            body.extend_from_slice(&(table.len() as u32).to_le_bytes());
+            body.extend_from_slice(&table);
+            body.extend_from_slice(settings);
+            let crc = crc32fast::hash(&body);
+            body.extend_from_slice(&crc.to_le_bytes());
+            body
+        };
+
+        assert_eq!(
+            decode_cluster_image(&frame_v1(&tail)),
+            None,
+            "the CRC is correct; the version word disagrees with the length"
+        );
+
+        // The control: the same framing with the honest 29-byte v1 tail
+        // decodes, so it is the length rule refusing above, not the frame.
+        let ok = frame_v1(&v1_settings_blob());
+        let d = decode_cluster_image(&ok).expect("an honest v1 tail decodes");
+        assert_eq!(d.settings.len(), SETTINGS_LEN_V1);
+        assert!(d.pins.is_empty() && d.reports.is_empty());
     }
 
     #[test]
