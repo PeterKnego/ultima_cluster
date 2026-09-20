@@ -36,7 +36,6 @@ cluster-tests = []
 uc_service = { path = "../../uc_service", version = "2.12.0" }
 uc_remote  = { path = "../../uc_remote", version = "2.12.0" }
 bytes       = { workspace = true }
-im          = "15"
 clap        = { workspace = true }
 anyhow      = { workspace = true }
 signal-hook = { workspace = true }

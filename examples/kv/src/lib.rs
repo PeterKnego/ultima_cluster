@@ -21,17 +21,21 @@ pub mod wire;
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 
 use bytes::Bytes;
-use im::{OrdMap, Vector};
+use std::collections::BTreeMap;
+use std::sync::Arc;
 use uc_service::{ApplyCtx, RawStateMachine, SnapshotError, SnapshotStateMachine};
 
 use wire::{Command, Query};
 
-/// What a key holds. `Clone` is O(1) for both (persistent structures).
+/// What a key holds. Plain std collections behind an `Arc` on the map (see
+/// `KvSm::map`): the example carries no persistent-map dependency — `im` is
+/// unmaintained with an open unsoundness advisory (RUSTSEC-2023-0126), and
+/// this is the code people copy.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Shape {
     Value(Bytes),
     /// Oldest first.
-    List(Vector<Bytes>),
+    List(Vec<Bytes>),
 }
 
 /// One stored key and the version (log position) that last wrote it.
@@ -44,7 +48,7 @@ pub struct Entry {
 /// The replicated state. `Default` is the genesis state (empty, nothing applied).
 #[derive(Default)]
 pub struct KvSm {
-    map: OrdMap<Bytes, Entry>,
+    map: Arc<BTreeMap<Bytes, Entry>>,
     last_applied: Option<u64>,
     /// XOR of `entry_hash` over every entry: order-independent, O(1) to
     /// maintain, and what `DIGEST` reports so replicas can be compared.
@@ -135,13 +139,13 @@ impl KvSm {
         Self::digest_of(&self.map)
     }
 
-    fn digest_of(map: &OrdMap<Bytes, Entry>) -> u64 {
+    fn digest_of(map: &BTreeMap<Bytes, Entry>) -> u64 {
         map.iter().fold(0u64, |d, (k, e)| d ^ entry_hash(k, e))
     }
 
     fn insert(&mut self, key: &[u8], entry: Entry) -> Option<Entry> {
         let new_hash = entry_hash(key, &entry);
-        let old = self.map.insert(Bytes::copy_from_slice(key), entry);
+        let old = Arc::make_mut(&mut self.map).insert(Bytes::copy_from_slice(key), entry);
         if let Some(old) = &old {
             self.digest ^= entry_hash(key, old);
         }
@@ -150,7 +154,7 @@ impl KvSm {
     }
 
     fn remove(&mut self, key: &[u8]) -> Option<Entry> {
-        let old = self.map.remove(key);
+        let old = Arc::make_mut(&mut self.map).remove(key);
         if let Some(old) = &old {
             self.digest ^= entry_hash(key, old);
         }
@@ -158,7 +162,7 @@ impl KvSm {
     }
 }
 
-fn write_list(out: &mut Vec<u8>, version: u64, items: &Vector<Bytes>) {
+fn write_list(out: &mut Vec<u8>, version: u64, items: &[Bytes]) {
     wire::put_status_u64(out, wire::ST_OK, version);
     out.extend_from_slice(&(items.len() as u32).to_le_bytes());
     for i in items {
@@ -236,7 +240,7 @@ impl RawStateMachine for KvSm {
                         self.last_applied = Some(position);
                         return;
                     }
-                    None => Vector::new(),
+                    None => Vec::new(),
                 };
                 let bytes: usize = items.iter().map(|i| i.len()).sum();
                 if items.len() >= wire::MAX_LIST_LEN || bytes + value.len() > wire::MAX_LIST_BYTES {
@@ -244,7 +248,7 @@ impl RawStateMachine for KvSm {
                     out.extend_from_slice(&(items.len() as u32).to_le_bytes());
                 } else {
                     let mut items = items;
-                    items.push_back(Bytes::copy_from_slice(value));
+                    items.push(Bytes::copy_from_slice(value));
                     let len = items.len() as u32;
                     self.insert(
                         key,
@@ -305,9 +309,13 @@ impl RawStateMachine for KvSm {
     }
 }
 
-/// A frozen view: an O(1) clone of the persistent map plus the two scalars.
+/// A frozen view: an O(1) `Arc` clone of the map plus the two scalars —
+/// exactly the "clone an `Arc`" shape `state-machine-contract.md` § Snapshots
+/// asks for. The O(n) copy happens instead on the FIRST write after a freeze
+/// (`Arc::make_mut` in `insert`/`remove`), once per instant, on the apply
+/// thread; see `docs/DESIGN.md` § "Why `Arc<BTreeMap>`".
 pub struct Frozen {
-    map: OrdMap<Bytes, Entry>,
+    map: Arc<BTreeMap<Bytes, Entry>>,
     last_applied: Option<u64>,
     digest: u64,
 }
@@ -425,7 +433,7 @@ impl SnapshotStateMachine for KvSm {
         }
         let digest = read_u64(&mut r)?;
         let count = read_u64(&mut r)?;
-        let mut map = OrdMap::new();
+        let mut map = BTreeMap::new();
         for i in 0..count {
             let kl = read_u16(&mut r)? as usize;
             if kl == 0 || kl > wire::MAX_KEY {
@@ -455,7 +463,7 @@ impl SnapshotStateMachine for KvSm {
                             wire::MAX_LIST_LEN
                         )));
                     }
-                    let mut items = Vector::new();
+                    let mut items = Vec::new();
                     let mut total = 0usize;
                     for _ in 0..n {
                         let l = read_u32(&mut r)? as usize;
@@ -466,7 +474,7 @@ impl SnapshotStateMachine for KvSm {
                                 wire::MAX_LIST_BYTES
                             )));
                         }
-                        items.push_back(read_blob(&mut r, l, wire::MAX_VALUE, "list element")?);
+                        items.push(read_blob(&mut r, l, wire::MAX_VALUE, "list element")?);
                     }
                     Shape::List(items)
                 }
@@ -491,7 +499,7 @@ impl SnapshotStateMachine for KvSm {
                 "image digest {digest:#018x} != recomputed {recomputed:#018x}"
             )));
         }
-        self.map = map;
+        self.map = Arc::new(map);
         self.digest = digest;
         self.last_applied = cursor;
         Ok(position)

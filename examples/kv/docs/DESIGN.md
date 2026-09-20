@@ -13,8 +13,8 @@ assumption is numbered in `../../LEDGER.md`.
 | `KvSm::{freeze, stream_snapshot, install_snapshot}` — image codec | The gateway's session envelope and `Sessioned<KvSm>`'s dedup table (UC-owned, deterministic by its own contract) |
 
 Inside the boundary: no clock, no randomness, no I/O, no `HashMap`, no
-floats, no panics on foreign input. The only ordered collection is
-`im::OrdMap` (a persistent B-tree, ordered by key bytes). Malformed input
+floats, no panics on foreign input. The only ordered collection is a
+`std::collections::BTreeMap` behind an `Arc` (ordered by key bytes). Malformed input
 produces a `BAD_REQUEST` response, never a panic — the raw tier was chosen
 partly because the typed tier fail-stops on a malformed `QUERY`
 (`limits.md` § residuals).
@@ -23,7 +23,7 @@ partly because the typed tier fail-stops on a malformed `QUERY`
 
 ```
 KvSm {
-    map:          im::OrdMap<Bytes, Entry { version: u64, value: Bytes }>,
+    map:          Arc<BTreeMap<Bytes, Entry { version: u64, value: Bytes }>>,
     last_applied: Option<u64>,   // the cursor the framework resumes from
     digest:       u64,           // XOR of fnv1a64(key ‖ version ‖ value) over all entries
 }
@@ -40,10 +40,18 @@ whole map: O(1) per apply, and the `DIGEST` query returns
 `(count, digest, last_applied)` so replicas can be compared cheaply through
 snapshot reads on each gateway (SDLC § 3 "cross-node divergence checks").
 
-**Why `im::OrdMap`.** `freeze()` runs on the apply thread and must be O(1)
-(`state-machine-contract.md` § Snapshots). Cloning a persistent map is O(1);
-subsequent applies pay O(log n) path-copying instead of an O(n) clone of an
-`Arc<BTreeMap>` on the first write after a freeze.
+**Why `Arc<BTreeMap>`.** `freeze()` runs on the apply thread and must be O(1)
+(`state-machine-contract.md` § Snapshots), and that contract names the shape:
+"clone an `Arc`". `freeze` clones the `Arc`; the first `insert`/`remove`
+after a freeze pays one O(n) copy through `Arc::make_mut`, once per instant,
+and every later write is an ordinary O(log n) B-tree operation. The store
+originally used `im::OrdMap` (a persistent B-tree, O(log n) path-copying on
+every write instead) — dropped 2026-09-20 because `im` is unmaintained
+(archived 2026-05-03, RUSTSEC-2026-0248) with an open unsoundness advisory on
+its shared node-insertion path (RUSTSEC-2023-0126), and a worked example must
+not carry that. The trade is one O(n) copy per instant against a dependency;
+`docs/benchmarks/` holds the measured OrdMap-vs-HashMap numbers if that trade
+is ever revisited.
 
 **Memory.** Limits (§ 5) allow 256 B keys and 1024 B values, so a few hundred
 thousand keys is at most ~300k × (256 + 1024 + ~100 B of node/`Bytes`
@@ -155,8 +163,10 @@ snapshot-format change. Ledger entries L17–L22 are the material-gap record.
 ## 9.1 Determinism boundary — unchanged
 
 Append and List run inside the state machine, deterministically, like the v1
-ops. No new clock, randomness or I/O. Lists are `im::Vector<Bytes>` (a
-persistent RRB-tree), so `freeze()` stays O(1). The digest stays incremental.
+ops. No new clock, randomness or I/O. Lists are `Vec<Bytes>` inside the
+`Arc<BTreeMap>`, so `freeze()` stays O(1) (the `Arc` clone) and a list's
+elements are copied with the map on the first write after a freeze. The
+digest stays incremental.
 
 ## 9.2 State shape
 
