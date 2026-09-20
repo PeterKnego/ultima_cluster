@@ -122,7 +122,8 @@ Fields within a slot (each its own 64 B line, one writer):
 | 0 | `status` (line 0, word 0) — `service_id` (bits 0..8) \| attached (bit 8) \| **snapshot-capable (bit 9)** \| incarnation (bits 32..64) | service, at attach / clean detach |
 | 8 | `version` (line 0, word 1) — packed FSM version (low 32 bits); `0` = unversioned/absent | service, at attach (cnc 3.1, FSM identity) |
 | 16 | `upgrade_origin` (line 0, word 2) — u64, the row's pinned origin position; `0` = no pin | **node** (`uc2-cluster` agent), republished on every view publish — cnc 3.3, FSM upgrade lifecycle |
-| 24 | `pinned_version` (line 0, word 3) — u64, low 32 = packed version the pin names | **node** (`uc2-cluster` agent), stored BEFORE `upgrade_origin` (see the ordering note below) — cnc 3.3 |
+| 24 | `pinned_version` (line 0, word 3) — u64, low 32 = packed version the pin names | **node** (`uc2-cluster` agent), published with `upgrade_origin` under the `pin_seq` seqlock (see the note below) — cnc 3.3 |
+| 32 | `pin_seq` (line 0, word 4) — u64 seqlock commit word for the pin pair; ODD = a pin store is in flight, EVEN = quiescent, `0` at init | **node** (`uc2-cluster` agent), bumped before and after each pin store — cnc 3.3 |
 | 64 | `applied` | service apply agent |
 | 128 | `epoch` | service, `fetch_add` at attach |
 | 192 | `output_completed` | service output agent |
@@ -138,17 +139,23 @@ A slot whose `status` reads `0` has never been attached this page generation.
 The node re-creates the page at every boot, so incarnation and epoch restart
 at 0 with the node. Line 0 (`status`/`version`) breaks the "one writer per
 line" pattern first (cnc 3.3): the service still owns `status`/`version` at
-attach/detach, but `upgrade_origin`/`pinned_version` are node-written,
-republished by the `uc2-cluster` agent on every view publish — a second
-writer on the line, each word still with exactly one writer. The pin pair
-is stored version-first, origin-last, both `Release`. That is enough to make
-the **first** pin consistent for a reader that loads each word once: a
-non-zero `upgrade_origin` implies its `pinned_version` is already visible.
-It is **not** enough for a **re-pin** — a reader can interleave with the
-second store and see the old origin beside the new version — so a reader
-must load the origin, the version, then the origin again and retry if it
-moved. `uc_log::cnc::ServiceStatusLine::pin` does exactly that, and every
-reader (`/metrics`, `uc2ctl status`, and the service's attach) uses it.
+attach/detach, but `upgrade_origin`/`pinned_version`/`pin_seq` are
+node-written, republished by the `uc2-cluster` agent on every view publish —
+a second writer on the line, each word still with exactly one writer. The
+pin pair is published under a **seqlock**, `pin_seq` at `+32`: the writer
+bumps it to ODD, stores the version, stores the origin, and bumps it back to
+EVEN, every step `Release`. A reader loads `pin_seq`, both words, then
+`pin_seq` again, and accepts the pair only if the first read was EVEN and
+the two reads match. Store order alone is *not* sufficient, and neither is
+re-reading one of the two words: a writer that has stored the new version
+but not yet the new origin leaves the origin stable, so a double read of it
+yields `(old origin, new version)` — a pair that was never stored. Two
+atomics with no shared sequence cannot be read consistently without one.
+`uc_log::cnc::ServiceStatusLine::pin` is that seqlock read; it returns
+either a pair that was stored together or `None` (which it also returns
+after 64 collided attempts, rather than guessing), and every reader
+(`/metrics`, `uc2ctl status`, and the service's attach) goes through it
+rather than through the raw word accessors.
 Line 7
 (`name`/`identity_hash`) breaks the "one writer per line, and it's the
 service" pattern the other six lines follow: it is

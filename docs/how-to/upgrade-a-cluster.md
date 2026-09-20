@@ -702,11 +702,15 @@ counter that catches this. **Stop every node before starting any node**, as
 with every other flag day; here the consequence of not doing so is silent
 rather than loud.
 
-**cnc 3.2 → 3.3: two new words on the service status line.**
-`upgrade_origin` at slot offset 16 and `pinned_version` at slot offset 24
-(`u64` each, low 32 bits of the latter = the packed version), **node**-written
+**cnc 3.2 → 3.3: three new words on the service status line.**
+`upgrade_origin` at slot offset 16, `pinned_version` at slot offset 24
+(`u64` each, low 32 bits of the latter = the packed version) and the seqlock
+commit word `pin_seq` at slot offset 32, **node**-written
 by the `uc2-cluster` agent and republished on every view publish; `0` = no
-pin. This makes line 0 the second line with two writers — the service still
+pin. The pair is published under `pin_seq` (bumped odd, then even, around
+the two stores), so a reader gets a pair that was stored together or no pin
+at all — never the old origin beside the new version. This makes line 0 the
+second line with two writers — the service still
 owns `status`/`version` at attach, the node owns the pin words. A 3.2
 attacher refuses by version, exactly as the 3.1 → 3.2 bump described, so
 each host's clients, services and gateway restart with its node.
@@ -732,7 +736,7 @@ floor and reconstructs from the journal, which is the same cost the
 
 **After the flag day**, nothing is required of the operator. A cluster that
 never runs `uc2ctl upgrade pin` holds an empty pin list and behaves exactly
-as `2.12.0` did; the two cnc words stay `0`, `uc2ctl status` prints
+as `2.12.0` did; the three cnc words stay `0`, `uc2ctl status` prints
 `upgrade_origin=0 pinned=unversioned`, and the new gauges read zero. The pins only
 start to matter when you upgrade an FSM's `VERSION` — see [The cluster
 FSM](../notes/uc2-cluster-fsm-explained.md) § Pins and reports for what a

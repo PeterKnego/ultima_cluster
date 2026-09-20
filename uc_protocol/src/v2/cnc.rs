@@ -323,6 +323,7 @@ const _: () = assert!(
 //   +8   version         u64 (low 32 = packed FSM version)   writer: service (attach)
 //   +16  upgrade_origin  u64 position (0 = no pin)             writer: node (cluster agent)
 //   +24  pinned_version  u64 (low 32 = packed version)         writer: node (cluster agent)
+//   +32  pin_seq         u64 seqlock (odd = pin store in flight) writer: node (cluster agent)
 //   +64  applied         u64 position                          writer: service apply agent
 //   +128 epoch           u64 (attach-time fetch_add, AcqRel)   writer: service (attach)
 //   +192 output_completed u64 position                         writer: service output agent
@@ -368,18 +369,26 @@ pub const CNC_SVC_OFF_VERSION: usize = 8;
 /// `VERSION` means "install `snap-<origin>` unconditionally"; a version
 /// that differs is an attach refusal.
 ///
-/// The writer stores `pinned_version` first and `upgrade_origin` last, both
-/// `Release`. That makes the FIRST pin (`0` -> non-zero origin) consistent
-/// for a reader that loads each word once; it does NOT make a RE-pin
-/// consistent — such a reader can interleave and observe the OLD origin
-/// beside the NEW version. Every reader (`/metrics`, `uc2ctl status`, and
-/// plan B2's attach) must therefore use `uc_log::cnc::ServiceStatusLine::pin`,
-/// which re-reads the origin after the version and retries if it moved.
+/// The pair is published under the [`CNC_SVC_OFF_PIN_SEQ`] seqlock, NOT by
+/// store order alone: two independent words cannot be read consistently by
+/// re-reading one of them, so a reader that loads each word once (or twice)
+/// can observe the OLD origin beside the NEW version on a re-pin. Every
+/// reader (`/metrics`, `uc2ctl status`, and plan B2's attach) must use
+/// `uc_log::cnc::ServiceStatusLine::pin`, which brackets both loads with the
+/// seq word and returns either a pair that was stored together or `None`.
 pub const CNC_SVC_OFF_UPGRADE_ORIGIN: usize = 16;
 /// Low 32 bits = the packed version the pin names (`identity::pack_version`).
-/// Stored BEFORE `upgrade_origin`; see that constant's doc for why a reader
-/// still needs the double read.
+/// Published under the [`CNC_SVC_OFF_PIN_SEQ`] seqlock together with
+/// `upgrade_origin`; see that constant's doc.
 pub const CNC_SVC_OFF_PINNED_VERSION: usize = 24;
+/// FSM upgrade lifecycle (cnc 3.3): the seqlock commit word guarding the
+/// `upgrade_origin`/`pinned_version` pair, the third word the `uc2-cluster`
+/// agent owns on the status line. The writer bumps it to ODD, stores the
+/// version then the origin, and bumps it back to EVEN; a reader that sees
+/// the same EVEN value on both sides of its two loads read a pair no
+/// `store_pin` was interleaved with. Odd (or a moved value) means retry.
+/// `0` at init, so an unpinned row reads as "no store in flight, no pin".
+pub const CNC_SVC_OFF_PIN_SEQ: usize = 32;
 /// cnc 3.1: line 7 — the row's FSM name, NUL-padded to 32 B, then its hash,
 /// then (time-and-timers) its pending-timer count, then (coordinated-
 /// snapshot spec §9) its last freeze duration.
@@ -846,13 +855,10 @@ mod tests {
         assert_eq!(CNC_V2_VERSION, (3 << 24) | (3 << 16));
         assert_eq!(CNC_SVC_OFF_UPGRADE_ORIGIN, 16);
         assert_eq!(CNC_SVC_OFF_PINNED_VERSION, 24);
+        assert_eq!(CNC_SVC_OFF_PIN_SEQ, 32);
         assert_eq!(CNC_SVC_OFF_UPGRADE_ORIGIN, CNC_SVC_OFF_VERSION + 8);
-        const {
-            assert!(
-                CNC_SVC_OFF_PINNED_VERSION + 8 <= 64,
-                "inside the status line"
-            )
-        };
+        assert_eq!(CNC_SVC_OFF_PIN_SEQ, CNC_SVC_OFF_PINNED_VERSION + 8);
+        const { assert!(CNC_SVC_OFF_PIN_SEQ + 8 <= 64, "inside the status line") };
         assert_eq!(CNC_SVC_OFF_VERSION, 8);
         assert_eq!(CNC_SVC_OFF_NAME, 448);
         assert_eq!(CNC_SVC_NAME_LEN, 32);

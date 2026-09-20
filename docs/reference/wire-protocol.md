@@ -11,7 +11,7 @@ self-locating header is in [Architecture](../ARCHITECTURE.md).
 | Constant | Value |
 |---|---|
 | `version::CURRENT` | `0.7.0` (`0.8.0`, since `2.12.0`, two new pairwise kinds for jumbo-frame MTU discovery, `PROBE` (24) and `PROBE_ACK` (25); no existing layout changes) (`0.9.0`, since `2.13.0`, two `CLUSTER` kinds, 4 and 5, no layout change; a 0.8.0 peer applies either as undecodable and its cluster FSM silently diverges — stop every node before starting any) |
-| cnc page version | 3.1 (FSM identity + log time, 2.11.0: the name + hash line at boot, the version word at attach, `log_time_ns`, per-row `timers_pending`) (3.2, since `2.12.0`, a live `payload_ceiling` word) (3.3, since `2.13.0`, two node-written words on the service status line, `upgrade_origin` and `pinned_version`) |
+| cnc page version | 3.1 (FSM identity + log time, 2.11.0: the name + hash line at boot, the version word at attach, `log_time_ns`, per-row `timers_pending`) (3.2, since `2.12.0`, a live `payload_ceiling` word) (3.3, since `2.13.0`, three node-written words on the service status line, `upgrade_origin`, `pinned_version` and their `pin_seq` seqlock) |
 
 The cnc page carries its own version gate, `CNC_V2_VERSION`, which is
 independent of this one. cnc 3.1 changed the same-host shmem layout only
