@@ -7733,14 +7733,25 @@ impl Consensus {
                     self.apply_schedule_table(req.id, req.ip, req.port)
                 }
                 (true, ADMIN_OP_SETTINGS_APPLY) => self.apply_settings(req.id, req.ip, req.port),
-                (true, _) => self.apply_upgrade_pin(req.id, req.ip, req.port),
+                (true, ADMIN_OP_UPGRADE_PIN) => self.apply_upgrade_pin(req.id, req.ip, req.port),
                 // Not the leader: retry, with the "version in effect" word
                 // each op reports — the table's position for `schedule`, the
                 // committed cluster position for `settings` and `upgrade
                 // pin`. Read NOTHING: the staged file is the leader's, and a
                 // follower has no business reading its own copy.
                 (false, ADMIN_OP_SCHEDULE_APPLY) => (2, 0, self.schedule_position),
-                (false, _) => (2, 0, self.cluster_view.position.load(Ordering::Acquire)),
+                (false, ADMIN_OP_SETTINGS_APPLY) | (false, ADMIN_OP_UPGRADE_PIN) => {
+                    (2, 0, self.cluster_view.position.load(Ordering::Acquire))
+                }
+                // Spelled out rather than folded into a catch-all: the
+                // enclosing `if` admits exactly ops 6, 7 and 10, so a
+                // fourth staged-file op added to that condition and not to
+                // this match is a panic in a test, not silently routed to
+                // whichever arm happened to be last.
+                (_, _) => unreachable!(
+                    "the enclosing if admits exactly ops 6, 7 and 10; got {}",
+                    req.op
+                ),
             };
             let (status, reason) = self.audit_admin_detailed(
                 actor.as_deref(),
@@ -13834,6 +13845,44 @@ mod tests {
             },
         );
         assert_eq!(h.cons.apply_upgrade_pin_staged().1, REASON_PIN_NOT_MONOTONE);
+    }
+
+    /// The three replicated pin/report reasons are ONE number in two
+    /// places: the `REASON_*` constant this module reports at the door and
+    /// the `ClusterRefusal` variant the FSM returns at apply. They are wired
+    /// by hand (`apply_*` maps the refusal through `reason_code`), so a
+    /// renumber on one side and not the other would make a refused pin
+    /// report a different code depending on which half caught it. Freeze
+    /// the pairing.
+    #[test]
+    fn the_replicated_pin_reason_codes_match_the_fsm_refusals() {
+        use crate::cluster_fsm::ClusterRefusal;
+        assert_eq!(
+            REASON_PIN_FROM_MISMATCH,
+            ClusterRefusal::PinFromMismatch.reason_code()
+        );
+        assert_eq!(
+            REASON_PIN_NOT_MONOTONE,
+            ClusterRefusal::PinNotMonotone.reason_code()
+        );
+        assert_eq!(
+            REASON_REPORT_STALE,
+            ClusterRefusal::ReportStale.reason_code()
+        );
+        // And the band itself, so a shift shows up here too.
+        assert_eq!(
+            (
+                REASON_PIN_ROW_UNDECLARED,
+                REASON_PIN_FROM_MISMATCH,
+                REASON_PIN_NO_SET,
+                REASON_PIN_NOT_MONOTONE,
+                REASON_PIN_DIGEST,
+                REASON_PIN_MISSING,
+                REASON_PIN_DECODE,
+                REASON_REPORT_STALE,
+            ),
+            (52, 53, 54, 55, 56, 57, 58, 59)
+        );
     }
 
     #[test]
