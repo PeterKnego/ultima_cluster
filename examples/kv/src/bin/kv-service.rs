@@ -32,27 +32,75 @@ use uc_service::{RawStateMachine, ServiceBuilder, ServiceConfig, SessionConfig, 
 struct Args {
     /// The instance directory of the node to attach to.
     #[arg(long)]
-    instance_dir: PathBuf,
+    instance_dir: Option<PathBuf>,
     /// Application identity; must match the node's and the gateway's.
     #[arg(long, default_value = "kv")]
     app_id: String,
     /// How long to wait for the node's control page to appear.
     #[arg(long, default_value_t = 30)]
     wait_secs: u64,
+    #[command(subcommand)]
+    cmd: Option<Sub>,
+}
+
+/// Diff replay (uc_diffreplay README): the app-binary contract.
+#[derive(clap::Subcommand)]
+enum Sub {
+    /// Replay a corpus through this FSM in-process and write the trace.
+    Replay {
+        #[arg(long)]
+        corpus: PathBuf,
+        #[arg(long)]
+        out: PathBuf,
+        #[arg(long)]
+        from_genesis: bool,
+    },
+    /// Install an artifact and print its canonical projection.
+    Project {
+        #[arg(long)]
+        artifact: PathBuf,
+        #[arg(long)]
+        position: u64,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
+    // The same wrapper stack the live service runs — the envelope is part of
+    // the behaviour being replayed.
+    let sm = || Sessioned::new(KvSm::default(), SessionConfig::default());
+    match args.cmd {
+        Some(Sub::Replay {
+            corpus,
+            out,
+            from_genesis,
+        }) => {
+            return uc_diffreplay::drive::run_replay_cli(sm(), &corpus, &out, from_genesis);
+        }
+        Some(Sub::Project { artifact, position }) => {
+            print!(
+                "{}",
+                uc_diffreplay::drive::project_artifact(sm(), &artifact, position)?
+            );
+            return Ok(());
+        }
+        None => {}
+    }
+    anyhow::ensure!(
+        args.instance_dir.is_some(),
+        "--instance-dir is required to attach"
+    );
+    let instance_dir = args.instance_dir.unwrap();
 
     // The node creates the control page on startup; under a supervisor we
     // may be launched first.
-    let cnc = args.instance_dir.join("cnc2.dat");
+    let cnc = instance_dir.join("cnc2.dat");
     let deadline = Instant::now() + Duration::from_secs(args.wait_secs);
     while !cnc.exists() {
         anyhow::ensure!(
             Instant::now() < deadline,
             "no node at {} after {}s (is uc2-node running?)",
-            args.instance_dir.display(),
+            instance_dir.display(),
             args.wait_secs
         );
         std::thread::sleep(Duration::from_millis(20));
@@ -62,7 +110,7 @@ fn main() -> anyhow::Result<()> {
     // run the same values (state-machine-contract.md § Sessioned). Defaults
     // everywhere, deliberately.
     let sm = Sessioned::new(KvSm::default(), SessionConfig::default());
-    let cfg = ServiceConfig::new(args.instance_dir.clone(), args.app_id.clone());
+    let cfg = ServiceConfig::new(instance_dir.clone(), args.app_id.clone());
     let service = ServiceBuilder::new(cfg, sm).start_with_snapshots()?;
     eprintln!(
         "kv-service: attached fsm={:?} version={:#x} row={} epoch={} instance_dir={}",
@@ -70,7 +118,7 @@ fn main() -> anyhow::Result<()> {
         KvSm::VERSION,
         service.service_id(),
         service.epoch(),
-        args.instance_dir.display()
+        instance_dir.display()
     );
 
     let stop = Arc::new(AtomicBool::new(false));

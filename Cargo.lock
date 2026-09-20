@@ -639,6 +639,7 @@ dependencies = [
  "proptest",
  "signal-hook",
  "tempfile",
+ "uc_diffreplay",
  "uc_remote",
  "uc_service",
 ]

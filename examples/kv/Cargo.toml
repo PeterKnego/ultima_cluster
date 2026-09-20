@@ -33,12 +33,13 @@ path = "src/bin/kv-load.rs"
 cluster-tests = []
 
 [dependencies]
-uc_service = { path = "../../uc_service", version = "2.12.0" }
-uc_remote  = { path = "../../uc_remote", version = "2.12.0" }
-bytes       = { workspace = true }
-clap        = { workspace = true }
-anyhow      = { workspace = true }
-signal-hook = { workspace = true }
+uc_service    = { path = "../../uc_service", version = "2.12.0" }
+uc_remote     = { path = "../../uc_remote", version = "2.12.0" }
+uc_diffreplay = { path = "../../uc_diffreplay", version = "2.12.0" }
+bytes         = { workspace = true }
+clap          = { workspace = true }
+anyhow        = { workspace = true }
+signal-hook   = { workspace = true }
 
 [dev-dependencies]
 proptest = "1"
