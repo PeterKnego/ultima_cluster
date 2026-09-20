@@ -1,8 +1,9 @@
 # FSM upgrade lifecycle — design
 
-**Status:** revision 3 — open questions **decided** 2026-09-20 (§10); ready
-for the maintainer's read-through before planning. **Dates:** drafted
-2026-09-19, decisions 2026-09-20.
+**Status:** revision 4 — open questions **decided** 2026-09-20 (§10); §4
+rewritten around the diff → attribute → confirm loop; ready for the
+maintainer's read-through before planning. **Dates:** drafted 2026-09-19,
+decisions and §4 rewrite 2026-09-20.
 **Tree:** worktree `fsm-upgrade-lifecycle`, branched from `main` @ `47e74e4`
 (UC 2.12.0).
 
@@ -17,12 +18,19 @@ flag-day procedure), `.superpowers/SBE vs serde+bincode 2 — Handover Doc.md`
 
 ## 0. Summary
 
+**The essence.** Take the old version and the new version of a state machine.
+Start both from the same origin. Feed both the same inputs. Diff *everything*
+they do — the state they hold (snapshots), the inputs they generate, the
+outputs they emit. Attribute every difference to the code change that caused
+it. Confirm that the attributed set is exactly what the developer intended.
+This spec is the system, tooling and procedure that make that loop
+well-defined and complete (§4).
+
 An application built on UC has no supported way to move its state machine from
-version N to version N+1 other than a flag day, and no tooling to tell it
-whether that flag day is safe. This spec models the lifecycle, names the
-failure modes, and proposes the platform pieces and one piece of tooling — a
-**differential replay harness** — that make the flag day correct and
-verifiable.
+version N to version N+1 other than a flag day, and no tooling to run that
+loop. This spec models the lifecycle, names the failure modes, and proposes
+the platform pieces and one piece of tooling — a **differential replay
+harness** — that make the flag day correct and verifiable.
 
 Five findings drive the design:
 
@@ -39,10 +47,11 @@ Five findings drive the design:
    disabled — the shipped default — a restarting service replays from genesis
    under the new binary, producing "the state this cluster would have had if it
    had always run v_new". That state never existed (§2.3, verified in code).
-4. **The comparison surface is not the snapshot image** (§4). Cross-version
-   comparison cannot use image bytes, because image format change is the thing
-   under test. The version-independent surface is the FSM's own responses and
-   queries.
+4. **Image hashes cannot be compared across versions, but image contents
+   must be** (§4.4). Format change is the thing under test, so bytes are
+   meaningless — yet the state is what is being upgraded, and only a
+   projection of it shows the migration directly. Responses and queries are
+   the outside view; the projection is the inside one; the loop needs both.
 5. **The default codec silently misparses across versions in 5 of 12 measured
    shapes, and 4 of those 5 are UC's own missing length check** (§2.4,
    Appendix A — measured, not asserted). The maintainer's decision is to
@@ -61,7 +70,8 @@ The work splits into **three deliverables** (§10 Q5). This spec is the first.
 
 - The **row** — one FSM slot — is the unit of every stage (§10 Q4).
 - A stage model for taking a row from version N to N+1 (§3).
-- The comparison surface that decides whether an upgrade is correct (§4).
+- The diff → attribute → confirm loop, the complete comparison surface it
+  runs over, and the state projection that makes snapshots diffable (§4).
 - Conventions the platform mandates and documents (§5).
 - **Platform pieces**: the `UpgradePin` cluster record and per-row version
   history (§2.5, §10 Q7); origin pinning — `uc2ctl upgrade pin`, the cnc origin
@@ -467,10 +477,25 @@ fix — the pin also halting apply at P — costs a check in the apply hot loop,
 which the 2.11.0 regression record argues against paying for a window this
 size. Recorded as a limit; revisit if a real deployment finds it matters.
 
-### S5 — Verify differentially
+### S5 — Verify differentially: diff, attribute, confirm
 
-Run the harness (§6). Gate: the divergence profile contains no *unexpected*
-entries (§4.3).
+The §4.1 loop, as a procedure:
+
+1. **Declare intent** (with the change, before running): the expected delta
+   per surface — state, inputs, outputs (§4.6). The skill drafts it from the
+   code diff (§8); the developer owns it.
+2. **Run** the harness in `upgrade` mode (§6.2): both versions from the
+   artifact at P over the corpus P→Q.
+3. **Diff** on every surface (§4.2): state projections at P and at Q (§4.4),
+   the divergence profile for inputs and outputs (§4.3).
+4. **Attribute** — mechanically first, then by judgement (§4.5). Every entry
+   ends up named to a hunk, or flagged unexplained.
+5. **Confirm** against the declaration (§4.6). Gate: no entry is unexplained,
+   undeclared, or declared-but-absent.
+
+A failure at step 5 is a finding, not a verdict on the change: an undeclared
+diff may be a bug or a forgotten line in the declaration, and telling those
+apart is step 4's job.
 
 ### S6 — Roll out
 
@@ -521,52 +546,141 @@ instead of guessed.
 
 ---
 
-## 4. The comparison surface
+## 4. The comparison surface, and the loop that runs over it
 
-### 4.1 Why image hashes do not work across versions
+### 4.1 The loop
 
-Hashing the snapshot image is valid only *within* a version, for cross-replica
-agreement. Across versions it is meaningless, because a changed image format is
-exactly the case under test. Cross-version comparison needs a version-
-independent observation surface.
+An upgrade is verified by one loop, run over every surface on which the two
+versions can be told apart:
 
-### 4.2 The surfaces
+1. **Diff.** Run v_old and v_new from the same origin over the same corpus;
+   record every difference, on every surface, localized to a position.
+2. **Attribute.** For each difference, name the code change that caused it.
+3. **Confirm.** Check the attributed set against what the developer declared
+   they intended. A difference that is *unattributed*, or attributed but
+   *undeclared*, or declared but *absent*, fails.
 
-| surface | catches | version-independent? |
-|---|---|---|
-| **Response bytes, per position** | per-command divergence, localized to a position | yes, if response schema is stable |
-| **Probe-query answers** at checkpoints | state divergence not yet visible in responses | **yes** |
-| **`svc_sched` records** (schedule/cancel) | timer-behaviour drift | yes |
-| **`on_committed` emission sequence** | side-effect drift | yes |
-| **`IdGen` ordinal per apply call** | the silent id-stream divergence (§2.4) | yes |
-| **Snapshot image bytes** | cross-*replica* agreement only | no |
+Everything else in this spec exists to make that loop well-defined and
+complete: the pinned origin (§3 S4) so a diff has a meaning; the corpus
+(§6.1) so the inputs are identical; the projection (§4.4) so state is visible
+at all; the skill (§8) for the attribution no tool can do mechanically.
 
-The design choice that keeps this cheap: **the developer's own queries are the
-logical digest.** They already exist, they are already kept stable for clients,
-and §2.4 identifies the query path as the one surface that genuinely rolls.
-`examples/kv` had to invent a bespoke `digest` query because nothing told it
-queries were the right place — so this is a convention to state, not a
-mechanism to build. No new trait surface is required.
+### 4.2 The three surfaces — and why the list is complete
 
-Limitation to write down: a probe suite can only cover the **intersection** of
-the two versions' state. State that exists only in v_new is verified by the
-v_new-only command tests, not by the differential.
+An FSM is observable through exactly the channels its traits expose.
+`RawStateMachine`: `apply` (mutates state; writes response bytes; may
+schedule or cancel timers and mint ids through `ApplyCtx`), `query` (writes
+response bytes), `on_timer` (as `apply`). `SnapshotStateMachine`:
+`freeze`/`stream_snapshot` (the image). The output handler: `on_committed`
+(external effects). **There is no other channel** — a difference between two
+versions that shows on none of these is not observable by anyone, including
+the cluster. So the list below is complete by construction, and "we diff *all*
+changes" is a property, not a hope.
 
-### 4.3 Divergence profile, not equality
+| class | surface | how captured | version-independent? |
+|---|---|---|---|
+| **State** | **snapshot projection** (§4.4) | the app's `project()`, at P and at Q | yes — the *direct* view |
+| | probe-query answers at checkpoints | the app's own queries | yes — the *cheap* view |
+| **Inputs** | the corpus: commands, timer frames, table ticks | identical by construction | — |
+| | timers the FSM schedules or cancels (`svc_sched` records) | per position | yes |
+| | ids the FSM mints (`IdGen` ordinal per apply) | per position | yes |
+| **Outputs** | response bytes | per position | yes, while the response schema is stable |
+| | `on_committed` emission sequence | per position | yes |
+| — | snapshot image **bytes** | hash | **no** — cross-*replica* agreement only |
+
+Inputs are identical for both versions by construction — except the two an FSM
+*generates*: the timers it schedules and the ids it mints are outputs that
+become inputs, and a difference there changes what the FSM sees next, not only
+what it emits. They are filed under inputs for that reason.
+
+Commands that exist only in v_new (§5.5) are inputs v_old never receives; they
+are verified by v_new-only runs against declared expectations, not by the
+differential.
+
+**On the two state views.** The projection is thorough and O(state); the
+probe queries are cheap and partial, and cover only the *intersection* of the
+two versions' state. Both are wanted: queries for every run, the projection
+for the run that matters. `examples/kv` had to invent a bespoke `digest` query
+because nothing told it queries were a comparison surface; that is now a
+stated convention (§5.4), and the projection is a stated hook (§5.8).
+
+### 4.3 Diff: a divergence profile, not equality
 
 Because §2.2 makes divergence legitimate, the harness must not assert equality.
 It emits a **divergence profile**: for each surface, the positions at which the
-two versions disagreed and what they produced. The developer records the
-expected profile alongside the change (an approval/characterization test). The
-gate is:
+two versions disagreed and what each produced. This is strictly more
+informative than a boolean, and it is the only formulation compatible with
+intentional semantic change. §4.5 and §4.6 are what is done with it.
 
-- an entry in the profile that the developer did not declare → **fail**;
-- a declared entry that did not occur → **fail** (the change did not do what it
-  claimed);
-- declared entries that occurred → pass.
+### 4.4 The state diff — the hard part
 
-This is strictly more informative than a boolean, and it is the only
-formulation compatible with intentional semantic change.
+Hashing the snapshot image is valid only *within* a version, for cross-replica
+agreement; across versions it is meaningless, because a changed image format
+is the thing under test. **But the image's *contents* must be compared
+anyway** — the state is what is being upgraded, and responses and queries only
+show it from the outside. The database analogy is exact: after a schema-plus-
+code migration nobody checksums the tables, and nobody skips inspecting them
+either. You look at the data before and after and ask whether the delta is the
+migration you meant. No recipe; judgement required; still mandatory.
+
+UC prescribes no image encoding, so only the app can render its state. Hence
+§5.8's **projection**: a canonical, diffable text form of the state,
+produced by the app, diffed by the harness. This *is* new trait surface — one
+provided hook — and the earlier claim that none was needed is withdrawn.
+
+**Two diff points, not one.** In `upgrade` mode both builds start from v_old's
+artifact at P and apply P→Q. Compare projections:
+
+- **At P — post-install, pre-apply.** v_new has installed v_old's image and
+  migrated it into its own shape, with no commands applied yet. This diff is
+  the **pure migration delta**: it isolates the S3 dual-read shim from every
+  behavioural change. "Every entry gained `ttl = 0`; nothing else moved" is
+  checkable here and nowhere else.
+- **At Q — post-apply.** The migration delta plus the behavioural delta over
+  the span.
+
+Separating them is what makes the state diff *readable*: the migration is
+confirmed alone before it is untangled from apply changes.
+
+**Cost.** A projection is O(state) — fine for a test corpus, not something to
+run casually on a production-sized artifact. The diff itself is structural
+and stays tractable.
+
+### 4.5 Attribute: from a difference to a hunk
+
+Two passes, mechanical then semantic.
+
+**Mechanical.** Partition the divergence profile by *command type* (the
+frame's decoded discriminant, or SBE `templateId`) and by *surface*. Partition
+the code diff by *apply arm* and by *touched type*. Cross-tabulate. A
+command type whose diffs are explained by a change to its own arm — or to a
+state field that arm reads — attributes itself. A command type that shows
+diffs while its arm is untouched is **flagged unexplained**: typically a
+state-shape change leaking through a shared path, or a changed helper. The
+state diff at P (§4.4) attributes separately, to the migration shim.
+
+**Semantic.** The skill (§8) takes each unexplained entry, the code diff, and
+both versions' paths for that command, and names the hunk — or reports that
+it cannot, which is itself a finding.
+
+### 4.6 Confirm: against declared intent
+
+The developer declares, *with* the change and *before* the run, the intended
+delta on each surface: state ("every entry gains `ttl = 0`"), inputs ("no
+timer changes"), outputs ("`Put` responses carry the new field; nothing else
+changes"). The gate is then a three-way check per entry:
+
+| observed | attributed | declared | verdict |
+|---|---|---|---|
+| yes | yes | yes | pass |
+| yes | yes | no | **fail — undeclared** (a bug, or a forgotten line in the declaration) |
+| yes | no | — | **fail — unexplained** (§4.5 could not name a cause) |
+| no | — | yes | **fail — absent** (the change did not do what it claimed) |
+
+There is no recipe for *writing* the declaration — it is the developer's
+understanding of their own change. The skill drafts it from the code diff
+(§8.1); the developer owns it. That the declaration exists at all, before the
+run, is what turns "look at the diff and see if it seems fine" into a check.
 
 ---
 
@@ -708,6 +822,16 @@ SBE generator, and the 2026-08-22 codec spike's finding that SBE costs the same
 as the raw tier at the hop — recorded, not re-run, and older than the 2.11.0
 apply-loop changes.*
 
+### 5.8 Provide a state projection
+
+An FSM that can be snapshotted should be able to render its state into a
+canonical, diffable text form (§4.4): the provided `project()` hook on
+`SnapshotStateMachine`, and a `--project <artifact>` entry point on the
+service binary for black-box use. Canonical means sorted keys and stable
+ordering — the same discipline the image itself already needs. `examples/kv`
+ships one, so the first worked example of a `SnapshotStateMachine` is also the
+first worked example of a projection.
+
 ---
 
 ## 6. Tooling: the differential replay harness
@@ -734,7 +858,7 @@ from position 0. That makes the harness cheaper as well as more honest.
 | mode | setup | catches |
 |---|---|---|
 | **`determinism`** | one build, **two processes**, same corpus | ambient clock, RNG, `HashMap` iteration order — *for free*, since Rust randomizes `RandomState` per process, so two processes already disagree if the FSM depends on hash order |
-| **`upgrade`** | two builds, same corpus | axis-H breakage, semantic drift, id-stream drift |
+| **`upgrade`** | two builds, same corpus; projections diffed at P (post-install) and at Q (post-apply) | axis-H breakage, semantic drift, id-stream drift, the migration delta (§4.4) |
 | **`reconstruction`** | one build, **two start states**: genesis-replay (or continue-from-X) vs. install-artifact-at-P + tail-replay | the §2.3 counterfactuals |
 
 That the determinism check falls out as a degenerate case is the main argument
@@ -772,8 +896,12 @@ the comparison surface has settled.
 
 ### 6.4 Output
 
-The divergence profile of §4.3, plus, on failure, the first divergent position
-and both versions' values on the offending surface.
+An **attributed diff report**: the divergence profile of §4.3 and the two
+state diffs of §4.4, each entry carrying its §4.5 attribution (hunk, or
+*unexplained*) and its §4.6 verdict (pass / undeclared / unexplained /
+absent). On failure, the first failing entry with both versions' values on
+the offending surface. The report is the artifact the developer — or the
+skill — reasons over; it is designed to be read, not just checked.
 
 ---
 
@@ -810,9 +938,22 @@ Three implementation constraints:
 
 The boundary matters; "add AI" is easy to over-claim.
 
-### 8.1 Where a skill genuinely helps — diff-relative and semantic checks
+### 8.1 Where a skill genuinely helps — the judgement steps of the §4.1 loop
 
+In the order the loop needs them:
+
+- **Draft the intent declaration** (§4.6) from the code diff, before the run:
+  read the change, state what it should do to state, inputs and outputs. The
+  developer edits and owns it; the skill makes "declare before you run" cheap
+  enough to actually happen.
 - **Classify the diff** against §2.4 and emit the obligations it creates.
+- **Attribute the unexplained residue** (§4.5): for each entry the mechanical
+  pass could not name, read both versions' paths for that command and name the
+  hunk — or say it cannot.
+- **Judge the state diff** (§4.4): is this migration delta the migration the
+  code made? This is the database-migration-review question — a semantic
+  judgement over a diff and a code change — and the strongest fit for the
+  skill in the whole spec.
 - **Generate the v_old→v_new command corpus from the schema diff** — a harness
   cannot invent an application's commands; an agent reading both versions'
   command types (or SBE schemas) can.
@@ -820,11 +961,8 @@ The boundary matters; "add AI" is easy to over-claim.
   newly-introduced `HashMap` iteration, a float op. The first is a *diff*
   property and genuinely outside a lint's reach.
 - **Spot the Appendix A shapes in a diff**: a variant inserted mid-enum, two
-  fields reordered. Both are one-line diffs with catastrophic consequences and
-  both are trivially recognizable by reading the diff. (Under SBE these become
-  schema-tool errors; the skill's job then is to read the schema diff instead.)
-- **Localize a divergence**: given "first disagreement at position P", bisect
-  the corpus and read both implementations' arms for that command.
+  fields reordered. (Under SBE these become schema-tool errors; the skill then
+  reads the schema diff instead.)
 
 ### 8.2 Where it does not
 
@@ -934,11 +1072,13 @@ written to them.
 | 2 | §5 conventions, written to the SBE header and pointing at deliverable 2 | docs | 1 |
 | 3 | Corpus format + trimmed export (§6.1) | code | — |
 | 4 | Harness, black-box; `reconstruction` mode **part 1** first (§6.2) | code | 3 |
+| 4a | `project()` hook on `SnapshotStateMachine` + `--project <artifact>` on the service binary; `examples/kv` projection (§5.8) | code | — |
+| 4b | Harness: state diff at P and Q (§4.4); mechanical attribution by command type × surface (§4.5); declaration format + three-way check (§4.6); attributed diff report (§6.4) | code | 4, 4a |
 | 5 | `UpgradePin` cluster record + per-row history + cnc words + `uc2ctl upgrade pin/show` + refusals 51–54 + audit + gauges (§2.5) | code, **flag day** | — |
 | 6 | Unconditional install at attach + attach refusal (§3 S4 steps 4–5) | code | 5 |
 | 7 | `ULTSNAP2` envelope stamp + `install_snapshot` cross-check (§9.1) | code | 5 |
 | 8 | `reconstruction` mode **part 2** — verify the refusal, empty and durable shapes (§6.2) | code | 4, 6 |
-| 9 | Skill (§8) | skill | 1, 4 |
+| 9 | Skill (§8) — declaration drafting, attribution, state-diff judgement | skill | 1, 4b |
 | 10 | White-box mode + `Shadow` (§7) — phase 2 | code | 4, §5.3 |
 | 11 | Learner shadow deployment — phase 2 | docs + ops | 10 |
 
