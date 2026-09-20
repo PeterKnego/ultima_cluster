@@ -3,10 +3,11 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use uc_lincheck::register::RegisterSm;
+use uc_client::Client;
+use uc_lincheck::register::{Cmd, CmdResp, RegisterSm};
 use uc_net::fault::FaultConfig;
 use uc_node::{Node, NodeConfig};
-use uc_service::StateMachine;
+use uc_service::{ServiceBuilder, ServiceConfig, StateMachine};
 
 pub fn tempdir() -> tempfile::TempDir {
     tempfile::Builder::new()
@@ -68,4 +69,35 @@ pub fn command_instant(node: &Node) -> u64 {
 
 pub fn register_name() -> &'static str {
     <RegisterSm as StateMachine>::NAME
+}
+
+/// Drive a single node with RegisterSm: N writes, an instant at P, M more
+/// writes. Returns `(P, u64::MAX)` — `Node` has no "applied frontier"
+/// accessor in this plan's scope, so the end is left to the caller (the
+/// driver stops at the journal's last frame instead of naming Q precisely).
+pub fn build_register_history(dir: &std::path::Path, app_id: &str, n: u64, m: u64) -> (u64, u64) {
+    let node = start_single_node(dir, app_id, register_name());
+    wait_until(|| node.can_serve());
+    let cfg = ServiceConfig::new(dir.to_path_buf(), app_id.to_string());
+    let svc = ServiceBuilder::new(cfg, RegisterSm::default())
+        .start_with_snapshots()
+        .unwrap();
+    let client = Client::connect(dir, app_id).unwrap();
+    for v in 0..n {
+        let _: CmdResp = client.submit(&Cmd::Write(v)).unwrap();
+    }
+    let p = command_instant(&node);
+    // The instant completes when the row's artifact appears.
+    let art = dir
+        .join("snapshots")
+        .join("0")
+        .join(format!("snap-{p}.ultsnap"));
+    wait_until(|| art.is_file());
+    for v in n..n + m {
+        let _: CmdResp = client.submit(&Cmd::Write(v)).unwrap();
+    }
+    client.shutdown();
+    svc.stop();
+    node.stop();
+    (p, u64::MAX)
 }
