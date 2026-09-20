@@ -10,9 +10,9 @@ use std::process::Command;
 use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
 use uc_diffreplay::attribute::{Declaration, attribute};
-use uc_diffreplay::confirm::confirm;
+use uc_diffreplay::confirm::{Verdicts, confirm};
 use uc_diffreplay::corpus::Corpus;
-use uc_diffreplay::diff::diff;
+use uc_diffreplay::diff::{Profile, diff};
 use uc_diffreplay::report::Report;
 use uc_diffreplay::trace::Trace;
 
@@ -121,6 +121,30 @@ fn finish(report: Report, path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The declaration every non-`upgrade` mode judges against: EMPTY by
+/// definition, so any divergence at all is a defect.
+fn empty_declaration() -> anyhow::Result<Declaration> {
+    Declaration::from_toml("[touched]\narms = []\n")
+}
+
+/// `diff → attribute → confirm`, the sequence every mode runs once it has
+/// its two traces. `adjust` runs between `diff` and `attribute`, so a mode
+/// can reshape the freshly computed profile before it is judged —
+/// `reconstruction` uses it to blank a surface it deliberately did not
+/// compare (see that arm) rather than letting an untouched `LineDiff`
+/// silently read as "compared and equal".
+fn judge(
+    a: &Trace,
+    b: &Trace,
+    d: &Declaration,
+    adjust: impl FnOnce(&mut Profile),
+) -> anyhow::Result<(Profile, Verdicts)> {
+    let mut profile = diff(a, b)?;
+    adjust(&mut profile);
+    let verdicts = confirm(&attribute(&profile, d), d);
+    Ok((profile, verdicts))
+}
+
 fn main() -> anyhow::Result<()> {
     match Args::parse().cmd {
         Sub::Corpus {
@@ -171,8 +195,7 @@ fn main() -> anyhow::Result<()> {
             let a = replay(&old, &corpus, &tmp.join("old.json"), false, &[])?;
             let b = replay(&new, &corpus, &tmp.join("new.json"), false, &[])?;
             let d = Declaration::from_toml(&std::fs::read_to_string(&declare)?)?;
-            let profile = diff(&a, &b)?;
-            let verdicts = confirm(&attribute(&profile, &d), &d);
+            let (profile, verdicts) = judge(&a, &b, &d, |_| {})?;
             finish(Report::new("upgrade", corpus, profile, verdicts), &report)
         }
         Sub::Determinism {
@@ -183,10 +206,8 @@ fn main() -> anyhow::Result<()> {
             let tmp = tempfile_dir(&report)?;
             let a = replay(&bin, &corpus, &tmp.join("run1.json"), false, &[])?;
             let b = replay(&bin, &corpus, &tmp.join("run2.json"), false, &[])?;
-            let profile = diff(&a, &b)?;
-            // The declaration is EMPTY by definition: any divergence is a defect.
-            let d = Declaration::from_toml("[touched]\narms = []\n")?;
-            let verdicts = confirm(&attribute(&profile, &d), &d);
+            let d = empty_declaration()?;
+            let (profile, verdicts) = judge(&a, &b, &d, |_| {})?;
             finish(
                 Report::new("determinism", corpus, profile, verdicts),
                 &report,
@@ -200,15 +221,24 @@ fn main() -> anyhow::Result<()> {
             let tmp = tempfile_dir(&report)?;
             let art = replay(&bin, &corpus, &tmp.join("artifact.json"), false, &[])?;
             let mut genesis = replay(&bin, &corpus, &tmp.join("genesis.json"), true, &[])?;
-            // Compare end state only: the genesis run has no origin projection
-            // and a different origin by construction. Align the spans for diff().
+            // Align the spans for diff() (same origin/end/row) — but the
+            // genesis run installs no artifact, so it has no origin state to
+            // compare. Do NOT fake one by copying the artifact run's
+            // projection over: leave it `None` and blank the resulting
+            // `projection_origin` diff below, so an empty diff there reads
+            // as "not applicable", never as "compared and found equal"
+            // (spec §6.4 — the report is designed to be read).
             genesis.origin = art.origin;
-            genesis.projection_at_origin = art.projection_at_origin.clone();
+            genesis.projection_at_origin = None;
             genesis.entries.retain(|e| e.pos >= art.origin);
-            let profile = diff(&art, &genesis)?;
-            let d = Declaration::from_toml("[touched]\narms = []\n")?;
-            let verdicts = confirm(&attribute(&profile, &d), &d);
-            let r = Report::new("reconstruction", corpus, profile, verdicts);
+            let d = empty_declaration()?;
+            let (profile, verdicts) = judge(&art, &genesis, &d, |p| {
+                p.projection_origin = Default::default();
+            })?;
+            let r = Report::new("reconstruction", corpus, profile, verdicts).with_note(
+                "projection_origin: not applicable in reconstruction mode — the genesis run \
+                 installs no artifact, so there is no origin state to compare",
+            );
             // In this mode a NON-empty end-projection diff is the expected
             // demonstration (spec §6.2 part 1); report it, exit 0 either way.
             r.write_json(std::fs::File::create(&report)?)?;

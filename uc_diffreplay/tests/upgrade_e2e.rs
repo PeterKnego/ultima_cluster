@@ -112,3 +112,37 @@ fn corpus_export_around_picks_the_newest_artifact_at_or_below_pos() {
     let c = Corpus::open(out.path()).unwrap();
     assert_eq!(c.manifest.origin, p);
 }
+
+/// The `reconstruction` mode never compares the origin projection (the
+/// genesis run installs no artifact, so there is nothing to compare it
+/// against) — the report must say so via a `notes` entry rather than let an
+/// empty `projection_origin` diff read as "compared and found equal"
+/// (spec §6.4).
+#[test]
+fn reconstruction_report_marks_origin_projection_not_applicable() {
+    let inst = common::tempdir();
+    let out = common::tempdir();
+    let (p, _) = common::build_register_history(inst.path(), "rec", 4, 4);
+    Corpus::export(inst.path(), "rec", 0, p, u64::MAX, 0, out.path()).unwrap();
+    let report = out.path().join("rec.json");
+    let st = Command::new(env!("CARGO_BIN_EXE_uc2-diffreplay"))
+        .args(["reconstruction", "--corpus"])
+        .arg(out.path())
+        .arg("--bin")
+        .arg(register_replay_bin())
+        .arg("--report")
+        .arg(&report)
+        .status()
+        .unwrap();
+    assert!(st.success());
+    let r: serde_json::Value =
+        serde_json::from_reader(std::fs::File::open(&report).unwrap()).unwrap();
+    let notes = r["notes"].as_array().expect("notes array");
+    assert!(
+        notes.iter().any(|n| n
+            .as_str()
+            .unwrap_or("")
+            .starts_with("projection_origin: not applicable")),
+        "expected a not-applicable note in {notes:?}"
+    );
+}

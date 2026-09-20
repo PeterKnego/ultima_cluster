@@ -27,6 +27,12 @@ pub struct Report {
     pub profile: Profile,
     pub findings: Vec<Finding>,
     pub summary: Summary,
+    /// Caveats about the report's own scope — e.g. a surface a mode
+    /// deliberately did not compare, so an empty diff there is not silently
+    /// mistaken for "compared and found equal" (spec §6.4: designed to be
+    /// read).
+    #[serde(default)]
+    pub notes: Vec<String>,
 }
 
 impl Report {
@@ -46,7 +52,14 @@ impl Report {
             profile,
             findings: verdicts.findings,
             summary: s,
+            notes: Vec::new(),
         }
+    }
+    /// Attach a caveat about the report's scope, printed as a `note: …` line
+    /// in the text report and carried in the JSON's `notes` array.
+    pub fn with_note(mut self, s: impl Into<String>) -> Report {
+        self.notes.push(s.into());
+        self
     }
     pub fn failed(&self) -> bool {
         self.summary.undeclared + self.summary.unexplained + self.summary.absent > 0
@@ -61,6 +74,9 @@ impl Report {
             self.mode,
             self.corpus.display()
         )?;
+        for n in &self.notes {
+            writeln!(w, "  note: {n}")?;
+        }
         writeln!(
             w,
             "  divergences: {} entries, origin projection {}−/{}+, end projection {}−/{}+",
