@@ -121,6 +121,13 @@ pub struct ClusterState {
     /// Spec §6.5.2: the newest `SnapshotReport` per row — the observed
     /// `(node, hash)` vector, never the verdict, which is
     /// `uc_protocol::v2::upgrade::verdict`'s to recompute.
+    ///
+    /// Every report held here arrived through `decode_snapshot_report` (from
+    /// an applied kind-5 frame, or from the image's report blob at install),
+    /// so each one satisfies that decoder's shape — `1 ≤ count ≤ MAX_MEMBERS`,
+    /// node ids strictly increasing — and therefore RE-ENCODES. `query` and
+    /// `freeze` both rely on that: neither can refuse a record it is only
+    /// serialising.
     pub reports: Vec<SnapshotReport>,
 }
 
@@ -598,6 +605,25 @@ impl SnapshotStateMachine for ClusterFsm {
             decode_settings(parts.settings).ok_or_else(|| bad("cluster image settings"))?;
         // Empty for a v1 image (the leaf hands both back as empty slices),
         // which decodes to an empty history rather than a refusal.
+        //
+        // NOT re-bounded here, deliberately. The list decoders enforce each
+        // RECORD's shape, but nothing below re-checks the collection
+        // invariants `apply` maintains — at most `MAX_PINS_PER_ROW` pins per
+        // row (`push_pin`), and one report per row (`report_for`'s "the
+        // newest"). An image is not arbitrary input in the way a frame is:
+        // it is written by `freeze` from a state that held those bounds, and
+        // a corrupt or crafted one is already refused by the outer CRC and
+        // exact framing. What a hostile image could buy is a longer list,
+        // not an unsound state: every reader of `pins`/`reports` is a scan.
+        //
+        // One consequence worth naming: `pin_for` returns the LAST matching
+        // entry, and "last = newest" is a property of the ORDER, not of any
+        // field in the record. That order is apply order, which is
+        // `origin` order (the FSM refuses a non-monotone `origin`, reason
+        // 55), and `freeze` writes the list in that same order — so every
+        // replica installing these bytes agrees on which pin is newest for
+        // exactly the reason it agrees on everything else here: it is
+        // reading the same bytes in the same order.
         let pins = decode_pin_list(parts.pins).ok_or_else(|| bad("cluster image pins"))?;
         let reports =
             decode_report_list(parts.reports).ok_or_else(|| bad("cluster image reports"))?;
@@ -618,6 +644,16 @@ impl SnapshotStateMachine for ClusterFsm {
 /// The position-tagged view the consensus agent reads (spec §4.5). Scalars
 /// are atomics so the per-pass reads are one load each; the structured parts
 /// sit behind a mutex taken only when `position` changed.
+///
+/// Two readers, two costs. The **consensus pass** touches only the atomics —
+/// one load each, never the mutex, which is the whole point of the split.
+/// The **`/metrics` scrape** is no longer lock-free: since the pin words and
+/// the snapshot-hash mismatch gauge it takes `inner` once per scrape to read
+/// `pins`/`reports`. That is a scrape-time cost on the HTTP thread, off the
+/// hot path entirely; the only writer it can contend with is the
+/// `uc2-cluster` agent, which takes the lock only on an APPLIED `CLUSTER`
+/// frame — rare by construction, since cluster commands are
+/// single-in-flight.
 pub struct ClusterView {
     pub position: AtomicU64,
     /// Spec §9: `uc2_settings_position`, the frame-END of the last Settings
@@ -1428,6 +1464,9 @@ mod tests {
 
     #[test]
     fn queries_4_and_5_return_the_lists() {
+        // Reusing one `out` across the queries below is deliberate and safe:
+        // `ClusterFsm::query` starts with `out.clear()`, so each answer is
+        // the whole answer, never appended to the previous one.
         let mut f = fsm();
         apply_at(&mut f, 100, &pin(2, 1, 2, 50));
         let mut out = Vec::new();
