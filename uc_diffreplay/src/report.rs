@@ -31,7 +31,6 @@ pub struct Report {
     /// deliberately did not compare, so an empty diff there is not silently
     /// mistaken for "compared and found equal" (spec §6.4: designed to be
     /// read).
-    #[serde(default)]
     pub notes: Vec<String>,
 }
 
@@ -79,8 +78,11 @@ impl Report {
         }
         writeln!(
             w,
-            "  divergences: {} entries, origin projection {}−/{}+, end projection {}−/{}+",
+            "  divergences: {} entries, {} only in a, {} only in b, \
+             origin projection {}−/{}+, end projection {}−/{}+",
             self.profile.entries.len(),
+            self.profile.only_in_a.len(),
+            self.profile.only_in_b.len(),
             self.profile.projection_origin.removed.len(),
             self.profile.projection_origin.added.len(),
             self.profile.projection_end.removed.len(),
@@ -91,7 +93,7 @@ impl Report {
                 w,
                 "  {:<11} {:<18} arm={:<10} pos={:<8} {}",
                 format!("{:?}", f.verdict),
-                format!("{:?}", f.surface),
+                f.surface.name(),
                 f.arm.as_deref().unwrap_or("-"),
                 f.pos.map(|p| p.to_string()).unwrap_or_else(|| "-".into()),
                 f.note

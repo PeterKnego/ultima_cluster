@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use crate::trace::{Entry, Trace};
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum Surface {
     Response,
     Sched,
@@ -32,12 +33,32 @@ impl Surface {
             _ => return None,
         })
     }
+
+    /// The inverse of [`Surface::parse`], and the ONE spelling used
+    /// everywhere a surface is written out: the declaration match in
+    /// `confirm`, the text report, and the JSON (`rename_all =
+    /// "snake_case"`). A round-trip test pins `parse(name()) == Some(self)`
+    /// over all four, so the two can never drift apart.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Surface::Response => "response",
+            Surface::Sched => "sched",
+            Surface::ProjectionOrigin => "projection_origin",
+            Surface::ProjectionEnd => "projection_end",
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct Divergence {
     pub pos: u64,
     pub tag: Vec<u8>,
+    /// The timer id, when the entry at this position was a TIMER frame
+    /// rather than a client command. A timer frame carries no application
+    /// payload, so its `tag` is empty and `[tags]` can never name it —
+    /// `[timers]` maps the id to an arm instead (`attribute`).
+    #[serde(default)]
+    pub timer_id: Option<u64>,
     pub surface: Surface,
     pub a: Vec<u8>,
     pub b: Vec<u8>,
@@ -119,6 +140,12 @@ pub fn diff(a: &Trace, b: &Trace) -> anyhow::Result<Profile> {
     fn by_pos(t: &Trace) -> BTreeMap<u64, &Entry> {
         t.entries.iter().map(|e| (e.pos, e)).collect()
     }
+    fn timer_id(e: &Entry) -> Option<u64> {
+        match e.kind {
+            crate::trace::EntryKind::Timer { id, .. } => Some(id),
+            crate::trace::EntryKind::Message => None,
+        }
+    }
     let (ma, mb) = (by_pos(a), by_pos(b));
     let mut p = Profile {
         projection_origin: LineDiff::of(
@@ -140,6 +167,7 @@ pub fn diff(a: &Trace, b: &Trace) -> anyhow::Result<Profile> {
             p.entries.push(Divergence {
                 pos,
                 tag: ea.tag.clone(),
+                timer_id: timer_id(ea),
                 surface: Surface::Response,
                 a: ea.response.clone(),
                 b: eb.response.clone(),
@@ -150,6 +178,7 @@ pub fn diff(a: &Trace, b: &Trace) -> anyhow::Result<Profile> {
             p.entries.push(Divergence {
                 pos,
                 tag: ea.tag.clone(),
+                timer_id: timer_id(ea),
                 surface: Surface::Sched,
                 a: enc(&ea.sched),
                 b: enc(&eb.sched),

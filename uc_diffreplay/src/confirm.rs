@@ -37,17 +37,8 @@ impl Verdicts {
     }
 }
 
-fn surface_name(s: Surface) -> &'static str {
-    match s {
-        Surface::Response => "response",
-        Surface::Sched => "sched",
-        Surface::ProjectionOrigin => "projection_origin",
-        Surface::ProjectionEnd => "projection_end",
-    }
-}
-
 fn matches(e: &Expect, s: Surface, arm: Option<&str>) -> bool {
-    e.surface == surface_name(s) && (e.arm.is_none() || e.arm.as_deref() == arm)
+    e.surface == s.name() && (e.arm.is_none() || e.arm.as_deref() == arm)
 }
 
 /// The most-specific `Expect` matching `(surface, arm)`: an entry whose
@@ -89,6 +80,11 @@ pub fn confirm(att: &Attributed, d: &Declaration) -> Verdicts {
         let arm = match a {
             Attribution::Arm(s) => Some(s.as_str()),
             Attribution::Migration => Some("migration"),
+            // The touched set as a whole names no single arm, so it matches
+            // only an `[[expect]]` that names none either — which
+            // `Declaration::from_toml` makes the only legal shape on a
+            // projection surface.
+            Attribution::Touched => None,
             Attribution::Unexplained => {
                 v.findings.push(Finding {
                     surface,
@@ -123,6 +119,21 @@ pub fn confirm(att: &Attributed, d: &Declaration) -> Verdicts {
 
     for (div, a) in &att.entries {
         judge(div.surface, Some(div.pos), a, &mut v);
+    }
+    // A position only one build dispatched is not a value difference on a
+    // surface — it is a disagreement about WHICH frames the FSM saw, which
+    // no arm can explain. Report one finding per position so the diff is
+    // never silently narrower than the profile (spec §6.4).
+    for (positions, side) in [(&att.only_in_a, "only_in_a"), (&att.only_in_b, "only_in_b")] {
+        for &pos in positions {
+            v.findings.push(Finding {
+                surface: Surface::Response,
+                arm: None,
+                pos: Some(pos),
+                verdict: Verdict::Unexplained,
+                note: format!("position dispatched by one build only ({side})"),
+            });
+        }
     }
     if let Some(a) = &att.projection_origin {
         judge(Surface::ProjectionOrigin, None, a, &mut v);

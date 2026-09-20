@@ -215,8 +215,11 @@ migration = false
     ));
 }
 
+/// A projection is ONE comparison over the whole state: no single arm owns
+/// it. Naming the first touched arm (as the plan drafted) would blame an arm
+/// the diff never implicated — `Touched` says what is actually known.
 #[test]
-fn end_projection_diff_attributes_to_first_touched_arm() {
+fn end_projection_diff_attributes_to_the_touched_set_as_a_whole() {
     const DECL_ARM_AND_MIGRATION: &str = r#"
 [touched]
 arms = ["put", "delete"]
@@ -226,7 +229,7 @@ migration = true
     let a = trace(vec![], "value=Some(1)\n");
     let b = trace(vec![], "value=Some(2)\n");
     let att = attribute(&diff(&a, &b).unwrap(), &d);
-    assert!(matches!(att.projection_end, Some(Attribution::Arm(ref s)) if s == "put"));
+    assert!(matches!(att.projection_end, Some(Attribution::Touched)));
 }
 
 #[test]
@@ -407,4 +410,175 @@ note = "typo"
         msg.contains("response | sched | projection_origin | projection_end"),
         "{msg}"
     );
+}
+
+/// I2: a position ONE build dispatched is not a value difference on any
+/// surface, so `attribute` can never name an arm for it — but it is the
+/// loudest thing a profile can hold (the two builds disagree about which
+/// frames the FSM saw). It must reach `confirm` and the report, not stop at
+/// the profile.
+#[test]
+fn a_one_sided_position_is_an_unexplained_finding_at_that_position() {
+    let d = Declaration::from_toml(DECL).unwrap();
+    let a = trace(
+        vec![(32, b"\x01", b"ok"), (64, b"\x01", b"ok")],
+        "value=Some(1)\n",
+    );
+    let b = trace(vec![(32, b"\x01", b"ok")], "value=Some(1)\n");
+    let p = diff(&a, &b).unwrap();
+    assert_eq!(p.only_in_a, vec![64]);
+    let att = attribute(&p, &d);
+    assert_eq!(att.only_in_a, vec![64]);
+    let v = confirm(&att, &d);
+    assert!(v.failed(), "{:?}", v.findings);
+    let one_sided: Vec<_> = v
+        .findings
+        .iter()
+        .filter(|f| matches!(f.verdict, Verdict::Unexplained) && f.pos == Some(64))
+        .collect();
+    assert_eq!(one_sided.len(), 1, "{:?}", v.findings);
+    assert!(
+        one_sided[0].note.contains("only_in_a"),
+        "{}",
+        one_sided[0].note
+    );
+}
+
+#[test]
+fn a_one_sided_position_in_b_is_reported_as_only_in_b() {
+    let d = Declaration::from_toml(DECL).unwrap();
+    let a = trace(vec![(32, b"\x01", b"ok")], "value=Some(1)\n");
+    let b = trace(
+        vec![(32, b"\x01", b"ok"), (96, b"\x01", b"ok")],
+        "value=Some(1)\n",
+    );
+    let v = confirm(&attribute(&diff(&a, &b).unwrap(), &d), &d);
+    assert!(
+        v.findings
+            .iter()
+            .any(|f| f.pos == Some(96) && f.note.contains("only_in_b")),
+        "{:?}",
+        v.findings
+    );
+}
+
+/// A TIMER frame carries no application payload, so `[tags]` can never reach
+/// it: its arm comes from `[timers]`, keyed on the timer id.
+fn timer_trace(id: u64, resp: &[u8]) -> Trace {
+    Trace {
+        row: 0,
+        version: 1,
+        origin: 32,
+        end: 1000,
+        projection_at_origin: Some("value=None\n".into()),
+        projection_at_end: Some(String::new()),
+        entries: vec![Entry {
+            pos: 32,
+            kind: EntryKind::Timer {
+                id,
+                deadline_ns: 5,
+                table: false,
+            },
+            tag: vec![],
+            response: resp.to_vec(),
+            sched: vec![],
+        }],
+    }
+}
+
+#[test]
+fn a_timer_divergence_is_attributed_by_timer_id() {
+    const DECL_TIMERS: &str = r#"
+[timers]
+"9" = "reaper"
+[touched]
+arms = ["reaper"]
+"#;
+    let d = Declaration::from_toml(DECL_TIMERS).unwrap();
+    assert_eq!(d.arm_of_timer(9), Some("reaper"));
+    let p = diff(&timer_trace(9, b"ok"), &timer_trace(9, b"OK")).unwrap();
+    assert_eq!(p.entries.len(), 1);
+    assert_eq!(p.entries[0].timer_id, Some(9));
+    let att = attribute(&p, &d);
+    assert!(matches!(att.entries[0].1, Attribution::Arm(ref s) if s == "reaper"));
+}
+
+/// Without the `[timers]` mapping the same divergence is permanently
+/// unexplained — the defect I3 names. A `[tags]` entry does not rescue it: a
+/// timer frame has no payload to tag.
+#[test]
+fn a_timer_divergence_without_a_timers_mapping_is_unexplained() {
+    const DECL_NO_TIMERS: &str = r#"
+[tags]
+"09" = "reaper"
+[touched]
+arms = ["reaper"]
+"#;
+    let d = Declaration::from_toml(DECL_NO_TIMERS).unwrap();
+    let att = attribute(
+        &diff(&timer_trace(9, b"ok"), &timer_trace(9, b"OK")).unwrap(),
+        &d,
+    );
+    assert!(matches!(att.entries[0].1, Attribution::Unexplained));
+}
+
+/// I4 at the parse boundary: a projection is attributed to the touched set
+/// as a whole, so an `arm` on a projection `[[expect]]` is a promise the
+/// harness cannot keep. Refuse it by name rather than let it sit there never
+/// matching.
+#[test]
+fn a_projection_expect_carrying_an_arm_is_refused_by_name() {
+    for surface in ["projection_origin", "projection_end"] {
+        let src = format!(
+            "[touched]\narms = [\"put\"]\n[[expect]]\nsurface = \"{surface}\"\n\
+             arm = \"put\"\nnote = \"x\"\n"
+        );
+        let msg = Declaration::from_toml(&src).unwrap_err().to_string();
+        assert!(
+            msg.contains(&format!("surface = \"{surface}\" takes no arm")),
+            "{msg}"
+        );
+        assert!(msg.contains("touched set as a whole"), "{msg}");
+    }
+}
+
+/// I6: a declaration is the developer's statement of intent — a typo in a
+/// key must not read as "not declared".
+#[test]
+fn an_unknown_declaration_key_fails_to_parse() {
+    let err = Declaration::from_toml("tagoffset = 16\n[touched]\narms = []\n").unwrap_err();
+    // `{:#}` walks the anyhow chain: the serde error naming the key sits
+    // under the "declaration TOML" context.
+    assert!(format!("{err:#}").contains("tagoffset"), "{err:#}");
+    // …at every level, not just the top.
+    assert!(Declaration::from_toml("[touched]\narms = []\nmigratoin = true\n").is_err());
+    assert!(
+        Declaration::from_toml(
+            "[touched]\narms = []\n[[expect]]\nsurface = \"response\"\nnotes = \"typo\"\n"
+        )
+        .is_err()
+    );
+}
+
+/// `arm_of` formats tag bytes as LOWERCASE hex, so an uppercase `[tags]` key
+/// would silently never match. `from_toml` normalises them.
+#[test]
+fn uppercase_tag_keys_are_lowercased_at_parse() {
+    let d = Declaration::from_toml("[tags]\n\"0A\" = \"put\"\n[touched]\narms = []\n").unwrap();
+    assert_eq!(d.tags.get("0a").map(String::as_str), Some("put"));
+    assert_eq!(d.arm_of(&[0x0a]), Some("put"));
+}
+
+/// One spelling of a surface, used by the declaration, the text report and
+/// the JSON alike.
+#[test]
+fn surface_name_round_trips_through_parse() {
+    for s in [
+        Surface::Response,
+        Surface::Sched,
+        Surface::ProjectionOrigin,
+        Surface::ProjectionEnd,
+    ] {
+        assert_eq!(Surface::parse(s.name()), Some(s), "{}", s.name());
+    }
 }
