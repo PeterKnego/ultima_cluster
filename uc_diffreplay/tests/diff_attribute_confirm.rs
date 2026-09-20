@@ -170,3 +170,78 @@ fn origin_projection_diff_attributes_to_migration_when_declared() {
         Some(Attribution::Migration)
     ));
 }
+
+#[test]
+fn origin_projection_diff_is_unexplained_when_migration_not_declared() {
+    const DECL_NO_MIGRATION: &str = r#"
+[touched]
+arms = []
+migration = false
+"#;
+    let d = Declaration::from_toml(DECL_NO_MIGRATION).unwrap();
+    let mut a = trace(vec![], "");
+    let mut b = a.clone();
+    a.projection_at_origin = Some("k=a\n".into());
+    b.projection_at_origin = Some("k=a ttl=0\n".into());
+    let att = attribute(&diff(&a, &b).unwrap(), &d);
+    assert!(matches!(
+        att.projection_origin,
+        Some(Attribution::Unexplained)
+    ));
+}
+
+#[test]
+fn end_projection_diff_attributes_to_first_touched_arm() {
+    const DECL_ARM_AND_MIGRATION: &str = r#"
+[touched]
+arms = ["put", "delete"]
+migration = true
+"#;
+    let d = Declaration::from_toml(DECL_ARM_AND_MIGRATION).unwrap();
+    let a = trace(vec![], "value=Some(1)\n");
+    let b = trace(vec![], "value=Some(2)\n");
+    let att = attribute(&diff(&a, &b).unwrap(), &d);
+    assert!(matches!(att.projection_end, Some(Attribution::Arm(ref s)) if s == "put"));
+}
+
+#[test]
+fn end_projection_diff_attributes_to_migration_when_no_arms_touched() {
+    const DECL_MIGRATION_ONLY: &str = r#"
+[touched]
+arms = []
+migration = true
+"#;
+    let d = Declaration::from_toml(DECL_MIGRATION_ONLY).unwrap();
+    let a = trace(vec![], "value=Some(1)\n");
+    let b = trace(vec![], "value=Some(2)\n");
+    let att = attribute(&diff(&a, &b).unwrap(), &d);
+    assert!(matches!(att.projection_end, Some(Attribution::Migration)));
+}
+
+#[test]
+fn end_projection_diff_is_unexplained_when_nothing_touched() {
+    const DECL_NOTHING_TOUCHED: &str = r#"
+[touched]
+arms = []
+migration = false
+"#;
+    let d = Declaration::from_toml(DECL_NOTHING_TOUCHED).unwrap();
+    let a = trace(vec![], "value=Some(1)\n");
+    let b = trace(vec![], "value=Some(2)\n");
+    let att = attribute(&diff(&a, &b).unwrap(), &d);
+    assert!(matches!(att.projection_end, Some(Attribution::Unexplained)));
+}
+
+#[test]
+fn end_projection_is_none_when_identical() {
+    const DECL_ARM_AND_MIGRATION: &str = r#"
+[touched]
+arms = ["put", "delete"]
+migration = true
+"#;
+    let d = Declaration::from_toml(DECL_ARM_AND_MIGRATION).unwrap();
+    let a = trace(vec![], "value=Some(1)\n");
+    let b = trace(vec![], "value=Some(1)\n");
+    let att = attribute(&diff(&a, &b).unwrap(), &d);
+    assert!(att.projection_end.is_none());
+}
