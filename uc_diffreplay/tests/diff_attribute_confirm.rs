@@ -145,6 +145,31 @@ fn declaration_parses_and_maps_tags() {
     assert_eq!(d.arm_of(b"\x09"), None);
     assert!(d.touched.migration);
     assert_eq!(d.expect.len(), 2);
+    // The default: the tag IS the application frame.
+    assert_eq!(d.tag_offset, 0);
+}
+
+/// `tag_offset` drops a framework envelope before the `[tags]` prefixes are
+/// matched — the real case being `Sessioned<S>`'s 16-byte `client_id ‖ seq`,
+/// which would otherwise make every tag start with a client id and match
+/// nothing. Two bytes here is the same mechanism, small enough to read.
+#[test]
+fn tag_offset_skips_the_envelope_before_matching_an_arm() {
+    const DECL_OFFSET: &str = r#"
+tag_offset = 2
+[tags]
+"01" = "put"
+[touched]
+arms = ["put"]
+"#;
+    let d = Declaration::from_toml(DECL_OFFSET).unwrap();
+    assert_eq!(d.tag_offset, 2);
+    assert_eq!(d.arm_of(&[0xAA, 0xBB, 0x01]), Some("put"));
+    // Without the skip these would be the bytes matched — and are not.
+    assert_eq!(d.arm_of(&[0x01, 0xBB, 0xAA]), None);
+    // A tag shorter than the offset leaves nothing to match, not a panic.
+    assert_eq!(d.arm_of(&[0xAA]), None);
+    assert_eq!(d.arm_of(&[]), None);
 }
 
 #[test]

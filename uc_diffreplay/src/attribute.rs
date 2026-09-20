@@ -19,6 +19,15 @@ pub struct Declaration {
     /// Hex of the command payload's leading bytes → arm name.
     #[serde(default)]
     pub tags: BTreeMap<String, String>,
+    /// How many leading tag bytes are FRAMEWORK envelope rather than
+    /// application bytes — dropped before the hex prefixes in `[tags]` are
+    /// matched. A `Sessioned<S>` service puts its 16-byte `client_id ‖ seq`
+    /// envelope ahead of the app's own frame (`uc_service::session`,
+    /// `SESSION_HEADER_LEN`), so `tag_offset = 16` is what makes `[tags]`
+    /// name the app's op bytes instead of a client id. Default 0: a raw SM
+    /// whose payload IS the application frame.
+    #[serde(default)]
+    pub tag_offset: usize,
     pub touched: Touched,
     #[serde(default)]
     pub expect: Vec<Expect>,
@@ -60,9 +69,14 @@ impl Declaration {
     }
 
     /// Longest hex prefix of `tag` that has a mapping wins, so `"01"` and
-    /// `"0102"` can coexist.
+    /// `"0102"` can coexist. The leading `tag_offset` bytes are dropped
+    /// first (the framework envelope, if any); an offset past the tag's end
+    /// leaves nothing to match, which is `None` rather than a panic.
     pub fn arm_of(&self, tag: &[u8]) -> Option<&str> {
-        let hex: String = tag.iter().map(|b| format!("{b:02x}")).collect();
+        let hex: String = tag[self.tag_offset.min(tag.len())..]
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
         (1..=hex.len())
             .rev()
             .filter(|n| n % 2 == 0)

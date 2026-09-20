@@ -31,4 +31,19 @@ prints the SM's canonical projection to stdout. Both exit non-zero on
 failure; `uc2-diffreplay` treats a non-zero exit from `replay` as a hard
 error (spawn/replay failure), not a divergence.
 
+## The declaration (`intent.toml`)
+
+`upgrade` judges a profile against a declaration: `[tags]` maps the hex of a
+command's leading bytes to an arm name (longest prefix wins), `[touched]
+arms` names the arms the change is allowed to move, and `[[expect]]` records
+what it should do to each surface.
+
+`tag_offset` (default 0) is how many leading tag bytes are **framework
+envelope** rather than application bytes, dropped before the `[tags]`
+prefixes are matched. A service running `uc_service::Sessioned<S>` puts a
+16-byte `client_id ‖ seq` envelope ahead of the app's own frame, so its
+declaration needs `tag_offset = 16` — without it every tag begins with a
+client id and no arm ever matches. `examples/kv/tests/corpora/put-then-delete/
+intent.toml` is the worked example.
+
 Spec: `docs/superpowers/specs/2026-09-19-uc2-fsm-upgrade-lifecycle-design.md`.

@@ -219,7 +219,13 @@ fn walk_block<S: SnapshotStateMachine>(
                 entries.push(Entry {
                     pos,
                     kind: EntryKind::Message,
-                    tag: payload[..payload.len().min(4)].to_vec(),
+                    // 32 bytes, not 4: a `Sessioned<S>` service's payload
+                    // opens with a 16-byte `client_id ‖ seq` envelope
+                    // (`uc_service::session::SESSION_HEADER_LEN`), so a
+                    // 4-byte tag would capture a client id and never reach
+                    // the app's own op byte. The declaration's `tag_offset`
+                    // says how much of this prefix to skip.
+                    tag: payload[..payload.len().min(32)].to_vec(),
                     response: resp.clone(),
                     sched: sched_of(&mut ctx),
                 });
@@ -548,10 +554,11 @@ mod tests {
         assert!(!cont, "the straddling frame must stop the scan");
         assert_eq!(entries.len(), 2, "{entries:?}");
 
-        // The MESSAGE: recorded headers, tag = first 4 payload bytes.
+        // The MESSAGE: recorded headers, tag = the first 32 payload bytes
+        // (this payload is 8, so all of it).
         assert_eq!(entries[0].pos, BASE);
         assert_eq!(entries[0].kind, EntryKind::Message);
-        assert_eq!(entries[0].tag, b"CMD\x01".to_vec());
+        assert_eq!(entries[0].tag, b"CMD\x01abcd".to_vec());
         assert_eq!(entries[0].response, b"ok".to_vec());
         assert_eq!(
             entries[0].sched,
@@ -615,7 +622,7 @@ mod tests {
         // its 0xFF body and broken out before the second MESSAGE).
         assert_eq!(entries.len(), 3, "{entries:?}");
         assert_eq!(entries[2].pos, BASE + 288);
-        assert_eq!(entries[2].tag, b"CMD\x02".to_vec());
+        assert_eq!(entries[2].tag, b"CMD\x02wxyz".to_vec());
         assert_eq!(sm.applied.len(), 2);
     }
 

@@ -24,7 +24,10 @@ pub struct Trace {
 pub struct Entry {
     pub pos: u64,
     pub kind: EntryKind,
-    /// First 4 bytes of the command payload — the app's discriminant.
+    /// First 32 bytes of the command payload. Wide enough to reach the app's
+    /// discriminant past a framework envelope (`Sessioned<S>`'s 16-byte
+    /// `client_id ‖ seq`); the declaration's `tag_offset` says how much of
+    /// this prefix to skip before matching an arm.
     pub tag: Vec<u8>,
     pub response: Vec<u8>,
     pub sched: Vec<Sched>,
