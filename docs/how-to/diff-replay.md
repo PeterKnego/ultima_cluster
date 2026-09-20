@@ -54,8 +54,8 @@ observed. Anything else exits 1 and the report names it: `Undeclared`,
 
 ## Also
 
-    uc2-diffreplay determinism    --corpus C --bin ./kv-service   # same build twice; must be empty
-    uc2-diffreplay reconstruction --corpus C --bin ./kv-service   # artifact vs genesis origin (spec §2.3)
+    uc2-diffreplay determinism    --corpus C --bin ./kv-service --report det.json   # same build twice; must be empty
+    uc2-diffreplay reconstruction --corpus C --bin ./kv-service --report rec.json   # artifact vs genesis origin (spec §2.3)
 
 `examples/kv/tests/corpora/README.md` is the regression-corpus convention —
 how a corpus becomes a `cargo test` that runs on every build.
