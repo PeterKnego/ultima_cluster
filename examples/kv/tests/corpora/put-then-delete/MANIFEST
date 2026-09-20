@@ -1,0 +1,15 @@
+format=uc2-backup-v3
+journal_first_base=0
+journal_last_pos=256
+newest_snapshot.0=192
+newest_snapshot.1=none
+newest_snapshot.2=none
+newest_snapshot.3=none
+newest_snapshot.4=none
+newest_snapshot.5=none
+newest_snapshot.6=none
+newest_snapshot.7=none
+newest_cluster_snapshot=192
+snapshot_floor=192
+healed_torn_tail=true
+created_unix_ns=1789915508823942616

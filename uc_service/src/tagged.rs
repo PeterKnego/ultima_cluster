@@ -60,6 +60,9 @@ impl<const ROW: u8, S: StateMachine + SnapshotStateMachine> SnapshotStateMachine
     ) -> Result<u64, SnapshotError> {
         self.0.install_snapshot(position, src)
     }
+    fn project(&self, out: &mut dyn std::io::Write) -> Result<(), SnapshotError> {
+        self.0.project(out)
+    }
 }
 
 #[cfg(test)]

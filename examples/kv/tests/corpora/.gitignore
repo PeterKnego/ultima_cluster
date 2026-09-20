@@ -1,0 +1,6 @@
+# `regression_corpora.rs` writes its report and traces to the cargo target
+# tree, not here. These patterns stay as a guard: a hand-run
+# `uc2-diffreplay --report` pointed at a corpus directory lands here, and a
+# report is output, never input.
+*.report.json
+*.report.traces/

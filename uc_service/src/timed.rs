@@ -194,4 +194,14 @@ impl<S: SnapshotStateMachine> SnapshotStateMachine for Timed<S> {
         self.max_pos_seen = self.inner.last_applied();
         Ok(got)
     }
+
+    fn project(&self, out: &mut dyn std::io::Write) -> Result<(), SnapshotError> {
+        self.inner.project(out)?;
+        let mut pending: Vec<(u64, u64)> = self.pending_timers();
+        pending.sort_unstable();
+        for (id, deadline) in pending {
+            writeln!(out, "timer id={id} deadline_ns={deadline}")?;
+        }
+        Ok(())
+    }
 }

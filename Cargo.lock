@@ -639,6 +639,11 @@ dependencies = [
  "proptest",
  "signal-hook",
  "tempfile",
+ "uc_client",
+ "uc_diffreplay",
+ "uc_net",
+ "uc_node",
+ "uc_protocol",
  "uc_remote",
  "uc_service",
 ]
@@ -1440,6 +1445,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "uc_diffreplay"
+version = "2.12.0"
+dependencies = [
+ "anyhow",
+ "bincode",
+ "clap",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "toml",
+ "uc_client",
+ "uc_journal",
+ "uc_lincheck",
+ "uc_log",
+ "uc_net",
+ "uc_node",
+ "uc_protocol",
+ "uc_service",
+]
+
+[[package]]
 name = "uc_gateway"
 version = "2.12.0"
 dependencies = [
@@ -1484,8 +1510,11 @@ dependencies = [
 name = "uc_lincheck"
 version = "2.12.0"
 dependencies = [
+ "anyhow",
  "bincode",
+ "clap",
  "serde",
+ "uc_diffreplay",
  "uc_protocol",
  "uc_service",
 ]

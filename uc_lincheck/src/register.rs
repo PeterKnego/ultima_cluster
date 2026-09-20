@@ -123,6 +123,75 @@ impl uc_service::SnapshotStateMachine for RegisterSm {
         self.last_applied = la;
         Ok(position)
     }
+
+    fn project(&self, out: &mut dyn std::io::Write) -> Result<(), uc_service::SnapshotError> {
+        writeln!(out, "value={:?}", self.value)?;
+        writeln!(out, "last_applied={:?}", self.last_applied)?;
+        Ok(())
+    }
+}
+
+// ------------------------------------------------------------ diff-replay fixture
+
+/// A diff-replay test fixture (`uc_diffreplay`'s own end-to-end proof, spec
+/// §2.3's counterfactual), **not a pattern for a user state machine** — see
+/// `examples/kv` for that. Same `NAME` as [`RegisterSm`] (the two builds must
+/// name the same FSM row for the harness to compare them) but `VERSION = 2`
+/// and changed semantics: `Write(v)` stores `2·v` instead of `v`, giving the
+/// harness a build whose `apply` genuinely differs from `RegisterSm` for the
+/// same recorded command.
+#[cfg(feature = "v2")]
+#[derive(Default)]
+pub struct DoublingRegisterSm(pub RegisterSm);
+
+#[cfg(feature = "v2")]
+impl uc_service::StateMachine for DoublingRegisterSm {
+    const NAME: &'static str = <RegisterSm as uc_service::StateMachine>::NAME;
+    const VERSION: u32 = 2;
+
+    type Command = Cmd;
+    type Response = CmdResp;
+    type Query = ();
+    type QueryResponse = Option<u64>;
+
+    fn apply(&mut self, ctx: &mut uc_service::ApplyCtx, cmd: Cmd) -> CmdResp {
+        let cmd = match cmd {
+            Cmd::Write(v) => Cmd::Write(v * 2),
+            other => other,
+        };
+        self.0.apply(ctx, cmd)
+    }
+    fn query(&self, q: ()) -> Option<u64> {
+        self.0.query(q)
+    }
+    fn last_applied(&self) -> Option<u64> {
+        self.0.last_applied()
+    }
+}
+
+#[cfg(feature = "v2")]
+impl uc_service::SnapshotStateMachine for DoublingRegisterSm {
+    type SnapshotHandle = <RegisterSm as uc_service::SnapshotStateMachine>::SnapshotHandle;
+
+    fn freeze(&self) -> Result<(Self::SnapshotHandle, u64), uc_service::SnapshotError> {
+        self.0.freeze()
+    }
+    fn stream_snapshot(
+        h: Self::SnapshotHandle,
+        dst: &mut dyn std::io::Write,
+    ) -> Result<(), uc_service::SnapshotError> {
+        RegisterSm::stream_snapshot(h, dst)
+    }
+    fn install_snapshot(
+        &mut self,
+        p: u64,
+        src: &mut dyn std::io::Read,
+    ) -> Result<u64, uc_service::SnapshotError> {
+        self.0.install_snapshot(p, src)
+    }
+    fn project(&self, out: &mut dyn std::io::Write) -> Result<(), uc_service::SnapshotError> {
+        self.0.project(out)
+    }
 }
 
 /// The pure CAS-register transition shared by both SDK `apply` impls (the only

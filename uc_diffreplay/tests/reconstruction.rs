@@ -1,0 +1,441 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Peter Knego
+
+//! The harness's first teeth-check (spec §6.2 part 1): the §2.3
+//! counterfactual, demonstrated twice.
+//!
+//! §2.3 claims that after a binary swap a service that replays the journal
+//! from GENESIS under the new build computes a state that never existed,
+//! while one that installs the pinned artifact carries the true history.
+//! The claim was derived from reading code; nothing demonstrated it. These
+//! tests do, at both levels:
+//!
+//! * [`genesis_to_p_under_v2_is_not_v1s_state_at_p`] — the driver level, via
+//!   the `register-replay` fixture binary: the same frames `[0, P)`, one run
+//!   from the artifact and one from genesis, disagree about the state at P.
+//! * [`real_attach_genesis_replay_computes_the_counterfactual_and_install_does_not`]
+//!   — UC's OWN reconstruction path (`uc_service::replay`'s gap guard) with
+//!   an in-process node: swap `RegisterSm` for `DoublingRegisterSm` on a live
+//!   instance dir and read the register back.
+//!
+//! [`a_real_divergence_is_detected_and_attributed`] closes the loop the other
+//! way: the diff → attribute → confirm chain over a divergence that is really
+//! there, which is the only end-to-end evidence that the harness reports a
+//! genuine change rather than only a declared-but-absent one.
+
+mod common;
+
+use std::path::Path;
+use std::process::Command;
+use std::time::Duration;
+
+use uc_client::Client;
+use uc_lincheck::register::{Cmd, CmdResp, DoublingRegisterSm, RegisterSm};
+use uc_log::cnc::CncPage;
+use uc_service::{ServiceBuilder, ServiceConfig};
+
+use common::{register_replay_bin, wait_for};
+use uc_diffreplay::attribute::{Attribution, Declaration, attribute};
+use uc_diffreplay::confirm::{Verdict, confirm};
+use uc_diffreplay::corpus::Corpus;
+use uc_diffreplay::diff::{Surface, diff};
+use uc_diffreplay::trace::Trace;
+
+/// The reattach experiments start a real node, purge a journal prefix and
+/// wait for a v2 service to walk it: 30 s, not [`common::wait_until`]'s 10,
+/// and non-panicking so the `Stop` guards run before the assertion.
+const REATTACH_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// `<bin> replay --corpus … --out …` with the given knobs, then read the
+/// trace back.
+fn replay(corpus: &Path, out: &Path, double: bool, from_genesis: bool) -> Trace {
+    let mut c = Command::new(register_replay_bin());
+    c.arg("replay")
+        .arg("--corpus")
+        .arg(corpus)
+        .arg("--out")
+        .arg(out);
+    if double {
+        c.arg("--double");
+    }
+    if from_genesis {
+        c.arg("--from-genesis");
+    }
+    let st = c.status().unwrap();
+    assert!(st.success(), "register-replay failed: {st}");
+    Trace::read_json(std::fs::File::open(out).unwrap()).unwrap()
+}
+
+// ------------------------------------------------------- 1. driver level
+
+/// Spec §2.3 at the driver level. `RegisterSm` (v1) writes `0..5`, so its
+/// artifact at **P** holds `value=Some(4)`. `DoublingRegisterSm` (v2, same
+/// row, `Write(v)` stores `2·v`) replaying the SAME frames `[0, P)` from
+/// genesis holds `value=Some(8)` — a state that never existed on any replica.
+///
+/// The two runs are compared at the SAME position on purpose: the corpus's
+/// `end` is P itself, so the genesis run stops exactly where the artifact was
+/// taken. (Comparing at the end of a longer span would not show it — the
+/// register keeps only the last write, and `2·7` is `2·7` either way.)
+#[test]
+fn genesis_to_p_under_v2_is_not_v1s_state_at_p() {
+    let inst = common::tempdir();
+    let out = common::tempdir();
+    let (p, _) = common::build_register_history(inst.path(), "rc2", 5, 0);
+    let c = Corpus::export(inst.path(), "rc2", 0, p, p, 0, out.path()).unwrap();
+
+    let from_genesis = replay(&c.dir, &out.path().join("gen.json"), true, true);
+    let at_end = from_genesis.projection_at_end.as_deref().unwrap();
+    assert!(
+        at_end.starts_with("value=Some(8)\n"),
+        "v2 from genesis must hold the doubled counterfactual, got {at_end:?}"
+    );
+    // The genesis run installs no artifact, so it has no origin projection —
+    // the artifact's own state is read directly instead.
+    assert!(
+        from_genesis.projection_at_origin.is_none(),
+        "a genesis run installs nothing, so it has no origin projection: {:?}",
+        from_genesis.projection_at_origin
+    );
+    assert_eq!(from_genesis.origin, 0);
+
+    let art = uc_diffreplay::drive::project_artifact(RegisterSm::default(), &c.artifact(), p)
+        .expect("project v1's artifact at P");
+    assert!(
+        art.starts_with("value=Some(4)\n"),
+        "v1's artifact at P must hold the true history, got {art:?}"
+    );
+}
+
+// ------------------------------- 2. a real divergence, named and confirmed
+
+/// The other half of the teeth-check: a divergence that is really there is
+/// observed, attributed to a touched arm, and confirmed against the
+/// declaration — `Pass`, with nothing `Absent` and nothing `Unexplained`.
+///
+/// Both runs start from the SAME artifact (`Origin::Artifact`), so the only
+/// thing that differs is what the two builds do with the tail above P.
+/// `RegisterSm` ends at the last written value, `DoublingRegisterSm` at twice
+/// it, and the `projection_end` surface carries the difference.
+///
+/// `Cmd::Write`'s responses do NOT diverge — both builds ack a write the same
+/// way — so the declaration expects only `projection_end`, and the profile is
+/// asserted to carry no per-entry divergence at all.
+#[test]
+fn a_real_divergence_is_detected_and_attributed() {
+    let inst = common::tempdir();
+    let out = common::tempdir();
+    // 5 writes, an instant at P, then 3 more: the tail above P is what the
+    // two builds disagree about.
+    let (p, _) = common::build_register_history(inst.path(), "rdiv", 5, 3);
+    let c = Corpus::export(inst.path(), "rdiv", 0, p, u64::MAX, 0, out.path()).unwrap();
+
+    let a = replay(&c.dir, &out.path().join("v1.json"), false, false);
+    let b = replay(&c.dir, &out.path().join("v2.json"), true, false);
+
+    // Both installed the artifact at P, so both have an origin projection and
+    // the two agree there: the change is in `apply`, not in the image.
+    assert_eq!(a.projection_at_origin, b.projection_at_origin);
+    assert!(
+        a.projection_at_end
+            .as_deref()
+            .unwrap()
+            .starts_with("value=Some(7)\n"),
+        "{:?}",
+        a.projection_at_end
+    );
+    assert!(
+        b.projection_at_end
+            .as_deref()
+            .unwrap()
+            .starts_with("value=Some(14)\n"),
+        "{:?}",
+        b.projection_at_end
+    );
+    // Both walked the same three tail frames.
+    assert_eq!(a.entries.len(), 3, "{:?}", a.entries);
+    assert_eq!(b.entries.len(), 3, "{:?}", b.entries);
+
+    // The declaration's `"00"` tag is the leading byte of an encoded
+    // `Cmd::Write`, in the codec the client actually submits with
+    // (`uc_client::pipelined`'s bincode-standard) — pinned here rather than
+    // assumed.
+    let encoded = bincode::serde::encode_to_vec(Cmd::Write(1), bincode::config::standard())
+        .expect("encode Cmd::Write");
+    assert_eq!(encoded[0], 0x00, "Cmd::Write's tag byte: {encoded:?}");
+    for e in &a.entries {
+        assert_eq!(e.tag.first(), Some(&0x00), "traced tag: {:?}", e.tag);
+    }
+
+    let profile = diff(&a, &b).unwrap();
+    // The responses are identical (`CmdResp::WriteAck` either way) and neither
+    // build schedules, so the ONLY surface that diverges is the end state.
+    assert!(
+        profile.entries.is_empty(),
+        "no per-entry divergence expected, got {:?}",
+        profile.entries
+    );
+    assert!(
+        profile.projection_origin.is_empty(),
+        "both installed the same artifact, so the origin states must match: {:?}",
+        profile.projection_origin
+    );
+    assert!(
+        !profile.projection_end.is_empty(),
+        "the end states must differ (Some(7) vs Some(14))"
+    );
+    assert!(
+        profile.only_in_a.is_empty() && profile.only_in_b.is_empty(),
+        "both builds walked the same positions: only_in_a={:?} only_in_b={:?}",
+        profile.only_in_a,
+        profile.only_in_b
+    );
+
+    let decl = Declaration::from_toml(
+        "[tags]\n\
+         \"00\" = \"write\"\n\
+         [touched]\n\
+         arms = [\"write\"]\n\
+         [[expect]]\n\
+         surface = \"projection_end\"\n\
+         note = \"values doubled\"\n",
+    )
+    .unwrap();
+    let att = attribute(&profile, &decl);
+    assert!(
+        att.entries.is_empty(),
+        "nothing per-entry to attribute: {:?}",
+        att.entries
+    );
+    assert_eq!(att.projection_origin, None);
+    // A projection is one comparison over the whole state: it is attributed
+    // to the change's touched set as a whole, never to one arm of it.
+    assert_eq!(att.projection_end, Some(Attribution::Touched));
+
+    let v = confirm(&att, &decl);
+    assert_eq!(v.findings.len(), 1, "{:?}", v.findings);
+    let f = &v.findings[0];
+    assert_eq!(f.surface, Surface::ProjectionEnd);
+    assert_eq!(f.verdict, Verdict::Pass);
+    // …and the finding names no arm, matching the arm-less `[[expect]]`.
+    assert_eq!(f.arm, None);
+    assert_eq!(f.note, "values doubled");
+    assert!(
+        !v.findings
+            .iter()
+            .any(|f| matches!(f.verdict, Verdict::Absent | Verdict::Unexplained)),
+        "{:?}",
+        v.findings
+    );
+    assert!(
+        !v.failed(),
+        "a declared, observed, attributed change must not fail: {:?}",
+        v.findings
+    );
+}
+
+// --------------------------------------------------- 3. the real attach path
+
+/// Stop `T` when the binding goes out of scope, however it goes out of scope.
+/// A failed wait in [`v2_after_swap`] must not leave a busy-spinning node or a
+/// service thread behind for the rest of this binary, and `Node::stop` /
+/// `Service::stop` both consume `self`, so neither can be called from a plain
+/// `Drop` impl on the value itself.
+struct Stop<T>(Option<T>, fn(T));
+
+impl<T> Stop<T> {
+    fn new(v: T, stop: fn(T)) -> Stop<T> {
+        Stop(Some(v), stop)
+    }
+    fn get(&self) -> &T {
+        self.0.as_ref().expect("live")
+    }
+}
+
+impl<T> Drop for Stop<T> {
+    fn drop(&mut self) {
+        if let Some(v) = self.0.take() {
+            (self.1)(v);
+        }
+    }
+}
+
+/// Writes submitted in the v1 era. Two jobs, both structural:
+///
+/// * **scroll the ring.** The reattaching service starts at cursor 0, and
+///   `LogFollower` only reports `Overrun` — the one door into
+///   `uc_service::replay` — once the appender is more than `buffer_bytes`
+///   ahead of it. Below that it reads the live buffer from 0 and replays from
+///   genesis no matter what the journal looks like, so BOTH arms would be the
+///   counterfactual and the test would prove nothing.
+/// * **roll journal segments.** `Journal::purge_before` drops whole
+///   non-active segments, so a purge only moves `first_meta()` off 0 when
+///   several segments lie below the instant.
+///
+/// At 2 payload bytes per `Cmd::Write` each frame occupies the 64-byte
+/// minimum slot, so this is ~128 KiB of log against a 64 KiB ring and 16 KiB
+/// segments.
+const WRITES: u64 = 2000;
+/// Ring capacity for the swap test — small on purpose (see [`WRITES`]).
+const BUFFER_BYTES: usize = 1 << 16;
+/// Journal segment size — small on purpose (see [`WRITES`]).
+const SEGMENT_BYTES: u64 = 16 * 1024;
+/// The values written cycle `0..MODULUS`, so the LAST one is fixed and the
+/// register's state at P is known without counting frames.
+const MODULUS: u64 = 5;
+/// v1's register at P, and the value the artifact carries.
+const LAST_WRITE: u64 = (WRITES - 1) % MODULUS;
+
+/// v1 (`RegisterSm`) writes, takes a coordinated instant at **P**, and stops.
+/// Then v2 (`DoublingRegisterSm`, same row name, `Write(v)` stores `2·v`)
+/// attaches to the SAME instance dir behind the SAME running node, and the
+/// register is read back once it has caught up to P.
+///
+/// `purge` is the whole experiment: with [`uc_node::PurgePolicy::Disabled`]
+/// the journal still holds `[0, P)` and the gap guard never fires, so v2
+/// replays from genesis; with `BelowSnapshot` the prefix below P is gone, the
+/// gap guard installs v1's artifact at P, and v2 carries the true history.
+fn v2_after_swap(purge: uc_node::PurgePolicy, app_id: &str) -> Option<u64> {
+    let inst = common::tempdir();
+    let dir = inst.path();
+    let purging = !matches!(purge, uc_node::PurgePolicy::Disabled);
+
+    // --- v1 era ---
+    let mut cfg = common::node_config(dir, app_id, common::register_name());
+    cfg.purge = purge;
+    cfg.buffer_bytes = BUFFER_BYTES;
+    cfg.journal_segment_bytes = SEGMENT_BYTES;
+    let node = Stop::new(uc_node::Node::start(cfg).unwrap(), uc_node::Node::stop);
+    // Task 2: the first submit races leader election without this and fails
+    // with `NotLeader`.
+    assert!(
+        wait_for(|| node.get().can_serve(), REATTACH_TIMEOUT),
+        "node never served"
+    );
+
+    let p = {
+        let _svc = Stop::new(
+            ServiceBuilder::new(
+                ServiceConfig::new(dir.to_path_buf(), app_id.to_string()),
+                RegisterSm::default(),
+            )
+            .start_with_snapshots()
+            .unwrap(),
+            uc_service::Service::<RegisterSm>::stop,
+        );
+        let client = Stop::new(Client::connect(dir, app_id).unwrap(), Client::shutdown);
+        for v in 0..WRITES {
+            let _: CmdResp = client.get().submit(&Cmd::Write(v % MODULUS)).unwrap();
+        }
+        let p = common::command_instant(node.get());
+        // The instant completes for this row when its artifact appears.
+        let art = dir
+            .join("snapshots")
+            .join("0")
+            .join(format!("snap-{p}.ultsnap"));
+        assert!(
+            wait_for(|| art.is_file(), REATTACH_TIMEOUT),
+            "row 0 never published snap-{p}.ultsnap"
+        );
+        // The precondition the whole experiment rests on: the appender is more
+        // than a ring capacity ahead of position 0, so the reattaching service
+        // CANNOT read `[0, …)` out of the live buffer and must go through
+        // `uc_service::replay`. Without it both arms replay from genesis and
+        // the test proves nothing (measured: at `buffer_bytes = 1 MiB` both
+        // arms answer `Some(8)`).
+        let append = node.get().counters().append.load_acquire();
+        assert!(
+            append > BUFFER_BYTES as u64,
+            "the ring must have scrolled past 0: append={append}, capacity={BUFFER_BYTES}"
+        );
+        let jr = uc_journal::TailReader::open(&dir.join("journal")).unwrap();
+        if purging {
+            // The complete set at P moves the node's durable snapshot floor,
+            // which commands the purge; the archive acks by advancing
+            // `archive_first_base` (`uc_node::Node::archive_first_base`, the
+            // same observable `tests/purge_safety.rs` uses). The floor persist
+            // is throttled to 100 ms, so this is a wait, not a poll.
+            assert!(
+                wait_for(|| node.get().archive_first_base() > 0, REATTACH_TIMEOUT),
+                "purge never advanced the archive floor below P={p}"
+            );
+            // And the journal's own lowest replayable position is what the
+            // service's gap guard reads (`replay.rs`: `first > needed`).
+            let first = jr.first_meta().unwrap().unwrap_or(0);
+            assert!(
+                first > 0 && first <= p,
+                "purged journal must start inside (0, {p}], got {first}"
+            );
+        } else {
+            // The other arm's premise, asserted rather than assumed: nothing
+            // was purged, so the gap guard never fires and the tail alone
+            // rebuilds the state — from genesis, under v2's `apply`.
+            assert_eq!(
+                jr.first_meta().unwrap().unwrap_or(0),
+                0,
+                "purge is disabled: the journal must still cover [0, P)"
+            );
+        }
+        p
+    }; // client shuts down, then the v1 service stops — the node keeps running.
+
+    // --- flag day: swap the service binary against the same instance dir ---
+    let svc2 = Stop::new(
+        ServiceBuilder::new(
+            ServiceConfig::new(dir.to_path_buf(), app_id.to_string()),
+            DoublingRegisterSm::default(),
+        )
+        .start_with_snapshots()
+        .unwrap(),
+        uc_service::Service::<DoublingRegisterSm>::stop,
+    );
+    // Reconstruction is finished when the row's published applied frontier has
+    // reached P — the slot the apply loop stores after every batch and after
+    // every replay pass. `attach` reset it to 0 before `start_with_snapshots`
+    // returned and v1 is stopped, so only v2 can raise it. (No sleep: a sleep
+    // would be a guess at how long a journal walk takes.)
+    let cnc = CncPage::open_file(&dir.join("cnc2.dat"), app_id).unwrap();
+    let caught_up = wait_for(
+        || cnc.service_slot(0).applied.load_acquire() >= p,
+        REATTACH_TIMEOUT,
+    );
+    let value = caught_up.then(|| svc2.get().query(()));
+    drop(svc2);
+    drop(node);
+    assert!(caught_up, "v2 never reconstructed up to P={p}");
+    value.unwrap()
+}
+
+/// Spec §2.3 through UC's own attach path. Same instance dir, same node, same
+/// v2 binary — only the journal's purge floor differs, and the two runs land
+/// on different states.
+#[test]
+fn real_attach_genesis_replay_computes_the_counterfactual_and_install_does_not() {
+    // Purge disabled (the shipped default): the journal still covers `[0, P)`,
+    // so v2 replays every old write through its own `apply` and doubles them.
+    let genesis = v2_after_swap(uc_node::PurgePolicy::Disabled, "ra1");
+    // Purge below the complete set: the prefix is gone, so v2's gap guard
+    // installs v1's artifact at P — the true history, computed by v1.
+    let installed = v2_after_swap(
+        uc_node::PurgePolicy::BelowSnapshot { slack_bytes: 0 },
+        "ra2",
+    );
+
+    // The §2.3 evidence note says this demonstration is missing; print it so
+    // a `--nocapture` run IS the record.
+    eprintln!("§2.3: genesis-replay={genesis:?}  artifact-install={installed:?}");
+    assert_eq!(
+        installed,
+        Some(LAST_WRITE),
+        "artifact path must carry v1's state"
+    );
+    assert_eq!(
+        genesis,
+        Some(2 * LAST_WRITE),
+        "genesis path under v2 is the counterfactual"
+    );
+    assert_ne!(
+        genesis, installed,
+        "§2.3: same binary, two paths, two states"
+    );
+}

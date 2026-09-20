@@ -43,6 +43,17 @@ impl TimerEvent {
     pub fn late(&self, ctx: &ApplyCtx) -> bool {
         ctx.time_ns > self.deadline_ns
     }
+
+    /// Construct an event — for harnesses that dispatch recorded `TIMER`
+    /// frames themselves (`uc_diffreplay::drive`). Production delivery
+    /// constructs these in-crate.
+    pub fn new(id: u64, deadline_ns: u64, table: bool) -> TimerEvent {
+        TimerEvent {
+            id,
+            deadline_ns,
+            table,
+        }
+    }
 }
 
 /// Everything the framework knows about the committed frame being applied
@@ -426,6 +437,21 @@ pub trait SnapshotStateMachine: RawStateMachine {
         position: u64,
         src: &mut dyn std::io::Read,
     ) -> Result<u64, SnapshotError>;
+
+    /// Render the current state as **canonical, diffable text** — one record
+    /// per line, sorted, stable, no timestamps or addresses — so two builds'
+    /// states can be compared across a version boundary where the image bytes
+    /// cannot be (diff replay spec §4.4, §5.8). Two SMs with identical logical
+    /// state MUST produce byte-identical projections; the harness's
+    /// `determinism` mode checks exactly that. O(state); never called on the
+    /// apply path. Default: a named refusal, so a bare SM keeps working and a
+    /// harness gets a clear answer.
+    fn project(&self, out: &mut dyn std::io::Write) -> Result<(), SnapshotError> {
+        let _ = out;
+        Err(SnapshotError::Codec(
+            "project() not implemented by this state machine (diff replay spec §5.8)".into(),
+        ))
+    }
 }
 
 /// Optional leader-only, at-least-once side-effect handler (Task 12 wires the

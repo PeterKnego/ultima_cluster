@@ -504,4 +504,39 @@ impl SnapshotStateMachine for KvSm {
         self.last_applied = cursor;
         Ok(position)
     }
+
+    /// Diff replay projection (spec §5.8): canonical text, one entry per
+    /// line, in key order — `OrdMap` iterates sorted, so this is canonical
+    /// for free. Same fields the image carries, human-readable.
+    fn project(&self, out: &mut dyn Write) -> Result<(), SnapshotError> {
+        let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+        writeln!(out, "count={}", self.map.len())?;
+        match self.last_applied {
+            Some(c) => writeln!(out, "cursor={c}")?,
+            None => writeln!(out, "cursor=none")?,
+        }
+        writeln!(out, "digest={:#018x}", self.digest)?;
+        for (k, e) in self.map.iter() {
+            match &e.shape {
+                Shape::Value(v) => writeln!(
+                    out,
+                    "key={} version={} shape=value bytes={}",
+                    hex(k),
+                    e.version,
+                    hex(v)
+                )?,
+                Shape::List(items) => {
+                    let items: Vec<String> = items.iter().map(|i| hex(i)).collect();
+                    writeln!(
+                        out,
+                        "key={} version={} shape=list items={}",
+                        hex(k),
+                        e.version,
+                        items.join(",")
+                    )?
+                }
+            }
+        }
+        Ok(())
+    }
 }

@@ -1,0 +1,110 @@
+# uc_diffreplay — diff replay for UC state machines
+
+Replay the same input (a snapshot + a log span) on different FSMs, then
+compare everything they do on the captured surfaces (see
+[What this does not compare](#what-this-does-not-compare)).
+
+    uc2-diffreplay corpus export --instance-dir D --app-id A --row 0 --around POS --out CORPUS
+    uc2-diffreplay upgrade       --corpus CORPUS --old ./svc-v1 --new ./svc-v2 --declare intent.toml --report r.json
+    uc2-diffreplay determinism   --corpus CORPUS --bin ./svc --report r.json
+    uc2-diffreplay reconstruction --corpus CORPUS --bin ./svc --report r.json
+
+An app binary takes part by embedding the driver behind a `replay`
+subcommand — see `examples/kv/src/bin/kv-service.rs`. `uc_lincheck/src/bin/
+register-replay.rs` (built behind the `uc_lincheck` `replay-bin` feature) is
+the harness's own end-to-end fixture, over `RegisterSm`.
+
+## CLI contract for app binaries
+
+`uc2-diffreplay` shells out to the app's own binary rather than linking
+against it, so the contract is two subcommands any binary embedding
+[`uc_diffreplay::drive::run_replay_cli`] / [`uc_diffreplay::drive::project_artifact`]
+must expose:
+
+    <bin> replay --corpus DIR --out TRACE.json [--from-genesis]
+    <bin> project --artifact FILE --position P
+
+`replay` drives the SM over the corpus at `DIR` (installing its artifact at
+the corpus's origin, unless `--from-genesis` replays from position 0 — the
+§2.3 counterfactual) and writes the resulting [`uc_diffreplay::trace::Trace`]
+to `--out` as JSON. `project` installs `--artifact` at `--position` and
+prints the SM's canonical projection to stdout. Both exit non-zero on
+failure; `uc2-diffreplay` treats a non-zero exit from `replay` as a hard
+error (spawn/replay failure), not a divergence.
+
+## The declaration (`intent.toml`)
+
+`upgrade` judges a profile against a declaration: `[tags]` maps the hex of a
+command's leading bytes to an arm name (longest prefix wins), `[touched]
+arms` names the arms the change is allowed to move, and `[[expect]]` records
+what it should do to each surface.
+
+`tag_offset` (default 0) is how many leading tag bytes are **framework
+envelope** rather than application bytes, dropped before the `[tags]`
+prefixes are matched. A service running `uc_service::Sessioned<S>` puts a
+16-byte `client_id ‖ seq` envelope ahead of the app's own frame, so its
+declaration needs `tag_offset = 16` — without it every tag begins with a
+client id and no arm ever matches. `examples/kv/tests/corpora/put-then-delete/
+intent.toml` is the worked example.
+
+`[timers]` is `[tags]` for TIMER frames: a timer frame carries no application
+payload, so there is nothing to tag and its arm comes from the timer id
+instead (`[timers] "9" = "reaper"` — the id as a decimal string, since TOML
+keys are strings). Without it a timer divergence is permanently
+`Unexplained`.
+
+An `[[expect]]` on `projection_origin` or `projection_end` takes **no**
+`arm`, and is refused by name if it carries one: a projection is one
+comparison over the whole state, attributed to the change's touched set as a
+whole rather than to any single arm.
+
+Unknown keys are refused — a declaration is a statement of intent, and a
+typo in one must not read as "not declared".
+
+Spec: `docs/superpowers/specs/2026-09-19-uc2-fsm-upgrade-lifecycle-design.md`.
+
+## What this does not compare
+
+Spec §4.2 lists the surfaces an FSM is observable through and argues the list
+is complete. The **driver captures three of them**: response bytes per
+position, `svc_sched` records per position, and the state projection at the
+origin and at the end. Those three are compared, and a divergence on any of
+them is a finding.
+
+These are **not captured**, so an empty diff says nothing about them:
+
+- **`on_committed` emissions.** The driver runs no output handler, so the
+  external-effect sequence is not observed at all. Closing this is an SDK
+  change (an output-handler recorder in the driver).
+- **Ids the FSM mints.** `ApplyCtx::ids()` returns a fresh generator per call
+  and exposes no mint count, so ids are observed only *indirectly* — through
+  the state and the responses they end up in. A change that mints a different
+  number of ids without that showing in state or a response is invisible
+  here.
+- **Probe-query answers.** The projection is the state view instead: thorough
+  and O(state), where the queries would have been cheap and partial.
+
+The report names the mode's own further caveats in its `notes` (for example
+`reconstruction` does not compare the origin projection at all).
+
+## The trace an app binary writes
+
+JSON, `uc_diffreplay::trace::Trace`: `row`, `version`, `origin`, `end`,
+`projection_at_origin`, `projection_at_end`, and `entries[]` of
+`{ pos, kind: "Message" | { "Timer": { id, deadline_ns, table } }, tag, response, sched[] }`.
+`tag` is the first 32 bytes of the command payload — an app-defined
+discriminant, opaque to the harness; `tag_offset` in the declaration says
+where the app's own bytes start. A non-Rust app produces the same JSON and
+takes part in every mode.
+
+## Running the tests
+
+The e2e and reconstruction tests shell out to prebuilt binaries and hard-assert
+they exist, so build them first:
+
+    cargo build -p uc_lincheck --features replay-bin --bin register-replay
+    cargo build -p uc_diffreplay
+
+(the second one is what `examples/kv`'s `regression_corpora` test needs). Then
+
+    cargo test -p uc_diffreplay -p uc_service -p uc_lincheck -p kv_store
