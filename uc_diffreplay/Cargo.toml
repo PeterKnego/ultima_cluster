@@ -1,6 +1,6 @@
 [package]
 name = "uc_diffreplay"
-description = "Diff replay for ultima_cluster state machines: replay one corpus (snapshot + log span) through two FSM builds, diff everything they do, attribute each difference, confirm against declared intent"
+description = "Diff replay for ultima_cluster state machines: replay one corpus (snapshot + log span) through two FSM builds, diff everything they do on the captured surfaces, attribute each difference, confirm against declared intent"
 edition.workspace = true
 version.workspace = true
 license.workspace = true

@@ -14,6 +14,8 @@
 
 **Spec erratum 2 (§4.2 ids surface):** `ApplyCtx::ids()` returns a fresh `IdGen` per call and exposes no mint count (`uc_service/src/traits.rs:131`). The "ids minted per apply" surface is therefore **observed indirectly** through state and responses, not captured directly. Capturing it directly needs an SDK change (a count on `ApplyCtx`) and is deferred to plan B or later.
 
+**Spec erratum 3 (§6.1 corpus trimming):** §6.1's trimming is not implemented: bytes below P are retained because `Origin::Genesis` (reconstruction mode) replays from 0, and `state/` is retained so a corpus stays a valid `uc2ctl verify-backup` artifact. A trimmed export that drops the sub-P journal and `state/` is a follow-up for a corpus that will only ever run in `upgrade`/`determinism` mode.
+
 ## Global Constraints
 
 - `rust-version = "1.89"`, `edition = "2024"` (root `Cargo.toml` `[workspace.package]`); the new crate inherits both via `.workspace = true`.

@@ -3,12 +3,21 @@
 
 //! Diff replay (spec `2026-09-19-uc2-fsm-upgrade-lifecycle-design.md` §4, §6):
 //! replay the same input — a snapshot plus a log span — on different FSMs,
-//! then compare the differences in their snapshots, outputs and logs.
+//! then compare everything they do **on the captured surfaces**: per-position
+//! responses, per-position `svc_sched` records, and the state projection at
+//! the origin and at the end.
+//!
+//! Three of spec §4.2's surfaces are NOT captured, and an empty diff says
+//! nothing about them: `on_committed` emissions (the driver runs no output
+//! handler), the ids an FSM mints (`ApplyCtx::ids()` exposes no count —
+//! observed only indirectly, through state and responses) and probe-query
+//! answers (the projection is the state view instead). The crate README's
+//! "What this does not compare" is the full statement.
 //!
 //! The pieces, in the order the loop runs them:
 //! - [`corpus`] — the input: a backup artifact plus a `CORPUS` manifest.
 //! - [`drive`] — the in-process replay driver an app's binary embeds.
-//! - [`trace`] — what one run captured, on every surface.
+//! - [`trace`] — what one run captured, on each captured surface.
 //! - [`diff`] — two traces → a divergence profile.
 //! - [`attribute`] — profile × declaration → each divergence named to an arm, or unexplained.
 //! - [`confirm`] — attributed profile × declaration → verdicts.

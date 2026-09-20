@@ -1,10 +1,22 @@
 # Diff replay an FSM change
 
 Replay the same input — a snapshot plus a log span — through the old and the
-new build of your state machine, diff everything they did, and confirm the
-differences are the ones you meant. The full model is the spec
+new build of your state machine, diff everything they did on the captured
+surfaces, and confirm the differences are the ones you meant. The full model
+is the spec
 (`docs/superpowers/specs/2026-09-19-uc2-fsm-upgrade-lifecycle-design.md`, §4);
 this page is the commands.
+
+**What "everything" means here.** Three surfaces are captured and compared:
+the response bytes at each position, the `svc_sched` records (timers
+scheduled and cancelled) at each position, and the state projection at the
+origin and at the end. Three more from the spec's §4.2 list are **not**
+captured, so an empty diff is not evidence about them: `on_committed`
+emissions (the replay driver runs no output handler), the ids the FSM mints
+(`ApplyCtx::ids()` exposes no count — they show up only indirectly, through
+state and responses), and probe-query answers (the projection is the state
+view instead). `uc_diffreplay/README.md` § "What this does not compare" is
+the standing statement.
 
 ## 1. Make your service binary replayable
 
@@ -17,9 +29,14 @@ wrapper stack** your live service uses (`Sessioned`, `Timed`, …) —
 ## 2. Capture a corpus
 
     uc2ctl snapshot …                                  # a complete set at P
-    <stop the node>
+    <stop the node>                                    # optional — see below
     uc2-diffreplay corpus export --instance-dir /srv/uc2/n0 --app-id kv --row 0 \
         --from P --out ./corpus                        # or --around <pos> for a bug
+
+Exporting from a **running** node is safe: `uc_node::backup`'s ordered copy
+is the correctness argument, not quiescence. Stopping the node first is still
+the simplest way to get a quiescent span, because nothing appends while you
+pick the end Q.
 
 ## 3. Declare what you intend
 
@@ -30,11 +47,13 @@ wrapper stack** your live service uses (`Sessioned`, `Timed`, …) —
     [tags]        # first bytes of your command encoding → arm name
     "0101" = "put"
     "0102" = "delete"
+    [timers]      # timer id (decimal) → arm name; a TIMER frame has no payload to tag
+    "9" = "reaper"
     [touched]
     arms = ["put"]
     migration = true                                    # the image format changed
     [[expect]]
-    surface = "projection_origin"
+    surface = "projection_origin"                       # projections take NO arm
     note = "every entry gains ttl=0"
     [[expect]]
     surface = "response"
@@ -42,6 +61,10 @@ wrapper stack** your live service uses (`Sessioned`, `Timed`, …) —
     note = "put acks now carry ttl"
 
 A bare (non-`Sessioned`) app leaves `tag_offset` out — it defaults to 0.
+An `[[expect]]` on `projection_origin` or `projection_end` must not carry an
+`arm` (it is refused by name): a projection is one comparison over the whole
+state, attributed to the touched set as a whole. Unknown keys are refused
+too, so a typo cannot quietly read as "not declared".
 
 ## 4. Run
 

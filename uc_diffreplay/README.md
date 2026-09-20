@@ -1,7 +1,8 @@
 # uc_diffreplay — diff replay for UC state machines
 
 Replay the same input (a snapshot + a log span) on different FSMs, then
-compare the differences in their snapshots, outputs and logs.
+compare everything they do on the captured surfaces (see
+[What this does not compare](#what-this-does-not-compare)).
 
     uc2-diffreplay corpus export --instance-dir D --app-id A --row 0 --around POS --out CORPUS
     uc2-diffreplay upgrade       --corpus CORPUS --old ./svc-v1 --new ./svc-v2 --declare intent.toml --report r.json
@@ -46,7 +47,45 @@ declaration needs `tag_offset = 16` — without it every tag begins with a
 client id and no arm ever matches. `examples/kv/tests/corpora/put-then-delete/
 intent.toml` is the worked example.
 
+`[timers]` is `[tags]` for TIMER frames: a timer frame carries no application
+payload, so there is nothing to tag and its arm comes from the timer id
+instead (`[timers] "9" = "reaper"` — the id as a decimal string, since TOML
+keys are strings). Without it a timer divergence is permanently
+`Unexplained`.
+
+An `[[expect]]` on `projection_origin` or `projection_end` takes **no**
+`arm`, and is refused by name if it carries one: a projection is one
+comparison over the whole state, attributed to the change's touched set as a
+whole rather than to any single arm.
+
+Unknown keys are refused — a declaration is a statement of intent, and a
+typo in one must not read as "not declared".
+
 Spec: `docs/superpowers/specs/2026-09-19-uc2-fsm-upgrade-lifecycle-design.md`.
+
+## What this does not compare
+
+Spec §4.2 lists the surfaces an FSM is observable through and argues the list
+is complete. The **driver captures three of them**: response bytes per
+position, `svc_sched` records per position, and the state projection at the
+origin and at the end. Those three are compared, and a divergence on any of
+them is a finding.
+
+These are **not captured**, so an empty diff says nothing about them:
+
+- **`on_committed` emissions.** The driver runs no output handler, so the
+  external-effect sequence is not observed at all. Closing this is an SDK
+  change (an output-handler recorder in the driver).
+- **Ids the FSM mints.** `ApplyCtx::ids()` returns a fresh generator per call
+  and exposes no mint count, so ids are observed only *indirectly* — through
+  the state and the responses they end up in. A change that mints a different
+  number of ids without that showing in state or a response is invisible
+  here.
+- **Probe-query answers.** The projection is the state view instead: thorough
+  and O(state), where the queries would have been cheap and partial.
+
+The report names the mode's own further caveats in its `notes` (for example
+`reconstruction` does not compare the origin projection at all).
 
 ## The trace an app binary writes
 
