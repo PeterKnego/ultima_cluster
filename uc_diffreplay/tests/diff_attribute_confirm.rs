@@ -245,3 +245,66 @@ migration = true
     let att = attribute(&diff(&a, &b).unwrap(), &d);
     assert!(att.projection_end.is_none());
 }
+
+use uc_diffreplay::confirm::{Verdict, confirm};
+
+#[test]
+fn declared_and_observed_passes_undeclared_fails() {
+    let d = Declaration::from_toml(DECL).unwrap();
+    let a = trace(vec![(32, b"\x01", b"ok")], "x=1\n");
+    let b = trace(vec![(32, b"\x01", b"OK")], "x=1\n");
+    let mut a2 = a.clone();
+    a2.projection_at_origin = Some("k=a\n".into());
+    let mut b2 = b.clone();
+    b2.projection_at_origin = Some("k=a ttl=0\n".into());
+    let v = confirm(&attribute(&diff(&a2, &b2).unwrap(), &d), &d);
+    assert!(!v.failed(), "{:?}", v.findings);
+    assert!(
+        v.findings
+            .iter()
+            .all(|f| matches!(f.verdict, Verdict::Pass))
+    );
+}
+
+#[test]
+fn an_observed_attributed_but_undeclared_diff_is_undeclared() {
+    let mut d = Declaration::from_toml(DECL).unwrap();
+    d.expect.clear(); // declare nothing
+    let a = trace(vec![(32, b"\x01", b"ok")], "");
+    let b = trace(vec![(32, b"\x01", b"OK")], "");
+    let v = confirm(&attribute(&diff(&a, &b).unwrap(), &d), &d);
+    assert!(v.failed());
+    assert!(
+        v.findings
+            .iter()
+            .any(|f| matches!(f.verdict, Verdict::Undeclared))
+    );
+}
+
+#[test]
+fn an_unexplained_diff_fails_as_unexplained() {
+    let d = Declaration::from_toml(DECL).unwrap();
+    let a = trace(vec![(32, b"\x02", b"ok")], ""); // delete: not touched
+    let b = trace(vec![(32, b"\x02", b"OK")], "");
+    let v = confirm(&attribute(&diff(&a, &b).unwrap(), &d), &d);
+    assert!(
+        v.findings
+            .iter()
+            .any(|f| matches!(f.verdict, Verdict::Unexplained))
+    );
+}
+
+#[test]
+fn a_declared_but_absent_diff_fails_as_absent() {
+    let d = Declaration::from_toml(DECL).unwrap();
+    let a = trace(vec![(32, b"\x01", b"ok")], "");
+    let v = confirm(&attribute(&diff(&a, &a.clone()).unwrap(), &d), &d);
+    assert!(v.failed());
+    assert_eq!(
+        v.findings
+            .iter()
+            .filter(|f| matches!(f.verdict, Verdict::Absent))
+            .count(),
+        2
+    );
+}
