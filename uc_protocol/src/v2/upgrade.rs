@@ -160,7 +160,19 @@ pub struct Verdict {
     pub minority: Vec<u32>,
 }
 
+/// **Precondition: `r.hashes` is non-empty.** Every path that produces a
+/// `SnapshotReport` goes through [`decode_snapshot_report`], which refuses
+/// `count == 0`, so the only way to violate this is to hand-build the
+/// struct. On an empty report `agreed` would read `true` (vacuously, from
+/// `windows(2)`) with `majority_hash = None` — an "agreed but nothing
+/// agreed on" pair that `uc2ctl upgrade show`'s match treats as
+/// unreachable. Debug builds assert it rather than producing that pair.
 pub fn verdict(r: &SnapshotReport) -> Verdict {
+    debug_assert!(
+        !r.hashes.is_empty(),
+        "verdict on an empty report: decode_snapshot_report refuses count == 0, \
+         so this report was hand-built"
+    );
     let n = r.hashes.len();
     let agreed = r.hashes.windows(2).all(|w| w[0].1 == w[1].1);
     let majority_hash = r

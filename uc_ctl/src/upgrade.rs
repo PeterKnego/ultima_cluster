@@ -71,6 +71,15 @@ pub fn pin(
         );
     }
     let to = parse_semver(to).map_err(|e| anyhow::anyhow!("--to: {e}"))?;
+    // Packed `0` is the "unversioned" sentinel — what an unversioned row's
+    // cnc word reads and what `status` prints as `unversioned`. Pinning TO
+    // it would make the pin indistinguishable from "no pin" at the cnc
+    // words. Refused here, beside `--origin 0`, rather than at the node.
+    if to == 0 {
+        anyhow::bail!(
+            "--to must be a real version: 0.0.0 packs to 0, the \"unversioned\" sentinel"
+        );
+    }
     let from = match from {
         Some(s) => parse_semver(s).map_err(|e| anyhow::anyhow!("--from: {e}"))?,
         None => {
@@ -189,6 +198,11 @@ pub fn show(common: &CommonArgs) -> anyhow::Result<()> {
                     r.position,
                     r.hashes.len()
                 ),
+                // `agreed` with no majority needs an EMPTY hash vector
+                // (`windows(2)` is vacuously true, and nothing is a
+                // majority of nothing). `decode_snapshot_report` refuses
+                // `count == 0`, and this report came off the artifact
+                // through it — see `verdict`'s non-empty precondition.
                 (true, None) => unreachable!("agreed implies a majority"),
             }
         }
@@ -205,11 +219,46 @@ mod tests {
             parse_semver("1.2.3"),
             Ok(uc_protocol::identity::pack_version(1, 2, 3))
         );
+        // `parse_semver` itself accepts 0.0.0 — it is a well-formed
+        // triple; `pin` is what refuses the packed sentinel.
         assert_eq!(parse_semver("0.0.0"), Ok(0));
         assert!(parse_semver("1.2").is_err());
         assert!(parse_semver("1.2.3.4").is_err());
         assert!(parse_semver("256.0.0").is_err());
         assert!(parse_semver("1.0.65536").is_err());
         assert!(parse_semver("a.b.c").is_err());
+    }
+
+    fn args() -> CommonArgs {
+        CommonArgs {
+            instance_dir: std::path::PathBuf::from("/nonexistent/uc2-pin-test"),
+            app_id: "test".into(),
+            admin_key: None,
+            admin_key_name: None,
+            admin_ttl_secs: 30,
+        }
+    }
+
+    /// `--to 0.0.0` packs to the `unversioned` sentinel, so `pin` refuses it
+    /// locally, before staging anything — like `--origin 0` and `--row 8`.
+    /// Driven through the argument checks only: all three precede every file
+    /// and socket touch, so the bogus instance dir above is never reached.
+    #[test]
+    fn pin_refuses_to_0_0_0_and_origin_0_before_touching_anything() {
+        let e = pin(&args(), 0, Some("1.0.0"), "0.0.0", 4096).unwrap_err();
+        assert!(
+            e.to_string().contains("unversioned"),
+            "expected the sentinel refusal, got {e}"
+        );
+        let e = pin(&args(), 0, Some("1.0.0"), "2.0.0", 0).unwrap_err();
+        assert!(
+            e.to_string().contains("--origin"),
+            "expected the origin refusal, got {e}"
+        );
+        let e = pin(&args(), 8, Some("1.0.0"), "2.0.0", 4096).unwrap_err();
+        assert!(
+            e.to_string().contains("--row"),
+            "expected the row refusal, got {e}"
+        );
     }
 }
