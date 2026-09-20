@@ -1503,8 +1503,11 @@ dependencies = [
 name = "uc_lincheck"
 version = "2.12.0"
 dependencies = [
+ "anyhow",
  "bincode",
+ "clap",
  "serde",
+ "uc_diffreplay",
  "uc_protocol",
  "uc_service",
 ]
