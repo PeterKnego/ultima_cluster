@@ -78,7 +78,8 @@ broken.
 So cluster data that was not in an FSM goes into one. `uc_node::cluster_fsm`
 is a state machine like any other — it implements `RawStateMachine` and
 `SnapshotStateMachine`, its identity is `const NAME = "uc_cluster"` — holding
-exactly three records: membership, the schedule table, and settings.
+exactly five records: membership, the schedule table, settings, and — since
+`2.13.0` — the per-row upgrade pins and the per-row snapshot reports.
 
 It is **in-process**, not a service: consensus cannot depend on an external
 process being alive to know what its own quorum is. It runs on a fifth polling
@@ -87,7 +88,7 @@ apply loop over the same log buffer. It has no cnc slot (page 2 is exactly
 eight service slots, with no ninth), and it is **outside the lag policy** —
 a stalled user FSM must not stall the node's view of its own configuration.
 
-Changing it is a command on the log. One frame type carries all three:
+Changing it is a command on the log. One frame type carries all five:
 
 ```
 FRAME_TYPE_CLUSTER = 4        (reuses the retired CONFIG's number)
@@ -96,6 +97,9 @@ body: kind: u8 ‖ reserved [u8; 7] ‖ payload
   kind 2 = ScheduleTable  payload = encode_schedule_table (≤ 1064 B)
   kind 3 = Settings       payload = the Settings record (33 B since 2.12.0;
                                     a 29-byte v1 record still decodes)
+  kind 4 = UpgradePin     payload = 20 B  (row ‖ from ‖ to ‖ origin)
+  kind 5 = SnapshotReport payload = 16–112 B  (row ‖ count ‖ position ‖
+                                    count × (node_id ‖ hash))
 ```
 
 The log is a **broadcast** log — it carries no service id and does no routing
