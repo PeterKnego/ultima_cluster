@@ -355,9 +355,12 @@ codec is replaced.
    10-byte digest of it, not the record.
 3. **The cnc words land on the status line, not "the row's cnc slot line
    7".** `upgrade_origin` (`+16`) and `pinned_version` (`+24`) are two new
-   words on the row's **service status line** (cnc 3.3): line 7 has exactly
-   one free word left after `log_time_ns`/`timers_pending`/`freeze_ns`, one
-   short of the two a pin needs.
+   words on the row's **service status line** (cnc 3.3): line 7 is already
+   seven of its eight words deep (`name`, four words from `+448`,
+   `identity_hash` at `+480`, `timers_pending` at `+488`, `freeze_ns` at
+   `+496`), so it has exactly one free word left, at `+504` — one short of
+   the two a pin needs. (`log_time_ns` is not on line 7 at all; it is the
+   unrelated page-1 global word at offset 4048.)
 4. **`pin_no_set` accepts only this node's NEWEST complete set
    (`uc2_snapshot_set_position`), not any retained set.** Retention is
    delete-only, so an older set can vanish between the door check and the

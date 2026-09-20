@@ -480,9 +480,13 @@ why `pin_no_set` accepts only it.
 
 **The cnc words, and why the write order is not incidental.** The pin
 republishes onto the row's service status line as two new words, `+16`
-`upgrade_origin` and `+24` `pinned_version` — not slot line 7, which after
-`log_time_ns`/`timers_pending`/`freeze_ns` has exactly one free word left,
-one short of the two a pin needs. `upgrade_origin == 0` is "no pin", the
+`upgrade_origin` and `+24` `pinned_version` — not slot line 7, which is
+already seven of its eight words deep (`name`, four words from `+448`,
+`identity_hash` at `+480`, `timers_pending` at `+488`, `freeze_ns` at
+`+496`) and so has exactly one free word left, at `+504` — one short of the
+two a pin needs. (`log_time_ns` is not one of line 7's occupants: it is the
+unrelated page-1 global word at offset 4048.) `upgrade_origin == 0` is "no
+pin", the
 gate every reader checks first; the node-side writer
 (`ServiceStatusLine::store_pin`) stores `pinned_version` **before**
 `upgrade_origin`, both with `Release` ordering, so a reader that observes a
