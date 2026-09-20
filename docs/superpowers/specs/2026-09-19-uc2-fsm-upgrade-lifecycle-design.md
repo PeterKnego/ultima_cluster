@@ -1,10 +1,10 @@
 # FSM upgrade lifecycle — design
 
-**Status:** revision 5 — open questions **decided** 2026-09-20 (§10); §4
-rewritten around the diff → attribute → confirm loop; §6.5 adds the two
-further applications of diff replay (bug fixing, live nondeterminism
-detection). Approved for planning. **Dates:** drafted 2026-09-19, decisions,
-§4 rewrite and §6.5 2026-09-20.
+**Status:** revision 6 — **plan A (the diff replay harness) is built**; the
+"as built" paragraphs in §2.3, §4.2 and §6.3 record what execution changed.
+Open questions decided 2026-09-20 (§10); §4 is the diff → attribute → confirm
+loop; §6.5 the two further applications. **Dates:** drafted 2026-09-19;
+decisions, §4 rewrite, §6.5 and plan A execution 2026-09-20.
 **Tree:** worktree `fsm-upgrade-lifecycle`, branched from `main` @ `47e74e4`
 (UC 2.12.0).
 
@@ -255,10 +255,26 @@ Genesis replay is faithful **iff exactly one version has ever applied that
 span**. That is true for a never-upgraded cluster and false forever after.
 Per §2.5, UC cannot currently tell the two cases apart.
 
-> **Evidence status.** The code paths above are read and quoted. The resulting
-> divergences are **not yet experimentally demonstrated** — that demonstration
-> is §6.2's `reconstruction` mode, part 1, and it is the harness's first
-> teeth-check.
+> **Evidence status — DEMONSTRATED 2026-09-20** (plan A, task 10,
+> `uc_diffreplay/tests/reconstruction.rs`). Through UC's own attach path with
+> a live in-process node: five `Write(0..5)` under v1, a coordinated instant at
+> P, stop, attach a v2 whose `Write(v)` stores `2v`. Purge **disabled** (the
+> shipped default) → the register reads `Some(8)`, the counterfactual. Purge
+> `BelowSnapshot` → `Some(4)`, v1's true state. Same binary, two paths, two
+> states; the test asserts the gap guard's own branch input in each arm
+> (`first == 0` vs `first > 0`), stable across seven runs. Two facts the
+> demonstration surfaced that the reading above missed:
+>
+> - **The counterfactual engages on any restart within ring size, journal
+>   replay or not.** With a 1 MiB log buffer and a short history the ring never
+>   scrolls, the fresh service reads the *live ring* from 0, and BOTH arms
+>   answer `Some(8)` (a measured control). The test needs a 64 KiB ring and
+>   2000 writes to force the journal path. So "genesis replay" above is the
+>   general case of "re-apply from 0 under the new binary", whichever store
+>   the bytes come from.
+> - `first_meta() >= P` can never hold — the covering segment is always
+>   retained — and 64 MiB default segments make purge a no-op at test scale;
+>   the observable is `0 < first_meta() <= P` with small segments.
 
 This also makes [#36] (a service restart is silent about how it reconstructed)
 load-bearing rather than cosmetic: it is precisely the observation needed to
@@ -623,6 +639,20 @@ In the §0 definition's words — *snapshots, outputs, logs* — the mapping is:
 the generated inputs, since what an FSM schedules and mints is what it writes
 back toward the log.
 
+**As built (plan A, 2026-09-20) — what the driver captures.** Responses per
+position, `svc_sched` records per position, and the projection at the origin
+and at the end. **Not captured**, stated so nobody reads the list above as a
+claim about the shipped tool: `on_committed` emissions (the driver runs no
+output handler), minted ids (`ApplyCtx::ids()` returns a fresh generator per
+call and exposes no count — observed only indirectly through state and
+responses), and probe-query answers (the projection is the state view
+instead). Closing the first two is an SDK change (an output-handler recorder
+in the driver; a mint count on `ApplyCtx`) and belongs with plan B's
+`uc_service` work. One more capture detail: `Entry.tag` is the first 32
+payload bytes and the declaration carries a `tag_offset`, because a
+`Sessioned` app's payload begins with the 16-byte `client_id ‖ seq` envelope
+and the app's own discriminant sits after it.
+
 Commands that exist only in v_new (§5.5) are inputs v_old never receives; they
 are verified by v_new-only runs against declared expectations, not by diff
 replay.
@@ -936,6 +966,23 @@ different dependencies:
 halves over a shared instance dir). White-box is the fast CI path, added once
 the comparison surface has settled.
 
+**As built (plan A, 2026-09-20) — erratum.** `upgrade` and `determinism` do
+**not** run a 1-node cluster. `uc_service/src/replay.rs`'s module doc states
+*replay never publishes*: a service reconstructing from a journal writes no
+responses to the egress ring, so a real node would yield an empty output
+surface. Instead `uc_diffreplay::drive` is an **in-process replay driver** —
+it walks the journal span with `TailReader`, calls `RawStateMachine::apply` /
+`on_timer` with the recorded frame headers, and captures every surface — and
+the app's own service binary embeds it behind `replay` / `project`
+subcommands (`examples/kv/src/bin/kv-service.rs` is the worked example). The
+harness still treats the app as black-box (it only runs binaries), still
+needs no linking of two versions, and a non-Rust app takes part by writing
+the same JSON trace. Only `reconstruction`'s real-attach test spawns a node.
+The driver's block walk mirrors `replay.rs` (the JOURNAL walker), not
+`uc_log/src/reader.rs` (the LIVE ring iterator) — they differ in three places
+(malformed-frame guard, span bound on frame END, uniform padding advance),
+and the walk is unit-tested against hand-laid frames.
+
 ### 6.4 Output
 
 An **attributed diff report**: the divergence profile of §4.3 and the two
@@ -1204,6 +1251,12 @@ written to them.
 
 ### Deliverable 1 — this spec
 
+**Plan A (`docs/superpowers/plans/2026-09-20-uc2-diff-replay-harness.md`)
+shipped items 3, 4, 4a, 4b and 12 on 2026-09-20** — the `uc_diffreplay`
+crate, `SnapshotStateMachine::project()`, the KV integration and the
+regression corpus — with three recorded errata (in-process driver; ids
+observed indirectly; no trimmed export). Items 5–9 are plans B–D.
+
 | # | deliverable | kind | depends on |
 |---|---|---|---|
 | 1 | §2.1 axes, §2.4 taxonomy, §2.2 common origin, §2.5 version-as-input, §3 per-row stages → folded into `application-sdlc.md`; the how-to becomes per-row | docs | — |
@@ -1265,11 +1318,17 @@ Read and quoted in this tree (worktree `fsm-upgrade-lifecycle`, `main` @ `47e74e
 **Run this session:** the Appendix A measurement (`cargo run` against bincode
 `=2.0.1`, private `CARGO_TARGET_DIR`), output reproduced verbatim below.
 
-**Not verified / not run:** the §2.3 divergences are derived from the quoted
-code paths, not demonstrated (§6.2 part 1 is that demonstration). The
-`Sessioned` / `Timed` inner-slice exactness for [#49] is untraced. The recorded
-2026-08-22 finding that SBE costs the same as the raw tier has not been re-run.
-The Rust SBE generator's maturity has not been assessed.
+**Run 2026-09-20 (plan A):** the §2.3 demonstration —
+`uc_diffreplay/tests/reconstruction.rs`, `Some(8)` (genesis / live-ring path)
+vs `Some(4)` (artifact path), both preconditions asserted in-test; the
+positive-divergence check (a doubled build through diff → attribute → confirm
+to `Pass`); the KV regression corpus's content guard.
+
+**Not verified / not run:** §6.2 part 2 (that S4's refusal prevents the wrong
+path) — plan C, after plan B lands. The `Sessioned` / `Timed` inner-slice
+exactness for [#49] is untraced. The recorded 2026-08-22 finding that SBE
+costs the same as the raw tier has not been re-run. The Rust SBE generator's
+maturity has not been assessed.
 
 ---
 
