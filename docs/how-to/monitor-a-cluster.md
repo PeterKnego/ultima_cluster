@@ -306,7 +306,7 @@ The `uc2_agent_alive` family covers **five** agents — `consensus`, `sender`,
 `receiver`, `archive`, and `cluster` (the `uc2-cluster` agent, labelled like
 its four siblings without the thread-name prefix).
 
-**Nine records** go with them — five at info, four at warn:
+**Nine records** go with them — four at info, five at warn:
 
 | Event | Level | Fields | Means, and what to do |
 |---|---|---|---|
