@@ -158,6 +158,11 @@ pub const ADMIN_OP_SNAPSHOT: u32 = 8;
 /// set into a voter, store-only. Runs on the voter it targets (leader-local,
 /// not a cluster command — it changes nothing cluster-wide).
 pub const ADMIN_OP_SNAPSHOT_FETCH: u32 = 9;
+/// FSM upgrade lifecycle (spec §2.5, plan B1): `uc2ctl upgrade pin`. The
+/// 20-byte record is staged at `<instance_dir>/upgrade.pending` and the
+/// first ten bytes of its SHA-256 ride `id ‖ ip ‖ port`, exactly as ops 6
+/// and 7 do. Leader-only, node-local, single-in-flight.
+pub const ADMIN_OP_UPGRADE_PIN: u32 = 10;
 /// M7 — admin RESPONSE line (writer: consensus agent). seq u64 @+0 echoes the
 /// request seq (written LAST, release); status u32 @+8, reason u32 @+12,
 /// version u64 @+16.
@@ -839,5 +844,7 @@ mod tests {
         assert_eq!(CNC_SVC_STATUS_SNAPSHOT_CAPABLE, 1 << 9);
         assert_eq!(ADMIN_OP_SNAPSHOT, 8);
         assert_eq!(ADMIN_OP_SNAPSHOT_FETCH, 9);
+        // FSM upgrade lifecycle (plan B1): `uc2ctl upgrade pin`.
+        assert_eq!(ADMIN_OP_UPGRADE_PIN, 10);
     }
 }

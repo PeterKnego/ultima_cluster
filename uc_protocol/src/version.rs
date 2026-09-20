@@ -78,7 +78,10 @@ impl ProtocolVersion {
 // verified minimum). No existing layout changes. A 0.7.0 peer counts both as
 // unknown kinds and drops them, so a mixed cluster never raises its ceiling —
 // safe, and unsupported anyway (flag-day rule). Ships in `2.12.0`.
-pub const CURRENT: ProtocolVersion = ProtocolVersion::new(0, 8, 0);
+// 0.9.0 — `CLUSTER` kinds 4 (UpgradePin) and 5 (SnapshotReport); cnc 3.3. A
+// 0.8.0 peer applies either as undecodable and silently diverges, hence the
+// bump.
+pub const CURRENT: ProtocolVersion = ProtocolVersion::new(0, 9, 0);
 pub const MIN_COMPATIBLE: ProtocolVersion = ProtocolVersion::new(0, 1, 0);
 
 #[cfg(test)]
@@ -115,7 +118,7 @@ mod tests {
     }
 
     #[test]
-    fn current_is_the_jumbo_frame_wire() {
-        assert_eq!(CURRENT, ProtocolVersion::new(0, 8, 0));
+    fn current_is_the_upgrade_lifecycle_wire() {
+        assert_eq!(CURRENT, ProtocolVersion::new(0, 9, 0));
     }
 }

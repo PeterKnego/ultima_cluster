@@ -40,6 +40,8 @@ pub const FRAME_TYPE_NEW_TERM: u8 = 3;
 /// frame 4 that is not a `Membership` command. User apply loops yield it;
 /// the cluster FSM's loop acts on it; the archive walk reads the kind byte
 /// to feed `Membership` payloads to the consensus kernel at durability.
+/// `4` = UpgradePin and `5` = SnapshotReport (FSM upgrade lifecycle, spec
+/// §2.5/§6.5.2, wire 0.9.0); their payloads are `crate::v2::upgrade`'s.
 pub const FRAME_TYPE_CLUSTER: u8 = 4;
 /// Scheduled timer fired by the leader (time-and-timers spec §4.2): a 24-byte
 /// body ([`TimerBody`]); `client_id`/`seq` are 0; `time_ns` is the deadline
@@ -73,6 +75,8 @@ pub enum ClusterKind {
     Membership = 1,
     ScheduleTable = 2,
     Settings = 3,
+    UpgradePin = 4,
+    SnapshotReport = 5,
 }
 
 impl ClusterKind {
@@ -81,6 +85,8 @@ impl ClusterKind {
             1 => Some(ClusterKind::Membership),
             2 => Some(ClusterKind::ScheduleTable),
             3 => Some(ClusterKind::Settings),
+            4 => Some(ClusterKind::UpgradePin),
+            5 => Some(ClusterKind::SnapshotReport),
             _ => None,
         }
     }
@@ -344,6 +350,22 @@ mod tests {
         let (kind, payload) = read_cluster_prefix(&buf).unwrap();
         assert_eq!(kind, ClusterKind::Settings);
         assert_eq!(payload, &[0xff, 0xff, 0xff]);
+    }
+
+    /// FSM upgrade lifecycle (spec §2.5, §6.5.2): two more kinds, FROZEN.
+    #[test]
+    fn upgrade_cluster_kinds_are_frozen() {
+        assert_eq!(ClusterKind::UpgradePin as u8, 4);
+        assert_eq!(ClusterKind::SnapshotReport as u8, 5);
+        assert_eq!(ClusterKind::from_u8(4), Some(ClusterKind::UpgradePin));
+        assert_eq!(ClusterKind::from_u8(5), Some(ClusterKind::SnapshotReport));
+        assert_eq!(ClusterKind::from_u8(6), None);
+        let mut b = vec![0u8; CLUSTER_BODY_PREFIX_LEN + 3];
+        write_cluster_prefix(&mut b, ClusterKind::SnapshotReport);
+        assert_eq!(
+            read_cluster_prefix(&b).map(|(k, p)| (k, p.len())),
+            Some((ClusterKind::SnapshotReport, 3))
+        );
     }
 
     #[test]
