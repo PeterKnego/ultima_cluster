@@ -375,6 +375,17 @@ codec is replaced.
    on-disk layout version (`CLUSTER_IMAGE_VERSION = 2`, since this flag
    day) that gates artifact compatibility, not the FSM identity version a
    user's state machine declares.
+8. **The retention keep-set protects a pinned origin only from COMMIT, not
+   from the door check.** Erratum 4 above says the newest complete set
+   "cannot vanish" between the `pin_no_set` check and the command's commit.
+   That is too strong as built: the keep-set is computed from the
+   *committed* cluster view, so it does not cover the append-to-commit
+   window. Inside it a newer instant can complete, the floor can advance
+   past `origin`, and a retention pass can prune the set the pin is about
+   to name. The window is narrow (one round trip) and the failure is
+   bounded and named — a B2 attach finds no set at the pinned origin and
+   refuses — so no fix is proposed here; it is recorded so that "a pinned
+   origin is never pruned" is not read as an invariant.
 
 The state at position Q is not a function of the log prefix `[0,Q]`. It is a
 function of

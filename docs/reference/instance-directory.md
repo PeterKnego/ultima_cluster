@@ -90,8 +90,15 @@ committed cluster view once per retention pass and excluded from deletion at
 every row (including `snapshots/cluster/`), even below the persisted floor —
 because a below-floor joiner attaching to that row must still be able to
 install the pinned set. Pinning a position therefore holds its whole
-snapshot set indefinitely, on every node, until the pin is superseded by a
-newer one for the same row.
+snapshot set **from the moment the pin commits**, on every node, until the
+pin is superseded by a newer one for the same row. The exemption is read
+from the *committed* view, so it does not reach backwards: between the
+moment `uc2ctl upgrade pin` is accepted at the leader's door and the moment
+the pin commits, a newer instant can complete, the floor can advance past
+that origin, and a retention pass can prune it. The window is one
+append-to-commit round trip, and the consequence is bounded — a service
+attaching later finds no set at the pinned origin and refuses by name — but
+it is a window, not an impossibility.
 
 ## Durability classes
 

@@ -8155,8 +8155,15 @@ impl Consensus {
                 return self.refuse_upgrade_pin(REASON_PIN_FROM_MISMATCH);
             }
         }
-        // 54: the complete set at `origin` — this node's NEWEST one, the only
-        // one retention cannot remove between here and commit.
+        // 54: the complete set at `origin` — this node's NEWEST one. That is
+        // the best a door check can do, not a guarantee: the keep-set reads
+        // the COMMITTED pin, so it protects `origin` only from the moment
+        // this command commits. In the window between here and that commit a
+        // newer instant can complete and the floor advance past `origin`,
+        // and retention may then prune it. The window is narrow (one
+        // append-to-commit round trip) and the worst case is bounded: a B2
+        // attach later finds no set at the pinned origin and refuses by
+        // name, rather than installing anything wrong.
         if pin.origin != self.snapshot_set_position.load(Ordering::Acquire) {
             return self.refuse_upgrade_pin(REASON_PIN_NO_SET);
         }
