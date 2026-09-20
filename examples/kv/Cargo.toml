@@ -35,7 +35,12 @@ cluster-tests = []
 [dependencies]
 uc_service    = { path = "../../uc_service", version = "2.12.0" }
 uc_remote     = { path = "../../uc_remote", version = "2.12.0" }
-uc_diffreplay = { path = "../../uc_diffreplay", version = "2.12.0" }
+# `default-features = false` drops the `export` feature, and with it the
+# `uc_node` dependency: `kv-service` embeds the replay DRIVER, it never
+# exports a corpus, and a service binary has no business linking the
+# consensus crate. `tests/gen_corpus.rs` does export one — the
+# dev-dependency below turns the feature back on for test builds only.
+uc_diffreplay = { path = "../../uc_diffreplay", version = "2.12.0", default-features = false }
 bytes         = { workspace = true }
 clap          = { workspace = true }
 anyhow        = { workspace = true }
@@ -51,6 +56,9 @@ uc_node     = { path = "../../uc_node", version = "2.12.0" }
 uc_client   = { path = "../../uc_client", version = "2.12.0" }
 uc_net      = { path = "../../uc_net", version = "2.12.0" }
 uc_protocol = { path = "../../uc_protocol", version = "2.12.0" }
+# `tests/gen_corpus.rs` calls `Corpus::export`, which lives behind
+# `uc_diffreplay`'s `export` feature (see the note above).
+uc_diffreplay = { path = "../../uc_diffreplay", version = "2.12.0", features = ["export"] }
 proptest = "1"
 tempfile = { workspace = true }
 libc     = { workspace = true }

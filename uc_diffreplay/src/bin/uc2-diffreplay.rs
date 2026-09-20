@@ -11,6 +11,7 @@ use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
 use uc_diffreplay::attribute::{Declaration, attribute};
 use uc_diffreplay::confirm::{Verdicts, confirm};
+#[cfg(feature = "export")]
 use uc_diffreplay::corpus::Corpus;
 use uc_diffreplay::diff::{Profile, diff};
 use uc_diffreplay::report::Report;
@@ -25,7 +26,8 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Sub {
-    /// Export a corpus from a (stopped) instance directory.
+    /// Export a corpus from an instance directory.
+    #[cfg(feature = "export")]
     Corpus {
         #[command(subcommand)]
         cmd: CorpusSub,
@@ -63,6 +65,7 @@ enum Sub {
     },
 }
 
+#[cfg(feature = "export")]
 #[derive(Subcommand)]
 enum CorpusSub {
     Export {
@@ -147,6 +150,7 @@ fn judge(
 
 fn main() -> anyhow::Result<()> {
     match Args::parse().cmd {
+        #[cfg(feature = "export")]
         Sub::Corpus {
             cmd:
                 CorpusSub::Export {

@@ -15,18 +15,30 @@ categories.workspace = true
 name = "uc2-diffreplay"
 path = "src/bin/uc2-diffreplay.rs"
 
+[features]
+default = ["export"]
+# `corpus export` is the ONLY thing here that needs a node: it shells
+# `uc_node::backup`'s ordered copy. An app that merely embeds the replay
+# driver (`examples/kv`) takes `default-features = false` and links no node
+# — otherwise every service binary in the tree drags the whole consensus
+# crate in behind a verb it never calls.
+export = ["dep:uc_node"]
+
 [dependencies]
 uc_service = { path = "../uc_service", version = "2.12.0" }
 uc_protocol = { path = "../uc_protocol", version = "2.12.0" }
 uc_journal = { workspace = true }
-uc_node = { path = "../uc_node", version = "2.12.0" }
+uc_node = { path = "../uc_node", version = "2.12.0", optional = true }
 serde = { workspace = true }
 serde_json = "1"
-toml = "0.9"
+toml = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
 
 [dev-dependencies]
+# Named again here so the test targets (`tests/common/mod.rs` starts a real
+# in-process node) do not depend on the optional `export` feature being on.
+uc_node = { path = "../uc_node", version = "2.12.0" }
 uc_lincheck = { path = "../uc_lincheck" }
 uc_client = { path = "../uc_client" }
 uc_net = { path = "../uc_net", version = "2.12.0" }

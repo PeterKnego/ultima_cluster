@@ -90,8 +90,15 @@ impl Corpus {
             .join(format!("snap-{}.ultsnap", self.manifest.origin))
     }
 
-    /// `uc2ctl backup` into `out`, then stamp the CORPUS manifest. The node
-    /// must be stopped (the backup verbs are offline — `uc_node::backup`).
+    /// `uc2ctl backup` into `out`, then stamp the CORPUS manifest.
+    ///
+    /// Safe on a RUNNING node — `uc_node::backup`'s ordered copy is the
+    /// correctness argument; stopping it first is still the simplest way to
+    /// get a quiescent span (nothing appends while you pick the end Q).
+    ///
+    /// Behind the default `export` feature: it is the only thing in this
+    /// crate that links `uc_node`.
+    #[cfg(feature = "export")]
     pub fn export(
         instance_dir: &Path,
         app_id: &str,
@@ -123,7 +130,8 @@ impl Corpus {
 
     /// Spec §6.1 `--around <pos>`: the newest complete artifact at or below
     /// `pos` is the origin; the end is `pos` itself (the caller widens it if
-    /// the trigger needs a tail).
+    /// the trigger needs a tail). Behind the default `export` feature.
+    #[cfg(feature = "export")]
     pub fn export_around(
         instance_dir: &Path,
         app_id: &str,
