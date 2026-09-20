@@ -276,6 +276,7 @@ RULE_META = {
     "Uc2SnapshotStalled": {"severity": "warning", "real": False, "scenario": "snapshot_stalled"},
     "Uc2StandbySnapshotStalled": {"severity": "warning", "real": False, "scenario": "standby_snapshot_stalled"},
     "Uc2SnapshotSetDiverged": {"severity": "warning", "real": False, "scenario": "snapshot_set_diverged"},
+    "Uc2SnapshotHashDiverged": {"severity": "critical", "real": False, "scenario": "snapshot_hash_diverged"},
     "Uc2MtuDiscoveryStalled": {"severity": "warning", "real": False, "scenario": "mtu_discovery_stalled"},
     "Uc2PathBelowMtu": {"severity": "critical", "real": False, "scenario": "path_below_mtu"},
     "Uc2JumboGateHeld": {"severity": "warning", "real": False, "scenario": "jumbo_gate_held"},
@@ -672,6 +673,24 @@ def build_Uc2SnapshotSetDiverged():
     return r
 
 
+def build_Uc2SnapshotHashDiverged():
+    # FSM upgrade lifecycle spec §6.5.2: a per-row gauge held > 0 — the
+    # single-instance hold shape of build_Uc2AgentDead, with the rule's
+    # `max by (service, row)` keeping those two labels.
+    rows = load_scenario("snapshot_hash_diverged")
+    row = select(rows, "uc2_snapshot_hash_mismatch", {"row": "0"})
+    # `max by (service, row)` keeps exactly those two labels on the result
+    # vector — the `labels_from={"labels": {...}}` idiom
+    # build_Uc2ServiceVersionDrift uses for its `by (row)`.
+    r = new_rule(
+        "critical",
+        labels_from={"labels": {"service": row["labels"]["service"], "row": row["labels"]["row"]}},
+    )
+    add_hold_last(r, row, "uc2_snapshot_hash_mismatch", 60)
+    r["eval_time"] = total_for(60)[0]
+    return r
+
+
 def build_Uc2MtuDiscoveryStalled():
     # Jumbo spec §9: `uc2_probe_min_mtu_bytes > uc2_datagram_mtu_bytes`, a
     # plain two-series LEVEL comparison on ONE instance (no `and`, no
@@ -743,6 +762,7 @@ RULE_BUILDERS = {
     "Uc2SnapshotStalled": build_Uc2SnapshotStalled,
     "Uc2StandbySnapshotStalled": build_Uc2StandbySnapshotStalled,
     "Uc2SnapshotSetDiverged": build_Uc2SnapshotSetDiverged,
+    "Uc2SnapshotHashDiverged": build_Uc2SnapshotHashDiverged,
     "Uc2MtuDiscoveryStalled": build_Uc2MtuDiscoveryStalled,
     "Uc2PathBelowMtu": build_Uc2PathBelowMtu,
     "Uc2JumboGateHeld": build_Uc2JumboGateHeld,

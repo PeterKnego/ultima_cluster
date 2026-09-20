@@ -110,6 +110,10 @@ transport setting, both measured closed-loop at inflight 1 on 8-vCPU
   (emitted only when a fire is late — there is deliberately no per-fire record
   on the consensus agent's hot path). See
   [Log time and timers, explained](../notes/uc2-log-time-and-timers-explained.md).
+  Beside those three, the FSM upgrade lifecycle (`2.13.0`) adds
+  `uc2_upgrade_pin_origin`, `uc2_upgrade_pin_version` and
+  `uc2_snapshot_hash_mismatch`, per row; `uc2ctl upgrade show` reads the same
+  committed state.
 - **Do all nodes hold the same schedule table?** `uc2_schedule_table_position`
   is the frame-end position of the table this node's **cluster FSM** has
   applied (`0` = none) and must be identical everywhere;

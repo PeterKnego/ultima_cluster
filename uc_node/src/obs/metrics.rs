@@ -88,6 +88,10 @@ pub const CONTRACT_SERIES: &[&str] = &[
     "uc2_settings_position",
     "uc2_schedule_entries",
     "uc2_schedule_apply_refused_total",
+    // FSM upgrade lifecycle (plan B1)
+    "uc2_upgrade_pin_origin",
+    "uc2_upgrade_pin_version",
+    "uc2_snapshot_hash_mismatch",
     "uc_services_declared",
     "uc2_fsm_lag_bytes",
     "uc2_log_time_ns",
@@ -347,6 +351,17 @@ struct ServiceRow {
     /// (`uc2_snapshot_freeze_seconds_count`) — a LOWER bound on freezes; see
     /// [`SnapshotFreezeStats`].
     freeze_count: u64,
+    /// FSM upgrade lifecycle (plan B1, spec §2.5): the row's pinned origin
+    /// position from the newest committed `UpgradePin`, as republished onto
+    /// the cnc status line by the `uc2-cluster` agent; 0 = no pin.
+    upgrade_origin: u64,
+    /// The packed version the row's newest `UpgradePin` names (`to`); 0 =
+    /// no pin.
+    pinned_version: u64,
+    /// Nodes whose artifact hash for the row's newest reported instant
+    /// differs from the majority's (spec §6.5.2), recomputed from the
+    /// committed `SnapshotReport` at scrape; 0 = agreed or no majority.
+    hash_mismatch: u64,
 }
 
 fn service_rows(s: &ObsSources, commit: u64, now: u64) -> Vec<ServiceRow> {
@@ -368,6 +383,11 @@ fn service_rows(s: &ObsSources, commit: u64, now: u64) -> Vec<ServiceRow> {
             .load(Ordering::Relaxed)
             .max(s.snapshot_standby_instant_position.load(Ordering::Acquire)),
     );
+    // FSM upgrade lifecycle (plan B1 T9): one snapshot of the cluster FSM's
+    // reports, taken ONCE before the row loop — every row's verdict is
+    // recomputed against the SAME committed view, not a tick-apart read per
+    // row.
+    let inner = s.cluster_view.snapshot_inner();
     let mut rows = Vec::new();
     for id in 0..CNC_MAX_SERVICES as u8 {
         if declared & (1u64 << id) == 0 {
@@ -385,6 +405,12 @@ fn service_rows(s: &ObsSources, commit: u64, now: u64) -> Vec<ServiceRow> {
         let (freeze_max_ns, freeze_sum_ns, freeze_count) = s
             .snapshot_freeze
             .observe_row(id as usize, slot.identity.freeze_ns());
+        let hash_mismatch = inner
+            .reports
+            .iter()
+            .find(|r| r.row == id)
+            .map(|r| uc_protocol::v2::upgrade::verdict(r).minority.len() as u64)
+            .unwrap_or(0);
         rows.push(ServiceRow {
             id: id as usize,
             labels: format!("service=\"{name}\",row=\"{id}\""),
@@ -404,6 +430,9 @@ fn service_rows(s: &ObsSources, commit: u64, now: u64) -> Vec<ServiceRow> {
             freeze_max_seconds: freeze_max_ns as f64 / 1e9,
             freeze_sum_seconds: freeze_sum_ns as f64 / 1e9,
             freeze_count,
+            upgrade_origin: slot.status.upgrade_origin(),
+            pinned_version: slot.status.pinned_version() as u64,
+            hash_mismatch,
         });
     }
     rows
@@ -660,6 +689,30 @@ fn push_service_families(out: &mut String, s: &ObsSources, commit: u64, now: u64
         "gauge",
         &rows,
         |r| r.timers_pending,
+    );
+    push_service_labeled(
+        out,
+        "uc2_upgrade_pin_origin",
+        "FSM upgrade lifecycle (spec §2.5): the row's pinned origin position from the newest committed UpgradePin, as republished in the cnc status line by the uc2-cluster agent; 0 = no pin. Identical on every node once caught up.",
+        "gauge",
+        &rows,
+        |r| r.upgrade_origin,
+    );
+    push_service_labeled(
+        out,
+        "uc2_upgrade_pin_version",
+        "The packed version the row's newest UpgradePin names (`to`); 0 = no pin. A service whose VERSION differs is refused at attach (plan B2).",
+        "gauge",
+        &rows,
+        |r| r.pinned_version,
+    );
+    push_service_labeled(
+        out,
+        "uc2_snapshot_hash_mismatch",
+        "Nodes whose artifact hash for the row's newest reported instant differs from the majority's (spec §6.5.2) — recomputed from the committed SnapshotReport at scrape; 0 = agreed or no majority to differ from. Alert: Uc2SnapshotHashDiverged.",
+        "gauge",
+        &rows,
+        |r| r.hash_mismatch,
     );
     push_service_labeled(
         out,
@@ -1726,7 +1779,7 @@ mod tests {
     fn the_contract_has_the_number_of_families_the_docs_state() {
         assert_eq!(
             CONTRACT_SERIES.len(),
-            108,
+            111,
             "if this is intentional, update the family count in \
              docs/how-to/monitor-a-cluster.md in the same commit"
         );
@@ -2196,6 +2249,95 @@ mod tests {
             text.contains(
                 "count by (row) (count_values(\"version\", uc2_service_version > 0) by (row)) > 1"
             ),
+            "{text}"
+        );
+    }
+
+    /// FSM upgrade lifecycle (plan B1 T9, spec §2.5/§6.5.2): the pin words
+    /// the `uc2-cluster` agent republishes onto the cnc status line, and the
+    /// mismatch count recomputed from the committed `SnapshotReport` at
+    /// scrape — same fixture shape as the neighbouring per-FSM-labels test,
+    /// with row 0 declared `"kv"`.
+    #[test]
+    fn pin_words_and_hash_mismatch_render_per_row() {
+        let kv = FsmName::parse("kv").unwrap();
+        let mut services = [None; uc_protocol::v2::cnc::CNC_MAX_SERVICES];
+        services[0] = Some(kv);
+        let meta = CncMeta {
+            node_id: 7,
+            instance_id: 0x1122_3344_5566_7788,
+            app_id: "test-app".into(),
+            buffer_bytes: 1 << 20,
+            max_payload: 1200,
+            services,
+        };
+        let cnc = CncPage::heap(&meta);
+        cnc.store_services_declared(0b1);
+
+        let sources = ObsSources {
+            node_id: 7,
+            cnc,
+            sender: Arc::new(SenderStats::default()),
+            receiver: Arc::new(FollowerStats::default()),
+            truncations: Arc::new(AtomicU64::new(0)),
+            wipes: Arc::new(AtomicU64::new(0)),
+            timer_stats: Arc::new(crate::timers::TimerStats::default()),
+            schedule_table_position: Arc::new(AtomicU64::new(0)),
+            schedule_entries: Arc::new(AtomicU64::new(0)),
+            log_clock_smear_ns: Arc::new(AtomicU64::new(0)),
+            schedule_apply_refused: Arc::new(AtomicU64::new(0)),
+            cluster_view: test_cluster_view(),
+            probe: uc_net::probe::ProbeTable::new(uc_net::probe::ProbeCadence::default()),
+            commands_over_standard: Arc::new(AtomicU64::new(0)),
+            reports_unattested: Arc::new(AtomicU64::new(0)),
+            reports_implausible: Arc::new(AtomicU64::new(0)),
+            crypto_handshake_failures: Arc::new(AtomicU64::new(0)),
+            snapshot_instant_position: Arc::new(AtomicU64::new(0)),
+            snapshot_standby_instant_position: Arc::new(AtomicU64::new(0)),
+            snapshot_set_position: Arc::new(AtomicU64::new(0)),
+            snapshot_row_incomplete: std::array::from_fn(|_| Arc::new(AtomicU64::new(0))),
+            snapshot_fetched_position: Arc::new(AtomicU64::new(0)),
+            snapshot_freeze: Arc::new(SnapshotFreezeStats::default()),
+            crypto_enabled: false,
+            purge_enabled: false,
+            journal_segment_bytes: 64 << 20,
+            agents: vec![
+                ("consensus", Arc::new(AtomicBool::new(false))),
+                ("sender", Arc::new(AtomicBool::new(false))),
+                ("receiver", Arc::new(AtomicBool::new(false))),
+                ("archive", Arc::new(AtomicBool::new(false))),
+                ("cluster", Arc::new(AtomicBool::new(false))),
+            ],
+            jumbo_gate_pending: Arc::new(AtomicBool::new(false)),
+        };
+
+        sources
+            .cnc
+            .service_slot(0)
+            .status
+            .store_pin(8192, 0x0101_0000);
+        let mut st = sources.cluster_view.to_state();
+        st.reports.push(uc_protocol::v2::upgrade::SnapshotReport {
+            row: 0,
+            position: 8192,
+            hashes: vec![(0, 1), (1, 1), (2, 2)],
+        });
+        sources.cluster_view.publish(&st);
+
+        let text = render_prometheus(&sources);
+        assert!(
+            text.contains("uc2_upgrade_pin_origin{service=\"kv\",row=\"0\"} 8192"),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!(
+                "uc2_upgrade_pin_version{{service=\"kv\",row=\"0\"}} {}",
+                0x0101_0000u64
+            )),
+            "{text}"
+        );
+        assert!(
+            text.contains("uc2_snapshot_hash_mismatch{service=\"kv\",row=\"0\"} 1"),
             "{text}"
         );
     }

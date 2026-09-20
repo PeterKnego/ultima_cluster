@@ -67,7 +67,7 @@ scrape_configs:
 ```
 
 `/metrics` serves `text/plain; version=0.0.4` — standard Prometheus text
-exposition. The full series contract — 108 families — is the
+exposition. The full series contract — 111 families — is the
 `CONTRACT_SERIES` array in
 [`uc_node/src/obs/metrics.rs`](../../uc_node/src/obs/metrics.rs); a test
 pins every family in that array against what the renderer actually emits, so
@@ -203,6 +203,9 @@ replicated schedule table — plus four **off-contract** timing families
 | `uc2_schedule_table_position` | gauge | none | frame-END position of the schedule table this node's **cluster FSM** has applied; `0` = none. The table is cluster-FSM state applied at commit, so this must be identical on every node once caught up |
 | `uc2_schedule_entries` | gauge | none | entries in that committed table naming a row **this node declares** — read from the cluster FSM's view, not from the timer heap, so it reads identically on leader and follower even though the heap is leader-only. A parked `once` — one that has already fired — still counts here, unlike `uc2_timers_pending` |
 | `uc2_schedule_apply_refused_total` | counter | none | `uc2ctl schedule apply` requests this node refused. **Retries are not counted**: neither a follower's (the staged file is node-local, so the request is never forwarded) nor the leader's while a previous table frame is still above commit |
+| `uc2_upgrade_pin_origin` (FSM upgrade lifecycle, 2.13.0) | gauge | `service`, `row` | the row's pinned origin position from the newest committed `UpgradePin`, as republished onto the cnc status line by the `uc2-cluster` agent; `0` = no pin. Identical on every node once caught up — see `uc2ctl upgrade show` |
+| `uc2_upgrade_pin_version` (FSM upgrade lifecycle, 2.13.0) | gauge | `service`, `row` | the packed version the row's newest `UpgradePin` names (`to`); `0` = no pin. A service whose `VERSION` differs is refused at attach (plan B2) |
+| `uc2_snapshot_hash_mismatch` (FSM upgrade lifecycle, 2.13.0) | gauge | `service`, `row` | nodes whose artifact hash for the row's newest reported instant differs from the majority's (spec §6.5.2), recomputed from the committed `SnapshotReport` at scrape; `0` = agreed or no majority to differ from. Alert: `Uc2SnapshotHashDiverged` |
 
 **One alert rule**, `Uc2LogTimeFrozen` (warning, `for: 30s`):
 `uc2_log_time_lag_seconds > 5 and on(instance) uc2_is_leader == 1`. The
@@ -303,7 +306,7 @@ The `uc2_agent_alive` family covers **five** agents — `consensus`, `sender`,
 `receiver`, `archive`, and `cluster` (the `uc2-cluster` agent, labelled like
 its four siblings without the thread-name prefix).
 
-**Six records** go with them — three at info, three at warn:
+**Nine records** go with them — five at info, four at warn:
 
 | Event | Level | Fields | Means, and what to do |
 |---|---|---|---|
@@ -311,8 +314,11 @@ its four siblings without the thread-name prefix).
 | `schedule_apply_refused` | warn | `node`, `reason` | an `uc2ctl schedule apply` was refused; `reason` is the same 40–43 code [`uc2ctl` prints](../reference/uc2ctl.md#refusal-reasons). Read the code, fix the file or re-run against the leader. Retries (a follower's, or the leader's single-in-flight one) are **not** refusals and do not appear here |
 | `schedule_staged_file_kept` | warn | `node`, `position`, `file`, `err` | the command *was* appended, but the staged file could not be deleted afterwards. `file` names which — `schedules.pending` or `settings.pending`, since both apply ops share this path. Deleting it is what normally makes a re-presented request refuse `schedule_missing`/`settings_missing` instead of appending the same payload a second time — remove the file by hand |
 | `settings_apply_refused` | warn | `node`, `reason` | a `uc2ctl settings apply` was refused; `reason` is the same 44–47 code [`uc2ctl` prints](../reference/uc2ctl.md#refusal-reasons) |
-| `cluster_command_applied` | info | `position`, `kind`, `accepted`, `reason` | this node's cluster FSM applied a `CLUSTER` command at frame-end `position`. `kind` is `1` Membership / `2` ScheduleTable / `3` Settings; `accepted` is `1` or `0`, with `reason` naming the refusal code when it is `0`. A refusal here is **deterministic and identical on every node** — it is the FSM's own validation, not a node-local judgement |
+| `upgrade_pin_applied` (FSM upgrade lifecycle, 2.13.0) | info | `position`, `row`, `from`, `to`, `origin` | this node's cluster FSM applied an `UpgradePin` at frame-end `position`: row `row` went from packed version `from` to `to`, pinned to the coordinated instant at `origin`. Nothing to do; `uc2ctl upgrade show` reads the same state |
+| `upgrade_pin_refused` (FSM upgrade lifecycle, 2.13.0) | warn | `node`, `reason` | a `uc2ctl upgrade pin` was refused; `reason` is the 52–58 code [`uc2ctl` prints](../reference/uc2ctl.md#refusal-reasons) |
+| `cluster_command_applied` | info | `position`, `kind`, `accepted`, `reason` | this node's cluster FSM applied a `CLUSTER` command at frame-end `position`. `kind` is `1` Membership / `2` ScheduleTable / `3` Settings / `4` UpgradePin / `5` SnapshotReport; `accepted` is `1` or `0`, with `reason` naming the refusal code when it is `0`. A refusal here is **deterministic and identical on every node** — it is the FSM's own validation, not a node-local judgement |
 | `cluster_artifact_installed` | info | `position`, `path` | a snapshot session's cluster artifact was installed by fiat at `position`; this node now holds the cluster's membership, schedule table and settings as of that position, before its purge floor advances |
+| `snapshot_hash_diverged` (FSM upgrade lifecycle, 2.13.0) | warn | `row`, `position`, `node`, `majority_hash` | this node's cluster FSM applied a `SnapshotReport` for `row` at `position` and found `node` in the minority against `majority_hash` — that node's artifact hashes differently from the rest. One event per minority node. Alert: `Uc2SnapshotHashDiverged`; run `uc2ctl upgrade show`, then `uc2-diffreplay determinism` on that row's corpus |
 
 ### The snapshot families (2.11.0)
 
@@ -533,6 +539,7 @@ table:
 | `Uc2SnapshotStalled` (coordinated snapshots, 2.11.0) | this node has commanded **full** snapshot instants at least twice in 30m with no complete set landing — one FSM is silently stopping all purging | warning |
 | `Uc2StandbySnapshotStalled` (coordinated snapshots, 2.11.0) | this **learner** has acted on standby snapshot instants at least twice in 30m with no complete set landing — one of its rows is silently stopping the standby set. Cannot fire on a voter (a voter exports `uc2_snapshot_standby_instant_position = 0`) | warning |
 | `Uc2SnapshotSetDiverged` (coordinated snapshots, 2.11.0) | nodes disagree on the newest complete snapshot set's position, i.e. on their purge floors, for 60s | warning |
+| `Uc2SnapshotHashDiverged` (FSM upgrade lifecycle, 2.13.0) | a node's artifact hash for a row's newest reported instant differs from the majority's, for 60s | critical |
 | `Uc2MtuDiscoveryStalled` (jumbo frames, 2.12.0) | this node has proven a larger datagram path than the cluster has committed, for 60s — some *other* member is holding discovery back, silent or narrower. Read `uc2_probe_min_mtu_bytes` on every node | warning |
 | `Uc2PathBelowMtu` (jumbo frames, 2.12.0) | the kernel refused a non-probe datagram for size in the last 5m: a path degraded below the committed rung (or below the 1408 B baseline). The rung is monotone and cannot be lowered — fix the path | critical |
 | `Uc2JumboGateHeld` (jumbo frames, 2.12.0) | this node has held a startup gate for 5m — `/readyz` 503 in any role: it has not proven the committed rung to a quorum of voters (one voter, for a learner). Read its `jumbo_join_gate_holding` records for the members short of the rung, then `uc2_probe_min_mtu_bytes` on those; with wire crypto on, a member whose pairwise session never came up looks like a dead one here | warning |

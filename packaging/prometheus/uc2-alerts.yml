@@ -311,6 +311,18 @@ groups:
     for: 60s
     labels: { severity: warning }
     annotations: { summary: "nodes disagree on the newest COMPLETE snapshot set's position — one node's purge floor is at a different point than another's; a node behind is either still catching up (transient) or stuck (check uc2_snapshot_row_incomplete_total and uc2ctl snapshot show on it)" }
+  - alert: Uc2SnapshotHashDiverged
+    # FSM upgrade lifecycle spec §6.5.2: every instance of a row applied the
+    # same log from the same origin, so their artifacts at one instant must
+    # hash identically. The cluster FSM holds the leader's collected vector
+    # and every node recomputes the verdict at scrape; a non-zero count is
+    # a NAMED minority node whose state diverged — nondeterminism in apply,
+    # or a non-canonical image — not a transient. Critical: it is the live
+    # form of diff replay's `determinism` mode failing.
+    expr: max by (service, row) (uc2_snapshot_hash_mismatch) > 0
+    for: 60s
+    labels: { severity: critical }
+    annotations: { summary: "a node's snapshot artifact for row {{ $labels.row }} hashes differently from the majority's at the newest reported instant — run `uc2ctl upgrade show` for the minority node id, then `uc2-diffreplay determinism` on that row's corpus" }
   - alert: Uc2MtuDiscoveryStalled
     # Jumbo spec §9. This node has PROVEN more than the cluster has COMMITTED:
     # `uc2_probe_min_mtu_bytes` is its own verified minimum over its peers and
