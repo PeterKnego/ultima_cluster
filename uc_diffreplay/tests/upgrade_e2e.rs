@@ -1,25 +1,8 @@
 mod common;
-use std::path::PathBuf;
 use std::process::Command;
 
+use common::register_replay_bin;
 use uc_diffreplay::corpus::Corpus;
-
-fn bin(name: &str) -> PathBuf {
-    // Built by cargo for this test binary's profile: target/<profile>/<name>.
-    let mut p = PathBuf::from(env!("CARGO_BIN_EXE_uc2-diffreplay"));
-    p.set_file_name(name);
-    p
-}
-
-fn register_replay_bin() -> PathBuf {
-    let p = bin("register-replay");
-    assert!(
-        p.exists(),
-        "build it first: cargo build -p uc_lincheck --features replay-bin --bin register-replay ({})",
-        p.display()
-    );
-    p
-}
 
 #[test]
 fn same_binary_twice_passes_with_an_empty_declaration() {

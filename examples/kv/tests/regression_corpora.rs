@@ -73,10 +73,13 @@ fn every_regression_corpus_is_deterministic_under_this_build() {
         assert!(decl.is_file(), "{} has no intent.toml", c.display());
         Declaration::from_toml(&std::fs::read_to_string(&decl).unwrap()).unwrap();
 
-        // The report lands beside the corpus (`tests/corpora/.gitignore`
-        // covers it and the traces directory `uc2-diffreplay` puts next to
-        // it), and is removed on success — a leftover means a failed run.
-        let report = c.join("determinism.report.json");
+        // The report (and the traces directory `uc2-diffreplay` puts beside
+        // it) is OUTPUT, so it goes to the cargo target tree, never into the
+        // source tree the corpus lives in. `uc2-diffreplay` removes the
+        // traces itself on a pass; a leftover report here means a failed run
+        // and is the evidence for it.
+        let name = c.file_name().unwrap().to_string_lossy().into_owned();
+        let report = scratch().join(format!("{name}.determinism.report.json"));
         let st = Command::new(&diffreplay)
             .arg("determinism")
             .arg("--corpus")
@@ -89,7 +92,6 @@ fn every_regression_corpus_is_deterministic_under_this_build() {
             .unwrap();
         assert!(st.success(), "determinism failed for {}", c.display());
         let _ = std::fs::remove_file(&report);
-        let _ = std::fs::remove_dir_all(c.join("determinism.report.traces"));
     }
 }
 

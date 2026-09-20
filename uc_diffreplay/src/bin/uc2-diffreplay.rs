@@ -121,7 +121,16 @@ fn finish(report: Report, path: &Path) -> anyhow::Result<()> {
     if report.failed() {
         std::process::exit(1);
     }
+    clear_traces(path);
     Ok(())
+}
+
+/// Drop the per-run traces on a PASS. They are EVIDENCE, so a failing run
+/// keeps them (and a leftover directory is itself the signal that something
+/// failed or was killed); a passing one has nothing to say and should leave
+/// nothing behind.
+fn clear_traces(report: &Path) {
+    let _ = std::fs::remove_dir_all(traces_dir_of(report));
 }
 
 /// The declaration every non-`upgrade` mode judges against: EMPTY by
@@ -195,7 +204,7 @@ fn main() -> anyhow::Result<()> {
             declare,
             report,
         } => {
-            let tmp = tempfile_dir(&report)?;
+            let tmp = traces_dir_beside(&report)?;
             let a = replay(&old, &corpus, &tmp.join("old.json"), false, &[])?;
             let b = replay(&new, &corpus, &tmp.join("new.json"), false, &[])?;
             let d = Declaration::from_toml(&std::fs::read_to_string(&declare)?)?;
@@ -207,7 +216,7 @@ fn main() -> anyhow::Result<()> {
             bin,
             report,
         } => {
-            let tmp = tempfile_dir(&report)?;
+            let tmp = traces_dir_beside(&report)?;
             let a = replay(&bin, &corpus, &tmp.join("run1.json"), false, &[])?;
             let b = replay(&bin, &corpus, &tmp.join("run2.json"), false, &[])?;
             let d = empty_declaration()?;
@@ -222,7 +231,7 @@ fn main() -> anyhow::Result<()> {
             bin,
             report,
         } => {
-            let tmp = tempfile_dir(&report)?;
+            let tmp = traces_dir_beside(&report)?;
             let art = replay(&bin, &corpus, &tmp.join("artifact.json"), false, &[])?;
             let mut genesis = replay(&bin, &corpus, &tmp.join("genesis.json"), true, &[])?;
             // Align the spans for diff() (same origin/end/row) — but the
@@ -247,6 +256,9 @@ fn main() -> anyhow::Result<()> {
             // demonstration (spec §6.2 part 1); report it, exit 0 either way.
             r.write_json(std::fs::File::create(&report)?)?;
             r.write_text(std::io::stdout())?;
+            if !r.failed() {
+                clear_traces(&report);
+            }
             println!(
                 "reconstruction: end projections {}",
                 if r.profile.projection_end.is_empty() {
@@ -260,8 +272,15 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
-fn tempfile_dir(beside: &Path) -> anyhow::Result<PathBuf> {
-    let d = beside.with_extension("traces");
+/// Where a run's per-binary traces land: `<report>.traces/`, beside the
+/// report itself, so the evidence for a failing run sits next to the report
+/// that names it.
+fn traces_dir_of(report: &Path) -> PathBuf {
+    report.with_extension("traces")
+}
+
+fn traces_dir_beside(report: &Path) -> anyhow::Result<PathBuf> {
+    let d = traces_dir_of(report);
     std::fs::create_dir_all(&d)?;
     Ok(d)
 }

@@ -25,32 +25,26 @@
 
 mod common;
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use uc_client::Client;
 use uc_lincheck::register::{Cmd, CmdResp, DoublingRegisterSm, RegisterSm};
 use uc_log::cnc::CncPage;
 use uc_service::{ServiceBuilder, ServiceConfig};
 
+use common::{register_replay_bin, wait_for};
 use uc_diffreplay::attribute::{Attribution, Declaration, attribute};
 use uc_diffreplay::confirm::{Verdict, confirm};
 use uc_diffreplay::corpus::Corpus;
 use uc_diffreplay::diff::{Surface, diff};
 use uc_diffreplay::trace::Trace;
 
-fn register_replay_bin() -> PathBuf {
-    // Built by cargo for this test binary's profile: target/<profile>/<name>.
-    let mut p = PathBuf::from(env!("CARGO_BIN_EXE_uc2-diffreplay"));
-    p.set_file_name("register-replay");
-    assert!(
-        p.exists(),
-        "build it first: cargo build -p uc_lincheck --features replay-bin --bin register-replay ({})",
-        p.display()
-    );
-    p
-}
+/// The reattach experiments start a real node, purge a journal prefix and
+/// wait for a v2 service to walk it: 30 s, not [`common::wait_until`]'s 10,
+/// and non-panicking so the `Stop` guards run before the assertion.
+const REATTACH_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// `<bin> replay --corpus … --out …` with the given knobs, then read the
 /// trace back.
@@ -214,14 +208,17 @@ fn a_real_divergence_is_detected_and_attributed() {
         att.entries
     );
     assert_eq!(att.projection_origin, None);
-    assert_eq!(att.projection_end, Some(Attribution::Arm("write".into())));
+    // A projection is one comparison over the whole state: it is attributed
+    // to the change's touched set as a whole, never to one arm of it.
+    assert_eq!(att.projection_end, Some(Attribution::Touched));
 
     let v = confirm(&att, &decl);
     assert_eq!(v.findings.len(), 1, "{:?}", v.findings);
     let f = &v.findings[0];
     assert_eq!(f.surface, Surface::ProjectionEnd);
     assert_eq!(f.verdict, Verdict::Pass);
-    assert_eq!(f.arm.as_deref(), Some("write"));
+    // …and the finding names no arm, matching the arm-less `[[expect]]`.
+    assert_eq!(f.arm, None);
     assert_eq!(f.note, "values doubled");
     assert!(
         !v.findings
@@ -261,20 +258,6 @@ impl<T> Drop for Stop<T> {
             (self.1)(v);
         }
     }
-}
-
-/// [`common::wait_until`] without the panic: the caller decides what to do
-/// with a timeout, so cleanup runs before the assertion fires.
-#[must_use]
-fn wait_for(mut f: impl FnMut() -> bool) -> bool {
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while !f() {
-        if Instant::now() >= deadline {
-            return false;
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
-    true
 }
 
 /// Writes submitted in the v1 era. Two jobs, both structural:
@@ -325,7 +308,10 @@ fn v2_after_swap(purge: uc_node::PurgePolicy, app_id: &str) -> Option<u64> {
     let node = Stop::new(uc_node::Node::start(cfg).unwrap(), uc_node::Node::stop);
     // Task 2: the first submit races leader election without this and fails
     // with `NotLeader`.
-    assert!(wait_for(|| node.get().can_serve()), "node never served");
+    assert!(
+        wait_for(|| node.get().can_serve(), REATTACH_TIMEOUT),
+        "node never served"
+    );
 
     let p = {
         let _svc = Stop::new(
@@ -348,7 +334,7 @@ fn v2_after_swap(purge: uc_node::PurgePolicy, app_id: &str) -> Option<u64> {
             .join("0")
             .join(format!("snap-{p}.ultsnap"));
         assert!(
-            wait_for(|| art.is_file()),
+            wait_for(|| art.is_file(), REATTACH_TIMEOUT),
             "row 0 never published snap-{p}.ultsnap"
         );
         // The precondition the whole experiment rests on: the appender is more
@@ -370,7 +356,7 @@ fn v2_after_swap(purge: uc_node::PurgePolicy, app_id: &str) -> Option<u64> {
             // same observable `tests/purge_safety.rs` uses). The floor persist
             // is throttled to 100 ms, so this is a wait, not a poll.
             assert!(
-                wait_for(|| node.get().archive_first_base() > 0),
+                wait_for(|| node.get().archive_first_base() > 0, REATTACH_TIMEOUT),
                 "purge never advanced the archive floor below P={p}"
             );
             // And the journal's own lowest replayable position is what the
@@ -409,7 +395,10 @@ fn v2_after_swap(purge: uc_node::PurgePolicy, app_id: &str) -> Option<u64> {
     // returned and v1 is stopped, so only v2 can raise it. (No sleep: a sleep
     // would be a guess at how long a journal walk takes.)
     let cnc = CncPage::open_file(&dir.join("cnc2.dat"), app_id).unwrap();
-    let caught_up = wait_for(|| cnc.service_slot(0).applied.load_acquire() >= p);
+    let caught_up = wait_for(
+        || cnc.service_slot(0).applied.load_acquire() >= p,
+        REATTACH_TIMEOUT,
+    );
     let value = caught_up.then(|| svc2.get().query(()));
     drop(svc2);
     drop(node);

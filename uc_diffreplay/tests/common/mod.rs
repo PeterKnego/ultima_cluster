@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use uc_client::Client;
@@ -45,12 +45,39 @@ pub fn start_single_node(dir: &Path, app_id: &str, fsm: &str) -> Node {
     Node::start(node_config(dir, app_id, fsm)).unwrap()
 }
 
-pub fn wait_until(mut f: impl FnMut() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+/// Poll `f` until it holds or `timeout` elapses. Returns whether it held —
+/// the caller decides what to do with a timeout, so cleanup can run before
+/// an assertion fires. [`wait_until`] is this with the assertion built in.
+#[must_use]
+pub fn wait_for(mut f: impl FnMut() -> bool, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
     while !f() {
-        assert!(Instant::now() < deadline, "condition never held");
+        if Instant::now() >= deadline {
+            return false;
+        }
         std::thread::sleep(Duration::from_millis(1));
     }
+    true
+}
+
+pub fn wait_until(f: impl FnMut() -> bool) {
+    assert!(wait_for(f, Duration::from_secs(10)), "condition never held");
+}
+
+/// The `register-replay` fixture binary, beside this test binary in the
+/// cargo target directory. It sits behind `uc_lincheck`'s `replay-bin`
+/// required-feature, so `cargo test` does NOT build it — assert rather than
+/// skip (a silently skipped e2e test is not a test) and name the command
+/// that fixes it. CI builds it before the test job.
+pub fn register_replay_bin() -> PathBuf {
+    let mut p = PathBuf::from(env!("CARGO_BIN_EXE_uc2-diffreplay"));
+    p.set_file_name("register-replay");
+    assert!(
+        p.exists(),
+        "build it first: cargo build -p uc_lincheck --features replay-bin --bin register-replay ({})",
+        p.display()
+    );
+    p
 }
 
 /// `uc2ctl snapshot` in process: command an instant, return its position P.
