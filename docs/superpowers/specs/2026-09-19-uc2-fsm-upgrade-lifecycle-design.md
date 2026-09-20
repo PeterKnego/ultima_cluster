@@ -18,19 +18,24 @@ flag-day procedure), `.superpowers/SBE vs serde+bincode 2 — Handover Doc.md`
 
 ## 0. Summary
 
-**The essence.** Take the old version and the new version of a state machine.
-Start both from the same origin. Feed both the same inputs. Diff *everything*
-they do — the state they hold (snapshots), the inputs they generate, the
-outputs they emit. Attribute every difference to the code change that caused
-it. Confirm that the attributed set is exactly what the developer intended.
-This spec is the system, tooling and procedure that make that loop
+**The essence — diff replay.** Take the old version and the new version of a
+state machine. Start both from the same origin. Feed both the same inputs.
+Diff *everything* they do — the state they hold (snapshots), the inputs they
+generate, the outputs they emit. Attribute every difference to the code change
+that caused it. Confirm that the attributed set is exactly what the developer
+intended. This spec is the system, tooling and procedure that make that loop
 well-defined and complete (§4).
 
+> **Diff replay** (n.): replaying the same input — a snapshot plus a log span
+> — on different FSMs, then comparing the differences in their snapshots,
+> outputs and logs. The name for the technique, the harness that runs it (§6),
+> and the mode of that harness that compares two versions (§6.2).
+
 An application built on UC has no supported way to move its state machine from
-version N to version N+1 other than a flag day, and no tooling to run that
-loop. This spec models the lifecycle, names the failure modes, and proposes
-the platform pieces and one piece of tooling — a **differential replay
-harness** — that make the flag day correct and verifiable.
+version N to version N+1 other than a flag day, and no tooling to run diff
+replay. This spec models the lifecycle, names the failure modes, and proposes
+the platform pieces and one piece of tooling — the **diff replay harness** —
+that make the flag day correct and verifiable.
 
 Five findings drive the design:
 
@@ -77,7 +82,7 @@ The work splits into **three deliverables** (§10 Q5). This spec is the first.
   history (§2.5, §10 Q7); origin pinning — `uc2ctl upgrade pin`, the cnc origin
   words, unconditional install at attach, attach refusal (§3 S4, §10 Q2); the
   artifact envelope's version stamp (§9.1).
-- **Tooling**: a differential replay harness — corpus format, three modes,
+- **Tooling**: the diff replay harness — corpus format, three modes,
   black-box execution (§6) — and a skill that drives it (§8).
 
 Everything here is **codec-agnostic**: the pin does not read the payload, the
@@ -477,7 +482,7 @@ fix — the pin also halting apply at P — costs a check in the apply hot loop,
 which the 2.11.0 regression record argues against paying for a window this
 size. Recorded as a limit; revisit if a real deployment finds it matters.
 
-### S5 — Verify differentially: diff, attribute, confirm
+### S5 — Diff replay: diff, attribute, confirm
 
 The §4.1 loop, as a procedure:
 
@@ -593,9 +598,14 @@ Inputs are identical for both versions by construction — except the two an FSM
 become inputs, and a difference there changes what the FSM sees next, not only
 what it emits. They are filed under inputs for that reason.
 
+In the §0 definition's words — *snapshots, outputs, logs* — the mapping is:
+**snapshots** = the state class; **outputs** = the outputs class; **logs** =
+the generated inputs, since what an FSM schedules and mints is what it writes
+back toward the log.
+
 Commands that exist only in v_new (§5.5) are inputs v_old never receives; they
-are verified by v_new-only runs against declared expectations, not by the
-differential.
+are verified by v_new-only runs against declared expectations, not by diff
+replay.
 
 **On the two state views.** The projection is thorough and O(state); the
 probe queries are cheap and partial, and cover only the *intersection* of the
@@ -834,7 +844,7 @@ first worked example of a projection.
 
 ---
 
-## 6. Tooling: the differential replay harness
+## 6. Tooling: the diff replay harness
 
 One machine, three configurations. Building it as one tool rather than two
 avoids two comparison implementations drifting apart.
@@ -863,7 +873,7 @@ from position 0. That makes the harness cheaper as well as more honest.
 
 That the determinism check falls out as a degenerate case is the main argument
 for this shape. It also makes [#38]'s item 2 (a determinism *lint*) largely
-redundant: a runtime differential is strictly stronger, because a lint can
+redundant: diff replay at runtime is strictly stronger, because a lint can
 enumerate `SystemTime::now()` but can never catch "this version mints a
 different number of ids".
 
