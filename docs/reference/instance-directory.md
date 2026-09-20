@@ -15,7 +15,7 @@ The directory path is passed to `Node::start` and to every `uc2ctl` invocation.
 | `journal/` | node | Segmented durable log (`uc_journal`). Survives restarts; the source for replay and purge. |
 | `state/` | node | Raft durables, held as `StableValue`s: vote, term map, output progress, snapshot floor, and the config record. These five are exactly `backup`'s `STATE_FILES` checklist. All five are **node data** under the cluster FSM's line (2.11.0): local, never replicated, never snapshotted. `config.state` is the one that looks like an exception and is not — it is the consensus kernel's *durable-time* membership shadow, a different reader at a different time base from the cluster FSM's committed view ([the cluster FSM explainer](../notes/uc2-cluster-fsm-explained.md)). There is **no** `schedules.state`: the schedule table is cluster data and lives in the cluster FSM's artifact. |
 | `snapshots/<id>/` | service and node | `snap-<pos>.ultsnap` artifacts for FSM `id`, one directory per declared id since M14. The service builds them; the node ships, installs and **deletes** them. `<pos>` is the absolute log byte position the snapshot represents — an **exclusive** frontier since coordinated instants (2.11.0): the image covers every frame strictly below it. Every file starts with a 16-byte UC envelope (below). A receiver's in-flight download sits beside them as `incoming-<pos>.part`, pre-sized and renamed into place as the contiguous frontier passes its end; an abandoned intake's part files are unlinked. |
-| `snapshots/cluster/` | node (`uc2-cluster` agent) | `snap-<pos>.ultcluster` — the **cluster FSM's** artifact (2.11.0): membership, the schedule table and the settings record as of `<pos>`, with a `UCCLUST1` magic, an image version and a trailing CRC32. Written by the node itself, not by a service, and shipped on the snapshot session under the reserved `service_id = 255` so a below-floor joiner installs it before its floor advances. Also what `uc2ctl schedule show`, `uc2ctl settings show` and `uc2ctl status`'s `schedule_position=` read. Retention is the node's, as it is for every row (below); the second-newest is what you fall back to if the newest is corrupt. |
+| `snapshots/cluster/` | node (`uc2-cluster` agent) | `snap-<pos>.ultcluster` — the **cluster FSM's** artifact (2.11.0): membership, the schedule table, the settings record, and, since `2.13.0` (image version `2`), each row's upgrade-pin history (at most 4 events) and any collected snapshot hash reports, all as of `<pos>`, with a `UCCLUST1` magic, an image version and a trailing CRC32. Written by the node itself, not by a service, and shipped on the snapshot session under the reserved `service_id = 255` so a below-floor joiner installs it before its floor advances. Also what `uc2ctl schedule show`, `uc2ctl settings show`, `uc2ctl upgrade show` and `uc2ctl status`'s `schedule_position=` read. Retention is the node's, as it is for every row (below); the second-newest is what you fall back to if the newest is corrupt. |
 | `ingress.ring` | clients → node | MPSC submit ring. Per-record commit format (`ULTRNG2` magic) since 2.7.0. |
 | `query.ring` | clients → node | Query submissions, both linearizable and snapshot reads. Payload is `service_id: u8` — which FSM answers (M14) — followed by the query bytes; same record framing as `ingress.ring`. |
 | `svc_query.<id>.ring` | node → service | Forwarded queries for FSM `id`. One per declared id since M14. |
@@ -25,6 +25,7 @@ The directory path is passed to `Node::start` and to every `uc2ctl` invocation.
 | `service.<id>.lock` | service | Exclusive `flock`, held for FSM `id`'s service process's life — one process per declared id (M14). |
 | `schedules.pending` | admin client → node | The staged schedule table `uc2ctl schedule apply` writes (mode `0600`, fsync, rename) before sending the admin request that carries its digest. Transient: the node reads it, checks the digest, and **deletes it after a successful append**. A refused or timed-out apply leaves it in place so a retry needs nothing re-staged. Present only between a stage and a successful apply. |
 | `settings.pending` | admin client → node | The same, for `uc2ctl settings apply` (2.11.0): the encoded settings record — 33 bytes since `2.12.0` (`SETTINGS_LEN`, version 2), 29 through `2.11.0` and still accepted on read — staged and digested identically. |
+| `upgrade.pending` | admin client → node | The same, for `uc2ctl upgrade pin` (2.13.0): the encoded 20-byte `UpgradePin` record (`UPGRADE_PIN_LEN`) — staged and digested identically; the admin line itself carries only the 10-byte digest addressing, not the record. |
 | `audit.jsonl` | node | Append-only record of every admin request this node answered, one JSON line each, fsynced before the answer is published. One exception: a byte-identical re-send of an already-answered, already-recorded proposal (same nonce) is counted, not re-recorded — it repeats an answer already in the file rather than being a new admin event. Never rotated or truncated by the node. See [Change cluster membership](../how-to/change-cluster-membership.md). |
 
 Since M14, the per-service files are named by id: `svc_query.<id>.ring` and
@@ -82,6 +83,15 @@ have had a per-row pruner delete the artifact at the floor, and the ship gate
 — "the complete set at my floor" — would then decline every joiner
 `missing artifact` forever. The node never writes an artifact; it only ever
 deletes one it can prove is superseded.
+
+**Since `2.13.0`, a pinned origin's set is exempt.** If any row carries an
+`uc2ctl upgrade pin`, its newest pin's `origin` position is read from the
+committed cluster view once per retention pass and excluded from deletion at
+every row (including `snapshots/cluster/`), even below the persisted floor —
+because a below-floor joiner attaching to that row must still be able to
+install the pinned set. Pinning a position therefore holds its whole
+snapshot set indefinitely, on every node, until the pin is superseded by a
+newer one for the same row.
 
 ## Durability classes
 

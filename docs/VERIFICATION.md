@@ -306,6 +306,22 @@ actually related, so a scenario can prove it was not vacuous
 (`inv12_the_cluster_fsms_membership_is_a_committed_prefix_of_the_kernels`
 asserts a non-zero count).
 
+The schedule table, the settings record and, since `2.13.0`, the upgrade
+pin and snapshot report are cluster-FSM data the sim cannot reach for the
+same reason (it has no cluster-FSM frames at all), so their correctness is
+unit-tested in-crate instead: `cluster_fsm.rs`'s
+`pin_refusals_are_replicated_state_only`,
+`pin_history_is_bounded_per_row`,
+`a_report_is_held_newest_per_row_and_a_stale_one_is_refused`,
+`pins_and_reports_ride_the_image_and_an_old_image_installs_empty` and
+`the_view_publishes_pins_and_reports` cover the replicated half (validation,
+the bounded history, the image round-trip and the view republish); `node.rs`'s
+`upgrade_pin_door_refusals_by_name`,
+`an_upgrade_pin_is_appended_as_a_cluster_frame_and_the_words_follow_at_commit`,
+`upgrade_pin_is_single_in_flight_on_the_view_position` and
+`retention_keeps_every_pinned_origin` cover the door half and the
+retention exemption.
+
 **The red twin, and an honest note about what it pins.**
 `counterfactual_kernel_on_the_committed_view_is_caught_by_inv6_the_durable_time_oracle`
 (behind `mutation-testing`) feeds the kernel from the **committed** view — the

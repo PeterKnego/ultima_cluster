@@ -342,6 +342,37 @@ codec is replaced.
 
 ### 2.5 The version is an input, and it is not in the log
 
+#### Errata (plan B1, as built)
+
+1. **Refusal numbers 52–59, not 51–54.** `51` was already taken by
+   `schedule_too_large`. Beyond the four this section drafted, plan B1 added
+   three staged-file codes — `56` `pin_digest`, `57` `pin_missing`, `58`
+   `pin_decode` — and one for `SnapshotReport` itself, `59` `report_stale`.
+2. **The pin rides a staged file (`upgrade.pending`), not the admin line.**
+   `uc2ctl upgrade pin` writes the 20-byte `UpgradePin` record to
+   `<instance_dir>/upgrade.pending` (mode `0600`, fsync, rename) — exactly
+   `settings apply`'s pipeline — and the admin request itself carries only a
+   10-byte digest of it, not the record.
+3. **The cnc words land on the status line, not "the row's cnc slot line
+   7".** `upgrade_origin` (`+16`) and `pinned_version` (`+24`) are two new
+   words on the row's **service status line** (cnc 3.3): line 7 has exactly
+   one free word left after `log_time_ns`/`timers_pending`/`freeze_ns`, one
+   short of the two a pin needs.
+4. **`pin_no_set` accepts only this node's NEWEST complete set
+   (`uc2_snapshot_set_position`), not any retained set.** Retention is
+   delete-only, so an older set can vanish between the door check and the
+   command's commit; the newest cannot, because retention now keeps a
+   row's pinned origin exempt from pruning.
+5. **`uc2ctl upgrade pin` takes an optional `--from`.** Absent, it reads the
+   row's attached version word off the local cnc page and refuses locally,
+   before staging anything, if that word is `0`.
+6. **`SnapshotReport` has one refusal of its own, `59` `report_stale`**, so
+   "accepted" always means "state changed."
+7. **`ClusterFsm::VERSION` stays `1`.** It is the cluster image's own
+   on-disk layout version (`CLUSTER_IMAGE_VERSION = 2`, since this flag
+   day) that gates artifact compatibility, not the FSM identity version a
+   user's state machine declares.
+
 The state at position Q is not a function of the log prefix `[0,Q]`. It is a
 function of
 

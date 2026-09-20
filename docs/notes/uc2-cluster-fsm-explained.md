@@ -2,9 +2,13 @@
 
 *Written 2026-09-06 for the cluster-FSM work (plan 1); extended 2026-09-07
 with the "Instants" section below when plan 2 (coordinated and standby
-snapshot instants, §5) landed. Release on hold. Spec:
+snapshot instants, §5) landed; extended again 2026-09-20 with "Pins and
+reports" when the FSM upgrade lifecycle (plan B1) took `CLUSTER` kinds 4 and
+5. Release on hold. Spec:
 `docs/superpowers/specs/2026-09-05-uc2-cluster-fsm-and-coordinated-snapshot-design.md`
-— this note carries §2–§5's argument in plain language.*
+— this note carries §2–§5's argument in plain language; the FSM upgrade
+lifecycle's own spec is
+`docs/superpowers/specs/2026-09-19-uc2-fsm-upgrade-lifecycle-design.md`.*
 
 ## The problem in one sentence
 
@@ -397,13 +401,124 @@ are not on disk.
 operator tells it to, not when the learner finishes. Making it automatic needs
 the learner's "complete at P" to be visible cluster-wide, and the honest
 channel for that is a cluster-FSM command the leader appends on the learner's
-behalf — a fourth kind, and a design of its own. Aeron's open-source half
+behalf — a further kind (kinds `4` and `5` are since spoken for, § Pins and
+reports below), and a design of its own. Aeron's open-source half
 defers it the same way: there, a member replicates a standby snapshot when an
 operator flips a toggle. The trade is stated rather than hidden: you do not
 pay the freeze on voters, and in exchange a voter's purge floor waits for you.
 
 *Timezones and cron.* Still out, and still the schedule table's business, not
 the snapshot instant's — an instant is a byte position, not a time.
+
+## Pins and reports (2.13.0)
+
+The cluster FSM's third data kind (spec §2.5, plan B1) is the first one that
+is not "the current state of X". Membership, the schedule table and settings
+are all **overwritten records**: applying a new one replaces the old one, and
+the FSM only ever needs to hold the latest. An FSM upgrade needs the opposite
+— what happened, in what order — which is why it gets two new `CLUSTER`
+kinds instead of a fourth field on Settings.
+
+**`UpgradePin` is an event, not a setting.** "At position `origin`, row `row`
+went from `from` to `to`" names a fact about history, not a tunable an
+operator dials: the whole point is the *sequence*, so a fresh pin never
+overwrites the last one, it is appended after it. The FSM keeps a **per-row
+history of at most 4** such events — enough for `uc2ctl upgrade show` to
+print a trail without the state growing without bound — and republishes the
+newest one into the row's cnc status line on every view publish, the same
+edge every other cnc word rides.
+
+**Why a pin exists at all.** A pin names the coordinated snapshot instant
+(`origin`, a `SNAPSHOT` frame's own END position — see [Instants](#instants-one-position-one-set)
+above) whose complete set a row should install the next time it attaches,
+rather than tail-replaying the log from wherever it last left off. That
+matters exactly when tail-replay would be unsound: a state machine whose
+`apply` logic changed between `from` and `to` cannot be trusted to reproduce
+`to`'s state by re-applying `from`'s history, so the pin is what lets a
+restarting service skip straight to a verified snapshot instead. (What
+*acts* on a pin at attach time — the unconditional install and its attach
+refusal — is plan B2's job, not this one; this plan only gets the fact
+recorded, replicated and observable.)
+
+**The refusals split at the door, on purpose.** Nine numbers, `52`–`59`,
+cover this feature (`51` was already `schedule_too_large`). Three checks read
+inputs that are this node's own, never the FSM's, and so are refused **at
+the door** — in `Consensus::apply_upgrade_pin`, before anything is proposed
+— rather than round-tripping to commit only to fail there identically on
+every node:
+
+| reason | name | checked | why it is node-local |
+|---|---|---|---|
+| 52 | `pin_row_undeclared` | door | `row` must be one *this* node declares (`[services] names`'s length) |
+| 53 | `pin_from_mismatch` | door (no pin yet) **or** replicated (a pin exists) | with no history for the row, `from` is checked against the row's own **attached version word** on the cnc page — a purely local read; once a pin exists, the FSM checks `from` against its own last-recorded `to` instead, which is replicated state every node computes identically |
+| 54 | `pin_no_set` | door | `origin` must equal *this node's* newest complete set (`uc2_snapshot_set_position`) — see below for why "newest", not "any retained" |
+| 55 | `pin_not_monotone` | replicated | a new pin's `origin` must be strictly greater than the row's last one — the FSM's own check, since only it knows the history |
+| 56 | `pin_digest` | door | the staged `upgrade.pending` file changed between staging and applying |
+| 57 | `pin_missing` | door | no staged file on this node |
+| 58 | `pin_decode` | door | the staged file is not a 20-byte `UpgradePin` record |
+| 59 | `report_stale` | replicated | a `SnapshotReport` below the row's held report position |
+
+The door reads are **advisory**, not authoritative: `to_state()` can pair a
+freshly-read `applied` position with pins that are a tick stale, so a door
+check can occasionally miss a case the FSM would have caught. That never
+makes an unsound pin *accepted* — every node re-runs the replicated half
+(53's existing-pin case, 55) at apply, so a command that slips past a stale
+door check is simply refused a moment later, identically everywhere, with
+`55` instead of a door number. The three-way split exists to make the common
+case (an operator's own mistake) fail fast and locally, not because the door
+is trusted for correctness.
+
+**`pin_no_set` names the newest set, deliberately not "any retained set".**
+Retention is delete-only (above), so the moment a pin is accepted its
+`origin` becomes exempt from pruning at every row — but *before* that
+moment, an older complete set can vanish out from under a check-then-commit
+race: the door reads `uc2_snapshot_set_position` (this node's newest), the
+retention sweep runs, and by the time the command would commit an older set
+named at the door is gone. The newest set cannot be pruned out from under
+you this way, because nothing is newer to make it the not-newest, which is
+why `pin_no_set` accepts only it.
+
+**The cnc words, and why the write order is not incidental.** The pin
+republishes onto the row's service status line as two new words, `+16`
+`upgrade_origin` and `+24` `pinned_version` — not slot line 7, which after
+`log_time_ns`/`timers_pending`/`freeze_ns` has exactly one free word left,
+one short of the two a pin needs. `upgrade_origin == 0` is "no pin", the
+gate every reader checks first; the node-side writer
+(`ServiceStatusLine::store_pin`) stores `pinned_version` **before**
+`upgrade_origin`, both with `Release` ordering, so a reader that observes a
+non-zero `upgrade_origin` is guaranteed to see the version that goes with
+it, never a half-published pin. Reading them in the opposite order would let
+a reader see a fresh `origin` paired with the *previous* pin's version for
+one publish.
+
+**`SnapshotReport` holds observations, not a verdict.** `(row, position,
+hashes: Vec<(node_id, hash)>)` is everything the leader collected for one
+`(row, position)` pair — 1 to 8 entries, node ids strictly increasing so
+identical observations always encode identically. The three-way reading
+(all equal / a majority names a minority / no majority at all) is
+[`verdict`](../../uc_protocol/src/v2/upgrade.rs), a **pure function** every
+reader recomputes from the stored hashes, not a field carried in the FSM's
+own state — the same reasoning as `uc2ctl upgrade show`'s history print:
+store what was observed, derive what it means, so two readers can never
+disagree about the derivation itself, only about which bytes they read.
+
+**The N = 2 case is not a bug.** With exactly two reporters disagreeing,
+neither hash is held by *strictly more than half*, so `verdict` reports
+`agreed: false, majority_hash: None, minority: []` — no verdict, not "one
+of them is wrong." A human reading `uc2ctl upgrade show`'s
+`hash_verdict=NO_MAJORITY nodes=2` output could easily read that as a
+missing feature; it is the correct answer to "which one is the majority"
+when there isn't one. A three-reporter cluster (or any odd count) is what
+lets 2-of-3 actually name the minority.
+
+**Until plan B3, nothing produces a report.** This plan gives
+`SnapshotReport` its wire kind, its codec, its FSM state, its refusal, its
+gauge and its `uc2ctl upgrade show` rendering — the whole replicated and
+observable half. No node yet computes a per-node artifact hash or appends
+the `CLUSTER kind = 5` command that would carry one; that is spec §6.5.2
+items 1–3, left to plan B3. Until then `uc2ctl upgrade show` prints nothing
+under `hash_verdict=` for any row, which is the correct behaviour for a
+feature whose producer has not shipped yet, not a defect in this plan.
 
 ## What plan 1 did not do, and plan 2 did not either
 
@@ -432,3 +547,10 @@ path the spec left to a phase 2.
   and their refusals.
 - [Monitor a cluster § The snapshot families](../how-to/monitor-a-cluster.md#the-snapshot-families-2110)
   — the eight families, the three alerts, and the records.
+- [`uc2ctl` § `upgrade pin` / `upgrade show`](../reference/uc2ctl.md#upgrade-pin)
+  — the refusals by name, and how to read a pin's history.
+- [Monitor a cluster § The log clock and the timer families](../how-to/monitor-a-cluster.md#the-log-clock-and-the-timer-families-2110)
+  — `uc2_upgrade_pin_origin`/`_version`, `uc2_snapshot_hash_mismatch` and
+  `Uc2SnapshotHashDiverged`.
+- `docs/superpowers/specs/2026-09-19-uc2-fsm-upgrade-lifecycle-design.md`
+  §2.5 — the FSM upgrade lifecycle's own spec, with its as-built errata.
