@@ -122,7 +122,7 @@ Fields within a slot (each its own 64 B line, one writer):
 | 0 | `status` (line 0, word 0) — `service_id` (bits 0..8) \| attached (bit 8) \| **snapshot-capable (bit 9)** \| incarnation (bits 32..64) | service, at attach / clean detach |
 | 8 | `version` (line 0, word 1) — packed FSM version (low 32 bits); `0` = unversioned/absent | service, at attach (cnc 3.1, FSM identity) |
 | 16 | `upgrade_origin` (line 0, word 2) — u64, the row's pinned origin position; `0` = no pin | **node** (`uc2-cluster` agent), republished on every view publish — cnc 3.3, FSM upgrade lifecycle |
-| 24 | `pinned_version` (line 0, word 3) — u64, low 32 = packed version the pin names | **node** (`uc2-cluster` agent), stored BEFORE `upgrade_origin` — cnc 3.3 |
+| 24 | `pinned_version` (line 0, word 3) — u64, low 32 = packed version the pin names | **node** (`uc2-cluster` agent), stored BEFORE `upgrade_origin` (see the ordering note below) — cnc 3.3 |
 | 64 | `applied` | service apply agent |
 | 128 | `epoch` | service, `fetch_add` at attach |
 | 192 | `output_completed` | service output agent |
@@ -140,7 +140,16 @@ at 0 with the node. Line 0 (`status`/`version`) breaks the "one writer per
 line" pattern first (cnc 3.3): the service still owns `status`/`version` at
 attach/detach, but `upgrade_origin`/`pinned_version` are node-written,
 republished by the `uc2-cluster` agent on every view publish — a second
-writer on the line, each word still with exactly one writer. Line 7
+writer on the line, each word still with exactly one writer. The pin pair
+is stored version-first, origin-last, both `Release`. That is enough to make
+the **first** pin consistent for a reader that loads each word once: a
+non-zero `upgrade_origin` implies its `pinned_version` is already visible.
+It is **not** enough for a **re-pin** — a reader can interleave with the
+second store and see the old origin beside the new version — so a reader
+must load the origin, the version, then the origin again and retry if it
+moved. `uc_log::cnc::ServiceStatusLine::pin` does exactly that, and every
+reader (`/metrics`, `uc2ctl status`, and the service's attach) uses it.
+Line 7
 (`name`/`identity_hash`) breaks the "one writer per line, and it's the
 service" pattern the other six lines follow: it is
 written once by the **node** at boot, before any service attaches, from

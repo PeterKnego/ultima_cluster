@@ -367,8 +367,18 @@ pub const CNC_SVC_OFF_VERSION: usize = 8;
 /// attach (plan B2): a non-zero origin whose version equals its own
 /// `VERSION` means "install `snap-<origin>` unconditionally"; a version
 /// that differs is an attach refusal.
+///
+/// The writer stores `pinned_version` first and `upgrade_origin` last, both
+/// `Release`. That makes the FIRST pin (`0` -> non-zero origin) consistent
+/// for a reader that loads each word once; it does NOT make a RE-pin
+/// consistent — such a reader can interleave and observe the OLD origin
+/// beside the NEW version. Every reader (`/metrics`, `uc2ctl status`, and
+/// plan B2's attach) must therefore use `uc_log::cnc::ServiceStatusLine::pin`,
+/// which re-reads the origin after the version and retries if it moved.
 pub const CNC_SVC_OFF_UPGRADE_ORIGIN: usize = 16;
 /// Low 32 bits = the packed version the pin names (`identity::pack_version`).
+/// Stored BEFORE `upgrade_origin`; see that constant's doc for why a reader
+/// still needs the double read.
 pub const CNC_SVC_OFF_PINNED_VERSION: usize = 24;
 /// cnc 3.1: line 7 — the row's FSM name, NUL-padded to 32 B, then its hash,
 /// then (time-and-timers) its pending-timer count, then (coordinated-

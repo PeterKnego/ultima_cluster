@@ -489,11 +489,17 @@ unrelated page-1 global word at offset 4048.) `upgrade_origin == 0` is "no
 pin", the
 gate every reader checks first; the node-side writer
 (`ServiceStatusLine::store_pin`) stores `pinned_version` **before**
-`upgrade_origin`, both with `Release` ordering, so a reader that observes a
-non-zero `upgrade_origin` is guaranteed to see the version that goes with
-it, never a half-published pin. Reading them in the opposite order would let
-a reader see a fresh `origin` paired with the *previous* pin's version for
-one publish.
+`upgrade_origin`, both with `Release` ordering. That ordering buys exactly
+one thing: for the **first** pin a row ever gets (`0` → a non-zero origin),
+a reader that loads each word once and sees a non-zero `upgrade_origin` is
+guaranteed to see the version that goes with it. It does **not** cover a
+**re-pin**: a reader can interleave with the second `store_pin` and observe
+the *previous* origin beside the *new* version. Closing that needs a double
+read — load the origin, load the version, load the origin again, and retry
+if it moved, so that a stable origin brackets the version read between the
+two loads. `ServiceStatusLine::pin()` is that read, and every reader
+(`/metrics`, `uc2ctl status`, and plan B2's attach) goes through it rather
+than through the two raw accessors.
 
 **`SnapshotReport` holds observations, not a verdict.** `(row, position,
 hashes: Vec<(node_id, hash)>)` is everything the leader collected for one

@@ -1022,6 +1022,9 @@ fn run_status(a: &StatusArgs) -> anyhow::Result<()> {
             .name()
             .map(|n| n.as_str().to_string())
             .unwrap_or_default();
+        // The pair together: a re-pin can otherwise be read half-old
+        // (`ServiceStatusLine::pin`).
+        let pin = s.status.pin().unwrap_or((0, 0));
         println!(
             "  row={id} name={name} version={} hash=0x{:016x} attached={attached} epoch={} \
              incarnation={incarnation} applied={applied} lag={} snapshot_pos={} \
@@ -1032,8 +1035,8 @@ fn run_status(a: &StatusArgs) -> anyhow::Result<()> {
             commit.saturating_sub(applied),
             s.snapshot_pos.load_acquire(),
             s.identity.timers_pending(),
-            s.status.upgrade_origin(),
-            VersionDisplay(s.status.pinned_version()),
+            pin.0,
+            VersionDisplay(pin.1),
         );
     }
     println!("members:");

@@ -203,8 +203,48 @@ impl ServiceStatusLine {
     pub fn pinned_version(&self) -> u32 {
         self.pinned_version.load(Ordering::Acquire) as u32
     }
-    /// Version FIRST, origin LAST with `Release`: a reader that `Acquire`s
-    /// a non-zero origin sees the version that goes with it.
+    /// The consistent pair, or `None` when the row has no pin.
+    ///
+    /// The two words are stored separately, so a single `Acquire` of each
+    /// is NOT enough on a RE-pin: `store_pin` writes the version first and
+    /// the origin last, which makes `0 -> first pin` safe (a non-zero
+    /// origin implies its version is already visible), but a reader that
+    /// interleaves with a second `store_pin` can still observe
+    /// `(origin = P_old, version = v_new)`. So read the origin, the
+    /// version, then the origin AGAIN: a stable origin across the two
+    /// loads brackets a window in which no `store_pin` completed, and the
+    /// version read inside it is the one that goes with that origin.
+    ///
+    /// Bounded at 8 attempts rather than looping forever: the writer is
+    /// the `uc2-cluster` agent republishing the same pair idempotently on
+    /// every view publish, so it is never a livelock partner — eight
+    /// consecutive re-pins landing inside one read would mean the page is
+    /// being rewritten far faster than a pin can commit. After the bound
+    /// the last pair read is returned; it is the newest version seen with
+    /// a plausible origin, and the next call converges.
+    pub fn pin(&self) -> Option<(u64, u32)> {
+        let mut origin = self.upgrade_origin.load(Ordering::Acquire);
+        for _ in 0..8 {
+            if origin == 0 {
+                return None;
+            }
+            let version = self.pinned_version.load(Ordering::Acquire) as u32;
+            let again = self.upgrade_origin.load(Ordering::Acquire);
+            if again == origin {
+                return Some((origin, version));
+            }
+            origin = again;
+        }
+        if origin == 0 {
+            None
+        } else {
+            Some((origin, self.pinned_version.load(Ordering::Acquire) as u32))
+        }
+    }
+    /// Version FIRST, origin LAST with `Release`. That ordering alone only
+    /// makes the FIRST pin (`0` -> non-zero origin) consistent for a reader
+    /// that loads the two words once; a re-pin needs the double read
+    /// [`ServiceStatusLine::pin`] does, which every reader should use.
     pub fn store_pin(&self, origin: u64, version: u32) {
         self.pinned_version.store(version as u64, Ordering::Release);
         self.upgrade_origin.store(origin, Ordering::Release);
@@ -1912,6 +1952,22 @@ mod tests {
         assert_eq!(
             page.service_slot(1).status.upgrade_origin(),
             0,
+            "slots are independent"
+        );
+    }
+
+    #[test]
+    fn pin_reads_the_pair_together_across_a_repin() {
+        let page = CncPage::heap(&test_meta());
+        let s = &page.service_slot(2).status;
+        assert_eq!(s.pin(), None, "no pin at init");
+        s.store_pin(8192, 0x0102_0003);
+        assert_eq!(s.pin(), Some((8192, 0x0102_0003)));
+        s.store_pin(9000, 0x0102_0004);
+        assert_eq!(s.pin(), Some((9000, 0x0102_0004)));
+        assert_eq!(
+            page.service_slot(1).status.pin(),
+            None,
             "slots are independent"
         );
     }

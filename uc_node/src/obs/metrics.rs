@@ -405,6 +405,9 @@ fn service_rows(s: &ObsSources, commit: u64, now: u64) -> Vec<ServiceRow> {
         let (freeze_max_ns, freeze_sum_ns, freeze_count) = s
             .snapshot_freeze
             .observe_row(id as usize, slot.identity.freeze_ns());
+        // The pair together: a re-pin can otherwise be read half-old
+        // (`ServiceStatusLine::pin`).
+        let pin = slot.status.pin().unwrap_or((0, 0));
         let hash_mismatch = inner
             .reports
             .iter()
@@ -430,8 +433,8 @@ fn service_rows(s: &ObsSources, commit: u64, now: u64) -> Vec<ServiceRow> {
             freeze_max_seconds: freeze_max_ns as f64 / 1e9,
             freeze_sum_seconds: freeze_sum_ns as f64 / 1e9,
             freeze_count,
-            upgrade_origin: slot.status.upgrade_origin(),
-            pinned_version: slot.status.pinned_version() as u64,
+            upgrade_origin: pin.0,
+            pinned_version: pin.1 as u64,
             hash_mismatch,
         });
     }
