@@ -1,14 +1,17 @@
 # FSM upgrade lifecycle — design
 
-**Status:** draft for maintainer review, revision 2. **Date:** 2026-09-19.
-**Tree:** worktree `fsm-upgrade-lifecycle`, branched from `main` @ `47e74e4` (UC 2.12.0).
+**Status:** revision 3 — open questions **decided** 2026-09-20 (§10); ready
+for the maintainer's read-through before planning. **Dates:** drafted
+2026-09-19, decisions 2026-09-20.
+**Tree:** worktree `fsm-upgrade-lifecycle`, branched from `main` @ `47e74e4`
+(UC 2.12.0).
 
 Companion documents that already exist and that this spec amends rather than
 replaces: `docs/reference/application-sdlc.md` (the written standard, whose §5
 is currently a promissory note), `docs/how-to/upgrade-an-application.md` (the
 flag-day procedure), `.superpowers/SBE vs serde+bincode 2 — Handover Doc.md`
 (the codec comparison this spec's §5.7 responds to), and issues [#33], [#36],
-[#38], [#41], [#42], [#31].
+[#38], [#41], [#42], [#31], [#49].
 
 ---
 
@@ -17,8 +20,9 @@ flag-day procedure), `.superpowers/SBE vs serde+bincode 2 — Handover Doc.md`
 An application built on UC has no supported way to move its state machine from
 version N to version N+1 other than a flag day, and no tooling to tell it
 whether that flag day is safe. This spec models the lifecycle, names the
-failure modes, and proposes one piece of tooling — a **differential replay
-harness** — that addresses most of them at once.
+failure modes, and proposes the platform pieces and one piece of tooling — a
+**differential replay harness** — that make the flag day correct and
+verifiable.
 
 Five findings drive the design:
 
@@ -41,33 +45,61 @@ Five findings drive the design:
    queries.
 5. **The default codec silently misparses across versions in 5 of 12 measured
    shapes, and 4 of those 5 are UC's own missing length check** (§2.4,
-   Appendix A — measured, not asserted).
+   Appendix A — measured, not asserted). The maintainer's decision is to
+   **replace the codec** (§10 Q6), which is its own deliverable.
+
+The decisions of 2026-09-20 are collected in §10; the sections below are
+written to them.
 
 ---
 
 ## 1. Scope
 
-### 1.1 In scope (this spec)
+The work splits into **three deliverables** (§10 Q5). This spec is the first.
 
-- A stage model for taking an FSM from version N to N+1 (§3).
+### 1.1 Deliverable 1 — this spec: make the flag day correct and verifiable
+
+- The **row** — one FSM slot — is the unit of every stage (§10 Q4).
+- A stage model for taking a row from version N to N+1 (§3).
 - The comparison surface that decides whether an upgrade is correct (§4).
-- Conventions the platform should mandate and document (§5).
-- A differential replay harness: corpus format, three modes, black-box
-  execution (§6).
-- A skill that drives the harness and interprets its output (§8).
-- Two separable platform defects found while writing this (§9.1).
+- Conventions the platform mandates and documents (§5).
+- **Platform pieces**: the `UpgradePin` cluster record and per-row version
+  history (§2.5, §10 Q7); origin pinning — `uc2ctl upgrade pin`, the cnc origin
+  words, unconditional install at attach, attach refusal (§3 S4, §10 Q2); the
+  artifact envelope's version stamp (§9.1).
+- **Tooling**: a differential replay harness — corpus format, three modes,
+  black-box execution (§6) — and a skill that drives it (§8).
 
-### 1.2 Named second phase (same spec, later work)
+Everything here is **codec-agnostic**: the pin does not read the payload, the
+harness compares bytes and query answers, the taxonomy is about shapes of
+change. Deliverable 1 can ship with bincode still in place.
+
+**This deliverable is a UC flag day.** A new `CLUSTER` kind is not additive —
+[#31] records that an old node refuses an unknown kind with 42 while `applied`
+still advances, so a mixed cluster diverges silently. Stop every node, start
+every node; a `2.13.0`, shipped the way every feature since 2.11.0 has been.
+The new cnc words *are* additive under the "reads 0 as absent" rule.
+
+### 1.2 Named second phase of deliverable 1
 
 - `Shadow<Old, New>` and the learner shadow deployment (§7).
 
-### 1.3 Out of scope (Track 2 — separate spec)
+### 1.3 Out of scope for this spec
 
-- The committed application level and the live-commit version gate ([#33],
-  shaped like [#31]'s wire level). This spec assumes the flag-day posture and
-  is designed to be useful under it; §9.2 states what remains unsolved.
-- Node-level rolling upgrades ([#31] proper).
-- Leadership transfer.
+- **Deliverable 2 — the typed-over-SBE tier** (§10 Q3, Q6). Replacing
+  bincode is an SDK redesign with its own concerns: generator maturity,
+  re-measuring the hop cost after the 2.11.0 apply-loop changes, migrating
+  `examples/counter`, `uc_lincheck::RegisterSm` (and so the lin capstones and
+  the crashtest service), and whatever the remote protocol touches. It gets
+  its own spec. This spec *assumes* it: §5.1 and §5.7 are written to the SBE
+  header and say so.
+- **Deliverable 3 — [#49]**, the `bytes_read` length check. Ships alone, now,
+  as the interim fix for the tier that exists today; moot once deliverable 2
+  lands, which is exactly why it should not wait.
+- **Track 2** — the committed application level and the live-commit version
+  gate ([#33], shaped like [#31]'s wire level). §9.2 states what remains
+  unsolved without it.
+- Node-level rolling upgrades ([#31] proper); leadership transfer.
 
 ### 1.4 Explicit non-goal: faithful replay from genesis
 
@@ -137,8 +169,8 @@ freeze at P; a node holds the complete set at P when every row's
 `snap-<P>.ultsnap` plus `snapshots/cluster/snap-<P>.ultcluster` exist. That set
 is committed by construction. It is exactly the pinned origin an upgrade needs.
 
-What is missing is any mechanism that *makes* a new-version service start from
-it.
+What was missing is any mechanism that *makes* a new-version service start from
+it. §3 S4 is that mechanism.
 
 ### 2.3 What UC does today — verified
 
@@ -183,18 +215,28 @@ silently. Heterogeneous journal history across a fleet is the normal condition
 of any long-lived cluster, because nodes get replaced — so both paths are
 typically live at once.
 
+**There is a third path the gap guard also gets wrong**, and it is the one that
+decided §10 Q2. A **durable** state machine — one whose `last_applied()` is
+non-`None` on attach, a shape the SDK explicitly supports (`traits.rs`
+documents under-reporting as safe and over-reporting as refused at attach,
+which only makes sense for a persisted value) — stopped at `X > P` sees
+`first > X` as false whether or not the journal is purged, and simply
+**continues from X**, carrying v_old's state for `(P, X]` while its fresh
+peers compute `(P, X]` under v_new. Each node's X differs, because "stop every
+service" stops each wherever it is. Purging to P does nothing for this case.
+
 Genesis replay is faithful **iff exactly one version has ever applied that
 span**. That is true for a never-upgraded cluster and false forever after.
 Per §2.5, UC cannot currently tell the two cases apart.
 
-> **Evidence status.** The code path above is read and quoted. The resulting
-> divergence is **not yet experimentally demonstrated** — building that
-> demonstration is §6.2's `reconstruction` mode, and it is the harness's first
+> **Evidence status.** The code paths above are read and quoted. The resulting
+> divergences are **not yet experimentally demonstrated** — that demonstration
+> is §6.2's `reconstruction` mode, part 1, and it is the harness's first
 > teeth-check.
 
 This also makes [#36] (a service restart is silent about how it reconstructed)
 load-bearing rather than cosmetic: it is precisely the observation needed to
-tell path A from path B.
+tell the paths apart.
 
 ### 2.4 The change taxonomy
 
@@ -218,6 +260,13 @@ from `application-sdlc.md`, which jumps from "write a design note" to
 | New or repurposed timer id | yes (log-derived pending set) | v_new inherits v_old's in-flight timers | yes | no |
 | Changed number of `ids()` calls on an existing path | yes | **silent id-stream divergence** | yes | no |
 | Adding `SnapshotStateMachine` to a row that lacked it | capability flag | flips `CNC_SVC_STATUS_SNAPSHOT_CAPABLE`; changes the leader's instant refusal (48) | — | n/a |
+
+The codec rows describe the **bincode** tier as shipped. Under deliverable 2
+(typed-over-SBE, §5.7) the first five rows change character: appended fields
+and appended variants become *decodable* by a newer FSM under `sinceVersion`
+semantics and *refused by name* by an older one; mid-enum insertion and
+reordering become schema-tool errors rather than runtime hazards. The table
+should be re-derived when that spec lands.
 
 Two rows deserve expansion because they are invisible to ordinary testing.
 
@@ -246,7 +295,8 @@ let (cmd, _) = bincode::serde::decode_from_slice::<S::Command, _>(cmd, standard(
 `decode_from_slice` does not require consuming the buffer. **Four of the five
 silent misparses leave `bytes_read < cmd.len()`** and would become the intended
 fail-stop under a length check. Only case E (field reorder) is byte-identical
-and survives it. See §9.1 for the fix.
+and survives it. That check is [#49], deliverable 3 — the interim fix until the
+codec is replaced.
 
 ### 2.5 The version is an input, and it is not in the log
 
@@ -279,14 +329,34 @@ Two concrete consequences, both verified:
   distinguish "genesis replay is faithful here" from "genesis replay computes a
   counterfactual" (§2.3).
 
-**The proposal.** Record the version change as a committed frame — a
-`FRAME_TYPE_CLUSTER` record, the same shape the cluster FSM already uses for
-Settings — carrying `(position, row, old_version, new_version)`. Then:
+**Decided (§10 Q7): the `UpgradePin` cluster record.** A new `CLUSTER kind =
+4`, carrying `row: u8 ‖ reserved [u8; 3] ‖ from: u32 ‖ to: u32 ‖ origin: u64`
+(20 bytes). It is an *event*, not a tunable — "at position `origin`, row `r`
+went from `from` to `to`" — which is why it is its own kind and not a Settings
+field: Settings holds current values and an apply replaces them, whereas §2.5's
+whole point is that the *sequence* matters.
 
-- the upgrade origin P is **committed data**, not an operator note;
-- a node can **refuse** to reconstruct across a span whose recorded version is
-  not its own, which is what turns §2.3's wrong path from silent into named;
-- the artifact's provenance becomes checkable against the log.
+- **Leader-only, single-in-flight** with the other three kinds (already the
+  rule). Refused unless the complete set at `origin` exists on the leader.
+- **Cluster FSM state**: a small bounded per-row history of
+  `(origin, from, to)` — 8 rows × a handful of entries, since retention keeps
+  only a couple of sets. It rides the cluster artifact under `service_id =
+  255`, so a below-floor joiner holds the pin **before** its service attaches.
+  That ordering is automatic and it is the one that matters.
+- **Applied at commit** by `uc2-cluster`, which writes the row's
+  `upgrade_origin` (u64) and `pinned_version` (u32) words to the row's cnc slot
+  line. Additive: 0 = no pin.
+- `uc2ctl upgrade pin --row r --to <ver> --origin P`; `uc2ctl upgrade show`;
+  audited as `upgrade_pin`; gauges `uc2_upgrade_pin_origin{row}` and
+  `uc2_upgrade_pin_version{row}`.
+- **Refusals 51–54, by name**: `pin_row_undeclared`, `pin_from_mismatch`
+  (`from` ≠ the row's current pinned/attached version), `pin_no_set` (no
+  complete set at `origin`), `pin_not_monotone` (`origin` ≤ the row's current
+  pin).
+
+With the pin history in the cluster FSM, "which version built `snap-<P>`?" is
+answerable for any retained artifact: the pin in effect at P. §9.1 adds the
+envelope stamp that lets the artifact answer it for itself.
 
 **What this deliberately does not buy:** faithful genesis replay. Even with a
 complete version history in the log, replaying `[0,Q]` correctly would require
@@ -298,7 +368,9 @@ impossible path possible.
 
 ## 3. The lifecycle
 
-Nine stages. Each names its artifact and its gate.
+Nine stages, **each scoped to one row** (§10 Q4). A whole-deployment upgrade is
+N per-row upgrades that happen to share an origin; nothing requires them to.
+Each stage names its artifact and its gate.
 
 ### S1 — Classify the change
 
@@ -316,19 +388,22 @@ Bump `const VERSION` via `identity::pack_version(major, minor, patch)`
   (`packaging/prometheus/uc2-alerts.yml:178`),
 - a cnc status word.
 
-What it does not buy: any live-commit gate ([#33]), and no durable record of
-*when* the version changed (§2.5).
+What it does not buy: any live-commit gate ([#33]). What it *will* buy after
+deliverable 1: a durable record of when the version changed (§2.5), and attach
+refusal against the pin (S4).
 
 `NAME` is never bumped. It is the identity hash *and* the `fold32` input to
 `IdGen`; changing it is not a version change, it is a different FSM with a
 different id stream.
 
-**Gap this spec should close:** there is no stated mapping from the §2.4
-classification to *which digit* moves. Proposal: major = any row whose axis-P
-risk is "severe" or "worst"; minor = additive-but-inert (and the harness must
-confirm the inertness); patch = no replicated behaviour change at all. Aeron's
-convention (major equality as the kill switch) is named in [#31] as a reserved
-validator and is the natural consumer of this mapping.
+**The digit mapping** (closing a gap the standard leaves open): major = any
+§2.4 row whose axis-P risk is "severe" or "worst"; minor = additive-but-inert
+(and the harness must confirm the inertness); patch = no replicated behaviour
+change at all. Under deliverable 2 this maps onto SBE directly — **UC major ↔
+SBE `templateId`/`schemaId`, UC minor ↔ SBE `version`** — and the framework's
+header check (§5.1) is written to that mapping. Aeron's convention (major
+equality as the kill switch) is named in [#31] as a reserved validator and is
+the natural consumer.
 
 ### S3 — Write the compatibility shims
 
@@ -336,46 +411,61 @@ Three shims, and they are not interchangeable:
 
 - **Forward decode** (old binary, new command) — *cannot be written
   retroactively*. It has to have been in v_old. This is the single strongest
-  argument for §5.1's command version tag being mandatory from day one.
+  argument for the version tag (§5.1) being present from day one — which the
+  SBE header makes automatic.
 - **Backward apply** (new binary, old command) — bounded by S9, not permanent.
+  Under SBE this is `sinceVersion` semantics rather than hand-kept per-version
+  decode paths.
 - **Snapshot dual-read** (new binary, old image) — what `examples/kv` hand-rolled
   as `IMAGE_VERSION_V1`/`V2` (`examples/kv/src/lib.rs:66-68`).
 
 ### S4 — Pin the origin
 
-**The stage that does not exist today.** Before stopping any service:
+**The stage that does not exist today; decided (§10 Q2): explicit pin,
+unconditional install, attach refusal.** Before stopping any instance of the
+row:
 
-1. Command a coordinated snapshot instant (`uc2ctl snapshot`) and confirm the
-   complete set at P on every node.
-2. Record P as the upgrade origin — durably, per §2.5.
-3. Ensure every new-version service reconstructs **from the artifact at P** and
-   not by replaying below it.
+1. `uc2ctl snapshot` → the complete set at P on every node (exists).
+2. `uc2ctl upgrade pin --row r --to <ver> --origin P` → appends the `UpgradePin`
+   record (§2.5). Refused by name if the set at P is incomplete, the row is
+   undeclared, `from` does not match, or P is not above the row's current pin.
+3. The cluster agent applies it and writes the row's `upgrade_origin` /
+   `pinned_version` cnc words.
+4. Stop every instance of row r, swap the binary, start. At attach a service
+   reads the words: `upgrade_origin > 0` and its `VERSION` equals
+   `pinned_version` → **install `snap-<P>` unconditionally**, overriding both
+   the gap guard and its own `last_applied()`. A durable SM at `X > P` is
+   rewound to P and recomputes `(P, X]` under v_new — the same thing its fresh
+   peers do. It already has to support `install_snapshot` to be
+   snapshot-capable, and step 1 already requires that capability (refusal 48),
+   so this asks nothing new of it.
+5. **Refusal backstop**: a service whose `VERSION` ≠ `pinned_version` is
+   refused at attach, by name. A stale v_old binary cannot rejoin after the pin
+   — a partial [#33] mitigation at the attach boundary, without touching the
+   live-commit path.
 
-Step 3 has no mechanism (§2.3). Options, for maintainer decision (Q2, §10):
+**Why not purge.** An earlier revision recommended advancing the purge floor
+to P as the mechanism. It is insufficient: purge only removes the genesis path
+for an SM that starts *empty*. §2.3's third path — a durable SM continuing from
+its own `last_applied()` above P — is untouched by purge, and diverges. Purge
+to P remains **correct and worthwhile as hygiene** (the prefix below P has no
+replay use for any binary the cluster will ever run again, and reclaiming it
+also settles [#41]'s framing — the off-node backup is the rollback point, the
+on-disk prefix never was), but correctness does not rest on it.
 
-- **(a) Advance the purge floor to P as part of the upgrade.** Makes the
-  artifact the only reachable path, using machinery that exists. **Under §2.5
-  this is the semantically motivated option, not merely the convenient one:**
-  below the last upgrade point the log is not faithfully replayable by *any*
-  single binary, so leaving it reachable leaves a hazard whose only use is to
-  produce a counterfactual state. Cost: it consumes the on-disk prefix, which
-  interacts with [#41] — though the off-node backup taken in step 1 of
-  `upgrade-an-application.md` is the actual rollback point and is unaffected.
-- **(b) An explicit "start from artifact P" service option.** No data
-  consumed, no purge-policy change forced on the operator; new surface.
-- **(c) Detect and refuse.** The service records the origin it reconstructed
-  from and refuses a mismatch against the committed upgrade origin. Smallest
-  change, and it subsumes [#36]; detects rather than prevents.
+**Upgrade requires snapshot capability.** Step 1 refuses on a row started with
+plain `start()`. That is not a new constraint; it is the existing one made
+visible.
 
-**Revised recommendation: (a) as the default, with (c) as the backstop.** An
-earlier revision recommended (b)+(c) on the grounds that (a) "takes an
-irreversible action on the operator's behalf". That reasoning was made under
-the wrong model — it treated the prefix as valuable data being discarded. Under
-§2.5 the prefix below P is not a usable replay source for any binary the
-cluster will ever run again; (c) alone would leave it reachable and rely on a
-refusal firing. (b) remains attractive where an operator has a reason to retain
-the prefix (forensics, a deliberate multi-version replay experiment), so it is
-worth having — but as the exception, not the default.
+**A documented limit, not a defect.** Between the pin (step 2) and the stop
+(step 4), v_old keeps applying, and its leader's `on_committed` emits external
+side effects for `(P, X]`. After the rewind, v_new recomputes `(P, X]` but the
+durable, increase-only `output_progress` marker stops it re-emitting. So the
+outside world saw v_old's effects for a span whose *state* is now v_new's. It
+is bounded and small; stopping promptly after the pin shrinks it. The clean
+fix — the pin also halting apply at P — costs a check in the apply hot loop,
+which the 2.11.0 regression record argues against paying for a window this
+size. Recorded as a limit; revisit if a real deployment finds it matters.
 
 ### S5 — Verify differentially
 
@@ -384,14 +474,25 @@ entries (§4.3).
 
 ### S6 — Roll out
 
-The existing flag day (`docs/how-to/upgrade-an-application.md`), with S4
-inserted before "stop every service".
+The existing flag day (`docs/how-to/upgrade-an-application.md`) becomes a
+**per-row** flag day: "stop every instance of row r", not "stop every
+service". S4 is inserted before it.
+
+**Cost to the other rows.** Under bounded or lockstep lag, stopping row r's
+service on a quorum of hosts stalls commit until it is back — M14's "one
+stalled FSM on a quorum stalls commit by design". A per-row upgrade is not
+invisible to its neighbours; it is exactly the same commit pause a
+whole-deployment flag day costs, so it is not a reason to prefer one over the
+other. Also: the coordinated instant in S4 step 1 freezes *every* row at P,
+not just row r — harmless (the others take a snapshot they did not strictly
+need) and useful (P is a complete set, well-defined cluster-wide regardless of
+which row is moving).
 
 ### S7 — Confirm
 
-Every row reports the new version; every replica agrees. Cross-replica
-agreement is an *image-digest* comparison and is valid here precisely because
-all replicas are now the same version (§4.1).
+Every instance of row r reports the new version; every replica agrees.
+Cross-replica agreement is an *image-digest* comparison and is valid here
+precisely because all replicas are now the same version (§4.1).
 
 ### S8 — Decide the point of no return
 
@@ -401,7 +502,8 @@ frames that state is v_new's. `upgrade-an-application.md` is already honest
 about this — the real rollback is restoring the off-node backup on every node,
 discarding every write acked since. The SDLC standard's "rollback plan" (§5)
 should be renamed and reframed as a **point-of-no-return plan**: what is the
-last moment abandonment is possible, and what does it cost?
+last moment abandonment is possible, and what does it cost? After S4 step 2 the
+pin is committed and monotone; that is the moment.
 
 ### S9 — Close axis H
 
@@ -470,24 +572,42 @@ formulation compatible with intentional semantic change.
 
 ## 5. Conventions to mandate
 
-### 5.1 A command version tag
+### 5.1 The version tag is the SBE header; the framework enforces it
 
-Every command carries a version tag readable **without decoding the rest**, so
-an old binary can determine "this is beyond me" and refuse *before* the ack.
-`examples/kv` independently converged on this: `FORMAT_VERSION: u8 = 1`
-(`examples/kv/src/wire.rs:13`), checked at `wire.rs:312` returning
-`BAD_FORMAT_VERSION`. A clean-room builder arriving at it unprompted is decent
-evidence it is the right convention.
+**Decided (§10 Q3).** Every command must carry a version tag readable
+**without decoding the rest**, so an old binary can determine "this is beyond
+me" and refuse *before* interpreting the body. Appendix A's case E is the
+demonstration: two same-typed fields reordered decode successfully, with the
+correct byte count, into swapped values. No codec-level check catches it. A tag
+ahead of the payload is the only thing that can.
 
-Appendix A supplies the demonstration. Case E — two same-typed fields
-reordered — decodes successfully, with the correct byte count, into swapped
-values. No codec-level check catches it. **A tag ahead of the payload is the
-only thing that can.**
+Under deliverable 2 that tag is **SBE's own message header** (`schemaId`,
+`templateId`, `version`, `blockLength`). UC adds nothing ahead of it. What UC
+*does* own is the check, and it is split the way the codebase already splits:
 
-Open design tension (Q3, §10): framework-owned envelope (like `ULTSNAP1 ‖ P`
-is for artifacts), or documented application convention? A framework envelope
-is enforceable but shrinks the payload ceiling further — the builder report
-already notes `Sessioned`'s envelope quietly shrinking it.
+- **Typed tier — framework-enforced.** The tier owns the codec, so it owns
+  the check. The blanket impl reads the header before handing bytes to the
+  generated decoder:
+  - `templateId`/`schemaId` ≠ the FSM's → **refuse, by name** (a major
+    mismatch, either direction).
+  - header `version` > the FSM's schema version → **refuse, by name**. This
+    suppresses SBE's tolerant skip (§5.7): an old FSM never applies a
+    truncated reading of a newer command.
+  - header `version` ≤ the FSM's → decode with `sinceVersion` semantics. A 1.4
+    FSM genuinely reads a 1.3 command, absent fields at their declared nulls.
+    **This is the part bincode could never give.**
+- **Raw tier — documented convention.** The app took ownership of its bytes;
+  forcing UC's header onto a flatbuffers user is presumptuous, and an SBE user
+  already has one. The contract is written down ("your first bytes identify
+  the schema version; SBE's header satisfies it"), not enforced.
+
+The rule follows from §2.4 and the S2 digit mapping: a major bump is a breaking
+schema change (refuse both directions); a minor is additive, so an FSM knows
+every minor *below* its own and cannot decode one above it.
+
+`examples/kv` independently converged on the prefix-byte form of this
+(`FORMAT_VERSION: u8 = 1`, `examples/kv/src/wire.rs:13`); it is the hand-rolled
+version of what the SBE header provides.
 
 ### 5.2 Tolerant readers are wrong for replication
 
@@ -507,7 +627,8 @@ field is genuinely inert to the old version (an audit comment that touches no
 state). But the platform cannot distinguish that case from the dangerous one —
 only the author can. So tolerant decode is an explicit per-change assertion the
 developer makes and the harness *checks* (identical state and responses for
-that command across versions), never a schema-level default.
+that command across versions), never a schema-level default. §5.1's header
+check is where the default is suppressed.
 
 ### 5.3 Package the FSM as a library crate
 
@@ -541,7 +662,8 @@ detail.
 `.superpowers/SBE vs serde+bincode 2 — Handover Doc.md` (2026-09-19) compares
 the two formats for schema evolution across the Ultima suite and concludes:
 SBE where nodes on different versions must interoperate, bincode for
-same-deploy-unit use. Three responses, in increasing order of consequence.
+same-deploy-unit use. Three responses, in increasing order of consequence, and
+then the decision.
 
 **(i) Its central factual claim is confirmed.** The doc asserts bincode can
 "misalign silently (producing wrong values with no error)". Appendix A measures
@@ -562,25 +684,29 @@ one for a replicated log.
 still wins here, for a reason the doc does not give. Its header carries
 `version` and `blockLength`, so an old decoder *knows* it is looking at a newer
 message before interpreting the body — which is precisely what §5.1 asks for,
-generated and enforced rather than hand-rolled. The correct posture is to
-decode the version, refuse anything above what this binary supports, and
-re-enable the skip only per-change, where the author asserts inertness (§5.2).
+generated and enforced rather than hand-rolled.
 
 **A consequence the doc's own taxonomy implies.** Its split is cross-version →
 SBE, same-deploy-unit ("WAL records read only by the process that wrote them")
 → bincode. A replicated command log is **neither**: it is written by one
 version and read by every replica *and by every future version*. By the doc's
 own criteria, bincode is the wrong choice for UC command payloads — and the
-typed tier, the documented easy path, uses exactly that. The raw tier already
-permits the alternative (`RawStateMachine`'s rustdoc: "Implement this directly
-for SBE / flatbuffers / hand-laid frames"), but only for developers who know to
-reach for it.
+typed tier, the documented easy path, uses exactly that.
 
-Whether to change that default steer is a product decision larger than this
-spec; it is recorded here as Q6 (§10). *One input worth re-measuring rather
-than trusting: a 2026-08-22 codec spike is recorded as finding SBE's cost equal
-to the raw tier, which would make this free at the hop. That has not been
-re-run and predates several apply-loop changes.*
+**Decided (§10 Q6): bincode goes. The typed tier becomes typed-over-SBE.**
+SBE is not a serde backend — it is codegen from an XML schema — so this is a
+redesign of the tier's contract (the `serde` bounds on `Command`/`Response`/
+`Query`/`QueryResponse` go away; the tier becomes "a `StateMachine` over
+SBE-generated message types"), not a backend swap. UC supplies the glue: a
+bound on generated codecs, the §5.1 header check, an encode helper for clients.
+The tier survives rather than collapsing into raw because that is the only
+shape in which the version check cannot be skipped. It is **deliverable 2**,
+its own spec (§1.3).
+
+*Two inputs that spec must verify rather than trust: the maturity of the Rust
+SBE generator, and the 2026-08-22 codec spike's finding that SBE costs the same
+as the raw tier at the hop — recorded, not re-run, and older than the 2.11.0
+apply-loop changes.*
 
 ---
 
@@ -593,8 +719,8 @@ avoids two comparison implementations drifting apart.
 
 A corpus is **(snapshot artifact at P, journal span P→Q, the version that built
 the artifact)** — the first two are what `uc2ctl backup` already produces, and
-the third is the provenance §2.5 says is currently missing and must be carried
-alongside until the envelope records it.
+the third comes from the pin history (§2.5) or the envelope stamp (§9.1) once
+those exist, and is carried alongside by hand until then.
 
 No new capture mechanism is needed; what is wanted is *trimming*, and [#42]
 already notes that backup copies the 64 MiB preallocation file, so the trimming
@@ -609,7 +735,7 @@ from position 0. That makes the harness cheaper as well as more honest.
 |---|---|---|
 | **`determinism`** | one build, **two processes**, same corpus | ambient clock, RNG, `HashMap` iteration order — *for free*, since Rust randomizes `RandomState` per process, so two processes already disagree if the FSM depends on hash order |
 | **`upgrade`** | two builds, same corpus | axis-H breakage, semantic drift, id-stream drift |
-| **`reconstruction`** | one build, **two start states**: genesis-replay vs. install-artifact-at-P + tail-replay | the §2.3 counterfactual |
+| **`reconstruction`** | one build, **two start states**: genesis-replay (or continue-from-X) vs. install-artifact-at-P + tail-replay | the §2.3 counterfactuals |
 
 That the determinism check falls out as a degenerate case is the main argument
 for this shape. It also makes [#38]'s item 2 (a determinism *lint*) largely
@@ -617,20 +743,18 @@ redundant: a runtime differential is strictly stronger, because a lint can
 enumerate `SystemTime::now()` but can never catch "this version mints a
 different number of ids".
 
-**The `reconstruction` mode's assertion is not equality.** An earlier revision
-had it comparing the two paths and expecting them to agree. Under §1.4 and
-§2.3 that is testing for something we do not want: after any semantic change
-the two paths *should* differ, because one of them is computing a
-counterfactual. The mode's job is therefore to
+**The `reconstruction` mode's assertion is not equality.** Under §1.4 and §2.3
+the two paths *should* differ after any semantic change, because one of them
+is computing a counterfactual. The mode's job is therefore in two parts, with
+different dependencies:
 
-1. **demonstrate** that the two paths diverge (the teeth-check that the harness
-   detects a real defect rather than passing vacuously), and
-2. **verify that the system refuses the wrong one** — i.e. that S4's mechanism
-   actually prevents a v_new service from reconstructing below the pinned
-   origin.
-
-This mode should be built **first**; item 1 is the demonstration §2.3 currently
-lacks.
+1. **Demonstrate** that the paths diverge — the teeth-check that the harness
+   detects a real defect rather than passing vacuously, and the demonstration
+   §2.3 currently lacks. Depends on nothing; **build this first.**
+2. **Verify that the system refuses the wrong one** — that S4's unconditional
+   install and attach refusal actually prevent a v_new service from
+   reconstructing below the pinned origin, for both the empty and the
+   durable-SM shapes. Depends on S4 landing.
 
 ### 6.3 Black-box before white-box
 
@@ -691,13 +815,14 @@ The boundary matters; "add AI" is easy to over-claim.
 - **Classify the diff** against §2.4 and emit the obligations it creates.
 - **Generate the v_old→v_new command corpus from the schema diff** — a harness
   cannot invent an application's commands; an agent reading both versions'
-  command types can.
+  command types (or SBE schemas) can.
 - **Spot the invisible determinism hazards**: a changed `ids()` call count, a
   newly-introduced `HashMap` iteration, a float op. The first is a *diff*
   property and genuinely outside a lint's reach.
 - **Spot the Appendix A shapes in a diff**: a variant inserted mid-enum, two
   fields reordered. Both are one-line diffs with catastrophic consequences and
-  both are trivially recognizable by reading the diff.
+  both are trivially recognizable by reading the diff. (Under SBE these become
+  schema-tool errors; the skill's job then is to read the schema diff instead.)
 - **Localize a divergence**: given "first disagreement at position P", bisect
   the corpus and read both implementations' arms for that command.
 
@@ -716,13 +841,12 @@ broke.**
 
 ### 9.1 Two platform defects found while writing this spec
 
-Both are independent of the lifecycle work and could ship on their own.
-
-**(1) The typed tier discards `bytes_read`** — filed as [#49]. All three decode sites
-(`uc_service/src/traits.rs:326, 336, 484`) destructure as `let (cmd, _) = ...`,
-and `decode_from_slice` does not require consuming the buffer. Per Appendix A,
-**four of the five measured silent misparses leave `bytes_read < len`** and
-would become the intended fail-stop under a length check.
+**(1) The typed tier discards `bytes_read`** — filed as [#49], **deliverable
+3**. All three decode sites (`uc_service/src/traits.rs:326, 336, 484`)
+destructure as `let (cmd, _) = ...`, and `decode_from_slice` does not require
+consuming the buffer. Per Appendix A, **four of the five measured silent
+misparses leave `bytes_read < len`** and would become the intended fail-stop
+under a length check.
 
 The check is viable: `uc_log/src/reader.rs:150` slices the payload as
 `&buf[self.boff + HEADER_LEN..self.boff + length]` — the header's `length`, not
@@ -733,17 +857,26 @@ assertion has no padding false-positives.
 derive their inner slice from their own envelopes; whether those are equally
 exact has not been traced and must be before the check is added there.*
 
-**(2) The snapshot artifact has no version provenance.** §2.5. The envelope is
-`ULTSNAP1 ‖ P` and nothing else (`uc_service/src/snapshots.rs:58,62`). For a
-system where version is an input to state, the artifact cannot say which
-semantics it embodies.
+Moot once deliverable 2 replaces the codec; ships now regardless.
+
+**(2) The snapshot artifact has no version provenance** — **decided (§10 Q7
+rider): stamp it.** The envelope becomes `ULTSNAP2 ‖ P ‖ version`, with
+pre-`ULTSNAP2` artifacts refused by name, exactly as the last envelope bump was
+handled ("clear a dev box's `snapshots/` once"). The `UpgradePin` history is
+the authority; the stamp lets `install_snapshot` cross-check that the artifact
+it is about to install was built by the version the pin says was in effect at
+P, and makes an artifact self-describing off-cluster (a backup on a shelf).
+Part of deliverable 1.
 
 ### 9.2 What this spec does not solve
 
 Without Track 2 ([#33]), a mixed-version *live commit* can still acknowledge a
-write no quorum can apply. Everything here makes the flag day verifiable; none
-of it makes a rolling application upgrade safe. The honest answer to "how do I
-upgrade" remains "flag day" until the committed application level and the
+write no quorum can apply. S4's attach refusal narrows the window — a stale
+binary cannot rejoin after the pin — but a v_old service that is *already
+attached* when a v_new leader commits a v_new-only command is still the [#33]
+hazard. Everything here makes the flag day verifiable; none of it makes a
+rolling application upgrade safe. The honest answer to "how do I upgrade"
+remains "per-row flag day" until the committed application level and the
 live-commit gate exist.
 
 What this spec *does* buy Track 2: [#31]'s own proposal (step 7) requires a
@@ -753,46 +886,76 @@ first means Track 2 arrives with its proof already in the tree.
 
 ---
 
-## 10. Open questions for the maintainer
+## 10. Decisions (2026-09-20)
 
-- ~~**Q1.** bincode's behaviour on a version mismatch.~~ **Answered by
-  measurement** — Appendix A. Silent misparse in 5 of 12 probes; 4 of the 5 are
-  UC's missing length check (§9.1).
-- **Q2.** S4 mechanism: (a) purge to P, (b) explicit start-from-artifact
-  option, or (c) detect-and-refuse. Spec now recommends **(a) + (c)**, revised
-  from (b) + (c) — see §3 S4 for why the earlier reasoning was wrong.
-- **Q3.** §5.1: framework-owned command envelope, or documented application
-  convention? Trades enforceability against payload ceiling.
-- **Q4.** Is per-row version skew across an 8-row multi-FSM deployment
-  *supported*, or merely representable? The identity/version arrays are
-  positional and per-row with `0` = unknown, so the wire permits it; nothing
-  states whether it is allowed.
-- **Q5.** Scope confirmation: §§1–6, §8 and §9.1 as this spec's deliverable,
-  with §7 named and deferred?
-- **Q6.** §5.7: does the typed tier stay the documented default for commands,
-  given that the handover doc's own taxonomy rules bincode out for a replicated
-  log? Changing the steer is a product decision beyond this spec.
-- **Q7.** §2.5: is the version-change record a new `CLUSTER` kind, or does it
-  ride the existing Settings record? The former is cleaner; the latter is
-  smaller.
+Taken with the maintainer one question at a time; the sections above are
+written to them.
+
+- **Q1** *(bincode's behaviour on a version mismatch)* — **answered by
+  measurement**, Appendix A. Silent misparse in 5 of 12 probes; 4 of the 5 are
+  UC's missing length check ([#49]).
+- **Q2** *(origin-pinning mechanism)* — **(b) explicit pin with unconditional
+  install at attach, plus (c) attach refusal. (a) purge-to-P demoted to
+  hygiene.** Deciding argument: purge only removes the genesis path for an SM
+  that starts empty; a durable SM continuing from its own `last_applied()`
+  above P is untouched by purge and diverges (§2.3, third path). Reverses
+  revision 2's recommendation, which was made without considering that shape.
+- **Q3** *(framework envelope vs. convention)* — **framework-enforced on the
+  typed tier, documented convention on the raw tier**; the tag itself is
+  SBE's message header once Q6 lands. Rule: template/schema id must match;
+  header version above the FSM's is refused; at or below decodes under
+  `sinceVersion`.
+- **Q4** *(per-row version skew)* — **supported; the row is the unit of every
+  stage.** The `SNAP_BEGIN` check (`receiver.rs:2367`) compares each row
+  between nodes, never across rows, and `Uc2ServiceVersionDrift` is
+  `count by (row)`; the state model is per-row throughout. Two cross-row
+  costs documented in S6.
+- **Q5** *(scope)* — **three deliverables**: this spec (docs + pin + record +
+  harness + skill, with `Shadow` as phase 2); the typed-over-SBE tier as its
+  own spec; [#49] alone, now. Deliverable 1 is a UC flag day (new `CLUSTER`
+  kind).
+- **Q6** *(does the typed tier stay on bincode?)* — **no. bincode is
+  replaced; the typed tier becomes typed-over-SBE.** Own spec.
+- **Q7** *(version-change record shape)* — **a new `CLUSTER kind = 4`,
+  `UpgradePin`**, 20-byte payload, per-row bounded history in the cluster FSM,
+  refusals 51–54, audited `upgrade_pin`; **plus** the `ULTSNAP2` envelope
+  stamp. Not a Settings field: it is an event with a position, the *sequence*
+  is what matters, and it wants its own refusals.
 
 ---
 
 ## 11. Work breakdown
 
+### Deliverable 1 — this spec
+
 | # | deliverable | kind | depends on |
 |---|---|---|---|
-| 0 | `bytes_read` length check at the three decode sites (§9.1, [#49]) | **code, separable** | — |
-| 1 | §2.1 axes, §2.4 taxonomy, §2.2 common origin, §2.5 version-as-input, §3 stages → folded into `application-sdlc.md` | docs | — |
-| 2 | §5 conventions, including §5.7's codec guidance | docs | 1 |
+| 1 | §2.1 axes, §2.4 taxonomy, §2.2 common origin, §2.5 version-as-input, §3 per-row stages → folded into `application-sdlc.md`; the how-to becomes per-row | docs | — |
+| 2 | §5 conventions, written to the SBE header and pointing at deliverable 2 | docs | 1 |
 | 3 | Corpus format + trimmed export (§6.1) | code | — |
-| 4 | Harness, black-box, `reconstruction` mode first (§6.2–6.4) | code | 3 |
-| 5 | Version-change record + artifact provenance (§2.5, §9.1) | code | — |
-| 6 | S4 origin-pinning mechanism (Q2) | code | 4, 5 |
-| 7 | Skill (§8) | skill | 1, 4 |
-| 8 | White-box mode + `Shadow` (§7) | code | 4, §5.3 |
-| 9 | Learner shadow deployment | docs + ops | 8 |
-| — | *Track 2: committed app level + live-commit gate* | separate spec | — |
+| 4 | Harness, black-box; `reconstruction` mode **part 1** first (§6.2) | code | 3 |
+| 5 | `UpgradePin` cluster record + per-row history + cnc words + `uc2ctl upgrade pin/show` + refusals 51–54 + audit + gauges (§2.5) | code, **flag day** | — |
+| 6 | Unconditional install at attach + attach refusal (§3 S4 steps 4–5) | code | 5 |
+| 7 | `ULTSNAP2` envelope stamp + `install_snapshot` cross-check (§9.1) | code | 5 |
+| 8 | `reconstruction` mode **part 2** — verify the refusal, empty and durable shapes (§6.2) | code | 4, 6 |
+| 9 | Skill (§8) | skill | 1, 4 |
+| 10 | White-box mode + `Shadow` (§7) — phase 2 | code | 4, §5.3 |
+| 11 | Learner shadow deployment — phase 2 | docs + ops | 10 |
+
+### Deliverable 2 — typed-over-SBE (own spec)
+
+Not broken down here. Inputs it must settle: Rust SBE generator maturity; hop
+cost re-measured; migration of `examples/counter`, `uc_lincheck::RegisterSm`,
+the crashtest service; whether the remote protocol is touched; the §2.4 table
+re-derived for SBE.
+
+### Deliverable 3 — [#49]
+
+Ships alone. Trace `Sessioned`/`Timed` inner-slice exactness first.
+
+### Not scheduled
+
+Track 2 ([#33] / [#31]) — separate spec.
 
 ---
 
@@ -803,9 +966,9 @@ Read and quoted in this tree (worktree `fsm-upgrade-lifecycle`, `main` @ `47e74e
 - `uc_service/src/replay.rs:207-228` — the gap guard; snapshot installed only when `first > start_pos`.
 - `uc_node/src/node.rs:171-173` — `PurgePolicy` with `#[default] Disabled`.
 - `uc_log/src/reader.rs:150` — `FrameIter::next` slices the payload to the header's `length`, not the aligned span.
-- `uc_service/src/traits.rs:326, 336, 484` — three typed-tier decodes, each discarding `bytes_read`.
+- `uc_service/src/traits.rs:326, 336, 484` — three typed-tier decodes, each discarding `bytes_read`; `last_applied()` documented as under-report-safe / over-report-refused (the durable-SM shape).
 - `uc_service/src/snapshots.rs:58,62` — the 16-byte `ULTSNAP1 ‖ P` envelope; no version field.
-- `uc_net/src/receiver.rs:2364-2385` — `SNAP_BEGIN` version comparison; nonzero-vs-nonzero inequality refuses; `0` is "unknown".
+- `uc_net/src/receiver.rs:2364-2385` — `SNAP_BEGIN` version comparison; per-row between nodes; nonzero-vs-nonzero inequality refuses; `0` is "unknown".
 - `uc_service/src/ids.rs` — `IdGen::next` = `permute(position, (ordinal << 32) | fold32)`.
 - `uc_service/src/tagged.rs` — the forwarding-wrapper idiom.
 - `uc_service/src/output.rs:148` — output agent idles on non-leaders.
@@ -816,15 +979,16 @@ Read and quoted in this tree (worktree `fsm-upgrade-lifecycle`, `main` @ `47e74e
 - `Cargo.toml:38` / `Cargo.lock` — `bincode = "2"`, locked at `2.0.1`.
 - `docs/reference/application-sdlc.md`, `docs/how-to/upgrade-an-application.md` — read in full.
 - `.superpowers/SBE vs serde+bincode 2 — Handover Doc.md` — read in full; §5.7 responds to it.
-- Issues [#31], [#33], [#36], [#38], [#41], [#42] — read via the REST API.
+- Issues [#31], [#33], [#36], [#38], [#41], [#42] — read via the REST API; [#49] filed from this spec.
 
 **Run this session:** the Appendix A measurement (`cargo run` against bincode
 `=2.0.1`, private `CARGO_TARGET_DIR`), output reproduced verbatim below.
 
-**Not verified / not run:** the §2.3 divergence is derived from the quoted code
-path, not demonstrated (§6.2 mode 1 is that demonstration). The `Sessioned` /
-`Timed` inner-slice exactness for §9.1 is untraced. The recorded 2026-08-22
-finding that SBE costs the same as the raw tier has not been re-run.
+**Not verified / not run:** the §2.3 divergences are derived from the quoted
+code paths, not demonstrated (§6.2 part 1 is that demonstration). The
+`Sessioned` / `Timed` inner-slice exactness for [#49] is untraced. The recorded
+2026-08-22 finding that SBE costs the same as the raw tier has not been re-run.
+The Rust SBE generator's maturity has not been assessed.
 
 ---
 
@@ -862,7 +1026,7 @@ directions where both are meaningful. Source:
 
 1. **Silent misparse is real: 5 of 12.** The handover doc's claim is confirmed.
 2. **Four of the five leave `bytes_read < len`** and would fail-stop under a
-   length check UC does not perform (§9.1).
+   length check UC does not perform ([#49]).
 3. **Case E survives any length check.** Reordering two same-typed fields is
    byte- and length-identical. Only a version tag ahead of the payload catches
    it (§5.1).
