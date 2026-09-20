@@ -1,0 +1,5 @@
+# `regression_corpora.rs` writes its report (and the two traces behind it)
+# beside the corpus it judged, then removes them. A run that failed or was
+# killed leaves them here; they are output, never input.
+*.report.json
+*.report.traces/

@@ -1,0 +1,20 @@
+# Regression corpus "put-then-delete": two puts below the origin, one delete
+# above it. Under the SAME build nothing may differ — that is what
+# `regression_corpora.rs` checks on every `cargo test`. Against a checked-in
+# `baseline.json` (none yet), declare here what a change is expected to do.
+#
+# The live service is `Sessioned<KvSm>`, so every command payload opens with
+# the 16-byte `client_id ‖ seq` envelope (uc_service::SESSION_HEADER_LEN)
+# before the KV frame starts. `tag_offset` skips it; without it every tag
+# would begin with a client id and no arm would ever match.
+tag_offset = 16
+
+# `FORMAT_VERSION ‖ op`, from examples/kv/src/wire.rs.
+[tags]
+"0101" = "put"
+"0102" = "delete"
+"0103" = "cas"
+"0104" = "append"
+
+[touched]
+arms = []

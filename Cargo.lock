@@ -639,7 +639,11 @@ dependencies = [
  "proptest",
  "signal-hook",
  "tempfile",
+ "uc_client",
  "uc_diffreplay",
+ "uc_net",
+ "uc_node",
+ "uc_protocol",
  "uc_remote",
  "uc_service",
 ]
