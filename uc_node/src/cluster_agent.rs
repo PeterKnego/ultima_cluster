@@ -834,6 +834,8 @@ mod tests {
             settings: Settings::genesis_default(),
             settings_position: 0,
             applied: 0,
+            pins: vec![],
+            reports: vec![],
         }
     }
 

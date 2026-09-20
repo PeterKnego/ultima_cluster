@@ -10857,6 +10857,8 @@ mod tests {
             settings: settings_genesis,
             settings_position: 0,
             applied: 0,
+            pins: vec![],
+            reports: vec![],
         };
         let cluster_view = Arc::new(ClusterView::new(&cluster_genesis));
         let cluster_snapshot_pos = Arc::new(AtomicU64::new(0));
@@ -13550,6 +13552,8 @@ mod tests {
                     settings: Settings::genesis_default(),
                     settings_position: 0,
                     applied: 0,
+                    pins: vec![],
+                    reports: vec![],
                 },
                 vec![hash],
             ),
@@ -13645,6 +13649,8 @@ mod tests {
                     settings: Settings::genesis_default(),
                     settings_position: 0,
                     applied: 0,
+                    pins: vec![],
+                    reports: vec![],
                 },
                 vec![hash],
             ),
@@ -15842,6 +15848,8 @@ mod tests {
                 settings: Settings::genesis_default(),
                 settings_position: 0,
                 applied: position,
+                pins: vec![],
+                reports: vec![],
             },
             Vec::new(),
         );
