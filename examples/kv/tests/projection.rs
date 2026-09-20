@@ -17,16 +17,14 @@ fn project(sm: &KvSm) -> String {
 }
 
 #[test]
-fn projection_is_canonical_regardless_of_insertion_order() {
-    // Same two facts (position 32 writes "b", position 64 writes "a") applied
-    // in opposite call order to `a` and `b`. `Entry::version` is the log
-    // position that wrote it (lib.rs's `apply`), so swapping which KEY gets
-    // which position (rather than just the call order) would give the two
-    // machines genuinely different entries/digests — not what "regardless of
-    // insertion order" means. Keeping the position<->key pairing fixed and
-    // only reversing the order the two calls happen in is what actually
-    // exercises OrdMap's insertion-order independence: same final entries and
-    // digest, different `last_applied` (whichever call happened last).
+fn projection_is_unaffected_by_call_order_given_ordered_map_and_xor_digest() {
+    // This guards the two structural properties the projection's
+    // canonicality rests on: `OrdMap` iterates key-sorted regardless of
+    // insertion order, and `digest` is an XOR fold, order-independent by
+    // construction. It would fail if either were replaced (an
+    // insertion-ordered map, or a non-commutative digest) — it does not by
+    // itself prove canonicality across independently-derived histories;
+    // that cross-history claim is `projection_survives_a_snapshot_roundtrip`'s.
     let mut a = KvSm::default();
     apply(&mut a, 32, &wire::encode_put(b"b", b"2"));
     apply(&mut a, 64, &wire::encode_put(b"a", b"1"));
