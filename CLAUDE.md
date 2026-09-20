@@ -563,6 +563,8 @@ this.
 ```bash
 cargo build --workspace                          # build all workspace crates
 cargo test                                       # in-process integration + sim tests (default)
+cargo build -p uc_lincheck --features replay-bin --bin register-replay \
+  && cargo build -p uc_diffreplay                # fixtures the diff-replay e2e + kv regression tests hard-assert
 cargo test -p uc_node --test lin_v2             # WGL linearizability capstone (failover + purge/snapshot churn)
 cargo test -p uc_node --test lin_partition_v2   # network-partition / quorum-loss linearizability
 cargo test -p uc_crashtest --features hard-crash-tests   # spawn real node+service procs; SIGKILL mid-load, assert linearizable

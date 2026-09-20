@@ -55,6 +55,16 @@ jobs:
         run: cargo clippy -p uc_service --features apply-profile --all-targets -- -D warnings
       - name: Clippy (uc_gateway + test-util)
         run: cargo clippy -p uc_gateway --features test-util --all-targets -- -D warnings
+      - name: Clippy (uc_lincheck + replay-bin)
+        run: cargo clippy -p uc_lincheck --features replay-bin --all-targets -- -D warnings
+      # `uc_diffreplay`'s e2e tests and `kv_store`'s `regression_corpora` shell
+      # out to these two binaries and hard-assert they exist. Neither is built
+      # by `cargo test --workspace`: `register-replay` sits behind
+      # `required-features`, and `uc2-diffreplay` is a *dependency's* binary.
+      - name: Build the diff-replay fixtures
+        run: cargo build -p uc_lincheck --features replay-bin --bin register-replay
+      - name: Build uc2-diffreplay (kv_store's regression_corpora needs the CLI binary)
+        run: cargo build -p uc_diffreplay
       - name: Tests (workspace, minus slow capstones)
         run: cargo test --workspace --exclude uc_node
       - name: Tests (uc_node fast integration)
