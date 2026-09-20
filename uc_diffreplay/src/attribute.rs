@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 use anyhow::Context;
 use serde::Deserialize;
 
-use crate::diff::{Divergence, Profile};
+use crate::diff::{Divergence, Profile, Surface};
 
 #[derive(Deserialize, Debug, Clone)]
 pub struct Declaration {
@@ -46,7 +46,17 @@ pub struct Expect {
 
 impl Declaration {
     pub fn from_toml(s: &str) -> anyhow::Result<Declaration> {
-        toml::from_str(s).context("declaration TOML")
+        let d: Declaration = toml::from_str(s).context("declaration TOML")?;
+        for e in &d.expect {
+            if Surface::parse(&e.surface).is_none() {
+                anyhow::bail!(
+                    "declaration: unknown surface \"{}\" in [[expect]]; expected \
+                     response | sched | projection_origin | projection_end",
+                    e.surface
+                );
+            }
+        }
+        Ok(d)
     }
 
     /// Longest hex prefix of `tag` that has a mapping wins, so `"01"` and

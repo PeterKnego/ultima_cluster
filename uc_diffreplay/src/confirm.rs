@@ -50,6 +50,37 @@ fn matches(e: &Expect, s: Surface, arm: Option<&str>) -> bool {
     e.surface == surface_name(s) && (e.arm.is_none() || e.arm.as_deref() == arm)
 }
 
+/// The most-specific `Expect` matching `(surface, arm)`: an entry whose
+/// `arm` equals the observed arm beats a wildcard (`arm = None`) entry on
+/// the same surface, regardless of declaration order — so a wildcard
+/// declared before a specific entry never steals its match. Among
+/// equally-specific candidates, prefer one not yet `satisfied`; otherwise
+/// the first in declaration order.
+fn best_expect(
+    d: &Declaration,
+    satisfied: &[bool],
+    surface: Surface,
+    arm: Option<&str>,
+) -> Option<usize> {
+    let candidates: Vec<usize> = d
+        .expect
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| matches(e, surface, arm))
+        .map(|(i, _)| i)
+        .collect();
+    let most_specific = candidates.iter().any(|&i| d.expect[i].arm.is_some());
+    let ranked: Vec<usize> = candidates
+        .into_iter()
+        .filter(|&i| d.expect[i].arm.is_some() == most_specific)
+        .collect();
+    ranked
+        .iter()
+        .copied()
+        .find(|&i| !satisfied[i])
+        .or_else(|| ranked.first().copied())
+}
+
 pub fn confirm(att: &Attributed, d: &Declaration) -> Verdicts {
     let mut v = Verdicts::default();
     let mut satisfied = vec![false; d.expect.len()];
@@ -69,7 +100,7 @@ pub fn confirm(att: &Attributed, d: &Declaration) -> Verdicts {
                 return;
             }
         };
-        match d.expect.iter().position(|e| matches(e, surface, arm)) {
+        match best_expect(d, &satisfied, surface, arm) {
             Some(i) => {
                 satisfied[i] = true;
                 v.findings.push(Finding {
@@ -101,12 +132,10 @@ pub fn confirm(att: &Attributed, d: &Declaration) -> Verdicts {
     }
     for (i, e) in d.expect.iter().enumerate() {
         if !satisfied[i] {
-            let surface = match e.surface.as_str() {
-                "response" => Surface::Response,
-                "sched" => Surface::Sched,
-                "projection_origin" => Surface::ProjectionOrigin,
-                _ => Surface::ProjectionEnd,
-            };
+            let surface = Surface::parse(&e.surface).expect(
+                "declaration validated at parse time: every Expect.surface is one of \
+                 response | sched | projection_origin | projection_end",
+            );
             v.findings.push(Finding {
                 surface,
                 arm: e.arm.clone(),

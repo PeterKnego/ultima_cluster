@@ -19,6 +19,21 @@ pub enum Surface {
     ProjectionEnd,
 }
 
+impl Surface {
+    /// The declaration-file spelling used in `[[expect]] surface = "..."`.
+    /// `None` for anything else — callers validate at the parse boundary
+    /// (`Declaration::from_toml`) rather than defaulting silently.
+    pub fn parse(s: &str) -> Option<Surface> {
+        Some(match s {
+            "response" => Surface::Response,
+            "sched" => Surface::Sched,
+            "projection_origin" => Surface::ProjectionOrigin,
+            "projection_end" => Surface::ProjectionEnd,
+            _ => return None,
+        })
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct Divergence {
     pub pos: u64,

@@ -308,3 +308,78 @@ fn a_declared_but_absent_diff_fails_as_absent() {
         2
     );
 }
+
+const DECL_WILDCARD_FIRST: &str = r#"
+[tags]
+"01" = "put"
+"02" = "delete"
+[touched]
+arms = ["put", "delete"]
+migration = false
+[[expect]]
+surface = "response"
+note = "any response change on a touched arm"
+[[expect]]
+surface = "response"
+arm = "put"
+note = "put now acks with the new version"
+"#;
+
+#[test]
+fn most_specific_expect_wins_over_an_earlier_wildcard_leaving_the_wildcard_absent() {
+    // The wildcard `[[expect]] surface = "response"` is declared BEFORE the
+    // specific `arm = "put"` entry. One `put` divergence must satisfy the
+    // specific entry, not the wildcard — declaration order must not decide
+    // this. The wildcard then has nothing left to match and is `Absent`:
+    // that is a correctly-reported over-specified declaration, not a bug.
+    let d = Declaration::from_toml(DECL_WILDCARD_FIRST).unwrap();
+    let a = trace(vec![(32, b"\x01", b"ok")], "");
+    let b = trace(vec![(32, b"\x01", b"OK")], "");
+    let v = confirm(&attribute(&diff(&a, &b).unwrap(), &d), &d);
+    let put_finding = v
+        .findings
+        .iter()
+        .find(|f| f.arm.as_deref() == Some("put"))
+        .expect("a finding naming the put arm");
+    assert!(matches!(put_finding.verdict, Verdict::Pass), "{v:?}");
+    let wildcard_finding = v
+        .findings
+        .iter()
+        .find(|f| f.arm.is_none())
+        .expect("a finding for the unsatisfied wildcard");
+    assert!(matches!(wildcard_finding.verdict, Verdict::Absent), "{v:?}");
+}
+
+#[test]
+fn specific_and_wildcard_expect_both_pass_when_every_declared_arm_is_observed() {
+    let d = Declaration::from_toml(DECL_WILDCARD_FIRST).unwrap();
+    let a = trace(vec![(32, b"\x01", b"ok"), (64, b"\x02", b"ok")], "");
+    let b = trace(vec![(32, b"\x01", b"OK"), (64, b"\x02", b"OK")], "");
+    let v = confirm(&attribute(&diff(&a, &b).unwrap(), &d), &d);
+    assert!(!v.failed(), "{:?}", v.findings);
+    assert_eq!(v.findings.len(), 2);
+    assert!(
+        v.findings
+            .iter()
+            .all(|f| matches!(f.verdict, Verdict::Pass))
+    );
+}
+
+#[test]
+fn an_unknown_expect_surface_fails_to_parse_by_name() {
+    const DECL_BAD_SURFACE: &str = r#"
+[touched]
+arms = []
+migration = false
+[[expect]]
+surface = "respones"
+note = "typo"
+"#;
+    let err = Declaration::from_toml(DECL_BAD_SURFACE).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("unknown surface \"respones\""), "{msg}");
+    assert!(
+        msg.contains("response | sched | projection_origin | projection_end"),
+        "{msg}"
+    );
+}
