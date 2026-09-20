@@ -52,7 +52,8 @@ checked, but it proves nothing about who is asking.
 
 Every **mutating** admin-band command (`add-learner`, `promote`, `demote`,
 `remove-learner`, `remove-voter`, and — since 2.11.0 — `schedule apply`,
-`settings apply`, `snapshot` and `snapshot fetch`)
+`settings apply`, `snapshot`, `snapshot fetch`, and — since the FSM upgrade
+lifecycle — `upgrade pin`)
 additionally takes (M12b, `v2.6.0`):
 
 **`--admin-key <PATH>`**
@@ -85,18 +86,20 @@ window.
 
 Sub-commands are: `add-learner`, `promote`, `demote`, `remove-learner`,
 `remove-voter`, `schedule apply`, `schedule show`, `settings apply`,
-`settings show`, `snapshot`, `snapshot fetch`, `snapshot show`, `status`.
+`settings show`, `snapshot`, `snapshot fetch`, `snapshot show`,
+`upgrade pin`, `upgrade show`, `status`.
 
 Every mutating one is a **cluster-FSM command** since 2.11.0: the
 reconfiguration ops append `CLUSTER kind = 1` (Membership), `schedule apply`
-appends `CLUSTER kind = 2`, and `settings apply` appends `CLUSTER kind = 3`.
-The operator-facing surface is unchanged; what changed is that one internal
-state machine now applies all three at commit
+appends `CLUSTER kind = 2`, `settings apply` appends `CLUSTER kind = 3`, and
+— since the FSM upgrade lifecycle — `upgrade pin` appends `CLUSTER kind = 4`
+(`UpgradePin`). The operator-facing surface is unchanged; what changed is
+that one internal state machine now applies all of these at commit
 ([the cluster FSM explainer](../notes/uc2-cluster-fsm-explained.md)).
-**Single in flight, across all three**: the leader answers `retry` while any
-previous `CLUSTER` command is still above the committed cluster view — so a
-`settings apply` will retry behind an in-flight membership change, and vice
-versa.
+**Single in flight, across all of them**: the leader answers `retry` while
+any previous `CLUSTER` command is still above the committed cluster view —
+so a `settings apply` will retry behind an in-flight membership change, an
+`upgrade pin` behind an in-flight `settings apply`, and vice versa.
 
 ### `add-learner`
 
@@ -403,6 +406,90 @@ such position exists, including "nothing has ever snapshotted". A row whose
 `newest=` sits below the others is the row a `Uc2SnapshotStalled` alert is
 pointing at.
 
+### `upgrade pin`
+
+Pin a declared row's **next version at a coordinated instant** (FSM upgrade
+lifecycle spec §2.5, §3 S4 step 2). Wire op `10`. `settings apply`'s pipeline
+verbatim: encode a 20-byte `UpgradePin` record, stage it at
+`<instance_dir>/upgrade.pending` (mode `0600`, fsync, rename), and sign the
+first ten bytes of its SHA-256 into the request's `id`/`ip`/`port` fields.
+
+```
+uc2ctl upgrade pin --row <R> --to <MAJOR.MINOR.PATCH> --origin <P> [--from <MAJOR.MINOR.PATCH>] --instance-dir <DIR> --app-id <ID> [--admin-key <PATH>]
+```
+
+- `--row <U8>` — the declared row to pin.
+- `--to <MAJOR.MINOR.PATCH>` — the version the row is pinned to.
+- `--origin <U64>` — the coordinated instant's position (`uc2ctl snapshot`'s
+  printed `instant=`) whose complete set the row installs, unconditionally, at
+  its next attach. Must be `> 0`; `0` is refused locally, before anything is
+  staged.
+- `--from <MAJOR.MINOR.PATCH>` — the version the row is pinned *from*.
+  Optional: omitted, `uc2ctl` reads it off the row's own attached version word
+  on **this** node (the same word `status`'s `version=` prints) and refuses
+  locally if that word is `0` (nothing attached here to read a version from —
+  pass `--from` explicitly).
+
+This is step 2 of the spec's S4 sequence — an upgrade is always
+`uc2ctl snapshot` → `uc2ctl upgrade pin` → stop every instance of the row,
+swap the binary, start. Step 1's complete set at P must already exist on
+every node; step 2 records the intent to install it; only step 3 (stop/swap/
+start) touches a running service, and only then does a v_new attach read the
+pin and install `snap-<P>` unconditionally — see
+`docs/superpowers/specs/2026-09-19-uc2-fsm-upgrade-lifecycle-design.md` §3 S4
+for the full sequence and its documented limits (a bounded window of
+already-emitted `on_committed` side effects between the pin and the stop is a
+recorded limit, not a defect).
+
+The same three consequences every `CLUSTER` command carries apply here:
+**leader-only** (the staged file is node-local, so a follower answers `retry`
+with the leader hint), **single in flight** across every `CLUSTER` command
+(a pin retries behind an in-flight membership/schedule/settings change, and
+vice versa), and **a refused or timed-out pin leaves the staged file in
+place**, so a retry needs nothing re-staged.
+
+On success the printed `position` word is the frame-end position of the new
+pin record:
+
+```
+pinned: row=0 from=1.2.3 to=1.3.0 origin=73792 position=81920
+```
+
+Every outcome is recorded in `audit.jsonl` as `upgrade_pin`, with the digest
+rendered in the `id`/`addr` fields.
+
+### `upgrade show`
+
+Print the **committed** pin history and hash verdicts, per row, from this
+node's newest cluster artifact. Read-only: it writes no admin request, and it
+carries the same artifact-lag caveat as
+[`schedule show`](#schedule-show)/[`settings show`](#settings-show) — a node
+whose declared rows have not all snapshotted yet has no cluster artifact, and
+`upgrade show` says so honestly (`no cluster artifact yet`) rather than
+printing a value nothing committed.
+
+```
+uc2ctl upgrade show --instance-dir <DIR> --app-id <ID>
+```
+
+```
+position=81920
+  row=0 pinned=1.3.0 from=1.2.3 origin=73792 history=[1.1.0->1.2.3@40960]
+  row=0 hash_verdict=agreed position=73792 nodes=3 hash=0x1122334455667788
+```
+
+`pinned=`/`from=`/`origin=` are the row's **newest** pin; `history=[...]`
+(when present) lists every earlier pin, oldest first, as
+`from->to@origin`. `hash_verdict` reads the newest `SnapshotReport` this
+node's leader collected for that row at that origin's position — computed by
+`uc_protocol::v2::upgrade::verdict`, a pure function, never stored:
+`agreed` (every reporting node's hash matches), `DIVERGED` (a majority hash
+exists but at least one node disagrees — `minority=` names the dissenting
+node ids), or `NO_MAJORITY` (no hash holds more than half the reporters —
+never expected outside a badly split cluster, and worth treating as an
+incident if seen). A row with a pin but no report yet prints only its pin
+line.
+
 ### `status`
 
 Prints the node's current config version and pending state, per-member
@@ -427,7 +514,7 @@ Output fields:
 | `log: commit / durable / append` | the three log counters, in bytes |
 | `members` | one line per occupied peer slot: `id`, `role`, `reported_durable`, and a staleness marker when `commit - reported_durable` exceeds the admission window |
 | `services` | the declared id list (cnc 4032's bitmask), the lag policy, and — since log time and timers (2.11.0) — `log_time_ns=<n>`, the log's clock read from cnc `4048`, in **raw nanoseconds since the Unix epoch**. It is not formatted as RFC 3339: the binary carries no date formatter, and the raw value is what the `uc2_log_time_ns` metric and the cnc word both hold. `0` means no leader has stamped anything this page generation — `fsm_lag=lockstep` or `fsm_lag=<N> bytes` (cnc 4040). A node started for a harness (`ServicesConfig::none_for_tests`) prints `declared=[] fsm_lag=n/a` and no rows: with nothing declared there is no lag policy to report, even though cnc 4040 still holds a resolved bound (since **2.8.1**; earlier releases printed that bound, or `lockstep` when it happened to read 0) |
-| per-FSM rows | one line per **declared** row, attached or not, in this order: `row=`, `name=` (the row's declared FSM name, node-written at boot, cnc 3.1), `version=` (the attached service's packed version, or the literal `unversioned` if the packed value is 0 — unattached or an FSM that never set `const VERSION`), `hash=0x...` (the row's identity hash, cnc 3.1), `attached=` (the slot's ATTACHED bit), `epoch=` (incarnations since this node booted), `incarnation=` (the status word's counter), `applied=`, `lag=` (`commit − applied`), `snapshot_pos=`, `heartbeat_age=` (`never` if that FSM has not stamped since boot), `timers_pending=` (that row's pending scheduled timers, cnc slot line 7 `+488`) — `name=`/`version=`/`hash=` are new since FSM identity and `timers_pending=` since log time and timers, both 2.11.0; earlier releases printed only `attached=... epoch=... incarnation=...` |
+| per-FSM rows | one line per **declared** row, attached or not, in this order: `row=`, `name=` (the row's declared FSM name, node-written at boot, cnc 3.1), `version=` (the attached service's packed version, or the literal `unversioned` if the packed value is 0 — unattached or an FSM that never set `const VERSION`), `hash=0x...` (the row's identity hash, cnc 3.1), `attached=` (the slot's ATTACHED bit), `epoch=` (incarnations since this node booted), `incarnation=` (the status word's counter), `applied=`, `lag=` (`commit − applied`), `snapshot_pos=`, `heartbeat_age=` (`never` if that FSM has not stamped since boot), `timers_pending=` (that row's pending scheduled timers, cnc slot line 7 `+488`), `upgrade_origin=` (the row's committed `UpgradePin` origin — the coordinated instant this row installs unconditionally at its next attach, `0` = no pin), `pinned=` (the version that pin names, `unversioned` when `upgrade_origin=0`) — `name=`/`version=`/`hash=` are new since FSM identity, `timers_pending=` since log time and timers (both 2.11.0), and `upgrade_origin=`/`pinned=` since the FSM upgrade lifecycle (cnc 3.3, `uc2ctl upgrade pin`/`show`); earlier releases printed only `attached=... epoch=... incarnation=...` |
 
 ## Offline commands
 
@@ -614,6 +701,15 @@ because its `retry` has a second cause:
 | `1` | `refused: <reason> (cluster position <N>) — staged file kept at <PATH>` | exit 1 |
 | `2` | `retry: leader unknown or a previous cluster command is still uncommitted (cluster position <N>) — staged file kept at <PATH>, try again` | exit 1 |
 
+`upgrade pin` does the same, with `pinned: row=<R> from=<V> to=<V> origin=<P>
+position=<N>` in place of `applied:`:
+
+| Status | Printed as | Process outcome |
+|---|---|---|
+| `0` | `pinned: row=<R> from=<V> to=<V> origin=<P> position=<N>` | exit 0 |
+| `1` | `refused: <reason> (cluster position <N>) — staged file kept at <PATH>` | exit 1 |
+| `2` | `retry: leader unknown or a previous cluster command is still uncommitted (cluster position <N>) — staged file kept at <PATH>, try again` | exit 1 |
+
 `snapshot` and `snapshot fetch` stage no file, so their status lines say
 nothing about one. `snapshot`'s `version` word is the instant's position;
 `snapshot fetch`'s is the position it bound:
@@ -637,7 +733,9 @@ are `schedule apply`'s own refusals (`uc_node::REASON_SCHEDULE_*`) and 44–47
 (2.11.0) are `settings apply`'s (`uc_node::REASON_SETTINGS_*`), each in
 its own band for the same reason. 48–50 (2.11.0) are the coordinated-snapshot
 ops' own (`uc_node::REASON_SNAPSHOT_*`), split across `snapshot` (48, 49) and
-`snapshot fetch` (50).
+`snapshot fetch` (50). 51 is `schedule apply`'s own, added later. 52–59 (FSM
+upgrade lifecycle) are `upgrade pin`'s own (`uc_node::REASON_PIN_*` and
+`report_stale`), in their own band for the same reason.
 
 | Code | Reason |
 |---|---|
@@ -670,6 +768,14 @@ ops' own (`uc_node::REASON_SNAPSHOT_*`), split across `snapshot` (48, 49) and
 | 49 | `snapshot_no_learner` — `uc2ctl snapshot --standby` with no learner in the committed membership. Only a learner freezes for a standby instant, so with none there nothing anywhere would build the set |
 | 50 | `snapshot_above_durable` — `uc2ctl snapshot fetch --position P` names a P above this node's own durable frontier. A voter must not adopt a floor above what it has made durable. Usually an operator typo, or a learner transiently ahead of this voter; legitimate again once this node's log catches up |
 | 51 | `schedule_too_large` — the table decoded fine and names only declared rows, but the `CLUSTER` frame carrying it is larger than this node's `max_payload`, so the leader could not append it. A full 32-entry table needs **1072 bytes** of frame body (8 B of `CLUSTER` prefix + 8 B of table header + 32 × 33 B). Raise `max_payload` in `node.toml` and restart, or apply fewer entries. Since 2.11.0 the daemon refuses at STARTUP, by name, if `max_payload` cannot carry a full table, so on a node that booted this reason is reachable only where the two can still disagree — a node started before that check existed, or a hand-edited config. Before 2.11.0 this case was reported as **42**, which sent operators to inspect a file that was perfectly valid |
+| 52 | `pin_row_undeclared` — `uc2ctl upgrade pin --row R` names a row this node does not declare in `[services] names` |
+| 53 | `pin_from_mismatch` — `--from` is not the row's current version: its newest pin's `to`, or, with no pin yet, the version the service is attached at. A stale `--from` usually means another pin already landed since it was read |
+| 54 | `pin_no_set` — no **complete** snapshot set at `--origin` on this node. Run `uc2ctl snapshot`, wait for `uc2_snapshot_set_position` to reach it (or `uc2ctl snapshot show`'s `set=`), and pin THAT position |
+| 55 | `pin_not_monotone` — `--origin` is not above the row's current pin. A pin only ever moves a row's origin forward |
+| 56 | `pin_digest` — the staged pin file's digest is not the one the request signed: a different file was staged than was signed, or it changed in between. Re-run `upgrade pin` |
+| 57 | `pin_missing` — no staged pin file on this node. Either `upgrade pin` was run against a different instance directory, or a successful apply already consumed it |
+| 58 | `pin_decode` — the staged file is not a decodable 20-byte `UpgradePin` record |
+| 59 | `report_stale` — a `SnapshotReport` below the row's held report position. Never produced by `uc2ctl`; recorded here because it shares op 10's refusal band |
 
 Code `0` is not a `ProposeError`. It is the CLI's own malformed-op sentinel.
 
