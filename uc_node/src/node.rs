@@ -46,8 +46,9 @@ use uc_protocol::ring::{
 };
 use uc_protocol::v2::cnc::{
     ADMIN_OP_SCHEDULE_APPLY, ADMIN_OP_SETTINGS_APPLY, ADMIN_OP_SNAPSHOT, ADMIN_OP_SNAPSHOT_FETCH,
-    CNC_MAX_PEER_SLOTS, CNC_MAX_SERVICES, CNC_PEER_ROLE_LEARNER, CNC_PEER_ROLE_VOTER,
-    CNC_SVC_STATUS_SNAPSHOT_CAPABLE, NODE_FLAG_CAN_SERVE, NODE_FLAG_LEADER, NODE_FLAG_LEARNER,
+    ADMIN_OP_UPGRADE_PIN, CNC_MAX_PEER_SLOTS, CNC_MAX_SERVICES, CNC_PEER_ROLE_LEARNER,
+    CNC_PEER_ROLE_VOTER, CNC_SVC_STATUS_SNAPSHOT_CAPABLE, NODE_FLAG_CAN_SERVE, NODE_FLAG_LEADER,
+    NODE_FLAG_LEARNER,
 };
 use uc_protocol::v2::config::{WireConfig, WireMember, decode_config, encode_config};
 use uc_protocol::v2::crypto::DGRAM_KIND_HS_KEY;
@@ -64,7 +65,7 @@ use uc_protocol::v2::ipc::{
 use crate::audit::{AuditLog, AuditOrigin, AuditOutcome, AuditRecord, op_name};
 use crate::cluster_fsm::{
     ClusterCommand, ClusterFsm, ClusterState, ClusterView, ClusterViewInner, SCHEDULE_PENDING_FILE,
-    SETTINGS_PENDING_FILE, staged_digest,
+    SETTINGS_PENDING_FILE, UPGRADE_PENDING_FILE, staged_digest,
 };
 use crate::ipc::InstanceDir;
 use crate::read_round::ProbeRound;
@@ -86,6 +87,7 @@ use uc_protocol::v2::schedule::{
     decode_schedule_table,
 };
 use uc_protocol::v2::settings::{Settings, Target, decode_settings};
+use uc_protocol::v2::upgrade::{UPGRADE_PIN_LEN, decode_upgrade_pin};
 
 /// Single-slot truncation ack. One truncation is in flight at a time (the SM
 /// latch serializes them), so a slot suffices and, unlike a bounded channel,
@@ -521,6 +523,20 @@ pub const REASON_SNAPSHOT_ABOVE_DURABLE: u32 = 50;
 /// larger than the baseline carries.
 pub const REASON_SCHEDULE_TOO_LARGE: u32 = 51;
 
+// FSM upgrade lifecycle (spec §2.5, plan B1): `ADMIN_OP_UPGRADE_PIN` (wire op
+// 10). 52/54 and the no-pin half of 53 are DOOR-ONLY (node-local inputs:
+// `[services] names`, the attached version word, this leader's newest
+// complete set); 55, the pinned half of 53, and 59 are the FSM's own
+// (`ClusterRefusal`). 56–58 are the staged-file outcomes 44–46 have.
+pub const REASON_PIN_ROW_UNDECLARED: u32 = 52;
+pub const REASON_PIN_FROM_MISMATCH: u32 = 53;
+pub const REASON_PIN_NO_SET: u32 = 54;
+pub const REASON_PIN_NOT_MONOTONE: u32 = 55;
+pub const REASON_PIN_DIGEST: u32 = 56;
+pub const REASON_PIN_MISSING: u32 = 57;
+pub const REASON_PIN_DECODE: u32 = 58;
+pub const REASON_REPORT_STALE: u32 = 59;
+
 /// Jumbo spec §7.1: the datagram rung a committed `Settings::datagram_mtu`
 /// word means, and whether it had to be clamped to get there.
 ///
@@ -755,6 +771,11 @@ impl std::fmt::Display for SnapshotRefusal {
 /// `decode_settings` is the one that rules on the exact (version, length)
 /// pair.
 const MAX_SETTINGS_BYTES: u64 = uc_protocol::v2::settings::SETTINGS_LEN as u64;
+
+/// Plan B1 (spec §2.5): the same, for a staged `upgrade.pending`. An
+/// `UpgradePin` is fixed-width and single-version, so the cap IS the record —
+/// `decode_upgrade_pin` refuses any other length outright.
+const MAX_UPGRADE_PIN_BYTES: u64 = UPGRADE_PIN_LEN as u64;
 
 /// What [`read_staged`] found at a staged admin payload's path.
 enum StagedRead {
@@ -2201,6 +2222,7 @@ impl Node {
             last_armed_table_position: 0,
             schedule_pending: instance.root.join(SCHEDULE_PENDING_FILE),
             settings_pending: instance.root.join(SETTINGS_PENDING_FILE),
+            upgrade_pending: instance.root.join(UPGRADE_PENDING_FILE),
             schedule_pos_pub: Arc::clone(&schedule_pos_pub),
             schedule_entries_pub: Arc::clone(&schedule_entries_pub),
             log_clock_smear_pub: Arc::clone(&log_clock_smear_pub),
@@ -3237,6 +3259,9 @@ struct Consensus {
     /// The same for `ADMIN_OP_SETTINGS_APPLY` (spec §6):
     /// `<instance_dir>/settings.pending`.
     settings_pending: PathBuf,
+    /// The same for `ADMIN_OP_UPGRADE_PIN` (spec §2.5, plan B1):
+    /// `<instance_dir>/upgrade.pending`.
+    upgrade_pending: PathBuf,
     /// Plan 2 (spec §6): the `/metrics` mirrors of `schedule_position` and
     /// the adopted entry count, published on adoption (rare) so the exporter
     /// thread never reaches into this agent's state. `uc2_schedule_table_position`
@@ -5872,6 +5897,22 @@ impl Consensus {
     fn prune_snapshots_below(&self, p: u64) {
         let mut removed = 0u64;
         let mut errors = 0u64;
+        // Plan B1: a pinned origin's set must outlive the floor — B2's
+        // attach-time install needs it. Read once per retention pass (the
+        // pass is throttled), from the committed view.
+        let keep: Vec<u64> = {
+            let inner = self.cluster_view.snapshot_inner();
+            (0..CNC_MAX_SERVICES as u8)
+                .filter_map(|row| {
+                    inner
+                        .pins
+                        .iter()
+                        .rev()
+                        .find(|p| p.row == row)
+                        .map(|p| p.origin)
+                })
+                .collect()
+        };
         // The DECLARED rows — the same set `check_set_completeness` reads, so
         // the pruner only ever touches artifact families the set is made of.
         // NOT `ring_ids()`, whose "row 0 stands in for clients" fallback would
@@ -5879,11 +5920,12 @@ impl Consensus {
         // `snapshots/0/` that its own set definition never covered. On a real
         // node (which always declares `[services] names`) the two are equal.
         for row in self.services.ids() {
-            let (r, e) = prune_snapshot_dir(&self.snap_root.join(row.to_string()), SNAP_SUFFIX, p);
+            let (r, e) =
+                prune_snapshot_dir(&self.snap_root.join(row.to_string()), SNAP_SUFFIX, p, &keep);
             removed += r;
             errors += e;
         }
-        let (r, e) = prune_snapshot_dir(&self.cluster_snapshot_dir, CLUSTER_SNAP_SUFFIX, p);
+        let (r, e) = prune_snapshot_dir(&self.cluster_snapshot_dir, CLUSTER_SNAP_SUFFIX, p, &keep);
         removed += r;
         errors += e;
         if removed > 0 || errors > 0 {
@@ -5893,7 +5935,8 @@ impl Consensus {
                 node = self.id as u64,
                 position = p,
                 removed = removed,
-                errors = errors
+                errors = errors,
+                kept = keep.len() as u64
             );
         }
     }
@@ -7662,18 +7705,22 @@ impl Consensus {
                 return;
             }
         };
-        // The two STAGED-FILE ops (`schedule apply`, plan 2 spec §5; `settings
-        // apply`, cluster-FSM spec §6) are their own pipeline — the payload is
-        // far too large for the 64-byte admin request line, so what the
-        // operator signs is the DIGEST of a file staged in the instance
-        // directory.
+        // The three STAGED-FILE ops (`schedule apply`, plan 2 spec §5;
+        // `settings apply`, cluster-FSM spec §6; `upgrade pin`, plan B1 spec
+        // §2.5) are their own pipeline — the payload is too large for the
+        // 64-byte admin request line (or, for a pin, carries a digest for the
+        // same authentication story), so what the operator signs is the
+        // DIGEST of a file staged in the instance directory.
         // Placed here, right after authentication and before the
         // leader/forward split, because the staged file is NODE-LOCAL: a
         // follower must not forward the request (the leader has no such file)
         // and must not read its own copy either (it cannot append). It
         // answers retry — side-effect-free — and `uc2ctl` re-stages against
         // the node the leader hint names.
-        if req.op == ADMIN_OP_SCHEDULE_APPLY || req.op == ADMIN_OP_SETTINGS_APPLY {
+        if req.op == ADMIN_OP_SCHEDULE_APPLY
+            || req.op == ADMIN_OP_SETTINGS_APPLY
+            || req.op == ADMIN_OP_UPGRADE_PIN
+        {
             // `appender.is_some()` alongside the role: a leader still waiting
             // on its leader-open collapse ack HAS the role but no appender
             // yet, and appending in that window would panic. It is the same
@@ -7681,15 +7728,19 @@ impl Consensus {
             // reconfiguration ops; here it answers retry, which is what
             // `uc2ctl` polls through.
             let leader = matches!(self.sm.role(), Role::Leader) && self.appender.is_some();
-            let settings = req.op == ADMIN_OP_SETTINGS_APPLY;
-            let (status, reason, version) = match (leader, settings) {
-                (true, false) => self.apply_schedule_table(req.id, req.ip, req.port),
-                (true, true) => self.apply_settings(req.id, req.ip, req.port),
+            let (status, reason, version) = match (leader, req.op) {
+                (true, ADMIN_OP_SCHEDULE_APPLY) => {
+                    self.apply_schedule_table(req.id, req.ip, req.port)
+                }
+                (true, ADMIN_OP_SETTINGS_APPLY) => self.apply_settings(req.id, req.ip, req.port),
+                (true, _) => self.apply_upgrade_pin(req.id, req.ip, req.port),
                 // Not the leader: retry, with the "version in effect" word
                 // each op reports — the table's position for `schedule`, the
-                // committed cluster position for `settings`.
-                (false, false) => (2, 0, self.schedule_position),
-                (false, true) => (2, 0, self.cluster_view.position.load(Ordering::Acquire)),
+                // committed cluster position for `settings` and `upgrade
+                // pin`. Read NOTHING: the staged file is the leader's, and a
+                // follower has no business reading its own copy.
+                (false, ADMIN_OP_SCHEDULE_APPLY) => (2, 0, self.schedule_position),
+                (false, _) => (2, 0, self.cluster_view.position.load(Ordering::Acquire)),
             };
             let (status, reason) = self.audit_admin_detailed(
                 actor.as_deref(),
@@ -8060,6 +8111,80 @@ impl Consensus {
         self.apply_settings(id, ip, port)
     }
 
+    /// Plan B1: the leader half of `ADMIN_OP_UPGRADE_PIN` —
+    /// [`Self::apply_settings`]'s twin over `<instance_dir>/upgrade.pending`
+    /// with the 52–58 band. Same reply triple, same leader-only / node-local
+    /// / single-in-flight rules. The three DOOR checks run here because
+    /// their inputs are this node's, never the FSM's (spec §2.5, Ruling R24).
+    ///
+    /// The door reads are ADVISORY and apply is authoritative: `to_state()`
+    /// may pair a fresh `applied` with pins a tick stale, so a door read can
+    /// be behind — the worst that costs is a command that reaches the FSM and
+    /// is refused there with 55 at apply. It can never make an unsound pin
+    /// ACCEPTED, because the FSM re-runs the replicated half on every node.
+    fn apply_upgrade_pin(&mut self, id: u32, ip: u32, port: u16) -> (u32, u32, u64) {
+        let view_position = self.cluster_view.position.load(Ordering::Acquire);
+        if self.last_cluster_append > view_position {
+            return (2, 0, view_position);
+        }
+        let bytes = match read_staged(&self.upgrade_pending, MAX_UPGRADE_PIN_BYTES) {
+            StagedRead::Bytes(b) => b,
+            StagedRead::Missing => return self.refuse_upgrade_pin(REASON_PIN_MISSING),
+            StagedRead::Unusable => return self.refuse_upgrade_pin(REASON_PIN_DECODE),
+        };
+        if staged_digest(&bytes) != (id, ip, port) {
+            return self.refuse_upgrade_pin(REASON_PIN_DIGEST);
+        }
+        let Some(pin) = decode_upgrade_pin(&bytes) else {
+            return self.refuse_upgrade_pin(REASON_PIN_DECODE);
+        };
+        // 52: the row must be one THIS node declares — `declared_hashes`'s source.
+        if !self
+            .timers
+            .get(pin.row as usize)
+            .is_some_and(|t| t.is_some())
+        {
+            return self.refuse_upgrade_pin(REASON_PIN_ROW_UNDECLARED);
+        }
+        let state = self.cluster_view.to_state();
+        // 53, no-pin half: `from` must be the version the row is ATTACHED at.
+        // With a pin in the history the FSM checks `from` against it instead.
+        if state.pin_for(pin.row).is_none() {
+            let attached = self.cnc.service_slot(pin.row as usize).status.version();
+            if pin.from != attached {
+                return self.refuse_upgrade_pin(REASON_PIN_FROM_MISMATCH);
+            }
+        }
+        // 54: the complete set at `origin` — this node's NEWEST one, the only
+        // one retention cannot remove between here and commit.
+        if pin.origin != self.snapshot_set_position.load(Ordering::Acquire) {
+            return self.refuse_upgrade_pin(REASON_PIN_NO_SET);
+        }
+        let cmd = ClusterCommand::UpgradePin(pin);
+        if let Err(reason) = self.validate_cluster_command(&cmd) {
+            return self.refuse_upgrade_pin(reason);
+        }
+        match self.append_cluster_frame(&cmd) {
+            Ok(position) => {
+                self.consume_staged(&self.upgrade_pending, position);
+                (0, 0, position)
+            }
+            Err(AppendError::WouldOverrun) => (2, 0, view_position),
+            // Unreachable: `UPGRADE_PIN_LEN` is 20 bytes. Refused rather than
+            // retried, for `apply_schedule_table`'s reason.
+            Err(AppendError::PayloadTooLarge) => self.refuse_upgrade_pin(REASON_PIN_DECODE),
+        }
+    }
+
+    /// Test helper: [`Self::apply_settings_staged`]'s twin over
+    /// `upgrade.pending`.
+    #[cfg(test)]
+    fn apply_upgrade_pin_staged(&mut self) -> (u32, u32, u64) {
+        let bytes = std::fs::read(&self.upgrade_pending).expect("pin staged for this call");
+        let (id, ip, port) = staged_digest(&bytes);
+        self.apply_upgrade_pin(id, ip, port)
+    }
+
     /// The staged file has done its job once the command is on the log.
     /// Deleting it earlier would lose the request on an append failure;
     /// deleting it at all is what keeps a re-presented request from appending
@@ -8302,6 +8427,23 @@ impl Consensus {
         crate::obs_event!(
             Warn,
             "settings_apply_refused",
+            node = self.id as u64,
+            reason = reason as u64
+        );
+        (
+            1,
+            reason,
+            self.cluster_view.position.load(Ordering::Acquire),
+        )
+    }
+
+    /// The same for a refused `upgrade pin` (plan B1), on
+    /// [`Self::refuse_settings`]'s shared counter for its reason.
+    fn refuse_upgrade_pin(&self, reason: u32) -> (u32, u32, u64) {
+        self.schedule_refused.fetch_add(1, Ordering::Relaxed);
+        crate::obs_event!(
+            Warn,
+            "upgrade_pin_refused",
             node = self.id as u64,
             reason = reason as u64
         );
@@ -10394,8 +10536,13 @@ const SNAP_SUFFIX: &str = ".ultsnap";
 /// The cluster FSM's artifact suffix (`cluster_agent::artifact_path`).
 const CLUSTER_SNAP_SUFFIX: &str = ".ultcluster";
 
-/// Unlink every `snap-<pos><suffix>` in `dir` with `pos < below`. Returns
-/// `(removed, errors)`.
+/// Unlink every `snap-<pos><suffix>` in `dir` with `pos < below`, except the
+/// positions `keep` names. Returns `(removed, errors)`.
+///
+/// Plan B1 (spec §2.5): `keep` is every row's currently PINNED origin. A pin
+/// names the complete set a row installs at its next attach, so that set has
+/// to outlive a floor that has since moved above it — the one exception to
+/// "below the floor is superseded".
 ///
 /// **Exact names only** (Ruling P1). A name counts only if it strips the
 /// prefix, strips the suffix and parses as a `u64` — so a builder's
@@ -10403,7 +10550,7 @@ const CLUSTER_SNAP_SUFFIX: &str = ".ultcluster";
 /// dropped in are all invisible here, and this sweep can never delete a file
 /// something else is still writing. A missing directory is not an error (a
 /// node whose rows have never snapshotted has none).
-fn prune_snapshot_dir(dir: &Path, suffix: &str, below: u64) -> (u64, u64) {
+fn prune_snapshot_dir(dir: &Path, suffix: &str, below: u64, keep: &[u64]) -> (u64, u64) {
     let Ok(rd) = std::fs::read_dir(dir) else {
         return (0, 0);
     };
@@ -10418,7 +10565,7 @@ fn prune_snapshot_dir(dir: &Path, suffix: &str, below: u64) -> (u64, u64) {
         else {
             continue;
         };
-        if pos >= below {
+        if pos >= below || keep.contains(&pos) {
             continue;
         }
         match std::fs::remove_file(entry.path()) {
@@ -10437,10 +10584,12 @@ mod tests {
     use super::*;
     use crate::cluster_agent::ClusterAgent;
     use uc_log::region::Region;
+    use uc_protocol::identity::pack_version;
     use uc_protocol::ring::RingHeader;
     use uc_protocol::v2::ipc::MSG_V2_SUBMIT;
     use uc_protocol::v2::schedule::{ScheduleTable, encode_schedule_table};
     use uc_protocol::v2::settings::encode_settings;
+    use uc_protocol::v2::upgrade::{UpgradePin, encode_upgrade_pin};
 
     /// Build a heap-backed cnc page for the bare-`Consensus` harness (no file,
     /// no flock — these tests drive `feed`/`exec` directly).
@@ -10995,6 +11144,7 @@ mod tests {
             last_armed_table_position: 0,
             schedule_pending: dir.path().join(SCHEDULE_PENDING_FILE),
             settings_pending: dir.path().join(SETTINGS_PENDING_FILE),
+            upgrade_pending: dir.path().join(UPGRADE_PENDING_FILE),
             schedule_pos_pub: Arc::new(AtomicU64::new(0)),
             schedule_entries_pub: Arc::new(AtomicU64::new(0)),
             log_clock_smear_pub: Arc::new(AtomicU64::new(0)),
@@ -11457,6 +11607,64 @@ mod tests {
         assert_eq!(
             names(&h.cons.cluster_snapshot_dir),
             vec![format!("snap-{p2}.ultcluster")]
+        );
+    }
+
+    /// Retention (spec §2.5 / plan B1 erratum 4): a pinned origin's
+    /// artifacts survive a floor above them, in the row dir AND the
+    /// cluster dir, while an unpinned older set goes. Built on
+    /// `retention_waits_for_the_floor_to_publish_and_never_outruns_the_ship_gate`'s
+    /// file layout; calls the pruner directly rather than through the
+    /// floor path, since the keep-set is the only thing under test.
+    #[test]
+    fn retention_keeps_every_pinned_origin() {
+        let h = harness_with_rows(&["a"]);
+        let (p0, p1, p2) = (2048u64, 4096u64, 6016u64);
+        let row_dir = h.cons.snap_root.join("0");
+        std::fs::create_dir_all(&row_dir).unwrap();
+        std::fs::create_dir_all(&h.cons.cluster_snapshot_dir).unwrap();
+        for p in [p0, p1, p2] {
+            std::fs::write(row_dir.join(format!("snap-{p}.ultsnap")), b"row").unwrap();
+            std::fs::write(
+                h.cons
+                    .cluster_snapshot_dir
+                    .join(format!("snap-{p}.ultcluster")),
+                b"cluster",
+            )
+            .unwrap();
+        }
+        let names = |d: &std::path::Path| -> Vec<String> {
+            let mut v: Vec<String> = std::fs::read_dir(d)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect();
+            v.sort();
+            v
+        };
+        // Row 0 is pinned at p1 in the committed view.
+        let mut st = h.cons.cluster_view.to_state();
+        st.pins.push(UpgradePin {
+            row: 0,
+            from: 1,
+            to: 2,
+            origin: p1,
+        });
+        st.applied = p1;
+        h.cons.cluster_view.publish(&st);
+
+        h.cons.prune_snapshots_below(p2);
+        assert_eq!(
+            names(&row_dir),
+            vec![format!("snap-{p1}.ultsnap"), format!("snap-{p2}.ultsnap")],
+            "p0 pruned, the pinned p1 kept, p2 at the floor kept"
+        );
+        assert_eq!(
+            names(&h.cons.cluster_snapshot_dir),
+            vec![
+                format!("snap-{p1}.ultcluster"),
+                format!("snap-{p2}.ultcluster")
+            ]
         );
     }
 
@@ -13480,6 +13688,175 @@ mod tests {
             !h.cons.settings_pending.exists(),
             "an accepted apply consumes the staged file"
         );
+    }
+
+    // ---- plan B1 task 7: admin op 10 `upgrade pin` ----
+
+    /// Stage `pin` as `<instance_dir>/upgrade.pending` — what `uc2ctl
+    /// upgrade pin` writes before it signs the digest.
+    fn stage_pin_for_test(h: &Harness, pin: &UpgradePin) {
+        let mut bytes = Vec::new();
+        encode_upgrade_pin(pin, &mut bytes);
+        std::fs::write(&h.cons.upgrade_pending, &bytes).expect("stage the pin");
+    }
+
+    /// The door checks are node-local and run BEFORE the FSM's own
+    /// `validate` (spec §2.5; Ruling R24's split). Each refusal leaves the
+    /// staged file in place and appends nothing.
+    /// `(status, reason)` only: the third word is the view position, which
+    /// `settings_apply_is_single_in_flight_on_the_view_position` compares
+    /// against the live atomic rather than a literal — do the same.
+    fn sr(t: (u32, u32, u64)) -> (u32, u32) {
+        (t.0, t.1)
+    }
+
+    #[test]
+    fn upgrade_pin_door_refusals_by_name() {
+        let mut h = harness_with_rows(&["a"]); // row 0 declared, rows 1..8 not
+        drive_to_serving_leader(&mut h);
+        let before = h.cons.last_cluster_append;
+        // 52: row 5 is not declared.
+        stage_pin_for_test(
+            &h,
+            &UpgradePin {
+                row: 5,
+                from: 1,
+                to: 2,
+                origin: 4096,
+            },
+        );
+        assert_eq!(
+            sr(h.cons.apply_upgrade_pin_staged()),
+            (1, REASON_PIN_ROW_UNDECLARED)
+        );
+        // 53 (no-pin half): the attached version word is 1.0.0, `from` says 2.0.0.
+        h.cons
+            .cnc
+            .service_slot(0)
+            .status
+            .store_version(pack_version(1, 0, 0));
+        stage_pin_for_test(
+            &h,
+            &UpgradePin {
+                row: 0,
+                from: pack_version(2, 0, 0),
+                to: pack_version(2, 1, 0),
+                origin: 4096,
+            },
+        );
+        assert_eq!(
+            sr(h.cons.apply_upgrade_pin_staged()),
+            (1, REASON_PIN_FROM_MISMATCH)
+        );
+        // 54: no complete set at 4096 (the set word reads 0).
+        stage_pin_for_test(
+            &h,
+            &UpgradePin {
+                row: 0,
+                from: pack_version(1, 0, 0),
+                to: pack_version(1, 1, 0),
+                origin: 4096,
+            },
+        );
+        assert_eq!(
+            sr(h.cons.apply_upgrade_pin_staged()),
+            (1, REASON_PIN_NO_SET)
+        );
+        // 56: the staged bytes differ from the signed digest.
+        h.cons.snapshot_set_position.store(4096, Ordering::Release);
+        let (status, reason, _) = h.cons.apply_upgrade_pin(1, 2, 3);
+        assert_eq!((status, reason), (1, REASON_PIN_DIGEST));
+        // 57 / 58: absent, then undecodable.
+        std::fs::remove_file(&h.cons.upgrade_pending).unwrap();
+        assert_eq!(h.cons.apply_upgrade_pin(0, 0, 0).1, REASON_PIN_MISSING);
+        std::fs::write(&h.cons.upgrade_pending, b"not twenty bytes").unwrap();
+        assert_eq!(h.cons.apply_upgrade_pin_staged().1, REASON_PIN_DECODE);
+        assert_eq!(h.cons.last_cluster_append, before, "nothing was appended");
+    }
+
+    /// Spec §3 S4 steps 2–3: pin → CLUSTER frame → applied at commit →
+    /// the row's cnc words hold origin and version.
+    #[test]
+    fn an_upgrade_pin_is_appended_as_a_cluster_frame_and_the_words_follow_at_commit() {
+        let mut h = harness_with_rows(&["a"]);
+        drive_to_serving_leader(&mut h);
+        h.cons
+            .cnc
+            .service_slot(0)
+            .status
+            .store_version(pack_version(1, 0, 0));
+        h.cons.snapshot_set_position.store(4096, Ordering::Release);
+        stage_pin_for_test(
+            &h,
+            &UpgradePin {
+                row: 0,
+                from: pack_version(1, 0, 0),
+                to: pack_version(1, 1, 0),
+                origin: 4096,
+            },
+        );
+        let (status, reason, end) = h.cons.apply_upgrade_pin_staged();
+        assert_eq!((status, reason), (0, 0));
+        assert!(!h.cons.upgrade_pending.exists(), "consumed on append");
+        assert_eq!(
+            h.cons.cnc.service_slot(0).status.upgrade_origin(),
+            0,
+            "nothing until commit"
+        );
+        // `commit_through` drives the harness's uc2-cluster agent (that is
+        // how `a_settings_command_is_appended_as_a_cluster_frame_and_the_view_follows_at_commit`
+        // sees the view move) — nothing else to call.
+        h.commit_through(end);
+        let s = &h.cons.cnc.service_slot(0).status;
+        assert_eq!(
+            (s.upgrade_origin(), s.pinned_version()),
+            (4096, pack_version(1, 1, 0))
+        );
+        assert_eq!(
+            h.cons.cluster_view.to_state().pin_for(0).map(|p| p.origin),
+            Some(4096)
+        );
+        // 55 now comes from the FSM (replicated): the same origin again.
+        stage_pin_for_test(
+            &h,
+            &UpgradePin {
+                row: 0,
+                from: pack_version(1, 1, 0),
+                to: pack_version(1, 2, 0),
+                origin: 4096,
+            },
+        );
+        assert_eq!(h.cons.apply_upgrade_pin_staged().1, REASON_PIN_NOT_MONOTONE);
+    }
+
+    #[test]
+    fn upgrade_pin_is_single_in_flight_on_the_view_position() {
+        let mut h = harness_with_rows(&["a"]);
+        drive_to_serving_leader(&mut h);
+        h.cons.snapshot_set_position.store(4096, Ordering::Release);
+        stage_pin_for_test(
+            &h,
+            &UpgradePin {
+                row: 0,
+                from: 0,
+                to: 1,
+                origin: 4096,
+            },
+        );
+        assert_eq!(h.cons.apply_upgrade_pin_staged().0, 0);
+        stage_settings_for_test(
+            &h,
+            &Settings {
+                snapshot_interval_bytes: 5,
+                ..Settings::genesis_default()
+            },
+        );
+        assert_eq!(
+            h.cons.apply_settings_staged().0,
+            2,
+            "retry: the pin is above the view"
+        );
+        assert!(h.cons.settings_pending.exists());
     }
 
     /// Spec §4.6, the load-bearing one: **the kernel's membership path is

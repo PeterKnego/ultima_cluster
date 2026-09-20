@@ -49,6 +49,8 @@ pub use uc_protocol::v2::cluster_image::{CLUSTER_IMAGE_MAGIC, CLUSTER_IMAGE_VERS
 pub const SCHEDULE_PENDING_FILE: &str = "schedules.pending";
 /// The same, for `ADMIN_OP_SETTINGS_APPLY` (spec §6).
 pub const SETTINGS_PENDING_FILE: &str = "settings.pending";
+/// The same, for `ADMIN_OP_UPGRADE_PIN` (spec §2.5, plan B1).
+pub const UPGRADE_PENDING_FILE: &str = "upgrade.pending";
 
 /// Spec §2.5: "a small bounded per-row history … a handful of entries".
 pub const MAX_PINS_PER_ROW: usize = 4;
