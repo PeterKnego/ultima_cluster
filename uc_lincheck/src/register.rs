@@ -123,6 +123,12 @@ impl uc_service::SnapshotStateMachine for RegisterSm {
         self.last_applied = la;
         Ok(position)
     }
+
+    fn project(&self, out: &mut dyn std::io::Write) -> Result<(), uc_service::SnapshotError> {
+        writeln!(out, "value={:?}", self.value)?;
+        writeln!(out, "last_applied={:?}", self.last_applied)?;
+        Ok(())
+    }
 }
 
 /// The pure CAS-register transition shared by both SDK `apply` impls (the only

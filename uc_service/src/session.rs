@@ -111,6 +111,17 @@ impl<S: RawStateMachine> Sessioned<S> {
         &mut self.inner
     }
 
+    /// `(client_id, highest_seq)` for every client the table remembers —
+    /// for [`SnapshotStateMachine::project`], not for general use (the table
+    /// itself stays private). `None` means the client has never had a fresh
+    /// frame applied (see [`ClientState::highest_seq`]).
+    fn sessions_for_projection(&self) -> Vec<(u64, Option<u64>)> {
+        self.clients
+            .iter()
+            .map(|(&id, st)| (id, st.highest_seq))
+            .collect()
+    }
+
     /// Deterministic victim order shared by both eviction paths: smallest
     /// `last_seen_pos`, ties broken by smallest `client_id`. Never wall-clock,
     /// never `HashMap` iteration order.
@@ -396,5 +407,15 @@ impl<S: SnapshotStateMachine> SnapshotStateMachine for Sessioned<S> {
         // frame — a silent one-command loss in every `Sessioned<S>` service.
         self.max_pos_seen = self.inner.last_applied();
         Ok(got)
+    }
+
+    fn project(&self, out: &mut dyn std::io::Write) -> Result<(), SnapshotError> {
+        self.inner.project(out)?;
+        let mut rows: Vec<(u64, Option<u64>)> = self.sessions_for_projection();
+        rows.sort_unstable();
+        for (client, seq) in rows {
+            writeln!(out, "session client={client} seq={seq:?}")?;
+        }
+        Ok(())
     }
 }
