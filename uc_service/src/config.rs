@@ -4,6 +4,20 @@
 //! Service configuration + error type.
 
 use std::path::PathBuf;
+use std::time::Duration;
+
+/// How long [`ServiceBuilder::start`](crate::ServiceBuilder::start) waits out
+/// a node that is still joining its cluster before giving up with
+/// [`ServiceError::NodeBooting`].
+///
+/// Ten seconds because that is an election plus a catch-up on a healthy
+/// cluster, and because the failure it covers — a service and its node
+/// restarting together, `systemd` starting both at once — is measured in
+/// hundreds of milliseconds, not seconds. A node that has not joined by then
+/// has something wrong with it, and an attach that reported success anyway
+/// would be attaching to a node whose cluster state (its upgrade pins above
+/// all) is not yet on the page.
+pub const DEFAULT_BOOT_WAIT: Duration = Duration::from_secs(10);
 
 /// Where the service attaches and which cluster it belongs to. The service
 /// resolves the node's well-known IPC paths under `instance_dir` and presents
@@ -12,6 +26,16 @@ use std::path::PathBuf;
 pub struct ServiceConfig {
     pub instance_dir: PathBuf,
     pub app_id: String,
+    /// Plan B3 T5: how long to wait for the node to publish its declared set
+    /// — i.e. to have joined its cluster and applied every committed
+    /// `CLUSTER` frame, upgrade pins included. Until it does, an attach is
+    /// [`ServiceError::NodeBooting`], and this is how long
+    /// [`ServiceBuilder::start`](crate::ServiceBuilder::start) keeps
+    /// retrying (every 20 ms) before returning that error.
+    ///
+    /// [`DEFAULT_BOOT_WAIT`] by default; [`Duration::ZERO`] disables the wait
+    /// and restores the pre-B3 behaviour of failing on the first look.
+    pub boot_wait: Duration,
 }
 
 impl ServiceConfig {
@@ -19,7 +43,14 @@ impl ServiceConfig {
         Self {
             instance_dir: instance_dir.into(),
             app_id: app_id.into(),
+            boot_wait: DEFAULT_BOOT_WAIT,
         }
+    }
+
+    /// Override [`boot_wait`](Self::boot_wait). `Duration::ZERO` = no wait.
+    pub fn with_boot_wait(mut self, boot_wait: Duration) -> Self {
+        self.boot_wait = boot_wait;
+        self
     }
 }
 
@@ -99,16 +130,28 @@ pub enum ServiceError {
          []); the node's page carries no names — is the node older than cnc 3.1?"
     )]
     UnknownFsmNoNames { name: String },
-    /// The node is mid-boot: its page carries FSM names on line 7 but
-    /// `services_declared` still reads 0. `create_file` publishes a complete,
-    /// crc-valid header (names included) and the node stores the declared set
-    /// and lag policy a few statements later; a page with names and no
-    /// declared set exists ONLY in that gap — a configured node always
-    /// declares a nonzero set, and a harness page has no names. Attaching on
-    /// it would read the harness `(0, _) => Off` lag arm and fix `LagMode::Off`
-    /// for the attachment's life, silently, on a lockstep cluster.
+    /// The node has not joined its cluster yet: its page carries FSM names on
+    /// line 7 but `services_declared` still reads 0. `create_file` publishes a
+    /// complete, crc-valid header (names included) at `Node::start`, and since
+    /// plan B3 the node stores the declared set and lag policy from the
+    /// CONSENSUS PASS — on the first pass where it knows a leader, has learned
+    /// a commit position, and its cluster FSM has consumed the log up to that
+    /// commit. A page with names and no declared set exists ONLY in that gap —
+    /// a configured node always declares a nonzero set, and a harness page has
+    /// no names. So this is not "the page is missing or half-written": the
+    /// page is fine and the CLUSTER is what this node is still joining.
+    ///
+    /// Two reasons the gap is a refusal rather than a shrug. Attaching in it
+    /// would read the harness `(0, _) => Off` lag arm and fix `LagMode::Off`
+    /// for the attachment's life, silently, on a lockstep cluster; and an
+    /// upgrade pin committed above the artifact this node recovered from is
+    /// not yet on its page, so a service attaching in the gap would read "no
+    /// pin" and replay from genesis under a new binary.
+    ///
+    /// [`ServiceConfig::boot_wait`](crate::ServiceConfig::boot_wait) is how
+    /// long `ServiceBuilder::start*` waits this out before returning it.
     #[error(
-        "the node is still initialising its cnc page (FSM names published, \
+        "the node has not joined its cluster yet (FSM names published, \
          declared set not yet) — it is booting; retry the attach"
     )]
     NodeBooting,

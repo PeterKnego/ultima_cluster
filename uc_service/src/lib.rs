@@ -68,7 +68,7 @@ use crate::output::{OutputState, output_cycle};
 use crate::snapshots::SnapshotStore;
 
 pub use crate::apply::{SNAPSHOT_FREEZE_FAILED, SNAPSHOT_SKIPPED_BUSY};
-pub use crate::config::{ServiceConfig, ServiceError, SnapshotError};
+pub use crate::config::{DEFAULT_BOOT_WAIT, ServiceConfig, ServiceError, SnapshotError};
 pub use crate::ids::IdGen;
 pub use crate::session::{
     SESSION_HEADER_LEN, SessionConfig, Sessioned, TAG_EXPIRED, TAG_FRESH, TAG_REPLAYED,
@@ -216,6 +216,12 @@ impl<S: RawStateMachine, O: RawOutputHandler<S>> ServiceBuilder<S, O> {
         // A row the cluster has pinned is refused here by name
         // (`PinRequiresSnapshots`) rather than replaying the origin's prefix
         // under this version.
+        //
+        // Plan B3 T5: a node publishes its declared set only once it has
+        // joined its cluster, so an attach that lands in that window is
+        // `NodeBooting`. Wait it out, bounded by `cfg.boot_wait` — `attach`
+        // takes `sm` by value, so the retry has to be here, ahead of it.
+        attach::wait_out_node_boot(&cfg)?;
         let attached = attach::attach(&cfg, sm, None)?;
         let buffer = attached.buffer;
         let cnc = attached.cnc;
@@ -324,6 +330,8 @@ impl<S: RawStateMachine, O: RawOutputHandler<S>> ServiceBuilder<S, O> {
             Box::new(|sm: &mut S, pos: u64, src: &mut dyn std::io::Read| {
                 sm.install_snapshot(pos, src)
             });
+        // Plan B3 T5: as `start` — wait out a node that has not joined yet.
+        attach::wait_out_node_boot(&cfg)?;
         let attached = attach::attach(&cfg, sm, Some(install))?;
         let install = attached
             .install

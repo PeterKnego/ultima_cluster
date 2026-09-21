@@ -67,7 +67,7 @@ scrape_configs:
 ```
 
 `/metrics` serves `text/plain; version=0.0.4` — standard Prometheus text
-exposition. The full series contract — 111 families — is the
+exposition. The full series contract — 115 families — is the
 `CONTRACT_SERIES` array in
 [`uc_node/src/obs/metrics.rs`](../../uc_node/src/obs/metrics.rs); a test
 pins every family in that array against what the renderer actually emits, so
@@ -149,6 +149,35 @@ Two shapes to know before writing a query:
   `uc_service_attached{service="k"} 0` with zeros beside it. That is
   deliberate: you cannot alert on a series that is absent, and "declared but
   never started" is the state that silently closes admission cluster-wide.
+- **Before the node has joined its cluster there are no per-FSM rows at
+  all** (2.13.0). The node publishes its declared set from the consensus
+  pass, not at `Node::start` — see the readiness gate below — so a scrape
+  that lands in that window reads `uc_services_declared 0`, renders no
+  `service!=""` rows and no `uc2ctl status` FSM lines. This is the one case
+  in which an absent row is not a defect; it clears within a pass or two of
+  the node hearing a leader. Use `uc2_agent_alive` and `uc2_commit_bytes`,
+  which are present from boot, to tell "still joining" from "dead", and do
+  not write a fleet query that reads a booting node's `0` as a declared-set
+  disagreement: the `count_values` drift queries below will briefly see two
+  values during a rolling restart.
+
+**The readiness gate (2.13.0).** The declared set is published on the first
+consensus pass where the node knows a leader, has learned a commit position,
+and its cluster FSM has consumed the log up to that commit — "this node has
+joined its cluster and applied every committed `CLUSTER` frame, upgrade pins
+included". One `services_declared_published` record marks it (below). Until
+then services and clients attaching to that node are refused `NodeBooting`
+and wait it out for their configured `boot_wait` (default 10 s). Two
+readings worth a dashboard note: `uc2_cluster_fsm_position` on a node,
+compared against `uc2_commit_bytes` **on that same node**, is the "is the
+cluster FSM keeping up?" question the gate asks (it is the `uc2-cluster`
+agent's walk cursor, per node and not fleet-constant); and a node whose own
+durable position trails commit does not satisfy the gate, since the cluster
+FSM applies at `min(commit, durable)`. That inversion is transient on a
+follower and cannot persist there at all — a follower's commit is bounded by
+its own durable — so a node stuck on it is a **leader** whose durability path
+is failing. After ~1 s of passes with the gate shut the node says which
+clause is holding it, once, as `services_declared_withheld` (below).
 
 `uc_service_lag_waits_total{service}` counts wait EPISODES at the lag
 barrier — one increment per park, however long the park lasts, so read its
@@ -205,7 +234,11 @@ replicated schedule table — plus four **off-contract** timing families
 | `uc2_schedule_apply_refused_total` | counter | none | **All three staged-file admin verbs' refusals, not just `schedule apply`** — `uc2ctl schedule apply` (op 6), `uc2ctl settings apply` (op 7) and, since `2.13.0`, `uc2ctl upgrade pin` (op 10) share this one counter; the name predates the other two. Which verb refused, and why, is in the `schedule_apply_refused` / `settings_apply_refused` / `upgrade_pin_refused` event record's `reason` field, not in any label here. **Retries are not counted**: neither a follower's (the staged file is node-local, so the request is never forwarded) nor the leader's while a previous cluster frame is still above commit |
 | `uc2_upgrade_pin_origin` (FSM upgrade lifecycle, 2.13.0) | gauge | `service`, `row` | the row's pinned origin position from the newest committed `UpgradePin`, as republished onto the cnc status line by the `uc2-cluster` agent; `0` = no pin or unreadable (a scrape that lands on a `Contended` seqlock read renders the same as `NoPin`, rather than a stale value). Identical on every node once caught up — see `uc2ctl upgrade show` |
 | `uc2_upgrade_pin_version` (FSM upgrade lifecycle, 2.13.0) | gauge | `service`, `row` | the packed version the row's newest `UpgradePin` names (`to`); `0` = no pin or unreadable, same `Contended`-renders-as-zero rule as the gauge above. A service whose `VERSION` differs is refused at attach (plan B2) |
-| `uc2_snapshot_hash_mismatch` (FSM upgrade lifecycle, 2.13.0) | gauge | `service`, `row` | nodes whose artifact hash for the row's newest reported instant differs from the majority's (spec §6.5.2), recomputed from the committed `SnapshotReport` at scrape; `0` = agreed or no majority to differ from. Alert: `Uc2SnapshotHashDiverged` |
+| `uc2_snapshot_hash_mismatch` (FSM upgrade lifecycle, 2.13.0) | gauge | `service`, `row` | nodes whose artifact hash for the row's newest reported instant differs from the majority's (spec §6.5.2), recomputed from the committed `SnapshotReport` at scrape; `0` = agreed or no majority to differ from. Alert: `Uc2SnapshotHashDiverged`. **The records this reads are produced live**: every node hashes each row artifact as its builder streams it and reports `(row, P, hash)` to the leader, which commits one record per `(row, P)` — the four counters below are that path |
+| `uc2_snapshot_reports_sent_total` (2.13.0) | counter | none | live `SNAP_REPORT` datagrams this node handed the transport for the leader on a set-complete edge — one per declared row that had published an artifact at the instant. A **leader** hands its own rows' hashes straight to its collector with no datagram and so exports `0`; on a follower this climbs by the declared-row count once per completed instant. It counts the **hand-off, not the delivery**: with crypto on, a control datagram with no established session to the leader is dropped inside the send and still counted |
+| `uc2_snapshot_reports_unsent_total` (2.13.0) | counter | none | reports this node dropped because it knew of no leader to address (no leader hint, or a hint naming a member it cannot resolve — an election in progress). A brief run around a failover is expected. **Sustained means this node's hashes never reach the committed record**, and a pin adjudicated from that record is missing a voter |
+| `uc2_snapshot_reports_appended_total` (2.13.0) | counter | none | `SnapshotReport` records (`CLUSTER kind = 5`) this node placed on the log **while leading** — one per row per instant it collected for. A follower appends none, so this sits still everywhere but the leader; cluster-wide it should climb by the declared-row count once per completed instant. **One documented gap: a collection in flight when the leader steps down is discarded, and that instant's record is never appended at all.** Nodes report on their own set-complete edge, which has passed, and the new leader's collector starts empty — so its 5 s timeout has nothing to fire on. Nothing is lost that matters (the artifacts are on disk and the next instant reports again), but a counter that skips exactly one instant across a failover is that, not a stalled collector |
+| `uc2_snapshot_reports_timed_out_total` (2.13.0) | counter | none | the subset of the counter above that went in on the **5 s collection timeout** rather than on every voter reporting. A brief run around a failover or restart is expected; a rate that keeps pace with `appended` means the records name too few voters to tell a divergent replica from an absent one — check `uc2_snapshot_reports_unsent_total` and the set-completion gauges on the quiet nodes. An **uncommitted** promote or add also lands here: the still-catching-up node counts as a required voter for as long as that configuration is in flight |
 
 **One alert rule**, `Uc2LogTimeFrozen` (warning, `for: 30s`):
 `uc2_log_time_lag_seconds > 5 and on(instance) uc2_is_leader == 1`. The
@@ -306,7 +339,7 @@ The `uc2_agent_alive` family covers **five** agents — `consensus`, `sender`,
 `receiver`, `archive`, and `cluster` (the `uc2-cluster` agent, labelled like
 its four siblings without the thread-name prefix).
 
-**Nine records** go with them — four at info, five at warn:
+**Thirteen records** go with them — eight at info, five at warn:
 
 | Event | Level | Fields | Means, and what to do |
 |---|---|---|---|
@@ -318,6 +351,10 @@ its four siblings without the thread-name prefix).
 | `upgrade_pin_refused` (FSM upgrade lifecycle, 2.13.0) | warn | `node`, `reason` | a `uc2ctl upgrade pin` was refused; `reason` is the 52–58 code [`uc2ctl` prints](../reference/uc2ctl.md#refusal-reasons) |
 | `cluster_command_applied` | info | `position`, `kind`, `accepted`, `reason` | this node's cluster FSM applied a `CLUSTER` command at frame-end `position`. `kind` is `1` Membership / `2` ScheduleTable / `3` Settings / `4` UpgradePin / `5` SnapshotReport; `accepted` is `1` or `0`, with `reason` naming the refusal code when it is `0`. A refusal here is **deterministic and identical on every node** — it is the FSM's own validation, not a node-local judgement |
 | `cluster_artifact_installed` | info | `position`, `path` | a snapshot session's cluster artifact was installed by fiat at `position`; this node now holds the cluster's membership, schedule table and settings as of that position, before its purge floor advances |
+| `snapshot_report_sent` (FSM upgrade lifecycle, 2.13.0) | info | `node`, `row`, `position` | this node completed its **local** snapshot set at `position` and reported that row's artifact hash to the leader. Once per row per instant, on every node — voters and learners alike. On the leader it means the same thing with no datagram involved (it feeds its own collector in process), which is why `uc2_snapshot_reports_sent_total` stays `0` there while these records still appear. Nothing to do; this is the healthy signal |
+| `snapshot_report_superseded` (FSM upgrade lifecycle, 2.13.0) | info | `node`, `row`, `old`, `new` | **leader only.** A report arrived for a NEWER instant (`new`) while the leader was still collecting the older one (`old`), so the older collection was discarded — hashes for two different artifacts must never be mixed into one record, and the timeout restarts on the new instant. Expected when instants come faster than the slowest replica completes a set; a steady run of these means no instant ever gets a full record, so lengthen the interval between instants |
+| `snapshot_report_appended` (FSM upgrade lifecycle, 2.13.0) | info | `node`, `row`, `position`, `frame_end`, `reporters`, `voters_reporting`, `voters_required`, `by` | **leader only.** The `SnapshotReport` for `row` at `position` went onto the log at `frame_end`, naming `reporters` nodes of which `voters_reporting` were voters. `by` is `"all_voters"` (every voter in the current membership reported — the healthy case) or `"timeout"` (5 s elapsed after the first report and the record went in naming whoever had). A `"timeout"` here is what increments `uc2_snapshot_reports_timed_out_total`; compare `voters_reporting` against `voters_required` to see how many were missing |
+| `snapshot_report_dropped` (FSM upgrade lifecycle, 2.13.0) | info | `node`, `row`, `position`, `reason` | **leader only.** A ready collection was discarded instead of appended. `reason = "stale"` — the row's committed report has since moved to that position or beyond (another leader's record committed underneath), so this one says nothing new; `reason = "no_members"` — every node that reported has since left the configuration, leaving nothing to attest with. Both are benign reconfiguration/failover outcomes. A repeating `"stale"` on one row would mean two nodes believe they lead |
 | `snapshot_hash_diverged` (FSM upgrade lifecycle, 2.13.0) | warn | `row`, `position`, `node`, `majority_hash` | this node's cluster FSM applied a `SnapshotReport` for `row` at `position` and found `node` in the minority against `majority_hash` — that node's artifact hashes differently from the rest. One event per minority node. Alert: `Uc2SnapshotHashDiverged`; run `uc2ctl upgrade show`, then `uc2-diffreplay determinism` on that row's corpus. **Re-emitted on replay**, like `upgrade_pin_applied`: a cluster-agent overrun replays the gap from the journal and re-applies the reports in it, so a divergence you investigated and resolved months ago can warn again the next time that span is replayed. Check the `position` field against the current one before treating it as new |
 
 ### The snapshot families (2.11.0)
@@ -687,6 +724,8 @@ flooding.
 | `config_loaded` | `path`, `sha256` | the config file that was read, and plain SHA-256 over its bytes — the config half of a release identity, checkable with `sha256sum`. See [Record a release](record-a-release.md). |
 | `config_env_override` | `var`, `value` | one `UC2_*` [environment override](../reference/configuration.md#environment-overrides) took effect, so this value did NOT come from the config file. Emitted before `[log] level` is applied, so it appears even at `warn`. |
 | `node_listening` | `node`, `bind` | the node is up and its UDP socket is bound to `bind`. The first record of a healthy boot. |
+| `services_declared_published` (2.13.0) | `node`, `commit`, `cluster_position` | this node **joined its cluster**: it knows a leader, has learned a commit position (`commit`), and its cluster FSM has consumed the log up to it (`cluster_position`, the `uc2-cluster` agent's walk cursor). Publishing the declared set is what opens the attach door — before this record, services and clients are refused `NodeBooting` and wait it out for their `boot_wait` (default 10 s), and `/metrics` renders `uc_services_declared 0` with no per-FSM rows. **Exactly one per node incarnation**, and it should follow `node_listening` within a pass or two. If it never arrives, read the `services_declared_withheld` warning below — the node names the clause itself. Together with `node_listening` it is the pair to key a "node fully up" dashboard on. |
+| `services_declared_withheld` (2.13.0, `warn`) | `node`, `clause`, `commit`, `cluster_position` | the counterpart: after ~1 s of consensus passes with the attach door still shut, the node names the clause holding it — `leader_unknown` (it hears no leader: check connectivity and whether a quorum is up), `commit_unlearned` (it knows a leader but has taken no commit position from it yet), or `walk_behind` (its `uc2-cluster` agent has not consumed the log up to `commit`; compare the two numbers). **Exactly one per node incarnation**, edge-triggered — it is not repeated while the condition lasts, and there is no record when the gate later opens other than `services_declared_published` itself. A `walk_behind` that never clears means this node's durable position is behind its commit, which can only persist on a **leader** (see the readiness-gate note above). No alert rule keys on it: one line per boot on a node that is merely slow to join is normal. |
 | `metrics_listening` | `node`, `url` | the observability endpoint is bound; `url` is the exact `/metrics` address. Absent when no `[metrics]` section is configured. |
 | `statvfs_failed` (derived) | `node`, `dir`, `err` | the ~1s pass could not stat the instance dir's filesystem, so `uc2_free_disk_bytes` still holds its previous value rather than a misleading zero. Rate-limited like the other derived records. |
 | `draining` | `node` | SIGTERM/SIGINT received; the observability endpoint is closed and the archive is draining to the `--drain-timeout-secs` deadline |

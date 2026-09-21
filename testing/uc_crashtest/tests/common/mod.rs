@@ -458,6 +458,22 @@ pub fn wait_for_path(path: &Path, timeout: Duration) {
 ///
 /// Fresh-boot only: on a respawn over a SAME dir use `wait_for_fresh_instance`,
 /// since a stale leftover cnc2.dat can let `connect` validate the OLD page.
+///
+/// Plan B3 T5 — **call this after EVERY node of the cluster has been spawned,
+/// never inside the spawn loop.** A successful attach is still exactly what
+/// this waits for, and since T5 an attach also waits for the node to have
+/// JOINED its cluster: it publishes `services_declared`, the word every
+/// attacher reads as "ready", only then. Node 0 of an n-voter cluster cannot
+/// join until nodes 1..n exist, so a loop that spawns one node and waits here
+/// before spawning the next deadlocks until `boot_wait` expires. Every
+/// multi-node caller in this crate is two passes for that reason: spawn all,
+/// then wait all.
+///
+/// The weaker alternative — returning as soon as the page reads "booting" —
+/// was tried and is WRONG: `node_booting` is the ABSENCE of the declared set,
+/// which is equally true before the rings exist and after, and
+/// `Engine::attach` raises it before it opens a single ring. It would return
+/// inside the very window this helper exists to close.
 pub fn wait_for_ready(instance_dir: &Path, timeout: Duration) {
     drop(connect_with_retry(instance_dir, timeout));
 }
@@ -500,8 +516,19 @@ pub fn wait_for_fresh_instance(
 /// Connect a client, retrying until the node is ready to accept the attach
 /// (the cnc2.dat file can exist a moment before the node has finished
 /// creating every ring file).
+///
+/// Plan B3 T5: `timeout` is the budget for THOSE retries, and it is now spent
+/// on top of the one wait the attach performs for itself. A node publishes
+/// its declared set only once it has joined its cluster, and
+/// `Client::connect` waits `uc_client::DEFAULT_BOOT_WAIT` for that before it
+/// reports `NodeBooting` — so a caller passing 10 s would otherwise see its
+/// whole budget consumed by the FIRST attempt, and this loop would never take
+/// a second turn. The wait is added rather than replacing the budget: the two
+/// answer different questions ("has this node joined?" and "is this
+/// instance dir finished?"), and a restarted node in these tests can need
+/// both.
 pub fn connect_with_retry(instance_dir: &Path, timeout: Duration) -> Client {
-    let deadline = Instant::now() + timeout;
+    let deadline = Instant::now() + timeout + uc_client::DEFAULT_BOOT_WAIT;
     loop {
         match Client::connect(instance_dir, APP_ID) {
             Ok(c) => return c,

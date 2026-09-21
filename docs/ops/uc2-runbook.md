@@ -52,6 +52,36 @@ verify rather than a build:
   faulted-exit/restart contract when a node's instance restarts underneath a
   running gateway.
 
+### Boot order: nodes first, then services (2.13.0)
+
+A node does not open its attach door until it has **joined its cluster** — it
+knows a leader, has learned a commit position, and its cluster FSM has applied
+every committed `CLUSTER` frame (upgrade pins included). Until then a service
+or client attaching there is refused `NodeBooting`, which
+`ServiceBuilder::start*`, `Client::connect` and `Engine::attach` wait out
+internally for `boot_wait` (default **10 s**, `Duration::ZERO` = no wait).
+
+- **Start every node, wait for a leader, then start the services.** Under
+  systemd on separate hosts this happens by itself; the case that bites is a
+  harness or embedded deployment bringing up several nodes **in one process**
+  and interleaving node-then-service — the first service burns its whole
+  `boot_wait` waiting for a leader that cannot be elected until a peer that
+  has not been started yet exists.
+- **`declared=[]` with no FSM rows on a configured node means "not joined
+  yet", not "misconfigured."** So does `uc_services_declared 0` with no
+  per-FSM series on `/metrics`. One `services_declared_published` record marks
+  the transition; it should follow `node_listening` within a pass or two.
+- **A saturated node wants a longer `boot_wait`.** The cluster FSM applies at
+  `min(commit, durable)`, so a node whose own durable position persistently
+  trails commit keeps the gate shut.
+
+Why the gate exists: an upgrade pin committed *above* the artifact a
+restarting node recovered from is invisible on that node for a few passes,
+and a service attaching in that window would read "no pin" and replay from
+genesis under a new binary. See
+[Upgrade a cluster](../how-to/upgrade-a-cluster.md) and
+[Configuration § Attaching a service or a client](../reference/configuration.md).
+
 ### Placing the processes on cores
 
 Two deploy-time choices move the commit path's own latency more than any

@@ -10,7 +10,7 @@ self-locating header is in [Architecture](../ARCHITECTURE.md).
 
 | Constant | Value |
 |---|---|
-| `version::CURRENT` | `0.7.0` (`0.8.0`, since `2.12.0`, two new pairwise kinds for jumbo-frame MTU discovery, `PROBE` (24) and `PROBE_ACK` (25); no existing layout changes) (`0.9.0`, since `2.13.0`, two `CLUSTER` kinds, 4 and 5, no layout change; a 0.8.0 peer applies either as undecodable and its cluster FSM silently diverges — stop every node before starting any) |
+| `version::CURRENT` | `0.7.0` (`0.8.0`, since `2.12.0`, two new pairwise kinds for jumbo-frame MTU discovery, `PROBE` (24) and `PROBE_ACK` (25); no existing layout changes) (`0.9.0`, since `2.13.0`, two `CLUSTER` kinds, 4 and 5, and one pairwise datagram kind, `SNAP_REPORT` (26), no layout change; a 0.8.0 peer applies either as undecodable and its cluster FSM silently diverges — stop every node before starting any) |
 | cnc page version | 3.1 (FSM identity + log time, 2.11.0: the name + hash line at boot, the version word at attach, `log_time_ns`, per-row `timers_pending`) (3.2, since `2.12.0`, a live `payload_ceiling` word) (3.3, since `2.13.0`, three node-written words on the service status line, `upgrade_origin`, `pinned_version` and their `pin_seq` seqlock) |
 
 The cnc page carries its own version gate, `CNC_V2_VERSION`, which is
@@ -83,6 +83,7 @@ The header is authenticated as AAD when wire crypto is enabled, and carries a
 | 23 | `SNAP_REDIRECT` | pairwise |
 | 24 | `PROBE` | pairwise (`0.8.0`, `2.12.0` — jumbo-frame MTU discovery) |
 | 25 | `PROBE_ACK` | pairwise (`0.8.0`, `2.12.0` — jumbo-frame MTU discovery) |
+| 26 | `SNAP_REPORT` | pairwise (0.9.0, 2.13.0 — live snapshot-hash reports) |
 
 Kind **21** was `SNAP_TABLE` — the schedule table carried beside a session —
 and is **retired** (`DGRAM_KIND_SNAP_TABLE_RETIRED`). The table now rides the
@@ -228,6 +229,28 @@ leader's commit rule over the probed rungs are
 [the jumbo-frame discovery spec](../superpowers/specs/2026-09-10-uc2-jumbo-frame-discovery-design.md)
 §5.1–5.3 (see its "Errata (plan 1, as built)" section for two corrections to
 §5.1's stop condition and cadence).
+
+#### `SNAP_REPORT` body (wire 0.9.0, `2.13.0`)
+
+Plan B3, live snapshot-hash reports: every node — leader or follower —
+reports one row's snapshot artifact hash the moment it freezes at a
+coordinated instant, addressed to the leader. This is the LIVE, per-node
+signal; the leader's own committed record of what it collected is a
+separate thing, `CLUSTER kind = 5 SnapshotReport` on the log (above). 24
+bytes, exact-length.
+
+| bytes | field | width | meaning |
+|---|---|---|---|
+| 0 | `row` | u8 | the declared FSM row (0..8) whose artifact this reports |
+| 1..4 | reserved | — | zero; a non-zero reserved byte refuses the body |
+| 4..8 | `node_id` | u32 | the reporting node's own id |
+| 8..16 | `position` | u64 | the position the artifact froze at; `0` refuses the body — position 0 is never a legitimate freeze |
+| 16..24 | `hash` | u64 | the artifact's hash at that position |
+
+Term-independent like `PROBE`/`PROBE_ACK` — a hash is a hash whoever is
+leading this term — so a receiver admits it before the stale-term drop,
+rather than through the term-adopting consensus-kind path (kinds 5–11).
+`Scope::Pairwise`.
 
 ### Administration
 

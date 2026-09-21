@@ -551,6 +551,21 @@ impl ClusterAgent {
         if applied_any {
             self.publish_view();
         }
+        // Plan B3 T5: …but the WALK is published, every pass, through the
+        // view's `consumed` word — one `fetch_max`, no mutex, nothing on the
+        // consensus hot path reading it in steady state. That is what lets
+        // the declared-set gate ask "has this node's cluster FSM caught up
+        // with commit?" on a cluster whose committed traffic is all ordinary
+        // MESSAGE frames, where `position` would sit still forever.
+        //
+        // LAST, after `publish_view`, and that order is load-bearing: the
+        // gate opens on this word (Release here, Acquire there) and what it
+        // promises an attaching service is that this row's PIN WORDS — which
+        // `publish_view` writes — are already on the page. Publishing the
+        // walk first would leave a window in which the node reads as ready
+        // while the pin it just applied is not yet visible, which is the
+        // whole bug the gate exists to close.
+        self.view.note_consumed(self.fsm.state().applied);
         applied_any || installed_any
     }
 

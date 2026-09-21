@@ -490,6 +490,78 @@ a network-path adversary who can spoof a member's UDP source address can
 still inject a proposal onto that plane. **`[admin] auth = "hmac"` only
 authenticates cluster-wide when paired with `[crypto].enabled = true`.**
 
+## Attaching a service or a client: `boot_wait`
+
+Everything above configures the **node**. The attaching sides have one key of
+their own, added in `2.13.0`, carried on three config structs:
+
+| Key | Crate | Reached by | How to set it |
+|---|---|---|---|
+| `ServiceConfig::boot_wait: Duration` | `uc_service` | `ServiceBuilder::start` / `start_with_snapshots` | `ServiceConfig::with_boot_wait(..)` |
+| `EngineConfig::boot_wait: Duration` | `uc_client` | `Engine::attach` | plain struct field |
+| `PipelinedConfig::boot_wait: Duration` | `uc_client` | `PipelinedClient::connect` (hands it to `EngineConfig` unchanged) | plain struct field |
+
+**Default: 10 seconds** on all three. `Duration::ZERO` disables the wait
+entirely and restores the pre-`2.13.0` behaviour of failing on the first
+look.
+
+**`Client::connect` is not configurable here.** It takes no config at all: it
+builds a `PipelinedConfig` internally and puts the 10 s default into it. If
+you need a different wait on the client side, use `PipelinedClient::connect`
+or `Engine::attach` with your own config.
+
+What it waits for. Since `2.13.0` a node does not publish its declared set —
+the word both attach doors read — at `Node::start`. It publishes it from the
+consensus pass, on the first pass where the node **knows a leader**, has
+**learned a commit position** (its own quorum ranking as leader, or a
+leader's gossip), and its cluster FSM has **consumed the log up to that
+commit**. In one sentence: *the node has joined its cluster and applied every
+committed `CLUSTER` frame, upgrade pins included.* Until then both doors
+refuse with:
+
+- `ServiceError::NodeBooting` — the service side;
+- `ClientError::NodeBooting` — the client side.
+
+`NodeBooting` means "the node has not joined its cluster yet", **not** "the
+cnc page is missing or malformed" — a missing or wrong-`app_id` page is a
+different, immediate refusal. It is a retry-and-it-will-clear condition, and
+`boot_wait` is how long `start*` / `connect` / `attach` retry it internally
+(re-reading the page every 20 ms) before handing the error back to you.
+
+Why a gate at all: an upgrade pin committed *above* the artifact a restarting
+node recovered from is invisible to that node for the few passes it takes to
+catch up. A service that attached inside that window would read "no pin" and
+replay from genesis under the new binary. The gate makes "no pin" a statement
+about committed cluster state instead. See
+[Upgrade a cluster](../how-to/upgrade-a-cluster.md).
+
+Two operational consequences:
+
+- **In one process, start every node before attaching any service.** A
+  harness or embedded deployment that brings up N nodes and their services
+  interleaved — start node 0, attach its service, start node 1, … — deadlocks
+  against its own `boot_wait`: node 0 cannot know a leader until enough peers
+  exist to elect one, so its service's attach burns the whole wait while the
+  peer that would end it has not been started. Start all N nodes first, then
+  attach.
+- **`boot_wait` covers a slow join, not a stuck one.** The cluster FSM applies
+  at `min(commit, durable)`, so a node whose durable position is behind its
+  commit keeps the third clause false until the durable catches up. A larger
+  `boot_wait` is the right answer while that is *transient* — a long archive
+  walk at boot, a large artifact to install, a node catching up after a
+  restart. It is never the answer to a *persistent* inversion, and it cannot
+  be: a **follower's** commit cannot outrun its own durable at all (its commit
+  is `deferred_commit.min(validated_up_to)`, and `validated_up_to` only ever
+  grows to that node's own `durable` — `uc_consensus/src/election.rs`), so the
+  inversion is only possible on a **leader**, whose commit is the quorum-th
+  ranked durable position and is therefore a statement about the cluster, not
+  about this node's disk. If it persists, every attach on that node is refused
+  for the life of the incarnation and no `boot_wait` is large enough — fix the
+  node's durability path (its disk, its archive agent), not the timeout. The
+  node names which clause is holding it in one `services_declared_withheld`
+  warning; see
+  [Monitor a cluster](../how-to/monitor-a-cluster.md#events-worth-alerting-on).
+
 ## Cluster limits
 
 | Limit | Value | Origin |

@@ -609,21 +609,37 @@ impl<SM: SnapshotStateMachine + Default, SM1: SnapshotStateMachine + StateMachin
                 crypto_config_for(i as NodeId),
             );
             let node = Node::start_with_socket(cfg, sock).expect("node start");
-            // A follower's service follows the committed log too, so every node
-            // carries a service from boot — the new leader after a failover
-            // already has one attached.
-            let service = spawn_service(&instance_dir, ccfg.snapshot_interval_bytes);
-            let service1 = spawn_service1::<SM1>(&instance_dir, ccfg);
-            let service_timer = spawn_service_timer_opt(&instance_dir, ccfg);
             nodes.push(NodeSlot {
                 id: i as NodeId,
                 addr,
                 instance_dir,
                 node: Some(node),
-                service: Some(service),
-                service1,
-                service_timer,
+                service: None,
+                service1: None,
+                service_timer: None,
             });
+        }
+        // Plan B3 T5: EVERY node first, THEN the services — two passes, and
+        // the split is load-bearing, not tidiness. A node publishes its
+        // declared set only once it has joined its cluster (it knows a
+        // leader, has learned a commit, and its cluster FSM has consumed the
+        // log up to it), and an attach before that waits
+        // `ServiceConfig::boot_wait` out and then fails `NodeBooting`. Node 0
+        // of a three-voter cluster cannot join until nodes 1 and 2 exist, so
+        // attaching its service inside the spawn loop would block the loop
+        // that is supposed to start them: a deadlock that ends in eight
+        // capstones failing `service start: NodeBooting`.
+        //
+        // A follower's service follows the committed log too, so every node
+        // still carries a service from boot — the new leader after a failover
+        // already has one attached.
+        for slot in &mut nodes {
+            slot.service = Some(spawn_service(
+                &slot.instance_dir,
+                ccfg.snapshot_interval_bytes,
+            ));
+            slot.service1 = spawn_service1::<SM1>(&slot.instance_dir, ccfg);
+            slot.service_timer = spawn_service_timer_opt(&slot.instance_dir, ccfg);
         }
         // M7 Task 10: reserve (bind-then-drop, same tolerance as `rebind`
         // elsewhere in this file) an extra address for the spare, outside the
@@ -1345,25 +1361,35 @@ impl<SM: SnapshotStateMachine + Default, SM1: SnapshotStateMachine + StateMachin
                 );
                 let sock = rebind(spare_addr);
                 let node = Node::start_with_socket(cfg, sock).expect("spare node start");
-                // M14c2: the spare is a FULL node — under `FsmSet::Two` it must
-                // boot BOTH declared FSMs or the leader's declared-set check
-                // refuses its join.
-                let service = spawn_service(&dir, self.ccfg.snapshot_interval_bytes);
-                let service1 = spawn_service1::<SM1>(&dir, self.ccfg);
-                let service_timer = spawn_service_timer_opt(&dir, self.ccfg);
                 self.spare = Some(NodeSlot {
                     id,
                     addr: spare_addr,
-                    instance_dir: dir,
+                    instance_dir: dir.clone(),
                     node: Some(node),
-                    service: Some(service),
-                    service1,
-                    service_timer,
+                    service: None,
+                    service1: None,
+                    service_timer: None,
                 });
                 let (ip, port) = Self::addr_to_wire(spare_addr);
                 let resp =
                     Self::admin_request(&leader_cnc, 1 /* AddLearner */, id, ip, port, 10);
                 if resp.status == 0 {
+                    // M14c2: the spare is a FULL node — under `FsmSet::Two` it
+                    // must boot BOTH declared FSMs or the leader's declared-set
+                    // check refuses its join.
+                    //
+                    // Plan B3 T5: spawned AFTER the `AddLearner` is accepted,
+                    // and that order is load-bearing. A node publishes its
+                    // declared set only once it has joined its cluster, and
+                    // this spare boots OUTSIDE the membership: nothing gossips
+                    // to it until the leader adds it, so an attach before this
+                    // point waits `ServiceConfig::boot_wait` out and then
+                    // fails `NodeBooting` — with the admin request it is
+                    // blocking never sent.
+                    let slot = self.spare.as_mut().expect("spare live");
+                    slot.service = Some(spawn_service(&dir, self.ccfg.snapshot_interval_bytes));
+                    slot.service1 = spawn_service1::<SM1>(&dir, self.ccfg);
+                    slot.service_timer = spawn_service_timer_opt(&dir, self.ccfg);
                     self.spare_phase = SparePhase::Added;
                     self.config_ops_accepted += 1;
                     true

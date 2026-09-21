@@ -153,8 +153,8 @@ use uc_protocol::v2::datagram::{
     DGRAM_KIND_NAK, DGRAM_KIND_PROBE, DGRAM_KIND_PROBE_ACK, DGRAM_KIND_READ_PROBE,
     DGRAM_KIND_READ_PROBE_ACK, DGRAM_KIND_REQUEST_VOTE, DGRAM_KIND_SNAP_BEGIN,
     DGRAM_KIND_SNAP_CHUNK, DGRAM_KIND_SNAP_DONE, DGRAM_KIND_SNAP_NAK, DGRAM_KIND_SNAP_REDIRECT,
-    DGRAM_KIND_SNAP_REQUEST, DGRAM_KIND_STATUS, DGRAM_KIND_TERM_MAP, DGRAM_KIND_VOTE,
-    OFF_DGRAM_KEY_EPOCH, read_datagram_header,
+    DGRAM_KIND_SNAP_REPORT, DGRAM_KIND_SNAP_REQUEST, DGRAM_KIND_STATUS, DGRAM_KIND_TERM_MAP,
+    DGRAM_KIND_VOTE, OFF_DGRAM_KEY_EPOCH, read_datagram_header,
 };
 use zeroize::Zeroizing;
 
@@ -328,7 +328,10 @@ impl Transport {
             // authenticated so a forged ack cannot raise the ceiling. Named
             // here (the catch-all already says Pairwise) to keep the inventory.
             | DGRAM_KIND_PROBE
-            | DGRAM_KIND_PROBE_ACK => Scope::Pairwise,
+            | DGRAM_KIND_PROBE_ACK
+            // Plan B3: a live snapshot-hash report is addressed to one peer
+            // (the leader) like every other SNAP kind.
+            | DGRAM_KIND_SNAP_REPORT => Scope::Pairwise,
 
             // Bootstrap: no session exists yet, so neither AEAD scope
             // applies — see [`Scope::Unsealed`]'s doc. Named explicitly
@@ -1829,6 +1832,13 @@ mod tests {
         // authenticated so a forged ack cannot raise the ceiling.
         assert_eq!(Transport::scope_of(DGRAM_KIND_PROBE), Scope::Pairwise);
         assert_eq!(Transport::scope_of(DGRAM_KIND_PROBE_ACK), Scope::Pairwise);
+    }
+
+    #[test]
+    fn snap_report_kind_is_pairwise() {
+        // Plan B3: addressed to the leader, one-to-one, like every other
+        // SNAP kind (SNAP_REQUEST/SNAP_REDIRECT above it).
+        assert_eq!(Transport::scope_of(DGRAM_KIND_SNAP_REPORT), Scope::Pairwise);
     }
 
     #[test]

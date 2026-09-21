@@ -309,8 +309,16 @@ fn a_wrong_app_id_is_refused_as_app_id_even_when_the_edge_is_faulted() {
 #[test]
 fn a_connection_told_not_serving_is_never_served_later_on_the_same_socket() {
     let root = common::tempdir();
+    // Plan B3 T5: an UNDECLARED (harness) node, deliberately. A node that
+    // declares a row publishes its declared set — the word every attacher
+    // reads as "ready" — only once it has joined its cluster, and on a
+    // single-voter cluster that instant IS the instant it starts serving. The
+    // service below and the `Edge` further down would both wait it out, and
+    // step 1's "exists but cannot serve" window would be gone before either
+    // was attached. Nothing declared means no names on line 7, which is the
+    // one page shape the booting gate does not apply to.
     let (node, dir) =
-        common::start_single_node_with_election(root.path(), 3_000_000_000, 4_000_000_000);
+        common::start_single_node_full(root.path(), 3_000_000_000, 4_000_000_000, false);
     let svc = ServiceBuilder::new(
         ServiceConfig::new(&dir, common::APP),
         Sessioned::new(RegisterSm::default(), SessionConfig::default()),

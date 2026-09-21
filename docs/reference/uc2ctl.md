@@ -491,6 +491,49 @@ never expected outside a badly split cluster, and worth treating as an
 incident if seen). A row with a pin but no report yet prints only its pin
 line.
 
+**The verdict line is populated on a live cluster** as of the same release
+that shipped the record. Every node hashes each row artifact as its builder
+streams it, and on its own set-complete edge reports `(row, P, hash)` to the
+leader over `SNAP_REPORT` (datagram kind 26); the leader appends one
+`SnapshotReport` per `(row, P)` once **every voter in the current
+membership** has reported it, or five seconds after the first report,
+whichever comes first. So:
+
+- `nodes=` on a healthy cluster equals the **voter count**, and often that
+  plus any learners whose reports arrived in time — learners report and their
+  hashes ride the record, but they never pace the release;
+- `nodes=` **short of the voter count** means the five-second fallback fired:
+  some voter did not report that instant. The record is still sound evidence
+  about the nodes it names — it just names fewer of them. Check
+  `uc2_snapshot_reports_timed_out_total` on the leader and
+  `uc2_snapshot_reports_unsent_total` on the quiet node;
+- a row that has snapshotted but shows **no verdict line at all** has had no
+  report committed yet: either the instant is younger than this node's
+  artifact (the lag above — the usual reason), or no node reported (see
+  [Monitor a cluster](../how-to/monitor-a-cluster.md)).
+
+**The verdict you read here is always at least one instant old, by
+construction.** This command reads the newest cluster **artifact**, and that
+artifact was frozen *as of* instant `P`; the `SnapshotReport` for `P` is
+appended at a position strictly **above** `P`, because the leader cannot
+release it until every voter has reported — which happens after the freeze.
+An artifact therefore can never carry its own instant's verdict: `P`'s
+verdict first appears in the artifact written at the *next* instant. Run
+right after commanding one instant, this prints no verdict line for that row,
+or the previous instant's. That is the same artifact-backed lag
+[`schedule show`](#schedule-show) and [`settings show`](#settings-show) carry,
+not a defect, and it is why `position=` on the verdict line is normally an
+EARLIER instant than the one you just took. To see a given instant's verdict
+durably, take a second instant (or wait for the `snapshot_interval_bytes`
+cadence) and read again. **For a prompt reading, use `/metrics` instead**:
+`uc2_snapshot_hash_mismatch{service,row}` is recomputed at scrape time from
+the node's committed cluster **view**, so it reflects an instant as soon as
+its record commits — see
+[Upgrade an application § Verify](../how-to/upgrade-an-application.md).
+
+The cluster FSM's own artifact (`service_id = 255`) is **not** reported —
+`SnapshotReport.row` covers declared rows `0..8` only.
+
 ### `status`
 
 Prints the node's current config version and pending state, per-member
@@ -514,8 +557,8 @@ Output fields:
 | `leader_hint` | the id this node believes leads; `unknown` when the raw value is `u64::MAX` |
 | `log: commit / durable / append` | the three log counters, in bytes |
 | `members` | one line per occupied peer slot: `id`, `role`, `reported_durable`, and a staleness marker when `commit - reported_durable` exceeds the admission window |
-| `services` | the declared id list (cnc 4032's bitmask), the lag policy, and — since log time and timers (2.11.0) — `log_time_ns=<n>`, the log's clock read from cnc `4048`, in **raw nanoseconds since the Unix epoch**. It is not formatted as RFC 3339: the binary carries no date formatter, and the raw value is what the `uc2_log_time_ns` metric and the cnc word both hold. `0` means no leader has stamped anything this page generation — `fsm_lag=lockstep` or `fsm_lag=<N> bytes` (cnc 4040). A node started for a harness (`ServicesConfig::none_for_tests`) prints `declared=[] fsm_lag=n/a` and no rows: with nothing declared there is no lag policy to report, even though cnc 4040 still holds a resolved bound (since **2.8.1**; earlier releases printed that bound, or `lockstep` when it happened to read 0) |
-| per-FSM rows | one line per **declared** row, attached or not, in this order: `row=`, `name=` (the row's declared FSM name, node-written at boot, cnc 3.1), `version=` (the attached service's packed version, or the literal `unversioned` if the packed value is 0 — unattached or an FSM that never set `const VERSION`), `hash=0x...` (the row's identity hash, cnc 3.1), `attached=` (the slot's ATTACHED bit), `epoch=` (incarnations since this node booted), `incarnation=` (the status word's counter), `applied=`, `lag=` (`commit − applied`), `snapshot_pos=`, `heartbeat_age=` (`never` if that FSM has not stamped since boot), `timers_pending=` (that row's pending scheduled timers, cnc slot line 7 `+488`), `upgrade_origin=` (the row's committed `UpgradePin` origin — the coordinated instant this row installs unconditionally at its next attach, `0` = no pin), `pinned=` (the version that pin names, `unversioned` when `upgrade_origin=0`), `pinned_from=` (the version the pin's origin artifact was BUILT by — the pinned install's cross-check version, `unversioned` when `upgrade_origin=0`) — `name=`/`version=`/`hash=` are new since FSM identity, `timers_pending=` since log time and timers (both 2.11.0), and `upgrade_origin=`/`pinned=`/`pinned_from=` since the FSM upgrade lifecycle (cnc 3.3, `uc2ctl upgrade pin`/`show`); earlier releases printed only `attached=... epoch=... incarnation=...` |
+| `services` | the declared id list (cnc 4032's bitmask), the lag policy, and — since log time and timers (2.11.0) — `log_time_ns=<n>`, the log's clock read from cnc `4048`, in **raw nanoseconds since the Unix epoch**. It is not formatted as RFC 3339: the binary carries no date formatter, and the raw value is what the `uc2_log_time_ns` metric and the cnc word both hold. `0` means no leader has stamped anything this page generation — `fsm_lag=lockstep` or `fsm_lag=<N> bytes` (cnc 4040). A node started for a harness (`ServicesConfig::none_for_tests`) prints `declared=[] fsm_lag=n/a` and no rows: with nothing declared there is no lag policy to report, even though cnc 4040 still holds a resolved bound (since **2.8.1**; earlier releases printed that bound, or `lockstep` when it happened to read 0). **Since `2.13.0` a configured node prints the same `declared=[]` and no rows while it is still joining its cluster** — the node publishes its declared set from the consensus pass, not at `Node::start`, so an empty list on a node that should have rows means "not joined yet", not "misconfigured". Give it a moment and re-run; if it persists, the node is not hearing a leader or its cluster FSM is not reaching commit |
+| per-FSM rows | one line per **declared** row, attached or not, in this order: `row=`, `name=` (the row's declared FSM name, node-written at boot, cnc 3.1), `version=` (the attached service's packed version, or the literal `unversioned` if the packed value is 0 — unattached or an FSM that never set `const VERSION`), `hash=0x...` (the row's identity hash, cnc 3.1), `attached=` (the slot's ATTACHED bit), `epoch=` (incarnations since this node booted), `incarnation=` (the status word's counter), `applied=`, `lag=` (`commit − applied`), `snapshot_pos=`, `heartbeat_age=` (`never` if that FSM has not stamped since boot), `timers_pending=` (that row's pending scheduled timers, cnc slot line 7 `+488`), `upgrade_origin=` (the row's committed `UpgradePin` origin — the coordinated instant this row installs unconditionally at its next attach, `0` = no pin), `pinned=` (the version that pin names, `unversioned` when `upgrade_origin=0`), `pinned_from=` (the version the pin's origin artifact was BUILT by — the pinned install's cross-check version, `unversioned` when `upgrade_origin=0`), `artifact_hash=0x...` (the hash of the artifact this row's builder published at `snapshot_pos` — SHA-256 of the artifact PAYLOAD, envelope excluded, truncated to its first 8 bytes, from cnc slot line 7 `+504`; `0x0000000000000000` = this row has published no artifact on this node since boot). Because it is written by the builder immediately BEFORE `snapshot_pos`, `snapshot_pos=` and `artifact_hash=` on the same line always describe the same artifact. Comparing the pair across nodes is the manual form of the live check — for the cluster's own verdict use [`upgrade show`](#upgrade-show), which is computed from a committed record rather than from what each node happens to print. `name=`/`version=`/`hash=` are new since FSM identity, `timers_pending=` since log time and timers (both 2.11.0), and `upgrade_origin=`/`pinned=`/`pinned_from=`/`artifact_hash=` since the FSM upgrade lifecycle (cnc 3.3, `uc2ctl upgrade pin`/`show`); earlier releases printed only `attached=... epoch=... incarnation=...` |
 
 ## Offline commands
 

@@ -973,9 +973,13 @@ impl ElectionSm {
     }
 
     /// Diagnostic (2026-08-16 hunt): how this node's `commit_seen` last moved
-    /// — `"rank"` (our own quorum ranking as leader), `"gossip"` (a leader's
-    /// commit position, post-validation), `"replay"` (a held position
-    /// released by `finish_validation`), or `"none"`. Read by the node's
+    /// — `"rank"` (our own quorum ranking as leader, [`Self::rank_leader`]),
+    /// `"gossip"` (a leader's commit position, post-validation,
+    /// [`Self::advance_gossip_commit`]), or `"none"` (this incarnation has
+    /// not learned one yet). Those THREE are the whole set: a gossip position
+    /// held through validation and released later comes back through
+    /// `advance_gossip_commit` and is labelled `"gossip"` like any other, so
+    /// there is no separate `"replay"` value. Read by the node's
     /// `UC2_TRUNC_TRACE` output so a cut below commit names its own provenance
     /// instead of leaving us to guess.
     pub fn commit_provenance(&self) -> (&'static str, u32, u64) {
@@ -988,6 +992,28 @@ impl ElectionSm {
 
     pub fn role(&self) -> Role {
         self.role
+    }
+
+    /// Plan B3 T5: has this incarnation learned a commit position AT ALL —
+    /// from its own quorum ranking as leader (`"rank"`, [`Self::rank_leader`])
+    /// or from a leader's gossip (`"gossip"`, [`Self::advance_gossip_commit`])?
+    /// Those are the only two values [`Self::commit_provenance`] ever
+    /// reports besides the initial `"none"`; a deferred gossip position
+    /// released by validation comes back through the second of them and is
+    /// labelled `"gossip"` like any other.
+    ///
+    /// A node that has not is still at its boot default of `0`, which is
+    /// indistinguishable from "this cluster has committed nothing" — and a
+    /// reader that treats the two the same concludes it is caught up with a
+    /// cluster it has not yet heard from. `uc_node`'s declared-set gate is
+    /// that reader: `cluster_fsm_position >= commit` says nothing until
+    /// `commit` is the cluster's answer rather than this node's default.
+    ///
+    /// The provenance string behind it is a diagnostic
+    /// ([`Self::commit_provenance`]); this is the one SEMANTIC question asked
+    /// of it, named so no caller has to compare strings.
+    pub fn commit_learned(&self) -> bool {
+        self.commit_source != "none"
     }
 
     pub fn current_term(&self) -> u32 {

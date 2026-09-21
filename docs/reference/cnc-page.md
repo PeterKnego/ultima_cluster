@@ -135,6 +135,7 @@ Fields within a slot (each its own 64 B line, one writer):
 | 480 | `identity_hash` (line 7) — u64, FNV-1a 64 of `name` | **node**, at `CncPage::init` (boot, once) — cnc 3.1, FSM identity |
 | 488 | `timers_pending` (line 7) — u64 count of this row's pending scheduled timers | **node** (consensus agent), republished every pass — cnc 3.1, log time. Since the cluster FSM (2.11.0) the timer heap is **leader-only**, so this is the leader's count and a follower always publishes `0` |
 | 496 | `freeze_ns` (line 7) — u64, the duration in nanoseconds of this row's **last** `freeze()` call | **service** (`on_snapshot_frame`), once per instant — coordinated snapshots, 2.11.0 |
+| 504 | `artifact_hash` (line 7) — u64, SHA-256[..8] of the row's newest artifact payload | **service** (builder agent), stored BEFORE `snapshot_pos` — plan B3 |
 
 A slot whose `status` reads `0` has never been attached this page generation.
 The node re-creates the page at every boot, so incarnation and epoch restart
@@ -189,6 +190,26 @@ derives `uc2_snapshot_freeze_seconds_max/_sum/_count{service,row}` from it.
 It shares a line with node-written words exactly as
 `CNC_SVC_STATUS_SNAPSHOT_CAPABLE` (status bit **9**, also service-written, set
 by `start_with_snapshots`) shares the status word.
+
+Line 7's fifth and last word, `artifact_hash` (`+504`), is plan B3's live
+determinism report: SHA-256 of the row's newest artifact PAYLOAD (the
+24-byte `ULTSNAP2` envelope excluded), truncated to its first 8 bytes as a
+`u64` LE. Its writer is the **service's builder agent**
+(`uc_service::builder_agent::builder_cycle`), the same writer as
+`snapshot_pos` — but unlike `freeze_ns`, which is stamped by the apply loop
+on a different cadence, this word is written by `snapshot_pos`'s own writer,
+right BEFORE it: `builder_cycle` calls `store_artifact_hash` and only then
+`snapshot_pos.store_release`. That order matters — a reader (`/metrics`,
+`uc2ctl status`, Task 3's live determinism check) that `Acquire`-loads
+`snapshot_pos == P` is thereby guaranteed to already see the hash of the
+artifact published AT `P`, never a stale hash left over from the previous
+instant. The hash itself is computed while the artifact streams to disk
+(`SnapshotStore::publish`'s `HashingWriter`), not read back afterwards.
+`uc2ctl status` prints it as `artifact_hash=0x{:016x}` after `pinned_from=`
+on each per-FSM row. **Line 7 is now full.** `+504` was its last free word
+and `artifact_hash` takes it; `+512` is the next slot's line 0, not more
+room on this one. A further per-row word needs the reserved band, not
+line 7.
 
 The capability bit is what `uc2ctl snapshot` checks before it commands
 anything: a row started with plain `start()` never sets it, ignores a

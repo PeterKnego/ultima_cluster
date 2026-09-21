@@ -366,6 +366,76 @@ reviewer wants a workload to attack.
 - **Alert on `uc2_log_clock_smear_ns`** (a smear above N seconds for M
   minutes), with its `scripts/m10_alert_fire.sh` builder and scenario —
   recorded 2026-09-08 by the log-clock spec's errata bullet 9.
+- **The cluster FSM's own artifact is not hash-reported.**
+  `SnapshotReport.row` covers declared rows `0..8`; `service_id = 255` — the
+  `snapshots/cluster/` image every below-floor joiner installs by fiat — has
+  no live determinism check at all. Its surface is far smaller than a user
+  FSM's `freeze()` (the image is a function of the committed `CLUSTER`
+  commands and nothing else), which is why plan B3 scoped it out rather than
+  widening the record's row field; it is still a real gap. Recorded
+  2026-09-21 as erratum 6 of the FSM upgrade lifecycle spec's
+  "Errata (plan B3, as built)".
+- **The `uc_service::apply` replay forward-progress guard has no counter.**
+  Plan B3 T5 added a guard that hands the cycle back when a replay pass
+  fails to advance the cursor (it used to spin forever, which also hung
+  `Service::stop`'s join). Since the plan's final review that episode is no
+  longer silent — it re-enters the replay with the gap forced, so the row
+  either installs a covering artifact or fail-stops by name — but the
+  episode itself is still reported only by an `eprintln!`: no metric family,
+  no obs record, because `uc_service` has no `uc_obs` dependency and no
+  status word for it. A row that waits there legitimately (its covering
+  artifact is above the apply target) is visible only in the service's own
+  stderr. Recorded 2026-09-21.
+- **Widen `replay_into`'s gap test — before the `2.13.0` release.**
+  `uc_service/src/replay.rs`'s gap guard is `first > start_pos` with `first
+  = reader.first_meta().unwrap_or(0)`, which cannot detect the shape a
+  below-floor joiner presents: cursor 0, a stale journal segment based at 0
+  (so `first = 0`), and a live buffer base above it. The plan B3 final review
+  (F1) routed around it — a replay pass that cannot advance re-enters with
+  the gap forced — but the root cause is that `first` is read from the
+  journal's own first block rather than from something that knows the
+  frontier (the log buffer's base, or the node's archive floor). Note what
+  the detour rests on: with the TRUE `first`, the covering-artifact test
+  `s_pos >= first` proves the artifact meets the journal's retained tail;
+  with the forced (synthetic) `first` it proves only "above the cursor", so
+  no-hole-between-artifact-and-tail is currently an ARCHIVE invariant
+  (`purge_before`, `truncate_to` and `adopt_floor` all keep the journal
+  contiguous or wipe it) rather than a local check. Deriving `first` from
+  the frontier restores the local check, makes the detour unnecessary and
+  removes a whole class of
+  "the journal answers a question it cannot answer". Not changed in the fix
+  wave because it is a change to the guard every reconstruction path runs
+  through. Recorded 2026-09-21 (`.superpowers/sdd/2026-09-21-uc2-live-snapshot-reports/final-review.md`,
+  Important 1).
+- **`uc_gateway/tests/credits_wire.rs`'s latch test no longer exercises a
+  declared node.**
+  `a_connection_told_not_serving_is_never_served_later_on_the_same_socket`
+  pins that an edge which answered "not serving" never serves that socket
+  afterwards. Plan B3's readiness gate collapses the "the node exists but
+  cannot serve" window on a single-voter cluster, so the test was re-shaped
+  onto an UNDECLARED harness node (`common::start_single_node_full(…,
+  declared = false)`) — a page with no names on line 7, the one shape the
+  gate does not apply to. The latch is still pinned, but no longer against a
+  node a client could really attach to: re-shape it around a **learner** (which
+  declares, and never serves), so the window is real again. A
+  branch-introduced coverage loss, recorded 2026-09-21.
+- **`commit_source` as an enum.** `uc_consensus/src/election.rs` carries the
+  provenance of the current commit position as a `&'static str` compared by
+  value (`"gossip"`, `"leader"`, …). It is read in obs records and in tests;
+  an enum with a `Display` would make a typo a compile error and let the
+  stale-value class of bug (a documented value that no longer exists) be
+  caught by the match. Ledgered by plan B3's T5 review, recorded 2026-09-21.
+- **Plan D carries: `uc2_cluster_fsm_position` was REPOINTED in `2.13.0`.**
+  The gauge shipped in `2.11.0` reading `ClusterView::position` (the
+  published view's tag, which only moves on a pass that applied a `CLUSTER`
+  frame) and now reads `consumed`, the `uc2-cluster` agent's walk cursor —
+  which is what its help text always described, and the only reading the
+  readiness gate can be asked about. The NAME is unchanged, so a dashboard
+  keeps working and silently reads a different quantity: that is a change to
+  a **shipped reading** and needs a release-note line in `RELEASES.md` and
+  `docs/releases.md`, which plan D owns. Recorded here 2026-09-21 because the
+  SDD ledger and the task report that carry it today are working artifacts
+  that get archived.
 
 ## Accepted residuals — listed so they are not re-proposed
 

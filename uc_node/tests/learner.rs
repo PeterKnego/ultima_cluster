@@ -3019,6 +3019,19 @@ fn a_joiner_below_the_voters_floor_is_redirected_to_the_learner() {
          (first_base={})",
         joiner.archive_first_base()
     );
+    // Plan B3 final review F1: a node converging is not the ROW converging.
+    // Everything above is node-level (`durable`, `archive_first_base`), and a
+    // joiner whose service row sat in the apply-replay stall — below the
+    // adopted floor with a journal that cannot reach its cursor — satisfied
+    // every one of those while its `applied` stood still for good. Assert the
+    // row itself: it reaches the frontier only by installing the covering
+    // artifact the redirect delivered.
+    let j_cnc = CncPage::open_file(&j_dir.join("cnc2.dat"), app).expect("open joiner cnc");
+    await_until(
+        60,
+        "the joiner's service row applied up to the voter's frontier",
+        || j_cnc.service_slot(0).applied.load_acquire() >= frontier,
+    );
     assert_eq!(
         joiner.snapshot_session_refusals(),
         (0, 0, 0, 0, 0),

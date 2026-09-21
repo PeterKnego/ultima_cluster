@@ -1084,6 +1084,7 @@ dependencies = [
  "bincode",
  "fs2",
  "serde",
+ "sha2",
  "thiserror",
  "tokio",
  "uc_journal",

@@ -1694,8 +1694,15 @@ fn sigkill_mid_config_window() {
             &members_str,
             crypto_args_for(i),
         )));
-        wait_for_ready(&d, Duration::from_secs(10));
         dirs.push(d);
+    }
+    // Plan B3 T5: every node is spawned BEFORE any readiness wait. A wait is
+    // a successful attach, and an attach now waits for the node to have
+    // joined its cluster — which node 0 cannot do until nodes 1..n exist. The
+    // old shape (spawn, wait, spawn, wait) deadlocks until `boot_wait`
+    // expires.
+    for d in &dirs {
+        wait_for_ready(d, Duration::from_secs(10));
     }
     let mut svc_procs: Vec<Option<Reap>> = dirs.iter().map(|d| Some(spawn_service(d))).collect();
 
@@ -1929,8 +1936,15 @@ fn leader_node_sigkill_recovery_multi_once(run: u32) {
             &members_str,
             crypto_args_for(i),
         )));
-        wait_for_ready(&d, Duration::from_secs(10));
         dirs.push(d);
+    }
+    // Plan B3 T5: every node is spawned BEFORE any readiness wait. A wait is
+    // a successful attach, and an attach now waits for the node to have
+    // joined its cluster — which node 0 cannot do until nodes 1..n exist. The
+    // old shape (spawn, wait, spawn, wait) deadlocks until `boot_wait`
+    // expires.
+    for d in &dirs {
+        wait_for_ready(d, Duration::from_secs(10));
     }
     let mut svc_procs: Vec<Option<Reap>> = dirs.iter().map(|d| Some(spawn_service(d))).collect();
 

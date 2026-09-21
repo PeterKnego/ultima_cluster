@@ -62,8 +62,8 @@ mod wait;
 
 pub use client::Client;
 pub use engine::{
-    Completion, Consistency, Engine, EngineConfig, EngineStats, Outcome, PollHalf, SendHalf,
-    SubmitError,
+    Completion, Consistency, DEFAULT_BOOT_WAIT, Engine, EngineConfig, EngineStats, Outcome,
+    PollHalf, SendHalf, SubmitError,
 };
 pub use error::ClientError;
 pub use pipelined::{PipelinedClient, PipelinedConfig};

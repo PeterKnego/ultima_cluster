@@ -107,7 +107,14 @@ fn node_creates_per_id_rings_dirs_and_publishes_the_declared_set() {
         "legacy singular name is not created"
     );
     let cnc = open_cnc(dir.path());
-    assert_eq!(cnc.services_declared(), 0b111);
+    // Plan B3 T5: the declared set is published by the consensus pass, on the
+    // first pass where this node knows its leader, has learned a commit, and
+    // its cluster FSM has consumed the log up to it — which is a pass or two
+    // AFTER `can_serve`, since the `uc2-cluster` agent's walk runs on its own
+    // thread. A wait, not a spot read.
+    wait_until("the declared set is published", || {
+        cnc.services_declared() == 0b111
+    });
     assert_eq!(cnc.fsm_lag_bytes(), 64 << 10);
     node.stop();
 }

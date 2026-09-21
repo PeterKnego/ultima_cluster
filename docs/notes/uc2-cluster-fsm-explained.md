@@ -489,8 +489,9 @@ republishes onto the row's service status line as **four** new words, `+16`
 addition — `+40` `pinned_from` — not slot line 7, which is
 already seven of its eight words deep (`name`, four words from `+448`,
 `identity_hash` at `+480`, `timers_pending` at `+488`, `freeze_ns` at
-`+496`) and so has exactly one free word left, at `+504` — well short of the
-four a pin needs. (`log_time_ns` is not one of line 7's occupants: it is the
+`+496`) and so had exactly one free word left, at `+504` — well short of the
+four a pin needs. (That last word is spent now: plan B3's `artifact_hash`
+took `+504`, and line 7 is full.) (`log_time_ns` is not one of line 7's occupants: it is the
 unrelated page-1 global word at offset 4048.) `upgrade_origin == 0` is "no
 pin", the
 gate every reader checks first. `pinned_from` is the version the artifact AT
@@ -572,14 +573,78 @@ missing feature; it is the correct answer to "which one is the majority"
 when there isn't one. A three-reporter cluster (or any odd count) is what
 lets 2-of-3 actually name the minority.
 
-**Until plan B3, nothing produces a report.** This plan gives
-`SnapshotReport` its wire kind, its codec, its FSM state, its refusal, its
-gauge and its `uc2ctl upgrade show` rendering — the whole replicated and
-observable half. No node yet computes a per-node artifact hash or appends
-the `CLUSTER kind = 5` command that would carry one; that is spec §6.5.2
-items 1–3, left to plan B3. Until then `uc2ctl upgrade show` prints nothing
-under `hash_verdict=` for any row, which is the correct behaviour for a
-feature whose producer has not shipped yet, not a defect in this plan.
+**Where the reports come from (plan B3).** Plan B1 gave `SnapshotReport` its
+wire kind, its codec, its FSM state, its refusal, its gauge and its `uc2ctl
+upgrade show` rendering — the whole replicated and observable half — but
+nothing produced one. Plan B3 is the producer, spec §6.5.2 items 1–3, and it
+is three seams:
+
+1. **The hash is taken where the bytes are written.** The row artifact is
+   streamed by the *service* process's builder agent, so that is where the
+   SHA-256 is taken — as the bytes go past, no extra I/O, no re-read — and
+   the first 8 bytes of the digest are published as a `u64` in the row's cnc
+   slot line 7 at `+504` (`artifact_hash`). It is written immediately
+   **before** `snapshot_pos`, so a reader that `Acquire`-loads
+   `snapshot_pos == P` is already looking at the hash of the artifact at `P`
+   and never at the previous instant's. The hash covers the PAYLOAD only —
+   the 24-byte `ULTSNAP2` envelope is identical across nodes by construction.
+   (Spec §6.5.2 item 1 says the *node* should hash, "a service should not
+   grade its own image"; as built it is service-side, because the node never
+   streams an artifact and a node-side re-read would cost the artifact's size
+   per instant on a node agent. Under the threat model — a compromised host
+   is out of scope — the two are equivalent.)
+
+2. **Every node reports, on its own local set-complete edge.** When a node
+   holds the complete set at `P` by its own work (not by `uc2ctl snapshot
+   fetch`), it reads each declared row's `artifact_hash` and sends
+   `(row, node_id, P, hash)` to the leader as `SNAP_REPORT`, datagram kind
+   26, 24 bytes, pairwise-sealed like every other addressed kind. Voters and
+   **learners** both report; the leader feeds its own rows straight into its
+   collector with no datagram. A node that knows no leader (mid-election)
+   drops the report rather than queueing it — a report is about a moment, and
+   holding it for whoever wins would attest an instant with a stale reading —
+   and counts it in `uc2_snapshot_reports_unsent_total`.
+
+3. **The leader collects per `(row, P)` and appends once.** Only the newest
+   instant per row is pending; a report for a newer one replaces the
+   collection outright (hashes for two different artifacts must never mix)
+   and restarts the clock. The record goes onto the log when **every voter in
+   the current membership has reported**, or five seconds
+   (`SNAP_REPORT_TIMEOUT_NS`) after the first report — whichever comes first
+   — through the same single-in-flight cluster append every other `CLUSTER`
+   command uses, at most one per pass, lowest row first.
+
+**Why every voter and not a quorum.** The spec said "once a quorum has
+reported… or on a timeout", and that is the one rule plan B3 changed. The
+whole purpose of the record is to **name the minority** (item 4), and a
+quorum trigger releases it the instant a majority has reported — which
+structurally omits whichever replica is slowest to complete its set. And that
+slowest replica is not a fresh draw each time: in the three-node fixture plan
+B3 was developed against — three busy-spin nodes in **one process on a dev
+box**, an observation rather than a fleet measurement — the *same* node
+straggles on every instant for the life of the process. A quorum trigger
+would therefore have excluded one fixed node from every record it ever wrote.
+The argument needs only that the ordering is persistent; no particular lag
+figure is load-bearing, and none is claimed. Worse, on three nodes a 2-hash
+record has no majority at all —
+`verdict` correctly answers `NO_MAJORITY`, the N = 2 case above — so it names
+nobody. The reason a quorum was attractive, *do not stall on a dead node*, is
+already served by the timeout; the cost of the stricter rule is that a
+permanently dead voter delays each `(row, P)` record by at most five seconds,
+which is diagnostic latency on a record that is on neither the commit path
+nor the snapshot-completeness path. Learners still report and their hashes
+still ride the record; they simply never pace the release.
+
+One consequence worth knowing: an **uncommitted** promote or add makes the
+still-catching-up node a required voter for as long as the change is in
+flight, so every instant in that window waits out the full five seconds and
+increments `uc2_snapshot_reports_timed_out_total`.
+
+**The cluster FSM's own artifact is not reported.** `SnapshotReport.row` is a
+declared row, `0..8`; `service_id = 255` is outside it. The cluster image is
+a function of the committed `CLUSTER` commands and nothing else, so it has
+far less room to diverge than a user FSM's `freeze()` does — but covering it
+is a real gap and is on the backlog.
 
 ## What plan 1 did not do, and plan 2 did not either
 

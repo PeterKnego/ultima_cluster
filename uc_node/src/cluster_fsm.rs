@@ -656,6 +656,22 @@ impl SnapshotStateMachine for ClusterFsm {
 /// single-in-flight.
 pub struct ClusterView {
     pub position: AtomicU64,
+    /// Plan B3 T5: the agent's WALK cursor — [`ClusterState::applied`] as of
+    /// the end of its last duty cycle, whether or not anything applied.
+    ///
+    /// Deliberately NOT [`Self::position`], which is the published VIEW's tag
+    /// and therefore moves only on a pass that applied a `CLUSTER` frame or
+    /// installed an artifact (see [`Self::publish`] and the `set_consumed`
+    /// comment in `cluster_agent::do_work`). On a cluster that commits
+    /// ordinary traffic and no cluster commands — the normal case — `position`
+    /// sits still while commit climbs, so "has the cluster FSM caught up with
+    /// commit?" cannot be asked of it. It can be asked of this word.
+    ///
+    /// One `fetch_max` per cluster-agent duty cycle writes it and nothing on
+    /// the consensus hot path reads it in steady state (the declared-set gate
+    /// reads it only while it is still closed, once per incarnation), so it
+    /// costs neither loop the mutex `position` would have cost them.
+    pub consumed: AtomicU64,
     /// Spec §9: `uc2_settings_position`, the frame-END of the last Settings
     /// command applied (0 = the genesis record). An atomic beside the five
     /// settings scalars, for the same reason they are: `/metrics` reads it
@@ -691,6 +707,10 @@ impl ClusterView {
     pub fn new(genesis: &ClusterState) -> ClusterView {
         let v = ClusterView {
             position: AtomicU64::new(0),
+            // Plan B3 T5: seeded from the recovered artifact, so a node whose
+            // `uc2-cluster` agent has not run a cycle yet still reports the
+            // walk it inherited rather than 0.
+            consumed: AtomicU64::new(genesis.applied),
             settings_position: AtomicU64::new(0),
             admission_bytes: AtomicU64::new(0),
             fsm_lag_bytes: AtomicU64::new(0),
@@ -735,8 +755,42 @@ impl ClusterView {
         self.position.store(st.applied, Ordering::Release);
     }
 
+    /// Plan B3 T5: publish the agent's walk cursor (see [`Self::consumed`]).
+    ///
+    /// Deliberately NOT called from [`Self::publish`], which writes the
+    /// structured parts BEFORE `ClusterAgent::publish_view` writes the pin
+    /// words: a `consumed` store in there would be visible while the pins it
+    /// promises are not. The agent calls this itself, last.
+    ///
+    /// `fetch_max`, not `store`: an artifact install replaces the whole FSM
+    /// state, and a word whose only promise is "monotone" must not depend on
+    /// the caller having checked that first.
+    pub fn note_consumed(&self, applied: u64) {
+        self.consumed.fetch_max(applied, Ordering::Release);
+    }
+
     pub fn snapshot_inner(&self) -> ClusterViewInner {
         self.inner.lock().unwrap().clone()
+    }
+
+    /// The committed `SnapshotReport` position for one row — `None` when the
+    /// cluster FSM holds no record for it yet.
+    ///
+    /// A scalar read under the same lock, rather than
+    /// [`Self::to_state`]: the leader's collector asks this question once per
+    /// received report and once per ready row at append, and `to_state`
+    /// clones the membership, the schedule table, the pin history and the
+    /// report list to answer it (final review, minor 7). Nothing about the
+    /// answer needs the rest of the state, and the allocation it avoided
+    /// grows with the pin history.
+    pub fn report_position_for(&self, row: u8) -> Option<u64> {
+        self.inner
+            .lock()
+            .unwrap()
+            .reports
+            .iter()
+            .find(|r| r.row == row)
+            .map(|r| r.position)
     }
 
     /// The view as a [`ClusterState`] — the inner clone plus the five scalar

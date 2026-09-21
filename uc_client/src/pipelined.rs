@@ -97,6 +97,9 @@ pub struct PipelinedConfig {
     /// Refuse submits/queries when the node isn't a serving leader instead of
     /// free-running into a dead/non-leader node.
     pub serving_gate: bool,
+    /// Plan B3 T5: how long `connect` waits for the node to join its cluster
+    /// — see [`EngineConfig::boot_wait`], which this is handed to unchanged.
+    pub boot_wait: Duration,
 }
 
 impl Default for PipelinedConfig {
@@ -106,6 +109,7 @@ impl Default for PipelinedConfig {
             max_inflight: 4096,
             request_timeout: Duration::from_secs(10),
             serving_gate: true,
+            boot_wait: crate::engine::DEFAULT_BOOT_WAIT,
         }
     }
 }
@@ -141,6 +145,7 @@ impl PipelinedClient {
             request_timeout: cfg.request_timeout,
             max_payload: None,
             serving_gate: cfg.serving_gate,
+            boot_wait: cfg.boot_wait,
             start_seq: 0,
         };
         let (send, poll) = Engine::attach(instance_dir, app_id, engine_cfg)?;

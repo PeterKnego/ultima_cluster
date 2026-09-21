@@ -93,6 +93,15 @@ Every step prints a timestamp.
    and exactly one node reporting `leader=true can_serve=true`.
 7. **Print the measured downtime** and exit 0.
 
+Steps 5 and 6 are in that order for a reason that became load-bearing in
+`2.13.0`: a node does not open its attach door until it has joined its
+cluster, so a service started against a node whose peers are not up yet sits
+in its bounded `NodeBooting` wait (default 10 s) and then fails. **Start all
+the nodes, wait for a leader, then start the services** — which is what step
+6 buys you. Service units ordered `After=` their node unit satisfy this only
+because the 10 s wait covers a normal election; nothing in systemd knows
+about the cluster.
+
 ## The abort path is load-bearing
 
 From step 2 (stopping nodes) through step 4 (`--upgrade-cmd`), **any
@@ -790,6 +799,46 @@ The two added steps are not optional:
   yet reads `PinRead::NoPin`, and a v_new service attaching there takes the
   **unpinned** path — no refusal, no log line, just the §2.3 counterfactual
   on that one node. Check every node, not the leader.
+
+  **The readiness gate backs this step up; it does not replace it.** Since
+  `2.13.0` a node does not publish its declared set — the word every attach
+  door reads — until it knows a leader, has learned a commit position, and
+  its cluster FSM has consumed the log up to that commit. So a service
+  **cannot** attach to a node that has not applied the committed cluster
+  state, and the specific race this step was written against — a node
+  restarting with a pin committed *above* the artifact it recovered from, and
+  a co-restarting service attaching in the gap and reading "no pin" — is
+  closed. What the gate cannot do is tell you the pin was ever *proposed*, or
+  that it committed rather than being refused at the door. That is still your
+  check, on every node, before you stop anything.
+
+  Three operational consequences of the gate, all new in `2.13.0`:
+
+  - **Attaching now waits.** `ServiceBuilder::start*`, `Client::connect` and
+    `Engine::attach` retry `NodeBooting` internally for `boot_wait`
+    (**default 10 s**; `Duration::ZERO` restores the old fail-immediately
+    behaviour). `NodeBooting` means "this node has not joined its cluster
+    yet", not "its page is missing". A node's own durable position can trail
+    commit for a while — the cluster FSM applies at `min(commit, durable)` —
+    and while that is transient (a long archive walk at boot, an artifact to
+    install, a node catching up), a larger `boot_wait` is the right answer
+    rather than treating the refusal as a fault. If it does **not** clear,
+    no `boot_wait` is large enough and every attach on that node stays
+    refused for the life of the incarnation: a follower's commit cannot
+    outrun its own durable, so a persistent inversion is a **leader** whose
+    durability path is failing, and the fix is there. The node names the
+    clause holding it once, as a `services_declared_withheld` warning —
+    `clause="walk_behind"` is this case.
+  - **Boot-time observability reads empty.** Until the node joins,
+    `/metrics` renders `uc_services_declared 0` with no per-FSM rows and
+    `uc2ctl status` prints `declared=[]` with no FSM lines. One
+    `services_declared_published` record marks the transition. During a
+    rolling flag-day restart, expect a window where a fleet-wide
+    declared-set query briefly sees two values.
+  - **If you bring nodes up inside one process** (a harness, an embedded
+    deployment), **start every node before attaching any service** — a
+    service attached after node 0 and before node 1 spends its whole
+    `boot_wait` waiting for a leader that cannot be elected yet.
 - **Take an instant AFTER the swap.** Once the pin is consumed the node's
   floor is free to advance past the origin, and the origin's artifact becomes
   prunable. A later restart of the row re-installs from the newest covering

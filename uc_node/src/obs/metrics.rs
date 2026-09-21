@@ -88,6 +88,11 @@ pub const CONTRACT_SERIES: &[&str] = &[
     "uc2_settings_position",
     "uc2_schedule_entries",
     "uc2_schedule_apply_refused_total",
+    // FSM upgrade lifecycle (plan B3): the live snapshot-hash report path.
+    "uc2_snapshot_reports_sent_total",
+    "uc2_snapshot_reports_unsent_total",
+    "uc2_snapshot_reports_appended_total",
+    "uc2_snapshot_reports_timed_out_total",
     // FSM upgrade lifecycle (plan B1)
     "uc2_upgrade_pin_origin",
     "uc2_upgrade_pin_version",
@@ -843,8 +848,8 @@ fn push_service_families(out: &mut String, s: &ObsSources, commit: u64, now: u64
     push_gauge(
         out,
         "uc2_cluster_fsm_position",
-        "Frame-END position this node's cluster FSM has CONSUMED the log up to (its `applied`, cluster-FSM spec §4.3) — the position tag on the view it publishes and on the artifact it writes. It advances with the agent's walk, not only on CLUSTER commands, so it is a per-node liveness reading (compare it against uc2_commit_bytes on the SAME node: a stalled uc2-cluster agent is one whose position sits still while commit moves) and NOT a cluster-wide constant — Uc2ScheduleTableDiverged keys on uc2_schedule_table_position for exactly that reason.",
-        s.cluster_view.position.load(Ordering::Acquire),
+        "Frame-END position this node's cluster FSM has CONSUMED the log up to (its `applied`, cluster-FSM spec §4.3) — the uc2-cluster agent's WALK cursor, read from the view's `consumed` word. It advances every duty cycle, not only on CLUSTER commands, so it is a per-node liveness reading (compare it against uc2_commit_bytes on the SAME node: a stalled uc2-cluster agent is one whose position sits still while commit moves) and NOT a cluster-wide constant — Uc2ScheduleTableDiverged keys on uc2_schedule_table_position for exactly that reason. The view's own `position` tag is a different word (it moves only when a CLUSTER command applies) and is NOT what this gauge reads.",
+        s.cluster_view.consumed.load(Ordering::Acquire),
     );
     push_gauge(
         out,
@@ -863,6 +868,30 @@ fn push_service_families(out: &mut String, s: &ObsSources, commit: u64, now: u64
         "uc2_schedule_apply_refused_total",
         "`uc2ctl schedule apply` requests this node refused (bad digest, missing or undecodable staged file, or an entry naming an undeclared FSM). Retries are NOT counted: neither the one a follower answers (the staged file is node-local, so the request is never forwarded) nor the one the leader answers while the previous cluster command is still above commit (single-in-flight).",
         s.schedule_apply_refused.load(Ordering::Relaxed),
+    );
+    push_counter(
+        out,
+        "uc2_snapshot_reports_sent_total",
+        "Live SNAP_REPORT datagrams this node handed the transport for the leader on a set-complete edge — one per declared row that had published an artifact at the instant (FSM upgrade lifecycle spec §6.5.2). A LEADER hands its own rows' hashes straight to its collector without a datagram, so it exports 0 here; on a follower this climbs by the declared-row count once per completed instant. It counts the hand-off, not the delivery: with crypto on, a control datagram with no established session to the leader is dropped inside the send and still counted.",
+        s.snapshot_reports_sent.load(Ordering::Relaxed),
+    );
+    push_counter(
+        out,
+        "uc2_snapshot_reports_unsent_total",
+        "Snapshot hash reports this node DROPPED because it knew of no leader to address (no leader hint, or a hint naming a member it cannot resolve — an election in progress). A brief run around a failover is expected; a sustained one means this node's hashes never reach the committed SnapshotReport record, and an upgrade pin adjudicated from it is missing a voter.",
+        s.snapshot_reports_unsent.load(Ordering::Relaxed),
+    );
+    push_counter(
+        out,
+        "uc2_snapshot_reports_appended_total",
+        "SnapshotReport records (CLUSTER kind = 5) this node placed on the log while leading — one per row per instant it collected hashes for (FSM upgrade lifecycle spec §6.5.2). A follower appends none, so this sits still everywhere but the leader; across a cluster it should climb by the declared-row count once per completed instant.",
+        s.snapshot_reports_appended.load(Ordering::Relaxed),
+    );
+    push_counter(
+        out,
+        "uc2_snapshot_reports_timed_out_total",
+        "The subset of uc2_snapshot_reports_appended_total that went in on the 5 s collection timeout rather than on every voter reporting. A brief run around a failover or a restart is expected; a rate that keeps pace with the appended counter means the records name too few voters to tell a divergent replica from an absent one, and an upgrade pin adjudicated from them is thinner evidence than it looks — check uc2_snapshot_reports_unsent_total and the set-completion gauges on the quiet nodes.",
+        s.snapshot_reports_timed_out.load(Ordering::Relaxed),
     );
     push_gauge(
         out,
@@ -1629,6 +1658,10 @@ mod tests {
             schedule_entries: Arc::new(AtomicU64::new(0)),
             log_clock_smear_ns: Arc::new(AtomicU64::new(0)),
             schedule_apply_refused: Arc::new(AtomicU64::new(0)),
+            snapshot_reports_sent: Arc::new(AtomicU64::new(0)),
+            snapshot_reports_unsent: Arc::new(AtomicU64::new(0)),
+            snapshot_reports_appended: Arc::new(AtomicU64::new(0)),
+            snapshot_reports_timed_out: Arc::new(AtomicU64::new(0)),
             cluster_view: test_cluster_view(),
             probe: uc_net::probe::ProbeTable::new(uc_net::probe::ProbeCadence::default()),
             commands_over_standard: Arc::new(AtomicU64::new(0)),
@@ -1657,10 +1690,17 @@ mod tests {
 
     /// Cluster FSM (spec §9): the cluster row's own two gauges, and the
     /// FIFTH `uc2_agent_alive` sample. `uc2_cluster_fsm_position` is the
-    /// view's position word (the FSM's `applied`) and `uc2_settings_position`
-    /// the frame-END of the last Settings command it applied — both read
-    /// straight off the view's atomics AT SCRAPE TIME, never published into
-    /// the consensus pass (M14a's lesson about a hot loop's body).
+    /// agent's WALK cursor (the view's `consumed` word — plan B3 T7 repointed
+    /// it there from the view's `position` tag, which is what the help text
+    /// had always described) and `uc2_settings_position` the frame-END of the
+    /// last Settings command it applied — both read straight off the view's
+    /// atomics AT SCRAPE TIME, never published into the consensus pass
+    /// (M14a's lesson about a hot loop's body).
+    ///
+    /// The fixture seeds `applied = 4096`, which `ClusterView::new` puts in
+    /// BOTH words, so this assertion is about the value being rendered, not
+    /// about which word it came from; `the_cluster_fsm_gauge_reads_the_walk_cursor`
+    /// below is the one that tells them apart.
     #[test]
     fn the_cluster_gauges_and_the_fifth_agent_sample_are_exported() {
         let s = synthetic_sources();
@@ -1689,6 +1729,40 @@ mod tests {
                 "missing the {agent} agent sample: {text}"
             );
         }
+    }
+
+    /// Plan B3 T7: `uc2_cluster_fsm_position` is the uc2-cluster agent's WALK
+    /// cursor, not the published view's `position` tag.
+    ///
+    /// The two words agree on a fresh view and diverge the moment the agent
+    /// walks a span that applied no `CLUSTER` command — which is the ordinary
+    /// case, and the only case in which the gauge's stated purpose ("is this
+    /// node's cluster FSM keeping up with commit?") can be answered at all.
+    /// The help text has described the walk cursor since the cluster FSM
+    /// shipped while the code read the view tag; this pins the reading the
+    /// text promises. The red twin is the old code: it renders 4096.
+    #[test]
+    fn the_cluster_fsm_gauge_reads_the_walk_cursor() {
+        let s = synthetic_sources();
+        // The agent walked to 8192 without applying a CLUSTER command, so the
+        // view's own tag stays at the fixture's 4096.
+        s.cluster_view.note_consumed(8192);
+        assert_eq!(
+            s.cluster_view.position.load(Ordering::Acquire),
+            4096,
+            "the fixture must keep the two words apart for this test to mean anything"
+        );
+        let text = render_prometheus(&s);
+        assert!(
+            text.contains("\nuc2_cluster_fsm_position 8192\n"),
+            "the gauge must read the walk cursor (8192), not the view tag (4096): {text}"
+        );
+        // `uc2_settings_position` is untouched by the walk — it is the other
+        // kind of reading, and stays fleet-identical-once-caught-up.
+        assert!(
+            text.contains("\nuc2_settings_position 2048\n"),
+            "the settings position must not follow the cursor: {text}"
+        );
     }
 
     #[test]
@@ -1788,7 +1862,7 @@ mod tests {
     fn the_contract_has_the_number_of_families_the_docs_state() {
         assert_eq!(
             CONTRACT_SERIES.len(),
-            111,
+            115,
             "if this is intentional, update the family count in \
              docs/how-to/monitor-a-cluster.md in the same commit"
         );
@@ -2192,6 +2266,10 @@ mod tests {
             schedule_entries: Arc::new(AtomicU64::new(0)),
             log_clock_smear_ns: Arc::new(AtomicU64::new(0)),
             schedule_apply_refused: Arc::new(AtomicU64::new(0)),
+            snapshot_reports_sent: Arc::new(AtomicU64::new(0)),
+            snapshot_reports_unsent: Arc::new(AtomicU64::new(0)),
+            snapshot_reports_appended: Arc::new(AtomicU64::new(0)),
+            snapshot_reports_timed_out: Arc::new(AtomicU64::new(0)),
             cluster_view: test_cluster_view(),
             probe: uc_net::probe::ProbeTable::new(uc_net::probe::ProbeCadence::default()),
             commands_over_standard: Arc::new(AtomicU64::new(0)),
@@ -2295,6 +2373,10 @@ mod tests {
             schedule_entries: Arc::new(AtomicU64::new(0)),
             log_clock_smear_ns: Arc::new(AtomicU64::new(0)),
             schedule_apply_refused: Arc::new(AtomicU64::new(0)),
+            snapshot_reports_sent: Arc::new(AtomicU64::new(0)),
+            snapshot_reports_unsent: Arc::new(AtomicU64::new(0)),
+            snapshot_reports_appended: Arc::new(AtomicU64::new(0)),
+            snapshot_reports_timed_out: Arc::new(AtomicU64::new(0)),
             cluster_view: test_cluster_view(),
             probe: uc_net::probe::ProbeTable::new(uc_net::probe::ProbeCadence::default()),
             commands_over_standard: Arc::new(AtomicU64::new(0)),

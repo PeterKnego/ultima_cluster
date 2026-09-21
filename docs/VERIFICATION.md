@@ -367,6 +367,95 @@ through a running node, answered by the same code path an operator's
 counterfactual disagree (`Some(4)` vs `Some(8)`) on the DEFAULT (purge-off)
 configuration, not just the purging one above.
 
+**The producing half (plan B3): live snapshot-hash reports.** Plans B1 and B2
+left `SnapshotReport` recorded, replicated and observable but never
+*produced*. Plan B3 is the producer, and each of its four seams has its own
+proof.
+
+The **hash** is `uc_service::snapshots::artifact_hash_of`, pinned against a
+hand-computed SHA-256 by
+`artifact_hash_is_sha256_of_the_payload_truncated`, which also drives a real
+`SnapshotStore::publish` through the streaming `HashingWriter` in two
+`write_all` calls and asserts the published hash equals the digest of the
+concatenation — so "the hash covers the payload as streamed, envelope
+excluded" is asserted, not asserted-about. The cnc word beneath it
+(`+504 artifact_hash`) has its offset pinned in **both** crates the way every
+cnc field is, plus `uc_log::cnc`'s
+`artifact_hash_roundtrips_and_offset_pin_and_slots_are_independent`.
+
+The **wire** is `uc_protocol::v2::datagram`'s
+`snap_report_kind_and_body_are_pinned` (kind `26`, `SNAP_REPORT_BODY_LEN =
+24`, the byte layout, the round trip, and the five refusals: short, long,
+non-zero reserved, row ≥ 8, position 0) and `uc_crypto`'s
+`snap_report_kind_is_pairwise`. It is in the `uc_protocol_datagram` fuzz
+target's arm list (§7), which offers every body reader every input.
+
+The **reporting edge** is six `uc_node::node` tests driving a real
+`Consensus` against a real UDP socket and draining the wire:
+`snapshot_report_goes_out_per_declared_row_on_a_followers_local_edge`,
+`snapshot_report_on_the_leader_reaches_the_collector_not_the_wire` (the
+leader feeds itself in process — no datagram),
+`snapshot_report_skips_a_row_with_no_published_artifact_hash`,
+`snapshot_report_is_never_sent_on_the_fetch_edge` (a set pulled with `uc2ctl
+snapshot fetch` is not this node's own observation),
+`snapshot_report_with_no_leader_to_address_is_dropped_and_counted`, and
+`snapshot_report_fires_on_the_set_complete_edge_not_once_per_pass`.
+
+The **collector and its release rule** are
+`snapshot_reports_append_once_every_voter_has_reported` (including the
+learner arm: two voters plus a learner is not every voter),
+`a_snapshot_report_from_a_non_member_is_dropped` and
+`both_leader_exits_clear_the_pending_snapshot_reports`.
+
+The **readiness gate** — B2's deferred boot window — is pinned clause by
+clause, because each clause alone is vacuous:
+`the_declared_set_waits_for_a_known_leader`,
+`the_declared_set_waits_for_a_commit_the_cluster_actually_took` (a restarted
+single voter is its own leader at commit 0 before it has ranked or gossiped
+anything, which is exactly the node whose pin sits above its recovered
+artifact) and `the_declared_set_waits_for_the_cluster_fsm_to_reach_commit`.
+Its service-side consequence is `uc_service/tests/pinned_attach.rs`'s
+`a_restarted_node_publishes_the_pin_before_the_declared_set` and
+`a_pin_above_the_recovered_artifact_is_published_before_the_declared_set` —
+the second is the case B2 could not close. The bounded `NodeBooting` wait has
+its own four tests in `uc_client::engine`
+(`names_present_with_declared_zero_is_refused_as_booting`,
+`a_node_that_never_joins_is_refused_after_the_bounded_wait`,
+`a_page_that_stops_opening_during_the_wait_reports_the_real_error` — the wait
+must not swallow a genuine re-open failure — and
+`attach_waits_out_a_joining_node_and_then_succeeds`) and two in
+`uc_service::attach`.
+
+**The end-to-end suite is `uc_node/tests/snapshot_reports.rs`**: three real
+nodes over loopback UDP, three real snapshot-capable services, one commanded
+coordinated instant, no sim and no fakes. `three_voters_agree` — every node
+commits the same record, `verdict().agreed` holds, and
+`uc2_snapshot_hash_mismatch{row="0"}` renders `0` on every node's own
+`/metrics`. `one_divergent_node_is_named` — node 2 runs a state machine whose
+`freeze()` appends its node id to the image (same FSM identity, different
+bytes), and three different readers of the SAME committed record must agree:
+the verdict names node 2 and only node 2 as the minority, the gauge reads `1`
+on **every** node rather than the leader's alone, and the `uc2-cluster`
+agent's `snapshot_hash_diverged` record names the row and the node. Its cheap
+red twin is giving node 2 a plain `SumSm`, which fails all three.
+`a_learner_reports_but_does_not_count_toward_quorum` — two voters and a
+learner, all three genuinely reporting; the record carries both voters, and a
+wall-clock bound well under `SNAP_REPORT_TIMEOUT_NS` pins that it was the
+voters' reports that released it and not the 5 s fallback, which is the
+assertion that tells the two mechanisms apart at all.
+
+**What this does not verify.** The release rule's *choice* — every voter
+rather than a quorum — rests on an **observation**, not a test and not a
+fleet measurement: in the three-node fixture above (three busy-spin nodes in
+ONE process on a dev box) the same replica completes its set last on every
+instant, for the life of the process. It is recorded in the spec's plan-B3
+errata. No test pins it, and none should: which replica straggles is a
+property of a machine, not of the code, so per CLAUDE.md's benchmarking
+discipline the underlying timing is smoke and no lag figure is claimed here
+— only the persistence of the ordering, which is all the argument needs. The
+cluster FSM's own artifact (`service_id = 255`) is not reported at all and so
+is not covered here either.
+
 **The red twin, and an honest note about what it pins.**
 `counterfactual_kernel_on_the_committed_view_is_caught_by_inv6_the_durable_time_oracle`
 (behind `mutation-testing`) feeds the kernel from the **committed** view — the
@@ -799,7 +888,7 @@ takes the process down. Availability is the thing being defended here.
 
 | Target | Seam, and why its input is untrusted |
 |---|---|
-| `uc_protocol_datagram` | `uc_protocol::v2::datagram` — the 16-byte header and every body reader. The **first code an unauthenticated UDP packet reaches**; with `[crypto].enabled = false` it is reached before any authentication at all. Three `2.11.0` seeds cover the `SNAP_BEGIN` shapes the flag day produced: `10-snap-begin-legacy-tail` (a body with a trailing carry, which the fixed-length reader must ignore rather than refuse), `14-snap-begin-v4` (the shipped layout) and `15-snap-begin-cluster` (`service_id = 255`, the cluster artifact). The `SNAP_TABLE` body reader those seeds replaced is retired with kind 21. |
+| `uc_protocol_datagram` | `uc_protocol::v2::datagram` — the 16-byte header and every body reader. The **first code an unauthenticated UDP packet reaches**; with `[crypto].enabled = false` it is reached before any authentication at all. Three `2.11.0` seeds cover the `SNAP_BEGIN` shapes the flag day produced: `10-snap-begin-legacy-tail` (a body with a trailing carry, which the fixed-length reader must ignore rather than refuse), `14-snap-begin-v4` (the shipped layout) and `15-snap-begin-cluster` (`service_id = 255`, the cluster artifact). The `SNAP_TABLE` body reader those seeds replaced is retired with kind 21. Since `2.13.0` the arm list also carries `read_snap_report_body` (kind 26, plan B3) — the target offers **every** reader the body of **every** input, so a 24-byte-exact decoder with reserved-byte, row-range and non-zero-position refusals is driven by bodies of every other length and shape, not only its own. |
 | `uc_protocol_log_frame` | `uc_protocol::v2::frame::read_header`, driven behind the real caller's `len >= HEADER_LEN` guard. Deliberately caller-guarded, so the target pins the guard's contract rather than pretending it is absent. |
 | `uc_protocol_timer_frame` | `2.11.0` — the TIMER body the apply loop decodes from a committed frame; guarded by length, total on any slice. |
 | `uc_protocol_sched_record` | `2.11.0` — the 17-byte service→node schedule record the consensus agent decodes from a shared-memory ring any local process can write. |

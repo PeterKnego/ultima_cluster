@@ -981,8 +981,15 @@ fn remote_lin_once(seed: u64, envelope: bool) {
         let d = root.path().join(format!("n{i}"));
         std::fs::create_dir_all(&d).unwrap();
         nodes.push(Some(spawn_node_member(&d, i as u32, bind, &node_members)));
-        wait_for_ready(&d, Duration::from_secs(20));
         dirs.push(d);
+    }
+    // Plan B3 T5: every node is spawned BEFORE any readiness wait. A wait is
+    // a successful attach, and an attach now waits for the node to have
+    // joined its cluster — which node 0 cannot do until nodes 1..n exist. The
+    // old shape (spawn, wait, spawn, wait) deadlocks until `boot_wait`
+    // expires.
+    for d in &dirs {
+        wait_for_ready(d, Duration::from_secs(20));
     }
     let svcs: Vec<Option<Reap>> = dirs
         .iter()
