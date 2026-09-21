@@ -194,6 +194,96 @@ impl uc_service::SnapshotStateMachine for DoublingRegisterSm {
     }
 }
 
+/// A diff-replay / pin-verify test fixture — **not a pattern for a user
+/// state machine** (see `examples/kv` for that) — and the reason it exists
+/// is worth stating, because [`DoublingRegisterSm`] looks like it should be
+/// enough and is not.
+///
+/// `RegisterSm` is **last-write-wins**, and `DoublingRegisterSm` changes only
+/// `Cmd::Write`. Take any span that separates the ARTIFACT path (install the
+/// artifact at P, recompute `(P, X]` under the new version) from the GENESIS
+/// path (replay everything under the new version): every write has to sit
+/// BELOW P, or the last write above P lands both paths on the same value
+/// again. But then nothing above P means anything different to the two
+/// versions, so the artifact path and the third path — **continue-from-X**,
+/// the one a service takes when it skips the pinned install and keeps the
+/// state it persisted — compute the same `(P, X]` and end in the same place.
+/// The durable rewind was therefore unobservable *through state*: a
+/// `pin-verify` run could not have failed on it.
+///
+/// This variant closes that by changing a command that PRESERVES history:
+/// `Cmd::Cas { old, new }` becomes `Cas { old, new: 2·new }`, with the `old`
+/// comparison left alone. The CAS chain's *outcome* still depends on the
+/// state at P (so the genesis path, whose doubled writes leave a different
+/// value, fails the whole chain), while its *result* now depends on the
+/// version (so continue-from-X, computed by the OLD binary, differs from the
+/// artifact path). All three paths land on distinct values, which is what
+/// gives `a_durable_register_is_rewound_to_the_origin_and_passes` teeth.
+///
+/// Same `NAME` as [`RegisterSm`] (the harness compares two builds of one FSM
+/// row); `VERSION = 3`, one above [`DoublingRegisterSm`], so the two can be
+/// pinned apart.
+#[cfg(feature = "v2")]
+#[derive(Default)]
+pub struct DoublingCasRegisterSm(pub RegisterSm);
+
+#[cfg(feature = "v2")]
+impl uc_service::StateMachine for DoublingCasRegisterSm {
+    const NAME: &'static str = <RegisterSm as uc_service::StateMachine>::NAME;
+    const VERSION: u32 = 3;
+
+    type Command = Cmd;
+    type Response = CmdResp;
+    type Query = ();
+    type QueryResponse = Option<u64>;
+
+    fn apply(&mut self, ctx: &mut uc_service::ApplyCtx, cmd: Cmd) -> CmdResp {
+        // `old` is deliberately NOT rewritten: the comparison keeps naming
+        // the value the recorded history meant, so whether the CAS FIRES is
+        // decided by the state at P while what it STORES is decided by the
+        // version.
+        let cmd = match cmd {
+            Cmd::Write(v) => Cmd::Write(v * 2),
+            Cmd::Cas { old, new } => Cmd::Cas { old, new: new * 2 },
+        };
+        self.0.apply(ctx, cmd)
+    }
+    fn query(&self, q: ()) -> Option<u64> {
+        self.0.query(q)
+    }
+    fn last_applied(&self) -> Option<u64> {
+        self.0.last_applied()
+    }
+    fn on_timer(&mut self, ctx: &mut uc_service::ApplyCtx, ev: uc_service::TimerEvent) {
+        uc_service::StateMachine::on_timer(&mut self.0, ctx, ev);
+    }
+}
+
+#[cfg(feature = "v2")]
+impl uc_service::SnapshotStateMachine for DoublingCasRegisterSm {
+    type SnapshotHandle = <RegisterSm as uc_service::SnapshotStateMachine>::SnapshotHandle;
+
+    fn freeze(&self) -> Result<(Self::SnapshotHandle, u64), uc_service::SnapshotError> {
+        self.0.freeze()
+    }
+    fn stream_snapshot(
+        h: Self::SnapshotHandle,
+        dst: &mut dyn std::io::Write,
+    ) -> Result<(), uc_service::SnapshotError> {
+        RegisterSm::stream_snapshot(h, dst)
+    }
+    fn install_snapshot(
+        &mut self,
+        p: u64,
+        src: &mut dyn std::io::Read,
+    ) -> Result<u64, uc_service::SnapshotError> {
+        self.0.install_snapshot(p, src)
+    }
+    fn project(&self, out: &mut dyn std::io::Write) -> Result<(), uc_service::SnapshotError> {
+        self.0.project(out)
+    }
+}
+
 /// The pure CAS-register transition shared by both SDK `apply` impls (the only
 /// difference between v1/v2 is the index name and the trait surface, never the
 /// business logic — keeping it in one place is what makes the model a single
@@ -398,6 +488,77 @@ mod v2_tests {
             restored
                 .install_snapshot(99, &mut bytes.as_slice())
                 .is_err()
+        );
+    }
+}
+
+/// The three diff-replay fixture builds on one recorded history, and the one
+/// arithmetic the pin-verify durable proof rests on.
+///
+/// `[Write(199), Cas{199 -> 200}]` is the GENESIS-shaped history: the doubled
+/// write moves the register off 199, so the CAS cannot fire under either
+/// doubling build. `[Cas{199 -> 200}]` applied to an INSTALLED 199 is the
+/// ARTIFACT-shaped history: the CAS fires under both, and only
+/// `DoublingCasRegisterSm` stores a different value than the plain build
+/// would — which is exactly the difference that makes a skipped pinned
+/// install (continue-from-X, 200) distinguishable from the artifact path
+/// (400).
+#[cfg(all(test, feature = "v2"))]
+mod fixture_arithmetic_tests {
+    use super::*;
+    use uc_service::{SnapshotStateMachine, StateMachine};
+
+    fn ctx(pos: u64) -> uc_service::ApplyCtx {
+        uc_service::ApplyCtx::new(pos, <RegisterSm as uc_service::RawStateMachine>::IDENTITY)
+    }
+
+    /// Drive `[Write(199), Cas{old: 199, new: 200}]` from empty.
+    fn write_then_cas<S: StateMachine<Command = Cmd, Query = (), QueryResponse = Option<u64>>>(
+        mut sm: S,
+    ) -> Option<u64> {
+        let _ = sm.apply(&mut ctx(64), Cmd::Write(199));
+        let _ = sm.apply(&mut ctx(128), Cmd::Cas { old: 199, new: 200 });
+        sm.query(())
+    }
+
+    #[test]
+    fn the_three_builds_on_a_write_then_cas_history() {
+        // Plain: last write 199, the CAS matches and stores 200.
+        assert_eq!(write_then_cas(RegisterSm::default()), Some(200));
+        // Doubling: the write stores 398, so `old: 199` no longer matches and
+        // the CAS is a no-op.
+        assert_eq!(write_then_cas(DoublingRegisterSm::default()), Some(398));
+        // DoublingCas: the same 398, and the same failed comparison — `old` is
+        // NOT rewritten, so doubling `new` changes nothing on a CAS that never
+        // fires.
+        assert_eq!(write_then_cas(DoublingCasRegisterSm::default()), Some(398));
+    }
+
+    /// The artifact-path shape: the state at P is installed, and the span
+    /// above P is the CAS alone. Here `old: 199` DOES match, the two doubling
+    /// builds part company, and the gap between them is the pin-verify
+    /// durable proof's whole tooth.
+    #[test]
+    fn a_cas_onto_an_installed_199_parts_the_two_doubling_builds() {
+        let image = {
+            let mut src = RegisterSm::default();
+            let _ = src.apply(&mut ctx(64), Cmd::Write(199));
+            SnapshotStateMachine::freeze(&src).unwrap().0
+        };
+        let cas = Cmd::Cas { old: 199, new: 200 };
+
+        let mut d = DoublingRegisterSm::default();
+        d.install_snapshot(64, &mut &image[..]).unwrap();
+        let _ = StateMachine::apply(&mut d, &mut ctx(128), cas.clone());
+        assert_eq!(StateMachine::query(&d, ()), Some(200), "Cas.new untouched");
+
+        let mut dc = DoublingCasRegisterSm::default();
+        dc.install_snapshot(64, &mut &image[..]).unwrap();
+        let _ = StateMachine::apply(&mut dc, &mut ctx(128), cas);
+        assert_eq!(
+            StateMachine::query(&dc, ()),
+            Some(400),
+            "Cas.new doubled: the version decides what a FIRING cas stores"
         );
     }
 }
