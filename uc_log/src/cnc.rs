@@ -170,12 +170,20 @@ pub fn pack_naks_plus_replay(naks_served: u32, replay_datagrams: u32) -> u64 {
 }
 
 /// cnc 3.1: the slot's line 0 — `status` (word 0) and the attached service's
-/// packed version (word 1). One writer (the service, at attach/detach).
+/// packed version (word 1). cnc 3.3 (plan B1) adds three more words to the
+/// same line, `upgrade_origin`/`pinned_version` and the `pin_seq` seqlock
+/// that publishes them as a pair — a second writer on the line: the service
+/// still owns `status`/`version` (attach/detach), the node's `uc2-cluster`
+/// agent owns the three pin words (republished on every view publish), and
+/// each word still has exactly one writer.
 #[repr(C)]
 pub struct ServiceStatusLine {
     status: AtomicU64,
     version: AtomicU64,
-    _pad: [u64; 6],
+    upgrade_origin: AtomicU64,
+    pinned_version: AtomicU64,
+    pin_seq: AtomicU64,
+    _pad: [u64; 3],
 }
 impl ServiceStatusLine {
     pub fn load_acquire(&self) -> u64 {
@@ -190,9 +198,98 @@ impl ServiceStatusLine {
     pub fn store_version(&self, v: u32) {
         self.version.store(v as u64, Ordering::Release)
     }
+    /// The row's pinned origin (cnc 3.3, spec §3 S4); `0` = no pin.
+    pub fn upgrade_origin(&self) -> u64 {
+        self.upgrade_origin.load(Ordering::Acquire)
+    }
+    pub fn pinned_version(&self) -> u32 {
+        self.pinned_version.load(Ordering::Acquire) as u32
+    }
+    /// The seqlock commit word guarding the pin pair (cnc 3.3, slot +32).
+    /// Odd ⇔ a [`ServiceStatusLine::store_pin`] is in flight. Exposed for
+    /// tests and for an operator decoding the raw page; readers want
+    /// [`ServiceStatusLine::pin`].
+    pub fn pin_seq(&self) -> u64 {
+        self.pin_seq.load(Ordering::Acquire)
+    }
+    /// The pair as it was stored, or `None`.
+    ///
+    /// `upgrade_origin` and `pinned_version` are two independent words, and
+    /// two atomics with no shared sequence CANNOT be read consistently by
+    /// re-reading one of them: a writer that has stored `version_new` but
+    /// not yet `origin_new` leaves the origin stable across a double read,
+    /// so the reader returns `(origin_old, version_new)` — a pair that
+    /// never existed. The pair therefore rides a real seqlock, `pin_seq`.
+    ///
+    /// Read `pin_seq`, both words, then `pin_seq` again; accept only if the
+    /// first read was EVEN (no store in flight) and the two reads match (no
+    /// store completed in between). The orderings are the file's seqlock
+    /// discipline — the commit word is `Acquire`-loaded, the writer's
+    /// stores are `Release` — and no extra fence is needed here because,
+    /// unlike `read_admin_req`'s plain byte fields, the two data words are
+    /// themselves atomics: if the origin (or version) load observes a value
+    /// a `store_pin` released, that store synchronizes-with this load, so
+    /// everything sequenced before it in the writer — including the bump to
+    /// ODD — happens-before the second `pin_seq` load, which therefore
+    /// cannot read the older EVEN value. A matching even pair of seq reads
+    /// thus brackets a window in which no `store_pin` touched either word.
+    ///
+    /// Bounded at 64 spins rather than looping forever, and on exhaustion
+    /// returns `None` — NOT a best-effort pair. The writer is the
+    /// `uc2-cluster` agent republishing the same pin idempotently on every
+    /// view publish, so 64 consecutive collisions mean something
+    /// pathological; under that, "this row reads as unpinned right now" is
+    /// an honest operator-facing answer and the next call converges, while
+    /// a fabricated `(origin, version)` pair is not — plan B2's attach
+    /// would install the wrong artifact from it.
+    pub fn pin(&self) -> Option<(u64, u32)> {
+        for _ in 0..64 {
+            let s1 = self.pin_seq.load(Ordering::Acquire);
+            if s1 & 1 != 0 {
+                std::hint::spin_loop();
+                continue;
+            }
+            let origin = self.upgrade_origin.load(Ordering::Acquire);
+            let version = self.pinned_version.load(Ordering::Acquire) as u32;
+            let s2 = self.pin_seq.load(Ordering::Acquire);
+            if s1 == s2 {
+                return (origin != 0).then_some((origin, version));
+            }
+            std::hint::spin_loop();
+        }
+        None
+    }
+    /// Publish the pair under the `pin_seq` seqlock: bump to ODD, store the
+    /// version, store the origin, bump back to EVEN — every step `Release`,
+    /// so a reader that observes either data word also observes the ODD
+    /// bump that preceded it. SINGLE WRITER (the `uc2-cluster` polling
+    /// agent owns all three words), so the bumps need no CAS; two concurrent
+    /// callers would corrupt the sequence, not merely race.
+    pub fn store_pin(&self, origin: u64, version: u32) {
+        self.pin_seq.fetch_add(1, Ordering::Release);
+        self.pinned_version.store(version as u64, Ordering::Release);
+        self.upgrade_origin.store(origin, Ordering::Release);
+        self.pin_seq.fetch_add(1, Ordering::Release);
+    }
+    /// The first half of [`ServiceStatusLine::store_pin`] — the ODD bump and
+    /// the version store, with the origin store and the closing bump left
+    /// undone. Exists only so a test can hold the seqlock open and observe
+    /// what a reader does mid-store.
+    #[cfg(test)]
+    fn store_pin_begin_for_test(&self, version: u32) {
+        self.pin_seq.fetch_add(1, Ordering::Release);
+        self.pinned_version.store(version as u64, Ordering::Release);
+    }
 }
 const _: () = assert!(std::mem::size_of::<ServiceStatusLine>() == 64);
 const _: () = assert!(std::mem::offset_of!(ServiceStatusLine, version) == cnc::CNC_SVC_OFF_VERSION);
+const _: () = assert!(
+    std::mem::offset_of!(ServiceStatusLine, upgrade_origin) == cnc::CNC_SVC_OFF_UPGRADE_ORIGIN
+);
+const _: () = assert!(
+    std::mem::offset_of!(ServiceStatusLine, pinned_version) == cnc::CNC_SVC_OFF_PINNED_VERSION
+);
+const _: () = assert!(std::mem::offset_of!(ServiceStatusLine, pin_seq) == cnc::CNC_SVC_OFF_PIN_SEQ);
 
 /// cnc 3.1: the slot's line 7 — the row's name (NUL-padded) and its FNV-1a
 /// hash, written ONCE by the node in `init`, before the header is published,
@@ -1872,6 +1969,73 @@ mod tests {
             u64::from_le_bytes(raw[off..off + 8].try_into().unwrap()),
             4096
         );
+    }
+
+    #[test]
+    fn pin_words_are_zero_at_init_and_store_version_before_origin() {
+        let page = CncPage::heap(&test_meta());
+        let s = &page.service_slot(2).status;
+        assert_eq!((s.upgrade_origin(), s.pinned_version()), (0, 0));
+        assert_eq!(s.pin_seq(), 0, "the seqlock starts even, at zero");
+        s.store_pin(8192, 0x0102_0003);
+        assert_eq!(
+            (s.upgrade_origin(), s.pinned_version()),
+            (8192, 0x0102_0003)
+        );
+        assert_eq!(
+            page.service_slot(1).status.upgrade_origin(),
+            0,
+            "slots are independent"
+        );
+    }
+
+    #[test]
+    fn pin_reads_the_pair_together_across_a_repin() {
+        let page = CncPage::heap(&test_meta());
+        let s = &page.service_slot(2).status;
+        assert_eq!(s.pin(), None, "no pin at init");
+        s.store_pin(8192, 0x0102_0003);
+        assert_eq!(s.pin(), Some((8192, 0x0102_0003)));
+        s.store_pin(9000, 0x0102_0004);
+        assert_eq!(s.pin(), Some((9000, 0x0102_0004)));
+        assert_eq!(
+            page.service_slot(1).status.pin(),
+            None,
+            "slots are independent"
+        );
+        assert_eq!(s.pin_seq() & 1, 0, "the seqlock is even after a full store");
+        assert_eq!(s.pin_seq(), 4, "two complete store_pin calls = four bumps");
+    }
+
+    /// The defect the seqlock exists for: a writer that has stored the NEW
+    /// version but not yet the NEW origin leaves the origin stable, so any
+    /// amount of re-reading the origin yields `(origin_old, version_new)` —
+    /// a pair that was never stored. With the seq word odd, `pin()` refuses
+    /// to answer at all.
+    #[test]
+    fn pin_returns_none_while_a_store_is_in_flight() {
+        let page = CncPage::heap(&test_meta());
+        let s = &page.service_slot(2).status;
+        s.store_pin(8192, 0x0102_0003);
+        assert_eq!(s.pin(), Some((8192, 0x0102_0003)));
+
+        // Drive only the first half of the next store_pin by hand.
+        s.store_pin_begin_for_test(0x0102_0004);
+        assert_eq!(s.pin_seq() & 1, 1, "the seqlock is held open");
+        assert_eq!(s.upgrade_origin(), 8192, "the origin has NOT moved yet");
+        assert_eq!(s.pinned_version(), 0x0102_0004, "the version already has");
+        assert_eq!(
+            s.pin(),
+            None,
+            "mid-store: no answer, never the (old origin, new version) pair"
+        );
+
+        // Completing that same store — its second half, by hand — publishes
+        // the real pair and closes the seqlock.
+        s.upgrade_origin.store(9000, Ordering::Release);
+        s.pin_seq.fetch_add(1, Ordering::Release);
+        assert_eq!(s.pin_seq() & 1, 0);
+        assert_eq!(s.pin(), Some((9000, 0x0102_0004)));
     }
 
     #[test]

@@ -71,6 +71,7 @@ const ALL_SCENARIOS: &[&str] = &[
     "snapshot_stalled",
     "standby_snapshot_stalled",
     "snapshot_set_diverged",
+    "snapshot_hash_diverged",
     "mtu_discovery_stalled",
     "path_below_mtu",
     "jumbo_gate_held",
@@ -204,6 +205,7 @@ fn run_scenario(name: &str, scratch_root: &Path) -> (SeriesFile, Disclosure) {
         "snapshot_stalled" => scenario_snapshot_stalled(),
         "standby_snapshot_stalled" => scenario_standby_snapshot_stalled(),
         "snapshot_set_diverged" => scenario_snapshot_set_diverged(),
+        "snapshot_hash_diverged" => scenario_snapshot_hash_diverged(),
         "mtu_discovery_stalled" => scenario_mtu_discovery_stalled(),
         "path_below_mtu" => scenario_path_below_mtu(),
         "jumbo_gate_held" => scenario_jumbo_gate_held(),
@@ -1654,6 +1656,55 @@ fn scenario_snapshot_set_diverged() -> (SeriesFile, Disclosure) {
 
 // ----------------------------------------------------------- scenario 21
 
+/// Uc2SnapshotHashDiverged — **synthetic, disclosed**: one synthetic
+/// `ObsSources` whose cluster view holds a committed `SnapshotReport` for
+/// row 0 naming three nodes, two agreeing and one not — the shape of a
+/// service whose apply diverged (nondeterminism, or a non-canonical image)
+/// on one member while the leader's collected vector still shows the
+/// majority. A genuine three-node divergence needs one member actually
+/// running different bytes at the same position, an order of magnitude
+/// larger than this rule's share of the harness; same synthetic-state/
+/// real-transition budget as `schedule_diverged` and `snapshot_set_diverged`
+/// above — only the verdict computation (`uc_protocol::v2::upgrade::verdict`)
+/// is real, run by the real exporter over a planted report.
+fn scenario_snapshot_hash_diverged() -> (SeriesFile, Disclosure) {
+    let kv = FsmName::parse("kv").unwrap();
+    let src = synthetic_sources_named(0, Some(kv));
+    src.cnc.store_services_declared(0b1);
+    // One committed SnapshotReport for row 0 at 8192: nodes 0 and 1 agree,
+    // node 2 does not — the verdict names one minority node.
+    let mut st = src.cluster_view.to_state();
+    st.reports.push(uc_protocol::v2::upgrade::SnapshotReport {
+        row: 0,
+        position: 8192,
+        hashes: vec![(0, 0xAA), (1, 0xAA), (2, 0xBB)],
+    });
+    st.applied = 8192;
+    src.cluster_view.publish(&st);
+    let srv = ObsServer::serve(src.clone(), "127.0.0.1:0".parse().unwrap()).expect("bind");
+    let addr = srv.local_addr();
+    let mut sf = SeriesFile::new();
+    for _ in 0..3 {
+        sf.record_round("n0", &scrape(addr), &["uc2_snapshot_hash_mismatch"]);
+        thread::sleep(Duration::from_millis(200));
+    }
+    srv.stop();
+    (
+        sf,
+        Disclosure {
+            scenario: "snapshot_hash_diverged",
+            rules: &["Uc2SnapshotHashDiverged"],
+            state: "synthetic",
+            method: "one synthetic ObsSource whose cluster view holds a committed SnapshotReport for row 0 \
+                     with hashes {0: AA, 1: AA, 2: BB}; the exporter recomputes the verdict at scrape and \
+                     renders uc2_snapshot_hash_mismatch{row=\"0\"} = 1 through the real encoder"
+                .into(),
+        },
+    )
+}
+
+// ----------------------------------------------------------- scenario 22
+
 /// Uc2MtuDiscoveryStalled — **synthetic, disclosed**: a single synthetic
 /// `ObsSources` with one peer added to the REAL `uc_net::probe::ProbeTable`
 /// and immediately acked at the top rung, while the `ClusterView` stays at
@@ -1706,7 +1757,7 @@ fn scenario_mtu_discovery_stalled() -> (SeriesFile, Disclosure) {
     )
 }
 
-// ----------------------------------------------------------- scenario 22
+// ----------------------------------------------------------- scenario 23
 
 /// Uc2PathBelowMtu — **synthetic, disclosed**: `sender.emsgsize` bumped
 /// directly (the real trigger — a route or NIC change that drops a path's
@@ -1748,7 +1799,7 @@ fn scenario_path_below_mtu() -> (SeriesFile, Disclosure) {
     )
 }
 
-// ----------------------------------------------------------- scenario 23
+// ----------------------------------------------------------- scenario 24
 
 /// Uc2JumboGateHeld — **synthetic, disclosed**: `jumbo_gate_pending` set
 /// directly and held (the real trigger — a node restarted onto a jumbo

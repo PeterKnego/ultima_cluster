@@ -6,7 +6,12 @@
 //! settings_position u64 ‖ membership (u32 len ‖ bytes) ‖ table (u32 len ‖
 //! bytes) ‖ settings (one whole [`SETTINGS_LEN`] or [`SETTINGS_LEN_V1`]
 //! record — the record is self-versioned and exact-length per version) ‖
-//! crc32 of everything before it.
+//! crc32 of everything before it. That is layout v1, still ACCEPTED on
+//! read. Layout v2 (plan B1 T3) appends two more length-prefixed blobs
+//! after the settings record, before the CRC: pins (u32 len ‖ bytes) ‖
+//! reports (u32 len ‖ bytes) — the upgrade-pin and snapshot-report records
+//! (`v2::upgrade`'s list codecs), carried here as opaque bytes; this leaf
+//! does not decode them.
 //!
 //! Moved out of `uc_node::cluster_fsm` (plan 3, spec §4.8) so a fuzz target
 //! can reach the decoder without pulling in `ClusterFsm` — a below-floor
@@ -16,9 +21,14 @@
 //! `v2::settings`: no I/O, no `sha2` — `crc32fast` is already a dependency of
 //! this crate.
 //!
-//! The byte layout is unchanged from the plan-1/plan-2 `ClusterFsm::freeze`
-//! this replaces — see `cluster_image_roundtrips_and_layout_is_frozen`'s
-//! fixture, captured from the pre-move `freeze` output.
+//! Layout v1 IS the byte layout the plan-1/plan-2 `ClusterFsm::freeze` this
+//! module replaced produced — see `cluster_image_roundtrips_and_layout_is_frozen`'s
+//! `PLAN1_FIXTURE`, captured from that pre-move `freeze` output. It is now
+//! **read-only compatibility**: `encode_cluster_image` always emits v2,
+//! which appends the two length-prefixed pin and report blobs after the
+//! settings record, so a fresh artifact no longer reproduces that fixture
+//! byte for byte. The fixture still has to DECODE, because a node restarting
+//! across the `2.13.0` flag day reads its own pre-upgrade artifact off disk.
 //!
 //! `membership`, `table` and `settings` are returned as opaque byte slices,
 //! not decoded here: the caller (`uc_node::cluster_fsm`) already owns
@@ -33,14 +43,10 @@ pub const CLUSTER_IMAGE_MAGIC: &[u8; 8] = b"UCCLUST1";
 /// The image layout's version, refused by [`decode_cluster_image`] when
 /// unknown.
 ///
-/// Still `1` even though the layout changed twice during plan 1's
-/// development: nothing was released at any intermediate shape, so there is
-/// no artifact in the world to be compatible with. A pre-release image
-/// therefore fails the membership-length or CRC check rather than a version
-/// refusal — a fine outcome for an artifact that only exists on a developer's
-/// disk, and not a reason to burn a version number. Bump it for the first
-/// change made AFTER a release.
-pub const CLUSTER_IMAGE_VERSION: u32 = 1;
+/// Bumped to 2 by plan B1 for the pin and report blobs; a version-1 image
+/// is still ACCEPTED on read, with both blobs empty — the settings v1/v2
+/// precedent, since a restarting `2.12.0` node reads its own artifact.
+pub const CLUSTER_IMAGE_VERSION: u32 = 2;
 
 /// Bytes fixed before the two length-prefixed payloads: magic(8) ‖
 /// version(4) ‖ applied(8) ‖ table_position(8) ‖ settings_position(8).
@@ -52,6 +58,12 @@ pub const MEMBERSHIP_LEN_OFFSET: usize = FIXED_HEADER_LEN;
 /// The smallest possible total image: the fixed header, two zero-length
 /// prefixes, the SHORTEST settings record a decode accepts ([`SETTINGS_LEN_V1`]
 /// — a `2.11.0` artifact carries one, jumbo spec §5.5) and the CRC.
+///
+/// This is a v1-shaped minimum and is left unchanged: it only guards the
+/// initial length + magic read, before the version word is even
+/// inspected, and both versions share that guard. A v2 image is at least 8
+/// bytes longer (its two extra length prefixes), which the v2-specific
+/// decode path below checks for itself.
 const MIN_IMAGE_LEN: usize = FIXED_HEADER_LEN + 4 + 4 + SETTINGS_LEN_V1 + 4;
 
 /// The three replicated records inside a cluster image, plus the two
@@ -69,6 +81,12 @@ pub struct ClusterImageParts<'a> {
     pub membership: &'a [u8],
     pub table: &'a [u8],
     pub settings: &'a [u8],
+    /// The `v2::upgrade` pin-list bytes (opaque here; empty for a v1
+    /// image or a cluster with no pins recorded).
+    pub pins: &'a [u8],
+    /// The `v2::upgrade` snapshot-report-list bytes (opaque here; empty for
+    /// a v1 image or a cluster with no reports recorded).
+    pub reports: &'a [u8],
 }
 
 /// Append the encoded image (magic through the trailing CRC) to `out`. The
@@ -76,14 +94,17 @@ pub struct ClusterImageParts<'a> {
 /// `out` before it — so a caller may compose this into a larger buffer
 /// without the checksum picking up unrelated prefix bytes.
 ///
-/// `None` if `p.membership` or `p.table` is longer than `u32::MAX` bytes —
-/// each rides a `u32` length prefix on the wire (the byte layout is
-/// unchanged), so a payload that long cannot be represented at all and must
-/// be refused rather than silently truncated by an `as u32` cast. Neither
-/// membership nor a 32-entry schedule table ever approaches this in
-/// practice; the check exists so the cast at the call site is provably safe
-/// rather than merely believed to be. `out` is left untouched on refusal —
-/// nothing is written until both lengths are known to fit.
+/// `None` if `p.membership`, `p.table`, `p.pins` or `p.reports` is longer
+/// than `u32::MAX` bytes — each rides a `u32` length prefix on the wire, so
+/// a payload that long cannot be represented at all and must be refused
+/// rather than silently truncated by an `as u32` cast. None of these ever
+/// approaches this in practice; the check exists so the cast at the call
+/// site is provably safe rather than merely believed to be. `out` is left
+/// untouched if `p.membership` or `p.table` is oversized (checked before
+/// anything is written); a pins/reports refusal is caught only after the
+/// fixed header, membership, table and settings have already been appended
+/// — an acceptable asymmetry given how far into the multi-gigabyte range a
+/// payload would have to be to trip it at all.
 /// The one place a payload length becomes a wire prefix: `None` if it does
 /// not fit the `u32` prefix, so [`encode_cluster_image`] REFUSES an oversized
 /// payload rather than truncating it the way an `as u32` cast would. Kept as
@@ -107,6 +128,12 @@ pub fn encode_cluster_image(p: &ClusterImageParts<'_>, out: &mut Vec<u8>) -> Opt
     out.extend_from_slice(&table_len.to_le_bytes());
     out.extend_from_slice(p.table);
     out.extend_from_slice(p.settings);
+    let pins_len = payload_len_prefix(p.pins.len())?;
+    let reports_len = payload_len_prefix(p.reports.len())?;
+    out.extend_from_slice(&pins_len.to_le_bytes());
+    out.extend_from_slice(p.pins);
+    out.extend_from_slice(&reports_len.to_le_bytes());
+    out.extend_from_slice(p.reports);
     let crc = crc32fast::hash(&out[start..]);
     out.extend_from_slice(&crc.to_le_bytes());
     Some(())
@@ -141,7 +168,8 @@ pub fn decode_cluster_image(buf: &[u8]) -> Option<ClusterImageParts<'_>> {
             .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
     };
     let mut o = 8;
-    if u32_at(o)? != CLUSTER_IMAGE_VERSION {
+    let version = u32_at(o)?;
+    if version != 1 && version != CLUSTER_IMAGE_VERSION {
         return None;
     }
     o += 4;
@@ -160,15 +188,52 @@ pub fn decode_cluster_image(buf: &[u8]) -> Option<ClusterImageParts<'_>> {
     o += 4;
     let table = o.checked_add(tl).and_then(|end| body.get(o..end))?;
     o += tl;
-    // The settings record is self-versioned and exact-length per version
-    // (`settings::decode_settings`): the remainder must be exactly one v1 or
-    // one v2 record — never a slice that could run past `body`'s end. A
-    // 2.11.0 artifact carries v1 — jumbo spec §5.5.
-    let rest = body.len().checked_sub(o)?;
-    if rest != SETTINGS_LEN && rest != SETTINGS_LEN_V1 {
-        return None;
-    }
-    let settings = &body[o..];
+    let (settings, pins, reports) = if version == 1 {
+        // 2.11.0/2.12.0 layout: the remainder is exactly one settings
+        // record, self-versioned and exact-length per version
+        // (`settings::decode_settings`) — never a slice that could run past
+        // `body`'s end. A 2.11.0 artifact carries v1 — jumbo spec §5.5.
+        // Size it by ITS OWN version word, exactly as the v2 branch does,
+        // and require the remainder to be that length and nothing else.
+        // Accepting `rest == SETTINGS_LEN || rest == SETTINGS_LEN_V1`
+        // without consulting the word would admit a 33-byte tail that says
+        // `version = 1`: `decode_settings` would then read a 29-byte record
+        // and the 4 trailing bytes would vanish on re-encode, so decode and
+        // re-encode would not round-trip for an input we accepted.
+        let sl = match u32_at(o)? {
+            1 => SETTINGS_LEN_V1,
+            2 => SETTINGS_LEN,
+            _ => return None,
+        };
+        let rest = body.len().checked_sub(o)?;
+        if rest != sl {
+            return None;
+        }
+        (&body[o..], &body[body.len()..], &body[body.len()..])
+    } else {
+        // v2: the settings record is sized by ITS OWN version word (the
+        // record is exact-length per version), then two length-prefixed
+        // blobs, then nothing.
+        let sl = match u32_at(o)? {
+            1 => SETTINGS_LEN_V1,
+            2 => SETTINGS_LEN,
+            _ => return None,
+        };
+        let settings = o.checked_add(sl).and_then(|end| body.get(o..end))?;
+        o += sl;
+        let pl = u32_at(o)? as usize;
+        o += 4;
+        let pins = o.checked_add(pl).and_then(|end| body.get(o..end))?;
+        o += pl;
+        let rl = u32_at(o)? as usize;
+        o += 4;
+        let reports = o.checked_add(rl).and_then(|end| body.get(o..end))?;
+        o += rl;
+        if o != body.len() {
+            return None;
+        }
+        (settings, pins, reports)
+    };
     Some(ClusterImageParts {
         applied,
         table_position,
@@ -176,6 +241,8 @@ pub fn decode_cluster_image(buf: &[u8]) -> Option<ClusterImageParts<'_>> {
         membership,
         table,
         settings,
+        pins,
+        reports,
     })
 }
 
@@ -187,9 +254,14 @@ mod tests {
     /// `uc_node::cluster_fsm::ClusterFsm::freeze` on this worktree BEFORE the
     /// leaf move (`ClusterFsm::new(ClusterState::genesis_empty(), ..)`,
     /// `set_consumed(500)`, then `freeze()`), printing the resulting bytes,
-    /// and pasting them here as a `const`. Pins that this leaf's
-    /// `encode_cluster_image` reproduces the plan-1/plan-2-era byte layout
-    /// exactly (Q4: "the byte layout on `main` NOW is the layout").
+    /// and pasting them here as a `const`. Originally pinned that this
+    /// leaf's `encode_cluster_image` reproduced the plan-1/plan-2-era byte
+    /// layout exactly (Q4: "the byte layout on `main` NOW is the layout");
+    /// since plan B1 T3, `encode_cluster_image` always writes the v2 layout
+    /// (two trailing length-prefixed pin/report blobs), so this fixture now
+    /// pins the DECODE side only — a version-1 image with no such blobs must
+    /// still decode, with both fields empty (the "v1 accepted on read"
+    /// requirement).
     ///
     /// Provenance, byte for byte (all fixed-width fields little-endian):
     ///   magic          "UCCLUST1"                                  (8 B)
@@ -263,6 +335,16 @@ mod tests {
         v
     }
 
+    /// A version-2 (33 B, jumbo `datagram_mtu` field included) settings
+    /// record: `encode_settings(&Settings::genesis_default())`'s bytes.
+    fn v2_settings() -> Vec<u8> {
+        use super::super::settings::{Settings, encode_settings};
+        let mut v = Vec::new();
+        encode_settings(&Settings::genesis_default(), &mut v);
+        assert_eq!(v.len(), SETTINGS_LEN);
+        v
+    }
+
     fn genesis_parts() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
         use super::super::config::{WireConfig, encode_config};
         use super::super::schedule::{ScheduleTable, encode_schedule_table};
@@ -302,26 +384,30 @@ mod tests {
             membership: &membership,
             table: &table,
             settings: &settings,
+            pins: &[],
+            reports: &[],
         };
+        // encode_cluster_image now always writes the v2 layout (with two
+        // trailing, empty, length-prefixed pin/report blobs), so it no
+        // longer reproduces PLAN1_FIXTURE byte-for-byte; that pinning moves
+        // to the decode side below, which is the "v1 accepted on read"
+        // requirement this test exists to cover.
         let mut img = Vec::new();
         encode_cluster_image(&parts, &mut img).expect("well under u32::MAX");
-
         assert_eq!(&img[0..8], CLUSTER_IMAGE_MAGIC, "magic at 0");
         assert_eq!(
             &img[8..12],
             &CLUSTER_IMAGE_VERSION.to_le_bytes(),
             "version at 8"
         );
-        assert_eq!(
-            img, PLAN1_FIXTURE,
-            "encode_cluster_image must reproduce the plan-1-era byte layout, CRC included, exactly"
-        );
-
         let decoded = decode_cluster_image(&img).expect("a well-formed image decodes");
         assert_eq!(decoded, parts);
-        // And the fixture itself installs, pinning that a plan-1-era
-        // artifact still loads under this leaf.
-        assert_eq!(decode_cluster_image(PLAN1_FIXTURE), Some(parts));
+
+        // And the plan-1-era fixture itself still installs under this leaf,
+        // with both new fields empty.
+        let from_v1 = decode_cluster_image(PLAN1_FIXTURE).expect("a plan-1-era image decodes");
+        assert_eq!(from_v1, parts);
+        assert!(from_v1.pins.is_empty() && from_v1.reports.is_empty());
     }
 
     /// Jumbo spec §5.5: a `2.11.0` artifact's tail is a 29-byte v1 settings
@@ -343,6 +429,8 @@ mod tests {
                 membership: &membership,
                 table: &table,
                 settings: tail,
+                pins: &[],
+                reports: &[],
             };
             let mut img = Vec::new();
             encode_cluster_image(&parts, &mut img).expect("well under u32::MAX");
@@ -365,6 +453,8 @@ mod tests {
                 membership: &membership,
                 table: &table,
                 settings: &tail,
+                pins: &[],
+                reports: &[],
             };
             let mut img = Vec::new();
             encode_cluster_image(&parts, &mut img).expect("well under u32::MAX");
@@ -374,6 +464,52 @@ mod tests {
                 "a {bad_len}-byte settings tail is neither version's exact length"
             );
         }
+    }
+
+    /// The v1 branch sizes the settings tail by the record's OWN version
+    /// word, not by "either accepted length": a v1-FRAMED image whose
+    /// 33-byte tail claims `version = 1` is not a v1 record padded with
+    /// four bytes, it is a length the codec cannot re-encode, so it is
+    /// refused rather than silently truncated to 29.
+    #[test]
+    fn a_v1_image_whose_33_byte_tail_claims_version_1_is_refused() {
+        let (membership, table, _) = genesis_parts();
+        let mut tail = v1_settings_blob();
+        tail.resize(SETTINGS_LEN, 0); // 33 bytes, version word still 1
+        assert_eq!(tail.len(), SETTINGS_LEN);
+        assert_eq!(&tail[0..4], &1u32.to_le_bytes());
+
+        let frame_v1 = |settings: &[u8]| -> Vec<u8> {
+            // Hand-framed as a VERSION-1 image (encode_cluster_image only
+            // emits v2), so the tail reaches the v1 branch.
+            let mut body = Vec::new();
+            body.extend_from_slice(CLUSTER_IMAGE_MAGIC);
+            body.extend_from_slice(&1u32.to_le_bytes());
+            body.extend_from_slice(&640u64.to_le_bytes()); // applied
+            body.extend_from_slice(&0u64.to_le_bytes()); // table_position
+            body.extend_from_slice(&320u64.to_le_bytes()); // settings_position
+            body.extend_from_slice(&(membership.len() as u32).to_le_bytes());
+            body.extend_from_slice(&membership);
+            body.extend_from_slice(&(table.len() as u32).to_le_bytes());
+            body.extend_from_slice(&table);
+            body.extend_from_slice(settings);
+            let crc = crc32fast::hash(&body);
+            body.extend_from_slice(&crc.to_le_bytes());
+            body
+        };
+
+        assert_eq!(
+            decode_cluster_image(&frame_v1(&tail)),
+            None,
+            "the CRC is correct; the version word disagrees with the length"
+        );
+
+        // The control: the same framing with the honest 29-byte v1 tail
+        // decodes, so it is the length rule refusing above, not the frame.
+        let ok = frame_v1(&v1_settings_blob());
+        let d = decode_cluster_image(&ok).expect("an honest v1 tail decodes");
+        assert_eq!(d.settings.len(), SETTINGS_LEN_V1);
+        assert!(d.pins.is_empty() && d.reports.is_empty());
     }
 
     #[test]
@@ -386,6 +522,8 @@ mod tests {
             membership: &membership,
             table: &table,
             settings: &settings,
+            pins: &[],
+            reports: &[],
         };
         let mut img = Vec::new();
         encode_cluster_image(&parts, &mut img).expect("well under u32::MAX");
@@ -437,8 +575,83 @@ mod tests {
             membership: &membership,
             table: &table,
             settings: &settings,
+            pins: &[],
+            reports: &[],
         };
         assert_eq!(encode_cluster_image(&parts, &mut out), Some(()));
         assert!(decode_cluster_image(&out).is_some());
+    }
+
+    #[test]
+    fn v2_roundtrips_pins_and_reports_and_is_exact() {
+        let pins = [1u8; 40]; // two 20-byte pin records' worth of bytes: the leaf does not decode them
+        let reports = [2u8; 7];
+        let p = ClusterImageParts {
+            applied: 500,
+            table_position: 0,
+            settings_position: 400,
+            membership: &[9, 9],
+            table: &[],
+            settings: &v2_settings(),
+            pins: &pins,
+            reports: &reports,
+        };
+        let mut img = Vec::new();
+        encode_cluster_image(&p, &mut img).unwrap();
+        assert_eq!(&img[8..12], &2u32.to_le_bytes(), "version 2");
+        let d = decode_cluster_image(&img).unwrap();
+        assert_eq!(
+            (
+                d.applied,
+                d.settings_position,
+                d.membership,
+                d.pins,
+                d.reports
+            ),
+            (500, 400, &[9u8, 9][..], &pins[..], &reports[..])
+        );
+        // Exact framing: a pins length that runs into the reports, or past
+        // the CRC, is refused; so is a byte after the reports blob.
+        let mut bad = img.clone();
+        // magic(8) + version(4) + applied/table_pos/settings_pos(24) +
+        // membership len prefix(4) + membership bytes(2) + table len
+        // prefix(4) + table bytes(0) + the settings record.
+        #[allow(clippy::identity_op)]
+        let pins_len_off = 8 + 4 + 24 + 4 + 2 + 4 + 0 + SETTINGS_LEN;
+        bad[pins_len_off..pins_len_off + 4].copy_from_slice(&41u32.to_le_bytes());
+        fix_crc(&mut bad);
+        assert!(decode_cluster_image(&bad).is_none());
+        let mut trailing = img.clone();
+        let l = trailing.len();
+        trailing.insert(l - 4, 0);
+        fix_crc(&mut trailing);
+        assert!(decode_cluster_image(&trailing).is_none());
+    }
+
+    #[test]
+    fn v2_carries_a_v1_settings_record_by_its_own_version_word() {
+        // A 2.11.0 settings record (29 B) inside a v2 image: the decoder
+        // sizes the record from its version word, never from "the rest".
+        let p = ClusterImageParts {
+            applied: 1,
+            table_position: 0,
+            settings_position: 0,
+            membership: &[],
+            table: &[],
+            settings: &v1_settings_blob(),
+            pins: &[],
+            reports: &[],
+        };
+        let mut img = Vec::new();
+        encode_cluster_image(&p, &mut img).unwrap();
+        let d = decode_cluster_image(&img).unwrap();
+        assert_eq!(d.settings, &v1_settings_blob()[..]);
+    }
+
+    /// Recompute the trailing CRC after a deliberate mutation.
+    fn fix_crc(img: &mut [u8]) {
+        let l = img.len();
+        let crc = crc32fast::hash(&img[..l - 4]);
+        img[l - 4..].copy_from_slice(&crc.to_le_bytes());
     }
 }

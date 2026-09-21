@@ -43,9 +43,11 @@ use uc_log::cnc::CncPage;
 use uc_log::reader::{Batch, LogFollower};
 use uc_protocol::v2::cnc::NODE_FLAG_LEARNER;
 use uc_protocol::v2::frame::{
-    FLAG_SNAPSHOT_STANDBY, FRAME_TYPE_CLUSTER, FRAME_TYPE_SNAPSHOT, align_frame_len,
+    CLUSTER_BODY_PREFIX_LEN, ClusterKind, FLAG_SNAPSHOT_STANDBY, FRAME_TYPE_CLUSTER,
+    FRAME_TYPE_SNAPSHOT, align_frame_len,
 };
 use uc_protocol::v2::schedule::ScheduleTable;
+use uc_protocol::v2::upgrade::{SnapshotReport, UpgradePin, verdict};
 use uc_service::{ApplyCtx, RawStateMachine, SnapshotStateMachine};
 
 use crate::cluster_fsm::{ClusterFsm, ClusterState, ClusterView};
@@ -123,6 +125,26 @@ pub fn read_committed_settings(
     }
     let st = fsm.state();
     Ok(Some((st.applied, st.settings)))
+}
+
+/// `uc2ctl upgrade show`'s reader (plan B1): the pin history and the held
+/// snapshot reports in this instance directory's newest cluster artifact,
+/// with the artifact's position — `read_committed_settings`'s contract and
+/// its staleness caveat, verbatim.
+#[allow(clippy::type_complexity)]
+pub fn read_committed_upgrade(
+    instance_dir: &Path,
+) -> io::Result<Option<(u64, Vec<UpgradePin>, Vec<SnapshotReport>)>> {
+    let (fsm, start) = recover(
+        &snapshot_dir_of(instance_dir),
+        ClusterState::genesis_empty(),
+        Vec::new(),
+    )?;
+    if start == 0 {
+        return Ok(None);
+    }
+    let st = fsm.state();
+    Ok(Some((st.applied, st.pins.clone(), st.reports.clone())))
 }
 
 /// Recovery (spec §4.7): the newest `snap-*.ultcluster` under `dir`, or
@@ -245,7 +267,7 @@ impl ClusterAgent {
     ) -> ClusterAgent {
         let snapshot_pos = fsm.last_applied().filter(|_| start > 0).unwrap_or(0);
         cluster_snapshot_pos.store(snapshot_pos, Ordering::Release);
-        ClusterAgent {
+        let mut agent = ClusterAgent {
             follower: LogFollower::new(buffer, start),
             cnc,
             fsm,
@@ -259,11 +281,79 @@ impl ClusterAgent {
             replay_gap_logged: false,
             install,
             installed,
-        }
+        };
+        // Spec §2.5 / §3 S4 step 3: a recovered agent republishes the pin
+        // words from the artifact BEFORE any service attaches — the same
+        // "no edge to miss" posture `publish_view` takes everywhere else.
+        agent.publish_view();
+        agent
     }
 
     pub fn applied(&self) -> u64 {
         self.fsm.state().applied
+    }
+
+    /// Publish the view AND the per-row pin words (spec §3 S4 step 3): the
+    /// words are a projection of FSM state, republished whole on every
+    /// publish — idempotent, so a recovered or freshly-installed state
+    /// writes them before any service attaches, with no edge to miss.
+    fn publish_view(&mut self) {
+        let st = self.fsm.state();
+        self.view.publish(st);
+        for row in 0..uc_protocol::v2::cnc::CNC_MAX_SERVICES as u8 {
+            if let Some(p) = st.pin_for(row) {
+                self.cnc
+                    .service_slot(row as usize)
+                    .status
+                    .store_pin(p.origin, p.to);
+            }
+        }
+    }
+
+    /// Plan B1: name what an ACCEPTED pin or report did, at the time it
+    /// did it. `row` is the payload's first byte, the same for both kinds.
+    /// A report's verdict is recomputed here from FSM state, not stored.
+    ///
+    /// Takes `fsm` rather than `&self` — same reason as
+    /// [`Self::freeze_and_write`]: `do_work`'s call site is inside the
+    /// `Batch::Frames` loop, where `iter` already holds a borrow of
+    /// `self.follower`, so a whole-`self` receiver here would conflict.
+    fn note_applied(fsm: &ClusterFsm, kind: u8, row: u8, accepted: bool, position: u64) {
+        if !accepted {
+            return;
+        }
+        let st = fsm.state();
+        match ClusterKind::from_u8(kind) {
+            Some(ClusterKind::UpgradePin) => {
+                if let Some(p) = st.pin_for(row) {
+                    crate::obs_event!(
+                        Info,
+                        "upgrade_pin_applied",
+                        position = position,
+                        row = p.row as u64,
+                        from = p.from as u64,
+                        to = p.to as u64,
+                        origin = p.origin
+                    );
+                }
+            }
+            Some(ClusterKind::SnapshotReport) => {
+                if let Some(r) = st.report_for(row) {
+                    let v = verdict(r);
+                    for node in v.minority {
+                        crate::obs_event!(
+                            Warn,
+                            "snapshot_hash_diverged",
+                            row = r.row as u64,
+                            position = r.position,
+                            node = node as u64,
+                            majority_hash = v.majority_hash.unwrap_or(0)
+                        );
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 
     /// The newest complete artifact's position on disk, 0 = none. Plan 2's
@@ -421,6 +511,13 @@ impl ClusterAgent {
                             accepted = accepted as u64,
                             reason = self.out.first().copied().unwrap_or(0) as u64
                         );
+                        Self::note_applied(
+                            &self.fsm,
+                            payload.first().copied().unwrap_or(0),
+                            payload.get(CLUSTER_BODY_PREFIX_LEN).copied().unwrap_or(0),
+                            accepted,
+                            end,
+                        );
                         applied_any = true;
                     }
                 }
@@ -452,7 +549,7 @@ impl ClusterAgent {
         // view's tag catches up on the next pass that really applies something.
         self.fsm.set_consumed(self.follower.cursor);
         if applied_any {
-            self.view.publish(self.fsm.state());
+            self.publish_view();
         }
         applied_any || installed_any
     }
@@ -492,7 +589,7 @@ impl ClusterAgent {
             .fsm
             .install_snapshot(position, &mut f)
             .map_err(|e| io::Error::other(e.to_string()))?;
-        self.view.publish(self.fsm.state());
+        self.publish_view();
         self.snapshot_pos = got;
         self.cluster_snapshot_pos.store(got, Ordering::Release);
         // The artifact IS every CLUSTER frame up to `got`, so the next frame
@@ -629,6 +726,17 @@ impl ClusterAgent {
                             .with_time(rf.header.time_ns)
                             .with_term(rf.header.leadership_term_id);
                         self.fsm.apply(&mut ctx, &rf.payload, &mut self.out);
+                        let accepted = self.out.first() == Some(&0);
+                        Self::note_applied(
+                            &self.fsm,
+                            rf.payload.first().copied().unwrap_or(0),
+                            rf.payload
+                                .get(CLUSTER_BODY_PREFIX_LEN)
+                                .copied()
+                                .unwrap_or(0),
+                            accepted,
+                            end,
+                        );
                         applied_any = true;
                         frames += 1;
                     }
@@ -771,6 +879,7 @@ impl ClusterAgent {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
     use uc_consensus::config::{Addr, ClusterConfig};
     use uc_log::archive::{Archive, ArchiveConfig};
     use uc_log::buffer::LogBuffer;
@@ -779,6 +888,9 @@ mod tests {
     use uc_protocol::v2::cnc::CNC_MAX_SERVICES;
     use uc_protocol::v2::frame::ClusterKind;
     use uc_protocol::v2::settings::{Settings, encode_settings};
+    use uc_protocol::v2::upgrade::{
+        SnapshotReport, UpgradePin, encode_snapshot_report, encode_upgrade_pin, verdict,
+    };
 
     use super::*;
 
@@ -834,6 +946,8 @@ mod tests {
             settings: Settings::genesis_default(),
             settings_position: 0,
             applied: 0,
+            pins: vec![],
+            reports: vec![],
         }
     }
 
@@ -866,6 +980,141 @@ mod tests {
             &mut p,
         );
         p
+    }
+
+    /// PAYLOAD only — `Appender::append_cluster(term, kind, payload)` writes
+    /// the prefix itself, exactly as `settings_cmd` is used.
+    fn pin_payload(row: u8, from: u32, to: u32, origin: u64) -> Vec<u8> {
+        let mut payload = Vec::new();
+        encode_upgrade_pin(
+            &UpgradePin {
+                row,
+                from,
+                to,
+                origin,
+            },
+            &mut payload,
+        );
+        payload
+    }
+    fn report_payload(row: u8, position: u64, hashes: &[(u32, u64)]) -> Vec<u8> {
+        let mut payload = Vec::new();
+        encode_snapshot_report(
+            &SnapshotReport {
+                row,
+                position,
+                hashes: hashes.to_vec(),
+            },
+            &mut payload,
+        )
+        .unwrap();
+        payload
+    }
+    /// The eleven-argument construction `applies_only_committed_cluster_frames_and_publishes_the_view`
+    /// uses, over an existing `(buffer, cnc, dir)` world — returns the view too.
+    fn agent_over(
+        buffer: &Arc<LogBuffer>,
+        cnc: &Arc<CncPage>,
+        dir: &Path,
+    ) -> (ClusterAgent, Arc<ClusterView>) {
+        let (fsm, start) =
+            recover(&dir.join("snapshots/cluster"), genesis_state(), vec![]).unwrap();
+        let view = Arc::new(ClusterView::new(fsm.state()));
+        let agent = ClusterAgent::new(
+            Arc::clone(buffer),
+            Arc::clone(cnc),
+            fsm,
+            Arc::clone(&view),
+            dir.join("snapshots/cluster"),
+            start,
+            Arc::new(AtomicU64::new(0)),
+            empty_journal(dir),
+            no_install_route(),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+        );
+        (agent, view)
+    }
+
+    /// Spec §2.5 / §3 S4 step 3: an applied pin lands in the row's cnc
+    /// words at commit, and a recovered agent republishes them at boot —
+    /// before any service attaches.
+    #[test]
+    fn an_applied_pin_is_written_to_the_rows_status_line_and_survives_recovery() {
+        let (buffer, cnc, dir) = world();
+        let mut app = buffer.appender_for_test(0);
+        app.set_now(1);
+        let end = app
+            .append_cluster(
+                1,
+                ClusterKind::UpgradePin,
+                &pin_payload(2, 0x0100_0000, 0x0101_0000, 4096),
+            )
+            .unwrap();
+        cnc.counters().durable.store_release(end);
+        cnc.counters().commit.store_release(end);
+        let (mut agent, _view) = agent_over(&buffer, &cnc, dir.path());
+        assert!(agent.do_work());
+        let s = &cnc.service_slot(2).status;
+        assert_eq!(
+            (s.upgrade_origin(), s.pinned_version()),
+            (4096, 0x0101_0000)
+        );
+        assert_eq!(cnc.service_slot(0).status.upgrade_origin(), 0);
+        assert_eq!(agent.applied(), end);
+
+        agent.take_snapshot().unwrap();
+        // A fresh page (a restarted node) and a recovered agent: the words
+        // are republished from the artifact at construction.
+        let (_, fresh_cnc, _) = world();
+        let (_agent2, _) = agent_over(&buffer, &fresh_cnc, dir.path());
+        assert_eq!(
+            fresh_cnc.service_slot(2).status.upgrade_origin(),
+            4096,
+            "recover republishes the pin words"
+        );
+    }
+
+    /// One accepted report through `do_work`; the verdict names node 2.
+    /// (The `snapshot_hash_diverged` event is emitted on the same branch;
+    /// the state is the contract asserted here.)
+    #[test]
+    fn a_report_with_a_minority_names_it() {
+        let (buffer, cnc, dir) = world();
+        let mut app = buffer.appender_for_test(0);
+        app.set_now(1);
+        let end = app
+            .append_cluster(
+                1,
+                ClusterKind::SnapshotReport,
+                &report_payload(0, 4096, &[(0, 1), (1, 1), (2, 2)]),
+            )
+            .unwrap();
+        cnc.counters().durable.store_release(end);
+        cnc.counters().commit.store_release(end);
+        let (mut agent, view) = agent_over(&buffer, &cnc, dir.path());
+        assert!(agent.do_work());
+        let st = view.to_state();
+        assert_eq!(verdict(st.report_for(0).unwrap()).minority, vec![2]);
+    }
+
+    #[test]
+    fn read_committed_upgrade_reads_the_artifact_or_says_none() {
+        let (buffer, cnc, dir) = world();
+        assert!(read_committed_upgrade(dir.path()).unwrap().is_none());
+        let mut app = buffer.appender_for_test(0);
+        app.set_now(1);
+        let end = app
+            .append_cluster(1, ClusterKind::UpgradePin, &pin_payload(1, 5, 6, 4096))
+            .unwrap();
+        cnc.counters().durable.store_release(end);
+        cnc.counters().commit.store_release(end);
+        let (mut agent, _view) = agent_over(&buffer, &cnc, dir.path());
+        assert!(agent.do_work());
+        let p = agent.take_snapshot().unwrap();
+        let (pos, pins, reports) = read_committed_upgrade(dir.path()).unwrap().unwrap();
+        assert_eq!((pos, pins.len(), reports.len()), (p, 1, 0));
+        assert_eq!(pins[0].origin, 4096);
     }
 
     #[test]

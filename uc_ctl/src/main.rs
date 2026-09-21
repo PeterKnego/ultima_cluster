@@ -79,6 +79,7 @@ use clap::{Parser, Subcommand};
 mod schedule;
 mod settings;
 mod snapshot;
+mod upgrade;
 
 use uc_crypto::admin::{AdminKey, AdminMessage, generate_key_file, sign};
 use uc_log::cnc::{AdminAuth, AdminReq, CncPage, unpack_service_status};
@@ -322,6 +323,52 @@ struct SettingsShowArgs {
     common: CommonArgs,
 }
 
+// ---------------------------------------------------------------- FSM upgrade lifecycle plan B1: upgrade
+
+#[derive(clap::Args)]
+struct UpgradeArgs {
+    #[command(subcommand)]
+    cmd: UpgradeCmd,
+}
+
+#[derive(Subcommand)]
+enum UpgradeCmd {
+    /// Stage, sign and submit an `UpgradePin` record
+    /// (`ADMIN_OP_UPGRADE_PIN`, wire op 10) — see `upgrade`'s module doc for
+    /// the S4 sequence.
+    Pin(UpgradePinArgs),
+    /// Print the newest committed pin history and hash verdicts, per row
+    /// (durable node state, not the staged file).
+    Show(UpgradeShowArgs),
+}
+
+#[derive(clap::Args)]
+struct UpgradePinArgs {
+    #[command(flatten)]
+    common: CommonArgs,
+    /// The declared row to pin.
+    #[arg(long)]
+    row: u8,
+    /// The version the row is pinned FROM (`MAJOR.MINOR.PATCH`). Omitted:
+    /// read off the row's attached version word on this node.
+    #[arg(long)]
+    from: Option<String>,
+    /// The version the row is pinned TO (`MAJOR.MINOR.PATCH`).
+    #[arg(long)]
+    to: String,
+    /// The coordinated instant's position whose complete set the row
+    /// installs at its next attach (`uc2ctl snapshot`'s position; must be
+    /// > 0).
+    #[arg(long)]
+    origin: u64,
+}
+
+#[derive(clap::Args)]
+struct UpgradeShowArgs {
+    #[command(flatten)]
+    common: CommonArgs,
+}
+
 // ---------------------------------------------------------------- plan 2: coordinated snapshot
 
 // `args_conflicts_with_subcommands` is the ONLY way to get clap to accept
@@ -497,6 +544,10 @@ enum Cmd {
     /// (`ADMIN_OP_SNAPSHOT`, wire op 8) — the default action — or run
     /// `fetch`/`show`.
     Snapshot(SnapshotArgs),
+    /// FSM upgrade lifecycle (spec §2.5): pin a row's next version at a
+    /// coordinated instant (`ADMIN_OP_UPGRADE_PIN`, wire op 10) or show the
+    /// committed pin history and hash verdicts.
+    Upgrade(UpgradeArgs),
 }
 
 fn main() {
@@ -530,6 +581,16 @@ fn main() {
                 snapshot::fetch(&args.common, args.from, args.position)
             }
             Some(SnapshotCmd::Show(args)) => snapshot::show(&args.common),
+        },
+        Cmd::Upgrade(a) => match a.cmd {
+            UpgradeCmd::Pin(args) => upgrade::pin(
+                &args.common,
+                args.row,
+                args.from.as_deref(),
+                &args.to,
+                args.origin,
+            ),
+            UpgradeCmd::Show(args) => upgrade::show(&args.common),
         },
     };
     if let Err(e) = r {
@@ -624,6 +685,26 @@ fn reason_str(reason: u32) -> &'static str {
         }
         50 => {
             "snapshot_above_durable (the fetch position named is above this node's durable frontier — an operator typo, or a learner transiently ahead of this voter; legitimate again once this node's log catches up)"
+        }
+        // FSM upgrade lifecycle (spec §2.5, plan B1): `ADMIN_OP_UPGRADE_PIN`
+        // (wire op 10) — `uc_node::REASON_PIN_*`.
+        52 => "pin_row_undeclared (this node does not declare that row in [services] names)",
+        53 => {
+            "pin_from_mismatch (--from is not the row's current version: its newest pin's `to`, or, with no pin yet, the version the service is attached at)"
+        }
+        54 => {
+            "pin_no_set (no complete snapshot set at --origin on this node — run `uc2ctl snapshot`, wait for uc2_snapshot_set_position to reach it, and pin THAT position)"
+        }
+        55 => "pin_not_monotone (--origin is not above the row's current pin)",
+        56 => {
+            "pin_digest (the staged file changed between staging and applying — re-run `upgrade pin`)"
+        }
+        57 => {
+            "pin_missing (no staged file on this node — was `upgrade pin` run against this same instance dir, or already consumed?)"
+        }
+        58 => "pin_decode (the staged file is not a 20-byte pin record)",
+        59 => {
+            "report_stale (a SnapshotReport below the row's held report position — never from uc2ctl)"
         }
         _ => "unknown/malformed",
     }
@@ -941,16 +1022,21 @@ fn run_status(a: &StatusArgs) -> anyhow::Result<()> {
             .name()
             .map(|n| n.as_str().to_string())
             .unwrap_or_default();
+        // The pair together: a re-pin can otherwise be read half-old
+        // (`ServiceStatusLine::pin`).
+        let pin = s.status.pin().unwrap_or((0, 0));
         println!(
             "  row={id} name={name} version={} hash=0x{:016x} attached={attached} epoch={} \
              incarnation={incarnation} applied={applied} lag={} snapshot_pos={} \
-             heartbeat_age={age} timers_pending={}",
+             heartbeat_age={age} timers_pending={} upgrade_origin={} pinned={}",
             VersionDisplay(s.status.version()),
             s.identity.hash(),
             s.epoch.load_acquire(),
             commit.saturating_sub(applied),
             s.snapshot_pos.load_acquire(),
             s.identity.timers_pending(),
+            pin.0,
+            VersionDisplay(pin.1),
         );
     }
     println!("members:");

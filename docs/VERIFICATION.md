@@ -306,6 +306,22 @@ actually related, so a scenario can prove it was not vacuous
 (`inv12_the_cluster_fsms_membership_is_a_committed_prefix_of_the_kernels`
 asserts a non-zero count).
 
+The schedule table, the settings record and, since `2.13.0`, the upgrade
+pin and snapshot report are cluster-FSM data the sim cannot reach for the
+same reason (it has no cluster-FSM frames at all), so their correctness is
+unit-tested in-crate instead: `cluster_fsm.rs`'s
+`pin_refusals_are_replicated_state_only`,
+`pin_history_is_bounded_per_row`,
+`a_report_is_held_newest_per_row_and_a_stale_one_is_refused`,
+`pins_and_reports_ride_the_image_and_an_old_image_installs_empty` and
+`the_view_publishes_pins_and_reports` cover the replicated half (validation,
+the bounded history, the image round-trip and the view republish); `node.rs`'s
+`upgrade_pin_door_refusals_by_name`,
+`an_upgrade_pin_is_appended_as_a_cluster_frame_and_the_words_follow_at_commit`,
+`upgrade_pin_is_single_in_flight_on_the_view_position` and
+`retention_keeps_every_pinned_origin` cover the door half and the
+retention exemption.
+
 **The red twin, and an honest note about what it pins.**
 `counterfactual_kernel_on_the_committed_view_is_caught_by_inv6_the_durable_time_oracle`
 (behind `mutation-testing`) feeds the kernel from the **committed** view — the
@@ -743,7 +759,7 @@ takes the process down. Availability is the thing being defended here.
 | `uc_protocol_timer_frame` | `2.11.0` — the TIMER body the apply loop decodes from a committed frame; guarded by length, total on any slice. |
 | `uc_protocol_sched_record` | `2.11.0` — the 17-byte service→node schedule record the consensus agent decodes from a shared-memory ring any local process can write. |
 | `uc_protocol_schedule_table` | `2.11.0` — the replicated schedule table: the `SCHEDULE_TABLE` frame body every node decodes off the log, and the bytes an operator stages in `schedules.pending` for the leader to read back. Also a **property** target: the recurrence arithmetic (`next_after`, `latest_at_or_before`, `arm`) runs on the consensus agent, so it must be total for any rule and any clock. |
-| `uc_protocol_cluster_frame` | cluster-FSM plan 1 — `uc_protocol::v2::frame::read_cluster_prefix` and the kind-dispatched payload decoders (`config::decode_config`, `schedule::decode_schedule_table`, `settings::decode_settings`): the `CLUSTER` body (spec §4.3) every node decodes off the log. |
+| `uc_protocol_cluster_frame` | cluster-FSM plan 1 — `uc_protocol::v2::frame::read_cluster_prefix` and the kind-dispatched payload decoders (`config::decode_config`, `schedule::decode_schedule_table`, `settings::decode_settings`, `upgrade::decode_upgrade_pin`, `upgrade::decode_snapshot_report`): the `CLUSTER` body (spec §4.3) every node decodes off the log. |
 | `uc_protocol_settings` | cluster-FSM plan 1 — `uc_protocol::v2::settings`, the replicated settings record's codec (spec §6): total on any slice, and a decoded value must round-trip through re-encoding. |
 | `uc_protocol_cluster_image` | cluster-FSM plan 3 (spec §4.8) — `uc_protocol::v2::cluster_image`, the cluster IMAGE codec moved out of `uc_node::cluster_fsm` so it can be fuzzed without `uc_node`: total, CRC-checked, exact framing; a decoded image round-trips through re-encoding. `uc_node_cluster_artifact` below still exercises the same decoder through the real `ClusterFsm::install_snapshot` entry point. |
 | `uc_protocol_cnc` | `uc_protocol::v2::cnc` — the 8 KiB control page (page-2 service-slot band and the 4032 pair since M14a) every attaching process maps and parses. A file on disk any local process with write access can corrupt. |

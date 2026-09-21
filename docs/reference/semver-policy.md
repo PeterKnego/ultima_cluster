@@ -213,10 +213,10 @@ Two version numbers are deliberately *outside* this policy, because semver's
 "a minor bump is safe" contract is the wrong promise for them:
 
 - **The node-to-node wire protocol** (`uc_protocol::version::CURRENT`,
-  currently `0.7.0`, `0.8.0` pending (`2.12.0`, jumbo-frame MTU discovery) —
-  see [wire protocol](wire-protocol.md)).
-- **The `cnc.dat` page layout** (`CNC_V2_VERSION`, currently cnc 3.1, `3.2`
-  pending (`2.12.0`) — see [the cnc control page](cnc-page.md)).
+  currently `0.9.0` (`2.13.0`, the FSM upgrade lifecycle's two new `CLUSTER`
+  kinds) — see [wire protocol](wire-protocol.md)).
+- **The `cnc.dat` page layout** (`CNC_V2_VERSION`, currently cnc `3.3`
+  (`2.13.0`) — see [the cnc control page](cnc-page.md)).
 
 A change to either is a **flag day**: every node in a cluster is stopped and
 restarted on the new version together. Mixed-version operation is not
@@ -227,9 +227,9 @@ cluster stalls commits rather than making unsound ones. The procedure is
 [Upgrade a cluster](../how-to/upgrade-a-cluster.md); it applies whether or
 not the crate version's major digit moved.
 
-**`2.11.0` shipped the most recent RELEASED flag day on both lines** (the
-next one, `2.12.0`, is below), and it carried **two** wire-and-page features at
-once: wire `0.6.0` → `0.7.0` and cnc `3.0` → `3.1`,
+**`2.12.0` shipped the most recent RELEASED flag day on both lines** (`2.13.0`,
+below, is not yet released). `2.11.0`, the one before it, carried **two**
+wire-and-page features at once: wire `0.6.0` → `0.7.0` and cnc `3.0` → `3.1`,
 bundled as one combined flag day per the standing rule that a cnc layout
 change is a flag day regardless of the digit.
 
@@ -263,6 +263,22 @@ this flag day alone. `node.toml`'s `max_payload` key is **refused by name**
 as of this flag day, pointing at discovery. As with every prior bump, mixed
 versions are unsupported: stop every node before starting any node on the
 new build.
+
+### The `2.13.0` flag day
+
+The FSM upgrade lifecycle is a further, separate flag day: wire `0.8.0` →
+`0.9.0` and cnc `3.2` → `3.3`. Two new `CLUSTER` kinds, `4` `UpgradePin` and
+`5` `SnapshotReport` ([wire protocol](wire-protocol.md#cluster-body-wire-070)) —
+no existing wire layout change, so a `0.8.0` peer's frames of these kinds
+still *parse* (the `CLUSTER` prefix is unchanged) but decode as an unknown
+kind and are dropped, and that node's cluster FSM silently diverges from one
+that applied them: stop every node before starting any node, exactly as for
+a layout change. Two new node-written cnc words on the service status line,
+`upgrade_origin` (`+16`) and `pinned_version` (`+24`)
+([cnc page](cnc-page.md#counters-and-status)). `ClusterFsm::VERSION` itself
+stays `1` — it is the cluster image's own on-disk version (`2`, since this
+flag day) that gates artifact compatibility, not the FSM identity version a
+user's own state machine declares.
 
 ## The one-way door: one tier per type
 

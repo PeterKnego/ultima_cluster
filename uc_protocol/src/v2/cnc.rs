@@ -61,7 +61,9 @@ pub const CNC_PAGE_LEN: usize = 8192;
 /// 3.2 (jumbo): the live payload ceiling word at 3984. A 3.1 attacher
 /// refuses by version, and a 3.2 attacher on a 3.1 page reads 0 there and
 /// treats it as the header bound.
-pub const CNC_V2_VERSION: u32 = (3 << 24) | (2 << 16);
+///
+/// 3.3 (plan B1): `upgrade_origin`/`pinned_version` at slot +16/+24.
+pub const CNC_V2_VERSION: u32 = (3 << 24) | (3 << 16);
 
 // ---- header (byte offsets) ------------------------------------------------
 pub const CNC_OFF_MAGIC: usize = 0; // [u8; 8]
@@ -158,6 +160,11 @@ pub const ADMIN_OP_SNAPSHOT: u32 = 8;
 /// set into a voter, store-only. Runs on the voter it targets (leader-local,
 /// not a cluster command — it changes nothing cluster-wide).
 pub const ADMIN_OP_SNAPSHOT_FETCH: u32 = 9;
+/// FSM upgrade lifecycle (spec §2.5, plan B1): `uc2ctl upgrade pin`. The
+/// 20-byte record is staged at `<instance_dir>/upgrade.pending` and the
+/// first ten bytes of its SHA-256 ride `id ‖ ip ‖ port`, exactly as ops 6
+/// and 7 do. Leader-only, node-local, single-in-flight.
+pub const ADMIN_OP_UPGRADE_PIN: u32 = 10;
 /// M7 — admin RESPONSE line (writer: consensus agent). seq u64 @+0 echoes the
 /// request seq (written LAST, release); status u32 @+8, reason u32 @+12,
 /// version u64 @+16.
@@ -314,6 +321,9 @@ const _: () = assert!(
 //   +0   status          u64 = service_id (bits 0..8) | attached (bit 8)
 //                              | incarnation (bits 32..64)    writer: service (attach/detach)
 //   +8   version         u64 (low 32 = packed FSM version)   writer: service (attach)
+//   +16  upgrade_origin  u64 position (0 = no pin)             writer: node (cluster agent)
+//   +24  pinned_version  u64 (low 32 = packed version)         writer: node (cluster agent)
+//   +32  pin_seq         u64 seqlock (odd = pin store in flight) writer: node (cluster agent)
 //   +64  applied         u64 position                          writer: service apply agent
 //   +128 epoch           u64 (attach-time fetch_add, AcqRel)   writer: service (attach)
 //   +192 output_completed u64 position                         writer: service output agent
@@ -350,6 +360,35 @@ pub const CNC_SVC_STATUS_INCARNATION_SHIFT: u32 = 32;
 /// cnc 3.1: the attached service's packed version (`identity::pack_version`),
 /// low 32 bits of the status line's second word. `0` = unversioned/absent.
 pub const CNC_SVC_OFF_VERSION: usize = 8;
+/// FSM upgrade lifecycle (spec §2.5, §3 S4; cnc 3.3): the row's newest
+/// `UpgradePin`, republished from cluster-FSM state by the `uc2-cluster`
+/// agent on every view publish — node-written, a second writer on the
+/// status line (the service writes `status`/`version` at attach; each word
+/// still has exactly one writer). `0` = no pin. A service reads them at
+/// attach (plan B2): a non-zero origin whose version equals its own
+/// `VERSION` means "install `snap-<origin>` unconditionally"; a version
+/// that differs is an attach refusal.
+///
+/// The pair is published under the [`CNC_SVC_OFF_PIN_SEQ`] seqlock, NOT by
+/// store order alone: two independent words cannot be read consistently by
+/// re-reading one of them, so a reader that loads each word once (or twice)
+/// can observe the OLD origin beside the NEW version on a re-pin. Every
+/// reader (`/metrics`, `uc2ctl status`, and plan B2's attach) must use
+/// `uc_log::cnc::ServiceStatusLine::pin`, which brackets both loads with the
+/// seq word and returns either a pair that was stored together or `None`.
+pub const CNC_SVC_OFF_UPGRADE_ORIGIN: usize = 16;
+/// Low 32 bits = the packed version the pin names (`identity::pack_version`).
+/// Published under the [`CNC_SVC_OFF_PIN_SEQ`] seqlock together with
+/// `upgrade_origin`; see that constant's doc.
+pub const CNC_SVC_OFF_PINNED_VERSION: usize = 24;
+/// FSM upgrade lifecycle (cnc 3.3): the seqlock commit word guarding the
+/// `upgrade_origin`/`pinned_version` pair, the third word the `uc2-cluster`
+/// agent owns on the status line. The writer bumps it to ODD, stores the
+/// version then the origin, and bumps it back to EVEN; a reader that sees
+/// the same EVEN value on both sides of its two loads read a pair no
+/// `store_pin` was interleaved with. Odd (or a moved value) means retry.
+/// `0` at init, so an unpinned row reads as "no store in flight, no pin".
+pub const CNC_SVC_OFF_PIN_SEQ: usize = 32;
 /// cnc 3.1: line 7 — the row's FSM name, NUL-padded to 32 B, then its hash,
 /// then (time-and-timers) its pending-timer count, then (coordinated-
 /// snapshot spec §9) its last freeze duration.
@@ -561,8 +600,8 @@ mod tests {
         write_cnc_header(&mut page, &h, "kv");
         // magic
         assert_eq!(&page[0..8], b"UC2CNC\0\0");
-        // version = (3<<24)|(2<<16) = 0x0302_0000 -> LE [0,0,2,3]
-        assert_eq!(&page[8..12], &[0x00, 0x00, 0x02, 0x03]);
+        // version = (3<<24)|(3<<16) = 0x0303_0000 -> LE [0,0,3,3]
+        assert_eq!(&page[8..12], &[0x00, 0x00, 0x03, 0x03]);
         // node_id = 7 -> LE [7,0,0,0]
         assert_eq!(&page[12..16], &[7, 0, 0, 0]);
     }
@@ -812,7 +851,14 @@ mod tests {
         // FSM identity (cnc 3.1): version word in the status line, name +
         // hash on the once-reserved line 7. Both inside the 512 B slot.
         // cnc 3.2: the live payload ceiling word (jumbo).
-        assert_eq!(CNC_V2_VERSION, (3 << 24) | (2 << 16));
+        // cnc 3.3 (plan B1): the row's pin words on the STATUS line, node-written.
+        assert_eq!(CNC_V2_VERSION, (3 << 24) | (3 << 16));
+        assert_eq!(CNC_SVC_OFF_UPGRADE_ORIGIN, 16);
+        assert_eq!(CNC_SVC_OFF_PINNED_VERSION, 24);
+        assert_eq!(CNC_SVC_OFF_PIN_SEQ, 32);
+        assert_eq!(CNC_SVC_OFF_UPGRADE_ORIGIN, CNC_SVC_OFF_VERSION + 8);
+        assert_eq!(CNC_SVC_OFF_PIN_SEQ, CNC_SVC_OFF_PINNED_VERSION + 8);
+        const { assert!(CNC_SVC_OFF_PIN_SEQ + 8 <= 64, "inside the status line") };
         assert_eq!(CNC_SVC_OFF_VERSION, 8);
         assert_eq!(CNC_SVC_OFF_NAME, 448);
         assert_eq!(CNC_SVC_NAME_LEN, 32);
@@ -839,5 +885,7 @@ mod tests {
         assert_eq!(CNC_SVC_STATUS_SNAPSHOT_CAPABLE, 1 << 9);
         assert_eq!(ADMIN_OP_SNAPSHOT, 8);
         assert_eq!(ADMIN_OP_SNAPSHOT_FETCH, 9);
+        // FSM upgrade lifecycle (plan B1): `uc2ctl upgrade pin`.
+        assert_eq!(ADMIN_OP_UPGRADE_PIN, 10);
     }
 }

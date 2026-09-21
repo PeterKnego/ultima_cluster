@@ -142,6 +142,10 @@ impl AuditOrigin {
 /// set's, on a refusal); for `snapshot_fetch`, `id` is the learner's id,
 /// `ip`/`port` pack the position, and `config_version` is that position.
 ///
+/// For `upgrade_pin` (plan B1) the `id`/`ip`/`port` carry the staged file's
+/// digest, exactly as for ops 6 and 7, and `config_version` is the appended
+/// frame's END position (or the committed cluster position on a refusal).
+///
 /// For the DISCOVERY `settings_apply` (`source = "discovery"`, jumbo spec §9)
 /// there is no signed staged file and no operator: `id` carries the datagram
 /// rung the leader committed, `addr` is null, `seq`/`nonce` are 0, and
@@ -157,6 +161,7 @@ pub fn op_name(op: u32) -> &'static str {
         7 => "settings_apply",
         8 => "snapshot",
         9 => "snapshot_fetch",
+        10 => "upgrade_pin",
         _ => "unknown",
     }
 }
@@ -515,7 +520,8 @@ mod tests {
         assert_eq!(op_name(7), "settings_apply");
         assert_eq!(op_name(8), "snapshot");
         assert_eq!(op_name(9), "snapshot_fetch");
-        assert_eq!(op_name(10), "unknown");
+        assert_eq!(op_name(10), "upgrade_pin");
+        assert_eq!(op_name(11), "unknown");
         assert_eq!(op_name(2), "promote");
         assert_eq!(op_name(4), "remove_learner");
         assert_eq!(op_name(5), "remove_voter");

@@ -678,6 +678,70 @@ before, which is the intended outcome rather than a failure. A **one-node**
 cluster also stays at the baseline: an empty member set is no evidence, so
 discovery begins when the first peer joins.
 
+## Wire + cnc change in 2.13.0: upgrade pins and snapshot reports (`0.9.0`, cnc `3.3`)
+
+The FSM upgrade lifecycle's platform half. Two new cluster records —
+`UpgradePin` ("at position `origin`, row `r` went from version `from` to
+version `to`") and `SnapshotReport` (the per-node artifact hashes for one
+`(row, position)` pair, with a deterministic verdict) — plus the operator
+path for pins (`uc2ctl upgrade pin` / `upgrade show`, admin op 10) and the
+cnc words a service reads at attach. See [The cluster
+FSM](../notes/uc2-cluster-fsm-explained.md) § Pins and reports.
+
+**Wire 0.8.0 → 0.9.0: two new `CLUSTER` kinds, and this one is NOT
+benign.** `FRAME_TYPE_CLUSTER = 4` gains `kind 4 = UpgradePin` (20 B) and
+`kind 5 = SnapshotReport` (16–112 B). Unlike `2.12.0`'s `PROBE`/`PROBE_ACK`
+— pairwise datagrams a `0.7.0` peer could simply drop — these are **frames
+on the replicated log**, and a `0.8.0` node applies an unknown kind as
+"undecodable": it pushes a refusal byte, advances `applied`, and moves on.
+It does not stall and it does not refuse. So a `0.8.0` node in a `0.9.0`
+cluster keeps committing while its cluster FSM **silently diverges** from
+every upgraded peer's — it holds no pins and no reports, its cluster
+artifact differs, and a joiner it serves inherits that hole. There is no
+counter that catches this. **Stop every node before starting any node**, as
+with every other flag day; here the consequence of not doing so is silent
+rather than loud.
+
+**cnc 3.2 → 3.3: three new words on the service status line.**
+`upgrade_origin` at slot offset 16, `pinned_version` at slot offset 24
+(`u64` each, low 32 bits of the latter = the packed version) and the seqlock
+commit word `pin_seq` at slot offset 32, **node**-written
+by the `uc2-cluster` agent and republished on every view publish; `0` = no
+pin. The pair is published under `pin_seq` (bumped odd, then even, around
+the two stores), so a reader gets a pair that was stored together or no pin
+at all — never the old origin beside the new version. This makes line 0 the
+second line with two writers — the service still
+owns `status`/`version` at attach, the node owns the pin words. A 3.2
+attacher refuses by version, exactly as the 3.1 → 3.2 bump described, so
+each host's clients, services and gateway restart with its node.
+
+**Cluster image 1 → 2, and no `snapshots/cluster/` wipe is required by this
+change.** The artifact under `snapshots/cluster/` grows two
+length-prefixed blobs (the pin list and the report list) after the settings
+record. A **version 1** image — the `2.11.0`/`2.12.0` shape — is still
+accepted on read and maps to an empty pin list and an empty report list, the
+same `Settings` v1/v2 precedent `2.12.0` set. A restarting node reads its own
+pre-upgrade artifact, and a first `uc2ctl upgrade pin` rewrites it at v2.
+
+**Whether the per-row snapshot artifacts need a wipe is OPEN.** Plan B2
+introduces an `ULTSNAP2` envelope on the row artifacts under
+`snapshots/<row>/` (the current envelope is the 16-byte `ULTSNAP1 ‖ P` from
+`2.11.0`). Whether a `ULTSNAP1` artifact is read as compatible or refused by
+name — and therefore whether this flag day requires clearing `snapshots/`
+on every host — is **not settled at the time of writing** and will be
+decided, and this section amended, before the `2.13.0` tag. Plan for the
+possibility: if a wipe turns out to be required, every node loses its purge
+floor and reconstructs from the journal, which is the same cost the
+"`NoCommonPrefix` = wipe-and-rejoin" path already documents.
+
+**After the flag day**, nothing is required of the operator. A cluster that
+never runs `uc2ctl upgrade pin` holds an empty pin list and behaves exactly
+as `2.12.0` did; the three cnc words stay `0`, `uc2ctl status` prints
+`upgrade_origin=0 pinned=unversioned`, and the new gauges read zero. The pins only
+start to matter when you upgrade an FSM's `VERSION` — see [The cluster
+FSM](../notes/uc2-cluster-fsm-explained.md) § Pins and reports for what a
+pin then does at the service's next attach.
+
 ## Where to go next
 
 - [Configuration: Admin authentication](../reference/configuration.md#admin-authentication)

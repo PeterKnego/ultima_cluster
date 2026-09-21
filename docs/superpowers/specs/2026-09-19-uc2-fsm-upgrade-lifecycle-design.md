@@ -342,6 +342,60 @@ codec is replaced.
 
 ### 2.5 The version is an input, and it is not in the log
 
+#### Errata (plan B1, as built)
+
+1. **Refusal numbers 52–59, not 51–54.** `51` was already taken by
+   `schedule_too_large`. Beyond the four this section drafted, plan B1 added
+   three staged-file codes — `56` `pin_digest`, `57` `pin_missing`, `58`
+   `pin_decode` — and one for `SnapshotReport` itself, `59` `report_stale`.
+2. **The pin rides a staged file (`upgrade.pending`), not the admin line.**
+   `uc2ctl upgrade pin` writes the 20-byte `UpgradePin` record to
+   `<instance_dir>/upgrade.pending` (mode `0600`, fsync, rename) — exactly
+   `settings apply`'s pipeline — and the admin request itself carries only a
+   10-byte digest of it, not the record.
+3. **The cnc words land on the status line, not "the row's cnc slot line
+   7", and there are THREE of them.** `upgrade_origin` (`+16`),
+   `pinned_version` (`+24`) and the seqlock commit word `pin_seq` (`+32`)
+   are three new words on the row's **service status line** (cnc 3.3): line
+   7 is already seven of its eight words deep (`name`, four words from
+   `+448`, `identity_hash` at `+480`, `timers_pending` at `+488`,
+   `freeze_ns` at `+496`), so it has exactly one free word left, at `+504` —
+   well short of what a pin needs. (`log_time_ns` is not on line 7 at all;
+   it is the unrelated page-1 global word at offset 4048.) The third word
+   exists because store order alone is not sufficient and neither is
+   re-reading the origin: a writer that has stored the new version but not
+   yet the new origin leaves the origin stable, so a double read returns
+   `(origin_old, version_new)` — a pair that was never stored. `store_pin`
+   therefore bumps `pin_seq` ODD, stores version then origin, and bumps it
+   EVEN; `ServiceStatusLine::pin()` brackets its two loads with the seq word
+   and returns a pair that was stored together, or `None`. Every reader
+   (`/metrics`, `uc2ctl status`, plan B2's attach) goes through it.
+4. **`pin_no_set` accepts only this node's NEWEST complete set
+   (`uc2_snapshot_set_position`), not any retained set.** Retention is
+   delete-only, so an older set can vanish between the door check and the
+   command's commit; the newest cannot, because retention now keeps a
+   row's pinned origin exempt from pruning.
+5. **`uc2ctl upgrade pin` takes an optional `--from`.** Absent, it reads the
+   row's attached version word off the local cnc page and refuses locally,
+   before staging anything, if that word is `0`.
+6. **`SnapshotReport` has one refusal of its own, `59` `report_stale`**, so
+   "accepted" always means "state changed."
+7. **`ClusterFsm::VERSION` stays `1`.** It is the cluster image's own
+   on-disk layout version (`CLUSTER_IMAGE_VERSION = 2`, since this flag
+   day) that gates artifact compatibility, not the FSM identity version a
+   user's state machine declares.
+8. **The retention keep-set protects a pinned origin only from COMMIT, not
+   from the door check.** Erratum 4 above says the newest complete set
+   "cannot vanish" between the `pin_no_set` check and the command's commit.
+   That is too strong as built: the keep-set is computed from the
+   *committed* cluster view, so it does not cover the append-to-commit
+   window. Inside it a newer instant can complete, the floor can advance
+   past `origin`, and a retention pass can prune the set the pin is about
+   to name. The window is narrow (one round trip) and the failure is
+   bounded and named — a B2 attach finds no set at the pinned origin and
+   refuses — so no fix is proposed here; it is recorded so that "a pinned
+   origin is never pruned" is not read as an invariant.
+
 The state at position Q is not a function of the log prefix `[0,Q]`. It is a
 function of
 

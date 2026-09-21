@@ -1452,6 +1452,11 @@ pub fn uc_protocol_cluster_image() -> Vec<Seed> {
         membership: &membership,
         table: &table,
         settings: &settings,
+        // A genesis image carries neither history (plan B1): the seed's job
+        // is the OUTER framing, and the empty blobs are the v2 layout's own
+        // starting shape.
+        pins: &[],
+        reports: &[],
     };
     let mut image = Vec::new();
     encode_cluster_image(&parts, &mut image).expect("genesis parts are well under u32::MAX");
