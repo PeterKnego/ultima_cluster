@@ -25,13 +25,15 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use uc_log::cnc::CncPage;
+use uc_log::cnc::{AdminReq, CncPage};
 use uc_net::fault::FaultConfig;
 use uc_node::{Node, NodeConfig, PurgePolicy};
 use uc_protocol::ring::{MpscProducer, MpscRing, RingError};
+use uc_protocol::v2::cnc::ADMIN_OP_UPGRADE_PIN;
 use uc_protocol::v2::cnc::CNC_SVC_STATUS_ATTACHED;
 use uc_protocol::v2::frame::{self, FRAME_TYPE_MESSAGE, HEADER_LEN, align_frame_len};
 use uc_protocol::v2::ipc::{MSG_V2_SUBMIT, extra_client};
+use uc_protocol::v2::upgrade::{UpgradePin, encode_upgrade_pin};
 use uc_service::snapshots::{EnvelopeError, SnapshotStore, verify_snapshot_envelope};
 use uc_service::{
     ApplyCtx, RawStateMachine, Service, ServiceBuilder, ServiceConfig, ServiceError,
@@ -286,6 +288,16 @@ impl Fixture {
     }
 
     fn build(app: &'static str, spec: Spec) -> Fixture {
+        let (f, svc1) = Fixture::build_with_v1(app, spec);
+        svc1.stop();
+        f
+    }
+
+    /// [`Fixture::build`] with the v1 service still ATTACHED and handed back.
+    /// One test needs the v1 era to continue past the pin — that is the
+    /// window spec §3 S4 describes, and it is the window in which a cadence
+    /// instant can land.
+    fn build_with_v1(app: &'static str, spec: Spec) -> (Fixture, Service<RegisterSm>) {
         let dir = tempdir();
         let node = start_node(dir.path(), app, spec.purge, spec.segment_bytes);
         wait_until("node can serve", || node.can_serve());
@@ -364,9 +376,7 @@ impl Fixture {
                  follower overruns: append={append}, P={p}, capacity={BUFFER_BYTES}"
             );
         }
-        svc1.stop();
-
-        Fixture { dir, app, node, p }
+        (Fixture { dir, app, node, p }, svc1)
     }
 
     fn path(&self) -> &Path {
@@ -395,6 +405,84 @@ impl Fixture {
 
     fn stop(self) {
         self.node.stop();
+    }
+}
+
+/// `uc2ctl upgrade pin`, in process: stage the 20-byte `UpgradePin` record at
+/// `<instance_dir>/upgrade.pending` and submit admin op 10 through the cnc
+/// admin band (these test nodes run the filesystem admin policy, so there is
+/// no auth line). The twin of `uc_diffreplay/tests/common::pin_row`.
+///
+/// [`Fixture::pin`] pokes the slot words instead, which is enough for a
+/// SERVICE-side test; this exists for the one test whose subject is the
+/// NODE's behaviour under a pin — the floor hold reads the COMMITTED view,
+/// not the cnc words.
+///
+/// Only two answers are races and only those two are retried: status 2
+/// (single-in-flight) and reason 54 `pin_no_set` (the set's position is
+/// published a moment after the artifact lands). Anything else fails here,
+/// named.
+fn pin_via_admin(dir: &Path, cnc: &CncPage, row: u8, from: u32, to: u32, origin: u64) {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let mut bytes = Vec::new();
+    encode_upgrade_pin(
+        &UpgradePin {
+            row,
+            from,
+            to,
+            origin,
+        },
+        &mut bytes,
+    );
+    let (id, ip, port) = uc_node::staged_digest(&bytes);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let pending = dir.join(uc_node::UPGRADE_PENDING_FILE);
+        let tmp = dir.join(format!("{}.tmp", uc_node::UPGRADE_PENDING_FILE));
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp)
+                .unwrap();
+            f.write_all(&bytes).unwrap();
+            f.sync_all().unwrap();
+        }
+        std::fs::rename(&tmp, &pending).unwrap();
+
+        let seq = cnc.read_admin_req(0).map(|r| r.seq).unwrap_or(0) + 1;
+        cnc.write_admin_req(&AdminReq {
+            seq,
+            nonce: seq,
+            op: ADMIN_OP_UPGRADE_PIN,
+            id,
+            ip,
+            port,
+        });
+        let resp_deadline = Instant::now() + Duration::from_secs(15);
+        let resp = loop {
+            if let Some(r) = cnc.read_admin_resp(seq) {
+                break r;
+            }
+            assert!(
+                Instant::now() < resp_deadline,
+                "admin response timed out for seq {seq}"
+            );
+            std::thread::yield_now();
+        };
+        let racy = resp.status == 2 || resp.reason == uc_node::REASON_PIN_NO_SET;
+        if resp.status == 0 || !racy || Instant::now() >= deadline {
+            assert_eq!(
+                resp.status, 0,
+                "upgrade pin refused: status={} reason={}",
+                resp.status, resp.reason
+            );
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
     }
 }
 
@@ -759,6 +847,79 @@ fn a_pinned_attach_prefers_the_origin_over_a_later_artifact() {
         store.path_for(p2).is_file(),
         "the later artifact is left alone, not consumed or deleted"
     );
+    svc2.stop();
+    f.stop();
+}
+
+/// Plan B2 T5 (fix round), the REAL shape the test above constructs by hand:
+/// purge on, a real `uc2ctl upgrade pin`, and then a real cadence instant at
+/// **P2 > origin** taken while v1 is STILL ATTACHED — the window spec §3 S4
+/// describes, in which `from` keeps applying between the pin and the swap.
+///
+/// Two things have to hold and neither did before this round:
+///
+/// * the NODE must not let its snapshot floor — and the journal purge behind
+///   it — pass a pinned origin it has not consumed
+///   (`Consensus::hold_floor_for_pins`). Without that, `archive_first_base`
+///   climbs past the origin and the pinned attach's tail replay has no
+///   covering artifact it may install;
+/// * the SERVICE's gap guard must then prefer the pinned origin over
+///   `snap-P2`, which v1 built (plan B2 T5's `replay.rs` change).
+///
+/// The pin goes in through admin op 10 rather than [`Fixture::pin`] because
+/// the node's hold reads the COMMITTED view.
+#[test]
+fn a_pinned_attach_survives_a_cadence_instant_after_the_pin() {
+    let (f, svc1) = Fixture::build_with_v1("pin-cadence", Spec::purging());
+    let origin = f.p;
+    let cnc = f.cnc();
+    assert!(
+        f.node.archive_first_base() > 0,
+        "precondition: the journal is purged below the origin"
+    );
+
+    pin_via_admin(f.path(), &cnc, 0, V1, V2, origin);
+    wait_until("the pin reached the row's slot words", || {
+        cnc.service_slot(0).status.pin()
+            == uc_log::cnc::PinRead::Pinned {
+                origin,
+                from: V1,
+                to: V2,
+            }
+    });
+
+    // The cadence instant, with v1 still attached: `snap-P2` is built by
+    // `from`, and the set at P2 completes.
+    let p2 = command_instant(&f.node);
+    assert!(p2 > origin, "P2={p2} must sit above the origin={origin}");
+    wait_until("row 0 published snap-P2", || {
+        artifact_path(f.path(), p2).is_file()
+    });
+    wait_until("the set at P2 is this node's newest", || {
+        f.node.snapshot_set_position() == p2
+    });
+    // Give the floor tick every chance to move (it is throttled to 100 ms and
+    // the purge behind it is asynchronous): if the hold is missing, this is
+    // where `archive_first_base` climbs past the origin.
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        f.node.archive_first_base() <= origin,
+        "the floor hold must keep the journal the pinned attach replays from: \
+         archive_first_base={} origin={origin} P2={p2}",
+        f.node.archive_first_base()
+    );
+
+    svc1.stop();
+    let svc2 = ServiceBuilder::new(cfg(f.path(), f.app), DoublingRegisterSm::default())
+        .start_with_snapshots()
+        .unwrap();
+    wait_service_caught_up(&cnc);
+    assert_eq!(
+        query_v2(&svc2),
+        Some(CAS_NEW),
+        "a pinned attach converges even though `from` took an instant after the pin"
+    );
+    assert_eq!(svc2.pinned(), Some((origin, V1, V2)));
     svc2.stop();
     f.stop();
 }
