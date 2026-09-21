@@ -27,7 +27,9 @@ export = ["dep:uc_node"]
 # page: everything an app that only embeds the replay driver must NOT link
 # (`examples/kv` takes `default-features = false`). It exports a corpus from
 # the instance dir it just drove, so it implies `export`.
-pin-verify = ["export", "dep:uc_node", "dep:uc_net", "dep:uc_log", "dep:uc_client", "dep:libc"]
+# (`dep:uc_node` is NOT repeated here: `export` already turns it on, and one
+# owner per optional dependency is what keeps the two lists readable.)
+pin-verify = ["export", "dep:uc_net", "dep:uc_log", "dep:uc_client", "dep:libc"]
 
 [dependencies]
 uc_service = { path = "../uc_service", version = "2.12.0" }

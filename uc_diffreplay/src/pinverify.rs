@@ -48,6 +48,22 @@ use crate::trace::Trace;
 /// binary's stderr. Pinned by `the_refusal_marker_is_the_sdks_own_text`.
 pub const REFUSAL_MARKER: &str = "is pinned to version";
 
+/// The stable prefix of the line `uc_service`'s attach path prints once it
+/// has run the PINNED INSTALL (`uc_service/src/attach.rs:327`):
+/// `uc_service: row {row} pinned install of snap-{origin} (from …, to …,
+/// artifact built by …)`. The swap arm matches this prefix followed by the
+/// run's own origin **P**, and a PASS requires the match.
+///
+/// Why it is required. `live == artifact` alone cannot tell a NEW that was
+/// rewound to P and recomputed `(P, X]` from a NEW that skipped the install
+/// and kept the state it had persisted, unless the span's own commands make
+/// the two compute different values — which is a property of the CORPUS, not
+/// of the mode. The marker is the mode's own observation that the install
+/// ran at all, and it is the same class of black-box evidence as
+/// [`REFUSAL_MARKER`]: the SDK's own words on the child's stderr. Pinned by
+/// `the_install_marker_is_the_sdks_own_text`.
+pub const INSTALL_MARKER_PREFIX: &str = "pinned install of snap-";
+
 /// Where a run's scratch lands by default: `<report>.pinverify/`, beside the
 /// report itself — the same rule the diff modes' `<report>.traces/` follows,
 /// so a failing run's evidence sits next to the report that names it.
@@ -58,10 +74,25 @@ pub fn scratch_dir_of(report: &Path) -> PathBuf {
 /// What the run proved. Only [`Verdict::Pass`] is a demonstration; the other
 /// two are honest about what was and was not shown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "UPPERCASE")]
 pub enum Verdict {
     Pass,
     Inconclusive,
     Fail,
+}
+
+/// One spelling of a verdict everywhere it is written: the JSON (through
+/// `rename_all`), the text render (through this `Display`) and the how-to's
+/// table all say `PASS` / `INCONCLUSIVE` / `FAIL`, so a
+/// `jq -e '.verdict == "PASS"'` CI job reads the same word a human does.
+impl std::fmt::Display for Verdict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Verdict::Pass => "PASS",
+            Verdict::Inconclusive => "INCONCLUSIVE",
+            Verdict::Fail => "FAIL",
+        })
+    }
 }
 
 /// The admin answer to `uc2ctl upgrade pin` (`status`/`reason` as the cnc
@@ -98,6 +129,13 @@ pub struct SwapArm {
     pub attached: bool,
     pub version_seen: u32,
     pub caught_up: bool,
+    /// Did NEW say it ran the pinned install? The SDK's own
+    /// [`INSTALL_MARKER_PREFIX`] line, naming this run's origin, on the
+    /// child's stderr. Required for a PASS or an INCONCLUSIVE (see
+    /// [`verdict`]); `#[serde(default)]` so a report written before this
+    /// field existed still parses, as `false`.
+    #[serde(default)]
+    pub install_logged: bool,
     /// `None` = never compared (a projection or a replay did not happen),
     /// never confused with a comparison that came out false.
     pub live_eq_artifact: Option<bool>,
@@ -130,9 +168,11 @@ pub struct PinVerifyReport {
 
 /// The verdict table (spec §6.2 part 2).
 ///
-/// A PASS needs all three: the pin refused the stale binary, NEW's live
-/// state is the one the ARTIFACT path computes, and the two paths could be
-/// told apart on this span. `live == artifact` with the paths AGREEING is
+/// A PASS needs all three: the arms held (the pin refused the stale binary,
+/// NEW attached at `--to`, and NEW **said it ran the pinned install** — the
+/// conjunction the caller passes as `refusal_held`), NEW's live state is the
+/// one the ARTIFACT path computes, and the two paths could be told apart on
+/// this span. `live == artifact` with the paths AGREEING is
 /// [`Verdict::Inconclusive`] — everything held, but nothing was shown, so
 /// calling it a pass would overstate the evidence. Anything else fails,
 /// including an arm that never produced a comparison at all.
@@ -145,6 +185,28 @@ pub fn verdict(
         (true, Some(true), Some(false)) => Verdict::Pass,
         (true, Some(true), Some(true)) => Verdict::Inconclusive,
         _ => Verdict::Fail,
+    }
+}
+
+/// Where the run's own instant at **P** falls: how many of the corpus's
+/// `MESSAGE` frames are re-submitted before it.
+///
+/// The default is half, clamped into range. An EXPLICIT `--split` is
+/// **refused** when it falls outside `1..=frames-1` rather than clamped:
+/// a clamped run is a different run than the operator asked for — the
+/// commands they meant to put above P are somewhere else — and nothing in
+/// the report would say so. A corpus of one frame has no legal explicit
+/// split at all (the instant must have something on each side), and the
+/// default's clamp lands on 1.
+pub fn choose_split(explicit: Option<usize>, frames: usize) -> anyhow::Result<usize> {
+    let max = frames.saturating_sub(1);
+    match explicit {
+        Some(n) if n < 1 || n > max => bail!(
+            "--split {n} is outside 1..={max}: the corpus has {frames} MESSAGE frames, and the \
+             instant at P needs at least one frame on each side of it"
+        ),
+        Some(n) => Ok(n),
+        None => Ok((frames / 2).clamp(1, max.max(1))),
     }
 }
 
@@ -226,6 +288,17 @@ impl PinVerifyReport {
         )?;
         writeln!(
             w,
+            "  swap: pinned install observed: {} (the SDK's own \"{}{}\" line on NEW's stderr)",
+            if self.swap.install_logged {
+                "yes"
+            } else {
+                "no"
+            },
+            INSTALL_MARKER_PREFIX,
+            self.origin
+        )?;
+        writeln!(
+            w,
             "  live == artifact: {}",
             yes_no(self.swap.live_eq_artifact)
         )?;
@@ -234,15 +307,7 @@ impl PinVerifyReport {
             "  artifact == genesis: {} (a PASS needs them to DIFFER — that is the counterfactual)",
             yes_no(self.swap.artifact_eq_genesis)
         )?;
-        writeln!(
-            w,
-            "  verdict: {}",
-            match self.verdict {
-                Verdict::Pass => "PASS",
-                Verdict::Inconclusive => "INCONCLUSIVE",
-                Verdict::Fail => "FAIL",
-            }
-        )?;
+        writeln!(w, "  verdict: {}", self.verdict)?;
         for n in &self.notes {
             writeln!(w, "  note: {n}")?;
         }
@@ -415,6 +480,17 @@ mod sequence {
         lines[lines.len().saturating_sub(n)..].join("\n")
     }
 
+    /// Did NEW's stderr carry the SDK's pinned-install line for THIS run's
+    /// origin? Reads the captured stderr FILE, and is called only once the
+    /// child has been stopped — see the call site's comment. (`AppProcess`
+    /// is consumed by `stop`, which is why this takes the path the run
+    /// handed `spawn_app` rather than the process.)
+    fn said_it_installed(stderr_path: &Path, origin: u64) -> bool {
+        std::fs::read_to_string(stderr_path)
+            .unwrap_or_default()
+            .contains(&format!("{INSTALL_MARKER_PREFIX}{origin}"))
+    }
+
     /// A bounded wait's outcome as a sentence, for a note.
     fn describe(outcome: &AttachOutcome) -> String {
         match outcome {
@@ -452,10 +528,7 @@ mod sequence {
                 corpus.manifest.end
             );
         }
-        let split = a
-            .split
-            .unwrap_or(frames.len() / 2)
-            .clamp(1, frames.len().saturating_sub(1).max(1));
+        let split = choose_split(a.split, frames.len())?;
         let scratch = a
             .scratch
             .clone()
@@ -629,13 +702,8 @@ mod sequence {
         // ---- S4 step 4: the swap arm — NEW attaches, installs the origin,
         // recomputes (P, X] ----
         let before = live::incarnation(&cnc, a.row);
-        let mut new = live::spawn_app(
-            &a.new,
-            &a.new_args,
-            &dir,
-            &a.app_id,
-            &scratch.join("new.stderr"),
-        )?;
+        let new_stderr = scratch.join("new.stderr");
+        let mut new = live::spawn_app(&a.new, &a.new_args, &dir, &a.app_id, &new_stderr)?;
         match new.wait_attached(&cnc, a.row, before, a.timeout) {
             AttachOutcome::Attached => r.swap.attached = true,
             other => {
@@ -665,6 +733,7 @@ mod sequence {
                 last_lines(&new.stderr(), 5)
             ));
             let _ = new.stop(a.timeout);
+            r.swap.install_logged = said_it_installed(&new_stderr, p);
             r.verdict = verdict(refusal_held, None, None);
             return Ok(r);
         }
@@ -679,6 +748,18 @@ mod sequence {
             Err(e) => r
                 .notes
                 .push(format!("NEW did not stop cleanly at Q={q}: {e}")),
+        }
+        // Read the marker only NOW: `stop` has waited the child out, so
+        // everything it wrote to the stderr FILE is flushed and visible.
+        // Reading it while NEW was still running would race its own first
+        // write and could report "not observed" for an install that did run.
+        r.swap.install_logged = said_it_installed(&new_stderr, p);
+        if !r.swap.install_logged {
+            r.notes.push(format!(
+                "NEW never printed \"{INSTALL_MARKER_PREFIX}{p}\" on its stderr: the pinned \
+                 install was NOT observed, so this run cannot say the swap crossed the version \
+                 boundary at the origin (it is not a PASS, whatever the projections say)"
+            ));
         }
 
         // ---- The three projections ----
@@ -775,7 +856,7 @@ mod sequence {
         r.swap.artifact = art_p;
         r.swap.genesis = gen_p;
         r.verdict = verdict(
-            refusal_held && r.swap.version_seen == a.to,
+            refusal_held && r.swap.version_seen == a.to && r.swap.install_logged,
             r.swap.live_eq_artifact,
             r.swap.artifact_eq_genesis,
         );
@@ -813,6 +894,87 @@ mod tests {
         assert_eq!(verdict(true, None, None), Verdict::Fail);
         // live == artifact but genesis unknown (a replay failed): still not a pass
         assert_eq!(verdict(true, Some(true), None), Verdict::Fail);
+        // The first argument is a CONJUNCTION at the call site: the refusal
+        // arm, NEW attaching at `--to`, and NEW having SAID it ran the pinned
+        // install. A run that never saw the install marker passes `false`
+        // here, and no projection can make that a pass — which is the whole
+        // point of requiring it, since `live == artifact` cannot see a
+        // skipped install on a span whose commands do not depend on the
+        // state at P.
+        let arms_held_but_no_install = false;
+        assert_eq!(
+            verdict(arms_held_but_no_install, Some(true), Some(false)),
+            Verdict::Fail,
+            "PASS without an observed pinned install"
+        );
+        assert_eq!(
+            verdict(arms_held_but_no_install, Some(true), Some(true)),
+            Verdict::Fail,
+            "INCONCLUSIVE without an observed pinned install"
+        );
+    }
+
+    /// The install marker is the SDK's own text, exactly as the refusal
+    /// marker is — but it reaches the harness through an `eprintln!` rather
+    /// than a `Display` impl, so there is no value to construct and assert
+    /// on. The honest pin is a COPY of the format literal at
+    /// `uc_service/src/attach.rs:327`, rendered here and checked to contain
+    /// what the swap arm looks for. If that `eprintln!` is reworded, this
+    /// test still passes and the arm goes quiet — which is why the
+    /// `pin_verify.rs` e2e asserts `install_logged == true` on a live run as
+    /// well: the two together catch a drift either could miss alone.
+    #[test]
+    fn the_install_marker_is_the_sdks_own_text() {
+        let (row, origin, from, to, built_by) = (0u8, 4096u64, 0u32, 3u32, 0u32);
+        // Copied verbatim from uc_service/src/attach.rs:327.
+        let line = format!(
+            "uc_service: row {row} pinned install of snap-{origin} \
+             (from {from:#010x} to {to:#010x}, artifact built by {built_by:#010x})"
+        );
+        assert!(line.contains(INSTALL_MARKER_PREFIX), "{line}");
+        assert!(
+            line.contains(&format!("{INSTALL_MARKER_PREFIX}{origin}")),
+            "the arm matches the prefix FOLLOWED BY this run's own origin: {line}"
+        );
+        // …and not some other run's origin.
+        assert!(!line.contains(&format!("{INSTALL_MARKER_PREFIX}{}", origin + 64)));
+    }
+
+    /// An explicit `--split` outside the corpus is refused by name, with both
+    /// numbers; the default is still clamped.
+    #[test]
+    fn an_explicit_split_out_of_range_is_refused_and_the_default_is_clamped() {
+        assert_eq!(choose_split(Some(1), 10).unwrap(), 1);
+        assert_eq!(choose_split(Some(9), 10).unwrap(), 9);
+        for bad in [0, 10, 5000] {
+            let e = choose_split(Some(bad), 10).unwrap_err().to_string();
+            assert!(e.contains(&bad.to_string()), "{e}");
+            assert!(e.contains("10"), "the corpus size is named too: {e}");
+        }
+        // A one-frame corpus has no legal explicit split at all.
+        assert!(choose_split(Some(1), 1).is_err());
+        // The default keeps its clamp: half, never 0, never past the end.
+        assert_eq!(choose_split(None, 10).unwrap(), 5);
+        assert_eq!(choose_split(None, 2).unwrap(), 1);
+        assert_eq!(choose_split(None, 1).unwrap(), 1);
+    }
+
+    /// M3: one spelling of the verdict — the JSON word and the text word are
+    /// the same word, so a `jq` job and a human read the same thing.
+    #[test]
+    fn the_verdict_is_spelled_the_same_in_json_and_text() {
+        for (v, word) in [
+            (Verdict::Pass, "PASS"),
+            (Verdict::Inconclusive, "INCONCLUSIVE"),
+            (Verdict::Fail, "FAIL"),
+        ] {
+            assert_eq!(serde_json::to_string(&v).unwrap(), format!("\"{word}\""));
+            assert_eq!(v.to_string(), word);
+            assert_eq!(
+                serde_json::from_str::<Verdict>(&format!("\"{word}\"")).unwrap(),
+                v
+            );
+        }
     }
 
     #[test]
@@ -873,6 +1035,7 @@ mod tests {
             "swap arm:",
             "live == artifact:",
             "artifact == genesis:",
+            "pinned install observed: no",
             "verdict: FAIL",
             "note: a note",
         ] {
