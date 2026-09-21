@@ -109,13 +109,13 @@ pub fn register_name() -> &'static str {
 /// (these test nodes run the filesystem admin policy, so there is no auth
 /// line, exactly as `uc_node/tests/reconfig.rs`'s `admin_request` relies on).
 ///
-/// Two of the node's three door checks are races against this fixture rather
-/// than errors in it: `pin_no_set` (54) compares `origin` against the node's
-/// NEWEST complete set, which the cluster agent publishes a moment after the
-/// row's own artifact appears, and status 2 is the ordinary
-/// single-in-flight retry. So a non-zero answer is retried until the
-/// deadline and only then asserted — a refusal that is really a refusal
-/// still fails the test, with its reason code.
+/// Exactly two answers are RACES against this fixture rather than errors in
+/// it, and only those two are retried: status 2 (the ordinary
+/// single-in-flight retry) and reason 54 `pin_no_set`, which compares
+/// `origin` against the node's NEWEST complete set — published by the
+/// cluster agent a moment after the row's own artifact appears. Every other
+/// refusal is a refusal: it fails immediately, naming its reason, instead of
+/// being re-sent for 30 s and then reported as a timeout.
 pub fn pin_row(dir: &Path, cnc: &CncPage, row: u8, from: u32, to: u32, origin: u64) -> AdminResp {
     let mut bytes = Vec::new();
     encode_upgrade_pin(
@@ -132,7 +132,8 @@ pub fn pin_row(dir: &Path, cnc: &CncPage, row: u8, from: u32, to: u32, origin: u
     loop {
         stage_upgrade_pin(dir, &bytes);
         let resp = admin_request(cnc, ADMIN_OP_UPGRADE_PIN, id, ip, port);
-        if resp.status == 0 || Instant::now() >= deadline {
+        let racy = resp.status == 2 || resp.reason == uc_node::REASON_PIN_NO_SET;
+        if resp.status == 0 || !racy || Instant::now() >= deadline {
             assert_eq!(
                 resp.status, 0,
                 "upgrade pin refused: status={} reason={}",
