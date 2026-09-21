@@ -740,16 +740,64 @@ left it): a `ULTSNAP1` artifact is **refused by name**
 envelope at all. **Clear `snapshots/<row>/` on every node once, as part of
 this flag day** — `ULTSNAP1` artifacts are refused by name; `snapshots/cluster/`
 is **untouched** by this change (cluster image 1 → 2, above, is
-forward-compatible on read, no wipe required there). Every node loses its
-purge floor and reconstructs from the journal until the next coordinated
-instant rebuilds the row's artifacts in the new layout — the same cost the
-"`NoCommonPrefix` = wipe-and-rejoin" path already documents.
+forward-compatible on read, no wipe required there). Until the next
+coordinated instant rebuilds the row's artifacts in the new layout, every
+node's rows reconstruct from the **journal** — the wipe removes artifacts,
+not the floor: a node's purge floor is seeded at boot from `state/`, which
+this step does not touch.
+
+**That is the precondition, and it is not a detail: the wipe is safe only if
+the row's state machine is durable, or the journal still reaches genesis.**
+Deleting `snapshots/<row>/` while the floor (and the journal purge behind it)
+sits above what the state machine holds leaves the gap guard with no covering
+artifact, and every node fail-stops the row with `SnapshotRequired`. Concretely:
+
+- **purge off (the default, `PurgePolicy::Disabled`)** — the journal still
+  reaches genesis. Wipe freely; rows replay from 0 until the next instant.
+- **purge on with a DURABLE state machine** — the SM's own cursor covers the
+  floor, so nothing needs the deleted artifacts. Wipe.
+- **purge on with an in-memory state machine** — **you cannot wipe.** There is
+  no path from the floor to a live row without an artifact, and `ULTSNAP1` is
+  refused by name. Such a deployment must wait for the envelope migration tool
+  (rewrite `ULTSNAP1 ‖ P` as `ULTSNAP2 ‖ P ‖ <operator-supplied version>`
+  in place), which is **not shipped** — it is a backlog item. Do not upgrade
+  to 2.13.0 before it exists.
+
+**Take a fresh instant after the wipe, before any `uc2ctl upgrade pin`.** Run
+`uc2ctl snapshot` as soon as the fleet is up on 2.13.0. Until one completes,
+the node's newest complete-set position is **seeded from the durable snapshot
+floor in `state/`** — which the wipe does not touch, so it still names a
+pre-wipe instant — and `pin_no_set` (reason 54) checks a pin's origin against
+exactly that word
+— so a stale value would let a pin be ACCEPTED at an origin whose artifact
+the wipe just deleted, and the attach would then refuse with
+`PinnedArtifactMissing` at the worst possible moment.
 
 **The S4 sequence, and what each refusal means.** An upgrade of a row whose
 `apply` semantics changed is always `uc2ctl snapshot` (the complete set at P)
 → `uc2ctl upgrade pin --row r --to <ver> --origin P` (records the intent) →
-stop every instance of row r, swap the binary, start (only now does a
-v_new attach read the pin and install `snap-<P>` unconditionally). See
+**confirm the pin is visible on every node** → stop every instance of row r,
+swap the binary, start (only now does a v_new attach read the pin and install
+`snap-<P>` unconditionally) → **`uc2ctl snapshot` again, as soon as the
+swapped row has caught up**.
+
+The two added steps are not optional:
+
+- **Confirm the pin everywhere BEFORE stopping any instance.** `uc2ctl
+  status` prints `upgrade_origin=`/`pinned=`/`pinned_from=` per row, and
+  `uc2_upgrade_pin_origin{service="…",row="r"}` carries the same origin on
+  each node's `/metrics`. A pin is a replicated command: a node that has not applied it
+  yet reads `PinRead::NoPin`, and a v_new service attaching there takes the
+  **unpinned** path — no refusal, no log line, just the §2.3 counterfactual
+  on that one node. Check every node, not the leader.
+- **Take an instant AFTER the swap.** Once the pin is consumed the node's
+  floor is free to advance past the origin, and the origin's artifact becomes
+  prunable. A later restart of the row re-installs from the newest covering
+  artifact, which must be one built by the version now running — with
+  `snapshot_interval_bytes = 0` (the default) nothing takes that instant for
+  you, and the restart fail-stops instead.
+
+See
 [`uc2ctl` § `upgrade pin`](../reference/uc2ctl.md#upgrade-pin) for the
 command's own door refusals (`52`–`59`, checked before anything is proposed
 or replicated). At attach, four more refusals guard the pinned install
@@ -779,8 +827,14 @@ land at `origin` at all — the journal below the floor is gone — and the
 attach path fail-stops rather than refusing cleanly by name. In practice the
 node holds its floor at any pinned origin it has not yet consumed
 (`snapshot_floor_held_for_pin`, below) precisely to keep this from happening
-on the node that did the pinning; it is a real risk only for a node that was
-offline, or otherwise behind, when the pin and the later purge both landed.
+on the node that did the pinning. It stays a real risk for any node whose own
+floor can be above the origin when the pin lands, and that is **not only the
+node that was offline or behind**: reason 54 compares the origin against the
+newest complete set of the node the pin was proposed on (the leader), so a
+node that is AHEAD of it — one whose own later instant completed and whose
+floor and journal purge have already moved past the origin — is refused
+nothing at the door and fails at attach time just the same. Check the floor
+on every node, not just the laggards.
 
 **A pinned-but-abandoned upgrade holds the journal indefinitely.** A node
 holds its snapshot/purge floor at a row's pinned origin until that row is
