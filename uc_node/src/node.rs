@@ -12983,6 +12983,49 @@ mod tests {
         assert_eq!(state.report_for(0).map(|r| r.position), Some(p));
     }
 
+    /// Two rows ready at once is the ordinary case (an instant freezes every
+    /// declared row), and the append is still ONE command per pass: the second
+    /// row waits behind the single-in-flight gate the first one shut. The
+    /// lowest row goes first, so which one that is does not depend on a
+    /// `HashMap`'s iteration order.
+    #[test]
+    fn two_ready_rows_append_one_per_pass_lowest_first() {
+        let mut h = harness_with_rows(&["a", "b"]);
+        drive_to_serving_leader(&mut h);
+        h.cons.pass_mono_ns = 1_000;
+        let p = 6048u64;
+        for row in [1u8, 0] {
+            h.cons.on_snap_report(0, row, p, 0x99);
+            h.cons.on_snap_report(1, row, p, 0x99);
+        }
+
+        assert!(h.cons.maybe_append_snapshot_reports());
+        assert!(
+            !h.cons.maybe_append_snapshot_reports(),
+            "the second row waits for the first command to commit"
+        );
+        let end = h.cons.last_cluster_append;
+        h.commit_through(end);
+        let state = h.cons.cluster_view.to_state();
+        assert_eq!(
+            state.report_for(0).map(|r| r.position),
+            Some(p),
+            "row 0 went first"
+        );
+        assert_eq!(state.report_for(1), None, "row 1 is still pending");
+
+        assert!(
+            h.cons.maybe_append_snapshot_reports(),
+            "and lands next pass"
+        );
+        let end = h.cons.last_cluster_append;
+        h.commit_through(end);
+        let state = h.cons.cluster_view.to_state();
+        assert_eq!(state.report_for(1).map(|r| r.position), Some(p));
+        assert!(h.cons.pending_snapshot_reports.is_empty());
+        assert_eq!(h.cons.snapshot_reports_appended.load(Ordering::Relaxed), 2);
+    }
+
     /// The collector runs on the ordinary leader pass — nothing else calls it,
     /// so a suite that only ever called it by hand would pass over a collector
     /// that was never wired into `do_work`.
