@@ -93,12 +93,33 @@ pub struct EngineConfig {
     /// is clear (`SubmitError::NotServing`) instead of free-running into a
     /// dead/non-leader node.
     pub serving_gate: bool,
+    /// Plan B3 T5: how long [`Engine::attach`] waits for the node to publish
+    /// its declared set — i.e. to have JOINED its cluster (a node publishes
+    /// that word on the first consensus pass where it knows its leader and
+    /// its cluster FSM has consumed the log up to commit, not at boot). Until
+    /// it does, an attach is [`ClientError::NodeBooting`], and this is how
+    /// long the attach keeps retrying (every [`BOOT_POLL`]) before returning
+    /// that error.
+    ///
+    /// [`DEFAULT_BOOT_WAIT`] by default; [`Duration::ZERO`] disables the wait
+    /// and restores the pre-B3 behaviour of failing on the first look.
+    pub boot_wait: Duration,
     /// Test hook: seed the slot table's sequence counter (default 0), used to
     /// exercise u32-wrap behavior deterministically. Not part of the stable
     /// public contract.
     #[doc(hidden)]
     pub start_seq: u64,
 }
+
+/// Default [`EngineConfig::boot_wait`] — the same ten seconds
+/// `uc_service::DEFAULT_BOOT_WAIT` gives a service, and for the same reason:
+/// it covers a client and its node starting together, and a node that has not
+/// joined its cluster by then has something wrong with it.
+pub const DEFAULT_BOOT_WAIT: Duration = Duration::from_secs(10);
+
+/// How often [`Engine::attach`] re-reads the page while waiting out a node's
+/// join (plan B3 T5).
+const BOOT_POLL: Duration = Duration::from_millis(20);
 
 impl Default for EngineConfig {
     fn default() -> Self {
@@ -107,6 +128,7 @@ impl Default for EngineConfig {
             request_timeout: Duration::from_secs(10),
             max_payload: None,
             serving_gate: true,
+            boot_wait: DEFAULT_BOOT_WAIT,
             start_seq: 0,
         }
     }
@@ -385,6 +407,55 @@ pub enum Outcome<'a> {
     InstanceRestart { attached: u128, current: u128 },
 }
 
+/// Plan B3 T5: is this page a node that has not yet joined its cluster?
+///
+/// Names on line 7 with no declared set. `Node::start` publishes the header
+/// (names included) before anything else; the declared set is published by
+/// the consensus pass, on the first pass where the node knows its leader and
+/// its cluster FSM has consumed the log up to commit. No configured node
+/// publishes that pair in steady state and no harness page has names, so it
+/// is unambiguous.
+fn node_booting(declared: u64, names: &[Option<FsmName>]) -> bool {
+    declared == 0 && names.iter().any(Option::is_some)
+}
+
+/// Plan B3 T5: wait out `boot_wait` for a node that is still joining, polling
+/// every [`BOOT_POLL`], and hand back the page to attach against.
+///
+/// The page is RE-OPENED every turn rather than held: a node restarting
+/// underneath this wait rewrites `cnc2.dat`, and a mapping taken before that
+/// says nothing about the node that is now booting. The page that comes back
+/// is therefore the one the caller must go on to use.
+fn wait_out_node_boot(
+    cnc: Arc<CncPage>,
+    instance_dir: &Path,
+    app_id: &str,
+    boot_wait: Duration,
+) -> Result<Arc<CncPage>, ClientError> {
+    if boot_wait.is_zero() || !node_booting(cnc.services_declared(), &cnc.service_names()) {
+        return Ok(cnc);
+    }
+    let deadline = Instant::now() + boot_wait;
+    let mut cnc = cnc;
+    loop {
+        if Instant::now() >= deadline {
+            return Err(ClientError::NodeBooting);
+        }
+        std::thread::sleep(BOOT_POLL);
+        // A page that will not open, or will not decode, is a real refusal
+        // the caller raises properly a moment from now with the same error —
+        // not something to spin on.
+        let Ok(fresh) = CncPage::open_file(&instance_dir.join(CNC_FILE), app_id) else {
+            return Ok(cnc);
+        };
+        cnc = fresh;
+        if cnc.try_meta().is_some() && !node_booting(cnc.services_declared(), &cnc.service_names())
+        {
+            return Ok(cnc);
+        }
+    }
+}
+
 impl Engine {
     /// Attach to a running node's instance directory: open the cnc page
     /// (validates `app_id`/protocol version), allocate `client_id` off
@@ -397,6 +468,12 @@ impl Engine {
         cfg: EngineConfig,
     ) -> Result<(SendHalf, PollHalf), ClientError> {
         let cnc = CncPage::open_file(&instance_dir.join(CNC_FILE), app_id)?;
+        // Plan B3 T5: a node publishes its declared set only once it has
+        // JOINED its cluster, so an attach landing in that window reads the
+        // page as booting. Wait it out, bounded by `cfg.boot_wait`, BEFORE
+        // allocating a `client_id` — a wait that burned one id per turn would
+        // spend five hundred of them on a node that never joins.
+        let cnc = wait_out_node_boot(cnc, instance_dir, app_id, cfg.boot_wait)?;
         let client_id = cnc.status().next_client_id.fetch_add(1) as u32;
         // The page validated at `open_file`, but it is memory the node owns and
         // re-initialises in place on restart — so it can go torn between that
@@ -429,11 +506,12 @@ impl Engine {
         // does not synthesize a name).
         let names = cnc.service_names();
         let raw = cnc.services_declared();
-        // Names with no declared set is the node MID-BOOT (between its
-        // `create_file` and `store_services_declared`), not a harness page:
-        // the `(0, _) => 0b1` fold below would pin this client to FSM 0 for
-        // life on a node that is about to declare more. Refuse by name.
-        if raw == 0 && names.iter().any(Option::is_some) {
+        // Names with no declared set is a node that has not JOINED its
+        // cluster yet (plan B3 T5, [`node_booting`]), not a harness page: the
+        // `(0, _) => 0b1` fold below would pin this client to FSM 0 for life
+        // on a node that is about to declare more. Refuse by name — the wait
+        // above has already given it `cfg.boot_wait` to get there.
+        if node_booting(raw, &names) {
             return Err(ClientError::NodeBooting);
         }
         let masked = raw & ((1u64 << CNC_MAX_SERVICES) - 1);
@@ -1198,31 +1276,97 @@ mod tests {
         BroadcastRing::create(&dir.join(EGRESS_NODE), MIB, 128).unwrap();
     }
 
-    /// Names on line 7 with `services_declared == 0` is the node mid-boot
-    /// (between `create_file` and `store_services_declared`), not a harness
-    /// page; folding it to FSM 0 would leave this client believing a
-    /// two-FSM node has one FSM for the attachment's life. Refuse by name.
-    #[test]
-    fn names_present_with_declared_zero_is_refused_as_booting() {
-        let dir = tempfile::tempdir_in(scratch_base()).unwrap();
+    /// A page with names on line 7 and no declared set: a node that has not
+    /// yet joined its cluster (plan B3 T5 — the declared set is published by
+    /// the consensus pass, not at boot). Only the rings attach opens before
+    /// it reads the declared set exist, so the refusal is the gap's, not a
+    /// missing file's.
+    fn make_instance_booting(dir: &Path, app_id: &str) {
         let mut services = [None; uc_protocol::v2::cnc::CNC_MAX_SERVICES];
         services[0] = Some(FsmName::parse("kv").unwrap());
         services[1] = Some(FsmName::parse("orders").unwrap());
         let m = uc_log::cnc::CncMeta {
             services,
-            ..meta("boot-gap")
+            ..meta(app_id)
         };
-        let _page = uc_log::cnc::CncPage::create_file(&dir.path().join(CNC_FILE), &m).unwrap();
-        // No `store_services_declared`: the node has not got there yet. The
-        // ingress/query rings exist (attach opens them before it reads the
-        // declared set), so the refusal is the gap's, not a missing file's.
+        // No `store_services_declared`: the node has not got there yet.
+        uc_log::cnc::CncPage::create_file(&dir.join(CNC_FILE), &m).unwrap();
         const MIB: u64 = 1 << 20;
-        MpscRing::create(&dir.path().join(INGRESS_RING), MIB, 128).unwrap();
-        MpscRing::create(&dir.path().join(QUERY_RING), MIB, 256).unwrap();
-        match Engine::attach(dir.path(), "boot-gap", EngineConfig::default()) {
+        MpscRing::create(&dir.join(INGRESS_RING), MIB, 128).unwrap();
+        MpscRing::create(&dir.join(QUERY_RING), MIB, 256).unwrap();
+    }
+
+    /// Names on line 7 with `services_declared == 0` is a node that has not
+    /// joined its cluster, not a harness page; folding it to FSM 0 would
+    /// leave this client believing a two-FSM node has one FSM for the
+    /// attachment's life. Refuse by name — with `boot_wait` off, on the
+    /// first look.
+    #[test]
+    fn names_present_with_declared_zero_is_refused_as_booting() {
+        let dir = tempfile::tempdir_in(scratch_base()).unwrap();
+        make_instance_booting(dir.path(), "boot-gap");
+        let cfg = EngineConfig {
+            boot_wait: Duration::ZERO,
+            ..EngineConfig::default()
+        };
+        match Engine::attach(dir.path(), "boot-gap", cfg) {
             Err(ClientError::NodeBooting) => {}
             other => panic!("expected NodeBooting, got {:?}", other.err()),
         }
+    }
+
+    /// Plan B3 T5: the same page, with a wait — the refusal comes back only
+    /// after `boot_wait` has actually elapsed, so a node that never joins is
+    /// reported rather than waited on forever.
+    #[test]
+    fn a_node_that_never_joins_is_refused_after_the_bounded_wait() {
+        let dir = tempfile::tempdir_in(scratch_base()).unwrap();
+        make_instance_booting(dir.path(), "boot-wait-out");
+        let cfg = EngineConfig {
+            boot_wait: Duration::from_millis(200),
+            ..EngineConfig::default()
+        };
+        let started = Instant::now();
+        match Engine::attach(dir.path(), "boot-wait-out", cfg) {
+            Err(ClientError::NodeBooting) => {}
+            other => panic!("expected NodeBooting, got {:?}", other.err()),
+        }
+        assert!(
+            started.elapsed() >= Duration::from_millis(200),
+            "the attach returned before the wait was up: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// ...and the case the wait exists for: the node finishes joining while
+    /// the client is waiting, and the attach succeeds against the page it
+    /// then declares. A client and its node started together (systemd, a
+    /// compose file, a test) is the common shape, and it would otherwise
+    /// race the consensus pass that publishes the declared set.
+    #[test]
+    fn attach_waits_out_a_joining_node_and_then_succeeds() {
+        let dir = tempfile::tempdir_in(scratch_base()).unwrap();
+        make_instance_booting(dir.path(), "boot-join");
+        let path = dir.path().to_path_buf();
+        let joiner = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            const MIB: u64 = 1 << 20;
+            BroadcastRing::create(&path.join(egress_service_ring(0)), MIB, 128).unwrap();
+            BroadcastRing::create(&path.join(egress_service_ring(1)), MIB, 128).unwrap();
+            BroadcastRing::create(&path.join(EGRESS_NODE), MIB, 128).unwrap();
+            // The consensus pass's store: this node has joined its cluster.
+            uc_log::cnc::CncPage::open_file(&path.join(CNC_FILE), "boot-join")
+                .unwrap()
+                .store_services_declared(0b11);
+        });
+        let (send, _poll) = Engine::attach(dir.path(), "boot-join", EngineConfig::default())
+            .expect("the wait outlasts the join");
+        joiner.join().unwrap();
+        assert_eq!(
+            send.declared(),
+            0b11,
+            "the attach read the declared set the node published, not a fold of 0"
+        );
     }
 
     /// cnc 3.1: a page with real names on line 7 resolves `fsm(name)` to the

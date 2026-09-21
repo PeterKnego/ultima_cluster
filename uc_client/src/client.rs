@@ -69,6 +69,10 @@ impl Client {
                 max_inflight: MAX_INFLIGHT,
                 request_timeout,
                 serving_gate: false, // pinned: pre-rework Client submits regardless of CAN_SERVE
+                // Plan B3 T5: the default wait for a node that has not joined
+                // its cluster yet — `Client::connect` takes no config, so
+                // this is the one it gets.
+                boot_wait: crate::engine::DEFAULT_BOOT_WAIT,
             },
         )?;
         Ok(Client { inner })

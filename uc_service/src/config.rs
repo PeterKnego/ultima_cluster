@@ -4,6 +4,20 @@
 //! Service configuration + error type.
 
 use std::path::PathBuf;
+use std::time::Duration;
+
+/// How long [`ServiceBuilder::start`](crate::ServiceBuilder::start) waits out
+/// a node that is still joining its cluster before giving up with
+/// [`ServiceError::NodeBooting`].
+///
+/// Ten seconds because that is an election plus a catch-up on a healthy
+/// cluster, and because the failure it covers — a service and its node
+/// restarting together, `systemd` starting both at once — is measured in
+/// hundreds of milliseconds, not seconds. A node that has not joined by then
+/// has something wrong with it, and an attach that reported success anyway
+/// would be attaching to a node whose cluster state (its upgrade pins above
+/// all) is not yet on the page.
+pub const DEFAULT_BOOT_WAIT: Duration = Duration::from_secs(10);
 
 /// Where the service attaches and which cluster it belongs to. The service
 /// resolves the node's well-known IPC paths under `instance_dir` and presents
@@ -12,6 +26,16 @@ use std::path::PathBuf;
 pub struct ServiceConfig {
     pub instance_dir: PathBuf,
     pub app_id: String,
+    /// Plan B3 T5: how long to wait for the node to publish its declared set
+    /// — i.e. to have joined its cluster and applied every committed
+    /// `CLUSTER` frame, upgrade pins included. Until it does, an attach is
+    /// [`ServiceError::NodeBooting`], and this is how long
+    /// [`ServiceBuilder::start`](crate::ServiceBuilder::start) keeps
+    /// retrying (every 20 ms) before returning that error.
+    ///
+    /// [`DEFAULT_BOOT_WAIT`] by default; [`Duration::ZERO`] disables the wait
+    /// and restores the pre-B3 behaviour of failing on the first look.
+    pub boot_wait: Duration,
 }
 
 impl ServiceConfig {
@@ -19,7 +43,14 @@ impl ServiceConfig {
         Self {
             instance_dir: instance_dir.into(),
             app_id: app_id.into(),
+            boot_wait: DEFAULT_BOOT_WAIT,
         }
+    }
+
+    /// Override [`boot_wait`](Self::boot_wait). `Duration::ZERO` = no wait.
+    pub fn with_boot_wait(mut self, boot_wait: Duration) -> Self {
+        self.boot_wait = boot_wait;
+        self
     }
 }
 

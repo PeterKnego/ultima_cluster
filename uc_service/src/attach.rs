@@ -64,6 +64,73 @@ pub(crate) fn lag_mode_for(cnc: &CncPage) -> crate::lag::LagMode {
     crate::lag::mode_from_page(cnc.services_declared(), cnc.fsm_lag_bytes())
 }
 
+/// Plan B3 T5: is this page a node that has NOT yet joined its cluster?
+///
+/// Names on line 7 with no declared set. `create_file` publishes the header
+/// (names included) at the very start of `Node::start`; the declared set is
+/// published by the consensus pass, on the first pass where the node knows
+/// its leader and its cluster FSM has consumed the log up to commit
+/// (`uc_node::Consensus::maybe_publish_declared`). Between the two, every
+/// word an attacher depends on — the lag policy, and the row's upgrade PIN
+/// above all — may still be missing or stale.
+///
+/// No configured node publishes this pair in steady state and no harness page
+/// has names (`ServicesConfig::none_for_tests` declares nothing and names
+/// nothing), so it is unambiguous.
+pub(crate) fn node_booting(
+    declared: u64,
+    names: &[Option<uc_protocol::identity::FsmName>],
+) -> bool {
+    declared == 0 && names.iter().any(Option::is_some)
+}
+
+/// Plan B3 T5: wait out [`ServiceConfig::boot_wait`] for a node that is still
+/// joining its cluster, polling every [`BOOT_POLL`].
+///
+/// Called by [`ServiceBuilder::start`](crate::ServiceBuilder::start) and
+/// [`start_with_snapshots`](crate::ServiceBuilder::start_with_snapshots)
+/// BEFORE [`attach`], because `attach` takes the state machine by value and
+/// so cannot be retried. The refusal it returns on timeout is `attach`'s own,
+/// by name.
+///
+/// The page is re-opened every turn rather than held: a node restarting
+/// underneath this wait rewrites `cnc2.dat`, and a mapping taken before that
+/// says nothing about the node that is now booting.
+pub(crate) fn wait_out_node_boot(cfg: &ServiceConfig) -> Result<(), ServiceError> {
+    if cfg.boot_wait.is_zero() {
+        return Ok(());
+    }
+    let path = cfg.instance_dir.join("cnc2.dat");
+    let deadline = std::time::Instant::now() + cfg.boot_wait;
+    loop {
+        // A torn page (a node rewriting it in place) reads as booting rather
+        // than as an error: `try_meta` is the same belt `attach` uses.
+        let booting = match CncPage::open_file(&path, &cfg.app_id) {
+            Ok(cnc) => {
+                cnc.try_meta().is_none()
+                    || node_booting(cnc.services_declared(), &cnc.service_names())
+            }
+            // Anything else — no page, wrong app_id, a bad header — is a real
+            // refusal `attach` will raise properly a moment from now, with
+            // the same error. Not something to spin on.
+            Err(_) => return Ok(()),
+        };
+        if !booting {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(ServiceError::NodeBooting);
+        }
+        std::thread::sleep(BOOT_POLL);
+    }
+}
+
+/// How often [`wait_out_node_boot`] looks at the page. Short enough that the
+/// common case (a service and its node started together) costs one or two
+/// turns, long enough that a full `boot_wait` is 500 map-and-read turns, not
+/// a spin.
+const BOOT_POLL: std::time::Duration = std::time::Duration::from_millis(20);
+
 /// Run the 6-step attach. Steps 1–5 here; step 6 (spawn the threads) is the
 /// builder's job, after this returns.
 ///
@@ -111,14 +178,19 @@ pub(crate) fn attach<S: RawStateMachine>(
     let names = cnc.service_names();
     let raw_declared = cnc.services_declared();
     let any_named = names.iter().any(Option::is_some);
-    // Names with no declared set is the node MID-BOOT — `create_file` has
-    // published the header (names included) and `store_services_declared`
-    // has not run yet. No configured node publishes that pair and no harness
-    // page has names, so it is unambiguous. Refuse rather than fall into the
+    // Names with no declared set is a node that has not yet JOINED its
+    // cluster (plan B3 T5, [`node_booting`]) — the declared set is published
+    // by the consensus pass, not at boot. Refuse rather than fall into the
     // harness arm below, which would fix `LagMode::Off` for this attachment's
-    // life. The node stores `fsm_lag_bytes` BEFORE `services_declared`, so a
-    // nonzero declared set also proves the lag policy is already published.
-    if raw_declared == 0 && any_named {
+    // life. The node stores `fsm_lag_bytes` BEFORE any agent runs, so a
+    // nonzero declared set also proves the lag policy is already published —
+    // and, since B3, that every committed `UpgradePin` has been applied here
+    // and republished onto this row's pin words.
+    //
+    // `ServiceBuilder::start` has already waited `cfg.boot_wait` out
+    // ([`wait_out_node_boot`]), so reaching this line means the node is
+    // genuinely not ready — or the caller asked for no wait at all.
+    if node_booting(raw_declared, &names) {
         return Err(ServiceError::NodeBooting);
     }
     let harness = raw_declared == 0 && !any_named;
@@ -393,6 +465,7 @@ pub(crate) fn attach<S: RawStateMachine>(
         table_last: std::collections::HashMap::new(),
         needs_replay: false,
         replay_wait: None,
+        replay_stalled: None,
         instance_id,
         instance_mismatch_streak: 0,
         my_epoch: epoch,
