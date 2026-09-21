@@ -1156,7 +1156,7 @@ fn a_pin_above_the_recovered_artifact_is_published_before_the_declared_set() {
         .join(format!("snap-{origin}.ultcluster"));
     assert!(
         cluster_art.is_file(),
-        "precondition: the artifact the restart recovers from is the one at          the instant, taken BEFORE the pin was committed"
+        "precondition: the artifact the restart recovers from is the one at the instant, taken BEFORE the pin was committed"
     );
 
     let old_instance = cnc.try_meta().expect("meta").instance_id;
@@ -1201,7 +1201,7 @@ fn a_pin_above_the_recovered_artifact_is_published_before_the_declared_set() {
     assert_eq!(
         sampled,
         Some(expected),
-        "a pin committed ABOVE the recovered artifact must also be published          before the declared set — the gate is the cluster FSM reaching          commit, not the boot ordering"
+        "a pin committed ABOVE the recovered artifact must also be published before the declared set — the gate is the cluster FSM reaching commit, not the boot ordering"
     );
 
     let cnc2 = open_cnc(dir.path(), app);

@@ -81,11 +81,11 @@ pub struct ObsSources {
     pub snapshot_reports_unsent: Arc<AtomicU64>,
     /// Plan B3 (spec §6.5.2): the LEADER half — `CLUSTER kind = 5` records
     /// this node placed, and how many of those it placed on the 5 s timeout
-    /// rather than on a voter quorum (a subset of the first). Both sit still
-    /// on a follower, which never appends; a `timed_out` that keeps pace with
-    /// `appended` means the records are going in without a quorum of voters
-    /// vouching for the instant, and an upgrade pin read from one is thinner
-    /// evidence than it looks.
+    /// rather than on every voter reporting (ruling R-B3-1; a subset of the
+    /// first). Both sit still on a follower, which never appends; a
+    /// `timed_out` that keeps pace with `appended` means the records are
+    /// going in with at least one voter not vouching for the instant, and an
+    /// upgrade pin read from one is thinner evidence than it looks.
     pub snapshot_reports_appended: Arc<AtomicU64>,
     pub snapshot_reports_timed_out: Arc<AtomicU64>,
     /// Cluster FSM (spec §9): the cluster FSM's published view — the SAME

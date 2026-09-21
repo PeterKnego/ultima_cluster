@@ -683,6 +683,9 @@ fn one_divergent_node_is_named() {
 #[test]
 fn a_learner_reports_but_does_not_count_toward_quorum() {
     let _g = serialize();
+    // Taken before the instant: the discriminator below is the leader's own
+    // `snapshot_report_appended` record (final review, minor 12).
+    let sink = ObsCapture::take();
     let c = spawn_cluster(2, 1, uc_node::ServicesConfig::single("sum"));
     let svcs: Vec<uc_service::Service<SumSm>> = c
         .nodes
@@ -693,13 +696,8 @@ fn a_learner_reports_but_does_not_count_toward_quorum() {
     let leader = settle(&c, &cncs, 400);
     assert!(leader < 2, "the leader must be a voter, got {leader}");
 
-    // The stopwatch starts once the instant is ON the log: `command_instant`
-    // polls through the `retry` window a fresh leader answers, and that wait
-    // is the harness settling, not the collector pacing itself.
     let p = command_instant(c.nodes[leader].n());
-    let commanded = Instant::now();
     let report = await_report_everywhere(&c, p, 60);
-    let elapsed = commanded.elapsed();
 
     assert!(
         report.hashes.len() >= 2,
@@ -721,13 +719,26 @@ fn a_learner_reports_but_does_not_count_toward_quorum() {
         "every replica here is deterministic: {report:?}"
     );
 
-    // The voters released it, not the clock. Stated as a wall-time bound well
-    // under the fallback so the assertion is about which mechanism fired.
-    const BOUND: Duration = Duration::from_secs(3);
+    // The voters released it, not the clock — asserted on the property
+    // itself. The leader's record names which mechanism fired
+    // (`by="all_voters"` vs `by="timeout"`), so this says exactly what the
+    // old 3 s wall-clock bound under `SNAP_REPORT_TIMEOUT_NS` was trying to
+    // say, without being a timing assertion in a test that also brings up
+    // three busy-spin nodes and three services (final review, minor 12).
+    let text = sink.text();
+    let line = text
+        .lines()
+        .find(|l| {
+            l.contains(r#""event":"snapshot_report_appended""#)
+                && l.contains(&format!(r#""position":{p}"#))
+        })
+        .unwrap_or_else(|| {
+            panic!("the leader appended no record for the instant {p}: {text}");
+        });
     assert!(
-        elapsed < BOUND,
-        "the record took {elapsed:?}, at or beyond the {BOUND:?} bound — that is the 5 s \
-         SNAP_REPORT_TIMEOUT_NS fallback firing, not the two voters' reports"
+        line.contains(r#""by":"all_voters""#),
+        "the record was released by the two voters' reports, not by the 5 s \
+         SNAP_REPORT_TIMEOUT_NS fallback: {line}"
     );
 
     for s in svcs {

@@ -379,6 +379,12 @@ const READ_BARRIER_TIMEOUT_NS: u64 = 1_000_000_000;
 /// human-paced upgrade step that reads the record.
 pub const SNAP_REPORT_TIMEOUT_NS: u64 = 5_000_000_000;
 
+/// Plan B3 final review F3: how many consensus passes the attach gate
+/// (`Consensus::maybe_publish_declared`) may stay shut before the node says
+/// which clause is holding it. See [`Consensus::note_declared_withheld`] for
+/// why this is counted in passes and for the ~0.9 s arithmetic behind the
+/// number.
+const DECLARED_WITHHELD_WARN_PASSES: u32 = 3_000_000;
 /// Output-progress persist floor (Task 12 / spec §7): rate-limits the durable
 /// `StableValue::store` (an fsync) to at most once per 100 ms even under a
 /// change every cycle. The cheap in-page `output_completed` compare still runs
@@ -2249,6 +2255,8 @@ impl Node {
             test_now_ns: None,
             services: cfg.services,
             declared_published: false,
+            declared_withheld_passes: 0,
+            declared_withheld_warned: false,
             snap_stats: Arc::clone(&route_drops),
             last_snap_refusals: (0, 0, 0, 0, 0),
             min_applied: u64::MAX,
@@ -3187,6 +3195,14 @@ struct Consensus {
     /// branch on a field that is already hot, not an atomic load (M14a: code
     /// in a hot loop's body costs even on paths that never run).
     declared_published: bool,
+    /// Plan B3 final review F3: passes taken with that gate still SHUT, and
+    /// whether the one `services_declared_withheld` warning has been emitted.
+    /// Both are dead the moment the gate opens (they are only touched from
+    /// [`Self::note_declared_withheld`], reached only while
+    /// `!declared_published`). Saturating is not needed: the counter stops at
+    /// the threshold, which is six orders of magnitude below `u32::MAX`.
+    declared_withheld_passes: u32,
+    declared_withheld_warned: bool,
     /// M14c (spec §14.3): the receiver's stats — the SAME `Arc` the follower
     /// receiver bumps and `Node::snapshot_session_refusals` reads. Sampled once
     /// per duty cycle so the two named snapshot-session refusals are NAMED in a
@@ -5474,12 +5490,18 @@ impl Consensus {
     /// inlining budget (M14a / the 2.11.0 apply-hop regression).
     #[inline(never)]
     fn maybe_publish_declared(&mut self) {
-        if !self.leader_known() || !self.sm.commit_learned() {
+        if !self.leader_known() {
+            self.note_declared_withheld("leader_unknown");
+            return;
+        }
+        if !self.sm.commit_learned() {
+            self.note_declared_withheld("commit_unlearned");
             return;
         }
         let commit = self.cnc.counters().commit.load_acquire();
         let consumed = self.cluster_view.consumed.load(Ordering::Acquire);
         if consumed < commit {
+            self.note_declared_withheld("walk_behind");
             return;
         }
         self.cnc.store_services_declared(self.services.declared());
@@ -5488,6 +5510,50 @@ impl Consensus {
             Info,
             "services_declared_published",
             node = self.id as u64,
+            commit = commit,
+            cluster_position = consumed
+        );
+    }
+
+    /// Plan B3 final review F3: the gate above can refuse EVERY attach on
+    /// this node, and until now it said nothing while it did — it logs only
+    /// on success, so a held node was diagnosed by the ABSENCE of
+    /// `services_declared_published` while the attaching side reported
+    /// `NodeBooting` without naming a cause. One edge-triggered `Warn`, once
+    /// per incarnation, naming the clause that is false and the two numbers
+    /// it turns on.
+    ///
+    /// Edge, not rate: a node held for good would otherwise emit forever, and
+    /// the second line would say nothing the first did not. The counter stops
+    /// climbing the moment the gate opens (this is only reached from
+    /// [`Self::maybe_publish_declared`], itself behind
+    /// `!self.declared_published`), so the steady path is untouched — one
+    /// `u32` increment on the pre-attach passes only.
+    ///
+    /// [`DECLARED_WITHHELD_WARN_PASSES`] is in PASSES, not nanoseconds,
+    /// because the consensus agent's duty cycle is the only clock this seam
+    /// has cheaply to hand. An idle leader's pass measured ~311 ns mean on a
+    /// dev box (2026-09-07 harness smoke, the same reading `NS_BUCKETS`'s
+    /// floor is set from), so 3 000 000 passes is ~0.9 s there. It is a
+    /// threshold for a human-readable warning, not a timeout: a slower or
+    /// loaded box stretches it, which costs nothing because the record is
+    /// edge-triggered and the gate is not.
+    fn note_declared_withheld(&mut self, clause: &'static str) {
+        if self.declared_withheld_warned {
+            return;
+        }
+        self.declared_withheld_passes += 1;
+        if self.declared_withheld_passes < DECLARED_WITHHELD_WARN_PASSES {
+            return;
+        }
+        self.declared_withheld_warned = true;
+        let commit = self.cnc.counters().commit.load_acquire();
+        let consumed = self.cluster_view.consumed.load(Ordering::Acquire);
+        crate::obs_event!(
+            Warn,
+            "services_declared_withheld",
+            node = self.id as u64,
+            clause = clause,
             commit = commit,
             cluster_position = consumed
         );
@@ -6365,15 +6431,13 @@ impl Consensus {
     /// The row's COMMITTED report position — `0` when the cluster FSM holds
     /// no report for it yet. Read from the view rather than kept as a field
     /// because the record is applied by the `uc2-cluster` agent, not here,
-    /// and a shadow copy could only be wrong. Costs one seqlock-guarded
-    /// clone, on paths that run at most once per report and once per append
-    /// (never per pass).
+    /// and a shadow copy could only be wrong. One lock-guarded scalar read
+    /// (`ClusterView::report_position_for`), on paths that run at most once
+    /// per report and once per append (never per pass) — it used to clone the
+    /// whole `ClusterState`, pin history included, to read this `u64` (final
+    /// review, minor 7).
     fn held_report_position(&self, row: u8) -> u64 {
-        self.cluster_view
-            .to_state()
-            .report_for(row)
-            .map(|r| r.position)
-            .unwrap_or(0)
+        self.cluster_view.report_position_for(row).unwrap_or(0)
     }
 
     /// Plan B3 (spec §6.5.2), the LEADER-side collector: take one node's
@@ -6537,6 +6601,14 @@ impl Consensus {
     /// On `WouldOverrun` the entry is KEPT — the buffer was momentarily full,
     /// nothing was appended, and the set is still the newest thing this leader
     /// knows about that row.
+    ///
+    /// `#[inline(never)]` (final review, minor 6): `do_work`'s comment claims
+    /// "one `is_empty` test on the steady path, which is the whole of its
+    /// cost here", and that is only true while this ~90-line body stays out
+    /// of line. The 2.11.0 apply-hop regression was precisely a hot caller
+    /// outgrowing its inlining budget, so the claim is pinned rather than
+    /// left to LLVM — as it already is on `maybe_publish_declared`.
+    #[inline(never)]
     fn maybe_append_snapshot_reports(&mut self) -> bool {
         if self.pending_snapshot_reports.is_empty() {
             return false;
@@ -11665,6 +11737,35 @@ mod tests {
         OBS_CAPTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// Hold the captured obs sink for a scope and RESTORE it on drop — the
+    /// hygiene half of the lock above (final review, minor 13; the same guard
+    /// `uc_node/tests/snapshot_reports.rs` already carries). These tests used
+    /// to call `capture_for_tests()` … assertions … `stderr_for_tests()` by
+    /// hand, so a panicking assertion — the normal way a test fails — left
+    /// the PROCESS-GLOBAL sink captured for every later test in this binary,
+    /// which is exactly the class `OBS_CAPTURE_LOCK` was added to fix.
+    ///
+    /// The lock discipline is unchanged: `let _obs = obs_capture_lock();`
+    /// still comes first, once per test, and this guard nests inside it.
+    struct ObsCapture(Arc<Mutex<Vec<u8>>>);
+
+    impl ObsCapture {
+        fn take() -> Self {
+            Self(crate::obs::log::capture_for_tests())
+        }
+
+        /// The capture buffer, as the by-hand `let buf = …` sites used it.
+        fn buf(&self) -> Arc<Mutex<Vec<u8>>> {
+            Arc::clone(&self.0)
+        }
+    }
+
+    impl Drop for ObsCapture {
+        fn drop(&mut self) {
+            crate::obs::log::stderr_for_tests();
+        }
+    }
+
     /// As [`harness`], but with the cluster FSM's GENESIS settings seeded from
     /// `[settings]` in `node.toml` — the thing `NodeConfig::settings_genesis`
     /// carries. The default is `Settings::genesis_default()` (every field
@@ -11977,6 +12078,8 @@ mod tests {
             fsm_lag_eff: crate::services::fsm_lag_eff(&services, 1 << 16, 4096),
             services,
             declared_published: false,
+            declared_withheld_passes: 0,
+            declared_withheld_warned: false,
             snap_stats: Arc::new(uc_net::receiver::FollowerStats::default()),
             last_snap_refusals: (0, 0, 0, 0, 0),
             min_applied: u64::MAX,
@@ -12933,7 +13036,8 @@ mod tests {
         h.cons.pass_mono_ns = 1_000;
         let p = 6048u64;
 
-        let buf = crate::obs::log::capture_for_tests();
+        let cap = ObsCapture::take();
+        let buf = cap.buf();
         h.cons.on_snap_report(1, 0, p, 0xA1);
         assert!(
             !h.cons.maybe_append_snapshot_reports(),
@@ -12950,7 +13054,6 @@ mod tests {
             "every voter has reported — and the leader does not wait out its timeout"
         );
         let text = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
-        crate::obs::log::stderr_for_tests();
 
         let end = h.cons.last_cluster_append;
         h.commit_through(end);
@@ -13010,10 +13113,10 @@ mod tests {
             "two of three voters is a quorum, and a quorum is not the trigger"
         );
         h.cons.pass_mono_ns += SNAP_REPORT_TIMEOUT_NS;
-        let buf = crate::obs::log::capture_for_tests();
+        let cap = ObsCapture::take();
+        let buf = cap.buf();
         assert!(h.cons.maybe_append_snapshot_reports(), "5 s is up");
         let text = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
-        crate::obs::log::stderr_for_tests();
 
         let end = h.cons.last_cluster_append;
         h.commit_through(end);
@@ -13064,10 +13167,10 @@ mod tests {
             "a nanosecond short of the timeout still waits"
         );
         h.cons.pass_mono_ns += 1;
-        let buf = crate::obs::log::capture_for_tests();
+        let cap = ObsCapture::take();
+        let buf = cap.buf();
         assert!(h.cons.maybe_append_snapshot_reports(), "5 s is up");
         let text = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
-        crate::obs::log::stderr_for_tests();
 
         let end = h.cons.last_cluster_append;
         h.commit_through(end);
@@ -13223,11 +13326,11 @@ mod tests {
              commit could still be unapplied here"
         );
 
-        let buf = crate::obs::log::capture_for_tests();
+        let cap = ObsCapture::take();
+        let buf = cap.buf();
         h.commit_through(commit); // one `uc2-cluster` cycle: the walk reaches commit
         h.cons.do_work();
         let text = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
-        crate::obs::log::stderr_for_tests();
 
         assert_eq!(h.cons.cnc.services_declared(), 0b1);
         assert!(
@@ -13250,6 +13353,103 @@ mod tests {
             h.cons.cnc.services_declared(),
             0xDEAD,
             "the gate stores the declared set once, not every pass"
+        );
+    }
+
+    /// Final review F3: a node the gate holds used to say NOTHING — it logs
+    /// only on success, so "my service will not start" was diagnosed by the
+    /// absence of `services_declared_published` while the attaching side
+    /// reported `NodeBooting` without naming a cause. After
+    /// [`DECLARED_WITHHELD_WARN_PASSES`] passes with the gate shut the node
+    /// names the clause that is false and the two numbers it turns on —
+    /// ONCE per incarnation, because a node held for good would otherwise
+    /// emit the same line forever.
+    ///
+    /// Driven by calling the gate directly rather than through `do_work`:
+    /// the counter counts gate passes, `do_work` only reaches the gate while
+    /// it is shut, and three million duty cycles is not a unit test.
+    #[test]
+    fn a_gate_that_stays_shut_names_the_clause_holding_it_exactly_once() {
+        let _obs = obs_capture_lock();
+        let mut h = harness_with_rows(&["count"]);
+        assert_eq!(
+            h.cons.cnc.status().leader_hint.load_acquire(),
+            u64::MAX,
+            "precondition: no leader is known, so clause (a) is the false one"
+        );
+        let cap = ObsCapture::take();
+        let buf = cap.buf();
+
+        for _ in 0..DECLARED_WITHHELD_WARN_PASSES - 1 {
+            h.cons.maybe_publish_declared();
+        }
+        let text = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(
+            !text.contains("services_declared_withheld"),
+            "nothing is said below the threshold: {text}"
+        );
+
+        // The threshold pass, and one after it.
+        h.cons.maybe_publish_declared();
+        h.cons.maybe_publish_declared();
+        let text = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert_eq!(
+            text.matches(r#""event":"services_declared_withheld""#)
+                .count(),
+            1,
+            "edge-triggered, once per incarnation: {text}"
+        );
+        assert!(
+            text.contains(r#""clause":"leader_unknown""#),
+            "the record names WHICH clause is false: {text}"
+        );
+        assert!(
+            text.contains(r#""commit":0"#) && text.contains(r#""cluster_position":0"#),
+            "…with the two numbers the clause turns on: {text}"
+        );
+        assert_eq!(
+            h.cons.cnc.services_declared(),
+            0,
+            "the warning is a diagnostic: it does not open the gate"
+        );
+    }
+
+    /// The other half: a gate that opens on its first pass never warns. The
+    /// counter only advances while the gate is shut, and `do_work` stops
+    /// reaching it once the set is published — so the steady state of a
+    /// healthy node is silence, not a line per boot.
+    #[test]
+    fn a_gate_that_opens_on_the_first_pass_never_warns() {
+        let _obs = obs_capture_lock();
+        let mut h = harness_with_rows(&["count"]);
+        h.cons.cnc.status().leader_hint.store_release(0); // (a)
+        h.cons.feed(Event::CommitGossip {
+            term: 2,
+            commit: 6016,
+        }); // (a')
+        h.commit_through(6016); // (b)
+        let cap = ObsCapture::take();
+        let buf = cap.buf();
+
+        for _ in 0..4 {
+            h.cons.do_work();
+        }
+        assert!(
+            h.cons.declared_published,
+            "the gate opened on the first pass"
+        );
+        let text = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(
+            text.contains(r#""event":"services_declared_published""#),
+            "precondition: this is the publishing path: {text}"
+        );
+        assert!(
+            !text.contains("services_declared_withheld"),
+            "a gate that never shut must not warn: {text}"
+        );
+        assert_eq!(
+            h.cons.declared_withheld_passes, 0,
+            "the counter never advanced"
         );
     }
 
@@ -13321,10 +13521,10 @@ mod tests {
 
         h.cons.on_snap_report(0, 0, p1, 0x11);
         h.cons.pass_mono_ns += 1_000;
-        let buf = crate::obs::log::capture_for_tests();
+        let cap = ObsCapture::take();
+        let buf = cap.buf();
         h.cons.on_snap_report(2, 0, p2, 0x22);
         let text = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
-        crate::obs::log::stderr_for_tests();
 
         let pend = &h.cons.pending_snapshot_reports[&0];
         assert_eq!(pend.position, p2, "the newer instant took the slot");
@@ -13594,13 +13794,13 @@ mod tests {
             "no voter reported, so it is not ready yet — it waits out the timeout"
         );
         h.cons.pass_mono_ns += SNAP_REPORT_TIMEOUT_NS;
-        let buf = crate::obs::log::capture_for_tests();
+        let cap = ObsCapture::take();
+        let buf = cap.buf();
         assert!(
             !h.cons.maybe_append_snapshot_reports(),
             "ready, but there is nothing left to attest with"
         );
         let text = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
-        crate::obs::log::stderr_for_tests();
 
         assert!(
             h.cons.pending_snapshot_reports.is_empty(),
@@ -13644,13 +13844,13 @@ mod tests {
             .expect("the record append");
         h.commit_through(end);
 
-        let buf = crate::obs::log::capture_for_tests();
+        let cap = ObsCapture::take();
+        let buf = cap.buf();
         assert!(
             h.cons.maybe_append_snapshot_reports(),
             "row 0 is stale, but row 1 still lands in this pass"
         );
         let text = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
-        crate::obs::log::stderr_for_tests();
 
         assert!(
             h.cons.pending_snapshot_reports.is_empty(),
@@ -14834,10 +15034,10 @@ mod tests {
         // module swap it. Other tests still add noise LINES to the buffer
         // while it is installed — the assertions below look for a record, not
         // for an exact transcript.
-        let buf = crate::obs::log::capture_for_tests();
+        let cap = ObsCapture::take();
+        let buf = cap.buf();
         pass_checking_the_gate(&mut h);
         let text = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
-        crate::obs::log::stderr_for_tests();
 
         assert!(
             matches!(
@@ -14873,13 +15073,13 @@ mod tests {
         // ONE voter proves the rung: self + 1 = 2 of 3 is a quorum, so the
         // gate passes with proof while the other member stays silent — the
         // dead-host case, resolved in one probe round instead of an outage.
-        let buf = crate::obs::log::capture_for_tests();
+        let cap = ObsCapture::take();
+        let buf = cap.buf();
         h.cons
             .probe_table
             .on_ack(peers[0], MTU_BOUND as u32, MTU_BOUND as u32);
         pass_checking_the_gate(&mut h);
         let text = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
-        crate::obs::log::stderr_for_tests();
 
         assert_eq!(h.cons.jumbo_gate, Some(JumboGate::Passed));
         assert!(
@@ -15193,13 +15393,13 @@ mod tests {
         // ONE proven voter is enough for a learner: its frames come from the
         // leader, a voter, and it needs no quorum for anything. The record
         // still says how many of the voters it was.
-        let buf = crate::obs::log::capture_for_tests();
+        let cap = ObsCapture::take();
+        let buf = cap.buf();
         h.cons
             .probe_table
             .on_ack(peers[0], MTU_BOUND as u32, MTU_BOUND as u32);
         pass_checking_the_gate(&mut h);
         let text = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
-        crate::obs::log::stderr_for_tests();
         assert_eq!(h.cons.jumbo_gate, Some(JumboGate::Passed), "1 of 2 voters");
         assert!(
             text.contains(r#""event":"jumbo_gate_passed""#)
@@ -15292,7 +15492,8 @@ mod tests {
         // The interval elapses: one record, and the deadline moves a whole
         // interval forward from THIS pass's clock — so the very next poll,
         // one tick later, is inside the new interval again.
-        let buf = crate::obs::log::capture_for_tests();
+        let cap = ObsCapture::take();
+        let buf = cap.buf();
         h.cons.pass_mono_ns = first_deadline;
         h.cons.jumbo_check_ns = 0;
         assert!(!h.cons.check_jumbo_gate());
@@ -15302,7 +15503,6 @@ mod tests {
             "re-seeded by the log"
         );
         let text = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
-        crate::obs::log::stderr_for_tests();
         assert!(
             text.contains(r#""event":"jumbo_join_gate_holding""#)
                 && text.contains(r#""committed":8960,"proven_voters":0,"voters":3,"self_vote":1"#)
@@ -15391,13 +15591,13 @@ mod tests {
         );
         assert!(!h.cons.can_serve_flag.load(Ordering::Acquire));
 
-        let buf = crate::obs::log::capture_for_tests();
+        let cap = ObsCapture::take();
+        let buf = cap.buf();
         h.cons
             .probe_table
             .on_ack(voters[0], MTU_BOUND as u32, MTU_BOUND as u32);
         pass_checking_the_gate(&mut h);
         let text = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
-        crate::obs::log::stderr_for_tests();
         assert_eq!(h.cons.jumbo_gate, Some(JumboGate::Passed));
         assert!(
             text.contains(r#""proven_voters":1,"voters":3"#),

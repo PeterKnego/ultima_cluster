@@ -773,6 +773,26 @@ impl ClusterView {
         self.inner.lock().unwrap().clone()
     }
 
+    /// The committed `SnapshotReport` position for one row — `None` when the
+    /// cluster FSM holds no record for it yet.
+    ///
+    /// A scalar read under the same lock, rather than
+    /// [`Self::to_state`]: the leader's collector asks this question once per
+    /// received report and once per ready row at append, and `to_state`
+    /// clones the membership, the schedule table, the pin history and the
+    /// report list to answer it (final review, minor 7). Nothing about the
+    /// answer needs the rest of the state, and the allocation it avoided
+    /// grows with the pin history.
+    pub fn report_position_for(&self, row: u8) -> Option<u64> {
+        self.inner
+            .lock()
+            .unwrap()
+            .reports
+            .iter()
+            .find(|r| r.row == row)
+            .map(|r| r.position)
+    }
+
     /// The view as a [`ClusterState`] — the inner clone plus the five scalar
     /// atomics, with `applied` taken from `position`.
     ///
