@@ -1312,20 +1312,30 @@ impl Node {
         // `0` only for a fresh instance dir (empty journal).
         cnc.store_log_time_ns(archive.recovered_log_time_ns());
 
-        // M14a: the declared set and the lag policy, published ONCE, before
-        // any agent runs; services and clients read them from the page.
+        // M14a: the lag policy, published ONCE, before any agent runs;
+        // services and clients read it from the page.
         //
         // Lag BEFORE declared, deliberately. A service can attach between
-        // `create_file` (a complete header, names on line 7) and these two
-        // stores; it refuses a page with names and `services_declared == 0`
-        // as "booting" (`uc_service::attach`). That check can only cover the
-        // gap if a nonzero declared set implies the lag policy is already on
-        // the page — otherwise the sub-window between the two stores reads as
-        // a legitimate lockstep config (`fsm_lag_bytes == 0`) and cannot be
-        // told apart. Both stores are Release and the reader's loads Acquire,
-        // so observing the declared set orders the lag word before it.
+        // `create_file` (a complete header, names on line 7) and the
+        // `store_services_declared` far below; it refuses a page with names
+        // and `services_declared == 0` as "booting" (`uc_service::attach`).
+        // That check can only cover the gap if a nonzero declared set implies
+        // the lag policy is already on the page — otherwise the sub-window
+        // between the two stores reads as a legitimate lockstep config
+        // (`fsm_lag_bytes == 0`) and cannot be told apart. Both stores are
+        // Release and the reader's loads Acquire, so observing the declared
+        // set orders the lag word before it.
+        //
+        // Plan B2 (final review C1): …and the recovered PIN words, published
+        // by the cluster agent's constructor, precede BOTH. `store_services_
+        // declared` is therefore no longer here: it is the LAST thing done
+        // before the agents run, after `ClusterAgent::new` has republished
+        // every pinned row's words. An attach that passes the booting gate on
+        // a page whose pin words were still zero would read `PinRead::NoPin`
+        // and take the unpinned path — on the default purge-off posture a
+        // silent genesis replay under the new binary (spec §2.3), with no
+        // refusal and no log line.
         cnc.store_fsm_lag_bytes(cfg.services.page_lag_value(cfg.buffer_bytes as u64));
-        cnc.store_services_declared(cfg.services.declared());
 
         // 4. Log buffer file: reuse the existing file when it already matches the
         // configured capacity (preserves ring bytes below `durable` across a
@@ -2128,6 +2138,20 @@ impl Node {
             Arc::clone(&cluster_installed),
             Arc::clone(&snapshot_standby_instant_pub),
         );
+        // M14a + plan B2 (final review C1): the declared set, published ONCE
+        // and LAST of the boot-time page words — see the `store_fsm_lag_bytes`
+        // comment above. `ClusterAgent::new` has just republished the pin
+        // words of every row its recovered artifact pins, so a service that
+        // passes the "booting" gate the instant this store lands already
+        // reads its row's real pin. Both stores are Release; the attach path's
+        // loads are Acquire, so observing a nonzero declared set orders the
+        // lag word AND the pin words before it.
+        //
+        // What this does NOT cover, by design (plan B3): a pin committed
+        // after this node's newest cluster artifact is invisible until the
+        // agent below replays up to it. Closing that needs the live reports,
+        // not a boot ordering.
+        cnc.store_services_declared(cfg.services.declared());
         let cluster_runner = AgentRunner::spawn("uc2-cluster", IdleStrategy::Yield, move || {
             cluster_agent.do_work()
         })?;

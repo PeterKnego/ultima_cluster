@@ -924,6 +924,106 @@ fn a_pinned_attach_survives_a_cadence_instant_after_the_pin() {
     f.stop();
 }
 
+/// Plan B2 (final review C1): a service that attaches in the node's BOOT
+/// WINDOW must not silently take the unpinned path.
+///
+/// `uc_service::attach` uses `services_declared != 0` as "this page is
+/// ready"; the pin words are republished by `ClusterAgent::new`'s
+/// `publish_view`, which the node constructs hundreds of lines further into
+/// `Node::start` (log-buffer open, journal recovery, artifact recovery). With
+/// the declared set stored first, an attach landing in that window reads
+/// `PinRead::NoPin` on a page whose row IS pinned and replays from genesis
+/// under the new binary — the §2.3 counterfactual, with no refusal and no log
+/// line. The node therefore stores the declared set LAST.
+///
+/// The test watches the page from a second thread and samples the pin words
+/// at the exact instant the declared set becomes visible. It re-opens the
+/// file every turn and ignores every page still carrying the PREVIOUS boot's
+/// `instance_id`, so it can only ever report the restarted node's own page.
+///
+/// It lives here rather than in `uc_node` because the subject is
+/// attach-visible state and because a committed pin needs a complete snapshot
+/// set at the origin — i.e. this file's fixture (a node, a v1 service, an
+/// instant and admin op 10). Scope: the pin must be in the cluster artifact
+/// the restart recovers from. A pin committed ABOVE this node's newest
+/// artifact stays invisible until the cluster agent replays up to it; that
+/// gate is plan B3's live reports, not a boot ordering.
+#[test]
+fn a_restarted_node_publishes_the_pin_before_the_declared_set() {
+    let (f, svc1) = Fixture::build_with_v1("pin-bootorder", Spec::small());
+    let Fixture { dir, app, node, p } = f;
+    let origin = p;
+    let cnc = open_cnc(dir.path(), app);
+
+    // A REAL pin: the boot-time republish reads the cluster FSM, not the slot
+    // words, so `Fixture::pin` would prove nothing here.
+    pin_via_admin(dir.path(), &cnc, 0, V1, V2, origin);
+    wait_until("the pin reached the row's slot words", || {
+        cnc.service_slot(0).status.pin()
+            == uc_log::cnc::PinRead::Pinned {
+                origin,
+                from: V1,
+                to: V2,
+            }
+    });
+    // …and it must be INSIDE the artifact the restart recovers from: one more
+    // instant, above the pin's own frame, freezes the cluster FSM with it.
+    let p2 = command_instant(&node);
+    let cluster_art = dir
+        .path()
+        .join("snapshots")
+        .join("cluster")
+        .join(format!("snap-{p2}.ultcluster"));
+    wait_until("the cluster artifact above the pin", || {
+        cluster_art.is_file()
+    });
+
+    let old_instance = cnc.try_meta().expect("meta").instance_id;
+    drop(cnc);
+    svc1.stop();
+    node.stop();
+
+    // The watcher: spin until a page with a NEW `instance_id` publishes a
+    // nonzero declared set, then sample that same page's pin words. Bounded,
+    // and it reports rather than panics off-thread.
+    let cnc_path = dir.path().join("cnc2.dat");
+    let watcher = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if let Ok(page) = CncPage::open_file(&cnc_path, app) {
+                let fresh = page
+                    .try_meta()
+                    .is_some_and(|m| m.instance_id != old_instance);
+                if fresh && page.services_declared() != 0 {
+                    return Some(page.service_slot(0).status.pin());
+                }
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::yield_now();
+        }
+    });
+
+    let node2 = start_node(dir.path(), app, PurgePolicy::Disabled, SEGMENT_BYTES);
+    let sampled = watcher.join().expect("watcher panicked");
+    let expected = uc_log::cnc::PinRead::Pinned {
+        origin,
+        from: V1,
+        to: V2,
+    };
+    assert_eq!(
+        sampled,
+        Some(expected),
+        "the pin words must already be published when the declared set turns \
+         on — an attach passing the booting gate any earlier reads NoPin"
+    );
+    // And the same state is what an attach sees once `Node::start` returns.
+    let cnc2 = open_cnc(dir.path(), app);
+    assert_eq!(cnc2.service_slot(0).status.pin(), expected);
+    node2.stop();
+}
+
 // ------------------------------------------------- the durable-SM stand-in
 
 /// Walk the archived log `[0, end)` and apply every MESSAGE frame through
