@@ -37,18 +37,18 @@ use uc_protocol::v2::datagram::{
     DGRAM_KIND_NAK, DGRAM_KIND_PROBE, DGRAM_KIND_PROBE_ACK, DGRAM_KIND_READ_PROBE,
     DGRAM_KIND_READ_PROBE_ACK, DGRAM_KIND_REQUEST_VOTE, DGRAM_KIND_SNAP_BEGIN,
     DGRAM_KIND_SNAP_CHUNK, DGRAM_KIND_SNAP_DONE, DGRAM_KIND_SNAP_NAK, DGRAM_KIND_SNAP_REDIRECT,
-    DGRAM_KIND_SNAP_REQUEST, DGRAM_KIND_STATUS, DGRAM_KIND_TERM_MAP, DGRAM_KIND_VOTE,
-    DatagramHeader, MAX_TERM_MAP_WIRE_ENTRIES, NAK_BODY_LEN, NakBody, PROBE_ACK_BODY_LEN,
-    ProbeAckBody, REQUEST_VOTE_BODY_LEN, RequestVoteBody, SNAP_BEGIN_FIXED_LEN,
+    DGRAM_KIND_SNAP_REPORT, DGRAM_KIND_SNAP_REQUEST, DGRAM_KIND_STATUS, DGRAM_KIND_TERM_MAP,
+    DGRAM_KIND_VOTE, DatagramHeader, MAX_TERM_MAP_WIRE_ENTRIES, NAK_BODY_LEN, NakBody,
+    PROBE_ACK_BODY_LEN, ProbeAckBody, REQUEST_VOTE_BODY_LEN, RequestVoteBody, SNAP_BEGIN_FIXED_LEN,
     SNAP_BEGIN_LAYOUT_V4, SNAP_NAK_BODY_LEN, SNAP_REQUEST_BODY_LEN, STATUS_BODY_LEN, SnapBeginBody,
     SnapNakBody, SnapRequestBody, StatusBody, TermMapEntryWire, VOTE_BODY_LEN, VoteBody,
     read_append_position_body, read_config_proposal_body, read_config_reply_body,
     read_datagram_header, read_nak_body, read_probe_ack_body, read_probe_rung,
     read_read_probe_body, read_request_vote_body, read_snap_begin_body, read_snap_nak_body,
-    read_snap_redirect_body, read_snap_request_body, read_status_body, read_term_map_body,
-    read_vote_body, write_append_position_body, write_datagram_header, write_nak_body,
-    write_probe_ack_body, write_snap_begin_body, write_snap_nak_body, write_snap_request_body,
-    write_status_body,
+    read_snap_redirect_body, read_snap_report_body, read_snap_request_body, read_status_body,
+    read_term_map_body, read_vote_body, write_append_position_body, write_datagram_header,
+    write_nak_body, write_probe_ack_body, write_snap_begin_body, write_snap_nak_body,
+    write_snap_request_body, write_status_body,
 };
 use uc_protocol::v2::frame::{self, FRAME_TYPE_PADDING, HEADER_LEN, align_frame_len};
 
@@ -251,6 +251,18 @@ pub enum NetEvent {
         learner_id: u32,
         position: u64,
     },
+    /// Plan B3 (kind 26): a node's live report of one row's snapshot artifact
+    /// hash at the position it just froze. `from` is the reporting node's own
+    /// id (from the body, not the socket address — the leader's collector
+    /// keys on node id). Term-independent, like the probe pair: routed here
+    /// before the stale-term drop rather than through `consensus_event`'s
+    /// kinds 5–11 (`is_consensus_kind` is deliberately NOT widened for it).
+    SnapReport {
+        from: u32,
+        row: u8,
+        position: u64,
+        hash: u64,
+    },
 }
 
 impl NetEvent {
@@ -270,12 +282,13 @@ impl NetEvent {
             NetEvent::ConfigProposal { .. } => 8,
             NetEvent::ConfigReply { .. } => 9,
             NetEvent::SnapRedirect { .. } => 10,
+            NetEvent::SnapReport { .. } => 11,
         }
     }
 }
 
 /// Number of [`NetEvent`] kinds (the width of the per-kind drop counters).
-pub const NET_EVENT_KINDS: usize = 11;
+pub const NET_EVENT_KINDS: usize = 12;
 
 /// Parse a consensus-plane datagram (kinds 5–11) into a [`NetEvent`], RAW — no
 /// term filter (the SM adopts higher terms). `from` is the datagram's source
@@ -1968,6 +1981,30 @@ impl FollowerReceiver {
         // before the term filter below.
         if matches!(h.kind, DGRAM_KIND_PROBE | DGRAM_KIND_PROBE_ACK) {
             self.on_probe(h.kind, &d[DATAGRAM_HEADER_LEN..], from);
+            return;
+        }
+        // Plan B3: a snapshot-hash report is term-independent too (a hash is
+        // a hash regardless of who is leading this term), so it is handled
+        // here rather than in the term-gated `match h.kind` below where
+        // `SNAP_REDIRECT` sits — that match only runs after the stale-term
+        // drop a few lines down, which is correct for `SNAP_REDIRECT` (it
+        // answers a NAK tied to the current transfer) but wrong for this
+        // kind. Not added to `is_consensus_kind`/`consensus_event` either:
+        // those forward RAW to the SM's term-adoption path, and a report
+        // carries no term at all to adopt.
+        if h.kind == DGRAM_KIND_SNAP_REPORT {
+            if let Some(b) = read_snap_report_body(&d[DATAGRAM_HEADER_LEN..]) {
+                let ev = NetEvent::SnapReport {
+                    from: b.node_id,
+                    row: b.row,
+                    position: b.position,
+                    hash: b.hash,
+                };
+                let idx = ev.kind_idx();
+                if self.route.try_send(ev).is_err() {
+                    self.stats.net_drops[idx].fetch_add(1, Ordering::Relaxed);
+                }
+            }
             return;
         }
         // Consensus kinds (5–11) are forwarded RAW to the consensus agent — no
@@ -4190,6 +4227,72 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Plan B3 (kind 26): a valid `SNAP_REPORT` yields `NetEvent::SnapReport`
+    /// on the route channel, at a term ABOVE the receiver's own — like the
+    /// read-barrier kinds above, term-independence is verified by a
+    /// deliberately mismatched term, not just an untested match. A body that
+    /// fails its own decode (bad reserved bytes) yields nothing.
+    #[test]
+    fn snap_report_kind_routes_raw_and_rejects_a_malformed_body() {
+        use uc_protocol::v2::datagram::{
+            SNAP_REPORT_BODY_LEN, SnapReportBody, write_snap_report_body,
+        };
+
+        let b = buffer();
+        let mut leader = FakeLeader::new();
+        let (tx, rx) = mpsc::sync_channel::<NetEvent>(16);
+        let mut r = follower_routed(&b, leader.addr(), tx);
+        let to = r.local_addr();
+
+        let mut body = vec![0u8; SNAP_REPORT_BODY_LEN];
+        write_snap_report_body(
+            &mut body,
+            &SnapReportBody {
+                row: 3,
+                node_id: 7,
+                position: 8192,
+                hash: 0xDEAD_BEEF_0000_0001,
+            },
+        );
+        // Term ABOVE the receiver's own — must NOT be term-filtered.
+        leader.send(to, DGRAM_KIND_SNAP_REPORT, 0, TERM + 9, &body);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut saw = false;
+        while !saw {
+            assert!(Instant::now() < deadline, "SNAP_REPORT never routed");
+            r.do_work();
+            while let Ok(ev) = rx.try_recv() {
+                if let NetEvent::SnapReport {
+                    from,
+                    row,
+                    position,
+                    hash,
+                } = ev
+                {
+                    assert_eq!(
+                        (from, row, position, hash),
+                        (7, 3, 8192, 0xDEAD_BEEF_0000_0001)
+                    );
+                    saw = true;
+                }
+            }
+        }
+
+        // A malformed body (non-zero reserved byte) must yield nothing.
+        let mut bad = body.clone();
+        bad[2] = 1;
+        leader.send(to, DGRAM_KIND_SNAP_REPORT, 0, TERM + 9, &bad);
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while Instant::now() < deadline {
+            r.do_work();
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "a malformed SNAP_REPORT body must not route"
+        );
     }
 
     /// M7 Task 7: kinds 16/17 (the admin-forward proposal/reply) route RAW to

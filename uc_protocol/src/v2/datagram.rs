@@ -488,6 +488,13 @@ pub const DGRAM_KIND_PROBE: u8 = 24;
 /// the leader learns every pair's result without a second exchange.
 /// `Scope::Pairwise`.
 pub const DGRAM_KIND_PROBE_ACK: u8 = 25;
+/// Plan B3 (wire 0.9.0, `2.13.0`): a node reports one row's snapshot artifact
+/// hash at the position it just froze, live — not carried on the log the way
+/// `CLUSTER kind = 5 SnapshotReport` (the leader's committed record of the
+/// collected hashes) is. Body = [`SnapReportBody`]. Term-independent like the
+/// probe pair (a hash is a hash regardless of who is leading), so a receiver
+/// admits it before the stale-term drop. `Scope::Pairwise`.
+pub const DGRAM_KIND_SNAP_REPORT: u8 = 26;
 
 /// The fixed prefix of a `PROBE` body: the rung, `u32 LE`. Everything after it
 /// is padding and carries nothing.
@@ -529,6 +536,57 @@ pub fn read_probe_ack_body(buf: &[u8]) -> Option<ProbeAckBody> {
     Some(ProbeAckBody {
         rung: u32::from_le_bytes(buf[0..4].try_into().unwrap()),
         own_min_rung: u32::from_le_bytes(buf[4..8].try_into().unwrap()),
+    })
+}
+
+pub const SNAP_REPORT_BODY_LEN: usize = 24;
+
+/// Plan B3: "row `row` froze its artifact at `position` with hash `hash`" —
+/// the sending node's own id is `node_id` (the reporter, not necessarily this
+/// datagram's source address once a follower's forward is ever added; today
+/// it always is the source). LE: row 0, reserved 1..4 (zero), node_id 4..8,
+/// position 8..16, hash 16..24.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SnapReportBody {
+    pub row: u8,
+    pub node_id: u32,
+    pub position: u64,
+    pub hash: u64,
+}
+
+pub fn write_snap_report_body(buf: &mut [u8], b: &SnapReportBody) {
+    buf[0] = b.row;
+    buf[1..4].fill(0);
+    buf[4..8].copy_from_slice(&b.node_id.to_le_bytes());
+    buf[8..16].copy_from_slice(&b.position.to_le_bytes());
+    buf[16..24].copy_from_slice(&b.hash.to_le_bytes());
+}
+
+/// Decode a `SNAP_REPORT` body, or `None` if `buf.len() != SNAP_REPORT_BODY_LEN`,
+/// the reserved bytes are non-zero, `row >= CNC_MAX_SERVICES` (8 declared rows),
+/// or `position == 0` (position 0 is never a legitimate freeze — the log
+/// starts past it — so a zeroed/garbage body is refused rather than silently
+/// misread as row 0's genesis report).
+pub fn read_snap_report_body(buf: &[u8]) -> Option<SnapReportBody> {
+    if buf.len() != SNAP_REPORT_BODY_LEN {
+        return None;
+    }
+    if buf[1..4] != [0, 0, 0] {
+        return None;
+    }
+    let row = buf[0];
+    if row >= 8 {
+        return None;
+    }
+    let position = u64::from_le_bytes(buf[8..16].try_into().unwrap());
+    if position == 0 {
+        return None;
+    }
+    Some(SnapReportBody {
+        row,
+        node_id: u32::from_le_bytes(buf[4..8].try_into().unwrap()),
+        position,
+        hash: u64::from_le_bytes(buf[16..24].try_into().unwrap()),
     })
 }
 
@@ -1375,5 +1433,50 @@ mod tests {
         assert_eq!(read_probe_ack_body(&buf), Some(a));
         assert_eq!(buf, [0, 0x23, 0, 0, 0x80, 0x05, 0, 0]); // 8960 = 0x2300, 1408 = 0x0580
         assert_eq!(read_probe_ack_body(&buf[..7]), None);
+    }
+
+    /// FROZEN once shipped (plan B3): the kind number and the body, with an
+    /// absolute wire pin like `probe_kinds_and_bodies_are_pinned`.
+    #[test]
+    fn snap_report_kind_and_body_are_pinned() {
+        assert_eq!(DGRAM_KIND_SNAP_REPORT, 26);
+        assert_eq!(SNAP_REPORT_BODY_LEN, 24);
+        let b = SnapReportBody {
+            row: 2,
+            node_id: 0x0A0B_0C0D,
+            position: 0x1_0000,
+            hash: 0x0102_0304_0506_0708,
+        };
+        let mut buf = [0u8; SNAP_REPORT_BODY_LEN];
+        write_snap_report_body(&mut buf, &b);
+        assert_eq!(read_snap_report_body(&buf), Some(b));
+        // Absolute LE wire pin: row @0, reserved @1..4 zero, node_id @4..8,
+        // position @8..16, hash @16..24.
+        assert_eq!(
+            buf,
+            [
+                2, 0, 0, 0, // row, reserved
+                0x0D, 0x0C, 0x0B, 0x0A, // node_id
+                0, 0, 1, 0, 0, 0, 0, 0, // position = 0x10000
+                0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, // hash
+            ]
+        );
+        // Refusals: too short, too long (exact-length like SnapRequest/Redirect).
+        assert!(read_snap_report_body(&buf[..SNAP_REPORT_BODY_LEN - 1]).is_none());
+        let mut too_long = [0u8; SNAP_REPORT_BODY_LEN + 1];
+        too_long[..SNAP_REPORT_BODY_LEN].copy_from_slice(&buf);
+        assert!(read_snap_report_body(&too_long).is_none());
+        // Non-zero reserved byte -> refused.
+        let mut bad_reserved = buf;
+        bad_reserved[2] = 1;
+        assert!(read_snap_report_body(&bad_reserved).is_none());
+        // row >= 8 (only 8 declared rows) -> refused.
+        let mut bad_row = buf;
+        bad_row[0] = 8;
+        assert!(read_snap_report_body(&bad_row).is_none());
+        // position == 0 -> refused.
+        let mut bad_position = buf;
+        bad_position[8..16].copy_from_slice(&0u64.to_le_bytes());
+        assert!(read_snap_report_body(&bad_position).is_none());
     }
 }

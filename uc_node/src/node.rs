@@ -7797,6 +7797,15 @@ impl Consensus {
                 self.follow_snap_redirect(learner_id, position);
                 return;
             }
+            // Plan B3 T2: wire-level routing only — kept exhaustive here so
+            // the match compiles. The leader-side collector (dedup per
+            // (row, position), quorum/timeout, `CLUSTER kind = 5
+            // SnapshotReport` append) is Task 4's `on_snap_report`, which
+            // replaces this arm; nothing sends a live `SNAP_REPORT` yet
+            // either (Task 3's job), so dropping it here is a no-op today.
+            NetEvent::SnapReport { .. } => {
+                return;
+            }
         };
         self.feed(event);
     }
