@@ -4,6 +4,23 @@
 //! chain (ruling R-C-1); a stale NEW is a FAIL (the swap arm is refused by
 //! name); a pure-write corpus is INCONCLUSIVE, not a pass; a same-version
 //! run is refused up front.
+//!
+//! **Why the durable case runs `--double-cas` and the empty one does not**
+//! (final review C1, ruling R-C-3). The two cases have different wrong
+//! paths. An EMPTY state machine that ignored the pin would replay from
+//! GENESIS, which is the counterfactual `artifact_eq_genesis` already
+//! computes — so `--double` has teeth there. A DURABLE one that ignored the
+//! pin would CONTINUE FROM X: it would keep the `(P, X]` it persisted. With
+//! `--double` (which rewrites `Cmd::Write` only) OLD and NEW compute the CAS
+//! tail identically — 249 either way — so the artifact path and
+//! continue-from-X land on the same value and the case could not fail on the
+//! rewind it is named for. `--double-cas` (`DoublingCasRegisterSm`, VERSION
+//! 3) also doubles `Cas.new`, which makes the tail's RESULT depend on the
+//! version while its OUTCOME still depends on the state at P: artifact/live
+//! = 400, continue-from-X = 249, genesis = 398, three distinct values. Both
+//! cases additionally require `install_logged` — the SDK's own
+//! `pinned install of snap-P` line — so a skipped install fails the run even
+//! on a span that could not tell the paths apart.
 mod common;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -142,6 +159,11 @@ fn an_in_memory_register_passes_and_demonstrates_the_counterfactual() {
         "the CAS tail makes the paths diverge"
     );
     assert!(
+        rep.swap.install_logged,
+        "NEW must have SAID it ran the pinned install of snap-{}: {}",
+        rep.origin, r.stdout
+    );
+    assert!(
         rep.frontier > rep.origin,
         "OLD must have run past P before the stop"
     );
@@ -150,26 +172,79 @@ fn an_in_memory_register_passes_and_demonstrates_the_counterfactual() {
 /// (b) The durable shape: `--durable` persists `(value, last_applied)`, so
 /// NEW attaches with `last_applied() = X > P` and MUST be rewound to P by
 /// the pinned install (spec §2.3's third path, S4 step 4).
+///
+/// NEW is `--double-cas`, not `--double`, and the difference is the whole
+/// tooth — see the module doc. The three paths over this corpus, all three
+/// arithmetics written out because the case is worthless if they coincide:
+///
+/// - OLD (plain) applies `Write(0..200)` below P, so the artifact at P holds
+///   `199`; above P its CAS chain fires all the way, `199 → 249`, and that
+///   `249` is what `--durable` persisted when OLD was stopped at X.
+/// - **Artifact path** (what the pin is for): install the artifact at P
+///   (`199`), then recompute `(P, X]` under `--double-cas`. The first CAS is
+///   `{old: 199, new: 2·200 = 400}` — `old` is NOT rewritten, so it still
+///   matches — and stores **400**; every later CAS then compares against a
+///   value that is no longer in the chain and fails. Live state = 400.
+/// - **Continue-from-X** (what a NEW that skipped the pinned install would
+///   have): OLD's persisted **249**, untouched.
+/// - **Genesis path**: every write doubled, so the register sits at
+///   `2·199 = 398` when the chain starts, `{old: 199, …}` never matches, and
+///   nothing fires. **398**.
+///
+/// 400 ≠ 249 ≠ 398: `live == artifact` now genuinely excludes the skipped
+/// install, and `artifact != genesis` still excludes the genesis replay.
 #[test]
 fn a_durable_register_is_rewound_to_the_origin_and_passes() {
     let (_inst, corpus) = cas_corpus("pv-durable");
     let r = pin_verify(
         &corpus,
         &["serve", "--durable"],
-        &["serve", "--double", "--durable"],
-        "2",
+        &["serve", "--double-cas", "--durable"],
+        "3",
         "pv-durable",
         Some(WRITES),
     );
     let rep = r.report.expect("report");
     assert!(r.status.success(), "{}", r.stdout);
     assert_eq!(rep.verdict, Verdict::Pass);
+    assert!(
+        rep.swap.install_logged,
+        "NEW must have SAID it ran the pinned install of snap-{} — the observation that a \
+         skipped install cannot fake: {}",
+        rep.origin, r.stdout
+    );
     assert_eq!(
         rep.swap.live_eq_artifact,
         Some(true),
-        "a durable SM that was NOT rewound would carry OLD's (P, X] and differ here"
+        "live={:?} artifact={:?}",
+        rep.swap.live,
+        rep.swap.artifact
     );
-    assert_eq!(rep.swap.artifact_eq_genesis, Some(false));
+    assert_eq!(
+        rep.swap.artifact_eq_genesis,
+        Some(false),
+        "artifact={:?} genesis={:?}",
+        rep.swap.artifact,
+        rep.swap.genesis
+    );
+    // The point of `--double-cas`: the value NEW ended on is the one the
+    // ARTIFACT path computes (2·WRITES), which a NEW that had continued from
+    // OLD's persisted state (WRITES + CAS_TAIL - 1) could not have produced,
+    // and which is not the genesis value (2·(WRITES - 1)) either.
+    let live = rep.swap.live.as_deref().unwrap_or_default();
+    assert!(
+        live.contains(&format!("value=Some({})", 2 * WRITES)),
+        "the artifact path stores 2·{WRITES}={} on the first CAS; continue-from-X would read \
+         value=Some({}) and genesis value=Some({}). live was: {live:?}",
+        2 * WRITES,
+        WRITES + CAS_TAIL - 1,
+        2 * (WRITES - 1)
+    );
+    let genesis = rep.swap.genesis.as_deref().unwrap_or_default();
+    assert!(
+        genesis.contains(&format!("value=Some({})", 2 * (WRITES - 1))),
+        "genesis doubles every write and fires no CAS: {genesis:?}"
+    );
 }
 
 /// (c) Teeth for the swap arm: NEW is the OLD binary (version 0) while the
