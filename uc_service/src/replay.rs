@@ -225,11 +225,37 @@ pub(crate) fn replay_into<S: RawStateMachine>(
             let c = cnc.counters();
             c.commit.load_acquire().min(c.durable.load_acquire())
         };
+        // Plan B2 T5 (spec §3 S4): on a PINNED row the covering artifact is
+        // the one at the pinned ORIGIN whenever it can cover — not the
+        // newest. Between the pin and the old binary's stop, `from` keeps
+        // applying, so a cadence instant can leave a LATER artifact on disk;
+        // it was built by `from`, so the same-version rule below refuses it
+        // and fail-stops the apply thread of a service the cluster
+        // sanctioned. The origin is the ONE artifact this binary is allowed
+        // to cross a version boundary on (`attach` already installed it,
+        // checked against `from`), so it is the one to prefer. It has to
+        // satisfy exactly what any covering artifact does — `>= first`, so
+        // the journal's retained tail continues it with no hole, and
+        // `<= target`, so the install cannot put the SM ahead of what this
+        // node has committed and durable — and when it cannot, the choice
+        // falls back to `newest` unchanged. (A pinned origin BELOW `first`
+        // is a genuinely uncoverable gap for this row; it is left to the
+        // arms below to name, not papered over here.)
         let covering = match restore {
-            Some(r) => r
-                .store
-                .newest(target)
-                .map_err(|e| ServiceError::Replay(e.to_string()))?,
+            Some(r) => {
+                let pinned = instant.pin.and_then(|(origin, _, _)| {
+                    let path = r.store.path_for(origin);
+                    (origin >= first && origin <= target && path.is_file())
+                        .then_some((origin, path))
+                });
+                match pinned {
+                    Some(hit) => Some(hit),
+                    None => r
+                        .store
+                        .newest(target)
+                        .map_err(|e| ServiceError::Replay(e.to_string()))?,
+                }
+            }
             None => None,
         };
         match (restore, covering) {

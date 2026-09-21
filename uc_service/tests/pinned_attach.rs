@@ -32,9 +32,10 @@ use uc_protocol::ring::{MpscProducer, MpscRing, RingError};
 use uc_protocol::v2::cnc::CNC_SVC_STATUS_ATTACHED;
 use uc_protocol::v2::frame::{self, FRAME_TYPE_MESSAGE, HEADER_LEN, align_frame_len};
 use uc_protocol::v2::ipc::{MSG_V2_SUBMIT, extra_client};
-use uc_service::snapshots::EnvelopeError;
+use uc_service::snapshots::{EnvelopeError, SnapshotStore, verify_snapshot_envelope};
 use uc_service::{
-    ApplyCtx, RawStateMachine, Service, ServiceBuilder, ServiceConfig, ServiceError, StateMachine,
+    ApplyCtx, RawStateMachine, Service, ServiceBuilder, ServiceConfig, ServiceError,
+    SnapshotStateMachine, StateMachine,
 };
 
 use uc_lincheck::register::{Cmd as RegCmd, DoublingRegisterSm, RegisterSm};
@@ -678,6 +679,86 @@ fn a_contended_pin_read_is_refused_not_ignored() {
     let cnc = f.cnc();
     wait_service_caught_up(&cnc);
     assert_eq!(query_v2(&svc2), Some(CAS_NEW));
+    svc2.stop();
+    f.stop();
+}
+
+/// Spec §3 S4's other shape, and plan B2 T5's fix: between the pin and the
+/// old binary's stop, `from` KEEPS APPLYING, so a cadence instant can leave a
+/// LATER artifact on disk — one built by `from`, not by the pinned `to`. The
+/// gap guard must then prefer the PINNED ORIGIN over that newer artifact.
+/// Picking the newest (what it did before T5) walks straight into the
+/// unpinned same-version rule (plan B2 T3), and the apply thread of a service
+/// that attached successfully fail-stops with
+/// `MistaggedSnapshot { VersionMismatch { built: V1, expected: V2 } }`.
+///
+/// **Why the later artifact is published here rather than by a second
+/// `command_instant`.** A real later instant completes a real SET, which
+/// advances this node's snapshot floor past the origin — and the journal
+/// purge that follows the floor takes `first` past the origin with it. That
+/// leaves the origin unable to cover the gap at all, which is a DIFFERENT
+/// hazard (S4 with the purge floor already above the origin) and not the one
+/// this fix is about. The state under test — a newer artifact on disk while
+/// the origin is still at or above the purge floor — is what the
+/// floor-persist throttle and a not-yet-complete set at P2 produce on a live
+/// node, and it is reached here deterministically instead: the artifact is a
+/// real v1 image published through the row's OWN [`SnapshotStore`], with the
+/// framework's own envelope and `from`'s version stamp. Nothing is
+/// hand-written.
+#[test]
+fn a_pinned_attach_prefers_the_origin_over_a_later_artifact() {
+    let f = Fixture::build("pin-later-art", Spec::purging());
+    assert!(
+        f.node.archive_first_base() > 0,
+        "precondition: the journal is purged below P"
+    );
+    let cnc = f.cnc();
+    let target = {
+        let c = cnc.counters();
+        c.commit.load_acquire().min(c.durable.load_acquire())
+    };
+
+    // v1's later cadence instant: a genuine v1 image (the artifact at the
+    // origin, read back through the framework's envelope check), republished
+    // at a position in the tail above the origin.
+    let p2 = f.p + HEADER_LEN as u64;
+    assert!(
+        p2 < target,
+        "P2={p2} must sit inside the tail (target={target})"
+    );
+    let store = SnapshotStore::open(f.path(), 0).unwrap();
+    let mut v1 = RegisterSm::default();
+    let mut art = std::fs::File::open(f.artifact()).unwrap();
+    verify_snapshot_envelope(&mut art, f.p, Some(V1)).unwrap();
+    SnapshotStateMachine::install_snapshot(&mut v1, f.p, &mut art).unwrap();
+    let (handle, _) = SnapshotStateMachine::freeze(&v1).unwrap();
+    store
+        .publish(p2, V1, |w| {
+            <RegisterSm as SnapshotStateMachine>::stream_snapshot(handle, w)
+        })
+        .unwrap();
+    assert_eq!(
+        store.newest(target).unwrap().map(|(pos, _)| pos),
+        Some(p2),
+        "precondition: the NEWEST covering artifact is the later one, not the origin"
+    );
+
+    f.pin(V1, V2);
+    let svc2 = ServiceBuilder::new(cfg(f.path(), f.app), DoublingRegisterSm::default())
+        .start_with_snapshots()
+        .unwrap();
+    wait_service_caught_up(&cnc);
+    assert_eq!(
+        query_v2(&svc2),
+        Some(CAS_NEW),
+        "the gap guard must cover the gap with the PINNED origin, not with the \
+         newer artifact `from` left behind"
+    );
+    assert_eq!(svc2.pinned(), Some((f.p, V1, V2)));
+    assert!(
+        store.path_for(p2).is_file(),
+        "the later artifact is left alone, not consumed or deleted"
+    );
     svc2.stop();
     f.stop();
 }
