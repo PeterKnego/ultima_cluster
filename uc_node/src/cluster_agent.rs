@@ -305,7 +305,7 @@ impl ClusterAgent {
                 self.cnc
                     .service_slot(row as usize)
                     .status
-                    .store_pin(p.origin, p.to);
+                    .store_pin(p.origin, p.from, p.to);
             }
         }
     }
@@ -883,7 +883,7 @@ mod tests {
     use uc_consensus::config::{Addr, ClusterConfig};
     use uc_log::archive::{Archive, ArchiveConfig};
     use uc_log::buffer::LogBuffer;
-    use uc_log::cnc::{CncMeta, CncPage};
+    use uc_log::cnc::{CncMeta, CncPage, PinRead};
     use uc_log::region::Region;
     use uc_protocol::v2::cnc::CNC_MAX_SERVICES;
     use uc_protocol::v2::frame::ClusterKind;
@@ -1057,8 +1057,12 @@ mod tests {
         assert!(agent.do_work());
         let s = &cnc.service_slot(2).status;
         assert_eq!(
-            (s.upgrade_origin(), s.pinned_version()),
-            (4096, 0x0101_0000)
+            s.pin(),
+            PinRead::Pinned {
+                origin: 4096,
+                from: 0x0100_0000,
+                to: 0x0101_0000
+            }
         );
         assert_eq!(cnc.service_slot(0).status.upgrade_origin(), 0);
         assert_eq!(agent.applied(), end);

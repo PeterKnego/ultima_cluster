@@ -82,7 +82,7 @@ mod snapshot;
 mod upgrade;
 
 use uc_crypto::admin::{AdminKey, AdminMessage, generate_key_file, sign};
-use uc_log::cnc::{AdminAuth, AdminReq, CncPage, unpack_service_status};
+use uc_log::cnc::{AdminAuth, AdminReq, CncPage, PinRead, unpack_service_status};
 use uc_protocol::identity::VersionDisplay;
 use uc_protocol::v2::cnc::{
     CNC_MAX_PEER_SLOTS, CNC_MAX_SERVICES, CNC_PEER_ROLE_LEARNER, CNC_PEER_ROLE_VOTER,
@@ -1022,21 +1022,26 @@ fn run_status(a: &StatusArgs) -> anyhow::Result<()> {
             .name()
             .map(|n| n.as_str().to_string())
             .unwrap_or_default();
-        // The pair together: a re-pin can otherwise be read half-old
-        // (`ServiceStatusLine::pin`).
-        let pin = s.status.pin().unwrap_or((0, 0));
+        // The triple together: a re-pin can otherwise be read half-old
+        // (`ServiceStatusLine::pin`). `Contended` renders as zeros, same as
+        // `NoPin`.
+        let (origin, from, to) = match s.status.pin() {
+            PinRead::Pinned { origin, from, to } => (origin, from, to),
+            _ => (0, 0, 0),
+        };
         println!(
             "  row={id} name={name} version={} hash=0x{:016x} attached={attached} epoch={} \
              incarnation={incarnation} applied={applied} lag={} snapshot_pos={} \
-             heartbeat_age={age} timers_pending={} upgrade_origin={} pinned={}",
+             heartbeat_age={age} timers_pending={} upgrade_origin={} pinned={} pinned_from={}",
             VersionDisplay(s.status.version()),
             s.identity.hash(),
             s.epoch.load_acquire(),
             commit.saturating_sub(applied),
             s.snapshot_pos.load_acquire(),
             s.identity.timers_pending(),
-            pin.0,
-            VersionDisplay(pin.1),
+            origin,
+            VersionDisplay(to),
+            VersionDisplay(from),
         );
     }
     println!("members:");

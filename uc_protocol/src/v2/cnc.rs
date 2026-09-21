@@ -324,6 +324,7 @@ const _: () = assert!(
 //   +16  upgrade_origin  u64 position (0 = no pin)             writer: node (cluster agent)
 //   +24  pinned_version  u64 (low 32 = packed version)         writer: node (cluster agent)
 //   +32  pin_seq         u64 seqlock (odd = pin store in flight) writer: node (cluster agent)
+//   +40  pinned_from     u64 (low 32 = packed version the pin's origin was built by)  writer: node (cluster agent)
 //   +64  applied         u64 position                          writer: service apply agent
 //   +128 epoch           u64 (attach-time fetch_add, AcqRel)   writer: service (attach)
 //   +192 output_completed u64 position                         writer: service output agent
@@ -389,6 +390,12 @@ pub const CNC_SVC_OFF_PINNED_VERSION: usize = 24;
 /// `store_pin` was interleaved with. Odd (or a moved value) means retry.
 /// `0` at init, so an unpinned row reads as "no store in flight, no pin".
 pub const CNC_SVC_OFF_PIN_SEQ: usize = 32;
+/// Plan B2: the version the artifact at `upgrade_origin` was BUILT by — the
+/// pin's `from`. A service attaching under the pin cross-checks the
+/// `ULTSNAP2` envelope's version against this word (spec §9.1), which is why
+/// it rides the same seqlock as the other three: a torn `(from, origin)`
+/// would refuse a correct artifact or accept a wrong one.
+pub const CNC_SVC_OFF_PINNED_FROM: usize = 40;
 /// cnc 3.1: line 7 — the row's FSM name, NUL-padded to 32 B, then its hash,
 /// then (time-and-timers) its pending-timer count, then (coordinated-
 /// snapshot spec §9) its last freeze duration.
@@ -859,6 +866,11 @@ mod tests {
         assert_eq!(CNC_SVC_OFF_UPGRADE_ORIGIN, CNC_SVC_OFF_VERSION + 8);
         assert_eq!(CNC_SVC_OFF_PIN_SEQ, CNC_SVC_OFF_PINNED_VERSION + 8);
         const { assert!(CNC_SVC_OFF_PIN_SEQ + 8 <= 64, "inside the status line") };
+        // plan B2: the pin's `from` — the version the artifact at `origin`
+        // was built by — fourth word under the same seqlock.
+        assert_eq!(CNC_SVC_OFF_PINNED_FROM, 40);
+        assert_eq!(CNC_SVC_OFF_PINNED_FROM, CNC_SVC_OFF_PIN_SEQ + 8);
+        const { assert!(CNC_SVC_OFF_PINNED_FROM + 8 <= 64, "inside the status line") };
         assert_eq!(CNC_SVC_OFF_VERSION, 8);
         assert_eq!(CNC_SVC_OFF_NAME, 448);
         assert_eq!(CNC_SVC_NAME_LEN, 32);
