@@ -394,8 +394,15 @@ reviewer wants a workload to attack.
   (F1) routed around it — a replay pass that cannot advance re-enters with
   the gap forced — but the root cause is that `first` is read from the
   journal's own first block rather than from something that knows the
-  frontier (the log buffer's base, or the node's archive floor). Deriving it
-  from one of those makes the detour unnecessary and removes a whole class of
+  frontier (the log buffer's base, or the node's archive floor). Note what
+  the detour rests on: with the TRUE `first`, the covering-artifact test
+  `s_pos >= first` proves the artifact meets the journal's retained tail;
+  with the forced (synthetic) `first` it proves only "above the cursor", so
+  no-hole-between-artifact-and-tail is currently an ARCHIVE invariant
+  (`purge_before`, `truncate_to` and `adopt_floor` all keep the journal
+  contiguous or wipe it) rather than a local check. Deriving `first` from
+  the frontier restores the local check, makes the detour unnecessary and
+  removes a whole class of
   "the journal answers a question it cannot answer". Not changed in the fix
   wave because it is a change to the guard every reconstruction path runs
   through. Recorded 2026-09-21 (`.superpowers/sdd/2026-09-21-uc2-live-snapshot-reports/final-review.md`,

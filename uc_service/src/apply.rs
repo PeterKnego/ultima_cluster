@@ -730,7 +730,20 @@ pub(crate) fn apply_cycle<S: RawStateMachine>(st: &mut ApplyState<S>) -> bool {
                 // Fail-stop with the contract named (Display carries it). The
                 // SnapshotRequired case is the deliberate below-floor-without-
                 // -snapshot outcome; any other Err is genuine journal I/O.
-                Err(e) => panic!("service journal replay fail-stop: {e}"),
+                // On the FORCED pass (a replay that could not advance, final
+                // review F1) the error's `first_available` is the synthetic
+                // bound the hint raised it to, not a journal reading — say so
+                // on the one line a supervisor is likely to capture.
+                Err(e) => {
+                    let forced = if st.replay_stalled.is_some() {
+                        " (forced after a replay pass that could not advance: the journal \
+                         does not retain the frontier's bytes; the first-available position \
+                         above is a synthetic bound, not a journal reading)"
+                    } else {
+                        ""
+                    };
+                    panic!("service journal replay fail-stop: {e}{forced}")
+                }
             };
             st.replay_wait = None;
             st.follower.cursor = cursor;
