@@ -238,9 +238,13 @@ pub(crate) fn replay_into<S: RawStateMachine>(
         // the journal's retained tail continues it with no hole, and
         // `<= target`, so the install cannot put the SM ahead of what this
         // node has committed and durable — and when it cannot, the choice
-        // falls back to `newest` unchanged. (A pinned origin BELOW `first`
-        // is a genuinely uncoverable gap for this row; it is left to the
-        // arms below to name, not papered over here.)
+        // falls back to `newest` unchanged. A pinned origin below `first`
+        // cannot bridge this gap at all (the frames in `(origin, first)` are
+        // gone), so the fallback is what runs, and a cross-version artifact
+        // it picks is still refused by name a few lines down. That refusal
+        // is the honest answer there: this row cannot be reconstructed from
+        // what is on this node, and the fix is a fresh set, not a quiet
+        // install.
         let covering = match restore {
             Some(r) => {
                 let pinned = instant.pin.and_then(|(origin, _, _)| {
