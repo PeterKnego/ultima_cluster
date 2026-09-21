@@ -14,7 +14,7 @@ The directory path is passed to `Node::start` and to every `uc2ctl` invocation.
 | `log.buf` | node | The log ring buffer, `buffer_bytes` long. Recreated on each boot. |
 | `journal/` | node | Segmented durable log (`uc_journal`). Survives restarts; the source for replay and purge. |
 | `state/` | node | Raft durables, held as `StableValue`s: vote, term map, output progress, snapshot floor, and the config record. These five are exactly `backup`'s `STATE_FILES` checklist. All five are **node data** under the cluster FSM's line (2.11.0): local, never replicated, never snapshotted. `config.state` is the one that looks like an exception and is not — it is the consensus kernel's *durable-time* membership shadow, a different reader at a different time base from the cluster FSM's committed view ([the cluster FSM explainer](../notes/uc2-cluster-fsm-explained.md)). There is **no** `schedules.state`: the schedule table is cluster data and lives in the cluster FSM's artifact. |
-| `snapshots/<id>/` | service and node | `snap-<pos>.ultsnap` artifacts for FSM `id`, one directory per declared id since M14. The service builds them; the node ships, installs and **deletes** them. `<pos>` is the absolute log byte position the snapshot represents — an **exclusive** frontier since coordinated instants (2.11.0): the image covers every frame strictly below it. Every file starts with a 16-byte UC envelope (below). A receiver's in-flight download sits beside them as `incoming-<pos>.part`, pre-sized and renamed into place as the contiguous frontier passes its end; an abandoned intake's part files are unlinked. |
+| `snapshots/<id>/` | service and node | `snap-<pos>.ultsnap` artifacts for FSM `id`, one directory per declared id since M14. The service builds them; the node ships, installs and **deletes** them. `<pos>` is the absolute log byte position the snapshot represents — an **exclusive** frontier since coordinated instants (2.11.0): the image covers every frame strictly below it. Every file starts with a 24-byte UC envelope (below). A receiver's in-flight download sits beside them as `incoming-<pos>.part`, pre-sized and renamed into place as the contiguous frontier passes its end; an abandoned intake's part files are unlinked. |
 | `snapshots/cluster/` | node (`uc2-cluster` agent) | `snap-<pos>.ultcluster` — the **cluster FSM's** artifact (2.11.0): membership, the schedule table, the settings record, and, since `2.13.0` (image version `2`), each row's upgrade-pin history (at most 4 events) and any collected snapshot hash reports, all as of `<pos>`, with a `UCCLUST1` magic, an image version and a trailing CRC32. Written by the node itself, not by a service, and shipped on the snapshot session under the reserved `service_id = 255` so a below-floor joiner installs it before its floor advances. Also what `uc2ctl schedule show`, `uc2ctl settings show`, `uc2ctl upgrade show` and `uc2ctl status`'s `schedule_position=` read. Retention is the node's, as it is for every row (below); the second-newest is what you fall back to if the newest is corrupt. |
 | `ingress.ring` | clients → node | MPSC submit ring. Per-record commit format (`ULTRNG2` magic) since 2.7.0. |
 | `query.ring` | clients → node | Query submissions, both linearizable and snapshot reads. Payload is `service_id: u8` — which FSM answers (M14) — followed by the query bytes; same record framing as `ingress.ring`. |
@@ -52,25 +52,49 @@ together on this upgrade — see
 
 ### The artifact envelope, and who deletes artifacts
 
-Two things about `snapshots/` changed with coordinated snapshot instants
-(2.11.0) and are worth knowing before you touch the directory by hand.
+Three things about `snapshots/` changed with coordinated snapshot instants
+(2.11.0) and the FSM upgrade lifecycle (2.13.0), and are worth knowing before
+you touch the directory by hand.
 
-**Every artifact starts with a 16-byte envelope.** `ULTSNAP1` then the
-position it was built at, `u64` LE — written by the framework
-(`uc_service::snapshots::SnapshotStore::publish`), ahead of whatever bytes the
-state machine itself streamed. UC still prescribes **no** payload encoding;
-it owns this header only. It exists because the tag is an exclusive frontier,
-which makes a mis-tagged artifact undetectable from the payload: an image
-built at some earlier `P0` and renamed to `snap-<P>.ultsnap` passes any check
-a state machine could write, and installing it would silently leave every
-frame in `(P0, P)` unapplied. So every install path strips and verifies the
-envelope first — the service's own reconstruction, a joiner's receive (the
-session ships the file's bytes verbatim, envelope included), and
-`uc2ctl verify-backup`. An artifact that fails is refused by name (too short,
-bad magic, or built-at ≠ presented-as), never installed. Artifacts written by
-a pre-2.11 build have no envelope and are refused: on a developer box that
-means clearing `snapshots/` once, which is part of the same flag day as the
-wire bump.
+**Every artifact starts with a 24-byte envelope.** `ULTSNAP2` (since
+`2.13.0`), then the position it was built at (`u64` LE), then the packed
+`S::VERSION` that BUILT it (`u32` LE), then 4 reserved zero bytes — written by
+the framework (`uc_service::snapshots::SnapshotStore::publish`), ahead of
+whatever bytes the state machine itself streamed. UC still prescribes **no**
+payload encoding; it owns this header only. The position field exists because
+the tag is an exclusive frontier, which makes a mis-tagged artifact
+undetectable from the payload: an image built at some earlier `P0` and
+renamed to `snap-<P>.ultsnap` passes any check a state machine could write,
+and installing it would silently leave every frame in `(P0, P)` unapplied.
+The version field is new in `2.13.0`: it is what lets an install cross-check
+the artifact against the version that was supposed to have built it — an
+unpinned install checks it against the running binary's own `S::VERSION`, a
+pinned install (below) against the upgrade pin's `from` instead. So every
+install path strips and verifies the envelope first — the service's own
+reconstruction, the FSM upgrade lifecycle's pinned install at attach, a
+joiner's receive (the session ships the file's bytes verbatim, envelope
+included), and `uc2ctl verify-backup`. An artifact that fails is refused by
+name (too short, bad magic, built-at ≠ presented-as, or the wrong version),
+never installed.
+
+**A pre-`2.13.0` (`ULTSNAP1`, 16-byte, no version field) artifact is refused
+BY NAME**, not decoded as version 0: on a developer box, or any node carrying
+snapshots from before this release, that means clearing `snapshots/<row>/`
+once per node — the next coordinated instant rebuilds it in the new layout.
+`snapshots/cluster/` is untouched by this change (its own image version
+already carries a forward-compatible v1→v2 path, above); only the per-row
+artifact directories need the wipe. A pre-2.11 artifact (no envelope at all)
+is refused the same way it always was.
+
+**The pinned install, when a row is pinned.** The FSM upgrade lifecycle (spec
+§3 S4) lets an operator pin a row's *next attach* to unconditionally install
+a specific artifact rather than tail-replay the log — see [The cluster FSM,
+explained § Pins and reports](../notes/uc2-cluster-fsm-explained.md#pins-and-reports-2130)
+and the [state machine contract's snapshots section](state-machine-contract.md#snapshots-the-instant-the-envelope-and-the-exclusive-frontier)
+for what `attach` does and its four named refusals. This is a reason a
+service's `snapshots/<row>/` directory matters even on a node that never runs
+`uc2ctl snapshot fetch` by hand: the artifact a pin names must still be on
+disk when the pinned binary attaches.
 
 **Retention is the node's, and it only ever deletes.** The node keeps the
 complete set at its **persisted** snapshot floor plus everything newer, and

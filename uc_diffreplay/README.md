@@ -94,9 +94,19 @@ The report names the mode's own further caveats in its `notes` (for example
 
 ## The trace an app binary writes
 
-JSON, `uc_diffreplay::trace::Trace`: `row`, `version`, `origin`, `end`,
-`projection_at_origin`, `projection_at_end`, and `entries[]` of
+JSON, `uc_diffreplay::trace::Trace`: `row`, `version`, `artifact_version`,
+`origin`, `end`, `projection_at_origin`, `projection_at_end`, and
+`entries[]` of
 `{ pos, kind: "Message" | { "Timer": { id, deadline_ns, table } }, tag, response, sched[], ids_calls, output }`.
+`artifact_version` is the version stamped in the installed artifact's
+`ULTSNAP2` envelope — `null` when the run started from genesis (nothing
+installed). It may disagree with `version` (this run's own `S::VERSION`):
+that disagreement is exactly the case the pinned-install cross-check
+(Tasks 3/4) exists for. The driver itself passes `None` as the expected
+version when it installs, by design — its whole point is to install an
+artifact across a version boundary and compare what each build's `apply`
+does with it, not to enforce sameness — so it reports the envelope's version
+rather than asserting it.
 `tag` is the first 32 bytes of the command payload — an app-defined
 discriminant, opaque to the harness; `tag_offset` in the declaration says
 where the app's own bytes start. `output` is `null` unless the driver ran

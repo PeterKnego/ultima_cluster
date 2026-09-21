@@ -370,6 +370,9 @@ codec is replaced.
    EVEN; `ServiceStatusLine::pin()` brackets its two loads with the seq word
    and returns a pair that was stored together, or `None`. Every reader
    (`/metrics`, `uc2ctl status`, plan B2's attach) goes through it.
+   **Superseded by plan B2's fourth word** (`pinned_from` at `+40`, same
+   seqlock) and the tri-state `PinRead` return — see the "Errata (plan B2,
+   as built)" block under §3 S4.
 4. **`pin_no_set` accepts only this node's NEWEST complete set
    (`uc2_snapshot_set_position`), not any retained set.** Retention is
    delete-only, so an older set can vanish between the door check and the
@@ -571,6 +574,69 @@ is bounded and small; stopping promptly after the pin shrinks it. The clean
 fix — the pin also halting apply at P — costs a check in the apply hot loop,
 which the 2.11.0 regression record argues against paying for a window this
 size. Recorded as a limit; revisit if a real deployment finds it matters.
+
+#### Errata (plan B2, as built)
+
+Six places execution diverged from the paragraphs above, or filled in a
+detail they left open:
+
+1. **A fourth cnc word, `pinned_from` (`+40`).** The three words this section
+   describes (`upgrade_origin`, `pinned_version`, `pin_seq`) are not enough
+   for a service to install soundly: the pinned artifact was built by
+   `from`, not by `to`, and the service's own cross-check needs to know
+   which. `pinned_from` rides the same seqlock as the other two, published
+   in the order `pinned_version`, `pinned_from`, `upgrade_origin` (data
+   words first, the word that gates "is there a pin at all" last).
+2. **`pin()` is tri-state, not boolean.** `uc_log::cnc::PinRead` is `NoPin` /
+   `Pinned { origin, from, to }` / `Contended` — a seqlock that never
+   settles after 64 collided reads is its own outcome, not folded into
+   `NoPin`. Attach fails **CLOSED** on `Contended`
+   (`ServiceError::PinUnreadable`): treating an unreadable pin as "no pin"
+   would let an attach skip an install the cluster requires.
+3. **The install happens in `attach`, not the reconstruction gap guard.** A
+   durable state machine already sitting above the origin on an unscrolled
+   ring never enters replay at all, so a pin the gap guard alone acted on
+   could leave exactly that state machine stuck on its own history — the
+   thing step 4 above is supposed to prevent. `attach` therefore reads the
+   pin and installs before publishing anything to the slot, and it takes the
+   install capability from
+   [`ServiceBuilder::start_with_snapshots`](../../../uc_service/src/lib.rs)
+   — a pinned row started with plain `start()` has no closure to install
+   with and is refused (`ServiceError::PinRequiresSnapshots`), rather than
+   silently computing the §2.3 counterfactual.
+4. **Two cross-checks, not one.** An **unpinned** install (the ordinary gap
+   guard) requires the artifact's stamped version `== S::VERSION`; a
+   **pinned** install requires it `==` the pin's `from` instead — see §9.1
+   (2)'s "as built" note. Correspondingly, the gap guard's own *expected*
+   version is the pin's `from` **only for the artifact sitting at the
+   pinned origin itself** — a pinned row's gap guard prefers that one
+   artifact over a newer one `from` may have left behind, for the same
+   sanctioned-crossing reason.
+5. **`ULTSNAP2` is 24 bytes: `magic ‖ P: u64 ‖ version: u32 ‖ 4 reserved
+   zero bytes`.** `ULTSNAP1` (16 bytes, no version field) is refused by name
+   (`EnvelopeError::Legacy`), never decoded as version 0. This is a flag-day
+   requirement of its own, narrower than the wire/cnc one: `2.13.0` requires
+   clearing `snapshots/<row>/` once per node; `snapshots/cluster/` is
+   untouched (its own image version already has a forward-compatible
+   v1→v2 read path).
+6. **The diff replay driver's `on_committed` recorder records the
+   framework's call outcome, not the handler's effects.** `Entry.output` is
+   `"ok"` / `"retryable: <msg>"` / `"permanent: <msg>"` — whether
+   `OutputHandler`/`RawOutputHandler` returned success, a retryable error, or
+   a permanent one — never the side effect itself (that leaves the process
+   the same way `on_committed` always has: leader-only, asynchronously, off
+   to whatever the handler was configured to do). A build whose handler
+   started emitting to a different destination looks identical here; only a
+   changed *outcome* (ok vs. retryable vs. permanent) shows up as a
+   `Surface::Output` divergence.
+
+A seventh point, found during execution rather than anticipated by the spec:
+**a node holds its snapshot/purge floor at a pinned origin until the row is
+consumed on that node** — attached at the pin's `to` **and** replayed past
+the cut, not merely attached (obs event `snapshot_floor_held_for_pin`). An
+upgrade that is pinned and then abandoned — the operator never swaps the
+binary — holds the journal at the origin indefinitely; there is no bound or
+alert on how long that can run. A bound or alert is plan D's, not this one's.
 
 ### S5 — Diff replay: diff, attribute, confirm
 
@@ -1243,7 +1309,17 @@ handled ("clear a dev box's `snapshots/` once"). The `UpgradePin` history is
 the authority; the stamp lets `install_snapshot` cross-check that the artifact
 it is about to install was built by the version the pin says was in effect at
 P, and makes an artifact self-describing off-cluster (a backup on a shelf).
-Part of deliverable 1.
+Part of deliverable 1. **As built (plan B2 T2–T4):** the cross-check is not
+one rule but two, because "the version the pin says was in effect" and "my
+own version" are the same value only on the unpinned path. An **unpinned**
+install (the ordinary reconstruction gap guard) requires the artifact's
+stamped version `== S::VERSION` — the running binary's own version. A
+**pinned** install (§3 S4, the errata block under S4 below) requires it
+`==` the pin's `from` instead, since a pin's entire purpose is to install an
+artifact a *different* version built. Both are the same decoder
+(`verify_snapshot_envelope`) called with a different `expected_version`; the
+diff replay driver is a deliberate third case, passing `None` because
+comparing across the boundary is its whole point.
 
 ### 9.2 What this spec does not solve
 

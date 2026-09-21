@@ -232,10 +232,12 @@ and replies (≤ 1033 B) are far below every UC limit (1 MiB remote frame,
 
 ## 5 — Snapshot image (not on the wire; on disk under `snapshots/0/`)
 
-For upgrade planning. The framework wraps the artifact: UC writes its 16-byte
-envelope (`ULTSNAP1 ‖ position: u64`) first, then — because the service runs
-wrapped in `Sessioned` — a `u64` length-prefixed dedup table, and only then
-the store's own image. The store owns the image bytes:
+For upgrade planning. The framework wraps the artifact: UC writes its 24-byte
+envelope (`ULTSNAP2 ‖ position: u64 ‖ version: u32 ‖ 4 reserved zero bytes`,
+since 2.13.0 — a pre-2.13.0 `ULTSNAP1` 16-byte envelope, with no version
+field, is refused by name) first, then — because the service runs wrapped in
+`Sessioned` — a `u64` length-prefixed dedup table, and only then the store's
+own image. The store owns the image bytes:
 
 **Image version 2 (what a v2 binary writes):**
 

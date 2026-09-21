@@ -75,6 +75,14 @@ Exit 0 = every difference is attributed and declared, every declaration was
 observed. Anything else exits 1 and the report names it: `Undeclared`,
 `Unexplained`, or `Absent`.
 
+Each side's raw trace also carries `artifact_version` — the version stamped
+in the installed artifact's `ULTSNAP2` envelope (`null` when the run started
+from genesis). The driver installs with no expected-version check of its own
+(that would defeat the point of comparing across a version boundary), so
+this field is how you confirm, after the fact, which version actually built
+the artifact each side started from. `uc_diffreplay/README.md` § "The trace
+an app binary writes" has the full field list.
+
 ## Also
 
     uc2-diffreplay determinism    --corpus C --bin ./kv-service --report det.json   # same build twice; must be empty

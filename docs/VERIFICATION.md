@@ -320,7 +320,52 @@ the bounded history, the image round-trip and the view republish); `node.rs`'s
 `an_upgrade_pin_is_appended_as_a_cluster_frame_and_the_words_follow_at_commit`,
 `upgrade_pin_is_single_in_flight_on_the_view_position` and
 `retention_keeps_every_pinned_origin` cover the door half and the
-retention exemption.
+retention exemption. Two more, from the fix round that found the floor-hold
+residual: `node.rs`'s
+`the_floor_is_held_at_a_pinned_origin_until_the_pinned_version_attaches`
+(the hold latches at the pinned origin and clears only once the row is
+attached at `to` **and** has replayed past the candidate floor — not merely
+attached) and `a_detached_row_under_a_pin_still_holds_the_floor` (a row with
+no service running at all still holds, since "not consumed" cannot
+distinguish an in-flight upgrade from one that never started).
+
+**The service-side half (plan B2).** Everything above proves the pin is
+recorded, replicated and observable; it says nothing about what a service
+process actually DOES with one at attach. `uc_service/tests/pinned_attach.rs`
+(11 tests, real `Node` + real `Service<S>` over an on-disk instance
+directory, no sim) covers that: the pinned install itself
+(`the_pinned_version_installs_the_origin_unconditionally_and_recomputes_the_tail`),
+its control — the same swap with no pin computing the §2.3 counterfactual
+instead
+(`the_same_swap_without_a_pin_computes_the_counterfactual`) — a durable state
+machine already above the origin being rewound to it
+(`a_durable_sm_above_the_origin_is_rewound_to_it`), the four `ServiceError`
+attach refusals plus the envelope's own version cross-check
+(`a_stale_binary_is_refused_by_name_after_the_pin` — `PinnedVersionMismatch`,
+`a_contended_pin_read_is_refused_not_ignored` — `PinUnreadable`,
+`a_pinned_row_started_without_snapshots_is_refused` —
+`PinRequiresSnapshots`, `a_pinned_origin_with_no_artifact_is_refused` —
+`PinnedArtifactMissing`, `a_pinned_artifact_built_by_the_wrong_version_is_refused`
+— `EnvelopeError::VersionMismatch` surfaced as `MistaggedSnapshot`), the gap guard's
+origin-over-newer-artifact preference
+(`a_pinned_attach_prefers_the_origin_over_a_later_artifact`), a cadence
+instant landing after the pin but before the stop
+(`a_pinned_attach_survives_a_cadence_instant_after_the_pin`), and convergence
+on a **purging** cluster (`a_pinned_attach_converges_on_a_purging_cluster`).
+That last test stands in for a two-row cluster where one row is busy enough
+to purge while a pinned row stays quiet: it is a single-node, single-row
+fixture, but drives `PURGE_EXTRA_INSTANTS = 400` coordinated instants past
+the pin's origin on an otherwise-idle row before the pinned binary attaches,
+which is what actually exercises "the origin's artifact must still be
+retrievable after the floor has moved past it many times" — a real two-row
+harness would add cross-row scheduling noise without changing what this
+assertion proves. `uc_diffreplay/tests/reconstruction.rs`'s
+`a_real_pin_makes_the_default_purge_off_swap_install_the_origin` is the
+end-to-end companion: a real admin `upgrade pin` request over the wire,
+through a running node, answered by the same code path an operator's
+`uc2ctl` would drive, confirming the pinned install and the §2.3
+counterfactual disagree (`Some(4)` vs `Some(8)`) on the DEFAULT (purge-off)
+configuration, not just the purging one above.
 
 **The red twin, and an honest note about what it pins.**
 `counterfactual_kernel_on_the_committed_view_is_caught_by_inv6_the_durable_time_oracle`
@@ -775,7 +820,7 @@ takes the process down. Availability is the thing being defended here.
 | `uc_node_toml` | `uc_node::config_file::parse_str` — the `node.toml` parser behind every M9/M11/M12b named startup refusal. |
 | `uc_gateway_toml` | `uc_gateway::config_file::parse_str` — the gateway's whole named-refusal path, including its own `EdgeConfig::validate`. |
 | `uc_node_http` | `uc_node::obs::http::route_raw` — the **unauthenticated** `/metrics` + `/healthz` + `/readyz` request parser. |
-| `uc_service_snapshot_envelope` | coordinated snapshots — `uc_service::snapshots::decode_snapshot_envelope`, the 16-byte `ULTSNAP1` header every artifact file now begins with. A pure decoder, total on any slice, and the one check standing between a renamed or mis-copied artifact and an install that would silently leave a span of frames unapplied. |
+| `uc_service_snapshot_envelope` | coordinated snapshots — `uc_service::snapshots::decode_snapshot_envelope`, the 24-byte `ULTSNAP2` header every artifact file now begins with (since `2.13.0`; a pre-`2.13.0` `ULTSNAP1` header is refused by name, `EnvelopeError::Legacy`, not decoded as version 0). A pure decoder, total on any slice, and the one check standing between a renamed or mis-copied (or wrong-version) artifact and an install that would silently leave a span of frames unapplied or cross a version boundary uncaught. |
 | `uc_node_cluster_artifact` | `ClusterFsm::install_snapshot` — the cluster IMAGE a below-floor joiner installs **by fiat** off a snapshot session, and a restarting node reads off disk. CRC32 is a checksum, not a MAC, so every length-prefixed read behind it is attacker-chosen. |
 | `uc_protocol_probe` | jumbo spec §4.2 — `uc_protocol::v2::datagram`'s path-MTU probe codecs, `read_probe_rung` and `read_probe_ack_body`/`write_probe_ack_body`. `Scope::Pairwise`: reached by any peer that can put a UDP datagram on the wire, ahead of the commit rule that consumes the result. |
 

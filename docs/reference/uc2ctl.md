@@ -394,7 +394,8 @@ set=73792
 It opens the cnc page only to learn which rows are declared and their names,
 then reads directory listings under `<instance_dir>/snapshots/` and parses
 **file names** only (`snap-<pos>.ultsnap`, `snap-<pos>.ultcluster`). It never
-opens an artifact: the 16-byte `ULTSNAP1` envelope inside each one is
+opens an artifact: the 24-byte `ULTSNAP2` envelope inside each one (a
+pre-2.13.0 `ULTSNAP1` artifact is refused by name) is
 [`verify-backup`](#verify-backup)'s business, not this command's.
 
 `set=<P>` is the newest position present in **every** declared row's directory
@@ -514,7 +515,7 @@ Output fields:
 | `log: commit / durable / append` | the three log counters, in bytes |
 | `members` | one line per occupied peer slot: `id`, `role`, `reported_durable`, and a staleness marker when `commit - reported_durable` exceeds the admission window |
 | `services` | the declared id list (cnc 4032's bitmask), the lag policy, and — since log time and timers (2.11.0) — `log_time_ns=<n>`, the log's clock read from cnc `4048`, in **raw nanoseconds since the Unix epoch**. It is not formatted as RFC 3339: the binary carries no date formatter, and the raw value is what the `uc2_log_time_ns` metric and the cnc word both hold. `0` means no leader has stamped anything this page generation — `fsm_lag=lockstep` or `fsm_lag=<N> bytes` (cnc 4040). A node started for a harness (`ServicesConfig::none_for_tests`) prints `declared=[] fsm_lag=n/a` and no rows: with nothing declared there is no lag policy to report, even though cnc 4040 still holds a resolved bound (since **2.8.1**; earlier releases printed that bound, or `lockstep` when it happened to read 0) |
-| per-FSM rows | one line per **declared** row, attached or not, in this order: `row=`, `name=` (the row's declared FSM name, node-written at boot, cnc 3.1), `version=` (the attached service's packed version, or the literal `unversioned` if the packed value is 0 — unattached or an FSM that never set `const VERSION`), `hash=0x...` (the row's identity hash, cnc 3.1), `attached=` (the slot's ATTACHED bit), `epoch=` (incarnations since this node booted), `incarnation=` (the status word's counter), `applied=`, `lag=` (`commit − applied`), `snapshot_pos=`, `heartbeat_age=` (`never` if that FSM has not stamped since boot), `timers_pending=` (that row's pending scheduled timers, cnc slot line 7 `+488`), `upgrade_origin=` (the row's committed `UpgradePin` origin — the coordinated instant this row installs unconditionally at its next attach, `0` = no pin), `pinned=` (the version that pin names, `unversioned` when `upgrade_origin=0`) — `name=`/`version=`/`hash=` are new since FSM identity, `timers_pending=` since log time and timers (both 2.11.0), and `upgrade_origin=`/`pinned=` since the FSM upgrade lifecycle (cnc 3.3, `uc2ctl upgrade pin`/`show`); earlier releases printed only `attached=... epoch=... incarnation=...` |
+| per-FSM rows | one line per **declared** row, attached or not, in this order: `row=`, `name=` (the row's declared FSM name, node-written at boot, cnc 3.1), `version=` (the attached service's packed version, or the literal `unversioned` if the packed value is 0 — unattached or an FSM that never set `const VERSION`), `hash=0x...` (the row's identity hash, cnc 3.1), `attached=` (the slot's ATTACHED bit), `epoch=` (incarnations since this node booted), `incarnation=` (the status word's counter), `applied=`, `lag=` (`commit − applied`), `snapshot_pos=`, `heartbeat_age=` (`never` if that FSM has not stamped since boot), `timers_pending=` (that row's pending scheduled timers, cnc slot line 7 `+488`), `upgrade_origin=` (the row's committed `UpgradePin` origin — the coordinated instant this row installs unconditionally at its next attach, `0` = no pin), `pinned=` (the version that pin names, `unversioned` when `upgrade_origin=0`), `pinned_from=` (the version the pin's origin artifact was BUILT by — the pinned install's cross-check version, `unversioned` when `upgrade_origin=0`) — `name=`/`version=`/`hash=` are new since FSM identity, `timers_pending=` since log time and timers (both 2.11.0), and `upgrade_origin=`/`pinned=`/`pinned_from=` since the FSM upgrade lifecycle (cnc 3.3, `uc2ctl upgrade pin`/`show`); earlier releases printed only `attached=... epoch=... incarnation=...` |
 
 ## Offline commands
 
@@ -546,7 +547,10 @@ present, the aggregate `newest_snapshot` (the min over ids present, or
 Read-only verification of a backup artifact — recovers its positions, checks
 the coverage invariant **per FSM id** present in `snapshots/<id>/` (a journal
 whose `first_base > 0` must be covered by that id's own retained snapshot,
-else `Hole { service: <id>, .. }`), and cross-checks a `MANIFEST` if present
+else `Hole { service: <id>, .. }`), checks every retained snapshot's 24-byte
+`ULTSNAP2` envelope (a **legacy** `ULTSNAP1` artifact — 2.11.0/2.12.0, no
+version field — is named and refused, same as one with no envelope at all,
+`corrupt snapshot artifact`), and cross-checks a `MANIFEST` if present
 (`ManifestMismatch` on tamper/bitrot). May heal the artifact's own torn
 active-segment tail (a shrink-only truncate, reported as
 `healed_torn_tail=true`, which is the routine case under segment

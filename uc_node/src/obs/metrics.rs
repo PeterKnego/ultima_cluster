@@ -701,7 +701,7 @@ fn push_service_families(out: &mut String, s: &ObsSources, commit: u64, now: u64
     push_service_labeled(
         out,
         "uc2_upgrade_pin_origin",
-        "FSM upgrade lifecycle (spec §2.5): the row's pinned origin position from the newest committed UpgradePin, as republished in the cnc status line by the uc2-cluster agent; 0 = no pin. Identical on every node once caught up.",
+        "FSM upgrade lifecycle (spec §2.5): the row's pinned origin position from the newest committed UpgradePin, as republished in the cnc status line by the uc2-cluster agent; 0 = no pin or unreadable. Identical on every node once caught up.",
         "gauge",
         &rows,
         |r| r.upgrade_origin,
@@ -709,7 +709,7 @@ fn push_service_families(out: &mut String, s: &ObsSources, commit: u64, now: u64
     push_service_labeled(
         out,
         "uc2_upgrade_pin_version",
-        "The packed version the row's newest UpgradePin names (`to`); 0 = no pin. A service whose VERSION differs is refused at attach (plan B2).",
+        "The packed version the row's newest UpgradePin names (`to`); 0 = no pin or unreadable. A service whose VERSION differs is refused at attach (plan B2).",
         "gauge",
         &rows,
         |r| r.pinned_version,
