@@ -890,7 +890,7 @@ fn push_service_families(out: &mut String, s: &ObsSources, commit: u64, now: u64
     push_counter(
         out,
         "uc2_snapshot_reports_timed_out_total",
-        "The subset of uc2_snapshot_reports_appended_total that went in on the 5 s collection timeout rather than on a quorum of voters reporting. A brief run around a failover or a restart is expected; a rate that keeps pace with the appended counter means the records name too few voters to tell a divergent replica from an absent one, and an upgrade pin adjudicated from them is thinner evidence than it looks — check uc2_snapshot_reports_unsent_total and the set-completion gauges on the quiet nodes.",
+        "The subset of uc2_snapshot_reports_appended_total that went in on the 5 s collection timeout rather than on every voter reporting. A brief run around a failover or a restart is expected; a rate that keeps pace with the appended counter means the records name too few voters to tell a divergent replica from an absent one, and an upgrade pin adjudicated from them is thinner evidence than it looks — check uc2_snapshot_reports_unsent_total and the set-completion gauges on the quiet nodes.",
         s.snapshot_reports_timed_out.load(Ordering::Relaxed),
     );
     push_gauge(

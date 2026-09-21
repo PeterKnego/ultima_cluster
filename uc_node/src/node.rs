@@ -3403,10 +3403,10 @@ struct Consensus {
     pending_snapshot_reports: HashMap<u8, PendingSnapshotReport>,
     /// Plan B3 (spec §6.5.2): `CLUSTER kind = 5` records this leader placed
     /// (`uc2_snapshot_reports_appended_total`), and how many of those went in
-    /// on the TIMEOUT rather than on a voter quorum
+    /// on the TIMEOUT rather than on every voter reporting
     /// (`uc2_snapshot_reports_timed_out_total`, a subset of the first). A
     /// climbing `timed_out` is the reading that matters: every instant is
-    /// being recorded without a quorum of voters vouching for it. Shared with
+    /// being recorded with a voter missing from it. Shared with
     /// `Node::observability` exactly as `snapshot_reports_sent` is.
     snapshot_reports_appended: Arc<AtomicU64>,
     snapshot_reports_timed_out: Arc<AtomicU64>,
@@ -6369,7 +6369,7 @@ impl Consensus {
     /// * **Members only.** The config is the whole of the trust here — a hash
     ///   from a node in no config this cluster adopted is not evidence about
     ///   this cluster's artifacts. Learners count as members (their hashes are
-    ///   evidence) but never toward the quorum below. This is a door, not the
+    ///   evidence) but never toward the release below. This is a door, not the
     ///   bound: an accepted entry outlives the config that admitted it, so
     ///   [`Consensus::maybe_append_snapshot_reports`] filters the payload
     ///   against the config again at append time.
@@ -6459,12 +6459,31 @@ impl Consensus {
     /// the log as a `CLUSTER kind = 5 SnapshotReport`. Called once per leader
     /// pass, beside the pass's other leader-issued `CLUSTER` appends.
     ///
-    /// A row is ready when a QUORUM of voters has reported it — the same
-    /// majority every other decision in this system rests on — or when its
-    /// collection has stood for [`SNAP_REPORT_TIMEOUT_NS`], whichever comes
-    /// first. The timeout is what keeps a down node from stopping the record
-    /// altogether: the append then names who DID report, which is exactly the
-    /// evidence [`uc_protocol::v2::upgrade::verdict`] reads.
+    /// A row is ready when EVERY VOTER in the current membership has reported
+    /// it, or when its collection has stood for [`SNAP_REPORT_TIMEOUT_NS`],
+    /// whichever comes first. The timeout is what keeps a down node from
+    /// stopping the record altogether: the append then names who DID report,
+    /// which is exactly the evidence [`uc_protocol::v2::upgrade::verdict`]
+    /// reads.
+    ///
+    /// **Why not a quorum** (ruling R-B3-1). A quorum trigger releases the
+    /// record the instant a majority has reported, which structurally omits
+    /// whichever replica is slowest to complete its set — and on a real
+    /// three-node cluster that is the SAME replica every instant (measured:
+    /// one node's set-complete edge lagging the other two by ~24 ms, forever).
+    /// Naming the divergent replica is the whole purpose of the record (spec
+    /// §6.5.2 item 4), so a trigger that can never name the slow one defeats
+    /// the feature. The reason a quorum was chosen — do not stall on a dead
+    /// node — is already served by the timeout.
+    ///
+    /// **The cost.** A permanently dead or slow voter delays that `(row, P)`
+    /// record by at most [`SNAP_REPORT_TIMEOUT_NS`] and never blocks it. That
+    /// is diagnostic latency only: the record is on neither the commit path
+    /// nor the snapshot-completeness path, and nothing waits on it.
+    ///
+    /// LEARNERS still report and their hashes still ride the vector, but they
+    /// never count toward the release — a learner cannot stand in for a voter
+    /// here any more than it can anywhere else.
     ///
     /// **Membership is applied HERE, not only at collection.** An entry
     /// outlives the config it was admitted under: `MAX_MEMBERS` bounds voters
@@ -6500,7 +6519,10 @@ impl Consensus {
         }
         let now = self.pass_mono_ns;
         let config = self.sm.config().clone();
-        let quorum = config.voters.len() / 2 + 1;
+        // Ruling R-B3-1: every voter, not a majority of them. Read from the
+        // SAME config the payload filter below uses, so "who must report" and
+        // "whose hash may be in the record" can never disagree.
+        let voters_required = config.voters.len();
         // Ascending, so which ready row goes first is a property of the data
         // and not of the `HashMap`'s iteration order.
         let mut rows: Vec<u8> = self.pending_snapshot_reports.keys().copied().collect();
@@ -6519,7 +6541,7 @@ impl Consensus {
                 .collect();
             let voters_reporting = hashes.iter().filter(|(id, _)| config.is_voter(*id)).count();
             let timed_out = now.saturating_sub(first_seen_ns) >= SNAP_REPORT_TIMEOUT_NS;
-            if voters_reporting < quorum && !timed_out {
+            if voters_reporting < voters_required && !timed_out {
                 continue; // still collecting
             }
             // Every reporter has since left the config: there is nothing left
@@ -6566,7 +6588,7 @@ impl Consensus {
             });
             return match self.append_cluster_frame(&cmd) {
                 Ok(end) => {
-                    let by_timeout = voters_reporting < quorum;
+                    let by_timeout = voters_reporting < voters_required;
                     self.pending_snapshot_reports.remove(&row);
                     self.snapshot_reports_appended
                         .fetch_add(1, Ordering::Relaxed);
@@ -6583,8 +6605,8 @@ impl Consensus {
                         frame_end = end,
                         reporters = reporters,
                         voters_reporting = voters_reporting as u64,
-                        quorum = quorum as u64,
-                        by = if by_timeout { "timeout" } else { "quorum" }
+                        voters_required = voters_required as u64,
+                        by = if by_timeout { "timeout" } else { "all_voters" }
                     );
                     true
                 }
@@ -12861,14 +12883,22 @@ mod tests {
 
     // ---- plan B3 T4: the leader collects the reports and appends the record ----
 
-    /// Spec §6.5.2 item 3, the base case: the leader holds what arrives per
-    /// `(row, instant)` and appends ONE `CLUSTER kind = 5` record the moment a
-    /// QUORUM of voters has reported — two of three here. The committed record
-    /// carries every reporter's hash, canonically ordered by node id, which is
-    /// what makes [`uc_protocol::v2::upgrade::verdict`] a pure function of the
-    /// log rather than of whoever happened to be leading.
+    /// Spec §6.5.2 item 3 as amended by ruling R-B3-1, the base case: the
+    /// leader holds what arrives per `(row, instant)` and appends ONE `CLUSTER
+    /// kind = 5` record the moment EVERY VOTER has reported — three of three
+    /// here. The committed record carries every reporter's hash, canonically
+    /// ordered by node id, which is what makes
+    /// [`uc_protocol::v2::upgrade::verdict`] a pure function of the log rather
+    /// than of whoever happened to be leading.
+    ///
+    /// A quorum is deliberately NOT the trigger. Releasing at two of three
+    /// structurally omits whichever replica is slowest to complete its set,
+    /// and naming that replica is the whole purpose of the record (spec
+    /// §6.5.2 item 4) — measured on a real three-node cluster, the omitted
+    /// node is the SAME one every instant, so the divergent replica a quorum
+    /// record leaves out is never named at all.
     #[test]
-    fn snapshot_reports_append_on_a_voter_quorum() {
+    fn snapshot_reports_append_once_every_voter_has_reported() {
         let _obs = obs_capture_lock();
         let mut h = harness_with_rows(&["a"]);
         drive_to_serving_leader(&mut h);
@@ -12879,12 +12909,17 @@ mod tests {
         h.cons.on_snap_report(1, 0, p, 0xA1);
         assert!(
             !h.cons.maybe_append_snapshot_reports(),
-            "one voter of three is not a quorum"
+            "one voter of three is not every voter"
         );
         h.cons.on_snap_report(0, 0, p, 0xA1);
         assert!(
+            !h.cons.maybe_append_snapshot_reports(),
+            "two of three is a QUORUM, and a quorum is not the trigger (ruling R-B3-1)"
+        );
+        h.cons.on_snap_report(2, 0, p, 0xA1);
+        assert!(
             h.cons.maybe_append_snapshot_reports(),
-            "two of three is — and the leader does not wait out its timeout"
+            "every voter has reported — and the leader does not wait out its timeout"
         );
         let text = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
         crate::obs::log::stderr_for_tests();
@@ -12897,9 +12932,9 @@ mod tests {
             Some(&SnapshotReport {
                 row: 0,
                 position: p,
-                hashes: vec![(0, 0xA1), (1, 0xA1)],
+                hashes: vec![(0, 0xA1), (1, 0xA1), (2, 0xA1)],
             }),
-            "the record holds both hashes, ordered by node id"
+            "the record holds all three hashes, ordered by node id"
         );
         assert!(
             h.cons.pending_snapshot_reports.is_empty(),
@@ -12913,18 +12948,68 @@ mod tests {
         assert_eq!(
             h.cons.snapshot_reports_timed_out.load(Ordering::Relaxed),
             0,
-            "a quorum append is not a timeout append"
+            "an all-voters append is not a timeout append"
         );
         assert!(
             text.contains(r#""event":"snapshot_report_appended""#)
-                && text.contains(r#""by":"quorum""#),
+                && text.contains(r#""by":"all_voters""#),
+            "the record says which rule fired: {text}"
+        );
+    }
+
+    /// Ruling R-B3-1's other half: a voter that never reports must not hold the
+    /// record back forever, so [`SNAP_REPORT_TIMEOUT_NS`] still releases what
+    /// HAS arrived. Two of three here — exactly the count a quorum trigger
+    /// released instantly — now costs 5 s, which is the price of the rule and
+    /// the whole of it: the record is on neither the commit nor the
+    /// snapshot-completeness path, so the delay is diagnostic latency and
+    /// nothing else.
+    ///
+    /// The straggler that turns up after the record commits is still dropped,
+    /// its instant being no newer than the one already held.
+    #[test]
+    fn two_of_three_voters_appends_only_after_the_timeout() {
+        let _obs = obs_capture_lock();
+        let mut h = harness_with_rows(&["a"]);
+        drive_to_serving_leader(&mut h);
+        h.cons.pass_mono_ns = 1_000;
+        let p = 6048u64;
+
+        h.cons.on_snap_report(0, 0, p, 0xC1);
+        h.cons.on_snap_report(1, 0, p, 0xC1);
+        assert!(
+            !h.cons.maybe_append_snapshot_reports(),
+            "two of three voters is a quorum, and a quorum is not the trigger"
+        );
+        h.cons.pass_mono_ns += SNAP_REPORT_TIMEOUT_NS;
+        let buf = crate::obs::log::capture_for_tests();
+        assert!(h.cons.maybe_append_snapshot_reports(), "5 s is up");
+        let text = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        crate::obs::log::stderr_for_tests();
+
+        let end = h.cons.last_cluster_append;
+        h.commit_through(end);
+        let state = h.cons.cluster_view.to_state();
+        assert_eq!(
+            state.report_for(0).map(|r| r.hashes.clone()),
+            Some(vec![(0, 0xC1), (1, 0xC1)]),
+            "the record names who DID report"
+        );
+        assert_eq!(h.cons.snapshot_reports_appended.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            h.cons.snapshot_reports_timed_out.load(Ordering::Relaxed),
+            1,
+            "and the operator can see it was the timeout that placed it"
+        );
+        assert!(
+            text.contains(r#""by":"timeout""#),
             "the record says which rule fired: {text}"
         );
 
         // ...and the straggler that arrives afterwards is DROPPED: its instant
         // is no newer than the one the committed record already holds, and
         // re-appending it would churn the log for nothing.
-        h.cons.on_snap_report(2, 0, p, 0xA1);
+        h.cons.on_snap_report(2, 0, p, 0xC1);
         assert!(
             h.cons.pending_snapshot_reports.is_empty(),
             "<= the held report's position"
@@ -12932,7 +13017,7 @@ mod tests {
         assert!(!h.cons.maybe_append_snapshot_reports());
     }
 
-    /// Spec §6.5.2: a set that never completes on a quorum must still reach
+    /// Spec §6.5.2: a set that never completes on every voter must still reach
     /// the log — a partial record naming who DID report is evidence; silence
     /// is not. After [`SNAP_REPORT_TIMEOUT_NS`] the leader appends what it has.
     #[test]
@@ -13156,11 +13241,11 @@ mod tests {
     }
 
     /// A LEARNER is a member: its hash is collected and lands in the record —
-    /// it is evidence like anyone's. It just never counts toward the quorum
-    /// that decides WHEN to append, exactly as it counts toward no other
-    /// quorum in this system.
+    /// it is evidence like anyone's. It just never counts toward the release
+    /// (ruling R-B3-1: every VOTER, or the timeout), exactly as it counts
+    /// toward no other decision in this system.
     #[test]
-    fn a_learners_report_is_collected_but_never_counts_toward_the_quorum() {
+    fn a_learners_report_is_collected_but_never_counts_toward_the_release() {
         let mut h = harness_with_rows(&["a"]);
         drive_to_serving_leader(&mut h);
         adopt_config_change(
@@ -13175,11 +13260,12 @@ mod tests {
 
         h.cons.on_snap_report(3, 0, p, 0xD4);
         h.cons.on_snap_report(1, 0, p, 0xD4);
+        h.cons.on_snap_report(0, 0, p, 0xD4);
         assert!(
             !h.cons.maybe_append_snapshot_reports(),
-            "one voter plus a learner is not a quorum of the three voters"
+            "two voters plus a learner is not every VOTER — the learner cannot stand              in for voter 2"
         );
-        h.cons.on_snap_report(0, 0, p, 0xD4);
+        h.cons.on_snap_report(2, 0, p, 0xD4);
         assert!(h.cons.maybe_append_snapshot_reports());
 
         let end = h.cons.last_cluster_append;
@@ -13187,7 +13273,7 @@ mod tests {
         let state = h.cons.cluster_view.to_state();
         assert_eq!(
             state.report_for(0).map(|r| r.hashes.clone()),
-            Some(vec![(0, 0xD4), (1, 0xD4), (3, 0xD4)]),
+            Some(vec![(0, 0xD4), (1, 0xD4), (2, 0xD4), (3, 0xD4)]),
             "the learner's hash IS in the record"
         );
     }
@@ -13293,8 +13379,9 @@ mod tests {
             }))
             .expect("settings append");
         let p = 6080u64;
-        h.cons.on_snap_report(0, 0, p, 0x77);
-        h.cons.on_snap_report(1, 0, p, 0x77);
+        for id in 0..3u32 {
+            h.cons.on_snap_report(id, 0, p, 0x77);
+        }
 
         assert!(
             !h.cons.maybe_append_snapshot_reports(),
@@ -13328,8 +13415,9 @@ mod tests {
         h.cons.pass_mono_ns = 1_000;
         let p = 6048u64;
         for row in [1u8, 0] {
-            h.cons.on_snap_report(0, row, p, 0x99);
-            h.cons.on_snap_report(1, row, p, 0x99);
+            for id in 0..3u32 {
+                h.cons.on_snap_report(id, row, p, 0x99);
+            }
         }
 
         assert!(h.cons.maybe_append_snapshot_reports());
@@ -13511,8 +13599,9 @@ mod tests {
         h.cons.pass_mono_ns = 1_000;
         let p = 6048u64;
         for row in [0u8, 1] {
-            h.cons.on_snap_report(0, row, p, 0x44);
-            h.cons.on_snap_report(1, row, p, 0x44);
+            for id in 0..3u32 {
+                h.cons.on_snap_report(id, row, p, 0x44);
+            }
         }
 
         // A record for row 0 at the same instant commits under us — what a
@@ -13565,8 +13654,9 @@ mod tests {
         drive_to_serving_leader(&mut h);
         h.cons.do_work(); // one ordinary pass: `first_seen_ns` is then a real clock reading
         let p = 6080u64;
-        h.cons.on_snap_report(0, 0, p, 0x88);
-        h.cons.on_snap_report(1, 0, p, 0x88);
+        for id in 0..3u32 {
+            h.cons.on_snap_report(id, 0, p, 0x88);
+        }
 
         let before = h.cons.cnc.counters().append.load_acquire();
         h.cons.do_work();
