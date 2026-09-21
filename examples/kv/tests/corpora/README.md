@@ -12,7 +12,11 @@ it with `intent.toml`.
 
 Regenerate a corpus with `cargo test --test gen_corpus -- --ignored` after a
 wire or image format change; a corpus without its `intent.toml` is a recording,
-not a test.
+not a test. The snapshot ENVELOPE counts as such a change: the artifact in a
+corpus carries it, and a build whose envelope has moved on refuses the old one
+by name rather than replaying it (an `ULTSNAP1` artifact under a 2.13.0
+binary — "pre-2.13.0 artifact (ULTSNAP1): carries no version stamp"). That is
+the regression gate working, not a corpus to patch by hand.
 
 ## What is here
 
