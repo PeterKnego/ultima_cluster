@@ -366,6 +366,24 @@ reviewer wants a workload to attack.
 - **Alert on `uc2_log_clock_smear_ns`** (a smear above N seconds for M
   minutes), with its `scripts/m10_alert_fire.sh` builder and scenario —
   recorded 2026-09-08 by the log-clock spec's errata bullet 9.
+- **The cluster FSM's own artifact is not hash-reported.**
+  `SnapshotReport.row` covers declared rows `0..8`; `service_id = 255` — the
+  `snapshots/cluster/` image every below-floor joiner installs by fiat — has
+  no live determinism check at all. Its surface is far smaller than a user
+  FSM's `freeze()` (the image is a function of the committed `CLUSTER`
+  commands and nothing else), which is why plan B3 scoped it out rather than
+  widening the record's row field; it is still a real gap. Recorded
+  2026-09-21 as erratum 6 of the FSM upgrade lifecycle spec's
+  "Errata (plan B3, as built)".
+- **The `uc_service::apply` replay forward-progress guard has no counter.**
+  Plan B3 T5 added a guard that hands the cycle back when a replay pass
+  fails to advance the cursor (it used to spin forever, which also hung
+  `Service::stop`'s join). It reports once per episode with an `eprintln!`
+  and nothing else — no metric family, no obs record — so a row idling there
+  is visible only in the service's own stderr and in its `applied` standing
+  still. Convergence is not guaranteed under the default
+  `PurgePolicy::Disabled`, which makes the counter worth more than it would
+  be otherwise. Recorded 2026-09-21.
 
 ## Accepted residuals — listed so they are not re-proposed
 

@@ -206,8 +206,10 @@ artifact published AT `P`, never a stale hash left over from the previous
 instant. The hash itself is computed while the artifact streams to disk
 (`SnapshotStore::publish`'s `HashingWriter`), not read back afterwards.
 `uc2ctl status` prints it as `artifact_hash=0x{:016x}` after `pinned_from=`
-on each per-FSM row. Line 7 is now full: `+504` is its last free word,
-`+512` is the next slot.
+on each per-FSM row. **Line 7 is now full.** `+504` was its last free word
+and `artifact_hash` takes it; `+512` is the next slot's line 0, not more
+room on this one. A further per-row word needs the reserved band, not
+line 7.
 
 The capability bit is what `uc2ctl snapshot` checks before it commands
 anything: a row started with plain `start()` never sets it, ignores a

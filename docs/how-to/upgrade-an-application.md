@@ -81,13 +81,46 @@ uc2ctl status --instance-dir /srv/uc2/nN --app-id APP | grep 'row='
 # a value acknowledged before the upgrade still reads back
 kv --gateways host0:9200,host1:9200,host2:9200 get --linearizable SOME_PREUPGRADE_KEY
 
-# and all replicas agree: a coordinated snapshot hashes identically everywhere
+# and all replicas agree: take a coordinated instant, then ask the cluster
 uc2ctl snapshot --instance-dir /srv/uc2/n0 --app-id APP --admin-key .../ops-admin.key
-sha256sum /srv/uc2/nN/snapshots/0/snap-<instant>.ultsnap   # identical on every node
+uc2ctl upgrade show --instance-dir /srv/uc2/nN --app-id APP
+#   row=0 hash_verdict=agreed position=<instant> nodes=3 hash=0x...
 ```
 
-Identical snapshot hashes at the new version, with every pre-upgrade value
+`hash_verdict=agreed`, at the new version, with every pre-upgrade value
 intact, is the upgrade done.
+
+**Since `2.13.0` you do not hash the files by hand.** Every node hashes its
+row artifact as the builder streams it and reports `(row, position, hash)` to
+the leader; the leader commits one `SnapshotReport` record naming everyone
+who reported, and `uc2ctl upgrade show` renders the verdict every replica
+computes from it. Read it on **any** node — it is committed cluster state, so
+the answer is the same everywhere, unlike a per-file `sha256sum` you have to
+collect and compare yourself.
+
+Three things to check in that line:
+
+- **`hash_verdict=agreed`** — every reporting node's artifact hashed the same.
+- **`nodes=`** should equal your voter count. Short of it means the leader's
+  5 s collection timeout fired and some voter did not report that instant:
+  the verdict is still sound about the nodes it names, but it is not evidence
+  about the one missing. Check `uc2_snapshot_reports_timed_out_total` on the
+  leader and `uc2_snapshot_reports_unsent_total` on the quiet node.
+- **`position=`** should be the instant you just commanded, not an older one.
+
+`hash_verdict=DIVERGED` names the minority node ids outright, and
+`uc2_snapshot_hash_mismatch{row="0"}` reads nonzero on every node with the
+`Uc2SnapshotHashDiverged` alert behind it — that is a nondeterminism in the
+new version's `freeze`/`stream_snapshot`, and the next step is
+`uc2-diffreplay determinism` on that row's corpus.
+
+If you still want the file-level check (a node the cluster has not heard
+from, say), note that the two numbers are **not** comparable: `sha256sum`
+over `snap-<instant>.ultsnap` covers the 24-byte `ULTSNAP2` envelope as well,
+while the reported hash is SHA-256 over the **payload only**, truncated to
+its first 8 bytes. The per-node value is on the cnc page and
+`uc2ctl status` prints it as `artifact_hash=` beside that row's
+`snapshot_pos=`.
 
 ## Rolling back
 

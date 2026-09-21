@@ -490,6 +490,58 @@ a network-path adversary who can spoof a member's UDP source address can
 still inject a proposal onto that plane. **`[admin] auth = "hmac"` only
 authenticates cluster-wide when paired with `[crypto].enabled = true`.**
 
+## Attaching a service or a client: `boot_wait`
+
+Everything above configures the **node**. The two attaching sides have one
+key of their own, added in `2.13.0`:
+
+**`ServiceConfig::boot_wait: Duration`** (`uc_service`) and
+**`EngineConfig::boot_wait: Duration`** (`uc_client`, read by
+`Client::connect` and `Engine::attach`).
+
+**Default: 10 seconds.** `Duration::ZERO` disables the wait entirely and
+restores the pre-`2.13.0` behaviour of failing on the first look. Set it with
+`ServiceConfig::with_boot_wait(..)`; `EngineConfig` is a plain struct, so set
+the field.
+
+What it waits for. Since `2.13.0` a node does not publish its declared set —
+the word both attach doors read — at `Node::start`. It publishes it from the
+consensus pass, on the first pass where the node **knows a leader**, has
+**learned a commit position** (its own quorum ranking as leader, or a
+leader's gossip), and its cluster FSM has **consumed the log up to that
+commit**. In one sentence: *the node has joined its cluster and applied every
+committed `CLUSTER` frame, upgrade pins included.* Until then both doors
+refuse with:
+
+- `ServiceError::NodeBooting` — the service side;
+- `ClientError::NodeBooting` — the client side.
+
+`NodeBooting` means "the node has not joined its cluster yet", **not** "the
+cnc page is missing or malformed" — a missing or wrong-`app_id` page is a
+different, immediate refusal. It is a retry-and-it-will-clear condition, and
+`boot_wait` is how long `start*` / `connect` / `attach` retry it internally
+(re-reading the page every 20 ms) before handing the error back to you.
+
+Why a gate at all: an upgrade pin committed *above* the artifact a restarting
+node recovered from is invisible to that node for the few passes it takes to
+catch up. A service that attached inside that window would read "no pin" and
+replay from genesis under the new binary. The gate makes "no pin" a statement
+about committed cluster state instead. See
+[Upgrade a cluster](../how-to/upgrade-a-cluster.md).
+
+Two operational consequences:
+
+- **In one process, start every node before attaching any service.** A
+  harness or embedded deployment that brings up N nodes and their services
+  interleaved — start node 0, attach its service, start node 1, … — deadlocks
+  against its own `boot_wait`: node 0 cannot know a leader until enough peers
+  exist to elect one, so its service's attach burns the whole wait while the
+  peer that would end it has not been started. Start all N nodes first, then
+  attach.
+- **A saturated node wants a larger `boot_wait`.** The cluster FSM applies at
+  `min(commit, durable)`, so a node whose own durable position persistently
+  trails commit never satisfies the third clause and the gate stays shut.
+
 ## Cluster limits
 
 | Limit | Value | Origin |

@@ -236,9 +236,70 @@ names an origin whose artifact is not on this node — the complete set at that
 instant was pruned or never fetched; there is no sound fallback, since a
 different artifact is a different instant and genesis is the counterfactual).
 
+**Your `freeze`/`stream_snapshot` determinism is now CHECKED, live** (2.13.0).
+As the builder thread streams an artifact it hashes the payload bytes going
+past — SHA-256, first 8 bytes as a `u64` — and publishes that hash in the
+row's cnc slot (line 7 `+504 artifact_hash`, written immediately **before**
+`snapshot_pos`, so a reader that sees `snapshot_pos == P` is already seeing
+the hash of the artifact at `P`). On its own set-complete edge every node —
+voter and learner alike — reports `(row, P, hash)` to the leader, the leader
+commits one `SnapshotReport` record naming everyone who reported, and every
+replica computes the same verdict from it.
+
+What that means for you: **two replicas' artifacts at the same instant must
+be byte-identical**, and if they are not the cluster now says so by name
+rather than discovering it at an install months later. The usual causes are
+the usual determinism traps moved one layer out — a `HashMap`'s iteration
+order serialized directly, a float formatted for output, a host timestamp or
+a process id folded into the image, or an encoder whose output depends on
+allocation addresses. Serialize from an ordered structure, or sort before you
+write. See [Monitor a cluster](../how-to/monitor-a-cluster.md) for
+`uc2_snapshot_hash_mismatch` and the `snapshot_hash_diverged` event, and
+`uc2ctl upgrade show` for the per-instant verdict.
+
+The hash is deliberately over the **payload only** — the 24-byte envelope is
+identical across nodes by construction — and it is an integrity/determinism
+check, not a security one: it is computed by the service that wrote the bytes,
+under a threat model in which a compromised host is out of scope.
+
 See [Instance directory § The artifact envelope](instance-directory.md#the-artifact-envelope-and-who-deletes-artifacts),
 [The cluster FSM, explained § Instants](../notes/uc2-cluster-fsm-explained.md#instants-one-position-one-set)
 and [§ Pins and reports](../notes/uc2-cluster-fsm-explained.md#pins-and-reports-2130).
+
+## Attaching: the node must have joined its cluster first
+
+`ServiceBuilder::start()` / `start_with_snapshots()` attach to a running
+node's shared memory. Since `2.13.0` that attach is **gated**: the node does
+not publish its declared set — the word the attach door reads — at
+`Node::start`. It publishes it from the consensus pass, on the first pass
+where it knows a leader, has learned a commit position, and its cluster FSM
+has consumed the log up to that commit. In one line: *the node has joined its
+cluster and applied every committed `CLUSTER` frame, upgrade pins included.*
+
+Until then `start*` gets `ServiceError::NodeBooting` — "this node has not
+joined its cluster yet", **not** "its page is missing or half-written". The
+builder waits it out for you, re-reading every 20 ms, bounded by
+**`ServiceConfig::boot_wait`** (default **10 s**; `Duration::ZERO` disables
+the wait and restores the pre-`2.13.0` fail-on-first-look). The client side
+has the identical key, `EngineConfig::boot_wait`, read by `Client::connect`
+and `Engine::attach`.
+
+Why: an upgrade pin committed *above* the artifact a restarting node
+recovered from is invisible on that node's page for the few passes it takes
+to catch up. Without the gate, a service attaching inside that window reads
+"no pin", skips the pinned install, and replays from genesis under the new
+binary — silently. The gate makes "no pin" a claim about committed cluster
+state rather than about whatever this node's artifact happened to contain.
+
+**If you bring up several nodes in one process, start every node before you
+attach any service.** Interleaving them — start node 0, attach its service,
+start node 1 — spends node 0's whole `boot_wait` waiting for a leader that
+cannot be elected until a peer you have not started yet exists. Two passes:
+all the nodes, then all the services. (Test harnesses in this repo do exactly
+that; see `testing/uc_crashtest`.)
+
+See [Configuration § Attaching a service or a client](configuration.md) and
+[Limits § Standing constraints](limits.md#standing-constraints).
 
 ## The blanket adapter and the byte-identity promise
 

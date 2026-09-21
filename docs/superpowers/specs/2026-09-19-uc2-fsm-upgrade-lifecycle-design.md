@@ -1148,6 +1148,123 @@ Three consequences:
 
 #### 6.5.2 Live nondeterminism detection
 
+#### Errata (plan B3, as built)
+
+Nine places execution diverged from the section below, or filled in a detail
+it left open. Read them BEFORE the body: two of them change what the
+mechanism actually does (8 and 9), and one item is dropped outright (5).
+"Item N" below means item N of the body's "The mechanism, decided" list.
+
+1. **The hash is taken SERVICE-side, not node-side.** Item 1 says "the
+   node is the right party — a service should not grade its own image", but
+   `builder_agent` runs in the **service** process (`uc_service::
+   builder_agent`): the node never streams a row artifact and only ever sees
+   the finished file. Hashing where the bytes are already flowing costs no
+   I/O; a node-side re-read would cost the artifact's full size per instant
+   on a node polling agent. Under this spec's threat model — a compromised
+   host is out of scope — the two are equivalent, so the argument for
+   node-side hashing has no force here. The hash is SHA-256 over the
+   artifact's PAYLOAD, truncated to its first 8 bytes as a `u64` LE,
+   published in the row's cnc slot line 7 at `+504` (`artifact_hash`)
+   immediately BEFORE `snapshot_pos`, so a reader that `Acquire`-loads
+   `snapshot_pos == P` already sees the hash of the artifact at `P`.
+2. **The body carries `node_id`.** `SnapReportBody` is `row u8 @0 ‖ reserved
+   [u8; 3] @1 ‖ node_id u32 @4 ‖ position u64 @8 ‖ hash u64 @16`, 24 bytes,
+   `Scope::Pairwise`, kind **26**. The sender names itself — the
+   `READ_PROBE_ACK` shape — so the leader can membership-check it and key its
+   vector without a reverse address lookup.
+3. **Learners report too.** Item 2 says "a node's artifact"; as built, every
+   node with a declared row reports on its own LOCAL set-complete edge,
+   learners included. A learner's hash is evidence about the cluster's
+   artifacts exactly as a voter's is, and it rides the committed record. It
+   never counts toward the release (erratum 8).
+4. **The timeout is a fixed leader-side constant,
+   `SNAP_REPORT_TIMEOUT_NS = 5 s`,** not a replicated setting. It is a
+   diagnostic deadline on a record nothing waits for, so the cost of getting
+   it wrong is bounded and one more `Settings` field is not worth the flag
+   day.
+5. **The metrics-only complement is DROPPED.** "Why through the log rather
+   than metrics alone" calls the metrics form "worth shipping as a
+   complement"; it is not shipped, and deliberately. A per-instant hash is
+   only comparable across nodes if the position is a **label**, and position
+   is unbounded — that is a cardinality bomb in every scrape, forever, for a
+   signal the log form already carries. B1's `uc2_snapshot_hash_mismatch` +
+   `Uc2SnapshotHashDiverged` are the alerting surface, and `uc2ctl status`
+   prints `artifact_hash=` per row for a manual cross-node comparison when
+   one is wanted.
+6. **The cluster FSM's own artifact is not reported.** `SnapshotReport.row`
+   is a declared row, `0..8`; `service_id = 255` is outside it, so the
+   cluster image's own determinism is unchecked by this mechanism. It is a
+   far smaller surface than a user FSM's `freeze()` — the image is a function
+   of the committed `CLUSTER` commands and nothing else — but it is a real
+   gap and is on the backlog, not closed here.
+7. **The pins-authoritative gate is a leader-and-commit condition, not a
+   per-row cnc word.** Plan B2 deferred "a service must not attach before the
+   node's committed pins are visible" to this plan, and the shape it
+   suggested was another cnc word per row. As built it is one node-wide gate:
+   `services_declared` — the word every attach door already reads — is
+   published from the consensus pass rather than at `Node::start`. This makes
+   "no pin" a statement about **committed cluster state** instead of a
+   statement about whatever this node's recovered artifact happened to
+   contain, which is the property B2 could not get.
+8. **Release on EVERY VOTER or the timeout, not on a quorum.** Item 3 says
+   "once a quorum has reported for `(row, P)`, or on a timeout". As built the
+   leader appends when every voter in the **current membership** has reported
+   that `(row, P)`, or `SNAP_REPORT_TIMEOUT_NS` after the FIRST report for
+   it, whichever comes first.
+
+   *Why.* Item 4's purpose is to **name the minority**. A quorum trigger
+   releases the record the instant a majority has reported, which
+   structurally omits whichever replica is slowest to complete its set — and
+   that is not a random replica: measured on a three-node cluster, one node's
+   set-complete edge trails the other two by ~24 ms on every instant after
+   the first, and it is the same node each time within a process. So a quorum
+   trigger would have excluded one fixed node from every record it ever
+   wrote, and the divergent replica in a live incident could easily be
+   exactly the one the trigger left out. Worse, on three nodes a two-hash
+   record has **no majority at all** — `verdict` correctly answers
+   `NO_MAJORITY` — so it names nobody, and item 4 produces nothing.
+
+   *The cost.* A permanently dead or slow voter delays each `(row, P)` record
+   by at most 5 s and never blocks it. That is diagnostic latency only: the
+   record is on neither the commit path nor the snapshot-completeness path,
+   and nothing waits on it. The reason a quorum was attractive — do not stall
+   on a dead node — is served by the timeout, which was already in item 3.
+
+   *Learners.* They still report and their hashes still ride the record; they
+   never pace the release. One visible consequence of reading the current
+   membership: an **uncommitted** promote or add makes the still-catching-up
+   node a required voter, so every instant in that window waits out the full
+   5 s and increments `uc2_snapshot_reports_timed_out_total`.
+9. **The gate's second clause reads the WALK CURSOR and requires a LEARNED
+   commit.** Erratum 7's gate was planned as "(a) the node knows a leader and
+   (b) `cluster_view.position >= commit`". Neither half survived contact:
+
+   - `ClusterView::position` is the published VIEW's tag and moves only when
+     a pass applies a `CLUSTER` frame. On a cluster carrying ordinary traffic
+     and no cluster commands — the normal case — it sits still while commit
+     climbs, so it could never catch commit. A new word, `ClusterView::
+     consumed`, carries the `uc2-cluster` agent's walk cursor, advanced by
+     one `fetch_max` per duty cycle whether or not anything applied, and the
+     gate reads that.
+   - A third clause, `ElectionSm::commit_learned()`, is required. A restarted
+     single voter is its own leader within a pass or two of boot, while its
+     commit counter is still `0` (`LogCounters::prime` deliberately does not
+     seed `commit`) and its cluster FSM is still at the artifact it
+     recovered — so "consumed ≥ commit" was vacuously true and the gate
+     opened **exactly for the node whose pin sits above its recovered
+     artifact**, the one case the gate exists for. `commit_learned` is true
+     once this node has ranked a commit as leader or taken one from a
+     leader's gossip; only then does `commit` cover everything the cluster
+     committed, pin included.
+
+   As built: leader known **and** `commit_learned()` **and** `consumed >=
+   commit`, with `commit` read first so the comparison proves the agent has
+   consumed everything committed as of a moment no later than the commit
+   reading. The attaching side gets a bounded `NodeBooting` wait,
+   `ServiceConfig::boot_wait` / `EngineConfig::boot_wait`, default 10 s,
+   `Duration::ZERO` = no wait.
+
 Every instance of a row on every node started from the same origin and applied
 the same log, so at every coordinated snapshot instant their artifacts at P
 **must be byte-identical**. Today nothing checks: `Uc2SnapshotSetDiverged`
