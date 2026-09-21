@@ -18,6 +18,12 @@ pub enum Surface {
     Sched,
     ProjectionOrigin,
     ProjectionEnd,
+    /// `ApplyCtx::ids_calls` — how many times this frame's apply/on_timer
+    /// minted a generator (plan B2 T6, spec §8.1's determinism hazard).
+    Ids,
+    /// The `on_committed` result the driver recorded for this frame, when
+    /// run with an output handler (plan B2 T6).
+    Output,
 }
 
 impl Surface {
@@ -30,6 +36,8 @@ impl Surface {
             "sched" => Surface::Sched,
             "projection_origin" => Surface::ProjectionOrigin,
             "projection_end" => Surface::ProjectionEnd,
+            "ids" => Surface::Ids,
+            "output" => Surface::Output,
             _ => return None,
         })
     }
@@ -38,13 +46,15 @@ impl Surface {
     /// everywhere a surface is written out: the declaration match in
     /// `confirm`, the text report, and the JSON (`rename_all =
     /// "snake_case"`). A round-trip test pins `parse(name()) == Some(self)`
-    /// over all four, so the two can never drift apart.
+    /// over all six, so the two can never drift apart.
     pub fn name(&self) -> &'static str {
         match self {
             Surface::Response => "response",
             Surface::Sched => "sched",
             Surface::ProjectionOrigin => "projection_origin",
             Surface::ProjectionEnd => "projection_end",
+            Surface::Ids => "ids",
+            Surface::Output => "output",
         }
     }
 }
@@ -182,6 +192,27 @@ pub fn diff(a: &Trace, b: &Trace) -> anyhow::Result<Profile> {
                 surface: Surface::Sched,
                 a: enc(&ea.sched),
                 b: enc(&eb.sched),
+            });
+        }
+        if ea.ids_calls != eb.ids_calls {
+            p.entries.push(Divergence {
+                pos,
+                tag: ea.tag.clone(),
+                timer_id: timer_id(ea),
+                surface: Surface::Ids,
+                a: ea.ids_calls.to_string().into_bytes(),
+                b: eb.ids_calls.to_string().into_bytes(),
+            });
+        }
+        if ea.output != eb.output {
+            let enc = |o: &Option<String>| serde_json::to_vec(o).unwrap_or_default();
+            p.entries.push(Divergence {
+                pos,
+                tag: ea.tag.clone(),
+                timer_id: timer_id(ea),
+                surface: Surface::Output,
+                a: enc(&ea.output),
+                b: enc(&eb.output),
             });
         }
     }

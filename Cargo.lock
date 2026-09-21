@@ -1454,6 +1454,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "tokio",
  "toml",
  "uc_client",
  "uc_journal",

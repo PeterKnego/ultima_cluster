@@ -56,7 +56,8 @@ pub struct Touched {
 #[derive(Deserialize, Debug, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct Expect {
-    /// `response` | `sched` | `projection_origin` | `projection_end`
+    /// `response` | `sched` | `projection_origin` | `projection_end` | `ids`
+    /// | `output`
     pub surface: String,
     #[serde(default)]
     pub arm: Option<String>,
@@ -79,7 +80,7 @@ impl Declaration {
             let Some(surface) = Surface::parse(&e.surface) else {
                 anyhow::bail!(
                     "declaration: unknown surface \"{}\" in [[expect]]; expected \
-                     response | sched | projection_origin | projection_end",
+                     response | sched | projection_origin | projection_end | ids | output",
                     e.surface
                 );
             };

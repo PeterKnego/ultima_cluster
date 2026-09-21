@@ -104,7 +104,7 @@ fn table_ticks_deliver_strictly_increasing_deadlines_and_report_table_consumed()
     let mut c = ctx(64, 1_000);
     t.on_timer(&mut c, tev(5, 1_000));
     assert_eq!(t.inner().fired, vec![(64, 5, 1_000)]);
-    let recs = c.take_sched_records_for_test(); // see note
+    let recs = c.take_sched_records();
     assert_eq!(recs.len(), 1);
     assert_eq!(
         (recs[0].op, recs[0].timer_id, recs[0].deadline_ns),
@@ -113,10 +113,7 @@ fn table_ticks_deliver_strictly_increasing_deadlines_and_report_table_consumed()
     let mut c = ctx(128, 1_000);
     t.on_timer(&mut c, tev(5, 1_000)); // duplicate (a re-fire): dropped, still reported
     assert_eq!(t.inner().fired.len(), 1);
-    assert_eq!(
-        c.take_sched_records_for_test()[0].op,
-        SchedOp::TableConsumed
-    );
+    assert_eq!(c.take_sched_records()[0].op, SchedOp::TableConsumed);
     let mut c = ctx(192, 900);
     t.on_timer(&mut c, tev(5, 900)); // an OLDER tick after a newer one: dropped
     assert_eq!(t.inner().fired.len(), 1);

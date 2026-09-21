@@ -37,6 +37,19 @@ pub struct Entry {
     pub tag: Vec<u8>,
     pub response: Vec<u8>,
     pub sched: Vec<Sched>,
+    /// How many times this frame's `apply`/`on_timer` called `ctx.ids()`
+    /// (`ApplyCtx::ids_calls`) — a changed count between two builds is a
+    /// determinism hazard the spec (§8.1) names explicitly, so it is a
+    /// captured surface (`Surface::Ids`) rather than invisible.
+    #[serde(default)]
+    pub ids_calls: u32,
+    /// The `on_committed` result for this frame, when the driver was given
+    /// an output handler (`drive::DriveOptions`): `"ok"`, `"retryable:
+    /// <msg>"`, or `"permanent: <msg>"`. `None` when no handler ran — never
+    /// confused with a successful `"ok"` (`Surface::Output`). Timer frames
+    /// never carry one: `on_committed` only runs for a committed MESSAGE.
+    #[serde(default)]
+    pub output: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -85,6 +98,8 @@ mod tests {
                     tag: vec![0, 7],
                     response: vec![0],
                     sched: vec![],
+                    ids_calls: 1,
+                    output: Some("ok".into()),
                 },
                 Entry {
                     pos: 64,
@@ -100,6 +115,8 @@ mod tests {
                         id: 9,
                         deadline_ns: 50,
                     }],
+                    ids_calls: 0,
+                    output: None,
                 },
             ],
         };

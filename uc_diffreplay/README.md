@@ -66,23 +66,28 @@ Spec: `docs/superpowers/specs/2026-09-19-uc2-fsm-upgrade-lifecycle-design.md`.
 ## What this does not compare
 
 Spec §4.2 lists the surfaces an FSM is observable through and argues the list
-is complete. The **driver captures three of them**: response bytes per
-position, `svc_sched` records per position, and the state projection at the
-origin and at the end. Those three are compared, and a divergence on any of
-them is a finding.
+is complete. The **driver captures five of them**: response bytes per
+position, `svc_sched` records per position, the state projection at the
+origin and at the end, `ApplyCtx::ids_calls` per position, and — when
+`drive_with` is given a `RawOutputHandler` — the `on_committed` result per
+position. Those five are compared, and a divergence on any of them is a
+finding.
 
-These are **not captured**, so an empty diff says nothing about them:
+This one is **not captured**, so an empty diff says nothing about it:
 
-- **`on_committed` emissions.** The driver runs no output handler, so the
-  external-effect sequence is not observed at all. Closing this is an SDK
-  change (an output-handler recorder in the driver).
-- **Ids the FSM mints.** `ApplyCtx::ids()` returns a fresh generator per call
-  and exposes no mint count, so ids are observed only *indirectly* — through
-  the state and the responses they end up in. A change that mints a different
-  number of ids without that showing in state or a response is invisible
-  here.
 - **Probe-query answers.** The projection is the state view instead: thorough
   and O(state), where the queries would have been cheap and partial.
+
+Two notes on the two surfaces that ARE captured but conditionally:
+
+- **`on_committed` emissions** are only recorded when the caller passes a
+  handler to `drive_with` (`drive` itself passes none, via `DriveOptions::
+  default()`) — `Entry.output` is `None`, not a passing comparison, when no
+  handler ran on either side.
+- **Ids the FSM mints** are captured as a per-frame *count*
+  (`ApplyCtx::ids_calls`), not as the ids themselves — a build that mints a
+  different number of ids for the same frame shows up as a `Surface::Ids`
+  divergence even if every id it DID mint matches.
 
 The report names the mode's own further caveats in its `notes` (for example
 `reconstruction` does not compare the origin projection at all).
@@ -91,11 +96,12 @@ The report names the mode's own further caveats in its `notes` (for example
 
 JSON, `uc_diffreplay::trace::Trace`: `row`, `version`, `origin`, `end`,
 `projection_at_origin`, `projection_at_end`, and `entries[]` of
-`{ pos, kind: "Message" | { "Timer": { id, deadline_ns, table } }, tag, response, sched[] }`.
+`{ pos, kind: "Message" | { "Timer": { id, deadline_ns, table } }, tag, response, sched[], ids_calls, output }`.
 `tag` is the first 32 bytes of the command payload — an app-defined
 discriminant, opaque to the harness; `tag_offset` in the declaration says
-where the app's own bytes start. A non-Rust app produces the same JSON and
-takes part in every mode.
+where the app's own bytes start. `output` is `null` unless the driver ran
+with a `RawOutputHandler`. A non-Rust app produces the same JSON and takes
+part in every mode.
 
 ## Running the tests
 
