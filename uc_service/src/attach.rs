@@ -336,6 +336,20 @@ pub(crate) fn attach<S: RawStateMachine>(
         Some((origin, _, _)) => origin,
         None => last_applied.unwrap_or(0),
     };
+    // …and the pinned `start_pos` gets the SAME drift bound the unpinned one
+    // was just given. `last_applied` was checked above, but the pinned arm
+    // replaces it with the ORIGIN, which is not the state machine's number at
+    // all: it comes off the cnc page. A store-only `uc2ctl snapshot fetch`
+    // (spec §5, admin op 9) can leave an artifact ABOVE this node's durable
+    // frontier, and a pin naming it would publish `applied` above `durable` —
+    // which the node's floor hold reads, so it must be bounded like every
+    // other published `applied`.
+    if start_pos > frontier {
+        return Err(ServiceError::Drift {
+            service: start_pos,
+            journal: frontier,
+        });
+    }
     // `s` is the same slot reference taken for the pin read in step 1d.
     s.applied.store_release(start_pos);
     // Status: attached, incarnation += 1 (the prior life's value survives a

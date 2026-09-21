@@ -397,10 +397,15 @@ impl Fixture {
     /// st.pin_for(row)`), and no test in this file commits an `UpgradePin`
     /// command — so the single-writer rule on those four words holds.
     fn pin(&self, from: u32, to: u32) {
+        self.pin_at(self.p, from, to);
+    }
+
+    /// [`Fixture::pin`] at an origin other than the fixture's instant.
+    fn pin_at(&self, origin: u64, from: u32, to: u32) {
         self.cnc()
             .service_slot(0)
             .status
-            .store_pin(self.p, from, to);
+            .store_pin(origin, from, to);
     }
 
     fn stop(self) {
@@ -921,6 +926,55 @@ fn a_pinned_attach_survives_a_cadence_instant_after_the_pin() {
     );
     assert_eq!(svc2.pinned(), Some((origin, V1, V2)));
     svc2.stop();
+    f.stop();
+}
+
+/// Plan B2 (final review I4): the pinned arm replaces the published `applied`
+/// with the ORIGIN — a number off the cnc page, not the state machine's — so
+/// it gets the SAME drift bound the unpinned arm has always had.
+///
+/// The state under test is reachable: a store-only `uc2ctl snapshot fetch`
+/// (admin op 9) can leave an artifact ABOVE this node's durable frontier, and
+/// a pin naming it would otherwise publish `applied` above `durable`, which
+/// the node's floor hold reads. The artifact here is a genuine v1 image
+/// republished at that position through the row's own [`SnapshotStore`] —
+/// nothing hand-written — so the install itself succeeds and the refusal is
+/// the drift check, not an envelope check.
+#[test]
+fn a_pinned_origin_above_the_durable_frontier_is_a_drift_refusal() {
+    let f = Fixture::new("pin-drift");
+    let cnc = f.cnc();
+    let applied_before = cnc.service_slot(0).applied.load_acquire();
+    let frontier = cnc.counters().durable.load_acquire();
+    let origin = frontier + BUFFER_BYTES as u64;
+
+    let store = SnapshotStore::open(f.path(), 0).unwrap();
+    let mut v1 = RegisterSm::default();
+    let mut art = std::fs::File::open(f.artifact()).unwrap();
+    verify_snapshot_envelope(&mut art, f.p, Some(V1)).unwrap();
+    SnapshotStateMachine::install_snapshot(&mut v1, f.p, &mut art).unwrap();
+    let (handle, _) = SnapshotStateMachine::freeze(&v1).unwrap();
+    store
+        .publish(origin, V1, |w| {
+            <RegisterSm as SnapshotStateMachine>::stream_snapshot(handle, w)
+        })
+        .unwrap();
+
+    f.pin_at(origin, V1, V2);
+    let err = ServiceBuilder::new(cfg(f.path(), f.app), DoublingRegisterSm::default())
+        .start_with_snapshots()
+        .err()
+        .expect("refused");
+    assert!(
+        matches!(err, ServiceError::Drift { service, journal }
+                 if service == origin && journal < origin),
+        "{err}"
+    );
+    assert_eq!(
+        cnc.service_slot(0).applied.load_acquire(),
+        applied_before,
+        "a refused attach does not republish `applied`"
+    );
     f.stop();
 }
 
