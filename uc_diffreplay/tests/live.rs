@@ -80,6 +80,50 @@ fn a_refused_attach_is_a_nonzero_exit_with_the_error_on_stderr() {
     node.stop();
 }
 
+/// Every rig-failure path in `pinverify::run` drops an attached `AppProcess`
+/// without reaching its `stop` — and an orphaned service does NOT exit on
+/// its own (`uc_service` fail-stops only when the node's `instance_id`
+/// CHANGES, and an in-process `Node::stop` leaves the cnc page intact), so
+/// it would spin a core against a dead node for the life of the process.
+/// Dropping the handle must therefore kill AND reap it.
+#[test]
+fn dropping_an_attached_app_kills_and_reaps_it() {
+    let inst = common::tempdir();
+    let dir = inst.path();
+    let node = start_node(dir, "livedrop", common::register_name(), T).unwrap();
+    let cnc = CncPage::open_file(&dir.join("cnc2.dat"), "livedrop").unwrap();
+    let before = uc_diffreplay::live::incarnation(&cnc, 0);
+    let mut app = spawn_app(
+        &common::register_replay_bin(),
+        &["serve".to_string()],
+        dir,
+        "livedrop",
+        &dir.join("drop.stderr"),
+    )
+    .unwrap();
+    assert!(
+        matches!(
+            app.wait_attached(&cnc, 0, before, T),
+            AttachOutcome::Attached
+        ),
+        "{}",
+        app.stderr()
+    );
+    let pid = app.pid() as libc::pid_t;
+    // The rig-failure path: no `stop`, just the `?` unwinding out of scope.
+    drop(app);
+    // Signal 0 probes for the process without sending anything: ESRCH means
+    // it is gone AND reaped (a zombie would still be found).
+    let rc = unsafe { libc::kill(pid, 0) };
+    let err = std::io::Error::last_os_error();
+    assert_eq!(
+        rc, -1,
+        "pid {pid} is still alive after the handle was dropped"
+    );
+    assert_eq!(err.raw_os_error(), Some(libc::ESRCH), "{err}");
+    node.stop();
+}
+
 /// The other half of the rig: [`message_frames`] indexes a corpus's recorded
 /// commands, and [`replay_span`] puts them back on the wire — onto a node
 /// that has never seen them, through the app's own binary.

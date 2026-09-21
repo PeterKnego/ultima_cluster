@@ -298,6 +298,13 @@ impl AppProcess {
         std::fs::read_to_string(&self.stderr_path).unwrap_or_default()
     }
 
+    /// The child's pid, while it is still ours (see [`AppProcess::stop`]'s
+    /// SAFETY note). Exposed so a test can look for the process AFTER the
+    /// handle is dropped.
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
     /// Poll `cond` against the page until it holds (→ `Attached`) or the
     /// child exits first (→ `Exited` with its code and stderr), bounded by
     /// `timeout` (→ `TimedOut`, the child killed and reaped).
@@ -372,6 +379,13 @@ impl AppProcess {
     /// a killed child returns `Err` naming the timeout, never a silent
     /// success that a caller could read as a clean stop.
     pub fn stop(mut self, timeout: Duration) -> anyhow::Result<std::process::ExitStatus> {
+        let st = self.stop_inner(timeout);
+        // `self` drops here; `stop_inner` has set `reaped`, so `Drop` is a
+        // no-op and the child is never signalled twice.
+        st
+    }
+
+    fn stop_inner(&mut self, timeout: Duration) -> anyhow::Result<std::process::ExitStatus> {
         if !self.reaped {
             // SAFETY: `reaped` is false, so this is a pid we spawned and
             // have NOT waited for — the kernel is still holding it for us
@@ -387,15 +401,63 @@ impl AppProcess {
         let deadline = Instant::now() + timeout;
         loop {
             if let Some(st) = self.child.try_wait()? {
+                self.reaped = true;
                 return Ok(st);
             }
             if Instant::now() >= deadline {
                 self.child.kill()?;
                 let st = self.child.wait()?;
+                self.reaped = true;
                 bail!("the service did not stop within {timeout:?} after SIGTERM; killed ({st})");
             }
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+}
+
+/// How long [`AppProcess`]'s `Drop` gives a child to honour SIGTERM before
+/// killing it. Short on purpose: the drop path is a rig FAILURE path, where
+/// the caller is already unwinding and a clean shutdown is a courtesy, not a
+/// result anyone will read.
+const DROP_GRACE: Duration = Duration::from_secs(2);
+
+impl Drop for AppProcess {
+    /// A child this rig spawned must never outlive the run. [`AppProcess::stop`]
+    /// consumes `self` and is the CLEAN path — it reports how the child went;
+    /// this covers every other way the handle can go out of scope, which is
+    /// every `?` and `bail!` between a successful attach and that call.
+    ///
+    /// It has to kill AND reap, because an orphaned service does not stop on
+    /// its own: `uc_service` fail-stops only when the node's `instance_id`
+    /// CHANGES (`uc_service/src/apply.rs`), and an in-process `Node::stop`
+    /// leaves the cnc page — id and all — intact, so the apply loop would
+    /// busy-spin against a dead node for the life of the process.
+    fn drop(&mut self) {
+        if self.reaped {
+            return;
+        }
+        // SAFETY: `reaped` is false, so the pid is still ours and cannot have
+        // been recycled — the same argument `stop_inner` makes.
+        unsafe {
+            libc::kill(self.child.id() as libc::pid_t, libc::SIGTERM);
+        }
+        let deadline = Instant::now() + DROP_GRACE;
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(5))
+                }
+                // Past the grace, or a `wait` that errored: SIGKILL and reap.
+                // Nothing here can report a failure, so nothing here tries.
+                _ => {
+                    let _ = self.child.kill();
+                    let _ = self.child.wait();
+                    break;
+                }
+            }
+        }
+        self.reaped = true;
     }
 }
 

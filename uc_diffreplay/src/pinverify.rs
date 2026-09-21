@@ -65,9 +65,19 @@ pub enum Verdict {
 }
 
 /// The admin answer to `uc2ctl upgrade pin` (`status`/`reason` as the cnc
-/// admin band carries them; `0`/`0` is accepted).
+/// admin band carries them).
+///
+/// `status`/`reason` alone carry no information: [`crate::live::pin_row`]
+/// returns `Ok` **only** on status 0, every refusal being an `Err` that the
+/// run records in `notes` — so an accepted pin and a pin that was never
+/// placed both read `{0, 0}`. `placed` is the bit that tells them apart, and
+/// it is what the text render speaks from; the two words stay in the JSON
+/// because the report's shape is fixed, and because a future `pin_row` that
+/// returns a non-zero status would have somewhere to put it.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PinArm {
+    #[serde(default)]
+    pub placed: bool,
     pub status: u32,
     pub reason: u32,
 }
@@ -180,12 +190,18 @@ impl PinVerifyReport {
         )?;
         writeln!(
             w,
-            "  pin: {} → {} at origin {} — admin status={} reason={}",
+            "  pin: {} → {} at origin {} — {}",
             VersionDisplay(self.from),
             VersionDisplay(self.to),
             self.origin,
-            self.pin.status,
-            self.pin.reason
+            if self.pin.placed {
+                format!(
+                    "accepted (admin op 10, status {} reason {})",
+                    self.pin.status, self.pin.reason
+                )
+            } else {
+                "NOT PLACED — see the notes".to_string()
+            }
         )?;
         writeln!(
             w,
@@ -495,6 +511,12 @@ mod sequence {
         // The frontier X is the row's published `applied` CURSOR — the position
         // after the last applied frame — never the last response's position,
         // which is that frame's START (`live::SpanReplay::last_position`).
+        // The `submitted > 0` guard: an empty tail is reachable only for a
+        // one-frame corpus (the clamp above forces `split <= len - 1`
+        // otherwise), and there `last_position` is 0 and there is nothing to
+        // wait past — the snap-P wait just above already proves the row
+        // applied through P, which is at or above every frame this run
+        // submitted. So X is read directly rather than waited for.
         let applied = || cnc.service_slot(a.row as usize).applied.load_acquire();
         if tail.submitted > 0 && !live::wait_for(|| applied() > tail.last_position, a.timeout) {
             bail!(
@@ -517,6 +539,7 @@ mod sequence {
         match live::pin_row(&dir, &cnc, a.row, r.from, a.to, p, a.timeout) {
             Ok(resp) => {
                 r.pin = PinArm {
+                    placed: true,
                     status: resp.status,
                     reason: resp.reason,
                 }
@@ -581,7 +604,13 @@ mod sequence {
                     describe(&other)
                 ));
                 if attached {
-                    let _ = stale.stop(a.timeout);
+                    // A stale binary that will not stop holds the row's
+                    // lock, and the next symptom would be NEW failing to
+                    // attach — reported with the wrong cause. Say it here.
+                    if let Err(e) = stale.stop(a.timeout) {
+                        r.notes
+                            .push(format!("the stale binary did not stop cleanly: {e}"));
+                    }
                 }
                 false
             }
@@ -608,9 +637,12 @@ mod sequence {
         }
         r.swap.version_seen = cnc.service_slot(a.row as usize).status.version();
         if r.swap.version_seen != a.to {
+            // One spelling of a version per report: `VersionDisplay`, the
+            // same one the text render and `uc2ctl status` use.
             r.notes.push(format!(
-                "NEW attached as version {:#010x} but --to named {:#010x}",
-                r.swap.version_seen, a.to
+                "NEW attached as version {} but --to named {}",
+                VersionDisplay(r.swap.version_seen),
+                VersionDisplay(a.to)
             ));
         }
         r.swap.caught_up = matches!(
@@ -663,16 +695,15 @@ mod sequence {
         // the rig's purge is OFF. If it is not, the genesis path would silently
         // be "from the first retained block" — a different claim — so the
         // comparison is left uncompared instead.
-        let first_meta = match note_err(
+        // `Some(None)` — no blocks at all — is not evidence of genesis
+        // either; only a journal that SAYS it starts at 0 earns the claim.
+        let first_meta: Option<Option<u64>> = note_err(
             &mut r.notes,
             "reading the exported journal's first block",
             TailReader::open(&ec.journal_dir())
                 .and_then(|t| t.first_meta())
                 .map_err(|e| anyhow::anyhow!("{e}")),
-        ) {
-            Some(m) => m.unwrap_or(0),
-            None => u64::MAX,
-        };
+        );
         let art = note_err(
             &mut r.notes,
             "NEW's artifact-path replay",
@@ -684,8 +715,8 @@ mod sequence {
                 false,
             ),
         );
-        let genesis = if first_meta == 0 {
-            note_err(
+        let genesis = match first_meta {
+            Some(Some(0)) => note_err(
                 &mut r.notes,
                 "NEW's genesis-path replay",
                 run_replay(
@@ -695,13 +726,30 @@ mod sequence {
                     &scratch.join("genesis.json"),
                     true,
                 ),
-            )
-        } else {
-            r.notes.push(format!(
-                "the exported journal starts at position {first_meta}, not 0, so a `--from-genesis` \
-                 replay would not be a genesis replay; the counterfactual was NOT computed"
-            ));
-            None
+            ),
+            Some(Some(n)) => {
+                r.notes.push(format!(
+                    "the exported journal starts at position {n}, not 0, so a `--from-genesis` \
+                     replay would not be a genesis replay; the counterfactual was NOT computed"
+                ));
+                None
+            }
+            Some(None) => {
+                r.notes.push(
+                    "the exported journal holds no blocks, so it cannot say that it starts at 0; \
+                     the counterfactual was NOT computed"
+                        .into(),
+                );
+                None
+            }
+            None => {
+                r.notes.push(
+                    "the exported journal's first block is unreadable (see the note above), so no \
+                     genesis claim is made; the counterfactual was NOT computed"
+                        .into(),
+                );
+                None
+            }
         };
         let art_p = art.and_then(|t| t.projection_at_end);
         let gen_p = genesis.and_then(|t| t.projection_at_end);
@@ -821,5 +869,23 @@ mod tests {
             assert!(text.contains(phrase), "{phrase:?} missing from:\n{text}");
         }
         assert!(!text.contains("todo"), "{text}");
+        // An unplaced pin must not render as an accepted one: `PinArm`'s
+        // `{status: 0, reason: 0}` is the same for both, so the line speaks
+        // from `placed`.
+        assert!(
+            text.contains("NOT PLACED"),
+            "an empty report's pin line reads as evidence it is not:\n{text}"
+        );
+        let mut placed = PinVerifyReport::empty(PathBuf::from("c"), 0, 2);
+        placed.pin = PinArm {
+            placed: true,
+            status: 0,
+            reason: 0,
+        };
+        let mut buf = Vec::new();
+        placed.write_text(&mut buf).unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        assert!(text.contains("accepted (admin op 10"), "{text}");
+        assert!(!text.contains("NOT PLACED"), "{text}");
     }
 }
