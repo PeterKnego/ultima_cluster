@@ -18,6 +18,11 @@ pub struct Trace {
     /// nothing. May disagree with `version` (this run's own `S::VERSION`):
     /// that disagreement is exactly the case Tasks 3/4's cross-check exists
     /// for.
+    ///
+    /// `#[serde(default)]` so a trace written before this field existed still
+    /// loads — as `None`, which is what "installed nothing recorded" meant
+    /// then. A committed regression corpus outlives the field list.
+    #[serde(default)]
     pub artifact_version: Option<u32>,
     pub origin: u64,
     pub end: u64,
