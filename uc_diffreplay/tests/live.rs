@@ -73,6 +73,9 @@ fn a_refused_attach_is_a_nonzero_exit_with_the_error_on_stderr() {
             assert!(stderr.contains("Error:"), "stderr: {stderr}");
         }
         AttachOutcome::Attached => panic!("a wrong app id must not attach"),
+        AttachOutcome::TimedOut { stderr } => {
+            panic!("a wrong app id must be refused, not time out: {stderr}")
+        }
     }
     node.stop();
 }
@@ -126,8 +129,10 @@ fn a_recorded_span_replays_onto_a_fresh_node() {
         r.last_position > 0,
         "a completed command names its position"
     );
-    // The app applied THROUGH the last response's position — the frontier a
-    // pin-verify sequence hands the next step.
+    // The row's published `applied` cursor reaches the last response's
+    // frame START — and passes it, since `applied` is the cursor AFTER the
+    // batch. That cursor, not `last_position`, is the frontier a pin-verify
+    // sequence hands the next step.
     assert!(
         matches!(
             app.wait_applied(&cnc, 0, r.last_position, T),

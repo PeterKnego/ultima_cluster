@@ -237,13 +237,31 @@ pub fn pin_row(
 pub struct AppProcess {
     child: Child,
     stderr_path: PathBuf,
+    /// Whether the child has already been waited for — by [`wait_cond`]'s
+    /// exit or timeout path. A reaped pid is no longer ours: the kernel may
+    /// hand the number to an unrelated process, so [`AppProcess::stop`]'s
+    /// raw `libc::kill` must not run once this is set.
+    ///
+    /// [`wait_cond`]: AppProcess::wait_cond
+    reaped: bool,
 }
 
-/// What a bounded wait on the child's cnc-page condition saw.
+/// What a bounded wait on the child's cnc-page condition saw. The three
+/// arms are distinct on purpose: a child that exited on its own has an exit
+/// code and said why, while one the wait KILLED never got to — reporting the
+/// second as `Exited { code: None }` would read as a signal death.
 #[derive(Debug)]
 pub enum AttachOutcome {
     Attached,
-    Exited { code: Option<i32>, stderr: String },
+    Exited {
+        code: Option<i32>,
+        stderr: String,
+    },
+    /// The condition never held within the bound; the child was still
+    /// running and has been killed.
+    TimedOut {
+        stderr: String,
+    },
 }
 
 pub fn spawn_app(
@@ -269,6 +287,7 @@ pub fn spawn_app(
     Ok(AppProcess {
         child,
         stderr_path: stderr_path.to_path_buf(),
+        reaped: false,
     })
 }
 
@@ -281,7 +300,7 @@ impl AppProcess {
 
     /// Poll `cond` against the page until it holds (→ `Attached`) or the
     /// child exits first (→ `Exited` with its code and stderr), bounded by
-    /// `timeout` (→ `Exited` with the child killed and `code: None`).
+    /// `timeout` (→ `TimedOut`, the child killed and reaped).
     fn wait_cond(&mut self, mut cond: impl FnMut() -> bool, timeout: Duration) -> AttachOutcome {
         let deadline = Instant::now() + timeout;
         loop {
@@ -293,6 +312,7 @@ impl AppProcess {
             // FIRST, above, and let a child that exited having satisfied the
             // condition be reported as attached.
             if let Ok(Some(st)) = self.child.try_wait() {
+                self.reaped = true;
                 return AttachOutcome::Exited {
                     code: st.code(),
                     stderr: self.stderr(),
@@ -301,8 +321,8 @@ impl AppProcess {
             if Instant::now() >= deadline {
                 let _ = self.child.kill();
                 let _ = self.child.wait();
-                return AttachOutcome::Exited {
-                    code: None,
+                self.reaped = true;
+                return AttachOutcome::TimedOut {
                     stderr: self.stderr(),
                 };
             }
@@ -352,10 +372,17 @@ impl AppProcess {
     /// a killed child returns `Err` naming the timeout, never a silent
     /// success that a caller could read as a clean stop.
     pub fn stop(mut self, timeout: Duration) -> anyhow::Result<std::process::ExitStatus> {
-        // SAFETY: a pid we spawned and have not reaped, so it is still ours;
-        // `kill` with SIGTERM has no memory-safety preconditions.
-        unsafe {
-            libc::kill(self.child.id() as libc::pid_t, libc::SIGTERM);
+        if !self.reaped {
+            // SAFETY: `reaped` is false, so this is a pid we spawned and
+            // have NOT waited for — the kernel is still holding it for us
+            // and cannot have recycled the number. (`kill` itself has no
+            // memory-safety preconditions; the pid's ownership is the
+            // hazard, and that is what the flag guards.) A child already
+            // waited for by `wait_cond` falls through to the cached exit
+            // status below instead.
+            unsafe {
+                libc::kill(self.child.id() as libc::pid_t, libc::SIGTERM);
+            }
         }
         let deadline = Instant::now() + timeout;
         loop {
@@ -422,11 +449,18 @@ pub fn message_frames(corpus: &Corpus) -> anyhow::Result<(Vec<Vec<u8>>, u64)> {
 pub struct SpanReplay {
     /// How many commands were accepted AND completed with a response.
     pub submitted: u64,
-    /// The log position the LAST completed command's response named — the
-    /// frontier the app has applied through once that response arrived. The
-    /// raw tier always carries it (`Completion::position` is `Some` for a
-    /// `Response`/`Responses` outcome), so there is no fallback read of the
-    /// row's `applied` word here.
+    /// The log position the LAST completed command's response named: the
+    /// START of that command's frame (`Egress::publish`'s `pos`, which is
+    /// [`uc_log`]'s `FrameIter` cursor BEFORE it advances over the frame —
+    /// `uc_log/src/reader.rs`). It is NOT an applied frontier, and a reader
+    /// must never resume from it: the frame at that very position has
+    /// already been applied. The row's own `applied` word — the cursor
+    /// AFTER the batch — is the frontier; it is strictly greater than this
+    /// once the last command lands.
+    ///
+    /// The raw tier always carries the position (`Completion::position` is
+    /// `Some` for a `Response`/`Responses` outcome), so there is no fallback
+    /// read of the row's `applied` word here.
     pub last_position: u64,
 }
 
@@ -460,8 +494,16 @@ pub fn replay_span(
             frames.len()
         );
     }
-    let (send, mut poll) = Engine::attach(dir, app_id, EngineConfig::default())
-        .map_err(|e| anyhow::anyhow!("engine attach: {e}"))?;
+    // The caller's bound is the binding one: `EngineConfig::default()`'s
+    // 10 s `request_timeout` would fail a command the caller was still
+    // willing to wait for (a coordinated freeze on this single voter stalls
+    // commit for as long as the slowest row's freeze takes).
+    let cfg = EngineConfig {
+        request_timeout: timeout,
+        ..EngineConfig::default()
+    };
+    let (send, mut poll) =
+        Engine::attach(dir, app_id, cfg).map_err(|e| anyhow::anyhow!("engine attach: {e}"))?;
     let mut last_position = 0u64;
     let mut submitted = 0u64;
     let mut i = range.start;
@@ -494,9 +536,17 @@ pub fn replay_span(
                     return;
                 }
                 verdict = Some(match c.outcome {
-                    Outcome::Response(_) | Outcome::Responses(_) => {
-                        Ok(Verdict::Done(c.position.unwrap_or(0)))
-                    }
+                    // A completed response ALWAYS names its position
+                    // (`uc_client`'s engine sets it for every `Response` /
+                    // `Responses` outcome). Degrading a missing one to 0
+                    // would hand the caller a frontier of zero as if it
+                    // were a measurement, so say so instead.
+                    Outcome::Response(_) | Outcome::Responses(_) => match c.position {
+                        Some(p) => Ok(Verdict::Done(p)),
+                        None => Err(anyhow::anyhow!(
+                            "command #{i}: completed with no log position on the response"
+                        )),
+                    },
                     Outcome::Retry | Outcome::NotLeader { .. } => Ok(Verdict::Again),
                     ref other => Err(anyhow::anyhow!("command #{i}: {other:?}")),
                 });
