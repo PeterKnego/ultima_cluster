@@ -79,6 +79,14 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: Swatinem/rust-cache@v2
+      # Same two fixtures ci.yml builds: `uc_diffreplay`'s e2e tests and
+      # `kv_store`'s `regression_corpora` hard-assert these binaries exist,
+      # and `cargo test --workspace` builds neither (`register-replay` is
+      # behind `required-features`; `uc2-diffreplay` is a dependency's bin).
+      - name: Build the diff-replay fixtures
+        run: cargo build -p uc_lincheck --features replay-bin --bin register-replay
+      - name: Build uc2-diffreplay (kv_store's regression_corpora needs the CLI binary)
+        run: cargo build -p uc_diffreplay
       - name: Full workspace tests (incl. lin_v2 + lin_partition_v2)
         run: cargo test --workspace
 

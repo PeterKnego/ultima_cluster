@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use clap::Parser;
 use counter::CounterSm;
-use uc_service::{ServiceBuilder, ServiceConfig, StateMachine};
+use uc_service::{ServiceBuilder, ServiceConfig, ServiceError, StateMachine};
 
 #[derive(Parser)]
 #[command(about = "Runs the counter state machine against a local node")]
@@ -47,8 +47,26 @@ fn main() -> anyhow::Result<()> {
         std::thread::sleep(Duration::from_millis(20));
     }
 
-    let cfg = ServiceConfig::new(args.instance_dir.clone(), args.app_id);
-    let service = ServiceBuilder::new(cfg, CounterSm::default()).start()?;
+    // The control page exists before the node has published its service
+    // table, and `start` refuses that window by name (`NodeBooting`) rather
+    // than attaching to a half-initialised node. Retry it within the same
+    // deadline; any other refusal is final.
+    let service = loop {
+        let cfg = ServiceConfig::new(args.instance_dir.clone(), args.app_id.clone());
+        match ServiceBuilder::new(cfg, CounterSm::default()).start() {
+            Ok(service) => break service,
+            Err(ServiceError::NodeBooting) => {
+                anyhow::ensure!(
+                    Instant::now() < deadline,
+                    "node at {} still booting after {}s",
+                    args.instance_dir.display(),
+                    args.wait_secs
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(e) => return Err(e.into()),
+        }
+    };
     println!(
         "service {:?} attached at {}",
         CounterSm::NAME,
