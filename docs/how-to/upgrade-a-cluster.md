@@ -818,10 +818,17 @@ The two added steps are not optional:
     `Engine::attach` retry `NodeBooting` internally for `boot_wait`
     (**default 10 s**; `Duration::ZERO` restores the old fail-immediately
     behaviour). `NodeBooting` means "this node has not joined its cluster
-    yet", not "its page is missing". On a saturated cluster a node's own
-    durable position can trail commit for a while — the cluster FSM applies
-    at `min(commit, durable)` — so give such a deployment a larger
-    `boot_wait` rather than treating the refusal as a fault.
+    yet", not "its page is missing". A node's own durable position can trail
+    commit for a while — the cluster FSM applies at `min(commit, durable)` —
+    and while that is transient (a long archive walk at boot, an artifact to
+    install, a node catching up), a larger `boot_wait` is the right answer
+    rather than treating the refusal as a fault. If it does **not** clear,
+    no `boot_wait` is large enough and every attach on that node stays
+    refused for the life of the incarnation: a follower's commit cannot
+    outrun its own durable, so a persistent inversion is a **leader** whose
+    durability path is failing, and the fix is there. The node names the
+    clause holding it once, as a `services_declared_withheld` warning —
+    `clause="walk_behind"` is this case.
   - **Boot-time observability reads empty.** Until the node joins,
     `/metrics` renders `uc_services_declared 0` with no per-FSM rows and
     `uc2ctl status` prints `declared=[]` with no FSM lines. One

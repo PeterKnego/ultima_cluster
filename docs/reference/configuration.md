@@ -544,9 +544,23 @@ Two operational consequences:
   exist to elect one, so its service's attach burns the whole wait while the
   peer that would end it has not been started. Start all N nodes first, then
   attach.
-- **A saturated node wants a larger `boot_wait`.** The cluster FSM applies at
-  `min(commit, durable)`, so a node whose own durable position persistently
-  trails commit never satisfies the third clause and the gate stays shut.
+- **`boot_wait` covers a slow join, not a stuck one.** The cluster FSM applies
+  at `min(commit, durable)`, so a node whose durable position is behind its
+  commit keeps the third clause false until the durable catches up. A larger
+  `boot_wait` is the right answer while that is *transient* — a long archive
+  walk at boot, a large artifact to install, a node catching up after a
+  restart. It is never the answer to a *persistent* inversion, and it cannot
+  be: a **follower's** commit cannot outrun its own durable at all (its commit
+  is `deferred_commit.min(validated_up_to)`, and `validated_up_to` only ever
+  grows to that node's own `durable` — `uc_consensus/src/election.rs`), so the
+  inversion is only possible on a **leader**, whose commit is the quorum-th
+  ranked durable position and is therefore a statement about the cluster, not
+  about this node's disk. If it persists, every attach on that node is refused
+  for the life of the incarnation and no `boot_wait` is large enough — fix the
+  node's durability path (its disk, its archive agent), not the timeout. The
+  node names which clause is holding it in one `services_declared_withheld`
+  warning; see
+  [Monitor a cluster](../how-to/monitor-a-cluster.md#events-worth-alerting-on).
 
 ## Cluster limits
 
