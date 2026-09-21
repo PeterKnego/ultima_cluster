@@ -367,7 +367,7 @@ git commit -m "uc_lincheck: Durable<S> register fixture and register-replay serv
   - `pub fn wait_for(f: impl FnMut() -> bool, timeout: Duration) -> bool`.
   - `pub fn command_instant(node: &Node, timeout: Duration) -> anyhow::Result<u64>`; `pub fn artifact_path(dir: &Path, row: u8, p: u64) -> PathBuf` (= `dir/snapshots/<row>/snap-<p>.ultsnap`).
   - `pub fn pin_row(dir: &Path, cnc: &CncPage, row: u8, from: u32, to: u32, origin: u64, timeout: Duration) -> anyhow::Result<AdminResp>` — returns `Ok(resp)` with `resp.status == 0`, or `Err` naming `status`/`reason` (the two races are retried until `timeout`, everything else is immediate).
-  - `pub struct AppProcess { child: Child, stderr_path: PathBuf }`, `pub fn spawn_app(bin: &Path, args: &[String], dir: &Path, app_id: &str, stderr_path: &Path) -> anyhow::Result<AppProcess>` (argv = `bin args... --instance-dir dir --app-id app_id`; stderr redirected to the file), `pub enum AttachOutcome { Attached, Exited { code: Option<i32>, stderr: String } }`, `impl AppProcess { pub fn wait_attached(&mut self, cnc: &CncPage, row: u8, at_least: u64, timeout: Duration) -> AttachOutcome` (Attached once `service_slot(row).applied.load_acquire() >= at_least` — pass `at_least = 0`… no: `applied` is reset to 0 at attach, so "attached" is observed as the row's `epoch`/instance? — use the slot's status **version word becoming non-zero** (`cnc.service_slot(row).status.version() != 0`) as "attached", and `applied >= at_least` as "caught up"; expose both: `wait_attached` and `pub fn wait_applied(&mut self, cnc, row, at_least, timeout) -> AttachOutcome`); `pub fn stop(mut self, timeout: Duration) -> anyhow::Result<std::process::ExitStatus>` (SIGTERM via `libc::kill(pid, libc::SIGTERM)`, wait up to `timeout`, then `kill()` and report), `pub fn stderr(&self) -> String` }`.
+  - `pub struct AppProcess { child: Child, stderr_path: PathBuf }`, `pub fn spawn_app(bin: &Path, args: &[String], dir: &Path, app_id: &str, stderr_path: &Path) -> anyhow::Result<AppProcess>` (argv = `bin args... --instance-dir dir --app-id app_id`; stderr redirected to the file), `pub enum AttachOutcome { Attached, Exited { code: Option<i32>, stderr: String } }`, `pub fn incarnation(cnc: &CncPage, row: u8) -> u32` (the slot status word's incarnation field, via `uc_log::cnc::unpack_service_status(cnc.service_slot(row).status.load_acquire())`), `impl AppProcess { pub fn wait_attached(&mut self, cnc: &CncPage, row: u8, before: u32, timeout: Duration) -> AttachOutcome` (Attached once the status word's ATTACHED bit is set AND its incarnation differs from `before` — the incarnation captured by the caller right before `spawn_app`; the version word is NOT usable here because `RegisterSm::VERSION` is the trait default `0`, and the bit alone is not enough because a stopped process may leave it set), `pub fn wait_applied(&mut self, cnc, row, at_least: u64, timeout) -> AttachOutcome` ("caught up" = `service_slot(row).applied.load_acquire() >= at_least`); `pub fn stop(mut self, timeout: Duration) -> anyhow::Result<std::process::ExitStatus>` (SIGTERM via `libc::kill(pid, libc::SIGTERM)`, wait up to `timeout`, then `kill()` and report), `pub fn stderr(&self) -> String` }`.
   - `pub struct SpanReplay { pub submitted: u64, pub skipped_timers: u64, pub last_position: u64 }`, `pub fn replay_span(corpus: &Corpus, dir: &Path, app_id: &str, row: u8, range: std::ops::Range<usize>, timeout: Duration) -> anyhow::Result<SpanReplay>` — re-submits the corpus's MESSAGE frames with index in `range` (0-based over MESSAGE frames only), one in flight, to `row`; `pub fn message_frames(corpus: &Corpus) -> anyhow::Result<Vec<Vec<u8>>>` (the payload bytes of every MESSAGE frame in `[origin, end)`, in order — what `replay_span` indexes).
 
 - [ ] **Step 1: Feature and deps**
@@ -415,6 +415,7 @@ fn the_serve_form_attaches_and_stops_cleanly() {
     let dir = inst.path();
     let node = start_node(dir, "live1", common::register_name(), T).unwrap();
     let cnc = CncPage::open_file(&dir.join("cnc2.dat"), "live1").unwrap();
+    let before = uc_diffreplay::live::incarnation(&cnc, 0);
     let mut app = spawn_app(
         &common::register_replay_bin(),
         &["serve".to_string()],
@@ -423,7 +424,7 @@ fn the_serve_form_attaches_and_stops_cleanly() {
         &dir.join("old.stderr"),
     )
     .unwrap();
-    assert!(matches!(app.wait_attached(&cnc, 0, T), AttachOutcome::Attached), "{}", app.stderr());
+    assert!(matches!(app.wait_attached(&cnc, 0, before, T), AttachOutcome::Attached), "{}", app.stderr());
     // An instant completes for the row: the artifact appears.
     let p = command_instant(&node, T).unwrap();
     assert!(
@@ -441,6 +442,7 @@ fn a_refused_attach_is_a_nonzero_exit_with_the_error_on_stderr() {
     let dir = inst.path();
     let node = start_node(dir, "live2", common::register_name(), T).unwrap();
     let cnc = CncPage::open_file(&dir.join("cnc2.dat"), "live2").unwrap();
+    let before = uc_diffreplay::live::incarnation(&cnc, 0);
     // Wrong app id: the page refuses the attach by name.
     let mut app = spawn_app(
         &common::register_replay_bin(),
@@ -450,7 +452,7 @@ fn a_refused_attach_is_a_nonzero_exit_with_the_error_on_stderr() {
         &dir.join("bad.stderr"),
     )
     .unwrap();
-    match app.wait_attached(&cnc, 0, T) {
+    match app.wait_attached(&cnc, 0, before, T) {
         AttachOutcome::Exited { code, stderr } => {
             assert_ne!(code, Some(0));
             assert!(stderr.contains("Error:"), "stderr: {stderr}");
@@ -560,6 +562,12 @@ pub fn command_instant(node: &Node, timeout: Duration) -> anyhow::Result<u64> {
 
 pub fn artifact_path(dir: &Path, row: u8, p: u64) -> PathBuf {
     dir.join("snapshots").join(row.to_string()).join(format!("snap-{p}.ultsnap"))
+}
+
+/// The slot status word's incarnation field — what `AppProcess::wait_attached`
+/// compares against, so a re-attach is told apart from a stale bit.
+pub fn incarnation(cnc: &CncPage, row: u8) -> u32 {
+    uc_log::cnc::unpack_service_status(cnc.service_slot(row as usize).status.load_acquire()).2
 }
 
 /// `<instance_dir>/upgrade.pending`, written the way `uc2ctl` writes it:
@@ -684,10 +692,21 @@ impl AppProcess {
         }
     }
 
-    /// "Attached" = the row's status line carries a non-zero packed version
-    /// (`attach` writes it last, after the pin check and the install).
-    pub fn wait_attached(&mut self, cnc: &CncPage, row: u8, timeout: Duration) -> AttachOutcome {
-        self.wait_cond(|| cnc.service_slot(row as usize).status.version() != 0, timeout)
+    /// "Attached" = the row's status word has its ATTACHED bit set under an
+    /// incarnation that differs from `before` (captured by the caller just
+    /// before `spawn_app`). Not the version word — `RegisterSm::VERSION` is
+    /// the trait default `0` — and not the bit alone, which a stopped process
+    /// may leave set.
+    pub fn wait_attached(&mut self, cnc: &CncPage, row: u8, before: u32, timeout: Duration) -> AttachOutcome {
+        self.wait_cond(
+            || {
+                let (_, attached, inc) = uc_log::cnc::unpack_service_status(
+                    cnc.service_slot(row as usize).status.load_acquire(),
+                );
+                attached && inc != before
+            },
+            timeout,
+        )
     }
 
     /// "Caught up" = the row's published `applied` frontier ≥ `at_least`.
@@ -1053,8 +1072,9 @@ pub fn run(a: &PinVerifyArgs) -> anyhow::Result<PinVerifyReport> {
     // cluster's life before the upgrade) ----
     let node = live::start_node(&dir, &a.app_id, &a.fsm, a.timeout)?;
     let cnc = CncPage::open_file(&dir.join("cnc2.dat"), &a.app_id)?;
+    let before = live::incarnation(&cnc, a.row);
     let mut old = live::spawn_app(&a.old, &a.old_args, &dir, &a.app_id, &scratch.join("old.stderr"))?;
-    match old.wait_attached(&cnc, a.row, a.timeout) {
+    match old.wait_attached(&cnc, a.row, before, a.timeout) {
         AttachOutcome::Attached => {}
         AttachOutcome::Exited { code, stderr } => { node.stop(); bail!("OLD never attached (exit {code:?}): {stderr}"); }
     }
@@ -1083,8 +1103,9 @@ pub fn run(a: &PinVerifyArgs) -> anyhow::Result<PinVerifyReport> {
     }
 
     // ---- S4 step 5: the refusal arm — the stale binary must not rejoin ----
+    let before = live::incarnation(&cnc, a.row);
     let mut stale = live::spawn_app(&a.old, &a.old_args, &dir, &a.app_id, &scratch.join("old-after-pin.stderr"))?;
-    let refusal_held = match stale.wait_attached(&cnc, a.row, a.timeout) {
+    let refusal_held = match stale.wait_attached(&cnc, a.row, before, a.timeout) {
         AttachOutcome::Exited { code, stderr } => {
             let matched = stderr.contains(REFUSAL_MARKER);
             r.refusal = RefusalArm { exited: true, code, matched, stderr_excerpt: last_lines(&stderr, 5) };
@@ -1098,8 +1119,9 @@ pub fn run(a: &PinVerifyArgs) -> anyhow::Result<PinVerifyReport> {
     };
 
     // ---- S4 step 4: the swap arm — NEW attaches, installs the origin, recomputes (P, X] ----
+    let before = live::incarnation(&cnc, a.row);
     let mut new = live::spawn_app(&a.new, &a.new_args, &dir, &a.app_id, &scratch.join("new.stderr"))?;
-    match new.wait_attached(&cnc, a.row, a.timeout) {
+    match new.wait_attached(&cnc, a.row, before, a.timeout) {
         AttachOutcome::Exited { code, stderr } => { r.notes.push(format!("NEW did not attach (exit {code:?}): {}", last_lines(&stderr, 5))); node.stop(); r.verdict = verdict(refusal_held, None, None); return Ok(r); }
         AttachOutcome::Attached => { r.swap.attached = true; }
     }
@@ -1301,7 +1323,7 @@ fn a_version_identical_upgrade_is_inconclusive_not_a_pass() {
 }
 ```
 
-Note on the last test's OLD: it serves `--double` (version 2) from the start so that `from = 2 = to`. If `Durable`/`Doubling` `VERSION` constants differ from `1`/`2`, read `uc_lincheck/src/register.rs` and use the real values in `--to`.
+Note on versions: `RegisterSm::VERSION` is the trait DEFAULT `0` (it does not override it) and `DoublingRegisterSm::VERSION = 2`, so the plain→double arms pin `from = 0` (read from the attached word, never passed) to `--to 2`. The last test's OLD serves `--double` (version 2) from the start so that `from = 2 = to`.
 
 - [ ] **Step 3: Run RED, then GREEN**
 
