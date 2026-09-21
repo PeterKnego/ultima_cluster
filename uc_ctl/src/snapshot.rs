@@ -32,8 +32,8 @@
 //! reads), then reads directory listings under `<instance_dir>/snapshots/`
 //! — one subdirectory per declared row, plus `snapshots/cluster/` — and
 //! parses only each entry's FILE NAME (`snap-<pos>.ultsnap` /
-//! `snap-<pos>.ultcluster`). It never opens a file: the 16-byte
-//! `ULTSNAP1`-tagged envelope inside each one (`uc_service::snapshots`) is
+//! `snap-<pos>.ultcluster`). It never opens a file: the 24-byte
+//! `ULTSNAP2`-tagged envelope inside each one (`uc_service::snapshots`) is
 //! not this command's business. `set=<P>` is the newest position present in
 //! **every** declared row's directory **and** `snapshots/cluster/` — the
 //! intersection of what is on disk, not each side's own newest — so a row

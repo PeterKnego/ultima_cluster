@@ -277,7 +277,7 @@ fn publish_snapshot_and_wait_for_purge(dir: &Path, app: &str, node: &Node) -> u6
     // own `freeze()` at P is what puts it here; this file has no service.)
     let store = SnapshotStore::open(dir, 0).expect("open snapshot store");
     store
-        .publish(p, |w| Ok(w.write_all(b"fake-snapshot-bytes")?))
+        .publish(p, 0, |w| Ok(w.write_all(b"fake-snapshot-bytes")?))
         .expect("publish snapshot");
     let cnc = open_cnc(dir, app);
     debug_assert_eq!(
@@ -606,7 +606,7 @@ fn ordered_backup_survives_a_purge_racing_the_copy() {
                     if durable > SEG_BYTES {
                         let pos = durable.saturating_sub(SEG_BYTES / 2).max(1);
                         if store
-                            .publish(pos, |w| Ok(w.write_all(b"race-snapshot")?))
+                            .publish(pos, 0, |w| Ok(w.write_all(b"race-snapshot")?))
                             .is_ok()
                         {
                             cnc.snapshots().service_snapshot_pos.store_release(pos);
@@ -1384,7 +1384,7 @@ fn verify_refuses_a_row_artifact_whose_envelope_disagrees_with_its_name() {
     let store = SnapshotStore::open(&dir, 0).expect("open snapshot store");
     let pos = node.counters().durable.load_acquire();
     store
-        .publish(pos, |w| Ok(w.write_all(b"fake-snapshot-bytes")?))
+        .publish(pos, 0, |w| Ok(w.write_all(b"fake-snapshot-bytes")?))
         .expect("publish snapshot");
     node.stop();
 

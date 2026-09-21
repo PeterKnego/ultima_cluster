@@ -1547,25 +1547,25 @@ pub fn uc_node_cluster_artifact() -> Vec<Seed> {
     ]
 }
 
-/// `uc_service_snapshot_envelope` — the 16-byte artifact envelope every
-/// `snap-<pos>.ultsnap` starts with (coordinated-snapshot ruling P6): the
-/// well-formed header, and the three refusals the decoder owes — empty, one
-/// byte short, and wrong magic — plus a header with a payload behind it (the
-/// shape every real install path reads).
+/// `uc_service_snapshot_envelope` — the 24-byte artifact envelope every
+/// `snap-<pos>.ultsnap` starts with (coordinated-snapshot ruling P6; plan B2
+/// T2): the well-formed header, and the three refusals the decoder owes —
+/// empty, one byte short, and wrong magic — plus a header with a payload
+/// behind it (the shape every real install path reads).
 pub fn uc_service_snapshot_envelope() -> Vec<Seed> {
     use uc_service::snapshots::write_snapshot_envelope;
 
-    fn envelope(pos: u64) -> Vec<u8> {
+    fn envelope(pos: u64, version: u32) -> Vec<u8> {
         let mut v = Vec::new();
-        write_snapshot_envelope(&mut v, pos).expect("a Vec never fails");
+        write_snapshot_envelope(&mut v, pos, version).expect("a Vec never fails");
         v
     }
 
-    let ok = envelope(4096);
+    let ok = envelope(4096, 1);
     let short = ok[..ok.len() - 1].to_vec();
     let mut bad_magic = ok.clone();
     bad_magic[0] ^= 0xFF;
-    let mut with_payload = envelope(1 << 40);
+    let mut with_payload = envelope(1 << 40, 1);
     with_payload.extend_from_slice(b"state machine bytes");
 
     vec![

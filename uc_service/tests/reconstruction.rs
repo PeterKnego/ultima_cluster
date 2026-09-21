@@ -528,7 +528,7 @@ fn a_replayed_instant_at_or_below_the_applied_frontier_is_not_frozen_at() {
     let (pos, path) = store.newest(u64::MAX).unwrap().expect("an artifact at p2");
     assert_eq!(pos, p2);
     let mut f = std::fs::File::open(&path).unwrap();
-    uc_service::snapshots::verify_snapshot_envelope(&mut f, p2).expect("envelope names p2");
+    uc_service::snapshots::verify_snapshot_envelope(&mut f, p2, None).expect("envelope names p2");
     let mut restored = SlowCountSm::default();
     restored.install_snapshot(p2, &mut f).unwrap();
     assert_eq!(
@@ -592,7 +592,7 @@ fn a_replayed_span_freezes_at_its_last_snapshot_frame_below_it_only() {
     let (pos, path) = store.newest(u64::MAX).unwrap().expect("an artifact at P");
     assert_eq!(pos, p, "tagged with the instant, not the SM's own cursor");
     let mut f = std::fs::File::open(&path).unwrap();
-    uc_service::snapshots::verify_snapshot_envelope(&mut f, p).expect("envelope names P");
+    uc_service::snapshots::verify_snapshot_envelope(&mut f, p, None).expect("envelope names P");
     let mut restored = CountSm::default();
     restored.install_snapshot(p, &mut f).unwrap();
     assert_eq!(
@@ -981,9 +981,11 @@ fn a_renamed_artifact_is_refused_by_name_and_a_correct_one_installs() {
     let (p0, real) = store.newest(u64::MAX).unwrap().expect("an artifact at P0");
     // The envelope says P0 whatever the file is called.
     let head = std::fs::read(&real).unwrap();
-    assert_eq!(
-        uc_service::snapshots::decode_snapshot_envelope(&head),
-        Ok(p0),
+    assert!(
+        matches!(
+            uc_service::snapshots::decode_snapshot_envelope(&head),
+            Ok(uc_service::snapshots::Envelope { position, .. }) if position == p0
+        ),
         "the artifact carries UC's envelope naming its own instant"
     );
 

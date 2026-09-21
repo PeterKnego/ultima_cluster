@@ -137,8 +137,8 @@ pub trait Adapter: Send + Sync {
     fn encode_append(&self, key: &[u8], val: u64) -> Option<Vec<u8>>;
     fn encode_list_read(&self, key: &[u8]) -> Option<Vec<u8>>;
     fn decode_list(&self, bytes: &[u8]) -> Result<Vec<u64>, String>;
-    /// Parse the service's snapshot artifact PAYLOAD (after UC's 16-byte
-    /// `ULTSNAP1 ‖ P` envelope).
+    /// Parse the service's snapshot artifact PAYLOAD (after UC's 24-byte
+    /// `ULTSNAP2 ‖ P ‖ version ‖ reserved` envelope).
     fn parse_snapshot_image(&self, image: &[u8]) -> Result<Image, String>;
 }
 

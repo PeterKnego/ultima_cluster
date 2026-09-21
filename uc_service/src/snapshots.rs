@@ -17,20 +17,25 @@
 //! slot `snapshot_pos`, written by the builder agent, not this module) is
 //! updated only AFTER `publish` returns `Ok`.
 //!
-//! **The envelope** (coordinated-snapshot ruling P6). Every file this module
-//! writes starts with 16 framework-owned bytes — [`SNAPSHOT_ENVELOPE_MAGIC`]
-//! then the position `P` it was built at, LE — ahead of the state machine's
-//! own bytes. UC prescribes no payload encoding, but it does own the header,
-//! and that is what makes a MIS-TAGGED artifact detectable: the file name is
-//! just a name (a `uc2ctl restore` of a mis-copied backup, or any rename, can
-//! make an artifact built at `P0` claim `P`), and installing an older image
-//! under a newer tag leaves a silent state gap — the exact bug class the
+//! **The envelope** (coordinated-snapshot ruling P6; plan B2 T2). Every file
+//! this module writes starts with 24 framework-owned bytes —
+//! [`SNAPSHOT_ENVELOPE_MAGIC`], then the position `P` it was built at (`u64`
+//! LE), then the packed `S::VERSION` that BUILT the artifact (`u32` LE), then
+//! 4 reserved zero bytes — ahead of the state machine's own bytes. UC
+//! prescribes no payload encoding, but it does own the header, and that is
+//! what makes a MIS-TAGGED artifact detectable: the file name is just a name
+//! (a `uc2ctl restore` of a mis-copied backup, or any rename, can make an
+//! artifact built at `P0` claim `P`), and installing an older image under a
+//! newer tag leaves a silent state gap — the exact bug class the
 //! reconstruction gap guard exists to prevent. The SM's own payload-position
 //! check cannot catch it, because the tag is an EXCLUSIVE frontier and the
 //! payload's cursor legitimately sits below it (see
 //! [`crate::SnapshotStateMachine::install_snapshot`]). So the framework checks
 //! the envelope on every install path, and the SM's check stays as
-//! belt-and-suspenders.
+//! belt-and-suspenders. A `ULTSNAP1` (pre-2.13.0) file carries no version
+//! stamp and is refused by name ([`EnvelopeError::Legacy`]) rather than
+//! silently treated as version 0 — clear a row's `snapshots/<row>/` once when
+//! moving to 2.13.0 and the next instant rebuilds it in the new layout.
 //!
 //! **Retention.** This module does NOT prune at all (coordinated-snapshot
 //! spec §5.3, ruling P1): only the NODE can see which artifacts form a
@@ -52,65 +57,121 @@ const DIR_NAME: &str = "snapshots";
 const PREFIX: &str = "snap-";
 const SUFFIX: &str = ".ultsnap";
 
-/// The framework-owned artifact header: 8 magic bytes then `P` as `u64` LE.
-/// Written by [`SnapshotStore::publish`], stripped and verified by every
-/// install path (module doc, ruling P6).
-pub const SNAPSHOT_ENVELOPE_LEN: usize = 16;
+/// The framework-owned artifact header: 8 magic bytes, `P` as `u64` LE, the
+/// builder's `S::VERSION` as `u32` LE, then 4 reserved zero bytes. Written by
+/// [`SnapshotStore::publish`], stripped and verified by every install path
+/// (module doc, ruling P6; plan B2 T2).
+pub const SNAPSHOT_ENVELOPE_LEN: usize = 24;
 
-/// The envelope's magic. `1` is the envelope's own layout version — the
-/// artifact's PAYLOAD is versioned by the state machine, never by UC.
-pub const SNAPSHOT_ENVELOPE_MAGIC: &[u8; 8] = b"ULTSNAP1";
+/// The envelope's magic. `2` is the envelope's own layout version — the
+/// artifact's PAYLOAD is versioned by the state machine, never by UC; this
+/// header now carries that stamp alongside its own.
+pub const SNAPSHOT_ENVELOPE_MAGIC: &[u8; 8] = b"ULTSNAP2";
 
-/// Why an artifact's 16-byte envelope did not verify. All three are refusals,
-/// never silent: an artifact that fails any of them is not installed.
+/// The pre-2.13.0 (16-byte, no version) magic. Refused by name via
+/// [`EnvelopeError::Legacy`] — never decoded as if it were a v2 header.
+pub const SNAPSHOT_ENVELOPE_MAGIC_V1: &[u8; 8] = b"ULTSNAP1";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Envelope {
+    pub position: u64,
+    pub version: u32,
+}
+
+/// Why an artifact's 24-byte envelope did not verify. All are refusals, never
+/// silent: an artifact that fails any of them is not installed.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum EnvelopeError {
     /// Fewer than [`SNAPSHOT_ENVELOPE_LEN`] bytes — a truncated or empty file
-    /// (or one written by something that is not UC).
+    /// (or one written by something that is not UC), AND not a (possibly
+    /// truncated) [`SNAPSHOT_ENVELOPE_MAGIC_V1`] header — see [`Self::Legacy`].
     #[error(
         "truncated artifact: {0} bytes, need {len} for the envelope",
         len = SNAPSHOT_ENVELOPE_LEN
     )]
     Short(usize),
-    /// The first 8 bytes are not [`SNAPSHOT_ENVELOPE_MAGIC`].
+    /// The first 8 bytes are not [`SNAPSHOT_ENVELOPE_MAGIC`] (and not
+    /// [`SNAPSHOT_ENVELOPE_MAGIC_V1`] either — that is [`Self::Legacy`]), or
+    /// the reserved tail is non-zero.
     #[error("not a UC snapshot artifact: magic {0:02x?}, expected {SNAPSHOT_ENVELOPE_MAGIC:?}")]
     BadMagic([u8; 8]),
+    /// A 2.11.0/2.12.0 (`ULTSNAP1`) artifact: it carries no version, so no
+    /// install path can cross-check it. Refused, REGARDLESS of how many bytes
+    /// follow the magic — a truncated `ULTSNAP1` header is still named as
+    /// `Legacy`, not `Short`, because naming the pre-2.13.0 artifact beats a
+    /// generic length complaint. The operator clears the row's
+    /// `snapshots/<row>/` once and the next instant rebuilds it.
+    #[error(
+        "pre-2.13.0 artifact (ULTSNAP1): carries no version stamp — clear \
+         snapshots/<row>/ once and take a new instant"
+    )]
+    Legacy,
     /// The envelope verified but names a DIFFERENT instant than the caller
     /// asked to land at — a renamed, mis-copied or stale artifact. Installing
     /// it would leave every frame in `(built, presented)` unapplied.
     #[error("artifact was built at position {built} but is presented as {presented}")]
     Mistagged { built: u64, presented: u64 },
+    /// The artifact was built by a different `VERSION` than the caller
+    /// requires here: an UNPINNED install by a newer binary (the §2.3
+    /// counterfactual, now refused), or a pinned install whose artifact is
+    /// not the one the pin's `from` built. Checked only when the caller
+    /// passes `Some` for `expected_version` (Task 2 callers pass `None`; the
+    /// cross-check is Tasks 3/4).
+    #[error("artifact was built by version {built:#010x} but {expected:#010x} is required here")]
+    VersionMismatch { built: u32, expected: u32 },
 }
 
-/// Decode the 16-byte envelope at the head of an artifact, returning the
-/// position it was built at. A **pure** decoder — no I/O, no allocation, total
-/// on any slice (fuzz target `uc_service_snapshot_envelope`).
-pub fn decode_snapshot_envelope(bytes: &[u8]) -> Result<u64, EnvelopeError> {
+/// Decode the 24-byte envelope at the head of an artifact. A **pure**
+/// decoder — no I/O, no allocation, total on any slice (fuzz target
+/// `uc_service_snapshot_envelope`).
+pub fn decode_snapshot_envelope(bytes: &[u8]) -> Result<Envelope, EnvelopeError> {
     let Some(head) = bytes.get(..SNAPSHOT_ENVELOPE_LEN) else {
+        // A v1 header is 16 bytes: name it if the magic says so, even when
+        // `bytes` is shorter than either header — `Legacy` beats `Short`
+        // regardless of length (controller ruling).
+        if bytes.len() >= 8 && &bytes[..8] == SNAPSHOT_ENVELOPE_MAGIC_V1 {
+            return Err(EnvelopeError::Legacy);
+        }
         return Err(EnvelopeError::Short(bytes.len()));
     };
     let magic: [u8; 8] = head[..8].try_into().expect("8 bytes");
-    if &magic != SNAPSHOT_ENVELOPE_MAGIC {
+    if &magic == SNAPSHOT_ENVELOPE_MAGIC_V1 {
+        return Err(EnvelopeError::Legacy);
+    }
+    if &magic != SNAPSHOT_ENVELOPE_MAGIC || head[20..24] != [0, 0, 0, 0] {
         return Err(EnvelopeError::BadMagic(magic));
     }
-    Ok(u64::from_le_bytes(head[8..16].try_into().expect("8 bytes")))
+    Ok(Envelope {
+        position: u64::from_le_bytes(head[8..16].try_into().expect("8 bytes")),
+        version: u32::from_le_bytes(head[16..20].try_into().expect("4 bytes")),
+    })
 }
 
-/// Write the envelope for an artifact built at `pos`.
-pub fn write_snapshot_envelope(dst: &mut dyn Write, pos: u64) -> io::Result<()> {
+/// Write the envelope for an artifact built at `pos` by `version`
+/// (`S::VERSION`).
+pub fn write_snapshot_envelope(dst: &mut dyn Write, pos: u64, version: u32) -> io::Result<()> {
     dst.write_all(SNAPSHOT_ENVELOPE_MAGIC)?;
-    dst.write_all(&pos.to_le_bytes())
+    dst.write_all(&pos.to_le_bytes())?;
+    dst.write_all(&version.to_le_bytes())?;
+    dst.write_all(&[0; 4])
 }
 
-/// Read the envelope off the front of `src` and check it names `expected`,
-/// leaving the reader positioned at the state machine's first payload byte —
-/// the one call every install path makes before handing the stream to
+/// Read the envelope off the front of `src`, check it names `expected`, and —
+/// when `expected_version` is `Some` — check the version too (position is
+/// checked FIRST: a mis-tagged artifact is refused by position even if its
+/// version happens to match), leaving the reader positioned at the state
+/// machine's first payload byte — the one call every install path makes
+/// before handing the stream to
 /// [`crate::SnapshotStateMachine::install_snapshot`].
 ///
 /// Reads with a short-read loop rather than `read_exact` so a truncated file
 /// is [`EnvelopeError::Short`] (a named refusal) instead of an opaque
 /// `UnexpectedEof`.
-pub fn verify_snapshot_envelope(src: &mut dyn Read, expected: u64) -> Result<(), EnvelopeError> {
+pub fn verify_snapshot_envelope(
+    src: &mut dyn Read,
+    expected: u64,
+    expected_version: Option<u32>,
+) -> Result<Envelope, EnvelopeError> {
     let mut buf = [0u8; SNAPSHOT_ENVELOPE_LEN];
     let mut n = 0usize;
     while n < SNAPSHOT_ENVELOPE_LEN {
@@ -128,14 +189,22 @@ pub fn verify_snapshot_envelope(src: &mut dyn Read, expected: u64) -> Result<(),
             Err(_) => break,
         }
     }
-    let built = decode_snapshot_envelope(&buf[..n])?;
-    if built != expected {
+    let env = decode_snapshot_envelope(&buf[..n])?;
+    if env.position != expected {
         return Err(EnvelopeError::Mistagged {
-            built,
+            built: env.position,
             presented: expected,
         });
     }
-    Ok(())
+    if let Some(want) = expected_version
+        && env.version != want
+    {
+        return Err(EnvelopeError::VersionMismatch {
+            built: env.version,
+            expected: want,
+        });
+    }
+    Ok(env)
 }
 
 /// Owns the `instance_dir/snapshots` directory: position-tagged file naming
@@ -213,17 +282,19 @@ impl SnapshotStore {
     pub fn publish(
         &self,
         pos: u64,
+        version: u32,
         write: impl FnOnce(&mut dyn Write) -> Result<(), SnapshotError>,
     ) -> Result<PathBuf, SnapshotError> {
         let tmp_path = self.tmp_path_for(pos);
         let result = (|| -> Result<(), SnapshotError> {
             let mut f = File::create(&tmp_path)?;
-            // Ruling P6: the framework's 16 bytes go first, ahead of the state
-            // machine's own. This is the ONE write site for a
-            // `snap-<pos>.ultsnap`, so "every artifact on disk carries an
-            // envelope naming its instant" is an invariant of this module
-            // rather than a convention its callers have to remember.
-            write_snapshot_envelope(&mut f, pos)?;
+            // Ruling P6 (plan B2 T2: now 24 bytes, carrying `version`): the
+            // framework's bytes go first, ahead of the state machine's own.
+            // This is the ONE write site for a `snap-<pos>.ultsnap`, so "every
+            // artifact on disk carries an envelope naming its instant and the
+            // version that built it" is an invariant of this module rather
+            // than a convention its callers have to remember.
+            write_snapshot_envelope(&mut f, pos, version)?;
             write(&mut f)?;
             f.sync_all()?;
             Ok(())
@@ -300,14 +371,20 @@ mod tests {
     #[test]
     fn the_envelope_decodes_round_trip_and_refuses_short_bad_magic_and_a_mis_tag() {
         let mut buf = Vec::new();
-        write_snapshot_envelope(&mut buf, 4096).unwrap();
+        write_snapshot_envelope(&mut buf, 4096, 1).unwrap();
         assert_eq!(buf.len(), SNAPSHOT_ENVELOPE_LEN);
-        assert_eq!(decode_snapshot_envelope(&buf), Ok(4096));
+        assert_eq!(
+            decode_snapshot_envelope(&buf),
+            Ok(Envelope {
+                position: 4096,
+                version: 1
+            })
+        );
 
         assert_eq!(decode_snapshot_envelope(&[]), Err(EnvelopeError::Short(0)));
         assert_eq!(
-            decode_snapshot_envelope(&buf[..15]),
-            Err(EnvelopeError::Short(15))
+            decode_snapshot_envelope(&buf[..SNAPSHOT_ENVELOPE_LEN - 1]),
+            Err(EnvelopeError::Short(SNAPSHOT_ENVELOPE_LEN - 1))
         );
         let mut bad = buf.clone();
         bad[0] ^= 0xFF;
@@ -320,7 +397,7 @@ mod tests {
         // to claim a later instant.
         let mut src = buf.as_slice();
         assert_eq!(
-            verify_snapshot_envelope(&mut src, 8192),
+            verify_snapshot_envelope(&mut src, 8192, None),
             Err(EnvelopeError::Mistagged {
                 built: 4096,
                 presented: 8192
@@ -330,23 +407,149 @@ mod tests {
         let mut with_payload = buf.clone();
         with_payload.extend_from_slice(b"sm bytes");
         let mut src = with_payload.as_slice();
-        verify_snapshot_envelope(&mut src, 4096).unwrap();
+        verify_snapshot_envelope(&mut src, 4096, None).unwrap();
         assert_eq!(src, b"sm bytes");
+    }
+
+    #[test]
+    fn envelope_v2_layout_is_frozen() {
+        let mut v = Vec::new();
+        write_snapshot_envelope(&mut v, 4096, 0x0102_0003).unwrap();
+        assert_eq!(v.len(), SNAPSHOT_ENVELOPE_LEN);
+        assert_eq!(SNAPSHOT_ENVELOPE_LEN, 24);
+        assert_eq!(&v[..8], b"ULTSNAP2");
+        assert_eq!(&v[8..16], &4096u64.to_le_bytes());
+        assert_eq!(&v[16..20], &0x0102_0003u32.to_le_bytes());
+        assert_eq!(&v[20..24], &[0, 0, 0, 0], "reserved written as zero");
+        assert_eq!(
+            decode_snapshot_envelope(&v),
+            Ok(Envelope {
+                position: 4096,
+                version: 0x0102_0003
+            })
+        );
+    }
+
+    /// Controller ruling: `decode_snapshot_envelope` returns
+    /// [`EnvelopeError::Legacy`] whenever the first 8 bytes are `ULTSNAP1`,
+    /// REGARDLESS of length (naming a pre-2.13.0 artifact beats a generic
+    /// `Short`) — so `v1[..12]` is `Legacy`, not `Short(12)`; a `Short(12)`
+    /// is demonstrated separately over 12 bytes of unrelated junk.
+    #[test]
+    fn a_v1_envelope_is_refused_by_name_and_other_refusals_are_unchanged() {
+        let mut v1 = Vec::new();
+        v1.extend_from_slice(b"ULTSNAP1");
+        v1.extend_from_slice(&4096u64.to_le_bytes());
+        v1.extend_from_slice(&[0; 8]);
+        assert_eq!(decode_snapshot_envelope(&v1), Err(EnvelopeError::Legacy));
+        assert_eq!(
+            decode_snapshot_envelope(&v1[..12]),
+            Err(EnvelopeError::Legacy)
+        );
+        let mut junk = Vec::new();
+        junk.extend_from_slice(b"NOTASNAP");
+        junk.extend_from_slice(&[0u8; 4]);
+        assert_eq!(
+            decode_snapshot_envelope(&junk),
+            Err(EnvelopeError::Short(12))
+        );
+        let mut bad_magic = v1.clone();
+        bad_magic[..8].copy_from_slice(b"NOTASNAP");
+        assert!(matches!(
+            decode_snapshot_envelope(&bad_magic),
+            Err(EnvelopeError::BadMagic(_))
+        ));
+        let mut reserved = Vec::new();
+        write_snapshot_envelope(&mut reserved, 1, 1).unwrap();
+        reserved[20] = 1;
+        assert!(
+            matches!(
+                decode_snapshot_envelope(&reserved),
+                Err(EnvelopeError::BadMagic(_))
+            ),
+            "non-zero reserved is not a v2 envelope"
+        );
+    }
+
+    #[test]
+    fn verify_checks_position_always_and_version_only_when_asked() {
+        let mut v = Vec::new();
+        write_snapshot_envelope(&mut v, 4096, 7).unwrap();
+        v.extend_from_slice(b"payload");
+        let mut r = &v[..];
+        assert_eq!(
+            verify_snapshot_envelope(&mut r, 4096, None),
+            Ok(Envelope {
+                position: 4096,
+                version: 7
+            })
+        );
+        assert_eq!(r, b"payload", "positioned at the payload");
+        let mut r = &v[..];
+        assert_eq!(
+            verify_snapshot_envelope(&mut r, 4096, Some(7)).map(|e| e.version),
+            Ok(7)
+        );
+        let mut r = &v[..];
+        assert_eq!(
+            verify_snapshot_envelope(&mut r, 4096, Some(8)),
+            Err(EnvelopeError::VersionMismatch {
+                built: 7,
+                expected: 8
+            })
+        );
+        let mut r = &v[..];
+        assert_eq!(
+            verify_snapshot_envelope(&mut r, 5000, Some(7)),
+            Err(EnvelopeError::Mistagged {
+                built: 4096,
+                presented: 5000
+            }),
+            "position is checked before version"
+        );
+    }
+
+    #[test]
+    fn publish_stamps_the_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SnapshotStore::open(dir.path(), 0).unwrap();
+        store
+            .publish(4096, 0x0100_0000, |w| {
+                w.write_all(b"x")?;
+                Ok(())
+            })
+            .unwrap();
+        let raw = std::fs::read(store.path_for(4096)).unwrap();
+        assert_eq!(
+            decode_snapshot_envelope(&raw),
+            Ok(Envelope {
+                position: 4096,
+                version: 0x0100_0000
+            })
+        );
+        assert_eq!(&raw[SNAPSHOT_ENVELOPE_LEN..], b"x");
     }
 
     #[test]
     fn publish_creates_the_pinned_file_name_and_newest_finds_it() {
         let dir = tempfile::tempdir().unwrap();
         let store = SnapshotStore::open(dir.path(), 0).unwrap();
-        let path = store.publish(4096, ok_write(b"hello")).unwrap();
+        let path = store.publish(4096, 1, ok_write(b"hello")).unwrap();
         assert_eq!(path, store.path_for(4096));
         assert!(path.ends_with("snap-4096.ultsnap"));
-        // Ruling P6: the file is UC's 16-byte envelope, then the SM's bytes.
+        // Ruling P6 (plan B2 T2): the file is UC's 24-byte envelope, then the
+        // SM's bytes.
         let raw = std::fs::read(&path).unwrap();
         assert_eq!(&raw[SNAPSHOT_ENVELOPE_LEN..], b"hello");
-        assert_eq!(decode_snapshot_envelope(&raw), Ok(4096));
+        assert_eq!(
+            decode_snapshot_envelope(&raw),
+            Ok(Envelope {
+                position: 4096,
+                version: 1
+            })
+        );
         let mut src = raw.as_slice();
-        verify_snapshot_envelope(&mut src, 4096).expect("verifies at its own P");
+        verify_snapshot_envelope(&mut src, 4096, None).expect("verifies at its own P");
         assert_eq!(src, b"hello", "the reader is left at the payload");
 
         let (pos, found) = store
@@ -384,13 +587,13 @@ mod tests {
         }
 
         let mut raw = Vec::new();
-        write_snapshot_envelope(&mut raw, 4096).unwrap();
+        write_snapshot_envelope(&mut raw, 4096, 0).unwrap();
         raw.extend_from_slice(b"payload");
         let mut src = EintrOnce {
             bytes: &raw,
             fired: false,
         };
-        verify_snapshot_envelope(&mut src, 4096).expect("EINTR is retried, not a refusal");
+        verify_snapshot_envelope(&mut src, 4096, None).expect("EINTR is retried, not a refusal");
         assert!(src.fired);
     }
 
@@ -414,11 +617,11 @@ mod tests {
         let store = SnapshotStore::open(dir.path(), 0).unwrap();
         // Happy path first: with a readable directory the fsync succeeds and
         // publish is unchanged.
-        store.publish(4096, ok_write(b"hello")).unwrap();
+        store.publish(4096, 1, ok_write(b"hello")).unwrap();
 
         let perms_before = std::fs::metadata(&store.dir).unwrap().permissions();
         std::fs::set_permissions(&store.dir, std::fs::Permissions::from_mode(0o300)).unwrap();
-        let result = store.publish(8192, ok_write(b"world"));
+        let result = store.publish(8192, 1, ok_write(b"world"));
         // Restore before asserting so a failure doesn't leave an
         // undeletable temp dir behind.
         std::fs::set_permissions(&store.dir, perms_before).unwrap();
@@ -445,7 +648,7 @@ mod tests {
     fn a_failed_write_never_becomes_newest_and_leaves_no_temp_file() {
         let dir = tempfile::tempdir().unwrap();
         let store = SnapshotStore::open(dir.path(), 0).unwrap();
-        let result = store.publish(100, |w| {
+        let result = store.publish(100, 1, |w| {
             w.write_all(b"partial").ok();
             Err(SnapshotError::Codec("boom".into()))
         });
@@ -498,7 +701,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = SnapshotStore::open(dir.path(), 0).unwrap();
         for pos in [100u64, 200, 300, 400] {
-            store.publish(pos, ok_write(b"x")).unwrap();
+            store.publish(pos, 1, ok_write(b"x")).unwrap();
         }
         let on_disk = |()| -> Vec<u64> {
             let mut v: Vec<u64> = std::fs::read_dir(dir.path().join("snapshots").join("0"))
@@ -522,8 +725,8 @@ mod tests {
     fn newest_at_most_picks_correctly_among_a_sparse_set() {
         let dir = tempfile::tempdir().unwrap();
         let store = SnapshotStore::open(dir.path(), 0).unwrap();
-        store.publish(100, ok_write(b"a")).unwrap();
-        store.publish(900, ok_write(b"b")).unwrap();
+        store.publish(100, 1, ok_write(b"a")).unwrap();
+        store.publish(900, 1, ok_write(b"b")).unwrap();
 
         assert_eq!(store.newest(u64::MAX).unwrap().map(|(p, _)| p), Some(900));
         assert_eq!(store.newest(500).unwrap().map(|(p, _)| p), Some(100));

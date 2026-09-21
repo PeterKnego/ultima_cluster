@@ -49,6 +49,12 @@ pub(crate) struct BuilderState {
     pub(crate) busy: Arc<AtomicBool>,
     /// M14a: which declared FSM slot this builder publishes to.
     pub(crate) service_id: u8,
+    /// Plan B2 T2: the packed `S::VERSION` that built the job this thread
+    /// streams — stamped into every artifact's envelope by `SnapshotStore::
+    /// publish`, so an install path can cross-check the version that
+    /// actually built an artifact (Tasks 3/4), not just the one presently
+    /// running.
+    pub(crate) version: u32,
 }
 
 /// One builder duty cycle. Returns `true` iff it drained a job (drives the
@@ -58,7 +64,7 @@ pub(crate) struct BuilderState {
 pub(crate) fn builder_cycle(st: &mut BuilderState) -> bool {
     match st.rx.try_recv() {
         Ok((pos, job)) => {
-            match st.store.publish(pos, job) {
+            match st.store.publish(pos, st.version, job) {
                 Ok(_path) => {
                     // The ONLY write site for this marker: after the atomic
                     // rename inside `publish` has already completed, so a torn
@@ -119,6 +125,7 @@ mod tests {
             cnc: page(),
             busy: Arc::clone(&busy),
             service_id: 0,
+            version: 0,
         };
         (tx, st, busy)
     }
@@ -157,8 +164,11 @@ mod tests {
         let raw = std::fs::read(path).unwrap();
         assert_eq!(
             crate::snapshots::decode_snapshot_envelope(&raw),
-            Ok(4096),
-            "the artifact names the instant it was built at"
+            Ok(crate::snapshots::Envelope {
+                position: 4096,
+                version: 0
+            }),
+            "the artifact names the instant it was built at and the version that built it"
         );
         assert_eq!(
             &raw[crate::snapshots::SNAPSHOT_ENVELOPE_LEN..],

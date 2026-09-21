@@ -61,13 +61,14 @@ fn project_string<S: SnapshotStateMachine>(sm: &S) -> anyhow::Result<String> {
 }
 
 /// Install `artifact` (tagged `position`) into `sm`: strip and check the
-/// framework envelope, then hand the payload to the SM. Returns the position
-/// the SM reported, which must equal `position`.
+/// framework envelope, then hand the payload to the SM. Returns `(got,
+/// artifact_version)`: the position the SM reported (must equal `position`)
+/// and the version stamped in the artifact's envelope.
 fn install<S: SnapshotStateMachine>(
     sm: &mut S,
     artifact: &Path,
     position: u64,
-) -> anyhow::Result<u64> {
+) -> anyhow::Result<(u64, u32)> {
     let mut f =
         BufReader::new(File::open(artifact).with_context(|| artifact.display().to_string())?);
     install_from(sm, &mut f, position)
@@ -75,14 +76,17 @@ fn install<S: SnapshotStateMachine>(
 
 /// [`install`] minus the file: envelope, install, and the two post-install
 /// checks. Split out so the refusals are unit-testable over an in-memory
-/// artifact — no scratch directory, no I/O.
+/// artifact — no scratch directory, no I/O. `None` for the envelope's
+/// expected version: this driver reports what the artifact was built with
+/// rather than asserting it (that cross-check is Tasks 3/4's).
 fn install_from<S: SnapshotStateMachine>(
     sm: &mut S,
     src: &mut dyn std::io::Read,
     position: u64,
-) -> anyhow::Result<u64> {
+) -> anyhow::Result<(u64, u32)> {
     let f: &mut dyn std::io::Read = src;
-    verify_snapshot_envelope(f, position).map_err(|e| anyhow::anyhow!("envelope: {e}"))?;
+    let env = verify_snapshot_envelope(f, position, None)
+        .map_err(|e| anyhow::anyhow!("envelope: {e}"))?;
     let got = sm
         .install_snapshot(position, f)
         .map_err(|e| anyhow::anyhow!("install_snapshot({position}): {e}"))?;
@@ -112,7 +116,7 @@ fn install_from<S: SnapshotStateMachine>(
         "install_snapshot({position}) left last_applied at {:?}; the image's cursor must be strictly below the artifact tag (P is an exclusive frontier)",
         sm.last_applied()
     );
-    Ok(got)
+    Ok((got, env.version))
 }
 
 pub fn project_artifact<S: SnapshotStateMachine>(
@@ -120,7 +124,7 @@ pub fn project_artifact<S: SnapshotStateMachine>(
     artifact: &Path,
     position: u64,
 ) -> anyhow::Result<String> {
-    install(&mut sm, artifact, position)?;
+    let (_got, _version) = install(&mut sm, artifact, position)?;
     project_string(&sm)
 }
 
@@ -130,12 +134,12 @@ pub fn drive<S: SnapshotStateMachine>(
     origin: Origin,
 ) -> anyhow::Result<Trace> {
     let m = &corpus.manifest;
-    let (start, projection_at_origin) = match origin {
+    let (start, projection_at_origin, artifact_version) = match origin {
         Origin::Artifact => {
-            install(&mut sm, &corpus.artifact(), m.origin)?;
-            (m.origin, Some(project_string(&sm)?))
+            let (_got, version) = install(&mut sm, &corpus.artifact(), m.origin)?;
+            (m.origin, Some(project_string(&sm)?), Some(version))
         }
-        Origin::Genesis => (0, None),
+        Origin::Genesis => (0, None, None),
     };
 
     let reader = TailReader::open(&corpus.journal_dir())?;
@@ -151,6 +155,7 @@ pub fn drive<S: SnapshotStateMachine>(
     Ok(Trace {
         row: m.row,
         version: S::VERSION,
+        artifact_version,
         origin: start,
         end,
         projection_at_origin,
@@ -412,11 +417,12 @@ mod tests {
         }
     }
 
-    /// An in-memory artifact: the framework envelope at `p` plus an empty
-    /// payload (`ProbeSm` reads its image from nowhere).
-    fn artifact_bytes(p: u64) -> Vec<u8> {
+    /// An in-memory artifact: the framework envelope at `p`, stamped with
+    /// `version`, plus an empty payload (`ProbeSm` reads its image from
+    /// nowhere).
+    fn artifact_bytes(p: u64, version: u32) -> Vec<u8> {
         let mut v = Vec::new();
-        write_snapshot_envelope(&mut v, p).unwrap();
+        write_snapshot_envelope(&mut v, p, version).unwrap();
         v
     }
 
@@ -425,9 +431,10 @@ mod tests {
     #[test]
     fn install_accepts_a_cursor_strictly_below_the_tag() {
         let mut sm = ProbeSm::default();
-        let art = artifact_bytes(512);
-        let got = install_from(&mut sm, &mut &art[..], 512).unwrap();
+        let art = artifact_bytes(512, 7);
+        let (got, version) = install_from(&mut sm, &mut &art[..], 512).unwrap();
         assert_eq!(got, 512);
+        assert_eq!(version, 7, "the artifact's own stamp is reported back");
         assert_eq!(sm.last_applied(), Some(448));
     }
 
@@ -437,7 +444,7 @@ mod tests {
             frontier: Frontier::AtTag,
             ..Default::default()
         };
-        let art = artifact_bytes(512);
+        let art = artifact_bytes(512, 0);
         let e = install_from(&mut sm, &mut &art[..], 512)
             .unwrap_err()
             .to_string();
@@ -453,7 +460,7 @@ mod tests {
             frontier: Frontier::Nothing,
             ..Default::default()
         };
-        let art = artifact_bytes(512);
+        let art = artifact_bytes(512, 0);
         let e = install_from(&mut sm, &mut &art[..], 512)
             .unwrap_err()
             .to_string();

@@ -1447,7 +1447,7 @@ mod tests {
         drop(archive);
         let store = crate::snapshots::SnapshotStore::open(dir.path(), 0).unwrap();
         store
-            .publish(p_pos, |w| w.write_all(b"snap").map_err(Into::into))
+            .publish(p_pos, 0, |w| w.write_all(b"snap").map_err(Into::into))
             .unwrap();
         let restore = super::SnapshotRestore::<CountSm> {
             store,

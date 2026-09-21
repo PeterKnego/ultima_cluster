@@ -13,6 +13,12 @@ use serde::{Deserialize, Serialize};
 pub struct Trace {
     pub row: u8,
     pub version: u32,
+    /// The version stamped in the installed artifact's envelope (plan B2
+    /// T2) — `None` for [`crate::drive::Origin::Genesis`], which installs
+    /// nothing. May disagree with `version` (this run's own `S::VERSION`):
+    /// that disagreement is exactly the case Tasks 3/4's cross-check exists
+    /// for.
+    pub artifact_version: Option<u32>,
     pub origin: u64,
     pub end: u64,
     pub projection_at_origin: Option<String>,
@@ -67,6 +73,7 @@ mod tests {
         let t = Trace {
             row: 0,
             version: 1,
+            artifact_version: Some(1),
             origin: 32,
             end: 96,
             projection_at_origin: Some("value=None\n".into()),

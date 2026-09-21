@@ -6,9 +6,9 @@
 //!    is at one position, not a race. Needs only TCP reachability; this is
 //!    the fleet form.
 //! 2. **Offline**, from two row-0 snapshot artifacts (`diff-snapshots`):
-//!    UC's 16-byte `ULTSNAP1 ‖ P` envelope is checked, the adapter parses
-//!    the image, and the key-level difference is listed. This is what says
-//!    WHICH keys diverged when the digests disagree.
+//!    UC's 24-byte `ULTSNAP2 ‖ P ‖ version ‖ reserved` envelope is checked,
+//!    the adapter parses the image, and the key-level difference is listed.
+//!    This is what says WHICH keys diverged when the digests disagree.
 
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -87,14 +87,19 @@ pub fn agree(rows: &[DigestRow]) -> bool {
         .all(|w| w[0].digest.count == w[1].digest.count && w[0].digest.digest == w[1].digest.digest)
 }
 
-const ENVELOPE: &[u8; 8] = b"ULTSNAP1";
+const ENVELOPE: &[u8; 8] = b"ULTSNAP2";
+/// UC's framework-owned artifact header length since plan B2 T2: 8 magic
+/// bytes, `P` as `u64` LE, the builder's version as `u32` LE, 4 reserved
+/// bytes (`uc_service::snapshots::SNAPSHOT_ENVELOPE_LEN`, hard-coded here
+/// since this crate has no `uc_service` dependency).
+const ENVELOPE_LEN: usize = 24;
 
 /// Read a row artifact: check UC's envelope and return (P, image).
 pub fn read_artifact(adapter: &dyn Adapter, path: &Path) -> Result<(u64, Image)> {
     let b = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
-    if b.len() < 16 || &b[..8] != ENVELOPE {
+    if b.len() < ENVELOPE_LEN || &b[..8] != ENVELOPE {
         bail!(
-            "{}: no ULTSNAP1 envelope (pre-2.11.0 artifact or not an artifact)",
+            "{}: no ULTSNAP2 envelope (pre-2.13.0 artifact or not an artifact)",
             path.display()
         );
     }
@@ -109,7 +114,7 @@ pub fn read_artifact(adapter: &dyn Adapter, path: &Path) -> Result<(u64, Image)>
     // NOT `envelope ‖ kv_image` as the builder's `WIRE-FORMAT.md` § 5 states.
     // We skip the prefix by its length (exact, never a scan); the blob's
     // bincode `TableImage` contents are UC's, not the adapter's business.
-    let payload = &b[16..];
+    let payload = &b[ENVELOPE_LEN..];
     let image: &[u8] = if adapter.sessioned() {
         let len_bytes = payload.get(..8).ok_or_else(|| {
             anyhow::anyhow!(

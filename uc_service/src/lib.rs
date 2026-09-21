@@ -387,6 +387,9 @@ impl<S: RawStateMachine, O: RawOutputHandler<S>> ServiceBuilder<S, O> {
             cnc: Arc::clone(&cnc),
             busy,
             service_id,
+            // Plan B2 T2: stamp every artifact this builder publishes with the
+            // VERSION of the binary that built it, not the row's own.
+            version: S::VERSION,
         };
         let builder_agent = AgentRunner::spawn("uc2-snapshot-builder", BUILDER_IDLE, move || {
             builder_cycle(&mut builder_state)

@@ -6,6 +6,7 @@ fn trace(entries: Vec<(u64, &[u8], &[u8])>, proj_end: &str) -> Trace {
     Trace {
         row: 0,
         version: 1,
+        artifact_version: Some(1),
         origin: 32,
         end: 1000,
         projection_at_origin: Some("value=None\n".into()),
@@ -468,6 +469,7 @@ fn timer_trace(id: u64, resp: &[u8]) -> Trace {
     Trace {
         row: 0,
         version: 1,
+        artifact_version: Some(1),
         origin: 32,
         end: 1000,
         projection_at_origin: Some("value=None\n".into()),

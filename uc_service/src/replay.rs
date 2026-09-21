@@ -240,12 +240,13 @@ pub(crate) fn replay_into<S: RawStateMachine>(
                 // bytes verbatim under `snapshots/<row>/`, so the artifact a
                 // snapshot session produced carries the shipper's envelope and
                 // is checked by this same line.
-                crate::snapshots::verify_snapshot_envelope(&mut file, s_pos).map_err(|e| {
-                    ServiceError::MistaggedSnapshot {
+                // `None` for now: the version cross-check is Task 3/4's; this
+                // task only carries the envelope's shape to 24 bytes.
+                let _env = crate::snapshots::verify_snapshot_envelope(&mut file, s_pos, None)
+                    .map_err(|e| ServiceError::MistaggedSnapshot {
                         path: path.display().to_string(),
                         source: e,
-                    }
-                })?;
+                    })?;
                 let installed = (r.install)(&mut guard, s_pos, &mut file)
                     .map_err(|e| ServiceError::Replay(format!("snapshot install: {e}")))?;
                 // A self-check on the TRAIT contract ("returns the post-install
