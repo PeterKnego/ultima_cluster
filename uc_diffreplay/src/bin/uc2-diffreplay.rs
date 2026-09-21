@@ -5,15 +5,16 @@
 //! implement the `replay` contract (README). Exit 1 when the report fails.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
-use anyhow::{Context, bail};
+#[cfg(feature = "export")]
+use anyhow::bail;
 use clap::{Parser, Subcommand};
 use uc_diffreplay::attribute::{Declaration, attribute};
 use uc_diffreplay::confirm::{Verdicts, confirm};
 #[cfg(feature = "export")]
 use uc_diffreplay::corpus::Corpus;
 use uc_diffreplay::diff::{Profile, diff};
+use uc_diffreplay::pinverify;
 use uc_diffreplay::report::Report;
 use uc_diffreplay::trace::Trace;
 
@@ -63,6 +64,90 @@ enum Sub {
         #[arg(long)]
         report: PathBuf,
     },
+    /// Spec §6.2 part 2: on a real node, with the app's real binaries, prove
+    /// the pin refuses the stale binary and steers the new one onto the
+    /// artifact path (never the genesis counterfactual).
+    #[cfg(feature = "pin-verify")]
+    PinVerify {
+        #[arg(long)]
+        corpus: PathBuf,
+        /// The OLD service binary (the version running before the upgrade).
+        #[arg(long)]
+        old: PathBuf,
+        /// The app's own arguments for its SERVE form — its serve verb, then
+        /// its knobs (repeatable, and each one may itself begin with `-`).
+        /// The `replay`/`project` forms reuse the knobs behind their own verb
+        /// (`uc_diffreplay::pinverify::app_knobs`).
+        #[arg(long = "old-arg", allow_hyphen_values = true)]
+        old_args: Vec<String>,
+        #[arg(long)]
+        new: PathBuf,
+        #[arg(long = "new-arg", allow_hyphen_values = true)]
+        new_args: Vec<String>,
+        #[arg(long)]
+        app_id: String,
+        /// The row's FSM name, as `[services] names` declares it.
+        #[arg(long)]
+        fsm: String,
+        #[arg(long, default_value_t = 0)]
+        row: u8,
+        /// The packed version the pin names — what `uc2ctl upgrade pin --to`
+        /// takes (`MAJOR.MINOR.PATCH`), or a raw packed integer.
+        #[arg(long, value_parser = parse_version)]
+        to: u32,
+        /// MESSAGE frames re-submitted before the instant (default: half).
+        #[arg(long)]
+        split: Option<usize>,
+        #[arg(long, default_value_t = 60)]
+        timeout_secs: u64,
+        /// Where the scratch instance dir and traces go (default:
+        /// `<report>.pinverify/`). Given explicitly, it is never removed.
+        #[arg(long)]
+        scratch: Option<PathBuf>,
+        #[arg(long)]
+        report: PathBuf,
+    },
+}
+
+/// What `--to` accepts: the `MAJOR.MINOR.PATCH` form `uc2ctl upgrade pin
+/// --to` takes (`uc_ctl::upgrade::parse_semver`'s rule, copied rather than
+/// depended on — this binary must not link the admin CLI), or a raw packed
+/// `u32` (decimal, or `0x`-prefixed hex) for a state machine whose `VERSION`
+/// is a bare integer rather than a packed semver — the harness's own
+/// `DoublingRegisterSm::VERSION = 2` is one.
+///
+/// Packed `0` is the "unversioned" sentinel — what an unversioned row's cnc
+/// word already reads — so a pin naming it could not be told from "no pin".
+/// Refused in BOTH forms, with the same message `uc2ctl` gives.
+#[cfg(feature = "pin-verify")]
+fn parse_version(s: &str) -> Result<u32, String> {
+    let v = if s.contains('.') {
+        let parts: Vec<&str> = s.split('.').collect();
+        if parts.len() != 3 {
+            return Err(format!("version {s:?}: expected MAJOR.MINOR.PATCH"));
+        }
+        let major: u8 = parts[0]
+            .parse()
+            .map_err(|_| format!("version {s:?}: major must be 0..=255"))?;
+        let minor: u8 = parts[1]
+            .parse()
+            .map_err(|_| format!("version {s:?}: minor must be 0..=255"))?;
+        let patch: u16 = parts[2]
+            .parse()
+            .map_err(|_| format!("version {s:?}: patch must be 0..=65535"))?;
+        uc_protocol::identity::pack_version(major, minor, patch)
+    } else if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        u32::from_str_radix(hex, 16).map_err(|_| format!("version {s:?}: not a packed u32"))?
+    } else {
+        s.parse::<u32>()
+            .map_err(|_| format!("version {s:?}: not MAJOR.MINOR.PATCH and not a packed u32"))?
+    };
+    if v == 0 {
+        return Err(format!(
+            "version {s:?} packs to 0, the \"unversioned\" sentinel: --to must name a real version"
+        ));
+    }
+    Ok(v)
 }
 
 #[cfg(feature = "export")]
@@ -88,31 +173,12 @@ enum CorpusSub {
     },
 }
 
-/// Run `<bin> replay --corpus C --out T [--from-genesis] [extra…]` and read the trace back.
-fn replay(
-    bin: &Path,
-    corpus: &Path,
-    out: &Path,
-    from_genesis: bool,
-    extra: &[&str],
-) -> anyhow::Result<Trace> {
-    let mut c = Command::new(bin);
-    c.arg("replay")
-        .arg("--corpus")
-        .arg(corpus)
-        .arg("--out")
-        .arg(out);
-    if from_genesis {
-        c.arg("--from-genesis");
-    }
-    c.args(extra);
-    let st = c
-        .status()
-        .with_context(|| format!("spawn {}", bin.display()))?;
-    if !st.success() {
-        bail!("{} replay exited {st}", bin.display());
-    }
-    Trace::read_json(std::fs::File::open(out)?)
+/// Run `<bin> replay --corpus C --out T [--from-genesis]` and read the trace
+/// back. The three diff modes give the app no arguments of their own; only
+/// `pin-verify` does (it runs one app binary in three forms), which is why
+/// the helper itself lives in [`uc_diffreplay::pinverify`].
+fn replay(bin: &Path, corpus: &Path, out: &Path, from_genesis: bool) -> anyhow::Result<Trace> {
+    pinverify::run_replay(bin, &[], corpus, out, from_genesis)
 }
 
 fn finish(report: Report, path: &Path) -> anyhow::Result<()> {
@@ -205,8 +271,8 @@ fn main() -> anyhow::Result<()> {
             report,
         } => {
             let tmp = traces_dir_beside(&report)?;
-            let a = replay(&old, &corpus, &tmp.join("old.json"), false, &[])?;
-            let b = replay(&new, &corpus, &tmp.join("new.json"), false, &[])?;
+            let a = replay(&old, &corpus, &tmp.join("old.json"), false)?;
+            let b = replay(&new, &corpus, &tmp.join("new.json"), false)?;
             let d = Declaration::from_toml(&std::fs::read_to_string(&declare)?)?;
             let (profile, verdicts) = judge(&a, &b, &d, |_| {})?;
             finish(Report::new("upgrade", corpus, profile, verdicts), &report)
@@ -217,8 +283,8 @@ fn main() -> anyhow::Result<()> {
             report,
         } => {
             let tmp = traces_dir_beside(&report)?;
-            let a = replay(&bin, &corpus, &tmp.join("run1.json"), false, &[])?;
-            let b = replay(&bin, &corpus, &tmp.join("run2.json"), false, &[])?;
+            let a = replay(&bin, &corpus, &tmp.join("run1.json"), false)?;
+            let b = replay(&bin, &corpus, &tmp.join("run2.json"), false)?;
             let d = empty_declaration()?;
             let (profile, verdicts) = judge(&a, &b, &d, |_| {})?;
             finish(
@@ -232,8 +298,8 @@ fn main() -> anyhow::Result<()> {
             report,
         } => {
             let tmp = traces_dir_beside(&report)?;
-            let art = replay(&bin, &corpus, &tmp.join("artifact.json"), false, &[])?;
-            let mut genesis = replay(&bin, &corpus, &tmp.join("genesis.json"), true, &[])?;
+            let art = replay(&bin, &corpus, &tmp.join("artifact.json"), false)?;
+            let mut genesis = replay(&bin, &corpus, &tmp.join("genesis.json"), true)?;
             // Align the spans for diff() (same origin/end/row) — but the
             // genesis run installs no artifact, so it has no origin state to
             // compare. Do NOT fake one by copying the artifact run's
@@ -269,6 +335,53 @@ fn main() -> anyhow::Result<()> {
             );
             Ok(())
         }
+        #[cfg(feature = "pin-verify")]
+        Sub::PinVerify {
+            corpus,
+            old,
+            old_args,
+            new,
+            new_args,
+            app_id,
+            fsm,
+            row,
+            to,
+            split,
+            timeout_secs,
+            scratch,
+            report,
+        } => {
+            // An explicit `--scratch` is the operator's directory: never
+            // removed, whatever the verdict. The default one is this run's
+            // own, and it is EVIDENCE — kept on a FAIL (like `clear_traces`),
+            // swept on a PASS or an INCONCLUSIVE.
+            let keep = scratch.is_some();
+            let a = pinverify::PinVerifyArgs {
+                corpus,
+                old,
+                old_args,
+                new,
+                new_args,
+                app_id,
+                fsm,
+                row,
+                to,
+                split,
+                timeout: std::time::Duration::from_secs(timeout_secs),
+                scratch,
+                report: report.clone(),
+            };
+            let r = pinverify::run(&a)?;
+            r.write_json(std::fs::File::create(&report)?)?;
+            r.write_text(std::io::stdout())?;
+            if r.failed() {
+                std::process::exit(1);
+            }
+            if !keep {
+                let _ = std::fs::remove_dir_all(pinverify::scratch_dir_of(&report));
+            }
+            Ok(())
+        }
     }
 }
 
@@ -283,4 +396,39 @@ fn traces_dir_beside(report: &Path) -> anyhow::Result<PathBuf> {
     let d = traces_dir_of(report);
     std::fs::create_dir_all(&d)?;
     Ok(d)
+}
+
+#[cfg(all(test, feature = "pin-verify"))]
+mod tests {
+    use super::parse_version;
+
+    /// `--to` takes both spellings a real pin is written in: the
+    /// `MAJOR.MINOR.PATCH` one `uc2ctl upgrade pin` takes, and the raw packed
+    /// integer a state machine's `const VERSION` may be (the harness's
+    /// `DoublingRegisterSm::VERSION = 2`). Packed `0` is the "unversioned"
+    /// sentinel and is refused in BOTH spellings — `0.0.0` packs to the very
+    /// word a bare `0` names.
+    #[test]
+    fn to_accepts_semver_and_packed_integers_but_never_zero() {
+        assert_eq!(parse_version("1.2.3"), Ok(0x0102_0003));
+        assert_eq!(parse_version("0.0.2"), Ok(2));
+        assert_eq!(parse_version("2"), Ok(2));
+        assert_eq!(parse_version("0x00010203"), Ok(0x0001_0203));
+        assert_eq!(parse_version("4294967295"), Ok(u32::MAX));
+        for zero in ["0.0.0", "0", "0x0"] {
+            let e = parse_version(zero).unwrap_err();
+            assert!(e.contains("unversioned"), "{zero}: {e}");
+        }
+        for bad in [
+            "1.2",
+            "1.2.3.4",
+            "nope",
+            "256.0.0",
+            "0.0.65536",
+            "-1",
+            "0xzz",
+        ] {
+            assert!(parse_version(bad).is_err(), "{bad} should not parse");
+        }
+    }
 }

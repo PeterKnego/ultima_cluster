@@ -36,5 +36,6 @@ pub mod diff;
 pub mod drive;
 #[cfg(feature = "pin-verify")]
 pub mod live;
+pub mod pinverify;
 pub mod report;
 pub mod trace;
