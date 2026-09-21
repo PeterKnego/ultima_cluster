@@ -185,6 +185,11 @@ fn last_actionable_instant<S: RawStateMachine>(
 ///   the previous incarnation; re-emitting them onto the egress ring would be
 ///   harmless (at-least-once) but noisy, so replay applies without publishing.
 ///
+/// `gap_above` is the caller's evidence that the journal cannot serve a cursor
+/// even though `first_meta` says it can (plan B3 final review F1): it forces
+/// the gap guard below to fire and to require a covering artifact strictly
+/// above that position. `None` is the ordinary pass.
+///
 /// [`LogFollower`]: uc_log::reader::LogFollower
 pub(crate) fn replay_into<S: RawStateMachine>(
     sm: &Mutex<S>,
@@ -192,6 +197,7 @@ pub(crate) fn replay_into<S: RawStateMachine>(
     journal_dir: &std::path::Path,
     restore: Option<&SnapshotRestore<S>>,
     instant: ReplayInstant<'_, S>,
+    gap_above: Option<u64>,
 ) -> Result<Replay, ServiceError> {
     let reader = TailReader::open(journal_dir).map_err(|e| ServiceError::Replay(e.to_string()))?;
     let mut guard = sm.lock().unwrap();
@@ -212,10 +218,28 @@ pub(crate) fn replay_into<S: RawStateMachine>(
     // class). Instead: install a covering snapshot (if the SM can), else
     // fail-stop with the contract named.
     let mut start_pos = guard.last_applied().unwrap_or(0);
-    let first = reader
+    let mut first = reader
         .first_meta()
         .map_err(|e| ServiceError::Replay(e.to_string()))?
         .unwrap_or(0);
+    // Plan B3 final review F1 — `gap_above` is the caller saying "a replay
+    // pass from this cursor moved nothing, and the bytes it needed are
+    // committed AND durable": `Batch::Overrun` is only reached with `cursor <
+    // min(commit, durable)` (`LogFollower::next_batch` answers `CaughtUp`
+    // first), and the durable counter IS the archive's recorded frontier, so
+    // every byte in `(cursor, target]` was recorded. A pass that applied none
+    // of them therefore proves the journal no longer RETAINS them — a purged
+    // prefix, or the stale-base-0 segment a below-floor joiner leaves behind.
+    // That is precisely the gap this guard exists for, and `first_meta` alone
+    // cannot see it (a stale block based at 0 answers `first = 0`, so `first >
+    // start_pos` is false and the hole is invisible). Raising `first` above
+    // BOTH the applied frontier and the caller's cursor makes the guard fire
+    // and constrains the covering artifact to sit strictly ABOVE that cursor —
+    // so the install can only move the row forward, never rewind it onto a
+    // journal tail that does not continue it.
+    if let Some(floor) = gap_above {
+        first = first.max(start_pos.max(floor).saturating_add(1));
+    }
     if first > start_pos {
         // A covering snapshot must reach at least `first` (so the snapshot's
         // prefix `[0, S]` and the journal's tail `[first, target]` overlap and

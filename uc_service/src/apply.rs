@@ -325,6 +325,12 @@ pub(crate) struct ApplyState<S: RawStateMachine> {
     /// Plan B3 T5: the cursor a replay pass last failed to advance past, so
     /// the forward-progress guard in [`apply_cycle`] reports one line per
     /// episode rather than one per duty cycle. `None` whenever a pass moved.
+    ///
+    /// Final review F1: it is also the guard's evidence, handed to
+    /// [`replay_into`](crate::replay::replay_into) as `gap_above` — a pass
+    /// that could not move this cursor under `Overrun` proves the journal no
+    /// longer retains the bytes above it, which is the gap condition
+    /// `first_meta` alone cannot detect.
     pub(crate) replay_stalled: Option<u64>,
 }
 
@@ -699,6 +705,11 @@ pub(crate) fn apply_cycle<S: RawStateMachine>(st: &mut ApplyState<S>) -> bool {
                     service_id: st.service_id,
                     pin: st.pin,
                 },
+                // Plan B3 final review F1: a pass that already failed to move
+                // this cursor is evidence the journal cannot serve it — feed
+                // that back so the gap guard fires instead of scanning
+                // nothing again (the guard below sets this, once).
+                st.replay_stalled,
             ) {
                 Ok(Replay::Rejoin(cursor)) => cursor,
                 // The covering artifact is above `min(commit, durable)`: the
@@ -746,31 +757,48 @@ pub(crate) fn apply_cycle<S: RawStateMachine>(st: &mut ApplyState<S>) -> bool {
             // scan yields nothing, and the cursor comes back unmoved while
             // `next_batch` keeps saying `Overrun`.
             //
-            // Hand the cycle back instead, exactly as the `AwaitArtifact` arm
-            // does, and let the agent idle and retry. What this guard
-            // GUARANTEES is only that: the loop yields, the agent stays
-            // stoppable, and the row reports rather than spins. It does NOT
-            // guarantee convergence. If the node's retained prefix does later
-            // stop covering this cursor — a purge below it, which needs
-            // `PurgePolicy::BelowSnapshot` and is therefore NOT the default
-            // (`PurgePolicy::Disabled`) — the gap guard fires on a subsequent
-            // pass and the row converges through the ordinary install path.
-            // Under the default policy nothing moves the prefix, so a row
-            // that lands here can idle indefinitely; the operator sees the
-            // line below and the row's `applied` standing still. Counting the
-            // episodes is backlog.
+            // A no-progress pass IS the gap (plan B3 final review F1), and it
+            // is the one shape `replay_into`'s own `first > start_pos` test
+            // cannot see: a stale block based at 0 answers `first = 0`, so
+            // nothing looks missing. The proof that it is a gap is the arm we
+            // are standing in — `Batch::Overrun` is only reached with `cursor
+            // < min(commit, durable)` (`next_batch` answers `CaughtUp`
+            // first), and `durable` IS the archive's recorded frontier, so
+            // every byte in `(cursor, target]` was recorded. A pass that
+            // applied none of them means the journal no longer RETAINS them.
             //
-            // Reported once per episode, so a row that stays stuck says so
-            // instead of sitting silent.
+            // So route it into the handling the gap guard already produces,
+            // rather than idling: re-enter the replay with `gap_above` set to
+            // this cursor, which forces the guard and requires the covering
+            // artifact to sit strictly ABOVE it. A snapshot-capable row
+            // installs that artifact and moves (or waits for it, through
+            // `AwaitArtifact`, if it is still above the apply target); a row
+            // that cannot install fail-stops with `SnapshotRequired` — the
+            // deliberate below-floor-without-snapshot outcome, which makes
+            // `is_alive()` false so a supervisor restarts the service and the
+            // restart's install-at-attach (plan B2) does the covering install.
+            // The one thing that must NOT happen is what happened before this
+            // fix: a silent row idling forever under the default
+            // `PurgePolicy::Disabled`, where nothing ever moves the retained
+            // prefix and no later pass could discover the gap by itself.
+            //
+            // The forced pass is taken ONCE per episode (`replay_stalled`
+            // records the cursor and is cleared by any pass that moves), and
+            // its three outcomes are exhaustive, so this `break` is the
+            // defensive arm only. Root cause — widening `replay_into`'s gap
+            // test so this detour is unnecessary — is filed in
+            // `docs/BACKLOG.md`.
             if cursor <= cursor_before {
                 if st.replay_stalled != Some(cursor) {
                     st.replay_stalled = Some(cursor);
                     eprintln!(
                         "uc_service: service {} replay made no progress at cursor {cursor} \
-                         (apply target {target}); idling and retrying — the journal's retained \
-                         prefix does not yet meet this row's frontier",
+                         (apply target {target}); the journal's retained prefix does not cover \
+                         this row — retrying the pass as a gap (install a covering snapshot, \
+                         or fail-stop)",
                         st.service_id
                     );
+                    continue;
                 }
                 break;
             }
@@ -1588,29 +1616,17 @@ mod tests {
 
     // ------------------- plan B3 T5: the replay forward-progress guard
 
-    /// A replay pass that does NOT advance the cursor must hand the cycle
-    /// back, not spin inside it.
-    ///
-    /// The overrun arm's comment argues the loop is livelock-free because
-    /// "each replay pass strictly ADVANCES the cursor toward the archived
-    /// frontier" — an argument, not an enforced invariant. When it does not
-    /// hold, `next_batch` keeps saying `Overrun`, `replay_into` keeps
-    /// returning the same cursor, and `apply_cycle` NEVER RETURNS. That is
-    /// worse than a hot loop: `AgentRunner` only reads its stop flag between
-    /// `work()` calls, so `Service::stop`'s join hangs for good — which is
-    /// how it was found (plan B3 T5 made a below-floor joiner's service
-    /// attach after its node had adopted a floor, and
-    /// `uc_node/tests/learner.rs`'s redirect capstone stopped terminating).
-    ///
-    /// Staged here with the journal REMOVED under a lapped ring: the gap
-    /// guard reads `first = 0`, sees no gap, scans nothing, and gives the
-    /// cursor straight back. Run on its own thread with a deadline, because
-    /// the defect this pins is a hang — a test that reproduced it inline
-    /// would hang the suite instead of failing it.
-    #[test]
-    fn a_replay_that_cannot_advance_returns_instead_of_spinning() {
-        let dir = scratch();
-        let cnc = page(0x9191);
+    /// Stage the below-floor-joiner shape: a cursor far under the ring's
+    /// retained window, and a journal that answers "my first base is 0" while
+    /// holding nothing at all — so `replay_into`'s own `first > start_pos`
+    /// test sees no gap, the scan yields nothing, and the cursor comes
+    /// straight back. Returns the state (with no install capability; the
+    /// caller adds one), the appended positions and the head.
+    fn a_stalled_below_floor_row(
+        dir: &tempfile::TempDir,
+        instance_id: u128,
+    ) -> (super::ApplyState<CountSm>, Vec<u64>, u64) {
+        let cnc = page(instance_id);
         cnc.store_services_declared(0b1);
         let buffer = std::sync::Arc::new(uc_log::buffer::LogBuffer::new(
             uc_log::region::Region::heap_zeroed(CAP as usize),
@@ -1618,10 +1634,7 @@ mod tests {
             256,
         ));
         // Lap the ring (the appender will not overwrite unrecorded bytes, so
-        // a real archive has to run alongside), then take the journal away:
-        // that is the shape a below-floor joiner presents — a cursor far
-        // under the ring's retained window and a journal that answers "my
-        // first base is 0", so nothing looks missing and nothing is there.
+        // a real archive has to run alongside), then take the journal away.
         let journal_dir = dir.path().join("journal");
         let mut archive = uc_log::archive::Archive::open(uc_log::archive::ArchiveConfig {
             segment_size_bytes: 16 * 1024,
@@ -1630,8 +1643,9 @@ mod tests {
         })
         .unwrap();
         let mut appender = uc_log::buffer::Appender::new(std::sync::Arc::clone(&buffer), 1, 0);
+        let mut pos = Vec::with_capacity(1400);
         for i in 0..1400usize {
-            appender.append(1, i as u32, &[1u8; 64]).unwrap();
+            pos.push(appender.append(1, i as u32, &[1u8; 64]).unwrap());
             if i % 100 == 99 {
                 while archive.do_work(&buffer).unwrap() {}
             }
@@ -1654,7 +1668,7 @@ mod tests {
             uc_protocol::ring::SpscRing::create(&dir.path().join("svc_sched.ring"), 1 << 16, 1024)
                 .unwrap()
                 .into_split();
-        let mut st = super::ApplyState {
+        let st = super::ApplyState {
             poisoned: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             follower: uc_log::reader::LogFollower::new(std::sync::Arc::clone(&buffer), 0),
             sm: Arc::new(std::sync::Mutex::new(CountSm::default())),
@@ -1671,7 +1685,7 @@ mod tests {
             needs_replay: false,
             replay_wait: None,
             replay_stalled: None,
-            instance_id: 0x9191,
+            instance_id,
             instance_mismatch_streak: 0,
             my_epoch: 1,
             service_id: 0,
@@ -1682,25 +1696,124 @@ mod tests {
             snapshot_trigger: None,
             snapshot_restore: None,
         };
+        (st, pos, head)
+    }
+
+    /// A replay pass that does NOT advance the cursor must hand the cycle
+    /// back, not spin inside it — and, since the final review, must not idle
+    /// silently either: on a row that CANNOT install a snapshot it fail-stops
+    /// with the contract named.
+    ///
+    /// The overrun arm's comment argues the loop is livelock-free because
+    /// "each replay pass strictly ADVANCES the cursor toward the archived
+    /// frontier" — an argument, not an enforced invariant. When it does not
+    /// hold, `next_batch` keeps saying `Overrun`, `replay_into` keeps
+    /// returning the same cursor, and `apply_cycle` NEVER RETURNS. That is
+    /// worse than a hot loop: `AgentRunner` only reads its stop flag between
+    /// `work()` calls, so `Service::stop`'s join hangs for good — which is
+    /// how it was found (plan B3 T5 made a below-floor joiner's service
+    /// attach after its node had adopted a floor, and
+    /// `uc_node/tests/learner.rs`'s redirect capstone stopped terminating).
+    ///
+    /// Final review F1: handing the cycle back is not enough on its own. A
+    /// no-progress pass under `Overrun` PROVES the journal no longer retains
+    /// the bytes above the cursor (they are committed and durable, so they
+    /// were recorded), so the pass is re-entered with the gap forced. Without
+    /// an install capability the honest answer is
+    /// [`ServiceError::SnapshotRequired`], which fail-stops this thread and
+    /// makes `is_alive()` false so a supervisor restarts the service —
+    /// instead of a dead row idling forever under the default
+    /// `PurgePolicy::Disabled`.
+    ///
+    /// Run on its own thread with a deadline, because the defect this pins is
+    /// a hang — a test that reproduced it inline would hang the suite instead
+    /// of failing it.
+    #[test]
+    fn a_replay_that_cannot_advance_fail_stops_a_row_that_cannot_install() {
+        let dir = scratch();
+        let (mut st, _pos, _head) = a_stalled_below_floor_row(&dir, 0x9191);
+        assert!(st.snapshot_restore.is_none(), "no install capability");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let h = std::thread::spawn(move || {
+            let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                super::apply_cycle(&mut st)
+            }));
+            let msg = match &out {
+                Ok(_) => None,
+                Err(e) => Some(
+                    e.downcast_ref::<String>()
+                        .cloned()
+                        .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
+                        .unwrap_or_default(),
+                ),
+            };
+            let _ = tx.send(msg);
+            (out.is_ok(), st.follower.cursor, st.replay_stalled)
+        });
+        let msg = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("apply_cycle never returned: the overrun loop spun in place");
+        let (ok, cursor, stalled) = h.join().unwrap();
+        assert!(!ok, "a row that cannot install must not idle here");
+        let msg = msg.expect("the cycle fail-stops");
+        assert!(
+            msg.contains("service journal replay fail-stop") && msg.contains("SnapshotRequired"),
+            "the fail-stop names the contract: {msg}"
+        );
+        assert_eq!(cursor, 0, "nothing was applied before the fail-stop");
+        assert_eq!(
+            stalled,
+            Some(0),
+            "the stall episode is recorded, so the line is printed once"
+        );
+    }
+
+    /// The same stall on a SNAPSHOT-CAPABLE row takes the covering-install
+    /// path instead: the forced gap pass installs the newest artifact at or
+    /// below the apply target and the row rejoins the live ring above it.
+    /// This is the half that makes the fail-stop above the deliberate
+    /// below-floor-WITHOUT-snapshot outcome rather than the only outcome.
+    #[test]
+    fn a_replay_that_cannot_advance_installs_a_covering_artifact_when_it_can() {
+        let dir = scratch();
+        let (mut st, pos, head) = a_stalled_below_floor_row(&dir, 0x9292);
+        let p_pos = pos[1300];
+        let store = crate::snapshots::SnapshotStore::open(dir.path(), 0).unwrap();
+        store
+            .publish(p_pos, 0, |w| w.write_all(b"snap").map_err(Into::into))
+            .unwrap();
+        st.snapshot_restore = Some(super::SnapshotRestore::<CountSm> {
+            store,
+            install: Box::new(|sm, pos, _r| {
+                sm.last = Some(pos);
+                Ok(pos)
+            }),
+        });
 
         let (tx, rx) = std::sync::mpsc::channel();
         let h = std::thread::spawn(move || {
             let progressed = super::apply_cycle(&mut st);
-            let cursor = st.follower.cursor;
-            let _ = tx.send((progressed, cursor));
+            let _ = tx.send(progressed);
             st
         });
-        let (progressed, cursor) = rx
+        let progressed = rx
             .recv_timeout(std::time::Duration::from_secs(10))
             .expect("apply_cycle never returned: the overrun loop spun in place");
         let st = h.join().unwrap();
-        assert!(!progressed, "nothing was applied");
-        assert_eq!(cursor, 0, "the cursor could not advance");
+        assert!(progressed, "the covering artifact moved the row");
+        assert_eq!(st.replay_stalled, None, "the stall episode ended");
         assert_eq!(
-            st.replay_stalled,
-            Some(0),
-            "the stall is recorded once per episode, so the row says so"
+            st.follower.cursor, head,
+            "installed at P, then read the live tail to the head"
         );
+        let sm = st.sm.lock().unwrap();
+        assert_eq!(
+            sm.applies,
+            (1400 - 1301) as u64,
+            "exactly the frames above P (P itself is in the artifact)"
+        );
+        assert_eq!(sm.last, Some(pos[1399]));
     }
 
     /// M14c2 ruling K (`docs/benchmarks/uc2-m14c-*`): `uc_service_lag_waits_total`
