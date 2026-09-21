@@ -325,12 +325,20 @@ impl Fixture {
         }
         // An instant whose builder was busy publishes nothing (`freeze` is
         // skipped, `SNAPSHOT_SKIPPED_BUSY`), so keep commanding until one
-        // lands rather than waiting forever on a skipped one.
+        // lands rather than waiting forever on a skipped one — bounded, so a
+        // row that never publishes fails here with the position it was stuck
+        // on instead of hanging the suite.
+        let instant_deadline = Instant::now() + Duration::from_secs(60);
         loop {
             let art = artifact_path(dir.path(), p);
             if wait_for(Duration::from_millis(500), || art.is_file()) {
                 break;
             }
+            assert!(
+                Instant::now() < instant_deadline,
+                "row 0 published no artifact for any commanded instant \
+                 (last P={p}); every freeze was skipped busy"
+            );
             p = command_instant(&node);
         }
         if !matches!(spec.purge, PurgePolicy::Disabled) {
@@ -587,6 +595,26 @@ fn a_pinned_attach_converges_on_a_purging_cluster() {
     assert!(
         f.node.archive_first_base() > 0,
         "precondition: the journal is purged below P"
+    );
+    // The TRIGGER, asserted rather than assumed: the gap guard fires only
+    // because the artifact's own internal cursor — where `install_snapshot`
+    // leaves the state machine, i.e. the row's last applied MESSAGE below P —
+    // sits BELOW the journal's first retained base. That is what `Spec
+    // ::purging`'s `extra_instants` buy; without it the pinned attach would
+    // converge through the ordinary tail replay and prove nothing about the
+    // gap. The purge behind the floor is asynchronous and throttled, so this
+    // is a bounded WAIT, not a spot read — on a loaded box the floor is at P
+    // well before the segments below it are gone.
+    let cursor = {
+        let mut v1 = RegisterSm::default();
+        let mut art = std::fs::File::open(f.artifact()).unwrap();
+        verify_snapshot_envelope(&mut art, f.p, Some(V1)).unwrap();
+        SnapshotStateMachine::install_snapshot(&mut v1, f.p, &mut art).unwrap();
+        StateMachine::last_applied(&v1).unwrap_or(0)
+    };
+    wait_until(
+        "the journal's first base passed the artifact's cursor (the gap)",
+        || f.node.archive_first_base() > cursor,
     );
     f.pin(V1, V2);
 
