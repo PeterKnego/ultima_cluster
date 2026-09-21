@@ -383,12 +383,23 @@ phrase, pinned to the Display by
 `the_refusal_marker_is_the_sdks_own_text`); the swapped-in binary's LIVE
 state equals what replaying the span from the pinned **artifact** computes
 and differs from the genesis counterfactual
-(`an_in_memory_register_passes_and_demonstrates_the_counterfactual`); the
-same holds for a state machine that persisted past the origin and therefore
+(`an_in_memory_register_passes_and_demonstrates_the_counterfactual`); and
+the same for a state machine that persisted past the origin and therefore
 has to be rewound to it
 (`a_durable_register_is_rewound_to_the_origin_and_passes`, over
 `uc_lincheck::register::Durable<S>`) — the empty and durable shapes §6.2 asks
-for. The teeth are three: a NEW binary that is not the pinned version is a
+for. **What makes that rewind observable** is named, because "OLD was
+stopped above P" is only the precondition: the mode requires NEW to have
+printed the SDK's own `pinned install of snap-P` line on its stderr
+(`SwapArm::install_logged`, the same class of evidence as the refusal
+marker, pinned by `the_install_marker_is_the_sdks_own_text`), and the
+durable case additionally runs NEW as `register-replay --double-cas`
+(`DoublingCasRegisterSm`, `VERSION = 3`), a version change that touches a
+history-PRESERVING command. That matters because a durable service's wrong
+path is not the genesis replay — it is continuing from X with the state it
+persisted — and with a last-write-wins register and a `Write`-only change
+the artifact path and continue-from-X compute the same value, so state alone
+could not have told them apart. The teeth are three: a NEW binary that is not the pinned version is a
 FAIL rather than a pass
 (`a_new_binary_that_is_not_the_pinned_version_is_a_fail`), a span whose
 commands cannot tell the two paths apart is INCONCLUSIVE rather than a pass
@@ -398,7 +409,11 @@ already IS the pinned version is refused before any pin is placed
 arm could not have refused anything. The evidence one run carried, as
 recorded in its own report: P=12864 < X=16160 < Q=16256, the artifact path
 and the live state both projecting `value=Some(249)` where the genesis path
-projects `value=Some(398)`.
+projects `value=Some(398)`. The durable case, on the same span with
+`--double-cas`, parts all three: live and artifact both `value=Some(400)`,
+genesis `value=Some(398)`, and the continue-from-X value a skipped install
+would have left — `value=Some(249)`, measured on the `--double` build this
+case used before — equal to neither.
 
 **What `pin_verify.rs` does NOT verify.** It is **one node** — a single
 voter in a scratch instance dir — so nothing here is evidence about a pin
@@ -409,7 +424,13 @@ sequence exercises both shapes (OLD is stopped at X > P before the pin), but
 the check is the same either way, and only the fixture pins each shape by
 construction. `TIMER` frames in a corpus are skipped and counted, never
 re-submitted — a node mints those — so a timer-driven divergence is outside
-what a span can demonstrate here. And `uc2ctl upgrade show` is deliberately
+what a span can demonstrate here. Nor is the re-submission row-aware:
+`live::message_frames` re-submits **every** `MESSAGE` frame in the span
+regardless of which row the recorded cluster routed it to (it inherits
+`drive::walk_block`'s dispatch), so on a corpus exported from a multi-FSM
+cluster the mode feeds other rows' commands into `--row`. Both paths see the
+same bytes, so the comparison itself is unaffected — but the span being
+replayed is not the row's own history. And `uc2ctl upgrade show` is deliberately
 not consulted (its record lands one instant behind the artifact it reads),
 so this suite says nothing about that surface; the metrics and `upgrade
 show` readings are covered by the plan B1/B3 tests above.

@@ -161,7 +161,7 @@ and hard-assert they exist, so build them first:
     cargo test -p uc_diffreplay -p uc_service -p uc_lincheck -p kv_store
 
 `tests/pin_verify.rs` is the heaviest of them: every case runs a real node
-and a real service process per era, and the cases that reach the swap arm
+and a real service process per era, and the cases that complete the swap arm
 run the app binary three more times (one `project`, two `replay`), so it needs
 the `register-replay` fixture built above and runs best on its own —
 

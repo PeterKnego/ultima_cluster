@@ -1101,8 +1101,10 @@ live"), and three of these change what the mode can be asked to do at all
 3. **Empty vs. durable is the app's property, exercised by the sequence and
    proven only on the fixture.** Stopping OLD at the frontier X > P before
    the pin is what makes a durable state machine attach with `last_applied()
-   = X` — and therefore what makes the pinned install's rewind to P
-   observable; an in-memory one attaches empty. The outcome check is the same
+   = X`, which is the PRECONDITION for a rewind — an in-memory one attaches
+   empty. Attaching above the origin is not the same as being *seen* to be
+   rewound to it; what makes the rewind observable is erratum 9's two
+   things. The outcome check is the same
    for both (live == artifact), and the report records P and X, but on an
    arbitrary app the harness **cannot say which shape it has**. The two
    shapes are each proven on the harness's own fixture instead:
@@ -1138,6 +1140,35 @@ live"), and three of these change what the mode can be asked to do at all
    re-submit. The harness's own e2e puts the whole workload — the writes and
    then the CAS chain — inside the exported span and splits at the writes, so
    the state-dependent tail lands after the harness's own instant at P.
+9. **What makes the pinned install's rewind OBSERVABLE, named — and it is
+   two things** (final review C1, ruling R-C-3). Erratum 3 originally
+   claimed the rewind was observable because OLD is stopped above P; that is
+   only the precondition. As built the mode observes the rewind two ways,
+   and it needs both.
+   - **(a) The SDK says it ran.** `uc_service`'s attach path prints
+     `uc_service: row R pinned install of snap-P (from …, to …, artifact
+     built by …)` on the service's own stderr once the unconditional install
+     has happened. The swap arm requires that line, naming THIS run's origin,
+     for a PASS or an INCONCLUSIVE (`SwapArm::install_logged`,
+     `uc_diffreplay::pinverify::INSTALL_MARKER_PREFIX`) — the same class of
+     black-box evidence as the refusal arm's `is pinned to version`, and the
+     only one that does not depend on the corpus.
+   - **(b) The span's own arithmetic parts the three paths** — but only if
+     the version change touches a command that PRESERVES history. A durable
+     state machine that ignored the pin would not replay from genesis; it
+     would CONTINUE FROM X, keeping the `(P, X]` it persisted. With a
+     last-write-wins register and a change that rewrites `Write` alone, every
+     span that separates the artifact path from the genesis path also
+     collapses the artifact path onto continue-from-X, so state alone cannot
+     tell a rewound service from one that skipped the install. The harness's
+     durable e2e therefore runs a third fixture build,
+     `register-replay --double-cas` (`uc_lincheck::register::
+     DoublingCasRegisterSm`, `VERSION = 3`), which doubles `Cas.new` as well
+     as `Write` and leaves `Cas.old` alone — so a CAS still FIRES on the
+     state at P while what it STORES depends on the version. Over the
+     fixture's corpus that gives artifact/live = 400, continue-from-X = 249
+     and genesis = 398, three distinct values. An app's own corpus and
+     version change need the same property before (b) adds anything to (a).
 
 ### 6.3 Black-box before white-box
 

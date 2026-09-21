@@ -29,7 +29,13 @@ is the one the artifact path computes rather than the genesis counterfactual.
 The sequence covers both state-machine shapes without needing to know which
 yours is — it stops the old binary above the pin's origin, so an in-memory
 state machine attaches empty while a durable one attaches above the origin
-and has to be rewound to it. This is a pre-flag-day check of the **pin
+and has to be rewound to it. It does not take that rewind on trust: the new
+binary has to print the SDK's own `pinned install of snap-<origin>` line on
+its stderr, or the run is a FAIL whatever the projections say. If your
+version change also alters a command whose result depends on prior state
+(not just one that overwrites it), the projections separate a third
+case as well — a durable service that quietly kept the state it had
+persisted instead of installing the artifact. This is a pre-flag-day check of the **pin
 mechanism on your binaries**, and it is not the same thing as [step
 4](#4-verify)'s `/metrics` check, which reads the real cluster after the real
 upgrade. See
