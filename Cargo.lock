@@ -1618,6 +1618,7 @@ dependencies = [
  "bincode",
  "fs2",
  "serde",
+ "sha2",
  "tempfile",
  "thiserror",
  "tokio",

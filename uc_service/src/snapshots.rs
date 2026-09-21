@@ -51,6 +51,8 @@ use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
+use sha2::{Digest, Sha256};
+
 use crate::config::SnapshotError;
 
 const DIR_NAME: &str = "snapshots";
@@ -226,6 +228,49 @@ pub fn verify_snapshot_envelope(
     Ok(env)
 }
 
+/// SHA-256 over `payload`, first 8 bytes as `u64` LE — the per-artifact hash
+/// every node reports for the live determinism check (spec §6.5.2). Over
+/// the PAYLOAD only: the 24-byte envelope is identical across nodes anyway.
+pub fn artifact_hash_of(payload: &[u8]) -> u64 {
+    let digest = Sha256::digest(payload);
+    u64::from_le_bytes(digest[..8].try_into().expect("8 bytes"))
+}
+
+/// A `Write` adapter that feeds every byte written through it into a running
+/// SHA-256 digest before passing it on to `inner` — so [`SnapshotStore::
+/// publish`] can compute [`artifact_hash_of`]'s hash WHILE streaming the
+/// payload, without buffering the artifact or reading it back off disk.
+struct HashingWriter<'a> {
+    inner: &'a mut dyn Write,
+    hasher: Sha256,
+}
+impl<'a> HashingWriter<'a> {
+    fn new(inner: &'a mut dyn Write) -> Self {
+        HashingWriter {
+            inner,
+            hasher: Sha256::new(),
+        }
+    }
+    /// Consume the adapter and return the same truncated digest
+    /// [`artifact_hash_of`] would compute over everything written through it.
+    fn finish(self) -> u64 {
+        let digest = self.hasher.finalize();
+        u64::from_le_bytes(digest[..8].try_into().expect("8 bytes"))
+    }
+}
+impl Write for HashingWriter<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        // Hash exactly the bytes actually accepted by `inner`, matching what
+        // ends up on disk even under a short write.
+        self.hasher.update(&buf[..n]);
+        Ok(n)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 /// Owns the `instance_dir/snapshots` directory: position-tagged file naming
 /// and atomic publish. It does **not** retain or prune — the node owns set
 /// retention (module doc, ruling P1). Cheap to construct — no open file
@@ -285,7 +330,9 @@ impl SnapshotStore {
     /// which is `fsync`'d, atomically renamed onto `snap-<pos>.ultsnap`
     /// (module doc), and then the DIRECTORY is `fsync`'d so the rename itself
     /// is durable. Nothing is pruned — the node's set retention decides what
-    /// is garbage. Returns the final path on success.
+    /// is garbage. Returns the final path and the payload's hash
+    /// ([`artifact_hash_of`], computed while streaming via [`HashingWriter`]
+    /// rather than read back off disk) on success — plan B3 T1.
     ///
     /// A directory-fsync failure is returned as a named `Io` error even though
     /// the rename has already happened: the artifact exists but is not
@@ -303,9 +350,9 @@ impl SnapshotStore {
         pos: u64,
         version: u32,
         write: impl FnOnce(&mut dyn Write) -> Result<(), SnapshotError>,
-    ) -> Result<PathBuf, SnapshotError> {
+    ) -> Result<(PathBuf, u64), SnapshotError> {
         let tmp_path = self.tmp_path_for(pos);
-        let result = (|| -> Result<(), SnapshotError> {
+        let result = (|| -> Result<u64, SnapshotError> {
             let mut f = File::create(&tmp_path)?;
             // Ruling P6 (plan B2 T2: now 24 bytes, carrying `version`): the
             // framework's bytes go first, ahead of the state machine's own.
@@ -314,14 +361,23 @@ impl SnapshotStore {
             // version that built it" is an invariant of this module rather
             // than a convention its callers have to remember.
             write_snapshot_envelope(&mut f, pos, version)?;
-            write(&mut f)?;
+            // Plan B3 T1: hash the PAYLOAD only, streamed — the envelope
+            // above is not fed through the hasher, so the reported hash is
+            // exactly what `artifact_hash_of` would compute over the bytes
+            // `write` produced, no more.
+            let mut hw = HashingWriter::new(&mut f);
+            write(&mut hw)?;
+            let hash = hw.finish();
             f.sync_all()?;
-            Ok(())
+            Ok(hash)
         })();
-        if let Err(e) = result {
-            let _ = std::fs::remove_file(&tmp_path);
-            return Err(e);
-        }
+        let hash = match result {
+            Ok(hash) => hash,
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp_path);
+                return Err(e);
+            }
+        };
         let final_path = self.path_for(pos);
         std::fs::rename(&tmp_path, &final_path)?;
         // I2 (final wave): fsync the artifact's DIRECTORY, so the rename that
@@ -359,7 +415,7 @@ impl SnapshotStore {
         // sets, so two abandoned instants after a complete set at P would
         // delete P — and the ship gate ("the complete set at my floor") would
         // then decline MISSING forever.
-        Ok(final_path)
+        Ok((final_path, hash))
     }
 }
 
@@ -561,7 +617,7 @@ mod tests {
     fn publish_creates_the_pinned_file_name_and_newest_finds_it() {
         let dir = tempfile::tempdir().unwrap();
         let store = SnapshotStore::open(dir.path(), 0).unwrap();
-        let path = store.publish(4096, 1, ok_write(b"hello")).unwrap();
+        let (path, _hash) = store.publish(4096, 1, ok_write(b"hello")).unwrap();
         assert_eq!(path, store.path_for(4096));
         assert!(path.ends_with("snap-4096.ultsnap"));
         // Ruling P6 (plan B2 T2): the file is UC's 24-byte envelope, then the
@@ -762,6 +818,30 @@ mod tests {
             store.newest(99).unwrap(),
             None,
             "nothing qualifies below the oldest"
+        );
+    }
+
+    /// Plan B3 T1: `artifact_hash_of` is SHA-256[..8] LE, pure, and `publish`
+    /// returns the hash of exactly the bytes the `write` closure streamed —
+    /// the envelope is excluded.
+    #[test]
+    fn artifact_hash_is_sha256_of_the_payload_truncated() {
+        use sha2::{Digest, Sha256};
+        let want = u64::from_le_bytes(Sha256::digest(b"payload")[..8].try_into().unwrap());
+        assert_eq!(artifact_hash_of(b"payload"), want);
+        assert_ne!(artifact_hash_of(b"payload"), artifact_hash_of(b"payloae"));
+        let dir = tempfile::tempdir().unwrap();
+        let store = SnapshotStore::open(dir.path(), 0).unwrap();
+        let (_path, h) = store
+            .publish(4096, 1, |w| {
+                w.write_all(b"pay")?;
+                w.write_all(b"load")?;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            h, want,
+            "the hash covers the payload as streamed, envelope excluded"
         );
     }
 

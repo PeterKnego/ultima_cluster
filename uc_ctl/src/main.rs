@@ -1032,7 +1032,8 @@ fn run_status(a: &StatusArgs) -> anyhow::Result<()> {
         println!(
             "  row={id} name={name} version={} hash=0x{:016x} attached={attached} epoch={} \
              incarnation={incarnation} applied={applied} lag={} snapshot_pos={} \
-             heartbeat_age={age} timers_pending={} upgrade_origin={} pinned={} pinned_from={}",
+             heartbeat_age={age} timers_pending={} upgrade_origin={} pinned={} pinned_from={} \
+             artifact_hash=0x{:016x}",
             VersionDisplay(s.status.version()),
             s.identity.hash(),
             s.epoch.load_acquire(),
@@ -1042,6 +1043,7 @@ fn run_status(a: &StatusArgs) -> anyhow::Result<()> {
             origin,
             VersionDisplay(to),
             VersionDisplay(from),
+            s.identity.artifact_hash(),
         );
     }
     println!("members:");

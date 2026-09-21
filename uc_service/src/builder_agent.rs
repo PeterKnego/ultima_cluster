@@ -65,12 +65,22 @@ pub(crate) fn builder_cycle(st: &mut BuilderState) -> bool {
     match st.rx.try_recv() {
         Ok((pos, job)) => {
             match st.store.publish(pos, st.version, job) {
-                Ok(_path) => {
+                Ok((_path, hash)) => {
+                    let row = slot(&st.cnc, st.service_id);
+                    // Plan B3 T1: the hash is stored BEFORE `snapshot_pos` —
+                    // the marker every other reader already treats as "the
+                    // artifact at this position is complete and durable"
+                    // (module doc / snapshots.rs doc). Storing the hash first
+                    // means a reader that `Acquire`-loads `snapshot_pos == P`
+                    // is guaranteed (by this Release-ordered store pair) to
+                    // already see the hash of the artifact AT `P`, never a
+                    // stale hash left over from the previous instant.
+                    row.identity.store_artifact_hash(hash);
                     // The ONLY write site for this marker: after the atomic
                     // rename inside `publish` has already completed, so a torn
                     // build is never observed here (module doc / snapshots.rs
                     // doc).
-                    slot(&st.cnc, st.service_id).snapshot_pos.store_release(pos);
+                    row.snapshot_pos.store_release(pos);
                 }
                 Err(e) => {
                     // Logged + dropped: the marker is not advanced, so the
@@ -152,6 +162,11 @@ mod tests {
 
         assert!(builder_cycle(&mut st), "one job drained");
         assert_eq!(cnc.service_slot(0).snapshot_pos.load_acquire(), 4096);
+        assert_eq!(
+            cnc.service_slot(0).identity.artifact_hash(),
+            crate::snapshots::artifact_hash_of(b"snapshot-bytes"),
+            "plan B3: the builder publishes the payload's hash on line 7"
+        );
         assert!(
             !busy.load(Ordering::Acquire),
             "busy cleared after completion"
@@ -173,6 +188,37 @@ mod tests {
         assert_eq!(
             &raw[crate::snapshots::SNAPSHOT_ENVELOPE_LEN..],
             b"snapshot-bytes"
+        );
+    }
+
+    /// Plan B3 T1: the hash word is stored BEFORE `snapshot_pos`, so a reader
+    /// that `Acquire`-loads `snapshot_pos == P` is guaranteed to already see
+    /// the hash of the artifact at `P` (never a stale hash left over from a
+    /// previous instant). A single-threaded unit test cannot observe a store
+    /// ORDER directly — there is no concurrent reader here to catch an
+    /// interleaving — so this drives the builder and asserts both words hold
+    /// their final values; the order itself is asserted STRUCTURALLY by
+    /// reading `builder_cycle`'s body (`store_artifact_hash` then
+    /// `snapshot_pos.store_release`, see the match arm above).
+    #[test]
+    fn the_hash_and_the_marker_both_land_and_the_hash_is_stored_first_by_code_inspection() {
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, mut st, busy) = state(dir.path());
+        let cnc = Arc::clone(&st.cnc);
+        busy.store(true, Ordering::Release);
+
+        let job: BuildJob = Box::new(|w| {
+            w.write_all(b"snapshot-bytes")?;
+            Ok(())
+        });
+        tx.try_send((4096, job)).unwrap();
+        assert!(builder_cycle(&mut st));
+
+        let slot = cnc.service_slot(0);
+        assert_eq!(slot.snapshot_pos.load_acquire(), 4096);
+        assert_eq!(
+            slot.identity.artifact_hash(),
+            crate::snapshots::artifact_hash_of(b"snapshot-bytes")
         );
     }
 

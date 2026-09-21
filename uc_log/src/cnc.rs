@@ -348,14 +348,16 @@ pub enum PinRead {
 /// otherwise-frozen line: `timers_pending` is node-written, refreshed once
 /// per consensus-agent pass; `freeze_ns` is SERVICE-written, once per
 /// instant (`on_snapshot_frame`) — a second, distinct writer on the same
-/// line, each owning its own word.
+/// line, each owning its own word. `artifact_hash` (plan B3) is the line's
+/// last word — SERVICE-written like `freeze_ns`, by the builder agent, and
+/// stored BEFORE `snapshot_pos` (see its own doc).
 #[repr(C)]
 pub struct ServiceIdentityLine {
     name: [u8; cnc::CNC_SVC_NAME_LEN],
     hash: AtomicU64,
     timers_pending: AtomicU64,
     freeze_ns: AtomicU64,
-    _pad: [u64; 1],
+    artifact_hash: AtomicU64,
 }
 impl ServiceIdentityLine {
     pub fn name(&self) -> Option<FsmName> {
@@ -380,6 +382,21 @@ impl ServiceIdentityLine {
     pub fn store_freeze_ns(&self, v: u64) {
         self.freeze_ns.store(v, Ordering::Release)
     }
+    /// This row's newest artifact's payload hash (plan B3, spec §6.5.2):
+    /// SHA-256 of the payload bytes, first 8 bytes as `u64` LE, envelope
+    /// excluded. `0` before this row has published its first artifact.
+    /// SERVICE-written by the builder agent, which stores this word BEFORE
+    /// `snapshot_pos` — so a reader that `Acquire`-loads `snapshot_pos == P`
+    /// is guaranteed to see the hash of the artifact at `P` (never a stale
+    /// hash from the previous instant), the same store-before-marker
+    /// discipline `publish`'s own doc already relies on for `snapshot_pos`
+    /// itself.
+    pub fn artifact_hash(&self) -> u64 {
+        self.artifact_hash.load(Ordering::Acquire)
+    }
+    pub fn store_artifact_hash(&self, v: u64) {
+        self.artifact_hash.store(v, Ordering::Release)
+    }
 }
 const _: () = assert!(std::mem::size_of::<ServiceIdentityLine>() == 64);
 const _: () = assert!(
@@ -393,6 +410,10 @@ const _: () = assert!(
 const _: () = assert!(
     std::mem::offset_of!(ServiceIdentityLine, freeze_ns)
         == cnc::CNC_SVC_OFF_FREEZE_NS - cnc::CNC_SVC_OFF_NAME
+);
+const _: () = assert!(
+    std::mem::offset_of!(ServiceIdentityLine, artifact_hash)
+        == cnc::CNC_SVC_OFF_ARTIFACT_HASH - cnc::CNC_SVC_OFF_NAME
 );
 
 /// M14a: one per-service slot on page 2 — see `uc_protocol::v2::cnc`'s
@@ -1978,6 +1999,29 @@ mod tests {
             4_200_000,
             "offset pin: freeze_ns lives at slot +496"
         );
+    }
+
+    /// Plan B3 T1: the artifact-hash word — 0 at init, roundtrips, pinned at
+    /// slot `+504`, and independent across slots.
+    #[test]
+    fn artifact_hash_roundtrips_and_offset_pin_and_slots_are_independent() {
+        let page = CncPage::heap(&test_meta());
+        let slot = page.service_slot(2);
+        assert_eq!(slot.identity.artifact_hash(), 0);
+        slot.identity.store_artifact_hash(0xDEAD);
+        assert_eq!(slot.identity.artifact_hash(), 0xDEAD);
+        let raw = page.page();
+        let base = cnc::CNC_OFF_SERVICE_SLOTS
+            + 2 * cnc::CNC_SERVICE_SLOT_STRIDE
+            + cnc::CNC_SVC_OFF_ARTIFACT_HASH;
+        assert_eq!(
+            u64::from_le_bytes(raw[base..base + 8].try_into().unwrap()),
+            0xDEAD,
+            "offset pin: artifact_hash lives at slot +504"
+        );
+        // Independent from a neighbouring slot's own artifact_hash.
+        let other = page.service_slot(3);
+        assert_eq!(other.identity.artifact_hash(), 0);
     }
 
     #[test]

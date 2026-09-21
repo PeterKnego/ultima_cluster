@@ -335,6 +335,7 @@ const _: () = assert!(
 //   +480 identity_hash   u64 FNV-1a 64 of the name             writer: node (init, boot-once)
 //   +488 timers_pending  u64 pending-timer count for this row  writer: node (consensus agent)
 //   +496 freeze_ns       u64 nanos, last freeze() call duration  writer: service (on_snapshot_frame)
+//   +504 artifact_hash   u64 SHA-256[..8] of the row's newest artifact payload  writer: service (builder agent)
 pub const CNC_OFF_SERVICE_SLOTS: usize = 4096;
 pub const CNC_SERVICE_SLOT_STRIDE: usize = 512;
 pub const CNC_MAX_SERVICES: usize = 8;
@@ -398,7 +399,8 @@ pub const CNC_SVC_OFF_PIN_SEQ: usize = 32;
 pub const CNC_SVC_OFF_PINNED_FROM: usize = 40;
 /// cnc 3.1: line 7 — the row's FSM name, NUL-padded to 32 B, then its hash,
 /// then (time-and-timers) its pending-timer count, then (coordinated-
-/// snapshot spec §9) its last freeze duration.
+/// snapshot spec §9) its last freeze duration, then (plan B3) its newest
+/// artifact's payload hash — the line's last free word.
 pub const CNC_SVC_OFF_NAME: usize = 448;
 pub const CNC_SVC_NAME_LEN: usize = 32;
 pub const CNC_SVC_OFF_IDENTITY_HASH: usize = 480;
@@ -415,10 +417,21 @@ pub const CNC_SVC_OFF_TIMERS_PENDING: usize = 488;
 /// `/metrics` reads it once per scrape (never per pass) to derive
 /// `uc2_snapshot_freeze_seconds_max/_sum/_count{row}`.
 pub const CNC_SVC_OFF_FREEZE_NS: usize = 496;
+/// Plan B3 (spec §6.5.2): SHA-256 of this row's newest artifact PAYLOAD
+/// (envelope excluded), first 8 bytes as `u64` LE — the word after
+/// `freeze_ns` on line 7, and the line's last free word (`+512` is the next
+/// slot). SERVICE-written, like `freeze_ns`: the builder agent
+/// (`uc_service::builder_agent::builder_cycle`) stores it BEFORE
+/// `snapshot_pos`, so a node that `Acquire`-loads `snapshot_pos == P` is
+/// guaranteed to see the hash of the artifact published at `P` (never a
+/// stale hash from the previous instant). `uc2ctl status` and `/metrics`
+/// read it as the live determinism check's per-node report.
+pub const CNC_SVC_OFF_ARTIFACT_HASH: usize = 504;
 const _: () = assert!(CNC_SVC_OFF_TIMERS_PENDING == CNC_SVC_OFF_IDENTITY_HASH + 8);
 const _: () = assert!(CNC_SVC_OFF_FREEZE_NS == CNC_SVC_OFF_TIMERS_PENDING + 8);
+const _: () = assert!(CNC_SVC_OFF_ARTIFACT_HASH == CNC_SVC_OFF_FREEZE_NS + 8);
 const _: () = assert!(CNC_SVC_OFF_NAME == CNC_SVC_OFF_RESERVED);
-const _: () = assert!(CNC_SVC_OFF_FREEZE_NS + 8 <= CNC_SERVICE_SLOT_STRIDE);
+const _: () = assert!(CNC_SVC_OFF_ARTIFACT_HASH + 8 <= CNC_SERVICE_SLOT_STRIDE);
 const _: () = assert!(
     CNC_OFF_SERVICE_SLOTS + CNC_MAX_SERVICES * CNC_SERVICE_SLOT_STRIDE <= CNC_PAGE_LEN,
     "service-slot band overruns the cnc page"
@@ -834,6 +847,15 @@ mod tests {
         // rest of the line.
         assert_eq!(CNC_SVC_OFF_FREEZE_NS, 496);
         assert_eq!(CNC_SVC_OFF_FREEZE_NS, CNC_SVC_OFF_TIMERS_PENDING + 8);
+        // plan B3: the row's artifact hash, service-written after freeze/stream.
+        assert_eq!(CNC_SVC_OFF_ARTIFACT_HASH, 504);
+        assert_eq!(CNC_SVC_OFF_ARTIFACT_HASH, CNC_SVC_OFF_FREEZE_NS + 8);
+        const {
+            assert!(
+                CNC_SVC_OFF_ARTIFACT_HASH + 8 <= CNC_SERVICE_SLOT_STRIDE,
+                "line 7 is now full"
+            )
+        };
         const { assert!(CNC_OFF_FSM_LAG_BYTES + 8 <= CNC_OFF_SERVICES_DECLARED + 64) };
         // Page 1 is now FULL: the pair's line ends exactly where page 2 starts.
         assert_eq!(CNC_OFF_SERVICES_DECLARED + 64, 4096);
