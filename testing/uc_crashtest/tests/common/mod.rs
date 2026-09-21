@@ -458,40 +458,24 @@ pub fn wait_for_path(path: &Path, timeout: Duration) {
 ///
 /// Fresh-boot only: on a respawn over a SAME dir use `wait_for_fresh_instance`,
 /// since a stale leftover cnc2.dat can let `connect` validate the OLD page.
+///
+/// Plan B3 T5 — **call this after EVERY node of the cluster has been spawned,
+/// never inside the spawn loop.** A successful attach is still exactly what
+/// this waits for, and since T5 an attach also waits for the node to have
+/// JOINED its cluster: it publishes `services_declared`, the word every
+/// attacher reads as "ready", only then. Node 0 of an n-voter cluster cannot
+/// join until nodes 1..n exist, so a loop that spawns one node and waits here
+/// before spawning the next deadlocks until `boot_wait` expires. Every
+/// multi-node caller in this crate is two passes for that reason: spawn all,
+/// then wait all.
+///
+/// The weaker alternative — returning as soon as the page reads "booting" —
+/// was tried and is WRONG: `node_booting` is the ABSENCE of the declared set,
+/// which is equally true before the rings exist and after, and
+/// `Engine::attach` raises it before it opens a single ring. It would return
+/// inside the very window this helper exists to close.
 pub fn wait_for_ready(instance_dir: &Path, timeout: Duration) {
-    let deadline = Instant::now() + timeout;
-    loop {
-        // No boot wait: this asks whether the node's INSTANCE DIR is
-        // finished, not whether the node has joined its cluster.
-        let cfg = uc_client::PipelinedConfig {
-            boot_wait: Duration::ZERO,
-            serving_gate: false,
-            ..Default::default()
-        };
-        match uc_client::PipelinedClient::connect(instance_dir, APP_ID, cfg) {
-            Ok(c) => {
-                c.shutdown();
-                return;
-            }
-            // Plan B3 T5: "this node has not joined its cluster yet" IS ready
-            // for this check, and treating it as anything else deadlocks every
-            // caller that waits inside its own node-spawn loop — node 0 of an
-            // n-voter cluster cannot join until nodes 1..n exist.
-            //
-            // It is also a sound readiness answer: `Node::start` creates every
-            // ring file before any agent runs, and the declared set is
-            // published later still, by the consensus pass — so a page that
-            // reads "booting" is already a node whose files are all there.
-            Err(ClientError::NodeBooting) => return,
-            Err(e) => {
-                assert!(
-                    Instant::now() < deadline,
-                    "timed out waiting for ready: {e}"
-                );
-                std::thread::sleep(Duration::from_millis(50));
-            }
-        }
-    }
+    drop(connect_with_retry(instance_dir, timeout));
 }
 
 /// Wait until a node respawned on the SAME instance dir has actually

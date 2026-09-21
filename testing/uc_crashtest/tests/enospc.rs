@@ -457,19 +457,23 @@ fn boot_cluster(tmp: &Path, dir0: PathBuf) -> Cluster {
     let node0_cfg_path = write_node_toml(tmp, 0, addrs[0], &dir0, &members);
     let mut node0_child = spawn_daemon(&node0_cfg_path);
     let node0_stderr = capture_stderr(&mut node0_child, "node0");
+    // Plan B3 T5: all three nodes spawn BEFORE any readiness wait. A wait is a
+    // successful attach, and an attach now waits for the node to have joined
+    // its cluster — which node 0 cannot do until nodes 1 and 2 exist. The old
+    // shape (spawn 0, wait 0, spawn 1, wait 1, …) deadlocks until `boot_wait`
+    // expires.
+    let mut survivor_node_procs: Vec<Option<Reap>> = vec![None, None, None];
+    survivor_node_procs[1] = Some(spawn_node_multi(&dirs[1], 1, addrs[1], &members_str));
+    survivor_node_procs[2] = Some(spawn_node_multi(&dirs[2], 2, addrs[2], &members_str));
     wait_for_ready(&dirs[0], Duration::from_secs(15));
+    wait_for_ready(&dirs[1], Duration::from_secs(10));
+    wait_for_ready(&dirs[2], Duration::from_secs(10));
     let node0_old_instance_id = {
         let c = connect_with_retry(&dirs[0], Duration::from_secs(10));
         let id = c.instance_id();
         c.shutdown();
         id
     };
-
-    let mut survivor_node_procs: Vec<Option<Reap>> = vec![None, None, None];
-    survivor_node_procs[1] = Some(spawn_node_multi(&dirs[1], 1, addrs[1], &members_str));
-    wait_for_ready(&dirs[1], Duration::from_secs(10));
-    survivor_node_procs[2] = Some(spawn_node_multi(&dirs[2], 2, addrs[2], &members_str));
-    wait_for_ready(&dirs[2], Duration::from_secs(10));
 
     let svc_procs: Vec<Option<Reap>> = dirs.iter().map(|d| Some(spawn_service(d))).collect();
 
