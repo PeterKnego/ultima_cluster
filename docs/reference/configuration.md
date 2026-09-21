@@ -492,17 +492,23 @@ authenticates cluster-wide when paired with `[crypto].enabled = true`.**
 
 ## Attaching a service or a client: `boot_wait`
 
-Everything above configures the **node**. The two attaching sides have one
-key of their own, added in `2.13.0`:
+Everything above configures the **node**. The attaching sides have one key of
+their own, added in `2.13.0`, carried on three config structs:
 
-**`ServiceConfig::boot_wait: Duration`** (`uc_service`) and
-**`EngineConfig::boot_wait: Duration`** (`uc_client`, read by
-`Client::connect` and `Engine::attach`).
+| Key | Crate | Reached by | How to set it |
+|---|---|---|---|
+| `ServiceConfig::boot_wait: Duration` | `uc_service` | `ServiceBuilder::start` / `start_with_snapshots` | `ServiceConfig::with_boot_wait(..)` |
+| `EngineConfig::boot_wait: Duration` | `uc_client` | `Engine::attach` | plain struct field |
+| `PipelinedConfig::boot_wait: Duration` | `uc_client` | `PipelinedClient::connect` (hands it to `EngineConfig` unchanged) | plain struct field |
 
-**Default: 10 seconds.** `Duration::ZERO` disables the wait entirely and
-restores the pre-`2.13.0` behaviour of failing on the first look. Set it with
-`ServiceConfig::with_boot_wait(..)`; `EngineConfig` is a plain struct, so set
-the field.
+**Default: 10 seconds** on all three. `Duration::ZERO` disables the wait
+entirely and restores the pre-`2.13.0` behaviour of failing on the first
+look.
+
+**`Client::connect` is not configurable here.** It takes no config at all: it
+builds a `PipelinedConfig` internally and puts the 10 s default into it. If
+you need a different wait on the client side, use `PipelinedClient::connect`
+or `Engine::attach` with your own config.
 
 What it waits for. Since `2.13.0` a node does not publish its declared set —
 the word both attach doors read — at `Node::start`. It publishes it from the

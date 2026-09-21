@@ -812,7 +812,7 @@ The two added steps are not optional:
   that it committed rather than being refused at the door. That is still your
   check, on every node, before you stop anything.
 
-  Two operational consequences of the gate, both new in `2.13.0`:
+  Three operational consequences of the gate, all new in `2.13.0`:
 
   - **Attaching now waits.** `ServiceBuilder::start*`, `Client::connect` and
     `Engine::attach` retry `NodeBooting` internally for `boot_wait`

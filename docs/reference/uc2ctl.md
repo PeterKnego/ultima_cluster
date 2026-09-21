@@ -509,8 +509,27 @@ whichever comes first. So:
   `uc2_snapshot_reports_unsent_total` on the quiet node;
 - a row that has snapshotted but shows **no verdict line at all** has had no
   report committed yet: either the instant is younger than this node's
-  artifact, or no node reported (see
+  artifact (the lag above — the usual reason), or no node reported (see
   [Monitor a cluster](../how-to/monitor-a-cluster.md)).
+
+**The verdict you read here is always at least one instant old, by
+construction.** This command reads the newest cluster **artifact**, and that
+artifact was frozen *as of* instant `P`; the `SnapshotReport` for `P` is
+appended at a position strictly **above** `P`, because the leader cannot
+release it until every voter has reported — which happens after the freeze.
+An artifact therefore can never carry its own instant's verdict: `P`'s
+verdict first appears in the artifact written at the *next* instant. Run
+right after commanding one instant, this prints no verdict line for that row,
+or the previous instant's. That is the same artifact-backed lag
+[`schedule show`](#schedule-show) and [`settings show`](#settings-show) carry,
+not a defect, and it is why `position=` on the verdict line is normally an
+EARLIER instant than the one you just took. To see a given instant's verdict
+durably, take a second instant (or wait for the `snapshot_interval_bytes`
+cadence) and read again. **For a prompt reading, use `/metrics` instead**:
+`uc2_snapshot_hash_mismatch{service,row}` is recomputed at scrape time from
+the node's committed cluster **view**, so it reflects an instant as soon as
+its record commits — see
+[Upgrade an application § Verify](../how-to/upgrade-an-application.md).
 
 The cluster FSM's own artifact (`service_id = 255`) is **not** reported —
 `SnapshotReport.row` covers declared rows `0..8` only.

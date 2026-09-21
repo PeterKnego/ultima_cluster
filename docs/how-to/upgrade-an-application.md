@@ -81,24 +81,54 @@ uc2ctl status --instance-dir /srv/uc2/nN --app-id APP | grep 'row='
 # a value acknowledged before the upgrade still reads back
 kv --gateways host0:9200,host1:9200,host2:9200 get --linearizable SOME_PREUPGRADE_KEY
 
-# and all replicas agree: take a coordinated instant, then ask the cluster
+# and all replicas agree: take a coordinated instant, then read the LIVE gauge
 uc2ctl snapshot --instance-dir /srv/uc2/n0 --app-id APP --admin-key .../ops-admin.key
-uc2ctl upgrade show --instance-dir /srv/uc2/nN --app-id APP
-#   row=0 hash_verdict=agreed position=<instant> nodes=3 hash=0x...
+curl -s http://hostN:9600/metrics | grep uc2_snapshot_hash_mismatch
+#   uc2_snapshot_hash_mismatch{service="kv",row="0"} 0      # on EVERY node
 ```
 
-`hash_verdict=agreed`, at the new version, with every pre-upgrade value
-intact, is the upgrade done.
+`0` on every node, at the new version, with every pre-upgrade value intact,
+is the upgrade done.
 
 **Since `2.13.0` you do not hash the files by hand.** Every node hashes its
 row artifact as the builder streams it and reports `(row, position, hash)` to
-the leader; the leader commits one `SnapshotReport` record naming everyone
-who reported, and `uc2ctl upgrade show` renders the verdict every replica
-computes from it. Read it on **any** node — it is committed cluster state, so
-the answer is the same everywhere, unlike a per-file `sha256sum` you have to
-collect and compare yourself.
+the leader; the leader commits one `SnapshotReport` record naming everyone who
+reported, and every replica computes the same verdict from it. So the check is
+committed cluster state rather than a per-file `sha256sum` you collect and
+compare yourself.
 
-Three things to check in that line:
+**There are two readings of that state, and they are not equally prompt.**
+
+- **The live one — use this for the upgrade.**
+  `uc2_snapshot_hash_mismatch{service,row}` on `/metrics` is recomputed **at
+  scrape time** from the node's committed cluster view, so it reflects the
+  instant you just commanded as soon as that instant's `SnapshotReport`
+  commits — seconds, not another instant. `0` = agreed (or no majority to
+  differ from); nonzero = that many replicas off the majority. The
+  `snapshot_hash_diverged` obs record fires on the same event and names the
+  row and the node. `Uc2SnapshotHashDiverged` is the alert behind the gauge.
+- **The durable one — `uc2ctl upgrade show` — lands ONE INSTANT BEHIND.** It
+  reads this node's newest cluster **artifact** on disk, and that artifact was
+  frozen *as of* instant `P`, while the `SnapshotReport` for `P` is appended
+  to the log at a position strictly **above** `P` (the leader waits for every
+  voter's report, which arrives after the freeze). An artifact can therefore
+  never carry its own instant's verdict: `P`'s verdict first appears in the
+  artifact written at the *next* instant. Run right after one instant,
+  `upgrade show` prints no verdict line for that row, or the previous
+  instant's. This is the same artifact-backed lag `schedule show`,
+  `settings show` and `status`'s `schedule_position=` have had since the
+  cluster FSM — see [`uc2ctl` § `upgrade show`](../reference/uc2ctl.md#upgrade-show).
+
+To get the durable record for instant `P`, **take a second instant** (or wait
+for the `snapshot_interval_bytes` cadence if you run one) and then read it:
+
+```bash
+uc2ctl snapshot --instance-dir /srv/uc2/n0 --app-id APP --admin-key .../ops-admin.key
+uc2ctl upgrade show --instance-dir /srv/uc2/nN --app-id APP
+#   row=0 hash_verdict=agreed position=<P> nodes=3 hash=0x...
+```
+
+Two things to check in that line:
 
 - **`hash_verdict=agreed`** — every reporting node's artifact hashed the same.
 - **`nodes=`** should equal your voter count. Short of it means the leader's
@@ -106,13 +136,14 @@ Three things to check in that line:
   the verdict is still sound about the nodes it names, but it is not evidence
   about the one missing. Check `uc2_snapshot_reports_timed_out_total` on the
   leader and `uc2_snapshot_reports_unsent_total` on the quiet node.
-- **`position=`** should be the instant you just commanded, not an older one.
 
-`hash_verdict=DIVERGED` names the minority node ids outright, and
-`uc2_snapshot_hash_mismatch{row="0"}` reads nonzero on every node with the
-`Uc2SnapshotHashDiverged` alert behind it — that is a nondeterminism in the
-new version's `freeze`/`stream_snapshot`, and the next step is
-`uc2-diffreplay determinism` on that row's corpus.
+And do **not** expect `position=` to be the instant you just commanded — by
+the lag above it is the EARLIER one, the instant whose verdict the newest
+artifact was able to carry.
+
+`hash_verdict=DIVERGED` names the minority node ids outright — that is a
+nondeterminism in the new version's `freeze`/`stream_snapshot`, and the next
+step is `uc2-diffreplay determinism` on that row's corpus.
 
 If you still want the file-level check (a node the cluster has not heard
 from, say), note that the two numbers are **not** comparable: `sha256sum`

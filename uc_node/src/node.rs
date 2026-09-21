@@ -6492,13 +6492,17 @@ impl Consensus {
     ///
     /// **Why not a quorum** (ruling R-B3-1). A quorum trigger releases the
     /// record the instant a majority has reported, which structurally omits
-    /// whichever replica is slowest to complete its set — and on a real
-    /// three-node cluster that is the SAME replica every instant (measured:
-    /// one node's set-complete edge lagging the other two by ~24 ms, forever).
-    /// Naming the divergent replica is the whole purpose of the record (spec
-    /// §6.5.2 item 4), so a trigger that can never name the slow one defeats
-    /// the feature. The reason a quorum was chosen — do not stall on a dead
-    /// node — is already served by the timeout.
+    /// whichever replica is slowest to complete its set — and that slowest
+    /// replica is not a fresh draw each time: in `uc_node/tests/
+    /// snapshot_reports.rs`'s fixture (three busy-spin nodes in ONE process
+    /// on a dev box — an observation, NOT a fleet measurement) the same node
+    /// straggles on every instant for the life of the process. Naming the
+    /// divergent replica is the whole purpose of the record (spec §6.5.2
+    /// item 4), so a trigger that can systematically never name the slow one
+    /// defeats the feature. The argument needs only that the ordering is
+    /// persistent, not any particular lag figure. The reason a quorum was
+    /// chosen — do not stall on a dead node — is already served by the
+    /// timeout.
     ///
     /// **The cost.** A permanently dead or slow voter delays that `(row, P)`
     /// record by at most [`SNAP_REPORT_TIMEOUT_NS`] and never blocks it. That

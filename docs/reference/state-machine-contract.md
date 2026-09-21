@@ -281,8 +281,10 @@ joined its cluster yet", **not** "its page is missing or half-written". The
 builder waits it out for you, re-reading every 20 ms, bounded by
 **`ServiceConfig::boot_wait`** (default **10 s**; `Duration::ZERO` disables
 the wait and restores the pre-`2.13.0` fail-on-first-look). The client side
-has the identical key, `EngineConfig::boot_wait`, read by `Client::connect`
-and `Engine::attach`.
+has the identical key on `EngineConfig` (`Engine::attach`) and
+`PipelinedConfig` (`PipelinedClient::connect`); `Client::connect` takes no
+config and waits out the same 10 s default. See
+[Configuration § Attaching a service or a client](configuration.md).
 
 Why: an upgrade pin committed *above* the artifact a restarting node
 recovered from is invisible on that node's page for the few passes it takes

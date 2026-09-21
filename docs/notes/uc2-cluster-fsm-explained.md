@@ -618,11 +618,15 @@ is three seams:
 reported… or on a timeout", and that is the one rule plan B3 changed. The
 whole purpose of the record is to **name the minority** (item 4), and a
 quorum trigger releases it the instant a majority has reported — which
-structurally omits whichever replica is slowest to complete its set. On a
-three-node cluster that is measurably the *same* replica every instant (one
-node's set-complete edge trailing the other two by ~24 ms, persistently), so
-a quorum trigger would have excluded one fixed node from every record it ever
-wrote. Worse, on three nodes a 2-hash record has no majority at all —
+structurally omits whichever replica is slowest to complete its set. And that
+slowest replica is not a fresh draw each time: in the three-node fixture plan
+B3 was developed against — three busy-spin nodes in **one process on a dev
+box**, an observation rather than a fleet measurement — the *same* node
+straggles on every instant for the life of the process. A quorum trigger
+would therefore have excluded one fixed node from every record it ever wrote.
+The argument needs only that the ordering is persistent; no particular lag
+figure is load-bearing, and none is claimed. Worse, on three nodes a 2-hash
+record has no majority at all —
 `verdict` correctly answers `NO_MAJORITY`, the N = 2 case above — so it names
 nobody. The reason a quorum was attractive, *do not stall on a dead node*, is
 already served by the timeout; the cost of the stricter rule is that a

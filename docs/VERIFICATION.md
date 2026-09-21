@@ -445,12 +445,16 @@ voters' reports that released it and not the 5 s fallback, which is the
 assertion that tells the two mechanisms apart at all.
 
 **What this does not verify.** The release rule's *choice* — every voter
-rather than a quorum — rests on a measurement (one replica's set-complete
-edge trailing the others by ~24 ms, persistently, on a three-node cluster)
-recorded in the spec's plan-B3 errata, not on a test: no test pins that the
-slow replica is always the same one, because that is a property of a machine,
-not of the code. The cluster FSM's own artifact (`service_id = 255`) is not
-reported at all and so is not covered here.
+rather than a quorum — rests on an **observation**, not a test and not a
+fleet measurement: in the three-node fixture above (three busy-spin nodes in
+ONE process on a dev box) the same replica completes its set last on every
+instant, for the life of the process. It is recorded in the spec's plan-B3
+errata. No test pins it, and none should: which replica straggles is a
+property of a machine, not of the code, so per CLAUDE.md's benchmarking
+discipline the underlying timing is smoke and no lag figure is claimed here
+— only the persistence of the ordering, which is all the argument needs. The
+cluster FSM's own artifact (`service_id = 255`) is not reported at all and so
+is not covered here either.
 
 **The red twin, and an honest note about what it pins.**
 `counterfactual_kernel_on_the_committed_view_is_caught_by_inv6_the_durable_time_oracle`

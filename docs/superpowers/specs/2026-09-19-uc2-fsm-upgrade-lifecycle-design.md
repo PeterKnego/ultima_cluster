@@ -1216,12 +1216,14 @@ mechanism actually does (8 and 9), and one item is dropped outright (5).
    *Why.* Item 4's purpose is to **name the minority**. A quorum trigger
    releases the record the instant a majority has reported, which
    structurally omits whichever replica is slowest to complete its set — and
-   that is not a random replica: measured on a three-node cluster, one node's
-   set-complete edge trails the other two by ~24 ms on every instant after
-   the first, and it is the same node each time within a process. So a quorum
-   trigger would have excluded one fixed node from every record it ever
-   wrote, and the divergent replica in a live incident could easily be
-   exactly the one the trigger left out. Worse, on three nodes a two-hash
+   that is not a random replica. **Observed** (not a fleet measurement: three
+   busy-spin nodes in ONE process on a dev box, `uc_node/tests/
+   snapshot_reports.rs`'s fixture) the same node straggles on every instant
+   for the life of the process. Only that persistence is load-bearing — the
+   lag figure behind it is a dev-box reading and no decision rests on its
+   value. So a quorum trigger would have excluded one fixed node from every
+   record it ever wrote, and the divergent replica in a live incident could
+   easily be exactly the one the trigger left out. Worse, on three nodes a two-hash
    record has **no majority at all** — `verdict` correctly answers
    `NO_MAJORITY` — so it names nobody, and item 4 produces nothing.
 
