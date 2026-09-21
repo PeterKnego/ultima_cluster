@@ -991,8 +991,12 @@ impl ElectionSm {
     }
 
     /// Plan B3 T5: has this incarnation learned a commit position AT ALL —
-    /// from its own quorum ranking as leader (`"rank"`), a leader's gossip
-    /// (`"gossip"`), or a replay hold released by validation (`"replay"`)?
+    /// from its own quorum ranking as leader (`"rank"`, [`Self::rank_leader`])
+    /// or from a leader's gossip (`"gossip"`, [`Self::advance_gossip_commit`])?
+    /// Those are the only two values [`Self::commit_provenance`] ever
+    /// reports besides the initial `"none"`; a deferred gossip position
+    /// released by validation comes back through the second of them and is
+    /// labelled `"gossip"` like any other.
     ///
     /// A node that has not is still at its boot default of `0`, which is
     /// indistinguishable from "this cluster has committed nothing" — and a

@@ -432,25 +432,31 @@ fn wait_out_node_boot(
     app_id: &str,
     boot_wait: Duration,
 ) -> Result<Arc<CncPage>, ClientError> {
-    if boot_wait.is_zero() || !node_booting(cnc.services_declared(), &cnc.service_names()) {
+    // Every page is `try_meta`-checked before `node_booting` reads it, the
+    // first one included: a torn page (a node rewriting it in place) must not
+    // have its declared set and names read as a decision. The service twin
+    // (`uc_service::attach::wait_out_node_boot`) checks every page too, and
+    // the two implementations of this predicate must not differ.
+    let booting = |p: &CncPage| {
+        p.try_meta().is_none() || node_booting(p.services_declared(), &p.service_names())
+    };
+    if boot_wait.is_zero() || !booting(&cnc) {
         return Ok(cnc);
     }
+    drop(cnc);
     let deadline = Instant::now() + boot_wait;
-    let mut cnc = cnc;
     loop {
         if Instant::now() >= deadline {
             return Err(ClientError::NodeBooting);
         }
         std::thread::sleep(BOOT_POLL);
-        // A page that will not open, or will not decode, is a real refusal
-        // the caller raises properly a moment from now with the same error —
-        // not something to spin on.
-        let Ok(fresh) = CncPage::open_file(&instance_dir.join(CNC_FILE), app_id) else {
-            return Ok(cnc);
-        };
-        cnc = fresh;
-        if cnc.try_meta().is_some() && !node_booting(cnc.services_declared(), &cnc.service_names())
-        {
+        // A page that will not open is a real refusal — a missing instance
+        // dir, the wrong `app_id`, a bad header — and it PROPAGATES. Handing
+        // the stale mapping back instead (as the first cut did) would make
+        // `attach` report `NodeBooting` for a node that is not booting at
+        // all, off a page nothing owns any more.
+        let cnc = CncPage::open_file(&instance_dir.join(CNC_FILE), app_id)?;
+        if !booting(&cnc) {
             return Ok(cnc);
         }
     }
@@ -1335,6 +1341,40 @@ mod tests {
             started.elapsed() >= Duration::from_millis(200),
             "the attach returned before the wait was up: {:?}",
             started.elapsed()
+        );
+    }
+
+    /// Plan B3 T5 fix round 1 (review Minor 4): a page that stops opening
+    /// PART WAY THROUGH the boot wait reports the real error, not
+    /// `NodeBooting`.
+    ///
+    /// The first cut handed the STALE mapping back on a re-open failure, so
+    /// `attach` read "booting" off a page nothing owned any more and reported
+    /// a node that is not booting at all as booting — having already burned a
+    /// `client_id` on it. The service twin
+    /// (`uc_service::attach::wait_out_node_boot`) never had the bug: it
+    /// returns and lets `attach` re-open and raise the genuine error.
+    #[test]
+    fn a_page_that_stops_opening_during_the_wait_reports_the_real_error() {
+        let dir = tempfile::tempdir_in(scratch_base()).unwrap();
+        make_instance_booting(dir.path(), "boot-vanish");
+        let path = dir.path().join(CNC_FILE);
+        let remover = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            std::fs::remove_file(&path).unwrap();
+        });
+        let cfg = EngineConfig {
+            boot_wait: Duration::from_secs(5),
+            ..EngineConfig::default()
+        };
+        let err = Engine::attach(dir.path(), "boot-vanish", cfg)
+            .err()
+            .expect("the page is gone");
+        remover.join().unwrap();
+        assert!(
+            matches!(err, ClientError::Cnc(uc_log::cnc::CncError::Io(_))),
+            "the real refusal must reach the caller, not a stale page's \
+             NodeBooting: {err:?}"
         );
     }
 
