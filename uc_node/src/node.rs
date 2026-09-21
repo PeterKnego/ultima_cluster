@@ -2800,6 +2800,24 @@ impl Node {
         self.cluster_snapshot_pos.load(Ordering::Acquire)
     }
 
+    /// Plan B3 (spec §6.5.2): the newest COMMITTED snapshot report for `row`,
+    /// cloned out of the cluster view — `None` until a leader has placed one
+    /// on the log and this node's `uc2-cluster` agent has applied it.
+    ///
+    /// The record names what each reporting node's artifact for ONE
+    /// coordinated instant hashed to;
+    /// [`uc_protocol::v2::upgrade::verdict`] is the reading of it (agreed?
+    /// which hash is the majority's? who is the minority?). Every node holds
+    /// the same record, because it is committed cluster state — so this is a
+    /// cluster-wide answer read locally, not a leader-only one.
+    pub fn snapshot_report(&self, row: u8) -> Option<uc_protocol::v2::upgrade::SnapshotReport> {
+        self.cluster_view()
+            .snapshot_inner()
+            .reports
+            .into_iter()
+            .find(|r| r.row == row)
+    }
+
     /// Partition handles for every one of the node's outbound sockets (receiver,
     /// sender, consensus). Blocking all of them isolates the node in both
     /// directions — the harness (Task 9) scripts partitions through these.
