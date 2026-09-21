@@ -503,9 +503,59 @@ fn v2_after_swap(purge: uc_node::PurgePolicy, pinned: bool, app_id: &str) -> Opt
 /// fail-stop panic unwinds a BACKGROUND thread, so it never fails the test
 /// thread directly and has to be recorded by a scoped panic hook
 /// (`uc_service/tests/reconstruction.rs`'s two fail-stop tests, verbatim).
-/// `set_hook`/`take_hook` are process-global, so the hook is installed for as
-/// short a window as the experiment allows and always restored.
 static PANIC_LOG: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// `PANIC_LOG` and `set_hook`/`take_hook` are process-global. Held for the
+/// whole hook-owning section so a sibling test cannot interleave with the
+/// swapped hook, and poison-tolerant for
+/// `uc_service/tests/reconstruction.rs`'s reason: a genuine regression that
+/// panics while this lock is held would otherwise make whichever test runs
+/// next fail on an unrelated poison error instead of its own assertion.
+static PANIC_HOOK_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Own the panic hook for as long as this value lives, and restore the
+/// previous one however the scope ends — including an unwind THROUGH it. A
+/// bare `take_hook` / `set_hook(prev)` pair leaks the capture hook onto every
+/// later test in this binary the moment anything between them panics, which
+/// is exactly when the messages are wanted on stderr.
+/// What `std::panic::take_hook` hands back.
+type Hook = Box<dyn Fn(&std::panic::PanicHookInfo<'_>) + Sync + Send + 'static>;
+
+struct HookGuard {
+    prev: Option<Hook>,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+impl HookGuard {
+    fn capture() -> HookGuard {
+        let _lock = PANIC_HOOK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        PANIC_LOG.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|info| {
+            PANIC_LOG
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(info.to_string());
+        }));
+        HookGuard {
+            prev: Some(prev),
+            _lock,
+        }
+    }
+
+    /// Everything the hook captured so far.
+    fn captured() -> Vec<String> {
+        PANIC_LOG.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+}
+
+impl Drop for HookGuard {
+    fn drop(&mut self) {
+        if let Some(prev) = self.prev.take() {
+            std::panic::set_hook(prev);
+        }
+    }
+}
 
 /// Spec §2.3 through UC's own attach path, UNPINNED — the two things an
 /// unpinned swap can do with a purge floor, and neither is v1's history.
@@ -529,26 +579,23 @@ static PANIC_LOG: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new
 fn real_attach_genesis_replay_computes_the_counterfactual_and_install_does_not() {
     let genesis = v2_after_swap(uc_node::PurgePolicy::Disabled, false, "ra1");
 
-    // Own the panic hook for the purge-on arm only, and restore it before any
-    // assertion of ours can fire.
-    PANIC_LOG.lock().unwrap().clear();
-    let prev = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|info| {
-        PANIC_LOG.lock().unwrap().push(info.to_string());
-    }));
-    let purged = swap_to_v2(
-        uc_node::PurgePolicy::BelowSnapshot { slack_bytes: 0 },
-        false,
-        "ra2",
-    );
+    // Own the panic hook for the purge-on arm only. The guard restores the
+    // previous hook when this scope ends, an unwind from inside the arm
+    // included, and holds `PANIC_HOOK_LOCK` for as long as it lives.
+    let (purged, seen) = {
+        let _hook = HookGuard::capture();
+        let purged = swap_to_v2(
+            uc_node::PurgePolicy::BelowSnapshot { slack_bytes: 0 },
+            false,
+            "ra2",
+        );
+        (purged, HookGuard::captured())
+    };
     let refusal =
         format!("artifact was built by version {V1:#010x} but {V2:#010x} is required here");
-    let fired = PANIC_LOG
-        .lock()
-        .unwrap()
+    let fired = seen
         .iter()
         .any(|m| m.contains("MistaggedSnapshot") && m.contains(&refusal));
-    std::panic::set_hook(prev);
 
     // The §2.3 evidence note says this demonstration is missing; print it so
     // a `--nocapture` run IS the record.
@@ -566,8 +613,7 @@ fn real_attach_genesis_replay_computes_the_counterfactual_and_install_does_not()
     assert!(
         fired,
         "the apply agent must fail-stop by name (MistaggedSnapshot/VersionMismatch \
-         {V1:#010x} vs {V2:#010x}); panics seen: {:?}",
-        PANIC_LOG.lock().unwrap()
+         {V1:#010x} vs {V2:#010x}); panics seen: {seen:?}"
     );
 }
 
