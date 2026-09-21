@@ -436,6 +436,35 @@ reviewer wants a workload to attack.
   `docs/releases.md`, which plan D owns. Recorded here 2026-09-21 because the
   SDD ledger and the task report that carry it today are working artifacts
   that get archived.
+- **`pin-verify` against a real cluster, and against a learner.**
+  `uc2-diffreplay pin-verify` (plan C) proves S4's refusal and the pinned
+  install's artifact path on **one** node — a single voter in a scratch
+  instance dir — so it says nothing about the step the upgrade how-to leans
+  on hardest: "confirm the pin is visible on EVERY node before you stop
+  anything". A multi-node rig would let the mode judge a pin that has
+  committed on some nodes and not others, and a learner arm would cover the
+  row shape that declares but never serves. Recorded 2026-09-21 as erratum 3
+  of the FSM upgrade lifecycle spec's "Errata (plan C, as built)" and in
+  `docs/VERIFICATION.md` § "What `pin_verify.rs` does NOT verify".
+- **A spurious `service_detached` record right after every attach.**
+  `uc_node::node`'s `note_service_transitions` (~`uc_node/src/node.rs:4738`)
+  decides whether a row is `live` from its `heartbeat_ns` word, and the
+  sample after an attach can still read `0` there — so `live` is false, the
+  `service_was_live` latch set at the attach edge clears, and that sample
+  emits a `service_detached` record about a service that never detached,
+  microseconds after its `service_attached`. Harmless to the node, but it
+  makes the obs stream lie about the one transition an operator watches
+  during an upgrade window.
+  Found by plan C T2 (the `pin-verify` rig watches exactly these
+  transitions); ticket-worthy. Recorded 2026-09-21.
+- **`uc_diffreplay` has never compiled with `--no-default-features
+  --all-targets`.** Its test targets call `Corpus::export`, which is gated
+  behind the `export` feature, without a `required-features` line — so
+  `cargo clippy -p uc_diffreplay --no-default-features --all-targets` fails
+  to build the tests, and only the `--lib --bins` form of that run is in the
+  proof stack. Pre-existing (it predates the `pin-verify` feature split),
+  and the fix is one `required-features` key per affected test target plus
+  the wider clippy run added to CI. Found by plan C T2, recorded 2026-09-21.
 
 ## Accepted residuals — listed so they are not re-proposed
 

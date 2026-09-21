@@ -20,6 +20,22 @@ looks safe and can silently lose an acknowledged write.
   (seconds — the length of your stop/start, not an election).
 - Admin access to every node (`uc2ctl`, the admin key).
 
+**Rehearse the swap off the production cluster first.** `uc2-diffreplay
+pin-verify` takes a corpus captured from this cluster and your two real
+service binaries, and on a throwaway single-voter node it places a real
+`uc2ctl upgrade pin` and checks the two things a pinned swap has to do: the
+old binary is **refused by name** after the pin, and the new one's live state
+is the one the artifact path computes rather than the genesis counterfactual.
+The sequence covers both state-machine shapes without needing to know which
+yours is — it stops the old binary above the pin's origin, so an in-memory
+state machine attaches empty while a durable one attaches above the origin
+and has to be rewound to it. This is a pre-flag-day check of the **pin
+mechanism on your binaries**, and it is not the same thing as [step
+4](#4-verify)'s `/metrics` check, which reads the real cluster after the real
+upgrade. See
+[Diff replay an FSM change § "Verify the pin
+live"](diff-replay.md#5-verify-the-pin-live-reconstruction-mode-part-2).
+
 ## 1. Back up every node first — the rollback point does not survive the upgrade
 
 Take a coordinated snapshot and copy it **off the node**, on every host, before
