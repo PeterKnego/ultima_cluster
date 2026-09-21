@@ -23,11 +23,18 @@
 //! - [`attribute`] — profile × declaration → each divergence named to an arm, or unexplained.
 //! - [`confirm`] — attributed profile × declaration → verdicts.
 //! - [`report`] — the attributed diff report, JSON and text.
+//!
+//! Behind the `pin-verify` feature, [`live`] adds the black-box rig the
+//! `pin-verify` mode drives: a real node, the app's own binary as a child
+//! process, a real `uc2ctl upgrade pin`, and a corpus's commands re-submitted
+//! through the raw client engine.
 
 pub mod attribute;
 pub mod confirm;
 pub mod corpus;
 pub mod diff;
 pub mod drive;
+#[cfg(feature = "pin-verify")]
+pub mod live;
 pub mod report;
 pub mod trace;

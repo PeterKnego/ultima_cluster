@@ -16,19 +16,27 @@ name = "uc2-diffreplay"
 path = "src/bin/uc2-diffreplay.rs"
 
 [features]
-default = ["export"]
+default = ["export", "pin-verify"]
 # `corpus export` is the ONLY thing here that needs a node: it shells
 # `uc_node::backup`'s ordered copy. An app that merely embeds the replay
 # driver (`examples/kv`) takes `default-features = false` and links no node
 # — otherwise every service binary in the tree drags the whole consensus
 # crate in behind a verb it never calls.
 export = ["dep:uc_node"]
+# `pin-verify` runs a real node, a real client engine and reads the cnc
+# page: everything an app that only embeds the replay driver must NOT link
+# (`examples/kv` takes `default-features = false`).
+pin-verify = ["dep:uc_node", "dep:uc_net", "dep:uc_log", "dep:uc_client", "dep:libc"]
 
 [dependencies]
 uc_service = { path = "../uc_service", version = "2.12.0" }
 uc_protocol = { path = "../uc_protocol", version = "2.12.0" }
 uc_journal = { workspace = true }
 uc_node = { path = "../uc_node", version = "2.12.0", optional = true }
+uc_net = { path = "../uc_net", version = "2.12.0", optional = true }
+uc_log = { path = "../uc_log", version = "2.12.0", optional = true }
+uc_client = { path = "../uc_client", version = "2.12.0", optional = true }
+libc = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = "1"
 toml = { workspace = true }
