@@ -500,11 +500,11 @@ mod sequence {
             let _ = old.stop(a.timeout);
             drop(node);
             bail!(
-                "row {} already runs version {:#010x}, which --to also names; pin-verify needs a \
+                "row {} already runs version {}, which --to also names; pin-verify needs a \
                  version change (a same-version pin cannot hold the refusal arm: the \"stale\" \
                  binary IS the pinned version)",
                 a.row,
-                r.from
+                VersionDisplay(r.from)
             );
         }
         live::replay_span(&frames, &dir, &a.app_id, a.row, 0..split, a.timeout)?;
@@ -580,13 +580,6 @@ mod sequence {
         }
 
         // ---- S4 step 5: the refusal arm — the stale binary must not rejoin ----
-        if r.from == a.to {
-            r.notes.push(format!(
-                "OLD already runs the pinned version ({}), so the refusal arm cannot refuse it — \
-                 a pin that names the running version closes no door",
-                VersionDisplay(a.to)
-            ));
-        }
         let before = live::incarnation(&cnc, a.row);
         let mut stale = live::spawn_app(
             &a.old,
