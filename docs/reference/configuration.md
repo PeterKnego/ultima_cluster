@@ -560,7 +560,7 @@ Two operational consequences:
   node's durability path (its disk, its archive agent), not the timeout. The
   node names which clause is holding it in one `services_declared_withheld`
   warning; see
-  [Monitor a cluster](../how-to/monitor-a-cluster.md#events-worth-alerting-on).
+  [Monitor a cluster](../how-to/monitor-a-cluster.md#structured-records).
 
 ## Cluster limits
 
