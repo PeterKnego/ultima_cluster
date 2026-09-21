@@ -870,7 +870,7 @@ fn push_service_families(out: &mut String, s: &ObsSources, commit: u64, now: u64
     push_counter(
         out,
         "uc2_snapshot_reports_sent_total",
-        "Live SNAP_REPORT datagrams this node sent the leader on a set-complete edge — one per declared row that had published an artifact at the instant (FSM upgrade lifecycle spec §6.5.2). A LEADER hands its own rows' hashes straight to its collector without a datagram, so it exports 0 here; on a follower this climbs by the declared-row count once per completed instant.",
+        "Live SNAP_REPORT datagrams this node handed the transport for the leader on a set-complete edge — one per declared row that had published an artifact at the instant (FSM upgrade lifecycle spec §6.5.2). A LEADER hands its own rows' hashes straight to its collector without a datagram, so it exports 0 here; on a follower this climbs by the declared-row count once per completed instant. It counts the hand-off, not the delivery: with crypto on, a control datagram with no established session to the leader is dropped inside the send and still counted.",
         s.snapshot_reports_sent.load(Ordering::Relaxed),
     );
     push_counter(

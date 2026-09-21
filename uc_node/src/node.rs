@@ -3316,14 +3316,18 @@ struct Consensus {
     /// Plan 2: `uc2_schedule_apply_refused_total` — every refused apply,
     /// whatever the reason. Shared with `Node::observability`.
     schedule_refused: Arc<AtomicU64>,
-    /// Plan B3 (spec §6.5.2): `SNAP_REPORT` datagrams this node has put on
-    /// the wire to the leader (`uc2_snapshot_reports_sent_total`), and ones
-    /// it had to drop because it knew of no leader to address
+    /// Plan B3 (spec §6.5.2): `SNAP_REPORT` datagrams this node handed the
+    /// transport for the leader (`uc2_snapshot_reports_sent_total`), and
+    /// ones it had to drop because it knew of no leader to address
     /// (`uc2_snapshot_reports_unsent_total`). Both are WIRE counters: a
     /// LEADER hands its own rows' hashes straight to its collector and moves
     /// neither, so a healthy leader exports two zeros while a healthy
-    /// follower's `sent` climbs one per declared row per instant. Shared with
-    /// `Node::observability` exactly as `schedule_refused` is.
+    /// follower's `sent` climbs one per declared row per instant. `sent`
+    /// counts the hand-off, not the delivery — with `[crypto]` on, a
+    /// datagram `send` cannot seal (no session with that peer yet) is
+    /// dropped inside `send` and still counted here, the same as every other
+    /// control-plane kind. Shared with `Node::observability` exactly as
+    /// `schedule_refused` is.
     snapshot_reports_sent: Arc<AtomicU64>,
     snapshot_reports_unsent: Arc<AtomicU64>,
     /// Plan B3 T3, **a stub Task 4 replaces**: the leader-side collector is
