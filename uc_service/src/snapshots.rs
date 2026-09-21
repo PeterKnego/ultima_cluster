@@ -91,10 +91,18 @@ pub enum EnvelopeError {
     )]
     Short(usize),
     /// The first 8 bytes are not [`SNAPSHOT_ENVELOPE_MAGIC`] (and not
-    /// [`SNAPSHOT_ENVELOPE_MAGIC_V1`] either — that is [`Self::Legacy`]), or
-    /// the reserved tail is non-zero.
+    /// [`SNAPSHOT_ENVELOPE_MAGIC_V1`] either — that is [`Self::Legacy`]).
     #[error("not a UC snapshot artifact: magic {0:02x?}, expected {SNAPSHOT_ENVELOPE_MAGIC:?}")]
     BadMagic([u8; 8]),
+    /// A well-formed `ULTSNAP2` magic whose 4 reserved bytes are not zero.
+    /// Its own variant rather than a [`Self::BadMagic`]: reporting "magic
+    /// ULTSNAP2, expected ULTSNAP2" told the operator nothing. A future
+    /// envelope field would land in exactly these bytes, so this is also what
+    /// a 2.13.0 binary says about an artifact written by a later one.
+    #[error(
+        "UC snapshot artifact with a non-zero reserved word ({0:#010x}): written by a newer UC"
+    )]
+    Reserved(u32),
     /// A 2.11.0/2.12.0 (`ULTSNAP1`) artifact: it carries no version, so no
     /// install path can cross-check it. Refused, REGARDLESS of how many bytes
     /// follow the magic — a truncated `ULTSNAP1` header is still named as
@@ -145,8 +153,12 @@ pub fn decode_snapshot_envelope(bytes: &[u8]) -> Result<Envelope, EnvelopeError>
     if &magic == SNAPSHOT_ENVELOPE_MAGIC_V1 {
         return Err(EnvelopeError::Legacy);
     }
-    if &magic != SNAPSHOT_ENVELOPE_MAGIC || head[20..24] != [0, 0, 0, 0] {
+    if &magic != SNAPSHOT_ENVELOPE_MAGIC {
         return Err(EnvelopeError::BadMagic(magic));
+    }
+    let reserved = u32::from_le_bytes(head[20..24].try_into().expect("4 bytes"));
+    if reserved != 0 {
+        return Err(EnvelopeError::Reserved(reserved));
     }
     Ok(Envelope {
         position: u64::from_le_bytes(head[8..16].try_into().expect("8 bytes")),
@@ -466,15 +478,23 @@ mod tests {
             decode_snapshot_envelope(&bad_magic),
             Err(EnvelopeError::BadMagic(_))
         ));
+        // A non-zero reserved word is its OWN refusal: `BadMagic` here read
+        // "magic ULTSNAP2, expected ULTSNAP2", which names nothing.
         let mut reserved = Vec::new();
         write_snapshot_envelope(&mut reserved, 1, 1).unwrap();
         reserved[20] = 1;
-        assert!(
-            matches!(
-                decode_snapshot_envelope(&reserved),
-                Err(EnvelopeError::BadMagic(_))
-            ),
+        reserved[23] = 0x80;
+        assert_eq!(
+            decode_snapshot_envelope(&reserved),
+            Err(EnvelopeError::Reserved(0x8000_0001)),
             "non-zero reserved is not a v2 envelope"
+        );
+        assert!(
+            EnvelopeError::Reserved(0x8000_0001)
+                .to_string()
+                .contains("reserved"),
+            "the message names what is wrong: {}",
+            EnvelopeError::Reserved(0x8000_0001)
         );
     }
 
