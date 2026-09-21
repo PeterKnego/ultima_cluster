@@ -115,8 +115,15 @@ pub enum EnvelopeError {
     /// requires here: an UNPINNED install by a newer binary (the §2.3
     /// counterfactual, now refused), or a pinned install whose artifact is
     /// not the one the pin's `from` built. Checked only when the caller
-    /// passes `Some` for `expected_version` (Task 2 callers pass `None`; the
-    /// cross-check is Tasks 3/4).
+    /// passes `Some` for `expected_version` — the reconstruction gap guard's
+    /// unpinned install (`uc_service::replay`, checks `S::VERSION`; plan B2
+    /// T3) and, from plan B2 T4, the pinned install at `attach` (checks the
+    /// pin's `from` instead). `uc_diffreplay`'s driver passes `None` by
+    /// design (`uc_diffreplay::drive::install_from`): its whole point is to
+    /// install an artifact across a version boundary and compare what each
+    /// build's `apply` does with it, so it reports the envelope's version
+    /// rather than asserting it, and cannot ask this check to enforce
+    /// sameness.
     #[error("artifact was built by version {built:#010x} but {expected:#010x} is required here")]
     VersionMismatch { built: u32, expected: u32 },
 }

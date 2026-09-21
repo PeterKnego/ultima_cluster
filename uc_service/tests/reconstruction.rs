@@ -868,8 +868,15 @@ fn gap_without_snapshot_capability_fails_stop_with_named_contract() {
     let (node, _prod) = purged_node_after_snapshotting_service(dir.path(), app, 4_000);
 
     // Own the panic hook exclusively for the rest of this test — see
-    // `PANIC_HOOK_LOCK`'s doc.
-    let _hook_guard = PANIC_HOOK_LOCK.lock().unwrap();
+    // `PANIC_HOOK_LOCK`'s doc. Poison-tolerant: a genuine regression that
+    // fails a SIBLING fail-stop test's own `assert!` panics while holding
+    // this same lock (see below — we drop it before ours too), which would
+    // poison it; the hook is unconditionally restored before either test's
+    // assert regardless of poisoning, so treating a poisoned lock as a plain
+    // one is sound here, and it keeps a real failure surfacing as ITS OWN
+    // assertion message rather than a misleading poison error on whichever
+    // test happens to run second.
+    let _hook_guard = PANIC_HOOK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // Record any panic message globally for the duration of this test. Success
     // paths never panic, so cross-talk from sibling tests is a non-issue; we only
     // assert on the SnapshotRequired substring.
@@ -907,6 +914,11 @@ fn gap_without_snapshot_capability_fails_stop_with_named_contract() {
         std::thread::sleep(Duration::from_millis(5));
     };
     std::panic::set_hook(prev);
+    // Release the hook lock BEFORE our own `assert!`: if it fails, this test
+    // panics with the lock already dropped, so a sibling fail-stop test's
+    // next `.lock()` sees a clean (not poisoned) mutex and fails, if it does,
+    // on its OWN assertion rather than an unrelated poison error.
+    drop(_hook_guard);
     assert!(
         fired,
         "the apply agent must fail-stop with SnapshotRequired within the deadline"
@@ -935,9 +947,9 @@ fn an_unpinned_newer_binary_cannot_install_an_older_versions_artifact() {
     let (node, _prod) = purged_node_after_snapshotting_service(dir.path(), app, 4_000);
 
     // Own the panic hook exclusively for the rest of this test — see
-    // `PANIC_HOOK_LOCK`'s doc. Same capture pattern otherwise as
-    // `gap_without_snapshot_capability_fails_stop_with_named_contract`.
-    let _hook_guard = PANIC_HOOK_LOCK.lock().unwrap();
+    // `PANIC_HOOK_LOCK`'s doc (poison-tolerant, same reasoning as
+    // `gap_without_snapshot_capability_fails_stop_with_named_contract`).
+    let _hook_guard = PANIC_HOOK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     PANIC_LOG.lock().unwrap().clear();
     let prev = std::panic::take_hook();
     std::panic::set_hook(Box::new(|info| {
@@ -977,6 +989,9 @@ fn an_unpinned_newer_binary_cannot_install_an_older_versions_artifact() {
         std::thread::sleep(Duration::from_millis(5));
     };
     std::panic::set_hook(prev);
+    // Release the hook lock BEFORE our own `assert!` — see the sibling
+    // test's matching comment.
+    drop(_hook_guard);
     assert!(
         fired,
         "the apply agent must fail-stop with MistaggedSnapshot/VersionMismatch \
