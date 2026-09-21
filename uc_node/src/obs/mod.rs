@@ -91,7 +91,9 @@ pub struct ObsSources {
     /// Cluster FSM (spec §9): the cluster FSM's published view — the SAME
     /// allocation the `uc2-cluster` agent publishes into. Two gauges are read
     /// straight off its atomics AT SCRAPE TIME (`uc2_cluster_fsm_position`
-    /// from `position`, `uc2_settings_position` from `settings_position`),
+    /// from `consumed`, the agent's walk cursor — NOT `position`, which is
+    /// the published view's tag and moves only when a `CLUSTER` command
+    /// applies; `uc2_settings_position` from `settings_position`),
     /// one `Acquire` load each and no lock: deliberately NOT published into
     /// the consensus pass the way `schedule_table_position` is, because that
     /// pass is a measured hot path and a scrape is not.

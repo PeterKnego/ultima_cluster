@@ -6401,7 +6401,13 @@ impl Consensus {
     ///   node the cluster is adopting, and if that add is truncated the append
     ///   filter drops it again. An uncommitted REMOVE thins that instant's
     ///   evidence by one — also harmless, and the honest reading: we stop
-    ///   counting a node the cluster has decided to drop.
+    ///   counting a node the cluster has decided to drop. The one visible
+    ///   cost is on the release side: an uncommitted promote or add makes the
+    ///   still-catching-up node a REQUIRED voter (the release rule reads the
+    ///   same kernel config), so every instant in that window waits out the
+    ///   full `SNAP_REPORT_TIMEOUT_NS` and bumps
+    ///   `uc2_snapshot_reports_timed_out_total` until the node reports or the
+    ///   configuration commits and settles.
     /// * **Newer than the record.** A report at or below the row's COMMITTED
     ///   report position says nothing the log does not already hold, and
     ///   appending it again would churn the log for nothing. This is strictly
@@ -13281,7 +13287,7 @@ mod tests {
         h.cons.on_snap_report(0, 0, p, 0xD4);
         assert!(
             !h.cons.maybe_append_snapshot_reports(),
-            "two voters plus a learner is not every VOTER — the learner cannot stand              in for voter 2"
+            "two voters plus a learner is not every VOTER — the learner cannot stand in for voter 2"
         );
         h.cons.on_snap_report(2, 0, p, 0xD4);
         assert!(h.cons.maybe_append_snapshot_reports());

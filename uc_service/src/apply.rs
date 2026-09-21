@@ -747,11 +747,21 @@ pub(crate) fn apply_cycle<S: RawStateMachine>(st: &mut ApplyState<S>) -> bool {
             // `next_batch` keeps saying `Overrun`.
             //
             // Hand the cycle back instead, exactly as the `AwaitArtifact` arm
-            // does, and let the agent idle and retry: the next pass re-reads
-            // the journal, and once the node's purge removes the stale prefix
-            // the gap guard fires and the row converges through the ordinary
-            // install path. Reported once per episode, so a row that stays
-            // stuck says so instead of sitting silent.
+            // does, and let the agent idle and retry. What this guard
+            // GUARANTEES is only that: the loop yields, the agent stays
+            // stoppable, and the row reports rather than spins. It does NOT
+            // guarantee convergence. If the node's retained prefix does later
+            // stop covering this cursor — a purge below it, which needs
+            // `PurgePolicy::BelowSnapshot` and is therefore NOT the default
+            // (`PurgePolicy::Disabled`) — the gap guard fires on a subsequent
+            // pass and the row converges through the ordinary install path.
+            // Under the default policy nothing moves the prefix, so a row
+            // that lands here can idle indefinitely; the operator sees the
+            // line below and the row's `applied` standing still. Counting the
+            // episodes is backlog.
+            //
+            // Reported once per episode, so a row that stays stuck says so
+            // instead of sitting silent.
             if cursor <= cursor_before {
                 if st.replay_stalled != Some(cursor) {
                     st.replay_stalled = Some(cursor);

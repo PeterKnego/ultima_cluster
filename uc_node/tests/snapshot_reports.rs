@@ -38,7 +38,7 @@
 
 use std::net::{SocketAddr, UdpSocket};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use uc_consensus::election::NodeId;
@@ -60,6 +60,32 @@ static TEST_LOCK: Mutex<()> = Mutex::new(());
 /// process-global obs sink, which no sibling test may be running under.
 fn serialize() -> MutexGuard<'static, ()> {
     TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The process-global obs sink, held for a scope. `capture_for_tests` swaps
+/// the sink and `stderr_for_tests` swaps it back; doing the swap-back by hand
+/// at the end of a test means a panicking assertion — the case the capture
+/// exists to diagnose — leaves the whole process writing into a buffer no one
+/// reads, so every later test in this binary loses its records. A drop guard
+/// restores it on the panic path too.
+struct ObsCapture(Arc<Mutex<Vec<u8>>>);
+
+impl ObsCapture {
+    fn take() -> Self {
+        Self(uc_node::obs::log::capture_for_tests())
+    }
+
+    /// The capture so far, as text. Takes the lock briefly and copies, so an
+    /// assertion built from it cannot hold the sink's lock while it panics.
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().unwrap_or_else(|e| e.into_inner())).into_owned()
+    }
+}
+
+impl Drop for ObsCapture {
+    fn drop(&mut self) {
+        uc_node::obs::log::stderr_for_tests();
+    }
 }
 
 /// `uc2ctl snapshot`, in process (coordinated-snapshot spec §5.5): command a
@@ -558,7 +584,7 @@ fn three_voters_agree() {
 #[test]
 fn one_divergent_node_is_named() {
     let _g = serialize();
-    let buf = uc_node::obs::log::capture_for_tests();
+    let _sink = ObsCapture::take();
     let c = spawn_cluster(3, 0, uc_node::ServicesConfig::single("sum"));
     let honest: Vec<uc_service::Service<SumSm>> = c.nodes[..2]
         .iter()
@@ -611,14 +637,23 @@ fn one_divergent_node_is_named() {
     // The obs record. Every node in this process applies the same frame and
     // emits its own copy into the shared capture, so this asserts on CONTENT —
     // row 0, node 2 — and not on how many copies landed.
-    let text = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+    let text = _sink.text();
     assert!(
         text.lines().any(|l| {
             l.contains(r#""event":"snapshot_hash_diverged""#)
                 && l.contains(r#""row":0"#)
                 && l.contains(r#""node":2"#)
         }),
-        "no snapshot_hash_diverged record named row 0 / node 2:\n{text}"
+        "no snapshot_hash_diverged record named row 0 / node 2; \
+         the {} snapshot_hash_diverged record(s) in the capture were:\n{}",
+        text.lines()
+            .filter(|l| l.contains(r#""event":"snapshot_hash_diverged""#))
+            .count(),
+        text.lines()
+            .filter(|l| l.contains(r#""event":"snapshot_hash_diverged""#))
+            .take(8)
+            .collect::<Vec<&str>>()
+            .join("\n")
     );
 
     for s in honest {
@@ -626,7 +661,6 @@ fn one_divergent_node_is_named() {
     }
     rogue.stop();
     stop(c);
-    uc_node::obs::log::stderr_for_tests();
 }
 
 // ---------------------------------------------------------------------------
@@ -659,8 +693,11 @@ fn a_learner_reports_but_does_not_count_toward_quorum() {
     let leader = settle(&c, &cncs, 400);
     assert!(leader < 2, "the leader must be a voter, got {leader}");
 
-    let commanded = Instant::now();
+    // The stopwatch starts once the instant is ON the log: `command_instant`
+    // polls through the `retry` window a fresh leader answers, and that wait
+    // is the harness settling, not the collector pacing itself.
     let p = command_instant(c.nodes[leader].n());
+    let commanded = Instant::now();
     let report = await_report_everywhere(&c, p, 60);
     let elapsed = commanded.elapsed();
 

@@ -848,8 +848,8 @@ fn push_service_families(out: &mut String, s: &ObsSources, commit: u64, now: u64
     push_gauge(
         out,
         "uc2_cluster_fsm_position",
-        "Frame-END position this node's cluster FSM has CONSUMED the log up to (its `applied`, cluster-FSM spec §4.3) — the position tag on the view it publishes and on the artifact it writes. It advances with the agent's walk, not only on CLUSTER commands, so it is a per-node liveness reading (compare it against uc2_commit_bytes on the SAME node: a stalled uc2-cluster agent is one whose position sits still while commit moves) and NOT a cluster-wide constant — Uc2ScheduleTableDiverged keys on uc2_schedule_table_position for exactly that reason.",
-        s.cluster_view.position.load(Ordering::Acquire),
+        "Frame-END position this node's cluster FSM has CONSUMED the log up to (its `applied`, cluster-FSM spec §4.3) — the uc2-cluster agent's WALK cursor, read from the view's `consumed` word. It advances every duty cycle, not only on CLUSTER commands, so it is a per-node liveness reading (compare it against uc2_commit_bytes on the SAME node: a stalled uc2-cluster agent is one whose position sits still while commit moves) and NOT a cluster-wide constant — Uc2ScheduleTableDiverged keys on uc2_schedule_table_position for exactly that reason. The view's own `position` tag is a different word (it moves only when a CLUSTER command applies) and is NOT what this gauge reads.",
+        s.cluster_view.consumed.load(Ordering::Acquire),
     );
     push_gauge(
         out,
@@ -1690,10 +1690,17 @@ mod tests {
 
     /// Cluster FSM (spec §9): the cluster row's own two gauges, and the
     /// FIFTH `uc2_agent_alive` sample. `uc2_cluster_fsm_position` is the
-    /// view's position word (the FSM's `applied`) and `uc2_settings_position`
-    /// the frame-END of the last Settings command it applied — both read
-    /// straight off the view's atomics AT SCRAPE TIME, never published into
-    /// the consensus pass (M14a's lesson about a hot loop's body).
+    /// agent's WALK cursor (the view's `consumed` word — plan B3 T7 repointed
+    /// it there from the view's `position` tag, which is what the help text
+    /// had always described) and `uc2_settings_position` the frame-END of the
+    /// last Settings command it applied — both read straight off the view's
+    /// atomics AT SCRAPE TIME, never published into the consensus pass
+    /// (M14a's lesson about a hot loop's body).
+    ///
+    /// The fixture seeds `applied = 4096`, which `ClusterView::new` puts in
+    /// BOTH words, so this assertion is about the value being rendered, not
+    /// about which word it came from; `the_cluster_fsm_gauge_reads_the_walk_cursor`
+    /// below is the one that tells them apart.
     #[test]
     fn the_cluster_gauges_and_the_fifth_agent_sample_are_exported() {
         let s = synthetic_sources();
@@ -1722,6 +1729,40 @@ mod tests {
                 "missing the {agent} agent sample: {text}"
             );
         }
+    }
+
+    /// Plan B3 T7: `uc2_cluster_fsm_position` is the uc2-cluster agent's WALK
+    /// cursor, not the published view's `position` tag.
+    ///
+    /// The two words agree on a fresh view and diverge the moment the agent
+    /// walks a span that applied no `CLUSTER` command — which is the ordinary
+    /// case, and the only case in which the gauge's stated purpose ("is this
+    /// node's cluster FSM keeping up with commit?") can be answered at all.
+    /// The help text has described the walk cursor since the cluster FSM
+    /// shipped while the code read the view tag; this pins the reading the
+    /// text promises. The red twin is the old code: it renders 4096.
+    #[test]
+    fn the_cluster_fsm_gauge_reads_the_walk_cursor() {
+        let s = synthetic_sources();
+        // The agent walked to 8192 without applying a CLUSTER command, so the
+        // view's own tag stays at the fixture's 4096.
+        s.cluster_view.note_consumed(8192);
+        assert_eq!(
+            s.cluster_view.position.load(Ordering::Acquire),
+            4096,
+            "the fixture must keep the two words apart for this test to mean anything"
+        );
+        let text = render_prometheus(&s);
+        assert!(
+            text.contains("\nuc2_cluster_fsm_position 8192\n"),
+            "the gauge must read the walk cursor (8192), not the view tag (4096): {text}"
+        );
+        // `uc2_settings_position` is untouched by the walk — it is the other
+        // kind of reading, and stays fleet-identical-once-caught-up.
+        assert!(
+            text.contains("\nuc2_settings_position 2048\n"),
+            "the settings position must not follow the cursor: {text}"
+        );
     }
 
     #[test]

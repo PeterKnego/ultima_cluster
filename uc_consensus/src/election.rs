@@ -973,9 +973,13 @@ impl ElectionSm {
     }
 
     /// Diagnostic (2026-08-16 hunt): how this node's `commit_seen` last moved
-    /// — `"rank"` (our own quorum ranking as leader), `"gossip"` (a leader's
-    /// commit position, post-validation), `"replay"` (a held position
-    /// released by `finish_validation`), or `"none"`. Read by the node's
+    /// — `"rank"` (our own quorum ranking as leader, [`Self::rank_leader`]),
+    /// `"gossip"` (a leader's commit position, post-validation,
+    /// [`Self::advance_gossip_commit`]), or `"none"` (this incarnation has
+    /// not learned one yet). Those THREE are the whole set: a gossip position
+    /// held through validation and released later comes back through
+    /// `advance_gossip_commit` and is labelled `"gossip"` like any other, so
+    /// there is no separate `"replay"` value. Read by the node's
     /// `UC2_TRUNC_TRACE` output so a cut below commit names its own provenance
     /// instead of leaving us to guess.
     pub fn commit_provenance(&self) -> (&'static str, u32, u64) {

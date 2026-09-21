@@ -90,14 +90,22 @@ pub enum ClientError {
     /// and no in-range id is either.
     #[error("service id {id} is not declared on this node (declared set 0b{declared:b})")]
     ServiceNotDeclared { id: u8, declared: u64 },
-    /// The node is mid-boot: the page carries FSM names on line 7 but
-    /// `services_declared` still reads 0 — a state that exists only between
-    /// the node's `create_file` and its `store_services_declared` (a
-    /// configured node always declares a nonzero set; a harness page has no
-    /// names). Folding it to FSM 0 would leave this client believing a
-    /// multi-FSM node has one FSM for the attachment's life.
+    /// The node has not joined its cluster yet: the page carries FSM names on
+    /// line 7 but `services_declared` still reads 0 — a state that exists only
+    /// between the node's `create_file` (at `Node::start`) and its
+    /// `store_services_declared`, which since plan B3 happens in the CONSENSUS
+    /// PASS, on the first pass where the node knows a leader, has learned a
+    /// commit position, and its cluster FSM has consumed the log up to that
+    /// commit. A configured node always declares a nonzero set; a harness page
+    /// has no names. So this is not "the page is missing or half-written" —
+    /// the page is fine and the CLUSTER is what this node is still joining.
+    /// Folding it to FSM 0 would leave this client believing a multi-FSM node
+    /// has one FSM for the attachment's life.
+    ///
+    /// [`EngineConfig::boot_wait`](crate::EngineConfig::boot_wait) is how long
+    /// `Engine::attach` / `Client::connect` waits this out before returning it.
     #[error(
-        "the node is still initialising its cnc page (FSM names published, \
+        "the node has not joined its cluster yet (FSM names published, \
          declared set not yet) — it is booting; retry the attach"
     )]
     NodeBooting,
