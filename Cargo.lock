@@ -1515,6 +1515,8 @@ dependencies = [
  "bincode",
  "clap",
  "serde",
+ "signal-hook",
+ "tempfile",
  "uc_diffreplay",
  "uc_protocol",
  "uc_service",
