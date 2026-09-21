@@ -990,6 +990,24 @@ impl ElectionSm {
         self.role
     }
 
+    /// Plan B3 T5: has this incarnation learned a commit position AT ALL —
+    /// from its own quorum ranking as leader (`"rank"`), a leader's gossip
+    /// (`"gossip"`), or a replay hold released by validation (`"replay"`)?
+    ///
+    /// A node that has not is still at its boot default of `0`, which is
+    /// indistinguishable from "this cluster has committed nothing" — and a
+    /// reader that treats the two the same concludes it is caught up with a
+    /// cluster it has not yet heard from. `uc_node`'s declared-set gate is
+    /// that reader: `cluster_fsm_position >= commit` says nothing until
+    /// `commit` is the cluster's answer rather than this node's default.
+    ///
+    /// The provenance string behind it is a diagnostic
+    /// ([`Self::commit_provenance`]); this is the one SEMANTIC question asked
+    /// of it, named so no caller has to compare strings.
+    pub fn commit_learned(&self) -> bool {
+        self.commit_source != "none"
+    }
+
     pub fn current_term(&self) -> u32 {
         self.current_term
     }

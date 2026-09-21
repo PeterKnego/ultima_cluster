@@ -1027,9 +1027,11 @@ fn a_pinned_origin_above_the_durable_frontier_is_a_drift_refusal() {
 /// attach-visible state and because a committed pin needs a complete snapshot
 /// set at the origin — i.e. this file's fixture (a node, a v1 service, an
 /// instant and admin op 10). Scope: the pin must be in the cluster artifact
-/// the restart recovers from. A pin committed ABOVE this node's newest
-/// artifact stays invisible until the cluster agent replays up to it; that
-/// gate is plan B3's live reports, not a boot ordering.
+/// the restart recovers from. A pin committed ABOVE that artifact is
+/// [`a_pin_above_the_recovered_artifact_is_published_before_the_declared_set`
+/// ]'s subject — plan B3 T5 moved the declared-set store into the consensus
+/// pass to cover it, and this test is what keeps the boot ordering it still
+/// relies on honest.
 #[test]
 fn a_restarted_node_publishes_the_pin_before_the_declared_set() {
     let (f, svc1) = Fixture::build_with_v1("pin-bootorder", Spec::small());
@@ -1103,6 +1105,119 @@ fn a_restarted_node_publishes_the_pin_before_the_declared_set() {
     // And the same state is what an attach sees once `Node::start` returns.
     let cnc2 = open_cnc(dir.path(), app);
     assert_eq!(cnc2.service_slot(0).status.pin(), expected);
+    node2.stop();
+}
+
+/// Plan B3 T5: the half of the boot race B2's C1 reorder explicitly did NOT
+/// cover — a pin committed **above** this node's newest cluster artifact.
+///
+/// The test above pins and then takes one more instant, so the pin is inside
+/// the artifact `ClusterAgent::recover` loads and the pin words are on the
+/// page before `Node::start` returns. Here there is no instant after the pin:
+/// the restart recovers a cluster FSM that does not hold it, and the pin only
+/// lands once the `uc2-cluster` agent has replayed the log above the artifact
+/// — some passes AFTER `Node::start` returned. A service attaching in that
+/// window used to read `PinRead::NoPin` and replay `[0, P)` from genesis
+/// under the new binary: the §2.3 counterfactual, silently.
+///
+/// T5 closes it by publishing the declared set — the word every attacher
+/// reads as "this node is ready" — from the consensus pass rather than from
+/// `Node::start`, on the first pass where the node knows its leader AND its
+/// cluster FSM has consumed the log up to commit. Two things are asserted:
+///
+/// * the ORDER, by the same watcher the test above uses: at the instant the
+///   declared set turns on, the row's pin words already hold the pin;
+/// * the CONSEQUENCE: a v2 service started the moment `Node::start` returns
+///   waits the gap out (`ServiceConfig::boot_wait`, `NodeBooting` internally)
+///   and then takes the pinned path — `Some(CAS_NEW)`, not the
+///   counterfactual, with the pin reported on the handle.
+#[test]
+fn a_pin_above_the_recovered_artifact_is_published_before_the_declared_set() {
+    let (f, svc1) = Fixture::build_with_v1("pin-abovecluster", Spec::small());
+    let Fixture { dir, app, node, p } = f;
+    let origin = p;
+    let cnc = open_cnc(dir.path(), app);
+
+    // A REAL pin, and NO instant after it: the newest cluster artifact is the
+    // one at `origin`, which predates the pin's own frame.
+    pin_via_admin(dir.path(), &cnc, 0, V1, V2, origin);
+    wait_until("the pin reached the row's slot words", || {
+        cnc.service_slot(0).status.pin()
+            == uc_log::cnc::PinRead::Pinned {
+                origin,
+                from: V1,
+                to: V2,
+            }
+    });
+    let cluster_art = dir
+        .path()
+        .join("snapshots")
+        .join("cluster")
+        .join(format!("snap-{origin}.ultcluster"));
+    assert!(
+        cluster_art.is_file(),
+        "precondition: the artifact the restart recovers from is the one at          the instant, taken BEFORE the pin was committed"
+    );
+
+    let old_instance = cnc.try_meta().expect("meta").instance_id;
+    drop(cnc);
+    svc1.stop();
+    node.stop();
+
+    // The watcher: spin until a page with a NEW `instance_id` publishes a
+    // nonzero declared set, then sample that same page's pin words.
+    let cnc_path = dir.path().join("cnc2.dat");
+    let watcher = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if let Ok(page) = CncPage::open_file(&cnc_path, app) {
+                let fresh = page
+                    .try_meta()
+                    .is_some_and(|m| m.instance_id != old_instance);
+                if fresh && page.services_declared() != 0 {
+                    return Some(page.service_slot(0).status.pin());
+                }
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::yield_now();
+        }
+    });
+
+    let node2 = start_node(dir.path(), app, PurgePolicy::Disabled, SEGMENT_BYTES);
+    // IMMEDIATELY, the way a co-restarting service does: the declared set is
+    // not on the page yet, so this attach waits it out.
+    let svc2 = ServiceBuilder::new(cfg(dir.path(), app), DoublingRegisterSm::default())
+        .start_with_snapshots()
+        .expect("the boot wait outlasts the node's join");
+
+    let sampled = watcher.join().expect("watcher panicked");
+    let expected = uc_log::cnc::PinRead::Pinned {
+        origin,
+        from: V1,
+        to: V2,
+    };
+    assert_eq!(
+        sampled,
+        Some(expected),
+        "a pin committed ABOVE the recovered artifact must also be published          before the declared set — the gate is the cluster FSM reaching          commit, not the boot ordering"
+    );
+
+    let cnc2 = open_cnc(dir.path(), app);
+    wait_service_caught_up(&cnc2);
+    assert_eq!(
+        svc2.pinned(),
+        Some((origin, V1, V2)),
+        "the attach acted on the pin"
+    );
+    assert_eq!(
+        query_v2(&svc2),
+        Some(CAS_NEW),
+        "v1's artifact at the origin, then the tail under v2 — not the \
+         counterfactual v2 would compute by replaying from genesis"
+    );
+    svc2.stop();
     node2.stop();
 }
 

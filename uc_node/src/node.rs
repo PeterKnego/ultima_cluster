@@ -1335,25 +1335,28 @@ impl Node {
         // services and clients read it from the page.
         //
         // Lag BEFORE declared, deliberately. A service can attach between
-        // `create_file` (a complete header, names on line 7) and the
-        // `store_services_declared` far below; it refuses a page with names
-        // and `services_declared == 0` as "booting" (`uc_service::attach`).
-        // That check can only cover the gap if a nonzero declared set implies
-        // the lag policy is already on the page — otherwise the sub-window
+        // `create_file` (a complete header, names on line 7) and whenever the
+        // declared set is published; it refuses a page with names and
+        // `services_declared == 0` as "booting" (`uc_service::attach`). That
+        // check can only cover the gap if a nonzero declared set implies the
+        // lag policy is already on the page — otherwise the sub-window
         // between the two stores reads as a legitimate lockstep config
         // (`fsm_lag_bytes == 0`) and cannot be told apart. Both stores are
         // Release and the reader's loads Acquire, so observing the declared
         // set orders the lag word before it.
         //
-        // Plan B2 (final review C1): …and the recovered PIN words, published
-        // by the cluster agent's constructor, precede BOTH. `store_services_
-        // declared` is therefore no longer here: it is the LAST thing done
-        // before the agents run, after `ClusterAgent::new` has republished
-        // every pinned row's words. An attach that passes the booting gate on
-        // a page whose pin words were still zero would read `PinRead::NoPin`
-        // and take the unpinned path — on the default purge-off posture a
-        // silent genesis replay under the new binary (spec §2.3), with no
-        // refusal and no log line.
+        // Plan B2 (final review C1) + plan B3 T5: …and the recovered PIN
+        // words, published by the cluster agent's constructor, precede BOTH.
+        // The declared set is published later still, and no longer at boot at
+        // all: `Consensus::maybe_publish_declared` stores it on the first
+        // pass where this node knows its leader AND its cluster FSM has
+        // consumed the log up to commit. Everything written here is written
+        // before any agent runs, so it is ordered before that pass by
+        // construction. An attach that passed the booting gate on a page
+        // whose pin words were still zero would read `PinRead::NoPin` and
+        // take the unpinned path — on the default purge-off posture a silent
+        // genesis replay under the new binary (spec §2.3), with no refusal
+        // and no log line.
         cnc.store_fsm_lag_bytes(cfg.services.page_lag_value(cfg.buffer_bytes as u64));
 
         // 4. Log buffer file: reuse the existing file when it already matches the
@@ -2163,20 +2166,25 @@ impl Node {
             Arc::clone(&cluster_installed),
             Arc::clone(&snapshot_standby_instant_pub),
         );
-        // M14a + plan B2 (final review C1): the declared set, published ONCE
-        // and LAST of the boot-time page words — see the `store_fsm_lag_bytes`
-        // comment above. `ClusterAgent::new` has just republished the pin
-        // words of every row its recovered artifact pins, so a service that
-        // passes the "booting" gate the instant this store lands already
-        // reads its row's real pin. Both stores are Release; the attach path's
-        // loads are Acquire, so observing a nonzero declared set orders the
-        // lag word AND the pin words before it.
+        // M14a + plan B2 (final review C1) + plan B3 T5: the declared set is
+        // NOT published here, and no longer at boot at all.
         //
-        // What this does NOT cover, by design (plan B3): a pin committed
-        // after this node's newest cluster artifact is invisible until the
-        // agent below replays up to it. Closing that needs the live reports,
-        // not a boot ordering.
-        cnc.store_services_declared(cfg.services.declared());
+        // B2 C1 moved this store to the end of `Node::start`, after
+        // `ClusterAgent::new` had republished the pin words its RECOVERED
+        // ARTIFACT holds, so an attach passing the "booting" gate read a real
+        // pin rather than `NoPin`. That closed the window only for a pin the
+        // artifact already carries: one committed ABOVE it is applied by the
+        // agent spawned just below, some passes later, and a co-restarting
+        // service could still slip in between and replay from genesis under
+        // the new binary (the §2.3 counterfactual, silently).
+        //
+        // So the store is now the consensus pass's, gated on the node having
+        // actually JOINED its cluster — see `Consensus::maybe_publish_
+        // declared`, which is the whole of the ordering argument now. What
+        // stays true here is the `store_fsm_lag_bytes` comment above: every
+        // boot-time page word this one orders (the lag word, the recovered
+        // pin words) is written BEFORE any agent runs, hence before any pass
+        // can publish the declared set.
         let cluster_runner = AgentRunner::spawn("uc2-cluster", IdleStrategy::Yield, move || {
             cluster_agent.do_work()
         })?;
@@ -2240,6 +2248,7 @@ impl Node {
             #[cfg(test)]
             test_now_ns: None,
             services: cfg.services,
+            declared_published: false,
             snap_stats: Arc::clone(&route_drops),
             last_snap_refusals: (0, 0, 0, 0, 0),
             min_applied: u64::MAX,
@@ -3149,6 +3158,17 @@ struct Consensus {
     /// Read by `publish_service_mins` every cycle; Task 6 also answers
     /// `MSG_V2_BAD_SERVICE` from it.
     services: ServicesConfig,
+    /// Plan B3 T5: has this incarnation already published `services_declared`
+    /// onto the cnc page? The word is the attach gate every service and
+    /// client reads ("names on line 7 with a zero declared set" = this node is
+    /// still booting), and it is published ONCE — see
+    /// [`Self::maybe_publish_declared`] for the two conditions and why.
+    ///
+    /// A plain `bool` rather than a check of the page word itself, so the
+    /// steady-state cost on the consensus duty cycle is one predictable
+    /// branch on a field that is already hot, not an atomic load (M14a: code
+    /// in a hot loop's body costs even on paths that never run).
+    declared_published: bool,
     /// M14c (spec §14.3): the receiver's stats — the SAME `Arc` the follower
     /// receiver bumps and `Node::snapshot_session_refusals` reads. Sampled once
     /// per duty cycle so the two named snapshot-session refusals are NAMED in a
@@ -4101,6 +4121,14 @@ impl Consensus {
         // (`pass_now_ns`) so a service in another process can compare it
         // against its own clock for liveness.
         self.publish_status();
+        // 6b. Plan B3 T5: the ATTACH gate — `services_declared`, published
+        // once this node has joined its cluster and not at boot. One branch
+        // on an already-hot `bool` in steady state; everything else is out of
+        // line (M14a: code in a hot loop's body costs even on paths that
+        // never run).
+        if !self.declared_published {
+            self.maybe_publish_declared();
+        }
         self.report_snapshot_refusals();
 
         // 7. Sample the service-written `output_completed` counter (Task 12);
@@ -5360,6 +5388,91 @@ impl Consensus {
             );
         }
         hold
+    }
+
+    /// Plan B3 T5: does this node know who leads its cluster? Either it IS
+    /// the leader, or current-term leader traffic has taught it a hint
+    /// (`learn_leader_hint`).
+    ///
+    /// `u64::MAX` is the page's "unknown" sentinel — written by `CncPage
+    /// ::init` on a fresh page and re-written by `exec`'s `BecomeFollower`
+    /// arm on adopting a strictly newer term. `0` is NOT the sentinel: node
+    /// ids start at 0, and a cluster whose leader is node 0 publishes exactly
+    /// that. Testing `!= 0` would read a node-0-led cluster as leaderless
+    /// forever.
+    ///
+    /// `Role::Leader` is a separate arm rather than a consequence of the
+    /// hint: `BecomeLeader` does store the hint, but only at the END of its
+    /// own arm, and a single-voter cluster's whole notion of "a leader is
+    /// known" is its own role.
+    fn leader_known(&self) -> bool {
+        matches!(self.sm.role(), Role::Leader)
+            || self.cnc.status().leader_hint.load_acquire() != u64::MAX
+    }
+
+    /// Plan B3 T5: publish `services_declared` — the word a service
+    /// (`uc_service::attach`) and a client (`uc_client::Engine::attach`) read
+    /// as "this node is ready to be attached to" — the first pass on which
+    /// BOTH hold:
+    ///
+    /// (a) **this node knows a leader** ([`Self::leader_known`]),
+    /// (a') **its commit counter is the CLUSTER's answer and not this
+    ///      incarnation's default** (`ElectionSm::commit_learned`), and
+    /// (b) **its cluster FSM has consumed the log up to commit**
+    ///     (`cluster_view.consumed >= commit`).
+    ///
+    /// Why all three. (b) alone is vacuous at boot: the commit counter starts
+    /// at 0 — `LogCounters::prime` seeds `append`/`durable` from the archive
+    /// and deliberately not `commit` — and a cluster FSM that has consumed
+    /// nothing is trivially "caught up" with 0. (a) alone does not fix that:
+    /// a single-voter node is its own leader within a pass or two of boot,
+    /// while its commit counter is still 0 and its `uc2-cluster` agent is
+    /// still at the artifact it recovered from — which is precisely the node
+    /// whose pin sits ABOVE that artifact. (a') is the missing half: once
+    /// this node has RANKED a commit as leader or taken one from a leader's
+    /// gossip, `commit` covers everything the cluster committed, the pin
+    /// included, so "consumed up to commit" becomes the real statement that
+    /// every committed `CLUSTER` frame has been applied here and republished
+    /// onto the page's pin words. (a) is kept because a hint-less node has
+    /// nothing to have learned a commit FROM, and reading that off the page
+    /// is what makes the gate's first clause cheap.
+    ///
+    /// That is the hole plan B2's C1 reorder explicitly left open: B2 could
+    /// only guarantee the pins the node's RECOVERED ARTIFACT already carried,
+    /// and a pin committed above it becomes visible some passes after
+    /// `Node::start` returns. A co-restarting service that attached in
+    /// between read `PinRead::NoPin` and replayed from genesis under the new
+    /// binary — the §2.3 counterfactual, silently. With this gate a service
+    /// cannot attach to a node that has not joined its cluster, which is the
+    /// point: the consequence is bounded by `ServiceConfig::boot_wait` /
+    /// `EngineConfig::boot_wait` on the attaching side.
+    ///
+    /// `commit` is read BEFORE `consumed`, deliberately: `consumed >= commit`
+    /// then proves the agent has consumed everything committed as of a moment
+    /// no LATER than the commit reading, never earlier.
+    ///
+    /// Out of line and `#[inline(never)]`: it runs at most once per
+    /// incarnation, and its body must not be part of the duty cycle's
+    /// inlining budget (M14a / the 2.11.0 apply-hop regression).
+    #[inline(never)]
+    fn maybe_publish_declared(&mut self) {
+        if !self.leader_known() || !self.sm.commit_learned() {
+            return;
+        }
+        let commit = self.cnc.counters().commit.load_acquire();
+        let consumed = self.cluster_view.consumed.load(Ordering::Acquire);
+        if consumed < commit {
+            return;
+        }
+        self.cnc.store_services_declared(self.services.declared());
+        self.declared_published = true;
+        crate::obs_event!(
+            Info,
+            "services_declared_published",
+            node = self.id as u64,
+            commit = commit,
+            cluster_position = consumed
+        );
     }
 
     /// Publish `term`, `flags` (leader/can_serve), and a fresh wall-clock
@@ -11813,6 +11926,7 @@ mod tests {
             test_now_ns: None,
             fsm_lag_eff: crate::services::fsm_lag_eff(&services, 1 << 16, 4096),
             services,
+            declared_published: false,
             snap_stats: Arc::new(uc_net::receiver::FollowerStats::default()),
             last_snap_refusals: (0, 0, 0, 0, 0),
             min_applied: u64::MAX,
@@ -12863,6 +12977,166 @@ mod tests {
         assert!(
             text.contains(r#""by":"timeout""#),
             "the record says which rule fired: {text}"
+        );
+    }
+
+    /// Plan B3 T5, condition (a): the declared set — the word every attacher
+    /// reads as "this node is ready" — stays 0 while this node knows no
+    /// leader, even though the cluster's commit has been learned and its
+    /// cluster FSM has consumed the log up to it.
+    ///
+    /// The hint is then set to **0**, a real node id in this harness's
+    /// membership `[0, 1, 2]` — which is also the test of WHICH sentinel
+    /// `leader_known` compares against. `u64::MAX` is "unknown"
+    /// (`CncPage::init`, and `BecomeFollower` on a newer term); a
+    /// `hint != 0` test would read a cluster led by node 0 as leaderless for
+    /// the life of the incarnation.
+    #[test]
+    fn the_declared_set_waits_for_a_known_leader() {
+        let mut h = harness_with_rows(&["count"]);
+        // (a') holds: the cluster's commit, taken straight into the SM so no
+        // source address is resolved and no leader hint is published.
+        h.cons.feed(Event::CommitGossip {
+            term: 2,
+            commit: 6016,
+        });
+        assert!(h.cons.sm.commit_learned());
+        // (b) holds: one agent cycle walks the cluster FSM to commit.
+        h.commit_through(6016);
+        assert_eq!(
+            h.cons.cluster_view.consumed.load(Ordering::Acquire),
+            h.cons.cnc.counters().commit.load_acquire(),
+            "precondition: the cluster FSM has consumed the log up to commit"
+        );
+        assert_eq!(
+            h.cons.cnc.status().leader_hint.load_acquire(),
+            u64::MAX,
+            "precondition: a fresh page's hint is the UNKNOWN sentinel"
+        );
+
+        h.cons.do_work();
+        assert!(
+            !matches!(h.cons.sm.role(), Role::Leader),
+            "precondition: this node did not win an election on its own tick"
+        );
+        assert_eq!(
+            h.cons.cnc.services_declared(),
+            0,
+            "no leader known: an attach must still read this node as booting"
+        );
+        assert!(!h.cons.declared_published);
+
+        // Current-term leader traffic teaches it the hint (`learn_leader_hint`).
+        h.cons.cnc.status().leader_hint.store_release(0);
+        h.cons.do_work();
+        assert_eq!(
+            h.cons.cnc.services_declared(),
+            0b1,
+            "node 0 leads — `0` is an id, not the unknown sentinel"
+        );
+        assert!(h.cons.declared_published);
+    }
+
+    /// Plan B3 T5, condition (a'): a node that knows a leader but has not yet
+    /// learned a commit from it publishes nothing — even though `consumed >=
+    /// commit` holds, because both are 0.
+    ///
+    /// This is the case a gate of (a) + (b) alone gets WRONG, and it is not a
+    /// corner: `LogCounters::prime` seeds `append`/`durable` from the archive
+    /// and NOT `commit`, so every restarted node passes through it, with its
+    /// `uc2-cluster` agent still sitting at the artifact it recovered from —
+    /// exactly the node whose upgrade pin lives above that artifact.
+    #[test]
+    fn the_declared_set_waits_for_a_commit_the_cluster_actually_took() {
+        let mut h = harness_with_rows(&["count"]);
+        h.cons.cnc.status().leader_hint.store_release(0); // (a) holds
+        assert!(
+            !h.cons.sm.commit_learned(),
+            "precondition: nothing has told this node where commit is"
+        );
+        assert_eq!(
+            h.cons.cnc.counters().commit.load_acquire(),
+            0,
+            "precondition: `prime` seeds durable/append, never commit"
+        );
+        assert_eq!(
+            h.cons.cluster_view.consumed.load(Ordering::Acquire),
+            0,
+            "…so `consumed >= commit` is trivially true and means nothing"
+        );
+
+        h.cons.do_work();
+        assert_eq!(
+            h.cons.cnc.services_declared(),
+            0,
+            "a node that has not heard a commit has not joined its cluster"
+        );
+    }
+
+    /// Plan B3 T5, condition (b): with a leader known and a real commit
+    /// learned, the declared set still waits for this node's cluster FSM to
+    /// consume the log up to that commit — which is what proves every
+    /// committed `UpgradePin` has been applied HERE and republished onto the
+    /// page's pin words. This is the hole plan B2's C1 reorder left open (a
+    /// pin committed above the artifact the restart recovered from).
+    ///
+    /// The `cluster_position` the obs line carries is the CONSUMED word, not
+    /// the published view's `position`: on a cluster whose committed traffic
+    /// is ordinary `MESSAGE` frames the view's tag never moves, and a gate
+    /// keyed on it would never open at all.
+    #[test]
+    fn the_declared_set_waits_for_the_cluster_fsm_to_reach_commit() {
+        let _obs = obs_capture_lock();
+        let mut h = harness_with_rows(&["count"]);
+        // (a) and (a') hold from the start.
+        h.cons.cnc.status().leader_hint.store_release(0);
+        h.cons.feed(Event::CommitGossip {
+            term: 2,
+            commit: 6016,
+        });
+        let commit = h.cons.cnc.counters().commit.load_acquire();
+        assert_eq!(commit, 6016, "the gossip advanced the commit counter");
+        assert_eq!(
+            h.cons.cluster_view.consumed.load(Ordering::Acquire),
+            0,
+            "precondition: the `uc2-cluster` agent has not run a cycle yet"
+        );
+
+        h.cons.do_work();
+        assert_eq!(
+            h.cons.cnc.services_declared(),
+            0,
+            "the cluster FSM has consumed nothing: a committed pin below \
+             commit could still be unapplied here"
+        );
+
+        let buf = crate::obs::log::capture_for_tests();
+        h.commit_through(commit); // one `uc2-cluster` cycle: the walk reaches commit
+        h.cons.do_work();
+        let text = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        crate::obs::log::stderr_for_tests();
+
+        assert_eq!(h.cons.cnc.services_declared(), 0b1);
+        assert!(
+            text.contains(r#""event":"services_declared_published""#),
+            "the publish is named in the log: {text}"
+        );
+        assert!(
+            text.contains(r#""cluster_position":6016"#) && text.contains(r#""commit":6016"#),
+            "…with both sides of the condition that opened it: {text}"
+        );
+
+        // Published ONCE per incarnation. Asserted on the PAGE rather than on
+        // a second capture: the obs sink is process-global, so a sibling test
+        // emitting the same event would satisfy (or defeat) a "not logged
+        // again" assertion by accident. A sentinel the gate would overwrite
+        // cannot be written by anyone else.
+        h.cons.cnc.store_services_declared(0xDEAD);
+        h.cons.do_work();
+        assert_eq!(
+            h.cons.cnc.services_declared(),
+            0xDEAD,
+            "the gate stores the declared set once, not every pass"
         );
     }
 

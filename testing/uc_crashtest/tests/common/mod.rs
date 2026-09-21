@@ -459,7 +459,39 @@ pub fn wait_for_path(path: &Path, timeout: Duration) {
 /// Fresh-boot only: on a respawn over a SAME dir use `wait_for_fresh_instance`,
 /// since a stale leftover cnc2.dat can let `connect` validate the OLD page.
 pub fn wait_for_ready(instance_dir: &Path, timeout: Duration) {
-    drop(connect_with_retry(instance_dir, timeout));
+    let deadline = Instant::now() + timeout;
+    loop {
+        // No boot wait: this asks whether the node's INSTANCE DIR is
+        // finished, not whether the node has joined its cluster.
+        let cfg = uc_client::PipelinedConfig {
+            boot_wait: Duration::ZERO,
+            serving_gate: false,
+            ..Default::default()
+        };
+        match uc_client::PipelinedClient::connect(instance_dir, APP_ID, cfg) {
+            Ok(c) => {
+                c.shutdown();
+                return;
+            }
+            // Plan B3 T5: "this node has not joined its cluster yet" IS ready
+            // for this check, and treating it as anything else deadlocks every
+            // caller that waits inside its own node-spawn loop — node 0 of an
+            // n-voter cluster cannot join until nodes 1..n exist.
+            //
+            // It is also a sound readiness answer: `Node::start` creates every
+            // ring file before any agent runs, and the declared set is
+            // published later still, by the consensus pass — so a page that
+            // reads "booting" is already a node whose files are all there.
+            Err(ClientError::NodeBooting) => return,
+            Err(e) => {
+                assert!(
+                    Instant::now() < deadline,
+                    "timed out waiting for ready: {e}"
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
 }
 
 /// Wait until a node respawned on the SAME instance dir has actually
@@ -500,8 +532,19 @@ pub fn wait_for_fresh_instance(
 /// Connect a client, retrying until the node is ready to accept the attach
 /// (the cnc2.dat file can exist a moment before the node has finished
 /// creating every ring file).
+///
+/// Plan B3 T5: `timeout` is the budget for THOSE retries, and it is now spent
+/// on top of the one wait the attach performs for itself. A node publishes
+/// its declared set only once it has joined its cluster, and
+/// `Client::connect` waits `uc_client::DEFAULT_BOOT_WAIT` for that before it
+/// reports `NodeBooting` — so a caller passing 10 s would otherwise see its
+/// whole budget consumed by the FIRST attempt, and this loop would never take
+/// a second turn. The wait is added rather than replacing the budget: the two
+/// answer different questions ("has this node joined?" and "is this
+/// instance dir finished?"), and a restarted node in these tests can need
+/// both.
 pub fn connect_with_retry(instance_dir: &Path, timeout: Duration) -> Client {
-    let deadline = Instant::now() + timeout;
+    let deadline = Instant::now() + timeout + uc_client::DEFAULT_BOOT_WAIT;
     loop {
         match Client::connect(instance_dir, APP_ID) {
             Ok(c) => return c,

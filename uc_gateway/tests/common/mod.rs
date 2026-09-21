@@ -48,10 +48,33 @@ pub fn start_single_node(root: &Path) -> (Node, PathBuf) {
 /// As [`start_single_node`], with the election timeout under the test's
 /// control — a long one gives a test a deterministic window in which the node
 /// exists but **cannot serve**, which is otherwise a ~50 ms race to hit.
+///
+/// `declared` picks which shape the node's `[services]` takes, and since plan
+/// B3 T5 that choice decides whether the window above is REACHABLE at all. A
+/// node that declares a row publishes its declared set only once it has
+/// JOINED its cluster, and every attacher — `uc_service::attach` and
+/// `uc_client::Engine::attach`, i.e. the `Edge` too — waits that out. On a
+/// SINGLE-voter cluster "joined" and "serving" are the same instant, so a
+/// service or an edge can never be attached to one while it cannot serve.
+/// `false` asks for a harness node (`ServicesConfig::none_for_tests`:
+/// nothing declared, no names on line 7, row 0 rung for whoever attaches),
+/// which is exactly the pre-M14c shape the booting gate deliberately does not
+/// apply to — so the window stays reachable for the one test that needs it.
 pub fn start_single_node_with_election(
     root: &Path,
     election_min_ns: u64,
     election_max_ns: u64,
+) -> (Node, PathBuf) {
+    start_single_node_full(root, election_min_ns, election_max_ns, true)
+}
+
+/// [`start_single_node_with_election`] with the `[services]` shape spelled
+/// out — see its doc for why a test would ask for an undeclared node.
+pub fn start_single_node_full(
+    root: &Path,
+    election_min_ns: u64,
+    election_max_ns: u64,
+    declared: bool,
 ) -> (Node, PathBuf) {
     let dir = root.join("node0");
     std::fs::create_dir_all(&dir).expect("instance dir");
@@ -75,7 +98,11 @@ pub fn start_single_node_with_election(
         learners: Vec::new(),
         journal_segment_bytes: uc_node::DEFAULT_JOURNAL_SEGMENT_BYTES,
         crypto: uc_node::CryptoConfig::Disabled,
-        services: uc_node::ServicesConfig::single(RegisterSm::NAME),
+        services: if declared {
+            uc_node::ServicesConfig::single(RegisterSm::NAME)
+        } else {
+            uc_node::ServicesConfig::none_for_tests()
+        },
     };
     let node = Node::start(cfg).expect("node start");
     (node, dir)
@@ -196,18 +223,28 @@ pub fn start_cluster(root: &Path, n: usize) -> Vec<Slot> {
             services: uc_node::ServicesConfig::single(RegisterSm::NAME),
         };
         let node = Node::start_with_socket(cfg, sock).expect("node start");
-        let service = ServiceBuilder::new(
-            ServiceConfig::new(&dir, APP),
-            Sessioned::new(RegisterSm::default(), SessionConfig::default()),
-        )
-        .start()
-        .expect("service start");
         slots.push(Slot {
             id: i as u32,
             instance_dir: dir,
             node: Some(node),
-            service: Some(service),
+            service: None,
         });
+    }
+    // Plan B3 T5: EVERY node first, THEN the services. A node publishes its
+    // declared set — the word an attaching service reads as "ready" — only
+    // once it has JOINED its cluster, and node 0 of an n-voter cluster cannot
+    // join until the others exist. Attaching its service inside the loop
+    // above would block the loop that starts them: a deadlock ending in
+    // `ServiceConfig::boot_wait` expiring with `NodeBooting`.
+    for slot in &mut slots {
+        slot.service = Some(
+            ServiceBuilder::new(
+                ServiceConfig::new(&slot.instance_dir, APP),
+                Sessioned::new(RegisterSm::default(), SessionConfig::default()),
+            )
+            .start()
+            .expect("service start"),
+        );
     }
     slots
 }

@@ -322,6 +322,10 @@ pub(crate) struct ApplyState<S: RawStateMachine> {
     /// `Some` only for a snapshot-capable service; `None` makes a below-floor
     /// gap fail-stop with [`ServiceError::SnapshotRequired`].
     pub(crate) snapshot_restore: Option<SnapshotRestore<S>>,
+    /// Plan B3 T5: the cursor a replay pass last failed to advance past, so
+    /// the forward-progress guard in [`apply_cycle`] reports one line per
+    /// episode rather than one per duty cycle. `None` whenever a pass moved.
+    pub(crate) replay_stalled: Option<u64>,
 }
 
 /// Write schedule records to the node; a full ring is transient (the node
@@ -723,6 +727,44 @@ pub(crate) fn apply_cycle<S: RawStateMachine>(st: &mut ApplyState<S>) -> bool {
                 .applied
                 .store_release(cursor);
             st.needs_replay = false;
+            // FORWARD-PROGRESS GUARD (plan B3 T5). The comment above argues
+            // this loop is livelock-free because "each replay pass strictly
+            // ADVANCES the cursor" — an argument, not an enforced invariant,
+            // and a pass that does NOT advance turns this `loop` into a spin
+            // that never hands control back to `AgentRunner`. The agent only
+            // checks its stop flag BETWEEN `work()` calls, so such a spin
+            // does not merely burn a core: it hangs `Service::stop`'s join
+            // for good.
+            //
+            // It is reachable: a replay that finds nothing to apply returns
+            // the cursor it was given. Concretely, a service attaching to a
+            // node that has already installed a snapshot and adopted a floor
+            // — a below-floor joiner, whose service can only attach once the
+            // node has joined its cluster since T5 — replays from 0 against
+            // a journal whose `first_meta` is still 0 (a stale segment below
+            // the adopted floor, not yet purged): no gap is detected, the
+            // scan yields nothing, and the cursor comes back unmoved while
+            // `next_batch` keeps saying `Overrun`.
+            //
+            // Hand the cycle back instead, exactly as the `AwaitArtifact` arm
+            // does, and let the agent idle and retry: the next pass re-reads
+            // the journal, and once the node's purge removes the stale prefix
+            // the gap guard fires and the row converges through the ordinary
+            // install path. Reported once per episode, so a row that stays
+            // stuck says so instead of sitting silent.
+            if cursor <= cursor_before {
+                if st.replay_stalled != Some(cursor) {
+                    st.replay_stalled = Some(cursor);
+                    eprintln!(
+                        "uc_service: service {} replay made no progress at cursor {cursor} \
+                         (apply target {target}); idling and retrying — the journal's retained \
+                         prefix does not yet meet this row's frontier",
+                        st.service_id
+                    );
+                }
+                break;
+            }
+            st.replay_stalled = None;
             progressed = true;
             // Replay jumped the cursor: any wait episode is over.
             st.lag_waiting = false;
@@ -1311,6 +1353,7 @@ mod tests {
             table_last: std::collections::HashMap::new(),
             needs_replay: false,
             replay_wait: None,
+            replay_stalled: None,
             instance_id: 0x7777,
             instance_mismatch_streak: 0,
             my_epoch: 1,
@@ -1495,6 +1538,7 @@ mod tests {
             table_last: std::collections::HashMap::new(),
             needs_replay: false,
             replay_wait: None,
+            replay_stalled: None,
             instance_id: 0x5151,
             instance_mismatch_streak: 0,
             my_epoch: 1,
@@ -1530,6 +1574,123 @@ mod tests {
         );
         assert_eq!(sm.last, Some(pos[N - 1]));
         assert_eq!(st.follower.cursor, head);
+    }
+
+    // ------------------- plan B3 T5: the replay forward-progress guard
+
+    /// A replay pass that does NOT advance the cursor must hand the cycle
+    /// back, not spin inside it.
+    ///
+    /// The overrun arm's comment argues the loop is livelock-free because
+    /// "each replay pass strictly ADVANCES the cursor toward the archived
+    /// frontier" — an argument, not an enforced invariant. When it does not
+    /// hold, `next_batch` keeps saying `Overrun`, `replay_into` keeps
+    /// returning the same cursor, and `apply_cycle` NEVER RETURNS. That is
+    /// worse than a hot loop: `AgentRunner` only reads its stop flag between
+    /// `work()` calls, so `Service::stop`'s join hangs for good — which is
+    /// how it was found (plan B3 T5 made a below-floor joiner's service
+    /// attach after its node had adopted a floor, and
+    /// `uc_node/tests/learner.rs`'s redirect capstone stopped terminating).
+    ///
+    /// Staged here with the journal REMOVED under a lapped ring: the gap
+    /// guard reads `first = 0`, sees no gap, scans nothing, and gives the
+    /// cursor straight back. Run on its own thread with a deadline, because
+    /// the defect this pins is a hang — a test that reproduced it inline
+    /// would hang the suite instead of failing it.
+    #[test]
+    fn a_replay_that_cannot_advance_returns_instead_of_spinning() {
+        let dir = scratch();
+        let cnc = page(0x9191);
+        cnc.store_services_declared(0b1);
+        let buffer = std::sync::Arc::new(uc_log::buffer::LogBuffer::new(
+            uc_log::region::Region::heap_zeroed(CAP as usize),
+            std::sync::Arc::clone(&cnc),
+            256,
+        ));
+        // Lap the ring (the appender will not overwrite unrecorded bytes, so
+        // a real archive has to run alongside), then take the journal away:
+        // that is the shape a below-floor joiner presents — a cursor far
+        // under the ring's retained window and a journal that answers "my
+        // first base is 0", so nothing looks missing and nothing is there.
+        let journal_dir = dir.path().join("journal");
+        let mut archive = uc_log::archive::Archive::open(uc_log::archive::ArchiveConfig {
+            segment_size_bytes: 16 * 1024,
+            preallocate_segments: false,
+            ..uc_log::archive::ArchiveConfig::new(&journal_dir)
+        })
+        .unwrap();
+        let mut appender = uc_log::buffer::Appender::new(std::sync::Arc::clone(&buffer), 1, 0);
+        for i in 0..1400usize {
+            appender.append(1, i as u32, &[1u8; 64]).unwrap();
+            if i % 100 == 99 {
+                while archive.do_work(&buffer).unwrap() {}
+            }
+        }
+        while archive.do_work(&buffer).unwrap() {}
+        drop(archive);
+        let head = cnc.counters().append.load_acquire();
+        cnc.counters().commit.store_release(head);
+        std::fs::remove_dir_all(&journal_dir).unwrap();
+        std::fs::create_dir_all(&journal_dir).unwrap();
+
+        let egress_ring =
+            uc_protocol::ring::BroadcastRing::create(&dir.path().join("egress.bc"), 1 << 16, 1024)
+                .unwrap();
+        let (_qp, svc_query) =
+            uc_protocol::ring::SpscRing::create(&dir.path().join("svc_query.ring"), 1 << 16, 1024)
+                .unwrap()
+                .into_split();
+        let (svc_sched, _sp) =
+            uc_protocol::ring::SpscRing::create(&dir.path().join("svc_sched.ring"), 1 << 16, 1024)
+                .unwrap()
+                .into_split();
+        let mut st = super::ApplyState {
+            poisoned: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            follower: uc_log::reader::LogFollower::new(std::sync::Arc::clone(&buffer), 0),
+            sm: Arc::new(std::sync::Mutex::new(CountSm::default())),
+            cnc: Arc::clone(&cnc),
+            egress: crate::egress::Egress::new(egress_ring.producer()),
+            resp_buf: Vec::new(),
+            journal_dir,
+            svc_query,
+            svc_sched,
+            announce_pending: false,
+            was_leader: false,
+            pending: std::collections::HashMap::new(),
+            table_last: std::collections::HashMap::new(),
+            needs_replay: false,
+            replay_wait: None,
+            replay_stalled: None,
+            instance_id: 0x9191,
+            instance_mismatch_streak: 0,
+            my_epoch: 1,
+            service_id: 0,
+            pin: None,
+            lag_mode: crate::lag::LagMode::Off,
+            declared: 0b1,
+            lag_waiting: false,
+            snapshot_trigger: None,
+            snapshot_restore: None,
+        };
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let h = std::thread::spawn(move || {
+            let progressed = super::apply_cycle(&mut st);
+            let cursor = st.follower.cursor;
+            let _ = tx.send((progressed, cursor));
+            st
+        });
+        let (progressed, cursor) = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("apply_cycle never returned: the overrun loop spun in place");
+        let st = h.join().unwrap();
+        assert!(!progressed, "nothing was applied");
+        assert_eq!(cursor, 0, "the cursor could not advance");
+        assert_eq!(
+            st.replay_stalled,
+            Some(0),
+            "the stall is recorded once per episode, so the row says so"
+        );
     }
 
     /// M14c2 ruling K (`docs/benchmarks/uc2-m14c-*`): `uc_service_lag_waits_total`
@@ -1591,6 +1752,7 @@ mod tests {
             table_last: std::collections::HashMap::new(),
             needs_replay: false,
             replay_wait: None,
+            replay_stalled: None,
             instance_id: 0x1234,
             instance_mismatch_streak: 0,
             my_epoch: 1,
