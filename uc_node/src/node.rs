@@ -3368,9 +3368,14 @@ struct Consensus {
     snapshot_reports_unsent: Arc<AtomicU64>,
     /// Plan B3 (spec §6.5.2), **LEADER-only**: the hashes collected so far
     /// for each row's NEWEST reported instant, keyed by row. One entry per
-    /// row (at most `CNC_MAX_SERVICES`) holding at most one hash per member
-    /// (at most `MAX_MEMBERS`), so the whole map is bounded by the config and
-    /// needs no eviction of its own. Filled by
+    /// row (at most `CNC_MAX_SERVICES`) holding at most one hash per node that
+    /// was a member WHEN IT REPORTED — which is NOT a bound of `MAX_MEMBERS`:
+    /// an entry outlives the config it was admitted under, so a remove and an
+    /// add inside a pending window can leave nine ids in a map that was only
+    /// ever eight wide. The payload is bounded by membership AT APPEND, where
+    /// [`Consensus::maybe_append_snapshot_reports`] filters it against the
+    /// current config; the map itself is bounded only by the rows and by the
+    /// leader's own lifetime (the clear below). Filled by
     /// [`Consensus::on_snap_report`], drained by
     /// [`Consensus::maybe_append_snapshot_reports`], and cleared on every
     /// leader exit for `last_cluster_append`'s reason — a set collected under
@@ -6251,7 +6256,21 @@ impl Consensus {
     /// * **Members only.** The config is the whole of the trust here — a hash
     ///   from a node in no config this cluster adopted is not evidence about
     ///   this cluster's artifacts. Learners count as members (their hashes are
-    ///   evidence) but never toward the quorum below.
+    ///   evidence) but never toward the quorum below. This is a door, not the
+    ///   bound: an accepted entry outlives the config that admitted it, so
+    ///   [`Consensus::maybe_append_snapshot_reports`] filters the payload
+    ///   against the config again at append time.
+    ///
+    ///   **The two memberships are deliberately different.** This check reads
+    ///   the KERNEL's config (`sm.config()` — the newest membership in the
+    ///   log, committed or not, which is what Raft §4.1 makes every other
+    ///   quorum on this agent depend on), while the staleness check below
+    ///   reads the COMMITTED cluster view. So an uncommitted ADD lets a
+    ///   not-yet-committed member's hash in — harmless: it is evidence from a
+    ///   node the cluster is adopting, and if that add is truncated the append
+    ///   filter drops it again. An uncommitted REMOVE thins that instant's
+    ///   evidence by one — also harmless, and the honest reading: we stop
+    ///   counting a node the cluster has decided to drop.
     /// * **Newer than the record.** A report at or below the row's COMMITTED
     ///   report position says nothing the log does not already hold, and
     ///   appending it again would churn the log for nothing. This is strictly
@@ -6334,12 +6353,26 @@ impl Consensus {
     /// altogether: the append then names who DID report, which is exactly the
     /// evidence [`uc_protocol::v2::upgrade::verdict`] reads.
     ///
+    /// **Membership is applied HERE, not only at collection.** An entry
+    /// outlives the config it was admitted under: `MAX_MEMBERS` bounds voters
+    /// plus learners at ONE instant, so a remove and an add inside a pending
+    /// window can leave nine ids in a map that was only ever eight wide, and
+    /// `encode_snapshot_report` would refuse the ninth — through an `expect`,
+    /// on the consensus agent. Worse quietly: an ex-member's hash committed
+    /// into the record skews [`uc_protocol::v2::upgrade::verdict`], which has
+    /// no membership filter of its own and cannot get one (it is a pure
+    /// function of the record). So the payload is filtered against the config
+    /// at append time, `voters_reporting` is counted on the FILTERED set, and
+    /// an entry the filter empties is dropped rather than appended.
+    ///
     /// **At most one append per pass**, because `append_cluster_frame` shuts
     /// the single-in-flight gate behind it: a second command placed above an
     /// uncommitted one is precisely what that gate exists to refuse. Ready
-    /// rows beyond the first simply wait for the next pass, and the lowest row
-    /// number goes first so the choice is deterministic rather than a
-    /// `HashMap`'s iteration order.
+    /// rows beyond the first simply wait for the next pass, and rows are
+    /// walked in ascending order so the choice is deterministic rather than a
+    /// `HashMap`'s iteration order. A row DROPPED here (stale, or emptied by
+    /// the filter) costs the pass nothing — the walk continues to the next
+    /// row, since nothing was appended and the gate is still open.
     ///
     /// On `WouldOverrun` the entry is KEPT — the buffer was momentarily full,
     /// nothing was appended, and the set is still the newest thing this leader
@@ -6355,75 +6388,101 @@ impl Consensus {
         let now = self.pass_mono_ns;
         let config = self.sm.config().clone();
         let quorum = config.voters.len() / 2 + 1;
-        // The ready row with the lowest number, and how many voters it has.
-        let mut ready: Option<(u8, usize)> = None;
-        for (&row, pend) in self.pending_snapshot_reports.iter() {
-            let voters_reporting = pend
+        // Ascending, so which ready row goes first is a property of the data
+        // and not of the `HashMap`'s iteration order.
+        let mut rows: Vec<u8> = self.pending_snapshot_reports.keys().copied().collect();
+        rows.sort_unstable();
+        for row in rows {
+            let pend = &self.pending_snapshot_reports[&row];
+            let position = pend.position;
+            let first_seen_ns = pend.first_seen_ns;
+            // The payload, filtered against the config AS IT IS NOW — see this
+            // function's doc for why collection-time membership is not enough.
+            let hashes: Vec<(u32, u64)> = pend
                 .hashes
-                .keys()
-                .filter(|id| config.is_voter(**id))
-                .count();
-            let timed_out = now.saturating_sub(pend.first_seen_ns) >= SNAP_REPORT_TIMEOUT_NS;
-            if (voters_reporting >= quorum || timed_out)
-                && ready.is_none_or(|(chosen, _)| row < chosen)
-            {
-                ready = Some((row, voters_reporting));
+                .iter()
+                .filter(|(id, _)| config.contains(**id))
+                .map(|(id, h)| (*id, *h))
+                .collect();
+            let voters_reporting = hashes.iter().filter(|(id, _)| config.is_voter(*id)).count();
+            let timed_out = now.saturating_sub(first_seen_ns) >= SNAP_REPORT_TIMEOUT_NS;
+            if voters_reporting < quorum && !timed_out {
+                continue; // still collecting
             }
-        }
-        let Some((row, voters_reporting)) = ready else {
-            return false;
-        };
-        let pend = &self.pending_snapshot_reports[&row];
-        let position = pend.position;
-        let hashes: Vec<(u32, u64)> = pend.hashes.iter().map(|(id, h)| (*id, *h)).collect();
-        // The row's committed report can have MOVED since the entry was made
-        // (a previous leader's record committing under us), in which case this
-        // one says nothing newer. Dropped rather than appended: the append
-        // would be refused at apply as stale, having cost the log a frame.
-        if position <= self.held_report_position(row) {
-            self.pending_snapshot_reports.remove(&row);
-            return false;
-        }
-        let reporters = hashes.len() as u64;
-        // Encodable by construction: non-empty (an entry is only ever created
-        // together with its first hash), at most one entry per member and
-        // therefore at most `MAX_MEMBERS`, strictly increasing by node id (the
-        // `BTreeMap`'s order), `row < CNC_MAX_SERVICES` and a non-zero
-        // position — the last two are `on_snap_report`'s door.
-        let cmd = ClusterCommand::SnapshotReport(SnapshotReport {
-            row,
-            position,
-            hashes,
-        });
-        match self.append_cluster_frame(&cmd) {
-            Ok(end) => {
-                let by_timeout = voters_reporting < quorum;
-                self.pending_snapshot_reports.remove(&row);
-                self.snapshot_reports_appended
-                    .fetch_add(1, Ordering::Relaxed);
-                if by_timeout {
-                    self.snapshot_reports_timed_out
-                        .fetch_add(1, Ordering::Relaxed);
-                }
+            // Every reporter has since left the config: there is nothing left
+            // to attest with, and an empty record is not even encodable.
+            if hashes.is_empty() {
                 crate::obs_event!(
                     Info,
-                    "snapshot_report_appended",
+                    "snapshot_report_dropped",
                     node = self.id as u64,
                     row = row as u64,
                     position = position,
-                    frame_end = end,
-                    reporters = reporters,
-                    voters_reporting = voters_reporting as u64,
-                    quorum = quorum as u64,
-                    by = if by_timeout { "timeout" } else { "quorum" }
+                    reason = "no_members"
                 );
-                true
+                self.pending_snapshot_reports.remove(&row);
+                continue;
             }
-            // WouldOverrun (or the unreachable PayloadTooLarge — the record is
-            // at most 112 bytes): nothing was appended, so the entry stands
-            // and the next pass tries again.
-            Err(_) => false,
+            // The row's committed report can have MOVED since the entry was
+            // made (a previous leader's record committing under us), in which
+            // case this one says nothing newer. Dropped rather than appended:
+            // the append would be refused at apply as stale, having cost the
+            // log a frame.
+            if position <= self.held_report_position(row) {
+                crate::obs_event!(
+                    Info,
+                    "snapshot_report_dropped",
+                    node = self.id as u64,
+                    row = row as u64,
+                    position = position,
+                    reason = "stale"
+                );
+                self.pending_snapshot_reports.remove(&row);
+                continue;
+            }
+            let reporters = hashes.len() as u64;
+            // Encodable by construction: non-empty (just checked), at most one
+            // entry per CURRENT member and therefore at most `MAX_MEMBERS` (the
+            // filter above), strictly increasing by node id (the `BTreeMap`'s
+            // order, which the filter preserves), `row < CNC_MAX_SERVICES` and
+            // a non-zero position — the last two are `on_snap_report`'s door.
+            let cmd = ClusterCommand::SnapshotReport(SnapshotReport {
+                row,
+                position,
+                hashes,
+            });
+            return match self.append_cluster_frame(&cmd) {
+                Ok(end) => {
+                    let by_timeout = voters_reporting < quorum;
+                    self.pending_snapshot_reports.remove(&row);
+                    self.snapshot_reports_appended
+                        .fetch_add(1, Ordering::Relaxed);
+                    if by_timeout {
+                        self.snapshot_reports_timed_out
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    crate::obs_event!(
+                        Info,
+                        "snapshot_report_appended",
+                        node = self.id as u64,
+                        row = row as u64,
+                        position = position,
+                        frame_end = end,
+                        reporters = reporters,
+                        voters_reporting = voters_reporting as u64,
+                        quorum = quorum as u64,
+                        by = if by_timeout { "timeout" } else { "quorum" }
+                    );
+                    true
+                }
+                // WouldOverrun (or the unreachable PayloadTooLarge — the record
+                // is at most 112 bytes): nothing was appended, so the entry
+                // stands and the next pass tries again. The walk stops rather
+                // than trying another row: the buffer is full for all of them.
+                Err(_) => false,
+            };
         }
+        false
     }
 
     /// Spec §5.3 (Ruling P1): the node-owned, **delete-only** retention
@@ -13024,6 +13083,203 @@ mod tests {
         assert_eq!(state.report_for(1).map(|r| r.position), Some(p));
         assert!(h.cons.pending_snapshot_reports.is_empty());
         assert_eq!(h.cons.snapshot_reports_appended.load(Ordering::Relaxed), 2);
+    }
+
+    /// [`adopt_config_change`] without the duty cycle it ends with. A test
+    /// that already holds a ready collection cannot afford a pass here — the
+    /// pass would append it, which is precisely the state these tests are
+    /// trying to set up.
+    fn adopt_config_no_pass(h: &mut Harness, op: ConfigOp) {
+        let next = h
+            .cons
+            .sm
+            .config()
+            .apply(op)
+            .expect("a valid membership change");
+        h.cons.feed(Event::ConfigObserved {
+            position: h.cons.cnc.counters().append.load_acquire(),
+            config: next,
+        });
+    }
+
+    /// A member id for a learner added by these tests.
+    fn member_addr(id: u32) -> (u32, u16) {
+        addr_to_pair(format!("127.0.0.1:{}", 9200 + id).parse().unwrap())
+    }
+
+    /// The review's Important finding. `MAX_MEMBERS` bounds voters plus
+    /// learners at ONE instant; the pending map is not one instant. A remove
+    /// and an add inside a pending window leave NINE ids in it, and nine ids
+    /// are not encodable — `ClusterFsm::encode_command` would take an
+    /// `expect` on the consensus agent. Filtering the payload against the
+    /// config at APPEND time is what makes that unreachable, and it is the
+    /// same filter that keeps an ex-member's hash out of a record `verdict`
+    /// reads without any membership filter of its own.
+    #[test]
+    fn the_append_filters_the_payload_against_the_current_config() {
+        let mut h = harness_with_rows(&["a"]);
+        drive_to_serving_leader(&mut h);
+        for id in 3..=7u32 {
+            adopt_config_no_pass(
+                &mut h,
+                ConfigOp::AddLearner {
+                    id,
+                    addr: member_addr(id),
+                },
+            );
+        }
+        let cfg = h.cons.sm.config();
+        assert_eq!(
+            cfg.voters.len() + cfg.learners.len(),
+            8,
+            "precondition: the config is at MAX_MEMBERS"
+        );
+
+        h.cons.pass_mono_ns = 1_000;
+        let p = 6048u64;
+        for id in 0..=7u32 {
+            h.cons.on_snap_report(id, 0, p, 0x100 + id as u64);
+        }
+        assert_eq!(h.cons.pending_snapshot_reports[&0].hashes.len(), 8);
+
+        // One removed, one added: still eight MEMBERS, but the pending entry
+        // — which outlives the config that admitted its ids — now holds nine.
+        adopt_config_no_pass(&mut h, ConfigOp::RemoveLearner { id: 3 });
+        adopt_config_no_pass(
+            &mut h,
+            ConfigOp::AddLearner {
+                id: 8,
+                addr: member_addr(8),
+            },
+        );
+        h.cons.on_snap_report(8, 0, p, 0x108);
+        assert_eq!(
+            h.cons.pending_snapshot_reports[&0].hashes.len(),
+            9,
+            "the map itself is NOT bounded by MAX_MEMBERS — that is the finding"
+        );
+
+        assert!(
+            h.cons.maybe_append_snapshot_reports(),
+            "and it does not panic"
+        );
+        let end = h.cons.last_cluster_append;
+        h.commit_through(end);
+        let state = h.cons.cluster_view.to_state();
+        let rec = state.report_for(0).expect("the record went in");
+        assert_eq!(rec.hashes.len(), 8, "filtered to the current membership");
+        assert!(
+            !rec.hashes.iter().any(|(id, _)| *id == 3),
+            "an ex-member's hash is not evidence about this cluster — and `verdict` \
+             has no membership filter to drop it later"
+        );
+        assert!(
+            rec.hashes.iter().any(|(id, _)| *id == 8),
+            "the node added inside the window is a member and its hash counts"
+        );
+    }
+
+    /// The other end of the same filter: every reporter left the config, so
+    /// there is nothing left to attest with and the record would not even
+    /// encode. Dropped and said out loud, rather than appended or held.
+    #[test]
+    fn an_entry_the_membership_filter_empties_is_dropped_not_appended() {
+        let _obs = obs_capture_lock();
+        let mut h = harness_with_rows(&["a"]);
+        drive_to_serving_leader(&mut h);
+        adopt_config_no_pass(
+            &mut h,
+            ConfigOp::AddLearner {
+                id: 3,
+                addr: member_addr(3),
+            },
+        );
+        h.cons.pass_mono_ns = 1_000;
+        let p = 6048u64;
+        h.cons.on_snap_report(3, 0, p, 0x33); // the only reporter, a learner
+        adopt_config_no_pass(&mut h, ConfigOp::RemoveLearner { id: 3 });
+
+        assert!(
+            !h.cons.maybe_append_snapshot_reports(),
+            "no voter reported, so it is not ready yet — it waits out the timeout"
+        );
+        h.cons.pass_mono_ns += SNAP_REPORT_TIMEOUT_NS;
+        let buf = crate::obs::log::capture_for_tests();
+        assert!(
+            !h.cons.maybe_append_snapshot_reports(),
+            "ready, but there is nothing left to attest with"
+        );
+        let text = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        crate::obs::log::stderr_for_tests();
+
+        assert!(
+            h.cons.pending_snapshot_reports.is_empty(),
+            "the dead entry is dropped, not carried forever"
+        );
+        assert_eq!(h.cons.snapshot_reports_appended.load(Ordering::Relaxed), 0);
+        assert_eq!(h.cons.cluster_view.to_state().report_for(0), None);
+        assert!(
+            text.contains(r#""event":"snapshot_report_dropped""#)
+                && text.contains(r#""reason":"no_members""#),
+            "the drop is recorded with its reason: {text}"
+        );
+    }
+
+    /// A row dropped at the append site costs the PASS nothing: nothing was
+    /// appended, so the single-in-flight gate is still open and the next ready
+    /// row goes in the same pass. (Returning instead would have let one stale
+    /// row delay every other row by a pass, silently.)
+    #[test]
+    fn a_stale_row_is_dropped_with_a_reason_and_the_next_row_still_lands() {
+        let _obs = obs_capture_lock();
+        let mut h = harness_with_rows(&["a", "b"]);
+        drive_to_serving_leader(&mut h);
+        h.cons.pass_mono_ns = 1_000;
+        let p = 6048u64;
+        for row in [0u8, 1] {
+            h.cons.on_snap_report(0, row, p, 0x44);
+            h.cons.on_snap_report(1, row, p, 0x44);
+        }
+
+        // A record for row 0 at the same instant commits under us — what a
+        // previous leader's in-flight append looks like from here.
+        let end = h
+            .cons
+            .append_cluster_frame(&ClusterCommand::SnapshotReport(SnapshotReport {
+                row: 0,
+                position: p,
+                hashes: vec![(2, 0x44)],
+            }))
+            .expect("the record append");
+        h.commit_through(end);
+
+        let buf = crate::obs::log::capture_for_tests();
+        assert!(
+            h.cons.maybe_append_snapshot_reports(),
+            "row 0 is stale, but row 1 still lands in this pass"
+        );
+        let text = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        crate::obs::log::stderr_for_tests();
+
+        assert!(
+            h.cons.pending_snapshot_reports.is_empty(),
+            "both rows resolved"
+        );
+        assert_eq!(h.cons.snapshot_reports_appended.load(Ordering::Relaxed), 1);
+        assert!(
+            text.contains(r#""event":"snapshot_report_dropped""#)
+                && text.contains(r#""reason":"stale""#),
+            "the stale drop is recorded rather than silent: {text}"
+        );
+        let end = h.cons.last_cluster_append;
+        h.commit_through(end);
+        let state = h.cons.cluster_view.to_state();
+        assert_eq!(state.report_for(1).map(|r| r.position), Some(p));
+        assert_eq!(
+            state.report_for(0).map(|r| r.hashes.clone()),
+            Some(vec![(2, 0x44)]),
+            "row 0 still holds the record that superseded the pending set"
+        );
     }
 
     /// The collector runs on the ordinary leader pass — nothing else calls it,
