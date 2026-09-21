@@ -11151,6 +11151,26 @@ mod tests {
         harness_with_crypto(None, &[])
     }
 
+    /// The obs-log sink is PROCESS-GLOBAL: `capture_for_tests` swaps it and
+    /// `stderr_for_tests` swaps it back, so two tests capturing at once steal
+    /// each other's records — whichever reads second finds an empty buffer
+    /// and fails with nothing in it to explain why (the documented
+    /// `a_joining_learner_needs_one_proven_voter_not_a_majority` flake).
+    /// Every capturing test in this module takes this lock for the whole
+    /// capture window, which is the serialization the flake ledger names.
+    static OBS_CAPTURE_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Take [`OBS_CAPTURE_LOCK`] for the rest of the test — `let _obs =
+    /// obs_capture_lock();` as the FIRST statement of any test that calls
+    /// `capture_for_tests`. Once per test, never once per capture: a test
+    /// that captures twice would deadlock on the second take (a `Mutex` is
+    /// not reentrant). A previous capturing test that panicked inside its
+    /// window poisons the lock; that is not a reason to fail every later
+    /// test, so the poison is stepped over.
+    fn obs_capture_lock() -> std::sync::MutexGuard<'static, ()> {
+        OBS_CAPTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// As [`harness`], but with the cluster FSM's GENESIS settings seeded from
     /// `[settings]` in `node.toml` — the thing `NodeConfig::settings_genesis`
     /// carries. The default is `Settings::genesis_default()` (every field
@@ -13510,6 +13530,7 @@ mod tests {
     /// survivor and serves within a probe round.
     #[test]
     fn silence_holds_the_join_gate_until_a_quorum_of_voters_proves_the_rung() {
+        let _obs = obs_capture_lock();
         let mut h = harness();
         drive_to_serving_leader(&mut h);
         let peers = mtu_peers(&h);
@@ -13854,6 +13875,7 @@ mod tests {
     /// pending flag (which masks `/readyz`) are.
     #[test]
     fn a_joining_learner_needs_one_proven_voter_not_a_majority() {
+        let _obs = obs_capture_lock();
         let mut h = harness();
         drive_to_serving_leader(&mut h);
         adopt_config_change(&mut h, ConfigOp::DemoteVoter { id: 1 });
@@ -13948,6 +13970,7 @@ mod tests {
     /// for the record's SHAPE.
     #[test]
     fn a_holding_join_gate_says_so_on_a_slow_cadence() {
+        let _obs = obs_capture_lock();
         let mut h = harness();
         drive_to_serving_leader(&mut h);
         let peers = mtu_peers(&h);
@@ -14045,6 +14068,7 @@ mod tests {
     /// the gate holds until a voter proves it.
     #[test]
     fn a_learner_peers_proof_does_not_count_toward_the_quorum() {
+        let _obs = obs_capture_lock();
         let mut h = harness();
         drive_to_serving_leader(&mut h);
         let addr7: SocketAddr = "127.0.0.1:9107".parse().unwrap();
