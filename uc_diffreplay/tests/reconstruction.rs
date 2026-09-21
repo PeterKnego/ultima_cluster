@@ -17,6 +17,9 @@
 //!   — UC's OWN reconstruction path (`uc_service::replay`'s gap guard) with
 //!   an in-process node: swap `RegisterSm` for `DoublingRegisterSm` on a live
 //!   instance dir and read the register back.
+//! * [`a_real_pin_makes_the_default_purge_off_swap_install_the_origin`] — the
+//!   same swap under a real `uc2ctl upgrade pin`: the origin is installed and
+//!   the row carries v1's true history, which is the whole point of the pin.
 //!
 //! [`a_real_divergence_is_detected_and_attributed`] closes the loop the other
 //! way: the diff → attribute → confirm chain over a divergence that is really
@@ -31,8 +34,8 @@ use std::time::Duration;
 
 use uc_client::Client;
 use uc_lincheck::register::{Cmd, CmdResp, DoublingRegisterSm, RegisterSm};
-use uc_log::cnc::CncPage;
-use uc_service::{ServiceBuilder, ServiceConfig};
+use uc_log::cnc::{CncPage, PinRead};
+use uc_service::{ServiceBuilder, ServiceConfig, StateMachine};
 
 use common::{register_replay_bin, wait_for};
 use uc_diffreplay::attribute::{Attribution, Declaration, attribute};
@@ -286,16 +289,30 @@ const MODULUS: u64 = 5;
 /// v1's register at P, and the value the artifact carries.
 const LAST_WRITE: u64 = (WRITES - 1) % MODULUS;
 
+/// `RegisterSm` takes the trait's default `VERSION`; `DoublingRegisterSm`
+/// declares 2. Read from the types rather than written as literals, so a
+/// change to either is a compile-time relocation and not a silently wrong
+/// pin.
+const V1: u32 = <RegisterSm as StateMachine>::VERSION;
+const V2: u32 = <DoublingRegisterSm as StateMachine>::VERSION;
+
 /// v1 (`RegisterSm`) writes, takes a coordinated instant at **P**, and stops.
 /// Then v2 (`DoublingRegisterSm`, same row name, `Write(v)` stores `2·v`)
 /// attaches to the SAME instance dir behind the SAME running node, and the
 /// register is read back once it has caught up to P.
 ///
-/// `purge` is the whole experiment: with [`uc_node::PurgePolicy::Disabled`]
-/// the journal still holds `[0, P)` and the gap guard never fires, so v2
-/// replays from genesis; with `BelowSnapshot` the prefix below P is gone, the
-/// gap guard installs v1's artifact at P, and v2 carries the true history.
-fn v2_after_swap(purge: uc_node::PurgePolicy, app_id: &str) -> Option<u64> {
+/// Two knobs, and between them they name every path §2.3 talks about:
+///
+/// * `purge` — with [`uc_node::PurgePolicy::Disabled`] (the shipped default)
+///   the journal still holds `[0, P)` and the gap guard never fires, so an
+///   unpinned v2 replays from genesis and computes the counterfactual; with
+///   `BelowSnapshot` the prefix below P is gone and the gap guard needs a
+///   covering artifact.
+/// * `pinned` — a real `uc2ctl upgrade pin` (admin op 10, through the cnc
+///   admin band and the cluster FSM) between the two eras. The pinned attach
+///   installs v1's artifact at P unconditionally, so v2 carries v1's true
+///   history instead of recomputing it.
+fn v2_after_swap(purge: uc_node::PurgePolicy, pinned: bool, app_id: &str) -> Option<u64> {
     let inst = common::tempdir();
     let dir = inst.path();
     let purging = !matches!(purge, uc_node::PurgePolicy::Disabled);
@@ -379,6 +396,53 @@ fn v2_after_swap(purge: uc_node::PurgePolicy, app_id: &str) -> Option<u64> {
         p
     }; // client shuts down, then the v1 service stops — the node keeps running.
 
+    let cnc = CncPage::open_file(&dir.join("cnc2.dat"), app_id).unwrap();
+
+    // --- the operator's pin, between the two eras (spec §3 S4 step 2) ---
+    if pinned {
+        common::pin_row(dir, &cnc, 0, V1, V2, p);
+        // The pin is cluster data: it reaches this row's slot words only once
+        // the `uc2-cluster` agent has APPLIED the command at commit and
+        // republished its view. Attaching before that would read `NoPin` and
+        // prove nothing.
+        assert!(
+            wait_for(
+                || cnc.service_slot(0).status.pin()
+                    == PinRead::Pinned {
+                        origin: p,
+                        from: V1,
+                        to: V2,
+                    },
+                REATTACH_TIMEOUT
+            ),
+            "the pin never reached row 0's slot words: {:?}",
+            cnc.service_slot(0).status.pin()
+        );
+        // And the pin is a one-way door: the version it names is the only one
+        // that may serve this row from here on, so v1's own re-attach — the
+        // operator's rollback reflex — is refused BY NAME rather than
+        // silently carrying on.
+        let err = ServiceBuilder::new(
+            ServiceConfig::new(dir.to_path_buf(), app_id.to_string()),
+            RegisterSm::default(),
+        )
+        .start_with_snapshots()
+        .err()
+        .expect("a pinned row must refuse the old binary");
+        assert!(
+            matches!(
+                err,
+                uc_service::ServiceError::PinnedVersionMismatch {
+                    row: 0,
+                    pinned: V2,
+                    mine: V1,
+                    ..
+                }
+            ),
+            "{err}"
+        );
+    }
+
     // --- flag day: swap the service binary against the same instance dir ---
     let svc2 = Stop::new(
         ServiceBuilder::new(
@@ -394,7 +458,6 @@ fn v2_after_swap(purge: uc_node::PurgePolicy, app_id: &str) -> Option<u64> {
     // every replay pass. `attach` reset it to 0 before `start_with_snapshots`
     // returned and v1 is stopped, so only v2 can raise it. (No sleep: a sleep
     // would be a guess at how long a journal walk takes.)
-    let cnc = CncPage::open_file(&dir.join("cnc2.dat"), app_id).unwrap();
     let caught_up = wait_for(
         || cnc.service_slot(0).applied.load_acquire() >= p,
         REATTACH_TIMEOUT,
@@ -413,11 +476,12 @@ fn v2_after_swap(purge: uc_node::PurgePolicy, app_id: &str) -> Option<u64> {
 fn real_attach_genesis_replay_computes_the_counterfactual_and_install_does_not() {
     // Purge disabled (the shipped default): the journal still covers `[0, P)`,
     // so v2 replays every old write through its own `apply` and doubles them.
-    let genesis = v2_after_swap(uc_node::PurgePolicy::Disabled, "ra1");
+    let genesis = v2_after_swap(uc_node::PurgePolicy::Disabled, false, "ra1");
     // Purge below the complete set: the prefix is gone, so v2's gap guard
     // installs v1's artifact at P — the true history, computed by v1.
     let installed = v2_after_swap(
         uc_node::PurgePolicy::BelowSnapshot { slack_bytes: 0 },
+        false,
         "ra2",
     );
 
@@ -437,5 +501,28 @@ fn real_attach_genesis_replay_computes_the_counterfactual_and_install_does_not()
     assert_ne!(
         genesis, installed,
         "§2.3: same binary, two paths, two states"
+    );
+}
+
+/// Spec §3 S4 end to end, through a REAL `uc2ctl upgrade pin`: the same
+/// purge-off swap that computes the counterfactual unpinned (plan A's
+/// finding, the first arm) installs v1's artifact at P once the cluster has
+/// pinned the row, and answers v1's true state `Some(4)`.
+///
+/// The pin goes in the way an operator's does — staged `upgrade.pending`,
+/// admin op 10, through the cluster FSM — and the arm also asserts the door
+/// it closes: v1's own re-attach after the pin is refused by name (inside
+/// [`v2_after_swap`], which is where the two eras meet).
+#[test]
+fn a_real_pin_makes_the_default_purge_off_swap_install_the_origin() {
+    assert_eq!(
+        v2_after_swap(uc_node::PurgePolicy::Disabled, false, "pin-off"),
+        Some(2 * LAST_WRITE),
+        "unpinned, the purge-off swap replays from genesis under v2's apply"
+    );
+    assert_eq!(
+        v2_after_swap(uc_node::PurgePolicy::Disabled, true, "pin-on"),
+        Some(LAST_WRITE),
+        "pinned, the SAME swap installs v1's artifact at P and carries its state"
     );
 }

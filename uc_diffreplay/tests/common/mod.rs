@@ -5,8 +5,11 @@ use std::time::{Duration, Instant};
 
 use uc_client::Client;
 use uc_lincheck::register::{Cmd, CmdResp, RegisterSm};
+use uc_log::cnc::{AdminReq, AdminResp, CncPage};
 use uc_net::fault::FaultConfig;
 use uc_node::{Node, NodeConfig};
+use uc_protocol::v2::cnc::ADMIN_OP_UPGRADE_PIN;
+use uc_protocol::v2::upgrade::{UpgradePin, encode_upgrade_pin};
 use uc_service::{ServiceBuilder, ServiceConfig, StateMachine};
 
 pub fn tempdir() -> tempfile::TempDir {
@@ -96,6 +99,106 @@ pub fn command_instant(node: &Node) -> u64 {
 
 pub fn register_name() -> &'static str {
     <RegisterSm as StateMachine>::NAME
+}
+
+/// `uc2ctl upgrade pin --row <row> --from <from> --to <to> --origin <origin>`
+/// in process (FSM upgrade lifecycle spec §2.5, plan B1): stage the 20-byte
+/// `UpgradePin` record at `<instance_dir>/upgrade.pending`, then submit admin
+/// op 10 with the staged file's digest in the `id`/`ip`/`port` fields —
+/// `uc_ctl::upgrade::pin`'s pipeline, minus the bin and minus the signature
+/// (these test nodes run the filesystem admin policy, so there is no auth
+/// line, exactly as `uc_node/tests/reconfig.rs`'s `admin_request` relies on).
+///
+/// Two of the node's three door checks are races against this fixture rather
+/// than errors in it: `pin_no_set` (54) compares `origin` against the node's
+/// NEWEST complete set, which the cluster agent publishes a moment after the
+/// row's own artifact appears, and status 2 is the ordinary
+/// single-in-flight retry. So a non-zero answer is retried until the
+/// deadline and only then asserted — a refusal that is really a refusal
+/// still fails the test, with its reason code.
+pub fn pin_row(dir: &Path, cnc: &CncPage, row: u8, from: u32, to: u32, origin: u64) -> AdminResp {
+    let mut bytes = Vec::new();
+    encode_upgrade_pin(
+        &UpgradePin {
+            row,
+            from,
+            to,
+            origin,
+        },
+        &mut bytes,
+    );
+    let (id, ip, port) = uc_node::staged_digest(&bytes);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        stage_upgrade_pin(dir, &bytes);
+        let resp = admin_request(cnc, ADMIN_OP_UPGRADE_PIN, id, ip, port);
+        if resp.status == 0 || Instant::now() >= deadline {
+            assert_eq!(
+                resp.status, 0,
+                "upgrade pin refused: status={} reason={}",
+                resp.status, resp.reason
+            );
+            return resp;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// `<instance_dir>/upgrade.pending`, written the way `uc2ctl` writes it:
+/// 0600, fsync'd, renamed into place, so the node reads a whole record or
+/// none of one.
+fn stage_upgrade_pin(dir: &Path, bytes: &[u8]) {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let pending = dir.join(uc_node::UPGRADE_PENDING_FILE);
+    let tmp = dir.join(format!("{}.tmp", uc_node::UPGRADE_PENDING_FILE));
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)
+            .unwrap();
+        f.write_all(bytes).unwrap();
+        f.sync_all().unwrap();
+    }
+    std::fs::rename(&tmp, &pending).unwrap();
+}
+
+/// The `uc2ctl` mutating-command flow, minus the bin —
+/// `uc_node/tests/reconfig.rs`'s `admin_request` verbatim: read the admin
+/// band's current seq, write a fresh request at `seq + 1`, poll the response
+/// line for the echoed seq.
+fn admin_request(cnc: &CncPage, op: u32, id: u32, ip: u32, port: u16) -> AdminResp {
+    let seq = cnc.read_admin_req(0).map(|r| r.seq).unwrap_or(0) + 1;
+    // The nonce is the anti-replay field of the SIGNED flow; with the
+    // filesystem policy nothing reads it, so a fresh wall-clock reading is
+    // enough to keep two requests in one run distinct without pulling `rand`
+    // into this crate's dev-dependencies.
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(seq);
+    cnc.write_admin_req(&AdminReq {
+        seq,
+        nonce,
+        op,
+        id,
+        ip,
+        port,
+    });
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if let Some(resp) = cnc.read_admin_resp(seq) {
+            return resp;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "admin response timed out for seq {seq}"
+        );
+        std::thread::yield_now();
+    }
 }
 
 /// Drive a single node with RegisterSm: N writes, an instant at P, M more
