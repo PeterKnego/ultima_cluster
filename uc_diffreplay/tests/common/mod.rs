@@ -67,33 +67,47 @@ pub fn pin_row(dir: &Path, cnc: &CncPage, row: u8, from: u32, to: u32, origin: u
     uc_diffreplay::live::pin_row(dir, cnc, row, from, to, origin, Duration::from_secs(30)).unwrap()
 }
 
-/// Drive a single node with RegisterSm: N writes, an instant at P, M more
-/// writes. Returns `(P, u64::MAX)` — `Node` has no "applied frontier"
-/// accessor in this plan's scope, so the end is left to the caller (the
-/// driver stops at the journal's last frame instead of naming Q precisely).
-pub fn build_register_history(dir: &std::path::Path, app_id: &str, n: u64, m: u64) -> (u64, u64) {
+/// Drive a single node with RegisterSm: `before`, a coordinated instant at
+/// P, `after`. Returns P — the position an exported corpus anchors on, and
+/// the artifact it installs from.
+///
+/// Both halves matter to a caller that exports `[P, …)`: only `after` lands
+/// inside that span, so a corpus whose replay must see a command needs it
+/// in `after`. `before` is what the artifact at P holds.
+pub fn build_register_history_with(dir: &Path, app_id: &str, before: &[Cmd], after: &[Cmd]) -> u64 {
+    // `start_single_node` already waits out `can_serve` (`live::start_node`),
+    // so the client below cannot race the election.
     let node = start_single_node(dir, app_id, register_name());
-    wait_until(|| node.can_serve());
     let cfg = ServiceConfig::new(dir.to_path_buf(), app_id.to_string());
     let svc = ServiceBuilder::new(cfg, RegisterSm::default())
         .start_with_snapshots()
         .unwrap();
     let client = Client::connect(dir, app_id).unwrap();
-    for v in 0..n {
-        let _: CmdResp = client.submit(&Cmd::Write(v)).unwrap();
+    for c in before {
+        let _: CmdResp = client.submit(c).unwrap();
     }
     let p = command_instant(&node);
     // The instant completes when the row's artifact appears.
-    let art = dir
-        .join("snapshots")
-        .join("0")
-        .join(format!("snap-{p}.ultsnap"));
+    let art = artifact_path(dir, 0, p);
     wait_until(|| art.is_file());
-    for v in n..n + m {
-        let _: CmdResp = client.submit(&Cmd::Write(v)).unwrap();
+    for c in after {
+        let _: CmdResp = client.submit(c).unwrap();
     }
     client.shutdown();
     svc.stop();
     node.stop();
-    (p, u64::MAX)
+    p
+}
+
+/// The all-writes special case: N writes, an instant at P, M more writes.
+/// Returns `(P, u64::MAX)` — `Node` has no "applied frontier" accessor in
+/// this plan's scope, so the end is left to the caller (the driver stops at
+/// the journal's last frame instead of naming Q precisely).
+pub fn build_register_history(dir: &std::path::Path, app_id: &str, n: u64, m: u64) -> (u64, u64) {
+    let before: Vec<Cmd> = (0..n).map(Cmd::Write).collect();
+    let after: Vec<Cmd> = (n..n + m).map(Cmd::Write).collect();
+    (
+        build_register_history_with(dir, app_id, &before, &after),
+        u64::MAX,
+    )
 }

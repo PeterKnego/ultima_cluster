@@ -490,6 +490,23 @@ mod sequence {
         }
         // The version the row is attached AT is the pin's `from`.
         r.from = cnc.service_slot(a.row as usize).status.version();
+        // Ruling R-C-1: a run whose OLD already IS `--to` cannot hold the
+        // refusal arm — the "stale" binary the arm re-starts is the pinned
+        // version, so it attaches and the run reports a FAIL that says
+        // nothing about the pin. Refuse it HERE, before a single command is
+        // submitted and before the pin is placed, rather than spending the
+        // whole sequence to produce a misleading verdict.
+        if r.from == a.to {
+            let _ = old.stop(a.timeout);
+            drop(node);
+            bail!(
+                "row {} already runs version {:#010x}, which --to also names; pin-verify needs a \
+                 version change (a same-version pin cannot hold the refusal arm: the \"stale\" \
+                 binary IS the pinned version)",
+                a.row,
+                r.from
+            );
+        }
         live::replay_span(&frames, &dir, &a.app_id, a.row, 0..split, a.timeout)?;
 
         // ---- S4 step 1: the instant at P ----
