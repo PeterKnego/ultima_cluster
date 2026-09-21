@@ -34,9 +34,11 @@ prints the SM's canonical projection to stdout. Both exit non-zero on
 failure; `uc2-diffreplay` treats a non-zero exit from `replay` as a hard
 error (spawn/replay failure), not a divergence.
 
-The third is the **serve** form, which `pin-verify` runs and every service
-binary in the tree already has — `examples/kv`, `examples/counter` and
-`uc_crashtest-service` all meet it:
+The third is the **serve** form, which `pin-verify` runs and the service
+binaries in the tree already have — `examples/kv`, `examples/counter` and
+`register-replay serve` all meet it (`uc_crashtest-service` does not register
+a SIGTERM handler, so a clean stop of it dies by signal rather than exiting
+0; it is a crash-test half, not a template):
 
     <bin> <serve argv…> --instance-dir D --app-id A
 
@@ -158,9 +160,9 @@ and hard-assert they exist, so build them first:
 
     cargo test -p uc_diffreplay -p uc_service -p uc_lincheck -p kv_store
 
-`tests/pin_verify.rs` is the heaviest of them: each case runs a real node, a
-real service process per era and three further runs of the app binary (one
-`project`, two `replay`), so it needs
+`tests/pin_verify.rs` is the heaviest of them: every case runs a real node
+and a real service process per era, and the cases that reach the swap arm
+run the app binary three more times (one `project`, two `replay`), so it needs
 the `register-replay` fixture built above and runs best on its own —
 
     cargo test -p uc_diffreplay --test pin_verify -- --test-threads=1

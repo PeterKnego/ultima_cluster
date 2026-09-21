@@ -372,9 +372,11 @@ configuration, not just the purging one above.
 into the test process. `uc2-diffreplay pin-verify` (spec §6.2 part 2) instead
 runs the app's real binaries as child processes against a real node and
 judges what UC's own surfaces say, and this suite is five end-to-end cases of
-it on the `register-replay` fixture — each one a node, a service process per
-era, a real admin `upgrade pin`, and three further runs of the app binary
-(one `project`, two `replay`). What they prove: the stale binary is
+it on the `register-replay` fixture — a node, a service process per era and,
+in the cases that get that far, a real admin `upgrade pin` and three further
+runs of the app binary (one `project`, two `replay`); the same-version case
+is refused before the pin, and the stale-NEW case stops at the un-attached
+swap arm. What they prove: the stale binary is
 **refused by name** after the pin (a non-zero
 exit whose stderr carries `ServiceError::PinnedVersionMismatch`'s own
 phrase, pinned to the Display by

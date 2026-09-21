@@ -149,8 +149,8 @@ position 0).
 
 | verdict | when | exit |
 |---|---|---|
-| **PASS** | the refusal arm held, `live == artifact`, and `artifact != genesis` | 0 |
-| **INCONCLUSIVE** | the refusal arm held and `live == artifact`, but `artifact == genesis` | 0 |
+| **PASS** | the refusal arm held, NEW attached as `--to`, `live == artifact`, and `artifact != genesis` | 0 |
+| **INCONCLUSIVE** | the refusal arm held, NEW attached as `--to`, and `live == artifact`, but `artifact == genesis` | 0 |
 | **FAIL** | anything else, including a comparison that never happened | 1 |
 
 INCONCLUSIVE is an honest outcome, not a failure: everything held, but the

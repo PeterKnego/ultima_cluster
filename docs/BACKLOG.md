@@ -443,8 +443,7 @@ reviewer wants a workload to attack.
   on hardest: "confirm the pin is visible on EVERY node before you stop
   anything". A multi-node rig would let the mode judge a pin that has
   committed on some nodes and not others, and a learner arm would cover the
-  row shape that declares but never serves. Recorded 2026-09-21 as erratum 3
-  of the FSM upgrade lifecycle spec's "Errata (plan C, as built)" and in
+  row shape that declares but never serves. Recorded 2026-09-21 in
   `docs/VERIFICATION.md` § "What `pin_verify.rs` does NOT verify".
 - **A spurious `service_detached` record right after every attach.**
   `uc_node::node`'s `note_service_transitions` (~`uc_node/src/node.rs:4738`)
