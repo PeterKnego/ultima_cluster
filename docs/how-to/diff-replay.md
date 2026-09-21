@@ -183,10 +183,10 @@ pinned one.
 `verdict` is the same word in both, `PASS` / `INCONCLUSIVE` / `FAIL`) names
 each phase: `origin` is P, `frontier` is **X — the position OLD had applied
 to when it was stopped**, which is what makes a *durable* state machine
-attach above the origin; `end` is Q. Two fields carry the arms. `refusal
-.matched` is the stale binary's own words — an exit alone could be any
-startup failure, so the arm holds only when it also said why. `swap
-.install_logged` is NEW's: the SDK prints `pinned install of snap-P` once
+attach above the origin; `end` is Q. Two fields carry the arms.
+`refusal.matched` is the stale binary's own words — an exit alone could be
+any startup failure, so the arm holds only when it also said why.
+`swap.install_logged` is NEW's: the SDK prints `pinned install of snap-P` once
 the pinned install has run, and **that line is what makes the rewind
 observable**, not the fact that OLD was stopped above P. Without it a
 durable state machine that quietly kept the state it had persisted would

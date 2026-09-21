@@ -1074,7 +1074,7 @@ different dependencies:
 
 #### Errata (plan C, as built)
 
-Eight places execution diverged from the two-part statement above, or filled
+Nine places execution diverged from the two-part statement above, or filled
 in a detail it left open. Read them BEFORE the body: part 2 is
 `uc2-diffreplay pin-verify` (`docs/how-to/diff-replay.md` § "Verify the pin
 live"), and three of these change what the mode can be asked to do at all

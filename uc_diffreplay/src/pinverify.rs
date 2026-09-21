@@ -486,9 +486,12 @@ mod sequence {
     /// is consumed by `stop`, which is why this takes the path the run
     /// handed `spawn_app` rather than the process.)
     fn said_it_installed(stderr_path: &Path, origin: u64) -> bool {
+        // The SDK's line continues " (from …" right after the origin
+        // (`uc_service/src/attach.rs`), so matching the space too keeps
+        // `snap-4096` from matching `snap-40960`.
         std::fs::read_to_string(stderr_path)
             .unwrap_or_default()
-            .contains(&format!("{INSTALL_MARKER_PREFIX}{origin}"))
+            .contains(&format!("{INSTALL_MARKER_PREFIX}{origin} "))
     }
 
     /// A bounded wait's outcome as a sentence, for a note.
