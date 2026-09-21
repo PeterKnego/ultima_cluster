@@ -240,13 +240,22 @@ pub(crate) fn replay_into<S: RawStateMachine>(
                 // bytes verbatim under `snapshots/<row>/`, so the artifact a
                 // snapshot session produced carries the shipper's envelope and
                 // is checked by this same line.
-                // `None` for now: the version cross-check is Task 3/4's; this
-                // task only carries the envelope's shape to 24 bytes.
-                let _env = crate::snapshots::verify_snapshot_envelope(&mut file, s_pos, None)
-                    .map_err(|e| ServiceError::MistaggedSnapshot {
-                        path: path.display().to_string(),
-                        source: e,
-                    })?;
+                // Plan B2 T3: an UNPINNED install must be same-version. A
+                // newer binary installing an older artifact and tail-replaying
+                // it under its own `apply` is the §2.3 counterfactual — the
+                // covering artifact was built by SOME earlier `S::VERSION`,
+                // and this incarnation's `apply` may have genuinely different
+                // semantics for the same recorded command (spec §2.3's worked
+                // example: `Write(v)` meaning `v` under one build and `2·v`
+                // under another). The pinned path (`attach`) is the sanctioned
+                // way across a version boundary and checks against the pin's
+                // `from` instead of `S::VERSION` (Task 4).
+                let env =
+                    crate::snapshots::verify_snapshot_envelope(&mut file, s_pos, Some(S::VERSION))
+                        .map_err(|e| ServiceError::MistaggedSnapshot {
+                            path: path.display().to_string(),
+                            source: e,
+                        })?;
                 let installed = (r.install)(&mut guard, s_pos, &mut file)
                     .map_err(|e| ServiceError::Replay(format!("snapshot install: {e}")))?;
                 // A self-check on the TRAIT contract ("returns the post-install
@@ -254,6 +263,10 @@ pub(crate) fn replay_into<S: RawStateMachine>(
                 // the mis-tag guarantee is the envelope check above, which is
                 // the framework's and cannot be weakened by an SM.
                 debug_assert_eq!(installed, s_pos, "install must land at the artifact's tag");
+                eprintln!(
+                    "uc_service: row {} installed snap-{s_pos} (built by version {:#010x})",
+                    instant.service_id, env.version
+                );
                 // The SM is now at `installed`; tail replay continues from there.
                 // (`installed >= first`, so the journal's retained tail is a
                 // contiguous continuation — no hole.)

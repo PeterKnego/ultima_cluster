@@ -65,7 +65,16 @@ pub enum ServiceError {
     /// installed under a newer tag would leave every frame between the two
     /// positions unapplied — a silent state gap, the class
     /// [`SnapshotRequired`](Self::SnapshotRequired) exists to fail-stop on.
-    /// Refuse by name instead.
+    /// Refuse by name instead. Plan B2 T3: also the artifact's `S::VERSION`
+    /// cross-check — an UNPINNED install (the reconstruction gap guard,
+    /// `replay.rs`) requires the artifact to have been built by THIS
+    /// incarnation's own `S::VERSION`; a pinned install (`attach`, Task 4)
+    /// requires it to match the pin's `from` instead. Either mismatch is this
+    /// same variant, with an [`EnvelopeError::VersionMismatch`
+    /// ](crate::snapshots::EnvelopeError::VersionMismatch) source — the §2.3
+    /// counterfactual (a newer binary silently installing and tail-replaying
+    /// an older artifact under its own, possibly different, `apply`) refused
+    /// by name rather than "succeeding".
     #[error("MistaggedSnapshot: {path}: {source}")]
     MistaggedSnapshot {
         path: String,
