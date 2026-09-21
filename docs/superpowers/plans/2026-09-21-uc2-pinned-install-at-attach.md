@@ -451,7 +451,7 @@ Expected: the service installs the v1 artifact and the assertion on the poison f
                 crate::obs_event!(Info, "snapshot_installed", row = ..., position = s_pos, version = env.version as u64);
 ```
 
-(Use whatever event macro/level `uc_service` already uses for its structured events — grep `obs_event!` in the crate; if it has none, use the crate's existing `eprintln!`-style reporting for reconstruction milestones and say so.) Extend the comment: "Plan B2: an UNPINNED install must be same-version. A newer binary installing an older artifact and tail-replaying under its own `apply` is the §2.3 counterfactual; the pinned path (`attach`) is the sanctioned way across a version boundary and checks against the pin's `from` instead." Update `MistaggedSnapshot`'s doc in `config.rs` to name the version case.
+(`uc_service` does NOT depend on `uc_obs` and has no `obs_event!`; its reconstruction milestones are reported with the `eprintln!("uc_service: …")` style `apply.rs:121,432,698` use. Use that style here — `uc_service: row {row} installed snap-{pos} (built by version {version:#010x})` — and the same in Task 4. Adding `uc_obs` to `uc_service` is out of scope; note it in the report as a follow-on.) Extend the comment: "Plan B2: an UNPINNED install must be same-version. A newer binary installing an older artifact and tail-replaying under its own `apply` is the §2.3 counterfactual; the pinned path (`attach`) is the sanctioned way across a version boundary and checks against the pin's `from` instead." Update `MistaggedSnapshot`'s doc in `config.rs` to name the version case.
 
 - [ ] **Step 4: Run the tests**
 
@@ -554,7 +554,7 @@ fn a_contended_pin_read_is_refused_not_ignored() {
 }
 ```
 
-For the third test, read `uc_service/src/lib.rs`'s `Service::stop` to see whether the SM comes back; if it does not, build the durable shape the way the sketch's second alternative says. For the last test, the in-flight helper must be reachable from an integration test: make `store_pin_begin_for_test` `pub` + `#[doc(hidden)]` (the pattern `take_sched_records_for_test` used), NOT `#[cfg(test)]`. `query_reg2` is `query_reg` for the doubling type.
+For the third test: `Service::stop(self)` (`uc_service/src/lib.rs:514`) returns nothing, so the SM does NOT come back — build the durable shape the second way: construct a `DoublingRegisterSm`, drive it in-process to a `last_applied()` strictly above P (the simplest driver is `uc_diffreplay::drive::drive` over a corpus exported from the instance dir, or a hand walk of the journal with `uc_journal::TailReader` applying `Write` frames through `RawStateMachine::apply` with a fresh `ApplyCtx` per frame — `uc_diffreplay/src/drive.rs` shows the walk), assert its `last_applied() > Some(p)` before the attach, then hand THAT instance to `ServiceBuilder::new(..)`. For the last test, the in-flight helper must be reachable from an integration test: make `store_pin_begin_for_test` `pub` + `#[doc(hidden)]` (the pattern `take_sched_records_for_test` used), NOT `#[cfg(test)]`. `query_reg2` is `query_reg` for the doubling type.
 
 - [ ] **Step 2: Run to verify they fail**
 
@@ -675,7 +675,7 @@ git commit -m "uc_diffreplay: end-to-end — a real upgrade pin makes the purge-
 ### Task 6: The plan-A carries — sched accessor, `ids()` call count, `on_committed` recorder
 
 **Files:**
-- Modify: `uc_service/src/traits.rs` (`take_sched_records` public; `ids_calls`), `uc_service/tests/timed.rs:107,117`, `uc_diffreplay/src/drive.rs` (`sched_of`; `ids_calls`; `DriveOptions` with an output handler), `uc_diffreplay/src/trace.rs` (`Entry.ids_calls: u32`, `Entry.output: Option<String>`), `uc_diffreplay/src/diff.rs` (surfaces `ids` and `output`), `uc_diffreplay/Cargo.toml` (`tokio` with `rt` if not already transitively enabled), `uc_diffreplay/README.md` + `docs/how-to/diff-replay.md` ("What this does not compare" shrinks)
+- Modify: `uc_service/src/traits.rs` (`take_sched_records` public; `ids_calls`), `uc_service/tests/timed.rs:107,117`, `uc_diffreplay/src/drive.rs` (`sched_of`; `ids_calls`; `DriveOptions` with an output handler), `uc_diffreplay/src/trace.rs` (`Entry.ids_calls: u32`, `Entry.output: Option<String>`), `uc_diffreplay/src/diff.rs` (surfaces `ids` and `output`), `uc_diffreplay/Cargo.toml` (add `tokio = { version = "1", default-features = false, features = ["rt"] }` — the crate has no tokio dependency today; `uc_service` pins the same shape with `["rt", "time"]`), `uc_diffreplay/README.md` + `docs/how-to/diff-replay.md` ("What this does not compare" shrinks)
 - Test: `uc_service` (traits unit tests), `uc_diffreplay/tests/drive.rs`, `diff_attribute_confirm.rs`
 
 **Interfaces:**
