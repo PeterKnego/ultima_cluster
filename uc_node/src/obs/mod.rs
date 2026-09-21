@@ -70,6 +70,15 @@ pub struct ObsSources {
     pub log_clock_smear_ns: Arc<AtomicU64>,
     /// Plan 2: `schedule apply` requests this node refused, for any reason.
     pub schedule_apply_refused: Arc<AtomicU64>,
+    /// Plan B3 (spec §6.5.2): live `SNAP_REPORT`s this node put on the wire
+    /// to the leader on a set-complete edge, and ones it dropped because it
+    /// knew of no leader to send them to. Both are FOLLOWER counters by
+    /// construction — a leader reports to its own collector in-process and
+    /// moves neither — so a `sent` that sits still on a follower whose
+    /// `uc2_snapshot_set_position` is advancing, or any sustained `unsent`,
+    /// is the reading that matters.
+    pub snapshot_reports_sent: Arc<AtomicU64>,
+    pub snapshot_reports_unsent: Arc<AtomicU64>,
     /// Cluster FSM (spec §9): the cluster FSM's published view — the SAME
     /// allocation the `uc2-cluster` agent publishes into. Two gauges are read
     /// straight off its atomics AT SCRAPE TIME (`uc2_cluster_fsm_position`
@@ -194,6 +203,8 @@ impl ObsSources {
             schedule_entries: Arc::new(AtomicU64::new(0)),
             log_clock_smear_ns: Arc::new(AtomicU64::new(0)),
             schedule_apply_refused: Arc::new(AtomicU64::new(0)),
+            snapshot_reports_sent: Arc::new(AtomicU64::new(0)),
+            snapshot_reports_unsent: Arc::new(AtomicU64::new(0)),
             cluster_view: Arc::new(crate::cluster_fsm::ClusterView::new(
                 &crate::cluster_fsm::ClusterState::genesis_empty(),
             )),

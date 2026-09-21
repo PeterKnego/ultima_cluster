@@ -88,6 +88,9 @@ pub const CONTRACT_SERIES: &[&str] = &[
     "uc2_settings_position",
     "uc2_schedule_entries",
     "uc2_schedule_apply_refused_total",
+    // FSM upgrade lifecycle (plan B3): the live snapshot-hash report path.
+    "uc2_snapshot_reports_sent_total",
+    "uc2_snapshot_reports_unsent_total",
     // FSM upgrade lifecycle (plan B1)
     "uc2_upgrade_pin_origin",
     "uc2_upgrade_pin_version",
@@ -864,6 +867,18 @@ fn push_service_families(out: &mut String, s: &ObsSources, commit: u64, now: u64
         "`uc2ctl schedule apply` requests this node refused (bad digest, missing or undecodable staged file, or an entry naming an undeclared FSM). Retries are NOT counted: neither the one a follower answers (the staged file is node-local, so the request is never forwarded) nor the one the leader answers while the previous cluster command is still above commit (single-in-flight).",
         s.schedule_apply_refused.load(Ordering::Relaxed),
     );
+    push_counter(
+        out,
+        "uc2_snapshot_reports_sent_total",
+        "Live SNAP_REPORT datagrams this node sent the leader on a set-complete edge — one per declared row that had published an artifact at the instant (FSM upgrade lifecycle spec §6.5.2). A LEADER hands its own rows' hashes straight to its collector without a datagram, so it exports 0 here; on a follower this climbs by the declared-row count once per completed instant.",
+        s.snapshot_reports_sent.load(Ordering::Relaxed),
+    );
+    push_counter(
+        out,
+        "uc2_snapshot_reports_unsent_total",
+        "Snapshot hash reports this node DROPPED because it knew of no leader to address (no leader hint, or a hint naming a member it cannot resolve — an election in progress). A brief run around a failover is expected; a sustained one means this node's hashes never reach the committed SnapshotReport record, and an upgrade pin adjudicated from it is missing a voter.",
+        s.snapshot_reports_unsent.load(Ordering::Relaxed),
+    );
     push_gauge(
         out,
         "uc_services_declared",
@@ -1629,6 +1644,8 @@ mod tests {
             schedule_entries: Arc::new(AtomicU64::new(0)),
             log_clock_smear_ns: Arc::new(AtomicU64::new(0)),
             schedule_apply_refused: Arc::new(AtomicU64::new(0)),
+            snapshot_reports_sent: Arc::new(AtomicU64::new(0)),
+            snapshot_reports_unsent: Arc::new(AtomicU64::new(0)),
             cluster_view: test_cluster_view(),
             probe: uc_net::probe::ProbeTable::new(uc_net::probe::ProbeCadence::default()),
             commands_over_standard: Arc::new(AtomicU64::new(0)),
@@ -1788,7 +1805,7 @@ mod tests {
     fn the_contract_has_the_number_of_families_the_docs_state() {
         assert_eq!(
             CONTRACT_SERIES.len(),
-            111,
+            113,
             "if this is intentional, update the family count in \
              docs/how-to/monitor-a-cluster.md in the same commit"
         );
@@ -2192,6 +2209,8 @@ mod tests {
             schedule_entries: Arc::new(AtomicU64::new(0)),
             log_clock_smear_ns: Arc::new(AtomicU64::new(0)),
             schedule_apply_refused: Arc::new(AtomicU64::new(0)),
+            snapshot_reports_sent: Arc::new(AtomicU64::new(0)),
+            snapshot_reports_unsent: Arc::new(AtomicU64::new(0)),
             cluster_view: test_cluster_view(),
             probe: uc_net::probe::ProbeTable::new(uc_net::probe::ProbeCadence::default()),
             commands_over_standard: Arc::new(AtomicU64::new(0)),
@@ -2295,6 +2314,8 @@ mod tests {
             schedule_entries: Arc::new(AtomicU64::new(0)),
             log_clock_smear_ns: Arc::new(AtomicU64::new(0)),
             schedule_apply_refused: Arc::new(AtomicU64::new(0)),
+            snapshot_reports_sent: Arc::new(AtomicU64::new(0)),
+            snapshot_reports_unsent: Arc::new(AtomicU64::new(0)),
             cluster_view: test_cluster_view(),
             probe: uc_net::probe::ProbeTable::new(uc_net::probe::ProbeCadence::default()),
             commands_over_standard: Arc::new(AtomicU64::new(0)),

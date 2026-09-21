@@ -75,12 +75,14 @@ use uc_protocol::v2::datagram::{
     CONFIG_PROPOSAL_BODY_LEN, CONFIG_REPLY_BODY_LEN, ConfigProposalBody, ConfigReplyBody,
     DATAGRAM_HEADER_LEN, DGRAM_KIND_COMMIT_POSITION, DGRAM_KIND_CONFIG_PROPOSAL,
     DGRAM_KIND_CONFIG_REPLY, DGRAM_KIND_READ_PROBE, DGRAM_KIND_READ_PROBE_ACK,
-    DGRAM_KIND_REQUEST_VOTE, DGRAM_KIND_TERM_MAP, DGRAM_KIND_VOTE, DatagramHeader, JUMBO_MIN_RUNG,
-    MAX_PAYLOAD_DEFAULT, MAX_TERM_MAP_WIRE_ENTRIES, MTU_DEFAULT, READ_PROBE_BODY_LEN,
-    REQUEST_VOTE_BODY_LEN, ReadProbeBody, RequestVoteBody, TERM_MAP_ENTRY_LEN, TERM_MAP_HEADER_LEN,
+    DGRAM_KIND_REQUEST_VOTE, DGRAM_KIND_SNAP_REPORT, DGRAM_KIND_TERM_MAP, DGRAM_KIND_VOTE,
+    DatagramHeader, JUMBO_MIN_RUNG, MAX_PAYLOAD_DEFAULT, MAX_TERM_MAP_WIRE_ENTRIES, MTU_DEFAULT,
+    READ_PROBE_BODY_LEN, REQUEST_VOTE_BODY_LEN, ReadProbeBody, RequestVoteBody,
+    SNAP_REPORT_BODY_LEN, SnapReportBody, TERM_MAP_ENTRY_LEN, TERM_MAP_HEADER_LEN,
     TermMapEntryWire, VOTE_BODY_LEN, VoteBody, is_rung, payload_ceiling,
     write_config_proposal_body, write_config_reply_body, write_datagram_header,
-    write_read_probe_body, write_request_vote_body, write_term_map_body, write_vote_body,
+    write_read_probe_body, write_request_vote_body, write_snap_report_body, write_term_map_body,
+    write_vote_body,
 };
 use uc_protocol::v2::schedule::{
     MAX_SCHEDULE_ENTRIES, SCHEDULE_ENTRY_LEN, SCHEDULE_HEADER_LEN, ScheduleRule,
@@ -1083,6 +1085,10 @@ pub struct Node {
     schedule_entries_pub: Arc<AtomicU64>,
     log_clock_smear_pub: Arc<AtomicU64>,
     schedule_refused: Arc<AtomicU64>,
+    /// Plan B3 (spec §6.5.2): the consensus agent's two `SNAP_REPORT` wire
+    /// counters — the SAME `Arc`s it bumps, handed on by `observability()`.
+    snapshot_reports_sent: Arc<AtomicU64>,
+    snapshot_reports_unsent: Arc<AtomicU64>,
     reports_implausible: Arc<AtomicU64>,
     /// Protocol 0.5.0: reports DECLINED because their content attestation
     /// (`durable_term`) disagreed with our own term map. Mirrored out of the
@@ -2104,6 +2110,10 @@ impl Node {
         // Plan 2 (spec §6): refused `schedule apply` requests, shared with
         // `Node::observability` (`uc2_schedule_apply_refused_total`).
         let schedule_refused = Arc::new(AtomicU64::new(0));
+        // Plan B3 (spec §6.5.2): the live snapshot-hash report counters,
+        // shared with `Node::observability` the same way.
+        let snapshot_reports_sent = Arc::new(AtomicU64::new(0));
+        let snapshot_reports_unsent = Arc::new(AtomicU64::new(0));
         let schedule_pos_pub = Arc::new(AtomicU64::new(0));
         let schedule_entries_pub = Arc::new(AtomicU64::new(0));
         let log_clock_smear_pub = Arc::new(AtomicU64::new(0));
@@ -2251,6 +2261,9 @@ impl Node {
             schedule_entries_pub: Arc::clone(&schedule_entries_pub),
             log_clock_smear_pub: Arc::clone(&log_clock_smear_pub),
             schedule_refused: Arc::clone(&schedule_refused),
+            snapshot_reports_sent: Arc::clone(&snapshot_reports_sent),
+            snapshot_reports_unsent: Arc::clone(&snapshot_reports_unsent),
+            pending_snapshot_reports_stub: Vec::new(),
             ingress_rx,
             trunc_tx,
             trunc_slot,
@@ -2385,6 +2398,8 @@ impl Node {
             schedule_entries_pub,
             log_clock_smear_pub,
             schedule_refused,
+            snapshot_reports_sent,
+            snapshot_reports_unsent,
             reports_implausible,
             reports_unattested,
             archive_first_base,
@@ -2816,6 +2831,8 @@ impl Node {
             schedule_entries: Arc::clone(&self.schedule_entries_pub),
             log_clock_smear_ns: Arc::clone(&self.log_clock_smear_pub),
             schedule_apply_refused: Arc::clone(&self.schedule_refused),
+            snapshot_reports_sent: Arc::clone(&self.snapshot_reports_sent),
+            snapshot_reports_unsent: Arc::clone(&self.snapshot_reports_unsent),
             cluster_view: Arc::clone(&self.cluster_view),
             probe: Arc::clone(&self.probe_table),
             commands_over_standard: Arc::clone(&self.commands_over_standard),
@@ -3299,6 +3316,23 @@ struct Consensus {
     /// Plan 2: `uc2_schedule_apply_refused_total` — every refused apply,
     /// whatever the reason. Shared with `Node::observability`.
     schedule_refused: Arc<AtomicU64>,
+    /// Plan B3 (spec §6.5.2): `SNAP_REPORT` datagrams this node has put on
+    /// the wire to the leader (`uc2_snapshot_reports_sent_total`), and ones
+    /// it had to drop because it knew of no leader to address
+    /// (`uc2_snapshot_reports_unsent_total`). Both are WIRE counters: a
+    /// LEADER hands its own rows' hashes straight to its collector and moves
+    /// neither, so a healthy leader exports two zeros while a healthy
+    /// follower's `sent` climbs one per declared row per instant. Shared with
+    /// `Node::observability` exactly as `schedule_refused` is.
+    snapshot_reports_sent: Arc<AtomicU64>,
+    snapshot_reports_unsent: Arc<AtomicU64>,
+    /// Plan B3 T3, **a stub Task 4 replaces**: the leader-side collector is
+    /// T4's `pending_snapshot_reports` (dedup per `(row, position)`, quorum
+    /// or timeout, then a `CLUSTER kind = 5 SnapshotReport` append). Until it
+    /// lands, `on_snap_report` only records what it was handed so T3's own
+    /// tests can see that the leader path reports to ITSELF rather than to
+    /// the wire. Delete this field with the stub.
+    pending_snapshot_reports_stub: Vec<(u32, u8, u64, u64)>,
     ingress_rx: mpsc::Receiver<Ingress>,
     trunc_tx: mpsc::SyncSender<ArchiveCmd>,
     trunc_slot: TruncationSlot,
@@ -6016,6 +6050,123 @@ impl Consensus {
             // which).
             source = "local"
         );
+        // Plan B3 (spec §6.5.2): the set THIS node built is the only one
+        // whose artifact hashes this node can vouch for — a `fetch` set is
+        // another node's freeze, copied here whole, and its rows never wrote
+        // a hash into their cnc slots. So the report rides the LOCAL edge
+        // only, and (because that edge is a high-water mark) exactly once per
+        // instant.
+        self.send_snapshot_reports(p);
+    }
+
+    /// Plan B3 (spec §6.5.2): on the edge where this node's own snapshot set
+    /// at `p` became complete, report each declared row's artifact hash to
+    /// the leader — live, off the cnc page, ahead of and independent of the
+    /// `CLUSTER kind = 5 SnapshotReport` the leader later commits.
+    ///
+    /// **Why the hash read is sound.** The builder stores the hash word
+    /// BEFORE `snapshot_pos` (plan B3 T1), and this reads them in the other
+    /// order — `snapshot_pos` first, `Acquire`, and only then the hash — so a
+    /// row seen at `p` is guaranteed to expose the hash of the artifact AT
+    /// `p`, never a stale one from the previous instant. `0` means the row
+    /// has published no artifact at all (a row declared but never frozen, or
+    /// a pre-plan-B3 service): there is nothing to attest, so it is skipped
+    /// rather than reported as a zero hash the leader would have to special-
+    /// case.
+    ///
+    /// The row loop re-checks `snapshot_pos == p` even though
+    /// `check_set_completeness` has just done so: the two loads are the
+    /// cheapest way to keep this function honest on its own terms, and a row
+    /// that raced ahead to a NEWER instant between the two passes must not be
+    /// reported at `p` with the newer artifact's hash.
+    fn send_snapshot_reports(&mut self, p: u64) {
+        // The row list is copied out first: `services.ids()` borrows `self`,
+        // and both arms below need `&mut self` (`send`, and the leader's
+        // `on_snap_report`). At most `CNC_MAX_SERVICES` rows, so this is a
+        // stack array and not an allocation on an edge that also does file
+        // I/O further down the pass.
+        let mut rows = [0u8; CNC_MAX_SERVICES];
+        let mut n = 0usize;
+        for row in self.services.ids() {
+            rows[n] = row;
+            n += 1;
+        }
+        // A leader reports to ITSELF, in-process: the collector is this same
+        // agent, so a datagram to our own address would only add latency and
+        // a loss mode. The hint and the term are read once for the whole
+        // edge — every report in it names the same instant.
+        let leader = matches!(self.sm.role(), Role::Leader);
+        let term = self.sm.current_term();
+        let hint = self.cnc.status().leader_hint.load_acquire();
+        let leader_addr = (hint != u64::MAX)
+            .then(|| self.id_to_addr.get(&(hint as NodeId)).copied())
+            .flatten();
+        for &row in &rows[..n] {
+            // `snapshot_pos` FIRST (Acquire), then the hash — the reverse of
+            // the builder's store order, which is what makes the pair
+            // coherent (see this function's doc).
+            let (at, hash) = {
+                let slot = self.cnc.service_slot(row as usize);
+                (
+                    slot.snapshot_pos.load_acquire(),
+                    slot.identity.artifact_hash(),
+                )
+            };
+            if at != p || hash == 0 {
+                continue;
+            }
+            if leader {
+                crate::obs_event!(
+                    Info,
+                    "snapshot_report_sent",
+                    node = self.id as u64,
+                    row = row as u64,
+                    position = p
+                );
+                self.on_snap_report(self.id, row, p, hash);
+            } else if let Some(addr) = leader_addr {
+                let mut body = [0u8; SNAP_REPORT_BODY_LEN];
+                write_snap_report_body(
+                    &mut body,
+                    &SnapReportBody {
+                        row,
+                        node_id: self.id,
+                        position: p,
+                        hash,
+                    },
+                );
+                // Position 0 on the header: the instant this report is ABOUT
+                // is in the body, and a header position would be read as
+                // this node's log frontier by every path that inspects one.
+                self.send(addr, DGRAM_KIND_SNAP_REPORT, 0, term, &body);
+                self.snapshot_reports_sent.fetch_add(1, Ordering::Relaxed);
+                crate::obs_event!(
+                    Info,
+                    "snapshot_report_sent",
+                    node = self.id as u64,
+                    row = row as u64,
+                    position = p
+                );
+            } else {
+                // No leader known — mid-election, or a hint naming a member
+                // this node cannot resolve. Dropped, not queued: a report is
+                // about a moment, and holding it for whoever wins would
+                // deliver a hash out of turn to a leader that never asked.
+                // The leader's own collector falls back on its 5 s timeout,
+                // and the next instant reports again.
+                self.snapshot_reports_unsent.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Plan B3 T3 **stub** — Task 4 replaces this whole method with the
+    /// leader-side collector (membership check, newest-per-row pending map,
+    /// quorum-or-timeout append). Here it only records, so T3's tests can
+    /// see that a LEADER reports to itself in-process instead of sending a
+    /// datagram to its own address.
+    fn on_snap_report(&mut self, from: NodeId, row: u8, position: u64, hash: u64) {
+        self.pending_snapshot_reports_stub
+            .push((from, row, position, hash));
     }
 
     /// Spec §5.3 (Ruling P1): the node-owned, **delete-only** retention
@@ -10759,6 +10910,7 @@ mod tests {
     use uc_log::region::Region;
     use uc_protocol::identity::pack_version;
     use uc_protocol::ring::RingHeader;
+    use uc_protocol::v2::datagram::read_snap_report_body;
     use uc_protocol::v2::ipc::MSG_V2_SUBMIT;
     use uc_protocol::v2::schedule::{ScheduleTable, encode_schedule_table};
     use uc_protocol::v2::settings::encode_settings;
@@ -10914,6 +11066,16 @@ mod tests {
                 .store_release(p);
         }
 
+        /// As [`Harness::row_froze_at`], but for a builder that has plan
+        /// B3's hash word too — in the SAME order `SnapshotStore::publish`
+        /// writes them (hash first, `snapshot_pos` last), which is the whole
+        /// reason a reader may trust the pair.
+        fn row_published_at(&self, row: u8, p: u64, hash: u64) {
+            let slot = self.cons.cnc.service_slot(row as usize);
+            slot.identity.store_artifact_hash(hash);
+            slot.snapshot_pos.store_release(p);
+        }
+
         /// Put a committed `Settings` with this cadence in force — the whole
         /// loop, so the value the cadence reads is the REPLICATED one and not
         /// a poked field.
@@ -11027,9 +11189,22 @@ mod tests {
     /// map and the `ServicesConfig` are built from the same names, exactly as
     /// `Node::start_with_socket` builds them from `[services] names`.
     fn harness_with_rows(names: &[&str]) -> Harness {
+        harness_with_rows_and_peers(names, &[])
+    }
+
+    /// [`harness_with_rows`] with `peer_override`'s members pointed at real
+    /// bound sockets, so a test can read exactly what this agent sent one of
+    /// them (the same trick `harness_with_crypto` uses for the handshake
+    /// plane, minus the crypto). The override reaches the genesis
+    /// `ClusterConfig` too, so a `rebuild_peer_maps` re-derives the same
+    /// addresses rather than reverting to the fictional `127.0.0.1:910x`.
+    fn harness_with_rows_and_peers(
+        names: &[&str],
+        peer_override: &[(NodeId, SocketAddr)],
+    ) -> Harness {
         harness_full(
             None,
-            &[],
+            peer_override,
             Settings::genesis_default(),
             ServicesConfig::from_names(names, None).expect("valid row names"),
         )
@@ -11322,6 +11497,9 @@ mod tests {
             schedule_entries_pub: Arc::new(AtomicU64::new(0)),
             log_clock_smear_pub: Arc::new(AtomicU64::new(0)),
             schedule_refused: Arc::new(AtomicU64::new(0)),
+            snapshot_reports_sent: Arc::new(AtomicU64::new(0)),
+            snapshot_reports_unsent: Arc::new(AtomicU64::new(0)),
+            pending_snapshot_reports_stub: Vec::new(),
             ingress_rx,
             trunc_tx,
             trunc_slot,
@@ -11952,6 +12130,261 @@ mod tests {
         h.advance_floor_timer();
         assert!(h.cons.maybe_persist_snapshot_floor());
         assert_eq!(h.cons.snapshot_persisted_floor, p1);
+    }
+
+    // ---- plan B3 T3: live snapshot-hash reports on the set-complete edge ----
+
+    /// Bind a loopback socket and hand back its address, to stand in for one
+    /// member of the harness cluster — everything this agent sends that
+    /// member lands in this socket's buffer, which is how these tests see a
+    /// `Consensus::send`.
+    fn report_peer_socket() -> (UdpSocket, SocketAddr) {
+        let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        sock.set_nonblocking(true).unwrap();
+        let addr = sock.local_addr().unwrap();
+        (sock, addr)
+    }
+
+    /// Every `SNAP_REPORT` waiting on `sock`, decoded, oldest first.
+    /// Anything else is skipped rather than failed on: an election's votes
+    /// and a leader's commit gossip share this socket.
+    fn drain_snap_reports(sock: &UdpSocket) -> Vec<SnapReportBody> {
+        let mut out = Vec::new();
+        let mut buf = [0u8; 2048];
+        while let Ok((n, _)) = sock.recv_from(&mut buf) {
+            if n < DATAGRAM_HEADER_LEN {
+                continue;
+            }
+            let Some(hdr) = read_datagram_header(&buf[..n]) else {
+                continue;
+            };
+            if hdr.kind != DGRAM_KIND_SNAP_REPORT {
+                continue;
+            }
+            out.push(
+                read_snap_report_body(&buf[DATAGRAM_HEADER_LEN..n])
+                    .expect("this node's own SNAP_REPORT body must decode"),
+            );
+        }
+        out
+    }
+
+    /// Everything currently queued on `sock`, thrown away — an election's
+    /// traffic, before the thing under test runs.
+    fn drain_all(sock: &UdpSocket) {
+        let mut sink = [0u8; 2048];
+        while sock.recv_from(&mut sink).is_ok() {}
+    }
+
+    /// Spec §6.5.2, the base case: when a FOLLOWER's own set at P completes,
+    /// it tells the leader what each declared row hashed to — one pairwise
+    /// datagram per row, carrying the hash the builder published for THAT
+    /// instant.
+    ///
+    /// The hash is the whole point: a set-complete edge without it says only
+    /// that artifacts exist, and an upgrade pin adjudicated from that cannot
+    /// tell a divergent replica from a lagging one.
+    #[test]
+    fn snapshot_report_goes_out_per_declared_row_on_a_followers_local_edge() {
+        let (sock, addr) = report_peer_socket();
+        let mut h = harness_with_rows_and_peers(&["a", "b"], &[(0, addr)]);
+        assert!(
+            !matches!(h.cons.sm.role(), Role::Leader),
+            "the harness node boots a follower — that is the case under test"
+        );
+        h.cons.cnc.status().leader_hint.store_release(0);
+
+        let p = 6016u64;
+        h.row_published_at(0, p, 0xA1A1_A1A1_A1A1_A1A1);
+        h.row_published_at(1, p, 0xB2B2_B2B2_B2B2_B2B2);
+        h.cluster_snapshot_pos.store(p, Ordering::Release);
+        h.cons.check_set_completeness();
+        assert_eq!(
+            h.cons.snapshot_set_position.load(Ordering::Relaxed),
+            p,
+            "precondition: the local edge fired"
+        );
+
+        let mut got = drain_snap_reports(&sock);
+        got.sort_by_key(|b| b.row);
+        assert_eq!(
+            got,
+            vec![
+                SnapReportBody {
+                    row: 0,
+                    node_id: 1,
+                    position: p,
+                    hash: 0xA1A1_A1A1_A1A1_A1A1,
+                },
+                SnapReportBody {
+                    row: 1,
+                    node_id: 1,
+                    position: p,
+                    hash: 0xB2B2_B2B2_B2B2_B2B2,
+                },
+            ],
+            "one report per declared row, each carrying ITS row's hash"
+        );
+        assert_eq!(h.cons.snapshot_reports_sent.load(Ordering::Relaxed), 2);
+        assert_eq!(h.cons.snapshot_reports_unsent.load(Ordering::Relaxed), 0);
+        assert!(
+            h.cons.pending_snapshot_reports_stub.is_empty(),
+            "a follower reports TO the leader; it collects nothing itself"
+        );
+    }
+
+    /// The leader is a reporter too — it holds a set like anyone else — but
+    /// it must not send itself a datagram: its own rows' hashes go straight
+    /// into the collector. (Sending would work only by accident, since a
+    /// node's `id_to_addr` does hold its own address; it would also charge
+    /// the report the wire's latency and loss for no reason.)
+    #[test]
+    fn snapshot_report_on_the_leader_reaches_the_collector_not_the_wire() {
+        let (sock, addr) = report_peer_socket();
+        let mut h = harness_with_rows_and_peers(&["a"], &[(0, addr)]);
+        drive_to_serving_leader(&mut h);
+        drain_all(&sock); // the election's own traffic
+
+        let p = 6048u64;
+        h.row_published_at(0, p, 0x00C0_FFEE_00C0_FFEE);
+        h.cluster_snapshot_pos.store(p, Ordering::Release);
+        h.cons.check_set_completeness();
+
+        assert_eq!(
+            h.cons.pending_snapshot_reports_stub,
+            vec![(1u32, 0u8, p, 0x00C0_FFEE_00C0_FFEE)],
+            "the leader's own report reaches its collector with its own id"
+        );
+        assert!(
+            drain_snap_reports(&sock).is_empty(),
+            "no SNAP_REPORT on the wire from a leader"
+        );
+        assert_eq!(h.cons.snapshot_reports_sent.load(Ordering::Relaxed), 0);
+        assert_eq!(h.cons.snapshot_reports_unsent.load(Ordering::Relaxed), 0);
+    }
+
+    /// A row at P whose hash word is still `0` has published no artifact
+    /// this node can attest to (a pre-plan-B3 service, or a row whose
+    /// builder never ran). Reporting a zero would make the leader's record
+    /// claim agreement on a hash nobody computed, so the row is skipped and
+    /// the rest of the set still reports.
+    #[test]
+    fn snapshot_report_skips_a_row_with_no_published_artifact_hash() {
+        let (sock, addr) = report_peer_socket();
+        let mut h = harness_with_rows_and_peers(&["a", "b"], &[(0, addr)]);
+        h.cons.cnc.status().leader_hint.store_release(0);
+
+        let p = 6016u64;
+        h.row_published_at(0, p, 0xFEED_FACE_FEED_FACE);
+        h.row_froze_at(1, p); // at P, but the hash word never moved off 0
+        h.cluster_snapshot_pos.store(p, Ordering::Release);
+        h.cons.check_set_completeness();
+
+        assert_eq!(
+            drain_snap_reports(&sock),
+            vec![SnapReportBody {
+                row: 0,
+                node_id: 1,
+                position: p,
+                hash: 0xFEED_FACE_FEED_FACE,
+            }],
+            "row 1 is part of the set but has nothing to attest"
+        );
+        assert_eq!(h.cons.snapshot_reports_sent.load(Ordering::Relaxed), 1);
+    }
+
+    /// Spec §5.7 item 4 meets §6.5.2: a set FETCHED whole from a learner is
+    /// another node's freeze, copied here. This node's rows never froze at
+    /// P and wrote no hash for it, so there is nothing it can honestly
+    /// attest — the report rides the LOCAL edge only.
+    ///
+    /// The cnc state here is deliberately identical to the local-edge test's
+    /// (rows at P with hashes, cluster artifact at P): it is the EDGE that
+    /// differs, and an implementation that reported off the level rather than
+    /// the local edge would pass every other test in this group.
+    #[test]
+    fn snapshot_report_is_never_sent_on_the_fetch_edge() {
+        let (sock, addr) = report_peer_socket();
+        let mut h = harness_with_rows_and_peers(&["a"], &[(0, addr)]);
+        h.cons.cnc.status().leader_hint.store_release(0);
+
+        let p = 6016u64;
+        h.row_published_at(0, p, 0xDEAD_BEEF_DEAD_BEEF);
+        h.cluster_snapshot_pos.store(p, Ordering::Release);
+        h.cons.cnc.counters().durable.store_release(p);
+        h.cons.stored_set_pos.store(p, Ordering::Release);
+
+        h.cons.check_set_completeness();
+        assert_eq!(
+            h.cons.snapshot_set_position.load(Ordering::Relaxed),
+            p,
+            "precondition: the fetch edge fired and took the set to P"
+        );
+        assert!(
+            drain_snap_reports(&sock).is_empty(),
+            "a fetched set is not this node's freeze to vouch for"
+        );
+        assert_eq!(h.cons.snapshot_reports_sent.load(Ordering::Relaxed), 0);
+        assert_eq!(h.cons.snapshot_reports_unsent.load(Ordering::Relaxed), 0);
+    }
+
+    /// No leader to address — mid-election (`leader_hint == u64::MAX`), or a
+    /// hint naming a member this node cannot resolve. The report is dropped
+    /// and COUNTED, never queued: the instant is a moment, and a report held
+    /// for a leader that may never be the one that adjudicates would be a
+    /// stale hash arriving out of turn.
+    #[test]
+    fn snapshot_report_with_no_leader_to_address_is_dropped_and_counted() {
+        let mut h = harness_with_rows(&["a", "b"]);
+        assert_eq!(
+            h.cons.cnc.status().leader_hint.load_acquire(),
+            u64::MAX,
+            "a fresh page means `no leader known`, not node 0"
+        );
+
+        let p = 6016u64;
+        h.row_published_at(0, p, 1);
+        h.row_published_at(1, p, 2);
+        h.cluster_snapshot_pos.store(p, Ordering::Release);
+        h.cons.check_set_completeness();
+        assert_eq!(h.cons.snapshot_reports_unsent.load(Ordering::Relaxed), 2);
+        assert_eq!(h.cons.snapshot_reports_sent.load(Ordering::Relaxed), 0);
+
+        // ...and the same for a hint naming an id no longer in the member map.
+        let p2 = 6048u64;
+        h.cons.cnc.status().leader_hint.store_release(99);
+        h.row_published_at(0, p2, 3);
+        h.row_published_at(1, p2, 4);
+        h.cluster_snapshot_pos.store(p2, Ordering::Release);
+        h.cons.check_set_completeness();
+        assert_eq!(h.cons.snapshot_reports_unsent.load(Ordering::Relaxed), 4);
+        assert_eq!(h.cons.snapshot_reports_sent.load(Ordering::Relaxed), 0);
+    }
+
+    /// Once per INSTANT, not once per pass. `check_set_completeness` runs
+    /// every consensus duty cycle; a report that keyed on the level rather
+    /// than the edge would flood the leader with an identical datagram
+    /// thousands of times a second for as long as the set stood.
+    #[test]
+    fn snapshot_report_fires_on_the_set_complete_edge_not_once_per_pass() {
+        let (sock, addr) = report_peer_socket();
+        let mut h = harness_with_rows_and_peers(&["a"], &[(0, addr)]);
+        h.cons.cnc.status().leader_hint.store_release(0);
+
+        let p = 6016u64;
+        h.row_published_at(0, p, 0x1234_5678_9abc_def0);
+        h.cluster_snapshot_pos.store(p, Ordering::Release);
+        h.cons.check_set_completeness();
+        assert_eq!(drain_snap_reports(&sock).len(), 1);
+
+        for _ in 0..4 {
+            h.cons.check_set_completeness();
+        }
+        assert!(
+            drain_snap_reports(&sock).is_empty(),
+            "the completed set is still at P — but the EDGE has passed"
+        );
+        assert_eq!(h.cons.snapshot_reports_sent.load(Ordering::Relaxed), 1);
     }
 
     /// Spec §5.7 item 4 (Ruling P4'): a set this node FETCHED from a learner
