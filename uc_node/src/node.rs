@@ -5166,13 +5166,32 @@ impl Consensus {
     /// instant may complete a set and may even be retained — it just may not
     /// move this node's floor past the origin.
     ///
-    /// **Consumed** is read off the row's own cnc slot: attached, with the
-    /// attached version word equal to the pin's `to`. That is precisely "the
-    /// binary the pin names is here and running", which is when the origin's
-    /// journal stops being needed. A row whose service has not come back yet
-    /// holds the floor — deliberately, and visibly: `snapshot_floor_held_for_pin`
-    /// names the hold, and an operator who has abandoned the upgrade clears it
-    /// by attaching `to` or by pinning forward, not by waiting.
+    /// **Consumed** is read off the row's own cnc slot, and it is three
+    /// conditions, all of them:
+    ///
+    /// 1. the slot is ATTACHED — some service is live on this row;
+    /// 2. its attached version word equals the pin's `to` — the binary the
+    ///    pin names is the one that is here, not the old one still running or
+    ///    a third build;
+    /// 3. its published `applied` frontier has reached the CANDIDATE floor —
+    ///    it has replayed past everything this floor move is about to let the
+    ///    purge remove.
+    ///
+    /// The third is not redundant, and leaving it out leaves a real race
+    /// (found reviewing the first cut of this fix). A pinned attach installs
+    /// the artifact at the origin and RETURNS; its tail replay from the
+    /// origin up runs afterwards, on the apply thread. Releasing the hold at
+    /// attach lets the floor — and the purge behind it — move to the newer
+    /// set while that replay is still walking the journal it needs, and the
+    /// replay's next pass then meets `first > origin` with no artifact this
+    /// binary may install: the same fail-stop the hold exists to prevent,
+    /// through a narrower window. Keyed on `applied` the hold releases when
+    /// the row is genuinely past the cut, which is the thing that matters.
+    ///
+    /// A row whose service has not come back yet holds the floor —
+    /// deliberately, and visibly: `snapshot_floor_held_for_pin` names the
+    /// hold, and an operator who has abandoned the upgrade clears it by
+    /// attaching `to` or by pinning forward, not by waiting.
     ///
     /// Node-local: no replicated state changes, and a node that has already
     /// published a floor above a pinned origin is not pulled back (the floor
@@ -5192,10 +5211,15 @@ impl Consensus {
             let Some(pin) = inner.pins.iter().rev().find(|p| p.row == row) else {
                 continue;
             };
-            let s = &self.cnc.service_slot(row as usize).status;
-            let (_, attached, _) = unpack_service_status(s.load_acquire());
-            if attached && s.version() == pin.to {
-                continue; // consumed: `to` is attached here
+            let slot = self.cnc.service_slot(row as usize);
+            let (_, attached, _) = unpack_service_status(slot.status.load_acquire());
+            // Consumed: `to` is attached here AND it has already replayed past
+            // everything this floor move is about to let the purge remove.
+            if attached
+                && slot.status.version() == pin.to
+                && slot.applied.load_acquire() >= candidate
+            {
+                continue;
             }
             hold = hold.min(pin.origin);
         }
@@ -11841,9 +11865,21 @@ mod tests {
         );
         assert_eq!(h.cons.snapshot_floor_hold, p1, "the hold is latched once");
 
-        // The swap completes: the pin's `to` is attached on this node. The
-        // origin's journal is no longer needed and the floor is free.
+        // `to` attaches — but its tail replay has not reached p2 yet. The
+        // hold STAYS: the journal it is about to replay is exactly what the
+        // purge behind this floor move would remove.
         h.cons.cnc.service_slot(0).status.store_version(2);
+        h.cons.cnc.service_slot(0).applied.store_release(p1);
+        h.advance_floor_timer();
+        h.cons.maybe_persist_snapshot_floor();
+        assert_eq!(
+            h.cons.snapshot_persisted_floor, p1,
+            "attached at `to` is not enough — the row has not replayed past the cut"
+        );
+
+        // …and releases once the row's published frontier is past the
+        // candidate floor.
+        h.cons.cnc.service_slot(0).applied.store_release(p2);
         h.advance_floor_timer();
         assert!(h.cons.maybe_persist_snapshot_floor());
         assert_eq!(
