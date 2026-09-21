@@ -4,8 +4,9 @@
 //! `RegisterSm` behind the diff-replay app-binary contract — the harness's
 //! own end-to-end fixture. Not a pattern to copy; see examples/kv for that.
 //!
-//! `<bin> replay --corpus DIR --out TRACE.json [--from-genesis] [--double]`,
-//! `<bin> project --artifact FILE --position P`, and
+//! `<bin> replay --corpus DIR --out TRACE.json [--from-genesis] [--double]
+//! [--durable]`, `<bin> project --artifact FILE --position P [--double]
+//! [--durable]`, and
 //! `<bin> serve --instance-dir D --app-id A [--double] [--durable]` (the
 //! serve form of the app-binary contract: attach, supervise, stop on
 //! SIGTERM), per the README's CLI contract for app binaries.
@@ -33,12 +34,29 @@ enum Sub {
         /// Test knob: double every written value (a "v2" with changed semantics).
         #[arg(long)]
         double: bool,
+        /// Accepted and IGNORED, so ONE knob list can drive all three forms
+        /// (`uc_diffreplay::pinverify::app_knobs`): `replay` drives the state
+        /// machine in process from the corpus, and `Durable` only changes
+        /// where a SERVING one keeps its state — it delegates `apply`,
+        /// `freeze` and `project` to the inner machine — so the durable shape
+        /// cannot change what this form computes.
+        #[arg(long)]
+        durable: bool,
     },
     Project {
         #[arg(long)]
         artifact: PathBuf,
         #[arg(long)]
         position: u64,
+        /// The "v2" build, as `replay` takes it. `DoublingRegisterSm`
+        /// delegates `project` to the inner machine, so the text is the same
+        /// either way; the form accepts the knob so the same list works for
+        /// every verb.
+        #[arg(long)]
+        double: bool,
+        /// Accepted and ignored — see `Replay`'s `--durable`.
+        #[arg(long)]
+        durable: bool,
     },
     /// The serve form of the diff-replay CLI contract: attach to a running
     /// node and apply until SIGTERM. `pin-verify` runs this for both eras.
@@ -64,6 +82,7 @@ fn main() -> anyhow::Result<()> {
             out,
             from_genesis,
             double,
+            durable: _,
         } => {
             if double {
                 uc_diffreplay::drive::run_replay_cli(
@@ -81,11 +100,22 @@ fn main() -> anyhow::Result<()> {
                 )
             }
         }
-        Sub::Project { artifact, position } => {
-            print!(
-                "{}",
+        Sub::Project {
+            artifact,
+            position,
+            double,
+            durable: _,
+        } => {
+            let text = if double {
+                uc_diffreplay::drive::project_artifact(
+                    DoublingRegisterSm::default(),
+                    &artifact,
+                    position,
+                )?
+            } else {
                 uc_diffreplay::drive::project_artifact(RegisterSm::default(), &artifact, position)?
-            );
+            };
+            print!("{text}");
             Ok(())
         }
         Sub::Serve {
