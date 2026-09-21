@@ -192,9 +192,12 @@ mod tests {
     }
 
     /// Plan B3 T1: the hash word is stored BEFORE `snapshot_pos`, so a reader
-    /// that `Acquire`-loads `snapshot_pos == P` is guaranteed to already see
-    /// the hash of the artifact at `P` (never a stale hash left over from a
-    /// previous instant). A single-threaded unit test cannot observe a store
+    /// that `Acquire`-loads `snapshot_pos == P` and then reads the hash never
+    /// sees a STALE one (a hash left over from a previous instant). It can
+    /// still see a NEWER one — this builder may publish `P'` between the
+    /// reader's two loads — which is why the reader
+    /// (`Consensus::send_snapshot_reports`) re-reads `snapshot_pos` after the
+    /// hash and drops the pair if it moved. A single-threaded unit test cannot observe a store
     /// ORDER directly — there is no concurrent reader here to catch an
     /// interleaving — so this drives the builder and asserts both words hold
     /// their final values; the order itself is asserted STRUCTURALLY by

@@ -91,6 +91,8 @@ pub const CONTRACT_SERIES: &[&str] = &[
     // FSM upgrade lifecycle (plan B3): the live snapshot-hash report path.
     "uc2_snapshot_reports_sent_total",
     "uc2_snapshot_reports_unsent_total",
+    "uc2_snapshot_reports_appended_total",
+    "uc2_snapshot_reports_timed_out_total",
     // FSM upgrade lifecycle (plan B1)
     "uc2_upgrade_pin_origin",
     "uc2_upgrade_pin_version",
@@ -879,6 +881,18 @@ fn push_service_families(out: &mut String, s: &ObsSources, commit: u64, now: u64
         "Snapshot hash reports this node DROPPED because it knew of no leader to address (no leader hint, or a hint naming a member it cannot resolve — an election in progress). A brief run around a failover is expected; a sustained one means this node's hashes never reach the committed SnapshotReport record, and an upgrade pin adjudicated from it is missing a voter.",
         s.snapshot_reports_unsent.load(Ordering::Relaxed),
     );
+    push_counter(
+        out,
+        "uc2_snapshot_reports_appended_total",
+        "SnapshotReport records (CLUSTER kind = 5) this node placed on the log while leading — one per row per instant it collected hashes for (FSM upgrade lifecycle spec §6.5.2). A follower appends none, so this sits still everywhere but the leader; across a cluster it should climb by the declared-row count once per completed instant.",
+        s.snapshot_reports_appended.load(Ordering::Relaxed),
+    );
+    push_counter(
+        out,
+        "uc2_snapshot_reports_timed_out_total",
+        "The subset of uc2_snapshot_reports_appended_total that went in on the 5 s collection timeout rather than on a quorum of voters reporting. A brief run around a failover or a restart is expected; a rate that keeps pace with the appended counter means the records name too few voters to tell a divergent replica from an absent one, and an upgrade pin adjudicated from them is thinner evidence than it looks — check uc2_snapshot_reports_unsent_total and the set-completion gauges on the quiet nodes.",
+        s.snapshot_reports_timed_out.load(Ordering::Relaxed),
+    );
     push_gauge(
         out,
         "uc_services_declared",
@@ -1646,6 +1660,8 @@ mod tests {
             schedule_apply_refused: Arc::new(AtomicU64::new(0)),
             snapshot_reports_sent: Arc::new(AtomicU64::new(0)),
             snapshot_reports_unsent: Arc::new(AtomicU64::new(0)),
+            snapshot_reports_appended: Arc::new(AtomicU64::new(0)),
+            snapshot_reports_timed_out: Arc::new(AtomicU64::new(0)),
             cluster_view: test_cluster_view(),
             probe: uc_net::probe::ProbeTable::new(uc_net::probe::ProbeCadence::default()),
             commands_over_standard: Arc::new(AtomicU64::new(0)),
@@ -1805,7 +1821,7 @@ mod tests {
     fn the_contract_has_the_number_of_families_the_docs_state() {
         assert_eq!(
             CONTRACT_SERIES.len(),
-            113,
+            115,
             "if this is intentional, update the family count in \
              docs/how-to/monitor-a-cluster.md in the same commit"
         );
@@ -2211,6 +2227,8 @@ mod tests {
             schedule_apply_refused: Arc::new(AtomicU64::new(0)),
             snapshot_reports_sent: Arc::new(AtomicU64::new(0)),
             snapshot_reports_unsent: Arc::new(AtomicU64::new(0)),
+            snapshot_reports_appended: Arc::new(AtomicU64::new(0)),
+            snapshot_reports_timed_out: Arc::new(AtomicU64::new(0)),
             cluster_view: test_cluster_view(),
             probe: uc_net::probe::ProbeTable::new(uc_net::probe::ProbeCadence::default()),
             commands_over_standard: Arc::new(AtomicU64::new(0)),
@@ -2316,6 +2334,8 @@ mod tests {
             schedule_apply_refused: Arc::new(AtomicU64::new(0)),
             snapshot_reports_sent: Arc::new(AtomicU64::new(0)),
             snapshot_reports_unsent: Arc::new(AtomicU64::new(0)),
+            snapshot_reports_appended: Arc::new(AtomicU64::new(0)),
+            snapshot_reports_timed_out: Arc::new(AtomicU64::new(0)),
             cluster_view: test_cluster_view(),
             probe: uc_net::probe::ProbeTable::new(uc_net::probe::ProbeCadence::default()),
             commands_over_standard: Arc::new(AtomicU64::new(0)),

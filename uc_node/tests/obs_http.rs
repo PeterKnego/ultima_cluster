@@ -90,6 +90,8 @@ fn synthetic_server() -> (ObsServer, ObsSources) {
         schedule_apply_refused: Arc::new(AtomicU64::new(0)),
         snapshot_reports_sent: Arc::new(AtomicU64::new(0)),
         snapshot_reports_unsent: Arc::new(AtomicU64::new(0)),
+        snapshot_reports_appended: Arc::new(AtomicU64::new(0)),
+        snapshot_reports_timed_out: Arc::new(AtomicU64::new(0)),
         cluster_view: Arc::new(uc_node::ClusterView::new(
             &uc_node::ClusterState::genesis_empty(),
         )),

@@ -3,7 +3,7 @@
 
 //! Node composition + the consensus agent (Task 8).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
 use std::path::{Path, PathBuf};
@@ -89,7 +89,7 @@ use uc_protocol::v2::schedule::{
     decode_schedule_table,
 };
 use uc_protocol::v2::settings::{Settings, Target, decode_settings};
-use uc_protocol::v2::upgrade::{UPGRADE_PIN_LEN, decode_upgrade_pin};
+use uc_protocol::v2::upgrade::{SnapshotReport, UPGRADE_PIN_LEN, decode_upgrade_pin};
 
 /// Single-slot truncation ack. One truncation is in flight at a time (the SM
 /// latch serializes them), so a slot suffices and, unlike a bounded channel,
@@ -369,6 +369,16 @@ const QUERY_DRAIN_PER_CYCLE: usize = 64;
 /// `MSG_V2_RETRY` (side-effect-free) and dropped. Same order as the election
 /// timeout — a partitioned-away leader fails its reads within ~1s.
 const READ_BARRIER_TIMEOUT_NS: u64 = 1_000_000_000;
+/// Plan B3 (spec §6.5.2): how long the leader holds a row's partial report
+/// set before appending what it has. A `SnapshotReport` is EVIDENCE, not a
+/// decision — a record naming the two nodes that did report, and the one that
+/// did not, is what an operator (and `verdict`) needs; waiting forever for a
+/// node that is down would put nothing on the log at all. Five seconds is an
+/// order of magnitude above a healthy instant's report spread (the reports
+/// ride the set-complete edge, one pairwise datagram each) and well below any
+/// human-paced upgrade step that reads the record.
+pub const SNAP_REPORT_TIMEOUT_NS: u64 = 5_000_000_000;
+
 /// Output-progress persist floor (Task 12 / spec §7): rate-limits the durable
 /// `StableValue::store` (an fsync) to at most once per 100 ms even under a
 /// change every cycle. The cheap in-page `output_completed` compare still runs
@@ -1086,9 +1096,12 @@ pub struct Node {
     log_clock_smear_pub: Arc<AtomicU64>,
     schedule_refused: Arc<AtomicU64>,
     /// Plan B3 (spec §6.5.2): the consensus agent's two `SNAP_REPORT` wire
-    /// counters — the SAME `Arc`s it bumps, handed on by `observability()`.
+    /// counters and its two leader-side collector counters — the SAME `Arc`s
+    /// it bumps, handed on by `observability()`.
     snapshot_reports_sent: Arc<AtomicU64>,
     snapshot_reports_unsent: Arc<AtomicU64>,
+    snapshot_reports_appended: Arc<AtomicU64>,
+    snapshot_reports_timed_out: Arc<AtomicU64>,
     reports_implausible: Arc<AtomicU64>,
     /// Protocol 0.5.0: reports DECLINED because their content attestation
     /// (`durable_term`) disagreed with our own term map. Mirrored out of the
@@ -2114,6 +2127,8 @@ impl Node {
         // shared with `Node::observability` the same way.
         let snapshot_reports_sent = Arc::new(AtomicU64::new(0));
         let snapshot_reports_unsent = Arc::new(AtomicU64::new(0));
+        let snapshot_reports_appended = Arc::new(AtomicU64::new(0));
+        let snapshot_reports_timed_out = Arc::new(AtomicU64::new(0));
         let schedule_pos_pub = Arc::new(AtomicU64::new(0));
         let schedule_entries_pub = Arc::new(AtomicU64::new(0));
         let log_clock_smear_pub = Arc::new(AtomicU64::new(0));
@@ -2263,7 +2278,9 @@ impl Node {
             schedule_refused: Arc::clone(&schedule_refused),
             snapshot_reports_sent: Arc::clone(&snapshot_reports_sent),
             snapshot_reports_unsent: Arc::clone(&snapshot_reports_unsent),
-            pending_snapshot_reports_stub: Vec::new(),
+            snapshot_reports_appended: Arc::clone(&snapshot_reports_appended),
+            snapshot_reports_timed_out: Arc::clone(&snapshot_reports_timed_out),
+            pending_snapshot_reports: HashMap::new(),
             ingress_rx,
             trunc_tx,
             trunc_slot,
@@ -2400,6 +2417,8 @@ impl Node {
             schedule_refused,
             snapshot_reports_sent,
             snapshot_reports_unsent,
+            snapshot_reports_appended,
+            snapshot_reports_timed_out,
             reports_implausible,
             reports_unattested,
             archive_first_base,
@@ -2833,6 +2852,8 @@ impl Node {
             schedule_apply_refused: Arc::clone(&self.schedule_refused),
             snapshot_reports_sent: Arc::clone(&self.snapshot_reports_sent),
             snapshot_reports_unsent: Arc::clone(&self.snapshot_reports_unsent),
+            snapshot_reports_appended: Arc::clone(&self.snapshot_reports_appended),
+            snapshot_reports_timed_out: Arc::clone(&self.snapshot_reports_timed_out),
             cluster_view: Arc::clone(&self.cluster_view),
             probe: Arc::clone(&self.probe_table),
             commands_over_standard: Arc::clone(&self.commands_over_standard),
@@ -3008,6 +3029,21 @@ struct PendingAdminFwd {
     id: u32,
     ip: u32,
     port: u16,
+}
+
+/// Plan B3 (spec §6.5.2): one row's in-flight collection — the instant every
+/// hash in it is ABOUT, when the first of them arrived (the timeout's origin),
+/// and the hashes themselves keyed by reporting node.
+///
+/// A `BTreeMap` rather than a `Vec`: it dedups a node that reports twice (a
+/// re-sent datagram is a duplicate, not a second opinion) and it iterates in
+/// node-id order, which is exactly the canonical order
+/// [`uc_protocol::v2::upgrade::encode_snapshot_report`] requires — so the
+/// record encodes identically wherever it is built.
+struct PendingSnapshotReport {
+    position: u64,
+    first_seen_ns: u64,
+    hashes: BTreeMap<u32, u64>,
 }
 
 struct Consensus {
@@ -3330,13 +3366,25 @@ struct Consensus {
     /// `schedule_refused` is.
     snapshot_reports_sent: Arc<AtomicU64>,
     snapshot_reports_unsent: Arc<AtomicU64>,
-    /// Plan B3 T3, **a stub Task 4 replaces**: the leader-side collector is
-    /// T4's `pending_snapshot_reports` (dedup per `(row, position)`, quorum
-    /// or timeout, then a `CLUSTER kind = 5 SnapshotReport` append). Until it
-    /// lands, `on_snap_report` only records what it was handed so T3's own
-    /// tests can see that the leader path reports to ITSELF rather than to
-    /// the wire. Delete this field with the stub.
-    pending_snapshot_reports_stub: Vec<(u32, u8, u64, u64)>,
+    /// Plan B3 (spec §6.5.2), **LEADER-only**: the hashes collected so far
+    /// for each row's NEWEST reported instant, keyed by row. One entry per
+    /// row (at most `CNC_MAX_SERVICES`) holding at most one hash per member
+    /// (at most `MAX_MEMBERS`), so the whole map is bounded by the config and
+    /// needs no eviction of its own. Filled by
+    /// [`Consensus::on_snap_report`], drained by
+    /// [`Consensus::maybe_append_snapshot_reports`], and cleared on every
+    /// leader exit for `last_cluster_append`'s reason — a set collected under
+    /// a term we no longer lead is not ours to place.
+    pending_snapshot_reports: HashMap<u8, PendingSnapshotReport>,
+    /// Plan B3 (spec §6.5.2): `CLUSTER kind = 5` records this leader placed
+    /// (`uc2_snapshot_reports_appended_total`), and how many of those went in
+    /// on the TIMEOUT rather than on a voter quorum
+    /// (`uc2_snapshot_reports_timed_out_total`, a subset of the first). A
+    /// climbing `timed_out` is the reading that matters: every instant is
+    /// being recorded without a quorum of voters vouching for it. Shared with
+    /// `Node::observability` exactly as `snapshot_reports_sent` is.
+    snapshot_reports_appended: Arc<AtomicU64>,
+    snapshot_reports_timed_out: Arc<AtomicU64>,
     ingress_rx: mpsc::Receiver<Ingress>,
     trunc_tx: mpsc::SyncSender<ArchiveCmd>,
     trunc_slot: TruncationSlot,
@@ -3987,6 +4035,13 @@ impl Consensus {
         // two due timers.
         if serving && !hold_clients {
             did |= self.maybe_commit_datagram_mtu();
+        }
+        // 3a'''. Plan B3 (spec §6.5.2): the leader's snapshot-hash record —
+        // the third leader-issued `CLUSTER` append of the pass, under the same
+        // gate as the two above it and for the same reason. One `is_empty`
+        // test on the steady path, which is the whole of its cost here.
+        if serving && !hold_clients {
+            did |= self.maybe_append_snapshot_reports();
         }
         if serving && !hold_clients {
             did |= self.drain_ingress();
@@ -6070,19 +6125,24 @@ impl Consensus {
     ///
     /// **Why the hash read is sound.** The builder stores the hash word
     /// BEFORE `snapshot_pos` (plan B3 T1), and this reads them in the other
-    /// order — `snapshot_pos` first, `Acquire`, and only then the hash — so a
-    /// row seen at `p` is guaranteed to expose the hash of the artifact AT
-    /// `p`, never a stale one from the previous instant. `0` means the row
-    /// has published no artifact at all (a row declared but never frozen, or
-    /// a pre-plan-B3 service): there is nothing to attest, so it is skipped
-    /// rather than reported as a zero hash the leader would have to special-
-    /// case.
+    /// order — `snapshot_pos` first, `Acquire`, and only then the hash — so
+    /// the hash a row seen at `p` exposes is never STALE (never one left over
+    /// from an instant before `p`). It can still be NEWER: the builder may
+    /// publish `p'` in the window between the two loads, and its store order
+    /// puts `hash(p')` in the word before `snapshot_pos` reaches `p'`. So the
+    /// loop re-reads `snapshot_pos` AFTER the hash and skips the row unless it
+    /// is still `p` — which is what makes the reported pair `(p, hash(p))` and
+    /// not `(p, hash(p'))`. A row dropped that way is not lost: it froze at a
+    /// newer instant, whose own set-complete edge reports it.
     ///
-    /// The row loop re-checks `snapshot_pos == p` even though
-    /// `check_set_completeness` has just done so: the two loads are the
-    /// cheapest way to keep this function honest on its own terms, and a row
-    /// that raced ahead to a NEWER instant between the two passes must not be
-    /// reported at `p` with the newer artifact's hash.
+    /// `0` means the row has published no artifact at all (a row declared but
+    /// never frozen, or a pre-plan-B3 service): there is nothing to attest, so
+    /// it is skipped rather than reported as a zero hash the leader would have
+    /// to special-case.
+    ///
+    /// The first `snapshot_pos == p` check is here even though
+    /// `check_set_completeness` has just made it: it is what keeps this
+    /// function honest on its own terms rather than on its caller's.
     fn send_snapshot_reports(&mut self, p: u64) {
         // The row list is copied out first: `services.ids()` borrows `self`,
         // and both arms below need `&mut self` (`send`, and the leader's
@@ -6109,14 +6169,17 @@ impl Consensus {
             // `snapshot_pos` FIRST (Acquire), then the hash — the reverse of
             // the builder's store order, which is what makes the pair
             // coherent (see this function's doc).
-            let (at, hash) = {
+            let (at, hash, still_at) = {
                 let slot = self.cnc.service_slot(row as usize);
-                (
-                    slot.snapshot_pos.load_acquire(),
-                    slot.identity.artifact_hash(),
-                )
+                let at = slot.snapshot_pos.load_acquire();
+                let hash = slot.identity.artifact_hash();
+                // …and `snapshot_pos` again, AFTER the hash: a builder that
+                // published the NEXT instant between the two loads would
+                // otherwise pair that instant's hash with `p` (see this
+                // function's doc).
+                (at, hash, slot.snapshot_pos.load_acquire())
             };
-            if at != p || hash == 0 {
+            if at != p || still_at != p || hash == 0 {
                 continue;
             }
             if leader {
@@ -6163,14 +6226,204 @@ impl Consensus {
         }
     }
 
-    /// Plan B3 T3 **stub** — Task 4 replaces this whole method with the
-    /// leader-side collector (membership check, newest-per-row pending map,
-    /// quorum-or-timeout append). Here it only records, so T3's tests can
-    /// see that a LEADER reports to itself in-process instead of sending a
-    /// datagram to its own address.
+    /// The row's COMMITTED report position — `0` when the cluster FSM holds
+    /// no report for it yet. Read from the view rather than kept as a field
+    /// because the record is applied by the `uc2-cluster` agent, not here,
+    /// and a shadow copy could only be wrong. Costs one seqlock-guarded
+    /// clone, on paths that run at most once per report and once per append
+    /// (never per pass).
+    fn held_report_position(&self, row: u8) -> u64 {
+        self.cluster_view
+            .to_state()
+            .report_for(row)
+            .map(|r| r.position)
+            .unwrap_or(0)
+    }
+
+    /// Plan B3 (spec §6.5.2), the LEADER-side collector: take one node's
+    /// `(row, position, hash)` into the pending set for that row.
+    ///
+    /// Four rules, in order:
+    ///
+    /// * **Leader-only.** A follower has no appender, so a collection it made
+    ///   could only rot; the reporters re-report at the next instant, to
+    ///   whoever leads then.
+    /// * **Members only.** The config is the whole of the trust here — a hash
+    ///   from a node in no config this cluster adopted is not evidence about
+    ///   this cluster's artifacts. Learners count as members (their hashes are
+    ///   evidence) but never toward the quorum below.
+    /// * **Newer than the record.** A report at or below the row's COMMITTED
+    ///   report position says nothing the log does not already hold, and
+    ///   appending it again would churn the log for nothing. This is strictly
+    ///   stronger than the FSM's own `ReportStale` refusal (which only refuses
+    ///   a STRICTLY older position), so a command built from this map is never
+    ///   one the FSM would refuse for staleness.
+    /// * **Newest instant per row.** One pending entry per row. A report for a
+    ///   NEWER instant replaces the entry outright — the older instant's
+    ///   hashes attest a different artifact and must not be mixed in — and
+    ///   restarts the timeout, because it is the new instant's set the leader
+    ///   is now waiting on. A report for an older instant than the one pending
+    ///   is dropped.
     fn on_snap_report(&mut self, from: NodeId, row: u8, position: u64, hash: u64) {
-        self.pending_snapshot_reports_stub
-            .push((from, row, position, hash));
+        if !matches!(self.sm.role(), Role::Leader) {
+            return;
+        }
+        if !self.sm.config().contains(from) {
+            return;
+        }
+        // Belt and braces: `read_snap_report_body` already refuses a row this
+        // page has no slot for (and a zero position), and the leader's own
+        // in-process call comes from `services.ids()`. The compare is one
+        // instruction and it keeps a wire-derived `row` from ever reaching
+        // `encode_snapshot_report`'s `expect` below.
+        if row as usize >= CNC_MAX_SERVICES {
+            return;
+        }
+        if position <= self.held_report_position(row) {
+            return;
+        }
+        let now = self.pass_mono_ns;
+        let node = self.id as u64;
+        match self.pending_snapshot_reports.get(&row).map(|p| p.position) {
+            Some(cur) if position < cur => return,
+            Some(cur) if position > cur => {
+                crate::obs_event!(
+                    Info,
+                    "snapshot_report_superseded",
+                    node = node,
+                    row = row as u64,
+                    old = cur,
+                    new = position
+                );
+                self.pending_snapshot_reports.insert(
+                    row,
+                    PendingSnapshotReport {
+                        position,
+                        first_seen_ns: now,
+                        hashes: BTreeMap::new(),
+                    },
+                );
+            }
+            Some(_) => {}
+            None => {
+                self.pending_snapshot_reports.insert(
+                    row,
+                    PendingSnapshotReport {
+                        position,
+                        first_seen_ns: now,
+                        hashes: BTreeMap::new(),
+                    },
+                );
+            }
+        }
+        self.pending_snapshot_reports
+            .get_mut(&row)
+            .expect("just inserted, or already present")
+            .hashes
+            .insert(from, hash);
+    }
+
+    /// Plan B3 (spec §6.5.2), the other half: place ONE row's collection on
+    /// the log as a `CLUSTER kind = 5 SnapshotReport`. Called once per leader
+    /// pass, beside the pass's other leader-issued `CLUSTER` appends.
+    ///
+    /// A row is ready when a QUORUM of voters has reported it — the same
+    /// majority every other decision in this system rests on — or when its
+    /// collection has stood for [`SNAP_REPORT_TIMEOUT_NS`], whichever comes
+    /// first. The timeout is what keeps a down node from stopping the record
+    /// altogether: the append then names who DID report, which is exactly the
+    /// evidence [`uc_protocol::v2::upgrade::verdict`] reads.
+    ///
+    /// **At most one append per pass**, because `append_cluster_frame` shuts
+    /// the single-in-flight gate behind it: a second command placed above an
+    /// uncommitted one is precisely what that gate exists to refuse. Ready
+    /// rows beyond the first simply wait for the next pass, and the lowest row
+    /// number goes first so the choice is deterministic rather than a
+    /// `HashMap`'s iteration order.
+    ///
+    /// On `WouldOverrun` the entry is KEPT — the buffer was momentarily full,
+    /// nothing was appended, and the set is still the newest thing this leader
+    /// knows about that row.
+    fn maybe_append_snapshot_reports(&mut self) -> bool {
+        if self.pending_snapshot_reports.is_empty() {
+            return false;
+        }
+        let view_position = self.cluster_view.position.load(Ordering::Acquire);
+        if self.last_cluster_append > view_position {
+            return false; // single-in-flight: a CLUSTER command is above commit
+        }
+        let now = self.pass_mono_ns;
+        let config = self.sm.config().clone();
+        let quorum = config.voters.len() / 2 + 1;
+        // The ready row with the lowest number, and how many voters it has.
+        let mut ready: Option<(u8, usize)> = None;
+        for (&row, pend) in self.pending_snapshot_reports.iter() {
+            let voters_reporting = pend
+                .hashes
+                .keys()
+                .filter(|id| config.is_voter(**id))
+                .count();
+            let timed_out = now.saturating_sub(pend.first_seen_ns) >= SNAP_REPORT_TIMEOUT_NS;
+            if (voters_reporting >= quorum || timed_out)
+                && ready.is_none_or(|(chosen, _)| row < chosen)
+            {
+                ready = Some((row, voters_reporting));
+            }
+        }
+        let Some((row, voters_reporting)) = ready else {
+            return false;
+        };
+        let pend = &self.pending_snapshot_reports[&row];
+        let position = pend.position;
+        let hashes: Vec<(u32, u64)> = pend.hashes.iter().map(|(id, h)| (*id, *h)).collect();
+        // The row's committed report can have MOVED since the entry was made
+        // (a previous leader's record committing under us), in which case this
+        // one says nothing newer. Dropped rather than appended: the append
+        // would be refused at apply as stale, having cost the log a frame.
+        if position <= self.held_report_position(row) {
+            self.pending_snapshot_reports.remove(&row);
+            return false;
+        }
+        let reporters = hashes.len() as u64;
+        // Encodable by construction: non-empty (an entry is only ever created
+        // together with its first hash), at most one entry per member and
+        // therefore at most `MAX_MEMBERS`, strictly increasing by node id (the
+        // `BTreeMap`'s order), `row < CNC_MAX_SERVICES` and a non-zero
+        // position — the last two are `on_snap_report`'s door.
+        let cmd = ClusterCommand::SnapshotReport(SnapshotReport {
+            row,
+            position,
+            hashes,
+        });
+        match self.append_cluster_frame(&cmd) {
+            Ok(end) => {
+                let by_timeout = voters_reporting < quorum;
+                self.pending_snapshot_reports.remove(&row);
+                self.snapshot_reports_appended
+                    .fetch_add(1, Ordering::Relaxed);
+                if by_timeout {
+                    self.snapshot_reports_timed_out
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                crate::obs_event!(
+                    Info,
+                    "snapshot_report_appended",
+                    node = self.id as u64,
+                    row = row as u64,
+                    position = position,
+                    frame_end = end,
+                    reporters = reporters,
+                    voters_reporting = voters_reporting as u64,
+                    quorum = quorum as u64,
+                    by = if by_timeout { "timeout" } else { "quorum" }
+                );
+                true
+            }
+            // WouldOverrun (or the unreachable PayloadTooLarge — the record is
+            // at most 112 bytes): nothing was appended, so the entry stands
+            // and the next pass tries again.
+            Err(_) => false,
+        }
     }
 
     /// Spec §5.3 (Ruling P1): the node-owned, **delete-only** retention
@@ -7952,13 +8205,21 @@ impl Consensus {
                 self.follow_snap_redirect(learner_id, position);
                 return;
             }
-            // Plan B3 T2: wire-level routing only — kept exhaustive here so
-            // the match compiles. The leader-side collector (dedup per
-            // (row, position), quorum/timeout, `CLUSTER kind = 5
-            // SnapshotReport` append) is Task 4's `on_snap_report`, which
-            // replaces this arm; nothing sends a live `SNAP_REPORT` yet
-            // either (Task 3's job), so dropping it here is a no-op today.
-            NetEvent::SnapReport { .. } => {
+            // Plan B3 (spec §6.5.2): another node's artifact hash for one
+            // row at one instant. Handled inline — the collector is this
+            // agent's own state, and the report is not an SM event: it says
+            // nothing about the log, only about what a snapshot of it hashed
+            // to. `on_snap_report` does the membership and staleness checks
+            // (`from` is the id the BODY carries, which is what makes a
+            // leader's in-process hand-off and a follower's datagram the same
+            // call).
+            NetEvent::SnapReport {
+                from,
+                row,
+                position,
+                hash,
+            } => {
+                self.on_snap_report(from, row, position, hash);
                 return;
             }
         };
@@ -9271,6 +9532,11 @@ impl Consensus {
                 // holding its position would refuse every later apply — on
                 // this node, forever.
                 self.last_cluster_append = 0;
+                // Plan B3 (spec §6.5.2): and the reports collected under the
+                // term we just left go with it — they are a leader's evidence
+                // to place, this node no longer appends, and every reporter
+                // reports again at its next instant.
+                self.pending_snapshot_reports.clear();
                 // Coordinated-snapshot spec §5.5: the snapshot instant's
                 // single-in-flight gate opens for the identical reason. The
                 // metric (`snapshot_instant_pub`) is deliberately NOT reset —
@@ -9572,9 +9838,11 @@ impl Consensus {
         // Cluster-FSM spec §4.9: the other leader-exit path — this node will
         // never append again, so the heap is discarded here too.
         self.discard_timers();
-        // …and the same for the cluster-command gate (`BecomeFollower`) and
-        // the snapshot instant's.
+        // …and the same for the cluster-command gate (`BecomeFollower`), the
+        // snapshot instant's, and the reports collected for an append this
+        // node will never make.
         self.last_cluster_append = 0;
+        self.pending_snapshot_reports.clear();
         self.snapshot_last_commanded = 0;
         self.snapshot_last_commanded_standby = false;
         self.can_serve_flag.store(false, Ordering::Release);
@@ -11523,7 +11791,9 @@ mod tests {
             schedule_refused: Arc::new(AtomicU64::new(0)),
             snapshot_reports_sent: Arc::new(AtomicU64::new(0)),
             snapshot_reports_unsent: Arc::new(AtomicU64::new(0)),
-            pending_snapshot_reports_stub: Vec::new(),
+            snapshot_reports_appended: Arc::new(AtomicU64::new(0)),
+            snapshot_reports_timed_out: Arc::new(AtomicU64::new(0)),
+            pending_snapshot_reports: HashMap::new(),
             ingress_rx,
             trunc_tx,
             trunc_slot,
@@ -12252,7 +12522,7 @@ mod tests {
         assert_eq!(h.cons.snapshot_reports_sent.load(Ordering::Relaxed), 2);
         assert_eq!(h.cons.snapshot_reports_unsent.load(Ordering::Relaxed), 0);
         assert!(
-            h.cons.pending_snapshot_reports_stub.is_empty(),
+            h.cons.pending_snapshot_reports.is_empty(),
             "a follower reports TO the leader; it collects nothing itself"
         );
     }
@@ -12274,10 +12544,15 @@ mod tests {
         h.cluster_snapshot_pos.store(p, Ordering::Release);
         h.cons.check_set_completeness();
 
+        let pend = &h.cons.pending_snapshot_reports[&0];
+        assert_eq!(pend.position, p);
         assert_eq!(
-            h.cons.pending_snapshot_reports_stub,
-            vec![(1u32, 0u8, p, 0x00C0_FFEE_00C0_FFEE)],
-            "the leader's own report reaches its collector with its own id"
+            pend.hashes
+                .iter()
+                .map(|(k, v)| (*k, *v))
+                .collect::<Vec<_>>(),
+            vec![(1u32, 0x00C0_FFEE_00C0_FFEE_u64)],
+            "the leader's own report reaches its collector under its own id"
         );
         assert!(
             drain_snap_reports(&sock).is_empty(),
@@ -12409,6 +12684,325 @@ mod tests {
             "the completed set is still at P — but the EDGE has passed"
         );
         assert_eq!(h.cons.snapshot_reports_sent.load(Ordering::Relaxed), 1);
+    }
+
+    // ---- plan B3 T4: the leader collects the reports and appends the record ----
+
+    /// Spec §6.5.2 item 3, the base case: the leader holds what arrives per
+    /// `(row, instant)` and appends ONE `CLUSTER kind = 5` record the moment a
+    /// QUORUM of voters has reported — two of three here. The committed record
+    /// carries every reporter's hash, canonically ordered by node id, which is
+    /// what makes [`uc_protocol::v2::upgrade::verdict`] a pure function of the
+    /// log rather than of whoever happened to be leading.
+    #[test]
+    fn snapshot_reports_append_on_a_voter_quorum() {
+        let _obs = obs_capture_lock();
+        let mut h = harness_with_rows(&["a"]);
+        drive_to_serving_leader(&mut h);
+        h.cons.pass_mono_ns = 1_000;
+        let p = 6048u64;
+
+        let buf = crate::obs::log::capture_for_tests();
+        h.cons.on_snap_report(1, 0, p, 0xA1);
+        assert!(
+            !h.cons.maybe_append_snapshot_reports(),
+            "one voter of three is not a quorum"
+        );
+        h.cons.on_snap_report(0, 0, p, 0xA1);
+        assert!(
+            h.cons.maybe_append_snapshot_reports(),
+            "two of three is — and the leader does not wait out its timeout"
+        );
+        let text = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        crate::obs::log::stderr_for_tests();
+
+        let end = h.cons.last_cluster_append;
+        h.commit_through(end);
+        let state = h.cons.cluster_view.to_state();
+        assert_eq!(
+            state.report_for(0),
+            Some(&SnapshotReport {
+                row: 0,
+                position: p,
+                hashes: vec![(0, 0xA1), (1, 0xA1)],
+            }),
+            "the record holds both hashes, ordered by node id"
+        );
+        assert!(
+            h.cons.pending_snapshot_reports.is_empty(),
+            "an appended row stops being pending"
+        );
+        assert_eq!(
+            h.cons.snapshot_reports_appended.load(Ordering::Relaxed),
+            1,
+            "counted once"
+        );
+        assert_eq!(
+            h.cons.snapshot_reports_timed_out.load(Ordering::Relaxed),
+            0,
+            "a quorum append is not a timeout append"
+        );
+        assert!(
+            text.contains(r#""event":"snapshot_report_appended""#)
+                && text.contains(r#""by":"quorum""#),
+            "the record says which rule fired: {text}"
+        );
+
+        // ...and the straggler that arrives afterwards is DROPPED: its instant
+        // is no newer than the one the committed record already holds, and
+        // re-appending it would churn the log for nothing.
+        h.cons.on_snap_report(2, 0, p, 0xA1);
+        assert!(
+            h.cons.pending_snapshot_reports.is_empty(),
+            "<= the held report's position"
+        );
+        assert!(!h.cons.maybe_append_snapshot_reports());
+    }
+
+    /// Spec §6.5.2: a set that never completes on a quorum must still reach
+    /// the log — a partial record naming who DID report is evidence; silence
+    /// is not. After [`SNAP_REPORT_TIMEOUT_NS`] the leader appends what it has.
+    #[test]
+    fn a_partial_report_set_appends_after_the_timeout() {
+        let _obs = obs_capture_lock();
+        let mut h = harness_with_rows(&["a"]);
+        drive_to_serving_leader(&mut h);
+        h.cons.pass_mono_ns = 1_000;
+        let p = 6048u64;
+
+        h.cons.on_snap_report(1, 0, p, 0xB2);
+        assert!(!h.cons.maybe_append_snapshot_reports(), "one of three");
+        h.cons.pass_mono_ns += SNAP_REPORT_TIMEOUT_NS - 1;
+        assert!(
+            !h.cons.maybe_append_snapshot_reports(),
+            "a nanosecond short of the timeout still waits"
+        );
+        h.cons.pass_mono_ns += 1;
+        let buf = crate::obs::log::capture_for_tests();
+        assert!(h.cons.maybe_append_snapshot_reports(), "5 s is up");
+        let text = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        crate::obs::log::stderr_for_tests();
+
+        let end = h.cons.last_cluster_append;
+        h.commit_through(end);
+        let state = h.cons.cluster_view.to_state();
+        assert_eq!(
+            state.report_for(0),
+            Some(&SnapshotReport {
+                row: 0,
+                position: p,
+                hashes: vec![(1, 0xB2)],
+            }),
+            "one reporter is a legitimate record — `verdict` reads it as agreed over one node"
+        );
+        assert_eq!(h.cons.snapshot_reports_appended.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            h.cons.snapshot_reports_timed_out.load(Ordering::Relaxed),
+            1,
+            "and the operator can see it was the timeout that placed it"
+        );
+        assert!(
+            text.contains(r#""by":"timeout""#),
+            "the record says which rule fired: {text}"
+        );
+    }
+
+    /// Membership is the whole of the leader's trust here: a hash from a node
+    /// that is in no config this cluster adopted is not evidence about this
+    /// cluster's artifacts, and letting one in would put an unattributable
+    /// entry in the record an upgrade pin is adjudicated from.
+    #[test]
+    fn a_snapshot_report_from_a_non_member_is_dropped() {
+        let mut h = harness_with_rows(&["a"]);
+        drive_to_serving_leader(&mut h);
+        h.cons.on_snap_report(99, 0, 6048, 0xC3);
+        assert!(
+            h.cons.pending_snapshot_reports.is_empty(),
+            "node 99 is in no config this cluster has adopted"
+        );
+    }
+
+    /// A LEARNER is a member: its hash is collected and lands in the record —
+    /// it is evidence like anyone's. It just never counts toward the quorum
+    /// that decides WHEN to append, exactly as it counts toward no other
+    /// quorum in this system.
+    #[test]
+    fn a_learners_report_is_collected_but_never_counts_toward_the_quorum() {
+        let mut h = harness_with_rows(&["a"]);
+        drive_to_serving_leader(&mut h);
+        adopt_config_change(
+            &mut h,
+            ConfigOp::AddLearner {
+                id: 3,
+                addr: addr_to_pair("127.0.0.1:9103".parse().unwrap()),
+            },
+        );
+        h.cons.pass_mono_ns = 1_000;
+        let p = 6048u64;
+
+        h.cons.on_snap_report(3, 0, p, 0xD4);
+        h.cons.on_snap_report(1, 0, p, 0xD4);
+        assert!(
+            !h.cons.maybe_append_snapshot_reports(),
+            "one voter plus a learner is not a quorum of the three voters"
+        );
+        h.cons.on_snap_report(0, 0, p, 0xD4);
+        assert!(h.cons.maybe_append_snapshot_reports());
+
+        let end = h.cons.last_cluster_append;
+        h.commit_through(end);
+        let state = h.cons.cluster_view.to_state();
+        assert_eq!(
+            state.report_for(0).map(|r| r.hashes.clone()),
+            Some(vec![(0, 0xD4), (1, 0xD4), (3, 0xD4)]),
+            "the learner's hash IS in the record"
+        );
+    }
+
+    /// One pending set per row, and it is always the NEWEST instant's: a node
+    /// that completed a later set has moved on, and holding both would leave
+    /// the leader appending a record about an instant the cluster has passed.
+    /// The timeout restarts with the new instant — it is that instant's set
+    /// the leader is now waiting on.
+    #[test]
+    fn a_newer_instant_supersedes_the_pending_reports_for_that_row() {
+        let _obs = obs_capture_lock();
+        let mut h = harness_with_rows(&["a"]);
+        drive_to_serving_leader(&mut h);
+        h.cons.pass_mono_ns = 1_000;
+        let (p1, p2) = (6048u64, 7040u64);
+
+        h.cons.on_snap_report(0, 0, p1, 0x11);
+        h.cons.pass_mono_ns += 1_000;
+        let buf = crate::obs::log::capture_for_tests();
+        h.cons.on_snap_report(2, 0, p2, 0x22);
+        let text = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        crate::obs::log::stderr_for_tests();
+
+        let pend = &h.cons.pending_snapshot_reports[&0];
+        assert_eq!(pend.position, p2, "the newer instant took the slot");
+        assert_eq!(
+            pend.hashes
+                .iter()
+                .map(|(k, v)| (*k, *v))
+                .collect::<Vec<_>>(),
+            vec![(2, 0x22)],
+            "p1's hashes are NOT carried over — they attest a different artifact"
+        );
+        assert_eq!(
+            pend.first_seen_ns, 2_000,
+            "the timeout runs from the new instant, not the superseded one"
+        );
+        assert!(
+            text.contains(r#""event":"snapshot_report_superseded""#),
+            "the drop is recorded: {text}"
+        );
+
+        // A LATE report for the superseded instant never re-opens it.
+        h.cons.on_snap_report(1, 0, p1, 0x11);
+        assert_eq!(h.cons.pending_snapshot_reports[&0].position, p2);
+        assert_eq!(h.cons.pending_snapshot_reports[&0].hashes.len(), 1);
+    }
+
+    /// Collection is LEADER-only. A follower that took a report would hold a
+    /// set nobody appends (it has no appender) and hand it to nothing on
+    /// promotion — the reporters re-report at the next instant, to whoever
+    /// leads then.
+    #[test]
+    fn a_follower_collects_nothing() {
+        let mut h = harness_with_rows(&["a"]);
+        assert!(!matches!(h.cons.sm.role(), Role::Leader));
+        h.cons.on_snap_report(0, 0, 6048, 0xE5);
+        assert!(h.cons.pending_snapshot_reports.is_empty());
+    }
+
+    /// Both leader exits drop what was collected, for `last_cluster_append`'s
+    /// reason: a set collected under a term we no longer lead is not ours to
+    /// place, and the next leader collects its own.
+    #[test]
+    fn both_leader_exits_clear_the_pending_snapshot_reports() {
+        for halt in [false, true] {
+            let mut h = harness_with_rows(&["a"]);
+            drive_to_serving_leader(&mut h);
+            h.cons.on_snap_report(0, 0, 6048, 0xF6);
+            assert!(!h.cons.pending_snapshot_reports.is_empty());
+            if halt {
+                h.cons.halt();
+            } else {
+                h.cons.feed(Event::RequestVote {
+                    from: 0,
+                    new_term: 9,
+                    last_term: 9,
+                    last_durable: 1 << 20,
+                });
+            }
+            assert!(
+                h.cons.pending_snapshot_reports.is_empty(),
+                "leader exit (halt = {halt}) drops the collection"
+            );
+        }
+    }
+
+    /// Spec §4.4: the record is a `CLUSTER` command like any other, so it
+    /// waits behind the single-in-flight gate rather than appending a second
+    /// command above an uncommitted one. Kept, never dropped — the set is
+    /// still the newest thing this leader knows about that row.
+    #[test]
+    fn the_report_append_waits_for_the_single_in_flight_gate() {
+        let mut h = harness_with_rows(&["a"]);
+        drive_to_serving_leader(&mut h);
+        h.cons.pass_mono_ns = 1_000;
+        let end = h
+            .cons
+            .append_cluster_frame(&ClusterCommand::Settings(Settings {
+                snapshot_interval_bytes: 5,
+                ..Settings::genesis_default()
+            }))
+            .expect("settings append");
+        let p = 6080u64;
+        h.cons.on_snap_report(0, 0, p, 0x77);
+        h.cons.on_snap_report(1, 0, p, 0x77);
+
+        assert!(
+            !h.cons.maybe_append_snapshot_reports(),
+            "a CLUSTER command is above the view"
+        );
+        assert!(
+            h.cons.pending_snapshot_reports.contains_key(&0),
+            "held for the next pass, not dropped"
+        );
+
+        h.commit_through(end);
+        assert!(
+            h.cons.maybe_append_snapshot_reports(),
+            "the gate opened at commit"
+        );
+        let end = h.cons.last_cluster_append;
+        h.commit_through(end);
+        let state = h.cons.cluster_view.to_state();
+        assert_eq!(state.report_for(0).map(|r| r.position), Some(p));
+    }
+
+    /// The collector runs on the ordinary leader pass — nothing else calls it,
+    /// so a suite that only ever called it by hand would pass over a collector
+    /// that was never wired into `do_work`.
+    #[test]
+    fn the_leader_pass_places_the_record_without_being_asked() {
+        let mut h = harness_with_rows(&["a"]);
+        drive_to_serving_leader(&mut h);
+        h.cons.do_work(); // one ordinary pass: `first_seen_ns` is then a real clock reading
+        let p = 6080u64;
+        h.cons.on_snap_report(0, 0, p, 0x88);
+        h.cons.on_snap_report(1, 0, p, 0x88);
+
+        let before = h.cons.cnc.counters().append.load_acquire();
+        h.cons.do_work();
+        assert!(
+            h.cons.cnc.counters().append.load_acquire() > before,
+            "the pass placed the record"
+        );
+        assert_eq!(h.cons.snapshot_reports_appended.load(Ordering::Relaxed), 1);
+        assert!(h.cons.pending_snapshot_reports.is_empty());
     }
 
     /// Spec §5.7 item 4 (Ruling P4'): a set this node FETCHED from a learner
@@ -13544,8 +14138,11 @@ mod tests {
         spend_fast_ladder(&h);
         publish_committed_rung(&mut h, MTU_BOUND as u32);
 
-        // No unit test in this module swaps the obs sink, so the capture is
-        // this test's alone (other tests may add noise lines to it).
+        // `OBS_CAPTURE_LOCK` (taken above) is what makes this capture this
+        // test's alone: the sink is process-global and several tests in this
+        // module swap it. Other tests still add noise LINES to the buffer
+        // while it is installed — the assertions below look for a record, not
+        // for an exact transcript.
         let buf = crate::obs::log::capture_for_tests();
         pass_checking_the_gate(&mut h);
         let text = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
