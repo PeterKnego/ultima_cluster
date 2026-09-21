@@ -64,6 +64,13 @@ pub(crate) struct ReplayInstant<'a, S: RawStateMachine> {
     pub node_flags: u64,
     /// This row's cnc slot, for the "already held" guard below.
     pub service_id: u8,
+    /// Plan B2 T4: the upgrade pin this incarnation attached under, `(origin,
+    /// from, to)`, or `None` on an unpinned row. Read by the gap guard only —
+    /// see the `expect_version` decision there. Travels on `ReplayInstant`
+    /// rather than as a sixth parameter to [`replay_into`] because it is the
+    /// same kind of thing the other three are: a fact about this row fixed at
+    /// attach that the replayed span needs in order to decide correctly.
+    pub pin: Option<(u64, u32, u32)>,
 }
 
 /// Ruling P10, pass 1: the START position of the LAST `SNAPSHOT` frame in the
@@ -247,15 +254,31 @@ pub(crate) fn replay_into<S: RawStateMachine>(
                 // and this incarnation's `apply` may have genuinely different
                 // semantics for the same recorded command (spec §2.3's worked
                 // example: `Write(v)` meaning `v` under one build and `2·v`
-                // under another). The pinned path (`attach`) is the sanctioned
-                // way across a version boundary and checks against the pin's
-                // `from` instead of `S::VERSION` (Task 4).
-                let env =
-                    crate::snapshots::verify_snapshot_envelope(&mut file, s_pos, Some(S::VERSION))
-                        .map_err(|e| ServiceError::MistaggedSnapshot {
-                            path: path.display().to_string(),
-                            source: e,
-                        })?;
+                // under another).
+                //
+                // Plan B2 T4 (review fix): with EXACTLY ONE exception — the
+                // artifact at this row's pinned ORIGIN. `attach` already
+                // installed that artifact, having checked it against the pin's
+                // `from`; the cluster sanctioned this crossing. This path can
+                // legitimately meet it again (the origin sits at or above the
+                // purge floor, so the newest covering artifact IS snap-origin)
+                // and refusing it here would fail-stop the apply thread of a
+                // service that attached successfully. Every OTHER artifact
+                // must still be same-version: the pin sanctions one instant,
+                // not the whole snapshot directory.
+                let expect_version = match instant.pin {
+                    Some((origin, from, _)) if origin == s_pos => from,
+                    _ => S::VERSION,
+                };
+                let env = crate::snapshots::verify_snapshot_envelope(
+                    &mut file,
+                    s_pos,
+                    Some(expect_version),
+                )
+                .map_err(|e| ServiceError::MistaggedSnapshot {
+                    path: path.display().to_string(),
+                    source: e,
+                })?;
                 let installed = (r.install)(&mut guard, s_pos, &mut file)
                     .map_err(|e| ServiceError::Replay(format!("snapshot install: {e}")))?;
                 // A self-check on the TRAIT contract ("returns the post-install

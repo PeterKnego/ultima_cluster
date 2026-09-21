@@ -52,9 +52,17 @@ const CLIENT_ID: u32 = 7;
 const V1: u32 = <RegisterSm as StateMachine>::VERSION;
 const V2: u32 = <DoublingRegisterSm as StateMachine>::VERSION;
 
-/// v1 writes `0..WRITES`; its register at P therefore holds `LAST_WRITE`.
-const WRITES: u64 = 5;
-const LAST_WRITE: u64 = WRITES - 1;
+/// v1 writes `Write(i % MODULUS)`; every `writes` count is a multiple of
+/// `MODULUS`, so its register at P always holds `LAST_WRITE`.
+const MODULUS: u64 = 5;
+const LAST_WRITE: u64 = MODULUS - 1;
+/// The PURGING fixture's shape: small journal segments so a few hundred KiB
+/// of log rolls many of them and the purge below P is real; `PURGE_FILLERS`
+/// frames above P then scroll the 64 KiB ring past P.
+const PURGE_SEGMENT_BYTES: u64 = 8 * 1024;
+const PURGE_WRITES: u64 = 4_000;
+const PURGE_FILLERS: u64 = 2_000;
+const PURGE_EXTRA_INSTANTS: u64 = 400;
 /// The post-P tail's first frame: one CAS keyed on v1's TRUE state at P (see
 /// the module doc).
 const CAS_NEW: u64 = 99;
@@ -95,7 +103,20 @@ fn wait_until(what: &str, mut f: impl FnMut() -> bool) {
     }
 }
 
-fn start_node(dir: &Path, app_id: &str) -> Node {
+/// Bounded wait that REPORTS rather than panics — for a condition that is
+/// allowed not to hold (a skipped instant publishes no artifact).
+fn wait_for(limit: Duration, mut f: impl FnMut() -> bool) -> bool {
+    let deadline = Instant::now() + limit;
+    while !f() {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    true
+}
+
+fn start_node(dir: &Path, app_id: &str, purge: PurgePolicy, segment_bytes: u64) -> Node {
     let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
     Node::start(NodeConfig {
         id: 0,
@@ -112,9 +133,9 @@ fn start_node(dir: &Path, app_id: &str) -> Node {
         election_timeout_max_ns: 100_000_000,
         seed: 1,
         faults: FaultConfig::default(),
-        purge: PurgePolicy::Disabled,
+        purge,
         learners: Vec::new(),
-        journal_segment_bytes: SEGMENT_BYTES,
+        journal_segment_bytes: segment_bytes,
         crypto: uc_node::CryptoConfig::Disabled,
         services: uc_node::ServicesConfig::single(<RegisterSm as StateMachine>::NAME),
     })
@@ -215,49 +236,133 @@ struct Fixture {
     p: u64,
 }
 
+/// How a [`Fixture`] is built. [`Spec::small`] is the purge-off shape every
+/// refusal test uses; [`Spec::purging`] is spec S4's production posture.
+struct Spec {
+    purge: PurgePolicy,
+    segment_bytes: u64,
+    /// `Write(i % MODULUS)` this many times before the instant. A multiple of
+    /// `MODULUS`, so v1's register at P is always `LAST_WRITE`.
+    writes: u64,
+    /// Extra never-matching CAS frames after the tail's first two, to scroll
+    /// the live ring past P — so the pinned attach's follower OVERRUNS and
+    /// the reconstruction path (`uc_service::replay`) runs.
+    fillers: u64,
+    /// Extra coordinated instants commanded after the row's last write, each
+    /// appending a header-only `SNAPSHOT` frame the row does NOT apply. They
+    /// push the instant **P** far above the row's last applied MESSAGE, which
+    /// is what puts the artifact's internal cursor below the purge floor —
+    /// the shape in which `replay_into`'s gap guard actually fires after a
+    /// pinned install. See `a_pinned_attach_converges_on_a_purging_cluster`.
+    extra_instants: u64,
+}
+
+impl Spec {
+    fn small() -> Spec {
+        Spec {
+            purge: PurgePolicy::Disabled,
+            segment_bytes: SEGMENT_BYTES,
+            writes: MODULUS,
+            fillers: 0,
+            extra_instants: 0,
+        }
+    }
+
+    fn purging() -> Spec {
+        Spec {
+            purge: PurgePolicy::BelowSnapshot { slack_bytes: 0 },
+            segment_bytes: PURGE_SEGMENT_BYTES,
+            writes: PURGE_WRITES,
+            fillers: PURGE_FILLERS,
+            extra_instants: PURGE_EXTRA_INSTANTS,
+        }
+    }
+}
+
 impl Fixture {
     fn new(app: &'static str) -> Fixture {
+        Fixture::build(app, Spec::small())
+    }
+
+    fn build(app: &'static str, spec: Spec) -> Fixture {
         let dir = tempdir();
-        let node = start_node(dir.path(), app);
+        let node = start_node(dir.path(), app, spec.purge, spec.segment_bytes);
         wait_until("node can serve", || node.can_serve());
 
         let svc1 = ServiceBuilder::new(cfg(dir.path(), app), RegisterSm::default())
             .start_with_snapshots()
             .unwrap();
         let prod = open_ingress(dir.path());
-        for v in 0..WRITES {
-            submit(&prod, v as u32 + 1, &RegCmd::Write(v));
+        let mut seq = 0u32;
+        for i in 0..spec.writes {
+            seq += 1;
+            submit(&prod, seq, &RegCmd::Write(i % MODULUS));
         }
         wait_drained(&node);
         let cnc = open_cnc(dir.path(), app);
         wait_service_caught_up(&cnc);
         assert_eq!(query_v1(&svc1), Some(LAST_WRITE), "v1's state before P");
 
-        let p = command_instant(&node);
-        let art = artifact_path(dir.path(), p);
-        wait_until("row 0 published its artifact", || art.is_file());
+        // The instant. `extra_instants` of them are commanded first: each is a
+        // header-only `SNAPSHOT` frame the row skips, so they lift P away from
+        // the row's last applied MESSAGE without changing its state.
+        let mut p = command_instant(&node);
+        for _ in 0..spec.extra_instants {
+            p = command_instant(&node);
+        }
+        // An instant whose builder was busy publishes nothing (`freeze` is
+        // skipped, `SNAPSHOT_SKIPPED_BUSY`), so keep commanding until one
+        // lands rather than waiting forever on a skipped one.
+        loop {
+            let art = artifact_path(dir.path(), p);
+            if wait_for(Duration::from_millis(500), || art.is_file()) {
+                break;
+            }
+            p = command_instant(&node);
+        }
+        if !matches!(spec.purge, PurgePolicy::Disabled) {
+            // The complete set at P moves the durable snapshot floor, which
+            // commands the purge; the archive acks by advancing its first
+            // base (the persist is throttled, so this is a wait, not a poll).
+            wait_until("purge advanced the archive floor", || {
+                node.archive_first_base() > 0
+            });
+        }
 
         // The tail above P: one CAS that only v1's true state at P satisfies,
-        // then one that nothing satisfies (see `NEVER_MATCHES`).
+        // then never-matching ones (see `NEVER_MATCHES`) — at least one, so
+        // the tail's LAST frame starts strictly above P.
+        seq += 1;
         submit(
             &prod,
-            WRITES as u32 + 1,
+            seq,
             &RegCmd::Cas {
                 old: LAST_WRITE,
                 new: CAS_NEW,
             },
         );
-        submit(
-            &prod,
-            WRITES as u32 + 2,
-            &RegCmd::Cas {
-                old: NEVER_MATCHES,
-                new: 0,
-            },
-        );
+        for _ in 0..=spec.fillers {
+            seq += 1;
+            submit(
+                &prod,
+                seq,
+                &RegCmd::Cas {
+                    old: NEVER_MATCHES,
+                    new: 0,
+                },
+            );
+        }
         wait_drained(&node);
         wait_service_caught_up(&cnc);
         assert_eq!(query_v1(&svc1), Some(CAS_NEW), "v1 applied its own tail");
+        if spec.fillers > 0 {
+            let append = node.counters().append.load_acquire();
+            assert!(
+                append > p + BUFFER_BYTES as u64,
+                "the ring must have scrolled PAST P so the pinned attach's \
+                 follower overruns: append={append}, P={p}, capacity={BUFFER_BYTES}"
+            );
+        }
         svc1.stop();
 
         Fixture { dir, app, node, p }
@@ -358,6 +463,51 @@ fn the_pinned_version_installs_the_origin_unconditionally_and_recomputes_the_tai
         Some(CAS_NEW),
         "the artifact at P was installed, then the tail recomputed under v2"
     );
+    assert_eq!(
+        svc2.pinned(),
+        Some((f.p, V1, V2)),
+        "this incarnation reports the pin it installed under"
+    );
+    svc2.stop();
+    f.stop();
+}
+
+/// Purge is the production posture of spec §3 S4, and it is the posture that
+/// puts the pinned attach on the reconstruction path: the ring has scrolled
+/// past the origin, so the follower overruns immediately and
+/// `uc_service::replay` runs — with the journal purged below the instant.
+///
+/// Two things have to hold for that to converge, and neither did before the
+/// T4 review fix:
+///
+/// * the follower must resume at the ORIGIN, not at the artifact's internal
+///   cursor: the tag is an exclusive frontier, so everything below it IS the
+///   artifact;
+/// * when the gap guard does fire, the artifact at the PINNED ORIGIN must be
+///   installable by this binary — it was built by the pin's `from`, and the
+///   unpinned same-version rule (plan B2 T3) would refuse it and fail-stop
+///   the apply thread.
+#[test]
+fn a_pinned_attach_converges_on_a_purging_cluster() {
+    let f = Fixture::build("pin-purge", Spec::purging());
+    assert!(
+        f.node.archive_first_base() > 0,
+        "precondition: the journal is purged below P"
+    );
+    f.pin(V1, V2);
+
+    let svc2 = ServiceBuilder::new(cfg(f.path(), f.app), DoublingRegisterSm::default())
+        .start_with_snapshots()
+        .unwrap();
+    let cnc = f.cnc();
+    wait_service_caught_up(&cnc);
+    assert_eq!(
+        query_v2(&svc2),
+        Some(CAS_NEW),
+        "a pinned attach on a purging cluster converges on v1's history, \
+         not the counterfactual"
+    );
+    assert_eq!(svc2.pinned(), Some((f.p, V1, V2)));
     svc2.stop();
     f.stop();
 }

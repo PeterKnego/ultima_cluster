@@ -319,7 +319,23 @@ pub(crate) fn attach<S: RawStateMachine>(
     // the SAME journal-replay mechanism (Task 9) reconstructs + rejoins. Exactly
     // one rejoin mechanism — try-live-then-replay — covers both a caught-up
     // reattach and a fresh SM (`None -> 0`) on a long-scrolled ring.
-    let start_pos = last_applied.unwrap_or(0);
+    // Plan B2 T4 (review fix): after a PINNED install the follower resumes at
+    // the ORIGIN, not at the artifact's internal cursor. The artifact tag is
+    // an EXCLUSIVE frontier — everything below it IS the artifact — so the
+    // frames in `(cursor, origin)` are already reflected in the installed
+    // image and replaying them is not just wasted work: resuming below the
+    // origin is what hands the reconstruction path a `start_pos` under the
+    // purge floor, and its gap guard then re-installs the very artifact we
+    // just installed. `uc_service::replay`'s own post-install path does the
+    // same thing (`start_pos = installed; cursor = installed`).
+    //
+    // The SM's own cursor is deliberately left where `install_snapshot` put
+    // it (strictly below the origin), so the apply loop's idempotency guard
+    // dispatches the frame that starts exactly AT the origin.
+    let start_pos = match pin {
+        Some((origin, _, _)) => origin,
+        None => last_applied.unwrap_or(0),
+    };
     // `s` is the same slot reference taken for the pin read in step 1d.
     s.applied.store_release(start_pos);
     // Status: attached, incarnation += 1 (the prior life's value survives a
@@ -367,6 +383,11 @@ pub(crate) fn attach<S: RawStateMachine>(
         instance_mismatch_streak: 0,
         my_epoch: epoch,
         service_id: row,
+        // Plan B2 T4 (review fix): the reconstruction path needs the pin too —
+        // the artifact at the pinned ORIGIN was built by the pin's `from`, so
+        // the gap guard's same-version rule (plan B2 T3) has to make an
+        // exception for exactly that one artifact. See `replay::replay_into`.
+        pin,
         lag_mode,
         declared,
         lag_waiting: false,
