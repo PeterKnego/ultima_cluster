@@ -27,6 +27,8 @@
 3. **Empty vs. durable is the app's property, exercised by the harness's sequence, proven by the fixture.** Stopping OLD at X > P before the pin is what makes a durable SM attach with `last_applied() = X`; an in-memory SM attaches empty. The outcome check is the same for both (live == artifact path), and the report records X and P but cannot say which shape the app has. The two shapes are each proven on the harness's own fixture: `register-replay serve` (empty) and `register-replay serve --durable` (durable, via `uc_lincheck::register::Durable<S>`).
 4. **INCONCLUSIVE is an outcome, not a failure.** If NEW's artifact-path and genesis-path projections agree over the span, the run cannot show the counterfactual (the change did not alter the semantics of any command in the span); the refusal arm and the live-equals-artifact check still hold and are still judged. Exit 0 with the note, so a CI job can require PASS-or-INCONCLUSIVE while a human reads the note.
 5. **`upgrade show` is not consulted.** The record for an instant lands one instant behind the artifact `upgrade show` reads (B3's documented lag); the harness reads the pin from the row's cnc words (`PinRead::Pinned`) and the state from artifacts and projections, none of which lag.
+6. **A same-version run is refused, not judged** (ruling R-C-1, found in Task 3's smoke). The refusal arm re-attaches OLD after a pin to `--to`; if the row already runs `--to`, OLD is the pinned version and the arm cannot hold. The mode refuses before placing the pin, naming both numbers.
+7. **The demonstration needs a state-dependent tail** (ruling R-C-1). For a last-write-wins FSM a write-only span makes the artifact and genesis paths agree at the end (INCONCLUSIVE by design); the harness's own e2e uses a CAS chain whose outcome depends on the state at P. An app's corpus should likewise carry commands whose result depends on prior state, or the run cannot show the counterfactual — the how-to says so.
 
 ---
 
@@ -1204,44 +1206,121 @@ git commit -m "uc_diffreplay: pin-verify — the S4 refusal and swap arms on a r
 
 ---
 
-### Task 4: End to end — empty, durable, a stale NEW, a no-op change
+### Task 4: End to end — empty, durable, a stale NEW, a no-op change, a same-version refusal
 
 **Files:**
 - Create: `uc_diffreplay/tests/pin_verify.rs`
-- Test: that file
+- Modify: `uc_diffreplay/tests/common/mod.rs` (`build_register_history_with`), `uc_diffreplay/src/pinverify.rs` (the up-front same-version refusal, ruling R-C-1)
+- Test: `uc_diffreplay/tests/pin_verify.rs`
 
 **Interfaces:**
-- Consumes: `register-replay serve [--double] [--durable]` (T1), `uc2-diffreplay pin-verify` (T3, via `env!("CARGO_BIN_EXE_uc2-diffreplay")`), `common::build_register_history` + `Corpus::export` (plan A's way to make a register corpus: N writes, instant, M writes, export `[P, end)`).
-- Produces: nothing downstream; this is the proof.
+- Consumes: `register-replay serve [--double] [--durable]` (T1/T3: `--old-arg`/`--new-arg` carry the serve form's argv INCLUDING the `serve` verb; `pinverify::app_knobs` strips the verb for the `replay`/`project` forms), `uc2-diffreplay pin-verify` (T3, via `env!("CARGO_BIN_EXE_uc2-diffreplay")`), `Corpus::export`, `uc_lincheck::register::{Cmd, CmdResp}` (`Cmd::Write(u64)`, `Cmd::Cas { old, new }` → `CmdResp::CasResult(bool)`).
+- Produces: `common::build_register_history_with(dir, app_id, before: &[Cmd], after: &[Cmd]) -> u64` (P); `pinverify::run` refuses before the pin when the row's attached version equals `--to`.
 
-- [ ] **Step 1: The corpus fixture and the runner**
+**Why the corpus needs a CAS tail (ruling R-C-1).** `RegisterSm` is last-write-wins: a `Write` tail lands on the same final value under every start state, so NEW's artifact-path and genesis-path projections AGREE over a pure-write span and the run is INCONCLUSIVE — true, but not the demonstration. A `Cas { old, new }` whose `old` is the value at P succeeds on the artifact path (state at P is v1's) and fails on the genesis path (state at P is the doubled counterfactual), so the two paths diverge by construction. The pure-write corpus is kept as the INCONCLUSIVE case.
+
+**Why a same-version run is refused (ruling R-C-1).** The refusal arm re-attaches OLD after a pin to `--to`; if the row already runs `--to`, OLD IS the pinned version, attaches, and the arm cannot hold — a FAIL that would mislead. The mode therefore refuses before placing the pin, naming both numbers.
+
+- [ ] **Step 1: The up-front refusal (RED first)**
+
+In `uc_diffreplay/src/pinverify.rs::run`, immediately after `r.from` is read from the attached word and BEFORE the first `replay_span`:
 
 ```rust
-//! `uc2-diffreplay pin-verify` end to end on the register fixture: the
-//! empty and the durable state-machine shapes both PASS with the
-//! counterfactual DEMONSTRATED (spec §6.2 part 2); a stale NEW is a FAIL
-//! (the swap arm is refused by name); a version-identical "upgrade" is
-//! INCONCLUSIVE, not a pass.
+    if r.from == a.to {
+        let _ = old.stop(a.timeout);
+        node.stop();
+        bail!(
+            "row {} already runs version {:#010x}, which --to also names; pin-verify needs a \
+             version change (a same-version pin cannot hold the refusal arm: the \"stale\" \
+             binary IS the pinned version)",
+            a.row, r.from
+        );
+    }
+```
+
+RED: write test (e) below first and watch it fail (the run proceeds and reports FAIL instead of refusing); then add the check; GREEN.
+
+- [ ] **Step 2: The corpus builders**
+
+`uc_diffreplay/tests/common/mod.rs`:
+
+```rust
+/// Drive a single node with RegisterSm: `before`, an instant at P, `after`.
+/// Returns P. `build_register_history` is the all-writes special case.
+pub fn build_register_history_with(dir: &Path, app_id: &str, before: &[Cmd], after: &[Cmd]) -> u64 {
+    let node = start_single_node(dir, app_id, register_name());
+    let cfg = ServiceConfig::new(dir.to_path_buf(), app_id.to_string());
+    let svc = ServiceBuilder::new(cfg, RegisterSm::default())
+        .start_with_snapshots()
+        .unwrap();
+    let client = Client::connect(dir, app_id).unwrap();
+    for c in before {
+        let _: CmdResp = client.submit(c).unwrap();
+    }
+    let p = command_instant(&node);
+    let art = artifact_path(dir, 0, p);
+    wait_until(|| art.is_file());
+    for c in after {
+        let _: CmdResp = client.submit(c).unwrap();
+    }
+    client.shutdown();
+    svc.stop();
+    node.stop();
+    p
+}
+
+pub fn build_register_history(dir: &Path, app_id: &str, n: u64, m: u64) -> (u64, u64) {
+    let before: Vec<Cmd> = (0..n).map(Cmd::Write).collect();
+    let after: Vec<Cmd> = (n..n + m).map(Cmd::Write).collect();
+    (build_register_history_with(dir, app_id, &before, &after), u64::MAX)
+}
+```
+
+- [ ] **Step 3: The test file**
+
+```rust
+//! `uc2-diffreplay pin-verify` end to end on the register fixture (spec
+//! §6.2 part 2): the empty and the durable state-machine shapes both PASS
+//! with the counterfactual DEMONSTRATED on a corpus whose tail is a CAS
+//! chain (ruling R-C-1); a stale NEW is a FAIL (the swap arm is refused by
+//! name); a pure-write corpus is INCONCLUSIVE, not a pass; a same-version
+//! run is refused up front.
 mod common;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use uc_diffreplay::corpus::Corpus;
 use uc_diffreplay::pinverify::{PinVerifyReport, Verdict};
+use uc_lincheck::register::Cmd;
 
-const WRITES_BEFORE: u64 = 200;
-const WRITES_AFTER: u64 = 200;
+const WRITES: u64 = 200;
+const CAS_TAIL: u64 = 50;
 
-/// A register corpus: `build_register_history` (plan A) then export `[P, end)`.
-fn register_corpus(app_id: &str) -> (tempfile::TempDir, PathBuf) {
+/// `WRITES` writes, an instant at P, then a CAS chain that starts from the
+/// value v1 holds at P (`WRITES - 1`) — the tail whose outcome depends on
+/// the state at P.
+fn cas_corpus(app_id: &str) -> (tempfile::TempDir, PathBuf) {
     let inst = common::tempdir();
-    let (p, _) = common::build_register_history(inst.path(), app_id, WRITES_BEFORE, WRITES_AFTER);
+    let before: Vec<Cmd> = (0..WRITES).map(Cmd::Write).collect();
+    let after: Vec<Cmd> = (0..CAS_TAIL)
+        .map(|k| Cmd::Cas { old: WRITES - 1 + k, new: WRITES + k })
+        .collect();
+    let p = common::build_register_history_with(inst.path(), app_id, &before, &after);
     let out = inst.path().join("corpus");
-    Corpus::export(inst.path(), app_id, 0, p, u64::MAX, 1, &out).unwrap();
+    Corpus::export(inst.path(), app_id, 0, p, u64::MAX, 0, &out).unwrap();
     (inst, out)
 }
 
-struct Run { status: std::process::ExitStatus, report: PinVerifyReport, stdout: String }
+/// The all-writes corpus: last-write-wins makes both paths agree.
+fn write_corpus(app_id: &str) -> (tempfile::TempDir, PathBuf) {
+    let inst = common::tempdir();
+    let (p, _) = common::build_register_history(inst.path(), app_id, WRITES, WRITES);
+    let out = inst.path().join("corpus");
+    Corpus::export(inst.path(), app_id, 0, p, u64::MAX, 0, &out).unwrap();
+    (inst, out)
+}
+
+struct Run { status: std::process::ExitStatus, report: Option<PinVerifyReport>, stdout: String, stderr: String }
 
 fn pin_verify(corpus: &Path, old_args: &[&str], new_args: &[&str], to: &str, app_id: &str) -> Run {
     let bin = common::register_replay_bin();
@@ -1255,87 +1334,94 @@ fn pin_verify(corpus: &Path, old_args: &[&str], new_args: &[&str], to: &str, app
     for a in new_args { c.arg("--new-arg").arg(a); }
     let out = c.output().unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
-    eprintln!("{stdout}{}", String::from_utf8_lossy(&out.stderr));
-    let report: PinVerifyReport = serde_json::from_reader(std::fs::File::open(&report).expect("report written")).unwrap();
-    Run { status: out.status, report, stdout }
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    eprintln!("{stdout}{stderr}");
+    let report = std::fs::File::open(&report).ok().map(|f| serde_json::from_reader(f).expect("report parses"));
+    Run { status: out.status, report, stdout, stderr }
 }
-```
 
-(`serde_json` is needed as a dev-dependency of `uc_diffreplay` if not already listed; it is a regular dependency, so it is available to integration tests as `serde_json`.)
-
-- [ ] **Step 2: The four tests**
-
-```rust
-/// The empty shape: an in-memory register. OLD = plain, NEW = `--double`.
+/// (a) The empty shape: an in-memory register. OLD = plain, NEW = `--double`.
 #[test]
 fn an_in_memory_register_passes_and_demonstrates_the_counterfactual() {
-    let (_inst, corpus) = register_corpus("pv-empty");
+    let (_inst, corpus) = cas_corpus("pv-empty");
     let r = pin_verify(&corpus, &["serve"], &["serve", "--double"], "2", "pv-empty");
+    let rep = r.report.expect("report");
     assert!(r.status.success(), "{}", r.stdout);
-    assert_eq!(r.report.verdict, Verdict::Pass);
-    assert!(r.report.refusal.matched, "the stale binary must be refused BY NAME");
-    assert_eq!(r.report.swap.live_eq_artifact, Some(true));
-    assert_eq!(r.report.swap.artifact_eq_genesis, Some(false), "doubling changes the replayed writes: the paths must diverge");
-    assert!(r.report.frontier > r.report.origin, "OLD must have run past P before the stop");
+    assert_eq!(rep.verdict, Verdict::Pass);
+    assert!(rep.refusal.matched, "the stale binary must be refused BY NAME");
+    assert_eq!(rep.swap.live_eq_artifact, Some(true));
+    assert_eq!(rep.swap.artifact_eq_genesis, Some(false), "the CAS tail makes the paths diverge");
+    assert!(rep.frontier > rep.origin, "OLD must have run past P before the stop");
 }
 
-/// The durable shape: `--durable` persists `(value, last_applied)`, so NEW
-/// attaches with `last_applied() = X > P` and MUST be rewound to P by the
-/// pinned install (spec §2.3's third path, S4 step 4).
+/// (b) The durable shape: `--durable` persists `(value, last_applied)`, so
+/// NEW attaches with `last_applied() = X > P` and MUST be rewound to P by
+/// the pinned install (spec §2.3's third path, S4 step 4).
 #[test]
 fn a_durable_register_is_rewound_to_the_origin_and_passes() {
-    let (_inst, corpus) = register_corpus("pv-durable");
+    let (_inst, corpus) = cas_corpus("pv-durable");
     let r = pin_verify(&corpus, &["serve", "--durable"], &["serve", "--double", "--durable"], "2", "pv-durable");
+    let rep = r.report.expect("report");
     assert!(r.status.success(), "{}", r.stdout);
-    assert_eq!(r.report.verdict, Verdict::Pass);
-    assert_eq!(r.report.swap.live_eq_artifact, Some(true), "a durable SM that was NOT rewound would carry OLD's (P, X] and differ here");
-    assert_eq!(r.report.swap.artifact_eq_genesis, Some(false));
+    assert_eq!(rep.verdict, Verdict::Pass);
+    assert_eq!(rep.swap.live_eq_artifact, Some(true), "a durable SM that was NOT rewound would carry OLD's (P, X] and differ here");
+    assert_eq!(rep.swap.artifact_eq_genesis, Some(false));
 }
 
-/// Teeth for the swap arm: NEW is the OLD binary (version 1) while the pin
-/// names 2 — the SDK refuses it at attach, and the mode must FAIL, not
-/// report a vacuous pass.
+/// (c) Teeth for the swap arm: NEW is the OLD binary (version 0) while the
+/// pin names 2 — the SDK refuses it at attach, and the mode must FAIL.
 #[test]
 fn a_new_binary_that_is_not_the_pinned_version_is_a_fail() {
-    let (_inst, corpus) = register_corpus("pv-stale");
+    let (_inst, corpus) = cas_corpus("pv-stale");
     let r = pin_verify(&corpus, &["serve"], &["serve"], "2", "pv-stale");
+    let rep = r.report.expect("report");
     assert!(!r.status.success());
-    assert_eq!(r.report.verdict, Verdict::Fail);
-    assert!(r.report.refusal.matched, "the refusal arm itself still holds");
-    assert!(!r.report.swap.attached, "{}", r.stdout);
+    assert_eq!(rep.verdict, Verdict::Fail);
+    assert!(rep.refusal.matched, "the refusal arm itself still holds");
+    assert!(!rep.swap.attached, "{}", r.stdout);
 }
 
-/// No semantic change: OLD and NEW are the same build and the pin names the
-/// version the row already runs. The paths agree, so the run is
+/// (d) No state-dependent command in the tail: last-write-wins makes NEW's
+/// artifact-path and genesis-path projections agree, so the run is
 /// INCONCLUSIVE — exit 0 with the note, never PASS.
 #[test]
-fn a_version_identical_upgrade_is_inconclusive_not_a_pass() {
-    let (_inst, corpus) = register_corpus("pv-same");
-    let r = pin_verify(&corpus, &["serve", "--double"], &["serve", "--double"], "2", "pv-same");
-    // The implementer establishes whether a pin with `from == to` is ACCEPTED
-    // by the cluster FSM (B1 refusals 52–59 do not name that case) — if it is
-    // refused, change this test to assert the refusal reason in
-    // `report.notes` and a FAIL exit, and record which in the report file.
+fn a_pure_write_corpus_is_inconclusive_not_a_pass() {
+    let (_inst, corpus) = write_corpus("pv-writes");
+    let r = pin_verify(&corpus, &["serve"], &["serve", "--double"], "2", "pv-writes");
+    let rep = r.report.expect("report");
     assert!(r.status.success(), "{}", r.stdout);
-    assert_eq!(r.report.verdict, Verdict::Inconclusive);
-    assert_eq!(r.report.swap.artifact_eq_genesis, Some(true));
-    assert!(r.report.notes.iter().any(|n| n.contains("cannot show the counterfactual")));
+    assert_eq!(rep.verdict, Verdict::Inconclusive);
+    assert!(rep.refusal.matched);
+    assert_eq!(rep.swap.live_eq_artifact, Some(true));
+    assert_eq!(rep.swap.artifact_eq_genesis, Some(true));
+    assert!(rep.notes.iter().any(|n| n.contains("cannot show the counterfactual")), "{:?}", rep.notes);
+}
+
+/// (e) A same-version "upgrade" cannot hold the refusal arm; the mode says
+/// so before placing a pin (ruling R-C-1). No report is written.
+#[test]
+fn a_same_version_run_is_refused_before_the_pin() {
+    let (_inst, corpus) = write_corpus("pv-same");
+    let r = pin_verify(&corpus, &["serve", "--double"], &["serve", "--double"], "2", "pv-same");
+    assert!(!r.status.success(), "{}", r.stdout);
+    assert!(r.report.is_none(), "refused before any arm ran: no report");
+    assert!(r.stderr.contains("already runs version"), "{}", r.stderr);
 }
 ```
 
-Note on versions: `RegisterSm::VERSION` is the trait DEFAULT `0` (it does not override it) and `DoublingRegisterSm::VERSION = 2`, so the plain→double arms pin `from = 0` (read from the attached word, never passed) to `--to 2`. The last test's OLD serves `--double` (version 2) from the start so that `from = 2 = to`.
+(`serde_json` and `tempfile` are already available to `uc_diffreplay`'s integration tests as a dependency / dev-dependency; `uc_lincheck` is a dev-dependency.)
 
-- [ ] **Step 3: Run RED, then GREEN**
+- [ ] **Step 4: Run RED, then GREEN**
 
-RED: with Task 3's `verdict` temporarily returning `Verdict::Pass` unconditionally (a one-line local mutation, not committed), the stale-NEW test must fail on its `Verdict::Fail` assertion — record it. Then restore.
+RED for (e): before Step 1's check exists, the run proceeds and (e) fails on `r.report.is_none()` — record it. RED for the verdict teeth: with `verdict` temporarily returning `Verdict::Pass` unconditionally (a one-line local mutation, not committed), (c) must fail on its `Verdict::Fail` assertion — record it. Then restore.
 Run: `cargo build -p uc_lincheck --features replay-bin --bin register-replay && cargo test -p uc_diffreplay --test pin_verify -- --test-threads=1`
-Expected: 4 passed (single-threaded: four in-process nodes plus four register processes at once would only add noise). Then run the file three more times in a row and report the tally.
+Expected: 5 passed (single-threaded: five in-process nodes plus register processes at once would only add noise). Then run the file three more times and report the tally.
 
-- [ ] **Step 4: Commit**
+- [ ] **Step 5: Commit**
 
 ```bash
-git add uc_diffreplay/tests/pin_verify.rs uc_diffreplay/Cargo.toml
-git commit -m "uc_diffreplay: pin-verify e2e — empty and durable PASS with the counterfactual shown, a stale NEW FAILs, a no-op change is INCONCLUSIVE (plan C T4)"
+git add uc_diffreplay/tests/pin_verify.rs uc_diffreplay/tests/common/mod.rs uc_diffreplay/src/pinverify.rs
+git commit -m "uc_diffreplay: pin-verify e2e — empty and durable PASS with the counterfactual shown on a CAS tail, a stale NEW FAILs, a pure-write span is INCONCLUSIVE, a same-version run is refused (plan C T4)"
 ```
 
 ---
