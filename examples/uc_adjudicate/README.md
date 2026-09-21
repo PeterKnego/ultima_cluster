@@ -67,12 +67,16 @@ speaks `uc_remote` for them.
 Recorded here because they are exactly what a black-box adjudication is for.
 
 1. **The builder's snapshot-image page omits the framework's session
-   prefix.** `WIRE-FORMAT.md` § 5 states the on-disk artifact is `ULTSNAP1 ‖ P
-   ‖ image`. It is not, for the deployed configuration: the KV runs
+   prefix.** `WIRE-FORMAT.md` § 5 states the on-disk artifact is
+   `ULTSNAP2 ‖ P ‖ version ‖ image`. It is not, for the deployed
+   configuration: the KV runs
    `Sessioned<KvSm>` (required for exactly-once, `[session] envelope = true`),
    and `uc_service::Sessioned::stream_snapshot` writes `u64 blob_len ‖
-   session-table blob` BEFORE the inner image. The real artifact is `ULTSNAP1
-   ‖ P ‖ session_blob_len:u64 ‖ session_blob ‖ kv_image`. `diverge::read_artifact`
+   session-table blob` BEFORE the inner image. The real artifact is
+   `ULTSNAP2 ‖ P ‖ version ‖ session_blob_len:u64 ‖ session_blob ‖ kv_image`,
+   with the session blob's length at **offset 24** (the envelope is 24 bytes
+   since `2.13.0`; it was the 16-byte `ULTSNAP1 ‖ P` before).
+   `diverge::read_artifact`
    strips the prefix by its length; the page is a doc defect for the operator
    ledger (`§ 5` is right only for a non-`Sessioned` service).
 

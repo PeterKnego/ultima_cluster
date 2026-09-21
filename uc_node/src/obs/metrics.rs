@@ -405,8 +405,9 @@ fn service_rows(s: &ObsSources, commit: u64, now: u64) -> Vec<ServiceRow> {
         let (freeze_max_ns, freeze_sum_ns, freeze_count) = s
             .snapshot_freeze
             .observe_row(id as usize, slot.identity.freeze_ns());
-        // The pair together: a re-pin can otherwise be read half-old
-        // (`ServiceStatusLine::pin`). A `Contended` scrape renders zeros,
+        // Through `pin()`, which reads the four words — three data words
+        // under one sequence word — together: a re-pin can otherwise be read
+        // half-old (`ServiceStatusLine::pin`). A `Contended` scrape renders zeros,
         // same as `NoPin` — the gauge HELP text says "0 = no pin or
         // unreadable".
         let pin = match slot.status.pin() {

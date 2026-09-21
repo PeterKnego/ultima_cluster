@@ -498,15 +498,15 @@ gate every reader checks first. `pinned_from` is the version the artifact AT
 service reads it because a pinned install (below) cross-checks the artifact
 it is about to install against exactly this value, not against its own
 `S::VERSION`: the whole point of a pin is to install an artifact a
-*different* version built. The triple (now the quadruple) itself is
-published under a **seqlock**: the node-side writer
+*different* version built. The pin is **three data words under one sequence
+word**, and the three are published under a **seqlock**: the node-side writer
 (`ServiceStatusLine::store_pin`) bumps `pin_seq` to ODD, stores
 `pinned_version`, stores `pinned_from`, stores `upgrade_origin`, and bumps
 `pin_seq` back to EVEN, every step `Release`; a reader loads `pin_seq`, all
 three data words, then `pin_seq` again, and accepts the set only if the
 first read was EVEN and the two reads agree.
 
-Why a third word (now a fourth), rather than just writing the version before
+Why a sequence word at all, rather than just writing the version before
 the origin? Because that order alone only covers the **first** pin a row
 ever gets (`0` → a non-zero origin), and re-reading the origin does not
 extend it to a **re-pin**. A writer that has stored `version_new` but has

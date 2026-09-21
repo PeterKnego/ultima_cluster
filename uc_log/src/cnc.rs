@@ -222,6 +222,11 @@ impl ServiceStatusLine {
     }
     /// The triple as it was stored, or a named reason it could not be read.
     ///
+    /// The pin occupies four words on the status line: **three data words
+    /// under one sequence word** (`upgrade_origin`, `pinned_version`,
+    /// `pinned_from`, committed by `pin_seq`). Everything below says "triple"
+    /// for the data the caller gets back.
+    ///
     /// `upgrade_origin`, `pinned_version` and `pinned_from` are three
     /// independent words, and independent atomics with no shared sequence
     /// CANNOT be read consistently by re-reading them one at a time: a
