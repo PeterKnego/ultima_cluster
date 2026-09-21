@@ -6,6 +6,7 @@ fn trace(entries: Vec<(u64, &[u8], &[u8])>, proj_end: &str) -> Trace {
     Trace {
         row: 0,
         version: 1,
+        artifact_version: Some(1),
         origin: 32,
         end: 1000,
         projection_at_origin: Some("value=None\n".into()),
@@ -18,6 +19,8 @@ fn trace(entries: Vec<(u64, &[u8], &[u8])>, proj_end: &str) -> Trace {
                 tag: tag.to_vec(),
                 response: resp.to_vec(),
                 sched: vec![],
+                ids_calls: 0,
+                output: None,
             })
             .collect(),
     }
@@ -86,6 +89,38 @@ fn a_changed_sched_record_is_a_sched_divergence() {
     let p = diff(&a, &b).unwrap();
     assert_eq!(p.entries.len(), 1);
     assert!(matches!(p.entries[0].surface, Surface::Sched));
+}
+
+#[test]
+fn a_changed_ids_call_count_is_an_ids_divergence() {
+    let mut a = trace(vec![(32, b"\x01", b"ok")], "");
+    let mut b = a.clone();
+    a.entries[0].ids_calls = 1;
+    b.entries[0].ids_calls = 2;
+    let p = diff(&a, &b).unwrap();
+    assert_eq!(p.entries.len(), 1, "{:?}", p.entries);
+    assert!(matches!(p.entries[0].surface, Surface::Ids));
+    assert_eq!(p.entries[0].a, b"1");
+    assert_eq!(p.entries[0].b, b"2");
+}
+
+#[test]
+fn a_changed_on_committed_result_is_an_output_divergence() {
+    let mut a = trace(vec![(32, b"\x01", b"ok")], "");
+    let mut b = a.clone();
+    a.entries[0].output = Some("ok".into());
+    b.entries[0].output = Some("permanent: boom".into());
+    let p = diff(&a, &b).unwrap();
+    assert_eq!(p.entries.len(), 1, "{:?}", p.entries);
+    assert!(matches!(p.entries[0].surface, Surface::Output));
+}
+
+#[test]
+fn no_handler_output_is_none_and_is_not_a_divergence_against_itself() {
+    let a = trace(vec![(32, b"\x01", b"ok")], "");
+    assert_eq!(a.entries[0].output, None);
+    let p = diff(&a, &a.clone()).unwrap();
+    assert!(p.is_empty(), "{p:?}");
 }
 
 #[test]
@@ -468,6 +503,7 @@ fn timer_trace(id: u64, resp: &[u8]) -> Trace {
     Trace {
         row: 0,
         version: 1,
+        artifact_version: Some(1),
         origin: 32,
         end: 1000,
         projection_at_origin: Some("value=None\n".into()),
@@ -482,6 +518,8 @@ fn timer_trace(id: u64, resp: &[u8]) -> Trace {
             tag: vec![],
             response: resp.to_vec(),
             sched: vec![],
+            ids_calls: 0,
+            output: None,
         }],
     }
 }
@@ -578,6 +616,8 @@ fn surface_name_round_trips_through_parse() {
         Surface::Sched,
         Surface::ProjectionOrigin,
         Surface::ProjectionEnd,
+        Surface::Ids,
+        Surface::Output,
     ] {
         assert_eq!(Surface::parse(s.name()), Some(s), "{}", s.name());
     }

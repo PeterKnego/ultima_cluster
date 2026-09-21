@@ -15,7 +15,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use uc_log::cnc::unpack_service_status;
+use uc_log::cnc::{PinRead, unpack_service_status};
 use uc_protocol::v2::cnc::{
     CNC_MAX_PEER_SLOTS, CNC_MAX_SERVICES, CNC_PEER_ROLE_LEARNER, CNC_PEER_ROLE_VOTER,
     NODE_FLAG_CAN_SERVE, NODE_FLAG_LEADER,
@@ -405,9 +405,15 @@ fn service_rows(s: &ObsSources, commit: u64, now: u64) -> Vec<ServiceRow> {
         let (freeze_max_ns, freeze_sum_ns, freeze_count) = s
             .snapshot_freeze
             .observe_row(id as usize, slot.identity.freeze_ns());
-        // The pair together: a re-pin can otherwise be read half-old
-        // (`ServiceStatusLine::pin`).
-        let pin = slot.status.pin().unwrap_or((0, 0));
+        // Through `pin()`, which reads the four words — three data words
+        // under one sequence word — together: a re-pin can otherwise be read
+        // half-old (`ServiceStatusLine::pin`). A `Contended` scrape renders zeros,
+        // same as `NoPin` — the gauge HELP text says "0 = no pin or
+        // unreadable".
+        let pin = match slot.status.pin() {
+            PinRead::Pinned { origin, to, .. } => (origin, to as u64),
+            _ => (0, 0),
+        };
         let hash_mismatch = inner
             .reports
             .iter()
@@ -434,7 +440,7 @@ fn service_rows(s: &ObsSources, commit: u64, now: u64) -> Vec<ServiceRow> {
             freeze_sum_seconds: freeze_sum_ns as f64 / 1e9,
             freeze_count,
             upgrade_origin: pin.0,
-            pinned_version: pin.1 as u64,
+            pinned_version: pin.1,
             hash_mismatch,
         });
     }
@@ -696,7 +702,7 @@ fn push_service_families(out: &mut String, s: &ObsSources, commit: u64, now: u64
     push_service_labeled(
         out,
         "uc2_upgrade_pin_origin",
-        "FSM upgrade lifecycle (spec §2.5): the row's pinned origin position from the newest committed UpgradePin, as republished in the cnc status line by the uc2-cluster agent; 0 = no pin. Identical on every node once caught up.",
+        "FSM upgrade lifecycle (spec §2.5): the row's pinned origin position from the newest committed UpgradePin, as republished in the cnc status line by the uc2-cluster agent; 0 = no pin or unreadable. Identical on every node once caught up.",
         "gauge",
         &rows,
         |r| r.upgrade_origin,
@@ -704,7 +710,7 @@ fn push_service_families(out: &mut String, s: &ObsSources, commit: u64, now: u64
     push_service_labeled(
         out,
         "uc2_upgrade_pin_version",
-        "The packed version the row's newest UpgradePin names (`to`); 0 = no pin. A service whose VERSION differs is refused at attach (plan B2).",
+        "The packed version the row's newest UpgradePin names (`to`); 0 = no pin or unreadable. A service whose VERSION differs is refused at attach (plan B2).",
         "gauge",
         &rows,
         |r| r.pinned_version,
@@ -2318,7 +2324,7 @@ mod tests {
             .cnc
             .service_slot(0)
             .status
-            .store_pin(8192, 0x0101_0000);
+            .store_pin(8192, 0x0100_0000, 0x0101_0000);
         let mut st = sources.cluster_view.to_state();
         st.reports.push(uc_protocol::v2::upgrade::SnapshotReport {
             row: 0,

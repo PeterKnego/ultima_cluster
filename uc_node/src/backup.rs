@@ -926,16 +926,19 @@ fn check_row_artifacts(root: &Path) -> Result<(), BackupError> {
                 }
             }
             match uc_service::snapshots::decode_snapshot_envelope(&head[..n]) {
-                Ok(built) if built == pos => {}
-                Ok(built) => {
+                Ok(env) if env.position == pos => {}
+                Ok(env) => {
                     return Err(BackupError::SnapshotArtifactCorrupt {
                         path,
                         reason: format!(
-                            "built at position {built} but named {pos} \
-                             (a renamed or mis-copied artifact)"
+                            "built at position {} but named {pos} \
+                             (a renamed or mis-copied artifact)",
+                            env.position
                         ),
                     });
                 }
+                // `Legacy` (a pre-2.13.0 `ULTSNAP1` artifact) surfaces here
+                // too, through the same arm: `e.to_string()` names it.
                 Err(e) => {
                     return Err(BackupError::SnapshotArtifactCorrupt {
                         path,

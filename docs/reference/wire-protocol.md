@@ -154,9 +154,9 @@ ahead the moment a later instant completes — and declines the session by name
 (`floor 0` / `missing artifact` / `set does not cover declared`) rather than
 shipping a set assembled from two different points of the log.
 
-The artifact bytes are shipped **verbatim**, which includes the 16-byte
-`ULTSNAP1` envelope every artifact file starts with. That is a file format,
-not a wire format (see
+The artifact bytes are shipped **verbatim**, which includes the 24-byte
+`ULTSNAP2` envelope every artifact file starts with (since 2.13.0). That is a
+file format, not a wire format (see
 [Instance directory § Snapshot artifacts](instance-directory.md#files)), but
 it rides the session unchanged, so the receiver writes a file byte-identical
 to the sender's and verifies the envelope at install.

@@ -67,8 +67,9 @@ install a snapshot instead of replaying from genesis), and it wraps itself in
 [`examples/kv/src/lib.rs`](../../examples/kv/src/lib.rs) alongside the
 [state machine contract](../reference/state-machine-contract.md): the state
 machine is the `apply`/`query` core, the snapshot is `build_snapshot` /
-`install_snapshot` over the artifact's payload bytes (UC owns the 16-byte
-`ULTSNAP1 ‖ P` envelope; the payload is entirely yours), and the service binary
+`install_snapshot` over the artifact's payload bytes (UC owns the 24-byte
+`ULTSNAP2 ‖ P ‖ version` envelope, since 2.13.0; the payload is entirely
+yours), and the service binary
 `kv-service` is the thin `main` that attaches the state machine to a node.
 
 Build the example:

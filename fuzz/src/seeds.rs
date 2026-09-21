@@ -1547,26 +1547,38 @@ pub fn uc_node_cluster_artifact() -> Vec<Seed> {
     ]
 }
 
-/// `uc_service_snapshot_envelope` — the 16-byte artifact envelope every
-/// `snap-<pos>.ultsnap` starts with (coordinated-snapshot ruling P6): the
-/// well-formed header, and the three refusals the decoder owes — empty, one
-/// byte short, and wrong magic — plus a header with a payload behind it (the
-/// shape every real install path reads).
+/// `uc_service_snapshot_envelope` — the 24-byte artifact envelope every
+/// `snap-<pos>.ultsnap` starts with (coordinated-snapshot ruling P6; plan B2
+/// T2): the well-formed header, and the five refusals the decoder owes —
+/// empty, one byte short, wrong magic, a `ULTSNAP1` header and a non-zero
+/// reserved word — plus a header with a payload behind it (the shape every
+/// real install path reads).
 pub fn uc_service_snapshot_envelope() -> Vec<Seed> {
     use uc_service::snapshots::write_snapshot_envelope;
 
-    fn envelope(pos: u64) -> Vec<u8> {
+    fn envelope(pos: u64, version: u32) -> Vec<u8> {
         let mut v = Vec::new();
-        write_snapshot_envelope(&mut v, pos).expect("a Vec never fails");
+        write_snapshot_envelope(&mut v, pos, version).expect("a Vec never fails");
         v
     }
 
-    let ok = envelope(4096);
+    let ok = envelope(4096, 1);
     let short = ok[..ok.len() - 1].to_vec();
     let mut bad_magic = ok.clone();
     bad_magic[0] ^= 0xFF;
-    let mut with_payload = envelope(1 << 40);
+    let mut with_payload = envelope(1 << 40, 1);
     with_payload.extend_from_slice(b"state machine bytes");
+    // The two refusals that are NOT bad magic, and that the corpus above
+    // could not reach by mutation: a whole pre-2.13.0 header (`Legacy`, the
+    // flag-day shape every unwiped node has on disk) and a well-formed
+    // `ULTSNAP2` whose reserved word is set (`Reserved`, what a 2.13.0 binary
+    // says about an artifact a later UC wrote).
+    let mut legacy = Vec::new();
+    legacy.extend_from_slice(uc_service::snapshots::SNAPSHOT_ENVELOPE_MAGIC_V1);
+    legacy.extend_from_slice(&4096u64.to_le_bytes());
+    legacy.extend_from_slice(b"state machine bytes");
+    let mut reserved = envelope(4096, 1);
+    reserved[20..24].copy_from_slice(&1u32.to_le_bytes());
 
     vec![
         Seed::fixed("01-envelope", ok),
@@ -1574,6 +1586,8 @@ pub fn uc_service_snapshot_envelope() -> Vec<Seed> {
         Seed::fixed("03-one-byte-short", short),
         Seed::fixed("04-bad-magic", bad_magic),
         Seed::fixed("05-envelope-plus-payload", with_payload),
+        Seed::fixed("06-legacy-ultsnap1", legacy),
+        Seed::fixed("07-non-zero-reserved", reserved),
     ]
 }
 

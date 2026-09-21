@@ -77,6 +77,13 @@ pub struct ApplyCtx {
     /// `Vec`s built and dropped per frame (apply_ab.sh measured the third
     /// list alone at -2.9 % on the apply hop, 2026-09-07; M14a).
     sched: Option<Box<SchedLists>>,
+    /// How many times [`Self::ids`] has been called for the frame currently
+    /// bound (reset in [`Self::rebind`] and by [`Self::new`]) — a changed
+    /// count between two builds is a determinism hazard the diff-replay spec
+    /// (§8.1) names explicitly, so it is a captured surface
+    /// (`uc_diffreplay::trace::Entry::ids_calls`), not just an internal
+    /// counter.
+    ids_calls: u32,
 }
 
 /// The per-apply schedule bookkeeping, boxed so that [`ApplyCtx`] stays a
@@ -96,6 +103,7 @@ impl ApplyCtx {
             term: 0,
             identity,
             sched: None,
+            ids_calls: 0,
         }
     }
     #[inline]
@@ -134,13 +142,26 @@ impl ApplyCtx {
         self.position = position;
         self.time_ns = time_ns;
         self.term = term;
+        self.ids_calls = 0;
     }
     pub fn identity(&self) -> FsmIdentity {
         self.identity
     }
     /// The deterministic ID generator for THIS apply call (spec §3.4).
-    pub fn ids(&self) -> IdGen {
+    /// `&mut self`: minting a generator counts against
+    /// [`Self::ids_calls`] (a `u32` field, not a `Cell` — there is no
+    /// interior mutability on this hot path), so a build that calls this a
+    /// different number of times for the same frame is a visible divergence.
+    pub fn ids(&mut self) -> IdGen {
+        self.ids_calls += 1;
         IdGen::new(self.position, self.identity)
+    }
+    /// How many times [`Self::ids`] has been called for the frame currently
+    /// bound. Reset by [`Self::rebind`] (and by [`Self::new`]) — never
+    /// carries over from a predecessor frame, same discipline as the
+    /// schedule lists.
+    pub fn ids_calls(&self) -> u32 {
+        self.ids_calls
     }
     /// Ask for `on_timer(id)` at `at_ns` (log time). Re-scheduling a pending id
     /// replaces its deadline. Deterministic: an output of apply, replayed
@@ -181,8 +202,17 @@ impl ApplyCtx {
     pub(crate) fn has_sched_records(&self) -> bool {
         self.sched.is_some()
     }
-    /// Apply loop only: drain both lists as wire records, requests first.
-    pub(crate) fn take_sched_records(&mut self) -> Vec<SchedRecord> {
+    /// Drain this apply's schedule bookkeeping as wire records, timer
+    /// requests (`Schedule`/`Cancel`) first, then delivery reports
+    /// (`Consumed`/`TableConsumed`) — the order the apply loop ships them to
+    /// the node in. Called exactly once per frame by three consumers: the
+    /// apply loop itself (building the record it publishes), `Timed<S>`
+    /// (`uc_service::timed`, which pushes `consumed`/`consumed_table`
+    /// entries before this drains them), and the diff-replay driver
+    /// (`uc_diffreplay::drive`), which has no other way to reach a frame's
+    /// `sched` list. Leaves `sched` empty, so a later frame never inherits a
+    /// predecessor's requests (see [`Self::rebind`]'s debug assertion).
+    pub fn take_sched_records(&mut self) -> Vec<SchedRecord> {
         let Some(mut lists) = self.sched.take() else {
             return Vec::new();
         };
@@ -218,13 +248,6 @@ impl ApplyCtx {
             });
         }
         out
-    }
-    /// Test-only alias of [`Self::take_sched_records`] for the integration
-    /// test in `uc_service/tests/timed.rs`, which cannot see the `pub(crate)`
-    /// method.
-    #[doc(hidden)]
-    pub fn take_sched_records_for_test(&mut self) -> Vec<SchedRecord> {
-        self.take_sched_records()
     }
 }
 
@@ -520,4 +543,26 @@ pub enum OutputError {
     Retryable(String),
     #[error("permanent: {0}")]
     Permanent(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const NAME: FsmIdentity = FsmIdentity::parse("traits_test", 0);
+
+    #[test]
+    fn ids_calls_counts_generator_requests_per_apply() {
+        let mut ctx = ApplyCtx::new(64, NAME);
+        assert_eq!(ctx.ids_calls(), 0);
+        let _ = ctx.ids();
+        let _ = ctx.ids();
+        assert_eq!(ctx.ids_calls(), 2);
+        ctx.rebind(128, 0, 0);
+        assert_eq!(
+            ctx.ids_calls(),
+            0,
+            "rebind starts the next frame with a clean count"
+        );
+    }
 }

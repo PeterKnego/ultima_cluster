@@ -7,16 +7,16 @@ is the spec
 (`docs/superpowers/specs/2026-09-19-uc2-fsm-upgrade-lifecycle-design.md`, §4);
 this page is the commands.
 
-**What "everything" means here.** Three surfaces are captured and compared:
+**What "everything" means here.** Five surfaces are captured and compared:
 the response bytes at each position, the `svc_sched` records (timers
-scheduled and cancelled) at each position, and the state projection at the
-origin and at the end. Three more from the spec's §4.2 list are **not**
-captured, so an empty diff is not evidence about them: `on_committed`
-emissions (the replay driver runs no output handler), the ids the FSM mints
-(`ApplyCtx::ids()` exposes no count — they show up only indirectly, through
-state and responses), and probe-query answers (the projection is the state
-view instead). `uc_diffreplay/README.md` § "What this does not compare" is
-the standing statement.
+scheduled and cancelled) at each position, the state projection at the origin
+and at the end, how many times each frame called `ctx.ids()`
+(`ApplyCtx::ids_calls`), and — when the driver is given a `RawOutputHandler`
+(`drive::DriveOptions`) — the `on_committed` result at each position. One
+more from the spec's §4.2 list is **not** captured, so an empty diff is not
+evidence about it: probe-query answers (the projection is the state view
+instead). `uc_diffreplay/README.md` § "What this does not compare" is the
+standing statement.
 
 ## 1. Make your service binary replayable
 
@@ -74,6 +74,14 @@ too, so a typo cannot quietly read as "not declared".
 Exit 0 = every difference is attributed and declared, every declaration was
 observed. Anything else exits 1 and the report names it: `Undeclared`,
 `Unexplained`, or `Absent`.
+
+Each side's raw trace also carries `artifact_version` — the version stamped
+in the installed artifact's `ULTSNAP2` envelope (`null` when the run started
+from genesis). The driver installs with no expected-version check of its own
+(that would defeat the point of comparing across a version boundary), so
+this field is how you confirm, after the fact, which version actually built
+the artifact each side started from. `uc_diffreplay/README.md` § "The trace
+an app binary writes" has the full field list.
 
 ## Also
 

@@ -284,6 +284,13 @@ pub(crate) struct ApplyState<S: RawStateMachine> {
     pub(crate) my_epoch: u64,
     /// M14a: which declared FSM slot this incarnation writes (`cfg.service_id`).
     pub(crate) service_id: u8,
+    /// Plan B2 T4: the upgrade pin this incarnation attached under, `(origin,
+    /// from, to)` — `Some` only when `attach` actually installed the artifact
+    /// at `origin`. Carried here for ONE reader, the reconstruction path's gap
+    /// guard: the artifact at the pinned origin was built by `from`, not by
+    /// this binary's `S::VERSION`, and the guard's same-version rule (plan B2
+    /// T3) must make an exception for exactly that artifact and no other.
+    pub(crate) pin: Option<(u64, u32, u32)>,
     /// M14a Task 7: the lag barrier mode this incarnation runs under, fixed at
     /// attach (the page's lag config is boot-once, like `service_id`).
     pub(crate) lag_mode: crate::lag::LagMode,
@@ -686,6 +693,7 @@ pub(crate) fn apply_cycle<S: RawStateMachine>(st: &mut ApplyState<S>) -> bool {
                     trigger: &mut st.snapshot_trigger,
                     node_flags,
                     service_id: st.service_id,
+                    pin: st.pin,
                 },
             ) {
                 Ok(Replay::Rejoin(cursor)) => cursor,
@@ -1307,6 +1315,7 @@ mod tests {
             instance_mismatch_streak: 0,
             my_epoch: 1,
             service_id: 0,
+            pin: None,
             lag_mode: crate::lag::LagMode::Off,
             declared: 0b1,
             lag_waiting: false,
@@ -1447,7 +1456,7 @@ mod tests {
         drop(archive);
         let store = crate::snapshots::SnapshotStore::open(dir.path(), 0).unwrap();
         store
-            .publish(p_pos, |w| w.write_all(b"snap").map_err(Into::into))
+            .publish(p_pos, 0, |w| w.write_all(b"snap").map_err(Into::into))
             .unwrap();
         let restore = super::SnapshotRestore::<CountSm> {
             store,
@@ -1490,6 +1499,7 @@ mod tests {
             instance_mismatch_streak: 0,
             my_epoch: 1,
             service_id: 0,
+            pin: None,
             lag_mode: crate::lag::LagMode::Off,
             declared: 0b1,
             lag_waiting: false,
@@ -1585,6 +1595,7 @@ mod tests {
             instance_mismatch_streak: 0,
             my_epoch: 1,
             service_id: 0,
+            pin: None,
             lag_mode: crate::lag::LagMode::Bounded(BOUND),
             declared: 0b11,
             lag_waiting: false,

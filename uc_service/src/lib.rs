@@ -211,13 +211,19 @@ impl<S: RawStateMachine, O: RawOutputHandler<S>> ServiceBuilder<S, O> {
     pub fn start(self) -> Result<Service<S>, ServiceError> {
         let ServiceBuilder { cfg, sm, output } = self;
 
-        let attached = attach::attach(&cfg, sm, false)?;
+        // Plan B2 T4: `None` — a plain `start()` carries no install
+        // capability, which is also what makes the row NOT snapshot-capable.
+        // A row the cluster has pinned is refused here by name
+        // (`PinRequiresSnapshots`) rather than replaying the origin's prefix
+        // under this version.
+        let attached = attach::attach(&cfg, sm, None)?;
         let buffer = attached.buffer;
         let cnc = attached.cnc;
         let instance_id = attached.instance_id;
         let epoch = attached.epoch;
         let poisoned = Arc::clone(&attached.poisoned);
         let service_id = attached.service_id;
+        let pinned = attached.pin;
         let lock = attached._lock;
 
         // 6. Spawn the apply thread. `AgentRunner::drop` already signals+joins,
@@ -276,6 +282,7 @@ impl<S: RawStateMachine, O: RawOutputHandler<S>> ServiceBuilder<S, O> {
             poisoned,
             service_id,
             _lock: lock,
+            pinned,
         })
     }
 
@@ -307,13 +314,27 @@ impl<S: RawStateMachine, O: RawOutputHandler<S>> ServiceBuilder<S, O> {
     {
         let ServiceBuilder { cfg, sm, output } = self;
 
-        let attached = attach::attach(&cfg, sm, true)?;
+        // M6 Task 5 / plan B2 T4: the install capability, built HERE because
+        // `S: SnapshotStateMachine` is only in scope in this method. `attach`
+        // borrows it for the pinned install (spec §3 S4 step 4) and hands the
+        // same closure back on `Attached`, where it becomes the apply
+        // thread's below-floor `SnapshotRestore` below — one closure, two
+        // install paths, no duplication.
+        let install: crate::apply::InstallFn<S> =
+            Box::new(|sm: &mut S, pos: u64, src: &mut dyn std::io::Read| {
+                sm.install_snapshot(pos, src)
+            });
+        let attached = attach::attach(&cfg, sm, Some(install))?;
+        let install = attached
+            .install
+            .expect("attach hands back the install capability it was given");
         let buffer = attached.buffer;
         let cnc = attached.cnc;
         let instance_id = attached.instance_id;
         let epoch = attached.epoch;
         let poisoned = Arc::clone(&attached.poisoned);
         let service_id = attached.service_id;
+        let pinned = attached.pin;
         let lock = attached._lock;
 
         let mut state = attached.apply_state;
@@ -368,15 +389,10 @@ impl<S: RawStateMachine, O: RawOutputHandler<S>> ServiceBuilder<S, O> {
             freeze,
         });
         // M6 Task 5: the mirror capability — install a covering snapshot when
-        // journal replay would otherwise fall below the purge floor. Built here
-        // for the same reason as `freeze`: `S: SnapshotStateMachine` is only in
-        // scope in this method. The reconstruction path (apply thread, SM lock
-        // held) uses its own `SnapshotStore` clone to locate the newest covering
-        // artifact.
-        let install: crate::apply::InstallFn<S> =
-            Box::new(|sm: &mut S, pos: u64, src: &mut dyn std::io::Read| {
-                sm.install_snapshot(pos, src)
-            });
+        // journal replay would otherwise fall below the purge floor. This is
+        // the very closure `attach` was given above and handed back (plan B2
+        // T4). The reconstruction path (apply thread, SM lock held) uses its
+        // own `SnapshotStore` clone to locate the newest covering artifact.
         state.snapshot_restore = Some(crate::apply::SnapshotRestore {
             store: store.clone(),
             install,
@@ -387,6 +403,9 @@ impl<S: RawStateMachine, O: RawOutputHandler<S>> ServiceBuilder<S, O> {
             cnc: Arc::clone(&cnc),
             busy,
             service_id,
+            // Plan B2 T2: stamp every artifact this builder publishes with the
+            // VERSION of the binary that built it, not the row's own.
+            version: S::VERSION,
         };
         let builder_agent = AgentRunner::spawn("uc2-snapshot-builder", BUILDER_IDLE, move || {
             builder_cycle(&mut builder_state)
@@ -413,6 +432,7 @@ impl<S: RawStateMachine, O: RawOutputHandler<S>> ServiceBuilder<S, O> {
             poisoned,
             service_id,
             _lock: lock,
+            pinned,
         })
     }
 }
@@ -444,9 +464,22 @@ pub struct Service<S: RawStateMachine> {
     /// M14a: `service.<id>.lock`, held for the service's life (dropped last,
     /// released by the OS on any exit) — enforces one process per id.
     _lock: std::fs::File,
+    /// Plan B2 T4: the upgrade pin this incarnation attached under. See
+    /// [`Service::pinned`].
+    pinned: Option<(u64, u32, u32)>,
 }
 
 impl<S: RawStateMachine> Service<S> {
+    /// The upgrade pin this incarnation installed at attach, as `(origin,
+    /// from, to)` — `Some` ONLY when the artifact at `origin` was actually
+    /// installed (FSM upgrade lifecycle spec §3 S4 step 4). `None` means the
+    /// row carried no pin and this incarnation rebuilt its state the ordinary
+    /// way. Which of the two ran is otherwise unobservable from outside, so
+    /// it is exposed rather than left to a log line.
+    pub fn pinned(&self) -> Option<(u64, u32, u32)> {
+        self.pinned
+    }
+
     /// The node instance this service attached to (a change means the node
     /// restarted since attach — a reconstruction trigger, Task 9).
     pub fn instance_id(&self) -> u128 {

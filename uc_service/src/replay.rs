@@ -64,6 +64,13 @@ pub(crate) struct ReplayInstant<'a, S: RawStateMachine> {
     pub node_flags: u64,
     /// This row's cnc slot, for the "already held" guard below.
     pub service_id: u8,
+    /// Plan B2 T4: the upgrade pin this incarnation attached under, `(origin,
+    /// from, to)`, or `None` on an unpinned row. Read by the gap guard only —
+    /// see the `expect_version` decision there. Travels on `ReplayInstant`
+    /// rather than as a sixth parameter to [`replay_into`] because it is the
+    /// same kind of thing the other three are: a fact about this row fixed at
+    /// attach that the replayed span needs in order to decide correctly.
+    pub pin: Option<(u64, u32, u32)>,
 }
 
 /// Ruling P10, pass 1: the START position of the LAST `SNAPSHOT` frame in the
@@ -218,11 +225,41 @@ pub(crate) fn replay_into<S: RawStateMachine>(
             let c = cnc.counters();
             c.commit.load_acquire().min(c.durable.load_acquire())
         };
+        // Plan B2 T5 (spec §3 S4): on a PINNED row the covering artifact is
+        // the one at the pinned ORIGIN whenever it can cover — not the
+        // newest. Between the pin and the old binary's stop, `from` keeps
+        // applying, so a cadence instant can leave a LATER artifact on disk;
+        // it was built by `from`, so the same-version rule below refuses it
+        // and fail-stops the apply thread of a service the cluster
+        // sanctioned. The origin is the ONE artifact this binary is allowed
+        // to cross a version boundary on (`attach` already installed it,
+        // checked against `from`), so it is the one to prefer. It has to
+        // satisfy exactly what any covering artifact does — `>= first`, so
+        // the journal's retained tail continues it with no hole, and
+        // `<= target`, so the install cannot put the SM ahead of what this
+        // node has committed and durable — and when it cannot, the choice
+        // falls back to `newest` unchanged. A pinned origin below `first`
+        // cannot bridge this gap at all (the frames in `(origin, first)` are
+        // gone), so the fallback is what runs, and a cross-version artifact
+        // it picks is still refused by name a few lines down. That refusal
+        // is the honest answer there: this row cannot be reconstructed from
+        // what is on this node, and the fix is a fresh set, not a quiet
+        // install.
         let covering = match restore {
-            Some(r) => r
-                .store
-                .newest(target)
-                .map_err(|e| ServiceError::Replay(e.to_string()))?,
+            Some(r) => {
+                let pinned = instant.pin.and_then(|(origin, _, _)| {
+                    let path = r.store.path_for(origin);
+                    (origin >= first && origin <= target && path.is_file())
+                        .then_some((origin, path))
+                });
+                match pinned {
+                    Some(hit) => Some(hit),
+                    None => r
+                        .store
+                        .newest(target)
+                        .map_err(|e| ServiceError::Replay(e.to_string()))?,
+                }
+            }
             None => None,
         };
         match (restore, covering) {
@@ -240,11 +277,37 @@ pub(crate) fn replay_into<S: RawStateMachine>(
                 // bytes verbatim under `snapshots/<row>/`, so the artifact a
                 // snapshot session produced carries the shipper's envelope and
                 // is checked by this same line.
-                crate::snapshots::verify_snapshot_envelope(&mut file, s_pos).map_err(|e| {
-                    ServiceError::MistaggedSnapshot {
-                        path: path.display().to_string(),
-                        source: e,
-                    }
+                // Plan B2 T3: an UNPINNED install must be same-version. A
+                // newer binary installing an older artifact and tail-replaying
+                // it under its own `apply` is the §2.3 counterfactual — the
+                // covering artifact was built by SOME earlier `S::VERSION`,
+                // and this incarnation's `apply` may have genuinely different
+                // semantics for the same recorded command (spec §2.3's worked
+                // example: `Write(v)` meaning `v` under one build and `2·v`
+                // under another).
+                //
+                // Plan B2 T4 (review fix): with EXACTLY ONE exception — the
+                // artifact at this row's pinned ORIGIN. `attach` already
+                // installed that artifact, having checked it against the pin's
+                // `from`; the cluster sanctioned this crossing. This path can
+                // legitimately meet it again (the origin sits at or above the
+                // purge floor, so the newest covering artifact IS snap-origin)
+                // and refusing it here would fail-stop the apply thread of a
+                // service that attached successfully. Every OTHER artifact
+                // must still be same-version: the pin sanctions one instant,
+                // not the whole snapshot directory.
+                let expect_version = match instant.pin {
+                    Some((origin, from, _)) if origin == s_pos => from,
+                    _ => S::VERSION,
+                };
+                let env = crate::snapshots::verify_snapshot_envelope(
+                    &mut file,
+                    s_pos,
+                    Some(expect_version),
+                )
+                .map_err(|e| ServiceError::MistaggedSnapshot {
+                    path: path.display().to_string(),
+                    source: e,
                 })?;
                 let installed = (r.install)(&mut guard, s_pos, &mut file)
                     .map_err(|e| ServiceError::Replay(format!("snapshot install: {e}")))?;
@@ -253,6 +316,10 @@ pub(crate) fn replay_into<S: RawStateMachine>(
                 // the mis-tag guarantee is the envelope check above, which is
                 // the framework's and cannot be weakened by an SM.
                 debug_assert_eq!(installed, s_pos, "install must land at the artifact's tag");
+                eprintln!(
+                    "uc_service: row {} installed snap-{s_pos} (built by version {:#010x})",
+                    instant.service_id, env.version
+                );
                 // The SM is now at `installed`; tail replay continues from there.
                 // (`installed >= first`, so the journal's retained tail is a
                 // contiguous continuation — no hole.)

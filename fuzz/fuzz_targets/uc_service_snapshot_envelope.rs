@@ -7,26 +7,30 @@ use uc_service::snapshots::{
     SNAPSHOT_ENVELOPE_LEN, decode_snapshot_envelope, verify_snapshot_envelope,
 };
 
-// The 16-byte artifact ENVELOPE (coordinated-snapshot ruling P6): `ULTSNAP1`
-// then the instant P the artifact was built at, LE. It is the FIRST thing read
-// off any `snap-<pos>.ultsnap` — a file a joiner received over the wire, an
-// operator restored from a backup, or anything else that happens to be sitting
-// under `snapshots/<row>/` — and the decision it drives is "install this image
-// or refuse it". So the decoder has to be total on any slice: every byte of it
-// is attacker- or accident-chosen, and a panic here kills the apply agent.
+// The 24-byte artifact ENVELOPE (coordinated-snapshot ruling P6; plan B2 T2):
+// `ULTSNAP2`, the instant P the artifact was built at (LE), the builder's
+// packed `VERSION` (LE), and 4 reserved zero bytes. A `ULTSNAP1` (pre-2.13.0)
+// header is refused by name (`EnvelopeError::Legacy`), never decoded as v2.
+// It is the FIRST thing read off any `snap-<pos>.ultsnap` — a file a joiner
+// received over the wire, an operator restored from a backup, or anything
+// else that happens to be sitting under `snapshots/<row>/` — and the decision
+// it drives is "install this image or refuse it". So the decoder has to be
+// total on any slice: every byte of it is attacker- or accident-chosen, and a
+// panic here kills the apply agent.
 //
 // Two calls per input. `decode_snapshot_envelope` is the pure decoder; then
 // `verify_snapshot_envelope` reads the same bytes through the `Read` path every
-// install site actually uses, at the position the input itself names, so a
-// well-formed envelope reaches the equality branch rather than always failing
-// at the magic. The property is only ever "never panics" — refusing is a legal
+// install site actually uses, at the position the input itself names (`None`
+// for the version — Task 2 does not cross-check it), so a well-formed
+// envelope reaches the equality branch rather than always failing at the
+// magic. The property is only ever "never panics" — refusing is a legal
 // outcome for any input, and so is accepting one that happens to be valid.
 fuzz_target!(|data: &[u8]| {
     let decoded = decode_snapshot_envelope(data);
 
     let mut src = data;
-    let expected = *decoded.as_ref().unwrap_or(&0);
-    let verified = verify_snapshot_envelope(&mut src, expected).is_ok();
+    let expected = decoded.as_ref().map(|e| e.position).unwrap_or(0);
+    let verified = verify_snapshot_envelope(&mut src, expected, None).is_ok();
 
     // The reader is left at the payload exactly when it verified.
     if verified && data.len() >= SNAPSHOT_ENVELOPE_LEN {

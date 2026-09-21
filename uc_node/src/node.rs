@@ -1312,20 +1312,30 @@ impl Node {
         // `0` only for a fresh instance dir (empty journal).
         cnc.store_log_time_ns(archive.recovered_log_time_ns());
 
-        // M14a: the declared set and the lag policy, published ONCE, before
-        // any agent runs; services and clients read them from the page.
+        // M14a: the lag policy, published ONCE, before any agent runs;
+        // services and clients read it from the page.
         //
         // Lag BEFORE declared, deliberately. A service can attach between
-        // `create_file` (a complete header, names on line 7) and these two
-        // stores; it refuses a page with names and `services_declared == 0`
-        // as "booting" (`uc_service::attach`). That check can only cover the
-        // gap if a nonzero declared set implies the lag policy is already on
-        // the page — otherwise the sub-window between the two stores reads as
-        // a legitimate lockstep config (`fsm_lag_bytes == 0`) and cannot be
-        // told apart. Both stores are Release and the reader's loads Acquire,
-        // so observing the declared set orders the lag word before it.
+        // `create_file` (a complete header, names on line 7) and the
+        // `store_services_declared` far below; it refuses a page with names
+        // and `services_declared == 0` as "booting" (`uc_service::attach`).
+        // That check can only cover the gap if a nonzero declared set implies
+        // the lag policy is already on the page — otherwise the sub-window
+        // between the two stores reads as a legitimate lockstep config
+        // (`fsm_lag_bytes == 0`) and cannot be told apart. Both stores are
+        // Release and the reader's loads Acquire, so observing the declared
+        // set orders the lag word before it.
+        //
+        // Plan B2 (final review C1): …and the recovered PIN words, published
+        // by the cluster agent's constructor, precede BOTH. `store_services_
+        // declared` is therefore no longer here: it is the LAST thing done
+        // before the agents run, after `ClusterAgent::new` has republished
+        // every pinned row's words. An attach that passes the booting gate on
+        // a page whose pin words were still zero would read `PinRead::NoPin`
+        // and take the unpinned path — on the default purge-off posture a
+        // silent genesis replay under the new binary (spec §2.3), with no
+        // refusal and no log line.
         cnc.store_fsm_lag_bytes(cfg.services.page_lag_value(cfg.buffer_bytes as u64));
-        cnc.store_services_declared(cfg.services.declared());
 
         // 4. Log buffer file: reuse the existing file when it already matches the
         // configured capacity (preserves ring bytes below `durable` across a
@@ -2128,6 +2138,20 @@ impl Node {
             Arc::clone(&cluster_installed),
             Arc::clone(&snapshot_standby_instant_pub),
         );
+        // M14a + plan B2 (final review C1): the declared set, published ONCE
+        // and LAST of the boot-time page words — see the `store_fsm_lag_bytes`
+        // comment above. `ClusterAgent::new` has just republished the pin
+        // words of every row its recovered artifact pins, so a service that
+        // passes the "booting" gate the instant this store lands already
+        // reads its row's real pin. Both stores are Release; the attach path's
+        // loads are Acquire, so observing a nonzero declared set orders the
+        // lag word AND the pin words before it.
+        //
+        // What this does NOT cover, by design (plan B3): a pin committed
+        // after this node's newest cluster artifact is invisible until the
+        // agent below replays up to it. Closing that needs the live reports,
+        // not a boot ordering.
+        cnc.store_services_declared(cfg.services.declared());
         let cluster_runner = AgentRunner::spawn("uc2-cluster", IdleStrategy::Yield, move || {
             cluster_agent.do_work()
         })?;
@@ -2310,6 +2334,7 @@ impl Node {
             fetch_tx,
             stored_set_pos: Arc::clone(&stored_set_pos),
             stored_above_durable: 0,
+            snapshot_floor_hold: 0,
             snapshot_standby_learner,
             snapshot_standby_position,
             snapshot_cmd_rx,
@@ -3650,6 +3675,12 @@ struct Consensus {
     /// stays behind the learner it fetched from logs the condition once rather
     /// than every pass; cleared the moment such a set is adopted.
     stored_above_durable: u64,
+    /// The pinned origin this node's snapshot floor is currently HELD at
+    /// (`0` = no hold outstanding) — see
+    /// [`Consensus::hold_floor_for_pins`]. A latch on the same pattern as
+    /// `stored_above_durable`: an upgrade that takes a while to swap its
+    /// binary would otherwise name the hold on every floor tick.
+    snapshot_floor_hold: u64,
     /// Spec §5.7 item 6: the learner the last standby instant this node
     /// commanded addressed, and that instant's position — the redirect hint
     /// the sender agent consults when it cannot serve a below-floor NAK.
@@ -5081,6 +5112,22 @@ impl Consensus {
         }
 
         let mut did = false;
+        // Plan B2 T5 (fix round): the candidate floor is HELD at any pinned
+        // origin this node has not consumed yet. Computed here — inside the
+        // `have_new_floor` branch and behind the throttle — so the view read
+        // it costs happens at most once per throttle window and never on the
+        // steady path.
+        let service_pos = if have_new_floor {
+            self.hold_floor_for_pins(service_pos)
+        } else {
+            service_pos
+        };
+        // The clamp can wipe out the whole move (the hold sits at or below the
+        // floor this node already published). Then there is nothing to persist
+        // and nothing to prune — but the throttle is still stamped below, so
+        // the next evaluation is one tick away rather than one pass away.
+        let held = have_new_floor && service_pos <= self.snapshot_persisted_floor;
+        let have_new_floor = have_new_floor && !held;
         if have_new_floor {
             self.state
                 .store_snapshot_floor(service_pos)
@@ -5119,10 +5166,102 @@ impl Consensus {
                 did = true;
             }
         }
-        if did {
+        if did || held {
             self.snapshot_floor_last_persist_ns = Some(now);
         }
+        // `held` alone is NOT work: returning `true` for it would keep the
+        // idle strategy hot for as long as an upgrade takes to swap its
+        // binary.
         did
+    }
+
+    /// Plan B2 T5 (fix round): the snapshot/purge floor must not pass a pinned
+    /// origin this node has not CONSUMED yet. Returns `candidate` clamped to
+    /// the lowest such origin.
+    ///
+    /// Retention (plan B1) already keeps the pinned artifacts; this keeps the
+    /// JOURNAL they need. The two are one mechanism: a pinned attach installs
+    /// the artifact at the origin and then tail-replays `(origin, target]`, and
+    /// with the origin's artifact kept but the journal above it purged, the
+    /// service's gap guard meets `first > origin`, can install nothing this
+    /// binary is allowed to install (the only covering artifact is the newer
+    /// one `from` built) and fail-stops the apply thread of a service that
+    /// attached successfully. So between the pin and the swap, a cadence
+    /// instant may complete a set and may even be retained — it just may not
+    /// move this node's floor past the origin.
+    ///
+    /// **Consumed** is read off the row's own cnc slot, and it is three
+    /// conditions, all of them:
+    ///
+    /// 1. the slot is ATTACHED — some service is live on this row;
+    /// 2. its attached version word equals the pin's `to` — the binary the
+    ///    pin names is the one that is here, not the old one still running or
+    ///    a third build;
+    /// 3. its published `applied` frontier has reached the CANDIDATE floor —
+    ///    it has replayed past everything this floor move is about to let the
+    ///    purge remove.
+    ///
+    /// The third is not redundant, and leaving it out leaves a real race
+    /// (found reviewing the first cut of this fix). A pinned attach installs
+    /// the artifact at the origin and RETURNS; its tail replay from the
+    /// origin up runs afterwards, on the apply thread. Releasing the hold at
+    /// attach lets the floor — and the purge behind it — move to the newer
+    /// set while that replay is still walking the journal it needs, and the
+    /// replay's next pass then meets `first > origin` with no artifact this
+    /// binary may install: the same fail-stop the hold exists to prevent,
+    /// through a narrower window. Keyed on `applied` the hold releases when
+    /// the row is genuinely past the cut, which is the thing that matters.
+    ///
+    /// A row whose service has not come back yet holds the floor —
+    /// deliberately, and visibly: `snapshot_floor_held_for_pin` names the
+    /// hold, and an operator who has abandoned the upgrade clears it by
+    /// attaching `to` or by pinning forward, not by waiting.
+    ///
+    /// Node-local: no replicated state changes, and a node that has already
+    /// published a floor above a pinned origin is not pulled back (the floor
+    /// is increase-only — a safety rule this must not break). The door check
+    /// for op 10 requires `origin` to be this node's newest complete set, so
+    /// in practice the pin lands at or above the floor.
+    fn hold_floor_for_pins(&mut self, candidate: u64) -> u64 {
+        let inner = self.cluster_view.snapshot_inner();
+        if inner.pins.is_empty() {
+            self.snapshot_floor_hold = 0;
+            return candidate;
+        }
+        let mut hold = u64::MAX;
+        for row in self.services.ids() {
+            // The newest pin for this row — the same "last wins" rule
+            // `pin_for` and the retention keep-set use.
+            let Some(pin) = inner.pins.iter().rev().find(|p| p.row == row) else {
+                continue;
+            };
+            let slot = self.cnc.service_slot(row as usize);
+            let (_, attached, _) = unpack_service_status(slot.status.load_acquire());
+            // Consumed: `to` is attached here AND it has already replayed past
+            // everything this floor move is about to let the purge remove.
+            if attached
+                && slot.status.version() == pin.to
+                && slot.applied.load_acquire() >= candidate
+            {
+                continue;
+            }
+            hold = hold.min(pin.origin);
+        }
+        if hold >= candidate {
+            self.snapshot_floor_hold = 0;
+            return candidate;
+        }
+        if self.snapshot_floor_hold != hold {
+            self.snapshot_floor_hold = hold;
+            crate::obs_event!(
+                Info,
+                "snapshot_floor_held_for_pin",
+                node = self.id as u64,
+                position = hold,
+                candidate = candidate
+            );
+        }
+        hold
     }
 
     /// Publish `term`, `flags` (leader/can_serve), and a fresh wall-clock
@@ -5900,6 +6039,13 @@ impl Consensus {
         // Plan B1: a pinned origin's set must outlive the floor — B2's
         // attach-time install needs it. Read once per retention pass (the
         // pass is throttled), from the committed view.
+        //
+        // Plan B2 T5 (fix round), the other half of the same guarantee:
+        // retention keeps the pinned ARTIFACTS, and
+        // [`Consensus::hold_floor_for_pins`] keeps the JOURNAL they need. An
+        // artifact at the origin with the journal above it purged is not
+        // enough — the pinned attach installs the artifact and then has to
+        // tail-replay `(origin, target]`.
         let keep: Vec<u64> = {
             let inner = self.cluster_view.snapshot_inner();
             (0..CNC_MAX_SERVICES as u8)
@@ -11252,6 +11398,7 @@ mod tests {
             fetch_tx,
             stored_set_pos,
             stored_above_durable: 0,
+            snapshot_floor_hold: 0,
             snapshot_standby_learner: Arc::new(AtomicU32::new(0)),
             snapshot_standby_position: Arc::new(AtomicU64::new(0)),
             snapshot_cmd_rx,
@@ -11684,6 +11831,118 @@ mod tests {
                 format!("snap-{p2}.ultcluster")
             ]
         );
+    }
+
+    /// Plan B2 T5 (fix round), the other half of the pinned-origin
+    /// guarantee: retention keeps the pinned artifacts, and the FLOOR is
+    /// held at a pinned origin this node has not consumed yet — so the
+    /// journal the pinned attach tail-replays from is still there when the
+    /// new binary shows up.
+    ///
+    /// Without the hold, a cadence instant between the pin and the swap
+    /// completes a set at p2, the floor (and under `BelowSnapshot` the
+    /// journal purge behind it) moves to p2, and the pinned attach's gap
+    /// guard then meets `first > origin` with no artifact it may install —
+    /// a fail-stop on a service the cluster sanctioned.
+    #[test]
+    fn the_floor_is_held_at_a_pinned_origin_until_the_pinned_version_attaches() {
+        let mut h = harness_with_rows(&["a"]);
+        let (p1, p2) = (4096u64, 6016u64);
+
+        // Row 0 is pinned at p1 (`from` 1 → `to` 2) in the committed view,
+        // and its service is attached — but still at `from`, which is the
+        // whole window this hold exists for.
+        let mut st = h.cons.cluster_view.to_state();
+        st.pins.push(UpgradePin {
+            row: 0,
+            from: 1,
+            to: 2,
+            origin: p1,
+        });
+        st.applied = p1;
+        h.cons.cluster_view.publish(&st);
+        let slot = h.cons.cnc.service_slot(0);
+        slot.status
+            .store_release(uc_log::cnc::pack_service_status(0, true, 1));
+        slot.status.store_version(1);
+
+        // A complete set at p2 — newer than the pinned origin.
+        h.row_froze_at(0, p2);
+        h.cluster_snapshot_pos.store(p2, Ordering::Release);
+        h.cons.check_set_completeness();
+        assert_eq!(
+            h.cons.snapshot_set_position.load(Ordering::Relaxed),
+            p2,
+            "precondition: the set at p2 is complete here"
+        );
+
+        h.advance_floor_timer();
+        assert!(h.cons.maybe_persist_snapshot_floor());
+        assert_eq!(
+            h.cons.snapshot_persisted_floor, p1,
+            "the floor stops at the unconsumed pin's origin, not at the newest set"
+        );
+        assert_eq!(
+            h.cons.cnc.snapshots().node_snapshot_floor.load_acquire(),
+            p1,
+            "and the mirrored word says the same thing"
+        );
+        assert_eq!(h.cons.snapshot_floor_hold, p1, "the hold is latched once");
+
+        // `to` attaches — but its tail replay has not reached p2 yet. The
+        // hold STAYS: the journal it is about to replay is exactly what the
+        // purge behind this floor move would remove.
+        h.cons.cnc.service_slot(0).status.store_version(2);
+        h.cons.cnc.service_slot(0).applied.store_release(p1);
+        h.advance_floor_timer();
+        h.cons.maybe_persist_snapshot_floor();
+        assert_eq!(
+            h.cons.snapshot_persisted_floor, p1,
+            "attached at `to` is not enough — the row has not replayed past the cut"
+        );
+
+        // …and releases once the row's published frontier is past the
+        // candidate floor.
+        h.cons.cnc.service_slot(0).applied.store_release(p2);
+        h.advance_floor_timer();
+        assert!(h.cons.maybe_persist_snapshot_floor());
+        assert_eq!(
+            h.cons.snapshot_persisted_floor, p2,
+            "a consumed pin holds nothing"
+        );
+        assert_eq!(h.cons.snapshot_floor_hold, 0, "and the latch is cleared");
+    }
+
+    /// The hold keys on ATTACHED-at-`to`, not on the pin's mere existence: a
+    /// row whose service is detached (mid-swap, the moment the old binary has
+    /// stopped and the new one has not started) still holds the floor, which
+    /// is exactly the window the artifact and its journal have to survive.
+    #[test]
+    fn a_detached_row_under_a_pin_still_holds_the_floor() {
+        let mut h = harness_with_rows(&["a"]);
+        let (p1, p2) = (4096u64, 6016u64);
+        let mut st = h.cons.cluster_view.to_state();
+        st.pins.push(UpgradePin {
+            row: 0,
+            from: 1,
+            to: 2,
+            origin: p1,
+        });
+        st.applied = p1;
+        h.cons.cluster_view.publish(&st);
+        // Detached, but the version word still reads `to` from a previous
+        // life — "attached AND at `to`" is the conjunction that matters.
+        let slot = h.cons.cnc.service_slot(0);
+        slot.status
+            .store_release(uc_log::cnc::pack_service_status(0, false, 1));
+        slot.status.store_version(2);
+
+        h.row_froze_at(0, p2);
+        h.cluster_snapshot_pos.store(p2, Ordering::Release);
+        h.cons.check_set_completeness();
+        h.advance_floor_timer();
+        assert!(h.cons.maybe_persist_snapshot_floor());
+        assert_eq!(h.cons.snapshot_persisted_floor, p1);
     }
 
     /// Spec §5.7 item 4 (Ruling P4'): a set this node FETCHED from a learner

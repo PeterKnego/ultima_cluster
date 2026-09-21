@@ -145,7 +145,7 @@ pub fn confirm(att: &Attributed, d: &Declaration) -> Verdicts {
         if !satisfied[i] {
             let surface = Surface::parse(&e.surface).expect(
                 "declaration validated at parse time: every Expect.surface is one of \
-                 response | sched | projection_origin | projection_end",
+                 response | sched | projection_origin | projection_end | ids | output",
             );
             v.findings.push(Finding {
                 surface,

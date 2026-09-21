@@ -181,16 +181,64 @@ frame normally starts exactly at it. So:
   machine does.
 
 **The mis-tag check is the framework's, not yours.** Every artifact file
-begins with a 16-byte UC envelope (`ULTSNAP1` + P, LE) that `SnapshotStore::
-publish` writes and every install path verifies, because the exclusive tag
-makes a mis-tagged artifact invisible from the payload: an image built at some
-earlier `P0` and renamed to `snap-<P>.ultsnap` passes any payload-side check a
-state machine can write. `src` is positioned at your first payload byte, and
-UC still prescribes **no** payload encoding. A payload cursor *above*
-`position` is worth refusing as belt-and-suspenders; below it is normal.
+begins with a 24-byte UC envelope (`ULTSNAP2 ‖ P: u64 LE ‖ version: u32 LE ‖
+4 reserved zero bytes`, since `2.13.0`) that `SnapshotStore::publish` writes
+and every install path verifies, because the exclusive tag makes a mis-tagged
+artifact invisible from the payload: an image built at some earlier `P0` and
+renamed to `snap-<P>.ultsnap` passes any payload-side check a state machine
+can write. `src` is positioned at your first payload byte, and UC still
+prescribes **no** payload encoding. A payload cursor *above* `position` is
+worth refusing as belt-and-suspenders; below it is normal. The pre-`2.13.0`
+16-byte `ULTSNAP1` envelope (no version field) is **refused by name**
+(`EnvelopeError::Legacy`), never decoded as version 0 — clear a row's
+`snapshots/<row>/` once when moving to `2.13.0` and the next instant rebuilds
+it in the new layout.
 
-See [Instance directory § The artifact envelope](instance-directory.md#the-artifact-envelope-and-who-deletes-artifacts)
-and [The cluster FSM, explained § Instants](../notes/uc2-cluster-fsm-explained.md#instants-one-position-one-set).
+**The version field is what makes an install's cross-check possible.** Every
+install path checks the artifact's `version` against the version it EXPECTS
+to have built the artifact, and the expectation differs by path:
+
+- an **unpinned** install (the reconstruction gap guard, `uc_service::replay`)
+  requires the artifact's `version == S::VERSION` — the running binary's own
+  version, since ordinary reconstruction assumes the artifact it is about to
+  install came from the same code it is running now;
+- a **pinned** install (spec §3 S4) requires it `== ` the upgrade pin's
+  `from` instead — the one sanctioned crossing of a version boundary, because
+  the whole point of a pin is to install an artifact a DIFFERENT version
+  built. `VersionMismatch { built, expected }` names both sides.
+
+**A pinned install runs in `attach`, not the gap guard.** The gap guard only
+runs when reconstruction decides it needs to replay, which a durable state
+machine already sitting on an unscrolled ring never triggers — so a pin that
+only the gap guard acted on could leave such an SM stuck on its own history.
+`attach` therefore reads the row's pin (through
+[`uc_log::cnc::PinRead`](cnc-page.md), a tri-state: `NoPin` / `Pinned {
+origin, from, to }` / `Contended`) BEFORE publishing anything to the slot,
+and — when `to == S::VERSION` — installs `snap-<origin>` **unconditionally**,
+overriding whatever the state machine's own `last_applied()` says. `attach`
+takes the install capability from
+[`ServiceBuilder::start_with_snapshots`](../../uc_service/src/lib.rs); a
+pinned row started with plain `start()` has no install closure to run and is
+refused, by name, rather than silently tail-replaying the origin's prefix
+under this binary (the §2.3 counterfactual). The gap guard's own expected
+version is the pin's `from` **only for the artifact at the pinned origin
+itself** — a pinned row's gap guard prefers that one artifact over a newer
+one `from` left behind, for the same "sanctioned crossing" reason.
+
+Four refusals guard this path, all named, none silent: `PinnedVersionMismatch`
+(a stale binary — one that is not the pin's `to` — tries to attach after the
+pin: the whole point of pinning), `PinUnreadable` (the pin words could not be
+read consistently through the seqlock — `Contended` fails CLOSED, never
+treated as "no pin", because attaching unpinned off a half-published triple
+would skip an install the cluster requires), `PinRequiresSnapshots` (a pinned
+row started with `start()`, above), and `PinnedArtifactMissing` (the pin
+names an origin whose artifact is not on this node — the complete set at that
+instant was pruned or never fetched; there is no sound fallback, since a
+different artifact is a different instant and genesis is the counterfactual).
+
+See [Instance directory § The artifact envelope](instance-directory.md#the-artifact-envelope-and-who-deletes-artifacts),
+[The cluster FSM, explained § Instants](../notes/uc2-cluster-fsm-explained.md#instants-one-position-one-set)
+and [§ Pins and reports](../notes/uc2-cluster-fsm-explained.md#pins-and-reports-2130).
 
 ## The blanket adapter and the byte-identity promise
 

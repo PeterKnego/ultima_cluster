@@ -172,14 +172,14 @@ impl Drop for Cluster {
     }
 }
 
-/// The kv image's version word inside an on-disk artifact: after UC's 16-byte
-/// `ULTSNAP1 ‖ P` envelope and `Sessioned`'s `u64 len ‖ dedup table` prefix
-/// (WIRE-FORMAT.md § 5).
+/// The kv image's version word inside an on-disk artifact: after UC's
+/// 24-byte `ULTSNAP2 ‖ P ‖ version ‖ reserved` envelope and `Sessioned`'s
+/// `u64 len ‖ dedup table` prefix (WIRE-FORMAT.md § 5).
 fn kv_image_version(artifact: &Path) -> u32 {
     let b = std::fs::read(artifact).unwrap();
-    assert_eq!(&b[..8], b"ULTSNAP1");
-    let table_len = u64::from_le_bytes(b[16..24].try_into().unwrap()) as usize;
-    let at = 24 + table_len;
+    assert_eq!(&b[..8], b"ULTSNAP2");
+    let table_len = u64::from_le_bytes(b[24..32].try_into().unwrap()) as usize;
+    let at = 32 + table_len;
     u32::from_le_bytes(b[at..at + 4].try_into().unwrap())
 }
 

@@ -40,7 +40,9 @@ use uc_service::snapshots::verify_snapshot_envelope;
 // `RawStateMachine`'s items (`apply`, `on_timer`, `last_applied`, `IDENTITY`,
 // `VERSION`) reach us through the `SnapshotStateMachine: RawStateMachine`
 // supertrait bound, so it needs no import of its own.
-use uc_service::{ApplyCtx, SnapshotStateMachine, TimerEvent};
+use uc_service::{
+    ApplyCtx, NoopOutput, OutputError, RawOutputHandler, SnapshotStateMachine, TimerEvent,
+};
 
 use crate::corpus::Corpus;
 use crate::trace::{Entry, EntryKind, Sched, Trace};
@@ -61,13 +63,14 @@ fn project_string<S: SnapshotStateMachine>(sm: &S) -> anyhow::Result<String> {
 }
 
 /// Install `artifact` (tagged `position`) into `sm`: strip and check the
-/// framework envelope, then hand the payload to the SM. Returns the position
-/// the SM reported, which must equal `position`.
+/// framework envelope, then hand the payload to the SM. Returns `(got,
+/// artifact_version)`: the position the SM reported (must equal `position`)
+/// and the version stamped in the artifact's envelope.
 fn install<S: SnapshotStateMachine>(
     sm: &mut S,
     artifact: &Path,
     position: u64,
-) -> anyhow::Result<u64> {
+) -> anyhow::Result<(u64, u32)> {
     let mut f =
         BufReader::new(File::open(artifact).with_context(|| artifact.display().to_string())?);
     install_from(sm, &mut f, position)
@@ -75,14 +78,17 @@ fn install<S: SnapshotStateMachine>(
 
 /// [`install`] minus the file: envelope, install, and the two post-install
 /// checks. Split out so the refusals are unit-testable over an in-memory
-/// artifact — no scratch directory, no I/O.
+/// artifact — no scratch directory, no I/O. `None` for the envelope's
+/// expected version: this driver reports what the artifact was built with
+/// rather than asserting it (that cross-check is Tasks 3/4's).
 fn install_from<S: SnapshotStateMachine>(
     sm: &mut S,
     src: &mut dyn std::io::Read,
     position: u64,
-) -> anyhow::Result<u64> {
+) -> anyhow::Result<(u64, u32)> {
     let f: &mut dyn std::io::Read = src;
-    verify_snapshot_envelope(f, position).map_err(|e| anyhow::anyhow!("envelope: {e}"))?;
+    let env = verify_snapshot_envelope(f, position, None)
+        .map_err(|e| anyhow::anyhow!("envelope: {e}"))?;
     let got = sm
         .install_snapshot(position, f)
         .map_err(|e| anyhow::anyhow!("install_snapshot({position}): {e}"))?;
@@ -112,7 +118,7 @@ fn install_from<S: SnapshotStateMachine>(
         "install_snapshot({position}) left last_applied at {:?}; the image's cursor must be strictly below the artifact tag (P is an exclusive frontier)",
         sm.last_applied()
     );
-    Ok(got)
+    Ok((got, env.version))
 }
 
 pub fn project_artifact<S: SnapshotStateMachine>(
@@ -120,37 +126,86 @@ pub fn project_artifact<S: SnapshotStateMachine>(
     artifact: &Path,
     position: u64,
 ) -> anyhow::Result<String> {
-    install(&mut sm, artifact, position)?;
+    let (_got, _version) = install(&mut sm, artifact, position)?;
     project_string(&sm)
 }
 
+/// Optional side effects for [`drive_with`] (plan B2 T6): after each applied
+/// MESSAGE frame, run `output.on_committed(pos, cmd, &sm)` on a
+/// `current_thread` tokio runtime and capture the result into
+/// [`crate::trace::Entry::output`]. Generic over the handler type, the same
+/// static-dispatch shape `uc_service::ServiceBuilder` already uses for
+/// `RawOutputHandler` — NOT a trait object: `RawOutputHandler::on_committed`
+/// is an `async fn`, which desugars to a return-position `impl Future` and
+/// is therefore not dyn-compatible (`Box<dyn RawOutputHandler<S>>` refuses
+/// to compile against the trait as declared). `DriveOptions::default()`
+/// (`O = NoopOutput`) runs no handler and leaves every entry's `output` at
+/// `None`.
+pub struct DriveOptions<O = NoopOutput> {
+    pub output: Option<O>,
+}
+
+impl<O> Default for DriveOptions<O> {
+    fn default() -> Self {
+        DriveOptions { output: None }
+    }
+}
+
 pub fn drive<S: SnapshotStateMachine>(
-    mut sm: S,
+    sm: S,
     corpus: &Corpus,
     origin: Origin,
 ) -> anyhow::Result<Trace> {
+    drive_with::<S, NoopOutput>(sm, corpus, origin, DriveOptions::default())
+}
+
+/// [`drive`] plus an optional `on_committed` recorder (plan B2 T6, spec
+/// §8.1's third uncaptured surface).
+pub fn drive_with<S: SnapshotStateMachine, O: RawOutputHandler<S>>(
+    mut sm: S,
+    corpus: &Corpus,
+    origin: Origin,
+    opts: DriveOptions<O>,
+) -> anyhow::Result<Trace> {
     let m = &corpus.manifest;
-    let (start, projection_at_origin) = match origin {
+    let (start, projection_at_origin, artifact_version) = match origin {
         Origin::Artifact => {
-            install(&mut sm, &corpus.artifact(), m.origin)?;
-            (m.origin, Some(project_string(&sm)?))
+            let (_got, version) = install(&mut sm, &corpus.artifact(), m.origin)?;
+            (m.origin, Some(project_string(&sm)?), Some(version))
         }
-        Origin::Genesis => (0, None),
+        Origin::Genesis => (0, None, None),
     };
 
     let reader = TailReader::open(&corpus.journal_dir())?;
     let identity = S::IDENTITY;
-    let mut entries = Vec::new();
-    let mut resp = Vec::with_capacity(256);
+    let mut out = WalkOutput {
+        resp: Vec::with_capacity(256),
+        entries: Vec::new(),
+    };
     let end = m.end;
 
+    // Built once, only when a handler was given — never a per-frame cost,
+    // and never built at all on the (default) no-handler path.
+    let rt = opts
+        .output
+        .is_some()
+        .then(|| tokio::runtime::Builder::new_current_thread().build())
+        .transpose()
+        .context("building the on_committed runtime")?;
+    let recorder = Recorder {
+        output: opts.output.as_ref(),
+        rt: rt.as_ref(),
+    };
+
     reader.scan_from(start, |_seq, base, block| {
-        walk_block(&mut sm, identity, base, block, end, &mut resp, &mut entries)
+        walk_block(&mut sm, identity, base, block, end, &mut out, &recorder)
     })?;
+    let entries = out.entries;
 
     Ok(Trace {
         row: m.row,
         version: S::VERSION,
+        artifact_version,
         origin: start,
         end,
         projection_at_origin,
@@ -159,23 +214,48 @@ pub fn drive<S: SnapshotStateMachine>(
     })
 }
 
+/// `Ok(())` → `"ok"`; `Err` → the `OutputError`'s own `Display`, which is
+/// already exactly `"retryable: <msg>"` / `"permanent: <msg>"`
+/// (`#[error(...)]` on the two variants) — never a value confusable with a
+/// successful `"ok"`.
+fn format_output(r: Result<(), OutputError>) -> String {
+    match r {
+        Ok(()) => "ok".to_string(),
+        Err(e) => e.to_string(),
+    }
+}
+
+/// `walk_block`'s two OUT parameters, bundled so the function stays under
+/// clippy's argument-count lint: every caller passes both together anyway.
+struct WalkOutput {
+    resp: Vec<u8>,
+    entries: Vec<Entry>,
+}
+
+/// `walk_block`'s optional `on_committed` recorder, bundled with the runtime
+/// it needs to `block_on` — same reasoning as [`WalkOutput`].
+struct Recorder<'a, O> {
+    output: Option<&'a O>,
+    rt: Option<&'a tokio::runtime::Runtime>,
+}
+
 /// Walk ONE archived block's frames, dispatching into `sm` and appending to
-/// `entries`. `base` is the block's base stream position, `end` the corpus's
-/// exclusive frontier. Returns what the `scan_from` visitor should return:
-/// `false` to stop the whole scan (the span's end was reached), `true` to
-/// continue with the next block.
+/// `out.entries`. `base` is the block's base stream position, `end` the
+/// corpus's exclusive frontier. Returns what the `scan_from` visitor should
+/// return: `false` to stop the whole scan (the span's end was reached),
+/// `true` to continue with the next block.
 ///
 /// Extracted from the closure so it can be unit-tested over a hand-laid
 /// block — the TIMER arm and the schedule capture are unreachable from a
 /// `RegisterSm` corpus, which never schedules and never receives a timer.
-fn walk_block<S: SnapshotStateMachine>(
+fn walk_block<S: SnapshotStateMachine, O: RawOutputHandler<S>>(
     sm: &mut S,
     identity: FsmIdentity,
     base: u64,
     block: &[u8],
     end: u64,
-    resp: &mut Vec<u8>,
-    entries: &mut Vec<Entry>,
+    out: &mut WalkOutput,
+    recorder: &Recorder<'_, O>,
 ) -> bool {
     let mut off = 0usize;
     while off + HEADER_LEN <= block.len() {
@@ -214,9 +294,19 @@ fn walk_block<S: SnapshotStateMachine>(
                 let mut ctx = ApplyCtx::new(pos, identity)
                     .with_time(hdr.time_ns)
                     .with_term(hdr.leadership_term_id);
-                resp.clear();
-                sm.apply(&mut ctx, payload, resp);
-                entries.push(Entry {
+                out.resp.clear();
+                sm.apply(&mut ctx, payload, &mut out.resp);
+                let ids_calls = ctx.ids_calls();
+                // Only a MESSAGE runs the recorder: `on_committed` is the
+                // committed-command side effect (spec §7); a TIMER frame has
+                // no `cmd` bytes to hand it.
+                let recorded_output = match (recorder.output, recorder.rt) {
+                    (Some(h), Some(rt)) => {
+                        Some(format_output(rt.block_on(h.on_committed(pos, payload, sm))))
+                    }
+                    _ => None,
+                };
+                out.entries.push(Entry {
                     pos,
                     kind: EntryKind::Message,
                     // 32 bytes, not 4: a `Sessioned<S>` service's payload
@@ -226,8 +316,10 @@ fn walk_block<S: SnapshotStateMachine>(
                     // the app's own op byte. The declaration's `tag_offset`
                     // says how much of this prefix to skip.
                     tag: payload[..payload.len().min(32)].to_vec(),
-                    response: resp.clone(),
+                    response: out.resp.clone(),
                     sched: sched_of(&mut ctx),
+                    ids_calls,
+                    output: recorded_output,
                 });
             }
             FRAME_TYPE_TIMER if above => {
@@ -244,7 +336,8 @@ fn walk_block<S: SnapshotStateMachine>(
                         &mut ctx,
                         TimerEvent::new(body.timer_id, body.deadline_ns, table),
                     );
-                    entries.push(Entry {
+                    let ids_calls = ctx.ids_calls();
+                    out.entries.push(Entry {
                         pos,
                         kind: EntryKind::Timer {
                             id: body.timer_id,
@@ -254,6 +347,8 @@ fn walk_block<S: SnapshotStateMachine>(
                         tag: Vec::new(),
                         response: Vec::new(),
                         sched: sched_of(&mut ctx),
+                        ids_calls,
+                        output: None,
                     });
                 }
             }
@@ -279,7 +374,7 @@ fn op_name(op: SchedOp) -> &'static str {
 }
 
 fn sched_of(ctx: &mut ApplyCtx) -> Vec<Sched> {
-    ctx.take_sched_records_for_test()
+    ctx.take_sched_records()
         .into_iter()
         .map(|r| Sched {
             op: op_name(r.op).into(),
@@ -362,6 +457,11 @@ mod tests {
             // order-sensitive and both op names are covered.
             ctx.schedule(7, 100);
             ctx.cancel(3);
+            // Two `ids()` calls, so `entries[0].ids_calls == 2` is a real
+            // observation of the walk plumbing the count through, not a
+            // default that happens to read zero.
+            let _ = ctx.ids();
+            let _ = ctx.ids();
             out.extend_from_slice(b"ok");
         }
 
@@ -374,6 +474,7 @@ mod tests {
         fn on_timer(&mut self, ctx: &mut ApplyCtx, ev: TimerEvent) {
             self.last = Some(ctx.position);
             self.timers.push((ev, ctx.position));
+            let _ = ctx.ids();
         }
     }
 
@@ -412,11 +513,12 @@ mod tests {
         }
     }
 
-    /// An in-memory artifact: the framework envelope at `p` plus an empty
-    /// payload (`ProbeSm` reads its image from nowhere).
-    fn artifact_bytes(p: u64) -> Vec<u8> {
+    /// An in-memory artifact: the framework envelope at `p`, stamped with
+    /// `version`, plus an empty payload (`ProbeSm` reads its image from
+    /// nowhere).
+    fn artifact_bytes(p: u64, version: u32) -> Vec<u8> {
         let mut v = Vec::new();
-        write_snapshot_envelope(&mut v, p).unwrap();
+        write_snapshot_envelope(&mut v, p, version).unwrap();
         v
     }
 
@@ -425,9 +527,10 @@ mod tests {
     #[test]
     fn install_accepts_a_cursor_strictly_below_the_tag() {
         let mut sm = ProbeSm::default();
-        let art = artifact_bytes(512);
-        let got = install_from(&mut sm, &mut &art[..], 512).unwrap();
+        let art = artifact_bytes(512, 7);
+        let (got, version) = install_from(&mut sm, &mut &art[..], 512).unwrap();
         assert_eq!(got, 512);
+        assert_eq!(version, 7, "the artifact's own stamp is reported back");
         assert_eq!(sm.last_applied(), Some(448));
     }
 
@@ -437,7 +540,7 @@ mod tests {
             frontier: Frontier::AtTag,
             ..Default::default()
         };
-        let art = artifact_bytes(512);
+        let art = artifact_bytes(512, 0);
         let e = install_from(&mut sm, &mut &art[..], 512)
             .unwrap_err()
             .to_string();
@@ -453,7 +556,7 @@ mod tests {
             frontier: Frontier::Nothing,
             ..Default::default()
         };
-        let art = artifact_bytes(512);
+        let art = artifact_bytes(512, 0);
         let e = install_from(&mut sm, &mut &art[..], 512)
             .unwrap_err()
             .to_string();
@@ -536,7 +639,14 @@ mod tests {
     fn walk_dispatches_message_and_own_timer_skips_foreign_and_stops_at_end() {
         let block = hand_laid_block();
         let mut sm = ProbeSm::default();
-        let (mut resp, mut entries) = (Vec::new(), Vec::new());
+        let mut out = WalkOutput {
+            resp: Vec::new(),
+            entries: Vec::new(),
+        };
+        let recorder: Recorder<'_, NoopOutput> = Recorder {
+            output: None,
+            rt: None,
+        };
         // The last MESSAGE starts at 1312 and ends at 1376; an `end` of 1340
         // makes it straddle the frontier, so it must not be dispatched.
         let cont = walk_block(
@@ -545,9 +655,10 @@ mod tests {
             BASE,
             &block,
             BASE + 316,
-            &mut resp,
-            &mut entries,
+            &mut out,
+            &recorder,
         );
+        let entries = &out.entries;
 
         // Stopped AT the straddling frame — not `break`-ed out of a desynced
         // walk, which would have returned true.
@@ -577,6 +688,10 @@ mod tests {
         );
         // The RECORDED header values reached apply: time_ns and term.
         assert_eq!(sm.applied, vec![(BASE, b"CMD\x01abcd".to_vec(), 9_000, 4)]);
+        // `ApplyCtx::ids_calls` reached the trace, and with no handler passed
+        // to `walk_block` the MESSAGE's `output` is `None`, not `"ok"`.
+        assert_eq!(entries[0].ids_calls, 2);
+        assert_eq!(entries[0].output, None);
 
         // OUR timer, table flag carried, id/deadline in the right slots.
         assert_eq!(
@@ -589,6 +704,10 @@ mod tests {
         );
         assert_eq!(entries[1].pos, BASE + 64);
         assert!(entries[1].tag.is_empty() && entries[1].response.is_empty());
+        // A TIMER frame's ids() calls are captured too; it never runs the
+        // recorder (there is no `cmd` to hand `on_committed`).
+        assert_eq!(entries[1].ids_calls, 1);
+        assert_eq!(entries[1].output, None);
 
         // The FOREIGN timer produced nothing — and only one timer arrived.
         assert_eq!(sm.timers.len(), 1);
@@ -605,16 +724,24 @@ mod tests {
     fn walk_runs_the_whole_block_when_end_is_above_it() {
         let block = hand_laid_block();
         let mut sm = ProbeSm::default();
-        let (mut resp, mut entries) = (Vec::new(), Vec::new());
+        let mut out = WalkOutput {
+            resp: Vec::new(),
+            entries: Vec::new(),
+        };
+        let recorder: Recorder<'_, NoopOutput> = Recorder {
+            output: None,
+            rt: None,
+        };
         let cont = walk_block(
             &mut sm,
             probe_identity(),
             BASE,
             &block,
             u64::MAX,
-            &mut resp,
-            &mut entries,
+            &mut out,
+            &recorder,
         );
+        let entries = &out.entries;
         // Ran off the end of the block, so the scan continues to the next one.
         assert!(cont);
         // Both MESSAGEs and our one TIMER; the 96-byte PADDING was walked at
@@ -633,16 +760,24 @@ mod tests {
             last: Some(BASE + 64),
             ..Default::default()
         };
-        let (mut resp, mut entries) = (Vec::new(), Vec::new());
+        let mut out = WalkOutput {
+            resp: Vec::new(),
+            entries: Vec::new(),
+        };
+        let recorder: Recorder<'_, NoopOutput> = Recorder {
+            output: None,
+            rt: None,
+        };
         walk_block(
             &mut sm,
             probe_identity(),
             BASE,
             &block,
             u64::MAX,
-            &mut resp,
-            &mut entries,
+            &mut out,
+            &recorder,
         );
+        let entries = &out.entries;
         // The first MESSAGE (at BASE) and our TIMER (at BASE+64) are history;
         // only the last MESSAGE is above the frontier.
         assert_eq!(entries.len(), 1, "{entries:?}");

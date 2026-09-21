@@ -8,14 +8,15 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 use uc_log::buffer::LogBuffer;
-use uc_log::cnc::{CncPage, pack_service_status, unpack_service_status};
+use uc_log::cnc::{CncPage, PinRead, pack_service_status, unpack_service_status};
 use uc_log::reader::LogFollower;
 use uc_protocol::ring::{BroadcastRing, SpscRing};
 use uc_protocol::v2::cnc::CNC_SVC_STATUS_SNAPSHOT_CAPABLE;
 
-use crate::apply::ApplyState;
+use crate::apply::{ApplyState, InstallFn};
 use crate::config::{ServiceConfig, ServiceError};
 use crate::egress::Egress;
+use crate::snapshots::SnapshotStore;
 use crate::traits::RawStateMachine;
 
 /// The pieces the builder needs after a successful attach: the apply agent's
@@ -39,6 +40,15 @@ pub(crate) struct Attached<S: RawStateMachine> {
     /// M14a: `service.<row>.lock`, held for the service's life (dropped last,
     /// released by the OS on any exit) — enforces one process per row.
     pub(crate) _lock: std::fs::File,
+    /// Plan B2 T4: the install capability the caller handed in, given back
+    /// untouched so `start_with_snapshots` can reuse the SAME closure for the
+    /// apply thread's [`crate::apply::SnapshotRestore`] — attach borrows it
+    /// for the pinned install and owns none of it.
+    pub(crate) install: Option<InstallFn<S>>,
+    /// Plan B2 T4: the pin this attach acted on, `(origin, from, to)` —
+    /// `Some` ONLY when the artifact at `origin` was actually installed here.
+    /// A row with no pin, or an attach that refused, yields `None`.
+    pub(crate) pin: Option<(u64, u32, u32)>,
 }
 
 /// M14a: the one path every service-side slot access takes.
@@ -57,19 +67,35 @@ pub(crate) fn lag_mode_for(cnc: &CncPage) -> crate::lag::LagMode {
 /// Run the 6-step attach. Steps 1–5 here; step 6 (spawn the threads) is the
 /// builder's job, after this returns.
 ///
-/// `snapshot_capable` is `true` only from
+/// `install` is `Some` only from
 /// [`ServiceBuilder::start_with_snapshots`](crate::ServiceBuilder::start_with_snapshots)
-/// — the one path that installs a `freeze()` — and rides the SAME status
+/// — the one path that has `S: SnapshotStateMachine` in scope — and is what
+/// makes this row snapshot-CAPABLE: the capability bit rides the SAME status
 /// store as the attached bit (coordinated-snapshot spec §5.2). Folding it in
 /// there rather than OR-ing it afterwards leaves no window in which the node
 /// can see this row attached-but-not-capable and refuse an instant
 /// (`48 snapshot_unsupported`) on a row that is about to be capable.
+///
+/// Plan B2 T4 (spec §3 S4 steps 4–5) adds the row's upgrade PIN to the
+/// sequence, between the lock and step 4. Order is load-bearing:
+///
+/// 1. the row is found by name (it names the lock file and the slot),
+/// 2. `service.<row>.lock` is taken — so two racing attaches cannot both
+///    pass the pin read and both install into the same row,
+/// 3. the pin is read through the seqlock reader and every refusal is
+///    decided,
+/// 4. the pinned install runs, rewinding the state machine to the origin,
+///
+/// and only then does step 4 below publish `applied`. Nothing is written to
+/// the slot before the pin decision, so a refused attach leaves the row
+/// exactly as it found it.
 pub(crate) fn attach<S: RawStateMachine>(
     cfg: &ServiceConfig,
     sm: S,
-    snapshot_capable: bool,
+    install: Option<InstallFn<S>>,
 ) -> Result<Attached<S>, ServiceError> {
     let dir = &cfg.instance_dir;
+    let snapshot_capable = install.is_some();
 
     // 1. Open + validate the cnc page (magic/crc/version/app_id). Capture the
     //    node's per-boot instance_id (a fresh id invalidates a stale attach).
@@ -146,6 +172,93 @@ pub(crate) fn attach<S: RawStateMachine>(
         row,
     })?;
 
+    // 1d. Plan B2 (spec §3 S4 steps 4–5): the row's PIN, read through the
+    //     seqlock reader ONLY, and decided BEFORE any slot word is written.
+    //     Under `service.<row>.lock` (just taken above), so the decision and
+    //     the install that follows it are serialised against any other
+    //     attach to this row.
+    let s = slot(&cnc, row);
+    let pin = match s.status.pin() {
+        PinRead::NoPin => None,
+        // NOT "no pin": a half-published triple that a reader silently read
+        // as unpinned would skip an install the cluster requires. Transient,
+        // so the refusal says to retry.
+        PinRead::Contended => return Err(ServiceError::PinUnreadable { row }),
+        PinRead::Pinned { origin, from, to } => {
+            if to != S::VERSION {
+                return Err(ServiceError::PinnedVersionMismatch {
+                    name: S::IDENTITY.name.as_str().to_string(),
+                    row,
+                    origin,
+                    pinned: to,
+                    mine: S::VERSION,
+                });
+            }
+            Some((origin, from, to))
+        }
+    };
+    // UNCONDITIONAL install (step 4): the artifact at the origin, built by
+    // the pin's `from`, replaces whatever state this state machine holds — a
+    // DURABLE state machine already above the origin is rewound to it and
+    // recomputes the tail under THIS version, exactly as its fresh peers do.
+    // There is no "already caught up, skip it" arm on purpose: the prefix
+    // below the origin was computed by `from`'s `apply`, and this binary's
+    // may mean something different by the same recorded command (spec §2.3).
+    let mut sm = sm;
+    if let Some((origin, from, to)) = pin {
+        let Some(install_fn) = install.as_ref() else {
+            return Err(ServiceError::PinRequiresSnapshots {
+                name: S::IDENTITY.name.as_str().to_string(),
+                row,
+                origin,
+            });
+        };
+        let store = SnapshotStore::open(dir, row)?;
+        let path = store.path_for(origin);
+        let mut file = match std::fs::File::open(&path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(ServiceError::PinnedArtifactMissing {
+                    row,
+                    origin,
+                    path: path.display().to_string(),
+                });
+            }
+            Err(e) => return Err(e.into()),
+        };
+        // The envelope is cross-checked against the PIN's `from`, not against
+        // `S::VERSION` — this is the sanctioned crossing of a version
+        // boundary, and the artifact is required to be the one `from` built
+        // (the unpinned path in `replay.rs` requires `S::VERSION` instead).
+        let env = crate::snapshots::verify_snapshot_envelope(&mut file, origin, Some(from))
+            .map_err(|e| ServiceError::MistaggedSnapshot {
+                path: path.display().to_string(),
+                source: e,
+            })?;
+        let installed = (install_fn)(&mut sm, origin, &mut file)
+            .map_err(|e| ServiceError::Replay(format!("pinned install at {origin}: {e}")))?;
+        // Two post-install checks on the TRAIT contract, because nothing
+        // downstream can catch either: the tag is an EXCLUSIVE frontier, so a
+        // cursor left AT or above `origin` swallows the frame starting at
+        // `origin`, and a cursor left at `None` restarts the whole replay
+        // from genesis under THIS version — the counterfactual this install
+        // exists to avoid. (`None >= Some(_)` is false, so the `None` case
+        // needs its own clause.)
+        let cursor = sm.last_applied();
+        if installed != origin || cursor.is_none() || cursor >= Some(origin) {
+            return Err(ServiceError::Replay(format!(
+                "pinned install at {origin} left the state machine at {cursor:?} \
+                 (returned {installed}); install_snapshot must land at the tag \
+                 with its cursor strictly below it"
+            )));
+        }
+        eprintln!(
+            "uc_service: row {row} pinned install of snap-{origin} \
+             (from {from:#010x} to {to:#010x}, artifact built by {:#010x})",
+            env.version
+        );
+    }
+
     // 2. Open the log buffer file (read-only in spirit: the service only ever
     //    uses the read APIs; a v2.x hardening may map PROT_READ). Its max_claim
     //    margin must match the node's, so take max_payload from the cnc header.
@@ -206,8 +319,38 @@ pub(crate) fn attach<S: RawStateMachine>(
     // the SAME journal-replay mechanism (Task 9) reconstructs + rejoins. Exactly
     // one rejoin mechanism — try-live-then-replay — covers both a caught-up
     // reattach and a fresh SM (`None -> 0`) on a long-scrolled ring.
-    let start_pos = last_applied.unwrap_or(0);
-    let s = slot(&cnc, row);
+    // Plan B2 T4 (review fix): after a PINNED install the follower resumes at
+    // the ORIGIN, not at the artifact's internal cursor. The artifact tag is
+    // an EXCLUSIVE frontier — everything below it IS the artifact — so the
+    // frames in `(cursor, origin)` are already reflected in the installed
+    // image and replaying them is not just wasted work: resuming below the
+    // origin is what hands the reconstruction path a `start_pos` under the
+    // purge floor, and its gap guard then re-installs the very artifact we
+    // just installed. `uc_service::replay`'s own post-install path does the
+    // same thing (`start_pos = installed; cursor = installed`).
+    //
+    // The SM's own cursor is deliberately left where `install_snapshot` put
+    // it (strictly below the origin), so the apply loop's idempotency guard
+    // dispatches the frame that starts exactly AT the origin.
+    let start_pos = match pin {
+        Some((origin, _, _)) => origin,
+        None => last_applied.unwrap_or(0),
+    };
+    // …and the pinned `start_pos` gets the SAME drift bound the unpinned one
+    // was just given. `last_applied` was checked above, but the pinned arm
+    // replaces it with the ORIGIN, which is not the state machine's number at
+    // all: it comes off the cnc page. A store-only `uc2ctl snapshot fetch`
+    // (spec §5, admin op 9) can leave an artifact ABOVE this node's durable
+    // frontier, and a pin naming it would publish `applied` above `durable` —
+    // which the node's floor hold reads, so it must be bounded like every
+    // other published `applied`.
+    if start_pos > frontier {
+        return Err(ServiceError::Drift {
+            service: start_pos,
+            journal: frontier,
+        });
+    }
+    // `s` is the same slot reference taken for the pin read in step 1d.
     s.applied.store_release(start_pos);
     // Status: attached, incarnation += 1 (the prior life's value survives a
     // crash on the same page; a node restart zeroes it with the page).
@@ -254,6 +397,11 @@ pub(crate) fn attach<S: RawStateMachine>(
         instance_mismatch_streak: 0,
         my_epoch: epoch,
         service_id: row,
+        // Plan B2 T4 (review fix): the reconstruction path needs the pin too —
+        // the artifact at the pinned ORIGIN was built by the pin's `from`, so
+        // the gap guard's same-version rule (plan B2 T3) has to make an
+        // exception for exactly that one artifact. See `replay::replay_into`.
+        pin,
         lag_mode,
         declared,
         lag_waiting: false,
@@ -277,6 +425,8 @@ pub(crate) fn attach<S: RawStateMachine>(
         poisoned,
         service_id: row,
         _lock: lock,
+        install,
+        pin,
     })
 }
 
@@ -378,7 +528,7 @@ mod tests {
 
     fn try_attach(dir: &std::path::Path) -> Option<crate::config::ServiceError> {
         let cfg = crate::config::ServiceConfig::new(dir, "boot-gap");
-        super::attach(&cfg, CountSm, false).err()
+        super::attach(&cfg, CountSm, None).err()
     }
 
     /// Names on line 7 with `services_declared == 0` is a page no configured

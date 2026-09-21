@@ -328,9 +328,10 @@ make an artifact built at some earlier `P0` claim P. Nothing in the payload
 can catch that, because the tag is an **exclusive** frontier: the image covers
 everything strictly below P, so a state machine's own cursor legitimately sits
 *below* the tag and an image from `P0` looks entirely plausible. So the
-framework took the guarantee: every artifact file now begins with sixteen
-bytes it owns — `ULTSNAP1` and P — checked on every install path and by
-`verify-backup`. UC still prescribes nothing about the payload.
+framework took the guarantee: every artifact file now begins with
+twenty-four bytes it owns — `ULTSNAP2`, P, and (since 2.13.0, the FSM
+upgrade lifecycle) the version that built it — checked on every install path
+and by `verify-backup`. UC still prescribes nothing about the payload.
 
 **Standby instants, and the pull that follows.** A freeze runs on the row's
 apply thread and is as long as the service's state is big — UC cannot bound
@@ -483,36 +484,73 @@ you this way, because nothing is newer to make it the not-newest, which is
 why `pin_no_set` accepts only it.
 
 **The cnc words, and why they need a seqlock.** The pin
-republishes onto the row's service status line as three new words, `+16`
-`upgrade_origin`, `+24` `pinned_version` and `+32` `pin_seq` — not slot line 7, which is
+republishes onto the row's service status line as **four** new words, `+16`
+`upgrade_origin`, `+24` `pinned_version`, `+32` `pin_seq`, and — plan B2's
+addition — `+40` `pinned_from` — not slot line 7, which is
 already seven of its eight words deep (`name`, four words from `+448`,
 `identity_hash` at `+480`, `timers_pending` at `+488`, `freeze_ns` at
 `+496`) and so has exactly one free word left, at `+504` — well short of the
-three a pin needs. (`log_time_ns` is not one of line 7's occupants: it is the
+four a pin needs. (`log_time_ns` is not one of line 7's occupants: it is the
 unrelated page-1 global word at offset 4048.) `upgrade_origin == 0` is "no
 pin", the
-gate every reader checks first. The pair itself is published under a
-**seqlock**: the node-side writer (`ServiceStatusLine::store_pin`) bumps
-`pin_seq` to ODD, stores `pinned_version`, stores `upgrade_origin`, and
-bumps `pin_seq` back to EVEN, every step `Release`; a reader loads
-`pin_seq`, both words, then `pin_seq` again, and accepts the pair only if
-the first read was EVEN and the two reads agree.
+gate every reader checks first. `pinned_from` is the version the artifact AT
+`upgrade_origin` was BUILT by — not the version the row is pinned TO. A
+service reads it because a pinned install (below) cross-checks the artifact
+it is about to install against exactly this value, not against its own
+`S::VERSION`: the whole point of a pin is to install an artifact a
+*different* version built. The pin is **three data words under one sequence
+word**, and the three are published under a **seqlock**: the node-side writer
+(`ServiceStatusLine::store_pin`) bumps `pin_seq` to ODD, stores
+`pinned_version`, stores `pinned_from`, stores `upgrade_origin`, and bumps
+`pin_seq` back to EVEN, every step `Release`; a reader loads `pin_seq`, all
+three data words, then `pin_seq` again, and accepts the set only if the
+first read was EVEN and the two reads agree.
 
-Why a third word, rather than just writing the version before the origin?
-Because that order alone only covers the **first** pin a row ever gets (`0`
-→ a non-zero origin), and re-reading the origin does not extend it to a
-**re-pin**. A writer that has stored `version_new` but has not yet stored
-`origin_new` leaves the origin *stable* — so a reader that loads the origin,
-the version, and the origin again sees no movement and returns
-`(origin_old, version_new)`, a pair that never existed, on its first
+Why a sequence word at all, rather than just writing the version before
+the origin? Because that order alone only covers the **first** pin a row
+ever gets (`0` → a non-zero origin), and re-reading the origin does not
+extend it to a **re-pin**. A writer that has stored `version_new` but has
+not yet stored `origin_new` leaves the origin *stable* — so a reader that
+loads the origin, the version, and the origin again sees no movement and
+returns `(origin_old, version_new)`, a pair that never existed, on its first
 attempt. Two atomics with no shared sequence cannot be read consistently by
 re-reading one of them; the sequence has to be its own word. What
-`ServiceStatusLine::pin()` guarantees now is exactly that: it returns a pair
-that was stored together, or `None` — including after 64 collided attempts,
-where an honest "this row reads as unpinned right now" beats a fabricated
-pair that plan B2's attach would install an artifact from. Every reader
-(`/metrics`, `uc2ctl status`, and plan B2's attach) goes through it rather
-than through the raw word accessors.
+`ServiceStatusLine::pin()` guarantees now is exactly that: it returns a
+**tri-state** `PinRead` — `NoPin` (the gate reads clear), `Pinned { origin,
+from, to }` (a set that was stored together), or `Contended` (64 collided
+reads, the seqlock never settled) — never a fabricated triple that plan B2's
+attach would install an artifact from on the strength of a torn read. Every
+reader (`/metrics`, `uc2ctl status`, and plan B2's attach) goes through it
+rather than through the raw word accessors, and `Contended` is never folded
+into `NoPin` at a decision point that matters: attach fails CLOSED on it
+(`ServiceError::PinUnreadable`), because attaching unpinned off a
+half-published set would skip an install the cluster requires. A metrics
+scrape is the one reader that *does* render `Contended` the same as `NoPin`
+(both as `0`) — safe there, because a gauge is advisory and the next scrape
+converges, which is not true of a one-shot attach decision.
+
+**What `attach` does with a pin (plan B2).** Reading the pin is only half the
+story; installing off it is the other half, and it happens in `attach`
+itself, not in the reconstruction gap guard — a durable state machine
+already sitting on an unscrolled ring never reaches the gap guard at all, so
+a pin that only the gap guard acted on could leave such a state machine
+stuck on its own history. When `pin()` returns `Pinned { origin, from, to }`
+and `to == S::VERSION`, `attach` installs `snap-<origin>` **unconditionally**
+— overriding the state machine's own `last_applied()` — before publishing
+anything else to the slot. That needs the install capability, which only
+[`ServiceBuilder::start_with_snapshots`](../../uc_service/src/lib.rs) carries
+(`S: SnapshotStateMachine`); a pinned row started with plain `start()` has no
+closure to install with and is refused (`ServiceError::PinRequiresSnapshots`)
+rather than silently tail-replaying the origin's prefix under this binary —
+the §2.3 counterfactual the pin exists to prevent. The install's own
+cross-check is against `pinned_from`, not `S::VERSION`: the artifact at the
+origin was built by whatever `from` names, and that is what
+`verify_snapshot_envelope` is told to expect. A binary whose `VERSION` is
+not the pin's `to` never reaches any of this — `attach` refuses it first, by
+name (`ServiceError::PinnedVersionMismatch`), and a pin whose artifact is
+missing from this node's `snapshots/<row>/` is refused too
+(`ServiceError::PinnedArtifactMissing`) rather than falling back to a
+different, unsound origin.
 
 **`SnapshotReport` holds observations, not a verdict.** `(row, position,
 hashes: Vec<(node_id, hash)>)` is everything the leader collected for one

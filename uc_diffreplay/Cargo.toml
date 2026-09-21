@@ -34,6 +34,11 @@ serde_json = "1"
 toml = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
+# `drive_with`'s on_committed recorder (plan B2 T6): a `current_thread`
+# runtime to `block_on` a `RawOutputHandler`, same shape `uc_service`'s own
+# output agent pins (`uc_service/Cargo.toml`), minus `time` — this driver
+# never sleeps inside a handler call.
+tokio = { version = "1", default-features = false, features = ["rt"] }
 
 [dev-dependencies]
 # Named again here so the test targets (`tests/common/mod.rs` starts a real

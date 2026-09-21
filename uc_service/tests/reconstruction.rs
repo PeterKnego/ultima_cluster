@@ -21,7 +21,7 @@ use uc_protocol::ring::{MpscProducer, MpscRing, RingError};
 use uc_protocol::v2::ipc::{MSG_V2_SUBMIT, extra_client};
 use uc_service::{ApplyCtx, Service, ServiceBuilder, ServiceConfig, StateMachine};
 
-use uc_lincheck::register::{Cmd as RegCmd, RegisterSm};
+use uc_lincheck::register::{Cmd as RegCmd, DoublingRegisterSm, RegisterSm};
 
 // A tiny ring so the committed history scrolls out of the live buffer fast,
 // forcing the attaching service down the journal-replay reconstruction path.
@@ -528,7 +528,7 @@ fn a_replayed_instant_at_or_below_the_applied_frontier_is_not_frozen_at() {
     let (pos, path) = store.newest(u64::MAX).unwrap().expect("an artifact at p2");
     assert_eq!(pos, p2);
     let mut f = std::fs::File::open(&path).unwrap();
-    uc_service::snapshots::verify_snapshot_envelope(&mut f, p2).expect("envelope names p2");
+    uc_service::snapshots::verify_snapshot_envelope(&mut f, p2, None).expect("envelope names p2");
     let mut restored = SlowCountSm::default();
     restored.install_snapshot(p2, &mut f).unwrap();
     assert_eq!(
@@ -592,7 +592,7 @@ fn a_replayed_span_freezes_at_its_last_snapshot_frame_below_it_only() {
     let (pos, path) = store.newest(u64::MAX).unwrap().expect("an artifact at P");
     assert_eq!(pos, p, "tagged with the instant, not the SM's own cursor");
     let mut f = std::fs::File::open(&path).unwrap();
-    uc_service::snapshots::verify_snapshot_envelope(&mut f, p).expect("envelope names P");
+    uc_service::snapshots::verify_snapshot_envelope(&mut f, p, None).expect("envelope names P");
     let mut restored = CountSm::default();
     restored.install_snapshot(p, &mut f).unwrap();
     assert_eq!(
@@ -846,10 +846,20 @@ fn fresh_service_below_purge_floor_installs_snapshot_then_tail_replays() {
     node.stop();
 }
 
-/// A snapshot capture buffer for the fail-stop test: the apply thread's
-/// `SnapshotRequired` panic is recorded by a scoped panic hook (the panic
-/// unwinds a background thread, so it never fails the test thread directly).
+/// A snapshot capture buffer for the fail-stop tests: the apply thread's
+/// fail-stop panic is recorded by a scoped panic hook (the panic unwinds a
+/// background thread, so it never fails the test thread directly).
 static PANIC_LOG: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// `PANIC_LOG` and `std::panic::set_hook`/`take_hook` are GLOBAL, process-wide
+/// state: two fail-stop tests (this one and
+/// `an_unpinned_newer_binary_cannot_install_an_older_versions_artifact`)
+/// swapping the hook concurrently under the default parallel test runner is
+/// real cross-talk, not a hypothetical — one test's `set_hook` can land
+/// between the other's panic and its own `set_hook(prev)`, losing or
+/// misattributing a message. Serialize the hook-owning section of every such
+/// test on this lock rather than relying on `--test-threads=1`.
+static PANIC_HOOK_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[test]
 fn gap_without_snapshot_capability_fails_stop_with_named_contract() {
@@ -857,6 +867,16 @@ fn gap_without_snapshot_capability_fails_stop_with_named_contract() {
     let app = "rec_nosnap";
     let (node, _prod) = purged_node_after_snapshotting_service(dir.path(), app, 4_000);
 
+    // Own the panic hook exclusively for the rest of this test — see
+    // `PANIC_HOOK_LOCK`'s doc. Poison-tolerant: a genuine regression that
+    // fails a SIBLING fail-stop test's own `assert!` panics while holding
+    // this same lock (see below — we drop it before ours too), which would
+    // poison it; the hook is unconditionally restored before either test's
+    // assert regardless of poisoning, so treating a poisoned lock as a plain
+    // one is sound here, and it keeps a real failure surfacing as ITS OWN
+    // assertion message rather than a misleading poison error on whichever
+    // test happens to run second.
+    let _hook_guard = PANIC_HOOK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // Record any panic message globally for the duration of this test. Success
     // paths never panic, so cross-talk from sibling tests is a non-issue; we only
     // assert on the SnapshotRequired substring.
@@ -894,6 +914,11 @@ fn gap_without_snapshot_capability_fails_stop_with_named_contract() {
         std::thread::sleep(Duration::from_millis(5));
     };
     std::panic::set_hook(prev);
+    // Release the hook lock BEFORE our own `assert!`: if it fails, this test
+    // panics with the lock already dropped, so a sibling fail-stop test's
+    // next `.lock()` sees a clean (not poisoned) mutex and fails, if it does,
+    // on its OWN assertion rather than an unrelated poison error.
+    drop(_hook_guard);
     assert!(
         fired,
         "the apply agent must fail-stop with SnapshotRequired within the deadline"
@@ -901,6 +926,80 @@ fn gap_without_snapshot_capability_fails_stop_with_named_contract() {
 
     // The apply thread is dead; `crash()` joins via Drop (swallowing the panic),
     // so teardown does not re-raise it.
+    svc2.crash();
+    node.stop();
+}
+
+/// Plan B2 T3: the gap guard's install cross-checks the version. A covering
+/// artifact built by `RegisterSm` sits below the purge floor (same setup as
+/// `fresh_service_below_purge_floor_installs_snapshot_then_tail_replays`), but
+/// the fresh attach is `DoublingRegisterSm` (same `NAME` — "register" — so it
+/// lands on the same row, but `VERSION = 2` and a genuinely different `apply`).
+/// An UNPINNED install must be same-version: installing the v-whatever
+/// artifact and tail-replaying it under `DoublingRegisterSm::apply` is the
+/// §2.3 silent counterfactual (a doubled value from the row that never should
+/// have been doubled), so the gap guard must refuse it by name instead of
+/// "succeeding".
+#[test]
+fn an_unpinned_newer_binary_cannot_install_an_older_versions_artifact() {
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let app = "rec_ver_mismatch";
+    let (node, _prod) = purged_node_after_snapshotting_service(dir.path(), app, 4_000);
+
+    // Own the panic hook exclusively for the rest of this test — see
+    // `PANIC_HOOK_LOCK`'s doc (poison-tolerant, same reasoning as
+    // `gap_without_snapshot_capability_fails_stop_with_named_contract`).
+    let _hook_guard = PANIC_HOOK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    PANIC_LOG.lock().unwrap().clear();
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|info| {
+        PANIC_LOG.lock().unwrap().push(info.to_string());
+    }));
+
+    // Service #2: a FRESH, snapshot-capable `DoublingRegisterSm` below the
+    // purge floor, WITHOUT a pin. The gap guard finds the covering artifact —
+    // built by `RegisterSm` — but must not install it under a different
+    // `S::VERSION`.
+    let svc2 = ServiceBuilder::new(
+        ServiceConfig::new(dir.path(), app),
+        DoublingRegisterSm::default(),
+    )
+    .start_with_snapshots()
+    .unwrap();
+
+    let built = <RegisterSm as StateMachine>::VERSION;
+    let expected = <DoublingRegisterSm as StateMachine>::VERSION;
+    let version_mismatch = format!(
+        "artifact was built by version {built:#010x} but {expected:#010x} is required here"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let fired = loop {
+        if PANIC_LOG
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|m| m.contains("MistaggedSnapshot") && m.contains(&version_mismatch))
+        {
+            break true;
+        }
+        if Instant::now() >= deadline {
+            break false;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    std::panic::set_hook(prev);
+    // Release the hook lock BEFORE our own `assert!` — see the sibling
+    // test's matching comment.
+    drop(_hook_guard);
+    assert!(
+        fired,
+        "the apply agent must fail-stop with MistaggedSnapshot/VersionMismatch \
+         ({built:#010x} vs {expected:#010x}) within the deadline"
+    );
+
+    // The apply thread is dead; `crash()` joins via Drop (swallowing the
+    // panic), so teardown does not re-raise it.
     svc2.crash();
     node.stop();
 }
@@ -981,9 +1080,11 @@ fn a_renamed_artifact_is_refused_by_name_and_a_correct_one_installs() {
     let (p0, real) = store.newest(u64::MAX).unwrap().expect("an artifact at P0");
     // The envelope says P0 whatever the file is called.
     let head = std::fs::read(&real).unwrap();
-    assert_eq!(
-        uc_service::snapshots::decode_snapshot_envelope(&head),
-        Ok(p0),
+    assert!(
+        matches!(
+            uc_service::snapshots::decode_snapshot_envelope(&head),
+            Ok(uc_service::snapshots::Envelope { position, .. }) if position == p0
+        ),
         "the artifact carries UC's envelope naming its own instant"
     );
 

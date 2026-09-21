@@ -65,7 +65,16 @@ pub enum ServiceError {
     /// installed under a newer tag would leave every frame between the two
     /// positions unapplied — a silent state gap, the class
     /// [`SnapshotRequired`](Self::SnapshotRequired) exists to fail-stop on.
-    /// Refuse by name instead.
+    /// Refuse by name instead. Plan B2 T3: also the artifact's `S::VERSION`
+    /// cross-check — an UNPINNED install (the reconstruction gap guard,
+    /// `replay.rs`) requires the artifact to have been built by THIS
+    /// incarnation's own `S::VERSION`; a pinned install (`attach`, Task 4)
+    /// requires it to match the pin's `from` instead. Either mismatch is this
+    /// same variant, with an [`EnvelopeError::VersionMismatch`
+    /// ](crate::snapshots::EnvelopeError::VersionMismatch) source — the §2.3
+    /// counterfactual (a newer binary silently installing and tail-replaying
+    /// an older artifact under its own, possibly different, `apply`) refused
+    /// by name rather than "succeeding".
     #[error("MistaggedSnapshot: {path}: {source}")]
     MistaggedSnapshot {
         path: String,
@@ -109,6 +118,55 @@ pub enum ServiceError {
          instance dir (service.{row}.lock)"
     )]
     AlreadyAttached { name: String, row: u8 },
+    /// Plan B2 T4 (spec §3 S4 step 5): the row carries a committed upgrade
+    /// pin naming a target version, and this binary is not it. The pin is the
+    /// cluster's decision about which version may serve the row from the
+    /// origin onward, so a stale binary rejoining afterwards — the one thing
+    /// the pin exists to stop — is refused BY NAME, before any slot word is
+    /// written.
+    #[error(
+        "FSM {name:?} at row {row} is pinned to version {pinned:#010x} from \
+         origin {origin}, but this binary is {mine:#010x}; a stale binary \
+         cannot rejoin after `uc2ctl upgrade pin`"
+    )]
+    PinnedVersionMismatch {
+        name: String,
+        row: u8,
+        origin: u64,
+        pinned: u32,
+        mine: u32,
+    },
+    /// The row's four pin words could not be read consistently through the
+    /// `pin_seq` seqlock ([`uc_log::cnc::PinRead::Contended`]). A reader that
+    /// must DECIDE never treats that as "no pin": attaching unpinned off a
+    /// half-published triple would skip an install the cluster requires.
+    /// Transient by construction — the next attach converges.
+    #[error(
+        "row {row}'s pin words could not be read consistently (the \
+         uc2-cluster agent is mid-publish); retry the attach"
+    )]
+    PinUnreadable { row: u8 },
+    /// A pinned row MUST install the artifact at its origin, and only
+    /// [`ServiceBuilder::start_with_snapshots`](crate::ServiceBuilder::start_with_snapshots)
+    /// carries the install capability (`S: SnapshotStateMachine`). A plain
+    /// `start()` on a pinned row would replay the origin's prefix under THIS
+    /// version instead — the §2.3 counterfactual — so it is refused.
+    #[error(
+        "FSM {name:?} at row {row} is pinned to origin {origin} but was \
+         started with start(); a pinned row must install snap-{origin} and \
+         needs start_with_snapshots()"
+    )]
+    PinRequiresSnapshots { name: String, row: u8, origin: u64 },
+    /// The pin names an origin whose artifact is not on this node: the
+    /// complete set at that instant was pruned, or this node never received
+    /// it. There is no sound fallback (a different artifact is a different
+    /// instant; genesis is the counterfactual), so this is a refusal.
+    #[error(
+        "row {row} is pinned to origin {origin} but {path} does not exist on \
+         this node — the set at the origin was pruned or never fetched; take \
+         `uc2ctl snapshot fetch` or re-pin at a retained instant"
+    )]
+    PinnedArtifactMissing { row: u8, origin: u64, path: String },
 }
 
 /// Why a [`SnapshotStateMachine`](crate::SnapshotStateMachine) freeze/stream/

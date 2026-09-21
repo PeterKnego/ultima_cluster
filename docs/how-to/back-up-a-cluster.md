@@ -150,17 +150,24 @@ Verify:
    rebuilt, even if every other declared FSM's snapshot is fine. A purged
    journal with no `snapshots/` directory at all is FSM 0's hole (the one id
    every node declares).
-5. Checks every `snapshots/<id>/snap-<pos>.ultsnap`'s **16-byte envelope**
-   (2.11.0): the file must start with `ULTSNAP1` followed by the
-   position it was built at, and that position must equal the one in its
-   name. A file that is too short, has the wrong magic, or was built at a
-   different position than it claims is a `corrupt snapshot artifact`
-   refusal — that last case is a renamed or mis-copied artifact, which is
-   exactly the failure the envelope exists to catch, because the tag is an
-   exclusive frontier and no payload-side check can see it
+5. Checks every `snapshots/<id>/snap-<pos>.ultsnap`'s **24-byte envelope**
+   (`ULTSNAP2` since 2.13.0): the file must start with the envelope magic
+   followed by the position it was built at and the packed version that
+   built it, and that position must equal the one in its name. A file that
+   is too short, has the wrong magic, or was built at a different position
+   than it claims is a `corrupt snapshot artifact` refusal — that last case
+   is a renamed or mis-copied artifact, which is exactly the failure the
+   envelope exists to catch, because the tag is an exclusive frontier and no
+   payload-side check can see it
    ([Instance directory § The artifact envelope](../reference/instance-directory.md#the-artifact-envelope-and-who-deletes-artifacts)).
-   An artifact written by a pre-2.11 build has no envelope and is refused
-   here by the same rule.
+   An artifact written by a pre-2.11 build has no envelope at all and is
+   refused here by the same rule; a `2.11.0`/`2.12.0` artifact (`ULTSNAP1`,
+   16-byte, no version field) is a **legacy** artifact and is refused by
+   name too — it carries no version stamp for a cross-check to read. Both
+   surface through this same `corrupt snapshot artifact` refusal path, named
+   by their own error text. Moving a backup archive to `2.13.0` needs the
+   same `snapshots/<row>/` wipe a live node needs
+   ([Upgrade a cluster § 2.13.0](upgrade-a-cluster.md#wire--cnc-change-in-2130-upgrade-pins-and-snapshot-reports-090-cnc-33)).
 6. Decodes the newest `snapshots/cluster/snap-<pos>.ultcluster` through the
    **same** image decoder a joiner installs it with — magic, image version,
    CRC32, every bounds check — so a verified artifact is one whose cluster
