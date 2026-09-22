@@ -32,9 +32,10 @@ What a service binary is written against.
   (`RawStateMachine`/`StateMachine`), their exact signatures, the
   byte-identity promise, and the `out`-buffer discipline.
 - [SDLC standard for applications](application-sdlc.md) — the lifecycle an
-  application on UC is held to: the design note, the determinism rules,
-  schema and snapshot versioning, the test pyramid, rollout and rollback,
-  and the observability a feature must expose before it is production-ready.
+  application on UC follows: the design note, the three compatibility axes and
+  the change taxonomy, the determinism rules, the conventions a version change
+  must respect, the test pyramid, the upgrade stages S1–S9 per row, and the
+  observability a feature must expose before it is production-ready.
 
 ## Compatibility
 

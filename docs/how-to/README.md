@@ -77,7 +77,9 @@ something is wrong" below.
 ## Building on it
 
 Read [the SDLC standard for applications](../reference/application-sdlc.md)
-first: it is the lifecycle every page below is a step of. The
+first: it is the lifecycle every page below is a step of — including the
+upgrade stages S1–S9 a row moves through and the conventions a version change
+must respect. The
 [Build an application](../tutorials/build-an-application.md) tutorial walks that
 whole lifecycle end to end with a worked example (`examples/kv`); the pages
 below are its individual steps in depth.
