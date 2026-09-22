@@ -343,8 +343,8 @@ the typed tier's `bytes_read` length check — which would turn four of the five
 measured silent misparses into the intended fail-stop — is **not shipped in
 `2.13.0`**: at that tag `uc_service/src/traits.rs` discards `bytes_read` at all
 three decode sites, and the standard and the taxonomy said so explicitly rather
-than describing the check as available. (Fixed on `main` after the tag, as
-`decode_exact`; the next release carries it.)
+than describing the check as available. (Fixed after the tag, as
+`decode_exact`, in its own PR off `0b73c32`; the next release carries it.)
 
 ### The dogfood deliverables (merged before this branch)
 

@@ -124,7 +124,7 @@ documentation for what it changes, because the tag is what people read.
       both writeups rather than omitted), and
       [#49](https://github.com/PeterKnego/ultima_cluster/issues/49), the typed
       tier's `bytes_read` length check, is claimed nowhere (as of `2.13.0`;
-      fixed on `main` afterwards) — do not quietly close either.
+      fixed afterwards, in its own PR off `0b73c32`) — do not quietly close either.
 
 ## 2. Check the version the way the workflow will
 
