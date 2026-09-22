@@ -38,10 +38,11 @@ documentation for what it changes, because the tag is what people read.
       `docs/how-to/run-a-cluster.md`. Find every straggler with:
 
       ```sh
-      grep -rn "$OLD" packaging/ docs/
+      grep -rn "$OLD" README.md packaging/ docs/
       ```
 
-      where `$OLD` is the version being replaced, and update each hit.
+      (`README.md` is in scope too — its "Try it" section names the release
+      tarball) where `$OLD` is the version being replaced, and update each hit.
 - [ ] **Retire the pre-tag scaffolding the writeup left behind**, because the
       tag freezes whatever is there. For `v2.6.0` that is: delete the
       not-published-yet notes (`README.md`'s "Try it" blockquote and
@@ -102,6 +103,28 @@ documentation for what it changes, because the tag is what people read.
       statistic, and row h's standby arm did not complete (an
       operating-envelope question, with four passing deterministic tests
       behind the mechanism).
+      For **`v2.13.0`** the shape is `v2.9.0`'s again, plus the two items no
+      grep finds. Retire: the two `<tag date>` headings (`RELEASES.md`,
+      `docs/releases.md`), each flagged by a `<!-- tag date: fill at tag time
+      -->` comment on the line below it; and the
+      `<!-- PENDING: tag-time evidence rows above -->` block at the end of
+      `docs/releases.md`'s `2.13.0` entry, together with the evidence rows it
+      flags — `ci.yml`, `docs.yml`, the `release.yml` dry run and the tag run,
+      artifact integrity and provenance, the release quickstart from the
+      tarball, and crates.io (**fourteen** crates; `uc_diffreplay` is a new
+      NAME, so budget for the new-name rate limit) — each of which reads
+      `pending` until the run it names exists.
+      `grep -rn "tag date\|PENDING:" RELEASES.md docs/releases.md` finds those
+      greppable ones. The two it does NOT find are named here for that reason:
+      **`SECURITY.md`'s supported-versions line**, which the release-prep sweep
+      already moved to `2.13.x` supported / `< 2.12` not (confirm rather than
+      edit it), and the **fuzz corpus prune** above, which is a working-tree
+      cleanliness check, not a grep. Two things this release leaves
+      deliberately open: no fleet gate was run or planned (stated as a row in
+      both writeups rather than omitted), and
+      [#49](https://github.com/PeterKnego/ultima_cluster/issues/49), the typed
+      tier's `bytes_read` length check, is claimed nowhere — do not quietly
+      close either.
 
 ## 2. Check the version the way the workflow will
 
@@ -232,7 +255,7 @@ It should print `PASS` on a machine that has never had a Rust toolchain on it.
 
 ## 6. Publish to crates.io — manually, in this order
 
-This is not in the workflow, on purpose. Thirteen crates, each of which must be
+This is not in the workflow, on purpose. Fourteen crates, each of which must be
 *indexed* by the registry before the next one can resolve it, and every
 version is permanent. An automated retry loop against an irreversible
 operation is a bad trade; a person watching each one is not.
@@ -250,6 +273,7 @@ cargo publish -p uc_net
 cargo publish -p uc_client
 cargo publish -p uc_service
 cargo publish -p uc_node
+cargo publish -p uc_diffreplay
 cargo publish -p uc_remote
 cargo publish -p uc_gateway
 cargo publish -p uc_ctl
@@ -257,14 +281,27 @@ cargo publish -p uc_ctl
 
 `uc_node` depends on `uc_service` since the cluster FSM (2.11.0), so `uc_service` publishes first; `uc_service`'s dev-dependency on `uc_node` is unversioned and stripped by `cargo package`.
 
+`uc_diffreplay` is the **fourteenth** crate, new in `2.13.0`, and it goes after
+`uc_node`: it depends on `uc_service`, `uc_protocol` and `uc_journal`
+unconditionally, and on `uc_node`, `uc_net`, `uc_log` and `uc_client` through
+its default `export` and `pin-verify` features — all of which publish earlier in
+this list. It is published rather than held back because an application's own
+CI is the intended caller of `uc2-diffreplay`, and because a corpus recorded by
+one version must be replayable by the next.
+
 Wait for each to appear on crates.io before starting the next — `cargo
 publish` returns before the index has caught up, and the next crate's
 dependency resolution reads the index. Modern cargo blocks on this for you;
 if a publish fails with "no matching package named …", the previous one has
 not indexed yet, so wait and re-run just that one.
 
-`uc_sim`, `uc_lincheck`, `counter` and `uc_crashtest` are `publish = false`:
-they are the proof and teaching apparatus, not the product.
+`uc_sim`, `uc_lincheck`, `counter`, `kv_store`, `uc_adjudicate` and
+`uc_crashtest` — six — are `publish = false`: they are the proof and teaching apparatus, not the product.
+`uc_lincheck` stays in that list even though the dependency now runs both ways:
+it takes `uc_diffreplay` as an *optional* dependency behind its `replay-bin`
+fixture feature, and `uc_diffreplay` takes `uc_lincheck` as an unversioned
+**dev**-dependency, which `cargo package` strips. Neither direction puts
+`uc_lincheck` on crates.io.
 
 **Expect 429s on a name's FIRST publish.** crates.io rate-limits *new crate
 names* much harder than new versions of an existing one — measured on the

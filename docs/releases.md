@@ -1,5 +1,473 @@
 # ultima_cluster releases
 
+## v2.13.0 — <tag date> — the FSM upgrade lifecycle
+
+<!-- tag date: fill at tag time -->
+
+**One flag day: wire `0.8.0` → `0.9.0` and cnc `3.2` → `3.3`, plus a row
+artifact envelope change (`ULTSNAP2`) that costs one wipe of
+`snapshots/<row>/` per node.** Baseline: the tagged `v2.12.0` (wire `0.8.0`,
+cnc `3.2`). The work is six plan branches and two hotfixes — plus the dogfood
+deliverables, which merged to `main` on 2026-09-18, after the `v2.12.0` tag, and
+therefore ship here too (see [The dogfood deliverables](#the-dogfood-deliverables-merged-before-this-branch)
+below). The five plan
+branches that carry code, and both hotfixes, landed in this order, and plan D
+(this writeup) follows them — **A**
+[#50](https://github.com/PeterKnego/ultima_cluster/pull/50) (the diff-replay
+harness, `main` `f63d293`) → **B1**
+[#51](https://github.com/PeterKnego/ultima_cluster/pull/51) (the two cluster
+records, `18ba553`) → **B2**
+[#52](https://github.com/PeterKnego/ultima_cluster/pull/52) (the pinned install
+at attach, `beedf8d`) → the CI hotfix
+[#53](https://github.com/PeterKnego/ultima_cluster/pull/53) (`bcbe01f`) → **B3**
+[#54](https://github.com/PeterKnego/ultima_cluster/pull/54) (live snapshot
+reports and the readiness gate, `fa8b0e1`) → the docs hotfix
+[#55](https://github.com/PeterKnego/ultima_cluster/pull/55) (`c8f8406`) → **C**
+[#56](https://github.com/PeterKnego/ultima_cluster/pull/56) (`pin-verify`,
+`5fe8a91`) → **D**, this writeup with the SDLC standard, the per-row upgrade
+how-to and the `diff-replay-judge` skill.
+
+**No fleet gate ran for this release**, and none was planned: nothing here is
+on the commit or apply hot path, no rate bar was set, and the two throughput
+questions still open from `2.12.0` (how to construct a rate bar this rig can
+rule on; jumbo row b at the 29 pairs its rule calls for) are untouched by it.
+Every number below is a source constant, a refusal code or a one-run
+observation labelled as such.
+
+Neither was this a ranked `docs/BACKLOG.md` direction. It comes out of the
+2026-09-18 clean-room dogfood, whose two experience reports named the
+application-upgrade story as the sharpest friction on the platform: the
+published procedure was "stop everything, swap, hope", with the safety
+property — every instance of the new version begins from the same
+state — carried by an operator's memory rather than by the platform.
+
+| | A: diff replay | B1: the records | B2: the pinned install | B3: reports + the gate | C: `pin-verify` | D: the standard |
+|---|---|---|---|---|---|---|
+| spec | §6.2, §6.3 | §2.5, §3 S4, §6.5.2, §9.1 | §3 S4 steps 4–5, §9.1 (2), §2.3 | §6.5.2 | §6.2 part 2, §11 item 8 | §2.1–§2.5, §3, §5, §11 items 1, 2, 9 |
+| plan | [harness](superpowers/plans/2026-09-20-uc2-diff-replay-harness.md) | [pin + report](superpowers/plans/2026-09-20-uc2-upgrade-pin-and-snapshot-report.md) | [install at attach](superpowers/plans/2026-09-21-uc2-pinned-install-at-attach.md) | [live reports](superpowers/plans/2026-09-21-uc2-live-snapshot-reports.md) | [pin-verify](superpowers/plans/2026-09-21-uc2-pin-verify.md) | [release docs](superpowers/plans/2026-09-22-uc2-fsm-upgrade-lifecycle-release-docs.md) |
+| errata block | the inline "as built" paragraphs in §2.3, §4.2 and §6.3 (not a block) | "(plan B1, as built)" | "(plan B2, as built)" | "(plan B3, as built)" | "(plan C, as built)" | "(plan D, as built)" |
+| explainer | — | [cluster FSM § Pins and reports](notes/uc2-cluster-fsm-explained.md#pins-and-reports-2130) | same | same | — | — |
+| how-to / reference | [diff replay](how-to/diff-replay.md) | [`uc2ctl` § `upgrade pin`](reference/uc2ctl.md#upgrade-pin) | [state-machine contract](reference/state-machine-contract.md) | [configuration § `boot_wait`](reference/configuration.md#attaching-a-service-or-a-client-boot_wait) | [diff replay § 5](how-to/diff-replay.md#5-verify-the-pin-live-reconstruction-mode-part-2) | [SDLC standard](reference/application-sdlc.md), [upgrade an application](how-to/upgrade-an-application.md) |
+| gate doc | none; no fleet gate | none | none | none | none | none |
+| flag-day surface | none | wire `0.9.0` (`CLUSTER` 4, 5), cnc `3.3` (3 status words), cluster image `1` → `2` | `ULTSNAP2`, cnc `3.3`'s fourth status word | wire `0.9.0` (pairwise kind 26), cnc line 7 `+504` | none | none |
+
+### A — `uc_diffreplay`, the harness (#50)
+
+**The problem.** Two versions of a state machine produce different state from
+the same input; that is the point of an upgrade. So no test comparing them for
+equality is meaningful, and the question that *is* meaningful — "is every
+difference between these two builds one I intended?" — had no instrument at
+all. `uc_diffreplay` is that instrument: one corpus, two builds, a diff on
+every captured surface, mechanical attribution to a code arm, and a gate
+against a declaration written with the change.
+
+- **The corpus** is a `uc2ctl backup`-shaped directory plus a `CORPUS`
+  manifest: an artifact at P and the journal span carrying `[P, Q)`.
+  `uc2-diffreplay corpus export --around <pos>` cuts one out of a live
+  instance directory. `examples/kv/tests/corpora/put-then-delete` is the first
+  one in the tree, content-guarded, with the convention in its README.
+- **The driver is in-process, not a one-node cluster.** `uc_service`'s journal
+  replay deliberately publishes no responses, so a real node would yield an
+  empty output surface; `uc_diffreplay::drive` instead installs the artifact,
+  walks the span with `TailReader`, calls `apply`/`on_timer` with the recorded
+  frame headers, and captures every surface. The app takes part by embedding
+  the driver behind `replay` / `project` subcommands on its own service binary
+  (`examples/kv/src/bin/kv-service.rs`), which is why a non-Rust service can
+  take part too: the interface is the JSON trace, not a linked crate. Only
+  `reconstruction`'s real-attach test spawns a node. Recorded as the §6.3
+  erratum.
+- **Five surfaces, and one that is not captured.** Response bytes per position,
+  `svc_sched` records per position, the state projection at the origin and at
+  the end, `ApplyCtx::ids_calls` per position, and the `on_committed` outcome
+  when `drive_with` is given a handler. Probe-query answers are not captured —
+  the projection is the state view instead. Two conditional surfaces are called
+  out in the README rather than left to be discovered: `output` is `None`, not
+  a passing comparison, when no handler ran; and ids are compared as a per-frame
+  **count**, so a build that mints a different number of ids diverges even
+  when every id it did mint matches.
+- **The declaration** (`intent.toml`) is what turns a diff into a verdict:
+  `[tags]` maps a command's leading bytes to an arm name, `[timers]` does the
+  same for timer ids (a `TIMER` frame has no payload to tag), `[touched] arms`
+  names what the change is allowed to move, and `[[expect]]` records what it
+  should do to each surface. `tag_offset = 16` is the `Sessioned` envelope.
+  Unknown keys are refused, so a typo cannot read as "not declared".
+- **`SnapshotStateMachine::project()`** is the one SDK addition — a provided
+  method producing canonical, diffable state text, forwarded by `Tagged`,
+  `Timed` and `Sessioned` (the latter two appending their own replicated
+  state, sorted). No apply hot-loop change.
+
+The result worth reading is `uc_diffreplay/tests/reconstruction.rs`, which
+demonstrates the spec's §2.3 counterfactual through UC's own attach path:
+five writes under v1, an instant at P, stop, attach a doubling v2. With purge
+**disabled** — the shipped default — the register reads `Some(8)`, a state
+that never existed; with purge `BelowSnapshot` it reads `Some(4)`, v1's true
+state. Same binary, two reconstruction paths, two states. Two things the
+demonstration surfaced that reading the code had missed: the counterfactual
+engages on **any** restart within ring size, journal replay or not; and
+`first_meta() >= P` can never hold, because the covering segment is always
+retained.
+
+### B1 — `UpgradePin` and `SnapshotReport` (#51)
+
+The two new cluster records, and the operator command that writes the first
+one. Both are `CLUSTER` frames in the cluster FSM, so they are replicated,
+applied at commit on every node, and carried in the cluster artifact — which is
+what lets a below-floor joiner hold a pin before its own service attaches.
+
+- **`UpgradePin`, `CLUSTER kind = 4`**, 20 B (`row ‖ reserved[3] ‖ from ‖ to ‖
+  origin`). It is an **event**, not a setting: "at position `origin`, row `r`
+  went `from` → `to`". The FSM keeps a per-row history of at most four.
+- **`SnapshotReport`, `CLUSTER kind = 5`**, 16–112 B, the leader's collected
+  per-node artifact hashes for one `(row, P)`, node ids strictly increasing.
+  The verdict (all equal / the majority names the minority / no majority at
+  N = 2) is a pure function recomputed by every reader, never stored. B1 ships
+  the record; nothing produces one on a live cluster until B3.
+- **`uc2ctl upgrade pin` / `upgrade show`**, admin op **10**. The pin rides a
+  staged `upgrade.pending` file (0600, fsync, rename) and the 64-byte admin
+  line carries only a 10-byte SHA-256 digest of it — `settings apply`'s
+  pipeline verbatim. Leader-only, node-local, single-in-flight with the other
+  `CLUSTER` kinds, audited `upgrade_pin`.
+- **Refusals 52–59**, split the way cluster-FSM ruling R24 requires: door-only
+  on the leader (**52** `pin_row_undeclared`, **53** `pin_from_mismatch` when
+  no pin exists, **54** `pin_no_set`, **56**/**57**/**58** the staged-file
+  codes) and replicated in the FSM (**55** `pin_not_monotone`, **53** again
+  when a pin does exist, **59** `report_stale`). The door is advisory; apply is
+  authoritative.
+
+**The erratum worth reading is number 3, and the fix it forced.** The spec
+placed the pin's cnc words on the row's slot line 7; that line had exactly one
+free word left, and a pin needs more. They went on the **service status line**
+instead — and the first cut of the publish was proven torn in review. Store
+order alone is not enough, and neither is re-reading the origin: a writer that
+has stored the new version but not yet the new origin leaves the origin stable,
+so a double read returns `(origin_old, version_new)`, a pair that was never
+stored. The shipped form is a real seqlock: a third word `pin_seq` bumped odd,
+the data words stored, then bumped even, with `ServiceStatusLine::pin()`
+bracketing its loads. Every reader — `/metrics`, `uc2ctl status`, B2's attach —
+goes through it, which is exactly why B2 inherited one correct reader instead
+of re-deriving the ordering argument.
+
+Erratum 8 is the honest limit on the other side: retention keeps a pinned
+origin from the moment the pin **commits**, computed from the committed
+cluster view, so it does not cover the append-to-commit window. Inside that
+one round trip a newer instant can complete and a retention pass can prune the
+set the pin is about to name. The window is narrow and the failure is bounded
+and named — a B2 attach finds no artifact at the origin and refuses — so it is
+recorded rather than fixed, and "a pinned origin is never pruned" is not an
+invariant.
+
+### B2 — the pinned install at attach, and `ULTSNAP2` (#52)
+
+B1 put the pin on the log. B2 is what makes it bite.
+
+- **The install lives in `attach`, not in the reconstruction gap guard**
+  (erratum 3). A durable state machine already sitting above the origin on an
+  unscrolled ring never enters replay at all, so a pin the gap guard alone
+  acted on would leave exactly that state machine stuck on its own history —
+  the thing the pin exists to prevent. `attach` reads the pin, decides, and
+  installs before publishing anything to the slot.
+- **The install is unconditional.** A durable state machine above the origin is
+  **rewound** to it and recomputes the tail under the new version, as a
+  freshly built peer does. That is the common-origin requirement, enforced.
+- **Four attach refusals**: `PinnedVersionMismatch` (the binary's `VERSION` is
+  not the pin's `to` — a stale binary can never rejoin), `PinUnreadable` (the
+  seqlock never settled in 64 reads; `pin()` is **tri-state**, and an
+  unreadable pin fails **closed** rather than folding into "no pin"),
+  `PinRequiresSnapshots` (a pinned row started with plain `start()` has no
+  closure to install with), `PinnedArtifactMissing`.
+- **Two cross-checks, not one** (erratum 4). An *unpinned* install requires the
+  artifact's stamped version to equal `S::VERSION` — which turns the spec's
+  §2.3 silent counterfactual into a named refusal. A *pinned* install requires
+  it to equal the pin's `from`, and a pinned row's gap guard prefers the
+  artifact at the pinned origin over a newer one `from` may have left behind
+  between the pin and the stop.
+- **`ULTSNAP2`** (erratum 5): 24 B, `magic ‖ P: u64 ‖ version: u32 ‖ 4
+  reserved`. Every row artifact now names the `S::VERSION` that built it, which
+  is what both cross-checks read. `ULTSNAP1` is refused **by name**, never
+  decoded as version 0 — so `2.13.0` requires clearing `snapshots/<row>/` once
+  per node. `snapshots/cluster/` is untouched: its image version already has a
+  forward-compatible v1 read path.
+- **The node holds its snapshot and purge floor at an unconsumed pinned
+  origin** (erratum 7, found in execution, not anticipated). B1 kept the
+  artifacts; this keeps the journal they need. "Consumed on this node" is three
+  clauses — the row is attached, its version word equals the pin's `to`, and it
+  has replayed past the cut. Obs `snapshot_floor_held_for_pin`.
+
+**The `snapshots/<row>/` wipe has a precondition, and it is not universal.**
+The row must be able to rebuild what was deleted: a durable state machine, or a
+journal that still retains genesis. A cluster running purge with an in-memory
+state machine can do neither, and therefore has no upgrade path to `2.13.0`
+until the envelope migration tool (`ULTSNAP1` → `ULTSNAP2` with an
+operator-supplied version) on `docs/BACKLOG.md` exists. This is stated in the
+how-to rather than buried here.
+
+**Two residuals recorded rather than fixed.** Pins have no lifecycle end:
+every later restart under `to` re-installs the origin and then re-converges via
+a newer same-version artifact — correct, and wasteful, which is why the how-to
+says to take a `uc2ctl snapshot` as soon as the swapped row has caught up and
+why a "pin consumed" verb is on the backlog. And an upgrade that is pinned and
+then abandoned holds the journal at the origin indefinitely, with no bound and
+no alert.
+
+### B3 — live snapshot reports, and the pins-authoritative gate (#54)
+
+**The reports.** Every instance of a row started from the same origin and
+applied the same log, so at every coordinated instant their artifacts must be
+byte-identical. Nothing checked: the closest thing was an operator running
+`sha256sum` per node over ssh, and `Uc2SnapshotSetDiverged` compares the
+newest set's *position*, which is a purge-floor check. Now the service hashes
+the payload as `builder_agent` streams it (SHA-256, first 8 bytes LE, published
+at the row's cnc slot line 7 `+504` immediately **before** `snapshot_pos`, so a
+reader that acquires `snapshot_pos == P` already sees the hash for P), reports
+`(row, P, hash)` to the leader over pairwise `SNAP_REPORT` (kind **26**, 24 B,
+carrying `node_id` so the leader can membership-check it without a reverse
+lookup), and the leader appends one `SnapshotReport` per `(row, P)`.
+
+**Ruling R-B3-1 — the release trigger is every voter or the timeout, not a
+quorum** (erratum 8). The spec said quorum. A quorum trigger releases the
+record the instant a majority has reported, which structurally omits whichever
+replica is slowest to complete its set — and that is not a random replica:
+observed in the in-process three-node fixture, the same node straggles on every
+instant for the life of the process (only the *persistence* of that is
+load-bearing; the lag figure behind it is a dev-box reading and no decision
+rests on it). Worse, on three nodes a two-hash record has no majority at all,
+so `verdict` correctly answers `NO_MAJORITY` and the feature's whole purpose —
+naming the minority — produces nothing. As built the leader waits for every
+voter in the current membership, or `SNAP_REPORT_TIMEOUT_NS = 5 s` after the
+first report. The cost is diagnostic latency only: a dead voter delays each
+record by at most 5 s, and nothing waits on the record. Learners report, their
+hashes ride the record, and they never pace the release. One visible
+consequence of reading the *current* membership: an uncommitted promote or add
+makes a still-catching-up node a required voter, so every instant in that
+window waits out the full 5 s and increments
+`uc2_snapshot_reports_timed_out_total`.
+
+**The gate.** Plan B2 closed the boot window it could see — `services_declared`
+is stored after the cluster agent's first publish — but left the real one open:
+a pin committed *above* this node's recovered cluster artifact is invisible
+while the agent is still replaying to it, and a service attaching in that
+window reads "no pin" and skips an install the cluster requires. B3 makes
+`services_declared` — the word every attach door already reads — a statement
+about **committed cluster state**: it is published from the consensus pass, once
+per incarnation, when the node knows a leader **and** has learned a commit
+**and** its cluster-FSM walk cursor has consumed to it.
+
+Neither half of the planned condition survived contact (erratum 9). The
+published view's `position` moves only on a pass that applied a `CLUSTER`
+frame, so on a cluster carrying ordinary traffic it sits still while commit
+climbs and could never catch it — hence the new `ClusterView::consumed`, the
+agent's walk cursor, advanced once per duty cycle whether or not anything
+applied. And a third clause, `ElectionSm::commit_learned()`, is required: a
+restarted single voter is its own leader within a pass or two while its commit
+counter is still `0`, so "consumed ≥ commit" was vacuously true and the gate
+opened **exactly for the node whose pin sits above its recovered artifact** —
+the one case it exists for.
+
+The attaching side gets a bounded wait rather than a hard refusal:
+`ServiceConfig::boot_wait` / `EngineConfig::boot_wait` /
+`PipelinedConfig::boot_wait`, default 10 s, `Duration::ZERO` = no wait.
+`NodeBooting` now means "this node has not joined its cluster yet". Two
+consequences are documented rather than discovered: a process that brings up
+several nodes must **start every node before attaching any service** (every
+harness in the tree was re-shaped), and boot-time readings change —
+`uc_services_declared` reads `0`, with no per-FSM rows and no `uc2ctl status`
+service lines, until the node has joined. `boot_wait` covers a slow join, not a
+stuck one: a node whose durable position permanently trails commit needs
+fixing, and no `boot_wait` is large enough.
+
+### C — `uc2-diffreplay pin-verify` (#56)
+
+Reconstruction mode's part 1 (plan A) *demonstrates* that the artifact path and
+the genesis counterfactual can be told apart. Part 2 verifies that the running
+system **refuses the wrong one**: after a real `uc2ctl upgrade pin` the stale
+binary is turned away by name, and the new binary's live state is the artifact
+path's. That needs a real node and the app's real binaries, which is what the
+mode runs — an in-process single voter, the OLD binary spawned as a subprocess,
+the corpus's own recorded `MESSAGE` frames re-submitted through the raw client
+engine, an instant at P, OLD run on to X and stopped, a real pin placed, then
+the refusal arm and the swap arm judged.
+
+Four errata shape what the mode can be asked to do:
+
+1. **The history is the corpus's own commands, re-submitted** (erratum 1). A
+   black-box harness cannot mint application commands, so the corpus is the
+   workload; its own artifact is *not* installed. `TIMER` frames cannot be
+   re-submitted and are skipped and counted.
+2. **`--to` is an input, not an observation** (erratum 2). Reading the new
+   binary's `VERSION` would mean attaching it, and attaching it before the pin
+   would run its `apply` on the live history — the very thing the pin prevents.
+   It is verified after the swap against the row's attached-version word.
+3. **INCONCLUSIVE is an outcome, not a failure** (erratum 4), and **the
+   demonstration needs a state-dependent tail** (erratum 7). With a
+   last-write-wins state machine a write-only span makes both paths agree at
+   the end; the harness's own e2e therefore ends its span with a CAS chain
+   whose outcome depends on the state at P, and a corpus exported at P carries
+   only frames at or above P, so the span must **contain** those commands and
+   `--split` decides which land before the instant (erratum 8).
+4. **What makes the rewind observable is two things, not one** (erratum 9,
+   from the final review). Stopping OLD above P is only the *precondition*. The
+   mode requires the SDK's own `pinned install of snap-<origin>` line on the new
+   service's stderr for a PASS or an INCONCLUSIVE — the same class of black-box
+   evidence as the refusal arm's marker, and the only one that does not depend
+   on the corpus. And the span's arithmetic parts the three paths only if the
+   version change touches a **history-preserving** command: with a
+   `Write`-only change the artifact path and continue-from-X coincide, so the
+   durable proof runs a third fixture (`--double-cas`, `VERSION = 3`, doubling
+   `Cas.new` as well) that gives artifact/live = 400, continue-from-X = 249 and
+   genesis = 398 — three distinct values on one run of the harness's own
+   fixture, not a property of any app.
+
+### D — the standard, the how-to, the skill, and this writeup
+
+`docs/reference/application-sdlc.md` gains the three compatibility axes, the
+change taxonomy, the common-origin requirement, version-as-an-input, the nine
+schema and protocol conventions, and the per-row S1–S9 upgrade lifecycle.
+`docs/how-to/upgrade-an-application.md` is rewritten as the seven-step pinned
+procedure S6 points at. `.claude/skills/diff-replay-judge/SKILL.md` carries the
+five judgement steps the harness cannot make: draft the declaration from the
+diff, classify the change against the taxonomy, attribute the report's
+unexplained residue to a hunk, judge the state diff at the origin, and spot the
+determinism hazards a lint cannot (a changed `ids()` call count, `HashMap`
+iteration, floats, a mid-enum insert, a field reorder).
+
+Two spec errata were added by this plan. Plan C's block gains item **10**:
+`pin-verify`'s PASS requires the SDK's Rust stderr marker, so §6.3's
+"Language: any" row holds for `replay`/`project`/`determinism`/`upgrade` but not
+for `pin-verify`. And a new one-item **"Errata (plan D, as built)"** under §2.4
+corrects "The `IdGen` trap": the ordinal is per **generator**, so a second
+`ctx.ids()` in one apply mints the *identical* series (duplicates, not a
+shift), while an extra `next()` on one generator shifts every later id from it
+and no counter records that — only the `ctx.ids()` call count is a captured
+surface.
+
+**One deliberate non-claim.** [#49](https://github.com/PeterKnego/ultima_cluster/issues/49),
+the typed tier's `bytes_read` length check — which would turn four of the five
+measured silent misparses into the intended fail-stop — is **not shipped**.
+`uc_service/src/traits.rs` still discards `bytes_read` at all three decode
+sites. The standard and the taxonomy say so explicitly rather than describing
+the check as available.
+
+### The dogfood deliverables (merged before this branch)
+
+The six plan branches above are the *platform* half of `2.13.0`. The other half
+merged to `main` on 2026-09-18 — after the `v2.12.0` tag, so it ships in this
+release — and is the work that motivated them: the clean-room dogfood run as
+wayfinder map [#16](https://github.com/PeterKnego/ultima_cluster/issues/16),
+whose charter is
+[`2026-09-13-uc2-dogfood-kv-charter.md`](superpowers/specs/2026-09-13-uc2-dogfood-kv-charter.md).
+Two agents worked from the published `2.12.0` material only, in sandboxes that
+could not read this repository: a **builder** given the docs, rustdoc and
+`examples/counter` and asked to build a real service, and an **operator** given
+bare Linux hosts, the release tarball and the builder's binaries and asked to
+run a cluster through outcome-shaped cards with the faults injected blind. Four
+things landed from it.
+
+- **[`examples/kv`](../examples/kv), a replicated key-value store**, merged
+  in-tree as a workspace example (`70fa2d1`, review nits `78cee00`). It is the
+  first *user-facing* shipped example that implements `SnapshotStateMachine`
+  and wraps itself in `Sessioned`, and it ships in **two shapes** — a v1
+  (put/get/delete/CAS) and a v2 that adds list-valued keys and bumps `VERSION`,
+  with v2 able to read a v1 image. That second shape is why the upgrade story
+  has a worked subject at all, and it is the corpus `uc_diffreplay`'s own
+  regression tests and plan C's `pin-verify` run against.
+- **A lifecycle tutorial**,
+  [Build an application](tutorials/build-an-application.md) — design → build →
+  test → package → deploy → operate → upgrade, walked once end to end with the
+  KV store as the worked example and linking out to the how-to for each stop.
+  It is `docs/reference/application-sdlc.md` walked rather than stated, which is
+  what turned the documentation set from per-milestone gate docs into a
+  lifecycle.
+- **Two experience reports**, the honest account rather than the tidy one:
+  [builder](notes/uc2-dogfood-kv-builder-report.md) (the v1 store built in a
+  single 28-minute clean-room session with zero maintainer interventions, 22
+  ledger items) and
+  [operator](notes/uc2-dogfood-kv-operator-report.md) (seven cards across three
+  sessions on a real 3-voter + 1-observer AWS fleet, all seven passed, 49 ledger
+  items). Both carry their accepted limits as accepted limits.
+- **Reference and how-to fixes plus product tickets.** Every ledger item was
+  resolved into one of four outcomes — a doc fix on `main`, a fix carried by the
+  deliverables, an accepted limit written into the report, or a product ticket
+  (**#33–#42**). The gate doc
+  [`uc2-dogfood-kv-gate-2026-09-15.md`](benchmarks/uc2-dogfood-kv-gate-2026-09-15.md)
+  pre-committed every bar before any run, in the honest-failure protocol this
+  repo has used since M7: rows `B5-builder` and `B5-operator` are **PASS** at
+  100 % resolution (22 and 49 items), and `B2-v1.iii` is an honest **FAIL**
+  traced to product defect
+  [#32](https://github.com/PeterKnego/ultima_cluster/issues/32) with the bar
+  kept.
+
+The sharpest friction the two ledgers named is the one the rest of this release
+closes: operator item **L45** — card 7, the application upgrade, was passable
+only from the *application author's own README paragraph*, because no platform
+application-upgrade page existed — and **L47**, that a new version's attach
+silently rewrote the pre-upgrade artifact in place, so the rollback point the
+README assumed could not survive on-node. Plans A–D are the answer to both.
+
+### Fixed on the way
+
+- **An apply overrun could replay forever, in silence** (pre-existing, found by
+  plan B3's final review). `replay_into`'s gap guard tests `first > start_pos`,
+  which cannot fire for a cursor of 0, a journal whose first block is at or
+  below 0, or a buffer base above 0 — so a replay pass that made no progress
+  idled instead of being recognised as "the retained prefix does not cover my
+  cursor", and `Service::stop` hung forever. A no-progress `Overrun → replay`
+  pass is *by construction* that condition (an overrun means bytes were
+  committed and recorded), so it now re-enters `replay_into` with a synthetic
+  first-available bound and takes the gap guard's own path: a snapshot-capable
+  row installs a covering artifact, one that is not fail-stops
+  `SnapshotRequired` by name. Under the shipped default (`PurgePolicy::
+  Disabled`) the old behaviour was a permanent, silent stall. The root cause —
+  widening the gap test, or deriving `first` from the buffer base or archive
+  floor — is on the backlog rather than fixed blind.
+- **The `uc_node` log-sink capture flake** (`a_joining_learner_…`,
+  `a_learner_peers_proof_…`) is closed: four in-module tests swapped the
+  process-global `uc_obs` sink concurrently. One `OBS_CAPTURE_LOCK` per
+  capturing test, plus drop guards so a failing test restores the sink.
+- **`counter-service` exited 1 on `NodeBooting`** (#53). It spawns 1 s after
+  its node, and B2's boot-order change widened the window enough for a slow
+  runner to land in it. It now retries `NodeBooting` on the same 20 ms cadence
+  and `--wait-secs` deadline it already used while waiting for `cnc2.dat`;
+  every other refusal stays final. B3's library-level `boot_wait` covers the
+  same window generally — belt and braces at the example layer.
+- **Nightly's `capstones` job did not build the fixture binaries** (#53):
+  `cargo test --workspace` does not build `register-replay` or
+  `uc2-diffreplay`, which `uc_diffreplay`'s e2e tests and `kv_store`'s
+  `regression_corpora` hard-assert. `ci.yml` had the two build steps since #50;
+  `nightly.yml` now mirrors them.
+- **Two documentation-pipeline reds**: `uc_diffreplay` was documented but not
+  linked from `.github/pages/index.html`, which the docs job's drift guard
+  fails on (#53); and `configuration.md` linked a `monitor-a-cluster.md`
+  heading that does not exist (#55).
+- **`uc2_cluster_fsm_position` is repointed** to the `uc2-cluster` agent's walk
+  cursor. This is a **changed reading of a shipped metric**, not a fix to a
+  wrong one in the ordinary sense: the gauge shipped in `2.11.0` reading the
+  published view's tag while its help text described the walk cursor, and the
+  readiness gate can only be asked about the cursor. The name is unchanged, so
+  a `2.11.0` dashboard keeps working and silently reads a different quantity.
+  It is called out in `RELEASES.md` for that reason.
+
+### Release evidence
+
+The post-tag rows are filled at tag time; the local rows are the proof stack
+this plan's own final task runs on the release-prep head.
+
+| what | evidence | result |
+|---|---|---|
+| `ci.yml` (fmt gate, clippy, workspace tests, MSRV 1.89, deny, publish-check) | on the release-prep head | pending — filled at tag time |
+| `docs.yml` (rustdoc, link check) | on the release-prep head | pending — filled at tag time |
+| `release.yml` dry run (build ×2, SBOM, `release-smoke`; no signing, no publish) | `workflow_dispatch` with `dry_run: true`, `cut-a-release.md` §2 | pending — filled at tag time |
+| `release.yml` on the tag (release, image, cosign) | run on tag `v2.13.0` | pending — filled at tag time |
+| the local proof stack: `cargo fmt --all -- --check`, seven `clippy` invocations (workspace; the four feature-gated crates `uc_crashtest`/`uc_lincheck`/`uc_service`/`uc_gateway`; `uc_diffreplay --no-default-features`; **and the MSRV gate**, `cargo +1.89.0 clippy --workspace --all-targets --locked`), the three fixture builds (`register-replay`, `uc_diffreplay`, `kv_store`), `cargo test --workspace`, `cargo test -p uc_diffreplay --test pin_verify`, `lin_v2`, the hard-crash suite, `cargo +nightly fuzz build`, `scripts/check_doc_links.py` | this plan's final task, on the release-prep head (run at `4c680a4`; the only later delta on the branch is `fuzz/Cargo.lock`, outside the workspace) | **green locally** — fmt and all seven clippy invocations clean; `cargo test --workspace` 139 `test result: ok` lines, 0 failed; `pin_verify` 5 passed; `lin_v2` 15 passed; the hard-crash suite 8 suites green (three `uc2-apply` fail-stop panics are the SIGKILL/restart harness's own contract, not failures — `remote_lin_envelope_on`/`_off` both passed, no flake hit); `cargo +nightly fuzz build` clean apart from the four known pre-existing `uc_gateway` deprecation warnings; `check_doc_links.py` 1250 links, 0 errors, 28 known md-tui-only warnings — a dev box, and not the whole `docs/VERIFICATION.md` surface |
+| `publish-check`'s batched `cargo package --no-verify` over the **fourteen** publishable crates, and `scripts/check_publish_metadata.sh` | run locally with `uc_diffreplay` in the batch, both before the bump and again in this task's run on `4c680a4` after it | ok — fourteen `Packaged` lines each time, metadata within crates.io limits |
+| the rest of the proof surface (`docs/VERIFICATION.md`): Elle, loom, Lean + conformance, fuzz smoke | no whole-tree release pass yet — the release procedure's own step | pending |
+| fleet gate | none — no rate bar was set for this release | **n/a**, stated rather than omitted |
+| the M10 alert tier, with the new `Uc2SnapshotHashDiverged` rule | `scripts/m10_alert_fire.sh`, scenario `snapshot_hash_diverged` | **green locally** during plan B1 — 27/27 rules fire under promtool; a local tier, not a fleet result |
+| artifact integrity (`sha256sum -c`) and provenance (`cosign verify-blob`, `cosign verify`) | `cut-a-release.md` §5 from a clean directory | pending — filled at tag time |
+| release quickstart, from the unpacked tarball | `cut-a-release.md` §5: `packaging/quickstart-local.sh` | pending — filled at tag time |
+| crates.io (**14** crates, `uc_service` before `uc_node`, `uc_diffreplay` after it) | `cut-a-release.md` §6, in dependency order | pending — filled at tag time; `uc_diffreplay` is a **new crate name**, so budget for the new-name rate limit that cost `2.9.0` 62 minutes |
+
+<!-- PENDING: tag-time evidence rows above -->
+
 ## v2.12.0 — 2026-09-13 — jumbo frames, and the monotonic log clock
 
 **Two features on one flag day: wire `0.7.0` → `0.8.0` and cnc `3.1` → `3.2`.**

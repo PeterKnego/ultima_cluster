@@ -102,7 +102,7 @@ Recorded here because they are exactly what a black-box adjudication is for.
 
 ```bash
 cargo build --release -p uc_adjudicate
-UC2_BIN_DIR=/path/to/uc2-2.12.0-…/bin \
+UC2_BIN_DIR=/path/to/uc2-2.13.0-…/bin \
   target/release/uc2-adjudicate wgl \
     --adapter kv-v1 --service-bin /path/to/kv-service --seed 1 --secs 20
 # churn (B2.iii); needs a tarball bin dir and the builder's kv-service:

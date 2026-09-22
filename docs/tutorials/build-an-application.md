@@ -151,15 +151,17 @@ account of where the docs helped and where they didn't.
 ## 6. Upgrade
 
 Eventually your application changes. The KV store's v2 adds list-valued keys
-(`append`, `list`) and moves `KV_VERSION` to `2.0.0`. At 2.12.0 an application
-upgrade is a **flag day** — you stop every service, install the new binary, and
-start every service — because a mixed-version cluster can commit a command the
-old replicas cannot apply, and a failover to an old leader would then lose an
-acknowledged write. That hazard, and the exact procedure, are the subject of
-the next how-to:
+(`append`, `list`) and moves `KV_VERSION` to `2.0.0`. An application upgrade is
+a **flag day, per row** — you pin the row's next version to a coordinated
+instant, then stop every instance of that row, install the new binary, and
+start it again — because a mixed-version cluster can commit a command the old
+replicas cannot apply, and a failover to an old leader would then lose an
+acknowledged write. The nine stages a row moves through are the standard's
+[upgrade lifecycle](../reference/application-sdlc.md#the-upgrade-lifecycle-per-row);
+the commands are the next how-to:
 
 > **[Upgrade an application](../how-to/upgrade-an-application.md)** — the
-> flag-day procedure as it actually is at 2.12.0, what to back up first (the v2
+> flag-day procedure as it actually is, what to back up first (the v2
 > service rewrites its rollback artifact in place, so an off-node copy is the
 > only safe rollback), and why the rolling upgrade is not here yet.
 

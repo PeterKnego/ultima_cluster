@@ -29,7 +29,11 @@ restarts, with a journal you can bound with one command. A key is one of two
 
 ## Build
 
-Rust 1.89+ (built with 1.96). The UC crates come from crates.io at `=2.12.0`.
+Rust 1.89+ (built with 1.96). The UC crates are now in-tree **workspace path
+dependencies** — `uc_service`, `uc_remote` and `uc_diffreplay`, each pinned
+`version = "2.13.0"` in lockstep with the workspace (`Cargo.toml`). The
+clean-room original built against crates.io at `=2.12.0`; merging it in-tree
+replaced that with the path deps.
 
 ```bash
 cargo build --release
@@ -211,6 +215,20 @@ snapshot set and tail-replays; a node wiped and restarted receives the set
 from the leader (`snapshot_installed` in its log). Compare `kv digest`
 across gateways afterwards.
 
+> **Note added 2026-09-22 (2.13.0).** The paragraph below, and the recipe in
+> § "Upgrading a running cluster v1 → v2", are the clean-room record of what
+> the 2.12.0 documentation said, and are left as written. **Do not follow
+> them on 2.13.0.** An application upgrade is now a **pinned, per-row**
+> procedure: you name an origin with `uc2ctl upgrade pin`, every instance of
+> the row installs that one artifact at attach, and a binary that does not
+> match the pin is refused by name. An *unpinned* v2 attach is no longer the
+> benign no-op this recipe assumes — it either refuses by name when an
+> install is needed, or computes the counterfactual of the SDLC standard's
+> § 2.3 against whatever the journal still retains. Follow
+> [Upgrade an application](../../docs/how-to/upgrade-an-application.md) and
+> [the SDLC standard's S1–S9](../../docs/reference/application-sdlc.md#the-upgrade-lifecycle-per-row)
+> instead.
+
 **Upgrading the store** is a flag day at 2.12.0 (the platform has no rolling
 application upgrade yet): stop traffic, stop every `kv-service`, install the
 new binary, start them. The wire and snapshot formats carry version bytes;
@@ -231,6 +249,12 @@ see `docs/DESIGN.md` § 7.
   name. `WIRE-FORMAT.md` § 5 has both layouts and the digest-continuity rule.
 
 ### Upgrading a running cluster v1 → v2 (a flag day)
+
+> **Superseded by 2.13.0** — see the note in § Operating. Kept as written,
+> because it is the clean-room record of what the 2.12.0 docs said; the
+> procedure it teaches is refused by the platform now. Use
+> [Upgrade an application](../../docs/how-to/upgrade-an-application.md)
+> (S1–S9).
 
 The platform has **no rolling application upgrade** at 2.12.0
 (`docs/reference/application-sdlc.md` § 5), so upgrading the store is a flag

@@ -16,6 +16,20 @@ subcommand — see `examples/kv/src/bin/kv-service.rs`. `uc_lincheck/src/bin/
 register-replay.rs` (built behind the `uc_lincheck` `replay-bin` feature) is
 the harness's own end-to-end fixture, over `RegisterSm`.
 
+## Installing
+
+`uc2-diffreplay` is **not** in the release tarball or the container image.
+Install it from crates.io once `2.13.0` is published:
+
+    cargo install uc_diffreplay
+
+or build it from a checkout of this repository:
+
+    cargo build -p uc_diffreplay      # target/<profile>/uc2-diffreplay
+
+An application's own CI is the intended caller, which is why this ships as a
+published crate rather than a tarball binary.
+
 ## CLI contract for app binaries
 
 `uc2-diffreplay` shells out to the app's own binary rather than linking
@@ -92,6 +106,27 @@ An `[[expect]]` on `projection_origin` or `projection_end` takes **no**
 `arm`, and is refused by name if it carries one: a projection is one
 comparison over the whole state, attributed to the change's touched set as a
 whole rather than to any single arm.
+
+Three rules about `[[expect]]` that a first declaration usually meets the
+hard way:
+
+- **`surface` is spelled `ids`**, not `ids_calls`. `ids_calls` is the *trace*
+  field the driver writes per entry; the surface an `[[expect]]` names is one
+  of `response`, `sched`, `projection_origin`, `projection_end`, `ids`,
+  `output`.
+- **One `[[expect]]` is enough for a pair, and it is REUSED.** An entry is
+  matched to a divergence by its `(surface, arm)` pair, and one entry covers
+  every divergence on that pair — however many positions diverged. A *second*
+  entry on the same pair is consumed only if that pair diverges **again** (the
+  matcher takes the first not-yet-satisfied candidate, in declaration order);
+  otherwise it ends the run as `Absent` ("declared but not observed") and fails
+  it. So one entry per pair is the rule of thumb, with the per-position detail
+  in its `note` — and a second entry on `projection_origin` or
+  `projection_end` is *always* `Absent`, since a projection is compared once.
+- **An `[[expect]]` with no `arm` is a wildcard on that surface, and a
+  specific entry beats it** regardless of declaration order — so a wildcard
+  declared first never steals a specific entry's match, and a wildcard
+  declared alongside specific entries only catches the arms they do not name.
 
 Unknown keys are refused — a declaration is a statement of intent, and a
 typo in one must not read as "not declared".

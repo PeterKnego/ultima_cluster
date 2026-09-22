@@ -146,6 +146,17 @@ The limits are enforced in the state machine (a violating frame gets
   only to a set at a position before the upgrade, or wipe `snapshots/` and
   replay the journal if purge has not removed the prefix.
 
+> **Note added 2026-09-22 (2.13.0).** This design note is a clean-room record
+> written against the 2.12.0 documentation snapshot and is left as written.
+> The platform has moved: an application upgrade is now a **pinned, per-row**
+> procedure, not a stop-everything flag day. You name an origin with `uc2ctl
+> upgrade pin`, every instance of the row installs that artifact at attach,
+> and the old binary is refused by name — which also means "put the old
+> binary back" is no longer a rollback. Follow
+> [Upgrade an application](../../../docs/how-to/upgrade-an-application.md) and
+> [the SDLC standard's S1–S9](../../../docs/reference/application-sdlc.md#the-upgrade-lifecycle-per-row)
+> instead of this bullet and § 9.5 below.
+
 ## 8. Observability
 
 The platform exports per-FSM apply/lag/snapshot metrics on the node's
@@ -213,6 +224,9 @@ but makes rollback one-way past the first v2 snapshot. Documented, not fixed:
 the platform offers no migration hook, so this is the application's to own.
 
 ## 9.5 Rollout (L19, L20, L22) — a flag day, because the platform has no rolling upgrade
+
+> **Superseded by 2.13.0** — see the note in § 7. Kept as written, because it
+> is the clean-room record of what the 2.12.0 docs said.
 
 `application-sdlc.md` § 5 states plainly that a rolling application upgrade is
 not supported at 2.12.0. So: stop every `kv-service`, install v2, start every

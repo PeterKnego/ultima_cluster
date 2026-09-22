@@ -18,21 +18,21 @@ name = "uc2-node"
 path = "src/bin/uc2-node.rs"
 
 [dependencies]
-uc_protocol = { path = "../uc_protocol", version = "2.12.0" }
-uc_obs = { path = "../uc_obs", version = "2.12.0" }
+uc_protocol = { path = "../uc_protocol", version = "2.13.0" }
+uc_obs = { path = "../uc_obs", version = "2.13.0" }
 # Already a workspace dependency (uc_crypto uses it) — no new crate enters the
 # lockfile. Used only to digest the config FILE at load, for the (build,
 # config) release identity of twelve-factor #5.
 sha2 = { workspace = true }
-uc_log = { path = "../uc_log", version = "2.12.0" }
-uc_net = { path = "../uc_net", version = "2.12.0" }
-uc_consensus = { path = "../uc_consensus", version = "2.12.0" }
-uc_crypto = { path = "../uc_crypto", version = "2.12.0" }
+uc_log = { path = "../uc_log", version = "2.13.0" }
+uc_net = { path = "../uc_net", version = "2.13.0" }
+uc_consensus = { path = "../uc_consensus", version = "2.13.0" }
+uc_crypto = { path = "../uc_crypto", version = "2.13.0" }
 # The cluster FSM (spec §4) implements uc_service's RawStateMachine +
 # SnapshotStateMachine so it is "treated like any FSM". This is a RUNTIME
 # edge; uc_service's dev-dependency on uc_node stays a dev-only cycle. The
 # crates.io publish order therefore flips: uc_service BEFORE uc_node.
-uc_service = { path = "../uc_service", version = "2.12.0" }
+uc_service = { path = "../uc_service", version = "2.13.0" }
 uc_journal = { workspace = true }
 thiserror = { workspace = true }
 fs2 = { workspace = true }
@@ -54,7 +54,7 @@ crc32fast = { workspace = true }
 # available on crates.io. The Task 11 barrier test drives the full read path
 # with a real service + client.
 uc_service = { path = "../uc_service" }
-uc_client = { path = "../uc_client", version = "2.12.0" }
+uc_client = { path = "../uc_client", version = "2.13.0" }
 # L3 lincheck port (Task 13): the WGL checker/history/model + CAS-register SM,
 # built for the v2 SDK trait only (v1 `uc_service` is not pulled in here).
 # NOTE: deliberately no `version =` — uc_lincheck is `publish = false` (never

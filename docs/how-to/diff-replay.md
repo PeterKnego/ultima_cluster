@@ -18,6 +18,14 @@ evidence about it: probe-query answers (the projection is the state view
 instead). `uc_diffreplay/README.md` § "What this does not compare" is the
 standing statement.
 
+**Getting `uc2-diffreplay`.** It is **not** in the release tarball or the
+container image — those carry `uc2-node`, `uc2ctl`, `uc2-gateway` and the
+counter example only. Install it from crates.io once `2.13.0` is published
+(`cargo install uc_diffreplay`), or build it from a checkout
+(`cargo build -p uc_diffreplay`, giving `target/<profile>/uc2-diffreplay`).
+An application's own CI is the intended caller, which is why it ships as a
+crate rather than a tarball binary.
+
 ## 1. Make your service binary replayable
 
 Add `replay` and `project` subcommands that call
@@ -65,6 +73,22 @@ An `[[expect]]` on `projection_origin` or `projection_end` must not carry an
 `arm` (it is refused by name): a projection is one comparison over the whole
 state, attributed to the touched set as a whole. Unknown keys are refused
 too, so a typo cannot quietly read as "not declared".
+
+Three more rules about `[[expect]]`, each of which will otherwise cost you a
+run:
+
+- `surface` is one of `response`, `sched`, `projection_origin`,
+  `projection_end`, **`ids`** and `output`. The ids surface is spelled `ids`;
+  `ids_calls` is the *trace* field the driver writes per entry, not a surface
+  name.
+- **One entry is enough for a `(surface, arm)` pair, and it is reused** for
+  every divergence on that pair. A second entry on the same pair is consumed
+  only if the pair diverges again; otherwise it comes back `Absent`, which
+  fails the run — so put the extra detail in the first entry's `note`. A second
+  entry on `projection_origin` or `projection_end` is always `Absent`, since a
+  projection is compared once.
+- **An `arm`-less entry is a wildcard, and a specific entry beats it** on the
+  same surface, regardless of which is declared first.
 
 ## 4. Run
 

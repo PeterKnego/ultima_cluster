@@ -147,7 +147,7 @@ jobs:
           command: check advisories licenses bans sources
           arguments: --all-features
 
-  # M12c Task 1: smoke-tests that the 13 publishable crates (see deny.toml's
+  # M12c Task 1: smoke-tests that the 14 publishable crates (see deny.toml's
   # bans comment in root Cargo.toml) actually package/publish, so a manifest
   # regression (a path dep missing `version =`, a stray `publish = false`,
   # a keyword crates.io would reject, ...) is caught here instead of at
@@ -169,7 +169,7 @@ jobs:
       # dependency and then requires it to actually resolve — even with
       # --no-verify (which only skips the build step, not this metadata
       # check). Pre-first-publish, NOTHING in this DAG is on crates.io yet,
-      # so packaging each of the 12 crates in its OWN `cargo package`
+      # so packaging each of the 14 crates in its OWN `cargo package`
       # invocation would fail forever for every non-leaf crate (this is not
       # a temporary bootstrap gap: uc_node's dev-dependency on uc_service,
       # for one example, is a genuine dev-only cycle no publish order can
@@ -179,14 +179,14 @@ jobs:
       # `-p ... -p ...` invocation against each other locally instead of
       # hitting the registry — it topo-sorts the selected set itself, so
       # neither the `-p` flag order nor the workspace `members` order
-      # matters here. So: one batched command for all 13 crates, not 13
+      # matters here. So: one batched command for all 14 crates, not 14
       # separate ones (which would each fail — see above).
-      - name: cargo package (all 13 publishable crates)
+      - name: cargo package (all 14 publishable crates)
         run: >
           cargo package --no-verify
           -p uc_journal -p uc_protocol -p uc_obs -p uc_crypto -p uc_log
           -p uc_consensus -p uc_net -p uc_client -p uc_service -p uc_node
-          -p uc_remote -p uc_gateway -p uc_ctl
+          -p uc_diffreplay -p uc_remote -p uc_gateway -p uc_ctl
       # The 4 leaves (no path dependencies of their own: uc_journal,
       # uc_protocol, uc_obs, uc_consensus) are the only crates that can be
       # `cargo publish --dry-run`'d before anything is actually on crates.io
