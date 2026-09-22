@@ -311,6 +311,7 @@ can forge fan-out traffic as any node. See runbook §11.
 | `uc_net` | Reliable-UDP sender/receiver agents, NAK repair, flow control, snapshot sessions |
 | `uc_consensus` | Pure-sync safety core: commit tracker, elections, term maps, truncation |
 | `uc_crypto` | Opt-in node-to-node wire crypto (M8, off by default): Noise `IK` handshake, AES-256-GCM over the datagram envelope, rotating group key, anti-replay; plus the M12b admin-request HMAC |
+| `uc_obs` | The structured JSON-lines log record format every daemon emits: `emit`, the `obs_event!` macro, the level filter, and the one formatter the admin audit file renders through. A dependency-free leaf, so it can sit under `uc2-gateway` as well as under the node |
 | `uc_sim` | Deterministic simulation + invariants + fuzz |
 | `uc_node` | The node: agents wired together, IPC surface, read barrier, gate harnesses |
 | `uc_service` | Service SDK: `StateMachine` traits, apply agent, reconstruction |

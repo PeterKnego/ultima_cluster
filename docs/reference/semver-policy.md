@@ -333,9 +333,9 @@ discovered at a downstream `cargo build`.
   shape that does not.
 - **`SnapshotStateMachine::project` is a provided method**, not a required one,
   so no existing implementation has to change. The default returns
-  `SnapshotError::Codec("project() not implemented by this state machine")`, so
-  a row that never overrides it simply has no state surface for diff replay to
-  compare — implement it if you want one.
+  `SnapshotError::Codec("project() not implemented by this state machine (diff
+  replay spec §5.8)")`, so a row that never overrides it simply has no state
+  surface for diff replay to compare — implement it if you want one.
 
 ## The one-way door: one tier per type
 

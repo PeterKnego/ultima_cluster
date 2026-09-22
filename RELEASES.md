@@ -174,9 +174,9 @@ reads `0`, with no per-FSM rows, until the node has joined).
   confirm on every node → stop → swap → verify), with what a rollback costs
   once the pin has committed and when the old code arm may finally be deleted.
   For agents, `.claude/skills/diff-replay-judge/` is a project skill covering
-  the four judgement steps the harness cannot make for you: draft the
-  declaration from the diff, classify the change, attribute the residue, and
-  judge the state diff.
+  the five judgement steps the harness cannot make for you: draft the
+  declaration from the diff, classify the change, attribute the residue, judge
+  the state diff, and spot the determinism hazards a lint cannot.
 - **Also in this release: the application lifecycle, documented end to end.** A
   clean-room dogfood — one agent building a real service on UC from the
   published docs alone, a second operating a real fleet through faults,

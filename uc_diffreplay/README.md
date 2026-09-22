@@ -100,11 +100,15 @@ hard way:
   field the driver writes per entry; the surface an `[[expect]]` names is one
   of `response`, `sched`, `projection_origin`, `projection_end`, `ids`,
   `output`.
-- **One `[[expect]]` covers EVERY divergence on its `(surface, arm)` pair**,
-  however many positions diverged. A second entry declaring the same pair is
-  never reached, so it ends the run as `Absent` ("declared but not observed")
-  and fails it. Say a thing once, in one entry, and put the per-position
-  detail in its `note`.
+- **One `[[expect]]` is enough for a pair, and it is REUSED.** An entry is
+  matched to a divergence by its `(surface, arm)` pair, and one entry covers
+  every divergence on that pair — however many positions diverged. A *second*
+  entry on the same pair is consumed only if that pair diverges **again** (the
+  matcher takes the first not-yet-satisfied candidate, in declaration order);
+  otherwise it ends the run as `Absent` ("declared but not observed") and fails
+  it. So one entry per pair is the rule of thumb, with the per-position detail
+  in its `note` — and a second entry on `projection_origin` or
+  `projection_end` is *always* `Absent`, since a projection is compared once.
 - **An `[[expect]]` with no `arm` is a wildcard on that surface, and a
   specific entry beats it** regardless of declaration order — so a wildcard
   declared first never steals a specific entry's match, and a wildcard

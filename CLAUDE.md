@@ -31,7 +31,9 @@ kinds 4 `UpgradePin` / 5 `SnapshotReport`, pairwise `SNAP_REPORT` 26) and cnc
 `3.2` → `3.3` (status-line words `+16 upgrade_origin`, `+24 pinned_version`,
 `+32 pin_seq`, `+40 pinned_from`; slot line 7 `+504 artifact_hash`) — plus a
 row-artifact envelope change, `ULTSNAP2` (24 B, carrying the `S::VERSION` that
-built the artifact; `ULTSNAP1` refused by name). Six branches, all merged:
+built the artifact; `ULTSNAP1` refused by name). Six plan branches and two
+hotfixes; the five that carry code are merged, **D (this writeup) is in
+flight**:
 **A** #50 (`uc_diffreplay`, the diff-replay harness), **B1** #51 (the two
 cluster records, `uc2ctl upgrade pin/show`, admin op 10, refusals 52–59), **B2**
 #52 (the pinned install at attach, four attach refusals, `ULTSNAP2`, the
@@ -40,7 +42,9 @@ and the pins-authoritative readiness gate), the docs hotfix #55, **C** #56
 (`uc2-diffreplay pin-verify`), and **D** (this writeup, the SDLC standard, the
 per-row upgrade how-to, the `diff-replay-judge` skill). Spec
 `docs/superpowers/specs/2026-09-19-uc2-fsm-upgrade-lifecycle-design.md` — read
-its **five** "Errata … as built" blocks (B1, B2, B3, C, D) before the body.
+its **five** `#### Errata … as built` blocks (B1, B2, B3, C, D) before the
+body, **plus plan A's three inline "as built" paragraphs in §2.3, §4.2 and
+§6.3**, which are not in a block.
 What a new task must know:
   - **Stop every node before starting any node** (the flag day), and clear
     `snapshots/<row>/` ONCE per node in the window. That wipe needs a durable

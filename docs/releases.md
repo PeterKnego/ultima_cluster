@@ -7,7 +7,9 @@
 **One flag day: wire `0.8.0` → `0.9.0` and cnc `3.2` → `3.3`, plus a row
 artifact envelope change (`ULTSNAP2`) that costs one wipe of
 `snapshots/<row>/` per node.** Baseline: the tagged `v2.12.0` (wire `0.8.0`,
-cnc `3.2`). The work landed as six branches merged in this order — **A**
+cnc `3.2`). The work is six plan branches and two hotfixes; the five plan
+branches that carry code, and both hotfixes, landed in this order, and plan D
+(this writeup) follows them — **A**
 [#50](https://github.com/PeterKnego/ultima_cluster/pull/50) (the diff-replay
 harness, `main` `f63d293`) → **B1**
 [#51](https://github.com/PeterKnego/ultima_cluster/pull/51) (the two cluster
@@ -40,7 +42,7 @@ state — carried by an operator's memory rather than by the platform.
 |---|---|---|---|---|---|---|
 | spec | §6.2, §6.3 | §2.5, §3 S4, §6.5.2, §9.1 | §3 S4 steps 4–5, §9.1 (2), §2.3 | §6.5.2 | §6.2 part 2, §11 item 8 | §2.1–§2.5, §3, §5, §11 items 1, 2, 9 |
 | plan | [harness](superpowers/plans/2026-09-20-uc2-diff-replay-harness.md) | [pin + report](superpowers/plans/2026-09-20-uc2-upgrade-pin-and-snapshot-report.md) | [install at attach](superpowers/plans/2026-09-21-uc2-pinned-install-at-attach.md) | [live reports](superpowers/plans/2026-09-21-uc2-live-snapshot-reports.md) | [pin-verify](superpowers/plans/2026-09-21-uc2-pin-verify.md) | [release docs](superpowers/plans/2026-09-22-uc2-fsm-upgrade-lifecycle-release-docs.md) |
-| errata block | §6.3 "as built" | "(plan B1, as built)" | "(plan B2, as built)" | "(plan B3, as built)" | "(plan C, as built)" | "(plan D, as built)" |
+| errata block | the inline "as built" paragraphs in §2.3, §4.2 and §6.3 (not a block) | "(plan B1, as built)" | "(plan B2, as built)" | "(plan B3, as built)" | "(plan C, as built)" | "(plan D, as built)" |
 | explainer | — | [cluster FSM § Pins and reports](notes/uc2-cluster-fsm-explained.md#pins-and-reports-2130) | same | same | — | — |
 | how-to / reference | [diff replay](how-to/diff-replay.md) | [`uc2ctl` § `upgrade pin`](reference/uc2ctl.md#upgrade-pin) | [state-machine contract](reference/state-machine-contract.md) | [configuration § `boot_wait`](reference/configuration.md#attaching-a-service-or-a-client-boot_wait) | [diff replay § 5](how-to/diff-replay.md#5-verify-the-pin-live-reconstruction-mode-part-2) | [SDLC standard](reference/application-sdlc.md), [upgrade an application](how-to/upgrade-an-application.md) |
 | gate doc | none; no fleet gate | none | none | none | none | none |
@@ -319,9 +321,11 @@ change taxonomy, the common-origin requirement, version-as-an-input, the nine
 schema and protocol conventions, and the per-row S1–S9 upgrade lifecycle.
 `docs/how-to/upgrade-an-application.md` is rewritten as the seven-step pinned
 procedure S6 points at. `.claude/skills/diff-replay-judge/SKILL.md` carries the
-four judgement steps the harness cannot make: draft the declaration from the
+five judgement steps the harness cannot make: draft the declaration from the
 diff, classify the change against the taxonomy, attribute the report's
-unexplained residue to a hunk, and judge the state diff at the origin.
+unexplained residue to a hunk, judge the state diff at the origin, and spot the
+determinism hazards a lint cannot (a changed `ids()` call count, `HashMap`
+iteration, floats, a mid-enum insert, a field reorder).
 
 Two spec errata were added by this plan. Plan C's block gains item **10**:
 `pin-verify`'s PASS requires the SDK's Rust stderr marker, so §6.3's

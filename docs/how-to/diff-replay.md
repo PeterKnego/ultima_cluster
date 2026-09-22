@@ -73,11 +73,14 @@ run:
   `projection_end`, **`ids`** and `output`. The ids surface is spelled `ids`;
   `ids_calls` is the *trace* field the driver writes per entry, not a surface
   name.
-- **One entry covers every divergence on its `(surface, arm)` pair.** A second
-  entry naming the same pair is never reached and comes back as `Absent`,
-  which fails the run — put the extra detail in the first entry's `note`.
+- **One entry is enough for a `(surface, arm)` pair, and it is reused** for
+  every divergence on that pair. A second entry on the same pair is consumed
+  only if the pair diverges again; otherwise it comes back `Absent`, which
+  fails the run — so put the extra detail in the first entry's `note`. A second
+  entry on `projection_origin` or `projection_end` is always `Absent`, since a
+  projection is compared once.
 - **An `arm`-less entry is a wildcard, and a specific entry beats it** on the
-  same surface, whichever is declared first.
+  same surface, regardless of which is declared first.
 
 ## 4. Run
 
