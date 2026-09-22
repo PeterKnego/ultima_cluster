@@ -379,10 +379,9 @@ impl AppProcess {
     /// a killed child returns `Err` naming the timeout, never a silent
     /// success that a caller could read as a clean stop.
     pub fn stop(mut self, timeout: Duration) -> anyhow::Result<std::process::ExitStatus> {
-        let st = self.stop_inner(timeout);
-        // `self` drops here; `stop_inner` has set `reaped`, so `Drop` is a
-        // no-op and the child is never signalled twice.
-        st
+        // `self` drops after the call; `stop_inner` has set `reaped`, so
+        // `Drop` is a no-op and the child is never signalled twice.
+        self.stop_inner(timeout)
     }
 
     fn stop_inner(&mut self, timeout: Duration) -> anyhow::Result<std::process::ExitStatus> {
