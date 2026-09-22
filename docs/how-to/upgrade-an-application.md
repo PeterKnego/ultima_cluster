@@ -39,9 +39,11 @@ procedures; they may share an origin, and nothing requires them to.
   (seconds per row — the length of your stop/start, not an election).
 - Admin access to every node (`uc2ctl`, the admin key), and an off-node
   destination for the backup in step 1.
-- The row must be snapshot-capable — started with `start_with_snapshots()`.
-  A row on plain `start()` is refused at step 2 (`48 snapshot_unsupported`)
-  and again at step 6 (`PinRequiresSnapshots`).
+- The row must be snapshot-capable — started with `start_with_snapshots()`. So
+  must every *other* declared row: `48 snapshot_unsupported` refuses the whole
+  instant in step 2 when **any** declared row lacks the capability bit, naming
+  it. The row being upgraded is refused a second time at step 6
+  (`PinRequiresSnapshots`).
 
 **Rehearse the swap off the production cluster first.** `uc2-diffreplay
 pin-verify` takes a corpus captured from this cluster and your two real
@@ -71,10 +73,12 @@ Take a coordinated snapshot and copy it **off the node**, on every host, before
 you stop anything — and, decisively, **before you pin**:
 
 ```bash
-# on each node
-uc2ctl snapshot --instance-dir /srv/uc2/nN --app-id APP --admin-key /etc/uc2/admin/ops-admin.key
-uc2ctl backup   --instance-dir /srv/uc2/nN --out /srv/uc2-backups/nN-preupgrade
-# then copy /srv/uc2-backups/nN-preupgrade to somewhere off this host
+# once, on the leader — the instant is one command, and a follower answers retry
+uc2ctl snapshot --instance-dir /srv/uc2/n0 --app-id APP --admin-key /etc/uc2/admin/ops-admin.key
+
+# then on each node
+uc2ctl backup --instance-dir /srv/uc2/nN --out /srv/uc2-backups/nN-preupgrade
+# and copy /srv/uc2-backups/nN-preupgrade to somewhere off this host
 ```
 
 This matters more than it looks, for two independent reasons.
@@ -84,11 +88,14 @@ This matters more than it looks, for two independent reasons.
   is refused. Rolling back then means restoring *this* copy on every node —
   see [Rolling back](#rolling-back) and
   [S8](../reference/application-sdlc.md#s8-decide-the-point-of-no-return).
-- **The on-node image was never the rollback point.** The new version rewrites
-  the row's artifacts in its own image format as it snapshots, so what is left
-  on the node after the upgrade is not something the old binary could install
-  even if it were allowed to attach. (This is operator-dogfood finding L47,
-  filed as [#41](https://github.com/PeterKnego/ultima_cluster/issues/41).)
+- **The on-node artifacts are not a rollback point, even though they survive.**
+  The pinned origin's whole set is held on every node until a newer pin
+  supersedes it, so `snap-P` — built by the old version, its envelope stamped
+  with the old version — is still sitting there afterwards. It is not a way
+  back: the old binary is refused at attach by name, and there is no operator
+  verb that installs a chosen artifact by hand. (The *later* artifacts are the
+  new version's image format besides — operator-dogfood finding L47, filed as
+  [#41](https://github.com/PeterKnego/ultima_cluster/issues/41).)
 
 The backup has to predate the pin. One taken *after* it carries the pin, so
 restoring it restores the door you were trying to walk back through.
@@ -110,8 +117,10 @@ The command is **leader-only**: a follower answers `retry` with a leader hint
 naming the row, if a declared row was started with plain `start()` — such a row
 would ignore the frame and the set could never complete.
 
-Now wait for the complete set at P **on every node**, because the pin in step 3
-is checked against the node it is run on:
+Now wait for the complete set at P **on every node**. The pin's `54 pin_no_set`
+is a door check on the **leader** alone, so it does not speak for the rest of
+the cluster; the node that has to have the artifact is every node, because in
+step 6 each one installs its own copy or refuses with `PinnedArtifactMissing`:
 
 ```bash
 # on each node
@@ -249,7 +258,7 @@ Without the install capability it would replay the origin's prefix under the
 **4. The artifact at the origin is not on this node** — refused:
 
 ```
-row 0 is pinned to origin 73792 but /srv/uc2/n0/snapshots/0/snap-73792.ultsnap does not exist on this node — the set at the origin was pruned or never fetched; take `uc2ctl snapshot fetch` or re-pin at a retained instant
+row 0 is pinned to origin 73792 but /srv/uc2/nN/snapshots/0/snap-73792.ultsnap does not exist on this node — the set at the origin was pruned or never fetched; take `uc2ctl snapshot fetch` or re-pin at a retained instant
 ```
 
 **5. Otherwise the artifact at the origin is installed unconditionally**, and
@@ -363,7 +372,11 @@ you took is harmless.
 
 **After the pin commits (step 3 onwards) it is a one-way door.** The pin is
 committed and monotone; there is **no unpin verb**, and a lower origin is
-refused (`55 pin_not_monotone`). The old binary is refused at attach by name on
+refused (`55 pin_not_monotone`). It is the **origin** that is checked for
+monotonicity, not the version — so a pin back to `--to 1.0.0` at a *newer*
+origin is accepted, and it is still not a rollback: the artifact at that newer
+origin was written by the new version, in the new version's image format, which
+the old binary refuses by name. The old binary is refused at attach by name on
 every node, so "put the old binary back" is not a rollback — it is a service
 that will not start. The only way back is:
 
