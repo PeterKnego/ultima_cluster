@@ -1,8 +1,6 @@
 # ultima_cluster releases
 
-## v2.13.0 — <tag date> — the FSM upgrade lifecycle
-
-<!-- tag date: fill at tag time -->
+## v2.13.0 — 2026-09-22 — the FSM upgrade lifecycle
 
 **One flag day: wire `0.8.0` → `0.9.0` and cnc `3.2` → `3.3`, plus a row
 artifact envelope change (`ULTSNAP2`) that costs one wipe of
@@ -453,20 +451,19 @@ this plan's own final task runs on the release-prep head.
 
 | what | evidence | result |
 |---|---|---|
-| `ci.yml` (fmt gate, clippy, workspace tests, MSRV 1.89, deny, publish-check) | on the release-prep head | pending — filled at tag time |
-| `docs.yml` (rustdoc, link check) | on the release-prep head | pending — filled at tag time |
-| `release.yml` dry run (build ×2, SBOM, `release-smoke`; no signing, no publish) | `workflow_dispatch` with `dry_run: true`, `cut-a-release.md` §2 | pending — filled at tag time |
-| `release.yml` on the tag (release, image, cosign) | run on tag `v2.13.0` | pending — filled at tag time |
+| `ci.yml` (fmt gate, clippy, workspace tests, MSRV 1.89, deny, publish-check) | run `35719956935` on `0909cf6`, the plan-D merge = the tagged commit | success |
+| `docs.yml` (rustdoc, link check) | run `35719956970` on `0909cf6` | success |
+| `release.yml` dry run (build ×2, SBOM, `release-smoke`; no signing, no publish) | dispatch run `35721408806` on `0909cf6`, `dry_run: true` | success — `version`, both builds, `sbom`, `release-smoke`; `image` and `release` skipped by design |
+| `release.yml` on the tag (release, image, cosign) | run `35722693337` on tag `v2.13.0` (`0909cf6`) | success — all seven jobs first time; no wedge this release (the `v2.12.0` tag's first push had one) |
 | the local proof stack: `cargo fmt --all -- --check`, seven `clippy` invocations (workspace; the four feature-gated crates `uc_crashtest`/`uc_lincheck`/`uc_service`/`uc_gateway`; `uc_diffreplay --no-default-features`; **and the MSRV gate**, `cargo +1.89.0 clippy --workspace --all-targets --locked`), the three fixture builds (`register-replay`, `uc_diffreplay`, `kv_store`), `cargo test --workspace`, `cargo test -p uc_diffreplay --test pin_verify`, `lin_v2`, the hard-crash suite, `cargo +nightly fuzz build`, `scripts/check_doc_links.py` | this plan's final task, on the release-prep head (run at `4c680a4`; the only later delta on the branch is `fuzz/Cargo.lock`, outside the workspace) | **green locally** — fmt and all seven clippy invocations clean; `cargo test --workspace` 139 `test result: ok` lines, 0 failed; `pin_verify` 5 passed; `lin_v2` 15 passed; the hard-crash suite 8 suites green (three `uc2-apply` fail-stop panics are the SIGKILL/restart harness's own contract, not failures — `remote_lin_envelope_on`/`_off` both passed, no flake hit); `cargo +nightly fuzz build` clean apart from the four known pre-existing `uc_gateway` deprecation warnings; `check_doc_links.py` 1250 links, 0 errors, 28 known md-tui-only warnings — a dev box, and not the whole `docs/VERIFICATION.md` surface |
 | `publish-check`'s batched `cargo package --no-verify` over the **fourteen** publishable crates, and `scripts/check_publish_metadata.sh` | run locally with `uc_diffreplay` in the batch, both before the bump and again in this task's run on `4c680a4` after it | ok — fourteen `Packaged` lines each time, metadata within crates.io limits |
 | the rest of the proof surface (`docs/VERIFICATION.md`): Elle, loom, Lean + conformance, fuzz smoke | no whole-tree release pass yet — the release procedure's own step | pending |
 | fleet gate | none — no rate bar was set for this release | **n/a**, stated rather than omitted |
 | the M10 alert tier, with the new `Uc2SnapshotHashDiverged` rule | `scripts/m10_alert_fire.sh`, scenario `snapshot_hash_diverged` | **green locally** during plan B1 — 27/27 rules fire under promtool; a local tier, not a fleet result |
-| artifact integrity (`sha256sum -c`) and provenance (`cosign verify-blob`, `cosign verify`) | `cut-a-release.md` §5 from a clean directory | pending — filled at tag time |
-| release quickstart, from the unpacked tarball | `cut-a-release.md` §5: `packaging/quickstart-local.sh` | pending — filled at tag time |
-| crates.io (**14** crates, `uc_service` before `uc_node`, `uc_diffreplay` after it) | `cut-a-release.md` §6, in dependency order | pending — filled at tag time; `uc_diffreplay` is a **new crate name**, so budget for the new-name rate limit that cost `2.9.0` 62 minutes |
+| artifact integrity (`sha256sum -c`) and provenance (`cosign verify-blob`, `cosign verify`) | `cut-a-release.md` §5, run 2026-09-22 from a clean directory against the downloaded release assets, identity pinned to `…/release.yml@refs/tags/v.*` at the GitHub OIDC issuer | **OK** — all three archives (x86_64, aarch64, SBOM); **Verified OK** — both tarball bundles, `SHA256SUMS` and the SBOM bundle, and the image `ghcr.io/peterknego/uc2:2.13.0` |
+| release quickstart, from the unpacked tarball | same §5 run: `packaging/quickstart-local.sh` — three nodes, three services, three gateways, an election, two committed writes and a linearizable read | **PASS**; `uc2-node`, `uc2ctl` and `uc2-gateway` each print `2.13.0` for `--version` |
+| crates.io (**14** crates, `uc_service` before `uc_node`, `uc_diffreplay` after it) | `cut-a-release.md` §6, run 2026-09-22 from the tagged tree in dependency order — every package verify-built first (`cargo package`, 14 verified), then `cargo publish --no-verify` one crate at a time with cargo's own wait for availability, and the sparse index confirmed for all fourteen at the end | **all 14 live at 2.13.0**, zero retries; the one new name, `uc_diffreplay`, drew no rate-limit answer at all |
 
-<!-- PENDING: tag-time evidence rows above -->
 
 ## v2.12.0 — 2026-09-13 — jumbo frames, and the monotonic log clock
 

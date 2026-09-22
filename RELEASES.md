@@ -7,9 +7,7 @@ analyses, wire-version mechanics, upgrade remedies — is
 (pre-committed bars, fleet runs) are in
 [`docs/benchmarks/`](docs/benchmarks).
 
-## v2.13.0 — <tag date> — the FSM upgrade lifecycle
-
-<!-- tag date: fill at tag time -->
+## v2.13.0 — 2026-09-22 — the FSM upgrade lifecycle
 
 Upgrading a **state machine** stops being a stop-everything flag day you
 execute from memory and becomes a pinned, per-row procedure the platform
