@@ -123,8 +123,8 @@ documentation for what it changes, because the tag is what people read.
       deliberately open: no fleet gate was run or planned (stated as a row in
       both writeups rather than omitted), and
       [#49](https://github.com/PeterKnego/ultima_cluster/issues/49), the typed
-      tier's `bytes_read` length check, is claimed nowhere — do not quietly
-      close either.
+      tier's `bytes_read` length check, is claimed nowhere (as of `2.13.0`;
+      fixed on `main` afterwards) — do not quietly close either.
 
 ## 2. Check the version the way the workflow will
 

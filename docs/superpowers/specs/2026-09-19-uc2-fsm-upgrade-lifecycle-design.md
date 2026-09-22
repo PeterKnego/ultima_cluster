@@ -1700,16 +1700,43 @@ Ships alone. Trace `Sessioned`/`Timed` inner-slice exactness first.
   The query site is included for symmetry; that a malformed client query
   fail-stops the service is a pre-existing property this change neither
   widens nor narrows.
-- **Tests:** `uc_service/tests/typed_decode_exact.rs`, six — trailing byte
-  through `apply`, `query` and `on_committed`; a `Sessioned` pair (exact body
-  applies, over-long body fail-stops) pinning the trace; and Appendix A's
-  worst row reproduced in-tree: an old `Put(11, 22)` read by an enum with a
+- **Tests:** `uc_service/tests/typed_decode_exact.rs`, ten — trailing byte
+  through `apply`, `query` and `on_committed`; a `Sessioned` pair and a
+  `Timed` pair (exact body applies, over-long body fail-stops) pinning the
+  trace; the `read == 0` shape (`type Command = ()` applies an empty payload
+  and fail-stops on any byte at all); and Appendix A's worst row reproduced
+  in-tree: an old `Put(11, 22)` read by an enum with a
   variant inserted mid-enum, which the pre-fix tree applied as `Get(11)` (the
   test reached that assertion with the check absent) and now fail-stops.
-- **One in-tree consumer of the defect existed.** `uc_node/tests/services.rs`
+- **Three in-tree consumers of the defect existed** — none caught by `cargo
+  test`, two found by the branch review. `uc_node/tests/services.rs`
   zero-padded a `bincode` `Cmd::Add(1)` to 64 B and said in its comment that
   the decoder "ignores the rest"; it now sends `Cmd::AddPadded(u64, Vec<u8>)`,
-  which encodes to exactly 64 B. No harness or example relied on the trick.
+  which encodes to exactly 64 B. `uc_node/examples/m10_gate.rs` and
+  `uc_node/examples/m10_alerts.rs` (the M10 gate's probes row and the
+  `fsm_pinned` alert scenario) attached `type Command = ()` state machines and
+  submitted zero-filled blocks as ballast — `()` consumes nothing, so every
+  byte was trailing; both now use `Command = Vec<u8>` with a `ballast(n)`
+  helper that encodes to exactly `n` bytes, and both were re-run
+  (`m10_gate probes` PASS, `m10_alerts --scenario fsm_pinned` — see the
+  branch's proof lines). Every other gate harness already encoded its
+  `Vec<u8>` commands, and `m4_gate` attaches no service.
+- **A rule this makes explicit for multi-row nodes:** the log is broadcast,
+  every declared row applies every committed `MESSAGE` frame, so N typed rows
+  must share one command type (the `uc_lincheck::timer::MixedCmd` pattern) — a
+  row handed a sibling's bytes it cannot consume whole now fail-stops instead
+  of decoding a valid-but-wrong prefix. Stated in
+  `docs/reference/application-sdlc.md` § Schema and protocol conventions and
+  in `docs/notes/uc2-m14-multi-service-explained.md` § Routing and fan-in.
+- **Hot-path shape and the measurement not taken.** The per-frame addition is
+  one integer compare after a decode that already dominates; both failure
+  paths (`decode_failed`, `trailing_bytes`) are `#[cold] #[inline(never)]`, so
+  the body `decode_exact` inlines into carries no message formatting. No
+  `apply_bench` A/B was run: that harness drives a RAW-tier counter
+  (`RawCount`, "no decode, no allocation"), so the typed blanket impl — the
+  only code this change touches — is outside the loop it measures. The
+  project's apply-hop standard applies when the FSM hop's own loop changes;
+  here it did not.
 - **Not fixed here, as §9.1 says:** the length-identical reorder of two
   same-typed fields, which only the version tag ahead of the payload (§5.1,
   deliverable 2) can see.

@@ -42,7 +42,8 @@ per-row upgrade how-to, the `diff-replay-judge` skill). Spec
 `docs/superpowers/specs/2026-09-19-uc2-fsm-upgrade-lifecycle-design.md` — read
 its **five** `#### Errata … as built` blocks (B1, B2, B3, C, D) before the
 body, **plus plan A's three inline "as built" paragraphs in §2.3, §4.2 and
-§6.3**, which are not in a block.
+§6.3**, which are not in a block, **plus the deliverable-3 `#### As built`
+block under §11** (#49, after `2.13.0`).
 What a new task must know:
   - **Stop every node before starting any node** (the flag day), and clear
     `snapshots/<row>/` ONCE per node in the window. That wipe needs a durable
@@ -163,7 +164,7 @@ names** hard and new *versions* barely at all, so `2.9.0`'s twelve new
 names took 62 minutes and `2.10.0`'s one took 59 seconds.)
 
 Deliverable 3, [#49](https://github.com/PeterKnego/ultima_cluster/issues/49),
-is **fixed on `main` since 2026-09-22, unreleased**: `decode_exact` in
+is **fixed 2026-09-22 (its own PR off `0b73c32`), unreleased**: `decode_exact` in
 `uc_service/src/traits.rs` makes the typed tier fail-stop on a payload it does
 not consume whole (four of the five measured silent misparses; the
 length-identical reorder still needs the version tag), with no wire, cnc or
