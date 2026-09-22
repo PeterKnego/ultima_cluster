@@ -83,6 +83,13 @@ drafts what the change *does*; only the developer can say what it was
      `(surface, arm)` pair, so a second `[[expect]]` on the same pair reads
      `Absent` unless two divergences actually arrive. Write one line per
      pair, not one per position.
+
+   Omitting `arm` is not just brevity: an `arm`-less `[[expect]]` is a
+   **wildcard** over every arm on that surface — the one-line way to declare
+   a change that moves several arms the same way. A specific entry always
+   beats a wildcard for the arm it names, regardless of declaration order,
+   so a wildcard declared first never steals a specific entry's match; the
+   wildcard then covers the rest.
 6. Check the file parses before handing it over. `upgrade` is the only mode
    that reads a declaration, so run it with the same binary on both sides:
 
@@ -130,7 +137,8 @@ version digit S2 must bump.
    semantics" row), and whether S9 will owe the deletion of an old arm once a
    pinned origin sits above that shape's last occurrence.
 4. Derive the digit S2 must bump: **major** for any row whose axis-P risk is
-   severe or worst, **minor** for additive-but-inert (and the `upgrade` run
+   severe (the rule is axis-P only; "worst" is an axis-**H** cell and does
+   not enter it), **minor** for additive-but-inert (and the `upgrade` run
    is what confirms the inertness), **patch** for no replicated behaviour
    change at all. `NAME` is never bumped — it is the identity hash and the
    `fold32` input to `IdGen`, so changing it is a different FSM with a
@@ -166,7 +174,11 @@ attribute` with exactly what was read.
      helper, a state field that arm reads, or a real bug. That is the entry
      this step exists for.
    - **`position dispatched by one build only (only_in_a|only_in_b)`** — not
-     a value difference at all. The two builds disagree about *which frames
+     a value difference at all. Read the line's own columns with that in
+     mind: it is stamped `response` and `arm=-` whatever diverged, because
+     the finding is minted with a fixed surface and no arm, so do not chase
+     a response bug on the strength of the word `response`. The two builds
+     disagree about *which frames
      the FSM saw*. Look at the wrapper stacks first (`Sessioned`, `Timed` —
      a session envelope answering `replayed` on one side dispatches nothing
      on that side), then at anything that can refuse a frame before dispatch,
@@ -230,8 +242,12 @@ the reader cannot account for.
    attributes to the touched set as a whole; untangling the two is exactly
    what step 4's separation buys.
 6. Two shapes that look like a missing migration and are not. An empty
-   `projection_origin` with `migration = true` declared surfaces as an
-   `Absent` finding — check the artifact really is the old image, via each
+   `projection_origin` is never judged at all, so it produces no finding on
+   its own; what surfaces is an `[[expect]] surface = "projection_origin"`
+   that no diff satisfies, as `Absent`. (`migration = true` by itself is not
+   a claim the harness checks — it only decides how a non-empty origin diff
+   attributes, and a non-empty one with no matching `[[expect]]` reads
+   `Undeclared`.) Either way, check the artifact really is the old image, via each
    trace's `artifact_version` (the version stamped in the `ULTSNAP2`
    envelope; `null` when the run started from genesis) against its `version`
    (the build's own `VERSION`). And a `reconstruction` report compares no
@@ -248,22 +264,38 @@ an unread file is worth nothing.
 Walk the diff for five shapes. The first is the one no single-version test
 and no lint can see.
 
-1. **A changed number of `ctx.ids()` calls on an existing path.**
-   `uc_service/src/ids.rs` computes `permute(position, (ordinal << 32) |
-   fold32(identity))`: the id depends on the **ordinal within the apply
-   call**, so one extra mint anywhere earlier in that call moves *every*
-   later id it produces, on a path that is otherwise behaviourally
-   identical. It is a property of the *diff*, not of either version.
+1. **A changed id-minting shape on an existing path** — two different
+   changes with two different consequences, and only one of them is visible
+   to the harness. `uc_service/src/ids.rs` computes `permute(position,
+   (ordinal << 32) | fold32(identity))`, where the ordinal is the counter
+   **inside one generator**: `ApplyCtx::ids()` hands back a fresh `IdGen`
+   with `ordinal: 0` every time, and the only other inputs are the frame's
+   position and the FSM's identity.
+   - **A changed number of `ctx.ids()` calls.** A second generator in the
+     same apply call starts from ordinal 0 over the same position and
+     identity, so it mints the **identical series** as the first: the
+     consequence is *duplicated* ids, not shifted ones (`ids.rs`'s
+     `same_inputs_same_series` pins it). This is the one the harness sees —
+     `ApplyCtx::ids()` increments `ids_calls`, and `uc_diffreplay` compares
+     that count per position as the `ids` surface. Say "duplicated series",
+     never "every later id moved", when explaining such a finding.
+   - **A changed number of `next()` calls on one generator.** *This* is what
+     shifts every later id in that call, because each `next()` consumes an
+     ordinal. The harness **cannot** see it: `diff.rs` compares `ids_calls`
+     and nothing else, so an extra or removed `next()` reaches the report
+     only indirectly, as a `response`, `sched` or projection difference —
+     which is exactly why it belongs on this list.
 
    ```bash
-   git grep -n 'ctx\.ids()\|\.ids()' <old> -- <fsm crate>
-   git grep -n 'ctx\.ids()\|\.ids()' <new> -- <fsm crate>
+   git grep -n 'ctx\.ids()\|\.ids()\|\.next()' <old> -- <fsm crate>
+   git grep -n 'ctx\.ids()\|\.ids()\|\.next()' <new> -- <fsm crate>
    ```
 
-   Compare the counts **per arm**, not per file. The harness captures this
-   as the `ids` surface (`Entry.ids_calls` per position), so a real
-   divergence is a finding; this step is what tells you it is coming before
-   the run, and what names the arm when it arrives.
+   Compare both counts **per arm**, not per file, and keep them apart: how
+   many generators the arm takes, and how many ids it mints from each. A
+   `.next()` hit that is not on an `IdGen` is noise — read the receiver.
+   This step is what tells you either change is coming before the run, and
+   what names the arm when only the second one's side effects arrive.
 2. **Iteration over a `HashMap`/`HashSet` feeding apply output, the image or
    the projection.** `RandomState` is seeded per process, so the order
    differs between two runs of the *same* binary. The `determinism` mode
@@ -479,13 +511,17 @@ is not paperwork — it is what makes attribution mean anything.
 Read: `examples/kv/src/lib.rs`, `examples/kv/src/wire.rs`,
 `examples/kv/src/bin/kv-service.rs`.
 
-- `ctx.ids()`: **no call on either side** — `KvSm::apply` mints no ids, so the
-  ordinal rule cannot bite and `ids_calls` is `0` in the trace above.
+- id minting: **no call of either kind on either side** — `git grep -n
+  'ctx\.ids()\|\.ids()\|\.next()' HEAD -- examples/kv/src` exits 1 (no
+  match), so `KvSm::apply` takes no generator and mints no id: neither the
+  duplicated-series shape nor the shifted-series one can arise, and
+  `ids_calls` is `0` in the trace above.
 - `HashMap`/`HashSet`: **none in code**. `git grep -n 'HashMap\|HashSet' --
-  examples/kv` returns doc-comment lines only
-  (`examples/kv/src/lib.rs:16`, `examples/kv/docs/DESIGN.md:15`, both stating
-  the rule); the state is `Arc<BTreeMap<Bytes, Entry>>` and lists are
-  `Vec<Bytes>`, so `project()` is canonical for free.
+  examples/kv` returns three lines, none of them code: two state the rule
+  (`examples/kv/src/lib.rs:16`, `examples/kv/docs/DESIGN.md:15`) and one is
+  prose about an OrdMap-vs-HashMap benchmark
+  (`examples/kv/docs/DESIGN.md:53`). The state is `Arc<BTreeMap<Bytes,
+  Entry>>` and lists are `Vec<Bytes>`, so `project()` is canonical for free.
 - floats: none.
 - ambient nondeterminism in `apply`: none — no clock, no RNG, no I/O.
 - Appendix A shapes: none reachable; see step 2.
