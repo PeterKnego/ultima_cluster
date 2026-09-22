@@ -977,3 +977,12 @@ The five canonical roles, unchanged. See `docs/agents/triage-labels.md`.
 ### Domain docs
 
 Single-context: one root `CONTEXT.md` plus `docs/adr/`. See `docs/agents/domain.md`.
+
+### Diff-replay judgement
+
+The five judgement steps of the diff-replay loop — draft the intent
+declaration, classify the change against the taxonomy, attribute the report's
+unexplained residue to a hunk, judge the migration delta at the origin, spot
+the determinism hazards a lint cannot — are
+`.claude/skills/diff-replay-judge/SKILL.md`. The harness itself is code and
+decides nothing: `uc2-diffreplay` (`docs/how-to/diff-replay.md`).
