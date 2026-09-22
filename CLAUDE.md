@@ -42,7 +42,8 @@ per-row upgrade how-to, the `diff-replay-judge` skill). Spec
 `docs/superpowers/specs/2026-09-19-uc2-fsm-upgrade-lifecycle-design.md` — read
 its **five** `#### Errata … as built` blocks (B1, B2, B3, C, D) before the
 body, **plus plan A's three inline "as built" paragraphs in §2.3, §4.2 and
-§6.3**, which are not in a block.
+§6.3**, which are not in a block, **plus the deliverable-3 `#### As built`
+block under §11** (#49, after `2.13.0`).
 What a new task must know:
   - **Stop every node before starting any node** (the flag day), and clear
     `snapshots/<row>/` ONCE per node in the window. That wipe needs a durable
@@ -162,19 +163,23 @@ rate-limit note is now measured on both runs: crates.io limits **new crate
 names** hard and new *versions* barely at all, so `2.9.0`'s twelve new
 names took 62 minutes and `2.10.0`'s one took 59 seconds.)
 
-Next up, now that `2.13.0` is tagged and published: (1) **deliverable 3,
-[#49](https://github.com/PeterKnego/ultima_cluster/issues/49)** — the typed
-tier's `bytes_read` length check, small, ships alone, and turns four of the
-five measured silent misparses into the intended fail-stop; (2) **the standing bar
+Deliverable 3, [#49](https://github.com/PeterKnego/ultima_cluster/issues/49),
+is **fixed 2026-09-22 (its own PR off `0b73c32`), unreleased**: `decode_exact` in
+`uc_service/src/traits.rs` makes the typed tier fail-stop on a payload it does
+not consume whole (four of the five measured silent misparses; the
+length-identical reorder still needs the version tag), with no wire, cnc or
+API change — its release bullet lands with the next cut.
+
+Next up, now that `2.13.0` is tagged and published: (1) **the standing bar
 question** — the `2.12.0` gates added two more rate bars an order of magnitude
 below the rig's variance, so four bars across two releases are now unadjudicable
 as written; how to construct a rate bar this rig can actually rule on is a
-maintainer decision, not a run; (3) a feasible **re-run of jumbo row b at the
+maintainer decision, not a run; (2) a feasible **re-run of jumbo row b at the
 29 pairs its own rule calls for** — the 2026-09-13 run judged 12, which is why
-its −3 % is inconclusive rather than a verdict; (4) **row c's soak instrument**,
-which does not exist, so that row stays NOT RUN and jumbo stays a knob; (5) a
+its −3 % is inconclusive rather than a verdict; (3) **row c's soak instrument**,
+which does not exist, so that row stays NOT RUN and jumbo stays a knob; (4) a
 fleet re-run of the time-and-timers rows a/b/e under the paired statistic, and
-of row c under its restated bar; (6) **B-lite's disposition**, still
+of row c under its restated bar; (5) **B-lite's disposition**, still
 undetermined. Two carried-over unknowns, neither blocking: the 58-minute
 `remote_lin` hang of 2026-09-08 is still unexplained (it fails with a name now,
 since `common::join_within` and the 30 s `Reap::drop` landed 2026-09-12), and

@@ -228,7 +228,12 @@ at `pipelined.rs:378-380`).
 
 So what happens to a command when only one FSM answers? Every declared FSM
 applies it, and on the leader every declared FSM publishes a response onto its
-own egress broadcast. The client's slot carries an `expected` bitmask; the
+own egress broadcast. That has a decoding corollary since
+[#49](https://github.com/PeterKnego/ultima_cluster/issues/49): a typed row must
+consume every committed command whole, so N typed rows behind one log share
+one command type (the `uc_lincheck::timer::MixedCmd` pattern) — a row handed a
+sibling's bytes it cannot consume entirely fail-stops rather than decoding a
+valid-but-wrong prefix. The client's slot carries an `expected` bitmask; the
 poll half reads all N rings, and a response arriving on a ring whose bit is
 clear resolves as `Resolve::WrongRing` — dropped and counted, never delivered
 (`engine.rs:792-796`). The siblings' answers are produced and discarded at the

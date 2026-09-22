@@ -348,6 +348,51 @@ pub trait RawStateMachine: Send + 'static {
     }
 }
 
+/// Decode one typed value from an EXACT payload slice, fail-stopping unless
+/// the decoder consumed every byte (#49).
+///
+/// `decode_from_slice` does not require consuming its buffer: a payload whose
+/// encoded prefix parses as `T` decodes successfully and the trailing bytes
+/// vanish in silence — under schema skew that is a command nobody sent,
+/// applied on one replica, i.e. divergence rather than a rejected frame. Every
+/// slice that reaches this function is exact (the log reader slices to the
+/// header's `length`, `Sessioned` strips its envelope, `Timed` forwards
+/// untouched, the query agent strips its epoch prefix), so a length mismatch
+/// is always a misparse, never alignment padding. The length-identical
+/// reorder of two same-typed fields is invisible to any codec-level check
+/// and belongs to the version tag (lifecycle spec §5.1), not here.
+#[inline]
+fn decode_exact<T: serde::de::DeserializeOwned>(bytes: &[u8], what: &str) -> T {
+    let (v, read) =
+        match bincode::serde::decode_from_slice::<T, _>(bytes, bincode::config::standard()) {
+            Ok(ok) => ok,
+            Err(e) => decode_failed(what, &e),
+        };
+    if read != bytes.len() {
+        trailing_bytes(what, read, bytes.len());
+    }
+    v
+}
+
+/// The two fail-stop paths are cold and never inlined, so the hot body of
+/// [`decode_exact`] — and of every apply loop it is inlined into — carries no
+/// message formatting (CLAUDE.md: code in a hot loop's body costs even on
+/// paths that never run).
+#[cold]
+#[inline(never)]
+fn decode_failed(what: &str, e: &bincode::error::DecodeError) -> ! {
+    panic!("corrupt {what} frame (fail-stop): {e}")
+}
+
+#[cold]
+#[inline(never)]
+fn trailing_bytes(what: &str, read: usize, len: usize) -> ! {
+    panic!(
+        "{what} frame has trailing bytes (fail-stop): decoded {read} of {len} — a \
+         schema-skewed or corrupt payload whose prefix parsed as the target type"
+    )
+}
+
 /// Every typed state machine is a raw one: decode with bincode-standard,
 /// apply, encode the response with bincode-standard — exactly the codec the
 /// framework used through v2.5.0, so the wire is byte-identical.
@@ -357,18 +402,14 @@ impl<S: StateMachine> RawStateMachine for S {
 
     #[inline]
     fn apply(&mut self, ctx: &mut ApplyCtx, cmd: &[u8], out: &mut Vec<u8>) {
-        let (cmd, _) =
-            bincode::serde::decode_from_slice::<S::Command, _>(cmd, bincode::config::standard())
-                .expect("corrupt committed frame (fail-stop)");
+        let cmd = decode_exact::<S::Command>(cmd, "committed");
         let resp = StateMachine::apply(self, ctx, cmd);
         bincode::serde::encode_into_std_write(&resp, out, bincode::config::standard())
             .expect("response bincode-encode (fail-stop)");
     }
     #[inline]
     fn query(&self, q: &[u8], out: &mut Vec<u8>) {
-        let (q, _) =
-            bincode::serde::decode_from_slice::<S::Query, _>(q, bincode::config::standard())
-                .expect("corrupt query frame (fail-stop)");
+        let q = decode_exact::<S::Query>(q, "query");
         let qr = StateMachine::query(self, q);
         bincode::serde::encode_into_std_write(&qr, out, bincode::config::standard())
             .expect("query-response bincode-encode (fail-stop)");
@@ -529,9 +570,7 @@ pub struct TypedOutput<O>(pub O);
 
 impl<S: StateMachine, O: OutputHandler<S>> RawOutputHandler<S> for TypedOutput<O> {
     async fn on_committed(&self, position: u64, cmd: &[u8], state: &S) -> Result<(), OutputError> {
-        let (cmd, _) =
-            bincode::serde::decode_from_slice::<S::Command, _>(cmd, bincode::config::standard())
-                .expect("corrupt committed frame (fail-stop)");
+        let cmd = decode_exact::<S::Command>(cmd, "on_committed");
         self.0.on_committed(position, &cmd, state).await
     }
 }

@@ -219,6 +219,10 @@ fn a_uc_prefixed_fsm_name_is_reserved_and_refused_by_name() {
 #[derive(Serialize, Deserialize)]
 pub enum Cmd {
     Add(u64),
+    /// `Add` with explicit ballast, for the size-arithmetic tests below: the
+    /// typed tier fail-stops on a payload it does not consume whole (#49), so
+    /// a frame of a chosen size must ENCODE to that size, never be zero-padded.
+    AddPadded(u64, Vec<u8>),
 }
 
 #[derive(Default)]
@@ -234,7 +238,9 @@ impl StateMachine for CountSm {
     type Query = ();
     type QueryResponse = u64;
     fn apply(&mut self, ctx: &mut ApplyCtx, cmd: Cmd) -> u64 {
-        let Cmd::Add(n) = cmd;
+        let n = match cmd {
+            Cmd::Add(n) | Cmd::AddPadded(n, _) => n,
+        };
         self.total += n;
         self.last = Some(ctx.position);
         self.total
@@ -752,14 +758,18 @@ fn q_a_follower_quorum_with_absent_fsms_stalls_commit_at_the_bound() {
     wait_until("leader serving again", || serving(&nodes[leader]));
     let leader_node = nodes[leader].as_ref().unwrap();
     // 2000 × 64 B payloads ≈ 200 KiB of frames through the leader's own door
-    // (256 KiB admission window, no FSM term). A valid `bincode`-encoded
-    // `Cmd::Add(1)` padded to 64 B with trailing zeros: `decode_from_slice`
-    // only consumes what the type needs and ignores the rest, so this both
-    // decodes cleanly once the FSMs attach below AND matches the frame-size
-    // arithmetic the assertions below assume.
-    let mut payload =
-        bincode::serde::encode_to_vec(Cmd::Add(1), bincode::config::standard()).unwrap();
-    payload.resize(64, 0);
+    // (256 KiB admission window, no FSM term). The 64 B is real encoded
+    // length — variant tag ‖ varint(1) ‖ varint(len) ‖ 61 bytes of ballast —
+    // because the typed tier fail-stops on trailing bytes (#49); a zero-padded
+    // `Cmd::Add(1)` would panic every apply thread once the FSMs attach below.
+    let payload =
+        bincode::serde::encode_to_vec(Cmd::AddPadded(1, vec![0; 61]), bincode::config::standard())
+            .unwrap();
+    assert_eq!(
+        payload.len(),
+        64,
+        "the frame-size arithmetic below assumes 64 B payloads"
+    );
     let mut sent = 0;
     while sent < 2000 {
         match leader_node.submit(payload.clone()) {
