@@ -1680,6 +1680,43 @@ re-derived for SBE.
 
 Ships alone. Trace `Sessioned`/`Timed` inner-slice exactness first.
 
+#### As built (deliverable 3, 2026-09-22)
+
+- **The trace came out clean.** Every slice that reaches the typed decoder
+  is exact, so the length check cannot fire on a correct frame: the apply
+  agent passes the payload `uc_log/src/reader.rs:150` sliced to the header's
+  `length`; the replay walk slices the same way
+  (`uc_service/src/replay.rs:484`); `Sessioned::apply` strips its 16-byte
+  envelope and hands down `&cmd[SESSION_HEADER_LEN..]`, the exact remainder,
+  and its `query` forwards untouched; `Timed` forwards `apply` and `query`
+  untouched; the query agent strips its 8-byte epoch prefix from a
+  length-prefixed ring record (`uc_service/src/apply.rs:1102`); the output
+  agent passes the same committed payload to `on_committed`.
+- **One private helper, three call sites.** `decode_exact::<T>(bytes, what)`
+  in `uc_service/src/traits.rs` decodes with bincode-standard and then
+  `assert_eq!(read, bytes.len())`; the blanket `apply`, the blanket `query`
+  and `TypedOutput::on_committed` route through it. A decode error and a
+  length mismatch both panic — the fail-stop the `.expect` always intended.
+  The query site is included for symmetry; that a malformed client query
+  fail-stops the service is a pre-existing property this change neither
+  widens nor narrows.
+- **Tests:** `uc_service/tests/typed_decode_exact.rs`, six — trailing byte
+  through `apply`, `query` and `on_committed`; a `Sessioned` pair (exact body
+  applies, over-long body fail-stops) pinning the trace; and Appendix A's
+  worst row reproduced in-tree: an old `Put(11, 22)` read by an enum with a
+  variant inserted mid-enum, which the pre-fix tree applied as `Get(11)` (the
+  test reached that assertion with the check absent) and now fail-stops.
+- **One in-tree consumer of the defect existed.** `uc_node/tests/services.rs`
+  zero-padded a `bincode` `Cmd::Add(1)` to 64 B and said in its comment that
+  the decoder "ignores the rest"; it now sends `Cmd::AddPadded(u64, Vec<u8>)`,
+  which encodes to exactly 64 B. No harness or example relied on the trick.
+- **Not fixed here, as §9.1 says:** the length-identical reorder of two
+  same-typed fields, which only the version tag ahead of the payload (§5.1,
+  deliverable 2) can see.
+- No wire, cnc or API surface changes. The behaviour change is the intended
+  one — a payload with trailing bytes that used to apply now fail-stops — and
+  with no deployments there is no migration.
+
 ### Not scheduled
 
 Track 2 ([#33] / [#31]) — separate spec.
