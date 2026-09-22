@@ -16,6 +16,20 @@ subcommand — see `examples/kv/src/bin/kv-service.rs`. `uc_lincheck/src/bin/
 register-replay.rs` (built behind the `uc_lincheck` `replay-bin` feature) is
 the harness's own end-to-end fixture, over `RegisterSm`.
 
+## Installing
+
+`uc2-diffreplay` is **not** in the release tarball or the container image.
+Install it from crates.io once `2.13.0` is published:
+
+    cargo install uc_diffreplay
+
+or build it from a checkout of this repository:
+
+    cargo build -p uc_diffreplay      # target/<profile>/uc2-diffreplay
+
+An application's own CI is the intended caller, which is why this ships as a
+published crate rather than a tarball binary.
+
 ## CLI contract for app binaries
 
 `uc2-diffreplay` shells out to the app's own binary rather than linking

@@ -18,6 +18,14 @@ evidence about it: probe-query answers (the projection is the state view
 instead). `uc_diffreplay/README.md` § "What this does not compare" is the
 standing statement.
 
+**Getting `uc2-diffreplay`.** It is **not** in the release tarball or the
+container image — those carry `uc2-node`, `uc2ctl`, `uc2-gateway` and the
+counter example only. Install it from crates.io once `2.13.0` is published
+(`cargo install uc_diffreplay`), or build it from a checkout
+(`cargo build -p uc_diffreplay`, giving `target/<profile>/uc2-diffreplay`).
+An application's own CI is the intended caller, which is why it ships as a
+crate rather than a tarball binary.
+
 ## 1. Make your service binary replayable
 
 Add `replay` and `project` subcommands that call

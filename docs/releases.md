@@ -7,7 +7,10 @@
 **One flag day: wire `0.8.0` → `0.9.0` and cnc `3.2` → `3.3`, plus a row
 artifact envelope change (`ULTSNAP2`) that costs one wipe of
 `snapshots/<row>/` per node.** Baseline: the tagged `v2.12.0` (wire `0.8.0`,
-cnc `3.2`). The work is six plan branches and two hotfixes; the five plan
+cnc `3.2`). The work is six plan branches and two hotfixes — plus the dogfood
+deliverables, which merged to `main` on 2026-09-18, after the `v2.12.0` tag, and
+therefore ship here too (see [The dogfood deliverables](#the-dogfood-deliverables-merged-before-this-branch)
+below). The five plan
 branches that carry code, and both hotfixes, landed in this order, and plan D
 (this writeup) follows them — **A**
 [#50](https://github.com/PeterKnego/ultima_cluster/pull/50) (the diff-replay
@@ -344,6 +347,62 @@ measured silent misparses into the intended fail-stop — is **not shipped**.
 sites. The standard and the taxonomy say so explicitly rather than describing
 the check as available.
 
+### The dogfood deliverables (merged before this branch)
+
+The six plan branches above are the *platform* half of `2.13.0`. The other half
+merged to `main` on 2026-09-18 — after the `v2.12.0` tag, so it ships in this
+release — and is the work that motivated them: the clean-room dogfood run as
+wayfinder map [#16](https://github.com/PeterKnego/ultima_cluster/issues/16),
+whose charter is
+[`2026-09-13-uc2-dogfood-kv-charter.md`](superpowers/specs/2026-09-13-uc2-dogfood-kv-charter.md).
+Two agents worked from the published `2.12.0` material only, in sandboxes that
+could not read this repository: a **builder** given the docs, rustdoc and
+`examples/counter` and asked to build a real service, and an **operator** given
+bare Linux hosts, the release tarball and the builder's binaries and asked to
+run a cluster through outcome-shaped cards with the faults injected blind. Four
+things landed from it.
+
+- **[`examples/kv`](../examples/kv), a replicated key-value store**, merged
+  in-tree as a workspace example (`70fa2d1`, review nits `78cee00`). It is the
+  first *user-facing* shipped example that implements `SnapshotStateMachine`
+  and wraps itself in `Sessioned`, and it ships in **two shapes** — a v1
+  (put/get/delete/CAS) and a v2 that adds list-valued keys and bumps `VERSION`,
+  with v2 able to read a v1 image. That second shape is why the upgrade story
+  has a worked subject at all, and it is the corpus `uc_diffreplay`'s own
+  regression tests and plan C's `pin-verify` run against.
+- **A lifecycle tutorial**,
+  [Build an application](tutorials/build-an-application.md) — design → build →
+  test → package → deploy → operate → upgrade, walked once end to end with the
+  KV store as the worked example and linking out to the how-to for each stop.
+  It is `docs/reference/application-sdlc.md` walked rather than stated, which is
+  what turned the documentation set from per-milestone gate docs into a
+  lifecycle.
+- **Two experience reports**, the honest account rather than the tidy one:
+  [builder](notes/uc2-dogfood-kv-builder-report.md) (the v1 store built in a
+  single 28-minute clean-room session with zero maintainer interventions, 22
+  ledger items) and
+  [operator](notes/uc2-dogfood-kv-operator-report.md) (seven cards across three
+  sessions on a real 3-voter + 1-observer AWS fleet, all seven passed, 49 ledger
+  items). Both carry their accepted limits as accepted limits.
+- **Reference and how-to fixes plus product tickets.** Every ledger item was
+  resolved into one of four outcomes — a doc fix on `main`, a fix carried by the
+  deliverables, an accepted limit written into the report, or a product ticket
+  (**#33–#42**). The gate doc
+  [`uc2-dogfood-kv-gate-2026-09-15.md`](benchmarks/uc2-dogfood-kv-gate-2026-09-15.md)
+  pre-committed every bar before any run, in the honest-failure protocol this
+  repo has used since M7: rows `B5-builder` and `B5-operator` are **PASS** at
+  100 % resolution (22 and 49 items), and `B2-v1.iii` is an honest **FAIL**
+  traced to product defect
+  [#32](https://github.com/PeterKnego/ultima_cluster/issues/32) with the bar
+  kept.
+
+The sharpest friction the two ledgers named is the one the rest of this release
+closes: operator item **L45** — card 7, the application upgrade, was passable
+only from the *application author's own README paragraph*, because no platform
+application-upgrade page existed — and **L47**, that a new version's attach
+silently rewrote the pre-upgrade artifact in place, so the rollback point the
+README assumed could not survive on-node. Plans A–D are the answer to both.
+
 ### Fixed on the way
 
 - **An apply overrun could replay forever, in silence** (pre-existing, found by
@@ -398,7 +457,7 @@ this plan's own final task runs on the release-prep head.
 | `docs.yml` (rustdoc, link check) | on the release-prep head | pending — filled at tag time |
 | `release.yml` dry run (build ×2, SBOM, `release-smoke`; no signing, no publish) | `workflow_dispatch` with `dry_run: true`, `cut-a-release.md` §2 | pending — filled at tag time |
 | `release.yml` on the tag (release, image, cosign) | run on tag `v2.13.0` | pending — filled at tag time |
-| the local proof stack: `cargo fmt --all -- --check`, seven `clippy` invocations (workspace; the four feature-gated crates `uc_crashtest`/`uc_lincheck`/`uc_service`/`uc_gateway`; `uc_diffreplay --no-default-features`; **and the MSRV gate**, `cargo +1.89.0 clippy --workspace --all-targets --locked`), the three fixture builds (`register-replay`, `uc_diffreplay`, `kv_store`), `cargo test --workspace`, `cargo test -p uc_diffreplay --test pin_verify`, `lin_v2`, the hard-crash suite, `cargo +nightly fuzz build`, `scripts/check_doc_links.py` | this plan's final task, on the release-prep head `4c680a4` | **green locally** — fmt and all seven clippy invocations clean; `cargo test --workspace` 139 `test result: ok` lines, 0 failed; `pin_verify` 5 passed; `lin_v2` 15 passed; the hard-crash suite 8 suites green (three `uc2-apply` fail-stop panics are the SIGKILL/restart harness's own contract, not failures — `remote_lin_envelope_on`/`_off` both passed, no flake hit); `cargo +nightly fuzz build` clean apart from the four known pre-existing `uc_gateway` deprecation warnings; `check_doc_links.py` 1250 links, 0 errors, 28 known md-tui-only warnings — a dev box, and not the whole `docs/VERIFICATION.md` surface |
+| the local proof stack: `cargo fmt --all -- --check`, seven `clippy` invocations (workspace; the four feature-gated crates `uc_crashtest`/`uc_lincheck`/`uc_service`/`uc_gateway`; `uc_diffreplay --no-default-features`; **and the MSRV gate**, `cargo +1.89.0 clippy --workspace --all-targets --locked`), the three fixture builds (`register-replay`, `uc_diffreplay`, `kv_store`), `cargo test --workspace`, `cargo test -p uc_diffreplay --test pin_verify`, `lin_v2`, the hard-crash suite, `cargo +nightly fuzz build`, `scripts/check_doc_links.py` | this plan's final task, on the release-prep head (run at `4c680a4`; the only later delta on the branch is `fuzz/Cargo.lock`, outside the workspace) | **green locally** — fmt and all seven clippy invocations clean; `cargo test --workspace` 139 `test result: ok` lines, 0 failed; `pin_verify` 5 passed; `lin_v2` 15 passed; the hard-crash suite 8 suites green (three `uc2-apply` fail-stop panics are the SIGKILL/restart harness's own contract, not failures — `remote_lin_envelope_on`/`_off` both passed, no flake hit); `cargo +nightly fuzz build` clean apart from the four known pre-existing `uc_gateway` deprecation warnings; `check_doc_links.py` 1250 links, 0 errors, 28 known md-tui-only warnings — a dev box, and not the whole `docs/VERIFICATION.md` surface |
 | `publish-check`'s batched `cargo package --no-verify` over the **fourteen** publishable crates, and `scripts/check_publish_metadata.sh` | run locally with `uc_diffreplay` in the batch, both before the bump and again in this task's run on `4c680a4` after it | ok — fourteen `Packaged` lines each time, metadata within crates.io limits |
 | the rest of the proof surface (`docs/VERIFICATION.md`): Elle, loom, Lean + conformance, fuzz smoke | no whole-tree release pass yet — the release procedure's own step | pending |
 | fleet gate | none — no rate bar was set for this release | **n/a**, stated rather than omitted |

@@ -157,7 +157,7 @@ Refused by name, with the reason code the CLI prints:
 |---|---|---|
 | 52 | `pin_row_undeclared` | `--row R` names a row this node does not declare in `[services] names`. Check the row number against `node.toml` |
 | 53 | `pin_from_mismatch` | `--from` is not the row's current version — its newest pin's `to`, or, with no pin yet, the version the service is attached at. A stale `--from` usually means another pin already landed since it was read; re-read `uc2ctl status` and re-run |
-| 54 | `pin_no_set` | no **complete** snapshot set at `--origin` on this node. Go back to step 2: run `uc2ctl snapshot`, wait for `uc2_snapshot_set_position` (or `uc2ctl snapshot show`'s `set=`) to reach it, and pin THAT position |
+| 54 | `pin_no_set` | `--origin` is not this node's **newest** complete snapshot set (an older set still on disk is refused too). Go back to step 2: run `uc2ctl snapshot`, wait for `uc2_snapshot_set_position` (or `uc2ctl snapshot show`'s `set=`) to reach it, and pin THAT position |
 | 55 | `pin_not_monotone` | `--origin` is not above the row's current pin. A pin only ever moves a row's origin forward — there is no way to point one backwards |
 | 56 | `pin_digest` | the staged pin file's digest is not the one the request signed: a different file was staged than was signed, or it changed in between. Re-run `upgrade pin` |
 | 57 | `pin_missing` | no staged pin file on this node. Either `upgrade pin` was run against a different instance directory, or a successful apply already consumed it |

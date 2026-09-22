@@ -40,10 +40,11 @@ exists — check that first. Step by step:
 
 **One new operating rule that is not on the wire:** a service or a client now
 attaches only once its node has **joined its cluster** — knows a leader, has
-learned a commit, and has applied the committed cluster state up to it. So a
-process or script that brings up several nodes must **start every node before
-attaching any service**, and boot-time readings change (`uc_services_declared`
-reads `0`, with no per-FSM rows, until the node has joined).
+learned a commit, and its cluster FSM's walk cursor has **consumed** the log up
+to that commit. So a process or script that brings up several nodes must
+**start every node before attaching any service**, and boot-time readings
+change (`uc_services_declared` reads `0`, with no per-FSM rows, until the
+node has joined).
 
 - **Upgrade pins: an upgrade names its origin, and the record is replicated.**
   `uc2ctl upgrade pin --row <R> --to <VER> --origin <P> [--from <VER>]` puts an

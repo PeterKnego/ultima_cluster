@@ -463,6 +463,20 @@ the typed (bincode) tier's, and whose interim length check is filed as #49 and
 not shipped — do not reach it. Digit: the severe axis-P rows make this a
 **major** bump, which is what `KV_VERSION = 2.0.0` is.
 
+### Step 3 — attribute, on a real report
+
+The only non-`Pass` finding this tree can produce is the `Absent` above, and
+step 3's residue is `Unexplained`, which needs two builds. What the step was
+exercised on is therefore the finding vocabulary itself, from
+`uc_diffreplay/src/confirm.rs`: the two `Unexplained` notes are `no touched
+arm explains this` and `position dispatched by one build only (only_in_a)` /
+`(only_in_b)`; `Undeclared` reads `observed and attributed, but not
+declared`; `Absent` reads `declared but not observed: <the note>` — confirmed
+verbatim in the run above. Worth noting for a real v1→v2 run on this corpus:
+the shipped declaration has `[touched] arms = []`, so **every** divergence
+would arrive `Unexplained` by construction. Drafting the touched set (step 1)
+is not paperwork — it is what makes attribution mean anything.
+
 ### Step 4 — judge the migration, on the code alone
 
 No two-build run exists here, so there is no `projection_origin` diff to read;
@@ -491,20 +505,6 @@ key=62 version=96 shape=value bytes=32  session client=1 seq=Some(2)
 session client=1 seq=Some(1)
          (at the origin, 192)                      (at the end)
 ```
-
-### Step 3 — attribute, on a real report
-
-The only non-`Pass` finding this tree can produce is the `Absent` above, and
-step 3's residue is `Unexplained`, which needs two builds. What the step was
-exercised on is therefore the finding vocabulary itself, from
-`uc_diffreplay/src/confirm.rs`: the two `Unexplained` notes are `no touched
-arm explains this` and `position dispatched by one build only (only_in_a)` /
-`(only_in_b)`; `Undeclared` reads `observed and attributed, but not
-declared`; `Absent` reads `declared but not observed: <the note>` — confirmed
-verbatim in the run above. Worth noting for a real v1→v2 run on this corpus:
-the shipped declaration has `[touched] arms = []`, so **every** divergence
-would arrive `Unexplained` by construction. Drafting the touched set (step 1)
-is not paperwork — it is what makes attribution mean anything.
 
 ### Step 5 — hazards, on the code alone
 

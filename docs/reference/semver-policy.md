@@ -204,7 +204,8 @@ Also outside the promise:
   `uc_protocol/uc-bench-probes`, `uc_journal/bench-support`,
   `uc_node/mutation-testing` and `uc_consensus/mutation-testing`.
 - **`uc_sim`, `uc_lincheck`, `examples/counter`, `examples/kv`,
-  `testing/uc_crashtest`.** These are `publish = false`: the proof and teaching
+  `examples/uc_adjudicate`, `testing/uc_crashtest`** — six. These are
+  `publish = false`: the proof and teaching
   apparatus, not the product. Nothing in them is API, and they are not on
   crates.io. (`uc_diffreplay` is **not** in this list — it is the fourteenth
   published crate, because an application's own CI runs its driver.)

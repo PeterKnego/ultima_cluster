@@ -103,6 +103,28 @@ documentation for what it changes, because the tag is what people read.
       statistic, and row h's standby arm did not complete (an
       operating-envelope question, with four passing deterministic tests
       behind the mechanism).
+      For **`v2.13.0`** the shape is `v2.9.0`'s again, plus the two items no
+      grep finds. Retire: the two `<tag date>` headings (`RELEASES.md`,
+      `docs/releases.md`), each flagged by a `<!-- tag date: fill at tag time
+      -->` comment on the line below it; and the
+      `<!-- PENDING: tag-time evidence rows above -->` block at the end of
+      `docs/releases.md`'s `2.13.0` entry, together with the evidence rows it
+      flags — `ci.yml`, `docs.yml`, the `release.yml` dry run and the tag run,
+      artifact integrity and provenance, the release quickstart from the
+      tarball, and crates.io (**fourteen** crates; `uc_diffreplay` is a new
+      NAME, so budget for the new-name rate limit) — each of which reads
+      `pending` until the run it names exists.
+      `grep -rn "tag date\|PENDING:" RELEASES.md docs/releases.md` finds those
+      greppable ones. The two it does NOT find are named here for that reason:
+      **`SECURITY.md`'s supported-versions line**, which the release-prep sweep
+      already moved to `2.13.x` supported / `< 2.12` not (confirm rather than
+      edit it), and the **fuzz corpus prune** above, which is a working-tree
+      cleanliness check, not a grep. Two things this release leaves
+      deliberately open: no fleet gate was run or planned (stated as a row in
+      both writeups rather than omitted), and
+      [#49](https://github.com/PeterKnego/ultima_cluster/issues/49), the typed
+      tier's `bytes_read` length check, is claimed nowhere — do not quietly
+      close either.
 
 ## 2. Check the version the way the workflow will
 
@@ -273,8 +295,8 @@ dependency resolution reads the index. Modern cargo blocks on this for you;
 if a publish fails with "no matching package named …", the previous one has
 not indexed yet, so wait and re-run just that one.
 
-`uc_sim`, `uc_lincheck`, `counter`, `kv_store` and `uc_crashtest` are
-`publish = false`: they are the proof and teaching apparatus, not the product.
+`uc_sim`, `uc_lincheck`, `counter`, `kv_store`, `uc_adjudicate` and
+`uc_crashtest` — six — are `publish = false`: they are the proof and teaching apparatus, not the product.
 `uc_lincheck` stays in that list even though the dependency now runs both ways:
 it takes `uc_diffreplay` as an *optional* dependency behind its `replay-bin`
 fixture feature, and `uc_diffreplay` takes `uc_lincheck` as an unversioned
