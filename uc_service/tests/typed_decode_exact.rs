@@ -12,7 +12,7 @@
 //! `Sessioned` pair below pins that.
 use uc_service::{
     ApplyCtx, OutputError, OutputHandler, RawOutputHandler, RawStateMachine, SessionConfig,
-    Sessioned, StateMachine, TypedOutput,
+    Sessioned, StateMachine, Timed, TypedOutput,
 };
 
 fn enc<T: serde::Serialize>(v: &T) -> Vec<u8> {
@@ -195,4 +195,84 @@ fn inserted_variant_fail_stops_instead_of_applying_a_command_nobody_sent() {
     );
     // Reached only while the defect is present: the misparse the issue measured.
     assert_eq!(sm.applied, vec![NewKv::Get(11)]);
+}
+
+/// The `Timed` leg of the trace: the wrapper forwards the slice untouched, so
+/// an exact payload applies through it and an over-long one fail-stops.
+#[test]
+fn timed_exact_body_applies_through_the_wrapper() {
+    let mut t = Timed::new(Counter::default());
+    let mut out = Vec::new();
+    t.apply(
+        &mut ApplyCtx::new(64, <Timed<Counter> as RawStateMachine>::IDENTITY),
+        &enc(&Cmd::Add(5)),
+        &mut out,
+    );
+    assert_eq!(out, enc(&5i64));
+}
+
+#[test]
+#[should_panic(expected = "trailing bytes")]
+fn timed_overlong_body_fail_stops() {
+    let mut t = Timed::new(Counter::default());
+    let mut body = enc(&Cmd::Add(5));
+    body.push(0xEE);
+    let mut out = Vec::new();
+    t.apply(
+        &mut ApplyCtx::new(64, <Timed<Counter> as RawStateMachine>::IDENTITY),
+        &body,
+        &mut out,
+    );
+}
+
+/// The `read == 0` shape: a command type that consumes nothing. Any
+/// non-empty payload is trailing bytes for it — the shape that felled the two
+/// `type Command = ()` gate harnesses, which used to submit zero-filled
+/// blocks as ballast.
+#[derive(Default)]
+struct Unit {
+    n: u64,
+    last: Option<u64>,
+}
+impl StateMachine for Unit {
+    const NAME: &'static str = "unit";
+
+    type Command = ();
+    type Response = ();
+    type Query = ();
+    type QueryResponse = ();
+    fn apply(&mut self, ctx: &mut ApplyCtx, _cmd: ()) {
+        self.n += 1;
+        self.last = Some(ctx.position);
+    }
+    fn query(&self, _q: ()) {}
+    fn last_applied(&self) -> Option<u64> {
+        self.last
+    }
+}
+
+#[test]
+fn unit_command_applies_an_empty_payload() {
+    let mut sm = Unit::default();
+    let mut out = Vec::new();
+    RawStateMachine::apply(
+        &mut sm,
+        &mut ApplyCtx::new(32, Unit::IDENTITY),
+        &[],
+        &mut out,
+    );
+    assert_eq!(sm.n, 1);
+}
+
+#[test]
+#[should_panic(expected = "decoded 0 of 1")]
+fn unit_command_fail_stops_on_any_byte_at_all() {
+    let mut sm = Unit::default();
+    let mut out = Vec::new();
+    RawStateMachine::apply(
+        &mut sm,
+        &mut ApplyCtx::new(32, Unit::IDENTITY),
+        &[0],
+        &mut out,
+    );
 }

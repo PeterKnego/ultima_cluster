@@ -250,6 +250,19 @@ impl Verdict {
 
 // --------------------------------------------------------- no-op state machine
 
+/// A committed payload of exactly `n` bytes that a `Command = Vec<u8>` state
+/// machine decodes WHOLE: bincode-standard `Vec<u8>` is a 1-byte length
+/// varint (for `n - 1 < 251`) followed by the bytes. The typed tier fail-stops
+/// on a payload it does not consume entirely (#49), so a zero-filled block
+/// handed to a `()` command — what these harnesses sent before — panics every
+/// apply thread; the frame-size arithmetic the rows assume needs the encoded
+/// length to be `n`, not the ballast length.
+fn ballast(n: usize) -> Vec<u8> {
+    let v = bincode::serde::encode_to_vec(vec![0u8; n - 1], bincode::config::standard()).unwrap();
+    assert_eq!(v.len(), n, "ballast({n}) must encode to exactly {n} bytes");
+    v
+}
+
 /// Trivial state machine so a cluster's nodes have an attached service —
 /// `/readyz` checks `service_heartbeat_ns` staleness, and that field is only
 /// ever stamped by `uc_service`'s apply agent (`uc_service/src/apply.rs`).
@@ -259,11 +272,11 @@ impl Verdict {
 struct NoopSm;
 impl StateMachine for NoopSm {
     const NAME: &'static str = "noop";
-    type Command = ();
+    type Command = Vec<u8>;
     type Response = ();
     type Query = ();
     type QueryResponse = ();
-    fn apply(&mut self, _ctx: &mut ApplyCtx, _cmd: ()) {}
+    fn apply(&mut self, _ctx: &mut ApplyCtx, _cmd: Vec<u8>) {}
     fn query(&self, _q: ()) {}
     fn last_applied(&self) -> Option<u64> {
         None
@@ -293,7 +306,7 @@ fn run_coverage(scratch_root: &Path) -> Verdict {
     // a coverage check that never touches the cluster could pass on a
     // family whose *rendering* is broken but whose zero value looks fine.
     for _ in 0..500 {
-        let _ = nodes[leader_idx].n().submit(vec![0u8; 64]);
+        let _ = nodes[leader_idx].n().submit(ballast(64));
     }
     thread::sleep(Duration::from_millis(300));
 
@@ -371,7 +384,7 @@ fn run_probes(scratch_root: &Path) -> Verdict {
 
     // A little load before the kill, so the cluster isn't idle when it happens.
     for _ in 0..200 {
-        let _ = nodes[leader_idx].n().submit(vec![0u8; 64]);
+        let _ = nodes[leader_idx].n().submit(ballast(64));
     }
     thread::sleep(Duration::from_millis(100));
 
@@ -405,7 +418,7 @@ fn run_probes(scratch_root: &Path) -> Verdict {
         for (k, &i) in survivors.iter().enumerate() {
             // Modest load: keep submitting through the transition. Harmless
             // no-op (Err(NotServing)) on whichever survivor isn't leader yet.
-            let _ = nodes[i].n().submit(vec![0u8; 64]);
+            let _ = nodes[i].n().submit(ballast(64));
 
             let addr = nodes[i].obs_addr();
             let status = get_status(addr, "/readyz");
@@ -502,7 +515,7 @@ fn commit_rate_window(nodes: &[NodeH], leader_idx: usize, secs: u64, scrape_on: 
     let deadline = Instant::now() + Duration::from_secs(secs);
     let mut next_scrape = Instant::now();
     while Instant::now() < deadline {
-        let _ = nodes[leader_idx].n().submit(vec![0u8; 128]);
+        let _ = nodes[leader_idx].n().submit(ballast(128));
         if scrape_on && Instant::now() >= next_scrape {
             for n in nodes {
                 let _ = scrape(n.obs_addr());

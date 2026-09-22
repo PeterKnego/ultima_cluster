@@ -556,14 +556,27 @@ fn scenario_leader_not_serving() -> (SeriesFile, Disclosure) {
 
 // ------------------------------------------------------------ scenario 4
 
+/// A committed payload of exactly `n` bytes that a `Command = Vec<u8>` state
+/// machine decodes WHOLE: bincode-standard `Vec<u8>` is a 1-byte length
+/// varint (for `n - 1 < 251`) followed by the bytes. The typed tier fail-stops
+/// on a payload it does not consume entirely (#49), so a zero-filled block
+/// handed to a `()` command — what these harnesses sent before — panics every
+/// apply thread; the frame-size arithmetic the rows assume needs the encoded
+/// length to be `n`, not the ballast length.
+fn ballast(n: usize) -> Vec<u8> {
+    let v = bincode::serde::encode_to_vec(vec![0u8; n - 1], bincode::config::standard()).unwrap();
+    assert_eq!(v.len(), n, "ballast({n}) must encode to exactly {n} bytes");
+    v
+}
+
 struct NoopSm;
 impl StateMachine for NoopSm {
     const NAME: &'static str = "noop";
-    type Command = ();
+    type Command = Vec<u8>;
     type Response = ();
     type Query = ();
     type QueryResponse = ();
-    fn apply(&mut self, _ctx: &mut ApplyCtx, _cmd: ()) {}
+    fn apply(&mut self, _ctx: &mut ApplyCtx, _cmd: Vec<u8>) {}
     fn query(&self, _q: ()) {}
     fn last_applied(&self) -> Option<u64> {
         None
@@ -651,7 +664,7 @@ fn scenario_leader_isolated(scratch_root: &Path) -> (SeriesFile, Disclosure) {
     for _ in 0..12 {
         let round_deadline = Instant::now() + Duration::from_millis(450);
         while Instant::now() < round_deadline {
-            let _ = nodes[leader_idx].n().submit(vec![0u8; 64]);
+            let _ = nodes[leader_idx].n().submit(ballast(64));
         }
         sf.record_round(&instance, &scrape(addr), &families);
         thread::sleep(Duration::from_millis(50));
@@ -807,7 +820,7 @@ fn scenario_follower_partitioned(scratch_root: &Path) -> (SeriesFile, Disclosure
     sf.record_round(&instance, &scrape(addr), &families); // baseline: lag == 0
     for _ in 0..10 {
         for _ in 0..40 {
-            let _ = nodes[leader_idx].n().submit(vec![0u8; 200]);
+            let _ = nodes[leader_idx].n().submit(ballast(200));
             thread::sleep(Duration::from_micros(500));
         }
         sf.record_round(&instance, &scrape(addr), &families);
@@ -1088,11 +1101,11 @@ fn scenario_service_absent(scratch_root: &Path) -> (SeriesFile, Disclosure) {
 struct SlowSm;
 impl StateMachine for SlowSm {
     const NAME: &'static str = "slow";
-    type Command = ();
+    type Command = Vec<u8>;
     type Response = ();
     type Query = ();
     type QueryResponse = ();
-    fn apply(&mut self, _ctx: &mut ApplyCtx, _cmd: ()) {
+    fn apply(&mut self, _ctx: &mut ApplyCtx, _cmd: Vec<u8>) {
         thread::sleep(Duration::from_millis(20));
     }
     fn query(&self, _q: ()) {}
@@ -1193,7 +1206,7 @@ fn scenario_fsm_pinned(scratch_root: &Path) -> (SeriesFile, Disclosure) {
         //    trip and the door reopens mid-request.
         let deadline = Instant::now() + Duration::from_secs(30);
         let body = loop {
-            while nodes[0].n().submit(vec![0u8; PINNED_PAYLOAD]).is_ok() {
+            while nodes[0].n().submit(ballast(PINNED_PAYLOAD)).is_ok() {
                 assert!(Instant::now() < deadline, "FSM door never shut under load");
                 thread::sleep(Duration::from_millis(1));
             }
@@ -1206,7 +1219,7 @@ fn scenario_fsm_pinned(scratch_root: &Path) -> (SeriesFile, Disclosure) {
             // A refused submit right after the scrape says the door was shut
             // across it — and a `Full` probe appends nothing.
             let still_pinned = matches!(
-                nodes[0].n().submit(vec![0u8; PINNED_PAYLOAD]),
+                nodes[0].n().submit(ballast(PINNED_PAYLOAD)),
                 Err(uc_node::SubmitError::Full)
             );
             if still_pinned && commit_at_append_head(&body) {
