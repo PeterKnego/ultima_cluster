@@ -469,14 +469,19 @@ reviewer wants a workload to attack.
   Only the `--lib --bins` form of that run is in the proof stack today.
   Found by plan C T2, cause and fix corrected by plan C's final review,
   recorded 2026-09-21.
-- **Plan D carries: `docs/how-to/upgrade-an-application.md` still describes
-  the 2.12.0 flag day, with no step structure.** The page an operator lands
-  on from `RELEASES.md` still walks a stop-everything flag day; the pinned
-  upgrade the 2.13.0 lifecycle work ships needs it rewritten around the S4
+- ~~**Plan D carries: `docs/how-to/upgrade-an-application.md` still describes
+  the 2.12.0 flag day, with no step structure.**~~ — **DONE 2026-09-22 (plan
+  D, T2).** The page an operator lands
+  on from `RELEASES.md` still walked a stop-everything flag day; the pinned
+  upgrade the 2.13.0 lifecycle work ships needed it rewritten around the S4
   sequence — the `uc2-diffreplay pin-verify` rehearsal (already linked from
   its preamble), the live `/metrics` check, and `uc2ctl upgrade show`
-  landing one instant behind the artifact it reads. That rewrite lands with
-  the 2.13.0 release writeup, which plan D owns. Recorded here 2026-09-21
+  landing one instant behind the artifact it reads. Rewritten as the seven
+  numbered steps the standard's S6 points at (back up → instant → pin →
+  confirm on every node → stop → swap → verify), plus a rollback section
+  around the pin as a one-way door and an axis-H closing section; the three
+  reviewed passages (the `pin-verify` rehearsal, the `/metrics`-vs-`upgrade
+  show` body, "Why a flag day") were kept. Recorded here 2026-09-21
   because the SDD ledger and the task report that carry it today are working
   artifacts that get archived.
 
