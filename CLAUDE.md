@@ -14,14 +14,13 @@ took those names in the `uc2_*` → `uc_*` rename (see `RELEASES.md`), so a
 pre-rename commit or doc naming them means the deleted v1 crate, not this
 code.
 
-**The newest TAG is `2.12.0`; `main` carries `2.13.0`, UNRELEASED.** There is
-no `2.13.0` tag, no `2.13.0` release object and nothing at `2.13.0` on
-crates.io until `docs/how-to/cut-a-release.md` §2–§7 have been run — never
-write or assume otherwise. The writeup is already in place
-(`RELEASES.md`, `docs/releases.md`), with `<tag date>` scaffolds the tagger
-fills.
+**Current version: `2.13.0`** — tagged 2026-09-22 at `0909cf6` (the plan-D
+merge). `docs/how-to/cut-a-release.md` §2–§7 are done: the dry run and the tag
+run both green first time, §5 verified from a clean directory, and **all 14
+crates live on crates.io** (the new name `uc_diffreplay` drew no rate limit).
+The evidence table at the top of `docs/releases.md` has every row filled.
 
-**`2.13.0` — on `main`, unreleased: the FSM upgrade lifecycle.** Upgrading a
+**`2.13.0` — RELEASED 2026-09-22: the FSM upgrade lifecycle.** Upgrading a
 state machine becomes a **pinned, per-row** procedure the platform enforces:
 you take a coordinated instant, name that position as the upgrade's ORIGIN
 (`uc2ctl upgrade pin`), and from that commit every instance of the row
@@ -32,8 +31,7 @@ kinds 4 `UpgradePin` / 5 `SnapshotReport`, pairwise `SNAP_REPORT` 26) and cnc
 `+32 pin_seq`, `+40 pinned_from`; slot line 7 `+504 artifact_hash`) — plus a
 row-artifact envelope change, `ULTSNAP2` (24 B, carrying the `S::VERSION` that
 built the artifact; `ULTSNAP1` refused by name). Six plan branches and two
-hotfixes; the five that carry code are merged, **D (this writeup) is in
-flight**:
+hotfixes, all merged (**D** is #57):
 **A** #50 (`uc_diffreplay`, the diff-replay harness), **B1** #51 (the two
 cluster records, `uc2ctl upgrade pin/show`, admin op 10, refusals 52–59), **B2**
 #52 (the pinned install at attach, four attach refusals, `ULTSNAP2`, the
@@ -164,11 +162,10 @@ rate-limit note is now measured on both runs: crates.io limits **new crate
 names** hard and new *versions* barely at all, so `2.9.0`'s twelve new
 names took 62 minutes and `2.10.0`'s one took 59 seconds.)
 
-Next up: (1) **cut `2.13.0`** — the writeup, the version bump and the proof
-stack are this plan's; `docs/how-to/cut-a-release.md` §2–§7 (workflow dry run,
-tag, verify artifacts, the ordered crates.io publish of **fourteen** crates,
-after-the-tag) are the maintainer's, and `uc_diffreplay` is a NEW crate name,
-so budget for the new-name rate limit; (2) **the standing bar
+Next up, now that `2.13.0` is tagged and published: (1) **deliverable 3,
+[#49](https://github.com/PeterKnego/ultima_cluster/issues/49)** — the typed
+tier's `bytes_read` length check, small, ships alone, and turns four of the
+five measured silent misparses into the intended fail-stop; (2) **the standing bar
 question** — the `2.12.0` gates added two more rate bars an order of magnitude
 below the rig's variance, so four bars across two releases are now unadjudicable
 as written; how to construct a rate bar this rig can actually rule on is a
@@ -275,8 +272,8 @@ one log stream (#11); the release-ledger line (#5) is process, not code
 
 ### Standing facts that bind new work
 
-- **The wire protocol on `main` is 0.9.0** (`2.13.0`, cnc `3.3`, unreleased);
-  **0.8.0 + cnc `3.2` is the newest TAG** (`2.12.0`). `0.9.0` adds `CLUSTER`
+- **The wire protocol SHIPPED is 0.9.0** (`2.13.0`, cnc `3.3`, tagged
+  2026-09-22); `0.8.0` + cnc `3.2` was `2.12.0`. `0.9.0` adds `CLUSTER`
   kinds 4 `UpgradePin` and 5 `SnapshotReport` plus pairwise `SNAP_REPORT` 26,
   with no layout change either side — which is exactly why it is unsound to
   mix: a `0.8.0` peer parses those frames and drops them as an unknown kind,
