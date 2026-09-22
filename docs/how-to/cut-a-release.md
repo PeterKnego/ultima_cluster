@@ -38,10 +38,11 @@ documentation for what it changes, because the tag is what people read.
       `docs/how-to/run-a-cluster.md`. Find every straggler with:
 
       ```sh
-      grep -rn "$OLD" packaging/ docs/
+      grep -rn "$OLD" README.md packaging/ docs/
       ```
 
-      where `$OLD` is the version being replaced, and update each hit.
+      (`README.md` is in scope too — its "Try it" section names the release
+      tarball) where `$OLD` is the version being replaced, and update each hit.
 - [ ] **Retire the pre-tag scaffolding the writeup left behind**, because the
       tag freezes whatever is there. For `v2.6.0` that is: delete the
       not-published-yet notes (`README.md`'s "Try it" blockquote and

@@ -24,12 +24,12 @@ uc_lincheck = { path = "../../uc_lincheck" }
 # The only path to the cluster under test: the framed-TCP remote protocol
 # through a `uc2-gateway`. `frame`/`conn` are used directly by the pinned
 # query client (`diverge`), which must NOT hop to the leader.
-uc_remote   = { path = "../../uc_remote", version = "2.12.0" }
+uc_remote   = { path = "../../uc_remote", version = "2.13.0" }
 # Reading a spawned node's control page (leader flags, service slot words,
 # archive first base) — maintainer-side observation, the same file `uc2ctl
 # status` reads.
-uc_log      = { path = "../../uc_log", version = "2.12.0" }
-uc_protocol = { path = "../../uc_protocol", version = "2.12.0" }
+uc_log      = { path = "../../uc_log", version = "2.13.0" }
+uc_protocol = { path = "../../uc_protocol", version = "2.13.0" }
 clap        = { workspace = true }
 anyhow      = { workspace = true }
 rand        = { workspace = true }
