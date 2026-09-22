@@ -194,6 +194,96 @@ impl uc_service::SnapshotStateMachine for DoublingRegisterSm {
     }
 }
 
+/// A diff-replay / pin-verify test fixture — **not a pattern for a user
+/// state machine** (see `examples/kv` for that) — and the reason it exists
+/// is worth stating, because [`DoublingRegisterSm`] looks like it should be
+/// enough and is not.
+///
+/// `RegisterSm` is **last-write-wins**, and `DoublingRegisterSm` changes only
+/// `Cmd::Write`. Take any span that separates the ARTIFACT path (install the
+/// artifact at P, recompute `(P, X]` under the new version) from the GENESIS
+/// path (replay everything under the new version): every write has to sit
+/// BELOW P, or the last write above P lands both paths on the same value
+/// again. But then nothing above P means anything different to the two
+/// versions, so the artifact path and the third path — **continue-from-X**,
+/// the one a service takes when it skips the pinned install and keeps the
+/// state it persisted — compute the same `(P, X]` and end in the same place.
+/// The durable rewind was therefore unobservable *through state*: a
+/// `pin-verify` run could not have failed on it.
+///
+/// This variant closes that by changing a command that PRESERVES history:
+/// `Cmd::Cas { old, new }` becomes `Cas { old, new: 2·new }`, with the `old`
+/// comparison left alone. The CAS chain's *outcome* still depends on the
+/// state at P (so the genesis path, whose doubled writes leave a different
+/// value, fails the whole chain), while its *result* now depends on the
+/// version (so continue-from-X, computed by the OLD binary, differs from the
+/// artifact path). All three paths land on distinct values, which is what
+/// gives `a_durable_register_is_rewound_to_the_origin_and_passes` teeth.
+///
+/// Same `NAME` as [`RegisterSm`] (the harness compares two builds of one FSM
+/// row); `VERSION = 3`, one above [`DoublingRegisterSm`], so the two can be
+/// pinned apart.
+#[cfg(feature = "v2")]
+#[derive(Default)]
+pub struct DoublingCasRegisterSm(pub RegisterSm);
+
+#[cfg(feature = "v2")]
+impl uc_service::StateMachine for DoublingCasRegisterSm {
+    const NAME: &'static str = <RegisterSm as uc_service::StateMachine>::NAME;
+    const VERSION: u32 = 3;
+
+    type Command = Cmd;
+    type Response = CmdResp;
+    type Query = ();
+    type QueryResponse = Option<u64>;
+
+    fn apply(&mut self, ctx: &mut uc_service::ApplyCtx, cmd: Cmd) -> CmdResp {
+        // `old` is deliberately NOT rewritten: the comparison keeps naming
+        // the value the recorded history meant, so whether the CAS FIRES is
+        // decided by the state at P while what it STORES is decided by the
+        // version.
+        let cmd = match cmd {
+            Cmd::Write(v) => Cmd::Write(v * 2),
+            Cmd::Cas { old, new } => Cmd::Cas { old, new: new * 2 },
+        };
+        self.0.apply(ctx, cmd)
+    }
+    fn query(&self, q: ()) -> Option<u64> {
+        self.0.query(q)
+    }
+    fn last_applied(&self) -> Option<u64> {
+        self.0.last_applied()
+    }
+    fn on_timer(&mut self, ctx: &mut uc_service::ApplyCtx, ev: uc_service::TimerEvent) {
+        uc_service::StateMachine::on_timer(&mut self.0, ctx, ev);
+    }
+}
+
+#[cfg(feature = "v2")]
+impl uc_service::SnapshotStateMachine for DoublingCasRegisterSm {
+    type SnapshotHandle = <RegisterSm as uc_service::SnapshotStateMachine>::SnapshotHandle;
+
+    fn freeze(&self) -> Result<(Self::SnapshotHandle, u64), uc_service::SnapshotError> {
+        self.0.freeze()
+    }
+    fn stream_snapshot(
+        h: Self::SnapshotHandle,
+        dst: &mut dyn std::io::Write,
+    ) -> Result<(), uc_service::SnapshotError> {
+        RegisterSm::stream_snapshot(h, dst)
+    }
+    fn install_snapshot(
+        &mut self,
+        p: u64,
+        src: &mut dyn std::io::Read,
+    ) -> Result<u64, uc_service::SnapshotError> {
+        self.0.install_snapshot(p, src)
+    }
+    fn project(&self, out: &mut dyn std::io::Write) -> Result<(), uc_service::SnapshotError> {
+        self.0.project(out)
+    }
+}
+
 /// The pure CAS-register transition shared by both SDK `apply` impls (the only
 /// difference between v1/v2 is the index name and the trait surface, never the
 /// business logic — keeping it in one place is what makes the model a single
@@ -212,6 +302,124 @@ fn apply_cmd(value: &mut Option<u64>, cmd: Cmd) -> CmdResp {
                 CmdResp::CasResult(false)
             }
         }
+    }
+}
+
+// ------------------------------------------------------------ durable fixture
+
+/// A diff-replay / pin-verify **test fixture** — the "durable state machine"
+/// shape spec §2.3 says decided Q2: one whose `last_applied()` is non-`None`
+/// on attach because it persisted. Wraps [`RegisterSm`] or
+/// [`DoublingRegisterSm`] and writes their snapshot image (`(value,
+/// last_applied)`) to `<instance_dir>/register.state` after every `apply`
+/// and every `install_snapshot`, restoring it at [`Durable::open`]. The
+/// write is `rename`-atomic so a killed process leaves the previous image,
+/// never a torn one. **Not a pattern for a user state machine**: it does
+/// file I/O inside `apply`, which is only acceptable because the I/O IS the
+/// durability under test and it is deterministic (same inputs, same file).
+#[cfg(feature = "v2")]
+pub struct Durable<S> {
+    inner: S,
+    path: std::path::PathBuf,
+}
+
+#[cfg(feature = "v2")]
+impl<S> Durable<S>
+where
+    S: uc_service::SnapshotStateMachine<SnapshotHandle = Vec<u8>>,
+{
+    pub const STATE_FILE: &'static str = "register.state";
+
+    /// Wrap `inner`, restoring the persisted image if `<instance_dir>/register.state`
+    /// exists. The restore goes through `inner.install_snapshot(la, image)` with
+    /// `la` = the image's own recorded cursor, which the register's install
+    /// accepts (payload position ≤ tag).
+    pub fn open(mut inner: S, instance_dir: &std::path::Path) -> std::io::Result<Durable<S>> {
+        let path = instance_dir.join(Self::STATE_FILE);
+        if path.is_file() {
+            let image = std::fs::read(&path)?;
+            let ((_, la), _) = bincode::serde::decode_from_slice::<(Option<u64>, Option<u64>), _>(
+                &image,
+                bincode::config::standard(),
+            )
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+            inner
+                .install_snapshot(la.unwrap_or(0), &mut &image[..])
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
+        }
+        Ok(Durable { inner, path })
+    }
+
+    fn persist(&self) {
+        // Failure here is a fixture defect, not a state-machine outcome:
+        // panic, so the apply thread fail-stops and the test names it.
+        let (image, _) = self.inner.freeze().expect("durable fixture: freeze");
+        let tmp = self.path.with_extension("state.tmp");
+        std::fs::write(&tmp, &image).expect("durable fixture: write");
+        std::fs::rename(&tmp, &self.path).expect("durable fixture: rename");
+    }
+}
+
+#[cfg(feature = "v2")]
+impl<S> uc_service::StateMachine for Durable<S>
+where
+    S: uc_service::StateMachine + uc_service::SnapshotStateMachine<SnapshotHandle = Vec<u8>>,
+{
+    const NAME: &'static str = <S as uc_service::StateMachine>::NAME;
+    const VERSION: u32 = <S as uc_service::StateMachine>::VERSION;
+    type Command = S::Command;
+    type Response = S::Response;
+    type Query = S::Query;
+    type QueryResponse = S::QueryResponse;
+
+    fn apply(&mut self, ctx: &mut uc_service::ApplyCtx, cmd: S::Command) -> S::Response {
+        let r = uc_service::StateMachine::apply(&mut self.inner, ctx, cmd);
+        self.persist();
+        r
+    }
+    fn query(&self, q: S::Query) -> S::QueryResponse {
+        uc_service::StateMachine::query(&self.inner, q)
+    }
+    fn last_applied(&self) -> Option<u64> {
+        uc_service::StateMachine::last_applied(&self.inner)
+    }
+    // `on_timer` is a provided method on `StateMachine` (default: ignore).
+    // A timer can change state (it is delivered through the same `apply`
+    // discipline — spec §4.7), so the wrapper is not transparent unless this
+    // is forwarded and persisted exactly like `apply` above.
+    fn on_timer(&mut self, ctx: &mut uc_service::ApplyCtx, ev: uc_service::TimerEvent) {
+        uc_service::StateMachine::on_timer(&mut self.inner, ctx, ev);
+        self.persist();
+    }
+}
+
+#[cfg(feature = "v2")]
+impl<S> uc_service::SnapshotStateMachine for Durable<S>
+where
+    S: uc_service::StateMachine + uc_service::SnapshotStateMachine<SnapshotHandle = Vec<u8>>,
+{
+    type SnapshotHandle = Vec<u8>;
+
+    fn freeze(&self) -> Result<(Vec<u8>, u64), uc_service::SnapshotError> {
+        self.inner.freeze()
+    }
+    fn stream_snapshot(
+        handle: Vec<u8>,
+        dst: &mut dyn std::io::Write,
+    ) -> Result<(), uc_service::SnapshotError> {
+        S::stream_snapshot(handle, dst)
+    }
+    fn install_snapshot(
+        &mut self,
+        position: u64,
+        src: &mut dyn std::io::Read,
+    ) -> Result<u64, uc_service::SnapshotError> {
+        let got = self.inner.install_snapshot(position, src)?;
+        self.persist();
+        Ok(got)
+    }
+    fn project(&self, out: &mut dyn std::io::Write) -> Result<(), uc_service::SnapshotError> {
+        self.inner.project(out)
     }
 }
 
@@ -280,6 +488,147 @@ mod v2_tests {
             restored
                 .install_snapshot(99, &mut bytes.as_slice())
                 .is_err()
+        );
+    }
+}
+
+/// The three diff-replay fixture builds on one recorded history, and the one
+/// arithmetic the pin-verify durable proof rests on.
+///
+/// `[Write(199), Cas{199 -> 200}]` is the GENESIS-shaped history: the doubled
+/// write moves the register off 199, so the CAS cannot fire under either
+/// doubling build. `[Cas{199 -> 200}]` applied to an INSTALLED 199 is the
+/// ARTIFACT-shaped history: the CAS fires under both, and only
+/// `DoublingCasRegisterSm` stores a different value than the plain build
+/// would — which is exactly the difference that makes a skipped pinned
+/// install (continue-from-X, 200) distinguishable from the artifact path
+/// (400).
+#[cfg(all(test, feature = "v2"))]
+mod fixture_arithmetic_tests {
+    use super::*;
+    use uc_service::{SnapshotStateMachine, StateMachine};
+
+    fn ctx(pos: u64) -> uc_service::ApplyCtx {
+        uc_service::ApplyCtx::new(pos, <RegisterSm as uc_service::RawStateMachine>::IDENTITY)
+    }
+
+    /// Drive `[Write(199), Cas{old: 199, new: 200}]` from empty.
+    fn write_then_cas<S: StateMachine<Command = Cmd, Query = (), QueryResponse = Option<u64>>>(
+        mut sm: S,
+    ) -> Option<u64> {
+        let _ = sm.apply(&mut ctx(64), Cmd::Write(199));
+        let _ = sm.apply(&mut ctx(128), Cmd::Cas { old: 199, new: 200 });
+        sm.query(())
+    }
+
+    #[test]
+    fn the_three_builds_on_a_write_then_cas_history() {
+        // Plain: last write 199, the CAS matches and stores 200.
+        assert_eq!(write_then_cas(RegisterSm::default()), Some(200));
+        // Doubling: the write stores 398, so `old: 199` no longer matches and
+        // the CAS is a no-op.
+        assert_eq!(write_then_cas(DoublingRegisterSm::default()), Some(398));
+        // DoublingCas: the same 398, and the same failed comparison — `old` is
+        // NOT rewritten, so doubling `new` changes nothing on a CAS that never
+        // fires.
+        assert_eq!(write_then_cas(DoublingCasRegisterSm::default()), Some(398));
+    }
+
+    /// The artifact-path shape: the state at P is installed, and the span
+    /// above P is the CAS alone. Here `old: 199` DOES match, the two doubling
+    /// builds part company, and the gap between them is the pin-verify
+    /// durable proof's whole tooth.
+    #[test]
+    fn a_cas_onto_an_installed_199_parts_the_two_doubling_builds() {
+        let image = {
+            let mut src = RegisterSm::default();
+            let _ = src.apply(&mut ctx(64), Cmd::Write(199));
+            SnapshotStateMachine::freeze(&src).unwrap().0
+        };
+        let cas = Cmd::Cas { old: 199, new: 200 };
+
+        let mut d = DoublingRegisterSm::default();
+        d.install_snapshot(64, &mut &image[..]).unwrap();
+        let _ = StateMachine::apply(&mut d, &mut ctx(128), cas.clone());
+        assert_eq!(StateMachine::query(&d, ()), Some(200), "Cas.new untouched");
+
+        let mut dc = DoublingCasRegisterSm::default();
+        dc.install_snapshot(64, &mut &image[..]).unwrap();
+        let _ = StateMachine::apply(&mut dc, &mut ctx(128), cas);
+        assert_eq!(
+            StateMachine::query(&dc, ()),
+            Some(400),
+            "Cas.new doubled: the version decides what a FIRING cas stores"
+        );
+    }
+}
+
+#[cfg(all(test, feature = "v2"))]
+mod durable_tests {
+    use super::*;
+    use uc_service::{SnapshotStateMachine, StateMachine};
+
+    fn ctx(pos: u64) -> uc_service::ApplyCtx {
+        uc_service::ApplyCtx::new(pos, <RegisterSm as uc_service::RawStateMachine>::IDENTITY)
+    }
+
+    /// Real disk under the cargo target tree (CLAUDE.md's scratch rule),
+    /// never `/tmp`. `CARGO_TARGET_TMPDIR` is only defined for integration
+    /// tests/benches, not a unit test compiled into `--lib` (see
+    /// `uc_service/src/attach.rs`'s identical `scratch()`), so a lib-level
+    /// test derives real disk from its own test binary's location instead.
+    fn scratch_base() -> std::path::PathBuf {
+        std::env::current_exe()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf()
+    }
+
+    #[test]
+    fn a_durable_register_restores_value_and_last_applied_from_its_file() {
+        let dir = tempfile::Builder::new()
+            .prefix("durable-")
+            .tempdir_in(scratch_base())
+            .unwrap();
+        {
+            let mut d = Durable::open(RegisterSm::default(), dir.path()).unwrap();
+            assert_eq!(
+                StateMachine::last_applied(&d),
+                None,
+                "fresh: nothing persisted yet"
+            );
+            let _ = StateMachine::apply(&mut d, &mut ctx(64), Cmd::Write(7));
+            let _ = StateMachine::apply(&mut d, &mut ctx(128), Cmd::Write(9));
+        }
+        let d = Durable::open(RegisterSm::default(), dir.path()).unwrap();
+        assert_eq!(StateMachine::query(&d, ()), Some(9));
+        assert_eq!(StateMachine::last_applied(&d), Some(128));
+        assert!(dir.path().join(Durable::<RegisterSm>::STATE_FILE).is_file());
+    }
+
+    #[test]
+    fn a_durable_register_persists_an_install_too() {
+        let dir = tempfile::Builder::new()
+            .prefix("durable-")
+            .tempdir_in(scratch_base())
+            .unwrap();
+        let (image, _) = {
+            let mut src = RegisterSm::default();
+            let _ = StateMachine::apply(&mut src, &mut ctx(32), Cmd::Write(5));
+            SnapshotStateMachine::freeze(&src).unwrap()
+        };
+        {
+            let mut d = Durable::open(RegisterSm::default(), dir.path()).unwrap();
+            let got = SnapshotStateMachine::install_snapshot(&mut d, 64, &mut &image[..]).unwrap();
+            assert_eq!(got, 64);
+        }
+        let d = Durable::open(RegisterSm::default(), dir.path()).unwrap();
+        assert_eq!(StateMachine::query(&d, ()), Some(5));
+        assert_eq!(
+            StateMachine::last_applied(&d),
+            Some(32),
+            "the image's recorded cursor, not the tag"
         );
     }
 }

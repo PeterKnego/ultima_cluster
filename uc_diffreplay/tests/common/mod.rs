@@ -1,16 +1,23 @@
-#![allow(dead_code)]
-use std::net::SocketAddr;
+// `common` is compiled into EVERY test binary in this directory, so an item
+// only one of them uses is unused in the others — for functions
+// (`dead_code`) and, since the rig moved into the crate, for the re-exports
+// below (`unused_imports`) alike.
+#![allow(dead_code, unused_imports)]
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use uc_client::Client;
 use uc_lincheck::register::{Cmd, CmdResp, RegisterSm};
-use uc_log::cnc::{AdminReq, AdminResp, CncPage};
-use uc_net::fault::FaultConfig;
-use uc_node::{Node, NodeConfig};
-use uc_protocol::v2::cnc::ADMIN_OP_UPGRADE_PIN;
-use uc_protocol::v2::upgrade::{UpgradePin, encode_upgrade_pin};
+use uc_log::cnc::{AdminResp, CncPage};
+use uc_node::Node;
 use uc_service::{ServiceBuilder, ServiceConfig, StateMachine};
+
+// The rig itself lives in the crate under test now (`uc_diffreplay::live`,
+// behind the `pin-verify` feature), so `pin-verify` and these tests drive
+// exactly the same node config, the same admin flow and the same waits.
+// What stays here is only the test-local shape: the panicking wrappers and
+// the fixtures.
+pub use uc_diffreplay::live::{artifact_path, node_config, wait_for};
 
 pub fn tempdir() -> tempfile::TempDir {
     tempfile::Builder::new()
@@ -19,48 +26,8 @@ pub fn tempdir() -> tempfile::TempDir {
         .unwrap()
 }
 
-pub fn node_config(dir: &Path, app_id: &str, fsm: &str) -> NodeConfig {
-    let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
-    NodeConfig {
-        id: 0,
-        members: vec![(0, bind)],
-        bind,
-        instance_dir: dir.to_path_buf(),
-        app_id: app_id.into(),
-        buffer_bytes: 1 << 20,
-        max_payload: 256,
-        admission_bytes_default: 256 * 1024,
-        settings_genesis: uc_protocol::v2::settings::Settings::genesis_default(),
-        force_jumbo_frames: false,
-        election_timeout_min_ns: 50_000_000,
-        election_timeout_max_ns: 100_000_000,
-        seed: 1,
-        faults: FaultConfig::default(),
-        purge: uc_node::PurgePolicy::Disabled,
-        learners: Vec::new(),
-        journal_segment_bytes: uc_node::DEFAULT_JOURNAL_SEGMENT_BYTES,
-        crypto: uc_node::CryptoConfig::Disabled,
-        services: uc_node::ServicesConfig::single(fsm),
-    }
-}
-
 pub fn start_single_node(dir: &Path, app_id: &str, fsm: &str) -> Node {
-    Node::start(node_config(dir, app_id, fsm)).unwrap()
-}
-
-/// Poll `f` until it holds or `timeout` elapses. Returns whether it held —
-/// the caller decides what to do with a timeout, so cleanup can run before
-/// an assertion fires. [`wait_until`] is this with the assertion built in.
-#[must_use]
-pub fn wait_for(mut f: impl FnMut() -> bool, timeout: Duration) -> bool {
-    let deadline = Instant::now() + timeout;
-    while !f() {
-        if Instant::now() >= deadline {
-            return false;
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
-    true
+    uc_diffreplay::live::start_node(dir, app_id, fsm, Duration::from_secs(60)).unwrap()
 }
 
 pub fn wait_until(f: impl FnMut() -> bool) {
@@ -85,16 +52,7 @@ pub fn register_replay_bin() -> PathBuf {
 
 /// `uc2ctl snapshot` in process: command an instant, return its position P.
 pub fn command_instant(node: &Node) -> u64 {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        match node.command_snapshot(false) {
-            Ok(p) => return p,
-            Err(uc_node::SnapshotRefusal::Retry) if Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(5));
-            }
-            Err(e) => panic!("uc2ctl snapshot refused: {e}"),
-        }
-    }
+    uc_diffreplay::live::command_instant(node, Duration::from_secs(10)).unwrap()
 }
 
 pub fn register_name() -> &'static str {
@@ -102,133 +60,54 @@ pub fn register_name() -> &'static str {
 }
 
 /// `uc2ctl upgrade pin --row <row> --from <from> --to <to> --origin <origin>`
-/// in process (FSM upgrade lifecycle spec §2.5, plan B1): stage the 20-byte
-/// `UpgradePin` record at `<instance_dir>/upgrade.pending`, then submit admin
-/// op 10 with the staged file's digest in the `id`/`ip`/`port` fields —
-/// `uc_ctl::upgrade::pin`'s pipeline, minus the bin and minus the signature
-/// (these test nodes run the filesystem admin policy, so there is no auth
-/// line, exactly as `uc_node/tests/reconfig.rs`'s `admin_request` relies on).
-///
-/// Exactly two answers are RACES against this fixture rather than errors in
-/// it, and only those two are retried: status 2 (the ordinary
-/// single-in-flight retry) and reason 54 `pin_no_set`, which compares
-/// `origin` against the node's NEWEST complete set — published by the
-/// cluster agent a moment after the row's own artifact appears. Every other
-/// refusal is a refusal: it fails immediately, naming its reason, instead of
-/// being re-sent for 30 s and then reported as a timeout.
+/// in process (FSM upgrade lifecycle spec §2.5, plan B1), asserting it was
+/// accepted — the rig's own [`uc_diffreplay::live::pin_row`] with this
+/// suite's timeout and a panic instead of an `Err`.
 pub fn pin_row(dir: &Path, cnc: &CncPage, row: u8, from: u32, to: u32, origin: u64) -> AdminResp {
-    let mut bytes = Vec::new();
-    encode_upgrade_pin(
-        &UpgradePin {
-            row,
-            from,
-            to,
-            origin,
-        },
-        &mut bytes,
-    );
-    let (id, ip, port) = uc_node::staged_digest(&bytes);
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        stage_upgrade_pin(dir, &bytes);
-        let resp = admin_request(cnc, ADMIN_OP_UPGRADE_PIN, id, ip, port);
-        let racy = resp.status == 2 || resp.reason == uc_node::REASON_PIN_NO_SET;
-        if resp.status == 0 || !racy || Instant::now() >= deadline {
-            assert_eq!(
-                resp.status, 0,
-                "upgrade pin refused: status={} reason={}",
-                resp.status, resp.reason
-            );
-            return resp;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    uc_diffreplay::live::pin_row(dir, cnc, row, from, to, origin, Duration::from_secs(30)).unwrap()
 }
 
-/// `<instance_dir>/upgrade.pending`, written the way `uc2ctl` writes it:
-/// 0600, fsync'd, renamed into place, so the node reads a whole record or
-/// none of one.
-fn stage_upgrade_pin(dir: &Path, bytes: &[u8]) {
-    use std::io::Write as _;
-    use std::os::unix::fs::OpenOptionsExt as _;
-    let pending = dir.join(uc_node::UPGRADE_PENDING_FILE);
-    let tmp = dir.join(format!("{}.tmp", uc_node::UPGRADE_PENDING_FILE));
-    {
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&tmp)
-            .unwrap();
-        f.write_all(bytes).unwrap();
-        f.sync_all().unwrap();
-    }
-    std::fs::rename(&tmp, &pending).unwrap();
-}
-
-/// The `uc2ctl` mutating-command flow, minus the bin —
-/// `uc_node/tests/reconfig.rs`'s `admin_request` verbatim: read the admin
-/// band's current seq, write a fresh request at `seq + 1`, poll the response
-/// line for the echoed seq.
-fn admin_request(cnc: &CncPage, op: u32, id: u32, ip: u32, port: u16) -> AdminResp {
-    let seq = cnc.read_admin_req(0).map(|r| r.seq).unwrap_or(0) + 1;
-    // The nonce is the anti-replay field of the SIGNED flow; with the
-    // filesystem policy nothing reads it, so a fresh wall-clock reading is
-    // enough to keep two requests in one run distinct without pulling `rand`
-    // into this crate's dev-dependencies.
-    let nonce = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(seq);
-    cnc.write_admin_req(&AdminReq {
-        seq,
-        nonce,
-        op,
-        id,
-        ip,
-        port,
-    });
-    let deadline = Instant::now() + Duration::from_secs(15);
-    loop {
-        if let Some(resp) = cnc.read_admin_resp(seq) {
-            return resp;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "admin response timed out for seq {seq}"
-        );
-        std::thread::yield_now();
-    }
-}
-
-/// Drive a single node with RegisterSm: N writes, an instant at P, M more
-/// writes. Returns `(P, u64::MAX)` — `Node` has no "applied frontier"
-/// accessor in this plan's scope, so the end is left to the caller (the
-/// driver stops at the journal's last frame instead of naming Q precisely).
-pub fn build_register_history(dir: &std::path::Path, app_id: &str, n: u64, m: u64) -> (u64, u64) {
+/// Drive a single node with RegisterSm: `before`, a coordinated instant at
+/// P, `after`. Returns P — the position an exported corpus anchors on, and
+/// the artifact it installs from.
+///
+/// Both halves matter to a caller that exports `[P, …)`: only `after` lands
+/// inside that span, so a corpus whose replay must see a command needs it
+/// in `after`. `before` is what the artifact at P holds.
+pub fn build_register_history_with(dir: &Path, app_id: &str, before: &[Cmd], after: &[Cmd]) -> u64 {
+    // `start_single_node` already waits out `can_serve` (`live::start_node`),
+    // so the client below cannot race the election.
     let node = start_single_node(dir, app_id, register_name());
-    wait_until(|| node.can_serve());
     let cfg = ServiceConfig::new(dir.to_path_buf(), app_id.to_string());
     let svc = ServiceBuilder::new(cfg, RegisterSm::default())
         .start_with_snapshots()
         .unwrap();
     let client = Client::connect(dir, app_id).unwrap();
-    for v in 0..n {
-        let _: CmdResp = client.submit(&Cmd::Write(v)).unwrap();
+    for c in before {
+        let _: CmdResp = client.submit(c).unwrap();
     }
     let p = command_instant(&node);
     // The instant completes when the row's artifact appears.
-    let art = dir
-        .join("snapshots")
-        .join("0")
-        .join(format!("snap-{p}.ultsnap"));
+    let art = artifact_path(dir, 0, p);
     wait_until(|| art.is_file());
-    for v in n..n + m {
-        let _: CmdResp = client.submit(&Cmd::Write(v)).unwrap();
+    for c in after {
+        let _: CmdResp = client.submit(c).unwrap();
     }
     client.shutdown();
     svc.stop();
     node.stop();
-    (p, u64::MAX)
+    p
+}
+
+/// The all-writes special case: N writes, an instant at P, M more writes.
+/// Returns `(P, u64::MAX)` — `Node` has no "applied frontier" accessor in
+/// this plan's scope, so the end is left to the caller (the driver stops at
+/// the journal's last frame instead of naming Q precisely).
+pub fn build_register_history(dir: &std::path::Path, app_id: &str, n: u64, m: u64) -> (u64, u64) {
+    let before: Vec<Cmd> = (0..n).map(Cmd::Write).collect();
+    let after: Vec<Cmd> = (n..n + m).map(Cmd::Write).collect();
+    (
+        build_register_history_with(dir, app_id, &before, &after),
+        u64::MAX,
+    )
 }

@@ -1072,6 +1072,104 @@ different dependencies:
    reconstructing below the pinned origin, for both the empty and the
    durable-SM shapes. Depends on S4 landing.
 
+#### Errata (plan C, as built)
+
+Nine places execution diverged from the two-part statement above, or filled
+in a detail it left open. Read them BEFORE the body: part 2 is
+`uc2-diffreplay pin-verify` (`docs/how-to/diff-replay.md` § "Verify the pin
+live"), and three of these change what the mode can be asked to do at all
+(1, 2 and 8).
+
+1. **The history is the corpus's own commands, re-submitted.** Part 2 needs
+   a LIVE history with a real pin in it, and a black-box harness cannot mint
+   application commands. So the corpus IS the workload: the `MESSAGE` frames
+   of its span are re-submitted verbatim through the raw client engine —
+   the first `--split` of them, then the instant at P, then the rest. `TIMER`
+   frames cannot be re-submitted (a node mints them) and are skipped and
+   counted in the report. The corpus's own artifact is not installed: the
+   fresh node's history starts empty under OLD, so the corpus is a source of
+   realistic bytes, not of state.
+2. **`--to` is an input, not an observation.** A black-box harness cannot
+   read the NEW binary's `VERSION` without attaching it, and attaching it
+   before the pin would run its `apply` on the live history — the very thing
+   the pin exists to prevent. `--to` is therefore required, in the two
+   spellings a real pin is written in (`MAJOR.MINOR.PATCH`, or the raw packed
+   `u32` a state machine whose `const VERSION` is a bare integer carries;
+   packed `0` is refused in both as the "unversioned" sentinel). It is
+   verified AFTER the swap against the row's attached-version word, and a
+   mismatch is a FAIL that names both numbers.
+3. **Empty vs. durable is the app's property, exercised by the sequence and
+   proven only on the fixture.** Stopping OLD at the frontier X > P before
+   the pin is what makes a durable state machine attach with `last_applied()
+   = X`, which is the PRECONDITION for a rewind — an in-memory one attaches
+   empty. Attaching above the origin is not the same as being *seen* to be
+   rewound to it; what makes the rewind observable is erratum 9's two
+   things. The outcome check is the same
+   for both (live == artifact), and the report records P and X, but on an
+   arbitrary app the harness **cannot say which shape it has**. The two
+   shapes are each proven on the harness's own fixture instead:
+   `register-replay serve` (empty) and `register-replay serve --durable`
+   (durable, via `uc_lincheck::register::Durable<S>`).
+4. **INCONCLUSIVE is an outcome, not a failure.** If NEW's artifact-path and
+   genesis-path projections agree over the span, the run cannot show the
+   counterfactual — the change altered no replayed command's semantics — while
+   the refusal arm and `live == artifact` still hold and are still judged.
+   That is exit 0 with the note, so a CI job can require PASS-or-INCONCLUSIVE
+   while a human reads the note; calling it a PASS would overstate the
+   evidence.
+5. **`upgrade show` is not consulted.** Its record lands one instant behind
+   the artifact it reads (plan B3's documented lag), so the mode reads the
+   pin from the row's own cnc words (`PinRead::Pinned`) and the state from
+   artifacts and projections — none of which lag.
+6. **A same-version run is refused, not judged** (ruling R-C-1). The refusal
+   arm re-starts OLD after a pin to `--to`; if the row already runs `--to`
+   then OLD *is* the pinned version, it attaches, and the run would report a
+   FAIL that says nothing about the pin. The mode refuses before placing the
+   pin — indeed before a single command is submitted — naming the version the
+   row already runs.
+7. **The demonstration needs a state-dependent tail** (ruling R-C-1). For a
+   last-write-wins state machine a write-only span makes the two paths agree
+   at the end, which is erratum 4's INCONCLUSIVE by construction. The
+   harness's own e2e therefore ends its span with a CAS chain whose outcome
+   depends on the state at P; an app's corpus should likewise carry commands
+   whose result depends on prior state, and the how-to says so.
+8. **The span must CONTAIN the commands the demonstration needs, and
+   `--split` places the instant inside it** (ruling R-C-2). `Corpus::export`
+   at P keeps only frames at or above P, so a corpus exported after the
+   interesting commands carries none of them and the mode has nothing to
+   re-submit. The harness's own e2e puts the whole workload — the writes and
+   then the CAS chain — inside the exported span and splits at the writes, so
+   the state-dependent tail lands after the harness's own instant at P.
+9. **What makes the pinned install's rewind OBSERVABLE, named — and it is
+   two things** (final review C1, ruling R-C-3). Erratum 3 originally
+   claimed the rewind was observable because OLD is stopped above P; that is
+   only the precondition. As built the mode observes the rewind two ways,
+   and it needs both.
+   - **(a) The SDK says it ran.** `uc_service`'s attach path prints
+     `uc_service: row R pinned install of snap-P (from …, to …, artifact
+     built by …)` on the service's own stderr once the unconditional install
+     has happened. The swap arm requires that line, naming THIS run's origin,
+     for a PASS or an INCONCLUSIVE (`SwapArm::install_logged`,
+     `uc_diffreplay::pinverify::INSTALL_MARKER_PREFIX`) — the same class of
+     black-box evidence as the refusal arm's `is pinned to version`, and the
+     only one that does not depend on the corpus.
+   - **(b) The span's own arithmetic parts the three paths** — but only if
+     the version change touches a command that PRESERVES history. A durable
+     state machine that ignored the pin would not replay from genesis; it
+     would CONTINUE FROM X, keeping the `(P, X]` it persisted. With a
+     last-write-wins register and a change that rewrites `Write` alone, every
+     span that separates the artifact path from the genesis path also
+     collapses the artifact path onto continue-from-X, so state alone cannot
+     tell a rewound service from one that skipped the install. The harness's
+     durable e2e therefore runs a third fixture build,
+     `register-replay --double-cas` (`uc_lincheck::register::
+     DoublingCasRegisterSm`, `VERSION = 3`), which doubles `Cas.new` as well
+     as `Write` and leaves `Cas.old` alone — so a CAS still FIRES on the
+     state at P while what it STORES depends on the version. Over the
+     fixture's corpus that gives artifact/live = 400, continue-from-X = 249
+     and genesis = 398, three distinct values. An app's own corpus and
+     version change need the same property before (b) adds anything to (a).
+
 ### 6.3 Black-box before white-box
 
 | | black-box (two binaries, subprocess, 1-node cluster) | white-box (two versions linked in one process) |

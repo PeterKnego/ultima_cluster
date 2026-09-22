@@ -83,10 +83,131 @@ this field is how you confirm, after the fact, which version actually built
 the artifact each side started from. `uc_diffreplay/README.md` § "The trace
 an app binary writes" has the full field list.
 
+## 5. Verify the pin live (reconstruction mode part 2)
+
+`reconstruction` above is part 1 of the spec's §6.2 two-part job: it
+*demonstrates* that the artifact path and the genesis counterfactual can be
+told apart. Part 2 is verifying that the running system **refuses the wrong
+one** — that a committed `uc2ctl upgrade pin` turns the stale binary away by
+name and steers the new one onto the artifact path. That needs a real node
+and your real binaries, which is what `pin-verify` runs:
+
+    uc2-diffreplay pin-verify --corpus ./corpus \
+        --old ./kv-service-v1 --new ./kv-service-v2 \
+        --app-id kv --fsm kv --to 1.1.0 --report pin.json
+
+The harness's own fixture is the same shape with the register binary on both
+sides, the "new build" selected by a knob:
+
+    uc2-diffreplay pin-verify --corpus ./corpus \
+        --old ./register-replay --old-arg serve \
+        --new ./register-replay --new-arg serve --new-arg --double \
+        --app-id pv --fsm register --to 2 --report pin.json
+
+`--old-arg` / `--new-arg` carry the app's **serve** argv — its serve verb
+followed by its own knobs, repeated once per token. The `replay` and
+`project` forms reuse the knobs behind their own verb, so one `--new-arg`
+list drives all three forms.
+
+**The inputs that are not obvious.**
+
+- **`--to` is an input, not something the harness reads off your binary.**
+  Reading NEW's `VERSION` would mean attaching NEW, and attaching NEW before
+  the pin is exactly the accident the pin prevents. Give the version the pin
+  will name, in the `MAJOR.MINOR.PATCH` spelling `uc2ctl upgrade pin --to`
+  takes — or, for a state machine whose `const VERSION` is a bare integer
+  rather than a packed semver, the raw packed `u32` (decimal or `0x…`),
+  which **this harness** additionally accepts. `uc2ctl` does not: `--to 2`
+  here is `--to 0.0.2` there, so write the dotted form into the real pin.
+  Packed `0` is the "unversioned" sentinel and is refused in both spellings.
+  After the swap the harness compares `--to` with the version the row
+  actually attached at, and a mismatch is a FAIL naming both.
+- **`--fsm` is the row's FSM name**, as `node.toml`'s `[services] names`
+  declares it — the scratch node is configured with that one row.
+- **`--split` is how many of the corpus's `MESSAGE` frames are re-submitted
+  before the harness takes its instant at P** (default: half). Everything
+  after the split lands above P, which is the part the counterfactual can
+  disagree about.
+
+**The sequence**, all of it on a throwaway single-voter node in the scratch
+directory. The node starts and OLD attaches; the corpus's recorded `MESSAGE`
+frames are re-submitted verbatim through the raw client engine (`TIMER`
+frames are skipped and counted — a node mints those); at `--split` the
+harness commands a coordinated instant **P**; the rest of the frames follow;
+OLD is stopped at the frontier **X > P**; a real `uc2ctl upgrade pin --from
+<the version OLD was attached at> --to <--to> --origin P` is placed through
+the admin band and waited for at the row's own cnc words; then the two arms
+— OLD is started again and must be **refused** (a non-zero exit whose stderr
+carries the SDK's `is pinned to version`), and NEW is started and must
+attach at `--to`, **say on its own stderr that it ran the pinned install**
+(`uc_service: row R pinned install of snap-P …`, which the harness requires
+for anything but a FAIL) and catch up to X. A second instant **Q** turns
+NEW's live state into an artifact anyone can project.
+
+**The three projections and the verdict.** The harness then asks NEW for
+three views of the same span: its **live** state at Q (`NEW project` on the
+artifact at Q), the **artifact path** (`NEW replay` over a corpus exported
+from `[P, Q)`), and the **genesis path** (`NEW replay --from-genesis` over
+the same corpus — only claimed when the exported journal says it starts at
+position 0).
+
+| verdict | when | exit |
+|---|---|---|
+| **PASS** | the refusal arm held, NEW attached as `--to` and logged its pinned install, `live == artifact`, and `artifact != genesis` | 0 |
+| **INCONCLUSIVE** | the same, but `artifact == genesis` | 0 |
+| **FAIL** | anything else, including a pinned install that was never observed and a comparison that never happened | 1 |
+
+INCONCLUSIVE is an honest outcome, not a failure: everything held, but the
+span could not tell the two paths apart, so the run shows nothing about the
+counterfactual. That is what a **state-dependent tail** is for. A
+last-write-wins state machine replayed over writes alone ends in the same
+place either way; end the span with commands whose result depends on the
+state at P (the fixture uses a CAS chain) and the two paths diverge. There
+is a **third** path the projections can be made to see, and it is the one a
+durable app actually risks: continuing from X with the state it persisted,
+the pinned install skipped. To separate that one as well, the version change
+has to alter a command that PRESERVES history rather than overwriting it —
+the fixture's `--double-cas` build doubles a `Cas`'s new value while leaving
+its expected value alone, which puts artifact, continue-from-X and genesis
+on three different numbers. Note
+also that `corpus export` at P keeps only frames at or above P: the commands
+you want the demonstration to run must be **inside** the exported span, with
+`--split` deciding which of them land before the instant.
+
+A run whose OLD is already at `--to` is **refused up front**, before any
+command is submitted and before any pin is placed: a pin naming the running
+version cannot hold the refusal arm, because the "stale" binary is the
+pinned one.
+
+**Reading the report.** `pin.json` (and the same thing as text on stdout;
+`verdict` is the same word in both, `PASS` / `INCONCLUSIVE` / `FAIL`) names
+each phase: `origin` is P, `frontier` is **X — the position OLD had applied
+to when it was stopped**, which is what makes a *durable* state machine
+attach above the origin; `end` is Q. Two fields carry the arms.
+`refusal.matched` is the stale binary's own words — an exit alone could be
+any startup failure, so the arm holds only when it also said why.
+`swap.install_logged` is NEW's: the SDK prints `pinned install of snap-P` once
+the pinned install has run, and **that line is what makes the rewind
+observable**, not the fact that OLD was stopped above P. Without it a
+durable state machine that quietly kept the state it had persisted would
+look the same, unless your version change happens to touch a command whose
+result depends on prior state — see the next paragraph, and prefer both.
+
+Scratch (the throwaway instance dir, both stderr files, the exported corpus
+and the traces) lands in `<report>.pinverify/`. It is **kept on a FAIL** and
+swept on a PASS or an INCONCLUSIVE — so a failing run's evidence sits beside
+the report that names it. It is kept on a **rig** failure too, and that case
+looks different: a run that fails the *rig* rather than the *check* — "row 0
+never published snap-P", "the pin never reached row 0's slot words", an
+out-of-range explicit `--split` — exits non-zero with **no report file at
+all** and a full scratch directory, so an empty `<report>.pinverify/` beside
+a missing `pin.json` is a crash while a full one beside a `FAIL` is
+evidence. `--scratch DIR` puts it where you say and never removes it.
+
 ## Also
 
     uc2-diffreplay determinism    --corpus C --bin ./kv-service --report det.json   # same build twice; must be empty
-    uc2-diffreplay reconstruction --corpus C --bin ./kv-service --report rec.json   # artifact vs genesis origin (spec §2.3)
+    uc2-diffreplay reconstruction --corpus C --bin ./kv-service --report rec.json   # artifact vs genesis origin (spec §2.3) — part 1
 
 `examples/kv/tests/corpora/README.md` is the regression-corpus convention —
 how a corpus becomes a `cargo test` that runs on every build.

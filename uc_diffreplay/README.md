@@ -8,6 +8,8 @@ compare everything they do on the captured surfaces (see
     uc2-diffreplay upgrade       --corpus CORPUS --old ./svc-v1 --new ./svc-v2 --declare intent.toml --report r.json
     uc2-diffreplay determinism   --corpus CORPUS --bin ./svc --report r.json
     uc2-diffreplay reconstruction --corpus CORPUS --bin ./svc --report r.json
+    uc2-diffreplay pin-verify    --corpus CORPUS --old ./svc-v1 --new ./svc-v2 \
+        --app-id A --fsm NAME --to 1.1.0 --report r.json
 
 An app binary takes part by embedding the driver behind a `replay`
 subcommand — see `examples/kv/src/bin/kv-service.rs`. `uc_lincheck/src/bin/
@@ -17,9 +19,9 @@ the harness's own end-to-end fixture, over `RegisterSm`.
 ## CLI contract for app binaries
 
 `uc2-diffreplay` shells out to the app's own binary rather than linking
-against it, so the contract is two subcommands any binary embedding
-[`uc_diffreplay::drive::run_replay_cli`] / [`uc_diffreplay::drive::project_artifact`]
-must expose:
+against it, so the contract is three subcommands. Two of them any binary
+embedding [`uc_diffreplay::drive::run_replay_cli`] /
+[`uc_diffreplay::drive::project_artifact`] must expose:
 
     <bin> replay --corpus DIR --out TRACE.json [--from-genesis]
     <bin> project --artifact FILE --position P
@@ -31,6 +33,39 @@ to `--out` as JSON. `project` installs `--artifact` at `--position` and
 prints the SM's canonical projection to stdout. Both exit non-zero on
 failure; `uc2-diffreplay` treats a non-zero exit from `replay` as a hard
 error (spawn/replay failure), not a divergence.
+
+The third is the **serve** form, which `pin-verify` runs and the service
+binaries in the tree already have — `examples/kv`, `examples/counter` and
+`register-replay serve` all meet it (`uc_crashtest-service` does not register
+a SIGTERM handler, so a clean stop of it dies by signal rather than exiting
+0; it is a crash-test half, not a template):
+
+    <bin> <serve argv…> --instance-dir D --app-id A
+
+It attaches to the node at `D` and applies until it is stopped. Two things
+about it are contract rather than convention: a clean stop (SIGTERM) exits
+**0**, and a **failed attach exits non-zero with the error on stderr** —
+which is how `pin-verify`'s refusal arm sees a pin's
+`ServiceError::PinnedVersionMismatch`. `<serve argv…>` is whatever the app
+calls its serve verb plus its own knobs — and it may be **empty**: for
+`kv-service` and `counter-service` serving is what the binary does with no
+subcommand at all.
+
+**One knob list drives all three forms.** `pin-verify` takes the serve argv
+(`--old-arg serve --new-arg serve --new-arg --double`), and
+[`uc_diffreplay::pinverify::app_knobs`] strips the leading verb so the
+`replay` and `project` forms can put their own verb in front of the same
+knobs. An app's knobs therefore have to ride **after** its verb — a first
+argument beginning with `-` is treated as a knob, not a verb, and kept.
+
+`uc2-diffreplay pin-verify` is the live half of the `reconstruction` mode
+(spec §6.2 part 2): on a throwaway single-voter node, with the app's real
+binaries, it places a real `uc2ctl upgrade pin` and checks that the stale
+binary is refused by name and that the new one's live state is the ARTIFACT
+path's rather than the genesis counterfactual's.
+`docs/how-to/diff-replay.md` § "Verify the pin live" is the command, the
+verdict table and how to give a span something the counterfactual can
+disagree about.
 
 ## The declaration (`intent.toml`)
 
@@ -115,8 +150,8 @@ part in every mode.
 
 ## Running the tests
 
-The e2e and reconstruction tests shell out to prebuilt binaries and hard-assert
-they exist, so build them first:
+The e2e, reconstruction and pin-verify tests shell out to prebuilt binaries
+and hard-assert they exist, so build them first:
 
     cargo build -p uc_lincheck --features replay-bin --bin register-replay
     cargo build -p uc_diffreplay
@@ -124,3 +159,10 @@ they exist, so build them first:
 (the second one is what `examples/kv`'s `regression_corpora` test needs). Then
 
     cargo test -p uc_diffreplay -p uc_service -p uc_lincheck -p kv_store
+
+`tests/pin_verify.rs` is the heaviest of them: every case runs a real node
+and a real service process per era, and the cases that complete the swap arm
+run the app binary three more times (one `project`, two `replay`), so it needs
+the `register-replay` fixture built above and runs best on its own —
+
+    cargo test -p uc_diffreplay --test pin_verify -- --test-threads=1

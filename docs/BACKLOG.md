@@ -436,6 +436,49 @@ reviewer wants a workload to attack.
   `docs/releases.md`, which plan D owns. Recorded here 2026-09-21 because the
   SDD ledger and the task report that carry it today are working artifacts
   that get archived.
+- **`pin-verify` against a real cluster, and against a learner.**
+  `uc2-diffreplay pin-verify` (plan C) proves S4's refusal and the pinned
+  install's artifact path on **one** node — a single voter in a scratch
+  instance dir — so it says nothing about the step the upgrade how-to leans
+  on hardest: "confirm the pin is visible on EVERY node before you stop
+  anything". A multi-node rig would let the mode judge a pin that has
+  committed on some nodes and not others, and a learner arm would cover the
+  row shape that declares but never serves. Recorded 2026-09-21 in
+  `docs/VERIFICATION.md` § "What `pin_verify.rs` does NOT verify".
+- **A spurious `service_detached` record right after every attach.**
+  `uc_node::node`'s `note_service_transitions` (~`uc_node/src/node.rs:4738`)
+  decides whether a row is `live` from its `heartbeat_ns` word, and the
+  sample after an attach can still read `0` there — so `live` is false, the
+  `service_was_live` latch set at the attach edge clears, and that sample
+  emits a `service_detached` record about a service that never detached,
+  microseconds after its `service_attached`. Harmless to the node, but it
+  makes the obs stream lie about the one transition an operator watches
+  during an upgrade window.
+  Found by plan C T2 (the `pin-verify` rig watches exactly these
+  transitions); ticket-worthy. Recorded 2026-09-21.
+- **`uc_diffreplay` has never compiled with `--no-default-features
+  --all-targets`.** Pre-existing — its test targets call `Corpus::export`,
+  gated behind the `export` feature, with no `required-features` line — but
+  **plan C widened it**, and the widened form is what a fixer will meet.
+  Measured on this HEAD the first errors are `unresolved import
+  uc_diffreplay::live` ×2 and `cannot find live in uc_diffreplay` ×8:
+  `tests/common/mod.rs` now `pub use`s `live::*`, and `common` is compiled
+  into **every** test target in the directory, so the fix is
+  `required-features = ["export", "pin-verify"]` on *every* target, not one
+  key on the two that call `export` — plus the wider clippy run added to CI.
+  Only the `--lib --bins` form of that run is in the proof stack today.
+  Found by plan C T2, cause and fix corrected by plan C's final review,
+  recorded 2026-09-21.
+- **Plan D carries: `docs/how-to/upgrade-an-application.md` still describes
+  the 2.12.0 flag day, with no step structure.** The page an operator lands
+  on from `RELEASES.md` still walks a stop-everything flag day; the pinned
+  upgrade the 2.13.0 lifecycle work ships needs it rewritten around the S4
+  sequence — the `uc2-diffreplay pin-verify` rehearsal (already linked from
+  its preamble), the live `/metrics` check, and `uc2ctl upgrade show`
+  landing one instant behind the artifact it reads. That rewrite lands with
+  the 2.13.0 release writeup, which plan D owns. Recorded here 2026-09-21
+  because the SDD ledger and the task report that carry it today are working
+  artifacts that get archived.
 
 ## Accepted residuals — listed so they are not re-proposed
 

@@ -367,6 +367,74 @@ through a running node, answered by the same code path an operator's
 counterfactual disagree (`Some(4)` vs `Some(8)`) on the DEFAULT (purge-off)
 configuration, not just the purging one above.
 
+**The black-box end of the same claim (plan C):
+`uc_diffreplay/tests/pin_verify.rs`.** Everything above links the service SDK
+into the test process. `uc2-diffreplay pin-verify` (spec §6.2 part 2) instead
+runs the app's real binaries as child processes against a real node and
+judges what UC's own surfaces say, and this suite is five end-to-end cases of
+it on the `register-replay` fixture — a node, a service process per era and,
+in the cases that get that far, a real admin `upgrade pin` and three further
+runs of the app binary (one `project`, two `replay`); the same-version case
+is refused before the pin, and the stale-NEW case stops at the un-attached
+swap arm. What they prove: the stale binary is
+**refused by name** after the pin (a non-zero
+exit whose stderr carries `ServiceError::PinnedVersionMismatch`'s own
+phrase, pinned to the Display by
+`the_refusal_marker_is_the_sdks_own_text`); the swapped-in binary's LIVE
+state equals what replaying the span from the pinned **artifact** computes
+and differs from the genesis counterfactual
+(`an_in_memory_register_passes_and_demonstrates_the_counterfactual`); and
+the same for a state machine that persisted past the origin and therefore
+has to be rewound to it
+(`a_durable_register_is_rewound_to_the_origin_and_passes`, over
+`uc_lincheck::register::Durable<S>`) — the empty and durable shapes §6.2 asks
+for. **What makes that rewind observable** is named, because "OLD was
+stopped above P" is only the precondition: the mode requires NEW to have
+printed the SDK's own `pinned install of snap-P` line on its stderr
+(`SwapArm::install_logged`, the same class of evidence as the refusal
+marker, pinned by `the_install_marker_is_the_sdks_own_text`), and the
+durable case additionally runs NEW as `register-replay --double-cas`
+(`DoublingCasRegisterSm`, `VERSION = 3`), a version change that touches a
+history-PRESERVING command. That matters because a durable service's wrong
+path is not the genesis replay — it is continuing from X with the state it
+persisted — and with a last-write-wins register and a `Write`-only change
+the artifact path and continue-from-X compute the same value, so state alone
+could not have told them apart. The teeth are three: a NEW binary that is not the pinned version is a
+FAIL rather than a pass
+(`a_new_binary_that_is_not_the_pinned_version_is_a_fail`), a span whose
+commands cannot tell the two paths apart is INCONCLUSIVE rather than a pass
+(`a_pure_write_corpus_is_inconclusive_not_a_pass`), and a run whose OLD
+already IS the pinned version is refused before any pin is placed
+(`a_same_version_run_is_refused_before_the_pin`), because that run's refusal
+arm could not have refused anything. The evidence one run carried, as
+recorded in its own report: P=12864 < X=16160 < Q=16256, the artifact path
+and the live state both projecting `value=Some(249)` where the genesis path
+projects `value=Some(398)`. The durable case, on the same span with
+`--double-cas`, parts all three: live and artifact both `value=Some(400)`,
+genesis `value=Some(398)`, and the continue-from-X value a skipped install
+would have left — `value=Some(249)`, measured on the `--double` build this
+case used before — equal to neither.
+
+**What `pin_verify.rs` does NOT verify.** It is **one node** — a single
+voter in a scratch instance dir — so nothing here is evidence about a pin
+propagating across a cluster, about the "confirm the pin on every node"
+step, or about a node that has not applied the pin yet. It cannot tell
+whether an arbitrary app's state machine is durable or in-memory: the
+sequence exercises both shapes (OLD is stopped at X > P before the pin), but
+the check is the same either way, and only the fixture pins each shape by
+construction. `TIMER` frames in a corpus are skipped and counted, never
+re-submitted — a node mints those — so a timer-driven divergence is outside
+what a span can demonstrate here. Nor is the re-submission row-aware:
+`live::message_frames` re-submits **every** `MESSAGE` frame in the span
+regardless of which row the recorded cluster routed it to (it inherits
+`drive::walk_block`'s dispatch), so on a corpus exported from a multi-FSM
+cluster the mode feeds other rows' commands into `--row`. Both paths see the
+same bytes, so the comparison itself is unaffected — but the span being
+replayed is not the row's own history. And `uc2ctl upgrade show` is deliberately
+not consulted (its record lands one instant behind the artifact it reads),
+so this suite says nothing about that surface; the metrics and `upgrade
+show` readings are covered by the plan B1/B3 tests above.
+
 **The producing half (plan B3): live snapshot-hash reports.** Plans B1 and B2
 left `SnapshotReport` recorded, replicated and observable but never
 *produced*. Plan B3 is the producer, and each of its four seams has its own
