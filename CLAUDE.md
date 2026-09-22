@@ -14,7 +14,58 @@ took those names in the `uc2_*` → `uc_*` rename (see `RELEASES.md`), so a
 pre-rename commit or doc naming them means the deleted v1 crate, not this
 code.
 
-**Current version: `2.12.0`** — tagged 2026-09-13 at `a5c42a8`: jumbo-frame
+**The newest TAG is `2.12.0`; `main` carries `2.13.0`, UNRELEASED.** There is
+no `2.13.0` tag, no `2.13.0` release object and nothing at `2.13.0` on
+crates.io until `docs/how-to/cut-a-release.md` §2–§7 have been run — never
+write or assume otherwise. The writeup is already in place
+(`RELEASES.md`, `docs/releases.md`), with `<tag date>` scaffolds the tagger
+fills.
+
+**`2.13.0` — on `main`, unreleased: the FSM upgrade lifecycle.** Upgrading a
+state machine becomes a **pinned, per-row** procedure the platform enforces:
+you take a coordinated instant, name that position as the upgrade's ORIGIN
+(`uc2ctl upgrade pin`), and from that commit every instance of the row
+installs that one artifact at attach before applying anything, while the old
+binary is refused by name. One flag day — wire `0.8.0` → `0.9.0` (`CLUSTER`
+kinds 4 `UpgradePin` / 5 `SnapshotReport`, pairwise `SNAP_REPORT` 26) and cnc
+`3.2` → `3.3` (status-line words `+16 upgrade_origin`, `+24 pinned_version`,
+`+32 pin_seq`, `+40 pinned_from`; slot line 7 `+504 artifact_hash`) — plus a
+row-artifact envelope change, `ULTSNAP2` (24 B, carrying the `S::VERSION` that
+built the artifact; `ULTSNAP1` refused by name). Six branches, all merged:
+**A** #50 (`uc_diffreplay`, the diff-replay harness), **B1** #51 (the two
+cluster records, `uc2ctl upgrade pin/show`, admin op 10, refusals 52–59), **B2**
+#52 (the pinned install at attach, four attach refusals, `ULTSNAP2`, the
+purge-floor hold), the CI hotfix #53, **B3** #54 (live snapshot-hash reports
+and the pins-authoritative readiness gate), the docs hotfix #55, **C** #56
+(`uc2-diffreplay pin-verify`), and **D** (this writeup, the SDLC standard, the
+per-row upgrade how-to, the `diff-replay-judge` skill). Spec
+`docs/superpowers/specs/2026-09-19-uc2-fsm-upgrade-lifecycle-design.md` — read
+its **five** "Errata … as built" blocks (B1, B2, B3, C, D) before the body.
+What a new task must know:
+  - **Stop every node before starting any node** (the flag day), and clear
+    `snapshots/<row>/` ONCE per node in the window. That wipe needs a durable
+    state machine or a journal that still holds genesis — **purge-on plus an
+    in-memory state machine cannot wipe** and waits for the backlog's envelope
+    migration tool. `snapshots/cluster/` is untouched.
+  - **Start every node before attaching any service or client.** `attach` now
+    gates on the node having JOINED its cluster (leader known ∧ commit learned
+    ∧ the cluster agent's walk consumed to commit); until then every door
+    refuses `NodeBooting` and waits `boot_wait` (default 10 s, on
+    `ServiceConfig`/`EngineConfig`/`PipelinedConfig`). Every in-tree harness was
+    re-shaped node-then-service; a new one must be too.
+  - **A pin is a ONE-WAY DOOR.** There is no unpin verb; monotonicity is
+    checked on the ORIGIN, not the version; after the pin commits the only
+    rollback is the pre-upgrade off-node backup restored on every node.
+  - **`uc2_cluster_fsm_position` was REPOINTED** to the cluster agent's walk
+    cursor (`consumed`) — same name, different quantity than `2.11.0`
+    exported. Recorded as a changed reading in both release docs.
+  - **Fourteen publishable crates now**, `uc_diffreplay` the new one, published
+    after `uc_node` and before `uc_remote`.
+  - **Run the MSRV clippy gate locally before pushing** (see § Build & Test):
+    1.89's clippy fires lints the pinned 1.96 does not, which is how PR #56
+    went red on a branch whose whole local proof stack was green.
+
+**Previous tagged version: `2.12.0`** — tagged 2026-09-13 at `a5c42a8`: jumbo-frame
 discovery and the monotonic log clock, one flag day (wire `0.7.0` → `0.8.0`,
 cnc `3.1` → `3.2`); the next block is what it shipped and how it was gated.
 All 13 crates published to crates.io the same day in 68 s, zero retries, so
@@ -109,16 +160,20 @@ rate-limit note is now measured on both runs: crates.io limits **new crate
 names** hard and new *versions* barely at all, so `2.9.0`'s twelve new
 names took 62 minutes and `2.10.0`'s one took 59 seconds.)
 
-Next up, now that `2.12.0` is tagged and published: (1) **the standing bar
+Next up: (1) **cut `2.13.0`** — the writeup, the version bump and the proof
+stack are this plan's; `docs/how-to/cut-a-release.md` §2–§7 (workflow dry run,
+tag, verify artifacts, the ordered crates.io publish of **fourteen** crates,
+after-the-tag) are the maintainer's, and `uc_diffreplay` is a NEW crate name,
+so budget for the new-name rate limit; (2) **the standing bar
 question** — the `2.12.0` gates added two more rate bars an order of magnitude
 below the rig's variance, so four bars across two releases are now unadjudicable
 as written; how to construct a rate bar this rig can actually rule on is a
-maintainer decision, not a run; (2) a feasible **re-run of jumbo row b at the
+maintainer decision, not a run; (3) a feasible **re-run of jumbo row b at the
 29 pairs its own rule calls for** — the 2026-09-13 run judged 12, which is why
-its −3 % is inconclusive rather than a verdict; (3) **row c's soak instrument**,
-which does not exist, so that row stays NOT RUN and jumbo stays a knob; (4) a
+its −3 % is inconclusive rather than a verdict; (4) **row c's soak instrument**,
+which does not exist, so that row stays NOT RUN and jumbo stays a knob; (5) a
 fleet re-run of the time-and-timers rows a/b/e under the paired statistic, and
-of row c under its restated bar; (5) **B-lite's disposition**, still
+of row c under its restated bar; (6) **B-lite's disposition**, still
 undetermined. Two carried-over unknowns, neither blocking: the 58-minute
 `remote_lin` hang of 2026-09-08 is still unexplained (it fails with a name now,
 since `common::join_within` and the 30 s `Reap::drop` landed 2026-09-12), and
@@ -216,7 +271,15 @@ one log stream (#11); the release-ledger line (#5) is process, not code
 
 ### Standing facts that bind new work
 
-- **The wire protocol SHIPPED is 0.8.0** (`2.12.0`, cnc `3.2`) — two pairwise
+- **The wire protocol on `main` is 0.9.0** (`2.13.0`, cnc `3.3`, unreleased);
+  **0.8.0 + cnc `3.2` is the newest TAG** (`2.12.0`). `0.9.0` adds `CLUSTER`
+  kinds 4 `UpgradePin` and 5 `SnapshotReport` plus pairwise `SNAP_REPORT` 26,
+  with no layout change either side — which is exactly why it is unsound to
+  mix: a `0.8.0` peer parses those frames and drops them as an unknown kind,
+  so its cluster FSM diverges in silence instead of stalling. `2.13.0` also
+  changes the row artifact envelope (`ULTSNAP2`, `ULTSNAP1` refused by name),
+  so that flag day costs one wipe of `snapshots/<row>/` per node.
+  `0.8.0` (`2.12.0`, cnc `3.2`) was two pairwise
   datagram kinds, 24/25, and one cnc word at 3984, with no layout change
   either side, so a `0.7.0` peer drops the probes and such a cluster simply
   never raises its ceiling. `0.7.0` + cnc `3.1` was `2.11.0`.
@@ -494,9 +557,14 @@ one log stream (#11); the release-ledger line (#5) is process, not code
   remote-reachable; lag policy per node must match cluster-wide (checked on
   the snapshot path); one stalled FSM on a quorum of hosts stalls commit by
   design (report ceiling); `service.<id>.lock` per FSM.
-- **13 publishable crates, versioned in lockstep** with the tag and the
+- **14 publishable crates, versioned in lockstep** with the tag and the
   image; `uc_sim`, `uc_lincheck` and the example crates are
-  `publish = false`. Publishing is manual and ordered
+  `publish = false`. `uc_diffreplay` is the fourteenth, new in `2.13.0` —
+  it publishes **after `uc_node` and before `uc_remote`** (it depends on
+  `uc_service`, `uc_protocol` and `uc_journal` outright, and on
+  `uc_node`/`uc_net`/`uc_log`/`uc_client` through its default `export` and
+  `pin-verify` features), and it is a NEW crate name, so its first publish
+  meets crates.io's new-name rate limit. Publishing is manual and ordered
   (`docs/how-to/cut-a-release.md` §6) — and the order **flipped** in
   `2.11.0`: `uc_node` now depends on `uc_service` (the
   cluster FSM implements the same traits a user's state machine does), so
@@ -552,7 +620,12 @@ Canonical documents, in order:
 MSRV is 1.89 (`rust-version` in the root `Cargo.toml`'s `[workspace.package]`
 — see that field's comment for how it was probed; CI's `msrv` job runs
 `cargo clippy --workspace --all-targets --locked -- -D warnings` directly
-against a 1.89.0 toolchain, not just `check`). Local dev, the rest of CI, and releases
+against a 1.89.0 toolchain, not just `check`). **Run that gate locally before
+you push**: 1.89's clippy fires lints the pinned 1.96 does not, so a branch
+whose whole local proof stack is green can still turn the `msrv` job red — it
+did on PR #56 (`let_and_return`), and the pinned-toolchain proof stack could
+not have caught it. Use a separate `CARGO_TARGET_DIR`; the command is in the
+block below. Local dev, the rest of CI, and releases
 build on the newer stable pinned in `rust-toolchain.toml` (currently 1.96.0;
 rustup auto-installs it). To bump the pin: `rustup toolchain install <ver>
 --profile minimal --component rustfmt --component clippy`, update `channel`
@@ -568,7 +641,9 @@ cargo build -p uc_lincheck --features replay-bin --bin register-replay \
 cargo test -p uc_node --test lin_v2             # WGL linearizability capstone (failover + purge/snapshot churn)
 cargo test -p uc_node --test lin_partition_v2   # network-partition / quorum-loss linearizability
 cargo test -p uc_crashtest --features hard-crash-tests   # spawn real node+service procs; SIGKILL mid-load, assert linearizable
+cargo test -p uc_diffreplay --test pin_verify -- --test-threads=1   # pin-verify e2e: real node + two service procs per case
 cargo clippy --workspace --all-targets -- -D warnings     # lint (must pass with zero warnings)
+CARGO_TARGET_DIR=$HOME/.cache/cargo-target-msrv cargo +1.89.0 clippy --workspace --all-targets --locked -- -D warnings  # the MSRV gate — RUN IT BEFORE EVERY PUSH
 cargo run -p uc_node --release --example m5_gate # throughput gate harness (see the gate doc)
 cargo run -p uc_node --release --example m6_gate -- all --secs 6 --cycles 5   # snapshots/learners/purge gate
 cargo run -p uc_node --release --example m7_gate -- all --secs 6             # live reconfig gate (replace/resize/self-removal)
@@ -670,6 +745,23 @@ Workspace crates:
   ships as the `uc2-gateway` binary + `gateway.toml` + a systemd unit.
   **M13**: a global outstanding-grant budget — the sum of per-connection
   credits never exceeds the node's admission window.
+- `uc_diffreplay` — **2.13.0**, the fourteenth published crate: the diff-replay
+  harness and its `uc2-diffreplay` binary. Takes a *corpus* (a `uc2ctl
+  backup`-shaped directory: one artifact at P plus the journal span to Q),
+  drives it through two builds of a state machine with an **in-process replay
+  driver** (never a one-node cluster — journal replay publishes no responses,
+  so a real node would yield an empty output surface), and captures five
+  surfaces per position: responses, `svc_sched` records, the state projection
+  at origin and end, `ApplyCtx::ids_calls`, and the `on_committed` outcome.
+  `diff` → `attribute` (tag × touched arm) → `confirm` against an
+  `intent.toml` declaration; an unexplained, undeclared or absent entry fails
+  the run. Modes `upgrade` / `determinism` / `reconstruction` / `pin-verify`
+  (the last spawns a real node and the app's real service binaries). An app
+  takes part by embedding the driver behind `replay`/`project` subcommands on
+  its own binary, so the interface is a JSON trace, not a linked crate — a
+  non-Rust service can play, except in `pin-verify`, whose PASS needs the Rust
+  SDK's own stderr marker. `default = ["export", "pin-verify"]`; an embedding
+  app takes `default-features = false` and links no node.
 - `uc_lincheck` — test/verification library: WGL linearizability `checker`, op
   `history` recorder, `model`, and the in-memory CAS-`register` SM
   (`Cmd`/`CmdResp`/`RegisterSm: uc_service::StateMachine`). One source of truth

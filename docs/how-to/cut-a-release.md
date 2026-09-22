@@ -232,7 +232,7 @@ It should print `PASS` on a machine that has never had a Rust toolchain on it.
 
 ## 6. Publish to crates.io — manually, in this order
 
-This is not in the workflow, on purpose. Thirteen crates, each of which must be
+This is not in the workflow, on purpose. Fourteen crates, each of which must be
 *indexed* by the registry before the next one can resolve it, and every
 version is permanent. An automated retry loop against an irreversible
 operation is a bad trade; a person watching each one is not.
@@ -250,6 +250,7 @@ cargo publish -p uc_net
 cargo publish -p uc_client
 cargo publish -p uc_service
 cargo publish -p uc_node
+cargo publish -p uc_diffreplay
 cargo publish -p uc_remote
 cargo publish -p uc_gateway
 cargo publish -p uc_ctl
@@ -257,14 +258,27 @@ cargo publish -p uc_ctl
 
 `uc_node` depends on `uc_service` since the cluster FSM (2.11.0), so `uc_service` publishes first; `uc_service`'s dev-dependency on `uc_node` is unversioned and stripped by `cargo package`.
 
+`uc_diffreplay` is the **fourteenth** crate, new in `2.13.0`, and it goes after
+`uc_node`: it depends on `uc_service`, `uc_protocol` and `uc_journal`
+unconditionally, and on `uc_node`, `uc_net`, `uc_log` and `uc_client` through
+its default `export` and `pin-verify` features — all of which publish earlier in
+this list. It is published rather than held back because an application's own
+CI is the intended caller of `uc2-diffreplay`, and because a corpus recorded by
+one version must be replayable by the next.
+
 Wait for each to appear on crates.io before starting the next — `cargo
 publish` returns before the index has caught up, and the next crate's
 dependency resolution reads the index. Modern cargo blocks on this for you;
 if a publish fails with "no matching package named …", the previous one has
 not indexed yet, so wait and re-run just that one.
 
-`uc_sim`, `uc_lincheck`, `counter` and `uc_crashtest` are `publish = false`:
-they are the proof and teaching apparatus, not the product.
+`uc_sim`, `uc_lincheck`, `counter`, `kv_store` and `uc_crashtest` are
+`publish = false`: they are the proof and teaching apparatus, not the product.
+`uc_lincheck` stays in that list even though the dependency now runs both ways:
+it takes `uc_diffreplay` as an *optional* dependency behind its `replay-bin`
+fixture feature, and `uc_diffreplay` takes `uc_lincheck` as an unversioned
+**dev**-dependency, which `cargo package` strips. Neither direction puts
+`uc_lincheck` on crates.io.
 
 **Expect 429s on a name's FIRST publish.** crates.io rate-limits *new crate
 names* much harder than new versions of an existing one — measured on the

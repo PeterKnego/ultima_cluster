@@ -340,6 +340,37 @@ fail-stop under a length check. Only case E (field reorder) is byte-identical
 and survives it. That check is [#49], deliverable 3 — the interim fix until the
 codec is replaced.
 
+#### Errata (plan D, as built)
+
+One correction to the paragraphs above, from reading the code the SDLC
+standard and the `diff-replay-judge` skill had to state precisely:
+
+1. **The `IdGen` ordinal is per GENERATOR, not per apply call, and the two
+   changes that follow are different bugs.** "The `IdGen` trap" above says the
+   id "depends on the **ordinal within the apply call**" and that minting two
+   ids where one was minted before shifts every subsequent id. Neither half is
+   quite right as built (`uc_service/src/ids.rs`). `IdGen::new(position,
+   identity)` starts a **fresh** generator at ordinal `0`, and `next()`
+   advances only *that* generator's counter, so:
+   - a **second `ctx.ids()` in the same apply** hands back a generator over the
+     same `position` and the same `fold32(identity)` starting again at ordinal
+     `0` — it mints the **identical series** as the first. The failure is
+     **duplicate ids**, not shifted ones (pinned by `ids.rs`'s own
+     `same_inputs_same_series` test);
+   - an **extra `next()` on one generator** is the shifting change: every later
+     id taken from *that* generator differs, and a replica replaying the span
+     under the new binary gets different ids than the old binary wrote.
+
+   Only the first is a **captured surface**: the driver records each frame's
+   `ctx.ids()` call count as `ids_calls` (`Surface::Ids`, spelled `ids` in a
+   declaration), and nothing counts `next()` calls — so a changed mint count
+   within one generator surfaces only indirectly, through the responses and
+   the state it feeds. A review of a version change must therefore ask two
+   questions, not one: how many generators an arm takes, and how many ids it
+   mints from each. Stated correctly in
+   `docs/reference/application-sdlc.md` § The change taxonomy and in
+   `.claude/skills/diff-replay-judge/SKILL.md`.
+
 ### 2.5 The version is an input, and it is not in the log
 
 #### Errata (plan B1, as built)
@@ -1074,7 +1105,7 @@ different dependencies:
 
 #### Errata (plan C, as built)
 
-Nine places execution diverged from the two-part statement above, or filled
+Ten places execution diverged from the two-part statement above, or filled
 in a detail it left open. Read them BEFORE the body: part 2 is
 `uc2-diffreplay pin-verify` (`docs/how-to/diff-replay.md` § "Verify the pin
 live"), and three of these change what the mode can be asked to do at all
@@ -1169,6 +1200,22 @@ live"), and three of these change what the mode can be asked to do at all
      fixture's corpus that gives artifact/live = 400, continue-from-X = 249
      and genesis = 398, three distinct values. An app's own corpus and
      version change need the same property before (b) adds anything to (a).
+10. **`pin-verify` is the one mode that is NOT language-agnostic** (recorded
+    by plan D). §6.3's table below says "Language: any — the raw tier
+    explicitly invites non-Rust", and that holds for `replay`, `project`,
+    `determinism` and `upgrade`: their interface is the JSON trace, which any
+    binary can write. It does **not** hold for `pin-verify`. Erratum 9(a)
+    makes a PASS (and an INCONCLUSIVE) require the marker line
+    `uc_service: row R pinned install of snap-P …` on the new service's own
+    stderr, and only `uc_service`'s Rust attach path prints it. A non-Rust
+    service half — or a Rust one launched behind a wrapper, supervisor or
+    container runtime that swallows or rewrites stderr — therefore always
+    FAILs `pin-verify`, however correct its behaviour. Two ways out if one is
+    ever wanted, neither built: a marker the app itself is required to emit
+    (which weakens the evidence class, since the app would be attesting to
+    its own install), or an out-of-band observation of the install by the node.
+    Until then, `pin-verify` is a Rust-SDK mode and §6.3's row should be read
+    as "any, except `pin-verify`".
 
 ### 6.3 Black-box before white-box
 

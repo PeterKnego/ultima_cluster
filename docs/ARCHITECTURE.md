@@ -318,17 +318,18 @@ can forge fan-out traffic as any node. See runbook §11.
 | `uc_remote` | The remote wire protocol (framed TCP, credit-gated flow control) and its Rust client: `RemoteEngine`'s split `RemoteSendHalf`/`RemotePollHalf` (two threads per connection, batched writes, no lock on the request path) plus the blocking `RemoteClient` convenience built on them — for clients that can't attach to shmem directly |
 | `uc_gateway` | The `Edge`: a per-node TCP front door relaying `uc_remote` traffic over the local `Engine`; ships as the `uc2-gateway` binary + `gateway.toml` |
 | `uc_lincheck` | WGL linearizability checker + history recorder + register model |
+| `uc_diffreplay` | Diff replay (2.13.0): drive one corpus (an artifact plus a journal span) through two builds of a state machine, diff every captured surface, attribute each difference to a code arm, confirm against a declared intent; `uc2-diffreplay`'s `upgrade`, `determinism`, `reconstruction` and `pin-verify` modes |
 | `uc_journal` | Segmented append journal + atomic `StableValue`s |
 
 Builds standalone, with **no external storage dependency**: durability is
 `uc_journal`, in-tree. A service brings its own state machine; UC neither
 ships nor requires a store.
 
-**Published to crates.io:** thirteen crates, prepared and gated in CI,
+**Published to crates.io:** fourteen crates, prepared and gated in CI,
 published **in lockstep at one version** — which is also the git tag, the
-tarball name and the image tag. That is the thirteen crates in the table above, minus `uc_sim` and
+tarball name and the image tag. That is the crates in the table above, minus `uc_sim` and
 `uc_lincheck`, plus `uc2ctl` (the admin CLI: a binary crate, so it has no row
-here). `uc_sim`, `uc_lincheck` and the two example crates are
+here). `uc_sim`, `uc_lincheck` and the example crates are
 `publish = false`: proof and teaching apparatus, not product. What that
 version number promises, and what it deliberately does not, is
 [the semver policy](reference/semver-policy.md).

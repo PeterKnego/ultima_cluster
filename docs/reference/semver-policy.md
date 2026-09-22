@@ -203,9 +203,11 @@ Also outside the promise:
   `uc_gateway/test-util` (`Edge::fault_for_tests`),
   `uc_protocol/uc-bench-probes`, `uc_journal/bench-support`,
   `uc_node/mutation-testing` and `uc_consensus/mutation-testing`.
-- **`uc_sim`, `uc_lincheck`, `examples/counter`, `testing/uc_crashtest`.**
-  These are `publish = false`: the proof and teaching apparatus, not the
-  product. Nothing in them is API, and they are not on crates.io.
+- **`uc_sim`, `uc_lincheck`, `examples/counter`, `examples/kv`,
+  `testing/uc_crashtest`.** These are `publish = false`: the proof and teaching
+  apparatus, not the product. Nothing in them is API, and they are not on
+  crates.io. (`uc_diffreplay` is **not** in this list — it is the fourteenth
+  published crate, because an application's own CI runs its driver.)
 
 ## The wire and the cnc page are flag-day, not semver
 
@@ -214,7 +216,8 @@ Two version numbers are deliberately *outside* this policy, because semver's
 
 - **The node-to-node wire protocol** (`uc_protocol::version::CURRENT`,
   currently `0.9.0` (`2.13.0`, the FSM upgrade lifecycle's two new `CLUSTER`
-  kinds) — see [wire protocol](wire-protocol.md)).
+  kinds and one new pairwise datagram kind) — see
+  [wire protocol](wire-protocol.md)).
 - **The `cnc.dat` page layout** (`CNC_V2_VERSION`, currently cnc `3.3`
   (`2.13.0`) — see [the cnc control page](cnc-page.md)).
 
@@ -267,18 +270,72 @@ new build.
 ### The `2.13.0` flag day
 
 The FSM upgrade lifecycle is a further, separate flag day: wire `0.8.0` →
-`0.9.0` and cnc `3.2` → `3.3`. Two new `CLUSTER` kinds, `4` `UpgradePin` and
-`5` `SnapshotReport` ([wire protocol](wire-protocol.md#cluster-body-wire-070)) —
-no existing wire layout change, so a `0.8.0` peer's frames of these kinds
-still *parse* (the `CLUSTER` prefix is unchanged) but decode as an unknown
-kind and are dropped, and that node's cluster FSM silently diverges from one
-that applied them: stop every node before starting any node, exactly as for
-a layout change. Two new node-written cnc words on the service status line,
-`upgrade_origin` (`+16`) and `pinned_version` (`+24`)
-([cnc page](cnc-page.md#counters-and-status)). `ClusterFsm::VERSION` itself
-stays `1` — it is the cluster image's own on-disk version (`2`, since this
-flag day) that gates artifact compatibility, not the FSM identity version a
-user's own state machine declares.
+`0.9.0` and cnc `3.2` → `3.3`. It is three surfaces, not two, and the third
+one costs a file deletion on every node.
+
+**Wire `0.9.0`.** Two new `CLUSTER` kinds, `4` `UpgradePin` and `5`
+`SnapshotReport` ([wire protocol](wire-protocol.md#cluster-body-wire-070)),
+and one new **pairwise** datagram kind, `SNAP_REPORT` (`26`), which carries a
+node's `(row, position, artifact hash)` to the leader. No existing wire layout
+changes, so a `0.8.0` peer's frames of these kinds still *parse* (the `CLUSTER`
+prefix is unchanged) but decode as an unknown kind and are dropped, and that
+node's cluster FSM silently diverges from one that applied them: stop every
+node before starting any node, exactly as for a layout change.
+
+**cnc `3.3`.** Four new node-written words on the row's **service status
+line** — `upgrade_origin` (`+16`), `pinned_version` (`+24`), the seqlock commit
+word `pin_seq` (`+32`) and `pinned_from` (`+40`) — plus one
+**service**-written word on slot line 7, `artifact_hash` (`+504`)
+([cnc page](cnc-page.md#counters-and-status)). The first four are published
+together under `pin_seq`: a reader takes them through
+`ServiceStatusLine::pin()`, which returns a set of values that were stored
+together, or reports the read as contended. `ClusterFsm::VERSION` itself stays
+`1` — it is the cluster image's own on-disk version (`2`, since this flag day)
+that gates artifact compatibility, not the FSM identity version a user's own
+state machine declares, and a version-1 image is still **read** (with empty
+pin and report histories), so a `2.12.0` node's recovered cluster artifact is
+fine.
+
+**`ULTSNAP2`, and the one-time wipe.** Every **row** artifact now carries a
+24-byte envelope, `magic ‖ P: u64 ‖ version: u32 ‖ 4 reserved`, naming the
+`S::VERSION` that built it — which is what the pinned install's cross-check
+reads. `ULTSNAP1` (16 bytes, no version field) is refused **by name**, never
+decoded as version 0, so **`snapshots/<row>/` is cleared once per node** during
+the upgrade window. `snapshots/cluster/` is untouched. The precondition is
+stated in [Upgrade a
+cluster](../how-to/upgrade-a-cluster.md#wire--cnc-change-in-2130-upgrade-pins-and-snapshot-reports-090-cnc-33):
+the row must be able to rebuild what was deleted, which means a durable state
+machine or a journal that still holds genesis. A cluster running purge with an
+in-memory state machine can do neither.
+
+### `2.13.0` API notes
+
+Three public-API changes ride this minor. None of them is a semver *break* by
+the rules above, and all three are named here rather than left to be
+discovered at a downstream `cargo build`.
+
+- **`boot_wait` is a new public field on three config structs** —
+  `uc_service::ServiceConfig`, `uc_client::EngineConfig` and
+  `uc_client::PipelinedConfig` ([configuration §
+  `boot_wait`](configuration.md#attaching-a-service-or-a-client-boot_wait)).
+  Adding a public field to a struct with public fields is **additive for every
+  caller that constructs it from `Default` or a builder, and breaking for one
+  that writes an exhaustive struct literal**. This policy's position: a struct
+  whose fields are public and whose `Default` is the documented way to build it
+  may gain a field in a minor; a caller that spells every field out is asking
+  for that coupling, and the fix is `..Default::default()`. The alternative —
+  `#[non_exhaustive]` on the config structs — would break the plain-struct
+  construction the SDK's own examples use, which is a worse trade.
+- **`ApplyCtx::ids` takes `&mut self`** (`uc_service/src/traits.rs`), because
+  the driver counts a frame's `ids()` calls as a comparison surface. `apply`
+  receives `&mut ApplyCtx`, so every in-tree caller and every ordinary state
+  machine compiles unchanged; a caller holding a shared `&ApplyCtx` is the one
+  shape that does not.
+- **`SnapshotStateMachine::project` is a provided method**, not a required one,
+  so no existing implementation has to change. The default returns
+  `SnapshotError::Codec("project() not implemented by this state machine")`, so
+  a row that never overrides it simply has no state surface for diff replay to
+  compare — implement it if you want one.
 
 ## The one-way door: one tier per type
 

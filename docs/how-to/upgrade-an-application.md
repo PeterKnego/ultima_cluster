@@ -376,7 +376,7 @@ refused (`55 pin_not_monotone`). It is the **origin** that is checked for
 monotonicity, not the version — so a pin back to `--to 1.0.0` at a *newer*
 origin is accepted, and it is still not a rollback: the artifact at that newer
 origin was written by the new version, in the new version's image format, which
-the old binary refuses by name. The old binary is refused at attach by name on
+the old binary cannot read. The old binary is refused at attach by name on
 every node, so "put the old binary back" is not a rollback — it is a service
 that will not start. The only way back is:
 

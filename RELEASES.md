@@ -7,39 +7,239 @@ analyses, wire-version mechanics, upgrade remedies — is
 (pre-committed bars, fleet runs) are in
 [`docs/benchmarks/`](docs/benchmarks).
 
-## Unreleased
+## v2.13.0 — <tag date> — the FSM upgrade lifecycle
 
-**The application lifecycle, documented end to end.** A clean-room dogfood — one
-agent building a real service on UC from the published docs alone, a second
-operating a real fleet through faults, reconfiguration, and an upgrade — drove
-the documentation from a set of per-milestone gate docs to a lifecycle a
-stranger can follow. The proof is a worked example now in the tree, and the
-friction the dogfood hit is filed as fixes and tickets.
+<!-- tag date: fill at tag time -->
 
-- **`examples/kv`: a replicated key-value store, merged in-tree.** The first
-  shipped user-facing `SnapshotStateMachine` + `Sessioned` worked example — coordinated
-  snapshots, exactly-once over a remote hop, a two-shape v2 that reads v1
-  images, and real-cluster tests including the flag-day upgrade.
-  [`examples/kv`](examples/kv).
-- **A lifecycle tutorial.**
-  [Build an application](docs/tutorials/build-an-application.md) walks design →
-  build → test → package → deploy → operate → upgrade with the KV store as the
-  worked example — the empty Diátaxis tutorial slot, filled.
-- **An application-upgrade how-to.**
-  [Upgrade an application](docs/how-to/upgrade-an-application.md): the flag-day
-  procedure at 2.12.0, what to back up first (the rollback artifact does not
-  survive the upgrade), and why a rolling swap is not safe yet.
-- **Two experience reports** —
-  [builder](docs/notes/uc2-dogfood-kv-builder-report.md) and
-  [operator](docs/notes/uc2-dogfood-kv-operator-report.md) — the honest account
-  of building and running UC from the docs alone: both buildable and operable,
-  with the friction concentrated in the upgrade story and in observability.
-- **Reference and how-to fixes** from the two friction ledgers: the stale
-  "2.12.0 pending" annotations swept now that 2.12.0 has shipped, a
-  voter-down / partition / lost-disk diagnosis section, response and
-  `Sessioned`-envelope payload limits, the dashboard's real panel inventory, and
-  the new member's config — plus product tickets for the observability and
-  packaging gaps the dogfood surfaced (#33–#42).
+Upgrading a **state machine** stops being a stop-everything flag day you
+execute from memory and becomes a pinned, per-row procedure the platform
+enforces. You take one coordinated snapshot instant, name that position as the
+upgrade's **origin** with `uc2ctl upgrade pin`, and from the moment that pin
+commits every instance of that row — a restart, a rebuilt host, a fresh learner
+— installs that one artifact before it applies anything. The old binary is
+refused by name instead of quietly recomputing a state the cluster never had.
+Alongside it: every node's artifact at every instant is hashed and the hashes
+are compared **on the log**, and a new harness, `uc2-diffreplay`, replays one
+corpus through two builds and holds the change to a declaration written before
+the upgrade.
+
+**One flag day: wire `0.8.0` → `0.9.0` and cnc `3.2` → `3.3` — stop every node
+before starting any node.** A `0.8.0` peer parses the two new `CLUSTER` kinds
+(the prefix is unchanged) but decodes them as an unknown kind and drops them,
+so its cluster FSM diverges silently rather than stalling: mixing versions is
+unsound, not merely unsupported. This release also changes the **row artifact
+envelope** — `ULTSNAP2` (24 B) carries the version that built the artifact, and
+an `ULTSNAP1` file is refused by name — so `snapshots/<row>/` is cleared **once
+per node** inside the window (`snapshots/cluster/` is untouched; its image has a
+v1 read path). That wipe has a precondition: the row must be able to rebuild
+what it deleted, which means a durable state machine or a journal that still
+holds genesis. **A cluster running purge with an in-memory state machine cannot
+wipe** and has no upgrade path until the envelope migration tool on the backlog
+exists — check that first. Step by step:
+[Upgrade a cluster § 2.13.0](docs/how-to/upgrade-a-cluster.md#wire--cnc-change-in-2130-upgrade-pins-and-snapshot-reports-090-cnc-33).
+
+**One new operating rule that is not on the wire:** a service or a client now
+attaches only once its node has **joined its cluster** — knows a leader, has
+learned a commit, and has applied the committed cluster state up to it. So a
+process or script that brings up several nodes must **start every node before
+attaching any service**, and boot-time readings change (`uc_services_declared`
+reads `0`, with no per-FSM rows, until the node has joined).
+
+- **Upgrade pins: an upgrade names its origin, and the record is replicated.**
+  `uc2ctl upgrade pin --row <R> --to <VER> --origin <P> [--from <VER>]` puts an
+  `UpgradePin` (`CLUSTER kind = 4`: row, from, to, origin) on the log — an
+  event, "at position `P`, row `R` went `from` → `to`" — kept as a per-row
+  history (at most four) in the cluster FSM and carried in the cluster
+  artifact, so a below-floor joiner holds the pin before its service attaches.
+  Leader-only and single-in-flight like every cluster command; the command
+  itself rides a staged `upgrade.pending` file whose SHA-256 digest is what the
+  64-byte admin line signs (admin op **10**, audited `upgrade_pin`). Eight
+  named refusals — **52** `pin_row_undeclared`, **53** `pin_from_mismatch`,
+  **54** `pin_no_set` (only this node's *newest* complete set may be named),
+  **55** `pin_not_monotone`, **56** `pin_digest`, **57** `pin_missing`, **58**
+  `pin_decode`, **59** `report_stale`. The pin is published onto the row's cnc
+  status line under a seqlock (`upgrade_origin` `+16`, `pinned_version` `+24`,
+  `pin_seq` `+32`, `pinned_from` `+40`), which is what `uc2ctl status`,
+  `/metrics` and the service's own attach all read; `uc2ctl upgrade show` reads
+  the committed artifact and therefore lands one instant behind those live
+  words. Gauges `uc2_upgrade_pin_origin` / `uc2_upgrade_pin_version`.
+  → [SDLC standard § The version is an input](docs/reference/application-sdlc.md#the-version-is-an-input) ·
+  [`uc2ctl` § `upgrade pin`](docs/reference/uc2ctl.md#upgrade-pin) ·
+  [§ `upgrade show`](docs/reference/uc2ctl.md#upgrade-show) ·
+  [The cluster FSM § Pins and reports](docs/notes/uc2-cluster-fsm-explained.md#pins-and-reports-2130)
+- **The pinned install at attach: the new binary starts from the origin, and
+  the old one cannot start at all.** A pinned row's `attach` reads the pin
+  before it publishes anything, and then installs `snap-<origin>`
+  **unconditionally** — a durable state machine already above the origin is
+  rewound to it and recomputes the tail under the new version, exactly as a
+  freshly built peer does, which is what makes every instance of the new
+  version begin from the same state. Four refusals guard it: a binary whose
+  `VERSION` is not the pin's `to` is refused `PinnedVersionMismatch` (the old
+  binary cannot rejoin, on any node, ever); a seqlock read that never settles
+  is refused `PinUnreadable` (fail **closed**, retryable — an unreadable pin is
+  not "no pin"); a pinned row started with plain `start()` has nothing to
+  install with and is refused `PinRequiresSnapshots`; a missing artifact at the
+  origin is refused `PinnedArtifactMissing`. Two version cross-checks now
+  bracket every install: an *unpinned* one requires the artifact's stamped
+  version to equal the attaching binary's, and a *pinned* one requires it to
+  equal the pin's `from` — which is what `ULTSNAP2` exists to record. The node
+  also **holds its snapshot and purge floor** at an unconsumed pinned origin
+  until the row has attached at `to` and replayed past the cut, so the journal
+  the install needs is still there (an upgrade that is pinned and then
+  abandoned holds it indefinitely — obs `snapshot_floor_held_for_pin`).
+  → [State-machine contract § Attaching](docs/reference/state-machine-contract.md#attaching-the-node-must-have-joined-its-cluster-first) ·
+  [§ Snapshots, the envelope, and the exclusive frontier](docs/reference/state-machine-contract.md#snapshots-the-instant-the-envelope-and-the-exclusive-frontier) ·
+  [Instance directory § The artifact envelope](docs/reference/instance-directory.md#the-artifact-envelope-and-who-deletes-artifacts) ·
+  [SDLC standard § S4 Pin the origin](docs/reference/application-sdlc.md#s4-pin-the-origin)
+- **Live snapshot-hash reports: divergence is found, not assumed.** Two
+  instances of a row that started from the same origin and applied the same log
+  must produce byte-identical artifacts at every coordinated instant. Until now
+  nothing checked — the upgrade procedure told an operator to `sha256sum` by
+  hand over ssh. Now every node's service hashes each artifact's payload as it
+  streams (SHA-256, first 8 bytes, published at the row's cnc slot line 7
+  `+504` `artifact_hash` just before `snapshot_pos`), reports `(row, P, hash)`
+  to the leader over a new pairwise datagram `SNAP_REPORT` (kind **26**), and
+  the leader commits one `SnapshotReport` (`CLUSTER kind = 5`) per `(row, P)`
+  once **every voter has reported, or 5 s after the first report** — every
+  voter and not a quorum, because a quorum trigger structurally omits whichever
+  replica is slowest to complete its set, and that is exactly the one worth
+  naming. Every node recomputes the verdict at commit: all equal, or the
+  majority names the minority. Out: `uc2_snapshot_hash_mismatch`, four
+  `uc2_snapshot_reports_*_total` counters, the `snapshot_hash_diverged` record,
+  and the `Uc2SnapshotHashDiverged` alert.
+  → [Monitor a cluster](docs/how-to/monitor-a-cluster.md) ·
+  [The cluster FSM § Pins and reports](docs/notes/uc2-cluster-fsm-explained.md#pins-and-reports-2130) ·
+  [Wire protocol](docs/reference/wire-protocol.md)
+- **A readiness gate at the attach door, and `boot_wait`.** A pin only binds a
+  service that can see it, so `services_declared` — the word every attach door
+  already reads — is now published from the consensus pass once the node knows a
+  leader, has **learned** a commit, and its cluster-FSM walk has **consumed** up
+  to that commit. Until then `ServiceBuilder::start*`, `Engine::attach` and
+  `PipelinedClient::connect` refuse `NodeBooting`, which now means "this node has
+  not joined its cluster yet", and each waits it out internally for `boot_wait`
+  (a new field on `ServiceConfig`, `EngineConfig` and `PipelinedConfig`; default
+  10 s, `Duration::ZERO` = do not wait). The consequence worth writing on a
+  runbook: **start every node before attaching any service** — on a fresh
+  cluster node 0 cannot know a leader until its peers exist. The gate opening
+  is recorded (`services_declared_published`) and a gate that stays shut names
+  the failing clause once per incarnation
+  (`services_declared_withheld`), and a node whose durable position permanently
+  trails commit is a fault to fix, not a reason for a bigger `boot_wait`.
+  → [Configuration § Attaching a service or a client: `boot_wait`](docs/reference/configuration.md#attaching-a-service-or-a-client-boot_wait) ·
+  [State-machine contract § Attaching](docs/reference/state-machine-contract.md#attaching-the-node-must-have-joined-its-cluster-first) ·
+  [Limits § standing constraints](docs/reference/limits.md#standing-constraints)
+- **Diff replay: replay one corpus through two builds, and declare what may
+  change.** The new `uc_diffreplay` crate and its `uc2-diffreplay` binary take a
+  corpus (a backup-shaped directory: an artifact at P plus the journal span to
+  Q) and run it through two builds of the same state machine, capturing five
+  surfaces per position — response bytes, `svc_sched` records, the state
+  projection at the origin and at the end, the `ctx.ids()` call count, and the
+  `on_committed` outcome when a handler is supplied. Three modes: `upgrade`
+  (old versus new over the same input), `determinism` (the same build twice —
+  the nondeterminism hunt) and `reconstruction` (the artifact path versus the
+  genesis counterfactual). Every difference is attributed to a code arm
+  mechanically and then confirmed against an `intent.toml` **declaration
+  written with the change**: an unexplained, undeclared or declared-but-absent
+  entry fails the run. `SnapshotStateMachine::project()` is the new provided
+  method the comparison reads, `examples/kv` is the worked example, and
+  `examples/kv/tests/corpora/` is the regression-corpus convention (`corpus
+  export --around <pos>` cuts one from a live instance directory).
+  → [Diff replay](docs/how-to/diff-replay.md) ·
+  [`uc_diffreplay` README](uc_diffreplay/README.md) ·
+  [SDLC standard § S5 Diff replay](docs/reference/application-sdlc.md#s5-diff-replay)
+- **`pin-verify`: rehearse the upgrade against a real node before the real
+  one.** `uc2-diffreplay pin-verify` is reconstruction mode's second half — it
+  proves, on a live single-voter node with your real service binaries, the two
+  things S4 is for: after a real `uc2ctl upgrade pin` the **stale binary is
+  refused by name**, and the new binary's live state is the **artifact path's**,
+  never the genesis counterfactual. It re-submits the corpus's own recorded
+  command frames, takes the instant, lets the old build run past it, stops it,
+  places the pin, then judges both arms; a PASS additionally requires the SDK's
+  own `pinned install of snap-<origin>` line on the new service's stderr, so
+  "it started from the origin" is observed rather than inferred. Verdicts are
+  PASS, INCONCLUSIVE (the span carried no state-dependent command, so the two
+  paths agree and the run cannot show the counterfactual) or FAIL; a
+  same-version run is refused up front.
+  → [Diff replay § 5. Verify the pin live](docs/how-to/diff-replay.md#5-verify-the-pin-live-reconstruction-mode-part-2) ·
+  [VERIFICATION](docs/VERIFICATION.md)
+- **The lifecycle, written down.** The [SDLC
+  standard](docs/reference/application-sdlc.md) gains the three compatibility
+  axes, the [change
+  taxonomy](docs/reference/application-sdlc.md#the-change-taxonomy), the
+  common-origin requirement, version-as-an-input, nine schema and protocol
+  conventions, and the [per-row upgrade lifecycle
+  S1–S9](docs/reference/application-sdlc.md#the-upgrade-lifecycle-per-row);
+  [Upgrade an application](docs/how-to/upgrade-an-application.md) is rewritten
+  as the seven-step pinned procedure S6 points at (back up → instant → pin →
+  confirm on every node → stop → swap → verify), with what a rollback costs
+  once the pin has committed and when the old code arm may finally be deleted.
+  For agents, `.claude/skills/diff-replay-judge/` is a project skill covering
+  the four judgement steps the harness cannot make for you: draft the
+  declaration from the diff, classify the change, attribute the residue, and
+  judge the state diff.
+- **Also in this release: the application lifecycle, documented end to end.** A
+  clean-room dogfood — one agent building a real service on UC from the
+  published docs alone, a second operating a real fleet through faults,
+  reconfiguration and an upgrade — drove the documentation from a set of
+  per-milestone gate docs to a lifecycle a stranger can follow, and left a
+  worked example in the tree.
+  - **[`examples/kv`](examples/kv): a replicated key-value store**, the first
+    shipped user-facing `SnapshotStateMachine` + `Sessioned` example —
+    coordinated snapshots, exactly-once over a remote hop, a two-shape v2 that
+    reads v1 images, and real-cluster tests including the upgrade.
+  - **A lifecycle tutorial**, [Build an
+    application](docs/tutorials/build-an-application.md): design → build → test
+    → package → deploy → operate → upgrade, with the KV store as the worked
+    example.
+  - **Two experience reports** —
+    [builder](docs/notes/uc2-dogfood-kv-builder-report.md) and
+    [operator](docs/notes/uc2-dogfood-kv-operator-report.md) — the honest
+    account of building and running UC from the docs alone, with the friction
+    concentrated in the upgrade story and in observability.
+  - **Reference and how-to fixes** from the two friction ledgers: a voter-down
+    / partition / lost-disk diagnosis section, response and
+    `Sessioned`-envelope payload limits, the dashboard's real panel inventory,
+    and the new member's config — plus product tickets for the observability
+    and packaging gaps the dogfood surfaced (#33–#42).
+- **Fixed:**
+  - **An apply pass that overran the log buffer could replay forever, in
+    silence.** A reconstruction replay that makes no progress is exactly the
+    "the retained prefix does not cover my cursor" condition the gap guard
+    exists for, but the guard's own test could not detect it in that shape, so
+    the row spun instead — and `Service::stop` then hung for good. A
+    no-progress pass now takes the gap guard's own path: a snapshot-capable row
+    installs a covering artifact, and one that is not fail-stops
+    `SnapshotRequired` by name. Pre-existing.
+  - **A `uc_node` test flake is closed**: four in-module tests swapped the
+    process-global `uc_obs` sink concurrently, so log-capture assertions failed
+    at random under the default thread count. One capture lock, held per
+    capturing test, with drop guards.
+  - **`counter-service` exited 1 instead of retrying while its node booted**
+    ([#53](https://github.com/PeterKnego/ultima_cluster/pull/53)) — it now
+    retries `NodeBooting` on the wait deadline it already had, while every
+    other refusal stays final.
+  - **Nightly CI did not build the two fixture binaries** the diff-replay and
+    KV corpus tests hard-assert, so its capstones job was red (#53); the docs
+    landing page did not link `uc_diffreplay` (#53); and one dead anchor in
+    `configuration.md` failed the link check
+    ([#55](https://github.com/PeterKnego/ultima_cluster/pull/55)).
+- **Changed reading:** `uc2_cluster_fsm_position` now reports the
+  `uc2-cluster` agent's **walk cursor** — the quantity its help text has always
+  described, and the only one the readiness gate can be asked about — instead of
+  the published view's tag, which moved only on a pass that applied a `CLUSTER`
+  frame. The metric's name is unchanged, so a dashboard built on `2.11.0` keeps
+  working and reads a different number: on a cluster carrying ordinary traffic
+  and no cluster commands it now climbs with commit instead of sitting still.
+- **API notes** (details in [the semver
+  policy](docs/reference/semver-policy.md#2130-api-notes)): `ServiceConfig`,
+  `EngineConfig` and `PipelinedConfig` each gain a public `boot_wait` field —
+  additive, but an exhaustive struct literal in downstream code stops
+  compiling; `ApplyCtx::ids` now takes `&mut self` (every caller already holds
+  `&mut ApplyCtx`, so a caller behind a shared reference is the one break); and
+  `SnapshotStateMachine::project` is a **provided** method, so no existing
+  implementation has to change.
+- **Performance: nothing measured — no fleet gate ran for this release.** This
+  is a control-plane and tooling release; no bar was set, run or moved.
 
 ## v2.12.0 — 2026-09-13 — jumbo frames, and the monotonic log clock
 

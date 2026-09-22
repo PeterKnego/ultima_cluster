@@ -93,6 +93,23 @@ An `[[expect]]` on `projection_origin` or `projection_end` takes **no**
 comparison over the whole state, attributed to the change's touched set as a
 whole rather than to any single arm.
 
+Three rules about `[[expect]]` that a first declaration usually meets the
+hard way:
+
+- **`surface` is spelled `ids`**, not `ids_calls`. `ids_calls` is the *trace*
+  field the driver writes per entry; the surface an `[[expect]]` names is one
+  of `response`, `sched`, `projection_origin`, `projection_end`, `ids`,
+  `output`.
+- **One `[[expect]]` covers EVERY divergence on its `(surface, arm)` pair**,
+  however many positions diverged. A second entry declaring the same pair is
+  never reached, so it ends the run as `Absent` ("declared but not observed")
+  and fails it. Say a thing once, in one entry, and put the per-position
+  detail in its `note`.
+- **An `[[expect]]` with no `arm` is a wildcard on that surface, and a
+  specific entry beats it** regardless of declaration order — so a wildcard
+  declared first never steals a specific entry's match, and a wildcard
+  declared alongside specific entries only catches the arms they do not name.
+
 Unknown keys are refused — a declaration is a statement of intent, and a
 typo in one must not read as "not declared".
 

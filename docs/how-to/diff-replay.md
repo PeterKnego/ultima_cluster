@@ -66,6 +66,19 @@ An `[[expect]]` on `projection_origin` or `projection_end` must not carry an
 state, attributed to the touched set as a whole. Unknown keys are refused
 too, so a typo cannot quietly read as "not declared".
 
+Three more rules about `[[expect]]`, each of which will otherwise cost you a
+run:
+
+- `surface` is one of `response`, `sched`, `projection_origin`,
+  `projection_end`, **`ids`** and `output`. The ids surface is spelled `ids`;
+  `ids_calls` is the *trace* field the driver writes per entry, not a surface
+  name.
+- **One entry covers every divergence on its `(surface, arm)` pair.** A second
+  entry naming the same pair is never reached and comes back as `Absent`,
+  which fails the run — put the extra detail in the first entry's `note`.
+- **An `arm`-less entry is a wildcard, and a specific entry beats it** on the
+  same surface, whichever is declared first.
+
 ## 4. Run
 
     uc2-diffreplay upgrade --corpus ./corpus --old ./kv-service-1.0 --new ./kv-service-1.1 \

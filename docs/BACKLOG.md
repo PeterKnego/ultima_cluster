@@ -425,7 +425,13 @@ reviewer wants a workload to attack.
   an enum with a `Display` would make a typo a compile error and let the
   stale-value class of bug (a documented value that no longer exists) be
   caught by the match. Ledgered by plan B3's T5 review, recorded 2026-09-21.
-- **Plan D carries: `uc2_cluster_fsm_position` was REPOINTED in `2.13.0`.**
+- ~~**Plan D carries: `uc2_cluster_fsm_position` was REPOINTED in
+  `2.13.0`.**~~ — **DONE 2026-09-22 (plan D, T4).** Written up as a
+  **changed reading** — not a fix — in both release documents: a
+  "Changed reading" bullet in `RELEASES.md`'s `v2.13.0` entry, and the last
+  bullet of `docs/releases.md` § "Fixed on the way", each saying that the name
+  is unchanged so a `2.11.0` dashboard keeps working and silently reads a
+  different quantity. The original entry, for the record:
   The gauge shipped in `2.11.0` reading `ClusterView::position` (the
   published view's tag, which only moves on a pass that applied a `CLUSTER`
   frame) and now reads `consumed`, the `uc2-cluster` agent's walk cursor —

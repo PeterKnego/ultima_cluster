@@ -30,6 +30,17 @@ Its `intent.toml` carries `tag_offset = 16`: the live service is
 only then the KV frame, whose first two bytes — `FORMAT_VERSION ‖ op` — are
 what `[tags]` names.
 
+**That declaration is written for `determinism`, not for an upgrade.** Its
+`[touched] arms` is empty and it carries no `[[expect]]`, which is exactly
+right for the gate that runs on every `cargo test` — under one build nothing
+may differ, so nothing is declared. It is **not** a usable declaration for a
+real v1 → v2 `upgrade` run on this corpus: with no touched arm and no
+expectation, every divergence the new build produces comes back
+`Unexplained` and the run fails. Write the declaration with the change —
+name the arms it touched, set `migration = true` if the image format moved,
+and add one `[[expect]]` per `(surface, arm)` pair — rather than reaching for
+this file and wondering why the report is a wall of red.
+
 ## Running them by hand
 
     cargo build -p uc_diffreplay -p kv_store
