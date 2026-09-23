@@ -36,6 +36,12 @@ durability, failover without losing acknowledged writes, snapshots,
 membership changes, and the client SDKs. Read more in
 [Architecture](/docs/ARCHITECTURE.md).
 
+## What you can build 
+
+Matching engines, ledgers, coordination services, control planes, sequencers,
+reservation systems and more. [What you can build with
+ultima_cluster](/docs/WHAT-TO-BUILD.md) lists multiple types os applications that are a good fit for ultima_cluster and also some that are not.
+
 ## Why?
 
 SMR is what you reach for when you need performance, correctness and
@@ -110,6 +116,8 @@ and crash tiers had missed. Full picture, including what is *not* verified:
 
 - **[Core Principles](/CORE_PRINCIPLES.md)** — correctness, resiliency, high
   performance, in plain language.
+- **[What you can build](/docs/WHAT-TO-BUILD.md)** — the applications UC
+  fits, and the ones it does not.
 - **[Architecture](/docs/ARCHITECTURE.md)** — how it works, and the crate map.
 - **[Quickstart](/docs/QUICKSTART.md)** — zero to a running three-node cluster.
 - **[Verification](/docs/VERIFICATION.md)** · **[Benchmarks](/docs/BENCHMARKS.md)** · **[Backlog](/docs/BACKLOG.md)**

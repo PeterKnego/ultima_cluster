@@ -82,25 +82,19 @@ node only — see [`OutputHandler`](../ARCHITECTURE.md#what-you-implement).
 
 ## When to reach for it
 
-The natural fit is **a modest amount of state that must be exactly right,
-mutated by a high rate of small commands**: matching engines and order books,
-exchange and trading systems, control planes, metadata and configuration
-stores, sequencers, coordination services. It is the model behind ZooKeeper,
-etcd, Aeron Cluster and the LMAX-style trading architectures.
+When the state is modest, must be exactly right, and is mutated by a high rate
+of small commands — matching engines, ledgers, control planes, sequencers,
+coordination services. The full catalog, each entry with a verdict for UC, is
+[What you can build with ultima_cluster](../WHAT-TO-BUILD.md).
 
 ## When not to
 
-- **Large state.** The whole state lives in memory on every node and must be
-  snapshottable. Bulk storage wants a replicated database, not SMR.
-- **Nondeterministic work.** If the work genuinely needs a clock, a service
-  call, or anything ambient in the middle of applying, the model does not
-  hold.
-- **Write scaling.** Every node applies every command, and ordering runs
-  through one leader. SMR buys consistency and failover, never write
-  throughput that scales with node count — adding nodes makes the system
-  *more durable*, not faster.
-- **Eventual consistency is sufficient.** Then this is a great deal of
-  machinery for a guarantee you are not using.
+When the state is too large for every node to hold and to ship to a new one
+as a snapshot, the work is
+genuinely nondeterministic, you need write throughput that scales with node
+count, or eventual consistency is enough.
+[What you can build § Poor fits](../WHAT-TO-BUILD.md#poor-fits) has the full
+list and UC's own limits.
 
 ## Where the diagram simplifies
 
@@ -161,6 +155,8 @@ See [multi-service](uc2-m14-multi-service-explained.md).
 
 - [Architecture](../ARCHITECTURE.md) — how UC implements all of the above,
   written for someone who now knows what SMR is.
+- [What you can build](../WHAT-TO-BUILD.md) — the applications this model
+  fits, and which ones UC carries today.
 - [Quickstart](../QUICKSTART.md) — a running three-node cluster in a few
   minutes.
 - [Core principles](../../CORE_PRINCIPLES.md) — the correctness, resiliency
