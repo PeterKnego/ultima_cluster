@@ -25,8 +25,10 @@ reports and the readiness gate, `fa8b0e1`) → the docs hotfix
 `5fe8a91`) → **D**, this writeup with the SDLC standard, the per-row upgrade
 how-to and the `diff-replay-judge` skill.
 
-**No fleet gate ran for this release**, and none was planned: nothing here is
-on the commit or apply hot path, no rate bar was set, and the two throughput
+**No fleet gate ran for this release**, and none was planned: nothing in the
+upgrade lifecycle is on the commit or apply hot path, no rate bar was set (the
+one hot-path change, the apply agent's idle ladder below, has a fleet
+measurement record of its own, not a gate), and the two throughput
 questions still open from `2.12.0` (how to construct a rate bar this rig can
 rule on; jumbo row b at the 29 pairs its rule calls for) are untouched by it.
 Every number below is a source constant, a refusal code or a one-run
@@ -401,6 +403,31 @@ only from the *application author's own README paragraph*, because no platform
 application-upgrade page existed — and **L47**, that a new version's attach
 silently rewrote the pre-upgrade artifact in place, so the rollback point the
 README assumed could not survive on-node. Plans A–D are the answer to both.
+
+### The apply agent's idle ladder (merged before this branch)
+
+Also on `main` since 2026-09-17 (`2be3d6f`), after the `v2.12.0` tag, so it
+ships here — and it is the one change in `2.13.0` that touches the commit
+path's latency. The 2026-09-16 service-time record found the apply agent's flat
+50 µs idle sleep landing on about half of all low-load responses as a second
+mode ~100 µs above the first; the apply agent was the only sleeping agent on
+the commit path. It now idles on a spin → yield → sleep ladder
+(`uc_log::IdleStrategy::Backoff`, driven by the runner's consecutive-idle
+streak; `uc_service::APPLY_IDLE` = spin 2 000, yield 1 024, then the same 50 µs
+sleep, no ramp), so a service quiet for seconds wakes within the same bound as
+before and a steady low-rate stream never meets the sleep. `UC2_APPLY_IDLE=backoff`
+spells the default and `sleep:50` restores the old posture; the snapshot
+builder keeps a plain sleep.
+
+Measured on a fresh 4 × `c6id.2xlarge` fleet, 2026-09-17, closed loop at
+inflight 1, shipped posture (unpinned, no env var): mean / p50 / p90 / p99
+**114 / 105 / 118 / 265 µs**, against 166 / 123 / 219 / 325 µs with the flat
+sleep the day before; the pinned-and-spinning arm, which never had the sleep,
+reads within 2 µs at p50 across the two fleets, so the delta is the ladder. The
+apply hop under load read +3.3 % on a dev-box A/B — a dev-box reading, not a
+claim. This is a measurement record, not a gate: no bar was set.
+→ [Service time § 4.5](benchmarks/uc2-service-time-2026-09-16.md#45-re-run-with-the-ladder-as-the-default--2026-09-17) ·
+[runbook](ops/uc2-runbook.md)
 
 ### Fixed on the way
 
@@ -2129,6 +2156,11 @@ fatal would hold 239 em-dashed headings — including gate docs, which are
 permanent records — hostage to a third-party TUI. It found one genuine
 pre-existing dead link on its first run.
 
+Two test-suite races behind nightly intermittents were closed: the reconfig
+removal fixtures now retry when a best-effort adoption race is lost, and
+`sigkill_mid_config_window` gained a 90 s liveness budget plus a straggler
+diagnostic that tells a starved process from a live-but-not-adopting one.
+
 ### Fleet work, all methodological
 
 No performance change ships in `2.10.0`; nothing on the commit path was
@@ -2201,9 +2233,28 @@ rate-limit note.
 
 **Mechanical. No behaviour change, no wire or cnc change, no binary rename.**
 Every package took a uniform `uc_` prefix, and every crate directory was
-renamed with it. The user-facing writeup, with the migration `sed` and the
-old→new table, is the `2.9.0` section of `RELEASES.md`; this entry is the
-engineering record of how it was done and what proves it.
+renamed with it. `RELEASES.md` carries the one-line summary; this entry is
+the engineering record of how it was done and what proves it.
+
+### Migrating source that names the old crates
+
+If you build against the workspace, `use uc2_service::…` and `cargo build -p
+uc2_node` stop resolving. The fix is mechanical, and the new names collide
+with nothing:
+
+```sh
+sed -i 's/uc2_log/uc_log/g; s/uc2_net/uc_net/g; s/uc2_crypto/uc_crypto/g;
+        s/uc2_consensus/uc_consensus/g; s/uc2_node/uc_node/g;
+        s/uc2_service/uc_service/g; s/uc2_client/uc_client/g;
+        s/uc2_remote/uc_remote/g; s/uc2_gateway/uc_gateway/g;
+        s/ultima_journal/uc_journal/g; s/ultima-journal/uc_journal/g' \
+    $(grep -rl 'uc2_\|ultima_journal' .)
+# and `-p uc2ctl` → `-p uc_ctl` (the *binary* name `uc2ctl` stays)
+```
+
+Release entries, gate docs and superpowers plans were rewritten to the new
+names so their commands still run; git history before the rename was not, so a
+pre-rename commit naming `uc_node` means v1's deleted crate, not this one.
 
 ### What moved, and what deliberately did not
 

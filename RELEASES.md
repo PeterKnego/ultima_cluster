@@ -1,1353 +1,392 @@
 # Releases
 
-What each release introduced, newest first. Every feature links to the doc
-that explains it in full. The deep engineering record — complete safety-fix
-analyses, wire-version mechanics, upgrade remedies — is
-[`docs/releases.md`](docs/releases.md); the per-milestone proof records
-(pre-committed bars, fleet runs) are in
+What each release introduced, newest first — one or two sentences per point,
+each linking to the doc that explains it. The full engineering record of every
+release (mechanics, rulings, evidence tables) is
+[`docs/releases.md`](docs/releases.md); the per-milestone proof records are in
 [`docs/benchmarks/`](docs/benchmarks).
 
 ## v2.13.0 — 2026-09-22 — the FSM upgrade lifecycle
 
-Upgrading a **state machine** stops being a stop-everything flag day you
-execute from memory and becomes a pinned, per-row procedure the platform
-enforces. You take one coordinated snapshot instant, name that position as the
-upgrade's **origin** with `uc2ctl upgrade pin`, and from the moment that pin
-commits every instance of that row — a restart, a rebuilt host, a fresh learner
-— installs that one artifact before it applies anything. The old binary is
-refused by name instead of quietly recomputing a state the cluster never had.
-Alongside it: every node's artifact at every instant is hashed and the hashes
-are compared **on the log**, and a new harness, `uc2-diffreplay`, replays one
-corpus through two builds and holds the change to a declaration written before
-the upgrade.
+Upgrading a state machine becomes a pinned, per-row procedure the platform
+enforces instead of a flag day run from memory.
+[Full record](docs/releases.md#v2130--2026-09-22--the-fsm-upgrade-lifecycle).
 
-**One flag day: wire `0.8.0` → `0.9.0` and cnc `3.2` → `3.3` — stop every node
-before starting any node.** A `0.8.0` peer parses the two new `CLUSTER` kinds
-(the prefix is unchanged) but decodes them as an unknown kind and drops them,
-so its cluster FSM diverges silently rather than stalling: mixing versions is
-unsound, not merely unsupported. This release also changes the **row artifact
-envelope** — `ULTSNAP2` (24 B) carries the version that built the artifact, and
-an `ULTSNAP1` file is refused by name — so `snapshots/<row>/` is cleared **once
-per node** inside the window (`snapshots/cluster/` is untouched; its image has a
-v1 read path). That wipe has a precondition: the row must be able to rebuild
-what it deleted, which means a durable state machine or a journal that still
-holds genesis. **A cluster running purge with an in-memory state machine cannot
-wipe** and has no upgrade path until the envelope migration tool on the backlog
-exists — check that first. Step by step:
-[Upgrade a cluster § 2.13.0](docs/how-to/upgrade-a-cluster.md#wire--cnc-change-in-2130-upgrade-pins-and-snapshot-reports-090-cnc-33).
-
-**One new operating rule that is not on the wire:** a service or a client now
-attaches only once its node has **joined its cluster** — knows a leader, has
-learned a commit, and its cluster FSM's walk cursor has **consumed** the log up
-to that commit. So a process or script that brings up several nodes must
-**start every node before attaching any service**, and boot-time readings
-change (`uc_services_declared` reads `0`, with no per-FSM rows, until the
-node has joined).
-
-- **Upgrade pins: an upgrade names its origin, and the record is replicated.**
-  `uc2ctl upgrade pin --row <R> --to <VER> --origin <P> [--from <VER>]` puts an
-  `UpgradePin` (`CLUSTER kind = 4`: row, from, to, origin) on the log — an
-  event, "at position `P`, row `R` went `from` → `to`" — kept as a per-row
-  history (at most four) in the cluster FSM and carried in the cluster
-  artifact, so a below-floor joiner holds the pin before its service attaches.
-  Leader-only and single-in-flight like every cluster command; the command
-  itself rides a staged `upgrade.pending` file whose SHA-256 digest is what the
-  64-byte admin line signs (admin op **10**, audited `upgrade_pin`). Eight
-  named refusals — **52** `pin_row_undeclared`, **53** `pin_from_mismatch`,
-  **54** `pin_no_set` (only this node's *newest* complete set may be named),
-  **55** `pin_not_monotone`, **56** `pin_digest`, **57** `pin_missing`, **58**
-  `pin_decode`, **59** `report_stale`. The pin is published onto the row's cnc
-  status line under a seqlock (`upgrade_origin` `+16`, `pinned_version` `+24`,
-  `pin_seq` `+32`, `pinned_from` `+40`), which is what `uc2ctl status`,
-  `/metrics` and the service's own attach all read; `uc2ctl upgrade show` reads
-  the committed artifact and therefore lands one instant behind those live
-  words. Gauges `uc2_upgrade_pin_origin` / `uc2_upgrade_pin_version`.
-  → [SDLC standard § The version is an input](docs/reference/application-sdlc.md#the-version-is-an-input) ·
-  [`uc2ctl` § `upgrade pin`](docs/reference/uc2ctl.md#upgrade-pin) ·
-  [§ `upgrade show`](docs/reference/uc2ctl.md#upgrade-show) ·
+- **Upgrade flag day:** wire `0.8.0` → `0.9.0` and cnc `3.2` → `3.3` — stop
+  every node before starting any, and clear `snapshots/<row>/` once per node
+  (a purge-on cluster with an in-memory state machine cannot yet).
+  → [Upgrade a cluster § 2.13.0](docs/how-to/upgrade-a-cluster.md#wire--cnc-change-in-2130-upgrade-pins-and-snapshot-reports-090-cnc-33)
+- **Upgrade pins.** `uc2ctl upgrade pin` commits a row's upgrade origin to the
+  log, so every instance of the new version starts from the same snapshot.
+  → [`uc2ctl` § `upgrade pin`](docs/reference/uc2ctl.md#upgrade-pin) ·
   [The cluster FSM § Pins and reports](docs/notes/uc2-cluster-fsm-explained.md#pins-and-reports-2130)
-- **The pinned install at attach: the new binary starts from the origin, and
-  the old one cannot start at all.** A pinned row's `attach` reads the pin
-  before it publishes anything, and then installs `snap-<origin>`
-  **unconditionally** — a durable state machine already above the origin is
-  rewound to it and recomputes the tail under the new version, exactly as a
-  freshly built peer does, which is what makes every instance of the new
-  version begin from the same state. Four refusals guard it: a binary whose
-  `VERSION` is not the pin's `to` is refused `PinnedVersionMismatch` (the old
-  binary cannot rejoin, on any node, ever); a seqlock read that never settles
-  is refused `PinUnreadable` (fail **closed**, retryable — an unreadable pin is
-  not "no pin"); a pinned row started with plain `start()` has nothing to
-  install with and is refused `PinRequiresSnapshots`; a missing artifact at the
-  origin is refused `PinnedArtifactMissing`. Two version cross-checks now
-  bracket every install: an *unpinned* one requires the artifact's stamped
-  version to equal the attaching binary's, and a *pinned* one requires it to
-  equal the pin's `from` — which is what `ULTSNAP2` exists to record. The node
-  also **holds its snapshot and purge floor** at an unconsumed pinned origin
-  until the row has attached at `to` and replayed past the cut, so the journal
-  the install needs is still there (an upgrade that is pinned and then
-  abandoned holds it indefinitely — obs `snapshot_floor_held_for_pin`).
+- **Pinned install at attach.** A pinned row installs the origin snapshot
+  before applying anything, and the old binary is refused by name.
   → [State-machine contract § Attaching](docs/reference/state-machine-contract.md#attaching-the-node-must-have-joined-its-cluster-first) ·
-  [§ Snapshots, the envelope, and the exclusive frontier](docs/reference/state-machine-contract.md#snapshots-the-instant-the-envelope-and-the-exclusive-frontier) ·
-  [Instance directory § The artifact envelope](docs/reference/instance-directory.md#the-artifact-envelope-and-who-deletes-artifacts) ·
   [SDLC standard § S4 Pin the origin](docs/reference/application-sdlc.md#s4-pin-the-origin)
-- **Live snapshot-hash reports: divergence is found, not assumed.** Two
-  instances of a row that started from the same origin and applied the same log
-  must produce byte-identical artifacts at every coordinated instant. Until now
-  nothing checked — the upgrade procedure told an operator to `sha256sum` by
-  hand over ssh. Now every node's service hashes each artifact's payload as it
-  streams (SHA-256, first 8 bytes, published at the row's cnc slot line 7
-  `+504` `artifact_hash` just before `snapshot_pos`), reports `(row, P, hash)`
-  to the leader over a new pairwise datagram `SNAP_REPORT` (kind **26**), and
-  the leader commits one `SnapshotReport` (`CLUSTER kind = 5`) per `(row, P)`
-  once **every voter has reported, or 5 s after the first report** — every
-  voter and not a quorum, because a quorum trigger structurally omits whichever
-  replica is slowest to complete its set, and that is exactly the one worth
-  naming. Every node recomputes the verdict at commit: all equal, or the
-  majority names the minority. Out: `uc2_snapshot_hash_mismatch`, four
-  `uc2_snapshot_reports_*_total` counters, the `snapshot_hash_diverged` record,
-  and the `Uc2SnapshotHashDiverged` alert.
-  → [Monitor a cluster](docs/how-to/monitor-a-cluster.md) ·
-  [The cluster FSM § Pins and reports](docs/notes/uc2-cluster-fsm-explained.md#pins-and-reports-2130) ·
-  [Wire protocol](docs/reference/wire-protocol.md)
-- **A readiness gate at the attach door, and `boot_wait`.** A pin only binds a
-  service that can see it, so `services_declared` — the word every attach door
-  already reads — is now published from the consensus pass once the node knows a
-  leader, has **learned** a commit, and its cluster-FSM walk has **consumed** up
-  to that commit. Until then `ServiceBuilder::start*`, `Engine::attach` and
-  `PipelinedClient::connect` refuse `NodeBooting`, which now means "this node has
-  not joined its cluster yet", and each waits it out internally for `boot_wait`
-  (a new field on `ServiceConfig`, `EngineConfig` and `PipelinedConfig`; default
-  10 s, `Duration::ZERO` = do not wait). The consequence worth writing on a
-  runbook: **start every node before attaching any service** — on a fresh
-  cluster node 0 cannot know a leader until its peers exist. The gate opening
-  is recorded (`services_declared_published`) and a gate that stays shut names
-  the failing clause once per incarnation
-  (`services_declared_withheld`), and a node whose durable position permanently
-  trails commit is a fault to fix, not a reason for a bigger `boot_wait`.
-  → [Configuration § Attaching a service or a client: `boot_wait`](docs/reference/configuration.md#attaching-a-service-or-a-client-boot_wait) ·
-  [State-machine contract § Attaching](docs/reference/state-machine-contract.md#attaching-the-node-must-have-joined-its-cluster-first) ·
-  [Limits § standing constraints](docs/reference/limits.md#standing-constraints)
-- **Diff replay: replay one corpus through two builds, and declare what may
-  change.** The new `uc_diffreplay` crate and its `uc2-diffreplay` binary take a
-  corpus (a backup-shaped directory: an artifact at P plus the journal span to
-  Q) and run it through two builds of the same state machine, capturing five
-  surfaces per position — response bytes, `svc_sched` records, the state
-  projection at the origin and at the end, the `ctx.ids()` call count, and the
-  `on_committed` outcome when a handler is supplied. Three modes: `upgrade`
-  (old versus new over the same input), `determinism` (the same build twice —
-  the nondeterminism hunt) and `reconstruction` (the artifact path versus the
-  genesis counterfactual). Every difference is attributed to a code arm
-  mechanically and then confirmed against an `intent.toml` **declaration
-  written with the change**: an unexplained, undeclared or declared-but-absent
-  entry fails the run. `SnapshotStateMachine::project()` is the new provided
-  method the comparison reads, `examples/kv` is the worked example, and
-  `examples/kv/tests/corpora/` is the regression-corpus convention (`corpus
-  export --around <pos>` cuts one from a live instance directory).
+- **Live snapshot-hash reports.** Every node's artifact hash at every instant
+  is compared on the log, and a divergent replica is named by a gauge and the
+  `Uc2SnapshotHashDiverged` alert.
+  → [Monitor a cluster](docs/how-to/monitor-a-cluster.md)
+- **A readiness gate at attach, and `boot_wait`.** Services and clients attach
+  only once their node has joined its cluster, so start every node before
+  attaching any service.
+  → [Configuration § `boot_wait`](docs/reference/configuration.md#attaching-a-service-or-a-client-boot_wait)
+- **Diff replay.** The new `uc2-diffreplay` replays one corpus through two
+  builds and fails on any difference not declared in advance; `pin-verify`
+  rehearses a pinned upgrade against a live node.
   → [Diff replay](docs/how-to/diff-replay.md) ·
-  [`uc_diffreplay` README](uc_diffreplay/README.md) ·
-  [SDLC standard § S5 Diff replay](docs/reference/application-sdlc.md#s5-diff-replay)
-- **`pin-verify`: rehearse the upgrade against a real node before the real
-  one.** `uc2-diffreplay pin-verify` is reconstruction mode's second half — it
-  proves, on a live single-voter node with your real service binaries, the two
-  things S4 is for: after a real `uc2ctl upgrade pin` the **stale binary is
-  refused by name**, and the new binary's live state is the **artifact path's**,
-  never the genesis counterfactual. It re-submits the corpus's own recorded
-  command frames, takes the instant, lets the old build run past it, stops it,
-  places the pin, then judges both arms; a PASS additionally requires the SDK's
-  own `pinned install of snap-<origin>` line on the new service's stderr, so
-  "it started from the origin" is observed rather than inferred. Verdicts are
-  PASS, INCONCLUSIVE (the span carried no state-dependent command, so the two
-  paths agree and the run cannot show the counterfactual) or FAIL; a
-  same-version run is refused up front.
-  → [Diff replay § 5. Verify the pin live](docs/how-to/diff-replay.md#5-verify-the-pin-live-reconstruction-mode-part-2) ·
-  [VERIFICATION](docs/VERIFICATION.md)
-- **The lifecycle, written down.** The [SDLC
-  standard](docs/reference/application-sdlc.md) gains the three compatibility
-  axes, the [change
-  taxonomy](docs/reference/application-sdlc.md#the-change-taxonomy), the
-  common-origin requirement, version-as-an-input, nine schema and protocol
-  conventions, and the [per-row upgrade lifecycle
-  S1–S9](docs/reference/application-sdlc.md#the-upgrade-lifecycle-per-row);
-  [Upgrade an application](docs/how-to/upgrade-an-application.md) is rewritten
-  as the seven-step pinned procedure S6 points at (back up → instant → pin →
-  confirm on every node → stop → swap → verify), with what a rollback costs
-  once the pin has committed and when the old code arm may finally be deleted.
-  For agents, `.claude/skills/diff-replay-judge/` is a project skill covering
-  the five judgement steps the harness cannot make for you: draft the
-  declaration from the diff, classify the change, attribute the residue, judge
-  the state diff, and spot the determinism hazards a lint cannot.
-- **Also in this release: the application lifecycle, documented end to end.** A
-  clean-room dogfood — one agent building a real service on UC from the
-  published docs alone, a second operating a real fleet through faults,
-  reconfiguration and an upgrade — drove the documentation from a set of
-  per-milestone gate docs to a lifecycle a stranger can follow, and left a
-  worked example in the tree.
-  - **[`examples/kv`](examples/kv): a replicated key-value store**, the first
-    shipped user-facing `SnapshotStateMachine` + `Sessioned` example —
-    coordinated snapshots, exactly-once over a remote hop, a two-shape v2 that
-    reads v1 images, and real-cluster tests including the upgrade.
-  - **A lifecycle tutorial**, [Build an
-    application](docs/tutorials/build-an-application.md): design → build → test
-    → package → deploy → operate → upgrade, with the KV store as the worked
-    example.
-  - **Two experience reports** —
-    [builder](docs/notes/uc2-dogfood-kv-builder-report.md) and
-    [operator](docs/notes/uc2-dogfood-kv-operator-report.md) — the honest
-    account of building and running UC from the docs alone, with the friction
-    concentrated in the upgrade story and in observability.
-  - **Reference and how-to fixes** from the two friction ledgers: a voter-down
-    / partition / lost-disk diagnosis section, response and
-    `Sessioned`-envelope payload limits, the dashboard's real panel inventory,
-    and the new member's config — plus product tickets for the observability
-    and packaging gaps the dogfood surfaced (#33–#42).
-- **Fixed:**
-  - **An apply pass that overran the log buffer could replay forever, in
-    silence.** A reconstruction replay that makes no progress is exactly the
-    "the retained prefix does not cover my cursor" condition the gap guard
-    exists for, but the guard's own test could not detect it in that shape, so
-    the row spun instead — and `Service::stop` then hung for good. A
-    no-progress pass now takes the gap guard's own path: a snapshot-capable row
-    installs a covering artifact, and one that is not fail-stops
-    `SnapshotRequired` by name. Pre-existing.
-  - **A `uc_node` test flake is closed**: four in-module tests swapped the
-    process-global `uc_obs` sink concurrently, so log-capture assertions failed
-    at random under the default thread count. One capture lock, held per
-    capturing test, with drop guards.
-  - **`counter-service` exited 1 instead of retrying while its node booted**
-    ([#53](https://github.com/PeterKnego/ultima_cluster/pull/53)) — it now
-    retries `NodeBooting` on the wait deadline it already had, while every
-    other refusal stays final.
-  - **Nightly CI did not build the two fixture binaries** the diff-replay and
-    KV corpus tests hard-assert, so its capstones job was red (#53); the docs
-    landing page did not link `uc_diffreplay` (#53); and one dead anchor in
-    `configuration.md` failed the link check
-    ([#55](https://github.com/PeterKnego/ultima_cluster/pull/55)).
-- **Changed reading:** `uc2_cluster_fsm_position` now reports the
-  `uc2-cluster` agent's **walk cursor** — the quantity its help text has always
-  described, and the only one the readiness gate can be asked about — instead of
-  the published view's tag, which moved only on a pass that applied a `CLUSTER`
-  frame. The metric's name is unchanged, so a dashboard built on `2.11.0` keeps
-  working and reads a different number: on a cluster carrying ordinary traffic
-  and no cluster commands it now climbs with commit instead of sitting still.
-- **API notes** (details in [the semver
-  policy](docs/reference/semver-policy.md#2130-api-notes)): `ServiceConfig`,
-  `EngineConfig` and `PipelinedConfig` each gain a public `boot_wait` field —
-  additive, but an exhaustive struct literal in downstream code stops
-  compiling; `ApplyCtx::ids` now takes `&mut self` (every caller already holds
-  `&mut ApplyCtx`, so a caller behind a shared reference is the one break); and
-  `SnapshotStateMachine::project` is a **provided** method, so no existing
-  implementation has to change.
-- **Performance: nothing measured — no fleet gate ran for this release.** This
-  is a control-plane and tooling release; no bar was set, run or moved.
+  [`uc_diffreplay` README](uc_diffreplay/README.md)
+- **The lifecycle, written down.** An SDLC standard with the change taxonomy
+  and per-row upgrade steps S1–S9, a rewritten upgrade how-to, and a
+  `diff-replay-judge` agent skill.
+  → [SDLC standard](docs/reference/application-sdlc.md) ·
+  [Upgrade an application](docs/how-to/upgrade-an-application.md)
+- **A worked example and a tutorial.** [`examples/kv`](examples/kv), a
+  replicated key-value store, and a design-to-upgrade tutorial built on it,
+  plus two clean-room experience reports.
+  → [Build an application](docs/tutorials/build-an-application.md) ·
+  [builder report](docs/notes/uc2-dogfood-kv-builder-report.md) ·
+  [operator report](docs/notes/uc2-dogfood-kv-operator-report.md)
+- **Lower low-load latency.** The apply agent idles on a spin → yield → sleep
+  ladder instead of a flat 50 µs sleep, which took the shipped posture's p90
+  from 219 to 118 µs on the fleet.
+  → [Service time § 4.5](docs/benchmarks/uc2-service-time-2026-09-16.md#45-re-run-with-the-ladder-as-the-default--2026-09-17)
+- **Fixed:** an apply pass that overran the log buffer could replay forever in
+  silence; plus a test flake, a service that did not retry a booting node, and
+  CI gaps.
+  → [Full record § Fixed on the way](docs/releases.md#fixed-on-the-way)
+- **Changed reading and API notes:** `uc2_cluster_fsm_position` now reports
+  the cluster agent's walk cursor; three config structs gain a public
+  `boot_wait` field and `ApplyCtx::ids` takes `&mut self`.
+  → [Semver policy § 2.13.0](docs/reference/semver-policy.md#2130-api-notes)
+- **Performance:** no fleet gate ran; this is a control-plane and tooling
+  release.
 
 ## v2.12.0 — 2026-09-13 — jumbo frames, and the monotonic log clock
 
-Two features on one flag day. The command payload ceiling stops being a source
-constant and becomes a **measurement of the paths between nodes**, committed
-cluster-wide; and the leader's log-time stamp moves onto a monotonic clock, so a
-backward wall-clock step no longer freezes the log's time. Wire `0.7.0` →
-`0.8.0` and cnc `3.1` → `3.2`, together: **stop every node before starting any
-node**, and delete `max_payload` from every `node.toml` first — the key is
-retired and refused by name. Step-by-step:
-[Upgrade a cluster § 2.12.0](docs/how-to/upgrade-a-cluster.md#wire--cnc-change-in-2120-jumbo-frames-080-cnc-32).
-No instance directory needs clearing.
+The command payload ceiling is discovered from the network, and the log clock
+no longer freezes on a backward wall-clock step.
+[Full record](docs/releases.md#v2120--2026-09-13--jumbo-frames-and-the-monotonic-log-clock).
 
-- **Jumbo frames: the command payload ceiling is discovered from the network,
-  not configured.** Every node probes every peer up a fixed ladder of datagram
-  sizes (`RUNGS = [1408, 8832, 8960]`) with do-not-fragment set, the leader
-  commits the minimum over all pairs through the replicated `Settings` record
-  once every member has proven it, and every node moves its doors at that
-  commit — so a cluster on a 9001 B path such as AWS carries **8896 B**
-  commands (8864 B with wire crypto) instead of 1344 B / 1312 B, one on an
-  8896 B fabric such as GCP lands on the 8832 rung (8768 / 8736), and a cluster
-  on an ordinary 1500 B path keeps the baseline and behaves exactly as before. The
-  number is monotone and never lowers (a committed frame is a permanent
-  obligation on every future leader), `max_payload` is gone from `node.toml`,
-  the optional new `force_jumbo_frames` makes a jumbo path a startup
-  requirement, and a node that cannot carry the committed rung refuses to join
-  by name instead of replicating what it cannot ship (one that has not yet
-  proven it holds `/readyz` at 503 until a quorum of voters has, or one voter
-  for a learner — so a single dead member never blocks a survivor's restart,
-  a member whose path shrank while it was down is refused rather than quietly
-  served, and a hold that outlasts discovery logs why every 30 s and alerts
-  after 5 min). **The raise is a one-way
-  door**: the committed rung never lowers and has no opt-out, so from the first
-  jumbo commit no member on a narrower path can ever join — an operator who will
-  need one later keeps a narrow path in the cluster from the start. Eight new
-  `/metrics` series, three new alerts, and one warning per client the first time a command
-  goes above the standard 1312 B ceiling — so a 4 KB command that works on a dev
-  box's loopback (MTU 65 536) does not surprise anyone in production. A node host must now run **Linux** (or
-  Android): the do-not-fragment socket options exist for those targets only,
-  and probing without them would over-report a path, so `uc2-node` refuses to
-  start elsewhere by name.
-  → [Jumbo frames and path-MTU discovery, explained](docs/notes/uc2-jumbo-frame-discovery-explained.md) ·
+- **Upgrade flag day:** wire `0.7.0` → `0.8.0`, cnc `3.1` → `3.2` — stop every
+  node before starting any, and delete `max_payload` from every `node.toml`
+  first.
+  → [Upgrade a cluster § 2.12.0](docs/how-to/upgrade-a-cluster.md#wire--cnc-change-in-2120-jumbo-frames-080-cnc-32)
+- **Jumbo frames.** Nodes probe their paths and commit the largest datagram
+  every member carries, so a 9001 B path carries 8896 B commands instead of
+  1344 B; the raise is one-way, and a node host must now run Linux.
+  → [Explainer](docs/notes/uc2-jumbo-frame-discovery-explained.md) ·
   [Run a cluster on jumbo frames](docs/how-to/jumbo-frames.md) ·
-  [Limits § hard limits](docs/reference/limits.md#hard-limits) ·
-  [Wire protocol](docs/reference/wire-protocol.md) ·
-  [spec](docs/superpowers/specs/2026-09-10-uc2-jumbo-frame-discovery-design.md)
-- **Monotonic log clock.** The leader's log-time stamp comes from
-  `CLOCK_MONOTONIC` plus a sampled epoch offset: a backward NTP step slows
-  the log clock (500 ppm) instead of freezing it, and the consensus pass
-  takes one clock read instead of two. New gauge `uc2_log_clock_smear_ns`,
-  new event `log_clock_step`; `Uc2LogTimeFrozen` now means only a stalled
-  appender.
-  [Explainer](docs/notes/uc2-log-time-and-timers-explained.md#the-log-clock),
-  [spec](docs/superpowers/specs/2026-09-08-uc2-monotonic-log-clock-design.md).
-- **Fixed: attaching to a restarting node could panic instead of refusing.**
-  `uc2ctl`, a client `Engine::attach`, a service attach and the gateway all
-  decoded the cnc page's header through a method that `expect`ed it to be
-  valid — but a restarting node re-initialises that page underneath every
-  attached reader, so the decode could land on a torn header and abort the
-  process. It is now fallible (`CncPage::try_meta`), and each caller answers
-  with the typed refusal it would have given had the page been bad at open
-  time. Recorded as a known issue at
-  [2.11.0](docs/releases.md#known-issue-at-release-cncpagemeta-panics-on-a-page-a-live-writer-re-initialised).
-- **Fixed: a service or client attaching while a node boots could adopt the
-  wrong lag policy or FSM set for life.** The node publishes its cnc header
-  (FSM names included) a few statements before the declared set and lag
-  policy; an attacher landing in that gap read the harness signature
-  (`services_declared == 0`) and fixed `LagMode::Off` — unbounded, on a
-  lockstep cluster — or a one-FSM view of a multi-FSM node, with no fail-stop
-  ever firing because the `instance_id` was correct. Names with no declared
-  set is a page no configured node publishes and no harness page has, so both
-  doors now refuse it by name (`ServiceError::NodeBooting` /
-  `ClientError::NodeBooting` — retry), and the node stores the lag policy
-  BEFORE the declared set so a published set implies a published policy.
-  Found by review of the `CncPage::meta()` fix; pre-existing since 2.8.0.
-- **Fixed: a stop signal during `uc2-node`'s own startup no longer kills it
-  by signal.** The daemon registered its `SIGTERM`/`SIGINT` handler only
-  after the node had started, so a `systemctl stop` that raced a start (or
-  a supervisor that signalled on first sight of the cnc page) hit the
-  default action and the process died with status 143 instead of draining
-  and exiting 0. The handler is registered before the node starts; a signal
-  caught during boot exits through the same drain path. Found by CI on the
-  release commit, reproduced locally at about one run in twenty-five.
-- **Fixed: a wedged worker in the multi-process crash tests now fails by
-  name instead of hanging a nightly for an hour.** The remote lincheck
-  capstone's worker and chaos-thread joins, the hard-crash and survival
-  suites' worker joins, and the child reap every crash suite shares had no
-  deadline, which is how a flaky failure became a 58-minute cancelled run on
-  2026-09-08. Each is bounded now. Diagnosability only: the hang's cause is
-  still unexplained.
-  [Engineering record](docs/releases.md#fixed-after-the-2110-tag).
-- **Performance: both gates ran on a fleet on 2026-09-13; no bar was moved.**
-  Jumbo: discovery converges on the top rung within ~2 s of the last node's
-  start on every rep (row a, PASS — the harness's first scrape already found
-  every node there); the `force_jumbo_frames` gate refuses by
-  name on both arms, each node at its own 30 s window (row d, PASS); a
-  1500 B path pins the rung at 1408 with zero `EMSGSIZE` and a probe counter
-  that keeps climbing as documented (row b's functional clauses hold). Row b's
-  −3 % throughput bar and the log clock's fleet A/B are both
-  **inconclusive**, recorded as such and not as a pass: row b ran 12 of the
-  29 pairs its own rule called for (a feasible re-run that was not made), and
-  the log clock's 0.27 % bar sits under per-arm spreads of 9–48 %, the same
-  finding as the 2.11.0 gates. Row c (whether the runbook should *recommend*
-  jumbo) was not run — its soak instrument was never built — so jumbo stays a
-  documented knob. Rows e and f are reported with no bar.
-  [Jumbo gate doc](docs/benchmarks/uc2-jumbo-frame-discovery-gate-2026-09-13.md) ·
-  [log-clock gate doc](docs/benchmarks/uc2-log-clock-gate-2026-09-08.md).
+  [Limits § hard limits](docs/reference/limits.md#hard-limits)
+- **Monotonic log clock.** Log time is `CLOCK_MONOTONIC` plus a sampled epoch
+  offset, so a backward NTP step slows the clock at 500 ppm instead of
+  freezing it.
+  → [Explainer](docs/notes/uc2-log-time-and-timers-explained.md#the-log-clock)
+- **Fixed:** attaching to a restarting node could panic on a torn cnc header,
+  and attaching during a node's boot gap could adopt the wrong FSM set for
+  life.
+  → [Full record § fixed after the 2.11.0 tag](docs/releases.md#fixed-after-the-2110-tag)
+- **Performance:** jumbo discovery converges within ~2 s and the refusal rows
+  pass; both throughput bars are inconclusive, and no bar was moved.
+  → [Jumbo gate](docs/benchmarks/uc2-jumbo-frame-discovery-gate-2026-09-13.md) ·
+  [log-clock gate](docs/benchmarks/uc2-log-clock-gate-2026-09-08.md)
 
 ## v2.11.0 — 2026-09-08 — FSM identity, log time, the cluster FSM, and coordinated snapshots
 
-Five features on one flag day: a state machine now carries its own **name and
-version** in code; every log frame carries the **time** the leader accepted it,
-with a scheduler and a replicated schedule table built on that clock; the
-cluster's own state (membership, schedules, settings) moves into an internal
-**cluster FSM** with its own snapshot artifact; and a snapshot becomes a
-**coordinated instant** the whole cluster takes at one log position, on command.
-Wire `0.6.0` → `0.7.0` and cnc `3.0` → `3.1`, together. Proof record, row by
-row: [FSM identity gate](docs/benchmarks/uc2-fsm-identity-gate-2026-09-02.md) ·
-[time-and-timers gate](docs/benchmarks/uc2-time-and-timers-gate-2026-09-03.md) ·
-[the release-evidence table](docs/releases.md#release-evidence). Both gates ran
-on a fleet 2026-09-07/08.
+Five features on one flag day: state machines carry their identity in code,
+frames carry time, cluster data moves into an internal FSM, and snapshots
+become coordinated instants.
+[Full record](docs/releases.md#v2110--2026-09-08--fsm-identity-log-time-the-cluster-fsm-and-coordinated-snapshots).
 
-- **FSM identity: a state machine declares its own name and version in
-  code** (`uc_service`, `uc_node`, `uc_protocol`): a required `const NAME`
-  and optional `const VERSION` on the trait; `[services] names = [...]`
-  replaces `ids` (required, refused by name); a service finds its row by
-  name; `SNAP_BEGIN` carries per-row hashes + versions and a mismatched
-  cluster is refused by name instead of silently diverging; `ApplyCtx`
-  replaces the bare `position` argument and `IdGen` derives deterministic
-  ids from it with zero coordination. →
-  [The FSM identity explainer](docs/notes/uc2-fsm-identity-and-deterministic-ids-explained.md) ·
-  [§ `IdGen`](docs/notes/uc2-fsm-identity-and-deterministic-ids-explained.md#idgen--deterministic-ids-and-why-per-apply-scoping-is-the-whole-story) ·
-  [Configuration § `[services]`](docs/reference/configuration.md#services) ·
-  [Monitor a cluster § per-FSM families](docs/how-to/monitor-a-cluster.md#the-per-fsm-families-m14) ·
-  [semver policy § carve-out](docs/reference/semver-policy.md#fsm-identity-a-breaking-trait-and-config-change-riding-as-a-minor)
-- **Log time and timers** (`uc_log`, `uc_node`, `uc_service`): the leader
-  reads its clock once per pass and stamps every frame `max(now, last)`, so
-  `ctx.time_ns` is the first deterministic "now" a state machine has had; a
-  state machine schedules its own callbacks (`ApplyCtx::schedule`/`cancel`,
-  `on_timer`), delivered before the pass's client frames, at-least-once at the
-  node and exactly-once through `uc_service::Timed<S>`; `uc2_log_time_ns`,
-  the timer families and `Uc2LogTimeFrozen` make the clock observable. →
-  [Log time and timers, explained](docs/notes/uc2-log-time-and-timers-explained.md) ·
-  [Schedule work inside a state machine](docs/how-to/schedule-work-in-a-service.md) ·
-  [State-machine contract § Timers](docs/reference/state-machine-contract.md#timers-on_timer-and-timeds) ·
-  [Wire protocol § Log frames](docs/reference/wire-protocol.md#log-frames) ·
-  [Monitor a cluster § log clock and timers](docs/how-to/monitor-a-cluster.md#the-log-clock-and-the-timer-families-2110)
-- **A replicated schedule table** (`uc2ctl`, `uc_node`): operators declare
-  recurrences — `every` with an anchor, `at` (daily, UTC), `once` — in a TOML
-  file and apply it with one signed, leader-only command; ticks fire through
-  the same heap and the same `TIMER` frame, one catch-up tick after downtime,
-  never a backlog. → [Run work on a schedule](docs/how-to/run-work-on-a-schedule.md) ·
-  [`uc2ctl` § `schedule apply`](docs/reference/uc2ctl.md#schedule-apply) ·
-  [explained § The schedule table](docs/notes/uc2-log-time-and-timers-explained.md#the-schedule-table) ·
-  [Wire protocol § `ScheduleTable`](docs/reference/wire-protocol.md#scheduletable-payload-cluster-kind-2-wire-070)
-- **The cluster FSM** (`uc_node`): membership, the schedule table and a new
-  replicated settings record live in one internal state machine, applied at
-  commit by a fifth agent and shipped to a below-floor joiner as its own
-  artifact — before the joiner's floor advances. Four settings (`fsm_lag`,
-  `admission_bytes`, `snapshot_interval_bytes`, `snapshot_target`) stop being
-  per-host config: `[settings]` seeds genesis, `uc2ctl settings apply` changes
-  them, the old keys are refused by name. →
-  [The cluster FSM, explained](docs/notes/uc2-cluster-fsm-explained.md) ·
-  [Configuration § `[settings]`](docs/reference/configuration.md#settings) ·
-  [`uc2ctl` § `settings apply`](docs/reference/uc2ctl.md#settings-apply) ·
-  [Wire protocol § `CLUSTER` body](docs/reference/wire-protocol.md#cluster-body-wire-070) ·
-  [Operations § Changing a running cluster](docs/ops/uc2-runbook.md#changing-a-running-cluster)
-- **Coordinated and standby snapshot instants** (`uc_node`, `uc_service`,
-  `uc2ctl`): `uc2ctl snapshot` puts a `SNAPSHOT` frame on the log and every
-  row plus the cluster FSM freeze at its position, so a node holds one
-  complete set at one P and the purge floor moves on complete sets only;
-  `--standby` freezes learners, not voters, so a snapshot need not stall
-  commit; `snapshot fetch` brings a set back to a voter. Artifacts carry a
-  16-byte `ULTSNAP1 ‖ P` envelope; retention is node-owned; the per-service
-  `SnapshotPolicy` is gone. →
-  [explained § Instants](docs/notes/uc2-cluster-fsm-explained.md#instants-one-position-one-set) ·
-  [Keep the journal from growing without bound](docs/how-to/bound-journal-growth.md) ·
-  [`uc2ctl` § `snapshot`](docs/reference/uc2ctl.md#snapshot) · [§ `snapshot fetch`](docs/reference/uc2ctl.md#snapshot-fetch) ·
-  [Instance directory § The artifact envelope](docs/reference/instance-directory.md#the-artifact-envelope-and-who-deletes-artifacts) ·
-  [Monitor a cluster § snapshot families](docs/how-to/monitor-a-cluster.md#the-snapshot-families-2110)
-- **Fixed:** a restarted ex-leader could run one config version behind
-  forever ([Verification § sim](docs/VERIFICATION.md#2-deterministic-simulation));
-  a learner joining below a still-climbing purge floor could wedge, and a
-  second FSM row fail-stopped when its snapshot sat above the min floor
-  ([Change cluster membership § pair with snapshots](docs/how-to/change-cluster-membership.md#before-you-start-pair-with-snapshots-if-you-write-continuously));
-  a default node could not apply a full 32-entry schedule table — `max_payload`
-  now derives from the path budget, a too-small value is refused at startup,
-  and the refusal is `schedule_too_large` rather than blaming the file
-  ([engineering record](docs/releases.md)); `uc2-gateway --version` exists.
-- **Known issue at release:** `uc2ctl`, a client attach or a service attach
-  that lands exactly on a node's restart can panic (`CncPage::meta()` asserts
-  a header a restarting node is rewriting). Nothing is written or lost;
-  re-running works. Not a regression. **Fixed on `main` for 2.12.0** (see
-  that section above). →
-  [engineering record](docs/releases.md)
-- **Performance:** both gates ran on 4 × `c6id.2xlarge`, 2026-09-07/08,
-  against bars pre-committed before any run; **no bar was moved**. Three rows
-  pass, two are honest failures, four could not be adjudicated as written.
-  - **PASS**: the two-FSM learner join over wire `0.7.0` converged in
-    **24.61 s** (bar ≤ 60 s) with zero snapshot-session refusals on every
-    host; the bounded pair converges to its slow FSM (1.037); a below-floor
-    join with the shipper **restarted mid-window** converged in **23.07 s**
-    with the snapshot set agreeing cluster-wide.
-  - **Measured, no bar**: an all-nodes instant over a 256 MiB state froze each
-    voter ~**164 ms** with **zero stalled seconds** of commit. The `--standby`
-    arm did not complete on a learner running far behind the write rate — an
-    operating-envelope fact (a standby instant completes only once the learner
-    has applied to its position), not a broken mechanism.
-  - **FAIL**: timer precision — median lateness ~1 µs (one pass) but the p99
-    tracked the pass-length tail; the bar was also unreachable as written and
-    has been restated for the next run. The apply-loop arm coordinated
-    snapshots added cost **−2.1 %** as introduced; the force-inlining work
-    since more than absorbs it (**+35 %** from that commit to what ships), and
-    the whole flag day's apply hop reads **within resolution** at N=1.
-  - **Inconclusive**: the throughput rows — a 1.12 % build-noise bar against
-    15–43 % fleet spread cannot be resolved by repetition; the driver now
-    judges a paired per-rep delta for the next run.
+- **Upgrade flag day:** wire `0.6.0` → `0.7.0`, cnc `3.0` → `3.1`, with a
+  same-length header relayout — stop every node before starting any, and make
+  three `node.toml` edits on every host.
+  → [Upgrade a cluster § 2.11](docs/how-to/upgrade-a-cluster.md#wire--cnc-change-in-2110-fsm-identity-log-time-and-the-cluster-fsm-070-cnc-31)
+- **FSM identity.** A state machine declares `const NAME` and `VERSION` in
+  code, and a mismatched cluster is refused by name; `ApplyCtx` replaces the
+  bare `position` argument and `IdGen` derives deterministic ids.
+  → [Explainer](docs/notes/uc2-fsm-identity-and-deterministic-ids-explained.md) ·
+  [semver carve-out](docs/reference/semver-policy.md#fsm-identity-a-breaking-trait-and-config-change-riding-as-a-minor)
+- **Log time and timers.** Every frame carries the leader's timestamp, giving
+  `apply` a deterministic "now", and a state machine can schedule its own
+  callbacks.
+  → [Explainer](docs/notes/uc2-log-time-and-timers-explained.md) ·
+  [Schedule work inside a state machine](docs/how-to/schedule-work-in-a-service.md)
+- **A replicated schedule table.** Operators declare recurring ticks in a TOML
+  file and apply it with one signed command.
+  → [Run work on a schedule](docs/how-to/run-work-on-a-schedule.md)
+- **The cluster FSM.** Membership, the schedule table and four replicated
+  settings live in one internal state machine with its own snapshot artifact.
+  → [Explainer](docs/notes/uc2-cluster-fsm-explained.md) ·
+  [`uc2ctl` § `settings apply`](docs/reference/uc2ctl.md#settings-apply)
+- **Coordinated snapshot instants.** `uc2ctl snapshot` freezes every row at one
+  log position, and `--standby` freezes only learners so commit never stalls.
+  → [Explainer § Instants](docs/notes/uc2-cluster-fsm-explained.md#instants-one-position-one-set) ·
+  [Keep the journal from growing without bound](docs/how-to/bound-journal-growth.md)
+- **Fixed:** a restarted ex-leader could run one config version behind, a
+  learner could wedge below a climbing purge floor, and a default node could
+  not apply a full schedule table.
+  → [Full record](docs/releases.md#v2110--2026-09-08--fsm-identity-log-time-the-cluster-fsm-and-coordinated-snapshots)
+- **Performance:** three rows pass, two are honest failures (timer precision,
+  the snapshot arm's introduction cost) and four were inconclusive; no bar was
+  moved.
   → [FSM identity gate](docs/benchmarks/uc2-fsm-identity-gate-2026-09-02.md) ·
   [time-and-timers gate](docs/benchmarks/uc2-time-and-timers-gate-2026-09-03.md)
 
-**Upgrade consequence.** Wire `0.7.0` and cnc `3.1` are flag days — and the
-sharper kind: the frame header is *relaid* at the same length, so a `0.6.0`
-peer's frames parse and mean something different. **Stop every node before
-starting any node.** Three `node.toml` edits on every host: `[services] ids`
-→ `names` (required), `admission_bytes` and `[services] fsm_lag` → `[settings]`,
-and — only if pinned — `max_payload` at least 1072 or, better, unset. The
-`apply` signature changes to `apply(&mut self, ctx: &mut ApplyCtx, cmd)`
-(ships as a minor under [the semver policy](docs/reference/semver-policy.md)),
-`SnapshotPolicy` is deleted, pre-envelope snapshot artifacts are refused by
-name (clear a dev box's `snapshots/` once), and `uc_node` now depends on
-`uc_service`, which flips the crates.io publish order. Details, in the
-imperative: [Upgrade a cluster § 2.11](docs/how-to/upgrade-a-cluster.md#wire--cnc-change-in-2110-fsm-identity-log-time-and-the-cluster-fsm-070-cnc-31) ·
-[Instance directory § Files](docs/reference/instance-directory.md#files) ·
-[§ Limits](docs/reference/instance-directory.md#limits) ·
-[Back up a cluster § Verify](docs/how-to/back-up-a-cluster.md#verify-before-you-trust-it) ·
-[Cut a release](docs/how-to/cut-a-release.md).
+## v2.10.0 — 2026-08-31 — one log stream, config from the environment, and a weak-memory fix
 
-## v2.10.0 — 2026-08-31
+Operator-facing hygiene plus a memory-ordering fix a loom model found.
+[Full record](docs/releases.md#v2100--2026-08-31--one-log-stream-config-from-the-environment-and-a-weak-memory-fix).
 
-**One log stream, config from the environment, and a memory-ordering fix a
-model found.** Two changes an operator must read before upgrading — the
-daemons no longer write to stdout at all, and `uc_service`'s `ultima_db`
-feature is gone — plus a correctness fix in the node→client response ring that
-only manifests on aarch64.
-
-- **Every daemon now has ONE output stream and ONE format.** `uc2-node` and
-  `uc2-gateway` previously wrote to *both* stdout and stderr, so a log
-  consumer had to merge two streams and two formats. Now every record from
-  startup onward is a JSON line on **stderr**, and **stdout is byte-empty**.
-  The gateway's 12-field prose stats line became a `gateway_stats` record, and
-  five node lifecycle lines became `node_listening`, `metrics_listening`,
-  `draining`, `stopped` and `statvfs_failed`. Two lines were deleted rather
-  than converted, because they duplicated records the library already emitted.
+- **Upgrade:** a plain binary swap, but the daemons no longer write to stdout.
+  → [Upgrade a cluster § 2.10.0](docs/how-to/upgrade-a-cluster.md#stdout-is-now-empty-2100)
+- **One log stream.** Every daemon record is a JSON line on stderr, and stdout
+  is empty.
   → [Monitor a cluster § Structured records](docs/how-to/monitor-a-cluster.md#structured-records)
-- **Config keys that vary per deploy can now come from the environment.**
-  Eleven `UC2_*` overrides (`UC2_NODE_ID`, `UC2_BIND`, `UC2_INSTANCE_DIR`,
-  `UC2_APP_ID`, `UC2_MEMBERS`, `UC2_LOG_LEVEL`, `UC2_METRICS_BIND` and four
-  `UC2_GATEWAY_*`), environment winning over file, each announced by a
-  `config_env_override` record. One immutable image can now run every node of
-  a cluster: `packaging/compose.yml` renders **two** config files instead of
-  six. Key material stays file-based deliberately, and a test enforces it.
+- **Environment overrides.** Eleven `UC2_*` variables override deploy-varying
+  config keys, so one image can run every node.
   → [Configuration § Environment overrides](docs/reference/configuration.md#environment-overrides)
-- **A node reports the config it loaded, so a release can be pinned.** Every
-  node emits `config_loaded` {path, sha256} at startup — plain SHA-256 over
-  the file's bytes, so it checks against `sha256sum` on the copy in version
-  control with no UC tooling. With `uc2_build_info{version}` and the override
-  records, what a node is running is fully identifiable from a live process.
+- **Config identity.** Every node logs the SHA-256 of the config it loaded.
   → [Record a release](docs/how-to/record-a-release.md)
-- **New crate `uc_obs`** — the structured log record format, extracted so
-  `uc2-gateway` can emit it without depending on `uc_node`. **13 publishable
-  crates now**, still versioned in lockstep.
-  → [Architecture § Crates](docs/ARCHITECTURE.md)
-- **A plain-language explanation of state machine replication**, with a
-  diagram — now the single source for the concept, which `README.md` and
-  `docs/ARCHITECTURE.md` point at rather than restating.
+- **New crate `uc_obs`**, the structured log format — 13 publishable crates.
+  → [Architecture](docs/ARCHITECTURE.md)
+- **SMR, explained.** A plain-language explainer is now the single source for
+  the concept.
   → [State machine replication, explained](docs/notes/state-machine-replication-explained.md)
-
-**Fixed**
-
-- **The Broadcast ring's seqlock was unsound on weak memory** — a torn
-  node→client response could escape its read barrier and reach the crc. The
-  producer's `Release` store orders accesses *before* it, not after, so the
-  next record's body writes could be observed ahead of the publish that warns
-  a lapped reader. Fixed with one publish-before-body fence: **no instruction
-  on x86_64**, one `dmb ish` on aarch64. Found by a new loom model, not by a
-  test — x86-TSO forbids the reordering and CI never executes aarch64.
+- **Fixed:** the Broadcast ring's seqlock could let a torn response through on
+  aarch64; the fix is one fence, free on x86_64.
   → [The broadcast seqlock, explained](docs/notes/uc2-broadcast-seqlock-explained.md)
-- Two test-suite races that produced nightly intermittents: the reconfig
-  removal fixtures now retry when a best-effort adoption race is lost, and
-  `sigkill_mid_config_window` gained a 90 s liveness budget plus a straggler
-  diagnostic that distinguishes a starved process from a live-but-not-adopting
-  one.
-
-**Removed (breaking)**
-
-- **`uc_service`'s `ultima_db` feature and the `ultima-db` dependency.** The
-  `StoreStateMachine` adapter it provided was used by nothing in the tree
-  except its own test — no binary, example, gate harness or capstone built it.
-  Removing it drops three crates from `Cargo.lock`. Not a major version: the
-  [semver policy](docs/reference/semver-policy.md) already excluded non-default
-  features by name. A service supplies its own `StateMachine`; UC prescribes
-  no store.
-
-**Performance**
-
-- **No performance change.** UC's throughput on the published `c6id.2xlarge`
-  configuration is unmeasured this release; nothing on the commit path
-  changed. Three fleet runs were made, all methodological:
-  CPU pinning was evaluated against a pre-committed bar and **not adopted**
-  (14.3 % spread against a < 5 % bar, and a −9.4 % throughput cost), a
-  core-count sweep answered **4 physical cores, one per polling agent**, and
-  a per-second timeline probe established that the fleet's run-to-run variance
-  is one distribution with a long low tail rather than two operating regimes.
+- **Removed (breaking):** `uc_service`'s `ultima_db` feature, which nothing in
+  the tree used.
+  → [Semver policy](docs/reference/semver-policy.md)
+- **Performance:** unchanged; CPU pinning was evaluated and not adopted, and a
+  node needs 4 physical cores.
   → [Pinning](docs/benchmarks/uc2-m14c2-fleet-pinning-2026-08-30.md) ·
-  [Core-count sweep](docs/benchmarks/uc2-node-core-count-sweep-2026-08-31.md) ·
-  [Regime probe](docs/benchmarks/uc2-regime-probe-2026-08-31.md)
-
-**Upgrading** — the binary swap is unchanged, but read
-[Upgrade a cluster § 2.10.0](docs/how-to/upgrade-a-cluster.md#stdout-is-now-empty-2100)
-first if anything you run parses daemon stdout.
+  [Core-count sweep](docs/benchmarks/uc2-node-core-count-sweep-2026-08-31.md)
 
 ## v2.9.0 — 2026-08-30 — one prefix: every crate is now `uc_*`
 
-**A rename, and nothing else.** No behaviour changed, no wire or cnc change, no
-configuration change, and **no binary was renamed** — an operator upgrading from
-`2.8.1` swaps binaries as usual and touches nothing else. What moved is the
-*package* names, which had accumulated three inconsistent conventions (`uc2_*`,
-the un-underscored `uc2ctl`, and `ultima-journal`) and carried an internal
-version number — `2` — into names that were about to become permanent on
-crates.io. Since the [ordered crates.io publish](docs/how-to/cut-a-release.md)
-had never been run, this was the last moment it was free.
+A package rename and nothing else: no behaviour, wire, config or binary name
+changed.
+[Full record](docs/releases.md#v290--2026-08-30--the-uc_-crate-rename).
 
-| was | is |
-|---|---|
-| `uc_protocol` | `uc_protocol` (unchanged) |
-| `uc2_log`, `uc2_net`, `uc2_crypto`, `uc2_consensus` | `uc_log`, `uc_net`, `uc_crypto`, `uc_consensus` |
-| `uc2_node`, `uc2_service`, `uc2_client` | `uc_node`, `uc_service`, `uc_client` |
-| `uc2_remote`, `uc2_gateway` | `uc_remote`, `uc_gateway` |
-| `uc2ctl` (package) | `uc_ctl` (the **binary** is still `uc2ctl`) |
-| `ultima-journal` | `uc_journal` |
-| `uc2_sim`, `uc-lincheck`, `uc2-crashtest`, `uc2-fuzz` (unpublished) | `uc_sim`, `uc_lincheck`, `uc_crashtest`, `uc_fuzz` |
-
-Each crate's **directory** was renamed with it, so `uc_node/src/node.rs` is
-where `uc_node` lives.
-
-- **Nothing an operator touches was renamed.** The binaries are still
-  `uc2-node`, `uc2ctl` and `uc2-gateway`; the systemd units, the
-  `ghcr.io/peterknego/uc2` image, `compose.yml`'s healthchecks, the instance-dir
-  layout and every `/metrics` name (`uc2_is_leader`, `uc2_fsm_lag_bytes`, …) are
-  byte-for-byte what `2.8.1` shipped. Dashboards and alert rules need no edit.
-  `uc_ctl` declares `[[bin]] name = "uc2ctl"` explicitly so the package rename
-  cannot leak into the CLI. → [Run a cluster](docs/how-to/run-a-cluster.md)
-- **What does break: source that names the old crates.** If you build against
-  the workspace, `use uc2_service::…` and `cargo build -p uc2_node` stop
-  resolving. The fix is mechanical, and the names do not collide with anything
-  else:
-
-  ```sh
-  sed -i 's/uc2_log/uc_log/g; s/uc2_net/uc_net/g; s/uc2_crypto/uc_crypto/g;
-          s/uc2_consensus/uc_consensus/g; s/uc2_node/uc_node/g;
-          s/uc2_service/uc_service/g; s/uc2_client/uc_client/g;
-          s/uc2_remote/uc_remote/g; s/uc2_gateway/uc_gateway/g;
-          s/ultima_journal/uc_journal/g; s/ultima-journal/uc_journal/g' \
-      $(grep -rl 'uc2_\|ultima_journal' .)
-  # and `-p uc2ctl` → `-p uc_ctl` (the *binary* name `uc2ctl` stays)
-  ```
-
-- **Why this is `2.9.0` and not `3.0.0`.** Renaming a promised item's path is a
-  major change under [the semver policy](docs/reference/semver-policy.md), and
-  every promised path moved. It shipped as a minor on one fact that can never
-  recur: **nothing had ever been published to crates.io**, so no resolver and no
-  lockfile anywhere could have referred to the old names. The policy now records
-  this as a single, spent exception — any later rename of a promised path is a
-  `3.0.0`. →
-  [Versioning and the semver promise](docs/reference/semver-policy.md#the-one-carve-out-the-290-crate-rename)
-- **Reading older docs and commits.** Release entries below this one, the gate
-  docs and the superpowers plans were rewritten to the new names so their
-  commands still run; the git history before the rename was not. A pre-rename
-  commit naming `uc_node` means v1's deleted crate, not this one.
+- **Renamed crates.** `uc2_*` and `ultima-journal` became `uc_*`, and the
+  `uc2ctl` package became `uc_ctl`; source that names the old crates needs a
+  mechanical `sed`.
+  → [Full record](docs/releases.md#v290--2026-08-30--the-uc_-crate-rename)
+- **Unchanged for operators.** Binaries, units, the image, the instance-dir
+  layout and every metric name are as `2.8.1` shipped.
+  → [Run a cluster](docs/how-to/run-a-cluster.md)
+- **First crates.io publish.** All 12 crates went live at `2.9.0` under their
+  new names.
+  → [Cut a release § 6](docs/how-to/cut-a-release.md)
+- **Why a minor.** Nothing had been published to crates.io before; that
+  exception is now spent.
+  → [Semver policy § the carve-out](docs/reference/semver-policy.md#the-one-carve-out-the-290-crate-rename)
 
 ## v2.8.1 — 2026-08-30 — the multi-service proof pass (M14c2)
 
-**A proof-only release.** No new feature, no configuration change, and no wire
-or cnc change — `2.8.1` is API-compatible with `2.8.0` by construction, and for
-an operator coming from `2.8.0` the upgrade is the plain binary swap the
-flag-day script already performs ([Upgrade a
-cluster](docs/how-to/upgrade-a-cluster.md)).
-What it adds is the evidence `2.8.0` said it did not have: the linearizability,
-partition, hard-crash and Elle tiers now all run **with two state machines
-attached to every node**, each FSM's history checked on its own. It also
-settles the M14 gate's row-e lockstep finding by experiment, and closes the
-deferrals M14c left open. The coverage record, with what is still open:
-[VERIFICATION § 11](docs/VERIFICATION.md#11-what-is-not-verified).
+Proof-only: no feature, config, wire or cnc change.
+[Full record](docs/releases.md#v281--2026-08-30--m14c2-the-multi-service-proof-pass).
 
-- **Linearizability with two FSMs, bounded and lockstep** — `two_fsm_bounded`
-  and `two_fsm_lockstep` ([`uc_node/tests/lin_v2.rs`](uc_node/tests/lin_v2.rs))
-  drive the M6 fault set (leader kills, service crashes, purge and snapshot
-  churn) against two attached FSMs, and check **one WGL history per FSM** with
-  the untouched checker. On top of that sits a second oracle:
-  **replication equivalence** — every `submit_all`'s per-FSM answers must be
-  byte-equal, so a divergence is caught even where both histories are
-  independently linearizable. The oracle is **shown to bite**:
-  `two_fsm_oracle_bites` runs FSM 1 as a corrupting state machine and dies on
-  the first divergent CAS. →
+- **Two-FSM capstones.** Linearizability, partition, `SIGKILL` and Elle tiers
+  now run with two state machines per node, plus a replication-equivalence
+  oracle shown to catch a divergent FSM.
+  → [VERIFICATION § 11](docs/VERIFICATION.md#11-what-is-not-verified) ·
   [How multi-service works](docs/notes/uc2-m14-multi-service-explained.md)
-- **A slow FSM does not break the pair, and does not get left behind** —
-  `two_fsm_slow` / `two_fsm_slow_lockstep`
-  ([`uc_node/tests/lin_v2.rs`](uc_node/tests/lin_v2.rs)) run a normal FSM
-  beside one that takes 200 µs per apply and assert two things every 50 ms: the
-  separation stays inside the lag policy, **and** over the run's second half
-  the two FSMs' apply rates agree within 10 %. Measured ratio: 1.000 — both
-  FSMs progressed at the same rate. Read it for what it is: the separation
-  never approached the bound (`max_lag = 192 B of 65536` bounded,
-  `64 B of 288` lockstep, at ~22 KB/s on both FSMs — dev-box smoke,
-  2026-08-30), so these runs do not exercise a bound-pinned state. The evidence
-  is of **equal progress** across a heterogeneous pair, not of the barrier's
-  behaviour at the bound. →
-  [Configuration § `[services]`](docs/reference/configuration.md#services)
-- **Partition and quorum loss with two FSMs** —
-  `minority_partition_and_heal_two_fsm`
-  ([`uc_node/tests/lin_partition_v2.rs`](uc_node/tests/lin_partition_v2.rs)):
-  a minority is isolated, the majority keeps writing, the partition heals, and
-  both FSMs' histories are checked separately with equivalence asserted before
-  either verdict is read.
-- **`SIGKILL` with two FSMs** — `two_fsm_service_sigkill` kills and respawns
-  one FSM's process under load; `two_fsm_node_sigkill` kills the node and both
-  services together and brings them all back
-  ([`testing/uc_crashtest/tests/hard_crash.rs`](testing/uc_crashtest/tests/hard_crash.rs)).
-  Real processes, real `kill -9`; every FSM history linearizable and the
-  equivalence oracle at zero across every restart.
-- **Elle runs with two FSMs** — a new `quiet_two_fsm` pass records **one
-  list-append history per FSM** and `scripts/elle_check.sh` adjudicates each
-  under both `serializable` and `strong-serializable`. The clean tier's default
-  is now **six** passes, and a failure names the FSM. Note the scope: this
-  tier's own equivalence check can only fail on a **malformed fan-in** (the
-  list-append response type has a single variant, so two FSMs cannot return
-  answers that differ meaningfully) — the equivalence evidence is the WGL
-  capstones'. →
-  [Investigate a failed run](docs/how-to/investigate-a-failed-run.md)
-- **A snapshot only shortens a restart together with purge** —
-  `snapshot_restart_installs_only_with_purge`
-  ([`uc_node/tests/lin_v2.rs`](uc_node/tests/lin_v2.rs)) pins the fact that
-  cost the M14 gate its row-d run 1: a `SnapshotPolicy` shortens a service
-  restart only when purge is on, **and** only once the live log buffer has
-  wrapped past the restart position — below the wrap a restart reads the
-  still-live ring and touches neither the journal nor a snapshot, whatever the
-  purge posture. → [Bound journal growth](docs/how-to/bound-journal-growth.md)
-- **A CPU-pinned fleet rig** — `--pin` (default off) in
-  `bench-infra/scripts/m14_fleet_gate.py` and `m14_ab_27_vs_28.py` gives every
-  node, service and client unit its own `CPUAffinity`, and refuses to start
-  unless the sibling layout it assumes is the layout every host in the run
-  actually reports. **It has not yet been run on a fleet**; its record
-  ([`uc2-m14c2-fleet-pinning-2026-08-30.md`](docs/benchmarks/uc2-m14c2-fleet-pinning-2026-08-30.md))
-  is a stub until it has.
-- **Lockstep under CPU oversubscription: an operating-envelope fact, not a
-  defect.** The M14 gate reported lockstep at 60× its bounded twin on a busy
-  8-vCPU host and could not say why. It reproduces on the dev box, harder:
-  **624 k → 709 frames/s (880×) with 3 runnable threads on 1 CPU**, while
-  bounded mode on the identical rung is unaffected at **7.4 M frames/s**. The
-  pre-registered explanation (a sleeping FSM cascading the set) is **refuted** —
-  the barrier ladder never exhausts, so the sleep is never reached. Against a
-  decision rule fixed before the first measurement, no candidate fix cleared
-  the 50 % recovery bar (a ×4 and a ×16 ladder and an unbounded yield all
-  1.00×; a futex handoff 116× but still only 13 % of the unconstrained rate),
-  so the bar stands and **no behaviour changed** — the number is documented as
-  an envelope instead: lockstep needs a free CPU per declared FSM plus the
-  node's own agents. →
-  [The experiment](docs/benchmarks/uc2-m14c2-lockstep-oversubscription-2026-08-30.md) ·
-  [Configuration § `[services]`](docs/reference/configuration.md#services) ·
-  [Limits](docs/reference/limits.md)
-- **Fixed:** `uc_service_lag_waits_total` counted **nothing** for the common
-  bounded case — a byte bound rarely divides the frame stream, so the usual
-  pinned state is a cap sitting *inside* the next frame, which the counter's
-  old edge never saw; it now counts one episode per bounded mid-frame stall
-  ([Diagnose a node](docs/how-to/diagnose-a-node.md) ·
-  [Monitor a cluster](docs/how-to/monitor-a-cluster.md)). A snapshot intake
-  that cannot publish — a directory in the way of the final rename, say — no
-  longer retries once per arriving chunk (at most one attempt per 250 ms on
-  both the chunk and the duty-cycle path) and is **abandoned after 60 s**
-  without a chunk, unlinking its unfinished `.part` files and re-downloading
-  the set on the next session: a behaviour change, so that a stalled transfer
-  cannot hold full-size partial files forever, and the window for "clear the
-  obstacle and it publishes" is now bounded at 60 s. Three new counters make
-  those visible (`uc2_snapshot_open_failed_total`,
-  `uc2_snapshot_intake_abandoned_total`,
-  `uc2_snapshot_begin_undecodable_total`), a repair `SNAP_NAK` for an artifact
-  whose `SNAP_BEGIN` has not gone out yet is skipped instead of served,
-  `snap_chunk` write failures are counted, `uc2ctl status` prints
-  `fsm_lag=n/a` when a node declares no FSMs, and the learner-join test now
-  pins the *positions* of the artifacts a joiner installed rather than just
-  their presence. **One alert threshold moved:** `Uc2ServicePinnedAtLagBound` now
-  fires at `max(bound − 1408, 0.9 × bound)` instead of `bound`, so an FSM
-  parked one frame short of its bound still pages — for a bound at or below one
-  MTU (1408 B) the old rule fired at any lag ≥ 1, the new one only at
-  ≥ 0.9 × bound, which is a **loosening** at those very small bounds.
-  Neither the exact frame size nor a per-deployment tolerance is expressible in
-  the rule today, and the alert fixture does not exercise the new clauses —
-  both stated in
-  [`packaging/prometheus/uc2-alerts.yml`](packaging/prometheus/uc2-alerts.yml)
-  and in [Monitor a cluster](docs/how-to/monitor-a-cluster.md).
-
-**`v2.8.0`'s pre-release flag stays; `v2.8.1` is Latest.** `2.8.0` was
-published as a GitHub *pre-release* precisely because these capstones were
-missing. It stays marked that way — the record of what it shipped and what it
-did not is worth keeping — and `v2.8.1` becomes the repository's *Latest
-release*. It is also the release that carries the **first crates.io publish**
-of the twelve publishable crates, on the maintainer's explicit go and in the
-order [`docs/how-to/cut-a-release.md` § 6](docs/how-to/cut-a-release.md) sets
-out. No upgrade steps: `2.8.1` changes neither the wire, the cnc page, nor any
-configuration `2.8.0` accepted.
+- **Lockstep under oversubscription is an operating envelope.** No candidate
+  fix cleared the bar, so lockstep needs a free CPU per declared FSM.
+  → [The experiment](docs/benchmarks/uc2-m14c2-lockstep-oversubscription-2026-08-30.md)
+- **A CPU-pinned fleet rig** (`--pin`, off by default).
+  → [Fleet pinning](docs/benchmarks/uc2-m14c2-fleet-pinning-2026-08-30.md)
+- **Fixed:** `uc_service_lag_waits_total` counted nothing in the common bounded
+  case, and a stuck snapshot intake is now abandoned after 60 s.
+  → [Monitor a cluster](docs/how-to/monitor-a-cluster.md)
+- **`v2.8.1` replaces the `v2.8.0` pre-release as Latest**; `v2.8.0` keeps
+  its pre-release flag as the record of what it lacked.
 
 ## v2.8.0 — 2026-08-30 — several state machines behind one log (M14)
 
-A cluster can now run up to eight state-machine processes per node, all fed
-by the one replicated log: submit to any of them, fan a query across all, and
-keep them within a bounded distance of each other or in lockstep. The
-node-to-node wire moves to `0.6.0` (one datagram changed) and the control
-page to cnc `3.0` (8 KiB) — both flag days, on the same terms as every prior
-one. Proof record, row by row: [M14 gate](docs/benchmarks/uc2-m14-gate-2026-08-29.md).
-Background: [how multi-service works](docs/notes/uc2-m14-multi-service-explained.md).
+Up to eight state machines per node, fed by one replicated log.
+[Full record](docs/releases.md#v280--2026-08-30--m14-multi-service-one-log-n-state-machines).
 
-- **`[services]`: declare N state machines, bounded or lockstep**
-  (`uc_node`, `uc_service`): ids `0..8` (id 0 is the default responder and
-  the only one the remote path reaches), each attaching with
-  `ServiceConfig::service_id`, holding `service.<id>.lock`, and publishing
-  its progress on the cnc page's per-service band. A lag policy keeps them
-  together: `fsm_lag = "<bytes>"` bounds how far any FSM may lead another;
-  `"lockstep"` makes every FSM finish frame k before any starts k+1. A
-  node's durable report is capped by its own FSMs' progress, so commit
-  stalls only when a quorum's FSMs are stuck — never on one straggler. →
-  [Configuration § `[services]`](docs/reference/configuration.md#services) ·
-  [Limits](docs/reference/limits.md)
-- **Per-FSM routing and a client fan-in** (`uc_client`, `uc_protocol`):
-  `submit_to(id)`, `submit_all` (one ticket, every FSM's answer),
-  `query_snapshot_on` / `query_linearizable_on`; a query names its FSM on the
-  wire and an undeclared id answers `BAD_SERVICE` instead of parking. →
-  [How it works § routing and fan-in](docs/notes/uc2-m14-multi-service-explained.md#routing-and-fan-in) · [Read path](docs/reference/read-path.md)
-- **A snapshot session ships every FSM's artifact — wire `0.6.0`**
-  (`uc_net`): `SNAP_BEGIN` now names the FSM, the sender's declared set and
-  a layout byte; a joiner adopts the floor only once the whole set has
-  landed, and refuses by name a `0.5.0` sender or a mismatched set rather
-  than installing half a cluster. → [Upgrade: the 0.6.0 flag day](docs/how-to/upgrade-a-cluster.md#wire-change-in-280-snap_begin-carries-every-fsms-snapshot-060) ·
-  [Wire protocol](docs/reference/wire-protocol.md)
-- **Per-FSM observability** (`uc_node`, `uc2ctl`): `service="<id>"` twins of
-  the service families, `uc_service_attached`, `uc_service_lag_bytes`,
-  `uc_service_lag_waits_total`, `uc_services_declared`; two alerts
-  (`Uc2ServiceAbsent`, `Uc2ServicePinnedAtLagBound`) proven to fire; a
-  per-FSM table in `uc2ctl status`; `service_attached`/`service_detached`
-  transition records. → [Monitor a cluster](docs/how-to/monitor-a-cluster.md) ·
-  [uc2ctl](docs/reference/uc2ctl.md)
-- **Per-FSM backup and restore**: `snapshots/<id>/` per FSM in the backup
-  artifact and on restore. → [Back up a cluster](docs/how-to/back-up-a-cluster.md)
-- **Fixed:** an unservable `SNAP_NAK` no longer pins a snapshot-session slot;
-  intake I/O failures are retried and counted (`uc2_snapshot_intake_io_failures_total`).
-  The lockstep barrier no longer sleeps on a live sibling (18 k → 631 k
-  frames/s at N=2 on the dev box) — [apply-hop bench](docs/benchmarks/uc2-m14a-apply-hop-2026-08-27.md).
-- **Performance:** the M14 gate ran on the fleet on **2026-08-29**
-  (4 × `c6id.2xlarge`, commit `711bf58`) against bars pre-committed before the
-  driver existed. **The verdict was FAIL: five of six rows met their bar, row
-  d did not, and the bar stands.**
-  - **a — PASS**, 0.961: two bounded FSMs behind one log cost 3.9 % of the
-    one-FSM rate (1 309 702 vs 1 362 555 ops/s), against a ≥ 0.90 bar.
-  - **b — PASS**, 1.015: a fast + slow FSM pair runs at the slow FSM's own
-    solo rate (774 043 vs 762 272 ops/s at K = 500), inside [0.90, 1.10].
-  - **c — PASS**: 57 checks, zero divergence. Every FSM on every host answers
-    the same count in both read modes after every arm — including after the
-    SIGKILL, where the rebuilt FSM matches the survivor exactly.
-  - **f — PASS**: a learner declaring `{0,1}` joined a purged two-FSM leader
-    under load in **24.12 s** (bar ≤ 60 s), with **zero** snapshot-session
-    refusals on all four nodes and both FSMs' artifacts installed over wire
-    `0.6.0`.
-  - **e — reported, no bar**: lockstep cost **60×** its bounded twin on the
-    fleet's leader host (21 707 vs 1 309 702 ops/s), far worse than the
-    dev-box hop bench suggests; the shape is a fixed per-frame stall and the
-    likely-but-untested cause is CPU oversubscription on that host.
-  - **d — FAIL**: SIGKILL an FSM on the leader host under fan-in load. FSM 1
-    was back inside its lag bound at **21.6 s** against a ≤ 15 s bar, and the
-    client's rate never recovered inside the arm. Cause: the harness restarts
-    the FSM with **no snapshot policy**, so it replays ~11.9 M commands of
-    journal, and journal replay deliberately publishes no responses — so the
-    client's 4 096 in-flight fan-in requests could only retire on their 30 s
-    timeout, pinning its window at zero. No product defect is implicated (row
-    c is green on that same arm); the row as specified cannot measure what it
-    claims to. Full diagnosis, and the re-specification that was applied before run 2: → [M14 gate § row d](docs/benchmarks/uc2-m14-gate-2026-08-29.md#row-d--the-fail-diagnosed);
-    re-specified and re-run 2026-08-29 — result:
-    re-run alone under the re-specified procedure (purge on, snapshots on
-    both FSMs, FSM-0-only client) on 2026-08-29 at commit `6228365`:
-    **PASS** — recovered 5.5 s, attached+caught-up 7.9 s, well inside the
-    ≤ 15 s bar; run 1's FAIL above stays in the record →
-    [M14 gate § Run 2 (re-specified)](docs/benchmarks/uc2-m14-gate-2026-08-29.md#run-2-re-specified).
-  - **g — pending**: the gated commit has never been pushed, so no CI or
-    nightly run exists at it.
-  → [M14 gate](docs/benchmarks/uc2-m14-gate-2026-08-29.md). Dev-box smoke,
-  never a bar: [apply hop](docs/benchmarks/uc2-m14a-apply-hop-2026-08-27.md)
-  and [client hop](docs/benchmarks/uc2-m14c-client-hop-2026-08-28.md). A fleet A/B of this arm against 2.7.0 (14 interleaved arms, 2026-08-30) found no detectable regression — point estimate +8 % for 2.8.0, inside a ±25 % per-generation variance that the rig itself exhibits → [A/B 2.7.0 vs 2.8.0](docs/benchmarks/uc2-m14d-ab-2.7.0-vs-2.8.0-2026-08-30.md).
-
-**Upgrade consequence.** Wire `0.6.0` and cnc `3.0` are flag days: stop every
-node, upgrade, start them together; a mixed cluster replicates and elects but
-a snapshot session between versions is refused by name, so a joiner stalls
-until the fleet matches. Existing single-service deployments need no config
-change — no `[services]` section means `{0}` with the default bound. A
-service must attach as id 0 (the default). Details, in the imperative:
-[Upgrade a cluster](docs/how-to/upgrade-a-cluster.md).
-
-**Published as a GitHub pre-release, not on crates.io (2026-08-30).** Because the
-two-FSM capstones are still M14c2, `v2.8.0` is marked *pre-release* on GitHub
-(Latest stays `v2.7.0`) and the crates.io publish is held until `2.8.1`
-carries those proofs. The tarballs, `SHA256SUMS`, SBOM and the
-`ghcr.io/peterknego/uc2:2.8.0` image are published and cosign-verified.
-**Those proofs landed in `v2.8.1` — the section above**, which is the release
-to take: `v2.8.0` keeps its pre-release flag, and `2.8.1` adds no feature, so
-nothing below changes.
-
-**Coverage.** Multi-service ships with unit tests, in-process integration
-(one node and a 3-node cluster), a sim scenario for the report ceiling and
-fuzz seeds for the new wire bytes. The two-FSM linearizability, partition,
-hard-crash and Elle capstones are the next, proof-only release (`2.8.1`,
-"M14c2") — stated in [VERIFICATION §11](docs/VERIFICATION.md#11-what-is-not-verified).
+- **Upgrade flag day:** wire `0.6.0`, cnc `3.0`; a single-service config needs
+  no change.
+  → [Upgrade a cluster](docs/how-to/upgrade-a-cluster.md#wire-change-in-280-snap_begin-carries-every-fsms-snapshot-060)
+- **`[services]`.** Declare N FSMs, kept within a byte bound of each other or
+  in lockstep.
+  → [Configuration § `[services]`](docs/reference/configuration.md#services)
+- **Per-FSM routing and fan-in.** Submit or query one FSM, or all of them with
+  one ticket.
+  → [How it works § routing and fan-in](docs/notes/uc2-m14-multi-service-explained.md#routing-and-fan-in)
+- **Per-FSM snapshots, observability, and backup.** A snapshot session ships
+  every FSM's artifact, and metrics, alerts and backups are per FSM.
+  → [Monitor a cluster](docs/how-to/monitor-a-cluster.md) ·
+  [Back up a cluster](docs/how-to/back-up-a-cluster.md)
+- **Performance:** five of six gate rows passed; row d failed as specified and
+  passed on a re-specified re-run.
+  → [M14 gate](docs/benchmarks/uc2-m14-gate-2026-08-29.md)
+- **Published as a GitHub pre-release** pending the two-FSM proofs, which
+  `2.8.1` carries.
 
 ## v2.7.0 — 2026-08-26 — the remote path at the cluster's speed (M13)
 
-The remote path — `client → TCP → gateway → shared memory → node` — now runs
-at the backend's own rate and **degrades instead of collapsing** when a host
-has more connections than cores. Three defects, located by a per-hop
-isolation bench that measured every hop alone
-([the bench](docs/benchmarks/uc2-m13-hop-bench-2026-08-24.md)) and fixed
-together. Nothing here touches consensus, the node-to-node wire protocol, or
-the cnc page; the remote wire protocol stays v1. Proof record, row by row:
-[M13 gate](docs/benchmarks/uc2-m13-gate-2026-08-24.md).
+The remote path runs at the backend's rate and degrades instead of collapsing
+under oversubscription.
+[Full record](docs/releases.md#v270--2026-08-26--m13-remote-path-performance-and-flow-control).
 
-- **A rebuilt remote client** (`uc_remote`): the same blocking
-  `RemoteClient::submit` / `Ticket::wait` surface, over an `Engine`-shaped
-  split — a submitter that encodes straight into a preallocated outgoing
-  ring, a writer thread that coalesces whatever is queued into one `write`,
-  a reader that resolves completions without a lock, and a poll half for
-  callers that want batches instead of tickets. The old client paid one
-  `write` and about seven futex operations **per request**; it capped at
-  ~171k responses/s against a sink that answered instantly, while a raw
-  client through the same shipped gateway into the same shipped cluster did
-  1.14M/s. That gap was the remote path's bottleneck, by 7×. →
-  [Remote protocol](docs/reference/remote-protocol.md) ·
-  [the hop bench](docs/benchmarks/uc2-m13-hop-bench-2026-08-24.md)
-- **A shared-memory ingress ring that cannot convoy**
-  (`uc_protocol::ring::mpsc`): producers now commit their own record and no
-  producer ever waits for another; the single consumer walks records in claim
-  order and stops at the first uncommitted one. A producer that is preempted
-  mid-record costs one consumer stall, not a pile-up of every other producer
-  spinning on it. A producer that *dies* mid-record leaves a hole the
-  consumer skips after `hole_timeout`, counted and logged, instead of
-  wedging every producer forever. →
-  [The MPSC publish convoy, explained](docs/notes/uc2-m13-mpsc-publish-convoy-explained.md)
-- **A global credit budget at the gateway**: the edge holds one `Engine`
-  window, keeps an eighth back as headroom, and divides the rest equally
-  across its live connections instead of promising each one the same
-  constant. A shrinking share is pushed as a `STATUS` before the client can
-  send into it; a growing one rides the next response. Two new startup
-  checks come with it — `per_conn_inflight` above the budget is a named
-  refusal, `max_connections` above it a printed warning. The old
-  halve-on-backpressure ladder is still there and is now the exception path.
-  →
-  [The grant budget](docs/reference/gateway-config.md#the-grant-budget-270) ·
-  [Run a gateway](docs/how-to/run-a-gateway.md#operating-envelope-270)
-- **Fixed:** the `2.6.0` gateway collapse — ~30× throughput loss, second-scale
-  p95 and lost responses past eight connections on an eight-core host — is
-  gone, and its diagnosis is corrected. It was **not** the missing credit
-  budget the `2.6.0` envelope blamed: it reproduced at 2,048 outstanding
-  requests, well inside that envelope, against a sink with no admission
-  window at all. It was the ingress ring's publish convoy. The `2.6.0`
-  operating envelope and the `CPUQuota=` advice that went with it are both
-  retired — CPU containment made the convoy *worse*. →
-  [the correction](docs/notes/uc2-m12a-edge-flow-control-gap.md) ·
-  [M12 gate row 2, closed](docs/benchmarks/uc2-m12-gate-2026-08-22.md)
-- **Performance:** measured on a 4× `c6id.2xlarge` fleet, the gate's
-  adjudicated rows — one connection through the gateway against the direct
-  shared-memory arm on the same cluster generation, the N-connection
-  aggregate against the same reference, the 1→16 connection ladder for
-  monotonicity, and N shared-memory engines on an oversubscribed host. →
-  [M13 gate](docs/benchmarks/uc2-m13-gate-2026-08-24.md) ·
+- **Upgrade:** a same-host restart (node, service, gateway and local clients
+  together), not a cluster flag day.
+  → [Upgrade a cluster](docs/how-to/upgrade-a-cluster.md)
+- **A rebuilt remote client.** The same blocking API over an `Engine`-shaped
+  split, removing a 7× bottleneck.
+  → [Remote protocol](docs/reference/remote-protocol.md)
+- **An ingress ring that cannot convoy.** Producers commit per record, so none
+  waits on another.
+  → [The MPSC publish convoy, explained](docs/notes/uc2-m13-mpsc-publish-convoy-explained.md)
+- **A global credit budget at the gateway.**
+  → [The grant budget](docs/reference/gateway-config.md#the-grant-budget-270)
+- **Fixed:** the `2.6.0` gateway collapse, correctly diagnosed as the ring
+  convoy, not the credit budget.
+  → [the correction](docs/notes/uc2-m12a-edge-flow-control-gap.md)
+- **Performance:**
+  → [M13 gate](docs/benchmarks/uc2-m13-gate-2026-08-24.md) ·
   [per-hop bench](docs/benchmarks/uc2-m13-hop-bench-2026-08-24.md)
-
-**Upgrade consequence.** The ingress ring's on-disk header changed, so its
-magic is bumped and a stale attach is refused by name. **Restart the node,
-the service, the gateway and every local client on a host together** — this
-is a same-host restart, not a cluster flag day: nodes on different hosts do
-not talk to each other through this ring, and the node-to-node wire protocol
-is untouched. A gateway `[limits]` section with `per_conn_inflight` above the
-grant budget (`max_inflight` less an eighth) now refuses to start, by name. →
-[Upgrade a cluster](docs/how-to/upgrade-a-cluster.md)
 
 ## v2.6.0 — adoptable cluster (M12) — *shipped as `v2.6.0-rc.1`; superseded by v2.7.0, no final tag*
 
-**Written before the tag, as every release here is.** The four M12
-sub-milestones — M12a gateway kit, M12b admin authentication and audit, M12c
-packaging and publishing, M12d security posture — land together as `v2.6.0`.
-**The tag itself is a separate maintainer step**, taken after deciding what to
-do about gate row 2 — which has now been run on a fleet twice and, in the
-process, showed its own bar to be mis-specified (see *Gates* below);
-`v2.6.0-rc.1` goes first, because the
-release workflow has never been run for real and a release candidate is the
-right place to find that out. Running record, row by row:
-[M12 gate record](docs/benchmarks/uc2-m12-gate-2026-08-22.md).
+The cluster becomes adoptable by someone who is not its author.
+[Full record](docs/releases.md#v260--m12-adoptable-cluster--shipped-as-v260-rc1-superseded-by-v270-no-final-tag).
 
-**This release is what makes the cluster adoptable by someone who is not
-its author**: clients that do not live on a node's host can reach it, admin
-operations have a credential and a paper trail, the software installs from a
-signed artifact with no toolchain, and what is defended — and what is not — is
-written down.
-
-- **A two-tier state-machine contract**: `RawStateMachine` (bytes in, bytes
-  out) is now the core trait, and the typed `StateMachine` you already write
-  is a blanket adapter on top of it. Existing services change **nothing** —
-  the adapter is the same bincode call, so a typed state machine's frames are
-  byte-identical to `v2.5.0`'s. What is new is the escape hatch: a service
-  with hot or large commands can own its own framing and skip the codec
-  entirely. The dev-box spike that motivated this measured the typed tier at
-  **75.8 %** of the apply cycle against the raw tier's **5.8 %** at a 509 B
-  payload — a share, on a box that is not a bench. The fleet run (gate row 3)
-  has since confirmed it on real hardware at the same 509 B payload: typed
-  `sm_apply` 1173 ns/frame (**87.7 %** of the apply cycle) against raw's 14 ns
-  (**8.0 %**), an ~84× per-frame drop. →
-  [State-machine contract](docs/reference/state-machine-contract.md) ·
-  [Two tiers, one contract](docs/notes/uc2-two-tier-state-machine-contract.md) ·
-  [the codec budget spike](docs/notes/2026-08-22-codec-budget-spike.md)
-- **Exactly-once over a remote hop** (`uc_service::session::Sessioned<S>`):
-  wrap either tier and a re-sent request after a failover is classified
-  `FRESH` / `REPLAYED` / `EXPIRED` instead of silently applied twice. The
-  dedup table is replicated state — it rides snapshots, and
-  `install_snapshot` refuses one whose embedded `SessionConfig` disagrees with
-  the live node rather than silently retuning it. →
-  [State-machine contract](docs/reference/state-machine-contract.md)
-- **A remote protocol and client** (`uc_remote`, protocol v1): framed TCP,
-  credit-gated flow control, pipelined submit/query, and a `RemoteClient` that
-  follows `REDIRECT`/`LEADER_CHANGED` across an election and re-sends
-  unanswered requests in order. Written to be re-implemented in another
-  language — the frame layout and every state transition are specified. →
-  [Remote protocol](docs/reference/remote-protocol.md)
-- **A gateway** (`uc2-gateway` + `gateway.toml`): a per-node TCP front door
-  that terminates the remote protocol on a node's host and relays over the
-  existing shared-memory `Engine`. Clients no longer have to share a host with
-  a node to talk to the cluster. It touches no consensus code, no wire
-  protocol between nodes and no cnc field. →
-  [Run a gateway](docs/how-to/run-a-gateway.md) ·
-  [Gateway configuration](docs/reference/gateway-config.md) ·
-  [gateway shapes and flow control](docs/notes/uc2-gateway-shapes-and-flow-control.md)
-- **Admin authentication and an audit log**: mutating `uc2ctl` verbs are
-  signed with a named HMAC-SHA256 key (`--admin-key`/`--admin-key-name`/
-  `--admin-ttl-secs`; `uc2ctl gen-admin-key PATH` writes one), every admin
-  request is recorded — accepted *or* refused, with the signing key's name —
-  in an append-only, `fsync`-per-record `<instance_dir>/audit.jsonl`, and
-  `uc2ctl audit` reads it back offline. A request that cannot be recorded is
-  refused rather than answered unrecorded. **Residual, stated wherever it
-  matters:** a follower forwards an authenticated request to the leader over
-  the node-to-node UDP plane, which is only address-filtered unless wire
-  crypto is on — so `[admin] auth = "hmac"` authenticates cluster-wide only
-  paired with `[crypto].enabled = true`. →
-  [Configuration § admin authentication](docs/reference/configuration.md#admin-authentication) ·
-  [Who may change the cluster](docs/notes/uc2-admin-authentication.md) ·
-  [Change cluster membership](docs/how-to/change-cluster-membership.md)
-- **Two config choices are now explicit, and an old `node.toml` will not
-  start without them.** `[crypto]` and `[admin]` are both required sections:
-  a config written for `v2.3.0`–`v2.5.0` refuses to start with a named error
-  (`CryptoChoiceRequired` / `AdminChoiceRequired`) until each host's file says
-  which posture it wants. This is a per-host config edit, not a wire flag day
-  — nodes on either side of it interoperate. →
-  [Upgrade a cluster](docs/how-to/upgrade-a-cluster.md) ·
-  [Configuration](docs/reference/configuration.md)
-- **Install without a toolchain**: signed tarballs for x86-64 and aarch64, a
-  `SHA256SUMS`, a CycloneDX SBOM and a distroless `ghcr.io/peterknego/uc2`
-  image are published per tag, all signed keylessly (cosign, identity-pinned
-  verification written out), and a `quickstart-local.sh` inside the tarball
-  brings up three nodes, three services and three gateways on one host and
-  prints `PASS`. The publish gate is a smoke run in a bare container with no
-  Rust installed — nothing is released unless it passes. →
-  [QUICKSTART](docs/QUICKSTART.md) ·
-  [Cut a release](docs/how-to/cut-a-release.md) ·
-  [`packaging/README-release.md`](packaging/README-release.md)
-- **A version identity and a compatibility promise**: all 12 publishable
-  crates move in lockstep at `2.6.0`, with the metadata crates.io needs, a
-  written semver policy that says what is public API and what is not, an MSRV
-  floor of **1.89** enforced by a CI job that runs `clippy` on that exact
-  toolchain, and supply-chain gates (`cargo-deny` advisories/licenses/bans, on
-  both the default and `--all-features` graphs). →
-  [Semver policy](docs/reference/semver-policy.md)
-- **A security package, and a fuzz tier that found real defects**: a threat
-  model, a per-parser attack surface (19 rows), a self-assessment with its
-  findings and its *accepted* weaknesses, and a `SECURITY.md` with a reporting
-  channel. Alongside it, 14 `cargo-fuzz` targets over every decoder that
-  touches untrusted bytes, run nightly at 600 s per target with a minimum-runs
-  floor (because a fuzz tier can be green and vacuous — one was, and that is
-  written up too), plus Miri over the pure decoders. The README now states the
-  posture and the scope limits up front. →
-  [`docs/security/`](docs/security) ·
-  [Verification § fuzzing](docs/VERIFICATION.md) ·
-  [SECURITY.md](SECURITY.md)
-- **Fixed bugs** — every one of them found by the sub-milestones' own review
-  and fuzz loops rather than by a user. Three are in code that never shipped
-  in any tag; the fourth is older, and what was never true of it in a released
-  tag is *reachability* — every caller guarded it. Full findings, with
-  severity and status:
-  [security self-assessment §2](docs/security/self-assessment.md#2-findings).
-  - **A captured admin request could be replayed after a restart** by an actor
-    with instance-directory write access and no key at all: the HMAC was
-    verified against an `instance_id` re-read from the cnc page — a file whose
-    header is only magic-checked — so the captured value could simply be
-    written back. The tag is now bound to the node's boot-time state, pinned
-    by a regression test that performs the forgery (F4, fixed pre-merge,
-    `50473d5`). →
-    [Who may change the cluster](docs/notes/uc2-admin-authentication.md) ·
-    [self-assessment §2](docs/security/self-assessment.md#2-findings)
-  - **`Sessioned::apply` violated the buffer contract it was itself a caller
-    of** — a contract-abiding inner state machine that cleared `out` truncated
-    the session tag away and panicked **on the apply thread**, killing the
-    service on its first command. Found by fuzzing (F2, `7c908b1`). →
-    [Verification § fuzzing](docs/VERIFICATION.md#7-fuzzing-decoders-total-on-untrusted-bytes)
-  - **`Sessioned::install_snapshot` pre-allocated up to 1 GiB** from an
-    unvalidated 8-byte length before reading a byte of the blob. Bounded;
-    20 000 executions went 91.8 s → 0.34 s. Found by fuzzing (F3,
-    `7c908b1`). →
-    [self-assessment §2](docs/security/self-assessment.md#2-findings)
-  - **Five UDP datagram readers could panic on a short slice.** This code
-    shipped in every tag through `v2.5.0`, and in none of them was the panic
-    reachable — every caller guarded it — but the totality of the first code
-    an unauthenticated packet reaches should not rest on five call sites
-    remembering. All five now return `Option`, the pre-guards are kept, and
-    the hot path is byte-identical (F1, `112b81f`). →
-    [Verification § fuzzing](docs/VERIFICATION.md#7-fuzzing-decoders-total-on-untrusted-bytes)
-  - Also: `uc_remote`'s `request_timeout` is now enforced *while
-    reconnecting* (it could be outlived by a reconnect loop — F5,
-    `ae0f245`/`fc27536`/`b4b3b0c`), and the architecture doc's log-buffer
-    default is corrected to `buffer_bytes`' real 64 MiB.
-- **Performance — a remote-path batching fix, and the network budget
-  measured.** The remote path now batches on every hop: a `RemoteClient`
-  writes its pending frames in a single `write_all` (flushing when the queue
-  drains), the edge driver batches its writes per drain, both sides parse
-  multiple frames out of one `recv`, and admission notifications are coalesced
-  to one per read batch — with `request_timeout`/deadline semantics and the
-  exactly-once and credit-flow-control invariants unchanged (reviewed, not
-  assumed). On the fleet the single-connection gateway/direct ratio moved
-  **0.072 → 0.098** with the session envelope on and **0.064 → 0.101** with it
-  off, ~+40 % throughput; on the dev box — a smoke observation, not a bench —
-  p50 fell from ~112 ms to ~10 ms at 4096 inflight. Separately, a
-  network-budget characterization settled whether a leader box is near its NIC
-  limit at peak: **it is not.** The 1,424,941 resp/s peak drives ~3.21 Gbps
-  and ~392k pkt/s — about a quarter of the instance's ~12.5 Gbps ceiling —
-  because replication is batched to ~0.28 packets and ~281 bytes per committed
-  command, and **p99 < 1 ms holds to 518,287 resp/s** (inflight 256: p50 0.472
-  / p90 0.568 / p95 0.611 / p99 0.660 ms, NIC ~1.14 Gbps). There is ample
-  headroom for a co-located gateway client; the ~1.4M/s ceiling is software,
-  not the network. →
-  [M12 gate record § network budget](docs/benchmarks/uc2-m12-gate-2026-08-22.md#network-budget-characterization-2026-08-24-path-1) ·
-  [Remote protocol](docs/reference/remote-protocol.md)
-- **Known limits — a gateway's flow control is per-connection only, and past
-  the node's admission window the edge collapses rather than degrading.**
-  Every connection is granted `per_conn_inflight` credits in full at
-  `HELLO_OK` and the halve/relax ladder runs per connection; **nothing bounds
-  the sum across connections** against the co-located node's ingress admission
-  window (`admission_bytes`, default 256 KiB ≈ 4–6k frames). Inside that
-  envelope the edge aggregates near-linearly — 451k resp/s across 4
-  connections, 0.32× the backend's peak. Outside it, the 2026-08-24 fleet
-  ladder measured a ~30× aggregate collapse at 8 connections (p95 4.3 s) and
-  9,126 lost responses at 16, with the edge burning ~7 of the host's 8 cores
-  and starving the node beside it — reproduced with the edge's protective
-  per-connection cap active, so it is a product defect, not a
-  misconfiguration. The fix (a global, admission-aware outstanding-grant
-  budget at the edge) is planned as the next milestone. **Until then**: keep
-  total client inflight across all connections to one edge under the node's
-  admission window, and bound a co-located gateway's CPU (`CPUQuota=`, shipped
-  commented in the unit file). →
-  [Operating envelope](docs/how-to/run-a-gateway.md#operating-envelope-270) ·
-  [gate record § the confirmed defect](docs/benchmarks/uc2-m12-gate-2026-08-22.md#clean-discipline-re-run-same-day-the-collapse-is-a-product-defect-not-a-harness-artifact)
-- **Gates** — [M12 gate record](docs/benchmarks/uc2-m12-gate-2026-08-22.md),
-  reported the way this project reports: what ran, and what did not.
-  - **PASS**: admin authentication, audit and refusal behaviour end to end
-    (row 4, per-PR CI); crates package and the leaf crates publish (row 7);
-    the MSRV floor (row 11); the supply-chain gates (row 12).
-  - **Pending its first nightly**: the remote lincheck capstone — three
-    gateways in the loop, repeated leader SIGKILLs, zero acked writes lost —
-    is green three consecutive local runs and awaits CI adjudication (row 1);
-    the fuzz job is built and locally proven across ~118 M executions but has
-    never run on a GitHub runner (row 8).
-  - **Fleet-run, and reported the way the run came out**: the codec share on
-    the apply thread (row 3) **PASSES** as a measurement row — the fleet put
-    the typed `CountSm` at `sm_apply` 1173 ns/frame (87.7 % of the apply
-    cycle) against the raw `RawCountSm`'s 14 ns (8.0 %), an ~84× per-frame
-    drop that confirms on real hardware the spike finding behind the two-tier
-    contract. Gateway throughput versus the direct `Engine` (row 2) **fails
-    its ≥ 0.8× bar — and the bar is the part that is wrong**: it compares one
-    `RemoteClient` on one TCP connection to one shmem client, and no single
-    TCP request/response connection matches shared memory at any batching
-    level (Little's Law fits both arms with no residual). The honest numbers
-    are **~0.1× per connection** (0.098 envelope on / 0.101 off, after the
-    batching fix above) and **451k resp/s aggregate across 4 connections —
-    0.32× the backend's measured 1.42M/s peak**, the edge scaling
-    near-linearly to that point. Re-specifying row 2 as an N-connection
-    edge-saturation ratio is recommended and **not yet done**; the
-    single-connection number stands recorded meanwhile.
-  - **Built, and partly proven**: the artifact quickstart (row 5) has its
-    tarball assembly, layout and rendered configs proven locally, but its
-    bare-container run, image build and compose stack are CI-only until the
-    first `-rc` tag — and `release-smoke` runs the **x86_64** tarball only, so
-    the aarch64 binaries are built and packaged but executed nowhere until
-    somebody runs them on arm hardware. Signing and verification (row 6) are
-    written out and identity-pinned but unproven until that same tag: keyless
-    signing needs a GitHub OIDC identity the dev box does not have.
-  - **Deferred, on the spec's own condition**: the `cargo fmt --check` gate
-    (row 13) — two long-lived worktrees are open and the one-shot reformat
-    measures 2 731 hunks, every one a conflict in both; the re-run condition
-    is written verbatim in the gate doc. `clippy -D warnings` is enforced on
-    both the pinned stable and the MSRV floor regardless.
-  - **Pending**: the external security review (row 10), which is
-    user-scheduled. Row 9 claims that the security package exists and is
-    honest — not that the system is secure.
-- **Upgrade notes.**
-  - **Edit every host's `node.toml` before starting a `2.6.0` node**: add a
-    `[crypto]` section (`enabled = true|false`) and an `[admin]` section
-    (`auth = "hmac"|"none"`). Without them the daemon refuses to start, by
-    name. **The config edit is per-host, not a wire flag day** — the
-    node-to-node protocol is unchanged at **0.5.0**
-    (`uc_protocol::version::CURRENT`), and nothing about the cnc page or what
-    another node sees moves. (The binary swap itself is still run the way
-    every upgrade in this system is run: everyone stopped together, per the
-    how-to. Do the config edit in that same window — you are touching every
-    `node.toml` anyway.) →
-    [Upgrade a cluster](docs/how-to/upgrade-a-cluster.md)
-  - **The ~78 MiB instance-directory reservation from `v2.5.0` is
-    unchanged**: a node still reserves `buffer_bytes` plus ~14 MiB of rings at
-    startup and refuses to start if it cannot. →
-    [Instance directory](docs/reference/instance-directory.md#on-disk-footprint)
+- **Upgrade:** add `[crypto]` and `[admin]` sections to every `node.toml`, or
+  the node refuses to start by name.
+  → [Upgrade a cluster](docs/how-to/upgrade-a-cluster.md)
+- **Two-tier state-machine contract.** A raw bytes-in/bytes-out tier under the
+  typed one, for services that want to skip the codec.
+  → [State-machine contract](docs/reference/state-machine-contract.md) ·
+  [Two tiers, one contract](docs/notes/uc2-two-tier-state-machine-contract.md)
+- **Exactly-once over a remote hop** with `Sessioned<S>`.
+  → [State-machine contract](docs/reference/state-machine-contract.md)
+- **A remote protocol, client and gateway.** Clients can reach a cluster over
+  TCP from another host.
+  → [Remote protocol](docs/reference/remote-protocol.md) ·
+  [Run a gateway](docs/how-to/run-a-gateway.md)
+- **Admin authentication and an audit log.** Mutating `uc2ctl` verbs are
+  HMAC-signed and every request is recorded.
+  → [Who may change the cluster](docs/notes/uc2-admin-authentication.md)
+- **Signed release artifacts.** Tarballs, an SBOM and a container image, all
+  cosign-signed.
+  → [QUICKSTART](docs/QUICKSTART.md)
+- **A semver policy and a security package**, with a fuzz tier that found
+  real defects.
+  → [Semver policy](docs/reference/semver-policy.md) ·
+  [`docs/security/`](docs/security) · [SECURITY.md](SECURITY.md)
+- **Fixed:** a replayable admin request after restart, two `Sessioned` defects
+  found by fuzzing, and panicking UDP readers.
+  → [security self-assessment § 2](docs/security/self-assessment.md#2-findings)
+- **Performance:** remote-path batching gave ~+40 % per connection; the leader
+  uses about a quarter of its NIC at peak.
+  → [M12 gate record](docs/benchmarks/uc2-m12-gate-2026-08-22.md)
 
 ## v2.5.0 — 2026-08-21 — survivable cluster (M11)
 
-**A cluster you can back up, restore onto a new host, force out of quorum
-loss, and upgrade on a measured schedule — each one proven by a test that
-destroys something real, not by a documented procedure.** Every gate row
-passes: the fleet flag day measured 14.0 s and 14.7 s of downtime against a
-60 s bar, and the full-disk row is confirmed independently by CI's sudo
-`survival` job against a real loopback filesystem. Full record, including
-the honest FAILs along the way and the two product defects they exposed:
-[gate record](docs/benchmarks/uc2-m11-gate-2026-08-20.md). Design deep-dive:
-[M11 explained](docs/notes/uc2-m11-survivable-cluster-explained.md).
+Back up, restore, recover from quorum loss and upgrade on a measured schedule.
+[Full record](docs/releases.md#v250--2026-08-21--m11-survivable-cluster).
 
-- **Offline backup, verify, and restore** (`uc2ctl backup / verify-backup /
-  restore`): safe against a *running* node's purge and snapshot churn via an
-  enforced copy ordering, with `verify` asserting the coverage invariant
-  instead of trusting the operator. →
-  [Back up a cluster](docs/how-to/back-up-a-cluster.md)
-- **Quorum-loss recovery** (`uc2ctl force-single-member`): when a majority of
-  the cluster is permanently gone, rebuild from one surviving node — offline,
-  provably non-persisting until confirmed, with the data-loss window stated
-  before anything is written. →
-  [Recover from quorum loss](docs/how-to/recover-from-quorum-loss.md)
-- **Full-disk fail-stop, observed end-to-end**: a node that hits the disk wall
-  halts loudly instead of acking writes it cannot persist, naming the errno
-  (`StorageFull` / `os error 28`) so the operator knows to free space; a new
-  `uc2_free_disk_bytes` metric and the `Uc2DiskLow` alert give the early
-  signal before the wall. Proving this end-to-end exposed two real defects,
-  both fixed here: the node's mmapped IPC files were sparse, so a full disk
-  killed whichever process (node, service, or client) next touched an
-  unbacked page with `SIGBUS` — bypassing the fail-stop path entirely — and
-  the journal's segment preallocator discarded the underlying errno, so even
-  a correct fail-stop said only "segment preallocation failed". **Operational
-  consequence:** those files now reserve their blocks at startup, so a
-  default instance dir needs ~78 MiB free before a node will boot, and a node
-  that cannot reserve it refuses to start with a named error. →
-  [Monitor a cluster](docs/how-to/monitor-a-cluster.md) ·
-  [gate record, row 3b](docs/benchmarks/uc2-m11-gate-2026-08-20.md)
-- **Upgrading to this release needs free disk before the node boots.** The
-  memory-mapped files in an instance directory now reserve their blocks at
-  startup instead of filling in lazily, so a node needs `buffer_bytes` plus
-  ~14 MiB of rings free — about 78 MiB at the defaults — and refuses to start
-  with a named error if it is not there. Check free space on every host before
-  a rolling restart or a flag day. →
-  [Run a cluster](docs/how-to/run-a-cluster.md) ·
-  [Instance directory](docs/reference/instance-directory.md#on-disk-footprint)
-- **Measured flag-day upgrades** (`scripts/uc2_flag_day.sh`): the
-  stop-all/upgrade/start-all procedure as a script with preflight refusals,
-  an un-upgrade path, and a printed downtime number. →
-  [Upgrade a cluster](docs/how-to/upgrade-a-cluster.md)
-- **Fixed bugs**: four pre-existing journal-layer defects surfaced by the
-  backup work's adversarial testing — a healable crash state that refused
-  boot, a heal-residue permanent wedge, a masked acked-durability hole at
-  segment rolls, and a latent writer panic. →
-  [M11 explained §5](docs/notes/uc2-m11-survivable-cluster-explained.md) ·
-  [gate record](docs/benchmarks/uc2-m11-gate-2026-08-20.md)
+- **Upgrade:** a node now needs ~78 MiB free in its instance dir before it
+  boots.
+  → [Instance directory](docs/reference/instance-directory.md#on-disk-footprint)
+- **Offline backup, verify and restore.**
+  → [Back up a cluster](docs/how-to/back-up-a-cluster.md)
+- **Quorum-loss recovery** with `uc2ctl force-single-member`.
+  → [Recover from quorum loss](docs/how-to/recover-from-quorum-loss.md)
+- **Full-disk fail-stop.** A node halts by name instead of acking writes it
+  cannot persist.
+  → [Monitor a cluster](docs/how-to/monitor-a-cluster.md)
+- **Measured flag-day upgrades** with `scripts/uc2_flag_day.sh`.
+  → [Upgrade a cluster](docs/how-to/upgrade-a-cluster.md)
+- **Fixed:** four pre-existing journal-layer defects.
+  → [M11 explained § 5](docs/notes/uc2-m11-survivable-cluster-explained.md)
+- **Performance:** fleet flag-day downtime 14.0 s and 14.7 s against a 60 s bar.
+  → [M11 gate record](docs/benchmarks/uc2-m11-gate-2026-08-20.md)
 
 ## v2.4.0 — 2026-08-20 — observable cluster (M10)
 
-A running cluster can now be watched, probed, and alerted on without touching
-the source — and it costs the hot path ~1.7%.
+A running cluster can be watched, probed and alerted on.
+[Full record](docs/releases.md#v240--2026-08-20--m10-observable-cluster).
 
-- **In-daemon observability endpoint**: `GET /metrics` (Prometheus text, 60+
-  metric families), `/healthz` (liveness), `/readyz` (role-aware readiness —
-  keyed on `can_serve`, so an elected-but-not-yet-serving leader is correctly
-  not ready). Zero new dependencies; enabled by the `[metrics]` config
-  section, off when absent. →
-  [Monitor a cluster](docs/how-to/monitor-a-cluster.md)
-- **Transition-triggered structured logging** (`[log]` config section): one
-  JSON line per state transition — election, truncation, snapshot install,
-  config adoption — never one per operation. →
-  [Monitor a cluster](docs/how-to/monitor-a-cluster.md)
-- **Shipped alert rules and dashboard**: 13 Prometheus alert rules (every one
-  proven to fire against a deliberately broken cluster) and a Grafana
-  dashboard, under [`packaging/`](packaging). →
-  [Monitor a cluster](docs/how-to/monitor-a-cluster.md)
-- **Fail-fast daemon**: an internal agent failure now exits the daemon (for
-  systemd to restart) instead of lingering as a healthy-looking zombie. →
-  [Run a cluster](docs/how-to/run-a-cluster.md)
-- **Performance**: the fleet gate measured scrape cost at median 0.983
-  on/off throughput ratio (≈1.7%, bar ≥ 0.95) under a 1 s all-nodes scrape,
-  with zero false alerts over a 10-minute healthy soak. →
-  [M10 gate record](docs/benchmarks/uc2-m10-gate-2026-08-20.md)
+- **`/metrics`, `/healthz`, `/readyz`** in the daemon, off unless `[metrics]`
+  is configured.
+  → [Monitor a cluster](docs/how-to/monitor-a-cluster.md)
+- **Structured transition logging**, one JSON line per state change.
+  → [Monitor a cluster](docs/how-to/monitor-a-cluster.md)
+- **Alert rules and a dashboard**, each rule proven to fire.
+  → [`packaging/`](packaging)
+- **Fail-fast daemon.** An internal agent failure exits the process for
+  systemd to restart.
+  → [Run a cluster](docs/how-to/run-a-cluster.md)
+- **Performance:** scraping costs ~1.7 % of throughput.
+  → [M10 gate record](docs/benchmarks/uc2-m10-gate-2026-08-20.md)
 
 ## v2.3.0 — 2026-08-19 — deployable node (M9) + rollup
 
-The first tag since v2.1.0, so it ships everything landed in between: the
-deployable daemon, wire crypto, a consensus safety fix, the pipelined client,
-and the batched read barrier.
+The first tag since `v2.1.0`, shipping everything landed in between.
+[Full record](docs/releases.md#v230--2026-08-19--m9-deployable-node).
 
-- **A real `uc2-node` daemon**: starts from a TOML config file; every config
-  mistake is a *named startup refusal* (a typo names the key, a semantic
-  error names the rule) instead of a later failure that looks like something
-  else. Clean `SIGTERM` drain-and-stop so planned restarts replay a journal
-  tail instead of paying reconstruction; packaged systemd units. →
-  [Run a cluster](docs/how-to/run-a-cluster.md) ·
+- **Upgrade flag day:** wire `0.5.0` — upgrade all nodes together.
+  → [Upgrade a cluster](docs/how-to/upgrade-a-cluster.md)
+- **A `uc2-node` daemon** with a TOML config, named startup refusals and
+  systemd units.
+  → [Run a cluster](docs/how-to/run-a-cluster.md) ·
   [Configuration reference](docs/reference/configuration.md)
-- **Service-binary template**: the shape a user's crate instantiates —
-  SIGTERM handling, supervision, the `counter-service` example. →
-  [Write a service binary](docs/how-to/write-a-service-binary.md)
-- **Wire crypto (M8) — opt-in, off by default**: authenticated + encrypted
-  node↔node UDP (Noise `IK` over an X25519 allowlist, AES-256-GCM, a rotating
-  group key for the fan-out, anti-replay). A cluster runs all-encrypted or
-  all-cleartext — no mixed mode. →
-  [Encrypt node traffic](docs/how-to/encrypt-node-traffic.md)
-- **Content-attested durable reports (wire protocol 0.5.0)**: a consensus
-  safety fix that upgrades commit ranking from a position quorum to a content
-  quorum. **Flag day**: upgrade all nodes together — a mixed cluster stalls
-  commits rather than committing unsoundly. →
-  [the plain-language explainer](docs/notes/uc2-term-map-window-loss-explained.md) ·
-  [wire protocol reference](docs/reference/wire-protocol.md)
-- **Pipelined client SDK**: `uc_client`'s public `Engine` (split send/poll
-  halves, exactly-once correlation) and `PipelinedClient` with an
-  `await`-able `Ticket` per request. →
-  [QUICKSTART — beyond one-shot CLI calls](docs/QUICKSTART.md) ·
-  [API docs](https://peterknego.github.io/ultima_cluster/)
-- **Batched linearizable read barrier**: linearizable reads ride shared probe
-  rounds; the barrier's throughput cost fell from ~58% to ~0% at ~953k
-  linearizable reads/s. →
-  [Read path reference](docs/reference/read-path.md) ·
-  [the read-barrier explainer](docs/notes/uc2-read-barrier-explained.md)
-- **Fixed bugs**: three consensus-safety windows found by the Lean proof
-  effort before any production deployment existed — a Raft Figure-8
-  acked-write-loss window in commit ranking, a candidate intake-gate reopen,
-  and a boot-open gate phantom commit (Findings #6b, #9, #5). →
-  [detailed record](docs/releases.md) ·
-  [verification overview](docs/VERIFICATION.md)
-- **Performance**: planned leader restart under load stops in 0.042 s and is
-  back at baseline ≤ 10.5 s (M9 gate); end-to-end 1.48 M responses/s @ p99
-  0.905 ms through the public pipelined client; UC leads Aeron Cluster
-  1.3–1.8× on the matched-durability scorecard. →
-  [M9 gate](docs/benchmarks/uc2-m9-gate-2026-08-19.md) ·
-  [client re-run + A/B](docs/benchmarks/uc2-m5-engine-gate-2026-08-15.md) ·
+- **A service-binary template.**
+  → [Write a service binary](docs/how-to/write-a-service-binary.md)
+- **Wire crypto (M8)**, opt-in and off by default.
+  → [Encrypt node traffic](docs/how-to/encrypt-node-traffic.md)
+- **Content-attested durable reports**, a consensus safety fix.
+  → [Explainer](docs/notes/uc2-term-map-window-loss-explained.md)
+- **A pipelined client SDK.**
+  → [QUICKSTART](docs/QUICKSTART.md)
+- **A batched linearizable read barrier**, cutting its throughput cost from
+  ~58 % to ~0 %.
+  → [Read path reference](docs/reference/read-path.md)
+- **Fixed:** three consensus-safety windows found by the Lean proof effort.
+  → [Verification overview](docs/VERIFICATION.md)
+- **Performance:** 1.48 M responses/s at p99 0.905 ms through the pipelined
+  client.
+  → [M9 gate](docs/benchmarks/uc2-m9-gate-2026-08-19.md) ·
+  [wire 0.5.0 fleet gate](docs/benchmarks/uc2-protocol-050-fleet-gate-2026-08-17.md) ·
   [Aeron scorecard](docs/benchmarks/uc2-aeron-parity-2026-08-15.md)
 
 ## v2.1.0 — 2026-07-14 — live reconfiguration (M7)
 
-- **Single-server membership changes, live, under load**: promote / demote /
-  add / remove one member at a time via the `uc2ctl` admin CLI — no restarts,
-  no joint consensus (adjacent configs differ by one member, so majorities
-  always intersect). Removed ids are tombstoned forever; a returning host
-  rejoins as a fresh id. →
-  [Change cluster membership](docs/how-to/change-cluster-membership.md) ·
-  [uc2ctl reference](docs/reference/uc2ctl.md)
-- **Fixed bugs**: the v2.0.0 MPSC ingress-ring free-space underflow under
-  producer contention (spurious backpressure, not corruption). →
-  [detailed record](docs/releases.md)
-- **Performance**: the 5-host fleet gate held every membership transition's
-  commit-rate dip ≤ 4.7% (bar < 10%) with a 3.22 s leader self-removal
-  handoff and zero loss or divergence. →
-  [M7 gate record](docs/benchmarks/uc2-m7-gate-2026-07-13.md)
+[Full record](docs/releases.md#v210--2026-07-14).
+
+- **Live membership changes.** Promote, demote, add or remove one member at a
+  time under load with `uc2ctl`.
+  → [Change cluster membership](docs/how-to/change-cluster-membership.md)
+- **Fixed:** an MPSC ingress-ring underflow under contention.
+- **Performance:** every transition's commit-rate dip stayed ≤ 4.7 %.
+  → [M7 gate record](docs/benchmarks/uc2-m7-gate-2026-07-13.md)
 
 ## v2.0.0 — 2026-07-13 — the v2 core (M1–M6)
 
-The Aeron-shaped rewrite: UC owns consensus, elections, and transport
-directly (the openraft-based v1 is retired).
+The Aeron-shaped rewrite: UC owns consensus, elections and transport.
+[Known issues](docs/releases.md#v200--known-issues).
 
-- **The SMR core**: four single-writer polling agents per node over a
-  shared-memory log buffer and control page; replication is a byte-stream
-  fan-out over UC's own reliable UDP; monotonic byte positions instead of log
-  indices. →
-  [Architecture](docs/ARCHITECTURE.md)
-- **The end-to-end SDK**: you write a sync, deterministic `StateMachine` in
-  your own process; the service SDK applies committed commands and the client
-  SDK submits and queries over shared memory. →
-  [QUICKSTART](docs/QUICKSTART.md)
-- **Leader elections and failover**: automatic, with zero committed-write
-  loss across repeated leader kills. →
-  [Architecture](docs/ARCHITECTURE.md) ·
-  [M4 gate record](docs/benchmarks/uc2-m4-gate-2026-07-11.md)
-- **Snapshots, learners, and journal purge** (purge off by default): a node
-  below the purge floor converges by snapshot install + tail replay; learners
-  replicate without counting toward quorum. →
-  [Bound journal growth](docs/how-to/bound-journal-growth.md)
-- **Linearizable reads**: a quorum read barrier plus a service-epoch check
-  that closes the TOCTOU against a service crashing mid-query. →
-  [Read path reference](docs/reference/read-path.md)
-- **Performance**: 1.64 M responses/s @ p50 0.600 ms end-to-end (M5 gate,
-  pre-pipelined client); learner join under load dipped commit rate 0.9%
-  (M6). →
-  [M5 gate record](docs/benchmarks/uc2-m5-gate-2026-07-12.md) ·
+- **The SMR core.** Single-writer polling agents over a shared-memory log,
+  replicated over UC's own reliable UDP.
+  → [Architecture](docs/ARCHITECTURE.md)
+- **The end-to-end SDK.** A sync, deterministic `StateMachine` in your own
+  process.
+  → [QUICKSTART](docs/QUICKSTART.md)
+- **Elections and failover**, with zero committed-write loss.
+  → [M4 gate record](docs/benchmarks/uc2-m4-gate-2026-07-11.md)
+- **Snapshots, learners and journal purge** (purge off by default).
+  → [Bound journal growth](docs/how-to/bound-journal-growth.md)
+- **Linearizable reads.**
+  → [Read path reference](docs/reference/read-path.md)
+- **Performance:** 1.64 M responses/s at p50 0.600 ms end-to-end.
+  → [M5 gate record](docs/benchmarks/uc2-m5-gate-2026-07-12.md) ·
   [M6 gate record](docs/benchmarks/uc2-m6-gate-2026-07-12.md)
-- **Known issue at release**: the MPSC ingress underflow, fixed in v2.1.0. →
-  [detailed record](docs/releases.md)

@@ -1030,8 +1030,14 @@ them manually if ever.
 
 The root **`RELEASES.md`** is the user-facing release document; `docs/releases.md`
 is the deep per-release engineering record behind it. **Every new release adds a
-new section at the top of `RELEASES.md`** (latest first), structured as:
+new section at the top of `RELEASES.md`** (latest first). `RELEASES.md` is a
+**summary with links, nothing more: every bullet is one or two sentences at
+most** — mechanics, refusal codes, metric lists, gate row-by-row results and
+caveats belong in `docs/releases.md` or the linked doc, never here. A section
+is a one-line summary plus a link to its `docs/releases.md` entry, then:
 
+0. an **upgrade** bullet when the release has a flag day or an operator step,
+   linking to `docs/how-to/upgrade-a-cluster.md`;
 1. one bullet per **feature**, briefly explained, each linking to a separate
    detailed doc (how-to / reference / `docs/notes/` explainer) — **write the
    detailed doc if it does not exist yet**;

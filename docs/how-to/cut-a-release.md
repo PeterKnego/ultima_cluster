@@ -18,10 +18,13 @@ Everything here assumes you are on `main`, with the work merged and CI green.
 CLAUDE.md's rule, and it is not ceremony — the tag must *contain* the
 documentation for what it changes, because the tag is what people read.
 
-- [ ] A new section at the top of `RELEASES.md` (latest first): one bullet per
-      feature, each linking to a how-to/reference/explainer that **exists**;
-      an optional bullet for fixed bugs; an optional bullet for performance,
-      linking the gate doc.
+- [ ] A new section at the top of `RELEASES.md` (latest first) — a summary
+      with links, **one or two sentences per bullet at most**: a one-line
+      summary linking the `docs/releases.md` entry; an upgrade bullet if there
+      is a flag day or operator step; one bullet per feature, each linking to
+      a how-to/reference/explainer that **exists**; an optional bullet for
+      fixed bugs; an optional bullet for performance, linking the gate doc.
+      Detail goes in `docs/releases.md`, not here.
 - [ ] The matching per-release entry in `docs/releases.md`.
 - [ ] A sweep of `QUICKSTART.md`, `docs/how-to/`, `docs/reference/` for
       statements this release invalidated. Upgrade consequences that refuse to
