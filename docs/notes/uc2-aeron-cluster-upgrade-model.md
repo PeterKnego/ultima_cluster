@@ -1,6 +1,10 @@
 # How Aeron Cluster handles software upgrades — the versioning model, read from source
 
-**Status:** research note, 2026-09-13. Companion to
+**Status:** research note, 2026-09-13; revised 2026-09-19 (the SBE
+extension rules in §D are now quoted from fetched pages, §B gains a second
+rolling-upgrade claim and a wire-retirement example, and §G separates the
+three upgrade axes — cluster jars, FSM, client — that Aeron's docs run
+together, with the rules on each). Companion to
 `uc2-rolling-upgrade-compatibility-assessment.md`, whose Aeron row and
 "FSM `const VERSION`" paragraph this extends (and corrects in one place, §C).
 
@@ -26,7 +30,11 @@ procedure is **not written down anywhere public** I could reach; what the
 tree and changelog say is: one node at a time is *possible* for
 schema-additive Aeron releases, and the maintainers name "clean shutdown
 with a snapshot, restart the whole cluster" as the procedure when a fix
-changes log semantics (§B).
+changes log semantics (§B). What the tree cannot say, and the talk does
+(§B, testimony): running **different versions of nodes in one cluster is
+business as usual** for Aeron's own operators — the tolerance comes
+entirely from protocol discipline, not from any mechanism the code
+enforces, which is exactly why no check exists to find.
 
 ## A. What Aeron versions, and at what granularity
 
@@ -65,7 +73,49 @@ as an upgrade sequence; its troubleshooting page says nothing about
 for `upgrade`. aeron.io's marketing page claims "Snapshotting and rolling
 upgrades allow for 24×7 operational models, enabling upgrades with zero
 downtime" (https://aeron.io/aeron-open-source/) with no procedure behind
-it — the same finding the companion note recorded.
+it — the same finding the companion note recorded. The talk page "Fault
+Tolerant 24/7 Ops with Aeron Cluster" (Todd Montgomery,
+https://aeron.io/resources/fault-tolerant-operations-aeron-cluster-todd-montgomery/,
+fetched 2026-09-19) is the closest thing to a statement of the model:
+"Aeron Cluster supports rolling upgrades, where components are updated one
+at a time … This method requires careful planning and implementation of
+protocols that support backward and forward compatibility, allowing
+different versions of the system to coexist temporarily. Semantic
+versioning and protocol design play crucial roles in this process." That
+is a description of the *discipline* (§D), placed on the application; it
+names no procedure, no gate and no check. Neither claim says **which
+upgrade** it means — the Aeron jars or the application on top of them —
+and the two are different axes with different mechanisms (§G). The one
+procedural sentence that exists, 1.47.0 below, is evidence for the
+*cluster* axis only.
+
+**From the video itself** (watched by this repo's maintainer 2026-09-19;
+there is no transcript to fetch, so this is recorded as **testimony**,
+not as a quoted page):
+
+1. Aeron's operators **run different versions of nodes in one cluster as
+   business as usual.** It is not an exceptional procedure; the system is
+   built to tolerate it. This is the fact the tree cannot show — no test
+   runs mixed versions and no check detects them (§A, §C) — and it
+   changes the reading of §A: the absence of a peer version check is not
+   an omission but the *consequence* of a design in which a mixed
+   cluster is the normal state and every message must survive it.
+2. The tolerance is achieved by **protocol design**, named as four
+   things: forward *and* backward compatibility of every message;
+   **version everything** — messages, data, snapshots; **semantic
+   versioning with strong rules** for what is and must stay compatible
+   across versions; and SBE's **ignore bits / optional fields** — a
+   reader skips what it does not know and nulls what the sender did not
+   send (§D).
+
+Read against the code, the talk and the tree agree: §A–§D is the
+mechanism the talk describes, and the 1.47.0 note is the exception the
+talk's rules imply — a fix that changes *semantics* is the one case
+extension rules cannot cover, so it is stop-the-world. The calibration
+line in issue #31 ("Aeron Cluster 1.53 has **no** supported rolling
+upgrade") is therefore too strong as written: Aeron has no rolling-upgrade
+*mechanism* — no gate, no negotiation, no committed level — but the
+*practice* is supported, by discipline, and is routine.
 
 What *can* be pinned down, by case:
 
@@ -90,7 +140,14 @@ What *can* be pinned down, by case:
   stop, upgrade and bring back each member in turn, finally the leader" —
   could not be traced to a page (the Gitter permalink redirects to an app
   shell): **not verified**, reported here only because it is the sole
-  description of a rolling sequence that surfaced.
+  description of a rolling sequence that surfaced. How Aeron *retires*
+  wire surface is visible in the same changelog: 1.53.0 removed the
+  archive's unauthenticated `ConnectRequest` (`templateId = 2`) as a
+  **Breaking** entry, justified by "This message was not used by official
+  Archive clients used since 1.24.0 (2019-11-24)" (`CHANGELOG.adoc:30-32`)
+  — a template is dropped only after every shipped client has stopped
+  sending it for years, which is the SBE "new message type, old one
+  lingers" rule (§D) run to completion.
 - **(ii) Application upgrade.** This is what `appVersion` exists for
   (§C). Same major → nodes may be rolled and the gate is silent; a major
   bump → the first new-major leader's `NewLeadershipTerm` / log event
@@ -176,10 +233,47 @@ wrapping the codec with the header's `blockLength` and `version` — the SBE
   explicit null, e.g. `NewLeadershipTerm.commitPosition sinceVersion="15"`
   (`aeron-cluster-codecs.xml:491`), `appVersion sinceVersion="4"` (`:262,677`);
 - **old reader, new message** — the reader positions past the sender's
-  `blockLength`, so appended root-block fields are skipped; this is the
-  SBE extension mechanism (FIX SBE spec, "extension"; the SBE wiki page on
-  forward compatibility failed to load — **not verified** from a fetched
-  page, but it is what wrapping with the *header's* block length does).
+  `blockLength`, so appended root-block fields are skipped. Both
+  directions are the stated design goal, fetched 2026-09-19 from the SBE
+  wiki's Design Principles page
+  (https://github.com/aeron-io/simple-binary-encoding/wiki/Design-Principles):
+  "an older system should be able to read a newer version of the same
+  message and vice versa … An extension mechanism is designed into SBE
+  which allows for the introduction of new optional fields within a
+  message that the new systems can use while the older systems ignore
+  them until upgrade." (The generated decoders that implement the
+  old-reader half are build outputs and not in the checkout, so the
+  mechanism is still inferred from the adapters' use of the header's
+  `blockLength`, not read from generated code.)
+
+The extension rules themselves, from the Message Versioning page
+(https://github.com/aeron-io/simple-binary-encoding/wiki/Message-Versioning,
+fetched 2026-09-19 — it had failed to load for the 2026-09-13 pass):
+
+- a field is added "by creating a new `messageSchema` and increasing the
+  `version` number", and its `sinceVersion` is "the version number that
+  has been used for the new schema";
+- fields may only be added "at the end of the root block in the `message`
+  or the end of a block in a `group`", and must be `presence="optional"`;
+- "Messages cannot remain backwards compatible if existing fields are
+  modified or removed";
+- "It is **not** possible to add fields to a `composite` type without
+  creating a new message template and schema version";
+- a new decoder handling an older message must "act like a previous
+  version to ensure it does not read beyond the end of an existing
+  block", returning "the null representation for the extension fields";
+- and the boundary of the mechanism, from Design Principles: "If new
+  mandatory fields are required or a fundamental structural change is
+  required then a new message type must be employed because it is no
+  longer a semantic extension of an existing message type."
+
+The `deprecated` attribute (six cluster messages carry `deprecated="12"`,
+`aeron-cluster-codecs.xml:351,532,540,550,558,575`) is an annotation on
+the template: no cluster adapter in `aeron-cluster/src/main/java`
+branches on it (grep, 2026-09-19), so a deprecated message still decodes
+and dispatches exactly as before. Together these
+are the whole of Aeron's "schema migration": there is no migration, only
+additive extension of a message and eventual replacement of the template.
 
 The schema history is consistent with a project that relies on this: 17
 schema versions and every post-`2` field is `sinceVersion`-tagged
@@ -242,6 +336,106 @@ a change is semantic rather than syntactic. UC's Level 2 is the piece
 Aeron lacks, and it is the piece that would have turned the 1.47.0 note
 from a procedure into a refusal.
 
+## G. Three upgrade axes, and the rules on each
+
+Sections A–F are read from the framework's side. Turned around — "I run
+an Aeron Cluster deployment; what are the rules when I change something?"
+— there are **three separate axes**, and Aeron's docs never name them
+because in Aeron they usually ship as one process: the consensus module,
+the service container and the `ClusteredService` run in the same JVM, so
+"upgrade the node" means all three at once. The *mechanisms* are
+separate, and so are the rules. (UC separates them by construction —
+node, service and client are three processes — which is why this
+section is split the way it is.)
+
+### G.1 Cluster axis: the Aeron jars themselves
+
+Consensus module, service container, archive, media driver. The
+application has no say here and no hook.
+
+- Mixed Aeron versions between consensus modules are **undetected**:
+  `protocolVersion` is carried and never compared (§A, §C). Decodability
+  across a roll comes from Aeron's own SBE `sinceVersion` discipline (§D).
+- Per-node files gate on **major** at open (§A), and every cluster mark
+  file ever shipped is `0.x`, so no release has refused an older node's
+  directory.
+- Whether a release is *semantically* safe to roll is a per-release
+  changelog judgement. The one time the maintainers made it (1.47.0) the
+  answer was "clean shutdown with a snapshot, restart the whole cluster"
+  (§B(i)).
+
+### G.2 Application axis: the FSM, its commands, its snapshot
+
+- **Aeron passes the command payload through as bytes.** The framework's
+  `SessionMessageHeader` is SBE and carries only `leadershipTermId`,
+  `clusterSessionId` and `timestamp` (`aeron-cluster-codecs.xml:132-138`);
+  the service sees `onSessionMessage(session, timestamp, buffer, offset,
+  length, header)` (`service/ClusteredService.java:82-88`) and the
+  container never decodes what follows the header. SBE is what Aeron
+  itself uses and recommends, **not a requirement** — but its extension
+  rules (§D: append optional `sinceVersion` fields, never modify or
+  remove one, new template for a mandatory or structural change, old
+  template kept until every producer has stopped) are the discipline the
+  application needs under whatever encoding it picks, because of the
+  next rule.
+- **A new FSM must replay the old log from the latest snapshot.**
+  Recovery is "load the newest snapshot, replay the terms after it"
+  (`RecordingLog` recovery plan, §E); the framework migrates nothing in
+  between. Snapshot before upgrading so the replay window is short. Every
+  message in that window is decoded by the *new* code, so an added
+  field's absent/null value must mean "the old behaviour" inside the FSM.
+- **The snapshot payload is yours, and only its envelope is checked.**
+  `SnapshotMarker.appVersion` + `timeUnit` (§B(iii)). A snapshot-encoding
+  change is either an app-major bump (stop-the-world by construction,
+  §C) or a custom `VersionValidator` plus your own old-format decoder.
+  If you want the log and the snapshot to carry different compatibility
+  rules — issue #1671's ask — the validator is the only hook, and it sees
+  one `int` per check with no indication of which of the four call sites
+  it is (`VersionValidator.isVersionCompatible(context, underTest)`,
+  `VersionValidator.java:37`).
+- **Same app major → restart nodes one at a time; different major → the
+  first new-major leader terminates every old-major node and service.**
+  There is no order rule from the framework; the unverified maintainer
+  sequence in §B(i) ("each member in turn, finally the leader") is the
+  only one that surfaced.
+
+### G.3 Client axis: the processes that submit commands
+
+Two layers again, one per axis above.
+
+- **Framework layer.** The cluster client's ingress protocol
+  (`AeronCluster.Configuration.PROTOCOL_SEMANTIC_VERSION = 0.3.0`) is
+  gated at **major** by the leader on `SessionConnectRequest`
+  (`SessionManager.java:270-275`, table A). The gate is one-sided: the
+  leader's `SessionEvent` carries its own `version` back
+  (`aeron-cluster-codecs.xml:153`, `sinceVersion="6"`), and
+  `client/AeronCluster.java` never compares it — the class imports
+  `SemanticVersion` and uses only the SBE acting version (grep,
+  2026-09-19). So a newer client is refused by an older cluster; an older
+  client is accepted by a newer one as long as the major holds.
+- **Application layer.** The payload the client encodes is the same
+  bytes the FSM decodes, so the G.2 extension rules apply **in both
+  directions during a roll**: an old client's message must still decode
+  on a new FSM (the replay case), and a new client's message with
+  appended fields must be harmless on an old leader that skips them.
+  Aeron gives the client side no version hook at all — no `appVersion`
+  on the ingress session, nothing in the egress — so client/FSM
+  compatibility is entirely the application's own contract.
+
+### Mapped onto UC
+
+For the reader coming from `docs/how-to/upgrade-a-cluster.md`:
+
+| Aeron axis | UC surface |
+|---|---|
+| G.1 cluster: undetected mixed versions, per-release judgement, stop-the-world when semantic | the node↔node wire + cnc **flag day**; the committed wire level of issue #31 is the proposed replacement, the piece Aeron never built (§F) |
+| G.2 payload as bytes, SBE recommended | `AppCommand = Bytes` end-to-end; the typed tier is a serde adapter, the encoding is the service's |
+| G.2 replay the old log through new code | `install_snapshot(P)` + journal tail-replay through the new apply loop; Level 1's tail-growth and unknown-kind discipline |
+| G.2 snapshot envelope check, major-only, pluggable | `ULTSNAP1 ‖ P` + the `SNAP_BEGIN` per-row `VERSION` refusal — **exact** today; the `const VERSION` validator in the FSM-identity spec is the reserved slot for Aeron's looser, pluggable rule |
+| G.2 same-major roll of the FSM | no UC counterpart yet — a per-row `VERSION` inequality, where both sides report a nonzero one, refuses the snapshot session (`uc_net/src/receiver.rs:478,623`), so a service upgrade that bumps `VERSION` is a flag day too |
+| G.3 framework layer, leader-side major gate | the client↔gateway remote protocol v1 (separate from the node wire, unchanged since M12) and the shmem `cnc` attach checks |
+| G.3 application layer, no hook | the same: UC checks nothing about the command bytes a client sends |
+
 ## Sources not reachable or not verified
 
 - Any aeron.io or wiki page describing a rolling-upgrade *procedure*:
@@ -250,9 +444,10 @@ from a procedure into a refusal.
   Log, RAFT feature page, theaeronfiles.com consensus-module pages).
 - The maintainer chat quote in §B(i): search-engine summary only,
   permalink unreadable — **not verified**.
-- SBE forward-compatibility (old reader, newer message) from a fetched
-  page: wiki failed to load — **not verified** beyond the code's use of
-  the header `blockLength`.
+- SBE forward-compatibility (old reader, newer message): the *rule* is
+  now quoted from the fetched Design Principles and Message Versioning
+  pages (§D, 2026-09-19); the *mechanism* in generated decoder code is
+  still inferred, since the checkout holds no generated codecs.
 - GitHub issue search: `gh search issues --repo aeron-io/aeron "rolling
   upgrade"` returned nothing; the web UI query showed one unrelated PR
   (#2093). Issue #1671 (fetched) is the only issue found that discusses
