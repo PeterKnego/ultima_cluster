@@ -65,7 +65,7 @@
 ### Task 1: Repository bootstrap and the generator
 
 **Files:**
-- Create (in a new repo `~/ultima/uc_starter`): `cargo-generate.toml`, `hooks/validate.rhai`, `UC_VERSION`, `uc-app.env`, `Cargo.toml`, `rust-toolchain.toml`, `.gitignore`, `LICENSE`, `README.md` (stub), `src/identity.rs`, `src/lib.rs` (stub), `template-tests/gen.sh`, `template-tests/generator.sh`
+- Create (in a new repo `~/ultima/uc_starter`): `cargo-generate.toml`, `hooks/validate.rhai`, `UC_VERSION`, `uc-app.env`, `Cargo.toml`, `rust-toolchain.toml`, `.gitignore`, `README.md` (stub), `src/identity.rs`, `src/lib.rs` (stub), `template-tests/gen.sh`, `template-tests/generator.sh`
 
 **Interfaces:**
 - Produces: `template-tests/gen.sh <dest-dir> [name] [fsm_name] [app_id] [base_port]` — generates a project; every later task tests through it. Defaults: `demo-app demo demo 7000`. Library crate is always named `app`.
@@ -288,7 +288,7 @@ pub fn local_gateways(offset: u16) -> Vec<String> {
 pub mod identity;
 ```
 
-`LICENSE`: Apache-2.0 text (copy from `~/ultima/ultima_cluster/LICENSE`). `README.md`: `# {{project-name}}` plus one line "Generated from uc_starter — full README in Task 9."
+No `LICENSE` file and no `license` key (user directive 2026-09-24: the license is entirely the developer's choice; README § Before you publish says to pick one). `README.md`: `# {{project-name}}` plus one line "Generated from uc_starter — full README in Task 9."
 
 - [ ] **Step 5: Run the test to verify it passes** — `bash template-tests/generator.sh`. Expected: `generator: PASS`. If `project-name` is not visible in pre-hooks, or `include` does not behave as "only these are processed", stop and adjust (check `cargo generate --help` and the cargo-generate book via context7) — do not weaken the test.
 

@@ -37,6 +37,8 @@ it and explain the change. Without an agent, the same path is a document
    natively and inside the devcontainer image.
 5. A UC release is not done until the starter builds against it (§8).
 
+**No license is presumed** (user directive 2026-09-24): neither the template nor a generated project ships a `LICENSE` file or a `license` key; the README tells the developer to choose one.
+
 **Non-goals (YAGNI, recorded so they are decisions, not gaps):** a non-Rust
 client; an HTTP/JSON facade in front of the client; generator toggles for
 optional features; first-class Cursor/Copilot/Codex config beyond
