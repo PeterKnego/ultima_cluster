@@ -490,6 +490,7 @@ reviewer wants a workload to attack.
   show` body, "Why a flag day") were kept. Recorded here 2026-09-21
   because the SDD ledger and the task report that carry it today are working
   artifacts that get archived.
+- **Build `uc_starter` against the in-tree crates in `ci.yml`** (`[patch.crates-io]`), so an SDK break is caught on the PR that makes it — deferred until `uc_starter` is public (a private checkout needs a secret). Spec `docs/superpowers/specs/2026-09-24-uc-starter-design.md` §8. On publication: link it from README.md, docs/QUICKSTART.md §7 and docs/tutorials/build-an-application.md.
 
 ## Accepted residuals — listed so they are not re-proposed
 

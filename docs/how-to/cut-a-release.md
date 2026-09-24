@@ -364,6 +364,7 @@ a half-published version is recoverable; a wrong published version is not.
       --jq '.[].metadata.container.tags'`.
 - [ ] The gate doc for the milestone records the release, per the honest-failure
       protocol every milestone has used.
+- [ ] **Bump `uc_starter`.** In a checkout of `PeterKnego/uc_starter`: `make uc-upgrade VERSION=<new>`, commit, push, wait for `template-ci` green, then `git tag v<new> && git push origin v<new>`. A release is not done until the starter generates, builds and passes its cluster smoke against it (spec `docs/superpowers/specs/2026-09-24-uc-starter-design.md` §8).
 
 ## Related
 
