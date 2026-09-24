@@ -4,6 +4,9 @@ This page lists the commands that you use with `ultima_cluster` (UC). Part 1 is
 for developers. Part 2 is for operators. Each row tells you what a command does
 and why you use it. The link on each command goes to its full reference.
 
+A printable version is in [`docs/uc-cheatsheet.pdf`](../uc-cheatsheet.pdf)
+(A4, six pages).
+
 ## How to read the tables
 
 - `<DIR>` is the instance directory of a node. `<ID>` is the application

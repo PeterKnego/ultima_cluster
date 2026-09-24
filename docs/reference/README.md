@@ -16,7 +16,8 @@ and the wire.
 What an operator touches directly.
 
 - [Command cheatsheet](cheatsheet.md) — every command an application
-  developer or an operator uses, with what it does and why, one line each.
+  developer or an operator uses, with what it does and why, one line each
+  ([printable A4 PDF](../uc-cheatsheet.pdf)).
 - [Contributor command cheatsheet](contributor-cheatsheet.md) — the build,
   lint, proof and benchmark commands for work on UC itself.
 - [`uc2ctl`](uc2ctl.md) — the admin CLI: every sub-command, its arguments, the
