@@ -122,6 +122,8 @@ and crash tiers had missed. Full picture, including what is *not* verified:
 - **[Quickstart](/docs/QUICKSTART.md)** — zero to a running three-node cluster.
 - **[Verification](/docs/VERIFICATION.md)** · **[Benchmarks](/docs/BENCHMARKS.md)** · **[Backlog](/docs/BACKLOG.md)**
   — what is proved, what is measured, on what.
+- **[Command cheatsheet](/docs/reference/cheatsheet.md)** — every developer
+  and operator command, one line each.
 - **[How-to guides](/docs/how-to)** · **[Reference](/docs/reference)** ·
   **[Operations runbook](/docs/ops/uc2-runbook.md)** · **[API docs](https://peterknego.github.io/ultima_cluster/)**.
 - **[Limits](/docs/reference/limits.md)** — every hard limit, standing

@@ -656,7 +656,7 @@ cargo run -p uc_node --release --example m7_gate -- all --secs 6             # l
 cargo run -p uc_ctl -- status --instance-dir D --app-id A  # M7 admin CLI: add/promote/demote/remove/status
 scripts/fuzz_smoke.sh 60 --min-runs 10000         # fuzz regression gate: every target, 60s each (needs nightly + cargo-fuzz)
 (cd fuzz && cargo +nightly fuzz run uc_protocol_datagram -- -max_total_time=600)  # hunt one target
-scripts/elle_check.sh                            # elle consistency tier: 5 list-append passes, both models (needs java+jq)
+scripts/elle_check.sh                            # elle consistency tier: 6 list-append passes, both models (needs java+jq)
 scripts/elle_mutation.sh                         # elle mutation testing: control clean + 3 injected consensus bugs caught
 (cd proofs && lake exe cache get && lake build)   # Lean proofs: model + theorems + conform checker (needs elan)
 cargo run -p uc_consensus --release --example conform_gen -- --out $HOME/.cache/uc2-conform/vectors.jsonl --count 100000 --seed 1 && (cd proofs && lake exe conform $HOME/.cache/uc2-conform/vectors.jsonl)  # model<->Rust conformance
