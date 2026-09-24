@@ -6,6 +6,75 @@ written review. **Target UC version:** `2.13.0` (wire `0.9.0`, cnc `3.3`).
 a first review, then made public — plus one step added to this repo's release
 procedure (§8).
 
+#### Errata (as built)
+
+Read these before the body; where they differ, they win. They record what the
+`uc_starter` implementation (uc_starter `main`, through the final-review fix
+wave of 2026-09-24) actually ships, and the rulings behind it (R3, R5–R8, R10
+in the implementation ledger).
+
+- **`next.sh --json` shape (§5.2).** One object:
+  `{step, of, part, id, title, status, part1_complete, part1_just_completed,
+  detail[]}`. There is **no `anchor`**: the human form points at
+  `WHAT-NEXT.md "Step N"` and an agent reads the step by number. `of` (13),
+  `part1_complete` and `part1_just_completed` are additions. `status` is
+  `todo`, `stale` or `complete` (id `done`).
+- **Part-1 completion is machine-local (R6).** It is the stamp
+  `.uc/state/part1.ok`, never a line in the committed `.uc-progress`;
+  `make done` refuses `part1`. A teammate's fresh clone re-proves the
+  machine-only steps (`make check`, the cluster, the demo, the failover) on
+  its own machine. `env` stays blocking in every mode.
+- **The "Part 1 complete" banner is derived (R7)**, not a one-shot flag:
+  `part1_just_completed` is true on every call while the reported step is the
+  first non-skipped Part-2 step and its own proof has not started.
+- **`fsm_name` (§3)** accepts `[a-z][a-z0-9_-]{0,31}` — a hyphen is allowed
+  and the maximum is 32 bytes, exactly UC's `FsmName::parse`
+  (`uc_protocol/src/identity.rs`) — and the rhai pre-hook still refuses the
+  reserved `uc_` prefix.
+- **The tree (§4).** The binaries are `src/bin/service.rs` and
+  `src/bin/client.rs` (explicit `[[bin]]` entries name them
+  `<name>-service` and `<name>`). There is no `config/*.tmpl`: `node.toml`
+  and `gateway.toml` are rendered by `scripts/lib.sh`'s `render_node_toml` /
+  `render_gateway_toml`, one shape for the local cluster (`cluster.sh`) and
+  the deploy bundle (`package.sh`). `tests/` also has `cli.rs` (argument
+  refusals without a cluster). `scripts/` also has `probe.sh` (below).
+- **Done-when forms (§5.2).** Step 5 is `cargo check` (not `cargo build`).
+  Step 6 is no `TODO(app)` in `src/state.rs`, `src/snapshot.rs` or
+  `tests/state.rs` plus `cargo test --test state` (not `cargo test --lib`,
+  which ran zero tests). Step 7 is no `TODO(app)` under `tests/` plus a fresh
+  `make check` stamp (tests + fmt + clippy + MSRV clippy + determinism grep).
+  Step 8 also requires no `TODO(app)` in `scripts/probe.sh`. `make done`
+  accepts only `concepts` and `deploy`; `make skip` accepts any step.
+- **No `LICENSE` (R3)**: neither the template nor a generated project ships
+  one, and `Cargo.toml` has no `license` key (as §1 already says).
+- **The Part-2 drills use `scripts/probe.sh`.** The snapshot and upgrade
+  drills' write and read are the app's own — `probe_write`, `probe_read`,
+  `probe_expect`, behind a whole-line `TODO(app)` that Step 8 clears and
+  `make demo` exercises — never the skeleton's `put`/`get`, so Steps 10 and
+  12 and the generated CI's cluster smoke work for any app. The upgrade
+  drill writes its pre-pin canary with the OLD client, which `make corpus`
+  saves beside the old service in `upgrade/old/`.
+- **Verified Claude Code facts (R8).** Permission rules are checked deny,
+  then ask, then allow, so an `ask` rule beats the blanket `Bash(make:*)`
+  allow; the kit's ask rules match text anywhere in the command
+  (`*upgrade-drill*`, `*UC_CONFIRM_PIN*`, `*upgrade pin*`, `*FRESH=1*`).
+  In the installed Claude Code 2.1.281, `continueOnBlock` exists only for
+  *prompt* hooks — a command hook drops it as an unknown key, and its exit 2
+  on PostToolUse already feeds stderr back to the agent; the kit keeps the
+  key on its command hook, harmlessly, for versions that honour it.
+- **The clean-room audit ruling (R10).** The transcript audit reported VOID
+  on its unmodified patterns; every hit was the sandbox itself or the
+  published `uc_service` crate source a real developer also has, with zero
+  reads of the UC repository. The walkthrough was judged benign and its
+  record (`template-tests/clean-room-2026-09-24.md`) stands as the
+  publication evidence.
+- **"Every UC minor so far has been a flag day" is false** (§5.1, §8): not
+  every minor changed the wire or the cnc page (`2.9.0` and `2.10.0` kept wire
+  `0.6.0` and cnc `3.0`). What holds, and what the
+  starter says, is that a UC upgrade is treated as a whole-cluster stop and
+  start, and a project pins exact crate versions; an older-UC user still
+  generates from the matching tag.
+
 ## 1. Intent
 
 A developer who wants to build an application on ultima_cluster (UC) should
@@ -196,7 +265,7 @@ waits `boot_wait` and then refuses `NodeBooting`).
 | `make snapshot-drill` / `observe` / `upgrade-drill` / `package` | Part 2 exercises (§5.2) |
 | `make corpus` / `upgrade-check` | export a diff-replay corpus / run `uc2-diffreplay upgrade` on it |
 | `make done STEP=x` / `skip STEP=x` | record a step the repo cannot show, or a deliberate skip |
-| `make uc-upgrade VERSION=x` | move `UC_VERSION`, the crate pins and the pinned doc links together, then print UC's upgrade how-to link — every UC minor so far has been a flag day |
+| `make uc-upgrade VERSION=x` | move `UC_VERSION`, the crate pins and the pinned doc links together, then print UC's upgrade how-to link — a UC upgrade is a whole-cluster stop and start |
 
 The MSRV clippy is in `make lint` because 1.89's clippy fires lints the
 pinned newer toolchain does not; UC's own PR #56 went red that way.
@@ -371,7 +440,8 @@ alone.
 - **Tags follow UC.** `uc_starter` tag `v2.13.0` generates a project for UC
   `2.13.0`; `cargo generate … --tag v<X>` pins it; `main` tracks the newest
   UC release. An older-UC user generates from the older tag — necessary,
-  since every UC minor so far has been a wire flag day.
+  since the crate pins are exact and a UC upgrade is a whole-cluster stop
+  and start.
 - **UC's release procedure gains a step.** `docs/how-to/cut-a-release.md`
   §7 "After" gets: in `uc_starter`, run `make uc-upgrade VERSION=<new>`, get
   its template CI green, tag it `v<new>`. A UC release is not done until the
