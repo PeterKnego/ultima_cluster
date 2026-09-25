@@ -33,11 +33,27 @@ struct Args {
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
+    // The template every service binary should copy: a signal flag, a poll
+    // loop that supervises the apply agent, and an explicit stop. A service
+    // killed by SIGTERM's default disposition never calls `Service::stop`, so
+    // it leaves the node's shared memory attached until the OS tears it down.
+    // Register the flag FIRST — before any wait — so a SIGTERM that arrives
+    // while the node is still booting also ends in a clean exit, not a kill.
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    for sig in [signal_hook::consts::SIGTERM, signal_hook::consts::SIGINT] {
+        signal_hook::flag::register(sig, std::sync::Arc::clone(&stop))?;
+    }
+    let stopping = || stop.load(std::sync::atomic::Ordering::Relaxed);
+
     // The node creates the control page on startup; tolerate being launched
     // first.
     let cnc = args.instance_dir.join("cnc2.dat");
     let deadline = Instant::now() + Duration::from_secs(args.wait_secs);
     while !cnc.exists() {
+        if stopping() {
+            println!("counter-service: signalled before attach, exiting");
+            return Ok(());
+        }
         anyhow::ensure!(
             Instant::now() < deadline,
             "no node at {} after {}s (is counter-node running?)",
@@ -50,9 +66,16 @@ fn main() -> anyhow::Result<()> {
     // The control page exists before the node has published its service
     // table, and `start` refuses that window by name (`NodeBooting`) rather
     // than attaching to a half-initialised node. Retry it within the same
-    // deadline; any other refusal is final.
+    // deadline; any other refusal is final. Each `start` waits only briefly
+    // (its own `boot_wait` defaults to 10 s), so this loop — which owns the
+    // deadline — also notices a stop request promptly.
     let service = loop {
-        let cfg = ServiceConfig::new(args.instance_dir.clone(), args.app_id.clone());
+        if stopping() {
+            println!("counter-service: signalled before attach, exiting");
+            return Ok(());
+        }
+        let cfg = ServiceConfig::new(args.instance_dir.clone(), args.app_id.clone())
+            .with_boot_wait(Duration::from_millis(200));
         match ServiceBuilder::new(cfg, CounterSm::default()).start() {
             Ok(service) => break service,
             Err(ServiceError::NodeBooting) => {
@@ -73,16 +96,7 @@ fn main() -> anyhow::Result<()> {
         args.instance_dir.display()
     );
 
-    // The template every service binary should copy: a signal flag, a poll
-    // loop that supervises the apply agent, and an explicit stop. A service
-    // killed by SIGTERM's default disposition never calls `Service::stop`, so
-    // it leaves the node's shared memory attached until the OS tears it down.
-    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    for sig in [signal_hook::consts::SIGTERM, signal_hook::consts::SIGINT] {
-        signal_hook::flag::register(sig, std::sync::Arc::clone(&stop))?;
-    }
-
-    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+    while !stopping() {
         // A fail-stopped apply thread must not look like a healthy service.
         // `is_alive` is false once the apply agent's work closure has panicked
         // (instance mismatch, log rewind) — exit non-zero so the supervisor

@@ -39,6 +39,50 @@ fn spawn(cmd: &mut Command) -> Reaped {
     )
 }
 
+/// SIGTERM that arrives before the service has attached — while it is still
+/// waiting for its node — must also end in a clean exit 0. The handler has to
+/// be registered before any wait, or the default disposition kills the
+/// process (exit by signal 15). No node is started, so the service is
+/// deterministically in its wait loop when the signal lands. On a slow runner
+/// this is also what `service_template_stops_cleanly_on_sigterm` hits when the
+/// node has not joined within its one-second head start.
+#[test]
+fn service_stops_cleanly_on_sigterm_before_attach() {
+    let dir = tempfile::Builder::new()
+        .prefix("counter-lifecycle-early-")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("tempdir");
+    let inst = dir.path().join("n1");
+    std::fs::create_dir_all(&inst).unwrap();
+
+    let mut svc = spawn(
+        Command::new(env!("CARGO_BIN_EXE_counter-service"))
+            .arg("--instance-dir")
+            .arg(&inst)
+            .arg("--wait-secs")
+            .arg("30"),
+    );
+    std::thread::sleep(Duration::from_millis(300));
+
+    unsafe { libc::kill(svc.0.id() as i32, libc::SIGTERM) };
+    // Bounded: a service that ignores the flag would sit out its 30 s wait.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(s) = svc.0.try_wait().expect("try_wait") {
+            break s;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "service did not exit within 5 s of SIGTERM while waiting for its node"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(
+        status.success(),
+        "SIGTERM before attach must exit 0, got {status:?}"
+    );
+}
+
 #[test]
 fn service_template_stops_cleanly_on_sigterm() {
     let dir = tempfile::Builder::new()
