@@ -379,12 +379,14 @@ const READ_BARRIER_TIMEOUT_NS: u64 = 1_000_000_000;
 /// human-paced upgrade step that reads the record.
 pub const SNAP_REPORT_TIMEOUT_NS: u64 = 5_000_000_000;
 
-/// Plan B3 final review F3: how many consensus passes the attach gate
-/// (`Consensus::maybe_publish_declared`) may stay shut before the node says
-/// which clause is holding it. See [`Consensus::note_declared_withheld`] for
-/// why this is counted in passes and for the ~0.9 s arithmetic behind the
-/// number.
-const DECLARED_WITHHELD_WARN_PASSES: u32 = 3_000_000;
+/// Plan B3 final review F3: how long (monotonic ns, the pass's own clock) the
+/// attach gate (`Consensus::maybe_publish_declared`) may stay shut before the
+/// node says which clause is holding it. Two seconds is well inside a
+/// service's default `boot_wait` (10 s), so the reason is logged BEFORE an
+/// attaching service gives up with `NodeBooting`. It was a pass count (3 M,
+/// ~0.9 s on an idle dev box) until a CPU-starved CI runner held a node for
+/// the whole 10 s without ever reaching it (nightly 2026-09-25).
+const DECLARED_WITHHELD_WARN_NS: u64 = 2_000_000_000;
 /// Output-progress persist floor (Task 12 / spec §7): rate-limits the durable
 /// `StableValue::store` (an fsync) to at most once per 100 ms even under a
 /// change every cycle. The cheap in-page `output_completed` compare still runs
@@ -2255,7 +2257,7 @@ impl Node {
             test_now_ns: None,
             services: cfg.services,
             declared_published: false,
-            declared_withheld_passes: 0,
+            declared_withheld_since_ns: None,
             declared_withheld_warned: false,
             snap_stats: Arc::clone(&route_drops),
             last_snap_refusals: (0, 0, 0, 0, 0),
@@ -3195,13 +3197,12 @@ struct Consensus {
     /// branch on a field that is already hot, not an atomic load (M14a: code
     /// in a hot loop's body costs even on paths that never run).
     declared_published: bool,
-    /// Plan B3 final review F3: passes taken with that gate still SHUT, and
-    /// whether the one `services_declared_withheld` warning has been emitted.
-    /// Both are dead the moment the gate opens (they are only touched from
-    /// [`Self::note_declared_withheld`], reached only while
-    /// `!declared_published`). Saturating is not needed: the counter stops at
-    /// the threshold, which is six orders of magnitude below `u32::MAX`.
-    declared_withheld_passes: u32,
+    /// Plan B3 final review F3: the `pass_mono_ns` of the first pass that
+    /// found that gate SHUT, and whether the one `services_declared_withheld`
+    /// warning has been emitted. Both are dead the moment the gate opens
+    /// (they are only touched from [`Self::note_declared_withheld`], reached
+    /// only while `!declared_published`).
+    declared_withheld_since_ns: Option<u64>,
     declared_withheld_warned: bool,
     /// M14c (spec §14.3): the receiver's stats — the SAME `Arc` the follower
     /// receiver bumps and `Node::snapshot_session_refusals` reads. Sampled once
@@ -5520,30 +5521,28 @@ impl Consensus {
     /// on success, so a held node was diagnosed by the ABSENCE of
     /// `services_declared_published` while the attaching side reported
     /// `NodeBooting` without naming a cause. One edge-triggered `Warn`, once
-    /// per incarnation, naming the clause that is false and the two numbers
-    /// it turns on.
+    /// per incarnation, naming the clause that is false, the two numbers it
+    /// turns on, and how long the gate has been held.
     ///
     /// Edge, not rate: a node held for good would otherwise emit forever, and
-    /// the second line would say nothing the first did not. The counter stops
-    /// climbing the moment the gate opens (this is only reached from
+    /// the second line would say nothing the first did not. The steady path
+    /// is untouched: this is only reached from
     /// [`Self::maybe_publish_declared`], itself behind
-    /// `!self.declared_published`), so the steady path is untouched — one
-    /// `u32` increment on the pre-attach passes only.
+    /// `!self.declared_published`.
     ///
-    /// [`DECLARED_WITHHELD_WARN_PASSES`] is in PASSES, not nanoseconds,
-    /// because the consensus agent's duty cycle is the only clock this seam
-    /// has cheaply to hand. An idle leader's pass measured ~311 ns mean on a
-    /// dev box (2026-09-07 harness smoke, the same reading `NS_BUCKETS`'s
-    /// floor is set from), so 3 000 000 passes is ~0.9 s there. It is a
-    /// threshold for a human-readable warning, not a timeout: a slower or
-    /// loaded box stretches it, which costs nothing because the record is
-    /// edge-triggered and the gate is not.
+    /// Timed on `pass_mono_ns` — the monotonic reading `do_work` already
+    /// takes once per pass — so a starved or loaded box delays the warning by
+    /// at most one pass instead of stretching it past a service's
+    /// `boot_wait`, which a pass count did. A threshold for a human-readable
+    /// warning, not a timeout: the gate itself is untouched.
     fn note_declared_withheld(&mut self, clause: &'static str) {
         if self.declared_withheld_warned {
             return;
         }
-        self.declared_withheld_passes += 1;
-        if self.declared_withheld_passes < DECLARED_WITHHELD_WARN_PASSES {
+        let now = self.pass_mono_ns;
+        let since = *self.declared_withheld_since_ns.get_or_insert(now);
+        let held_ns = now.saturating_sub(since);
+        if held_ns < DECLARED_WITHHELD_WARN_NS {
             return;
         }
         self.declared_withheld_warned = true;
@@ -5555,7 +5554,8 @@ impl Consensus {
             node = self.id as u64,
             clause = clause,
             commit = commit,
-            cluster_position = consumed
+            cluster_position = consumed,
+            held_ms = held_ns / 1_000_000
         );
     }
 
@@ -12078,7 +12078,7 @@ mod tests {
             fsm_lag_eff: crate::services::fsm_lag_eff(&services, 1 << 16, 4096),
             services,
             declared_published: false,
-            declared_withheld_passes: 0,
+            declared_withheld_since_ns: None,
             declared_withheld_warned: false,
             snap_stats: Arc::new(uc_net::receiver::FollowerStats::default()),
             last_snap_refusals: (0, 0, 0, 0, 0),
@@ -13359,15 +13359,15 @@ mod tests {
     /// Final review F3: a node the gate holds used to say NOTHING — it logs
     /// only on success, so "my service will not start" was diagnosed by the
     /// absence of `services_declared_published` while the attaching side
-    /// reported `NodeBooting` without naming a cause. After
-    /// [`DECLARED_WITHHELD_WARN_PASSES`] passes with the gate shut the node
-    /// names the clause that is false and the two numbers it turns on —
-    /// ONCE per incarnation, because a node held for good would otherwise
-    /// emit the same line forever.
+    /// reported `NodeBooting` without naming a cause. Once the gate has been
+    /// shut for [`DECLARED_WITHHELD_WARN_NS`] of the pass clock the node
+    /// names the clause that is false, the two numbers it turns on and how
+    /// long it has held — ONCE per incarnation, because a node held for good
+    /// would otherwise emit the same line forever.
     ///
-    /// Driven by calling the gate directly rather than through `do_work`:
-    /// the counter counts gate passes, `do_work` only reaches the gate while
-    /// it is shut, and three million duty cycles is not a unit test.
+    /// Driven by calling the gate directly with `pass_mono_ns` set by hand
+    /// (the value `do_work` would have read), so the threshold is exact and
+    /// no wall time passes.
     #[test]
     fn a_gate_that_stays_shut_names_the_clause_holding_it_exactly_once() {
         let _obs = obs_capture_lock();
@@ -13380,9 +13380,11 @@ mod tests {
         let cap = ObsCapture::take();
         let buf = cap.buf();
 
-        for _ in 0..DECLARED_WITHHELD_WARN_PASSES - 1 {
-            h.cons.maybe_publish_declared();
-        }
+        let t0 = 5_000_000_000u64;
+        h.cons.pass_mono_ns = t0; // the first shut pass starts the clock
+        h.cons.maybe_publish_declared();
+        h.cons.pass_mono_ns = t0 + DECLARED_WITHHELD_WARN_NS - 1;
+        h.cons.maybe_publish_declared();
         let text = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
         assert!(
             !text.contains("services_declared_withheld"),
@@ -13390,7 +13392,9 @@ mod tests {
         );
 
         // The threshold pass, and one after it.
+        h.cons.pass_mono_ns = t0 + DECLARED_WITHHELD_WARN_NS;
         h.cons.maybe_publish_declared();
+        h.cons.pass_mono_ns = t0 + 3 * DECLARED_WITHHELD_WARN_NS;
         h.cons.maybe_publish_declared();
         let text = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
         assert_eq!(
@@ -13407,6 +13411,10 @@ mod tests {
             text.contains(r#""commit":0"#) && text.contains(r#""cluster_position":0"#),
             "…with the two numbers the clause turns on: {text}"
         );
+        assert!(
+            text.contains(r#""held_ms":2000"#),
+            "…and how long the gate had been held when it spoke: {text}"
+        );
         assert_eq!(
             h.cons.cnc.services_declared(),
             0,
@@ -13415,7 +13423,7 @@ mod tests {
     }
 
     /// The other half: a gate that opens on its first pass never warns. The
-    /// counter only advances while the gate is shut, and `do_work` stops
+    /// hold clock only starts while the gate is shut, and `do_work` stops
     /// reaching it once the set is published — so the steady state of a
     /// healthy node is silence, not a line per boot.
     #[test]
@@ -13448,8 +13456,8 @@ mod tests {
             "a gate that never shut must not warn: {text}"
         );
         assert_eq!(
-            h.cons.declared_withheld_passes, 0,
-            "the counter never advanced"
+            h.cons.declared_withheld_since_ns, None,
+            "the hold clock never started"
         );
     }
 

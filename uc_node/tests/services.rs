@@ -254,9 +254,36 @@ impl StateMachine for CountSm {
 }
 
 pub fn start_service<S: StateMachine + Default>(dir: &Path) -> uc_service::Service<S> {
-    ServiceBuilder::new(ServiceConfig::new(dir, APP), S::default())
-        .start()
-        .expect("service start")
+    match ServiceBuilder::new(ServiceConfig::new(dir, APP), S::default()).start() {
+        Ok(service) => service,
+        // `NodeBooting` means the node never published its declared set
+        // (`Consensus::maybe_publish_declared` held: leader unknown, commit
+        // unlearned, or the cluster walk behind commit). Print what the page
+        // can show about the first two before failing — a rare CI hit
+        // (nightly 2026-09-25) left nothing to diagnose it by. The node's own
+        // `services_declared_withheld` warning, logged after 2 s, names the
+        // clause.
+        Err(e) => {
+            let page = match CncPage::open_file(&dir.join("cnc2.dat"), APP) {
+                Ok(cnc) => {
+                    let (st, c) = (cnc.status(), cnc.counters());
+                    format!(
+                        "leader_hint={} term={} flags={:#x} commit={} durable={} append={} \
+                         services_declared={:#x}",
+                        st.leader_hint.load_acquire(),
+                        st.term.load_acquire(),
+                        st.flags.load_acquire(),
+                        c.commit.load_acquire(),
+                        c.durable.load_acquire(),
+                        c.append.load_acquire(),
+                        cnc.services_declared(),
+                    )
+                }
+                Err(open) => format!("cnc unreadable: {open}"),
+            };
+            panic!("service start at {}: {e:?} [{page}]", dir.display());
+        }
+    }
 }
 
 #[test]
