@@ -200,3 +200,175 @@ fn status_prints_fsm_lag_n_a_for_a_harness_page_with_nothing_declared() {
 
     node.stop();
 }
+
+/// #35: after a `SIGKILL` the cnc page is frozen exactly as the node last
+/// wrote it — `leader=true can_serve=true` included — and `status` used to
+/// print it verbatim, so a dead node read as the serving leader (and a script
+/// grepping for `leader=true can_serve=true` picked it). A stopped node here
+/// stands in for the killed one: `Node::stop` releases `instance.lock`, the
+/// flags are then re-frozen to the killed leader's by hand, and the
+/// heartbeat is left at whatever the node last stamped. `status` must still
+/// succeed (reading a stopped node's leftover page is a documented step of
+/// the flag-day upgrade) but must say the node is not running and report the
+/// role it EFFECTIVELY has — none — with the page's stale flags alongside.
+#[test]
+fn status_reports_a_stopped_node_as_not_running_and_not_serving() {
+    let root = tempfile::Builder::new()
+        .prefix("uc2ctl-dead-")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("tempdir");
+    let sock = UdpSocket::bind("127.0.0.1:0").expect("bind");
+    let addr = sock.local_addr().unwrap();
+    let dir = root.path().join("n0");
+    let node = Node::start_with_socket(
+        make_config(dir.clone(), addr, ServicesConfig::none_for_tests()),
+        sock,
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !node.can_serve() {
+        assert!(
+            Instant::now() < deadline,
+            "node never became leader/serving"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let status = |dir: &PathBuf| {
+        let out = Command::new(bin())
+            .args([
+                "status",
+                "--instance-dir",
+                dir.to_str().unwrap(),
+                "--app-id",
+                APP,
+            ])
+            .output()
+            .expect("spawn uc2ctl");
+        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+        assert_eq!(out.status.code(), Some(0), "status must succeed: {stdout}");
+        stdout
+    };
+
+    // Live: the lock is held and the heartbeat is fresh.
+    let live = status(&dir);
+    assert!(live.contains("node: running=true heartbeat_age="), "{live}");
+    assert!(live.contains("role: leader=true can_serve=true"), "{live}");
+    assert!(!live.contains("page_flags="), "{live}");
+
+    node.stop();
+    let cnc = CncPage::open_file(&dir.join("cnc2.dat"), APP).expect("open cnc");
+    cnc.status().flags.store_release(
+        uc_protocol::v2::cnc::NODE_FLAG_LEADER | uc_protocol::v2::cnc::NODE_FLAG_CAN_SERVE,
+    );
+
+    let dead = status(&dir);
+    assert!(dead.contains("node: running=false"), "{dead}");
+    assert!(dead.contains("NOT RUNNING"), "{dead}");
+    assert!(
+        dead.contains("role: leader=false can_serve=false"),
+        "{dead}"
+    );
+    assert!(dead.contains("page_flags=leader+can_serve"), "{dead}");
+    // The trap the ticket names: nothing a script greps for may match.
+    assert!(!dead.contains("leader=true"), "{dead}");
+    assert!(!dead.contains("can_serve=true"), "{dead}");
+    // The forensic read still works: every other section is still printed.
+    assert!(dead.contains("log: commit="), "{dead}");
+    assert!(dead.contains("members:"), "{dead}");
+}
+
+/// Env var that turns [`node_process_for_the_sigkill_test`] from an ignored
+/// no-op into a real node process (the instance dir to run it on).
+const SIGKILL_CHILD_DIR: &str = "UC2CTL_TEST_SIGKILL_NODE_DIR";
+
+/// Not a test: the child half of
+/// [`status_reports_a_sigkilled_leader_as_not_running`]. Re-executed by that
+/// test as a separate process so the node can be `SIGKILL`ed without taking
+/// the test harness with it. Runs a one-voter node until killed.
+#[test]
+#[ignore = "child process of status_reports_a_sigkilled_leader_as_not_running"]
+fn node_process_for_the_sigkill_test() {
+    let Some(dir) = std::env::var_os(SIGKILL_CHILD_DIR) else {
+        return;
+    };
+    let sock = UdpSocket::bind("127.0.0.1:0").expect("bind");
+    let addr = sock.local_addr().unwrap();
+    let _node = Node::start_with_socket(
+        make_config(PathBuf::from(dir), addr, ServicesConfig::none_for_tests()),
+        sock,
+    )
+    .unwrap();
+    loop {
+        std::thread::sleep(Duration::from_secs(1));
+    }
+}
+
+/// #35, end to end: a real node PROCESS serving as leader is `SIGKILL`ed, and
+/// `status` reads the page it left — nothing rewritten by hand. The killed
+/// node's page still says `0x03` and its heartbeat is still under 3 s old, so
+/// only the lock probe can tell; `status` must report it not running.
+#[test]
+fn status_reports_a_sigkilled_leader_as_not_running() {
+    let root = tempfile::Builder::new()
+        .prefix("uc2ctl-kill9-")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("tempdir");
+    let dir = root.path().join("n0");
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "node_process_for_the_sigkill_test",
+            "--exact",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env(SIGKILL_CHILD_DIR, &dir)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn node child");
+
+    let both = uc_protocol::v2::cnc::NODE_FLAG_LEADER | uc_protocol::v2::cnc::NODE_FLAG_CAN_SERVE;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let serving = CncPage::open_file(&dir.join("cnc2.dat"), APP)
+            .map(|c| c.status().flags.load_acquire() == both)
+            .unwrap_or(false);
+        if serving {
+            break;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("child node never became leader/serving");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    child.kill().expect("SIGKILL the node"); // `Child::kill` is SIGKILL on Unix
+    child.wait().expect("reap the node");
+
+    let out = Command::new(bin())
+        .args([
+            "status",
+            "--instance-dir",
+            dir.to_str().unwrap(),
+            "--app-id",
+            APP,
+        ])
+        .output()
+        .expect("spawn uc2ctl");
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    assert_eq!(out.status.code(), Some(0), "status must succeed: {stdout}");
+    // The page really is the frozen leader's: the flags survive the kill.
+    let cnc = CncPage::open_file(&dir.join("cnc2.dat"), APP).expect("open cnc");
+    assert_eq!(cnc.status().flags.load_acquire(), both, "{stdout}");
+
+    assert!(stdout.contains("node: running=false"), "{stdout}");
+    assert!(stdout.contains("NOT RUNNING"), "{stdout}");
+    assert!(
+        stdout.contains("role: leader=false can_serve=false"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("page_flags=leader+can_serve"), "{stdout}");
+    assert!(!stdout.contains("leader=true"), "{stdout}");
+    assert!(!stdout.contains("can_serve=true"), "{stdout}");
+}

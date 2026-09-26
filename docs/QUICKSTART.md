@@ -176,6 +176,7 @@ bin/uc2ctl status --instance-dir ~/uc2-quickstart/n0 --app-id quickstart
 ```
 
 ```text
+node: running=true heartbeat_age=0.004s
 config: version=0 pending=false
 role: leader=true can_serve=true term=1 leader_hint=0
 log: commit=224 durable=224 append=224
