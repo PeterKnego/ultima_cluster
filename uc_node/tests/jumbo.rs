@@ -215,6 +215,30 @@ fn await_rung(nodes: &[Node], want: u32, secs: u64) {
     }
 }
 
+/// Wait until every node's LIVE ceiling (the cnc word a client's door reads)
+/// is `want`. Not implied by [`await_rung`]: the rung is the cluster agent's
+/// view, published when the Settings record commits, and the ceiling word is
+/// written by the CONSENSUS agent on its next pass after it sees that view
+/// (`node.rs`, "door and cnc word first"). On a starved runner that pass can
+/// lag — nightly 2026-09-26 caught a node at rung 8832 still reading 1344.
+fn await_ceiling(nodes: &[Node], want: usize, secs: u64) {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    loop {
+        if nodes.iter().all(|n| n.payload_ceiling() == want) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "ceilings {:?}, wanted {want} everywhere",
+            nodes
+                .iter()
+                .map(|n| n.payload_ceiling())
+                .collect::<Vec<_>>()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 fn stop_all(nodes: Vec<Node>) {
     for n in nodes {
         n.stop();
@@ -237,9 +261,8 @@ fn discovery_lands_on_the_capped_rung_on_every_node() {
     );
     await_single_leader(&nodes, 10);
     await_rung(&nodes, 8832, 20);
-    for n in &nodes {
-        assert_eq!(n.payload_ceiling(), 8768, "crypto-off ceiling at 8832");
-    }
+    // crypto-off ceiling at 8832
+    await_ceiling(&nodes, 8768, 10);
     stop_all(nodes);
 }
 
@@ -251,13 +274,8 @@ fn an_uncapped_loopback_cluster_reaches_the_top_rung() {
     let (_fleet, nodes) = spawn_cluster(3, FaultConfig::default());
     await_single_leader(&nodes, 10);
     await_rung(&nodes, 8960, 20);
-    for n in &nodes {
-        assert_eq!(
-            n.payload_ceiling(),
-            MAX_PAYLOAD,
-            "min(bound 8864, ceiling(8960, off) = 8896)"
-        );
-    }
+    // min(bound 8864, ceiling(8960, off) = 8896)
+    await_ceiling(&nodes, MAX_PAYLOAD, 10);
     stop_all(nodes);
 }
 
@@ -323,6 +341,8 @@ fn a_client_attached_before_the_raise_sees_it() {
     );
 
     await_rung(&nodes, 8960, 20);
+    // The client's door is the leader's live ceiling word, not the rung.
+    await_ceiling(&nodes[leader..=leader], MAX_PAYLOAD, 10);
 
     let after: Result<u64, ClientError> = client.submit(&big);
     let total = after.expect("4000 B under a discovered ceiling of 8864");
