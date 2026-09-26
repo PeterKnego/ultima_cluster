@@ -200,3 +200,79 @@ fn status_prints_fsm_lag_n_a_for_a_harness_page_with_nothing_declared() {
 
     node.stop();
 }
+
+/// #35: after a `SIGKILL` the cnc page is frozen exactly as the node last
+/// wrote it — `leader=true can_serve=true` included — and `status` used to
+/// print it verbatim, so a dead node read as the serving leader (and a script
+/// grepping for `leader=true can_serve=true` picked it). A stopped node here
+/// stands in for the killed one: `Node::stop` releases `instance.lock`, the
+/// flags are then re-frozen to the killed leader's by hand, and the
+/// heartbeat is left at whatever the node last stamped. `status` must still
+/// succeed (reading a stopped node's leftover page is a documented step of
+/// the flag-day upgrade) but must say the node is not running and report the
+/// role it EFFECTIVELY has — none — with the page's stale flags alongside.
+#[test]
+fn status_reports_a_stopped_node_as_not_running_and_not_serving() {
+    let root = tempfile::Builder::new()
+        .prefix("uc2ctl-dead-")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("tempdir");
+    let sock = UdpSocket::bind("127.0.0.1:0").expect("bind");
+    let addr = sock.local_addr().unwrap();
+    let dir = root.path().join("n0");
+    let node = Node::start_with_socket(
+        make_config(dir.clone(), addr, ServicesConfig::none_for_tests()),
+        sock,
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !node.can_serve() {
+        assert!(
+            Instant::now() < deadline,
+            "node never became leader/serving"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let status = |dir: &PathBuf| {
+        let out = Command::new(bin())
+            .args([
+                "status",
+                "--instance-dir",
+                dir.to_str().unwrap(),
+                "--app-id",
+                APP,
+            ])
+            .output()
+            .expect("spawn uc2ctl");
+        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+        assert_eq!(out.status.code(), Some(0), "status must succeed: {stdout}");
+        stdout
+    };
+
+    // Live: the lock is held and the heartbeat is fresh.
+    let live = status(&dir);
+    assert!(live.contains("node: running=true heartbeat_age="), "{live}");
+    assert!(live.contains("role: leader=true can_serve=true"), "{live}");
+    assert!(!live.contains("page_flags="), "{live}");
+
+    node.stop();
+    let cnc = CncPage::open_file(&dir.join("cnc2.dat"), APP).expect("open cnc");
+    cnc.status().flags.store_release(
+        uc_protocol::v2::cnc::NODE_FLAG_LEADER | uc_protocol::v2::cnc::NODE_FLAG_CAN_SERVE,
+    );
+
+    let dead = status(&dir);
+    assert!(dead.contains("node: running=false"), "{dead}");
+    assert!(dead.contains("NOT RUNNING"), "{dead}");
+    assert!(
+        dead.contains("role: leader=false can_serve=false"),
+        "{dead}"
+    );
+    assert!(dead.contains("page_flags=leader+can_serve"), "{dead}");
+    // The trap the ticket names: nothing a script greps for may match.
+    assert!(!dead.contains("leader=true"), "{dead}");
+    assert!(!dead.contains("can_serve=true"), "{dead}");
+    // The forensic read still works: every other section is still printed.
+    assert!(dead.contains("log: commit="), "{dead}");
+    assert!(dead.contains("members:"), "{dead}");
+}

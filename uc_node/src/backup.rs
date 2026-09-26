@@ -101,7 +101,6 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use fs2::FileExt;
 use uc_journal::{StableValue, StableValueConfig};
 use uc_log::archive::{Archive, ArchiveConfig};
 use uc_log::state::{ConfigRecord, TermMap, VoteRecord};
@@ -301,19 +300,12 @@ pub enum BackupError {
 /// No `instance.lock` at all is the ordinary shipped-artifact case and is
 /// not probed further.
 fn refuse_if_live_instance_dir(path: &Path) -> Result<(), BackupError> {
-    let lock_path = path.join("instance.lock");
-    if !lock_path.is_file() {
-        return Ok(());
+    match crate::ipc::probe_instance_lock(path)? {
+        crate::ipc::InstanceLock::Held => {
+            Err(BackupError::LooksLikeLiveInstanceDir(path.to_path_buf()))
+        }
+        crate::ipc::InstanceLock::Free | crate::ipc::InstanceLock::Absent => Ok(()),
     }
-    let f = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&lock_path)?;
-    if f.try_lock_exclusive().is_err() {
-        return Err(BackupError::LooksLikeLiveInstanceDir(path.to_path_buf()));
-    }
-    let _ = f.unlock();
-    Ok(())
 }
 
 fn journal_dir(root: &Path) -> PathBuf {

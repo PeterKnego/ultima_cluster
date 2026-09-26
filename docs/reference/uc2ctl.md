@@ -540,6 +540,11 @@ Prints the node's current config version and pending state, per-member
 peer-slot observability, the per-declared-FSM service table (M14), and the
 leader/serving flags. Read-only: it writes no admin request.
 
+It works on a stopped node too — the page outlives the process, and reading a
+stopped node's `log:` line is a step of the flag-day upgrade — so it exits `0`
+either way. The first line, `node:`, says which case you are reading; a node
+that is not running is never reported as a leader or as serving.
+
 - `--admission-bytes <U64>` — override for the staleness warning's admission
   window. Since wire protocol 0.3.0 the node publishes its configured value on
   the cnc page; this flag is needed only against pre-0.3.0 nodes, whose page
@@ -551,8 +556,10 @@ Output fields:
 |---|---|
 | `config` | the adopted config version, whether a change is pending, and — since the schedule table (2.11.0) — `schedule_position=<n>`, the frame-end position of the committed schedule table, read from this node's newest **cluster artifact** (`snapshots/cluster/`) since the cluster FSM. `none` = no artifact yet, or an artifact holding no table; `?` = the artifact could not be read — a read error, not "no table", and it degrades to `?` rather than aborting so one unreadable file never takes the role/log/service lines down with it. It is the same number `uc2_schedule_table_position` exports and must be identical on every node once caught up |
 | `ceiling` | jumbo frames (`2.12.0`): the live command payload ceiling in bytes, from the cnc word at offset 3984, plus the datagram rung it came from and whether that rung is `baseline` (1408) or `discovered`. The rung is read from this node's newest **cluster artifact**; with the default snapshot cadence (`0`) there may be none yet, so a ceiling the baseline rung cannot produce prints as `rung >1408, discovered — inferred from the ceiling`, saying plainly that the rung was inferred rather than read. A trailing `— capped by this node's own max_payload, not by the rung` means the binding half is this host's buffer bound, not the cluster's rung. `uc2_commands_over_standard_total` is deliberately **not** here: it is an in-process counter, not a cnc word, and lives in `/metrics` alone |
-| `leader` | `NODE_FLAG_LEADER` is set |
-| `can_serve` | `NODE_FLAG_CAN_SERVE` is set |
+| `node` | printed first: whether a node is behind this page right now. `running=` is a non-blocking probe of `instance.lock` — `true` if a process holds it, `false` if the file is free or absent (the OS drops the flock on any exit, `SIGKILL` included), `?` if the probe itself failed (the reason follows in parentheses). `heartbeat_age=` is the age of the node's own heartbeat (cnc 896), `never` if unstamped. A node that is not running gets a trailing `-- NOT RUNNING`; one that holds its lock but has not stamped for 3 s (the `/readyz` bar) gets `-- STALE`. Either way the role below is reported as none. Since #35; before it, a killed node's frozen page read as whatever role it last held |
+| `leader` | `NODE_FLAG_LEADER` is set **and** the `node` line says the node is live; always `false` for a node that is not running or is stale, whatever its page says |
+| `can_serve` | `NODE_FLAG_CAN_SERVE` is set, under the same liveness condition as `leader` |
+| `page_flags` | only when the node is not live: the role flags its page still holds (`leader+can_serve`, `leader`, `can_serve` or `none`), for forensics. Deliberately not spelled `leader=`/`can_serve=`, so a script that greps for the live role cannot match the stale one |
 | `term` | current term |
 | `leader_hint` | the id this node believes leads; `unknown` when the raw value is `u64::MAX` |
 | `log: commit / durable / append` | the three log counters, in bytes |

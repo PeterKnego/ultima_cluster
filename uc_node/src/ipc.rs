@@ -118,9 +118,61 @@ impl InstanceDir {
     }
 }
 
+/// What [`probe_instance_lock`] found at `<root>/instance.lock`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstanceLock {
+    /// A process holds the flock: a node owns this dir right now.
+    Held,
+    /// The file exists but nothing holds it — a stopped (or killed) node's
+    /// leftover; shutdown never deletes it, and the OS drops the flock on
+    /// any exit, `SIGKILL` included.
+    Free,
+    /// No `instance.lock` at all: no node has ever booted here (or this is a
+    /// backup artifact, which never carries one).
+    Absent,
+}
+
+/// Probe whether a node currently owns `root`, without holding the lock
+/// beyond the probe itself: a non-blocking exclusive try-lock — the same
+/// primitive [`InstanceDir::acquire`] uses to enforce one node per dir —
+/// released again at once. Unlike a heartbeat this cannot be fooled by a
+/// frozen page: the OS releases the flock the instant the node's process
+/// dies. It is a same-host answer only, which is all an instance directory
+/// ever is.
+///
+/// Opened read-only: `flock` does not care about the open mode, and a reader
+/// that may not write the lock file can still ask.
+pub fn probe_instance_lock(root: &Path) -> std::io::Result<InstanceLock> {
+    let lock = match std::fs::File::open(root.join("instance.lock")) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(InstanceLock::Absent),
+        Err(e) => return Err(e),
+    };
+    if FileExt::try_lock_exclusive(&lock).is_err() {
+        return Ok(InstanceLock::Held);
+    }
+    let _ = FileExt::unlock(&lock);
+    Ok(InstanceLock::Free)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn probe_instance_lock_tells_held_from_free_from_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            probe_instance_lock(dir.path()).unwrap(),
+            InstanceLock::Absent
+        );
+        let held = InstanceDir::acquire(dir.path()).unwrap();
+        assert_eq!(probe_instance_lock(dir.path()).unwrap(), InstanceLock::Held);
+        drop(held);
+        assert_eq!(probe_instance_lock(dir.path()).unwrap(), InstanceLock::Free);
+        // The probe released what it took: the dir is still acquirable.
+        let _again = InstanceDir::acquire(dir.path()).unwrap();
+    }
 
     #[test]
     fn acquire_holds_exclusive_lock_and_refuses_second() {

@@ -904,9 +904,127 @@ fn open(common: &CommonArgs) -> anyhow::Result<std::sync::Arc<CncPage>> {
         .map_err(|e| anyhow::anyhow!("open cnc: {e:?}"))
 }
 
+/// How stale the node's own heartbeat may get before `status` stops
+/// believing the page's role flags. The same 3 s bar `/readyz` and
+/// `/healthz` apply (`uc_node::obs::http`'s private `HEARTBEAT_STALE_NS`, pinned
+/// equal to [`uc_node::services::SERVICE_STALE_NS`]), so `status` and the
+/// probes never disagree about a wedged node.
+const NODE_HEARTBEAT_STALE_NS: u64 = uc_node::services::SERVICE_STALE_NS;
+
+fn wall_now_ns() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+}
+
+/// `status`'s verdict on whether a node is behind this page right now (#35).
+/// The instance lock is the authority on "is a process there" — the OS drops
+/// it on any exit, `SIGKILL` included — and the heartbeat is the authority on
+/// "is that process still running its passes" (a `SIGSTOP`ped or wedged node
+/// keeps its lock).
+#[derive(Debug, PartialEq, Eq)]
+struct NodeLiveness {
+    /// `Some(true)` held, `Some(false)` free or absent, `None` = the probe
+    /// itself failed (the reason is in `probe_error`).
+    lock_held: Option<bool>,
+    probe_error: Option<String>,
+    /// Nanoseconds since the node last stamped its heartbeat; `None` = never
+    /// stamped this page generation.
+    heartbeat_age_ns: Option<u64>,
+}
+
+fn node_liveness(
+    lock: std::io::Result<uc_node::ipc::InstanceLock>,
+    heartbeat_ns: u64,
+    now_ns: u64,
+) -> NodeLiveness {
+    use uc_node::ipc::InstanceLock;
+    let (lock_held, probe_error) = match lock {
+        Ok(InstanceLock::Held) => (Some(true), None),
+        Ok(InstanceLock::Free | InstanceLock::Absent) => (Some(false), None),
+        Err(e) => (None, Some(e.to_string())),
+    };
+    NodeLiveness {
+        lock_held,
+        probe_error,
+        heartbeat_age_ns: (heartbeat_ns != 0).then(|| now_ns.saturating_sub(heartbeat_ns)),
+    }
+}
+
+impl NodeLiveness {
+    fn heartbeat_fresh(&self) -> bool {
+        self.heartbeat_age_ns
+            .is_some_and(|age| age < NODE_HEARTBEAT_STALE_NS)
+    }
+
+    /// Believe the page's role flags only when a process holds the lock (or
+    /// the probe could not say — then the heartbeat decides alone) AND it is
+    /// still stamping its heartbeat.
+    fn is_live(&self) -> bool {
+        self.lock_held != Some(false) && self.heartbeat_fresh()
+    }
+
+    fn line(&self) -> String {
+        let age = match self.heartbeat_age_ns {
+            None => "never".to_string(),
+            Some(ns) => format!("{:.3}s", ns as f64 / 1e9),
+        };
+        let running = match self.lock_held {
+            Some(true) => "true",
+            Some(false) => "false",
+            None => "?",
+        };
+        let mut line = format!("node: running={running} heartbeat_age={age}");
+        if let Some(e) = &self.probe_error {
+            line.push_str(&format!(" (could not probe instance.lock: {e})"));
+        }
+        if self.lock_held == Some(false) {
+            line.push_str(
+                " -- NOT RUNNING: no process holds instance.lock; every value below is what \
+                 the node last wrote before it stopped, and the role is reported as none",
+            );
+        } else if !self.heartbeat_fresh() {
+            line.push_str(&format!(
+                " -- STALE: the node has not stamped its heartbeat for {:.0}s or more (hung, \
+                 stopped by a signal, or not yet through its first pass); the role is reported \
+                 as none",
+                NODE_HEARTBEAT_STALE_NS as f64 / 1e9
+            ));
+        }
+        line
+    }
+}
+
+/// The page's raw role flags, for a node whose role `status` does not
+/// believe. Deliberately not `leader=…`/`can_serve=…`: nothing that greps the
+/// live role may match the stale one.
+fn page_flags_desc(flags: u64) -> &'static str {
+    match (
+        flags & NODE_FLAG_LEADER != 0,
+        flags & NODE_FLAG_CAN_SERVE != 0,
+    ) {
+        (true, true) => "leader+can_serve",
+        (true, false) => "leader",
+        (false, true) => "can_serve",
+        (false, false) => "none",
+    }
+}
+
 fn run_status(a: &StatusArgs) -> anyhow::Result<()> {
     let cnc = open(&a.common)?;
-    let flags = cnc.status().flags.load_acquire();
+    let page_flags = cnc.status().flags.load_acquire();
+    // #35: the page outlives the process, frozen at whatever the node last
+    // wrote — a `SIGKILL`ed leader's page says `leader=true can_serve=true`
+    // forever. So liveness comes first, and the role printed is the one the
+    // node EFFECTIVELY has; the page's own flags are shown beside it, named
+    // so no `leader=`/`can_serve=` grep can mistake them for a live role.
+    let liveness = node_liveness(
+        uc_node::ipc::probe_instance_lock(&a.common.instance_dir),
+        cnc.status().node_heartbeat_ns.load_acquire(),
+        wall_now_ns(),
+    );
+    let flags = if liveness.is_live() { page_flags } else { 0 };
     let leader = (flags & NODE_FLAG_LEADER) != 0;
     let can_serve = (flags & NODE_FLAG_CAN_SERVE) != 0;
     let term = cnc.status().term.load_acquire();
@@ -940,17 +1058,23 @@ fn run_status(a: &StatusArgs) -> anyhow::Result<()> {
             Ok((position, _)) => position.to_string(),
             Err(_) => "?".to_string(),
         };
+    println!("{}", liveness.line());
     println!(
         "config: version={} pending={} schedule_position={schedule_position}",
         cnc.config_version(),
         cnc.config_pending() != 0
     );
     println!(
-        "role: leader={leader} can_serve={can_serve} term={term} leader_hint={}",
+        "role: leader={leader} can_serve={can_serve} term={term} leader_hint={}{}",
         if leader_hint == u64::MAX {
             "unknown".to_string()
         } else {
             leader_hint.to_string()
+        },
+        if liveness.is_live() {
+            String::new()
+        } else {
+            format!(" page_flags={}", page_flags_desc(page_flags))
         }
     );
     println!("log: commit={commit} durable={durable} append={append}");
@@ -1001,10 +1125,7 @@ fn run_status(a: &StatusArgs) -> anyhow::Result<()> {
                 .map(|(_, s)| s.datagram_mtu),
         )
     );
-    let now_ns = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
+    let now_ns = wall_now_ns();
     for id in ids {
         let s = cnc.service_slot(id as usize);
         let (_, attached, incarnation) = unpack_service_status(s.status.load_acquire());
@@ -1457,6 +1578,68 @@ mod tests {
     // cannot make sense of must come back `None` (so the caller falls back
     // to printing the raw line with a `?` marker) rather than a silently
     // truncated value.
+
+    /// #35: the lock says whether a process is there, the heartbeat whether
+    /// it is still running its passes; only both together make the page's
+    /// role believable. A failed probe falls back to the heartbeat alone.
+    #[test]
+    fn node_liveness_needs_the_lock_and_a_fresh_heartbeat() {
+        use uc_node::ipc::InstanceLock;
+        let now = 100 * NODE_HEARTBEAT_STALE_NS;
+        let fresh = now - 1_000_000;
+        let stale = now - NODE_HEARTBEAT_STALE_NS;
+
+        let live = node_liveness(Ok(InstanceLock::Held), fresh, now);
+        assert!(live.is_live());
+        assert_eq!(live.line(), "node: running=true heartbeat_age=0.001s");
+
+        let hung = node_liveness(Ok(InstanceLock::Held), stale, now);
+        assert!(!hung.is_live(), "a wedged node keeps its lock");
+        assert!(
+            hung.line()
+                .starts_with("node: running=true heartbeat_age=3.000s -- STALE")
+        );
+
+        // A killed node's heartbeat can still read fresh for up to 3 s: the
+        // lock alone must be enough to disbelieve it.
+        for lock in [InstanceLock::Free, InstanceLock::Absent] {
+            let dead = node_liveness(Ok(lock), fresh, now);
+            assert!(!dead.is_live(), "{lock:?}");
+            assert!(dead.line().contains("running=false"), "{lock:?}");
+            assert!(dead.line().contains("NOT RUNNING"), "{lock:?}");
+        }
+
+        let never = node_liveness(Ok(InstanceLock::Held), 0, now);
+        assert!(!never.is_live());
+        assert!(
+            never
+                .line()
+                .starts_with("node: running=true heartbeat_age=never -- STALE")
+        );
+
+        let err = || Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        let unknown_fresh = node_liveness(err(), fresh, now);
+        assert!(unknown_fresh.is_live(), "the heartbeat decides alone");
+        assert!(
+            unknown_fresh
+                .line()
+                .starts_with("node: running=? heartbeat_age=0.001s (could not probe")
+        );
+        assert!(!node_liveness(err(), stale, now).is_live());
+    }
+
+    #[test]
+    fn page_flags_desc_never_reads_as_a_live_role() {
+        for f in 0..4u64 {
+            let d = page_flags_desc(f);
+            assert!(!d.contains('='), "{d}");
+        }
+        assert_eq!(
+            page_flags_desc(NODE_FLAG_LEADER | NODE_FLAG_CAN_SERVE),
+            "leader+can_serve"
+        );
+        assert_eq!(page_flags_desc(0), "none");
+    }
 
     /// Jumbo spec §9: `status`'s ceiling line reports the LIVE ceiling and
     /// says whether its rung was discovered or is still the baseline. No

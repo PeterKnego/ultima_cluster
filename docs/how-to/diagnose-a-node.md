@@ -48,6 +48,16 @@ own clock. They are separate processes and fail separately: a frozen service
 heartbeat with a live node heartbeat means the apply loop is wedged, not the
 cluster.
 
+`uc2ctl status` answers the node half on its first line, `node: running=…
+heartbeat_age=…`, and adds what the page alone cannot: whether any process
+still holds `instance.lock`. That matters because **the page outlives the
+node** — a `SIGKILL`ed leader's page reads `flags = 0x03` indefinitely, and for up to 3 s
+its heartbeat still looks fresh. When the lock is free, `status` prints
+`-- NOT RUNNING`, reports `leader=false can_serve=false`, and shows the frozen
+flags only as `page_flags=`. If you read offset 768 by hand, probe the lock
+yourself first (`flock -n D/instance.lock true` succeeds only when no node
+holds it).
+
 ## Which FSM is holding the cluster up?
 
 Since M14 a node runs one FSM per declared id, and the slowest one paces
