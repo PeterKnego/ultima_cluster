@@ -1007,8 +1007,14 @@ multi-process SIGKILL crashtest (`testing/uc_crashtest`).
   offset-assertion tests, and must never drift. Add fields in the reserved band.
 - **Snapshot `freeze`/`install_snapshot` are keyed on `position`.** `install_snapshot`
   takes the target position and rejects a mis-tagged artifact.
-- **One node per instance directory** — an exclusive flock prevents accidental
-  coexistence; service and clients take a shared lock as a liveness probe.
+- **One node per instance directory** — the node holds `instance.lock`
+  exclusively for its life, and **nothing else may ever hold it**: a service
+  locks only `service.<row>.lock`, and clients lock nothing. That makes the
+  lock a liveness signal the OS keeps honest (released on any exit, `SIGKILL`
+  included): `uc_node::ipc::probe_instance_lock` try-locks and releases it at
+  once, which is how `uc2ctl status` and backup tell a dead node's frozen cnc
+  page from a live one (#35). A second holder — even a shared lock — would
+  make a dead node read as running.
 - **`app_id` + `instance_id` + `protocol_version` checked at every IPC entry.**
   Wrong `app_id` = wrong cluster; changed `instance_id` = node restart since last
   attach; protocol mismatch = refuse.
