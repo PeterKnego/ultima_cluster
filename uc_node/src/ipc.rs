@@ -38,6 +38,19 @@ pub struct InstanceDir {
     _lock: std::fs::File,
 }
 
+/// How long [`InstanceDir::acquire`] keeps retrying a CONTENDED instance
+/// lock before calling it `AlreadyRunning`: long enough to outlast any
+/// [`probe_instance_lock`] (a try-lock and an unlock), short enough that a
+/// second node on a live dir still refuses at once to a human.
+const ACQUIRE_PROBE_GRACE: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// `fs2`'s "somebody else holds it" error, as opposed to a lock the
+/// filesystem could not take at all (`ENOLCK`, NFS's `EBADF` on a read-only
+/// fd) — the two mean different things to both callers.
+fn is_contended(e: &std::io::Error) -> bool {
+    e.raw_os_error() == fs2::lock_contended_error().raw_os_error()
+}
+
 impl InstanceDir {
     /// Create/open the dir, take `instance.lock` EXCLUSIVELY (fs2
     /// `try_lock_exclusive` → [`IpcError::AlreadyRunning`] on contention), and
@@ -52,9 +65,24 @@ impl InstanceDir {
             .create(true)
             .truncate(false)
             .open(&lock_path)?;
-        // Non-blocking: a contended lock means a live node already owns the dir.
-        FileExt::try_lock_exclusive(&lock)
-            .map_err(|_| IpcError::AlreadyRunning(root.to_path_buf()))?;
+        // Non-blocking: a contended lock means a live node already owns the dir
+        // — unless it stays free again within `ACQUIRE_PROBE_GRACE`. A
+        // [`probe_instance_lock`] (`uc2ctl status`, `backup`) holds the same
+        // exclusive lock for microseconds, and `status` is polled at boot (the
+        // compose healthcheck, the flag-day script), so a single try would let
+        // a probe make a booting node refuse to start as `AlreadyRunning`
+        // (#35 review). A real node holds the lock for its whole life, so the
+        // grace only delays that refusal, never hides it.
+        let deadline = std::time::Instant::now() + ACQUIRE_PROBE_GRACE;
+        loop {
+            match FileExt::try_lock_exclusive(&lock) {
+                Ok(()) => break,
+                Err(e) if is_contended(&e) && std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                Err(_) => return Err(IpcError::AlreadyRunning(root.to_path_buf())),
+            }
+        }
         std::fs::create_dir_all(root.join("journal"))?;
         std::fs::create_dir_all(root.join("state"))?;
         Ok(InstanceDir {
@@ -140,19 +168,35 @@ pub enum InstanceLock {
 /// dies. It is a same-host answer only, which is all an instance directory
 /// ever is.
 ///
-/// Opened read-only: `flock` does not care about the open mode, and a reader
-/// that may not write the lock file can still ask.
+/// Opened read-only: `flock` does not care about the open mode on a local
+/// filesystem, and a reader that may not write the lock file can still ask.
+///
+/// Sound only while the node is the ONE process that ever locks
+/// `instance.lock`: a service, client or gateway taking even a shared lock on
+/// it would read as `Held` after the node died. They lock
+/// `service.<row>.lock` instead — keep it that way.
+///
+/// The probe briefly holds the exclusive lock itself;
+/// [`InstanceDir::acquire`] retries a contended lock for
+/// `ACQUIRE_PROBE_GRACE` so a probe can never make a booting node refuse.
 pub fn probe_instance_lock(root: &Path) -> std::io::Result<InstanceLock> {
     let lock = match std::fs::File::open(root.join("instance.lock")) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(InstanceLock::Absent),
         Err(e) => return Err(e),
     };
-    if FileExt::try_lock_exclusive(&lock).is_err() {
-        return Ok(InstanceLock::Held);
+    match FileExt::try_lock_exclusive(&lock) {
+        Ok(()) => {
+            // Dropping `lock` would release it too; unlocking first just
+            // makes the hold as short as it can be.
+            let _ = FileExt::unlock(&lock);
+            Ok(InstanceLock::Free)
+        }
+        Err(e) if is_contended(&e) => Ok(InstanceLock::Held),
+        // The filesystem could not answer (no flock support, NFS's EBADF on a
+        // read-only fd): say so rather than guess either way.
+        Err(e) => Err(e),
     }
-    let _ = FileExt::unlock(&lock);
-    Ok(InstanceLock::Free)
 }
 
 #[cfg(test)]
@@ -172,6 +216,24 @@ mod tests {
         assert_eq!(probe_instance_lock(dir.path()).unwrap(), InstanceLock::Free);
         // The probe released what it took: the dir is still acquirable.
         let _again = InstanceDir::acquire(dir.path()).unwrap();
+    }
+
+    /// #35 review: a probe's momentary hold must not make a booting node
+    /// refuse. Stand in for a probe that holds the lock for 20 ms (far longer
+    /// than a real one) while the node acquires.
+    #[test]
+    fn acquire_outlasts_a_momentary_probe_hold() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("instance.lock"), b"").unwrap();
+        let probe = std::fs::File::open(dir.path().join("instance.lock")).unwrap();
+        FileExt::try_lock_exclusive(&probe).unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            drop(probe);
+        });
+        let held = InstanceDir::acquire(dir.path());
+        release.join().unwrap();
+        assert!(held.is_ok(), "{:?}", held.err());
     }
 
     #[test]

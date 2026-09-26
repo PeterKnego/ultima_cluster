@@ -911,78 +911,108 @@ fn open(common: &CommonArgs) -> anyhow::Result<std::sync::Arc<CncPage>> {
 /// probes never disagree about a wedged node.
 const NODE_HEARTBEAT_STALE_NS: u64 = uc_node::services::SERVICE_STALE_NS;
 
-fn wall_now_ns() -> u64 {
+/// Wall-clock nanoseconds since the Unix epoch, or `None` when this host's
+/// clock reads before the epoch — a heartbeat age measured against that would
+/// be meaningless, so the liveness verdict must not treat it as fresh.
+fn wall_now_ns() -> Option<u64> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
+        .ok()
         .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0)
 }
 
 /// `status`'s verdict on whether a node is behind this page right now (#35).
 /// The instance lock is the authority on "is a process there" — the OS drops
 /// it on any exit, `SIGKILL` included — and the heartbeat is the authority on
 /// "is that process still running its passes" (a `SIGSTOP`ped or wedged node
-/// keeps its lock).
+/// keeps its lock). Fails CLOSED: the page's role is believed only when both
+/// were actually proven, so no degraded read can re-open #35.
 #[derive(Debug, PartialEq, Eq)]
 struct NodeLiveness {
-    /// `Some(true)` held, `Some(false)` free or absent, `None` = the probe
-    /// itself failed (the reason is in `probe_error`).
-    lock_held: Option<bool>,
-    probe_error: Option<String>,
-    /// Nanoseconds since the node last stamped its heartbeat; `None` = never
-    /// stamped this page generation.
-    heartbeat_age_ns: Option<u64>,
+    lock: LockProbe,
+    heartbeat: HeartbeatAge,
+}
+
+/// What the `instance.lock` probe said, folded to what `status` needs.
+#[derive(Debug, PartialEq, Eq)]
+enum LockProbe {
+    /// A process holds the lock.
+    Held,
+    /// Free or absent: no node is running on this dir.
+    NotRunning,
+    /// The probe itself failed, so nothing is proven: the role is not believed.
+    Unknown(String),
+}
+
+/// The node's heartbeat, as `status` can judge it.
+#[derive(Debug, PartialEq, Eq)]
+enum HeartbeatAge {
+    /// Never stamped this page generation (the word is `0`).
+    Never,
+    /// This host's own clock could not be read, so no age can be computed.
+    Unknown,
+    /// Nanoseconds since the node last stamped it.
+    Ns(u64),
 }
 
 fn node_liveness(
     lock: std::io::Result<uc_node::ipc::InstanceLock>,
     heartbeat_ns: u64,
-    now_ns: u64,
+    now_ns: Option<u64>,
 ) -> NodeLiveness {
     use uc_node::ipc::InstanceLock;
-    let (lock_held, probe_error) = match lock {
-        Ok(InstanceLock::Held) => (Some(true), None),
-        Ok(InstanceLock::Free | InstanceLock::Absent) => (Some(false), None),
-        Err(e) => (None, Some(e.to_string())),
-    };
     NodeLiveness {
-        lock_held,
-        probe_error,
-        heartbeat_age_ns: (heartbeat_ns != 0).then(|| now_ns.saturating_sub(heartbeat_ns)),
+        lock: match lock {
+            Ok(InstanceLock::Held) => LockProbe::Held,
+            Ok(InstanceLock::Free | InstanceLock::Absent) => LockProbe::NotRunning,
+            Err(e) => LockProbe::Unknown(e.to_string()),
+        },
+        heartbeat: match (heartbeat_ns, now_ns) {
+            (0, _) => HeartbeatAge::Never,
+            (_, None) => HeartbeatAge::Unknown,
+            (hb, Some(now)) => HeartbeatAge::Ns(now.saturating_sub(hb)),
+        },
     }
 }
 
 impl NodeLiveness {
     fn heartbeat_fresh(&self) -> bool {
-        self.heartbeat_age_ns
-            .is_some_and(|age| age < NODE_HEARTBEAT_STALE_NS)
+        matches!(self.heartbeat, HeartbeatAge::Ns(age) if age < NODE_HEARTBEAT_STALE_NS)
     }
 
-    /// Believe the page's role flags only when a process holds the lock (or
-    /// the probe could not say — then the heartbeat decides alone) AND it is
-    /// still stamping its heartbeat.
+    /// Believe the page's role flags only when a process is proven to hold the
+    /// lock AND it is proven to be still stamping its heartbeat.
     fn is_live(&self) -> bool {
-        self.lock_held != Some(false) && self.heartbeat_fresh()
+        self.lock == LockProbe::Held && self.heartbeat_fresh()
     }
 
     fn line(&self) -> String {
-        let age = match self.heartbeat_age_ns {
-            None => "never".to_string(),
-            Some(ns) => format!("{:.3}s", ns as f64 / 1e9),
+        let age = match self.heartbeat {
+            HeartbeatAge::Never => "never".to_string(),
+            HeartbeatAge::Unknown => "?".to_string(),
+            HeartbeatAge::Ns(ns) => format!("{:.3}s", ns as f64 / 1e9),
         };
-        let running = match self.lock_held {
-            Some(true) => "true",
-            Some(false) => "false",
-            None => "?",
+        let running = match self.lock {
+            LockProbe::Held => "true",
+            LockProbe::NotRunning => "false",
+            LockProbe::Unknown(_) => "?",
         };
         let mut line = format!("node: running={running} heartbeat_age={age}");
-        if let Some(e) = &self.probe_error {
+        if let LockProbe::Unknown(e) = &self.lock {
             line.push_str(&format!(" (could not probe instance.lock: {e})"));
         }
-        if self.lock_held == Some(false) {
+        if self.heartbeat == HeartbeatAge::Unknown {
+            line.push_str(" (this host's clock reads before the Unix epoch)");
+        }
+        if self.lock == LockProbe::NotRunning {
             line.push_str(
                 " -- NOT RUNNING: no process holds instance.lock; every value below is what \
                  the node last wrote before it stopped, and the role is reported as none",
+            );
+        } else if let LockProbe::Unknown(_) = self.lock {
+            line.push_str(
+                " -- UNVERIFIED: whether a node is running could not be checked; the role is \
+                 reported as none",
             );
         } else if !self.heartbeat_fresh() {
             line.push_str(&format!(
@@ -1125,7 +1155,8 @@ fn run_status(a: &StatusArgs) -> anyhow::Result<()> {
                 .map(|(_, s)| s.datagram_mtu),
         )
     );
-    let now_ns = wall_now_ns();
+    // A pre-epoch clock keeps the old reading (ages measured from 0).
+    let now_ns = wall_now_ns().unwrap_or(0);
     for id in ids {
         let s = cnc.service_slot(id as usize);
         let (_, attached, incarnation) = unpack_service_status(s.status.load_acquire());
@@ -1589,11 +1620,11 @@ mod tests {
         let fresh = now - 1_000_000;
         let stale = now - NODE_HEARTBEAT_STALE_NS;
 
-        let live = node_liveness(Ok(InstanceLock::Held), fresh, now);
+        let live = node_liveness(Ok(InstanceLock::Held), fresh, Some(now));
         assert!(live.is_live());
         assert_eq!(live.line(), "node: running=true heartbeat_age=0.001s");
 
-        let hung = node_liveness(Ok(InstanceLock::Held), stale, now);
+        let hung = node_liveness(Ok(InstanceLock::Held), stale, Some(now));
         assert!(!hung.is_live(), "a wedged node keeps its lock");
         assert!(
             hung.line()
@@ -1603,13 +1634,13 @@ mod tests {
         // A killed node's heartbeat can still read fresh for up to 3 s: the
         // lock alone must be enough to disbelieve it.
         for lock in [InstanceLock::Free, InstanceLock::Absent] {
-            let dead = node_liveness(Ok(lock), fresh, now);
+            let dead = node_liveness(Ok(lock), fresh, Some(now));
             assert!(!dead.is_live(), "{lock:?}");
             assert!(dead.line().contains("running=false"), "{lock:?}");
             assert!(dead.line().contains("NOT RUNNING"), "{lock:?}");
         }
 
-        let never = node_liveness(Ok(InstanceLock::Held), 0, now);
+        let never = node_liveness(Ok(InstanceLock::Held), 0, Some(now));
         assert!(!never.is_live());
         assert!(
             never
@@ -1617,15 +1648,28 @@ mod tests {
                 .starts_with("node: running=true heartbeat_age=never -- STALE")
         );
 
+        // Fails closed: a probe that could not answer proves nothing, even
+        // with a fresh heartbeat — that heartbeat may be a dead node's last.
         let err = || Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
-        let unknown_fresh = node_liveness(err(), fresh, now);
-        assert!(unknown_fresh.is_live(), "the heartbeat decides alone");
+        let unknown = node_liveness(err(), fresh, Some(now));
+        assert!(!unknown.is_live());
         assert!(
-            unknown_fresh
+            unknown
                 .line()
                 .starts_with("node: running=? heartbeat_age=0.001s (could not probe")
         );
-        assert!(!node_liveness(err(), stale, now).is_live());
+        assert!(unknown.line().contains("-- UNVERIFIED"));
+
+        // Fails closed on this host's clock too: an unreadable clock must not
+        // make every heartbeat look fresh.
+        let no_clock = node_liveness(Ok(InstanceLock::Held), fresh, None);
+        assert!(!no_clock.is_live());
+        assert!(
+            no_clock
+                .line()
+                .starts_with("node: running=true heartbeat_age=? (this host's clock")
+        );
+        assert!(no_clock.line().contains("-- STALE"));
     }
 
     #[test]
@@ -1634,6 +1678,8 @@ mod tests {
             let d = page_flags_desc(f);
             assert!(!d.contains('='), "{d}");
         }
+        assert_eq!(page_flags_desc(NODE_FLAG_LEADER), "leader");
+        assert_eq!(page_flags_desc(NODE_FLAG_CAN_SERVE), "can_serve");
         assert_eq!(
             page_flags_desc(NODE_FLAG_LEADER | NODE_FLAG_CAN_SERVE),
             "leader+can_serve"

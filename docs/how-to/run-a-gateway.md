@@ -255,13 +255,16 @@ socket closes) or the node restarts (the faulted path above). That is why
 ### The stronger fix, not implemented
 
 The edge could probe the node's liveness directly rather than trusting the
-frozen page: `uc_service` already takes a **shared flock on the instance
-directory** as a liveness probe against the node's exclusive lock, and an
-edge doing the same could refuse writes the instant the node's lock became
+frozen page: the node holds `instance.lock` exclusively for its whole life,
+and the OS releases it on any exit, `SIGKILL` included. `uc2ctl status` has
+probed exactly that since #35 (`uc_node::ipc::probe_instance_lock`), and an
+edge doing the same could refuse writes the instant the lock became
 acquirable — no supervisor in the loop, and no residual window at all. That
-is a follow-up, deliberately not in M12a: it adds a per-instance-dir probe to
-the edge's periodic work and needs its own test for the case where the lock
-is momentarily free during a clean restart.
+is a follow-up, not yet implemented: it adds a per-instance-dir probe to the
+edge's periodic work and needs its own test for the case where the lock is
+momentarily free during a clean restart. The probe must stay a momentary
+try-lock: nothing but the node may HOLD `instance.lock` (a service locks
+`service.<row>.lock`), or a dead node would read as alive.
 
 ## When an edge is full
 

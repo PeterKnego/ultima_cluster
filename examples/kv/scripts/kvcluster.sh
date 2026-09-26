@@ -101,8 +101,9 @@ ctl() { local n="$1"; shift; "$UC2_BIN_DIR/uc2ctl" "$@" --instance-dir "$ROOT/n$
 leader() {
     # A SIGKILLed node leaves its control page frozen with the leader and
     # CAN_SERVE bits still set (run-a-gateway.md, "When the node underneath
-    # dies"), and `uc2ctl status` reads that page verbatim — so check the
-    # process is alive before believing the page.
+    # dies"). Since #35 `uc2ctl status` probes instance.lock and reports such
+    # a node as `leader=false can_serve=false`; the process check below is
+    # kept as a cheap first filter.
     local i out
     for i in 0 1 2; do
         alive node "$i" || continue
