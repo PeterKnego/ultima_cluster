@@ -855,11 +855,14 @@ pub unsafe fn try_read_record_at(
 //   bits 18-30  LAP       (record_start_pos / capacity) & 0x1FFF
 //   bits 0-17   LENGTH    total record bytes (claim word: the claimed advance)
 //
-// The lap is what makes the consumer's read of a stale slot unambiguous
-// WITHOUT the consumer ever writing into the ring: the bounded claim means a
-// producer only overwrites a slot the consumer has already consumed, so the
-// only stale value the consumer can meet is an OLDER lap's committed word,
-// which fails lap equality. 13 bits is unambiguous because the consumer can
+// The lap tells this lap's words from an older lap's COMMIT WORDS. It cannot
+// tell them from an older lap's DATA: records vary in length, so a boundary
+// on this lap can fall inside a previous lap's payload, and payload bytes
+// can spell any lap (issue #32 — a KV `PUT "wgl:1:0"` payload begins
+// `01 01 07 00`, which reads as lap 1, length 196865). The consumer
+// therefore zeroes every range it passes before releasing it
+// (`MpscConsumer::zero_consumed`), so a stale word is always `0`. With that,
+// the lap is defence in depth; 13 bits suffices because the consumer can
 // never be 8192 laps behind a claim — the bound is one lap.
 
 /// Bit 31: the slot is claimed by a producer that has not committed yet.

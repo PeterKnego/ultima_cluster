@@ -42,13 +42,13 @@
 //! A producer that only STALLED (not died) past `hole_timeout` can resume
 //! after its hole was skipped. The consumer marks a skip with a
 //! `compare_exchange` from the exact claim word it observed to the skip
-//! marker `CLAIMED | LAP | 0` — the one write the otherwise read-only
-//! consumer ever makes into the slot region — instead of trusting its own
-//! bookkeeping; if the producer committed in the window between the
+//! marker `CLAIMED | LAP | 0` — the consumer's one CONDITIONAL write into
+//! the slot region — instead of trusting its own bookkeeping; if the producer committed in the window between the
 //! consumer's timeout check and that CAS, the CAS fails harmlessly and the
 //! record is delivered normally, `holes_skipped` uncounted. If the marker
 //! lands first, the resumed producer's own commit CAS (expecting its claim
-//! word, not the marker) fails immediately and it gets
+//! word, not the marker — nor the zeroes that replace the marker once the
+//! consumer releases the range, see below) fails immediately and it gets
 //! [`RingError::Skipped`] — no lap required. The marker also closes the
 //! window a bare "later claimant re-stamped the slot" check would leave
 //! open across a lap; loss is signalled either way a resurrection can be
@@ -76,8 +76,26 @@
 //! Padding never bumps the commit count and never signals, on either outcome.
 //!
 //! The consumer reads with Relaxed loads on its own `consumer_position`
-//! (single reader) and, other than the one skip-marker CAS above, never
-//! writes into the slot region at all.
+//! (single reader).
+//!
+//! ## The consumer zeroes what it passes (issue #32)
+//!
+//! Every range the consumer moves past — a delivered record, padding, a
+//! skipped hole — is zeroed before the Release store of `consumer_position`
+//! hands it back to producers, so every byte behind the consumer is zero.
+//! The lap tag alone is not enough: records vary in length, so a boundary on
+//! this lap can land inside a previous lap's payload, and a caught-up
+//! consumer loads the word there before any producer has stamped it
+//! (`claim_position` moves first). Payload bytes can spell any lap; zeroes
+//! read as `Empty`. See `MpscConsumer::zero_consumed`.
+//!
+//! One residual survives, and it is the resurrection residual above in a
+//! new place: a producer that resumes mid-body-write after its hole was
+//! skipped writes into a range the consumer already zeroed, which can leave
+//! non-zero bytes behind the consumer again. It needs a stall past
+//! `hole_timeout` in the middle of a `memcpy`, and it surfaces as a
+//! `Corrupt`/`BadCrc` fail-stop on a later lap — silent only through a
+//! crc32 collision.
 
 use std::cell::Cell;
 use std::path::Path;
@@ -730,8 +748,9 @@ impl MpscConsumer {
                     // after this. So skipping is not an unconditional store:
                     // it's a `compare_exchange` from the EXACT word we just
                     // observed to the skip marker `CLAIMED | LAP | 0` (spec
-                    // §4.1 amendment — the one write the otherwise
-                    // read-only consumer ever makes into the slot region).
+                    // §4.1 amendment — the consumer's one CONDITIONAL
+                    // write into the slot region; `zero_consumed` then
+                    // clears the range like any other it passes).
                     // If the producer committed in the window between our
                     // timeout check and this CAS, the word has already
                     // changed underneath us and the CAS fails harmlessly:
@@ -800,6 +819,10 @@ impl MpscConsumer {
                         continue;
                     }
                     self.holes_skipped += 1;
+                    // SAFETY: `[slot_offset, slot_offset + advance)` is inside
+                    // the slot region (`advance <= bytes_to_tail`, checked
+                    // above) and the marker CAS just made it ours to release.
+                    unsafe { self.zero_consumed(slot_offset, advance as usize) };
                     // Re-derive the header reference rather than reusing the
                     // outer `header` binding: `hole_elapsed` above takes
                     // `&mut self`, which the outer binding (borrowed from
@@ -861,18 +884,60 @@ impl MpscConsumer {
                     let claims_padding = u16::from_le_bytes([slot[4], slot[5]]) == PADDING_MSG_TYPE;
                     if claims_padding && len == bytes_to_tail {
                         let (_pad, advance) = decode_record_slice(slot, payload_buf)?;
+                        // SAFETY: `advance == len <= bytes_to_tail`; the
+                        // decode above is the last read of `slot`.
+                        unsafe { self.zero_consumed(slot_offset, advance) };
                         header
                             .consumer_position
                             .store(consumer_pos + advance as u64, Ordering::Release);
                         continue;
                     }
                     let (rec, advance) = decode_record_slice_no_padding(slot, payload_buf)?;
+                    // SAFETY: `advance` is `len` rounded up to RECORD_ALIGN,
+                    // and `bytes_to_tail` is a multiple of RECORD_ALIGN at
+                    // least `len`, so the range stays inside the slot region;
+                    // the decode above copied the payload out and is the last
+                    // read of `slot`.
+                    unsafe { self.zero_consumed(slot_offset, advance) };
                     header
                         .consumer_position
                         .store(consumer_pos + advance as u64, Ordering::Release);
                     return Ok(Some(rec));
                 }
             }
+        }
+    }
+
+    /// Zero a range the consumer is about to pass, BEFORE the Release store of
+    /// `consumer_position` that hands it back to the producers (issue #32).
+    ///
+    /// Without this, the bytes behind the consumer are whatever the last lap
+    /// left there, and a record boundary on this lap can fall in the middle
+    /// of a previous lap's PAYLOAD. A consumer that catches up with the
+    /// frontier loads the word at its position before any producer has
+    /// stamped it (`claim_position` moves first, the stamp lands after), and
+    /// payload bytes are arbitrary: they can carry the current lap in bits
+    /// 18-30 and read as `Committed` or `Claimed`. The lap tag rules out
+    /// only an older lap's COMMIT WORD, never an older lap's data. Zeroing
+    /// makes the invariant structural — every byte behind `consumer_position`
+    /// is zero — so a word the consumer meets is either `0` (`Empty`) or one
+    /// a producer of this lap wrote. Aeron's `ManyToOneRingBuffer` zeroes its
+    /// consumed range for the same reason.
+    ///
+    /// The commit word is cleared with an atomic store (producers CAS it);
+    /// the body with plain writes, as producers fill it.
+    ///
+    /// # Safety
+    ///
+    /// `[slot_offset, slot_offset + len)` is inside the slot region, `len >=
+    /// 4`, `slot_offset` is RECORD_ALIGN-aligned, and no reference into the
+    /// range is live.
+    #[inline(always)]
+    unsafe fn zero_consumed(&self, slot_offset: usize, len: usize) {
+        let region = self.inner.slot_region_mut();
+        unsafe {
+            std::ptr::write_bytes(region.add(slot_offset + 4), 0, len - 4);
+            store_commit_word(region, slot_offset, 0, Ordering::Relaxed);
         }
     }
 
@@ -1068,6 +1133,53 @@ mod tests {
         assert_eq!(&buf[..], b"world");
     }
 
+    /// Issue #32: a slot boundary on lap N can sit in the middle of a record's
+    /// PAYLOAD from lap N-1, and payload bytes are arbitrary — they can spell a
+    /// word whose lap field equals the consumer's current lap. A consumer that
+    /// has caught up with the frontier must still read "nothing here yet", not
+    /// decode the leftover payload as a committed record. (Production shape: a
+    /// KV `PUT "wgl:1:0"` payload starts `01 01 07 00`, which reads as lap 1,
+    /// length 196865.)
+    #[test]
+    fn a_stale_payload_word_from_the_previous_lap_is_not_a_record() {
+        let tmp = NamedTempFile::new().unwrap();
+        let ring = MpscRing::create(tmp.path(), 1024, 1024).expect("create");
+        let (producer, mut consumer) = ring.into_split();
+        let mut buf = Vec::new();
+
+        // Lap 0, record A at offset 0 (120 B). Its payload starts at offset
+        // 16, so payload[8..12] lands on offset 24 — RECORD_ALIGN-aligned,
+        // i.e. a place a lap-1 record can start. Put a lap-1 commit word there.
+        let mut a = vec![0u8; 100];
+        a[8..12].copy_from_slice(&encode_commit_word(1, 500, false).to_le_bytes());
+        producer.try_write(1, 0, [0; 8], &a).expect("write A");
+        // Fill the rest of lap 0 exactly: 1024 - 120 = 904 = 16 + 884 + 4.
+        producer
+            .try_write(1, 0, [0; 8], &[0u8; 884])
+            .expect("write filler");
+        consumer.try_read(&mut buf).expect("read A").expect("A");
+        consumer
+            .try_read(&mut buf)
+            .expect("read filler")
+            .expect("filler");
+
+        // Lap 1: one 24-byte record at offset 0, consumed. The consumer now
+        // sits at lap 1 offset 24 with claim_position == consumer_position.
+        producer
+            .try_write(2, 0, [0; 8], &[7u8; 4])
+            .expect("write B");
+        consumer.try_read(&mut buf).expect("read B").expect("B");
+
+        assert!(
+            matches!(consumer.try_read(&mut buf), Ok(None)),
+            "a caught-up consumer must see an empty ring, not lap 0's payload"
+        );
+        // And the ring keeps working: the next real record is delivered.
+        producer.try_write(3, 0, [3; 8], b"next").expect("write C");
+        let rec = consumer.try_read(&mut buf).expect("read C").expect("C");
+        assert_eq!((rec.msg_type, &buf[..]), (3, &b"next"[..]));
+    }
+
     #[test]
     fn many_producers_one_consumer_no_wrap() {
         // Stays comfortably within the first generation (no wrap).
@@ -1165,6 +1277,73 @@ mod tests {
             h.join().unwrap();
         }
         assert_eq!(received.len(), total);
+    }
+
+    /// Issue #32 under contention: variable-length records across hundreds
+    /// of laps, every payload word a committed-looking word tagged with the
+    /// NEXT lap (the worst case for a stale read), and a consumer that keeps
+    /// catching up with the frontier. The payloads of
+    /// `wrap_under_many_producers_no_torn_read` are ASCII and can never spell
+    /// a lap-matching word, which is why it never saw this.
+    #[test]
+    fn wrap_with_lap_shaped_payloads_under_many_producers() {
+        let tmp = NamedTempFile::new().unwrap();
+        const CAP: usize = 4096;
+        let ring = MpscRing::create(tmp.path(), CAP as u64, 512).expect("create");
+        let (producer, mut consumer) = ring.into_split();
+
+        const N_THREADS: usize = 4;
+        const PER_THREAD: usize = 5000;
+
+        let handles: Vec<_> = (0..N_THREADS)
+            .map(|t| {
+                let p = producer.clone();
+                thread::spawn(move || {
+                    let mut x = 0x9E37_79B9u32.wrapping_mul(t as u32 + 1);
+                    for i in 0..PER_THREAD {
+                        x ^= x << 13;
+                        x ^= x >> 17;
+                        x ^= x << 5;
+                        // 8..=208 bytes, a multiple of 4: lengths vary, so
+                        // record boundaries drift from lap to lap.
+                        let words = 2 + (x % 51) as usize;
+                        let claim = p.inner.header().claim_position.load(Ordering::Relaxed);
+                        let next_lap = lap_of(claim, CAP) + 1;
+                        let fake = encode_commit_word(next_lap, 64, false).to_le_bytes();
+                        let mut payload: Vec<u8> = fake.repeat(words);
+                        payload[..4].copy_from_slice(&(t as u16).to_le_bytes().repeat(2));
+                        payload[4..8].copy_from_slice(&(i as u32).to_le_bytes());
+                        loop {
+                            match p.try_write(1, 0, [0; 8], &payload) {
+                                Ok(()) => break,
+                                Err(RingError::Full) => thread::yield_now(),
+                                Err(e) => panic!("write: {e}"),
+                            }
+                        }
+                    }
+                })
+            })
+            .collect();
+
+        let mut next = [0u32; N_THREADS];
+        let mut received = 0;
+        while received < N_THREADS * PER_THREAD {
+            let mut buf = Vec::new();
+            match consumer.try_read(&mut buf) {
+                Ok(Some(_)) => {
+                    let t = u16::from_le_bytes([buf[0], buf[1]]) as usize;
+                    let i = u32::from_le_bytes(buf[4..8].try_into().unwrap());
+                    assert_eq!(i, next[t], "producer {t}: out of order or lost");
+                    next[t] += 1;
+                    received += 1;
+                }
+                Ok(None) => thread::yield_now(),
+                Err(e) => panic!("read after {received} records: {e}"),
+            }
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
     }
 
     /// Regression test for the free-space underflow fix (commit 8c1ae01).
