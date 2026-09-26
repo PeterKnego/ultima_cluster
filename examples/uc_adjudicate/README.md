@@ -98,6 +98,32 @@ Recorded here because they are exactly what a black-box adjudication is for.
    machinery is otherwise proven (instants commanded, 9 installs observed and
    counted, wipe-and-rejoin executed, per-key Linearizable throughout).
 
+   **Root-caused and fixed 2026-09-26 ([#32]); the account above is wrong on
+   the cause.** Neither the instant nor the jumbo rung is involved: the first
+   fail-stop of the original run came ~2 s in, before any instant, and every
+   occurrence sits on lap 1, the ingress ring's first wrap. Records vary in
+   length, so a boundary on lap 1 can fall inside lap 0's payload, and a
+   consumer that has caught up with the producers read those leftover bytes as
+   a commit word. A `PUT "wgl:1:0"` payload begins `01 01 07 00`: the `07` is
+   `key_len = 7` (not 3), and its bit 2 is the commit word's lap bit, so the
+   word reads as lap 1, length 196865. The fix makes the consumer zero every
+   range it passes (`uc_protocol::ring::mpsc`, `MpscConsumer::zero_consumed`).
+   Measured with this harness and the filler unthrottled (`FILL_WINDOW = 256`,
+   no batch pause), churn seeds 1–3, in-tree `kv-service` via `kv-v2`: `main`
+   at `8631e08` fail-stopped on 3/3 seeds, 2 nodes each; the fix, 0/3.
+
+3. **The final-state oracle misordered a Delete** (fixed 2026-09-26, found by
+   the first churn run with no fail-stop to stop it early). A Delete's reply
+   carries the version it removed, the deleted Put's own position, and the
+   oracle ordered it by that, tying it with the Put. `max_by_key` keeps the
+   last of equal maxima, so when the Delete's ack was recorded first the
+   oracle expected the deleted value and reported **ACKED-WRITE LOSS** for a
+   key the log had correctly deleted: the journal showed the acked Put and
+   then the Delete in the very next frame, on every replica. A Delete is now
+   ordered by the position it applied at (`mutation_pos`).
+
+[#32]: https://github.com/PeterKnego/ultima_cluster/issues/32
+
 ## Running it
 
 ```bash
