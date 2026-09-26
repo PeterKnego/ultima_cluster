@@ -333,11 +333,6 @@ fn filler(shared: Arc<Shared>, stop: Arc<AtomicBool>) {
     }
 }
 
-/// The values the final read of a key may legitimately observe (the
-/// `remote_lin` oracle, per key): the last FRESH acknowledged mutation by
-/// position, any REPLAYED mutation above it (a replay's `position` is only
-/// an upper bound when it is the resend's), and every indeterminate
-/// mutation (it may still commit).
 /// Where a mutation sits in the log, for the final-state oracle. A Put's or
 /// CAS's reply version IS the position it applied at. A Delete's is not: it
 /// is the version it REMOVED (the deleted write's own position), which would
@@ -350,6 +345,11 @@ fn mutation_pos(op: &KvOp, reply_version: Option<u64>, applied_at: u64) -> u64 {
     }
 }
 
+/// The values the final read of a key may legitimately observe (the
+/// `remote_lin` oracle, per key): the last FRESH acknowledged mutation by
+/// position, any REPLAYED mutation above it (a replay's `position` is only
+/// an upper bound when it is the resend's), and every indeterminate
+/// mutation (it may still commit).
 fn expected_final(muts: &[Mutation], indet: &[Option<u64>]) -> Vec<Option<u64>> {
     let mut c = Vec::new();
     let last_fresh = muts.iter().filter(|m| !m.replayed).max_by_key(|m| m.pos);

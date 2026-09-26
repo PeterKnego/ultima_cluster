@@ -82,7 +82,8 @@
 //!
 //! Every range the consumer moves past — a delivered record, padding, a
 //! skipped hole — is zeroed before the Release store of `consumer_position`
-//! hands it back to producers, so every byte behind the consumer is zero.
+//! hands it back to producers, so every byte of the unclaimed window
+//! `[claim_position, consumer_position + capacity)` is zero.
 //! The lap tag alone is not enough: records vary in length, so a boundary on
 //! this lap can land inside a previous lap's payload, and a caught-up
 //! consumer loads the word there before any producer has stamped it
@@ -90,12 +91,17 @@
 //! read as `Empty`. See `MpscConsumer::zero_consumed`.
 //!
 //! One residual survives, and it is the resurrection residual above in a
-//! new place: a producer that resumes mid-body-write after its hole was
-//! skipped writes into a range the consumer already zeroed, which can leave
-//! non-zero bytes behind the consumer again. It needs a stall past
-//! `hole_timeout` in the middle of a `memcpy`, and it surfaces as a
-//! `Corrupt`/`BadCrc` fail-stop on a later lap — silent only through a
-//! crc32 collision.
+//! new place: a producer that stalls past `hole_timeout` anywhere between
+//! its claim stamp and the end of its body write, and then resumes after its
+//! hole was skipped, writes into a range the consumer already zeroed — which
+//! puts non-zero bytes back into the unclaimed window. Those bytes are
+//! client payload, so they can spell a word of the right lap again: usually
+//! that surfaces as a `Corrupt`/`BadCrc` fail-stop or a stall of up to
+//! `hole_timeout` on a later lap, but a padding-shaped word takes the
+//! crc-free padding path, and a claim-shaped one can be skip-marked just
+//! ahead of a real producer's stamp. Neither is worse than before this fix,
+//! when the whole unclaimed window held stale bytes and the resurrection
+//! residual already had a silent case (the complete same-length stomp).
 
 use std::cell::Cell;
 use std::path::Path;
@@ -919,9 +925,10 @@ impl MpscConsumer {
     /// payload bytes are arbitrary: they can carry the current lap in bits
     /// 18-30 and read as `Committed` or `Claimed`. The lap tag rules out
     /// only an older lap's COMMIT WORD, never an older lap's data. Zeroing
-    /// makes the invariant structural — every byte behind `consumer_position`
-    /// is zero — so a word the consumer meets is either `0` (`Empty`) or one
-    /// a producer of this lap wrote. Aeron's `ManyToOneRingBuffer` zeroes its
+    /// makes the invariant structural — every byte of the unclaimed window
+    /// `[claim_position, consumer_position + capacity)` is zero — so a word
+    /// the consumer meets is either `0` (`Empty`) or one a producer of this
+    /// lap wrote. Aeron's `ManyToOneRingBuffer` zeroes its
     /// consumed range for the same reason.
     ///
     /// The commit word is cleared with an atomic store (producers CAS it);
@@ -1469,6 +1476,85 @@ mod tests {
         // Nothing else is left, and the counter does not drift.
         assert!(matches!(consumer.try_read(&mut buf), Ok(None)));
         assert_eq!(consumer.holes_skipped(), 1);
+    }
+
+    /// Issue #32's invariant, checked byte for byte: once a ring is drained
+    /// (`claim_position == consumer_position`), nothing is claimed, so every
+    /// byte of the slot region must be zero.
+    fn assert_drained_region_is_zero(consumer: &MpscConsumer) {
+        let h = consumer.inner.header();
+        assert_eq!(
+            h.claim_position.load(Ordering::Acquire),
+            h.consumer_position.load(Ordering::Acquire),
+            "the ring must be drained for this check"
+        );
+        let cap = consumer.inner.capacity();
+        // SAFETY: the slot region is `cap` mapped bytes, and nothing writes
+        // to it while the ring is drained and no producer is running.
+        let region = unsafe { std::slice::from_raw_parts(consumer.inner.slot_region(), cap) };
+        let dirty: Vec<usize> = (0..cap).filter(|&i| region[i] != 0).collect();
+        assert!(
+            dirty.is_empty(),
+            "non-zero bytes behind the consumer at {dirty:?}"
+        );
+    }
+
+    /// Issue #32, the padding call site of `zero_consumed`: a record that
+    /// straddles the tail leaves a padding marker, and the consumer must zero
+    /// it as it passes, like any record.
+    #[test]
+    fn a_consumed_padding_marker_is_zeroed() {
+        let tmp = NamedTempFile::new().unwrap();
+        let ring = MpscRing::create(tmp.path(), 1024, 1024).expect("create");
+        let (producer, mut consumer) = ring.into_split();
+        let mut buf = Vec::new();
+        // 1000 B (16 + 980 + 4) leaves a 24 B remnant; a 40 B record cannot
+        // fit it, so it pads [1000, 1024) and lands at [1024, 1064).
+        producer
+            .try_write(1, 0, [9; 8], &[0xA5; 980])
+            .expect("filler");
+        // Free the filler's room first: the straddler needs 24 + 40 bytes.
+        consumer.try_read(&mut buf).expect("read").expect("filler");
+        producer
+            .try_write(2, 0, [9; 8], &[0x5A; 20])
+            .expect("straddler");
+        assert_eq!(
+            producer
+                .inner
+                .header()
+                .claim_position
+                .load(Ordering::Acquire),
+            1064,
+            "the second write must have taken the padding path"
+        );
+        let rec = consumer
+            .try_read(&mut buf)
+            .expect("read")
+            .expect("straddler");
+        assert_eq!(rec.msg_type, 2);
+        assert_drained_region_is_zero(&consumer);
+    }
+
+    /// Issue #32, the skipped-hole call site of `zero_consumed`: a dead
+    /// producer's claimed-and-written range must be zeroed when the consumer
+    /// skips it, or its body is stale data a later lap can misread.
+    #[test]
+    fn a_skipped_hole_is_zeroed() {
+        let tmp = NamedTempFile::new().unwrap();
+        let ring = MpscRing::create(tmp.path(), 4096, 1024).expect("create");
+        let (producer, mut consumer) = ring.into_split();
+        consumer.set_hole_timeout(std::time::Duration::from_millis(0));
+        drop(
+            producer
+                .claim_without_commit(1, 0, [7; 8], &[0xA5; 100])
+                .expect("claim"),
+        );
+        producer.try_write(1, 0, [0; 8], b"kept").expect("write");
+        let mut buf = Vec::new();
+        assert!(matches!(consumer.try_read(&mut buf), Ok(None))); // starts the timer
+        consumer.try_read(&mut buf).expect("read").expect("kept");
+        assert_eq!(consumer.holes_skipped(), 1);
+        assert_drained_region_is_zero(&consumer);
     }
 
     /// A hole that resolves BEFORE the timeout is not a hole: no skip, no
