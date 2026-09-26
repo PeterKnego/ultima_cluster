@@ -64,6 +64,18 @@
 //! records do not tile it, doubling P1's already-678k state space — but the
 //! two publication paths now share one discipline, so P4/P5 speak for both.
 //!
+//! **The tiling had a blind spot, too (issue #32).** Because the model's
+//! records tile the ring exactly, a slot boundary on one lap is a slot
+//! boundary on every lap, so a consumer can only ever meet an older lap's
+//! COMMIT WORD — which the lap tag rejects. Production records vary in
+//! length: a boundary on lap N can fall inside lap N-1's payload, and a
+//! caught-up consumer loaded those payload bytes as a commit word that
+//! happened to carry lap N. The fix (the consumer zeroes every range it
+//! passes, `MpscConsumer::zero_consumed`) is not modeled here for the same
+//! reason the bug was not: with tiled one-word bodies there is no stale data
+//! for it to clear. `mpsc.rs`'s
+//! `a_stale_payload_word_from_the_previous_lap_is_not_a_record` pins it.
+//!
 //! # Properties
 //!
 //! * **P1** `every_committed_record_is_delivered_exactly_once_in_claim_order`

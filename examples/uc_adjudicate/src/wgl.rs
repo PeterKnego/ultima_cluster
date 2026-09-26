@@ -222,7 +222,7 @@ fn worker(id: u32, seed: u64, shared: Arc<Shared>, stop: Arc<AtomicBool>) {
                     );
                     if mutated {
                         shared.mutations[k].lock().unwrap().push(Mutation {
-                            pos: d.version.unwrap_or(resp.position),
+                            pos: mutation_pos(&op, d.version, resp.position),
                             value: mutation_value(&op).unwrap(),
                             replayed: resp.replayed,
                         });
@@ -275,12 +275,12 @@ fn worker(id: u32, seed: u64, shared: Arc<Shared>, stop: Arc<AtomicBool>) {
     }
 }
 
-// Sized to move the purge floor over a ~30 s churn window without a firehose:
-// a saturating filler on loopback (where discovery engages the 8896 B jumbo
-// rung) drove a node to an `IngressRingCorrupt` fail-stop, which the harness
-// correctly reports but which drowns the row's own signal. A bounded window
-// with a small pause per batch generates the log volume purge needs and no
-// more. See the gate doc's B2.iii note and the harness README.
+// Sized to move the purge floor over a ~30 s churn window without a firehose.
+// History: a saturating filler drove nodes to an `IngressRingCorrupt`
+// fail-stop, first blamed on the jumbo rung and the instants. It was #32, an
+// MPSC consumer reading the previous lap's payload as a commit word, and is
+// fixed; this sizing is kept so the row's signal stays comparable with the
+// runs already recorded. See the harness README's findings 2 and 3.
 const FILL_WINDOW: usize = 48;
 const FILL_VALUE_BYTES: usize = 512;
 const FILL_BATCH_PAUSE: Duration = Duration::from_millis(2);
@@ -330,6 +330,18 @@ fn filler(shared: Arc<Shared>, stop: Arc<AtomicBool>) {
     }
     if let Some(c) = client {
         c.shutdown();
+    }
+}
+
+/// Where a mutation sits in the log, for the final-state oracle. A Put's or
+/// CAS's reply version IS the position it applied at. A Delete's is not: it
+/// is the version it REMOVED (the deleted write's own position), which would
+/// tie the Delete with that write — so a Delete is ordered by the position
+/// it applied at.
+fn mutation_pos(op: &KvOp, reply_version: Option<u64>, applied_at: u64) -> u64 {
+    match op {
+        KvOp::Delete => applied_at,
+        _ => reply_version.unwrap_or(applied_at),
     }
 }
 
@@ -885,5 +897,27 @@ mod tests {
         assert_eq!(expected_final(&[], &[]), vec![None]);
         // A replayed Delete does make absent a candidate.
         assert_eq!(expected_final(&[m(5, None, true)], &[]), vec![None]);
+    }
+
+    /// A Delete's reply carries the version it REMOVED — the Put's own
+    /// position — so ordering it by that version ties it with the Put, and
+    /// `max_by_key` keeps whichever ack was recorded last. Seen on a
+    /// 2026-09-26 churn run: Put(619) committed at P, Delete committed in the
+    /// very next frame, the Delete's ack recorded first, and the oracle
+    /// reported "final read None" as acked-write loss.
+    #[test]
+    fn a_delete_is_ordered_by_where_it_applied_not_what_it_removed() {
+        let put = Mutation {
+            pos: mutation_pos(&KvOp::Put(619), Some(1000), 1000),
+            value: Some(619),
+            replayed: false,
+        };
+        let del = Mutation {
+            pos: mutation_pos(&KvOp::Delete, Some(1000), 1096),
+            value: None,
+            replayed: false,
+        };
+        // Acks recorded Delete-first, the order that produced the false FAIL.
+        assert_eq!(expected_final(&[del, put], &[]), vec![None]);
     }
 }

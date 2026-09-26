@@ -137,11 +137,26 @@ not gate runs.
 |---|---|---|---|
 | B2-v1.i | per-key WGL linearizability through `uc_remote` under leader kills | **Linearizable** on every key, all 5 seeds | **PASS** (2026-09-16). 5/5 seeds, every key Linearizable, 27 leader kills total; `uc2-adjudicate wgl --adapter kv-v1` on the 2.12.0 tarball binaries against the builder's `kv-service` (app HEAD `9e82e84`) |
 | B2-v1.ii | acked-write loss | **0** acknowledged writes lost, all 5 seeds | **PASS** (2026-09-16). 0 acknowledged writes lost across all 10 runs (5 wgl + 5 churn) |
-| B2-v1.iii | snapshot + purge churn | **Linearizable**, all 5 seeds, **and** ≥ 1 snapshot install observed on a restarted or joining service per seed — a seed with no install is **NOT RUN**, not PASS | **FAIL** (2026-09-16), traced to **product defect #32** (not a builder assumption). 5/5 seeds: per-key **Linearizable** and ≥1 snapshot install observed on every seed (6–9 service installs), but a UC node **fail-stops** (`IngressRingCorrupt`) under the coordinated instant + ingress load, so the run is not a clean PASS. The KV is correct; the platform is not. Honest FAIL, bar unmoved; re-runnable at the baseline rung on a fleet to disambiguate the jumbo correlation (#32) |
+| B2-v1.iii | snapshot + purge churn | **Linearizable**, all 5 seeds, **and** ≥ 1 snapshot install observed on a restarted or joining service per seed — a seed with no install is **NOT RUN**, not PASS | **FAIL** (2026-09-16), traced to **product defect #32** (not a builder assumption). 5/5 seeds: per-key **Linearizable** and ≥1 snapshot install observed on every seed (6–9 service installs), but a UC node **fail-stops** (`IngressRingCorrupt`) under the coordinated instant + ingress load, so the run is not a clean PASS. The KV is correct; the platform is not. Honest FAIL, bar unmoved; re-runnable at the baseline rung on a fleet to disambiguate the jumbo correlation (#32). **#32 root-caused and fixed 2026-09-26** — the jumbo correlation is refuted; see the note below the table; not re-run |
 | B2-v2.i | per-key WGL under leader kills, v2 binary | as B2-v1.i | **PASS** (2026-09-16). 5/5 seeds, every key Linearizable under leader kills (27 kills); v2 binary via the `kv-v2` adapter |
 | B2-v2.ii | acked-write loss, v2 binary | as B2-v1.ii | **PASS** (2026-09-16). 0 acknowledged writes lost, all 5 seeds |
-| B2-v2.iii | snapshot + purge churn, v2 binary | as B2-v1.iii | **FAIL** (2026-09-16), traced to **product defect #32** (same as B2-v1.iii, not the builder). 5/5 seeds per-key Linearizable with ≥1 install observed, but a UC node fail-stops (`IngressRingCorrupt`) under the coordinated instant + ingress load. Honest FAIL, bar unmoved |
+| B2-v2.iii | snapshot + purge churn, v2 binary | as B2-v1.iii | **FAIL** (2026-09-16), traced to **product defect #32** (same as B2-v1.iii, not the builder). 5/5 seeds per-key Linearizable with ≥1 install observed, but a UC node fail-stops (`IngressRingCorrupt`) under the coordinated instant + ingress load. Honest FAIL, bar unmoved. **#32 root-caused and fixed 2026-09-26** — see the note below the table; not re-run |
 | B2-v2.iv | Elle list-append over `Append`, driven through the remote path | **clean under both `serializable` and `strong-serializable`**, all 5 passes (what `scripts/elle_check.sh` checks) | **PASS** (2026-09-16). Elle list-append through `uc_remote`, 5/5 passes **clean under both `serializable` and `strong-serializable`** (the vendored elle-cli via `scripts/dogfood_elle.sh`); ~3000 `:ok` ops per history, 6 leader kills each — non-vacuous |
+
+**#32 note (2026-09-26, added after the rows were adjudicated; neither FAIL
+is changed).** The fail-stop in B2-v1.iii and B2-v2.iii was not caused by the
+coordinated instant or the jumbo rung. The MPSC ingress consumer, once caught
+up with its producers past the ring's first wrap, read the previous lap's
+payload bytes as a commit word. Records vary in length, so a boundary on lap 1
+can fall inside a lap-0 payload, and the KV's `key_len = 7` byte carries the
+commit word's lap bit. The fix zeroes every range the consumer passes. Dev-box
+smoke, not a re-run of either row: with the harness's filler unthrottled, churn
+seeds 1–3 on the in-tree `kv-service` failed 3/3 on `main` at `8631e08` and 0/3
+with the fix. One of the fix's seeds then reported acked-write loss, which
+traced to the harness's own final-state oracle (a Delete ordered by the
+version it removed; `examples/uc_adjudicate/README.md` finding 3), not to UC.
+Both rows stay **FAIL** as recorded. A re-run under this gate's protocol is
+owed.
 
 ### B3 — performance (reported, no bar)
 

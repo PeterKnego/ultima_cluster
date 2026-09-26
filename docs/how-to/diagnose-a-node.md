@@ -307,6 +307,17 @@ storage corruption of the mapped ring file. Recovery is identical to
 `IngressRingWedged`: restart the node, and every attached process
 reattaches.
 
+**On `2.7.0` through `2.13.0` there is a third cause, and it is the likely
+one:** [#32](https://github.com/PeterKnego/ultima_cluster/issues/32). A
+node consuming a busy ring past its first wrap could read the previous
+lap's leftover payload bytes as a record header, typically as
+`commit word length <N> out of range` or `crc mismatch` at a position
+beyond the ring's capacity (4 MiB for `ingress`). Nothing was stomped, and
+no acknowledged write is lost; the node fail-stops before it applies
+anything wrong. It is fixed after `2.13.0`: the consumer now zeroes every
+range it passes. Until you run the fix, a restart recovers the node, and the
+fail-stop can recur under the same load.
+
 ## Is a joiner recovering by snapshot?
 
 Watch `incoming_snapshot_pos` (1280) on the joining node. It advances when a
