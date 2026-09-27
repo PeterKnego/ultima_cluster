@@ -500,6 +500,13 @@ fn mixed_version_scenario(app: &str) -> Result<(), String> {
             )
         })
         .collect();
+    // `new_leader_v1_alive` false selects the fixed-world branch below. It
+    // cannot be SPURIOUSLY false there — a v1 that died for some reason
+    // other than the version gate would not stop at exactly the genesis
+    // record, and the branch asserts that exact stop for every attached v1,
+    // the new leader's included. A refused v1 (`Err`) reads false too, which
+    // is the fix working. `new_leader` is always one of the two followers
+    // (the old leader is stopped), so the `find` always hits.
     let new_leader_v1_alive = followers_v1
         .iter()
         .find(|a| a.node == new_leader)
@@ -660,10 +667,26 @@ fn clients_wait_until_every_declared_row_has_a_version() {
     let page = c.page(leader);
     let before = page.counters().append.load_acquire();
 
-    // No service anywhere: the row has no version. The submit blocks (the
-    // client's own timeout is 10 s), so it runs on its own thread.
-    let client = c.client(leader);
-    let waiting = std::thread::spawn(move || client.submit(&put(1)));
+    // No service anywhere: the row has no version. The submit blocks, so it
+    // runs on its own thread, with an explicit 60 s request timeout: the
+    // `Client` default (10 s) is shared between the 1 s held here and however
+    // long `start_all` plus the genesis commit take, which is too tight.
+    let client = uc_client::PipelinedClient::connect(
+        &c.dirs[leader],
+        &c.app,
+        uc_client::PipelinedConfig {
+            request_timeout: Duration::from_secs(60),
+            serving_gate: false, // as `Client::connect` pins it
+            ..Default::default()
+        },
+    )
+    .expect("client connect");
+    let waiting = std::thread::spawn(move || {
+        client
+            .submit::<Cmd, u8>(&put(1))
+            .and_then(|t| t.wait())
+            .map(|b| vec![b])
+    });
     std::thread::sleep(Duration::from_millis(1_000));
     let after = page.counters().append.load_acquire();
     assert_eq!(
@@ -730,4 +753,278 @@ fn ingress_gate_is_open_with_nothing_declared() {
         other => panic!("expected the client frame at {commit0}, got {other:?}"),
     }
     node.stop();
+}
+
+// ------------------------------------------- the pin stops old services
+
+impl Cluster {
+    /// Run `f` on node `i`'s in-process handle.
+    fn with_node<R>(&self, i: usize, f: impl FnOnce(&Node) -> R) -> R {
+        let nodes = self.nodes.lock().unwrap();
+        f(nodes[i].as_ref().expect("node stopped"))
+    }
+
+    /// Submit through whichever node leads NOW, reconnecting and resending on
+    /// an error (a leadership move mid-call). Returns the response and
+    /// whether a resend happened — a resent command may have committed
+    /// twice, which only an idempotent command can shrug off.
+    fn submit_via_leader(&self, cmd: &Cmd) -> (Vec<u8>, bool) {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut resent = false;
+        loop {
+            let l = self.wait_leader();
+            match self.client(l).submit(cmd) {
+                Ok(r) => return (r, resent),
+                Err(e) => {
+                    assert!(Instant::now() < deadline, "submit never acked: {e:?}");
+                    eprintln!("submit via node {l} failed ({e:?}); re-resolving the leader");
+                    resent = true;
+                }
+            }
+        }
+    }
+
+    /// `uc2ctl snapshot`, in process (admin op 8's exact body, as
+    /// `Node::command_snapshot` runs it): command an instant on whichever
+    /// node leads — re-resolved on every `Retry`, so a leadership move is
+    /// absorbed — and wait until EVERY node holds the complete set at the
+    /// returned **P** (each node's v2 will install that node's own copy of
+    /// the origin, and the pin door requires the pinning node's newest set).
+    fn snapshot_instant(&self) -> u64 {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let p = loop {
+            let l = self.wait_leader();
+            match self.with_node(l, |n| n.command_snapshot(false)) {
+                Ok(p) => break p,
+                Err(uc_node::SnapshotRefusal::Retry) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(e) => panic!("uc2ctl snapshot refused: {e}"),
+            }
+        };
+        for i in 0..N {
+            self.wait(|| self.with_node(i, |n| n.snapshot_set_position()) == p);
+        }
+        p
+    }
+
+    /// `uc2ctl upgrade pin`, in process: stage the 20-byte `UpgradePin` at
+    /// `<instance_dir>/upgrade.pending` (`uc_node::UPGRADE_PENDING_FILE`) on
+    /// the node that leads NOW and submit admin op 10 through its cnc admin
+    /// band (filesystem admin policy: no auth line) — the twin of
+    /// `uc_service/tests/pinned_attach.rs`'s `pin_via_admin`. Returns
+    /// `(node, END position)` from the accepted reply.
+    ///
+    /// Retried, re-resolving the leader each time: status 2 (not the leader
+    /// any more, or single-in-flight) and reason 54 `pin_no_set` (the set's
+    /// position is published a moment after the artifact lands). Anything
+    /// else fails here, named.
+    fn pin(&self, row: u8, from: u32, to: u32, origin: u64) -> (usize, u64) {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        use uc_protocol::v2::upgrade::{UpgradePin, encode_upgrade_pin};
+        let mut bytes = Vec::new();
+        encode_upgrade_pin(
+            &UpgradePin {
+                row,
+                from,
+                to,
+                origin,
+            },
+            &mut bytes,
+        );
+        let (id, ip, port) = uc_node::staged_digest(&bytes);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let l = self.wait_leader();
+            let dir = &self.dirs[l];
+            let pending = dir.join(uc_node::UPGRADE_PENDING_FILE);
+            let tmp = dir.join(format!("{}.tmp", uc_node::UPGRADE_PENDING_FILE));
+            {
+                let mut f = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .mode(0o600)
+                    .open(&tmp)
+                    .unwrap();
+                f.write_all(&bytes).unwrap();
+                f.sync_all().unwrap();
+            }
+            std::fs::rename(&tmp, &pending).unwrap();
+
+            let cnc = self.page(l);
+            let seq = cnc.read_admin_req(0).map(|r| r.seq).unwrap_or(0) + 1;
+            cnc.write_admin_req(&uc_log::cnc::AdminReq {
+                seq,
+                nonce: seq,
+                op: uc_protocol::v2::cnc::ADMIN_OP_UPGRADE_PIN,
+                id,
+                ip,
+                port,
+            });
+            let resp_deadline = Instant::now() + Duration::from_secs(15);
+            let resp = loop {
+                if let Some(r) = cnc.read_admin_resp(seq) {
+                    break r;
+                }
+                assert!(
+                    Instant::now() < resp_deadline,
+                    "node {l}: admin response timed out for seq {seq}"
+                );
+                std::thread::yield_now();
+            };
+            if resp.status == 0 {
+                return (l, resp.version);
+            }
+            let racy = resp.status == 2 || resp.reason == uc_node::REASON_PIN_NO_SET;
+            assert!(
+                racy && Instant::now() < deadline,
+                "upgrade pin refused on node {l}: status={} reason={}",
+                resp.status,
+                resp.reason
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// The START of the frame whose END is `end`, found by walking node `i`'s
+    /// log buffer frame by frame from position 0 (the harness's 4 MiB buffer
+    /// never wraps in these tests, so every frame is still there). Asserts
+    /// the frame found is a `CLUSTER` `UpgradePin` for `row` — so a walk that
+    /// lands on the wrong frame fails here, not as an off-by-one below.
+    fn frame_start_of(&self, end: u64, i: usize, row: u8) -> u64 {
+        use uc_protocol::v2::frame::{
+            CLUSTER_BODY_PREFIX_LEN, ClusterKind, FRAME_TYPE_CLUSTER, HEADER_LEN, align_frame_len,
+        };
+        let mut buf = Vec::new();
+        let mut pos = 0u64;
+        self.with_node(i, |n| {
+            loop {
+                let h = match n.read_frame_validated(pos, &mut buf) {
+                    uc_log::buffer::FrameRead::Frame(h) => h,
+                    other => panic!("node {i}: walking to {end}, read at {pos} gave {other:?}"),
+                };
+                let next = pos + align_frame_len(h.length as usize) as u64;
+                if next == end {
+                    assert_eq!(h.frame_type, FRAME_TYPE_CLUSTER, "node {i}: frame at {pos}");
+                    assert_eq!(
+                        (buf[HEADER_LEN], buf[HEADER_LEN + CLUSTER_BODY_PREFIX_LEN]),
+                        (ClusterKind::UpgradePin as u8, row),
+                        "node {i}: the frame ending at {end} is not row {row}'s pin"
+                    );
+                    return pos;
+                }
+                assert!(
+                    next < end,
+                    "node {i}: no frame ends at {end} ({pos}..{next})"
+                );
+                pos = next;
+            }
+        })
+    }
+}
+
+/// #33 spec §10.2 (and §4.3, §7.2): 1.0 services are attached and applying
+/// when a pin to 2.0 commits. Each stops at EXACTLY the pin record — its
+/// slot's `applied` is the record's frame START (every earlier frame
+/// applied, nothing after) — and says so with a `version_superseded` event.
+/// 2.0 services then attach on every node, install the pin's origin, and the
+/// row resumes: an `Append` (2.0-only) is acknowledged and the value is
+/// recomputed from the origin.
+///
+/// The stop message is asserted on the captured `uc_obs` sink. This binary's
+/// `TEST_LOCK` (held by every test here, via `three_node_cluster`) is what
+/// keeps the process-global capture from being stolen by a sibling — the
+/// `OBS_CAPTURE_LOCK` discipline of `node.rs`'s unit tests.
+///
+/// Leadership: every "the leader" step re-resolves it (`submit_via_leader`,
+/// `snapshot_instant`, `pin`), and every node runs the row, so a move at any
+/// point costs a retry, not the test.
+#[test]
+fn a_committed_pin_stops_every_old_service_at_exactly_the_record() {
+    let c = three_node_cluster("rowpin");
+    c.wait_leader();
+    let olds = c.start_all::<KvV1>();
+    for v in 0..200 {
+        // `Put` is idempotent, so a resend after a leader move is harmless.
+        assert_eq!(c.submit_via_leader(&put(v)).0, vec![0], "put({v})");
+    }
+    let origin = c.snapshot_instant();
+
+    let sink = ObsCapture::take();
+    let (pinned_on, pin_end) = c.pin(0, pack_version(1, 0, 0), pack_version(2, 0, 0), origin);
+    let pin_start = c.frame_start_of(pin_end, pinned_on, 0);
+    for (i, s) in olds.iter().enumerate() {
+        c.wait(|| !s.is_alive());
+        // The log is replicated byte for byte: every node's walk agrees.
+        assert_eq!(c.frame_start_of(pin_end, i, 0), pin_start, "node {i}");
+        let page = c.page(i);
+        assert_eq!(
+            page.service_slot(0).applied.load_acquire(),
+            pin_start,
+            "node {i}'s v1 stopped somewhere other than the pin record"
+        );
+        match page.service_slot(0).status.row_view() {
+            uc_log::cnc::RowRead::View {
+                running: Some(v),
+                record_pos,
+                ..
+            } => assert_eq!(
+                (v, record_pos),
+                (pack_version(2, 0, 0), pin_end),
+                "node {i}"
+            ),
+            other => panic!("node {i}: row view {other:?}"),
+        }
+    }
+    let text = sink.text();
+    drop(sink);
+    let stops: Vec<&str> = text
+        .lines()
+        .filter(|l| l.contains("\"event\":\"version_superseded\""))
+        .collect();
+    assert_eq!(stops.len(), N, "one version_superseded per v1:\n{text}");
+    for l in &stops {
+        assert!(
+            l.contains(&format!("\"position\":{pin_start}"))
+                && l.contains("\"running\":\"2.0.0\"")
+                && l.contains("\"mine\":\"1.0.0\""),
+            "{l}"
+        );
+    }
+
+    // Each v1 has fail-stopped; dropping the handle joins its thread without
+    // re-raising the panic and releases `service.0.lock` for the v2 attach.
+    drop(olds);
+    let _news = c.start_all::<KvV2>();
+    let (r, resent) = c.submit_via_leader(&append(1));
+    assert_eq!(r, vec![0], "the 2.0-only Append must be acknowledged");
+    let got = c.client(c.wait_leader()).query_u64();
+    if resent {
+        // A resent Append may have committed twice.
+        assert!(matches!(got, 200 | 201), "got {got}");
+    } else {
+        assert_eq!(got, 200, "199 + 1, recomputed from the origin");
+    }
+}
+
+/// The process-global obs sink, held for a scope and restored on drop (the
+/// panic path included) — `uc_node/tests/snapshot_reports.rs`'s guard.
+struct ObsCapture(std::sync::Arc<Mutex<Vec<u8>>>);
+
+impl ObsCapture {
+    fn take() -> Self {
+        Self(uc_node::obs::log::capture_for_tests())
+    }
+
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().unwrap_or_else(|e| e.into_inner())).into_owned()
+    }
+}
+
+impl Drop for ObsCapture {
+    fn drop(&mut self) {
+        uc_node::obs::log::stderr_for_tests();
+    }
 }
