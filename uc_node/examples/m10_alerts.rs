@@ -636,6 +636,12 @@ fn scenario_service_wedged(scratch_root: &Path) -> (SeriesFile, Disclosure) {
 fn scenario_leader_isolated(scratch_root: &Path) -> (SeriesFile, Disclosure) {
     let admission_bytes = 8 * 1024;
     let (_dir, mut nodes) = spawn_cluster(scratch_root, "leader-isolated", 3, admission_bytes);
+    await_stable_leader(&nodes, 20);
+    // Fix round 1 (ruling R14): attach row 0 everywhere and wait for its
+    // running version, or the leader's admission gate never opens and this
+    // whole scenario is a deterministic no-op — see
+    // `attach_noop_everywhere`'s doc comment.
+    let svcs = attach_noop_everywhere(&nodes);
     let leader_idx = await_stable_leader(&nodes, 20);
     let others: Vec<usize> = (0..nodes.len()).filter(|&i| i != leader_idx).collect();
     for &o in &others {
@@ -651,12 +657,13 @@ fn scenario_leader_isolated(scratch_root: &Path) -> (SeriesFile, Disclosure) {
         "uc2_admission_bytes",
     ];
     let mut sf = SeriesFile::new();
-    // Baseline BEFORE any load: append==commit==32 (just the NewTerm frame).
-    // The busy-submit burst below floods the tiny window to its ceiling
-    // within a single round, so without this baseline the whole captured
-    // trace would already be flat at the plateau — this sample is what
-    // proves the real JUMP (append rising while commit stays put), which
-    // the dilation step places inside the delta range window.
+    // Baseline BEFORE any load: append==commit, past whatever frames the
+    // NewTerm + row-genesis cluster commands (Fix round 1) already put in
+    // the log. The busy-submit burst below floods the tiny window to its
+    // ceiling within a single round, so without this baseline the whole
+    // captured trace would already be flat at the plateau — this sample is
+    // what proves the real JUMP (append rising while commit stays put),
+    // which the dilation step places inside the delta range window.
     sf.record_round(&instance, &scrape(addr), &families);
     // Drive load into the isolated leader while sampling — the append
     // counter climbs (until the admission window closes it), commit never
@@ -675,6 +682,9 @@ fn scenario_leader_isolated(scratch_root: &Path) -> (SeriesFile, Disclosure) {
     for &o in &others {
         heal_pair(&nodes, leader_idx, o);
     }
+    for svc in svcs {
+        svc.stop();
+    }
     for n in nodes.iter_mut() {
         n.stop();
     }
@@ -686,11 +696,12 @@ fn scenario_leader_isolated(scratch_root: &Path) -> (SeriesFile, Disclosure) {
             rules: &["Uc2ReplicationStalled", "Uc2AdmissionSaturated"],
             state: "real",
             method: format!(
-                "real 3-node cluster, admission_bytes={admission_bytes} (deliberately tiny); \
-                 partition the leader (n{leader_idx}) from BOTH followers and keep submitting — \
-                 12 real ~0.5s-spaced scrapes show uc2_commit_bytes frozen while \
-                 uc2_append_bytes climbs and uc2_admission_saturation crosses 1.0 as the window \
-                 fills."
+                "real 3-node cluster, admission_bytes={admission_bytes} (deliberately tiny); a \
+                 real NoopSm attached on every node (Fix round 1 — the leader's admission gate \
+                 refuses everything until row 0 has a running version) before partitioning the \
+                 leader (n{leader_idx}) from BOTH followers and keep submitting — 12 real \
+                 ~0.5s-spaced scrapes show uc2_commit_bytes frozen while uc2_append_bytes \
+                 climbs and uc2_admission_saturation crosses 1.0 as the window fills."
             ),
         },
     )
@@ -789,6 +800,12 @@ fn scenario_peer_never_heard(scratch_root: &Path) -> (SeriesFile, Disclosure) {
 fn scenario_follower_partitioned(scratch_root: &Path) -> (SeriesFile, Disclosure) {
     let admission_bytes = 16 * 1024;
     let (_dir, mut nodes) = spawn_cluster(scratch_root, "peer-lagging", 3, admission_bytes);
+    await_stable_leader(&nodes, 20);
+    // Fix round 1 (ruling R14): attach row 0 everywhere and wait for its
+    // running version BEFORE partitioning anything — genesis needs a
+    // quorum to commit, so it must land while every node can still hear
+    // every other node. See `attach_noop_everywhere`'s doc comment.
+    let svcs = attach_noop_everywhere(&nodes);
     let leader_idx = await_stable_leader(&nodes, 20);
     let victim_idx = (0..nodes.len())
         .find(|&i| i != leader_idx)
@@ -832,6 +849,9 @@ fn scenario_follower_partitioned(scratch_root: &Path) -> (SeriesFile, Disclosure
     for &o in &others {
         heal_pair(&nodes, victim_idx, o);
     }
+    for svc in svcs {
+        svc.stop();
+    }
     for n in nodes.iter_mut() {
         n.stop();
     }
@@ -843,8 +863,10 @@ fn scenario_follower_partitioned(scratch_root: &Path) -> (SeriesFile, Disclosure
             rules: &["Uc2PeerLagging"],
             state: "real",
             method: format!(
-                "real 3-node cluster, leader admission_bytes={admission_bytes}; fully isolate \
-                 ONE follower (n{victim_idx}, both links) while the leader (n{leader_idx}) and \
+                "real 3-node cluster, leader admission_bytes={admission_bytes}; a real NoopSm \
+                 attached on every node (Fix round 1 — the leader's admission gate refuses \
+                 everything until row 0 has a running version) before fully isolating ONE \
+                 follower (n{victim_idx}, both links) while the leader (n{leader_idx}) and \
                  the other follower keep committing under load — n{victim_idx} stops reporting \
                  durable positions, so the leader's view of \
                  uc2_peer_replication_lag_bytes{{peer=\"{victim_idx}\"}} grows past its own \
@@ -2136,4 +2158,56 @@ fn await_stable_leader(nodes: &[NodeH], secs: u64) -> usize {
         }
         assert!(Instant::now() < deadline, "leader never stabilized");
     }
+}
+
+/// #33 Fix round 1 (ruling R14): since Task 7, the leader admits no client
+/// frame until every declared row has a running version — a genesis record,
+/// which needs the LEADER's service for that row attached. A scenario that
+/// drives load through a bare `spawn_cluster` (a single declared row,
+/// `noop`, with nothing ever attached anywhere) therefore has admission held
+/// shut forever: every `submit` silently errs, the window never fills, and
+/// no follower ever falls behind — deterministically, on every run.
+///
+/// Attach a real `NoopSm` on EVERY node, not just the leader — leadership
+/// can move (and does, per `await_stable_leader`'s own comment on this box)
+/// — then poll the CURRENT leader's row 0 until it shows a committed
+/// running version before returning. Callers must keep the returned handles
+/// alive for the scenario's lifetime and `.stop()` them at cleanup, same as
+/// every other real-service scenario in this file.
+fn attach_noop_everywhere(nodes: &[NodeH]) -> Vec<uc_service::Service<NoopSm>> {
+    let services: Vec<uc_service::Service<NoopSm>> = nodes
+        .iter()
+        .map(|n| {
+            ServiceBuilder::new(ServiceConfig::new(&n.instance_dir, APP), NoopSm)
+                .start()
+                .expect("NoopSm attaches")
+        })
+        .collect();
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let leader_idx = await_single_leader(nodes, 20);
+        let has_running = matches!(
+            nodes[leader_idx]
+                .n()
+                .observability()
+                .cnc
+                .service_slot(0)
+                .status
+                .row_view(),
+            uc_log::cnc::RowRead::View {
+                running: Some(_),
+                ..
+            }
+        );
+        if has_running {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "row 0 never got a running version on the leader"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    services
 }
