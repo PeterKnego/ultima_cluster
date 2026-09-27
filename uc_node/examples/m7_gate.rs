@@ -1040,13 +1040,18 @@ fn run_all(a: AllArgs) -> anyhow::Result<()> {
             SNAPSHOT_INTERVAL_BYTES,
         );
         let node = Node::start_with_socket(cfg, sock).expect("node start");
-        let svc = spawn_service(&dir, SNAPSHOT_INTERVAL_BYTES);
         nodes.push(NodeH {
             id: i as NodeId,
             dir,
             node,
-            svc: Some(svc),
+            svc: None,
         });
+    }
+    // Node-then-service (2.13.0): `attach` waits for its node to have JOINED
+    // (leader known, commit learned), and no node joins before a quorum is
+    // up — so every node starts before any service attaches.
+    for h in nodes.iter_mut() {
+        h.svc = Some(spawn_service(&h.dir, SNAPSHOT_INTERVAL_BYTES));
     }
 
     let leader = await_single_leader(&nodes, 30);
