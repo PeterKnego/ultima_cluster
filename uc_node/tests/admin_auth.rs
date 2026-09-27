@@ -1177,6 +1177,19 @@ fn schedule_apply_is_signed_digest_checked_leader_only_and_audited() {
         })
         .collect();
     let leader = await_single_leader(&c.nodes, 30);
+    // #33 spec §6.1: once its service attaches, the leader appends a
+    // `RowGenesis` for the row, and a `CLUSTER`-appending admin op answers
+    // retry while that is above commit (single-in-flight). Wait for it to
+    // commit, so every answer below is the one the case is about.
+    let leader_view = c.nodes[leader].node.as_ref().unwrap().cluster_view();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while leader_view.running_for(0).is_none() {
+        assert!(
+            Instant::now() < deadline,
+            "the genesis record never committed"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
     let follower = (0..c.nodes.len()).find(|&i| i != leader).unwrap();
     let dir = c.nodes[leader].instance_dir.clone();
     let cnc = open_cnc(&dir);
@@ -1212,7 +1225,19 @@ fn schedule_apply_is_signed_digest_checked_leader_only_and_audited() {
     );
     assert_eq!(field(&line, "op"), ADMIN_OP_SCHEDULE_APPLY.to_string());
     assert_eq!(field(&line, "op_name"), "schedule_apply", "{line}");
-    assert_eq!(resp.version, 0, "nothing was adopted");
+    // A refusal reports the committed cluster position, which is no longer 0
+    // once the leader's #33 genesis record (`RowGenesis`) commits — so
+    // "nothing was adopted" is checked on the table itself.
+    let inner = c.nodes[leader]
+        .node
+        .as_ref()
+        .unwrap()
+        .cluster_view()
+        .snapshot_inner();
+    assert!(
+        inner.table.entries.is_empty() && inner.table_position == 0,
+        "nothing was adopted"
+    );
     assert!(
         dir.join(uc_node::SCHEDULE_PENDING_FILE).exists(),
         "a refused apply leaves the staged file for the operator to re-sign"

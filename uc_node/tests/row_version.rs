@@ -250,6 +250,28 @@ impl Cluster {
         KvClient(Client::connect(&self.dirs[i], &self.app).expect("client connect"))
     }
 
+    /// Node `i`'s cnc page, opened read-side the way an attacher opens it.
+    fn page(&self, i: usize) -> std::sync::Arc<uc_log::cnc::CncPage> {
+        uc_log::cnc::CncPage::open_file(&self.dirs[i].join("cnc2.dat"), &self.app)
+            .unwrap_or_else(|e| panic!("open node {i}'s cnc page: {e:?}"))
+    }
+
+    /// Poll `pred` until it holds; panic after 20 s.
+    fn wait(&self, pred: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !pred() {
+            assert!(Instant::now() < deadline, "condition not met within 20 s");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Node `i`'s `audit.jsonl`, one entry per line (empty if absent).
+    fn audit_lines(&self, i: usize) -> Vec<String> {
+        std::fs::read_to_string(self.dirs[i].join("audit.jsonl"))
+            .map(|s| s.lines().map(str::to_owned).collect())
+            .unwrap_or_default()
+    }
+
     fn stop_node(&self, i: usize) {
         let n = self.nodes.lock().unwrap()[i]
             .take()
@@ -314,6 +336,42 @@ impl KvClient {
 }
 
 // ------------------------------------------------------------------- test
+
+/// #33 spec §6.1: the leader records its own attached service's version as
+/// the row's running version (`RowGenesis`), every node applies it at
+/// commit, and the leader audits the append as `source = "genesis"`.
+#[test]
+fn the_leader_records_its_attached_version_as_genesis() {
+    let c = three_node_cluster("rowgen");
+    let leader = c.wait_leader();
+    let _s = c.start::<KvV2>(leader);
+    let page = c.page(leader);
+    c.wait(|| {
+        matches!(
+            page.service_slot(0).status.row_view(),
+            uc_log::cnc::RowRead::View { running: Some(v), record_pos, .. }
+                if v == pack_version(2, 0, 0) && record_pos > 0
+        )
+    });
+    // Every node agrees (applied at commit everywhere).
+    for i in 0..N {
+        let page = c.page(i);
+        c.wait(|| {
+            matches!(
+                page.service_slot(0).status.row_view(),
+                uc_log::cnc::RowRead::View { running: Some(v), .. } if v == pack_version(2, 0, 0)
+            )
+        });
+    }
+    let lines = c.audit_lines(leader);
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("\"source\":\"genesis\"")
+                && l.contains("\"op_name\":\"row_genesis\"")),
+        "no genesis audit line on the leader: {lines:#?}"
+    );
+}
 /// The #33 scenario (spec §10.1, controller ruling R4). Before the fix: the
 /// leader's v2 acknowledges `Append(5)`; the v1 followers apply it as
 /// BAD_REQUEST; once the leader stops, a v1 follower leads, answers through

@@ -438,11 +438,13 @@ pub(crate) fn attach<S: RawStateMachine>(
     } else {
         0
     };
+    // cnc 3.1: the attaching service's declared version (`ServiceStatusLine::
+    // version`). #33 spec §6.1: the version word BEFORE the status word — the
+    // leader's genesis reads ATTACHED (Acquire) and then the version, so this
+    // order (both Release) makes the version it reads this incarnation's.
+    s.status.store_version(S::VERSION);
     s.status
         .store_release(pack_service_status(row, true, incarnation.wrapping_add(1)) | capable);
-    // cnc 3.1: the attaching service's declared version, for observability
-    // (`ServiceStatusLine::version`) — written once, here, alongside status.
-    s.status.store_version(S::VERSION);
     // 5. Bump the epoch AFTER applied, AcqRel — the discipline the node's
     //    capture-recheck bracket relies on (unchanged, now per slot).
     let epoch = s.epoch.fetch_add(1) + 1;
