@@ -92,7 +92,11 @@ enum Sub {
         #[arg(long, default_value_t = 0)]
         row: u8,
         /// The packed version the pin names — what `uc2ctl upgrade pin --to`
-        /// takes (`MAJOR.MINOR.PATCH`), or a raw packed integer.
+        /// takes (`MAJOR.MINOR.PATCH`), or a raw packed integer. Build the
+        /// state machine's `VERSION` with `pack_version(major, minor,
+        /// patch)`: a bare integer (1, 2, 3 …) packs as 0.0.x, and every
+        /// 0.0.x build is ONE line, so a pin between two of them refuses
+        /// nothing.
         #[arg(long, value_parser = parse_version)]
         to: u32,
         /// MESSAGE frames re-submitted before the instant (default: half).
@@ -112,8 +116,11 @@ enum Sub {
 /// What `--to` accepts: the `MAJOR.MINOR.PATCH` form `uc2ctl upgrade pin
 /// --to` takes (`uc_ctl::upgrade::parse_semver`'s rule, copied rather than
 /// depended on — this binary must not link the admin CLI), or a raw packed
-/// `u32` (decimal, or `0x`-prefixed hex) for a state machine whose `VERSION`
-/// is a bare integer rather than a packed semver (`const VERSION: u32 = 2`).
+/// `u32` (decimal, or `0x`-prefixed hex). A state machine should build its
+/// `VERSION` with `pack_version(major, minor, patch)`; a bare integer
+/// (`const VERSION: u32 = 2`) is accepted here but packs as `0.0.2`, and
+/// since #33 every `0.0.x` build is one line (major.minor `0.0`, patch
+/// ignored), so a pin between two bare-integer builds refuses nothing.
 ///
 /// Packed `0` is the "unversioned" sentinel — what an unversioned row's cnc
 /// word already reads — so a pin naming it could not be told from "no pin".

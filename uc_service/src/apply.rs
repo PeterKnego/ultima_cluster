@@ -774,6 +774,11 @@ pub(crate) fn apply_cycle<S: RawStateMachine>(st: &mut ApplyState<S>) -> bool {
                 Ok(Replay::AwaitVersion(at)) => {
                     st.replay_wait = None;
                     st.needs_replay = false;
+                    // Final review M4: reaching the record proves the journal
+                    // served this cursor, so the stall episode is over whether
+                    // or not the cursor moved (it does not when the row was
+                    // already waiting AT the record).
+                    st.replay_stalled = None;
                     let moved = at > cursor_before;
                     crate::version_gate::rewind_to_record(
                         &mut st.follower.cursor,
@@ -782,7 +787,6 @@ pub(crate) fn apply_cycle<S: RawStateMachine>(st: &mut ApplyState<S>) -> bool {
                         at,
                     );
                     if moved {
-                        st.replay_stalled = None;
                         st.lag_waiting = false;
                         st.announce_pending = true;
                     }
@@ -2032,6 +2036,91 @@ mod tests {
         assert_eq!(
             st.replay_stalled, None,
             "never the gap guard's no-progress case"
+        );
+    }
+
+    /// Final review M4: reaching a version record in a replay pass proves the
+    /// journal SERVED the cursor, so the stall episode is over even when the
+    /// follower's cursor did not move — `AwaitVersion` clears `replay_stalled`
+    /// unconditionally. Shape: the row already waits AT the record (cursor ==
+    /// the record, the SM's own frontier below it), the ring lapped meanwhile,
+    /// and a prior no-progress pass left a stall recorded. The forced gap pass
+    /// installs a covering artifact, replays the tail up to the record, and
+    /// rejoins AT it — the same cursor, so `moved` is false.
+    #[test]
+    fn a_replay_that_reaches_a_version_record_ends_the_stall_even_without_moving() {
+        let dir = scratch();
+        let cnc = page(0x3434);
+        cnc.store_services_declared(0b1);
+        let buffer = std::sync::Arc::new(uc_log::buffer::LogBuffer::new(
+            uc_log::region::Region::heap_zeroed(CAP as usize),
+            std::sync::Arc::clone(&cnc),
+            256,
+        ));
+        let journal_dir = dir.path().join("journal");
+        let mut archive = uc_log::archive::Archive::open(uc_log::archive::ArchiveConfig {
+            segment_size_bytes: 16 * 1024,
+            preallocate_segments: false,
+            ..uc_log::archive::ArchiveConfig::new(&journal_dir)
+        })
+        .unwrap();
+        let mut appender = uc_log::buffer::Appender::new(std::sync::Arc::clone(&buffer), 1, 0);
+        let v1 = uc_protocol::identity::pack_version(1, 0, 0);
+        let mut pos = Vec::new();
+        let mut rec = (0, 0);
+        for i in 0..1400u32 {
+            pos.push(appender.append(1, i, &[1u8; 64]).unwrap());
+            if i == 199 {
+                rec = append_genesis(&mut appender, v1);
+            }
+            if i % 100 == 99 {
+                while archive.do_work(&buffer).unwrap() {}
+            }
+        }
+        while archive.do_work(&buffer).unwrap() {}
+        drop(archive);
+        let head = cnc.counters().append.load_acquire();
+        cnc.counters().commit.store_release(head);
+
+        let (mut st, _cnc2, _sc2, _ap2, _dir2) = apply_state_for_test(CountSm::default());
+        st.cnc = Arc::clone(&cnc);
+        // Waiting AT the record; the SM's own frontier is frame 100's end.
+        st.follower = uc_log::reader::LogFollower::new(std::sync::Arc::clone(&buffer), rec.0);
+        st.sm.lock().unwrap().last = Some(pos[100]);
+        st.journal_dir = journal_dir;
+        st.instance_id = 0x3434;
+        st.replay_stalled = Some(pos[100]);
+        let store = crate::snapshots::SnapshotStore::open(dir.path(), 0).unwrap();
+        store
+            .publish(pos[150], 0, |w| w.write_all(b"snap").map_err(Into::into))
+            .unwrap();
+        st.snapshot_restore = Some(super::SnapshotRestore::<CountSm> {
+            store,
+            install: Box::new(|sm, p, _r| {
+                sm.last = Some(p);
+                Ok(p)
+            }),
+        });
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let progressed = super::apply_cycle(&mut st);
+            let _ = tx.send((progressed, st));
+        });
+        let (progressed, st) = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("a pending record must end the replay, not spin");
+        assert!(progressed);
+        assert_eq!(st.follower.cursor, rec.0, "rejoined AT the record, unmoved");
+        let sm = st.sm.try_lock().expect("not held, not poisoned");
+        assert_eq!(
+            sm.last,
+            Some(pos[199]),
+            "installed at frame 150, replayed to the record"
+        );
+        assert_eq!(
+            st.replay_stalled, None,
+            "reaching the record ends the stall episode"
         );
     }
 

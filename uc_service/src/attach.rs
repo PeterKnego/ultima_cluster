@@ -156,6 +156,15 @@ const BOOT_POLL: std::time::Duration = std::time::Duration::from_millis(20);
 /// and only then does step 4 below publish `applied`. Nothing is written to
 /// the slot before the pin decision, so a refused attach leaves the row
 /// exactly as it found it.
+/// #33 final review I1(b): a bare-integer `const VERSION` (1, 2, 3 …)
+/// packs as `0.0.x` — major.minor `0.0` with a nonzero patch — so under D3
+/// ("same version" = equal major.minor, patch free) every such build is ONE
+/// line: they mix freely and a pin between two of them refuses nothing.
+/// `0` itself is an ordinary version (D4) and is not flagged.
+pub(crate) const fn version_is_patch_only(v: u32) -> bool {
+    v != 0 && v < 1 << 16
+}
+
 pub(crate) fn attach<S: RawStateMachine>(
     cfg: &ServiceConfig,
     sm: S,
@@ -321,8 +330,10 @@ pub(crate) fn attach<S: RawStateMachine>(
         };
         // The envelope is cross-checked against the PIN's `from`, not against
         // `S::VERSION` — this is the sanctioned crossing of a version
-        // boundary, and the artifact is required to be the one `from` built
-        // (the unpinned path in `replay.rs` requires `S::VERSION` instead).
+        // boundary, and the artifact is required to be one `from`'s LINE
+        // built (the unpinned path in `replay.rs` requires `S::VERSION`'s
+        // line instead). Both envelope checks compare by line (`same_line`,
+        // patch ignored — #33 D3), never by exact version.
         let env = crate::snapshots::verify_snapshot_envelope(&mut file, origin, Some(from))
             .map_err(|e| ServiceError::MistaggedSnapshot {
                 path: path.display().to_string(),
@@ -464,6 +475,21 @@ pub(crate) fn attach<S: RawStateMachine>(
     // leader's genesis reads ATTACHED (Acquire) and then the version, so this
     // order (both Release) makes the version it reads this incarnation's.
     s.status.store_version(S::VERSION);
+    // #33 final review I1(b): warn, never refuse — a bare-integer version is
+    // legal, it just cannot express a line change.
+    if version_is_patch_only(S::VERSION) {
+        let version = uc_protocol::identity::VersionDisplay(S::VERSION).to_string();
+        uc_obs::obs_event!(
+            Warn,
+            "version_is_patch_only",
+            row = u64::from(row),
+            row_name = S::IDENTITY.name.as_str(),
+            version = version.as_str(),
+            detail = "this VERSION is a bare integer: it packs as 0.0.x and shares the 0.0 line \
+                      with every other bare-integer build, so such builds mix freely and a pin \
+                      between them refuses nothing; use pack_version(major, minor, patch)",
+        );
+    }
     s.status
         .store_release(pack_service_status(row, true, incarnation.wrapping_add(1)) | capable);
     // 5. Bump the epoch AFTER applied, AcqRel — the discipline the node's
@@ -530,6 +556,24 @@ pub(crate) fn attach<S: RawStateMachine>(
 #[cfg(test)]
 mod tests {
     use super::lag_mode_for;
+
+    #[test]
+    fn version_is_patch_only_flags_bare_integers_only() {
+        use super::version_is_patch_only;
+        use uc_protocol::identity::pack_version;
+        // Bare integers: 0.0.x with x > 0.
+        assert!(version_is_patch_only(1));
+        assert!(version_is_patch_only(2));
+        assert!(version_is_patch_only(0xFFFF));
+        assert!(version_is_patch_only(pack_version(0, 0, 7)));
+        // 0 is an ordinary version (D4), not a bare integer.
+        assert!(!version_is_patch_only(0));
+        // Anything with a real major or minor.
+        assert!(!version_is_patch_only(1 << 16));
+        assert!(!version_is_patch_only(pack_version(0, 1, 0)));
+        assert!(!version_is_patch_only(pack_version(1, 0, 3)));
+        assert!(!version_is_patch_only(u32::MAX));
+    }
     use crate::lag::LagMode;
     use uc_log::cnc::{CncMeta, CncPage};
 

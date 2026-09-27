@@ -568,7 +568,7 @@ fn mixed_version_scenario(app: &str) -> Result<(), String> {
 /// end, so a matching binary restarted after the record never re-adjudicates
 /// it. (KvV2 on every node — leader-move robustness, as elsewhere here.)
 #[test]
-fn a_restart_after_the_stop_is_covered_by_attach() {
+fn a_matching_restart_after_genesis_does_not_stop_again() {
     let c = three_node_cluster("rowrestart");
     let leader = c.wait_leader();
     let mut svcs: Vec<Option<uc_service::Service<KvV2>>> =
@@ -820,6 +820,21 @@ impl Cluster {
     /// position is published a moment after the artifact lands). Anything
     /// else fails here, named.
     fn pin(&self, row: u8, from: u32, to: u32, origin: u64) -> (usize, u64) {
+        self.try_pin(row, from, to, origin)
+            .unwrap_or_else(|(l, status, reason)| {
+                panic!("upgrade pin refused on node {l}: status={status} reason={reason}")
+            })
+    }
+
+    /// [`Self::pin`], handing back a non-racy refusal as `(node, status,
+    /// reason)` instead of failing on it.
+    fn try_pin(
+        &self,
+        row: u8,
+        from: u32,
+        to: u32,
+        origin: u64,
+    ) -> Result<(usize, u64), (usize, u32, u32)> {
         use std::io::Write as _;
         use std::os::unix::fs::OpenOptionsExt as _;
         use uc_protocol::v2::upgrade::{UpgradePin, encode_upgrade_pin};
@@ -875,15 +890,12 @@ impl Cluster {
                 std::thread::yield_now();
             };
             if resp.status == 0 {
-                return (l, resp.version);
+                return Ok((l, resp.version));
             }
             let racy = resp.status == 2 || resp.reason == uc_node::REASON_PIN_NO_SET;
-            assert!(
-                racy && Instant::now() < deadline,
-                "upgrade pin refused on node {l}: status={} reason={}",
-                resp.status,
-                resp.reason
-            );
+            if !(racy && Instant::now() < deadline) {
+                return Err((l, resp.status, resp.reason));
+            }
             std::thread::sleep(Duration::from_millis(10));
         }
     }
@@ -947,6 +959,43 @@ impl Cluster {
                 return false;
             }
             std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// A RE-STAGE of a pin whose earlier attempt was not seen to commit in
+    /// time (final review M6). That attempt may have committed LATE, and then
+    /// the re-stage is refused 55 (`pin_not_monotone`: the same origin is no
+    /// longer above the row's pin). Recognise that case from the leader's
+    /// row view — its pin names this `origin` and `to`, and the row's running
+    /// version is `to` — and hand back `(leader, record_pos)`: the committed
+    /// pin's END, exactly what an accepted reply would have returned. Any
+    /// other refusal still fails, named.
+    fn restage_pin(&self, row: u8, from: u32, to: u32, origin: u64) -> (usize, u64) {
+        match self.try_pin(row, from, to, origin) {
+            Ok(hit) => hit,
+            Err((_, _, reason)) if reason == uc_node::REASON_PIN_NOT_MONOTONE => {
+                let l = self.wait_leader();
+                match self.page(l).service_slot(row as usize).status.row_view() {
+                    uc_log::cnc::RowRead::View {
+                        pin: Some((o, _, t)),
+                        running: Some(v),
+                        record_pos,
+                    } if (o, t, v) == (origin, to, to) => {
+                        eprintln!(
+                            "re-staged pin refused 55: the earlier attempt committed late at \
+                             {record_pos}; carrying on with it"
+                        );
+                        (l, record_pos)
+                    }
+                    other => panic!(
+                        "upgrade pin refused 55 on node {l}, and no committed pin to {to:#x} at \
+                         origin {origin} is on its row view: {other:?}"
+                    ),
+                }
+            }
+            Err((l, status, reason)) => {
+                panic!("upgrade pin refused on node {l}: status={status} reason={reason}")
+            }
         }
     }
 }
@@ -1099,6 +1148,28 @@ impl<'a> Workload<'a> {
     }
 }
 
+/// Final review M6: a pin re-staged because its earlier attempt was not
+/// SEEN to commit in time may find that attempt DID commit late — the
+/// re-stage is then refused 55 (`pin_not_monotone`: same origin). The retry
+/// must recognise the committed pin (the row's running version is `to`, its
+/// pin names this origin) and carry on with it, not fail the test.
+#[test]
+fn a_restaged_pin_that_already_committed_is_recognised() {
+    let c = three_node_cluster("rowrestage");
+    c.wait_leader();
+    let olds = c.start_all::<KvV1>();
+    let from = pack_version(1, 0, 0);
+    let to = pack_version(2, 0, 0);
+    let origin = c.snapshot_instant();
+    let (on, end) = c.pin(0, from, to, origin);
+    assert!(c.pin_committed_within(on, end, to, Duration::from_secs(30)));
+    // The earlier attempt committed; re-staging the same pin must hand it
+    // back, not panic on the 55.
+    let (_, again) = c.restage_pin(0, from, to, origin);
+    assert_eq!(again, end, "the re-stage recognised the committed pin");
+    drop(olds);
+}
+
 /// #33 spec §10.2 (and §4.3, §7.2): 1.0 services are attached and applying
 /// UNDER LOAD when a pin to 2.0 commits. Each stops at EXACTLY the pin
 /// record — its slot's `applied` is the record's frame START (every earlier
@@ -1146,7 +1217,13 @@ fn a_committed_pin_stops_every_old_service_at_exactly_the_record() {
         let mut attempt = 0;
         let (pinned_on, pin_end) = loop {
             attempt += 1;
-            let (on, end) = c.pin(0, from, to, origin);
+            // A re-stage recognises an earlier attempt that committed late
+            // (refused 55) instead of failing on it — final review M6.
+            let (on, end) = if attempt == 1 {
+                c.pin(0, from, to, origin)
+            } else {
+                c.restage_pin(0, from, to, origin)
+            };
             w.pinned.store(true, SeqCst);
             if c.pin_committed_within(on, end, to, Duration::from_secs(10)) {
                 break (on, end);

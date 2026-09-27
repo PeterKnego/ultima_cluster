@@ -413,7 +413,7 @@ impl ClusterFsm {
             }
             ClusterCommand::UpgradePin(p) => {
                 // Spec §2.5, replicated half only: the row's history is FSM
-                // state. `pin_row_undeclared` (52), the no-running-version
+                // state. `row_undeclared` (52), the no-running-version
                 // half of `pin_from_mismatch` (53, against the attached
                 // version WORD) and `pin_no_set` (54, this leader's
                 // filesystem) are node-local and stay at the door

@@ -4125,8 +4125,11 @@ impl Consensus {
         }
         // 3a''''. #33 spec §6.1: record the leader's own attached version for
         // any declared row that has none — the fourth leader-issued `CLUSTER`
-        // append, same gate, same reason. One mask test in steady state.
-        if serving && !hold_clients {
+        // append, same gate, same reason. Steady state is one field test: once
+        // every declared row is versioned the latch below is set (by this
+        // append's own mask test or by the client gate, `rows_versioned`) and
+        // the call is skipped — a committed version is never removed.
+        if serving && !hold_clients && !self.rows_versioned_latched {
             did |= self.maybe_append_row_genesis();
         }
         if serving && !hold_clients {
@@ -5954,7 +5957,10 @@ impl Consensus {
     /// Append pending + queued payloads via the leader appender, bounded.
     fn drain_ingress(&mut self) -> bool {
         let mut did = false;
-        // #33 spec §6.2: the same client gate as `drain_ingress_ring`.
+        // #33 spec §6.2: the same client gate as `drain_ingress_ring`. It
+        // also holds the test-only `Ingress::TimerForTest` frames queued on
+        // this channel, not just client payloads — a harness that injects a
+        // timer before every declared row is versioned waits with the rest.
         if !self.rows_versioned() {
             return did;
         }
@@ -6885,8 +6891,10 @@ impl Consensus {
     /// from then on the row has a line that attach and pins are checked
     /// against.
     ///
-    /// Steady state (every declared row versioned) is one `Acquire` load and
-    /// one mask test. While a declared row is still unversioned and this
+    /// Steady state (every declared row versioned) never calls this: the
+    /// caller tests `rows_versioned_latched` first, and the first call that
+    /// finds no row missing sets that latch (so does the client gate,
+    /// [`Self::rows_versioned`]). While a declared row is still unversioned and this
     /// leader has no attached, live service for it, each pass instead runs
     /// the (at most 8-row, out-of-line) slot loop and appends nothing — cheap,
     /// and bounded to the window before genesis commits. Single-in-flight like every leader-issued `CLUSTER`
@@ -6904,6 +6912,9 @@ impl Consensus {
         let versioned = self.cluster_view.versioned.load(Ordering::Acquire);
         let missing = declared & !versioned;
         if missing == 0 {
+            // Latched for the incarnation, as `rows_versioned` latches it: a
+            // committed version is never removed.
+            self.rows_versioned_latched = true;
             return false;
         }
         let view_position = self.cluster_view.position.load(Ordering::Acquire);
@@ -16409,7 +16420,14 @@ mod tests {
         st.applied = end;
         h.cons.cluster_view.publish(&st);
         assert_eq!(h.cons.cluster_view.versioned.load(Ordering::Acquire), 1);
+        assert!(
+            !h.cons.rows_versioned_latched,
+            "not latched before the view says so"
+        );
         assert!(!h.cons.maybe_append_row_genesis());
+        // Final review M5: that call latched, so the pass's call site skips
+        // the append on a field test from now on.
+        assert!(h.cons.rows_versioned_latched);
     }
 
     /// Spec §3 S4 steps 2–3: pin → CLUSTER frame → applied at commit →

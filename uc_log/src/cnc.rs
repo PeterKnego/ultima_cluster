@@ -173,11 +173,12 @@ pub fn pack_naks_plus_replay(naks_served: u32, replay_datagrams: u32) -> u64 {
 /// cnc 3.1: the slot's line 0 — `status` (word 0) and the attached service's
 /// packed version (word 1). cnc 3.3 (plan B1, extended by plan B2) adds four
 /// more words to the same line, `upgrade_origin`/`pinned_version`/
-/// `pinned_from` and the `pin_seq` seqlock that publishes them together — a
-/// second writer on the line: the service still owns `status`/`version`
-/// (attach/detach), the node's `uc2-cluster` agent owns the four pin words
-/// (republished on every view publish), and each word still has exactly one
-/// writer.
+/// `pinned_from` and the `pin_seq` seqlock that publishes them together, and
+/// cnc 3.4 (#33) two more under the same seqlock, `running_version`/
+/// `running_record_pos` — a second writer on the line: the service still
+/// owns `status`/`version` (attach/detach), the node's `uc2-cluster` agent is
+/// the SINGLE writer of all six row-view words (republished on every view
+/// publish), and each word still has exactly one writer.
 #[repr(C)]
 pub struct ServiceStatusLine {
     status: AtomicU64,
@@ -224,9 +225,11 @@ impl ServiceStatusLine {
     }
     /// The triple as it was stored, or a named reason it could not be read.
     ///
-    /// The pin occupies four words on the status line: **three data words
-    /// under one sequence word** (`upgrade_origin`, `pinned_version`,
-    /// `pinned_from`, committed by `pin_seq`). Everything below says "triple"
+    /// The row view occupies six words on the status line: **five data
+    /// words under one sequence word** (the pin's `upgrade_origin`,
+    /// `pinned_version` and `pinned_from`, plus cnc 3.4's `running_version`
+    /// and `running_record_pos`, all committed by `pin_seq`, single writer).
+    /// This reader returns the pin's three; everything below says "triple"
     /// for the data the caller gets back.
     ///
     /// `upgrade_origin`, `pinned_version` and `pinned_from` are three
@@ -284,7 +287,7 @@ impl ServiceStatusLine {
     /// `to`, store `from`, store the origin, bump back to EVEN — every step
     /// `Release`, so a reader that observes any data word also observes the
     /// ODD bump that preceded it. SINGLE WRITER (the `uc2-cluster` polling
-    /// agent owns all four words), so the bumps need no CAS; two concurrent
+    /// agent owns all six row-view words), so the bumps need no CAS; two concurrent
     /// callers would corrupt the sequence, not merely race.
     ///
     /// Kept for existing callers; delegates to [`Self::store_row_view`],

@@ -298,7 +298,8 @@ mod tests {
         assert!(!same_line(pack_version(1, 4, 2), pack_version(2, 4, 2)));
         assert!(same_line(0, 0));
         assert!(!same_line(0, pack_version(1, 0, 0)));
-        // raw small ints (the uc_lincheck fixtures' VERSION = 1/2/3) are 0.0.x:
+        // raw small ints (bare-integer VERSIONs 1, 2, 3 …) are 0.0.x, one line
+        // — which is why the uc_lincheck fixtures now pack 0.0.0/0.2.0/0.3.0:
         assert!(same_line(1, 3));
     }
 

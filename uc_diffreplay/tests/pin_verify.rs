@@ -247,8 +247,9 @@ fn a_durable_register_is_rewound_to_the_origin_and_passes() {
     );
 }
 
-/// (c) Teeth for the swap arm: NEW is the OLD binary (version 0) while the
-/// pin names 2 — the SDK refuses it at attach, and the mode must FAIL.
+/// (c) Teeth for the swap arm: NEW is the OLD binary (version 0.0.0) while
+/// the pin names 0.2.0 — another line, so the SDK refuses it at attach, and
+/// the mode must FAIL.
 #[test]
 fn a_new_binary_that_is_not_the_pinned_version_is_a_fail() {
     let (_inst, corpus) = cas_corpus("pv-stale");

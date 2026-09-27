@@ -203,7 +203,13 @@ pub(crate) fn stop_at_record<S: crate::traits::RawStateMachine>(
     // Clear ATTACHED and nothing else: the incarnation (a fresh attach bumps
     // it) and SNAPSHOT_CAPABLE stay, so the node can still command an
     // instant while the row sits stopped at the record. This apply thread is
-    // the status word's writer while attached; nothing else stores it here.
+    // the status word's writer while attached, with ONE exception (final
+    // review M8): `Service::stop` on the owning thread also clears ATTACHED,
+    // by a plain store rather than a read-modify-write, and the two may race
+    // on this word. The race is harmless: both write ATTACHED clear with the
+    // same incarnation, so either order leaves a detached row; the only
+    // difference is whether SNAPSHOT_CAPABLE survives (this store keeps it,
+    // `stop`'s drops it), and a stopped service is detached either way.
     let w = slot.status.load_acquire();
     slot.status
         .store_release(w & !uc_protocol::v2::cnc::CNC_SVC_STATUS_ATTACHED);

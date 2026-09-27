@@ -860,11 +860,12 @@ mod tests {
         assert_eq!(CNC_OFF_FSM_LAG_BYTES, 4040);
         assert_eq!(CNC_OFF_FSM_LAG_BYTES - CNC_OFF_SERVICES_DECLARED, 8);
         // time-and-timers spec §6 (FROZEN): the archive's last recorded stamp,
-        // third word of the boot-once 4032 line.
+        // third word of the 4032 line — live-written, NOT boot-once.
         assert_eq!(CNC_OFF_LOG_TIME_NS, 4048);
         assert_eq!(CNC_OFF_LOG_TIME_NS, CNC_OFF_FSM_LAG_BYTES + 8);
         // #33 (row running version): the cluster agent's last-applied position,
-        // fourth and last word of the boot-once 4032 line.
+        // fourth and last word of the 4032 line — live-written by the cluster
+        // agent, NOT boot-once (only 4032/4040 are).
         assert_eq!(CNC_OFF_CLUSTER_APPLIED, 4056);
         assert_eq!(CNC_OFF_CLUSTER_APPLIED, CNC_OFF_LOG_TIME_NS + 8);
         // per-row pending-timer count, the word after identity_hash on line 7.

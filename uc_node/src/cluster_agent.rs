@@ -334,8 +334,9 @@ impl ClusterAgent {
         }
     }
 
-    /// Plan B1: name what an ACCEPTED pin or report did, at the time it
-    /// did it. `row` is the payload's first byte, the same for both kinds.
+    /// Plan B1: name what an ACCEPTED pin, report or (#33) row-genesis
+    /// record did, at the time it did it. `row` is the payload's first byte,
+    /// the same for all three kinds.
     /// A report's verdict is recomputed here from FSM state, not stored.
     ///
     /// Takes `fsm` rather than `&self` — same reason as

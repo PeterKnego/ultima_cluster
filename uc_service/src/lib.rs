@@ -553,6 +553,13 @@ impl<S: RawStateMachine> Service<S> {
     /// (fail-loud in teardown). `crash()` deliberately leaves the bit set — a
     /// crash is indistinguishable from a kill; the heartbeat ages instead
     /// (spec §8).
+    ///
+    /// #33 (final review M8): the apply thread's version stop
+    /// (`version_gate::stop_at_record`) ALSO clears ATTACHED on this word, and
+    /// may race this store. Harmless: both leave ATTACHED clear with the same
+    /// incarnation; they differ only in whether SNAPSHOT_CAPABLE survives
+    /// (the version stop keeps it, this store drops it), and either way the
+    /// row reads detached.
     pub fn stop(self) {
         let s = attach::slot(&self._cnc, self.service_id);
         let (_, _, inc) = uc_log::cnc::unpack_service_status(s.status.load_acquire());

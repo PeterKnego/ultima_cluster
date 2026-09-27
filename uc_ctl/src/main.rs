@@ -361,6 +361,13 @@ struct UpgradePinArgs {
     /// > 0).
     #[arg(long)]
     origin: u64,
+    /// Allow a SAME-LINE pin (`--from` and `--to` share major.minor, patch
+    /// differs). Refused without this flag: a same-line pin does not refuse
+    /// the old build — patch builds of one line mix by design — so it is
+    /// almost always a mis-packed version (a bare-integer `const VERSION`
+    /// packs as `0.0.x`; use `pack_version(major, minor, patch)`).
+    #[arg(long)]
+    patch: bool,
 }
 
 #[derive(clap::Args)]
@@ -589,6 +596,7 @@ fn main() {
                 args.from.as_deref(),
                 &args.to,
                 args.origin,
+                args.patch,
             ),
             UpgradeCmd::Show(args) => upgrade::show(&args.common),
         },
@@ -688,12 +696,13 @@ fn reason_str(reason: u32) -> &'static str {
         }
         // FSM upgrade lifecycle (spec §2.5, plan B1): `ADMIN_OP_UPGRADE_PIN`
         // (wire op 10) — `uc_node::REASON_PIN_*`. #33 spec §6.3: renamed
-        // from `pin_row_undeclared` — the door check it names (this node
-        // does not declare the row in `[services] names`) is now shared with
-        // the automatic genesis record, not just a pin.
+        // from `pin_row_undeclared` to the bare `row_undeclared` (the
+        // explanation lives in `docs/reference/uc2ctl.md`). As built, only a
+        // pin refuses 52 — the automatic genesis record refuses only 60
+        // (spec errata, "Smaller as-built facts").
         52 => "row_undeclared",
         53 => {
-            "pin_from_mismatch (--from is not the row's current version: its newest pin's `to`, or, with no pin yet, the version the service is attached at)"
+            "pin_from_mismatch (--from is not on the row's running line — same major.minor as its running version, patch ignored — or, with no running version yet, on the line of the version the service is attached at)"
         }
         54 => {
             "pin_no_set (no complete snapshot set at --origin on this node — run `uc2ctl snapshot`, wait for uc2_snapshot_set_position to reach it, and pin THAT position)"
