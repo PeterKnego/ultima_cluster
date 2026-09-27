@@ -979,6 +979,15 @@ struct Workload<'a> {
     ok_total: std::sync::atomic::AtomicU64,
 }
 
+/// Sets the flag on drop — on the success path and on unwind.
+struct StopOnDrop<'a>(&'a std::sync::atomic::AtomicBool);
+
+impl Drop for StopOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
 /// Per-op request timeout for the workload's clients: long enough for a
 /// loaded loopback cluster, short enough that the ops caught in the
 /// stop-to-attach gap resolve (as indeterminate) quickly.
@@ -1122,6 +1131,11 @@ fn a_committed_pin_stops_every_old_service_at_exactly_the_record() {
     let sink = ObsCapture::take();
 
     let (pin_end, pin_start, committed_seq, _news) = std::thread::scope(|s| {
+        // `thread::scope` joins every worker before re-raising a panic from
+        // this closure, and the workers loop until `stop`: without this guard
+        // any failing assertion below would HANG the test instead of failing
+        // it. Dropped on success and on unwind alike.
+        let _stop_workers = StopOnDrop(&w.stop);
         s.spawn(|| w.writer(1));
         s.spawn(|| w.writer(2));
         s.spawn(|| w.reader(3));
@@ -1174,7 +1188,6 @@ fn a_committed_pin_stops_every_old_service_at_exactly_the_record() {
         w.v2_up.store(true, SeqCst);
         // The row resumes under the recorded load.
         c.wait(|| w.ok_after_v2.load(SeqCst) >= 50);
-        w.stop.store(true, SeqCst);
         (pin_end, pin_start, committed_seq, news)
     });
 
