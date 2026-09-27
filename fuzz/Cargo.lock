@@ -1089,6 +1089,7 @@ dependencies = [
  "tokio",
  "uc_journal",
  "uc_log",
+ "uc_obs",
  "uc_protocol",
 ]
 

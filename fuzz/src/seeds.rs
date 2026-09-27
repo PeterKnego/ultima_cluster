@@ -1366,6 +1366,7 @@ pub fn uc_protocol_cluster_frame() -> Vec<Seed> {
     use uc_protocol::v2::frame::{CLUSTER_BODY_PREFIX_LEN, ClusterKind, write_cluster_prefix};
     use uc_protocol::v2::schedule::{ScheduleEntry, ScheduleRule, ScheduleTable, encode_schedule_table};
     use uc_protocol::v2::settings::{Settings, encode_settings};
+    use uc_protocol::v2::upgrade::{RowGenesis, encode_row_genesis};
 
     fn prefixed(kind: ClusterKind, payload: &[u8]) -> Vec<u8> {
         let mut v = vec![0u8; CLUSTER_BODY_PREFIX_LEN];
@@ -1401,6 +1402,13 @@ pub fn uc_protocol_cluster_frame() -> Vec<Seed> {
     let mut settings_bytes = Vec::new();
     encode_settings(&Settings::genesis_default(), &mut settings_bytes);
 
+    // #33: kind 6, a row's genesis running version (row 0 at 1.2.0).
+    let mut genesis_bytes = Vec::new();
+    encode_row_genesis(
+        &RowGenesis { row: 0, version: uc_protocol::identity::pack_version(1, 2, 0) },
+        &mut genesis_bytes,
+    );
+
     let mut unknown_kind = vec![0u8; CLUSTER_BODY_PREFIX_LEN];
     unknown_kind[0] = 9;
 
@@ -1415,6 +1423,7 @@ pub fn uc_protocol_cluster_frame() -> Vec<Seed> {
         Seed::fixed("04-short", vec![0u8; 4]),
         Seed::fixed("05-unknown-kind", unknown_kind),
         Seed::fixed("06-reserved-nonzero", reserved_nonzero),
+        Seed::fixed("07-row-genesis", prefixed(ClusterKind::RowGenesis, &genesis_bytes)),
     ]
 }
 
@@ -1431,6 +1440,7 @@ pub fn uc_protocol_cluster_frame() -> Vec<Seed> {
 /// wires it up correctly end to end.
 pub fn uc_protocol_cluster_image() -> Vec<Seed> {
     use uc_protocol::v2::cluster_image::{ClusterImageParts, encode_cluster_image};
+    use uc_protocol::v2::upgrade::{RowRunning, encode_running_list};
     use uc_protocol::v2::config::{WireConfig, encode_config};
     use uc_protocol::v2::schedule::{ScheduleTable, encode_schedule_table};
     use uc_protocol::v2::settings::{Settings, encode_settings};
@@ -1465,9 +1475,21 @@ pub fn uc_protocol_cluster_image() -> Vec<Seed> {
     let mut bad_crc = image.clone();
     *bad_crc.last_mut().expect("non-empty image") ^= 1;
 
+    // #33: layout v3's trailing `running` blob, non-empty — one row with a
+    // running version recorded by its genesis.
+    let mut running = Vec::new();
+    encode_running_list(
+        &[RowRunning { row: 0, version: uc_protocol::identity::pack_version(1, 2, 0), record_pos: 96 }],
+        &mut running,
+    );
+    let mut v3_running = Vec::new();
+    encode_cluster_image(&ClusterImageParts { running: &running, ..parts }, &mut v3_running)
+        .expect("genesis parts are well under u32::MAX");
+
     vec![
         Seed::fixed("21-cluster-image", image),
         Seed::fixed("22-cluster-image-bad-crc", bad_crc),
+        Seed::fixed("23-cluster-image-v3-running", v3_running),
     ]
 }
 
@@ -1484,6 +1506,7 @@ pub fn uc_node_cluster_artifact() -> Vec<Seed> {
     use uc_protocol::v2::frame::{CLUSTER_BODY_PREFIX_LEN, write_cluster_prefix};
     use uc_protocol::v2::schedule::{ScheduleEntry, ScheduleRule, ScheduleTable};
     use uc_protocol::v2::settings::Settings;
+    use uc_protocol::v2::upgrade::RowGenesis;
     use uc_service::{ApplyCtx, RawStateMachine, SnapshotStateMachine};
 
     // One declared row, so the table command below is accepted rather than
@@ -1520,6 +1543,19 @@ pub fn uc_node_cluster_artifact() -> Vec<Seed> {
     );
     let (image, _pos) = fsm.freeze().expect("freeze the cluster image");
 
+    // #33: the same FSM after a row genesis (kind 6) — a v3 image whose
+    // trailing `running` blob is non-empty, so the running-list decode under
+    // `install_snapshot` has a real entry to start from.
+    fsm.apply(
+        &mut ApplyCtx::for_sm::<ClusterFsm>(960),
+        &body(&ClusterCommand::RowGenesis(RowGenesis {
+            row: 0,
+            version: uc_protocol::identity::pack_version(1, 2, 0),
+        })),
+        &mut out,
+    );
+    let (v3_running, _pos) = fsm.freeze().expect("freeze the cluster image after a genesis");
+
     let mut bad_crc = image.clone();
     *bad_crc.last_mut().expect("non-empty image") ^= 1;
 
@@ -1545,6 +1581,7 @@ pub fn uc_node_cluster_artifact() -> Vec<Seed> {
         Seed::fixed("03-truncated", truncated),
         Seed::fixed("04-bad-magic", bad_magic),
         Seed::fixed("05-lying-membership-length", lying_length),
+        Seed::fixed("v3_running", v3_running),
     ]
 }
 
