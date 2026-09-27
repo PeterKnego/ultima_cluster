@@ -291,6 +291,13 @@ pub(crate) struct ApplyState<S: RawStateMachine> {
     /// this binary's `S::VERSION`, and the guard's same-version rule (plan B2
     /// T3) must make an exception for exactly that artifact and no other.
     pub(crate) pin: Option<(u64, u32, u32)>,
+    /// #33: every version record at or below this frame-END was decided by
+    /// this attach; the apply loop adjudicates only later ones.
+    #[expect(
+        dead_code,
+        reason = "#33: recorded at attach here; read by the apply-loop version arm (plan Task 9)"
+    )]
+    pub(crate) attach_record_pos: u64,
     /// M14a Task 7: the lag barrier mode this incarnation runs under, fixed at
     /// attach (the page's lag config is boot-once, like `service_id`).
     pub(crate) lag_mode: crate::lag::LagMode,
@@ -1410,6 +1417,7 @@ mod tests {
             my_epoch: 1,
             service_id: 0,
             pin: None,
+            attach_record_pos: 0,
             lag_mode: crate::lag::LagMode::Off,
             declared: 0b1,
             lag_waiting: false,
@@ -1595,6 +1603,7 @@ mod tests {
             my_epoch: 1,
             service_id: 0,
             pin: None,
+            attach_record_pos: 0,
             lag_mode: crate::lag::LagMode::Off,
             declared: 0b1,
             lag_waiting: false,
@@ -1703,6 +1712,7 @@ mod tests {
             my_epoch: 1,
             service_id: 0,
             pin: None,
+            attach_record_pos: 0,
             lag_mode: crate::lag::LagMode::Off,
             declared: 0b1,
             lag_waiting: false,
@@ -1894,6 +1904,7 @@ mod tests {
             my_epoch: 1,
             service_id: 0,
             pin: None,
+            attach_record_pos: 0,
             lag_mode: crate::lag::LagMode::Bounded(BOUND),
             declared: 0b11,
             lag_waiting: false,

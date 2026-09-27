@@ -741,10 +741,18 @@ fn a_pinned_origin_with_no_artifact_is_refused() {
 /// Plan B2 erratum: the pinned install cross-checks the artifact against the
 /// pin's `from`, not against `S::VERSION`. A pin naming a `from` no artifact
 /// on this node was built by is refused by name.
+///
+/// #33 D3 (spec §7.3): that cross-check is by LINE, so "no artifact was built
+/// by `from`" means "none was built on `from`'s major.minor". The artifact
+/// here was built by `V1` (0.0.0); `from` is 1.0.0, a different line. (This
+/// test used `from = 3` — 0.0.3, the same line as 0.0.0 since #33, which
+/// [`a_pinned_artifact_built_by_a_patch_of_from_is_installed`] now covers.)
 #[test]
 fn a_pinned_artifact_built_by_the_wrong_version_is_refused() {
     let f = Fixture::new("pin-wrongfrom");
-    f.pin(3, V2);
+    let off_line = uc_protocol::identity::pack_version(1, 0, 0);
+    assert!(!uc_protocol::identity::same_line(off_line, V1));
+    f.pin(off_line, V2);
 
     let err = ServiceBuilder::new(cfg(f.path(), f.app), DoublingRegisterSm::default())
         .start_with_snapshots()
@@ -756,13 +764,39 @@ fn a_pinned_artifact_built_by_the_wrong_version_is_refused() {
             ServiceError::MistaggedSnapshot {
                 source: EnvelopeError::VersionMismatch {
                     built: V1,
-                    expected: 3
+                    expected
                 },
                 ..
-            }
+            } if expected == off_line
         ),
         "{err}"
     );
+    f.stop();
+}
+
+/// #33 D3 (spec §7.3): patch builds of one line share the artifact format, so
+/// a pin whose `from` is another PATCH of the artifact's builder installs it —
+/// origin artifacts on different nodes may come from different patch builds
+/// of `from`'s line. `Some(CAS_NEW)` is the install-then-recompute signature
+/// (module doc).
+#[test]
+fn a_pinned_artifact_built_by_a_patch_of_from_is_installed() {
+    let f = Fixture::new("pin-patchfrom");
+    let patch = V1 + 3; // 0.0.3: same major.minor as V1 (0.0.0), other patch
+    assert!(patch != V1 && uc_protocol::identity::same_line(patch, V1));
+    f.pin(patch, V2);
+
+    let svc2 = ServiceBuilder::new(cfg(f.path(), f.app), DoublingRegisterSm::default())
+        .start_with_snapshots()
+        .expect("a same-line artifact installs");
+    let cnc = f.cnc();
+    wait_service_caught_up(&cnc);
+    assert_eq!(
+        query_v2(&svc2),
+        Some(CAS_NEW),
+        "the artifact at P was installed, then the tail recomputed under v2"
+    );
+    drop(svc2);
     f.stop();
 }
 

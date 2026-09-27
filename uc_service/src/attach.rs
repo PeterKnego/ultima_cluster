@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 use uc_log::buffer::LogBuffer;
-use uc_log::cnc::{CncPage, PinRead, pack_service_status, unpack_service_status};
+use uc_log::cnc::{CncPage, PinRead, RowRead, pack_service_status, unpack_service_status};
 use uc_log::reader::LogFollower;
 use uc_protocol::ring::{BroadcastRing, SpscRing};
 use uc_protocol::v2::cnc::CNC_SVC_STATUS_SNAPSHOT_CAPABLE;
@@ -269,6 +269,24 @@ pub(crate) fn attach<S: RawStateMachine>(
             Some((origin, from, to))
         }
     };
+    // 1e. #33 spec §7.1: the row's RUNNING version, one seqlock read, still
+    //     before any slot word is written. Absent → proceed (a genesis
+    //     record is coming and the apply loop adjudicates it). A pinned
+    //     attach already passed the stricter exact check above.
+    let attach_record_pos = match s.status.row_view() {
+        RowRead::Contended => return Err(ServiceError::RowViewUnreadable { row }),
+        RowRead::View {
+            running: Some(r), ..
+        } if !uc_protocol::identity::same_line(S::VERSION, r) => {
+            return Err(ServiceError::VersionMismatch {
+                name: S::IDENTITY.name.as_str().to_string(),
+                row,
+                running: r,
+                mine: S::VERSION,
+            });
+        }
+        RowRead::View { record_pos, .. } => record_pos,
+    };
     // UNCONDITIONAL install (step 4): the artifact at the origin, built by
     // the pin's `from`, replaces whatever state this state machine holds — a
     // DURABLE state machine already above the origin is rewound to it and
@@ -477,6 +495,7 @@ pub(crate) fn attach<S: RawStateMachine>(
         // the gap guard's same-version rule (plan B2 T3) has to make an
         // exception for exactly that one artifact. See `replay::replay_into`.
         pin,
+        attach_record_pos,
         lag_mode,
         declared,
         lag_waiting: false,

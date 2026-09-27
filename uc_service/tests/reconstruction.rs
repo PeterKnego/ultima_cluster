@@ -930,77 +930,88 @@ fn gap_without_snapshot_capability_fails_stop_with_named_contract() {
     node.stop();
 }
 
-/// Plan B2 T3: the gap guard's install cross-checks the version. A covering
-/// artifact built by `RegisterSm` sits below the purge floor (same setup as
-/// `fresh_service_below_purge_floor_installs_snapshot_then_tail_replays`), but
-/// the fresh attach is `DoublingRegisterSm` (same `NAME` — "register" — so it
-/// lands on the same row, but `VERSION = 2` and a genuinely different `apply`).
-/// An UNPINNED install must be same-version: installing the v-whatever
-/// artifact and tail-replaying it under `DoublingRegisterSm::apply` is the
-/// §2.3 silent counterfactual (a doubled value from the row that never should
-/// have been doubled), so the gap guard must refuse it by name instead of
-/// "succeeding".
+/// `DoublingRegisterSm`'s semantics on a DIFFERENT LINE (1.0.0) from
+/// `RegisterSm` (0.0.0). `DoublingRegisterSm` itself declares raw `2` =
+/// 0.0.2, the SAME line as `RegisterSm` under #33's D3 (patch is free), so it
+/// can no longer stand for "a newer binary" in a version-refusal test.
+#[derive(Default)]
+struct OffLineDoublingSm(DoublingRegisterSm);
+
+impl StateMachine for OffLineDoublingSm {
+    const NAME: &'static str = <RegisterSm as StateMachine>::NAME;
+    const VERSION: u32 = uc_protocol::identity::pack_version(1, 0, 0);
+    type Command = RegCmd;
+    type Response = <DoublingRegisterSm as StateMachine>::Response;
+    type Query = ();
+    type QueryResponse = Option<u64>;
+    fn apply(&mut self, ctx: &mut ApplyCtx, cmd: RegCmd) -> Self::Response {
+        self.0.apply(ctx, cmd)
+    }
+    fn query(&self, q: ()) -> Option<u64> {
+        self.0.query(q)
+    }
+    fn last_applied(&self) -> Option<u64> {
+        StateMachine::last_applied(&self.0)
+    }
+}
+
+impl uc_service::SnapshotStateMachine for OffLineDoublingSm {
+    type SnapshotHandle = <DoublingRegisterSm as uc_service::SnapshotStateMachine>::SnapshotHandle;
+    fn freeze(&self) -> Result<(Self::SnapshotHandle, u64), uc_service::SnapshotError> {
+        self.0.freeze()
+    }
+    fn stream_snapshot(
+        h: Self::SnapshotHandle,
+        dst: &mut dyn std::io::Write,
+    ) -> Result<(), uc_service::SnapshotError> {
+        DoublingRegisterSm::stream_snapshot(h, dst)
+    }
+    fn install_snapshot(
+        &mut self,
+        p: u64,
+        src: &mut dyn std::io::Read,
+    ) -> Result<u64, uc_service::SnapshotError> {
+        self.0.install_snapshot(p, src)
+    }
+}
+
+/// Plan B2 T3: an UNPINNED newer binary must never install an older
+/// version's artifact and tail-replay it under its own `apply` — the §2.3
+/// silent counterfactual. Same setup as
+/// `fresh_service_below_purge_floor_installs_snapshot_then_tail_replays`: a
+/// covering artifact built by `RegisterSm` (0.0.0) below the purge floor.
+///
+/// #33 (spec §7.1) moves the refusal EARLIER. `RegisterSm`'s attach recorded
+/// 0.0.0 as the row's running version, so a binary off that line (1.0.0) is
+/// now refused at ATTACH, by name, before it installs anything or writes a
+/// slot word — the gap guard's envelope check (by line since D3, unit-covered
+/// in `snapshots.rs` and `pinned_attach.rs`) is no longer the first line of
+/// defence here. This test used `DoublingRegisterSm` (0.0.2) and asserted the
+/// gap guard's apply-thread fail-stop; 0.0.2 is the same line as 0.0.0 since
+/// #33, so that binary is now admitted by design (D3: patch is trusted).
 #[test]
 fn an_unpinned_newer_binary_cannot_install_an_older_versions_artifact() {
     let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let app = "rec_ver_mismatch";
     let (node, _prod) = purged_node_after_snapshotting_service(dir.path(), app, 4_000);
 
-    // Own the panic hook exclusively for the rest of this test — see
-    // `PANIC_HOOK_LOCK`'s doc (poison-tolerant, same reasoning as
-    // `gap_without_snapshot_capability_fails_stop_with_named_contract`).
-    let _hook_guard = PANIC_HOOK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    PANIC_LOG.lock().unwrap().clear();
-    let prev = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|info| {
-        PANIC_LOG.lock().unwrap().push(info.to_string());
-    }));
-
-    // Service #2: a FRESH, snapshot-capable `DoublingRegisterSm` below the
-    // purge floor, WITHOUT a pin. The gap guard finds the covering artifact —
-    // built by `RegisterSm` — but must not install it under a different
-    // `S::VERSION`.
-    let svc2 = ServiceBuilder::new(
+    let built = <RegisterSm as StateMachine>::VERSION;
+    let mine = <OffLineDoublingSm as StateMachine>::VERSION;
+    let err = ServiceBuilder::new(
         ServiceConfig::new(dir.path(), app),
-        DoublingRegisterSm::default(),
+        OffLineDoublingSm::default(),
     )
     .start_with_snapshots()
-    .unwrap();
-
-    let built = <RegisterSm as StateMachine>::VERSION;
-    let expected = <DoublingRegisterSm as StateMachine>::VERSION;
-    let version_mismatch = format!(
-        "artifact was built by version {built:#010x} but {expected:#010x} is required here"
-    );
-
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let fired = loop {
-        if PANIC_LOG
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|m| m.contains("MistaggedSnapshot") && m.contains(&version_mismatch))
-        {
-            break true;
-        }
-        if Instant::now() >= deadline {
-            break false;
-        }
-        std::thread::sleep(Duration::from_millis(5));
-    };
-    std::panic::set_hook(prev);
-    // Release the hook lock BEFORE our own `assert!` — see the sibling
-    // test's matching comment.
-    drop(_hook_guard);
+    .err()
+    .expect("an off-line binary is refused at attach");
     assert!(
-        fired,
-        "the apply agent must fail-stop with MistaggedSnapshot/VersionMismatch \
-         ({built:#010x} vs {expected:#010x}) within the deadline"
+        matches!(
+            err,
+            uc_service::ServiceError::VersionMismatch { row: 0, running, mine: m, .. }
+                if running == built && m == mine
+        ),
+        "{err}"
     );
-
-    // The apply thread is dead; `crash()` joins via Drop (swallowing the
-    // panic), so teardown does not re-raise it.
-    svc2.crash();
     node.stop();
 }
 

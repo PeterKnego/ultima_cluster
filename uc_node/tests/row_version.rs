@@ -102,6 +102,8 @@ macro_rules! kv_build {
 }
 kv_build!(KvV1, pack_version(1, 0, 0), false);
 kv_build!(KvV2, pack_version(2, 0, 0), true);
+// Same line as KvV2 (2.0), different patch: admitted wherever 2.0.x runs (D3).
+kv_build!(KvV2Patch, pack_version(2, 0, 7), true);
 
 /// A command is exactly 9 bytes. It travels as a `[u8; 9]` through the typed
 /// client because bincode encodes a fixed array as its raw bytes, with no
@@ -281,6 +283,21 @@ impl Cluster {
             .unwrap_or_default()
     }
 
+    /// Wait until node `i`'s page shows a committed running version for
+    /// `row` (the cluster agent has applied its genesis or pin record).
+    fn wait_versioned(&self, i: usize, row: u8) {
+        let page = self.page(i);
+        self.wait(|| {
+            matches!(
+                page.service_slot(usize::from(row)).status.row_view(),
+                uc_log::cnc::RowRead::View {
+                    running: Some(_),
+                    ..
+                }
+            )
+        });
+    }
+
     fn stop_node(&self, i: usize) {
         let n = self.nodes.lock().unwrap()[i]
             .take()
@@ -296,6 +313,18 @@ struct Attempt<S: uc_service::RawStateMachine> {
 }
 
 impl<S: uc_service::RawStateMachine> Attempt<S> {
+    /// The refusal's `Display` text; panics if the start was admitted.
+    fn unwrap_err_string(self) -> String {
+        match self.result {
+            Err(e) => e.to_string(),
+            Ok(s) => panic!(
+                "expected node {}'s start to be refused, but it attached to row {}",
+                self.node,
+                s.service_id()
+            ),
+        }
+    }
+
     /// True when the start was refused, or the service stops applying
     /// (`is_alive()` turns false) within `d`.
     fn is_refused_or_stopped_within(&self, d: Duration) -> bool {
@@ -465,6 +494,39 @@ fn a_mixed_version_row_never_loses_an_acknowledged_write() {
             "a v1 service is still applying a row that runs 2.0: {dbg}"
         );
     }
+}
+
+// ------------------------------------------------------------ attach
+
+/// #33 spec §7.1: once a row has a committed running version, a service
+/// whose version is off that LINE (major.minor) is refused at attach, by
+/// name — before any slot word is written. A patch build of the running line
+/// is admitted (D3).
+///
+/// KvV2 starts on every node first (leader-move robustness: whichever node
+/// leads appends genesis), then one follower's v2 is dropped to free its row
+/// lock for the v1 attempt.
+#[test]
+fn attach_refuses_a_binary_off_the_running_line_by_name() {
+    let c = three_node_cluster("rowattach");
+    let leader = c.wait_leader();
+    let mut v2s: Vec<Option<uc_service::Service<KvV2>>> =
+        c.start_all::<KvV2>().into_iter().map(Some).collect();
+    c.wait_versioned(leader, 0);
+    let f = c.others(leader).next().unwrap();
+    c.wait_versioned(f, 0);
+    drop(v2s[f].take()); // release service.0.lock on node f
+    let err = c.try_start::<KvV1>(f).unwrap_err_string();
+    assert!(
+        err.contains("row 0") && err.contains("2.0.0") && err.contains("1.0.0"),
+        "{err}"
+    );
+    assert!(
+        err.contains("\"kv\"") && err.contains("2.0.x") && err.contains("uc2ctl upgrade pin"),
+        "the refusal names the FSM, the line to install, and the pin: {err}"
+    );
+    // Same line, different patch: admitted (D3).
+    let _patch = c.start::<KvV2Patch>(f);
 }
 
 // ------------------------------------------------------- the client gate

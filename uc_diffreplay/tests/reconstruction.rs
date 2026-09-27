@@ -320,8 +320,9 @@ enum Swap {
 ///   the journal still holds `[0, P)` and the gap guard never fires, so an
 ///   unpinned v2 replays from genesis and computes the counterfactual; with
 ///   `BelowSnapshot` the prefix below P is gone and the gap guard must find a
-///   covering artifact — v1's, which an UNPINNED v2 is refused by name (plan
-///   B2 T3).
+///   covering artifact — v1's, which an UNPINNED v2 was refused by name (plan
+///   B2 T3) until #33 made that check by LINE; this fixture's v1/v2 share one
+///   line, so it now installs (see the `real_attach_…` test's doc).
 /// * `pinned` — a real `uc2ctl upgrade pin` (admin op 10, through the cnc
 ///   admin band and the cluster FSM) between the two eras. The pinned attach
 ///   installs v1's artifact at P unconditionally, so v2 carries v1's true
@@ -572,9 +573,21 @@ impl Drop for HookGuard {
 ///   `Some(4)`; that is now the PINNED path's answer — see
 ///   [`a_real_pin_makes_the_default_purge_off_swap_install_the_origin`].)
 ///
-/// So the §2.3 demonstration reads, today: *unpinned, genesis replay computes
-/// the counterfactual or the install is refused by name; pinned, the origin
-/// is installed.*
+/// So the §2.3 demonstration read, at `2.13.0`: *unpinned, genesis replay
+/// computes the counterfactual or the install is refused by name; pinned, the
+/// origin is installed.*
+///
+/// #33 (row running version, spec D3) changed the purge-on arm's outcome
+/// WITHOUT changing the code path: the envelope check is by LINE
+/// (major.minor) now, and this fixture's `V1`/`V2` are raw `0`/`2` — 0.0.0 and
+/// 0.0.2, ONE line. D3 declares patch builds of a line format- and
+/// behaviour-compatible, so the unpinned install of v1's artifact is admitted
+/// and v2 answers v1's true state. `DoublingRegisterSm` breaking that promise
+/// (a behaviour change shipped as a "patch") is exactly spec §11's "patch is
+/// trusted" risk, which `uc2-diffreplay upgrade` exists to catch. A cross-LINE
+/// unpinned swap is now refused earlier, at attach, by name
+/// (`ServiceError::VersionMismatch`; `uc_service/tests/reconstruction.rs`
+/// `an_unpinned_newer_binary_cannot_install_an_older_versions_artifact`).
 #[test]
 fn real_attach_genesis_replay_computes_the_counterfactual_and_install_does_not() {
     let genesis = v2_after_swap(uc_node::PurgePolicy::Disabled, false, "ra1");
@@ -605,15 +618,18 @@ fn real_attach_genesis_replay_computes_the_counterfactual_and_install_does_not()
         Some(2 * LAST_WRITE),
         "genesis path under v2 is the counterfactual"
     );
+    // #33 D3: V1 (0.0.0) and V2 (0.0.2) are one line, so the unpinned install
+    // is admitted (see the doc above). Before #33 this arm was `Stalled` with
+    // a `MistaggedSnapshot` fail-stop.
+    assert!(uc_protocol::identity::same_line(V1, V2));
     assert_eq!(
         purged,
-        Swap::Stalled,
-        "an unpinned cross-version install must not converge"
+        Swap::CaughtUp(Some(LAST_WRITE)),
+        "a same-line unpinned install is admitted and carries v1's state (D3)"
     );
     assert!(
-        fired,
-        "the apply agent must fail-stop by name (MistaggedSnapshot/VersionMismatch \
-         {V1:#010x} vs {V2:#010x}); panics seen: {seen:?}"
+        !fired,
+        "a same-line artifact must not be refused (D3); panics seen: {seen:?}"
     );
 }
 

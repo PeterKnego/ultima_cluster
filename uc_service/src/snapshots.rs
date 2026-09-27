@@ -217,8 +217,10 @@ pub fn verify_snapshot_envelope(
             presented: expected,
         });
     }
+    // #33 D3: by LINE (major.minor) — patch builds of one line share the
+    // artifact format, so an artifact built by 1.0.1 installs into 1.0.3.
     if let Some(want) = expected_version
-        && env.version != want
+        && !uc_protocol::identity::same_line(env.version, want)
     {
         return Err(EnvelopeError::VersionMismatch {
             built: env.version,
@@ -556,34 +558,51 @@ mod tests {
 
     #[test]
     fn verify_checks_position_always_and_version_only_when_asked() {
+        use uc_protocol::identity::pack_version;
+        let built = pack_version(1, 0, 3);
         let mut v = Vec::new();
-        write_snapshot_envelope(&mut v, 4096, 7).unwrap();
+        write_snapshot_envelope(&mut v, 4096, built).unwrap();
         v.extend_from_slice(b"payload");
         let mut r = &v[..];
         assert_eq!(
             verify_snapshot_envelope(&mut r, 4096, None),
             Ok(Envelope {
                 position: 4096,
-                version: 7
+                version: built
             })
         );
         assert_eq!(r, b"payload", "positioned at the payload");
         let mut r = &v[..];
         assert_eq!(
-            verify_snapshot_envelope(&mut r, 4096, Some(7)).map(|e| e.version),
-            Ok(7)
+            verify_snapshot_envelope(&mut r, 4096, Some(built)).map(|e| e.version),
+            Ok(built)
         );
+        // #33 D3: the envelope check is by LINE — patch builds share the format.
         let mut r = &v[..];
         assert_eq!(
-            verify_snapshot_envelope(&mut r, 4096, Some(8)),
+            verify_snapshot_envelope(&mut r, 4096, Some(pack_version(1, 0, 9))).map(|e| e.version),
+            Ok(built)
+        );
+        // A different minor (or major) is a different format: refused.
+        let mut r2 = &v[..];
+        assert_eq!(
+            verify_snapshot_envelope(&mut r2, 4096, Some(pack_version(1, 1, 0))),
             Err(EnvelopeError::VersionMismatch {
-                built: 7,
-                expected: 8
+                built,
+                expected: pack_version(1, 1, 0)
+            })
+        );
+        let mut r2 = &v[..];
+        assert_eq!(
+            verify_snapshot_envelope(&mut r2, 4096, Some(pack_version(2, 0, 3))),
+            Err(EnvelopeError::VersionMismatch {
+                built,
+                expected: pack_version(2, 0, 3)
             })
         );
         let mut r = &v[..];
         assert_eq!(
-            verify_snapshot_envelope(&mut r, 5000, Some(7)),
+            verify_snapshot_envelope(&mut r, 5000, Some(built)),
             Err(EnvelopeError::Mistagged {
                 built: 4096,
                 presented: 5000

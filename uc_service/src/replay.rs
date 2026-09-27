@@ -308,7 +308,9 @@ pub(crate) fn replay_into<S: RawStateMachine>(
                 // and this incarnation's `apply` may have genuinely different
                 // semantics for the same recorded command (spec §2.3's worked
                 // example: `Write(v)` meaning `v` under one build and `2·v`
-                // under another).
+                // under another). #33 D3: "same-version" means same LINE
+                // (major.minor) — `verify_snapshot_envelope` compares by
+                // `same_line`, since patch builds share the artifact format.
                 //
                 // Plan B2 T4 (review fix): with EXACTLY ONE exception — the
                 // artifact at this row's pinned ORIGIN. `attach` already
