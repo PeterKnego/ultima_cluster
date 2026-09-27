@@ -66,6 +66,8 @@ const ALL_SCENARIOS: &[&str] = &[
     "fsm_pinned",
     "identity_drift",
     "version_drift",
+    "version_drift_zero_line",
+    "version_drift_patch_only",
     "row_version_mismatch",
     "log_time_frozen",
     "schedule_diverged",
@@ -201,6 +203,8 @@ fn run_scenario(name: &str, scratch_root: &Path) -> (SeriesFile, Disclosure) {
         "fsm_pinned" => scenario_fsm_pinned(scratch_root),
         "identity_drift" => scenario_identity_drift(),
         "version_drift" => scenario_version_drift(),
+        "version_drift_zero_line" => scenario_version_drift_zero_line(),
+        "version_drift_patch_only" => scenario_version_drift_patch_only(),
         "row_version_mismatch" => scenario_row_version_mismatch(),
         "log_time_frozen" => scenario_log_time_frozen(),
         "schedule_diverged" => scenario_schedule_diverged(),
@@ -1393,6 +1397,117 @@ fn scenario_version_drift() -> (SeriesFile, Disclosure) {
                  real encoder as uc2_service_version{{row=\"0\"}}; two DISTINCT nonzero values \
                  for the same row across instances is exactly what Uc2ServiceVersionDrift's \
                  count_values idiom detects.",
+                kv.as_str()
+            ),
+        },
+    )
+}
+
+// -------------------------------------------------- scenario 15-extra-a
+
+/// Fix round 2 review-fix REGRESSION case for `Uc2ServiceVersionDrift`, NOT
+/// one of the 28 shipped rules — adjudicated separately, as an "extra
+/// check", by `scripts/m10_alert_fire.sh`. The PRE-fix expression floored
+/// the packed version BEFORE filtering the sentinel
+/// (`floor(uc2_service_version / 65536) > 0`), so a genuinely running
+/// 0.0.x line (packed value nonzero but `< 65536`, so it floors to 0) read
+/// identically to the unattached sentinel `0` itself and was silently
+/// dropped from the comparison — a real 0.0.5-vs-1.0.0 disagreement never
+/// counted as drift. Two synthetic `ObsSources` ("n0", "n1") declare the
+/// SAME row 0 name; "n0" wrote 0.0.5, "n1" wrote 1.0.0. Under the FIXED
+/// expression (filter the raw sentinel first, floor second) this pair MUST
+/// fire.
+fn scenario_version_drift_zero_line() -> (SeriesFile, Disclosure) {
+    let kv = FsmName::parse("kv").unwrap();
+    let src_a = synthetic_sources_named(0, Some(kv));
+    let src_b = synthetic_sources_named(1, Some(kv));
+    src_a.cnc.store_services_declared(0b1);
+    src_b.cnc.store_services_declared(0b1);
+    let v_a = uc_protocol::identity::pack_version(0, 0, 5);
+    let v_b = uc_protocol::identity::pack_version(1, 0, 0);
+    src_a.cnc.service_slot(0).status.store_version(v_a);
+    src_b.cnc.service_slot(0).status.store_version(v_b);
+
+    let srv_a = ObsServer::serve(src_a.clone(), "127.0.0.1:0".parse().unwrap()).expect("bind");
+    let srv_b = ObsServer::serve(src_b.clone(), "127.0.0.1:0".parse().unwrap()).expect("bind");
+    let addr_a = srv_a.local_addr();
+    let addr_b = srv_b.local_addr();
+
+    let mut sf = SeriesFile::new();
+    for _ in 0..3 {
+        sf.record_round("n0", &scrape(addr_a), &["uc2_service_version"]);
+        sf.record_round("n1", &scrape(addr_b), &["uc2_service_version"]);
+        thread::sleep(Duration::from_millis(200));
+    }
+    srv_a.stop();
+    srv_b.stop();
+
+    (
+        sf,
+        Disclosure {
+            scenario: "version_drift_zero_line",
+            rules: &["Uc2ServiceVersionDrift"],
+            state: "synthetic",
+            method: format!(
+                "Fix round 2 review-fix regression case (NOT one of the 28 shipped rules — an \
+                 extra check): two synthetic ObsSources, row 0 = {:?} agreeing; \"n0\" wrote \
+                 version {v_a} (0.0.5), \"n1\" wrote {v_b} (1.0.0). The pre-fix expression \
+                 floored the line BEFORE filtering '> 0', so 0.0.5 (packed nonzero, < 65536) \
+                 floored to line 0 and was wrongly excluded as if it were the unattached \
+                 sentinel — this pair would NOT have fired. The fixed expression filters the \
+                 sentinel on the RAW value first, so this pair (two distinct nonzero lines, 0 \
+                 and 256) DOES fire.",
+                kv.as_str()
+            ),
+        },
+    )
+}
+
+// -------------------------------------------------- scenario 15-extra-b
+
+/// Fix round 2 review-fix NEGATIVE regression case for
+/// `Uc2ServiceVersionDrift`, also NOT one of the 28 shipped rules. Two
+/// patch builds of the SAME line (1.2.0 vs 1.2.7) — patch is free by
+/// design (#33 D3) — must NOT fire either before or after the fix; this
+/// pins that the fix did not accidentally widen the rule to compare exact
+/// versions again.
+fn scenario_version_drift_patch_only() -> (SeriesFile, Disclosure) {
+    let kv = FsmName::parse("kv").unwrap();
+    let src_a = synthetic_sources_named(0, Some(kv));
+    let src_b = synthetic_sources_named(1, Some(kv));
+    src_a.cnc.store_services_declared(0b1);
+    src_b.cnc.store_services_declared(0b1);
+    let v_a = uc_protocol::identity::pack_version(1, 2, 0);
+    let v_b = uc_protocol::identity::pack_version(1, 2, 7);
+    src_a.cnc.service_slot(0).status.store_version(v_a);
+    src_b.cnc.service_slot(0).status.store_version(v_b);
+
+    let srv_a = ObsServer::serve(src_a.clone(), "127.0.0.1:0".parse().unwrap()).expect("bind");
+    let srv_b = ObsServer::serve(src_b.clone(), "127.0.0.1:0".parse().unwrap()).expect("bind");
+    let addr_a = srv_a.local_addr();
+    let addr_b = srv_b.local_addr();
+
+    let mut sf = SeriesFile::new();
+    for _ in 0..3 {
+        sf.record_round("n0", &scrape(addr_a), &["uc2_service_version"]);
+        sf.record_round("n1", &scrape(addr_b), &["uc2_service_version"]);
+        thread::sleep(Duration::from_millis(200));
+    }
+    srv_a.stop();
+    srv_b.stop();
+
+    (
+        sf,
+        Disclosure {
+            scenario: "version_drift_patch_only",
+            rules: &["Uc2ServiceVersionDrift"],
+            state: "synthetic",
+            method: format!(
+                "Fix round 2 review-fix NEGATIVE regression case (NOT one of the 28 shipped \
+                 rules — an extra check): two synthetic ObsSources, row 0 = {:?} agreeing; \
+                 \"n0\" wrote version {v_a} (1.2.0), \"n1\" wrote {v_b} (1.2.7) — the same \
+                 LINE, two patch builds. floor(x/65536) agrees for both (258), so count_values \
+                 sees one distinct line for this row and the alert must NOT fire.",
                 kv.as_str()
             ),
         },

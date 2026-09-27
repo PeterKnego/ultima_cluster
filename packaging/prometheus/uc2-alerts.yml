@@ -182,12 +182,22 @@ groups:
     # `floor(x / 65536)` discards the low 16 patch bits, the same arithmetic
     # `uc_protocol::identity::same_line` does. Patch builds of the same line
     # are allowed to differ by design (a fleet mid patch-rollout is not
-    # drift); a differing MINOR is. `> 0` first: 0 means "no service has
-    # ever attached this slot" (a declared-but-unstarted FSM, or a service
-    # built without a `const VERSION`), which is a normal transient state —
-    # not a real disagreement to page on. A rolling upgrade holding old and
-    # new LINES live at once is exactly what this catches.
-    expr: count by (row) (count_values("line", floor(uc2_service_version / 65536) > 0) by (row)) > 1
+    # drift); a differing MINOR is.
+    #
+    # Review fix (Fix round 2): the sentinel MUST be filtered on the RAW
+    # value, before flooring — `floor(x / 65536) > 0` (the first cut) floors
+    # FIRST, so a genuinely running 0.0.x line (packed nonzero, but < 65536)
+    # reads as floored line 0 and was wrongly dropped as if it were the
+    # unattached sentinel 0 itself. That silently excluded one side of a
+    # real 0.0.5-vs-1.0.0 pair from the comparison, so it never counted as
+    # drift. `(uc2_service_version > 0)` filters the sentinel FIRST, on the
+    # raw value — only the exact value 0 ("no service has ever attached
+    # this slot": a declared-but-unstarted FSM, or a service built without
+    # a `const VERSION`, a normal transient state, not a real disagreement
+    # to page on) is excluded, and every other value (including a real
+    # 0.0.x line) is floored and compared. A rolling upgrade holding old
+    # and new LINES live at once is exactly what this catches.
+    expr: count by (row) (count_values("line", floor((uc2_service_version > 0) / 65536)) by (row)) > 1
     for: 5m
     labels: { severity: warning }
     annotations: { summary: "row {{ $labels.row }} runs different FSM version LINES across nodes" }

@@ -880,6 +880,42 @@ tests:
     return path
 
 
+def write_extra_test_yaml(filename, alertname, spec, expect_fire):
+    """Fix round 2: an ad hoc promtool test against a SHIPPED rule
+    (`alertname`), but fed by a scenario that is NOT that rule's
+    RULE_META/RULE_BUILDERS entry — used for extra regression coverage that
+    isn't itself one of the 28 shipped rules (a second, narrower case for a
+    rule already adjudicated above). Unlike `write_test_yaml`, `filename`
+    (the .yml basename) and `alertname` (what the ALERTS query and the
+    expected-labels block use) are independent, and `expect_fire=False`
+    asserts an EMPTY result (`exp_samples: []`, promtool's own idiom for
+    "this query must return nothing at eval_time") instead of a firing
+    sample."""
+    input_series_yaml = "\n".join(
+        f'      - series: \'{series}\'\n        values: "{values}"' for series, values in spec["series"]
+    )
+    if expect_fire:
+        exp = exp_labels_block(alertname, spec["severity"], spec["labels_from"])
+        exp_block = f'        exp_samples:\n          - labels: \'ALERTS{exp}\'\n            value: 1\n'
+    else:
+        exp_block = "        exp_samples: []\n"
+    yaml_text = f"""rule_files:
+  - {RULES_FILE}
+evaluation_interval: {INTERVAL}s
+tests:
+  - interval: {INTERVAL}s
+    input_series:
+{input_series_yaml}
+    promql_expr_test:
+      - expr: 'ALERTS{{alertname="{alertname}",alertstate="firing"}}'
+        eval_time: {spec["eval_time"]}s
+{exp_block}"""
+    path = os.path.join(TEST_DIR, f"{filename}.yml")
+    with open(path, "w") as f:
+        f.write(yaml_text)
+    return path
+
+
 overall_ok = True
 for name in sorted(RULE_META):
     meta = RULE_META[name]
@@ -917,5 +953,64 @@ for name in sorted(RULE_META):
         print(proc.stdout)
         print(proc.stderr, file=sys.stderr)
 
-sys.exit(0 if overall_ok else 1)
+# ------------------------------------------------------------ extra checks
+#
+# Fix round 2: review finding on Uc2ServiceVersionDrift — the PRE-fix
+# expression floored the packed version BEFORE filtering the sentinel
+# (`floor(uc2_service_version / 65536) > 0`), so a genuinely running 0.0.x
+# line (packed nonzero but < 65536) floored to line 0 and was silently
+# dropped from the comparison, same as the unattached sentinel 0 itself —
+# a real 0.0.5-vs-1.0.0 pair never counted as drift. These two checks are
+# NOT among the 28 shipped rules (they adjudicate the SAME shipped rule,
+# Uc2ServiceVersionDrift, against two extra scenarios) so they are reported
+# separately, `extra=...` rather than `rule=...`, and are not counted
+# toward the 28/28 total — but a FAIL here still fails the whole script.
+print()
+print("== extra checks: Uc2ServiceVersionDrift review-fix regression (Fix round 2) ==")
+
+
+def run_extra_check(extra_name, scenario_name, expect_fire, human):
+    try:
+        rows = load_scenario(scenario_name)
+        row_a = select(rows, "uc2_service_version", {"instance": "n0"})
+        row_b = select(rows, "uc2_service_version", {"instance": "n1"})
+        labels_from = (
+            {"labels": {"row": row_a["labels"]["row"]}} if expect_fire else None
+        )
+        spec = new_rule("warning", labels_from=labels_from)
+        add_hold_last(spec, row_a, "uc2_service_version", 300)
+        add_hold_last(spec, row_b, "uc2_service_version", 300)
+        spec["eval_time"] = total_for(300)[0]
+    except ScenarioMissing as e:
+        print(f"FAIL extra={extra_name} rule=Uc2ServiceVersionDrift ({human}) — scenario did not produce series: {e}")
+        return False
+
+    for line in spec["dilation"]:
+        print(f"  dilate extra={extra_name} {line}")
+    path = write_extra_test_yaml(extra_name, "Uc2ServiceVersionDrift", spec, expect_fire)
+    proc = subprocess.run([PROMTOOL, "test", "rules", path], capture_output=True, text=True)
+    if proc.returncode == 0:
+        print(f"PASS extra={extra_name} rule=Uc2ServiceVersionDrift ({human})")
+        return True
+    print(f"FAIL extra={extra_name} rule=Uc2ServiceVersionDrift ({human})")
+    print(proc.stdout)
+    print(proc.stderr, file=sys.stderr)
+    return False
+
+
+extra_ok = True
+extra_ok &= run_extra_check(
+    "Uc2ServiceVersionDrift__zero_line",
+    "version_drift_zero_line",
+    True,
+    "0.0.5 vs 1.0.0 must fire",
+)
+extra_ok &= run_extra_check(
+    "Uc2ServiceVersionDrift__patch_only",
+    "version_drift_patch_only",
+    False,
+    "1.2.0 vs 1.2.7 must NOT fire",
+)
+
+sys.exit(0 if (overall_ok and extra_ok) else 1)
 PYEOF

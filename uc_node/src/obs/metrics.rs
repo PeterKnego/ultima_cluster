@@ -728,7 +728,7 @@ fn push_service_families(out: &mut String, s: &ObsSources, commit: u64, now: u64
     push_service_labeled(
         out,
         "uc2_service_version",
-        "Packed semantic version of the attached service (0 = none/unversioned). Alert: Uc2ServiceVersionDrift (packaging/prometheus/uc2-alerts.yml) — `count by (row) (count_values(\"line\", floor(uc2_service_version / 65536) > 0) by (row)) > 1` (#33: compares major.minor LINES, patch free by design); a bare `count by (row, service) (uc2_service_version > 0) > 1` counts SERIES, not distinct values, and pages permanently on any multi-node cluster. See also uc2_row_running_version and Uc2RowVersionMismatch.",
+        "Packed semantic version of the attached service (0 = none/unversioned). Alert: Uc2ServiceVersionDrift (packaging/prometheus/uc2-alerts.yml) — `count by (row) (count_values(\"line\", floor((uc2_service_version > 0) / 65536)) by (row)) > 1` (#33: compares major.minor LINES, patch free by design; the sentinel 0 is filtered on the RAW value before flooring, not after, so a genuinely running 0.0.x line is never mistaken for the unattached sentinel); a bare `count by (row, service) (uc2_service_version > 0) > 1` counts SERIES, not distinct values, and pages permanently on any multi-node cluster. See also uc2_row_running_version and Uc2RowVersionMismatch.",
         "gauge",
         &rows,
         |r| r.version,
@@ -2389,7 +2389,7 @@ mod tests {
         );
         assert!(
             text.contains(
-                "count by (row) (count_values(\"line\", floor(uc2_service_version / 65536) > 0) by (row)) > 1"
+                "count by (row) (count_values(\"line\", floor((uc2_service_version > 0) / 65536)) by (row)) > 1"
             ),
             "{text}"
         );
