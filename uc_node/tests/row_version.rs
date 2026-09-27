@@ -888,50 +888,217 @@ impl Cluster {
         }
     }
 
-    /// The START of the frame whose END is `end`, found by walking node `i`'s
-    /// log buffer frame by frame from position 0 (the harness's 4 MiB buffer
-    /// never wraps in these tests, so every frame is still there). Asserts
-    /// the frame found is a `CLUSTER` `UpgradePin` for `row` — so a walk that
-    /// lands on the wrong frame fails here, not as an off-by-one below.
+    /// The START of the pin frame whose END is `end`, derived from the pin
+    /// frame's fixed length and then VERIFIED by reading node `i`'s log at
+    /// that start: it must be a `CLUSTER` `UpgradePin` for `row` whose
+    /// aligned length ends exactly at `end`. A wrong derivation fails here,
+    /// not as an off-by-one below. (A walk from position 0 would work too,
+    /// but under the recorded workload the 4 MiB buffer is not guaranteed
+    /// never to wrap; the frame at `end` is recent, so it is still there.)
     fn frame_start_of(&self, end: u64, i: usize, row: u8) -> u64 {
         use uc_protocol::v2::frame::{
             CLUSTER_BODY_PREFIX_LEN, ClusterKind, FRAME_TYPE_CLUSTER, HEADER_LEN, align_frame_len,
         };
+        let len = align_frame_len(
+            HEADER_LEN + CLUSTER_BODY_PREFIX_LEN + uc_protocol::v2::upgrade::UPGRADE_PIN_LEN,
+        ) as u64;
+        let start = end - len;
         let mut buf = Vec::new();
-        let mut pos = 0u64;
-        self.with_node(i, |n| {
-            loop {
-                let h = match n.read_frame_validated(pos, &mut buf) {
-                    uc_log::buffer::FrameRead::Frame(h) => h,
-                    other => panic!("node {i}: walking to {end}, read at {pos} gave {other:?}"),
-                };
-                let next = pos + align_frame_len(h.length as usize) as u64;
-                if next == end {
-                    assert_eq!(h.frame_type, FRAME_TYPE_CLUSTER, "node {i}: frame at {pos}");
-                    assert_eq!(
-                        (buf[HEADER_LEN], buf[HEADER_LEN + CLUSTER_BODY_PREFIX_LEN]),
-                        (ClusterKind::UpgradePin as u8, row),
-                        "node {i}: the frame ending at {end} is not row {row}'s pin"
-                    );
-                    return pos;
-                }
-                assert!(
-                    next < end,
-                    "node {i}: no frame ends at {end} ({pos}..{next})"
+        self.with_node(i, |n| match n.read_frame_validated(start, &mut buf) {
+            uc_log::buffer::FrameRead::Frame(h) => {
+                assert_eq!(
+                    h.frame_type, FRAME_TYPE_CLUSTER,
+                    "node {i}: frame at {start}"
                 );
-                pos = next;
+                assert_eq!(
+                    start + align_frame_len(h.length as usize) as u64,
+                    end,
+                    "node {i}: the frame at {start} does not end at {end}"
+                );
+                assert_eq!(
+                    (buf[HEADER_LEN], buf[HEADER_LEN + CLUSTER_BODY_PREFIX_LEN]),
+                    (ClusterKind::UpgradePin as u8, row),
+                    "node {i}: the frame ending at {end} is not row {row}'s pin"
+                );
             }
-        })
+            other => panic!("node {i}: read at {start} gave {other:?}"),
+        });
+        start
+    }
+
+    /// Op 10 answers at APPEND, not at commit. Wait (bounded) until node
+    /// `on`'s committed row view shows this pin — `running = to` recorded at
+    /// `end`. `false` on timeout: the appending leader lost leadership and
+    /// the frame at `end` was truncated (or replaced) by its successor.
+    fn pin_committed_within(&self, on: usize, end: u64, to: u32, d: Duration) -> bool {
+        let page = self.page(on);
+        let deadline = Instant::now() + d;
+        loop {
+            if let uc_log::cnc::RowRead::View {
+                running: Some(v),
+                record_pos,
+                ..
+            } = page.service_slot(0).status.row_view()
+                && (v, record_pos) == (to, end)
+            {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+}
+
+/// A recorded register workload against row `kv` (spec §10.2's "under load"
+/// and "linearizable history across the switch"). `Put(v)` is the model's
+/// `Write(v)` and a linearizable query is its `Read`; `KvV1` and `KvV2`
+/// give both exactly the same semantics (only `Append` differs, and the
+/// workload never sends one), so the origin install cannot legitimately
+/// change a value and the history must linearize across the switch.
+///
+/// Written values are never 0, so the store's initial 0 reads as the
+/// model's `None` (never written).
+///
+/// Every op whose outcome was not observed — a timeout (between the v1 stop
+/// and the v2 attach nothing answers), a NOT_LEADER, a dead connection — is
+/// recorded INDETERMINATE: a write may or may not have committed. Nothing is
+/// dropped or counted as failed. The worker then re-resolves the leader and
+/// reconnects.
+struct Workload<'a> {
+    c: &'a Cluster,
+    history: uc_lincheck::history::History,
+    stop: std::sync::atomic::AtomicBool,
+    /// Set once `pin` has returned; ops invoked after it are counted.
+    pinned: std::sync::atomic::AtomicBool,
+    invoked_after_pin: std::sync::atomic::AtomicU64,
+    /// Set once every v2 is attached; Ok ops completed after it are counted.
+    v2_up: std::sync::atomic::AtomicBool,
+    ok_after_v2: std::sync::atomic::AtomicU64,
+    ok_total: std::sync::atomic::AtomicU64,
+}
+
+/// Per-op request timeout for the workload's clients: long enough for a
+/// loaded loopback cluster, short enough that the ops caught in the
+/// stop-to-attach gap resolve (as indeterminate) quickly.
+const WORKLOAD_TIMEOUT: Duration = Duration::from_secs(3);
+/// Pause between one worker's ops: keeps the history (and the checker's
+/// search) small and the log well inside the buffer.
+const WORKLOAD_PACE: Duration = Duration::from_millis(3);
+
+impl<'a> Workload<'a> {
+    fn new(c: &'a Cluster) -> Self {
+        use std::sync::atomic::{AtomicBool, AtomicU64};
+        Workload {
+            c,
+            history: Default::default(),
+            stop: AtomicBool::new(false),
+            pinned: AtomicBool::new(false),
+            invoked_after_pin: AtomicU64::new(0),
+            v2_up: AtomicBool::new(false),
+            ok_after_v2: AtomicU64::new(0),
+            ok_total: AtomicU64::new(0),
+        }
+    }
+
+    fn connect(&self) -> uc_client::PipelinedClient {
+        let l = self.c.wait_leader();
+        uc_client::PipelinedClient::connect(
+            &self.c.dirs[l],
+            &self.c.app,
+            uc_client::PipelinedConfig {
+                request_timeout: WORKLOAD_TIMEOUT,
+                serving_gate: false, // as `Client::connect` pins it
+                ..Default::default()
+            },
+        )
+        .expect("client connect")
+    }
+
+    fn stamp_invoke(&self) -> u64 {
+        use std::sync::atomic::Ordering::SeqCst;
+        let inv = self.history.invoke();
+        if self.pinned.load(SeqCst) {
+            self.invoked_after_pin.fetch_add(1, SeqCst);
+        }
+        inv
+    }
+
+    fn ok(&self) {
+        use std::sync::atomic::Ordering::SeqCst;
+        self.ok_total.fetch_add(1, SeqCst);
+        if self.v2_up.load(SeqCst) {
+            self.ok_after_v2.fetch_add(1, SeqCst);
+        }
+    }
+
+    /// Writer `w` writes `w * 1_000_000 + k` for k = 1, 2, … — unique and
+    /// never 0.
+    fn writer(&self, w: u32) {
+        use std::sync::atomic::Ordering::SeqCst;
+        use uc_lincheck::history::{Op, Outcome, RegResp};
+        let mut client = self.connect();
+        let mut k = 0u64;
+        while !self.stop.load(SeqCst) {
+            k += 1;
+            let v = u64::from(w) * 1_000_000 + k;
+            let inv = self.stamp_invoke();
+            let r = client.submit::<Cmd, u8>(&put(v)).and_then(|t| t.wait());
+            match r {
+                Ok(0) => {
+                    self.history
+                        .record(w, Op::Write(v), inv, Outcome::Ok(RegResp::Ack));
+                    self.ok();
+                }
+                Ok(other) => panic!("put({v}) answered {other:#x}"),
+                Err(_) => {
+                    self.history
+                        .record(w, Op::Write(v), inv, Outcome::Indeterminate);
+                    client = self.connect();
+                }
+            }
+            std::thread::sleep(WORKLOAD_PACE);
+        }
+    }
+
+    fn reader(&self, id: u32) {
+        use std::sync::atomic::Ordering::SeqCst;
+        use uc_lincheck::history::{Op, Outcome, RegResp};
+        let mut client = self.connect();
+        while !self.stop.load(SeqCst) {
+            let inv = self.stamp_invoke();
+            let r = client
+                .query_linearizable::<(), [u8; 8]>(&())
+                .and_then(|t| t.wait());
+            match r {
+                Ok(b) => {
+                    let v = u64::from_le_bytes(b);
+                    let seen = (v != 0).then_some(v);
+                    self.history
+                        .record(id, Op::Read, inv, Outcome::Ok(RegResp::Value(seen)));
+                    self.ok();
+                }
+                Err(_) => {
+                    self.history
+                        .record(id, Op::Read, inv, Outcome::Indeterminate);
+                    client = self.connect();
+                }
+            }
+            std::thread::sleep(WORKLOAD_PACE);
+        }
     }
 }
 
 /// #33 spec §10.2 (and §4.3, §7.2): 1.0 services are attached and applying
-/// when a pin to 2.0 commits. Each stops at EXACTLY the pin record — its
-/// slot's `applied` is the record's frame START (every earlier frame
-/// applied, nothing after) — and says so with a `version_superseded` event.
-/// 2.0 services then attach on every node, install the pin's origin, and the
-/// row resumes: an `Append` (2.0-only) is acknowledged and the value is
-/// recomputed from the origin.
+/// UNDER LOAD when a pin to 2.0 commits. Each stops at EXACTLY the pin
+/// record — its slot's `applied` is the record's frame START (every earlier
+/// frame applied, nothing after) — and says so with a `version_superseded`
+/// event. 2.0 services then attach on every node, install the pin's origin,
+/// and the row resumes. A recorded register workload (two writers, one
+/// reader) runs from before the instant until the 2.0 services are serving,
+/// and its history is linearizable across the switch (WGL checker). After
+/// the workload an `Append` (2.0-only) is acknowledged and adds to the value.
 ///
 /// The stop message is asserted on the captured `uc_obs` sink. This binary's
 /// `TEST_LOCK` (held by every test here, via `three_node_cluster`) is what
@@ -939,45 +1106,78 @@ impl Cluster {
 /// `OBS_CAPTURE_LOCK` discipline of `node.rs`'s unit tests.
 ///
 /// Leadership: every "the leader" step re-resolves it (`submit_via_leader`,
-/// `snapshot_instant`, `pin`), and every node runs the row, so a move at any
-/// point costs a retry, not the test.
+/// `snapshot_instant`, `pin`, the workload's reconnects), and every node
+/// runs the row, so a move at any point costs a retry, not the test. A pin
+/// frame truncated by a leader move before it committed is re-staged and
+/// retried (the op-10 reply is an append, not a commit).
 #[test]
 fn a_committed_pin_stops_every_old_service_at_exactly_the_record() {
+    use std::sync::atomic::Ordering::SeqCst;
     let c = three_node_cluster("rowpin");
     c.wait_leader();
     let olds = c.start_all::<KvV1>();
-    for v in 0..200 {
-        // `Put` is idempotent, so a resend after a leader move is harmless.
-        assert_eq!(c.submit_via_leader(&put(v)).0, vec![0], "put({v})");
-    }
-    let origin = c.snapshot_instant();
-
+    let from = pack_version(1, 0, 0);
+    let to = pack_version(2, 0, 0);
+    let w = Workload::new(&c);
     let sink = ObsCapture::take();
-    let (pinned_on, pin_end) = c.pin(0, pack_version(1, 0, 0), pack_version(2, 0, 0), origin);
-    let pin_start = c.frame_start_of(pin_end, pinned_on, 0);
-    for (i, s) in olds.iter().enumerate() {
-        c.wait(|| !s.is_alive());
-        // The log is replicated byte for byte: every node's walk agrees.
-        assert_eq!(c.frame_start_of(pin_end, i, 0), pin_start, "node {i}");
-        let page = c.page(i);
-        assert_eq!(
-            page.service_slot(0).applied.load_acquire(),
-            pin_start,
-            "node {i}'s v1 stopped somewhere other than the pin record"
-        );
-        match page.service_slot(0).status.row_view() {
-            uc_log::cnc::RowRead::View {
-                running: Some(v),
-                record_pos,
-                ..
-            } => assert_eq!(
-                (v, record_pos),
-                (pack_version(2, 0, 0), pin_end),
-                "node {i}"
-            ),
-            other => panic!("node {i}: row view {other:?}"),
+
+    let (pin_end, pin_start, committed_seq, _news) = std::thread::scope(|s| {
+        s.spawn(|| w.writer(1));
+        s.spawn(|| w.writer(2));
+        s.spawn(|| w.reader(3));
+        // Some acknowledged state before the instant, so the origin carries it.
+        c.wait(|| w.ok_total.load(SeqCst) >= 100);
+        let origin = c.snapshot_instant();
+
+        let mut attempt = 0;
+        let (pinned_on, pin_end) = loop {
+            attempt += 1;
+            let (on, end) = c.pin(0, from, to, origin);
+            w.pinned.store(true, SeqCst);
+            if c.pin_committed_within(on, end, to, Duration::from_secs(10)) {
+                break (on, end);
+            }
+            assert!(
+                attempt < 3,
+                "the pin appended at {end} on node {on} never committed there in 10 s, three \
+                 times — each time truncated after a leader move?"
+            );
+            eprintln!("pin at {end} on node {on} not committed in 10 s; re-staging");
+        };
+        // Every op invoked after this stamp started after the pin committed.
+        let committed_seq = w.history.invoke();
+        let pin_start = c.frame_start_of(pin_end, pinned_on, 0);
+        for (i, s) in olds.iter().enumerate() {
+            c.wait(|| !s.is_alive());
+            // The log is replicated byte for byte: every node agrees.
+            assert_eq!(c.frame_start_of(pin_end, i, 0), pin_start, "node {i}");
+            let page = c.page(i);
+            assert_eq!(
+                page.service_slot(0).applied.load_acquire(),
+                pin_start,
+                "node {i}'s v1 stopped somewhere other than the pin record"
+            );
+            match page.service_slot(0).status.row_view() {
+                uc_log::cnc::RowRead::View {
+                    running: Some(v),
+                    record_pos,
+                    ..
+                } => assert_eq!((v, record_pos), (to, pin_end), "node {i}"),
+                other => panic!("node {i}: row view {other:?}"),
+            }
         }
-    }
+        // Each v1 has fail-stopped; dropping the handle joins its thread
+        // without re-raising the panic and releases `service.0.lock` for the
+        // v2 attach.
+        drop(olds);
+        let news = c.start_all::<KvV2>();
+        w.v2_up.store(true, SeqCst);
+        // The row resumes under the recorded load.
+        c.wait(|| w.ok_after_v2.load(SeqCst) >= 50);
+        w.stop.store(true, SeqCst);
+        (pin_end, pin_start, committed_seq, news)
+    });
+
     let text = sink.text();
     drop(sink);
     let stops: Vec<&str> = text
@@ -994,18 +1194,47 @@ fn a_committed_pin_stops_every_old_service_at_exactly_the_record() {
         );
     }
 
-    // Each v1 has fail-stopped; dropping the handle joins its thread without
-    // re-raising the panic and releases `service.0.lock` for the v2 attach.
-    drop(olds);
-    let _news = c.start_all::<KvV2>();
+    // The load genuinely spans the pin.
+    let after_pin = w.invoked_after_pin.load(SeqCst);
+    assert!(after_pin >= 1, "no client op was issued after the pin");
+    let entries = w.history.into_entries();
+    let indeterminate = entries
+        .iter()
+        .filter(|e| matches!(e.outcome, uc_lincheck::history::GenOutcome::Indeterminate))
+        .count();
+    // ...and a client frame committed after the pin was acknowledged (by a
+    // 2.0 service: every 1.0 stopped at the record).
+    assert!(
+        entries.iter().any(|e| e.invoke > committed_seq
+            && matches!(e.op, uc_lincheck::history::Op::Write(_))
+            && matches!(e.outcome, uc_lincheck::history::GenOutcome::Ok(_))),
+        "no write invoked after the pin committed was acknowledged"
+    );
+    let (verdict, spent) = uc_lincheck::checker::check_register_reporting(
+        &entries,
+        uc_lincheck::checker::DEFAULT_BUDGET,
+    );
+    eprintln!(
+        "pin at {pin_start}..{pin_end}: {} ops ({indeterminate} indeterminate, {after_pin} \
+         invoked after the pin), checker spent {spent}",
+        entries.len()
+    );
+    assert_eq!(
+        verdict,
+        uc_lincheck::checker::Verdict::Linearizable,
+        "the history across the pin is not linearizable"
+    );
+
+    // The workload is over: `Append` (2.0-only) is acknowledged and adds.
+    let before = c.client(c.wait_leader()).query_u64();
     let (r, resent) = c.submit_via_leader(&append(1));
     assert_eq!(r, vec![0], "the 2.0-only Append must be acknowledged");
     let got = c.client(c.wait_leader()).query_u64();
     if resent {
         // A resent Append may have committed twice.
-        assert!(matches!(got, 200 | 201), "got {got}");
+        assert!(got == before + 1 || got == before + 2, "{before} -> {got}");
     } else {
-        assert_eq!(got, 200, "199 + 1, recomputed from the origin");
+        assert_eq!(got, before + 1, "Append(1) on {before}");
     }
 }
 
