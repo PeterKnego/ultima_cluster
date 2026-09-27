@@ -1596,6 +1596,13 @@ rolling application upgrade safe. The honest answer to "how do I upgrade"
 remains "per-row flag day" until the committed application level and the
 live-commit gate exist.
 
+**Closed by `2026-09-27-uc2-row-running-version-design.md` (#33) for the
+safety half; rolling application upgrades are #66.** Since that work an
+attached old service no longer keeps applying past a pin: it stops at exactly
+the pin record's start, and a binary off the row's running line (major.minor)
+is refused at attach even on a row that was never pinned. Plain-language
+account: `docs/notes/uc2-row-running-version-explained.md`.
+
 What this spec *does* buy Track 2: [#31]'s own proposal (step 7) requires a
 proof surface — a two-binary crashtest under load with a linearizable history —
 to ship *with* the rolling-upgrade flag day. §6 is that apparatus. Building it

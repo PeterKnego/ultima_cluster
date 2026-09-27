@@ -137,6 +137,16 @@ attached service's packed version; `0` = none/unversioned). These are the
 spec) — a cross-node query compares them in steady state, before any
 snapshot session ever runs.
 
+**One more per row since the row running version (wire `0.10.0`, #33)**:
+`uc2_row_running_version{service="<name>",row="<r>"}` — the packed version
+the row **runs**, committed in the cluster FSM by a genesis record or a pin,
+and so identical on every node once caught up. Where `uc2_service_version` is
+what the attached binary says it is, this is what the cluster says the row
+is. It has **no sample at all** before the row's first record — not a `0`,
+because `0` is an ordinary version here (an FSM that never set `const
+VERSION`). See [the row running version,
+explained](../notes/uc2-row-running-version-explained.md).
+
 Two shapes to know before writing a query:
 
 - **The first four families also carry an unlabeled sample**, which is the
@@ -202,14 +212,45 @@ dedicated alert rules**, keyed on the two new gauges above, because they
 carry per-row identity rather than a set-membership bit:
 `Uc2ServiceIdentityDrift` — `count by (row) (count_values("hash",
 uc2_service_identity_hash) by (row)) > 1` — fires the moment two nodes'
-row-`r` FSM names disagree, and `Uc2ServiceVersionDrift` — `count by (row)
-(count_values("version", uc2_service_version > 0) by (row)) > 1` — fires
-when two nodes' row-`r` attached versions disagree (excluding the
-unattached/unversioned `0` case, so a joiner whose service hasn't started
-yet does not page). Both are per-row fleet queries like the declared-set one
-above, **not** a bare `count by (row) (uc2_service_identity_hash) > 1` —
-that counts *series* (one per node instance), not distinct values, and pages
-permanently on any multi-node cluster.
+row-`r` FSM names disagree, and `Uc2ServiceVersionDrift`:
+
+```
+count by (row) (count_values("line", floor((uc2_service_version > 0) / 65536)) by (row)) > 1
+```
+
+fires when two nodes' row-`r` attached services are on different version
+**lines**. A packed version is `major:8 ‖ minor:8 ‖ patch:16`, so
+`floor(v / 65536)` drops the patch and keeps major.minor — the same
+comparison the platform itself makes (`same_line`). Since #33 two patch
+builds of one line may run side by side by design, so a fleet part-way
+through a patch roll-out does not page; a differing major or minor does. The
+`> 0` filter drops the unattached sentinel `0` **before** the floor, on the
+raw value, so a joiner whose service hasn't started yet does not page while a
+real `0.0.x` line is still compared (filtering after the floor would drop
+every `0.0.x` build with it). Both rules are per-row fleet queries like the
+declared-set one above, **not** a bare `count by (row)
+(uc2_service_identity_hash) > 1` — that counts *series* (one per node
+instance), not distinct values, and pages permanently on any multi-node
+cluster.
+
+**`Uc2RowVersionMismatch` (#33) is the per-node counterpart**, and it is
+critical rather than a warning:
+
+```
+floor(uc2_service_version / 65536) != on(instance, row) floor(uc2_row_running_version / 65536)
+  and on(instance, row) uc_service_attached == 1
+```
+
+for one minute: a service attached on this node whose line differs from its
+row's committed running line. Such a service should not exist for long — it
+is refused at attach, and an already-attached one stops at the record that
+moved its row — so a firing alert means **a stop that did not happen**, or a
+slot that still reads attached at the old version because the stopped
+service has not been replaced yet (a fail-stopped service does not clear its
+ATTACHED bit). During an upgrade that second case is expected on any node
+where the new build takes more than a minute to attach; outside one,
+investigate. A row with no running version yet exports no
+`uc2_row_running_version` sample, so it can never match.
 
 ### The log clock and the timer families (2.11.0)
 
@@ -573,7 +614,8 @@ table:
 | `Uc2ServiceAbsent` | a declared FSM's `uc_service_attached` has read 0 for 30s — it was never started, or it stopped. This node's durable report is capped at the lag bound; if the FSM is absent on a **quorum of voters** (or a single node runs past its `fsm_lag` headroom) the cluster stalls by design until it attaches — but a lone follower with lag headroom keeps committing, so this alert can fire on a still-serving cluster | critical |
 | `Uc2ServicePinnedAtLagBound` | a declared FSM that **is attached** has had its `uc_service_lag_bytes` at or above `uc2_fsm_lag_bytes` for 30s in bounded mode — that FSM is running, just slower than the log, and is pacing the whole cluster | warning |
 | `Uc2ServiceIdentityDrift` (FSM identity, 2.11.0) | two nodes disagree on row `r`'s declared FSM name (its exported hash differs) — a config edit landed on some hosts and not others, or in a different order; the row's SNAP_BEGIN sessions will refuse each other the moment one runs | critical |
-| `Uc2ServiceVersionDrift` (FSM identity, 2.11.0) | two nodes' attached services at row `r` report different non-zero packed versions — a rolling upgrade in progress, or a mis-deployed binary; refused on the snapshot path, **not** prevented on the live commit path (§7) | warning |
+| `Uc2ServiceVersionDrift` (FSM identity, 2.11.0; lines since #33) | two nodes' attached services at row `r` are on different version **lines** (major.minor; patch differences are allowed and do not fire) — a mis-deployed binary, or a node whose old service has not yet been replaced after a pin | warning |
+| `Uc2RowVersionMismatch` (row running version, #33) | an attached service on this node is off its row's committed running line (`uc2_row_running_version`), for 1m — a stop that did not happen, or a stopped service's slot not yet taken over by the new build | critical |
 | `Uc2SnapshotStalled` (coordinated snapshots, 2.11.0) | this node has commanded **full** snapshot instants at least twice in 30m with no complete set landing — one FSM is silently stopping all purging | warning |
 | `Uc2StandbySnapshotStalled` (coordinated snapshots, 2.11.0) | this **learner** has acted on standby snapshot instants at least twice in 30m with no complete set landing — one of its rows is silently stopping the standby set. Cannot fire on a voter (a voter exports `uc2_snapshot_standby_instant_position = 0`) | warning |
 | `Uc2SnapshotSetDiverged` (coordinated snapshots, 2.11.0) | nodes disagree on the newest complete snapshot set's position, i.e. on their purge floors, for 60s | warning |

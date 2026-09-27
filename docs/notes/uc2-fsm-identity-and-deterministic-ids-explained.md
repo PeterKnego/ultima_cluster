@@ -139,6 +139,13 @@ commit path will keep applying commands and can silently diverge if their
 logic actually differs. The version makes that mismatch *visible*; it does
 not make it *safe*.
 
+*Update, wire `0.10.0` (#33): the live-commit half is now enforced.* Each
+row has a committed running version, and a service whose major.minor differs
+from it is refused at attach or stops at exactly the record that changed it,
+so two lines of one FSM can no longer apply the same row. Patch versions may
+still differ, by design. See [The row running version,
+explained](uc2-row-running-version-explained.md).
+
 This is deliberately the smaller half of a two-part mechanism Aeron
 ships whole. Aeron's `appVersion` has a static half — `ctx.appVersion()`,
 configured on every module and container — and a leader-stamped half: the
@@ -340,7 +347,10 @@ of that FSM's service everywhere, or accept that a rolling upgrade is in
 progress and expect this until it finishes. `Uc2ServiceVersionDrift` is the
 steady-state counterpart, watching `uc2_service_version`, and it
 deliberately ignores the `0` case (a service that hasn't attached yet) so
-it doesn't page on ordinary startup.
+it doesn't page on ordinary startup. (Since #33 that alert compares version
+*lines* — major.minor — while this session refusal still compares exact
+versions, so two patch builds of one line pass the alert and still refuse
+each other's snapshot sessions.)
 
 None of these refusals is fatal to the cluster: a mismatched or mixed-name
 session stays stalled-but-safe, never half-installed, exactly the same

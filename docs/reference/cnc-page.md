@@ -16,7 +16,7 @@ To read a live page while diagnosing a node, see
 | Offset | Size | Field | Notes |
 |---|---|---|---|
 | 0 | 8 B | magic | `UC2CNC\0\0` |
-| 8 | u32 LE | version | `CNC_V2_VERSION` = `(3 << 24) \| (1 << 16)` (cnc 3.1, FSM identity + log time, 2.11.0); `(3 << 24) \| (2 << 16)` (cnc 3.2, `payload_ceiling`, `2.12.0`); `(3 << 24) \| (3 << 16)` (cnc 3.3, `upgrade_origin`/`pinned_version`, FSM upgrade lifecycle) |
+| 8 | u32 LE | version | `CNC_V2_VERSION` = `(3 << 24) \| (1 << 16)` (cnc 3.1, FSM identity + log time, 2.11.0); `(3 << 24) \| (2 << 16)` (cnc 3.2, `payload_ceiling`, `2.12.0`); `(3 << 24) \| (3 << 16)` (cnc 3.3, `upgrade_origin`/`pinned_version`, FSM upgrade lifecycle); `(3 << 24) \| (4 << 16)` (cnc 3.4, `running_version`/`running_record_pos`/`cluster_applied`, the row running version, #33) |
 | 12 | u32 LE | node id | |
 | 16 | u64 LE | instance id, low | changes on every node restart |
 | 24 | u64 LE | instance id, high | |
@@ -67,7 +67,8 @@ writer.
 | 3984 | `payload_ceiling` | u64, **live** (cnc 3.2, jumbo-frame MTU discovery, `2.12.0`) — the third word of the 3968 line, same writer (consensus agent), published on change only: at boot, and whenever the committed rung moves. Readers: every client and the gateway edge, per submit. The header's `max_payload` (offset 112) stays the BOUND the buffer is sized for; this word is the door — see [Wire protocol § `PROBE` / `PROBE_ACK` bodies](wire-protocol.md#probe--probe_ack-bodies-wire-080-2120) |
 | 4032 | `services_declared` | node, once at boot (bit *i* ⇔ id *i* declared), stored AFTER `fsm_lag_bytes` (4040) since 2.12.0 — a reader that observes a nonzero set may rely on the lag word; names on line 7 with this word still 0 is a booting node and attachers refuse it. **Unchanged by cnc 3.1 / FSM identity**: this same-host bitmask is unrelated to the wire's per-row `SnapBeginBody.identity` array (`docs/reference/wire-protocol.md`) — the two are derived from the same `[services] names` config but serve different readers |
 | 4040 | `fsm_lag_bytes` | node (`0` ⇔ lockstep) — shares 4032's line. Since the cluster FSM (2.11.0) this is derived from the committed `Settings::fsm_lag_bytes` and **re-published when that setting moves**, not written once at boot. The record's own `0` means "derive at use" and lockstep is `u64::MAX` there, so `page_lag_from_setting` is the one place that maps the record's sentinels onto this word's |
-| 4048 | `log_time_ns` | **archive agent** (cnc 3.1, log time, 2.11.0) — the highest leader stamp the archive has recorded, ns since the Unix epoch. The third word of the `4032` line, and its only *live* writer: `4032`/`4040` are written once before publish and never again. **Never lowered.** A new leader seeds its stamp clamp from this word after the leader-open collapse; `/metrics` exports it as `uc2_log_time_ns` and `uc2ctl status` prints `log_time_ns=` (raw ns, not RFC 3339) |
+| 4048 | `log_time_ns` | **archive agent** (cnc 3.1, log time, 2.11.0) — the highest leader stamp the archive has recorded, ns since the Unix epoch. The third word of the `4032` line, and its only *live* writer until cnc 3.4: `4032`/`4040` are written once before publish and never again. **Never lowered.** A new leader seeds its stamp clamp from this word after the leader-open collapse; `/metrics` exports it as `uc2_log_time_ns` and `uc2ctl status` prints `log_time_ns=` (raw ns, not RFC 3339) |
+| 4056 | `cluster_applied` | **`uc2-cluster` agent** (cnc 3.4, #33) — the frame-END position the cluster FSM had applied `CLUSTER` frames up to when it last applied or installed something. Written only after a batch that applied or installed something, and at boot from the recovered state — not on every pass, which keeps the second live writer on the `4032` line rare — and always **after** that batch's row words (`running_version`/`running_record_pos`, below), with `Release`. So a reader that `Acquire`-loads `cluster_applied ≥ p` also sees every row's running-version words as of `p`. The reader is the service apply loop, only at a `CLUSTER` version record for its own row: it waits for this word to pass the record, then reads the row's verdict. `0` = nothing applied since boot. The fourth word of the `4032` line; `4064`–`4088` stay free |
 
 Counters are absolute byte positions in the replicated log, not indices.
 `log_time_ns` is the one exception: it is a wall-clock nanosecond value, not a
@@ -125,6 +126,8 @@ Fields within a slot (each its own 64 B line, one writer):
 | 24 | `pinned_version` (line 0, word 3) — u64, low 32 = packed version the pin names | **node** (`uc2-cluster` agent), published with `upgrade_origin` under the `pin_seq` seqlock (see the note below) — cnc 3.3 |
 | 32 | `pin_seq` (line 0, word 4) — u64 seqlock commit word for the pin words; ODD = a pin store is in flight, EVEN = quiescent, `0` at init | **node** (`uc2-cluster` agent), bumped before and after each pin store — cnc 3.3 |
 | 40 | `pinned_from` (line 0, word 5) — u64, low 32 = packed version the pin's `origin` artifact was BUILT by | **node** (`uc2-cluster` agent), published with `upgrade_origin`/`pinned_version` under the `pin_seq` seqlock (see the note below) — cnc 3.3, plan B2 |
+| 48 | `running_version` (line 0, word 6) — u64: bit 32 (`RUNNING_PRESENT`) set ⇔ the row has a running version, low 32 bits = its packed version. `0` = absent (no genesis or pin record yet). Because presence is its own bit, a recorded version of `0` (an FSM that never set `const VERSION`) reads `1 << 32`, not `0` | **node** (`uc2-cluster` agent), under the `pin_seq` seqlock with the pin words — cnc 3.4, #33 |
+| 56 | `running_record_pos` (line 0, word 7) — u64, frame-END position of the row's last **accepted** version record (a `RowGenesis` or an `UpgradePin`); `0` = none | **node** (`uc2-cluster` agent), under the same seqlock — cnc 3.4, #33 |
 | 64 | `applied` | service apply agent |
 | 128 | `epoch` | service, `fetch_add` at attach |
 | 192 | `output_completed` | service output agent |
@@ -163,6 +166,25 @@ read," never as "no pin." Every reader (`/metrics`, `uc2ctl status`, and the
 service's attach) goes through `pin()` rather than through the raw word
 accessors; `/metrics` and `uc2ctl status` render a `Contended` scrape as
 zeros, the same as `NoPin`.
+
+**cnc 3.4 (#33) fills line 0.** `running_version` (`+48`) and
+`running_record_pos` (`+56`) take the status line's last two free words and
+ride the **same** seqlock: the writer (`ServiceStatusLine::store_row_view`)
+bumps `pin_seq` to ODD, stores `pinned_version`, `pinned_from`,
+`upgrade_origin`, `running_version`, `running_record_pos`, and bumps it back to
+EVEN; the reader (`ServiceStatusLine::row_view`) loads all five between two
+reads of `pin_seq`. It returns `RowRead::View { pin, running, record_pos }` —
+`running` is `None` when the presence bit is clear — or `RowRead::Contended`
+after 64 collided attempts. One seqlock, one writer, one read: a service's
+attach takes the pin decision and the running-version decision from **one**
+`row_view()` read, so it can never pair a pin from one publish with a running
+version from another, and treats `Contended` as `PinUnreadable` (retry),
+never as "no pin" or "no version". `pin()` still exists and reads the pin
+triple alone. `uc2ctl status` prints the pair as `running=`/`running_pos=`,
+and `/metrics` exports `uc2_row_running_version{service,row}` — with **no
+sample at all** for an absent row, since `0` is an ordinary version there.
+Line 0 has no free word left; a further per-row word needs the reserved band.
+
 Line 7
 (`name`/`identity_hash`) breaks the "one writer per line, and it's the
 service" pattern the other six lines follow: it is

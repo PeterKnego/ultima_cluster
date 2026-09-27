@@ -907,6 +907,69 @@ to matter when you upgrade an FSM's `VERSION` — see [The cluster
 FSM](../notes/uc2-cluster-fsm-explained.md) § Pins and reports for what a
 pin then does at the service's next attach.
 
+## Wire + cnc change after 2.13.0: the row running version (`0.10.0`, cnc `3.4`)
+
+Issue [#33](https://github.com/PeterKnego/ultima_cluster/issues/33),
+unreleased as this is written. Every declared row gets a committed **running
+version**, and the platform enforces that a row is never applied by two
+versions of its state machine at once. The reasoning is [The row running
+version, explained](../notes/uc2-row-running-version-explained.md); the rules
+an application is built and upgraded by are [Upgrade an application § The
+version rules](upgrade-an-application.md#the-version-rules).
+
+**Wire 0.9.0 → 0.10.0: one new `CLUSTER` kind, and like `0.9.0`'s it is NOT
+benign.** `kind 6 = RowGenesis` (8 B: `row ‖ reserved ‖ version`) is a frame
+on the replicated log. A `0.9.0` node applies it as undecodable and moves on,
+so its cluster FSM never learns any row's running version and diverges in
+silence. **Stop every node before starting any node.**
+
+**cnc 3.3 → 3.4: three new node-written words.** `running_version` (slot
+`+48`; bit 32 = present, low 32 bits = the packed version) and
+`running_record_pos` (slot `+56`) on the service status line, under the same
+`pin_seq` seqlock as the pin words; and `cluster_applied` at page-1 offset
+`4056`. See [the cnc control page](../reference/cnc-page.md#service-slots). As
+with every page bump, each host's clients, services and gateway restart with
+its node.
+
+**No wipe.** The cluster artifact moves from image version 2 to 3 (a
+per-row running-version blob), and versions 1 and 2 are still read: a row
+with pin history takes its newest pin's `to` as its running version, and a
+row without pins gets one the first time the leader sees its own service for
+that row attached. The row artifacts' envelope (`ULTSNAP2`) is unchanged, so
+neither `snapshots/<row>/` nor `snapshots/cluster/` needs clearing.
+
+**What to expect when the cluster comes back up.**
+
+- **Client writes wait until every declared row has a running version.** The
+  leader records a row's first version (a `RowGenesis` record, audited as
+  `row_genesis` with `actor="node"`, `source="genesis"`) from **its own**
+  attached service for that row, and until every declared row has one it
+  drains nothing from the ingress ring: clients see back-pressure, not an
+  error. The node logs `version_gate_waiting` every 5 s naming the lowest row
+  still waiting and `leader_service_attached`. A declared row whose service
+  never attaches **on the leader** keeps the cluster closed to writes, so
+  start every declared row's service on every node, as the flag-day order
+  already says. A row that already had a pin before the upgrade carries its
+  version across and needs no genesis.
+- **Start the same line everywhere.** Genesis records whatever line the
+  leader's service is on. A follower whose service is on another line
+  (major.minor) is refused at attach with `VersionMismatch`, or — if it
+  attached before the record committed — stops at the record with
+  `version_superseded`. Both name the row and both versions.
+- **An unversioned FSM is version `0`, and `0` is a real version.** A row
+  whose leader ran a service without `const VERSION` records `0`, and a
+  later binary with a real `VERSION` is refused until you move the row with
+  `uc2ctl upgrade pin --from 0.0.0`.
+- **`uc2ctl status`** prints `running=` and `running_pos=` last on each row's
+  line; `/metrics` adds `uc2_row_running_version{service,row}` and the
+  `Uc2RowVersionMismatch` alert, and `Uc2ServiceVersionDrift` now compares
+  lines, not exact versions ([Monitor a
+  cluster](monitor-a-cluster.md#the-per-fsm-families-m14)).
+- **Harnesses that start a node and submit without a service now wait
+  forever.** Anything that declares a row must attach a service for it on the
+  leader before driving load — in-tree, the M10 alert-fire harness was
+  re-shaped this way.
+
 ## Where to go next
 
 - [Configuration: Admin authentication](../reference/configuration.md#admin-authentication)

@@ -216,11 +216,12 @@ Two version numbers are deliberately *outside* this policy, because semver's
 "a minor bump is safe" contract is the wrong promise for them:
 
 - **The node-to-node wire protocol** (`uc_protocol::version::CURRENT`,
-  currently `0.9.0` (`2.13.0`, the FSM upgrade lifecycle's two new `CLUSTER`
-  kinds and one new pairwise datagram kind) — see
+  currently `0.10.0` (#33, the row running version's one new `CLUSTER`
+  kind; unreleased as this is written — `0.9.0` shipped in `2.13.0`) — see
   [wire protocol](wire-protocol.md)).
-- **The `cnc.dat` page layout** (`CNC_V2_VERSION`, currently cnc `3.3`
-  (`2.13.0`) — see [the cnc control page](cnc-page.md)).
+- **The `cnc.dat` page layout** (`CNC_V2_VERSION`, currently cnc `3.4`
+  (#33, unreleased; cnc `3.3` shipped in `2.13.0`) — see [the cnc control
+  page](cnc-page.md)).
 
 A change to either is a **flag day**: every node in a cluster is stopped and
 restarted on the new version together. Mixed-version operation is not
@@ -231,8 +232,9 @@ cluster stalls commits rather than making unsound ones. The procedure is
 [Upgrade a cluster](../how-to/upgrade-a-cluster.md); it applies whether or
 not the crate version's major digit moved.
 
-**`2.12.0` shipped the most recent RELEASED flag day on both lines** (`2.13.0`,
-below, is not yet released). `2.11.0`, the one before it, carried **two**
+**`2.13.0` shipped the most recent RELEASED flag day on both lines**; the
+row running version's (`0.10.0` / cnc `3.4`, below) is not yet released.
+`2.11.0` carried **two**
 wire-and-page features at once: wire `0.6.0` → `0.7.0` and cnc `3.0` → `3.1`,
 bundled as one combined flag day per the standing rule that a cnc layout
 change is a flag day regardless of the digit.
@@ -308,6 +310,57 @@ cluster](../how-to/upgrade-a-cluster.md#wire--cnc-change-in-2130-upgrade-pins-an
 the row must be able to rebuild what was deleted, which means a durable state
 machine or a journal that still holds genesis. A cluster running purge with an
 in-memory state machine can do neither.
+
+### The row running version flag day (`0.10.0`, cnc `3.4`)
+
+Issue [#33](https://github.com/PeterKnego/ultima_cluster/issues/33), not yet
+released: wire `0.9.0` → `0.10.0` and cnc `3.3` → `3.4`, one more flag day on
+the same terms as the rest.
+
+**Wire `0.10.0`.** One new `CLUSTER` kind, `6` `RowGenesis` (8 bytes: `row ‖
+reserved [3] ‖ version`), which the leader appends on its own to record a
+row's first running version ([wire protocol](wire-protocol.md#cluster-body-wire-070)).
+No existing layout changes. A `0.9.0` peer refuses kind 6 as undecodable and
+advances past it, so its cluster FSM never learns any row's running version
+and silently diverges: stop every node before starting any node.
+
+**cnc `3.4`.** Three node-written words, no layout move: `running_version`
+(`+48`) and `running_record_pos` (`+56`) on the row's service status line,
+published under the existing `pin_seq` seqlock with the pin words (line 0 is
+now full), and `cluster_applied` at page-1 offset `4056`
+([cnc page](cnc-page.md#counters-and-status)). Every new word reads `0` as
+absent.
+
+**Cluster image 2 → 3, no wipe.** The cluster artifact gains a trailing
+per-row running-version blob. Versions 1 and 2 are still read: a row with
+pin history takes its newest pin's `to` as its running version (record
+position = the image's applied position), and a row without pins has none
+until the leader records one. No `snapshots/` directory needs clearing for
+this flag day. `ClusterFsm::VERSION` itself stays `1`, as before.
+
+**What changes for an application.** No trait changes, but three behaviour
+changes an operator will see:
+
+- a service whose `VERSION` is off its row's running line (major.minor) is
+  **refused at attach** with the new `ServiceError::VersionMismatch`;
+- an attached service **fail-stops** at a record that moves its row to
+  another line (`version_superseded`), with `applied` at exactly the record's
+  start — so `Service::is_alive()` can now turn `false` at a pin;
+- a leader admits **no client writes** until every declared row has a running
+  version, which it records from its own attached services.
+
+And one relaxation: the snapshot envelope's version check (both the unpinned
+install's and the pinned install's cross-check against `from`) compares
+**lines**, not exact versions, so patch builds of one line install each
+other's artifacts. The rules are [Upgrade an application § The version
+rules](../how-to/upgrade-an-application.md#the-version-rules).
+
+**API note.** `ServiceError` gains a variant, `VersionMismatch { name, row,
+running, mine }`. `ServiceError` is a promised type and is not
+`#[non_exhaustive]`, so an exhaustive `match` on it downstream stops compiling
+— the same documented minor-version hazard `Outcome` and `SubmitError`
+carried in M14b. Adding a variant is additive under this policy.
+`uc_protocol::identity::same_line` is new, but `uc_protocol` is not promised.
 
 ### `2.13.0` API notes
 

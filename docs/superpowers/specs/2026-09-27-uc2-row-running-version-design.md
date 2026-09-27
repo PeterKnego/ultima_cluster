@@ -8,6 +8,86 @@ the FSM upgrade lifecycle spec
 (`2026-09-19-uc2-fsm-upgrade-lifecycle-design.md` §1.3, §9.2) — the safety
 half only.
 
+**Explainer:** `docs/notes/uc2-row-running-version-explained.md` carries
+this spec's argument in plain language; the operator's rules are
+`docs/how-to/upgrade-an-application.md` § The version rules.
+
+#### Errata (as built)
+
+Where the implementation diverged from the body below. Read these first; each
+cites the commit that settled it.
+
+- **R5 — the page-1 word at `4056` is `cluster_applied`, not
+  `cluster_consumed`** (§5.2). The `uc2-cluster` agent writes it only after a
+  batch that applied or installed something (and at boot, next bullet), with
+  the frame-END position the FSM has applied `CLUSTER` frames up to — not
+  the walk cursor on every pass. That is what §5.2's own false-sharing
+  argument asked for, and a service waits on it only at a `CLUSTER` frame,
+  which is exactly an applying batch. (`c63c9ef`, `a9af9cb`, `60dc03f`)
+- **R6 — recovery publishes `cluster_applied` too.** `ClusterAgent::new`'s
+  recovery-time publish also stores `cluster_applied` = the recovered
+  `applied`. Without it the word starts at 0 after a node restart, and a
+  service waiting at a refused record at or below the recovered position
+  would wait for a write that no replay ever makes. (`60dc03f`)
+- **R12 — journal replay DOES need the version stop** (§7.2 says "replay
+  needs no arm"; that is wrong). `replay_into` runs on every `Overrun`,
+  including the attach-time catch-up, and walks past `attach_record_pos`, so
+  it stops at a superseding record exactly as the live loop does; a test
+  fails without it. (`ccd8008`)
+- **R13 — the wait is bounded; a verdict that is not ready yields
+  `Pending`.** §7.2 step 2 waits for `cluster_consumed ≥ pos` with no bound.
+  As built, the arm spins (1024) then yields (64) and, if the cluster agent
+  has still not applied the record (or the view stayed contended), returns
+  `Gate::Pending`: the live loop rewinds its cursor to the record's start,
+  publishes `applied = pos` and ends the cycle, and the SM lock is not held
+  across the wait; the replay path returns and rejoins at the record. So a
+  dead cluster agent can never make `Service::stop` hang. (`e9282c2`)
+- **R9 — attach takes ONE `row_view()` read** for the pin, the running
+  version and `record_pos`, and derives the pin decision from it, rather than
+  §7.1's pin read followed by a second row-view read (a TOCTOU: the two could
+  come from different publishes). `RowRead::Contended` → the existing
+  `ServiceError::PinUnreadable`; the separate `RowViewUnreadable` refusal
+  never shipped. (`a8de0e2`)
+- **Migration record position** (§5.3). A v1/v2 image gives each pinned row
+  `record_pos` = the image's `applied`, which depends on the position the
+  image was taken at, so replicas may hold **different** `record_pos` values
+  for one row until its next pin. That is harmless — cluster artifacts
+  already differ byte-wise across the flag day, and nothing compares
+  `record_pos` across nodes or decides on it cluster-wide — and it has one
+  visible effect: after a legacy install, a same-line service may take ONE
+  spurious stop at an old pin record above its attach position. That is
+  safe; the next attach covers the record and there is no stop loop.
+  (`4042ef1`)
+- **Records inside a span jumped by a mid-life snapshot install are never
+  walked** by the version gate. That path relies on the envelope's
+  `same_line` check at install instead: an artifact built on another line is
+  refused. (`855a0aa`)
+- **R8/R10 — test fixtures.** Under D3 raw small `VERSION` integers are all
+  one line (`0.0.x`), which silently aliased the `uc_lincheck` register
+  fixtures that exist to model different versions; they moved to distinct
+  lines (`DoublingRegisterSm` `0.2.0`, `DoublingCasRegisterSm` `0.3.0`).
+  Tests that used to observe an unpinned mixed-version stall now observe the
+  earlier attach refusal (`VersionMismatch`), the stronger form of the same
+  protection. (`a8de0e2`)
+- **S4 of the lifecycle spec (the purge-floor hold for pins).** With the old
+  pinned row now stopped at the pin record, no newer complete set can form
+  before the new build attaches, so `hold_floor_for_pins` has no end-to-end
+  scenario left; its three `pinned_attach` tests were reworked to wait for
+  the old service's stop (R11). (`54caa65`)
+- **R14 — the client gate reaches harnesses.** A harness that declares a row
+  and submits with no leader-side service now waits forever at the gate
+  (§6.2). The M10 alert-fire harness's real-cluster scenarios had to attach a
+  service on every node before driving load. (`e23973e`)
+- **Smaller as-built facts.** Refusal 52's `reason_str` is the bare
+  `row_undeclared` (the explanation moved to `docs/reference/uc2ctl.md`), and
+  genesis refuses only 60, not 52. §6.1's audit line is op `row_genesis`
+  (audit-only op code 100) with `source="genesis"`. `upgrade show`'s running
+  line reads `running=<v> set_at=<end> by=pin|genesis`, with `by` inferred
+  from whether the newest pin's `to` equals the running version.
+  `Uc2ServiceVersionDrift` was also moved to compare lines (major.minor),
+  filtering the `0` sentinel before the floor. (`389e40d`, `2d38335`,
+  `0af2f16`)
+
 ## 1. Problem
 
 A row (one declared FSM, `[services] names`, index 0–7) can today be served
