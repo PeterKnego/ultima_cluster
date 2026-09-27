@@ -510,6 +510,14 @@ fn mixed_version_scenario(app: &str) -> Result<(), String> {
         // No fix: the v1 build still serves the row on the new leader.
         c.client(new_leader).query_u64()
     } else {
+        // Every v1 refused or stopped FIRST, so a still-alive v1 fails with
+        // this message rather than with the exact-stop one below.
+        for (refused_or_stopped, dbg) in &verdicts {
+            assert!(
+                *refused_or_stopped,
+                "a v1 service is still applying a row that runs 2.0: {dbg}"
+            );
+        }
         // Spec §4.3: a stopped v1 stopped at EXACTLY the record — its slot's
         // `applied` is the genesis frame's START (every earlier frame, none
         // after). Read before any v2 attaches and rewrites the slot.
@@ -538,7 +546,8 @@ fn mixed_version_scenario(app: &str) -> Result<(), String> {
     };
     assert_eq!(got, 15, "the acknowledged Append(5) was lost");
 
-    // Second line of defence: every v1 service was refused or has stopped.
+    // Second line of defence on the live-v1 branch (the fixed branch checked
+    // it before its exact-stop assertion): every v1 was refused or stopped.
     for (refused_or_stopped, dbg) in &verdicts {
         assert!(
             *refused_or_stopped,

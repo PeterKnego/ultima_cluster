@@ -48,38 +48,60 @@ pub(crate) fn verdict(mine: u32, rec_end: u64, view: RowRead) -> Option<Verdict>
     )
 }
 
-/// Spins before the wait starts yielding. The agent applies at commit and
-/// this frame is already committed here, so the wait is normally short.
-const SPINS_BEFORE_YIELD: u32 = 1024;
+/// The arm's wait budget (ruling R13): spin this many times, then yield
+/// [`WAIT_YIELDS`] times, then give up for this cycle with
+/// [`Gate::Pending`]. The agent applies at commit and this frame is already
+/// committed here, so the common wait ends inside the spins; the whole budget
+/// is on the order of one short apply cycle (a few µs of spinning plus 64
+/// scheduler yields — tens to a few hundred µs), never a sleep.
+const WAIT_SPINS: u32 = 1024;
+/// See [`WAIT_SPINS`].
+const WAIT_YIELDS: u32 = 64;
+
+/// What the arm decided about one `CLUSTER` frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub(crate) enum Gate {
+    /// Not a version record for this row, already decided, refused, or
+    /// accepted and on this binary's line: apply on.
+    Pass,
+    /// The record superseded this binary's line: stop at exactly `pos`.
+    Stop { running: u32 },
+    /// The `uc2-cluster` agent has not applied the record (or the view stayed
+    /// contended) within the wait budget. The caller rewinds to `pos`,
+    /// publishes `applied = pos` and ends the cycle; the next cycle re-walks
+    /// the record (R13 — a wait must never starve the runner's stop check).
+    Pending,
+}
 
 /// The apply loop's arm (out of line — M14a). `pos` is the frame START.
-/// Returns `Some(running)` when the service must stop BEFORE any later frame
-/// (the caller publishes `applied = pos` and fail-stops); `None` otherwise.
 #[inline(never)]
 pub(crate) fn on_cluster_frame(
     cnc: &CncPage,
     row: u8,
     mine: u32,
-    attach_record_pos: u64,
+    decided_to: u64,
     pos: u64,
     hdr: &FrameHeader,
     payload: &[u8],
-) -> Option<u32> {
+) -> Gate {
     // The same bytes the cluster agent hands `ClusterFsm::apply`, prefix
     // included; both version bodies start with the row byte.
-    let (kind, body) = read_cluster_prefix(payload)?;
+    let Some((kind, body)) = read_cluster_prefix(payload) else {
+        return Gate::Pass;
+    };
     if !matches!(kind, ClusterKind::UpgradePin | ClusterKind::RowGenesis)
         || body.first() != Some(&row)
     {
-        return None;
+        return Gate::Pass;
     }
     // A frame END, the unit `running_record_pos` is kept in (the cluster
     // agent computes the same end for the ctx it applies under).
     let rec_end = pos + align_frame_len(hdr.length as usize) as u64;
-    if rec_end <= attach_record_pos {
-        return None; // decided by this incarnation's attach (spec §7.1)
+    if rec_end <= decided_to {
+        return Gate::Pass; // decided by this incarnation's attach (spec §7.1)
     }
-    let mut spins = 0u32;
+    let (mut spins, mut yields) = (0u32, 0u32);
     loop {
         // `cluster_applied` is stored (Release) AFTER the row words, so a
         // reader that sees it at or past `rec_end` sees the row as of then.
@@ -91,18 +113,33 @@ pub(crate) fn on_cluster_frame(
             )
         {
             return match v {
-                Verdict::Continue => None,
-                Verdict::Stop { running } => Some(running),
+                Verdict::Continue => Gate::Pass,
+                Verdict::Stop { running } => Gate::Stop { running },
             };
         }
-        // Never sleep on a live peer (CLAUDE.md, M14a): spin, then yield.
-        if spins < SPINS_BEFORE_YIELD {
+        // Never sleep on a live peer (CLAUDE.md, M14a): spin, then yield,
+        // then hand the cycle back (R13).
+        if spins < WAIT_SPINS {
             spins += 1;
             std::hint::spin_loop();
-        } else {
+        } else if yields < WAIT_YIELDS {
+            yields += 1;
             std::thread::yield_now();
+        } else {
+            return Gate::Pending;
         }
     }
+}
+
+/// R13, the live arm's `Pending`: rewind the follower to the record and
+/// publish `applied = pos` — every frame before it applied, nothing at or
+/// after it. Out of line and cold so the per-frame arm stays a type test,
+/// one call and a small match.
+#[cold]
+#[inline(never)]
+pub(crate) fn rewind_to_record(cursor: &mut u64, cnc: &CncPage, row: u8, pos: u64) {
+    *cursor = pos;
+    crate::attach::slot(cnc, row).applied.store_release(pos);
 }
 
 /// The named fail-stop message (spec §7.2).
@@ -258,11 +295,14 @@ mod tests {
         p.service_slot(0).status.store_row_view(None, Some(V2), END);
         p.store_cluster_applied(END);
         let (h, pl) = genesis(ROW, V2);
-        assert_eq!(on_cluster_frame(&p, ROW, V1, 0, START, &h, &pl), Some(V2));
+        assert_eq!(
+            on_cluster_frame(&p, ROW, V1, 0, START, &h, &pl),
+            Gate::Stop { running: V2 }
+        );
         // The same record for a matching line build is not a stop.
         assert_eq!(
             on_cluster_frame(&p, ROW, pack_version(2, 0, 9), 0, START, &h, &pl),
-            None
+            Gate::Pass
         );
     }
 
@@ -274,32 +314,45 @@ mod tests {
         let (h, pl) = genesis(1, V2);
         assert_eq!(
             on_cluster_frame(&p, ROW, V1, 0, START, &h, &pl),
-            None,
+            Gate::Pass,
             "other row"
         );
         let (h, pl) = cluster_frame(ClusterKind::Settings, &[0u8; 40]);
         assert_eq!(
             on_cluster_frame(&p, ROW, V1, 0, START, &h, &pl),
-            None,
+            Gate::Pass,
             "other kind"
         );
         let (h, pl) = genesis(ROW, V2);
         assert_eq!(
             on_cluster_frame(&p, ROW, V1, END, START, &h, &pl),
-            None,
+            Gate::Pass,
             "at or below attach_record_pos: decided by the attach"
         );
         assert_eq!(
             on_cluster_frame(&p, ROW, V1, 0, START, &h, &[]),
-            None,
+            Gate::Pass,
             "no prefix"
         );
     }
 
+    /// R13: the arm waits a BOUNDED budget, then answers `Pending`; a caller
+    /// that re-asks once the agent has applied the record gets the verdict.
     #[test]
-    fn the_arm_waits_for_the_agent_then_decides() {
+    fn the_arm_waits_a_bounded_budget_then_decides_on_a_later_ask() {
         let p = page();
         let (h, pl) = genesis(ROW, V2);
+        let t0 = std::time::Instant::now();
+        assert_eq!(
+            on_cluster_frame(&p, ROW, V1, 0, START, &h, &pl),
+            Gate::Pending,
+            "the agent never advanced"
+        );
+        assert!(
+            t0.elapsed() < std::time::Duration::from_millis(500),
+            "the budget is bounded: {:?}",
+            t0.elapsed()
+        );
         let writer = {
             let p = std::sync::Arc::clone(&p);
             std::thread::spawn(move || {
@@ -309,12 +362,19 @@ mod tests {
                 p.store_cluster_applied(END);
             })
         };
-        let t0 = std::time::Instant::now();
-        assert_eq!(on_cluster_frame(&p, ROW, V1, 0, START, &h, &pl), Some(V2));
-        assert!(
-            t0.elapsed() >= std::time::Duration::from_millis(40),
-            "it waited"
-        );
+        let (mut pendings, t0) = (0u32, std::time::Instant::now());
+        let gate = loop {
+            match on_cluster_frame(&p, ROW, V1, 0, START, &h, &pl) {
+                Gate::Pending => pendings += 1,
+                g => break g,
+            }
+            assert!(
+                t0.elapsed() < std::time::Duration::from_secs(5),
+                "never decided"
+            );
+        };
+        assert_eq!(gate, Gate::Stop { running: V2 });
+        assert!(pendings >= 1, "the 50 ms wait outlasts one budget");
         writer.join().unwrap();
     }
 
@@ -329,8 +389,14 @@ mod tests {
         p.service_slot(0).status.store_row_view(None, Some(V1), r2);
         p.store_cluster_applied(r2);
         let (h, pl) = genesis(ROW, V2);
-        assert_eq!(on_cluster_frame(&p, ROW, V1, r2, START, &h, &pl), None);
-        assert_eq!(on_cluster_frame(&p, ROW, V1, 0, START, &h, &pl), Some(V1));
+        assert_eq!(
+            on_cluster_frame(&p, ROW, V1, r2, START, &h, &pl),
+            Gate::Pass
+        );
+        assert_eq!(
+            on_cluster_frame(&p, ROW, V1, 0, START, &h, &pl),
+            Gate::Stop { running: V1 }
+        );
     }
 
     #[test]
@@ -341,7 +407,10 @@ mod tests {
         p.service_slot(0).status.store_row_view(None, Some(V1), 640);
         p.store_cluster_applied(END + 4096);
         let (h, pl) = genesis(ROW, V2);
-        assert_eq!(on_cluster_frame(&p, ROW, V1, 640, START, &h, &pl), None);
+        assert_eq!(
+            on_cluster_frame(&p, ROW, V1, 640, START, &h, &pl),
+            Gate::Pass
+        );
     }
 
     #[test]

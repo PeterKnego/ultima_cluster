@@ -564,6 +564,9 @@ pub(crate) fn apply_cycle<S: RawStateMachine>(st: &mut ApplyState<S>) -> bool {
                 // `ApplyCtx::rebind`): the per-frame construction was ~10
                 // stores plus a drop on the hot path.
                 let mut ctx = ApplyCtx::new(0, S::IDENTITY);
+                // R13: the start of a version record the agent has not
+                // applied yet — the batch ends there, see below.
+                let mut pending_at: Option<u64> = None;
                 for (pos, hdr, payload) in frames {
                     // PADDING, NEW_TERM, CONFIG (and any future type that is
                     // neither MESSAGE nor a TIMER for THIS row), and anything
@@ -647,8 +650,10 @@ pub(crate) fn apply_cycle<S: RawStateMachine>(st: &mut ApplyState<S>) -> bool {
                         // #33 spec §7.2: the type test and one out-of-line
                         // call (M14a). A version record that superseded this
                         // binary's line stops the service at EXACTLY `pos`:
-                        // every earlier frame applied, nothing after.
-                        if let Some(running) = crate::version_gate::on_cluster_frame(
+                        // every earlier frame applied, nothing after. One the
+                        // agent has not applied yet ends the batch AT it
+                        // (R13), handled below, off the per-frame path.
+                        match crate::version_gate::on_cluster_frame(
                             &st.cnc,
                             st.service_id,
                             S::VERSION,
@@ -657,13 +662,20 @@ pub(crate) fn apply_cycle<S: RawStateMachine>(st: &mut ApplyState<S>) -> bool {
                             &hdr,
                             payload,
                         ) {
-                            crate::version_gate::stop_at_record(
-                                sm,
-                                &st.cnc,
-                                st.service_id,
-                                running,
-                                pos,
-                            );
+                            crate::version_gate::Gate::Pass => {}
+                            crate::version_gate::Gate::Stop { running } => {
+                                crate::version_gate::stop_at_record(
+                                    sm,
+                                    &st.cnc,
+                                    st.service_id,
+                                    running,
+                                    pos,
+                                );
+                            }
+                            crate::version_gate::Gate::Pending => {
+                                pending_at = Some(pos);
+                                break;
+                            }
                         }
                     }
                     if one_frame {
@@ -678,6 +690,23 @@ pub(crate) fn apply_cycle<S: RawStateMachine>(st: &mut ApplyState<S>) -> bool {
                         std::sync::atomic::Ordering::Relaxed,
                     );
                     profile::add(pf_frames, pf_sm, pf_pub, pf_bytes);
+                }
+                if let Some(pos) = pending_at {
+                    // R13: rewind to the record (`applied = pos`) and hand the
+                    // cycle back — the SM guard is already released, the
+                    // runner checks its stop flag, and the next cycle
+                    // re-walks the record (the CLUSTER arm has no side
+                    // effects; MESSAGE/TIMER are `> last_applied`-guarded).
+                    // Counted as progress so the runner does not park the
+                    // row on its idle ladder while a record is in flight.
+                    crate::version_gate::rewind_to_record(
+                        &mut st.follower.cursor,
+                        &st.cnc,
+                        st.service_id,
+                        pos,
+                    );
+                    progressed = true;
+                    break;
                 }
                 // Publish the new applied frontier for barrier readers / clients.
                 crate::attach::slot(&st.cnc, st.service_id)
@@ -738,6 +767,28 @@ pub(crate) fn apply_cycle<S: RawStateMachine>(st: &mut ApplyState<S>) -> bool {
                 st.replay_stalled,
             ) {
                 Ok(Replay::Rejoin(cursor)) => cursor,
+                // R13: replay reached a version record the agent has not
+                // applied yet — rejoin AT it and end the cycle, exactly as
+                // the live arm's `Pending` does. Never the gap guard's
+                // no-progress case: nothing is missing, the agent is behind.
+                Ok(Replay::AwaitVersion(at)) => {
+                    st.replay_wait = None;
+                    st.needs_replay = false;
+                    let moved = at > cursor_before;
+                    crate::version_gate::rewind_to_record(
+                        &mut st.follower.cursor,
+                        &st.cnc,
+                        st.service_id,
+                        at,
+                    );
+                    if moved {
+                        st.replay_stalled = None;
+                        st.lag_waiting = false;
+                        st.announce_pending = true;
+                    }
+                    progressed = true;
+                    break;
+                }
                 // The covering artifact is above `min(commit, durable)`: the
                 // counters are still climbing toward it. Leave the cursor
                 // where it is and let the agent idle; the next cycle overruns
@@ -1746,6 +1797,85 @@ mod tests {
         }
     }
 
+    /// R13: a version record the `uc2-cluster` agent has not reached within
+    /// the wait budget is PENDING, not a spin-forever: the cycle rewinds the
+    /// cursor to the record, publishes `applied = pos`, applies nothing after
+    /// it, releases the SM mutex and RETURNS — so the runner's stop check and
+    /// the next cycle's `check_node_instance` both get their turn. The next
+    /// cycle re-walks the record; once the agent has applied it, the frame
+    /// after it applies. Timeout-wrapped so a RED run fails, not hangs.
+    #[test]
+    fn a_pending_version_record_returns_from_the_cycle_at_the_record() {
+        let (mut st, cnc, _sc, mut appender, _dir) = apply_state_for_test(CountSm::default());
+        let before = appender.append(1, 1, &[1u8; 64]).unwrap();
+        let v0 = 0u32; // CountSm's own line: the record is ours once applied
+        let (start, end) = append_genesis(&mut appender, v0);
+        let after = appender.append(1, 2, &[1u8; 64]).unwrap();
+        let head = appender.position();
+        cnc.counters().durable.store_release(head);
+        cnc.counters().commit.store_release(head);
+        // The agent never advances: `cluster_applied` stays 0.
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let progressed = super::apply_cycle(&mut st);
+            let _ = tx.send((progressed, st));
+        });
+        let (_, mut st) = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("apply_cycle must return while the record is pending, not spin");
+        {
+            let sm = st
+                .sm
+                .try_lock()
+                .expect("the SM mutex is released, not held or poisoned");
+            assert_eq!(
+                (sm.applies, sm.last),
+                (1, Some(before)),
+                "nothing at or after the record"
+            );
+        }
+        assert_eq!(
+            st.follower.cursor, start,
+            "the cursor is rewound to the record"
+        );
+        assert_eq!(cnc.service_slot(0).applied.load_acquire(), start);
+
+        // The agent catches up; the next cycle re-walks the record and goes on.
+        agent_accepted(&cnc, v0, end);
+        assert!(super::apply_cycle(&mut st));
+        let sm = st.sm.lock().unwrap();
+        assert_eq!((sm.applies, sm.last), (2, Some(after)));
+        assert_eq!(cnc.service_slot(0).applied.load_acquire(), head);
+    }
+
+    /// R13, the teardown half: with the agent never advancing, the apply
+    /// agent's runner still reaches its stop check, so `stop()` (what
+    /// `Service::stop` does per agent) returns promptly.
+    #[test]
+    fn stop_returns_while_a_version_record_waits_on_a_silent_agent() {
+        let (mut st, cnc, _sc, mut appender, _dir) = apply_state_for_test(CountSm::default());
+        appender.append(1, 1, &[1u8; 64]).unwrap();
+        append_genesis(&mut appender, uc_protocol::identity::pack_version(1, 0, 0));
+        let head = appender.position();
+        cnc.counters().durable.store_release(head);
+        cnc.counters().commit.store_release(head);
+        let runner = uc_log::agent::AgentRunner::spawn(
+            "uc2-apply-r13",
+            uc_log::agent::IdleStrategy::Yield,
+            move || super::apply_cycle(&mut st),
+        )
+        .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            runner.stop();
+            let _ = tx.send(());
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("stop() must return while the version record is pending");
+    }
+
     /// Replay arm: the mid-life/attach-time journal replay (`Overrun`) walks
     /// frames above `attach_record_pos` too, so it must stop at a superseding
     /// record exactly as the live loop does.
@@ -1808,6 +1938,80 @@ mod tests {
             "frames 0..200 only"
         );
         assert_eq!(cnc.service_slot(0).applied.load_acquire(), rec.0);
+    }
+
+    /// R13 on the replay path: a version record the agent has not applied
+    /// ends the pass AT it (`Replay::AwaitVersion`) and the cycle returns —
+    /// the gap guard must not read it as a no-progress pass.
+    #[test]
+    fn a_pending_version_record_ends_the_journal_replay_at_it() {
+        let dir = scratch();
+        let cnc = page(0x3333);
+        cnc.store_services_declared(0b1);
+        let buffer = std::sync::Arc::new(uc_log::buffer::LogBuffer::new(
+            uc_log::region::Region::heap_zeroed(CAP as usize),
+            std::sync::Arc::clone(&cnc),
+            256,
+        ));
+        let journal_dir = dir.path().join("journal");
+        let mut archive = uc_log::archive::Archive::open(uc_log::archive::ArchiveConfig {
+            segment_size_bytes: 16 * 1024,
+            preallocate_segments: false,
+            ..uc_log::archive::ArchiveConfig::new(&journal_dir)
+        })
+        .unwrap();
+        let mut appender = uc_log::buffer::Appender::new(std::sync::Arc::clone(&buffer), 1, 0);
+        // Lap the 64 KiB ring (1400 × 96 B) so cursor 0 overruns; the record
+        // sits after frame 199, far below what the ring retains.
+        let v1 = uc_protocol::identity::pack_version(1, 0, 0);
+        let mut last_before = 0;
+        let mut rec = (0, 0);
+        for i in 0..1400u32 {
+            let p = appender.append(1, i, &[1u8; 64]).unwrap();
+            if i < 200 {
+                last_before = p;
+            }
+            if i == 199 {
+                rec = append_genesis(&mut appender, v1);
+            }
+            if i % 100 == 99 {
+                while archive.do_work(&buffer).unwrap() {}
+            }
+        }
+        while archive.do_work(&buffer).unwrap() {}
+        drop(archive);
+        let head = cnc.counters().append.load_acquire();
+        assert_eq!(cnc.counters().durable.load_acquire(), head, "all recorded");
+        cnc.counters().commit.store_release(head);
+        // The agent never advances: `cluster_applied` stays 0.
+
+        let (mut st, _cnc2, _sc2, _ap2, _dir2) = apply_state_for_test(CountSm::default());
+        st.cnc = Arc::clone(&cnc);
+        st.follower = uc_log::reader::LogFollower::new(std::sync::Arc::clone(&buffer), 0);
+        st.journal_dir = journal_dir;
+        st.instance_id = 0x3333;
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let progressed = super::apply_cycle(&mut st);
+            let _ = tx.send((progressed, st));
+        });
+        let (progressed, st) = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("a pending record must end the replay, not spin");
+        assert!(progressed, "the replay moved the cursor up to the record");
+        let sm = st.sm.try_lock().expect("not held, not poisoned");
+        assert_eq!(
+            (sm.applies, sm.last),
+            (200, Some(last_before)),
+            "frames 0..200 only"
+        );
+        assert_eq!(st.follower.cursor, rec.0, "rejoined AT the record");
+        assert_eq!(cnc.service_slot(0).applied.load_acquire(), rec.0);
+        assert_eq!(
+            st.replay_stalled, None,
+            "never the gap guard's no-progress case"
+        );
     }
 
     // ------------------- plan B3 T5: the replay forward-progress guard

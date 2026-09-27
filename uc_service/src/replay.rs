@@ -46,6 +46,11 @@ pub(crate) enum Replay {
     /// the floor until the tail catches up; nightly 33488022809). Nothing was
     /// applied; the caller retries next cycle.
     AwaitArtifact { artifact: u64, target: u64 },
+    /// #33 / R13: the walk reached a version record for this row that the
+    /// `uc2-cluster` agent has not applied yet (within the arm's wait
+    /// budget). Every frame before it applied; the payload is the record's
+    /// START, where the caller rejoins and ends its cycle.
+    AwaitVersion(u64),
 }
 
 /// Ruling P10's inputs: everything a replayed span needs in order to act on
@@ -440,6 +445,9 @@ pub(crate) fn replay_into<S: RawStateMachine>(
     // #33: `Some((running, record start))` once the scan meets a record that
     // moved this row off this binary's line.
     let mut stop_at: Option<(u32, u64)> = None;
+    // R13: `Some(record start)` once the scan meets a version record the
+    // agent has not applied yet.
+    let mut pending_at: Option<u64> = None;
     reader
         .scan_from(start_pos, |_seq, base, payload| {
             // `target` is the ONE frontier captured above, shared with pass 1
@@ -525,7 +533,7 @@ pub(crate) fn replay_into<S: RawStateMachine>(
                 } else if hdr.frame_type == FRAME_TYPE_CLUSTER {
                     // #33 spec §7.2, the same arm as the live loop's: stop at
                     // exactly a record that moved the row off this line.
-                    if let Some(running) = crate::version_gate::on_cluster_frame(
+                    match crate::version_gate::on_cluster_frame(
                         cnc,
                         instant.service_id,
                         S::VERSION,
@@ -534,11 +542,19 @@ pub(crate) fn replay_into<S: RawStateMachine>(
                         &hdr,
                         &payload[off + HEADER_LEN..off + total],
                     ) {
-                        // Out of the scan; the fail-stop runs below, once
-                        // the SM guard can be released (a panic here would
-                        // poison the SM mutex).
-                        stop_at = Some((running, pos));
-                        return false;
+                        crate::version_gate::Gate::Pass => {}
+                        // Out of the scan either way: the fail-stop runs
+                        // below, once the SM guard can be released (a panic
+                        // here would poison the SM mutex); a pending record
+                        // ends the pass AT it (R13).
+                        crate::version_gate::Gate::Stop { running } => {
+                            stop_at = Some((running, pos));
+                            return false;
+                        }
+                        crate::version_gate::Gate::Pending => {
+                            pending_at = Some(pos);
+                            return false;
+                        }
                     }
                 } else if hdr.frame_type == FRAME_TYPE_SNAPSHOT && Some(pos) > guard.last_applied()
                 {
@@ -590,6 +606,9 @@ pub(crate) fn replay_into<S: RawStateMachine>(
     if let Some((running, at)) = stop_at {
         // Every frame below the record applied, nothing at or after it.
         crate::version_gate::stop_at_record(guard, cnc, instant.service_id, running, at);
+    }
+    if let Some(at) = pending_at {
+        return Ok(Replay::AwaitVersion(at));
     }
     Ok(Replay::Rejoin(cursor))
 }
