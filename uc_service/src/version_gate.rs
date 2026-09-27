@@ -183,8 +183,9 @@ pub(crate) fn stop_fail(name: &str, running: u32, at: u64, mine: u32) -> ! {
 /// [`stop_fail`].
 ///
 /// Ruling R18: this stop is DELIBERATE, not a crash, so it clears ATTACHED
-/// exactly as `Service::stop` does (incarnation kept; a fresh attach bumps
-/// it). Left set, the slot would read as a wedged live service — stale
+/// as `Service::stop` does (incarnation kept; a fresh attach bumps it) —
+/// but ONLY that bit: `SNAPSHOT_CAPABLE` stays, so `uc2ctl snapshot` is not
+/// refused 48 on a row stopped at a pin. Left set, the slot would read as a wedged live service — stale
 /// heartbeat, attached bit on — and `Uc2ServiceWedged` would page on every
 /// upgrade whose new build takes longer than its `for:` to attach. Cleared,
 /// the row honestly reads absent until the new build takes the slot.
@@ -199,9 +200,13 @@ pub(crate) fn stop_at_record<S: crate::traits::RawStateMachine>(
 ) -> ! {
     let slot = crate::attach::slot(cnc, row);
     slot.applied.store_release(at);
-    let (_, _, inc) = uc_log::cnc::unpack_service_status(slot.status.load_acquire());
+    // Clear ATTACHED and nothing else: the incarnation (a fresh attach bumps
+    // it) and SNAPSHOT_CAPABLE stay, so the node can still command an
+    // instant while the row sits stopped at the record. This apply thread is
+    // the status word's writer while attached; nothing else stores it here.
+    let w = slot.status.load_acquire();
     slot.status
-        .store_release(uc_log::cnc::pack_service_status(row, false, inc));
+        .store_release(w & !uc_protocol::v2::cnc::CNC_SVC_STATUS_ATTACHED);
     drop(guard);
     stop_fail(S::IDENTITY.name.as_str(), running, at, S::VERSION)
 }

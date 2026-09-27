@@ -97,12 +97,14 @@ cites the commit that settled it.
 - **R18 — a version stop clears ATTACHED.** §7.2's fail-stop left the
   slot's ATTACHED bit set, as a crash does. A version stop is deliberate, so
   `version_gate::stop_at_record` (the one path the live loop and replay
-  share) now clears it before the panic, as `Service::stop` does, keeping
-  the incarnation. The row reads absent until the new build attaches.
+  share) now clears it before the panic, as `Service::stop` does — but only
+  that bit: the incarnation and `SNAPSHOT_CAPABLE` stay, so `uc2ctl
+  snapshot` is not refused 48 on a row stopped at a pin (two `pinned_attach`
+  tests take an instant in exactly that window). The row reads absent until the new build attaches.
   `Uc2ServiceAbsent` (30 s) and `Uc2ServiceWedged` (1 m, which reads the
   stalest declared row's heartbeat whether attached or not) still fire on a
   swap slower than their `for:`; that is an accurate report of a row that
-  applies nothing, not a false page. (`967fe04`)
+  applies nothing, not a false page. (`967fe04`, and the commit after it)
 - **Smaller as-built facts.** Refusal 52's `reason_str` is the bare
   `row_undeclared` (the explanation moved to `docs/reference/uc2ctl.md`), and
   genesis refuses only 60, not 52. §6.1's audit line is op `row_genesis`

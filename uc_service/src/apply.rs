@@ -1749,10 +1749,10 @@ mod tests {
         cnc.counters().durable.store_release(head);
         cnc.counters().commit.store_release(head);
         agent_accepted(&cnc, uc_protocol::identity::pack_version(1, 0, 0), end);
-        // R18: attached (incarnation 7) going in.
-        cnc.service_slot(0)
-            .status
-            .store_release(uc_log::cnc::pack_service_status(0, true, 7));
+        // R18: attached (incarnation 7) and snapshot-capable going in.
+        let before_word = uc_log::cnc::pack_service_status(0, true, 7)
+            | uc_protocol::v2::cnc::CNC_SVC_STATUS_SNAPSHOT_CAPABLE;
+        cnc.service_slot(0).status.store_release(before_word);
 
         let r =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| super::apply_cycle(&mut st)));
@@ -1771,12 +1771,13 @@ mod tests {
             "only the frame before it"
         );
         assert_eq!(cnc.service_slot(0).applied.load_acquire(), start);
-        // R18: a deliberate stop is not a crash — it clears ATTACHED (keeping
-        // the incarnation), exactly as `Service::stop` does.
+        // R18: a deliberate stop is not a crash — it clears ATTACHED and
+        // nothing else (incarnation and SNAPSHOT_CAPABLE kept, so the node
+        // can still command an instant while the row is stopped).
         assert_eq!(
-            uc_log::cnc::unpack_service_status(cnc.service_slot(0).status.load_acquire()),
-            (0, false, 7),
-            "the version stop cleared ATTACHED, incarnation kept"
+            cnc.service_slot(0).status.load_acquire(),
+            before_word & !uc_protocol::v2::cnc::CNC_SVC_STATUS_ATTACHED,
+            "the version stop cleared ATTACHED only"
         );
     }
 
@@ -1937,10 +1938,10 @@ mod tests {
         st.follower = uc_log::reader::LogFollower::new(std::sync::Arc::clone(&buffer), 0);
         st.journal_dir = journal_dir;
         st.instance_id = 0x3333;
-        // R18: attached (incarnation 7) going in.
-        cnc.service_slot(0)
-            .status
-            .store_release(uc_log::cnc::pack_service_status(0, true, 7));
+        // R18: attached (incarnation 7) and snapshot-capable going in.
+        let before_word = uc_log::cnc::pack_service_status(0, true, 7)
+            | uc_protocol::v2::cnc::CNC_SVC_STATUS_SNAPSHOT_CAPABLE;
+        cnc.service_slot(0).status.store_release(before_word);
 
         let r =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| super::apply_cycle(&mut st)));
@@ -1954,9 +1955,9 @@ mod tests {
         );
         assert_eq!(cnc.service_slot(0).applied.load_acquire(), rec.0);
         assert_eq!(
-            uc_log::cnc::unpack_service_status(cnc.service_slot(0).status.load_acquire()),
-            (0, false, 7),
-            "R18: the replay-path version stop cleared ATTACHED, incarnation kept"
+            cnc.service_slot(0).status.load_acquire(),
+            before_word & !uc_protocol::v2::cnc::CNC_SVC_STATUS_ATTACHED,
+            "R18: the replay-path version stop cleared ATTACHED only"
         );
     }
 
