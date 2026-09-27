@@ -271,6 +271,7 @@ RULE_META = {
     "Uc2ServicePinnedAtLagBound": {"severity": "warning", "real": True, "scenario": "fsm_pinned"},
     "Uc2ServiceIdentityDrift": {"severity": "critical", "real": False, "scenario": "identity_drift"},
     "Uc2ServiceVersionDrift": {"severity": "warning", "real": False, "scenario": "version_drift"},
+    "Uc2RowVersionMismatch": {"severity": "critical", "real": False, "scenario": "row_version_mismatch"},
     "Uc2LogTimeFrozen": {"severity": "warning", "real": False, "scenario": "log_time_frozen"},
     "Uc2ScheduleTableDiverged": {"severity": "warning", "real": False, "scenario": "schedule_diverged"},
     "Uc2SnapshotStalled": {"severity": "warning", "real": False, "scenario": "snapshot_stalled"},
@@ -528,6 +529,38 @@ def build_Uc2ServiceVersionDrift():
     return r
 
 
+def build_Uc2RowVersionMismatch():
+    # #33: `row_version_mismatch`'s scenario scrapes a SINGLE synthetic
+    # "node" ("n0") — unlike the two-instance drift rules, this alert
+    # compares two gauges on the SAME instance/row (the attached service's
+    # version against its row's committed running line), so one source is
+    # enough. Same three-series `and`-chain shape as
+    # build_Uc2ServicePinnedAtLagBound, but with an `on(instance, row)`
+    # comparison as the LHS instead of a bare metric. Unlike a plain
+    # `and on(...)` join (which keeps the LHS's full label set), a `!=
+    # on(instance, row)` COMPARISON only keeps the `on(...)` labels
+    # themselves in its output — either side's other labels (here `service`)
+    # can legitimately differ and are dropped, not kept from one side by
+    # convention — so `labels_from` is a synthetic dict carrying just
+    # `instance`/`row`, the same idiom build_Uc2ServiceIdentityDrift uses for
+    # its `count_values`-collapsed result.
+    rows = load_scenario("row_version_mismatch")
+    ver_row = select(rows, "uc2_service_version", {"row": "0"})
+    running_row = select(rows, "uc2_row_running_version", {"row": "0"})
+    att_row = select(rows, "uc_service_attached", {"row": "0"})
+    r = new_rule(
+        "critical",
+        labels_from={
+            "labels": {"instance": ver_row["labels"]["instance"], "row": ver_row["labels"]["row"]}
+        },
+    )
+    add_hold_last(r, ver_row, "uc2_service_version", 60)
+    add_hold_last(r, running_row, "uc2_row_running_version", 60)
+    add_hold_last(r, att_row, "uc_service_attached", 60)
+    r["eval_time"] = total_for(60)[0]
+    return r
+
+
 def build_Uc2LogTimeFrozen():
     # Time-and-timers plan 1: `uc2_log_time_lag_seconds > 5 and on(instance)
     # uc2_is_leader == 1`. Same two-series `and` shape as
@@ -757,6 +790,7 @@ RULE_BUILDERS = {
     "Uc2ServicePinnedAtLagBound": build_Uc2ServicePinnedAtLagBound,
     "Uc2ServiceIdentityDrift": build_Uc2ServiceIdentityDrift,
     "Uc2ServiceVersionDrift": build_Uc2ServiceVersionDrift,
+    "Uc2RowVersionMismatch": build_Uc2RowVersionMismatch,
     "Uc2LogTimeFrozen": build_Uc2LogTimeFrozen,
     "Uc2ScheduleTableDiverged": build_Uc2ScheduleTableDiverged,
     "Uc2SnapshotStalled": build_Uc2SnapshotStalled,

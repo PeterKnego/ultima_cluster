@@ -177,16 +177,42 @@ groups:
     annotations: { summary: "row {{ $labels.row }} names different FSMs on different nodes — snapshot sessions between them are refused by name" }
   - alert: Uc2ServiceVersionDrift
     # Same `count_values` idiom as Uc2ServiceIdentityDrift, over the packed
-    # version word each service last wrote at attach (Task 5). `> 0` first:
-    # 0 means "no service has ever attached this slot" (a declared-but-
-    # unstarted FSM, or a service built without a `const VERSION`), which is
-    # a normal transient state — not a real disagreement to page on. A
-    # rolling upgrade holding old and new versions live at once is exactly
-    # what this catches.
-    expr: count by (row) (count_values("version", uc2_service_version > 0) by (row)) > 1
+    # version word each service last wrote at attach (Task 5) — but since
+    # #33 (D3) it compares LINES (major.minor), not exact versions:
+    # `floor(x / 65536)` discards the low 16 patch bits, the same arithmetic
+    # `uc_protocol::identity::same_line` does. Patch builds of the same line
+    # are allowed to differ by design (a fleet mid patch-rollout is not
+    # drift); a differing MINOR is. `> 0` first: 0 means "no service has
+    # ever attached this slot" (a declared-but-unstarted FSM, or a service
+    # built without a `const VERSION`), which is a normal transient state —
+    # not a real disagreement to page on. A rolling upgrade holding old and
+    # new LINES live at once is exactly what this catches.
+    expr: count by (row) (count_values("line", floor(uc2_service_version / 65536) > 0) by (row)) > 1
     for: 5m
     labels: { severity: warning }
-    annotations: { summary: "row {{ $labels.row }} runs different FSM versions across nodes" }
+    annotations: { summary: "row {{ $labels.row }} runs different FSM version LINES across nodes" }
+  - alert: Uc2RowVersionMismatch
+    # #33: an attached service whose major.minor differs from its row's
+    # committed running version. It can only last until that service stops
+    # at the superseding record, so a firing alert means a stuck stop.
+    #
+    # `floor(x / 65536)` is `same_line`'s own arithmetic (major<<8|minor,
+    # patch discarded) applied to both packed-version gauges; `on(instance,
+    # row)` restricts the `!=` match to series that share both — instance so
+    # this never cross-wires two different nodes' rows, row so it never
+    # compares two different FSMs' versions — and the trailing `and
+    # on(instance, row) uc_service_attached == 1` (the real per-FSM
+    # attached-bit gauge, not a guess) both excludes a declared-but-
+    # unattached row (which would otherwise read `uc2_service_version == 0`
+    # and mismatch every nonzero running line) and, since `uc2_service_version`
+    # and `uc2_row_running_version` are conditionally emitted (absent, never
+    # zero, before a row's first record — #33 D4, 0 is an ordinary version),
+    # means an absent-either-side row produces no series for `!=` to match in
+    # the first place, so it cannot fire on absence either.
+    expr: floor(uc2_service_version / 65536) != on(instance, row) floor(uc2_row_running_version / 65536) and on(instance, row) uc_service_attached == 1
+    for: 1m
+    labels: { severity: critical }
+    annotations: { summary: "row {{ $labels.row }} on {{ $labels.instance }} runs a version off its committed line" }
   - alert: Uc2ScheduleTableDiverged
     # Cluster-FSM spec §4.3: the replicated schedule table is a record inside
     # the node's own internal cluster FSM, changed by a CLUSTER frame (type 4,

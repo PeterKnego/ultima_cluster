@@ -35,7 +35,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use clap::Parser;
 
 use uc_consensus::election::NodeId;
-use uc_log::cnc::{CncMeta, CncPage};
+use uc_log::cnc::{CncMeta, CncPage, pack_service_status};
 use uc_net::fault::FaultConfig;
 use uc_net::receiver::FollowerStats;
 use uc_net::sender::SenderStats;
@@ -66,6 +66,7 @@ const ALL_SCENARIOS: &[&str] = &[
     "fsm_pinned",
     "identity_drift",
     "version_drift",
+    "row_version_mismatch",
     "log_time_frozen",
     "schedule_diverged",
     "snapshot_stalled",
@@ -200,6 +201,7 @@ fn run_scenario(name: &str, scratch_root: &Path) -> (SeriesFile, Disclosure) {
         "fsm_pinned" => scenario_fsm_pinned(scratch_root),
         "identity_drift" => scenario_identity_drift(),
         "version_drift" => scenario_version_drift(),
+        "row_version_mismatch" => scenario_row_version_mismatch(),
         "log_time_frozen" => scenario_log_time_frozen(),
         "schedule_diverged" => scenario_schedule_diverged(),
         "snapshot_stalled" => scenario_snapshot_stalled(),
@@ -1369,6 +1371,72 @@ fn scenario_version_drift() -> (SeriesFile, Disclosure) {
                  real encoder as uc2_service_version{{row=\"0\"}}; two DISTINCT nonzero values \
                  for the same row across instances is exactly what Uc2ServiceVersionDrift's \
                  count_values idiom detects.",
+                kv.as_str()
+            ),
+        },
+    )
+}
+
+// ------------------------------------------------------- scenario 15b
+
+/// Uc2RowVersionMismatch — **synthetic, disclosed**: a single synthetic
+/// `ObsSources` ("n0") declares row 0 = kv, ATTACHES a service that wrote
+/// version 1.3.0, and republishes a row view whose committed running
+/// version reads 1.2.0 — the exact shape of a service stuck mid-stop after
+/// its row's running line moved without it (the version gate should have
+/// stopped it at the superseding record, so a firing alert means a stuck
+/// stop). Unlike `scenario_identity_drift`/`scenario_version_drift`, this
+/// alert compares TWO gauges on the SAME instance, so one source suffices.
+fn scenario_row_version_mismatch() -> (SeriesFile, Disclosure) {
+    let kv = FsmName::parse("kv").unwrap();
+    let src = synthetic_sources_named(0, Some(kv));
+    src.cnc.store_services_declared(0b1);
+    let v_service = uc_protocol::identity::pack_version(1, 3, 0);
+    let v_running = uc_protocol::identity::pack_version(1, 2, 0);
+    src.cnc.service_slot(0).status.store_version(v_service);
+    src.cnc
+        .service_slot(0)
+        .status
+        .store_release(pack_service_status(0, true, 1));
+    src.cnc
+        .service_slot(0)
+        .status
+        .store_row_view(None, Some(v_running), 640);
+
+    let srv = ObsServer::serve(src.clone(), "127.0.0.1:0".parse().unwrap()).expect("bind");
+    let addr = srv.local_addr();
+
+    let mut sf = SeriesFile::new();
+    for _ in 0..3 {
+        sf.record_round(
+            "n0",
+            &scrape(addr),
+            &[
+                "uc2_service_version",
+                "uc2_row_running_version",
+                "uc_service_attached",
+            ],
+        );
+        thread::sleep(Duration::from_millis(200));
+    }
+    srv.stop();
+
+    (
+        sf,
+        Disclosure {
+            scenario: "row_version_mismatch",
+            rules: &["Uc2RowVersionMismatch"],
+            state: "synthetic",
+            method: format!(
+                "one synthetic ObsSources, its own real exporter: row 0 = {:?} is ATTACHED \
+                 running version {v_service} (1.3.0) while the row's committed running line \
+                 (genesis or a pin) reads {v_running} (1.2.0) — the exact shape of a service \
+                 stuck mid-stop after its row's line moved without it. All three render through \
+                 the real encoder as uc2_service_version{{row=\"0\"}}, \
+                 uc2_row_running_version{{row=\"0\"}} and uc_service_attached{{row=\"0\"}}; the \
+                 differing major.minor with attached == 1 is exactly what \
+                 Uc2RowVersionMismatch's floor(x / 65536) != on(instance, row) comparison \
+                 detects.",
                 kv.as_str()
             ),
         },

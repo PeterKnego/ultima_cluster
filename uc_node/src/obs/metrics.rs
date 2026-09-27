@@ -15,7 +15,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use uc_log::cnc::{PinRead, unpack_service_status};
+use uc_log::cnc::{PinRead, RowRead, unpack_service_status};
 use uc_protocol::v2::cnc::{
     CNC_MAX_PEER_SLOTS, CNC_MAX_SERVICES, CNC_PEER_ROLE_LEARNER, CNC_PEER_ROLE_VOTER,
     NODE_FLAG_CAN_SERVE, NODE_FLAG_LEADER,
@@ -68,6 +68,9 @@ pub const CONTRACT_SERIES: &[&str] = &[
     "uc_service_lag_waits_total",
     "uc2_service_identity_hash",
     "uc2_service_version",
+    // #33: the row's committed running version — absent (no sample) until
+    // the row's first accepted version record (genesis or a pin).
+    "uc2_row_running_version",
     "uc2_timers_pending",
     "uc2_timers_fired_total",
     "uc2_timers_late_total",
@@ -336,6 +339,12 @@ struct ServiceRow {
     identity_hash: u64,
     /// Packed semantic version the attached service last wrote (0 = none).
     version: u64,
+    /// #33 spec §5.2: the row's committed running version — `None` before
+    /// its first accepted version record (genesis or a pin), or on a
+    /// contended seqlock read. Unlike `version`, `0` is an ordinary packed
+    /// version here (D4), so this cannot be collapsed to a `u64` with `0`
+    /// meaning absent.
+    running: Option<u64>,
     /// Time-and-timers §6: pending scheduled timers for this row (cnc slot
     /// line 7's live word, refreshed once per consensus-agent pass).
     timers_pending: u64,
@@ -425,6 +434,13 @@ fn service_rows(s: &ObsSources, commit: u64, now: u64) -> Vec<ServiceRow> {
             .find(|r| r.row == id)
             .map(|r| uc_protocol::v2::upgrade::verdict(r).minority.len() as u64)
             .unwrap_or(0);
+        // #33 spec §5.2: the row's committed running version, through the
+        // same seqlock-consistent read as `pin()` above — `Contended` is
+        // "could not read", rendered as absent, same as no record yet.
+        let running = match slot.status.row_view() {
+            RowRead::View { running, .. } => running.map(u64::from),
+            RowRead::Contended => None,
+        };
         rows.push(ServiceRow {
             id: id as usize,
             labels: format!("service=\"{name}\",row=\"{id}\""),
@@ -437,6 +453,7 @@ fn service_rows(s: &ObsSources, commit: u64, now: u64) -> Vec<ServiceRow> {
             heartbeat_age: now.saturating_sub(hb) as f64 / 1e9,
             identity_hash: slot.identity.hash(),
             version: slot.status.version() as u64,
+            running,
             timers_pending: slot.identity.timers_pending(),
             fired: s.timer_stats.fired[id as usize].load(Ordering::Relaxed),
             late: s.timer_stats.late[id as usize].load(Ordering::Relaxed),
@@ -517,6 +534,26 @@ fn push_service_labeled(
     pick: impl Fn(&ServiceRow) -> u64,
 ) {
     let samples: Vec<(String, u64)> = rows.iter().map(|r| (r.labels.clone(), pick(r))).collect();
+    push_labeled(out, name, help, ty, &samples);
+}
+
+/// [`push_service_labeled`] for a family whose value is `Option<u64>`
+/// (`uc2_row_running_version`, #33 spec §5.2/§8): a row with `None` gets NO
+/// sample at all, not a fabricated `0` — unlike every other per-FSM family,
+/// `0` here is an ordinary packed version (D4), so absence cannot be
+/// encoded as a value.
+fn push_service_labeled_option(
+    out: &mut String,
+    name: &str,
+    help: &str,
+    ty: &str,
+    rows: &[ServiceRow],
+    pick: impl Fn(&ServiceRow) -> Option<u64>,
+) {
+    let samples: Vec<(String, u64)> = rows
+        .iter()
+        .filter_map(|r| pick(r).map(|v| (r.labels.clone(), v)))
+        .collect();
     push_labeled(out, name, help, ty, &samples);
 }
 
@@ -691,10 +728,18 @@ fn push_service_families(out: &mut String, s: &ObsSources, commit: u64, now: u64
     push_service_labeled(
         out,
         "uc2_service_version",
-        "Packed semantic version of the attached service (0 = none/unversioned). Alert: Uc2ServiceVersionDrift (packaging/prometheus/uc2-alerts.yml) — `count by (row) (count_values(\"version\", uc2_service_version > 0) by (row)) > 1`; a bare `count by (row, service) (uc2_service_version > 0) > 1` counts SERIES, not distinct values, and pages permanently on any multi-node cluster.",
+        "Packed semantic version of the attached service (0 = none/unversioned). Alert: Uc2ServiceVersionDrift (packaging/prometheus/uc2-alerts.yml) — `count by (row) (count_values(\"line\", floor(uc2_service_version / 65536) > 0) by (row)) > 1` (#33: compares major.minor LINES, patch free by design); a bare `count by (row, service) (uc2_service_version > 0) > 1` counts SERIES, not distinct values, and pages permanently on any multi-node cluster. See also uc2_row_running_version and Uc2RowVersionMismatch.",
         "gauge",
         &rows,
         |r| r.version,
+    );
+    push_service_labeled_option(
+        out,
+        "uc2_row_running_version",
+        "Packed version the row RUNS (#33) — committed by genesis or a pin; absent before the first record. Alert: Uc2RowVersionMismatch.",
+        "gauge",
+        &rows,
+        |r| r.running,
     );
     push_service_labeled(
         out,
@@ -1645,6 +1690,16 @@ mod tests {
         // why vacuous presence checks are the hazard here).
         cnc.store_services_declared(0b1);
         cnc.store_fsm_lag_bytes(1 << 20);
+        // #33: give row 0 a committed running version so
+        // `every_contract_series_is_present` sees a real
+        // `uc2_row_running_version` sample — it is conditionally emitted
+        // (absent, not zero, before the first record), same hazard as the
+        // two families noted above.
+        cnc.service_slot(0).status.store_row_view(
+            None,
+            Some(uc_protocol::identity::pack_version(0, 1, 0)),
+            1,
+        );
 
         ObsSources {
             node_id: 7,
@@ -1862,7 +1917,7 @@ mod tests {
     fn the_contract_has_the_number_of_families_the_docs_state() {
         assert_eq!(
             CONTRACT_SERIES.len(),
-            115,
+            116,
             "if this is intentional, update the family count in \
              docs/how-to/monitor-a-cluster.md in the same commit"
         );
@@ -2334,7 +2389,7 @@ mod tests {
         );
         assert!(
             text.contains(
-                "count by (row) (count_values(\"version\", uc2_service_version > 0) by (row)) > 1"
+                "count by (row) (count_values(\"line\", floor(uc2_service_version / 65536) > 0) by (row)) > 1"
             ),
             "{text}"
         );
@@ -2429,6 +2484,89 @@ mod tests {
         );
         assert!(
             text.contains("uc2_snapshot_hash_mismatch{service=\"kv\",row=\"0\"} 1"),
+            "{text}"
+        );
+    }
+
+    /// #33 spec §5.2/§8: `uc2_row_running_version` renders only for rows
+    /// that have a committed record — an absent view (`RowRead::View {
+    /// running: None, .. }`, the default before genesis) must not fabricate
+    /// a `0` sample, since `0` is itself an ordinary packed version (D4) and
+    /// `Uc2RowVersionMismatch` must never match an absent row. Same fixture
+    /// shape as `pin_words_and_hash_mismatch_render_per_row`, with a second
+    /// declared-but-untouched row 1 to prove the skip.
+    #[test]
+    fn row_running_version_renders_only_for_rows_that_have_one() {
+        let kv = FsmName::parse("kv").unwrap();
+        let mut services = [None; uc_protocol::v2::cnc::CNC_MAX_SERVICES];
+        services[0] = Some(kv);
+        let meta = CncMeta {
+            node_id: 7,
+            instance_id: 0x1122_3344_5566_7788,
+            app_id: "test-app".into(),
+            buffer_bytes: 1 << 20,
+            max_payload: 1200,
+            services,
+        };
+        let cnc = CncPage::heap(&meta);
+        cnc.store_services_declared(0b11);
+        cnc.service_slot(0).status.store_row_view(
+            None,
+            Some(uc_protocol::identity::pack_version(1, 4, 2)),
+            640,
+        );
+
+        let s = ObsSources {
+            node_id: 7,
+            cnc,
+            sender: Arc::new(SenderStats::default()),
+            receiver: Arc::new(FollowerStats::default()),
+            truncations: Arc::new(AtomicU64::new(0)),
+            wipes: Arc::new(AtomicU64::new(0)),
+            timer_stats: Arc::new(crate::timers::TimerStats::default()),
+            schedule_table_position: Arc::new(AtomicU64::new(0)),
+            schedule_entries: Arc::new(AtomicU64::new(0)),
+            log_clock_smear_ns: Arc::new(AtomicU64::new(0)),
+            schedule_apply_refused: Arc::new(AtomicU64::new(0)),
+            snapshot_reports_sent: Arc::new(AtomicU64::new(0)),
+            snapshot_reports_unsent: Arc::new(AtomicU64::new(0)),
+            snapshot_reports_appended: Arc::new(AtomicU64::new(0)),
+            snapshot_reports_timed_out: Arc::new(AtomicU64::new(0)),
+            cluster_view: test_cluster_view(),
+            probe: uc_net::probe::ProbeTable::new(uc_net::probe::ProbeCadence::default()),
+            commands_over_standard: Arc::new(AtomicU64::new(0)),
+            reports_unattested: Arc::new(AtomicU64::new(0)),
+            reports_implausible: Arc::new(AtomicU64::new(0)),
+            crypto_handshake_failures: Arc::new(AtomicU64::new(0)),
+            snapshot_instant_position: Arc::new(AtomicU64::new(0)),
+            snapshot_standby_instant_position: Arc::new(AtomicU64::new(0)),
+            snapshot_set_position: Arc::new(AtomicU64::new(0)),
+            snapshot_row_incomplete: std::array::from_fn(|_| Arc::new(AtomicU64::new(0))),
+            snapshot_fetched_position: Arc::new(AtomicU64::new(0)),
+            snapshot_freeze: Arc::new(SnapshotFreezeStats::default()),
+            crypto_enabled: false,
+            purge_enabled: false,
+            journal_segment_bytes: 64 << 20,
+            agents: vec![
+                ("consensus", Arc::new(AtomicBool::new(false))),
+                ("sender", Arc::new(AtomicBool::new(false))),
+                ("receiver", Arc::new(AtomicBool::new(false))),
+                ("archive", Arc::new(AtomicBool::new(false))),
+                ("cluster", Arc::new(AtomicBool::new(false))),
+            ],
+            jumbo_gate_pending: Arc::new(AtomicBool::new(false)),
+        };
+
+        let text = render_prometheus(&s);
+        assert!(
+            text.contains(&format!(
+                "uc2_row_running_version{{service=\"kv\",row=\"0\"}} {}",
+                uc_protocol::identity::pack_version(1, 4, 2)
+            )),
+            "{text}"
+        );
+        assert!(
+            !text.contains("uc2_row_running_version{service=\"\",row=\"1\"}"),
             "{text}"
         );
     }
