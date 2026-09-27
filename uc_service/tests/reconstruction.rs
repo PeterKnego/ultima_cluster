@@ -930,51 +930,6 @@ fn gap_without_snapshot_capability_fails_stop_with_named_contract() {
     node.stop();
 }
 
-/// `DoublingRegisterSm`'s semantics on a DIFFERENT LINE (1.0.0) from
-/// `RegisterSm` (0.0.0). `DoublingRegisterSm` itself declares raw `2` =
-/// 0.0.2, the SAME line as `RegisterSm` under #33's D3 (patch is free), so it
-/// can no longer stand for "a newer binary" in a version-refusal test.
-#[derive(Default)]
-struct OffLineDoublingSm(DoublingRegisterSm);
-
-impl StateMachine for OffLineDoublingSm {
-    const NAME: &'static str = <RegisterSm as StateMachine>::NAME;
-    const VERSION: u32 = uc_protocol::identity::pack_version(1, 0, 0);
-    type Command = RegCmd;
-    type Response = <DoublingRegisterSm as StateMachine>::Response;
-    type Query = ();
-    type QueryResponse = Option<u64>;
-    fn apply(&mut self, ctx: &mut ApplyCtx, cmd: RegCmd) -> Self::Response {
-        self.0.apply(ctx, cmd)
-    }
-    fn query(&self, q: ()) -> Option<u64> {
-        self.0.query(q)
-    }
-    fn last_applied(&self) -> Option<u64> {
-        StateMachine::last_applied(&self.0)
-    }
-}
-
-impl uc_service::SnapshotStateMachine for OffLineDoublingSm {
-    type SnapshotHandle = <DoublingRegisterSm as uc_service::SnapshotStateMachine>::SnapshotHandle;
-    fn freeze(&self) -> Result<(Self::SnapshotHandle, u64), uc_service::SnapshotError> {
-        self.0.freeze()
-    }
-    fn stream_snapshot(
-        h: Self::SnapshotHandle,
-        dst: &mut dyn std::io::Write,
-    ) -> Result<(), uc_service::SnapshotError> {
-        DoublingRegisterSm::stream_snapshot(h, dst)
-    }
-    fn install_snapshot(
-        &mut self,
-        p: u64,
-        src: &mut dyn std::io::Read,
-    ) -> Result<u64, uc_service::SnapshotError> {
-        self.0.install_snapshot(p, src)
-    }
-}
-
 /// Plan B2 T3: an UNPINNED newer binary must never install an older
 /// version's artifact and tail-replay it under its own `apply` — the §2.3
 /// silent counterfactual. Same setup as
@@ -982,13 +937,12 @@ impl uc_service::SnapshotStateMachine for OffLineDoublingSm {
 /// covering artifact built by `RegisterSm` (0.0.0) below the purge floor.
 ///
 /// #33 (spec §7.1) moves the refusal EARLIER. `RegisterSm`'s attach recorded
-/// 0.0.0 as the row's running version, so a binary off that line (1.0.0) is
-/// now refused at ATTACH, by name, before it installs anything or writes a
-/// slot word — the gap guard's envelope check (by line since D3, unit-covered
-/// in `snapshots.rs` and `pinned_attach.rs`) is no longer the first line of
-/// defence here. This test used `DoublingRegisterSm` (0.0.2) and asserted the
-/// gap guard's apply-thread fail-stop; 0.0.2 is the same line as 0.0.0 since
-/// #33, so that binary is now admitted by design (D3: patch is trusted).
+/// 0.0.0 as the row's running version, so `DoublingRegisterSm` (0.2.0, a
+/// different line) is now refused at ATTACH, by name, before it installs
+/// anything or writes a slot word. Before #33 this test asserted the gap
+/// guard's apply-thread `MistaggedSnapshot` fail-stop; that envelope check
+/// (by line since D3) remains as defence in depth, unit-covered in
+/// `snapshots.rs` and exercised by `pinned_attach.rs`.
 #[test]
 fn an_unpinned_newer_binary_cannot_install_an_older_versions_artifact() {
     let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
@@ -996,10 +950,10 @@ fn an_unpinned_newer_binary_cannot_install_an_older_versions_artifact() {
     let (node, _prod) = purged_node_after_snapshotting_service(dir.path(), app, 4_000);
 
     let built = <RegisterSm as StateMachine>::VERSION;
-    let mine = <OffLineDoublingSm as StateMachine>::VERSION;
+    let mine = <DoublingRegisterSm as StateMachine>::VERSION;
     let err = ServiceBuilder::new(
         ServiceConfig::new(dir.path(), app),
-        OffLineDoublingSm::default(),
+        DoublingRegisterSm::default(),
     )
     .start_with_snapshots()
     .err()

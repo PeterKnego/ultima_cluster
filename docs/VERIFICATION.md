@@ -394,7 +394,7 @@ printed the SDK's own `pinned install of snap-P` line on its stderr
 (`SwapArm::install_logged`, the same class of evidence as the refusal
 marker, pinned by `the_install_marker_is_the_sdks_own_text`), and the
 durable case additionally runs NEW as `register-replay --double-cas`
-(`DoublingCasRegisterSm`, `VERSION = 3`), a version change that touches a
+(`DoublingCasRegisterSm`, `VERSION = 0.3.0`), a version change that touches a
 history-PRESERVING command. That matters because a durable service's wrong
 path is not the genesis replay — it is continuing from X with the state it
 persisted — and with a last-write-wins register and a `Write`-only change

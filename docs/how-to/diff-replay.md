@@ -126,7 +126,7 @@ sides, the "new build" selected by a knob:
     uc2-diffreplay pin-verify --corpus ./corpus \
         --old ./register-replay --old-arg serve \
         --new ./register-replay --new-arg serve --new-arg --double \
-        --app-id pv --fsm register --to 2 --report pin.json
+        --app-id pv --fsm register --to 0.2.0 --report pin.json
 
 `--old-arg` / `--new-arg` carry the app's **serve** argv — its serve verb
 followed by its own knobs, repeated once per token. The `replay` and

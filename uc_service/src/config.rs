@@ -179,8 +179,9 @@ pub enum ServiceError {
         pinned: u32,
         mine: u32,
     },
-    /// The row's four pin words could not be read consistently through the
-    /// `pin_seq` seqlock ([`uc_log::cnc::PinRead::Contended`]). A reader that
+    /// The row's view (the pin triple and, since #33, the running-version
+    /// words) could not be read consistently through the `pin_seq` seqlock
+    /// ([`uc_log::cnc::RowRead::Contended`]). A reader that
     /// must DECIDE never treats that as "no pin": attaching unpinned off a
     /// half-published triple would skip an install the cluster requires.
     /// Transient by construction — the next attach converges.
@@ -206,15 +207,6 @@ pub enum ServiceError {
         running: u32,
         mine: u32,
     },
-    /// #33: the row view (pin + running-version words) could not be read
-    /// consistently through the `pin_seq` seqlock
-    /// ([`uc_log::cnc::RowRead::Contended`]). A reader that must DECIDE never
-    /// treats that as "no running version". Transient; retry the attach.
-    #[error(
-        "row {row}: the running-version words could not be read consistently \
-         (the uc2-cluster agent is mid-publish); retry the attach"
-    )]
-    RowViewUnreadable { row: u8 },
     /// A pinned row MUST install the artifact at its origin, and only
     /// [`ServiceBuilder::start_with_snapshots`](crate::ServiceBuilder::start_with_snapshots)
     /// carries the install capability (`S: SnapshotStateMachine`). A plain

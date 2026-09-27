@@ -113,8 +113,7 @@ enum Sub {
 /// --to` takes (`uc_ctl::upgrade::parse_semver`'s rule, copied rather than
 /// depended on — this binary must not link the admin CLI), or a raw packed
 /// `u32` (decimal, or `0x`-prefixed hex) for a state machine whose `VERSION`
-/// is a bare integer rather than a packed semver — the harness's own
-/// `DoublingRegisterSm::VERSION = 2` is one.
+/// is a bare integer rather than a packed semver (`const VERSION: u32 = 2`).
 ///
 /// Packed `0` is the "unversioned" sentinel — what an unversioned row's cnc
 /// word already reads — so a pin naming it could not be told from "no pin".
@@ -404,8 +403,8 @@ mod tests {
 
     /// `--to` takes both spellings a real pin is written in: the
     /// `MAJOR.MINOR.PATCH` one `uc2ctl upgrade pin` takes, and the raw packed
-    /// integer a state machine's `const VERSION` may be (the harness's
-    /// `DoublingRegisterSm::VERSION = 2`). Packed `0` is the "unversioned"
+    /// integer a state machine's `const VERSION` may be (e.g. `const
+    /// VERSION: u32 = 2`). Packed `0` is the "unversioned"
     /// sentinel and is refused in BOTH spellings — `0.0.0` packs to the very
     /// word a bare `0` names.
     #[test]

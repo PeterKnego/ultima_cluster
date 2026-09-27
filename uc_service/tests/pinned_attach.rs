@@ -636,21 +636,49 @@ fn a_pinned_attach_converges_on_a_purging_cluster() {
 
 /// The control that makes the assertion above evidence: the SAME swap with no
 /// pin computes the §2.3 counterfactual instead.
+///
+/// #33 (spec §7.1): an unpinned attach of a binary off the row's running line
+/// is now refused BY NAME — `RegisterSm`'s attach recorded 0.0.0, and
+/// `DoublingRegisterSm` is 0.2.0 — so the unpinned swap can no longer run
+/// through attach at all. The counterfactual it would have computed is
+/// computed directly instead (v2's `apply` over the journal from genesis to
+/// the same frontier, as [`a_durable_sm_above_the_origin_is_rewound_to_it`]
+/// builds its precondition), so `Some(CAS_NEW)` above still stands against
+/// `Some(COUNTERFACTUAL)` here.
 #[test]
 fn the_same_swap_without_a_pin_computes_the_counterfactual() {
     let f = Fixture::new("pin-none");
-
-    let svc2 = ServiceBuilder::new(cfg(f.path(), f.app), DoublingRegisterSm::default())
-        .start_with_snapshots()
-        .unwrap();
     let cnc = f.cnc();
-    wait_service_caught_up(&cnc);
+
+    let err = ServiceBuilder::new(cfg(f.path(), f.app), DoublingRegisterSm::default())
+        .start_with_snapshots()
+        .err()
+        .expect("an unpinned off-line swap is refused at attach (#33)");
+    assert!(
+        matches!(
+            err,
+            ServiceError::VersionMismatch { row: 0, running, mine, .. }
+                if running == V1 && mine == V2
+        ),
+        "{err}"
+    );
     assert_eq!(
-        query_v2(&svc2),
+        cnc.service_slot(0).status.load_acquire() & CNC_SVC_STATUS_ATTACHED,
+        0,
+        "nothing was written to the slot"
+    );
+
+    let end = {
+        let c = cnc.counters();
+        c.commit.load_acquire().min(c.durable.load_acquire())
+    };
+    let mut v2 = DoublingRegisterSm::default();
+    replay_from_genesis(&mut v2, &f.path().join("journal"), end);
+    assert_eq!(
+        StateMachine::query(&v2, ()),
         Some(COUNTERFACTUAL),
         "unpinned, v2 replays [0, P) itself: Write(4) stores 8 and the CAS fails"
     );
-    svc2.stop();
     f.stop();
 }
 

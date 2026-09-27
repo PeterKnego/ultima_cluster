@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 use uc_log::buffer::LogBuffer;
-use uc_log::cnc::{CncPage, PinRead, RowRead, pack_service_status, unpack_service_status};
+use uc_log::cnc::{CncPage, RowRead, pack_service_status, unpack_service_status};
 use uc_log::reader::LogFollower;
 use uc_protocol::ring::{BroadcastRing, SpscRing};
 use uc_protocol::v2::cnc::CNC_SVC_STATUS_SNAPSHOT_CAPABLE;
@@ -244,40 +244,41 @@ pub(crate) fn attach<S: RawStateMachine>(
         row,
     })?;
 
-    // 1d. Plan B2 (spec §3 S4 steps 4–5): the row's PIN, read through the
-    //     seqlock reader ONLY, and decided BEFORE any slot word is written.
-    //     Under `service.<row>.lock` (just taken above), so the decision and
-    //     the install that follows it are serialised against any other
-    //     attach to this row.
+    // 1d. Plan B2 (spec §3 S4 steps 4–5) + #33 spec §7.1: the row VIEW — the
+    //     pin triple AND the running version — in ONE seqlock read, decided
+    //     BEFORE any slot word is written. One read, not two: two separate
+    //     reads could pair a pin from one publish with a running version
+    //     from another. Under `service.<row>.lock` (just taken above), so
+    //     the decision and the install that follows it are serialised
+    //     against any other attach to this row.
     let s = slot(&cnc, row);
-    let pin = match s.status.pin() {
-        PinRead::NoPin => None,
-        // NOT "no pin": a half-published triple that a reader silently read
+    let (pin, running, attach_record_pos) = match s.status.row_view() {
+        // NOT "no pin": a half-published view that a reader silently read
         // as unpinned would skip an install the cluster requires. Transient,
         // so the refusal says to retry.
-        PinRead::Contended => return Err(ServiceError::PinUnreadable { row }),
-        PinRead::Pinned { origin, from, to } => {
-            if to != S::VERSION {
-                return Err(ServiceError::PinnedVersionMismatch {
-                    name: S::IDENTITY.name.as_str().to_string(),
-                    row,
-                    origin,
-                    pinned: to,
-                    mine: S::VERSION,
-                });
-            }
-            Some((origin, from, to))
-        }
-    };
-    // 1e. #33 spec §7.1: the row's RUNNING version, one seqlock read, still
-    //     before any slot word is written. Absent → proceed (a genesis
-    //     record is coming and the apply loop adjudicates it). A pinned
-    //     attach already passed the stricter exact check above.
-    let attach_record_pos = match s.status.row_view() {
-        RowRead::Contended => return Err(ServiceError::RowViewUnreadable { row }),
+        RowRead::Contended => return Err(ServiceError::PinUnreadable { row }),
         RowRead::View {
-            running: Some(r), ..
-        } if !uc_protocol::identity::same_line(S::VERSION, r) => {
+            pin,
+            running,
+            record_pos,
+        } => (pin, running, record_pos),
+    };
+    match (pin, running) {
+        // A pinned row: the pin names ONE build, so the check is exact.
+        (Some((origin, _from, to)), _) if to != S::VERSION => {
+            return Err(ServiceError::PinnedVersionMismatch {
+                name: S::IDENTITY.name.as_str().to_string(),
+                row,
+                origin,
+                pinned: to,
+                mine: S::VERSION,
+            });
+        }
+        (Some(_), _) => {}
+        // 1e. #33 spec §7.1: unpinned, the row's RUNNING version gates by
+        //     LINE. Absent → proceed (a genesis record is coming and the
+        //     apply loop adjudicates it).
+        (None, Some(r)) if !uc_protocol::identity::same_line(S::VERSION, r) => {
             return Err(ServiceError::VersionMismatch {
                 name: S::IDENTITY.name.as_str().to_string(),
                 row,
@@ -285,8 +286,8 @@ pub(crate) fn attach<S: RawStateMachine>(
                 mine: S::VERSION,
             });
         }
-        RowRead::View { record_pos, .. } => record_pos,
-    };
+        (None, _) => {}
+    }
     // UNCONDITIONAL install (step 4): the artifact at the origin, built by
     // the pin's `from`, replaces whatever state this state machine holds — a
     // DURABLE state machine already above the origin is rewound to it and

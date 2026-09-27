@@ -13,7 +13,8 @@
 //! binaries.
 //!
 //! Three builds of one FSM row: the plain register (`VERSION` 0), `--double`
-//! (`DoublingRegisterSm`, 2) and `--double-cas` (`DoublingCasRegisterSm`, 3).
+//! (`DoublingRegisterSm`, 0.2.0) and `--double-cas` (`DoublingCasRegisterSm`,
+//! 0.3.0).
 //! The two doubling knobs name different state machines and are mutually
 //! exclusive — clap refuses them together by name.
 
