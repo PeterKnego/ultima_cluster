@@ -78,6 +78,22 @@ cites the commit that settled it.
   and submits with no leader-side service now waits forever at the gate
   (§6.2). The M10 alert-fire harness's real-cluster scenarios had to attach a
   service on every node before driving load. (`e23973e`)
+- **R17 — pins name a line, not a build; SNAP_BEGIN compares lines;
+  `Uc2RowVersionMismatch` requires a fresh heartbeat.** D3 ("patch is free")
+  was false in three places as first built. (1) Pinned attach refused any
+  `VERSION != to`; it now refuses `!same_line(to, VERSION)`, so a patch
+  build of `to` takes the pinned install. The same rule reached the node's
+  `hold_floor_for_pins` (a row attached at a patch of `to` consumes the pin),
+  the door's no-running-version half of 53 (`same_line(from, attached)`),
+  and `uc2-diffreplay pin-verify`'s two version arms (a same-LINE run is
+  refused up front; NEW at a patch of `--to` is at the pinned line).
+  `uc2ctl upgrade show`'s `by=pin` inference stays exact: it compares two
+  recorded values, not a build. (2) The receiver's `SNAP_BEGIN` per-row
+  version check is `!same_line(ours, theirs)`; `0` still means unknown.
+  (3) A stopped old service keeps its ATTACHED bit until the new build
+  re-attaches, so the alert paged on any swap slower than `for:`; it now
+  also requires `uc_service_heartbeat_age_seconds < 10` on the row.
+  (`72c80fb`, `732f896`, `02b0b6b`)
 - **Smaller as-built facts.** Refusal 52's `reason_str` is the bare
   `row_undeclared` (the explanation moved to `docs/reference/uc2ctl.md`), and
   genesis refuses only 60, not 52. §6.1's audit line is op `row_genesis`

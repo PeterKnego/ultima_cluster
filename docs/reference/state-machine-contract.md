@@ -241,7 +241,8 @@ itself** — a pinned row's gap guard prefers that one artifact over a newer
 one `from` left behind, for the same "sanctioned crossing" reason.
 
 Four refusals guard this path, all named, none silent: `PinnedVersionMismatch`
-(a stale binary — one that is not the pin's `to` — tries to attach after the
+(a stale binary — one not on the pin's `to` line; a patch build of `to` is
+admitted — tries to attach after the
 pin: the whole point of pinning), `PinUnreadable` (the pin words could not be
 read consistently through the seqlock — `Contended` fails CLOSED, never
 treated as "no pin", because attaching unpinned off a half-published triple

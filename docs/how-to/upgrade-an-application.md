@@ -68,17 +68,17 @@ you build and operate by are these.
   service for it is attached. A declared row whose leader-side service never
   attaches keeps the cluster closed to writes. After genesis only
   `uc2ctl upgrade pin` moves the version, forward or back.
-- **A pinned row admits exactly the pinned build.** While a row has a pin,
-  attach requires `VERSION` to equal the pin's `to` bit for bit, patch
-  included (`PinnedVersionMismatch`). So patch builds roll node by node only
-  on a row whose running version came from genesis; on a row that has been
-  pinned, a patch roll-out is itself a pin, from the running version to the
-  new patch build, at a fresh origin. Such a same-line pin does not stop the
-  services already attached — only a change of line does.
-- **Snapshot sessions still compare versions exactly.** A joiner below the
-  purge floor is refused a snapshot session by a peer whose attached version
-  differs from its own in any digit, patch included (`version mismatch` on
-  the session). Finish a patch roll-out before you rely on snapshot catch-up.
+- **A pin names a line, not a build.** While a row has a pin, attach
+  requires `VERSION` to be on the pin's `to` line — same major.minor, any
+  patch (`PinnedVersionMismatch` otherwise). A patch build of `to` attaches
+  through the same pinned install as `to` itself, so patch builds roll node
+  by node on a pinned row exactly as on a row whose running version came
+  from genesis: no pin, no window.
+- **Snapshot sessions compare lines too.** A joiner below the purge floor is
+  refused a snapshot session only by a peer whose attached version is on a
+  different line from its own (`version mismatch` on the session); two patch
+  builds of one line exchange sessions, so snapshot catch-up works in the
+  middle of a patch roll-out.
 
 **What the two new refusals mean, and what to do.**
 
@@ -282,7 +282,7 @@ Refused by name, with the reason code the CLI prints:
 | Code | Reason | What it means, and what to do |
 |---|---|---|
 | 52 | `row_undeclared` | `--row R` names a row this node does not declare in `[services] names`. Check the row number against `node.toml`. (Named `pin_row_undeclared` through `2.13.0`; same number, same check) |
-| 53 | `pin_from_mismatch` | `--from` is not on the row's running line: its major.minor differs from the row's running version (`status`'s `running=`; patch is ignored). With no running version recorded yet, `--from` must equal the version the service is attached at. A stale `--from` usually means another pin already landed since it was read; re-read `uc2ctl status` and re-run |
+| 53 | `pin_from_mismatch` | `--from` is not on the row's running line: its major.minor differs from the row's running version (`status`'s `running=`; patch is ignored). With no running version recorded yet, `--from` must be on the line of the version the service is attached at. A stale `--from` usually means another pin already landed since it was read; re-read `uc2ctl status` and re-run |
 | 54 | `pin_no_set` | `--origin` is not this node's **newest** complete snapshot set (an older set still on disk is refused too). Go back to step 2: run `uc2ctl snapshot`, wait for `uc2_snapshot_set_position` (or `uc2ctl snapshot show`'s `set=`) to reach it, and pin THAT position |
 | 55 | `pin_not_monotone` | `--origin` is not above the row's current pin. A pin only ever moves a row's origin forward — there is no way to point one backwards |
 | 56 | `pin_digest` | the staged pin file's digest is not the one the request signed: a different file was staged than was signed, or it changed in between. Re-run `upgrade pin` |
@@ -363,10 +363,10 @@ noisy.
 
 A node on which the old service has **not** stopped has not applied the pin —
 go back to step 4 on that node. `Uc2RowVersionMismatch` (an attached service
-off its row's committed line, for a minute) is the alert for a stop that did
-not happen — but because a fail-stopped slot still reads attached at the old
-version, it also fires on any node where the new build takes longer than a
-minute to attach. It clears when the new build attaches.
+off its row's committed line that is still stamping its heartbeat, for a
+minute) is the alert for a stop that did not happen. A fail-stopped slot
+still reads attached at the old version, but its heartbeat goes stale, so
+the alert does not fire on a node whose new build is merely slow to attach.
 
 **Why a mixed row cannot happen any more.** Before `0.10.0` this step said
 "stop them all before starting any", because while a row was mixed — some
@@ -409,7 +409,8 @@ row 0's pin words could not be read consistently (the uc2-cluster agent is mid-p
 It fails **closed** on purpose: treating an unreadable pin as "no pin" would
 skip an install the cluster requires. Transient — retry the attach.
 
-**2. The binary's `VERSION` is not the pin's `to`** — refused:
+**2. The binary's `VERSION` is not on the pin's `to` line** — refused (a
+patch build of `to` is admitted):
 
 ```
 FSM "kv" at row 0 is pinned to version 0x02000000 from origin 73792, but this binary is 0x01000000; a stale binary cannot rejoin after `uc2ctl upgrade pin`
@@ -569,7 +570,8 @@ stop the services.
 
 One more consequence of abandoning a pinned upgrade: a node **holds its
 snapshot/purge floor at the pinned origin** until that row is consumed there
-(attached at the pin's `to` **and** replayed past the cut), and logs
+(attached on the pin's `to` line — a patch build of `to` counts — **and**
+replayed past the cut), and logs
 `snapshot_floor_held_for_pin` when it does. A pin placed and then left alone
 holds the journal at that origin **indefinitely** — there is no bound and no
 alert on the hold. Clear it by finishing the upgrade or by pinning the row

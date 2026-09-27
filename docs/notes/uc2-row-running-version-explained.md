@@ -275,13 +275,12 @@ dual-read question an upgrade asks, in the other direction.
   bare `const VERSION: u32 = 2`, which packs as `0.0.2`, a patch — passes
   every check. Use `pack_version(major, minor, patch)`, and use
   `uc2-diffreplay upgrade` to prove a patch is a patch.
-- **A pinned row admits exactly one build.** A pin names one `to`, and attach
-  requires it bit for bit, patch included. Patch builds roll node by node
-  only on a row whose version came from genesis. On a pinned row a patch
-  roll-out is a pin of its own — one on the same line, which stops nothing.
-- **Snapshot sessions still compare versions exactly.** A joiner below the
-  purge floor is refused a snapshot session by a peer on a different patch
-  build. Finish a patch roll-out before relying on snapshot catch-up.
+- **Patch is free everywhere.** A pin names a line, not a build: a patch
+  build of the pin's `to` attaches through the same pinned install as `to`
+  itself, so patch builds roll node by node on a pinned row as on any other.
+  Snapshot sessions compare lines as well, so two patch builds of one line
+  exchange sessions mid-roll-out. (Before ruling R17 both checks were exact,
+  which made the "patch is free" promise false on a pinned row.)
 - **The gate is a hard wait.** A declared row with no service on the leader
   keeps writes out, by design, and says so in the log.
 - **A span jumped by a snapshot install is not walked.** A service that

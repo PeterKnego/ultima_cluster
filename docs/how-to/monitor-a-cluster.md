@@ -239,17 +239,19 @@ critical rather than a warning:
 ```
 floor(uc2_service_version / 65536) != on(instance, row) floor(uc2_row_running_version / 65536)
   and on(instance, row) uc_service_attached == 1
+  and on(instance, row) uc_service_heartbeat_age_seconds < 10
 ```
 
-for one minute: a service attached on this node whose line differs from its
-row's committed running line. Such a service should not exist for long — it
-is refused at attach, and an already-attached one stops at the record that
-moved its row — so a firing alert means **a stop that did not happen**, or a
-slot that still reads attached at the old version because the stopped
-service has not been replaced yet (a fail-stopped service does not clear its
-ATTACHED bit). During an upgrade that second case is expected on any node
-where the new build takes more than a minute to attach; outside one,
-investigate. A row with no running version yet exports no
+for one minute: a LIVE service (its per-row heartbeat younger than 10 s)
+attached on this node whose line differs from its row's committed running
+line. Such a service should not exist for long — it is refused at attach,
+and an already-attached one stops at the record that moved its row — so a
+firing alert means **a stop that did not happen**. The heartbeat clause is
+what keeps a normal upgrade quiet: a service that did stop at the record
+fail-stops without clearing its ATTACHED bit, so its slot reads attached at
+the old version until the new build takes it over, but its heartbeat goes
+stale and the rule does not match (a slot left that way for good is
+`Uc2ServiceWedged`'s business). A row with no running version yet exports no
 `uc2_row_running_version` sample, so it can never match.
 
 ### The log clock and the timer families (2.11.0)
@@ -615,7 +617,7 @@ table:
 | `Uc2ServicePinnedAtLagBound` | a declared FSM that **is attached** has had its `uc_service_lag_bytes` at or above `uc2_fsm_lag_bytes` for 30s in bounded mode — that FSM is running, just slower than the log, and is pacing the whole cluster | warning |
 | `Uc2ServiceIdentityDrift` (FSM identity, 2.11.0) | two nodes disagree on row `r`'s declared FSM name (its exported hash differs) — a config edit landed on some hosts and not others, or in a different order; the row's SNAP_BEGIN sessions will refuse each other the moment one runs | critical |
 | `Uc2ServiceVersionDrift` (FSM identity, 2.11.0; lines since #33) | two nodes' attached services at row `r` are on different version **lines** (major.minor; patch differences are allowed and do not fire) — a mis-deployed binary, or a node whose old service has not yet been replaced after a pin | warning |
-| `Uc2RowVersionMismatch` (row running version, #33) | an attached service on this node is off its row's committed running line (`uc2_row_running_version`), for 1m — a stop that did not happen, or a stopped service's slot not yet taken over by the new build | critical |
+| `Uc2RowVersionMismatch` (row running version, #33) | a live (heartbeat < 10 s) attached service on this node is off its row's committed running line (`uc2_row_running_version`), for 1m — a stop that did not happen; a stopped service's slot awaiting the new build does not fire | critical |
 | `Uc2SnapshotStalled` (coordinated snapshots, 2.11.0) | this node has commanded **full** snapshot instants at least twice in 30m with no complete set landing — one FSM is silently stopping all purging | warning |
 | `Uc2StandbySnapshotStalled` (coordinated snapshots, 2.11.0) | this **learner** has acted on standby snapshot instants at least twice in 30m with no complete set landing — one of its rows is silently stopping the standby set. Cannot fire on a voter (a voter exports `uc2_snapshot_standby_instant_position = 0`) | warning |
 | `Uc2SnapshotSetDiverged` (coordinated snapshots, 2.11.0) | nodes disagree on the newest complete snapshot set's position, i.e. on their purge floors, for 60s | warning |

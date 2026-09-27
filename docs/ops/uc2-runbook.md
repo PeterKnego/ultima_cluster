@@ -442,9 +442,9 @@ transport setting, both measured closed-loop at inflight 1 on 8-vCPU
   (a mis-declared `[services]` config, not a missing FSM); `Uc2ServiceVersionDrift`
   fires when an attached FSM's version **line** (major.minor) differs
   node-to-node — patch differences are allowed and do not fire — and
-  `Uc2RowVersionMismatch` when an attached FSM is off its row's committed
-  running line (since wire `0.10.0`, a stop that did not happen, or a stopped
-  service not yet replaced after a pin). See [Upgrade an application § The
+  `Uc2RowVersionMismatch` when a live attached FSM (heartbeat under 10 s) is
+  off its row's committed running line (since wire `0.10.0`, a stop that did
+  not happen; a stopped service not yet replaced after a pin does not fire). See [Upgrade an application § The
   version rules](../how-to/upgrade-an-application.md#the-version-rules).
 - [Configuration](../reference/configuration.md) — `NodeConfig`, environment
   switches, crypto file formats, cluster limits.
