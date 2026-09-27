@@ -104,7 +104,7 @@ cites the commit that settled it.
   `Uc2ServiceAbsent` (30 s) and `Uc2ServiceWedged` (1 m, which reads the
   stalest declared row's heartbeat whether attached or not) still fire on a
   swap slower than their `for:`; that is an accurate report of a row that
-  applies nothing, not a false page. (`967fe04`, and the commit after it)
+  applies nothing, not a false page. (`967fe04`, `2e55714`)
 - **Smaller as-built facts.** Refusal 52's `reason_str` is the bare
   `row_undeclared` (the explanation moved to `docs/reference/uc2ctl.md`), and
   genesis refuses only 60, not 52. §6.1's audit line is op `row_genesis`
