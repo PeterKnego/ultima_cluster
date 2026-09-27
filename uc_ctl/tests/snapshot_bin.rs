@@ -281,3 +281,53 @@ fn snapshot_take_commits_a_set_and_show_reads_it_back() {
     svc.stop();
     node.stop();
 }
+
+/// #33 task 10: `uc2ctl upgrade show` prints the row's running version and
+/// which record set it. This fixture's leader attaches `TrivialSm` (`const
+/// VERSION` defaults to 0, "unversioned") with no pin ever staged, so the
+/// only record that can set row 0's running version is the automatic
+/// genesis append — `by=genesis`. A coordinated instant is enough to force
+/// the cluster artifact to disk (the same wait `snapshot_take_...` above
+/// uses), which is what `show` reads.
+#[test]
+fn upgrade_show_reports_the_genesis_running_version() {
+    let root = tempfile::Builder::new()
+        .prefix("uc2ctl-upgrade-show-")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("tempdir");
+
+    let (node, instance_dir) = start_node(root.path(), "n0");
+    await_leader(&node, 20);
+    let svc = start_capable_service(&instance_dir, APP);
+    await_row0_capable(&instance_dir, APP, 20);
+    let dir_s = instance_dir.to_str().unwrap();
+
+    let r = run_ctl(&["snapshot", "--instance-dir", dir_s, "--app-id", APP]);
+    assert_eq!(r.status, 0, "snapshot must succeed: {r:?}");
+    let p = parse_instant(&r.stdout);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while node.snapshot_set_position() != p {
+        assert!(
+            Instant::now() < deadline,
+            "the leader never completed the set at {p} (stuck at {})",
+            node.snapshot_set_position()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let r_show = run_ctl(&["upgrade", "show", "--instance-dir", dir_s, "--app-id", APP]);
+    assert_eq!(r_show.status, 0, "upgrade show must succeed: {r_show:?}");
+    assert!(
+        r_show.stdout.contains("row=0 running=unversioned"),
+        "expected the running version on row 0's line:\n{}",
+        r_show.stdout
+    );
+    assert!(
+        r_show.stdout.contains("by=genesis"),
+        "no pin was ever staged, so the record must be named genesis:\n{}",
+        r_show.stdout
+    );
+
+    svc.stop();
+    node.stop();
+}

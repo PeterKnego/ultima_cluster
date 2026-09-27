@@ -47,7 +47,7 @@ use uc_protocol::v2::frame::{
     FRAME_TYPE_SNAPSHOT, align_frame_len,
 };
 use uc_protocol::v2::schedule::ScheduleTable;
-use uc_protocol::v2::upgrade::{SnapshotReport, UpgradePin, verdict};
+use uc_protocol::v2::upgrade::{RowRunning, SnapshotReport, UpgradePin, verdict};
 use uc_service::{ApplyCtx, RawStateMachine, SnapshotStateMachine};
 
 use crate::cluster_fsm::{ClusterFsm, ClusterState, ClusterView};
@@ -127,14 +127,22 @@ pub fn read_committed_settings(
     Ok(Some((st.applied, st.settings)))
 }
 
-/// `uc2ctl upgrade show`'s reader (plan B1): the pin history and the held
-/// snapshot reports in this instance directory's newest cluster artifact,
-/// with the artifact's position — `read_committed_settings`'s contract and
-/// its staleness caveat, verbatim.
+/// `uc2ctl upgrade show`'s reader (plan B1, extended by #33 task 10): the
+/// pin history, the held snapshot reports, and every row's running-version
+/// record in this instance directory's newest cluster artifact, with the
+/// artifact's position — `read_committed_settings`'s contract and its
+/// staleness caveat, verbatim.
 #[allow(clippy::type_complexity)]
 pub fn read_committed_upgrade(
     instance_dir: &Path,
-) -> io::Result<Option<(u64, Vec<UpgradePin>, Vec<SnapshotReport>)>> {
+) -> io::Result<
+    Option<(
+        u64,
+        Vec<UpgradePin>,
+        Vec<SnapshotReport>,
+        [Option<RowRunning>; uc_protocol::v2::cnc::CNC_MAX_SERVICES],
+    )>,
+> {
     let (fsm, start) = recover(
         &snapshot_dir_of(instance_dir),
         ClusterState::genesis_empty(),
@@ -144,7 +152,12 @@ pub fn read_committed_upgrade(
         return Ok(None);
     }
     let st = fsm.state();
-    Ok(Some((st.applied, st.pins.clone(), st.reports.clone())))
+    Ok(Some((
+        st.applied,
+        st.pins.clone(),
+        st.reports.clone(),
+        st.running,
+    )))
 }
 
 /// Recovery (spec §4.7): the newest `snap-*.ultcluster` under `dir`, or
@@ -1250,9 +1263,13 @@ mod tests {
         let (mut agent, _view) = agent_over(&buffer, &cnc, dir.path());
         assert!(agent.do_work());
         let p = agent.take_snapshot().unwrap();
-        let (pos, pins, reports) = read_committed_upgrade(dir.path()).unwrap().unwrap();
+        let (pos, pins, reports, running) = read_committed_upgrade(dir.path()).unwrap().unwrap();
         assert_eq!((pos, pins.len(), reports.len()), (p, 1, 0));
         assert_eq!(pins[0].origin, 4096);
+        // #33 task 10: the pin also set row 1's running version, and the
+        // running list rides the same reader.
+        assert_eq!(running[1].map(|r| r.version), Some(6));
+        assert_eq!(running[0], None);
     }
 
     #[test]

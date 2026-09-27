@@ -28,6 +28,25 @@ fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_uc2ctl")
 }
 
+/// Run `uc2ctl status` against `dir` and return its stdout, asserting exit
+/// code 0 first — the shared helper every test in this file drives `status`
+/// through, so a new caller never re-spawns the `Command` block by hand.
+fn run_status(dir: &std::path::Path) -> String {
+    let out = Command::new(bin())
+        .args([
+            "status",
+            "--instance-dir",
+            dir.to_str().unwrap(),
+            "--app-id",
+            APP,
+        ])
+        .output()
+        .expect("spawn uc2ctl");
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    assert_eq!(out.status.code(), Some(0), "status must succeed: {stdout}");
+    stdout
+}
+
 fn make_config(instance_dir: PathBuf, addr: SocketAddr, services: ServicesConfig) -> NodeConfig {
     NodeConfig {
         id: 0,
@@ -88,18 +107,7 @@ fn status_prints_one_row_per_declared_fsm_including_an_absent_one() {
     );
     s0.status.store_release(pack_service_status(0, true, 1));
 
-    let out = Command::new(bin())
-        .args([
-            "status",
-            "--instance-dir",
-            dir.to_str().unwrap(),
-            "--app-id",
-            APP,
-        ])
-        .output()
-        .expect("spawn uc2ctl");
-    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-    assert_eq!(out.status.code(), Some(0), "status must succeed: {stdout}");
+    let stdout = run_status(&dir);
 
     assert!(
         stdout.contains("services: declared=[0, 1] fsm_lag=8192 bytes"),
@@ -134,6 +142,26 @@ fn status_prints_one_row_per_declared_fsm_including_an_absent_one() {
     // The pre-existing sections are untouched.
     assert!(stdout.contains("config: version="), "{stdout}");
     assert!(stdout.contains("members:"), "{stdout}");
+    // Row 0 has no row view stored yet: `running=none`.
+    assert!(
+        stdout.contains("row=0") && stdout.contains("running=none"),
+        "{stdout}"
+    );
+
+    // #33 task 10: a row view on slot 0 — `running` present, at a named
+    // record position — is rendered right after `artifact_hash=`.
+    cnc.service_slot(0).status.store_row_view(
+        None,
+        Some(uc_protocol::identity::pack_version(1, 4, 2)),
+        640,
+    );
+    let stdout = run_status(&dir);
+    assert!(stdout.contains("running=1.4.2 running_pos=640"), "{stdout}");
+    // Row 1 still has no row view stored: `running=none`.
+    assert!(
+        stdout.contains("row=1") && stdout.contains("running=none"),
+        "{stdout}"
+    );
 
     node.stop();
 }

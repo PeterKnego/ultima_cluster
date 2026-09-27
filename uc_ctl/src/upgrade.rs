@@ -10,11 +10,31 @@ use std::io::Write as _;
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::Path;
 
+use uc_log::cnc::{CncPage, RowRead};
 use uc_protocol::identity::{VersionDisplay, pack_version};
 use uc_protocol::v2::cnc::ADMIN_OP_UPGRADE_PIN;
 use uc_protocol::v2::upgrade::{UpgradePin, encode_upgrade_pin, verdict};
 
 use crate::CommonArgs;
+
+/// `--from`'s default (spec §8): the row's RUNNING version off the local
+/// page's row view when a genesis or pin record has set one, falling back
+/// to the ATTACHED version word otherwise — the only signal before a row's
+/// first record lands, and this crate's pre-#33-task-10 behaviour.
+/// `RowRead::Contended` (the single-writer cluster agent mid-store;
+/// effectively unreachable) falls back the same way: a reader that must
+/// decide never fabricates a running version out of a contended read.
+fn default_from(cnc: &CncPage, row: u8) -> Option<u32> {
+    let slot = cnc.service_slot(row as usize);
+    if let RowRead::View {
+        running: Some(v), ..
+    } = slot.status.row_view()
+    {
+        return Some(v);
+    }
+    let attached = slot.status.version();
+    (attached != 0).then_some(attached)
+}
 
 /// `MAJOR.MINOR.PATCH` → the packed version `S::VERSION` carries.
 pub fn parse_semver(s: &str) -> Result<u32, String> {
@@ -83,14 +103,17 @@ pub fn pin(
     let from = match from {
         Some(s) => parse_semver(s).map_err(|e| anyhow::anyhow!("--from: {e}"))?,
         None => {
-            // The row's ATTACHED version word — what the node's own door
-            // check (53) compares against when the row has no pin yet.
+            // #33 spec §8: prefer the row's RUNNING version (the door check
+            // (53) now compares `from` against it whenever one is
+            // recorded); fall back to the ATTACHED version word when the
+            // row has no running version yet.
             let cnc = crate::open(common)?;
-            let v = cnc.service_slot(row as usize).status.version();
-            if v == 0 {
-                anyhow::bail!("row {row} has no attached version word on this node; pass --from");
-            }
-            v
+            default_from(&cnc, row).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "row {row} has no running version and no attached version word on this \
+                     node; pass --from"
+                )
+            })?
         }
     };
     let mut bytes = Vec::new();
@@ -147,7 +170,7 @@ pub fn pin(
 }
 
 pub fn show(common: &CommonArgs) -> anyhow::Result<()> {
-    let Some((position, pins, reports)) =
+    let Some((position, pins, reports, running)) =
         uc_node::cluster_agent::read_committed_upgrade(&common.instance_dir)?
     else {
         println!("no cluster artifact yet");
@@ -178,6 +201,26 @@ pub fn show(common: &CommonArgs) -> anyhow::Result<()> {
                 print!(" history=[{}]", older.join(","));
             }
             println!();
+        }
+        // #33 spec §8: the row's running version and which record set it —
+        // `pin` when the row's newest pin's `to` is the running version,
+        // `genesis` otherwise (the running version was recorded before any
+        // pin ever touched this row, or by a row that has never been
+        // pinned at all).
+        if let Some(entry) = running[row as usize] {
+            let by = if history
+                .last()
+                .is_some_and(|newest: &&UpgradePin| newest.to == entry.version)
+            {
+                "pin"
+            } else {
+                "genesis"
+            };
+            println!(
+                "  row={row} running={} set_at={} by={by}",
+                VersionDisplay(entry.version),
+                entry.record_pos
+            );
         }
         if let Some(r) = reports.iter().find(|r| r.row == row) {
             let v = verdict(r);
@@ -213,6 +256,65 @@ pub fn show(common: &CommonArgs) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use uc_log::cnc::CncMeta;
+
+    fn test_cnc(dir: &std::path::Path) -> std::sync::Arc<CncPage> {
+        CncPage::create_file(
+            &dir.join("cnc2.dat"),
+            &CncMeta {
+                node_id: 1,
+                instance_id: 0x1122_3344_5566_7788,
+                app_id: "test".into(),
+                buffer_bytes: 1 << 20,
+                max_payload: 256,
+                services: [None; uc_protocol::v2::cnc::CNC_MAX_SERVICES],
+            },
+        )
+        .unwrap()
+    }
+
+    /// #33 spec §8: `--from`'s default prefers the row's RUNNING version
+    /// over the attached version word when a row view has been recorded —
+    /// even when the two disagree, which only happens transiently around a
+    /// pin (the attached word is the OLD binary's; running is the row's new
+    /// truth the moment the pin commits).
+    #[test]
+    fn default_from_prefers_running_over_attached_version() {
+        // A unit test in `src/`, not `tests/` — `CARGO_TARGET_TMPDIR` is
+        // only set for integration-test binaries, so this follows
+        // `uc_log::cnc`'s own unit-test precedent (a single 8 KiB page, not
+        // a heavy artifact) rather than CLAUDE.md's scratch-dir rule for
+        // multi-GB test output.
+        let dir = tempfile::tempdir().unwrap();
+        let cnc = test_cnc(dir.path());
+        let slot = cnc.service_slot(0);
+        slot.status.store_version(pack_version(1, 0, 0));
+        slot.status
+            .store_row_view(None, Some(pack_version(2, 1, 0)), 640);
+        assert_eq!(default_from(&cnc, 0), Some(pack_version(2, 1, 0)));
+    }
+
+    /// With no row view recorded yet, `--from` falls back to the attached
+    /// version word — the pre-#33-task-10 behaviour, unchanged.
+    #[test]
+    fn default_from_falls_back_to_the_attached_version_word() {
+        let dir = tempfile::tempdir().unwrap();
+        let cnc = test_cnc(dir.path());
+        cnc.service_slot(1)
+            .status
+            .store_version(pack_version(3, 4, 5));
+        assert_eq!(default_from(&cnc, 1), Some(pack_version(3, 4, 5)));
+    }
+
+    /// Neither a row view nor an attached version word: `None`, so `pin`
+    /// bails with "pass --from" rather than staging a bogus record.
+    #[test]
+    fn default_from_is_none_with_nothing_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let cnc = test_cnc(dir.path());
+        assert_eq!(default_from(&cnc, 2), None);
+    }
+
     #[test]
     fn parse_semver_packs_and_refuses() {
         assert_eq!(
