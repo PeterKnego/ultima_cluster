@@ -235,6 +235,15 @@ impl Cluster {
             .unwrap_or_else(|e| panic!("service start on node {i}: {e:?}"))
     }
 
+    /// Start `S` on every node, so whichever node leads (now or after a
+    /// leadership move) has an attached service for the row.
+    fn start_all<S>(&self) -> Vec<uc_service::Service<S>>
+    where
+        S: uc_service::SnapshotStateMachine + Default,
+    {
+        (0..N).map(|i| self.start::<S>(i)).collect()
+    }
+
     fn try_start<S>(&self, i: usize) -> Attempt<S>
     where
         S: uc_service::SnapshotStateMachine + Default,
@@ -339,39 +348,48 @@ impl KvClient {
 
 /// #33 spec §6.1: the leader records its own attached service's version as
 /// the row's running version (`RowGenesis`), every node applies it at
-/// commit, and the leader audits the append as `source = "genesis"`.
+/// commit, and the proposing leader audits the append as `source =
+/// "genesis"`.
+///
+/// KvV2 runs on EVERY node: a leader with no attached service never appends
+/// genesis (by design), so attaching only on the node that led at
+/// `wait_leader` would time out whenever leadership moved afterwards.
 #[test]
 fn the_leader_records_its_attached_version_as_genesis() {
     let c = three_node_cluster("rowgen");
-    let leader = c.wait_leader();
-    let _s = c.start::<KvV2>(leader);
-    let page = c.page(leader);
-    c.wait(|| {
-        matches!(
-            page.service_slot(0).status.row_view(),
-            uc_log::cnc::RowRead::View { running: Some(v), record_pos, .. }
-                if v == pack_version(2, 0, 0) && record_pos > 0
-        )
-    });
+    c.wait_leader();
+    let _svcs = c.start_all::<KvV2>();
     // Every node agrees (applied at commit everywhere).
     for i in 0..N {
         let page = c.page(i);
         c.wait(|| {
             matches!(
                 page.service_slot(0).status.row_view(),
-                uc_log::cnc::RowRead::View { running: Some(v), .. } if v == pack_version(2, 0, 0)
+                uc_log::cnc::RowRead::View { running: Some(v), record_pos, .. }
+                    if v == pack_version(2, 0, 0) && record_pos > 0
             )
         });
     }
-    let lines = c.audit_lines(leader);
+    // The audit line is on whichever node proposed it. `>= 1`, not `== 1`:
+    // a leader audits right AFTER its append, before commit, so a leader
+    // deposed with its genesis frame uncommitted leaves a line for a frame
+    // that was later truncated, and its successor appends and audits again.
+    // Only one can ever be APPLIED (a second is refused 60), which the
+    // `running` check above already covers.
+    let genesis: Vec<String> = (0..N)
+        .flat_map(|i| c.audit_lines(i))
+        .filter(|l| {
+            l.contains("\"source\":\"genesis\"")
+                && l.contains("\"op_name\":\"row_genesis\"")
+                && l.contains("\"detail\":\"row=0\"")
+        })
+        .collect();
     assert!(
-        lines
-            .iter()
-            .any(|l| l.contains("\"source\":\"genesis\"")
-                && l.contains("\"op_name\":\"row_genesis\"")),
-        "no genesis audit line on the leader: {lines:#?}"
+        !genesis.is_empty(),
+        "no genesis audit line on any node's audit.jsonl"
     );
 }
+
 /// The #33 scenario (spec §10.1, controller ruling R4). Before the fix: the
 /// leader's v2 acknowledges `Append(5)`; the v1 followers apply it as
 /// BAD_REQUEST; once the leader stops, a v1 follower leads, answers through

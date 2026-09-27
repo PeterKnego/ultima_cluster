@@ -6865,7 +6865,10 @@ impl Consensus {
     /// against.
     ///
     /// Steady state (every declared row versioned) is one `Acquire` load and
-    /// one mask test. Single-in-flight like every leader-issued `CLUSTER`
+    /// one mask test. While a declared row is still unversioned and this
+    /// leader has no attached, live service for it, each pass instead runs
+    /// the (at most 8-row, out-of-line) slot loop and appends nothing — cheap,
+    /// and bounded to the window before genesis commits. Single-in-flight like every leader-issued `CLUSTER`
     /// append, and at most ONE row per pass — the lowest one whose slot on
     /// THIS page reads ATTACHED with a fresh heartbeat. A row whose leader-side
     /// service is not attached is skipped (its genesis waits for one); a
