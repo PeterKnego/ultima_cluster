@@ -114,6 +114,19 @@ row or `VersionMismatch` on a row whose version genesis set. Outside a
 planned upgrade it means the row's version was changed under this service —
 read `uc2ctl upgrade show` to see which record did it.
 
+**A durable state machine that stopped keeps the old line's state on disk.**
+Everything a stopped service applied before the record, it applied as the
+*old* build. An in-memory state machine loses that on exit and rebuilds, but
+a **durable** one attaches above the record with it intact — so do not simply
+restart it as the new line on top of its old store when frames before the
+record may have been applied differently by the two lines. The sharpest case
+is a genesis stop: a follower that was on another line from the leader when
+genesis recorded the leader's version, which is exactly what crossing from
+`2.13.0` with an already-mixed row produces. Either discard that node's store
+for the row, so the new build rebuilds it from the journal or a snapshot, or
+move the row with a pin, whose origin install replaces the state
+unconditionally (step 3 below).
+
 **Take the origin on a learner.** Every pin names an origin, and the
 recommended source is a **standby instant**: `uc2ctl snapshot --standby`
 freezes only learners, so no voter pauses for the upgrade, and

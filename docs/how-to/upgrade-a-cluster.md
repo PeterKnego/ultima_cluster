@@ -938,6 +938,28 @@ row without pins gets one the first time the leader sees its own service for
 that row attached. The row artifacts' envelope (`ULTSNAP2`) is unchanged, so
 neither `snapshots/<row>/` nor `snapshots/cluster/` needs clearing.
 
+**Before you stop the nodes.**
+
+- **Check that no application's `VERSION` is a bare integer.** A
+  `const VERSION` of `1`, `2`, `3` … packs as `0.0.x`, and from `0.10.0` "the
+  same version" means the same major.minor with patch ignored — so every
+  bare-integer build is on one line, the `0.0` line. Its rows treat all such
+  builds as the same version: they mix freely, and a pin from one to another
+  refuses nothing (`uc2ctl upgrade pin` refuses a same-line pin unless you pass
+  `--patch`, and a service logs `version_is_patch_only` at attach). If one is,
+  give that state machine a real major.minor with `pack_version(major, minor,
+  patch)` in the same window — see [Upgrade an application § The version
+  rules](upgrade-an-application.md#the-version-rules).
+- **Take a coordinated snapshot instant right before you stop them.** Run
+  `uc2ctl snapshot` once traffic has stopped and wait until
+  `uc2_snapshot_set_position` reaches it on every node, so every node's newest
+  cluster artifact sits at the same position P. The pin rule changed in this
+  release — refusal `53` used to require `--from` to equal the row's current
+  pin's `to` exactly, and now requires only the same line — so a node that
+  boots from an older cluster artifact and replays an old pin frame under the
+  new rule could accept a pin that `2.13.0` refused. With every node starting
+  from P, there is nothing older left to replay.
+
 **What to expect when the cluster comes back up.**
 
 - **Client writes wait until every declared row has a running version.** The

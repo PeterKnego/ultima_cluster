@@ -536,7 +536,7 @@ passes because the 1.0 followers are refused by name. Beside it:
 `clients_wait_until_every_declared_row_has_a_version` (the log must not
 grow while a declared row has no version, not merely a submit time out),
 `attach_refuses_a_binary_off_the_running_line_by_name`,
-`a_restart_after_the_stop_is_covered_by_attach`, and
+`a_matching_restart_after_genesis_does_not_stop_again`, and
 `a_committed_pin_stops_every_old_service_at_exactly_the_record` — which
 asserts `applied` equals the pin frame's start on every node, runs a
 recorded register workload across the switch and checks it with

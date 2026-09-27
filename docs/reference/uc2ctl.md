@@ -416,7 +416,7 @@ verbatim: encode a 20-byte `UpgradePin` record, stage it at
 first ten bytes of its SHA-256 into the request's `id`/`ip`/`port` fields.
 
 ```
-uc2ctl upgrade pin --row <R> --to <MAJOR.MINOR.PATCH> --origin <P> [--from <MAJOR.MINOR.PATCH>] --instance-dir <DIR> --app-id <ID> [--admin-key <PATH>]
+uc2ctl upgrade pin --row <R> --to <MAJOR.MINOR.PATCH> --origin <P> [--from <MAJOR.MINOR.PATCH>] [--patch] --instance-dir <DIR> --app-id <ID> [--admin-key <PATH>]
 ```
 
 - `--row <U8>` — the declared row to pin.
@@ -435,6 +435,16 @@ uc2ctl upgrade pin --row <R> --to <MAJOR.MINOR.PATCH> --origin <P> [--from <MAJO
   version of `0` is a real version (an FSM that never set `const VERSION`) and
   is used as `--from 0.0.0`. `--to 0.0.0` is refused locally: packed `0` is
   what the pin words read as "no pin".
+- `--patch` — allow a **same-line** pin: `--from` and `--to` share
+  major.minor and differ only in patch. Without it such a pin is refused
+  locally, before anything is staged, naming both versions: a same-line pin
+  sets the running version but does **not** refuse the old build (patch
+  builds of one line mix by design), which is right for a real patch release
+  and wrong for anything else. The usual cause is a bare-integer
+  `const VERSION` (`1`, `2`, `3` …), which packs as `0.0.x` — every such build
+  is one line, so "pin 1 → 2" would refuse nothing. Give the state machine a
+  real major.minor with `pack_version(major, minor, patch)` and pin across
+  lines instead.
 
 This is step 2 of the spec's S4 sequence — an upgrade is always
 `uc2ctl snapshot` → `uc2ctl upgrade pin` → stop every instance of the row,
