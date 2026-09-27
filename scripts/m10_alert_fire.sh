@@ -544,19 +544,31 @@ def build_Uc2RowVersionMismatch():
     # convention — so `labels_from` is a synthetic dict carrying just
     # `instance`/`row`, the same idiom build_Uc2ServiceIdentityDrift uses for
     # its `count_values`-collapsed result.
-    rows = load_scenario("row_version_mismatch")
+    #
+    # #33 ruling R17 added a fourth series: the per-row
+    # `uc_service_heartbeat_age_seconds` (`< 10` — a LIVE service), so a
+    # normal upgrade's exited-but-still-ATTACHED old service does not page.
+    # Its negative twin is the `row_version_mismatch_stale_heartbeat` extra
+    # check below.
+    return row_version_mismatch_spec("row_version_mismatch", expect_fire=True)
+
+
+def row_version_mismatch_spec(scenario, expect_fire):
+    rows = load_scenario(scenario)
     ver_row = select(rows, "uc2_service_version", {"row": "0"})
     running_row = select(rows, "uc2_row_running_version", {"row": "0"})
     att_row = select(rows, "uc_service_attached", {"row": "0"})
-    r = new_rule(
-        "critical",
-        labels_from={
-            "labels": {"instance": ver_row["labels"]["instance"], "row": ver_row["labels"]["row"]}
-        },
+    hb_row = select(rows, "uc_service_heartbeat_age_seconds", {"row": "0"})
+    labels_from = (
+        {"labels": {"instance": ver_row["labels"]["instance"], "row": ver_row["labels"]["row"]}}
+        if expect_fire
+        else None
     )
+    r = new_rule("critical", labels_from=labels_from)
     add_hold_last(r, ver_row, "uc2_service_version", 60)
     add_hold_last(r, running_row, "uc2_row_running_version", 60)
     add_hold_last(r, att_row, "uc_service_attached", 60)
+    add_hold_last(r, hb_row, "uc_service_heartbeat_age_seconds", 60)
     r["eval_time"] = total_for(60)[0]
     return r
 
@@ -1010,6 +1022,43 @@ extra_ok &= run_extra_check(
     "version_drift_patch_only",
     False,
     "1.2.0 vs 1.2.7 must NOT fire",
+)
+
+
+# #33 ruling R17: Uc2RowVersionMismatch gained a fresh-heartbeat clause so a
+# NORMAL upgrade does not page — the old service stops at the superseding
+# record and exits, but its ATTACHED bit stays set until the new build
+# re-attaches. This negative case (off-line, attached, heartbeat never
+# stamped) must NOT fire. Not one of the 28 shipped rules; a FAIL here still
+# fails the script.
+print()
+print("== extra checks: Uc2RowVersionMismatch fresh-heartbeat clause (#33 R17) ==")
+
+
+def run_row_mismatch_extra(extra_name, scenario_name, expect_fire, human):
+    try:
+        spec = row_version_mismatch_spec(scenario_name, expect_fire)
+    except ScenarioMissing as e:
+        print(f"FAIL extra={extra_name} rule=Uc2RowVersionMismatch ({human}) — scenario did not produce series: {e}")
+        return False
+    for line in spec["dilation"]:
+        print(f"  dilate extra={extra_name} {line}")
+    path = write_extra_test_yaml(extra_name, "Uc2RowVersionMismatch", spec, expect_fire)
+    proc = subprocess.run([PROMTOOL, "test", "rules", path], capture_output=True, text=True)
+    if proc.returncode == 0:
+        print(f"PASS extra={extra_name} rule=Uc2RowVersionMismatch ({human})")
+        return True
+    print(f"FAIL extra={extra_name} rule=Uc2RowVersionMismatch ({human})")
+    print(proc.stdout)
+    print(proc.stderr, file=sys.stderr)
+    return False
+
+
+extra_ok &= run_row_mismatch_extra(
+    "Uc2RowVersionMismatch__stale_heartbeat",
+    "row_version_mismatch_stale_heartbeat",
+    False,
+    "off-line + attached + stale heartbeat must NOT fire",
 )
 
 sys.exit(0 if (overall_ok and extra_ok) else 1)

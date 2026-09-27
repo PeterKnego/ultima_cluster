@@ -219,10 +219,22 @@ groups:
     # zero, before a row's first record — #33 D4, 0 is an ordinary version),
     # means an absent-either-side row produces no series for `!=` to match in
     # the first place, so it cannot fire on absence either.
-    expr: floor(uc2_service_version / 65536) != on(instance, row) floor(uc2_row_running_version / 65536) and on(instance, row) uc_service_attached == 1
+    #
+    # #33 ruling R17: the last clause, `and on(instance, row)
+    # uc_service_heartbeat_age_seconds < 10` (the per-row heartbeat age —
+    # the unlabeled stalest-FSM series carries no `row` and never joins),
+    # keeps this from paging on a NORMAL upgrade. An old service that did
+    # stop at the superseding record exits but keeps its ATTACHED bit until
+    # the new build re-attaches, so without it the rule fired whenever the
+    # swap took longer than `for:`. A stopped service's heartbeat goes
+    # stale; a live off-line one keeps stamping, and that is the case this
+    # alert exists for. 10 s is well past the 3 s staleness bar the
+    # heartbeat rules use elsewhere, so one late stamp does not suppress it.
+    # A dead-but-attached service is Uc2ServiceWedged's business.
+    expr: floor(uc2_service_version / 65536) != on(instance, row) floor(uc2_row_running_version / 65536) and on(instance, row) uc_service_attached == 1 and on(instance, row) uc_service_heartbeat_age_seconds < 10
     for: 1m
     labels: { severity: critical }
-    annotations: { summary: "row {{ $labels.row }} on {{ $labels.instance }} runs a version off its committed line" }
+    annotations: { summary: "row {{ $labels.row }} on {{ $labels.instance }} runs a LIVE service off its committed line — a stuck stop" }
   - alert: Uc2ScheduleTableDiverged
     # Cluster-FSM spec §4.3: the replicated schedule table is a record inside
     # the node's own internal cluster FSM, changed by a CLUSTER frame (type 4,

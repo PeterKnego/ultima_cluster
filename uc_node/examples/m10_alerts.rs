@@ -69,6 +69,7 @@ const ALL_SCENARIOS: &[&str] = &[
     "version_drift_zero_line",
     "version_drift_patch_only",
     "row_version_mismatch",
+    "row_version_mismatch_stale_heartbeat",
     "log_time_frozen",
     "schedule_diverged",
     "snapshot_stalled",
@@ -206,6 +207,7 @@ fn run_scenario(name: &str, scratch_root: &Path) -> (SeriesFile, Disclosure) {
         "version_drift_zero_line" => scenario_version_drift_zero_line(),
         "version_drift_patch_only" => scenario_version_drift_patch_only(),
         "row_version_mismatch" => scenario_row_version_mismatch(),
+        "row_version_mismatch_stale_heartbeat" => scenario_row_version_mismatch_stale_heartbeat(),
         "log_time_frozen" => scenario_log_time_frozen(),
         "schedule_diverged" => scenario_schedule_diverged(),
         "snapshot_stalled" => scenario_snapshot_stalled(),
@@ -1518,13 +1520,30 @@ fn scenario_version_drift_patch_only() -> (SeriesFile, Disclosure) {
 
 /// Uc2RowVersionMismatch — **synthetic, disclosed**: a single synthetic
 /// `ObsSources` ("n0") declares row 0 = kv, ATTACHES a service that wrote
-/// version 1.3.0, and republishes a row view whose committed running
-/// version reads 1.2.0 — the exact shape of a service stuck mid-stop after
-/// its row's running line moved without it (the version gate should have
-/// stopped it at the superseding record, so a firing alert means a stuck
-/// stop). Unlike `scenario_identity_drift`/`scenario_version_drift`, this
-/// alert compares TWO gauges on the SAME instance, so one source suffices.
+/// version 1.3.0 and keeps stamping its heartbeat, and republishes a row
+/// view whose committed running version reads 1.2.0 — the exact shape of a
+/// LIVE service stuck mid-stop after its row's running line moved without
+/// it (the version gate should have stopped it at the superseding record,
+/// so a firing alert means a stuck stop). Unlike
+/// `scenario_identity_drift`/`scenario_version_drift`, this alert compares
+/// gauges on the SAME instance, so one source suffices.
 fn scenario_row_version_mismatch() -> (SeriesFile, Disclosure) {
+    row_version_mismatch_with(true)
+}
+
+// ------------------------------------------------- scenario 15b-extra
+
+/// #33 ruling R17 NEGATIVE extra check for `Uc2RowVersionMismatch` (NOT one
+/// of the 28 shipped rules): the same off-line, ATTACHED row as
+/// [`scenario_row_version_mismatch`], but its heartbeat is never stamped —
+/// the shape of a NORMAL upgrade's old service, which stopped at the
+/// superseding record and exited while its ATTACHED bit waits for the new
+/// build to re-attach. The rule must NOT page on it.
+fn scenario_row_version_mismatch_stale_heartbeat() -> (SeriesFile, Disclosure) {
+    row_version_mismatch_with(false)
+}
+
+fn row_version_mismatch_with(fresh_heartbeat: bool) -> (SeriesFile, Disclosure) {
     let kv = FsmName::parse("kv").unwrap();
     let src = synthetic_sources_named(0, Some(kv));
     src.cnc.store_services_declared(0b1);
@@ -1545,6 +1564,13 @@ fn scenario_row_version_mismatch() -> (SeriesFile, Disclosure) {
 
     let mut sf = SeriesFile::new();
     for _ in 0..3 {
+        if fresh_heartbeat {
+            // What a live apply loop does: stamp the row's heartbeat.
+            src.cnc
+                .service_slot(0)
+                .heartbeat_ns
+                .store_release(uc_node::obs::metrics::now_unix_ns());
+        }
         sf.record_round(
             "n0",
             &scrape(addr),
@@ -1552,28 +1578,40 @@ fn scenario_row_version_mismatch() -> (SeriesFile, Disclosure) {
                 "uc2_service_version",
                 "uc2_row_running_version",
                 "uc_service_attached",
+                "uc_service_heartbeat_age_seconds",
             ],
         );
         thread::sleep(Duration::from_millis(200));
     }
     srv.stop();
 
+    let (scenario, heartbeat) = if fresh_heartbeat {
+        (
+            "row_version_mismatch",
+            "its heartbeat stamped fresh before every scrape (a LIVE service)",
+        )
+    } else {
+        (
+            "row_version_mismatch_stale_heartbeat",
+            "its heartbeat NEVER stamped (a service that stopped at the record and exited, \
+             ATTACHED bit not yet cleared — a normal upgrade's swap window); extra check, \
+             must NOT fire",
+        )
+    };
     (
         sf,
         Disclosure {
-            scenario: "row_version_mismatch",
+            scenario,
             rules: &["Uc2RowVersionMismatch"],
             state: "synthetic",
             method: format!(
                 "one synthetic ObsSources, its own real exporter: row 0 = {:?} is ATTACHED \
                  running version {v_service} (1.3.0) while the row's committed running line \
-                 (genesis or a pin) reads {v_running} (1.2.0) — the exact shape of a service \
-                 stuck mid-stop after its row's line moved without it. All three render through \
-                 the real encoder as uc2_service_version{{row=\"0\"}}, \
-                 uc2_row_running_version{{row=\"0\"}} and uc_service_attached{{row=\"0\"}}; the \
-                 differing major.minor with attached == 1 is exactly what \
-                 Uc2RowVersionMismatch's floor(x / 65536) != on(instance, row) comparison \
-                 detects.",
+                 (genesis or a pin) reads {v_running} (1.2.0), {heartbeat}. All four render \
+                 through the real encoder as uc2_service_version{{row=\"0\"}}, \
+                 uc2_row_running_version{{row=\"0\"}}, uc_service_attached{{row=\"0\"}} and \
+                 uc_service_heartbeat_age_seconds{{row=\"0\"}}; Uc2RowVersionMismatch fires on \
+                 a differing major.minor with attached == 1 AND a heartbeat younger than 10 s.",
                 kv.as_str()
             ),
         },
