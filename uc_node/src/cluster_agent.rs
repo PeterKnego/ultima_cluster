@@ -286,6 +286,12 @@ impl ClusterAgent {
         // words from the artifact BEFORE any service attaches — the same
         // "no edge to miss" posture `publish_view` takes everywhere else.
         agent.publish_view();
+        // Ruling R6: `cluster_applied` must reflect a RECOVERED position too,
+        // not just one this agent goes on to apply or install — a service
+        // can be waiting on `cluster_applied >= rec_end` for a version
+        // record at or below the recovered `applied`, which this agent will
+        // never re-apply, so nothing would ever move the word otherwise.
+        agent.cnc.store_cluster_applied(agent.fsm.state().applied);
         agent
     }
 
@@ -1169,6 +1175,42 @@ mod tests {
             }
         );
         assert_eq!(cnc.cluster_applied(), end);
+    }
+
+    /// Ruling R6: recovering a snapshot must publish `cluster_applied` too —
+    /// not just an applying or installing batch. A service can be waiting on
+    /// `cluster_applied >= rec_end` for a version record at or below the
+    /// recovered `applied`, which this agent will never re-apply (it starts
+    /// its walk AFTER that position), so nothing but construction itself can
+    /// ever move the word for such a service.
+    #[test]
+    fn recovering_a_snapshot_sets_cluster_applied_with_no_batch_run() {
+        let (buffer, cnc, dir) = world();
+        let mut app = buffer.appender_for_test(0);
+        app.set_now(1);
+        let end = app
+            .append_cluster(
+                1,
+                ClusterKind::RowGenesis,
+                &genesis_payload(0, pack_version(1, 0, 0)),
+            )
+            .unwrap();
+        cnc.counters().durable.store_release(end);
+        cnc.counters().commit.store_release(end);
+        let (mut agent, _view) = agent_over(&buffer, &cnc, dir.path());
+        assert!(agent.do_work());
+        let pos = agent.take_snapshot().unwrap();
+        assert_eq!(pos, end, "sanity: the artifact is tagged at the frame end");
+
+        // A fresh page (a restarted node) and a fresh agent constructed
+        // straight from the recovered artifact — NO `do_work` call.
+        let (_, fresh_cnc, _) = world();
+        let (_agent2, _) = agent_over(&buffer, &fresh_cnc, dir.path());
+        assert_eq!(
+            fresh_cnc.cluster_applied(),
+            end,
+            "recovery alone must publish cluster_applied"
+        );
     }
 
     /// One accepted report through `do_work`; the verdict names node 2.
