@@ -214,6 +214,12 @@ fn instant_with_faked_rows(node: &Node, v_dir: &Path, cnc: &CncPage, rows: &[u8]
 /// automatic snapshot builder would race the test's own hand-staged
 /// snapshot floor/artifact). Stop + join it once the submit loop is done —
 /// nothing after that in these tests submits again.
+///
+/// #33 spec §6.2: a leader admits no client frame until every declared row
+/// has a running version, which the leader records (`RowGenesis`) only for a
+/// service ATTACHED on its own page. So the stand-in first plays the attach
+/// the genesis needs — [`stand_in_for_row_genesis`] — before it starts
+/// mirroring.
 fn spawn_applied_mirror(
     cnc: std::sync::Arc<CncPage>,
     id: usize,
@@ -221,6 +227,7 @@ fn spawn_applied_mirror(
     std::sync::Arc<std::sync::atomic::AtomicBool>,
     std::thread::JoinHandle<()>,
 ) {
+    stand_in_for_row_genesis(&cnc, id);
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let stop2 = std::sync::Arc::clone(&stop);
     let handle = std::thread::spawn(move || {
@@ -231,6 +238,45 @@ fn spawn_applied_mirror(
         }
     });
     (stop, handle)
+}
+
+/// #33 spec §6.2 stand-in for "a service attached long enough for genesis":
+/// mark row `id` ATTACHED with a fresh heartbeat (and `applied` mirrored from
+/// `durable`) until this page shows the row's committed running version, then
+/// put the status line back as it was. The recorded version is whatever the
+/// slot's version word already holds (`0` unless the test stored one), just
+/// as a real attach records the version it wrote there. On a follower's page
+/// nothing is appended; it simply waits for the leader's genesis to commit.
+fn stand_in_for_row_genesis(cnc: &CncPage, id: usize) {
+    let slot = cnc.service_slot(id);
+    let versioned = || {
+        matches!(
+            slot.status.row_view(),
+            uc_log::cnc::RowRead::View {
+                running: Some(_),
+                ..
+            }
+        )
+    };
+    if versioned() {
+        return;
+    }
+    let prev = slot.status.load_acquire();
+    slot.status
+        .store_release(uc_log::cnc::pack_service_status(id as u8, true, 1));
+    let deadline = deadline_secs(30);
+    while !versioned() {
+        assert!(
+            Instant::now() < deadline,
+            "row {id} never got a running version"
+        );
+        slot.heartbeat_ns.store_release(wall_now_ns());
+        slot.applied
+            .store_release(cnc.counters().durable.load_acquire());
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    slot.status.store_release(prev);
+    slot.heartbeat_ns.store_release(0);
 }
 
 struct NodeH {

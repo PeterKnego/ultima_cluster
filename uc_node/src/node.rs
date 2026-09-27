@@ -389,6 +389,10 @@ pub const SNAP_REPORT_TIMEOUT_NS: u64 = 5_000_000_000;
 /// ~0.9 s on an idle dev box) until a CPU-starved CI runner held a node for
 /// the whole 10 s without ever reaching it (nightly 2026-09-25).
 const DECLARED_WITHHELD_WARN_NS: u64 = 2_000_000_000;
+
+/// #33 spec §6.2: how often a closed client gate logs `version_gate_waiting`.
+const VERSION_GATE_LOG_NS: u64 = 5_000_000_000;
+
 /// Output-progress persist floor (Task 12 / spec §7): rate-limits the durable
 /// `StableValue::store` (an fsync) to at most once per 100 ms even under a
 /// change every cycle. The cheap in-page `output_completed` compare still runs
@@ -2292,6 +2296,8 @@ impl Node {
             cfg_obs_rx,
             view_position_seen: u64::MAX, // see the field: the first refresh must always run
             last_cluster_append: 0,
+            rows_versioned_latched: false,
+            next_version_gate_log_ns: 0,
             schedule_position: 0,
             last_armed_table_position: 0,
             schedule_pending: instance.root.join(SCHEDULE_PENDING_FILE),
@@ -3367,6 +3373,14 @@ struct Consensus {
     /// cluster FSM applies whichever of the two commits, in log order, and a
     /// truncated one simply never reaches the view.
     last_cluster_append: u64,
+    /// #33 spec §6.2, the client gate: `true` once every declared row has a
+    /// running version on the published cluster view. LATCHED for the
+    /// incarnation — a committed version is never removed (a pin replaces
+    /// it, never clears it), so once open the steady state is one bool test.
+    rows_versioned_latched: bool,
+    /// Throttle for `version_gate_waiting` (on `pass_mono_ns`): the next
+    /// pass at or after which the closed gate may log again.
+    next_version_gate_log_ns: u64,
     /// Cluster FSM: MIRROR of the view's `table_position` — published as the
     /// cluster-wide table metrics (`schedule_pos_pub`/`schedule_entries_pub`)
     /// whenever it moves, on every node regardless of role; also the
@@ -5937,6 +5951,10 @@ impl Consensus {
     /// Append pending + queued payloads via the leader appender, bounded.
     fn drain_ingress(&mut self) -> bool {
         let mut did = false;
+        // #33 spec §6.2: the same client gate as `drain_ingress_ring`.
+        if !self.rows_versioned() {
+            return did;
+        }
         // Retry an item held back by a prior WouldOverrun before taking more.
         if let Some(item) = self.pending_ingress.take() {
             if !self.try_append_ingress(&item) {
@@ -7939,6 +7957,14 @@ impl Consensus {
 
         for _ in 0..INGRESS_PER_CYCLE {
             if serving {
+                // #33 spec §6.2: no client frame until every declared row
+                // has a running version — the records stay in the ring
+                // (backpressure, not an error). Deliberately NOT folded into
+                // `serving`: that would block the genesis append itself,
+                // drop `can_serve`, and redirect clients with NOT_LEADER.
+                if !self.rows_versioned() {
+                    break;
+                }
                 let append = self.cnc.counters().append.load_acquire();
                 let commit = self.cnc.counters().commit.load_acquire();
                 if !admission_open(append, commit, self.admission_bytes) {
@@ -7982,6 +8008,47 @@ impl Consensus {
             }
         }
         did
+    }
+
+    /// #33 spec §6.2: true once every declared row has a running version.
+    /// Latched: a committed version is never removed. While it is false, a
+    /// throttled (every 5 s) `version_gate_waiting` names the lowest row still
+    /// waiting and whether this node's own service for it is attached — only
+    /// the leader's service acknowledges writes, so a row whose leader-side
+    /// service never attaches keeps the cluster closed, and the log says
+    /// which row. A page with nothing declared is open from the first call.
+    fn rows_versioned(&mut self) -> bool {
+        if self.rows_versioned_latched {
+            return true;
+        }
+        let declared = self.services.declared() as u8;
+        let missing = declared & !self.cluster_view.versioned.load(Ordering::Acquire);
+        if missing == 0 {
+            self.rows_versioned_latched = true;
+            return true;
+        }
+        self.note_version_gate_waiting(missing);
+        false
+    }
+
+    /// The closed gate's throttled log line — out of line so the drain
+    /// loop's body stays small.
+    #[inline(never)]
+    fn note_version_gate_waiting(&mut self, missing: u8) {
+        if self.pass_mono_ns < self.next_version_gate_log_ns {
+            return;
+        }
+        self.next_version_gate_log_ns = self.pass_mono_ns + VERSION_GATE_LOG_NS;
+        let row = missing.trailing_zeros() as u64;
+        let (_, attached, _) =
+            unpack_service_status(self.cnc.service_slot(row as usize).status.load_acquire());
+        crate::obs_event!(
+            Info,
+            "version_gate_waiting",
+            node = self.id as u64,
+            row = row,
+            leader_service_attached = attached
+        );
     }
 
     /// Append one client-stamped ring record; `false` = would overrun
@@ -12239,6 +12306,8 @@ mod tests {
             cfg_obs_rx,
             view_position_seen: u64::MAX,
             last_cluster_append: 0,
+            rows_versioned_latched: false,
+            next_version_gate_log_ns: 0,
             schedule_position: 0,
             last_armed_table_position: 0,
             schedule_pending: dir.path().join(SCHEDULE_PENDING_FILE),

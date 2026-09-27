@@ -466,3 +466,124 @@ fn a_mixed_version_row_never_loses_an_acknowledged_write() {
         );
     }
 }
+
+// ------------------------------------------------------- the client gate
+
+impl Cluster {
+    /// Wait until the cluster has nothing of its own left to append: every
+    /// live node has reached the top jumbo rung (loopback proves all three,
+    /// and each raise is a `CLUSTER` frame), and node `i`'s append counter
+    /// equals its commit and has held still for 500 ms.
+    fn settle(&self, i: usize) {
+        let top = uc_protocol::v2::datagram::MTU_BOUND as u32;
+        self.wait(|| {
+            self.nodes
+                .lock()
+                .unwrap()
+                .iter()
+                .flatten()
+                .all(|n| n.datagram_mtu() == top)
+        });
+        let page = self.page(i);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut last = (u64::MAX, Instant::now());
+        loop {
+            let a = page.counters().append.load_acquire();
+            let k = page.counters().commit.load_acquire();
+            if a != last.0 || a != k {
+                last = (a, Instant::now());
+            } else if last.1.elapsed() >= Duration::from_millis(500) {
+                return;
+            }
+            assert!(Instant::now() < deadline, "node {i} never settled");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+/// #33 spec §6.2 (controller ruling R1): while a declared row has no running
+/// version, the leader appends no client frame — the LOG does not grow, the
+/// record stays in the ingress ring. A timeout alone would prove nothing
+/// (with no leader-side service nothing answers either way), so this reads
+/// the leader's `append` counter across the attempt. Once the row gets a
+/// version (a service attaches and genesis commits), the SAME waiting submit
+/// is admitted and acknowledged.
+#[test]
+fn clients_wait_until_every_declared_row_has_a_version() {
+    let c = three_node_cluster("rowgate");
+    let leader = c.wait_leader();
+    c.settle(leader);
+    let page = c.page(leader);
+    let before = page.counters().append.load_acquire();
+
+    // No service anywhere: the row has no version. The submit blocks (the
+    // client's own timeout is 10 s), so it runs on its own thread.
+    let client = c.client(leader);
+    let waiting = std::thread::spawn(move || client.submit(&put(1)));
+    std::thread::sleep(Duration::from_millis(1_000));
+    let after = page.counters().append.load_acquire();
+    assert_eq!(
+        after, before,
+        "the leader appended while the row had no running version"
+    );
+    assert!(!waiting.is_finished(), "the submit must still be waiting");
+
+    // Every node runs the row, so whichever leads appends genesis.
+    let _svcs = c.start_all::<KvV2>();
+    let got = waiting.join().expect("submit thread");
+    assert_eq!(got.expect("admitted after genesis"), vec![0]);
+}
+
+/// Review Focus 5: a page that declares no rows
+/// (`ServicesConfig::none_for_tests()`) has nothing to wait for — the gate
+/// must not hold, or every harness that commits client frames with no
+/// service would wedge. The raw ingress-ring pattern of `smoke.rs`.
+#[test]
+fn ingress_gate_is_open_with_nothing_declared() {
+    let _guard = serialize();
+    let root = tempfile::Builder::new()
+        .prefix("uc2-rowgate0-")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("tempdir");
+    let sock = UdpSocket::bind("127.0.0.1:0").expect("bind");
+    let members = [(0u32, sock.local_addr().unwrap())];
+    let mut cfg = make_config(0, &members, root.path().join("n0"), "rowgate0");
+    cfg.services = ServicesConfig::none_for_tests();
+    let node = Node::start_with_socket(cfg, sock).expect("node start");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !node.can_serve() {
+        assert!(Instant::now() < deadline, "no serving leader within 20 s");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let ring = uc_protocol::ring::mpsc::MpscRing::open(&root.path().join("n0/ingress.ring"))
+        .expect("open ingress ring");
+    let (prod, _) = ring.into_split();
+    // A solo cluster never raises its rung (jumbo erratum 4), so once it has
+    // settled nothing else lands between `commit0` and the client's frame.
+    std::thread::sleep(Duration::from_millis(500));
+    let commit0 = node.counters().commit.load_acquire();
+    prod.try_write(
+        uc_protocol::v2::ipc::MSG_V2_SUBMIT,
+        0,
+        uc_protocol::v2::ipc::extra_client(7, 1),
+        b"gate-open",
+    )
+    .expect("ring write");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while node.counters().commit.load_acquire() <= commit0 {
+        assert!(
+            Instant::now() < deadline,
+            "a harness node must still admit client frames"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let mut buf = Vec::new();
+    match node.read_frame_validated(commit0, &mut buf) {
+        uc_log::buffer::FrameRead::Frame(h) => {
+            assert_eq!((h.client_id, h.seq), (7, 1), "the client's frame")
+        }
+        other => panic!("expected the client frame at {commit0}, got {other:?}"),
+    }
+    node.stop();
+}
