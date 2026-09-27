@@ -653,6 +653,45 @@ fn a_version_mismatch_is_refused_only_when_both_sides_report_one() {
     );
 }
 
+/// #33 ruling R17 (spec D3: patch is free). The per-row version check
+/// compares LINES (major.minor): a peer whose row runs a different PATCH of
+/// our line is not a mismatch, so a patch release can roll node by node
+/// without refusing a snapshot session between the two builds. An off-line
+/// version (different minor) is still refused.
+#[test]
+fn a_patch_only_version_difference_is_not_a_mismatch() {
+    use uc_protocol::identity::pack_version;
+    let mut h = build_with_versions(
+        FaultConfig::default(),
+        &["a"],
+        [pack_version(1, 4, 2), 0, 0, 0, 0, 0, 0, 0],
+    );
+    let st = h.follower.stats();
+    let ours = [name_hash("a"), 0, 0, 0, 0, 0, 0, 0];
+    // Their row 0 is 1.4.9 against our 1.4.2: same line, the intake opens.
+    h.forge_begin(
+        SNAP_BEGIN_LAYOUT_V4,
+        ours,
+        [pack_version(1, 4, 9), 0, 0, 0, 0, 0, 0, 0],
+    );
+    h.pump_until("intake opened", |h| h.follower_snap_dir.join("0").exists());
+    assert_eq!(st.snap_refused_version_mismatch.load(Ordering::Relaxed), 0);
+    // Their row 0 is 1.5.2: off-line, refused.
+    h.forge_begin(
+        SNAP_BEGIN_LAYOUT_V4,
+        ours,
+        [pack_version(1, 5, 2), 0, 0, 0, 0, 0, 0, 0],
+    );
+    h.pump_until("version refusal", |_| {
+        st.snap_refused_version_mismatch.load(Ordering::Relaxed) > 0
+    });
+    let r = st.version_refusal.lock().unwrap().clone().unwrap();
+    assert_eq!(
+        (r.row, r.ours_version, r.theirs_version),
+        (0, pack_version(1, 4, 2), pack_version(1, 5, 2))
+    );
+}
+
 /// CRITICAL regression: `service_id` is a bare, peer-controlled `u8` on the
 /// wire (0..=255) and is never bounds-checked to the 8 real rows. A BEGIN
 /// whose `identity` array matches ours EXACTLY (so the array-equality half of

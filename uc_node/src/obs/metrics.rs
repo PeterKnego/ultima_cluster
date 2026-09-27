@@ -1374,7 +1374,7 @@ pub fn render_prometheus(s: &ObsSources) -> String {
     push_counter(
         &mut out,
         "uc2_snapshot_refused_version_total",
-        "Snapshot sessions refused because the sender declared a different version than this node's attached service for at least one row — a joiner is stuck until every node runs the same version per row (spec §4.5, §9).",
+        "Snapshot sessions refused because the sender declared a version on a different line (major.minor; patch is ignored) than this node's attached service for at least one row — a joiner is stuck until every node runs the same line per row (spec §4.5, §9; #33 ruling R17).",
         s.receiver
             .snap_refused_version_mismatch
             .load(Ordering::Relaxed),
