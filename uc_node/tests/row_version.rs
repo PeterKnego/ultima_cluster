@@ -314,13 +314,17 @@ impl KvClient {
 }
 
 // ------------------------------------------------------------------- test
-
-/// The #33 scenario. Before the fix: the leader's v2 acknowledges
-/// `Append(5)`; the v1 followers apply it as BAD_REQUEST; after the leader
-/// stops, a v1 follower leads and the value reads 10, not 15 — an
-/// acknowledged write lost. After the fix: every v1 service is refused at
-/// attach or stopped at the genesis record, and once v2 runs everywhere the
-/// value reads 15.
+/// The #33 scenario (spec §10.1, controller ruling R4). Before the fix: the
+/// leader's v2 acknowledges `Append(5)`; the v1 followers apply it as
+/// BAD_REQUEST; once the leader stops, a v1 follower leads, answers through
+/// its live v1 service, and the value reads 10, not 15 — an acknowledged
+/// write lost. After the fix: every v1 service is refused at attach or
+/// stopped at the genesis record, so the survivors start v2, and the value
+/// reads 15.
+///
+/// The value check comes FIRST, so today's tree fails on the loss itself; the
+/// "every v1 was refused or stopped" check follows it as the second line of
+/// defence once the fix lands.
 #[test]
 #[ignore = "#33: un-ignored in Task 12"]
 fn a_mixed_version_row_never_loses_an_acknowledged_write() {
@@ -328,25 +332,61 @@ fn a_mixed_version_row_never_loses_an_acknowledged_write() {
     let leader = c.wait_leader();
     // Followers FIRST, so they are attached before the genesis record
     // commits (Review Focus 3).
-    let followers_v1: Vec<_> = c.others(leader).map(|i| c.try_start::<KvV1>(i)).collect();
-    let _leader_v2 = c.start::<KvV2>(leader);
+    let mut followers_v1: Vec<_> = c.others(leader).map(|i| c.try_start::<KvV1>(i)).collect();
+    let leader_v2 = c.start::<KvV2>(leader);
     let client = c.client(leader);
     assert_eq!(client.submit(&put(10)).expect("put acked"), vec![0]);
     assert_eq!(client.submit(&append(5)).expect("append acked"), vec![0]);
+    drop(client);
 
-    // Every v1 service is either refused or has stopped by now.
-    for f in followers_v1.iter() {
+    // Stop the leader first; a survivor leads.
+    c.stop_node(leader);
+    drop(leader_v2);
+    let new_leader = c.wait_leader();
+
+    let new_leader_v1_alive = followers_v1
+        .iter()
+        .find(|a| a.node == new_leader)
+        .and_then(|a| a.result.as_ref().ok())
+        .is_some_and(|s| s.is_alive());
+    // Each v1 attempt's verdict (refused or stopped?), with its Debug line.
+    let verdicts: Vec<(bool, String)>;
+    let _v2s: Vec<uc_service::Service<KvV2>>;
+    let got = if new_leader_v1_alive {
+        // Today's tree: the v1 build still serves the row on the new leader.
+        let got = c.client(new_leader).query_u64();
+        verdicts = followers_v1
+            .iter()
+            .map(|a| {
+                (
+                    a.is_refused_or_stopped_within(Duration::from_secs(10)),
+                    format!("{a:?}"),
+                )
+            })
+            .collect();
+        got
+    } else {
+        // The fix stopped or refused v1: bring v2 up on both survivors.
+        verdicts = followers_v1
+            .iter()
+            .map(|a| {
+                (
+                    a.is_refused_or_stopped_within(Duration::from_secs(10)),
+                    format!("{a:?}"),
+                )
+            })
+            .collect();
+        followers_v1.clear(); // release every v1's row lock before v2 attaches
+        _v2s = c.others(leader).map(|i| c.start::<KvV2>(i)).collect();
+        c.client(new_leader).query_u64()
+    };
+    assert_eq!(got, 15, "the acknowledged Append(5) was lost");
+
+    // Second line of defence: every v1 service was refused or has stopped.
+    for (refused_or_stopped, dbg) in &verdicts {
         assert!(
-            f.is_refused_or_stopped_within(Duration::from_secs(10)),
-            "a v1 service is still applying a row that runs 2.0: {f:?}"
+            *refused_or_stopped,
+            "a v1 service is still applying a row that runs 2.0: {dbg}"
         );
     }
-    drop(followers_v1);
-    // Bring v2 up on the followers, stop the old leader, read on the new one.
-    let v2s: Vec<_> = c.others(leader).map(|i| c.start::<KvV2>(i)).collect();
-    c.stop_node(leader);
-    let new_leader = c.wait_leader();
-    let got = c.client(new_leader).query_u64();
-    assert_eq!(got, 15, "the acknowledged Append(5) was lost");
-    drop(v2s);
 }
