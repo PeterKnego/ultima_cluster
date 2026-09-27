@@ -1025,11 +1025,11 @@ extra_ok &= run_extra_check(
 )
 
 
-# #33 ruling R17: Uc2RowVersionMismatch gained a fresh-heartbeat clause so a
-# NORMAL upgrade does not page — the old service stops at the superseding
-# record and exits, but its ATTACHED bit stays set until the new build
-# re-attaches. This negative case (off-line, attached, heartbeat never
-# stamped) must NOT fire. Not one of the 28 shipped rules; a FAIL here still
+# #33 ruling R17: Uc2RowVersionMismatch gained a fresh-heartbeat clause so it
+# pages only on a LIVE off-line service. (Since R18 a deliberate version stop
+# also clears ATTACHED; the clause still covers an old service that was
+# killed with its ATTACHED bit set.) This negative case (off-line, attached,
+# heartbeat never stamped) must NOT fire. Not one of the 28 shipped rules; a FAIL here still
 # fails the script.
 print()
 print("== extra checks: Uc2RowVersionMismatch fresh-heartbeat clause (#33 R17) ==")

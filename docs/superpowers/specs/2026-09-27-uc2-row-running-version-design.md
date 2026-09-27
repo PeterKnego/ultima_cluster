@@ -94,6 +94,15 @@ cites the commit that settled it.
   re-attaches, so the alert paged on any swap slower than `for:`; it now
   also requires `uc_service_heartbeat_age_seconds < 10` on the row.
   (`72c80fb`, `732f896`, `02b0b6b`)
+- **R18 — a version stop clears ATTACHED.** §7.2's fail-stop left the
+  slot's ATTACHED bit set, as a crash does. A version stop is deliberate, so
+  `version_gate::stop_at_record` (the one path the live loop and replay
+  share) now clears it before the panic, as `Service::stop` does, keeping
+  the incarnation. The row reads absent until the new build attaches.
+  `Uc2ServiceAbsent` (30 s) and `Uc2ServiceWedged` (1 m, which reads the
+  stalest declared row's heartbeat whether attached or not) still fire on a
+  swap slower than their `for:`; that is an accurate report of a row that
+  applies nothing, not a false page. (`967fe04`)
 - **Smaller as-built facts.** Refusal 52's `reason_str` is the bare
   `row_undeclared` (the explanation moved to `docs/reference/uc2ctl.md`), and
   genesis refuses only 60, not 52. §6.1's audit line is op `row_genesis`

@@ -246,12 +246,17 @@ for one minute: a LIVE service (its per-row heartbeat younger than 10 s)
 attached on this node whose line differs from its row's committed running
 line. Such a service should not exist for long — it is refused at attach,
 and an already-attached one stops at the record that moved its row — so a
-firing alert means **a stop that did not happen**. The heartbeat clause is
-what keeps a normal upgrade quiet: a service that did stop at the record
-fail-stops without clearing its ATTACHED bit, so its slot reads attached at
-the old version until the new build takes it over, but its heartbeat goes
-stale and the rule does not match (a slot left that way for good is
-`Uc2ServiceWedged`'s business). A row with no running version yet exports no
+firing alert means **a stop that did not happen**. It stays quiet through a
+normal upgrade: a service that stops at the record clears its slot's
+ATTACHED bit before it fail-stops, as a graceful stop does, and an old
+service that was killed instead has a stale heartbeat, so neither matches.
+The slot does read honestly as **absent** until the new build attaches, and
+the absent-service rules report that: `Uc2ServiceAbsent`
+(`uc_service_attached == 0`) after 30 s and `Uc2ServiceWedged` after 1 m.
+`Uc2ServiceWedged` reads the unlabeled heartbeat age, which is the stalest
+*declared* row's, attached or not. Both are accurate during the swap, because
+the row applies nothing and admission is closed. Attach the new build within
+their `for:`, or silence them for the maintenance window. A row with no running version yet exports no
 `uc2_row_running_version` sample, so it can never match.
 
 ### The log clock and the timer families (2.11.0)
@@ -756,7 +761,7 @@ flooding.
 | `log_truncated` | `node`, `epoch`, `to` | the log was cut back to position `to` as part of reconciliation epoch `epoch` |
 | `log_wiped` | `node` | a stronger case of the above: no common prefix with the leader, so the node truncated to 0 and will rejoin from the snapshot floor (`wipes_total` also increments) |
 | `snapshot_installed` | `node`, `pos`, `table_position` | the incoming-snapshot floor advanced to `pos`. **This fires whenever the floor marker moves, including the sub-case where the node already held the bytes and only the marker advanced** — it means "this node adopted a snapshot floor," not necessarily "a snapshot transfer happened." Don't read it as proof of a wire transfer. `table_position` (`2.11.0`) is the schedule-table position this node holds once the install is done: the carried table's on the fiat path a below-floor joiner takes, and this node's own, unchanged, on the mid-life path that adopts nothing. Note the **pinned install itself is not an obs event**: `uc2ctl upgrade pin`'s effect on the *cluster FSM* is `upgrade_pin_applied` (below), but a service process actually installing a pinned artifact at attach reports with a plain `eprintln!("uc_service: …")` line on the service's OWN stderr, outside this stream — there is no `pinned_install` event on the node's JSON log. |
-| `snapshot_floor_held_for_pin` (FSM upgrade lifecycle, 2.13.0) | `node`, `position`, `candidate` | this node's snapshot/purge floor is HELD at `position` — a pinned origin some row has not yet consumed (attached at the pin's `to` **and** replayed past the cut) — instead of advancing to `candidate`, the position it would otherwise publish. Fires once per change in the held position, not once per pass. An upgrade that was pinned and then abandoned holds the floor here indefinitely; clear it by finishing the upgrade (attach `to`) or by pinning the row forward, not by waiting — see [Upgrade a cluster § 2.13.0](upgrade-a-cluster.md#wire--cnc-change-in-2130-upgrade-pins-and-snapshot-reports-090-cnc-33). |
+| `snapshot_floor_held_for_pin` (FSM upgrade lifecycle, 2.13.0) | `node`, `position`, `candidate` | this node's snapshot/purge floor is HELD at `position` — a pinned origin some row has not yet consumed (attached on the pin's `to` line — a patch build of `to` counts — **and** replayed past the cut) — instead of advancing to `candidate`, the position it would otherwise publish. Fires once per change in the held position, not once per pass. An upgrade that was pinned and then abandoned holds the floor here indefinitely; clear it by finishing the upgrade (attach a build on `to`'s line) or by pinning the row forward, not by waiting — see [Upgrade a cluster § 2.13.0](upgrade-a-cluster.md#wire--cnc-change-in-2130-upgrade-pins-and-snapshot-reports-090-cnc-33). |
 | `config_adopted` | `node`, `position`, `version`, `prev_position` | a new `ClusterConfig` (version `version`) was adopted at `position`, superseding the one at `prev_position` |
 | `halt_removed` | `node`, `term`, `msg` | this node is not a member of the just-adopted config and has fail-stopped (parked permanently; the process keeps running but never serves again) |
 | `stepdown_removed` | `node`, `term`, `msg` | this node's own self-removal just committed while it was leader; it fail-stopped the same way as `halt_removed` |

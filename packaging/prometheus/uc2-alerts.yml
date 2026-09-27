@@ -223,12 +223,11 @@ groups:
     # #33 ruling R17: the last clause, `and on(instance, row)
     # uc_service_heartbeat_age_seconds < 10` (the per-row heartbeat age —
     # the unlabeled stalest-FSM series carries no `row` and never joins),
-    # keeps this from paging on a NORMAL upgrade. An old service that did
-    # stop at the superseding record exits but keeps its ATTACHED bit until
-    # the new build re-attaches, so without it the rule fired whenever the
-    # swap took longer than `for:`. A stopped service's heartbeat goes
-    # stale; a live off-line one keeps stamping, and that is the case this
-    # alert exists for. 10 s is well past the 3 s staleness bar the
+    # restricts this to a LIVE off-line service — the stuck stop this alert
+    # exists for. An old service that stopped at the superseding record
+    # clears ATTACHED itself (ruling R18) and never matches; one that was
+    # killed with ATTACHED still set has a stale heartbeat and does not
+    # match either. 10 s is well past the 3 s staleness bar the
     # heartbeat rules use elsewhere, so one late stamp does not suppress it.
     # A dead-but-attached service is Uc2ServiceWedged's business.
     expr: floor(uc2_service_version / 65536) != on(instance, row) floor(uc2_row_running_version / 65536) and on(instance, row) uc_service_attached == 1 and on(instance, row) uc_service_heartbeat_age_seconds < 10

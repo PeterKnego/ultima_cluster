@@ -98,10 +98,9 @@ Read it in this order:
    binary's major.minor is not the row's `running=` line; install a build on
    that line, or pin the row). An FSM that was attached and then logged
    `version_superseded` stopped on purpose at a record that moved its row to
-   another line: its `applied=` sits at that record's start — and because a
-   fail-stop does not clear the ATTACHED bit, its line may read
-   `attached=true` with a growing `heartbeat_age` that looks like step 2 but
-   is not a wedge. The fix is to start a build on the new `running=` line
+   another line: its `applied=` sits at that record's start, and it cleared
+   its ATTACHED bit on the way out (`attached=false`, a growing
+   `heartbeat_age`), so it lands in this step and is not a wedge (step 2). The fix is to start a build on the new `running=` line
    ([the version rules](upgrade-an-application.md#the-version-rules)). `heartbeat_age=never` distinguishes "never started
    since this node booted" from "was running, stopped".
 2. **`attached=true` with a stale `heartbeat_age`** (`Uc2ServiceWedged`) —

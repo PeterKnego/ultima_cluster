@@ -353,10 +353,13 @@ sudo systemctl stop uc2-service@APP
 
 Since the pin commits a change of line, every old service of the row has
 already stopped itself at the pin record (step 3): `applied=` reads the
-record's start on every node and the service logged `version_superseded`. A
-fail-stopped service does not clear its slot's ATTACHED bit — only a graceful
-stop does — so `attached=` may still read `true`, with a `heartbeat_age=`
-that keeps growing; the next attach takes the slot over. Stopping the unit is
+record's start on every node and the service logged `version_superseded`.
+The version stop clears the slot's ATTACHED bit before it fail-stops, as a
+graceful stop does, so `attached=` reads `false` and `heartbeat_age=` keeps
+growing until the new build takes the slot over. The row reads absent: a swap
+slower than 30 s raises `Uc2ServiceAbsent`, and one slower than a minute
+raises `Uc2ServiceWedged` as well
+([Monitor a cluster](monitor-a-cluster.md)). Stopping the unit is
 still worth doing: a supervisor that restarts the old binary gets it refused
 at attach (`PinnedVersionMismatch`) over and over, which is harmless but
 noisy.
@@ -364,9 +367,9 @@ noisy.
 A node on which the old service has **not** stopped has not applied the pin —
 go back to step 4 on that node. `Uc2RowVersionMismatch` (an attached service
 off its row's committed line that is still stamping its heartbeat, for a
-minute) is the alert for a stop that did not happen. A fail-stopped slot
-still reads attached at the old version, but its heartbeat goes stale, so
-the alert does not fire on a node whose new build is merely slow to attach.
+minute) is the alert for a stop that did not happen. A service that stopped
+at the record reads detached, so this alert does not fire on a node whose
+new build is merely slow to attach.
 
 **Why a mixed row cannot happen any more.** Before `0.10.0` this step said
 "stop them all before starting any", because while a row was mixed — some

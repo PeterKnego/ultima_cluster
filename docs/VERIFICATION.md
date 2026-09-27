@@ -399,7 +399,7 @@ history-PRESERVING command. That matters because a durable service's wrong
 path is not the genesis replay — it is continuing from X with the state it
 persisted — and with a last-write-wins register and a `Write`-only change
 the artifact path and continue-from-X compute the same value, so state alone
-could not have told them apart. The teeth are three: a NEW binary that is not the pinned version is a
+could not have told them apart. The teeth are three: a NEW binary that is not on the pinned version's line (major.minor; a patch build of `--to` is the pinned line since #33 R17) is a
 FAIL rather than a pass
 (`a_new_binary_that_is_not_the_pinned_version_is_a_fail`), a span whose
 commands cannot tell the two paths apart is INCONCLUSIVE rather than a pass

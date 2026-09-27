@@ -1536,9 +1536,10 @@ fn scenario_row_version_mismatch() -> (SeriesFile, Disclosure) {
 /// #33 ruling R17 NEGATIVE extra check for `Uc2RowVersionMismatch` (NOT one
 /// of the 28 shipped rules): the same off-line, ATTACHED row as
 /// [`scenario_row_version_mismatch`], but its heartbeat is never stamped —
-/// the shape of a NORMAL upgrade's old service, which stopped at the
-/// superseding record and exited while its ATTACHED bit waits for the new
-/// build to re-attach. The rule must NOT page on it.
+/// an off-line old service that is DEAD but left its ATTACHED bit set (a
+/// kill or crash; since ruling R18 a deliberate version stop clears the bit
+/// itself). The rule pages only on a LIVE off-line service, so it must NOT
+/// fire here; a dead slot is `Uc2ServiceWedged`'s business.
 fn scenario_row_version_mismatch_stale_heartbeat() -> (SeriesFile, Disclosure) {
     row_version_mismatch_with(false)
 }
@@ -1593,8 +1594,8 @@ fn row_version_mismatch_with(fresh_heartbeat: bool) -> (SeriesFile, Disclosure) 
     } else {
         (
             "row_version_mismatch_stale_heartbeat",
-            "its heartbeat NEVER stamped (a service that stopped at the record and exited, \
-             ATTACHED bit not yet cleared — a normal upgrade's swap window); extra check, \
+            "its heartbeat NEVER stamped (a dead off-line service that left ATTACHED set — a \
+             kill or crash; a deliberate version stop clears the bit since R18); extra check, \
              must NOT fire",
         )
     };

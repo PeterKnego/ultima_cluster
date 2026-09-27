@@ -887,7 +887,7 @@ on every node, not just the laggards.
 
 **A pinned-but-abandoned upgrade holds the journal indefinitely.** A node
 holds its snapshot/purge floor at a row's pinned origin until that row is
-consumed **on that node** — attached at the pin's `to` **and** replayed past
+consumed **on that node** — attached on the pin's `to` line (a patch build of `to` counts) **and** replayed past
 the cut, not merely attached. `snapshot_floor_held_for_pin` (an `Info` obs
 event, fields `node`, `position` the held floor, `candidate` the floor the
 node would otherwise publish) names the hold whenever it is in effect. An
