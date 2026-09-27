@@ -5426,8 +5426,11 @@ impl Consensus {
             let (_, attached, _) = unpack_service_status(slot.status.load_acquire());
             // Consumed: `to` is attached here AND it has already replayed past
             // everything this floor move is about to let the purge remove.
+            // "`to`" means `to`'s LINE (#33 ruling R17, spec D3 — patch is
+            // free): a patch build of `to` attaches through the same pinned
+            // install, so it consumes the pin just as `to` itself would.
             if attached
-                && slot.status.version() == pin.to
+                && uc_protocol::identity::same_line(slot.status.version(), pin.to)
                 && slot.applied.load_acquire() >= candidate
             {
                 continue;
@@ -9221,12 +9224,14 @@ impl Consensus {
             return self.refuse_upgrade_pin(REASON_PIN_ROW_UNDECLARED);
         }
         let state = self.cluster_view.to_state();
-        // 53, no-pin half: `from` must be the version the row is ATTACHED at.
-        // With a pin in the history, or (#33 spec §6.3) a recorded running
-        // version, the FSM's `same_line(from, running)` rule decides instead.
+        // 53, no-pin half: `from` must be on the LINE the row is ATTACHED at
+        // (#33 ruling R17, spec D3 — patch is free; the pinned install's
+        // envelope check is by line too). With a pin in the history, or
+        // (#33 spec §6.3) a recorded running version, the FSM's
+        // `same_line(from, running)` rule decides instead.
         if state.pin_for(pin.row).is_none() && state.running_for(pin.row).is_none() {
             let attached = self.cnc.service_slot(pin.row as usize).status.version();
-            if pin.from != attached {
+            if !uc_protocol::identity::same_line(pin.from, attached) {
                 return self.refuse_upgrade_pin(REASON_PIN_FROM_MISMATCH);
             }
         }
@@ -12858,14 +12863,17 @@ mod tests {
         let mut h = harness_with_rows(&["a"]);
         let (p1, p2) = (4096u64, 6016u64);
 
-        // Row 0 is pinned at p1 (`from` 1 → `to` 2) in the committed view,
-        // and its service is attached — but still at `from`, which is the
-        // whole window this hold exists for.
+        // Row 0 is pinned at p1 (`from` 1.0.0 → `to` 2.0.0) in the committed
+        // view, and its service is attached — but still at `from`, which is
+        // the whole window this hold exists for. Distinct LINES on purpose:
+        // since #33 ruling R17 the hold compares by line, and raw `1`/`2`
+        // are both 0.0.x.
+        let (from, to) = (pack_version(1, 0, 0), pack_version(2, 0, 0));
         let mut st = h.cons.cluster_view.to_state();
         st.pins.push(UpgradePin {
             row: 0,
-            from: 1,
-            to: 2,
+            from,
+            to,
             origin: p1,
         });
         st.applied = p1;
@@ -12873,7 +12881,7 @@ mod tests {
         let slot = h.cons.cnc.service_slot(0);
         slot.status
             .store_release(uc_log::cnc::pack_service_status(0, true, 1));
-        slot.status.store_version(1);
+        slot.status.store_version(from);
 
         // A complete set at p2 — newer than the pinned origin.
         h.row_froze_at(0, p2);
@@ -12901,7 +12909,7 @@ mod tests {
         // `to` attaches — but its tail replay has not reached p2 yet. The
         // hold STAYS: the journal it is about to replay is exactly what the
         // purge behind this floor move would remove.
-        h.cons.cnc.service_slot(0).status.store_version(2);
+        h.cons.cnc.service_slot(0).status.store_version(to);
         h.cons.cnc.service_slot(0).applied.store_release(p1);
         h.advance_floor_timer();
         h.cons.maybe_persist_snapshot_floor();
@@ -12920,6 +12928,54 @@ mod tests {
             "a consumed pin holds nothing"
         );
         assert_eq!(h.cons.snapshot_floor_hold, 0, "and the latch is cleared");
+    }
+
+    /// #33 ruling R17 (spec D3, patch is free): the pin names a LINE, so a
+    /// row attached at a PATCH build of `to` that has replayed past the
+    /// candidate has consumed the pin — the hold releases. Before R17 the
+    /// check was exact and a row upgraded to a patch of `to` held the floor
+    /// forever. A build on another line (here: still `from`) keeps holding.
+    #[test]
+    fn a_patch_build_of_the_pinned_to_consumes_the_pin() {
+        let mut h = harness_with_rows(&["a"]);
+        let (p1, p2) = (4096u64, 6016u64);
+        let (from, to) = (pack_version(1, 0, 0), pack_version(2, 0, 0));
+        let to_patch = pack_version(2, 0, 3);
+        let mut st = h.cons.cluster_view.to_state();
+        st.pins.push(UpgradePin {
+            row: 0,
+            from,
+            to,
+            origin: p1,
+        });
+        st.applied = p1;
+        h.cons.cluster_view.publish(&st);
+        let slot = h.cons.cnc.service_slot(0);
+        slot.status
+            .store_release(uc_log::cnc::pack_service_status(0, true, 1));
+        // Off-line (still `from`), past the candidate: holds.
+        slot.status.store_version(from);
+        slot.applied.store_release(p2);
+
+        h.row_froze_at(0, p2);
+        h.cluster_snapshot_pos.store(p2, Ordering::Release);
+        h.cons.check_set_completeness();
+        h.advance_floor_timer();
+        assert!(h.cons.maybe_persist_snapshot_floor());
+        assert_eq!(
+            h.cons.snapshot_persisted_floor, p1,
+            "a row still on `from`'s line has not consumed the pin"
+        );
+
+        // A patch of `to`, past the candidate: consumed.
+        h.cons.cnc.service_slot(0).status.store_version(to_patch);
+        h.advance_floor_timer();
+        assert!(h.cons.maybe_persist_snapshot_floor());
+        assert_eq!(
+            h.cons.snapshot_persisted_floor, p2,
+            "a patch build of `to` consumes the pin"
+        );
+        assert_eq!(h.cons.snapshot_floor_hold, 0);
     }
 
     /// The hold keys on ATTACHED-at-`to`, not on the pin's mere existence: a
@@ -16219,8 +16275,52 @@ mod tests {
         assert_eq!(h.cons.last_cluster_append, before, "nothing was appended");
     }
 
+    /// #33 ruling R17 (spec D3, patch is free): the door's no-running-version
+    /// half of 53 compares `from` with the attached word by LINE, as the
+    /// FSM's `same_line(from, running)` clause and the pinned install's
+    /// envelope check do. A `from` that is a patch neighbour of the attached
+    /// build passes 53 (and here meets 54, no set); an off-line one is 53.
+    #[test]
+    fn the_pin_door_compares_from_with_the_attached_word_by_line() {
+        let mut h = harness_with_rows(&["a"]);
+        drive_to_serving_leader(&mut h);
+        h.cons
+            .cnc
+            .service_slot(0)
+            .status
+            .store_version(pack_version(1, 4, 2));
+        stage_pin_for_test(
+            &h,
+            &UpgradePin {
+                row: 0,
+                from: pack_version(1, 4, 7),
+                to: pack_version(1, 5, 0),
+                origin: 4096,
+            },
+        );
+        assert_eq!(
+            sr(h.cons.apply_upgrade_pin_staged()),
+            (1, REASON_PIN_NO_SET),
+            "a patch neighbour of the attached build is past 53"
+        );
+        stage_pin_for_test(
+            &h,
+            &UpgradePin {
+                row: 0,
+                from: pack_version(1, 3, 2),
+                to: pack_version(1, 5, 0),
+                origin: 4096,
+            },
+        );
+        assert_eq!(
+            sr(h.cons.apply_upgrade_pin_staged()),
+            (1, REASON_PIN_FROM_MISMATCH),
+            "an off-line `from` is still 53"
+        );
+    }
+
     /// #33 spec §6.3: once the row has a recorded running version, the door's
-    /// no-pin `from == attached` check stands aside and the FSM's
+    /// no-pin `same_line(from, attached)` check stands aside and the FSM's
     /// `same_line(from, running)` rule decides — so a pin whose `from` is on
     /// the running line is accepted even when the attached word disagrees,
     /// and one whose `from` matches only the attached word is refused 53.

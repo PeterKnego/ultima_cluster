@@ -162,7 +162,9 @@ pub enum ServiceError {
     )]
     AlreadyAttached { name: String, row: u8 },
     /// Plan B2 T4 (spec §3 S4 step 5): the row carries a committed upgrade
-    /// pin naming a target version, and this binary is not it. The pin is the
+    /// pin naming a target version, and this binary is not on its LINE
+    /// (major.minor — a patch build of `to` is admitted and takes the pinned
+    /// install, #33 ruling R17 / spec D3). The pin is the
     /// cluster's decision about which version may serve the row from the
     /// origin onward, so a stale binary rejoining afterwards — the one thing
     /// the pin exists to stop — is refused BY NAME, before any slot word is

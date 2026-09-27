@@ -264,8 +264,10 @@ pub(crate) fn attach<S: RawStateMachine>(
         } => (pin, running, record_pos),
     };
     match (pin, running) {
-        // A pinned row: the pin names ONE build, so the check is exact.
-        (Some((origin, _from, to)), _) if to != S::VERSION => {
+        // A pinned row: the pin names a LINE (#33 ruling R17, spec D3 —
+        // patch is free), so a patch build of `to` takes the pinned path
+        // below and an off-line build is refused by name.
+        (Some((origin, _from, to)), _) if !uc_protocol::identity::same_line(to, S::VERSION) => {
             return Err(ServiceError::PinnedVersionMismatch {
                 name: S::IDENTITY.name.as_str().to_string(),
                 row,

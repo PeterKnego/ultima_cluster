@@ -837,6 +837,53 @@ fn a_pinned_artifact_built_by_a_patch_of_from_is_installed() {
     f.stop();
 }
 
+/// #33 ruling R17 (spec D3, patch is free): a pin names a LINE, not a
+/// build. A PATCH build of the pin's `to` attaches to the pinned row and
+/// takes the pinned path — installs the origin, recomputes the tail — rather
+/// than being refused, so a patch release of the pinned version can roll
+/// node by node after the pin. A build on another line is still refused by
+/// name.
+#[test]
+fn a_patch_build_of_the_pinned_to_installs_the_origin() {
+    let f = Fixture::new("pin-patchto");
+    let to_patch = V2 + 5; // 0.2.5: DoublingRegisterSm (0.2.0)'s line, other patch
+    assert!(to_patch != V2 && uc_protocol::identity::same_line(to_patch, V2));
+    f.pin(V1, to_patch);
+
+    // Off-line (V1 = 0.0.0 against the pinned 0.2.x): refused by name.
+    let err = ServiceBuilder::new(cfg(f.path(), f.app), RegisterSm::default())
+        .start_with_snapshots()
+        .err()
+        .expect("an off-line build is refused");
+    assert!(
+        matches!(
+            err,
+            ServiceError::PinnedVersionMismatch {
+                row: 0,
+                pinned,
+                mine: V1,
+                ..
+            } if pinned == to_patch
+        ),
+        "{err}"
+    );
+
+    // Same line, other patch: admitted, and it installs the origin.
+    let svc2 = ServiceBuilder::new(cfg(f.path(), f.app), DoublingRegisterSm::default())
+        .start_with_snapshots()
+        .expect("a patch build of the pinned `to` attaches");
+    let cnc = f.cnc();
+    wait_service_caught_up(&cnc);
+    assert_eq!(
+        query_v2(&svc2),
+        Some(CAS_NEW),
+        "the artifact at P was installed, then the tail recomputed under v2"
+    );
+    assert_eq!(svc2.pinned(), Some((f.p, V1, to_patch)));
+    drop(svc2);
+    f.stop();
+}
+
 /// `PinRead::Contended` is "could not read", never "no pin": a reader that
 /// must DECIDE refuses rather than attaching unpinned off a half-published
 /// triple.

@@ -39,7 +39,7 @@ use std::process::Command;
 
 use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
-use uc_protocol::identity::VersionDisplay;
+use uc_protocol::identity::{VersionDisplay, same_line};
 
 use crate::trace::Trace;
 
@@ -186,6 +186,21 @@ pub fn verdict(
         (true, Some(true), Some(true)) => Verdict::Inconclusive,
         _ => Verdict::Fail,
     }
+}
+
+/// Can the refusal arm hold for a run whose OLD is attached at `from` and
+/// whose pin names `to`? Only when the pin would refuse OLD — i.e. when OLD
+/// is not on `to`'s LINE. A pin names a line, not a build (#33 ruling R17,
+/// spec D3 — patch is free): a patch build of `to` attaches to the pinned
+/// row, so an OLD that is one could never be refused.
+pub fn stale_can_be_refused(from: u32, to: u32) -> bool {
+    !same_line(from, to)
+}
+
+/// Did NEW attach at the version the pin names? By LINE, for the same
+/// reason: a patch build of `--to` is the pinned line.
+pub fn new_attached_at_to(seen: u32, to: u32) -> bool {
+    same_line(seen, to)
 }
 
 /// Where the run's own instant at **P** falls: how many of the corpus's
@@ -566,19 +581,20 @@ mod sequence {
         }
         // The version the row is attached AT is the pin's `from`.
         r.from = cnc.service_slot(a.row as usize).status.version();
-        // Ruling R-C-1: a run whose OLD already IS `--to` cannot hold the
-        // refusal arm — the "stale" binary the arm re-starts is the pinned
-        // version, so it attaches and the run reports a FAIL that says
-        // nothing about the pin. Refuse it HERE, before a single command is
+        // Ruling R-C-1: a run whose OLD is already on `--to`'s line (#33
+        // R17: the same build or a patch of it) cannot hold the refusal arm
+        // — the "stale" binary the arm re-starts is admitted by the pin, so
+        // it attaches and the run reports a FAIL that says nothing about the
+        // pin. Refuse it HERE, before a single command is
         // submitted and before the pin is placed, rather than spending the
         // whole sequence to produce a misleading verdict.
-        if r.from == a.to {
+        if !stale_can_be_refused(r.from, a.to) {
             let _ = old.stop(a.timeout);
             drop(node);
             bail!(
-                "row {} already runs version {}, which --to also names; pin-verify needs a \
-                 version change (a same-version pin cannot hold the refusal arm: the \"stale\" \
-                 binary IS the pinned version)",
+                "row {} already runs version {}, on the line --to also names; pin-verify needs a \
+                 line change (a pin names major.minor, so a same-line pin cannot hold the refusal \
+                 arm: the \"stale\" binary is admitted by the pin)",
                 a.row,
                 VersionDisplay(r.from)
             );
@@ -717,11 +733,11 @@ mod sequence {
             }
         }
         r.swap.version_seen = cnc.service_slot(a.row as usize).status.version();
-        if r.swap.version_seen != a.to {
+        if !new_attached_at_to(r.swap.version_seen, a.to) {
             // One spelling of a version per report: `VersionDisplay`, the
             // same one the text render and `uc2ctl status` use.
             r.notes.push(format!(
-                "NEW attached as version {} but --to named {}",
+                "NEW attached as version {}, not on the line --to named ({})",
                 VersionDisplay(r.swap.version_seen),
                 VersionDisplay(a.to)
             ));
@@ -859,7 +875,7 @@ mod sequence {
         r.swap.artifact = art_p;
         r.swap.genesis = gen_p;
         r.verdict = verdict(
-            refusal_held && r.swap.version_seen == a.to && r.swap.install_logged,
+            refusal_held && new_attached_at_to(r.swap.version_seen, a.to) && r.swap.install_logged,
             r.swap.live_eq_artifact,
             r.swap.artifact_eq_genesis,
         );
@@ -882,6 +898,28 @@ pub use sequence::{PinVerifyArgs, run};
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    /// #33 ruling R17 (spec D3, patch is free): a pin names a LINE, so the
+    /// row admits every patch build of `to`. A run whose OLD is a patch of
+    /// `--to` therefore cannot hold the refusal arm (OLD would attach), and a
+    /// NEW that attached at a patch of `--to` did attach at the pinned line.
+    #[test]
+    fn the_version_arms_compare_lines_not_builds() {
+        use uc_protocol::identity::pack_version;
+        let to = pack_version(1, 4, 2);
+        assert!(!stale_can_be_refused(to, to), "same build");
+        assert!(
+            !stale_can_be_refused(pack_version(1, 4, 0), to),
+            "a patch of --to is admitted by the pin, so it cannot be refused"
+        );
+        assert!(stale_can_be_refused(pack_version(1, 3, 9), to), "off-line");
+        assert!(new_attached_at_to(to, to));
+        assert!(
+            new_attached_at_to(pack_version(1, 4, 9), to),
+            "a patch of --to is at the pinned line"
+        );
+        assert!(!new_attached_at_to(pack_version(1, 5, 2), to), "off-line");
+    }
 
     #[test]
     fn the_verdict_table() {
