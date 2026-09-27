@@ -1,7 +1,9 @@
 # UC2 row running version — design (#33)
 
 **Status:** design, approved in conversation 2026-09-27; this document is
-the written spec for review. **Issue:** [#33] (P1). **Track:** "Track 2" of
+the written spec for review. **Revision 2 (2026-09-27):** `adopt` and the
+genesis pin were dropped — every version change is a pin (§3.1); snapshots
+become mandatory under [#67]. **Issue:** [#33] (P1). **Track:** "Track 2" of
 the FSM upgrade lifecycle spec
 (`2026-09-19-uc2-fsm-upgrade-lifecycle-design.md` §1.3, §9.2) — the safety
 half only.
@@ -27,7 +29,7 @@ it; the platform does not enforce it.
 ## 2. Scope
 
 **In:** a row can never be applied by two versions at once. Every version
-change of a row becomes an enforced, per-row flag day.
+change of a row is a pin — an enforced, per-row flag day.
 
 **Out, tracked elsewhere:**
 
@@ -36,6 +38,9 @@ change of a row becomes an enforced, per-row flag day.
   floor: #66 relaxes "must equal" (§4.3) to "at or above the level", and
   nothing here forecloses that.
 - Rolling upgrades of **UC itself** (node binary, wire, cnc) — [#31].
+- Making snapshot support mandatory for every service — [#67]. This design
+  only needs what is already true: a pin requires a snapshot-capable row
+  (refusal 48).
 - Any change to the consensus kernel, `uc_sim`, or the Lean model: the
   running version is cluster-FSM state applied at commit, like pins.
 
@@ -44,26 +49,54 @@ change of a row becomes an enforced, per-row flag day.
 | # | decision | why |
 |---|---|---|
 | D1 | Scope is the safety floor, not rolling app upgrades | P1 bug; rolling is #66 and builds on this |
-| D2 | Two ways to change a row's version: `uc2ctl upgrade adopt` and the existing pin | pin alone would lock every row without snapshots out of any upgrade |
+| D2 | **Every version change is a pin**; there is no other way to change a row's version | a pin is the only change in which every replica starts the new version from one common state (§3.1) |
 | D3 | "Same version" = equal **major.minor**; patch may differ | the lifecycle spec defines patch as "no replicated behaviour"; patch releases can roll node by node |
 | D4 | `VERSION = 0` is an ordinary version, equal only to 0 | otherwise an app that never set `VERSION` gets no protection |
 | D5 | Per row: each FSM has its own running version | rows are independent FSMs; `audit` need not match `kv` |
-| D6 | `adopt` is **monotone** (never lowers major.minor) | an older binary cannot honestly apply newer commands; going back is a pin or the off-node backup |
+| D6 | Snapshots are mandatory ([#67]); no "genesis pin" for rows that cannot snapshot | without snapshots a long-running cluster cannot purge or rebuild an FSM in reasonable time (§3.1) |
 | D7 | A service defers to the cluster FSM's verdict on a version record; it never decides from the record bytes | the cluster FSM can refuse a record, and a refused record must change nothing |
 
-### 3.1 `adopt` vs pin — the contract
+### 3.1 Why a pin, and only a pin
 
-- **`adopt` to V** promises: *V applies every command already in the log
-  exactly as the previous version did.* It is for additive changes — new
-  command variants appended, existing ones untouched (the lifecycle spec
-  §2.4 row "New command variant (appended)"; exactly #33's case). A lagging
-  or restarted replica may replay pre-adopt frames under V, and the promise
-  is what makes that sound. `uc2-diffreplay upgrade` is how the promise is
-  checked; the docs say so.
-- **A pin** is required whenever V changes what an existing command does.
-  Every replica reinstalls the same origin artifact, so no replica applies
-  old frames under V. Pin requires snapshot capability (unchanged, refusal
-  48).
+A service reconstructs its state at attach by one of three routes: replay
+the journal from the start, install its newest local snapshot and replay the
+tail, or — a durable state machine — continue from its own `last_applied()`
+(`uc_service/src/attach.rs`, `start_pos = last_applied.unwrap_or(0)` when
+unpinned). Every route except a pin can hand a new binary **state or
+commands produced under the old version**. Whether that is sound depends on
+the new version applying old commands exactly as the old one did *and*
+reading the old version's saved state — a semantic promise the platform
+cannot check.
+
+A pin removes the question: every replica of the row installs **the same
+origin artifact** and applies only frames after it under the new version.
+The one residual requirement — the new version reads the artifact the old
+version wrote (the lifecycle spec's "snapshot dual-read" shim) — is checked
+at install by the artifact's envelope (`ULTSNAP2` carries the builder's
+`VERSION`), not trusted.
+
+**Rejected alternatives** (recorded so they are not re-proposed):
+
+- **`uc2ctl upgrade adopt`** — commit "the row now runs V" with no origin
+  artifact, the operator promising V treats every existing command and the
+  old saved state exactly as before. Rejected: the promise is the hardest
+  property to get right, unenforceable inside the cluster
+  (`uc2-diffreplay upgrade` can only sample it), and a false promise
+  re-creates exactly the divergence this spec exists to prevent.
+- **A genesis pin** — pin at position 0, every replica rebuilding the row
+  from an empty state by replaying the whole log under V; its only use was a
+  row that cannot snapshot. Rejected with [#67]: at 10 % of the measured
+  single-FSM ingest (1 362 555 commands/s, `uc2-m14-gate-2026-08-29.md:42`,
+  ~128 B per command) a cluster writes ~1.5 TB of log per day, and the
+  measured restart replay rate (~550 000 commands/s, same doc :415-422)
+  needs ~7.5 days per month of history. A row without snapshots is not a
+  deployment option, so it does not get an upgrade path of its own.
+
+**Where the origin comes from.** A standby instant (`uc2ctl snapshot
+--standby`) freezes only learners, and `uc2ctl snapshot fetch` brings the
+set to the node that will accept the pin — FSM determinism is what makes
+one learner's artifact valid for every replica. The docs recommend this as
+the normal source, so voters never pause for an upgrade.
 
 ## 4. Model
 
@@ -75,16 +108,21 @@ version (`uc_protocol::identity::pack_version`) the row runs, or `None`
 before its first record. `None` and `Some(0)` are different: `Some(0)` is an
 unversioned FSM that has been recorded (D4).
 
-Three records set it, all applied at commit on every node:
+Two records set it, both applied at commit on every node:
 
 | record | set by | effect | refused (on every node) unless |
 |---|---|---|---|
-| **genesis** — kind 6, `source = 1` | the leader's node, automatically (§6.1) | `running[row] = Some(to)` | `running[row]` is `None` → else **60 `version_already_set`** |
-| **adopt** — kind 6, `source = 2` | operator, `uc2ctl upgrade adopt` (§7.1) | `running[row] = Some(to)` | `running[row]` is `Some` → else **61 `version_unset`**; `from == running[row]` → else **62 `adopt_from_mismatch`**; `major.minor(to) ≥ major.minor(from)` → else **63 `adopt_not_monotone`** |
-| **pin** — kind 4 (existing) | operator, `uc2ctl upgrade pin` | existing pin effects, **plus** `running[row] = Some(to)` | existing pin rules (52–59) |
+| **genesis** — new kind 6 `RowGenesis` | the leader's node, automatically, the first time a row has no running version (§6.1) | `running[row] = Some(version)` | `running[row]` is `None` → else **60 `version_already_set`** |
+| **pin** — kind 4 (existing) | operator, `uc2ctl upgrade pin` | existing pin effects, **plus** `running[row] = Some(to)` | existing pin rules (52–59), **plus**: when `running[row]` is `Some(r)`, `same_line(from, r)` → else **53 `pin_from_mismatch`** (existing code, new clause) |
+
+Genesis is the only record without an operator; it records a fact (the
+version the leader already runs) and never changes one. After genesis, only
+a pin moves the version — in either direction: a pin to an *older* version
+is sound for the same reason as any pin (every replica reinstalls the
+origin), so rollback is just another pin.
 
 The state also records, per row, the frame-end position of the last
-**accepted** version record (`running_record_pos`), for §5.2 and §6.4.
+**accepted** version record (`running_record_pos`), for §5.2 and §7.
 
 Refused records advance `applied` and change nothing, as every `CLUSTER`
 kind does today (`cluster_fsm.rs:465-480`).
@@ -94,34 +132,36 @@ kind does today (`cluster_fsm.rs:465-480`).
 `fn same_line(a: u32, b: u32) -> bool` in `uc_protocol::identity`: equal
 major and minor (`a >> 16 == b >> 16`), patch ignored (D3). `0` is compared
 like any other value (D4). One helper, used by attach, the apply-loop arm,
-the leader's door checks, metrics and `uc2ctl`.
+the pin rule above, the pinned install (§7.3), metrics and `uc2ctl`.
+
+D3 makes a promise about patch releases that covers **everything
+replicated**, and that includes the snapshot payload format: a patch bump
+must write and read artifacts the other patch builds of its line can read.
+The docs state this with the version rules.
 
 ### 4.3 The guarantee
 
-For every row and every accepted version record R for that row (genesis,
-adopt or pin, at position `p_R`, setting version `v_R`): **no frame after
+For every row and every accepted version record R for that row (genesis or
+pin, at position `p_R`, setting version `v_R`): **no frame after
 `p_R` is applied by a service whose `VERSION` is not `same_line` with
 `v_R`** — until the next accepted record for the row. Such a service is
 refused at attach (§7.1) or stops at exactly `p_R` (§7.2).
 
-Frames *before* `p_R` may be applied by a later version only in the two
-sanctioned ways: under an `adopt`, by its promise (§3.1); under a pin, from
-the origin artifact every replica reinstalls. #66 later weakens the
-`same_line` predicate above, and nothing else.
+Frames *before* `p_R` are never applied under `v_R` at all when R is a pin:
+every `v_R` service starts from the pin's origin artifact. #66 later weakens
+the `same_line` predicate above, and nothing else.
 
 ## 5. Wire, cnc, image
 
 ### 5.1 Wire `0.9.0` → `0.10.0` — flag day
 
-`ClusterKind::RowVersion = 6` (`uc_protocol/src/v2/frame.rs:72-93`),
-payload 12 bytes, `uc_protocol::v2::upgrade`:
+`ClusterKind::RowGenesis = 6` (`uc_protocol/src/v2/frame.rs:72-93`),
+payload 8 bytes, `uc_protocol::v2::upgrade`:
 
 ```
-row u8 @0 ‖ source u8 @1 ‖ reserved [u8; 2] @2 ‖ from u32 @4 ‖ to u32 @8
+row u8 @0 ‖ reserved [u8; 3] @1 ‖ version u32 @4
 ```
 
-- `source`: `1 = genesis`, `2 = adopt`; anything else is undecodable.
-- Genesis writes `from = 0` and the decoder requires it (reserved-style).
 - Exact length, reserved bytes zero, `row < CNC_MAX_SERVICES`.
 - `CURRENT = 0.10.0` (`uc_protocol/src/version.rs:84`).
 
@@ -178,8 +218,8 @@ gating (`serving && !hold_clients`), same shape (`node.rs:6803-6847`):
    on a cached flag in steady state).
 2. Single-in-flight: `last_cluster_append > cluster_view.position` → skip.
 3. For the lowest such row whose slot on **this** (the leader's) page reads
-   ATTACHED with a non-stale heartbeat: append kind 6 `source = 1`,
-   `to = status.version()`. One row per pass.
+   ATTACHED with a non-stale heartbeat: append kind 6 `RowGenesis`,
+   `version = status.version()`. One row per pass.
 4. `obs_event` `row_version_genesis_proposed` and an audit line
    `actor="node"`, `source="genesis"` (the `audit_datagram_mtu` precedent,
    `node.rs:6868-6898`).
@@ -205,17 +245,14 @@ the leader's own service for it is attached. A row whose leader-side service
 never attaches keeps the cluster closed to clients — correct, since only the
 leader's service acknowledges writes — and the log says which row.
 
-### 6.3 Leader door for `adopt` (admin op 11)
+### 6.3 Pin door
 
-`apply_upgrade_adopt` in `handle_admin`. The payload is 9 bytes (`row`,
-`from`, `to`), so it rides in the signed admin line's `id ‖ ip ‖ port`
-fields directly — no staged file, unlike pin (§7.1). Order:
-
-1. Not leader → retry (2). Single-in-flight → retry (2).
-2. Row not declared → **52** (existing code; its name becomes
-   `row_undeclared` in `reason_str` and the docs, number unchanged).
-3. `validate_cluster_command` (the FSM rules of §4.1, 60–63) → refuse by code.
-4. Append kind 6 `source = 2`; audit `upgrade_adopt`.
+`apply_upgrade_pin` (`node.rs:9001-9060`) is unchanged except that
+`validate_cluster_command` now includes the new `same_line(from, running)`
+clause (§4.1), so a pin whose `from` names a line the row is not running is
+refused 53 at the door as well as at apply. The row-undeclared code 52 is
+renamed `row_undeclared` in `reason_str` and the docs (number unchanged),
+since genesis uses the same check.
 
 ## 7. Service side (`uc_service`)
 
@@ -229,12 +266,12 @@ After the existing pin decision (`attach.rs:247-271`), read the row view
 - `running` present and `!same_line(S::VERSION, running)` → refuse
   **`ServiceError::VersionMismatch { name, row, running, mine }`**:
   "row `kv` runs 2.1.0; this binary is 2.0.3 — install 2.1.x, or move the
-  row with `uc2ctl upgrade adopt`/`pin`".
+  row to this version with `uc2ctl upgrade pin`".
 - Remember `attach_record_pos = running_record_pos` in `ApplyState`. Every
   version record at or below it is already decided by this attach.
 
-A pinned attach keeps its stricter existing check (`to == S::VERSION`
-exactly, since the artifact install depends on it).
+A pinned attach keeps its existing check (`to == S::VERSION` exactly, since
+the pin names one build).
 
 ### 7.2 The apply-loop arm
 
@@ -269,33 +306,44 @@ The stop is safe to restart from: the next attach reads a
 `replay.rs` (journal replay at attach) needs **no** arm: every record it
 walks is at or below `attach_record_pos`, already decided by the attach.
 
+### 7.3 Pinned install across patch builds
+
+Today the pinned install requires the artifact's envelope version to equal
+the pin's `from` **exactly** (`ServiceError::MistaggedSnapshot`,
+`uc_service/src/config.rs:92-114`). Under D3 the origin artifacts on
+different nodes may have been built by different patch builds of `from`'s
+line (1.0.1 on one learner, 1.0.3 on another). The check becomes
+`same_line(envelope_version, from)` — consistent with D3 and with §4.2's
+statement that patch builds share the artifact format. The unpinned
+envelope check (`== S::VERSION`) relaxes the same way.
+
 ## 8. Operator surface
 
-- **`uc2ctl upgrade adopt --row <name|id> --to <x.y.z> [--from <x.y.z>]`** —
-  admin op 11 (`ADMIN_OP_UPGRADE_ADOPT`), signed, audited. `--from` defaults
-  to the row's `running_version` off the local page; the command refuses
-  locally if the row has none yet. Replies as `pin` does (0 accepted with
-  the position, 1 refused with the reason, 2 retry).
+- **No new admin op.** `uc2ctl upgrade pin`'s `--from` default becomes the
+  row's `running_version` off the local page when present (today it is the
+  attached service's version, `uc_ctl/src/upgrade.rs:83-95`).
 - **`uc2ctl status`**: each row line gains `running=<ver>|none
   running_pos=<p>`.
 - **`uc2ctl upgrade show`**: each row's running version and the record that
-  set it (genesis / adopt / pin, position), from the committed artifact.
-- **`reason_str`** + `docs/reference/uc2ctl.md`: 60–63, 52 renamed.
+  set it (genesis or pin, position), from the committed artifact.
+- **`reason_str`** + `docs/reference/uc2ctl.md`: 60; 52 renamed; 53's new
+  clause.
 - **Metrics**: `uc2_row_running_version{row,service}` (packed, absent → not
   exported); alert `Uc2RowVersionMismatch` — an attached service whose
   version is not `same_line` with its row's running version (it can only
   last until the service stops, so a firing alert means a stuck stop). Plus
   `scripts/m10_alert_fire.sh` `RULE_BUILDERS` coverage for the new rule.
 - **Log events**: `row_version_genesis_proposed`, `row_version_recorded`
-  (cluster agent, on every accepted kind-6 or pin), `version_gate_waiting`,
+  (cluster agent, on every accepted genesis or pin), `version_gate_waiting`,
   `version_superseded` (service).
 
 ## 9. Docs
 
 - `docs/how-to/upgrade-an-application.md` (the existing per-row upgrade
-  how-to): a new first section, "adopt or pin?" (§3.1), the `adopt`
-  procedure beside the existing pin procedure, and `uc2-diffreplay upgrade`
-  as the check for adopt's promise.
+  how-to): the version rules (major.minor must match, patch free and what
+  "patch" must not change, `0` is a version), what a refused or stopped
+  service's message means, and the standby instant on a learner as the
+  recommended origin.
 - References: `uc2ctl.md`, `cnc-page.md` (3.4 words), `wire-protocol.md`
   (kind 6, 0.10.0), `semver-policy.md`.
 - `docs/how-to/upgrade-a-cluster.md`: the `0.10.0` / cnc `3.4` flag day.
@@ -312,18 +360,21 @@ walks is at or below `attach_record_pos`, already decided by the attach.
    fail** — an acknowledged write is gone — and the failure is recorded.
    After: the 1.0 services are refused by name at attach, and no
    acknowledged write is lost.
-2. **Already-attached stop**: 1.0 services applying under load; `adopt 2.0`;
-   each 1.0 service stops with `applied == record position` exactly; 2.0
-   services attach and the row resumes. Linearizable history across the
+2. **Already-attached stop**: 1.0 services applying under load; a pin to
+   2.0 commits; each 1.0 service stops with `applied == record position`
+   exactly — closing the lifecycle spec's §9.2 window; 2.0 services attach,
+   install the origin and the row resumes. Linearizable history across the
    switch (`uc_lincheck`).
-3. **Refused record**: an `adopt` with a stale `from` → refused (62), and
-   the attached services keep applying (no stop).
+3. **Refused record**: a pin whose `from` is not the running line → refused
+   (53) at apply, and the attached services keep applying (no stop). The
+   test forces the record past the leader's door to exercise the apply-side
+   refusal.
 4. **Genesis**: a fresh cluster admits no client frame until every declared
    row has a record; mixed bootstrap (leader 2.0, follower 1.0) records 2.0
    and refuses the follower by name.
-5. **Unit**: FSM rules 60–63; `same_line` (patch free, 0 exact); codec
-   golden bytes for kind 6; image v1/v2 → v3 migration (fixtures); the
-   seqlock row view; the attach ordering fix.
+5. **Unit**: rule 60 and 53's new clause; `same_line` (patch free, 0 exact);
+   codec golden bytes for kind 6; image v1/v2 → v3 migration (fixtures); the
+   seqlock row view; the attach ordering fix; the relaxed envelope check.
 6. **Fuzz**: `uc_node_cluster_artifact` and the cluster-command decode
    targets extended to kind 6 and image v3.
 7. **Regression**: workspace tests, `lin_v2`, `lin_partition_v2`, the
@@ -335,17 +386,19 @@ walks is at or below `attach_record_pos`, already decided by the attach.
 
 - **Flag day**: wire `0.10.0` + cnc `3.4` + image v3 — stop every node
   before starting any node. #31 is what ends this class.
-- **`adopt`'s promise is the operator's.** A false promise (V changes an
-  existing command) diverges replicas that replay old frames under V. The
-  platform cannot see semantics; `uc2-diffreplay upgrade` can. Pin is the
-  safe path when in doubt.
+- **Every upgrade needs snapshots.** A row that cannot snapshot cannot
+  change version at all once this lands; [#67] makes that the only kind of
+  row there is. Until #67 ships, such a row's docs say so plainly.
 - **Patch is trusted (D3).** An app that ships a replicated behaviour change
-  as a patch bump defeats the check. Same mitigation.
+  — or a snapshot format change — as a patch bump defeats the check.
+  `uc2-diffreplay upgrade` is how to catch it before release.
 - **Leader-only acks make the gate a hard wait**: a declared row whose
   leader-side service never attaches closes the cluster to clients, named in
   the log (§6.2).
-- **Not addressed**: rolling app upgrades (#66), rolling UC upgrades (#31).
+- **Not addressed**: rolling app upgrades (#66), rolling UC upgrades (#31),
+  mandatory snapshots (#67).
 
 [#31]: https://github.com/PeterKnego/ultima_cluster/issues/31
 [#33]: https://github.com/PeterKnego/ultima_cluster/issues/33
 [#66]: https://github.com/PeterKnego/ultima_cluster/issues/66
+[#67]: https://github.com/PeterKnego/ultima_cluster/issues/67
