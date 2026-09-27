@@ -732,6 +732,7 @@ pub(crate) fn apply_cycle<S: RawStateMachine>(st: &mut ApplyState<S>) -> bool {
                     node_flags,
                     service_id: st.service_id,
                     pin: st.pin,
+                    decided_to: st.attach_record_pos.max(st.follower.cursor),
                 },
                 // Plan B3 final review F1: a pass that already failed to move
                 // this cursor is evidence the journal cannot serve it — feed
@@ -1655,6 +1656,161 @@ mod tests {
         );
         assert_eq!(sm.last, Some(pos[N - 1]));
         assert_eq!(st.follower.cursor, head);
+    }
+
+    // ------------------- #33 spec §7.2: the version-record arm
+
+    /// `RowGenesis { row: 0, version }` as a CLUSTER frame, through the real
+    /// appender. Returns (frame start, frame end).
+    fn append_genesis(appender: &mut uc_log::buffer::Appender, version: u32) -> (u64, u64) {
+        let mut body = vec![0u8, 0, 0, 0];
+        body.extend_from_slice(&version.to_le_bytes());
+        let end = appender
+            .append_cluster(1, uc_protocol::v2::frame::ClusterKind::RowGenesis, &body)
+            .unwrap();
+        (end - 64, end)
+    }
+
+    /// Stand in for the `uc2-cluster` agent having applied (and accepted)
+    /// the genesis record: row words first, then `cluster_applied`.
+    fn agent_accepted(cnc: &CncPage, version: u32, end: u64) {
+        cnc.service_slot(0)
+            .status
+            .store_row_view(None, Some(version), end);
+        cnc.store_cluster_applied(end);
+    }
+
+    fn panic_text(e: Box<dyn std::any::Any + Send>) -> String {
+        e.downcast_ref::<String>()
+            .cloned()
+            .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
+            .unwrap_or_default()
+    }
+
+    /// Live arm: a record that moved the row off this binary's line stops the
+    /// service at EXACTLY its start — the frame before it applied, the frame
+    /// after it not, and `applied` published as the record's start.
+    #[test]
+    fn the_live_loop_stops_at_exactly_a_superseding_record() {
+        let (mut st, cnc, _sc, mut appender, _dir) = apply_state_for_test(CountSm::default());
+        let before = appender.append(1, 1, &[1u8; 64]).unwrap();
+        let (start, end) =
+            append_genesis(&mut appender, uc_protocol::identity::pack_version(1, 0, 0));
+        appender.append(1, 2, &[1u8; 64]).unwrap();
+        let head = appender.position();
+        cnc.counters().durable.store_release(head);
+        cnc.counters().commit.store_release(head);
+        agent_accepted(&cnc, uc_protocol::identity::pack_version(1, 0, 0), end);
+
+        let r =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| super::apply_cycle(&mut st)));
+        let msg = panic_text(r.expect_err("the service must fail-stop at the record"));
+        assert!(
+            msg.starts_with("version_superseded: row \"count\" moved to 1.0.0"),
+            "{msg}"
+        );
+        let sm = st
+            .sm
+            .lock()
+            .expect("the SM mutex is not poisoned by the stop");
+        assert_eq!(
+            (sm.applies, sm.last),
+            (1, Some(before)),
+            "only the frame before it"
+        );
+        assert_eq!(cnc.service_slot(0).applied.load_acquire(), start);
+    }
+
+    /// Live arm, the other way: a record that keeps this binary's line is
+    /// walked past, and so is one the agent REFUSED (`record_pos` older).
+    #[test]
+    fn the_live_loop_walks_past_its_own_line_and_a_refused_record() {
+        for (running, record_at_end) in [
+            (0u32, true),
+            (uc_protocol::identity::pack_version(1, 0, 0), false),
+        ] {
+            let (mut st, cnc, _sc, mut appender, _dir) = apply_state_for_test(CountSm::default());
+            appender.append(1, 1, &[1u8; 64]).unwrap();
+            let (_, end) = append_genesis(&mut appender, running);
+            let after = appender.append(1, 2, &[1u8; 64]).unwrap();
+            let head = appender.position();
+            cnc.counters().durable.store_release(head);
+            cnc.counters().commit.store_release(head);
+            if record_at_end {
+                agent_accepted(&cnc, running, end);
+            } else {
+                // Refused: the view still names an older record (here none).
+                cnc.store_cluster_applied(head);
+            }
+            assert!(super::apply_cycle(&mut st));
+            let sm = st.sm.lock().unwrap();
+            assert_eq!((sm.applies, sm.last), (2, Some(after)));
+            assert_eq!(cnc.service_slot(0).applied.load_acquire(), head);
+        }
+    }
+
+    /// Replay arm: the mid-life/attach-time journal replay (`Overrun`) walks
+    /// frames above `attach_record_pos` too, so it must stop at a superseding
+    /// record exactly as the live loop does.
+    #[test]
+    fn the_journal_replay_stops_at_exactly_a_superseding_record() {
+        let dir = scratch();
+        let cnc = page(0x3333);
+        cnc.store_services_declared(0b1);
+        let buffer = std::sync::Arc::new(uc_log::buffer::LogBuffer::new(
+            uc_log::region::Region::heap_zeroed(CAP as usize),
+            std::sync::Arc::clone(&cnc),
+            256,
+        ));
+        let journal_dir = dir.path().join("journal");
+        let mut archive = uc_log::archive::Archive::open(uc_log::archive::ArchiveConfig {
+            segment_size_bytes: 16 * 1024,
+            preallocate_segments: false,
+            ..uc_log::archive::ArchiveConfig::new(&journal_dir)
+        })
+        .unwrap();
+        let mut appender = uc_log::buffer::Appender::new(std::sync::Arc::clone(&buffer), 1, 0);
+        // Lap the 64 KiB ring (1400 × 96 B) so cursor 0 overruns; the record
+        // sits after frame 199, far below what the ring retains.
+        let v1 = uc_protocol::identity::pack_version(1, 0, 0);
+        let mut last_before = 0;
+        let mut rec = (0, 0);
+        for i in 0..1400u32 {
+            let p = appender.append(1, i, &[1u8; 64]).unwrap();
+            if i < 200 {
+                last_before = p;
+            }
+            if i == 199 {
+                rec = append_genesis(&mut appender, v1);
+            }
+            if i % 100 == 99 {
+                while archive.do_work(&buffer).unwrap() {}
+            }
+        }
+        while archive.do_work(&buffer).unwrap() {}
+        drop(archive);
+        let head = cnc.counters().append.load_acquire();
+        assert_eq!(cnc.counters().durable.load_acquire(), head, "all recorded");
+        cnc.counters().commit.store_release(head);
+        agent_accepted(&cnc, v1, rec.1);
+
+        let (mut st, _cnc2, _sc2, _ap2, _dir2) = apply_state_for_test(CountSm::default());
+        st.cnc = Arc::clone(&cnc);
+        st.follower = uc_log::reader::LogFollower::new(std::sync::Arc::clone(&buffer), 0);
+        st.journal_dir = journal_dir;
+        st.instance_id = 0x3333;
+
+        let r =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| super::apply_cycle(&mut st)));
+        let msg = panic_text(r.expect_err("replay must fail-stop at the record"));
+        assert!(msg.starts_with("version_superseded:"), "{msg}");
+        let sm = st.sm.lock().expect("not poisoned");
+        assert_eq!(
+            (sm.applies, sm.last),
+            (200, Some(last_before)),
+            "frames 0..200 only"
+        );
+        assert_eq!(cnc.service_slot(0).applied.load_acquire(), rec.0);
     }
 
     // ------------------- plan B3 T5: the replay forward-progress guard

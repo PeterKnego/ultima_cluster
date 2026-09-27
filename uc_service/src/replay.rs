@@ -22,8 +22,8 @@ use uc_journal::TailReader;
 use uc_log::cnc::CncPage;
 use uc_protocol::v2::cnc::NODE_FLAG_LEARNER;
 use uc_protocol::v2::frame::{
-    self, FLAG_SNAPSHOT_STANDBY, FLAG_TIMER_TABLE, FRAME_TYPE_MESSAGE, FRAME_TYPE_SNAPSHOT,
-    FRAME_TYPE_TIMER, HEADER_LEN, align_frame_len,
+    self, FLAG_SNAPSHOT_STANDBY, FLAG_TIMER_TABLE, FRAME_TYPE_CLUSTER, FRAME_TYPE_MESSAGE,
+    FRAME_TYPE_SNAPSHOT, FRAME_TYPE_TIMER, HEADER_LEN, align_frame_len,
 };
 
 use crate::apply::{SnapshotRestore, SnapshotTrigger, on_snapshot_frame};
@@ -71,6 +71,14 @@ pub(crate) struct ReplayInstant<'a, S: RawStateMachine> {
     /// same kind of thing the other three are: a fact about this row fixed at
     /// attach that the replayed span needs in order to decide correctly.
     pub pin: Option<(u64, u32, u32)>,
+    /// #33 spec §7.2: every version record whose frame END is at or below
+    /// this was already decided — by this incarnation's attach
+    /// (`attach_record_pos`) or by the live loop, which walked every frame
+    /// below the cursor this replay starts from. Records above it are
+    /// adjudicated here exactly as the live arm does: this path is not only
+    /// "replay at attach" — it is every `Overrun`, and it walks up to the
+    /// live `min(commit, durable)`, past anything the attach saw.
+    pub decided_to: u64,
 }
 
 /// Ruling P10, pass 1: the START position of the LAST `SNAPSHOT` frame in the
@@ -429,6 +437,9 @@ pub(crate) fn replay_into<S: RawStateMachine>(
         None
     };
 
+    // #33: `Some((running, record start))` once the scan meets a record that
+    // moved this row off this binary's line.
+    let mut stop_at: Option<(u32, u64)> = None;
     reader
         .scan_from(start_pos, |_seq, base, payload| {
             // `target` is the ONE frontier captured above, shared with pass 1
@@ -511,6 +522,24 @@ pub(crate) fn replay_into<S: RawStateMachine>(
                         },
                     );
                     let _ = ctx.take_sched_records();
+                } else if hdr.frame_type == FRAME_TYPE_CLUSTER {
+                    // #33 spec §7.2, the same arm as the live loop's: stop at
+                    // exactly a record that moved the row off this line.
+                    if let Some(running) = crate::version_gate::on_cluster_frame(
+                        cnc,
+                        instant.service_id,
+                        S::VERSION,
+                        instant.decided_to,
+                        pos,
+                        &hdr,
+                        &payload[off + HEADER_LEN..off + total],
+                    ) {
+                        // Out of the scan; the fail-stop runs below, once
+                        // the SM guard can be released (a panic here would
+                        // poison the SM mutex).
+                        stop_at = Some((running, pos));
+                        return false;
+                    }
                 } else if hdr.frame_type == FRAME_TYPE_SNAPSHOT && Some(pos) > guard.last_applied()
                 {
                     // Fix round 3: the SAME `> last_applied` bound the two arms
@@ -558,5 +587,13 @@ pub(crate) fn replay_into<S: RawStateMachine>(
         })
         .map_err(|e| ServiceError::Replay(e.to_string()))?;
 
+    if let Some((running, at)) = stop_at {
+        // Every frame below the record applied, nothing at or after it.
+        crate::attach::slot(cnc, instant.service_id)
+            .applied
+            .store_release(at);
+        drop(guard);
+        crate::version_gate::stop_fail(S::IDENTITY.name.as_str(), running, at, S::VERSION);
+    }
     Ok(Replay::Rejoin(cursor))
 }
