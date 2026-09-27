@@ -157,6 +157,14 @@ pub const fn unpack_version(v: u32) -> (u8, u8, u16) {
     ((v >> 24) as u8, (v >> 16) as u8, v as u16)
 }
 
+/// #33 (row running version, spec D3/D4): two packed versions are the SAME
+/// LINE when major and minor agree; patch is free. `0` is an ordinary value
+/// here — it equals only `0`. FROZEN: attach, the apply-loop version gate,
+/// the cluster FSM's pin rule and the pinned install all decide on this.
+pub const fn same_line(a: u32, b: u32) -> bool {
+    a >> 16 == b >> 16
+}
+
 /// `Display` for a packed version: `"1.2.3"`, or `"unversioned"` for `0`.
 pub struct VersionDisplay(pub u32);
 
@@ -281,6 +289,17 @@ mod tests {
         let full_p = full.padded();
         assert_eq!(full_p.iter().position(|&c| c == 0), None);
         assert_eq!(FsmName::from_padded(&full_p), Some(full));
+    }
+
+    #[test]
+    fn same_line_ignores_patch_and_treats_zero_as_a_version() {
+        assert!(same_line(pack_version(1, 4, 2), pack_version(1, 4, 9)));
+        assert!(!same_line(pack_version(1, 4, 2), pack_version(1, 5, 2)));
+        assert!(!same_line(pack_version(1, 4, 2), pack_version(2, 4, 2)));
+        assert!(same_line(0, 0));
+        assert!(!same_line(0, pack_version(1, 0, 0)));
+        // raw small ints (the uc_lincheck fixtures' VERSION = 1/2/3) are 0.0.x:
+        assert!(same_line(1, 3));
     }
 
     #[test]

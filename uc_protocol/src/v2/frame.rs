@@ -77,6 +77,13 @@ pub enum ClusterKind {
     Settings = 3,
     UpgradePin = 4,
     SnapshotReport = 5,
+    /// #33 (row running version, spec §5.1): the leader's own attached
+    /// version for a row that has none yet — a recorded FACT, never an
+    /// operator's change. This is a `ClusterKind` value (the `CLUSTER`
+    /// body's own kind byte), a separate numbering from the outer
+    /// `FRAME_TYPE_*` constants, so it does not collide with the retired
+    /// `FRAME_TYPE_SCHEDULE_TABLE_RETIRED = 6`.
+    RowGenesis = 6,
 }
 
 impl ClusterKind {
@@ -87,6 +94,7 @@ impl ClusterKind {
             3 => Some(ClusterKind::Settings),
             4 => Some(ClusterKind::UpgradePin),
             5 => Some(ClusterKind::SnapshotReport),
+            6 => Some(ClusterKind::RowGenesis),
             _ => None,
         }
     }
@@ -359,13 +367,20 @@ mod tests {
         assert_eq!(ClusterKind::SnapshotReport as u8, 5);
         assert_eq!(ClusterKind::from_u8(4), Some(ClusterKind::UpgradePin));
         assert_eq!(ClusterKind::from_u8(5), Some(ClusterKind::SnapshotReport));
-        assert_eq!(ClusterKind::from_u8(6), None);
+        assert_eq!(ClusterKind::from_u8(6), Some(ClusterKind::RowGenesis));
+        assert_eq!(ClusterKind::from_u8(7), None);
         let mut b = vec![0u8; CLUSTER_BODY_PREFIX_LEN + 3];
         write_cluster_prefix(&mut b, ClusterKind::SnapshotReport);
         assert_eq!(
             read_cluster_prefix(&b).map(|(k, p)| (k, p.len())),
             Some((ClusterKind::SnapshotReport, 3))
         );
+    }
+
+    #[test]
+    fn cluster_kind_six_is_row_genesis() {
+        assert_eq!(ClusterKind::from_u8(6), Some(ClusterKind::RowGenesis));
+        assert_eq!(ClusterKind::from_u8(7), None);
     }
 
     #[test]

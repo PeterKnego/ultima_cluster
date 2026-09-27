@@ -196,6 +196,38 @@ pub fn verdict(r: &SnapshotReport) -> Verdict {
     }
 }
 
+/// `row u8 @0 ‖ reserved [u8; 3] @1 ‖ version u32 @4` — exactly 8 bytes,
+/// `CLUSTER kind = 6` (#33 spec §5.1). The leader's own attached version for
+/// a row that has none yet: a recorded FACT, never an operator's change.
+pub const ROW_GENESIS_LEN: usize = 8;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RowGenesis {
+    pub row: u8,
+    pub version: u32,
+}
+
+pub fn encode_row_genesis(g: &RowGenesis, out: &mut Vec<u8>) {
+    out.push(g.row);
+    out.extend_from_slice(&[0, 0, 0]);
+    out.extend_from_slice(&g.version.to_le_bytes());
+}
+
+/// Exact-length, reserved-zero, `row < CNC_MAX_SERVICES`.
+pub fn decode_row_genesis(buf: &[u8]) -> Option<RowGenesis> {
+    if buf.len() != ROW_GENESIS_LEN || buf[1..4] != [0, 0, 0] {
+        return None;
+    }
+    let row = buf[0];
+    if row as usize >= CNC_MAX_SERVICES {
+        return None;
+    }
+    Some(RowGenesis {
+        row,
+        version: u32::from_le_bytes(buf[4..8].try_into().ok()?),
+    })
+}
+
 /// The image's pin blob: `count × UPGRADE_PIN_LEN`, in apply order.
 pub fn encode_pin_list(pins: &[UpgradePin], out: &mut Vec<u8>) {
     for p in pins {
@@ -239,6 +271,29 @@ pub fn decode_report_list(buf: &[u8]) -> Option<Vec<SnapshotReport>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::identity::pack_version;
+
+    #[test]
+    fn row_genesis_golden_bytes_and_strict_decode() {
+        let g = RowGenesis {
+            row: 3,
+            version: pack_version(1, 2, 3),
+        };
+        let mut b = Vec::new();
+        encode_row_genesis(&g, &mut b);
+        assert_eq!(b, [3, 0, 0, 0, 0x03, 0x00, 0x02, 0x01]);
+        assert_eq!(decode_row_genesis(&b), Some(g));
+        let mut bad = b.clone();
+        bad[1] = 1; // reserved non-zero
+        assert_eq!(decode_row_genesis(&bad), None);
+        let mut bad = b.clone();
+        bad[0] = CNC_MAX_SERVICES as u8; // row out of range
+        assert_eq!(decode_row_genesis(&bad), None);
+        assert_eq!(decode_row_genesis(&b[..7]), None); // short
+        let mut long = b.clone();
+        long.push(0);
+        assert_eq!(decode_row_genesis(&long), None); // exact length
+    }
 
     fn pin() -> UpgradePin {
         UpgradePin {

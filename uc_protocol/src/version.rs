@@ -81,7 +81,9 @@ impl ProtocolVersion {
 // 0.9.0 — `CLUSTER` kinds 4 (UpgradePin) and 5 (SnapshotReport); cnc 3.3. A
 // 0.8.0 peer applies either as undecodable and silently diverges, hence the
 // bump.
-pub const CURRENT: ProtocolVersion = ProtocolVersion::new(0, 9, 0);
+// 0.10.0 (#33): `CLUSTER` kind 6 `RowGenesis`; a 0.9.0 peer refuses it as
+// undecodable and diverges silently — flag day.
+pub const CURRENT: ProtocolVersion = ProtocolVersion::new(0, 10, 0);
 pub const MIN_COMPATIBLE: ProtocolVersion = ProtocolVersion::new(0, 1, 0);
 
 #[cfg(test)]
@@ -119,6 +121,6 @@ mod tests {
 
     #[test]
     fn current_is_the_upgrade_lifecycle_wire() {
-        assert_eq!(CURRENT, ProtocolVersion::new(0, 9, 0));
+        assert_eq!(CURRENT, ProtocolVersion::new(0, 10, 0));
     }
 }

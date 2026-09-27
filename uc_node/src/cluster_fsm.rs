@@ -420,6 +420,8 @@ impl ClusterFsm {
             ClusterKind::SnapshotReport => {
                 ClusterCommand::SnapshotReport(decode_snapshot_report(payload)?)
             }
+            // #33: implemented in Task 4.
+            ClusterKind::RowGenesis => return None,
         })
     }
 
