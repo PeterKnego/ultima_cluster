@@ -271,8 +271,8 @@ pub fn decode_cluster_image(buf: &[u8]) -> Option<ClusterImageParts<'_>> {
         table,
         settings,
         pins,
-        running,
         reports,
+        running,
     })
 }
 
@@ -739,9 +739,35 @@ mod tests {
         );
         assert_eq!(decode_cluster_image(&img).unwrap().running, &running[..]);
         // A v2 image (the existing v2 fixture, captured before this task's
-        // encoder change) decodes with empty running.
+        // encoder change) decodes with empty running — and its pins/reports
+        // (the v2-era fields) survive untouched: the fixture was captured
+        // with one UpgradePin and no reports (see PLAN_B1_V2_FIXTURE's doc
+        // comment for its exact provenance).
+        use super::super::upgrade::{UpgradePin, encode_upgrade_pin};
+        let mut expected_pins = Vec::new();
+        encode_upgrade_pin(
+            &UpgradePin {
+                row: 2,
+                from: 0x0100_0000,
+                to: 0x0102_0000,
+                origin: 4096,
+            },
+            &mut expected_pins,
+        );
         let v2 = v2_fixture_image();
-        assert_eq!(decode_cluster_image(v2).unwrap().running, &[] as &[u8]);
+        let d = decode_cluster_image(v2).unwrap();
+        assert_eq!(
+            u32::from_le_bytes(v2[8..12].try_into().unwrap()),
+            2,
+            "the fixture itself is a genuine v2 image, not a v3 one"
+        );
+        assert_eq!(d.running, &[] as &[u8]);
+        assert_eq!(
+            d.pins,
+            &expected_pins[..],
+            "the v2 fixture's one pin record survives decode intact"
+        );
+        assert_eq!(d.reports, &[] as &[u8]);
         // And the plan-1-era v1 fixture too.
         assert_eq!(
             decode_cluster_image(PLAN1_FIXTURE).unwrap().running,
