@@ -963,6 +963,7 @@ mod tests {
             applied: 0,
             pins: vec![],
             reports: vec![],
+            running: [None; uc_protocol::v2::cnc::CNC_MAX_SERVICES],
         }
     }
 

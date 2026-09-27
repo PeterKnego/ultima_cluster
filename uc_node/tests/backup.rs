@@ -1441,6 +1441,7 @@ fn cluster_genesis() -> uc_node::ClusterState {
         applied: 0,
         pins: Vec::new(),
         reports: Vec::new(),
+        running: [None; uc_protocol::v2::cnc::CNC_MAX_SERVICES],
     }
 }
 

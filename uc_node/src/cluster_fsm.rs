@@ -16,6 +16,7 @@ use uc_consensus::config::{ClusterConfig, ProposeError};
 use uc_protocol::v2::cluster_image::{
     ClusterImageParts, decode_cluster_image, encode_cluster_image,
 };
+use uc_protocol::v2::cnc::CNC_MAX_SERVICES;
 use uc_protocol::v2::config::{decode_config, encode_config};
 use uc_protocol::v2::frame::{ClusterKind, read_cluster_prefix};
 use uc_protocol::v2::schedule::{
@@ -25,9 +26,10 @@ use uc_protocol::v2::settings::{
     FSM_LAG_LOCKSTEP, MIN_FSM_LAG_BYTES, Settings, decode_settings, encode_settings,
 };
 use uc_protocol::v2::upgrade::{
-    SnapshotReport, UpgradePin, decode_pin_list, decode_report_list, decode_snapshot_report,
-    decode_upgrade_pin, encode_pin_list, encode_report_list, encode_snapshot_report,
-    encode_upgrade_pin,
+    RowGenesis, RowRunning, SnapshotReport, UpgradePin, decode_pin_list, decode_report_list,
+    decode_row_genesis, decode_running_list, decode_snapshot_report, decode_upgrade_pin,
+    encode_pin_list, encode_report_list, encode_row_genesis, encode_running_list,
+    encode_snapshot_report, encode_upgrade_pin,
 };
 use uc_service::{ApplyCtx, RawStateMachine, SnapshotError, SnapshotStateMachine};
 
@@ -38,8 +40,11 @@ use crate::node::{cluster_to_wire, wire_to_cluster_config};
 /// can reach without `uc_node` — so a fuzz target can exercise the decoder
 /// directly; re-exported here under their original names since nothing in
 /// this crate's public surface should have to change to follow the move. See
-/// [`uc_protocol::v2::cluster_image::CLUSTER_IMAGE_VERSION`] for the "why
-/// still `1`" note.
+/// [`uc_protocol::v2::cluster_image::CLUSTER_IMAGE_VERSION`] for the layout
+/// history: the image is now version `3` (#33 added the trailing per-row
+/// `running` blob), and versions `1` and `2` are still read — a pre-#33
+/// image migrates each pinned row's running version from its newest pin
+/// (`install_snapshot`, #33 spec §5.3).
 pub use uc_protocol::v2::cluster_image::{CLUSTER_IMAGE_MAGIC, CLUSTER_IMAGE_VERSION};
 
 /// The staged table file an admin client writes under the instance directory
@@ -129,6 +134,11 @@ pub struct ClusterState {
     /// `freeze` both rely on that: neither can refuse a record it is only
     /// serialising.
     pub reports: Vec<SnapshotReport>,
+    /// #33 spec §4.1: per row, the version it RUNS and the frame-END of the
+    /// last accepted record that set it (genesis or pin). `None` = no record
+    /// yet — distinct from `Some(version: 0)`, a recorded unversioned FSM.
+    /// The `row` field inside an entry always equals its index.
+    pub running: [Option<RowRunning>; CNC_MAX_SERVICES],
 }
 
 impl ClusterState {
@@ -151,7 +161,14 @@ impl ClusterState {
             applied: 0,
             pins: Vec::new(),
             reports: Vec::new(),
+            running: [None; CNC_MAX_SERVICES],
         }
+    }
+
+    /// #33: the row's running version, if one has been recorded. An
+    /// out-of-range row reads as `None`.
+    pub fn running_for(&self, row: u8) -> Option<RowRunning> {
+        self.running.get(row as usize).copied().flatten()
     }
 
     /// The row's newest pin, if any.
@@ -207,17 +224,24 @@ pub enum ClusterCommand {
     Settings(Settings),
     UpgradePin(UpgradePin),
     SnapshotReport(SnapshotReport),
+    /// #33 spec §4.1 / §6.1: the leader's own attached version for a row
+    /// with no running version yet — a recorded fact, never a change.
+    RowGenesis(RowGenesis),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClusterRefusal {
     Membership(ProposeError),
-    ScheduleUnknownFsm { entry: usize },
+    ScheduleUnknownFsm {
+        entry: usize,
+    },
     ScheduleTooLarge,
     SettingsBounds(&'static str),
     PinFromMismatch,
     PinNotMonotone,
     ReportStale,
+    /// #33: a `RowGenesis` for a row that already has a running version.
+    VersionAlreadySet,
 }
 
 impl ClusterRefusal {
@@ -225,6 +249,8 @@ impl ClusterRefusal {
     ///
     /// The pin/report codes are the 52–59 band, plan B1; 52/54/56–58 are
     /// door-only and live in `uc_node::node`, so they never appear here.
+    /// 60 (#33) is `version_already_set`, a `RowGenesis` for a row that
+    /// already runs a recorded version.
     pub fn reason_code(&self) -> u32 {
         match self {
             ClusterRefusal::Membership(e) => ClusterConfig::reason_code(e),
@@ -234,6 +260,7 @@ impl ClusterRefusal {
             ClusterRefusal::PinFromMismatch => 53,
             ClusterRefusal::PinNotMonotone => 55,
             ClusterRefusal::ReportStale => 59,
+            ClusterRefusal::VersionAlreadySet => 60,
         }
     }
 }
@@ -272,6 +299,12 @@ impl ClusterFsm {
 
     pub fn state(&self) -> &ClusterState {
         &self.state
+    }
+
+    /// The recorded running versions in row order — the shape query 6 and
+    /// the image's `running` blob both carry.
+    fn running_list(&self) -> Vec<RowRunning> {
+        self.state.running.iter().flatten().copied().collect()
     }
 
     /// The LEADER's pre-append acceptance decision on THIS state, no
@@ -380,17 +413,25 @@ impl ClusterFsm {
             }
             ClusterCommand::UpgradePin(p) => {
                 // Spec §2.5, replicated half only: the row's history is FSM
-                // state. `pin_row_undeclared` (52), the no-pin half of
-                // `pin_from_mismatch` (53, against the attached version
-                // WORD) and `pin_no_set` (54, this leader's filesystem) are
-                // node-local and stay at the door (`Consensus::apply_upgrade_pin`).
-                if let Some(cur) = self.state.pin_for(p.row) {
-                    if p.origin <= cur.origin {
-                        return Err(ClusterRefusal::PinNotMonotone);
-                    }
-                    if p.from != cur.to {
-                        return Err(ClusterRefusal::PinFromMismatch);
-                    }
+                // state. `pin_row_undeclared` (52), the no-running-version
+                // half of `pin_from_mismatch` (53, against the attached
+                // version WORD) and `pin_no_set` (54, this leader's
+                // filesystem) are node-local and stay at the door
+                // (`Consensus::apply_upgrade_pin`).
+                if let Some(cur) = self.state.pin_for(p.row)
+                    && p.origin <= cur.origin
+                {
+                    return Err(ClusterRefusal::PinNotMonotone);
+                }
+                // #33 spec §4.1: a pin starts from the row's RUNNING line
+                // (patch ignored, `same_line`). This replaces the old exact
+                // `from == previous pin's to` rule and covers it: an accepted
+                // pin sets `running` to its `to`, so a row whose last record
+                // was a pin is checked against that pin's line.
+                if let Some(r) = self.state.running_for(p.row)
+                    && !uc_protocol::identity::same_line(p.from, r.version)
+                {
+                    return Err(ClusterRefusal::PinFromMismatch);
                 }
                 Ok(())
             }
@@ -401,6 +442,14 @@ impl ClusterFsm {
                     .is_some_and(|held| r.position < held.position)
                 {
                     return Err(ClusterRefusal::ReportStale);
+                }
+                Ok(())
+            }
+            ClusterCommand::RowGenesis(g) => {
+                // #33 spec §4.1: genesis records a fact once and never
+                // changes one; after it only a pin moves the version.
+                if self.state.running_for(g.row).is_some() {
+                    return Err(ClusterRefusal::VersionAlreadySet);
                 }
                 Ok(())
             }
@@ -420,8 +469,7 @@ impl ClusterFsm {
             ClusterKind::SnapshotReport => {
                 ClusterCommand::SnapshotReport(decode_snapshot_report(payload)?)
             }
-            // #33: implemented in Task 4.
-            ClusterKind::RowGenesis => return None,
+            ClusterKind::RowGenesis => ClusterCommand::RowGenesis(decode_row_genesis(payload)?),
         })
     }
 
@@ -453,6 +501,10 @@ impl ClusterFsm {
                      non-empty, <= MAX_MEMBERS, ids increasing",
                 );
                 ClusterKind::SnapshotReport
+            }
+            ClusterCommand::RowGenesis(g) => {
+                encode_row_genesis(g, out);
+                ClusterKind::RowGenesis
             }
         }
     }
@@ -495,8 +547,23 @@ impl RawStateMachine for ClusterFsm {
                 self.state.settings.datagram_mtu = keep;
                 self.state.settings_position = ctx.position;
             }
-            ClusterCommand::UpgradePin(p) => self.state.push_pin(p),
+            ClusterCommand::UpgradePin(p) => {
+                self.state.push_pin(p);
+                // #33 spec §4.1: a pin also sets the row's running version.
+                self.state.running[p.row as usize] = Some(RowRunning {
+                    row: p.row,
+                    version: p.to,
+                    record_pos: ctx.position,
+                });
+            }
             ClusterCommand::SnapshotReport(r) => self.state.put_report(r),
+            ClusterCommand::RowGenesis(g) => {
+                self.state.running[g.row as usize] = Some(RowRunning {
+                    row: g.row,
+                    version: g.version,
+                    record_pos: ctx.position,
+                });
+            }
         }
         out.push(0);
     }
@@ -514,6 +581,8 @@ impl RawStateMachine for ClusterFsm {
             Some(5) => {
                 encode_report_list(&self.state.reports, out).expect("held reports are encodable");
             }
+            // #33: the running list, one entry per recorded row, row order.
+            Some(6) => encode_running_list(&self.running_list(), out),
             _ => {}
         }
     }
@@ -528,7 +597,8 @@ impl RawStateMachine for ClusterFsm {
 /// (u32 len ‖ encode_schedule_table) ‖ settings (one whole record — the
 /// decoder accepts a v1 or a v2 one, `SETTINGS_LEN_V1` or `SETTINGS_LEN`) ‖
 /// pins (u32 len ‖ `encode_pin_list`) ‖ reports (u32 len ‖
-/// `encode_report_list`) ‖ crc32 of everything before it. The two blobs are
+/// `encode_report_list`) ‖ running (u32 len ‖ `encode_running_list`, #33,
+/// layout **v3**) ‖ crc32 of everything before it. The pin and report blobs are
 /// image layout **v2** (plan B1): a v1 image — one a `2.12.0` node wrote
 /// before this release, which a restarting node still reads off its own
 /// disk — carries neither and installs with both histories EMPTY, the same
@@ -554,6 +624,8 @@ impl SnapshotStateMachine for ClusterFsm {
         let mut reports = Vec::new();
         encode_report_list(&self.state.reports, &mut reports)
             .ok_or_else(|| SnapshotError::Codec("cluster image: unencodable report".into()))?;
+        let mut running = Vec::new();
+        encode_running_list(&self.running_list(), &mut running);
         let mut img = Vec::new();
         encode_cluster_image(
             &ClusterImageParts {
@@ -565,9 +637,7 @@ impl SnapshotStateMachine for ClusterFsm {
                 settings: &s,
                 pins: &pins,
                 reports: &reports,
-                // Task 4 fills this in with the per-row running-version
-                // records; this task owns the codec only.
-                running: &[],
+                running: &running,
             },
             &mut img,
         )
@@ -632,6 +702,33 @@ impl SnapshotStateMachine for ClusterFsm {
         let pins = decode_pin_list(parts.pins).ok_or_else(|| bad("cluster image pins"))?;
         let reports =
             decode_report_list(parts.reports).ok_or_else(|| bad("cluster image reports"))?;
+        let mut running = [None; CNC_MAX_SERVICES];
+        if parts.running.is_empty() {
+            // v1/v2 image (#33 spec §5.3): a pinned row runs its newest pin's
+            // `to`; the pin's own record position is not in the image, so use
+            // `applied` — at or above it, which is all attach needs. A row
+            // with no pin stays `None`, for the leader's genesis to fill. A
+            // v3 image with no rows recorded also has an empty blob and lands
+            // here too, harmlessly: such an image also holds no pins.
+            for (row, slot) in running.iter_mut().enumerate() {
+                let row = row as u8;
+                if let Some(p) = pins.iter().rev().find(|p| p.row == row) {
+                    *slot = Some(RowRunning {
+                        row,
+                        version: p.to,
+                        record_pos: parts.applied,
+                    });
+                }
+            }
+        } else {
+            // The decoder refuses an out-of-range or repeated row, so
+            // indexing by `r.row` is in bounds and never overwrites.
+            for r in
+                decode_running_list(parts.running).ok_or_else(|| bad("cluster image running"))?
+            {
+                running[r.row as usize] = Some(r);
+            }
+        }
         self.state = ClusterState {
             membership,
             table,
@@ -641,6 +738,7 @@ impl SnapshotStateMachine for ClusterFsm {
             applied: parts.applied,
             pins,
             reports,
+            running,
         };
         Ok(parts.applied)
     }
@@ -691,6 +789,12 @@ pub struct ClusterView {
     /// the other settings scalars for the same reason — the sender agent
     /// reads it per pass with one load and no lock.
     pub datagram_mtu: AtomicU32,
+    /// #33: bit `r` set ⇔ row `r` has a running version. Stored by
+    /// [`Self::publish`] AFTER the structured parts (so a reader that sees a
+    /// bit and then locks finds the row's entry) and BEFORE `position`. One
+    /// load answers "does this row have a version yet?" without the lock —
+    /// the genesis trigger's question (spec §6.1).
+    pub versioned: AtomicU8,
     inner: Mutex<ClusterViewInner>,
 }
 
@@ -706,6 +810,9 @@ pub struct ClusterViewInner {
     /// behind it.
     pub pins: Vec<UpgradePin>,
     pub reports: Vec<SnapshotReport>,
+    /// #33: the per-row running versions, under the same lock for the same
+    /// reason — the pin door validates against [`ClusterView::to_state`].
+    pub running: [Option<RowRunning>; CNC_MAX_SERVICES],
 }
 
 impl ClusterView {
@@ -722,20 +829,23 @@ impl ClusterView {
             snapshot_interval_bytes: AtomicU64::new(0),
             snapshot_target: AtomicU8::new(0),
             datagram_mtu: AtomicU32::new(0),
+            versioned: AtomicU8::new(0),
             inner: Mutex::new(ClusterViewInner {
                 membership: genesis.membership.clone(),
                 table: genesis.table.clone(),
                 table_position: genesis.table_position,
                 pins: genesis.pins.clone(),
                 reports: genesis.reports.clone(),
+                running: genesis.running,
             }),
         };
         v.publish(genesis);
         v
     }
 
-    /// Structured parts first, position LAST with Release, so a reader that
-    /// sees the new position and then locks sees the new inner.
+    /// Structured parts first, then `versioned` (#33), position LAST with
+    /// Release, so a reader that sees the new position (or a `versioned`
+    /// bit) and then locks sees the new inner.
     pub fn publish(&self, st: &ClusterState) {
         {
             let mut g = self.inner.lock().unwrap();
@@ -744,7 +854,15 @@ impl ClusterView {
             g.table_position = st.table_position;
             g.pins.clone_from(&st.pins);
             g.reports.clone_from(&st.reports);
+            g.running = st.running;
         }
+        let mask = st
+            .running
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.is_some())
+            .fold(0u8, |m, (i, _)| m | (1 << i));
+        self.versioned.store(mask, Ordering::Release);
         self.settings_position
             .store(st.settings_position, Ordering::Release);
         self.admission_bytes
@@ -772,6 +890,19 @@ impl ClusterView {
     /// the caller having checked that first.
     pub fn note_consumed(&self, applied: u64) {
         self.consumed.fetch_max(applied, Ordering::Release);
+    }
+
+    /// #33: one row's running version, under the inner lock (pin door,
+    /// genesis) — a scalar read, like [`Self::report_position_for`], rather
+    /// than a whole [`Self::to_state`] clone.
+    pub fn running_for(&self, row: u8) -> Option<RowRunning> {
+        self.inner
+            .lock()
+            .unwrap()
+            .running
+            .get(row as usize)
+            .copied()
+            .flatten()
     }
 
     pub fn snapshot_inner(&self) -> ClusterViewInner {
@@ -830,6 +961,7 @@ impl ClusterView {
             applied: self.position.load(Ordering::Acquire),
             pins: inner.pins,
             reports: inner.reports,
+            running: inner.running,
         }
     }
     pub fn membership(&self) -> ClusterConfig {
@@ -842,10 +974,12 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     use uc_consensus::config::{Addr, ClusterConfig, ConfigOp};
+    use uc_protocol::identity::pack_version;
     use uc_protocol::v2::frame::{CLUSTER_BODY_PREFIX_LEN, write_cluster_prefix};
     use uc_protocol::v2::schedule::{ScheduleEntry, ScheduleRule};
     use uc_protocol::v2::upgrade::{
-        SnapshotReport, UpgradePin, Verdict, decode_pin_list, decode_report_list, verdict,
+        RowGenesis, RowRunning, SnapshotReport, UpgradePin, Verdict, decode_pin_list,
+        decode_report_list, decode_running_list, verdict,
     };
     use uc_service::{ApplyCtx, RawStateMachine, SnapshotStateMachine};
 
@@ -864,6 +998,7 @@ mod tests {
             applied: 0,
             pins: vec![],
             reports: vec![],
+            running: [None; CNC_MAX_SERVICES],
         }
     }
     /// `Addr = (ip: u32 network-order, port: u16)` — the same encoding
@@ -1409,22 +1544,31 @@ mod tests {
 
     #[test]
     fn pin_refusals_are_replicated_state_only() {
+        // #33: versions are packed on distinct LINES here, because 53 is now
+        // `same_line(from, running)` (patch ignored) rather than the old exact
+        // `from == previous pin's to` — bare 1/2/3 are all line 0.0.
+        let (v1, v2, v3) = (
+            pack_version(1, 0, 0),
+            pack_version(2, 0, 0),
+            pack_version(3, 0, 0),
+        );
         let mut f = fsm();
-        assert_eq!(apply_at(&mut f, 100, &pin(0, 1, 2, 50)), 0);
+        assert_eq!(apply_at(&mut f, 100, &pin(0, v1, v2, 50)), 0);
         // 55: origin not above the row's current pin (equal, then below).
-        assert_eq!(apply_at(&mut f, 200, &pin(0, 2, 3, 50)), 55);
-        assert_eq!(apply_at(&mut f, 300, &pin(0, 2, 3, 40)), 55);
-        // 53: `from` is not what the row's pin says it is at.
-        assert_eq!(apply_at(&mut f, 400, &pin(0, 1, 3, 90)), 53);
-        // A row with NO pin accepts any `from` here — that half of 53 is
-        // the leader's door check against the attached version word.
+        assert_eq!(apply_at(&mut f, 200, &pin(0, v2, v3, 50)), 55);
+        assert_eq!(apply_at(&mut f, 300, &pin(0, v2, v3, 40)), 55);
+        // 53: `from` is not on the line the row runs (the last pin's `to`).
+        assert_eq!(apply_at(&mut f, 400, &pin(0, v1, v3, 90)), 53);
+        // A row with NO running version accepts any `from` here — that half
+        // of 53 is the leader's door check against the attached version word.
         assert_eq!(apply_at(&mut f, 500, &pin(1, 42, 43, 90)), 0);
         assert_eq!(f.state().applied, 500, "a refusal still advances applied");
         assert_eq!(
             f.state().pin_for(0).map(|p| p.to),
-            Some(2),
+            Some(v2),
             "nothing changed on refusal"
         );
+        assert_eq!(f.state().running_for(0).map(|r| r.version), Some(v2));
     }
 
     #[test]
@@ -1533,6 +1677,222 @@ mod tests {
         assert_eq!(decode_pin_list(&out).unwrap(), f.state().pins);
         f.query(&[5], &mut out);
         assert_eq!(decode_report_list(&out).unwrap(), vec![]);
+    }
+
+    // ------------------------------------------------------ #33 running version
+
+    fn genesis_cmd(row: u8, version: u32) -> ClusterCommand {
+        ClusterCommand::RowGenesis(RowGenesis { row, version })
+    }
+
+    /// A version-2 image (plan B1's layout: pins and reports, no `running`
+    /// blob) holding one pin. Provenance: `encode_cluster_image` writes v3,
+    /// whose only difference from v2 is the trailing `u32` running-length
+    /// prefix (plus its bytes, empty here) before the CRC, and the version
+    /// word — so this takes a v3 image with an EMPTY running blob, drops that
+    /// 4-byte zero prefix, writes version 2 and re-seals the CRC. That is
+    /// byte-for-byte the v2 framing `uc_protocol`'s `PLAN_B1_V2_FIXTURE`
+    /// pins (test-module constants are not reachable from this crate).
+    fn v2_image_with_pin(p: UpgradePin, applied: u64) -> Vec<u8> {
+        let mut m = Vec::new();
+        encode_config(&cluster_to_wire(&genesis().membership, 0), &mut m);
+        let mut t = Vec::new();
+        encode_schedule_table(&ScheduleTable { entries: vec![] }, &mut t);
+        let mut s = Vec::new();
+        encode_settings(&Settings::genesis_default(), &mut s);
+        let mut pins = Vec::new();
+        encode_pin_list(&[p], &mut pins);
+        let mut img = Vec::new();
+        encode_cluster_image(
+            &ClusterImageParts {
+                applied,
+                table_position: 0,
+                settings_position: 0,
+                membership: &m,
+                table: &t,
+                settings: &s,
+                pins: &pins,
+                reports: &[],
+                running: &[],
+            },
+            &mut img,
+        )
+        .unwrap();
+        // Strip the CRC and the empty running blob's zero length prefix.
+        img.truncate(img.len() - 4);
+        let prefix = img.split_off(img.len() - 4);
+        assert_eq!(prefix, 0u32.to_le_bytes(), "empty running blob");
+        img[8..12].copy_from_slice(&2u32.to_le_bytes());
+        let crc = crc32fast::hash(&img);
+        img.extend_from_slice(&crc.to_le_bytes());
+        img
+    }
+
+    #[test]
+    fn genesis_sets_a_rows_running_version_once_and_refuses_60_after() {
+        let mut f = fsm();
+        assert_eq!(f.state().running_for(1), None);
+        assert_eq!(
+            apply_at(&mut f, 640, &genesis_cmd(1, pack_version(1, 0, 0))),
+            0
+        );
+        assert_eq!(
+            f.state().running_for(1),
+            Some(RowRunning {
+                row: 1,
+                version: pack_version(1, 0, 0),
+                record_pos: 640
+            })
+        );
+        assert_eq!(
+            apply_at(&mut f, 1280, &genesis_cmd(1, pack_version(2, 0, 0))),
+            60
+        );
+        assert_eq!(ClusterRefusal::VersionAlreadySet.reason_code(), 60);
+        assert_eq!(
+            f.state().running_for(1).unwrap(),
+            RowRunning {
+                row: 1,
+                version: pack_version(1, 0, 0),
+                record_pos: 640
+            },
+            "a refused record changes nothing"
+        );
+        assert_eq!(f.state().applied, 1280, "a refusal still advances applied");
+        // `Some(0)` is a recorded unversioned FSM, distinct from `None` (D4).
+        assert_eq!(apply_at(&mut f, 1920, &genesis_cmd(2, 0)), 0);
+        assert_eq!(f.state().running_for(2).map(|r| r.version), Some(0));
+        assert_eq!(apply_at(&mut f, 2560, &genesis_cmd(2, 0)), 60);
+    }
+
+    #[test]
+    fn a_pin_sets_running_and_must_start_from_the_running_line() {
+        let mut f = fsm();
+        assert_eq!(
+            apply_at(&mut f, 640, &genesis_cmd(0, pack_version(1, 4, 2))),
+            0
+        );
+        // Off the running line (1.3 vs 1.4): refused 53, and nothing moves.
+        let off_line = pin(0, pack_version(1, 3, 0), pack_version(2, 0, 0), 512);
+        assert_eq!(apply_at(&mut f, 1280, &off_line), 53);
+        assert_eq!(f.state().pin_for(0), None, "refused: no pin recorded");
+        assert_eq!(
+            f.state().running_for(0).unwrap().record_pos,
+            640,
+            "refused: running untouched"
+        );
+        // Same line, different patch: accepted (D3), and running follows `to`.
+        let patch_from = pin(0, pack_version(1, 4, 7), pack_version(2, 0, 0), 512);
+        assert_eq!(apply_at(&mut f, 1920, &patch_from), 0);
+        assert_eq!(
+            f.state().running_for(0).unwrap(),
+            RowRunning {
+                row: 0,
+                version: pack_version(2, 0, 0),
+                record_pos: 1920
+            }
+        );
+        // Rollback is just another pin, from the running line (spec §4.1).
+        let back = pin(0, pack_version(2, 0, 0), pack_version(1, 4, 2), 1024);
+        assert_eq!(apply_at(&mut f, 2560, &back), 0);
+        assert_eq!(
+            f.state().running_for(0).map(|r| (r.version, r.record_pos)),
+            Some((pack_version(1, 4, 2), 2560))
+        );
+        // A pin on a row with NO running version sets it (the door owns the
+        // attached-word check for that case).
+        assert_eq!(
+            apply_at(&mut f, 3200, &pin(3, 9, pack_version(0, 2, 0), 64)),
+            0
+        );
+        assert_eq!(
+            f.state().running_for(3).map(|r| r.version),
+            Some(pack_version(0, 2, 0))
+        );
+        // A pin refused 55 (origin not monotone) leaves running alone too.
+        let stale = pin(0, pack_version(1, 4, 2), pack_version(3, 0, 0), 1024);
+        assert_eq!(apply_at(&mut f, 3840, &stale), 55);
+        assert_eq!(
+            f.state().running_for(0).map(|r| r.version),
+            Some(pack_version(1, 4, 2))
+        );
+    }
+
+    #[test]
+    fn freeze_install_round_trips_running_and_a_v2_image_migrates_from_pins() {
+        let mut f = fsm();
+        apply_at(&mut f, 640, &genesis_cmd(2, 7));
+        apply_at(&mut f, 1280, &genesis_cmd(0, pack_version(1, 0, 0)));
+        let (img, pos) = f.freeze().unwrap();
+        let mut g = fsm();
+        g.install_snapshot(pos, &mut &img[..]).unwrap();
+        assert_eq!(g.state().running, f.state().running);
+        assert_eq!(g.state(), f.state());
+        // v2 image with a pin for row 0 and nothing for row 1: row 0 migrates
+        // to the pin's `to` at record_pos = applied; row 1 stays None.
+        let img_v2 = v2_image_with_pin(
+            UpgradePin {
+                row: 0,
+                from: 1,
+                to: 2,
+                origin: 512,
+            },
+            4096,
+        );
+        let mut h = fsm();
+        h.install_snapshot(4096, &mut &img_v2[..]).unwrap();
+        assert_eq!(
+            h.state().running_for(0),
+            Some(RowRunning {
+                row: 0,
+                version: 2,
+                record_pos: 4096
+            })
+        );
+        assert_eq!(h.state().running_for(1), None);
+        assert_eq!(h.state().pin_for(0).map(|p| p.to), Some(2));
+    }
+
+    #[test]
+    fn query_6_returns_the_running_list() {
+        let mut f = fsm();
+        apply_at(&mut f, 640, &genesis_cmd(3, 5));
+        apply_at(&mut f, 1280, &genesis_cmd(1, 9));
+        let mut out = Vec::new();
+        f.query(&[6], &mut out);
+        assert_eq!(
+            decode_running_list(&out).unwrap(),
+            vec![
+                RowRunning {
+                    row: 1,
+                    version: 9,
+                    record_pos: 1280
+                },
+                RowRunning {
+                    row: 3,
+                    version: 5,
+                    record_pos: 640
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn the_view_publishes_running_and_the_versioned_mask() {
+        let mut f = fsm();
+        let v = ClusterView::new(f.state());
+        assert_eq!(v.versioned.load(Ordering::Acquire), 0);
+        assert_eq!(v.running_for(0), None);
+        apply_at(&mut f, 640, &genesis_cmd(0, 4));
+        apply_at(&mut f, 1280, &genesis_cmd(5, 0));
+        v.publish(f.state());
+        assert_eq!(v.versioned.load(Ordering::Acquire), 0b0010_0001);
+        assert_eq!(v.running_for(5), f.state().running_for(5));
+        assert_eq!(v.running_for(1), None);
+        assert_eq!(v.to_state(), *f.state());
+        // `new` publishes too: a recovered state's mask is live at once.
+        let w = ClusterView::new(f.state());
+        assert_eq!(w.versioned.load(Ordering::Acquire), 0b0010_0001);
     }
 
     #[test]
