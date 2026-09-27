@@ -139,6 +139,24 @@ pub(crate) fn stop_fail(name: &str, running: u32, at: u64, mine: u32) -> ! {
     panic!("{}", stop_message(name, running, at, mine))
 }
 
+/// The whole stop, out of line so the apply loop's arm stays a type test and
+/// two calls: publish `applied = at` (every frame before the record applied,
+/// nothing after), release the SM guard (a fail-stop must not poison the SM
+/// mutex the query path locks), then [`stop_fail`].
+#[cold]
+#[inline(never)]
+pub(crate) fn stop_at_record<S: crate::traits::RawStateMachine>(
+    guard: std::sync::MutexGuard<'_, S>,
+    cnc: &CncPage,
+    row: u8,
+    running: u32,
+    at: u64,
+) -> ! {
+    crate::attach::slot(cnc, row).applied.store_release(at);
+    drop(guard);
+    stop_fail(S::IDENTITY.name.as_str(), running, at, S::VERSION)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

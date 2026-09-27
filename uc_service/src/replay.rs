@@ -589,11 +589,7 @@ pub(crate) fn replay_into<S: RawStateMachine>(
 
     if let Some((running, at)) = stop_at {
         // Every frame below the record applied, nothing at or after it.
-        crate::attach::slot(cnc, instant.service_id)
-            .applied
-            .store_release(at);
-        drop(guard);
-        crate::version_gate::stop_fail(S::IDENTITY.name.as_str(), running, at, S::VERSION);
+        crate::version_gate::stop_at_record(guard, cnc, instant.service_id, running, at);
     }
     Ok(Replay::Rejoin(cursor))
 }

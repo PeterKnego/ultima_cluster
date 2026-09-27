@@ -657,15 +657,12 @@ pub(crate) fn apply_cycle<S: RawStateMachine>(st: &mut ApplyState<S>) -> bool {
                             &hdr,
                             payload,
                         ) {
-                            crate::attach::slot(&st.cnc, st.service_id)
-                                .applied
-                                .store_release(pos);
-                            drop(sm); // fail-stop without poisoning the SM mutex
-                            crate::version_gate::stop_fail(
-                                S::IDENTITY.name.as_str(),
+                            crate::version_gate::stop_at_record(
+                                sm,
+                                &st.cnc,
+                                st.service_id,
                                 running,
                                 pos,
-                                S::VERSION,
                             );
                         }
                     }
