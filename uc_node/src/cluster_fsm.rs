@@ -565,6 +565,9 @@ impl SnapshotStateMachine for ClusterFsm {
                 settings: &s,
                 pins: &pins,
                 reports: &reports,
+                // Task 4 fills this in with the per-row running-version
+                // records; this task owns the codec only.
+                running: &[],
             },
             &mut img,
         )
