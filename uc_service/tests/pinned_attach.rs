@@ -293,10 +293,10 @@ impl Fixture {
         f
     }
 
-    /// [`Fixture::build`] with the v1 service still ATTACHED and handed back.
-    /// One test needs the v1 era to continue past the pin — that is the
-    /// window spec §3 S4 describes, and it is the window in which a cadence
-    /// instant can land.
+    /// [`Fixture::build`] with the v1 service still ATTACHED and handed back,
+    /// for the tests that commit a REAL pin while v1 runs. Since #33 that
+    /// v1 stops at the pin record ([`wait_stopped_at_the_pin`]); before it,
+    /// v1 kept applying past the pin (spec §3 S4's window, now closed).
     fn build_with_v1(app: &'static str, spec: Spec) -> (Fixture, Service<RegisterSm>) {
         let dir = tempdir();
         let node = start_node(dir.path(), app, spec.purge, spec.segment_bytes);
@@ -504,6 +504,15 @@ fn artifact_path(dir: &Path, p: u64) -> std::path::PathBuf {
     dir.join("snapshots")
         .join("0")
         .join(format!("snap-{p}.ultsnap"))
+}
+
+/// #33 spec §7.2: a service still attached when a pin to another LINE
+/// commits stops at exactly the pin record — its apply thread fail-stops
+/// (`version_superseded`), so `Service::stop` would re-raise that panic.
+/// Wait for the stop, then drop the handle (which joins without re-raising).
+fn wait_stopped_at_the_pin(svc: Service<RegisterSm>) {
+    wait_until("v1 stopped at the pin record (#33)", || !svc.is_alive());
+    drop(svc);
 }
 
 // --------------------------------------------------------------------- tests
@@ -946,23 +955,30 @@ fn a_pinned_attach_prefers_the_origin_over_a_later_artifact() {
     f.stop();
 }
 
-/// Plan B2 T5 (fix round), the REAL shape the test above constructs by hand:
-/// purge on, a real `uc2ctl upgrade pin`, and then a real cadence instant at
-/// **P2 > origin** taken while v1 is STILL ATTACHED — the window spec §3 S4
-/// describes, in which `from` keeps applying between the pin and the swap.
+/// Plan B2 T5 (fix round): purge on, a real `uc2ctl upgrade pin`, and then a
+/// real cadence instant at **P2 > origin**.
 ///
-/// Two things have to hold and neither did before this round:
+/// Before #33 this instant was taken while v1 was STILL APPLYING — the window
+/// spec §3 S4 described, in which `from` kept applying between the pin and
+/// the swap and built `snap-P2` itself, so the node's floor hold
+/// (`Consensus::hold_floor_for_pins`) and the service's preference for the
+/// pinned origin over `snap-P2` were both load-bearing here. #33 (spec §7.2)
+/// CLOSES that window: an attached v1 stops at exactly the pin record, so
+/// `from` builds nothing above it. What this test now pins:
 ///
-/// * the NODE must not let its snapshot floor — and the journal purge behind
-///   it — pass a pinned origin it has not consumed
-///   (`Consensus::hold_floor_for_pins`). Without that, `archive_first_base`
-///   climbs past the origin and the pinned attach's tail replay has no
-///   covering artifact it may install;
-/// * the SERVICE's gap guard must then prefer the pinned origin over
-///   `snap-P2`, which v1 built (plan B2 T5's `replay.rs` change).
+/// * v1 stops at the pin (it does not keep applying);
+/// * the instant at P2 therefore finds no row-0 builder — no `snap-P2`, no
+///   complete set at P2, and the journal the pinned attach replays from
+///   stays (`archive_first_base <= origin`);
+/// * the pinned attach converges (`Some(CAS_NEW)`).
+///
+/// The origin-over-a-later-`from`-artifact preference stays covered by
+/// [`a_pinned_attach_prefers_the_origin_over_a_later_artifact`], which
+/// constructs that artifact by hand.
 ///
 /// The pin goes in through admin op 10 rather than [`Fixture::pin`] because
-/// the node's hold reads the COMMITTED view.
+/// only a COMMITTED pin is a version record the apply loop acts on, and the
+/// node's hold reads the committed view.
 #[test]
 fn a_pinned_attach_survives_a_cadence_instant_after_the_pin() {
     let (f, svc1) = Fixture::build_with_v1("pin-cadence", Spec::purging());
@@ -982,29 +998,30 @@ fn a_pinned_attach_survives_a_cadence_instant_after_the_pin() {
                 to: V2,
             }
     });
+    wait_stopped_at_the_pin(svc1);
 
-    // The cadence instant, with v1 still attached: `snap-P2` is built by
-    // `from`, and the set at P2 completes.
+    // The cadence instant, with v1 stopped at the pin: nothing on row 0 can
+    // build `snap-P2`, so the set at P2 never completes on this node.
     let p2 = command_instant(&f.node);
     assert!(p2 > origin, "P2={p2} must sit above the origin={origin}");
-    wait_until("row 0 published snap-P2", || {
-        artifact_path(f.path(), p2).is_file()
-    });
-    wait_until("the set at P2 is this node's newest", || {
-        f.node.snapshot_set_position() == p2
-    });
     // Give the floor tick every chance to move (it is throttled to 100 ms and
-    // the purge behind it is asynchronous): if the hold is missing, this is
-    // where `archive_first_base` climbs past the origin.
+    // the purge behind it is asynchronous).
     std::thread::sleep(Duration::from_millis(500));
     assert!(
+        !artifact_path(f.path(), p2).is_file(),
+        "a stopped `from` must not build snap-P2 above its pin"
+    );
+    assert!(
+        f.node.snapshot_set_position() < p2,
+        "no complete set at P2 without a row-0 artifact"
+    );
+    assert!(
         f.node.archive_first_base() <= origin,
-        "the floor hold must keep the journal the pinned attach replays from: \
+        "the journal the pinned attach replays from must stay: \
          archive_first_base={} origin={origin} P2={p2}",
         f.node.archive_first_base()
     );
 
-    svc1.stop();
     let svc2 = ServiceBuilder::new(cfg(f.path(), f.app), DoublingRegisterSm::default())
         .start_with_snapshots()
         .unwrap();
@@ -1012,7 +1029,7 @@ fn a_pinned_attach_survives_a_cadence_instant_after_the_pin() {
     assert_eq!(
         query_v2(&svc2),
         Some(CAS_NEW),
-        "a pinned attach converges even though `from` took an instant after the pin"
+        "a pinned attach converges after an instant above the pin"
     );
     assert_eq!(svc2.pinned(), Some((origin, V1, V2)));
     svc2.stop();
@@ -1126,7 +1143,7 @@ fn a_restarted_node_publishes_the_pin_before_the_declared_set() {
 
     let old_instance = cnc.try_meta().expect("meta").instance_id;
     drop(cnc);
-    svc1.stop();
+    wait_stopped_at_the_pin(svc1);
     node.stop();
 
     // The watcher: spin until a page with a NEW `instance_id` publishes a
@@ -1223,7 +1240,7 @@ fn a_pin_above_the_recovered_artifact_is_published_before_the_declared_set() {
 
     let old_instance = cnc.try_meta().expect("meta").instance_id;
     drop(cnc);
-    svc1.stop();
+    wait_stopped_at_the_pin(svc1);
     node.stop();
 
     // The watcher: spin until a page with a NEW `instance_id` publishes a

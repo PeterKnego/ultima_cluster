@@ -51,6 +51,7 @@ pub mod snapshots;
 pub mod tagged;
 mod timed;
 mod traits;
+mod version_gate;
 
 use std::sync::Arc;
 use std::sync::Mutex;

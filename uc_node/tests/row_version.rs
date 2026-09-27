@@ -427,21 +427,57 @@ fn the_leader_records_its_attached_version_as_genesis() {
 /// stopped at the genesis record, so the survivors start v2, and the value
 /// reads 15.
 ///
-/// The value check comes FIRST, so today's tree fails on the loss itself; the
-/// "every v1 was refused or stopped" check follows it as the second line of
-/// defence once the fix lands.
+/// The value check comes FIRST, so a tree without the fix fails on the loss
+/// itself; the "every v1 was refused or stopped, at exactly the record"
+/// checks follow it as the second line of defence.
+///
+/// Leadership robustness (Task 9): the scenario needs the v2 node to lead
+/// from `wait_leader` until both acks. If leadership moves before then —
+/// genesis records a v1 build, or the acks never come from the v2 node — the
+/// PRECONDITION failed, not the property, and the scenario reruns on a fresh
+/// cluster (at most three times). An ack that did come is never retried
+/// away: a wrong `Append` answer fails at once.
 #[test]
-#[ignore = "#33: un-ignored in Task 12"]
 fn a_mixed_version_row_never_loses_an_acknowledged_write() {
-    let c = three_node_cluster("rowver33");
+    for attempt in 1..=3 {
+        match mixed_version_scenario(&format!("rowver33-{attempt}")) {
+            Ok(()) => return,
+            Err(why) => eprintln!("attempt {attempt}: leadership moved ({why}); rerunning"),
+        }
+    }
+    panic!("leadership moved before the acks on three fresh clusters");
+}
+
+/// One run of the #33 scenario. `Err` = leadership moved before the acks
+/// (the precondition, not the property); every property failure panics.
+fn mixed_version_scenario(app: &str) -> Result<(), String> {
+    let c = three_node_cluster(app);
     let leader = c.wait_leader();
     // Followers FIRST, so they are attached before the genesis record
     // commits (Review Focus 3).
     let mut followers_v1: Vec<_> = c.others(leader).map(|i| c.try_start::<KvV1>(i)).collect();
-    let leader_v2 = c.start::<KvV2>(leader);
+    let leader_v2 = match c.try_start::<KvV2>(leader).result {
+        Ok(s) => s,
+        // Only a v1 node leading first records genesis at 1.0.
+        Err(e) => return Err(format!("v2 refused on node {leader}: {e}")),
+    };
+    c.wait_versioned(leader, 0);
+    match c.page(leader).service_slot(0).status.row_view() {
+        uc_log::cnc::RowRead::View {
+            running: Some(v), ..
+        } if v == pack_version(2, 0, 0) => {}
+        other => return Err(format!("genesis was not the v2 node's: {other:?}")),
+    }
     let client = c.client(leader);
-    assert_eq!(client.submit(&put(10)).expect("put acked"), vec![0]);
-    assert_eq!(client.submit(&append(5)).expect("append acked"), vec![0]);
+    for (what, cmd) in [("put", put(10)), ("append", append(5))] {
+        match client.submit(&cmd) {
+            Ok(r) => assert_eq!(r, vec![0], "{what} acked with an error"),
+            Err(e) if c.wait_leader() != leader => {
+                return Err(format!("{what} not acked ({e:?}); leader moved"));
+            }
+            Err(e) => panic!("{what} not acked, leader unchanged: {e:?}"),
+        }
+    }
     drop(client);
 
     // Stop the leader first; a survivor leads.
@@ -449,38 +485,53 @@ fn a_mixed_version_row_never_loses_an_acknowledged_write() {
     drop(leader_v2);
     let new_leader = c.wait_leader();
 
+    // Each v1 attempt's verdict (refused or stopped?), with its Debug line —
+    // gathered BEFORE reading `is_alive()` below: a v1 follower meets the
+    // genesis record only once its node learns that commit, which may be
+    // only after the new leader's first commit, so an instantaneous
+    // `is_alive()` right after the election could still read true on a tree
+    // with the fix. On a tree without it this costs the 10 s wait.
+    let verdicts: Vec<(bool, String)> = followers_v1
+        .iter()
+        .map(|a| {
+            (
+                a.is_refused_or_stopped_within(Duration::from_secs(10)),
+                format!("{a:?}"),
+            )
+        })
+        .collect();
     let new_leader_v1_alive = followers_v1
         .iter()
         .find(|a| a.node == new_leader)
         .and_then(|a| a.result.as_ref().ok())
         .is_some_and(|s| s.is_alive());
-    // Each v1 attempt's verdict (refused or stopped?), with its Debug line.
-    let verdicts: Vec<(bool, String)>;
     let _v2s: Vec<uc_service::Service<KvV2>>;
     let got = if new_leader_v1_alive {
-        // Today's tree: the v1 build still serves the row on the new leader.
-        let got = c.client(new_leader).query_u64();
-        verdicts = followers_v1
-            .iter()
-            .map(|a| {
-                (
-                    a.is_refused_or_stopped_within(Duration::from_secs(10)),
-                    format!("{a:?}"),
-                )
-            })
-            .collect();
-        got
+        // No fix: the v1 build still serves the row on the new leader.
+        c.client(new_leader).query_u64()
     } else {
-        // The fix stopped or refused v1: bring v2 up on both survivors.
-        verdicts = followers_v1
-            .iter()
-            .map(|a| {
-                (
-                    a.is_refused_or_stopped_within(Duration::from_secs(10)),
-                    format!("{a:?}"),
-                )
-            })
-            .collect();
+        // Spec §4.3: a stopped v1 stopped at EXACTLY the record — its slot's
+        // `applied` is the genesis frame's START (every earlier frame, none
+        // after). Read before any v2 attaches and rewrites the slot.
+        let genesis_len = uc_protocol::v2::frame::align_frame_len(
+            uc_protocol::v2::frame::HEADER_LEN
+                + uc_protocol::v2::frame::CLUSTER_BODY_PREFIX_LEN
+                + uc_protocol::v2::upgrade::ROW_GENESIS_LEN,
+        ) as u64;
+        for a in followers_v1.iter().filter(|a| a.result.is_ok()) {
+            let page = c.page(a.node);
+            let uc_log::cnc::RowRead::View { record_pos, .. } =
+                page.service_slot(0).status.row_view()
+            else {
+                panic!("node {}: row view contended", a.node);
+            };
+            assert_eq!(
+                page.service_slot(0).applied.load_acquire(),
+                record_pos - genesis_len,
+                "node {}'s v1 must stop at exactly the genesis record",
+                a.node
+            );
+        }
         followers_v1.clear(); // release every v1's row lock before v2 attaches
         _v2s = c.others(leader).map(|i| c.start::<KvV2>(i)).collect();
         c.client(new_leader).query_u64()
@@ -494,6 +545,28 @@ fn a_mixed_version_row_never_loses_an_acknowledged_write() {
             "a v1 service is still applying a row that runs 2.0: {dbg}"
         );
     }
+    Ok(())
+}
+
+/// #33 Review Focus 2: attach records `attach_record_pos` = the record's
+/// end, so a matching binary restarted after the record never re-adjudicates
+/// it. (KvV2 on every node — leader-move robustness, as elsewhere here.)
+#[test]
+fn a_restart_after_the_stop_is_covered_by_attach() {
+    let c = three_node_cluster("rowrestart");
+    let leader = c.wait_leader();
+    let mut svcs: Vec<Option<uc_service::Service<KvV2>>> =
+        c.start_all::<KvV2>().into_iter().map(Some).collect();
+    c.wait_versioned(leader, 0);
+    drop(svcs[leader].take());
+    let s2 = c.start::<KvV2>(leader);
+    let now = c.wait_leader();
+    let client = c.client(now);
+    assert_eq!(client.submit(&put(3)).unwrap(), vec![0]);
+    assert!(
+        s2.is_alive(),
+        "a matching restart must not stop at the genesis record"
+    );
 }
 
 // ------------------------------------------------------------ attach

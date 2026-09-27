@@ -1631,6 +1631,7 @@ dependencies = [
  "uc_log",
  "uc_net",
  "uc_node",
+ "uc_obs",
  "uc_protocol",
 ]
 

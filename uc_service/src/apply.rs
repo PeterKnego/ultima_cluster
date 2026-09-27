@@ -21,8 +21,8 @@ use uc_log::reader::{Batch, LogFollower};
 use uc_protocol::ring::{RingError, SpscConsumer, SpscProducer};
 use uc_protocol::v2::cnc::{NODE_FLAG_LEADER, NODE_FLAG_LEARNER};
 use uc_protocol::v2::frame::{
-    FLAG_SNAPSHOT_STANDBY, FLAG_TIMER_TABLE, FRAME_TYPE_MESSAGE, FRAME_TYPE_SNAPSHOT,
-    FRAME_TYPE_TIMER, FrameHeader, align_frame_len, read_timer_body,
+    FLAG_SNAPSHOT_STANDBY, FLAG_TIMER_TABLE, FRAME_TYPE_CLUSTER, FRAME_TYPE_MESSAGE,
+    FRAME_TYPE_SNAPSHOT, FRAME_TYPE_TIMER, FrameHeader, align_frame_len, read_timer_body,
 };
 use uc_protocol::v2::ipc::{MSG_V2_SCHED, SchedOp, SchedRecord, write_sched_record};
 
@@ -293,10 +293,6 @@ pub(crate) struct ApplyState<S: RawStateMachine> {
     pub(crate) pin: Option<(u64, u32, u32)>,
     /// #33: every version record at or below this frame-END was decided by
     /// this attach; the apply loop adjudicates only later ones.
-    #[expect(
-        dead_code,
-        reason = "#33: recorded at attach here; read by the apply-loop version arm (plan Task 9)"
-    )]
     pub(crate) attach_record_pos: u64,
     /// M14a Task 7: the lag barrier mode this incarnation runs under, fixed at
     /// attach (the page's lag config is boot-once, like `service_id`).
@@ -647,6 +643,31 @@ pub(crate) fn apply_cycle<S: RawStateMachine>(st: &mut ApplyState<S>) -> bool {
                             &st.cnc,
                             st.service_id,
                         );
+                    } else if hdr.frame_type == FRAME_TYPE_CLUSTER {
+                        // #33 spec §7.2: the type test and one out-of-line
+                        // call (M14a). A version record that superseded this
+                        // binary's line stops the service at EXACTLY `pos`:
+                        // every earlier frame applied, nothing after.
+                        if let Some(running) = crate::version_gate::on_cluster_frame(
+                            &st.cnc,
+                            st.service_id,
+                            S::VERSION,
+                            st.attach_record_pos,
+                            pos,
+                            &hdr,
+                            payload,
+                        ) {
+                            crate::attach::slot(&st.cnc, st.service_id)
+                                .applied
+                                .store_release(pos);
+                            drop(sm); // fail-stop without poisoning the SM mutex
+                            crate::version_gate::stop_fail(
+                                S::IDENTITY.name.as_str(),
+                                running,
+                                pos,
+                                S::VERSION,
+                            );
+                        }
                     }
                     if one_frame {
                         break; // lockstep: exactly one frame past the floor
