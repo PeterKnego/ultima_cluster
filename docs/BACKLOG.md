@@ -491,6 +491,26 @@ reviewer wants a workload to attack.
   because the SDD ledger and the task report that carry it today are working
   artifacts that get archived.
 - **Build `uc_starter` against the in-tree crates in `ci.yml`** (`[patch.crates-io]`), so an SDK break is caught on the PR that makes it — deferred until `uc_starter` is public (a private checkout needs a secret). Spec `docs/superpowers/specs/2026-09-24-uc-starter-design.md` §8. On publication: link it from README.md, docs/QUICKSTART.md §7 and docs/tutorials/build-an-application.md.
+- **A backward wall-clock step on the leader stalls the heartbeat-staleness
+  predicate for as long as the smear takes to retire it, not for the step's
+  own size.** `maybe_append_row_genesis` (`uc_node/src/node.rs`) — and the
+  existing service-liveness predicate it shares the comparison with — judge
+  freshness as `pass_now_ns.saturating_sub(heartbeat_ns) <
+  SERVICE_STALE_NS` (3 s, `uc_node/src/services.rs`). `heartbeat_ns` is
+  stamped from the real wall clock (`unix_ns()`, `uc_service/src/apply.rs`),
+  but `pass_now_ns` is the leader's smeared, monotonic LOG clock
+  (`uc_node::log_clock`, `2.12.0`): a backward step is never frozen but
+  retired at `SMEAR_PPM = 500` parts per million of monotonic time, so a
+  step bigger than `SERVICE_STALE_NS` leaves `pass_now_ns` reading ahead of
+  every fresh heartbeat for `step_ns / 0.0005` of real time — around 100
+  minutes to retire a 3 s step, not 3 s. Every reader of this predicate
+  (row genesis, and whatever else keys "is this row's service alive" off
+  the same comparison) waits that long. Candidate fix: read the wall clock
+  for the staleness test only when a row is unversioned (row genesis is a
+  one-time bring-up cost, not a steady-state one, so paying a real
+  `SystemTime::now()` read there does not reintroduce the ambient-clock
+  problem the log clock exists to avoid on the steady apply path). Recorded
+  2026-09-28.
 
 ## Accepted residuals — listed so they are not re-proposed
 

@@ -442,9 +442,9 @@ pub(crate) fn replay_into<S: RawStateMachine>(
         None
     };
 
-    // #33: `Some((running, record start))` once the scan meets a record that
-    // moved this row off this binary's line.
-    let mut stop_at: Option<(u32, u64)> = None;
+    // #33: `Some((running, record start, superseded_later))` once the scan
+    // meets a record that moved this row off this binary's line.
+    let mut stop_at: Option<(u32, u64, bool)> = None;
     // R13: `Some(record start)` once the scan meets a version record the
     // agent has not applied yet.
     let mut pending_at: Option<u64> = None;
@@ -547,8 +547,11 @@ pub(crate) fn replay_into<S: RawStateMachine>(
                         // below, once the SM guard can be released (a panic
                         // here would poison the SM mutex); a pending record
                         // ends the pass AT it (R13).
-                        crate::version_gate::Gate::Stop { running } => {
-                            stop_at = Some((running, pos));
+                        crate::version_gate::Gate::Stop {
+                            running,
+                            superseded_later,
+                        } => {
+                            stop_at = Some((running, pos, superseded_later));
                             return false;
                         }
                         crate::version_gate::Gate::Pending => {
@@ -603,9 +606,16 @@ pub(crate) fn replay_into<S: RawStateMachine>(
         })
         .map_err(|e| ServiceError::Replay(e.to_string()))?;
 
-    if let Some((running, at)) = stop_at {
+    if let Some((running, at, superseded_later)) = stop_at {
         // Every frame below the record applied, nothing at or after it.
-        crate::version_gate::stop_at_record(guard, cnc, instant.service_id, running, at);
+        crate::version_gate::stop_at_record(
+            guard,
+            cnc,
+            instant.service_id,
+            running,
+            at,
+            superseded_later,
+        );
     }
     if let Some(at) = pending_at {
         return Ok(Replay::AwaitVersion(at));

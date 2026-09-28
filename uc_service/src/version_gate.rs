@@ -14,7 +14,14 @@ use uc_protocol::v2::frame::{ClusterKind, FrameHeader, align_frame_len, read_clu
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Verdict {
     Continue,
-    Stop { running: u32 },
+    /// `superseded_later`: `true` when the row view's `record_pos` is past
+    /// `rec_end` — a LATER record already moved the row again, so `running`
+    /// is the row's CURRENT version, not what the record at `rec_end` set
+    /// (final review #33 follow-up, [`stop_message`]).
+    Stop {
+        running: u32,
+        superseded_later: bool,
+    },
 }
 
 /// Pure decision once the agent has applied past `rec_end`:
@@ -43,7 +50,10 @@ pub(crate) fn verdict(mine: u32, rec_end: u64, view: RowRead) -> Option<Verdict>
         if record_pos < rec_end || (record_pos == rec_end && same_line(mine, running)) {
             Verdict::Continue
         } else {
-            Verdict::Stop { running }
+            Verdict::Stop {
+                running,
+                superseded_later: record_pos > rec_end,
+            }
         },
     )
 }
@@ -66,7 +76,11 @@ pub(crate) enum Gate {
     /// accepted and on this binary's line: apply on.
     Pass,
     /// The record superseded this binary's line: stop at exactly `pos`.
-    Stop { running: u32 },
+    /// `superseded_later`: see [`Verdict::Stop`].
+    Stop {
+        running: u32,
+        superseded_later: bool,
+    },
     /// The `uc2-cluster` agent has not applied the record (or the view stayed
     /// contended) within the wait budget. The caller rewinds to `pos`,
     /// publishes `applied = pos` and ends the cycle; the next cycle re-walks
@@ -114,7 +128,13 @@ pub(crate) fn on_cluster_frame(
         {
             return match v {
                 Verdict::Continue => Gate::Pass,
-                Verdict::Stop { running } => Gate::Stop { running },
+                Verdict::Stop {
+                    running,
+                    superseded_later,
+                } => Gate::Stop {
+                    running,
+                    superseded_later,
+                },
             };
         }
         // Never sleep on a live peer (CLAUDE.md, M14a): spin, then yield,
@@ -143,15 +163,49 @@ pub(crate) fn rewind_to_record(cursor: &mut u64, cnc: &CncPage, row: u8, pos: u6
 }
 
 /// The named fail-stop message (spec §7.2).
-pub(crate) fn stop_message(name: &str, running: u32, at: u64, mine: u32) -> String {
-    format!(
-        "version_superseded: row {name:?} moved to {} at position {at}; this binary ({}) \
-         stopped there — restart it as a {}.{}.x build",
-        VersionDisplay(running),
-        VersionDisplay(mine),
-        running >> 24,
-        (running >> 16) & 0xff,
-    )
+///
+/// `superseded_later` (final review #33 follow-up) is [`Verdict::Stop`]'s
+/// same flag: `false` when the record THIS binary stopped at is the one
+/// that moved the row off `mine`'s line (`running` is exactly what it set,
+/// so "moved to `running` at `at`" is true); `true` when a LATER record has
+/// already moved the row again by the time this binary noticed — `running`
+/// is the row's CURRENT version, not what the record at `at` set, and it can
+/// equal `mine` (a pin away and a pin back), which would make "moved to
+/// 1.0.0 … this binary (1.0.0)" read as a no-op. That case says only that
+/// the row changed at `at` and again since, and names `running` only as what
+/// to restart with.
+///
+/// A `running` of `0` is the unversioned sentinel (D4), not literally
+/// "major 0, minor 0" — [`VersionDisplay`] already renders it "unversioned"
+/// where it names the ROW's version, but the "restart it as an X.Y.x build"
+/// remedy unpacks major/minor by hand and would print "a 0.0.x build" (a
+/// build that does not exist) unless special-cased here too.
+pub(crate) fn stop_message(
+    name: &str,
+    running: u32,
+    at: u64,
+    mine: u32,
+    superseded_later: bool,
+) -> String {
+    let restart = if running == 0 {
+        "an unversioned build (VERSION = 0)".to_string()
+    } else {
+        format!("a {}.{}.x build", running >> 24, (running >> 16) & 0xff)
+    };
+    if superseded_later {
+        format!(
+            "version_superseded: row {name:?} changed version at position {at} and again \
+             since; this binary ({}) stopped there — restart it as {restart}",
+            VersionDisplay(mine),
+        )
+    } else {
+        format!(
+            "version_superseded: row {name:?} moved to {} at position {at}; this binary ({}) \
+             stopped there — restart it as {restart}",
+            VersionDisplay(running),
+            VersionDisplay(mine),
+        )
+    }
 }
 
 /// Fail-stop at a superseding version record: the `version_superseded`
@@ -162,7 +216,7 @@ pub(crate) fn stop_message(name: &str, running: u32, at: u64, mine: u32) -> Stri
 /// `applied = at`.
 #[cold]
 #[inline(never)]
-pub(crate) fn stop_fail(name: &str, running: u32, at: u64, mine: u32) -> ! {
+pub(crate) fn stop_fail(name: &str, running: u32, at: u64, mine: u32, superseded_later: bool) -> ! {
     let running_s = VersionDisplay(running).to_string();
     let mine_s = VersionDisplay(mine).to_string();
     uc_obs::obs_event!(
@@ -173,7 +227,10 @@ pub(crate) fn stop_fail(name: &str, running: u32, at: u64, mine: u32) -> ! {
         mine = mine_s.as_str(),
         position = at,
     );
-    panic!("{}", stop_message(name, running, at, mine))
+    panic!(
+        "{}",
+        stop_message(name, running, at, mine, superseded_later)
+    )
 }
 
 /// The whole stop, out of line so the apply loop's arm stays a type test and
@@ -197,6 +254,7 @@ pub(crate) fn stop_at_record<S: crate::traits::RawStateMachine>(
     row: u8,
     running: u32,
     at: u64,
+    superseded_later: bool,
 ) -> ! {
     let slot = crate::attach::slot(cnc, row);
     slot.applied.store_release(at);
@@ -214,7 +272,13 @@ pub(crate) fn stop_at_record<S: crate::traits::RawStateMachine>(
     slot.status
         .store_release(w & !uc_protocol::v2::cnc::CNC_SVC_STATUS_ATTACHED);
     drop(guard);
-    stop_fail(S::IDENTITY.name.as_str(), running, at, S::VERSION)
+    stop_fail(
+        S::IDENTITY.name.as_str(),
+        running,
+        at,
+        S::VERSION,
+        superseded_later,
+    )
 }
 
 #[cfg(test)]
@@ -251,16 +315,23 @@ mod tests {
     fn verdict_stops_when_the_accepted_record_is_not_ours() {
         assert_eq!(
             verdict(V1, 1280, view(Some(V2), 1280)),
-            Some(Verdict::Stop { running: V2 })
+            Some(Verdict::Stop {
+                running: V2,
+                superseded_later: false,
+            })
         );
     }
     #[test]
     fn verdict_stops_when_a_later_record_superseded_this_one() {
         // Review Focus 1: R1 (to v2) at 1280, R2 (back to v1) at 1920; a v1
         // service reaching R1 must stop even though running reads v1 again.
+        // `record_pos` (1920) > `rec_end` (1280): `superseded_later` is set.
         assert_eq!(
             verdict(V1, 1280, view(Some(V1), 1920)),
-            Some(Verdict::Stop { running: V1 })
+            Some(Verdict::Stop {
+                running: V1,
+                superseded_later: true,
+            })
         );
     }
     #[test]
@@ -320,7 +391,10 @@ mod tests {
         let (h, pl) = genesis(ROW, V2);
         assert_eq!(
             on_cluster_frame(&p, ROW, V1, 0, START, &h, &pl),
-            Gate::Stop { running: V2 }
+            Gate::Stop {
+                running: V2,
+                superseded_later: false,
+            }
         );
         // The same record for a matching line build is not a stop.
         assert_eq!(
@@ -396,7 +470,13 @@ mod tests {
                 "never decided"
             );
         };
-        assert_eq!(gate, Gate::Stop { running: V2 });
+        assert_eq!(
+            gate,
+            Gate::Stop {
+                running: V2,
+                superseded_later: false,
+            }
+        );
         assert!(pendings >= 1, "the 50 ms wait outlasts one budget");
         writer.join().unwrap();
     }
@@ -418,7 +498,10 @@ mod tests {
         );
         assert_eq!(
             on_cluster_frame(&p, ROW, V1, 0, START, &h, &pl),
-            Gate::Stop { running: V1 }
+            Gate::Stop {
+                running: V1,
+                superseded_later: true,
+            }
         );
     }
 
@@ -438,11 +521,53 @@ mod tests {
 
     #[test]
     fn the_stop_message_names_row_versions_position_and_remedy() {
-        let m = stop_message("kv", pack_version(2, 1, 0), 4096, pack_version(2, 0, 3));
+        let m = stop_message(
+            "kv",
+            pack_version(2, 1, 0),
+            4096,
+            pack_version(2, 0, 3),
+            false,
+        );
         assert_eq!(
             m,
             "version_superseded: row \"kv\" moved to 2.1.0 at position 4096; this binary \
              (2.0.3) stopped there — restart it as a 2.1.x build"
         );
+    }
+
+    /// Final review #33 follow-up (item 5a): `superseded_later` must not say
+    /// "moved to `running`" when `running` is the row's CURRENT version, not
+    /// what the record at `at` set — especially not when it equals `mine`,
+    /// which would otherwise read as "moved to 1.0.0 … this binary (1.0.0)",
+    /// a no-op.
+    #[test]
+    fn the_stop_message_names_a_later_change_without_claiming_what_it_moved_to() {
+        let m = stop_message(
+            "kv",
+            pack_version(1, 0, 0),
+            1280,
+            pack_version(1, 0, 0),
+            true,
+        );
+        assert_eq!(
+            m,
+            "version_superseded: row \"kv\" changed version at position 1280 and again since; \
+             this binary (1.0.0) stopped there — restart it as a 1.0.x build"
+        );
+        assert!(!m.contains("moved to"), "{m}");
+    }
+
+    /// Final review #33 follow-up (item 5b): `0` is the unversioned
+    /// sentinel (D4), not literally major 0 minor 0 — the remedy must not
+    /// print "a 0.0.x build" (a build that does not exist).
+    #[test]
+    fn the_stop_message_names_an_unversioned_remedy_for_running_zero() {
+        let m = stop_message("kv", 0, 4096, pack_version(2, 0, 3), false);
+        assert_eq!(
+            m,
+            "version_superseded: row \"kv\" moved to unversioned at position 4096; this binary \
+             (2.0.3) stopped there — restart it as an unversioned build (VERSION = 0)"
+        );
+        assert!(!m.contains("0.0.x"), "{m}");
     }
 }

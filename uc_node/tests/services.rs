@@ -310,9 +310,13 @@ fn page_one_service_band_is_the_min_over_declared_ids() {
     // service attached on its page. FSM 1 must stay ABSENT for what this
     // test asserts — a real attach would leave its `applied`/heartbeat words
     // behind after it stopped — so stand in for the attach on the status
-    // line alone until genesis commits, then put the line back.
+    // line alone until genesis commits, then put the status AND the
+    // heartbeat back exactly as found (final review #33 follow-up: zeroing
+    // the heartbeat unconditionally would be wrong for a row that already
+    // had one).
     let s1 = cnc.service_slot(1);
     let prev = s1.status.load_acquire();
+    let prev_heartbeat = s1.heartbeat_ns.load_acquire();
     s1.status
         .store_release(uc_log::cnc::pack_service_status(1, true, 1));
     let versioned = || {
@@ -335,7 +339,7 @@ fn page_one_service_band_is_the_min_over_declared_ids() {
         std::thread::sleep(Duration::from_millis(1));
     }
     s1.status.store_release(prev);
-    s1.heartbeat_ns.store_release(0);
+    s1.heartbeat_ns.store_release(prev_heartbeat);
 
     let client = Client::connect(dir.path(), APP).unwrap();
     for _ in 0..20 {
