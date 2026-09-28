@@ -190,7 +190,12 @@ costs, when to write the full trait instead, and the D5 check.
 1. **Compile-fail test** (`trybuild` or a doc-test with `compile_fail`): an
    FSM without snapshot support cannot call `ServiceBuilder::start()`.
 2. **Coherence test:** in one test crate, a helper-based FSM and a
-   hand-written `SnapshotStateMachine` both compile and attach.
+   hand-written `SnapshotStateMachine` both compile and attach. The SDK's own
+   generic wrappers that already implement `SnapshotStateMachine` for `W<S>`
+   (`Sessioned<S>`, `Timed<S>`; the plan lists every such impl via
+   `grep -rn "SnapshotStateMachine for" uc_service/src`) must still compile
+   around BOTH kinds of inner FSM: a wrapper over a helper-based FSM forwards
+   to the inner blanket impl rather than conflicting with it.
 3. **Helper unit tests:**
    - freeze then install round-trips state and cursor;
    - a recorded cursor above the tag is refused;
