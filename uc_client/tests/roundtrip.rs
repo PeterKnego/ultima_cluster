@@ -16,6 +16,9 @@
 //!    sequence of observed totals must still be strictly increasing
 //!    (monotone) between successive submits.
 
+#[macro_use]
+mod common;
+
 use std::net::SocketAddr;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -65,6 +68,9 @@ impl StateMachine for CountSm {
     }
 }
 
+// #67 Task 2: every row this file attaches must be snapshot-capable.
+impl_count_sm_snapshot!(CountSm);
+
 fn node_config(dir: &Path, app_id: &str) -> NodeConfig {
     let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
     NodeConfig {
@@ -108,7 +114,7 @@ fn hundred_submits_in_order_then_two_concurrent_clients_stay_monotone_with_disti
         ServiceConfig::new(dir.path(), "client-test"),
         CountSm::default(),
     )
-    .start()
+    .start_with_snapshots()
     .unwrap();
 
     // --- Step 1: one client, 100 sequential submits, exact totals 1..=100.
@@ -184,7 +190,7 @@ fn fsm_resolves_a_name_to_its_row_and_refuses_an_unknown_one() {
         ServiceConfig::new(dir.path(), "client-test-fsm"),
         CountSm::default(),
     )
-    .start()
+    .start_with_snapshots()
     .unwrap();
 
     let client = Client::connect(dir.path(), "client-test-fsm").unwrap();

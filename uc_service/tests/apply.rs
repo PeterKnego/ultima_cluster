@@ -6,6 +6,9 @@
 //! response per submit onto the egress broadcast with the client's identity
 //! and the position ++ bincoded response payload (the pinned egress layout).
 
+#[macro_use]
+mod common;
+
 use std::net::SocketAddr;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -60,6 +63,9 @@ impl StateMachine for CountSm {
         self.last_applied
     }
 }
+
+// #67 Task 2: every row this file attaches must be snapshot-capable.
+impl_count_sm_snapshot!(CountSm);
 
 // --------------------------------------------------------------------- harness
 
@@ -172,7 +178,7 @@ fn service_applies_committed_frames_and_publishes_responses() {
         ServiceConfig::new(dir.path(), "svc-test"),
         CountSm::default(),
     )
-    .start()
+    .start_with_snapshots()
     .unwrap();
 
     // 100 submits through the real ingress ring, client identity (13, 1..=100).
@@ -234,7 +240,7 @@ fn egress_frame_layout_is_byte_pinned() {
         .unwrap()
         .subscribe();
     let svc = ServiceBuilder::new(ServiceConfig::new(dir.path(), "layout"), CountSm::default())
-        .start()
+        .start_with_snapshots()
         .unwrap();
 
     let prod = open_ingress(dir.path());
@@ -305,6 +311,23 @@ impl StateMachine for TimerCountSm {
     }
 }
 
+// #67 Task 2: this row must be snapshot-capable too.
+type TimerCountSmState = (Vec<(u64, u64, u64)>, Option<u64>);
+impl uc_service::WholeStateSnapshot for TimerCountSm {
+    fn encode_state(&self) -> Result<Vec<u8>, uc_service::SnapshotError> {
+        bincode::serde::encode_to_vec((&self.fired, self.last), bincode::config::standard())
+            .map_err(|e| uc_service::SnapshotError::Codec(e.to_string()))
+    }
+    fn decode_state(&mut self, bytes: &[u8]) -> Result<(), uc_service::SnapshotError> {
+        let ((fired, last), _): (TimerCountSmState, usize) =
+            bincode::serde::decode_from_slice(bytes, bincode::config::standard())
+                .map_err(|e| uc_service::SnapshotError::Codec(e.to_string()))?;
+        self.fired = fired;
+        self.last = last;
+        Ok(())
+    }
+}
+
 #[test]
 fn timer_frame_is_delivered_to_the_named_fsm_only_and_responses_carry_time() {
     let dir = tempfile::tempdir().unwrap();
@@ -319,7 +342,7 @@ fn timer_frame_is_delivered_to_the_named_fsm_only_and_responses_carry_time() {
         ServiceConfig::new(dir.path(), "svc-test"),
         TimerCountSm::default(),
     )
-    .start()
+    .start_with_snapshots()
     .unwrap();
     let hash = <TimerCountSm as RawStateMachine>::IDENTITY.hash();
     node.append_timer_for_test(TimerBody {

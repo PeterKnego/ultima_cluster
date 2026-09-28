@@ -282,7 +282,7 @@ fn fresh_service_reconstructs_from_journal_after_ring_scrolled() {
     // FIRST service attaches only now: the ring long since scrolled → the fresh
     // SM at cursor 0 hits Overrun immediately → journal replay reconstruction.
     let svc = ServiceBuilder::new(cfg(dir.path(), "rec"), CountSm::default())
-        .start()
+        .start_with_snapshots()
         .unwrap();
     let cnc = open_cnc(dir.path(), "rec");
     wait_service_caught_up(&cnc);
@@ -686,7 +686,7 @@ fn restarted_service_epoch_bumps_and_state_rebuilds() {
 
     // First incarnation: reconstructs from the journal, converges to 2000.
     let svc1 = ServiceBuilder::new(cfg(dir.path(), "rst"), CountSm::default())
-        .start()
+        .start_with_snapshots()
         .unwrap();
     let cnc = open_cnc(dir.path(), "rst");
     wait_service_caught_up(&cnc);
@@ -698,7 +698,7 @@ fn restarted_service_epoch_bumps_and_state_rebuilds() {
     svc1.crash();
 
     let svc2 = ServiceBuilder::new(cfg(dir.path(), "rst"), CountSm::default())
-        .start()
+        .start_with_snapshots()
         .unwrap();
     let new_epoch = svc2.epoch();
     assert_eq!(

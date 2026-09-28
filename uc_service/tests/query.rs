@@ -15,6 +15,9 @@
 //!    This pins the task14 TOCTOU close in v2 shape: the service refuses a read
 //!    routed for a superseded incarnation.
 
+#[macro_use]
+mod common;
+
 use std::net::SocketAddr;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -70,6 +73,9 @@ impl StateMachine for CountSm {
     }
 }
 
+// #67 Task 2: every row this file attaches must be snapshot-capable.
+impl_count_sm_snapshot!(CountSm);
+
 // --------------------------------------------------------------------- harness
 
 fn node_config(dir: &Path, app_id: &str) -> NodeConfig {
@@ -118,7 +124,7 @@ fn reads_return_the_applied_total() {
     wait_until(|| node.can_serve());
 
     let svc = ServiceBuilder::new(ServiceConfig::new(dir.path(), "q-e2e"), CountSm::default())
-        .start()
+        .start_with_snapshots()
         .unwrap();
 
     let client = Client::connect(dir.path(), "q-e2e").unwrap();
@@ -166,7 +172,7 @@ fn stale_epoch_svc_query_gets_retry() {
         ServiceConfig::new(dir.path(), "q-epoch"),
         CountSm::default(),
     )
-    .start()
+    .start_with_snapshots()
     .unwrap();
     let old_epoch = svc1.epoch();
     assert_eq!(old_epoch, 1);
@@ -181,7 +187,7 @@ fn stale_epoch_svc_query_gets_retry() {
         ServiceConfig::new(dir.path(), "q-epoch"),
         CountSm::default(),
     )
-    .start()
+    .start_with_snapshots()
     .unwrap();
     assert_eq!(svc2.epoch(), 2, "the restarted incarnation bumps the epoch");
     let cnc = uc_log::cnc::CncPage::open_file(&dir.path().join("cnc2.dat"), "q-epoch").unwrap();

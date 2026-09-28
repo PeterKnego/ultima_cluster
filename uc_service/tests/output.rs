@@ -12,6 +12,9 @@
 //! committed position ever SKIPPED (`is_contiguous_positions`, walked against
 //! the journal via `TailReader`).
 
+#[macro_use]
+mod common;
+
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -74,6 +77,9 @@ impl StateMachine for CountSm {
         self.last_applied
     }
 }
+
+// #67 Task 2: every row this file attaches must be snapshot-capable.
+impl_count_sm_snapshot!(CountSm);
 
 // --------------------------------------------------------------- the handler
 
@@ -184,7 +190,7 @@ fn output_thread_spawns_only_for_a_real_handler() {
     );
 
     let svc_noop = ServiceBuilder::new(cfg(dir.path(), "spawn"), CountSm::default())
-        .start()
+        .start_with_snapshots()
         .unwrap();
     assert!(
         !thread_names().iter().any(|n| n == "uc2-output"),
@@ -198,7 +204,7 @@ fn output_thread_spawns_only_for_a_real_handler() {
             seen,
             fail_first: AtomicBool::new(false),
         })
-        .start()
+        .start_with_snapshots()
         .unwrap();
     // A NEW thread's name (`pthread_setname_np`) is set by the thread ITSELF
     // early in its startup, not by the parent's `spawn` call — so there is a
@@ -232,7 +238,7 @@ fn output_handler_explicit_noop_spawns_no_thread() {
 
     let svc = ServiceBuilder::new(cfg(dir.path(), "explicit-noop"), CountSm::default())
         .output_handler(NoopOutput)
-        .start()
+        .start_with_snapshots()
         .unwrap();
     assert!(
         !thread_names().iter().any(|n| n == "uc2-output"),
@@ -298,7 +304,7 @@ fn output_runs_leader_only_at_least_once_across_service_restart() {
             seen: seen.clone(),
             fail_first: AtomicBool::new(true),
         })
-        .start()
+        .start_with_snapshots()
         .unwrap();
     let client = Client::connect(dir.path(), "out").unwrap();
     for _ in 0..20 {
@@ -322,7 +328,7 @@ fn output_runs_leader_only_at_least_once_across_service_restart() {
             seen: seen.clone(),
             fail_first: AtomicBool::new(false),
         })
-        .start()
+        .start_with_snapshots()
         .unwrap();
     for _ in 0..5 {
         let _: u64 = client.submit(&Cmd::Add(1)).unwrap();

@@ -984,7 +984,10 @@ fn boot_cluster<S, F>(
     make_sm: F,
 ) -> (Vec<Node>, Vec<Service<S>>, Vec<PathBuf>)
 where
-    S: RawStateMachine,
+    // #67 Task 2: both instantiations (the direct arm's `CountSm` and the
+    // gateway arm's `CountSm` / `Sessioned<CountSm>`) are already snapshot-
+    // capable, so this is a tightened bound, not a behavior change.
+    S: SnapshotStateMachine,
     F: Fn() -> S,
 {
     let socks: Vec<UdpSocket> = (0..n)
@@ -1025,7 +1028,7 @@ where
     // up — so every node starts before any service attaches.
     for instance_dir in &dirs {
         let svc = ServiceBuilder::new(ServiceConfig::new(instance_dir, app_id), make_sm())
-            .start()
+            .start_with_snapshots()
             .expect("service start");
         services.push(svc);
     }
@@ -1089,13 +1092,13 @@ fn boot_cluster2(
     // up — so every node starts before any service attaches.
     for instance_dir in &dirs {
         let a = ServiceBuilder::new(ServiceConfig::new(instance_dir, app_id), CountSm::default())
-            .start()
+            .start_with_snapshots()
             .expect("service 0");
         let b = ServiceBuilder::new(
             ServiceConfig::new(instance_dir, app_id),
             SpinCountSm::with_spin(spin),
         )
-        .start()
+        .start_with_snapshots()
         .expect("service 1");
         s0.push(a);
         s1.push(b);
@@ -1627,7 +1630,9 @@ fn run_gateway_arm_generic<S, F>(
     make_sm: F,
 ) -> ClientStats
 where
-    S: RawStateMachine,
+    // #67 Task 2: both instantiations (`CountSm` and `Sessioned<CountSm>`)
+    // are already snapshot-capable — `boot_cluster` requires it too.
+    S: SnapshotStateMachine,
     F: Fn() -> S,
 {
     const APP_ID: &str = "uc2-m12-gate-gateway";

@@ -8,6 +8,9 @@
 //! `make_instance` from `tests/synthetic.rs`, and the hand-rolled `block_on`
 //! from `src/ticket.rs`'s test module.
 
+#[macro_use]
+mod common;
+
 use std::net::SocketAddr;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -54,6 +57,9 @@ impl StateMachine for CountSm {
         self.last_applied
     }
 }
+
+// #67 Task 2: every row this file attaches must be snapshot-capable.
+impl_count_sm_snapshot!(CountSm);
 
 fn node_config(dir: &Path, app_id: &str) -> NodeConfig {
     let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -168,7 +174,7 @@ fn pipelined_submits_all_resolve_and_totals_are_a_permutation_free_prefix() {
         ServiceConfig::new(dir.path(), "pipe-test"),
         CountSm::default(),
     )
-    .start()
+    .start_with_snapshots()
     .unwrap();
 
     let client = connect(dir.path());
@@ -192,7 +198,7 @@ fn async_await_resolves_against_a_real_cluster() {
         ServiceConfig::new(dir.path(), "pipe-test"),
         CountSm::default(),
     )
-    .start()
+    .start_with_snapshots()
     .unwrap();
 
     let client = connect(dir.path());
@@ -209,7 +215,7 @@ fn queries_ride_the_same_engine() {
         ServiceConfig::new(dir.path(), "pipe-test"),
         CountSm::default(),
     )
-    .start()
+    .start_with_snapshots()
     .unwrap();
 
     let client = connect(dir.path());
@@ -233,7 +239,7 @@ fn dropping_a_ticket_orphans_cleanly_and_later_traffic_is_unaffected() {
         ServiceConfig::new(dir.path(), "pipe-test"),
         CountSm::default(),
     )
-    .start()
+    .start_with_snapshots()
     .unwrap();
 
     let client = connect(dir.path());
@@ -349,7 +355,7 @@ fn every_wait_strategy_round_trips() {
         ServiceConfig::new(dir.path(), "pipe-test"),
         CountSm::default(),
     )
-    .start()
+    .start_with_snapshots()
     .unwrap();
 
     for ws in [
