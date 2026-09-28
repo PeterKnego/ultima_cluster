@@ -54,6 +54,7 @@ use std::path::{Path, PathBuf};
 use sha2::{Digest, Sha256};
 
 use crate::config::SnapshotError;
+use crate::traits::{RawStateMachine, SnapshotStateMachine};
 
 const DIR_NAME: &str = "snapshots";
 const PREFIX: &str = "snap-";
@@ -431,6 +432,80 @@ fn parse_snap_pos(file_name: &str) -> Option<u64> {
         .strip_suffix(SUFFIX)?
         .parse()
         .ok()
+}
+
+/// Snapshot support for an FSM whose whole state can be written to bytes (#67).
+///
+/// The app owns the encoding (any codec — bincode today, SBE or a
+/// hand-rolled layout tomorrow); the SDK owns everything else: the handle,
+/// streaming, the cursor, and the exclusive-frontier check.
+///
+/// **Cost.** `encode_state` runs as `freeze`: on the apply thread with the
+/// SM lock held, so each snapshot pauses apply for as long as encoding takes —
+/// proportional to state size. For large state implement
+/// [`SnapshotStateMachine`] directly (a persistent map pins in O(1)), or take
+/// snapshots as standby instants on a learner so voters never pause.
+///
+/// **Determinism.** `encode_state` must turn equal states into equal bytes:
+/// replicas' artifact hashes are compared (`SnapshotReport`). Never iterate a
+/// `HashMap` into the bytes.
+///
+/// **The cursor.** `decode_state` must restore the state's own
+/// `last_applied` — encode it with the rest of the state. The SDK records the
+/// cursor at freeze and refuses an install whose `decode_state` did not bring
+/// it back, because a lost cursor makes the apply loop re-apply frames the
+/// snapshot already contains.
+pub trait WholeStateSnapshot: RawStateMachine {
+    /// Encode the whole state, including `last_applied`.
+    fn encode_state(&self) -> Result<Vec<u8>, SnapshotError>;
+    /// Replace the whole state from bytes `encode_state` produced.
+    fn decode_state(&mut self, bytes: &[u8]) -> Result<(), SnapshotError>;
+}
+
+/// `cursor_present u8 ‖ cursor u64 LE`, ahead of the app's bytes.
+const WHOLE_STATE_HEADER_LEN: usize = 9;
+
+impl<S: WholeStateSnapshot> SnapshotStateMachine for S {
+    type SnapshotHandle = Vec<u8>;
+
+    fn freeze(&self) -> Result<(Vec<u8>, u64), SnapshotError> {
+        let cursor = self.last_applied();
+        let app = self.encode_state()?;
+        let mut out = Vec::with_capacity(WHOLE_STATE_HEADER_LEN + app.len());
+        out.push(cursor.is_some() as u8);
+        out.extend_from_slice(&cursor.unwrap_or(0).to_le_bytes());
+        out.extend_from_slice(&app);
+        Ok((out, cursor.unwrap_or(0)))
+    }
+
+    fn stream_snapshot(handle: Vec<u8>, dst: &mut dyn std::io::Write) -> Result<(), SnapshotError> {
+        dst.write_all(&handle)?;
+        Ok(())
+    }
+
+    fn install_snapshot(
+        &mut self,
+        position: u64,
+        src: &mut dyn std::io::Read,
+    ) -> Result<u64, SnapshotError> {
+        let mut buf = Vec::new();
+        src.read_to_end(&mut buf)?;
+        if buf.len() < WHOLE_STATE_HEADER_LEN || buf[0] > 1 {
+            return Err(SnapshotError::Codec("whole-state frame".into()));
+        }
+        let recorded =
+            (buf[0] == 1).then(|| u64::from_le_bytes(buf[1..9].try_into().expect("8 bytes")));
+        if recorded.unwrap_or(0) > position {
+            return Err(SnapshotError::Codec("mis-tagged: cursor above tag".into()));
+        }
+        self.decode_state(&buf[WHOLE_STATE_HEADER_LEN..])?;
+        if self.last_applied() != recorded {
+            return Err(SnapshotError::Codec(
+                "decode_state did not restore last_applied (encode it with the state)".into(),
+            ));
+        }
+        Ok(position)
+    }
 }
 
 #[cfg(test)]
@@ -873,5 +948,148 @@ mod tests {
         // Reopening (e.g. a fresh service incarnation attaching again) must
         // not fail on an already-existing directory.
         let _store2 = SnapshotStore::open(dir.path(), 3).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod whole_state_tests {
+    use super::*;
+    use crate::{ApplyCtx, RawStateMachine, SnapshotStateMachine};
+
+    /// A raw FSM whose state is one u64; `forget_cursor` makes decode_state
+    /// drop last_applied on purpose (Review Focus 1).
+    #[derive(Default)]
+    struct Sum {
+        total: u64,
+        last: Option<u64>,
+        forget_cursor: bool,
+    }
+    impl RawStateMachine for Sum {
+        const NAME: &'static str = "sum";
+        fn apply(&mut self, ctx: &mut ApplyCtx, cmd: &[u8], out: &mut Vec<u8>) {
+            self.total += cmd.len() as u64;
+            self.last = Some(ctx.position);
+            out.clear();
+        }
+        fn query(&self, _q: &[u8], out: &mut Vec<u8>) {
+            out.clear();
+            out.extend_from_slice(&self.total.to_le_bytes());
+        }
+        fn last_applied(&self) -> Option<u64> {
+            self.last
+        }
+    }
+    impl WholeStateSnapshot for Sum {
+        fn encode_state(&self) -> Result<Vec<u8>, SnapshotError> {
+            let mut b = self.total.to_le_bytes().to_vec();
+            b.push(self.last.is_some() as u8);
+            b.extend_from_slice(&self.last.unwrap_or(0).to_le_bytes());
+            Ok(b)
+        }
+        fn decode_state(&mut self, b: &[u8]) -> Result<(), SnapshotError> {
+            if b.len() != 17 {
+                return Err(SnapshotError::Codec("sum state".into()));
+            }
+            self.total = u64::from_le_bytes(b[0..8].try_into().unwrap());
+            if !self.forget_cursor {
+                self.last = (b[8] == 1).then(|| u64::from_le_bytes(b[9..17].try_into().unwrap()));
+            }
+            Ok(())
+        }
+    }
+
+    fn freeze_bytes(s: &Sum) -> (Vec<u8>, u64) {
+        let (h, pos) = s.freeze().unwrap();
+        let mut out = Vec::new();
+        Sum::stream_snapshot(h, &mut out).unwrap();
+        (out, pos)
+    }
+
+    #[test]
+    fn freeze_then_install_round_trips_state_and_cursor() {
+        let s = Sum {
+            total: 7,
+            last: Some(4096),
+            forget_cursor: false,
+        };
+        let (bytes, pos) = freeze_bytes(&s);
+        assert_eq!(pos, 4096);
+        let mut t = Sum::default();
+        // the tag is the instant P, an exclusive frontier at or above the cursor
+        assert_eq!(t.install_snapshot(4160, &mut &bytes[..]).unwrap(), 4160);
+        assert_eq!((t.total, t.last), (7, Some(4096)));
+    }
+
+    #[test]
+    fn a_fresh_fsm_round_trips_none() {
+        let (bytes, pos) = freeze_bytes(&Sum::default());
+        assert_eq!(pos, 0);
+        let mut t = Sum {
+            total: 9,
+            last: Some(1),
+            forget_cursor: false,
+        };
+        t.install_snapshot(64, &mut &bytes[..]).unwrap();
+        assert_eq!((t.total, t.last), (0, None));
+    }
+
+    #[test]
+    fn install_refuses_a_cursor_above_the_tag() {
+        let (bytes, _) = freeze_bytes(&Sum {
+            total: 1,
+            last: Some(8192),
+            forget_cursor: false,
+        });
+        let err = Sum::default()
+            .install_snapshot(4096, &mut &bytes[..])
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("mis-tagged: cursor above tag"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn install_refuses_a_decode_that_drops_the_cursor() {
+        let (bytes, _) = freeze_bytes(&Sum {
+            total: 1,
+            last: Some(4096),
+            forget_cursor: false,
+        });
+        let mut t = Sum {
+            forget_cursor: true,
+            ..Default::default()
+        };
+        let err = t.install_snapshot(4160, &mut &bytes[..]).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("decode_state did not restore last_applied"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn install_refuses_a_truncated_frame() {
+        for n in 0..9 {
+            let err = Sum::default()
+                .install_snapshot(64, &mut &[1u8; 9][..n])
+                .unwrap_err();
+            assert!(err.to_string().contains("whole-state frame"), "{n}: {err}");
+        }
+    }
+
+    #[test]
+    fn equal_state_freezes_to_equal_bytes() {
+        let a = Sum {
+            total: 3,
+            last: Some(640),
+            forget_cursor: false,
+        };
+        let b = Sum {
+            total: 3,
+            last: Some(640),
+            forget_cursor: true,
+        };
+        assert_eq!(freeze_bytes(&a).0, freeze_bytes(&b).0);
     }
 }

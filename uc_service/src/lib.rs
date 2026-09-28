@@ -74,6 +74,7 @@ pub use crate::ids::IdGen;
 pub use crate::session::{
     SESSION_HEADER_LEN, SessionConfig, Sessioned, TAG_EXPIRED, TAG_FRESH, TAG_REPLAYED,
 };
+pub use crate::snapshots::WholeStateSnapshot;
 pub use crate::tagged::Tagged;
 pub use crate::timed::Timed;
 pub use crate::traits::{
