@@ -18,7 +18,8 @@ a separate feature. Declare it on the trait impl:
 ```rust
 impl StateMachine for Orders {
     const NAME: &'static str = "orders";   // required
-    const VERSION: u32 = 3;                // optional, defaults to 0
+    // optional, defaults to 0; pack it — a bare `3` would be 0.0.3
+    const VERSION: u32 = uc_protocol::identity::pack_version(1, 0, 0);
     // …
 }
 ```

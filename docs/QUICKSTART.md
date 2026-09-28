@@ -112,9 +112,9 @@ ultima_cluster quickstart
    waiting for the gateways to accept (up to 30s)
    listening on 127.0.0.1:9200,127.0.0.1:9201,127.0.0.1:9202
 5. driving the cluster from outside, through the gateways
-   reset            -> value=0 position=32 replayed=false
-   add 5            -> value=5 position=96 replayed=false
-   add 5            -> value=10 position=160 replayed=false
+   reset            -> value=0 position=96 replayed=false
+   add 5            -> value=5 position=160 replayed=false
+   add 5            -> value=10 position=224 replayed=false
    get              -> value=10
 
 PASS
@@ -149,7 +149,7 @@ bin/counter-remote --gateways 127.0.0.1:9200,127.0.0.1:9201,127.0.0.1:9202 \
 ```
 
 ```text
-value=17 position=224 replayed=false
+value=17 position=384 replayed=false
 ```
 
 ## 3. What just happened
@@ -179,17 +179,21 @@ bin/uc2ctl status --instance-dir ~/uc2-quickstart/n0 --app-id quickstart
 node: running=true heartbeat_age=0.004s
 config: version=0 pending=false
 role: leader=true can_serve=true term=1 leader_hint=0
-log: commit=224 durable=224 append=224
+log: commit=384 durable=384 append=384
 members:
-  id=1 role=voter reported_durable=224
-  id=2 role=voter reported_durable=224
+  id=1 role=voter reported_durable=384
+  id=2 role=voter reported_durable=384
 ```
 
 `commit`, `durable` and `append` are **byte positions**, not entry indices —
 the absolute offset of a place in the log stream. There is no "entry 3" in
 this system; there is "the frame at byte 160", which is why the writes above
-report `position=96`, `position=160`. That is what lets replication be a
-byte-stream fan-out. See
+report `position=160`, `position=224`. That is what lets replication be a
+byte-stream fan-out. The log also carries the cluster's own records between
+yours — the leader's opening frame at 0, and at 32 the record of the counter
+row's version, which the leader writes before it admits any client write
+([the version rules](/docs/how-to/upgrade-an-application.md#the-version-rules))
+— so the exact numbers you see can differ by a record or two. See
 [ARCHITECTURE.md](/docs/ARCHITECTURE.md#positions-not-indices).
 
 The two writes were acknowledged only after a **majority of the three nodes

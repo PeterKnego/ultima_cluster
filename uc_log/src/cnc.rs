@@ -24,13 +24,14 @@ use uc_protocol::identity::FsmName;
 use uc_protocol::v2::cnc::{
     self, CNC_MAX_PEER_SLOTS, CNC_MAX_SERVICES, CNC_OFF_ADMIN_AUTH, CNC_OFF_ADMIN_REQ,
     CNC_OFF_ADMIN_RESP, CNC_OFF_ADMISSION_BYTES, CNC_OFF_APPEND, CNC_OFF_ARCHIVE_FIRST_BASE,
-    CNC_OFF_CONFIG_PENDING, CNC_OFF_CONFIG_VERSION, CNC_OFF_FREE_DISK_BYTES, CNC_OFF_FSM_LAG_BYTES,
-    CNC_OFF_HEADER_CRC, CNC_OFF_INGRESS_HOLES_SKIPPED, CNC_OFF_LOG_TIME_NS,
-    CNC_OFF_PAYLOAD_CEILING, CNC_OFF_PEER_SLOTS, CNC_OFF_QUERY_HOLES_SKIPPED,
-    CNC_OFF_SEAL_FAILURES, CNC_OFF_SERVICE_APPLIED, CNC_OFF_SERVICE_SLOTS,
-    CNC_OFF_SERVICE_SNAPSHOT_POS, CNC_OFF_SERVICES_DECLARED, CNC_OFF_TERM, CNC_PAGE_LEN,
-    CNC_PEER_SLOT_STRIDE, CNC_SERVICE_SLOT_STRIDE, CNC_SVC_STATUS_ATTACHED,
-    CNC_SVC_STATUS_INCARNATION_SHIFT, CNC_V2_VERSION, CncHeader,
+    CNC_OFF_CLUSTER_APPLIED, CNC_OFF_CONFIG_PENDING, CNC_OFF_CONFIG_VERSION,
+    CNC_OFF_FREE_DISK_BYTES, CNC_OFF_FSM_LAG_BYTES, CNC_OFF_HEADER_CRC,
+    CNC_OFF_INGRESS_HOLES_SKIPPED, CNC_OFF_LOG_TIME_NS, CNC_OFF_PAYLOAD_CEILING,
+    CNC_OFF_PEER_SLOTS, CNC_OFF_QUERY_HOLES_SKIPPED, CNC_OFF_SEAL_FAILURES,
+    CNC_OFF_SERVICE_APPLIED, CNC_OFF_SERVICE_SLOTS, CNC_OFF_SERVICE_SNAPSHOT_POS,
+    CNC_OFF_SERVICES_DECLARED, CNC_OFF_TERM, CNC_PAGE_LEN, CNC_PEER_SLOT_STRIDE,
+    CNC_SERVICE_SLOT_STRIDE, CNC_SVC_STATUS_ATTACHED, CNC_SVC_STATUS_INCARNATION_SHIFT,
+    CNC_V2_VERSION, CncHeader,
 };
 
 use crate::counters::{LogCounters, PaddedAtomicU64};
@@ -172,11 +173,12 @@ pub fn pack_naks_plus_replay(naks_served: u32, replay_datagrams: u32) -> u64 {
 /// cnc 3.1: the slot's line 0 — `status` (word 0) and the attached service's
 /// packed version (word 1). cnc 3.3 (plan B1, extended by plan B2) adds four
 /// more words to the same line, `upgrade_origin`/`pinned_version`/
-/// `pinned_from` and the `pin_seq` seqlock that publishes them together — a
-/// second writer on the line: the service still owns `status`/`version`
-/// (attach/detach), the node's `uc2-cluster` agent owns the four pin words
-/// (republished on every view publish), and each word still has exactly one
-/// writer.
+/// `pinned_from` and the `pin_seq` seqlock that publishes them together, and
+/// cnc 3.4 (#33) two more under the same seqlock, `running_version`/
+/// `running_record_pos` — a second writer on the line: the service still
+/// owns `status`/`version` (attach/detach), the node's `uc2-cluster` agent is
+/// the SINGLE writer of all six row-view words (republished on every view
+/// publish), and each word still has exactly one writer.
 #[repr(C)]
 pub struct ServiceStatusLine {
     status: AtomicU64,
@@ -185,7 +187,8 @@ pub struct ServiceStatusLine {
     pinned_version: AtomicU64,
     pin_seq: AtomicU64,
     pinned_from: AtomicU64,
-    _pad: [u64; 2],
+    running_version: AtomicU64,
+    running_record_pos: AtomicU64,
 }
 impl ServiceStatusLine {
     pub fn load_acquire(&self) -> u64 {
@@ -222,9 +225,11 @@ impl ServiceStatusLine {
     }
     /// The triple as it was stored, or a named reason it could not be read.
     ///
-    /// The pin occupies four words on the status line: **three data words
-    /// under one sequence word** (`upgrade_origin`, `pinned_version`,
-    /// `pinned_from`, committed by `pin_seq`). Everything below says "triple"
+    /// The row view occupies six words on the status line: **five data
+    /// words under one sequence word** (the pin's `upgrade_origin`,
+    /// `pinned_version` and `pinned_from`, plus cnc 3.4's `running_version`
+    /// and `running_record_pos`, all committed by `pin_seq`, single writer).
+    /// This reader returns the pin's three; everything below says "triple"
     /// for the data the caller gets back.
     ///
     /// `upgrade_origin`, `pinned_version` and `pinned_from` are three
@@ -282,14 +287,66 @@ impl ServiceStatusLine {
     /// `to`, store `from`, store the origin, bump back to EVEN — every step
     /// `Release`, so a reader that observes any data word also observes the
     /// ODD bump that preceded it. SINGLE WRITER (the `uc2-cluster` polling
-    /// agent owns all four words), so the bumps need no CAS; two concurrent
+    /// agent owns all six row-view words), so the bumps need no CAS; two concurrent
     /// callers would corrupt the sequence, not merely race.
+    ///
+    /// Kept for existing callers; delegates to [`Self::store_row_view`],
+    /// re-reading its own running words first so this round republishes them
+    /// unchanged (it is the single writer, so this is a plain read, not a
+    /// race).
     pub fn store_pin(&self, origin: u64, from: u32, to: u32) {
+        let rv = self.running_version.load(Ordering::Acquire);
+        let running = (rv & cnc::RUNNING_PRESENT != 0).then_some(rv as u32);
+        let record_pos = self.running_record_pos.load(Ordering::Acquire);
+        let pin = (origin != 0).then_some((origin, from, to));
+        self.store_row_view(pin, running, record_pos);
+    }
+    /// #33 spec §5.2: publish the whole row view — the pin triple (origin `0`
+    /// = none), the running version (`None` = no record yet) and the
+    /// position of the last accepted version record — in ONE seqlock round.
+    /// Single writer (the `uc2-cluster` agent), same discipline as the pin
+    /// triple alone used to have.
+    pub fn store_row_view(
+        &self,
+        pin: Option<(u64, u32, u32)>,
+        running: Option<u32>,
+        record_pos: u64,
+    ) {
+        let (origin, from, to) = pin.unwrap_or((0, 0, 0));
+        let rv = running.map_or(0, |v| cnc::RUNNING_PRESENT | v as u64);
         self.pin_seq.fetch_add(1, Ordering::Release);
         self.pinned_version.store(to as u64, Ordering::Release);
         self.pinned_from.store(from as u64, Ordering::Release);
         self.upgrade_origin.store(origin, Ordering::Release);
+        self.running_version.store(rv, Ordering::Release);
+        self.running_record_pos.store(record_pos, Ordering::Release);
         self.pin_seq.fetch_add(1, Ordering::Release);
+    }
+    /// The row view as one consistent read, or [`RowRead::Contended`] after
+    /// 64 spins — the same discipline and the same "never fabricate" rule as
+    /// [`Self::pin`].
+    pub fn row_view(&self) -> RowRead {
+        for _ in 0..64 {
+            let s1 = self.pin_seq.load(Ordering::Acquire);
+            if s1 & 1 != 0 {
+                std::hint::spin_loop();
+                continue;
+            }
+            let origin = self.upgrade_origin.load(Ordering::Acquire);
+            let to = self.pinned_version.load(Ordering::Acquire) as u32;
+            let from = self.pinned_from.load(Ordering::Acquire) as u32;
+            let rv = self.running_version.load(Ordering::Acquire);
+            let record_pos = self.running_record_pos.load(Ordering::Acquire);
+            if s1 == self.pin_seq.load(Ordering::Acquire) {
+                return RowRead::View {
+                    pin: (origin != 0).then_some((origin, from, to)),
+                    running: (rv & cnc::RUNNING_PRESENT != 0).then_some(rv as u32),
+                    record_pos,
+                };
+            }
+            std::hint::spin_loop();
+        }
+        RowRead::Contended
     }
     /// The first half of [`ServiceStatusLine::store_pin`] — the ODD bump and
     /// the `from`/`to` stores, with the origin store and the closing bump
@@ -323,6 +380,13 @@ const _: () = assert!(
 const _: () = assert!(std::mem::offset_of!(ServiceStatusLine, pin_seq) == cnc::CNC_SVC_OFF_PIN_SEQ);
 const _: () =
     assert!(std::mem::offset_of!(ServiceStatusLine, pinned_from) == cnc::CNC_SVC_OFF_PINNED_FROM);
+const _: () = assert!(
+    std::mem::offset_of!(ServiceStatusLine, running_version) == cnc::CNC_SVC_OFF_RUNNING_VERSION
+);
+const _: () = assert!(
+    std::mem::offset_of!(ServiceStatusLine, running_record_pos)
+        == cnc::CNC_SVC_OFF_RUNNING_RECORD_POS
+);
 
 /// What a consistent read of the pin words found. `Contended` is the
 /// 64-spin exhaustion of the seqlock read — with the single `uc2-cluster`
@@ -333,6 +397,19 @@ const _: () =
 pub enum PinRead {
     NoPin,
     Pinned { origin: u64, from: u32, to: u32 },
+    Contended,
+}
+
+/// #33: a consistent read of the whole row view. `Contended` has
+/// [`PinRead::Contended`]'s meaning: a reader that must DECIDE treats it as
+/// "could not read", never as "absent".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowRead {
+    View {
+        pin: Option<(u64, u32, u32)>,
+        running: Option<u32>,
+        record_pos: u64,
+    },
     Contended,
 }
 
@@ -854,6 +931,24 @@ impl CncPage {
         // SAFETY: as `log_time_ns`.
         unsafe {
             (*(self.region.ptr_at(CNC_OFF_LOG_TIME_NS) as *const AtomicU64))
+                .store(v, Ordering::Release)
+        }
+    }
+
+    /// cnc 3.4 (#33): the cluster FSM's consumed position, republished only
+    /// after a `uc2-cluster` batch that applied or installed something (R5)
+    /// — NOT every pass. See `uc_protocol::v2::cnc::CNC_OFF_CLUSTER_APPLIED`.
+    pub fn cluster_applied(&self) -> u64 {
+        // SAFETY: as `log_time_ns` — an aligned, page-backed u64 at a pinned offset.
+        unsafe {
+            (*(self.region.ptr_at(CNC_OFF_CLUSTER_APPLIED) as *const AtomicU64))
+                .load(Ordering::Acquire)
+        }
+    }
+    pub fn store_cluster_applied(&self, v: u64) {
+        // SAFETY: as above; single writer (the `uc2-cluster` agent).
+        unsafe {
+            (*(self.region.ptr_at(CNC_OFF_CLUSTER_APPLIED) as *const AtomicU64))
                 .store(v, Ordering::Release)
         }
     }
@@ -1399,6 +1494,7 @@ mod tests {
         assert_eq!(cnc::CNC_OFF_SERVICES_DECLARED, 4032);
         assert_eq!(cnc::CNC_OFF_FSM_LAG_BYTES, 4040);
         assert_eq!(cnc::CNC_OFF_LOG_TIME_NS, 4048);
+        assert_eq!(cnc::CNC_OFF_CLUSTER_APPLIED, 4056);
         assert_eq!(
             std::mem::offset_of!(ServiceIdentityLine, timers_pending),
             cnc::CNC_SVC_OFF_TIMERS_PENDING - cnc::CNC_SVC_OFF_NAME
@@ -2137,6 +2233,65 @@ mod tests {
                 to: 3
             }
         );
+    }
+
+    #[test]
+    fn row_view_round_trips_and_absent_reads_as_none() {
+        let page = CncPage::heap(&test_meta());
+        let s = &page.service_slot(2).status;
+        assert_eq!(
+            s.row_view(),
+            RowRead::View {
+                pin: None,
+                running: None,
+                record_pos: 0
+            }
+        );
+        s.store_row_view(Some((4096, 7, 8)), Some(0), 5120);
+        assert_eq!(
+            s.row_view(),
+            RowRead::View {
+                pin: Some((4096, 7, 8)),
+                running: Some(0),
+                record_pos: 5120
+            }
+        );
+        assert_eq!(
+            s.pin(),
+            PinRead::Pinned {
+                origin: 4096,
+                from: 7,
+                to: 8
+            }
+        );
+        // Some(0) is a recorded unversioned FSM, distinct from None (D4).
+        s.store_row_view(None, None, 0);
+        assert_eq!(
+            s.row_view(),
+            RowRead::View {
+                pin: None,
+                running: None,
+                record_pos: 0
+            }
+        );
+    }
+
+    #[test]
+    fn row_view_is_contended_while_a_store_is_in_flight() {
+        let page = CncPage::heap(&test_meta());
+        let s = &page.service_slot(0).status;
+        s.store_pin_begin_for_test(1, 2); // leaves pin_seq ODD
+        assert_eq!(s.row_view(), RowRead::Contended);
+        s.store_pin_finish_for_test(64);
+        assert!(matches!(s.row_view(), RowRead::View { .. }));
+    }
+
+    #[test]
+    fn cluster_applied_word_round_trips_at_4056() {
+        let page = CncPage::heap(&test_meta());
+        assert_eq!(page.cluster_applied(), 0);
+        page.store_cluster_applied(9000);
+        assert_eq!(page.cluster_applied(), 9000);
     }
 
     #[test]

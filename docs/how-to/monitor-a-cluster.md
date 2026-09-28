@@ -67,7 +67,7 @@ scrape_configs:
 ```
 
 `/metrics` serves `text/plain; version=0.0.4` — standard Prometheus text
-exposition. The full series contract — 115 families — is the
+exposition. The full series contract — 116 families — is the
 `CONTRACT_SERIES` array in
 [`uc_node/src/obs/metrics.rs`](../../uc_node/src/obs/metrics.rs); a test
 pins every family in that array against what the renderer actually emits, so
@@ -137,6 +137,16 @@ attached service's packed version; `0` = none/unversioned). These are the
 spec) — a cross-node query compares them in steady state, before any
 snapshot session ever runs.
 
+**One more per row since the row running version (wire `0.10.0`, #33)**:
+`uc2_row_running_version{service="<name>",row="<r>"}` — the packed version
+the row **runs**, committed in the cluster FSM by a genesis record or a pin,
+and so identical on every node once caught up. Where `uc2_service_version` is
+what the attached binary says it is, this is what the cluster says the row
+is. It has **no sample at all** before the row's first record — not a `0`,
+because `0` is an ordinary version here (an FSM that never set `const
+VERSION`). See [the row running version,
+explained](../notes/uc2-row-running-version-explained.md).
+
 Two shapes to know before writing a query:
 
 - **The first four families also carry an unlabeled sample**, which is the
@@ -202,14 +212,52 @@ dedicated alert rules**, keyed on the two new gauges above, because they
 carry per-row identity rather than a set-membership bit:
 `Uc2ServiceIdentityDrift` — `count by (row) (count_values("hash",
 uc2_service_identity_hash) by (row)) > 1` — fires the moment two nodes'
-row-`r` FSM names disagree, and `Uc2ServiceVersionDrift` — `count by (row)
-(count_values("version", uc2_service_version > 0) by (row)) > 1` — fires
-when two nodes' row-`r` attached versions disagree (excluding the
-unattached/unversioned `0` case, so a joiner whose service hasn't started
-yet does not page). Both are per-row fleet queries like the declared-set one
-above, **not** a bare `count by (row) (uc2_service_identity_hash) > 1` —
-that counts *series* (one per node instance), not distinct values, and pages
-permanently on any multi-node cluster.
+row-`r` FSM names disagree, and `Uc2ServiceVersionDrift`:
+
+```
+count by (row) (count_values("line", floor((uc2_service_version > 0) / 65536)) by (row)) > 1
+```
+
+fires when two nodes' row-`r` attached services are on different version
+**lines**. A packed version is `major:8 ‖ minor:8 ‖ patch:16`, so
+`floor(v / 65536)` drops the patch and keeps major.minor — the same
+comparison the platform itself makes (`same_line`). Since #33 two patch
+builds of one line may run side by side by design, so a fleet part-way
+through a patch roll-out does not page; a differing major or minor does. The
+`> 0` filter drops the unattached sentinel `0` **before** the floor, on the
+raw value, so a joiner whose service hasn't started yet does not page while a
+real `0.0.x` line is still compared (filtering after the floor would drop
+every `0.0.x` build with it). Both rules are per-row fleet queries like the
+declared-set one above, **not** a bare `count by (row)
+(uc2_service_identity_hash) > 1` — that counts *series* (one per node
+instance), not distinct values, and pages permanently on any multi-node
+cluster.
+
+**`Uc2RowVersionMismatch` (#33) is the per-node counterpart**, and it is
+critical rather than a warning:
+
+```
+floor(uc2_service_version / 65536) != on(instance, row) floor(uc2_row_running_version / 65536)
+  and on(instance, row) uc_service_attached == 1
+  and on(instance, row) uc_service_heartbeat_age_seconds < 10
+```
+
+for one minute: a LIVE service (its per-row heartbeat younger than 10 s)
+attached on this node whose line differs from its row's committed running
+line. Such a service should not exist for long — it is refused at attach,
+and an already-attached one stops at the record that moved its row — so a
+firing alert means **a stop that did not happen**. It stays quiet through a
+normal upgrade: a service that stops at the record clears its slot's
+ATTACHED bit before it fail-stops, as a graceful stop does, and an old
+service that was killed instead has a stale heartbeat, so neither matches.
+The slot does read honestly as **absent** until the new build attaches, and
+the absent-service rules report that: `Uc2ServiceAbsent`
+(`uc_service_attached == 0`) after 30 s and `Uc2ServiceWedged` after 1 m.
+`Uc2ServiceWedged` reads the unlabeled heartbeat age, which is the stalest
+*declared* row's, attached or not. Both are accurate during the swap, because
+the row applies nothing and admission is closed. Attach the new build within
+their `for:`, or silence them for the maintenance window. A row with no running version yet exports no
+`uc2_row_running_version` sample, so it can never match.
 
 ### The log clock and the timer families (2.11.0)
 
@@ -573,7 +621,8 @@ table:
 | `Uc2ServiceAbsent` | a declared FSM's `uc_service_attached` has read 0 for 30s — it was never started, or it stopped. This node's durable report is capped at the lag bound; if the FSM is absent on a **quorum of voters** (or a single node runs past its `fsm_lag` headroom) the cluster stalls by design until it attaches — but a lone follower with lag headroom keeps committing, so this alert can fire on a still-serving cluster | critical |
 | `Uc2ServicePinnedAtLagBound` | a declared FSM that **is attached** has had its `uc_service_lag_bytes` at or above `uc2_fsm_lag_bytes` for 30s in bounded mode — that FSM is running, just slower than the log, and is pacing the whole cluster | warning |
 | `Uc2ServiceIdentityDrift` (FSM identity, 2.11.0) | two nodes disagree on row `r`'s declared FSM name (its exported hash differs) — a config edit landed on some hosts and not others, or in a different order; the row's SNAP_BEGIN sessions will refuse each other the moment one runs | critical |
-| `Uc2ServiceVersionDrift` (FSM identity, 2.11.0) | two nodes' attached services at row `r` report different non-zero packed versions — a rolling upgrade in progress, or a mis-deployed binary; refused on the snapshot path, **not** prevented on the live commit path (§7) | warning |
+| `Uc2ServiceVersionDrift` (FSM identity, 2.11.0; lines since #33) | two nodes' attached services at row `r` are on different version **lines** (major.minor; patch differences are allowed and do not fire) — a mis-deployed binary, or a node whose old service has not yet been replaced after a pin | warning |
+| `Uc2RowVersionMismatch` (row running version, #33) | a live (heartbeat < 10 s) attached service on this node is off its row's committed running line (`uc2_row_running_version`), for 1m — a stop that did not happen; a stopped service's slot awaiting the new build does not fire | critical |
 | `Uc2SnapshotStalled` (coordinated snapshots, 2.11.0) | this node has commanded **full** snapshot instants at least twice in 30m with no complete set landing — one FSM is silently stopping all purging | warning |
 | `Uc2StandbySnapshotStalled` (coordinated snapshots, 2.11.0) | this **learner** has acted on standby snapshot instants at least twice in 30m with no complete set landing — one of its rows is silently stopping the standby set. Cannot fire on a voter (a voter exports `uc2_snapshot_standby_instant_position = 0`) | warning |
 | `Uc2SnapshotSetDiverged` (coordinated snapshots, 2.11.0) | nodes disagree on the newest complete snapshot set's position, i.e. on their purge floors, for 60s | warning |
@@ -712,7 +761,7 @@ flooding.
 | `log_truncated` | `node`, `epoch`, `to` | the log was cut back to position `to` as part of reconciliation epoch `epoch` |
 | `log_wiped` | `node` | a stronger case of the above: no common prefix with the leader, so the node truncated to 0 and will rejoin from the snapshot floor (`wipes_total` also increments) |
 | `snapshot_installed` | `node`, `pos`, `table_position` | the incoming-snapshot floor advanced to `pos`. **This fires whenever the floor marker moves, including the sub-case where the node already held the bytes and only the marker advanced** — it means "this node adopted a snapshot floor," not necessarily "a snapshot transfer happened." Don't read it as proof of a wire transfer. `table_position` (`2.11.0`) is the schedule-table position this node holds once the install is done: the carried table's on the fiat path a below-floor joiner takes, and this node's own, unchanged, on the mid-life path that adopts nothing. Note the **pinned install itself is not an obs event**: `uc2ctl upgrade pin`'s effect on the *cluster FSM* is `upgrade_pin_applied` (below), but a service process actually installing a pinned artifact at attach reports with a plain `eprintln!("uc_service: …")` line on the service's OWN stderr, outside this stream — there is no `pinned_install` event on the node's JSON log. |
-| `snapshot_floor_held_for_pin` (FSM upgrade lifecycle, 2.13.0) | `node`, `position`, `candidate` | this node's snapshot/purge floor is HELD at `position` — a pinned origin some row has not yet consumed (attached at the pin's `to` **and** replayed past the cut) — instead of advancing to `candidate`, the position it would otherwise publish. Fires once per change in the held position, not once per pass. An upgrade that was pinned and then abandoned holds the floor here indefinitely; clear it by finishing the upgrade (attach `to`) or by pinning the row forward, not by waiting — see [Upgrade a cluster § 2.13.0](upgrade-a-cluster.md#wire--cnc-change-in-2130-upgrade-pins-and-snapshot-reports-090-cnc-33). |
+| `snapshot_floor_held_for_pin` (FSM upgrade lifecycle, 2.13.0) | `node`, `position`, `candidate` | this node's snapshot/purge floor is HELD at `position` — a pinned origin some row has not yet consumed (attached on the pin's `to` line — a patch build of `to` counts — **and** replayed past the cut) — instead of advancing to `candidate`, the position it would otherwise publish. Fires once per change in the held position, not once per pass. An upgrade that was pinned and then abandoned holds the floor here indefinitely; clear it by finishing the upgrade (attach a build on `to`'s line) or by pinning the row forward, not by waiting — see [Upgrade a cluster § 2.13.0](upgrade-a-cluster.md#wire--cnc-change-in-2130-upgrade-pins-and-snapshot-reports-090-cnc-33). |
 | `config_adopted` | `node`, `position`, `version`, `prev_position` | a new `ClusterConfig` (version `version`) was adopted at `position`, superseding the one at `prev_position` |
 | `halt_removed` | `node`, `term`, `msg` | this node is not a member of the just-adopted config and has fail-stopped (parked permanently; the process keeps running but never serves again) |
 | `stepdown_removed` | `node`, `term`, `msg` | this node's own self-removal just committed while it was leader; it fail-stopped the same way as `halt_removed` |

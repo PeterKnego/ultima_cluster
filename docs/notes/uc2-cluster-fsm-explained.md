@@ -8,7 +8,12 @@ reports" when the FSM upgrade lifecycle (plan B1) took `CLUSTER` kinds 4 and
 `docs/superpowers/specs/2026-09-05-uc2-cluster-fsm-and-coordinated-snapshot-design.md`
 — this note carries §2–§5's argument in plain language; the FSM upgrade
 lifecycle's own spec is
-`docs/superpowers/specs/2026-09-19-uc2-fsm-upgrade-lifecycle-design.md`.*
+`docs/superpowers/specs/2026-09-19-uc2-fsm-upgrade-lifecycle-design.md`.
+Since wire `0.10.0` (#33) the cluster FSM also holds each row's running
+version and takes a sixth kind, `RowGenesis`; that has its own note.*
+
+The running version's note: [The row running version,
+explained](uc2-row-running-version-explained.md).
 
 ## The problem in one sentence
 
@@ -88,7 +93,7 @@ apply loop over the same log buffer. It has no cnc slot (page 2 is exactly
 eight service slots, with no ninth), and it is **outside the lag policy** —
 a stalled user FSM must not stall the node's view of its own configuration.
 
-Changing it is a command on the log. One frame type carries all five:
+Changing it is a command on the log. One frame type carries all six:
 
 ```
 FRAME_TYPE_CLUSTER = 4        (reuses the retired CONFIG's number)
@@ -100,12 +105,17 @@ body: kind: u8 ‖ reserved [u8; 7] ‖ payload
   kind 4 = UpgradePin     payload = 20 B  (row ‖ from ‖ to ‖ origin)
   kind 5 = SnapshotReport payload = 16–112 B  (row ‖ count ‖ position ‖
                                     count × (node_id ‖ hash))
+  kind 6 = RowGenesis     payload = 8 B  (row ‖ reserved ‖ version) — wire 0.10.0
 ```
 
 The log is a **broadcast** log — it carries no service id and does no routing
 — so the frame type is the only router there is. User apply loops act on
-`MESSAGE` and their own `TIMER` frames and yield everything else, so they skip
-`CLUSTER` for free; the cluster agent's loop is the mirror image.
+`MESSAGE` and their own `TIMER` frames and yield everything else; the cluster
+agent's loop is the mirror image. Since wire `0.10.0` a user row looks at one
+kind of `CLUSTER` frame without applying it — a version record (kind 4 or 6)
+naming its own row — where it waits for the cluster FSM's verdict and stops
+if its row moved to another version line; every other `CLUSTER` frame it
+still skips for free.
 
 And it snapshots like any FSM: `snapshots/cluster/snap-<pos>.ultcluster`,
 written at the position it has consumed the log up to. That file is the thing
@@ -454,14 +464,15 @@ every node:
 
 | reason | name | checked | why it is node-local |
 |---|---|---|---|
-| 52 | `pin_row_undeclared` | door | `row` must be one *this* node declares (`[services] names`'s length) |
-| 53 | `pin_from_mismatch` | door (no pin yet) **or** replicated (a pin exists) | with no history for the row, `from` is checked against the row's own **attached version word** on the cnc page — a purely local read; once a pin exists, the FSM checks `from` against its own last-recorded `to` instead, which is replicated state every node computes identically |
+| 52 | `row_undeclared` (`pin_row_undeclared` through `2.13.0`) | door | `row` must be one *this* node declares (`[services] names`'s length) |
+| 53 | `pin_from_mismatch` | door (no running version yet) **or** replicated (the row has one) | with no running version for the row, `from` is checked against the row's own **attached version word** on the cnc page — a purely local read. Once the row has a running version (since wire `0.10.0`: a genesis record or an earlier pin), the FSM checks that `from` is on its **line** — same major.minor — which is replicated state every node computes identically. Through `2.13.0` the replicated rule was exact equality with the last pin's `to` |
 | 54 | `pin_no_set` | door | `origin` must equal *this node's* newest complete set (`uc2_snapshot_set_position`) — see below for why "newest", not "any retained" |
 | 55 | `pin_not_monotone` | replicated | a new pin's `origin` must be strictly greater than the row's last one — the FSM's own check, since only it knows the history |
 | 56 | `pin_digest` | door | the staged `upgrade.pending` file changed between staging and applying |
 | 57 | `pin_missing` | door | no staged file on this node |
 | 58 | `pin_decode` | door | the staged file is not a 20-byte `UpgradePin` record |
 | 59 | `report_stale` | replicated | a `SnapshotReport` below the row's held report position |
+| 60 | `version_already_set` | replicated | a `RowGenesis` (wire `0.10.0`) for a row that already has a running version — genesis records a row's first version once and never changes one |
 
 The door reads are **advisory**, not authoritative: `to_state()` can pair a
 freshly-read `applied` position with pins that are a tick stale, so a door

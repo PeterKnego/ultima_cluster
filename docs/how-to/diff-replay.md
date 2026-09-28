@@ -126,7 +126,7 @@ sides, the "new build" selected by a knob:
     uc2-diffreplay pin-verify --corpus ./corpus \
         --old ./register-replay --old-arg serve \
         --new ./register-replay --new-arg serve --new-arg --double \
-        --app-id pv --fsm register --to 2 --report pin.json
+        --app-id pv --fsm register --to 0.2.0 --report pin.json
 
 `--old-arg` / `--new-arg` carry the app's **serve** argv — its serve verb
 followed by its own knobs, repeated once per token. The `replay` and
@@ -198,10 +198,10 @@ also that `corpus export` at P keeps only frames at or above P: the commands
 you want the demonstration to run must be **inside** the exported span, with
 `--split` deciding which of them land before the instant.
 
-A run whose OLD is already at `--to` is **refused up front**, before any
-command is submitted and before any pin is placed: a pin naming the running
-version cannot hold the refusal arm, because the "stale" binary is the
-pinned one.
+A run whose OLD is already on `--to`'s line (the same major.minor — `--to`
+itself or a patch of it) is **refused up front**, before any command is
+submitted and before any pin is placed: a pin names a line, not a build, so
+it admits OLD and cannot hold the refusal arm.
 
 **Reading the report.** `pin.json` (and the same thing as text on stdout;
 `verdict` is the same word in both, `PASS` / `INCONCLUSIVE` / `FAIL`) names

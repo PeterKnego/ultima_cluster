@@ -22,8 +22,8 @@ use uc_journal::TailReader;
 use uc_log::cnc::CncPage;
 use uc_protocol::v2::cnc::NODE_FLAG_LEARNER;
 use uc_protocol::v2::frame::{
-    self, FLAG_SNAPSHOT_STANDBY, FLAG_TIMER_TABLE, FRAME_TYPE_MESSAGE, FRAME_TYPE_SNAPSHOT,
-    FRAME_TYPE_TIMER, HEADER_LEN, align_frame_len,
+    self, FLAG_SNAPSHOT_STANDBY, FLAG_TIMER_TABLE, FRAME_TYPE_CLUSTER, FRAME_TYPE_MESSAGE,
+    FRAME_TYPE_SNAPSHOT, FRAME_TYPE_TIMER, HEADER_LEN, align_frame_len,
 };
 
 use crate::apply::{SnapshotRestore, SnapshotTrigger, on_snapshot_frame};
@@ -46,6 +46,11 @@ pub(crate) enum Replay {
     /// the floor until the tail catches up; nightly 33488022809). Nothing was
     /// applied; the caller retries next cycle.
     AwaitArtifact { artifact: u64, target: u64 },
+    /// #33 / R13: the walk reached a version record for this row that the
+    /// `uc2-cluster` agent has not applied yet (within the arm's wait
+    /// budget). Every frame before it applied; the payload is the record's
+    /// START, where the caller rejoins and ends its cycle.
+    AwaitVersion(u64),
 }
 
 /// Ruling P10's inputs: everything a replayed span needs in order to act on
@@ -71,6 +76,14 @@ pub(crate) struct ReplayInstant<'a, S: RawStateMachine> {
     /// same kind of thing the other three are: a fact about this row fixed at
     /// attach that the replayed span needs in order to decide correctly.
     pub pin: Option<(u64, u32, u32)>,
+    /// #33 spec §7.2: every version record whose frame END is at or below
+    /// this was already decided — by this incarnation's attach
+    /// (`attach_record_pos`) or by the live loop, which walked every frame
+    /// below the cursor this replay starts from. Records above it are
+    /// adjudicated here exactly as the live arm does: this path is not only
+    /// "replay at attach" — it is every `Overrun`, and it walks up to the
+    /// live `min(commit, durable)`, past anything the attach saw.
+    pub decided_to: u64,
 }
 
 /// Ruling P10, pass 1: the START position of the LAST `SNAPSHOT` frame in the
@@ -308,7 +321,9 @@ pub(crate) fn replay_into<S: RawStateMachine>(
                 // and this incarnation's `apply` may have genuinely different
                 // semantics for the same recorded command (spec §2.3's worked
                 // example: `Write(v)` meaning `v` under one build and `2·v`
-                // under another).
+                // under another). #33 D3: "same-version" means same LINE
+                // (major.minor) — `verify_snapshot_envelope` compares by
+                // `same_line`, since patch builds share the artifact format.
                 //
                 // Plan B2 T4 (review fix): with EXACTLY ONE exception — the
                 // artifact at this row's pinned ORIGIN. `attach` already
@@ -427,6 +442,12 @@ pub(crate) fn replay_into<S: RawStateMachine>(
         None
     };
 
+    // #33: `Some((running, record start))` once the scan meets a record that
+    // moved this row off this binary's line.
+    let mut stop_at: Option<(u32, u64)> = None;
+    // R13: `Some(record start)` once the scan meets a version record the
+    // agent has not applied yet.
+    let mut pending_at: Option<u64> = None;
     reader
         .scan_from(start_pos, |_seq, base, payload| {
             // `target` is the ONE frontier captured above, shared with pass 1
@@ -509,6 +530,32 @@ pub(crate) fn replay_into<S: RawStateMachine>(
                         },
                     );
                     let _ = ctx.take_sched_records();
+                } else if hdr.frame_type == FRAME_TYPE_CLUSTER {
+                    // #33 spec §7.2, the same arm as the live loop's: stop at
+                    // exactly a record that moved the row off this line.
+                    match crate::version_gate::on_cluster_frame(
+                        cnc,
+                        instant.service_id,
+                        S::VERSION,
+                        instant.decided_to,
+                        pos,
+                        &hdr,
+                        &payload[off + HEADER_LEN..off + total],
+                    ) {
+                        crate::version_gate::Gate::Pass => {}
+                        // Out of the scan either way: the fail-stop runs
+                        // below, once the SM guard can be released (a panic
+                        // here would poison the SM mutex); a pending record
+                        // ends the pass AT it (R13).
+                        crate::version_gate::Gate::Stop { running } => {
+                            stop_at = Some((running, pos));
+                            return false;
+                        }
+                        crate::version_gate::Gate::Pending => {
+                            pending_at = Some(pos);
+                            return false;
+                        }
+                    }
                 } else if hdr.frame_type == FRAME_TYPE_SNAPSHOT && Some(pos) > guard.last_applied()
                 {
                     // Fix round 3: the SAME `> last_applied` bound the two arms
@@ -556,5 +603,12 @@ pub(crate) fn replay_into<S: RawStateMachine>(
         })
         .map_err(|e| ServiceError::Replay(e.to_string()))?;
 
+    if let Some((running, at)) = stop_at {
+        // Every frame below the record applied, nothing at or after it.
+        crate::version_gate::stop_at_record(guard, cnc, instant.service_id, running, at);
+    }
+    if let Some(at) = pending_at {
+        return Ok(Replay::AwaitVersion(at));
+    }
     Ok(Replay::Rejoin(cursor))
 }

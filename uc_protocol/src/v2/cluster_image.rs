@@ -11,7 +11,11 @@
 //! after the settings record, before the CRC: pins (u32 len ‖ bytes) ‖
 //! reports (u32 len ‖ bytes) — the upgrade-pin and snapshot-report records
 //! (`v2::upgrade`'s list codecs), carried here as opaque bytes; this leaf
-//! does not decode them.
+//! does not decode them. Layout v3 (#33 task 3) appends one more
+//! length-prefixed blob after `reports`, before the CRC: running (u32 len ‖
+//! bytes) — the per-row running-version records (`v2::upgrade::RowRunning`'s
+//! list codec), also opaque here. v1 and v2 images are still ACCEPTED on
+//! read, with `running` empty.
 //!
 //! Moved out of `uc_node::cluster_fsm` (plan 3, spec §4.8) so a fuzz target
 //! can reach the decoder without pulling in `ClusterFsm` — a below-floor
@@ -46,7 +50,11 @@ pub const CLUSTER_IMAGE_MAGIC: &[u8; 8] = b"UCCLUST1";
 /// Bumped to 2 by plan B1 for the pin and report blobs; a version-1 image
 /// is still ACCEPTED on read, with both blobs empty — the settings v1/v2
 /// precedent, since a restarting `2.12.0` node reads its own artifact.
-pub const CLUSTER_IMAGE_VERSION: u32 = 2;
+/// Bumped to 3 (#33): a trailing length-prefixed `running` blob after
+/// `reports`. A v1 or v2 image is still ACCEPTED on read, with `running`
+/// empty — the same precedent, since a restarting `2.13.0` node reads its
+/// own pre-upgrade artifact.
+pub const CLUSTER_IMAGE_VERSION: u32 = 3;
 
 /// Bytes fixed before the two length-prefixed payloads: magic(8) ‖
 /// version(4) ‖ applied(8) ‖ table_position(8) ‖ settings_position(8).
@@ -87,6 +95,9 @@ pub struct ClusterImageParts<'a> {
     /// The `v2::upgrade` snapshot-report-list bytes (opaque here; empty for
     /// a v1 image or a cluster with no reports recorded).
     pub reports: &'a [u8],
+    /// The `v2::upgrade` running-version-list bytes (opaque here; empty for
+    /// a v1/v2 image or a cluster with no running versions recorded).
+    pub running: &'a [u8],
 }
 
 /// Append the encoded image (magic through the trailing CRC) to `out`. The
@@ -134,6 +145,9 @@ pub fn encode_cluster_image(p: &ClusterImageParts<'_>, out: &mut Vec<u8>) -> Opt
     out.extend_from_slice(p.pins);
     out.extend_from_slice(&reports_len.to_le_bytes());
     out.extend_from_slice(p.reports);
+    let running_len = payload_len_prefix(p.running.len())?;
+    out.extend_from_slice(&running_len.to_le_bytes());
+    out.extend_from_slice(p.running);
     let crc = crc32fast::hash(&out[start..]);
     out.extend_from_slice(&crc.to_le_bytes());
     Some(())
@@ -169,7 +183,7 @@ pub fn decode_cluster_image(buf: &[u8]) -> Option<ClusterImageParts<'_>> {
     };
     let mut o = 8;
     let version = u32_at(o)?;
-    if version != 1 && version != CLUSTER_IMAGE_VERSION {
+    if !(1..=CLUSTER_IMAGE_VERSION).contains(&version) {
         return None;
     }
     o += 4;
@@ -188,7 +202,7 @@ pub fn decode_cluster_image(buf: &[u8]) -> Option<ClusterImageParts<'_>> {
     o += 4;
     let table = o.checked_add(tl).and_then(|end| body.get(o..end))?;
     o += tl;
-    let (settings, pins, reports) = if version == 1 {
+    let (settings, pins, reports, running) = if version == 1 {
         // 2.11.0/2.12.0 layout: the remainder is exactly one settings
         // record, self-versioned and exact-length per version
         // (`settings::decode_settings`) — never a slice that could run past
@@ -209,11 +223,17 @@ pub fn decode_cluster_image(buf: &[u8]) -> Option<ClusterImageParts<'_>> {
         if rest != sl {
             return None;
         }
-        (&body[o..], &body[body.len()..], &body[body.len()..])
+        (
+            &body[o..],
+            &body[body.len()..],
+            &body[body.len()..],
+            &body[body.len()..],
+        )
     } else {
-        // v2: the settings record is sized by ITS OWN version word (the
+        // v2/v3: the settings record is sized by ITS OWN version word (the
         // record is exact-length per version), then two length-prefixed
-        // blobs, then nothing.
+        // blobs (pins, reports), then — v3 only — a third length-prefixed
+        // blob (running), then nothing.
         let sl = match u32_at(o)? {
             1 => SETTINGS_LEN_V1,
             2 => SETTINGS_LEN,
@@ -229,10 +249,19 @@ pub fn decode_cluster_image(buf: &[u8]) -> Option<ClusterImageParts<'_>> {
         o += 4;
         let reports = o.checked_add(rl).and_then(|end| body.get(o..end))?;
         o += rl;
+        let running = if version >= 3 {
+            let nl = u32_at(o)? as usize;
+            o += 4;
+            let r = o.checked_add(nl).and_then(|end| body.get(o..end))?;
+            o += nl;
+            r
+        } else {
+            &body[body.len()..]
+        };
         if o != body.len() {
             return None;
         }
-        (settings, pins, reports)
+        (settings, pins, reports, running)
     };
     Some(ClusterImageParts {
         applied,
@@ -243,6 +272,7 @@ pub fn decode_cluster_image(buf: &[u8]) -> Option<ClusterImageParts<'_>> {
         settings,
         pins,
         reports,
+        running,
     })
 }
 
@@ -320,6 +350,33 @@ mod tests {
         0xFF, 0x83, 0x32, 0x9D,
     ];
 
+    /// Captured 2026-09-27 (#33 task 3, BEFORE the v3 encoder change) by
+    /// temporarily instrumenting this test module to call the then-current
+    /// (v2) `encode_cluster_image` with genesis membership/table, a v2
+    /// (33 B) settings record, one `UpgradePin` (`row: 2, from:
+    /// 0x0100_0000, to: 0x0102_0000, origin: 4096`) as the pins blob, and no
+    /// reports, then printing the resulting bytes and pasting them here as a
+    /// `const`. This pins the "a v2 image decodes with an empty `running`"
+    /// requirement against a fixture the v3 encoder never touched — a
+    /// fixture produced by the v3 encoder would prove nothing about v2
+    /// decode compatibility.
+    #[rustfmt::skip]
+    const PLAN_B1_V2_FIXTURE: &[u8] = &[
+        0x55, 0x43, 0x43, 0x4C, 0x55, 0x53, 0x54, 0x31, 0x02, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x16, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0x00,
+        0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x14, 0x00, 0x00, 0x00, 0x02,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x02, 0x01, 0x00, 0x10, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, 0xE5, 0xFB, 0x03,
+    ];
+
+    fn v2_fixture_image() -> &'static [u8] {
+        PLAN_B1_V2_FIXTURE
+    }
+
     /// The 29-byte VERSION-1 settings record a `2.11.0` node wrote — the tail
     /// of every cluster artifact that survives the jumbo flag day, and the
     /// tail [`PLAN1_FIXTURE`] pins. Hand-built because `encode_settings` now
@@ -386,6 +443,7 @@ mod tests {
             settings: &settings,
             pins: &[],
             reports: &[],
+            running: &[],
         };
         // encode_cluster_image now always writes the v2 layout (with two
         // trailing, empty, length-prefixed pin/report blobs), so it no
@@ -431,6 +489,7 @@ mod tests {
                 settings: tail,
                 pins: &[],
                 reports: &[],
+                running: &[],
             };
             let mut img = Vec::new();
             encode_cluster_image(&parts, &mut img).expect("well under u32::MAX");
@@ -455,6 +514,7 @@ mod tests {
                 settings: &tail,
                 pins: &[],
                 reports: &[],
+                running: &[],
             };
             let mut img = Vec::new();
             encode_cluster_image(&parts, &mut img).expect("well under u32::MAX");
@@ -524,6 +584,7 @@ mod tests {
             settings: &settings,
             pins: &[],
             reports: &[],
+            running: &[],
         };
         let mut img = Vec::new();
         encode_cluster_image(&parts, &mut img).expect("well under u32::MAX");
@@ -577,6 +638,7 @@ mod tests {
             settings: &settings,
             pins: &[],
             reports: &[],
+            running: &[],
         };
         assert_eq!(encode_cluster_image(&parts, &mut out), Some(()));
         assert!(decode_cluster_image(&out).is_some());
@@ -595,10 +657,11 @@ mod tests {
             settings: &v2_settings(),
             pins: &pins,
             reports: &reports,
+            running: &[],
         };
         let mut img = Vec::new();
         encode_cluster_image(&p, &mut img).unwrap();
-        assert_eq!(&img[8..12], &2u32.to_le_bytes(), "version 2");
+        assert_eq!(&img[8..12], &3u32.to_le_bytes(), "version 3");
         let d = decode_cluster_image(&img).unwrap();
         assert_eq!(
             (
@@ -641,11 +704,75 @@ mod tests {
             settings: &v1_settings_blob(),
             pins: &[],
             reports: &[],
+            running: &[],
         };
         let mut img = Vec::new();
         encode_cluster_image(&p, &mut img).unwrap();
         let d = decode_cluster_image(&img).unwrap();
         assert_eq!(d.settings, &v1_settings_blob()[..]);
+    }
+
+    /// #33 task 3: layout v3 appends a trailing length-prefixed `running`
+    /// blob after `reports`. A v1 or v2 image (this crate's own v2
+    /// encoder's prior output, captured BEFORE this change as
+    /// `PLAN_B1_V2_FIXTURE`) still decodes, with `running` empty.
+    #[test]
+    fn v3_image_round_trips_the_running_blob_and_v2_reads_empty() {
+        let running = [7u8; 16];
+        let p = ClusterImageParts {
+            applied: 4096,
+            table_position: 0,
+            settings_position: 0,
+            membership: b"m",
+            table: b"t",
+            settings: &v2_settings(),
+            pins: &[],
+            reports: &[],
+            running: &running,
+        };
+        let mut img = Vec::new();
+        encode_cluster_image(&p, &mut img).unwrap();
+        assert_eq!(
+            u32::from_le_bytes(img[8..12].try_into().unwrap()),
+            3,
+            "encode_cluster_image now writes layout v3"
+        );
+        assert_eq!(decode_cluster_image(&img).unwrap().running, &running[..]);
+        // A v2 image (the existing v2 fixture, captured before this task's
+        // encoder change) decodes with empty running — and its pins/reports
+        // (the v2-era fields) survive untouched: the fixture was captured
+        // with one UpgradePin and no reports (see PLAN_B1_V2_FIXTURE's doc
+        // comment for its exact provenance).
+        use super::super::upgrade::{UpgradePin, encode_upgrade_pin};
+        let mut expected_pins = Vec::new();
+        encode_upgrade_pin(
+            &UpgradePin {
+                row: 2,
+                from: 0x0100_0000,
+                to: 0x0102_0000,
+                origin: 4096,
+            },
+            &mut expected_pins,
+        );
+        let v2 = v2_fixture_image();
+        let d = decode_cluster_image(v2).unwrap();
+        assert_eq!(
+            u32::from_le_bytes(v2[8..12].try_into().unwrap()),
+            2,
+            "the fixture itself is a genuine v2 image, not a v3 one"
+        );
+        assert_eq!(d.running, &[] as &[u8]);
+        assert_eq!(
+            d.pins,
+            &expected_pins[..],
+            "the v2 fixture's one pin record survives decode intact"
+        );
+        assert_eq!(d.reports, &[] as &[u8]);
+        // And the plan-1-era v1 fixture too.
+        assert_eq!(
+            decode_cluster_image(PLAN1_FIXTURE).unwrap().running,
+            &[] as &[u8]
+        );
     }
 
     /// Recompute the trailing CRC after a deliberate mutation.

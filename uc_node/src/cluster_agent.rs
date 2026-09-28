@@ -47,7 +47,7 @@ use uc_protocol::v2::frame::{
     FRAME_TYPE_SNAPSHOT, align_frame_len,
 };
 use uc_protocol::v2::schedule::ScheduleTable;
-use uc_protocol::v2::upgrade::{SnapshotReport, UpgradePin, verdict};
+use uc_protocol::v2::upgrade::{RowRunning, SnapshotReport, UpgradePin, verdict};
 use uc_service::{ApplyCtx, RawStateMachine, SnapshotStateMachine};
 
 use crate::cluster_fsm::{ClusterFsm, ClusterState, ClusterView};
@@ -127,14 +127,22 @@ pub fn read_committed_settings(
     Ok(Some((st.applied, st.settings)))
 }
 
-/// `uc2ctl upgrade show`'s reader (plan B1): the pin history and the held
-/// snapshot reports in this instance directory's newest cluster artifact,
-/// with the artifact's position — `read_committed_settings`'s contract and
-/// its staleness caveat, verbatim.
+/// `uc2ctl upgrade show`'s reader (plan B1, extended by #33 task 10): the
+/// pin history, the held snapshot reports, and every row's running-version
+/// record in this instance directory's newest cluster artifact, with the
+/// artifact's position — `read_committed_settings`'s contract and its
+/// staleness caveat, verbatim.
 #[allow(clippy::type_complexity)]
 pub fn read_committed_upgrade(
     instance_dir: &Path,
-) -> io::Result<Option<(u64, Vec<UpgradePin>, Vec<SnapshotReport>)>> {
+) -> io::Result<
+    Option<(
+        u64,
+        Vec<UpgradePin>,
+        Vec<SnapshotReport>,
+        [Option<RowRunning>; uc_protocol::v2::cnc::CNC_MAX_SERVICES],
+    )>,
+> {
     let (fsm, start) = recover(
         &snapshot_dir_of(instance_dir),
         ClusterState::genesis_empty(),
@@ -144,7 +152,12 @@ pub fn read_committed_upgrade(
         return Ok(None);
     }
     let st = fsm.state();
-    Ok(Some((st.applied, st.pins.clone(), st.reports.clone())))
+    Ok(Some((
+        st.applied,
+        st.pins.clone(),
+        st.reports.clone(),
+        st.running,
+    )))
 }
 
 /// Recovery (spec §4.7): the newest `snap-*.ultcluster` under `dir`, or
@@ -286,6 +299,12 @@ impl ClusterAgent {
         // words from the artifact BEFORE any service attaches — the same
         // "no edge to miss" posture `publish_view` takes everywhere else.
         agent.publish_view();
+        // Ruling R6: `cluster_applied` must reflect a RECOVERED position too,
+        // not just one this agent goes on to apply or install — a service
+        // can be waiting on `cluster_applied >= rec_end` for a version
+        // record at or below the recovered `applied`, which this agent will
+        // never re-apply, so nothing would ever move the word otherwise.
+        agent.cnc.store_cluster_applied(agent.fsm.state().applied);
         agent
     }
 
@@ -293,25 +312,31 @@ impl ClusterAgent {
         self.fsm.state().applied
     }
 
-    /// Publish the view AND the per-row pin words (spec §3 S4 step 3): the
-    /// words are a projection of FSM state, republished whole on every
-    /// publish — idempotent, so a recovered or freshly-installed state
-    /// writes them before any service attaches, with no edge to miss.
+    /// Publish the view AND every row's cnc words — the pin triple and the
+    /// running version, together, in one seqlock round (#33 spec §5.2): a
+    /// projection of FSM state, republished whole on every publish —
+    /// idempotent, so a recovered or freshly-installed state writes them
+    /// before any service attaches, with no edge to miss. Every declared row
+    /// is written, including one with neither a pin nor a running version
+    /// (`store_row_view(None, None, 0)`), so a row's words never go stale
+    /// after its pin or running version is cleared by a fresh genesis state.
     fn publish_view(&mut self) {
         let st = self.fsm.state();
         self.view.publish(st);
         for row in 0..uc_protocol::v2::cnc::CNC_MAX_SERVICES as u8 {
-            if let Some(p) = st.pin_for(row) {
-                self.cnc
-                    .service_slot(row as usize)
-                    .status
-                    .store_pin(p.origin, p.from, p.to);
-            }
+            let pin = st.pin_for(row).map(|p| (p.origin, p.from, p.to));
+            let running = st.running_for(row);
+            self.cnc.service_slot(row as usize).status.store_row_view(
+                pin,
+                running.map(|r| r.version),
+                running.map_or(0, |r| r.record_pos),
+            );
         }
     }
 
-    /// Plan B1: name what an ACCEPTED pin or report did, at the time it
-    /// did it. `row` is the payload's first byte, the same for both kinds.
+    /// Plan B1: name what an ACCEPTED pin, report or (#33) row-genesis
+    /// record did, at the time it did it. `row` is the payload's first byte,
+    /// the same for all three kinds.
     /// A report's verdict is recomputed here from FSM state, not stored.
     ///
     /// Takes `fsm` rather than `&self` — same reason as
@@ -334,6 +359,31 @@ impl ClusterAgent {
                         from = p.from as u64,
                         to = p.to as u64,
                         origin = p.origin
+                    );
+                }
+                // #33 spec §4.1/§5.2: a pin also sets the row's running
+                // version — name that fact under its own event, distinct
+                // from `upgrade_pin_applied` (which names the pin itself).
+                if let Some(r) = st.running_for(row) {
+                    crate::obs_event!(
+                        Info,
+                        "row_version_recorded",
+                        position = position,
+                        row = r.row as u64,
+                        version = r.version as u64,
+                        source = "pin"
+                    );
+                }
+            }
+            Some(ClusterKind::RowGenesis) => {
+                if let Some(r) = st.running_for(row) {
+                    crate::obs_event!(
+                        Info,
+                        "row_version_recorded",
+                        position = position,
+                        row = r.row as u64,
+                        version = r.version as u64,
+                        source = "genesis"
                     );
                 }
             }
@@ -550,6 +600,12 @@ impl ClusterAgent {
         self.fsm.set_consumed(self.follower.cursor);
         if applied_any {
             self.publish_view();
+            // Ruling R5: written only after a batch that applied something,
+            // never per pass (false sharing on the 4032 line stays rare).
+            // Ordering: the row words first (above), then this word
+            // (Release) — a reader that sees `cluster_applied >= p` must
+            // already see every row word as of p.
+            self.cnc.store_cluster_applied(self.fsm.state().applied);
         }
         // Plan B3 T5: …but the WALK is published, every pass, through the
         // view's `consumed` word — one `fetch_max`, no mutex, nothing on the
@@ -605,6 +661,10 @@ impl ClusterAgent {
             .install_snapshot(position, &mut f)
             .map_err(|e| io::Error::other(e.to_string()))?;
         self.publish_view();
+        // Ruling R5: an install is a batch that installed something, so it
+        // writes `cluster_applied` too — same ordering rule as `do_work`'s
+        // `applied_any` branch (row words first, then this word).
+        self.cnc.store_cluster_applied(self.fsm.state().applied);
         self.snapshot_pos = got;
         self.cluster_snapshot_pos.store(got, Ordering::Release);
         // The artifact IS every CLUSTER frame up to `got`, so the next frame
@@ -898,13 +958,15 @@ mod tests {
     use uc_consensus::config::{Addr, ClusterConfig};
     use uc_log::archive::{Archive, ArchiveConfig};
     use uc_log::buffer::LogBuffer;
-    use uc_log::cnc::{CncMeta, CncPage, PinRead};
+    use uc_log::cnc::{CncMeta, CncPage, PinRead, RowRead};
     use uc_log::region::Region;
+    use uc_protocol::identity::pack_version;
     use uc_protocol::v2::cnc::CNC_MAX_SERVICES;
     use uc_protocol::v2::frame::ClusterKind;
     use uc_protocol::v2::settings::{Settings, encode_settings};
     use uc_protocol::v2::upgrade::{
-        SnapshotReport, UpgradePin, encode_snapshot_report, encode_upgrade_pin, verdict,
+        RowGenesis, SnapshotReport, UpgradePin, encode_row_genesis, encode_snapshot_report,
+        encode_upgrade_pin, verdict,
     };
 
     use super::*;
@@ -963,6 +1025,7 @@ mod tests {
             applied: 0,
             pins: vec![],
             reports: vec![],
+            running: [None; uc_protocol::v2::cnc::CNC_MAX_SERVICES],
         }
     }
 
@@ -1010,6 +1073,11 @@ mod tests {
             },
             &mut payload,
         );
+        payload
+    }
+    fn genesis_payload(row: u8, version: u32) -> Vec<u8> {
+        let mut payload = Vec::new();
+        encode_row_genesis(&RowGenesis { row, version }, &mut payload);
         payload
     }
     fn report_payload(row: u8, position: u64, hashes: &[(u32, u64)]) -> Vec<u8> {
@@ -1094,6 +1162,71 @@ mod tests {
         );
     }
 
+    /// #33 task 5: an accepted genesis reaches the row's whole view (pin +
+    /// running version) in the same seqlock round `publish_view` writes
+    /// every row through, and `cluster_applied` moves to the frame's end in
+    /// the same applying batch — never on a pass that applied nothing.
+    #[test]
+    fn an_applied_genesis_reaches_the_row_view_before_cluster_applied_moves() {
+        let (buffer, cnc, dir) = world();
+        assert_eq!(cnc.cluster_applied(), 0, "sanity: nothing applied yet");
+        let mut app = buffer.appender_for_test(0);
+        app.set_now(1);
+        let version = pack_version(1, 0, 0);
+        let end = app
+            .append_cluster(1, ClusterKind::RowGenesis, &genesis_payload(0, version))
+            .unwrap();
+        cnc.counters().durable.store_release(end);
+        cnc.counters().commit.store_release(end);
+        let (mut agent, _view) = agent_over(&buffer, &cnc, dir.path());
+        assert!(agent.do_work());
+        assert_eq!(
+            cnc.service_slot(0).status.row_view(),
+            RowRead::View {
+                pin: None,
+                running: Some(version),
+                record_pos: end,
+            }
+        );
+        assert_eq!(cnc.cluster_applied(), end);
+    }
+
+    /// Ruling R6: recovering a snapshot must publish `cluster_applied` too —
+    /// not just an applying or installing batch. A service can be waiting on
+    /// `cluster_applied >= rec_end` for a version record at or below the
+    /// recovered `applied`, which this agent will never re-apply (it starts
+    /// its walk AFTER that position), so nothing but construction itself can
+    /// ever move the word for such a service.
+    #[test]
+    fn recovering_a_snapshot_sets_cluster_applied_with_no_batch_run() {
+        let (buffer, cnc, dir) = world();
+        let mut app = buffer.appender_for_test(0);
+        app.set_now(1);
+        let end = app
+            .append_cluster(
+                1,
+                ClusterKind::RowGenesis,
+                &genesis_payload(0, pack_version(1, 0, 0)),
+            )
+            .unwrap();
+        cnc.counters().durable.store_release(end);
+        cnc.counters().commit.store_release(end);
+        let (mut agent, _view) = agent_over(&buffer, &cnc, dir.path());
+        assert!(agent.do_work());
+        let pos = agent.take_snapshot().unwrap();
+        assert_eq!(pos, end, "sanity: the artifact is tagged at the frame end");
+
+        // A fresh page (a restarted node) and a fresh agent constructed
+        // straight from the recovered artifact — NO `do_work` call.
+        let (_, fresh_cnc, _) = world();
+        let (_agent2, _) = agent_over(&buffer, &fresh_cnc, dir.path());
+        assert_eq!(
+            fresh_cnc.cluster_applied(),
+            end,
+            "recovery alone must publish cluster_applied"
+        );
+    }
+
     /// One accepted report through `do_work`; the verdict names node 2.
     /// (The `snapshot_hash_diverged` event is emitted on the same branch;
     /// the state is the contract asserted here.)
@@ -1131,9 +1264,13 @@ mod tests {
         let (mut agent, _view) = agent_over(&buffer, &cnc, dir.path());
         assert!(agent.do_work());
         let p = agent.take_snapshot().unwrap();
-        let (pos, pins, reports) = read_committed_upgrade(dir.path()).unwrap().unwrap();
+        let (pos, pins, reports, running) = read_committed_upgrade(dir.path()).unwrap().unwrap();
         assert_eq!((pos, pins.len(), reports.len()), (p, 1, 0));
         assert_eq!(pins[0].origin, 4096);
+        // #33 task 10: the pin also set row 1's running version, and the
+        // running list rides the same reader.
+        assert_eq!(running[1].map(|r| r.version), Some(6));
+        assert_eq!(running[0], None);
     }
 
     #[test]

@@ -299,6 +299,10 @@ fn run_coverage(scratch_root: &Path) -> Verdict {
     let _ = std::fs::create_dir_all(scratch_root);
     println!("== row 1: /metrics coverage ==");
     let (_dir, mut nodes) = spawn_cluster(scratch_root, "coverage", 3, ADMISSION_BYTES);
+    // #33: the leader admits no client frame until every declared row has a
+    // running version, and genesis records one only when a leader-side
+    // service attaches — without this the load below never commits.
+    let svcs = attach_noop_everywhere(&nodes);
     let leader_idx = await_stable_leader(&nodes, 20);
     println!("leader elected: n{leader_idx}");
 
@@ -341,6 +345,9 @@ fn run_coverage(scratch_root: &Path) -> Verdict {
     for n in nodes.iter_mut() {
         n.stop();
     }
+    for svc in svcs {
+        svc.stop();
+    }
 
     let pass = missing.is_empty() && peer_occupied;
     let detail = if pass {
@@ -366,15 +373,9 @@ fn run_probes(scratch_root: &Path) -> Verdict {
     println!("\n== row 2: probe regime across a leader kill ==");
     let (_dir, mut nodes) = spawn_cluster(scratch_root, "probes", 3, ADMISSION_BYTES);
 
-    // Every node needs an attached service — see NoopSm's doc comment.
-    let mut svcs: Vec<Service<NoopSm>> = Vec::with_capacity(nodes.len());
-    for n in &nodes {
-        svcs.push(
-            ServiceBuilder::new(ServiceConfig::new(&n.instance_dir, APP), NoopSm)
-                .start()
-                .expect("service attaches"),
-        );
-    }
+    // Every node needs an attached service — see NoopSm's doc comment — and
+    // (#33) the load below needs row 0's running version recorded first.
+    let svcs = attach_noop_everywhere(&nodes);
     for n in &nodes {
         wait_ready(n.obs_addr(), 20);
     }
@@ -484,6 +485,9 @@ fn run_perturb_smoke(scratch_root: &Path, secs: u64) {
     let _ = std::fs::create_dir_all(scratch_root);
     println!("\n== row 3: scrape perturbation (SMOKE — see gate doc; rate bars are fleet-only) ==");
     let (_dir, mut nodes) = spawn_cluster(scratch_root, "perturb", 3, ADMISSION_BYTES);
+    // #33: without a running version on row 0 the leader admits nothing and
+    // both windows read 0 B/s — see `attach_noop_everywhere`.
+    let svcs = attach_noop_everywhere(&nodes);
     let leader_idx = await_stable_leader(&nodes, 20);
     println!("leader elected: n{leader_idx}");
 
@@ -492,6 +496,9 @@ fn run_perturb_smoke(scratch_root: &Path, secs: u64) {
 
     for n in nodes.iter_mut() {
         n.stop();
+    }
+    for svc in svcs {
+        svc.stop();
     }
 
     let delta_pct = if without_scrape > 0.0 {
@@ -678,6 +685,50 @@ fn await_single_leader(nodes: &[NodeH], secs: u64) -> usize {
 /// before returning — see `m10_alerts.rs`'s doc comment on the same helper
 /// for why (a 4-core dev box running 12+ busy-polling agent threads can see
 /// a spurious re-election right after the first leader settles).
+/// Attach a [`NoopSm`] on every node and wait until row 0 has a running
+/// version on the leader (#33 spec §6.2): the leader admits no client frame
+/// until every declared row has one, and genesis records it only once a
+/// LEADER-side service attaches. Every row that loads the cluster calls this
+/// first, or its submits never commit. Same shape as `m10_alerts.rs`'s
+/// helper of the same name (ruling R14).
+fn attach_noop_everywhere(nodes: &[NodeH]) -> Vec<Service<NoopSm>> {
+    let services: Vec<Service<NoopSm>> = nodes
+        .iter()
+        .map(|n| {
+            ServiceBuilder::new(ServiceConfig::new(&n.instance_dir, APP), NoopSm)
+                .start()
+                .expect("service attaches")
+        })
+        .collect();
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let leader_idx = await_single_leader(nodes, 20);
+        let has_running = matches!(
+            nodes[leader_idx]
+                .n()
+                .observability()
+                .cnc
+                .service_slot(0)
+                .status
+                .row_view(),
+            uc_log::cnc::RowRead::View {
+                running: Some(_),
+                ..
+            }
+        );
+        if has_running {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "row 0 never got a running version on the leader"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    services
+}
+
 fn await_stable_leader(nodes: &[NodeH], secs: u64) -> usize {
     let deadline = Instant::now() + Duration::from_secs(secs);
     loop {

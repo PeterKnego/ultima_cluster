@@ -734,15 +734,20 @@ fn boot_cluster(
             SMOKE_BUFFER_BYTES,
         );
         let node = Node::start_with_socket(cfg, sock).expect("node start");
+        nodes.push(node);
+        dirs.push(instance_dir);
+    }
+    // Node-then-service (2.13.0): `attach` waits for its node to have JOINED
+    // (leader known, commit learned), and no node joins before a quorum is
+    // up — so every node starts before any service attaches.
+    for instance_dir in &dirs {
         let svc = ServiceBuilder::new(
-            ServiceConfig::new(&instance_dir, app_id),
+            ServiceConfig::new(instance_dir, app_id),
             ProfileSm::default(),
         )
         .start()
         .expect("service start");
-        nodes.push(node);
         services.push(svc);
-        dirs.push(instance_dir);
     }
     let leader = await_single_leader(&nodes, 30);
     Ok((nodes, services, dirs, leader))

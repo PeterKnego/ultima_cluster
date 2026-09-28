@@ -150,6 +150,11 @@ impl AuditOrigin {
 /// there is no signed staged file and no operator: `id` carries the datagram
 /// rung the leader committed, `addr` is null, `seq`/`nonce` are 0, and
 /// `config_version` is the proposing frame's END position.
+///
+/// For `row_genesis` (op [`AUDIT_OP_ROW_GENESIS`], `source = "genesis"`, #33
+/// spec §6.1) there is likewise no operator: `id` carries the recorded packed
+/// version, `addr` is null, `detail` is `row=<n>`, and `config_version` is
+/// the `RowGenesis` frame's END position.
 pub fn op_name(op: u32) -> &'static str {
     match op {
         1 => "add_learner",
@@ -162,6 +167,7 @@ pub fn op_name(op: u32) -> &'static str {
         8 => "snapshot",
         9 => "snapshot_fetch",
         10 => "upgrade_pin",
+        AUDIT_OP_ROW_GENESIS => "row_genesis",
         _ => "unknown",
     }
 }
@@ -233,6 +239,17 @@ pub const SOURCE_OPERATOR: &str = "operator";
 /// [`AuditRecord::source`] for the `settings_apply` record path-MTU discovery
 /// writes on its own (jumbo spec §9).
 pub const SOURCE_DISCOVERY: &str = "discovery";
+
+/// [`AuditRecord::source`] for the `row_genesis` record the leader writes on
+/// its own when it records its attached service's version as a row's
+/// running version (#33 spec §6.1).
+pub const SOURCE_GENESIS: &str = "genesis";
+
+/// #33 spec §6.1: the op code of the `row_genesis` audit record. AUDIT-ONLY:
+/// it never appears on the admin request line (no verb proposes a genesis —
+/// the leader does, from its own attached version), and 100 keeps it far
+/// from the real admin op numbers so a future op cannot collide with it.
+pub const AUDIT_OP_ROW_GENESIS: u32 = 100;
 
 /// The append-only admin audit file. Opened once at node start and owned by
 /// the consensus agent (the only writer).
@@ -522,6 +539,8 @@ mod tests {
         assert_eq!(op_name(9), "snapshot_fetch");
         assert_eq!(op_name(10), "upgrade_pin");
         assert_eq!(op_name(11), "unknown");
+        assert_eq!(op_name(AUDIT_OP_ROW_GENESIS), "row_genesis");
+        assert_eq!(op_name(99), "unknown");
         assert_eq!(op_name(2), "promote");
         assert_eq!(op_name(4), "remove_learner");
         assert_eq!(op_name(5), "remove_voter");

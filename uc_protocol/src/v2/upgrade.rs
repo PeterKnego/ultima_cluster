@@ -196,6 +196,88 @@ pub fn verdict(r: &SnapshotReport) -> Verdict {
     }
 }
 
+/// `row u8 @0 ‖ reserved [u8; 3] @1 ‖ version u32 @4` — exactly 8 bytes,
+/// `CLUSTER kind = 6` (#33 spec §5.1). The leader's own attached version for
+/// a row that has none yet: a recorded FACT, never an operator's change.
+pub const ROW_GENESIS_LEN: usize = 8;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RowGenesis {
+    pub row: u8,
+    pub version: u32,
+}
+
+pub fn encode_row_genesis(g: &RowGenesis, out: &mut Vec<u8>) {
+    out.push(g.row);
+    out.extend_from_slice(&[0, 0, 0]);
+    out.extend_from_slice(&g.version.to_le_bytes());
+}
+
+/// Exact-length, reserved-zero, `row < CNC_MAX_SERVICES`.
+pub fn decode_row_genesis(buf: &[u8]) -> Option<RowGenesis> {
+    if buf.len() != ROW_GENESIS_LEN || buf[1..4] != [0, 0, 0] {
+        return None;
+    }
+    let row = buf[0];
+    if row as usize >= CNC_MAX_SERVICES {
+        return None;
+    }
+    Some(RowGenesis {
+        row,
+        version: u32::from_le_bytes(buf[4..8].try_into().ok()?),
+    })
+}
+
+/// #33 spec §5.3: one entry per row that HAS a running version, strictly
+/// increasing by row: `row u8 ‖ reserved [u8; 3] ‖ version u32 ‖
+/// record_pos u64` — exactly 16 bytes, the cluster image's trailing
+/// `running` blob (`v2::cluster_image` layout v3).
+pub const ROW_RUNNING_LEN: usize = 16;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RowRunning {
+    pub row: u8,
+    pub version: u32,
+    pub record_pos: u64,
+}
+
+/// The image's running-version blob: `count × ROW_RUNNING_LEN`, one entry
+/// per row that has a running version, in row order.
+pub fn encode_running_list(l: &[RowRunning], out: &mut Vec<u8>) {
+    for r in l {
+        out.push(r.row);
+        out.extend_from_slice(&[0, 0, 0]);
+        out.extend_from_slice(&r.version.to_le_bytes());
+        out.extend_from_slice(&r.record_pos.to_le_bytes());
+    }
+}
+
+/// Exact framing (a length that is not a multiple of [`ROW_RUNNING_LEN`] is
+/// refused), reserved-zero, `row < CNC_MAX_SERVICES`, and rows strictly
+/// increasing entry to entry — a duplicate or out-of-order row is refused
+/// rather than silently accepted, since the caller indexes this list by
+/// row.
+pub fn decode_running_list(buf: &[u8]) -> Option<Vec<RowRunning>> {
+    if !buf.len().is_multiple_of(ROW_RUNNING_LEN) {
+        return None;
+    }
+    let mut out: Vec<RowRunning> = Vec::new();
+    for c in buf.chunks_exact(ROW_RUNNING_LEN) {
+        if c[1..4] != [0, 0, 0] || c[0] as usize >= CNC_MAX_SERVICES {
+            return None;
+        }
+        if out.last().is_some_and(|p| p.row >= c[0]) {
+            return None;
+        }
+        out.push(RowRunning {
+            row: c[0],
+            version: u32::from_le_bytes(c[4..8].try_into().ok()?),
+            record_pos: u64::from_le_bytes(c[8..16].try_into().ok()?),
+        });
+    }
+    Some(out)
+}
+
 /// The image's pin blob: `count × UPGRADE_PIN_LEN`, in apply order.
 pub fn encode_pin_list(pins: &[UpgradePin], out: &mut Vec<u8>) {
     for p in pins {
@@ -239,6 +321,29 @@ pub fn decode_report_list(buf: &[u8]) -> Option<Vec<SnapshotReport>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::identity::pack_version;
+
+    #[test]
+    fn row_genesis_golden_bytes_and_strict_decode() {
+        let g = RowGenesis {
+            row: 3,
+            version: pack_version(1, 2, 3),
+        };
+        let mut b = Vec::new();
+        encode_row_genesis(&g, &mut b);
+        assert_eq!(b, [3, 0, 0, 0, 0x03, 0x00, 0x02, 0x01]);
+        assert_eq!(decode_row_genesis(&b), Some(g));
+        let mut bad = b.clone();
+        bad[1] = 1; // reserved non-zero
+        assert_eq!(decode_row_genesis(&bad), None);
+        let mut bad = b.clone();
+        bad[0] = CNC_MAX_SERVICES as u8; // row out of range
+        assert_eq!(decode_row_genesis(&bad), None);
+        assert_eq!(decode_row_genesis(&b[..7]), None); // short
+        let mut long = b.clone();
+        long.push(0);
+        assert_eq!(decode_row_genesis(&long), None); // exact length
+    }
 
     fn pin() -> UpgradePin {
         UpgradePin {
@@ -387,6 +492,31 @@ mod tests {
             (v.agreed, v.majority_hash, v.minority),
             (true, Some(5), vec![])
         );
+    }
+
+    #[test]
+    fn running_list_round_trips_and_rejects_unsorted_rows() {
+        let l = vec![
+            RowRunning {
+                row: 0,
+                version: pack_version(1, 0, 0),
+                record_pos: 640,
+            },
+            RowRunning {
+                row: 3,
+                version: 0,
+                record_pos: 1280,
+            },
+        ];
+        let mut b = Vec::new();
+        encode_running_list(&l, &mut b);
+        assert_eq!(b.len(), 2 * ROW_RUNNING_LEN);
+        assert_eq!(decode_running_list(&b), Some(l.clone()));
+        let mut swapped = b[ROW_RUNNING_LEN..].to_vec();
+        swapped.extend_from_slice(&b[..ROW_RUNNING_LEN]);
+        assert_eq!(decode_running_list(&swapped), None);
+        assert_eq!(decode_running_list(&b[..15]), None);
+        assert_eq!(decode_running_list(&[]), Some(vec![]));
     }
 
     #[test]

@@ -15,7 +15,7 @@
 //! tail identically — 249 either way — so the artifact path and
 //! continue-from-X land on the same value and the case could not fail on the
 //! rewind it is named for. `--double-cas` (`DoublingCasRegisterSm`, VERSION
-//! 3) also doubles `Cas.new`, which makes the tail's RESULT depend on the
+//! 0.3.0) also doubles `Cas.new`, which makes the tail's RESULT depend on the
 //! version while its OUTCOME still depends on the state at P: artifact/live
 //! = 400, continue-from-X = 249, genesis = 398, three distinct values. Both
 //! cases additionally require `install_logged` — the SDK's own
@@ -141,7 +141,7 @@ fn an_in_memory_register_passes_and_demonstrates_the_counterfactual() {
         &corpus,
         &["serve"],
         &["serve", "--double"],
-        "2",
+        "0.2.0",
         "pv-empty",
         Some(WRITES),
     );
@@ -200,7 +200,7 @@ fn a_durable_register_is_rewound_to_the_origin_and_passes() {
         &corpus,
         &["serve", "--durable"],
         &["serve", "--double-cas", "--durable"],
-        "3",
+        "0.3.0",
         "pv-durable",
         Some(WRITES),
     );
@@ -247,8 +247,9 @@ fn a_durable_register_is_rewound_to_the_origin_and_passes() {
     );
 }
 
-/// (c) Teeth for the swap arm: NEW is the OLD binary (version 0) while the
-/// pin names 2 — the SDK refuses it at attach, and the mode must FAIL.
+/// (c) Teeth for the swap arm: NEW is the OLD binary (version 0.0.0) while
+/// the pin names 0.2.0 — another line, so the SDK refuses it at attach, and
+/// the mode must FAIL.
 #[test]
 fn a_new_binary_that_is_not_the_pinned_version_is_a_fail() {
     let (_inst, corpus) = cas_corpus("pv-stale");
@@ -256,7 +257,7 @@ fn a_new_binary_that_is_not_the_pinned_version_is_a_fail() {
         &corpus,
         &["serve"],
         &["serve"],
-        "2",
+        "0.2.0",
         "pv-stale",
         Some(WRITES),
     );
@@ -277,7 +278,7 @@ fn a_pure_write_corpus_is_inconclusive_not_a_pass() {
         &corpus,
         &["serve"],
         &["serve", "--double"],
-        "2",
+        "0.2.0",
         "pv-writes",
         None,
     );
@@ -305,7 +306,7 @@ fn a_same_version_run_is_refused_before_the_pin() {
         &corpus,
         &["serve", "--double"],
         &["serve", "--double"],
-        "2",
+        "0.2.0",
         "pv-same",
         None,
     );

@@ -293,10 +293,10 @@ impl Fixture {
         f
     }
 
-    /// [`Fixture::build`] with the v1 service still ATTACHED and handed back.
-    /// One test needs the v1 era to continue past the pin — that is the
-    /// window spec §3 S4 describes, and it is the window in which a cadence
-    /// instant can land.
+    /// [`Fixture::build`] with the v1 service still ATTACHED and handed back,
+    /// for the tests that commit a REAL pin while v1 runs. Since #33 that
+    /// v1 stops at the pin record ([`wait_stopped_at_the_pin`]); before it,
+    /// v1 kept applying past the pin (spec §3 S4's window, now closed).
     fn build_with_v1(app: &'static str, spec: Spec) -> (Fixture, Service<RegisterSm>) {
         let dir = tempdir();
         let node = start_node(dir.path(), app, spec.purge, spec.segment_bytes);
@@ -506,6 +506,15 @@ fn artifact_path(dir: &Path, p: u64) -> std::path::PathBuf {
         .join(format!("snap-{p}.ultsnap"))
 }
 
+/// #33 spec §7.2: a service still attached when a pin to another LINE
+/// commits stops at exactly the pin record — its apply thread fail-stops
+/// (`version_superseded`), so `Service::stop` would re-raise that panic.
+/// Wait for the stop, then drop the handle (which joins without re-raising).
+fn wait_stopped_at_the_pin(svc: Service<RegisterSm>) {
+    wait_until("v1 stopped at the pin record (#33)", || !svc.is_alive());
+    drop(svc);
+}
+
 // --------------------------------------------------------------------- tests
 
 /// Spec §3 S4 step 5: the pin names the version that may serve this row, and
@@ -636,21 +645,49 @@ fn a_pinned_attach_converges_on_a_purging_cluster() {
 
 /// The control that makes the assertion above evidence: the SAME swap with no
 /// pin computes the §2.3 counterfactual instead.
+///
+/// #33 (spec §7.1): an unpinned attach of a binary off the row's running line
+/// is now refused BY NAME — `RegisterSm`'s attach recorded 0.0.0, and
+/// `DoublingRegisterSm` is 0.2.0 — so the unpinned swap can no longer run
+/// through attach at all. The counterfactual it would have computed is
+/// computed directly instead (v2's `apply` over the journal from genesis to
+/// the same frontier, as [`a_durable_sm_above_the_origin_is_rewound_to_it`]
+/// builds its precondition), so `Some(CAS_NEW)` above still stands against
+/// `Some(COUNTERFACTUAL)` here.
 #[test]
 fn the_same_swap_without_a_pin_computes_the_counterfactual() {
     let f = Fixture::new("pin-none");
-
-    let svc2 = ServiceBuilder::new(cfg(f.path(), f.app), DoublingRegisterSm::default())
-        .start_with_snapshots()
-        .unwrap();
     let cnc = f.cnc();
-    wait_service_caught_up(&cnc);
+
+    let err = ServiceBuilder::new(cfg(f.path(), f.app), DoublingRegisterSm::default())
+        .start_with_snapshots()
+        .err()
+        .expect("an unpinned off-line swap is refused at attach (#33)");
+    assert!(
+        matches!(
+            err,
+            ServiceError::VersionMismatch { row: 0, running, mine, .. }
+                if running == V1 && mine == V2
+        ),
+        "{err}"
+    );
     assert_eq!(
-        query_v2(&svc2),
+        cnc.service_slot(0).status.load_acquire() & CNC_SVC_STATUS_ATTACHED,
+        0,
+        "nothing was written to the slot"
+    );
+
+    let end = {
+        let c = cnc.counters();
+        c.commit.load_acquire().min(c.durable.load_acquire())
+    };
+    let mut v2 = DoublingRegisterSm::default();
+    replay_from_genesis(&mut v2, &f.path().join("journal"), end);
+    assert_eq!(
+        StateMachine::query(&v2, ()),
         Some(COUNTERFACTUAL),
         "unpinned, v2 replays [0, P) itself: Write(4) stores 8 and the CAS fails"
     );
-    svc2.stop();
     f.stop();
 }
 
@@ -741,10 +778,18 @@ fn a_pinned_origin_with_no_artifact_is_refused() {
 /// Plan B2 erratum: the pinned install cross-checks the artifact against the
 /// pin's `from`, not against `S::VERSION`. A pin naming a `from` no artifact
 /// on this node was built by is refused by name.
+///
+/// #33 D3 (spec §7.3): that cross-check is by LINE, so "no artifact was built
+/// by `from`" means "none was built on `from`'s major.minor". The artifact
+/// here was built by `V1` (0.0.0); `from` is 1.0.0, a different line. (This
+/// test used `from = 3` — 0.0.3, the same line as 0.0.0 since #33, which
+/// [`a_pinned_artifact_built_by_a_patch_of_from_is_installed`] now covers.)
 #[test]
 fn a_pinned_artifact_built_by_the_wrong_version_is_refused() {
     let f = Fixture::new("pin-wrongfrom");
-    f.pin(3, V2);
+    let off_line = uc_protocol::identity::pack_version(1, 0, 0);
+    assert!(!uc_protocol::identity::same_line(off_line, V1));
+    f.pin(off_line, V2);
 
     let err = ServiceBuilder::new(cfg(f.path(), f.app), DoublingRegisterSm::default())
         .start_with_snapshots()
@@ -756,13 +801,86 @@ fn a_pinned_artifact_built_by_the_wrong_version_is_refused() {
             ServiceError::MistaggedSnapshot {
                 source: EnvelopeError::VersionMismatch {
                     built: V1,
-                    expected: 3
+                    expected
                 },
                 ..
-            }
+            } if expected == off_line
         ),
         "{err}"
     );
+    f.stop();
+}
+
+/// #33 D3 (spec §7.3): patch builds of one line share the artifact format, so
+/// a pin whose `from` is another PATCH of the artifact's builder installs it —
+/// origin artifacts on different nodes may come from different patch builds
+/// of `from`'s line. `Some(CAS_NEW)` is the install-then-recompute signature
+/// (module doc).
+#[test]
+fn a_pinned_artifact_built_by_a_patch_of_from_is_installed() {
+    let f = Fixture::new("pin-patchfrom");
+    let patch = V1 + 3; // 0.0.3: same major.minor as V1 (0.0.0), other patch
+    assert!(patch != V1 && uc_protocol::identity::same_line(patch, V1));
+    f.pin(patch, V2);
+
+    let svc2 = ServiceBuilder::new(cfg(f.path(), f.app), DoublingRegisterSm::default())
+        .start_with_snapshots()
+        .expect("a same-line artifact installs");
+    let cnc = f.cnc();
+    wait_service_caught_up(&cnc);
+    assert_eq!(
+        query_v2(&svc2),
+        Some(CAS_NEW),
+        "the artifact at P was installed, then the tail recomputed under v2"
+    );
+    drop(svc2);
+    f.stop();
+}
+
+/// #33 ruling R17 (spec D3, patch is free): a pin names a LINE, not a
+/// build. A PATCH build of the pin's `to` attaches to the pinned row and
+/// takes the pinned path — installs the origin, recomputes the tail — rather
+/// than being refused, so a patch release of the pinned version can roll
+/// node by node after the pin. A build on another line is still refused by
+/// name.
+#[test]
+fn a_patch_build_of_the_pinned_to_installs_the_origin() {
+    let f = Fixture::new("pin-patchto");
+    let to_patch = V2 + 5; // 0.2.5: DoublingRegisterSm (0.2.0)'s line, other patch
+    assert!(to_patch != V2 && uc_protocol::identity::same_line(to_patch, V2));
+    f.pin(V1, to_patch);
+
+    // Off-line (V1 = 0.0.0 against the pinned 0.2.x): refused by name.
+    let err = ServiceBuilder::new(cfg(f.path(), f.app), RegisterSm::default())
+        .start_with_snapshots()
+        .err()
+        .expect("an off-line build is refused");
+    assert!(
+        matches!(
+            err,
+            ServiceError::PinnedVersionMismatch {
+                row: 0,
+                pinned,
+                mine: V1,
+                ..
+            } if pinned == to_patch
+        ),
+        "{err}"
+    );
+
+    // Same line, other patch: admitted, and it installs the origin.
+    let svc2 = ServiceBuilder::new(cfg(f.path(), f.app), DoublingRegisterSm::default())
+        .start_with_snapshots()
+        .expect("a patch build of the pinned `to` attaches");
+    let cnc = f.cnc();
+    wait_service_caught_up(&cnc);
+    assert_eq!(
+        query_v2(&svc2),
+        Some(CAS_NEW),
+        "the artifact at P was installed, then the tail recomputed under v2"
+    );
+    assert_eq!(svc2.pinned(), Some((f.p, V1, to_patch)));
+    drop(svc2);
     f.stop();
 }
 
@@ -884,23 +1002,30 @@ fn a_pinned_attach_prefers_the_origin_over_a_later_artifact() {
     f.stop();
 }
 
-/// Plan B2 T5 (fix round), the REAL shape the test above constructs by hand:
-/// purge on, a real `uc2ctl upgrade pin`, and then a real cadence instant at
-/// **P2 > origin** taken while v1 is STILL ATTACHED — the window spec §3 S4
-/// describes, in which `from` keeps applying between the pin and the swap.
+/// Plan B2 T5 (fix round): purge on, a real `uc2ctl upgrade pin`, and then a
+/// real cadence instant at **P2 > origin**.
 ///
-/// Two things have to hold and neither did before this round:
+/// Before #33 this instant was taken while v1 was STILL APPLYING — the window
+/// spec §3 S4 described, in which `from` kept applying between the pin and
+/// the swap and built `snap-P2` itself, so the node's floor hold
+/// (`Consensus::hold_floor_for_pins`) and the service's preference for the
+/// pinned origin over `snap-P2` were both load-bearing here. #33 (spec §7.2)
+/// CLOSES that window: an attached v1 stops at exactly the pin record, so
+/// `from` builds nothing above it. What this test now pins:
 ///
-/// * the NODE must not let its snapshot floor — and the journal purge behind
-///   it — pass a pinned origin it has not consumed
-///   (`Consensus::hold_floor_for_pins`). Without that, `archive_first_base`
-///   climbs past the origin and the pinned attach's tail replay has no
-///   covering artifact it may install;
-/// * the SERVICE's gap guard must then prefer the pinned origin over
-///   `snap-P2`, which v1 built (plan B2 T5's `replay.rs` change).
+/// * v1 stops at the pin (it does not keep applying);
+/// * the instant at P2 therefore finds no row-0 builder — no `snap-P2`, no
+///   complete set at P2, and the journal the pinned attach replays from
+///   stays (`archive_first_base <= origin`);
+/// * the pinned attach converges (`Some(CAS_NEW)`).
+///
+/// The origin-over-a-later-`from`-artifact preference stays covered by
+/// [`a_pinned_attach_prefers_the_origin_over_a_later_artifact`], which
+/// constructs that artifact by hand.
 ///
 /// The pin goes in through admin op 10 rather than [`Fixture::pin`] because
-/// the node's hold reads the COMMITTED view.
+/// only a COMMITTED pin is a version record the apply loop acts on, and the
+/// node's hold reads the committed view.
 #[test]
 fn a_pinned_attach_survives_a_cadence_instant_after_the_pin() {
     let (f, svc1) = Fixture::build_with_v1("pin-cadence", Spec::purging());
@@ -920,29 +1045,30 @@ fn a_pinned_attach_survives_a_cadence_instant_after_the_pin() {
                 to: V2,
             }
     });
+    wait_stopped_at_the_pin(svc1);
 
-    // The cadence instant, with v1 still attached: `snap-P2` is built by
-    // `from`, and the set at P2 completes.
+    // The cadence instant, with v1 stopped at the pin: nothing on row 0 can
+    // build `snap-P2`, so the set at P2 never completes on this node.
     let p2 = command_instant(&f.node);
     assert!(p2 > origin, "P2={p2} must sit above the origin={origin}");
-    wait_until("row 0 published snap-P2", || {
-        artifact_path(f.path(), p2).is_file()
-    });
-    wait_until("the set at P2 is this node's newest", || {
-        f.node.snapshot_set_position() == p2
-    });
     // Give the floor tick every chance to move (it is throttled to 100 ms and
-    // the purge behind it is asynchronous): if the hold is missing, this is
-    // where `archive_first_base` climbs past the origin.
+    // the purge behind it is asynchronous).
     std::thread::sleep(Duration::from_millis(500));
     assert!(
+        !artifact_path(f.path(), p2).is_file(),
+        "a stopped `from` must not build snap-P2 above its pin"
+    );
+    assert!(
+        f.node.snapshot_set_position() < p2,
+        "no complete set at P2 without a row-0 artifact"
+    );
+    assert!(
         f.node.archive_first_base() <= origin,
-        "the floor hold must keep the journal the pinned attach replays from: \
+        "the journal the pinned attach replays from must stay: \
          archive_first_base={} origin={origin} P2={p2}",
         f.node.archive_first_base()
     );
 
-    svc1.stop();
     let svc2 = ServiceBuilder::new(cfg(f.path(), f.app), DoublingRegisterSm::default())
         .start_with_snapshots()
         .unwrap();
@@ -950,7 +1076,7 @@ fn a_pinned_attach_survives_a_cadence_instant_after_the_pin() {
     assert_eq!(
         query_v2(&svc2),
         Some(CAS_NEW),
-        "a pinned attach converges even though `from` took an instant after the pin"
+        "a pinned attach converges after an instant above the pin"
     );
     assert_eq!(svc2.pinned(), Some((origin, V1, V2)));
     svc2.stop();
@@ -1064,7 +1190,7 @@ fn a_restarted_node_publishes_the_pin_before_the_declared_set() {
 
     let old_instance = cnc.try_meta().expect("meta").instance_id;
     drop(cnc);
-    svc1.stop();
+    wait_stopped_at_the_pin(svc1);
     node.stop();
 
     // The watcher: spin until a page with a NEW `instance_id` publishes a
@@ -1161,7 +1287,7 @@ fn a_pin_above_the_recovered_artifact_is_published_before_the_declared_set() {
 
     let old_instance = cnc.try_meta().expect("meta").instance_id;
     drop(cnc);
-    svc1.stop();
+    wait_stopped_at_the_pin(svc1);
     node.stop();
 
     // The watcher: spin until a page with a NEW `instance_id` publishes a

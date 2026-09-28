@@ -305,6 +305,38 @@ fn page_one_service_band_is_the_min_over_declared_ids() {
         "page-1 epoch is retired"
     );
 
+    // #33 spec §6.2: the leader admits no client frame until EVERY declared
+    // row has a running version, and it records one (genesis) only for a
+    // service attached on its page. FSM 1 must stay ABSENT for what this
+    // test asserts — a real attach would leave its `applied`/heartbeat words
+    // behind after it stopped — so stand in for the attach on the status
+    // line alone until genesis commits, then put the line back.
+    let s1 = cnc.service_slot(1);
+    let prev = s1.status.load_acquire();
+    s1.status
+        .store_release(uc_log::cnc::pack_service_status(1, true, 1));
+    let versioned = || {
+        matches!(
+            s1.status.row_view(),
+            uc_log::cnc::RowRead::View {
+                running: Some(_),
+                ..
+            }
+        )
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !versioned() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "row 1 never got a running version"
+        );
+        s1.heartbeat_ns
+            .store_release(uc_node::obs::metrics::now_unix_ns());
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    s1.status.store_release(prev);
+    s1.heartbeat_ns.store_release(0);
+
     let client = Client::connect(dir.path(), APP).unwrap();
     for _ in 0..20 {
         let _: u64 = client.submit(&Cmd::Add(1)).unwrap();

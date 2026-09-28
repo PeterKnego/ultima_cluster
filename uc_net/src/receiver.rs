@@ -633,7 +633,8 @@ pub struct FollowerStats {
     /// the offending row's detail.
     pub snap_refused_declared_mismatch: AtomicU64,
     /// Wire 0.7.0 (spec §5, §8): a `SNAP_BEGIN` arrived whose identity
-    /// matched at every row but whose `version` differed from this node's own
+    /// matched at every row but whose `version` is on a different LINE
+    /// (major.minor; patch ignored since #33 ruling R17) from this node's own
     /// at some row where BOTH sides report a nonzero version — the named
     /// refusal **`version mismatch`**. An unversioned side (0) is never a
     /// mismatch: it means "unknown," not "empty." See
@@ -2400,9 +2401,15 @@ impl FollowerReceiver {
         }
         if let Some(own) = &self.own_versions {
             let ours = own();
-            if let Some(r) =
-                (0..8).find(|&r| ours[r] != 0 && b.version[r] != 0 && ours[r] != b.version[r])
-            {
+            // #33 ruling R17 (spec D3, patch is free): versions compare by
+            // LINE (major.minor), so two patch builds of one line exchange
+            // sessions and a patch release rolls node by node. `0` on either
+            // side still means "unknown here", never a mismatch.
+            if let Some(r) = (0..8).find(|&r| {
+                ours[r] != 0
+                    && b.version[r] != 0
+                    && !uc_protocol::identity::same_line(ours[r], b.version[r])
+            }) {
                 *self
                     .stats
                     .version_refusal

@@ -162,7 +162,9 @@ pub enum ServiceError {
     )]
     AlreadyAttached { name: String, row: u8 },
     /// Plan B2 T4 (spec §3 S4 step 5): the row carries a committed upgrade
-    /// pin naming a target version, and this binary is not it. The pin is the
+    /// pin naming a target version, and this binary is not on its LINE
+    /// (major.minor — a patch build of `to` is admitted and takes the pinned
+    /// install, #33 ruling R17 / spec D3). The pin is the
     /// cluster's decision about which version may serve the row from the
     /// origin onward, so a stale binary rejoining afterwards — the one thing
     /// the pin exists to stop — is refused BY NAME, before any slot word is
@@ -179,8 +181,9 @@ pub enum ServiceError {
         pinned: u32,
         mine: u32,
     },
-    /// The row's four pin words could not be read consistently through the
-    /// `pin_seq` seqlock ([`uc_log::cnc::PinRead::Contended`]). A reader that
+    /// The row's view (the pin triple and, since #33, the running-version
+    /// words) could not be read consistently through the `pin_seq` seqlock
+    /// ([`uc_log::cnc::RowRead::Contended`]). A reader that
     /// must DECIDE never treats that as "no pin": attaching unpinned off a
     /// half-published triple would skip an install the cluster requires.
     /// Transient by construction — the next attach converges.
@@ -189,6 +192,23 @@ pub enum ServiceError {
          uc2-cluster agent is mid-publish); retry the attach"
     )]
     PinUnreadable { row: u8 },
+    /// #33 spec §7.1: the row has a committed running version and this
+    /// binary is not on its LINE (major.minor; patch is free, D3). Refused by
+    /// name before any slot word is written; the only way to move a row to
+    /// another line is `uc2ctl upgrade pin`.
+    #[error(
+        "row {row} ({name:?}) runs {running_v}; this binary is {mine_v} — install a \
+         {running_line} build, or move the row to this version with `uc2ctl upgrade pin`",
+        running_v = uc_protocol::identity::VersionDisplay(*running),
+        mine_v = uc_protocol::identity::VersionDisplay(*mine),
+        running_line = LineDisplay(*running)
+    )]
+    VersionMismatch {
+        name: String,
+        row: u8,
+        running: u32,
+        mine: u32,
+    },
     /// A pinned row MUST install the artifact at its origin, and only
     /// [`ServiceBuilder::start_with_snapshots`](crate::ServiceBuilder::start_with_snapshots)
     /// carries the install capability (`S: SnapshotStateMachine`). A plain
@@ -212,6 +232,17 @@ pub enum ServiceError {
     PinnedArtifactMissing { row: u8, origin: u64, path: String },
 }
 
+/// `Display` for a packed version's LINE: `"2.1.x"` (patch elided — any
+/// patch of the line is admitted, spec D3).
+struct LineDisplay(u32);
+
+impl std::fmt::Display for LineDisplay {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (major, minor, _) = uc_protocol::identity::unpack_version(self.0);
+        write!(f, "{major}.{minor}.x")
+    }
+}
+
 /// Why a [`SnapshotStateMachine`](crate::SnapshotStateMachine) freeze/stream/
 /// install failed. Mirrors the v1 `uc_service::SnapshotError` shape (an I/O
 /// failure or a codec/serialization failure), re-exported at the crate root.
@@ -221,4 +252,28 @@ pub enum SnapshotError {
     Io(#[from] std::io::Error),
     #[error("codec: {0}")]
     Codec(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use uc_protocol::identity::pack_version;
+
+    /// #33 spec §7.1: the refusal names the row, the FSM, the running
+    /// version, this binary's version, the line to install, and the pin.
+    #[test]
+    fn version_mismatch_names_everything_an_operator_needs() {
+        let e = ServiceError::VersionMismatch {
+            name: "kv".into(),
+            row: 3,
+            running: pack_version(2, 1, 0),
+            mine: pack_version(2, 0, 3),
+        };
+        assert_eq!(
+            e.to_string(),
+            "row 3 (\"kv\") runs 2.1.0; this binary is 2.0.3 — install a 2.1.x build, \
+             or move the row to this version with `uc2ctl upgrade pin`"
+        );
+        assert_eq!(LineDisplay(0).to_string(), "0.0.x");
+    }
 }

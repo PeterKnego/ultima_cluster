@@ -10,8 +10,8 @@ self-locating header is in [Architecture](../ARCHITECTURE.md).
 
 | Constant | Value |
 |---|---|
-| `version::CURRENT` | `0.7.0` (`0.8.0`, since `2.12.0`, two new pairwise kinds for jumbo-frame MTU discovery, `PROBE` (24) and `PROBE_ACK` (25); no existing layout changes) (`0.9.0`, since `2.13.0`, two `CLUSTER` kinds, 4 and 5, and one pairwise datagram kind, `SNAP_REPORT` (26), no layout change; a 0.8.0 peer applies either as undecodable and its cluster FSM silently diverges — stop every node before starting any) |
-| cnc page version | 3.1 (FSM identity + log time, 2.11.0: the name + hash line at boot, the version word at attach, `log_time_ns`, per-row `timers_pending`) (3.2, since `2.12.0`, a live `payload_ceiling` word) (3.3, since `2.13.0`, five new words: four node-written on the service status line — `upgrade_origin` (`+16`), `pinned_version` (`+24`), the seqlock word `pin_seq` (`+32`) that publishes the first two as a pair, and `pinned_from` (`+40`) — plus one **service**-written word on slot line 7, `artifact_hash` (`+504`), which fills that line) |
+| `version::CURRENT` | `0.7.0` (`0.8.0`, since `2.12.0`, two new pairwise kinds for jumbo-frame MTU discovery, `PROBE` (24) and `PROBE_ACK` (25); no existing layout changes) (`0.9.0`, since `2.13.0`, two `CLUSTER` kinds, 4 and 5, and one pairwise datagram kind, `SNAP_REPORT` (26), no layout change; a 0.8.0 peer applies either as undecodable and its cluster FSM silently diverges — stop every node before starting any) (`0.10.0`, #33, unreleased as this is written: one `CLUSTER` kind, 6 `RowGenesis`, no layout change; a 0.9.0 peer refuses it as undecodable and its cluster FSM silently diverges — never learns the row's running version — so again stop every node before starting any) |
+| cnc page version | 3.1 (FSM identity + log time, 2.11.0: the name + hash line at boot, the version word at attach, `log_time_ns`, per-row `timers_pending`) (3.2, since `2.12.0`, a live `payload_ceiling` word) (3.3, since `2.13.0`, five new words: four node-written on the service status line — `upgrade_origin` (`+16`), `pinned_version` (`+24`), the seqlock word `pin_seq` (`+32`) that publishes the first two as a pair, and `pinned_from` (`+40`) — plus one **service**-written word on slot line 7, `artifact_hash` (`+504`), which fills that line) (3.4, #33, three node-written words: `running_version` (`+48`) and `running_record_pos` (`+56`) on the service status line, under the same `pin_seq` seqlock, which fills that line; and `cluster_applied` at page-1 offset `4056`) |
 
 The cnc page carries its own version gate, `CNC_V2_VERSION`, which is
 independent of this one. cnc 3.1 changed the same-host shmem layout only
@@ -335,7 +335,7 @@ seeds its clamp from.
 `FRAME_TYPE_CLUSTER = 4` carries every change to the cluster's own state —
 membership, the replicated schedule table, the replicated settings record,
 and, since `0.9.0` (`2.13.0`), an upgrade pin event and a snapshot hash
-report. It reuses `CONFIG`'s number: `2.11.0` is a flag day anyway, and no
+report, and, since `0.10.0` (#33), a row's first running version. It reuses `CONFIG`'s number: `2.11.0` is a flag day anyway, and no
 shipped node ever emitted a frame `4` that was not a membership record.
 
 The log is a **broadcast** log — it carries no service id and does no routing —
@@ -343,7 +343,7 @@ so the frame type is the only router there is. One type, one kind byte:
 
 | bytes | field | meaning |
 |---|---|---|
-| 0 | `kind` | `1` = Membership, `2` = ScheduleTable, `3` = Settings, `4` = UpgradePin, `5` = SnapshotReport; any other value is undecodable |
+| 0 | `kind` | `1` = Membership, `2` = ScheduleTable, `3` = Settings, `4` = UpgradePin, `5` = SnapshotReport, `6` = RowGenesis (0.10.0); any other value is undecodable |
 | 1..8 | reserved | written as zero, and a **non-zero** reserved byte makes the body undecodable — the bytes are claimable by a later kind without ambiguity |
 | 8.. | `payload` | the kind's own encoding |
 
@@ -358,17 +358,25 @@ otherwise the kind plus the payload slice. Per kind:
 | `3` Settings | `SETTINGS_LEN = 33` bytes exactly (**`2.12.0`**; was 29 through `2.11.0`): `version u32 = 2 ‖ fsm_lag_bytes u64 @4 ‖ admission_bytes u64 @12 ‖ snapshot_interval_bytes u64 @20 ‖ snapshot_target u8 @28 ‖ datagram_mtu u32 @29`. `0` in any u64 means "derive at use"; `fsm_lag_bytes = u64::MAX` (`FSM_LAG_LOCKSTEP`) means lockstep; `snapshot_target` is `0` = all, `1` = learners; `datagram_mtu` is `0` (= the `MTU_DEFAULT` baseline) or a member of `RUNGS`, discovered and monotone, never operator-written. A **version `1`** record — 29 B, `SETTINGS_LEN_V1`, the `2.11.0` shape — is still ACCEPTED on read and maps to `datagram_mtu = 0`, because the cluster artifact and committed `CLUSTER` frames survive the upgrade; an encoder always writes version 2. No trailing bytes are tolerated, and no other `(version, len)` pair decodes | `uc_protocol::v2::settings` |
 | `4` UpgradePin | **20 B** exactly: `row u8 @0 ‖ reserved [u8; 3] @1 ‖ from u32 @4 ‖ to u32 @8 ‖ origin u64 @12`. `row < 8`, `origin > 0`, reserved zero. An EVENT ("at `origin`, `row` went `from` → `to`"), kept as a per-row history of at most 4 in the cluster FSM and republished into the row's cnc status line (`+16`/`+24`) | `uc_protocol::v2::upgrade` |
 | `5` SnapshotReport | `row u8 @0 ‖ count u8 @1 ‖ reserved [u8; 6] @2 ‖ position u64 @8 ‖ count × (node_id u32 ‖ hash u64)`, `1 ≤ count ≤ 8` → **16–112 B**, node ids strictly increasing. The leader's collected per-node artifact hashes for `(row, position)`; the verdict (all equal / majority names minority / no majority) is recomputed by every reader, never carried | `uc_protocol::v2::upgrade` |
+| `6` RowGenesis (0.10.0, #33) | **8 B** exactly (`ROW_GENESIS_LEN`): `row u8 @0 ‖ reserved [u8; 3] @1 ‖ version u32 @4`. `row < 8`, reserved zero; `version` is a packed version and `0` is a legal value (an unversioned FSM). A recorded FACT, not an operator's change: the leader appends it on its own, once per row, naming the version of its own attached service when the row has no running version yet. Applied at commit, it sets the row's running version; refused `60 version_already_set` if the row already has one. An accepted `UpgradePin` (kind 4) sets the running version too, to its `to`, and is refused `53` when its `from` is not on the running line (same major.minor) | `uc_protocol::v2::upgrade` (`encode_row_genesis`/`decode_row_genesis`) |
 
-The largest of the five is still the table at 1064 B, inside the 1312 B
+The largest of the six is still the table at 1064 B, inside the 1312 B
 crypto-on ceiling at the 1408 B baseline rung — the floor the ceiling only
 rises from once a jumbo path is discovered (`2.12.0`; up to 8864 B crypto-on
 at the top rung) — so a `CLUSTER` frame always fits one datagram
 ([Limits](limits.md#hard-limits)).
 
-**Two consumers, one frame.** Every FSM's apply loop yields a `CLUSTER` frame,
-so it costs a user row nothing. The node's fifth polling agent, `uc2-cluster`,
+**Two consumers, one frame.** Every FSM's apply loop yields a `CLUSTER` frame
+without applying it. Since `0.10.0` it does look at one: a kind `4` or `6`
+record naming its own row, above the position its attach already decided, is
+where the service waits for the cluster FSM's verdict (the page-1
+`cluster_applied` word passing the record) and stops at exactly the record's
+start if the row moved to another major.minor
+([the row running version, explained](../notes/uc2-row-running-version-explained.md)).
+That check sits out of line behind the frame-type test, so every other
+`CLUSTER` frame still costs a user row nothing. The node's fifth polling agent, `uc2-cluster`,
 acts on it: it applies the command at **commit** into the cluster FSM, which is
-the snapshot authority for all five records. *Additionally*, for `kind = 1`
+the snapshot authority for all six records. *Additionally*, for `kind = 1`
 only, the archive's header walk reads the kind byte and feeds the membership
 payload to the consensus kernel at **durability**, exactly as it fed `CONFIG`
 — because Raft requires a node to use the newest configuration in its log
@@ -376,7 +384,7 @@ whether or not it is committed. Two readers, two time bases, one frame; the
 reasoning is
 [the cluster FSM explainer § Membership](../notes/uc2-cluster-fsm-explained.md#membership-one-frame-two-readers-and-why-that-is-safe).
 
-Decode is fuzzed as `uc_protocol_cluster_frame` (the prefix plus all five
+Decode is fuzzed as `uc_protocol_cluster_frame` (the prefix plus all six
 payload codecs) and `uc_protocol_settings` (the settings record alone, with a
 re-encode round-trip).
 

@@ -62,7 +62,9 @@ use uc_protocol::v2::ipc::{
     split_query_payload,
 };
 
-use crate::audit::{AuditLog, AuditOrigin, AuditOutcome, AuditRecord, op_name};
+use crate::audit::{
+    AUDIT_OP_ROW_GENESIS, AuditLog, AuditOrigin, AuditOutcome, AuditRecord, op_name,
+};
 use crate::cluster_fsm::{
     ClusterCommand, ClusterFsm, ClusterState, ClusterView, ClusterViewInner, SCHEDULE_PENDING_FILE,
     SETTINGS_PENDING_FILE, UPGRADE_PENDING_FILE, staged_digest,
@@ -89,7 +91,7 @@ use uc_protocol::v2::schedule::{
     decode_schedule_table,
 };
 use uc_protocol::v2::settings::{Settings, Target, decode_settings};
-use uc_protocol::v2::upgrade::{SnapshotReport, UPGRADE_PIN_LEN, decode_upgrade_pin};
+use uc_protocol::v2::upgrade::{RowGenesis, SnapshotReport, UPGRADE_PIN_LEN, decode_upgrade_pin};
 
 /// Single-slot truncation ack. One truncation is in flight at a time (the SM
 /// latch serializes them), so a slot suffices and, unlike a bounded channel,
@@ -387,6 +389,10 @@ pub const SNAP_REPORT_TIMEOUT_NS: u64 = 5_000_000_000;
 /// ~0.9 s on an idle dev box) until a CPU-starved CI runner held a node for
 /// the whole 10 s without ever reaching it (nightly 2026-09-25).
 const DECLARED_WITHHELD_WARN_NS: u64 = 2_000_000_000;
+
+/// #33 spec §6.2: how often a closed client gate logs `version_gate_waiting`.
+const VERSION_GATE_LOG_NS: u64 = 5_000_000_000;
+
 /// Output-progress persist floor (Task 12 / spec §7): rate-limits the durable
 /// `StableValue::store` (an fsync) to at most once per 100 ms even under a
 /// change every cycle. The cheap in-page `output_completed` compare still runs
@@ -556,6 +562,10 @@ pub const REASON_PIN_DIGEST: u32 = 56;
 pub const REASON_PIN_MISSING: u32 = 57;
 pub const REASON_PIN_DECODE: u32 = 58;
 pub const REASON_REPORT_STALE: u32 = 59;
+/// #33 spec §4.1: a `RowGenesis` for a row that already has a running
+/// version. FSM-only (`ClusterRefusal::VersionAlreadySet`): the leader's own
+/// genesis append validates first and simply skips a row that has one.
+pub const REASON_VERSION_ALREADY_SET: u32 = 60;
 
 /// Jumbo spec §7.1: the datagram rung a committed `Settings::datagram_mtu`
 /// word means, and whether it had to be clamped to get there.
@@ -2286,6 +2296,8 @@ impl Node {
             cfg_obs_rx,
             view_position_seen: u64::MAX, // see the field: the first refresh must always run
             last_cluster_append: 0,
+            rows_versioned_latched: false,
+            next_version_gate_log_ns: 0,
             schedule_position: 0,
             last_armed_table_position: 0,
             schedule_pending: instance.root.join(SCHEDULE_PENDING_FILE),
@@ -3361,6 +3373,14 @@ struct Consensus {
     /// cluster FSM applies whichever of the two commits, in log order, and a
     /// truncated one simply never reaches the view.
     last_cluster_append: u64,
+    /// #33 spec §6.2, the client gate: `true` once every declared row has a
+    /// running version on the published cluster view. LATCHED for the
+    /// incarnation — a committed version is never removed (a pin replaces
+    /// it, never clears it), so once open the steady state is one bool test.
+    rows_versioned_latched: bool,
+    /// Throttle for `version_gate_waiting` (on `pass_mono_ns`): the next
+    /// pass at or after which the closed gate may log again.
+    next_version_gate_log_ns: u64,
     /// Cluster FSM: MIRROR of the view's `table_position` — published as the
     /// cluster-wide table metrics (`schedule_pos_pub`/`schedule_entries_pub`)
     /// whenever it moves, on every node regardless of role; also the
@@ -4102,6 +4122,15 @@ impl Consensus {
         // test on the steady path, which is the whole of its cost here.
         if serving && !hold_clients {
             did |= self.maybe_append_snapshot_reports();
+        }
+        // 3a''''. #33 spec §6.1: record the leader's own attached version for
+        // any declared row that has none — the fourth leader-issued `CLUSTER`
+        // append, same gate, same reason. Steady state is one field test: once
+        // every declared row is versioned the latch below is set (by this
+        // append's own mask test or by the client gate, `rows_versioned`) and
+        // the call is skipped — a committed version is never removed.
+        if serving && !hold_clients && !self.rows_versioned_latched {
+            did |= self.maybe_append_row_genesis();
         }
         if serving && !hold_clients {
             did |= self.drain_ingress();
@@ -5400,8 +5429,11 @@ impl Consensus {
             let (_, attached, _) = unpack_service_status(slot.status.load_acquire());
             // Consumed: `to` is attached here AND it has already replayed past
             // everything this floor move is about to let the purge remove.
+            // "`to`" means `to`'s LINE (#33 ruling R17, spec D3 — patch is
+            // free): a patch build of `to` attaches through the same pinned
+            // install, so it consumes the pin just as `to` itself would.
             if attached
-                && slot.status.version() == pin.to
+                && uc_protocol::identity::same_line(slot.status.version(), pin.to)
                 && slot.applied.load_acquire() >= candidate
             {
                 continue;
@@ -5925,6 +5957,13 @@ impl Consensus {
     /// Append pending + queued payloads via the leader appender, bounded.
     fn drain_ingress(&mut self) -> bool {
         let mut did = false;
+        // #33 spec §6.2: the same client gate as `drain_ingress_ring`. It
+        // also holds the test-only `Ingress::TimerForTest` frames queued on
+        // this channel, not just client payloads — a harness that injects a
+        // timer before every declared row is versioned waits with the rest.
+        if !self.rows_versioned() {
+            return did;
+        }
         // Retry an item held back by a prior WouldOverrun before taking more.
         if let Some(item) = self.pending_ingress.take() {
             if !self.try_append_ingress(&item) {
@@ -6843,6 +6882,130 @@ impl Consensus {
                 true
             }
             Err(_) => false, // WouldOverrun: next check
+        }
+    }
+
+    /// #33 spec §6.1: the leader records its OWN attached service's version
+    /// as the running version of a declared row that has none, by appending a
+    /// `RowGenesis` (`CLUSTER` kind 6). Every node applies it at commit, and
+    /// from then on the row has a line that attach and pins are checked
+    /// against.
+    ///
+    /// Steady state (every declared row versioned) never calls this: the
+    /// caller tests `rows_versioned_latched` first, and the first call that
+    /// finds no row missing sets that latch (so does the client gate,
+    /// [`Self::rows_versioned`]). While a declared row is still unversioned and this
+    /// leader has no attached, live service for it, each pass instead runs
+    /// the (at most 8-row, out-of-line) slot loop and appends nothing — cheap,
+    /// and bounded to the window before genesis commits. Single-in-flight like every leader-issued `CLUSTER`
+    /// append, and at most ONE row per pass — the lowest one whose slot on
+    /// THIS page reads ATTACHED with a fresh heartbeat. A row whose leader-side
+    /// service is not attached is skipped (its genesis waits for one); a
+    /// `WouldOverrun` retries next pass.
+    ///
+    /// `#[inline(never)]` for `maybe_append_snapshot_reports`'s reason: the
+    /// "one mask test" claim on `do_work` holds only while this body stays
+    /// out of line.
+    #[inline(never)]
+    fn maybe_append_row_genesis(&mut self) -> bool {
+        let declared = self.services.declared() as u8;
+        let versioned = self.cluster_view.versioned.load(Ordering::Acquire);
+        let missing = declared & !versioned;
+        if missing == 0 {
+            // Latched for the incarnation, as `rows_versioned` latches it: a
+            // committed version is never removed.
+            self.rows_versioned_latched = true;
+            return false;
+        }
+        let view_position = self.cluster_view.position.load(Ordering::Acquire);
+        if self.last_cluster_append > view_position {
+            return false; // single-in-flight: a CLUSTER command is above commit
+        }
+        // This pass's one wall reading — the clock service heartbeats use.
+        let now = self.pass_now_ns;
+        for row in 0..CNC_MAX_SERVICES as u8 {
+            if missing & (1 << row) == 0 {
+                continue;
+            }
+            let slot = self.cnc.service_slot(row as usize);
+            // Status FIRST (Acquire), then the version word: attach stores
+            // the version before the status word (both Release), so ATTACHED
+            // here implies the version below is this incarnation's (§6.1).
+            let (_, attached, _) = unpack_service_status(slot.status.load_acquire());
+            let fresh = now.saturating_sub(slot.heartbeat_ns.load_acquire())
+                < crate::services::SERVICE_STALE_NS;
+            if !attached || !fresh {
+                continue;
+            }
+            let version = slot.status.version();
+            let cmd = ClusterCommand::RowGenesis(RowGenesis { row, version });
+            if self.validate_cluster_command(&cmd).is_err() {
+                return false;
+            }
+            return match self.append_cluster_frame(&cmd) {
+                Ok(position) => {
+                    crate::obs_event!(
+                        Info,
+                        "row_version_genesis_proposed",
+                        node = self.id as u64,
+                        row = row as u64,
+                        version = version as u64,
+                        position = position
+                    );
+                    self.audit_row_genesis(row, version, position);
+                    true
+                }
+                Err(_) => false, // WouldOverrun: next pass
+            };
+        }
+        false
+    }
+
+    /// #33 spec §6.1: audit a genesis append as `row_genesis`, `source =
+    /// "genesis"` — [`Self::audit_datagram_mtu`]'s twin, and for its reason:
+    /// no admin request produced this record, so without it an operator
+    /// reading `audit.jsonl` would find a row's running version set with
+    /// nobody's name on it. `actor` is `"node"` (nothing was authenticated),
+    /// `id` carries the recorded packed version, `detail` names the row and
+    /// `config_version` the frame-END position that ties the line to the log.
+    ///
+    /// Written AFTER the append, not before (the one deliberate departure
+    /// from `crate::audit`'s record-before-respond rule): there is no answer
+    /// to withhold, and the position the record reports only exists once the
+    /// frame is placed. A failed write is therefore a loud `error` event, not
+    /// a refusal — the append has already happened and unwinding it is not
+    /// something consensus can do. Cost: one `write` + one `sync_data`, once
+    /// per declared row per cluster life.
+    fn audit_row_genesis(&mut self, row: u8, version: u32, position: u64) {
+        let detail = format!("row={row}");
+        let rec = AuditRecord {
+            ts_ns: crate::obs::metrics::now_unix_ns(),
+            actor: "node",
+            origin: AuditOrigin::Local,
+            op: AUDIT_OP_ROW_GENESIS,
+            op_name: op_name(AUDIT_OP_ROW_GENESIS),
+            id: version,
+            addr: None,
+            seq: 0,
+            nonce: 0,
+            outcome: AuditOutcome::Accepted,
+            reason: 0,
+            config_version: position,
+            detail: Some(&detail),
+            source: crate::audit::SOURCE_GENESIS,
+        };
+        if let Err(e) = self.audit.record(&rec) {
+            let err = e.to_string();
+            crate::obs_event!(
+                Error,
+                "admin_audit_failed",
+                node = self.id as u64,
+                seq = 0u64,
+                nonce = 0u64,
+                op = AUDIT_OP_ROW_GENESIS as u64,
+                status = 0u64,
+                err = err.as_str(),
+            );
         }
     }
 
@@ -7808,6 +7971,14 @@ impl Consensus {
 
         for _ in 0..INGRESS_PER_CYCLE {
             if serving {
+                // #33 spec §6.2: no client frame until every declared row
+                // has a running version — the records stay in the ring
+                // (backpressure, not an error). Deliberately NOT folded into
+                // `serving`: that would block the genesis append itself,
+                // drop `can_serve`, and redirect clients with NOT_LEADER.
+                if !self.rows_versioned() {
+                    break;
+                }
                 let append = self.cnc.counters().append.load_acquire();
                 let commit = self.cnc.counters().commit.load_acquire();
                 if !admission_open(append, commit, self.admission_bytes) {
@@ -7851,6 +8022,47 @@ impl Consensus {
             }
         }
         did
+    }
+
+    /// #33 spec §6.2: true once every declared row has a running version.
+    /// Latched: a committed version is never removed. While it is false, a
+    /// throttled (every 5 s) `version_gate_waiting` names the lowest row still
+    /// waiting and whether this node's own service for it is attached — only
+    /// the leader's service acknowledges writes, so a row whose leader-side
+    /// service never attaches keeps the cluster closed, and the log says
+    /// which row. A page with nothing declared is open from the first call.
+    fn rows_versioned(&mut self) -> bool {
+        if self.rows_versioned_latched {
+            return true;
+        }
+        let declared = self.services.declared() as u8;
+        let missing = declared & !self.cluster_view.versioned.load(Ordering::Acquire);
+        if missing == 0 {
+            self.rows_versioned_latched = true;
+            return true;
+        }
+        self.note_version_gate_waiting(missing);
+        false
+    }
+
+    /// The closed gate's throttled log line — out of line so the drain
+    /// loop's body stays small.
+    #[inline(never)]
+    fn note_version_gate_waiting(&mut self, missing: u8) {
+        if self.pass_mono_ns < self.next_version_gate_log_ns {
+            return;
+        }
+        self.next_version_gate_log_ns = self.pass_mono_ns + VERSION_GATE_LOG_NS;
+        let row = missing.trailing_zeros() as u64;
+        let (_, attached, _) =
+            unpack_service_status(self.cnc.service_slot(row as usize).status.load_acquire());
+        crate::obs_event!(
+            Info,
+            "version_gate_waiting",
+            node = self.id as u64,
+            row = row,
+            leader_service_attached = attached
+        );
     }
 
     /// Append one client-stamped ring record; `false` = would overrun
@@ -9023,11 +9235,14 @@ impl Consensus {
             return self.refuse_upgrade_pin(REASON_PIN_ROW_UNDECLARED);
         }
         let state = self.cluster_view.to_state();
-        // 53, no-pin half: `from` must be the version the row is ATTACHED at.
-        // With a pin in the history the FSM checks `from` against it instead.
-        if state.pin_for(pin.row).is_none() {
+        // 53, no-pin half: `from` must be on the LINE the row is ATTACHED at
+        // (#33 ruling R17, spec D3 — patch is free; the pinned install's
+        // envelope check is by line too). With a pin in the history, or
+        // (#33 spec §6.3) a recorded running version, the FSM's
+        // `same_line(from, running)` rule decides instead.
+        if state.pin_for(pin.row).is_none() && state.running_for(pin.row).is_none() {
             let attached = self.cnc.service_slot(pin.row as usize).status.version();
-            if pin.from != attached {
+            if !uc_protocol::identity::same_line(pin.from, attached) {
                 return self.refuse_upgrade_pin(REASON_PIN_FROM_MISMATCH);
             }
         }
@@ -11971,6 +12186,7 @@ mod tests {
             applied: 0,
             pins: vec![],
             reports: vec![],
+            running: [None; uc_protocol::v2::cnc::CNC_MAX_SERVICES],
         };
         let cluster_view = Arc::new(ClusterView::new(&cluster_genesis));
         let cluster_snapshot_pos = Arc::new(AtomicU64::new(0));
@@ -12106,6 +12322,8 @@ mod tests {
             cfg_obs_rx,
             view_position_seen: u64::MAX,
             last_cluster_append: 0,
+            rows_versioned_latched: false,
+            next_version_gate_log_ns: 0,
             schedule_position: 0,
             last_armed_table_position: 0,
             schedule_pending: dir.path().join(SCHEDULE_PENDING_FILE),
@@ -12656,14 +12874,17 @@ mod tests {
         let mut h = harness_with_rows(&["a"]);
         let (p1, p2) = (4096u64, 6016u64);
 
-        // Row 0 is pinned at p1 (`from` 1 → `to` 2) in the committed view,
-        // and its service is attached — but still at `from`, which is the
-        // whole window this hold exists for.
+        // Row 0 is pinned at p1 (`from` 1.0.0 → `to` 2.0.0) in the committed
+        // view, and its service is attached — but still at `from`, which is
+        // the whole window this hold exists for. Distinct LINES on purpose:
+        // since #33 ruling R17 the hold compares by line, and raw `1`/`2`
+        // are both 0.0.x.
+        let (from, to) = (pack_version(1, 0, 0), pack_version(2, 0, 0));
         let mut st = h.cons.cluster_view.to_state();
         st.pins.push(UpgradePin {
             row: 0,
-            from: 1,
-            to: 2,
+            from,
+            to,
             origin: p1,
         });
         st.applied = p1;
@@ -12671,7 +12892,7 @@ mod tests {
         let slot = h.cons.cnc.service_slot(0);
         slot.status
             .store_release(uc_log::cnc::pack_service_status(0, true, 1));
-        slot.status.store_version(1);
+        slot.status.store_version(from);
 
         // A complete set at p2 — newer than the pinned origin.
         h.row_froze_at(0, p2);
@@ -12699,7 +12920,7 @@ mod tests {
         // `to` attaches — but its tail replay has not reached p2 yet. The
         // hold STAYS: the journal it is about to replay is exactly what the
         // purge behind this floor move would remove.
-        h.cons.cnc.service_slot(0).status.store_version(2);
+        h.cons.cnc.service_slot(0).status.store_version(to);
         h.cons.cnc.service_slot(0).applied.store_release(p1);
         h.advance_floor_timer();
         h.cons.maybe_persist_snapshot_floor();
@@ -12718,6 +12939,54 @@ mod tests {
             "a consumed pin holds nothing"
         );
         assert_eq!(h.cons.snapshot_floor_hold, 0, "and the latch is cleared");
+    }
+
+    /// #33 ruling R17 (spec D3, patch is free): the pin names a LINE, so a
+    /// row attached at a PATCH build of `to` that has replayed past the
+    /// candidate has consumed the pin — the hold releases. Before R17 the
+    /// check was exact and a row upgraded to a patch of `to` held the floor
+    /// forever. A build on another line (here: still `from`) keeps holding.
+    #[test]
+    fn a_patch_build_of_the_pinned_to_consumes_the_pin() {
+        let mut h = harness_with_rows(&["a"]);
+        let (p1, p2) = (4096u64, 6016u64);
+        let (from, to) = (pack_version(1, 0, 0), pack_version(2, 0, 0));
+        let to_patch = pack_version(2, 0, 3);
+        let mut st = h.cons.cluster_view.to_state();
+        st.pins.push(UpgradePin {
+            row: 0,
+            from,
+            to,
+            origin: p1,
+        });
+        st.applied = p1;
+        h.cons.cluster_view.publish(&st);
+        let slot = h.cons.cnc.service_slot(0);
+        slot.status
+            .store_release(uc_log::cnc::pack_service_status(0, true, 1));
+        // Off-line (still `from`), past the candidate: holds.
+        slot.status.store_version(from);
+        slot.applied.store_release(p2);
+
+        h.row_froze_at(0, p2);
+        h.cluster_snapshot_pos.store(p2, Ordering::Release);
+        h.cons.check_set_completeness();
+        h.advance_floor_timer();
+        assert!(h.cons.maybe_persist_snapshot_floor());
+        assert_eq!(
+            h.cons.snapshot_persisted_floor, p1,
+            "a row still on `from`'s line has not consumed the pin"
+        );
+
+        // A patch of `to`, past the candidate: consumed.
+        h.cons.cnc.service_slot(0).status.store_version(to_patch);
+        h.advance_floor_timer();
+        assert!(h.cons.maybe_persist_snapshot_floor());
+        assert_eq!(
+            h.cons.snapshot_persisted_floor, p2,
+            "a patch build of `to` consumes the pin"
+        );
+        assert_eq!(h.cons.snapshot_floor_hold, 0);
     }
 
     /// The hold keys on ATTACHED-at-`to`, not on the pin's mere existence: a
@@ -16017,6 +16286,150 @@ mod tests {
         assert_eq!(h.cons.last_cluster_append, before, "nothing was appended");
     }
 
+    /// #33 ruling R17 (spec D3, patch is free): the door's no-running-version
+    /// half of 53 compares `from` with the attached word by LINE, as the
+    /// FSM's `same_line(from, running)` clause and the pinned install's
+    /// envelope check do. A `from` that is a patch neighbour of the attached
+    /// build passes 53 (and here meets 54, no set); an off-line one is 53.
+    #[test]
+    fn the_pin_door_compares_from_with_the_attached_word_by_line() {
+        let mut h = harness_with_rows(&["a"]);
+        drive_to_serving_leader(&mut h);
+        h.cons
+            .cnc
+            .service_slot(0)
+            .status
+            .store_version(pack_version(1, 4, 2));
+        stage_pin_for_test(
+            &h,
+            &UpgradePin {
+                row: 0,
+                from: pack_version(1, 4, 7),
+                to: pack_version(1, 5, 0),
+                origin: 4096,
+            },
+        );
+        assert_eq!(
+            sr(h.cons.apply_upgrade_pin_staged()),
+            (1, REASON_PIN_NO_SET),
+            "a patch neighbour of the attached build is past 53"
+        );
+        stage_pin_for_test(
+            &h,
+            &UpgradePin {
+                row: 0,
+                from: pack_version(1, 3, 2),
+                to: pack_version(1, 5, 0),
+                origin: 4096,
+            },
+        );
+        assert_eq!(
+            sr(h.cons.apply_upgrade_pin_staged()),
+            (1, REASON_PIN_FROM_MISMATCH),
+            "an off-line `from` is still 53"
+        );
+    }
+
+    /// #33 spec §6.3: once the row has a recorded running version, the door's
+    /// no-pin `same_line(from, attached)` check stands aside and the FSM's
+    /// `same_line(from, running)` rule decides — so a pin whose `from` is on
+    /// the running line is accepted even when the attached word disagrees,
+    /// and one whose `from` matches only the attached word is refused 53.
+    #[test]
+    fn the_pin_door_defers_to_a_recorded_running_version() {
+        let mut h = harness_with_rows(&["a"]);
+        drive_to_serving_leader(&mut h);
+        h.cons.snapshot_set_position.store(4096, Ordering::Release);
+        let mut st = h.cons.cluster_view.to_state();
+        st.running[0] = Some(uc_protocol::v2::upgrade::RowRunning {
+            row: 0,
+            version: pack_version(1, 0, 0),
+            record_pos: 64,
+        });
+        h.cons.cluster_view.publish(&st);
+        h.cons
+            .cnc
+            .service_slot(0)
+            .status
+            .store_version(pack_version(3, 0, 0));
+        // `from` on the attached word's line, not the running one: the FSM's
+        // clause refuses it (the door's own check would have let it through).
+        stage_pin_for_test(
+            &h,
+            &UpgradePin {
+                row: 0,
+                from: pack_version(3, 0, 0),
+                to: pack_version(3, 1, 0),
+                origin: 4096,
+            },
+        );
+        assert_eq!(
+            sr(h.cons.apply_upgrade_pin_staged()),
+            (1, REASON_PIN_FROM_MISMATCH)
+        );
+        // `from` on the running line (patch ignored), attached word elsewhere:
+        // accepted (the door's own check would have refused it 53).
+        stage_pin_for_test(
+            &h,
+            &UpgradePin {
+                row: 0,
+                from: pack_version(1, 0, 7),
+                to: pack_version(2, 0, 0),
+                origin: 4096,
+            },
+        );
+        assert_eq!(sr(h.cons.apply_upgrade_pin_staged()), (0, 0));
+    }
+
+    /// #33 spec §6.1: the leader's genesis append waits for an ATTACHED, live
+    /// service on its own page, records that service's version word, is
+    /// single-in-flight, and stops once the row is versioned.
+    #[test]
+    fn the_leader_appends_genesis_only_for_an_attached_live_unversioned_row() {
+        let mut h = harness_with_rows(&["a"]);
+        drive_to_serving_leader(&mut h);
+        let now = 10_000_000_000;
+        h.cons.pass_now_ns = now;
+        let cnc = h.cons.cnc.clone();
+        let slot = cnc.service_slot(0);
+        // Not attached: nothing to record.
+        assert!(!h.cons.maybe_append_row_genesis());
+        // Attached but stale: still nothing.
+        slot.status.store_version(pack_version(2, 0, 0));
+        slot.status
+            .store_release(uc_log::cnc::pack_service_status(0, true, 1));
+        slot.heartbeat_ns
+            .store_release(now - crate::services::SERVICE_STALE_NS);
+        assert!(!h.cons.maybe_append_row_genesis());
+        // Attached and live: one RowGenesis carrying the attached version.
+        slot.heartbeat_ns.store_release(now);
+        let before = h.cons.last_cluster_append;
+        assert!(h.cons.maybe_append_row_genesis());
+        let end = h.cons.last_cluster_append;
+        assert!(end > before, "a CLUSTER frame was appended");
+        // Single-in-flight: the frame is above the view's position.
+        assert!(!h.cons.maybe_append_row_genesis());
+        // Once the row is versioned (the record committed), the mask test
+        // alone answers.
+        let mut st = h.cons.cluster_view.to_state();
+        st.running[0] = Some(uc_protocol::v2::upgrade::RowRunning {
+            row: 0,
+            version: pack_version(2, 0, 0),
+            record_pos: end,
+        });
+        st.applied = end;
+        h.cons.cluster_view.publish(&st);
+        assert_eq!(h.cons.cluster_view.versioned.load(Ordering::Acquire), 1);
+        assert!(
+            !h.cons.rows_versioned_latched,
+            "not latched before the view says so"
+        );
+        assert!(!h.cons.maybe_append_row_genesis());
+        // Final review M5: that call latched, so the pass's call site skips
+        // the append on a field test from now on.
+        assert!(h.cons.rows_versioned_latched);
+    }
+
     /// Spec §3 S4 steps 2–3: pin → CLUSTER frame → applied at commit →
     /// the row's cnc words hold origin and version.
     #[test]
@@ -16094,6 +16507,10 @@ mod tests {
             REASON_REPORT_STALE,
             ClusterRefusal::ReportStale.reason_code()
         );
+        assert_eq!(
+            REASON_VERSION_ALREADY_SET,
+            ClusterRefusal::VersionAlreadySet.reason_code()
+        );
         // And the band itself, so a shift shows up here too.
         assert_eq!(
             (
@@ -16105,8 +16522,9 @@ mod tests {
                 REASON_PIN_MISSING,
                 REASON_PIN_DECODE,
                 REASON_REPORT_STALE,
+                REASON_VERSION_ALREADY_SET,
             ),
-            (52, 53, 54, 55, 56, 57, 58, 59)
+            (52, 53, 54, 55, 56, 57, 58, 59, 60)
         );
     }
 
@@ -16212,6 +16630,7 @@ mod tests {
                     applied: 0,
                     pins: vec![],
                     reports: vec![],
+                    running: [None; uc_protocol::v2::cnc::CNC_MAX_SERVICES],
                 },
                 vec![hash],
             ),
@@ -16309,6 +16728,7 @@ mod tests {
                     applied: 0,
                     pins: vec![],
                     reports: vec![],
+                    running: [None; uc_protocol::v2::cnc::CNC_MAX_SERVICES],
                 },
                 vec![hash],
             ),
@@ -18508,6 +18928,7 @@ mod tests {
                 applied: position,
                 pins: vec![],
                 reports: vec![],
+                running: [None; uc_protocol::v2::cnc::CNC_MAX_SERVICES],
             },
             Vec::new(),
         );

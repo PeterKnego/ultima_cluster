@@ -394,12 +394,12 @@ printed the SDK's own `pinned install of snap-P` line on its stderr
 (`SwapArm::install_logged`, the same class of evidence as the refusal
 marker, pinned by `the_install_marker_is_the_sdks_own_text`), and the
 durable case additionally runs NEW as `register-replay --double-cas`
-(`DoublingCasRegisterSm`, `VERSION = 3`), a version change that touches a
+(`DoublingCasRegisterSm`, `VERSION = 0.3.0`), a version change that touches a
 history-PRESERVING command. That matters because a durable service's wrong
 path is not the genesis replay — it is continuing from X with the state it
 persisted — and with a last-write-wins register and a `Write`-only change
 the artifact path and continue-from-X compute the same value, so state alone
-could not have told them apart. The teeth are three: a NEW binary that is not the pinned version is a
+could not have told them apart. The teeth are three: a NEW binary that is not on the pinned version's line (major.minor; a patch build of `--to` is the pinned line since #33 R17) is a
 FAIL rather than a pass
 (`a_new_binary_that_is_not_the_pinned_version_is_a_fail`), a span whose
 commands cannot tell the two paths apart is INCONCLUSIVE rather than a pass
@@ -523,6 +523,35 @@ discipline the underlying timing is smoke and no lag figure is claimed here
 — only the persistence of the ordering, which is all the argument needs. The
 cluster FSM's own artifact (`service_id = 255`) is not reported at all and so
 is not covered here either.
+
+**The row running version (wire `0.10.0`, #33).** The end-to-end suite is
+`uc_node/tests/row_version.rs`, three real nodes in one process with two
+builds of one KV state machine (`1.0.0` and `2.0.0`, which differ only in an
+`append` command). `a_mixed_version_row_never_loses_an_acknowledged_write`
+is the #33 repro: leader on 2.0, followers on 1.0, a 2.0-only write, then a
+leader change. It was written first and **failed on the lost value itself**
+(10 read back where 15 was acknowledged) before any fix existed; it now
+passes because the 1.0 followers are refused by name. Beside it:
+`the_leader_records_its_attached_version_as_genesis`,
+`clients_wait_until_every_declared_row_has_a_version` (the log must not
+grow while a declared row has no version, not merely a submit time out),
+`attach_refuses_a_binary_off_the_running_line_by_name`,
+`a_matching_restart_after_genesis_does_not_stop_again`, and
+`a_committed_pin_stops_every_old_service_at_exactly_the_record` — which
+asserts `applied` equals the pin frame's start on every node, runs a
+recorded register workload across the switch and checks it with
+`uc_lincheck`'s WGL checker (`Linearizable`), and requires at least one
+write committed after the pin to be acknowledged, which only a 2.0 service
+can do. The pure decisions have unit tests where they live: the pin and
+genesis rules in `uc_node/src/cluster_fsm.rs`, the version-gate verdict and
+its bounded wait in `uc_service/src/version_gate.rs`, `same_line` in
+`uc_protocol::identity`, the row-view seqlock and the `cluster_applied` word
+in `uc_log::cnc`, and the image v1/v2 → v3 migration against captured
+fixtures. `uc_protocol_cluster_frame` decodes kind 6. **Not verified:** the
+consensus kernel, `uc_sim` and the Lean model are untouched — the running
+version is cluster-FSM state applied at commit, like pins — and "patch
+changes nothing replicated" is the application's promise, which only
+`uc2-diffreplay upgrade` samples.
 
 **The red twin, and an honest note about what it pins.**
 `counterfactual_kernel_on_the_committed_view_is_caught_by_inv6_the_durable_time_oracle`

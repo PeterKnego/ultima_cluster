@@ -1097,12 +1097,17 @@ fn run_all_generic<S: RawStateMachine + Default>(a: AllArgs, sm_label: &str) -> 
             crypto,
         );
         let node = Node::start_with_socket(cfg, sock).expect("node start");
-        let svc = ServiceBuilder::new(ServiceConfig::new(&instance_dir, ALL_APP_ID), S::default())
+        nodes.push(node);
+        dirs.push(instance_dir);
+    }
+    // Node-then-service (2.13.0): `attach` waits for its node to have JOINED
+    // (leader known, commit learned), and no node joins before a quorum is
+    // up — so every node starts before any service attaches.
+    for instance_dir in &dirs {
+        let svc = ServiceBuilder::new(ServiceConfig::new(instance_dir, ALL_APP_ID), S::default())
             .start()
             .expect("service start");
-        nodes.push(node);
         services.push(svc);
-        dirs.push(instance_dir);
     }
 
     let leader = await_single_leader(&nodes, 30);

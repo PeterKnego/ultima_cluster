@@ -701,8 +701,13 @@ fn run_all(a: AllArgs) -> anyhow::Result<()> {
             APP.into(),
         );
         nodes.push(Node::start_with_socket(cfg, sock).expect("node start"));
-        services.push(Some(spawn_service(&instance_dir)));
         dirs.push(instance_dir);
+    }
+    // Node-then-service (2.13.0): `attach` waits for its node to have JOINED
+    // (leader known, commit learned), and no node joins before a quorum is
+    // up — so every node starts before any service attaches.
+    for instance_dir in &dirs {
+        services.push(Some(spawn_service(instance_dir)));
     }
 
     let leader = await_single_leader(&nodes, 30);

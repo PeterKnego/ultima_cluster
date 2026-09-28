@@ -136,10 +136,14 @@ impl uc_service::SnapshotStateMachine for RegisterSm {
 /// A diff-replay test fixture (`uc_diffreplay`'s own end-to-end proof, spec
 /// §2.3's counterfactual), **not a pattern for a user state machine** — see
 /// `examples/kv` for that. Same `NAME` as [`RegisterSm`] (the two builds must
-/// name the same FSM row for the harness to compare them) but `VERSION = 2`
-/// and changed semantics: `Write(v)` stores `2·v` instead of `v`, giving the
+/// name the same FSM row for the harness to compare them) but `VERSION =
+/// 0.2.0` and changed semantics: `Write(v)` stores `2·v` instead of `v`, giving the
 /// harness a build whose `apply` genuinely differs from `RegisterSm` for the
 /// same recorded command.
+///
+/// A changed `apply` is a new major.minor LINE, never a patch (#33 spec D3:
+/// patch builds of one line are trusted to apply identically), so this build
+/// sits on line 0.2, apart from [`RegisterSm`]'s 0.0.
 #[cfg(feature = "v2")]
 #[derive(Default)]
 pub struct DoublingRegisterSm(pub RegisterSm);
@@ -147,7 +151,7 @@ pub struct DoublingRegisterSm(pub RegisterSm);
 #[cfg(feature = "v2")]
 impl uc_service::StateMachine for DoublingRegisterSm {
     const NAME: &'static str = <RegisterSm as uc_service::StateMachine>::NAME;
-    const VERSION: u32 = 2;
+    const VERSION: u32 = uc_protocol::identity::pack_version(0, 2, 0);
 
     type Command = Cmd;
     type Response = CmdResp;
@@ -221,8 +225,8 @@ impl uc_service::SnapshotStateMachine for DoublingRegisterSm {
 /// gives `a_durable_register_is_rewound_to_the_origin_and_passes` teeth.
 ///
 /// Same `NAME` as [`RegisterSm`] (the harness compares two builds of one FSM
-/// row); `VERSION = 3`, one above [`DoublingRegisterSm`], so the two can be
-/// pinned apart.
+/// row); `VERSION = 0.3.0`, one LINE above [`DoublingRegisterSm`], so the
+/// two can be pinned apart (#33 D3: a changed `apply` is a new line).
 #[cfg(feature = "v2")]
 #[derive(Default)]
 pub struct DoublingCasRegisterSm(pub RegisterSm);
@@ -230,7 +234,7 @@ pub struct DoublingCasRegisterSm(pub RegisterSm);
 #[cfg(feature = "v2")]
 impl uc_service::StateMachine for DoublingCasRegisterSm {
     const NAME: &'static str = <RegisterSm as uc_service::StateMachine>::NAME;
-    const VERSION: u32 = 3;
+    const VERSION: u32 = uc_protocol::identity::pack_version(0, 3, 0);
 
     type Command = Cmd;
     type Response = CmdResp;

@@ -74,6 +74,17 @@ internally for `boot_wait` (default **10 s**, `Duration::ZERO` = no wait).
 - **A saturated node wants a longer `boot_wait`.** The cluster FSM applies at
   `min(commit, durable)`, so a node whose own durable position persistently
   trails commit keeps the gate shut.
+- **Clients wait for every declared row's version (wire `0.10.0`, #33).**
+  The leader admits no client write until every declared row has a committed
+  running version, which it records from **its own** attached service for
+  that row. A declared row whose service never starts on the leader keeps the
+  whole cluster closed to writes — clients see back-pressure, not an error —
+  and the leader logs `version_gate_waiting` every 5 s naming the row and
+  `leader_service_attached`. Start every declared row's service on every
+  node, on the same major.minor: a follower's service on another line is
+  refused `VersionMismatch`, or stops at the genesis record with
+  `version_superseded`. See
+  [Upgrade an application § The version rules](../how-to/upgrade-an-application.md#the-version-rules).
 
 Why the gate exists: an upgrade pin committed *above* the artifact a
 restarting node recovered from is invisible on that node for a few passes,
@@ -429,8 +440,12 @@ transport setting, both measured closed-loop at inflight 1 on 8-vCPU
   aggregate means now, and the declared-set drift query. `Uc2ServiceIdentityDrift`
   fires the same way when a row's declared NAME itself differs node-to-node
   (a mis-declared `[services]` config, not a missing FSM); `Uc2ServiceVersionDrift`
-  fires when an attached FSM's version differs node-to-node (expected transiently
-  during a rolling upgrade, a bug if it persists).
+  fires when an attached FSM's version **line** (major.minor) differs
+  node-to-node — patch differences are allowed and do not fire — and
+  `Uc2RowVersionMismatch` when a live attached FSM (heartbeat under 10 s) is
+  off its row's committed running line (since wire `0.10.0`, a stop that did
+  not happen; a stopped service not yet replaced after a pin does not fire). See [Upgrade an application § The
+  version rules](../how-to/upgrade-an-application.md#the-version-rules).
 - [Configuration](../reference/configuration.md) — `NodeConfig`, environment
   switches, crypto file formats, cluster limits.
 - [Linearizable read path](../reference/read-path.md) — how reads are certified

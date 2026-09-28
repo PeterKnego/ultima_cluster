@@ -81,6 +81,14 @@ Both are sync, deterministic, no I/O, **no host clock**, no randomness —
 non-negotiable for state-machine-replication correctness, and the reason
 neither signature takes `async`.
 
+**`VERSION` is packed `major:8 ‖ minor:8 ‖ patch:16`**
+(`uc_protocol::identity::pack_version`), so write it as
+`pack_version(major, minor, patch)`: a bare `2` is `0.0.2`. Since wire
+`0.10.0` (#33) it is enforced per row — every service of a row must share the
+row's committed major.minor, patch is free, and `0` is a version equal only
+to `0` — see [Upgrade an application § The version
+rules](../how-to/upgrade-an-application.md#the-version-rules).
+
 ## `ApplyCtx`: position, time, term, identity
 
 `apply` receives `&mut ApplyCtx` rather than a bare `position: u64` (FSM
@@ -199,13 +207,20 @@ install path checks the artifact's `version` against the version it EXPECTS
 to have built the artifact, and the expectation differs by path:
 
 - an **unpinned** install (the reconstruction gap guard, `uc_service::replay`)
-  requires the artifact's `version == S::VERSION` — the running binary's own
-  version, since ordinary reconstruction assumes the artifact it is about to
-  install came from the same code it is running now;
-- a **pinned** install (spec §3 S4) requires it `== ` the upgrade pin's
-  `from` instead — the one sanctioned crossing of a version boundary, because
-  the whole point of a pin is to install an artifact a DIFFERENT version
-  built. `VersionMismatch { built, expected }` names both sides.
+  requires the artifact's `version` to be on `S::VERSION`'s line — the running
+  binary's own version, since ordinary reconstruction assumes the artifact it
+  is about to install came from the same code it is running now;
+- a **pinned** install (spec §3 S4) requires it to be on the upgrade pin's
+  `from` line instead — the one sanctioned crossing of a version boundary,
+  because the whole point of a pin is to install an artifact a DIFFERENT
+  version built. `VersionMismatch { built, expected }` names both sides.
+
+"On the line" means the same major.minor, patch ignored
+(`uc_protocol::identity::same_line`), since wire `0.10.0` (#33); in `2.13.0`
+both checks were exact equality. Patch builds of one line may run on
+different nodes and install each other's artifacts, which is why a patch
+build must not change the snapshot payload format
+([Upgrade an application § The version rules](../how-to/upgrade-an-application.md#the-version-rules)).
 
 **A pinned install runs in `attach`, not the gap guard.** The gap guard only
 runs when reconstruction decides it needs to replay, which a durable state
@@ -226,7 +241,8 @@ itself** — a pinned row's gap guard prefers that one artifact over a newer
 one `from` left behind, for the same "sanctioned crossing" reason.
 
 Four refusals guard this path, all named, none silent: `PinnedVersionMismatch`
-(a stale binary — one that is not the pin's `to` — tries to attach after the
+(a stale binary — one not on the pin's `to` line; a patch build of `to` is
+admitted — tries to attach after the
 pin: the whole point of pinning), `PinUnreadable` (the pin words could not be
 read consistently through the seqlock — `Contended` fails CLOSED, never
 treated as "no pin", because attaching unpinned off a half-published triple

@@ -82,7 +82,7 @@ mod snapshot;
 mod upgrade;
 
 use uc_crypto::admin::{AdminKey, AdminMessage, generate_key_file, sign};
-use uc_log::cnc::{AdminAuth, AdminReq, CncPage, PinRead, unpack_service_status};
+use uc_log::cnc::{AdminAuth, AdminReq, CncPage, PinRead, RowRead, unpack_service_status};
 use uc_protocol::identity::VersionDisplay;
 use uc_protocol::v2::cnc::{
     CNC_MAX_PEER_SLOTS, CNC_MAX_SERVICES, CNC_PEER_ROLE_LEARNER, CNC_PEER_ROLE_VOTER,
@@ -361,6 +361,13 @@ struct UpgradePinArgs {
     /// > 0).
     #[arg(long)]
     origin: u64,
+    /// Allow a SAME-LINE pin (`--from` and `--to` share major.minor, patch
+    /// differs). Refused without this flag: a same-line pin does not refuse
+    /// the old build — patch builds of one line mix by design — so it is
+    /// almost always a mis-packed version (a bare-integer `const VERSION`
+    /// packs as `0.0.x`; use `pack_version(major, minor, patch)`).
+    #[arg(long)]
+    patch: bool,
 }
 
 #[derive(clap::Args)]
@@ -589,6 +596,7 @@ fn main() {
                 args.from.as_deref(),
                 &args.to,
                 args.origin,
+                args.patch,
             ),
             UpgradeCmd::Show(args) => upgrade::show(&args.common),
         },
@@ -687,10 +695,14 @@ fn reason_str(reason: u32) -> &'static str {
             "snapshot_above_durable (the fetch position named is above this node's durable frontier — an operator typo, or a learner transiently ahead of this voter; legitimate again once this node's log catches up)"
         }
         // FSM upgrade lifecycle (spec §2.5, plan B1): `ADMIN_OP_UPGRADE_PIN`
-        // (wire op 10) — `uc_node::REASON_PIN_*`.
-        52 => "pin_row_undeclared (this node does not declare that row in [services] names)",
+        // (wire op 10) — `uc_node::REASON_PIN_*`. #33 spec §6.3: renamed
+        // from `pin_row_undeclared` to the bare `row_undeclared` (the
+        // explanation lives in `docs/reference/uc2ctl.md`). As built, only a
+        // pin refuses 52 — the automatic genesis record refuses only 60
+        // (spec errata, "Smaller as-built facts").
+        52 => "row_undeclared",
         53 => {
-            "pin_from_mismatch (--from is not the row's current version: its newest pin's `to`, or, with no pin yet, the version the service is attached at)"
+            "pin_from_mismatch (--from is not on the row's running line — same major.minor as its running version, patch ignored — or, with no running version yet, on the line of the version the service is attached at)"
         }
         54 => {
             "pin_no_set (no complete snapshot set at --origin on this node — run `uc2ctl snapshot`, wait for uc2_snapshot_set_position to reach it, and pin THAT position)"
@@ -706,6 +718,12 @@ fn reason_str(reason: u32) -> &'static str {
         59 => {
             "report_stale (a SnapshotReport below the row's held report position — never from uc2ctl)"
         }
+        // #33 spec §4.1: `RowGenesis` refused because the row already has a
+        // running version — FSM-only (`ClusterRefusal::VersionAlreadySet`),
+        // never returned to an admin request uc2ctl itself sent (genesis is
+        // the leader's own automatic append), listed here for completeness
+        // with the rest of the 52-60 band.
+        60 => "version_already_set",
         _ => "unknown/malformed",
     }
 }
@@ -1181,11 +1199,26 @@ fn run_status(a: &StatusArgs) -> anyhow::Result<()> {
             PinRead::Pinned { origin, from, to } => (origin, from, to),
             _ => (0, 0, 0),
         };
+        // #33 spec §8: the row's running version and the position of the
+        // record that set it, off the same seqlock the pin triple above
+        // reads. `Contended` (the single-writer cluster agent mid-store;
+        // effectively unreachable) renders as `?`, never fabricated as
+        // "none" — the same "could not read" convention `Contended` has
+        // everywhere else in this table.
+        let (running, running_pos) = match s.status.row_view() {
+            RowRead::View {
+                running: Some(v),
+                record_pos,
+                ..
+            } => (VersionDisplay(v).to_string(), record_pos.to_string()),
+            RowRead::View { running: None, .. } => ("none".to_string(), "0".to_string()),
+            RowRead::Contended => ("?".to_string(), "?".to_string()),
+        };
         println!(
             "  row={id} name={name} version={} hash=0x{:016x} attached={attached} epoch={} \
              incarnation={incarnation} applied={applied} lag={} snapshot_pos={} \
              heartbeat_age={age} timers_pending={} upgrade_origin={} pinned={} pinned_from={} \
-             artifact_hash=0x{:016x}",
+             artifact_hash=0x{:016x} running={running} running_pos={running_pos}",
             VersionDisplay(s.status.version()),
             s.identity.hash(),
             s.epoch.load_acquire(),
@@ -1761,6 +1794,16 @@ mod tests {
         assert!(reason_str(48).contains("snapshot_unsupported"));
         assert!(reason_str(49).contains("snapshot_no_learner"));
         assert!(reason_str(50).contains("snapshot_above_durable"));
+    }
+
+    /// #33 spec §6.3: 60 is `version_already_set` (genesis, the row already
+    /// has a running version); 52 is renamed `row_undeclared` — the same
+    /// door check genesis now shares with `upgrade pin`, so the `pin_`
+    /// prefix no longer names it precisely.
+    #[test]
+    fn reason_str_names_60_and_52() {
+        assert_eq!(reason_str(60), "version_already_set");
+        assert_eq!(reason_str(52), "row_undeclared");
     }
 
     // Fix round 1 (Important): every `uc2ctl snapshot ...` invocation shape

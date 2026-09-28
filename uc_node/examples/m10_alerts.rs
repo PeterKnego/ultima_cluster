@@ -35,7 +35,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use clap::Parser;
 
 use uc_consensus::election::NodeId;
-use uc_log::cnc::{CncMeta, CncPage};
+use uc_log::cnc::{CncMeta, CncPage, pack_service_status};
 use uc_net::fault::FaultConfig;
 use uc_net::receiver::FollowerStats;
 use uc_net::sender::SenderStats;
@@ -66,6 +66,10 @@ const ALL_SCENARIOS: &[&str] = &[
     "fsm_pinned",
     "identity_drift",
     "version_drift",
+    "version_drift_zero_line",
+    "version_drift_patch_only",
+    "row_version_mismatch",
+    "row_version_mismatch_stale_heartbeat",
     "log_time_frozen",
     "schedule_diverged",
     "snapshot_stalled",
@@ -200,6 +204,10 @@ fn run_scenario(name: &str, scratch_root: &Path) -> (SeriesFile, Disclosure) {
         "fsm_pinned" => scenario_fsm_pinned(scratch_root),
         "identity_drift" => scenario_identity_drift(),
         "version_drift" => scenario_version_drift(),
+        "version_drift_zero_line" => scenario_version_drift_zero_line(),
+        "version_drift_patch_only" => scenario_version_drift_patch_only(),
+        "row_version_mismatch" => scenario_row_version_mismatch(),
+        "row_version_mismatch_stale_heartbeat" => scenario_row_version_mismatch_stale_heartbeat(),
         "log_time_frozen" => scenario_log_time_frozen(),
         "schedule_diverged" => scenario_schedule_diverged(),
         "snapshot_stalled" => scenario_snapshot_stalled(),
@@ -634,6 +642,12 @@ fn scenario_service_wedged(scratch_root: &Path) -> (SeriesFile, Disclosure) {
 fn scenario_leader_isolated(scratch_root: &Path) -> (SeriesFile, Disclosure) {
     let admission_bytes = 8 * 1024;
     let (_dir, mut nodes) = spawn_cluster(scratch_root, "leader-isolated", 3, admission_bytes);
+    await_stable_leader(&nodes, 20);
+    // Fix round 1 (ruling R14): attach row 0 everywhere and wait for its
+    // running version, or the leader's admission gate never opens and this
+    // whole scenario is a deterministic no-op — see
+    // `attach_noop_everywhere`'s doc comment.
+    let svcs = attach_noop_everywhere(&nodes);
     let leader_idx = await_stable_leader(&nodes, 20);
     let others: Vec<usize> = (0..nodes.len()).filter(|&i| i != leader_idx).collect();
     for &o in &others {
@@ -649,12 +663,13 @@ fn scenario_leader_isolated(scratch_root: &Path) -> (SeriesFile, Disclosure) {
         "uc2_admission_bytes",
     ];
     let mut sf = SeriesFile::new();
-    // Baseline BEFORE any load: append==commit==32 (just the NewTerm frame).
-    // The busy-submit burst below floods the tiny window to its ceiling
-    // within a single round, so without this baseline the whole captured
-    // trace would already be flat at the plateau — this sample is what
-    // proves the real JUMP (append rising while commit stays put), which
-    // the dilation step places inside the delta range window.
+    // Baseline BEFORE any load: append==commit, past whatever frames the
+    // NewTerm + row-genesis cluster commands (Fix round 1) already put in
+    // the log. The busy-submit burst below floods the tiny window to its
+    // ceiling within a single round, so without this baseline the whole
+    // captured trace would already be flat at the plateau — this sample is
+    // what proves the real JUMP (append rising while commit stays put),
+    // which the dilation step places inside the delta range window.
     sf.record_round(&instance, &scrape(addr), &families);
     // Drive load into the isolated leader while sampling — the append
     // counter climbs (until the admission window closes it), commit never
@@ -673,6 +688,9 @@ fn scenario_leader_isolated(scratch_root: &Path) -> (SeriesFile, Disclosure) {
     for &o in &others {
         heal_pair(&nodes, leader_idx, o);
     }
+    for svc in svcs {
+        svc.stop();
+    }
     for n in nodes.iter_mut() {
         n.stop();
     }
@@ -684,11 +702,12 @@ fn scenario_leader_isolated(scratch_root: &Path) -> (SeriesFile, Disclosure) {
             rules: &["Uc2ReplicationStalled", "Uc2AdmissionSaturated"],
             state: "real",
             method: format!(
-                "real 3-node cluster, admission_bytes={admission_bytes} (deliberately tiny); \
-                 partition the leader (n{leader_idx}) from BOTH followers and keep submitting — \
-                 12 real ~0.5s-spaced scrapes show uc2_commit_bytes frozen while \
-                 uc2_append_bytes climbs and uc2_admission_saturation crosses 1.0 as the window \
-                 fills."
+                "real 3-node cluster, admission_bytes={admission_bytes} (deliberately tiny); a \
+                 real NoopSm attached on every node (Fix round 1 — the leader's admission gate \
+                 refuses everything until row 0 has a running version) before partitioning the \
+                 leader (n{leader_idx}) from BOTH followers and keep submitting — 12 real \
+                 ~0.5s-spaced scrapes show uc2_commit_bytes frozen while uc2_append_bytes \
+                 climbs and uc2_admission_saturation crosses 1.0 as the window fills."
             ),
         },
     )
@@ -787,6 +806,12 @@ fn scenario_peer_never_heard(scratch_root: &Path) -> (SeriesFile, Disclosure) {
 fn scenario_follower_partitioned(scratch_root: &Path) -> (SeriesFile, Disclosure) {
     let admission_bytes = 16 * 1024;
     let (_dir, mut nodes) = spawn_cluster(scratch_root, "peer-lagging", 3, admission_bytes);
+    await_stable_leader(&nodes, 20);
+    // Fix round 1 (ruling R14): attach row 0 everywhere and wait for its
+    // running version BEFORE partitioning anything — genesis needs a
+    // quorum to commit, so it must land while every node can still hear
+    // every other node. See `attach_noop_everywhere`'s doc comment.
+    let svcs = attach_noop_everywhere(&nodes);
     let leader_idx = await_stable_leader(&nodes, 20);
     let victim_idx = (0..nodes.len())
         .find(|&i| i != leader_idx)
@@ -830,6 +855,9 @@ fn scenario_follower_partitioned(scratch_root: &Path) -> (SeriesFile, Disclosure
     for &o in &others {
         heal_pair(&nodes, victim_idx, o);
     }
+    for svc in svcs {
+        svc.stop();
+    }
     for n in nodes.iter_mut() {
         n.stop();
     }
@@ -841,8 +869,10 @@ fn scenario_follower_partitioned(scratch_root: &Path) -> (SeriesFile, Disclosure
             rules: &["Uc2PeerLagging"],
             state: "real",
             method: format!(
-                "real 3-node cluster, leader admission_bytes={admission_bytes}; fully isolate \
-                 ONE follower (n{victim_idx}, both links) while the leader (n{leader_idx}) and \
+                "real 3-node cluster, leader admission_bytes={admission_bytes}; a real NoopSm \
+                 attached on every node (Fix round 1 — the leader's admission gate refuses \
+                 everything until row 0 has a running version) before fully isolating ONE \
+                 follower (n{victim_idx}, both links) while the leader (n{leader_idx}) and \
                  the other follower keep committing under load — n{victim_idx} stops reporting \
                  durable positions, so the leader's view of \
                  uc2_peer_replication_lag_bytes{{peer=\"{victim_idx}\"}} grows past its own \
@@ -1369,6 +1399,220 @@ fn scenario_version_drift() -> (SeriesFile, Disclosure) {
                  real encoder as uc2_service_version{{row=\"0\"}}; two DISTINCT nonzero values \
                  for the same row across instances is exactly what Uc2ServiceVersionDrift's \
                  count_values idiom detects.",
+                kv.as_str()
+            ),
+        },
+    )
+}
+
+// -------------------------------------------------- scenario 15-extra-a
+
+/// Fix round 2 review-fix REGRESSION case for `Uc2ServiceVersionDrift`, NOT
+/// one of the 28 shipped rules — adjudicated separately, as an "extra
+/// check", by `scripts/m10_alert_fire.sh`. The PRE-fix expression floored
+/// the packed version BEFORE filtering the sentinel
+/// (`floor(uc2_service_version / 65536) > 0`), so a genuinely running
+/// 0.0.x line (packed value nonzero but `< 65536`, so it floors to 0) read
+/// identically to the unattached sentinel `0` itself and was silently
+/// dropped from the comparison — a real 0.0.5-vs-1.0.0 disagreement never
+/// counted as drift. Two synthetic `ObsSources` ("n0", "n1") declare the
+/// SAME row 0 name; "n0" wrote 0.0.5, "n1" wrote 1.0.0. Under the FIXED
+/// expression (filter the raw sentinel first, floor second) this pair MUST
+/// fire.
+fn scenario_version_drift_zero_line() -> (SeriesFile, Disclosure) {
+    let kv = FsmName::parse("kv").unwrap();
+    let src_a = synthetic_sources_named(0, Some(kv));
+    let src_b = synthetic_sources_named(1, Some(kv));
+    src_a.cnc.store_services_declared(0b1);
+    src_b.cnc.store_services_declared(0b1);
+    let v_a = uc_protocol::identity::pack_version(0, 0, 5);
+    let v_b = uc_protocol::identity::pack_version(1, 0, 0);
+    src_a.cnc.service_slot(0).status.store_version(v_a);
+    src_b.cnc.service_slot(0).status.store_version(v_b);
+
+    let srv_a = ObsServer::serve(src_a.clone(), "127.0.0.1:0".parse().unwrap()).expect("bind");
+    let srv_b = ObsServer::serve(src_b.clone(), "127.0.0.1:0".parse().unwrap()).expect("bind");
+    let addr_a = srv_a.local_addr();
+    let addr_b = srv_b.local_addr();
+
+    let mut sf = SeriesFile::new();
+    for _ in 0..3 {
+        sf.record_round("n0", &scrape(addr_a), &["uc2_service_version"]);
+        sf.record_round("n1", &scrape(addr_b), &["uc2_service_version"]);
+        thread::sleep(Duration::from_millis(200));
+    }
+    srv_a.stop();
+    srv_b.stop();
+
+    (
+        sf,
+        Disclosure {
+            scenario: "version_drift_zero_line",
+            rules: &["Uc2ServiceVersionDrift"],
+            state: "synthetic",
+            method: format!(
+                "Fix round 2 review-fix regression case (NOT one of the 28 shipped rules — an \
+                 extra check): two synthetic ObsSources, row 0 = {:?} agreeing; \"n0\" wrote \
+                 version {v_a} (0.0.5), \"n1\" wrote {v_b} (1.0.0). The pre-fix expression \
+                 floored the line BEFORE filtering '> 0', so 0.0.5 (packed nonzero, < 65536) \
+                 floored to line 0 and was wrongly excluded as if it were the unattached \
+                 sentinel — this pair would NOT have fired. The fixed expression filters the \
+                 sentinel on the RAW value first, so this pair (two distinct nonzero lines, 0 \
+                 and 256) DOES fire.",
+                kv.as_str()
+            ),
+        },
+    )
+}
+
+// -------------------------------------------------- scenario 15-extra-b
+
+/// Fix round 2 review-fix NEGATIVE regression case for
+/// `Uc2ServiceVersionDrift`, also NOT one of the 28 shipped rules. Two
+/// patch builds of the SAME line (1.2.0 vs 1.2.7) — patch is free by
+/// design (#33 D3) — must NOT fire either before or after the fix; this
+/// pins that the fix did not accidentally widen the rule to compare exact
+/// versions again.
+fn scenario_version_drift_patch_only() -> (SeriesFile, Disclosure) {
+    let kv = FsmName::parse("kv").unwrap();
+    let src_a = synthetic_sources_named(0, Some(kv));
+    let src_b = synthetic_sources_named(1, Some(kv));
+    src_a.cnc.store_services_declared(0b1);
+    src_b.cnc.store_services_declared(0b1);
+    let v_a = uc_protocol::identity::pack_version(1, 2, 0);
+    let v_b = uc_protocol::identity::pack_version(1, 2, 7);
+    src_a.cnc.service_slot(0).status.store_version(v_a);
+    src_b.cnc.service_slot(0).status.store_version(v_b);
+
+    let srv_a = ObsServer::serve(src_a.clone(), "127.0.0.1:0".parse().unwrap()).expect("bind");
+    let srv_b = ObsServer::serve(src_b.clone(), "127.0.0.1:0".parse().unwrap()).expect("bind");
+    let addr_a = srv_a.local_addr();
+    let addr_b = srv_b.local_addr();
+
+    let mut sf = SeriesFile::new();
+    for _ in 0..3 {
+        sf.record_round("n0", &scrape(addr_a), &["uc2_service_version"]);
+        sf.record_round("n1", &scrape(addr_b), &["uc2_service_version"]);
+        thread::sleep(Duration::from_millis(200));
+    }
+    srv_a.stop();
+    srv_b.stop();
+
+    (
+        sf,
+        Disclosure {
+            scenario: "version_drift_patch_only",
+            rules: &["Uc2ServiceVersionDrift"],
+            state: "synthetic",
+            method: format!(
+                "Fix round 2 review-fix NEGATIVE regression case (NOT one of the 28 shipped \
+                 rules — an extra check): two synthetic ObsSources, row 0 = {:?} agreeing; \
+                 \"n0\" wrote version {v_a} (1.2.0), \"n1\" wrote {v_b} (1.2.7) — the same \
+                 LINE, two patch builds. floor(x/65536) agrees for both (258), so count_values \
+                 sees one distinct line for this row and the alert must NOT fire.",
+                kv.as_str()
+            ),
+        },
+    )
+}
+
+// ------------------------------------------------------- scenario 15b
+
+/// Uc2RowVersionMismatch — **synthetic, disclosed**: a single synthetic
+/// `ObsSources` ("n0") declares row 0 = kv, ATTACHES a service that wrote
+/// version 1.3.0 and keeps stamping its heartbeat, and republishes a row
+/// view whose committed running version reads 1.2.0 — the exact shape of a
+/// LIVE service stuck mid-stop after its row's running line moved without
+/// it (the version gate should have stopped it at the superseding record,
+/// so a firing alert means a stuck stop). Unlike
+/// `scenario_identity_drift`/`scenario_version_drift`, this alert compares
+/// gauges on the SAME instance, so one source suffices.
+fn scenario_row_version_mismatch() -> (SeriesFile, Disclosure) {
+    row_version_mismatch_with(true)
+}
+
+// ------------------------------------------------- scenario 15b-extra
+
+/// #33 ruling R17 NEGATIVE extra check for `Uc2RowVersionMismatch` (NOT one
+/// of the 28 shipped rules): the same off-line, ATTACHED row as
+/// [`scenario_row_version_mismatch`], but its heartbeat is never stamped —
+/// an off-line old service that is DEAD but left its ATTACHED bit set (a
+/// kill or crash; since ruling R18 a deliberate version stop clears the bit
+/// itself). The rule pages only on a LIVE off-line service, so it must NOT
+/// fire here; a dead slot is `Uc2ServiceWedged`'s business.
+fn scenario_row_version_mismatch_stale_heartbeat() -> (SeriesFile, Disclosure) {
+    row_version_mismatch_with(false)
+}
+
+fn row_version_mismatch_with(fresh_heartbeat: bool) -> (SeriesFile, Disclosure) {
+    let kv = FsmName::parse("kv").unwrap();
+    let src = synthetic_sources_named(0, Some(kv));
+    src.cnc.store_services_declared(0b1);
+    let v_service = uc_protocol::identity::pack_version(1, 3, 0);
+    let v_running = uc_protocol::identity::pack_version(1, 2, 0);
+    src.cnc.service_slot(0).status.store_version(v_service);
+    src.cnc
+        .service_slot(0)
+        .status
+        .store_release(pack_service_status(0, true, 1));
+    src.cnc
+        .service_slot(0)
+        .status
+        .store_row_view(None, Some(v_running), 640);
+
+    let srv = ObsServer::serve(src.clone(), "127.0.0.1:0".parse().unwrap()).expect("bind");
+    let addr = srv.local_addr();
+
+    let mut sf = SeriesFile::new();
+    for _ in 0..3 {
+        if fresh_heartbeat {
+            // What a live apply loop does: stamp the row's heartbeat.
+            src.cnc
+                .service_slot(0)
+                .heartbeat_ns
+                .store_release(uc_node::obs::metrics::now_unix_ns());
+        }
+        sf.record_round(
+            "n0",
+            &scrape(addr),
+            &[
+                "uc2_service_version",
+                "uc2_row_running_version",
+                "uc_service_attached",
+                "uc_service_heartbeat_age_seconds",
+            ],
+        );
+        thread::sleep(Duration::from_millis(200));
+    }
+    srv.stop();
+
+    let (scenario, heartbeat) = if fresh_heartbeat {
+        (
+            "row_version_mismatch",
+            "its heartbeat stamped fresh before every scrape (a LIVE service)",
+        )
+    } else {
+        (
+            "row_version_mismatch_stale_heartbeat",
+            "its heartbeat NEVER stamped (a dead off-line service that left ATTACHED set — a \
+             kill or crash; a deliberate version stop clears the bit since R18); extra check, \
+             must NOT fire",
+        )
+    };
+    (
+        sf,
+        Disclosure {
+            scenario,
+            rules: &["Uc2RowVersionMismatch"],
+            state: "synthetic",
+            method: format!(
+                "one synthetic ObsSources, its own real exporter: row 0 = {:?} is ATTACHED \
+                 running version {v_service} (1.3.0) while the row's committed running line \
+                 (genesis or a pin) reads {v_running} (1.2.0), {heartbeat}. All four render \
+                 through the real encoder as uc2_service_version{{row=\"0\"}}, \
+                 uc2_row_running_version{{row=\"0\"}}, uc_service_attached{{row=\"0\"}} and \
+                 uc_service_heartbeat_age_seconds{{row=\"0\"}}; Uc2RowVersionMismatch fires on \
+                 a differing major.minor with attached == 1 AND a heartbeat younger than 10 s.",
                 kv.as_str()
             ),
         },
@@ -2068,4 +2312,56 @@ fn await_stable_leader(nodes: &[NodeH], secs: u64) -> usize {
         }
         assert!(Instant::now() < deadline, "leader never stabilized");
     }
+}
+
+/// #33 Fix round 1 (ruling R14): since Task 7, the leader admits no client
+/// frame until every declared row has a running version — a genesis record,
+/// which needs the LEADER's service for that row attached. A scenario that
+/// drives load through a bare `spawn_cluster` (a single declared row,
+/// `noop`, with nothing ever attached anywhere) therefore has admission held
+/// shut forever: every `submit` silently errs, the window never fills, and
+/// no follower ever falls behind — deterministically, on every run.
+///
+/// Attach a real `NoopSm` on EVERY node, not just the leader — leadership
+/// can move (and does, per `await_stable_leader`'s own comment on this box)
+/// — then poll the CURRENT leader's row 0 until it shows a committed
+/// running version before returning. Callers must keep the returned handles
+/// alive for the scenario's lifetime and `.stop()` them at cleanup, same as
+/// every other real-service scenario in this file.
+fn attach_noop_everywhere(nodes: &[NodeH]) -> Vec<uc_service::Service<NoopSm>> {
+    let services: Vec<uc_service::Service<NoopSm>> = nodes
+        .iter()
+        .map(|n| {
+            ServiceBuilder::new(ServiceConfig::new(&n.instance_dir, APP), NoopSm)
+                .start()
+                .expect("NoopSm attaches")
+        })
+        .collect();
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let leader_idx = await_single_leader(nodes, 20);
+        let has_running = matches!(
+            nodes[leader_idx]
+                .n()
+                .observability()
+                .cnc
+                .service_slot(0)
+                .status
+                .row_view(),
+            uc_log::cnc::RowRead::View {
+                running: Some(_),
+                ..
+            }
+        );
+        if has_running {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "row 0 never got a running version on the leader"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    services
 }

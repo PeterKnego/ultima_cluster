@@ -156,7 +156,10 @@ a **flag day, per row** — you pin the row's next version to a coordinated
 instant, then stop every instance of that row, install the new binary, and
 start it again — because a mixed-version cluster can commit a command the old
 replicas cannot apply, and a failover to an old leader would then lose an
-acknowledged write. The nine stages a row moves through are the standard's
+acknowledged write. The platform enforces this: each row has one committed
+running version, a binary on another major.minor is refused at attach, and a
+pin stops the old services at exactly the pin record
+([the version rules](../how-to/upgrade-an-application.md#the-version-rules)). The nine stages a row moves through are the standard's
 [upgrade lifecycle](../reference/application-sdlc.md#the-upgrade-lifecycle-per-row);
 the commands are the next how-to:
 

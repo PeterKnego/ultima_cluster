@@ -271,6 +271,7 @@ RULE_META = {
     "Uc2ServicePinnedAtLagBound": {"severity": "warning", "real": True, "scenario": "fsm_pinned"},
     "Uc2ServiceIdentityDrift": {"severity": "critical", "real": False, "scenario": "identity_drift"},
     "Uc2ServiceVersionDrift": {"severity": "warning", "real": False, "scenario": "version_drift"},
+    "Uc2RowVersionMismatch": {"severity": "critical", "real": False, "scenario": "row_version_mismatch"},
     "Uc2LogTimeFrozen": {"severity": "warning", "real": False, "scenario": "log_time_frozen"},
     "Uc2ScheduleTableDiverged": {"severity": "warning", "real": False, "scenario": "schedule_diverged"},
     "Uc2SnapshotStalled": {"severity": "warning", "real": False, "scenario": "snapshot_stalled"},
@@ -528,6 +529,50 @@ def build_Uc2ServiceVersionDrift():
     return r
 
 
+def build_Uc2RowVersionMismatch():
+    # #33: `row_version_mismatch`'s scenario scrapes a SINGLE synthetic
+    # "node" ("n0") — unlike the two-instance drift rules, this alert
+    # compares two gauges on the SAME instance/row (the attached service's
+    # version against its row's committed running line), so one source is
+    # enough. Same three-series `and`-chain shape as
+    # build_Uc2ServicePinnedAtLagBound, but with an `on(instance, row)`
+    # comparison as the LHS instead of a bare metric. Unlike a plain
+    # `and on(...)` join (which keeps the LHS's full label set), a `!=
+    # on(instance, row)` COMPARISON only keeps the `on(...)` labels
+    # themselves in its output — either side's other labels (here `service`)
+    # can legitimately differ and are dropped, not kept from one side by
+    # convention — so `labels_from` is a synthetic dict carrying just
+    # `instance`/`row`, the same idiom build_Uc2ServiceIdentityDrift uses for
+    # its `count_values`-collapsed result.
+    #
+    # #33 ruling R17 added a fourth series: the per-row
+    # `uc_service_heartbeat_age_seconds` (`< 10` — a LIVE service), so a
+    # normal upgrade's exited-but-still-ATTACHED old service does not page.
+    # Its negative twin is the `row_version_mismatch_stale_heartbeat` extra
+    # check below.
+    return row_version_mismatch_spec("row_version_mismatch", expect_fire=True)
+
+
+def row_version_mismatch_spec(scenario, expect_fire):
+    rows = load_scenario(scenario)
+    ver_row = select(rows, "uc2_service_version", {"row": "0"})
+    running_row = select(rows, "uc2_row_running_version", {"row": "0"})
+    att_row = select(rows, "uc_service_attached", {"row": "0"})
+    hb_row = select(rows, "uc_service_heartbeat_age_seconds", {"row": "0"})
+    labels_from = (
+        {"labels": {"instance": ver_row["labels"]["instance"], "row": ver_row["labels"]["row"]}}
+        if expect_fire
+        else None
+    )
+    r = new_rule("critical", labels_from=labels_from)
+    add_hold_last(r, ver_row, "uc2_service_version", 60)
+    add_hold_last(r, running_row, "uc2_row_running_version", 60)
+    add_hold_last(r, att_row, "uc_service_attached", 60)
+    add_hold_last(r, hb_row, "uc_service_heartbeat_age_seconds", 60)
+    r["eval_time"] = total_for(60)[0]
+    return r
+
+
 def build_Uc2LogTimeFrozen():
     # Time-and-timers plan 1: `uc2_log_time_lag_seconds > 5 and on(instance)
     # uc2_is_leader == 1`. Same two-series `and` shape as
@@ -757,6 +802,7 @@ RULE_BUILDERS = {
     "Uc2ServicePinnedAtLagBound": build_Uc2ServicePinnedAtLagBound,
     "Uc2ServiceIdentityDrift": build_Uc2ServiceIdentityDrift,
     "Uc2ServiceVersionDrift": build_Uc2ServiceVersionDrift,
+    "Uc2RowVersionMismatch": build_Uc2RowVersionMismatch,
     "Uc2LogTimeFrozen": build_Uc2LogTimeFrozen,
     "Uc2ScheduleTableDiverged": build_Uc2ScheduleTableDiverged,
     "Uc2SnapshotStalled": build_Uc2SnapshotStalled,
@@ -846,6 +892,42 @@ tests:
     return path
 
 
+def write_extra_test_yaml(filename, alertname, spec, expect_fire):
+    """Fix round 2: an ad hoc promtool test against a SHIPPED rule
+    (`alertname`), but fed by a scenario that is NOT that rule's
+    RULE_META/RULE_BUILDERS entry — used for extra regression coverage that
+    isn't itself one of the 28 shipped rules (a second, narrower case for a
+    rule already adjudicated above). Unlike `write_test_yaml`, `filename`
+    (the .yml basename) and `alertname` (what the ALERTS query and the
+    expected-labels block use) are independent, and `expect_fire=False`
+    asserts an EMPTY result (`exp_samples: []`, promtool's own idiom for
+    "this query must return nothing at eval_time") instead of a firing
+    sample."""
+    input_series_yaml = "\n".join(
+        f'      - series: \'{series}\'\n        values: "{values}"' for series, values in spec["series"]
+    )
+    if expect_fire:
+        exp = exp_labels_block(alertname, spec["severity"], spec["labels_from"])
+        exp_block = f'        exp_samples:\n          - labels: \'ALERTS{exp}\'\n            value: 1\n'
+    else:
+        exp_block = "        exp_samples: []\n"
+    yaml_text = f"""rule_files:
+  - {RULES_FILE}
+evaluation_interval: {INTERVAL}s
+tests:
+  - interval: {INTERVAL}s
+    input_series:
+{input_series_yaml}
+    promql_expr_test:
+      - expr: 'ALERTS{{alertname="{alertname}",alertstate="firing"}}'
+        eval_time: {spec["eval_time"]}s
+{exp_block}"""
+    path = os.path.join(TEST_DIR, f"{filename}.yml")
+    with open(path, "w") as f:
+        f.write(yaml_text)
+    return path
+
+
 overall_ok = True
 for name in sorted(RULE_META):
     meta = RULE_META[name]
@@ -883,5 +965,101 @@ for name in sorted(RULE_META):
         print(proc.stdout)
         print(proc.stderr, file=sys.stderr)
 
-sys.exit(0 if overall_ok else 1)
+# ------------------------------------------------------------ extra checks
+#
+# Fix round 2: review finding on Uc2ServiceVersionDrift — the PRE-fix
+# expression floored the packed version BEFORE filtering the sentinel
+# (`floor(uc2_service_version / 65536) > 0`), so a genuinely running 0.0.x
+# line (packed nonzero but < 65536) floored to line 0 and was silently
+# dropped from the comparison, same as the unattached sentinel 0 itself —
+# a real 0.0.5-vs-1.0.0 pair never counted as drift. These two checks are
+# NOT among the 28 shipped rules (they adjudicate the SAME shipped rule,
+# Uc2ServiceVersionDrift, against two extra scenarios) so they are reported
+# separately, `extra=...` rather than `rule=...`, and are not counted
+# toward the 28/28 total — but a FAIL here still fails the whole script.
+print()
+print("== extra checks: Uc2ServiceVersionDrift review-fix regression (Fix round 2) ==")
+
+
+def run_extra_check(extra_name, scenario_name, expect_fire, human):
+    try:
+        rows = load_scenario(scenario_name)
+        row_a = select(rows, "uc2_service_version", {"instance": "n0"})
+        row_b = select(rows, "uc2_service_version", {"instance": "n1"})
+        labels_from = (
+            {"labels": {"row": row_a["labels"]["row"]}} if expect_fire else None
+        )
+        spec = new_rule("warning", labels_from=labels_from)
+        add_hold_last(spec, row_a, "uc2_service_version", 300)
+        add_hold_last(spec, row_b, "uc2_service_version", 300)
+        spec["eval_time"] = total_for(300)[0]
+    except ScenarioMissing as e:
+        print(f"FAIL extra={extra_name} rule=Uc2ServiceVersionDrift ({human}) — scenario did not produce series: {e}")
+        return False
+
+    for line in spec["dilation"]:
+        print(f"  dilate extra={extra_name} {line}")
+    path = write_extra_test_yaml(extra_name, "Uc2ServiceVersionDrift", spec, expect_fire)
+    proc = subprocess.run([PROMTOOL, "test", "rules", path], capture_output=True, text=True)
+    if proc.returncode == 0:
+        print(f"PASS extra={extra_name} rule=Uc2ServiceVersionDrift ({human})")
+        return True
+    print(f"FAIL extra={extra_name} rule=Uc2ServiceVersionDrift ({human})")
+    print(proc.stdout)
+    print(proc.stderr, file=sys.stderr)
+    return False
+
+
+extra_ok = True
+extra_ok &= run_extra_check(
+    "Uc2ServiceVersionDrift__zero_line",
+    "version_drift_zero_line",
+    True,
+    "0.0.5 vs 1.0.0 must fire",
+)
+extra_ok &= run_extra_check(
+    "Uc2ServiceVersionDrift__patch_only",
+    "version_drift_patch_only",
+    False,
+    "1.2.0 vs 1.2.7 must NOT fire",
+)
+
+
+# #33 ruling R17: Uc2RowVersionMismatch gained a fresh-heartbeat clause so it
+# pages only on a LIVE off-line service. (Since R18 a deliberate version stop
+# also clears ATTACHED; the clause still covers an old service that was
+# killed with its ATTACHED bit set.) This negative case (off-line, attached,
+# heartbeat never stamped) must NOT fire. Not one of the 28 shipped rules; a FAIL here still
+# fails the script.
+print()
+print("== extra checks: Uc2RowVersionMismatch fresh-heartbeat clause (#33 R17) ==")
+
+
+def run_row_mismatch_extra(extra_name, scenario_name, expect_fire, human):
+    try:
+        spec = row_version_mismatch_spec(scenario_name, expect_fire)
+    except ScenarioMissing as e:
+        print(f"FAIL extra={extra_name} rule=Uc2RowVersionMismatch ({human}) — scenario did not produce series: {e}")
+        return False
+    for line in spec["dilation"]:
+        print(f"  dilate extra={extra_name} {line}")
+    path = write_extra_test_yaml(extra_name, "Uc2RowVersionMismatch", spec, expect_fire)
+    proc = subprocess.run([PROMTOOL, "test", "rules", path], capture_output=True, text=True)
+    if proc.returncode == 0:
+        print(f"PASS extra={extra_name} rule=Uc2RowVersionMismatch ({human})")
+        return True
+    print(f"FAIL extra={extra_name} rule=Uc2RowVersionMismatch ({human})")
+    print(proc.stdout)
+    print(proc.stderr, file=sys.stderr)
+    return False
+
+
+extra_ok &= run_row_mismatch_extra(
+    "Uc2RowVersionMismatch__stale_heartbeat",
+    "row_version_mismatch_stale_heartbeat",
+    False,
+    "off-line + attached + stale heartbeat must NOT fire",
+)
+
+sys.exit(0 if (overall_ok and extra_ok) else 1)
 PYEOF

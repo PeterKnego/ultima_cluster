@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 use uc_log::buffer::LogBuffer;
-use uc_log::cnc::{CncPage, PinRead, pack_service_status, unpack_service_status};
+use uc_log::cnc::{CncPage, RowRead, pack_service_status, unpack_service_status};
 use uc_log::reader::LogFollower;
 use uc_protocol::ring::{BroadcastRing, SpscRing};
 use uc_protocol::v2::cnc::CNC_SVC_STATUS_SNAPSHOT_CAPABLE;
@@ -156,6 +156,15 @@ const BOOT_POLL: std::time::Duration = std::time::Duration::from_millis(20);
 /// and only then does step 4 below publish `applied`. Nothing is written to
 /// the slot before the pin decision, so a refused attach leaves the row
 /// exactly as it found it.
+/// #33 final review I1(b): a bare-integer `const VERSION` (1, 2, 3 …)
+/// packs as `0.0.x` — major.minor `0.0` with a nonzero patch — so under D3
+/// ("same version" = equal major.minor, patch free) every such build is ONE
+/// line: they mix freely and a pin between two of them refuses nothing.
+/// `0` itself is an ordinary version (D4) and is not flagged.
+pub(crate) const fn version_is_patch_only(v: u32) -> bool {
+    v != 0 && v < 1 << 16
+}
+
 pub(crate) fn attach<S: RawStateMachine>(
     cfg: &ServiceConfig,
     sm: S,
@@ -244,31 +253,52 @@ pub(crate) fn attach<S: RawStateMachine>(
         row,
     })?;
 
-    // 1d. Plan B2 (spec §3 S4 steps 4–5): the row's PIN, read through the
-    //     seqlock reader ONLY, and decided BEFORE any slot word is written.
-    //     Under `service.<row>.lock` (just taken above), so the decision and
-    //     the install that follows it are serialised against any other
-    //     attach to this row.
+    // 1d. Plan B2 (spec §3 S4 steps 4–5) + #33 spec §7.1: the row VIEW — the
+    //     pin triple AND the running version — in ONE seqlock read, decided
+    //     BEFORE any slot word is written. One read, not two: two separate
+    //     reads could pair a pin from one publish with a running version
+    //     from another. Under `service.<row>.lock` (just taken above), so
+    //     the decision and the install that follows it are serialised
+    //     against any other attach to this row.
     let s = slot(&cnc, row);
-    let pin = match s.status.pin() {
-        PinRead::NoPin => None,
-        // NOT "no pin": a half-published triple that a reader silently read
+    let (pin, running, attach_record_pos) = match s.status.row_view() {
+        // NOT "no pin": a half-published view that a reader silently read
         // as unpinned would skip an install the cluster requires. Transient,
         // so the refusal says to retry.
-        PinRead::Contended => return Err(ServiceError::PinUnreadable { row }),
-        PinRead::Pinned { origin, from, to } => {
-            if to != S::VERSION {
-                return Err(ServiceError::PinnedVersionMismatch {
-                    name: S::IDENTITY.name.as_str().to_string(),
-                    row,
-                    origin,
-                    pinned: to,
-                    mine: S::VERSION,
-                });
-            }
-            Some((origin, from, to))
-        }
+        RowRead::Contended => return Err(ServiceError::PinUnreadable { row }),
+        RowRead::View {
+            pin,
+            running,
+            record_pos,
+        } => (pin, running, record_pos),
     };
+    match (pin, running) {
+        // A pinned row: the pin names a LINE (#33 ruling R17, spec D3 —
+        // patch is free), so a patch build of `to` takes the pinned path
+        // below and an off-line build is refused by name.
+        (Some((origin, _from, to)), _) if !uc_protocol::identity::same_line(to, S::VERSION) => {
+            return Err(ServiceError::PinnedVersionMismatch {
+                name: S::IDENTITY.name.as_str().to_string(),
+                row,
+                origin,
+                pinned: to,
+                mine: S::VERSION,
+            });
+        }
+        (Some(_), _) => {}
+        // 1e. #33 spec §7.1: unpinned, the row's RUNNING version gates by
+        //     LINE. Absent → proceed (a genesis record is coming and the
+        //     apply loop adjudicates it).
+        (None, Some(r)) if !uc_protocol::identity::same_line(S::VERSION, r) => {
+            return Err(ServiceError::VersionMismatch {
+                name: S::IDENTITY.name.as_str().to_string(),
+                row,
+                running: r,
+                mine: S::VERSION,
+            });
+        }
+        (None, _) => {}
+    }
     // UNCONDITIONAL install (step 4): the artifact at the origin, built by
     // the pin's `from`, replaces whatever state this state machine holds — a
     // DURABLE state machine already above the origin is rewound to it and
@@ -300,8 +330,10 @@ pub(crate) fn attach<S: RawStateMachine>(
         };
         // The envelope is cross-checked against the PIN's `from`, not against
         // `S::VERSION` — this is the sanctioned crossing of a version
-        // boundary, and the artifact is required to be the one `from` built
-        // (the unpinned path in `replay.rs` requires `S::VERSION` instead).
+        // boundary, and the artifact is required to be one `from`'s LINE
+        // built (the unpinned path in `replay.rs` requires `S::VERSION`'s
+        // line instead). Both envelope checks compare by line (`same_line`,
+        // patch ignored — #33 D3), never by exact version.
         let env = crate::snapshots::verify_snapshot_envelope(&mut file, origin, Some(from))
             .map_err(|e| ServiceError::MistaggedSnapshot {
                 path: path.display().to_string(),
@@ -438,11 +470,28 @@ pub(crate) fn attach<S: RawStateMachine>(
     } else {
         0
     };
+    // cnc 3.1: the attaching service's declared version (`ServiceStatusLine::
+    // version`). #33 spec §6.1: the version word BEFORE the status word — the
+    // leader's genesis reads ATTACHED (Acquire) and then the version, so this
+    // order (both Release) makes the version it reads this incarnation's.
+    s.status.store_version(S::VERSION);
+    // #33 final review I1(b): warn, never refuse — a bare-integer version is
+    // legal, it just cannot express a line change.
+    if version_is_patch_only(S::VERSION) {
+        let version = uc_protocol::identity::VersionDisplay(S::VERSION).to_string();
+        uc_obs::obs_event!(
+            Warn,
+            "version_is_patch_only",
+            row = u64::from(row),
+            row_name = S::IDENTITY.name.as_str(),
+            version = version.as_str(),
+            detail = "this VERSION is a bare integer: it packs as 0.0.x and shares the 0.0 line \
+                      with every other bare-integer build, so such builds mix freely and a pin \
+                      between them refuses nothing; use pack_version(major, minor, patch)",
+        );
+    }
     s.status
         .store_release(pack_service_status(row, true, incarnation.wrapping_add(1)) | capable);
-    // cnc 3.1: the attaching service's declared version, for observability
-    // (`ServiceStatusLine::version`) — written once, here, alongside status.
-    s.status.store_version(S::VERSION);
     // 5. Bump the epoch AFTER applied, AcqRel — the discipline the node's
     //    capture-recheck bracket relies on (unchanged, now per slot).
     let epoch = s.epoch.fetch_add(1) + 1;
@@ -475,6 +524,7 @@ pub(crate) fn attach<S: RawStateMachine>(
         // the gap guard's same-version rule (plan B2 T3) has to make an
         // exception for exactly that one artifact. See `replay::replay_into`.
         pin,
+        attach_record_pos,
         lag_mode,
         declared,
         lag_waiting: false,
@@ -506,6 +556,24 @@ pub(crate) fn attach<S: RawStateMachine>(
 #[cfg(test)]
 mod tests {
     use super::lag_mode_for;
+
+    #[test]
+    fn version_is_patch_only_flags_bare_integers_only() {
+        use super::version_is_patch_only;
+        use uc_protocol::identity::pack_version;
+        // Bare integers: 0.0.x with x > 0.
+        assert!(version_is_patch_only(1));
+        assert!(version_is_patch_only(2));
+        assert!(version_is_patch_only(0xFFFF));
+        assert!(version_is_patch_only(pack_version(0, 0, 7)));
+        // 0 is an ordinary version (D4), not a bare integer.
+        assert!(!version_is_patch_only(0));
+        // Anything with a real major or minor.
+        assert!(!version_is_patch_only(1 << 16));
+        assert!(!version_is_patch_only(pack_version(0, 1, 0)));
+        assert!(!version_is_patch_only(pack_version(1, 0, 3)));
+        assert!(!version_is_patch_only(u32::MAX));
+    }
     use crate::lag::LagMode;
     use uc_log::cnc::{CncMeta, CncPage};
 

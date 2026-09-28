@@ -21,8 +21,8 @@ use uc_log::reader::{Batch, LogFollower};
 use uc_protocol::ring::{RingError, SpscConsumer, SpscProducer};
 use uc_protocol::v2::cnc::{NODE_FLAG_LEADER, NODE_FLAG_LEARNER};
 use uc_protocol::v2::frame::{
-    FLAG_SNAPSHOT_STANDBY, FLAG_TIMER_TABLE, FRAME_TYPE_MESSAGE, FRAME_TYPE_SNAPSHOT,
-    FRAME_TYPE_TIMER, FrameHeader, align_frame_len, read_timer_body,
+    FLAG_SNAPSHOT_STANDBY, FLAG_TIMER_TABLE, FRAME_TYPE_CLUSTER, FRAME_TYPE_MESSAGE,
+    FRAME_TYPE_SNAPSHOT, FRAME_TYPE_TIMER, FrameHeader, align_frame_len, read_timer_body,
 };
 use uc_protocol::v2::ipc::{MSG_V2_SCHED, SchedOp, SchedRecord, write_sched_record};
 
@@ -291,6 +291,9 @@ pub(crate) struct ApplyState<S: RawStateMachine> {
     /// this binary's `S::VERSION`, and the guard's same-version rule (plan B2
     /// T3) must make an exception for exactly that artifact and no other.
     pub(crate) pin: Option<(u64, u32, u32)>,
+    /// #33: every version record at or below this frame-END was decided by
+    /// this attach; the apply loop adjudicates only later ones.
+    pub(crate) attach_record_pos: u64,
     /// M14a Task 7: the lag barrier mode this incarnation runs under, fixed at
     /// attach (the page's lag config is boot-once, like `service_id`).
     pub(crate) lag_mode: crate::lag::LagMode,
@@ -561,6 +564,9 @@ pub(crate) fn apply_cycle<S: RawStateMachine>(st: &mut ApplyState<S>) -> bool {
                 // `ApplyCtx::rebind`): the per-frame construction was ~10
                 // stores plus a drop on the hot path.
                 let mut ctx = ApplyCtx::new(0, S::IDENTITY);
+                // R13: the start of a version record the agent has not
+                // applied yet — the batch ends there, see below.
+                let mut pending_at: Option<u64> = None;
                 for (pos, hdr, payload) in frames {
                     // PADDING, NEW_TERM, CONFIG (and any future type that is
                     // neither MESSAGE nor a TIMER for THIS row), and anything
@@ -640,6 +646,37 @@ pub(crate) fn apply_cycle<S: RawStateMachine>(st: &mut ApplyState<S>) -> bool {
                             &st.cnc,
                             st.service_id,
                         );
+                    } else if hdr.frame_type == FRAME_TYPE_CLUSTER {
+                        // #33 spec §7.2: the type test and one out-of-line
+                        // call (M14a). A version record that superseded this
+                        // binary's line stops the service at EXACTLY `pos`:
+                        // every earlier frame applied, nothing after. One the
+                        // agent has not applied yet ends the batch AT it
+                        // (R13), handled below, off the per-frame path.
+                        match crate::version_gate::on_cluster_frame(
+                            &st.cnc,
+                            st.service_id,
+                            S::VERSION,
+                            st.attach_record_pos,
+                            pos,
+                            &hdr,
+                            payload,
+                        ) {
+                            crate::version_gate::Gate::Pass => {}
+                            crate::version_gate::Gate::Stop { running } => {
+                                crate::version_gate::stop_at_record(
+                                    sm,
+                                    &st.cnc,
+                                    st.service_id,
+                                    running,
+                                    pos,
+                                );
+                            }
+                            crate::version_gate::Gate::Pending => {
+                                pending_at = Some(pos);
+                                break;
+                            }
+                        }
                     }
                     if one_frame {
                         break; // lockstep: exactly one frame past the floor
@@ -653,6 +690,23 @@ pub(crate) fn apply_cycle<S: RawStateMachine>(st: &mut ApplyState<S>) -> bool {
                         std::sync::atomic::Ordering::Relaxed,
                     );
                     profile::add(pf_frames, pf_sm, pf_pub, pf_bytes);
+                }
+                if let Some(pos) = pending_at {
+                    // R13: rewind to the record (`applied = pos`) and hand the
+                    // cycle back — the SM guard is already released, the
+                    // runner checks its stop flag, and the next cycle
+                    // re-walks the record (the CLUSTER arm has no side
+                    // effects; MESSAGE/TIMER are `> last_applied`-guarded).
+                    // Counted as progress so the runner does not park the
+                    // row on its idle ladder while a record is in flight.
+                    crate::version_gate::rewind_to_record(
+                        &mut st.follower.cursor,
+                        &st.cnc,
+                        st.service_id,
+                        pos,
+                    );
+                    progressed = true;
+                    break;
                 }
                 // Publish the new applied frontier for barrier readers / clients.
                 crate::attach::slot(&st.cnc, st.service_id)
@@ -704,6 +758,7 @@ pub(crate) fn apply_cycle<S: RawStateMachine>(st: &mut ApplyState<S>) -> bool {
                     node_flags,
                     service_id: st.service_id,
                     pin: st.pin,
+                    decided_to: st.attach_record_pos.max(st.follower.cursor),
                 },
                 // Plan B3 final review F1: a pass that already failed to move
                 // this cursor is evidence the journal cannot serve it — feed
@@ -712,6 +767,32 @@ pub(crate) fn apply_cycle<S: RawStateMachine>(st: &mut ApplyState<S>) -> bool {
                 st.replay_stalled,
             ) {
                 Ok(Replay::Rejoin(cursor)) => cursor,
+                // R13: replay reached a version record the agent has not
+                // applied yet — rejoin AT it and end the cycle, exactly as
+                // the live arm's `Pending` does. Never the gap guard's
+                // no-progress case: nothing is missing, the agent is behind.
+                Ok(Replay::AwaitVersion(at)) => {
+                    st.replay_wait = None;
+                    st.needs_replay = false;
+                    // Final review M4: reaching the record proves the journal
+                    // served this cursor, so the stall episode is over whether
+                    // or not the cursor moved (it does not when the row was
+                    // already waiting AT the record).
+                    st.replay_stalled = None;
+                    let moved = at > cursor_before;
+                    crate::version_gate::rewind_to_record(
+                        &mut st.follower.cursor,
+                        &st.cnc,
+                        st.service_id,
+                        at,
+                    );
+                    if moved {
+                        st.lag_waiting = false;
+                        st.announce_pending = true;
+                    }
+                    progressed = true;
+                    break;
+                }
                 // The covering artifact is above `min(commit, durable)`: the
                 // counters are still climbing toward it. Leave the cursor
                 // where it is and let the agent idle; the next cycle overruns
@@ -1410,6 +1491,7 @@ mod tests {
             my_epoch: 1,
             service_id: 0,
             pin: None,
+            attach_record_pos: 0,
             lag_mode: crate::lag::LagMode::Off,
             declared: 0b1,
             lag_waiting: false,
@@ -1595,6 +1677,7 @@ mod tests {
             my_epoch: 1,
             service_id: 0,
             pin: None,
+            attach_record_pos: 0,
             lag_mode: crate::lag::LagMode::Off,
             declared: 0b1,
             lag_waiting: false,
@@ -1625,6 +1708,420 @@ mod tests {
         );
         assert_eq!(sm.last, Some(pos[N - 1]));
         assert_eq!(st.follower.cursor, head);
+    }
+
+    // ------------------- #33 spec §7.2: the version-record arm
+
+    /// `RowGenesis { row: 0, version }` as a CLUSTER frame, through the real
+    /// appender. Returns (frame start, frame end).
+    fn append_genesis(appender: &mut uc_log::buffer::Appender, version: u32) -> (u64, u64) {
+        let mut body = vec![0u8, 0, 0, 0];
+        body.extend_from_slice(&version.to_le_bytes());
+        let end = appender
+            .append_cluster(1, uc_protocol::v2::frame::ClusterKind::RowGenesis, &body)
+            .unwrap();
+        (end - 64, end)
+    }
+
+    /// Stand in for the `uc2-cluster` agent having applied (and accepted)
+    /// the genesis record: row words first, then `cluster_applied`.
+    fn agent_accepted(cnc: &CncPage, version: u32, end: u64) {
+        cnc.service_slot(0)
+            .status
+            .store_row_view(None, Some(version), end);
+        cnc.store_cluster_applied(end);
+    }
+
+    fn panic_text(e: Box<dyn std::any::Any + Send>) -> String {
+        e.downcast_ref::<String>()
+            .cloned()
+            .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
+            .unwrap_or_default()
+    }
+
+    /// Live arm: a record that moved the row off this binary's line stops the
+    /// service at EXACTLY its start — the frame before it applied, the frame
+    /// after it not, and `applied` published as the record's start.
+    #[test]
+    fn the_live_loop_stops_at_exactly_a_superseding_record() {
+        let (mut st, cnc, _sc, mut appender, _dir) = apply_state_for_test(CountSm::default());
+        let before = appender.append(1, 1, &[1u8; 64]).unwrap();
+        let (start, end) =
+            append_genesis(&mut appender, uc_protocol::identity::pack_version(1, 0, 0));
+        appender.append(1, 2, &[1u8; 64]).unwrap();
+        let head = appender.position();
+        cnc.counters().durable.store_release(head);
+        cnc.counters().commit.store_release(head);
+        agent_accepted(&cnc, uc_protocol::identity::pack_version(1, 0, 0), end);
+        // R18: attached (incarnation 7) and snapshot-capable going in.
+        let before_word = uc_log::cnc::pack_service_status(0, true, 7)
+            | uc_protocol::v2::cnc::CNC_SVC_STATUS_SNAPSHOT_CAPABLE;
+        cnc.service_slot(0).status.store_release(before_word);
+
+        let r =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| super::apply_cycle(&mut st)));
+        let msg = panic_text(r.expect_err("the service must fail-stop at the record"));
+        assert!(
+            msg.starts_with("version_superseded: row \"count\" moved to 1.0.0"),
+            "{msg}"
+        );
+        let sm = st
+            .sm
+            .lock()
+            .expect("the SM mutex is not poisoned by the stop");
+        assert_eq!(
+            (sm.applies, sm.last),
+            (1, Some(before)),
+            "only the frame before it"
+        );
+        assert_eq!(cnc.service_slot(0).applied.load_acquire(), start);
+        // R18: a deliberate stop is not a crash — it clears ATTACHED and
+        // nothing else (incarnation and SNAPSHOT_CAPABLE kept, so the node
+        // can still command an instant while the row is stopped).
+        assert_eq!(
+            cnc.service_slot(0).status.load_acquire(),
+            before_word & !uc_protocol::v2::cnc::CNC_SVC_STATUS_ATTACHED,
+            "the version stop cleared ATTACHED only"
+        );
+    }
+
+    /// Live arm, the other way: a record that keeps this binary's line is
+    /// walked past, and so is one the agent REFUSED (`record_pos` older).
+    #[test]
+    fn the_live_loop_walks_past_its_own_line_and_a_refused_record() {
+        for (running, record_at_end) in [
+            (0u32, true),
+            (uc_protocol::identity::pack_version(1, 0, 0), false),
+        ] {
+            let (mut st, cnc, _sc, mut appender, _dir) = apply_state_for_test(CountSm::default());
+            appender.append(1, 1, &[1u8; 64]).unwrap();
+            let (_, end) = append_genesis(&mut appender, running);
+            let after = appender.append(1, 2, &[1u8; 64]).unwrap();
+            let head = appender.position();
+            cnc.counters().durable.store_release(head);
+            cnc.counters().commit.store_release(head);
+            if record_at_end {
+                agent_accepted(&cnc, running, end);
+            } else {
+                // Refused: the view still names an older record (here none).
+                cnc.store_cluster_applied(head);
+            }
+            assert!(super::apply_cycle(&mut st));
+            let sm = st.sm.lock().unwrap();
+            assert_eq!((sm.applies, sm.last), (2, Some(after)));
+            assert_eq!(cnc.service_slot(0).applied.load_acquire(), head);
+        }
+    }
+
+    /// R13: a version record the `uc2-cluster` agent has not reached within
+    /// the wait budget is PENDING, not a spin-forever: the cycle rewinds the
+    /// cursor to the record, publishes `applied = pos`, applies nothing after
+    /// it, releases the SM mutex and RETURNS — so the runner's stop check and
+    /// the next cycle's `check_node_instance` both get their turn. The next
+    /// cycle re-walks the record; once the agent has applied it, the frame
+    /// after it applies. Timeout-wrapped so a RED run fails, not hangs.
+    #[test]
+    fn a_pending_version_record_returns_from_the_cycle_at_the_record() {
+        let (mut st, cnc, _sc, mut appender, _dir) = apply_state_for_test(CountSm::default());
+        let before = appender.append(1, 1, &[1u8; 64]).unwrap();
+        let v0 = 0u32; // CountSm's own line: the record is ours once applied
+        let (start, end) = append_genesis(&mut appender, v0);
+        let after = appender.append(1, 2, &[1u8; 64]).unwrap();
+        let head = appender.position();
+        cnc.counters().durable.store_release(head);
+        cnc.counters().commit.store_release(head);
+        // The agent never advances: `cluster_applied` stays 0.
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let progressed = super::apply_cycle(&mut st);
+            let _ = tx.send((progressed, st));
+        });
+        let (_, mut st) = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("apply_cycle must return while the record is pending, not spin");
+        {
+            let sm = st
+                .sm
+                .try_lock()
+                .expect("the SM mutex is released, not held or poisoned");
+            assert_eq!(
+                (sm.applies, sm.last),
+                (1, Some(before)),
+                "nothing at or after the record"
+            );
+        }
+        assert_eq!(
+            st.follower.cursor, start,
+            "the cursor is rewound to the record"
+        );
+        assert_eq!(cnc.service_slot(0).applied.load_acquire(), start);
+
+        // The agent catches up; the next cycle re-walks the record and goes on.
+        agent_accepted(&cnc, v0, end);
+        assert!(super::apply_cycle(&mut st));
+        let sm = st.sm.lock().unwrap();
+        assert_eq!((sm.applies, sm.last), (2, Some(after)));
+        assert_eq!(cnc.service_slot(0).applied.load_acquire(), head);
+    }
+
+    /// R13, the teardown half: with the agent never advancing, the apply
+    /// agent's runner still reaches its stop check, so `stop()` (what
+    /// `Service::stop` does per agent) returns promptly.
+    #[test]
+    fn stop_returns_while_a_version_record_waits_on_a_silent_agent() {
+        let (mut st, cnc, _sc, mut appender, _dir) = apply_state_for_test(CountSm::default());
+        appender.append(1, 1, &[1u8; 64]).unwrap();
+        append_genesis(&mut appender, uc_protocol::identity::pack_version(1, 0, 0));
+        let head = appender.position();
+        cnc.counters().durable.store_release(head);
+        cnc.counters().commit.store_release(head);
+        let runner = uc_log::agent::AgentRunner::spawn(
+            "uc2-apply-r13",
+            uc_log::agent::IdleStrategy::Yield,
+            move || super::apply_cycle(&mut st),
+        )
+        .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            runner.stop();
+            let _ = tx.send(());
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("stop() must return while the version record is pending");
+    }
+
+    /// Replay arm: the mid-life/attach-time journal replay (`Overrun`) walks
+    /// frames above `attach_record_pos` too, so it must stop at a superseding
+    /// record exactly as the live loop does.
+    #[test]
+    fn the_journal_replay_stops_at_exactly_a_superseding_record() {
+        let dir = scratch();
+        let cnc = page(0x3333);
+        cnc.store_services_declared(0b1);
+        let buffer = std::sync::Arc::new(uc_log::buffer::LogBuffer::new(
+            uc_log::region::Region::heap_zeroed(CAP as usize),
+            std::sync::Arc::clone(&cnc),
+            256,
+        ));
+        let journal_dir = dir.path().join("journal");
+        let mut archive = uc_log::archive::Archive::open(uc_log::archive::ArchiveConfig {
+            segment_size_bytes: 16 * 1024,
+            preallocate_segments: false,
+            ..uc_log::archive::ArchiveConfig::new(&journal_dir)
+        })
+        .unwrap();
+        let mut appender = uc_log::buffer::Appender::new(std::sync::Arc::clone(&buffer), 1, 0);
+        // Lap the 64 KiB ring (1400 × 96 B) so cursor 0 overruns; the record
+        // sits after frame 199, far below what the ring retains.
+        let v1 = uc_protocol::identity::pack_version(1, 0, 0);
+        let mut last_before = 0;
+        let mut rec = (0, 0);
+        for i in 0..1400u32 {
+            let p = appender.append(1, i, &[1u8; 64]).unwrap();
+            if i < 200 {
+                last_before = p;
+            }
+            if i == 199 {
+                rec = append_genesis(&mut appender, v1);
+            }
+            if i % 100 == 99 {
+                while archive.do_work(&buffer).unwrap() {}
+            }
+        }
+        while archive.do_work(&buffer).unwrap() {}
+        drop(archive);
+        let head = cnc.counters().append.load_acquire();
+        assert_eq!(cnc.counters().durable.load_acquire(), head, "all recorded");
+        cnc.counters().commit.store_release(head);
+        agent_accepted(&cnc, v1, rec.1);
+
+        let (mut st, _cnc2, _sc2, _ap2, _dir2) = apply_state_for_test(CountSm::default());
+        st.cnc = Arc::clone(&cnc);
+        st.follower = uc_log::reader::LogFollower::new(std::sync::Arc::clone(&buffer), 0);
+        st.journal_dir = journal_dir;
+        st.instance_id = 0x3333;
+        // R18: attached (incarnation 7) and snapshot-capable going in.
+        let before_word = uc_log::cnc::pack_service_status(0, true, 7)
+            | uc_protocol::v2::cnc::CNC_SVC_STATUS_SNAPSHOT_CAPABLE;
+        cnc.service_slot(0).status.store_release(before_word);
+
+        let r =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| super::apply_cycle(&mut st)));
+        let msg = panic_text(r.expect_err("replay must fail-stop at the record"));
+        assert!(msg.starts_with("version_superseded:"), "{msg}");
+        let sm = st.sm.lock().expect("not poisoned");
+        assert_eq!(
+            (sm.applies, sm.last),
+            (200, Some(last_before)),
+            "frames 0..200 only"
+        );
+        assert_eq!(cnc.service_slot(0).applied.load_acquire(), rec.0);
+        assert_eq!(
+            cnc.service_slot(0).status.load_acquire(),
+            before_word & !uc_protocol::v2::cnc::CNC_SVC_STATUS_ATTACHED,
+            "R18: the replay-path version stop cleared ATTACHED only"
+        );
+    }
+
+    /// R13 on the replay path: a version record the agent has not applied
+    /// ends the pass AT it (`Replay::AwaitVersion`) and the cycle returns —
+    /// the gap guard must not read it as a no-progress pass.
+    #[test]
+    fn a_pending_version_record_ends_the_journal_replay_at_it() {
+        let dir = scratch();
+        let cnc = page(0x3333);
+        cnc.store_services_declared(0b1);
+        let buffer = std::sync::Arc::new(uc_log::buffer::LogBuffer::new(
+            uc_log::region::Region::heap_zeroed(CAP as usize),
+            std::sync::Arc::clone(&cnc),
+            256,
+        ));
+        let journal_dir = dir.path().join("journal");
+        let mut archive = uc_log::archive::Archive::open(uc_log::archive::ArchiveConfig {
+            segment_size_bytes: 16 * 1024,
+            preallocate_segments: false,
+            ..uc_log::archive::ArchiveConfig::new(&journal_dir)
+        })
+        .unwrap();
+        let mut appender = uc_log::buffer::Appender::new(std::sync::Arc::clone(&buffer), 1, 0);
+        // Lap the 64 KiB ring (1400 × 96 B) so cursor 0 overruns; the record
+        // sits after frame 199, far below what the ring retains.
+        let v1 = uc_protocol::identity::pack_version(1, 0, 0);
+        let mut last_before = 0;
+        let mut rec = (0, 0);
+        for i in 0..1400u32 {
+            let p = appender.append(1, i, &[1u8; 64]).unwrap();
+            if i < 200 {
+                last_before = p;
+            }
+            if i == 199 {
+                rec = append_genesis(&mut appender, v1);
+            }
+            if i % 100 == 99 {
+                while archive.do_work(&buffer).unwrap() {}
+            }
+        }
+        while archive.do_work(&buffer).unwrap() {}
+        drop(archive);
+        let head = cnc.counters().append.load_acquire();
+        assert_eq!(cnc.counters().durable.load_acquire(), head, "all recorded");
+        cnc.counters().commit.store_release(head);
+        // The agent never advances: `cluster_applied` stays 0.
+
+        let (mut st, _cnc2, _sc2, _ap2, _dir2) = apply_state_for_test(CountSm::default());
+        st.cnc = Arc::clone(&cnc);
+        st.follower = uc_log::reader::LogFollower::new(std::sync::Arc::clone(&buffer), 0);
+        st.journal_dir = journal_dir;
+        st.instance_id = 0x3333;
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let progressed = super::apply_cycle(&mut st);
+            let _ = tx.send((progressed, st));
+        });
+        let (progressed, st) = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("a pending record must end the replay, not spin");
+        assert!(progressed, "the replay moved the cursor up to the record");
+        let sm = st.sm.try_lock().expect("not held, not poisoned");
+        assert_eq!(
+            (sm.applies, sm.last),
+            (200, Some(last_before)),
+            "frames 0..200 only"
+        );
+        assert_eq!(st.follower.cursor, rec.0, "rejoined AT the record");
+        assert_eq!(cnc.service_slot(0).applied.load_acquire(), rec.0);
+        assert_eq!(
+            st.replay_stalled, None,
+            "never the gap guard's no-progress case"
+        );
+    }
+
+    /// Final review M4: reaching a version record in a replay pass proves the
+    /// journal SERVED the cursor, so the stall episode is over even when the
+    /// follower's cursor did not move — `AwaitVersion` clears `replay_stalled`
+    /// unconditionally. Shape: the row already waits AT the record (cursor ==
+    /// the record, the SM's own frontier below it), the ring lapped meanwhile,
+    /// and a prior no-progress pass left a stall recorded. The forced gap pass
+    /// installs a covering artifact, replays the tail up to the record, and
+    /// rejoins AT it — the same cursor, so `moved` is false.
+    #[test]
+    fn a_replay_that_reaches_a_version_record_ends_the_stall_even_without_moving() {
+        let dir = scratch();
+        let cnc = page(0x3434);
+        cnc.store_services_declared(0b1);
+        let buffer = std::sync::Arc::new(uc_log::buffer::LogBuffer::new(
+            uc_log::region::Region::heap_zeroed(CAP as usize),
+            std::sync::Arc::clone(&cnc),
+            256,
+        ));
+        let journal_dir = dir.path().join("journal");
+        let mut archive = uc_log::archive::Archive::open(uc_log::archive::ArchiveConfig {
+            segment_size_bytes: 16 * 1024,
+            preallocate_segments: false,
+            ..uc_log::archive::ArchiveConfig::new(&journal_dir)
+        })
+        .unwrap();
+        let mut appender = uc_log::buffer::Appender::new(std::sync::Arc::clone(&buffer), 1, 0);
+        let v1 = uc_protocol::identity::pack_version(1, 0, 0);
+        let mut pos = Vec::new();
+        let mut rec = (0, 0);
+        for i in 0..1400u32 {
+            pos.push(appender.append(1, i, &[1u8; 64]).unwrap());
+            if i == 199 {
+                rec = append_genesis(&mut appender, v1);
+            }
+            if i % 100 == 99 {
+                while archive.do_work(&buffer).unwrap() {}
+            }
+        }
+        while archive.do_work(&buffer).unwrap() {}
+        drop(archive);
+        let head = cnc.counters().append.load_acquire();
+        cnc.counters().commit.store_release(head);
+
+        let (mut st, _cnc2, _sc2, _ap2, _dir2) = apply_state_for_test(CountSm::default());
+        st.cnc = Arc::clone(&cnc);
+        // Waiting AT the record; the SM's own frontier is frame 100's end.
+        st.follower = uc_log::reader::LogFollower::new(std::sync::Arc::clone(&buffer), rec.0);
+        st.sm.lock().unwrap().last = Some(pos[100]);
+        st.journal_dir = journal_dir;
+        st.instance_id = 0x3434;
+        st.replay_stalled = Some(pos[100]);
+        let store = crate::snapshots::SnapshotStore::open(dir.path(), 0).unwrap();
+        store
+            .publish(pos[150], 0, |w| w.write_all(b"snap").map_err(Into::into))
+            .unwrap();
+        st.snapshot_restore = Some(super::SnapshotRestore::<CountSm> {
+            store,
+            install: Box::new(|sm, p, _r| {
+                sm.last = Some(p);
+                Ok(p)
+            }),
+        });
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let progressed = super::apply_cycle(&mut st);
+            let _ = tx.send((progressed, st));
+        });
+        let (progressed, st) = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("a pending record must end the replay, not spin");
+        assert!(progressed);
+        assert_eq!(st.follower.cursor, rec.0, "rejoined AT the record, unmoved");
+        let sm = st.sm.try_lock().expect("not held, not poisoned");
+        assert_eq!(
+            sm.last,
+            Some(pos[199]),
+            "installed at frame 150, replayed to the record"
+        );
+        assert_eq!(
+            st.replay_stalled, None,
+            "reaching the record ends the stall episode"
+        );
     }
 
     // ------------------- plan B3 T5: the replay forward-progress guard
@@ -1703,6 +2200,7 @@ mod tests {
             my_epoch: 1,
             service_id: 0,
             pin: None,
+            attach_record_pos: 0,
             lag_mode: crate::lag::LagMode::Off,
             declared: 0b1,
             lag_waiting: false,
@@ -1894,6 +2392,7 @@ mod tests {
             my_epoch: 1,
             service_id: 0,
             pin: None,
+            attach_record_pos: 0,
             lag_mode: crate::lag::LagMode::Bounded(BOUND),
             declared: 0b11,
             lag_waiting: false,

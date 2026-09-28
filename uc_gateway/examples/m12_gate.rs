@@ -1017,12 +1017,17 @@ where
             0, // purge off in the local smoke: no cadence either
         );
         let node = Node::start_with_socket(cfg, sock).expect("node start");
-        let svc = ServiceBuilder::new(ServiceConfig::new(&instance_dir, app_id), make_sm())
+        nodes.push(node);
+        dirs.push(instance_dir);
+    }
+    // Node-then-service (2.13.0): `attach` waits for its node to have JOINED
+    // (leader known, commit learned), and no node joins before a quorum is
+    // up — so every node starts before any service attaches.
+    for instance_dir in &dirs {
+        let svc = ServiceBuilder::new(ServiceConfig::new(instance_dir, app_id), make_sm())
             .start()
             .expect("service start");
-        nodes.push(node);
         services.push(svc);
-        dirs.push(instance_dir);
     }
     (nodes, services, dirs)
 }
@@ -1076,22 +1081,24 @@ fn boot_cluster2(
             0, // purge off in the local smoke: no cadence either
         );
         let node = Node::start_with_socket(cfg, sock).expect("node start");
-        let a = ServiceBuilder::new(
-            ServiceConfig::new(&instance_dir, app_id),
-            CountSm::default(),
-        )
-        .start()
-        .expect("service 0");
+        nodes.push(node);
+        dirs.push(instance_dir);
+    }
+    // Node-then-service (2.13.0): `attach` waits for its node to have JOINED
+    // (leader known, commit learned), and no node joins before a quorum is
+    // up — so every node starts before any service attaches.
+    for instance_dir in &dirs {
+        let a = ServiceBuilder::new(ServiceConfig::new(instance_dir, app_id), CountSm::default())
+            .start()
+            .expect("service 0");
         let b = ServiceBuilder::new(
-            ServiceConfig::new(&instance_dir, app_id),
+            ServiceConfig::new(instance_dir, app_id),
             SpinCountSm::with_spin(spin),
         )
         .start()
         .expect("service 1");
-        nodes.push(node);
         s0.push(a);
         s1.push(b);
-        dirs.push(instance_dir);
     }
     (nodes, s0, s1, dirs)
 }

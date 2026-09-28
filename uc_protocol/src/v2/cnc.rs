@@ -63,7 +63,13 @@ pub const CNC_PAGE_LEN: usize = 8192;
 /// treats it as the header bound.
 ///
 /// 3.3 (plan B1): `upgrade_origin`/`pinned_version` at slot +16/+24.
-pub const CNC_V2_VERSION: u32 = (3 << 24) | (3 << 16);
+///
+/// 3.4 (#33, row running version): `running_version`/`running_record_pos` at
+/// slot +48/+56 (the free tail of the pin words' status line) and
+/// `cluster_applied` at page-1 offset 4056 (the fourth word of the 4032
+/// line). A 3.3 attacher on a 3.4 page finds no running-version words and
+/// refuses by name; a 3.4 attacher on a 3.3 page reads `0` (absent) at +48.
+pub const CNC_V2_VERSION: u32 = (3 << 24) | (4 << 16);
 
 // ---- header (byte offsets) ------------------------------------------------
 pub const CNC_OFF_MAGIC: usize = 0; // [u8; 8]
@@ -308,6 +314,14 @@ const _: () = assert!(CNC_OFF_FSM_LAG_BYTES == CNC_OFF_SERVICES_DECLARED + 8);
 pub const CNC_OFF_LOG_TIME_NS: usize = 4048;
 const _: () = assert!(CNC_OFF_LOG_TIME_NS == CNC_OFF_FSM_LAG_BYTES + 8);
 const _: () = assert!(CNC_OFF_LOG_TIME_NS + 8 <= 4096);
+/// cnc 3.4 (#33 spec §5.2): the frame-END position the `uc2-cluster` agent
+/// had applied `CLUSTER` frames up to when it last applied one (written
+/// only after a batch that applied or installed something, AFTER the row
+/// words — so a reader that sees `>= p` sees every row word as of `p`).
+/// Fourth word of the 4032 line. Writer: cluster agent; init = 0.
+pub const CNC_OFF_CLUSTER_APPLIED: usize = 4056;
+const _: () = assert!(CNC_OFF_CLUSTER_APPLIED == CNC_OFF_LOG_TIME_NS + 8);
+const _: () = assert!(CNC_OFF_CLUSTER_APPLIED + 8 <= 4096);
 const _: () = assert!(
     CNC_OFF_SERVICES_DECLARED + 64 == 4096,
     "page 1 is exactly full"
@@ -397,6 +411,16 @@ pub const CNC_SVC_OFF_PIN_SEQ: usize = 32;
 /// it rides the same seqlock as the other three: a torn `(from, origin)`
 /// would refuse a correct artifact or accept a wrong one.
 pub const CNC_SVC_OFF_PINNED_FROM: usize = 40;
+/// cnc 3.4 (#33 spec §5.2): the row's committed RUNNING version — bit 32
+/// set ⇔ present, low 32 bits the packed version. `0` = absent (no record
+/// yet). Written by the `uc2-cluster` agent under the `pin_seq` seqlock,
+/// with the four pin words and `running_record_pos`.
+pub const CNC_SVC_OFF_RUNNING_VERSION: usize = 48;
+/// cnc 3.4: frame-END position of the row's last ACCEPTED version record
+/// (genesis or pin); `0` = none. Same writer and seqlock as the word above.
+pub const CNC_SVC_OFF_RUNNING_RECORD_POS: usize = 56;
+/// Presence bit of [`CNC_SVC_OFF_RUNNING_VERSION`].
+pub const RUNNING_PRESENT: u64 = 1 << 32;
 /// cnc 3.1: line 7 — the row's FSM name, NUL-padded to 32 B, then its hash,
 /// then (time-and-timers) its pending-timer count, then (coordinated-
 /// snapshot spec §9) its last freeze duration, then (plan B3) its newest
@@ -620,8 +644,8 @@ mod tests {
         write_cnc_header(&mut page, &h, "kv");
         // magic
         assert_eq!(&page[0..8], b"UC2CNC\0\0");
-        // version = (3<<24)|(3<<16) = 0x0303_0000 -> LE [0,0,3,3]
-        assert_eq!(&page[8..12], &[0x00, 0x00, 0x03, 0x03]);
+        // version = (3<<24)|(4<<16) = 0x0304_0000 -> LE [0,0,4,3]
+        assert_eq!(&page[8..12], &[0x00, 0x00, 0x04, 0x03]);
         // node_id = 7 -> LE [7,0,0,0]
         assert_eq!(&page[12..16], &[7, 0, 0, 0]);
     }
@@ -836,9 +860,14 @@ mod tests {
         assert_eq!(CNC_OFF_FSM_LAG_BYTES, 4040);
         assert_eq!(CNC_OFF_FSM_LAG_BYTES - CNC_OFF_SERVICES_DECLARED, 8);
         // time-and-timers spec §6 (FROZEN): the archive's last recorded stamp,
-        // third word of the boot-once 4032 line.
+        // third word of the 4032 line — live-written, NOT boot-once.
         assert_eq!(CNC_OFF_LOG_TIME_NS, 4048);
         assert_eq!(CNC_OFF_LOG_TIME_NS, CNC_OFF_FSM_LAG_BYTES + 8);
+        // #33 (row running version): the cluster agent's last-applied position,
+        // fourth and last word of the 4032 line — live-written by the cluster
+        // agent, NOT boot-once (only 4032/4040 are).
+        assert_eq!(CNC_OFF_CLUSTER_APPLIED, 4056);
+        assert_eq!(CNC_OFF_CLUSTER_APPLIED, CNC_OFF_LOG_TIME_NS + 8);
         // per-row pending-timer count, the word after identity_hash on line 7.
         assert_eq!(CNC_SVC_OFF_TIMERS_PENDING, 488);
         assert_eq!(CNC_SVC_OFF_TIMERS_PENDING, CNC_SVC_OFF_IDENTITY_HASH + 8);
@@ -881,7 +910,8 @@ mod tests {
         // hash on the once-reserved line 7. Both inside the 512 B slot.
         // cnc 3.2: the live payload ceiling word (jumbo).
         // cnc 3.3 (plan B1): the row's pin words on the STATUS line, node-written.
-        assert_eq!(CNC_V2_VERSION, (3 << 24) | (3 << 16));
+        // cnc 3.4 (#33): the row's running-version words on the same line.
+        assert_eq!(CNC_V2_VERSION, (3 << 24) | (4 << 16));
         assert_eq!(CNC_SVC_OFF_UPGRADE_ORIGIN, 16);
         assert_eq!(CNC_SVC_OFF_PINNED_VERSION, 24);
         assert_eq!(CNC_SVC_OFF_PIN_SEQ, 32);
@@ -893,6 +923,22 @@ mod tests {
         assert_eq!(CNC_SVC_OFF_PINNED_FROM, 40);
         assert_eq!(CNC_SVC_OFF_PINNED_FROM, CNC_SVC_OFF_PIN_SEQ + 8);
         const { assert!(CNC_SVC_OFF_PINNED_FROM + 8 <= 64, "inside the status line") };
+        // #33 (row running version): the row's committed running version and
+        // its record position, filling the status line's last two free words.
+        assert_eq!(CNC_SVC_OFF_RUNNING_VERSION, 48);
+        assert_eq!(CNC_SVC_OFF_RUNNING_VERSION, CNC_SVC_OFF_PINNED_FROM + 8);
+        assert_eq!(CNC_SVC_OFF_RUNNING_RECORD_POS, 56);
+        assert_eq!(
+            CNC_SVC_OFF_RUNNING_RECORD_POS,
+            CNC_SVC_OFF_RUNNING_VERSION + 8
+        );
+        const {
+            assert!(
+                CNC_SVC_OFF_RUNNING_RECORD_POS + 8 <= 64,
+                "status line is now full"
+            )
+        };
+        assert_eq!(RUNNING_PRESENT, 1 << 32);
         assert_eq!(CNC_SVC_OFF_VERSION, 8);
         assert_eq!(CNC_SVC_OFF_NAME, 448);
         assert_eq!(CNC_SVC_NAME_LEN, 32);
@@ -921,5 +967,13 @@ mod tests {
         assert_eq!(ADMIN_OP_SNAPSHOT_FETCH, 9);
         // FSM upgrade lifecycle (plan B1): `uc2ctl upgrade pin`.
         assert_eq!(ADMIN_OP_UPGRADE_PIN, 10);
+    }
+
+    #[test]
+    fn cnc_3_4_row_version_words_sit_in_the_free_status_line_words() {
+        assert_eq!(CNC_SVC_OFF_RUNNING_VERSION, 48);
+        assert_eq!(CNC_SVC_OFF_RUNNING_RECORD_POS, 56);
+        assert_eq!(CNC_OFF_CLUSTER_APPLIED, 4056);
+        assert_eq!(CNC_V2_VERSION, (3 << 24) | (4 << 16));
     }
 }
