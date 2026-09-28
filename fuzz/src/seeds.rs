@@ -1575,6 +1575,35 @@ pub fn uc_node_cluster_artifact() -> Vec<Seed> {
     let crc = crc32fast::hash(&lying_length[..body_len]);
     lying_length[body_len..].copy_from_slice(&crc.to_le_bytes());
 
+    // #33 follow-up (item 7): the SAME lying-length shape, one section later
+    // — layout v3's trailing `running` blob, whose length prefix
+    // (`decode_cluster_image`'s `nl`/`r` arm) gets its own `.get(..)` bound
+    // check. `v3_running` is the only fixture here with a non-empty running
+    // blob to lie about, so find its length prefix by decoding rather than
+    // hard-coding an offset that the settings/pins/reports lengths above
+    // would silently shift.
+    let mut lying_running_length = v3_running.clone();
+    let running_len = uc_protocol::v2::cluster_image::decode_cluster_image(&v3_running)
+        .expect("v3_running decodes")
+        .running
+        .len();
+    assert!(running_len > 0, "the running blob must be non-empty to lie about");
+    let running_crc_at = lying_running_length.len() - 4;
+    let rl_offset = running_crc_at - running_len - 4;
+    lying_running_length[rl_offset..rl_offset + 4]
+        .copy_from_slice(&0xFFFF_0000u32.to_le_bytes());
+    let body_len = lying_running_length.len() - 4;
+    let crc = crc32fast::hash(&lying_running_length[..body_len]);
+    lying_running_length[body_len..].copy_from_slice(&crc.to_le_bytes());
+    // The point of this seed: a CRC-consistent body whose running length lies
+    // must be REFUSED (`None`), not indexed out of bounds — assert it here so
+    // a change to the codec's field order (which would silently aim this
+    // seed's tamper at the wrong offset) fails the generator, not a fuzzer.
+    assert!(
+        uc_protocol::v2::cluster_image::decode_cluster_image(&lying_running_length).is_none(),
+        "a lying running length must be refused, not decoded"
+    );
+
     vec![
         Seed::fixed("01-image", image),
         Seed::fixed("02-bad-crc", bad_crc),
@@ -1582,6 +1611,7 @@ pub fn uc_node_cluster_artifact() -> Vec<Seed> {
         Seed::fixed("04-bad-magic", bad_magic),
         Seed::fixed("05-lying-membership-length", lying_length),
         Seed::fixed("v3_running", v3_running),
+        Seed::fixed("06-lying-running-length", lying_running_length),
     ]
 }
 

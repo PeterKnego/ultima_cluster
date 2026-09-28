@@ -131,6 +131,15 @@ pub(crate) fn wait_out_node_boot(cfg: &ServiceConfig) -> Result<(), ServiceError
 /// a spin.
 const BOOT_POLL: std::time::Duration = std::time::Duration::from_millis(20);
 
+/// #33 final review I1(b): a bare-integer `const VERSION` (1, 2, 3 …)
+/// packs as `0.0.x` — major.minor `0.0` with a nonzero patch — so under D3
+/// ("same version" = equal major.minor, patch free) every such build is ONE
+/// line: they mix freely and a pin between two of them refuses nothing.
+/// `0` itself is an ordinary version (D4) and is not flagged.
+pub(crate) const fn version_is_patch_only(v: u32) -> bool {
+    v != 0 && v < 1 << 16
+}
+
 /// Run the 6-step attach. Steps 1–5 here; step 6 (spawn the threads) is the
 /// builder's job, after this returns.
 ///
@@ -156,15 +165,6 @@ const BOOT_POLL: std::time::Duration = std::time::Duration::from_millis(20);
 /// and only then does step 4 below publish `applied`. Nothing is written to
 /// the slot before the pin decision, so a refused attach leaves the row
 /// exactly as it found it.
-/// #33 final review I1(b): a bare-integer `const VERSION` (1, 2, 3 …)
-/// packs as `0.0.x` — major.minor `0.0` with a nonzero patch — so under D3
-/// ("same version" = equal major.minor, patch free) every such build is ONE
-/// line: they mix freely and a pin between two of them refuses nothing.
-/// `0` itself is an ordinary version (D4) and is not flagged.
-pub(crate) const fn version_is_patch_only(v: u32) -> bool {
-    v != 0 && v < 1 << 16
-}
-
 pub(crate) fn attach<S: RawStateMachine>(
     cfg: &ServiceConfig,
     sm: S,
@@ -556,6 +556,8 @@ pub(crate) fn attach<S: RawStateMachine>(
 #[cfg(test)]
 mod tests {
     use super::lag_mode_for;
+    use crate::lag::LagMode;
+    use uc_log::cnc::{CncMeta, CncPage};
 
     #[test]
     fn version_is_patch_only_flags_bare_integers_only() {
@@ -574,8 +576,6 @@ mod tests {
         assert!(!version_is_patch_only(pack_version(1, 0, 3)));
         assert!(!version_is_patch_only(u32::MAX));
     }
-    use crate::lag::LagMode;
-    use uc_log::cnc::{CncMeta, CncPage};
 
     fn page() -> std::sync::Arc<CncPage> {
         CncPage::heap(&CncMeta {

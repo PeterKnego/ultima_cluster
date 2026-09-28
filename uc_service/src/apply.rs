@@ -663,13 +663,17 @@ pub(crate) fn apply_cycle<S: RawStateMachine>(st: &mut ApplyState<S>) -> bool {
                             payload,
                         ) {
                             crate::version_gate::Gate::Pass => {}
-                            crate::version_gate::Gate::Stop { running } => {
+                            crate::version_gate::Gate::Stop {
+                                running,
+                                superseded_later,
+                            } => {
                                 crate::version_gate::stop_at_record(
                                     sm,
                                     &st.cnc,
                                     st.service_id,
                                     running,
                                     pos,
+                                    superseded_later,
                                 );
                             }
                             crate::version_gate::Gate::Pending => {

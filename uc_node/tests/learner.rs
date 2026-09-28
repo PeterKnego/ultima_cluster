@@ -243,10 +243,13 @@ fn spawn_applied_mirror(
 /// #33 spec §6.2 stand-in for "a service attached long enough for genesis":
 /// mark row `id` ATTACHED with a fresh heartbeat (and `applied` mirrored from
 /// `durable`) until this page shows the row's committed running version, then
-/// put the status line back as it was. The recorded version is whatever the
-/// slot's version word already holds (`0` unless the test stored one), just
-/// as a real attach records the version it wrote there. On a follower's page
-/// nothing is appended; it simply waits for the leader's genesis to commit.
+/// put the status line AND the heartbeat back exactly as they were (final
+/// review #33 follow-up: restoring the heartbeat to `0` instead of its prior
+/// value would misreport a row that had a real heartbeat before this ran).
+/// The recorded version is whatever the slot's version word already holds
+/// (`0` unless the test stored one), just as a real attach records the
+/// version it wrote there. On a follower's page nothing is appended; it
+/// simply waits for the leader's genesis to commit.
 fn stand_in_for_row_genesis(cnc: &CncPage, id: usize) {
     let slot = cnc.service_slot(id);
     let versioned = || {
@@ -262,6 +265,7 @@ fn stand_in_for_row_genesis(cnc: &CncPage, id: usize) {
         return;
     }
     let prev = slot.status.load_acquire();
+    let prev_heartbeat = slot.heartbeat_ns.load_acquire();
     slot.status
         .store_release(uc_log::cnc::pack_service_status(id as u8, true, 1));
     let deadline = deadline_secs(30);
@@ -276,7 +280,43 @@ fn stand_in_for_row_genesis(cnc: &CncPage, id: usize) {
         std::thread::sleep(Duration::from_millis(1));
     }
     slot.status.store_release(prev);
-    slot.heartbeat_ns.store_release(0);
+    slot.heartbeat_ns.store_release(prev_heartbeat);
+}
+
+/// #33 follow-up (item 6): the stand-in must put the heartbeat back as it
+/// found it, not zero it — a row that had a real (nonzero) heartbeat before
+/// the stand-in ran must have that SAME value after, not `0` (which would
+/// misread as "never heartbeat" to `uc2ctl status` and the liveness bar).
+/// No real cluster: a bare heap page, and a second thread supplies the
+/// running version the stand-in is waiting for once it has had a chance to
+/// publish its own (throwaway) heartbeat.
+#[test]
+fn stand_in_for_row_genesis_restores_the_previous_heartbeat_not_zero() {
+    let cnc = uc_log::cnc::CncPage::heap(&uc_log::cnc::CncMeta {
+        node_id: 1,
+        instance_id: 1,
+        app_id: "stand-in-heartbeat-test".into(),
+        buffer_bytes: 1 << 20,
+        max_payload: 256,
+        services: [None; uc_protocol::v2::cnc::CNC_MAX_SERVICES],
+    });
+    let slot = cnc.service_slot(0);
+    let prev_heartbeat = 123_456_789u64;
+    slot.heartbeat_ns.store_release(prev_heartbeat);
+
+    let cnc2 = std::sync::Arc::clone(&cnc);
+    let t = std::thread::spawn(move || stand_in_for_row_genesis(&cnc2, 0));
+    // Give the stand-in a moment to publish ATTACHED and a heartbeat of its
+    // own before supplying the running version it's waiting for.
+    std::thread::sleep(Duration::from_millis(20));
+    cnc.service_slot(0).status.store_row_view(None, Some(1), 0);
+    t.join().unwrap();
+
+    assert_eq!(
+        slot.heartbeat_ns.load_acquire(),
+        prev_heartbeat,
+        "the stand-in must restore the PREVIOUS heartbeat, not zero it"
+    );
 }
 
 struct NodeH {

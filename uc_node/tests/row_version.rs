@@ -757,6 +757,75 @@ fn ingress_gate_is_open_with_nothing_declared() {
 
 // ------------------------------------------- the pin stops old services
 
+/// `ServiceStatusLine::row_view` already retries its own seqlock read up to
+/// 64 times, but a busy writer (or a paused thread mid-write, under a loaded
+/// dev box or CI runner) can outlast even that. Retry the WHOLE read here
+/// too, bounded, spin/yield only — never `thread::sleep`, so a permanently
+/// contended line still returns (as `RowRead::Contended`) rather than
+/// hanging forever (#33 follow-up: `restage_pin` used to give up on the
+/// first `Contended` read).
+const ROW_VIEW_RETRY_ATTEMPTS: u32 = 50_000;
+
+fn row_view_retrying(status: &uc_log::cnc::ServiceStatusLine) -> uc_log::cnc::RowRead {
+    for _ in 0..ROW_VIEW_RETRY_ATTEMPTS {
+        match status.row_view() {
+            uc_log::cnc::RowRead::Contended => std::thread::yield_now(),
+            view => return view,
+        }
+    }
+    uc_log::cnc::RowRead::Contended
+}
+
+/// A bare heap page for testing [`row_view_retrying`] without a cluster —
+/// same shape as `uc_service::attach`'s test-only `page()` helper.
+fn heap_page_for_row_view_test() -> std::sync::Arc<uc_log::cnc::CncPage> {
+    uc_log::cnc::CncPage::heap(&uc_log::cnc::CncMeta {
+        node_id: 1,
+        instance_id: 1,
+        app_id: "row-view-retry-test".into(),
+        buffer_bytes: 1 << 20,
+        max_payload: 256,
+        services: [None; uc_protocol::v2::cnc::CNC_MAX_SERVICES],
+    })
+}
+
+/// A write that stays mid-flight (seqlock ODD) longer than a single
+/// `row_view()`'s own 64-spin can outlast proves the OUTER bound in
+/// [`row_view_retrying`] is what recovers it, not the inner one.
+#[test]
+fn row_view_retrying_recovers_a_write_that_outlasts_one_inner_read() {
+    let page = heap_page_for_row_view_test();
+    let s = &page.service_slot(0).status;
+    s.store_pin_begin_for_test(7, 8); // leaves pin_seq ODD: Contended
+    let view = std::thread::scope(|scope| {
+        scope.spawn(|| {
+            std::thread::sleep(Duration::from_millis(2));
+            s.store_pin_finish_for_test(4096);
+        });
+        row_view_retrying(s)
+    });
+    assert_eq!(
+        view,
+        uc_log::cnc::RowRead::View {
+            pin: Some((4096, 7, 8)),
+            running: None,
+            record_pos: 0,
+        },
+        "the outer retry should have waited out the in-flight write"
+    );
+}
+
+/// A permanently contended line (the writer never finishes) must still
+/// RETURN — bounded spin/yield, not `sleep`-forever — rather than hang the
+/// caller. This test itself hanging is the failure mode.
+#[test]
+fn row_view_retrying_gives_up_on_a_permanently_contended_line() {
+    let page = heap_page_for_row_view_test();
+    let s = &page.service_slot(0).status;
+    s.store_pin_begin_for_test(7, 8); // never finished
+    assert_eq!(row_view_retrying(s), uc_log::cnc::RowRead::Contended);
+}
+
 impl Cluster {
     /// Run `f` on node `i`'s in-process handle.
     fn with_node<R>(&self, i: usize, f: impl FnOnce(&Node) -> R) -> R {
@@ -969,13 +1038,15 @@ impl Cluster {
     /// row view — its pin names this `origin` and `to`, and the row's running
     /// version is `to` — and hand back `(leader, record_pos)`: the committed
     /// pin's END, exactly what an accepted reply would have returned. Any
-    /// other refusal still fails, named.
+    /// other refusal still fails, named. The row view read is
+    /// [`row_view_retrying`], not a single `row_view()` call: a `Contended`
+    /// read here used to panic immediately (#33 follow-up).
     fn restage_pin(&self, row: u8, from: u32, to: u32, origin: u64) -> (usize, u64) {
         match self.try_pin(row, from, to, origin) {
             Ok(hit) => hit,
             Err((_, _, reason)) if reason == uc_node::REASON_PIN_NOT_MONOTONE => {
                 let l = self.wait_leader();
-                match self.page(l).service_slot(row as usize).status.row_view() {
+                match row_view_retrying(&self.page(l).service_slot(row as usize).status) {
                     uc_log::cnc::RowRead::View {
                         pin: Some((o, _, t)),
                         running: Some(v),

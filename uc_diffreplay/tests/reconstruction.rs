@@ -13,13 +13,15 @@
 //! * [`genesis_to_p_under_v2_is_not_v1s_state_at_p`] — the driver level, via
 //!   the `register-replay` fixture binary: the same frames `[0, P)`, one run
 //!   from the artifact and one from genesis, disagree about the state at P.
-//! * [`real_attach_genesis_replay_computes_the_counterfactual_and_install_does_not`]
+//! * [`real_attach_is_refused_and_a_direct_genesis_replay_computes_the_counterfactual`]
 //!   — UC's OWN reconstruction path (`uc_service::replay`'s gap guard) with
 //!   an in-process node: swap `RegisterSm` for `DoublingRegisterSm` on a live
 //!   instance dir and read the register back. UNPINNED, that swap either
 //!   computed the counterfactual (genesis replay) or was refused by name
 //!   (the gap guard's same-version rule, plan B2 T3); since #33 it is refused
-//!   earlier still, at attach, because v2 is off the row's running line.
+//!   earlier still, at attach, because v2 is off the row's running line — so
+//!   this test replays the refused arm's own journal directly to still show
+//!   the counterfactual it would have computed.
 //! * [`a_real_pin_makes_the_default_purge_off_swap_install_the_origin`] — the
 //!   same swap under a real `uc2ctl upgrade pin`: the origin is installed and
 //!   the row carries v1's true history, which is the whole point of the pin.
@@ -38,7 +40,8 @@ use std::time::Duration;
 use uc_client::Client;
 use uc_lincheck::register::{Cmd, CmdResp, DoublingRegisterSm, RegisterSm};
 use uc_log::cnc::{CncPage, PinRead};
-use uc_service::{ServiceBuilder, ServiceConfig, StateMachine};
+use uc_protocol::v2::frame::{self, FRAME_TYPE_MESSAGE, HEADER_LEN, align_frame_len};
+use uc_service::{ApplyCtx, RawStateMachine, ServiceBuilder, ServiceConfig, StateMachine};
 
 use common::{register_replay_bin, wait_for};
 use uc_diffreplay::attribute::{Attribution, Declaration, attribute};
@@ -300,6 +303,46 @@ const LAST_WRITE: u64 = (WRITES - 1) % MODULUS;
 const V1: u32 = <RegisterSm as StateMachine>::VERSION;
 const V2: u32 = <DoublingRegisterSm as StateMachine>::VERSION;
 
+/// Walk the archived log `[0, end)` and apply every MESSAGE frame through
+/// `sm`'s own `apply`, with the RECORDED header values — the same dispatch
+/// `uc_service::replay` and `uc_diffreplay::drive` do, minus the live-rejoin
+/// machinery. This is what an UNPINNED attach off the row's running line
+/// would have computed for itself, had #33 not refused it before it got the
+/// chance (spec §2.3's counterfactual) — copied from
+/// `uc_service/tests/pinned_attach.rs`'s helper of the same name, which
+/// demonstrates the identical gap for the typed tier directly.
+fn replay_from_genesis<S: RawStateMachine>(sm: &mut S, journal_dir: &Path, end: u64) {
+    let reader = uc_journal::TailReader::open(journal_dir).unwrap();
+    let identity = S::IDENTITY;
+    let mut resp = Vec::with_capacity(256);
+    reader
+        .scan_from(0, |_seq, base, block| {
+            let mut off = 0usize;
+            while off + HEADER_LEN <= block.len() {
+                let hdr = frame::read_header(&block[off..]);
+                let total = hdr.length as usize;
+                let aligned = align_frame_len(total);
+                if total < HEADER_LEN || off + aligned > block.len() {
+                    break;
+                }
+                let pos = base + off as u64;
+                if pos.saturating_add(aligned as u64) > end {
+                    return false;
+                }
+                if hdr.frame_type == FRAME_TYPE_MESSAGE && Some(pos) > sm.last_applied() {
+                    let mut ctx = ApplyCtx::new(pos, identity)
+                        .with_time(hdr.time_ns)
+                        .with_term(hdr.leadership_term_id);
+                    resp.clear();
+                    sm.apply(&mut ctx, &block[off + HEADER_LEN..off + total], &mut resp);
+                }
+                off += aligned;
+            }
+            true
+        })
+        .unwrap();
+}
+
 /// What the swapped-in v2 service did with the instance dir.
 #[derive(Debug, PartialEq, Eq)]
 enum Swap {
@@ -336,7 +379,15 @@ enum Swap {
 ///   admin band and the cluster FSM) between the two eras. The pinned attach
 ///   installs v1's artifact at P unconditionally, so v2 carries v1's true
 ///   history instead of recomputing it.
-fn swap_to_v2(purge: uc_node::PurgePolicy, pinned: bool, app_id: &str) -> Swap {
+///
+/// Hands back the instance dir (kept alive — its journal is what a caller
+/// replays from genesis to see the counterfactual a `Refused` arm never got
+/// to compute for itself) and P alongside the outcome.
+fn swap_to_v2(
+    purge: uc_node::PurgePolicy,
+    pinned: bool,
+    app_id: &str,
+) -> (Swap, tempfile::TempDir, u64) {
     let inst = common::tempdir();
     let dir = inst.path();
     let purging = !matches!(purge, uc_node::PurgePolicy::Disabled);
@@ -477,7 +528,7 @@ fn swap_to_v2(purge: uc_node::PurgePolicy, pinned: bool, app_id: &str) -> Swap {
         Ok(svc) => svc,
         Err(e @ uc_service::ServiceError::VersionMismatch { .. }) => {
             drop(node);
-            return Swap::Refused(e.to_string());
+            return (Swap::Refused(e.to_string()), inst, p);
         }
         Err(e) => panic!("v2 attach failed other than by a version refusal: {e}"),
     };
@@ -505,12 +556,12 @@ fn swap_to_v2(purge: uc_node::PurgePolicy, pinned: bool, app_id: &str) -> Swap {
         svc2.crash();
     }
     drop(node);
-    out
+    (out, inst, p)
 }
 
 /// [`swap_to_v2`] for the arms that are expected to converge.
 fn v2_after_swap(purge: uc_node::PurgePolicy, pinned: bool, app_id: &str) -> Option<u64> {
-    match swap_to_v2(purge, pinned, app_id) {
+    match swap_to_v2(purge, pinned, app_id).0 {
         Swap::CaughtUp(v) => v,
         other => panic!("v2 never reconstructed up to P (app_id={app_id}): {other:?}"),
     }
@@ -532,14 +583,19 @@ fn v2_after_swap(purge: uc_node::PurgePolicy, pinned: bool, app_id: &str) -> Opt
 /// #33 (spec §7.1) closes both arms one step EARLIER: v1's attach recorded
 /// 0.0.0 as the row's running version, and v2 (0.2.0) is off that line, so
 /// the unpinned attach is refused by name before it installs or replays
-/// anything. Both arms now read `Refused(VersionMismatch)`. The counterfactual
-/// value itself is still demonstrated, through the replay driver, by
-/// [`genesis_to_p_under_v2_is_not_v1s_state_at_p`]; the PINNED path's answer
+/// anything. Both arms now read `Refused(VersionMismatch)` — REFUSED, not
+/// computed, is what the real attach path proves, and the refused attach
+/// never reaches replay to demonstrate the counterfactual §2.3 predicts. So
+/// this test also replays the genesis arm's own (unread, undeleted) journal
+/// directly — [`replay_from_genesis`], the same tool
+/// `uc_service/tests/pinned_attach.rs` uses for the identical gap — and shows
+/// it disagrees with v1's true answer, `LAST_WRITE`. The PINNED path's answer
 /// is [`a_real_pin_makes_the_default_purge_off_swap_install_the_origin`].
 #[test]
-fn real_attach_genesis_replay_computes_the_counterfactual_and_install_does_not() {
-    let genesis = swap_to_v2(uc_node::PurgePolicy::Disabled, false, "ra1");
-    let purged = swap_to_v2(
+fn real_attach_is_refused_and_a_direct_genesis_replay_computes_the_counterfactual() {
+    let (genesis, genesis_dir, genesis_p) =
+        swap_to_v2(uc_node::PurgePolicy::Disabled, false, "ra1");
+    let (purged, _purged_dir, _purged_p) = swap_to_v2(
         uc_node::PurgePolicy::BelowSnapshot { slack_bytes: 0 },
         false,
         "ra2",
@@ -557,6 +613,18 @@ fn real_attach_genesis_replay_computes_the_counterfactual_and_install_does_not()
             "{arm}: the refusal names the row and both versions: {msg}"
         );
     }
+
+    // The genesis arm's journal was never touched by the refused attach, and
+    // the write sequence (`Cmd::Write(v % MODULUS)`) is deterministic, so
+    // replaying it directly under v2 shows exactly what an unpinned attach
+    // would have computed had #33 not closed the door first.
+    let mut v2 = DoublingRegisterSm::default();
+    replay_from_genesis(&mut v2, &genesis_dir.path().join("journal"), genesis_p);
+    assert_eq!(
+        StateMachine::query(&v2, ()),
+        Some(2 * LAST_WRITE),
+        "a genesis replay under v2 doubles every write — the counterfactual, not v1's LAST_WRITE"
+    );
 }
 
 /// Spec §3 S4 end to end, through a REAL `uc2ctl upgrade pin`: the same
@@ -571,18 +639,32 @@ fn real_attach_genesis_replay_computes_the_counterfactual_and_install_does_not()
 #[test]
 fn a_real_pin_makes_the_default_purge_off_swap_install_the_origin() {
     // #33: unpinned, the swap no longer reaches replay — v2 is off the row's
-    // running line and is refused at attach (it would have computed
-    // `Some(2 * LAST_WRITE)` before #33).
+    // running line and is refused at attach. What it would have computed had
+    // it reached replay is shown directly, on the refused arm's own
+    // (untouched) journal, exactly as the first test does.
+    let (unpinned, unpinned_dir, unpinned_p) =
+        swap_to_v2(uc_node::PurgePolicy::Disabled, false, "pin-off");
     assert!(
-        matches!(
-            swap_to_v2(uc_node::PurgePolicy::Disabled, false, "pin-off"),
-            Swap::Refused(_)
-        ),
+        matches!(unpinned, Swap::Refused(_)),
         "unpinned, the purge-off swap is refused at attach"
     );
+    let mut v2 = DoublingRegisterSm::default();
+    replay_from_genesis(&mut v2, &unpinned_dir.path().join("journal"), unpinned_p);
+    let counterfactual = StateMachine::query(&v2, ());
+
+    let pinned = v2_after_swap(uc_node::PurgePolicy::Disabled, true, "pin-on");
     assert_eq!(
-        v2_after_swap(uc_node::PurgePolicy::Disabled, true, "pin-on"),
+        pinned,
         Some(LAST_WRITE),
         "pinned, the SAME swap installs v1's artifact at P and carries its state"
+    );
+    assert_eq!(
+        counterfactual,
+        Some(2 * LAST_WRITE),
+        "unpinned, the same journal replayed from genesis under v2 doubles every write"
+    );
+    assert_ne!(
+        counterfactual, pinned,
+        "the pin's answer must differ from the counterfactual it prevents"
     );
 }
