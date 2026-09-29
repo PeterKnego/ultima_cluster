@@ -92,7 +92,7 @@ fn two_clients_stay_inside_the_credits_the_edge_grants() {
             uc_service::SessionConfig::default(),
         ),
     )
-    .start_with_snapshots()
+    .start()
     .unwrap();
     common::await_serving(&node, 10);
 
@@ -169,7 +169,7 @@ fn a_new_connection_shrinks_the_grant_and_status_says_so_unprompted() {
             uc_service::SessionConfig::default(),
         ),
     )
-    .start_with_snapshots()
+    .start()
     .unwrap();
     common::await_serving(&node, 10);
 
@@ -228,7 +228,7 @@ fn a_squeezed_window_still_resolves_every_request() {
             uc_service::SessionConfig::default(),
         ),
     )
-    .start_with_snapshots()
+    .start()
     .unwrap();
     common::await_serving(&node, 10);
 
@@ -308,7 +308,7 @@ fn the_sum_of_grants_never_exceeds_the_edges_budget_under_concurrent_connects() 
             uc_service::SessionConfig::default(),
         ),
     )
-    .start_with_snapshots()
+    .start()
     .unwrap();
     common::await_serving(&node, 10);
 
@@ -418,7 +418,7 @@ fn the_sum_of_grants_never_exceeds_the_edges_budget_under_a_connect_disconnect_r
             uc_service::SessionConfig::default(),
         ),
     )
-    .start_with_snapshots()
+    .start()
     .unwrap();
     common::await_serving(&node, 10);
 
@@ -551,7 +551,7 @@ fn a_disconnect_gives_its_share_back_and_hello_ok_carries_the_live_grant() {
             uc_service::SessionConfig::default(),
         ),
     )
-    .start_with_snapshots()
+    .start()
     .unwrap();
     common::await_serving(&node, 10);
 

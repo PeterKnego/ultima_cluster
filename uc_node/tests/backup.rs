@@ -900,7 +900,7 @@ fn restore_roundtrip_boots_and_serves() {
         ServicesConfig::single(RestoreCountSm::NAME),
     );
     let svc = ServiceBuilder::new(ServiceConfig::new(&dir, app), RestoreCountSm::default())
-        .start_with_snapshots()
+        .start()
         .expect("start service");
 
     let client = Client::connect(&dir, app).expect("connect client");
@@ -944,7 +944,7 @@ fn restore_roundtrip_boots_and_serves() {
         ServiceConfig::new(&fresh_dir, app),
         RestoreCountSm::default(),
     )
-    .start_with_snapshots()
+    .start()
     .expect("start restored service");
 
     let restored_client = Client::connect(&fresh_dir, app).expect("connect restored client");
@@ -985,7 +985,7 @@ fn restore_accepts_a_target_with_empty_dirs_and_a_stale_lock() {
         ServicesConfig::single(RestoreCountSm::NAME),
     );
     let svc = ServiceBuilder::new(ServiceConfig::new(&dir, app), RestoreCountSm::default())
-        .start_with_snapshots()
+        .start()
         .expect("start service");
 
     let client = Client::connect(&dir, app).expect("connect client");
@@ -1033,7 +1033,7 @@ fn restore_accepts_a_target_with_empty_dirs_and_a_stale_lock() {
         ServiceConfig::new(&fresh_dir, app),
         RestoreCountSm::default(),
     )
-    .start_with_snapshots()
+    .start()
     .expect("start restored service");
 
     let restored_client = Client::connect(&fresh_dir, app).expect("connect restored client");
@@ -1243,13 +1243,13 @@ fn two_fsm_purged_node(
     // nothing on their own: the 32 KiB byte cadence is deleted, so the purge
     // this helper waits for follows the instant commanded below.
     let s0 = ServiceBuilder::new(ServiceConfig::new(dir, app), RegisterSm::default())
-        .start_with_snapshots()
+        .start()
         .expect("snapshot service 0");
     let s1 = ServiceBuilder::new(
         ServiceConfig::new(dir, app),
         Tagged::<1, RegisterSm>::default(),
     )
-    .start_with_snapshots()
+    .start()
     .expect("snapshot service 1");
     let client = Client::connect(dir, app).expect("client");
     let mut v = 0u64;
@@ -1327,13 +1327,13 @@ fn restore_roundtrip_with_two_fsms_keeps_both_snapshot_trees() {
     let rnode = Node::start(cfg).expect("restored node");
     wait_until("restored serving", || rnode.can_serve());
     let rs0 = ServiceBuilder::new(ServiceConfig::new(&fresh, app), RegisterSm::default())
-        .start_with_snapshots()
+        .start()
         .expect("restored svc 0");
     let rs1 = ServiceBuilder::new(
         ServiceConfig::new(&fresh, app),
         Tagged::<1, RegisterSm>::default(),
     )
-    .start_with_snapshots()
+    .start()
     .expect("restored svc 1");
     let client = Client::connect(&fresh, app).expect("client");
     let got: Option<u64> = client.query_linearizable(&()).expect("read");

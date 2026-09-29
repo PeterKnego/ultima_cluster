@@ -411,7 +411,7 @@ fn swap_to_v2(
                 ServiceConfig::new(dir.to_path_buf(), app_id.to_string()),
                 RegisterSm::default(),
             )
-            .start_with_snapshots()
+            .start()
             .unwrap(),
             uc_service::Service::<RegisterSm>::stop,
         );
@@ -501,7 +501,7 @@ fn swap_to_v2(
             ServiceConfig::new(dir.to_path_buf(), app_id.to_string()),
             RegisterSm::default(),
         )
-        .start_with_snapshots()
+        .start()
         .err()
         .expect("a pinned row must refuse the old binary");
         assert!(
@@ -523,7 +523,7 @@ fn swap_to_v2(
         ServiceConfig::new(dir.to_path_buf(), app_id.to_string()),
         DoublingRegisterSm::default(),
     )
-    .start_with_snapshots()
+    .start()
     {
         Ok(svc) => svc,
         Err(e @ uc_service::ServiceError::VersionMismatch { .. }) => {
@@ -534,7 +534,7 @@ fn swap_to_v2(
     };
     // Reconstruction is finished when the row's published applied frontier has
     // reached P — the slot the apply loop stores after every batch and after
-    // every replay pass. `attach` reset it to 0 before `start_with_snapshots`
+    // every replay pass. `attach` reset it to 0 before `start`
     // returned and v1 is stopped, so only v2 can raise it. (No sleep: a sleep
     // would be a guess at how long a journal walk takes.)
     let caught_up = wait_for(

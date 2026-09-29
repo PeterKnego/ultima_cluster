@@ -2,7 +2,7 @@
 // Copyright 2026 Peter Knego
 
 //! The snapshot builder duty cycle (M6 Task 3). A single polling thread,
-//! spawned only by [`crate::ServiceBuilder::start_with_snapshots`], that pulls
+//! spawned only by [`crate::ServiceBuilder::start`], that pulls
 //! one `(position, streaming job)` handoff at a time off a 1-slot channel from
 //! the apply thread, streams it to [`SnapshotStore::publish`] — off the SM
 //! lock entirely — and, on success, publishes the position onto the cnc

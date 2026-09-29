@@ -336,9 +336,10 @@ pub fn spawn_service_id(instance_dir: &Path, id: u8) -> Reap {
     Reap(child)
 }
 
-/// Coordinated-snapshot plan 2 (T10): spawn the service-only binary
-/// snapshot-CAPABLE (`--snapshots`, i.e. `start_with_snapshots()`), so the
-/// leader will accept `uc2ctl snapshot` for the row.
+/// Coordinated-snapshot plan 2 (T10): spawn the service-only binary with
+/// `--snapshots`, its `SlowFreeze` arm, for a test that commands instants.
+/// (#67: every arm is snapshot-CAPABLE, so the leader accepts `uc2ctl
+/// snapshot` for any row; this arm adds the slowable freeze.)
 ///
 /// `freeze_ms` arms the bin's `SlowFreeze` wrapper through
 /// `UC2_CRASHTEST_FREEZE_MS` — `None` (or `0`) leaves `freeze()` a straight

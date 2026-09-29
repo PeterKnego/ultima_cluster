@@ -393,7 +393,7 @@ fn a_real_single_node_cluster_serves_and_becomes_ready() {
     // (readiness requires it fresh; a node with no service ever attached
     // must NOT read as ready).
     let svc = ServiceBuilder::new(ServiceConfig::new(&instance_dir, APP), NoopSm)
-        .start_with_snapshots()
+        .start()
         .expect("service attaches");
 
     let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();

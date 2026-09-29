@@ -242,7 +242,7 @@ pub fn start_cluster(root: &Path, n: usize) -> Vec<Slot> {
                 ServiceConfig::new(&slot.instance_dir, APP),
                 Sessioned::new(RegisterSm::default(), SessionConfig::default()),
             )
-            .start_with_snapshots()
+            .start()
             .expect("service start"),
         );
     }

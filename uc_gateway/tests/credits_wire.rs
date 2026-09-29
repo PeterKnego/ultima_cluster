@@ -67,7 +67,7 @@ fn no_frame_precedes_hello_ok_and_status_follows_it() {
         ServiceConfig::new(&dir, common::APP),
         Sessioned::new(RegisterSm::default(), SessionConfig::default()),
     )
-    .start_with_snapshots()
+    .start()
     .unwrap();
     common::await_serving(&node, 10);
     let edge = Edge::start(edge_config(&dir)).unwrap();
@@ -136,7 +136,7 @@ fn an_idle_remote_client_is_kept_alive_by_status_frames() {
         ServiceConfig::new(&dir, common::APP),
         Sessioned::new(RegisterSm::default(), SessionConfig::default()),
     )
-    .start_with_snapshots()
+    .start()
     .unwrap();
     common::await_serving(&node, 10);
     let edge = Edge::start(edge_config(&dir)).unwrap();
@@ -190,7 +190,7 @@ fn a_faulted_edge_refuses_new_handshakes_instead_of_livelocking() {
         ServiceConfig::new(&dir, common::APP),
         Sessioned::new(RegisterSm::default(), SessionConfig::default()),
     )
-    .start_with_snapshots()
+    .start()
     .unwrap();
     common::await_serving(&node, 10);
     let edge = Edge::start(edge_config(&dir)).unwrap();
@@ -262,7 +262,7 @@ fn a_wrong_app_id_is_refused_as_app_id_even_when_the_edge_is_faulted() {
         ServiceConfig::new(&dir, common::APP),
         Sessioned::new(RegisterSm::default(), SessionConfig::default()),
     )
-    .start_with_snapshots()
+    .start()
     .unwrap();
     common::await_serving(&node, 10);
     let edge = Edge::start(edge_config(&dir)).unwrap();
@@ -323,7 +323,7 @@ fn a_connection_told_not_serving_is_never_served_later_on_the_same_socket() {
         ServiceConfig::new(&dir, common::APP),
         Sessioned::new(RegisterSm::default(), SessionConfig::default()),
     )
-    .start_with_snapshots()
+    .start()
     .unwrap();
     assert!(
         !node.can_serve(),
@@ -430,7 +430,7 @@ fn an_edge_at_its_connection_ceiling_refuses_the_next_client_as_busy() {
         ServiceConfig::new(&dir, common::APP),
         Sessioned::new(RegisterSm::default(), SessionConfig::default()),
     )
-    .start_with_snapshots()
+    .start()
     .unwrap();
     common::await_serving(&node, 10);
     let edge = Edge::start(EdgeConfig {

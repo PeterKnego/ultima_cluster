@@ -329,7 +329,7 @@ fn spawn_service(dir: &std::path::Path) -> uc_service::Service<RegSm> {
     // is the replicated cadence seeded in `make_config`.
     let cfg = ServiceConfig::new(dir, APP);
     ServiceBuilder::new(cfg, RegSm::default())
-        .start_with_snapshots()
+        .start()
         .expect("snapshot service start")
 }
 

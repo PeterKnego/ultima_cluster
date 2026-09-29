@@ -209,9 +209,8 @@ fn linearizable_under_failover_v2() {
 /// **Where the snapshots come from (plan 2 T10).** They used to come from a
 /// per-service byte cadence — "a snapshot every 32 KiB of applied progress" —
 /// which no longer exists: since coordinated instants, a row freezes only at a
-/// `SNAPSHOT` frame the leader appended (spec §5.2), and
-/// `ClusterCfg::snapshot_interval_bytes > 0` now means CAPABLE and nothing
-/// more. So the churn loop COMMANDS one instant per fault tick
+/// `SNAPSHOT` frame the leader appended (spec §5.2), and every service is
+/// snapshot-CAPABLE (#67). So the churn loop COMMANDS one instant per fault tick
 /// ([`LinClusterV2::command_instant`], best-effort: a tick with no serving
 /// leader is the normal case in a fault loop, and the `max_archive_first_base
 /// > 0` gate below is what adjudicates whether enough of them landed).
@@ -250,14 +249,13 @@ fn linearizable_under_purge_and_snapshot_churn() {
 
     // Purge posture: 16 KiB journal segments (small enough that whole segments
     // fall below the snapshot floor and get dropped even in this low-volume
-    // workload), snapshot-CAPABLE services (`snapshot_interval_bytes > 0` means
-    // exactly that and nothing more — see the doc above), and purge everything
+    // workload), snapshot-CAPABLE services (every service is, since #67 — see
+    // the doc above), and purge everything
     // below the snapshot with zero slack — the most aggressive purge, so
     // below-floor reconstruction fires reliably within a short run.
     let ccfg = ClusterCfg {
         purge: PurgePolicy::BelowSnapshot { slack_bytes: 0 },
         journal_segment_bytes: 16 * 1024,
-        snapshot_interval_bytes: 32 * 1024,
         spare_node: false,
         crypto: false,
         ..ClusterCfg::default()
@@ -718,7 +716,6 @@ fn linearizable_under_purge_and_snapshot_churn_with_crypto() {
     let ccfg = ClusterCfg {
         purge: PurgePolicy::BelowSnapshot { slack_bytes: 0 },
         journal_segment_bytes: 16 * 1024,
-        snapshot_interval_bytes: 32 * 1024,
         spare_node: false,
         crypto: true,
         ..ClusterCfg::default()
@@ -1020,7 +1017,6 @@ fn run_two_fsm(label: &str, lag: uc_node::FsmLag, seed: u64) {
     let ccfg = ClusterCfg {
         purge: PurgePolicy::BelowSnapshot { slack_bytes: 0 },
         journal_segment_bytes: 16 * 1024,
-        snapshot_interval_bytes: 32 * 1024,
         services: lincheck_v2::FsmSet::Two { lag },
         ..ClusterCfg::default()
     };
@@ -1366,7 +1362,6 @@ fn restart_installs(purge: bool) -> u32 {
             PurgePolicy::Disabled
         },
         journal_segment_bytes: 16 * 1024,
-        snapshot_interval_bytes: 32 * 1024,
         buffer_bytes: RING_BYTES,
         ..ClusterCfg::default()
     };

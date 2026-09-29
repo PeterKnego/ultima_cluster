@@ -57,8 +57,8 @@ pub(crate) enum Replay {
 /// its last `SNAPSHOT` frame. Bundled rather than passed as three more
 /// parameters because they travel together and mean one thing.
 ///
-/// `trigger` is `None` on a row started with plain `start()` — not
-/// snapshot-capable, so pass 1 is skipped outright and the walk is
+/// `trigger` is `None` only on an in-crate harness row (every SDK `start()`
+/// carries one since #67) — not snapshot-capable, so pass 1 is skipped outright and the walk is
 /// byte-for-byte what it was before P10.
 pub(crate) struct ReplayInstant<'a, S: RawStateMachine> {
     pub trigger: &'a mut Option<SnapshotTrigger<S>>,

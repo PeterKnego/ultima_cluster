@@ -137,14 +137,14 @@ pub(crate) mod profile {
 }
 
 /// Boxed "freeze the current state and produce a streaming job" closure. Built
-/// once, in [`crate::ServiceBuilder::start_with_snapshots`], where the
+/// once, in [`crate::ServiceBuilder::start`], where the
 /// `S: SnapshotStateMachine` bound is available; stored here behind a plain
 /// `S: RawStateMachine`-bounded type so [`ApplyState`] itself needs no such
 /// bound.
 pub(crate) type FreezeFn<S> = Box<dyn Fn(&S) -> Result<(BuildJob, u64), SnapshotError> + Send>;
 
 /// Boxed "install this snapshot stream into the SM" closure (M6 Task 5). Same
-/// type-erasure trick as [`FreezeFn`]: built in `start_with_snapshots` where
+/// type-erasure trick as [`FreezeFn`]: built in `start` where
 /// `S: SnapshotStateMachine`, called by the reconstruction path on the apply
 /// thread with the SM lock held (install IS state mutation). Returns the
 /// post-install position `S` (== the artifact's tag).
@@ -152,7 +152,7 @@ pub(crate) type InstallFn<S> =
     Box<dyn Fn(&mut S, u64, &mut dyn std::io::Read) -> Result<u64, SnapshotError> + Send>;
 
 /// The apply thread's below-the-floor reconstruction capability (M6 Task 5).
-/// Present only for a snapshot-capable service (`start_with_snapshots`); its
+/// Present only for a snapshot-capable service (`start`); its
 /// absence is what turns a below-floor gap into [`ServiceError::SnapshotRequired`]
 /// fail-stop instead of a covering install.
 pub(crate) struct SnapshotRestore<S: RawStateMachine> {
@@ -161,8 +161,8 @@ pub(crate) struct SnapshotRestore<S: RawStateMachine> {
 }
 
 /// M6 Task 3: the apply thread's half of the snapshot-builder handoff. Present
-/// only when the service was started via `start_with_snapshots`; `None` for a
-/// plain `start()` (or an SM that never opted in) means the row is not
+/// on every service started via `start` (all of them since #67); `None` —
+/// reachable only from an in-crate harness — means the row is not
 /// snapshot-capable and [`on_snapshot_frame`] ignores every instant.
 ///
 /// Coordinated-snapshot spec §5.2: the trigger is now the LOG — a
@@ -319,7 +319,7 @@ pub(crate) struct ApplyState<S: RawStateMachine> {
     /// flag set, so the next park folds into the SAME episode rather than
     /// opening a new one.
     pub(crate) lag_waiting: bool,
-    /// M6 Task 3: `Some` only for a service started via `start_with_snapshots`.
+    /// M6 Task 3: `Some` only for a service started via `start`.
     pub(crate) snapshot_trigger: Option<SnapshotTrigger<S>>,
     /// M6 Task 5: below-floor reconstruction (snapshot install + tail replay).
     /// `Some` only for a snapshot-capable service; `None` makes a below-floor
@@ -1008,8 +1008,8 @@ fn on_timer_frame<S: RawStateMachine>(
 /// Three silent declines, in order (spec §10 — an incomplete set is the honest
 /// outcome of every one of them, never a fail-stop):
 ///
-/// 1. **No trigger.** A row started with plain `start()` is not
-///    snapshot-capable and never sets `CNC_SVC_STATUS_SNAPSHOT_CAPABLE`; the
+/// 1. **No trigger.** A row with no trigger (an in-crate harness; every SDK
+///    `start()` has one since #67) never sets `CNC_SVC_STATUS_SNAPSHOT_CAPABLE`; the
 ///    leader refuses to command an instant on a cluster holding one
 ///    (`48 snapshot_unsupported`, spec §5.5), so reaching here means the frame
 ///    predates the refusal or the row is a harness. Ignore it.
@@ -2447,7 +2447,7 @@ mod tests {
 
     // ------------------- coordinated snapshot instants (spec §5.2, §5.7)
 
-    /// The `FreezeFn` shape `start_with_snapshots` builds, for `CountSm`: the
+    /// The `FreezeFn` shape `start` builds, for `CountSm`: the
     /// job writes the apply count as 8 LE bytes, so a test can read back
     /// exactly how much of the log the frozen image covers.
     fn count_freeze() -> super::FreezeFn<CountSm> {
@@ -2461,7 +2461,7 @@ mod tests {
         })
     }
 
-    /// Install the snapshot trigger `start_with_snapshots` installs, minus the
+    /// Install the snapshot trigger `start` installs, minus the
     /// builder thread: the receiver half comes back so a test inspects the
     /// handoff directly, and `busy` so it can simulate a build in flight.
     fn with_snapshot_trigger<S: crate::traits::RawStateMachine>(
@@ -2538,7 +2538,8 @@ mod tests {
         );
     }
 
-    /// Spec §5.2 / §10: a row started with plain `start()` has no capability
+    /// Spec §5.2 / §10: a row with no trigger (the pre-#67 plain `start()`)
+    /// has no capability
     /// and ignores the frame (the set is simply incomplete); a row whose
     /// builder is still busy skips this instant and counts the skip.
     #[test]

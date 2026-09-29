@@ -124,7 +124,7 @@ fn reads_return_the_applied_total() {
     wait_until(|| node.can_serve());
 
     let svc = ServiceBuilder::new(ServiceConfig::new(dir.path(), "q-e2e"), CountSm::default())
-        .start_with_snapshots()
+        .start()
         .unwrap();
 
     let client = Client::connect(dir.path(), "q-e2e").unwrap();
@@ -172,7 +172,7 @@ fn stale_epoch_svc_query_gets_retry() {
         ServiceConfig::new(dir.path(), "q-epoch"),
         CountSm::default(),
     )
-    .start_with_snapshots()
+    .start()
     .unwrap();
     let old_epoch = svc1.epoch();
     assert_eq!(old_epoch, 1);
@@ -187,7 +187,7 @@ fn stale_epoch_svc_query_gets_retry() {
         ServiceConfig::new(dir.path(), "q-epoch"),
         CountSm::default(),
     )
-    .start_with_snapshots()
+    .start()
     .unwrap();
     assert_eq!(svc2.epoch(), 2, "the restarted incarnation bumps the epoch");
     let cnc = uc_log::cnc::CncPage::open_file(&dir.path().join("cnc2.dat"), "q-epoch").unwrap();

@@ -619,21 +619,19 @@ fn elle_partition() {
 }
 
 /// Purge pass: the M6 purge-churn capstone's posture — aggressive
-/// snapshot-backed purge (16 KiB segments, 32 KiB snapshot cadence, zero
+/// snapshot-backed purge (16 KiB segments, an instant commanded per cycle, zero
 /// slack) with the follower-service-crash arm forcing below-floor
 /// snapshot-install reconstruction. Non-vacuity: the archive floor advanced.
 #[test]
 #[ignore]
 fn elle_purge() {
-    // `snapshot_interval_bytes` no longer configures a cadence
-    // (coordinated-snapshot spec §5.2) — it only makes the rows CAPABLE. The
-    // fault loop below commands an instant on every cycle, which is what
+    // Every row is snapshot-CAPABLE (#67) and there is no per-service cadence
+    // (coordinated-snapshot spec §5.2). The fault loop below commands an instant on every cycle, which is what
     // moves the floor this pass's non-vacuity check reads.
     // `scripts/elle_check.sh` runs this pass.
     let ccfg = ClusterCfg {
         purge: uc_node::PurgePolicy::BelowSnapshot { slack_bytes: 0 },
         journal_segment_bytes: 16 * 1024,
-        snapshot_interval_bytes: 32 * 1024,
         spare_node: false,
         crypto: false,
         ..ClusterCfg::default()

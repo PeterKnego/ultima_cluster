@@ -673,7 +673,7 @@ fn run_service(a: ServiceArgs) -> anyhow::Result<()> {
         std::thread::sleep(Duration::from_millis(20));
     }
     let cfg = ServiceConfig::new(a.instance_dir, a.app_id);
-    let _svc = ServiceBuilder::new(cfg, ProfileSm::default()).start_with_snapshots()?;
+    let _svc = ServiceBuilder::new(cfg, ProfileSm::default()).start()?;
     println!("read_profile service up; parking");
     loop {
         std::thread::park();
@@ -759,7 +759,7 @@ fn boot_cluster(
             ServiceConfig::new(instance_dir, app_id),
             ProfileSm::default(),
         )
-        .start_with_snapshots()
+        .start()
         .expect("service start");
         services.push(svc);
     }

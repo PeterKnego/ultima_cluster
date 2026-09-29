@@ -161,7 +161,7 @@ fn generate_put_then_delete_corpus() {
 
     let cfg = ServiceConfig::new(inst.clone(), APP_ID.to_string());
     let sm = Sessioned::new(KvSm::default(), SessionConfig::default());
-    let service = ServiceBuilder::new(cfg, sm).start_with_snapshots().unwrap();
+    let service = ServiceBuilder::new(cfg, sm).start().unwrap();
 
     let (send, mut poll) = Engine::attach(&inst, APP_ID, EngineConfig::default()).unwrap();
 

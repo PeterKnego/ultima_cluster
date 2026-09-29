@@ -340,7 +340,7 @@ fn a_client_attached_before_the_raise_sees_it() {
     let leader_dir = fleet.dirs[leader].clone();
 
     let svc = ServiceBuilder::new(ServiceConfig::new(&leader_dir, APP), CountSm::default())
-        .start_with_snapshots()
+        .start()
         .unwrap();
     let client = Client::connect(&leader_dir, APP).unwrap();
 

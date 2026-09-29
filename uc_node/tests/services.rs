@@ -273,7 +273,7 @@ impl uc_service::WholeStateSnapshot for CountSm {
 pub fn start_service<S: StateMachine + SnapshotStateMachine + Default>(
     dir: &Path,
 ) -> uc_service::Service<S> {
-    match ServiceBuilder::new(ServiceConfig::new(dir, APP), S::default()).start_with_snapshots() {
+    match ServiceBuilder::new(ServiceConfig::new(dir, APP), S::default()).start() {
         Ok(service) => service,
         // `NodeBooting` means the node never published its declared set
         // (`Consensus::maybe_publish_declared` held: leader unknown, commit
@@ -392,7 +392,7 @@ fn an_unknown_name_is_refused_by_name_and_a_second_attach_of_the_same_fsm_is_ref
     let node = Node::start(config(dir.path(), names(&["count", "fsm1"], None))).unwrap();
     wait_until("serving", || node.can_serve());
     let err = ServiceBuilder::new(ServiceConfig::new(dir.path(), APP), SlowCountSm::default())
-        .start_with_snapshots()
+        .start()
         .err()
         .expect("slow-count is not declared");
     match &err {
@@ -413,7 +413,7 @@ fn an_unknown_name_is_refused_by_name_and_a_second_attach_of_the_same_fsm_is_ref
         ServiceConfig::new(dir.path(), APP),
         Tagged::<1, CountSm>::default(),
     )
-    .start_with_snapshots()
+    .start()
     .err()
     .expect("fsm1 is held");
     assert!(
@@ -463,7 +463,7 @@ fn an_unknown_name_against_a_nameless_declared_page_hints_at_an_old_node() {
     }
 
     let err = ServiceBuilder::new(ServiceConfig::new(dir.path(), APP), SlowCountSm::default())
-        .start_with_snapshots()
+        .start()
         .err()
         .expect("row 0's name is gone, so nothing matches");
     assert!(
@@ -654,7 +654,7 @@ fn bounded_lag_holds_between_a_fast_and_a_slow_fsm() {
         ServiceConfig::new(dir.path(), APP),
         Tagged::<1, SlowCountSm>::default(),
     )
-    .start_with_snapshots()
+    .start()
     .unwrap();
     // 3000 frames × 128 B = 384 KiB of log — six times the bound.
     let (max_gap, total) = drive_and_sample_gap(dir.path(), 3000);
@@ -697,7 +697,7 @@ fn lockstep_holds_the_fsms_within_one_frame() {
         ServiceConfig::new(dir.path(), APP),
         Tagged::<1, SlowCountSm>::default(),
     )
-    .start_with_snapshots()
+    .start()
     .unwrap();
     let (max_gap, total) = drive_and_sample_gap(dir.path(), 500);
     assert_eq!(total, 500);

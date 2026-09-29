@@ -41,7 +41,7 @@ pub(crate) struct Attached<S: RawStateMachine> {
     /// released by the OS on any exit) — enforces one process per row.
     pub(crate) _lock: std::fs::File,
     /// Plan B2 T4: the install capability the caller handed in, given back
-    /// untouched so `start_with_snapshots` can reuse the SAME closure for the
+    /// untouched so `start` can reuse the SAME closure for the
     /// apply thread's [`crate::apply::SnapshotRestore`] — attach borrows it
     /// for the pinned install and owns none of it.
     pub(crate) install: Option<InstallFn<S>>,
@@ -87,8 +87,7 @@ pub(crate) fn node_booting(
 /// Plan B3 T5: wait out [`ServiceConfig::boot_wait`] for a node that is still
 /// joining its cluster, polling every [`BOOT_POLL`].
 ///
-/// Called by [`ServiceBuilder::start`](crate::ServiceBuilder::start) and
-/// [`start_with_snapshots`](crate::ServiceBuilder::start_with_snapshots)
+/// Called by [`ServiceBuilder::start`](crate::ServiceBuilder::start)
 /// BEFORE [`attach`], because `attach` takes the state machine by value and
 /// so cannot be retried. The refusal it returns on timeout is `attach`'s own,
 /// by name.
@@ -143,9 +142,10 @@ pub(crate) const fn version_is_patch_only(v: u32) -> bool {
 /// Run the 6-step attach. Steps 1–5 here; step 6 (spawn the threads) is the
 /// builder's job, after this returns.
 ///
-/// `install` is `Some` only from
-/// [`ServiceBuilder::start_with_snapshots`](crate::ServiceBuilder::start_with_snapshots)
-/// — the one path that has `S: SnapshotStateMachine` in scope — and is what
+/// `install` is always `Some` from
+/// [`ServiceBuilder::start`](crate::ServiceBuilder::start)
+/// — which requires `S: SnapshotStateMachine` since #67; only this module's
+/// unit tests pass `None` — and is what
 /// makes this row snapshot-CAPABLE: the capability bit rides the SAME status
 /// store as the attached bit (coordinated-snapshot spec §5.2). Folding it in
 /// there rather than OR-ing it afterwards leaves no window in which the node
@@ -528,14 +528,15 @@ pub(crate) fn attach<S: RawStateMachine>(
         lag_mode,
         declared,
         lag_waiting: false,
-        // M6 Task 3: only `start_with_snapshots` installs a real trigger
+        // M6 Task 3: only `start` installs a real trigger
         // (it needs `S: SnapshotStateMachine`, a bound `attach` doesn't
         // carry) — it overwrites this field on the `Attached` this function
         // returns, before spawning the apply thread.
         snapshot_trigger: None,
-        // M6 Task 5: likewise, only `start_with_snapshots` installs the
-        // below-floor reconstruction capability; a plain `start()` leaves it
-        // `None`, so a purged-below gap fail-stops with `SnapshotRequired`.
+        // M6 Task 5: likewise, only `start` installs the
+        // below-floor reconstruction capability; left `None` (only an
+        // in-crate harness does that since #67), a purged-below gap
+        // fail-stops with `SnapshotRequired`.
         snapshot_restore: None,
     };
 
@@ -711,5 +712,29 @@ mod tests {
             ),
             "a harness page (no names, declared 0) is not the boot gap"
         );
+    }
+
+    /// #67: every SDK `start()` hands `attach` the install capability, so an
+    /// SDK service can no longer reach [`ServiceError::PinRequiresSnapshots`]
+    /// (the integration test that did, `pinned_attach.rs`'s
+    /// `a_pinned_row_started_without_snapshots_is_refused`, is retired). The
+    /// refusal stays as `attach`'s backstop for an attach WITHOUT the
+    /// capability: a pinned row must install the origin's artifact, never
+    /// replay the origin's prefix under this version.
+    #[test]
+    fn a_pinned_row_attached_without_the_install_capability_is_refused() {
+        let dir = scratch();
+        let page = file_page(dir.path(), &["count"], Some(0b1));
+        // Same line as `CountSm::VERSION` (0), so the version gate passes
+        // and the capability check is what decides.
+        page.service_slot(0).status.store_pin(4096, 0, 0);
+        match try_attach(dir.path()) {
+            Some(crate::config::ServiceError::PinRequiresSnapshots {
+                row: 0,
+                origin: 4096,
+                ..
+            }) => {}
+            other => panic!("expected PinRequiresSnapshots, got {other:?}"),
+        }
     }
 }

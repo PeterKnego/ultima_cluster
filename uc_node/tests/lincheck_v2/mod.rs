@@ -226,20 +226,19 @@ pub enum FsmSet {
 /// every one of the node's sockets (drop/dup/reorder), used by the lossy-links
 /// scenario; partitions are scripted separately through `partition_handles`.
 /// M6 Task 10: the purge/snapshot knobs a cluster boots (and re-boots) with.
-/// `Default` = the M5 posture (no purge, no snapshots, 64 MiB segments) so the
-/// failover capstone is byte-for-byte unchanged; the purge-churn capstone sets
-/// all three to exercise snapshot-backed purge + below-floor reconstruction.
+/// `Default` = the M5 posture (no purge, no instants commanded, 64 MiB
+/// segments); the purge-churn capstone sets both to exercise snapshot-backed
+/// purge + below-floor reconstruction.
+///
+/// #67: every service is snapshot-CAPABLE (the SDK's one `start()`), so the
+/// old `snapshot_interval_bytes` capability switch is gone. Whether artifacts
+/// appear is decided only by whether a capstone COMMANDS an instant
+/// ([`LinClusterV2::command_instant`]); with none commanded the builder
+/// thread just idles.
 #[derive(Clone, Copy)]
 pub struct ClusterCfg {
     pub purge: uc_node::PurgePolicy,
     pub journal_segment_bytes: u64,
-    /// `> 0` → services start via `start_with_snapshots`, i.e. snapshot-CAPABLE
-    /// (coordinated-snapshot spec §5.2's cnc status bit); `0` → plain `start`
-    /// (no snapshot builder), the M5 default. The number itself no longer
-    /// configures anything: the byte cadence is deleted, and artifacts appear
-    /// only at instants a capstone commands
-    /// ([`LinClusterV2::command_instant`]).
-    pub snapshot_interval_bytes: u64,
     /// M7 Task 10: reserve an extra (not-yet-a-member) address for
     /// [`LinClusterV2::random_config_op`] to cycle a "spare" node through
     /// add-learner -> promote -> demote -> remove-learner. `false` (the M5/M6
@@ -272,7 +271,6 @@ impl Default for ClusterCfg {
         Self {
             purge: uc_node::PurgePolicy::Disabled,
             journal_segment_bytes: uc_node::DEFAULT_JOURNAL_SEGMENT_BYTES,
-            snapshot_interval_bytes: 0,
             spare_node: false,
             crypto: false,
             services: FsmSet::Single,
@@ -381,26 +379,15 @@ fn rebind(addr: SocketAddr) -> UdpSocket {
 /// `Single`/`Two` posture's first FSM. `SM1` under [`FsmSet::Two`] is always
 /// wrapped in [`Tagged<1, _>`](spawn_service_row1), never passed here
 /// directly.
-fn spawn_service<SM: SnapshotStateMachine + Default>(
-    dir: &Path,
-    snapshot_interval_bytes: u64,
-) -> uc_service::Service<SM> {
-    let cfg = ServiceConfig::new(dir, APP);
-    if snapshot_interval_bytes == 0 {
-        ServiceBuilder::new(cfg, SM::default())
-            .start()
-            .expect("service start")
-    } else {
-        // M6 Task 10: snapshot-capable service, so the node can advance its
-        // purge floor and below-floor reconstruction goes via install. The
-        // byte cadence is gone (coordinated-snapshot spec §5.2), so
-        // `snapshot_interval_bytes > 0` now means CAPABLE and nothing more:
-        // artifacts appear at the instants a capstone's churn commands
-        // through [`LinClusterV2::command_instant`].
-        ServiceBuilder::new(cfg, SM::default())
-            .start_with_snapshots()
-            .expect("snapshot service start")
-    }
+///
+/// Snapshot-capable (#67: every `start()` is), so the node can advance its
+/// purge floor and below-floor reconstruction goes via install; artifacts
+/// appear only at the instants a capstone's churn commands through
+/// [`LinClusterV2::command_instant`].
+fn spawn_service<SM: SnapshotStateMachine + Default>(dir: &Path) -> uc_service::Service<SM> {
+    ServiceBuilder::new(ServiceConfig::new(dir, APP), SM::default())
+        .start()
+        .expect("service start")
 }
 
 /// The second FSM under [`FsmSet::Two`], row 1, declared name `"fsm1"`
@@ -411,9 +398,8 @@ fn spawn_service<SM: SnapshotStateMachine + Default>(
 /// which would otherwise collide with row 0 or mismatch the declared set).
 fn spawn_service_row1<SM1: SnapshotStateMachine + StateMachine + Default>(
     dir: &Path,
-    snapshot_interval_bytes: u64,
 ) -> uc_service::Service<Tagged<1, SM1>> {
-    spawn_service::<Tagged<1, SM1>>(dir, snapshot_interval_bytes)
+    spawn_service::<Tagged<1, SM1>>(dir)
 }
 
 /// The second FSM (row 1) under [`FsmSet::Two`], else `None`. Every path that
@@ -424,8 +410,7 @@ fn spawn_service1<SM1: SnapshotStateMachine + StateMachine + Default>(
     dir: &Path,
     ccfg: ClusterCfg,
 ) -> Option<uc_service::Service<Tagged<1, SM1>>> {
-    matches!(ccfg.services, FsmSet::Two { .. })
-        .then(|| spawn_service_row1::<SM1>(dir, ccfg.snapshot_interval_bytes))
+    matches!(ccfg.services, FsmSet::Two { .. }).then(|| spawn_service_row1::<SM1>(dir))
 }
 
 /// Time-and-timers T11: the row-1 service under [`FsmSet::TwoTimed`].
@@ -433,21 +418,11 @@ fn spawn_service1<SM1: SnapshotStateMachine + StateMachine + Default>(
 /// implements `RawStateMachine`, never `StateMachine`), so it cannot go
 /// through the generic [`spawn_service`] — the wrapping is the point, and
 /// `ServiceBuilder` only needs the raw tier.
-fn spawn_service_timer(
-    dir: &Path,
-    snapshot_interval_bytes: u64,
-) -> uc_service::Service<Timed<TimerSm>> {
-    let cfg = ServiceConfig::new(dir, APP);
-    if snapshot_interval_bytes == 0 {
-        ServiceBuilder::new(cfg, Timed::new(TimerSm::default()))
-            .start()
-            .expect("timer service start")
-    } else {
-        // Capable, never self-triggering — see `spawn_service` above.
-        ServiceBuilder::new(cfg, Timed::new(TimerSm::default()))
-            .start_with_snapshots()
-            .expect("timer snapshot service start")
-    }
+fn spawn_service_timer(dir: &Path) -> uc_service::Service<Timed<TimerSm>> {
+    // Capable, never self-triggering — see `spawn_service` above.
+    ServiceBuilder::new(ServiceConfig::new(dir, APP), Timed::new(TimerSm::default()))
+        .start()
+        .expect("timer service start")
 }
 
 /// The row-1 timer service under [`FsmSet::TwoTimed`], else `None` — the
@@ -457,8 +432,7 @@ fn spawn_service_timer_opt(
     dir: &Path,
     ccfg: ClusterCfg,
 ) -> Option<uc_service::Service<Timed<TimerSm>>> {
-    matches!(ccfg.services, FsmSet::TwoTimed { .. })
-        .then(|| spawn_service_timer(dir, ccfg.snapshot_interval_bytes))
+    matches!(ccfg.services, FsmSet::TwoTimed { .. }).then(|| spawn_service_timer(dir))
 }
 
 // ------------------------------------------------------------------ one slot
@@ -634,10 +608,7 @@ impl<SM: SnapshotStateMachine + Default, SM1: SnapshotStateMachine + StateMachin
         // still carries a service from boot — the new leader after a failover
         // already has one attached.
         for slot in &mut nodes {
-            slot.service = Some(spawn_service(
-                &slot.instance_dir,
-                ccfg.snapshot_interval_bytes,
-            ));
+            slot.service = Some(spawn_service(&slot.instance_dir));
             slot.service1 = spawn_service1::<SM1>(&slot.instance_dir, ccfg);
             slot.service_timer = spawn_service_timer_opt(&slot.instance_dir, ccfg);
         }
@@ -961,7 +932,7 @@ impl<SM: SnapshotStateMachine + Default, SM1: SnapshotStateMachine + StateMachin
             crypto,
         );
         let node = Node::start_with_socket(cfg, sock).expect("leader node restart");
-        let service = spawn_service(&dir, self.ccfg.snapshot_interval_bytes);
+        let service = spawn_service(&dir);
         let service1 = spawn_service1::<SM1>(&dir, self.ccfg);
         let service_timer = spawn_service_timer_opt(&dir, self.ccfg);
         self.nodes[li].node = Some(node);
@@ -1018,26 +989,21 @@ impl<SM: SnapshotStateMachine + Default, SM1: SnapshotStateMachine + StateMachin
                 if let Some(service) = self.nodes[i].service.take() {
                     service.crash(); // drop-joins; swallows the fail-stop panic
                 }
-                self.nodes[i].service =
-                    Some(spawn_service(&dir, self.ccfg.snapshot_interval_bytes));
+                self.nodes[i].service = Some(spawn_service(&dir));
                 respawned += 1;
             }
             if dead1 {
                 if let Some(s1) = self.nodes[i].service1.take() {
                     s1.crash();
                 }
-                self.nodes[i].service1 = Some(spawn_service_row1::<SM1>(
-                    &dir,
-                    self.ccfg.snapshot_interval_bytes,
-                ));
+                self.nodes[i].service1 = Some(spawn_service_row1::<SM1>(&dir));
                 respawned += 1;
             }
             if dead_timer {
                 if let Some(st) = self.nodes[i].service_timer.take() {
                     st.crash();
                 }
-                self.nodes[i].service_timer =
-                    Some(spawn_service_timer(&dir, self.ccfg.snapshot_interval_bytes));
+                self.nodes[i].service_timer = Some(spawn_service_timer(&dir));
                 respawned += 1;
             }
         }
@@ -1056,7 +1022,7 @@ impl<SM: SnapshotStateMachine + Default, SM1: SnapshotStateMachine + StateMachin
         if let Some(st) = self.nodes[li].service_timer.take() {
             st.crash();
         }
-        let service = spawn_service(&dir, self.ccfg.snapshot_interval_bytes);
+        let service = spawn_service(&dir);
         let service1 = spawn_service1::<SM1>(&dir, self.ccfg);
         let service_timer = spawn_service_timer_opt(&dir, self.ccfg);
         self.nodes[li].service = Some(service);
@@ -1092,7 +1058,7 @@ impl<SM: SnapshotStateMachine + Default, SM1: SnapshotStateMachine + StateMachin
         if let Some(st) = self.nodes[fi].service_timer.take() {
             st.crash();
         }
-        let service = spawn_service(&dir, self.ccfg.snapshot_interval_bytes);
+        let service = spawn_service(&dir);
         let service1 = spawn_service1::<SM1>(&dir, self.ccfg);
         let service_timer = spawn_service_timer_opt(&dir, self.ccfg);
         self.nodes[fi].service = Some(service);
@@ -1387,7 +1353,7 @@ impl<SM: SnapshotStateMachine + Default, SM1: SnapshotStateMachine + StateMachin
                     // fails `NodeBooting` — with the admin request it is
                     // blocking never sent.
                     let slot = self.spare.as_mut().expect("spare live");
-                    slot.service = Some(spawn_service(&dir, self.ccfg.snapshot_interval_bytes));
+                    slot.service = Some(spawn_service(&dir));
                     slot.service1 = spawn_service1::<SM1>(&dir, self.ccfg);
                     slot.service_timer = spawn_service_timer_opt(&dir, self.ccfg);
                     self.spare_phase = SparePhase::Added;

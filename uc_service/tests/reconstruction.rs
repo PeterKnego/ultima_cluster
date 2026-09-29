@@ -282,7 +282,7 @@ fn fresh_service_reconstructs_from_journal_after_ring_scrolled() {
     // FIRST service attaches only now: the ring long since scrolled → the fresh
     // SM at cursor 0 hits Overrun immediately → journal replay reconstruction.
     let svc = ServiceBuilder::new(cfg(dir.path(), "rec"), CountSm::default())
-        .start_with_snapshots()
+        .start()
         .unwrap();
     let cnc = open_cnc(dir.path(), "rec");
     wait_service_caught_up(&cnc);
@@ -430,7 +430,7 @@ fn a_replayed_instant_at_or_below_the_applied_frontier_is_not_frozen_at() {
     SLOW_NS.store(0, O::Relaxed);
     FREEZE_OK.store(false, O::Relaxed); // every freeze DECLINES
     let svc = ServiceBuilder::new(cfg(dir.path(), "recp10g"), SlowCountSm::default())
-        .start_with_snapshots()
+        .start()
         .unwrap();
 
     // ---- phase A: an instant the row DECLINES, then applies past.
@@ -581,7 +581,7 @@ fn a_replayed_span_freezes_at_its_last_snapshot_frame_below_it_only() {
     );
 
     let svc = ServiceBuilder::new(cfg(dir.path(), "recp10"), CountSm::default())
-        .start_with_snapshots()
+        .start()
         .unwrap();
     let cnc = open_cnc(dir.path(), "recp10");
     wait_service_caught_up(&cnc);
@@ -626,7 +626,7 @@ fn a_restart_completes_an_instant_sitting_in_its_journal_tail() {
     }
     wait_commit_covers_all(&node);
     let svc1 = ServiceBuilder::new(cfg(dir.path(), "recp10r"), CountSm::default())
-        .start_with_snapshots()
+        .start()
         .unwrap();
     let cnc = open_cnc(dir.path(), "recp10r");
     wait_service_caught_up(&cnc);
@@ -651,7 +651,7 @@ fn a_restart_completes_an_instant_sitting_in_its_journal_tail() {
     // The restart installs the artifact at P1 (or replays to it) and then
     // walks a tail containing P2: the builder must receive P2.
     let svc2 = ServiceBuilder::new(cfg(dir.path(), "recp10r"), CountSm::default())
-        .start_with_snapshots()
+        .start()
         .unwrap();
     wait_service_caught_up(&cnc);
     wait_until(|| cnc.service_slot(0).snapshot_pos.load_acquire() == p2);
@@ -686,7 +686,7 @@ fn restarted_service_epoch_bumps_and_state_rebuilds() {
 
     // First incarnation: reconstructs from the journal, converges to 2000.
     let svc1 = ServiceBuilder::new(cfg(dir.path(), "rst"), CountSm::default())
-        .start_with_snapshots()
+        .start()
         .unwrap();
     let cnc = open_cnc(dir.path(), "rst");
     wait_service_caught_up(&cnc);
@@ -698,7 +698,7 @@ fn restarted_service_epoch_bumps_and_state_rebuilds() {
     svc1.crash();
 
     let svc2 = ServiceBuilder::new(cfg(dir.path(), "rst"), CountSm::default())
-        .start_with_snapshots()
+        .start()
         .unwrap();
     let new_epoch = svc2.epoch();
     assert_eq!(
@@ -786,7 +786,7 @@ fn purged_node_after_snapshotting_service(dir: &Path, app: &str, n: u32) -> (Nod
     wait_until(|| node.can_serve());
 
     let svc1 = ServiceBuilder::new(ServiceConfig::new(dir, app), RegisterSm::default())
-        .start_with_snapshots()
+        .start()
         .unwrap();
 
     let prod = open_ingress(dir);
@@ -832,7 +832,7 @@ fn fresh_service_below_purge_floor_installs_snapshot_then_tail_replays() {
     // replay carries it to the live frontier — state == snapshot prefix + tail,
     // exactly once.
     let svc2 = ServiceBuilder::new(ServiceConfig::new(dir.path(), app), RegisterSm::default())
-        .start_with_snapshots()
+        .start()
         .unwrap();
     let cnc = open_cnc(dir.path(), app);
     wait_service_caught_up(&cnc);
@@ -861,11 +861,27 @@ static PANIC_LOG: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new
 /// test on this lock rather than relying on `--test-threads=1`.
 static PANIC_HOOK_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// A below-floor gap nothing can bridge fail-stops with the contract named.
+///
+/// #67: this was `gap_without_snapshot_capability_fails_stop_with_named_contract`,
+/// which reached the gap with a snapshot-less `start()` (no install
+/// capability). That start is gone — every SDK row can install — so the
+/// no-capability arm is now unit-covered in `apply.rs`
+/// (`a_replay_that_cannot_advance_fail_stops_a_row_that_cannot_install`),
+/// and this test reaches the SAME named fail-stop the way an SDK row still
+/// can: the capability is there, but no covering artifact is on disk (a
+/// pruned or wiped `snapshots/<row>/`).
 #[test]
-fn gap_without_snapshot_capability_fails_stop_with_named_contract() {
+fn gap_with_no_covering_artifact_fails_stop_with_named_contract() {
     let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let app = "rec_nosnap";
     let (node, _prod) = purged_node_after_snapshotting_service(dir.path(), app, 4_000);
+    // Remove every artifact of row 0: the journal is purged below the floor
+    // and nothing on disk covers the gap.
+    let store = uc_service::snapshots::SnapshotStore::open(dir.path(), 0).unwrap();
+    while let Some((_, path)) = store.newest(u64::MAX).unwrap() {
+        std::fs::remove_file(path).unwrap();
+    }
 
     // Own the panic hook exclusively for the rest of this test — see
     // `PANIC_HOOK_LOCK`'s doc. Poison-tolerant: a genuine regression that
@@ -886,9 +902,8 @@ fn gap_without_snapshot_capability_fails_stop_with_named_contract() {
         PANIC_LOG.lock().unwrap().push(info.to_string());
     }));
 
-    // Service #2 attaches via plain `.start()` (not `.start_with_snapshots()`),
-    // which never wires `snapshot_restore` regardless of the SM's capability.
-    // Attaching below the purge floor cannot install a snapshot: the apply
+    // Service #2 attaches below the purge floor with no covering artifact,
+    // so it cannot install a snapshot: the apply
     // agent must fail-stop with the contract named, never silently replay a
     // partial prefix from `first_base` onto a phantom cursor. Must be a
     // `RegisterSm` (not `CountSm`) — FSM identity: this node declares
@@ -955,7 +970,7 @@ fn an_unpinned_newer_binary_cannot_install_an_older_versions_artifact() {
         ServiceConfig::new(dir.path(), app),
         DoublingRegisterSm::default(),
     )
-    .start_with_snapshots()
+    .start()
     .err()
     .expect("an off-line binary is refused at attach");
     assert!(
@@ -983,7 +998,7 @@ fn snapshotting_count_sm_below_floor_recovers_exact_total() {
     let node = start_purge_node(dir.path(), app, CountSm::NAME);
     wait_until(|| node.can_serve());
     let svc1 = ServiceBuilder::new(ServiceConfig::new(dir.path(), app), CountSm::default())
-        .start_with_snapshots()
+        .start()
         .unwrap();
     let prod = open_ingress(dir.path());
     for i in 1..=n {
@@ -1007,7 +1022,7 @@ fn snapshotting_count_sm_below_floor_recovers_exact_total() {
     // Fresh snapshot-capable CountSm: install the covering snapshot (its prefix
     // total), then tail-replay the rest → the exact grand total, no prefix lost.
     let svc2 = ServiceBuilder::new(ServiceConfig::new(dir.path(), app), CountSm::default())
-        .start_with_snapshots()
+        .start()
         .unwrap();
     wait_service_caught_up(&cnc);
     assert_eq!(
@@ -1059,7 +1074,7 @@ fn a_renamed_artifact_is_refused_by_name_and_a_correct_one_installs() {
     std::fs::rename(&real, &liar).unwrap();
 
     // The refusal lands on the apply thread's first below-floor cycle, so
-    // capture it the way `gap_without_snapshot_capability_fails_stop_with_named_contract`
+    // capture it the way `gap_with_no_covering_artifact_fails_stop_with_named_contract`
     // does: a scoped panic hook over this test's window.
     PANIC_LOG.lock().unwrap().clear();
     let prev = std::panic::take_hook();
@@ -1067,7 +1082,7 @@ fn a_renamed_artifact_is_refused_by_name_and_a_correct_one_installs() {
         PANIC_LOG.lock().unwrap().push(info.to_string());
     }));
     let svc_bad = ServiceBuilder::new(ServiceConfig::new(dir.path(), app), RegisterSm::default())
-        .start_with_snapshots()
+        .start()
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(20);
     let fired = loop {
@@ -1096,7 +1111,7 @@ fn a_renamed_artifact_is_refused_by_name_and_a_correct_one_installs() {
     std::fs::rename(&liar, &real).unwrap();
     let svc =
         uc_service::ServiceBuilder::new(ServiceConfig::new(dir.path(), app), RegisterSm::default())
-            .start_with_snapshots()
+            .start()
             .unwrap();
     let cnc = open_cnc(dir.path(), app);
     wait_service_caught_up(&cnc);

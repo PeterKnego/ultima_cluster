@@ -95,12 +95,11 @@ impl RawStateMachine for RawCount {
         self.last
     }
 }
-// #67 Task 3: only the impl, not the `.start()` -> `.start_with_snapshots()`
-// switch — this harness is perf-sensitive (see the module's hop-isolation
-// doc) and never commands a snapshot instant (confirmed: `grep -n
-// "snapshot\|SNAPSHOT\|instant"` finds only the `snapshot_dir_for` mkdir at
-// setup), so whether to pay for the builder thread here is a controller
-// call, not this task's.
+// #67: every service is snapshot-capable, so this harness's rows are too.
+// It never commands a snapshot instant (the only snapshot-ish line is the
+// `snapshot_dir_for` mkdir at setup), so the capability costs each row an
+// idle `uc2-snapshot-builder` thread (`IdleStrategy::Sleep(50µs)`) and the
+// CAPABLE status bit — nothing on the apply hop itself.
 impl uc_service::WholeStateSnapshot for RawCount {
     fn encode_state(&self) -> Result<Vec<u8>, uc_service::SnapshotError> {
         bincode::serde::encode_to_vec((self.frames, self.last), bincode::config::standard())
@@ -135,6 +134,16 @@ impl<const ROW: u8> RawStateMachine for TaggedRaw<ROW> {
     }
     fn last_applied(&self) -> Option<u64> {
         self.0.last_applied()
+    }
+}
+/// Delegates to the inner [`RawCount`]'s whole-state encoding — the row
+/// name is a type parameter, not state.
+impl<const ROW: u8> uc_service::WholeStateSnapshot for TaggedRaw<ROW> {
+    fn encode_state(&self) -> Result<Vec<u8>, uc_service::SnapshotError> {
+        self.0.encode_state()
+    }
+    fn decode_state(&mut self, bytes: &[u8]) -> Result<(), uc_service::SnapshotError> {
+        self.0.decode_state(bytes)
     }
 }
 

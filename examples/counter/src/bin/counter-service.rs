@@ -76,7 +76,7 @@ fn main() -> anyhow::Result<()> {
         }
         let cfg = ServiceConfig::new(args.instance_dir.clone(), args.app_id.clone())
             .with_boot_wait(Duration::from_millis(200));
-        match ServiceBuilder::new(cfg, CounterSm::default()).start_with_snapshots() {
+        match ServiceBuilder::new(cfg, CounterSm::default()).start() {
             Ok(service) => break service,
             Err(ServiceError::NodeBooting) => {
                 anyhow::ensure!(

@@ -70,7 +70,7 @@ fn write_cas_read_round_trip_through_the_edge() {
         ServiceConfig::new(&dir, common::APP),
         Sessioned::new(RegisterSm::default(), SessionConfig::default()),
     )
-    .start_with_snapshots()
+    .start()
     .unwrap();
     common::await_serving(&node, 10);
 
@@ -137,7 +137,7 @@ fn raw_pass_through_round_trips_with_the_envelope_off() {
     let root = common::tempdir();
     let (node, dir) = common::start_single_node(root.path());
     let svc = ServiceBuilder::new(ServiceConfig::new(&dir, common::APP), RegisterSm::default())
-        .start_with_snapshots()
+        .start()
         .unwrap();
     common::await_serving(&node, 10);
 
@@ -202,7 +202,7 @@ fn an_oversized_submit_is_refused_with_payload_too_large() {
         ServiceConfig::new(&dir, common::APP),
         Sessioned::new(RegisterSm::default(), SessionConfig::default()),
     )
-    .start_with_snapshots()
+    .start()
     .unwrap();
     common::await_serving(&node, 10);
 
@@ -273,7 +273,7 @@ fn the_edge_door_follows_the_live_cnc_ceiling() {
         ServiceConfig::new(&dir, common::APP),
         Sessioned::new(RegisterSm::default(), SessionConfig::default()),
     )
-    .start_with_snapshots()
+    .start()
     .unwrap();
     common::await_serving(&node, 10);
 

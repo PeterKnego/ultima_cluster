@@ -1172,7 +1172,7 @@ fn schedule_apply_is_signed_digest_checked_leader_only_and_audited() {
                 uc_service::ServiceConfig::new(&h.instance_dir, APP),
                 RegisterSm::default(),
             )
-            .start_with_snapshots()
+            .start()
             .expect("service start")
         })
         .collect();

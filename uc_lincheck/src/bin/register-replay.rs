@@ -171,18 +171,17 @@ fn main() -> anyhow::Result<()> {
             // is unreachable and `double_cas` is matched first.
             match (double_cas, double, durable) {
                 (false, false, false) => supervise(
-                    uc_service::ServiceBuilder::new(cfg(), RegisterSm::default())
-                        .start_with_snapshots()?,
+                    uc_service::ServiceBuilder::new(cfg(), RegisterSm::default()).start()?,
                     &stop,
                 ),
                 (false, true, false) => supervise(
                     uc_service::ServiceBuilder::new(cfg(), DoublingRegisterSm::default())
-                        .start_with_snapshots()?,
+                        .start()?,
                     &stop,
                 ),
                 (true, _, false) => supervise(
                     uc_service::ServiceBuilder::new(cfg(), DoublingCasRegisterSm::default())
-                        .start_with_snapshots()?,
+                        .start()?,
                     &stop,
                 ),
                 (false, false, true) => supervise(
@@ -190,7 +189,7 @@ fn main() -> anyhow::Result<()> {
                         cfg(),
                         uc_lincheck::register::Durable::open(RegisterSm::default(), &instance_dir)?,
                     )
-                    .start_with_snapshots()?,
+                    .start()?,
                     &stop,
                 ),
                 (false, true, true) => supervise(
@@ -201,7 +200,7 @@ fn main() -> anyhow::Result<()> {
                             &instance_dir,
                         )?,
                     )
-                    .start_with_snapshots()?,
+                    .start()?,
                     &stop,
                 ),
                 (true, _, true) => supervise(
@@ -212,7 +211,7 @@ fn main() -> anyhow::Result<()> {
                             &instance_dir,
                         )?,
                     )
-                    .start_with_snapshots()?,
+                    .start()?,
                     &stop,
                 ),
             }

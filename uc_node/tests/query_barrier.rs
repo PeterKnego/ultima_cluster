@@ -196,7 +196,7 @@ fn stale_leader_fails_linearizable_read_confirmation() {
 
     // A real service + client attached to the current leader.
     let svc = ServiceBuilder::new(ServiceConfig::new(&leader_dir, APP), CountSm::default())
-        .start_with_snapshots()
+        .start()
         .unwrap();
     let client = Client::connect(&leader_dir, APP).unwrap();
 
@@ -253,7 +253,7 @@ fn concurrent_batched_reads_stay_linearizable_across_partition() {
     let leader_dir = c.dirs[leader].clone();
 
     let svc = ServiceBuilder::new(ServiceConfig::new(&leader_dir, APP), CountSm::default())
-        .start_with_snapshots()
+        .start()
         .unwrap();
     let client = Client::connect(&leader_dir, APP).unwrap();
     drive_submits(&client, 100);

@@ -551,7 +551,7 @@ fn run_service(a: ServiceArgs) -> anyhow::Result<()> {
     // Each arm diverges (parks forever), so the two `Service<_>` types (one
     // per state-machine tier) never need to unify.
     if a.raw_sm {
-        let _svc = ServiceBuilder::new(cfg, RawCountSm::default()).start_with_snapshots()?;
+        let _svc = ServiceBuilder::new(cfg, RawCountSm::default()).start()?;
         println!(
             "m5_gate service up (raw-tier RawCountSm); parking (killed externally by the harness)"
         );
@@ -559,7 +559,7 @@ fn run_service(a: ServiceArgs) -> anyhow::Result<()> {
             std::thread::park();
         }
     } else {
-        let _svc = ServiceBuilder::new(cfg, CountSm::default()).start_with_snapshots()?;
+        let _svc = ServiceBuilder::new(cfg, CountSm::default()).start()?;
         println!("m5_gate service up (typed CountSm); parking (killed externally by the harness)");
         loop {
             std::thread::park();
@@ -1136,7 +1136,7 @@ fn run_all_generic<S: RawStateMachine + uc_service::SnapshotStateMachine + Defau
     // up — so every node starts before any service attaches.
     for instance_dir in &dirs {
         let svc = ServiceBuilder::new(ServiceConfig::new(instance_dir, ALL_APP_ID), S::default())
-            .start_with_snapshots()
+            .start()
             .expect("service start");
         services.push(svc);
     }

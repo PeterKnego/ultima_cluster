@@ -89,7 +89,7 @@ use uc_remote::{
 use uc_service::{
     ApplyCtx, RawStateMachine, SESSION_HEADER_LEN, Service, ServiceBuilder, ServiceConfig,
     SessionConfig, Sessioned, SnapshotError, SnapshotStateMachine, StateMachine, TAG_FRESH,
-    TimerEvent,
+    TimerEvent, WholeStateSnapshot,
 };
 
 // --------------------------------------------------------------- CLI shape
@@ -256,16 +256,13 @@ struct ServiceArgs {
     /// the deliberately slow FSM. Only valid with `--fsm spin`.
     #[arg(long, default_value_t = 0)]
     work_spin: u64,
-    /// M14d row f: make the service snapshot-CAPABLE so the leader has
-    /// artifacts to ship. `0` = no snapshots — `start()`, byte-for-byte every
-    /// prior arm. `> 0` runs `start_with_snapshots()` (typed tier only:
-    /// `CountSm`/`SpinCountSm` and their `Sessioned<_>` wrap are all
-    /// `SnapshotStateMachine`); paired with `--fsm raw` it is refused by name.
-    ///
-    /// The BYTE VALUE no longer sets a cadence: coordinated-snapshot spec §5.2
-    /// deleted the per-service byte interval, and instants are commanded by
-    /// the leader. The flag is kept as the capability switch until Task 5
-    /// wires the command.
+    /// M14d row f: on this (SERVICE) role the value is recorded in the "up"
+    /// line only — since #67 every service is snapshot-capable whatever it
+    /// says, and a row with no instant commanded just idles its builder. The
+    /// NODE role's flag of the same name seeds the replicated cadence that
+    /// makes the leader command instants and have artifacts to ship.
+    /// Paired with `--fsm raw` it is refused by name (row 3's codec A/B
+    /// commands no snapshots).
     #[arg(long, default_value_t = 0)]
     snapshot_interval_bytes: u64,
     /// Time-and-timers gate row a: wrap the state machine in
@@ -275,8 +272,8 @@ struct ServiceArgs {
     /// `Timed<X>`. Row a runs every service wrapped and NO timers scheduled,
     /// which is what makes it a measurement of the wrapper alone.
     ///
-    /// Refused with `--fsm raw`: `RawCountSm` is not a `SnapshotStateMachine`
-    /// and the raw arms deliberately keep the plain `start()` path.
+    /// Refused with `--fsm raw`: the raw arms are row 3's codec A/B, spelled
+    /// by hand (only `Sessioned` wraps them), not through `run_wrapped`.
     #[arg(long, default_value_t = false)]
     timed: bool,
     /// Time-and-timers gate row b: run [`TimerLoadSm`] in place of
@@ -1028,7 +1025,7 @@ where
     // up — so every node starts before any service attaches.
     for instance_dir in &dirs {
         let svc = ServiceBuilder::new(ServiceConfig::new(instance_dir, app_id), make_sm())
-            .start_with_snapshots()
+            .start()
             .expect("service start");
         services.push(svc);
     }
@@ -1092,13 +1089,13 @@ fn boot_cluster2(
     // up — so every node starts before any service attaches.
     for instance_dir in &dirs {
         let a = ServiceBuilder::new(ServiceConfig::new(instance_dir, app_id), CountSm::default())
-            .start_with_snapshots()
+            .start()
             .expect("service 0");
         let b = ServiceBuilder::new(
             ServiceConfig::new(instance_dir, app_id),
             SpinCountSm::with_spin(spin),
         )
-        .start_with_snapshots()
+        .start()
         .expect("service 1");
         s0.push(a);
         s1.push(b);
@@ -1949,6 +1946,34 @@ impl RawStateMachine for RawCountSm {
     }
 }
 
+/// #67: every service is snapshot-capable, so the raw arm is too. The whole
+/// state is two words — the count and the applied cursor, both encoded
+/// (`count ‖ cursor_present ‖ cursor`, little-endian). Row 3 commands no
+/// instant, so the builder thread only idles.
+impl WholeStateSnapshot for RawCountSm {
+    fn encode_state(&self) -> Result<Vec<u8>, SnapshotError> {
+        let mut out = Vec::with_capacity(17);
+        out.extend_from_slice(&self.count.to_le_bytes());
+        out.push(self.last_applied.is_some() as u8);
+        out.extend_from_slice(&self.last_applied.unwrap_or(0).to_le_bytes());
+        Ok(out)
+    }
+
+    fn decode_state(&mut self, bytes: &[u8]) -> Result<(), SnapshotError> {
+        let b: &[u8; 17] = bytes.try_into().map_err(|_| {
+            SnapshotError::Codec(format!("RawCountSm state is 17 bytes, got {}", bytes.len()))
+        })?;
+        self.count = u64::from_le_bytes(b[..8].try_into().expect("8 bytes"));
+        let cursor = u64::from_le_bytes(b[9..].try_into().expect("8 bytes"));
+        self.last_applied = match b[8] {
+            0 => None,
+            1 => Some(cursor),
+            t => return Err(SnapshotError::Codec(format!("bad cursor tag {t}"))),
+        };
+        Ok(())
+    }
+}
+
 /// `id@addr,...` — used for both the node role's UDP member list and the edge
 /// role's node-id -> gateway-address map (the two are different addresses for
 /// the same ids, which is why the edge takes its own flag).
@@ -2094,22 +2119,6 @@ fn run_node_role(a: NodeArgs) -> anyhow::Result<()> {
 
 // ---------------------------------------------------------- service role
 
-/// M14d T2 fix round 1: only `start_with_snapshots()` spawns the M6 builder
-/// thread and declares the row snapshot-capable (`uc_service/src/lib.rs`, the
-/// same method `m6_gate.rs` uses); plain `start()` can never snapshot. Shared by the four typed arms below (raw arms
-/// keep plain `start()`; `--fsm raw` + `--snapshot-interval-bytes` is refused
-/// by name before this is ever reached).
-fn start_typed_svc<S: SnapshotStateMachine>(
-    b: ServiceBuilder<S>,
-    snapshots: bool,
-) -> anyhow::Result<Service<S>> {
-    if snapshots {
-        Ok(b.start_with_snapshots()?)
-    } else {
-        Ok(b.start()?)
-    }
-}
-
 /// FSM identity: which SM type `--fsm` selects. `Tagged(n)` is
 /// `uc_service::Tagged<n, CountSm>`, `n` in `0..8` — the const generic can't
 /// be a runtime value, so callers `match` over it.
@@ -2145,10 +2154,9 @@ fn parse_fsm(s: &str) -> anyhow::Result<FsmKind> {
 fn run_and_park<S: SnapshotStateMachine>(
     cfg: ServiceConfig,
     sm: S,
-    snapshots: bool,
     what: String,
 ) -> anyhow::Result<()> {
-    let _svc = start_typed_svc(ServiceBuilder::new(cfg, sm), snapshots)?;
+    let _svc = ServiceBuilder::new(cfg, sm).start()?;
     park_service(&what)
 }
 
@@ -2164,7 +2172,6 @@ fn run_wrapped<S: SnapshotStateMachine>(
     sm: S,
     envelope: bool,
     timed: bool,
-    snapshots: bool,
     inner: &str,
     tag: &str,
 ) -> anyhow::Result<()> {
@@ -2172,25 +2179,21 @@ fn run_wrapped<S: SnapshotStateMachine>(
         (true, true) => run_and_park(
             cfg,
             uc_service::Timed::new(Sessioned::new(sm, SessionConfig::default())),
-            snapshots,
             format!("Timed<Sessioned<{inner}>> (typed tier, envelope on, {tag})"),
         ),
         (true, false) => run_and_park(
             cfg,
             Sessioned::new(sm, SessionConfig::default()),
-            snapshots,
             format!("Sessioned<{inner}> (typed tier, envelope on, {tag})"),
         ),
         (false, true) => run_and_park(
             cfg,
             uc_service::Timed::new(sm),
-            snapshots,
             format!("Timed<{inner}> (typed tier, envelope off, {tag})"),
         ),
         (false, false) => run_and_park(
             cfg,
             sm,
-            snapshots,
             format!("{inner} (typed tier, envelope off, {tag})"),
         ),
     }
@@ -2213,14 +2216,15 @@ fn run_service_role(a: ServiceArgs) -> anyhow::Result<()> {
     );
     anyhow::ensure!(
         !(matches!(kind, FsmKind::Raw) && a.snapshot_interval_bytes > 0),
-        "--fsm raw and --snapshot-interval-bytes are exclusive: RawCountSm is not a SnapshotStateMachine"
+        "--fsm raw and --snapshot-interval-bytes are exclusive: the raw arm is row 3's codec A/B \
+         and commands no snapshots"
     );
-    // The raw tier keeps the plain `start()` path and has no snapshot
-    // capability, so it has nothing for `Timed` to sit on either.
+    // The raw arms are spelled by hand below (only `Sessioned` wraps them),
+    // not through `run_wrapped`, so there is no `Timed` stack for them.
     anyhow::ensure!(
         !(matches!(kind, FsmKind::Raw) && a.timed),
-        "--fsm raw and --timed are exclusive: RawCountSm is not a SnapshotStateMachine, and the \
-         raw arms deliberately keep the plain start() path"
+        "--fsm raw and --timed are exclusive: the raw arms are row 3's codec A/B and take no \
+         Timed wrapper"
     );
     anyhow::ensure!(
         a.timers_per_sec == 0 || matches!(kind, FsmKind::Count),
@@ -2236,10 +2240,9 @@ fn run_service_role(a: ServiceArgs) -> anyhow::Result<()> {
          is re-delivered by the next leader), and uc_service::Timed is what makes delivery \
          exactly-once from the log-derived pending set"
     );
-    // On the SERVICE role `--snapshot-interval-bytes` now only selects
-    // `start_with_snapshots()` below, i.e. snapshot-CAPABLE
-    // (coordinated-snapshot spec §5.2's cnc status bit) — any positive value
-    // means the same thing. The cadence it used to configure lives in the
+    // On the SERVICE role `--snapshot-interval-bytes` no longer selects
+    // anything: since #67 every `start()` is snapshot-CAPABLE (coordinated-
+    // snapshot spec §5.2's cnc status bit). The cadence lives in the
     // replicated settings record and is seeded by the NODE role's flag of the
     // same name, reaching this row as a `SNAPSHOT` frame. Passing the same
     // number to both roles (as `m14_fleet_gate.py` does) keeps the two
@@ -2247,7 +2250,6 @@ fn run_service_role(a: ServiceArgs) -> anyhow::Result<()> {
     let cfg = ServiceConfig::new(&a.instance_dir, &a.app_id);
     let envelope = a.envelope == Envelope::On;
     let timed = a.timed;
-    let snapshots = a.snapshot_interval_bytes > 0;
     let mut tag = format!(
         "fsm={} spin={} snap={}",
         a.fsm, a.work_spin, a.snapshot_interval_bytes
@@ -2264,7 +2266,6 @@ fn run_service_role(a: ServiceArgs) -> anyhow::Result<()> {
             TimerLoadSm::new(a.timers_per_sec, a.state_bytes),
             envelope,
             timed,
-            snapshots,
             &format!("TimerLoadSm({}/s)", a.timers_per_sec),
             &tag,
         ),
@@ -2273,7 +2274,6 @@ fn run_service_role(a: ServiceArgs) -> anyhow::Result<()> {
             CountSm::with_state_bytes(a.state_bytes),
             envelope,
             timed,
-            snapshots,
             "CountSm",
             &tag,
         ),
@@ -2282,7 +2282,6 @@ fn run_service_role(a: ServiceArgs) -> anyhow::Result<()> {
             SpinCountSm::with_spin_and_state(a.work_spin, a.state_bytes),
             envelope,
             timed,
-            snapshots,
             "SpinCountSm",
             &tag,
         ),
@@ -2308,7 +2307,6 @@ fn run_service_role(a: ServiceArgs) -> anyhow::Result<()> {
                         uc_service::Tagged::<$n, CountSm>(CountSm::with_state_bytes(a.state_bytes)),
                         envelope,
                         timed,
-                        snapshots,
                         concat!("Tagged<", stringify!($n), ", CountSm>"),
                         &tag,
                     )
@@ -2883,5 +2881,21 @@ mod tests {
         assert!(!fsms_pass_ok(&[(0, 42), (1, 41)], Some(42), None));
         // no successful pass yet (every attempt hit a query error) → not a pass.
         assert!(!fsms_pass_ok(&[], None, None));
+    }
+
+    /// #67: `RawCountSm`'s whole state — count AND cursor — survives the
+    /// helper's freeze/install round trip.
+    #[test]
+    fn raw_count_sm_round_trips_through_a_snapshot() {
+        let src = RawCountSm {
+            count: 7,
+            last_applied: Some(4096),
+        };
+        let (handle, pos) = src.freeze().unwrap();
+        let mut bytes = Vec::new();
+        RawCountSm::stream_snapshot(handle, &mut bytes).unwrap();
+        let mut dst = RawCountSm::default();
+        dst.install_snapshot(pos, &mut bytes.as_slice()).unwrap();
+        assert_eq!((dst.count, dst.last_applied), (7, Some(4096)));
     }
 }

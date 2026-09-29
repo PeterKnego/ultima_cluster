@@ -1243,9 +1243,7 @@ fn heavy_corruption_and_replay_injection_never_panics_and_never_diverges() {
         };
         if client.is_none() {
             let d = dirs[leader].clone();
-            match ServiceBuilder::new(ServiceConfig::new(&d, APP), CountSm::default())
-                .start_with_snapshots()
-            {
+            match ServiceBuilder::new(ServiceConfig::new(&d, APP), CountSm::default()).start() {
                 Ok(svc) => {
                     svc_holder = Some(svc);
                     client = Client::connect(&d, APP).ok();

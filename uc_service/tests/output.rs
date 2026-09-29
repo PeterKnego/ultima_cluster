@@ -190,7 +190,7 @@ fn output_thread_spawns_only_for_a_real_handler() {
     );
 
     let svc_noop = ServiceBuilder::new(cfg(dir.path(), "spawn"), CountSm::default())
-        .start_with_snapshots()
+        .start()
         .unwrap();
     assert!(
         !thread_names().iter().any(|n| n == "uc2-output"),
@@ -204,7 +204,7 @@ fn output_thread_spawns_only_for_a_real_handler() {
             seen,
             fail_first: AtomicBool::new(false),
         })
-        .start_with_snapshots()
+        .start()
         .unwrap();
     // A NEW thread's name (`pthread_setname_np`) is set by the thread ITSELF
     // early in its startup, not by the parent's `spawn` call — so there is a
@@ -238,7 +238,7 @@ fn output_handler_explicit_noop_spawns_no_thread() {
 
     let svc = ServiceBuilder::new(cfg(dir.path(), "explicit-noop"), CountSm::default())
         .output_handler(NoopOutput)
-        .start_with_snapshots()
+        .start()
         .unwrap();
     assert!(
         !thread_names().iter().any(|n| n == "uc2-output"),
@@ -304,7 +304,7 @@ fn output_runs_leader_only_at_least_once_across_service_restart() {
             seen: seen.clone(),
             fail_first: AtomicBool::new(true),
         })
-        .start_with_snapshots()
+        .start()
         .unwrap();
     let client = Client::connect(dir.path(), "out").unwrap();
     for _ in 0..20 {
@@ -328,7 +328,7 @@ fn output_runs_leader_only_at_least_once_across_service_restart() {
             seen: seen.clone(),
             fail_first: AtomicBool::new(false),
         })
-        .start_with_snapshots()
+        .start()
         .unwrap();
     for _ in 0..5 {
         let _: u64 = client.submit(&Cmd::Add(1)).unwrap();

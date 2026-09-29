@@ -365,7 +365,8 @@ pub const CNC_SVC_OFF_RESERVED: usize = 448;
 /// detach; a crashed service leaves it set and its heartbeat ages instead).
 pub const CNC_SVC_STATUS_ATTACHED: u64 = 1 << 8;
 /// Coordinated-snapshot plan 2 (spec §5.2): service-written, set by
-/// `start_with_snapshots`. A row without this bit is not capable of
+/// the SDK's `ServiceBuilder::start` (every SDK row, since #67). A row
+/// without this bit — a non-SDK attacher — is not capable of
 /// completing a set at any instant; `uc2ctl snapshot`/cadence refuse
 /// `48 snapshot_unsupported` naming any declared row that lacks it.
 /// Bits 9..31 of the status word are otherwise free.

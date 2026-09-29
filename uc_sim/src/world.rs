@@ -763,7 +763,7 @@ struct Node {
     /// are dropped at the ack (the artifacts are orphans, spec §10).
     complete_sets: Vec<(u64, u32)>,
     /// Instants this node will never complete a set at — the sim's model of
-    /// spec §5.2's "a row started with plain `start()` has no capability and
+    /// spec §5.2's "a row [without the capability bit] has no capability and
     /// IGNORES the frame; if one exists the set is simply incomplete". What
     /// makes inv11's non-prefix shape real rather than theoretical.
     snap_declined: Vec<u64>,
@@ -3427,7 +3427,7 @@ impl World {
 
     /// Task 9: make `node` DECLINE the instant at `position` — it will never
     /// complete a set there. The sim's model of spec §5.2's capability-less
-    /// row ("a row started with plain `start()` … ignores the frame; if one
+    /// row ("a row [without the capability bit] … ignores the frame; if one
     /// exists the set is simply incomplete"), and the reason inv11 cannot be
     /// a prefix rule. Call it before the node's frontier reaches `position`.
     pub fn decline_instant(&mut self, node: usize, position: u64) {

@@ -704,7 +704,7 @@ fn attach_noop_everywhere(nodes: &[NodeH]) -> Vec<Service<NoopSm>> {
         .iter()
         .map(|n| {
             ServiceBuilder::new(ServiceConfig::new(&n.instance_dir, APP), NoopSm)
-                .start_with_snapshots()
+                .start()
                 .expect("service attaches")
         })
         .collect();

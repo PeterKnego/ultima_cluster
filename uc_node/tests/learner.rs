@@ -1019,7 +1019,7 @@ fn start_helper_sum_service(dir: &Path, app: &str) -> uc_service::Service<Helper
     // row freezes at the instants the leader commands.
     let cfg = uc_service::ServiceConfig::new(dir, app);
     uc_service::ServiceBuilder::new(cfg, HelperSumSm::default())
-        .start_with_snapshots()
+        .start()
         .expect("service start")
 }
 
@@ -1267,7 +1267,7 @@ fn start_sum_service(dir: &Path, app: &str) -> uc_service::Service<SumSm> {
     // instants the leader commands (`command_instant`).
     let cfg = uc_service::ServiceConfig::new(dir, app);
     uc_service::ServiceBuilder::new(cfg, SumSm::default())
-        .start_with_snapshots()
+        .start()
         .expect("service start")
 }
 
@@ -1314,7 +1314,7 @@ fn start_sum_service_row1(dir: &Path, app: &str) -> uc_service::Service<TaggedSu
     // Capable, never self-triggering (as `start_sum_service`).
     let cfg = uc_service::ServiceConfig::new(dir, app);
     uc_service::ServiceBuilder::new(cfg, TaggedSum::default())
-        .start_with_snapshots()
+        .start()
         .expect("service start")
 }
 

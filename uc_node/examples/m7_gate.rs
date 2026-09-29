@@ -157,9 +157,9 @@ struct NodeArgs {
     /// late-joining voter/learner under fleet load converges via snapshot
     /// install + tail replay instead of racing pure journal replay against an
     /// unthrottled writer (see the module doc). Default false (`Disabled`) —
-    /// unchanged behavior unless set. Only useful paired with the `service`
-    /// role's `--snapshot-interval-bytes > 0` (purge needs a real snapshot
-    /// floor to purge below).
+    /// unchanged behavior unless set. Only useful paired with a nonzero
+    /// `--snapshot-interval-bytes` cadence (purge needs a real snapshot floor
+    /// to purge below).
     #[arg(long)]
     purge_below_snapshot: bool,
     /// Journal segment size in bytes; only material with
@@ -177,13 +177,11 @@ struct ServiceArgs {
     instance_dir: PathBuf,
     #[arg(long, default_value = "m7-gate")]
     app_id: String,
-    /// M6 pairing: snapshot capability (the byte value no longer configures a
-    /// cadence — coordinated-snapshot spec §5.2). 0 (default) = off — the
-    /// service starts plain (`ServiceBuilder::start`), current behavior
-    /// unchanged. > 0 starts with `start_with_snapshots`, giving the
-    /// node a real snapshot floor to purge below and a snapshot session for
-    /// distant joiners/reconstructions to install instead of replaying the
-    /// full journal from genesis.
+    /// M6 pairing, kept so fleet drivers can pass the same number to both
+    /// roles: on the SERVICE role it is echoed in the "up" line and does
+    /// nothing else. Since #67 every service is snapshot-capable (the SDK's
+    /// one `start()`); what gives the node a real snapshot floor to purge
+    /// below is the NODE role's cadence, which commands the instants.
     #[arg(long, default_value_t = 0)]
     snapshot_interval_bytes: u64,
 }
@@ -229,7 +227,7 @@ struct LoadClientArgs {
     /// here made this gate's load ~14x lighter than M6's, which is not
     /// "under load" by M6's own bar. Kept as a flag rather than deleted
     /// outright because a fresh, un-snapshotted M7 spare's catch-up is pure
-    /// journal replay (this gate's SM has no snapshot capability) — an
+    /// journal replay (no instant commanded yet, so no artifact) — an
     /// unthrottled writer CAN outrun a distant learner's replay (a real
     /// repro hit during gate authoring). On the FLEET the guard against that
     /// race is the `promote` precondition itself (`NotCaughtUp` refusal +
@@ -423,26 +421,14 @@ fn make_config(
     }
 }
 
-/// `snapshot_interval_bytes == 0` starts the service plain (current
-/// behavior); `> 0` starts it snapshot-CAPABLE (M6 pairing — see the module
-/// doc). The same number is seeded into `make_config`'s replicated settings,
-/// where it is the cluster's snapshot CADENCE — so a capable row and a
-/// cadence that commands instants for it always arrive together.
-fn spawn_service(dir: &Path, snapshot_interval_bytes: u64) -> Service<RegSm> {
-    if snapshot_interval_bytes == 0 {
-        let cfg = ServiceConfig::new(dir, APP);
-        ServiceBuilder::new(cfg, RegSm::default())
-            .start()
-            .expect("service start")
-    } else {
-        // The byte cadence is gone (coordinated-snapshot spec §5.2): `> 0`
-        // only means "capable" here, and the leader's cadence is what
-        // commands the instants this row freezes at.
-        let cfg = ServiceConfig::new(dir, APP);
-        ServiceBuilder::new(cfg, RegSm::default())
-            .start_with_snapshots()
-            .expect("snapshot service start")
-    }
+/// Start the gate's service. Snapshot-CAPABLE whatever the flags say (#67:
+/// the SDK's one `start()`); whether it ever freezes is decided by the
+/// cadence `make_config` seeds into the replicated settings, which commands
+/// the instants (`0` = none, and the builder thread just idles).
+fn spawn_service(dir: &Path) -> Service<RegSm> {
+    ServiceBuilder::new(ServiceConfig::new(dir, APP), RegSm::default())
+        .start()
+        .expect("service start")
 }
 
 fn addr_to_wire(addr: SocketAddr) -> (u32, u16) {
@@ -508,8 +494,12 @@ fn run_service(a: ServiceArgs) -> anyhow::Result<()> {
         anyhow::ensure!(Instant::now() < deadline, "timed out waiting for {cnc:?}");
         thread::sleep(Duration::from_millis(20));
     }
-    let _svc = spawn_service(&a.instance_dir, a.snapshot_interval_bytes);
-    println!("m7_gate service up; parking (harness owns lifecycle)");
+    let _svc = spawn_service(&a.instance_dir);
+    println!(
+        "m7_gate service up (snapshot_interval_bytes={}, informational); parking (harness owns \
+         lifecycle)",
+        a.snapshot_interval_bytes
+    );
     loop {
         thread::park();
     }
@@ -1051,7 +1041,7 @@ fn run_all(a: AllArgs) -> anyhow::Result<()> {
     // (leader known, commit learned), and no node joins before a quorum is
     // up — so every node starts before any service attaches.
     for h in nodes.iter_mut() {
-        h.svc = Some(spawn_service(&h.dir, SNAPSHOT_INTERVAL_BYTES));
+        h.svc = Some(spawn_service(&h.dir));
     }
 
     let leader = await_single_leader(&nodes, 30);
@@ -1164,7 +1154,7 @@ fn scenario_replace_a_box(
         SNAPSHOT_INTERVAL_BYTES,
     );
     let node = Node::start_with_socket(cfg, sock).expect("start spare");
-    let svc = spawn_service(&dir, SNAPSHOT_INTERVAL_BYTES);
+    let svc = spawn_service(&dir);
     nodes.push(NodeH {
         id: new_id,
         dir,
@@ -1279,7 +1269,7 @@ fn scenario_resize_3_5_3(
             SNAPSHOT_INTERVAL_BYTES,
         );
         let node = Node::start_with_socket(cfg, sock).expect("start spare");
-        let svc = spawn_service(&dir, SNAPSHOT_INTERVAL_BYTES);
+        let svc = spawn_service(&dir);
         nodes.push(NodeH {
             id: spare_id,
             dir,

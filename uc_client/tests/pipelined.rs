@@ -174,7 +174,7 @@ fn pipelined_submits_all_resolve_and_totals_are_a_permutation_free_prefix() {
         ServiceConfig::new(dir.path(), "pipe-test"),
         CountSm::default(),
     )
-    .start_with_snapshots()
+    .start()
     .unwrap();
 
     let client = connect(dir.path());
@@ -198,7 +198,7 @@ fn async_await_resolves_against_a_real_cluster() {
         ServiceConfig::new(dir.path(), "pipe-test"),
         CountSm::default(),
     )
-    .start_with_snapshots()
+    .start()
     .unwrap();
 
     let client = connect(dir.path());
@@ -215,7 +215,7 @@ fn queries_ride_the_same_engine() {
         ServiceConfig::new(dir.path(), "pipe-test"),
         CountSm::default(),
     )
-    .start_with_snapshots()
+    .start()
     .unwrap();
 
     let client = connect(dir.path());
@@ -239,7 +239,7 @@ fn dropping_a_ticket_orphans_cleanly_and_later_traffic_is_unaffected() {
         ServiceConfig::new(dir.path(), "pipe-test"),
         CountSm::default(),
     )
-    .start_with_snapshots()
+    .start()
     .unwrap();
 
     let client = connect(dir.path());
@@ -355,7 +355,7 @@ fn every_wait_strategy_round_trips() {
         ServiceConfig::new(dir.path(), "pipe-test"),
         CountSm::default(),
     )
-    .start_with_snapshots()
+    .start()
     .unwrap();
 
     for ws in [

@@ -341,7 +341,7 @@ fn a_crypto_enabled_cluster_elects_replicates_and_serves_a_linearizable_read() {
 
     let leader_dir = c.dirs[leader].clone();
     let svc = ServiceBuilder::new(ServiceConfig::new(&leader_dir, APP), CountSm::default())
-        .start_with_snapshots()
+        .start()
         .unwrap();
     let client = Client::connect(&leader_dir, APP).unwrap();
 
@@ -417,7 +417,7 @@ fn a_cleartext_node_cannot_join_a_sealed_cluster() {
 
     let leader_dir = c.dirs[leader].clone();
     let svc = ServiceBuilder::new(ServiceConfig::new(&leader_dir, APP), CountSm::default())
-        .start_with_snapshots()
+        .start()
         .unwrap();
     let client = Client::connect(&leader_dir, APP).unwrap();
     for _ in 0..10 {
@@ -536,7 +536,7 @@ fn a_cluster_forms_even_when_one_member_never_comes_up() {
     let leader = await_single_leader(&nodes, &[0, 1], 60);
     let leader_dir = dirs[leader].clone();
     let svc = ServiceBuilder::new(ServiceConfig::new(&leader_dir, APP), CountSm::default())
-        .start_with_snapshots()
+        .start()
         .unwrap();
     let client = Client::connect(&leader_dir, APP).unwrap();
     for i in 1..=5u64 {

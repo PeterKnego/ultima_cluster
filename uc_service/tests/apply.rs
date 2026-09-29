@@ -178,7 +178,7 @@ fn service_applies_committed_frames_and_publishes_responses() {
         ServiceConfig::new(dir.path(), "svc-test"),
         CountSm::default(),
     )
-    .start_with_snapshots()
+    .start()
     .unwrap();
 
     // 100 submits through the real ingress ring, client identity (13, 1..=100).
@@ -240,7 +240,7 @@ fn egress_frame_layout_is_byte_pinned() {
         .unwrap()
         .subscribe();
     let svc = ServiceBuilder::new(ServiceConfig::new(dir.path(), "layout"), CountSm::default())
-        .start_with_snapshots()
+        .start()
         .unwrap();
 
     let prod = open_ingress(dir.path());
@@ -342,7 +342,7 @@ fn timer_frame_is_delivered_to_the_named_fsm_only_and_responses_carry_time() {
         ServiceConfig::new(dir.path(), "svc-test"),
         TimerCountSm::default(),
     )
-    .start_with_snapshots()
+    .start()
     .unwrap();
     let hash = <TimerCountSm as RawStateMachine>::IDENTITY.hash();
     node.append_timer_for_test(TimerBody {

@@ -512,11 +512,11 @@ pub const REASON_SETTINGS_BOUNDS: u32 = 47;
 // ---- Plan 2: `uc2ctl snapshot` refusal reasons (coordinated-snapshot §5.5) --
 // Wire `reason` codes on a refused (`status = 1`) [`ADMIN_OP_SNAPSHOT`].
 /// A declared row's cnc slot does not carry `CNC_SVC_STATUS_SNAPSHOT_CAPABLE`
-/// — the service attached there was started with `start()` rather than
-/// `start_with_snapshots()`, so it will never act on a `SNAPSHOT` frame and
-/// the set at P can never be complete. Such a cluster is legitimate (purge is
-/// off by default) and simply never snapshots; the operator is TOLD rather
-/// than left with a floor that never moves. The audit record's `detail` names
+/// — the service attached there did not declare snapshot support, so it will
+/// never act on a `SNAPSHOT` frame and the set at P can never be complete.
+/// Every SDK `start()` declares it since #67, so only a non-SDK attacher
+/// reaches this; the operator is TOLD rather than left with a floor that
+/// never moves. The audit record's `detail` names
 /// the first such row.
 pub const REASON_SNAPSHOT_UNSUPPORTED: u32 = 48;
 /// A `--standby` instant was commanded on a cluster whose committed
@@ -6066,7 +6066,7 @@ impl Consensus {
     ///    pass over eight cnc slots to say "not yet".
     /// 3. **Capability.** Every DECLARED row's slot must carry
     ///    `CNC_SVC_STATUS_SNAPSHOT_CAPABLE`; the first that does not is named
-    ///    (`48`). A row started with plain `start()` ignores the frame, so
+    ///    (`48`). A row without the bit (a non-SDK attacher since #67) ignores the frame, so
     ///    the set at P could never complete and the floor would never move —
     ///    the operator is told rather than left watching a stalled floor.
     /// 4. **A standby instant needs a learner** (`49`): only a learner
@@ -11828,7 +11828,7 @@ mod tests {
         }
 
         /// Coordinated-snapshot spec §5.2/§5.7: stand in for a service that
-        /// was started with `start_with_snapshots()` — the capability bit is
+        /// was started with the SDK's `start()` — the capability bit is
         /// SERVICE-written into its slot's status word at attach.
         fn mark_capable(&self, row: u8) {
             let slot = self.cons.cnc.service_slot(row as usize);
@@ -12536,7 +12536,7 @@ mod tests {
         let e = h
             .cons
             .command_snapshot(false)
-            .expect_err("row 0 was started with plain start()");
+            .expect_err("row 0 never declared the capability bit");
         assert_eq!(e.code(), REASON_SNAPSHOT_UNSUPPORTED);
         assert_eq!(
             e,

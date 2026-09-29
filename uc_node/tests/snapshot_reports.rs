@@ -408,7 +408,7 @@ impl uc_service::SnapshotStateMachine for DivergentSum {
 /// leader commands.
 fn start_sum_service(dir: &Path) -> uc_service::Service<SumSm> {
     uc_service::ServiceBuilder::new(uc_service::ServiceConfig::new(dir, APP), SumSm::default())
-        .start_with_snapshots()
+        .start()
         .expect("service start")
 }
 
@@ -417,7 +417,7 @@ fn start_divergent_service(dir: &Path, node_id: u64) -> uc_service::Service<Dive
         uc_service::ServiceConfig::new(dir, APP),
         DivergentSum::new(node_id),
     )
-    .start_with_snapshots()
+    .start()
     .expect("service start")
 }
 
