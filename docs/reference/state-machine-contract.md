@@ -147,14 +147,97 @@ Full semantics, the ordering guarantee, and the failure-mode table:
 (the table specifically:
 [The schedule table](../notes/uc2-log-time-and-timers-explained.md#the-schedule-table)).
 
-## Snapshots: the instant, the envelope, and the exclusive frontier
+## Snapshots: required, the instant, the envelope, and the exclusive frontier
 
-Snapshotting is opt-in: implement `SnapshotStateMachine` alongside your tier
-and start the service with `start_with_snapshots()` rather than `start()`.
-That is what sets the row's **snapshot-capability bit** on the cnc page, and
-`uc2ctl snapshot` refuses `48 snapshot_unsupported` naming any declared row
-that lacks it — a row started with plain `start()` would ignore the frame, so
-the set could never complete and the purge floor would never move.
+**Snapshot support is required (#67).** `ServiceBuilder::start()` takes one
+bound, `S: SnapshotStateMachine`, and there is no snapshot-less start any
+more — `start_with_snapshots()` is gone, along with the body that used to run
+without a snapshot handle. A row that cannot snapshot cannot purge its
+journal in reasonable time and cannot honour an upgrade pin (every version
+change is a pin, and a pin needs the origin artifact); the SDK makes that a
+compile error instead of a production surprise. `start()` always spawns the
+snapshot builder thread now, too — it idles (sleeps between checks) until the
+log commands an instant, so an unconfigured cluster that never snapshots
+costs one builder thread per service that wakes about 1 000 times a second
+while idle, not a busy poll.
+
+There are two ways to satisfy the bound:
+
+**1. The `WholeStateSnapshot` helper**, for any FSM whose whole state can be
+written to bytes. It is the easy path — encode, decode, and the SDK does the
+rest (the handle, streaming, the cursor check, the exclusive-frontier check).
+`examples/counter`'s whole implementation:
+
+```rust
+/// Snapshots are required (#67). A counter's whole state is two numbers, so
+/// the simple helper fits: encode the state, decode it back, and the SDK
+/// handles the rest. A state machine with a large state should implement
+/// `SnapshotStateMachine` itself instead — see below.
+impl uc_service::WholeStateSnapshot for CounterSm {
+    fn encode_state(&self) -> Result<Vec<u8>, uc_service::SnapshotError> {
+        bincode::serde::encode_to_vec((self.value, self.last_applied), bincode::config::standard())
+            .map_err(|e| uc_service::SnapshotError::Codec(e.to_string()))
+    }
+    fn decode_state(&mut self, bytes: &[u8]) -> Result<(), uc_service::SnapshotError> {
+        let ((value, last_applied), _): ((i64, Option<u64>), _) =
+            bincode::serde::decode_from_slice(bytes, bincode::config::standard())
+                .map_err(|e| uc_service::SnapshotError::Codec(e.to_string()))?;
+        self.value = value;
+        self.last_applied = last_applied;
+        Ok(())
+    }
+}
+```
+
+`encode_state`/`decode_state` are codec-neutral — bincode here, any codec
+elsewhere — `uc_service` itself imports none for the helper. The blanket
+`impl<S: WholeStateSnapshot> SnapshotStateMachine for S` in
+`uc_service/src/snapshots.rs` frames your bytes as `cursor_present: u8 ‖
+cursor: u64 LE ‖ app bytes`, inside the unchanged `ULTSNAP2` envelope
+described below. That blanket impl already owns `SnapshotStateMachine::project`,
+so a helper FSM cannot override `project` itself (E0119); to take part in
+`uc2-diffreplay`, override `WholeStateSnapshot::project_state` instead — the
+blanket `project()` forwards to it.
+
+**Cost.** `encode_state` runs as `freeze`, on the apply thread with the SM
+lock held, so *every* snapshot instant pauses that row's apply for as long as
+encoding takes — proportional to state size. For state where that pause
+matters, you have two ways out: implement `SnapshotStateMachine` directly
+(item 2, below) so `freeze` pins a persistent structure in O(1) and the
+O(state) work moves into `stream_snapshot`, off the apply thread; or take
+snapshots as
+**standby instants on a learner** (`uc2ctl snapshot --standby`,
+[Upgrade an application](../how-to/upgrade-an-application.md#2-take-the-origin-one-coordinated-instant-p))
+so no voter ever pauses.
+
+**Determinism.** `encode_state` must turn equal states into equal bytes —
+replicas' artifact hashes are compared live (`SnapshotReport`, see below).
+Never serialize a `HashMap`'s iteration order directly; serialize from an
+ordered structure, or sort before you write.
+
+**The cursor check.** `decode_state` must restore the state's own
+`last_applied`, encoded alongside the rest of the state — the helper records
+the cursor at `freeze` and, on install, refuses to proceed unless
+`self.last_applied()` afterwards equals what it recorded:
+`SnapshotError::Codec("decode_state did not restore last_applied (encode it
+with the state)")`. A lost cursor would make the apply loop re-apply frames
+the snapshot already contains — a silent double-apply — so the SDK makes it a
+named error instead. A recorded cursor *above* the install's tag is refused
+too, with `SnapshotError::Codec("mis-tagged: cursor above tag")` (the tag is
+an exclusive frontier — see below — so the cursor may sit at or below it,
+never above).
+
+**2. The full `SnapshotStateMachine` trait**, for large state or a
+copy-on-write / persistent-structure implementation where the helper's whole-
+state copy is too expensive. Implement `freeze`/`stream_snapshot`/
+`install_snapshot` yourself: `uc_lincheck`'s `RegisterSm`/`ListAppendSm` are
+small worked examples, and the exclusive-frontier and mis-tag rules below
+apply to a hand-written implementation exactly as they do to the helper.
+
+Whichever route you take, `uc2ctl snapshot` refuses `48 snapshot_unsupported`
+naming any declared row that lacks the capability bit — with the SDK this can
+no longer happen for a Rust service (every `start()` sets it), so in practice
+it is the node's backstop for a row attached without the Rust SDK.
 
 **When `freeze()` is called is no longer your decision** (2.11.0). The
 per-service `SnapshotPolicy { interval_bytes }` is **retired**: a snapshot is
@@ -231,14 +314,12 @@ only the gap guard acted on could leave such an SM stuck on its own history.
 origin, from, to }` / `Contended`) BEFORE publishing anything to the slot,
 and — when `to == S::VERSION` — installs `snap-<origin>` **unconditionally**,
 overriding whatever the state machine's own `last_applied()` says. `attach`
-takes the install capability from
-[`ServiceBuilder::start_with_snapshots`](../../uc_service/src/lib.rs); a
-pinned row started with plain `start()` has no install closure to run and is
-refused, by name, rather than silently tail-replaying the origin's prefix
-under this binary (the §2.3 counterfactual). The gap guard's own expected
-version is the pin's `from` **only for the artifact at the pinned origin
-itself** — a pinned row's gap guard prefers that one artifact over a newer
-one `from` left behind, for the same "sanctioned crossing" reason.
+takes the install capability from `S: SnapshotStateMachine`, which every
+[`ServiceBuilder::start`](../../uc_service/src/lib.rs) carries since #67. The
+gap guard's own expected version is the pin's `from` **only for the artifact
+at the pinned origin itself** — a pinned row's gap guard prefers that one
+artifact over a newer one `from` left behind, for the same "sanctioned
+crossing" reason.
 
 Four refusals guard this path, all named, none silent: `PinnedVersionMismatch`
 (a stale binary — one not on the pin's `to` line; a patch build of `to` is
@@ -247,10 +328,14 @@ pin: the whole point of pinning), `PinUnreadable` (the pin words could not be
 read consistently through the seqlock — `Contended` fails CLOSED, never
 treated as "no pin", because attaching unpinned off a half-published triple
 would skip an install the cluster requires), `PinRequiresSnapshots` (a pinned
-row started with `start()`, above), and `PinnedArtifactMissing` (the pin
-names an origin whose artifact is not on this node — the complete set at that
-instant was pruned or never fetched; there is no sound fallback, since a
-different artifact is a different instant and genesis is the counterfactual).
+row attached without the install capability — since #67 every `start()`
+carries it, so the SDK can no longer produce this; it stays as `attach`'s
+backstop for a service attached without the current Rust SDK (a non-Rust attacher, or a binary built before #67), which would otherwise replay the
+origin's prefix under this binary instead — the §2.3 counterfactual), and
+`PinnedArtifactMissing` (the pin names an origin whose artifact is not on
+this node — the complete set at that instant was pruned or never fetched;
+there is no sound fallback, since a different artifact is a different
+instant and genesis is the counterfactual).
 
 **Your `freeze`/`stream_snapshot` determinism is now CHECKED, live** (2.13.0).
 As the builder thread streams an artifact it hashes the payload bytes going
@@ -284,15 +369,15 @@ and [§ Pins and reports](../notes/uc2-cluster-fsm-explained.md#pins-and-reports
 
 ## Attaching: the node must have joined its cluster first
 
-`ServiceBuilder::start()` / `start_with_snapshots()` attach to a running
-node's shared memory. Since `2.13.0` that attach is **gated**: the node does
-not publish its declared set — the word the attach door reads — at
+`ServiceBuilder::start()` attaches to a running node's shared memory. Since
+`2.13.0` that attach is **gated**: the node does not publish its declared
+set — the word the attach door reads — at
 `Node::start`. It publishes it from the consensus pass, on the first pass
 where it knows a leader, has learned a commit position, and its cluster FSM
 has consumed the log up to that commit. In one line: *the node has joined its
 cluster and applied every committed `CLUSTER` frame, upgrade pins included.*
 
-Until then `start*` gets `ServiceError::NodeBooting` — "this node has not
+Until then `start()` gets `ServiceError::NodeBooting` — "this node has not
 joined its cluster yet", **not** "its page is missing or half-written". The
 builder waits it out for you, re-reading every 20 ms, bounded by
 **`ServiceConfig::boot_wait`** (default **10 s**; `Duration::ZERO` disables

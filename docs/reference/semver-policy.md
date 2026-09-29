@@ -502,6 +502,19 @@ maintainer decision for one release, recorded here so it is not mistaken
 for a change to the rule above. The next breaking change is `3.0.0` unless
 the maintainer says otherwise again, at the time.
 
+### Snapshots become mandatory (#67)
+
+Mandatory snapshots (spec `docs/superpowers/specs/2026-09-28-uc2-mandatory-snapshots-design.md`,
+D1/D2) rides the **same no-external-users carve-out** as FSM identity above,
+for the next release past `2.13.0`. `ServiceBuilder::start()` now requires
+`S: SnapshotStateMachine`, and `start_with_snapshots()` — the previous
+opt-in, listed above under `2.11.0`'s FSM identity break — is **removed
+outright**, with no deprecation shim. Under the rule at the top of this
+section, removing a public method is a breaking change; it ships as a minor
+for the same one-maintainer-decision reason as every prior carve-out on this
+line. The new `WholeStateSnapshot` helper trait (`uc_service::snapshots`) is
+additive — see [the state-machine contract § Snapshots](state-machine-contract.md#snapshots-required-the-instant-the-envelope-and-the-exclusive-frontier).
+
 ## Related
 
 - [Cut a release](../how-to/cut-a-release.md) — the lockstep bump, the tag,

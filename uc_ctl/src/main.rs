@@ -686,7 +686,7 @@ fn reason_str(reason: u32) -> &'static str {
         // `ADMIN_OP_SNAPSHOT_FETCH` (wire ops 8/9) refusal reasons —
         // `uc_node::REASON_SNAPSHOT_*` (`uc_node::node`).
         48 => {
-            "snapshot_unsupported (a declared row lacks the snapshot capability bit — it was started with plain start() rather than start_with_snapshots(); the audit detail names the row)"
+            "snapshot_unsupported (a declared row lacks the snapshot capability bit: its service was attached without the current Rust SDK, a non-Rust attacher or a binary built before #67; every SDK start() declares it; the audit detail names the row)"
         }
         49 => {
             "snapshot_no_learner (--standby with no learner in the committed membership — only a learner freezes for a standby instant)"

@@ -253,7 +253,7 @@ impl Cluster {
         let cfg = uc_service::ServiceConfig::new(&self.dirs[i], &self.app);
         Attempt {
             node: i,
-            result: uc_service::ServiceBuilder::new(cfg, S::default()).start_with_snapshots(),
+            result: uc_service::ServiceBuilder::new(cfg, S::default()).start(),
         }
     }
 

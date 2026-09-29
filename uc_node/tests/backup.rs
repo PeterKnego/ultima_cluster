@@ -867,6 +867,20 @@ impl StateMachine for RestoreCountSm {
         self.last_applied
     }
 }
+impl uc_service::WholeStateSnapshot for RestoreCountSm {
+    fn encode_state(&self) -> Result<Vec<u8>, uc_service::SnapshotError> {
+        bincode::serde::encode_to_vec((self.total, self.last_applied), bincode::config::standard())
+            .map_err(|e| uc_service::SnapshotError::Codec(e.to_string()))
+    }
+    fn decode_state(&mut self, bytes: &[u8]) -> Result<(), uc_service::SnapshotError> {
+        let ((total, last_applied), _): ((u64, Option<u64>), usize) =
+            bincode::serde::decode_from_slice(bytes, bincode::config::standard())
+                .map_err(|e| uc_service::SnapshotError::Codec(e.to_string()))?;
+        self.total = total;
+        self.last_applied = last_applied;
+        Ok(())
+    }
+}
 
 /// End-to-end: back up a stopped single node's instance dir, restore the
 /// artifact into a FRESH instance dir, boot a node + service there, and
@@ -1229,13 +1243,13 @@ fn two_fsm_purged_node(
     // nothing on their own: the 32 KiB byte cadence is deleted, so the purge
     // this helper waits for follows the instant commanded below.
     let s0 = ServiceBuilder::new(ServiceConfig::new(dir, app), RegisterSm::default())
-        .start_with_snapshots()
+        .start()
         .expect("snapshot service 0");
     let s1 = ServiceBuilder::new(
         ServiceConfig::new(dir, app),
         Tagged::<1, RegisterSm>::default(),
     )
-    .start_with_snapshots()
+    .start()
     .expect("snapshot service 1");
     let client = Client::connect(dir, app).expect("client");
     let mut v = 0u64;
@@ -1313,13 +1327,13 @@ fn restore_roundtrip_with_two_fsms_keeps_both_snapshot_trees() {
     let rnode = Node::start(cfg).expect("restored node");
     wait_until("restored serving", || rnode.can_serve());
     let rs0 = ServiceBuilder::new(ServiceConfig::new(&fresh, app), RegisterSm::default())
-        .start_with_snapshots()
+        .start()
         .expect("restored svc 0");
     let rs1 = ServiceBuilder::new(
         ServiceConfig::new(&fresh, app),
         Tagged::<1, RegisterSm>::default(),
     )
-    .start_with_snapshots()
+    .start()
     .expect("restored svc 1");
     let client = Client::connect(&fresh, app).expect("client");
     let got: Option<u64> = client.query_linearizable(&()).expect("read");

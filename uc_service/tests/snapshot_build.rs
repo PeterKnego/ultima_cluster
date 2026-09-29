@@ -3,7 +3,7 @@
 
 //! M6 Task 3 capstone, as re-pointed by coordinated-snapshot plan 2 Task 3: a
 //! single node + a snapshot-capable service (`uc_lincheck`'s `RegisterSm`,
-//! feature `v2`) started via `start_with_snapshots` builds position-tagged
+//! feature `v2`) started via `start` builds position-tagged
 //! on-disk snapshot files **at the instants the LOG names** — a
 //! `FRAME_TYPE_SNAPSHOT` frame, spec §5.2, in place of the deleted M6 byte
 //! interval — and publishes the artifact's position onto
@@ -110,7 +110,7 @@ fn builder_publishes_position_tagged_snapshot_and_cnc_marker() {
         ServiceConfig::new(dir.path(), "snapb"),
         RegisterSm::default(),
     )
-    .start_with_snapshots()
+    .start()
     .unwrap();
     let client = Client::connect(dir.path(), "snapb").unwrap();
     for i in 0..400u64 {
@@ -173,7 +173,7 @@ fn builder_publishes_position_tagged_snapshot_and_cnc_marker() {
     node.stop();
 }
 
-/// An UNCOMMANDED cluster never snapshots: `start_with_snapshots` spawns the
+/// An UNCOMMANDED cluster never snapshots: `start` spawns the
 /// builder thread machinery, but with no `SNAPSHOT` frame on the log it never
 /// trips — no file is written and the cnc marker stays `0`, even under real
 /// commit traffic. Pins "no snapshots, no marker, no purge" as the observable
@@ -189,7 +189,7 @@ fn a_service_never_commanded_an_instant_never_builds_a_snapshot() {
         ServiceConfig::new(dir.path(), "snapdef"),
         RegisterSm::default(),
     )
-    .start_with_snapshots()
+    .start()
     .unwrap();
     let client = Client::connect(dir.path(), "snapdef").unwrap();
     for i in 0..200u64 {

@@ -557,6 +557,20 @@ impl StateMachine for ProfileSm {
         self.last_applied
     }
 }
+impl uc_service::WholeStateSnapshot for ProfileSm {
+    fn encode_state(&self) -> Result<Vec<u8>, uc_service::SnapshotError> {
+        bincode::serde::encode_to_vec((self.count, self.last_applied), bincode::config::standard())
+            .map_err(|e| uc_service::SnapshotError::Codec(e.to_string()))
+    }
+    fn decode_state(&mut self, bytes: &[u8]) -> Result<(), uc_service::SnapshotError> {
+        let ((count, last_applied), _): ((u64, Option<u64>), usize) =
+            bincode::serde::decode_from_slice(bytes, bincode::config::standard())
+                .map_err(|e| uc_service::SnapshotError::Codec(e.to_string()))?;
+        self.count = count;
+        self.last_applied = last_applied;
+        Ok(())
+    }
+}
 
 /// Sandbox safety cap (m1–m5 pattern): clip `requested` to the env var when set
 /// and nonzero; unset/zero is a no-op (the fleet's mode).

@@ -11,7 +11,10 @@ use serde::{Deserialize, Serialize};
 use uc_client::Client;
 use uc_log::cnc::CncPage;
 use uc_node::{CryptoConfig, FsmLag, Node, NodeConfig, PurgePolicy, ServicesConfig};
-use uc_service::{ApplyCtx, ServiceBuilder, ServiceConfig, StateMachine, Tagged};
+use uc_service::{
+    ApplyCtx, ServiceBuilder, ServiceConfig, SnapshotStateMachine, StateMachine, Tagged,
+    WholeStateSnapshot,
+};
 
 pub const APP: &str = "m14-services";
 
@@ -252,8 +255,24 @@ impl StateMachine for CountSm {
         self.last
     }
 }
+impl uc_service::WholeStateSnapshot for CountSm {
+    fn encode_state(&self) -> Result<Vec<u8>, uc_service::SnapshotError> {
+        bincode::serde::encode_to_vec((self.total, self.last), bincode::config::standard())
+            .map_err(|e| uc_service::SnapshotError::Codec(e.to_string()))
+    }
+    fn decode_state(&mut self, bytes: &[u8]) -> Result<(), uc_service::SnapshotError> {
+        let ((total, last), _): ((u64, Option<u64>), usize) =
+            bincode::serde::decode_from_slice(bytes, bincode::config::standard())
+                .map_err(|e| uc_service::SnapshotError::Codec(e.to_string()))?;
+        self.total = total;
+        self.last = last;
+        Ok(())
+    }
+}
 
-pub fn start_service<S: StateMachine + Default>(dir: &Path) -> uc_service::Service<S> {
+pub fn start_service<S: StateMachine + SnapshotStateMachine + Default>(
+    dir: &Path,
+) -> uc_service::Service<S> {
     match ServiceBuilder::new(ServiceConfig::new(dir, APP), S::default()).start() {
         Ok(service) => service,
         // `NodeBooting` means the node never published its declared set
@@ -479,6 +498,14 @@ fn attach_writes_the_declared_version_into_the_slot() {
             self.0.last_applied()
         }
     }
+    impl WholeStateSnapshot for V {
+        fn encode_state(&self) -> Result<Vec<u8>, uc_service::SnapshotError> {
+            self.0.encode_state()
+        }
+        fn decode_state(&mut self, bytes: &[u8]) -> Result<(), uc_service::SnapshotError> {
+            self.0.decode_state(bytes)
+        }
+    }
     let _g = serialize();
     let dir = tempdir();
     let node = Node::start(config(dir.path(), names(&["count"], None))).unwrap();
@@ -553,6 +580,14 @@ impl StateMachine for SlowCountSm {
     }
     fn last_applied(&self) -> Option<u64> {
         self.0.last_applied()
+    }
+}
+impl uc_service::WholeStateSnapshot for SlowCountSm {
+    fn encode_state(&self) -> Result<Vec<u8>, uc_service::SnapshotError> {
+        self.0.encode_state()
+    }
+    fn decode_state(&mut self, bytes: &[u8]) -> Result<(), uc_service::SnapshotError> {
+        self.0.decode_state(bytes)
     }
 }
 

@@ -16,6 +16,9 @@
 //!    sequence of observed totals must still be strictly increasing
 //!    (monotone) between successive submits.
 
+#[macro_use]
+mod common;
+
 use std::net::SocketAddr;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -64,6 +67,9 @@ impl StateMachine for CountSm {
         self.last_applied
     }
 }
+
+// #67 Task 2: every row this file attaches must be snapshot-capable.
+impl_count_sm_snapshot!(CountSm);
 
 fn node_config(dir: &Path, app_id: &str) -> NodeConfig {
     let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();

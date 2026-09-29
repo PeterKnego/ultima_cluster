@@ -12,6 +12,9 @@
 //! committed position ever SKIPPED (`is_contiguous_positions`, walked against
 //! the journal via `TailReader`).
 
+#[macro_use]
+mod common;
+
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -74,6 +77,9 @@ impl StateMachine for CountSm {
         self.last_applied
     }
 }
+
+// #67 Task 2: every row this file attaches must be snapshot-capable.
+impl_count_sm_snapshot!(CountSm);
 
 // --------------------------------------------------------------- the handler
 

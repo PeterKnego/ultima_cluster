@@ -255,10 +255,11 @@ day**. The same doc measured a restart replaying **11 858 320 commands in
 commands, which takes **about 7.5 days** to replay — for each upgrade, on
 every node, with the row down the whole time. A row without snapshots cannot
 purge its log or rebuild in reasonable time either, so it is not something
-to build an upgrade path for. Snapshot support becomes mandatory for every
-row instead ([#67](https://github.com/PeterKnego/ultima_cluster/issues/67)).
-Until then, a row that cannot snapshot cannot change version once it has
-one; the upgrade how-to says so.
+to build an upgrade path for. **#67 (2026-09-28) closed this gap**: snapshot
+support is now mandatory for every row, enforced at compile time
+(`ServiceBuilder::start()` requires `S: SnapshotStateMachine`, either
+directly or through the `WholeStateSnapshot` helper) — there is no row left
+that cannot snapshot, and so no row left that cannot change version.
 
 Rollback is also just a pin — to the older version, at a newer origin. It is
 sound for the same reason every pin is. Whether it is *possible* depends on

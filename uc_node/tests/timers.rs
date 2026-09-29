@@ -59,8 +59,8 @@ use uc_protocol::v2::schedule::{
     ScheduleEntry, ScheduleRule, ScheduleTable, encode_schedule_table,
 };
 use uc_service::{
-    ApplyCtx, RawStateMachine, Service, ServiceBuilder, ServiceConfig, StateMachine, Timed,
-    TimerEvent,
+    ApplyCtx, RawStateMachine, Service, ServiceBuilder, ServiceConfig, SnapshotStateMachine,
+    StateMachine, Timed, TimerEvent,
 };
 /// The §4.3 ordering oracle, over frames a REAL node appended (plan 2 T10).
 /// `uc_sim` is a dev-dependency of `uc_node` for exactly this — see the
@@ -140,7 +140,7 @@ fn open_cnc(dir: &Path) -> std::sync::Arc<CncPage> {
 /// `services.rs::start_service`, but for an already-constructed state machine
 /// (`Timed<ClockSm>` has no `Default`, and wrapping is the point here) and for
 /// the raw tier (`Timed<S>` implements `RawStateMachine`, not `StateMachine`).
-fn start_service_with<S: RawStateMachine>(dir: &Path, sm: S) -> Service<S> {
+fn start_service_with<S: RawStateMachine + SnapshotStateMachine>(dir: &Path, sm: S) -> Service<S> {
     ServiceBuilder::new(ServiceConfig::new(dir, APP), sm)
         .start()
         .expect("service start")
@@ -1342,12 +1342,12 @@ fn capstone_config(
 /// what puts the joiner below it.
 fn start_snapshot_service(dir: &Path) -> Service<Timed<ClockSm>> {
     // The byte cadence is deleted (coordinated-snapshot spec §5.2): this row
-    // is snapshot-CAPABLE (the bit `start_with_snapshots` sets) but builds
+    // is snapshot-CAPABLE (the bit `start` sets) but builds
     // nothing until the leader commands an instant. `command_instant` below
     // is what moves the floor the capstone needs.
     let cfg = ServiceConfig::new(dir, APP);
     ServiceBuilder::new(cfg, Timed::new(ClockSm::default()))
-        .start_with_snapshots()
+        .start()
         .expect("service start")
 }
 
@@ -1904,7 +1904,7 @@ impl uc_service::SnapshotStateMachine for SumSm {
 
 fn start_sum_service(dir: &Path) -> Service<SumSm> {
     ServiceBuilder::new(ServiceConfig::new(dir, APP), SumSm::default())
-        .start_with_snapshots()
+        .start()
         .expect("row 1 service start")
 }
 

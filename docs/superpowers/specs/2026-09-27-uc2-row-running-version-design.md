@@ -114,6 +114,14 @@ cites the commit that settled it.
   `Uc2ServiceVersionDrift` was also moved to compare lines (major.minor),
   filtering the `0` sentinel before the floor. (`389e40d`, `2d38335`,
   `0af2f16`)
+- **#67 (2026-09-28) made snapshot support a compile-time requirement; the
+  genesis-pin rejection (§3.1) stands.** `ServiceBuilder::start()` now
+  requires `S: SnapshotStateMachine` (directly, or via the new
+  `WholeStateSnapshot` helper) and `start_with_snapshots()` is removed, so
+  there is no longer a row an SDK service can build without snapshot
+  support. D6's premise — "no genesis pin for rows that cannot snapshot" —
+  was written before that was enforced; it is unaffected, since a row that
+  cannot snapshot no longer exists to need one. (`6c99896`)
 
 ## 1. Problem
 

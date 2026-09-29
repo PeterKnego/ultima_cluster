@@ -15,6 +15,9 @@
 //!    This pins the task14 TOCTOU close in v2 shape: the service refuses a read
 //!    routed for a superseded incarnation.
 
+#[macro_use]
+mod common;
+
 use std::net::SocketAddr;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -69,6 +72,9 @@ impl StateMachine for CountSm {
         self.last_applied
     }
 }
+
+// #67 Task 2: every row this file attaches must be snapshot-capable.
+impl_count_sm_snapshot!(CountSm);
 
 // --------------------------------------------------------------------- harness
 

@@ -74,6 +74,7 @@ pub use crate::ids::IdGen;
 pub use crate::session::{
     SESSION_HEADER_LEN, SessionConfig, Sessioned, TAG_EXPIRED, TAG_FRESH, TAG_REPLAYED,
 };
+pub use crate::snapshots::WholeStateSnapshot;
 pub use crate::tagged::Tagged;
 pub use crate::timed::Timed;
 pub use crate::traits::{
@@ -104,8 +105,9 @@ const APPLY_IDLE: IdleStrategy = IdleStrategy::Backoff {
 };
 /// The snapshot builder's idle: the plain sleep. It is a background agent
 /// whose work arrives at snapshot instants, not per frame, so the ladder's
-/// awake window would buy it nothing and cost a core after every build.
-const BUILDER_IDLE: IdleStrategy = IdleStrategy::Sleep(Duration::from_micros(50));
+/// awake window would buy it nothing and cost a core after every build. One
+/// builder thread per service wakes about 1 000 times a second while idle.
+const BUILDER_IDLE: IdleStrategy = IdleStrategy::Sleep(Duration::from_millis(1));
 
 /// The apply agent's idle strategy from `UC2_APPLY_IDLE`, or [`APPLY_IDLE`]
 /// when unset. Accepted values: `backoff` (the default ladder, spelled out),
@@ -207,23 +209,88 @@ impl<S: RawStateMachine, O: RawOutputHandler<S>> ServiceBuilder<S, O> {
     }
 
     /// Attach and spawn the agent threads (sync). Steps 1–5 run the attach
-    /// discipline; step 6 spawns the apply thread (and, for a real handler,
-    /// the output thread — Task 12) here.
-    pub fn start(self) -> Result<Service<S>, ServiceError> {
+    /// discipline; step 6 spawns the apply thread, the snapshot builder thread
+    /// and, for a real handler, the output thread (Task 12).
+    ///
+    /// **Snapshot support is required (#67).** `S` must implement
+    /// [`SnapshotStateMachine`], either directly (streaming, copy-on-write, or
+    /// any encoding the service owns) or through [`WholeStateSnapshot`], the
+    /// codec-neutral helper that encodes the whole state as one blob and has
+    /// the SDK check the restored cursor. There is no snapshot-less start: a
+    /// row that cannot install a snapshot cannot rejoin a purged cluster or
+    /// honour an upgrade pin. `start` always spawns the snapshot builder
+    /// thread, which idles until the log commands an instant.
+    ///
+    /// Coordinated-snapshot spec §5.2: this is also where the row declares
+    /// itself snapshot-CAPABLE (`CNC_SVC_STATUS_SNAPSHOT_CAPABLE` in its slot
+    /// status, written by `attach` in the same store as the attached bit).
+    /// The leader refuses to command an instant while any declared row lacks
+    /// that bit (refusal 48), which a service attached without the current Rust SDK
+    /// (a non-Rust attacher, or a binary built before #67) can still trigger.
+    ///
+    /// A state machine without snapshot support does not start (#67):
+    ///
+    /// ```compile_fail
+    /// use uc_service::{ApplyCtx, RawStateMachine, ServiceBuilder, ServiceConfig};
+    /// #[derive(Default)]
+    /// struct NoSnap;
+    /// impl RawStateMachine for NoSnap {
+    ///     const NAME: &'static str = "nosnap";
+    ///     fn apply(&mut self, _c: &mut ApplyCtx, _cmd: &[u8], out: &mut Vec<u8>) { out.clear(); }
+    ///     fn query(&self, _q: &[u8], out: &mut Vec<u8>) { out.clear(); }
+    ///     fn last_applied(&self) -> Option<u64> { None }
+    /// }
+    /// let _ = ServiceBuilder::new(ServiceConfig::new("/nonexistent", "a"), NoSnap).start();
+    /// ```
+    ///
+    /// The same state machine with [`WholeStateSnapshot`] does — this twin is
+    /// what proves the `compile_fail` above fails on the snapshot bound and
+    /// nothing else:
+    ///
+    /// ```no_run
+    /// use uc_service::{
+    ///     ApplyCtx, RawStateMachine, ServiceBuilder, ServiceConfig, SnapshotError,
+    ///     WholeStateSnapshot,
+    /// };
+    /// #[derive(Default)]
+    /// struct NoSnap;
+    /// impl RawStateMachine for NoSnap {
+    ///     const NAME: &'static str = "nosnap";
+    ///     fn apply(&mut self, _c: &mut ApplyCtx, _cmd: &[u8], out: &mut Vec<u8>) { out.clear(); }
+    ///     fn query(&self, _q: &[u8], out: &mut Vec<u8>) { out.clear(); }
+    ///     fn last_applied(&self) -> Option<u64> { None }
+    /// }
+    /// impl WholeStateSnapshot for NoSnap {
+    ///     fn encode_state(&self) -> Result<Vec<u8>, SnapshotError> { Ok(Vec::new()) }
+    ///     fn decode_state(&mut self, _b: &[u8]) -> Result<(), SnapshotError> { Ok(()) }
+    /// }
+    /// let _ = ServiceBuilder::new(ServiceConfig::new("/nonexistent", "a"), NoSnap).start();
+    /// ```
+    pub fn start(self) -> Result<Service<S>, ServiceError>
+    where
+        S: SnapshotStateMachine,
+    {
         let ServiceBuilder { cfg, sm, output } = self;
 
-        // Plan B2 T4: `None` — a plain `start()` carries no install
-        // capability, which is also what makes the row NOT snapshot-capable.
-        // A row the cluster has pinned is refused here by name
-        // (`PinRequiresSnapshots`) rather than replaying the origin's prefix
-        // under this version.
-        //
+        // M6 Task 5 / plan B2 T4: the install capability, built HERE because
+        // `S: SnapshotStateMachine` is only in scope in this method. `attach`
+        // borrows it for the pinned install (spec §3 S4 step 4) and hands the
+        // same closure back on `Attached`, where it becomes the apply
+        // thread's below-floor `SnapshotRestore` below — one closure, two
+        // install paths, no duplication.
+        let install: crate::apply::InstallFn<S> =
+            Box::new(|sm: &mut S, pos: u64, src: &mut dyn std::io::Read| {
+                sm.install_snapshot(pos, src)
+            });
         // Plan B3 T5: a node publishes its declared set only once it has
         // joined its cluster, so an attach that lands in that window is
         // `NodeBooting`. Wait it out, bounded by `cfg.boot_wait` — `attach`
         // takes `sm` by value, so the retry has to be here, ahead of it.
         attach::wait_out_node_boot(&cfg)?;
-        let attached = attach::attach(&cfg, sm, None)?;
+        let attached = attach::attach(&cfg, sm, Some(install))?;
+        let install = attached
+            .install
+            .expect("attach hands back the install capability it was given");
         let buffer = attached.buffer;
         let cnc = attached.cnc;
         let instance_id = attached.instance_id;
@@ -252,7 +319,7 @@ impl<S: RawStateMachine, O: RawOutputHandler<S>> ServiceBuilder<S, O> {
         // named too, because M12a routes a typed handler through that adapter:
         // without it the `.output_handler(NoopOutput)` case would start
         // spawning a thread that can only ever run a no-op duty cycle.
-        let mut agents = Vec::with_capacity(2);
+        let mut agents = Vec::with_capacity(3);
         if !is_noop_output::<O>() {
             // Own cursor over the SAME log buffer, seeded from the node's
             // durable output-progress marker (Task 12 module doc).
@@ -273,99 +340,6 @@ impl<S: RawStateMachine, O: RawOutputHandler<S>> ServiceBuilder<S, O> {
             // Stop order (`Service::stop`/`Drop`): output before apply — a
             // side-effect thread is lower-priority to keep running through
             // teardown than the apply thread it depends on for `state: &S`.
-            agents.push(output_agent);
-        }
-        let apply_idle = apply_idle_from_env()?;
-        let apply_agent =
-            AgentRunner::spawn("uc2-apply", apply_idle, move || apply_cycle(&mut state))?;
-        agents.push(apply_agent);
-
-        Ok(Service {
-            agents,
-            sm,
-            _cnc: cnc,
-            instance_id,
-            epoch,
-            poisoned,
-            service_id,
-            _lock: lock,
-            pinned,
-        })
-    }
-
-    /// Like [`start`](Self::start), but ALSO spawns the M6 Task 3 snapshot
-    /// builder thread — explicit opt-in for `S: SnapshotStateMachine`.
-    ///
-    /// **Controller-resolved deviation from the M6 Task 3 brief.** The brief's
-    /// implicit shape was "spawn the builder whenever the SM is capable", but
-    /// Rust cannot specialize a generic function's behavior on an *optional*
-    /// trait bound at runtime — `start`'s `S: RawStateMachine` bound alone gives
-    /// the compiler no way to conditionally call `S::freeze` only "if `S`
-    /// happens to also implement `SnapshotStateMachine`". The resolution
-    /// mirrors the existing `.output_handler(..)` opt-in pattern: a caller
-    /// whose SM implements [`SnapshotStateMachine`] but does NOT want the
-    /// builder thread (e.g. it wants to defer opting in) simply calls
-    /// [`start`](Self::start) instead — the builder thread only ever exists
-    /// because THIS method was called, never as a side effect of the SM's
-    /// capability alone.
-    ///
-    /// Coordinated-snapshot spec §5.2: this is also where the row declares
-    /// itself snapshot-CAPABLE (`CNC_SVC_STATUS_SNAPSHOT_CAPABLE` in its slot
-    /// status, written by `attach` in the same store as the attached bit).
-    /// The leader refuses to command an instant while any declared row lacks
-    /// that bit, so a cluster holding a `start()`-ed row is told, rather than
-    /// left with a floor that never moves.
-    pub fn start_with_snapshots(self) -> Result<Service<S>, ServiceError>
-    where
-        S: SnapshotStateMachine,
-    {
-        let ServiceBuilder { cfg, sm, output } = self;
-
-        // M6 Task 5 / plan B2 T4: the install capability, built HERE because
-        // `S: SnapshotStateMachine` is only in scope in this method. `attach`
-        // borrows it for the pinned install (spec §3 S4 step 4) and hands the
-        // same closure back on `Attached`, where it becomes the apply
-        // thread's below-floor `SnapshotRestore` below — one closure, two
-        // install paths, no duplication.
-        let install: crate::apply::InstallFn<S> =
-            Box::new(|sm: &mut S, pos: u64, src: &mut dyn std::io::Read| {
-                sm.install_snapshot(pos, src)
-            });
-        // Plan B3 T5: as `start` — wait out a node that has not joined yet.
-        attach::wait_out_node_boot(&cfg)?;
-        let attached = attach::attach(&cfg, sm, Some(install))?;
-        let install = attached
-            .install
-            .expect("attach hands back the install capability it was given");
-        let buffer = attached.buffer;
-        let cnc = attached.cnc;
-        let instance_id = attached.instance_id;
-        let epoch = attached.epoch;
-        let poisoned = Arc::clone(&attached.poisoned);
-        let service_id = attached.service_id;
-        let pinned = attached.pin;
-        let lock = attached._lock;
-
-        let mut state = attached.apply_state;
-        let sm = Arc::clone(&state.sm);
-        let journal_dir = state.journal_dir.clone();
-
-        let mut agents = Vec::with_capacity(3);
-        if !is_noop_output::<O>() {
-            let start_pos = cnc.status().output_progress.load_acquire();
-            let output_follower = LogFollower::new(Arc::clone(&buffer), start_pos);
-            let mut output_state = OutputState::new(
-                output_follower,
-                Arc::clone(&sm),
-                Arc::clone(&cnc),
-                output,
-                journal_dir,
-                instance_id,
-                service_id,
-            )?;
-            let output_agent = AgentRunner::spawn("uc2-output", OUTPUT_IDLE, move || {
-                output_cycle(&mut output_state)
-            })?;
             agents.push(output_agent);
         }
 

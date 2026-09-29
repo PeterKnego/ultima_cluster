@@ -303,7 +303,7 @@ impl Fixture {
         wait_until("node can serve", || node.can_serve());
 
         let svc1 = ServiceBuilder::new(cfg(dir.path(), app), RegisterSm::default())
-            .start_with_snapshots()
+            .start()
             .unwrap();
         let prod = open_ingress(dir.path());
         let mut seq = 0u32;
@@ -528,7 +528,7 @@ fn a_stale_binary_is_refused_by_name_after_the_pin() {
     f.pin(V1, V2);
 
     let err = ServiceBuilder::new(cfg(f.path(), f.app), RegisterSm::default())
-        .start_with_snapshots()
+        .start()
         .err()
         .expect("refused");
     assert!(
@@ -565,7 +565,7 @@ fn the_pinned_version_installs_the_origin_unconditionally_and_recomputes_the_tai
     f.pin(V1, V2);
 
     let svc2 = ServiceBuilder::new(cfg(f.path(), f.app), DoublingRegisterSm::default())
-        .start_with_snapshots()
+        .start()
         .unwrap();
     let cnc = f.cnc();
     wait_service_caught_up(&cnc);
@@ -628,7 +628,7 @@ fn a_pinned_attach_converges_on_a_purging_cluster() {
     f.pin(V1, V2);
 
     let svc2 = ServiceBuilder::new(cfg(f.path(), f.app), DoublingRegisterSm::default())
-        .start_with_snapshots()
+        .start()
         .unwrap();
     let cnc = f.cnc();
     wait_service_caught_up(&cnc);
@@ -660,7 +660,7 @@ fn the_same_swap_without_a_pin_computes_the_counterfactual() {
     let cnc = f.cnc();
 
     let err = ServiceBuilder::new(cfg(f.path(), f.app), DoublingRegisterSm::default())
-        .start_with_snapshots()
+        .start()
         .err()
         .expect("an unpinned off-line swap is refused at attach (#33)");
     assert!(
@@ -725,7 +725,7 @@ fn a_durable_sm_above_the_origin_is_rewound_to_it() {
 
     f.pin(V1, V2);
     let svc2 = ServiceBuilder::new(cfg(f.path(), f.app), durable)
-        .start_with_snapshots()
+        .start()
         .unwrap();
     wait_service_caught_up(&cnc);
     assert_eq!(
@@ -737,24 +737,13 @@ fn a_durable_sm_above_the_origin_is_rewound_to_it() {
     f.stop();
 }
 
-/// A pinned row MUST install, and only `start_with_snapshots` carries the
-/// capability — a plain `start()` on a pinned row is refused by name rather
-/// than silently replaying under the new version.
-#[test]
-fn a_pinned_row_started_without_snapshots_is_refused() {
-    let f = Fixture::new("pin-nosnap");
-    f.pin(V1, V2);
-
-    let err = ServiceBuilder::new(cfg(f.path(), f.app), DoublingRegisterSm::default())
-        .start()
-        .err()
-        .expect("refused");
-    assert!(
-        matches!(err, ServiceError::PinRequiresSnapshots { row: 0, .. }),
-        "{err}"
-    );
-    f.stop();
-}
+// #67 retired `a_pinned_row_started_without_snapshots_is_refused`: it
+// started a pinned row with the snapshot-less `start()`, which no longer
+// exists — every `ServiceBuilder::start()` carries the install capability, so
+// the SDK cannot produce `PinRequiresSnapshots`. The refusal is still
+// `attach`'s backstop for an attach without the capability and is covered
+// there, at unit level:
+// `attach::tests::a_pinned_row_attached_without_the_install_capability_is_refused`.
 
 /// The set at the origin was pruned or never fetched: named, with the path,
 /// instead of falling back to some other artifact or to genesis.
@@ -765,7 +754,7 @@ fn a_pinned_origin_with_no_artifact_is_refused() {
     f.pin(V1, V2);
 
     let err = ServiceBuilder::new(cfg(f.path(), f.app), DoublingRegisterSm::default())
-        .start_with_snapshots()
+        .start()
         .err()
         .expect("refused");
     assert!(
@@ -792,7 +781,7 @@ fn a_pinned_artifact_built_by_the_wrong_version_is_refused() {
     f.pin(off_line, V2);
 
     let err = ServiceBuilder::new(cfg(f.path(), f.app), DoublingRegisterSm::default())
-        .start_with_snapshots()
+        .start()
         .err()
         .expect("refused");
     assert!(
@@ -824,7 +813,7 @@ fn a_pinned_artifact_built_by_a_patch_of_from_is_installed() {
     f.pin(patch, V2);
 
     let svc2 = ServiceBuilder::new(cfg(f.path(), f.app), DoublingRegisterSm::default())
-        .start_with_snapshots()
+        .start()
         .expect("a same-line artifact installs");
     let cnc = f.cnc();
     wait_service_caught_up(&cnc);
@@ -852,7 +841,7 @@ fn a_patch_build_of_the_pinned_to_installs_the_origin() {
 
     // Off-line (V1 = 0.0.0 against the pinned 0.2.x): refused by name.
     let err = ServiceBuilder::new(cfg(f.path(), f.app), RegisterSm::default())
-        .start_with_snapshots()
+        .start()
         .err()
         .expect("an off-line build is refused");
     assert!(
@@ -870,7 +859,7 @@ fn a_patch_build_of_the_pinned_to_installs_the_origin() {
 
     // Same line, other patch: admitted, and it installs the origin.
     let svc2 = ServiceBuilder::new(cfg(f.path(), f.app), DoublingRegisterSm::default())
-        .start_with_snapshots()
+        .start()
         .expect("a patch build of the pinned `to` attaches");
     let cnc = f.cnc();
     wait_service_caught_up(&cnc);
@@ -898,7 +887,7 @@ fn a_contended_pin_read_is_refused_not_ignored() {
         .store_pin_begin_for_test(V1, V2);
 
     let err = ServiceBuilder::new(cfg(f.path(), f.app), DoublingRegisterSm::default())
-        .start_with_snapshots()
+        .start()
         .err()
         .expect("refused");
     assert!(
@@ -913,7 +902,7 @@ fn a_contended_pin_read_is_refused_not_ignored() {
         .status
         .store_pin_finish_for_test(f.p);
     let svc2 = ServiceBuilder::new(cfg(f.path(), f.app), DoublingRegisterSm::default())
-        .start_with_snapshots()
+        .start()
         .unwrap();
     let cnc = f.cnc();
     wait_service_caught_up(&cnc);
@@ -984,7 +973,7 @@ fn a_pinned_attach_prefers_the_origin_over_a_later_artifact() {
 
     f.pin(V1, V2);
     let svc2 = ServiceBuilder::new(cfg(f.path(), f.app), DoublingRegisterSm::default())
-        .start_with_snapshots()
+        .start()
         .unwrap();
     wait_service_caught_up(&cnc);
     assert_eq!(
@@ -1070,7 +1059,7 @@ fn a_pinned_attach_survives_a_cadence_instant_after_the_pin() {
     );
 
     let svc2 = ServiceBuilder::new(cfg(f.path(), f.app), DoublingRegisterSm::default())
-        .start_with_snapshots()
+        .start()
         .unwrap();
     wait_service_caught_up(&cnc);
     assert_eq!(
@@ -1116,7 +1105,7 @@ fn a_pinned_origin_above_the_durable_frontier_is_a_drift_refusal() {
 
     f.pin_at(origin, V1, V2);
     let err = ServiceBuilder::new(cfg(f.path(), f.app), DoublingRegisterSm::default())
-        .start_with_snapshots()
+        .start()
         .err()
         .expect("refused");
     assert!(
@@ -1315,7 +1304,7 @@ fn a_pin_above_the_recovered_artifact_is_published_before_the_declared_set() {
     // IMMEDIATELY, the way a co-restarting service does: the declared set is
     // not on the page yet, so this attach waits it out.
     let svc2 = ServiceBuilder::new(cfg(dir.path(), app), DoublingRegisterSm::default())
-        .start_with_snapshots()
+        .start()
         .expect("the boot wait outlasts the node's join");
 
     let sampled = watcher.join().expect("watcher panicked");

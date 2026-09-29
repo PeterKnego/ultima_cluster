@@ -232,7 +232,7 @@ fn spawn_service(dir: &Path, app_id: &str, _snapshot_interval_bytes: u64) -> Ser
     // unchanged for the fleet driver.
     let cfg = ServiceConfig::new(dir, app_id);
     ServiceBuilder::new(cfg, RegSm::default())
-        .start_with_snapshots()
+        .start()
         .expect("snapshot service start")
 }
 

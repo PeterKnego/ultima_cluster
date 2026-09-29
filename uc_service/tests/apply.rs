@@ -6,6 +6,9 @@
 //! response per submit onto the egress broadcast with the client's identity
 //! and the position ++ bincoded response payload (the pinned egress layout).
 
+#[macro_use]
+mod common;
+
 use std::net::SocketAddr;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -60,6 +63,9 @@ impl StateMachine for CountSm {
         self.last_applied
     }
 }
+
+// #67 Task 2: every row this file attaches must be snapshot-capable.
+impl_count_sm_snapshot!(CountSm);
 
 // --------------------------------------------------------------------- harness
 
@@ -302,6 +308,23 @@ impl StateMachine for TimerCountSm {
     fn on_timer(&mut self, ctx: &mut ApplyCtx, ev: TimerEvent) {
         self.fired.push((ctx.position, ev.id, ctx.time_ns));
         self.last = Some(ctx.position);
+    }
+}
+
+// #67 Task 2: this row must be snapshot-capable too.
+type TimerCountSmState = (Vec<(u64, u64, u64)>, Option<u64>);
+impl uc_service::WholeStateSnapshot for TimerCountSm {
+    fn encode_state(&self) -> Result<Vec<u8>, uc_service::SnapshotError> {
+        bincode::serde::encode_to_vec((&self.fired, self.last), bincode::config::standard())
+            .map_err(|e| uc_service::SnapshotError::Codec(e.to_string()))
+    }
+    fn decode_state(&mut self, bytes: &[u8]) -> Result<(), uc_service::SnapshotError> {
+        let ((fired, last), _): (TimerCountSmState, usize) =
+            bincode::serde::decode_from_slice(bytes, bincode::config::standard())
+                .map_err(|e| uc_service::SnapshotError::Codec(e.to_string()))?;
+        self.fired = fired;
+        self.last = last;
+        Ok(())
     }
 }
 

@@ -590,6 +590,14 @@ impl StateMachine for NoopSm {
         None
     }
 }
+impl uc_service::WholeStateSnapshot for NoopSm {
+    fn encode_state(&self) -> Result<Vec<u8>, uc_service::SnapshotError> {
+        Ok(Vec::new())
+    }
+    fn decode_state(&mut self, _bytes: &[u8]) -> Result<(), uc_service::SnapshotError> {
+        Ok(())
+    }
+}
 
 /// Uc2ServiceWedged — **real**. A real node + a real attached service; stop
 /// the service's apply agent while the node keeps running.
@@ -1141,6 +1149,14 @@ impl StateMachine for SlowSm {
     fn query(&self, _q: ()) {}
     fn last_applied(&self) -> Option<u64> {
         None
+    }
+}
+impl uc_service::WholeStateSnapshot for SlowSm {
+    fn encode_state(&self) -> Result<Vec<u8>, uc_service::SnapshotError> {
+        Ok(Vec::new())
+    }
+    fn decode_state(&mut self, _bytes: &[u8]) -> Result<(), uc_service::SnapshotError> {
+        Ok(())
     }
 }
 

@@ -209,15 +209,16 @@ pub enum ServiceError {
         running: u32,
         mine: u32,
     },
-    /// A pinned row MUST install the artifact at its origin, and only
-    /// [`ServiceBuilder::start_with_snapshots`](crate::ServiceBuilder::start_with_snapshots)
-    /// carries the install capability (`S: SnapshotStateMachine`). A plain
-    /// `start()` on a pinned row would replay the origin's prefix under THIS
-    /// version instead — the §2.3 counterfactual — so it is refused.
+    /// A pinned row MUST install the artifact at its origin, which needs the
+    /// install capability (`S: SnapshotStateMachine`). Since #67 every
+    /// [`ServiceBuilder::start`](crate::ServiceBuilder::start) carries it, so
+    /// the SDK can no longer produce this refusal; it stays as `attach`'s
+    /// backstop for an attach without the capability, which would replay the
+    /// origin's prefix under THIS version instead — the §2.3 counterfactual.
     #[error(
         "FSM {name:?} at row {row} is pinned to origin {origin} but was \
-         started with start(); a pinned row must install snap-{origin} and \
-         needs start_with_snapshots()"
+         attached without snapshot support; a pinned row must install \
+         snap-{origin}"
     )]
     PinRequiresSnapshots { name: String, row: u8, origin: u64 },
     /// The pin names an origin whose artifact is not on this node: the

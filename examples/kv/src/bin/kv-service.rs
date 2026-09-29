@@ -9,7 +9,7 @@
 //!   gateway's session envelope must be ON (`[session] envelope = true`,
 //!   the default) — a re-sent write is then answered `replayed`, not applied
 //!   twice;
-//! - it starts with `start_with_snapshots()`, which is what lets
+//! - it starts with `start()`, which is what lets
 //!   `uc2ctl snapshot` and `[purge]` bound the journal.
 //!
 //! Exit codes: 0 clean stop, 1 attach failed or the apply agent fail-stopped
@@ -136,7 +136,7 @@ fn main() -> anyhow::Result<()> {
         let sm = Sessioned::new(KvSm::default(), SessionConfig::default());
         let cfg = ServiceConfig::new(instance_dir.clone(), args.app_id.clone())
             .with_boot_wait(Duration::from_millis(200));
-        match ServiceBuilder::new(cfg, sm).start_with_snapshots() {
+        match ServiceBuilder::new(cfg, sm).start() {
             Ok(service) => break service,
             Err(ServiceError::NodeBooting) => {
                 anyhow::ensure!(

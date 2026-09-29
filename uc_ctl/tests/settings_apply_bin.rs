@@ -119,7 +119,7 @@ fn run_ctl(args: &[&str]) -> Run {
 /// command committed — `show` must print the honest "no cluster artifact
 /// yet" line rather than a value nothing committed. Driving a real artifact
 /// would need a `SnapshotStateMachine` service tuned the way
-/// `uc_node/tests/learner.rs`'s `start_with_snapshots` tests do; that setup
+/// `uc_node/tests/learner.rs`'s `start` tests do; that setup
 /// is not needed to prove the apply path end to end, so this test does not
 /// do it.
 #[test]

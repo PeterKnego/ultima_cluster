@@ -163,14 +163,15 @@ struct Args {
     /// (see the `uc_lincheck::timer` module doc).
     #[arg(long, default_value_t = false)]
     mixed_register: bool,
-    /// Coordinated-snapshot plan 2 (T10): attach through
-    /// `start_with_snapshots()` — i.e. publish
-    /// `CNC_SVC_STATUS_SNAPSHOT_CAPABLE`, without which the leader refuses
-    /// `uc2ctl snapshot` with `48 snapshot_unsupported` — and wrap the SM in
-    /// [`SlowFreeze`] so [`FREEZE_MS_ENV`] can widen the build window.
+    /// Coordinated-snapshot plan 2 (T10): the arm for tests that COMMAND
+    /// instants and expect artifacts — wrap the SM in [`SlowFreeze`] so
+    /// [`FREEZE_MS_ENV`] can widen the build window.
     ///
-    /// Opt-in rather than the default so every pre-plan-2 hard-crash test
-    /// keeps attaching exactly as it did. Supports row 0 (bare `RegisterSm`)
+    /// #67: every arm is snapshot-CAPABLE (the SDK's one `start()` publishes
+    /// `CNC_SVC_STATUS_SNAPSHOT_CAPABLE`), so this flag no longer decides
+    /// whether the leader accepts `uc2ctl snapshot` — only whether the freeze
+    /// can be slowed. Opt-in rather than the default so every pre-plan-2
+    /// hard-crash test keeps its SM unwrapped. Supports row 0 (bare `RegisterSm`)
     /// and `--tagged 1` (`Tagged<1, RegisterSm>`) — the two rows the
     /// coordinated-instant crashtest declares; it does not compose with
     /// `--sessioned` / `--timer` / `--mixed-register`.
@@ -221,7 +222,7 @@ fn main() -> anyhow::Result<()> {
         );
         return supervise(svc);
     }
-    // Coordinated-snapshot plan 2 (T10): the snapshot-CAPABLE arms, checked
+    // Coordinated-snapshot plan 2 (T10): the `SlowFreeze` arms, checked
     // before the `(tagged, sessioned)` matrix below for the same reason the
     // timer arms are — this one does not compose with it either.
     if args.snapshots {
@@ -233,9 +234,9 @@ fn main() -> anyhow::Result<()> {
             None => {
                 let svc =
                     ServiceBuilder::new(cfg, SlowFreeze::new(RegisterSm::default(), &instance_dir))
-                        .start_with_snapshots()?;
+                        .start()?;
                 println!(
-                    "service {:?} attached (snapshot-capable) at {}",
+                    "service {:?} attached (slow-freeze) at {}",
                     <RegisterSm as StateMachine>::NAME,
                     instance_dir.display()
                 );
@@ -246,9 +247,9 @@ fn main() -> anyhow::Result<()> {
                     cfg,
                     SlowFreeze::new(Tagged::<1, RegisterSm>::default(), &instance_dir),
                 )
-                .start_with_snapshots()?;
+                .start()?;
                 println!(
-                    "service {:?} attached (snapshot-capable) at {}",
+                    "service {:?} attached (slow-freeze) at {}",
                     <Tagged<1, RegisterSm> as StateMachine>::NAME,
                     instance_dir.display()
                 );

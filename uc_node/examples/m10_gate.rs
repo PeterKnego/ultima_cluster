@@ -282,6 +282,14 @@ impl StateMachine for NoopSm {
         None
     }
 }
+impl uc_service::WholeStateSnapshot for NoopSm {
+    fn encode_state(&self) -> Result<Vec<u8>, uc_service::SnapshotError> {
+        Ok(Vec::new())
+    }
+    fn decode_state(&mut self, _bytes: &[u8]) -> Result<(), uc_service::SnapshotError> {
+        Ok(())
+    }
+}
 
 // ------------------------------------------------------------- row 1: coverage
 

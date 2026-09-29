@@ -444,6 +444,11 @@ impl<S: StateMachine> RawStateMachine for S {
 /// artifact tags. `freeze` pins the current position; `install_snapshot` is told
 /// the position `S` the artifact was tagged with and must land the restored
 /// state exactly there.
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` has no snapshot support",
+    label = "this state machine cannot be snapshotted",
+    note = "every service must snapshot: implement `uc_service::WholeStateSnapshot` (encode/decode the whole state) or `SnapshotStateMachine` directly"
+)]
 pub trait SnapshotStateMachine: RawStateMachine {
     /// An opaque, consistent handle to the frozen state. `Send + 'static` so it
     /// can cross to the off-thread streaming step.

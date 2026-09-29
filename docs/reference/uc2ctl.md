@@ -323,10 +323,11 @@ instant=73792
 ```
 
 Two refusals are specific to it. `48 snapshot_unsupported` names a declared
-row that lacks the snapshot capability bit — it was started with plain
-`start()` rather than `start_with_snapshots()`, so it would ignore the frame
-and the set could never complete; the audit record's `detail` field names the
-row. `49 snapshot_no_learner` is `--standby` with no learner. A **follower**
+row that lacks the snapshot capability bit — since #67 every Rust SDK
+service gets it automatically (`ServiceBuilder::start()` requires `S:
+SnapshotStateMachine`), so this is the backstop for a row attached outside
+the SDK: it would ignore the frame and the set could never complete; the
+audit record's `detail` field names the row. `49 snapshot_no_learner` is `--standby` with no learner. A **follower**
 answers `retry` (status `2`), exactly as `schedule apply` does — check
 `uc2ctl status`'s `leader_hint` for where to re-run it — and so does a leader
 still opening its term. A leader whose previous instant's set has not
@@ -853,7 +854,7 @@ cluster FSM's refusal of a `RowGenesis` record.
 | 45 | `settings_missing` — no staged settings file on this node. Either `settings apply` was run against a different instance directory, or a successful apply already consumed it |
 | 46 | `settings_decode` — the staged file is not a decodable settings record (wrong length, unknown encoding version, or an unknown `snapshot_target` byte) |
 | 47 | `settings_bounds` — a field is out of range; the node's refusal detail and the audit record name which. Three values are out of range: `admission_bytes` or `snapshot_interval_bytes` equal to `u64::MAX` (the reserved sentinel), and an `fsm_lag` byte bound **below 1376 B** — one max-size frame. A sub-frame lag pins the report ceiling (`min_applied + fsm_lag`) inside the next frame and stops commit cluster-wide **permanently**, since changing a replicated setting needs a command that commits; `"lockstep"` is how you ask for the tightest pacing. `fsm_lag = "0"` (derive) and `"lockstep"` are sentinels, not bounds, and are never refused here |
-| 48 | `snapshot_unsupported` — a declared row lacks the snapshot capability bit: it was started with plain `start()` rather than `start_with_snapshots()`, so it would ignore the `SNAPSHOT` frame and the set at P could never complete. The audit record's `detail` field names the row. The cluster is legitimate — purge is off by default and such a cluster simply never snapshots — so it is refused by name rather than left with a floor that never moves |
+| 48 | `snapshot_unsupported` — a declared row lacks the snapshot capability bit, so it would ignore the `SNAPSHOT` frame and the set at P could never complete. Since #67 every Rust SDK service sets this bit unconditionally (`ServiceBuilder::start()` requires `S: SnapshotStateMachine`), so this is now the backstop for a service attached without the current Rust SDK (a non-Rust attacher, or a binary built before #67). The audit record's `detail` field names the row; it is refused by name rather than left with a floor that never moves |
 | 49 | `snapshot_no_learner` — `uc2ctl snapshot --standby` with no learner in the committed membership. Only a learner freezes for a standby instant, so with none there nothing anywhere would build the set |
 | 50 | `snapshot_above_durable` — `uc2ctl snapshot fetch --position P` names a P above this node's own durable frontier. A voter must not adopt a floor above what it has made durable. Usually an operator typo, or a learner transiently ahead of this voter; legitimate again once this node's log catches up |
 | 51 | `schedule_too_large` — the table decoded fine and names only declared rows, but the `CLUSTER` frame carrying it is larger than this node's `max_payload`, so the leader could not append it. A full 32-entry table needs **1072 bytes** of frame body (8 B of `CLUSTER` prefix + 8 B of table header + 32 × 33 B). Raise `max_payload` in `node.toml` and restart, or apply fewer entries. Since 2.11.0 the daemon refuses at STARTUP, by name, if `max_payload` cannot carry a full table, so on a node that booted this reason is reachable only where the two can still disagree — a node started before that check existed, or a hand-edited config. Before 2.11.0 this case was reported as **42**, which sent operators to inspect a file that was perfectly valid |

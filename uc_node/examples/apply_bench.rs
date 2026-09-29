@@ -95,6 +95,25 @@ impl RawStateMachine for RawCount {
         self.last
     }
 }
+// #67: every service is snapshot-capable, so this harness's rows are too.
+// It never commands a snapshot instant (the only snapshot-ish line is the
+// `snapshot_dir_for` mkdir at setup), so the capability costs each row an
+// idle `uc2-snapshot-builder` thread (`IdleStrategy::Sleep(1ms)`) and the
+// CAPABLE status bit — nothing on the apply hop itself.
+impl uc_service::WholeStateSnapshot for RawCount {
+    fn encode_state(&self) -> Result<Vec<u8>, uc_service::SnapshotError> {
+        bincode::serde::encode_to_vec((self.frames, self.last), bincode::config::standard())
+            .map_err(|e| uc_service::SnapshotError::Codec(e.to_string()))
+    }
+    fn decode_state(&mut self, bytes: &[u8]) -> Result<(), uc_service::SnapshotError> {
+        let ((frames, last), _): ((u64, Option<u64>), usize) =
+            bincode::serde::decode_from_slice(bytes, bincode::config::standard())
+                .map_err(|e| uc_service::SnapshotError::Codec(e.to_string()))?;
+        self.frames = frames;
+        self.last = last;
+        Ok(())
+    }
+}
 
 /// FSM identity: attach finds a service's row by name now, so N instances of
 /// the same `RawCount` logic each need a DISTINCT declared name to occupy N
@@ -115,6 +134,16 @@ impl<const ROW: u8> RawStateMachine for TaggedRaw<ROW> {
     }
     fn last_applied(&self) -> Option<u64> {
         self.0.last_applied()
+    }
+}
+/// Delegates to the inner [`RawCount`]'s whole-state encoding — the row
+/// name is a type parameter, not state.
+impl<const ROW: u8> uc_service::WholeStateSnapshot for TaggedRaw<ROW> {
+    fn encode_state(&self) -> Result<Vec<u8>, uc_service::SnapshotError> {
+        self.0.encode_state()
+    }
+    fn decode_state(&mut self, bytes: &[u8]) -> Result<(), uc_service::SnapshotError> {
+        self.0.decode_state(bytes)
     }
 }
 

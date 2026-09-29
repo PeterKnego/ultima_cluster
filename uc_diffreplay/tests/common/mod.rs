@@ -80,7 +80,7 @@ pub fn build_register_history_with(dir: &Path, app_id: &str, before: &[Cmd], aft
     let node = start_single_node(dir, app_id, register_name());
     let cfg = ServiceConfig::new(dir.to_path_buf(), app_id.to_string());
     let svc = ServiceBuilder::new(cfg, RegisterSm::default())
-        .start_with_snapshots()
+        .start()
         .unwrap();
     let client = Client::connect(dir, app_id).unwrap();
     for c in before {

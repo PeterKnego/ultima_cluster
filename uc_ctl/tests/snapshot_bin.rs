@@ -7,7 +7,7 @@
 //! Starts a real node IN-PROCESS (`uc_node::Node::start_with`, the same
 //! harness shape `settings_apply_bin.rs`/`admin_auth_bin.rs` use) plus a
 //! real snapshot-CAPABLE service (`uc_service::ServiceBuilder::
-//! start_with_snapshots`, the same fixture shape `uc_node/tests/learner.rs`'s
+//! start`, the same fixture shape `uc_node/tests/learner.rs`'s
 //! `SumSm` uses) and shells out to the compiled `uc2ctl` binary
 //! (`env!("CARGO_BIN_EXE_uc2ctl")`) for every assertion — `uc_ctl` stays
 //! bin-only (Ruling R16: its own doc says "nothing in this crate is a Rust
@@ -139,7 +139,7 @@ impl SnapshotStateMachine for TrivialSm {
 fn start_capable_service(dir: &Path, app: &str) -> uc_service::Service<TrivialSm> {
     let cfg = ServiceConfig::new(dir, app);
     ServiceBuilder::new(cfg, TrivialSm)
-        .start_with_snapshots()
+        .start()
         .expect("service start")
 }
 
