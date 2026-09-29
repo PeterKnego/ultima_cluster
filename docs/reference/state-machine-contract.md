@@ -193,7 +193,10 @@ elsewhere — `uc_service` itself imports none for the helper. The blanket
 `impl<S: WholeStateSnapshot> SnapshotStateMachine for S` in
 `uc_service/src/snapshots.rs` frames your bytes as `cursor_present: u8 ‖
 cursor: u64 LE ‖ app bytes`, inside the unchanged `ULTSNAP2` envelope
-described below.
+described below. That blanket impl already owns `SnapshotStateMachine::project`,
+so a helper FSM cannot override `project` itself (E0119); to take part in
+`uc2-diffreplay`, override `WholeStateSnapshot::project_state` instead — the
+blanket `project()` forwards to it.
 
 **Cost.** `encode_state` runs as `freeze`, on the apply thread with the SM
 lock held, so *every* snapshot instant pauses that row's apply for as long as

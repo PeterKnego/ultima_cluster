@@ -224,3 +224,16 @@ costs, when to write the full trait instead, and the D5 check.
 
 [#33]: https://github.com/PeterKnego/ultima_cluster/issues/33
 [#67]: https://github.com/PeterKnego/ultima_cluster/issues/67
+
+#### Errata (as built)
+
+§4.3's "An app that wants a diff-replay projection overrides it on the
+helper type exactly as it does today" is wrong: the blanket
+`impl<S: WholeStateSnapshot> SnapshotStateMachine for S` already owns
+`project()`, so a hand override of `project()` on the helper type is E0119
+under coherence, not a legal override. As built, `WholeStateSnapshot` gets
+its own provided method, `project_state(&self, out: &mut dyn
+std::io::Write) -> Result<(), SnapshotError>`, whose default returns the
+same named refusal `SnapshotStateMachine::project`'s default does; the
+blanket impl's `project()` forwards to it. A helper FSM that wants to take
+part in `uc2-diffreplay` overrides `project_state`, not `project`.

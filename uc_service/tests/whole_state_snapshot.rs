@@ -82,6 +82,39 @@ impl SnapshotStateMachine for Manual {
     }
 }
 
+/// A helper FSM that opts in to diff replay by overriding `project_state`
+/// (I1) — `WholeStateSnapshot` owns `project_state`, not `project` itself:
+/// the blanket `impl<S: WholeStateSnapshot> SnapshotStateMachine for S`
+/// already owns `project`, so a hand override of `project` on a helper type
+/// is E0119 (coherence). The blanket impl's `project()` forwards to
+/// `project_state`.
+#[derive(Default)]
+struct Projecting;
+impl RawStateMachine for Projecting {
+    const NAME: &'static str = "projecting";
+    fn apply(&mut self, _ctx: &mut ApplyCtx, _c: &[u8], out: &mut Vec<u8>) {
+        out.clear();
+    }
+    fn query(&self, _q: &[u8], out: &mut Vec<u8>) {
+        out.clear();
+    }
+    fn last_applied(&self) -> Option<u64> {
+        None
+    }
+}
+impl WholeStateSnapshot for Projecting {
+    fn encode_state(&self) -> Result<Vec<u8>, SnapshotError> {
+        Ok(Vec::new())
+    }
+    fn decode_state(&mut self, _b: &[u8]) -> Result<(), SnapshotError> {
+        Ok(())
+    }
+    fn project_state(&self, out: &mut dyn std::io::Write) -> Result<(), SnapshotError> {
+        out.write_all(b"projecting-state")?;
+        Ok(())
+    }
+}
+
 fn assert_snapshot_capable<S: SnapshotStateMachine>() {}
 
 #[test]
@@ -123,4 +156,25 @@ fn sessioned_helper_round_trips_through_freeze_stream_install() {
     assert_eq!(got, 4160);
     assert_eq!(t.last_applied(), s.last_applied());
     assert_eq!(t.inner().state(), s.inner().state());
+}
+
+/// I1: a helper FSM's `project_state` override is reachable through
+/// `SnapshotStateMachine::project` (the blanket impl forwards to it).
+#[test]
+fn a_project_state_override_is_reachable_through_project() {
+    let mut out = Vec::new();
+    Projecting.project(&mut out).unwrap();
+    assert_eq!(out, b"projecting-state");
+}
+
+/// I1: a helper FSM that does NOT override `project_state` still gets the
+/// same named refusal `SnapshotStateMachine::project`'s default returns.
+#[test]
+fn a_helper_without_a_project_state_override_gets_the_default_refusal() {
+    let mut out = Vec::new();
+    let err = Helper::default().project(&mut out).unwrap_err();
+    assert!(
+        err.to_string().contains("project() not implemented"),
+        "{err}"
+    );
 }

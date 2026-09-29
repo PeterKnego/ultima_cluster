@@ -460,6 +460,25 @@ pub trait WholeStateSnapshot: RawStateMachine {
     fn encode_state(&self) -> Result<Vec<u8>, SnapshotError>;
     /// Replace the whole state from bytes `encode_state` produced.
     fn decode_state(&mut self, bytes: &[u8]) -> Result<(), SnapshotError>;
+
+    /// Render the current state as canonical, diffable text (diff replay
+    /// spec §4.4, §5.8) — the same contract as
+    /// [`SnapshotStateMachine::project`](crate::SnapshotStateMachine::project).
+    ///
+    /// A distinct name, not an override of `project` itself: the blanket
+    /// `impl<S: WholeStateSnapshot> SnapshotStateMachine for S` below already
+    /// owns `project`, and coherence forbids a helper FSM from providing its
+    /// own — `SnapshotStateMachine::project`'s default and a hand override on
+    /// the same method would be E0119. `project`'s blanket impl forwards
+    /// here, so overriding `project_state` is how a `WholeStateSnapshot`
+    /// helper opts in to diff replay. Default: the same named refusal
+    /// `SnapshotStateMachine::project`'s default returns.
+    fn project_state(&self, out: &mut dyn std::io::Write) -> Result<(), SnapshotError> {
+        let _ = out;
+        Err(SnapshotError::Codec(
+            "project() not implemented by this state machine (diff replay spec §5.8)".into(),
+        ))
+    }
 }
 
 /// `cursor_present u8 ‖ cursor u64 LE`, ahead of the app's bytes.
@@ -505,6 +524,10 @@ impl<S: WholeStateSnapshot> SnapshotStateMachine for S {
             ));
         }
         Ok(position)
+    }
+
+    fn project(&self, out: &mut dyn std::io::Write) -> Result<(), SnapshotError> {
+        self.project_state(out)
     }
 }
 
@@ -1091,5 +1114,28 @@ mod whole_state_tests {
             forget_cursor: true,
         };
         assert_eq!(freeze_bytes(&a).0, freeze_bytes(&b).0);
+    }
+
+    #[test]
+    fn install_refuses_a_cursor_tag_byte_other_than_0_or_1() {
+        let buf = [2u8; WHOLE_STATE_HEADER_LEN + 1];
+        let err = Sum::default()
+            .install_snapshot(64, &mut &buf[..])
+            .unwrap_err();
+        assert!(err.to_string().contains("whole-state frame"), "{err}");
+    }
+
+    #[test]
+    fn a_recorded_cursor_of_zero_round_trips_as_some_zero_not_none() {
+        let s = Sum {
+            total: 5,
+            last: Some(0),
+            forget_cursor: false,
+        };
+        let (bytes, pos) = freeze_bytes(&s);
+        assert_eq!(pos, 0);
+        let mut t = Sum::default();
+        t.install_snapshot(64, &mut &bytes[..]).unwrap();
+        assert_eq!(t.last, Some(0));
     }
 }
