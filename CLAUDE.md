@@ -450,8 +450,13 @@ one log stream (#11); the release-ledger line (#5) is process, not code
     applying to P, apply is gated on `min(commit, durable)`, committed bytes
     are never truncated), which is what lets the ship gate become "the
     complete set at my floor" with no counter. The retired `SnapshotPolicy` /
-    `ServiceConfig::snapshot_policy` are **DELETED**; `start_with_snapshots`
-    is the whole opt-in and sets `CNC_SVC_STATUS_SNAPSHOT_CAPABLE = 1 << 9`.
+    `ServiceConfig::snapshot_policy` are **DELETED**. `2.11.0`'s opt-in was
+    `start_with_snapshots`; **since #67 there is no opt-in** — the one
+    `ServiceBuilder::start()` requires `S: SnapshotStateMachine` and always
+    sets `CNC_SVC_STATUS_SNAPSHOT_CAPABLE = 1 << 9`, so `48
+    snapshot_unsupported` and `PinRequiresSnapshots` are reachable only by a
+    service attached without the current Rust SDK (a non-Rust attacher, or a
+    binary built before #67).
     Header flag `FLAG_SNAPSHOT_STANDBY = 0x01` (the byte `FLAG_TIMER_TABLE`
     rides in) makes an instant learners-only; a node reads its role from
     `NODE_FLAG_LEARNER = 4` in the cnc node-flags word. Return path:
@@ -729,8 +734,13 @@ Workspace crates:
 - `uc_service` — service-side SDK. **M12a: two tiers.** `RawStateMachine`
   (bytes-in/bytes-out, the core contract) or the typed `StateMachine` (sync
   `apply`/`query`), which gets `RawStateMachine` for free via a blanket impl —
-  a type implements exactly one of the two. Optionally `SnapshotStateMachine`
-  (M6 purge) + `RawOutputHandler`/`OutputHandler` (async, leader-only,
+  a type implements exactly one of the two. **`SnapshotStateMachine` is
+  required since #67** (`start()` does not compile without it): implement it
+  directly, or implement the codec-neutral `WholeStateSnapshot` helper
+  (`encode_state`/`decode_state`, optional `project_state` for diff-replay;
+  the SDK owns the frame and checks the restored `last_applied`) and get it
+  through a blanket impl. Purge stays a separate opt-in (`PurgePolicy`).
+  Optionally `RawOutputHandler`/`OutputHandler` (async, leader-only,
   `TypedOutput` adapts the latter onto the former). `uc_service::session::
   Sessioned<S>` wraps either tier for exactly-once-over-a-remote-hop: a
   16-byte `client_id ++ seq` envelope, a 1-byte FRESH/REPLAYED/EXPIRED tag,
@@ -931,8 +941,9 @@ Storage primitives:
   CRC per block; block seq = block index, meta = base position).
 - Durable state: `uc_journal::StableValue<T>` (rotating two-slot atomic value)
   for vote, term map, snapshot floor, output progress, cluster-config record (config.state).
-- App state + snapshots: the user's `StateMachine`. M6 snapshots use the
-  `SnapshotStateMachine` capability; the artifact's PAYLOAD bytes are entirely
+- App state + snapshots: the user's `StateMachine`, which since #67 MUST
+  implement `SnapshotStateMachine` (by hand or via `WholeStateSnapshot`);
+  the artifact's PAYLOAD bytes are entirely
   the service's own business — UC ships no store and prescribes no snapshot
   encoding, but since `2.11.0` it does own a 16-byte
   `ULTSNAP1 ‖ P` envelope ahead of them, and the artifact tag is an
