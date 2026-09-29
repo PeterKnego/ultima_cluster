@@ -2452,7 +2452,7 @@ fn snapshot_instant_abandoned_on_service_sigkill_mid_build_and_the_next_complete
         }) {
             assert!(
                 Instant::now() < deadline,
-                "both rows must publish the snapshot-capability bit (--snapshots)"
+                "both rows must publish CNC_SVC_STATUS_SNAPSHOT_CAPABLE"
             );
             std::thread::sleep(Duration::from_millis(20));
         }
