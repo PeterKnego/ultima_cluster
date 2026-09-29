@@ -514,10 +514,10 @@ pub const REASON_SETTINGS_BOUNDS: u32 = 47;
 /// A declared row's cnc slot does not carry `CNC_SVC_STATUS_SNAPSHOT_CAPABLE`
 /// — the service attached there did not declare snapshot support, so it will
 /// never act on a `SNAPSHOT` frame and the set at P can never be complete.
-/// Every SDK `start()` declares it since #67, so only a non-SDK attacher
-/// reaches this; the operator is TOLD rather than left with a floor that
-/// never moves. The audit record's `detail` names
-/// the first such row.
+/// Every SDK `start()` declares it since #67, so this reaches only a service
+/// attached without the current Rust SDK (a non-Rust attacher, or a binary
+/// built before #67); the operator is TOLD rather than left with a floor
+/// that never moves. The audit record's `detail` names the first such row.
 pub const REASON_SNAPSHOT_UNSUPPORTED: u32 = 48;
 /// A `--standby` instant was commanded on a cluster whose committed
 /// membership holds no learner. Only a learner freezes for a standby instant

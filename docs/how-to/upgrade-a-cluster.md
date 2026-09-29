@@ -866,7 +866,8 @@ for the full account:
   capability. A pinned row must be able to install `snap-<origin>`; since #67
   every `ServiceBuilder::start()` carries this capability, so a Rust SDK
   service cannot reach this refusal any more — it stays as `attach`'s
-  backstop for a row attached outside the SDK.
+  backstop for a service attached without the current Rust SDK (a non-Rust
+  attacher, or a binary built before #67).
 - **`PinnedArtifactMissing`** — the pin names an origin whose artifact is not
   on this node (pruned, or never fetched). Run `uc2ctl snapshot fetch`, or
   re-pin at a retained instant.

@@ -21,9 +21,9 @@ whole state, the SDK does the rest) or a hand-written `freeze` /
 Every declared row has to be capable, not just row 0: a set at a position is
 complete only when every row *and* the cluster FSM have published an artifact
 at it. The only way to see a row without the capability bit is a service
-attached outside the Rust SDK — `uc2ctl snapshot` refuses `48
-snapshot_unsupported`, naming the row, rather than leaving you watching a
-floor that never moves.
+attached without the current Rust SDK (a non-Rust attacher, or a binary
+built before #67) — `uc2ctl snapshot` refuses `48 snapshot_unsupported`,
+naming the row, rather than leaving you watching a floor that never moves.
 
 See [State-machine contract § Snapshots](../reference/state-machine-contract.md#snapshots-required-the-instant-the-envelope-and-the-exclusive-frontier)
 for what `freeze` must and must not do — in particular, keep it O(1) and put

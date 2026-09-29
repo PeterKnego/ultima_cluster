@@ -229,7 +229,8 @@ naming the row, if a declared row lacks the snapshot-capability bit — such a
 row would ignore the frame and the set could never complete. Since #67 every
 Rust SDK service gets this bit automatically (`ServiceBuilder::start()`
 requires `S: SnapshotStateMachine`), so in practice this refusal only fires
-for a row attached without the SDK.
+for a row attached without the current Rust SDK — a non-Rust attacher, or a
+binary built before #67.
 
 Now wait for the complete set at P **on every node**. The pin's `54 pin_no_set`
 is a door check on the **leader** alone, so it does not speak for the rest of
