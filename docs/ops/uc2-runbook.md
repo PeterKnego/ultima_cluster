@@ -255,10 +255,12 @@ transport setting, both measured closed-loop at inflight 1 on 8-vCPU
   `uc2ctl status`'s `leader_hint` says where — and it prints `instant=<P>`, the frame-end position every
   declared row and the cluster FSM freeze at. When they have all published
   `snap-<P>`, that node's purge floor moves to P. Refused
-  `48 snapshot_unsupported` naming any declared row started with plain
-  `start()` rather than `start_with_snapshots()` (it would ignore the frame,
-  so the set could never complete), and `49 snapshot_no_learner` for
-  `--standby` with no learner in the committed membership. A cadence is the
+  `48 snapshot_unsupported` naming any declared row without the snapshot
+  capability bit (it would ignore the frame, so the set could never
+  complete — since #67 every Rust SDK service sets this bit unconditionally,
+  so it now only fires for a row attached outside the SDK), and
+  `49 snapshot_no_learner` for `--standby` with no learner in the committed
+  membership. A cadence is the
   replicated `snapshot_interval_bytes` (`0`, the default, means
   operator-commanded only).
   **`--standby` freezes only the learners**, which is how you avoid the

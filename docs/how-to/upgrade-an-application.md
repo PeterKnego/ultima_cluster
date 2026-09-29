@@ -155,11 +155,6 @@ routes.
   build is attached on the leader.
 - Admin access to every node (`uc2ctl`, the admin key), and an off-node
   destination for the backup in step 1.
-- The row must be snapshot-capable — started with `start_with_snapshots()`. So
-  must every *other* declared row: `48 snapshot_unsupported` refuses the whole
-  instant in step 2 when **any** declared row lacks the capability bit, naming
-  it. The row being upgraded is refused a second time at step 6
-  (`PinRequiresSnapshots`).
 
 **Rehearse the swap off the production cluster first.** `uc2-diffreplay
 pin-verify` takes a corpus captured from this cluster and your two real
@@ -230,8 +225,11 @@ why a per-row upgrade still costs one instant for everyone.
 
 The command is **leader-only**: a follower answers `retry` with a leader hint
 (`uc2ctl status`'s `leader_hint`). It is refused `48 snapshot_unsupported`,
-naming the row, if a declared row was started with plain `start()` — such a row
-would ignore the frame and the set could never complete.
+naming the row, if a declared row lacks the snapshot-capability bit — such a
+row would ignore the frame and the set could never complete. Since #67 every
+Rust SDK service gets this bit automatically (`ServiceBuilder::start()`
+requires `S: SnapshotStateMachine`), so in practice this refusal only fires
+for a row attached without the SDK.
 
 Now wait for the complete set at P **on every node**. The pin's `54 pin_no_set`
 is a door check on the **leader** alone, so it does not speak for the rest of
@@ -435,14 +433,17 @@ FSM "kv" at row 0 is pinned to version 0x02000000 from origin 73792, but this bi
 This is the backstop that makes step 4 worth doing: a host that was missed, or
 a unit that restarted the old binary, stops here instead of diverging.
 
-**3. The row was started with plain `start()`** — refused:
+**3. The row attached without the install capability** — refused:
 
 ```
-FSM "kv" at row 0 is pinned to origin 73792 but was started with start(); a pinned row must install snap-73792 and needs start_with_snapshots()
+FSM "kv" at row 0 is pinned to origin 73792 but was attached without snapshot support; a pinned row must install snap-73792
 ```
 
 Without the install capability it would replay the origin's prefix under the
 *new* version, which is exactly the counterfactual the pin exists to avoid.
+Since #67 every `ServiceBuilder::start()` carries this capability, so a Rust
+SDK service cannot reach this refusal any more — it is `attach`'s backstop
+for a row attached outside the SDK.
 
 **4. The artifact at the origin is not on this node** — refused:
 

@@ -497,7 +497,7 @@ their own, added in `2.13.0`, carried on three config structs:
 
 | Key | Crate | Reached by | How to set it |
 |---|---|---|---|
-| `ServiceConfig::boot_wait: Duration` | `uc_service` | `ServiceBuilder::start` / `start_with_snapshots` | `ServiceConfig::with_boot_wait(..)` |
+| `ServiceConfig::boot_wait: Duration` | `uc_service` | `ServiceBuilder::start` | `ServiceConfig::with_boot_wait(..)` |
 | `EngineConfig::boot_wait: Duration` | `uc_client` | `Engine::attach` | plain struct field |
 | `PipelinedConfig::boot_wait: Duration` | `uc_client` | `PipelinedClient::connect` (hands it to `EngineConfig` unchanged) | plain struct field |
 

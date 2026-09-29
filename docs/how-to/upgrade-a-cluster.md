@@ -419,13 +419,16 @@ next instant.
 
 **`SnapshotPolicy` is retired from the SDK.** A service that configured
 `ServiceConfig::snapshot_policy(SnapshotPolicy { interval_bytes })` (retired)
-no longer compiles: delete the call. `start_with_snapshots()` is the whole opt-in now,
-and the trigger moved to the log — command an instant with `uc2ctl snapshot`,
-or set the replicated `snapshot_interval_bytes` with `uc2ctl settings apply`.
+no longer compiles: delete the call. `start_with_snapshots()` was the whole
+opt-in as of this release, and the trigger moved to the log — command an
+instant with `uc2ctl snapshot`, or set the replicated `snapshot_interval_bytes`
+with `uc2ctl settings apply`. (#67 later renamed `start_with_snapshots()` to
+`start()` and made snapshot support mandatory — see
+[State-machine contract § Snapshots](../reference/state-machine-contract.md#snapshots-required-the-instant-the-envelope-and-the-exclusive-frontier).)
 Check your `install_snapshot` while you are there: the position it is handed
 is an **exclusive** frontier and it must return that position, not report it
 from `last_applied()`
-([State-machine contract § Snapshots](../reference/state-machine-contract.md#snapshots-the-instant-the-envelope-and-the-exclusive-frontier)).
+([State-machine contract § Snapshots](../reference/state-machine-contract.md#snapshots-required-the-instant-the-envelope-and-the-exclusive-frontier)).
 
 **The `max_payload` edit, required only on hosts that PIN it.** If a
 `node.toml` sets `max_payload` to a value below what a full schedule table
@@ -851,7 +854,7 @@ See
 command's own door refusals (`52`–`59`, checked before anything is proposed
 or replicated). At attach, four more refusals guard the pinned install
 itself — see [State machine contract §
-Snapshots](../reference/state-machine-contract.md#snapshots-the-instant-the-envelope-and-the-exclusive-frontier)
+Snapshots](../reference/state-machine-contract.md#snapshots-required-the-instant-the-envelope-and-the-exclusive-frontier)
 for the full account:
 
 - **`PinnedVersionMismatch`** — a stale binary (not the pin's `to`) tries to
@@ -859,9 +862,11 @@ for the full account:
 - **`PinUnreadable`** — the pin words could not be read consistently through
   the seqlock (the `uc2-cluster` agent is mid-publish). Transient; retry the
   attach.
-- **`PinRequiresSnapshots`** — the row was started with plain `start()`, not
-  `start_with_snapshots()`. A pinned row must be able to install; start it
-  with snapshot capability.
+- **`PinRequiresSnapshots`** — the row attached without the install
+  capability. A pinned row must be able to install `snap-<origin>`; since #67
+  every `ServiceBuilder::start()` carries this capability, so a Rust SDK
+  service cannot reach this refusal any more — it stays as `attach`'s
+  backstop for a row attached outside the SDK.
 - **`PinnedArtifactMissing`** — the pin names an origin whose artifact is not
   on this node (pruned, or never fetched). Run `uc2ctl snapshot fetch`, or
   re-pin at a retained instant.

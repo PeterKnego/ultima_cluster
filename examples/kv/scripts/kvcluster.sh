@@ -159,8 +159,9 @@ app_id = "$APP"
 buffer_bytes = 16777216
 journal_segment_bytes = 4194304
 
-$members# The kv state machine implements SnapshotStateMachine and kv-service starts
-# with start_with_snapshots(); this is the other half of bounding the log.
+$members# The kv state machine implements SnapshotStateMachine (snapshot support is
+# mandatory for every kv-service build since #67); this is the other half of
+# bounding the log.
 [purge]
 below_snapshot_slack_bytes = 1048576
 

@@ -263,8 +263,10 @@ oneshots — the client matcher correlates off the ring.
   [the state-machine contract reference](reference/state-machine-contract.md)
   for the raw bytes-in/bytes-out tier underneath it and when to reach for it
   directly.
-- **`SnapshotStateMachine`** *(optional)* — enables journal purge. Since
-  `2.11.0` a snapshot is taken at a **coordinated instant**: a
+- **`SnapshotStateMachine`** *(required since #67, directly or via the
+  `WholeStateSnapshot` helper)* — enables journal purge, which stays a
+  separate opt-in `PurgePolicy`. Since `2.11.0` a snapshot is taken at a
+  **coordinated instant**: a
   `SNAPSHOT` frame the leader appends, at whose frame-end position P every
   declared FSM and UC's own cluster FSM freeze together, so a node's snapshot
   "set" is one log position. A node below the purge floor (crashed service,

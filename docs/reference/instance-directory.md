@@ -91,7 +91,7 @@ is refused the same way it always was.
 §3 S4) lets an operator pin a row's *next attach* to unconditionally install
 a specific artifact rather than tail-replay the log — see [The cluster FSM,
 explained § Pins and reports](../notes/uc2-cluster-fsm-explained.md#pins-and-reports-2130)
-and the [state machine contract's snapshots section](state-machine-contract.md#snapshots-the-instant-the-envelope-and-the-exclusive-frontier)
+and the [state machine contract's snapshots section](state-machine-contract.md#snapshots-required-the-instant-the-envelope-and-the-exclusive-frontier)
 for what `attach` does and its four named refusals. This is a reason a
 service's `snapshots/<row>/` directory matters even on a node that never runs
 `uc2ctl snapshot fetch` by hand: the artifact a pin names must still be on

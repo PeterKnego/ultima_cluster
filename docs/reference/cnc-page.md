@@ -211,7 +211,8 @@ matters. The service's apply loop writes it once per instant, right after
 derives `uc2_snapshot_freeze_seconds_max/_sum/_count{service,row}` from it.
 It shares a line with node-written words exactly as
 `CNC_SVC_STATUS_SNAPSHOT_CAPABLE` (status bit **9**, also service-written, set
-by `start_with_snapshots`) shares the status word.
+unconditionally by `ServiceBuilder::start()` since #67 made snapshot support
+mandatory) shares the status word.
 
 Line 7's fifth and last word, `artifact_hash` (`+504`), is plan B3's live
 determinism report: SHA-256 of the row's newest artifact PAYLOAD (the
@@ -234,8 +235,9 @@ room on this one. A further per-row word needs the reserved band, not
 line 7.
 
 The capability bit is what `uc2ctl snapshot` checks before it commands
-anything: a row started with plain `start()` never sets it, ignores a
-`SNAPSHOT` frame, and could therefore never complete a set — so the leader
-refuses the instant `48 snapshot_unsupported` **naming that row** rather than
-leaving an operator watching a floor that never moves. See
+anything: a row that never sets it ignores a `SNAPSHOT` frame and could
+therefore never complete a set — since #67 every Rust SDK service sets it
+unconditionally, so this can only happen for a row attached outside the SDK
+— so the leader refuses the instant `48 snapshot_unsupported` **naming that
+row** rather than leaving an operator watching a floor that never moves. See
 [The cluster FSM, explained § Instants](../notes/uc2-cluster-fsm-explained.md#instants-one-position-one-set).

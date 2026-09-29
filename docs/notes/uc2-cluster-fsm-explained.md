@@ -549,12 +549,14 @@ a pin that only the gap guard acted on could leave such a state machine
 stuck on its own history. When `pin()` returns `Pinned { origin, from, to }`
 and `to == S::VERSION`, `attach` installs `snap-<origin>` **unconditionally**
 — overriding the state machine's own `last_applied()` — before publishing
-anything else to the slot. That needs the install capability, which only
-[`ServiceBuilder::start_with_snapshots`](../../uc_service/src/lib.rs) carries
-(`S: SnapshotStateMachine`); a pinned row started with plain `start()` has no
-closure to install with and is refused (`ServiceError::PinRequiresSnapshots`)
-rather than silently tail-replaying the origin's prefix under this binary —
-the §2.3 counterfactual the pin exists to prevent. The install's own
+anything else to the slot. That needs the install capability
+(`S: SnapshotStateMachine`), which every
+[`ServiceBuilder::start`](../../uc_service/src/lib.rs) carries since #67 made
+snapshot support mandatory; a row attached without it (only possible outside
+the Rust SDK now) has no closure to install with and is refused
+(`ServiceError::PinRequiresSnapshots`) rather than silently tail-replaying
+the origin's prefix under this binary — the §2.3 counterfactual the pin
+exists to prevent. The install's own
 cross-check is against `pinned_from`, not `S::VERSION`: the artifact at the
 origin was built by whatever `from` names, and that is what
 `verify_snapshot_envelope` is told to expect. A binary whose `VERSION` is

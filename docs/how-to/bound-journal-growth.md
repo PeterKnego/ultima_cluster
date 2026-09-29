@@ -8,23 +8,24 @@ together, at one log position, on command.
 This is also a prerequisite for reconfiguring a cluster under sustained write
 load — see [Change cluster membership](change-cluster-membership.md).
 
-## Confirm every declared FSM can snapshot
+## Every declared FSM can already snapshot
 
-Your `StateMachine` must also implement `SnapshotStateMachine`, giving it
-`freeze` (pin the state cheaply and hand back a handle), `stream_snapshot`
-(write that handle's bytes, off the apply thread) and `install_snapshot`, and
-the service must be started with
-`start_with_snapshots()` rather than `start()` — that is what publishes the
-row's **snapshot-capability bit**. `uc_lincheck`'s `RegisterSm` and
-`ListAppendSm` are small worked examples of the pair.
+Snapshot support is required (#67): `ServiceBuilder::start()` only compiles
+for `S: SnapshotStateMachine`, so any row built with the current SDK already
+has it, either through the `WholeStateSnapshot` helper (encode/decode the
+whole state, the SDK does the rest) or a hand-written `freeze` /
+`stream_snapshot` / `install_snapshot`. `uc_lincheck`'s `RegisterSm` and
+`ListAppendSm` are small worked examples of the hand-written pair;
+`examples/counter` is the helper.
 
 Every declared row has to be capable, not just row 0: a set at a position is
 complete only when every row *and* the cluster FSM have published an artifact
-at it. A cluster with one non-snapshotting row is legitimate — it simply never
-snapshots — so you are told rather than left watching a floor that never
-moves: `uc2ctl snapshot` refuses `48 snapshot_unsupported`, naming the row.
+at it. The only way to see a row without the capability bit is a service
+attached outside the Rust SDK — `uc2ctl snapshot` refuses `48
+snapshot_unsupported`, naming the row, rather than leaving you watching a
+floor that never moves.
 
-See [State-machine contract § Snapshots](../reference/state-machine-contract.md#snapshots-the-instant-the-envelope-and-the-exclusive-frontier)
+See [State-machine contract § Snapshots](../reference/state-machine-contract.md#snapshots-required-the-instant-the-envelope-and-the-exclusive-frontier)
 for what `freeze` must and must not do — in particular, keep it O(1) and put
 the O(state) work in `stream_snapshot`.
 

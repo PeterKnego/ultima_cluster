@@ -1630,7 +1630,8 @@ def arm_tt_h(voters, learner, a, checks, pins=None):
     two this arm commands, which is what makes the commit gaps attributable.
     `--snapshot-interval-bytes` still reaches the SERVICE role, where since
     coordinated snapshots it is nothing but the capability switch
-    (`start_with_snapshots`, `CNC_SVC_STATUS_SNAPSHOT_CAPABLE`)."""
+    (`CNC_SVC_STATUS_SNAPSHOT_CAPABLE`, set unconditionally by
+    `ServiceBuilder::start()` since #67 made snapshot support mandatory)."""
     with tt_options(state_bytes=a.state_bytes):
         leader = start_cluster_m14(voters, [(0, 0)], purge=False,
                                    snap=M14_SNAPSHOT_INTERVAL_BYTES, pins=pins)
