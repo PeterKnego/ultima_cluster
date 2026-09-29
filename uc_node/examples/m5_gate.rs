@@ -259,6 +259,20 @@ impl StateMachine for CountSm {
         self.last_applied
     }
 }
+impl uc_service::WholeStateSnapshot for CountSm {
+    fn encode_state(&self) -> Result<Vec<u8>, uc_service::SnapshotError> {
+        bincode::serde::encode_to_vec((self.count, self.last_applied), bincode::config::standard())
+            .map_err(|e| uc_service::SnapshotError::Codec(e.to_string()))
+    }
+    fn decode_state(&mut self, bytes: &[u8]) -> Result<(), uc_service::SnapshotError> {
+        let ((count, last_applied), _): ((u64, Option<u64>), usize) =
+            bincode::serde::decode_from_slice(bytes, bincode::config::standard())
+                .map_err(|e| uc_service::SnapshotError::Codec(e.to_string()))?;
+        self.count = count;
+        self.last_applied = last_applied;
+        Ok(())
+    }
+}
 
 /// Raw-tier twin of [`CountSm`]: sees the frame bytes, decodes nothing. Same
 /// deterministic increment, and a `u64` response either way — but NOT the same
@@ -288,6 +302,20 @@ impl RawStateMachine for RawCountSm {
 
     fn last_applied(&self) -> Option<u64> {
         self.last_applied
+    }
+}
+impl uc_service::WholeStateSnapshot for RawCountSm {
+    fn encode_state(&self) -> Result<Vec<u8>, uc_service::SnapshotError> {
+        bincode::serde::encode_to_vec((self.count, self.last_applied), bincode::config::standard())
+            .map_err(|e| uc_service::SnapshotError::Codec(e.to_string()))
+    }
+    fn decode_state(&mut self, bytes: &[u8]) -> Result<(), uc_service::SnapshotError> {
+        let ((count, last_applied), _): ((u64, Option<u64>), usize) =
+            bincode::serde::decode_from_slice(bytes, bincode::config::standard())
+                .map_err(|e| uc_service::SnapshotError::Codec(e.to_string()))?;
+        self.count = count;
+        self.last_applied = last_applied;
+        Ok(())
     }
 }
 
@@ -523,7 +551,7 @@ fn run_service(a: ServiceArgs) -> anyhow::Result<()> {
     // Each arm diverges (parks forever), so the two `Service<_>` types (one
     // per state-machine tier) never need to unify.
     if a.raw_sm {
-        let _svc = ServiceBuilder::new(cfg, RawCountSm::default()).start()?;
+        let _svc = ServiceBuilder::new(cfg, RawCountSm::default()).start_with_snapshots()?;
         println!(
             "m5_gate service up (raw-tier RawCountSm); parking (killed externally by the harness)"
         );
@@ -531,7 +559,7 @@ fn run_service(a: ServiceArgs) -> anyhow::Result<()> {
             std::thread::park();
         }
     } else {
-        let _svc = ServiceBuilder::new(cfg, CountSm::default()).start()?;
+        let _svc = ServiceBuilder::new(cfg, CountSm::default()).start_with_snapshots()?;
         println!("m5_gate service up (typed CountSm); parking (killed externally by the harness)");
         loop {
             std::thread::park();
@@ -1023,7 +1051,10 @@ fn run_all(a: AllArgs) -> anyhow::Result<()> {
     }
 }
 
-fn run_all_generic<S: RawStateMachine + Default>(a: AllArgs, sm_label: &str) -> anyhow::Result<()> {
+fn run_all_generic<S: RawStateMachine + uc_service::SnapshotStateMachine + Default>(
+    a: AllArgs,
+    sm_label: &str,
+) -> anyhow::Result<()> {
     let root = a
         .root
         .unwrap_or_else(|| PathBuf::from("target/m5_gate_smoke"));
@@ -1105,7 +1136,7 @@ fn run_all_generic<S: RawStateMachine + Default>(a: AllArgs, sm_label: &str) -> 
     // up — so every node starts before any service attaches.
     for instance_dir in &dirs {
         let svc = ServiceBuilder::new(ServiceConfig::new(instance_dir, ALL_APP_ID), S::default())
-            .start()
+            .start_with_snapshots()
             .expect("service start");
         services.push(svc);
     }

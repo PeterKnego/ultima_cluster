@@ -11,7 +11,10 @@ use serde::{Deserialize, Serialize};
 use uc_client::Client;
 use uc_log::cnc::CncPage;
 use uc_node::{CryptoConfig, FsmLag, Node, NodeConfig, PurgePolicy, ServicesConfig};
-use uc_service::{ApplyCtx, ServiceBuilder, ServiceConfig, StateMachine, Tagged};
+use uc_service::{
+    ApplyCtx, ServiceBuilder, ServiceConfig, SnapshotStateMachine, StateMachine, Tagged,
+    WholeStateSnapshot,
+};
 
 pub const APP: &str = "m14-services";
 
@@ -252,9 +255,25 @@ impl StateMachine for CountSm {
         self.last
     }
 }
+impl uc_service::WholeStateSnapshot for CountSm {
+    fn encode_state(&self) -> Result<Vec<u8>, uc_service::SnapshotError> {
+        bincode::serde::encode_to_vec((self.total, self.last), bincode::config::standard())
+            .map_err(|e| uc_service::SnapshotError::Codec(e.to_string()))
+    }
+    fn decode_state(&mut self, bytes: &[u8]) -> Result<(), uc_service::SnapshotError> {
+        let ((total, last), _): ((u64, Option<u64>), usize) =
+            bincode::serde::decode_from_slice(bytes, bincode::config::standard())
+                .map_err(|e| uc_service::SnapshotError::Codec(e.to_string()))?;
+        self.total = total;
+        self.last = last;
+        Ok(())
+    }
+}
 
-pub fn start_service<S: StateMachine + Default>(dir: &Path) -> uc_service::Service<S> {
-    match ServiceBuilder::new(ServiceConfig::new(dir, APP), S::default()).start() {
+pub fn start_service<S: StateMachine + SnapshotStateMachine + Default>(
+    dir: &Path,
+) -> uc_service::Service<S> {
+    match ServiceBuilder::new(ServiceConfig::new(dir, APP), S::default()).start_with_snapshots() {
         Ok(service) => service,
         // `NodeBooting` means the node never published its declared set
         // (`Consensus::maybe_publish_declared` held: leader unknown, commit
@@ -373,7 +392,7 @@ fn an_unknown_name_is_refused_by_name_and_a_second_attach_of_the_same_fsm_is_ref
     let node = Node::start(config(dir.path(), names(&["count", "fsm1"], None))).unwrap();
     wait_until("serving", || node.can_serve());
     let err = ServiceBuilder::new(ServiceConfig::new(dir.path(), APP), SlowCountSm::default())
-        .start()
+        .start_with_snapshots()
         .err()
         .expect("slow-count is not declared");
     match &err {
@@ -394,7 +413,7 @@ fn an_unknown_name_is_refused_by_name_and_a_second_attach_of_the_same_fsm_is_ref
         ServiceConfig::new(dir.path(), APP),
         Tagged::<1, CountSm>::default(),
     )
-    .start()
+    .start_with_snapshots()
     .err()
     .expect("fsm1 is held");
     assert!(
@@ -444,7 +463,7 @@ fn an_unknown_name_against_a_nameless_declared_page_hints_at_an_old_node() {
     }
 
     let err = ServiceBuilder::new(ServiceConfig::new(dir.path(), APP), SlowCountSm::default())
-        .start()
+        .start_with_snapshots()
         .err()
         .expect("row 0's name is gone, so nothing matches");
     assert!(
@@ -477,6 +496,14 @@ fn attach_writes_the_declared_version_into_the_slot() {
         }
         fn last_applied(&self) -> Option<u64> {
             self.0.last_applied()
+        }
+    }
+    impl WholeStateSnapshot for V {
+        fn encode_state(&self) -> Result<Vec<u8>, uc_service::SnapshotError> {
+            self.0.encode_state()
+        }
+        fn decode_state(&mut self, bytes: &[u8]) -> Result<(), uc_service::SnapshotError> {
+            self.0.decode_state(bytes)
         }
     }
     let _g = serialize();
@@ -555,6 +582,14 @@ impl StateMachine for SlowCountSm {
         self.0.last_applied()
     }
 }
+impl uc_service::WholeStateSnapshot for SlowCountSm {
+    fn encode_state(&self) -> Result<Vec<u8>, uc_service::SnapshotError> {
+        self.0.encode_state()
+    }
+    fn decode_state(&mut self, bytes: &[u8]) -> Result<(), uc_service::SnapshotError> {
+        self.0.decode_state(bytes)
+    }
+}
 
 /// Drive `n` submits through the pipelined client while a sampler thread
 /// records the largest `applied_0 - applied_1` it sees (applied_0 read FIRST,
@@ -619,7 +654,7 @@ fn bounded_lag_holds_between_a_fast_and_a_slow_fsm() {
         ServiceConfig::new(dir.path(), APP),
         Tagged::<1, SlowCountSm>::default(),
     )
-    .start()
+    .start_with_snapshots()
     .unwrap();
     // 3000 frames × 128 B = 384 KiB of log — six times the bound.
     let (max_gap, total) = drive_and_sample_gap(dir.path(), 3000);
@@ -662,7 +697,7 @@ fn lockstep_holds_the_fsms_within_one_frame() {
         ServiceConfig::new(dir.path(), APP),
         Tagged::<1, SlowCountSm>::default(),
     )
-    .start()
+    .start_with_snapshots()
     .unwrap();
     let (max_gap, total) = drive_and_sample_gap(dir.path(), 500);
     assert_eq!(total, 500);

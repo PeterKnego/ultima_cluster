@@ -282,6 +282,14 @@ impl StateMachine for NoopSm {
         None
     }
 }
+impl uc_service::WholeStateSnapshot for NoopSm {
+    fn encode_state(&self) -> Result<Vec<u8>, uc_service::SnapshotError> {
+        Ok(Vec::new())
+    }
+    fn decode_state(&mut self, _bytes: &[u8]) -> Result<(), uc_service::SnapshotError> {
+        Ok(())
+    }
+}
 
 // ------------------------------------------------------------- row 1: coverage
 
@@ -696,7 +704,7 @@ fn attach_noop_everywhere(nodes: &[NodeH]) -> Vec<Service<NoopSm>> {
         .iter()
         .map(|n| {
             ServiceBuilder::new(ServiceConfig::new(&n.instance_dir, APP), NoopSm)
-                .start()
+                .start_with_snapshots()
                 .expect("service attaches")
         })
         .collect();

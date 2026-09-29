@@ -867,6 +867,20 @@ impl StateMachine for RestoreCountSm {
         self.last_applied
     }
 }
+impl uc_service::WholeStateSnapshot for RestoreCountSm {
+    fn encode_state(&self) -> Result<Vec<u8>, uc_service::SnapshotError> {
+        bincode::serde::encode_to_vec((self.total, self.last_applied), bincode::config::standard())
+            .map_err(|e| uc_service::SnapshotError::Codec(e.to_string()))
+    }
+    fn decode_state(&mut self, bytes: &[u8]) -> Result<(), uc_service::SnapshotError> {
+        let ((total, last_applied), _): ((u64, Option<u64>), usize) =
+            bincode::serde::decode_from_slice(bytes, bincode::config::standard())
+                .map_err(|e| uc_service::SnapshotError::Codec(e.to_string()))?;
+        self.total = total;
+        self.last_applied = last_applied;
+        Ok(())
+    }
+}
 
 /// End-to-end: back up a stopped single node's instance dir, restore the
 /// artifact into a FRESH instance dir, boot a node + service there, and
@@ -886,7 +900,7 @@ fn restore_roundtrip_boots_and_serves() {
         ServicesConfig::single(RestoreCountSm::NAME),
     );
     let svc = ServiceBuilder::new(ServiceConfig::new(&dir, app), RestoreCountSm::default())
-        .start()
+        .start_with_snapshots()
         .expect("start service");
 
     let client = Client::connect(&dir, app).expect("connect client");
@@ -930,7 +944,7 @@ fn restore_roundtrip_boots_and_serves() {
         ServiceConfig::new(&fresh_dir, app),
         RestoreCountSm::default(),
     )
-    .start()
+    .start_with_snapshots()
     .expect("start restored service");
 
     let restored_client = Client::connect(&fresh_dir, app).expect("connect restored client");
@@ -971,7 +985,7 @@ fn restore_accepts_a_target_with_empty_dirs_and_a_stale_lock() {
         ServicesConfig::single(RestoreCountSm::NAME),
     );
     let svc = ServiceBuilder::new(ServiceConfig::new(&dir, app), RestoreCountSm::default())
-        .start()
+        .start_with_snapshots()
         .expect("start service");
 
     let client = Client::connect(&dir, app).expect("connect client");
@@ -1019,7 +1033,7 @@ fn restore_accepts_a_target_with_empty_dirs_and_a_stale_lock() {
         ServiceConfig::new(&fresh_dir, app),
         RestoreCountSm::default(),
     )
-    .start()
+    .start_with_snapshots()
     .expect("start restored service");
 
     let restored_client = Client::connect(&fresh_dir, app).expect("connect restored client");

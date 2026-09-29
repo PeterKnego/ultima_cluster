@@ -95,6 +95,26 @@ impl RawStateMachine for RawCount {
         self.last
     }
 }
+// #67 Task 3: only the impl, not the `.start()` -> `.start_with_snapshots()`
+// switch — this harness is perf-sensitive (see the module's hop-isolation
+// doc) and never commands a snapshot instant (confirmed: `grep -n
+// "snapshot\|SNAPSHOT\|instant"` finds only the `snapshot_dir_for` mkdir at
+// setup), so whether to pay for the builder thread here is a controller
+// call, not this task's.
+impl uc_service::WholeStateSnapshot for RawCount {
+    fn encode_state(&self) -> Result<Vec<u8>, uc_service::SnapshotError> {
+        bincode::serde::encode_to_vec((self.frames, self.last), bincode::config::standard())
+            .map_err(|e| uc_service::SnapshotError::Codec(e.to_string()))
+    }
+    fn decode_state(&mut self, bytes: &[u8]) -> Result<(), uc_service::SnapshotError> {
+        let ((frames, last), _): ((u64, Option<u64>), usize) =
+            bincode::serde::decode_from_slice(bytes, bincode::config::standard())
+                .map_err(|e| uc_service::SnapshotError::Codec(e.to_string()))?;
+        self.frames = frames;
+        self.last = last;
+        Ok(())
+    }
+}
 
 /// FSM identity: attach finds a service's row by name now, so N instances of
 /// the same `RawCount` logic each need a DISTINCT declared name to occupy N

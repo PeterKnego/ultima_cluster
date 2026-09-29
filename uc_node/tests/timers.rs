@@ -59,8 +59,8 @@ use uc_protocol::v2::schedule::{
     ScheduleEntry, ScheduleRule, ScheduleTable, encode_schedule_table,
 };
 use uc_service::{
-    ApplyCtx, RawStateMachine, Service, ServiceBuilder, ServiceConfig, StateMachine, Timed,
-    TimerEvent,
+    ApplyCtx, RawStateMachine, Service, ServiceBuilder, ServiceConfig, SnapshotStateMachine,
+    StateMachine, Timed, TimerEvent,
 };
 /// The §4.3 ordering oracle, over frames a REAL node appended (plan 2 T10).
 /// `uc_sim` is a dev-dependency of `uc_node` for exactly this — see the
@@ -140,9 +140,9 @@ fn open_cnc(dir: &Path) -> std::sync::Arc<CncPage> {
 /// `services.rs::start_service`, but for an already-constructed state machine
 /// (`Timed<ClockSm>` has no `Default`, and wrapping is the point here) and for
 /// the raw tier (`Timed<S>` implements `RawStateMachine`, not `StateMachine`).
-fn start_service_with<S: RawStateMachine>(dir: &Path, sm: S) -> Service<S> {
+fn start_service_with<S: RawStateMachine + SnapshotStateMachine>(dir: &Path, sm: S) -> Service<S> {
     ServiceBuilder::new(ServiceConfig::new(dir, APP), sm)
-        .start()
+        .start_with_snapshots()
         .expect("service start")
 }
 

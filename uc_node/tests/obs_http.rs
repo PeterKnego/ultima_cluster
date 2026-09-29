@@ -333,6 +333,14 @@ impl StateMachine for NoopSm {
         None
     }
 }
+impl uc_service::WholeStateSnapshot for NoopSm {
+    fn encode_state(&self) -> Result<Vec<u8>, uc_service::SnapshotError> {
+        Ok(Vec::new())
+    }
+    fn decode_state(&mut self, _bytes: &[u8]) -> Result<(), uc_service::SnapshotError> {
+        Ok(())
+    }
+}
 
 fn config_for(addr: SocketAddr, instance_dir: std::path::PathBuf) -> NodeConfig {
     NodeConfig {
@@ -385,7 +393,7 @@ fn a_real_single_node_cluster_serves_and_becomes_ready() {
     // (readiness requires it fresh; a node with no service ever attached
     // must NOT read as ready).
     let svc = ServiceBuilder::new(ServiceConfig::new(&instance_dir, APP), NoopSm)
-        .start()
+        .start_with_snapshots()
         .expect("service attaches");
 
     let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();

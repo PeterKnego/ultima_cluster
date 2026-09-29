@@ -88,6 +88,20 @@ impl StateMachine for CountSm {
         self.last_applied
     }
 }
+impl uc_service::WholeStateSnapshot for CountSm {
+    fn encode_state(&self) -> Result<Vec<u8>, uc_service::SnapshotError> {
+        bincode::serde::encode_to_vec((self.total, self.last_applied), bincode::config::standard())
+            .map_err(|e| uc_service::SnapshotError::Codec(e.to_string()))
+    }
+    fn decode_state(&mut self, bytes: &[u8]) -> Result<(), uc_service::SnapshotError> {
+        let ((total, last_applied), _): ((u64, Option<u64>), usize) =
+            bincode::serde::decode_from_slice(bytes, bincode::config::standard())
+                .map_err(|e| uc_service::SnapshotError::Codec(e.to_string()))?;
+        self.total = total;
+        self.last_applied = last_applied;
+        Ok(())
+    }
+}
 
 // --------------------------------------------------------- crypto fixtures
 
@@ -327,7 +341,7 @@ fn a_crypto_enabled_cluster_elects_replicates_and_serves_a_linearizable_read() {
 
     let leader_dir = c.dirs[leader].clone();
     let svc = ServiceBuilder::new(ServiceConfig::new(&leader_dir, APP), CountSm::default())
-        .start()
+        .start_with_snapshots()
         .unwrap();
     let client = Client::connect(&leader_dir, APP).unwrap();
 
@@ -403,7 +417,7 @@ fn a_cleartext_node_cannot_join_a_sealed_cluster() {
 
     let leader_dir = c.dirs[leader].clone();
     let svc = ServiceBuilder::new(ServiceConfig::new(&leader_dir, APP), CountSm::default())
-        .start()
+        .start_with_snapshots()
         .unwrap();
     let client = Client::connect(&leader_dir, APP).unwrap();
     for _ in 0..10 {
@@ -522,7 +536,7 @@ fn a_cluster_forms_even_when_one_member_never_comes_up() {
     let leader = await_single_leader(&nodes, &[0, 1], 60);
     let leader_dir = dirs[leader].clone();
     let svc = ServiceBuilder::new(ServiceConfig::new(&leader_dir, APP), CountSm::default())
-        .start()
+        .start_with_snapshots()
         .unwrap();
     let client = Client::connect(&leader_dir, APP).unwrap();
     for i in 1..=5u64 {

@@ -60,6 +60,20 @@ impl StateMachine for CountSm {
         self.last_applied
     }
 }
+impl uc_service::WholeStateSnapshot for CountSm {
+    fn encode_state(&self) -> Result<Vec<u8>, uc_service::SnapshotError> {
+        bincode::serde::encode_to_vec((self.total, self.last_applied), bincode::config::standard())
+            .map_err(|e| uc_service::SnapshotError::Codec(e.to_string()))
+    }
+    fn decode_state(&mut self, bytes: &[u8]) -> Result<(), uc_service::SnapshotError> {
+        let ((total, last_applied), _): ((u64, Option<u64>), usize) =
+            bincode::serde::decode_from_slice(bytes, bincode::config::standard())
+                .map_err(|e| uc_service::SnapshotError::Codec(e.to_string()))?;
+        self.total = total;
+        self.last_applied = last_applied;
+        Ok(())
+    }
+}
 
 // ------------------------------------------------------------------ harness
 
@@ -182,7 +196,7 @@ fn stale_leader_fails_linearizable_read_confirmation() {
 
     // A real service + client attached to the current leader.
     let svc = ServiceBuilder::new(ServiceConfig::new(&leader_dir, APP), CountSm::default())
-        .start()
+        .start_with_snapshots()
         .unwrap();
     let client = Client::connect(&leader_dir, APP).unwrap();
 
@@ -239,7 +253,7 @@ fn concurrent_batched_reads_stay_linearizable_across_partition() {
     let leader_dir = c.dirs[leader].clone();
 
     let svc = ServiceBuilder::new(ServiceConfig::new(&leader_dir, APP), CountSm::default())
-        .start()
+        .start_with_snapshots()
         .unwrap();
     let client = Client::connect(&leader_dir, APP).unwrap();
     drive_submits(&client, 100);

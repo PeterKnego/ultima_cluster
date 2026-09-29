@@ -1107,6 +1107,20 @@ impl StateMachine for CountSm {
         self.last_applied
     }
 }
+impl uc_service::WholeStateSnapshot for CountSm {
+    fn encode_state(&self) -> Result<Vec<u8>, uc_service::SnapshotError> {
+        bincode::serde::encode_to_vec((self.total, self.last_applied), bincode::config::standard())
+            .map_err(|e| uc_service::SnapshotError::Codec(e.to_string()))
+    }
+    fn decode_state(&mut self, bytes: &[u8]) -> Result<(), uc_service::SnapshotError> {
+        let ((total, last_applied), _): ((u64, Option<u64>), usize) =
+            bincode::serde::decode_from_slice(bytes, bincode::config::standard())
+                .map_err(|e| uc_service::SnapshotError::Codec(e.to_string()))?;
+        self.total = total;
+        self.last_applied = last_applied;
+        Ok(())
+    }
+}
 
 fn spawn_storm_cluster(faults: FaultConfig) -> (tempfile::TempDir, Vec<Node>, Vec<PathBuf>) {
     let n = 3;
@@ -1229,7 +1243,9 @@ fn heavy_corruption_and_replay_injection_never_panics_and_never_diverges() {
         };
         if client.is_none() {
             let d = dirs[leader].clone();
-            match ServiceBuilder::new(ServiceConfig::new(&d, APP), CountSm::default()).start() {
+            match ServiceBuilder::new(ServiceConfig::new(&d, APP), CountSm::default())
+                .start_with_snapshots()
+            {
                 Ok(svc) => {
                     svc_holder = Some(svc);
                     client = Client::connect(&d, APP).ok();
