@@ -99,3 +99,42 @@ impl StateMachine for CounterSm {
         self.last_applied
     }
 }
+
+/// Snapshots are required (#67). A counter's whole state is two numbers, so
+/// the simple helper fits: encode the state, decode it back, and the SDK
+/// handles the rest. A state machine with a large state should implement
+/// `SnapshotStateMachine` itself instead — see `docs/reference/state-machine-contract.md`.
+impl uc_service::WholeStateSnapshot for CounterSm {
+    fn encode_state(&self) -> Result<Vec<u8>, uc_service::SnapshotError> {
+        bincode::serde::encode_to_vec((self.value, self.last_applied), bincode::config::standard())
+            .map_err(|e| uc_service::SnapshotError::Codec(e.to_string()))
+    }
+    fn decode_state(&mut self, bytes: &[u8]) -> Result<(), uc_service::SnapshotError> {
+        let ((value, last_applied), _): ((i64, Option<u64>), _) =
+            bincode::serde::decode_from_slice(bytes, bincode::config::standard())
+                .map_err(|e| uc_service::SnapshotError::Codec(e.to_string()))?;
+        self.value = value;
+        self.last_applied = last_applied;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+    use uc_service::SnapshotStateMachine;
+
+    #[test]
+    fn counter_round_trips_value_and_cursor() {
+        let c = CounterSm {
+            value: -5,
+            last_applied: Some(640),
+        };
+        let (h, pos) = c.freeze().unwrap();
+        let mut bytes = Vec::new();
+        CounterSm::stream_snapshot(h, &mut bytes).unwrap();
+        let mut d = CounterSm::default();
+        d.install_snapshot(pos + 64, &mut &bytes[..]).unwrap();
+        assert_eq!((d.value, d.last_applied), (-5, Some(640)));
+    }
+}

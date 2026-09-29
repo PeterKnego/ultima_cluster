@@ -77,7 +77,7 @@ fn main() -> anyhow::Result<()> {
         ServiceConfig::new(instance_dir.clone(), APP_ID.to_string()),
         CounterSm::default(),
     )
-    .start()?;
+    .start_with_snapshots()?;
 
     // 4. Connect a client over shared memory and drive it.
     let client = Client::connect(&instance_dir, APP_ID)?;

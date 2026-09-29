@@ -955,6 +955,249 @@ fn fresh_learner_joins_a_purged_leader_via_snapshot_session() {
     voter.stop();
 }
 
+/// #67 Task 4 (spec §7.4): the same raw-tier "sum" logic as `SumSm` below —
+/// `apply`/`query`/`last_applied` are copied verbatim — but its snapshot
+/// support comes from the SDK's `WholeStateSnapshot` helper instead of a
+/// hand-written `SnapshotStateMachine` impl. `encode_state`/`decode_state`
+/// replace `freeze`/`stream_snapshot`/`install_snapshot`; the SDK owns the
+/// framing, the exclusive-frontier check, and the cursor check (spec D5)
+/// neither this type nor `SumSm` has to repeat by hand. `encode_state` still
+/// carries `last_applied` itself (spec §4.3: "INCLUDING the state's own
+/// record of `last_applied`") — the SDK only *checks* the cursor came back,
+/// it does not restore it for the app.
+#[derive(Default)]
+struct HelperSumSm {
+    total: u64,
+    last: Option<u64>,
+}
+
+impl uc_service::RawStateMachine for HelperSumSm {
+    const NAME: &'static str = "sum-helper";
+
+    fn apply(&mut self, ctx: &mut uc_service::ApplyCtx, cmd: &[u8], out: &mut Vec<u8>) {
+        if cmd.len() >= 8 {
+            self.total = self
+                .total
+                .wrapping_add(u64::from_le_bytes(cmd[..8].try_into().unwrap()));
+        }
+        self.last = Some(ctx.position);
+        out.extend_from_slice(&self.total.to_le_bytes());
+    }
+    fn query(&self, _q: &[u8], out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.total.to_le_bytes());
+    }
+    fn last_applied(&self) -> Option<u64> {
+        self.last
+    }
+}
+
+impl uc_service::WholeStateSnapshot for HelperSumSm {
+    fn encode_state(&self) -> Result<Vec<u8>, uc_service::SnapshotError> {
+        let mut buf = Vec::with_capacity(16);
+        buf.extend_from_slice(&self.total.to_le_bytes());
+        buf.extend_from_slice(&self.last.unwrap_or(0).to_le_bytes());
+        Ok(buf)
+    }
+    fn decode_state(&mut self, bytes: &[u8]) -> Result<(), uc_service::SnapshotError> {
+        if bytes.len() < 16 {
+            return Err(uc_service::SnapshotError::Codec("helper sum frame".into()));
+        }
+        self.total = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+        // The teeth check (Task 4 report): commenting out this line makes
+        // `decode_state` restore `total` but not `last`, so the D5 check in
+        // the blanket `install_snapshot` ("decode_state did not restore
+        // last_applied") refuses the install and the apply thread fail-stops
+        // in `uc_service::replay::replay_into` — proving this line is load
+        // -bearing rather than the round-trip passing by accident.
+        self.last = Some(u64::from_le_bytes(bytes[8..16].try_into().unwrap()));
+        Ok(())
+    }
+}
+
+fn start_helper_sum_service(dir: &Path, app: &str) -> uc_service::Service<HelperSumSm> {
+    // Snapshot-CAPABLE only, exactly like `start_sum_service` below — this
+    // row freezes at the instants the leader commands.
+    let cfg = uc_service::ServiceConfig::new(dir, app);
+    uc_service::ServiceBuilder::new(cfg, HelperSumSm::default())
+        .start_with_snapshots()
+        .expect("service start")
+}
+
+/// #67 Task 4 (spec §7.4): the same below-floor join as
+/// `fresh_learner_joins_a_purged_leader_via_snapshot_session` above, but
+/// driven by a REAL, helper-based service (`HelperSumSm`) instead of faked
+/// row artifacts — `uc_node`'s tests cannot depend on `examples/counter`, so
+/// this is the end-to-end proof that a `WholeStateSnapshot` FSM's artifact
+/// survives a real snapshot session and a real fresh-learner join, with the
+/// value converging afterwards.
+#[test]
+fn a_helper_fsm_learner_joins_a_purged_leader() {
+    let _g = serialize();
+    let dir = tempfile::Builder::new()
+        .prefix("uc2-learner-helper-")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("tempdir");
+    const SEG: u64 = 64 * 1024;
+    const N: u64 = 12000;
+    let app = "learner-join-helper";
+
+    let v_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let l_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let v_addr = v_sock.local_addr().unwrap();
+    let l_addr = l_sock.local_addr().unwrap();
+    let members = vec![(0u32, v_addr)];
+    let learners = vec![(1u32, l_addr)];
+
+    let cfg = |id: NodeId, sock_addr: SocketAddr, d: PathBuf| NodeConfig {
+        id,
+        members: members.clone(),
+        learners: learners.clone(),
+        bind: sock_addr,
+        instance_dir: d,
+        app_id: app.into(),
+        // A SMALL ring so a fresh learner's NAK from 0 falls BELOW the ring
+        // floor (durable - capacity) into the PURGED journal region →
+        // snapshot session — same shape as the hand-written-trait test above.
+        buffer_bytes: 1 << 18,
+        max_payload: 256,
+        admission_bytes_default: 256 * 1024,
+        settings_genesis: uc_protocol::v2::settings::Settings::genesis_default(),
+        force_jumbo_frames: false,
+        election_timeout_min_ns: 50_000_000,
+        election_timeout_max_ns: 100_000_000,
+        seed: 0xC0FFEE ^ id as u64,
+        faults: FaultConfig::default(),
+        purge: PurgePolicy::BelowSnapshot { slack_bytes: 0 },
+        journal_segment_bytes: SEG,
+        crypto: uc_node::CryptoConfig::Disabled,
+        services: uc_node::ServicesConfig::single(
+            <HelperSumSm as uc_service::RawStateMachine>::NAME,
+        ),
+    };
+
+    let v_dir = dir.path().join("v0");
+    let voter =
+        Node::start_with_socket(cfg(0, v_addr, v_dir.clone()), v_sock).expect("start voter");
+    let v0 = start_helper_sum_service(&v_dir, app);
+    await_until(30, "voter serves", || voter.can_serve());
+
+    // No faking here: the row runs a REAL helper-based snapshot-capable
+    // service, so it freezes for real at the instant the leader commands
+    // (coordinated-snapshot spec §5.5). The instant lands in the MIDDLE of
+    // the traffic, same as the hand-written-trait test: half the log below P
+    // becomes the purged prefix, half above it the tail a below-floor joiner
+    // replays after installing the set.
+    let v_cnc = CncPage::open_file(&v_dir.join("cnc2.dat"), app).expect("open voter cnc");
+    submit_frames(&voter, N);
+    let instant = instant_until_complete(&voter, &v_cnc, &[0], |_| {});
+    submit_frames(&voter, N);
+    await_until(30, "voter quiesced", || {
+        let c = voter.counters();
+        let a = c.append.load_acquire();
+        a > 0 && c.commit.load_acquire() == a && c.durable.load_acquire() == a
+    });
+
+    assert_eq!(
+        v_cnc.service_slot(0).snapshot_pos.load_acquire(),
+        instant,
+        "the helper-based row froze at the instant"
+    );
+    assert!(
+        instant > SEG,
+        "need >1 segment below the instant (instant={instant})"
+    );
+
+    await_until(30, "voter purged its prefix", || {
+        voter.archive_first_base() > 0
+    });
+    let first_base = voter.archive_first_base();
+    assert!(
+        first_base > 0,
+        "the prefix must be gone so replay-from-0 is impossible"
+    );
+    let frontier = voter.counters().append.load_acquire();
+    let commit = voter.counters().commit.load_acquire();
+
+    // "voter quiesced" above only waits for the NODE's counters (append /
+    // commit / durable); the row's OWN apply loop can still be catching up
+    // through an overrun on this small a ring size — Ruling R18 / spec §10 apply
+    // to the leader's own row too, not only a joiner's. Wait for the row
+    // itself before reading its value, or the query below can race a stale
+    // total (measured: it does, reliably, without this wait).
+    await_until(
+        30,
+        "voter's helper-based row applied to its own commit",
+        || v_cnc.service_slot(0).applied.load_acquire() >= commit,
+    );
+
+    // `submit_frames` sends 0..N twice (once below the instant, once above
+    // it), each frame's payload the little-endian `u64` `i` — the same
+    // encoding `HelperSumSm::apply` decodes.
+    let mut voter_value = Vec::new();
+    v0.query_raw(&[], &mut voter_value);
+    assert_ne!(
+        voter_value,
+        0u64.to_le_bytes(),
+        "sanity: real traffic moved the value off its zero default"
+    );
+
+    // A FRESH learner joins with no prior state.
+    let l_dir = dir.path().join("l1");
+    let learner =
+        Node::start_with_socket(cfg(1, l_addr, l_dir.clone()), l_sock).expect("start learner");
+    let l0 = start_helper_sum_service(&l_dir, app);
+
+    // It cannot replay `[0, first_base)` (purged) — the ONLY way it reaches
+    // the frontier is the snapshot session + AdoptFloor + tail replay.
+    await_until(60, "learner caught up across the purged prefix", || {
+        learner.counters().durable.load_acquire() >= frontier
+            && learner.counters().commit.load_acquire() >= frontier
+    });
+    assert!(
+        learner.archive_first_base() >= first_base,
+        "the learner must have adopted the shipped snapshot floor, not replayed from 0"
+    );
+    assert!(!learner.is_leader(), "a learner never leads");
+
+    let l_cnc = CncPage::open_file(&l_dir.join("cnc2.dat"), app).expect("open learner cnc");
+    await_until(
+        60,
+        "the helper-based FSM applied to the leader's commit",
+        || l_cnc.service_slot(0).applied.load_acquire() >= commit,
+    );
+
+    // The claim this test exists to prove: the helper-based FSM's value
+    // converges after a real below-floor join through a real snapshot
+    // session — not just that SOME bytes landed on disk.
+    let mut learner_value = Vec::new();
+    l0.query_raw(&[], &mut learner_value);
+    assert_eq!(
+        learner_value, voter_value,
+        "the learner's helper-based state must converge with the voter's after the \
+         below-floor join"
+    );
+
+    assert_eq!(
+        learner.snapshot_session_refusals(),
+        (0, 0, 0, 0, 0),
+        "matching declared identity/version and a wire-current peer: no refusal may fire"
+    );
+    // As the hand-written-trait test's discriminating oracle: the artifact
+    // must have come from a snapshot SESSION, not a log replay.
+    assert!(
+        voter
+            .observability()
+            .sender
+            .snap_sessions
+            .load(std::sync::atomic::Ordering::Relaxed)
+            >= 1,
+        "the artifact must have come from a snapshot session, not a log replay"
+    );
+
+    learner.stop();
+    voter.stop();
+}
+
 /// A snapshot-capable RAW state machine (bytes in, bytes out — no serde, so the
 /// test can submit plain byte payloads through `Node::submit` exactly as the
 /// single-FSM join test above does). `freeze` pins `(total, last_applied)`.
