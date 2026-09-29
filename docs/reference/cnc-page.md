@@ -237,7 +237,7 @@ line 7.
 The capability bit is what `uc2ctl snapshot` checks before it commands
 anything: a row that never sets it ignores a `SNAPSHOT` frame and could
 therefore never complete a set — since #67 every Rust SDK service sets it
-unconditionally, so this can only happen for a row attached outside the SDK
+unconditionally, so this can only happen for a service attached without the current Rust SDK (a non-Rust attacher, or a binary built before #67)
 — so the leader refuses the instant `48 snapshot_unsupported` **naming that
 row** rather than leaving an operator watching a floor that never moves. See
 [The cluster FSM, explained § Instants](../notes/uc2-cluster-fsm-explained.md#instants-one-position-one-set).

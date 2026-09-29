@@ -330,7 +330,7 @@ treated as "no pin", because attaching unpinned off a half-published triple
 would skip an install the cluster requires), `PinRequiresSnapshots` (a pinned
 row attached without the install capability — since #67 every `start()`
 carries it, so the SDK can no longer produce this; it stays as `attach`'s
-backstop for an attach outside the Rust SDK, which would otherwise replay the
+backstop for a service attached without the current Rust SDK (a non-Rust attacher, or a binary built before #67), which would otherwise replay the
 origin's prefix under this binary instead — the §2.3 counterfactual), and
 `PinnedArtifactMissing` (the pin names an origin whose artifact is not on
 this node — the complete set at that instant was pruned or never fetched;

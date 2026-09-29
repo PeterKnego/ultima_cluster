@@ -258,7 +258,7 @@ transport setting, both measured closed-loop at inflight 1 on 8-vCPU
   `48 snapshot_unsupported` naming any declared row without the snapshot
   capability bit (it would ignore the frame, so the set could never
   complete — since #67 every Rust SDK service sets this bit unconditionally,
-  so it now only fires for a row attached outside the SDK), and
+  so it now only fires for a service attached without the current Rust SDK (a non-Rust attacher, or a binary built before #67)), and
   `49 snapshot_no_learner` for `--standby` with no learner in the committed
   membership. A cadence is the
   replicated `snapshot_interval_bytes` (`0`, the default, means

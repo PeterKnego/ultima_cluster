@@ -225,7 +225,8 @@ impl<S: RawStateMachine, O: RawOutputHandler<S>> ServiceBuilder<S, O> {
     /// itself snapshot-CAPABLE (`CNC_SVC_STATUS_SNAPSHOT_CAPABLE` in its slot
     /// status, written by `attach` in the same store as the attached bit).
     /// The leader refuses to command an instant while any declared row lacks
-    /// that bit (refusal 48), which a non-SDK attacher can still trigger.
+    /// that bit (refusal 48), which a service attached without the current Rust SDK
+    /// (a non-Rust attacher, or a binary built before #67) can still trigger.
     ///
     /// A state machine without snapshot support does not start (#67):
     ///

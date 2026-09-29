@@ -444,7 +444,7 @@ Without the install capability it would replay the origin's prefix under the
 *new* version, which is exactly the counterfactual the pin exists to avoid.
 Since #67 every `ServiceBuilder::start()` carries this capability, so a Rust
 SDK service cannot reach this refusal any more — it is `attach`'s backstop
-for a row attached outside the SDK.
+for a service attached without the current Rust SDK (a non-Rust attacher, or a binary built before #67).
 
 **4. The artifact at the origin is not on this node** — refused:
 

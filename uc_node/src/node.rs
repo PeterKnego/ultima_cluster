@@ -6066,7 +6066,8 @@ impl Consensus {
     ///    pass over eight cnc slots to say "not yet".
     /// 3. **Capability.** Every DECLARED row's slot must carry
     ///    `CNC_SVC_STATUS_SNAPSHOT_CAPABLE`; the first that does not is named
-    ///    (`48`). A row without the bit (a non-SDK attacher since #67) ignores the frame, so
+    ///    (`48`). A row without the bit (since #67, only a service attached without the current Rust SDK:
+    ///    a non-Rust attacher, or a binary built before #67) ignores the frame, so
     ///    the set at P could never complete and the floor would never move —
     ///    the operator is told rather than left watching a stalled floor.
     /// 4. **A standby instant needs a learner** (`49`): only a learner
