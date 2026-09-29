@@ -222,10 +222,11 @@ the cursor at `freeze` and, on install, refuses to proceed unless
 `SnapshotError::Codec("decode_state did not restore last_applied (encode it
 with the state)")`. A lost cursor would make the apply loop re-apply frames
 the snapshot already contains — a silent double-apply — so the SDK makes it a
-named error instead. A recorded cursor *above* the install's tag is refused
-too, with `SnapshotError::Codec("mis-tagged: cursor above tag")` (the tag is
-an exclusive frontier — see below — so the cursor may sit at or below it,
-never above).
+named error instead. A recorded cursor *at or above* the install's tag is
+refused too, with `SnapshotError::Codec("mis-tagged: cursor not below tag")`:
+the tag is an exclusive frontier (see below) and a cursor is a frame's start,
+so the cursor must sit strictly below it — a cursor equal to the tag would
+claim the very frame the tag says is not covered.
 
 **2. The full `SnapshotStateMachine` trait**, for large state or a
 copy-on-write / persistent-structure implementation where the helper's whole-

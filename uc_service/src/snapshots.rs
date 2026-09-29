@@ -514,8 +514,14 @@ impl<S: WholeStateSnapshot> SnapshotStateMachine for S {
         }
         let recorded =
             (buf[0] == 1).then(|| u64::from_le_bytes(buf[1..9].try_into().expect("8 bytes")));
-        if recorded.unwrap_or(0) > position {
-            return Err(SnapshotError::Codec("mis-tagged: cursor above tag".into()));
+        // The tag is EXCLUSIVE and a cursor is a frame START, so a recorded
+        // cursor must sit strictly below it: every UC-built artifact has
+        // `cursor < SNAPSHOT frame start < tag` (#73). Equal is a mis-tag too
+        // — it claims the frame AT the tag, which tail-replay would then skip.
+        if recorded.is_some_and(|c| c >= position) {
+            return Err(SnapshotError::Codec(
+                "mis-tagged: cursor not below tag".into(),
+            ));
         }
         self.decode_state(&buf[WHOLE_STATE_HEADER_LEN..])?;
         if self.last_applied() != recorded {
@@ -1067,8 +1073,34 @@ mod whole_state_tests {
             .install_snapshot(4096, &mut &bytes[..])
             .unwrap_err();
         assert!(
-            err.to_string().contains("mis-tagged: cursor above tag"),
+            err.to_string().contains("mis-tagged: cursor not below tag"),
             "{err}"
+        );
+    }
+
+    /// #73: the tag is an EXCLUSIVE frontier and a cursor is a frame START,
+    /// so a cursor EQUAL to the tag says the frame at the tag was applied
+    /// while the tag says it is not covered. Every UC-built artifact has
+    /// `cursor < SNAPSHOT frame start < P` (`apply.rs::on_snapshot_frame`),
+    /// so equality is only ever a mis-tag — and accepting it would make the
+    /// replay path (which does not check the cursor) skip the frame at P.
+    #[test]
+    fn install_refuses_a_cursor_equal_to_the_tag() {
+        let (bytes, _) = freeze_bytes(&Sum {
+            total: 1,
+            last: Some(4096),
+            forget_cursor: false,
+        });
+        let mut t = Sum::default();
+        let err = t.install_snapshot(4096, &mut &bytes[..]).unwrap_err();
+        assert!(
+            err.to_string().contains("mis-tagged: cursor not below tag"),
+            "{err}"
+        );
+        assert_eq!(
+            (t.total, t.last),
+            (0, None),
+            "a refused install must not half-apply"
         );
     }
 
