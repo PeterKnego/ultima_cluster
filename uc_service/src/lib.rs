@@ -298,12 +298,29 @@ impl<S: RawStateMachine, O: RawOutputHandler<S>> ServiceBuilder<S, O> {
         let pinned = attached.pin;
         let lock = attached._lock;
 
+        // 6. Spawn the apply thread. `AgentRunner::drop` already signals+joins,
+        //    so a spawn failure below cannot leak a running thread. Keep a shared
+        //    handle to the state machine so the `Service` can answer direct
+        //    queries (test/embedded path until the client query ring, Task 11)
+        //    AND so the output thread (below) sees apply's effects.
         let mut state = attached.apply_state;
         let sm = Arc::clone(&state.sm);
         let journal_dir = state.journal_dir.clone();
 
+        // Task 12: spawn the output thread ONLY for a real (non-Noop) handler
+        // — `O`'s bound (`Send + 'static`) makes it `TypeId`-comparable, so this
+        // check is resolved per-monomorphization. The comparison is on the
+        // CONCRETE type, not on how it reached the builder, so an explicit
+        // `.output_handler(NoopOutput)` skips the spawn exactly like the
+        // default (no `.output_handler` call) path — there is no way to force
+        // a pure no-op thread into existence. `TypedOutput<NoopOutput>` is
+        // named too, because M12a routes a typed handler through that adapter:
+        // without it the `.output_handler(NoopOutput)` case would start
+        // spawning a thread that can only ever run a no-op duty cycle.
         let mut agents = Vec::with_capacity(3);
         if !is_noop_output::<O>() {
+            // Own cursor over the SAME log buffer, seeded from the node's
+            // durable output-progress marker (Task 12 module doc).
             let start_pos = cnc.status().output_progress.load_acquire();
             let output_follower = LogFollower::new(Arc::clone(&buffer), start_pos);
             let mut output_state = OutputState::new(
@@ -318,6 +335,9 @@ impl<S: RawStateMachine, O: RawOutputHandler<S>> ServiceBuilder<S, O> {
             let output_agent = AgentRunner::spawn("uc2-output", OUTPUT_IDLE, move || {
                 output_cycle(&mut output_state)
             })?;
+            // Stop order (`Service::stop`/`Drop`): output before apply — a
+            // side-effect thread is lower-priority to keep running through
+            // teardown than the apply thread it depends on for `state: &S`.
             agents.push(output_agent);
         }
 
