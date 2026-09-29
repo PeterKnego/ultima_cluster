@@ -375,7 +375,7 @@ fn main() -> anyhow::Result<()> {
                 cnc.counters().durable.store_release(p);
                 cnc.counters().commit.store_release(p);
                 appended.store(n, Ordering::Relaxed);
-                stalls
+                (stalls, n, p)
             })?
     };
 
@@ -397,7 +397,7 @@ fn main() -> anyhow::Result<()> {
     let appended1 = appended.load(Ordering::Relaxed);
     let elapsed = t0.elapsed().as_secs_f64();
     stop.store(true, Ordering::Relaxed);
-    let stalls = driver.join().expect("driver");
+    let (stalls, total_frames, end) = driver.join().expect("driver");
 
     println!(
         "== apply_bench: {} FSM(s), mode={} lag={} payload={} frame={} batch={} window={} secs={:.2} (SMOKE, not a gate) ==",
@@ -435,14 +435,33 @@ fn main() -> anyhow::Result<()> {
     );
 
     // The SM's own count: proves the cursor sweep applied every frame (not
-    // just advanced past them). `total` covers warmup too, so compare against
-    // the total applied bytes / frame.
+    // just advanced past them). Compare it against the frames the driver
+    // APPENDED, never `applied / frame`: the applied cursor is a byte
+    // position, and it also crosses the header-only PADDING frame the
+    // appender writes at each wrap whenever `frame` does not divide the
+    // buffer (96 B into 64 MiB leaves 64 B a lap), which the apply loop
+    // rightly skips — so bytes / frame over-counts by ~64/96 per lap (#72).
+    // Wait for every FSM to reach the driver's final position first, so the
+    // count is not read while a slow FSM is still catching up.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    for id in 0..a.fsms as usize {
+        while cnc.service_slot(id).applied.load_acquire() < end {
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "fsm={id} did not apply to the driver's final position {end} within 10 s"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
     for (id, s) in services.iter().enumerate() {
         let sm_frames = s.query_frames();
-        let swept = cnc.service_slot(id).applied.load_acquire() / frame;
         println!(
-            "fsm={id} sm_frames={sm_frames} swept_frames={swept}{}",
-            if sm_frames == swept { "" } else { " MISMATCH" }
+            "fsm={id} sm_frames={sm_frames} appended_frames={total_frames}{}",
+            if sm_frames == total_frames {
+                ""
+            } else {
+                " MISMATCH"
+            }
         );
     }
     for s in services {
