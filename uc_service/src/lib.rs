@@ -105,8 +105,9 @@ const APPLY_IDLE: IdleStrategy = IdleStrategy::Backoff {
 };
 /// The snapshot builder's idle: the plain sleep. It is a background agent
 /// whose work arrives at snapshot instants, not per frame, so the ladder's
-/// awake window would buy it nothing and cost a core after every build.
-const BUILDER_IDLE: IdleStrategy = IdleStrategy::Sleep(Duration::from_micros(50));
+/// awake window would buy it nothing and cost a core after every build. One
+/// builder thread per service wakes about 1 000 times a second while idle.
+const BUILDER_IDLE: IdleStrategy = IdleStrategy::Sleep(Duration::from_millis(1));
 
 /// The apply agent's idle strategy from `UC2_APPLY_IDLE`, or [`APPLY_IDLE`]
 /// when unset. Accepted values: `backoff` (the default ladder, spelled out),

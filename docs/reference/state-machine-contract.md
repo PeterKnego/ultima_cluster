@@ -158,7 +158,8 @@ change is a pin, and a pin needs the origin artifact); the SDK makes that a
 compile error instead of a production surprise. `start()` always spawns the
 snapshot builder thread now, too — it idles (sleeps between checks) until the
 log commands an instant, so an unconfigured cluster that never snapshots
-costs one quiet thread, not a busy poll.
+costs one builder thread per service that wakes about 1 000 times a second
+while idle, not a busy poll.
 
 There are two ways to satisfy the bound:
 

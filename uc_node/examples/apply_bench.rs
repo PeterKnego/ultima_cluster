@@ -98,7 +98,7 @@ impl RawStateMachine for RawCount {
 // #67: every service is snapshot-capable, so this harness's rows are too.
 // It never commands a snapshot instant (the only snapshot-ish line is the
 // `snapshot_dir_for` mkdir at setup), so the capability costs each row an
-// idle `uc2-snapshot-builder` thread (`IdleStrategy::Sleep(50µs)`) and the
+// idle `uc2-snapshot-builder` thread (`IdleStrategy::Sleep(1ms)`) and the
 // CAPABLE status bit — nothing on the apply hop itself.
 impl uc_service::WholeStateSnapshot for RawCount {
     fn encode_state(&self) -> Result<Vec<u8>, uc_service::SnapshotError> {
