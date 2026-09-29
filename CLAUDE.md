@@ -468,7 +468,9 @@ one log stream (#11); the release-ledger line (#5) is process, not code
     **49 `snapshot_no_learner`**, **50 `snapshot_above_durable`**. New cnc
     slot word `freeze_ns` at line 7 `+496` (**service**-written, unlike the
     rest of that line). Every artifact now carries a framework-owned 16-byte
-    envelope, `ULTSNAP1 ‖ P` — the tag is an **EXCLUSIVE** frontier, so
+    envelope, `ULTSNAP1 ‖ P` (replaced in `2.13.0` by the 24-byte
+    `ULTSNAP2`, which adds the builder's `S::VERSION`) — the tag is an
+    **EXCLUSIVE** frontier, so
     `install_snapshot(P)` returns `position` and must NOT report P from
     `last_applied()`, and no payload-side check can catch a mis-tag;
     pre-envelope artifacts are refused by name (clear a dev box's
@@ -945,8 +947,10 @@ Storage primitives:
   implement `SnapshotStateMachine` (by hand or via `WholeStateSnapshot`);
   the artifact's PAYLOAD bytes are entirely
   the service's own business — UC ships no store and prescribes no snapshot
-  encoding, but since `2.11.0` it does own a 16-byte
-  `ULTSNAP1 ‖ P` envelope ahead of them, and the artifact tag is an
+  encoding, but it does own a 24-byte `ULTSNAP2` envelope ahead of them
+  (magic ‖ `P` u64 LE ‖ the builder's `S::VERSION` u32 LE ‖ 4 reserved zero
+  bytes; `2.13.0` — the 16-byte `ULTSNAP1` of `2.11.0`/`2.12.0` is refused by
+  name), and the artifact tag is an
   **exclusive** frontier. `uc_lincheck`'s `RegisterSm`/`ListAppendSm` are the
   worked examples. **When** a snapshot happens is no longer the service's
   choice: it is a coordinated instant on the log (`SNAPSHOT` frame, type 7),
