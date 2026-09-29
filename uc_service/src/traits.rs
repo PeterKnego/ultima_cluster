@@ -484,8 +484,11 @@ pub trait SnapshotStateMachine: RawStateMachine {
     /// would silently swallow the first frame above the instant. Restore the
     /// cursor the artifact itself recorded (put it in your image; every
     /// reference SM does) and return `position` for the framework to resume
-    /// reading from. A payload cursor ABOVE `position` is a genuinely
-    /// mis-tagged artifact and should be refused — belt-and-suspenders only:
+    /// reading from. A payload cursor AT OR ABOVE `position` is a genuinely
+    /// mis-tagged artifact and should be refused (a cursor is a frame START,
+    /// and every UC-built artifact has `cursor < SNAPSHOT frame start < P`,
+    /// so a cursor equal to P claims the very frame P excludes — #73) —
+    /// belt-and-suspenders only:
     /// the tag is exclusive, so an artifact built at some LOWER `P0` and
     /// presented as `P` passes any payload-side check an SM can write. That
     /// case is the framework's (ruling P6). UC prescribes no payload encoding

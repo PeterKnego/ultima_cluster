@@ -237,3 +237,16 @@ std::io::Write) -> Result<(), SnapshotError>`, whose default returns the
 same named refusal `SnapshotStateMachine::project`'s default does; the
 blanket impl's `project()` forwards to it. A helper FSM that wants to take
 part in `uc2-diffreplay` overrides `project_state`, not `project`.
+
+§4.3 step 2 (`recorded > position` → `"mis-tagged: cursor above tag"`) was
+too loose ([#73]): the tag is an exclusive frontier and a cursor is a frame
+START, so a cursor EQUAL to the tag claims the frame at the tag while the tag
+says it is not covered — and the replay/learner install path never checks the
+cursor, so it would skip that frame. Every UC-built artifact has
+`cursor < SNAPSHOT frame start < P` (`apply.rs::on_snapshot_frame`, shared by
+live apply and replay), so equality is never legitimate. As built the check
+is `recorded.is_some_and(|c| c >= position)` →
+`"mis-tagged: cursor not below tag"`, matching `examples/kv`'s long-standing
+`>=`. A `None` cursor is never refused.
+
+[#73]: https://github.com/PeterKnego/ultima_cluster/issues/73
