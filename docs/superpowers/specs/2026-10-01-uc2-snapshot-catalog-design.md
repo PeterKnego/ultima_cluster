@@ -78,7 +78,7 @@ which node holds which set at which version, and cannot; and the backup tier
 | D1 | **Hybrid**: agreements replicated in the cluster FSM, observations advertised as soft state. | A set's agreed hash and the retention policy cannot drift and must be safe to act on; which node holds what on disk changes constantly and can become false silently (a lost disk). Replicating the second class costs consensus writes per segment rotation and still lags reality. Same split as Kafka tiered storage: segment metadata replicated, broker contents soft. |
 | D2 | **Sets, not rows.** The catalog is keyed by set position P; rows are fields of a set. | Every consumer asks about a set at P (install it, purge below it, fetch it). The per-row `SnapshotReport` record stays as the diagnostic matrix. |
 | D3 | **Record *commanded*, derived from the `SNAPSHOT` frame itself.** No new record. | A stalled instant then has a durable, cluster-wide name. Every node's cluster agent already sees the frame (it freezes on it), so deriving the entry costs no frame. The cost is that the cluster FSM becomes a function of one non-`CLUSTER` frame type; accepted over an extra leader-appended record per instant. |
-| D4 | **The purge floor and every install source are `newest_agreed`.** A diverged set is visible and fetchable, never installed, never the floor. | Closes the file-presence floor (§1). A set no quorum agrees on is not evidence of anything. |
+| D4 | **Every install source is an agreed set, and the purge floor is bounded by `newest_agreed`.** A diverged set is visible and fetchable, never installed, never the floor. A node's *effective* floor is the newest agreed set **it holds on disk** (§4.4). | Closes the file-presence floor (§1). A set no quorum agrees on is not evidence of anything — and a node must never purge below a set it cannot rebuild from, which with learner-only snapshots (§4.6) is every voter until it fetches. |
 | D5 | **Retention is a replicated setting**, `retain_sets ≥ 1`; pinned origins are always kept. | Every node must keep the same sets or the catalog's "exists cluster-wide" is false. `0` is refused at the door: it would retire the floor. |
 | D6 | **The soft advertisement is built off the consensus hot path.** | A directory listing per pass would be a hot-loop cost for a value that changes seconds apart. The builder and the pruner update a cached struct; the sender ships it at the status cadence. |
 | D7 | **Genesis is empty; a named fallback covers the window** until the first agreed set. | The flag day cannot migrate sets built before the catalog existed without reading every artifact on every node. Today's behaviour (newest complete on disk, newest-only retention) is correct in that window and is what runs. |
@@ -151,11 +151,15 @@ agreed sets in position order.
    set, and every `Commanded` or non-agreed `Complete` entry older than it.
    (A stalled or diverged set is kept while it is newer than the floor, so
    it stays visible and alertable; once superseded it is history.)
-3. The **purge floor** is `newest_agreed()`: the youngest agreed set. The
-   node's purge driver reads it from the view instead of
-   `snapshot_set_position` (`node.rs:5287`), and `prune_snapshots_below`'s
-   argument becomes "everything the catalog does not list", not "everything
-   below the newest".
+3. The **cluster floor** is `newest_agreed()`: the youngest agreed set. A
+   node's **effective floor** is the newest agreed set *it holds complete on
+   disk*, which is at or below the cluster floor. The purge driver purges
+   below the effective floor only (today it purges below
+   `snapshot_set_position`, `node.rs:5287`, which is the same quantity
+   without the agreement check), and `prune_snapshots_below`'s argument
+   becomes "everything the catalog does not list", not "everything below
+   the newest". `newest_agreed()` is a ceiling and a target to fetch, never
+   a licence to purge what this node cannot rebuild from.
 
 Raising `retain_sets` retires nothing until the list grows. Lowering it
 retires at the next apply. `retain_sets = 0` is refused at the leader's door
@@ -174,6 +178,28 @@ catalog has **no agreed set**, every reader takes the `Empty` branch:
 The first instant that completes and agrees seeds the catalog, and the
 fallback ends. `Empty` is a named state, exported as a gauge, so the window
 is visible rather than implicit.
+
+### 4.6 Learner-only snapshots
+
+The common production shape is that only learners snapshot, so voters
+never pause: `snapshot_target = learners` (replicated, `Settings`) or
+`uc2ctl snapshot --standby`. The catalog supports it without a special
+case:
+
+- The standby set is catalogued with `kind: Standby`; its reports come from
+  learners, which are members, so it becomes *agreed* and the cluster has a
+  named, hashed record of it — which it does not have today.
+- Voters hold no artifact at P. Their effective floor (§4.4) stays at the
+  last set they hold, so they purge nothing until a copy lands; a joiner is
+  redirected to a holder as today (`node.rs:1795`), and `holders(P)` is the
+  piece #48's automatic fetch needs to choose that holder.
+- **"I do not hold the set the catalog names" is the normal state of a
+  voter, not an error.** Project 2's lifecycle rule must treat it as *fetch
+  from a holder, then install*, never as a gap.
+- With **one** learner, a set's hash is agreed over one reporter (today's
+  rule, `node.rs:13455`) and divergence is undetectable by construction;
+  **two** learners is the minimum for the verdict to mean anything. The
+  catalog does not enforce a minimum; `uc2ctl` should say it.
 
 ## 5. The soft side (advertised)
 
@@ -229,8 +255,9 @@ the same answer from the same inputs.
 
 ### 6.1 Two consequences
 
-- **The purge floor is `newest_agreed`.** A diverged set never moves the
-  floor; the previous agreed set stays until a newer agreed one exists.
+- **The purge floor is bounded by `newest_agreed`** and, per node, by what
+  it holds (§4.4). A diverged set never moves the floor; the previous
+  agreed set stays until a newer agreed one exists.
 - **Install sources are agreed sets only.** Project 2's rule and the pinned
   install both draw from `agreed_for`/`newest_agreed`.
 
@@ -271,6 +298,7 @@ node, as for every flag day.
 | **Stale or wrong soft state** | Nothing is decided on an advertisement alone. A fetch from a holder that no longer has P fails by name and the chooser tries the next; a short journal falls into today's gap guard. A node whose status stops arriving leaves `holders()`/`journal_covers()` after the liveness timeout. |
 | **Flag-day window** | `Empty` (§4.5): today's behaviour, and the pruner deletes nothing, until the first agreed set. |
 | **Retention lowered** | Oldest agreed sets retire at the next apply, pinned origins excepted. **Raised**: nothing retires until the list grows. **`0`**: refused, 47. |
+| **Voter without the agreed set** (learner-only snapshots) | Not an error: its effective floor does not move, a restart of its service fetches from `holders()` (project 2), a joiner is redirected. |
 | **A node lies** | Out of the threat model (a compromised member), as the fan-out key residual is. |
 
 ## 9. Migration
@@ -317,7 +345,11 @@ node, as for every flag day.
      the fallback serves a joiner and deletes nothing; the first instant
      seeds the catalog and the fallback ends;
    - soft state: a killed node leaves `holders()` after the timeout and a
-     fetch routes to the surviving holder.
+     fetch routes to the surviving holder;
+   - learner-only: `snapshot_target = learners`, purge on; the standby set
+     becomes agreed, `holders()` names the learner only, the voters' journals
+     are **not** purged, a `uc2ctl snapshot fetch` lands the set on a voter
+     and only then does that voter's floor move.
 6. **Regression, unchanged**: `lin_v2`, `lin_partition_v2`, hard-crash,
    `pin_verify`, Elle. None should change: the catalog adds no commit-path
    semantics.
