@@ -1,0 +1,348 @@
+# UC2 snapshot catalog — design
+
+**Status:** design approved in conversation on 2026-10-01; this document is
+the written spec for review. **Project 1 of 4** of the storage-service
+direction (catalog, node-local lifecycle, backup tier, decision surface);
+the other three get their own specs and depend on this one.
+
+## 1. Problem
+
+Nothing in UC lists the snapshot sets and journal spans the cluster holds.
+The facts exist, scattered and partial:
+
+- The cluster FSM holds one `SnapshotReport` per row — the **newest** set's
+  position and every node's hash of it (`uc_protocol/src/v2/upgrade.rs:78`,
+  `uc_node/src/cluster_fsm.rs:126`). It forgets the previous set the moment a
+  newer report lands, and it covers only sets a node built itself.
+- A node knows only its own disk. Heartbeats carry no snapshot positions
+  (`StatusBody` is `contiguous_position` + `receive_window`,
+  `uc_protocol/src/v2/datagram.rs:878`). A joiner below the floor does not
+  choose a source: the peer it NAKed decides, or redirects it to the one
+  learner the leader last addressed a standby instant to (`node.rs:1795`).
+- `uc2ctl snapshot show` parses one node's directory names; `uc2ctl backup`
+  records one node's state in a `MANIFEST`. Neither sees the cluster.
+- Retention is hard-coded: the newest complete set plus pinned origins
+  (`prune_snapshots_below`, `node.rs:6763`), and purge below it when
+  `[purge]` is on. There is no replicated retention setting.
+- **A set becomes the purge floor on file presence alone.**
+  `check_set_completeness` (`node.rs:6278`) marks a set complete when its
+  last artifact is on disk; the hash verdict is never consulted. A set whose
+  rows diverged across nodes can therefore become the floor, and the journal
+  below a set no quorum agrees on is deleted.
+
+The consequences: an operator cannot answer "what can this cluster rebuild
+from, and from where" without visiting every node; a restarting service
+replays the whole journal from 0 rather than from the newest snapshot
+(`replay_into` installs only when its gap guard fires); #48 (auto-fetch after
+a standby instant) and #66 (rolling application upgrades) both need to know
+which node holds which set at which version, and cannot; and the backup tier
+(project 3) has nothing to protect because nothing names what exists.
+
+## 2. Scope
+
+**In:**
+
+- A replicated **catalog of snapshot sets** in the cluster FSM: position,
+  kind, log time, state, and per row the building version, the agreed hash
+  and the verdict, plus the cluster artifact's hash.
+- A **replicated retention policy** (`retain_sets`) that drives both snapshot
+  pruning and the purge floor.
+- A **soft, per-node advertisement** of what each node holds (journal span,
+  sets on disk, applied per row, bytes), aggregated by the leader.
+- A **query interface** over the two: pure functions every consumer shares.
+- The purge floor and every install source become the newest **agreed** set.
+- One flag day: `SNAP_REPORT`, `STATUS`, `Settings` and the cluster artifact.
+
+**Out (named so the boundaries are explicit):**
+
+- **The lifecycle rule** that uses the catalog at restart, catch-up, join and
+  upgrade ("load the newest agreed set ahead of me, replay from there", when
+  a short catch-up should replay instead, source preference among holders).
+  Project 2. This spec provides the queries; it does not change
+  `replay_into` or `attach`.
+- **The backup tier** (long retention off-node, restore from it, the
+  "backed up through P" watermark). Project 3. This spec reserves a record
+  kind for the watermark and nothing more.
+- **The operator / AI surface** (`uc2ctl catalog`, JSON, metrics, a live
+  read path that does not wait for the first cluster artifact). Project 4.
+  This spec names the live-read requirement (§6.3) and leaves the mechanism.
+- Diagnosing *which* node diverged. The per-node hash matrix stays in
+  today's per-row `SnapshotReport`; the catalog stores the verdict.
+- A snapshot-storage trait (a backend other than the local directory).
+  `SnapshotStore` stays a concrete struct.
+
+## 3. Decisions
+
+| # | decision | why |
+|---|---|---|
+| D1 | **Hybrid**: agreements replicated in the cluster FSM, observations advertised as soft state. | A set's agreed hash and the retention policy cannot drift and must be safe to act on; which node holds what on disk changes constantly and can become false silently (a lost disk). Replicating the second class costs consensus writes per segment rotation and still lags reality. Same split as Kafka tiered storage: segment metadata replicated, broker contents soft. |
+| D2 | **Sets, not rows.** The catalog is keyed by set position P; rows are fields of a set. | Every consumer asks about a set at P (install it, purge below it, fetch it). The per-row `SnapshotReport` record stays as the diagnostic matrix. |
+| D3 | **Record *commanded*, derived from the `SNAPSHOT` frame itself.** No new record. | A stalled instant then has a durable, cluster-wide name. Every node's cluster agent already sees the frame (it freezes on it), so deriving the entry costs no frame. The cost is that the cluster FSM becomes a function of one non-`CLUSTER` frame type; accepted over an extra leader-appended record per instant. |
+| D4 | **The purge floor and every install source are `newest_agreed`.** A diverged set is visible and fetchable, never installed, never the floor. | Closes the file-presence floor (§1). A set no quorum agrees on is not evidence of anything. |
+| D5 | **Retention is a replicated setting**, `retain_sets ≥ 1`; pinned origins are always kept. | Every node must keep the same sets or the catalog's "exists cluster-wide" is false. `0` is refused at the door: it would retire the floor. |
+| D6 | **The soft advertisement is built off the consensus hot path.** | A directory listing per pass would be a hot-loop cost for a value that changes seconds apart. The builder and the pruner update a cached struct; the sender ships it at the status cadence. |
+| D7 | **Genesis is empty; a named fallback covers the window** until the first agreed set. | The flag day cannot migrate sets built before the catalog existed without reading every artifact on every node. Today's behaviour (newest complete on disk, newest-only retention) is correct in that window and is what runs. |
+| D8 | **No performance bar.** The apply hop is untouched; the consensus pass gains one cached-struct encode at the status cadence. | The 2.11.0–2.12.0 gates showed rate bars under the rig's variance cannot be adjudicated. `STATUS` body size before/after is recorded as a number, not a bar. |
+
+## 4. The catalog (replicated)
+
+### 4.1 State
+
+Added to `ClusterState` (`uc_node/src/cluster_fsm.rs:87`):
+
+```rust
+pub struct Catalog {
+    /// Oldest first. Bounded by `retain_sets` + pinned origins + commanded
+    /// sets not yet complete (see §4.4).
+    pub sets: Vec<SetEntry>,
+}
+
+pub struct SetEntry {
+    pub position: u64,          // P, the artifact tag; the key
+    pub kind: SetKind,          // Full | Standby
+    pub time_ns: u64,           // the SNAPSHOT frame's log time
+    pub state: SetState,        // Commanded | Complete | Retiring
+    pub rows: [RowEntry; 8],    // index = row; unset rows are `Unreported`
+    pub cluster: RowEntry,      // the cluster artifact, "row 255"
+}
+
+pub struct RowEntry {
+    pub version: u32,           // the FSM version that built it (packed)
+    pub hash: u64,              // the majority hash (0 while unreported)
+    pub verdict: Verdict,       // Agreed | Diverged | NoMajority | Unreported
+}
+```
+
+A set is **agreed** when every *declared* row and the cluster artifact are
+`Agreed`. A `Standby` set is agreed on the same rule; its holders are
+learners only.
+
+### 4.2 Transitions
+
+Applied by `ClusterFsm::apply` at commit, deterministic, on every node:
+
+| Event | Effect |
+|---|---|
+| `SNAPSHOT` frame at END position P (D3) | Push `SetEntry { position: P, kind from FLAG_SNAPSHOT_STANDBY, time_ns from the header, state: Commanded, rows: Unreported }`. A frame at a position already present is ignored (ruling P10's "act on the last" already dedups at the agent). |
+| `SnapshotReport` (kind 5) for row r at P | Set `rows[r] = { version, hash: majority, verdict }` on the entry at P, computed by today's `verdict()` (`upgrade.rs:170`). A report for a P with no entry (a report that outran its frame cannot happen — the frame commits first — but a report after the entry was dropped can): ignored, as `ReportStale` (59) already refuses at the door. When every declared row and the cluster artifact are reported, `state = Complete`. |
+| `SnapshotReport` for "row 255" | The cluster artifact's hash, reported by the same path (§5.1). Fills `cluster`. |
+| An entry becomes `Complete` and **agreed** | Retention runs (§4.4). |
+| `Settings` with a new `retain_sets` | Retention runs. |
+| `UpgradePin` naming origin P | No catalog change; §4.4 reads pins from `membership`/the pin state as today. |
+
+### 4.3 Verdict and "agreed"
+
+`verdict()` is unchanged: the majority hash among the reporters that are
+current members, `Agreed` when all reporters match, `Diverged` when a
+majority exists and some differ, `NoMajority` otherwise. One reporter is
+agreed over one node, as today (`node.rs:13455`). The catalog adds nothing
+to the rule; it stores the result.
+
+### 4.4 Retention
+
+Runs after an agreed completion and after a settings change. Let `A` be the
+agreed sets in position order.
+
+1. If `|A| > retain_sets`, mark the oldest `|A| − retain_sets` agreed sets
+   `Retiring`, **except** any whose position is a pinned origin of some row
+   (kept until the pin is superseded, exactly as `prune_snapshots_below`'s
+   `keep` list does today, `node.rs:6791`).
+2. Drop from `sets` every `Retiring` entry older than the oldest kept agreed
+   set, and every `Commanded` or non-agreed `Complete` entry older than it.
+   (A stalled or diverged set is kept while it is newer than the floor, so
+   it stays visible and alertable; once superseded it is history.)
+3. The **purge floor** is `newest_agreed()`: the youngest agreed set. The
+   node's purge driver reads it from the view instead of
+   `snapshot_set_position` (`node.rs:5287`), and `prune_snapshots_below`'s
+   argument becomes "everything the catalog does not list", not "everything
+   below the newest".
+
+Raising `retain_sets` retires nothing until the list grows. Lowering it
+retires at the next apply. `retain_sets = 0` is refused at the leader's door
+with reason 47 (`settings_bounds`), the existing bounds reason.
+
+### 4.5 Genesis and the `Empty` fallback (D7)
+
+A cluster artifact at the new layout starts with `sets = []`. While the
+catalog has **no agreed set**, every reader takes the `Empty` branch:
+
+- `newest_agreed()` answers what `snapshot_set_position` answers today.
+- The pruner deletes **nothing** (not "newest only": nothing), because the
+  catalog cannot say what the newest is.
+- `holders()`/`journal_covers()` still work (soft state is independent).
+
+The first instant that completes and agrees seeds the catalog, and the
+fallback ends. `Empty` is a named state, exported as a gauge, so the window
+is visible rather than implicit.
+
+## 5. The soft side (advertised)
+
+### 5.1 What a node advertises
+
+`StatusBody` (`datagram.rs:878`) grows from 16 B to carry:
+
+| Field | Source |
+|---|---|
+| `journal_first` | the cnc `archive_first_base` word (offset 1344) |
+| `durable`, `commit` | cnc counters |
+| `applied[8]` | cnc service slots' `applied` |
+| `sets_held` | positions from the catalog this node holds complete on disk, as a bitmap over the catalog's entries (oldest first) plus the catalog position it was computed against |
+| `free_bytes`, `journal_bytes`, `snapshots_bytes` | the filesystem under the instance dir |
+
+The cluster artifact's hash joins the completeness report as "row 255": a
+node that completes a set reports `(255, hash of snap-P.ultcluster)` beside
+its rows, through `send_snapshot_reports` (`node.rs:6360`). Row 255 is the
+`service_id` the snapshot session already uses for the cluster artifact.
+
+### 5.2 How it is built (D6)
+
+A `Holdings` struct cached in the node. Writers: the completeness check
+(`check_set_completeness`) when a set lands; the pruner when it deletes;
+the archive agent's first-base mirror; a once-per-second filesystem probe for
+the byte counts. The consensus pass encodes it into `STATUS` at the existing
+status cadence. No directory listing happens on the pass.
+
+### 5.3 How the leader keeps it
+
+A `HashMap<NodeId, (Holdings, last_seen_ns)>`. An entry is **stale** when
+`last_seen_ns` is older than the liveness timeout the node already uses for
+heartbeats, and stale entries are excluded from every query. The table is
+rebuilt within one status cadence after a leader change; it is never
+persisted and never replicated.
+
+## 6. The query interface
+
+Pure functions over `(view: &ClusterView, soft: &SoftTable, now_ns)`.
+Shared by the node, `uc2ctl` and any future surface, so every consumer gets
+the same answer from the same inputs.
+
+| Function | Answer |
+|---|---|
+| `newest_agreed(at_most: u64) -> Option<P>` | the youngest agreed set ≤ `at_most`; the purge floor is `newest_agreed(u64::MAX)` |
+| `agreed_for(row, version) -> Vec<P>` | agreed sets whose `rows[row].version` is on `version`'s line (`same_line`) |
+| `holders(P) -> Vec<NodeId>` | non-stale nodes advertising P complete |
+| `journal_covers(P, Q) -> Vec<NodeId>` | non-stale nodes with `journal_first ≤ P` and `durable ≥ Q` |
+| `stalled(timeout_ns) -> Vec<P>` | `Commanded` sets whose `time_ns + timeout < now` |
+| `diverged() -> Vec<(P, row)>` | every `Diverged`/`NoMajority` row of every listed set |
+| `retiring() -> Vec<P>` | sets a node may delete |
+| `coverage_gaps() -> Vec<(P, Q)>` | spans between consecutive agreed sets that no holder and no journal span covers: history nobody can rebuild |
+
+### 6.1 Two consequences
+
+- **The purge floor is `newest_agreed`.** A diverged set never moves the
+  floor; the previous agreed set stays until a newer agreed one exists.
+- **Install sources are agreed sets only.** Project 2's rule and the pinned
+  install both draw from `agreed_for`/`newest_agreed`.
+
+### 6.2 What it does not answer
+
+Which holder to prefer (project 2 / #48), and anything about off-node
+copies (project 3, through its own record).
+
+### 6.3 The live-read requirement
+
+`uc2ctl` reads the cluster artifact, which exists only after the first
+instant (`docs/BACKLOG.md`'s recorded gap). The catalog is what an operator
+asks about *before* and *during* an instant, so project 4 must give the
+queries a live path (an admin op answered over the admin band, or a
+cnc-mapped copy of the view). This spec does not choose; it records that
+the artifact alone is not enough.
+
+## 7. Wire and layout changes — one flag day
+
+| Surface | Change |
+|---|---|
+| `SNAP_REPORT` (pairwise 26) / `SnapshotReport` (CLUSTER kind 5) | row `255` admitted, carrying the cluster artifact's hash |
+| `STATUS` body (kind 4) | 16 B → the §5.1 fields; a `0.10.0` peer's 16 B body is refused by name |
+| `Settings` (CLUSTER kind 3) | `+ retain_sets: u16`, refused at the door when `0` (47) |
+| cluster artifact (`snapshots/cluster/*.ultcluster`) | `ClusterState` gains `Catalog`; the old layout is refused by name, so `snapshots/cluster/` is cleared once per node on the flag day (`snapshots/<row>/` is untouched) |
+| `CLUSTER` kind `7` | **reserved** for project 3's backup watermark; refused as unknown until then |
+
+Wire `0.10.0` → `0.11.0`, cnc unchanged (the catalog is not on the page;
+`Empty` and the gauges go through `/metrics`). Stop every node, start every
+node, as for every flag day.
+
+## 8. Error handling
+
+| Case | Behaviour |
+|---|---|
+| **Diverged set** | `Complete` with the row `Diverged`. Never `newest_agreed`, never the floor, never installed; kept and visible while newer than the oldest kept agreed set (§4.4). `Uc2SnapshotSetDiverged` keys on `diverged()` instead of comparing per-node gauges. |
+| **Stalled set** | Stays `Commanded`; retention ignores it; the next instant proceeds; `stalled()` names it after the timeout; dropped once below the oldest kept agreed set (§4.4). |
+| **Stale or wrong soft state** | Nothing is decided on an advertisement alone. A fetch from a holder that no longer has P fails by name and the chooser tries the next; a short journal falls into today's gap guard. A node whose status stops arriving leaves `holders()`/`journal_covers()` after the liveness timeout. |
+| **Flag-day window** | `Empty` (§4.5): today's behaviour, and the pruner deletes nothing, until the first agreed set. |
+| **Retention lowered** | Oldest agreed sets retire at the next apply, pinned origins excepted. **Raised**: nothing retires until the list grows. **`0`**: refused, 47. |
+| **A node lies** | Out of the threat model (a compromised member), as the fan-out key residual is. |
+
+## 9. Migration
+
+- **Operators**: the flag-day procedure in `docs/how-to/upgrade-a-cluster.md`
+  gains "clear `snapshots/cluster/` once per node". `node.toml`'s `[purge]`
+  stays (it is *whether* to purge; `retain_sets` is *what to keep*).
+- **Code**: `snapshot_set_position` (`node.rs:2759`) stays as the node's own
+  newest-complete reading and feeds the `Empty` fallback; the purge driver
+  switches to the view. `prune_snapshots_below` keeps its shape and takes
+  the catalog's listed positions as its keep-set.
+- **Metrics**: `uc2_catalog_sets` (listed), `uc2_catalog_agreed_position`
+  (= the floor), `uc2_catalog_empty` (the fallback gauge),
+  `uc2_catalog_stalled`, `uc2_catalog_diverged`. `uc2_snapshot_set_position`
+  keeps its meaning (this node's newest complete on disk).
+- **Alerts**: `Uc2SnapshotSetDiverged` re-sourced to `uc2_catalog_diverged`;
+  `Uc2SnapshotStalled` can key on `uc2_catalog_stalled` (kept as is if its
+  current source is simpler).
+
+## 10. Proof
+
+1. **Unit**, `cluster_fsm.rs`: every §4.2 transition, table-driven over
+   scripted frame sequences: commanded from a `SNAPSHOT` frame; complete and
+   per-row verdict from reports; row 255; retention on overflow with a pinned
+   origin kept; `Empty`; `retain_sets` lowered, raised, `0` refused. Every §6
+   function against hand-built views and soft tables, including: a diverged
+   set is never `newest_agreed`; `holders()` excludes stale nodes.
+2. **Codecs**: round-trip and refuse-by-name for the extended `SNAP_REPORT`,
+   `STATUS` and `Settings`, in the shape of `upgrade.rs`'s tests.
+3. **Sim** (`uc_sim`): a new invariant beside inv12: two nodes at the same
+   commit have byte-equal catalogs, and `purge floor ≤ newest_agreed` always.
+   Seeded fuzz over partitions and crashes with it on.
+4. **Fuzz**: `uc_node_cluster_artifact` covers the new layout; a new target
+   decodes the extended `STATUS` body.
+5. **End to end**, `uc_node/tests`:
+   - divergence injected (two FSMs on one row with different hashes): the set
+     is complete-diverged, the floor does not move, a joiner is served the
+     previous agreed set, the alert source reads diverged;
+   - stalled (a row without the capability bit): commanded-not-complete,
+     `stalled()` after the timeout, the next instant completes;
+   - `retain_sets = 2` with purge on: the third set retires the first, the
+     pinned origin survives, the journal floor follows `newest_agreed`;
+   - the flag-day window: pre-existing sets on disk and an empty catalog;
+     the fallback serves a joiner and deletes nothing; the first instant
+     seeds the catalog and the fallback ends;
+   - soft state: a killed node leaves `holders()` after the timeout and a
+     fetch routes to the surviving holder.
+6. **Regression, unchanged**: `lin_v2`, `lin_partition_v2`, hard-crash,
+   `pin_verify`, Elle. None should change: the catalog adds no commit-path
+   semantics.
+7. **Performance** (D8): no bar. A review check that `Holdings` is written
+   off the pass; the `STATUS` body size before/after recorded as a number.
+
+## 11. Risks
+
+- **The FSM reads a non-`CLUSTER` frame (D3).** The cluster agent already
+  acts on `SNAPSHOT` frames (it freezes); the FSM now also records them. The
+  sim invariant (§10.3) is what proves this stays deterministic.
+- **`STATUS` grows** from 16 B to roughly 100 B at the status cadence. Not
+  on the replication data path; recorded, not barred.
+- **Retention with `retain_sets > 1` costs disk** (the journal is kept down
+  to the oldest kept set). Until the backup tier exists the practical value
+  on a node is small; the default is `1`, today's behaviour.
+- **`Empty` lasts until an instant agrees.** On a cluster with a row that
+  cannot complete, the fallback runs indefinitely: visible through the gauge
+  and `stalled()`, and no worse than today.
+
+## 12. Open questions for the next projects
+
+- Project 2: the restart rule's threshold for "far enough behind to install
+  rather than replay", and holder preference (locality, learner-first).
+- Project 3: the watermark record's shape (kind 7 reserved here), and
+  whether a node may retire below the catalog's `retain_sets` once the tier
+  confirms a set.
+- Project 4: the live-read mechanism (§6.3) and the JSON shape an AI reads.
