@@ -563,10 +563,11 @@ pub fn write_snap_report_body(buf: &mut [u8], b: &SnapReportBody) {
 }
 
 /// Decode a `SNAP_REPORT` body, or `None` if `buf.len() != SNAP_REPORT_BODY_LEN`,
-/// the reserved bytes are non-zero, `row >= CNC_MAX_SERVICES` (8 declared rows),
-/// or `position == 0` (position 0 is never a legitimate freeze — the log
-/// starts past it — so a zeroed/garbage body is refused rather than silently
-/// misread as row 0's genesis report).
+/// the reserved bytes are non-zero, `row` names neither a declared row nor the
+/// cluster artifact (`uc_protocol::v2::upgrade::is_report_row` — 8 declared
+/// rows plus `CLUSTER_ROW = 255`), or `position == 0` (position 0 is never a
+/// legitimate freeze — the log starts past it — so a zeroed/garbage body is
+/// refused rather than silently misread as row 0's genesis report).
 pub fn read_snap_report_body(buf: &[u8]) -> Option<SnapReportBody> {
     if buf.len() != SNAP_REPORT_BODY_LEN {
         return None;
@@ -575,7 +576,7 @@ pub fn read_snap_report_body(buf: &[u8]) -> Option<SnapReportBody> {
         return None;
     }
     let row = buf[0];
-    if row >= 8 {
+    if !super::upgrade::is_report_row(row) {
         return None;
     }
     let position = u64::from_le_bytes(buf[8..16].try_into().unwrap());
@@ -1478,5 +1479,22 @@ mod tests {
         let mut bad_position = buf;
         bad_position[8..16].copy_from_slice(&0u64.to_le_bytes());
         assert!(read_snap_report_body(&bad_position).is_none());
+    }
+
+    #[test]
+    fn snap_report_body_admits_row_255_only_beyond_the_declared_rows() {
+        let mut buf = [0u8; SNAP_REPORT_BODY_LEN];
+        write_snap_report_body(
+            &mut buf,
+            &SnapReportBody {
+                row: 255,
+                node_id: 1,
+                position: 64,
+                hash: 9,
+            },
+        );
+        assert_eq!(read_snap_report_body(&buf).map(|b| b.row), Some(255));
+        buf[0] = 8;
+        assert_eq!(read_snap_report_body(&buf), None);
     }
 }

@@ -60,6 +60,17 @@ pub fn decode_upgrade_pin(buf: &[u8]) -> Option<UpgradePin> {
     })
 }
 
+/// The cluster artifact's "row" in a snapshot report (catalog spec §5.1):
+/// the same `service_id = 255` the snapshot session ships it under. Not a
+/// declared row — `CNC_MAX_SERVICES` is 8 — so every row check is
+/// `row < CNC_MAX_SERVICES || row == CLUSTER_ROW`.
+pub const CLUSTER_ROW: u8 = 255;
+
+#[inline]
+pub const fn is_report_row(row: u8) -> bool {
+    (row as usize) < CNC_MAX_SERVICES || row == CLUSTER_ROW
+}
+
 /// `row u8 @0 ‖ count u8 @1 ‖ reserved [u8; 6] @2 ‖ position u64 @8`.
 pub const SNAPSHOT_REPORT_HEADER_LEN: usize = 16;
 /// `node_id u32 ‖ hash u64`.
@@ -95,7 +106,7 @@ pub fn encode_snapshot_report(r: &SnapshotReport, out: &mut Vec<u8>) -> Option<(
     if n == 0
         || n > MAX_SNAPSHOT_REPORT_NODES
         || !ids_strictly_increasing(&r.hashes)
-        || r.row as usize >= CNC_MAX_SERVICES
+        || !is_report_row(r.row)
         || r.position == 0
     {
         return None;
@@ -119,7 +130,7 @@ pub fn decode_snapshot_report(buf: &[u8]) -> Option<SnapshotReport> {
     }
     let row = buf[0];
     let n = buf[1] as usize;
-    if row as usize >= CNC_MAX_SERVICES
+    if !is_report_row(row)
         || n == 0
         || n > MAX_SNAPSHOT_REPORT_NODES
         || buf.len() != SNAPSHOT_REPORT_HEADER_LEN + n * SNAPSHOT_REPORT_ENTRY_LEN
@@ -462,6 +473,46 @@ mod tests {
             None,
             "count disagrees with length"
         );
+    }
+
+    #[test]
+    fn row_255_is_the_cluster_artifact_and_round_trips() {
+        let r = SnapshotReport {
+            row: CLUSTER_ROW,
+            position: 4096,
+            hashes: vec![(0, 7), (1, 7)],
+        };
+        let mut b = Vec::new();
+        assert_eq!(encode_snapshot_report(&r, &mut b), Some(()));
+        assert_eq!(b[0], 255);
+        assert_eq!(decode_snapshot_report(&b), Some(r));
+    }
+
+    #[test]
+    fn rows_8_to_254_are_still_refused() {
+        for row in [8u8, 9, 100, 254] {
+            let r = SnapshotReport {
+                row,
+                position: 4096,
+                hashes: vec![(0, 7)],
+            };
+            assert_eq!(
+                encode_snapshot_report(&r, &mut Vec::new()),
+                None,
+                "row {row}"
+            );
+            let mut b = Vec::new();
+            encode_snapshot_report(
+                &SnapshotReport {
+                    row: 0,
+                    ..r.clone()
+                },
+                &mut b,
+            )
+            .unwrap();
+            b[0] = row;
+            assert_eq!(decode_snapshot_report(&b), None, "row {row}");
+        }
     }
 
     #[test]
