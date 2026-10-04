@@ -783,6 +783,20 @@ impl ClusterAgent {
                         break; // never apply an uncommitted frame
                     }
                     cursor = end;
+                    // Ledger ruling R11: the catalog is a function of the
+                    // COMMITTED PREFIX and must not depend on which path a
+                    // node took to it — so EVERY `SNAPSHOT` frame this walk
+                    // crosses (not just the one pass 1 picked to freeze at)
+                    // is recorded here, before and independently of the
+                    // freeze decision below. `on_snapshot_frame` is
+                    // idempotent on `end`, so a frame the live arm already
+                    // saw (or will see again on a later overrun) costs
+                    // nothing.
+                    if rf.header.frame_type == FRAME_TYPE_SNAPSHOT {
+                        let standby = rf.header.flags & FLAG_SNAPSHOT_STANDBY != 0;
+                        self.fsm.on_snapshot_frame(end, standby, rf.header.time_ns);
+                        applied_any = true;
+                    }
                     // Ruling P10, pass 2: the ONE instant pass 1 picked, acted
                     // on exactly where it sits in the span — after every frame
                     // below P has applied and before any frame at or above P
@@ -799,7 +813,11 @@ impl ClusterAgent {
                     // never complete, at any timeout, which is exactly the
                     // stall `uc_node/tests/learner.rs` reproduced 1-in-20.
                     // Only the EARLIER instants in a span are meaningless, and
-                    // pass 1 is what drops those.
+                    // pass 1 is what drops those. The FREEZE here stays
+                    // selective (R11 only widens the catalog record, never
+                    // the freeze decision): `last_actionable_instant` still
+                    // applies the same role skip and "one build in flight"
+                    // rule it always has.
                     if Some(rf.position) == freeze_at {
                         // Ruling P13(b), as on the live path: `freeze_at` is
                         // `last_actionable_instant`'s pick, which applies the
@@ -2039,6 +2057,125 @@ mod tests {
             "the replay stops at the journal's real content, not at the staged head"
         );
         assert!(e3 < head, "sanity: the staged head is beyond real content");
+    }
+
+    /// Ledger ruling R11: the catalog is a function of the committed prefix,
+    /// not of which path the agent took to reach it — so the journal
+    /// catch-up path must catalog every `SNAPSHOT` frame it crosses exactly
+    /// like the live arm does, even the standby instants its OWN freeze
+    /// decision (`last_actionable_instant`'s role skip) declines to pay for.
+    /// Modeled on `a_replayed_span_freezes_at_its_last_snapshot_frame_and_only_that_one`.
+    ///
+    /// A voter replays a span holding a standby instant (skipped by the
+    /// freeze decision, same as the live arm's role check) followed by a
+    /// full instant (which the freeze decision DOES act on, being the last
+    /// actionable one in the span): both land in the catalog, but only the
+    /// full one gets an artifact.
+    #[test]
+    fn a_voter_catching_up_from_the_journal_catalogs_the_standby_instants_it_skipped() {
+        let (buffer, cnc, dir) = world();
+        let mut archive = Archive::open(ArchiveConfig::new(dir.path().join("journal"))).unwrap();
+        let mut app = buffer.appender_for_test(0);
+        app.set_now(1);
+        let (p_standby, stamp_standby) = app.append_snapshot(1, FLAG_SNAPSHOT_STANDBY).unwrap();
+        let (p_full, stamp_full) = app.append_snapshot(1, 0).unwrap();
+        while archive.do_work(&buffer).unwrap() {}
+        let journal = archive.journal_arc();
+
+        let (fsm, start) = recover(dir.path(), genesis_state(), vec![]).unwrap();
+        let view = Arc::new(ClusterView::new(fsm.state()));
+        let mut agent = ClusterAgent::new(
+            Arc::clone(&buffer),
+            Arc::clone(&cnc),
+            fsm,
+            view,
+            dir.path().join("snapshots/cluster"),
+            start,
+            Arc::new(AtomicU64::new(0)),
+            journal,
+            no_install_route(),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+        );
+        // Flags word 0 = a voter throughout: never takes NODE_FLAG_LEARNER.
+        let head = stage_overrun(&buffer, &cnc);
+        assert!(head > p_full);
+
+        assert!(agent.do_work(), "the span is replayed");
+        assert_eq!(
+            agent.snapshot_pos(),
+            p_full,
+            "the freeze decision stays selective: only the full instant \
+             (the last ACTIONABLE one — the standby one is role-skipped) \
+             is frozen"
+        );
+        let dir_names = {
+            let mut v: Vec<String> = std::fs::read_dir(dir.path().join("snapshots/cluster"))
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect();
+            v.sort();
+            v
+        };
+        assert_eq!(
+            dir_names,
+            vec![format!("snap-{p_full}.ultcluster")],
+            "no artifact was written for the standby instant — no freeze paid for it"
+        );
+
+        let catalog = &agent.fsm.state().catalog;
+        assert_eq!(
+            catalog.len(),
+            2,
+            "both instants are catalogued even though only one was frozen"
+        );
+        assert_eq!(catalog[0].position, p_standby);
+        assert_eq!(catalog[0].kind, SetKind::Standby);
+        assert_eq!(catalog[0].state, SetState::Commanded);
+        assert_eq!(catalog[0].time_ns, stamp_standby);
+        assert_eq!(catalog[1].position, p_full);
+        assert_eq!(catalog[1].kind, SetKind::Full);
+        assert_eq!(catalog[1].state, SetState::Commanded);
+        assert_eq!(catalog[1].time_ns, stamp_full);
+
+        // Determinism check (R11's actual claim): the SAME two frames fed
+        // through the LIVE arm, on a second agent/FSM that never overran,
+        // produce the identical catalog — the path taken to the committed
+        // prefix must not matter.
+        let (buffer2, cnc2, dir2) = world();
+        let mut app2 = buffer2.appender_for_test(0);
+        app2.set_now(1);
+        let (p_standby2, _) = app2.append_snapshot(1, FLAG_SNAPSHOT_STANDBY).unwrap();
+        let (p_full2, _) = app2.append_snapshot(1, 0).unwrap();
+        assert_eq!(
+            (p_standby2, p_full2),
+            (p_standby, p_full),
+            "sanity: the two worlds lay out frames identically"
+        );
+        cnc2.counters().durable.store_release(p_full2);
+        cnc2.counters().commit.store_release(p_full2);
+        let (fsm2, start2) = recover(dir2.path(), genesis_state(), vec![]).unwrap();
+        let view2 = Arc::new(ClusterView::new(fsm2.state()));
+        let mut agent2 = ClusterAgent::new(
+            buffer2,
+            cnc2,
+            fsm2,
+            view2,
+            dir2.path().join("snapshots/cluster"),
+            start2,
+            Arc::new(AtomicU64::new(0)),
+            empty_journal(dir2.path()),
+            no_install_route(),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+        );
+        agent2.do_work();
+        assert_eq!(
+            &agent2.fsm.state().catalog,
+            catalog,
+            "live walk and journal catch-up agree on the catalog byte-for-byte"
+        );
     }
 
     // A `should_panic` test for the journal-error fail-stop path (a
