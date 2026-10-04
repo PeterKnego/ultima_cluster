@@ -899,12 +899,12 @@ pub struct Holdings {
     pub commit: u64,
     pub applied: [u64; crate::v2::cnc::CNC_MAX_SERVICES],
     pub free_bytes: u64,
-    /// Disk consumed by the journal directory, preallocated segments
-    /// included: each file counts at its full apparent size, so a fresh
-    /// node already reports one whole segment.
+    /// The journal's disk use: an estimate from the archive's positions
+    /// rounded to whole segments, preallocation included — not a file walk.
     pub journal_bytes: u64,
     pub snapshots_bytes: u64,
-    /// The published catalog position `sets_held` was computed against.
+    /// The content hash of the catalog `sets_held` was computed against
+    /// (`ClusterView::catalog_version`); the wire name predates the ruling.
     pub catalog_position: u64,
     /// Bit i ⇔ this node holds the catalog's i-th listed set (oldest first)
     /// complete on disk.

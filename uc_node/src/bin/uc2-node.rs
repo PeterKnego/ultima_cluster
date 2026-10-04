@@ -269,7 +269,7 @@ fn main() -> ExitCode {
             // failure, leave the cnc field at its last value (never write a
             // stale-but-plausible 0) and rate-limit the warning the same way
             // seal_failures/nak_storm do above.
-            match free_disk_bytes(&instance_dir) {
+            match preflight::free_disk_bytes(&instance_dir) {
                 Some(bytes) => obs.cnc.store_free_disk_bytes(bytes),
                 None => {
                     if last_statvfs_warn_emit
@@ -320,28 +320,4 @@ fn main() -> ExitCode {
         }
     }
     ExitCode::SUCCESS
-}
-
-/// M11 (Task 5): free bytes on the filesystem backing `path`, via `statvfs`
-/// (`f_bavail * f_frsize` — bytes an unprivileged process could still write,
-/// not the raw free-block count). `None` on a probe failure (bad path,
-/// syscall error) — the caller leaves the cnc field at its last value rather
-/// than writing a stale-but-plausible 0. Same `CString`/`statfs`-family idiom
-/// as `preflight::fs_kind`, just the `statvfs` sibling call.
-#[allow(
-    clippy::unnecessary_cast,
-    reason = "libc::statvfs's f_bavail/f_frsize field types vary by target (not \
-              always u64) — the cast is a portability normalization, a no-op only \
-              on this specific build target; 1.89 clippy flags it, 1.96 does not"
-)]
-fn free_disk_bytes(path: &std::path::Path) -> Option<u64> {
-    use std::os::unix::ffi::OsStrExt;
-    let c = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
-    let mut buf: libc::statvfs = unsafe { std::mem::zeroed() };
-    // SAFETY: `c` is a valid NUL-terminated path; `buf` is a zeroed statvfs
-    // this call owns for the duration of the call.
-    if unsafe { libc::statvfs(c.as_ptr(), &mut buf) } != 0 {
-        return None;
-    }
-    Some(buf.f_bavail as u64 * buf.f_frsize as u64)
 }

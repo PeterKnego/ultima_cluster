@@ -1100,6 +1100,11 @@ pub struct ClusterView {
     /// How many row entries (the cluster artifact's included) across the
     /// listed sets read `Diverged` or `NoMajority`.
     pub catalog_diverged: AtomicU64,
+    /// Catalog ruling R16: a CONTENT hash of the listed sets
+    /// ([`catalog_version_of`]) — the stamp a node's `Holdings.sets_held`
+    /// is computed against, and the one a leader's query compares. Equal on
+    /// every node whose catalog is equal, whatever its walk cursor.
+    pub catalog_version: AtomicU64,
     inner: Mutex<ClusterViewInner>,
 }
 
@@ -1124,6 +1129,25 @@ pub struct ClusterViewInner {
     pub catalog: Vec<SetEntry>,
 }
 
+/// Catalog ruling R16: FNV-1a-64 over the set list's wire encoding
+/// ([`encode_set_list`]) — a content hash, so two nodes holding the same
+/// catalog agree on it regardless of where their walks stand. Run by
+/// [`ClusterView::publish`] on the cluster agent, never on the consensus
+/// pass. A list too long to encode (never produced: retention caps it)
+/// hashes as its length alone.
+pub fn catalog_version_of(sets: &[SetEntry]) -> u64 {
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut bytes = Vec::with_capacity(2 + sets.len() * 64);
+    if encode_set_list(sets, &mut bytes).is_none() {
+        bytes.clear();
+        bytes.extend_from_slice(&(sets.len() as u64).to_le_bytes());
+    }
+    bytes
+        .iter()
+        .fold(OFFSET, |h, b| (h ^ u64::from(*b)).wrapping_mul(PRIME))
+}
+
 impl ClusterView {
     pub fn new(genesis: &ClusterState) -> ClusterView {
         let v = ClusterView {
@@ -1144,6 +1168,7 @@ impl ClusterView {
             catalog_len: AtomicU64::new(0),
             catalog_stalled: AtomicU64::new(0),
             catalog_diverged: AtomicU64::new(0),
+            catalog_version: AtomicU64::new(0),
             inner: Mutex::new(ClusterViewInner {
                 membership: genesis.membership.clone(),
                 table: genesis.table.clone(),
@@ -1215,6 +1240,8 @@ impl ClusterView {
             .store(stalled as u64, Ordering::Release);
         self.catalog_diverged
             .store(diverged as u64, Ordering::Release);
+        self.catalog_version
+            .store(catalog_version_of(&st.catalog), Ordering::Release);
         self.position.store(st.applied, Ordering::Release);
     }
 
@@ -1859,6 +1886,38 @@ mod tests {
         assert_eq!(v.position.load(Ordering::Acquire), 900);
         assert_eq!(v.admission_bytes.load(Ordering::Acquire), 123);
         assert_eq!(v.membership(), st.membership);
+    }
+
+    /// Catalog ruling R16: `catalog_version` is a CONTENT hash of the set
+    /// list — two FSMs whose catalogs are equal publish the same value
+    /// whatever their walk cursors, and a one-entry difference changes it.
+    #[test]
+    fn catalog_version_is_a_content_hash_of_the_set_list() {
+        let a = ClusterView::new(&ClusterState::genesis_empty());
+        let b = ClusterView::new(&ClusterState::genesis_empty());
+        let mut sa = ClusterState::genesis_empty();
+        sa.on_snapshot_frame(1000, false, 5);
+        sa.on_snapshot_frame(2000, true, 6);
+        sa.applied = 2100;
+        let mut sb = sa.clone();
+        sb.applied = 9999; // a different walk cursor (trailing MESSAGE frames)
+        a.publish(&sa);
+        b.publish(&sb);
+        let va = a.catalog_version.load(Ordering::Acquire);
+        assert_eq!(va, b.catalog_version.load(Ordering::Acquire));
+        assert_eq!(va, catalog_version_of(&sa.catalog));
+        sb.on_snapshot_frame(3000, false, 7);
+        b.publish(&sb);
+        assert_ne!(
+            va,
+            b.catalog_version.load(Ordering::Acquire),
+            "one more entry"
+        );
+        assert_ne!(
+            catalog_version_of(&[]),
+            va,
+            "the empty catalog has its own version"
+        );
     }
 
     // ------------------------------------------------------ FSM upgrade lifecycle

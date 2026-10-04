@@ -82,6 +82,9 @@ fn row_version(e: &SetEntry, row: u8) -> Option<u32> {
 /// caller for each query — it borrows, never owns, `sets` and `soft`.
 pub struct CatalogQuery<'a> {
     pub sets: &'a [SetEntry],
+    /// The content hash of the catalog `sets` is
+    /// (`ClusterView::catalog_version`) — what a holder's
+    /// `Holdings.catalog_position` must equal; the name predates the ruling.
     pub catalog_position: u64,
     pub soft: &'a SoftTable,
     pub now_ns: u64,
@@ -120,7 +123,9 @@ impl CatalogQuery<'_> {
     }
 
     /// Nodes that count as holding the set at `p`: live in the soft table,
-    /// advertising the same `catalog_position` this query is against, with
+    /// advertising the same `catalog_position` — the content hash of the
+    /// catalog (`ClusterView::catalog_version`); the name predates the
+    /// ruling — this query is against, with
     /// bit `i` of `sets_held` set, `i` = `p`'s index in `sets`. `p` not
     /// listed, or an index at or past bit 63, answers empty — never a shift
     /// panic.

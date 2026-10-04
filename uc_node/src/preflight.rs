@@ -287,6 +287,31 @@ pub fn check(cfg: &NodeConfig, opts: &StartupOptions) -> Result<FsVerdict, Prefl
     check_durable_fs(&cfg.instance_dir, opts)
 }
 
+/// M11 (Task 5): free bytes on the filesystem backing `path`, via `statvfs`
+/// (`f_bavail * f_frsize` — bytes an unprivileged process could still write,
+/// not the raw free-block count). `None` on a probe failure (bad path,
+/// syscall error) — the caller leaves the cnc field at its last value rather
+/// than writing a stale-but-plausible 0. Same `CString`/`statfs`-family idiom
+/// as `fs_kind`, just the `statvfs` sibling call. Shared by the daemon's
+/// cnc word and the node's `Holdings.free_bytes` probe (catalog spec §5.1).
+#[allow(
+    clippy::unnecessary_cast,
+    reason = "libc::statvfs's f_bavail/f_frsize field types vary by target (not \
+              always u64) — the cast is a portability normalization, a no-op only \
+              on this specific build target; 1.89 clippy flags it, 1.96 does not"
+)]
+pub fn free_disk_bytes(path: &std::path::Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut buf: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `c` is a valid NUL-terminated path; `buf` is a zeroed statvfs
+    // this call owns for the duration of the call.
+    if unsafe { libc::statvfs(c.as_ptr(), &mut buf) } != 0 {
+        return None;
+    }
+    Some(buf.f_bavail as u64 * buf.f_frsize as u64)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
