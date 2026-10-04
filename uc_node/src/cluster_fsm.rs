@@ -956,6 +956,11 @@ impl ClusterView {
                     _ => uc_protocol::v2::settings::Target::All,
                 },
                 datagram_mtu: self.datagram_mtu.load(Ordering::Acquire),
+                // Catalog spec §7: `ClusterView` has no atomic for this yet
+                // — a later task gives it the same lock-free scalar
+                // treatment as its four siblings. Until then `to_state`
+                // reports "unset", like a v1/v2 record.
+                retain_sets: 0,
             },
             settings_position: self.settings_position.load(Ordering::Acquire),
             applied: self.position.load(Ordering::Acquire),
@@ -1478,6 +1483,11 @@ mod tests {
             snapshot_interval_bytes: 1 << 30,
             snapshot_target: uc_protocol::v2::settings::Target::Learners,
             datagram_mtu: 8832,
+            // `to_state` hardcodes 0 until a later task gives `retain_sets`
+            // its own atomic (see the comment there); matching it here, not
+            // the genesis default, keeps this round-trip test exact for the
+            // field it DOES cover (0 happens to be both right now).
+            retain_sets: 0,
         };
         let v = ClusterView::new(&st);
         assert_eq!(v.to_state(), st);

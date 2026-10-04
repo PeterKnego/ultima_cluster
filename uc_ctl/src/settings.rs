@@ -103,6 +103,9 @@ pub fn parse_settings(toml_text: &str) -> Result<Settings, String> {
         // an ordinary `settings apply` a no-op for it: the cluster FSM keeps
         // the committed rung monotone, so a zero here cannot lower it.
         datagram_mtu: 0,
+        // Catalog spec §7: same posture — no operator key here yet, `0`
+        // ("unset") is a no-op for `settings apply`.
+        retain_sets: 0,
     })
 }
 
@@ -245,6 +248,7 @@ mod tests {
                 snapshot_interval_bytes: 10,
                 snapshot_target: Target::Learners,
                 datagram_mtu: 0,
+                retain_sets: 0,
             }
         );
         assert_eq!(parse_settings("").unwrap(), Settings::genesis_default());

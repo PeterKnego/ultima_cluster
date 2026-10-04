@@ -6,15 +6,19 @@
 //! as a `CLUSTER kind=Settings` payload and inside the cluster FSM's image.
 //! `core` + `alloc` (the encoder appends into a `Vec<u8>`), like `v2::schedule`.
 
-/// Encoding version, first word of the payload. `2` since the jumbo flag day
-/// (`datagram_mtu`); a reader ACCEPTS `1` (the `2.11.0` shape, mapped to
-/// `datagram_mtu = 0`) because cluster artifacts and committed frames written
-/// by `2.11.0` persist across the upgrade — jumbo spec §5.5.
-pub const SETTINGS_VERSION: u32 = 2;
-/// The exact encoded length of a version-2 record — no trailing bytes.
-pub const SETTINGS_LEN: usize = 4 + 8 + 8 + 8 + 1 + 4;
+/// Encoding version, first word of the payload. `3` since the catalog spec
+/// (`retain_sets`); a reader ACCEPTS `2` (the jumbo-flag-day shape, mapped to
+/// `retain_sets = 0`, "unset") and `1` (the `2.11.0` shape, mapped to
+/// `datagram_mtu = 0` and `retain_sets = 0`) because cluster artifacts and
+/// committed frames written by earlier releases persist across the upgrade —
+/// catalog spec §7, jumbo spec §5.5.
+pub const SETTINGS_VERSION: u32 = 3;
+/// The exact encoded length of a version-3 record — no trailing bytes.
+pub const SETTINGS_LEN: usize = 4 + 8 + 8 + 8 + 1 + 4 + 2; // 35
+/// The exact length of a version-2 record, accepted on decode only.
+pub const SETTINGS_LEN_V2: usize = 4 + 8 + 8 + 8 + 1 + 4; // 33
 /// The exact length of a version-1 record, accepted on decode only.
-pub const SETTINGS_LEN_V1: usize = 4 + 8 + 8 + 8 + 1;
+pub const SETTINGS_LEN_V1: usize = 4 + 8 + 8 + 8 + 1; // 29
 /// `fsm_lag_bytes` value meaning lockstep.
 ///
 /// NOT the cnc page's `0` sentinel: in THIS record `0` already means "derive
@@ -79,6 +83,11 @@ pub struct Settings {
     /// written by discovery, never by an operator file; the FSM keeps it
     /// monotone (`max(committed, incoming)`).
     pub datagram_mtu: u32,
+    /// Catalog spec §4.4: how many AGREED snapshot sets the cluster keeps.
+    /// `0` = unset (a v1/v2 record), read as `1` at use — today's
+    /// newest-only retention. `1..=MAX_CATALOG_SETS` otherwise; the FSM's
+    /// door refuses anything else (47).
+    pub retain_sets: u16,
 }
 
 impl Settings {
@@ -89,6 +98,7 @@ impl Settings {
             snapshot_interval_bytes: 0,
             snapshot_target: Target::All,
             datagram_mtu: 0,
+            retain_sets: 0,
         }
     }
 }
@@ -100,21 +110,27 @@ pub fn encode_settings(s: &Settings, out: &mut Vec<u8>) {
     out.extend_from_slice(&s.snapshot_interval_bytes.to_le_bytes());
     out.push(s.snapshot_target as u8);
     out.extend_from_slice(&s.datagram_mtu.to_le_bytes());
+    out.extend_from_slice(&s.retain_sets.to_le_bytes());
 }
 
-/// Total: `None` on any (version, length) pair other than the two this
-/// reader knows — `(1, SETTINGS_LEN_V1)` and `(2, SETTINGS_LEN)` — or an
-/// unknown target byte. The length is EXACT PER VERSION, so a v1 header with
-/// a v2 length (or the reverse) is refused rather than read as a prefix; the
-/// pair check up front makes every subsequent slice index infallible.
+/// Total: `None` on any (version, length) pair other than the three this
+/// reader knows — `(1, SETTINGS_LEN_V1)`, `(2, SETTINGS_LEN_V2)` and
+/// `(3, SETTINGS_LEN)` — or an unknown target byte. The length is EXACT PER
+/// VERSION, so a header with another version's length (or the reverse) is
+/// refused rather than read as a prefix; the pair check up front makes every
+/// subsequent slice index infallible.
 pub fn decode_settings(buf: &[u8]) -> Option<Settings> {
     if buf.len() < 4 {
         return None;
     }
     let version = u32::from_le_bytes(buf[0..4].try_into().unwrap());
-    let datagram_mtu = match (version, buf.len()) {
-        (1, SETTINGS_LEN_V1) => 0,
-        (2, SETTINGS_LEN) => u32::from_le_bytes(buf[29..33].try_into().unwrap()),
+    let (datagram_mtu, retain_sets) = match (version, buf.len()) {
+        (1, SETTINGS_LEN_V1) => (0, 0),
+        (2, SETTINGS_LEN_V2) => (u32::from_le_bytes(buf[29..33].try_into().unwrap()), 0),
+        (3, SETTINGS_LEN) => (
+            u32::from_le_bytes(buf[29..33].try_into().unwrap()),
+            u16::from_le_bytes(buf[33..35].try_into().unwrap()),
+        ),
         _ => return None,
     };
     let fsm_lag_bytes = u64::from_le_bytes(buf[4..12].try_into().unwrap());
@@ -131,6 +147,7 @@ pub fn decode_settings(buf: &[u8]) -> Option<Settings> {
         snapshot_interval_bytes,
         snapshot_target,
         datagram_mtu,
+        retain_sets,
     })
 }
 
@@ -145,11 +162,13 @@ mod tests {
 
     #[test]
     fn settings_layout_is_frozen() {
-        // FROZEN once shipped (cluster-FSM spec §6/§7, jumbo spec §5.5):
-        // version u32 @0, fsm_lag_bytes u64 @4, admission_bytes u64 @12,
-        // snapshot_interval_bytes u64 @20, target u8 @28, datagram_mtu u32 @29.
-        assert_eq!(SETTINGS_VERSION, 2);
-        assert_eq!(SETTINGS_LEN, 33);
+        // FROZEN once shipped (cluster-FSM spec §6/§7, jumbo spec §5.5,
+        // catalog spec §7): version u32 @0, fsm_lag_bytes u64 @4,
+        // admission_bytes u64 @12, snapshot_interval_bytes u64 @20, target
+        // u8 @28, datagram_mtu u32 @29, retain_sets u16 @33.
+        assert_eq!(SETTINGS_VERSION, 3);
+        assert_eq!(SETTINGS_LEN, 35);
+        assert_eq!(SETTINGS_LEN_V2, 33);
         assert_eq!(SETTINGS_LEN_V1, 29);
         // The lockstep sentinel is a WORD VALUE in this record, not the cnc
         // page's `0` — `0` here is already "derive the default at use".
@@ -166,14 +185,46 @@ mod tests {
             snapshot_interval_bytes: 1 << 30,
             snapshot_target: Target::Learners,
             datagram_mtu: 8960,
+            retain_sets: 3,
         };
         let mut out = Vec::new();
         encode_settings(&s, &mut out);
         assert_eq!(out.len(), SETTINGS_LEN);
-        assert_eq!(&out[0..4], &2u32.to_le_bytes());
+        assert_eq!(&out[0..4], &3u32.to_le_bytes());
         assert_eq!(out[28], 1);
         assert_eq!(&out[29..33], &8960u32.to_le_bytes());
+        assert_eq!(&out[33..35], &3u16.to_le_bytes());
         assert_eq!(decode_settings(&out), Some(s));
+    }
+
+    /// Catalog spec §7: `retain_sets` round-trips on a v3 record; a v2
+    /// record (one word shorter, version 2) decodes with it read as `0`
+    /// ("unset"); a v3 HEADER on a v2 LENGTH is refused — the length is
+    /// exact per version, so a header cannot borrow another version's size.
+    #[test]
+    fn settings_v3_round_trips_retain_sets_and_v2_reads_as_unset() {
+        let s = Settings {
+            fsm_lag_bytes: 0,
+            admission_bytes: 0,
+            snapshot_interval_bytes: 0,
+            snapshot_target: Target::All,
+            datagram_mtu: 0,
+            retain_sets: 3,
+        };
+        let mut b = Vec::new();
+        encode_settings(&s, &mut b);
+        assert_eq!(b.len(), SETTINGS_LEN);
+        assert_eq!(&b[0..4], &3u32.to_le_bytes(), "version 3");
+        assert_eq!(&b[33..35], &3u16.to_le_bytes(), "retain_sets @33");
+        assert_eq!(decode_settings(&b), Some(s));
+        // a v2 record (33 B, version 2) decodes with retain_sets = 0 (unset)
+        let mut v2 = b[..33].to_vec();
+        v2[0..4].copy_from_slice(&2u32.to_le_bytes());
+        assert_eq!(decode_settings(&v2).map(|s| s.retain_sets), Some(0));
+        // a v3 header on a v2 length is refused
+        let mut bad = b[..33].to_vec();
+        bad[0..4].copy_from_slice(&3u32.to_le_bytes());
+        assert_eq!(decode_settings(&bad), None);
     }
 
     /// Jumbo spec §5.5: the first flag day in which a cluster artifact and
@@ -196,10 +247,10 @@ mod tests {
         // length is exact per version.
         v1.extend_from_slice(&[0, 0, 0, 0]);
         assert!(decode_settings(&v1).is_none());
-        let mut short_v2 = Vec::new();
-        encode_settings(&Settings::genesis_default(), &mut short_v2);
-        short_v2.truncate(SETTINGS_LEN_V1);
-        assert!(decode_settings(&short_v2).is_none());
+        let mut short_v3 = Vec::new();
+        encode_settings(&Settings::genesis_default(), &mut short_v3);
+        short_v3.truncate(SETTINGS_LEN_V1);
+        assert!(decode_settings(&short_v3).is_none());
     }
 
     #[test]
@@ -207,10 +258,11 @@ mod tests {
         assert!(decode_settings(&[]).is_none());
         let mut out = Vec::new();
         encode_settings(&Settings::genesis_default(), &mut out);
-        // `2` is a REAL version now, so the unknown-version case is `3`.
-        let mut v3 = out.clone();
-        v3[0] = 3;
-        assert!(decode_settings(&v3).is_none());
+        // `1`, `2` and `3` are all REAL versions now, so the unknown-version
+        // case is `4`.
+        let mut v4 = out.clone();
+        v4[0] = 4;
+        assert!(decode_settings(&v4).is_none());
         let mut t9 = out.clone();
         t9[28] = 9;
         assert!(decode_settings(&t9).is_none());
@@ -225,6 +277,7 @@ mod tests {
         assert_eq!(d.admission_bytes, 0);
         assert_eq!(d.snapshot_interval_bytes, 0);
         assert_eq!(d.snapshot_target, Target::All);
+        assert_eq!(d.retain_sets, 0);
         assert_eq!(d.datagram_mtu, 0);
     }
 }
