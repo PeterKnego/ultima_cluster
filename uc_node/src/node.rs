@@ -1964,8 +1964,17 @@ impl Node {
         let arc_obs_frontier = Arc::clone(&obs_frontier);
         let cons_obs_frontier = Arc::clone(&obs_frontier);
         let cons_trace_prov = Arc::clone(&trace_prov);
+        // Catalog spec §5.2 (D6), ruling R14: the once-a-second filesystem
+        // probe rides the archive agent, on its own clock.
+        let mut holdings_probe = HoldingsProbe::new(
+            Arc::clone(&holdings),
+            instance.journal_dir(),
+            snap_root.clone(),
+        );
+        let probe_base = std::time::Instant::now();
         let archive_agent = AgentRunner::spawn("uc2-archive", IdleStrategy::Yield, move || {
             let mut did = false;
+            holdings_probe.maybe_probe(probe_base.elapsed().as_nanos() as u64);
             while let Ok(cmd) = trunc_rx.try_recv() {
                 match cmd {
                     ArchiveCmd::Truncate { epoch, to } => {
@@ -2438,12 +2447,9 @@ impl Node {
             snapshot_cadence_refused: 0,
             holdings: Arc::clone(&holdings),
             holdings_next_copy_ns: 0,
-            last_holdings_probe_ns: None,
-            holdings_probes: 0,
             holdings_fs_ops: 0,
             holdings_catalog: Vec::with_capacity(MAX_CATALOG_SETS),
             holdings_held: Vec::with_capacity(2 * MAX_CATALOG_SETS),
-            journal_dir: instance.journal_dir(),
         };
         // Cluster FSM (spec §4.5): arm from the RECOVERED view BEFORE the
         // consensus agent starts. The view already holds genesis or the
@@ -3951,13 +3957,9 @@ struct Consensus {
     /// pass pays one `u64` compare and the lock is taken ~100 times a
     /// second, not once per pass.
     holdings_next_copy_ns: u64,
-    /// The pass-clock instant of the last filesystem probe
-    /// ([`HOLDINGS_PROBE_NS`] apart); `None` until the first.
-    last_holdings_probe_ns: Option<u64>,
-    /// Filesystem probes run (test-visible; a plain counter, no atomics).
-    holdings_probes: u64,
-    /// Directory listings, `statvfs` calls and file stats the holdings
-    /// writers made — the D6 test's witness that none of them run per pass.
+    /// File stats the consensus agent's holdings writers made (only the
+    /// view-change seed, [`Self::note_catalog_for_holdings`]) — the D6
+    /// test's witness that none run per pass.
     holdings_fs_ops: u64,
     /// The catalog positions (oldest first) `holdings.sets_held` is a bitmap
     /// over — a copy of the view's list, refreshed on the view-change edge
@@ -3968,9 +3970,6 @@ struct Consensus {
     /// the cluster artifact, added on every completion edge, dropped by the
     /// pruner. The effective floor reads it in place of a file check.
     holdings_held: Vec<u64>,
-    /// `<instance_dir>/journal` — the probe's `journal_bytes` walk and its
-    /// `statvfs` target.
-    journal_dir: PathBuf,
 }
 
 impl Consensus {
@@ -6994,14 +6993,11 @@ impl Consensus {
     }
 
     /// Catalog spec §5.2 (D6): refresh the counter half of the `Holdings`
-    /// cache, and — at most once per [`HOLDINGS_PROBE_NS`] — its filesystem
-    /// half. Called from `do_work` only when `pass_now_ns` has reached
+    /// cache. Called from `do_work` only when `pass_now_ns` has reached
     /// `holdings_next_copy_ns`, so every other pass pays one compare; out of
-    /// line so the pass body does not grow (M14a).
-    ///
-    /// Loads, then one short lock for the copy. The probe (a `statvfs` and
-    /// two directory walks) runs BEFORE the lock is taken, so the receiver
-    /// agent's `STATUS` never waits on a filesystem call.
+    /// line so the pass body does not grow (M14a). Atomic loads, then one
+    /// short lock for the copy — no filesystem call: the byte fields are the
+    /// archive agent's ([`HoldingsProbe`], ruling R14).
     #[inline(never)]
     fn refresh_holdings(&mut self) {
         let now = self.pass_now_ns;
@@ -7014,43 +7010,11 @@ impl Consensus {
             applied[row as usize] = self.cnc.service_slot(row as usize).applied.load_acquire();
         }
         let journal_first = self.archive_first_base.load(Ordering::Acquire);
-        let probe_due = self
-            .last_holdings_probe_ns
-            .is_none_or(|t| now.saturating_sub(t) >= HOLDINGS_PROBE_NS);
-        let fs = if probe_due {
-            self.last_holdings_probe_ns = Some(now);
-            Some(self.probe_holdings_fs())
-        } else {
-            None
-        };
         let mut h = self.holdings.lock().unwrap_or_else(|e| e.into_inner());
         h.journal_first = journal_first;
         h.durable = durable;
         h.commit = commit;
         h.applied = applied;
-        if let Some((free, journal, snapshots)) = fs {
-            // A failed `statvfs` keeps the last reading rather than
-            // advertising a plausible-looking 0.
-            if let Some(free) = free {
-                h.free_bytes = free;
-            }
-            h.journal_bytes = journal;
-            h.snapshots_bytes = snapshots;
-        }
-    }
-
-    /// The filesystem half of `Holdings`: `(free, journal, snapshots)`
-    /// bytes. Runs off the per-pass path (see [`Self::refresh_holdings`]).
-    #[cold]
-    fn probe_holdings_fs(&mut self) -> (Option<u64>, u64, u64) {
-        self.holdings_probes += 1;
-        self.holdings_fs_ops += 1;
-        // The instance dir (the journal's parent) always exists; the
-        // journal dir itself may not yet on a fresh harness.
-        let free = fs_free_bytes(self.journal_dir.parent().unwrap_or(&self.journal_dir));
-        let journal = dir_bytes(&self.journal_dir, &mut self.holdings_fs_ops);
-        let snapshots = dir_bytes(&self.snap_root, &mut self.holdings_fs_ops);
-        (free, journal, snapshots)
     }
 
     /// Catalog spec §5.1: the view moved (`refresh_from_view`'s edge, never
@@ -11246,6 +11210,66 @@ fn create_rings(
 /// u16)`) as a real `SocketAddr` (IPv4-only — `uc_consensus` stays dep-free,
 /// so this conversion lives here). Inverse of `stored_member`'s ip/port
 /// extraction below.
+/// Catalog spec §5.2 (D6), ruling R14: the filesystem half of the
+/// `Holdings` cache — free bytes, journal bytes, snapshot bytes — probed at
+/// most once per [`HOLDINGS_PROBE_NS`] on the ARCHIVE agent's duty cycle (the
+/// agent that already owns disk I/O), never on the consensus pass. The probe
+/// computes with no lock held, then takes the cache's lock for three stores.
+struct HoldingsProbe {
+    holdings: Arc<Mutex<Holdings>>,
+    journal_dir: PathBuf,
+    snap_root: PathBuf,
+    last_probe_ns: Option<u64>,
+    /// Probes run (test-visible).
+    probes: u64,
+}
+
+impl HoldingsProbe {
+    fn new(holdings: Arc<Mutex<Holdings>>, journal_dir: PathBuf, snap_root: PathBuf) -> Self {
+        HoldingsProbe {
+            holdings,
+            journal_dir,
+            snap_root,
+            last_probe_ns: None,
+            probes: 0,
+        }
+    }
+
+    /// Probe if [`HOLDINGS_PROBE_NS`] has passed since the last probe on
+    /// the caller's clock (`now_ns`); `true` when it did.
+    #[inline]
+    fn maybe_probe(&mut self, now_ns: u64) -> bool {
+        if self
+            .last_probe_ns
+            .is_some_and(|t| now_ns.saturating_sub(t) < HOLDINGS_PROBE_NS)
+        {
+            return false;
+        }
+        self.last_probe_ns = Some(now_ns);
+        self.probe();
+        true
+    }
+
+    #[cold]
+    fn probe(&mut self) {
+        self.probes += 1;
+        let mut ops = 0u64;
+        // The instance dir (the journal's parent) always exists; the
+        // journal dir itself may not yet on a fresh harness.
+        let free = fs_free_bytes(self.journal_dir.parent().unwrap_or(&self.journal_dir));
+        let journal = dir_bytes(&self.journal_dir, &mut ops);
+        let snapshots = dir_bytes(&self.snap_root, &mut ops);
+        let mut h = self.holdings.lock().unwrap_or_else(|e| e.into_inner());
+        // A failed `statvfs` keeps the last reading rather than advertising
+        // a plausible-looking 0.
+        if let Some(free) = free {
+            h.free_bytes = free;
+        }
+        h.journal_bytes = journal;
+        h.snapshots_bytes = snapshots;
+    }
+}
+
 /// Wall-clock nanoseconds since the UNIX epoch (`0` before it) — the clock
 /// the sender stamps soft-table entries with.
 fn unix_now_ns() -> u64 {
@@ -12860,12 +12884,9 @@ mod tests {
             snapshot_cadence_refused: 0,
             holdings: Arc::new(Mutex::new(Holdings::default())),
             holdings_next_copy_ns: 0,
-            last_holdings_probe_ns: None,
-            holdings_probes: 0,
             holdings_fs_ops: 0,
             holdings_catalog: Vec::with_capacity(MAX_CATALOG_SETS),
             holdings_held: Vec::with_capacity(2 * MAX_CATALOG_SETS),
-            journal_dir: dir.path().join("journal"),
         };
         // The LAST thing `Node::start_with_socket` does before spawning the
         // consensus agent, mirrored here so this harness exercises the same
@@ -13460,29 +13481,28 @@ mod tests {
         );
     }
 
-    /// Catalog spec §5.2 (D6): the filesystem half of `Holdings` (free
-    /// bytes, journal bytes, snapshot bytes) is probed at most once per
-    /// second of the pass clock, however many passes run in between.
+    /// Catalog spec §5.2 (D6), ruling R14: the filesystem half of
+    /// `Holdings` (free bytes, journal bytes, snapshot bytes) is probed by
+    /// the ARCHIVE agent's [`HoldingsProbe`], at most once per second of that
+    /// agent's clock however many duty cycles run in between, and lands in
+    /// the shared cache.
     #[test]
     fn holdings_probe_runs_at_most_once_per_second() {
-        let mut h = harness_with_rows(&["a"]);
+        let h = harness_with_rows(&["a"]);
         write_row_artifact(&h, 0, 1000, &[7u8; 4096]);
+        let root = h.cons.snap_root.parent().unwrap().to_path_buf();
+        let mut probe = HoldingsProbe::new(
+            Arc::clone(&h.cons.holdings),
+            root.join("journal"),
+            h.cons.snap_root.clone(),
+        );
         let t0 = 1_000_000_000_000u64;
-        h.cons.test_now_ns = Some(t0);
-        h.cons.do_work();
-        assert_eq!(h.cons.holdings_probes, 1, "the first pass probes");
-        h.cons.test_now_ns = Some(t0 + 500_000);
-        h.cons.do_work();
-        assert_eq!(
-            h.cons.holdings_probes, 1,
-            "two passes 0.5 ms apart: one probe"
-        );
-        h.cons.test_now_ns = Some(t0 + 1_000_000_000);
-        h.cons.do_work();
-        assert_eq!(
-            h.cons.holdings_probes, 2,
-            "a second later: the second probe"
-        );
+        assert!(probe.maybe_probe(t0), "the first cycle probes");
+        assert_eq!(probe.probes, 1);
+        assert!(!probe.maybe_probe(t0 + 500_000));
+        assert_eq!(probe.probes, 1, "two cycles 0.5 ms apart: one probe");
+        assert!(probe.maybe_probe(t0 + 1_000_000_000));
+        assert_eq!(probe.probes, 2, "a second later: the second probe");
         let c = *h.cons.holdings.lock().unwrap();
         assert!(
             c.snapshots_bytes >= 4096,
@@ -13491,18 +13511,18 @@ mod tests {
         assert!(c.free_bytes > 0, "statvfs answered: {c:?}");
     }
 
-    /// Catalog spec §5.2 (D6): the pass copies counters into the cache, but
-    /// lists no directory and stats no file — 1000 passes over 100 ms of
-    /// pass clock leave the filesystem counter where it was.
+    /// Catalog spec §5.2 (D6), ruling R14: the consensus pass copies
+    /// counters into the cache and makes NO filesystem call — 1000 passes
+    /// over 100 ms of pass clock (first pass included) leave the filesystem
+    /// counter at zero and the byte fields untouched.
     #[test]
     fn holdings_are_not_rebuilt_on_the_pass() {
         let mut h = harness_with_rows(&["a"]);
         let append = drive_to_serving_leader(&mut h);
+        let ops = h.cons.holdings_fs_ops;
         let t0 = 2_000_000_000_000u64;
         h.cons.test_now_ns = Some(t0);
         h.cons.do_work();
-        let ops = h.cons.holdings_fs_ops;
-        let probes = h.cons.holdings_probes;
         // A counter that moves AFTER the first pass: the cache must follow.
         h.cons.cnc.service_slot(0).applied.store_release(4096);
         for i in 1..=1000u64 {
@@ -13511,10 +13531,14 @@ mod tests {
         }
         assert_eq!(
             h.cons.holdings_fs_ops, ops,
-            "no directory listing on the pass"
+            "no filesystem call on the pass"
         );
-        assert_eq!(h.cons.holdings_probes, probes, "no probe inside the second");
         let c = *h.cons.holdings.lock().unwrap();
+        assert_eq!(
+            (c.free_bytes, c.journal_bytes, c.snapshots_bytes),
+            (0, 0, 0),
+            "the byte fields are the archive agent's, never the pass's"
+        );
         assert_eq!(c.applied[0], 4096, "…but the counters are copied");
         assert_eq!(c.durable, h.cons.cnc.counters().durable.load_acquire());
         assert_eq!(c.commit, h.cons.cnc.counters().commit.load_acquire());

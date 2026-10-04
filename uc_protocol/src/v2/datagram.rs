@@ -899,6 +899,9 @@ pub struct Holdings {
     pub commit: u64,
     pub applied: [u64; crate::v2::cnc::CNC_MAX_SERVICES],
     pub free_bytes: u64,
+    /// Disk consumed by the journal directory, preallocated segments
+    /// included: each file counts at its full apparent size, so a fresh
+    /// node already reports one whole segment.
     pub journal_bytes: u64,
     pub snapshots_bytes: u64,
     /// The published catalog position `sets_held` was computed against.
