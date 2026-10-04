@@ -227,6 +227,12 @@ struct SettingsSection {
     snapshot_interval_bytes: Option<u64>,
     #[serde(default)]
     snapshot_target: Option<String>,
+    /// Task 8b (catalog spec §4.4 / D5, controller ruling R6): seeds the
+    /// replicated record's genesis value. Absent means `1` (today's
+    /// newest-only retention); the FSM's door, not this loader, refuses `0`
+    /// or anything above `MAX_RETAIN_SETS`.
+    #[serde(default)]
+    retain_sets: Option<u16>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -826,9 +832,12 @@ pub fn parse_str_with_env(
                 // `[settings]` seeds genesis at the baseline and there is no
                 // operator key for it (`deny_unknown_fields` refuses one).
                 datagram_mtu: 0,
-                // Catalog spec §4.4 / errata: no operator key; genesis seeds
-                // `1` (newest-only) — the FSM's door refuses `0`.
-                retain_sets: Settings::genesis_default().retain_sets,
+                // Task 8b: absent means `1` (today's newest-only retention)
+                // — spelled here rather than
+                // `Settings::genesis_default().retain_sets` so the default
+                // is visible where the operator looks. An explicit value,
+                // in or out of the door's bound, passes through unchecked.
+                retain_sets: s.retain_sets.unwrap_or(1),
             }
         }
     };
@@ -1736,21 +1745,24 @@ level = "info"
     }
 
     /// `[settings]` is optional; absent, `settings_genesis` is exactly
-    /// [`Settings::genesis_default`]. Present, it seeds the four fields
-    /// (spec §6) — `admission_bytes`, `fsm_lag` (parsed the same way
-    /// `services.fsm_lag` used to be), `snapshot_interval_bytes`, and
-    /// `snapshot_target`.
+    /// [`Settings::genesis_default`]. Present, it seeds the five fields
+    /// (spec §6; `retain_sets` added by task 8b, catalog spec §4.4 / D5) —
+    /// `admission_bytes`, `fsm_lag` (parsed the same way `services.fsm_lag`
+    /// used to be), `snapshot_interval_bytes`, `snapshot_target`, and
+    /// `retain_sets` (absent means `1`, today's newest-only retention).
     #[test]
     fn settings_section_seeds_genesis_and_is_optional() {
         let toml = format!(
             "{MINIMAL}\n[settings]\nadmission_bytes = 4096\nfsm_lag = \"lockstep\"\n\
-             snapshot_interval_bytes = 1073741824\nsnapshot_target = \"learners\"\n"
+             snapshot_interval_bytes = 1073741824\nsnapshot_target = \"learners\"\n\
+             retain_sets = 5\n"
         );
         let (c, _) = load_str(&toml).unwrap();
         assert_eq!(c.settings_genesis.admission_bytes, 4096);
         assert_eq!(c.settings_genesis.fsm_lag_bytes, FSM_LAG_LOCKSTEP);
         assert_eq!(c.settings_genesis.snapshot_interval_bytes, 1 << 30);
         assert_eq!(c.settings_genesis.snapshot_target, Target::Learners);
+        assert_eq!(c.settings_genesis.retain_sets, 5);
         assert_eq!(
             load_str(MINIMAL).unwrap().0.settings_genesis,
             Settings::genesis_default()
@@ -1775,6 +1787,21 @@ level = "info"
                 other => panic!("{bad:?}: {other}"),
             }
         }
+    }
+
+    /// Task 8b (catalog spec §4.4 / D5, controller ruling R6): `retain_sets`
+    /// is an operator key under `[settings]` now, seeding the replicated
+    /// record's genesis value. Absent means `1` (today's newest-only
+    /// retention), never `0`.
+    #[test]
+    fn settings_retain_sets_seeds_genesis_and_defaults_to_one() {
+        let toml = format!("{MINIMAL}\n[settings]\nretain_sets = 2\n");
+        let (cfg, _) = load_str(&toml).unwrap();
+        assert_eq!(cfg.settings_genesis.retain_sets, 2);
+
+        let toml = format!("{MINIMAL}\n[settings]\n");
+        let (cfg, _) = load_str(&toml).unwrap();
+        assert_eq!(cfg.settings_genesis.retain_sets, 1);
     }
 
     /// FSM identity + cluster FSM (spec §3.3, §6): `uc_` is reserved

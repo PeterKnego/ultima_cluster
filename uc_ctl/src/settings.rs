@@ -52,6 +52,7 @@ struct SettingsFile {
     fsm_lag: Option<String>,
     snapshot_interval_bytes: Option<u64>,
     snapshot_target: Option<String>,
+    retain_sets: Option<u16>,
 }
 
 /// TOML text -> a validated [`Settings`]. Every key is optional; an absent
@@ -66,6 +67,16 @@ struct SettingsFile {
 /// wire record's own sentinel (`0` means "derive at use" in THIS record,
 /// which is why lockstep needs its own sentinel, [`FSM_LAG_LOCKSTEP`],
 /// rather than reusing the cnc page's `0`).
+///
+/// `retain_sets` is the one key that is NOT "derive at use": an absent key
+/// means `1` (today's newest-only retention, [`Settings::genesis_default`]'s
+/// own value — this is the one field where the default IS a concrete
+/// non-zero value, not a sentinel), spelled as the literal `1` here so the
+/// default is visible where the operator looks rather than hidden behind
+/// `genesis_default()`. An explicit `0`, or anything above
+/// `uc_protocol::v2::catalog::MAX_RETAIN_SETS`, passes through uncontested —
+/// the FSM's door is the single authority on the bound (reason 47), exactly
+/// as for `fsm_lag`.
 pub fn parse_settings(toml_text: &str) -> Result<Settings, String> {
     let file: SettingsFile = toml::from_str(toml_text).map_err(|e| e.to_string())?;
 
@@ -103,11 +114,12 @@ pub fn parse_settings(toml_text: &str) -> Result<Settings, String> {
         // an ordinary `settings apply` a no-op for it: the cluster FSM keeps
         // the committed rung monotone, so a zero here cannot lower it.
         datagram_mtu: 0,
-        // Catalog spec §4.4 / errata: no operator key here yet. The FSM's
-        // door refuses `0` (reason 47), so stage the genesis default (`1`,
-        // newest-only) rather than "unset" — an absent key keeps
-        // `Settings::genesis_default`'s meaning, like every key above.
-        retain_sets: Settings::genesis_default().retain_sets,
+        // Task 8b (catalog spec §4.4 / D5): absent means `1` (today's
+        // newest-only retention) — spelled here rather than
+        // `Settings::genesis_default().retain_sets` so the default is
+        // visible where the operator looks. An explicit value, in or out of
+        // the door's bound, passes through unchecked.
+        retain_sets: file.retain_sets.unwrap_or(1),
     })
 }
 
@@ -198,19 +210,10 @@ fn render_fsm_lag(bytes: u64) -> String {
     }
 }
 
-/// `uc2ctl settings show`: the COMMITTED settings, read out of this instance
-/// directory's newest cluster artifact
-/// (`uc_node::cluster_agent::read_committed_settings`). `None` (no artifact
-/// yet) prints the honest line rather than a value nothing committed.
-pub fn show(common: &CommonArgs) -> anyhow::Result<()> {
-    let Some((position, settings)) =
-        uc_node::cluster_agent::read_committed_settings(&common.instance_dir)
-            .map_err(|e| anyhow::anyhow!("reading the cluster artifact: {e}"))?
-    else {
-        println!("no cluster artifact yet");
-        return Ok(());
-    };
-
+/// The exact text `settings show` prints for one committed `(position,
+/// Settings)` pair — pulled out of [`show`] so it is testable without a real
+/// cluster artifact on disk.
+fn render_settings_line(position: u64, settings: &Settings) -> String {
     let fsm_lag = render_fsm_lag(settings.fsm_lag_bytes);
     let target = match settings.snapshot_target {
         Target::All => "all",
@@ -224,11 +227,31 @@ pub fn show(common: &CommonArgs) -> anyhow::Result<()> {
     } else {
         "discovered"
     };
-    println!(
+    format!(
         "position={position} admission_bytes={} fsm_lag={fsm_lag} \
-         snapshot_interval_bytes={} snapshot_target={target} datagram_mtu={} ({rung})",
-        settings.admission_bytes, settings.snapshot_interval_bytes, settings.datagram_mtu
-    );
+         snapshot_interval_bytes={} snapshot_target={target} retain_sets={} \
+         datagram_mtu={} ({rung})",
+        settings.admission_bytes,
+        settings.snapshot_interval_bytes,
+        settings.retain_sets,
+        settings.datagram_mtu,
+    )
+}
+
+/// `uc2ctl settings show`: the COMMITTED settings, read out of this instance
+/// directory's newest cluster artifact
+/// (`uc_node::cluster_agent::read_committed_settings`). `None` (no artifact
+/// yet) prints the honest line rather than a value nothing committed.
+pub fn show(common: &CommonArgs) -> anyhow::Result<()> {
+    let Some((position, settings)) =
+        uc_node::cluster_agent::read_committed_settings(&common.instance_dir)
+            .map_err(|e| anyhow::anyhow!("reading the cluster artifact: {e}"))?
+    else {
+        println!("no cluster artifact yet");
+        return Ok(());
+    };
+
+    println!("{}", render_settings_line(position, &settings));
     Ok(())
 }
 
@@ -237,9 +260,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_settings_accepts_the_four_keys_and_refuses_unknowns() {
+    fn parse_settings_accepts_the_five_keys_and_refuses_unknowns() {
         let s = parse_settings(
-            "admission_bytes = 4096\nfsm_lag = \"lockstep\"\nsnapshot_interval_bytes = 10\nsnapshot_target = \"learners\"\n",
+            "admission_bytes = 4096\nfsm_lag = \"lockstep\"\nsnapshot_interval_bytes = 10\n\
+             snapshot_target = \"learners\"\nretain_sets = 3\n",
         )
         .unwrap();
         assert_eq!(
@@ -250,7 +274,7 @@ mod tests {
                 snapshot_interval_bytes: 10,
                 snapshot_target: Target::Learners,
                 datagram_mtu: 0,
-                retain_sets: 1,
+                retain_sets: 3,
             }
         );
         assert_eq!(parse_settings("").unwrap(), Settings::genesis_default());
@@ -334,5 +358,33 @@ mod tests {
         let s = parse_settings("fsm_lag = \"64KiB\"\n").unwrap();
         assert_eq!(s.fsm_lag_bytes, 65536);
         assert_eq!(render_fsm_lag(s.fsm_lag_bytes), "65536B");
+    }
+
+    /// Task 8b: `retain_sets` is an operator key now. Absent means `1`
+    /// (today's newest-only retention), never `0`. `0` written explicitly
+    /// passes through — the CLI does not validate the range; the FSM's door
+    /// (reason 47) is the single authority.
+    #[test]
+    fn retain_sets_parses_and_defaults_to_one() {
+        let s = parse_settings("retain_sets = 3\n").unwrap();
+        assert_eq!(s.retain_sets, 3);
+        let s = parse_settings("admission_bytes = 4096\n").unwrap();
+        assert_eq!(
+            s.retain_sets, 1,
+            "absent means today's newest-only retention, never 0"
+        );
+        let s = parse_settings("retain_sets = 0\n").unwrap();
+        assert_eq!(
+            s.retain_sets, 0,
+            "the CLI passes it through; the FSM's door refuses it (47)"
+        );
+    }
+
+    #[test]
+    fn settings_show_prints_retain_sets() {
+        let mut s = Settings::genesis_default();
+        s.retain_sets = 4;
+        let line = render_settings_line(0, &s);
+        assert!(line.contains("retain_sets=4"), "{line}");
     }
 }
