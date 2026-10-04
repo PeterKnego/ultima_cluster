@@ -16,7 +16,11 @@
 //! length-prefixed blob after `reports`, before the CRC: running (u32 len ‖
 //! bytes) — the per-row running-version records (`v2::upgrade::RowRunning`'s
 //! list codec), also opaque here. v1 and v2 images are still ACCEPTED on
-//! read, with `running` empty.
+//! read, with `running` empty. Layout v4 (catalog spec §7) appends one more
+//! length-prefixed blob after `running`, before the CRC: catalog (u32 len ‖
+//! bytes) — the snapshot catalog's set list (`v2::catalog`'s
+//! `encode_set_list`), opaque here. v1–v3 images are still ACCEPTED on read,
+//! with `catalog` empty.
 //!
 //! Moved out of `uc_node::cluster_fsm` (plan 3, spec §4.8) so a fuzz target
 //! can reach the decoder without pulling in `ClusterFsm` — a below-floor
@@ -55,7 +59,11 @@ pub const CLUSTER_IMAGE_MAGIC: &[u8; 8] = b"UCCLUST1";
 /// `reports`. A v1 or v2 image is still ACCEPTED on read, with `running`
 /// empty — the same precedent, since a restarting `2.13.0` node reads its
 /// own pre-upgrade artifact.
-pub const CLUSTER_IMAGE_VERSION: u32 = 3;
+/// Bumped to 4 (catalog spec §7): a trailing length-prefixed `catalog` blob
+/// after `running`. A v1–v3 image is still ACCEPTED on read, with `catalog`
+/// empty — the `Empty` state of catalog spec §4.5, since the flag day does
+/// not migrate sets built before the catalog existed.
+pub const CLUSTER_IMAGE_VERSION: u32 = 4;
 
 /// Bytes fixed before the two length-prefixed payloads: magic(8) ‖
 /// version(4) ‖ applied(8) ‖ table_position(8) ‖ settings_position(8).
@@ -99,6 +107,9 @@ pub struct ClusterImageParts<'a> {
     /// The `v2::upgrade` running-version-list bytes (opaque here; empty for
     /// a v1/v2 image or a cluster with no running versions recorded).
     pub running: &'a [u8],
+    /// The `v2::catalog` set-list bytes (opaque here; empty for a v1–v3
+    /// image or a cluster whose catalog holds no set).
+    pub catalog: &'a [u8],
 }
 
 /// Append the encoded image (magic through the trailing CRC) to `out`. The
@@ -149,6 +160,9 @@ pub fn encode_cluster_image(p: &ClusterImageParts<'_>, out: &mut Vec<u8>) -> Opt
     let running_len = payload_len_prefix(p.running.len())?;
     out.extend_from_slice(&running_len.to_le_bytes());
     out.extend_from_slice(p.running);
+    let catalog_len = payload_len_prefix(p.catalog.len())?;
+    out.extend_from_slice(&catalog_len.to_le_bytes());
+    out.extend_from_slice(p.catalog);
     let crc = crc32fast::hash(&out[start..]);
     out.extend_from_slice(&crc.to_le_bytes());
     Some(())
@@ -203,7 +217,7 @@ pub fn decode_cluster_image(buf: &[u8]) -> Option<ClusterImageParts<'_>> {
     o += 4;
     let table = o.checked_add(tl).and_then(|end| body.get(o..end))?;
     o += tl;
-    let (settings, pins, reports, running) = if version == 1 {
+    let (settings, pins, reports, running, catalog) = if version == 1 {
         // 2.11.0/2.12.0 layout: the remainder is exactly one settings
         // record, self-versioned and exact-length per version
         // (`settings::decode_settings`) — never a slice that could run past
@@ -230,12 +244,14 @@ pub fn decode_cluster_image(buf: &[u8]) -> Option<ClusterImageParts<'_>> {
             &body[body.len()..],
             &body[body.len()..],
             &body[body.len()..],
+            &body[body.len()..],
         )
     } else {
-        // v2/v3: the settings record is sized by ITS OWN version word (the
-        // record is exact-length per version), then two length-prefixed
-        // blobs (pins, reports), then — v3 only — a third length-prefixed
-        // blob (running), then nothing.
+        // v2/v3/v4: the settings record is sized by ITS OWN version word
+        // (the record is exact-length per version), then two length-prefixed
+        // blobs (pins, reports), then — v3 and later — a third
+        // length-prefixed blob (running), then — v4 only — a fourth
+        // (catalog), then nothing.
         let sl = match u32_at(o)? {
             1 => SETTINGS_LEN_V1,
             2 => SETTINGS_LEN_V2,
@@ -261,10 +277,19 @@ pub fn decode_cluster_image(buf: &[u8]) -> Option<ClusterImageParts<'_>> {
         } else {
             &body[body.len()..]
         };
+        let catalog = if version >= 4 {
+            let cl = u32_at(o)? as usize;
+            o += 4;
+            let c = o.checked_add(cl).and_then(|end| body.get(o..end))?;
+            o += cl;
+            c
+        } else {
+            &body[body.len()..]
+        };
         if o != body.len() {
             return None;
         }
-        (settings, pins, reports, running)
+        (settings, pins, reports, running, catalog)
     };
     Some(ClusterImageParts {
         applied,
@@ -276,6 +301,7 @@ pub fn decode_cluster_image(buf: &[u8]) -> Option<ClusterImageParts<'_>> {
         pins,
         reports,
         running,
+        catalog,
     })
 }
 
@@ -451,6 +477,7 @@ mod tests {
             pins: &[],
             reports: &[],
             running: &[],
+            catalog: &[],
         };
         // encode_cluster_image now always writes the v2 layout (with two
         // trailing, empty, length-prefixed pin/report blobs), so it no
@@ -498,6 +525,7 @@ mod tests {
                 pins: &[],
                 reports: &[],
                 running: &[],
+                catalog: &[],
             };
             let mut img = Vec::new();
             encode_cluster_image(&parts, &mut img).expect("well under u32::MAX");
@@ -524,6 +552,7 @@ mod tests {
                 pins: &[],
                 reports: &[],
                 running: &[],
+                catalog: &[],
             };
             let mut img = Vec::new();
             encode_cluster_image(&parts, &mut img).expect("well under u32::MAX");
@@ -596,6 +625,7 @@ mod tests {
             pins: &[],
             reports: &[],
             running: &[],
+            catalog: &[],
         };
         let mut img = Vec::new();
         encode_cluster_image(&parts, &mut img).expect("well under u32::MAX");
@@ -650,6 +680,7 @@ mod tests {
             pins: &[],
             reports: &[],
             running: &[],
+            catalog: &[],
         };
         assert_eq!(encode_cluster_image(&parts, &mut out), Some(()));
         assert!(decode_cluster_image(&out).is_some());
@@ -669,10 +700,11 @@ mod tests {
             pins: &pins,
             reports: &reports,
             running: &[],
+            catalog: &[],
         };
         let mut img = Vec::new();
         encode_cluster_image(&p, &mut img).unwrap();
-        assert_eq!(&img[8..12], &3u32.to_le_bytes(), "version 3");
+        assert_eq!(&img[8..12], &4u32.to_le_bytes(), "version 4");
         let d = decode_cluster_image(&img).unwrap();
         assert_eq!(
             (
@@ -716,6 +748,7 @@ mod tests {
             pins: &[],
             reports: &[],
             running: &[],
+            catalog: &[],
         };
         let mut img = Vec::new();
         encode_cluster_image(&p, &mut img).unwrap();
@@ -740,13 +773,14 @@ mod tests {
             pins: &[],
             reports: &[],
             running: &running,
+            catalog: &[],
         };
         let mut img = Vec::new();
         encode_cluster_image(&p, &mut img).unwrap();
         assert_eq!(
             u32::from_le_bytes(img[8..12].try_into().unwrap()),
-            3,
-            "encode_cluster_image now writes layout v3"
+            CLUSTER_IMAGE_VERSION,
+            "encode_cluster_image writes the current layout (v3 or later)"
         );
         assert_eq!(decode_cluster_image(&img).unwrap().running, &running[..]);
         // A v2 image (the existing v2 fixture, captured before this task's
@@ -784,6 +818,54 @@ mod tests {
             decode_cluster_image(PLAN1_FIXTURE).unwrap().running,
             &[] as &[u8]
         );
+    }
+
+    /// Catalog spec §7: layout v4 appends a trailing length-prefixed
+    /// `catalog` blob after `running` (opaque here — the `v2::catalog`
+    /// set-list bytes). A v3 image (a v4 image with no catalog prefix and
+    /// version word 3) still decodes, with `catalog` empty, and a catalog
+    /// length that runs past the CRC is refused.
+    #[test]
+    fn v4_image_round_trips_a_catalog_blob_and_v3_reads_empty() {
+        let running = [7u8; 12];
+        let catalog = [5u8; 137];
+        let p = ClusterImageParts {
+            applied: 8192,
+            table_position: 0,
+            settings_position: 0,
+            membership: b"m",
+            table: b"t",
+            settings: &v2_settings(),
+            pins: &[],
+            reports: &[],
+            running: &running,
+            catalog: &catalog,
+        };
+        let mut img = Vec::new();
+        encode_cluster_image(&p, &mut img).unwrap();
+        assert_eq!(&img[8..12], &4u32.to_le_bytes(), "layout v4");
+        assert_eq!(decode_cluster_image(&img), Some(p));
+
+        // The same parts without a catalog, re-framed as v3: drop the
+        // 4-byte zero catalog prefix, write version 3, re-seal.
+        let mut v4_empty = Vec::new();
+        encode_cluster_image(&ClusterImageParts { catalog: &[], ..p }, &mut v4_empty).unwrap();
+        let l = v4_empty.len();
+        assert_eq!(&v4_empty[l - 8..l - 4], &0u32.to_le_bytes());
+        let mut v3 = v4_empty[..l - 8].to_vec();
+        v3[8..12].copy_from_slice(&3u32.to_le_bytes());
+        let crc = crc32fast::hash(&v3);
+        v3.extend_from_slice(&crc.to_le_bytes());
+        let d = decode_cluster_image(&v3).expect("a v3 image still decodes");
+        assert_eq!(d.running, &running[..]);
+        assert_eq!(d.catalog, &[] as &[u8]);
+
+        // A catalog length one past what is there is refused (exact framing).
+        let mut bad = img.clone();
+        let off = img.len() - 4 - catalog.len() - 4;
+        bad[off..off + 4].copy_from_slice(&(catalog.len() as u32 + 1).to_le_bytes());
+        fix_crc(&mut bad);
+        assert_eq!(decode_cluster_image(&bad), None);
     }
 
     /// Recompute the trailing CRC after a deliberate mutation.

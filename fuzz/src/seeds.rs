@@ -1471,6 +1471,7 @@ pub fn uc_protocol_cluster_image() -> Vec<Seed> {
         pins: &[],
         reports: &[],
         running: &[],
+        catalog: &[],
     };
     let mut image = Vec::new();
     encode_cluster_image(&parts, &mut image).expect("genesis parts are well under u32::MAX");

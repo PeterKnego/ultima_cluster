@@ -826,9 +826,9 @@ pub fn parse_str_with_env(
                 // `[settings]` seeds genesis at the baseline and there is no
                 // operator key for it (`deny_unknown_fields` refuses one).
                 datagram_mtu: 0,
-                // Catalog spec §7: same posture as `datagram_mtu` — no
-                // operator key; `0` ("unset") is a no-op for the FSM's door.
-                retain_sets: 0,
+                // Catalog spec §4.4 / errata: no operator key; genesis seeds
+                // `1` (newest-only) — the FSM's door refuses `0`.
+                retain_sets: Settings::genesis_default().retain_sets,
             }
         }
     };

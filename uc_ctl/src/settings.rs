@@ -103,9 +103,11 @@ pub fn parse_settings(toml_text: &str) -> Result<Settings, String> {
         // an ordinary `settings apply` a no-op for it: the cluster FSM keeps
         // the committed rung monotone, so a zero here cannot lower it.
         datagram_mtu: 0,
-        // Catalog spec §7: same posture — no operator key here yet, `0`
-        // ("unset") is a no-op for `settings apply`.
-        retain_sets: 0,
+        // Catalog spec §4.4 / errata: no operator key here yet. The FSM's
+        // door refuses `0` (reason 47), so stage the genesis default (`1`,
+        // newest-only) rather than "unset" — an absent key keeps
+        // `Settings::genesis_default`'s meaning, like every key above.
+        retain_sets: Settings::genesis_default().retain_sets,
     })
 }
 
@@ -248,7 +250,7 @@ mod tests {
                 snapshot_interval_bytes: 10,
                 snapshot_target: Target::Learners,
                 datagram_mtu: 0,
-                retain_sets: 0,
+                retain_sets: 1,
             }
         );
         assert_eq!(parse_settings("").unwrap(), Settings::genesis_default());

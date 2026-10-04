@@ -98,7 +98,10 @@ impl Settings {
             snapshot_interval_bytes: 0,
             snapshot_target: Target::All,
             datagram_mtu: 0,
-            retain_sets: 0,
+            // Catalog spec errata (2026-10-04): genesis seeds `1` — today's
+            // newest-only retention — because the FSM's door refuses `0`.
+            // `0` survives only as the "unset" reading of a v1/v2 record.
+            retain_sets: 1,
         }
     }
 }
@@ -277,7 +280,7 @@ mod tests {
         assert_eq!(d.admission_bytes, 0);
         assert_eq!(d.snapshot_interval_bytes, 0);
         assert_eq!(d.snapshot_target, Target::All);
-        assert_eq!(d.retain_sets, 0);
+        assert_eq!(d.retain_sets, 1, "genesis seeds newest-only retention");
         assert_eq!(d.datagram_mtu, 0);
     }
 }

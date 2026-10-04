@@ -12188,6 +12188,7 @@ mod tests {
             pins: vec![],
             reports: vec![],
             running: [None; uc_protocol::v2::cnc::CNC_MAX_SERVICES],
+            catalog: Vec::new(),
         };
         let cluster_view = Arc::new(ClusterView::new(&cluster_genesis));
         let cluster_snapshot_pos = Arc::new(AtomicU64::new(0));
@@ -16632,6 +16633,7 @@ mod tests {
                     pins: vec![],
                     reports: vec![],
                     running: [None; uc_protocol::v2::cnc::CNC_MAX_SERVICES],
+                    catalog: Vec::new(),
                 },
                 vec![hash],
             ),
@@ -16730,6 +16732,7 @@ mod tests {
                     pins: vec![],
                     reports: vec![],
                     running: [None; uc_protocol::v2::cnc::CNC_MAX_SERVICES],
+                    catalog: Vec::new(),
                 },
                 vec![hash],
             ),
@@ -18930,6 +18933,7 @@ mod tests {
                 pins: vec![],
                 reports: vec![],
                 running: [None; uc_protocol::v2::cnc::CNC_MAX_SERVICES],
+                catalog: Vec::new(),
             },
             Vec::new(),
         );
