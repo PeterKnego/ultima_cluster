@@ -73,6 +73,7 @@ use crate::ipc::InstanceDir;
 use crate::read_round::ProbeRound;
 use crate::services::ServicesConfig;
 use uc_log::buffer::FrameRead;
+use uc_protocol::v2::catalog::SetEntry;
 use uc_protocol::v2::datagram::{
     CONFIG_PROPOSAL_BODY_LEN, CONFIG_REPLY_BODY_LEN, ConfigProposalBody, ConfigReplyBody,
     DATAGRAM_HEADER_LEN, DGRAM_KIND_COMMIT_POSITION, DGRAM_KIND_CONFIG_PROPOSAL,
@@ -91,7 +92,9 @@ use uc_protocol::v2::schedule::{
     decode_schedule_table,
 };
 use uc_protocol::v2::settings::{Settings, Target, decode_settings};
-use uc_protocol::v2::upgrade::{RowGenesis, SnapshotReport, UPGRADE_PIN_LEN, decode_upgrade_pin};
+use uc_protocol::v2::upgrade::{
+    CLUSTER_ROW, RowGenesis, SnapshotReport, UPGRADE_PIN_LEN, decode_upgrade_pin, is_report_row,
+};
 
 /// Single-slot truncation ack. One truncation is in flight at a time (the SM
 /// latch serializes them), so a slot suffices and, unlike a bounded channel,
@@ -5284,13 +5287,21 @@ impl Consensus {
         // it: "no complete set yet" is exactly `snapshot_set_position == 0`,
         // one word, with no window in which a row's floor is unbounded by the
         // cluster artifact.
-        let service_pos = self.snapshot_set_position.load(Ordering::Acquire);
+        //
+        // Catalog spec §4.4: what the floor may MOVE to is this node's
+        // EFFECTIVE floor — the newest agreed set it holds
+        // ([`Self::effective_floor_in`]) — and `own` is only its ceiling. So
+        // the cheap per-pass test is still on `own` alone (one load, one
+        // compare): the candidate can never exceed it, so a stable `own`
+        // costs nothing, and the view read the candidate needs runs only
+        // behind the throttle below.
+        let own = self.snapshot_set_position.load(Ordering::Acquire);
         let durable = self.cnc.counters().durable.load_acquire();
-        let have_new_floor = service_pos > self.snapshot_persisted_floor && service_pos <= durable;
+        let may_move = own > self.snapshot_persisted_floor && own <= durable;
         let purge_on = matches!(self.purge_policy, PurgePolicy::BelowSnapshot { .. });
         // Cheap exit every cycle when there is neither a newer floor to persist
         // nor a purge policy that might have outstanding work.
-        if !have_new_floor && !purge_on {
+        if !may_move && !purge_on {
             return false;
         }
         let now = self.now_ns();
@@ -5302,48 +5313,53 @@ impl Consensus {
         }
 
         let mut did = false;
-        // Plan B2 T5 (fix round): the candidate floor is HELD at any pinned
-        // origin this node has not consumed yet. Computed here — inside the
-        // `have_new_floor` branch and behind the throttle — so the view read
-        // it costs happens at most once per throttle window and never on the
-        // steady path.
-        let service_pos = if have_new_floor {
-            self.hold_floor_for_pins(service_pos)
-        } else {
-            service_pos
-        };
-        // The clamp can wipe out the whole move (the hold sits at or below the
-        // floor this node already published). Then there is nothing to persist
-        // and nothing to prune — but the throttle is still stamped below, so
-        // the next evaluation is one tick away rather than one pass away.
-        let held = have_new_floor && service_pos <= self.snapshot_persisted_floor;
-        let have_new_floor = have_new_floor && !held;
-        if have_new_floor {
-            self.state
-                .store_snapshot_floor(service_pos)
-                .expect("snapshot floor persist fail-stop (journal I/O)");
-            self.cnc
-                .snapshots()
-                .node_snapshot_floor
-                .store_release(service_pos);
-            self.snapshot_persisted_floor = service_pos;
-            // Ruling P1 (fix round 1): retention runs HERE — below the floor
-            // this pass just PUBLISHED — not on the completion edge.
-            //
-            // The ship gate reads the persisted `node_snapshot_floor`, and
-            // this persist is throttled to `OUTPUT_PROGRESS_FLOOR_NS`. Pruning
-            // at completion instead would open a window of up to that
-            // throttle in which the floor still names P1 while P1's artifacts
-            // have already been unlinked in favour of P2 — every session in
-            // that window declines `SNAP_DECLINE_MISSING`, and a joiner
-            // re-NAKs into it. Pruning below the published floor cannot
-            // produce that state: the set the floor names is, by definition,
-            // at or above the cut.
-            //
-            // Still rare and still off the hot path: this branch runs only
-            // when the floor actually moved, which is once per complete set.
-            self.prune_snapshots_below(service_pos);
-            did = true;
+        // `held`: `own` could have moved the floor but the candidate did not
+        // (no agreed set held above the floor, or a pinned origin holds it).
+        // The throttle is still stamped below, so the next evaluation is one
+        // tick away rather than one pass away.
+        let mut held = false;
+        if may_move {
+            // ONE clone of the committed view for this whole evaluation — the
+            // catalog read, the pin hold and the retention keep-set all read
+            // it — and only here, inside the throttle.
+            let inner = self.cluster_view.snapshot_inner();
+            let candidate = self.effective_floor_in(own, &inner.catalog);
+            // Plan B2 T5 (fix round): the candidate floor is HELD at any
+            // pinned origin this node has not consumed yet.
+            let service_pos = if candidate > self.snapshot_persisted_floor {
+                self.hold_floor_for_pins(&inner, candidate)
+            } else {
+                candidate
+            };
+            if service_pos > self.snapshot_persisted_floor {
+                self.state
+                    .store_snapshot_floor(service_pos)
+                    .expect("snapshot floor persist fail-stop (journal I/O)");
+                self.cnc
+                    .snapshots()
+                    .node_snapshot_floor
+                    .store_release(service_pos);
+                self.snapshot_persisted_floor = service_pos;
+                // Ruling P1 (fix round 1): retention runs HERE — below the floor
+                // this pass just PUBLISHED — not on the completion edge.
+                //
+                // The ship gate reads the persisted `node_snapshot_floor`, and
+                // this persist is throttled to `OUTPUT_PROGRESS_FLOOR_NS`. Pruning
+                // at completion instead would open a window of up to that
+                // throttle in which the floor still names P1 while P1's artifacts
+                // have already been unlinked in favour of P2 — every session in
+                // that window declines `SNAP_DECLINE_MISSING`, and a joiner
+                // re-NAKs into it. Pruning below the published floor cannot
+                // produce that state: the set the floor names is, by definition,
+                // at or above the cut.
+                //
+                // Still rare and still off the hot path: this branch runs only
+                // when the floor actually moved, which is once per complete set.
+                self.prune_snapshots_below_in(service_pos, &inner);
+                did = true;
+            } else {
+                held = true;
+            }
         }
         if let PurgePolicy::BelowSnapshot { slack_bytes } = self.purge_policy {
             let target = self.snapshot_persisted_floor.saturating_sub(slack_bytes);
@@ -5363,6 +5379,84 @@ impl Consensus {
         // idle strategy hot for as long as an upgrade takes to swap its
         // binary.
         did
+    }
+
+    /// Catalog spec §4.4: this node's EFFECTIVE floor candidate — the newest
+    /// AGREED set it holds complete on disk, at or below `own`
+    /// (`snapshot_set_position`, its newest complete set). Reads the view
+    /// itself; the floor path uses [`Self::effective_floor_in`] on the clone
+    /// it already holds.
+    #[cfg(test)]
+    fn effective_floor_candidate(&self) -> u64 {
+        let own = self.snapshot_set_position.load(Ordering::Acquire);
+        if self
+            .cluster_view
+            .catalog_agreed_position
+            .load(Ordering::Acquire)
+            == 0
+        {
+            return own; // Empty: today's behaviour, no view clone
+        }
+        let inner = self.cluster_view.snapshot_inner();
+        self.effective_floor_in(own, &inner.catalog)
+    }
+
+    /// The body of [`Self::effective_floor_candidate`] over a catalog the
+    /// caller already cloned. Three answers:
+    ///
+    /// * **`Empty`** (no agreed set listed — catalog spec §4.5): `own`, which
+    ///   is today's behaviour, unchanged.
+    /// * **`own` is itself an agreed listed set**: `own`. This node holds it
+    ///   by definition (it is its newest complete set), so the common case
+    ///   costs no filesystem call.
+    /// * **otherwise** (`own` unlisted, or listed but not agreed): the newest
+    ///   agreed listed set BELOW `own` whose artifacts this node holds
+    ///   ([`Self::holds_set`]) — holding P does not imply holding anything
+    ///   older, which may have been pruned or never built here. Only sets
+    ///   ABOVE the persisted floor are probed (one at or below it could not
+    ///   move the floor anyway), so on a stable floor the probe is empty.
+    ///
+    /// `0` means "no agreed set I hold above my floor": nothing moves. That
+    /// is the normal state of a voter on a learner-only cluster (§4.6), not
+    /// an error — the catalog's newest agreed set is a target to fetch, never
+    /// a licence to purge what this node cannot rebuild from.
+    fn effective_floor_in(&self, own: u64, catalog: &[SetEntry]) -> u64 {
+        if !catalog.iter().any(SetEntry::is_agreed) {
+            return own;
+        }
+        for e in catalog.iter().rev() {
+            if e.position > own || !e.is_agreed() {
+                continue;
+            }
+            if e.position == own {
+                return own;
+            }
+            if e.position <= self.snapshot_persisted_floor {
+                return 0;
+            }
+            if self.holds_set(e.position) {
+                return e.position;
+            }
+        }
+        0
+    }
+
+    /// Does this node hold the complete set at `p` on disk — every declared
+    /// row's `snap-<p>.ultsnap` and the cluster's `snap-<p>.ultcluster`? The
+    /// same set definition `check_set_completeness` applies, read off the
+    /// filesystem rather than the cnc slots (which only ever name the newest
+    /// instant). File-presence only; called from [`Self::effective_floor_in`]
+    /// in its uncommon branch, behind the floor throttle — never per pass.
+    fn holds_set(&self, p: u64) -> bool {
+        self.services.ids().all(|row| {
+            self.snap_root
+                .join(row.to_string())
+                .join(format!("{SNAP_PREFIX}{p}{SNAP_SUFFIX}"))
+                .is_file()
+        }) && self
+            .cluster_snapshot_dir
+            .join(format!("{SNAP_PREFIX}{p}{CLUSTER_SNAP_SUFFIX}"))
+            .is_file()
     }
 
     /// Plan B2 T5 (fix round): the snapshot/purge floor must not pass a pinned
@@ -5412,8 +5506,7 @@ impl Consensus {
     /// is increase-only — a safety rule this must not break). The door check
     /// for op 10 requires `origin` to be this node's newest complete set, so
     /// in practice the pin lands at or above the floor.
-    fn hold_floor_for_pins(&mut self, candidate: u64) -> u64 {
-        let inner = self.cluster_view.snapshot_inner();
+    fn hold_floor_for_pins(&mut self, inner: &ClusterViewInner, candidate: u64) -> u64 {
         if inner.pins.is_empty() {
             self.snapshot_floor_hold = 0;
             return candidate;
@@ -6407,7 +6500,22 @@ impl Consensus {
         let leader_addr = (hint != u64::MAX)
             .then(|| self.id_to_addr.get(&(hint as NodeId)).copied())
             .flatten();
-        for &row in &rows[..n] {
+        // Catalog spec §5.1: the cluster artifact at `p` joins the report as
+        // row [`CLUSTER_ROW`], hashed with `artifact_hash_of` — the SAME
+        // function the service builder applies to a row's payload. The
+        // cluster artifact carries no `ULTSNAP2` envelope (it is the bare
+        // image `ClusterFsm::freeze` encodes, self-describing by its own
+        // magic), so its payload IS the whole file. Read off disk once, on
+        // this edge only (once per instant), never per pass. A missing or
+        // unreadable file is skipped: the set is not complete here as far as
+        // the cluster row can vouch, and the next instant reports again.
+        let cluster_hash = std::fs::read(
+            self.cluster_snapshot_dir
+                .join(format!("{SNAP_PREFIX}{p}{CLUSTER_SNAP_SUFFIX}")),
+        )
+        .ok()
+        .map(|img| uc_service::snapshots::artifact_hash_of(&img));
+        let row_reports = rows[..n].iter().filter_map(|&row| {
             // `snapshot_pos` FIRST (Acquire), then the hash — the reverse of
             // the builder's store order, which is what makes the pair
             // coherent (see this function's doc).
@@ -6421,9 +6529,17 @@ impl Consensus {
                 // function's doc).
                 (at, hash, slot.snapshot_pos.load_acquire())
             };
-            if at != p || still_at != p || hash == 0 {
-                continue;
-            }
+            (at == p && still_at == p && hash != 0).then_some((row, hash))
+        });
+        // Collected before the sends: the iterator above borrows `self.cnc`,
+        // and every arm below needs `&mut self`. At most nine entries.
+        let mut reports = [(0u8, 0u64); CNC_MAX_SERVICES + 1];
+        let mut m = 0usize;
+        for r in row_reports.chain(cluster_hash.map(|h| (CLUSTER_ROW, h))) {
+            reports[m] = r;
+            m += 1;
+        }
+        for &(row, hash) in &reports[..m] {
             if leader {
                 crate::obs_event!(
                     Info,
@@ -6533,10 +6649,11 @@ impl Consensus {
         }
         // Belt and braces: `read_snap_report_body` already refuses a row this
         // page has no slot for (and a zero position), and the leader's own
-        // in-process call comes from `services.ids()`. The compare is one
+        // in-process call comes from `services.ids()` plus the cluster row
+        // ([`CLUSTER_ROW`], catalog spec §5.1). The compare is one
         // instruction and it keeps a wire-derived `row` from ever reaching
         // `encode_snapshot_report`'s `expect` below.
-        if row as usize >= CNC_MAX_SERVICES {
+        if !is_report_row(row) {
             return;
         }
         if position <= self.held_report_position(row) {
@@ -6664,7 +6781,8 @@ impl Consensus {
         // "whose hash may be in the record" can never disagree.
         let voters_required = config.voters.len();
         // Ascending, so which ready row goes first is a property of the data
-        // and not of the `HashMap`'s iteration order.
+        // and not of the `HashMap`'s iteration order — and the cluster row
+        // (`CLUSTER_ROW = 255`) sorts after every user row.
         let mut rows: Vec<u8> = self.pending_snapshot_reports.keys().copied().collect();
         rows.sort_unstable();
         for row in rows {
@@ -6719,7 +6837,7 @@ impl Consensus {
             // Encodable by construction: non-empty (just checked), at most one
             // entry per CURRENT member and therefore at most `MAX_MEMBERS` (the
             // filter above), strictly increasing by node id (the `BTreeMap`'s
-            // order, which the filter preserves), `row < CNC_MAX_SERVICES` and
+            // order, which the filter preserves), `is_report_row(row)` and
             // a non-zero position — the last two are `on_snap_report`'s door.
             let cmd = ClusterCommand::SnapshotReport(SnapshotReport {
                 row,
@@ -6775,7 +6893,15 @@ impl Consensus {
     /// The node never WRITES an artifact (every row artifact carries the
     /// 16-byte envelope only `uc_service::snapshots::SnapshotStore::publish`
     /// writes); it only ever deletes one it can prove is superseded.
+    #[cfg(test)]
     fn prune_snapshots_below(&self, p: u64) {
+        let inner = self.cluster_view.snapshot_inner();
+        self.prune_snapshots_below_in(p, &inner);
+    }
+
+    /// [`Self::prune_snapshots_below`] over a view the caller already cloned
+    /// (the floor path's one clone per evaluation).
+    fn prune_snapshots_below_in(&self, p: u64, inner: &ClusterViewInner) {
         let mut removed = 0u64;
         let mut errors = 0u64;
         // Plan B1: a pinned origin's set must outlive the floor — B2's
@@ -6788,19 +6914,22 @@ impl Consensus {
         // artifact at the origin with the journal above it purged is not
         // enough — the pinned attach installs the artifact and then has to
         // tail-replay `(origin, target]`.
-        let keep: Vec<u64> = {
-            let inner = self.cluster_view.snapshot_inner();
-            (0..CNC_MAX_SERVICES as u8)
-                .filter_map(|row| {
-                    inner
-                        .pins
-                        .iter()
-                        .rev()
-                        .find(|p| p.row == row)
-                        .map(|p| p.origin)
-                })
-                .collect()
-        };
+        //
+        // Catalog spec §4.4 step 3: and every position the catalog LISTS, in
+        // whatever state — a listed set is the catalog's to retire, so the
+        // pruner deletes only what the catalog no longer names (a stalled or
+        // diverged set stays visible and alertable while it is listed).
+        let keep: Vec<u64> = (0..CNC_MAX_SERVICES as u8)
+            .filter_map(|row| {
+                inner
+                    .pins
+                    .iter()
+                    .rev()
+                    .find(|p| p.row == row)
+                    .map(|p| p.origin)
+            })
+            .chain(inner.catalog.iter().map(|e| e.position))
+            .collect();
         // The DECLARED rows — the same set `check_set_completeness` reads, so
         // the pruner only ever touches artifact families the set is made of.
         // NOT `ring_ids()`, whose "row 0 stands in for clients" fallback would
@@ -12857,6 +12986,167 @@ mod tests {
                 format!("snap-{p1}.ultcluster"),
                 format!("snap-{p2}.ultcluster")
             ]
+        );
+    }
+
+    /// Catalog test helper: a `Complete` set at `p` whose cluster artifact
+    /// and row 0 are `Agreed` — the shape `is_agreed` accepts.
+    fn agreed_entry(p: u64) -> uc_protocol::v2::catalog::SetEntry {
+        use uc_protocol::v2::catalog::{RowVerdict, SetEntry, SetKind, SetState};
+        let mut e = SetEntry::commanded(p, SetKind::Full, 0);
+        e.state = SetState::Complete;
+        e.cluster.verdict = RowVerdict::Agreed;
+        e.rows[0].verdict = RowVerdict::Agreed;
+        e
+    }
+
+    /// Catalog test helper: row `row`'s artifact at `p` under the harness's
+    /// snapshot root (the envelope is irrelevant to every reader here — the
+    /// row hash comes off the cnc slot, the pruner reads names only).
+    fn write_row_artifact(h: &Harness, row: u8, p: u64, payload: &[u8]) {
+        let d = h.cons.snap_root.join(row.to_string());
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join(format!("snap-{p}.ultsnap")), payload).unwrap();
+    }
+
+    /// Catalog test helper: the cluster artifact at `p`. The cluster
+    /// artifact carries no `ULTSNAP2` envelope (it is the bare image
+    /// `ClusterFsm::freeze` encodes), so its payload IS the file; returned
+    /// so a test can hash it.
+    fn write_cluster_artifact(h: &Harness, p: u64, payload: &[u8]) -> Vec<u8> {
+        std::fs::create_dir_all(&h.cons.cluster_snapshot_dir).unwrap();
+        std::fs::write(
+            h.cons
+                .cluster_snapshot_dir
+                .join(format!("snap-{p}.ultcluster")),
+            payload,
+        )
+        .unwrap();
+        payload.to_vec()
+    }
+
+    /// Catalog test helper: the positions of row `row`'s artifacts on disk.
+    fn list_row_artifacts(h: &Harness, row: u8) -> Vec<u64> {
+        let mut v: Vec<u64> = std::fs::read_dir(h.cons.snap_root.join(row.to_string()))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter_map(|e| {
+                e.file_name()
+                    .to_str()?
+                    .strip_prefix("snap-")?
+                    .strip_suffix(".ultsnap")?
+                    .parse()
+                    .ok()
+            })
+            .collect();
+        v.sort_unstable();
+        v
+    }
+
+    /// Catalog spec §5.1: a node that completes a set reports the cluster
+    /// artifact's hash as row 255 beside its rows, hashed with the SAME
+    /// function the service builder uses for a row (over the payload; the
+    /// cluster artifact has no envelope, so that is the whole file).
+    #[test]
+    fn the_completeness_report_includes_the_cluster_artifact_as_row_255() {
+        use uc_protocol::v2::upgrade::CLUSTER_ROW;
+        let mut h = harness_with_rows(&["a"]);
+        drive_to_serving_leader(&mut h);
+        let p = 6048u64;
+        write_row_artifact(&h, 0, p, b"row-zero");
+        let cluster_payload = write_cluster_artifact(&h, p, b"cluster");
+        h.row_published_at(0, p, uc_service::snapshots::artifact_hash_of(b"row-zero"));
+        h.cluster_snapshot_pos.store(p, Ordering::Release);
+        h.cons.check_set_completeness();
+        let mut rows: Vec<u8> = h.cons.pending_snapshot_reports.keys().copied().collect();
+        rows.sort_unstable();
+        assert_eq!(rows, vec![0, CLUSTER_ROW]);
+        assert_eq!(
+            h.cons.pending_snapshot_reports[&CLUSTER_ROW].hashes[&h.cons.id],
+            uc_service::snapshots::artifact_hash_of(&cluster_payload),
+            "row 255's hash is the SAME function over the cluster artifact's payload"
+        );
+    }
+
+    /// Catalog spec §4.4: the floor candidate is the newest AGREED set this
+    /// node HOLDS — `own` itself when it is agreed, else the newest agreed
+    /// listed set below it whose artifacts are on disk here, else nothing.
+    /// `Empty` (no agreed set) keeps today's behaviour.
+    #[test]
+    fn effective_floor_candidate_follows_what_this_node_holds() {
+        use uc_protocol::v2::upgrade::RowRunning;
+        let h = harness_with_rows(&["a"]);
+        let mut st = h.cons.cluster_view.to_state();
+        st.catalog = vec![agreed_entry(1000), agreed_entry(2000)];
+        st.running[0] = Some(RowRunning {
+            row: 0,
+            version: 1,
+            record_pos: 1,
+        });
+        h.cons.cluster_view.publish(&st);
+        h.cons.snapshot_set_position.store(1000, Ordering::Release);
+        assert_eq!(h.cons.effective_floor_candidate(), 1000);
+        h.cons.snapshot_set_position.store(2000, Ordering::Release);
+        assert_eq!(h.cons.effective_floor_candidate(), 2000);
+        // own = 1500 is unlisted; the newest agreed below it is 1000 — which
+        // counts only if this node holds it.
+        h.cons.snapshot_set_position.store(1500, Ordering::Release);
+        assert_eq!(
+            h.cons.effective_floor_candidate(),
+            0,
+            "1000 is agreed but its artifacts are not on disk here"
+        );
+        write_row_artifact(&h, 0, 1000, b"x");
+        assert_eq!(
+            h.cons.effective_floor_candidate(),
+            0,
+            "half a set (no cluster artifact) is not held"
+        );
+        write_cluster_artifact(&h, 1000, b"c");
+        assert_eq!(
+            h.cons.effective_floor_candidate(),
+            1000,
+            "1000 held on disk: the newest agreed set at or below 1500"
+        );
+        h.cons.snapshot_set_position.store(500, Ordering::Release);
+        assert_eq!(
+            h.cons.effective_floor_candidate(),
+            0,
+            "nothing agreed at or below what this node holds"
+        );
+        st.catalog.clear();
+        h.cons.cluster_view.publish(&st);
+        h.cons.snapshot_set_position.store(3000, Ordering::Release);
+        assert_eq!(
+            h.cons.effective_floor_candidate(),
+            3000,
+            "Empty: today's behaviour"
+        );
+    }
+
+    /// Catalog spec §4.4 step 3: the pruner deletes only what the catalog
+    /// does not list (and no pinned origin), below the floor.
+    #[test]
+    fn the_pruner_keeps_every_catalogued_position_and_every_pin() {
+        let h = harness_with_rows(&["a"]);
+        for p in [500u64, 1000, 2000, 3000] {
+            write_row_artifact(&h, 0, p, b"x");
+            write_cluster_artifact(&h, p, b"c");
+        }
+        let mut st = h.cons.cluster_view.to_state();
+        st.catalog = vec![agreed_entry(2000), agreed_entry(3000)];
+        st.pins.push(UpgradePin {
+            row: 0,
+            origin: 1000,
+            from: 1,
+            to: 2,
+        });
+        h.cons.cluster_view.publish(&st);
+        h.cons.prune_snapshots_below(3000);
+        assert_eq!(
+            list_row_artifacts(&h, 0),
+            vec![1000, 2000, 3000],
+            "500 deleted; 1000 is a pin; 2000/3000 are listed"
         );
     }
 

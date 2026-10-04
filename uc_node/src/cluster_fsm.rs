@@ -1259,14 +1259,24 @@ impl ClusterView {
     /// report list to answer it (final review, minor 7). Nothing about the
     /// answer needs the rest of the state, and the allocation it avoided
     /// grows with the pin history.
+    ///
+    /// The cluster row ([`CLUSTER_ROW`]) has no per-row report entry (its
+    /// report only fills a catalog entry's `cluster` field), so for it the
+    /// answer is the newest catalog position whose `cluster` verdict is
+    /// recorded — the same "already on the log" frontier a row's entry
+    /// gives, which keeps the leader's `position <= held` staleness guard
+    /// meaningful for row 255 rather than vacuous.
     pub fn report_position_for(&self, row: u8) -> Option<u64> {
-        self.inner
-            .lock()
-            .unwrap()
-            .reports
-            .iter()
-            .find(|r| r.row == row)
-            .map(|r| r.position)
+        let g = self.inner.lock().unwrap();
+        if row == CLUSTER_ROW {
+            return g
+                .catalog
+                .iter()
+                .rev()
+                .find(|e| e.cluster.verdict != RowVerdict::Unreported)
+                .map(|e| e.position);
+        }
+        g.reports.iter().find(|r| r.row == row).map(|r| r.position)
     }
 
     /// The view as a [`ClusterState`] — the inner clone plus the settings scalar
