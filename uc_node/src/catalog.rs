@@ -1,0 +1,373 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Peter Knego
+
+//! The catalog's query layer (catalog spec §4.3-§4.4): pure, total functions
+//! over the replicated set list (`ClusterViewInner::catalog`, oldest first)
+//! plus [`SoftTable`], a node's SOFT per-node table of advertised
+//! [`Holdings`]. The soft table is never replicated and never persisted —
+//! gossip-shaped, rebuilt purely from inbound `STATUS` datagrams as they
+//! arrive, so a restart starts it empty and a node that stops advertising
+//! simply ages out of [`SoftTable::live`].
+//!
+//! This module is pure: no I/O, no clock reads. `now_ns` and `stale_ns` /
+//! `timeout_ns` are always inputs, never sampled in here — the caller (the
+//! node, `uc2ctl`, a test) supplies them. Every function here is total: an
+//! unlisted position, an empty `sets` slice, or a row index past
+//! `CNC_MAX_SERVICES` all answer "nothing", never panic.
+//!
+//! Consumed by: Task 8 (a node's effective floor), Task 9 (the leader fills
+//! `SoftTable` from inbound `STATUS`), Task 10 (gauges), Task 12 (e2e tests)
+//! and later `uc2ctl`.
+
+use std::collections::BTreeMap;
+
+use uc_consensus::election::NodeId;
+use uc_protocol::identity::same_line;
+use uc_protocol::v2::catalog::{CLUSTER_ROW, RowVerdict, SetEntry, SetState};
+use uc_protocol::v2::datagram::Holdings;
+
+/// One node's last-advertised [`Holdings`] plus when it was recorded, for
+/// [`SoftTable::live`]'s staleness check.
+pub struct SoftEntry {
+    pub holdings: Holdings,
+    pub last_seen_ns: u64,
+}
+
+/// The soft per-node table (catalog spec §4.4): what every node last said it
+/// holds. Keyed by [`NodeId`] so a later `record` for the same node simply
+/// replaces its entry — there is no history, only the latest advertisement.
+#[derive(Default)]
+pub struct SoftTable {
+    pub by_node: BTreeMap<NodeId, SoftEntry>,
+}
+
+impl SoftTable {
+    /// Record (or replace) `node`'s advertised holdings as of `now_ns`.
+    pub fn record(&mut self, node: NodeId, h: Holdings, now_ns: u64) {
+        self.by_node.insert(
+            node,
+            SoftEntry {
+                holdings: h,
+                last_seen_ns: now_ns,
+            },
+        );
+    }
+
+    /// Entries not yet stale: `now_ns - last_seen_ns <= stale_ns`
+    /// (saturating, so a `now_ns` before `last_seen_ns` never underflows).
+    pub fn live(&self, now_ns: u64, stale_ns: u64) -> impl Iterator<Item = (NodeId, &Holdings)> {
+        self.by_node.iter().filter_map(move |(&id, e)| {
+            if now_ns.saturating_sub(e.last_seen_ns) <= stale_ns {
+                Some((id, &e.holdings))
+            } else {
+                None
+            }
+        })
+    }
+}
+
+/// `row`'s packed version within `e` — `None` for a row index at or past
+/// `CNC_MAX_SERVICES` (never a panic; the caller treats "no such row" as "no
+/// match"). `CLUSTER_ROW` (255) reads the cluster artifact's entry.
+fn row_version(e: &SetEntry, row: u8) -> Option<u32> {
+    if row == CLUSTER_ROW {
+        Some(e.cluster.version)
+    } else {
+        e.rows.get(row as usize).map(|r| r.version)
+    }
+}
+
+/// A read-only view over the catalog's set list plus the soft table, with
+/// the inputs a pure query needs (spec §4.3's query set). Built fresh by the
+/// caller for each query — it borrows, never owns, `sets` and `soft`.
+pub struct CatalogQuery<'a> {
+    pub sets: &'a [SetEntry],
+    pub catalog_position: u64,
+    pub soft: &'a SoftTable,
+    pub now_ns: u64,
+    pub stale_ns: u64,
+}
+
+impl CatalogQuery<'_> {
+    /// `sets`'s index for `p`, or `None` if `p` is not a listed position —
+    /// total over an empty `sets` slice.
+    fn index_of(&self, p: u64) -> Option<usize> {
+        self.sets.iter().position(|e| e.position == p)
+    }
+
+    /// The newest `is_agreed()` entry at or below `at_most`, or `None` if
+    /// there is none (an empty catalog, or every entry above `at_most`).
+    pub fn newest_agreed(&self, at_most: u64) -> Option<u64> {
+        self.sets
+            .iter()
+            .filter(|e| e.is_agreed() && e.position <= at_most)
+            .map(|e| e.position)
+            .max()
+    }
+
+    /// Agreed entries whose `row`'s version is the SAME LINE as `version`
+    /// (major.minor match, patch free — `same_line`); `row == CLUSTER_ROW`
+    /// reads the cluster artifact's entry instead of a declared row.
+    pub fn agreed_for(&self, row: u8, version: u32) -> Vec<u64> {
+        self.sets
+            .iter()
+            .filter(|e| e.is_agreed())
+            .filter_map(|e| {
+                let v = row_version(e, row)?;
+                same_line(v, version).then_some(e.position)
+            })
+            .collect()
+    }
+
+    /// Nodes that count as holding the set at `p`: live in the soft table,
+    /// advertising the same `catalog_position` this query is against, with
+    /// bit `i` of `sets_held` set, `i` = `p`'s index in `sets`. `p` not
+    /// listed, or an index at or past bit 63, answers empty — never a shift
+    /// panic.
+    pub fn holders(&self, p: u64) -> Vec<NodeId> {
+        let Some(i) = self.index_of(p) else {
+            return Vec::new();
+        };
+        if i >= 64 {
+            return Vec::new();
+        }
+        let bit = 1u64 << i;
+        self.soft
+            .live(self.now_ns, self.stale_ns)
+            .filter(|(_, h)| h.catalog_position == self.catalog_position && h.sets_held & bit != 0)
+            .map(|(id, _)| id)
+            .collect()
+    }
+
+    /// Live nodes whose advertised journal span covers `[p, q]`:
+    /// `journal_first <= p && durable >= q`.
+    pub fn journal_covers(&self, p: u64, q: u64) -> Vec<NodeId> {
+        self.soft
+            .live(self.now_ns, self.stale_ns)
+            .filter(|(_, h)| h.journal_first <= p && h.durable >= q)
+            .map(|(id, _)| id)
+            .collect()
+    }
+
+    /// Positions of `Commanded` entries whose instant is older than
+    /// `timeout_ns` (saturating, so a timeout past `u64::MAX - time_ns`
+    /// never wraps into "not stalled").
+    pub fn stalled(&self, timeout_ns: u64) -> Vec<u64> {
+        self.sets
+            .iter()
+            .filter(|e| {
+                e.state == SetState::Commanded && e.time_ns.saturating_add(timeout_ns) < self.now_ns
+            })
+            .map(|e| e.position)
+            .collect()
+    }
+
+    /// Every `(position, row)` whose verdict is `Diverged` or `NoMajority`,
+    /// rows `0..CNC_MAX_SERVICES` then the cluster row as `CLUSTER_ROW`
+    /// (255), in position order (the catalog's own order — oldest first).
+    pub fn diverged(&self) -> Vec<(u64, u8)> {
+        let mut out = Vec::new();
+        for e in self.sets {
+            for (row, r) in e.rows.iter().enumerate() {
+                if matches!(r.verdict, RowVerdict::Diverged | RowVerdict::NoMajority) {
+                    out.push((e.position, row as u8));
+                }
+            }
+            if matches!(
+                e.cluster.verdict,
+                RowVerdict::Diverged | RowVerdict::NoMajority
+            ) {
+                out.push((e.position, CLUSTER_ROW));
+            }
+        }
+        out
+    }
+
+    /// Spans `(a, b]` between consecutive agreed entries that nobody can
+    /// rebuild: no live node holds `b`'s set complete, and no live node's
+    /// journal spans `[a, b]`.
+    pub fn coverage_gaps(&self) -> Vec<(u64, u64)> {
+        let agreed: Vec<u64> = self
+            .sets
+            .iter()
+            .filter(|e| e.is_agreed())
+            .map(|e| e.position)
+            .collect();
+        agreed
+            .windows(2)
+            .filter_map(|w| {
+                let (a, b) = (w[0], w[1]);
+                if self.holders(b).is_empty() && self.journal_covers(a, b).is_empty() {
+                    Some((a, b))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// §4.4: the newest agreed set among those `node` advertises holding
+    /// (per [`holders`](Self::holders)) — `None` when `node` holds nothing
+    /// agreed (an empty catalog, or a voter on a learner-only cluster), in
+    /// which case the caller falls back.
+    pub fn effective_floor(&self, node: NodeId) -> Option<u64> {
+        self.sets
+            .iter()
+            .filter(|e| e.is_agreed())
+            .filter(|e| self.holders(e.position).contains(&node))
+            .map(|e| e.position)
+            .max()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use uc_protocol::identity::pack_version;
+    use uc_protocol::v2::catalog::*;
+
+    const OK: RowEntry = RowEntry {
+        version: 0x0102_0000,
+        hash: 1,
+        verdict: RowVerdict::Agreed,
+    };
+    fn agreed(p: u64) -> SetEntry {
+        let mut e = SetEntry::commanded(p, SetKind::Full, p);
+        e.rows[0] = OK;
+        e.cluster = OK;
+        e.state = SetState::Complete;
+        e
+    }
+    fn diverged(p: u64) -> SetEntry {
+        let mut e = agreed(p);
+        e.rows[0].verdict = RowVerdict::Diverged;
+        e
+    }
+    fn holding(catalog_position: u64, sets_held: u64, first: u64, durable: u64) -> Holdings {
+        Holdings {
+            catalog_position,
+            sets_held,
+            journal_first: first,
+            durable,
+            commit: durable,
+            ..Default::default()
+        }
+    }
+    fn q<'a>(sets: &'a [SetEntry], soft: &'a SoftTable) -> CatalogQuery<'a> {
+        CatalogQuery {
+            sets,
+            catalog_position: 42,
+            soft,
+            now_ns: 10_000,
+            stale_ns: 900,
+        }
+    }
+
+    #[test]
+    fn newest_agreed_skips_diverged_and_commanded_sets() {
+        let sets = [
+            agreed(1000),
+            diverged(2000),
+            SetEntry::commanded(2500, SetKind::Full, 0),
+            agreed(3000),
+        ];
+        let soft = SoftTable::default();
+        let c = q(&sets, &soft);
+        assert_eq!(c.newest_agreed(u64::MAX), Some(3000));
+        assert_eq!(
+            c.newest_agreed(2999),
+            Some(1000),
+            "2000 diverged, 2500 commanded"
+        );
+        assert_eq!(c.newest_agreed(999), None);
+    }
+
+    #[test]
+    fn holders_requires_live_and_matching_catalog_position() {
+        let sets = [agreed(1000), agreed(2000)];
+        let mut soft = SoftTable::default();
+        soft.record(1, holding(42, 0b10, 0, 5000), 9_500); // live, holds 2000
+        soft.record(2, holding(42, 0b10, 0, 5000), 9_000); // stale: 10_000 - 9_000 > 900
+        soft.record(3, holding(41, 0b10, 0, 5000), 9_900); // wrong catalog position
+        soft.record(4, holding(42, 0b01, 0, 5000), 9_900); // holds 1000 only
+        let c = q(&sets, &soft);
+        assert_eq!(c.holders(2000), vec![1]);
+        assert_eq!(c.holders(1000), vec![4]);
+        assert_eq!(c.holders(3000), Vec::<NodeId>::new(), "not a listed set");
+    }
+
+    #[test]
+    fn journal_covers_is_first_le_p_and_durable_ge_q() {
+        let sets = [agreed(1000)];
+        let mut soft = SoftTable::default();
+        soft.record(1, holding(42, 0, 1000, 2000), 9_900);
+        soft.record(2, holding(42, 0, 1001, 2000), 9_900);
+        soft.record(3, holding(42, 0, 1000, 1999), 9_900);
+        let c = q(&sets, &soft);
+        assert_eq!(c.journal_covers(1000, 2000), vec![1]);
+    }
+
+    #[test]
+    fn stalled_names_commanded_sets_past_the_timeout() {
+        let sets = [
+            SetEntry::commanded(100, SetKind::Full, 1_000),
+            SetEntry::commanded(200, SetKind::Full, 9_800),
+            agreed(300),
+        ];
+        let soft = SoftTable::default();
+        let c = q(&sets, &soft); // now_ns = 10_000
+        assert_eq!(
+            c.stalled(500),
+            vec![100],
+            "200 is only 200 ns old; 300 is complete"
+        );
+    }
+
+    #[test]
+    fn diverged_lists_every_non_agreed_row_including_the_cluster() {
+        let mut e = agreed(1000);
+        e.cluster.verdict = RowVerdict::NoMajority;
+        let sets = [e, diverged(2000), agreed(3000)];
+        let soft = SoftTable::default();
+        assert_eq!(
+            q(&sets, &soft).diverged(),
+            vec![(1000, CLUSTER_ROW), (2000, 0)]
+        );
+    }
+
+    #[test]
+    fn coverage_gaps_are_spans_nobody_can_rebuild() {
+        let sets = [agreed(1000), agreed(2000), agreed(3000)];
+        let mut soft = SoftTable::default();
+        soft.record(1, holding(42, 0b100, 2500, 3500), 9_900); // holds 3000; journal [2500, 3500]
+        let c = q(&sets, &soft);
+        // (1000, 2000]: nobody holds 2000 and no journal covers it → gap
+        // (2000, 3000]: node 1 holds 3000 → covered
+        assert_eq!(c.coverage_gaps(), vec![(1000, 2000)]);
+    }
+
+    #[test]
+    fn effective_floor_is_what_this_node_holds() {
+        let sets = [agreed(1000), agreed(2000)];
+        let mut soft = SoftTable::default();
+        soft.record(1, holding(42, 0b01, 0, 9000), 9_900);
+        soft.record(2, holding(42, 0b00, 0, 9000), 9_900);
+        let c = q(&sets, &soft);
+        assert_eq!(c.newest_agreed(u64::MAX), Some(2000), "the cluster floor");
+        assert_eq!(c.effective_floor(1), Some(1000), "node 1 holds only 1000");
+        assert_eq!(
+            c.effective_floor(2),
+            None,
+            "a voter on a learner-only cluster"
+        );
+    }
+
+    #[test]
+    fn agreed_for_matches_the_line_not_the_patch() {
+        let sets = [agreed(1000), agreed(2000)];
+        let soft = SoftTable::default();
+        let c = q(&sets, &soft);
+        assert_eq!(c.agreed_for(0, pack_version(1, 2, 7)), vec![1000, 2000]);
+        assert_eq!(c.agreed_for(0, pack_version(1, 3, 0)), Vec::<u64>::new());
+    }
+}

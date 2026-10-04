@@ -36,6 +36,11 @@
 
 pub mod audit;
 pub mod backup;
+/// The snapshot catalog's query layer (catalog spec §4.3-§4.4): the soft
+/// per-node holdings table and the pure query functions over the replicated
+/// set list. `pub` so a caller outside the crate can name [`catalog::CatalogQuery`]
+/// without going through a re-export.
+pub mod catalog;
 /// The `uc2-cluster` agent (spec §4.1/§4.7). `pub` for
 /// [`cluster_agent::read_committed_table`] alone: `uc2ctl schedule show` and
 /// `uc2ctl status` read the newest cluster artifact under `snapshots/cluster/`
@@ -61,6 +66,10 @@ pub mod recovery;
 pub mod services;
 pub(crate) mod timers;
 
+/// Catalog spec §4.4: the soft per-node holdings table, re-exported so the
+/// node/service code that fills and queries it doesn't need
+/// `uc_node::catalog::SoftTable`.
+pub use catalog::SoftTable;
 /// The staged-file digest under its plan-2 name. `uc2ctl` computes it over
 /// the file it stages for `schedule apply`; the same function now also serves
 /// `settings apply`, hence the neutral canonical name [`staged_digest`].
@@ -100,6 +109,10 @@ pub use uc_crypto::CryptoConfig;
 /// exactly the pre-M12b posture: the instance directory's permissions are the
 /// admin boundary and the cnc auth line is ignored.
 pub use uc_crypto::admin::{AdminKey, AdminPolicy};
+/// What a node advertises holding on `STATUS` since wire 0.11.0 (catalog
+/// spec §5), re-exported so a caller building a [`SoftTable`] doesn't need
+/// to name `uc_protocol` directly.
+pub use uc_protocol::v2::datagram::Holdings;
 /// The cluster FSM (spec §3.3, §6): the replicated settings record, re-exported
 /// so a deployment that only depends on `uc_node` can build a [`NodeConfig`]'s
 /// `settings_genesis` without naming `uc_protocol` directly.
