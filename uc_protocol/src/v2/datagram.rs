@@ -872,32 +872,107 @@ pub fn read_nak_body(buf: &[u8]) -> Option<NakBody> {
 /// Status: flow-control advert (spec §5) — contiguous-rebuilt position +
 /// receive window (bytes the receiver can still accept beyond it: its own
 /// archive gate, `durable + capacity − contiguous`; capacity ≤ 2^31 so it
-/// fits u32).
-pub const STATUS_BODY_LEN: usize = 16;
+/// fits u32) — plus, since wire 0.11.0 (the snapshot catalog), `Holdings`:
+/// what this node holds, so the leader (and, eventually, the catalog) can
+/// reason about the fleet's snapshot-set coverage without a side channel.
+///
+/// The 0.10.0 body was 16 B with a zero reserved word at offset 12; that word
+/// is now the layout discriminator [`STATUS_LAYOUT_V2`], so a 0.10.0 peer's
+/// body (reserved = 0) and a short buffer both read as `None` — see
+/// [`read_status_body`].
+pub const STATUS_BODY_LEN_V1: usize = 16;
+/// The wire-0.11.0 body length: the fixed prefix (contiguous + window +
+/// layout, 16 B) plus [`Holdings`]'s 128 B.
+pub const STATUS_BODY_LEN: usize = 144;
+/// The layout discriminator written at the old reserved word, offset 12.
+pub const STATUS_LAYOUT_V2: u32 = 2;
+
+/// What a node holds, advertised on every `STATUS` since wire 0.11.0 (spec
+/// §5, the snapshot catalog). `applied` is indexed by service/row id
+/// (`uc_protocol::v2::cnc::CNC_MAX_SERVICES` slots); `sets_held` is a bitmask
+/// over the catalog as published at `catalog_position`, bit `i` set iff this
+/// node holds that set's artifacts complete on disk, oldest set first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Holdings {
+    pub journal_first: u64,
+    pub durable: u64,
+    pub commit: u64,
+    pub applied: [u64; crate::v2::cnc::CNC_MAX_SERVICES],
+    pub free_bytes: u64,
+    pub journal_bytes: u64,
+    pub snapshots_bytes: u64,
+    /// The published catalog position `sets_held` was computed against.
+    pub catalog_position: u64,
+    /// Bit i ⇔ this node holds the catalog's i-th listed set (oldest first)
+    /// complete on disk.
+    pub sets_held: u64,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StatusBody {
     pub contiguous_position: u64,
     pub receive_window: u32,
+    pub holdings: Holdings,
 }
 
+/// Encode a status body. `buf` must be at least [`STATUS_BODY_LEN`] (144 B).
+///
+/// Layout (LE): `contiguous_position` 0..8, `receive_window` 8..12,
+/// [`STATUS_LAYOUT_V2`] 12..16, `holdings.journal_first` 16..24, `durable`
+/// 24..32, `commit` 32..40, `applied[8]` 40..104, `free_bytes` 104..112,
+/// `journal_bytes` 112..120, `snapshots_bytes` 120..128, `catalog_position`
+/// 128..136, `sets_held` 136..144.
 pub fn write_status_body(buf: &mut [u8], b: &StatusBody) {
     buf[0..8].copy_from_slice(&b.contiguous_position.to_le_bytes());
     buf[8..12].copy_from_slice(&b.receive_window.to_le_bytes());
-    buf[12..16].copy_from_slice(&0u32.to_le_bytes());
+    buf[12..16].copy_from_slice(&STATUS_LAYOUT_V2.to_le_bytes());
+    buf[16..24].copy_from_slice(&b.holdings.journal_first.to_le_bytes());
+    buf[24..32].copy_from_slice(&b.holdings.durable.to_le_bytes());
+    buf[32..40].copy_from_slice(&b.holdings.commit.to_le_bytes());
+    for (i, applied) in b.holdings.applied.iter().enumerate() {
+        let off = 40 + i * 8;
+        buf[off..off + 8].copy_from_slice(&applied.to_le_bytes());
+    }
+    buf[104..112].copy_from_slice(&b.holdings.free_bytes.to_le_bytes());
+    buf[112..120].copy_from_slice(&b.holdings.journal_bytes.to_le_bytes());
+    buf[120..128].copy_from_slice(&b.holdings.snapshots_bytes.to_le_bytes());
+    buf[128..136].copy_from_slice(&b.holdings.catalog_position.to_le_bytes());
+    buf[136..144].copy_from_slice(&b.holdings.sets_held.to_le_bytes());
 }
 
-/// Decode a status body, or `None` if the buffer is shorter than
-/// [`STATUS_BODY_LEN`]. The receiver still guards the length before calling
-/// (belt and braces); the reader is total so that no datagram, however
-/// truncated, can panic a node.
+/// Decode a status body, or `None` unless `buf.len() >= `[`STATUS_BODY_LEN`]
+/// **and** the layout word at offset 12 is [`STATUS_LAYOUT_V2`] — which is
+/// how a 0.10.0 peer's 16-byte body (reserved word zero) is refused rather
+/// than silently misparsed. The receiver still guards the length before
+/// calling (belt and braces); the reader is total so that no datagram,
+/// however truncated, can panic a node.
 pub fn read_status_body(buf: &[u8]) -> Option<StatusBody> {
     if buf.len() < STATUS_BODY_LEN {
         return None;
     }
+    let layout = u32::from_le_bytes(buf[12..16].try_into().unwrap());
+    if layout != STATUS_LAYOUT_V2 {
+        return None;
+    }
+    let mut applied = [0u64; crate::v2::cnc::CNC_MAX_SERVICES];
+    for (i, slot) in applied.iter_mut().enumerate() {
+        let off = 40 + i * 8;
+        *slot = u64::from_le_bytes(buf[off..off + 8].try_into().unwrap());
+    }
     Some(StatusBody {
         contiguous_position: u64::from_le_bytes(buf[0..8].try_into().unwrap()),
         receive_window: u32::from_le_bytes(buf[8..12].try_into().unwrap()),
+        holdings: Holdings {
+            journal_first: u64::from_le_bytes(buf[16..24].try_into().unwrap()),
+            durable: u64::from_le_bytes(buf[24..32].try_into().unwrap()),
+            commit: u64::from_le_bytes(buf[32..40].try_into().unwrap()),
+            applied,
+            free_bytes: u64::from_le_bytes(buf[104..112].try_into().unwrap()),
+            journal_bytes: u64::from_le_bytes(buf[112..120].try_into().unwrap()),
+            snapshots_bytes: u64::from_le_bytes(buf[120..128].try_into().unwrap()),
+            catalog_position: u64::from_le_bytes(buf[128..136].try_into().unwrap()),
+            sets_held: u64::from_le_bytes(buf[136..144].try_into().unwrap()),
+        },
     })
 }
 
@@ -1026,14 +1101,73 @@ mod tests {
         let s = StatusBody {
             contiguous_position: 1 << 33,
             receive_window: 1 << 28,
+            holdings: Holdings::default(),
         };
         let mut buf = [0u8; STATUS_BODY_LEN];
         write_status_body(&mut buf, &s);
         assert_eq!(read_status_body(&buf).unwrap(), s);
-        // Absolute wire pin: contiguous_position=1<<33=0x2_0000_0000 -> LE
-        // [0,0,0,0,2,0,0,0]; receive_window=1<<28=0x1000_0000 -> LE
-        // [0,0,0,16]; reserved=[0,0,0,0].
-        assert_eq!(buf, [0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 16, 0, 0, 0, 0]);
+        // Absolute wire pin of the fixed prefix: contiguous_position=1<<33=
+        // 0x2_0000_0000 -> LE [0,0,0,0,2,0,0,0]; receive_window=1<<28=
+        // 0x1000_0000 -> LE [0,0,0,16]; layout word @12 = STATUS_LAYOUT_V2=2
+        // -> LE [2,0,0,0]. `Holdings::default()` fills the rest with zero.
+        assert_eq!(
+            &buf[0..16],
+            [0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 16, 2, 0, 0, 0]
+        );
+        assert!(buf[16..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn status_body_v2_round_trips_and_pins_its_layout() {
+        let mut h = Holdings {
+            journal_first: 10,
+            durable: 20,
+            commit: 15,
+            free_bytes: 1,
+            journal_bytes: 2,
+            snapshots_bytes: 3,
+            catalog_position: 99,
+            sets_held: 0b101,
+            ..Default::default()
+        };
+        h.applied[3] = 13;
+        let b = StatusBody {
+            contiguous_position: 20,
+            receive_window: 7,
+            holdings: h,
+        };
+        let mut buf = [0u8; STATUS_BODY_LEN];
+        write_status_body(&mut buf, &b);
+        assert_eq!(&buf[12..16], &2u32.to_le_bytes(), "layout word @12");
+        assert_eq!(
+            &buf[40 + 3 * 8..40 + 4 * 8],
+            &13u64.to_le_bytes(),
+            "applied[3]"
+        );
+        assert_eq!(&buf[136..144], &0b101u64.to_le_bytes(), "sets_held last");
+        assert_eq!(read_status_body(&buf), Some(b));
+    }
+
+    #[test]
+    fn a_v1_status_body_is_refused() {
+        // a 0.10.0 peer: 16 bytes, reserved word zero
+        let mut v1 = [0u8; 16];
+        v1[0..8].copy_from_slice(&20u64.to_le_bytes());
+        assert_eq!(read_status_body(&v1), None);
+        // a 144-byte body whose layout word is 0 is refused too
+        let zero = [0u8; STATUS_BODY_LEN];
+        assert_eq!(read_status_body(&zero), None);
+        // and a short v2
+        let mut ok = [0u8; STATUS_BODY_LEN];
+        write_status_body(
+            &mut ok,
+            &StatusBody {
+                contiguous_position: 1,
+                receive_window: 1,
+                holdings: Holdings::default(),
+            },
+        );
+        assert_eq!(read_status_body(&ok[..143]), None);
     }
 
     #[test]

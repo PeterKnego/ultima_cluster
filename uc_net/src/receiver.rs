@@ -38,7 +38,7 @@ use uc_protocol::v2::datagram::{
     DGRAM_KIND_READ_PROBE_ACK, DGRAM_KIND_REQUEST_VOTE, DGRAM_KIND_SNAP_BEGIN,
     DGRAM_KIND_SNAP_CHUNK, DGRAM_KIND_SNAP_DONE, DGRAM_KIND_SNAP_NAK, DGRAM_KIND_SNAP_REDIRECT,
     DGRAM_KIND_SNAP_REPORT, DGRAM_KIND_SNAP_REQUEST, DGRAM_KIND_STATUS, DGRAM_KIND_TERM_MAP,
-    DGRAM_KIND_VOTE, DatagramHeader, MAX_TERM_MAP_WIRE_ENTRIES, NAK_BODY_LEN, NakBody,
+    DGRAM_KIND_VOTE, DatagramHeader, Holdings, MAX_TERM_MAP_WIRE_ENTRIES, NAK_BODY_LEN, NakBody,
     PROBE_ACK_BODY_LEN, ProbeAckBody, REQUEST_VOTE_BODY_LEN, RequestVoteBody, SNAP_BEGIN_FIXED_LEN,
     SNAP_BEGIN_LAYOUT_V4, SNAP_NAK_BODY_LEN, SNAP_REQUEST_BODY_LEN, STATUS_BODY_LEN, SnapBeginBody,
     SnapNakBody, SnapRequestBody, StatusBody, TermMapEntryWire, VOTE_BODY_LEN, VoteBody,
@@ -2204,6 +2204,7 @@ impl FollowerReceiver {
                     && let Some(route) = &self.sender_route
                     && let Some(b) = read_status_body(body)
                 {
+                    // Task 9 wires the real holdings
                     let _ = route.try_send(CtrlMsg::Status {
                         from,
                         contiguous: b.contiguous_position,
@@ -3385,6 +3386,8 @@ impl FollowerReceiver {
                 &StatusBody {
                     contiguous_position: contiguous,
                     receive_window: window,
+                    // Task 9 wires the real holdings
+                    holdings: Holdings::default(),
                 },
             );
             // M8 (T17): sealed or dropped; cursors advance only on a real
@@ -4868,6 +4871,7 @@ mod tests {
             &StatusBody {
                 contiguous_position: 4096,
                 receive_window: 1 << 20,
+                holdings: Holdings::default(),
             },
         );
         peer.send(to, DGRAM_KIND_STATUS, 0, TERM, &sb);

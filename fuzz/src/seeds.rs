@@ -80,7 +80,10 @@ pub fn uc_protocol_datagram() -> Vec<Seed> {
     seeds.push(Seed::fixed("04-nak", datagram(DGRAM_KIND_NAK, 0, 3, &b)));
 
     let mut b = [0u8; STATUS_BODY_LEN];
-    write_status_body(&mut b, &StatusBody { contiguous_position: 2048, receive_window: 65536 });
+    write_status_body(
+        &mut b,
+        &StatusBody { contiguous_position: 2048, receive_window: 65536, holdings: Holdings::default() },
+    );
     seeds.push(Seed::fixed("05-status", datagram(DGRAM_KIND_STATUS, 0, 3, &b)));
 
     let mut b = [0u8; REQUEST_VOTE_BODY_LEN];
