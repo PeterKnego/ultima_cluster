@@ -8,7 +8,7 @@
 
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU32};
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use uc_journal::Journal;
@@ -18,10 +18,12 @@ use uc_log::buffer::{AppendError, Appender, LogBuffer};
 use uc_log::cnc::{CncMeta, CncPage};
 use uc_log::counters::PaddedAtomicU64;
 use uc_log::region::Region;
+use uc_net::SoftTableWire;
 use uc_net::fault::{FaultConfig, FaultSocket};
 use uc_net::rebuild::NakConfig;
 use uc_net::receiver::{FollowerConfig, FollowerReceiver, NetEvent};
 use uc_net::sender::{Sender, SenderConfig};
+use uc_protocol::v2::datagram::Holdings;
 
 /// A channel end for the consensus route that nothing drains (this harness has
 /// no `ElectionSm` — the wire-level tests here don't exercise commit ranking,
@@ -113,15 +115,28 @@ pub fn spawn_follower(name: &str, leader: SocketAddr, faults: FaultConfig) -> Fo
 /// `spawn_follower` is the two-line wrapper that binds a fresh socket.
 pub fn spawn_follower_on(
     name: &str,
+    sock: FaultSocket,
+    leader: SocketAddr,
+    faults: FaultConfig,
+) -> Follower {
+    spawn_follower_with_holdings(name, sock, leader, faults, None)
+}
+
+/// [`spawn_follower_on`] with the catalog's soft advertisement wired: the
+/// follower's `STATUS` carries whatever `holdings` holds at send time.
+pub fn spawn_follower_with_holdings(
+    name: &str,
     mut sock: FaultSocket,
     leader: SocketAddr,
     faults: FaultConfig,
+    holdings: Option<Arc<Mutex<Holdings>>>,
 ) -> Follower {
     let addr = sock.local_addr().unwrap();
     sock.set_faults(faults);
     let buffer = buffer();
     let dir = tempfile::tempdir().unwrap();
     let mut cfg = FollowerConfig::new(leader);
+    cfg.holdings = holdings;
     cfg.seed = faults.seed.wrapping_add(addr.port() as u64);
     cfg.status_floor_ns = 5_000_000; // 5 ms: keep flow adverts fresh under test loads
     cfg.nak = NakConfig {
@@ -164,6 +179,17 @@ pub struct Leader {
 /// harmless, since none of these wire-level tests assert on commit ranking
 /// (that property now lives entirely in `uc_consensus`/`uc_node`).
 pub fn spawn_leader(raw: UdpSocket, followers: Vec<SocketAddr>, faults: FaultConfig) -> Leader {
+    spawn_leader_with_soft(raw, followers, faults, None)
+}
+
+/// [`spawn_leader`] with the sender's soft table wired: every inbound
+/// `STATUS` lands its `Holdings` in `soft` under the follower's address.
+pub fn spawn_leader_with_soft(
+    raw: UdpSocket,
+    followers: Vec<SocketAddr>,
+    faults: FaultConfig,
+    soft: Option<Arc<Mutex<SoftTableWire>>>,
+) -> Leader {
     let buffer = buffer();
     let dir = tempfile::tempdir().unwrap();
     let self_addr = raw.local_addr().unwrap();
@@ -190,6 +216,9 @@ pub fn spawn_leader(raw: UdpSocket, followers: Vec<SocketAddr>, faults: FaultCon
         role,
     );
     sender.set_replay_source(journal);
+    if let Some(soft) = soft {
+        sender.set_soft_table(soft);
+    }
     let stats = sender.stats();
     let txa =
         AgentRunner::spawn("leader-tx", IdleStrategy::Yield, move || sender.do_work()).unwrap();

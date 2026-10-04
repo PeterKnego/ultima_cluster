@@ -406,7 +406,7 @@ pub(crate) fn walk_advance(body: &[u8]) -> Option<u64> {
     Some(adv)
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct FollowerConfig {
     pub leader: SocketAddr,
     pub seed: u64,
@@ -420,6 +420,11 @@ pub struct FollowerConfig {
     /// AppendPosition is sent on durable advance; the floor bounds the gap
     /// between reports when durable is quiescent (spec §6).
     pub append_pos_floor_ns: u64,
+    /// Catalog spec §5.2 (D6): the node's cached soft advertisement. Each
+    /// `STATUS` copies it (one lock, one `Copy` of 128 B) into the v2 body;
+    /// the node's writers keep it current off the consensus pass. `None`
+    /// sends `Holdings::default()` — harnesses that do not advertise.
+    pub holdings: Option<Arc<Mutex<Holdings>>>,
 }
 
 impl FollowerConfig {
@@ -434,6 +439,7 @@ impl FollowerConfig {
             status_floor_ns: 100_000_000,
             status_bytes: 0,
             append_pos_floor_ns: 100_000_000,
+            holdings: None,
         }
     }
 }
@@ -1291,6 +1297,7 @@ impl FollowerReceiver {
             None => (None, None, None, None),
         };
         let start = buffer.counters().append.load_acquire();
+        let (snap_nak, snap_seed) = (cfg.nak, cfg.seed);
         let status_bytes = if cfg.status_bytes == 0 {
             buffer.capacity() / 4
         } else {
@@ -1336,8 +1343,8 @@ impl FollowerReceiver {
             armed_fetch: None,
             last_expired_fetch: None,
             fetch_session_seq: 0,
-            snap_nak_cfg: cfg.nak,
-            snap_seed: cfg.seed,
+            snap_nak_cfg: snap_nak,
+            snap_seed,
             snap_adopt_pending: None,
             prime_gen: None,
             #[cfg(test)]
@@ -2204,11 +2211,11 @@ impl FollowerReceiver {
                     && let Some(route) = &self.sender_route
                     && let Some(b) = read_status_body(body)
                 {
-                    // Task 9 wires the real holdings
                     let _ = route.try_send(CtrlMsg::Status {
                         from,
                         contiguous: b.contiguous_position,
                         window: b.receive_window,
+                        holdings: b.holdings,
                     });
                 }
             }
@@ -3370,6 +3377,13 @@ impl FollowerReceiver {
             // saturate anyway so a future guard regression degrades to a
             // window=0 backpressure signal rather than a bogus ~4 GiB window.
             let window = (durable + self.buffer.capacity()).saturating_sub(contiguous) as u32;
+            // Catalog spec §5.2: the lock is held for a copy, nothing else.
+            let holdings = self
+                .cfg
+                .holdings
+                .as_ref()
+                .map(|h| *h.lock().unwrap_or_else(|e| e.into_inner()))
+                .unwrap_or_default();
             let mut d = vec![0u8; DATAGRAM_HEADER_LEN + STATUS_BODY_LEN];
             write_datagram_header(
                 &mut d,
@@ -3386,8 +3400,7 @@ impl FollowerReceiver {
                 &StatusBody {
                     contiguous_position: contiguous,
                     receive_window: window,
-                    // Task 9 wires the real holdings
-                    holdings: Holdings::default(),
+                    holdings,
                 },
             );
             // M8 (T17): sealed or dropped; cursors advance only on a real

@@ -39,3 +39,5 @@ pub mod rebuild;
 pub mod receiver;
 pub mod sender;
 pub mod sockopt;
+
+pub use sender::SoftTableWire;

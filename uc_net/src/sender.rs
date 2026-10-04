@@ -14,9 +14,9 @@ use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Seek, SeekFrom};
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use uc_crypto::{NodeId, Scope, SendHalf, Transport};
@@ -30,7 +30,7 @@ use uc_protocol::v2::datagram::read_snap_begin_body;
 use uc_protocol::v2::datagram::{
     DATAGRAM_HEADER_LEN, DGRAM_KIND_DATA, DGRAM_KIND_HEARTBEAT, DGRAM_KIND_PROBE,
     DGRAM_KIND_SNAP_BEGIN, DGRAM_KIND_SNAP_CHUNK, DGRAM_KIND_SNAP_REDIRECT, DatagramHeader,
-    MTU_BOUND, MTU_DEFAULT, PROBE_RUNG_LEN, SNAP_BEGIN_FIXED_LEN, SNAP_BEGIN_LAYOUT_V4,
+    Holdings, MTU_BOUND, MTU_DEFAULT, PROBE_RUNG_LEN, SNAP_BEGIN_FIXED_LEN, SNAP_BEGIN_LAYOUT_V4,
     SNAP_REDIRECT_BODY_LEN, SnapBeginBody, SnapRedirectBody, SnapRequestBody,
     write_datagram_header, write_probe_rung, write_snap_begin_body, write_snap_redirect_body,
 };
@@ -98,6 +98,10 @@ pub enum CtrlMsg {
         from: SocketAddr,
         contiguous: u64,
         window: u32,
+        /// Catalog spec §5.1: the follower's soft advertisement, decoded
+        /// from the v2 body. Landed in [`SoftTableWire`] when one is wired;
+        /// flow control never reads it.
+        holdings: Holdings,
     },
     /// M6 Task 6: the snapshot-session peer requests a missing file range.
     SnapNak {
@@ -603,6 +607,26 @@ pub struct Sender {
     /// wires one, where `cfg.mtu` stands in — the pre-jumbo behaviour,
     /// byte-for-byte.
     live_mtu: Option<Arc<AtomicUsize>>,
+    /// Catalog spec §5.3: the leader's soft table, by follower ADDRESS (this
+    /// crate knows no node ids — the node maps them through membership).
+    /// `None` = nothing recorded (harness senders).
+    soft: Option<Arc<Mutex<SoftTableWire>>>,
+}
+
+/// Catalog spec §5.3: the sender's half of the leader's soft table — each
+/// follower's newest advertised [`Holdings`] and the UNIX-epoch nanoseconds
+/// at which this sender drained it (wall time, so a reader compares it with
+/// its own wall clock — the sender's `base` is process-private). Never
+/// persisted, never replicated, rebuilt within one status cadence of a
+/// leader change.
+pub type SoftTableWire = HashMap<SocketAddr, (Holdings, u64)>;
+
+/// Wall-clock nanoseconds since the UNIX epoch; `0` if the clock reads
+/// before it.
+fn unix_now_ns() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as u64)
 }
 
 /// M8 (Task 17): everything the SEND path needs to run with crypto on, taken
@@ -776,6 +800,7 @@ impl Sender {
             peer_ids_src,
             probe: None,
             live_mtu: None,
+            soft: None,
         }
     }
 
@@ -805,6 +830,13 @@ impl Sender {
     /// the band's sender-owned cells stay dormant (unit tests, non-leaders).
     pub fn set_peer_slots(&mut self, cnc: Arc<CncPage>, slots: Vec<(SocketAddr, usize)>) {
         self.peer_obs = Some((cnc, slots));
+    }
+
+    /// Catalog spec §5.3: wire the leader's soft table. Every drained
+    /// `STATUS` inserts `(holdings, unix_now_ns)` under the follower's
+    /// address — one lock held for an insert of a `Copy` value.
+    pub fn set_soft_table(&mut self, soft: Arc<Mutex<SoftTableWire>>) {
+        self.soft = Some(soft);
     }
 
     /// Wire the newest-shippable-snapshot resolver (M6 Task 6). Without it a
@@ -1029,9 +1061,16 @@ impl Sender {
                     from,
                     contiguous,
                     window,
+                    holdings,
                 } => {
                     self.last_status.insert(from, (contiguous, window));
-                    self.flow.on_status(from, contiguous, window)
+                    self.flow.on_status(from, contiguous, window);
+                    if let Some(soft) = &self.soft {
+                        let at = unix_now_ns();
+                        soft.lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .insert(from, (holdings, at));
+                    }
                 }
                 CtrlMsg::Nak {
                     from,
@@ -2470,12 +2509,14 @@ mod tests {
             from: f1.addr(),
             contiguous: 1_000_000,
             window: 100_000,
+            holdings: Holdings::default(),
         })
         .unwrap();
         tx.send(CtrlMsg::Status {
             from: f2.addr(),
             contiguous: 2_000_000,
             window: 50_000,
+            holdings: Holdings::default(),
         })
         .unwrap();
         s.do_work();
@@ -2519,6 +2560,7 @@ mod tests {
             from: f1.addr(),
             contiguous: 0,
             window: 96,
+            holdings: Holdings::default(),
         })
         .unwrap();
         let mut a = Appender::new(Arc::clone(&b), 9, 0);
@@ -2540,6 +2582,7 @@ mod tests {
             from: f1.addr(),
             contiguous: 96,
             window: 1 << 20,
+            holdings: Holdings::default(),
         })
         .unwrap();
         s.do_work();
