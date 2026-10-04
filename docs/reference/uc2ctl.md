@@ -254,6 +254,7 @@ admission_bytes         = 262144       # 0 / absent = derive (256 KiB)
 fsm_lag                 = "16MiB"      # or "lockstep"; absent = derive (buffer_bytes / 4)
 snapshot_interval_bytes = 0            # 0 = on demand only
 snapshot_target         = "all"        # "all" or "learners"
+retain_sets             = 3            # 0.11.0, the snapshot catalog; absent = 1 (today's newest-only)
 ```
 
 An unknown key is refused locally by name, before anything is staged. The same
@@ -284,11 +285,14 @@ uc2ctl settings show --instance-dir <DIR> --app-id <ID>
 ```
 
 ```
-position=8192 admission_bytes=262144 fsm_lag=16MiB snapshot_interval_bytes=0 snapshot_target=all datagram_mtu=0 (baseline)
+position=8192 admission_bytes=262144 fsm_lag=16MiB snapshot_interval_bytes=0 snapshot_target=all retain_sets=1 datagram_mtu=0 (baseline)
 ```
 
 `fsm_lag` renders as `default` (the record's `0`), `lockstep`, a whole-MiB
-count, or a raw byte count when it is neither. `datagram_mtu` (2.12 pending)
+count, or a raw byte count when it is neither. `retain_sets` (`0.11.0`, the
+snapshot catalog, unreleased) is how many agreed snapshot sets the cluster
+keeps; `1` is the default and matches today's newest-only retention.
+`datagram_mtu` (2.12 pending)
 is the committed datagram rung: `0 (baseline)` is the `MTU_DEFAULT` every
 cluster starts from, and a rung the leader's path-MTU discovery committed
 prints as `(discovered)`. It is **leader-owned** — naming it in a `settings
@@ -407,6 +411,19 @@ maximum would make an established set appear to vanish. `set=none` means no
 such position exists, including "nothing has ever snapshotted". A row whose
 `newest=` sits below the others is the row a `Uc2SnapshotStalled` alert is
 pointing at.
+
+This is the **node-local, on-disk** reading — a file listing, nothing more.
+Since `0.11.0` (the snapshot catalog, unreleased) this is NOT the same thing
+as the purge floor: the cluster's own view is the replicated catalog, whose
+sets are tagged AGREED or not (every row's reported hash matches) and whose
+newest agreed position is the floor every node is bounded by. `set=<P>` can
+list a position no quorum agrees on, and the catalog can agree on a position
+this node does not hold. A live read of the catalog itself — rather than the
+newest cluster artifact, which lags — is project 4 of the [snapshot catalog
+design](../superpowers/specs/2026-10-01-uc2-snapshot-catalog-design.md#6-the-query-interface);
+today the five `uc2_catalog_*` gauges on `/metrics` are the only live
+surface (`uc2_catalog_sets`, `uc2_catalog_agreed_position`,
+`uc2_catalog_empty`, `uc2_catalog_stalled`, `uc2_catalog_diverged`).
 
 ### `upgrade pin`
 
@@ -853,7 +870,7 @@ cluster FSM's refusal of a `RowGenesis` record.
 | 44 | `settings_digest` — the staged settings file's digest is not the one the request signed: a different file was staged than was signed, or it changed in between. Re-run `settings apply` |
 | 45 | `settings_missing` — no staged settings file on this node. Either `settings apply` was run against a different instance directory, or a successful apply already consumed it |
 | 46 | `settings_decode` — the staged file is not a decodable settings record (wrong length, unknown encoding version, or an unknown `snapshot_target` byte) |
-| 47 | `settings_bounds` — a field is out of range; the node's refusal detail and the audit record name which. Three values are out of range: `admission_bytes` or `snapshot_interval_bytes` equal to `u64::MAX` (the reserved sentinel), and an `fsm_lag` byte bound **below 1376 B** — one max-size frame. A sub-frame lag pins the report ceiling (`min_applied + fsm_lag`) inside the next frame and stops commit cluster-wide **permanently**, since changing a replicated setting needs a command that commits; `"lockstep"` is how you ask for the tightest pacing. `fsm_lag = "0"` (derive) and `"lockstep"` are sentinels, not bounds, and are never refused here |
+| 47 | `settings_bounds` — a field is out of range; the node's refusal detail and the audit record name which. Four values are out of range: `admission_bytes` or `snapshot_interval_bytes` equal to `u64::MAX` (the reserved sentinel); an `fsm_lag` byte bound **below 1376 B** — one max-size frame; and, since `0.11.0` (the snapshot catalog, unreleased), `retain_sets` equal to `0` or above `56` (`uc_protocol::v2::catalog::MAX_RETAIN_SETS`) from an operator's own `settings apply` — `0` from a REPLAYED older record is not refused here, it is normalised at apply to the cluster's current `retain_sets`. A sub-frame lag pins the report ceiling (`min_applied + fsm_lag`) inside the next frame and stops commit cluster-wide **permanently**, since changing a replicated setting needs a command that commits; `"lockstep"` is how you ask for the tightest pacing. `fsm_lag = "0"` (derive) and `"lockstep"` are sentinels, not bounds, and are never refused here |
 | 48 | `snapshot_unsupported` — a declared row lacks the snapshot capability bit, so it would ignore the `SNAPSHOT` frame and the set at P could never complete. Since #67 every Rust SDK service sets this bit unconditionally (`ServiceBuilder::start()` requires `S: SnapshotStateMachine`), so this is now the backstop for a service attached without the current Rust SDK (a non-Rust attacher, or a binary built before #67). The audit record's `detail` field names the row; it is refused by name rather than left with a floor that never moves |
 | 49 | `snapshot_no_learner` — `uc2ctl snapshot --standby` with no learner in the committed membership. Only a learner freezes for a standby instant, so with none there nothing anywhere would build the set |
 | 50 | `snapshot_above_durable` — `uc2ctl snapshot fetch --position P` names a P above this node's own durable frontier. A voter must not adopt a floor above what it has made durable. Usually an operator typo, or a learner transiently ahead of this voter; legitimate again once this node's log catches up |

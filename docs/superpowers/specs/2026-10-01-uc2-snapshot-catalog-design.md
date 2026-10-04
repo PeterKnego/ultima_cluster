@@ -410,3 +410,115 @@ before its `STATUS` is ever parsed.
   (900 ms by default): no per-peer heartbeat timestamp existed to reuse.
 - **`uc2_catalog_stalled`** counts commanded-not-complete sets with no
   timeout; the timeout judgement is the `stalled()` query's.
+
+#### Errata (as built, 2026-10-04)
+
+- **§4.4 retention counts a pinned origin toward `retain_sets`, not beside
+  it (rulings R3, R21).** §4.4 step 1 reads as excepting a pinned origin
+  from the retiring sweep entirely, which would keep it without spending
+  one of the `retain_sets` slots. As built, `retire()`'s removal loop counts
+  every agreed entry — pinned or not — against `retain_sets` and only
+  refuses to pick a pinned entry as the *victim*; a pin therefore shrinks
+  effective retention by one for as long as it stands. This is the literal
+  reading of R3 and is **not yet** the intended rule: R21 restates it as
+  "keep the newest `retain_sets` agreed sets, PLUS every pinned origin"
+  (pins free, never counted), ruled but **not implemented** — it lands in
+  the final fix wave (Task 5's `retire()` and its test, Task 12 test 3, and
+  this section's wording).
+- **§4.4 names no upper bound on `retain_sets`; the door enforces one,
+  `MAX_RETAIN_SETS = 56` (ruling R8).** D5 says only `retain_sets ≥ 1`. The
+  catalog's list rides inside the cluster IMAGE, not a `CLUSTER` frame, so
+  its own retention bound is `MAX_CATALOG_SETS = 64` on the list itself —
+  and `retain_sets` is refused above `MAX_CATALOG_SETS − 8 = 56`, the eight
+  entries of headroom retention needs for commanded instants still in
+  flight and the pinned origins step 1 must also keep. `cap_catalog()` is
+  the backstop this bound is meant to make unreachable: it evicts the
+  oldest non-agreed entry first, then the oldest agreed entry that is
+  neither a pinned origin nor the newest agreed set, and never the newest
+  entry outright (evicting it would drop every later instant on arrival and
+  freeze the floor).
+- **§4.1/§4.3's "agreed" is FROZEN at completion, not recomputed against the
+  live declared mask (ruling R9).** As drafted, `is_agreed` reads as a
+  live predicate — "every *currently* declared row and the cluster artifact
+  are `Agreed`" — which would let a row added to a running cluster
+  retroactively un-agree every earlier set (no artifact for the new row
+  exists at those positions). As built, a `Complete` entry's agreement is
+  judged once, against the rows it had to cover *at the moment it turned
+  `Complete`*; `SetEntry::is_agreed` takes no mask argument, and a row
+  declared later is `Unreported` in an older entry without un-agreeing it.
+  Completeness itself (`Commanded` → `Complete`) is still judged against the
+  live running-derived mask at report time — only *agreement*, once
+  reached, is frozen. Otherwise adding a row would empty the catalog on the
+  spot and let retention drop a pinned origin out from under its pin.
+- **§4.4/§7's "`retain_sets = 0` is refused at the door" elides apply's own
+  handling of a replicated `0` (ruling R10).** The flag day clears nothing
+  on disk, so a `0` can reach `apply` two ways that are not an operator's
+  request: a v1/v2 `Settings` record replayed from the journal (where `0`
+  always meant "unset"), or the image's own `ClusterState::retain_sets`
+  before anything has ever set it. `validate_replicated` (the replicated
+  half every node runs identically) refuses only `retain_sets >
+  MAX_RETAIN_SETS`; a replicated `0` is **normalised at `apply`** to the
+  *current* `retain_sets` (retention is simply unchanged by that record).
+  Only the leader's pre-append door (`validate`) refuses an operator's own
+  `0` unconditionally, with `47`, so no operator can ever stage one.
+- **§4.4 step 3's "holds complete on disk" is a cache read, not a file
+  check, outside one seam (ruling R12).** As drafted this reads as "ask the
+  filesystem". As built, a node's effective-floor candidate is read from
+  `holdings_held` — the same cache `Holdings.sets_held` advertises,
+  maintained by the writers §5.2 already names — and a filesystem check
+  (`holds_set`) runs only once, at the uncommon view-change edge where a
+  newly-listed agreed set has no cache entry yet (see ruling R18 below);
+  never on a steady pass.
+- **§4.5's `Empty` fallback keeps today's pruning rule, not "nothing"
+  (ruling R13).** As drafted, the pruner "deletes nothing" while `Empty`.
+  As built, it keeps TODAY's rule instead — delete below this node's own
+  newest complete set, pinned origins kept — because "nothing" protected
+  nothing real (every set §4.5 meant to protect already sits below the
+  node's own newest complete set, which was always prunable) while
+  breaking every existing purge test, none of which has an agreed set to
+  offer.
+- **§5.2's once-per-second filesystem probe runs on the ARCHIVE agent, not
+  wherever "off the pass" was read to mean (ruling R14).** The spec's "off
+  the consensus hot path" (D6) is a correct constraint but names no agent;
+  an early draft of the probe landed inside the node's own per-pass
+  `do_work`, which is itself the consensus pass and contradicts D6 outright
+  for a directory walk. As built it runs on the **archive agent**'s duty
+  cycle — the agent that already owns disk I/O (journal recording), so a
+  slow filesystem stalls archiving, never commit.
+- **§5.1's `catalog_position` stamp is a content hash, not a position
+  (ruling R16).** The spec's `sets_held` row names "the catalog position it
+  was computed against" without saying what that quantity is; the natural
+  reading is a walk cursor or list length. As built it is
+  `catalog_version_of(sets)`, an FNV-1a-64 **content hash** over the set
+  list's wire encoding, computed in `ClusterView::publish` on the cluster
+  agent and stored as `ClusterView::catalog_version`. `Holdings.catalog_position`
+  keeps the wire field name but carries this hash — two nodes holding the
+  same catalog agree on it regardless of where their own walk cursor
+  stands, which a position-based stamp would not guarantee.
+- **§5.1's `journal_bytes` is an O(1) estimate, not a filesystem reading
+  (ruling R17).** "The filesystem under the instance dir" reads as a walk.
+  As built it is computed from positions alone —
+  `(durable − archive_first_base)` rounded up to whole `segment_size_bytes`,
+  plus one more segment when `preallocate_segments` is on — because the
+  journal has block sequence numbers, not a segment count, and a per-file
+  walk would scale with the journal itself (tens of thousands of files at
+  1 TB) on the same agent that advances `durable`.
+- **§5.2's holders list implies the disk-presence seed runs continuously;
+  it runs once, at boot (ruling R18).** The writers §5.2 names (the
+  completeness check, the pruner, the archive's first-base mirror, the
+  probe) are all steady-state edges that never touch the filesystem to
+  decide "held". The one writer that DOES check the filesystem,
+  `holds_set` (ruling R12), runs **only** at boot/recovery, gated by a
+  `holdings_seeded` flag the first `refresh_from_view` consumes; after
+  that, a newly-listed set becomes "held" only through this node's own
+  completion edge, so a view change on the consensus pass performs no
+  filesystem call.
+- **§10.3's inv13 covers clause (a) only, not both halves (ruling R19).**
+  The proof plan asks for both "the catalog each node would derive … is
+  identical across nodes at equal commit" (a) and "no node's purge floor
+  exceeds the newest agreed set it holds" (b) in one invariant. `uc_sim`
+  has no purge floor to check (b) against — the sim models the cluster
+  FSM's catalog abstractly and never runs a node's actual pruner — so inv13
+  as shipped sweeps clause (a) alone (`World::check_catalog_determinism`);
+  clause (b)'s coverage is Task 8's node unit tests and Task 12's end-to-end
+  tests, not the sim.

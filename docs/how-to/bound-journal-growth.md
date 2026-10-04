@@ -77,10 +77,24 @@ explicit: a voter's floor moves when an operator fetches, not on its own.
 
 Set `purge: PurgePolicy::BelowSnapshot { slack_bytes }` in `NodeConfig`.
 
-Purge follows the **set**: a node's floor moves to P only once every declared
-row's artifact at P and the cluster artifact at P are on disk, and the node
-prunes the journal below that floor. Retention is the node's too, and it only
-deletes: it keeps the set at the persisted floor plus everything newer.
+Purge follows the **set** — but, since `0.11.0` (the snapshot catalog,
+unreleased), not file presence alone. A node's floor moves to P only once P
+is the newest set the cluster's replicated catalog **agrees** on (every
+declared row's and the cluster artifact's reported hash match, spec §4.4)
+*and* this node holds that set complete on disk. A set every row built but
+that diverged across nodes is never the floor, whatever `uc2ctl snapshot
+show`'s `set=` says — `set=` is the node-local, **on-disk** reading (a file
+listing); the floor is the catalog's, and the two can legitimately differ.
+Before the first instant agrees (the `Empty` state, `uc2_catalog_empty`),
+the floor falls back to today's behaviour: the newest complete set this
+node holds, file presence alone. On a learner-only cluster (`snapshot_target
+= "learners"`) a voter's effective floor does not move until it fetches
+(below) — that is the normal state of such a voter, not a stall. The node
+prunes the journal below its effective floor. Retention is the node's too,
+and it only deletes: it keeps the set at the persisted floor plus
+everything newer. `retain_sets` (default `1`) is how many agreed sets the
+replicated catalog keeps at all — see [Configuration §
+`[settings]`](../reference/configuration.md#settings).
 
 `slack_bytes` retains a tail below the snapshot floor so that a
 slightly-behind follower can still catch up by ordinary journal replay instead

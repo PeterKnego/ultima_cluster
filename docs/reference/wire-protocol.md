@@ -10,7 +10,7 @@ self-locating header is in [Architecture](../ARCHITECTURE.md).
 
 | Constant | Value |
 |---|---|
-| `version::CURRENT` | `0.7.0` (`0.8.0`, since `2.12.0`, two new pairwise kinds for jumbo-frame MTU discovery, `PROBE` (24) and `PROBE_ACK` (25); no existing layout changes) (`0.9.0`, since `2.13.0`, two `CLUSTER` kinds, 4 and 5, and one pairwise datagram kind, `SNAP_REPORT` (26), no layout change; a 0.8.0 peer applies either as undecodable and its cluster FSM silently diverges — stop every node before starting any) (`0.10.0`, #33, unreleased as this is written: one `CLUSTER` kind, 6 `RowGenesis`, no layout change; a 0.9.0 peer refuses it as undecodable and its cluster FSM silently diverges — never learns the row's running version — so again stop every node before starting any) |
+| `version::CURRENT` | `0.7.0` (`0.8.0`, since `2.12.0`, two new pairwise kinds for jumbo-frame MTU discovery, `PROBE` (24) and `PROBE_ACK` (25); no existing layout changes) (`0.9.0`, since `2.13.0`, two `CLUSTER` kinds, 4 and 5, and one pairwise datagram kind, `SNAP_REPORT` (26), no layout change; a 0.8.0 peer applies either as undecodable and its cluster FSM silently diverges — stop every node before starting any) (`0.10.0`, #33, unreleased as this is written: one `CLUSTER` kind, 6 `RowGenesis`, no layout change; a 0.9.0 peer refuses it as undecodable and its cluster FSM silently diverges — never learns the row's running version — so again stop every node before starting any) (`0.11.0`, the snapshot catalog, unreleased as this is written: `STATUS`'s body 16 B → 144 B, `SNAP_REPORT`/`SnapshotReport` admits row 255, `Settings` grows to version 3 with `retain_sets`, no existing layout change; a 0.10.0 peer's shorter `STATUS` is refused by length and it applies the row-255 report and the wider `Settings` record as undecodable, silently diverging — stop every node before starting any) |
 | cnc page version | 3.1 (FSM identity + log time, 2.11.0: the name + hash line at boot, the version word at attach, `log_time_ns`, per-row `timers_pending`) (3.2, since `2.12.0`, a live `payload_ceiling` word) (3.3, since `2.13.0`, five new words: four node-written on the service status line — `upgrade_origin` (`+16`), `pinned_version` (`+24`), the seqlock word `pin_seq` (`+32`) that publishes the first two as a pair, and `pinned_from` (`+40`) — plus one **service**-written word on slot line 7, `artifact_hash` (`+504`), which fills that line) (3.4, #33, three node-written words: `running_version` (`+48`) and `running_record_pos` (`+56`) on the service status line, under the same `pin_seq` seqlock, which fills that line; and `cluster_applied` at page-1 offset `4056`) |
 
 The cnc page carries its own version gate, `CNC_V2_VERSION`, which is
@@ -62,7 +62,7 @@ The header is authenticated as AAD when wire crypto is enabled, and carries a
 | 1 | `DATA` | group |
 | 2 | `HEARTBEAT` | group |
 | 3 | `NAK` | pairwise |
-| 4 | `STATUS` | pairwise |
+| 4 | `STATUS` | pairwise (body grows 16 B → 144 B, `0.11.0`, the snapshot catalog — the per-node `Holdings` advertisement; a `0.10.0` peer's 16 B body is refused by length) |
 | 5 | `APPEND_POSITION` | pairwise |
 | 6 | `COMMIT_POSITION` | group |
 | 7 | `REQUEST_VOTE` | pairwise |
@@ -241,7 +241,7 @@ bytes, exact-length.
 
 | bytes | field | width | meaning |
 |---|---|---|---|
-| 0 | `row` | u8 | the declared FSM row (0..8) whose artifact this reports |
+| 0 | `row` | u8 | the declared FSM row (0..8) whose artifact this reports, or `255` (`CLUSTER_ROW`, since `0.11.0`, the snapshot catalog) for the cluster artifact itself |
 | 1..4 | reserved | — | zero; a non-zero reserved byte refuses the body |
 | 4..8 | `node_id` | u32 | the reporting node's own id |
 | 8..16 | `position` | u64 | the position the artifact froze at; `0` refuses the body — position 0 is never a legitimate freeze |
@@ -250,7 +250,9 @@ bytes, exact-length.
 Term-independent like `PROBE`/`PROBE_ACK` — a hash is a hash whoever is
 leading this term — so a receiver admits it before the stale-term drop,
 rather than through the term-adopting consensus-kind path (kinds 5–11).
-`Scope::Pairwise`.
+`Scope::Pairwise`. `is_report_row(row)` is the one check both this body and
+the `CLUSTER kind = 5 SnapshotReport` payload (below) share: `row < 8 ||
+row == 255`.
 
 ### Administration
 
@@ -343,7 +345,7 @@ so the frame type is the only router there is. One type, one kind byte:
 
 | bytes | field | meaning |
 |---|---|---|
-| 0 | `kind` | `1` = Membership, `2` = ScheduleTable, `3` = Settings, `4` = UpgradePin, `5` = SnapshotReport, `6` = RowGenesis (0.10.0); any other value is undecodable |
+| 0 | `kind` | `1` = Membership, `2` = ScheduleTable, `3` = Settings, `4` = UpgradePin, `5` = SnapshotReport, `6` = RowGenesis (0.10.0); `7` is **reserved** for project 3's backup watermark (catalog spec §7/§12) — not yet a `ClusterKind` variant, so it is refused today exactly like any other unassigned value; any other value is undecodable |
 | 1..8 | reserved | written as zero, and a **non-zero** reserved byte makes the body undecodable — the bytes are claimable by a later kind without ambiguity |
 | 8.. | `payload` | the kind's own encoding |
 
@@ -355,7 +357,7 @@ otherwise the kind plus the payload slice. Per kind:
 |---|---|---|
 | `1` Membership | the `ClusterConfig` encoding `CONFIG` carried through `0.6.0`, unchanged | `uc_protocol::v2::config` |
 | `2` ScheduleTable | the whole table — an 8-byte header plus `count × 33` bytes, at most `MAX_SCHEDULE_ENTRIES = 32`, so **≤ 1064 B**. Layout below | `uc_protocol::v2::schedule` |
-| `3` Settings | `SETTINGS_LEN = 33` bytes exactly (**`2.12.0`**; was 29 through `2.11.0`): `version u32 = 2 ‖ fsm_lag_bytes u64 @4 ‖ admission_bytes u64 @12 ‖ snapshot_interval_bytes u64 @20 ‖ snapshot_target u8 @28 ‖ datagram_mtu u32 @29`. `0` in any u64 means "derive at use"; `fsm_lag_bytes = u64::MAX` (`FSM_LAG_LOCKSTEP`) means lockstep; `snapshot_target` is `0` = all, `1` = learners; `datagram_mtu` is `0` (= the `MTU_DEFAULT` baseline) or a member of `RUNGS`, discovered and monotone, never operator-written. A **version `1`** record — 29 B, `SETTINGS_LEN_V1`, the `2.11.0` shape — is still ACCEPTED on read and maps to `datagram_mtu = 0`, because the cluster artifact and committed `CLUSTER` frames survive the upgrade; an encoder always writes version 2. No trailing bytes are tolerated, and no other `(version, len)` pair decodes | `uc_protocol::v2::settings` |
+| `3` Settings | `SETTINGS_LEN = 35` bytes exactly (**`0.11.0`**, the snapshot catalog; was 33 through `2.12.0`, 29 through `2.11.0`): `version u32 = 3 ‖ fsm_lag_bytes u64 @4 ‖ admission_bytes u64 @12 ‖ snapshot_interval_bytes u64 @20 ‖ snapshot_target u8 @28 ‖ datagram_mtu u32 @29 ‖ retain_sets u16 @33`. `0` in any u64 means "derive at use"; `fsm_lag_bytes = u64::MAX` (`FSM_LAG_LOCKSTEP`) means lockstep; `snapshot_target` is `0` = all, `1` = learners; `datagram_mtu` is `0` (= the `MTU_DEFAULT` baseline) or a member of `RUNGS`, discovered and monotone, never operator-written; `retain_sets` is how many AGREED catalog sets the cluster keeps — `0` means "unset" (only reachable through a replayed older record, normalised at `apply` to the current value) and `1..=56` (`MAX_RETAIN_SETS`) otherwise, refused above that and at `0` from an operator by the leader's door (`47 settings_bounds`). A **version `2`** record — 33 B, `SETTINGS_LEN_V2`, the `2.12.0` shape — is still ACCEPTED on read and maps `retain_sets` to `0`; a **version `1`** record — 29 B, `SETTINGS_LEN_V1`, the `2.11.0` shape — is still ACCEPTED and maps both `datagram_mtu` and `retain_sets` to `0`, because the cluster artifact and committed `CLUSTER` frames survive the upgrade; an encoder always writes version 3. No trailing bytes are tolerated, and no other `(version, len)` pair decodes | `uc_protocol::v2::settings` |
 | `4` UpgradePin | **20 B** exactly: `row u8 @0 ‖ reserved [u8; 3] @1 ‖ from u32 @4 ‖ to u32 @8 ‖ origin u64 @12`. `row < 8`, `origin > 0`, reserved zero. An EVENT ("at `origin`, `row` went `from` → `to`"), kept as a per-row history of at most 4 in the cluster FSM and republished into the row's cnc status line (`+16`/`+24`) | `uc_protocol::v2::upgrade` |
 | `5` SnapshotReport | `row u8 @0 ‖ count u8 @1 ‖ reserved [u8; 6] @2 ‖ position u64 @8 ‖ count × (node_id u32 ‖ hash u64)`, `1 ≤ count ≤ 8` → **16–112 B**, node ids strictly increasing. The leader's collected per-node artifact hashes for `(row, position)`; the verdict (all equal / majority names minority / no majority) is recomputed by every reader, never carried | `uc_protocol::v2::upgrade` |
 | `6` RowGenesis (0.10.0, #33) | **8 B** exactly (`ROW_GENESIS_LEN`): `row u8 @0 ‖ reserved [u8; 3] @1 ‖ version u32 @4`. `row < 8`, reserved zero; `version` is a packed version and `0` is a legal value (an unversioned FSM). A recorded FACT, not an operator's change: the leader appends it on its own, once per row, naming the version of its own attached service when the row has no running version yet. Applied at commit, it sets the row's running version; refused `60 version_already_set` if the row already has one. An accepted `UpgradePin` (kind 4) sets the running version too, to its `to`, and is refused `53` when its `from` is not on the running line (same major.minor) | `uc_protocol::v2::upgrade` (`encode_row_genesis`/`decode_row_genesis`) |

@@ -210,11 +210,34 @@ transport setting, both measured closed-loop at inflight 1 on 8-vCPU
   See [Run a cluster on jumbo frames](../how-to/jumbo-frames.md).
 - **What snapshot set is this node holding?** `uc2ctl snapshot show` prints
   each declared row's newest artifact position, the cluster row's, and
-  `set=<P>` — the newest position present in **all** of them, which is the
-  purge floor once persisted. It is offline (a directory listing) and never
-  opens an artifact. A row whose `newest=` sits below the others is the row
-  holding the floor back, and `uc2_snapshot_row_incomplete_total{row}` will be
-  climbing for it.
+  `set=<P>` — the newest position present in **all** of them. It is offline
+  (a directory listing) and never opens an artifact. A row whose `newest=`
+  sits below the others is the row holding the floor back, and
+  `uc2_snapshot_row_incomplete_total{row}` will be climbing for it. Since
+  `0.11.0` (the snapshot catalog, unreleased) `set=` is the node-local,
+  on-disk reading only — see the next bullet for the cluster's own view,
+  which is what actually bounds the purge floor.
+- **What does the cluster agree it can rebuild from?** The snapshot catalog
+  (`0.11.0`, unreleased,
+  [design spec](../superpowers/specs/2026-10-01-uc2-snapshot-catalog-design.md))
+  replaces "the newest set that exists on disk" with "the newest set every
+  declared row and the cluster artifact **agree** on" as the purge floor and
+  every install source. A node's own effective floor is the newest agreed
+  set it actually holds, which can sit below the cluster-wide one — the
+  normal state of a voter on a learner-only cluster (`snapshot_target =
+  "learners"`), not a stall. Today there is no live read of the catalog
+  itself (that is project 4 — the live-read mechanism and an AI-friendly
+  JSON shape are both open); what exists now is five gauges on `/metrics`:
+  `uc2_catalog_sets` (how many sets are listed), `uc2_catalog_agreed_position`
+  (the cluster floor), `uc2_catalog_empty` (`1` while no set has ever
+  agreed — the flag-day/genesis fallback window, during which the floor and
+  retention both run on today's pre-catalog rule instead),
+  `uc2_catalog_stalled` and `uc2_catalog_diverged` (how many commanded or
+  disagreeing sets are visible). `Uc2SnapshotSetDiverged` now keys on
+  `uc2_catalog_diverged` rather than comparing per-node gauges directly.
+  `read_committed_catalog` (`uc_node::cluster_agent`) reads the same catalog
+  out of the newest cluster artifact, offline, for a future `uc2ctl catalog`
+  (also project 4; not shipped yet).
 
 ## Changing a running cluster
 

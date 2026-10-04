@@ -434,6 +434,17 @@ the FSM only ever needs to hold the latest. An FSM upgrade needs the opposite
 — what happened, in what order — which is why it gets two new `CLUSTER`
 kinds instead of a fourth field on Settings.
 
+**The snapshot catalog (`0.11.0`, unreleased) builds directly on
+`SnapshotReport`.** Every `(row, position)` hash this feature collects feeds
+a replicated catalog of snapshot **sets**, keyed by position rather than by
+row, that remembers more than one set at a time and names each one's
+agreement verdict — closing the "the FSM forgets the previous set the
+moment a newer report lands" gap this section used to end on. See [the
+design spec](../superpowers/specs/2026-10-01-uc2-snapshot-catalog-design.md)
+and, below, [What plan 1 did not do, and plan 2 did not
+either](#what-plan-1-did-not-do-and-plan-2-did-not-either) for the one
+paragraph that gap used to live in.
+
 **`UpgradePin` is an event, not a setting.** "At position `origin`, row `row`
 went from `from` to `to`" names a fact about history, not a tunable an
 operator dials: the whole point is the *sequence*, so a fresh pin never
@@ -653,11 +664,18 @@ still-catching-up node a required voter for as long as the change is in
 flight, so every instant in that window waits out the full five seconds and
 increments `uc2_snapshot_reports_timed_out_total`.
 
-**The cluster FSM's own artifact is not reported.** `SnapshotReport.row` is a
-declared row, `0..8`; `service_id = 255` is outside it. The cluster image is
+**The cluster FSM's own artifact IS reported, since `0.11.0`.** This used to
+be a real gap: `SnapshotReport.row` covered only declared rows, `0..8`, and
+`service_id = 255` — the cluster artifact — was outside it, with no live
+determinism check at all. The snapshot catalog (unreleased as this is
+written) closes it by admitting row `255` (`CLUSTER_ROW`) to the same
+report: a node that completes a set reports the cluster artifact's hash
+beside its declared rows', and the catalog's `cluster` field carries that
+row's verdict exactly as every other row's does. The cluster image is still
 a function of the committed `CLUSTER` commands and nothing else, so it has
-far less room to diverge than a user FSM's `freeze()` does — but covering it
-is a real gap and is on the backlog.
+far less room to diverge than a user FSM's `freeze()` does — but it is no
+longer unwatched. See [the design
+spec](../superpowers/specs/2026-10-01-uc2-snapshot-catalog-design.md).
 
 ## What plan 1 did not do, and plan 2 did not either
 

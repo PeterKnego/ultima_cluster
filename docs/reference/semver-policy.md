@@ -216,12 +216,14 @@ Two version numbers are deliberately *outside* this policy, because semver's
 "a minor bump is safe" contract is the wrong promise for them:
 
 - **The node-to-node wire protocol** (`uc_protocol::version::CURRENT`,
-  currently `0.10.0` (#33, the row running version's one new `CLUSTER`
-  kind; unreleased as this is written — `0.9.0` shipped in `2.13.0`) — see
-  [wire protocol](wire-protocol.md)).
+  currently `0.11.0` (the snapshot catalog's `STATUS` body, `SNAP_REPORT`
+  row 255 and `Settings` v3; unreleased as this is written — `0.10.0`
+  shipped #33's row running version, also unreleased; `0.9.0` shipped in
+  `2.13.0`) — see [wire protocol](wire-protocol.md)).
 - **The `cnc.dat` page layout** (`CNC_V2_VERSION`, currently cnc `3.4`
-  (#33, unreleased; cnc `3.3` shipped in `2.13.0`) — see [the cnc control
-  page](cnc-page.md)).
+  (#33, unreleased; the snapshot catalog leaves cnc untouched — the
+  catalog is not on the shmem page; cnc `3.3` shipped in `2.13.0`) — see
+  [the cnc control page](cnc-page.md)).
 
 A change to either is a **flag day**: every node in a cluster is stopped and
 restarted on the new version together. Mixed-version operation is not
@@ -361,6 +363,40 @@ running, mine }`. `ServiceError` is a promised type and is not
 — the same documented minor-version hazard `Outcome` and `SubmitError`
 carried in M14b. Adding a variant is additive under this policy.
 `uc_protocol::identity::same_line` is new, but `uc_protocol` is not promised.
+
+### The snapshot catalog flag day (`0.11.0`)
+
+Unreleased as this is written, and a further flag day on the same terms:
+wire `0.10.0` → `0.11.0`, cnc **unchanged** at `3.4` — the catalog is not on
+the shmem page, only on the cluster artifact and `/metrics`.
+
+**Wire `0.11.0`.** `STATUS`'s body grows from 16 B to 144 B, carrying a
+per-node `Holdings` advertisement (journal span, catalogued sets held,
+per-row applied, byte counts); a `0.10.0` peer's 16 B body is refused by
+length. `SNAP_REPORT`/`SnapshotReport` (`CLUSTER` kind 5) admits row `255`
+— the cluster artifact's own hash, closing the gap recorded on the backlog
+since plan B3. `Settings` grows to encoding version 3 (35 B), adding
+`retain_sets: u16`; a version-1 or version-2 record is still accepted on
+read, with `retain_sets` reading `0` ("unset"). No existing layout changes
+anywhere, so a `0.10.0` peer's frames of these kinds still *parse* but
+decode as undecodable/unknown and are dropped — its cluster FSM silently
+diverges rather than refusing outright. Stop every node before starting any
+node.
+
+**Cluster image 3 → 4, no wipe.** The artifact gains a trailing
+length-prefixed catalog blob; a v1–v3 image is still **read**, with the
+blob empty (the `Empty` state, [Upgrade a
+cluster](../how-to/upgrade-a-cluster.md#wire-change-after-0100-the-snapshot-catalog-0110)).
+`snapshots/<row>/` and `snapshots/cluster/` are both untouched.
+
+**What changes for an operator.** The purge floor and every install source
+move from "the newest complete set on this node's own disk" to "the
+newest set the cluster **agrees** on, that this node holds" — a diverged
+set (rows that disagree) is visible and fetchable but never the floor and
+never installed. `retain_sets` (default `1`, the prior newest-only
+behaviour) is the first replicated retention policy; `0` and anything above
+`56` are refused with `47`. No API change: this flag day is entirely wire,
+cnc-page-adjacent (the artifact, not the live page) and operator-surface.
 
 ### `2.13.0` API notes
 

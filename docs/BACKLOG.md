@@ -366,15 +366,45 @@ reviewer wants a workload to attack.
 - **Alert on `uc2_log_clock_smear_ns`** (a smear above N seconds for M
   minutes), with its `scripts/m10_alert_fire.sh` builder and scenario —
   recorded 2026-09-08 by the log-clock spec's errata bullet 9.
-- **The cluster FSM's own artifact is not hash-reported.**
-  `SnapshotReport.row` covers declared rows `0..8`; `service_id = 255` — the
-  `snapshots/cluster/` image every below-floor joiner installs by fiat — has
-  no live determinism check at all. Its surface is far smaller than a user
-  FSM's `freeze()` (the image is a function of the committed `CLUSTER`
-  commands and nothing else), which is why plan B3 scoped it out rather than
-  widening the record's row field; it is still a real gap. Recorded
-  2026-09-21 as erratum 6 of the FSM upgrade lifecycle spec's
-  "Errata (plan B3, as built)".
+- ~~**The cluster FSM's own artifact is not hash-reported.**~~ — **CLOSED by
+  the snapshot catalog (`0.11.0`, unreleased).** `SnapshotReport` now admits
+  row `255` (`CLUSTER_ROW`): a node that completes a set reports the cluster
+  artifact's hash beside its declared rows', and the catalog's `cluster`
+  field carries that row's verdict exactly as every other row's. Recorded
+  2026-09-21 as erratum 6 of the FSM upgrade lifecycle spec's "Errata (plan
+  B3, as built)"; closed by
+  [the snapshot catalog design](superpowers/specs/2026-10-01-uc2-snapshot-catalog-design.md).
+- **Project 2 (not this spec): the lifecycle rule that USES the catalog.**
+  "Load the newest agreed set ahead of me, replay from there" at restart,
+  catch-up, join and upgrade; when a short catch-up should replay instead of
+  installing; holder preference among `holders()` (locality, learner-first).
+  The catalog spec provides the queries (`newest_agreed`, `agreed_for`,
+  `holders`) and deliberately does not change `replay_into` or `attach`
+  itself —
+  [spec §2 "Out"](superpowers/specs/2026-10-01-uc2-snapshot-catalog-design.md#2-scope)
+  and §12.
+- **Project 3 (not this spec): the backup tier.** Long off-node retention,
+  restore from it, and a "backed up through P" watermark — `CLUSTER` kind
+  `7` is reserved for the watermark record and nothing more is built yet;
+  whether a node may retire below `retain_sets` once the tier confirms a
+  set is also open —
+  [spec §2 "Out"](superpowers/specs/2026-10-01-uc2-snapshot-catalog-design.md#2-scope)
+  and §12.
+- **Project 4 (not this spec): the operator / AI surface.** A live read of
+  the catalog that does not wait for the first cluster artifact (today only
+  `read_committed_catalog`'s offline read and five `/metrics` gauges exist),
+  `uc2ctl catalog`, and a JSON shape meant for an AI to read —
+  [spec §2 "Out"](superpowers/specs/2026-10-01-uc2-snapshot-catalog-design.md#2-scope),
+  §6.3 and §12.
+- **A whole-cluster cold restart may never commit (reproduce on main).**
+  Found by the snapshot catalog's own test 4: when the log end sits past
+  `fsm_lag` at a cold start, `applied` stays `0`, the durable report ceiling
+  (`min_applied + fsm_lag`) pins at `fsm_lag`, the opening `NewTerm` frame
+  above it never commits, and every door answers `NodeBooting` forever —
+  worked around in that test with an applied-mirror stand-in rather than
+  fixed. Not yet verified on `main` without the catalog change; ruling R20
+  is "reproduce on main and ticket it, a flag-day defect if real", not "fix
+  it here". Recorded 2026-10-04.
 - **The `uc_service::apply` replay forward-progress guard has no counter.**
   Plan B3 T5 added a guard that hands the cycle back when a replay pass
   fails to advance the cursor (it used to spin forever, which also hung

@@ -998,6 +998,66 @@ neither `snapshots/<row>/` nor `snapshots/cluster/` needs clearing.
   leader before driving load — in-tree, the M10 alert-fire harness was
   re-shaped this way.
 
+## Wire change after 0.10.0: the snapshot catalog (0.11.0)
+
+The snapshot catalog, unreleased as this is written. It is project 1 of a
+four-project storage-service direction; the reasoning is
+[the design spec](../superpowers/specs/2026-10-01-uc2-snapshot-catalog-design.md).
+The cluster now keeps a replicated list of the snapshot **sets** it has
+coordinated — position, kind, state, and per row the building version, the
+hash and the agreement verdict — instead of forgetting a set the moment a
+newer one lands, and the purge floor follows the newest set the cluster
+**agrees** on rather than the newest set that merely exists on disk.
+
+**Wire `0.10.0` → `0.11.0`.** `STATUS`'s body grows from 16 B to 144 B
+(`uc_protocol::v2::datagram::STATUS_BODY_LEN`): every node now advertises
+what it holds — its journal span, which catalogued sets it has complete on
+disk, applied positions per row, and free/journal/snapshot byte counts
+(`Holdings`). A `0.10.0` peer's 16-byte body is refused by length before a
+`0.11.0` node ever tries to read the new fields, so a mixed cluster stalls
+rather than misreads. `SNAP_REPORT`/`SnapshotReport` (`CLUSTER` kind 5)
+admits row `255`: the cluster artifact's own hash now joins the per-row
+completeness report, closing the "the cluster FSM's own artifact has no
+determinism check" gap. The replicated `Settings` record grows one field,
+`retain_sets: u16` (version 3, 35 B; a version-1 (`2.11.0`) or version-2
+(`2.12.0`) record is still accepted on read and reads `retain_sets` as `0`,
+"unset"). No existing
+layout changes anywhere, which is exactly why mixing is unsound rather than
+merely unsupported: a `0.10.0` peer applies the row-255 report and the wider
+`Settings` record as undecodable and silently diverges — its catalog never
+completes a set. **Stop every node before starting any node.**
+
+**cnc unchanged.** The catalog is not on the shmem page; it rides inside
+the cluster artifact and `/metrics` only. No cnc version bump, no node-local
+process restart beyond the ordinary flag-day one.
+
+**Nothing on disk is cleared.** The cluster artifact's image layout moves
+from version 3 to 4 (a trailing length-prefixed catalog blob); a v1–v3
+artifact is still **read**, with the new blob empty — the same "accept every
+older version with its missing trailing blobs read as empty" rule every
+prior image bump used. `snapshots/<row>/` and `snapshots/cluster/` are both
+untouched; there is no wipe for this flag day.
+
+**The `Empty` window.** A v1–v3 artifact — or a fresh genesis — starts with
+an empty catalog: no set has ever been agreed. Every reader takes a named
+fallback in that state: the purge floor and every install source read as
+today's pre-catalog behaviour (the node's own newest complete set on disk),
+and the pruner keeps deleting on that same old rule rather than refusing to
+delete anything. The gauge `uc2_catalog_empty` is `1` for as long as this
+holds and `0` once the first instant completes and agrees — watch it after
+the upgrade to know when the cluster has actually started keeping the new
+replicated record, as opposed to merely running the new binary.
+
+**`retain_sets` defaults to `1`.** Absent from both `node.toml`'s
+`[settings]` (genesis) and a `uc2ctl settings apply` TOML file, it means
+`1` — today's newest-only retention, unchanged from before this flag day.
+Set it with [`uc2ctl settings apply`](../reference/uc2ctl.md#settings-apply)
+to keep more than one agreed set; `0` and anything above `56` are refused at
+the door with `47 settings_bounds`. See
+[Configuration § `[settings]`](../reference/configuration.md#settings) and
+[How to keep the journal from growing without bound § Choose a slack and
+turn purging on](bound-journal-growth.md#choose-a-slack-and-turn-purging-on).
+
 ## Where to go next
 
 - [Configuration: Admin authentication](../reference/configuration.md#admin-authentication)
