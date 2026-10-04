@@ -703,17 +703,15 @@ def build_Uc2StandbySnapshotStalled():
 
 
 def build_Uc2SnapshotSetDiverged():
-    # Coordinated-snapshot spec §9: the same two-instance count_values shape
-    # as build_Uc2ScheduleTableDiverged, verbatim, over
-    # uc2_snapshot_set_position instead of uc2_schedule_table_position — the
-    # outer count(...) has no `by`, so it strips every label:
-    # labels_from=None, same as build_Uc2ScheduleTableDiverged's.
+    # Snapshot-catalog spec §9: RE-SOURCED off max(uc2_catalog_diverged) > 0
+    # — a simple single-series LEVEL rule now, not the two-instance
+    # count_values shape this used to need. uc2_catalog_diverged is already
+    # unlabeled (a bare node-agnostic gauge), and the outer max(...) has no
+    # `by` either way, so labels_from=None.
     rows = load_scenario("snapshot_set_diverged")
-    row_a = select(rows, "uc2_snapshot_set_position", {"instance": "n0"})
-    row_b = select(rows, "uc2_snapshot_set_position", {"instance": "n1"})
+    row = select(rows, "uc2_catalog_diverged", {})
     r = new_rule("warning", labels_from=None)
-    add_hold_last(r, row_a, "uc2_snapshot_set_position", 60)
-    add_hold_last(r, row_b, "uc2_snapshot_set_position", 60)
+    add_hold_last(r, row, "uc2_catalog_diverged", 60)
     r["eval_time"] = total_for(60)[0]
     return r
 

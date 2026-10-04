@@ -345,19 +345,20 @@ groups:
     labels: { severity: warning }
     annotations: { summary: "{{ $labels.instance }} is a standby learner that has acted on snapshot instants at least twice in 30m with no complete set landing — one of ITS rows is silently stopping the standby set; run `uc2ctl snapshot show` on this learner and look for the row whose snapshot_pos is behind" }
   - alert: Uc2SnapshotSetDiverged
-    # Coordinated-snapshot spec §5.3/§9: the newest COMPLETE set's position
-    # must agree cluster-wide once every node is caught up — it is the
-    # node's purge floor once persisted, so two nodes disagreeing means one
-    # has pruned (or will prune) a different prefix than the other. Same
-    # count_values idiom as Uc2ScheduleTableDiverged, verbatim, over
-    # uc2_snapshot_set_position instead of uc2_schedule_table_position:
-    # promote the sample's own value into a label, then count how many
-    # distinct ones exist across scraped instances. More than one is
-    # divergence.
-    expr: count(count_values("p", uc2_snapshot_set_position)) > 1
+    # Snapshot-catalog spec §9: RE-SOURCED off the catalog's own verdict.
+    # This used to compare per-node uc2_snapshot_set_position values
+    # (count_values(...) > 1, the Uc2ScheduleTableDiverged idiom), which is a
+    # FALSE ALARM on a learner-only cluster — a voter that never fetches
+    # legitimately reads a lower set position than a learner that does, with
+    # nothing wrong. uc2_catalog_diverged is sound instead: it is the
+    # replicated catalog's own count of row entries whose reported hashes did
+    # NOT agree across the nodes that reported them, identical cluster-wide
+    # once caught up, so a single node's reading already answers the
+    # question — no count_values, no quorum of scrapes to agree.
+    expr: max(uc2_catalog_diverged) > 0
     for: 60s
     labels: { severity: warning }
-    annotations: { summary: "nodes disagree on the newest COMPLETE snapshot set's position — one node's purge floor is at a different point than another's; a node behind is either still catching up (transient) or stuck (check uc2_snapshot_row_incomplete_total and uc2ctl snapshot show on it)" }
+    annotations: { summary: "a listed snapshot set's row hashes did not agree across the nodes that reported it — a real divergence, not a catching-up node; run `uc2ctl upgrade show` for the per-node hash matrix and start with the row(s) it names" }
   - alert: Uc2SnapshotHashDiverged
     # FSM upgrade lifecycle spec §6.5.2: every instance of a row applied the
     # same log from the same origin, so their artifacts at one instant must

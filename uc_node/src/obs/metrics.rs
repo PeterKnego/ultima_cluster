@@ -84,6 +84,12 @@ pub const CONTRACT_SERIES: &[&str] = &[
     "uc2_snapshot_standby_instant_position",
     "uc2_snapshot_set_position",
     "uc2_snapshot_fetched_position",
+    // Snapshot-catalog spec §9: the replicated catalog's own gauges.
+    "uc2_catalog_sets",
+    "uc2_catalog_agreed_position",
+    "uc2_catalog_empty",
+    "uc2_catalog_stalled",
+    "uc2_catalog_diverged",
     // Plan 2 (spec §6): the replicated schedule table.
     "uc2_schedule_table_position",
     // Cluster FSM (spec §9): the cluster row's own two positions.
@@ -875,7 +881,7 @@ fn push_service_families(out: &mut String, s: &ObsSources, commit: u64, now: u64
     push_gauge(
         out,
         "uc2_snapshot_set_position",
-        "The position of the newest COMPLETE snapshot set this node holds, 0 until the first one; must agree cluster-wide once caught up (coordinated-snapshot spec §5.3/§9). Alerts: Uc2SnapshotStalled, Uc2SnapshotSetDiverged.",
+        "The position of the newest COMPLETE snapshot set this node holds, 0 until the first one (coordinated-snapshot spec §5.3/§9). Agrees on a fully-fetched cluster; on a learner-only cluster voters legitimately read lower (they never fetch) — the cluster floor is uc2_catalog_agreed_position (catalog spec §9). Alert: Uc2SnapshotStalled.",
         s.snapshot_set_position.load(Ordering::Acquire),
     );
     push_gauge(
@@ -883,6 +889,43 @@ fn push_service_families(out: &mut String, s: &ObsSources, commit: u64, now: u64
         "uc2_snapshot_fetched_position",
         "The newest set this node FETCHED whole from a learner (coordinated-snapshot spec §5.7 item 4), 0 if it never has.",
         s.snapshot_fetched_position.load(Ordering::Acquire),
+    );
+    // Snapshot-catalog spec §9: the replicated catalog's own gauges, read
+    // straight off the ClusterView atomics at scrape time (one Acquire load
+    // each, no lock) — the same seam as uc2_cluster_fsm_position above.
+    let catalog_agreed_position = s
+        .cluster_view
+        .catalog_agreed_position
+        .load(Ordering::Acquire);
+    push_gauge(
+        out,
+        "uc2_catalog_sets",
+        "How many sets the replicated snapshot catalog lists, any state (catalog spec §9); identical cluster-wide once every node is caught up.",
+        s.cluster_view.catalog_len.load(Ordering::Acquire),
+    );
+    push_gauge(
+        out,
+        "uc2_catalog_agreed_position",
+        "The cluster floor: the newest AGREED set's position, 0 while the catalog is Empty (catalog spec §4.5/§9) — the flag-day window before any set has agreed. Unlike uc2_snapshot_set_position this is sound on a learner-only cluster: a voter that has never fetched still reads the agreed floor here.",
+        catalog_agreed_position,
+    );
+    push_gauge(
+        out,
+        "uc2_catalog_empty",
+        "1 while no set has agreed yet (uc2_catalog_agreed_position == 0, catalog spec §4.5/§9), else 0 — a derived convenience so an alert does not have to spell out the == 0 case itself.",
+        u64::from(catalog_agreed_position == 0),
+    );
+    push_gauge(
+        out,
+        "uc2_catalog_stalled",
+        "Listed sets still Commanded — not yet complete (catalog spec §9). No timeout is baked in here; the stalled() query's judgement decides what counts as stuck.",
+        s.cluster_view.catalog_stalled.load(Ordering::Acquire),
+    );
+    push_gauge(
+        out,
+        "uc2_catalog_diverged",
+        "Row entries reading Diverged or NoMajority, summed across every listed set (catalog spec §9). Alert: Uc2SnapshotSetDiverged.",
+        s.cluster_view.catalog_diverged.load(Ordering::Acquire),
     );
     push_gauge(
         out,
@@ -1820,6 +1863,66 @@ mod tests {
         );
     }
 
+    /// Snapshot-catalog spec §9: before any set has ever agreed the catalog
+    /// is `Empty` — the flag-day window — and every gauge reads the vacuous
+    /// case: no sets listed, no agreed floor, nothing stalled or diverged,
+    /// and `uc2_catalog_empty` says so explicitly rather than leaving a
+    /// reader to infer it from `uc2_catalog_agreed_position == 0`.
+    #[test]
+    fn the_catalog_gauges_read_empty_before_any_set_agrees() {
+        let text = render_prometheus(&synthetic_sources());
+        assert!(text.contains("\nuc2_catalog_sets 0\n"), "{text}");
+        assert!(text.contains("\nuc2_catalog_agreed_position 0\n"), "{text}");
+        assert!(text.contains("\nuc2_catalog_empty 1\n"), "{text}");
+        assert!(text.contains("\nuc2_catalog_stalled 0\n"), "{text}");
+        assert!(text.contains("\nuc2_catalog_diverged 0\n"), "{text}");
+    }
+
+    /// A populated catalog: one AGREED set (2048), one COMPLETE set with a
+    /// diverged row (4096, so not agreed), one still-COMMANDED set (8192).
+    /// `uc2_catalog_agreed_position` must read the newest AGREED set's
+    /// position (2048), not the newest LISTED one (8192) — the distinction
+    /// the catalog spec's `Empty`/agreed-floor split exists to make.
+    #[test]
+    fn the_catalog_gauges_render_from_a_populated_catalog() {
+        use uc_protocol::v2::catalog::{RowVerdict, SetEntry, SetKind, SetState};
+
+        let mut agreed = SetEntry::commanded(2048, SetKind::Full, 0);
+        agreed.state = SetState::Complete;
+        agreed.cluster.verdict = RowVerdict::Agreed;
+        agreed.rows[0].verdict = RowVerdict::Agreed;
+
+        let mut diverged = SetEntry::commanded(4096, SetKind::Full, 0);
+        diverged.state = SetState::Complete;
+        diverged.cluster.verdict = RowVerdict::Agreed;
+        diverged.rows[1].verdict = RowVerdict::Diverged;
+
+        let stalled = SetEntry::commanded(8192, SetKind::Full, 0);
+
+        let st = crate::cluster_fsm::ClusterState {
+            catalog: vec![agreed, diverged, stalled],
+            ..crate::cluster_fsm::ClusterState::genesis_empty()
+        };
+        let mut s = synthetic_sources();
+        s.cluster_view = Arc::new(crate::cluster_fsm::ClusterView::new(&st));
+
+        let text = render_prometheus(&s);
+        assert!(text.contains("\nuc2_catalog_sets 3\n"), "{text}");
+        assert!(
+            text.contains("\nuc2_catalog_agreed_position 2048\n"),
+            "must read the newest AGREED set, not the newest listed one: {text}"
+        );
+        assert!(text.contains("\nuc2_catalog_empty 0\n"), "{text}");
+        assert!(
+            text.contains("\nuc2_catalog_stalled 1\n"),
+            "exactly one Commanded entry: {text}"
+        );
+        assert!(
+            text.contains("\nuc2_catalog_diverged 1\n"),
+            "exactly one Diverged row across the listed sets: {text}"
+        );
+    }
+
     #[test]
     fn log_clock_smear_gauge_renders_the_published_value() {
         let s = synthetic_sources();
@@ -1917,7 +2020,7 @@ mod tests {
     fn the_contract_has_the_number_of_families_the_docs_state() {
         assert_eq!(
             CONTRACT_SERIES.len(),
-            116,
+            121,
             "if this is intentional, update the family count in \
              docs/how-to/monitor-a-cluster.md in the same commit"
         );

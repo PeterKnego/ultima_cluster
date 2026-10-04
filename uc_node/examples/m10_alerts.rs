@@ -1886,33 +1886,45 @@ fn scenario_standby_snapshot_stalled() -> (SeriesFile, Disclosure) {
 
 // ----------------------------------------------------------- scenario 20
 
-/// Uc2SnapshotSetDiverged — **synthetic, disclosed**: the same two-instance
-/// `count_values` shape as `scenario_schedule_diverged` — two synthetic
-/// `ObsSources` ("n0" holding a complete set at a real position, "n1" still
-/// at 0, the fresh-node/never-completed reading), each its own real
-/// exporter. Producing it for real needs a multi-node cluster with one
-/// node's completeness poll genuinely stuck, an order of magnitude larger
-/// than this rule's share of the harness; same synthetic-state/real-
-/// transition budget as `schedule_diverged`.
+/// Uc2SnapshotSetDiverged — **synthetic, disclosed**. Snapshot-catalog spec
+/// §9 re-sourced this rule off the replicated catalog's own verdict
+/// (`max(uc2_catalog_diverged) > 0`) instead of comparing per-node
+/// `uc2_snapshot_set_position` values — the old count_values shape was a
+/// false alarm on a learner-only cluster. One synthetic `ObsSources` whose
+/// cluster view holds a COMPLETE catalog set with one row's verdict
+/// `Diverged` — the `scenario_snapshot_hash_diverged` shape, over the
+/// catalog instead of a bare `SnapshotReport`. Producing it for real needs
+/// a multi-node cluster where two nodes' row artifacts genuinely hash
+/// differently at the same instant, an order of magnitude larger than this
+/// rule's share of the harness; same synthetic-state/real-transition budget
+/// as `schedule_diverged`/`snapshot_hash_diverged`.
 fn scenario_snapshot_set_diverged() -> (SeriesFile, Disclosure) {
-    let src_a = synthetic_sources(0);
-    let src_b = synthetic_sources(1);
-    // n0 holds a complete set at 8192; n1 has never completed one (0).
-    src_a.snapshot_set_position.store(8192, Ordering::Release);
+    let src = synthetic_sources(0);
+    // One COMPLETE set at 8192 whose cluster artifact agreed but row 0 did
+    // not — `uc2_catalog_diverged` counts row entries, the cluster's own
+    // included, reading Diverged or NoMajority across every listed set.
+    let mut st = src.cluster_view.to_state();
+    let mut set = uc_protocol::v2::catalog::SetEntry::commanded(
+        8192,
+        uc_protocol::v2::catalog::SetKind::Full,
+        0,
+    );
+    set.state = uc_protocol::v2::catalog::SetState::Complete;
+    set.cluster.verdict = uc_protocol::v2::catalog::RowVerdict::Agreed;
+    set.rows[0].verdict = uc_protocol::v2::catalog::RowVerdict::Diverged;
+    st.catalog.push(set);
+    st.applied = 8192;
+    src.cluster_view.publish(&st);
 
-    let srv_a = ObsServer::serve(src_a.clone(), "127.0.0.1:0".parse().unwrap()).expect("bind");
-    let srv_b = ObsServer::serve(src_b.clone(), "127.0.0.1:0".parse().unwrap()).expect("bind");
-    let addr_a = srv_a.local_addr();
-    let addr_b = srv_b.local_addr();
+    let srv = ObsServer::serve(src.clone(), "127.0.0.1:0".parse().unwrap()).expect("bind");
+    let addr = srv.local_addr();
 
     let mut sf = SeriesFile::new();
     for _ in 0..3 {
-        sf.record_round("n0", &scrape(addr_a), &["uc2_snapshot_set_position"]);
-        sf.record_round("n1", &scrape(addr_b), &["uc2_snapshot_set_position"]);
+        sf.record_round("n0", &scrape(addr), &["uc2_catalog_diverged"]);
         thread::sleep(Duration::from_millis(200));
     }
-    srv_a.stop();
-    srv_b.stop();
+    srv.stop();
 
     (
         sf,
@@ -1920,12 +1932,12 @@ fn scenario_snapshot_set_diverged() -> (SeriesFile, Disclosure) {
             scenario: "snapshot_set_diverged",
             rules: &["Uc2SnapshotSetDiverged"],
             state: "synthetic",
-            method: "two synthetic ObsSources, each its own real exporter: \"n0\" holds a \
-                     complete set (uc2_snapshot_set_position 8192) and \"n1\" has never \
-                     completed one (0) — a node that has not caught up to the newest complete \
-                     set. Both positions render through the real encoder; two DISTINCT values \
-                     across instances is exactly what Uc2SnapshotSetDiverged's count_values \
-                     idiom detects."
+            method: "one synthetic ObsSources whose cluster view holds a COMPLETE catalog set \
+                     at position 8192 with the cluster artifact Agreed but row 0's verdict \
+                     Diverged; the exporter recomputes uc2_catalog_diverged at scrape and \
+                     renders 1 through the real encoder — Uc2SnapshotSetDiverged's \
+                     max(uc2_catalog_diverged) > 0 predicate, with no per-node comparison \
+                     needed now that the catalog carries one node-agnostic verdict."
                 .into(),
         },
     )

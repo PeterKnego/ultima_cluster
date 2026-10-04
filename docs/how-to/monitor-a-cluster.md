@@ -67,7 +67,7 @@ scrape_configs:
 ```
 
 `/metrics` serves `text/plain; version=0.0.4` — standard Prometheus text
-exposition. The full series contract — 116 families — is the
+exposition. The full series contract — 121 families — is the
 `CONTRACT_SERIES` array in
 [`uc_node/src/obs/metrics.rs`](../../uc_node/src/obs/metrics.rs); a test
 pins every family in that array against what the renderer actually emits, so
@@ -412,18 +412,25 @@ Since coordinated snapshot instants, a snapshot is something the whole cluster
 takes at one log position **P** on the leader's command
 ([the explainer](../notes/uc2-cluster-fsm-explained.md#instants-one-position-one-set)),
 and the purge floor moves only when the **complete set** at P is on disk.
-Eight families:
+Thirteen families — the first eight are the coordinated-snapshot gauges and
+counters; the last five, added with the snapshot catalog (spec §9), are the
+replicated catalog's own view of that same set list:
 
 | family | type | labels | meaning |
 |---|---|---|---|
 | `uc2_snapshot_instant_position` | gauge | none | the last **full** instant this node **commanded as leader**, `0` if never. Leader-local: a follower's reading is whatever it last commanded in some earlier term, so never compare it across instances. A `--standby` instant does **not** advance it — see the next row |
 | `uc2_snapshot_standby_instant_position` | gauge | none | the last **standby** instant this node's `uc2-cluster` agent *acted on*, `0` if never. **Learner-only**: a voter skips every standby frame by design, so a voter always reads `0`. This is the gauge to watch on a `snapshot.target = learners` cluster — the leader is a voter, so its own instant gauge and set position tell you nothing about whether the standby work is happening |
-| `uc2_snapshot_set_position` | gauge | none | the newest **complete set** this node holds — its purge floor once persisted. `0` until the first one. **Must agree cluster-wide once caught up** |
+| `uc2_snapshot_set_position` | gauge | none | the newest **complete set** this node holds — its purge floor once persisted. `0` until the first one. Agrees on a fully-fetched cluster; on a **learner-only** cluster voters legitimately read lower (they never fetch), so this is not the cluster-wide floor to alert on — that is `uc2_catalog_agreed_position`, below |
 | `uc2_snapshot_fetched_position` | gauge | none | the newest set this node pulled whole from a learner with `uc2ctl snapshot fetch`, `0` if it never has. The standby return path's progress reading |
 | `uc2_snapshot_row_incomplete_total` | counter | `service`, `row` | instants this row **owed a freeze for** and failed to reach before the next one superseded it. The row whose counter climbs is the row stopping all purging. A superseded standby instant on a voter is not counted — that row is *supposed* not to freeze for one |
 | `uc2_snapshot_freeze_seconds_max` | gauge | `service`, `row` | the longest `freeze()` this row has reported since the instant its node's rows are working on last advanced — the full one on a voter, the standby one on a learner; reset to `0` on the scrape after that moves |
 | `uc2_snapshot_freeze_seconds_sum` | counter | `service`, `row` | cumulative `freeze()` seconds for this row |
 | `uc2_snapshot_freeze_seconds_count` | counter | `service`, `row` | DISTINCT freeze durations sampled from this row's cnc word at scrape boundaries — a **lower bound** on freezes, not a count of them (see below) |
+| `uc2_catalog_sets` | gauge | none | how many sets the replicated catalog lists, any state, identical cluster-wide once caught up (catalog spec §9) |
+| `uc2_catalog_agreed_position` | gauge | none | the **cluster floor**: the newest set the catalog has marked AGREED, `0` while the catalog is `Empty` (the flag-day window before the first set agrees). This is the cluster-wide reading `uc2_snapshot_set_position` cannot be on a learner-only cluster |
+| `uc2_catalog_empty` | gauge | none | `1` while no set has agreed yet (`uc2_catalog_agreed_position == 0`), else `0` — a derived convenience so an alert does not have to spell out the `== 0` case itself |
+| `uc2_catalog_stalled` | gauge | none | listed sets still `Commanded` — not yet complete. No timeout is baked in here; a persistent nonzero reading is the signal, the same shape as `Uc2SnapshotStalled` |
+| `uc2_catalog_diverged` | gauge | none | row entries reading `Diverged` or `NoMajority`, summed across every listed set. Nonzero means some row's artifact hashes did not agree. Alert: `Uc2SnapshotSetDiverged`, re-sourced to this gauge — see below |
 
 The last three are a **stand-in for a histogram**: this exposition encoder has
 no histogram type, so a max gauge plus a sum/count pair carries the
@@ -482,14 +489,16 @@ learner's* rows is not reaching P; the remedy is the same
 shows up as `Uc2ReplicationStalled`/`Uc2PeerLagging` on that node.
 
 `Uc2SnapshotSetDiverged` (warning, `for: 60s`):
-`count(count_values("p", uc2_snapshot_set_position)) > 1` — the
-`Uc2ScheduleTableDiverged` idiom verbatim, over the set position. The newest
-complete set's position must agree cluster-wide once every node is caught up,
-because it *is* the node's purge floor: two nodes disagreeing means one has
-pruned (or will prune) a different prefix than the other. A node behind is
-either still catching up (transient) or stuck — and on a cluster taking
-`--standby` instants it is also the reading that tells you a voter has not run
-`uc2ctl snapshot fetch` yet.
+`max(uc2_catalog_diverged) > 0`. **Re-sourced with the snapshot catalog** —
+it used to compare per-node `uc2_snapshot_set_position` values
+(`count(count_values(...)) > 1`), which is a **false alarm** on a
+learner-only cluster: voters legitimately read a lower set position than a
+learner that fetches, with nothing wrong. The catalog's own verdict is the
+sound signal instead: a listed set's row hashes did not agree across the
+nodes that reported it, which is a real divergence regardless of who has
+fetched what. Firing means some row's artifact hashes disagree; run
+`uc2ctl upgrade show` for the per-node hash matrix and start with the row(s)
+it names.
 
 **Snapshot-session refusals.** Five named counters drop a session outright and
 leave the joiner NAKing rather than installing a wrong or half set —
@@ -625,7 +634,7 @@ table:
 | `Uc2RowVersionMismatch` (row running version, #33) | a live (heartbeat < 10 s) attached service on this node is off its row's committed running line (`uc2_row_running_version`), for 1m — a stop that did not happen; a stopped service's slot awaiting the new build does not fire | critical |
 | `Uc2SnapshotStalled` (coordinated snapshots, 2.11.0) | this node has commanded **full** snapshot instants at least twice in 30m with no complete set landing — one FSM is silently stopping all purging | warning |
 | `Uc2StandbySnapshotStalled` (coordinated snapshots, 2.11.0) | this **learner** has acted on standby snapshot instants at least twice in 30m with no complete set landing — one of its rows is silently stopping the standby set. Cannot fire on a voter (a voter exports `uc2_snapshot_standby_instant_position = 0`) | warning |
-| `Uc2SnapshotSetDiverged` (coordinated snapshots, 2.11.0) | nodes disagree on the newest complete snapshot set's position, i.e. on their purge floors, for 60s | warning |
+| `Uc2SnapshotSetDiverged` (snapshot catalog) | a listed set's row hashes did not agree across the nodes that reported it (`uc2_catalog_diverged > 0`), for 60s — run `uc2ctl upgrade show` for the per-node matrix | warning |
 | `Uc2SnapshotHashDiverged` (FSM upgrade lifecycle, 2.13.0) | a node's artifact hash for a row's newest reported instant differs from the majority's, for 60s | critical |
 | `Uc2MtuDiscoveryStalled` (jumbo frames, 2.12.0) | this node has proven a larger datagram path than the cluster has committed, for 60s — some *other* member is holding discovery back, silent or narrower. Read `uc2_probe_min_mtu_bytes` on every node | warning |
 | `Uc2PathBelowMtu` (jumbo frames, 2.12.0) | the kernel refused a non-probe datagram for size in the last 5m: a path degraded below the committed rung (or below the 1408 B baseline). The rung is monotone and cannot be lowered — fix the path | critical |
