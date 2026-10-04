@@ -29,6 +29,11 @@ pub use super::upgrade::{CLUSTER_ROW, is_report_row};
 /// datagram ceiling, since the list rides the cluster image, never a
 /// `CLUSTER` frame.
 pub const MAX_CATALOG_SETS: usize = 64;
+/// The largest `retain_sets` the cluster FSM's door accepts (ruling R8):
+/// `MAX_CATALOG_SETS` less eight entries of headroom, so a full complement
+/// of retained agreed sets still leaves room for commanded instants (and
+/// the pinned origins retention must keep) under the image's list bound.
+pub const MAX_RETAIN_SETS: u16 = (MAX_CATALOG_SETS - 8) as u16;
 /// `version u32 ‖ hash u64 ‖ verdict u8`.
 pub const ROW_ENTRY_LEN: usize = 4 + 8 + 1; // 13
 /// `position u64 ‖ kind u8 ‖ state u8 ‖ time_ns u64 ‖ rows[0..CNC_MAX_SERVICES]
@@ -112,14 +117,21 @@ impl SetEntry {
         }
     }
 
-    /// Every DECLARED row (bit `r` of `declared`) and `cluster` are
-    /// `Agreed` — an undeclared row's verdict (bit clear) is never
-    /// consulted, so a cluster with fewer than `CNC_MAX_SERVICES` rows
-    /// declared is not held to an answer about rows it never asked.
-    pub fn is_agreed(&self, declared: u64) -> bool {
-        self.cluster.verdict == RowVerdict::Agreed
-            && (0..CNC_MAX_SERVICES)
-                .all(|r| declared & (1 << r) == 0 || self.rows[r].verdict == RowVerdict::Agreed)
+    /// Agreement is FROZEN at completion (ruling R9): a `Complete` entry
+    /// whose cluster artifact and every REPORTED row are `Agreed`. Which
+    /// rows a set had to cover is judged once, when the entry turns
+    /// `Complete` (against the declared rows at that report); a row
+    /// declared LATER is `Unreported` in the entry and does not un-agree
+    /// it — otherwise adding a row would retroactively empty the catalog
+    /// and let retention drop a pinned origin. A `Commanded` entry is never
+    /// agreed.
+    pub fn is_agreed(&self) -> bool {
+        self.state == SetState::Complete
+            && self.cluster.verdict == RowVerdict::Agreed
+            && self
+                .rows
+                .iter()
+                .all(|r| matches!(r.verdict, RowVerdict::Unreported | RowVerdict::Agreed))
     }
 }
 
@@ -277,7 +289,7 @@ mod tests {
     }
 
     #[test]
-    fn is_agreed_needs_every_declared_row_and_the_cluster() {
+    fn a_complete_entry_is_agreed_iff_its_cluster_and_every_reported_row_agree() {
         let mut e = SetEntry::commanded(1, SetKind::Full, 0);
         let ok = RowEntry {
             version: 1,
@@ -286,11 +298,24 @@ mod tests {
         };
         e.rows[0] = ok;
         e.rows[1] = ok;
-        assert!(!e.is_agreed(0b11), "cluster unreported");
         e.cluster = ok;
-        assert!(e.is_agreed(0b11));
-        assert!(!e.is_agreed(0b111), "row 2 unreported");
+        assert!(!e.is_agreed(), "a Commanded entry is never agreed");
+        e.state = SetState::Complete;
+        assert!(e.is_agreed());
+        assert_eq!(e.rows[2].verdict, RowVerdict::Unreported);
+        assert!(e.is_agreed(), "an Unreported row does not un-agree it");
+        e.cluster.verdict = RowVerdict::Unreported;
+        assert!(!e.is_agreed(), "the cluster artifact must agree");
+        e.cluster = ok;
         e.rows[1].verdict = RowVerdict::Diverged;
-        assert!(!e.is_agreed(0b11));
+        assert!(!e.is_agreed());
+        e.rows[1].verdict = RowVerdict::NoMajority;
+        assert!(!e.is_agreed());
+    }
+
+    #[test]
+    fn max_retain_sets_leaves_eight_entries_of_headroom() {
+        assert_eq!(MAX_RETAIN_SETS, 56);
+        assert_eq!(MAX_RETAIN_SETS as usize + 8, MAX_CATALOG_SETS);
     }
 }

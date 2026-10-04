@@ -14,8 +14,8 @@ use std::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering};
 
 use uc_consensus::config::{ClusterConfig, ProposeError};
 use uc_protocol::v2::catalog::{
-    CLUSTER_ROW, MAX_CATALOG_SETS, RowEntry, RowVerdict, SetEntry, SetKind, SetState,
-    decode_set_list, encode_set_list,
+    CLUSTER_ROW, MAX_CATALOG_SETS, MAX_RETAIN_SETS, RowEntry, RowVerdict, SetEntry, SetKind,
+    SetState, decode_set_list, encode_set_list,
 };
 use uc_protocol::v2::cluster_image::{
     ClusterImageParts, decode_cluster_image, encode_cluster_image,
@@ -239,9 +239,11 @@ impl ClusterState {
     /// Catalog spec §4.2: set `rows[r.row]` (or `cluster`) on the entry at
     /// `r.position` from today's `verdict()`. A report whose position has no
     /// entry (it was retired, or never commanded on this log) and a report
-    /// for an UNDECLARED row are ignored. When every declared row and the
-    /// cluster artifact are reported the entry becomes `Complete`; when it
-    /// is then agreed, retention runs (§4.4).
+    /// for an UNDECLARED row are ignored. When every row declared AT THIS
+    /// REPORT and the cluster artifact are reported the entry becomes
+    /// `Complete` — the one place the live [`Self::declared_mask`] is
+    /// consulted; agreement is then frozen in the entry (ruling R9,
+    /// [`SetEntry::is_agreed`]). When it is agreed, retention runs (§4.4).
     fn fold_into_catalog(&mut self, r: &SnapshotReport) {
         let v = uc_protocol::v2::upgrade::verdict(r);
         let verdict = if v.agreed {
@@ -273,7 +275,7 @@ impl ClusterState {
         if complete && e.state == SetState::Commanded {
             e.state = SetState::Complete;
         }
-        if e.is_agreed(declared) {
+        if e.is_agreed() {
             self.retire();
         }
     }
@@ -308,8 +310,9 @@ impl ClusterState {
     }
 
     /// Catalog spec §4.4: how many AGREED sets the cluster keeps. A `0`
-    /// (unset — it can only arrive through an installed v1–v3 image, since
-    /// the door refuses it) reads as `1`, today's newest-only retention.
+    /// (unset — it can only reach the state through an installed v1–v3
+    /// image: the door refuses it, and apply normalises a replayed one to
+    /// the current value) reads as `1`, today's newest-only retention.
     pub fn retain_sets(&self) -> u16 {
         self.settings.retain_sets.max(1)
     }
@@ -345,22 +348,27 @@ impl ClusterState {
         self.cap_catalog();
     }
 
-    /// Catalog spec §4.4 (as amended, ruling R3). Let `A` be the agreed
-    /// entries in position order. A removal candidate is an agreed entry
-    /// that is neither a pinned origin (any row's newest pin) nor the newest
-    /// agreed set. While `|A| > retain_sets()`, remove the oldest candidate;
-    /// stop when none remains. Then drop every entry (any state) older than
-    /// the oldest remaining agreed set. The newest agreed set is never
-    /// removed — it is the cluster floor.
-    fn retire(&mut self) {
-        let declared = self.declared_mask();
-        let pinned: Vec<u64> = (0..CNC_MAX_SERVICES as u8)
+    /// Every row's newest pin origin — the sets retention must keep (D5).
+    fn pinned_origins(&self) -> Vec<u64> {
+        (0..CNC_MAX_SERVICES as u8)
             .filter_map(|row| self.pin_for(row).map(|p| p.origin))
-            .collect();
+            .collect()
+    }
+
+    /// Catalog spec §4.4 (as amended, rulings R3 and R9). Let `A` be the
+    /// agreed entries in position order. A removal candidate is an agreed
+    /// entry that is neither a pinned origin (any row's newest pin) nor the
+    /// newest agreed set. While `|A| > retain_sets()`, remove the oldest
+    /// candidate; stop when none remains. Then drop every entry (any state)
+    /// older than the oldest remaining agreed set — except a pinned origin,
+    /// which is never dropped here (belt-and-braces for D5). The newest
+    /// agreed set is never removed — it is the cluster floor.
+    fn retire(&mut self) {
+        let pinned = self.pinned_origins();
         let retain = self.retain_sets() as usize;
         loop {
             let agreed: Vec<usize> = (0..self.catalog.len())
-                .filter(|&i| self.catalog[i].is_agreed(declared))
+                .filter(|&i| self.catalog[i].is_agreed())
                 .collect();
             if agreed.len() <= retain {
                 break;
@@ -377,23 +385,36 @@ impl ClusterState {
         if let Some(floor) = self
             .catalog
             .iter()
-            .find(|e| e.is_agreed(declared))
+            .find(|e| e.is_agreed())
             .map(|e| e.position)
         {
-            self.catalog.retain(|e| e.position >= floor);
+            self.catalog
+                .retain(|e| e.position >= floor || pinned.contains(&e.position));
         }
     }
 
-    /// Bound the list at [`MAX_CATALOG_SETS`] (the image's set-list limit)
-    /// by dropping the oldest NON-agreed entries, so a storm of stalled
-    /// instants cannot grow the image without bound. Agreed entries never
-    /// exceed the bound on their own: [`Self::retire`] holds them to
-    /// `max(retain_sets, pinned origins + 1)`, both at most
-    /// `MAX_CATALOG_SETS`.
+    /// Bound the list at [`MAX_CATALOG_SETS`] (the image's set-list limit),
+    /// ruling R8. The NEWEST entry by position (the instant just commanded)
+    /// is never evicted — evicting it would drop every later instant on
+    /// arrival and freeze the floor. Evict the oldest non-agreed entry
+    /// first; if the list is still over, the oldest agreed entry that is
+    /// neither a pinned origin nor the newest agreed set. With
+    /// `retain_sets <= MAX_RETAIN_SETS` the second step is a backstop that
+    /// [`Self::retire`] normally makes unreachable.
     fn cap_catalog(&mut self) {
-        let declared = self.declared_mask();
+        let pinned = self.pinned_origins();
         while self.catalog.len() > MAX_CATALOG_SETS {
-            let Some(i) = self.catalog.iter().position(|e| !e.is_agreed(declared)) else {
+            let last = self.catalog.len() - 1;
+            let newest_agreed = self.catalog.iter().rposition(|e| e.is_agreed());
+            let victim = self.catalog[..last]
+                .iter()
+                .position(|e| !e.is_agreed())
+                .or_else(|| {
+                    (0..last).find(|&i| {
+                        Some(i) != newest_agreed && !pinned.contains(&self.catalog[i].position)
+                    })
+                });
+            let Some(i) = victim else {
                 break;
             };
             self.catalog.remove(i);
@@ -402,11 +423,10 @@ impl ClusterState {
 
     /// The newest AGREED set at or below `at_most`, if any.
     pub fn newest_agreed_at_most(&self, at_most: u64) -> Option<u64> {
-        let declared = self.declared_mask();
         self.catalog
             .iter()
             .rev()
-            .find(|e| e.position <= at_most && e.is_agreed(declared))
+            .find(|e| e.position <= at_most && e.is_agreed())
             .map(|e| e.position)
     }
 
@@ -534,6 +554,15 @@ impl ClusterFsm {
     /// how much.
     pub fn validate(&self, cmd: &ClusterCommand) -> Result<(), ClusterRefusal> {
         self.validate_replicated(cmd)?;
+        // Ruling R10, the DOOR half: no operator may apply an unset `0`.
+        // `validate_replicated` accepts one — a pre-catalog record replayed
+        // from the journal decodes as `0` and must still apply (its other
+        // fields included) — and `apply` normalises it to the current value.
+        if let ClusterCommand::Settings(s) = cmd
+            && s.retain_sets == 0
+        {
+            return Err(ClusterRefusal::SettingsBounds("retain_sets"));
+        }
         // NODE-LOCAL, leader-only (Ruling R24). `declared_hashes` is this
         // host's `[services] names`; running it inside `apply` would let two
         // nodes with different lists reach opposite verdicts on the same
@@ -626,10 +655,13 @@ impl ClusterFsm {
                 {
                     return Err(ClusterRefusal::SettingsBounds("fsm_lag"));
                 }
-                // Catalog spec §4.4 / errata: `0` would retire the floor and
-                // above `MAX_CATALOG_SETS` the image cannot carry the list —
-                // both refused unconditionally (47). Genesis seeds `1`.
-                if !(1..=MAX_CATALOG_SETS as u16).contains(&s.retain_sets) {
+                // Rulings R8/R10: above `MAX_RETAIN_SETS` the image could not
+                // carry the list with headroom for commanded instants —
+                // refused (47). `0` is NOT refused here: it is a pre-catalog
+                // record replayed from the journal, normalised at apply to
+                // the current value; the leader's door (`validate`) refuses
+                // it from an operator.
+                if s.retain_sets > MAX_RETAIN_SETS {
                     return Err(ClusterRefusal::SettingsBounds("retain_sets"));
                 }
                 Ok(())
@@ -766,6 +798,12 @@ impl RawStateMachine for ClusterFsm {
                 // an operator record (absent keys = 0) cannot lower it, and
                 // every replica computes the same value.
                 let keep = self.state.settings.datagram_mtu.max(s.datagram_mtu);
+                // Ruling R10: a replayed pre-catalog record (`retain_sets =
+                // 0`) leaves retention as it is.
+                let mut s = s;
+                if s.retain_sets == 0 {
+                    s.retain_sets = self.state.settings.retain_sets;
+                }
                 self.state.settings = s;
                 self.state.settings.datagram_mtu = keep;
                 self.state.settings_position = ctx.position;
@@ -1134,13 +1172,9 @@ impl ClusterView {
             g.running = st.running;
             g.catalog.clone_from(&st.catalog);
         }
-        let mask = st
-            .running
-            .iter()
-            .enumerate()
-            .filter(|(_, r)| r.is_some())
-            .fold(0u8, |m, (i, _)| m | (1 << i));
-        self.versioned.store(mask, Ordering::Release);
+        // `CNC_MAX_SERVICES == 8` rows, so the mask fits a byte.
+        self.versioned
+            .store(st.declared_mask() as u8, Ordering::Release);
         self.settings_position
             .store(st.settings_position, Ordering::Release);
         self.admission_bytes
@@ -2397,13 +2431,23 @@ mod tests {
     #[test]
     fn retain_sets_zero_and_above_the_bound_are_refused_with_47() {
         let f = fsm();
-        for v in [0u16, (MAX_CATALOG_SETS + 1) as u16] {
-            assert_eq!(
-                f.validate_replicated(&settings_with_retain(&f, v)),
-                Err(ClusterRefusal::SettingsBounds("retain_sets")),
-                "retain_sets = {v}"
-            );
+        // `0`: refused at the leader's door, accepted by the replicated half
+        // (a replayed pre-catalog record must still apply — ruling R10).
+        let zero = settings_with_retain(&f, 0);
+        assert_eq!(
+            f.validate(&zero),
+            Err(ClusterRefusal::SettingsBounds("retain_sets"))
+        );
+        assert_eq!(f.validate_replicated(&zero), Ok(()));
+        // Above `MAX_RETAIN_SETS`: refused by both (ruling R8).
+        let over = settings_with_retain(&f, MAX_RETAIN_SETS + 1);
+        for r in [f.validate(&over), f.validate_replicated(&over)] {
+            assert_eq!(r, Err(ClusterRefusal::SettingsBounds("retain_sets")));
         }
+        assert_eq!(
+            f.validate(&settings_with_retain(&f, MAX_RETAIN_SETS)),
+            Ok(())
+        );
         assert_eq!(
             ClusterRefusal::SettingsBounds("retain_sets").reason_code(),
             47
@@ -2564,5 +2608,167 @@ mod tests {
         assert_eq!(*g.state(), before, "a refused install changes nothing");
         // Control: the unswapped image installs.
         assert_eq!(g.install_snapshot(3000, &mut &img[..]).unwrap(), 3000);
+    }
+
+    #[test]
+    fn retain_sets_at_the_bound_never_wedges_the_catalog() {
+        let mut f = fsm();
+        genesis_row(&mut f, 0, 100);
+        let cmd = settings_with_retain(&f, MAX_RETAIN_SETS);
+        assert_eq!(apply_at(&mut f, 200, &cmd), 0);
+        let n = MAX_RETAIN_SETS as u64;
+        for k in 1..=n {
+            agreed_set(&mut f, k * 1000, k * 1000 + 100);
+        }
+        assert_eq!(f.state().catalog.len(), MAX_RETAIN_SETS as usize);
+        assert_eq!(f.state().newest_agreed_at_most(u64::MAX), Some(n * 1000));
+        let next = (n + 1) * 1000;
+        agreed_set(&mut f, next, next + 100);
+        assert_eq!(
+            f.state().newest_agreed_at_most(u64::MAX),
+            Some(next),
+            "the next instant lands and the floor advances"
+        );
+        assert_eq!(f.state().catalog.len(), MAX_RETAIN_SETS as usize);
+        assert_eq!(f.state().catalog[0].position, 2000, "the oldest retired");
+    }
+
+    #[test]
+    fn the_cap_never_evicts_the_newest_entry() {
+        let mut f = fsm();
+        for k in 1..=(MAX_CATALOG_SETS as u64 + 1) {
+            f.on_snapshot_frame(k * 1000, false, k);
+        }
+        let p = positions(&f);
+        assert_eq!(p.len(), MAX_CATALOG_SETS);
+        assert_eq!(*p.last().unwrap(), (MAX_CATALOG_SETS as u64 + 1) * 1000);
+        assert_eq!(p[0], 2000, "the oldest commanded entry went");
+    }
+
+    #[test]
+    fn a_row_added_later_does_not_unagree_earlier_sets_or_drop_a_pinned_origin() {
+        let mut f = fsm();
+        genesis_row(&mut f, 0, 100);
+        let cmd = settings_with_retain(&f, 4);
+        assert_eq!(apply_at(&mut f, 200, &cmd), 0);
+        agreed_set(&mut f, 1000, 1100);
+        agreed_set(&mut f, 2000, 2100);
+        assert_eq!(
+            apply_at(
+                &mut f,
+                2300,
+                &pin(0, pack_version(1, 0, 0), pack_version(1, 1, 0), 1000)
+            ),
+            0
+        );
+        genesis_row(&mut f, 1, 2500);
+        assert!(
+            f.state().catalog.iter().all(|e| e.is_agreed()),
+            "agreement is frozen"
+        );
+        assert!(!f.state().catalog_empty());
+        assert_eq!(f.state().newest_agreed_at_most(u64::MAX), Some(2000));
+        // A set at 3000 must now cover rows 0 AND 1.
+        f.on_snapshot_frame(3000, false, 3);
+        assert_eq!(apply_at(&mut f, 3100, &report(0, 3000, &[(0, 1)])), 0);
+        assert_eq!(
+            apply_at(&mut f, 3110, &report(CLUSTER_ROW, 3000, &[(0, 1)])),
+            0
+        );
+        assert_eq!(
+            f.state().catalog.last().unwrap().state,
+            SetState::Commanded,
+            "row 1 unreported"
+        );
+        assert_eq!(apply_at(&mut f, 3120, &report(1, 3000, &[(0, 1)])), 0);
+        assert_eq!(f.state().newest_agreed_at_most(u64::MAX), Some(3000));
+        let cmd = settings_with_retain(&f, 1);
+        assert_eq!(apply_at(&mut f, 3200, &cmd), 0);
+        assert_eq!(
+            positions(&f),
+            vec![1000, 3000],
+            "pinned 1000 stays, 2000 goes"
+        );
+    }
+
+    #[test]
+    fn a_replayed_pre_catalog_settings_record_keeps_the_current_retention() {
+        let mut f = fsm();
+        let cmd = settings_with_retain(&f, 3);
+        assert_eq!(apply_at(&mut f, 100, &cmd), 0);
+        let mut old = f.state().settings;
+        old.retain_sets = 0;
+        old.admission_bytes = 12345;
+        assert_eq!(apply_at(&mut f, 200, &ClusterCommand::Settings(old)), 0);
+        assert_eq!(f.state().settings.admission_bytes, 12345);
+        assert_eq!(f.state().retain_sets(), 3);
+        assert_eq!(f.state().settings.retain_sets, 3);
+    }
+
+    #[test]
+    fn a_report_for_a_position_with_no_entry_is_ignored() {
+        let mut f = fsm();
+        genesis_row(&mut f, 0, 100);
+        f.on_snapshot_frame(4096, false, 1);
+        let before = f.state().catalog.clone();
+        assert_eq!(apply_at(&mut f, 4200, &report(0, 5000, &[(0, 7)])), 0);
+        assert_eq!(
+            apply_at(&mut f, 4300, &report(CLUSTER_ROW, 5000, &[(0, 7)])),
+            0
+        );
+        assert_eq!(f.state().catalog, before);
+        // The per-row diagnostic matrix still holds the row-0 report.
+        assert_eq!(f.state().report_for(0).map(|r| r.position), Some(5000));
+    }
+
+    #[test]
+    fn a_cluster_row_report_does_not_enter_the_per_row_reports() {
+        let mut f = fsm();
+        f.on_snapshot_frame(4096, false, 1);
+        assert_eq!(
+            apply_at(&mut f, 4200, &report(CLUSTER_ROW, 4096, &[(0, 9)])),
+            0
+        );
+        assert!(f.state().reports.is_empty());
+        assert_eq!(f.state().report_for(CLUSTER_ROW), None);
+        assert_eq!(f.state().catalog[0].cluster.verdict, RowVerdict::Agreed);
+    }
+
+    #[test]
+    fn a_standby_set_agrees_exactly_like_a_full_one() {
+        let mut f = fsm();
+        genesis_row(&mut f, 0, 100);
+        f.on_snapshot_frame(4096, true, 1);
+        assert_eq!(
+            apply_at(&mut f, 4200, &report(0, 4096, &[(3, 7), (4, 7)])),
+            0
+        );
+        assert_eq!(
+            apply_at(&mut f, 4300, &report(CLUSTER_ROW, 4096, &[(3, 9), (4, 9)])),
+            0
+        );
+        let e = &f.state().catalog[0];
+        assert_eq!((e.kind, e.state), (SetKind::Standby, SetState::Complete));
+        assert!(e.is_agreed());
+        assert_eq!(f.state().newest_agreed_at_most(u64::MAX), Some(4096));
+    }
+
+    #[test]
+    fn retention_removes_a_younger_unpinned_set_past_a_pinned_origin() {
+        let mut f = fsm();
+        genesis_row(&mut f, 0, 100);
+        agreed_set(&mut f, 1000, 1100);
+        assert_eq!(
+            apply_at(
+                &mut f,
+                1500,
+                &pin(0, pack_version(1, 0, 0), pack_version(1, 1, 0), 1000)
+            ),
+            0
+        );
+        agreed_set(&mut f, 2000, 2100);
+        assert_eq!(positions(&f), vec![1000, 2000], "2000 is the newest agreed");
+        agreed_set(&mut f, 3000, 3100);
+        assert_eq!(positions(&f), vec![1000, 3000]);
     }
 }

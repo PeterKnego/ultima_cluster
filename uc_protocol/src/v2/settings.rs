@@ -84,9 +84,10 @@ pub struct Settings {
     /// monotone (`max(committed, incoming)`).
     pub datagram_mtu: u32,
     /// Catalog spec §4.4: how many AGREED snapshot sets the cluster keeps.
-    /// `0` = unset (a v1/v2 record), read as `1` at use — today's
-    /// newest-only retention. `1..=MAX_CATALOG_SETS` otherwise; the FSM's
-    /// door refuses anything else (47).
+    /// `0` = unset (a v1/v2 record): a replayed one keeps the current
+    /// retention, and an installed v1–v3 image's reads as `1`.
+    /// `1..=MAX_RETAIN_SETS` (56) otherwise; the leader's door refuses `0`
+    /// and anything above (47), and apply refuses only the latter.
     pub retain_sets: u16,
 }
 
