@@ -208,6 +208,13 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "uc_protocol_status_body"
+path = "fuzz_targets/uc_protocol_status_body.rs"
+test = false
+doc = false
+bench = false
+
 # one [[bin]] per target.
 
 [workspace]

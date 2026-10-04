@@ -960,6 +960,11 @@ pub struct World {
     /// sweep has JUDGED over the run. A run whose count is 0 proved nothing —
     /// no node ever completed a set.
     stat_set_alignment_checks: u64,
+    /// inv13 non-vacuity: how many (node, node) pairs sharing an applied
+    /// frontier the catalog-determinism sweep has COMPARED over the run. A
+    /// run whose count is 0 proved nothing — no two nodes ever shared a
+    /// frontier with a SNAPSHOT frame below it.
+    stat_catalog_checks: u64,
 
     // ---- T13: crypto plane ----
     /// `HS_KEY` (kind 20) deliveries addressed to a given node index are
@@ -991,6 +996,10 @@ pub struct Stats {
     /// inv11 non-vacuity: (node, complete set) pairs the set-alignment sweep
     /// judged over the run (see `World::set_alignment_checks`).
     pub set_alignment_checks: u64,
+    /// inv13 non-vacuity: (node, node) pairs sharing an applied frontier the
+    /// catalog-determinism sweep compared over the run (see
+    /// `World::catalog_checks`).
+    pub catalog_checks: u64,
 }
 
 impl World {
@@ -1088,6 +1097,7 @@ impl World {
             stat_stale_vote_window: 0,
             stat_two_readers_checks: 0,
             stat_set_alignment_checks: 0,
+            stat_catalog_checks: 0,
             key_delivery_blocked_until: HashMap::new(),
             nodes,
             cfg,
@@ -1397,6 +1407,11 @@ impl World {
         if !self.snapshot_frames.is_empty() {
             self.complete_snapshot_sets();
             self.stat_set_alignment_checks += self.check_set_alignment(step)?;
+            // inv13 — the catalog (spec §10.3, as amended): each node's
+            // catalog must be a pure function of its own applied frontier.
+            // Same fast-exit precondition as inv11 (nothing to compare until
+            // some leader has commanded an instant).
+            self.stat_catalog_checks += self.check_catalog_determinism(step)?;
         }
         Ok(true)
     }
@@ -1411,6 +1426,7 @@ impl World {
             steps: self.steps,
             two_readers_checks: self.stat_two_readers_checks,
             set_alignment_checks: self.stat_set_alignment_checks,
+            catalog_checks: self.stat_catalog_checks,
         }
     }
 
@@ -2340,6 +2356,80 @@ impl World {
                 self.snapshot_claims.insert(end, (who, term));
             }
             self.nodes[i].sets_judged = self.nodes[i].complete_sets.len();
+        }
+        Ok(checks)
+    }
+
+    /// Task 11 (cluster-FSM spec §10.3, as amended): node `node`'s CATALOG at
+    /// applied frontier `frontier` — every `(frame-end, standby)` pair from
+    /// the world's SNAPSHOT-frame ledger at or below `frontier` that `node`
+    /// genuinely HOLDS (content identity, `holds_frame` — exactly inv11's
+    /// test). Ascending by construction: `snapshot_frames` is a `BTreeMap`
+    /// keyed by frame end, walked in key order.
+    fn catalog_at(&self, node: usize, frontier: u64) -> Vec<(u64, u8)> {
+        self.snapshot_frames
+            .range(..=frontier)
+            .flat_map(|(&end, frames)| {
+                frames
+                    .iter()
+                    .filter(move |f| self.holds_frame(node, end, f.term))
+                    .map(move |f| (end, u8::from(f.standby)))
+            })
+            .collect()
+    }
+
+    /// inv13 — THE CATALOG (cluster-FSM spec §10.3, as amended). Swept beside
+    /// inv11, on the same fast-exit precondition (no instant has ever been
+    /// commanded). Judges half (a) only — the catalog-determinism half: any
+    /// two UP nodes that land on the same applied frontier `f =
+    /// min(commit, durable)` must derive the identical catalog from it
+    /// (`catalog_at`). Compared fresh on every sweep rather than judged once
+    /// (unlike inv11's set-alignment claim map): the comparison is a pure
+    /// equality test with no cross-sweep state to keep honest, so recomputing
+    /// is sound and cheap at the sim's node counts.
+    ///
+    /// Half (b) — "no node's purge floor exceeds the newest AGREED position
+    /// it holds" — is NOT judged here; see
+    /// [`crate::invariants::InvariantChecker::check_catalog_determinism`]'s
+    /// doc comment for why `uc_sim` has nothing to check it against.
+    ///
+    /// Down/halted nodes are excluded, the same exemption
+    /// `complete_snapshot_sets` takes: their service is not applying, so
+    /// their frontier is a frozen snapshot of the last live instant rather
+    /// than a live reading.
+    fn check_catalog_determinism(&self, step: u64) -> Result<u64, InvariantViolation> {
+        if self.snapshot_frames.is_empty() {
+            return Ok(0);
+        }
+        let frontiers: Vec<(usize, u64)> = (0..self.cfg.n_nodes)
+            .filter(|&i| self.nodes[i].up)
+            .map(|i| (i, self.nodes[i].commit.min(self.nodes[i].durable)))
+            .collect();
+        let mut checks = 0u64;
+        for (idx, &(i, fi)) in frontiers.iter().enumerate() {
+            for &(j, fj) in &frontiers[idx + 1..] {
+                if fi != fj {
+                    continue;
+                }
+                checks += 1;
+                let cat_i = self.catalog_at(i, fi);
+                let cat_j = self.catalog_at(j, fj);
+                if cat_i != cat_j {
+                    let missing: Vec<(u64, u8)> = cat_i
+                        .iter()
+                        .chain(cat_j.iter())
+                        .filter(|e| !(cat_i.contains(e) && cat_j.contains(e)))
+                        .copied()
+                        .collect();
+                    self.checker.check_catalog_determinism(
+                        i as NodeId,
+                        j as NodeId,
+                        fi,
+                        &missing,
+                        step,
+                    )?;
+                }
+            }
         }
         Ok(checks)
     }
@@ -3439,6 +3529,43 @@ impl World {
     /// invariant proved nothing.
     pub fn set_alignment_checks(&self) -> u64 {
         self.stat_set_alignment_checks
+    }
+
+    /// inv13 non-vacuity: how many (node, node) pairs sharing an applied
+    /// frontier the catalog-determinism sweep has compared so far. Zero means
+    /// no two nodes ever shared a frontier with a SNAPSHOT frame below it, so
+    /// the invariant proved nothing.
+    pub fn catalog_checks(&self) -> u64 {
+        self.stat_catalog_checks
+    }
+
+    /// Task 11 (inv13 scenario support): command `n` coordinated snapshot
+    /// instants through the current leader, one at a time, waiting for each
+    /// to land in the ledger before commanding the next — mirrors
+    /// `scenarios.rs`'s own `command_and_wait`, as a method so the inv13
+    /// scenario can drive it without duplicating the wait loop. Stops early
+    /// (returning the count actually appended, not an error) if there is no
+    /// leader or the world stalls, the same "caller judges the count" shape
+    /// `churn_membership` uses — a stalled world is not itself an invariant
+    /// breach. Also lets the queue run a further 300 virtual steps after the
+    /// last instant, the same pacing `churn_membership` gives each frame, so
+    /// every up node's applied frontier has a chance to cross it before the
+    /// caller inspects the catalog.
+    pub fn command_instants(&mut self, n: usize) -> Result<u64, InvariantViolation> {
+        let mut appended = 0u64;
+        for _ in 0..n {
+            let Some(leader) = self.current_leader() else {
+                break;
+            };
+            let before = self.instants().len();
+            self.command_snapshot(leader, false);
+            if !self.run_until(|w| w.instants().len() > before)? {
+                break; // the world stalled; the caller judges via the count
+            }
+            appended += 1;
+        }
+        self.run_steps(300)?;
+        Ok(appended)
     }
 
     pub fn set_apply_ceiling(&mut self, node: usize, ceiling: Option<u64>) {

@@ -774,6 +774,51 @@ impl InvariantChecker {
         Ok(())
     }
 
+    /// Invariant 13 — THE CATALOG (cluster-FSM spec §10.3, as amended): the
+    /// catalog a node's cnc page reports — the `(P, standby)` pairs its
+    /// SNAPSHOT-frame ledger implies at or below its own applied frontier `f =
+    /// min(commit, durable)` — is a pure FUNCTION of that frontier, not of
+    /// which node is asked. Two nodes `a`/`b` sharing the same frontier must
+    /// derive the identical catalog from it (`World::check_catalog_determinism`
+    /// computes the argument: `missing` is the symmetric difference of the two
+    /// nodes' catalogs — every `(P, standby)` pair listed by exactly one of
+    /// them). Must be empty.
+    ///
+    /// This judges only inv13's half (a), the catalog-determinism half. Half
+    /// (b) — "no node's purge floor exceeds the newest AGREED position it
+    /// holds" — is NOT checked here: `uc_sim` has no modeled purge floor (no
+    /// `PurgePolicy`, no field a node's purge ever reads or advances), and
+    /// inv11's set-alignment sweep does not read one either — there is nothing
+    /// in the abstract model that could violate it, because every position in
+    /// `agreed(n) ∩ holds(n)` is already bounded above by the same frontier
+    /// `catalog(n)` is, by construction (`complete_sets` only ever grows up to
+    /// `snap_cursor`, which tracks the frontier). Flagged rather than invented
+    /// per the task-11 brief's own escape hatch; see the task-11 report.
+    pub fn check_catalog_determinism(
+        &self,
+        a: NodeId,
+        b: NodeId,
+        frontier: u64,
+        missing: &[(u64, u8)],
+        step: u64,
+    ) -> Result<(), InvariantViolation> {
+        if let Some(&(p, standby)) = missing.first() {
+            return Err(self.viol(
+                "catalog (inv13)",
+                step,
+                format!(
+                    "node {a} and node {b} share applied frontier {frontier} but disagree on \
+                     the catalog: position {p} (standby={}) is listed by only one of them ({} \
+                     differing entries in total) — the catalog must be a pure function of the \
+                     committed-and-durable prefix, not of which node reports it",
+                    standby != 0,
+                    missing.len()
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     /// Invariant 8 — revert correctness: once a truncation SETTLES (the
     /// matching-epoch ack landed: durable clamped, map adopted, config
     /// reverted/kept per spec §5), the adopted config must re-equal the

@@ -2194,6 +2194,27 @@ fn counterfactual_kernel_on_the_committed_view_is_caught_by_inv6_the_durable_tim
     );
 }
 
+// ============ Cluster FSM (spec §10.3, as amended): inv13, the catalog ============
+
+/// inv13 — THE CATALOG: a node's catalog (the `(P, standby)` pairs its
+/// SNAPSHOT-frame ledger implies at or below its own applied frontier,
+/// `min(commit, durable)`) is a pure function of that frontier — two nodes
+/// that land on the same frontier must derive the same catalog from it. The
+/// scenario drives real membership churn (so the invariant set that shares
+/// the sweep — inv6/inv12 — is exercised too) and then commands several
+/// coordinated snapshot instants, which is what gives inv13 something to
+/// compare.
+#[test]
+fn inv13_the_catalog_is_a_function_of_the_committed_prefix() {
+    let mut w = World::new(two_readers_cfg());
+    churn_membership(&mut w, 2).expect("invariants");
+    let n = w.command_instants(3).expect("invariants (instants)");
+    assert!(n >= 3);
+    // Non-vacuity: the sweep actually compared two nodes' catalogs at a
+    // shared frontier at least once.
+    assert!(w.catalog_checks() > 0, "inv13 never asserted anything");
+}
+
 // ================= Task 12 ledger: run_until timeout signal + parked violation =================
 
 /// Ledger minor (x): `run_until` must distinguish "predicate held" from
