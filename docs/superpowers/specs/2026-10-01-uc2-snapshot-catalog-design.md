@@ -282,12 +282,15 @@ the artifact alone is not enough.
 | `SNAP_REPORT` (pairwise 26) / `SnapshotReport` (CLUSTER kind 5) | row `255` admitted, carrying the cluster artifact's hash |
 | `STATUS` body (kind 4) | 16 B → the §5.1 fields; a `0.10.0` peer's 16 B body is refused by name |
 | `Settings` (CLUSTER kind 3) | `+ retain_sets: u16`, refused at the door when `0` (47) |
-| cluster artifact (`snapshots/cluster/*.ultcluster`) | `ClusterState` gains `Catalog`; the old layout is refused by name, so `snapshots/cluster/` is cleared once per node on the flag day (`snapshots/<row>/` is untouched) |
+| cluster artifact (`snapshots/cluster/*.ultcluster`) | `ClusterState` gains `Catalog`; `CLUSTER_IMAGE_VERSION` 3 → 4 with a trailing catalog blob. The image codec already reads every older version with the missing trailing blobs empty (`cluster_image.rs:186`), so a v3 artifact loads with an **empty catalog** — the `Empty` state of §4.5 — and **no wipe is needed**. A v4 artifact is refused by a v3 reader, as every newer layout is today |
 | `CLUSTER` kind `7` | **reserved** for project 3's backup watermark; refused as unknown until then |
 
 Wire `0.10.0` → `0.11.0`, cnc unchanged (the catalog is not on the page;
 `Empty` and the gauges go through `/metrics`). Stop every node, start every
-node, as for every flag day.
+node, as for every flag day; nothing on disk is cleared. `read_status_body`
+today accepts any body of at least 16 B (`datagram.rs:892`), so the new body
+gets its own length floor; a `0.10.0` peer is refused by the wire version
+before its `STATUS` is ever parsed.
 
 ## 8. Error handling
 
@@ -296,7 +299,7 @@ node, as for every flag day.
 | **Diverged set** | `Complete` with the row `Diverged`. Never `newest_agreed`, never the floor, never installed; kept and visible while newer than the oldest kept agreed set (§4.4). `Uc2SnapshotSetDiverged` keys on `diverged()` instead of comparing per-node gauges. |
 | **Stalled set** | Stays `Commanded`; retention ignores it; the next instant proceeds; `stalled()` names it after the timeout; dropped once below the oldest kept agreed set (§4.4). |
 | **Stale or wrong soft state** | Nothing is decided on an advertisement alone. A fetch from a holder that no longer has P fails by name and the chooser tries the next; a short journal falls into today's gap guard. A node whose status stops arriving leaves `holders()`/`journal_covers()` after the liveness timeout. |
-| **Flag-day window** | `Empty` (§4.5): today's behaviour, and the pruner deletes nothing, until the first agreed set. |
+| **Flag-day window** | `Empty` (§4.5): the pre-catalog cluster artifact loads with an empty catalog; today's behaviour, and the pruner deletes nothing, until the first agreed set. |
 | **Retention lowered** | Oldest agreed sets retire at the next apply, pinned origins excepted. **Raised**: nothing retires until the list grows. **`0`**: refused, 47. |
 | **Voter without the agreed set** (learner-only snapshots) | Not an error: its effective floor does not move, a restart of its service fetches from `holders()` (project 2), a joiner is redirected. |
 | **A node lies** | Out of the threat model (a compromised member), as the fan-out key residual is. |
@@ -304,8 +307,9 @@ node, as for every flag day.
 ## 9. Migration
 
 - **Operators**: the flag-day procedure in `docs/how-to/upgrade-a-cluster.md`
-  gains "clear `snapshots/cluster/` once per node". `node.toml`'s `[purge]`
-  stays (it is *whether* to purge; `retain_sets` is *what to keep*).
+  gains a `0.11.0` section; nothing on disk is cleared. `node.toml`'s
+  `[purge]` stays (it is *whether* to purge; `retain_sets` is *what to
+  keep*).
 - **Code**: `snapshot_set_position` (`node.rs:2759`) stays as the node's own
   newest-complete reading and feeds the `Empty` fallback; the purge driver
   switches to the view. `prune_snapshots_below` keeps its shape and takes
@@ -328,9 +332,15 @@ node, as for every flag day.
    set is never `newest_agreed`; `holders()` excludes stale nodes.
 2. **Codecs**: round-trip and refuse-by-name for the extended `SNAP_REPORT`,
    `STATUS` and `Settings`, in the shape of `upgrade.rs`'s tests.
-3. **Sim** (`uc_sim`): a new invariant beside inv12: two nodes at the same
-   commit have byte-equal catalogs, and `purge floor ≤ newest_agreed` always.
-   Seeded fuzz over partitions and crashes with it on.
+3. **Sim** (`uc_sim`): `uc_sim` does not run `ClusterFsm`; it models the
+   cluster FSM's membership and snapshot sets abstractly (`world.rs:2023`,
+   inv11 `check_set_alignment`). The new invariant (inv13) is written the same
+   way: the catalog each node would derive from the `SNAPSHOT` frames and
+   set completions at or below its commit is identical across nodes at equal
+   commit, and no node's purge floor exceeds the newest agreed set it holds.
+   Seeded fuzz over partitions and crashes with it on. Byte-equality of the
+   real FSM is a unit test in `cluster_fsm.rs` (two instances, one frame
+   sequence, equal images).
 4. **Fuzz**: `uc_node_cluster_artifact` covers the new layout; a new target
    decodes the extended `STATUS` body.
 5. **End to end**, `uc_node/tests`:
