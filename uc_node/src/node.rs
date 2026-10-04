@@ -29,7 +29,6 @@ use uc_log::counters::LogCounters;
 use uc_log::state::{
     ConfigRecord, NodeState, StoredConfig, StoredMember, TermMap, TermMapEntry, VoteRecord,
 };
-use uc_net::TermHandle;
 use uc_net::fault::{FaultConfig, FaultSocket, PartitionHandle};
 use uc_net::probe::{ProbeCadence, ProbeTable};
 use uc_net::receiver::{
@@ -40,6 +39,7 @@ use uc_net::sender::{
     CLUSTER_ARTIFACT_ID, CtrlMsg, Sender, SenderConfig, SenderCrypto, SnapArtifact, SnapshotSet,
     identity_mask,
 };
+use uc_net::{SoftTableWire, TermHandle};
 use uc_protocol::ring::{
     BroadcastProducer, BroadcastRing, MpscConsumer, MpscRing, RingError, SpscConsumer,
     SpscProducer, SpscRing,
@@ -73,14 +73,14 @@ use crate::ipc::InstanceDir;
 use crate::read_round::ProbeRound;
 use crate::services::ServicesConfig;
 use uc_log::buffer::FrameRead;
-use uc_protocol::v2::catalog::SetEntry;
+use uc_protocol::v2::catalog::{MAX_CATALOG_SETS, SetEntry};
 use uc_protocol::v2::datagram::{
     CONFIG_PROPOSAL_BODY_LEN, CONFIG_REPLY_BODY_LEN, ConfigProposalBody, ConfigReplyBody,
     DATAGRAM_HEADER_LEN, DGRAM_KIND_COMMIT_POSITION, DGRAM_KIND_CONFIG_PROPOSAL,
     DGRAM_KIND_CONFIG_REPLY, DGRAM_KIND_READ_PROBE, DGRAM_KIND_READ_PROBE_ACK,
     DGRAM_KIND_REQUEST_VOTE, DGRAM_KIND_SNAP_REPORT, DGRAM_KIND_TERM_MAP, DGRAM_KIND_VOTE,
-    DatagramHeader, JUMBO_MIN_RUNG, MAX_PAYLOAD_DEFAULT, MAX_TERM_MAP_WIRE_ENTRIES, MTU_DEFAULT,
-    READ_PROBE_BODY_LEN, REQUEST_VOTE_BODY_LEN, ReadProbeBody, RequestVoteBody,
+    DatagramHeader, Holdings, JUMBO_MIN_RUNG, MAX_PAYLOAD_DEFAULT, MAX_TERM_MAP_WIRE_ENTRIES,
+    MTU_DEFAULT, READ_PROBE_BODY_LEN, REQUEST_VOTE_BODY_LEN, ReadProbeBody, RequestVoteBody,
     SNAP_REPORT_BODY_LEN, SnapReportBody, TERM_MAP_ENTRY_LEN, TERM_MAP_HEADER_LEN,
     TermMapEntryWire, VOTE_BODY_LEN, VoteBody, is_rung, payload_ceiling,
     write_config_proposal_body, write_config_reply_body, write_datagram_header,
@@ -383,6 +383,21 @@ const READ_BARRIER_TIMEOUT_NS: u64 = 1_000_000_000;
 /// ride the set-complete edge, one pairwise datagram each) and well below any
 /// human-paced upgrade step that reads the record.
 pub const SNAP_REPORT_TIMEOUT_NS: u64 = 5_000_000_000;
+
+/// Catalog spec §5.3: a leader's soft-table entry is stale once it is older
+/// than this many maximum election timeouts — the liveness horizon the node
+/// already runs on (no per-peer heartbeat timestamp exists to reuse).
+pub const SOFT_STALE_FACTOR: u64 = 3;
+
+/// Catalog spec §5.2 (D6): the pass-clock spacing of the counter half of the
+/// `Holdings` cache (durable, commit, applied, journal first). Below the
+/// follower's 20 ms `STATUS` floor, so every advert carries counters at most
+/// one copy old.
+const HOLDINGS_COPY_NS: u64 = 10_000_000;
+
+/// Catalog spec §5.2 (D6): the filesystem probe's spacing — free bytes,
+/// journal bytes and snapshot bytes change seconds apart.
+const HOLDINGS_PROBE_NS: u64 = 1_000_000_000;
 
 /// Plan B3 final review F3: how long (monotonic ns, the pass's own clock) the
 /// attach gate (`Consensus::maybe_publish_declared`) may stay shut before the
@@ -1176,6 +1191,15 @@ pub struct Node {
     /// Jumbo spec §5.1: the same discovery ledger the three agents share,
     /// kept here so in-process tests can inspect what each path resolved to.
     probe_table: Arc<ProbeTable>,
+    /// Catalog spec §5.3: the SAME map the sender agent lands every drained
+    /// `STATUS`'s `Holdings` in, by follower address. Read only by
+    /// [`Node::soft_table`].
+    soft_wire: Arc<Mutex<SoftTableWire>>,
+    /// Catalog spec §5.2: this node's own cached advertisement (the cell the
+    /// consensus agent writes and the receiver ships).
+    holdings: Arc<Mutex<Holdings>>,
+    /// `cfg.election_timeout_max_ns`, kept for [`Node::soft_stale_ns`].
+    election_timeout_max_ns: u64,
     // Held for the node's life: the instance flock and the IPC ring mmaps.
     _instance: InstanceDir,
     _rings: Rings,
@@ -1821,12 +1845,20 @@ impl Node {
             .map(|(i, (id, _))| (id_to_addr[id], i))
             .collect();
         sender.set_peer_slots(Arc::clone(&cnc), sender_peer_slots);
+        // Catalog spec §5.3: the leader's soft table, by follower address —
+        // `Node::soft_table` maps it to node ids through membership.
+        let soft_wire = Arc::new(Mutex::new(SoftTableWire::new()));
+        sender.set_soft_table(Arc::clone(&soft_wire));
 
         // Receiver (unified follower-receiver + leader-control demux).
         let mut rcfg = FollowerConfig::new(self_addr); // auto-learns the real leader from DATA
         rcfg.seed = cfg.seed ^ 0x5DEE_CE66_1D0C_2A11;
         rcfg.status_floor_ns = 20_000_000;
         rcfg.append_pos_floor_ns = 20_000_000;
+        // Catalog spec §5.2: the cached soft advertisement every `STATUS`
+        // carries; the consensus agent's writers keep it current.
+        let holdings = Arc::new(Mutex::new(Holdings::default()));
+        rcfg.holdings = Some(Arc::clone(&holdings));
         // M8 (Task 12): the receive half, the sender-identity map, and the
         // handshake route travel together in one `CryptoIntake` — forgetting
         // any of the three is a compile error, not a silent cluster-wide
@@ -2404,6 +2436,14 @@ impl Node {
             snapshot_cmd_rx,
             fetch_cmd_rx,
             snapshot_cadence_refused: 0,
+            holdings: Arc::clone(&holdings),
+            holdings_next_copy_ns: 0,
+            last_holdings_probe_ns: None,
+            holdings_probes: 0,
+            holdings_fs_ops: 0,
+            holdings_catalog: Vec::with_capacity(MAX_CATALOG_SETS),
+            holdings_held: Vec::with_capacity(2 * MAX_CATALOG_SETS),
+            journal_dir: instance.journal_dir(),
         };
         // Cluster FSM (spec §4.5): arm from the RECOVERED view BEFORE the
         // consensus agent starts. The view already holds genesis or the
@@ -2466,6 +2506,9 @@ impl Node {
             journal_segment_bytes: cfg.journal_segment_bytes,
             cluster_view,
             probe_table,
+            soft_wire,
+            holdings,
+            election_timeout_max_ns: cfg.election_timeout_max_ns,
             _instance: instance,
             _rings: rings,
             // Stop order: consensus first (stops writing the term handle), then
@@ -2512,6 +2555,38 @@ impl Node {
     /// floor's realized value). `0` when nothing has been purged. Exposed for
     /// purge-safety tests: after the service publishes a snapshot and the purge
     /// driver runs, this advances to at most the snapshot floor.
+    /// Catalog spec §5.3: the leader's soft table — every follower's newest
+    /// advertised [`Holdings`] keyed by node id (the sender keeps it by
+    /// address; this maps through the COMMITTED membership, so an address
+    /// no longer a member is dropped). `last_seen_ns` is UNIX-epoch wall
+    /// nanoseconds, so a query compares it against its own wall clock with
+    /// [`Self::soft_stale_ns`]. Empty on a node that has not led.
+    pub fn soft_table(&self) -> crate::catalog::SoftTable {
+        let membership = self.cluster_view.snapshot_inner().membership;
+        let wire = self
+            .soft_wire
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let mut t = crate::catalog::SoftTable::default();
+        for (id, addr) in membership.voters.iter().chain(membership.learners.iter()) {
+            if let Some((h, at)) = wire.get(&addr_of(*addr)) {
+                t.record(*id, *h, *at);
+            }
+        }
+        // This node's own cache, stamped now: a node never sends itself a
+        // `STATUS`, but it is as much a holder as any follower.
+        let own = *self.holdings.lock().unwrap_or_else(|e| e.into_inner());
+        t.record(self.node_id, own, unix_now_ns());
+        t
+    }
+
+    /// Catalog spec §5.3: how old a soft-table entry may be and still count
+    /// — [`SOFT_STALE_FACTOR`] maximum election timeouts.
+    pub fn soft_stale_ns(&self) -> u64 {
+        SOFT_STALE_FACTOR * self.election_timeout_max_ns
+    }
+
     pub fn archive_first_base(&self) -> u64 {
         self.archive_first_base.load(Ordering::Acquire)
     }
@@ -3866,6 +3941,36 @@ struct Consensus {
     /// instead of every pass. Cleared by the next accepted cadence instant,
     /// exactly like the snapshot source's decline latch.
     snapshot_cadence_refused: u32,
+    /// Catalog spec §5.2 (D6): this node's cached soft advertisement — the
+    /// SAME cell the receiver agent copies into every `STATUS`. Every write
+    /// here is a short copy under the lock; nothing is computed while it is
+    /// held.
+    holdings: Arc<Mutex<Holdings>>,
+    /// The pass-clock (`pass_now_ns`) instant the counter half of
+    /// `holdings` is next refreshed — [`HOLDINGS_COPY_NS`] apart, so the
+    /// pass pays one `u64` compare and the lock is taken ~100 times a
+    /// second, not once per pass.
+    holdings_next_copy_ns: u64,
+    /// The pass-clock instant of the last filesystem probe
+    /// ([`HOLDINGS_PROBE_NS`] apart); `None` until the first.
+    last_holdings_probe_ns: Option<u64>,
+    /// Filesystem probes run (test-visible; a plain counter, no atomics).
+    holdings_probes: u64,
+    /// Directory listings, `statvfs` calls and file stats the holdings
+    /// writers made — the D6 test's witness that none of them run per pass.
+    holdings_fs_ops: u64,
+    /// The catalog positions (oldest first) `holdings.sets_held` is a bitmap
+    /// over — a copy of the view's list, refreshed on the view-change edge
+    /// only (capacity reserved for `MAX_CATALOG_SETS`, so no reallocation).
+    holdings_catalog: Vec<u64>,
+    /// The positions whose COMPLETE set this node holds on disk, as the
+    /// writers know it: seeded from disk for a newly listed set at or below
+    /// the cluster artifact, added on every completion edge, dropped by the
+    /// pruner. The effective floor reads it in place of a file check.
+    holdings_held: Vec<u64>,
+    /// `<instance_dir>/journal` — the probe's `journal_bytes` walk and its
+    /// `statvfs` target.
+    journal_dir: PathBuf,
 }
 
 impl Consensus {
@@ -3927,6 +4032,11 @@ impl Consensus {
         self.pass_now_ns = now_wall;
         if let Some(app) = self.appender.as_mut() {
             app.set_now(now_wall);
+        }
+        // Catalog spec §5.2 (D6): the soft advertisement's counters, every
+        // `HOLDINGS_COPY_NS` of pass clock — one compare on every other pass.
+        if now_wall >= self.holdings_next_copy_ns {
+            self.refresh_holdings();
         }
         // Jumbo spec §6/§5.4: THIS pass's gate answer, evaluated once, here —
         // ahead of every step that acts as a serving node. A node that has not
@@ -5410,11 +5520,12 @@ impl Consensus {
     ///   by definition (it is its newest complete set), so the common case
     ///   costs no filesystem call.
     /// * **otherwise** (`own` unlisted, or listed but not agreed): the newest
-    ///   agreed listed set BELOW `own` whose artifacts this node holds
-    ///   ([`Self::holds_set`]) — holding P does not imply holding anything
-    ///   older, which may have been pruned or never built here. Only sets
-    ///   ABOVE the persisted floor are probed (one at or below it could not
-    ///   move the floor anyway), so on a stable floor the probe is empty.
+    ///   agreed listed set BELOW `own` this node holds — read from the
+    ///   holdings writers' record (`holdings_held`, the same knowledge
+    ///   `Holdings::sets_held` advertises), never a file check (Task 9, D6).
+    ///   Holding P does not imply holding anything older, which may have
+    ///   been pruned or never built here. Only sets ABOVE the persisted floor
+    ///   count (one at or below it could not move the floor anyway).
     ///
     /// `0` means "no agreed set I hold above my floor": nothing moves. That
     /// is the normal state of a voter on a learner-only cluster (§4.6), not
@@ -5434,7 +5545,7 @@ impl Consensus {
             if e.position <= self.snapshot_persisted_floor {
                 return 0;
             }
-            if self.holds_set(e.position) {
+            if self.holdings_held.contains(&e.position) {
                 return e.position;
             }
         }
@@ -5445,8 +5556,10 @@ impl Consensus {
     /// row's `snap-<p>.ultsnap` and the cluster's `snap-<p>.ultcluster`? The
     /// same set definition `check_set_completeness` applies, read off the
     /// filesystem rather than the cnc slots (which only ever name the newest
-    /// instant). File-presence only; called from [`Self::effective_floor_in`]
-    /// in its uncommon branch, behind the floor throttle — never per pass.
+    /// instant). File-presence only; called only by
+    /// [`Self::note_catalog_for_holdings`] to SEED `holdings_held` for a
+    /// newly listed set at or below the cluster artifact (boot, or a journal
+    /// catch-up) — a view-change edge, never a steady pass.
     fn holds_set(&self, p: u64) -> bool {
         self.services.ids().all(|row| {
             self.snap_root
@@ -6408,6 +6521,7 @@ impl Consensus {
             } else {
                 self.stored_above_durable = 0;
                 self.snapshot_set_position.store(stored, Ordering::Release);
+                self.note_set_held(stored);
                 crate::obs_event!(
                     Info,
                     "snapshot_set_complete",
@@ -6434,6 +6548,7 @@ impl Consensus {
             }
         }
         self.snapshot_set_position.store(p, Ordering::Release);
+        self.note_set_held(p);
         crate::obs_event!(
             Info,
             "snapshot_set_complete",
@@ -6878,6 +6993,130 @@ impl Consensus {
         false
     }
 
+    /// Catalog spec §5.2 (D6): refresh the counter half of the `Holdings`
+    /// cache, and — at most once per [`HOLDINGS_PROBE_NS`] — its filesystem
+    /// half. Called from `do_work` only when `pass_now_ns` has reached
+    /// `holdings_next_copy_ns`, so every other pass pays one compare; out of
+    /// line so the pass body does not grow (M14a).
+    ///
+    /// Loads, then one short lock for the copy. The probe (a `statvfs` and
+    /// two directory walks) runs BEFORE the lock is taken, so the receiver
+    /// agent's `STATUS` never waits on a filesystem call.
+    #[inline(never)]
+    fn refresh_holdings(&mut self) {
+        let now = self.pass_now_ns;
+        self.holdings_next_copy_ns = now.saturating_add(HOLDINGS_COPY_NS);
+        let c = self.cnc.counters();
+        let durable = c.durable.load_acquire();
+        let commit = c.commit.load_acquire();
+        let mut applied = [0u64; CNC_MAX_SERVICES];
+        for row in self.services.ids() {
+            applied[row as usize] = self.cnc.service_slot(row as usize).applied.load_acquire();
+        }
+        let journal_first = self.archive_first_base.load(Ordering::Acquire);
+        let probe_due = self
+            .last_holdings_probe_ns
+            .is_none_or(|t| now.saturating_sub(t) >= HOLDINGS_PROBE_NS);
+        let fs = if probe_due {
+            self.last_holdings_probe_ns = Some(now);
+            Some(self.probe_holdings_fs())
+        } else {
+            None
+        };
+        let mut h = self.holdings.lock().unwrap_or_else(|e| e.into_inner());
+        h.journal_first = journal_first;
+        h.durable = durable;
+        h.commit = commit;
+        h.applied = applied;
+        if let Some((free, journal, snapshots)) = fs {
+            // A failed `statvfs` keeps the last reading rather than
+            // advertising a plausible-looking 0.
+            if let Some(free) = free {
+                h.free_bytes = free;
+            }
+            h.journal_bytes = journal;
+            h.snapshots_bytes = snapshots;
+        }
+    }
+
+    /// The filesystem half of `Holdings`: `(free, journal, snapshots)`
+    /// bytes. Runs off the per-pass path (see [`Self::refresh_holdings`]).
+    #[cold]
+    fn probe_holdings_fs(&mut self) -> (Option<u64>, u64, u64) {
+        self.holdings_probes += 1;
+        self.holdings_fs_ops += 1;
+        // The instance dir (the journal's parent) always exists; the
+        // journal dir itself may not yet on a fresh harness.
+        let free = fs_free_bytes(self.journal_dir.parent().unwrap_or(&self.journal_dir));
+        let journal = dir_bytes(&self.journal_dir, &mut self.holdings_fs_ops);
+        let snapshots = dir_bytes(&self.snap_root, &mut self.holdings_fs_ops);
+        (free, journal, snapshots)
+    }
+
+    /// Catalog spec §5.1: the view moved (`refresh_from_view`'s edge, never
+    /// a steady pass) — re-take the catalog's positions and recompute
+    /// `sets_held` against them. A NEWLY listed position at or below the
+    /// cluster artifact this node last wrote, not already known held, is
+    /// checked on disk once ([`Self::holds_set`]): that is a node booting on
+    /// sets it already holds, or catching up a journal span whose instants
+    /// it froze before a restart. A new instant above the artifact is not
+    /// checked — it completes, if at all, through the completion edge.
+    #[cold]
+    fn note_catalog_for_holdings(&mut self, view_position: u64, catalog: &[SetEntry]) {
+        let artifact = self.cluster_snapshot_pos.load(Ordering::Acquire);
+        for e in catalog {
+            let p = e.position;
+            if p <= artifact
+                && !self.holdings_catalog.contains(&p)
+                && !self.holdings_held.contains(&p)
+            {
+                self.holdings_fs_ops += 1;
+                if self.holds_set(p) {
+                    self.holdings_held.push(p);
+                }
+            }
+        }
+        self.holdings_catalog.clear();
+        self.holdings_catalog
+            .extend(catalog.iter().take(MAX_CATALOG_SETS).map(|e| e.position));
+        // Bounded by the catalog: a held set it no longer lists is nothing a
+        // reader can ask about. A position above the newest listed one is
+        // kept — a completion edge can, in principle, beat the view that
+        // lists its instant by a pass.
+        let newest = self.holdings_catalog.last().copied().unwrap_or(0);
+        let listed = &self.holdings_catalog;
+        self.holdings_held
+            .retain(|p| *p > newest || listed.contains(p));
+        self.publish_sets_held(Some(view_position));
+    }
+
+    /// Catalog spec §5.1: this node now holds the complete set at `p` (the
+    /// local or fetch completion edge).
+    #[cold]
+    fn note_set_held(&mut self, p: u64) {
+        if !self.holdings_held.contains(&p) {
+            self.holdings_held.push(p);
+        }
+        self.publish_sets_held(None);
+    }
+
+    /// Recompute `sets_held` from `holdings_held` over `holdings_catalog`
+    /// and write it (and, on a view change, `catalog_position`) into the
+    /// cache — the lock is held for the two stores.
+    fn publish_sets_held(&mut self, view_position: Option<u64>) {
+        let bits = self
+            .holdings_catalog
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| self.holdings_held.contains(p))
+            .fold(0u64, |acc, (i, _)| acc | 1 << i);
+        let mut h = self.holdings.lock().unwrap_or_else(|e| e.into_inner());
+        h.sets_held = bits;
+        if let Some(vp) = view_position {
+            h.catalog_position = vp;
+        }
+    }
+
     /// Spec §5.3 (Ruling P1): the node-owned, **delete-only** retention
     /// sweep. Keeps the complete set at `p` and everything newer; unlinks
     /// every older artifact under each row's `snapshots/<row>/` and under
@@ -6894,14 +7133,14 @@ impl Consensus {
     /// 16-byte envelope only `uc_service::snapshots::SnapshotStore::publish`
     /// writes); it only ever deletes one it can prove is superseded.
     #[cfg(test)]
-    fn prune_snapshots_below(&self, p: u64) {
+    fn prune_snapshots_below(&mut self, p: u64) {
         let inner = self.cluster_view.snapshot_inner();
         self.prune_snapshots_below_in(p, &inner);
     }
 
     /// [`Self::prune_snapshots_below`] over a view the caller already cloned
     /// (the floor path's one clone per evaluation).
-    fn prune_snapshots_below_in(&self, p: u64, inner: &ClusterViewInner) {
+    fn prune_snapshots_below_in(&mut self, p: u64, inner: &ClusterViewInner) {
         let mut removed = 0u64;
         let mut errors = 0u64;
         // Plan B1: a pinned origin's set must outlive the floor — B2's
@@ -6945,6 +7184,14 @@ impl Consensus {
         let (r, e) = prune_snapshot_dir(&self.cluster_snapshot_dir, CLUSTER_SNAP_SUFFIX, p, &keep);
         removed += r;
         errors += e;
+        // Catalog spec §5.2: every set below the cut that is not kept is
+        // gone — or, on a failed unlink, no longer whole — so it is no
+        // longer advertised.
+        let before = self.holdings_held.len();
+        self.holdings_held.retain(|h| *h >= p || keep.contains(h));
+        if self.holdings_held.len() != before {
+            self.publish_sets_held(None);
+        }
         if removed > 0 || errors > 0 {
             crate::obs_event!(
                 Info,
@@ -7419,6 +7666,8 @@ impl Consensus {
         }
         self.view_position_seen = vp;
         let inner = self.cluster_view.snapshot_inner();
+        // Catalog spec §5.1: `sets_held` is a bitmap over THIS view's list.
+        self.note_catalog_for_holdings(vp, &inner.catalog);
         // The table METRICS are cluster-wide and unconditional (every node,
         // leader or follower) — gated only on the position actually moving,
         // so a repeat visit from the promotion-forced re-check above (where
@@ -10997,6 +11246,55 @@ fn create_rings(
 /// u16)`) as a real `SocketAddr` (IPv4-only — `uc_consensus` stays dep-free,
 /// so this conversion lives here). Inverse of `stored_member`'s ip/port
 /// extraction below.
+/// Wall-clock nanoseconds since the UNIX epoch (`0` before it) — the clock
+/// the sender stamps soft-table entries with.
+fn unix_now_ns() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as u64)
+}
+
+/// Catalog spec §5.1: free bytes on the filesystem backing `path`
+/// (`f_bavail * f_frsize`, what an unprivileged writer could still use);
+/// `None` on a probe failure. The same `statvfs` idiom as the daemon's
+/// `free_disk_bytes`.
+#[allow(
+    clippy::unnecessary_cast,
+    reason = "libc::statvfs's f_bavail/f_frsize field types vary by target (not \
+              always u64) — the cast is a portability normalization"
+)]
+fn fs_free_bytes(path: &Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut buf: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `c` is a valid NUL-terminated path; `buf` is a zeroed statvfs
+    // this call owns for the duration of the call.
+    if unsafe { libc::statvfs(c.as_ptr(), &mut buf) } != 0 {
+        return None;
+    }
+    Some(buf.f_bavail as u64 * buf.f_frsize as u64)
+}
+
+/// Catalog spec §5.1: the bytes of every regular file under `dir`,
+/// recursively (symlinks not followed); `0` for a missing directory. `ops`
+/// counts the directory listings made.
+fn dir_bytes(dir: &Path, ops: &mut u64) -> u64 {
+    *ops += 1;
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut total = 0u64;
+    for e in rd.flatten() {
+        let Ok(ft) = e.file_type() else { continue };
+        if ft.is_dir() {
+            total += dir_bytes(&e.path(), ops);
+        } else if ft.is_file() {
+            total += e.metadata().map_or(0, |m| m.len());
+        }
+    }
+    total
+}
+
 fn addr_of((ip, port): Addr) -> SocketAddr {
     SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::from(ip.to_be_bytes()), port))
 }
@@ -12560,6 +12858,14 @@ mod tests {
             snapshot_cmd_rx,
             fetch_cmd_rx,
             snapshot_cadence_refused: 0,
+            holdings: Arc::new(Mutex::new(Holdings::default())),
+            holdings_next_copy_ns: 0,
+            last_holdings_probe_ns: None,
+            holdings_probes: 0,
+            holdings_fs_ops: 0,
+            holdings_catalog: Vec::with_capacity(MAX_CATALOG_SETS),
+            holdings_held: Vec::with_capacity(2 * MAX_CATALOG_SETS),
+            journal_dir: dir.path().join("journal"),
         };
         // The LAST thing `Node::start_with_socket` does before spawning the
         // consensus agent, mirrored here so this harness exercises the same
@@ -12939,7 +13245,7 @@ mod tests {
     /// floor path, since the keep-set is the only thing under test.
     #[test]
     fn retention_keeps_every_pinned_origin() {
-        let h = harness_with_rows(&["a"]);
+        let mut h = harness_with_rows(&["a"]);
         let (p0, p1, p2) = (2048u64, 4096u64, 6016u64);
         let row_dir = h.cons.snap_root.join("0");
         std::fs::create_dir_all(&row_dir).unwrap();
@@ -13075,7 +13381,7 @@ mod tests {
     #[test]
     fn effective_floor_candidate_follows_what_this_node_holds() {
         use uc_protocol::v2::upgrade::RowRunning;
-        let h = harness_with_rows(&["a"]);
+        let mut h = harness_with_rows(&["a"]);
         let mut st = h.cons.cluster_view.to_state();
         st.catalog = vec![agreed_entry(1000), agreed_entry(2000)];
         st.running[0] = Some(RowRunning {
@@ -13096,17 +13402,21 @@ mod tests {
             0,
             "1000 is agreed but its artifacts are not on disk here"
         );
+        // Task 9 (D6): the floor no longer stats files — it reads what the
+        // holdings writers know. Files that appear behind their back do not
+        // count; the completion edge (or the boot seed) does.
         write_row_artifact(&h, 0, 1000, b"x");
-        assert_eq!(
-            h.cons.effective_floor_candidate(),
-            0,
-            "half a set (no cluster artifact) is not held"
-        );
         write_cluster_artifact(&h, 1000, b"c");
         assert_eq!(
             h.cons.effective_floor_candidate(),
+            0,
+            "files no writer recorded are not consulted"
+        );
+        h.cons.note_set_held(1000);
+        assert_eq!(
+            h.cons.effective_floor_candidate(),
             1000,
-            "1000 held on disk: the newest agreed set at or below 1500"
+            "1000 held: the newest agreed set at or below 1500"
         );
         h.cons.snapshot_set_position.store(500, Ordering::Release);
         assert_eq!(
@@ -13128,7 +13438,7 @@ mod tests {
     /// does not list (and no pinned origin), below the floor.
     #[test]
     fn the_pruner_keeps_every_catalogued_position_and_every_pin() {
-        let h = harness_with_rows(&["a"]);
+        let mut h = harness_with_rows(&["a"]);
         for p in [500u64, 1000, 2000, 3000] {
             write_row_artifact(&h, 0, p, b"x");
             write_cluster_artifact(&h, p, b"c");
@@ -13148,6 +13458,109 @@ mod tests {
             vec![1000, 2000, 3000],
             "500 deleted; 1000 is a pin; 2000/3000 are listed"
         );
+    }
+
+    /// Catalog spec §5.2 (D6): the filesystem half of `Holdings` (free
+    /// bytes, journal bytes, snapshot bytes) is probed at most once per
+    /// second of the pass clock, however many passes run in between.
+    #[test]
+    fn holdings_probe_runs_at_most_once_per_second() {
+        let mut h = harness_with_rows(&["a"]);
+        write_row_artifact(&h, 0, 1000, &[7u8; 4096]);
+        let t0 = 1_000_000_000_000u64;
+        h.cons.test_now_ns = Some(t0);
+        h.cons.do_work();
+        assert_eq!(h.cons.holdings_probes, 1, "the first pass probes");
+        h.cons.test_now_ns = Some(t0 + 500_000);
+        h.cons.do_work();
+        assert_eq!(
+            h.cons.holdings_probes, 1,
+            "two passes 0.5 ms apart: one probe"
+        );
+        h.cons.test_now_ns = Some(t0 + 1_000_000_000);
+        h.cons.do_work();
+        assert_eq!(
+            h.cons.holdings_probes, 2,
+            "a second later: the second probe"
+        );
+        let c = *h.cons.holdings.lock().unwrap();
+        assert!(
+            c.snapshots_bytes >= 4096,
+            "the probe counted the artifact: {c:?}"
+        );
+        assert!(c.free_bytes > 0, "statvfs answered: {c:?}");
+    }
+
+    /// Catalog spec §5.2 (D6): the pass copies counters into the cache, but
+    /// lists no directory and stats no file — 1000 passes over 100 ms of
+    /// pass clock leave the filesystem counter where it was.
+    #[test]
+    fn holdings_are_not_rebuilt_on_the_pass() {
+        let mut h = harness_with_rows(&["a"]);
+        let append = drive_to_serving_leader(&mut h);
+        let t0 = 2_000_000_000_000u64;
+        h.cons.test_now_ns = Some(t0);
+        h.cons.do_work();
+        let ops = h.cons.holdings_fs_ops;
+        let probes = h.cons.holdings_probes;
+        // A counter that moves AFTER the first pass: the cache must follow.
+        h.cons.cnc.service_slot(0).applied.store_release(4096);
+        for i in 1..=1000u64 {
+            h.cons.test_now_ns = Some(t0 + i * 100_000);
+            h.cons.do_work();
+        }
+        assert_eq!(
+            h.cons.holdings_fs_ops, ops,
+            "no directory listing on the pass"
+        );
+        assert_eq!(h.cons.holdings_probes, probes, "no probe inside the second");
+        let c = *h.cons.holdings.lock().unwrap();
+        assert_eq!(c.applied[0], 4096, "…but the counters are copied");
+        assert_eq!(c.durable, h.cons.cnc.counters().durable.load_acquire());
+        assert_eq!(c.commit, h.cons.cnc.counters().commit.load_acquire());
+        assert!(c.commit > 0 && c.commit <= append);
+    }
+
+    /// Catalog spec §5.1: `sets_held` is a bitmap over the catalog's listed
+    /// sets, kept by the writers — seeded from disk for a set listed at or
+    /// below the cluster artifact, set on the completion edge, cleared by
+    /// the pruner — and stamped with the view position it was computed on.
+    #[test]
+    fn holdings_sets_held_follow_completion_seeding_and_pruning() {
+        let mut h = harness_with_rows(&["a"]);
+        drive_to_serving_leader(&mut h);
+        let (p1, p2) = (1000u64, 6048u64);
+        write_row_artifact(&h, 0, p1, b"x");
+        write_cluster_artifact(&h, p1, b"c");
+        h.cluster_snapshot_pos.store(p1, Ordering::Release);
+        let mut st = h.cons.cluster_view.to_state();
+        st.catalog = vec![agreed_entry(p1), agreed_entry(p2)];
+        st.applied = p2 + 1;
+        h.cons.cluster_view.publish(&st);
+        h.cons.refresh_from_view();
+        let c = *h.cons.holdings.lock().unwrap();
+        assert_eq!(c.sets_held, 0b01, "p1 seeded from disk; p2 not held");
+        assert_eq!(c.catalog_position, p2 + 1);
+
+        write_row_artifact(&h, 0, p2, b"y");
+        write_cluster_artifact(&h, p2, b"d");
+        h.row_published_at(0, p2, uc_service::snapshots::artifact_hash_of(b"y"));
+        h.cluster_snapshot_pos.store(p2, Ordering::Release);
+        h.cons.check_set_completeness();
+        assert_eq!(
+            h.cons.holdings.lock().unwrap().sets_held,
+            0b11,
+            "completion edge"
+        );
+
+        st.catalog = vec![agreed_entry(p2)];
+        st.applied = p2 + 2;
+        h.cons.cluster_view.publish(&st);
+        h.cons.refresh_from_view();
+        h.cons.prune_snapshots_below(p2);
+        assert_eq!(h.cons.holdings.lock().unwrap().sets_held, 0b1);
+        assert_eq!(h.cons.holdings_held, vec![p2], "the pruner forgot p1");
+        assert_eq!(list_row_artifacts(&h, 0), vec![p2]);
     }
 
     /// Plan B2 T5 (fix round), the other half of the pinned-origin
