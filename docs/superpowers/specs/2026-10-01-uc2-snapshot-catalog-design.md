@@ -138,6 +138,20 @@ majority exists and some differ, `NoMajority` otherwise. One reporter is
 agreed over one node, as today (`node.rs:13455`). The catalog adds nothing
 to the rule; it stores the result.
 
+**The recorded `version` is the version IN FORCE STRICTLY BELOW P, not the
+running version at the moment the report applies.** §4.2's reports row
+leaves `version` unexplained; it is derived from the row's pin history,
+oldest → newest: the EARLIEST pin with `origin >= P` names its `from` (that
+pin's install had not taken effect at P); otherwise the LATEST pin's `to`;
+otherwise the row's running version (`0` with none recorded). The cluster
+row's version is always `0` — its artifact is versioned by the image
+layout, not an FSM version. This matters because a pin at origin P commits
+*after* P: a report for P can land after the pin, and the running version
+at report-apply time would then name the pin's `to` for an artifact the
+pin's `from` actually built. The per-row pin history is bounded at four
+entries (`MAX_PINS_PER_ROW`), so a set more than four pins back reads the
+oldest RETAINED pin's `from`, which may not be the version that built it.
+
 ### 4.4 Retention
 
 Runs after an agreed completion and after a settings change. Let `A` be the
@@ -425,6 +439,19 @@ before its `STATUS` is ever parsed.
   (pins free, never counted), ruled but **not implemented** — it lands in
   the final fix wave (Task 5's `retire()` and its test, Task 12 test 3, and
   this section's wording).
+- **§4.2's reports row does not say which version is recorded (ruling
+  R4).** "Set `rows[r] = { version, hash: majority, verdict }`" names the
+  field but not its value. As built, `version` is the version IN FORCE
+  STRICTLY BELOW P — `ClusterState::version_at(row, p)`
+  (`uc_node/src/cluster_fsm.rs:298-310`): the earliest pin with `origin >=
+  p` names its `from`; else the latest pin's `to`; else the row's running
+  version; the cluster row always records `0`. Not the running version at
+  report-apply time, because a pin at origin P commits *after* P — a report
+  for P landing after the pin would otherwise record the pin's `to` for an
+  artifact its `from` actually built. Bounded by the per-row pin history
+  (`MAX_PINS_PER_ROW = 4`): a set more than four pins back reads the oldest
+  retained pin's `from`, which may not be the version that built it. Added
+  to §4.3's body as its own paragraph.
 - **§4.4 names no upper bound on `retain_sets`; the door enforces one,
   `MAX_RETAIN_SETS = 56` (ruling R8).** D5 says only `retain_sets ≥ 1`. The
   catalog's list rides inside the cluster IMAGE, not a `CLUSTER` frame, so
@@ -450,6 +477,13 @@ before its `STATUS` is ever parsed.
   live running-derived mask at report time — only *agreement*, once
   reached, is frozen. Otherwise adding a row would empty the catalog on the
   spot and let retention drop a pinned origin out from under its pin.
+  **This SUPERSEDES ruling R7.** R7 had accepted, as a limitation, that "a
+  row added later un-agrees earlier sets and the catalog reads `Empty`
+  until the next instant agrees" — true of a live-mask `is_agreed`, which is
+  what R7 was ruled against before R9 replaced it. Under frozen agreement
+  that no longer happens: a row added later reconstructs from its own
+  genesis above the earlier sets, which stay agreed and never drop out from
+  under retention or a pin.
 - **§4.4/§7's "`retain_sets = 0` is refused at the door" elides apply's own
   handling of a replicated `0` (ruling R10).** The flag day clears nothing
   on disk, so a `0` can reach `apply` two ways that are not an operator's
@@ -522,3 +556,52 @@ before its `STATUS` is ever parsed.
   as shipped sweeps clause (a) alone (`World::check_catalog_determinism`);
   clause (b)'s coverage is Task 8's node unit tests and Task 12's end-to-end
   tests, not the sim.
+- **§4.1's "every declared row" presumes the node and the FSM already
+  agree on what "declared" means (ruling R1).** As built, both read the
+  same mask — derived from the FSM's `running` (bit r ⇔ `running[r]` is
+  set), never from a node's local `services.ids()` — because a row between
+  attach and genesis would otherwise make the node and the FSM disagree on
+  which sets are complete or agreed. `prune_snapshots_below_in`
+  (`uc_node/src/node.rs:7160-7165`) states the equivalence explicitly: "the
+  same set `check_set_completeness` reads… on a real node (which always
+  declares `[services] names`) the two are equal." Largely moot after R9
+  freezes agreement at completion rather than recomputing it live, but
+  stated here because it is still what "declared" means at the point a set
+  turns `Complete`.
+- **§7's "`install_snapshot` refuses a mis-tagged artifact" is one of
+  several codec-level refusals the catalog adds, not stated (ruling R5).**
+  `install_snapshot` also refuses a cluster image whose catalog blob is not
+  strictly increasing by position — `"cluster image: catalog out of
+  order"` (`uc_node/src/cluster_fsm.rs`, the `install_snapshot` leaf) —
+  same class as the image's other structural checks (CRC, framing, pin and
+  report list bounds), since `retire` and every reader rely on the list
+  staying ordered oldest-first.
+- **§4.2's `SNAPSHOT`-frame row describes the live arm only; the journal
+  catch-up path shares it (ruling R11).** `on_snapshot_frame` is recorded
+  on EVERY path the cluster agent walks a `SNAPSHOT` frame on — the live
+  arm and `replay_from_journal`'s catch-up walk alike
+  (`uc_node/src/cluster_agent.rs`) — for every `SNAPSHOT` frame at or below
+  the walk's target, independent of whether THIS node's own freeze
+  decision (`last_actionable_instant`'s pick) acts on that particular
+  frame. The catalog is a function of the committed prefix and must not
+  depend on which path a node took to reach it; `on_snapshot_frame` is
+  idempotent on `end`, so recording the same frame twice — once from the
+  live arm, again if a later overrun replays the same ground through the
+  journal — costs nothing.
+- **§5.3's leader-side soft table is silent on whether the leader counts
+  itself (ruling R15).** A node never sends itself a `STATUS` datagram, so
+  a literal reading of "built from inbound `STATUS` datagrams" would leave
+  the leader absent from its own `holders()`. As built, `Node::soft_table()`
+  stamps and records its own cached `Holdings` under its own node id before
+  returning the table — the leader is as much a legitimate holder and fetch
+  source as any follower, and omitting it would make a single-voter
+  cluster, or a quorum that happens to include the leader, read as having
+  no holder for a set it plainly has.
+- **`retain_sets` had no operator surface in the plan this spec was
+  reviewed against (ruling R6).** D5/§4.4 assume an operator can set
+  `retain_sets`, but neither `node.toml`'s `[settings]` nor `uc2ctl
+  settings apply`'s TOML carried the key — an omission Task 12 test 3 and
+  this spec's own `uc2ctl` documentation would otherwise have had nothing
+  to point at. Added as Task 8b (after Task 8): `[settings] retain_sets`
+  for genesis, the `retain_sets` key in the `settings apply` TOML, and
+  `settings show`'s rendering of it.

@@ -439,8 +439,13 @@ kinds instead of a fourth field on Settings.
 a replicated catalog of snapshot **sets**, keyed by position rather than by
 row, that remembers more than one set at a time and names each one's
 agreement verdict — closing the "the FSM forgets the previous set the
-moment a newer report lands" gap this section used to end on. See [the
-design spec](../superpowers/specs/2026-10-01-uc2-snapshot-catalog-design.md)
+moment a newer report lands" gap this section used to end on. The version
+it records per row is not the running version at the moment the report
+applies: it is the version IN FORCE STRICTLY BELOW that set's position,
+read back from the pin history above (`ClusterState::version_at`), which is
+what keeps a report that lands just after a pin commits from mislabelling
+the artifact `from` built as one `to` built. See [the design
+spec](../superpowers/specs/2026-10-01-uc2-snapshot-catalog-design.md)
 and, below, [What plan 1 did not do, and plan 2 did not
 either](#what-plan-1-did-not-do-and-plan-2-did-not-either) for the one
 paragraph that gap used to live in.
