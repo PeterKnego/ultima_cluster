@@ -41,6 +41,7 @@ use uc_log::archive::replay_journal_from;
 use uc_log::buffer::LogBuffer;
 use uc_log::cnc::CncPage;
 use uc_log::reader::{Batch, LogFollower};
+use uc_protocol::v2::catalog::SetEntry;
 use uc_protocol::v2::cnc::NODE_FLAG_LEARNER;
 use uc_protocol::v2::frame::{
     CLUSTER_BODY_PREFIX_LEN, ClusterKind, FLAG_SNAPSHOT_STANDBY, FRAME_TYPE_CLUSTER,
@@ -158,6 +159,26 @@ pub fn read_committed_upgrade(
         st.reports.clone(),
         st.running,
     )))
+}
+
+/// Catalog spec D3/`uc2ctl`'s offline reader: the commanded/complete set
+/// list this instance directory's newest cluster artifact holds, as
+/// `(position, catalog, declared_mask)` — `read_committed_table`'s contract
+/// and its staleness caveat, verbatim: this reads the artifact, not the live
+/// view. A freeze this agent pays (a full instant, or a standby one a
+/// learner takes) captures the just-recorded entry in the SAME artifact, but
+/// a voter's commanded entry for a standby instant it skipped the freeze for
+/// (task 7: recorded before the role check either way) is on-disk only once
+/// a later freeze writes it. `(0, [], 0)` when there is no artifact yet, the
+/// same "nothing yet" reading `read_committed_table` gives rather than an
+/// `Option`.
+pub fn read_committed_catalog(instance_dir: &Path) -> io::Result<(u64, Vec<SetEntry>, u64)> {
+    let genesis = ClusterState::genesis_empty();
+    // No declared hashes: this reader never APPLIES a command, and
+    // `install_snapshot` does not consult them.
+    let (fsm, _) = recover(&snapshot_dir_of(instance_dir), genesis, Vec::new())?;
+    let st = fsm.state();
+    Ok((st.applied, st.catalog.clone(), st.declared_mask()))
 }
 
 /// Recovery (spec §4.7): the newest `snap-*.ultcluster` under `dir`, or
@@ -508,6 +529,13 @@ impl ClusterAgent {
                             // pays no freeze (§5.7's whole point).
                             let end = pos + align_frame_len(hdr.length as usize) as u64;
                             let standby = hdr.flags & FLAG_SNAPSHOT_STANDBY != 0;
+                            // Catalog spec D3: every node records the
+                            // instant, whatever its role — a voter that
+                            // skips a standby freeze still catalogs the set,
+                            // or voters and learners would hold different
+                            // catalogs.
+                            self.fsm.on_snapshot_frame(end, standby, hdr.time_ns);
+                            applied_any = true;
                             if standby && node_flags & NODE_FLAG_LEARNER == 0 {
                                 continue;
                             }
@@ -961,6 +989,7 @@ mod tests {
     use uc_log::cnc::{CncMeta, CncPage, PinRead, RowRead};
     use uc_log::region::Region;
     use uc_protocol::identity::pack_version;
+    use uc_protocol::v2::catalog::{SetKind, SetState};
     use uc_protocol::v2::cnc::CNC_MAX_SERVICES;
     use uc_protocol::v2::frame::ClusterKind;
     use uc_protocol::v2::settings::{Settings, encode_settings};
@@ -1607,6 +1636,98 @@ mod tests {
             end2,
             "a learner takes a standby instant"
         );
+    }
+
+    /// Catalog spec D3: every node records the *commanded* set from a
+    /// `SNAPSHOT` frame before any role check — a voter that skips the
+    /// freeze for a standby instant (spec §5.7, the test right above this
+    /// one) must still catalog it, or voters and learners would hold
+    /// different catalogs. Modeled on
+    /// `a_standby_instant_is_ignored_unless_this_node_is_a_learner`, but this
+    /// node stays a voter throughout (flags word never gets
+    /// `NODE_FLAG_LEARNER`).
+    #[test]
+    fn a_voter_catalogs_a_standby_instant_it_does_not_freeze() {
+        let (buffer, cnc, dir) = world();
+        let mut app = buffer.appender_for_test(0);
+        app.set_now(1);
+
+        let (fsm, start) = recover(dir.path(), genesis_state(), vec![]).unwrap();
+        let view = Arc::new(ClusterView::new(fsm.state()));
+        let mut agent = ClusterAgent::new(
+            Arc::clone(&buffer),
+            Arc::clone(&cnc),
+            fsm,
+            view,
+            dir.path().join("snapshots/cluster"),
+            start,
+            Arc::new(AtomicU64::new(0)),
+            empty_journal(dir.path()),
+            no_install_route(),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+        );
+
+        // Flags word 0 = a voter throughout: never takes NODE_FLAG_LEARNER.
+        let (end, stamp) = app.append_snapshot(1, FLAG_SNAPSHOT_STANDBY).unwrap();
+        cnc.counters().durable.store_release(end);
+        cnc.counters().commit.store_release(end);
+        agent.do_work();
+
+        assert_eq!(
+            agent.snapshot_pos(),
+            0,
+            "a voter must not pay the freeze for a standby instant"
+        );
+        let catalog = &agent.fsm.state().catalog;
+        assert_eq!(
+            catalog.len(),
+            1,
+            "the voter still records the commanded set"
+        );
+        assert_eq!(catalog[0].position, end);
+        assert_eq!(catalog[0].kind, SetKind::Standby);
+        assert_eq!(catalog[0].state, SetState::Commanded);
+        assert_eq!(catalog[0].time_ns, stamp);
+    }
+
+    /// The mirror case: a FULL instant is catalogued too, on a node that DOES
+    /// pay the freeze (no role check in its path at all). Modeled on
+    /// `the_cluster_agent_freezes_at_a_snapshot_frames_position`.
+    #[test]
+    fn a_full_instant_is_catalogued_when_it_is_frozen() {
+        let (buffer, cnc, dir) = world();
+        let mut app = buffer.appender_for_test(0);
+        app.set_now(1);
+
+        let (fsm, start) = recover(dir.path(), genesis_state(), vec![]).unwrap();
+        let view = Arc::new(ClusterView::new(fsm.state()));
+        let mut agent = ClusterAgent::new(
+            Arc::clone(&buffer),
+            Arc::clone(&cnc),
+            fsm,
+            view,
+            dir.path().join("snapshots/cluster"),
+            start,
+            Arc::new(AtomicU64::new(0)),
+            empty_journal(dir.path()),
+            no_install_route(),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+        );
+
+        let (end, stamp) = app.append_snapshot(1, 0).unwrap();
+        cnc.counters().durable.store_release(end);
+        cnc.counters().commit.store_release(end);
+        agent.do_work();
+
+        assert_eq!(agent.snapshot_pos(), end, "a full instant is frozen");
+        let catalog = &agent.fsm.state().catalog;
+        assert_eq!(catalog.len(), 1);
+        assert_eq!(catalog[0].position, end);
+        assert_eq!(catalog[0].kind, SetKind::Full);
+        assert_eq!(catalog[0].state, SetState::Commanded);
+        assert_eq!(catalog[0].time_ns, stamp);
     }
 
     /// Stages an `Overrun` the same way `uc_log::reader`'s own
