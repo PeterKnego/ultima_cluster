@@ -388,3 +388,25 @@ before its `STATUS` is ever parsed.
   whether a node may retire below the catalog's `retain_sets` once the tier
   confirms a set.
 - Project 4: the live-read mechanism (§6.3) and the JSON shape an AI reads.
+
+#### Errata (plan review, 2026-10-04)
+
+- **`SetState::Retiring` is removed.** §4.4 step 2 drops a retiring entry in
+  the same apply that marks it, so the state was never observable and
+  `retiring()` would always answer nothing. A retired set is simply removed
+  from the list; `SetState` is `Commanded | Complete`. "What may this node
+  delete" is a node-local reading — every artifact on disk whose position
+  the catalog does not list — so `retiring()` leaves the query interface and
+  becomes the pruner's own rule (§4.4 step 3 already says "everything the
+  catalog does not list").
+- **`declared_mask` is derived from `running`.** The FSM does not hold
+  `[services] names`; since #33 every declared row has a committed running
+  version before it serves, so "every declared row" in `is_agreed` means
+  every row with a `running` entry.
+- **`retain_sets = 0` is refused at `apply` unconditionally** (47); genesis
+  seeds `1`. A `0` reaches the state only through an installed v1–v3 image,
+  where `retain_sets()` reads it as `1`.
+- **The soft table's staleness timeout** is `3 × election_timeout_max_ns`
+  (900 ms by default): no per-peer heartbeat timestamp existed to reuse.
+- **`uc2_catalog_stalled`** counts commanded-not-complete sets with no
+  timeout; the timeout judgement is the `stalled()` query's.
