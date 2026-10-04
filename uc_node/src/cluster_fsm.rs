@@ -252,7 +252,7 @@ impl ClusterState {
             RowVerdict::NoMajority
         };
         let entry = RowEntry {
-            version: self.version_for_report(r.row),
+            version: self.version_at(r.row, r.position),
             hash: v.majority_hash.unwrap_or(0),
             verdict,
         };
@@ -278,13 +278,31 @@ impl ClusterState {
         }
     }
 
-    /// The FSM version a report's artifact was built by, as the catalog
-    /// records it: a row's RUNNING version at the time the report applies
-    /// (`0` with none recorded); `0` for the cluster row, whose artifact is
-    /// versioned by the image layout, not by an FSM version.
-    fn version_for_report(&self, row: u8) -> u32 {
+    /// The FSM version IN FORCE STRICTLY BELOW `p` for `row` — the version
+    /// that built the row's artifact at `p`, which the catalog records
+    /// (ledger ruling R4). A pin at origin P commits AFTER P, so a report
+    /// for P can land after it; the running version at report-apply time
+    /// would then name the pin's `to` for an artifact its `from` built.
+    ///
+    /// Derived from the pin history, oldest → newest: the EARLIEST pin with
+    /// `origin >= p` names its `from` (that pin's install had not taken
+    /// effect at `p`); otherwise the LATEST pin's `to`; otherwise the row's
+    /// running version (`0` with none recorded). The cluster row is `0` —
+    /// its artifact is versioned by the image layout, not an FSM version.
+    ///
+    /// The history is bounded at [`MAX_PINS_PER_ROW`] per row, so a set
+    /// older than four pins back reads the oldest RETAINED pin's `from`,
+    /// which may not be the version that built it.
+    pub fn version_at(&self, row: u8, p: u64) -> u32 {
         if row == CLUSTER_ROW {
             return 0;
+        }
+        let mut row_pins = self.pins.iter().filter(|q| q.row == row);
+        if let Some(q) = row_pins.clone().find(|q| q.origin >= p) {
+            return q.from;
+        }
+        if let Some(q) = row_pins.next_back() {
+            return q.to;
         }
         self.running_for(row).map_or(0, |r| r.version)
     }
@@ -953,6 +971,12 @@ impl SnapshotStateMachine for ClusterFsm {
         } else {
             decode_set_list(parts.catalog).ok_or_else(|| bad("cluster image: catalog"))?
         };
+        // The list is keyed by position, oldest first; `retire` and every
+        // reader rely on that order, so an image that breaks it is refused
+        // rather than installed (and the state is left untouched).
+        if catalog.windows(2).any(|w| w[0].position >= w[1].position) {
+            return Err(bad("cluster image: catalog out of order"));
+        }
         self.state = ClusterState {
             membership,
             table,
@@ -2470,5 +2494,75 @@ mod tests {
         assert_eq!(v.catalog_diverged.load(Ordering::Acquire), 1);
         assert_eq!(v.snapshot_inner().catalog, f.state().catalog);
         assert_eq!(v.to_state(), *f.state());
+    }
+
+    #[test]
+    fn the_catalog_records_the_version_that_built_the_set_not_the_one_after_a_pin() {
+        let mut f = fsm();
+        genesis_row(&mut f, 0, 100);
+        f.on_snapshot_frame(4096, false, 1);
+        let up = UpgradePin {
+            row: 0,
+            origin: 4096,
+            from: pack_version(1, 0, 0),
+            to: pack_version(1, 1, 0),
+        };
+        assert_eq!(apply_at(&mut f, 4200, &ClusterCommand::UpgradePin(up)), 0);
+        assert_eq!(apply_at(&mut f, 4300, &report(0, 4096, &[(0, 7)])), 0);
+        assert_eq!(
+            apply_at(&mut f, 4400, &report(CLUSTER_ROW, 4096, &[(0, 9)])),
+            0
+        );
+        let e = f
+            .state()
+            .catalog
+            .iter()
+            .find(|e| e.position == 4096)
+            .unwrap();
+        assert_eq!(e.rows[0].version, pack_version(1, 0, 0), "from built it");
+        // A later set, reported after the pin, was built by `to`.
+        f.on_snapshot_frame(8192, false, 2);
+        assert_eq!(apply_at(&mut f, 8300, &report(0, 8192, &[(0, 8)])), 0);
+        assert_eq!(
+            apply_at(&mut f, 8400, &report(CLUSTER_ROW, 8192, &[(0, 9)])),
+            0
+        );
+        let e = f
+            .state()
+            .catalog
+            .iter()
+            .find(|e| e.position == 8192)
+            .unwrap();
+        assert_eq!(e.rows[0].version, pack_version(1, 1, 0));
+    }
+
+    #[test]
+    fn an_image_whose_catalog_is_out_of_order_is_refused() {
+        let mut f = fsm();
+        f.on_snapshot_frame(1000, false, 1);
+        f.on_snapshot_frame(2000, true, 2);
+        f.set_consumed(3000);
+        let (img, _) = f.freeze().unwrap();
+        // The catalog blob is the image's tail before the CRC:
+        // count u16 ‖ 2 × SET_ENTRY_LEN.
+        use uc_protocol::v2::catalog::SET_ENTRY_LEN;
+        let body_end = img.len() - 4;
+        let first = body_end - 2 * SET_ENTRY_LEN;
+        let mut bad = img[..body_end].to_vec();
+        let a = bad[first..first + SET_ENTRY_LEN].to_vec();
+        let b = bad[first + SET_ENTRY_LEN..body_end].to_vec();
+        bad[first..first + SET_ENTRY_LEN].copy_from_slice(&b);
+        bad[first + SET_ENTRY_LEN..body_end].copy_from_slice(&a);
+        let crc = crc32fast::hash(&bad);
+        bad.extend_from_slice(&crc.to_le_bytes());
+        let mut g = fsm();
+        let before = g.state().clone();
+        match g.install_snapshot(3000, &mut &bad[..]) {
+            Err(SnapshotError::Codec(m)) => assert_eq!(m, "cluster image: catalog out of order"),
+            other => panic!("expected the order refusal, got {other:?}"),
+        }
+        assert_eq!(*g.state(), before, "a refused install changes nothing");
+        // Control: the unswapped image installs.
+        assert_eq!(g.install_snapshot(3000, &mut &img[..]).unwrap(), 3000);
     }
 }
