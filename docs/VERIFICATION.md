@@ -483,8 +483,15 @@ one-instant-per-row rule: zero appends),
 `an_appended_instant_drops_the_older_pending_ones_as_superseded`,
 `pending_instants_are_bounded_per_row_and_the_oldest_is_evicted`, and the
 re-offer to a new leader,
-`a_follower_re_offers_its_newest_set_to_a_new_leader_once` and
-`a_new_leader_re_offers_its_own_newest_set_to_itself`.
+`a_follower_re_offers_its_newest_set_to_a_new_leader_once`,
+`a_new_leader_re_offers_its_own_newest_set_to_itself` and (ruling R38-2,
+every held set the catalog lists as not complete)
+`a_follower_re_offers_every_held_commanded_set_to_a_new_leader`. Ruling
+R38-1's clock — the timeout runs from the instant's log-time stamp, so a
+leader change does not restart it — is
+`a_fresh_leader_times_an_old_instant_out_on_the_logs_clock`,
+`an_instant_times_out_when_the_log_clock_reaches_it_plus_the_timeout` and
+the fallback `an_unlisted_instant_falls_back_to_its_first_sighting`.
 
 The **readiness gate** — B2's deferred boot window — is pinned clause by
 clause, because each clause alone is vacuous:

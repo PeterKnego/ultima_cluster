@@ -639,14 +639,19 @@ is three seams:
    different artifacts never mix), and a newer instant never discards an
    older one's evidence. A collection goes onto the log when **every voter in
    the current membership has reported** that instant, or five seconds
-   (`SNAP_REPORT_TIMEOUT_NS`) after ITS first report — whichever comes first
+   (`SNAP_REPORT_TIMEOUT_NS`) of LOG time after the instant itself — the
+   SNAPSHOT frame's stamp, as the catalog records it (ruling R38; an instant
+   the catalog does not list yet times out from its first report) — whichever
+   comes first
    — through the same single-in-flight cluster append every other `CLUSTER`
    command uses, at most one per pass, lowest row first and, within a row,
    oldest instant first. Appending an instant drops the row's older pending
    collections (once it commits they would be refused as stale); a row holds
    at most 64 pending instants, the oldest evicted past that. Both leader
-   exits drop the collections, so every node re-offers its newest complete
-   set's reports once each time it learns a new leader.
+   exits drop the collections, so every node re-offers the reports for every
+   set it holds that the catalog still lists as not complete, once each time
+   it learns a new leader — and since the clock is the log's, the new leader
+   does not start it over.
 
    *Why per instant* (snapshot catalog spec, erratum R37). The first version
    kept one pending instant per row and let a newer report replace it. With

@@ -1296,7 +1296,9 @@ Three consequences:
 > **Amended by the snapshot catalog spec's erratum R37**
 > (`2026-10-01-uc2-snapshot-catalog-design.md`, last block): the leader keeps
 > one pending collection per `(row, instant)` with its own timeout, not one
-> per row, and nodes re-offer their newest set's reports to a new leader.
+> per row; and by its ruling R38 the timeout runs from the instant's own
+> log-time stamp and nodes re-offer every held, not-yet-complete set's
+> reports to a new leader.
 
 #### Errata (plan B3, as built)
 
