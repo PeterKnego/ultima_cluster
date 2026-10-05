@@ -2391,6 +2391,7 @@ impl Node {
             snapshot_reports_timed_out: Arc::clone(&snapshot_reports_timed_out),
             pending_snapshot_reports: HashMap::new(),
             report_leader_seen: None,
+            reported_sets: Vec::with_capacity(MAX_CATALOG_SETS),
             ingress_rx,
             trunc_tx,
             trunc_slot,
@@ -3217,10 +3218,29 @@ struct PendingAdminFwd {
 /// node-id order, which is exactly the canonical order
 /// [`uc_protocol::v2::upgrade::encode_snapshot_report`] requires — so the
 /// record encodes identically wherever it is built.
+/// Ruling R38-2: the `(row, hash)` reports one set produced on this node's
+/// completion edge, kept for the re-offer to a new leader. A fixed array, so
+/// the cache allocates only when it grows.
+#[derive(Clone, Copy)]
+struct ReportedSet {
+    position: u64,
+    n: usize,
+    reports: [(u8, u64); CNC_MAX_SERVICES + 1],
+}
+
 struct PendingSnapshotReport {
     position: u64,
     first_seen_ns: u64,
     hashes: BTreeMap<u32, u64>,
+    /// Ruling R38-1: the instant's own log-time stamp, from the committed
+    /// catalog's entry at `position` — `None` until this node's catalog lists
+    /// it. When known, the timeout runs from IT in log time, so a leader
+    /// change (which empties the collector) does not restart the clock.
+    instant_time_ns: Option<u64>,
+    /// The `ClusterView::position` at which `instant_time_ns` was last looked
+    /// up and not found: the walk re-reads the catalog for this entry only
+    /// once the view has moved, never on every pass.
+    time_looked_up_at: u64,
 }
 
 struct Consensus {
@@ -3592,14 +3612,15 @@ struct Consensus {
     /// leader exit for `last_cluster_append`'s reason — a set collected under
     /// a term we no longer lead is not ours to place.
     pending_snapshot_reports: HashMap<u8, Vec<PendingSnapshotReport>>,
-    /// Catalog erratum R37 item 4: the leader (`(node id, term)`) this node
-    /// last offered its snapshot reports to. A leader exit clears the
-    /// collection, so a node re-offers its NEWEST complete set's reports once
+    /// Catalog erratum R37 item 4 / ruling R38-2: the leadership (`(node id,
+    /// term)`) this node last re-offered its held, not-yet-Complete sets to.
+    /// A leader exit clears the collection, so a node re-offers them once
     /// each time the cnc `leader_hint` names a different leadership —
-    /// [`Consensus::maybe_reoffer_snapshot_reports`] — and
-    /// `send_snapshot_reports` records every leader it reports to here, so a
-    /// set-complete edge is never followed by a duplicate re-offer.
+    /// [`Consensus::maybe_reoffer_snapshot_reports`].
     report_leader_seen: Option<(u64, u32)>,
+    /// Ruling R38-2: what this node reported per set, ascending by position,
+    /// at most `MAX_CATALOG_SETS` — see [`Consensus::cache_report_set`].
+    reported_sets: Vec<ReportedSet>,
     /// Plan B3 (spec §6.5.2): `CLUSTER kind = 5` records this leader placed
     /// (`uc2_snapshot_reports_appended_total`), and how many of those went in
     /// on the TIMEOUT rather than on every voter reporting
@@ -6680,24 +6701,6 @@ impl Consensus {
             rows[n] = row;
             n += 1;
         }
-        // A leader reports to ITSELF, in-process: the collector is this same
-        // agent, so a datagram to our own address would only add latency and
-        // a loss mode. The hint and the term are read once for the whole
-        // edge — every report in it names the same instant.
-        let leader = matches!(self.sm.role(), Role::Leader);
-        let term = self.sm.current_term();
-        let hint = self.cnc.status().leader_hint.load_acquire();
-        let leader_addr = (hint != u64::MAX)
-            .then(|| self.id_to_addr.get(&(hint as NodeId)).copied())
-            .flatten();
-        // Catalog erratum R37 item 4: whoever these reports reach has been
-        // offered this node's newest set, so the re-offer on a leader change
-        // (`maybe_reoffer_snapshot_reports`) does not repeat it.
-        if leader {
-            self.report_leader_seen = Some((self.id as u64, term));
-        } else if leader_addr.is_some() {
-            self.report_leader_seen = Some((hint, term));
-        }
         // Catalog spec §5.1: the cluster artifact at `p` joins the report as
         // row [`CLUSTER_ROW`], hashed with `artifact_hash_of` — the SAME
         // function the service builder applies to a row's payload. The
@@ -6734,7 +6737,66 @@ impl Consensus {
             reports[m] = r;
             m += 1;
         }
-        for &(row, hash) in &reports[..m] {
+        self.cache_report_set(p, &reports[..m]);
+        self.deliver_snapshot_reports(p, &reports[..m]);
+    }
+
+    /// Ruling R38-2: keep what this node reported for set `p` — the cnc slots
+    /// carry only the NEWEST instant's hash, so an older held set's hashes
+    /// exist nowhere else in memory, and re-offering it to a new leader
+    /// needs them. One entry per set, at most [`MAX_CATALOG_SETS`] (the
+    /// lowest position evicted past that); written on a set's completion
+    /// edge, never per pass. A later computation for the same set that
+    /// found FEWER rows (a row has since frozen a newer instant) does not
+    /// replace a fuller one. Node memory only: a restart forgets it, and a
+    /// restarted node re-offers only what its slots still name.
+    fn cache_report_set(&mut self, p: u64, reports: &[(u8, u64)]) {
+        if reports.is_empty() {
+            return;
+        }
+        let mut set = ReportedSet {
+            position: p,
+            n: reports.len(),
+            reports: [(0u8, 0u64); CNC_MAX_SERVICES + 1],
+        };
+        set.reports[..reports.len()].copy_from_slice(reports);
+        match self.reported_sets.binary_search_by_key(&p, |s| s.position) {
+            Ok(i) => {
+                if reports.len() >= self.reported_sets[i].n {
+                    self.reported_sets[i] = set;
+                }
+            }
+            Err(i) => {
+                if self.reported_sets.len() >= MAX_CATALOG_SETS {
+                    if i == 0 {
+                        return;
+                    }
+                    self.reported_sets.remove(0);
+                    self.reported_sets.insert(i - 1, set);
+                } else {
+                    self.reported_sets.insert(i, set);
+                }
+            }
+        }
+    }
+
+    /// Hand one set's `(row, hash)` reports to the leader: in-process when
+    /// this node leads, a `SNAP_REPORT` datagram per row otherwise, dropped
+    /// and counted when no leader is known. Split out of
+    /// [`Self::send_snapshot_reports`] so the re-offer (ruling R38-2) can
+    /// deliver a set whose hashes come from [`Self::cache_report_set`].
+    fn deliver_snapshot_reports(&mut self, p: u64, reports: &[(u8, u64)]) {
+        // A leader reports to ITSELF, in-process: the collector is this same
+        // agent, so a datagram to our own address would only add latency and
+        // a loss mode. The hint and the term are read once for the whole
+        // edge — every report in it names the same instant.
+        let leader = matches!(self.sm.role(), Role::Leader);
+        let term = self.sm.current_term();
+        let hint = self.cnc.status().leader_hint.load_acquire();
+        let leader_addr = (hint != u64::MAX)
+            .then(|| self.id_to_addr.get(&(hint as NodeId)).copied())
+            .flatten();
+        for &(row, hash) in reports {
             if leader {
                 crate::obs_event!(
                     Info,
@@ -6779,24 +6841,30 @@ impl Consensus {
         }
     }
 
-    /// Catalog erratum R37 item 4: re-offer this node's NEWEST complete set's
-    /// reports (`snapshot_set_position`, when non-zero) each time it learns a
-    /// DIFFERENT leadership — the cnc `leader_hint` naming another node, or
-    /// this node itself once it leads, in which case `send_snapshot_reports`
-    /// feeds its own collector in-process. Both leader exits clear the
+    /// Catalog erratum R37 item 4 as amended by ruling R38-2: on each new
+    /// leadership, re-offer the reports for EVERY set this node holds that
+    /// the committed catalog still lists as `Commanded` (not yet Complete)
+    /// and that sits above the lowest committed report position among this
+    /// node's report rows — not only the newest. Both leader exits clear the
     /// collector, so without this the evidence collected under one leader is
-    /// simply lost to the next, and a set agreed nowhere holds the purge floor
-    /// until the NEXT instant agrees.
+    /// lost to the next; re-offering only the newest set lost every older
+    /// pending instant at each failover (proof run (e), round 1). On an EMPTY
+    /// catalog it re-offers the newest complete set (`snapshot_set_position`)
+    /// as before; the newest set is also offered when the catalog does not
+    /// list it yet (this node's view can trail its own completion edge).
+    /// Bounded by the catalog (at most [`MAX_CATALOG_SETS`] sets), ascending.
+    /// A set's hashes come from [`Self::cache_report_set`] when this node
+    /// recorded them (the cnc slots name only the newest instant), else from
+    /// the slots through `send_snapshot_reports`, whose `snapshot_pos == p`
+    /// guard skips a row that has since frozen a newer instant.
     ///
-    /// Keyed on `(leader id, term)`, not the id alone: a node re-elected in a
-    /// later term cleared its collector on the exit in between, so it is a
-    /// different collection to offer to. Once per leadership: the key is
-    /// recorded here and by every `send_snapshot_reports` that reached a
-    /// leader, so neither a heartbeat nor a set-complete edge repeats it. An
-    /// unknown leader (`u64::MAX`) or a candidate's stale hint records
-    /// nothing — the next known leader is offered the set. `send_snapshot_reports`'s own
-    /// `snapshot_pos == p` guard skips a row that has since frozen a newer
-    /// instant.
+    /// A new leadership is the cnc `leader_hint` naming another node, or this
+    /// node itself once it leads (in which case delivery feeds its own
+    /// collector in-process). Keyed on `(leader id, term)`, not the id alone:
+    /// a node re-elected in a later term cleared its collector on the exit in
+    /// between. Once per leadership — never per heartbeat. An unknown leader
+    /// (`u64::MAX`) or a candidate's stale hint records nothing. The
+    /// catalog read is one view clone per leadership change, never per pass.
     fn maybe_reoffer_snapshot_reports(&mut self) {
         let hint = self.cnc.status().leader_hint.load_acquire();
         // A candidate has bumped its term but still carries the hint of the
@@ -6809,9 +6877,61 @@ impl Consensus {
             return;
         }
         self.report_leader_seen = Some(leadership);
-        let p = self.snapshot_set_position.load(Ordering::Acquire);
-        if p != 0 {
-            self.send_snapshot_reports(p);
+        let newest = self.snapshot_set_position.load(Ordering::Acquire);
+        let inner = self.cluster_view.snapshot_inner();
+        if inner.catalog.is_empty() {
+            if newest != 0 {
+                self.reoffer_set(newest);
+            }
+            return;
+        }
+        // The lowest committed report position over this node's report rows:
+        // a set at or below it has nothing left to say for any row.
+        let cluster_reported = inner
+            .catalog
+            .iter()
+            .rev()
+            .find(|e| e.cluster.verdict != uc_protocol::v2::catalog::RowVerdict::Unreported)
+            .map_or(0, |e| e.position);
+        let low = self
+            .services
+            .ids()
+            .map(|row| {
+                inner
+                    .reports
+                    .iter()
+                    .find(|r| r.row == row)
+                    .map_or(0, |r| r.position)
+            })
+            .fold(cluster_reported, u64::min);
+        let mut sets = [0u64; MAX_CATALOG_SETS + 1];
+        let mut n = 0usize;
+        for e in &inner.catalog {
+            if n < MAX_CATALOG_SETS
+                && e.state == SetState::Commanded
+                && e.position > low
+                && self.holdings_held.contains(&e.position)
+            {
+                sets[n] = e.position;
+                n += 1;
+            }
+        }
+        if newest > low && !inner.catalog.iter().any(|e| e.position == newest) {
+            sets[n] = newest;
+            n += 1;
+        }
+        sets[..n].sort_unstable();
+        for &p in &sets[..n] {
+            self.reoffer_set(p);
+        }
+    }
+
+    /// Re-offer one set: from the cache when this node recorded its reports,
+    /// else from the cnc slots (which hold only the newest instant).
+    fn reoffer_set(&mut self, p: u64) {
+        match self.reported_sets.iter().find(|s| s.position == p).copied() {
+            Some(set) => self.deliver_snapshot_reports(p, &set.reports[..set.n]),
+            None => self.send_snapshot_reports(p),
         }
     }
 
@@ -6901,6 +7021,12 @@ impl Consensus {
         }
         let now = self.pass_mono_ns;
         let node = self.id as u64;
+        // Ruling R38-1, read before the entry borrow below (it locks the
+        // view). Only a NEW entry uses it; a report joining an existing entry
+        // pays one scalar read it did not need — the same once-per-report
+        // cost `held_report_position` above already takes.
+        let view_at = self.cluster_view.position.load(Ordering::Acquire);
+        let instant_time_ns = self.cluster_view.catalog_time_at(position);
         let list = self.pending_snapshot_reports.entry(row).or_default();
         let mut at = match list.binary_search_by_key(&position, |e| e.position) {
             Ok(i) => {
@@ -6938,6 +7064,8 @@ impl Consensus {
                 position,
                 first_seen_ns: now,
                 hashes,
+                instant_time_ns,
+                time_looked_up_at: view_at,
             },
         );
     }
@@ -6948,10 +7076,22 @@ impl Consensus {
     /// leader-issued `CLUSTER` appends.
     ///
     /// An entry is ready when EVERY VOTER in the current membership has
-    /// reported it, or when THAT ENTRY has stood for
-    /// [`SNAP_REPORT_TIMEOUT_NS`] on its own clock, whichever comes first
+    /// reported it, or when its timeout has run, whichever comes first
     /// (catalog erratum R37: a newer instant never restarts an older one's
-    /// clock). The timeout is what keeps a down node from
+    /// clock).
+    ///
+    /// **Whose clock** (ruling R38-1). When the committed catalog lists the
+    /// instant, the timeout runs from the INSTANT: the entry is ready once the
+    /// leader's LOG time (`log_time_now`, the stamp its next frame would
+    /// carry) reaches the SNAPSHOT frame's own stamp (`SetEntry::time_ns`)
+    /// plus [`SNAP_REPORT_TIMEOUT_NS`]. A leader change empties the collector,
+    /// but it no longer restarts the clock, because the clock is the log's —
+    /// a new leader that hears one report for an instant already 5 s old
+    /// appends it at once. Only an instant this node's catalog does not list
+    /// yet falls back to `first_seen_ns` + the timeout in the pass's
+    /// monotonic clock. The catalog is read when the entry is made and, if
+    /// it was not listed then, again only once the view has moved — never
+    /// per pass. The timeout is what keeps a down node from
     /// stopping the record altogether: the append then names who DID report,
     /// which is exactly the evidence [`uc_protocol::v2::upgrade::verdict`]
     /// reads.
@@ -7027,6 +7167,7 @@ impl Consensus {
             return false; // single-in-flight: a CLUSTER command is above commit
         }
         let now = self.pass_mono_ns;
+        let log_now = self.log_time_now();
         let config = self.sm.config().clone();
         // Ruling R-B3-1: every voter, not a majority of them. Read from the
         // SAME config the payload filter below uses, so "who must report" and
@@ -7055,6 +7196,19 @@ impl Consensus {
                 .and_then(|list| list.get(i))
             {
                 let position = pend.position;
+                // Ruling R38-1: an instant the catalog had not listed when
+                // this entry was made is looked up again once the view has
+                // moved — at most once per view change per entry.
+                if pend.instant_time_ns.is_none() && pend.time_looked_up_at != view_position {
+                    let t = self.cluster_view.catalog_time_at(position);
+                    let pend = &mut self
+                        .pending_snapshot_reports
+                        .get_mut(&row)
+                        .expect("row present")[i];
+                    pend.instant_time_ns = t;
+                    pend.time_looked_up_at = view_position;
+                }
+                let pend = &self.pending_snapshot_reports[&row][i];
                 // Counted on the config-filtered set (`is_voter` implies
                 // membership), before anything is collected: an entry that is
                 // still waiting costs the pass no allocation.
@@ -7063,7 +7217,10 @@ impl Consensus {
                     .keys()
                     .filter(|id| config.is_voter(**id))
                     .count();
-                let timed_out = now.saturating_sub(pend.first_seen_ns) >= SNAP_REPORT_TIMEOUT_NS;
+                let timed_out = match pend.instant_time_ns {
+                    Some(t) => log_now >= t.saturating_add(SNAP_REPORT_TIMEOUT_NS),
+                    None => now.saturating_sub(pend.first_seen_ns) >= SNAP_REPORT_TIMEOUT_NS,
+                };
                 if voters_reporting < voters_required && !timed_out {
                     i += 1;
                     continue; // still collecting
@@ -7171,6 +7328,15 @@ impl Consensus {
             }
         }
         false
+    }
+
+    /// Ruling R38-1: the leader's current LOG time — the stamp the next frame
+    /// would carry, `max(pass stamp, last stamp)`, exactly the clamp the
+    /// appender applies. A follower (no appender) answers the pass stamp.
+    fn log_time_now(&self) -> u64 {
+        self.appender
+            .as_ref()
+            .map_or(self.pass_now_ns, |a| a.last_stamp().max(self.pass_now_ns))
     }
 
     /// Test-only: `row`'s pending instants, ascending by position (empty
@@ -13022,6 +13188,7 @@ mod tests {
             snapshot_reports_timed_out: Arc::new(AtomicU64::new(0)),
             pending_snapshot_reports: HashMap::new(),
             report_leader_seen: None,
+            reported_sets: Vec::with_capacity(MAX_CATALOG_SETS),
             ingress_rx,
             trunc_tx,
             trunc_slot,
@@ -15370,6 +15537,10 @@ mod tests {
         let mut h = harness_with_rows_and_peers(&["a"], &[(0, addr0), (2, addr2)]);
         assert!(!matches!(h.cons.sm.role(), Role::Leader));
         h.cons.cnc.status().leader_hint.store_release(0);
+        // Leader 0 is learned before the set completes — the ordinary order:
+        // nothing is held yet, so that leadership is recorded with nothing
+        // to offer.
+        h.cons.maybe_reoffer_snapshot_reports();
 
         let p = 6016u64;
         h.row_published_at(0, p, 0x0D0D_0D0D_0D0D_0D0D);
@@ -15472,6 +15643,159 @@ mod tests {
             vec![(h.cons.id, 0x0E0E_0E0E_0E0E_0E0E)],
             "under its own id, in-process"
         );
+    }
+
+    /// Ruling R38-1 helper: publish a committed catalog listing a
+    /// `Commanded` FULL set at each `(position, time_ns)`.
+    fn publish_commanded_catalog(h: &mut Harness, sets: &[(u64, u64)]) {
+        use uc_protocol::v2::catalog::{SetEntry, SetKind};
+        let mut st = h.cons.cluster_view.to_state();
+        st.catalog = sets
+            .iter()
+            .map(|&(p, t)| SetEntry::commanded(p, SetKind::Full, t))
+            .collect();
+        h.cons.cluster_view.publish(&st);
+    }
+
+    /// Ruling R38-1 helper: put the leader's LOG clock at `t` — the per-pass
+    /// stamp, at or above the appender's last stamp (the log never goes
+    /// backwards, so a value below it would not be the log's time).
+    fn set_log_time(h: &mut Harness, t: u64) -> u64 {
+        let last = h.cons.appender.as_ref().map_or(0, |a| a.last_stamp());
+        let t = t.max(last);
+        h.cons.pass_now_ns = t;
+        t
+    }
+
+    /// Ruling R38-1: a report's timeout runs from the INSTANT (the SNAPSHOT
+    /// frame's log-time stamp, as the committed catalog records it), not
+    /// from this leader's first sighting. A fresh leader — its collector
+    /// empty, as after every leader change — that receives one report for
+    /// an instant already 6 s old in log time appends it on the next walk,
+    /// by timeout, naming the one voter that reported.
+    #[test]
+    fn a_fresh_leader_times_an_old_instant_out_on_the_logs_clock() {
+        let _obs = obs_capture_lock();
+        let mut h = harness_with_rows(&["a"]);
+        drive_to_serving_leader(&mut h);
+        const SEC: u64 = 1_000_000_000;
+        let now = set_log_time(&mut h, 100 * SEC);
+        let p = 8192u64;
+        publish_commanded_catalog(&mut h, &[(p, now - 6 * SEC)]);
+        h.cons.pass_mono_ns = 1_000;
+        h.cons.on_snap_report(0, 0, p, 0x61);
+        let cap = ObsCapture::take();
+        let buf = cap.buf();
+        assert!(
+            h.cons.maybe_append_snapshot_reports(),
+            "the instant is 6 s old on the log's clock — past the timeout, \
+             however recently THIS leader first saw a report for it"
+        );
+        let text = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(
+            text.contains(r#""by":"timeout""#) && text.contains(r#""voters_reporting":1"#),
+            "by timeout, with the one voter that reported: {text}"
+        );
+        assert_eq!(h.cons.snapshot_reports_timed_out.load(Ordering::Relaxed), 1);
+    }
+
+    /// Ruling R38-1, the negative and the boundary: an instant 1 s old in log
+    /// time does not time out, and it does once the LOG clock (not the pass's
+    /// monotonic clock, which does not move here) reaches 5 s after it.
+    #[test]
+    fn an_instant_times_out_when_the_log_clock_reaches_it_plus_the_timeout() {
+        let mut h = harness_with_rows(&["a"]);
+        drive_to_serving_leader(&mut h);
+        const SEC: u64 = 1_000_000_000;
+        let now = set_log_time(&mut h, 100 * SEC);
+        let p = 8192u64;
+        let t0 = now - SEC;
+        publish_commanded_catalog(&mut h, &[(p, t0)]);
+        h.cons.pass_mono_ns = 1_000;
+        h.cons.on_snap_report(0, 0, p, 0x62);
+        assert!(
+            !h.cons.maybe_append_snapshot_reports(),
+            "1 s old: still collecting"
+        );
+        h.cons.pass_now_ns = t0 + SNAP_REPORT_TIMEOUT_NS - 1;
+        assert!(
+            !h.cons.maybe_append_snapshot_reports(),
+            "a nanosecond short"
+        );
+        h.cons.pass_now_ns = t0 + SNAP_REPORT_TIMEOUT_NS;
+        assert!(
+            h.cons.maybe_append_snapshot_reports(),
+            "the log clock reached instant + timeout; the monotonic clock never moved"
+        );
+    }
+
+    /// Ruling R38-1, the fallback: an instant the committed catalog does not
+    /// list yet (its frame not committed on this node) times out on
+    /// `first_seen_ns` in the pass's monotonic clock, as before — however far
+    /// the log clock has run.
+    #[test]
+    fn an_unlisted_instant_falls_back_to_its_first_sighting() {
+        let mut h = harness_with_rows(&["a"]);
+        drive_to_serving_leader(&mut h);
+        const SEC: u64 = 1_000_000_000;
+        set_log_time(&mut h, 100 * SEC);
+        let p = 8192u64;
+        h.cons.pass_mono_ns = 1_000;
+        h.cons.on_snap_report(0, 0, p, 0x63);
+        h.cons.pass_now_ns += 60 * SEC;
+        assert!(
+            !h.cons.maybe_append_snapshot_reports(),
+            "no catalog entry: the log clock is not this instant's clock"
+        );
+        h.cons.pass_mono_ns = 1_000 + SNAP_REPORT_TIMEOUT_NS;
+        assert!(h.cons.maybe_append_snapshot_reports(), "first_seen + 5 s");
+    }
+
+    /// Ruling R38-2: on a new leader a node re-offers EVERY set it holds that
+    /// the committed catalog still lists as not Complete — not only its
+    /// newest — once per leadership. The older set's hashes are no longer on
+    /// the cnc slots (they name only the newest instant), so they come from
+    /// what this node computed at that set's own completion edge.
+    #[test]
+    fn a_follower_re_offers_every_held_commanded_set_to_a_new_leader() {
+        let (sock2, addr2) = report_peer_socket();
+        let mut h = harness_with_rows_and_peers(&["a"], &[(2, addr2)]);
+        assert!(!matches!(h.cons.sm.role(), Role::Leader));
+        let (p1, p2) = (6016u64, 6048u64);
+        // Both sets complete while no leader is known: nothing is sent.
+        h.row_published_at(0, p1, 0x0101);
+        h.cluster_snapshot_pos.store(p1, Ordering::Release);
+        h.cons.check_set_completeness();
+        h.row_published_at(0, p2, 0x0202);
+        h.cluster_snapshot_pos.store(p2, Ordering::Release);
+        h.cons.check_set_completeness();
+        assert_eq!(h.cons.snapshot_set_position.load(Ordering::Relaxed), p2);
+        publish_commanded_catalog(&mut h, &[(p1, 1), (p2, 2)]);
+
+        h.cons.cnc.status().leader_hint.store_release(2);
+        h.cons.maybe_reoffer_snapshot_reports();
+        let mut got = drain_snap_reports(&sock2);
+        got.sort_by_key(|b| b.position);
+        assert_eq!(
+            got,
+            vec![
+                SnapReportBody {
+                    row: 0,
+                    node_id: 1,
+                    position: p1,
+                    hash: 0x0101,
+                },
+                SnapReportBody {
+                    row: 0,
+                    node_id: 1,
+                    position: p2,
+                    hash: 0x0202,
+                },
+            ],
+            "both Commanded sets this node holds, each with ITS hash"
+        );
+        h.cons.maybe_reoffer_snapshot_reports();
+        assert!(drain_snap_reports(&sock2).is_empty(), "once per leadership");
     }
 
     /// Spec §4.4: the record is a `CLUSTER` command like any other, so it

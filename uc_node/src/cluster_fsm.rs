@@ -1328,6 +1328,22 @@ impl ClusterView {
         self.inner.lock().unwrap().clone()
     }
 
+    /// Ruling R38-1: the log-time stamp (`SetEntry::time_ns`, the SNAPSHOT
+    /// frame's own stamp) of the committed catalog's set at `position`, or
+    /// `None` when the catalog does not list it. A scalar read under the
+    /// inner lock, like [`Self::report_position_for`], rather than a
+    /// [`Self::snapshot_inner`] clone: the leader's report collector asks it
+    /// once per pending instant, not per pass.
+    pub fn catalog_time_at(&self, position: u64) -> Option<u64> {
+        self.inner
+            .lock()
+            .unwrap()
+            .catalog
+            .iter()
+            .find(|e| e.position == position)
+            .map(|e| e.time_ns)
+    }
+
     /// The committed `SnapshotReport` position for one row — `None` when the
     /// cluster FSM holds no record for it yet.
     ///
