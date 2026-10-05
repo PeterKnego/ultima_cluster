@@ -491,7 +491,16 @@ R38-1's clock — the timeout runs from the instant's log-time stamp, so a
 leader change does not restart it — is
 `a_fresh_leader_times_an_old_instant_out_on_the_logs_clock`,
 `an_instant_times_out_when_the_log_clock_reaches_it_plus_the_timeout` and
-the fallback `an_unlisted_instant_falls_back_to_its_first_sighting`.
+the fallback `an_unlisted_instant_falls_back_to_its_first_sighting`. The
+re-offer's filter and cache are
+`the_re_offer_skips_complete_reported_and_unheld_sets`,
+`a_new_leader_re_offers_every_cached_held_set_to_itself` and
+`the_report_cache_is_bounded_and_keeps_the_fuller_entry`; ruling R40's seed
+from disk is `the_probe_seeds_the_report_cache_from_a_set_held_on_disk`
+(which pins the row payload's hash to the slot's `artifact_hash` and row 255's
+to the cluster agent's published word) and
+`a_seed_arriving_after_the_leadership_edge_is_offered_to_that_leader`; ruling
+R39's door is `a_report_above_the_leaders_log_extent_is_dropped`.
 
 The **readiness gate** — B2's deferred boot window — is pinned clause by
 clause, because each clause alone is vacuous:

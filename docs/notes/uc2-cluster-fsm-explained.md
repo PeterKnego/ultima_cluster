@@ -651,7 +651,10 @@ is three seams:
    exits drop the collections, so every node re-offers the reports for every
    set it holds that the catalog still lists as not complete, once each time
    it learns a new leader — and since the clock is the log's, the new leader
-   does not start it over.
+   does not start it over. A restarted node knows those sets' hashes too:
+   its `uc2-holdings` thread re-hashes the artifacts it holds on disk, off
+   the consensus pass. A report above the leader's own log extent is
+   dropped at the door (an honest one is committed, so the leader has it).
 
    *Why per instant* (snapshot catalog spec, erratum R37). The first version
    kept one pending instant per row and let a newer report replace it. With
