@@ -1293,6 +1293,11 @@ Three consequences:
 
 #### 6.5.2 Live nondeterminism detection
 
+> **Amended by the snapshot catalog spec's erratum R37**
+> (`2026-10-01-uc2-snapshot-catalog-design.md`, last block): the leader keeps
+> one pending collection per `(row, instant)` with its own timeout, not one
+> per row, and nodes re-offer their newest set's reports to a new leader.
+
 #### Errata (plan B3, as built)
 
 Nine places execution diverged from the section below, or filled in a detail

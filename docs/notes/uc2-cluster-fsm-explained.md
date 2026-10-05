@@ -634,14 +634,27 @@ is three seams:
    holding it for whoever wins would attest an instant with a stale reading —
    and counts it in `uc2_snapshot_reports_unsent_total`.
 
-3. **The leader collects per `(row, P)` and appends once.** Only the newest
-   instant per row is pending; a report for a newer one replaces the
-   collection outright (hashes for two different artifacts must never mix)
-   and restarts the clock. The record goes onto the log when **every voter in
-   the current membership has reported**, or five seconds
-   (`SNAP_REPORT_TIMEOUT_NS`) after the first report — whichever comes first
+3. **The leader collects per `(row, P)` and appends once.** Every reported
+   instant has its own pending collection and its own clock (hashes for two
+   different artifacts never mix), and a newer instant never discards an
+   older one's evidence. A collection goes onto the log when **every voter in
+   the current membership has reported** that instant, or five seconds
+   (`SNAP_REPORT_TIMEOUT_NS`) after ITS first report — whichever comes first
    — through the same single-in-flight cluster append every other `CLUSTER`
-   command uses, at most one per pass, lowest row first.
+   command uses, at most one per pass, lowest row first and, within a row,
+   oldest instant first. Appending an instant drops the row's older pending
+   collections (once it commits they would be refused as stale); a row holds
+   at most 64 pending instants, the oldest evicted past that. Both leader
+   exits drop the collections, so every node re-offers its newest complete
+   set's reports once each time it learns a new leader.
+
+   *Why per instant* (snapshot catalog spec, erratum R37). The first version
+   kept one pending instant per row and let a newer report replace it. With
+   instants arriving faster than the timeout, a voter one instant behind the
+   others starved agreement for every instant — the others' reports for P
+   were thrown away when they reported P+1, the laggard's P was then "older
+   than pending", and the clock restarted at every instant — and since the
+   catalog made the purge floor depend on an agreed record, purge froze.
 
 **Why every voter and not a quorum.** The spec said "once a quorum has
 reported… or on a timeout", and that is the one rule plan B3 changed. The

@@ -473,7 +473,18 @@ The **collector and its release rule** are
 `snapshot_reports_append_once_every_voter_has_reported` (including the
 learner arm: two voters plus a learner is not every voter),
 `a_snapshot_report_from_a_non_member_is_dropped` and
-`both_leader_exits_clear_the_pending_snapshot_reports`.
+`both_leader_exits_clear_the_pending_snapshot_reports`. Its liveness under a
+lagging voter (snapshot catalog spec, erratum R37 — one collection per
+`(row, instant)`, each on its own clock) is
+`a_voter_one_instant_behind_never_starves_agreement` (RED under the old
+one-instant-per-row rule: zero appends),
+`each_pending_instant_times_out_on_its_own_clock`,
+`a_newer_instant_never_discards_the_pending_reports_for_an_older_one`,
+`an_appended_instant_drops_the_older_pending_ones_as_superseded`,
+`pending_instants_are_bounded_per_row_and_the_oldest_is_evicted`, and the
+re-offer to a new leader,
+`a_follower_re_offers_its_newest_set_to_a_new_leader_once` and
+`a_new_leader_re_offers_its_own_newest_set_to_itself`.
 
 The **readiness gate** — B2's deferred boot window — is pinned clause by
 clause, because each clause alone is vacuous:
