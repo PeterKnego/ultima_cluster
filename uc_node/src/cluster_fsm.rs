@@ -1178,6 +1178,29 @@ pub struct ClusterViewInner {
     pub catalog: Vec<SetEntry>,
 }
 
+impl ClusterViewInner {
+    /// The committed `SnapshotReport` position for one row — `None` when no
+    /// record for it is held. The ONE statement of the rule, shared by
+    /// [`ClusterView::report_position_for`] (under the lock) and by the
+    /// node's re-offer (on its clone): a user row reads its `reports` entry;
+    /// the cluster row ([`CLUSTER_ROW`]) has none, so it reads the newest
+    /// catalog entry whose `cluster` verdict is recorded.
+    pub fn report_position_for(&self, row: u8) -> Option<u64> {
+        if row == CLUSTER_ROW {
+            return self
+                .catalog
+                .iter()
+                .rev()
+                .find(|e| e.cluster.verdict != RowVerdict::Unreported)
+                .map(|e| e.position);
+        }
+        self.reports
+            .iter()
+            .find(|r| r.row == row)
+            .map(|r| r.position)
+    }
+}
+
 /// Catalog ruling R16: FNV-1a-64 over the set list's wire encoding
 /// ([`encode_set_list`]) — a content hash, so two nodes holding the same
 /// catalog agree on it regardless of where their walks stand. Run by
@@ -1362,16 +1385,7 @@ impl ClusterView {
     /// gives, which keeps the leader's `position <= held` staleness guard
     /// meaningful for row 255 rather than vacuous.
     pub fn report_position_for(&self, row: u8) -> Option<u64> {
-        let g = self.inner.lock().unwrap();
-        if row == CLUSTER_ROW {
-            return g
-                .catalog
-                .iter()
-                .rev()
-                .find(|e| e.cluster.verdict != RowVerdict::Unreported)
-                .map(|e| e.position);
-        }
-        g.reports.iter().find(|r| r.row == row).map(|r| r.position)
+        self.inner.lock().unwrap().report_position_for(row)
     }
 
     /// The view as a [`ClusterState`] — the inner clone plus the settings scalar

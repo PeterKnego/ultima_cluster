@@ -384,6 +384,12 @@ const READ_BARRIER_TIMEOUT_NS: u64 = 1_000_000_000;
 /// human-paced upgrade step that reads the record.
 pub const SNAP_REPORT_TIMEOUT_NS: u64 = 5_000_000_000;
 
+/// Ruling R39: minimum spacing, in the consensus pass's monotonic clock,
+/// between two `snapshot_report_dropped { reason: "above_extent" }` lines for
+/// the same reporting node. Every such report is still dropped; only the log
+/// line is throttled.
+const ABOVE_EXTENT_LOG_INTERVAL_NS: u64 = 60_000_000_000;
+
 /// Catalog spec §5.3: a leader's soft-table entry is stale once it is older
 /// than this many maximum election timeouts — the liveness horizon the node
 /// already runs on (no per-peer heartbeat timestamp exists to reuse).
@@ -1868,6 +1874,9 @@ impl Node {
         // carries; the consensus agent's writers keep it current.
         let holdings = Arc::new(Mutex::new(Holdings::default()));
         rcfg.holdings = Some(Arc::clone(&holdings));
+        // Ruling R40: the probe thread's report seeds for the consensus
+        // agent's per-set report cache.
+        let report_seeds = Arc::new(ReportSeeds::default());
         // M8 (Task 12): the receive half, the sender-identity map, and the
         // handshake route travel together in one `CryptoIntake` — forgetting
         // any of the three is a compile error, not a silent cluster-wide
@@ -1987,7 +1996,14 @@ impl Node {
             snap_root.clone(),
             journal_segment_bytes,
             journal_preallocate,
-        );
+        )
+        .with_report_seeder(ReportSeeder::new(
+            Arc::clone(&report_seeds),
+            cfg.services.ids().collect(),
+            snap_root.clone(),
+            instance.cluster_snapshot_dir(),
+            Arc::clone(&snapshot_set_position),
+        ));
         let probe_base = std::time::Instant::now();
         let probe_cnc = Arc::clone(&cnc);
         let probe_first_base = Arc::clone(&archive_first_base);
@@ -2392,6 +2408,9 @@ impl Node {
             pending_snapshot_reports: HashMap::new(),
             report_leader_seen: None,
             reported_sets: Vec::with_capacity(MAX_CATALOG_SETS),
+            report_seeds: Arc::clone(&report_seeds),
+            report_seed_gen_seen: 0,
+            above_extent_logged: HashMap::new(),
             ingress_rx,
             trunc_tx,
             trunc_slot,
@@ -3207,6 +3226,41 @@ struct PendingAdminFwd {
     port: u16,
 }
 
+/// Ruling R38-2: the `(row, hash)` reports one set produced on this node —
+/// on its completion edge, or seeded from the artifacts on disk by the
+/// `uc2-holdings` probe (ruling R40) — kept for the re-offer to a new leader.
+/// A fixed array per set; the cache holding these is preallocated to
+/// `MAX_CATALOG_SETS` and bounded there, so it never allocates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ReportedSet {
+    position: u64,
+    n: usize,
+    reports: [(u8, u64); CNC_MAX_SERVICES + 1],
+}
+
+/// Ruling R40: the hand-off between the `uc2-holdings` probe thread, which
+/// hashes the artifacts of held sets this node has no cached reports for
+/// (after a restart, every set but the one its slots name), and the
+/// consensus agent's [`ReportedSet`] cache. The same shape as the
+/// `Holdings` cell: the probe computes with no lock held, then takes the
+/// lock for a push; the consensus agent reads one `Acquire` generation word
+/// per pass and takes the lock only when it moved.
+#[derive(Default)]
+struct ReportSeeds {
+    /// Bumped (`Release`) after every push into `inner.offered`.
+    generation: AtomicU64,
+    inner: Mutex<ReportSeedsInner>,
+}
+
+#[derive(Default)]
+struct ReportSeedsInner {
+    /// Probe → consensus: sets hashed from disk, not yet merged.
+    offered: Vec<ReportedSet>,
+    /// Consensus → probe: the positions already in the consensus cache, so
+    /// the probe never re-hashes a set the completion edge already reported.
+    known: Vec<u64>,
+}
+
 /// Plan B3 (spec §6.5.2): one in-flight collection for one `(row, instant)` —
 /// the instant every hash in it is ABOUT, when the first of them arrived (THIS
 /// entry's own timeout origin; catalog erratum R37), and the hashes
@@ -3218,16 +3272,6 @@ struct PendingAdminFwd {
 /// node-id order, which is exactly the canonical order
 /// [`uc_protocol::v2::upgrade::encode_snapshot_report`] requires — so the
 /// record encodes identically wherever it is built.
-/// Ruling R38-2: the `(row, hash)` reports one set produced on this node's
-/// completion edge, kept for the re-offer to a new leader. A fixed array, so
-/// the cache allocates only when it grows.
-#[derive(Clone, Copy)]
-struct ReportedSet {
-    position: u64,
-    n: usize,
-    reports: [(u8, u64); CNC_MAX_SERVICES + 1],
-}
-
 struct PendingSnapshotReport {
     position: u64,
     first_seen_ns: u64,
@@ -3621,6 +3665,12 @@ struct Consensus {
     /// Ruling R38-2: what this node reported per set, ascending by position,
     /// at most `MAX_CATALOG_SETS` — see [`Consensus::cache_report_set`].
     reported_sets: Vec<ReportedSet>,
+    /// Ruling R40: the probe thread's seeds, and the generation last merged.
+    report_seeds: Arc<ReportSeeds>,
+    report_seed_gen_seen: u64,
+    /// Ruling R39: when the `above_extent` drop was last logged, per
+    /// reporting node — see [`Consensus::note_report_above_extent`].
+    above_extent_logged: HashMap<NodeId, u64>,
     /// Plan B3 (spec §6.5.2): `CLUSTER kind = 5` records this leader placed
     /// (`uc2_snapshot_reports_appended_total`), and how many of those went in
     /// on the TIMEOUT rather than on every voter reporting
@@ -6754,6 +6804,27 @@ impl Consensus {
         if reports.is_empty() {
             return;
         }
+        self.cache_report_set_quiet(p, reports);
+        self.publish_known_report_sets();
+    }
+
+    /// Ruling R40: tell the probe which sets the cache already holds, so it
+    /// never hashes their artifacts. One lock per cache change — a
+    /// completion edge or a seed merge, never a pass.
+    fn publish_known_report_sets(&self) {
+        let mut g = self
+            .report_seeds
+            .inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        g.known.clear();
+        g.known
+            .extend(self.reported_sets.iter().map(|s| s.position));
+    }
+
+    /// [`Self::cache_report_set`]'s insert, without publishing `known`.
+    /// `true` when the cache changed (a new set, or a fuller one).
+    fn cache_report_set_quiet(&mut self, p: u64, reports: &[(u8, u64)]) -> bool {
         let mut set = ReportedSet {
             position: p,
             n: reports.len(),
@@ -6762,20 +6833,23 @@ impl Consensus {
         set.reports[..reports.len()].copy_from_slice(reports);
         match self.reported_sets.binary_search_by_key(&p, |s| s.position) {
             Ok(i) => {
-                if reports.len() >= self.reported_sets[i].n {
+                if reports.len() >= self.reported_sets[i].n && self.reported_sets[i] != set {
                     self.reported_sets[i] = set;
+                    return true;
                 }
+                false
             }
             Err(i) => {
                 if self.reported_sets.len() >= MAX_CATALOG_SETS {
                     if i == 0 {
-                        return;
+                        return false;
                     }
                     self.reported_sets.remove(0);
                     self.reported_sets.insert(i - 1, set);
                 } else {
                     self.reported_sets.insert(i, set);
                 }
+                true
             }
         }
     }
@@ -6853,57 +6927,118 @@ impl Consensus {
     /// as before; the newest set is also offered when the catalog does not
     /// list it yet (this node's view can trail its own completion edge).
     /// Bounded by the catalog (at most [`MAX_CATALOG_SETS`] sets), ascending.
-    /// A set's hashes come from [`Self::cache_report_set`] when this node
-    /// recorded them (the cnc slots name only the newest instant), else from
-    /// the slots through `send_snapshot_reports`, whose `snapshot_pos == p`
-    /// guard skips a row that has since frozen a newer instant.
+    /// A set's hashes come from the [`ReportedSet`] cache — filled on each
+    /// completion edge and, for sets held on disk that this incarnation never
+    /// reported (a restart), SEEDED by the `uc2-holdings` probe (ruling R40)
+    /// — else from the cnc slots through `send_snapshot_reports`, whose
+    /// `snapshot_pos == p` guard skips a row that has since frozen a newer
+    /// instant.
     ///
     /// A new leadership is the cnc `leader_hint` naming another node, or this
     /// node itself once it leads (in which case delivery feeds its own
     /// collector in-process). Keyed on `(leader id, term)`, not the id alone:
     /// a node re-elected in a later term cleared its collector on the exit in
     /// between. Once per leadership — never per heartbeat. An unknown leader
-    /// (`u64::MAX`) or a candidate's stale hint records nothing. The
-    /// catalog read is one view clone per leadership change, never per pass.
+    /// (`u64::MAX`) or a candidate's stale hint records nothing. A seed that
+    /// lands AFTER the leadership was offered (the probe runs once a second;
+    /// a restarted node learns its leader in milliseconds) is offered to that
+    /// leadership on arrival, once.
+    ///
+    /// This is the hot half (review M4): two `Acquire` loads and two compares
+    /// per pass. Everything else — the view clone, the walk, the sort, the
+    /// seed merge — is in the `#[cold]`, `#[inline(never)]` bodies, so this
+    /// call cannot grow `do_work` past its inlining budget.
+    #[inline]
     fn maybe_reoffer_snapshot_reports(&mut self) {
-        let hint = self.cnc.status().leader_hint.load_acquire();
-        // A candidate has bumped its term but still carries the hint of the
-        // leader it gave up on: that pair names no leadership at all.
-        if hint == u64::MAX || matches!(self.sm.role(), Role::Candidate) {
-            return;
+        let generation = self.report_seeds.generation.load(Ordering::Acquire);
+        if generation != self.report_seed_gen_seen {
+            self.merge_report_seeds(generation);
         }
-        let leadership = (hint, self.sm.current_term());
+        let hint = self.cnc.status().leader_hint.load_acquire();
+        let Some(leadership) = self.current_report_leadership(hint) else {
+            return;
+        };
         if self.report_leader_seen == Some(leadership) {
             return;
         }
         self.report_leader_seen = Some(leadership);
+        self.reoffer_held_sets(None);
+    }
+
+    /// The `(leader id, term)` a report would reach now, or `None` when there
+    /// is no leadership to offer to: an unknown leader (`u64::MAX`), or a
+    /// candidate, which has bumped its term but still carries the hint of
+    /// the leader it gave up on.
+    #[inline]
+    fn current_report_leadership(&self, hint: u64) -> Option<(u64, u32)> {
+        if hint == u64::MAX || matches!(self.sm.role(), Role::Candidate) {
+            return None;
+        }
+        Some((hint, self.sm.current_term()))
+    }
+
+    /// Ruling R40: merge the probe's seeds into the cache, and offer the sets
+    /// that are new to it to the current leadership if that leadership was
+    /// already offered (otherwise the leadership edge offers them).
+    #[cold]
+    #[inline(never)]
+    fn merge_report_seeds(&mut self, generation: u64) {
+        self.report_seed_gen_seen = generation;
+        let offered = {
+            let mut g = self
+                .report_seeds
+                .inner
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            std::mem::take(&mut g.offered)
+        };
+        let mut fresh = [0u64; MAX_CATALOG_SETS];
+        let mut n = 0usize;
+        for set in &offered {
+            if self.cache_report_set_quiet(set.position, &set.reports[..set.n]) && n < fresh.len() {
+                fresh[n] = set.position;
+                n += 1;
+            }
+        }
+        self.publish_known_report_sets();
+        if n == 0 {
+            return;
+        }
+        let hint = self.cnc.status().leader_hint.load_acquire();
+        if self.report_leader_seen.is_some()
+            && self.report_leader_seen == self.current_report_leadership(hint)
+        {
+            self.reoffer_held_sets(Some(&fresh[..n]));
+        }
+    }
+
+    /// The re-offer's cold body: choose the sets (see
+    /// [`Self::maybe_reoffer_snapshot_reports`]) and deliver each one,
+    /// ascending. `only`, when given, narrows the choice to those positions
+    /// (the sets a seed merge just added).
+    #[cold]
+    #[inline(never)]
+    fn reoffer_held_sets(&mut self, only: Option<&[u64]>) {
         let newest = self.snapshot_set_position.load(Ordering::Acquire);
         let inner = self.cluster_view.snapshot_inner();
+        let wanted = |p: u64| only.is_none_or(|o| o.contains(&p));
         if inner.catalog.is_empty() {
-            if newest != 0 {
+            if newest != 0 && wanted(newest) {
                 self.reoffer_set(newest);
             }
             return;
         }
-        // The lowest committed report position over this node's report rows:
-        // a set at or below it has nothing left to say for any row.
-        let cluster_reported = inner
-            .catalog
-            .iter()
-            .rev()
-            .find(|e| e.cluster.verdict != uc_protocol::v2::catalog::RowVerdict::Unreported)
-            .map_or(0, |e| e.position);
+        // The lowest committed report position over this node's report rows
+        // (the cluster row included): a set at or below it has nothing left
+        // to say for any row. One rule, shared with the leader's door
+        // (`ClusterViewInner::report_position_for`, review M8).
         let low = self
             .services
             .ids()
-            .map(|row| {
-                inner
-                    .reports
-                    .iter()
-                    .find(|r| r.row == row)
-                    .map_or(0, |r| r.position)
-            })
-            .fold(cluster_reported, u64::min);
+            .chain(std::iter::once(CLUSTER_ROW))
+            .map(|row| inner.report_position_for(row).unwrap_or(0))
+            .min()
+            .unwrap_or(0);
         let mut sets = [0u64; MAX_CATALOG_SETS + 1];
         let mut n = 0usize;
         for e in &inner.catalog {
@@ -6911,12 +7046,13 @@ impl Consensus {
                 && e.state == SetState::Commanded
                 && e.position > low
                 && self.holdings_held.contains(&e.position)
+                && wanted(e.position)
             {
                 sets[n] = e.position;
                 n += 1;
             }
         }
-        if newest > low && !inner.catalog.iter().any(|e| e.position == newest) {
+        if newest > low && wanted(newest) && !inner.catalog.iter().any(|e| e.position == newest) {
             sets[n] = newest;
             n += 1;
         }
@@ -7000,6 +7136,19 @@ impl Consensus {
     ///   [`MAX_CATALOG_SETS`] pending instants, by evicting the oldest — both
     ///   counted under `snapshot_report_superseded`. A report older than every
     ///   instant of a FULL row would be that oldest, so it is the one dropped.
+    /// * **Within this leader's log** (ruling R39). A report for a position
+    ///   ABOVE this leader's own log extent (its append frontier) is dropped.
+    ///   An honest reporter froze its set at P only after applying to P, so P
+    ///   is committed, and a leader holds every committed byte — an honest
+    ///   report is never above the extent. The bound is the extent and not
+    ///   `commit`: a fresh leader's commit counter can transiently trail a
+    ///   follower's learned commit, and would drop honest re-offers. What it
+    ///   stops: with wire crypto off, one forged report at a huge position
+    ///   would otherwise be appended by timeout, become the row's committed
+    ///   report position, and make the door drop every honest report for that
+    ///   row forever — a permanent stall of the catalog's floor. Logged as
+    ///   `snapshot_report_dropped` with `reason = "above_extent"`, at most
+    ///   once per reporting node per [`ABOVE_EXTENT_LOG_INTERVAL_NS`].
     fn on_snap_report(&mut self, from: NodeId, row: u8, position: u64, hash: u64) {
         if !matches!(self.sm.role(), Role::Leader) {
             return;
@@ -7014,6 +7163,11 @@ impl Consensus {
         // instruction and it keeps a wire-derived `row` from ever reaching
         // `encode_snapshot_report`'s `expect` below.
         if !is_report_row(row) {
+            return;
+        }
+        let extent = self.cnc.counters().append.load_acquire();
+        if position > extent {
+            self.note_report_above_extent(from, row, position, extent);
             return;
         }
         if position <= self.held_report_position(row) {
@@ -7168,11 +7322,13 @@ impl Consensus {
         }
         let now = self.pass_mono_ns;
         let log_now = self.log_time_now();
-        let config = self.sm.config().clone();
         // Ruling R-B3-1: every voter, not a majority of them. Read from the
         // SAME config the payload filter below uses, so "who must report" and
-        // "whose hash may be in the record" can never disagree.
-        let voters_required = config.voters.len();
+        // "whose hash may be in the record" can never disagree. Borrowed, not
+        // cloned (review M6): nothing in this walk changes the kernel's
+        // config, and a pass that only finds entries still collecting must
+        // not pay a membership clone for them.
+        let voters_required = self.sm.config().voters.len();
         // Ascending, so which ready row goes first is a property of the data
         // and not of the `HashMap`'s iteration order — and the cluster row
         // (`CLUSTER_ROW = 255`) sorts after every user row. At most nine rows
@@ -7215,9 +7371,14 @@ impl Consensus {
                 let voters_reporting = pend
                     .hashes
                     .keys()
-                    .filter(|id| config.is_voter(**id))
+                    .filter(|id| self.sm.config().is_voter(**id))
                     .count();
                 let timed_out = match pend.instant_time_ns {
+                    // Skew bound (review M9): `t` was stamped by the leader
+                    // that commanded the instant; a successor whose wall clock
+                    // runs AHEAD of it times the instant out early by at most
+                    // that skew (one running behind is clamped by the log, so
+                    // it never times out late).
                     Some(t) => log_now >= t.saturating_add(SNAP_REPORT_TIMEOUT_NS),
                     None => now.saturating_sub(pend.first_seen_ns) >= SNAP_REPORT_TIMEOUT_NS,
                 };
@@ -7231,7 +7392,7 @@ impl Consensus {
                 let hashes: Vec<(u32, u64)> = pend
                     .hashes
                     .iter()
-                    .filter(|(id, _)| config.contains(**id))
+                    .filter(|(id, _)| self.sm.config().contains(**id))
                     .map(|(id, h)| (*id, *h))
                     .collect();
                 // Every reporter has since left the config: there is nothing
@@ -7337,6 +7498,36 @@ impl Consensus {
         self.appender
             .as_ref()
             .map_or(self.pass_now_ns, |a| a.last_stamp().max(self.pass_now_ns))
+    }
+
+    /// Ruling R39: the `above_extent` drop's log line, rate-limited per
+    /// reporting node (the `status_refused` pattern). Reporters are members
+    /// by the time this runs, so the table is bounded by the membership; it
+    /// is still reset past `MAX_CATALOG_SETS` entries rather than grown.
+    #[cold]
+    fn note_report_above_extent(&mut self, from: NodeId, row: u8, position: u64, extent: u64) {
+        let now = self.pass_mono_ns;
+        let due = self
+            .above_extent_logged
+            .get(&from)
+            .is_none_or(|&last| now.saturating_sub(last) >= ABOVE_EXTENT_LOG_INTERVAL_NS);
+        if !due {
+            return;
+        }
+        if self.above_extent_logged.len() >= MAX_CATALOG_SETS {
+            self.above_extent_logged.clear();
+        }
+        self.above_extent_logged.insert(from, now);
+        crate::obs_event!(
+            Warn,
+            "snapshot_report_dropped",
+            node = self.id as u64,
+            row = row as u64,
+            position = position,
+            reason = "above_extent",
+            from = from as u64,
+            extent = extent
+        );
     }
 
     /// Test-only: `row`'s pending instants, ascending by position (empty
@@ -11608,6 +11799,181 @@ struct HoldingsProbe {
     last_probe_ns: Option<u64>,
     /// Probes run (test-visible).
     probes: u64,
+    /// Ruling R40: hashes held sets' artifacts for the report cache.
+    seeder: Option<ReportSeeder>,
+}
+
+/// Ruling R40: the `uc2-holdings` probe's second job. For each complete set
+/// this node holds on disk (every declared row's `snap-<P>.ultsnap` plus the
+/// cluster's `snap-<P>.ultcluster`) that the consensus agent has no cached
+/// reports for, hash every artifact once — a row's PAYLOAD (the file minus
+/// its 24-byte `ULTSNAP2` envelope) and the cluster's bare image, each with
+/// SHA-256 truncated to its first 8 bytes LE, which is exactly
+/// `uc_service::snapshots::artifact_hash_of` — and hand the `(row, hash)`
+/// list to the consensus agent through [`ReportSeeds`]. That is what lets a
+/// RESTARTED node re-offer its full evidence to a new leader instead of only
+/// the rows its cnc slots happen to name (every thin record in round 2's
+/// proof runs). The I/O is on this thread, never the consensus pass (catalog
+/// rulings R27/R28 kept). Bounded: only sets at or below the node's newest
+/// complete set, the newest `MAX_CATALOG_SETS` of them, each attempted once.
+struct ReportSeeder {
+    cell: Arc<ReportSeeds>,
+    rows: Vec<u8>,
+    snap_root: PathBuf,
+    cluster_dir: PathBuf,
+    /// The node's newest complete set (`snapshot_set_position`): a set above
+    /// it has not completed here yet, and its completion edge will report it.
+    set_position: Arc<AtomicU64>,
+    /// Sets already hashed (or found unreadable) — never attempted twice.
+    attempted: Vec<u64>,
+    /// Sets seeded (test-visible).
+    seeded: u64,
+}
+
+impl ReportSeeder {
+    fn new(
+        cell: Arc<ReportSeeds>,
+        rows: Vec<u8>,
+        snap_root: PathBuf,
+        cluster_dir: PathBuf,
+        set_position: Arc<AtomicU64>,
+    ) -> Self {
+        ReportSeeder {
+            cell,
+            rows,
+            snap_root,
+            cluster_dir,
+            set_position,
+            attempted: Vec::with_capacity(MAX_CATALOG_SETS),
+            seeded: 0,
+        }
+    }
+
+    #[cold]
+    fn seed(&mut self) {
+        let ceiling = self.set_position.load(Ordering::Acquire);
+        if ceiling == 0 {
+            return;
+        }
+        let known = {
+            let g = self.cell.inner.lock().unwrap_or_else(|e| e.into_inner());
+            g.known.clone()
+        };
+        let Ok(rd) = std::fs::read_dir(&self.cluster_dir) else {
+            return;
+        };
+        let mut held: Vec<u64> = rd
+            .flatten()
+            .filter_map(|e| {
+                e.file_name()
+                    .to_str()?
+                    .strip_prefix(SNAP_PREFIX)?
+                    .strip_suffix(CLUSTER_SNAP_SUFFIX)?
+                    .parse::<u64>()
+                    .ok()
+            })
+            .filter(|&p| p != 0 && p <= ceiling)
+            .collect();
+        held.sort_unstable();
+        if held.len() > MAX_CATALOG_SETS {
+            held.drain(..held.len() - MAX_CATALOG_SETS);
+        }
+        self.attempted.retain(|p| held.contains(p));
+        let mut out = Vec::new();
+        for &p in &held {
+            if known.contains(&p) || self.attempted.contains(&p) {
+                continue;
+            }
+            let row_paths: Vec<PathBuf> = self
+                .rows
+                .iter()
+                .map(|row| {
+                    self.snap_root
+                        .join(row.to_string())
+                        .join(format!("{SNAP_PREFIX}{p}{SNAP_SUFFIX}"))
+                })
+                .collect();
+            if !row_paths.iter().all(|f| f.is_file()) {
+                continue; // not a complete set (yet): looked at again next probe
+            }
+            self.attempted.push(p);
+            let mut set = ReportedSet {
+                position: p,
+                n: 0,
+                reports: [(0u8, 0u64); CNC_MAX_SERVICES + 1],
+            };
+            for (&row, path) in self.rows.iter().zip(&row_paths) {
+                if let Some(h) = hash_row_artifact(path, p) {
+                    set.reports[set.n] = (row, h);
+                    set.n += 1;
+                }
+            }
+            let cluster = self
+                .cluster_dir
+                .join(format!("{SNAP_PREFIX}{p}{CLUSTER_SNAP_SUFFIX}"));
+            if let Some(h) = hash_file_from(&cluster, 0) {
+                set.reports[set.n] = (CLUSTER_ROW, h);
+                set.n += 1;
+            }
+            if set.n > 0 {
+                out.push(set);
+            }
+        }
+        if out.is_empty() {
+            return;
+        }
+        self.seeded += out.len() as u64;
+        self.cell
+            .inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .offered
+            .extend(out);
+        self.cell.generation.fetch_add(1, Ordering::Release);
+    }
+}
+
+/// Ruling R40: a row artifact's hash as the builder computed it — SHA-256 of
+/// the PAYLOAD (everything after the 24-byte `ULTSNAP2` envelope), first 8
+/// bytes LE (`uc_service::snapshots::artifact_hash_of`). `None` when the file
+/// cannot be read or its envelope does not name `p`.
+fn hash_row_artifact(path: &Path, p: u64) -> Option<u64> {
+    use std::io::Read;
+    use uc_service::snapshots::{SNAPSHOT_ENVELOPE_LEN, decode_snapshot_envelope};
+    let mut f = std::fs::File::open(path).ok()?;
+    let mut head = [0u8; SNAPSHOT_ENVELOPE_LEN];
+    f.read_exact(&mut head).ok()?;
+    if decode_snapshot_envelope(&head).ok()?.position != p {
+        return None;
+    }
+    hash_reader(f)
+}
+
+/// Ruling R40: [`hash_row_artifact`] for a file with no envelope (the cluster
+/// artifact's bare image), from byte `skip`.
+fn hash_file_from(path: &Path, skip: u64) -> Option<u64> {
+    use std::io::{Seek, SeekFrom};
+    let mut f = std::fs::File::open(path).ok()?;
+    f.seek(SeekFrom::Start(skip)).ok()?;
+    hash_reader(f)
+}
+
+/// SHA-256 of everything `r` yields, first 8 bytes LE — the streaming form of
+/// `artifact_hash_of`, so an artifact is never held in memory whole.
+fn hash_reader(mut r: impl std::io::Read) -> Option<u64> {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        match r.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => hasher.update(&buf[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return None,
+        }
+    }
+    let digest = hasher.finalize();
+    Some(u64::from_le_bytes(digest[..8].try_into().expect("8 bytes")))
 }
 
 impl HoldingsProbe {
@@ -11626,7 +11992,14 @@ impl HoldingsProbe {
             preallocate,
             last_probe_ns: None,
             probes: 0,
+            seeder: None,
         }
+    }
+
+    /// Ruling R40: also seed the report cache (see [`ReportSeeder`]).
+    fn with_report_seeder(mut self, seeder: ReportSeeder) -> Self {
+        self.seeder = Some(seeder);
+        self
     }
 
     /// Probe if [`HOLDINGS_PROBE_NS`] has passed since the last probe on
@@ -11660,6 +12033,10 @@ impl HoldingsProbe {
         }
         h.journal_bytes = journal;
         h.snapshots_bytes = snapshots;
+        drop(h);
+        if let Some(seeder) = self.seeder.as_mut() {
+            seeder.seed();
+        }
     }
 }
 
@@ -13189,6 +13566,9 @@ mod tests {
             pending_snapshot_reports: HashMap::new(),
             report_leader_seen: None,
             reported_sets: Vec::with_capacity(MAX_CATALOG_SETS),
+            report_seeds: Arc::new(ReportSeeds::default()),
+            report_seed_gen_seen: 0,
+            above_extent_logged: HashMap::new(),
             ingress_rx,
             trunc_tx,
             trunc_slot,
@@ -15159,7 +15539,7 @@ mod tests {
         let mut h = harness_with_rows(&["a"]);
         drive_to_serving_leader(&mut h);
         h.cons.pass_mono_ns = 1_000;
-        let (p1, p2) = (6048u64, 7040u64);
+        let (p1, p2) = (5024u64, 6048u64);
 
         let cap = ObsCapture::take();
         let buf = cap.buf();
@@ -15293,7 +15673,7 @@ mod tests {
         let mut h = harness_with_rows(&["a"]);
         drive_to_serving_leader(&mut h);
         const SEC: u64 = 1_000_000_000;
-        let at = |i: u64| 8192 + i * 1024;
+        let at = |i: u64| 1024 + i * 512;
         let cap = ObsCapture::take();
         let buf = cap.buf();
         for i in 1..=8u64 {
@@ -15346,7 +15726,7 @@ mod tests {
         drive_to_serving_leader(&mut h);
         const SEC: u64 = 1_000_000_000;
         let t0 = 1_000u64;
-        let (p1, p2) = (8192u64, 9216u64);
+        let (p1, p2) = (4096u64, 5120u64);
         h.cons.pass_mono_ns = t0;
         h.cons.on_snap_report(0, 0, p1, 0x11);
         h.cons.pass_mono_ns = t0 + SEC;
@@ -15412,7 +15792,7 @@ mod tests {
         let mut h = harness_with_rows(&["a"]);
         drive_to_serving_leader(&mut h);
         h.cons.pass_mono_ns = 1_000;
-        let (p1, p2) = (8192u64, 9216u64);
+        let (p1, p2) = (4096u64, 5120u64);
         h.cons.on_snap_report(0, 0, p1, 0x11);
         h.cons.on_snap_report(1, 0, p1, 0x11);
 
@@ -15471,7 +15851,7 @@ mod tests {
         let mut h = harness_with_rows(&["a"]);
         drive_to_serving_leader(&mut h);
         h.cons.pass_mono_ns = 1_000;
-        let at = |i: u64| 8192 + i * 1024;
+        let at = |i: u64| 64 + i * 64;
         let n = MAX_CATALOG_SETS as u64;
         let cap = ObsCapture::take();
         let buf = cap.buf();
@@ -15680,7 +16060,7 @@ mod tests {
         drive_to_serving_leader(&mut h);
         const SEC: u64 = 1_000_000_000;
         let now = set_log_time(&mut h, 100 * SEC);
-        let p = 8192u64;
+        let p = 4096u64;
         publish_commanded_catalog(&mut h, &[(p, now - 6 * SEC)]);
         h.cons.pass_mono_ns = 1_000;
         h.cons.on_snap_report(0, 0, p, 0x61);
@@ -15708,7 +16088,7 @@ mod tests {
         drive_to_serving_leader(&mut h);
         const SEC: u64 = 1_000_000_000;
         let now = set_log_time(&mut h, 100 * SEC);
-        let p = 8192u64;
+        let p = 4096u64;
         let t0 = now - SEC;
         publish_commanded_catalog(&mut h, &[(p, t0)]);
         h.cons.pass_mono_ns = 1_000;
@@ -15739,7 +16119,7 @@ mod tests {
         drive_to_serving_leader(&mut h);
         const SEC: u64 = 1_000_000_000;
         set_log_time(&mut h, 100 * SEC);
-        let p = 8192u64;
+        let p = 4096u64;
         h.cons.pass_mono_ns = 1_000;
         h.cons.on_snap_report(0, 0, p, 0x63);
         h.cons.pass_now_ns += 60 * SEC;
@@ -15798,10 +16178,294 @@ mod tests {
         assert!(drain_snap_reports(&sock2).is_empty(), "once per leadership");
     }
 
+    /// Ruling R39: a report for a position ABOVE the leader's own log extent
+    /// is dropped at the door — an honest reporter's P is committed, so the
+    /// leader holds it — and the collector is untouched. A report AT the
+    /// extent is accepted.
+    #[test]
+    fn a_report_above_the_leaders_log_extent_is_dropped() {
+        let _obs = obs_capture_lock();
+        let mut h = harness_with_rows(&["a"]);
+        drive_to_serving_leader(&mut h);
+        h.cons.pass_mono_ns = 1_000;
+        let extent = h.cons.cnc.counters().append.load_acquire();
+        let cap = ObsCapture::take();
+        let buf = cap.buf();
+        h.cons.on_snap_report(0, 0, extent + 1, 0x71);
+        h.cons.on_snap_report(0, 0, extent + 1, 0x71);
+        let text = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(
+            h.cons.pending_snapshot_reports.is_empty(),
+            "a report above the extent never reaches the collector"
+        );
+        assert_eq!(
+            text.matches(r#""reason":"above_extent""#).count(),
+            1,
+            "named, once per reporting node per interval: {text}"
+        );
+        h.cons.on_snap_report(0, 0, extent, 0x72);
+        assert_eq!(
+            h.cons
+                .pending_reports_for(0)
+                .iter()
+                .map(|e| e.position)
+                .collect::<Vec<_>>(),
+            vec![extent],
+            "a report AT the extent is accepted"
+        );
+    }
+
+    /// Ruling R40: a node whose report cache is empty — a restart — but whose
+    /// `snapshots/` holds a complete set at P ends up with a cache entry at P
+    /// whose hashes are the ones the slots path would have sent: the row's
+    /// payload hash equals the `artifact_hash` the builder published on the
+    /// slot, and row 255's equals the word the cluster agent published. Each
+    /// artifact is hashed once.
+    #[test]
+    fn the_probe_seeds_the_report_cache_from_a_set_held_on_disk() {
+        use uc_protocol::v2::upgrade::CLUSTER_ROW;
+        let mut h = harness_with_rows(&["a"]);
+        let p = 6016u64;
+        let instance_dir = h.cons.snap_root.parent().unwrap().to_path_buf();
+        // The row artifact through the builder's own store: the hash it
+        // returns is exactly the word the builder publishes on the slot.
+        let (_, row_hash) = uc_service::snapshots::SnapshotStore::open(&instance_dir, 0)
+            .unwrap()
+            .publish(p, 1, |w| {
+                w.write_all(b"row-zero-payload, longer than any envelope")?;
+                Ok(())
+            })
+            .unwrap();
+        h.row_published_at(0, p, row_hash);
+        // The cluster artifact through the real agent.
+        let membership = h.cons.cluster_view.membership();
+        install_cluster_artifact_for_test(&mut h, p, &membership);
+        assert_eq!(h.cluster.take_snapshot().unwrap(), p);
+        let cluster_hash = h
+            .cons
+            .cluster_artifact_hash
+            .hash_at(p)
+            .expect("the cluster agent published its artifact's hash");
+        // The node's newest complete set is P, but this incarnation never ran
+        // the completion edge: the cache is empty, as after a restart.
+        h.cons.snapshot_set_position.store(p, Ordering::Release);
+        assert!(
+            h.cons.reported_sets.is_empty(),
+            "precondition: nothing cached"
+        );
+
+        let mut seeder = ReportSeeder::new(
+            Arc::clone(&h.cons.report_seeds),
+            vec![0],
+            h.cons.snap_root.clone(),
+            h.cons.cluster_snapshot_dir.clone(),
+            Arc::clone(&h.cons.snapshot_set_position),
+        );
+        seeder.seed();
+        assert_eq!(seeder.seeded, 1);
+        h.cons.maybe_reoffer_snapshot_reports(); // merges the seed
+        let seeded = *h
+            .cons
+            .reported_sets
+            .iter()
+            .find(|s| s.position == p)
+            .expect("the seed reached the consensus agent's cache");
+        assert_eq!(
+            &seeded.reports[..seeded.n],
+            &[(0u8, row_hash), (CLUSTER_ROW, cluster_hash)],
+            "row 0: the payload hash IS the slot's artifact_hash; row 255: the published word"
+        );
+
+        // The slots path computes the same list, so it does not change the
+        // entry …
+        h.cluster_snapshot_pos.store(p, Ordering::Release);
+        h.cons.send_snapshot_reports(p);
+        assert_eq!(
+            h.cons
+                .reported_sets
+                .iter()
+                .find(|s| s.position == p)
+                .copied(),
+            Some(seeded),
+            "the slots and the files agree"
+        );
+        // … and the probe does not hash a cached set again.
+        seeder.seed();
+        assert_eq!(seeder.seeded, 1, "each file hashed once");
+    }
+
+    /// Ruling R40: a seed that lands AFTER this node already offered its sets
+    /// to the current leader (the probe runs once a second; a restarted node
+    /// learns its leader in milliseconds) is offered to that leader on
+    /// arrival — once.
+    #[test]
+    fn a_seed_arriving_after_the_leadership_edge_is_offered_to_that_leader() {
+        let (sock2, addr2) = report_peer_socket();
+        let mut h = harness_with_rows_and_peers(&["a"], &[(2, addr2)]);
+        let p = 6016u64;
+        publish_commanded_catalog(&mut h, &[(p, 1)]);
+        h.cons.holdings_held.push(p);
+        h.cons.snapshot_set_position.store(p, Ordering::Release);
+        h.cons.cnc.status().leader_hint.store_release(2);
+        h.cons.maybe_reoffer_snapshot_reports();
+        assert!(
+            drain_snap_reports(&sock2).is_empty(),
+            "precondition: nothing cached and the slots name nothing at P"
+        );
+        let mut set = ReportedSet {
+            position: p,
+            n: 1,
+            reports: [(0u8, 0u64); CNC_MAX_SERVICES + 1],
+        };
+        set.reports[0] = (0, 0x5EED);
+        h.cons.report_seeds.inner.lock().unwrap().offered.push(set);
+        h.cons
+            .report_seeds
+            .generation
+            .fetch_add(1, Ordering::Release);
+        h.cons.maybe_reoffer_snapshot_reports();
+        h.cons.maybe_reoffer_snapshot_reports();
+        assert_eq!(
+            drain_snap_reports(&sock2),
+            vec![SnapReportBody {
+                row: 0,
+                node_id: 1,
+                position: p,
+                hash: 0x5EED,
+            }],
+            "the seeded set reaches the leader already offered to, once"
+        );
+    }
+
+    /// Review M5: the re-offer's filter. Of four held-or-not sets only the one
+    /// that is Commanded, held, and above the rows' lowest committed report
+    /// position is offered — every set is in the cache, so an exclusion is the
+    /// filter's and not a missing hash.
+    #[test]
+    fn the_re_offer_skips_complete_reported_and_unheld_sets() {
+        use uc_protocol::v2::catalog::{RowVerdict, SetEntry, SetKind, SetState};
+        let (sock2, addr2) = report_peer_socket();
+        let mut h = harness_with_rows_and_peers(&["a"], &[(2, addr2)]);
+        let (reported, complete, unheld, eligible) = (5000u64, 5500u64, 5800u64, 5900u64);
+        let mut st = h.cons.cluster_view.to_state();
+        let mut done = SetEntry::commanded(complete, SetKind::Full, 2);
+        done.state = SetState::Complete;
+        done.cluster.verdict = RowVerdict::Agreed;
+        done.rows[0].verdict = RowVerdict::Agreed;
+        st.catalog = vec![
+            SetEntry::commanded(reported, SetKind::Full, 1),
+            done,
+            SetEntry::commanded(unheld, SetKind::Full, 3),
+            SetEntry::commanded(eligible, SetKind::Full, 4),
+        ];
+        st.reports = vec![SnapshotReport {
+            row: 0,
+            position: reported,
+            hashes: vec![(0, 0xAA)],
+        }];
+        h.cons.cluster_view.publish(&st);
+        for p in [reported, complete, unheld, eligible] {
+            h.cons.cache_report_set(p, &[(0, p)]);
+        }
+        h.cons.holdings_held.extend([reported, complete, eligible]);
+        h.cons
+            .snapshot_set_position
+            .store(eligible, Ordering::Release);
+        h.cons.cnc.status().leader_hint.store_release(2);
+        h.cons.maybe_reoffer_snapshot_reports();
+        assert_eq!(
+            drain_snap_reports(&sock2)
+                .iter()
+                .map(|b| b.position)
+                .collect::<Vec<_>>(),
+            vec![eligible],
+            "Complete, at-or-below the committed report, and not held are all skipped"
+        );
+    }
+
+    /// Review M5: the leader's own multi-set re-offer comes from the cache —
+    /// two held Commanded sets, both fed in-process under its own id with
+    /// their own hashes, though its slots name neither.
+    #[test]
+    fn a_new_leader_re_offers_every_cached_held_set_to_itself() {
+        let mut h = harness_with_rows(&["a"]);
+        let (p1, p2) = (5000u64, 6000u64);
+        h.cons.cache_report_set(p1, &[(0, 0x01)]);
+        h.cons.cache_report_set(p2, &[(0, 0x02)]);
+        h.cons.holdings_held.extend([p1, p2]);
+        publish_commanded_catalog(&mut h, &[(p1, 1), (p2, 2)]);
+        h.cons.snapshot_set_position.store(p2, Ordering::Release);
+        drive_to_serving_leader(&mut h);
+        h.cons.maybe_reoffer_snapshot_reports();
+        let got: Vec<(u64, Vec<(u32, u64)>)> = h
+            .cons
+            .pending_reports_for(0)
+            .iter()
+            .map(|e| (e.position, e.hashes.iter().map(|(k, v)| (*k, *v)).collect()))
+            .collect();
+        assert_eq!(got, vec![(p1, vec![(1, 0x01)]), (p2, vec![(1, 0x02)])]);
+    }
+
+    /// Review M5: the cache's bound and replacement rule. Full at
+    /// `MAX_CATALOG_SETS`: a set older than all of them is not admitted, a
+    /// newer one evicts the oldest. A recomputation that found FEWER rows
+    /// never replaces a fuller entry; an equally full one does.
+    #[test]
+    fn the_report_cache_is_bounded_and_keeps_the_fuller_entry() {
+        let mut h = harness_with_rows(&["a"]);
+        let n = MAX_CATALOG_SETS as u64;
+        for i in 1..=n {
+            h.cons.cache_report_set(i * 100, &[(0, i), (1, i)]);
+        }
+        let positions = |h: &Harness| {
+            h.cons
+                .reported_sets
+                .iter()
+                .map(|s| s.position)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(h.cons.reported_sets.len(), MAX_CATALOG_SETS);
+        h.cons.cache_report_set(50, &[(0, 9)]);
+        assert_eq!(
+            positions(&h).first(),
+            Some(&100),
+            "older than a full cache: not admitted"
+        );
+        h.cons.cache_report_set((n + 1) * 100, &[(0, 9)]);
+        assert_eq!(h.cons.reported_sets.len(), MAX_CATALOG_SETS);
+        assert_eq!(
+            (
+                positions(&h).first().copied(),
+                positions(&h).last().copied()
+            ),
+            (Some(200), Some((n + 1) * 100)),
+            "a newer set evicts the oldest"
+        );
+        h.cons.cache_report_set(200, &[(0, 0xFF)]);
+        let e = h.cons.reported_sets[0];
+        assert_eq!(
+            &e.reports[..e.n],
+            &[(0, 2), (1, 2)],
+            "fewer rows never replace"
+        );
+        h.cons.cache_report_set(200, &[(0, 0xF0), (1, 0xF1)]);
+        let e = h.cons.reported_sets[0];
+        assert_eq!(
+            &e.reports[..e.n],
+            &[(0, 0xF0), (1, 0xF1)],
+            "an equally full one does"
+        );
+        assert_eq!(
+            h.cons.report_seeds.inner.lock().unwrap().known,
+            positions(&h),
+            "the probe is told what the cache holds"
+        );
+    }
+
     /// Spec §4.4: the record is a `CLUSTER` command like any other, so it
     /// waits behind the single-in-flight gate rather than appending a second
-    /// command above an uncommitted one. Kept, never dropped — the set is
-    /// still the newest thing this leader knows about that row.
+    /// command above an uncommitted one. Kept, never dropped — the evidence
+    /// is still good.
     #[test]
     fn the_report_append_waits_for_the_single_in_flight_gate() {
         let mut h = harness_with_rows(&["a"]);
@@ -16089,7 +16753,7 @@ mod tests {
         let mut h = harness_with_rows(&["a"]);
         drive_to_serving_leader(&mut h);
         h.cons.do_work(); // one ordinary pass: `first_seen_ns` is then a real clock reading
-        let p = 6080u64;
+        let p = 6048u64;
         for id in 0..3u32 {
             h.cons.on_snap_report(id, 0, p, 0x88);
         }
