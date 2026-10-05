@@ -715,9 +715,20 @@ procedure forbids it.)
   lost. Requiring `is_agreed()` at the door is a project-2 question (the
   chooser decides what a pinned attach may install from), not built here.
 
-#### Addendum (2026-10-05): lock discipline of the published view
+#### Addendum (2026-10-05): lock discipline of the published view — RETRACTED
 
-**Finding.** `lin_v2::two_fsm_bounded` is deterministic on `main` (5 fault
+**Retracted the same day (ruling R37).** The addendum's finding rested on
+one maximum sample per run. A five-run probe at the same commit (Task 15,
+`~/scratch/t15/`) measured the `ClusterView` mutex's longest acquisition
+wait at 1.07–1.51 µs while the bad runs (21 and 13 fault ticks, 5 and 3
+abandoned instants) still occurred, and the four design items below, once
+built, left the tick distribution unchanged (5/8/11/7/13). The lock is not
+the carrier; the commit that built this addendum (5a7a8c2) is reverted.
+The actual mechanism is the report-aggregation liveness gap recorded in
+the erratum that follows this addendum. The text below is kept as the
+record of a wrong diagnosis and binds nothing.
+
+**Finding (retracted).** `lin_v2::two_fsm_bounded` is deterministic on `main` (5 fault
 ticks) and non-deterministic on this branch (5–31 ticks, WGL stack overflow in
 3/5 runs). Bisected to the row-255 report × the catalog-aware floor. Probes
 show the mechanism is **contention on the `ClusterView` mutex**: acquisition
@@ -757,3 +768,89 @@ of the view's lock does more than a pointer copy while holding it.
 after (the probe in `~/scratch/lin-m2-report.md`): after must be < 1 ms;
 `two_fsm_bounded` 5/5 at 5 ticks with 0 `snapshot_instant_abandoned`; the
 full proof stack. **No bar** on anything else (D8).
+
+#### Erratum (2026-10-05, ruling R37): the leader's report aggregation must stay live under a lagging voter
+
+**What the spec assumed.** §4.2 takes the `SnapshotReport` record as given
+and §4.5 makes the purge floor "the newest AGREED set this node holds". Both
+inherit, unexamined, the aggregation rule plan B3 built for live
+nondeterminism detection (lifecycle spec §6.5.2, `Consensus::on_snap_report`):
+the leader keeps **one** pending instant per row; a report for a NEWER
+instant replaces that entry outright and restarts the 5 s
+`SNAP_REPORT_TIMEOUT_NS` clock; a report for an OLDER instant than the one
+pending is dropped; and both leader exits clear the map. Before the catalog
+that rule only cost divergence coverage: a node's floor moved on its own
+complete set. The catalog made the floor depend on an agreed record, so the
+rule's liveness became the floor's liveness.
+
+**What breaks.** With instants arriving faster than the timeout, a voter that
+is ONE instant behind the others starves agreement for every instant: the
+others' reports for P are discarded when they report P+1, the laggard's
+report for P is then "older than pending" and dropped, and the clock never
+runs 5 s because every instant restarts it. `lin_v2::two_fsm_lockstep`
+(one instant per 1.2 s fault tick, one node always restarting) shows it in
+full — 83 instants, 33 leader changes, 501 reports sent, 147 superseded,
+0 timed out, 3 appended, floor 0 for the whole budget — and
+`two_fsm_bounded`'s 5-to-21-tick spread is the same mechanism: each run ends
+at its FIRST agreed instant, and how many instants that takes is luck. In
+production the same shape is a slow voter under a short
+`snapshot_interval_bytes`: purge freezes cluster-wide and
+`uc2_catalog_stalled` is the only symptom. This is a liveness regression
+against `main`, found by the proof stack, and it is fixed on this branch
+before merge.
+
+**Rule.** A report is evidence about one `(row, instant)`; a newer instant
+never discards an older one's evidence. The leader keeps pending evidence
+keyed by `(row, position)`, every entry with its own clock, and appends an
+entry when **every voter has reported it OR its own clock reaches
+`SNAP_REPORT_TIMEOUT_NS`**, whichever is first — ascending by position
+within a row, rows ascending, one append per pass (single-in-flight is
+unchanged). `verdict()` and `is_agreed()` are unchanged: two matching voters
+of three appended by timeout are `Agreed`, so a lagging voter delays the
+floor by at most the timeout instead of forever.
+
+**Mechanics.**
+1. `pending_snapshot_reports` becomes a map from row to an ordered list of
+   `PendingSnapshotReport { position, first_seen_ns, hashes }`, ascending
+   by position. A report for a position at or below the row's COMMITTED
+   report position is still dropped (unchanged, `held_report_position`). Any
+   other position gets or joins its own entry; a report never moves between
+   entries and never restarts another entry's clock.
+2. When an entry for `(row, P')` is appended, the row's pending entries
+   BELOW `P'` are removed and counted under the existing
+   `snapshot_report_superseded` event: once `P'` commits they would be
+   refused as stale at the door (§4.2 / refusal 59). That is now the ONLY
+   place the event fires. A lost agreement opportunity exists here (P could
+   still have completed by timeout while P' waits on another row) and is
+   accepted: ascending order means P' appends before P only when P is not
+   ready, and §4.2's completion drop (R25) removes P's `Commanded` entry
+   once P' completes anyway.
+3. Bound: at most `MAX_CATALOG_SETS` (64) pending instants per row; a new
+   instant beyond the bound evicts the row's OLDEST pending entry, counted
+   under the same event. Memory is ≤ 64 × 9 rows × ~120 B; the append rate
+   is unchanged from a healthy cluster's (one record per row per instant).
+4. Both leader exits still clear the map — a leader's evidence is a leader's
+   to place — and the evidence is RE-OFFERED instead of lost: a node
+   re-sends the reports for its NEWEST complete set (`snapshot_set_position`,
+   when non-zero) each time it learns a DIFFERENT leader (the cnc
+   `leader_hint` changes to another node id, or this node becomes leader, in
+   which case it feeds itself in-process as `send_snapshot_reports` already
+   does for a leader). Once per leader change; through the existing
+   `send_snapshot_reports(p)`, whose `snapshot_pos == p` guard skips any row
+   that has since frozen a newer instant.
+5. `uc2_snapshot_reports_timed_out_total` keeps its meaning (an append with
+   fewer voters than required); no new metric, no wire or layout change; the
+   `SnapshotReport` record is unchanged. Not a flag day.
+
+**Proof (binding for Task 16).** (a) A unit test on a 3-voter leader that
+replays the starvation: instants every 1 s of `pass_mono_ns`, voter C always
+one instant late — under the old rule no instant appends; under the new rule
+every instant appends `by: all_voters`. (b) Per-entry clocks: P then P+1 a
+second later; P appends by timeout at 5 s, P+1 not before its own 5 s. (c)
+The appended-P' drop of older pending and the 64-entry eviction, each with
+the superseded event. (d) The re-send on a changed leader hint (and the
+in-process self-report on becoming leader). (e) `lin_v2::two_fsm_bounded`
+5 runs: the test's own tick count in every run equals `main`'s (5) within
+±1, with the per-run count of `snapshot_report_appended` recorded; (f)
+`lin_v2::two_fsm_lockstep` 3/3 pass; (g) the all-15 `lin_v2` suite once; the
+usual gates. No performance bar (D8).
