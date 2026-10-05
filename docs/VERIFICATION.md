@@ -507,7 +507,10 @@ R39's door is `a_report_above_the_leaders_log_extent_is_dropped`. Ruling R42
 `a_foreign_marker_excludes_a_set_after_a_restart`,
 `pruning_a_set_removes_its_foreign_marker`, the receiver's
 `a_session_does_not_complete_until_its_cluster_artifact_lands_and_routes_it_first`
-(the marker lands before the cluster artifact) and backup's
+and `an_aborted_session_leaves_its_row_copies_already_marked` (the marker
+lands before any of a session's artifacts),
+`marking_a_set_foreign_evicts_its_cached_report`,
+`after_a_restart_the_re_offer_skips_a_marked_set` and backup's
 `the_snapshot_copy_carries_a_sets_foreign_marker`; the seeder's per-probe
 budget and retry are `a_backlog_of_held_sets_drains_over_successive_probes`
 and `a_partially_hashed_set_is_retried_on_the_next_probe`.

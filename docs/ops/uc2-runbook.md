@@ -436,8 +436,8 @@ transport setting, both measured closed-loop at inflight 1 on 8-vCPU
   backup and restore carry with it). **Operator rule:** the marker is how a
   node knows a set is a copy and must not be reported as its own
   observation. If you copy a set's artifacts into `snapshots/` by hand,
-  create `snapshots/cluster/snap-<pos>.foreign` beside its `.ultcluster`
-  (before copying that file in), or that node becomes a spurious attester —
+  create `snapshots/cluster/snap-<pos>.foreign` first (before copying any
+  of that set's files in), or that node becomes a spurious attester —
   its reports for the set agree with the source by construction and count
   as an independent builder in the catalog's verdict. And two transient staged
   payloads in the instance root, `schedules.pending` and `settings.pending`,

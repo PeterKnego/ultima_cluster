@@ -1049,6 +1049,15 @@ the values it already runs is fine). Do not rely on `[settings] retain_sets`
 in `node.toml` for an upgraded cluster: `[settings]` seeds **genesis** only,
 and an upgraded cluster's genesis is long past.
 
+**Sets this node did not build carry a marker from now on — older ones do
+not.** A set that arrives through a snapshot session (`uc2ctl snapshot
+fetch`, or a below-floor install) is marked
+`<instance_dir>/snapshots/cluster/snap-<pos>.foreign`, and the node never
+reports a marked set's hashes as its own. Instance directories from before
+this change carry no markers, so a set this node fetched or was installed
+with before the upgrade is treated as its own; to exclude one, create that
+empty file for its position by hand while the node is stopped.
+
 **cnc unchanged.** The catalog is not on the shmem page; it rides inside
 the cluster artifact and `/metrics` only. No cnc version bump, no node-local
 process restart beyond the ordinary flag-day one.
