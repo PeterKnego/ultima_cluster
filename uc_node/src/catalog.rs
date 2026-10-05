@@ -68,13 +68,18 @@ impl SoftTable {
 
 /// `row`'s packed version within `e` — `None` for a row index at or past
 /// `CNC_MAX_SERVICES` (never a panic; the caller treats "no such row" as "no
-/// match"). `CLUSTER_ROW` (255) reads the cluster artifact's entry.
+/// match") and `None` for a row whose verdict is `Unreported`: such a row
+/// built nothing at P, and its `version` field is the default `0` — which is
+/// also a legitimate packed version, so reading it would let an unreported
+/// row match `agreed_for(row, 0)`. `CLUSTER_ROW` (255) reads the cluster
+/// artifact's entry under the same rule.
 fn row_version(e: &SetEntry, row: u8) -> Option<u32> {
-    if row == CLUSTER_ROW {
-        Some(e.cluster.version)
+    let r = if row == CLUSTER_ROW {
+        &e.cluster
     } else {
-        e.rows.get(row as usize).map(|r| r.version)
-    }
+        e.rows.get(row as usize)?
+    };
+    (r.verdict != RowVerdict::Unreported).then_some(r.version)
 }
 
 /// A read-only view over the catalog's set list plus the soft table, with
@@ -374,5 +379,81 @@ mod tests {
         let c = q(&sets, &soft);
         assert_eq!(c.agreed_for(0, pack_version(1, 2, 7)), vec![1000, 2000]);
         assert_eq!(c.agreed_for(0, pack_version(1, 3, 0)), Vec::<u64>::new());
+    }
+
+    /// A row that never reported at P has `version = 0` in the entry — and
+    /// `0` is a legitimate packed version — so an UNREPORTED row must never
+    /// match `agreed_for(row, 0)`: it built nothing at P.
+    #[test]
+    fn an_unreported_row_never_matches_agreed_for() {
+        let sets = [agreed(1000), agreed(2000)];
+        assert_eq!(sets[0].rows[1].verdict, RowVerdict::Unreported);
+        assert_eq!(sets[0].rows[1].version, 0);
+        let soft = SoftTable::default();
+        let c = q(&sets, &soft);
+        assert_eq!(
+            c.agreed_for(1, 0),
+            Vec::<u64>::new(),
+            "row 1 never reported"
+        );
+        // A reported row at version 0 still matches.
+        let mut zero = agreed(3000);
+        zero.rows[0].version = 0;
+        let sets = [zero];
+        let c = q(&sets, &soft);
+        assert_eq!(c.agreed_for(0, 0), vec![3000]);
+        // And the cluster row likewise: reported → read, unreported → None.
+        assert_eq!(c.agreed_for(CLUSTER_ROW, 0x0102_0000), vec![3000]);
+        let mut e = agreed(4000);
+        e.cluster = RowEntry::default();
+        assert_eq!(row_version(&e, CLUSTER_ROW), None);
+        assert_eq!(row_version(&e, 0), Some(0x0102_0000));
+        assert_eq!(row_version(&e, 200), None, "past CNC_MAX_SERVICES");
+    }
+
+    /// Boundaries of the time-based queries: `live` is inclusive at
+    /// `now - last_seen == stale_ns`; `stalled` is strict, so an instant at
+    /// exactly `time_ns + timeout == now` is NOT stalled yet.
+    #[test]
+    fn live_and_stalled_boundaries() {
+        let mut soft = SoftTable::default();
+        soft.record(1, holding(42, 0, 0, 0), 10_000 - 900); // exactly stale_ns old
+        soft.record(2, holding(42, 0, 0, 0), 10_000 - 901);
+        let live: Vec<NodeId> = soft.live(10_000, 900).map(|(id, _)| id).collect();
+        assert_eq!(live, vec![1], "inclusive at the boundary");
+        let sets = [
+            SetEntry::commanded(100, SetKind::Full, 9_500), // 9_500 + 500 == now
+            SetEntry::commanded(200, SetKind::Full, 9_499),
+        ];
+        let c = q(&sets, &soft);
+        assert_eq!(c.stalled(500), vec![200], "at the boundary: not stalled");
+    }
+
+    /// `newest_agreed(at_most)` is inclusive: a set AT `at_most` answers.
+    #[test]
+    fn newest_agreed_is_inclusive_at_its_bound() {
+        let sets = [agreed(1000), agreed(2000)];
+        let soft = SoftTable::default();
+        let c = q(&sets, &soft);
+        assert_eq!(c.newest_agreed(2000), Some(2000));
+        assert_eq!(c.newest_agreed(1999), Some(1000));
+        assert_eq!(c.newest_agreed(1000), Some(1000));
+    }
+
+    /// `coverage_gaps`' journal escape: a span nobody holds the newer set of
+    /// is still NOT a gap while some live node's journal covers it.
+    #[test]
+    fn coverage_gaps_escape_through_a_covering_journal() {
+        let sets = [agreed(1000), agreed(2000)];
+        let mut soft = SoftTable::default();
+        soft.record(1, holding(42, 0, 1000, 2000), 9_900); // holds nothing, journal [1000, 2000]
+        let c = q(&sets, &soft);
+        assert_eq!(c.holders(2000), Vec::<NodeId>::new());
+        assert_eq!(c.coverage_gaps(), Vec::<(u64, u64)>::new());
+        // One byte short on either end and the gap reappears.
+        let mut soft = SoftTable::default();
+        soft.record(1, holding(42, 0, 1001, 2000), 9_900);
+        let c = q(&sets, &soft);
+        assert_eq!(c.coverage_gaps(), vec![(1000, 2000)]);
     }
 }

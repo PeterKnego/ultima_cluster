@@ -21,7 +21,7 @@
 //!    counted toward `retain_sets` (ruling R21);
 //! 4. the flag-day window (a pre-catalog `v3` cluster artifact on disk) is
 //!    `Empty`, serves a joiner, keeps the set the node stands on, and ends
-//!    at the first agreed instant;
+//!    at the first instant that completes (ruling R26; here it also agrees);
 //! 5. a stopped node leaves `holders()` after the soft staleness timeout and
 //!    a fetch routed by `holders()` lands from the surviving holder;
 //! 6. on a learner-only cluster the voters know the cluster floor yet purge
@@ -59,8 +59,29 @@ const SEG: u64 = 64 * 1024;
 
 static TEST_LOCK: Mutex<()> = Mutex::new(());
 
-fn serialize() -> MutexGuard<'static, ()> {
-    TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+/// The whole-box serialization guard, plus the reset of every process-global
+/// fault knob this file's state machines read ([`SALT`], [`FREEZE_FAILS`]).
+/// The reset runs in `Drop` — on a normal return AND on a panic's unwind —
+/// and BEFORE the lock is released (a struct's own `drop` runs before its
+/// fields'), so a test that fails mid-way can never leak a salted row or a
+/// failing freeze into the next test that takes the lock.
+struct Serial {
+    _lock: MutexGuard<'static, ()>,
+}
+
+impl Drop for Serial {
+    fn drop(&mut self) {
+        for s in &SALT {
+            s.store(0, Ordering::Release);
+        }
+        FREEZE_FAILS.store(false, Ordering::Release);
+    }
+}
+
+fn serialize() -> Serial {
+    Serial {
+        _lock: TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner()),
+    }
 }
 
 /// UNIX-epoch wall nanoseconds — the clock the soft table stamps
@@ -314,14 +335,21 @@ fn await_single_leader(c: &Cluster, secs: u64) -> usize {
 /// One submitted frame's aligned log footprint: 32 B header + [`PAYLOAD`].
 const FRAME_BYTES: u64 = 32 + PAYLOAD as u64;
 
-/// `node.submit`, `n` times, spinning on a full ring. Payload `i` as a
-/// little-endian `u64` — what every state machine here sums.
+/// `node.submit`, `n` times, retrying a full ring (bounded, Ruling R23).
+/// Payload `i` as a little-endian `u64` — what every state machine here sums.
 ///
 /// Then waits until the leader has COMMITTED them. `submit` only enqueues
 /// on the ingress ring, while an instant is appended straight to the log —
 /// so without this wait the instant the caller commands next can land
 /// AHEAD of the traffic it was meant to follow (observed: a standby instant
 /// at P = 128 after 6000 "submitted" frames).
+///
+/// The commit target, `append-before + n × FRAME_BYTES`, is a LOWER BOUND
+/// on where these frames end: anything else appended meanwhile (a `CLUSTER`
+/// command, an instant, a `NEW_TERM`) lands in the same log, so commit
+/// reaching the target proves only that at least that many bytes committed
+/// — enough to order the next instant after the traffic, not an exact
+/// position of the last frame.
 fn submit_frames(node: &Node, n: u64) {
     /// How long ONE frame may keep meeting a full ingress ring (Ruling R23:
     /// fail by name, never hang).
@@ -978,15 +1006,19 @@ fn a_diverged_row_completes_the_set_but_never_moves_the_floor() {
 }
 
 /// Catalog spec §8 "Stalled set": an instant some row cannot freeze stays
-/// `Commanded`; retention ignores it; `stalled()` names it; and the NEXT
-/// instant proceeds and completes.
+/// `Commanded`; `stalled()` names it; and the NEXT instant proceeds and
+/// completes. ("Retention ignores a stalled set" is part of the same §8 row
+/// but is NOT observable here — with `retain_sets = 1` there is only ever
+/// one agreed set to retain; test 3 covers retention, and the cluster FSM's
+/// unit tests cover a stall above the floor.)
 ///
 /// Two rows, real services on every node: row 0 `SumSm`, row 1 `FlakySum`,
 /// whose `freeze()` fails while [`FREEZE_FAILS`] is set. With it set, the
 /// instant `p1` completes row 0 everywhere and row 1 nowhere — no node holds
 /// the set, nobody reports it, and the catalog keeps it `Commanded`. Clear the
 /// flag and the next instant `p2` completes, agrees, and supersedes `p1`,
-/// which retention then drops as history (§4.4 step 2).
+/// which is dropped as history the moment `p2` turns `Complete` (catalog
+/// ruling R25; before R25 it went at `p2`'s agreement, §4.4 step 2).
 ///
 /// Red twin: leave the flag clear for `p1` — it completes, and the
 /// `Commanded` / `stalled()` assertions fail.
@@ -1465,9 +1497,15 @@ fn a_killed_node_leaves_holders_after_the_stale_timeout() {
     );
     let stale = Duration::from_nanos(c.node(leader).soft_stale_ns());
 
+    // Measured BEFORE the stop begins, not after it: the learner keeps
+    // sending STATUS until its agents are joined, so its last STATUS is at or
+    // after this instant, and "left after the staleness timeout" then reads
+    // `elapsed >= stale` with no dependence on how long the service and node
+    // stops take. The 50 ms slack covers the clock-domain difference only
+    // (the soft table stamps wall time; this is the monotonic clock).
+    let stopped = Instant::now();
     learner2_svc.take().unwrap().stop();
     c.nodes[2].stop();
-    let stopped = Instant::now();
     await_until(30, "the stopped learner left holders(p)", || {
         query_holders(c.node(leader), p) == vec![l3]
     });
@@ -1515,6 +1553,15 @@ fn a_killed_node_leaves_holders_after_the_stale_timeout() {
 ///
 /// Red twin: assert a voter's `archive_first_base > 0` after the 10 s hold —
 /// it is not; or drop the fetch — voter 0's floor never moves.
+///
+/// Which assertions are the CATALOG's teeth: the no-purge half alone ("a
+/// voter that holds nothing purges nothing") would pass on a pre-catalog
+/// build too — such a voter never had a complete set to float its floor on.
+/// The catalog-specific ones are that every voter reads the AGREED standby
+/// set as the cluster floor (`agreed_position == p`) while holding nothing;
+/// that the entry is catalogued as `Standby`; that the leader's soft table
+/// names ONLY the learner as a holder; and that a fetch moves exactly the
+/// fetching voter's floor to that agreed set and no one else's.
 #[test]
 fn learner_only_voters_do_not_purge_until_they_fetch() {
     let _g = serialize();

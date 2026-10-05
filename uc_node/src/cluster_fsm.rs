@@ -892,10 +892,14 @@ impl RawStateMachine for ClusterFsm {
 /// The frozen image: magic ‖ version u32 ‖ applied u64 ‖ table_position u64
 /// ‖ settings_position u64 ‖ membership (u32 len ‖ encode_config) ‖ table
 /// (u32 len ‖ encode_schedule_table) ‖ settings (one whole record — the
-/// decoder accepts a v1 or a v2 one, `SETTINGS_LEN_V1` or `SETTINGS_LEN`) ‖
+/// decoder accepts all three settings versions: v1 (`SETTINGS_LEN_V1`, 29
+/// B), v2 (`SETTINGS_LEN_V2`, 33 B) and v3 (`SETTINGS_LEN`, 35 B, the only
+/// one `freeze` writes); v1/v2 read `retain_sets = 1`, catalog ruling R24) ‖
 /// pins (u32 len ‖ `encode_pin_list`) ‖ reports (u32 len ‖
 /// `encode_report_list`) ‖ running (u32 len ‖ `encode_running_list`, #33,
-/// layout **v3**) ‖ crc32 of everything before it. The pin and report blobs are
+/// layout **v3**) ‖ catalog (u32 len ‖ `encode_set_list`, the snapshot
+/// catalog, layout **v4**; empty for an `Empty` catalog) ‖ crc32 of
+/// everything before it. The pin and report blobs are
 /// image layout **v2** (plan B1): a v1 image — one a `2.12.0` node wrote
 /// before this release, which a restarting node still reads off its own
 /// disk — carries neither and installs with both histories EMPTY, the same
@@ -2796,6 +2800,45 @@ mod tests {
         assert_eq!(p.len(), MAX_CATALOG_SETS);
         assert_eq!(*p.last().unwrap(), (MAX_CATALOG_SETS as u64 + 1) * 1000);
         assert_eq!(p[0], 2000, "the oldest commanded entry went");
+    }
+
+    /// The differentiating case for `cap_catalog`'s newest-entry guard: a
+    /// list FULL of agreed sets (an installed image whose `retain_sets`
+    /// keeps them all), then one more `SNAPSHOT` frame. The new commanded
+    /// entry is the ONLY non-agreed entry, so "evict the oldest non-agreed
+    /// entry" over the whole list would evict the instant just commanded —
+    /// and every later one on arrival. With the guard the oldest agreed set
+    /// goes instead and the newest survives.
+    #[test]
+    fn the_cap_keeps_a_new_instant_over_a_full_list_of_agreed_sets() {
+        let mut seed = fsm();
+        genesis_row(&mut seed, 0, 100);
+        let mut st = seed.state().clone();
+        st.settings.retain_sets = MAX_CATALOG_SETS as u16; // hand-built: past the door's bound
+        st.catalog = (1..=MAX_CATALOG_SETS as u64)
+            .map(|k| {
+                let mut e = SetEntry::commanded(k * 1000, SetKind::Full, k);
+                e.state = SetState::Complete;
+                e.cluster.verdict = RowVerdict::Agreed;
+                e.rows[0].verdict = RowVerdict::Agreed;
+                e
+            })
+            .collect();
+        st.applied = 100_000;
+        let (img, at) = ClusterFsm::new(st, vec![]).freeze().unwrap();
+        let mut f = fsm();
+        assert_eq!(f.install_snapshot(at, &mut &img[..]).unwrap(), at);
+        assert_eq!(f.state().catalog.len(), MAX_CATALOG_SETS);
+        let next = (MAX_CATALOG_SETS as u64 + 1) * 1000;
+        f.on_snapshot_frame(next, false, 99);
+        let p = positions(&f);
+        assert_eq!(p.len(), MAX_CATALOG_SETS);
+        assert_eq!(
+            *p.last().unwrap(),
+            next,
+            "the instant just commanded survives"
+        );
+        assert_eq!(p[0], 2000, "the oldest agreed set was evicted instead");
     }
 
     #[test]

@@ -706,3 +706,11 @@ procedure forbids it.)
   that follower's flow-control window never opens and replication to it
   stalls; a `0.10.0` leader accepts a 144 B body and ignores the tail —
   mixing is unsound both ways and the procedure forbids it.
+- **The pin door does not require an AGREED origin (open for project 2).**
+  `uc2ctl upgrade pin` (admin op 10) still checks only that the origin is
+  this node's newest COMPLETE set, as it did before the catalog; it does not
+  consult the catalog's verdict. A pin can therefore name a set that later
+  reads `Diverged`, and retention keeps it (a pinned origin is never
+  retired, R21) — but the floor never moves onto it (D4, R26), so nothing is
+  lost. Requiring `is_agreed()` at the door is a project-2 question (the
+  chooser decides what a pinned attach may install from), not built here.

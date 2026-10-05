@@ -2366,6 +2366,12 @@ impl World {
     /// genuinely HOLDS (content identity, `holds_frame` — exactly inv11's
     /// test). Ascending by construction: `snapshot_frames` is a `BTreeMap`
     /// keyed by frame end, walked in key order.
+    ///
+    /// "Catalog" here means the COMMANDED half only — every `SNAPSHOT` frame
+    /// at or below `frontier`, the entries `on_snapshot_frame` records. It is
+    /// NOT the set of complete or agreed sets: the sim models no row reports,
+    /// so completion and agreement (and the retention they drive) are out of
+    /// its reach; those are the cluster FSM's unit tests and the e2e tests.
     fn catalog_at(&self, node: usize, frontier: u64) -> Vec<(u64, u8)> {
         self.snapshot_frames
             .range(..=frontier)

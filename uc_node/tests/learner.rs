@@ -2218,16 +2218,50 @@ struct JoinOpts<'a> {
     restart_shipper: bool,
 }
 
-/// `voter.submit`, `n` times, spinning on a full ring — the raw byte path the
+/// `voter.submit`, `n` times, retrying a full ring — the raw byte path the
 /// fixture drives instead of a real client (there is no service attached).
+///
+/// Ruling R23 (catalog final fix wave): fails by name, never hangs. A
+/// `NotServing` refusal is an immediate named panic — leadership moved off
+/// the node this fixture submits to, and retrying would spin forever — and a
+/// `Full` ingress ring is retried for at most 60 s per frame, then named
+/// with the node's counters.
 fn submit_frames(node: &Node, n: u64) {
+    /// How long ONE frame may keep meeting a full ingress ring.
+    const FULL_DEADLINE: Duration = Duration::from_secs(60);
+    let counters = || {
+        let c = node.counters();
+        format!(
+            "append={} commit={} durable={}",
+            c.append.load_acquire(),
+            c.commit.load_acquire(),
+            c.durable.load_acquire()
+        )
+    };
     for i in 0u64..n {
         let mut p = vec![0u8; PAYLOAD];
         p[..8].copy_from_slice(&i.to_le_bytes());
+        let mut first_full: Option<Instant> = None;
         loop {
             match node.submit(p.clone()) {
                 Ok(()) => break,
-                Err(_) => std::thread::yield_now(),
+                Err(uc_node::SubmitError::NotServing) => panic!(
+                    "submit_frames: frame {i} of {n} refused NotServing — leadership moved off \
+                     the node this fixture submits to; re-shape the test rather than retry ({})",
+                    counters()
+                ),
+                Err(uc_node::SubmitError::Full) => {
+                    let since = *first_full.get_or_insert_with(Instant::now);
+                    if since.elapsed() >= FULL_DEADLINE {
+                        panic!(
+                            "submit_frames: frame {i} of {n} met a full ingress ring for \
+                             {FULL_DEADLINE:?} — the log is not draining (a stalled `durable` \
+                             means the archive cannot write): {}",
+                            counters()
+                        );
+                    }
+                    std::thread::yield_now();
+                }
             }
         }
     }

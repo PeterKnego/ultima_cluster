@@ -213,6 +213,15 @@ fn render_fsm_lag(bytes: u64) -> String {
 /// The exact text `settings show` prints for one committed `(position,
 /// Settings)` pair — pulled out of [`show`] so it is testable without a real
 /// cluster artifact on disk.
+///
+/// **Field-ordering contract.** The line is `key=value` pairs in a FIXED
+/// order — `position`, `admission_bytes`, `fsm_lag`,
+/// `snapshot_interval_bytes`, `snapshot_target`, `retain_sets`,
+/// `datagram_mtu` (with its `(baseline|discovered)` suffix last) — and that
+/// order is part of the output contract `docs/reference/uc2ctl.md` prints
+/// and scripts may split on. A new field goes BEFORE `datagram_mtu`'s
+/// parenthesised suffix (as `retain_sets` did) or after it; existing keys
+/// are never reordered or renamed.
 fn render_settings_line(position: u64, settings: &Settings) -> String {
     let fsm_lag = render_fsm_lag(settings.fsm_lag_bytes);
     let target = match settings.snapshot_target {

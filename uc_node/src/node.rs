@@ -9588,7 +9588,7 @@ impl Consensus {
                 (0, 0, position)
             }
             Err(AppendError::WouldOverrun) => (2, 0, view_position),
-            // Unreachable: `SETTINGS_LEN` is 33 bytes. Refused rather than
+            // Unreachable: `SETTINGS_LEN` is 35 bytes. Refused rather than
             // retried, for `apply_schedule_table`'s reason.
             Err(AppendError::PayloadTooLarge) => self.refuse_settings(REASON_SETTINGS_DECODE),
         }
@@ -13558,6 +13558,119 @@ mod tests {
         );
     }
 
+    /// Catalog spec §4.4, the floor path end to end under a non-`Empty`
+    /// catalog: `own` (this node's newest complete set) is UNLISTED, and an
+    /// older agreed set is listed. Not held here → nothing persists and no
+    /// purge is commanded; held → the persisted floor, the mirrored cnc word
+    /// and the purge target all land on the agreed set, never on `own`.
+    #[test]
+    fn the_floor_persists_at_the_newest_agreed_set_held_not_at_own() {
+        use uc_protocol::v2::upgrade::RowRunning;
+        let mut h = harness_with_rows(&["a"]);
+        h.cons.purge_policy = PurgePolicy::BelowSnapshot { slack_bytes: 0 };
+        let (agreed, own) = (4096u64, 6016u64);
+        assert!(own <= h.cons.cnc.counters().durable.load_acquire());
+        let mut st = h.cons.cluster_view.to_state();
+        st.catalog = vec![agreed_entry(agreed)];
+        st.running[0] = Some(RowRunning {
+            row: 0,
+            version: 1,
+            record_pos: 1,
+        });
+        h.cons.cluster_view.publish(&st);
+        h.cons.snapshot_set_position.store(own, Ordering::Release);
+
+        h.advance_floor_timer();
+        assert!(!h.cons.maybe_persist_snapshot_floor());
+        assert_eq!(h.cons.snapshot_persisted_floor, 0, "not held: no floor");
+        assert!(h._trunc_rx.try_recv().is_err(), "not held: no purge");
+
+        h.cons.note_set_held(agreed);
+        h.advance_floor_timer();
+        assert!(h.cons.maybe_persist_snapshot_floor());
+        assert_eq!(h.cons.snapshot_persisted_floor, agreed);
+        assert_eq!(
+            h.cons.cnc.snapshots().node_snapshot_floor.load_acquire(),
+            agreed
+        );
+        assert!(
+            matches!(h._trunc_rx.try_recv(), Ok(ArchiveCmd::Purge { below }) if below == agreed),
+            "the purge target is the agreed set held, not own"
+        );
+    }
+
+    /// `effective_floor_in`'s two remaining branches: `own` LISTED but not
+    /// agreed (diverged) falls through to the newest agreed set held below
+    /// it; and the search stops at the persisted floor (`0` — a set at or
+    /// below it could not move the floor anyway), even when an older agreed
+    /// set is held.
+    #[test]
+    fn effective_floor_skips_a_diverged_own_and_stops_at_the_persisted_floor() {
+        use uc_protocol::v2::catalog::RowVerdict;
+        use uc_protocol::v2::upgrade::RowRunning;
+        let mut h = harness_with_rows(&["a"]);
+        let mut diverged = agreed_entry(3000);
+        diverged.rows[0].verdict = RowVerdict::Diverged;
+        let mut st = h.cons.cluster_view.to_state();
+        st.catalog = vec![agreed_entry(1000), agreed_entry(2000), diverged];
+        st.running[0] = Some(RowRunning {
+            row: 0,
+            version: 1,
+            record_pos: 1,
+        });
+        h.cons.cluster_view.publish(&st);
+        h.cons.snapshot_set_position.store(3000, Ordering::Release);
+        h.cons.note_set_held(1000);
+        assert_eq!(
+            h.cons.effective_floor_candidate(),
+            1000,
+            "own diverged; 2000 not held; 1000 held"
+        );
+        h.cons.note_set_held(2000);
+        assert_eq!(h.cons.effective_floor_candidate(), 2000);
+        h.cons.snapshot_persisted_floor = 2000;
+        assert_eq!(
+            h.cons.effective_floor_candidate(),
+            0,
+            "2000 is the persisted floor: nothing at or below it moves anything"
+        );
+    }
+
+    /// The pruner at a floor ABOVE every listed set: a listed set below the
+    /// cut survives only because it is listed, an unlisted one below the cut
+    /// goes, in the row dir and the cluster dir alike.
+    #[test]
+    fn the_pruner_keeps_listed_sets_below_a_floor_above_them_all() {
+        let mut h = harness_with_rows(&["a"]);
+        for p in [1000u64, 2000, 2500, 3000, 4000] {
+            write_row_artifact(&h, 0, p, b"x");
+            write_cluster_artifact(&h, p, b"c");
+        }
+        let mut st = h.cons.cluster_view.to_state();
+        st.catalog = vec![agreed_entry(1000), agreed_entry(3000)];
+        h.cons.cluster_view.publish(&st);
+        h.cons.prune_snapshots_below(4000);
+        assert_eq!(list_row_artifacts(&h, 0), vec![1000, 3000, 4000]);
+        let mut cluster: Vec<u64> = std::fs::read_dir(&h.cons.cluster_snapshot_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter_map(|e| {
+                e.file_name()
+                    .to_str()?
+                    .strip_prefix("snap-")?
+                    .strip_suffix(".ultcluster")?
+                    .parse()
+                    .ok()
+            })
+            .collect();
+        cluster.sort_unstable();
+        assert_eq!(
+            cluster,
+            vec![1000, 3000, 4000],
+            "the cluster dir keeps exactly what the row dir keeps"
+        );
+    }
+
     /// Catalog ruling R26 (I2): `Empty` means "no `Complete` entry", not
     /// "no agreed entry". A catalog whose only complete set DIVERGED is not
     /// `Empty`, so the candidate is `0` (nothing moves) — never `own`, which
@@ -13624,6 +13737,21 @@ mod tests {
             vec![1000, 2000, 3000],
             "500 deleted; 1000 is a pin; 2000/3000 are listed"
         );
+        assert!(
+            !h.cons
+                .cluster_snapshot_dir
+                .join("snap-500.ultcluster")
+                .exists()
+        );
+        for p in [1000u64, 2000, 3000] {
+            assert!(
+                h.cons
+                    .cluster_snapshot_dir
+                    .join(format!("snap-{p}.ultcluster"))
+                    .exists(),
+                "cluster artifact at {p} survives"
+            );
+        }
     }
 
     /// Catalog spec §5.2 (D6), catalog ruling R27: the filesystem half of
