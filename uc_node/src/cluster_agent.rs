@@ -33,7 +33,7 @@
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering, fence};
 use std::sync::{Arc, mpsc};
 
 use uc_journal::Journal;
@@ -222,6 +222,45 @@ pub fn recover(
     }
 }
 
+/// Catalog ruling R28: the cluster artifact's `artifact_hash_of` hash,
+/// published by the `uc2-cluster` agent beside the artifact's position so the
+/// consensus agent's report edge (`send_snapshot_reports`) reads one word
+/// instead of re-reading the file it just wrote. Written once per artifact
+/// (freeze, install, or the boot seed), read once per completed set.
+///
+/// A seqlock over `(pos, hash)`: [`Self::publish`] zeroes `pos`, fences,
+/// writes `hash`, then stores `pos` with `Release`; [`Self::hash_at`] reads
+/// `pos` (Acquire), `hash`, fences, and re-reads `pos` — an overlapping
+/// publish of a NEWER artifact changes `pos` and the read answers `None`
+/// rather than pairing one artifact's hash with another's position.
+/// Positions only grow, so `pos` itself is the sequence number.
+#[derive(Debug, Default)]
+pub struct ClusterArtifactHash {
+    pos: AtomicU64,
+    hash: AtomicU64,
+}
+
+impl ClusterArtifactHash {
+    /// Publish `hash` as the hash of the artifact at `pos`.
+    pub fn publish(&self, pos: u64, hash: u64) {
+        self.pos.store(0, Ordering::Relaxed);
+        fence(Ordering::Release);
+        self.hash.store(hash, Ordering::Relaxed);
+        self.pos.store(pos, Ordering::Release);
+    }
+
+    /// The hash of the artifact at `p`, or `None` when the published word is
+    /// for another position (or a publish is in flight).
+    pub fn hash_at(&self, p: u64) -> Option<u64> {
+        if p == 0 || self.pos.load(Ordering::Acquire) != p {
+            return None;
+        }
+        let h = self.hash.load(Ordering::Relaxed);
+        fence(Ordering::Acquire);
+        (self.pos.load(Ordering::Relaxed) == p).then_some(h)
+    }
+}
+
 /// The `uc2-cluster` agent: the fifth polling agent, driving the cluster
 /// FSM's own apply loop over `CLUSTER` frames. Has no cnc slot and sits
 /// outside the lag policy.
@@ -235,6 +274,10 @@ pub struct ClusterAgent {
     /// Mirrors `snapshot_pos` for the consensus agent (task 5's floor
     /// computation) — Ruling R2.
     cluster_snapshot_pos: Arc<AtomicU64>,
+    /// Catalog ruling R28: the hash of the artifact `cluster_snapshot_pos`
+    /// names, published BEFORE that word moves. Created here; the node hands
+    /// a clone to the consensus agent ([`Self::artifact_hash_cell`]).
+    artifact_hash: Arc<ClusterArtifactHash>,
     /// Ruling P13(b): the last STANDBY instant this agent ACTED on, `0` if it
     /// never has — `uc2_snapshot_standby_instant_position`, read at scrape.
     ///
@@ -300,6 +343,15 @@ impl ClusterAgent {
         standby_instant_pos: Arc<AtomicU64>,
     ) -> ClusterAgent {
         let snapshot_pos = fsm.last_applied().filter(|_| start > 0).unwrap_or(0);
+        // Catalog ruling R28: seed the hash word from the recovered artifact
+        // — one read at boot, never on a pass. An unreadable file leaves the
+        // word empty, and that set's cluster row simply goes unreported.
+        let artifact_hash = Arc::new(ClusterArtifactHash::default());
+        if snapshot_pos > 0
+            && let Ok(img) = fs::read(artifact_path(&snapshot_dir, snapshot_pos))
+        {
+            artifact_hash.publish(snapshot_pos, uc_service::snapshots::artifact_hash_of(&img));
+        }
         cluster_snapshot_pos.store(snapshot_pos, Ordering::Release);
         let mut agent = ClusterAgent {
             follower: LogFollower::new(buffer, start),
@@ -309,6 +361,7 @@ impl ClusterAgent {
             snapshot_dir,
             snapshot_pos,
             cluster_snapshot_pos,
+            artifact_hash,
             standby_instant_pos,
             out: Vec::new(),
             journal,
@@ -331,6 +384,12 @@ impl ClusterAgent {
 
     pub fn applied(&self) -> u64 {
         self.fsm.state().applied
+    }
+
+    /// Catalog ruling R28: the published cluster-artifact hash word, for the
+    /// consensus agent's report edge.
+    pub fn artifact_hash_cell(&self) -> Arc<ClusterArtifactHash> {
+        Arc::clone(&self.artifact_hash)
     }
 
     /// Publish the view AND every row's cnc words — the pin triple and the
@@ -559,6 +618,7 @@ impl ClusterAgent {
                                 &self.snapshot_dir,
                                 &mut self.snapshot_pos,
                                 &self.cluster_snapshot_pos,
+                                &self.artifact_hash,
                             ) {
                                 // Spec §10: an incomplete set is the honest
                                 // outcome of a failed freeze, never a
@@ -683,11 +743,15 @@ impl ClusterAgent {
             self.installed.fetch_max(position, Ordering::Release);
             return Ok(());
         }
-        let mut f = File::open(path)?;
+        // Read whole (it is read whole by `install_snapshot` anyway) so the
+        // same bytes feed the R28 hash word.
+        let img = fs::read(path)?;
         let got = self
             .fsm
-            .install_snapshot(position, &mut f)
+            .install_snapshot(position, &mut &img[..])
             .map_err(|e| io::Error::other(e.to_string()))?;
+        self.artifact_hash
+            .publish(got, uc_service::snapshots::artifact_hash_of(&img));
         self.publish_view();
         // Ruling R5: an install is a batch that installed something, so it
         // writes `cluster_applied` too — same ordering rule as `do_work`'s
@@ -833,6 +897,7 @@ impl ClusterAgent {
                             &self.snapshot_dir,
                             &mut self.snapshot_pos,
                             &self.cluster_snapshot_pos,
+                            &self.artifact_hash,
                         ) {
                             crate::obs_event!(
                                 Warn,
@@ -950,6 +1015,7 @@ impl ClusterAgent {
             &self.snapshot_dir,
             &mut self.snapshot_pos,
             &self.cluster_snapshot_pos,
+            &self.artifact_hash,
         )
     }
 
@@ -963,6 +1029,7 @@ impl ClusterAgent {
         snapshot_dir: &Path,
         snapshot_pos: &mut u64,
         cluster_snapshot_pos: &Arc<AtomicU64>,
+        artifact_hash: &ClusterArtifactHash,
     ) -> io::Result<u64> {
         let (img, pos) = fsm.freeze().map_err(|e| io::Error::other(e.to_string()))?;
         fs::create_dir_all(snapshot_dir)?;
@@ -993,6 +1060,9 @@ impl ClusterAgent {
             }
         }
         *snapshot_pos = pos;
+        // Catalog ruling R28: the hash BEFORE the position, so a reader that
+        // sees `cluster_snapshot_pos == pos` finds the word published.
+        artifact_hash.publish(pos, uc_service::snapshots::artifact_hash_of(&img));
         cluster_snapshot_pos.store(pos, Ordering::Release);
         Ok(pos)
     }
@@ -1017,6 +1087,21 @@ mod tests {
     };
 
     use super::*;
+
+    /// Catalog ruling R28: the hash word answers only for the position it
+    /// was published with, and a newer publish replaces the pair whole.
+    #[test]
+    fn the_artifact_hash_word_answers_only_for_its_position() {
+        let w = ClusterArtifactHash::default();
+        assert_eq!(w.hash_at(0), None);
+        assert_eq!(w.hash_at(100), None);
+        w.publish(100, 0xAA);
+        assert_eq!(w.hash_at(100), Some(0xAA));
+        assert_eq!(w.hash_at(200), None);
+        w.publish(200, 0xBB);
+        assert_eq!(w.hash_at(100), None, "superseded");
+        assert_eq!(w.hash_at(200), Some(0xBB));
+    }
 
     /// A journal with nothing recorded — for tests that need a valid
     /// `Arc<Journal>` but never exercise `replay_from_journal` (the Overrun

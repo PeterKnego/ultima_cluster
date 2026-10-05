@@ -519,9 +519,12 @@ before its `STATUS` is ever parsed.
   the consensus hot path" (D6) is a correct constraint but names no agent;
   an early draft of the probe landed inside the node's own per-pass
   `do_work`, which is itself the consensus pass and contradicts D6 outright
-  for a directory walk. As built it runs on the **archive agent**'s duty
-  cycle — the agent that already owns disk I/O (journal recording), so a
-  slow filesystem stalls archiving, never commit.
+  for a directory walk. As built through Task 13 it ran on the **archive
+  agent**'s duty cycle — the agent that already owns disk I/O (journal
+  recording). The reasoning recorded here then, "so a slow filesystem
+  stalls archiving, never commit", was **false**: `durable` gates commit
+  through the report ceiling, so the archive agent IS the commit path.
+  **SUPERSEDED by R27 below** — the probe now runs on its own thread.
 - **§5.1's `catalog_position` stamp is a content hash, not a position
   (ruling R16).** The spec's `sets_held` row names "the catalog position it
   was computed against" without saying what that quantity is; the natural
@@ -649,3 +652,26 @@ before its `STATUS` is ever parsed.
   still means "nothing agreed"; `uc2_catalog_empty` now reads
   `catalog_has_complete` and is `1` iff no entry is `Complete`. Cost: journal
   growth (never loss) on a cluster whose every set diverges.
+- **R27 — the `Holdings` probe runs on its own `uc2-holdings` thread
+  (supersedes R14; final fix wave, Important I3).** R14 put the 1 Hz
+  `statvfs` + `snapshots/` walk on the archive agent on the premise that a
+  slow filesystem would stall archiving, never commit. The premise is wrong:
+  `durable` gates commit through the report ceiling, so a directory walk
+  there couples commit to the snapshots directory's metadata locks. As
+  built: `HoldingsProbe` is driven by a sixth thread, `uc2-holdings` — an
+  `AgentRunner` with `IdleStrategy::Sleep(50 ms)` whose work closure calls
+  `maybe_probe` (still at most once per second) and never reports progress,
+  so it sleeps between wakes rather than spinning. It has no consensus role,
+  is not one of the five `/healthz` agents, and is stopped and joined with
+  the node like the others. It reads two atomics (`durable`,
+  `archive_first_base`) and writes the `Holdings` cell's three byte fields.
+- **R28 — the cluster artifact's hash is published at freeze, not re-read
+  on the pass (final fix wave, M1).** As built through Task 13,
+  `send_snapshot_reports` did an `fs::read` of `snap-P.ultcluster` on the
+  consensus pass, once per completed set, to hash row 255. As built: the
+  `uc2-cluster` agent hashes the image it is writing (`freeze_and_write`),
+  the image it installs (`install_from`) and, once at boot, the recovered
+  artifact, and publishes `(position, hash)` through
+  `cluster_agent::ClusterArtifactHash` — a two-word seqlock, published
+  BEFORE `cluster_snapshot_pos` moves — and the report edge reads
+  `hash_at(P)`, skipping row 255 when the word names another position.

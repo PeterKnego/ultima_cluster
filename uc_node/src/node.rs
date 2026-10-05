@@ -398,6 +398,10 @@ const HOLDINGS_COPY_NS: u64 = 10_000_000;
 /// Catalog spec §5.2 (D6): the filesystem probe's spacing — free bytes,
 /// journal bytes and snapshot bytes change seconds apart.
 const HOLDINGS_PROBE_NS: u64 = 1_000_000_000;
+/// Catalog ruling R27: the `uc2-holdings` thread's sleep between wakes. The
+/// probe itself runs at most once per [`HOLDINGS_PROBE_NS`]; this only bounds
+/// how long a node stop waits to join the thread.
+const HOLDINGS_THREAD_SLEEP: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// Plan B3 final review F3: how long (monotonic ns, the pass's own clock) the
 /// attach gate (`Consensus::maybe_publish_declared`) may stay shut before the
@@ -1969,8 +1973,14 @@ impl Node {
         let arc_obs_frontier = Arc::clone(&obs_frontier);
         let cons_obs_frontier = Arc::clone(&obs_frontier);
         let cons_trace_prov = Arc::clone(&trace_prov);
-        // Catalog spec §5.2 (D6), ruling R14: the once-a-second filesystem
-        // probe rides the archive agent, on its own clock.
+        // Catalog spec §5.2 (D6), catalog ruling R27 (supersedes R14): the
+        // once-a-second filesystem probe runs on its OWN low-priority thread,
+        // `uc2-holdings` — a sleep loop with no consensus role. NOT the
+        // archive agent: `durable` gates commit through the report ceiling,
+        // so the archive agent IS the commit path, and a `statvfs` plus a
+        // directory walk there would couple commit to the filesystem's
+        // metadata locks. The thread only reads two atomics and writes the
+        // `Holdings` cell's byte fields.
         let mut holdings_probe = HoldingsProbe::new(
             Arc::clone(&holdings),
             cfg.instance_dir.clone(),
@@ -1979,13 +1989,25 @@ impl Node {
             journal_preallocate,
         );
         let probe_base = std::time::Instant::now();
+        let probe_cnc = Arc::clone(&cnc);
+        let probe_first_base = Arc::clone(&archive_first_base);
+        let holdings_runner = AgentRunner::spawn(
+            "uc2-holdings",
+            IdleStrategy::Sleep(HOLDINGS_THREAD_SLEEP),
+            move || {
+                holdings_probe.maybe_probe(
+                    probe_base.elapsed().as_nanos() as u64,
+                    probe_cnc.counters().durable.load_acquire(),
+                    probe_first_base.load(Ordering::Acquire),
+                );
+                // Never "progress": the idle strategy's sleep is the loop's
+                // whole pacing, and the probe's own 1 s clock decides when a
+                // wake does any work.
+                false
+            },
+        )?;
         let archive_agent = AgentRunner::spawn("uc2-archive", IdleStrategy::Yield, move || {
             let mut did = false;
-            holdings_probe.maybe_probe(
-                probe_base.elapsed().as_nanos() as u64,
-                arc_cnc.counters().durable.load_acquire(),
-                arc_first_base.load(Ordering::Acquire),
-            );
             while let Ok(cmd) = trunc_rx.try_recv() {
                 match cmd {
                     ArchiveCmd::Truncate { epoch, to } => {
@@ -2239,6 +2261,7 @@ impl Node {
             Arc::clone(&cluster_installed),
             Arc::clone(&snapshot_standby_instant_pub),
         );
+        let cluster_artifact_hash = cluster_agent.artifact_hash_cell();
         // M14a + plan B2 (final review C1) + plan B3 T5: the declared set is
         // NOT published here, and no longer at boot at all.
         //
@@ -2435,6 +2458,7 @@ impl Node {
             crypto_last_log_ns: 0,
             cluster_view: Arc::clone(&cluster_view),
             cluster_snapshot_pos: Arc::clone(&cluster_snapshot_pos),
+            cluster_artifact_hash,
             snapshot_last_commanded: 0,
             snapshot_last_commanded_standby: false,
             snapshot_last_commanded_bytes: 0,
@@ -2541,6 +2565,10 @@ impl Node {
                 receiver_agent,
                 archive_agent,
                 cluster_runner,
+                // Catalog ruling R27: not a polling agent (no `agents`
+                // label in `/healthz`); last, so its index never shifts the
+                // five above.
+                holdings_runner,
             ],
         })
     }
@@ -3852,6 +3880,10 @@ struct Consensus {
     /// of a SET (spec §5.3) — `check_set_completeness` reads it beside every
     /// declared row's slot.
     cluster_snapshot_pos: Arc<AtomicU64>,
+    /// Catalog ruling R28: the `uc2-cluster` agent's published hash of the
+    /// artifact at `cluster_snapshot_pos` — what the report edge sends as
+    /// row 255, read instead of the file.
+    cluster_artifact_hash: Arc<crate::cluster_agent::ClusterArtifactHash>,
 
     // ---- Coordinated snapshot instants (spec §5.3-§5.5) -------------------
     /// The frame-END P of the newest `SNAPSHOT` frame THIS node appended as
@@ -6640,16 +6672,13 @@ impl Consensus {
         // function the service builder applies to a row's payload. The
         // cluster artifact carries no `ULTSNAP2` envelope (it is the bare
         // image `ClusterFsm::freeze` encodes, self-describing by its own
-        // magic), so its payload IS the whole file. Read off disk once, on
-        // this edge only (once per instant), never per pass. A missing or
-        // unreadable file is skipped: the set is not complete here as far as
-        // the cluster row can vouch, and the next instant reports again.
-        let cluster_hash = std::fs::read(
-            self.cluster_snapshot_dir
-                .join(format!("{SNAP_PREFIX}{p}{CLUSTER_SNAP_SUFFIX}")),
-        )
-        .ok()
-        .map(|img| uc_service::snapshots::artifact_hash_of(&img));
+        // magic), so its payload IS the whole file. Catalog ruling R28: the
+        // `uc2-cluster` agent hashed it as it wrote it and published the
+        // word beside its position, so this edge does no filesystem read. A
+        // word for another position (a newer artifact already landed, or
+        // none was ever hashed) skips the row: the set is not vouched for
+        // here by the cluster row, and the next instant reports again.
+        let cluster_hash = self.cluster_artifact_hash.hash_at(p);
         let row_reports = rows[..n].iter().filter_map(|&row| {
             // `snapshot_pos` FIRST (Acquire), then the hash — the reverse of
             // the builder's store order, which is what makes the pair
@@ -7018,7 +7047,7 @@ impl Consensus {
     /// `holdings_next_copy_ns`, so every other pass pays one compare; out of
     /// line so the pass body does not grow (M14a). Atomic loads, then one
     /// short lock for the copy — no filesystem call: the byte fields are the
-    /// archive agent's ([`HoldingsProbe`], ruling R14).
+    /// `uc2-holdings` thread's ([`HoldingsProbe`], catalog ruling R27).
     #[inline(never)]
     fn refresh_holdings(&mut self) {
         let now = self.pass_now_ns;
@@ -11239,10 +11268,11 @@ fn create_rings(
 
 // --------------------------------------------------------- M7 config helpers
 
-/// Catalog spec §5.2 (D6), rulings R14/R17: the archive-agent half of the
-/// `Holdings` cache — free bytes, journal bytes, snapshot bytes — refreshed
-/// at most once per [`HOLDINGS_PROBE_NS`] on the ARCHIVE agent's duty cycle
-/// (the agent that already owns disk I/O), never on the consensus pass. One
+/// Catalog spec §5.2 (D6), catalog rulings R27/R17: the filesystem half of
+/// the `Holdings` cache — free bytes, journal bytes, snapshot bytes —
+/// refreshed at most once per [`HOLDINGS_PROBE_NS`] on its own `uc2-holdings`
+/// thread, never on the consensus pass and never on the archive agent (whose
+/// `durable` gates commit through the report ceiling). One
 /// `statvfs`, one walk of `snapshots/` (bounded by retained sets × rows),
 /// and an O(1) journal estimate ([`journal_bytes_estimate`]) — no journal
 /// walk. Computes with no lock held, then takes the cache's lock for three
@@ -12903,6 +12933,7 @@ mod tests {
             crypto_last_log_ns: 0,
             cluster_view,
             cluster_snapshot_pos: Arc::clone(&cluster_snapshot_pos),
+            cluster_artifact_hash: cluster.artifact_hash_cell(),
             snapshot_last_commanded: 0,
             snapshot_last_commanded_standby: false,
             snapshot_last_commanded_bytes: 0,
@@ -13421,24 +13452,49 @@ mod tests {
     /// artifact's hash as row 255 beside its rows, hashed with the SAME
     /// function the service builder uses for a row (over the payload; the
     /// cluster artifact has no envelope, so that is the whole file).
+    ///
+    /// Catalog ruling R28: the hash is the word the `uc2-cluster` agent
+    /// published when it WROTE the artifact (`freeze_and_write`), not a
+    /// re-read of the file on the consensus pass — so the artifact here is
+    /// written by the real agent, and the reported hash must equal both the
+    /// published word and the hash of the file on disk.
     #[test]
     fn the_completeness_report_includes_the_cluster_artifact_as_row_255() {
         use uc_protocol::v2::upgrade::CLUSTER_ROW;
         let mut h = harness_with_rows(&["a"]);
         drive_to_serving_leader(&mut h);
         let p = 6048u64;
+        let membership = h.cons.cluster_view.membership();
+        install_cluster_artifact_for_test(&mut h, p, &membership);
+        assert_eq!(h.cluster.take_snapshot().unwrap(), p);
         write_row_artifact(&h, 0, p, b"row-zero");
-        let cluster_payload = write_cluster_artifact(&h, p, b"cluster");
         h.row_published_at(0, p, uc_service::snapshots::artifact_hash_of(b"row-zero"));
-        h.cluster_snapshot_pos.store(p, Ordering::Release);
+        assert_eq!(h.cluster_snapshot_pos.load(Ordering::Acquire), p);
         h.cons.check_set_completeness();
         let mut rows: Vec<u8> = h.cons.pending_snapshot_reports.keys().copied().collect();
         rows.sort_unstable();
         assert_eq!(rows, vec![0, CLUSTER_ROW]);
+        let reported = h.cons.pending_snapshot_reports[&CLUSTER_ROW].hashes[&h.cons.id];
+        let file = std::fs::read(
+            h.cons
+                .cluster_snapshot_dir
+                .join(format!("snap-{p}.ultcluster")),
+        )
+        .unwrap();
         assert_eq!(
-            h.cons.pending_snapshot_reports[&CLUSTER_ROW].hashes[&h.cons.id],
-            uc_service::snapshots::artifact_hash_of(&cluster_payload),
-            "row 255's hash is the SAME function over the cluster artifact's payload"
+            Some(reported),
+            h.cons.cluster_artifact_hash.hash_at(p),
+            "row 255's hash is the word the cluster agent published"
+        );
+        assert_eq!(
+            reported,
+            uc_service::snapshots::artifact_hash_of(&file),
+            "…and that word is the SAME function over the artifact on disk"
+        );
+        assert_eq!(
+            h.cons.cluster_artifact_hash.hash_at(p + 1),
+            None,
+            "a word for another position is never paired with this one"
         );
     }
 
@@ -13570,11 +13626,11 @@ mod tests {
         );
     }
 
-    /// Catalog spec §5.2 (D6), ruling R14: the filesystem half of
+    /// Catalog spec §5.2 (D6), catalog ruling R27: the filesystem half of
     /// `Holdings` (free bytes, journal bytes, snapshot bytes) is probed by
-    /// the ARCHIVE agent's [`HoldingsProbe`], at most once per second of that
-    /// agent's clock however many duty cycles run in between, and lands in
-    /// the shared cache.
+    /// [`HoldingsProbe`] — driven by the `uc2-holdings` thread, which is just
+    /// a caller — at most once per second of the caller's clock however many
+    /// wakes run in between, and lands in the shared cache.
     #[test]
     fn holdings_probe_runs_at_most_once_per_second() {
         let h = harness_with_rows(&["a"]);
@@ -13634,7 +13690,7 @@ mod tests {
         assert_eq!(
             (c.free_bytes, c.journal_bytes, c.snapshots_bytes),
             (0, 0, 0),
-            "the byte fields are the archive agent's, never the pass's"
+            "the byte fields are the uc2-holdings thread's, never the pass's"
         );
         assert_eq!(c.applied[0], 4096, "…but the counters are copied");
         assert_eq!(c.durable, h.cons.cnc.counters().durable.load_acquire());
