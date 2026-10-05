@@ -500,7 +500,17 @@ from disk is `the_probe_seeds_the_report_cache_from_a_set_held_on_disk`
 (which pins the row payload's hash to the slot's `artifact_hash` and row 255's
 to the cluster agent's published word) and
 `a_seed_arriving_after_the_leadership_edge_is_offered_to_that_leader`; ruling
-R39's door is `a_report_above_the_leaders_log_extent_is_dropped`.
+R39's door is `a_report_above_the_leaders_log_extent_is_dropped`. Ruling R42
+(a node reports only sets it built) is
+`a_fetched_set_is_never_seeded_or_re_offered_but_a_built_one_is`,
+`a_session_installed_set_is_recorded_as_foreign`,
+`a_foreign_marker_excludes_a_set_after_a_restart`,
+`pruning_a_set_removes_its_foreign_marker`, the receiver's
+`a_session_does_not_complete_until_its_cluster_artifact_lands_and_routes_it_first`
+(the marker lands before the cluster artifact) and backup's
+`the_snapshot_copy_carries_a_sets_foreign_marker`; the seeder's per-probe
+budget and retry are `a_backlog_of_held_sets_drains_over_successive_probes`
+and `a_partially_hashed_set_is_retried_on_the_next_probe`.
 
 The **readiness gate** — B2's deferred boot window — is pinned clause by
 clause, because each clause alone is vacuous:

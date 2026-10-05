@@ -653,7 +653,10 @@ is three seams:
    it learns a new leader — and since the clock is the log's, the new leader
    does not start it over. A restarted node knows those sets' hashes too:
    its `uc2-holdings` thread re-hashes the artifacts it holds on disk, off
-   the consensus pass. A report above the leader's own log extent is
+   the consensus pass — only sets it BUILT: a set that arrived whole by a
+   snapshot session (fetched or installed) carries a `snap-<P>.foreign`
+   marker and is never reported as this node's observation, since a copy
+   is not an independent builder. A report above the leader's own log extent is
    dropped at the door (an honest one is committed, so the leader has it).
 
    *Why per instant* (snapshot catalog spec, erratum R37). The first version

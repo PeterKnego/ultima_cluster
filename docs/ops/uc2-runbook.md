@@ -431,7 +431,15 @@ transport setting, both measured closed-loop at inflight 1 on 8-vCPU
   own artifact holding membership, the schedule table and the settings record
   as of `<pos>`; `uc2ctl backup` **does** copy it, as an artifact family of
   its own, and `verify-backup` decodes the newest one through the same image
-  decoder a joiner installs it with) and two transient staged
+  decoder a joiner installs it with — and the zero-byte `snap-<pos>.foreign`
+  marker beside a set this node received whole instead of building, which
+  backup and restore carry with it). **Operator rule:** the marker is how a
+  node knows a set is a copy and must not be reported as its own
+  observation. If you copy a set's artifacts into `snapshots/` by hand,
+  create `snapshots/cluster/snap-<pos>.foreign` beside its `.ultcluster`
+  (before copying that file in), or that node becomes a spurious attester —
+  its reports for the set agree with the source by construction and count
+  as an independent builder in the catalog's verdict. And two transient staged
   payloads in the instance root, `schedules.pending` and `settings.pending`,
   each written by its `uc2ctl … apply` and deleted by the node after a
   successful append. There is no `state/schedules.state`. *Was §1.*
