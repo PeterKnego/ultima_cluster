@@ -514,17 +514,51 @@ fn await_agreed(c: &Cluster, idxs: &[usize], p: u64) {
     let deadline = deadline_secs(60);
     while !idxs.iter().all(|&i| agreed_position(c.node(i)) == p) {
         if Instant::now() >= deadline {
-            let dump: Vec<String> = idxs
-                .iter()
-                .map(|&i| format!("node {i}: {:?}", catalog(c.node(i))))
-                .collect();
             panic!(
-                "every node agreed the set at {p} — catalogs:\n{}",
-                dump.join("\n")
+                "every node agreed the set at {p} — per node:\n{}",
+                dump_row0(c, idxs, p)
             );
         }
         std::thread::yield_now();
     }
+}
+
+/// Failure-path diagnostic (ruling R32): per node, the catalog's row-0
+/// verdict at `p`, the committed row-0 report, and the row-0 artifact — its
+/// length, first 32 bytes, and `SumSm`'s `total ‖ last` decoded past the
+/// 24-byte envelope — so a divergence says whether the FILES differ or only
+/// the reported hash does.
+fn dump_row0(c: &Cluster, idxs: &[usize], p: u64) -> String {
+    const ENVELOPE: usize = 24;
+    let u64_at = |b: &[u8], o: usize| {
+        b.get(o..o + 8)
+            .map(|x| u64::from_le_bytes(x.try_into().unwrap()))
+    };
+    idxs.iter()
+        .map(|&i| {
+            let n = c.node(i);
+            let row = entry(n, p).map(|e| (e.state, e.rows[0].verdict, e.rows[0].hash));
+            let art = match std::fs::read(row_artifact(c.dir(i), 0, p)) {
+                Ok(b) => format!(
+                    "len={} head={} total={:?} last={:?}",
+                    b.len(),
+                    b.iter()
+                        .take(32)
+                        .map(|x| format!("{x:02x}"))
+                        .collect::<String>(),
+                    u64_at(&b, ENVELOPE),
+                    u64_at(&b, ENVELOPE + 8)
+                ),
+                Err(e) => format!("<{e}>"),
+            };
+            format!(
+                "node {i}: catalog row0 (state, verdict, hash)={row:?}\n  \
+                 report(0)={:?}\n  artifact {art}",
+                n.snapshot_report(0).map(|r| r.hashes)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// The leader's query over its own committed catalog and soft table, as
