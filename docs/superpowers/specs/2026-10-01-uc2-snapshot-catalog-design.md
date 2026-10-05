@@ -914,3 +914,19 @@ accepts one reporter, the purging node must additionally hold the set, and
 the absent voter has nothing a third report could have compared. A grace
 period on a fresh leader was analysed and declined: it would have changed
 none of the thin records.
+
+**Settled (ruling R42, 2026-10-05, Task 16 fix round 2).** A report is the
+BUILDER's observation (plan B3), and the disk-seeded cache of R40 must not
+turn a copied artifact into one: a set this node did not build — one that
+arrived through a snapshot session, whether a store-only `uc2ctl snapshot
+fetch`, a below-floor install, or a mid-life install — is never seeded and
+never re-offered. In the same incarnation the receiver's completion edge
+records the position as foreign (and evicts any report cached for it);
+across restarts the receiver writes a zero-byte marker
+`snapshots/cluster/snap-<P>.foreign` in its single rename path, before the
+set's cluster artifact becomes visible, so a complete set is never unmarked;
+the pruner removes the marker with the artifact, and backup, verify-backup,
+restore and the `uc2ctl snapshot` listing carry it. The residual is an
+operator who copies a set's artifacts in by hand without the marker: that
+node then attests a set it did not build, and no code can tell — the
+runbook's snapshots section names the rule.
