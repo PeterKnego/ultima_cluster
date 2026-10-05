@@ -923,8 +923,12 @@ fetch`, a below-floor install, or a mid-life install — is never seeded and
 never re-offered. In the same incarnation the receiver's completion edge
 records the position as foreign (and evicts any report cached for it);
 across restarts the receiver writes a zero-byte marker
-`snapshots/cluster/snap-<P>.foreign` in its single rename path, before the
-set's cluster artifact becomes visible, so a complete set is never unmarked;
+`snapshots/cluster/snap-<P>.foreign` in its single rename path, before ANY of
+the session's artifacts becomes visible (re-review m-A: a session that dies
+after one row lands must not leave an unmarked row copy that a later local
+freeze of the cluster artifact at the same P could complete), so a complete
+set is never unmarked; a marker whose fsync fails is removed so a retry
+cannot trust it;
 the pruner removes the marker with the artifact, and backup, verify-backup,
 restore and the `uc2ctl snapshot` listing carry it. The residual is an
 operator who copies a set's artifacts in by hand without the marker: that

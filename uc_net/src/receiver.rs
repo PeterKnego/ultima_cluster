@@ -1251,8 +1251,17 @@ fn write_foreign_marker(final_path: &Path, pos: u64) -> std::io::Result<()> {
         std::fs::create_dir_all(&dir)?;
         std::fs::File::open(root)?.sync_all()?;
     }
-    std::fs::File::create(&marker)?.sync_all()?;
-    std::fs::File::open(&dir)?.sync_all()
+    // Re-review n1: a marker whose fsync failed must not stay on disk — the
+    // retry's `exists()` short-cut above would then trust a file that may not
+    // survive a crash. Undo the create on any error after it.
+    let made_durable = (|| -> std::io::Result<()> {
+        std::fs::File::create(&marker)?.sync_all()?;
+        std::fs::File::open(&dir)?.sync_all()
+    })();
+    if made_durable.is_err() {
+        let _ = std::fs::remove_file(&marker);
+    }
+    made_durable
 }
 
 /// M14c: open the `.part` for one announced artifact under `<root>/<id>/`. Free
