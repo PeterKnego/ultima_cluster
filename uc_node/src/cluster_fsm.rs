@@ -9,8 +9,8 @@
 //! anything node-local is clamped at use by the reader of [`ClusterView`].
 
 use std::io::{Read, Write};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
 
 use uc_consensus::config::{ClusterConfig, ProposeError};
 use uc_protocol::v2::catalog::{
@@ -1076,21 +1076,17 @@ impl SnapshotStateMachine for ClusterFsm {
 
 /// The position-tagged view the consensus agent reads (spec §4.5). Scalars
 /// are atomics so the per-pass reads are one load each; the structured parts
-/// are an immutable [`ClusterViewInner`] behind an `Arc`, and the mutex
-/// guards only that POINTER.
+/// sit behind a mutex taken only when `position` changed.
 ///
-/// **Lock discipline** (catalog spec, addendum 2026-10-05): no holder of
-/// `inner`'s lock does more than an `Arc` copy or swap while holding it.
-/// [`Self::publish`] builds the new inner outside the lock and swaps the
-/// pointer under it; every reader ([`Self::snapshot_inner`] and the scalar
-/// helpers) copies the `Arc` under it and reads through the copy after
-/// releasing it. A hold is therefore nanoseconds whatever the inner's size,
-/// so a holder preempted on an oversubscribed box cannot convoy the
-/// `uc2-cluster` agent behind it — the failure that made a restarted row miss
-/// its freeze (the readiness gate waits on the agent's walk) and the instant
-/// be abandoned. The consensus pass, beyond that, takes the lock only on an
-/// edge (the view's position moved, the floor's cache key moved), never in
-/// steady state.
+/// Two readers, two costs. The **consensus pass** touches only the atomics —
+/// one load each, never the mutex, which is the whole point of the split.
+/// The **`/metrics` scrape** is no longer lock-free: since the pin words and
+/// the snapshot-hash mismatch gauge it takes `inner` once per scrape to read
+/// `pins`/`reports`. That is a scrape-time cost on the HTTP thread, off the
+/// hot path entirely; the only writer it can contend with is the
+/// `uc2-cluster` agent, which takes the lock only on an APPLIED `CLUSTER`
+/// frame — rare by construction, since cluster commands are
+/// single-in-flight.
 pub struct ClusterView {
     pub position: AtomicU64,
     /// Plan B3 T5: the agent's WALK cursor — [`ClusterState::applied`] as of
@@ -1158,10 +1154,7 @@ pub struct ClusterView {
     /// is computed against, and the one a leader's query compares. Equal on
     /// every node whose catalog is equal, whatever its walk cursor.
     pub catalog_version: AtomicU64,
-    /// The structured parts, immutable once published: replaced whole by
-    /// [`Self::publish`] (a pointer swap under the lock), never mutated in
-    /// place, so an `Arc` a reader holds keeps reading the view it took.
-    inner: Mutex<Arc<ClusterViewInner>>,
+    inner: Mutex<ClusterViewInner>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1183,22 +1176,6 @@ pub struct ClusterViewInner {
     /// query module and the node's floor reader take it with the rest of
     /// the structured state.
     pub catalog: Vec<SetEntry>,
-}
-
-impl ClusterViewInner {
-    /// The structured parts of `st`, cloned — built by
-    /// [`ClusterView::publish`] outside the view's lock.
-    fn of(st: &ClusterState) -> ClusterViewInner {
-        ClusterViewInner {
-            membership: st.membership.clone(),
-            table: st.table.clone(),
-            table_position: st.table_position,
-            pins: st.pins.clone(),
-            reports: st.reports.clone(),
-            running: st.running,
-            catalog: st.catalog.clone(),
-        }
-    }
 }
 
 /// Catalog ruling R16: FNV-1a-64 over the set list's wire encoding
@@ -1242,74 +1219,34 @@ impl ClusterView {
             catalog_stalled: AtomicU64::new(0),
             catalog_diverged: AtomicU64::new(0),
             catalog_version: AtomicU64::new(0),
-            inner: Mutex::new(Arc::new(ClusterViewInner::of(genesis))),
+            inner: Mutex::new(ClusterViewInner {
+                membership: genesis.membership.clone(),
+                table: genesis.table.clone(),
+                table_position: genesis.table_position,
+                pins: genesis.pins.clone(),
+                reports: genesis.reports.clone(),
+                running: genesis.running,
+                catalog: genesis.catalog.clone(),
+            }),
         };
-        // Unconditional: the atomics above are zeros, not the genesis
-        // state's, so the change test in `publish` must not get a say here.
-        v.store_published(genesis);
+        v.publish(genesis);
         v
     }
 
-    /// Publish `st` — only if what the view publishes CHANGED (catalog spec,
-    /// addendum 2026-10-05, item 4). Returns whether it did.
-    ///
-    /// "Changed" is the structured parts ([`ClusterViewInner`], compared
-    /// against the current `Arc` field by field, before anything is built)
-    /// plus the settings scalars the atomics carry; every other atomic is
-    /// derived from those two. Equal means the swap, the derived gauges (the
-    /// catalog hash among them) and every store but one are skipped.
-    ///
-    /// The one store an unchanged publish still makes is `position`, and it
-    /// has to: `position` is also the cluster commands' SINGLE-IN-FLIGHT
-    /// cursor (`last_cluster_append > position` ⇒ retry, on every leader door
-    /// and on the report and genesis appenders) and the `version` an admin
-    /// answer hands `uc2ctl` to wait on. A refused command, or a report the
-    /// FSM folds into a record it already holds, changes nothing published —
-    /// and a `position` left behind it would wedge every later cluster
-    /// command on that leader for good. Moving it is also truthful: the view
-    /// IS the state as of `st.applied`. It is one atomic store, no lock.
-    pub fn publish(&self, st: &ClusterState) -> bool {
-        if self.publishes_same(st) {
-            self.position.store(st.applied, Ordering::Release);
-            return false;
+    /// Structured parts first, then `versioned` (#33), position LAST with
+    /// Release, so a reader that sees the new position (or a `versioned`
+    /// bit) and then locks sees the new inner.
+    pub fn publish(&self, st: &ClusterState) {
+        {
+            let mut g = self.inner.lock().unwrap();
+            g.membership = st.membership.clone();
+            g.table = st.table.clone();
+            g.table_position = st.table_position;
+            g.pins.clone_from(&st.pins);
+            g.reports.clone_from(&st.reports);
+            g.running = st.running;
+            g.catalog.clone_from(&st.catalog);
         }
-        self.store_published(st);
-        true
-    }
-
-    /// Does `st` publish exactly what the view already holds? Reads the
-    /// current inner through an `Arc` copy (the lock held for the copy only)
-    /// and the settings atomics; allocates nothing.
-    fn publishes_same(&self, st: &ClusterState) -> bool {
-        let cur = self.snapshot_inner();
-        cur.table_position == st.table_position
-            && cur.running == st.running
-            && cur.membership == st.membership
-            && cur.table == st.table
-            && cur.pins == st.pins
-            && cur.reports == st.reports
-            && cur.catalog == st.catalog
-            && self.settings_position.load(Ordering::Acquire) == st.settings_position
-            && self.admission_bytes.load(Ordering::Acquire) == st.settings.admission_bytes
-            && self.fsm_lag_bytes.load(Ordering::Acquire) == st.settings.fsm_lag_bytes
-            && self.snapshot_interval_bytes.load(Ordering::Acquire)
-                == st.settings.snapshot_interval_bytes
-            && self.snapshot_target.load(Ordering::Acquire) == st.settings.snapshot_target as u8
-            && self.datagram_mtu.load(Ordering::Acquire) == st.settings.datagram_mtu
-            && self.retain_sets.load(Ordering::Acquire) == st.retain_sets()
-    }
-
-    /// The whole publish. The new inner is built OUTSIDE the lock and only
-    /// the `Arc` is swapped under it; the old one is dropped after the lock
-    /// is released (it may be the last reference, and freeing a catalog is
-    /// not a pointer copy). Then `versioned` (#33), then the scalars, then
-    /// `position` LAST with Release — so a reader that sees the new position
-    /// (or a `versioned` bit) and then takes [`Self::snapshot_inner`] gets
-    /// the new inner or a newer one.
-    fn store_published(&self, st: &ClusterState) {
-        let next = Arc::new(ClusterViewInner::of(st));
-        let old = std::mem::replace(&mut *self.inner.lock().unwrap(), next);
-        drop(old);
         // `CNC_MAX_SERVICES == 8` rows, so the mask fits a byte.
         self.versioned
             .store(st.declared_mask() as u8, Ordering::Release);
@@ -1378,28 +1315,25 @@ impl ClusterView {
     /// genesis) — a scalar read, like [`Self::report_position_for`], rather
     /// than a whole [`Self::to_state`] clone.
     pub fn running_for(&self, row: u8) -> Option<RowRunning> {
-        self.snapshot_inner()
+        self.inner
+            .lock()
+            .unwrap()
             .running
             .get(row as usize)
             .copied()
             .flatten()
     }
 
-    /// The published structured parts, as the `Arc` the view holds — the lock
-    /// is held for the pointer copy only (no allocation, no clone of the
-    /// contents); read through it after. A later [`Self::publish`] swaps in a
-    /// new `Arc` and leaves this one, and so this caller's view, untouched.
-    pub fn snapshot_inner(&self) -> Arc<ClusterViewInner> {
-        Arc::clone(&self.inner.lock().unwrap())
+    pub fn snapshot_inner(&self) -> ClusterViewInner {
+        self.inner.lock().unwrap().clone()
     }
 
     /// The committed `SnapshotReport` position for one row — `None` when the
     /// cluster FSM holds no record for it yet.
     ///
-    /// A scalar read through the published `Arc` (the lock held for the
-    /// pointer copy only), rather than [`Self::to_state`]: the leader's
-    /// collector asks this question once per received report and once per
-    /// ready row at append, and `to_state`
+    /// A scalar read under the same lock, rather than
+    /// [`Self::to_state`]: the leader's collector asks this question once per
+    /// received report and once per ready row at append, and `to_state`
     /// clones the membership, the schedule table, the pin history and the
     /// report list to answer it (final review, minor 7). Nothing about the
     /// answer needs the rest of the state, and the allocation it avoided
@@ -1412,7 +1346,7 @@ impl ClusterView {
     /// gives, which keeps the leader's `position <= held` staleness guard
     /// meaningful for row 255 rather than vacuous.
     pub fn report_position_for(&self, row: u8) -> Option<u64> {
-        let g = self.snapshot_inner();
+        let g = self.inner.lock().unwrap();
         if row == CLUSTER_ROW {
             return g
                 .catalog
@@ -1424,8 +1358,7 @@ impl ClusterView {
         g.reports.iter().find(|r| r.row == row).map(|r| r.position)
     }
 
-    /// The view as a [`ClusterState`] — the inner's fields cloned out of the
-    /// published `Arc` (after the lock is released) plus the settings scalar
+    /// The view as a [`ClusterState`] — the inner clone plus the settings scalar
     /// atomics, with `applied` taken from `position`.
     ///
     /// This is what the leader's PRE-APPEND check runs `ClusterFsm::validate`
@@ -1440,41 +1373,35 @@ impl ClusterView {
     pub fn to_state(&self) -> ClusterState {
         let inner = self.snapshot_inner();
         ClusterState {
-            membership: inner.membership.clone(),
-            table: inner.table.clone(),
+            membership: inner.membership,
+            table: inner.table,
             table_position: inner.table_position,
-            settings: self.settings(),
+            settings: Settings {
+                fsm_lag_bytes: self.fsm_lag_bytes.load(Ordering::Acquire),
+                admission_bytes: self.admission_bytes.load(Ordering::Acquire),
+                snapshot_interval_bytes: self.snapshot_interval_bytes.load(Ordering::Acquire),
+                snapshot_target: match self.snapshot_target.load(Ordering::Acquire) {
+                    1 => uc_protocol::v2::settings::Target::Learners,
+                    _ => uc_protocol::v2::settings::Target::All,
+                },
+                datagram_mtu: self.datagram_mtu.load(Ordering::Acquire),
+                // The NORMALISED value (`ClusterState::retain_sets`), so a
+                // state that installed a v1–v3 image's unset `0` reads back
+                // as `1` here — the one field `to_state` does not return
+                // verbatim, and deliberately: a record rebuilt from this view
+                // and re-proposed must pass the door's `1..=64` bound.
+                retain_sets: self.retain_sets.load(Ordering::Acquire),
+            },
             settings_position: self.settings_position.load(Ordering::Acquire),
             applied: self.position.load(Ordering::Acquire),
-            pins: inner.pins.clone(),
-            reports: inner.reports.clone(),
+            pins: inner.pins,
+            reports: inner.reports,
             running: inner.running,
-            catalog: inner.catalog.clone(),
-        }
-    }
-
-    /// The committed settings record, rebuilt from the scalar atomics alone —
-    /// no lock, nothing cloned (the jumbo raise re-proposes it).
-    pub fn settings(&self) -> Settings {
-        Settings {
-            fsm_lag_bytes: self.fsm_lag_bytes.load(Ordering::Acquire),
-            admission_bytes: self.admission_bytes.load(Ordering::Acquire),
-            snapshot_interval_bytes: self.snapshot_interval_bytes.load(Ordering::Acquire),
-            snapshot_target: match self.snapshot_target.load(Ordering::Acquire) {
-                1 => uc_protocol::v2::settings::Target::Learners,
-                _ => uc_protocol::v2::settings::Target::All,
-            },
-            datagram_mtu: self.datagram_mtu.load(Ordering::Acquire),
-            // The NORMALISED value (`ClusterState::retain_sets`), so a
-            // state that installed a v1–v3 image's unset `0` reads back
-            // as `1` here — the one field `to_state` does not return
-            // verbatim, and deliberately: a record rebuilt from this view
-            // and re-proposed must pass the door's `1..=64` bound.
-            retain_sets: self.retain_sets.load(Ordering::Acquire),
+            catalog: inner.catalog,
         }
     }
     pub fn membership(&self) -> ClusterConfig {
-        self.snapshot_inner().membership.clone()
+        self.inner.lock().unwrap().membership.clone()
     }
 }
 
@@ -3194,74 +3121,5 @@ mod tests {
             vec![500, 1000],
             "700 dropped, pinned 500 kept"
         );
-    }
-
-    /// Catalog spec addendum (2026-10-05), item 1: `publish` swaps the
-    /// published `Arc` and never mutates the inner in place — a reader still
-    /// holding the old `Arc` keeps reading the old view; a fresh
-    /// `snapshot_inner` reads the new one.
-    #[test]
-    fn publish_swaps_the_inner_arc_and_an_old_reader_keeps_its_view() {
-        let st = genesis();
-        let v = ClusterView::new(&st);
-        let old = v.snapshot_inner();
-        assert_eq!(old.membership, st.membership);
-        let mut next = st.clone();
-        next.membership = ClusterConfig::genesis(vec![(0, addr(0)), (1, addr(1))], vec![]);
-        next.applied = 640;
-        assert!(v.publish(&next), "a changed state publishes");
-        let new = v.snapshot_inner();
-        assert!(!std::sync::Arc::ptr_eq(&old, &new), "a new Arc, swapped in");
-        assert_eq!(
-            old.membership, st.membership,
-            "the old reader's view is untouched"
-        );
-        assert_eq!(new.membership, next.membership);
-        assert_eq!(v.position.load(Ordering::Acquire), 640);
-        assert!(
-            std::sync::Arc::ptr_eq(&new, &v.snapshot_inner()),
-            "a read is a pointer copy, not a clone of the contents"
-        );
-    }
-
-    /// Item 4: a state equal to the published one swaps nothing and stores
-    /// nothing — `position` included, when `applied` is the same — and when
-    /// only `applied` moved (a refused command), it moves `position` alone:
-    /// that word is the single-in-flight cursor, which must not be left
-    /// behind a command that changed nothing.
-    #[test]
-    fn an_unchanged_state_does_not_republish() {
-        let mut st = genesis();
-        st.applied = 320;
-        let v = ClusterView::new(&st);
-        let before = v.snapshot_inner();
-        let cv = v.catalog_version.load(Ordering::Acquire);
-        assert!(!v.publish(&st), "equal state: nothing published");
-        assert!(std::sync::Arc::ptr_eq(&before, &v.snapshot_inner()));
-        assert_eq!(
-            v.position.load(Ordering::Acquire),
-            320,
-            "position not bumped"
-        );
-        assert_eq!(v.catalog_version.load(Ordering::Acquire), cv);
-
-        st.applied = 640;
-        assert!(!v.publish(&st), "only the cursor moved: still no swap");
-        assert!(std::sync::Arc::ptr_eq(&before, &v.snapshot_inner()));
-        assert_eq!(
-            v.position.load(Ordering::Acquire),
-            640,
-            "the single-in-flight cursor follows `applied`"
-        );
-
-        // A settings-only change is a change: the scalars are published state.
-        st.settings.admission_bytes += 1;
-        st.settings_position = 640;
-        assert!(v.publish(&st));
-        assert_eq!(
-            v.admission_bytes.load(Ordering::Acquire),
-            st.settings.admission_bytes
-        );
-        assert_eq!(v.to_state(), st);
     }
 }

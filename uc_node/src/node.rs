@@ -2475,8 +2475,6 @@ impl Node {
             stored_set_pos: Arc::clone(&stored_set_pos),
             stored_above_durable: 0,
             snapshot_floor_hold: 0,
-            floor_candidate_cache: None,
-            floor_candidate_evals: 0,
             snapshot_standby_learner,
             snapshot_standby_position,
             snapshot_cmd_rx,
@@ -2607,8 +2605,7 @@ impl Node {
     /// nanoseconds, so a query compares it against its own wall clock with
     /// [`Self::soft_stale_ns`]. Empty on a node that has not led.
     pub fn soft_table(&self) -> crate::catalog::SoftTable {
-        let view = self.cluster_view.snapshot_inner();
-        let membership = &view.membership;
+        let membership = self.cluster_view.snapshot_inner().membership;
         let wire = self
             .soft_wire
             .lock()
@@ -2964,9 +2961,8 @@ impl Node {
         self.cluster_view()
             .snapshot_inner()
             .reports
-            .iter()
+            .into_iter()
             .find(|r| r.row == row)
-            .cloned()
     }
 
     /// Partition handles for every one of the node's outbound sockets (receiver,
@@ -3980,17 +3976,6 @@ struct Consensus {
     /// `stored_above_durable`: an upgrade that takes a while to swap its
     /// binary would otherwise name the hold on every floor tick.
     snapshot_floor_hold: u64,
-    /// Catalog spec addendum (2026-10-05), item 2: the floor path's last
-    /// candidate computation, keyed on `(own, catalog_version,
-    /// persisted_floor)` — the three inputs [`Self::effective_floor_in`]
-    /// reads besides `holdings_held`, whose every change clears this
-    /// ([`Self::publish_sets_held`]). While the key holds, a stuck floor's
-    /// throttle tick reuses the answer: one compare, no view read.
-    floor_candidate_cache: Option<((u64, u64, u64), u64)>,
-    /// How many times the floor path actually computed a candidate (a
-    /// cache miss) — the witness the floor-cache tests count, as
-    /// `holdings_fs_ops` is the D6 one.
-    floor_candidate_evals: u64,
     /// Spec §5.7 item 6: the learner the last standby instant this node
     /// commanded addressed, and that instant's position — the redirect hint
     /// the sender agent consults when it cannot serve a below-floor NAK.
@@ -5494,43 +5479,19 @@ impl Consensus {
         // tick away rather than one pass away.
         let mut held = false;
         if may_move {
-            // Catalog spec addendum (2026-10-05), item 2: the candidate is a
-            // function of `own`, the catalog (`catalog_version` is its
-            // content hash), the persisted floor and `holdings_held` (whose
-            // changes clear the cache) — so while the key holds, the answer
-            // is the last one, and a floor stuck below `own` costs this tick
-            // one compare and no view read at all.
-            let cv = self.cluster_view.catalog_version.load(Ordering::Acquire);
-            let key = (own, cv, self.snapshot_persisted_floor);
-            let candidate = match self.floor_candidate_cache {
-                Some((k, c)) if k == key => c,
-                _ => {
-                    self.floor_candidate_evals += 1;
-                    // The `Arc` the view holds, not a clone of it. A view
-                    // newer than `cv` (published between the two loads) is
-                    // harmless: its own hash then moves the key and the next
-                    // tick recomputes.
-                    let inner = self.cluster_view.snapshot_inner();
-                    let c = self.effective_floor_in(own, &inner.catalog);
-                    self.floor_candidate_cache = Some((key, c));
-                    c
-                }
+            // ONE clone of the committed view for this whole evaluation — the
+            // catalog read, the pin hold and the retention keep-set all read
+            // it — and only here, inside the throttle.
+            let inner = self.cluster_view.snapshot_inner();
+            let candidate = self.effective_floor_in(own, &inner.catalog);
+            // Plan B2 T5 (fix round): the candidate floor is HELD at any
+            // pinned origin this node has not consumed yet.
+            let service_pos = if candidate > self.snapshot_persisted_floor {
+                self.hold_floor_for_pins(&inner, candidate)
+            } else {
+                candidate
             };
-            // Past here only when the candidate CAN move the floor — once
-            // per complete set, or per tick while a pin holds it — so the
-            // pin hold and the retention keep-set read the view through one
-            // `Arc` taken here. The pin hold is NOT cached: it reads the
-            // rows' cnc slots, which move without any of the key's inputs.
-            let mut service_pos = candidate;
-            let mut inner = None;
-            if candidate > self.snapshot_persisted_floor {
-                let view = self.cluster_view.snapshot_inner();
-                // Plan B2 T5 (fix round): the candidate floor is HELD at any
-                // pinned origin this node has not consumed yet.
-                service_pos = self.hold_floor_for_pins(&view, candidate);
-                inner = Some(view);
-            }
-            if let Some(inner) = inner.filter(|_| service_pos > self.snapshot_persisted_floor) {
+            if service_pos > self.snapshot_persisted_floor {
                 self.state
                     .store_snapshot_floor(service_pos)
                     .expect("snapshot floor persist fail-stop (journal I/O)");
@@ -7168,9 +7129,6 @@ impl Consensus {
             .enumerate()
             .filter(|(_, p)| self.holdings_held.contains(p))
             .fold(0u64, |acc, (i, _)| acc | 1 << i);
-        // Every change to `holdings_held` lands here, and the floor's
-        // candidate reads it: drop the cached one.
-        self.floor_candidate_cache = None;
         let mut h = self.holdings.lock().unwrap_or_else(|e| e.into_inner());
         h.sets_held = bits;
         if let Some(cv) = catalog_version {
@@ -7287,10 +7245,7 @@ impl Consensus {
             return false; // single-in-flight: a CLUSTER command is above commit
         }
         let committed = self.cluster_view.datagram_mtu.load(Ordering::Acquire);
-        // The published `Arc`, borrowed — no membership clone on this
-        // (leader, 100 ms) consensus-pass tick.
-        let view = self.cluster_view.snapshot_inner();
-        let membership = &view.membership;
+        let membership = self.cluster_view.membership();
         let members: Vec<SocketAddr> = membership
             .voters
             .iter()
@@ -7304,7 +7259,7 @@ impl Consensus {
         if min <= committed.max(MTU_DEFAULT as u32) {
             return false; // nothing to raise (a lower min is a degraded path — plan 2 reports it)
         }
-        let mut settings = self.cluster_view.settings();
+        let mut settings = self.cluster_view.to_state().settings;
         settings.datagram_mtu = min;
         let cmd = ClusterCommand::Settings(settings);
         if self.validate_cluster_command(&cmd).is_err() {
@@ -9877,13 +9832,7 @@ impl Consensus {
     /// WRITE an answer above durable, and the completeness poll refuses to
     /// adopt one — the two together close that case.)
     fn start_fetch(&mut self, learner_id: NodeId, position: u64) -> Result<(), FetchRefusal> {
-        if learner_id == self.id
-            || !self
-                .cluster_view
-                .snapshot_inner()
-                .membership
-                .is_learner(learner_id)
-        {
+        if learner_id == self.id || !self.cluster_view.membership().is_learner(learner_id) {
             return Err(FetchRefusal::NotALearner);
         }
         // Honour `PendingFetch`: one fetch at a time. A second request is
@@ -13004,8 +12953,6 @@ mod tests {
             stored_set_pos,
             stored_above_durable: 0,
             snapshot_floor_hold: 0,
-            floor_candidate_cache: None,
-            floor_candidate_evals: 0,
             snapshot_standby_learner: Arc::new(AtomicU32::new(0)),
             snapshot_standby_position: Arc::new(AtomicU64::new(0)),
             snapshot_cmd_rx,
@@ -13650,73 +13597,6 @@ mod tests {
             matches!(h._trunc_rx.try_recv(), Ok(ArchiveCmd::Purge { below }) if below == agreed),
             "the purge target is the agreed set held, not own"
         );
-    }
-
-    /// Catalog spec addendum (2026-10-05), item 2: a floor stuck below `own`
-    /// computes its candidate ONCE per `(own, catalog_version,
-    /// persisted_floor)` — later throttle ticks reuse it without reading the
-    /// view — and recomputes when the catalog's hash moves, or when
-    /// `holdings_held` does (the cache is cleared there).
-    #[test]
-    fn a_stuck_floor_computes_its_candidate_once_per_key() {
-        use uc_protocol::v2::upgrade::RowRunning;
-        let mut h = harness_with_rows(&["a"]);
-        let (agreed, own) = (4096u64, 6016u64);
-        assert!(own <= h.cons.cnc.counters().durable.load_acquire());
-        let mut st = h.cons.cluster_view.to_state();
-        st.catalog = vec![agreed_entry(agreed)];
-        st.running[0] = Some(RowRunning {
-            row: 0,
-            version: 1,
-            record_pos: 1,
-        });
-        h.cons.cluster_view.publish(&st);
-        h.cons.snapshot_set_position.store(own, Ordering::Release);
-
-        let base = h.cons.floor_candidate_evals;
-        h.advance_floor_timer();
-        assert!(!h.cons.maybe_persist_snapshot_floor(), "held: not work");
-        assert_eq!(
-            h.cons.floor_candidate_evals,
-            base + 1,
-            "first tick computes"
-        );
-        for _ in 0..3 {
-            h.advance_floor_timer();
-            assert!(!h.cons.maybe_persist_snapshot_floor());
-        }
-        assert_eq!(
-            h.cons.floor_candidate_evals,
-            base + 1,
-            "an unchanged key reuses the candidate: no view read, no walk"
-        );
-        assert_eq!(h.cons.snapshot_persisted_floor, 0);
-
-        // The catalog moves (its content hash with it): recompute once.
-        let cv = h.cons.cluster_view.catalog_version.load(Ordering::Acquire);
-        st.catalog.push(agreed_entry(5000));
-        h.cons.cluster_view.publish(&st);
-        assert_ne!(
-            h.cons.cluster_view.catalog_version.load(Ordering::Acquire),
-            cv
-        );
-        h.advance_floor_timer();
-        assert!(!h.cons.maybe_persist_snapshot_floor());
-        h.advance_floor_timer();
-        assert!(!h.cons.maybe_persist_snapshot_floor());
-        assert_eq!(
-            h.cons.floor_candidate_evals,
-            base + 2,
-            "a new catalog_version recomputes, once"
-        );
-
-        // `holdings_held` moves (the completion edge): the cache is dropped
-        // and the recomputed candidate moves the floor.
-        h.cons.note_set_held(5000);
-        h.advance_floor_timer();
-        assert!(h.cons.maybe_persist_snapshot_floor());
-        assert_eq!(h.cons.floor_candidate_evals, base + 3);
-        assert_eq!(h.cons.snapshot_persisted_floor, 5000);
     }
 
     /// `effective_floor_in`'s two remaining branches: `own` LISTED but not

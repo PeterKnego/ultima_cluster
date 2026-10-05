@@ -491,7 +491,7 @@ fn instant_until_complete(c: &Cluster, leader: usize, idxs: &[usize]) -> u64 {
 }
 
 fn catalog(node: &Node) -> Vec<SetEntry> {
-    node.cluster_view().snapshot_inner().catalog.clone()
+    node.cluster_view().snapshot_inner().catalog
 }
 
 fn positions(node: &Node) -> Vec<u64> {
