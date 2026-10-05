@@ -2390,6 +2390,7 @@ impl Node {
             snapshot_reports_appended: Arc::clone(&snapshot_reports_appended),
             snapshot_reports_timed_out: Arc::clone(&snapshot_reports_timed_out),
             pending_snapshot_reports: HashMap::new(),
+            report_leader_seen: None,
             ingress_rx,
             trunc_tx,
             trunc_slot,
@@ -3205,9 +3206,11 @@ struct PendingAdminFwd {
     port: u16,
 }
 
-/// Plan B3 (spec §6.5.2): one row's in-flight collection — the instant every
-/// hash in it is ABOUT, when the first of them arrived (the timeout's origin),
-/// and the hashes themselves keyed by reporting node.
+/// Plan B3 (spec §6.5.2): one in-flight collection for one `(row, instant)` —
+/// the instant every hash in it is ABOUT, when the first of them arrived (THIS
+/// entry's own timeout origin; catalog erratum R37), and the hashes
+/// themselves keyed by reporting node. A row holds a list of these, ascending
+/// by position (see `Consensus::pending_snapshot_reports`).
 ///
 /// A `BTreeMap` rather than a `Vec`: it dedups a node that reports twice (a
 /// re-sent datagram is a duplicate, not a second opinion) and it iterates in
@@ -3567,20 +3570,36 @@ struct Consensus {
     snapshot_reports_sent: Arc<AtomicU64>,
     snapshot_reports_unsent: Arc<AtomicU64>,
     /// Plan B3 (spec §6.5.2), **LEADER-only**: the hashes collected so far
-    /// for each row's NEWEST reported instant, keyed by row. One entry per
-    /// row (at most `CNC_MAX_SERVICES`) holding at most one hash per node that
+    /// for every `(row, instant)` reported and not yet appended (catalog
+    /// erratum R37): keyed by row, each row a list ASCENDING by position, one
+    /// [`PendingSnapshotReport`] per instant with its own clock. A row's list
+    /// is never empty (the key goes with its last entry, so the pass's
+    /// `is_empty` test stays the whole steady-path cost) and holds at most
+    /// [`MAX_CATALOG_SETS`] instants — one more evicts the oldest. A newer
+    /// instant never discards an older one's evidence: a voter one instant
+    /// behind the others would otherwise starve agreement for every instant.
+    /// Each entry holds at most one hash per node that
     /// was a member WHEN IT REPORTED — which is NOT a bound of `MAX_MEMBERS`:
     /// an entry outlives the config it was admitted under, so a remove and an
     /// add inside a pending window can leave nine ids in a map that was only
     /// ever eight wide. The payload is bounded by membership AT APPEND, where
     /// [`Consensus::maybe_append_snapshot_reports`] filters it against the
-    /// current config; the map itself is bounded only by the rows and by the
-    /// leader's own lifetime (the clear below). Filled by
+    /// current config; the map itself is bounded by the rows, by
+    /// `MAX_CATALOG_SETS` instants per row and by the leader's own lifetime
+    /// (the clear below). Filled by
     /// [`Consensus::on_snap_report`], drained by
     /// [`Consensus::maybe_append_snapshot_reports`], and cleared on every
     /// leader exit for `last_cluster_append`'s reason — a set collected under
     /// a term we no longer lead is not ours to place.
-    pending_snapshot_reports: HashMap<u8, PendingSnapshotReport>,
+    pending_snapshot_reports: HashMap<u8, Vec<PendingSnapshotReport>>,
+    /// Catalog erratum R37 item 4: the leader (`(node id, term)`) this node
+    /// last offered its snapshot reports to. A leader exit clears the
+    /// collection, so a node re-offers its NEWEST complete set's reports once
+    /// each time the cnc `leader_hint` names a different leadership —
+    /// [`Consensus::maybe_reoffer_snapshot_reports`] — and
+    /// `send_snapshot_reports` records every leader it reports to here, so a
+    /// set-complete edge is never followed by a duplicate re-offer.
+    report_leader_seen: Option<(u64, u32)>,
     /// Plan B3 (spec §6.5.2): `CLUSTER kind = 5` records this leader placed
     /// (`uc2_snapshot_reports_appended_total`), and how many of those went in
     /// on the TIMEOUT rather than on every voter reporting
@@ -4066,6 +4085,10 @@ impl Consensus {
         // in step 8 reads. Commit, apply and replication never wait on a
         // snapshot, so this is a poll and never a barrier.
         self.check_set_completeness();
+        // Catalog erratum R37 item 4: and re-offer that set's reports to a
+        // leader that has not had them. One `Acquire` load and a compare on
+        // the steady path.
+        self.maybe_reoffer_snapshot_reports();
         let mut did = false;
 
         // Time-and-timers spec §3.2/§4.3, monotonic log clock spec §5 — ONE
@@ -6667,6 +6690,14 @@ impl Consensus {
         let leader_addr = (hint != u64::MAX)
             .then(|| self.id_to_addr.get(&(hint as NodeId)).copied())
             .flatten();
+        // Catalog erratum R37 item 4: whoever these reports reach has been
+        // offered this node's newest set, so the re-offer on a leader change
+        // (`maybe_reoffer_snapshot_reports`) does not repeat it.
+        if leader {
+            self.report_leader_seen = Some((self.id as u64, term));
+        } else if leader_addr.is_some() {
+            self.report_leader_seen = Some((hint, term));
+        }
         // Catalog spec §5.1: the cluster artifact at `p` joins the report as
         // row [`CLUSTER_ROW`], hashed with `artifact_hash_of` — the SAME
         // function the service builder applies to a row's payload. The
@@ -6748,6 +6779,42 @@ impl Consensus {
         }
     }
 
+    /// Catalog erratum R37 item 4: re-offer this node's NEWEST complete set's
+    /// reports (`snapshot_set_position`, when non-zero) each time it learns a
+    /// DIFFERENT leadership — the cnc `leader_hint` naming another node, or
+    /// this node itself once it leads, in which case `send_snapshot_reports`
+    /// feeds its own collector in-process. Both leader exits clear the
+    /// collector, so without this the evidence collected under one leader is
+    /// simply lost to the next, and a set agreed nowhere holds the purge floor
+    /// until the NEXT instant agrees.
+    ///
+    /// Keyed on `(leader id, term)`, not the id alone: a node re-elected in a
+    /// later term cleared its collector on the exit in between, so it is a
+    /// different collection to offer to. Once per leadership: the key is
+    /// recorded here and by every `send_snapshot_reports` that reached a
+    /// leader, so neither a heartbeat nor a set-complete edge repeats it. An
+    /// unknown leader (`u64::MAX`) or a candidate's stale hint records
+    /// nothing — the next known leader is offered the set. `send_snapshot_reports`'s own
+    /// `snapshot_pos == p` guard skips a row that has since frozen a newer
+    /// instant.
+    fn maybe_reoffer_snapshot_reports(&mut self) {
+        let hint = self.cnc.status().leader_hint.load_acquire();
+        // A candidate has bumped its term but still carries the hint of the
+        // leader it gave up on: that pair names no leadership at all.
+        if hint == u64::MAX || matches!(self.sm.role(), Role::Candidate) {
+            return;
+        }
+        let leadership = (hint, self.sm.current_term());
+        if self.report_leader_seen == Some(leadership) {
+            return;
+        }
+        self.report_leader_seen = Some(leadership);
+        let p = self.snapshot_set_position.load(Ordering::Acquire);
+        if p != 0 {
+            self.send_snapshot_reports(p);
+        }
+    }
+
     /// The row's COMMITTED report position — `0` when the cluster FSM holds
     /// no report for it yet. Read from the view rather than kept as a field
     /// because the record is applied by the `uc2-cluster` agent, not here,
@@ -6798,12 +6865,21 @@ impl Consensus {
     ///   stronger than the FSM's own `ReportStale` refusal (which only refuses
     ///   a STRICTLY older position), so a command built from this map is never
     ///   one the FSM would refuse for staleness.
-    /// * **Newest instant per row.** One pending entry per row. A report for a
-    ///   NEWER instant replaces the entry outright — the older instant's
-    ///   hashes attest a different artifact and must not be mixed in — and
-    ///   restarts the timeout, because it is the new instant's set the leader
-    ///   is now waiting on. A report for an older instant than the one pending
-    ///   is dropped.
+    /// * **One entry per instant** (catalog erratum R37). A report is
+    ///   evidence about one `(row, position)`: it joins that instant's entry,
+    ///   or opens one with its OWN clock, and never moves between entries or
+    ///   restarts another entry's clock — hashes for different instants
+    ///   attest different artifacts and are never mixed. A newer instant does
+    ///   NOT discard an older one's evidence: under the old one-entry-per-row
+    ///   rule a voter one instant behind the others starved agreement for
+    ///   every instant (the others' reports for P were thrown away when they
+    ///   reported P+1, the laggard's P was then "older than pending", and the
+    ///   timeout restarted at every instant). Older entries go only when a
+    ///   newer instant of the row is APPENDED
+    ///   ([`Consensus::maybe_append_snapshot_reports`]) or, past
+    ///   [`MAX_CATALOG_SETS`] pending instants, by evicting the oldest — both
+    ///   counted under `snapshot_report_superseded`. A report older than every
+    ///   instant of a FULL row would be that oldest, so it is the one dropped.
     fn on_snap_report(&mut self, from: NodeId, row: u8, position: u64, hash: u64) {
         if !matches!(self.sm.role(), Role::Leader) {
             return;
@@ -6825,52 +6901,57 @@ impl Consensus {
         }
         let now = self.pass_mono_ns;
         let node = self.id as u64;
-        match self.pending_snapshot_reports.get(&row).map(|p| p.position) {
-            Some(cur) if position < cur => return,
-            Some(cur) if position > cur => {
-                crate::obs_event!(
-                    Info,
-                    "snapshot_report_superseded",
-                    node = node,
-                    row = row as u64,
-                    old = cur,
-                    new = position
-                );
-                self.pending_snapshot_reports.insert(
-                    row,
-                    PendingSnapshotReport {
-                        position,
-                        first_seen_ns: now,
-                        hashes: BTreeMap::new(),
-                    },
-                );
+        let list = self.pending_snapshot_reports.entry(row).or_default();
+        let mut at = match list.binary_search_by_key(&position, |e| e.position) {
+            Ok(i) => {
+                list[i].hashes.insert(from, hash);
+                return;
             }
-            Some(_) => {}
-            None => {
-                self.pending_snapshot_reports.insert(
-                    row,
-                    PendingSnapshotReport {
-                        position,
-                        first_seen_ns: now,
-                        hashes: BTreeMap::new(),
-                    },
-                );
+            Err(i) => i,
+        };
+        if list.len() >= MAX_CATALOG_SETS {
+            // Full: the row's OLDEST instant goes. When the new report is
+            // itself older than every pending instant, it IS that oldest.
+            let (old, new) = if at == 0 {
+                (position, list[0].position)
+            } else {
+                at -= 1;
+                (list.remove(0).position, position)
+            };
+            crate::obs_event!(
+                Info,
+                "snapshot_report_superseded",
+                node = node,
+                row = row as u64,
+                old = old,
+                new = new
+            );
+            if old == position {
+                return;
             }
         }
-        self.pending_snapshot_reports
-            .get_mut(&row)
-            .expect("just inserted, or already present")
-            .hashes
-            .insert(from, hash);
+        let mut hashes = BTreeMap::new();
+        hashes.insert(from, hash);
+        list.insert(
+            at,
+            PendingSnapshotReport {
+                position,
+                first_seen_ns: now,
+                hashes,
+            },
+        );
     }
 
-    /// Plan B3 (spec §6.5.2), the other half: place ONE row's collection on
-    /// the log as a `CLUSTER kind = 5 SnapshotReport`. Called once per leader
-    /// pass, beside the pass's other leader-issued `CLUSTER` appends.
+    /// Plan B3 (spec §6.5.2), the other half: place ONE pending `(row,
+    /// instant)` collection on the log as a `CLUSTER kind = 5
+    /// SnapshotReport`. Called once per leader pass, beside the pass's other
+    /// leader-issued `CLUSTER` appends.
     ///
-    /// A row is ready when EVERY VOTER in the current membership has reported
-    /// it, or when its collection has stood for [`SNAP_REPORT_TIMEOUT_NS`],
-    /// whichever comes first. The timeout is what keeps a down node from
+    /// An entry is ready when EVERY VOTER in the current membership has
+    /// reported it, or when THAT ENTRY has stood for
+    /// [`SNAP_REPORT_TIMEOUT_NS`] on its own clock, whichever comes first
+    /// (catalog erratum R37: a newer instant never restarts an older one's
+    /// clock). The timeout is what keeps a down node from
     /// stopping the record altogether: the append then names who DID report,
     /// which is exactly the evidence [`uc_protocol::v2::upgrade::verdict`]
     /// reads.
@@ -6913,15 +6994,22 @@ impl Consensus {
     /// **At most one append per pass**, because `append_cluster_frame` shuts
     /// the single-in-flight gate behind it: a second command placed above an
     /// uncommitted one is precisely what that gate exists to refuse. Ready
-    /// rows beyond the first simply wait for the next pass, and rows are
-    /// walked in ascending order so the choice is deterministic rather than a
-    /// `HashMap`'s iteration order. A row DROPPED here (stale, or emptied by
-    /// the filter) costs the pass nothing — the walk continues to the next
-    /// row, since nothing was appended and the gate is still open.
+    /// entries beyond the first simply wait for the next pass. Rows are walked
+    /// in ascending order, and within a row entries ascending by position, so
+    /// the choice is deterministic rather than a `HashMap`'s iteration order
+    /// and the OLDEST ready instant of a row goes first. An entry DROPPED here
+    /// (stale, or emptied by the filter) costs the pass nothing — the walk
+    /// continues, since nothing was appended and the gate is still open.
+    ///
+    /// Appending `(row, P')` removes the row's pending entries BELOW `P'`,
+    /// each counted under `snapshot_report_superseded`: once `P'` commits they
+    /// would be refused as stale at the door. That gives up the chance that
+    /// such a `P` would still have completed by its own timeout — accepted
+    /// (catalog erratum R37 item 2): ascending order means `P'` goes first
+    /// only when `P` was not ready.
     ///
     /// On `WouldOverrun` the entry is KEPT — the buffer was momentarily full,
-    /// nothing was appended, and the set is still the newest thing this leader
-    /// knows about that row.
+    /// nothing was appended, and the evidence is still good.
     ///
     /// `#[inline(never)]` (final review, minor 6): `do_work`'s comment claims
     /// "one `is_empty` test on the steady path, which is the whole of its
@@ -6946,100 +7034,167 @@ impl Consensus {
         let voters_required = config.voters.len();
         // Ascending, so which ready row goes first is a property of the data
         // and not of the `HashMap`'s iteration order — and the cluster row
-        // (`CLUSTER_ROW = 255`) sorts after every user row.
-        let mut rows: Vec<u8> = self.pending_snapshot_reports.keys().copied().collect();
-        rows.sort_unstable();
-        for row in rows {
-            let pend = &self.pending_snapshot_reports[&row];
-            let position = pend.position;
-            let first_seen_ns = pend.first_seen_ns;
-            // The payload, filtered against the config AS IT IS NOW — see this
-            // function's doc for why collection-time membership is not enough.
-            let hashes: Vec<(u32, u64)> = pend
-                .hashes
-                .iter()
-                .filter(|(id, _)| config.contains(**id))
-                .map(|(id, h)| (*id, *h))
-                .collect();
-            let voters_reporting = hashes.iter().filter(|(id, _)| config.is_voter(*id)).count();
-            let timed_out = now.saturating_sub(first_seen_ns) >= SNAP_REPORT_TIMEOUT_NS;
-            if voters_reporting < voters_required && !timed_out {
-                continue; // still collecting
-            }
-            // Every reporter has since left the config: there is nothing left
-            // to attest with, and an empty record is not even encodable.
-            if hashes.is_empty() {
-                crate::obs_event!(
-                    Info,
-                    "snapshot_report_dropped",
-                    node = self.id as u64,
-                    row = row as u64,
-                    position = position,
-                    reason = "no_members"
-                );
-                self.pending_snapshot_reports.remove(&row);
-                continue;
-            }
-            // The row's committed report can have MOVED since the entry was
-            // made (a previous leader's record committing under us), in which
-            // case this one says nothing newer. Dropped rather than appended:
-            // the append would be refused at apply as stale, having cost the
-            // log a frame.
-            if position <= self.held_report_position(row) {
-                crate::obs_event!(
-                    Info,
-                    "snapshot_report_dropped",
-                    node = self.id as u64,
-                    row = row as u64,
-                    position = position,
-                    reason = "stale"
-                );
-                self.pending_snapshot_reports.remove(&row);
-                continue;
-            }
-            let reporters = hashes.len() as u64;
-            // Encodable by construction: non-empty (just checked), at most one
-            // entry per CURRENT member and therefore at most `MAX_MEMBERS` (the
-            // filter above), strictly increasing by node id (the `BTreeMap`'s
-            // order, which the filter preserves), `is_report_row(row)` and
-            // a non-zero position — the last two are `on_snap_report`'s door.
-            let cmd = ClusterCommand::SnapshotReport(SnapshotReport {
-                row,
-                position,
-                hashes,
-            });
-            return match self.append_cluster_frame(&cmd) {
-                Ok(end) => {
-                    let by_timeout = voters_reporting < voters_required;
-                    self.pending_snapshot_reports.remove(&row);
-                    self.snapshot_reports_appended
-                        .fetch_add(1, Ordering::Relaxed);
-                    if by_timeout {
-                        self.snapshot_reports_timed_out
-                            .fetch_add(1, Ordering::Relaxed);
-                    }
+        // (`CLUSTER_ROW = 255`) sorts after every user row. At most nine rows
+        // (`is_report_row`), so a stack array rather than an allocation.
+        let mut rows = [0u8; CNC_MAX_SERVICES + 1];
+        let mut n = 0usize;
+        for &row in self.pending_snapshot_reports.keys() {
+            rows[n] = row;
+            n += 1;
+        }
+        rows[..n].sort_unstable();
+        for &row in &rows[..n] {
+            // Catalog erratum R37: within a row, ascending by position — the
+            // OLDEST ready instant goes first, and each entry is judged on its
+            // OWN clock. An entry that is not ready does not hold back a newer
+            // one that is.
+            let mut i = 0usize;
+            while let Some(pend) = self
+                .pending_snapshot_reports
+                .get(&row)
+                .and_then(|list| list.get(i))
+            {
+                let position = pend.position;
+                // Counted on the config-filtered set (`is_voter` implies
+                // membership), before anything is collected: an entry that is
+                // still waiting costs the pass no allocation.
+                let voters_reporting = pend
+                    .hashes
+                    .keys()
+                    .filter(|id| config.is_voter(**id))
+                    .count();
+                let timed_out = now.saturating_sub(pend.first_seen_ns) >= SNAP_REPORT_TIMEOUT_NS;
+                if voters_reporting < voters_required && !timed_out {
+                    i += 1;
+                    continue; // still collecting
+                }
+                // The payload, filtered against the config AS IT IS NOW — see
+                // this function's doc for why collection-time membership is not
+                // enough.
+                let hashes: Vec<(u32, u64)> = pend
+                    .hashes
+                    .iter()
+                    .filter(|(id, _)| config.contains(**id))
+                    .map(|(id, h)| (*id, *h))
+                    .collect();
+                // Every reporter has since left the config: there is nothing
+                // left to attest with, and an empty record is not even
+                // encodable.
+                if hashes.is_empty() {
                     crate::obs_event!(
                         Info,
-                        "snapshot_report_appended",
+                        "snapshot_report_dropped",
                         node = self.id as u64,
                         row = row as u64,
                         position = position,
-                        frame_end = end,
-                        reporters = reporters,
-                        voters_reporting = voters_reporting as u64,
-                        voters_required = voters_required as u64,
-                        by = if by_timeout { "timeout" } else { "all_voters" }
+                        reason = "no_members"
                     );
-                    true
+                    self.remove_pending_reports(row, i..i + 1);
+                    continue;
                 }
-                // WouldOverrun (or the unreachable PayloadTooLarge — the record
-                // is at most 112 bytes): nothing was appended, so the entry
-                // stands and the next pass tries again. The walk stops rather
-                // than trying another row: the buffer is full for all of them.
-                Err(_) => false,
-            };
+                // The row's committed report can have MOVED since the entry
+                // was made (a previous leader's record committing under us),
+                // in which case this one says nothing newer. Dropped rather
+                // than appended: the append would be refused at apply as
+                // stale, having cost the log a frame.
+                if position <= self.held_report_position(row) {
+                    crate::obs_event!(
+                        Info,
+                        "snapshot_report_dropped",
+                        node = self.id as u64,
+                        row = row as u64,
+                        position = position,
+                        reason = "stale"
+                    );
+                    self.remove_pending_reports(row, i..i + 1);
+                    continue;
+                }
+                let reporters = hashes.len() as u64;
+                // Encodable by construction: non-empty (just checked), at most
+                // one entry per CURRENT member and therefore at most
+                // `MAX_MEMBERS` (the filter above), strictly increasing by node
+                // id (the `BTreeMap`'s order, which the filter preserves),
+                // `is_report_row(row)` and a non-zero position — the last two
+                // are `on_snap_report`'s door.
+                let cmd = ClusterCommand::SnapshotReport(SnapshotReport {
+                    row,
+                    position,
+                    hashes,
+                });
+                return match self.append_cluster_frame(&cmd) {
+                    Ok(end) => {
+                        let by_timeout = voters_reporting < voters_required;
+                        // This entry, and every OLDER one of the row: once this
+                        // record commits they would be refused as stale at the
+                        // door (catalog §4.2 / refusal 59). The one place
+                        // `snapshot_report_superseded` fires besides the
+                        // bound's eviction (catalog erratum R37 item 2).
+                        for old in self.remove_pending_reports(row, 0..i + 1) {
+                            if old != position {
+                                crate::obs_event!(
+                                    Info,
+                                    "snapshot_report_superseded",
+                                    node = self.id as u64,
+                                    row = row as u64,
+                                    old = old,
+                                    new = position
+                                );
+                            }
+                        }
+                        self.snapshot_reports_appended
+                            .fetch_add(1, Ordering::Relaxed);
+                        if by_timeout {
+                            self.snapshot_reports_timed_out
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                        crate::obs_event!(
+                            Info,
+                            "snapshot_report_appended",
+                            node = self.id as u64,
+                            row = row as u64,
+                            position = position,
+                            frame_end = end,
+                            reporters = reporters,
+                            voters_reporting = voters_reporting as u64,
+                            voters_required = voters_required as u64,
+                            by = if by_timeout { "timeout" } else { "all_voters" }
+                        );
+                        true
+                    }
+                    // WouldOverrun (or the unreachable PayloadTooLarge — the
+                    // record is at most 112 bytes): nothing was appended, so
+                    // the entry stands and the next pass tries again. The walk
+                    // stops rather than trying another entry: the buffer is
+                    // full for all of them.
+                    Err(_) => false,
+                };
+            }
         }
         false
+    }
+
+    /// Test-only: `row`'s pending instants, ascending by position (empty
+    /// when none is pending).
+    #[cfg(test)]
+    fn pending_reports_for(&self, row: u8) -> &[PendingSnapshotReport] {
+        self.pending_snapshot_reports
+            .get(&row)
+            .map_or(&[], |list| list.as_slice())
+    }
+
+    /// Remove `range` (indices into the row's ascending list) from `row`'s
+    /// pending reports, dropping the row's key with its last entry so the
+    /// map's `is_empty` stays the pass's whole steady-path test. Returns the
+    /// removed entries' positions, ascending. At most `MAX_CATALOG_SETS`.
+    fn remove_pending_reports(&mut self, row: u8, range: std::ops::Range<usize>) -> Vec<u64> {
+        let Some(list) = self.pending_snapshot_reports.get_mut(&row) else {
+            return Vec::new();
+        };
+        let gone: Vec<u64> = list.drain(range).map(|e| e.position).collect();
+        if list.is_empty() {
+            self.pending_snapshot_reports.remove(&row);
+        }
+        gone
     }
 
     /// Catalog spec §5.2 (D6): refresh the counter half of the `Holdings`
@@ -12866,6 +13021,7 @@ mod tests {
             snapshot_reports_appended: Arc::new(AtomicU64::new(0)),
             snapshot_reports_timed_out: Arc::new(AtomicU64::new(0)),
             pending_snapshot_reports: HashMap::new(),
+            report_leader_seen: None,
             ingress_rx,
             trunc_tx,
             trunc_slot,
@@ -13474,7 +13630,7 @@ mod tests {
         let mut rows: Vec<u8> = h.cons.pending_snapshot_reports.keys().copied().collect();
         rows.sort_unstable();
         assert_eq!(rows, vec![0, CLUSTER_ROW]);
-        let reported = h.cons.pending_snapshot_reports[&CLUSTER_ROW].hashes[&h.cons.id];
+        let reported = h.cons.pending_reports_for(CLUSTER_ROW)[0].hashes[&h.cons.id];
         let file = std::fs::read(
             h.cons
                 .cluster_snapshot_dir
@@ -14180,7 +14336,7 @@ mod tests {
         h.cluster_snapshot_pos.store(p, Ordering::Release);
         h.cons.check_set_completeness();
 
-        let pend = &h.cons.pending_snapshot_reports[&0];
+        let pend = &h.cons.pending_reports_for(0)[0];
         assert_eq!(pend.position, p);
         assert_eq!(
             pend.hashes
@@ -14824,49 +14980,96 @@ mod tests {
         );
     }
 
-    /// One pending set per row, and it is always the NEWEST instant's: a node
-    /// that completed a later set has moved on, and holding both would leave
-    /// the leader appending a record about an instant the cluster has passed.
-    /// The timeout restarts with the new instant — it is that instant's set
-    /// the leader is now waiting on.
+    /// Catalog erratum R37: a newer instant does NOT supersede the pending
+    /// reports for an older one. Each `(row, instant)` holds its own entry,
+    /// its own hashes (never mixed — they attest different artifacts) and its
+    /// own clock; the older instant completes when its last voter reports,
+    /// and the newer one stays pending beside it. A late report at or below
+    /// the row's COMMITTED report position is still dropped.
     #[test]
-    fn a_newer_instant_supersedes_the_pending_reports_for_that_row() {
+    fn a_newer_instant_never_discards_the_pending_reports_for_an_older_one() {
         let _obs = obs_capture_lock();
         let mut h = harness_with_rows(&["a"]);
         drive_to_serving_leader(&mut h);
         h.cons.pass_mono_ns = 1_000;
         let (p1, p2) = (6048u64, 7040u64);
 
-        h.cons.on_snap_report(0, 0, p1, 0x11);
-        h.cons.pass_mono_ns += 1_000;
         let cap = ObsCapture::take();
         let buf = cap.buf();
-        h.cons.on_snap_report(2, 0, p2, 0x22);
-        let text = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        h.cons.on_snap_report(0, 0, p1, 0x11);
+        h.cons.on_snap_report(1, 0, p1, 0x11);
+        h.cons.pass_mono_ns += 1_000;
+        h.cons.on_snap_report(0, 0, p2, 0x22);
+        h.cons.on_snap_report(1, 0, p2, 0x22);
 
-        let pend = &h.cons.pending_snapshot_reports[&0];
-        assert_eq!(pend.position, p2, "the newer instant took the slot");
+        let pending = h.cons.pending_reports_for(0);
         assert_eq!(
-            pend.hashes
+            pending.iter().map(|e| e.position).collect::<Vec<_>>(),
+            vec![p1, p2],
+            "both instants are pending, ascending"
+        );
+        assert_eq!(
+            pending[0]
+                .hashes
                 .iter()
                 .map(|(k, v)| (*k, *v))
                 .collect::<Vec<_>>(),
-            vec![(2, 0x22)],
-            "p1's hashes are NOT carried over — they attest a different artifact"
+            vec![(0, 0x11), (1, 0x11)],
+            "p1 keeps its own evidence"
         );
         assert_eq!(
-            pend.first_seen_ns, 2_000,
-            "the timeout runs from the new instant, not the superseded one"
+            pending[1]
+                .hashes
+                .iter()
+                .map(|(k, v)| (*k, *v))
+                .collect::<Vec<_>>(),
+            vec![(0, 0x22), (1, 0x22)],
+            "p2's hashes are its own — never mixed with p1's"
         );
-        assert!(
-            text.contains(r#""event":"snapshot_report_superseded""#),
-            "the drop is recorded: {text}"
+        assert_eq!(
+            (pending[0].first_seen_ns, pending[1].first_seen_ns),
+            (1_000, 2_000),
+            "each instant runs its own clock"
         );
 
-        // A LATE report for the superseded instant never re-opens it.
-        h.cons.on_snap_report(1, 0, p1, 0x11);
-        assert_eq!(h.cons.pending_snapshot_reports[&0].position, p2);
-        assert_eq!(h.cons.pending_snapshot_reports[&0].hashes.len(), 1);
+        h.cons.on_snap_report(2, 0, p1, 0x11);
+        assert!(
+            h.cons.maybe_append_snapshot_reports(),
+            "the laggard's report completes p1"
+        );
+        let text = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(
+            text.contains(r#""by":"all_voters""#),
+            "agreed by every voter, not by the timeout: {text}"
+        );
+        assert!(
+            !text.contains("snapshot_report_superseded"),
+            "nothing older than p1 was pending, so nothing is superseded: {text}"
+        );
+        let end = h.cons.last_cluster_append;
+        h.commit_through(end);
+        assert_eq!(
+            h.cons.cluster_view.to_state().report_for(0),
+            Some(&SnapshotReport {
+                row: 0,
+                position: p1,
+                hashes: vec![(0, 0x11), (1, 0x11), (2, 0x11)],
+            })
+        );
+        assert_eq!(
+            h.cons
+                .pending_reports_for(0)
+                .iter()
+                .map(|e| e.position)
+                .collect::<Vec<_>>(),
+            vec![p2],
+            "p2 is still pending"
+        );
+
+        // A LATE report at or below the committed report position is dropped.
+        h.cons.on_snap_report(2, 0, p1, 0x11);
+        assert_eq!(h.cons.pending_reports_for(0).len(), 1);
+        assert_eq!(h.cons.pending_reports_for(0)[0].position, p2);
     }
 
     /// Collection is LEADER-only. A follower that took a report would hold a
@@ -14906,6 +15109,369 @@ mod tests {
                 "leader exit (halt = {halt}) drops the collection"
             );
         }
+    }
+
+    /// Catalog spec erratum R37, proof (a) — the starvation this rule exists
+    /// to end. Instants land every second; voters 0 and 1 report each one as
+    /// it completes and voter 2 is always ONE instant behind. A rule that
+    /// keeps one pending instant per row discards 0 and 1's evidence for P
+    /// the moment they report P+1, then drops 2's report for P as "older than
+    /// pending", and its timeout never runs out because every instant
+    /// restarts it — so nothing is ever appended. Keyed by `(row, position)`,
+    /// each instant is completed by the laggard's report one second later:
+    /// every instant but the last appends `by: all_voters`.
+    #[test]
+    fn a_voter_one_instant_behind_never_starves_agreement() {
+        let _obs = obs_capture_lock();
+        let mut h = harness_with_rows(&["a"]);
+        drive_to_serving_leader(&mut h);
+        const SEC: u64 = 1_000_000_000;
+        let at = |i: u64| 8192 + i * 1024;
+        let cap = ObsCapture::take();
+        let buf = cap.buf();
+        for i in 1..=8u64 {
+            h.cons.pass_mono_ns = i * SEC;
+            h.cons.on_snap_report(0, 0, at(i), 0xA0 + i);
+            h.cons.on_snap_report(1, 0, at(i), 0xA0 + i);
+            if i > 1 {
+                h.cons.on_snap_report(2, 0, at(i - 1), 0xA0 + i - 1);
+            }
+            while h.cons.maybe_append_snapshot_reports() {
+                let end = h.cons.last_cluster_append;
+                h.commit_through(end);
+            }
+        }
+        let text = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert_eq!(
+            h.cons.snapshot_reports_appended.load(Ordering::Relaxed),
+            7,
+            "every instant but the last is agreed by all three voters: {text}"
+        );
+        assert_eq!(
+            h.cons.snapshot_reports_timed_out.load(Ordering::Relaxed),
+            0,
+            "and none of them needed the timeout"
+        );
+        assert_eq!(
+            text.matches(r#""by":"all_voters""#).count(),
+            7,
+            "each append names the all-voters rule: {text}"
+        );
+        assert_eq!(
+            h.cons.cluster_view.to_state().report_for(0),
+            Some(&SnapshotReport {
+                row: 0,
+                position: at(7),
+                hashes: vec![(0, 0xA7), (1, 0xA7), (2, 0xA7)],
+            }),
+            "the newest committed record is instant 7, with all three hashes"
+        );
+    }
+
+    /// Erratum R37, proof (b): every pending instant has its OWN clock. A
+    /// report for a newer instant neither discards the older one's evidence
+    /// nor restarts its timeout — P appends by timeout 5 s after ITS first
+    /// report, and P+1 not before 5 s after its own.
+    #[test]
+    fn each_pending_instant_times_out_on_its_own_clock() {
+        let _obs = obs_capture_lock();
+        let mut h = harness_with_rows(&["a"]);
+        drive_to_serving_leader(&mut h);
+        const SEC: u64 = 1_000_000_000;
+        let t0 = 1_000u64;
+        let (p1, p2) = (8192u64, 9216u64);
+        h.cons.pass_mono_ns = t0;
+        h.cons.on_snap_report(0, 0, p1, 0x11);
+        h.cons.pass_mono_ns = t0 + SEC;
+        h.cons.on_snap_report(0, 0, p2, 0x22);
+
+        h.cons.pass_mono_ns = t0 + SNAP_REPORT_TIMEOUT_NS - 1;
+        assert!(
+            !h.cons.maybe_append_snapshot_reports(),
+            "neither instant has stood 5 s yet"
+        );
+        h.cons.pass_mono_ns = t0 + SNAP_REPORT_TIMEOUT_NS;
+        assert!(
+            h.cons.maybe_append_snapshot_reports(),
+            "P's own clock reached the timeout — P+1's report did not restart it"
+        );
+        let end = h.cons.last_cluster_append;
+        h.commit_through(end);
+        assert_eq!(
+            h.cons
+                .cluster_view
+                .to_state()
+                .report_for(0)
+                .map(|r| r.position),
+            Some(p1)
+        );
+        assert_eq!(h.cons.snapshot_reports_timed_out.load(Ordering::Relaxed), 1);
+        assert!(
+            !h.cons.maybe_append_snapshot_reports(),
+            "P+1 has stood only 4 s"
+        );
+        h.cons.pass_mono_ns = t0 + SEC + SNAP_REPORT_TIMEOUT_NS - 1;
+        assert!(
+            !h.cons.maybe_append_snapshot_reports(),
+            "a nanosecond short"
+        );
+        h.cons.pass_mono_ns += 1;
+        assert!(
+            h.cons.maybe_append_snapshot_reports(),
+            "P+1's own 5 s is up"
+        );
+        let end = h.cons.last_cluster_append;
+        h.commit_through(end);
+        assert_eq!(
+            h.cons
+                .cluster_view
+                .to_state()
+                .report_for(0)
+                .map(|r| r.position),
+            Some(p2)
+        );
+        assert_eq!(h.cons.snapshot_reports_timed_out.load(Ordering::Relaxed), 2);
+        assert!(h.cons.pending_snapshot_reports.is_empty());
+    }
+
+    /// Erratum R37, proof (c), first half: an older pending instant is
+    /// dropped — and counted under `snapshot_report_superseded` — only when
+    /// a NEWER instant of the same row is APPENDED, since once that record
+    /// commits the older one would be refused as stale at the door. Taking
+    /// the newer report is not, on its own, a reason to drop anything.
+    #[test]
+    fn an_appended_instant_drops_the_older_pending_ones_as_superseded() {
+        let _obs = obs_capture_lock();
+        let mut h = harness_with_rows(&["a"]);
+        drive_to_serving_leader(&mut h);
+        h.cons.pass_mono_ns = 1_000;
+        let (p1, p2) = (8192u64, 9216u64);
+        h.cons.on_snap_report(0, 0, p1, 0x11);
+        h.cons.on_snap_report(1, 0, p1, 0x11);
+
+        let cap = ObsCapture::take();
+        let buf = cap.buf();
+        for id in 0..3u32 {
+            h.cons.on_snap_report(id, 0, p2, 0x22);
+        }
+        let text = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(
+            !text.contains("snapshot_report_superseded"),
+            "a newer report alone supersedes nothing: {text}"
+        );
+        buf.lock().unwrap().clear();
+
+        assert!(
+            h.cons.maybe_append_snapshot_reports(),
+            "P+1 is agreed by every voter; P still waits on voter 2"
+        );
+        let text = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(
+            text.contains(r#""event":"snapshot_report_appended""#)
+                && text.contains(&format!(r#""position":{p2}"#)),
+            "P+1 went in: {text}"
+        );
+        assert_eq!(
+            text.matches(r#""event":"snapshot_report_superseded""#)
+                .count(),
+            1,
+            "P is dropped once P+1 is appended: {text}"
+        );
+        assert!(
+            text.contains(&format!(r#""old":{p1}"#)) && text.contains(&format!(r#""new":{p2}"#)),
+            "naming both instants: {text}"
+        );
+        assert!(
+            h.cons.pending_snapshot_reports.is_empty(),
+            "nothing of row 0 is left pending"
+        );
+        let end = h.cons.last_cluster_append;
+        h.commit_through(end);
+        // A late report for the dropped instant is at or below the row's
+        // committed report position, so it never re-opens it.
+        h.cons.on_snap_report(2, 0, p1, 0x11);
+        assert!(h.cons.pending_snapshot_reports.is_empty());
+    }
+
+    /// Erratum R37, proof (c), second half: at most `MAX_CATALOG_SETS`
+    /// pending instants per row. One more evicts the row's OLDEST, counted
+    /// under `snapshot_report_superseded`; a report OLDER than every pending
+    /// instant of a full row would itself be the oldest, so it is the one
+    /// dropped (and counted). What stays pending still completes.
+    #[test]
+    fn pending_instants_are_bounded_per_row_and_the_oldest_is_evicted() {
+        let _obs = obs_capture_lock();
+        let mut h = harness_with_rows(&["a"]);
+        drive_to_serving_leader(&mut h);
+        h.cons.pass_mono_ns = 1_000;
+        let at = |i: u64| 8192 + i * 1024;
+        let n = MAX_CATALOG_SETS as u64;
+        let cap = ObsCapture::take();
+        let buf = cap.buf();
+        for i in 0..=n {
+            h.cons.on_snap_report(0, 0, at(i), 0x50);
+        }
+        let text = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert_eq!(
+            text.matches(r#""event":"snapshot_report_superseded""#)
+                .count(),
+            1,
+            "only the instant beyond the bound evicts anything: {text}"
+        );
+        assert!(
+            text.contains(&format!(r#""old":{}"#, at(0)))
+                && text.contains(&format!(r#""new":{}"#, at(n))),
+            "the OLDEST went: {text}"
+        );
+        let pending = h.cons.pending_reports_for(0);
+        assert_eq!(pending.len(), MAX_CATALOG_SETS, "the bound holds");
+        assert_eq!(
+            (pending[0].position, pending[MAX_CATALOG_SETS - 1].position),
+            (at(1), at(n)),
+            "ascending, oldest surviving first"
+        );
+        buf.lock().unwrap().clear();
+        h.cons.on_snap_report(1, 0, at(0), 0x50);
+        let text = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(
+            text.contains(r#""event":"snapshot_report_superseded""#)
+                && text.contains(&format!(r#""old":{}"#, at(0))),
+            "a report older than a full row's every instant is the one dropped: {text}"
+        );
+
+        h.cons.on_snap_report(1, 0, at(1), 0x50);
+        h.cons.on_snap_report(2, 0, at(1), 0x50);
+        assert!(
+            h.cons.maybe_append_snapshot_reports(),
+            "the oldest SURVIVING instant still completes"
+        );
+        let end = h.cons.last_cluster_append;
+        h.commit_through(end);
+        assert_eq!(
+            h.cons
+                .cluster_view
+                .to_state()
+                .report_for(0)
+                .map(|r| r.position),
+            Some(at(1))
+        );
+    }
+
+    /// Erratum R37, proof (d), the follower half: both leader exits clear the
+    /// collection, so a node re-offers its NEWEST complete set's reports each
+    /// time it learns a DIFFERENT leadership — once, not on every pass.
+    /// Driven through `maybe_reoffer_snapshot_reports` (the call `do_work`
+    /// makes each pass) rather than `do_work` itself: the harness's 150–300 ns
+    /// election timeout turns any real follower pass into a candidacy.
+    #[test]
+    fn a_follower_re_offers_its_newest_set_to_a_new_leader_once() {
+        let (sock0, addr0) = report_peer_socket();
+        let (sock2, addr2) = report_peer_socket();
+        let mut h = harness_with_rows_and_peers(&["a"], &[(0, addr0), (2, addr2)]);
+        assert!(!matches!(h.cons.sm.role(), Role::Leader));
+        h.cons.cnc.status().leader_hint.store_release(0);
+
+        let p = 6016u64;
+        h.row_published_at(0, p, 0x0D0D_0D0D_0D0D_0D0D);
+        h.cluster_snapshot_pos.store(p, Ordering::Release);
+        h.cons.check_set_completeness();
+        assert_eq!(
+            drain_snap_reports(&sock0).len(),
+            1,
+            "precondition: the set-complete edge reported to leader 0"
+        );
+        for _ in 0..3 {
+            h.cons.maybe_reoffer_snapshot_reports();
+        }
+        assert!(
+            drain_snap_reports(&sock0).is_empty(),
+            "the same leader is never re-offered the same set"
+        );
+
+        // Leader 0 is gone and node 2 leads: its collection starts empty.
+        h.cons.cnc.status().leader_hint.store_release(2);
+        h.cons.maybe_reoffer_snapshot_reports();
+        assert_eq!(
+            drain_snap_reports(&sock2),
+            vec![SnapReportBody {
+                row: 0,
+                node_id: 1,
+                position: p,
+                hash: 0x0D0D_0D0D_0D0D_0D0D,
+            }],
+            "the newest complete set is re-offered to the new leader"
+        );
+        for _ in 0..3 {
+            h.cons.maybe_reoffer_snapshot_reports();
+        }
+        assert!(
+            drain_snap_reports(&sock2).is_empty() && drain_snap_reports(&sock0).is_empty(),
+            "once per leader change, not once per pass"
+        );
+
+        // Node 2 is re-elected in a later term. Its collector was cleared on
+        // the exit in between, so the same id in a new term is a new
+        // leadership — offered again, once.
+        let term = h.cons.sm.current_term();
+        h.cons.feed(Event::RequestVote {
+            from: 2,
+            new_term: term + 1,
+            last_term: term + 1,
+            last_durable: 1 << 20,
+        });
+        assert_eq!(
+            h.cons.cnc.status().leader_hint.load_acquire(),
+            u64::MAX,
+            "precondition: a new term forgets the leader"
+        );
+        h.cons.maybe_reoffer_snapshot_reports();
+        assert!(
+            drain_snap_reports(&sock2).is_empty(),
+            "no leader known, nothing offered"
+        );
+        h.cons.cnc.status().leader_hint.store_release(2);
+        h.cons.maybe_reoffer_snapshot_reports();
+        h.cons.maybe_reoffer_snapshot_reports();
+        assert_eq!(
+            drain_snap_reports(&sock2).len(),
+            1,
+            "re-offered to the re-elected leader, once"
+        );
+    }
+
+    /// Erratum R37, proof (d), the leader half: a node that becomes leader
+    /// feeds its own newest complete set into its (empty) collector,
+    /// in-process — exactly as `send_snapshot_reports` does for a leader.
+    #[test]
+    fn a_new_leader_re_offers_its_own_newest_set_to_itself() {
+        let mut h = harness_with_rows(&["a"]);
+        let p = 6016u64;
+        h.row_published_at(0, p, 0x0E0E_0E0E_0E0E_0E0E);
+        h.cluster_snapshot_pos.store(p, Ordering::Release);
+        h.cons.check_set_completeness();
+        assert_eq!(
+            h.cons.snapshot_reports_unsent.load(Ordering::Relaxed),
+            1,
+            "precondition: no leader was known when the set completed"
+        );
+        drive_to_serving_leader(&mut h);
+        h.cons.do_work();
+        assert!(
+            h.cons.pending_snapshot_reports.contains_key(&0),
+            "the new leader's own report is in its collector"
+        );
+        let pending = h.cons.pending_reports_for(0);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].position, p);
+        assert_eq!(
+            pending[0]
+                .hashes
+                .iter()
+                .map(|(k, v)| (*k, *v))
+                .collect::<Vec<_>>(),
+            vec![(h.cons.id, 0x0E0E_0E0E_0E0E_0E0E)],
+            "under its own id, in-process"
+        );
     }
 
     /// Spec §4.4: the record is a `CLUSTER` command like any other, so it
@@ -15048,7 +15614,7 @@ mod tests {
         for id in 0..=7u32 {
             h.cons.on_snap_report(id, 0, p, 0x100 + id as u64);
         }
-        assert_eq!(h.cons.pending_snapshot_reports[&0].hashes.len(), 8);
+        assert_eq!(h.cons.pending_reports_for(0)[0].hashes.len(), 8);
 
         // One removed, one added: still eight MEMBERS, but the pending entry
         // — which outlives the config that admitted its ids — now holds nine.
@@ -15062,7 +15628,7 @@ mod tests {
         );
         h.cons.on_snap_report(8, 0, p, 0x108);
         assert_eq!(
-            h.cons.pending_snapshot_reports[&0].hashes.len(),
+            h.cons.pending_reports_for(0)[0].hashes.len(),
             9,
             "the map itself is NOT bounded by MAX_MEMBERS — that is the finding"
         );
