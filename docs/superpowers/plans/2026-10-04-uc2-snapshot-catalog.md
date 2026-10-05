@@ -1158,3 +1158,13 @@ Run, with the private target dir, logging each to `$HOME/scratch/rv-catalog/NN-*
 13. `cargo test -p uc_sim` (inv13 on) and the doc-link check.
 
 Report every command's exit code and the pass/fail counts verbatim. Any red stops the plan: it is not "flaky" until it has been reproduced and named.
+
+### Task 16: report aggregation stays live under a lagging voter (spec erratum R37)
+
+Added 2026-10-05 after Task 15's probe retracted the lock-convoy diagnosis. The
+requirements are the spec's "Erratum (2026-10-05, ruling R37)" block; the
+executable brief is the SDD workspace's `task-16-brief.md`. Pending report
+evidence is keyed by `(row, instant)` with per-entry clocks; a newer instant
+never discards an older one's evidence; a node re-offers its newest set's
+reports to each new leader. Proof: the starvation unit test, `two_fsm_bounded`
+5× within ±1 tick of `main`, `two_fsm_lockstep` 3/3, the all-15 `lin_v2`.
