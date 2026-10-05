@@ -400,6 +400,13 @@ impl ClusterAgent {
     /// is written, including one with neither a pin nor a running version
     /// (`store_row_view(None, None, 0)`), so a row's words never go stale
     /// after its pin or running version is cleared by a fresh genesis state.
+    ///
+    /// The VIEW half is change-gated inside [`ClusterView::publish`] (catalog
+    /// spec addendum 2026-10-05, item 4): a batch that left the published
+    /// state equal — a refused command, a report folded into a record already
+    /// held — swaps nothing and stores only `position`. The row words stay
+    /// unconditional: they are the cnc page's seqlock, not the view's lock,
+    /// and the construction-time call is what writes them on a fresh page.
     fn publish_view(&mut self) {
         let st = self.fsm.state();
         self.view.publish(st);
