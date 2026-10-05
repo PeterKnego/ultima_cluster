@@ -25,6 +25,16 @@ use crate::v2::cnc::CNC_MAX_SERVICES;
 
 pub use super::upgrade::{CLUSTER_ROW, is_report_row};
 
+/// Ruling R42: the suffix of the zero-byte marker
+/// `snapshots/cluster/snap-<P>.foreign` that says the set at `P` was NOT
+/// built on this node — it arrived whole through a snapshot session (a
+/// below-floor install, or `uc2ctl snapshot fetch`). The receiver writes it
+/// (and makes it durable) BEFORE it renames the session's cluster artifact
+/// into place, so a complete set is never unmarked; the node's retention
+/// removes it with that artifact. A node never reports a marked set's hashes
+/// as its own observation: a copy is not an independent builder.
+pub const FOREIGN_SET_SUFFIX: &str = ".foreign";
+
 /// Retention bound on the catalog's own list (spec §4 "Sizing") — NOT a
 /// datagram ceiling, since the list rides the cluster image, never a
 /// `CLUSTER` frame.

@@ -351,6 +351,15 @@ fn parse_cluster_snap_pos(name: &str) -> Option<u64> {
         .ok()
 }
 
+/// Ruling R42: the `snap-<pos>.foreign` marker beside a cluster artifact —
+/// copied with it, never counted as an artifact.
+fn parse_foreign_marker_pos(name: &str) -> Option<u64> {
+    name.strip_prefix(SNAP_PREFIX)?
+        .strip_suffix(uc_protocol::v2::catalog::FOREIGN_SET_SUFFIX)?
+        .parse()
+        .ok()
+}
+
 /// `snapshots/cluster/` under `root`.
 fn cluster_snapshots_dir(root: &Path) -> PathBuf {
     snapshots_dir(root).join(CLUSTER_DIR)
@@ -504,7 +513,9 @@ fn copy_snapshot_tree(src_root: &Path, dst_root: &Path) -> Result<(), BackupErro
         copy_dir_sorted(
             &cluster_snapshots_dir(src_root),
             &cluster_snapshots_dir(dst_root),
-            |n| parse_cluster_snap_pos(n).is_some(),
+            // Ruling R42: and each set's zero-byte `.foreign` marker, so a
+            // restored node still knows which sets it did not build.
+            |n| parse_cluster_snap_pos(n).is_some() || parse_foreign_marker_pos(n).is_some(),
         )?;
     }
     Ok(())
@@ -1167,6 +1178,32 @@ mod tests {
         assert_eq!(parse_cluster_snap_pos("snap-4096.ultcluster.part"), None);
         assert_eq!(parse_cluster_snap_pos("snap-4096.ultsnap"), None);
         assert_eq!(parse_snap_pos("snap-4096.ultcluster"), None);
+    }
+
+    /// Ruling R42: backup and restore (both [`copy_snapshot_tree`]) carry a
+    /// set's `snap-<P>.foreign` marker beside its cluster artifact — a
+    /// restored node must still know it did not build that set. The marker
+    /// sorts before `snap-<P>.ultcluster`, so the sorted copy lands it first.
+    #[test]
+    fn the_snapshot_copy_carries_a_sets_foreign_marker() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let cdir = cluster_snapshots_dir(src.path());
+        fs::create_dir_all(&cdir).unwrap();
+        fs::write(cdir.join("snap-4096.ultcluster"), b"image").unwrap();
+        fs::write(cdir.join("snap-4096.foreign"), b"").unwrap();
+        fs::write(cdir.join("snap-4096.ultcluster.part"), b"torn").unwrap();
+        copy_snapshot_tree(src.path(), dst.path()).unwrap();
+        let out = cluster_snapshots_dir(dst.path());
+        assert!(out.join("snap-4096.ultcluster").is_file());
+        assert!(
+            out.join("snap-4096.foreign").is_file(),
+            "the marker travels with its set"
+        );
+        assert!(
+            !out.join("snap-4096.ultcluster.part").exists(),
+            "an in-progress write still does not"
+        );
     }
 
     /// `cluster` is not a `u8`, so the per-row scan skips it — the property

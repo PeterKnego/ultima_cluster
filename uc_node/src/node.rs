@@ -73,7 +73,7 @@ use crate::ipc::InstanceDir;
 use crate::read_round::ProbeRound;
 use crate::services::ServicesConfig;
 use uc_log::buffer::FrameRead;
-use uc_protocol::v2::catalog::{MAX_CATALOG_SETS, SetEntry, SetState};
+use uc_protocol::v2::catalog::{FOREIGN_SET_SUFFIX, MAX_CATALOG_SETS, SetEntry, SetState};
 use uc_protocol::v2::datagram::{
     CONFIG_PROPOSAL_BODY_LEN, CONFIG_REPLY_BODY_LEN, ConfigProposalBody, ConfigReplyBody,
     DATAGRAM_HEADER_LEN, DGRAM_KIND_COMMIT_POSITION, DGRAM_KIND_CONFIG_PROPOSAL,
@@ -1877,6 +1877,16 @@ impl Node {
         // Ruling R40: the probe thread's report seeds for the consensus
         // agent's per-set report cache.
         let report_seeds = Arc::new(ReportSeeds::default());
+        // Ruling R42: the sets this node did not build, as the markers on
+        // disk say — the only memory of a fetch or install that survives a
+        // restart. Read once, here, at boot.
+        let foreign_at_boot = foreign_markers_in(&instance.cluster_snapshot_dir());
+        report_seeds
+            .inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .foreign
+            .clone_from(&foreign_at_boot);
         // M8 (Task 12): the receive half, the sender-identity map, and the
         // handshake route travel together in one `CryptoIntake` — forgetting
         // any of the three is a compile error, not a silent cluster-wide
@@ -2409,6 +2419,7 @@ impl Node {
             reported_sets: Vec::with_capacity(MAX_CATALOG_SETS),
             report_seeds: Arc::clone(&report_seeds),
             report_seed_gen_seen: 0,
+            foreign_sets: foreign_at_boot,
             above_extent_logged: HashMap::new(),
             ingress_rx,
             trunc_tx,
@@ -3258,6 +3269,11 @@ struct ReportSeedsInner {
     /// Consensus → probe: the positions already in the consensus cache, so
     /// the probe never re-hashes a set the completion edge already reported.
     known: Vec<u64>,
+    /// Consensus → probe (ruling R42): sets this node did NOT build — this
+    /// incarnation's fetch and install edges, plus the markers found at boot.
+    /// The probe also honours the on-disk marker itself; this list is the
+    /// same-incarnation half.
+    foreign: Vec<u64>,
 }
 
 /// Plan B3 (spec §6.5.2): one in-flight collection for one `(row, instant)` —
@@ -3667,6 +3683,11 @@ struct Consensus {
     /// Ruling R40: the probe thread's seeds, and the generation last merged.
     report_seeds: Arc<ReportSeeds>,
     report_seed_gen_seen: u64,
+    /// Ruling R42: sets this node did not build (fetched store-only, or
+    /// installed by a snapshot session), ascending, at most
+    /// `MAX_CATALOG_SETS` — never seeded, never re-offered. Seeded at boot
+    /// from the `snap-<P>.foreign` markers ([`foreign_markers_in`]).
+    foreign_sets: Vec<u64>,
     /// Ruling R39: when the `above_extent` drop was last logged, per
     /// reporting node — see [`Consensus::note_report_above_extent`].
     above_extent_logged: HashMap<NodeId, u64>,
@@ -5381,6 +5402,10 @@ impl Consensus {
             return false;
         }
         self.adopted_incoming = pos;
+        // Ruling R42: a session-installed set is the leader's freeze, not
+        // this node's — never reported as ours, then or after a restart (the
+        // receiver marked it on disk before the cluster artifact landed).
+        self.note_foreign_set(pos);
         self.cnc
             .snapshots()
             .incoming_snapshot_pos
@@ -6667,6 +6692,8 @@ impl Consensus {
                 self.stored_above_durable = 0;
                 self.snapshot_set_position.store(stored, Ordering::Release);
                 self.note_set_held(stored);
+                // Ruling R42: another node's freeze — never reported as ours.
+                self.note_foreign_set(stored);
                 crate::obs_event!(
                     Info,
                     "snapshot_set_complete",
@@ -6828,6 +6855,27 @@ impl Consensus {
                 .filter(|s| s.n >= full)
                 .map(|s| s.position),
         );
+    }
+
+    /// Ruling R42: record that the set at `p` was not built here (the fetch
+    /// edge, or a snapshot-session install), and tell the probe. Bounded at
+    /// `MAX_CATALOG_SETS`, the lowest evicted — the marker on disk still
+    /// names an evicted set. One lock per such edge, never per pass.
+    #[cold]
+    fn note_foreign_set(&mut self, p: u64) {
+        if let Err(i) = self.foreign_sets.binary_search(&p) {
+            self.foreign_sets.insert(i, p);
+            if self.foreign_sets.len() > MAX_CATALOG_SETS {
+                self.foreign_sets.remove(0);
+            }
+        }
+        self.reported_sets.retain(|s| s.position != p);
+        let mut g = self
+            .report_seeds
+            .inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        g.foreign.clone_from(&self.foreign_sets);
     }
 
     /// [`Self::cache_report_set`]'s insert, without publishing `known`.
@@ -7031,7 +7079,7 @@ impl Consensus {
         let inner = self.cluster_view.snapshot_inner();
         let wanted = |p: u64| only.is_none_or(|o| o.contains(&p));
         if inner.catalog.is_empty() {
-            if newest != 0 && wanted(newest) {
+            if newest != 0 && wanted(newest) && !self.foreign_sets.contains(&newest) {
                 self.reoffer_set(newest);
             }
             return;
@@ -7054,13 +7102,18 @@ impl Consensus {
                 && e.state == SetState::Commanded
                 && e.position > low
                 && self.holdings_held.contains(&e.position)
+                && !self.foreign_sets.contains(&e.position)
                 && wanted(e.position)
             {
                 sets[n] = e.position;
                 n += 1;
             }
         }
-        if newest > low && wanted(newest) && !inner.catalog.iter().any(|e| e.position == newest) {
+        if newest > low
+            && wanted(newest)
+            && !self.foreign_sets.contains(&newest)
+            && !inner.catalog.iter().any(|e| e.position == newest)
+        {
             sets[n] = newest;
             n += 1;
         }
@@ -7515,6 +7568,10 @@ impl Consensus {
     #[cold]
     fn note_report_above_extent(&mut self, from: NodeId, row: u8, position: u64, extent: u64) {
         let now = self.pass_mono_ns;
+        // Review m4, accepted as the crypto-off posture: with wire crypto off
+        // a forged report naming a member's id can spend that member's
+        // throttle and silence its own line for up to the interval. Every
+        // such report is still dropped; only the line is lost.
         let due = self
             .above_extent_logged
             .get(&from)
@@ -7723,6 +7780,12 @@ impl Consensus {
         let (r, e) = prune_snapshot_dir(&self.cluster_snapshot_dir, CLUSTER_SNAP_SUFFIX, p, &keep);
         removed += r;
         errors += e;
+        // Ruling R42: a set's `.foreign` marker goes with its cluster artifact
+        // — the same cut and the same keep list, so a kept set keeps it. Not
+        // counted as a removed artifact: it is zero bytes of bookkeeping.
+        let (_, e) = prune_snapshot_dir(&self.cluster_snapshot_dir, FOREIGN_SET_SUFFIX, p, &keep);
+        errors += e;
+        self.foreign_sets.retain(|f| *f >= p || keep.contains(f));
         // Catalog spec §5.2: every set below the cut that is not kept is
         // gone — or, on a failed unlink, no longer whole — so it is no
         // longer advertised.
@@ -11823,7 +11886,19 @@ struct HoldingsProbe {
 /// the rows its cnc slots happen to name (every thin record in round 2's
 /// proof runs). The I/O is on this thread, never the consensus pass (catalog
 /// rulings R27/R28 kept). Bounded: the newest `MAX_CATALOG_SETS` complete
-/// sets on disk, each attempted once.
+/// sets on disk, newest first, at most [`SEED_ARTIFACTS_PER_PROBE`]
+/// artifacts hashed per probe (review m3); a set hashed in full is never
+/// hashed again, and one whose hashing failed or came out partial is retried
+/// on later probes up to [`SEED_ATTEMPTS`] times, then named once (review m2).
+///
+/// **Only sets this node BUILT** (ruling R42). A set that arrived whole
+/// through a snapshot session — `uc2ctl snapshot fetch`, or a below-floor
+/// install — is another node's freeze, and its hashes posing as this node's
+/// observation would count a copy as an independent builder. Such a set is
+/// skipped when the consensus agent has recorded it ([`ReportSeeds`]'s
+/// `foreign`, this incarnation) or when its `snap-<P>.foreign` marker exists
+/// (the receiver writes it before the set's cluster artifact lands, so it
+/// survives a restart).
 ///
 /// Not bounded by `snapshot_set_position`: after a restart that word starts
 /// at the durable floor, and the sets above it — exactly the ones a new
@@ -11833,6 +11908,15 @@ struct HoldingsProbe {
 /// complete, which keeps the probe from racing a live completion edge (the
 /// edge follows the last artifact's rename by microseconds, the probe runs
 /// once a second) and so from hashing every fresh set a second time.
+/// Review m3: the most artifacts [`ReportSeeder::seed`] hashes on one probe,
+/// so the `Holdings` byte fields the same thread refreshes once a second are
+/// never stale for more than a probe or two after a restart with many held
+/// sets. One whole set is always hashed, however many rows it has.
+const SEED_ARTIFACTS_PER_PROBE: usize = 8;
+/// Review m2: how many probes may try a set whose hashing failed or came out
+/// partial before the seeder names it once and leaves it.
+const SEED_ATTEMPTS: u32 = 3;
+
 struct ReportSeeder {
     cell: Arc<ReportSeeds>,
     rows: Vec<u8>,
@@ -11840,8 +11924,12 @@ struct ReportSeeder {
     cluster_dir: PathBuf,
     /// Complete sets seen on a previous probe and not yet cached.
     sighted: Vec<u64>,
-    /// Sets already hashed (or found unreadable) — never attempted twice.
+    /// Sets hashed in full, or given up on after [`SEED_ATTEMPTS`] — never
+    /// attempted again.
     attempted: Vec<u64>,
+    /// Review m2: sets whose hashing failed or came out partial, with the
+    /// attempts so far.
+    failures: Vec<(u64, u32)>,
     /// Sets seeded (test-visible).
     seeded: u64,
 }
@@ -11860,15 +11948,16 @@ impl ReportSeeder {
             cluster_dir,
             sighted: Vec::with_capacity(MAX_CATALOG_SETS),
             attempted: Vec::with_capacity(MAX_CATALOG_SETS),
+            failures: Vec::new(),
             seeded: 0,
         }
     }
 
     #[cold]
     fn seed(&mut self) {
-        let known = {
+        let (known, foreign) = {
             let g = self.cell.inner.lock().unwrap_or_else(|e| e.into_inner());
-            g.known.clone()
+            (g.known.clone(), g.foreign.clone())
         };
         let Ok(rd) = std::fs::read_dir(&self.cluster_dir) else {
             return;
@@ -11890,10 +11979,22 @@ impl ReportSeeder {
             held.drain(..held.len() - MAX_CATALOG_SETS);
         }
         self.attempted.retain(|p| held.contains(p));
+        self.failures.retain(|(p, _)| held.contains(p));
+        let per_set = self.rows.len() + 1;
+        let mut budget = SEED_ARTIFACTS_PER_PROBE;
+        let mut hashed_any = false;
         let mut out = Vec::new();
-        let mut sighted_now = Vec::with_capacity(MAX_CATALOG_SETS);
-        for &p in &held {
+        let mut sighted_next = Vec::with_capacity(MAX_CATALOG_SETS);
+        // Newest first: a re-offer only ever wants sets the catalog still
+        // lists as Commanded, and those are the newest ones.
+        for &p in held.iter().rev() {
             if known.contains(&p) || self.attempted.contains(&p) {
+                continue;
+            }
+            // Ruling R42: a set this node did not build is never hashed —
+            // this incarnation's fetch/install edges, or the marker the
+            // receiver wrote before the set's cluster artifact landed.
+            if foreign.contains(&p) || foreign_marker_exists(&self.cluster_dir, p) {
                 continue;
             }
             let row_paths: Vec<PathBuf> = self
@@ -11908,11 +12009,16 @@ impl ReportSeeder {
             if !row_paths.iter().all(|f| f.is_file()) {
                 continue; // not a complete set (yet): looked at again next probe
             }
-            if !self.sighted.contains(&p) {
-                sighted_now.push(p); // hashed next probe, if still uncached
+            // Sighted one probe before it is hashed (see the struct doc), and
+            // at most `SEED_ARTIFACTS_PER_PROBE` artifacts hashed per probe
+            // (review m3) — a set over budget stays sighted for the next one.
+            // One whole set always fits, however many rows it has.
+            if !self.sighted.contains(&p) || (budget < per_set && hashed_any) {
+                sighted_next.push(p);
                 continue;
             }
-            self.attempted.push(p);
+            budget = budget.saturating_sub(per_set);
+            hashed_any = true;
             let mut set = ReportedSet {
                 position: p,
                 n: 0,
@@ -11931,11 +12037,42 @@ impl ReportSeeder {
                 set.reports[set.n] = (CLUSTER_ROW, h);
                 set.n += 1;
             }
+            if set.n == per_set {
+                self.attempted.push(p);
+            } else {
+                // Review m2: a failed or partial hash (a transient read
+                // error, retention racing the read, a bad envelope) is tried
+                // again on the next probe — up to SEED_ATTEMPTS times, then
+                // named once and left alone.
+                let tries = match self.failures.iter_mut().find(|(q, _)| *q == p) {
+                    Some((_, t)) => {
+                        *t += 1;
+                        *t
+                    }
+                    None => {
+                        self.failures.push((p, 1));
+                        1
+                    }
+                };
+                if tries >= SEED_ATTEMPTS {
+                    self.attempted.push(p);
+                    crate::obs_event!(
+                        Warn,
+                        "snapshot_report_seed_incomplete",
+                        position = p,
+                        hashed = set.n as u64,
+                        artifacts = per_set as u64,
+                        attempts = tries as u64
+                    );
+                } else {
+                    sighted_next.push(p);
+                }
+            }
             if set.n > 0 {
                 out.push(set);
             }
         }
-        self.sighted = sighted_now;
+        self.sighted = sighted_next;
         if out.is_empty() {
             return;
         }
@@ -11948,6 +12085,36 @@ impl ReportSeeder {
             .extend(out);
         self.cell.generation.fetch_add(1, Ordering::Release);
     }
+}
+
+/// Ruling R42: the positions whose `snap-<P>.foreign` marker exists under
+/// `cluster_dir`, ascending — the sets this node did not build. Read once at
+/// boot; the seeder checks each set's marker per probe
+/// ([`foreign_marker_exists`]).
+fn foreign_markers_in(cluster_dir: &Path) -> Vec<u64> {
+    let Ok(rd) = std::fs::read_dir(cluster_dir) else {
+        return Vec::new();
+    };
+    let mut v: Vec<u64> = rd
+        .flatten()
+        .filter_map(|e| {
+            e.file_name()
+                .to_str()?
+                .strip_prefix(SNAP_PREFIX)?
+                .strip_suffix(FOREIGN_SET_SUFFIX)?
+                .parse::<u64>()
+                .ok()
+        })
+        .collect();
+    v.sort_unstable();
+    v
+}
+
+/// Ruling R42: does the set at `p` carry the "not built here" marker?
+fn foreign_marker_exists(cluster_dir: &Path, p: u64) -> bool {
+    cluster_dir
+        .join(format!("{SNAP_PREFIX}{p}{FOREIGN_SET_SUFFIX}"))
+        .is_file()
 }
 
 /// Ruling R40: a row artifact's hash as the builder computed it — SHA-256 of
@@ -13585,6 +13752,7 @@ mod tests {
             reported_sets: Vec::with_capacity(MAX_CATALOG_SETS),
             report_seeds: Arc::new(ReportSeeds::default()),
             report_seed_gen_seen: 0,
+            foreign_sets: Vec::new(),
             above_extent_logged: HashMap::new(),
             ingress_rx,
             trunc_tx,
@@ -16491,6 +16659,203 @@ mod tests {
             "the probe is told which sets the cache holds IN FULL; a thin one \
              is left for it to hash"
         );
+    }
+
+    /// Ruling R42 test helper: a complete set at `p` on disk, as ANY writer
+    /// leaves it — row 0 through the builder's own store (so it carries the
+    /// `ULTSNAP2` envelope), the cluster artifact as a plain file. Returns
+    /// the row's payload hash.
+    fn write_held_set(h: &Harness, p: u64, payload: &[u8]) -> u64 {
+        let instance_dir = h.cons.snap_root.parent().unwrap().to_path_buf();
+        let (_, hash) = uc_service::snapshots::SnapshotStore::open(&instance_dir, 0)
+            .unwrap()
+            .publish(p, 1, |w| {
+                w.write_all(payload)?;
+                Ok(())
+            })
+            .unwrap();
+        write_cluster_artifact(h, p, payload);
+        hash
+    }
+
+    fn report_seeder_for(h: &Harness) -> ReportSeeder {
+        ReportSeeder::new(
+            Arc::clone(&h.cons.report_seeds),
+            vec![0],
+            h.cons.snap_root.clone(),
+            h.cons.cluster_snapshot_dir.clone(),
+        )
+    }
+
+    /// Ruling R42 (review J1), tests (a) and (c): a set this node did NOT
+    /// build — one it FETCHED (`uc2ctl snapshot fetch`'s store-only edge) —
+    /// is never hashed into the report cache and never re-offered: its bytes
+    /// are another node's freeze, and reporting them under this node's id
+    /// would count a copy as an independent builder. A set this node built,
+    /// sitting beside it, is still seeded and re-offered.
+    #[test]
+    fn a_fetched_set_is_never_seeded_or_re_offered_but_a_built_one_is() {
+        let (sock2, addr2) = report_peer_socket();
+        let mut h = harness_with_rows_and_peers(&["a"], &[(2, addr2)]);
+        let (built, fetched) = (2048u64, 4096u64);
+        let built_hash = write_held_set(&h, built, b"built here");
+        write_held_set(&h, fetched, b"fetched from a learner");
+        h.cons.holdings_held.push(built);
+        // The receiver finished the store-only intake at `fetched`.
+        h.cons.stored_set_pos.store(fetched, Ordering::Release);
+        h.cons.check_set_completeness();
+        assert_eq!(
+            h.cons.snapshot_set_position.load(Ordering::Relaxed),
+            fetched,
+            "precondition: the fetch edge adopted the set"
+        );
+        publish_commanded_catalog(&mut h, &[(built, 1), (fetched, 2)]);
+
+        let mut seeder = report_seeder_for(&h);
+        seeder.seed();
+        seeder.seed();
+        h.cons.cnc.status().leader_hint.store_release(2);
+        h.cons.maybe_reoffer_snapshot_reports();
+        h.cons.maybe_reoffer_snapshot_reports();
+        assert!(
+            !h.cons.reported_sets.iter().any(|s| s.position == fetched),
+            "a fetched set is never in the report cache"
+        );
+        assert_eq!(
+            drain_snap_reports(&sock2),
+            vec![
+                SnapReportBody {
+                    row: 0,
+                    node_id: 1,
+                    position: built,
+                    hash: built_hash,
+                },
+                SnapReportBody {
+                    row: CLUSTER_ROW,
+                    node_id: 1,
+                    position: built,
+                    // The cluster file holds the same bytes as the row payload.
+                    hash: built_hash,
+                },
+            ],
+            "only the set this node built is re-offered, every row of it"
+        );
+    }
+
+    /// Ruling R42 test (b): across a restart nothing in memory remembers that
+    /// a set was fetched or installed, so the zero-byte marker
+    /// `snapshots/cluster/snap-<P>.foreign` the receiver wrote beside it does.
+    /// A fresh incarnation (this harness never saw the fetch edge) whose disk
+    /// holds a complete, marked set seeds nothing for it.
+    #[test]
+    fn a_foreign_marker_excludes_a_set_after_a_restart() {
+        let h = harness_with_rows(&["a"]);
+        let p = 4096u64;
+        write_held_set(&h, p, b"installed by a session");
+        std::fs::write(
+            h.cons
+                .cluster_snapshot_dir
+                .join(format!("snap-{p}.foreign")),
+            b"",
+        )
+        .unwrap();
+        let mut seeder = report_seeder_for(&h);
+        seeder.seed();
+        seeder.seed();
+        assert_eq!(seeder.seeded, 0, "a marked set is never hashed");
+        assert_eq!(
+            foreign_markers_in(&h.cons.cluster_snapshot_dir),
+            vec![p],
+            "and the boot scan that seeds `foreign_sets` finds it"
+        );
+    }
+
+    /// Ruling R42 test (d): the pruner removes a set's marker with its cluster
+    /// artifact, and keeps the marker of a set it keeps.
+    #[test]
+    fn pruning_a_set_removes_its_foreign_marker() {
+        let mut h = harness_with_rows(&["a"]);
+        let (p1, p2) = (2048u64, 4096u64);
+        for p in [p1, p2] {
+            write_held_set(&h, p, b"x");
+            std::fs::write(
+                h.cons
+                    .cluster_snapshot_dir
+                    .join(format!("snap-{p}.foreign")),
+                b"",
+            )
+            .unwrap();
+        }
+        h.cons.prune_snapshots_below(p2);
+        let dir = &h.cons.cluster_snapshot_dir;
+        assert!(!dir.join(format!("snap-{p1}.ultcluster")).exists());
+        assert!(
+            !dir.join(format!("snap-{p1}.foreign")).exists(),
+            "the marker goes with its artifact"
+        );
+        assert!(
+            dir.join(format!("snap-{p2}.foreign")).exists(),
+            "a kept set keeps it"
+        );
+    }
+
+    /// Review m3: at most `SEED_ARTIFACTS_PER_PROBE` artifacts are hashed per
+    /// probe, so a restart with many held sets drains over successive probes
+    /// and the holdings advert the same thread refreshes is never stale for
+    /// long. Ten one-row sets (two artifacts each) take three probes after
+    /// the sighting one.
+    #[test]
+    fn a_backlog_of_held_sets_drains_over_successive_probes() {
+        let h = harness_with_rows(&["a"]);
+        for i in 1..=10u64 {
+            write_held_set(&h, i * 1000, b"backlog");
+        }
+        let mut seeder = report_seeder_for(&h);
+        seeder.seed(); // sighting
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            seeder.seed();
+            seen.push(seeder.seeded);
+        }
+        assert_eq!(seen, vec![4, 8, 10, 10], "eight artifacts per probe");
+    }
+
+    /// Review m2: a set whose hashing came out PARTIAL is tried again on the
+    /// next probe rather than abandoned — here a row artifact unreadable on
+    /// the first try (its envelope names another position) and repaired
+    /// before the second.
+    #[test]
+    fn a_partially_hashed_set_is_retried_on_the_next_probe() {
+        let mut h = harness_with_rows(&["a"]);
+        let p = 4096u64;
+        let good = write_held_set(&h, p, b"good bytes");
+        let row = h.cons.snap_root.join("0").join(format!("snap-{p}.ultsnap"));
+        let original = std::fs::read(&row).unwrap();
+        let mut bad = original.clone();
+        bad[8] ^= 0xFF; // the envelope's position no longer names P
+        std::fs::write(&row, &bad).unwrap();
+        let mut seeder = report_seeder_for(&h);
+        seeder.seed(); // sighting
+        seeder.seed(); // partial: the cluster row only
+        h.cons.maybe_reoffer_snapshot_reports();
+        let e = *h
+            .cons
+            .reported_sets
+            .iter()
+            .find(|s| s.position == p)
+            .unwrap();
+        assert_eq!(e.n, 1, "precondition: partial");
+        std::fs::write(&row, &original).unwrap();
+        seeder.seed();
+        h.cons.maybe_reoffer_snapshot_reports();
+        let e = *h
+            .cons
+            .reported_sets
+            .iter()
+            .find(|s| s.position == p)
+            .unwrap();
+        assert_eq!(e.n, 2, "retried on the next probe and now full");
+        assert_eq!(e.reports[0], (0, good));
     }
 
     /// Spec §4.4: the record is a `CLUSTER` command like any other, so it
@@ -21622,6 +21987,35 @@ mod tests {
             h.cons.cnc.config_pending(),
             0,
             "the fiat install itself must clear the pending mirror"
+        );
+    }
+
+    /// Ruling R42, the install edge: a set a snapshot session installed is
+    /// the leader's freeze, so the fiat install records it as foreign — in
+    /// the consensus agent's list (the re-offer's skip) and in the seed cell
+    /// (the probe's skip).
+    #[test]
+    fn a_session_installed_set_is_recorded_as_foreign() {
+        let mut h = harness();
+        let v1 = v1_of(&h);
+        let floor = 1u64 << 20;
+        install_cluster_artifact_for_test(&mut h, floor, &v1);
+        h.cons.incoming_cluster_pos.store(floor, Ordering::Release);
+        h.cons.incoming_snapshot.store(floor, Ordering::Release);
+        h.cons.do_work();
+        assert!(
+            h.cons.foreign_sets.contains(&floor),
+            "the re-offer skips it"
+        );
+        assert!(
+            h.cons
+                .report_seeds
+                .inner
+                .lock()
+                .unwrap()
+                .foreign
+                .contains(&floor),
+            "and so does the probe"
         );
     }
 

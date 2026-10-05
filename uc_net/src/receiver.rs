@@ -1224,6 +1224,29 @@ fn discard_snap_parts(parts: Vec<SnapPart>) {
     }
 }
 
+/// Ruling R42: the zero-byte `snap-<P>.foreign` marker beside a session's
+/// cluster artifact `snap-<P>.ultcluster` (`final_path`), made durable — the
+/// directory is fsync'd — before the caller renames the artifact into place.
+/// A marker already present (a retried rename) is left as it is.
+fn write_foreign_marker(final_path: &Path) -> std::io::Result<()> {
+    let dir = final_path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("cluster artifact has no directory"))?;
+    let stem = final_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .and_then(|n| n.strip_suffix(".ultcluster"))
+        .ok_or_else(|| std::io::Error::other("not a cluster artifact name"))?;
+    let marker = dir.join(format!(
+        "{stem}{}",
+        uc_protocol::v2::catalog::FOREIGN_SET_SUFFIX
+    ));
+    if !marker.exists() {
+        std::fs::File::create(&marker)?.sync_all()?;
+    }
+    std::fs::File::open(dir)?.sync_all()
+}
+
 /// M14c: open the `.part` for one announced artifact under `<root>/<id>/`. Free
 /// function so it borrows neither the receiver nor the intake.
 ///
@@ -2839,6 +2862,22 @@ impl FollowerReceiver {
                     return;
                 }
                 drop(file);
+            }
+            // Ruling R42: the CLUSTER artifact is the one file every set has,
+            // and the node's report seeder needs the complete set including
+            // it — so marking it here, durably and BEFORE its rename, leaves
+            // no moment at which this session's set is complete on disk but
+            // unmarked. The marker says "not built here": a node never
+            // reports a session-delivered (fetched or installed) set's
+            // hashes as its own observation. Idempotent on the retry.
+            if intake.parts[k].service_id == CLUSTER_ARTIFACT_ID
+                && write_foreign_marker(&intake.parts[k].final_path).is_err()
+            {
+                intake.last_publish_try_ns = Some(now);
+                self.stats
+                    .snap_intake_io_failures
+                    .fetch_add(1, Ordering::Relaxed);
+                return;
             }
             if std::fs::rename(&intake.parts[k].part_path, &intake.parts[k].final_path).is_err() {
                 intake.last_publish_try_ns = Some(now);
@@ -6804,6 +6843,14 @@ mod tests {
             landed.is_file(),
             "it lands under snapshots/cluster/ — the same path the node's own \
              uc2-cluster agent writes and recovers from, not a 255/ directory"
+        );
+        assert!(
+            dir.path()
+                .join("cluster")
+                .join("snap-4096.foreign")
+                .is_file(),
+            "ruling R42: a session-delivered set is marked 'not built here', \
+             written before the cluster artifact's rename"
         );
         assert_eq!(
             rx.try_recv().expect("the artifact is routed to the agent"),

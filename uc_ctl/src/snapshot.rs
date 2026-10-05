@@ -271,6 +271,21 @@ mod tests {
         assert_eq!(newest_str(&positions), "8192");
     }
 
+    /// Ruling R42: the cluster family's `snap-<P>.foreign` marker is not an
+    /// artifact — the listing ignores it rather than counting (or refusing)
+    /// it.
+    #[test]
+    fn positions_in_ignores_a_foreign_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("snap-4096.ultcluster"), b"x").unwrap();
+        std::fs::write(dir.path().join("snap-4096.foreign"), b"").unwrap();
+        std::fs::write(dir.path().join("snap-8192.foreign"), b"").unwrap();
+        assert_eq!(
+            positions_in(dir.path(), ".ultcluster"),
+            HashSet::from([4096])
+        );
+    }
+
     #[test]
     fn positions_in_is_empty_for_a_missing_directory() {
         let positions = positions_in(Path::new("/nonexistent/does/not/exist"), ".ultsnap");
