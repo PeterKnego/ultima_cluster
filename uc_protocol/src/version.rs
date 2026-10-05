@@ -84,11 +84,15 @@ impl ProtocolVersion {
 // 0.10.0 (#33): `CLUSTER` kind 6 `RowGenesis`; a 0.9.0 peer refuses it as
 // undecodable and diverges silently — flag day.
 // 0.11.0 (snapshot catalog): STATUS body 16 B → 144 B (layout word 2 in the
-// old reserved slot; a 0.10.0 body reads as `None`), SNAP_REPORT/report row
-// 255 = the cluster artifact, Settings v3 `retain_sets`, cluster image v4.
-// No layout change on the replication path — which is exactly why mixing is
-// unsound: a 0.10.0 peer drops the row-255 report as undecodable and its
-// catalog never completes a set, in silence.
+// old reserved slot), SNAP_REPORT/report row 255 = the cluster artifact,
+// Settings v3 `retain_sets`, cluster image v4. No layout change on the
+// replication path, and no wire-version word on node↔node datagrams — so
+// nothing refuses a 0.10.0 peer by name, and mixing is unsound both ways: a
+// 0.11.0 leader DROPS a 0.10.0 follower's 16 B STATUS (counted,
+// `statuses_refused` / `status_refused`), so that follower's flow-control
+// window never opens and replication to it stalls; a 0.10.0 leader accepts a
+// 144 B body and ignores the tail; and a 0.10.0 peer drops the row-255 report
+// as undecodable, so its catalog never completes a set, in silence.
 pub const CURRENT: ProtocolVersion = ProtocolVersion::new(0, 11, 0);
 pub const MIN_COMPATIBLE: ProtocolVersion = ProtocolVersion::new(0, 1, 0);
 

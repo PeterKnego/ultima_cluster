@@ -1013,9 +1013,14 @@ newer one lands, and the purge floor follows the newest set the cluster
 (`uc_protocol::v2::datagram::STATUS_BODY_LEN`): every node now advertises
 what it holds — its journal span, which catalogued sets it has complete on
 disk, applied positions per row, and free/journal/snapshot byte counts
-(`Holdings`). A `0.10.0` peer's 16-byte body is refused by length before a
-`0.11.0` node ever tries to read the new fields, so a mixed cluster stalls
-rather than misreads. `SNAP_REPORT`/`SnapshotReport` (`CLUSTER` kind 5)
+(`Holdings`). There is no wire-version word on node↔node datagrams, so
+nothing refuses a `0.10.0` peer by name: a `0.11.0` leader **drops** a
+`0.10.0` follower's 16-byte `STATUS` (counted as
+`uc2_status_refused_total` and named on stderr as `status_refused`), so
+that follower's flow-control window never opens and replication to it
+stalls; a `0.10.0` leader accepts a `0.11.0` follower's 144-byte body and
+ignores the tail. Mixing is unsound in both directions, and this procedure
+forbids it. `SNAP_REPORT`/`SnapshotReport` (`CLUSTER` kind 5)
 admits row `255`: the cluster artifact's own hash now joins the per-row
 completeness report, closing the "the cluster FSM's own artifact has no
 determinism check" gap. The replicated `Settings` record grows one field,

@@ -294,7 +294,7 @@ the artifact alone is not enough.
 | Surface | Change |
 |---|---|
 | `SNAP_REPORT` (pairwise 26) / `SnapshotReport` (CLUSTER kind 5) | row `255` admitted, carrying the cluster artifact's hash |
-| `STATUS` body (kind 4) | 16 B → the §5.1 fields; a `0.10.0` peer's 16 B body is refused by name |
+| `STATUS` body (kind 4) | 16 B → the §5.1 fields; a `0.11.0` leader drops a `0.10.0` follower's 16 B body (counted, `status_refused` — corrected by R30; there is no wire version to refuse it by name) |
 | `Settings` (CLUSTER kind 3) | `+ retain_sets: u16`, refused at the door when `0` (47) |
 | cluster artifact (`snapshots/cluster/*.ultcluster`) | `ClusterState` gains `Catalog`; `CLUSTER_IMAGE_VERSION` 3 → 4 with a trailing catalog blob. The image codec already reads every older version with the missing trailing blobs empty (`cluster_image.rs:186`), so a v3 artifact loads with an **empty catalog** — the `Empty` state of §4.5 — and **no wipe is needed**. A v4 artifact is refused by a v3 reader, as every newer layout is today |
 | `CLUSTER` kind `7` | **reserved** for project 3's backup watermark; refused as unknown until then |
@@ -303,8 +303,13 @@ Wire `0.10.0` → `0.11.0`, cnc unchanged (the catalog is not on the page;
 `Empty` and the gauges go through `/metrics`). Stop every node, start every
 node, as for every flag day; nothing on disk is cleared. `read_status_body`
 today accepts any body of at least 16 B (`datagram.rs:892`), so the new body
-gets its own length floor; a `0.10.0` peer is refused by the wire version
-before its `STATUS` is ever parsed.
+gets its own length floor. (Corrected by R30: there is no wire-version
+word on node↔node datagrams, so a `0.10.0` peer is not refused by the wire
+version. A `0.11.0` leader DROPS a `0.10.0` follower's 16 B `STATUS`
+(counted, `status_refused`), so that follower's flow-control window never
+opens and replication to it stalls; a `0.10.0` leader accepts a 144 B body
+and ignores the tail — mixing is unsound in both directions and the
+procedure forbids it.)
 
 ## 8. Error handling
 
@@ -687,3 +692,17 @@ before its `STATUS` is ever parsed.
   pins plus commanded headroom exceeded the 64-entry list and
   `cap_catalog` would evict a retained agreed set. Cost: an operator who
   wanted 49–56 retained sets (none exist before the backup tier).
+- **R30 — mixed-version `STATUS` is DROPPED and counted, not "refused by
+  name" (final fix wave, M3).** §7 and the release docs said a `0.10.0`
+  peer is "refused by name / by the wire version". No wire-version word
+  rides node↔node datagrams: `read_status_body` refuses a body without the
+  layout-2 word, and the receiver silently dropped it. As built: the
+  receiver counts every such body (`FollowerStats::statuses_refused`,
+  exported as `uc2_status_refused_total`) and names the source on stderr
+  as `status_refused` at most once a minute per source (the
+  `note_cleartext_peer` throttle shape; `uc_net` has no `uc_obs`
+  dependency). The truthful statement, now in §7 and every doc that made
+  the claim: a `0.11.0` leader drops a `0.10.0` follower's 16 B `STATUS`, so
+  that follower's flow-control window never opens and replication to it
+  stalls; a `0.10.0` leader accepts a 144 B body and ignores the tail —
+  mixing is unsound both ways and the procedure forbids it.

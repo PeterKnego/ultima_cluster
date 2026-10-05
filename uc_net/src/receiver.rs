@@ -449,6 +449,14 @@ impl FollowerConfig {
 /// every occurrence; only the log line is throttled.
 const CLEARTEXT_LOG_INTERVAL_NS: u64 = 30_000_000_000; // 30s
 
+/// Catalog ruling R30: minimum spacing between `note_status_refused`'s
+/// `status_refused` line for the SAME source — the counter still increments
+/// on every refused body.
+const STATUS_REFUSED_LOG_INTERVAL_NS: u64 = 60_000_000_000; // 60s
+/// The most sources `note_status_refused` remembers before it forgets them
+/// all (a throttle table, not a peer list).
+const STATUS_REFUSED_LOG_MAX_PEERS: usize = 64;
+
 /// M14c2 (T10a): an inbound snapshot intake that has seen no chunk for this
 /// long is abandoned — its pre-sized `.part` files unlinked and the
 /// abandonment counted ([`FollowerStats::snap_intake_abandoned`]).
@@ -735,6 +743,14 @@ pub struct FollowerStats {
     /// carrying `layout != SNAP_BEGIN_LAYOUT_V4`), which
     /// `snap_refused_legacy_peer` deliberately folds together.
     pub snap_begin_undecodable: AtomicU64,
+    /// Catalog ruling R30: inbound `STATUS` datagrams (leader role) whose
+    /// body `read_status_body` refused — in practice a `0.10.0` follower's
+    /// 16-byte body, which a `0.11.0` leader cannot read. There is no
+    /// wire-version word on node↔node datagrams, so this counter (and the
+    /// rate-limited `status_refused` stderr line beside it) is the only
+    /// witness: the follower's flow-control window never opens and
+    /// replication to it stalls. Counted per datagram, not per peer.
+    pub statuses_refused: AtomicU64,
     /// Coordinated-snapshot spec §5.7 item 5: a node-requested fetch dropped
     /// because a snapshot transfer was already in flight here. Not an error —
     /// the operator's verb is re-runnable — but it is why an accepted
@@ -1152,6 +1168,9 @@ pub struct FollowerReceiver {
     /// grown into an unbounded-memory vector by a flood of forged source
     /// addresses.
     cleartext_peer_log: HashMap<SocketAddr, u64>,
+    /// Catalog ruling R30: per-source last `status_refused` line, for the
+    /// throttle in `note_status_refused`.
+    status_refused_log: HashMap<SocketAddr, u64>,
     /// Jumbo spec §5.1: the discovery ledger (acks land here; probes are
     /// answered with `own_min_rung` from here). `None` = harness receiver.
     probe: Option<Arc<ProbeTable>>,
@@ -1359,6 +1378,7 @@ impl FollowerReceiver {
             peer_ids_src,
             hs_route,
             cleartext_peer_log: HashMap::new(),
+            status_refused_log: HashMap::new(),
             probe: None,
             last_wire_len: 0,
         }
@@ -1862,6 +1882,36 @@ impl FollowerReceiver {
         }
     }
 
+    /// Catalog ruling R30: a `STATUS` body this leader cannot read — in
+    /// practice a `0.10.0` follower's 16-byte body. Dropped (there is no
+    /// wire-version word on node↔node datagrams to refuse it by), counted in
+    /// [`FollowerStats::statuses_refused`] on every occurrence, and named on
+    /// stderr at most once per [`STATUS_REFUSED_LOG_INTERVAL_NS`] per source
+    /// — the same per-peer throttle `note_cleartext_peer` uses.
+    #[cold]
+    fn note_status_refused(&mut self, from: SocketAddr, len: usize) {
+        self.stats.statuses_refused.fetch_add(1, Ordering::Relaxed);
+        let now = self.now_ns();
+        let due = self
+            .status_refused_log
+            .get(&from)
+            .is_none_or(|&last| now.saturating_sub(last) >= STATUS_REFUSED_LOG_INTERVAL_NS);
+        if due {
+            // Bounded: a cleartext cluster admits any source address, so the
+            // map is reset rather than allowed to grow without limit.
+            if self.status_refused_log.len() >= STATUS_REFUSED_LOG_MAX_PEERS {
+                self.status_refused_log.clear();
+            }
+            self.status_refused_log.insert(from, now);
+            eprintln!(
+                "uc_net: status_refused: STATUS from {from} has a {len}-byte body this node cannot \
+                 read (wire 0.11.0 expects {STATUS_BODY_LEN}) -- almost certainly a wire 0.10.0 \
+                 follower; its flow-control window never opens and replication to it stalls. \
+                 Upgrade every node together (the node<->node wire is a flag day)"
+            );
+        }
+    }
+
     /// Forwards a handshake-plane datagram (kind 18/19/20) to
     /// [`CryptoIntake::handshake`]'s channel, if crypto is on.
     /// Drops and counts (`dropped_handshake`) otherwise — no route, or a
@@ -2207,16 +2257,18 @@ impl FollowerReceiver {
                 // Leader role (M4): a follower's flow-window advert, demuxed to
                 // our sender's quorum pacing.
                 let body = &d[DATAGRAM_HEADER_LEN..];
-                if body.len() >= STATUS_BODY_LEN
-                    && let Some(route) = &self.sender_route
-                    && let Some(b) = read_status_body(body)
-                {
-                    let _ = route.try_send(CtrlMsg::Status {
-                        from,
-                        contiguous: b.contiguous_position,
-                        window: b.receive_window,
-                        holdings: b.holdings,
-                    });
+                match read_status_body(body).filter(|_| body.len() >= STATUS_BODY_LEN) {
+                    Some(b) => {
+                        if let Some(route) = &self.sender_route {
+                            let _ = route.try_send(CtrlMsg::Status {
+                                from,
+                                contiguous: b.contiguous_position,
+                                window: b.receive_window,
+                                holdings: b.holdings,
+                            });
+                        }
+                    }
+                    None => self.note_status_refused(from, body.len()),
                 }
             }
             // M6 Task 6 — INBOUND snapshot transfer (this node is the receiver:
@@ -4853,6 +4905,58 @@ mod tests {
             "straddling prime clobbered by the stale frontier"
         );
         assert_eq!(prime_gen.load(Relaxed), 1);
+    }
+
+    /// Catalog ruling R30 (M3): a `0.10.0` follower's 16-byte `STATUS` body
+    /// is DROPPED by a `0.11.0` leader — there is no wire-version word on
+    /// node↔node datagrams to refuse it "by name" — so the drop is counted
+    /// (`statuses_refused`) and named on stderr, rate-limited per source. A
+    /// well-formed body is never counted.
+    #[test]
+    fn a_short_status_body_is_dropped_and_counted() {
+        use Ordering::Relaxed;
+        let b = buffer();
+        let mut peer = FakeLeader::new();
+        let mut r = follower(&b, peer.addr());
+        let (tx, rx) = mpsc::sync_channel::<CtrlMsg>(16);
+        r.set_sender_route(tx);
+        let to = r.local_addr();
+        let st = r.stats();
+        // The pre-0.11.0 body: contiguous_position u64 ‖ receive_window u64.
+        let mut old = [0u8; 16];
+        old[0..8].copy_from_slice(&4096u64.to_le_bytes());
+        old[8..16].copy_from_slice(&(1u64 << 20).to_le_bytes());
+        peer.send(to, DGRAM_KIND_STATUS, 0, TERM, &old);
+        peer.send(to, DGRAM_KIND_STATUS, 0, TERM, &old);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while st.statuses_refused.load(Relaxed) < 2 {
+            assert!(Instant::now() < deadline, "short STATUS never counted");
+            r.do_work();
+        }
+        assert!(
+            !matches!(rx.try_recv(), Ok(CtrlMsg::Status { .. })),
+            "a short STATUS must never reach the sender's pacing"
+        );
+        // A well-formed 0.11.0 body is demuxed and not counted.
+        let mut sb = [0u8; STATUS_BODY_LEN];
+        write_status_body(
+            &mut sb,
+            &StatusBody {
+                contiguous_position: 8192,
+                receive_window: 1 << 20,
+                holdings: Holdings::default(),
+            },
+        );
+        peer.send(to, DGRAM_KIND_STATUS, 0, TERM, &sb);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            assert!(Instant::now() < deadline, "good STATUS never demuxed");
+            r.do_work();
+            if matches!(rx.try_recv(), Ok(CtrlMsg::Status { .. })) {
+                break;
+            }
+        }
+        assert_eq!(st.statuses_refused.load(Relaxed), 2);
     }
 
     /// Leader-role node composition (M4): the unified `FollowerReceiver` with a

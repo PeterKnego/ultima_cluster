@@ -945,8 +945,10 @@ pub fn write_status_body(buf: &mut [u8], b: &StatusBody) {
 
 /// Decode a status body, or `None` unless `buf.len() >= `[`STATUS_BODY_LEN`]
 /// **and** the layout word at offset 12 is [`STATUS_LAYOUT_V2`] — which is
-/// how a 0.10.0 peer's 16-byte body (reserved word zero) is refused rather
-/// than silently misparsed. The receiver still guards the length before
+/// how a 0.10.0 peer's 16-byte body (reserved word zero) is dropped rather
+/// than silently misparsed (the receiver counts the drop as
+/// `statuses_refused`, catalog ruling R30 — there is no wire-version word to
+/// refuse it by name). The receiver still guards the length before
 /// calling (belt and braces); the reader is total so that no datagram,
 /// however truncated, can panic a node.
 pub fn read_status_body(buf: &[u8]) -> Option<StatusBody> {

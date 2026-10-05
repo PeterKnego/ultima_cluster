@@ -155,6 +155,8 @@ pub const CONTRACT_SERIES: &[&str] = &[
     "uc2_snapshot_open_failed_total",
     "uc2_snapshot_intake_abandoned_total",
     "uc2_snapshot_begin_undecodable_total",
+    // Catalog ruling R30: the mixed-version STATUS witness.
+    "uc2_status_refused_total",
     "uc2_reports_implausible_total",
     "uc_crypto_handshake_failures_total",
     "uc2_sender_seal_failures_total",
@@ -1458,6 +1460,12 @@ pub fn render_prometheus(s: &ObsSources) -> String {
     );
     push_counter(
         &mut out,
+        "uc2_status_refused_total",
+        "Inbound STATUS datagrams (leader role) whose body this node could not read — in practice a wire-0.10.0 follower's 16-byte body under a 0.11.0 leader (catalog ruling R30). Dropped, so that follower's flow-control window never opens and replication to it stalls. There is no wire-version word on node-to-node datagrams; this counter is the witness. Nonzero means the fleet is mixed-version; upgrade every node together.",
+        s.receiver.statuses_refused.load(Ordering::Relaxed),
+    );
+    push_counter(
+        &mut out,
         "uc2_reports_implausible_total",
         "Durable reports declined for disagreeing with this node's term map.",
         s.reports_implausible.load(Ordering::Relaxed),
@@ -2035,7 +2043,7 @@ mod tests {
     fn the_contract_has_the_number_of_families_the_docs_state() {
         assert_eq!(
             CONTRACT_SERIES.len(),
-            121,
+            122,
             "if this is intentional, update the family count in \
              docs/how-to/monitor-a-cluster.md in the same commit"
         );
@@ -2731,6 +2739,16 @@ mod tests {
             text.contains("uc2_snapshot_begin_undecodable_total 7\n"),
             "{text}"
         );
+    }
+
+    /// Catalog ruling R30: `uc2_status_refused_total` is wired to the
+    /// receiver's own `statuses_refused` cell.
+    #[test]
+    fn the_status_refused_counter_renders_from_its_stats_cell() {
+        let s = synthetic_sources();
+        s.receiver.statuses_refused.fetch_add(9, Ordering::Relaxed);
+        let text = render_prometheus(&s);
+        assert!(text.contains("uc2_status_refused_total 9\n"), "{text}");
     }
 
     #[test]

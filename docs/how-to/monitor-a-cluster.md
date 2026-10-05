@@ -67,7 +67,7 @@ scrape_configs:
 ```
 
 `/metrics` serves `text/plain; version=0.0.4` — standard Prometheus text
-exposition. The full series contract — 121 families — is the
+exposition. The full series contract — 122 families — is the
 `CONTRACT_SERIES` array in
 [`uc_node/src/obs/metrics.rs`](../../uc_node/src/obs/metrics.rs); a test
 pins every family in that array against what the renderer actually emits, so
@@ -88,6 +88,15 @@ joiner not converging?", and they split it cleanly between the two ends:
 | `uc2_snapshot_open_failed_total` | leader | this node could not open an artifact its own snapshot store had just listed, so it refused to ship the set. A one-off is a purge racing a session; a persistent count means look at *this* node's snapshot directory while a peer is trying to join. |
 | `uc2_snapshot_begin_undecodable_total` | joiner | one refused session per count, because the sender's `SNAP_BEGIN` could not be decoded at all — the realistic wire-0.5.0 flag-day shape. Nonzero means the fleet is mixed-version; upgrade every node together. |
 | `uc2_snapshot_refused_legacy_peer_total` | joiner | every such datagram, not every session — the leader re-sends a `SNAP_BEGIN` every 20 ms, so this one measures the resend cadence. Read the row above it for "how many sessions". |
+
+One more mixed-version witness, outside the snapshot session:
+`uc2_status_refused_total` (the snapshot catalog, `0.11.0`, unreleased)
+counts `STATUS` datagrams a leader could not read — in practice a
+wire-`0.10.0` follower's 16-byte body under a `0.11.0` leader. They are
+dropped, so that follower's flow-control window never opens and replication
+to it stalls; each source is also named on stderr as `status_refused`, at
+most once a minute. Nonzero means the fleet is mixed-version: upgrade every
+node together.
 
 Two families worth calling out because their shape is easy to misread:
 `uc2_ingress_holes_skipped_total` and `uc2_query_holes_skipped_total`

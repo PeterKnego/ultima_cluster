@@ -372,8 +372,11 @@ the shmem page, only on the cluster artifact and `/metrics`.
 
 **Wire `0.11.0`.** `STATUS`'s body grows from 16 B to 144 B, carrying a
 per-node `Holdings` advertisement (journal span, catalogued sets held,
-per-row applied, byte counts); a `0.10.0` peer's 16 B body is refused by
-length. `SNAP_REPORT`/`SnapshotReport` (`CLUSTER` kind 5) admits row `255`
+per-row applied, byte counts). No wire-version word rides node↔node
+datagrams: a `0.11.0` leader drops a `0.10.0` follower's 16 B body
+(counted, `uc2_status_refused_total`), so replication to that follower
+stalls, while a `0.10.0` leader accepts a 144 B body and ignores the tail
+— unsound both ways. `SNAP_REPORT`/`SnapshotReport` (`CLUSTER` kind 5) admits row `255`
 — the cluster artifact's own hash, closing the gap recorded on the backlog
 since plan B3. `Settings` grows to encoding version 3 (35 B), adding
 `retain_sets: u16`; a version-1 or version-2 record is still accepted on
