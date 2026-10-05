@@ -1880,13 +1880,7 @@ impl Node {
         // Ruling R42: the sets this node did not build, as the markers on
         // disk say — the only memory of a fetch or install that survives a
         // restart. Read once, here, at boot.
-        let foreign_at_boot = foreign_markers_in(&instance.cluster_snapshot_dir());
-        report_seeds
-            .inner
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .foreign
-            .clone_from(&foreign_at_boot);
+        let foreign_at_boot = boot_foreign_sets(&instance.cluster_snapshot_dir(), &report_seeds);
         // M8 (Task 12): the receive half, the sender-identity map, and the
         // handshake route travel together in one `CryptoIntake` — forgetting
         // any of the three is a compile error, not a silent cluster-wide
@@ -6869,7 +6863,11 @@ impl Consensus {
                 self.foreign_sets.remove(0);
             }
         }
+        let before = self.reported_sets.len();
         self.reported_sets.retain(|s| s.position != p);
+        if self.reported_sets.len() != before {
+            self.publish_known_report_sets();
+        }
         let mut g = self
             .report_seeds
             .inner
@@ -11897,7 +11895,7 @@ struct HoldingsProbe {
 /// observation would count a copy as an independent builder. Such a set is
 /// skipped when the consensus agent has recorded it ([`ReportSeeds`]'s
 /// `foreign`, this incarnation) or when its `snap-<P>.foreign` marker exists
-/// (the receiver writes it before the set's cluster artifact lands, so it
+/// (the receiver writes it before any of the session's artifacts lands, so it
 /// survives a restart).
 ///
 /// Not bounded by `snapshot_set_position`: after a restart that word starts
@@ -12108,6 +12106,22 @@ fn foreign_markers_in(cluster_dir: &Path) -> Vec<u64> {
         .collect();
     v.sort_unstable();
     v
+}
+
+/// Ruling R42, the boot hand-off: the sets the markers under `cluster_dir`
+/// name as not built here, published into the probe's seed cell and returned
+/// for `Consensus::foreign_sets`. The one place a restarted node learns which
+/// of the sets on its disk are copies — so both halves (the seeder and the
+/// re-offer) start the incarnation knowing them.
+fn boot_foreign_sets(cluster_dir: &Path, seeds: &ReportSeeds) -> Vec<u64> {
+    let foreign = foreign_markers_in(cluster_dir);
+    seeds
+        .inner
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .foreign
+        .clone_from(&foreign);
+    foreign
 }
 
 /// Ruling R42: does the set at `p` carry the "not built here" marker?
@@ -16856,6 +16870,73 @@ mod tests {
             .unwrap();
         assert_eq!(e.n, 2, "retried on the next probe and now full");
         assert_eq!(e.reports[0], (0, good));
+    }
+
+    /// Ruling R42, review m-D: marking a set foreign evicts any report the
+    /// cache already held for it — an entry made before the fetch edge fired
+    /// must not outlive the knowledge that the set is a copy.
+    #[test]
+    fn marking_a_set_foreign_evicts_its_cached_report() {
+        let mut h = harness_with_rows(&["a"]);
+        let p = 4096u64;
+        h.cons
+            .cache_report_set(p, &[(0, 0x01), (CLUSTER_ROW, 0x02)]);
+        assert!(h.cons.reported_sets.iter().any(|s| s.position == p));
+        h.cons.stored_set_pos.store(p, Ordering::Release);
+        h.cons.check_set_completeness(); // the fetch edge
+        assert!(
+            !h.cons.reported_sets.iter().any(|s| s.position == p),
+            "the cached report for a set now known to be foreign is gone"
+        );
+        assert!(
+            !h.cons.report_seeds.inner.lock().unwrap().known.contains(&p),
+            "and the probe is not told it is cached"
+        );
+    }
+
+    /// Ruling R42, review m-D: the re-offer half of the restart path. A new
+    /// incarnation learns its foreign sets from the markers on disk through
+    /// the same boot hand-off `Node::start` runs ([`boot_foreign_sets`]);
+    /// a held, Commanded set marked foreign is then never re-offered, even
+    /// with a cached report for it.
+    #[test]
+    fn after_a_restart_the_re_offer_skips_a_marked_set() {
+        let (sock2, addr2) = report_peer_socket();
+        let mut h = harness_with_rows_and_peers(&["a"], &[(2, addr2)]);
+        let p = 4096u64;
+        write_held_set(&h, p, b"installed by a session");
+        std::fs::write(
+            h.cons
+                .cluster_snapshot_dir
+                .join(format!("snap-{p}.foreign")),
+            b"",
+        )
+        .unwrap();
+        // The restart: the boot hand-off over this instance dir.
+        h.cons.foreign_sets = boot_foreign_sets(&h.cons.cluster_snapshot_dir, &h.cons.report_seeds);
+        assert_eq!(h.cons.foreign_sets, vec![p]);
+        // Everything else would offer it: cached, held, Commanded, newest.
+        h.cons
+            .cache_report_set(p, &[(0, 0x01), (CLUSTER_ROW, 0x02)]);
+        h.cons.holdings_held.push(p);
+        publish_commanded_catalog(&mut h, &[(p, 1)]);
+        h.cons.snapshot_set_position.store(p, Ordering::Release);
+        h.cons.cnc.status().leader_hint.store_release(2);
+        h.cons.maybe_reoffer_snapshot_reports();
+        assert!(
+            drain_snap_reports(&sock2).is_empty(),
+            "a marked set is never re-offered after a restart"
+        );
+        assert!(
+            h.cons
+                .report_seeds
+                .inner
+                .lock()
+                .unwrap()
+                .foreign
+                .contains(&p),
+            "and the probe learned it at boot too"
+        );
     }
 
     /// Spec §4.4: the record is a `CLUSTER` command like any other, so it

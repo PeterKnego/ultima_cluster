@@ -29,8 +29,9 @@ pub use super::upgrade::{CLUSTER_ROW, is_report_row};
 /// `snapshots/cluster/snap-<P>.foreign` that says the set at `P` was NOT
 /// built on this node — it arrived whole through a snapshot session (a
 /// below-floor install, or `uc2ctl snapshot fetch`). The receiver writes it
-/// (and makes it durable) BEFORE it renames the session's cluster artifact
-/// into place, so a complete set is never unmarked; the node's retention
+/// (and makes it durable) BEFORE it renames ANY of the session's artifacts
+/// into place, so neither a complete set nor an aborted session's row copy is
+/// ever unmarked; the node's retention
 /// removes it with that artifact. A node never reports a marked set's hashes
 /// as its own observation: a copy is not an independent builder.
 pub const FOREIGN_SET_SUFFIX: &str = ".foreign";

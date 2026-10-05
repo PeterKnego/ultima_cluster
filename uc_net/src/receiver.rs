@@ -1224,27 +1224,35 @@ fn discard_snap_parts(parts: Vec<SnapPart>) {
     }
 }
 
-/// Ruling R42: the zero-byte `snap-<P>.foreign` marker beside a session's
-/// cluster artifact `snap-<P>.ultcluster` (`final_path`), made durable — the
-/// directory is fsync'd — before the caller renames the artifact into place.
-/// A marker already present (a retried rename) is left as it is.
-fn write_foreign_marker(final_path: &Path) -> std::io::Result<()> {
-    let dir = final_path
+/// Ruling R42: the zero-byte `<root>/cluster/snap-<P>.foreign` marker for the
+/// set a session is delivering, made durable before the caller renames ANY of
+/// that session's artifacts into place (review m-A) — a row copy included,
+/// since a session that dies after one row lands would otherwise leave an
+/// unmarked foreign row that a later LOCAL freeze of the cluster artifact at
+/// the same `P` could complete into a set this node never built.
+/// `final_path` is any part's destination (`<root>/<row>/snap-P.ultsnap` or
+/// `<root>/cluster/snap-P.ultcluster`); `pos` is its `P`. A marker already
+/// present was made durable when it was created, so the common case — every
+/// rename after a session's first — is one `stat`.
+fn write_foreign_marker(final_path: &Path, pos: u64) -> std::io::Result<()> {
+    let root = final_path
         .parent()
-        .ok_or_else(|| std::io::Error::other("cluster artifact has no directory"))?;
-    let stem = final_path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .and_then(|n| n.strip_suffix(".ultcluster"))
-        .ok_or_else(|| std::io::Error::other("not a cluster artifact name"))?;
+        .and_then(Path::parent)
+        .ok_or_else(|| std::io::Error::other("artifact path has no snapshot root"))?;
+    let dir = root.join("cluster");
     let marker = dir.join(format!(
-        "{stem}{}",
+        "snap-{pos}{}",
         uc_protocol::v2::catalog::FOREIGN_SET_SUFFIX
     ));
-    if !marker.exists() {
-        std::fs::File::create(&marker)?.sync_all()?;
+    if marker.exists() {
+        return Ok(());
     }
-    std::fs::File::open(dir)?.sync_all()
+    if !dir.is_dir() {
+        std::fs::create_dir_all(&dir)?;
+        std::fs::File::open(root)?.sync_all()?;
+    }
+    std::fs::File::create(&marker)?.sync_all()?;
+    std::fs::File::open(&dir)?.sync_all()
 }
 
 /// M14c: open the `.part` for one announced artifact under `<root>/<id>/`. Free
@@ -2863,15 +2871,14 @@ impl FollowerReceiver {
                 }
                 drop(file);
             }
-            // Ruling R42: the CLUSTER artifact is the one file every set has,
-            // and the node's report seeder needs the complete set including
-            // it — so marking it here, durably and BEFORE its rename, leaves
-            // no moment at which this session's set is complete on disk but
-            // unmarked. The marker says "not built here": a node never
-            // reports a session-delivered (fetched or installed) set's
-            // hashes as its own observation. Idempotent on the retry.
-            if intake.parts[k].service_id == CLUSTER_ARTIFACT_ID
-                && write_foreign_marker(&intake.parts[k].final_path).is_err()
+            // Ruling R42: mark the set "not built here" — durably, and before
+            // ANY of this session's artifacts becomes visible (review m-A),
+            // not just the cluster one: a node never reports a
+            // session-delivered (fetched or installed) set's hashes as its own
+            // observation, and an aborted session must not leave an unmarked
+            // row copy behind. Idempotent: after the first part it is a stat.
+            if write_foreign_marker(&intake.parts[k].final_path, intake.parts[k].snapshot_pos)
+                .is_err()
             {
                 intake.last_publish_try_ns = Some(now);
                 self.stats
@@ -6776,6 +6783,58 @@ mod tests {
     /// `uc2-cluster` agent that owns the cluster FSM, and its position is
     /// published — both BEFORE the floor signal the consensus agent's install
     /// handler keys on.
+    /// Ruling R42, review m-A: the `snap-<P>.foreign` marker is written
+    /// before the FIRST artifact of a session becomes visible, not only
+    /// before the cluster artifact. A session that dies after one row lands
+    /// leaves that row copy on disk; were it unmarked, a later LOCAL freeze of
+    /// the cluster artifact at the same P could complete the set and make
+    /// this node attest a row it never built. Here the session stops right
+    /// after row 0 is renamed — no cluster part ever arrives.
+    #[test]
+    fn an_aborted_session_leaves_its_row_copies_already_marked() {
+        let b = buffer();
+        let mut leader = FakeLeader::new();
+        let mut r = follower(&b, leader.addr());
+        let dir = snap_scratch_dir();
+        let pos_cell = Arc::new(AtomicU64::new(0));
+        let cluster_cell = Arc::new(AtomicU64::new(0));
+        let (tx, _rx) = mpsc::sync_channel::<(u64, PathBuf)>(1);
+        r.set_snapshot_intake(
+            dir.path().to_path_buf(),
+            ident(0b1),
+            Arc::new(|| [0u32; 8]),
+            Some((Arc::clone(&pos_cell), Arc::clone(&cluster_cell), tx)),
+        );
+        let to = r.local_addr();
+        leader.send(
+            to,
+            DGRAM_KIND_SNAP_BEGIN,
+            0,
+            TERM,
+            &snap_begin_wire(7, 0, 4096, 64, 0b1),
+        );
+        leader.send(to, DGRAM_KIND_SNAP_CHUNK, 0, TERM, &[0xABu8; 64]);
+        assert_eq!(pump_and_count_dones(&mut r, &leader), 0);
+        assert!(
+            dir.path().join("0").join("snap-4096.ultsnap").exists(),
+            "precondition: row 0's copy is visible"
+        );
+        assert!(
+            dir.path()
+                .join("cluster")
+                .join("snap-4096.foreign")
+                .is_file(),
+            "the set is already marked 'not built here' before any of it was visible"
+        );
+        assert!(
+            !dir.path()
+                .join("cluster")
+                .join("snap-4096.ultcluster")
+                .exists(),
+            "and the cluster artifact never arrived"
+        );
+    }
+
     #[test]
     fn a_session_does_not_complete_until_its_cluster_artifact_lands_and_routes_it_first() {
         use Ordering::Relaxed;
