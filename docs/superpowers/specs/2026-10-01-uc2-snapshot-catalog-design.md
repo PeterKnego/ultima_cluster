@@ -714,3 +714,46 @@ procedure forbids it.)
   retired, R21) — but the floor never moves onto it (D4, R26), so nothing is
   lost. Requiring `is_agreed()` at the door is a project-2 question (the
   chooser decides what a pinned attach may install from), not built here.
+
+#### Addendum (2026-10-05): lock discipline of the published view
+
+**Finding.** `lin_v2::two_fsm_bounded` is deterministic on `main` (5 fault
+ticks) and non-deterministic on this branch (5–31 ticks, WGL stack overflow in
+3/5 runs). Bisected to the row-255 report × the catalog-aware floor. Probes
+show the mechanism is **contention on the `ClusterView` mutex**: acquisition
+waits of ~35 ms (good runs) to ~100 ms (bad runs) with ~3 µs medians — a lock
+convoy of short holders preempted on an oversubscribed box. The branch added
+takers on both sides: the consensus pass clones `ClusterViewInner` for the
+floor every 100 ms while the floor is stuck (D4/R12), and the cluster agent
+publishes on every `SNAPSHOT` frame (D3) and appends one more report per
+instant (row 255). A delayed agent delays a restarted row's attach (the
+readiness gate waits on the agent's walk), the row misses its freeze at P, the
+next command supersedes the instant, and the fault loop's history grows.
+Disabling either taker alone restores `main`'s behaviour; the pruner is not
+involved; no filesystem I/O or snapshot install is involved at HEAD.
+
+**Rule.** The consensus pass takes **no lock in steady state**, and no holder
+of the view's lock does more than a pointer copy while holding it.
+
+**Design.**
+1. `ClusterView.inner` becomes `Mutex<Arc<ClusterViewInner>>`. `publish`
+   builds the new `ClusterViewInner` **outside** the lock, then swaps the
+   `Arc` under it; the atomics are stored after the swap, `position` last, as
+   today. `snapshot_inner()` returns `Arc<ClusterViewInner>` (an `Arc` clone
+   under the lock — nanoseconds, no allocation); callers read through it.
+2. The floor path caches its last computation on
+   `(own, catalog_version, persisted_floor)` and recomputes only when one of
+   the three moves; a stuck floor costs the pass one compare per throttle
+   tick and no view read.
+3. Every `snapshot_inner()` call reachable from the consensus pass or from
+   the leader's per-report path (`on_snap_report` → `report_position_for`) is
+   audited: served by an atomic where one exists, otherwise by the `Arc`
+   (never a clone of the contents).
+4. The cluster agent publishes only when the state it publishes changed
+   (a `SNAPSHOT` frame changes the catalog, so it still publishes; an
+   applied `CLUSTER` command that left the state equal does not).
+
+**Proof.** `publish`'s mutex-wait max measured in `two_fsm_bounded` before and
+after (the probe in `~/scratch/lin-m2-report.md`): after must be < 1 ms;
+`two_fsm_bounded` 5/5 at 5 ticks with 0 `snapshot_instant_abandoned`; the
+full proof stack. **No bar** on anything else (D8).
