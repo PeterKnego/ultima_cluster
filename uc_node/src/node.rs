@@ -2002,7 +2002,6 @@ impl Node {
             cfg.services.ids().collect(),
             snap_root.clone(),
             instance.cluster_snapshot_dir(),
-            Arc::clone(&snapshot_set_position),
         ));
         let probe_base = std::time::Instant::now();
         let probe_cnc = Arc::clone(&cnc);
@@ -11814,16 +11813,24 @@ struct HoldingsProbe {
 /// RESTARTED node re-offer its full evidence to a new leader instead of only
 /// the rows its cnc slots happen to name (every thin record in round 2's
 /// proof runs). The I/O is on this thread, never the consensus pass (catalog
-/// rulings R27/R28 kept). Bounded: only sets at or below the node's newest
-/// complete set, the newest `MAX_CATALOG_SETS` of them, each attempted once.
+/// rulings R27/R28 kept). Bounded: the newest `MAX_CATALOG_SETS` complete
+/// sets on disk, each attempted once.
+///
+/// Not bounded by `snapshot_set_position`: after a restart that word starts
+/// at the durable floor, and the sets above it — exactly the ones a new
+/// leader still needs — may never see a completion edge in this incarnation
+/// (the slots name only the newest instant, and only once the services
+/// re-attach). A set is hashed on the probe AFTER the one that first saw it
+/// complete, which keeps the probe from racing a live completion edge (the
+/// edge follows the last artifact's rename by microseconds, the probe runs
+/// once a second) and so from hashing every fresh set a second time.
 struct ReportSeeder {
     cell: Arc<ReportSeeds>,
     rows: Vec<u8>,
     snap_root: PathBuf,
     cluster_dir: PathBuf,
-    /// The node's newest complete set (`snapshot_set_position`): a set above
-    /// it has not completed here yet, and its completion edge will report it.
-    set_position: Arc<AtomicU64>,
+    /// Complete sets seen on a previous probe and not yet cached.
+    sighted: Vec<u64>,
     /// Sets already hashed (or found unreadable) — never attempted twice.
     attempted: Vec<u64>,
     /// Sets seeded (test-visible).
@@ -11836,14 +11843,13 @@ impl ReportSeeder {
         rows: Vec<u8>,
         snap_root: PathBuf,
         cluster_dir: PathBuf,
-        set_position: Arc<AtomicU64>,
     ) -> Self {
         ReportSeeder {
             cell,
             rows,
             snap_root,
             cluster_dir,
-            set_position,
+            sighted: Vec::with_capacity(MAX_CATALOG_SETS),
             attempted: Vec::with_capacity(MAX_CATALOG_SETS),
             seeded: 0,
         }
@@ -11851,10 +11857,6 @@ impl ReportSeeder {
 
     #[cold]
     fn seed(&mut self) {
-        let ceiling = self.set_position.load(Ordering::Acquire);
-        if ceiling == 0 {
-            return;
-        }
         let known = {
             let g = self.cell.inner.lock().unwrap_or_else(|e| e.into_inner());
             g.known.clone()
@@ -11872,7 +11874,7 @@ impl ReportSeeder {
                     .parse::<u64>()
                     .ok()
             })
-            .filter(|&p| p != 0 && p <= ceiling)
+            .filter(|&p| p != 0)
             .collect();
         held.sort_unstable();
         if held.len() > MAX_CATALOG_SETS {
@@ -11880,6 +11882,7 @@ impl ReportSeeder {
         }
         self.attempted.retain(|p| held.contains(p));
         let mut out = Vec::new();
+        let mut sighted_now = Vec::with_capacity(MAX_CATALOG_SETS);
         for &p in &held {
             if known.contains(&p) || self.attempted.contains(&p) {
                 continue;
@@ -11895,6 +11898,10 @@ impl ReportSeeder {
                 .collect();
             if !row_paths.iter().all(|f| f.is_file()) {
                 continue; // not a complete set (yet): looked at again next probe
+            }
+            if !self.sighted.contains(&p) {
+                sighted_now.push(p); // hashed next probe, if still uncached
+                continue;
             }
             self.attempted.push(p);
             let mut set = ReportedSet {
@@ -11919,6 +11926,7 @@ impl ReportSeeder {
                 out.push(set);
             }
         }
+        self.sighted = sighted_now;
         if out.is_empty() {
             return;
         }
@@ -16246,9 +16254,9 @@ mod tests {
             .cluster_artifact_hash
             .hash_at(p)
             .expect("the cluster agent published its artifact's hash");
-        // The node's newest complete set is P, but this incarnation never ran
-        // the completion edge: the cache is empty, as after a restart.
-        h.cons.snapshot_set_position.store(p, Ordering::Release);
+        // This incarnation never ran the completion edge for P, and its
+        // newest-complete-set word is still 0 (a restart recovers it from
+        // the durable floor, which can sit below P): the cache is empty.
         assert!(
             h.cons.reported_sets.is_empty(),
             "precondition: nothing cached"
@@ -16259,10 +16267,11 @@ mod tests {
             vec![0],
             h.cons.snap_root.clone(),
             h.cons.cluster_snapshot_dir.clone(),
-            Arc::clone(&h.cons.snapshot_set_position),
         );
         seeder.seed();
-        assert_eq!(seeder.seeded, 1);
+        assert_eq!(seeder.seeded, 0, "the first probe only sights the set");
+        seeder.seed();
+        assert_eq!(seeder.seeded, 1, "the next one hashes it");
         h.cons.maybe_reoffer_snapshot_reports(); // merges the seed
         let seeded = *h
             .cons
