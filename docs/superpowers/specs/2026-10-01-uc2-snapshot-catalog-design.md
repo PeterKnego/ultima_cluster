@@ -854,3 +854,41 @@ in-process self-report on becoming leader). (e) `lin_v2::two_fsm_bounded`
 ±1, with the per-run count of `snapshot_report_appended` recorded; (f)
 `lin_v2::two_fsm_lockstep` 3/3 pass; (g) the all-15 `lin_v2` suite once; the
 usual gates. No performance bar (D8).
+
+**Amended (ruling R38, 2026-10-05, after Task 16 round 1).** Round 1 built
+mechanics 1–5 as written and removed the starvation (the headline test went
+from 0 appends to 7; `two_fsm_lockstep` 3/3), but proof (e) missed its bar
+(ticks 5/5/7/5/12): under one fault per 1.2 s most instants complete on two
+of three voters and must wait out the timeout, the leader changes every 3–5
+ticks, and each change cleared the map and restarted every clock. Two
+mechanics change, both from replicated data, no wire or layout change:
+- **The clock is the log's, not the leader's.** A pending `(row, P)` times out
+  when the leader's current LOG time is at or past `SetEntry(P).time_ns +
+  SNAP_REPORT_TIMEOUT_NS` — the instant's own stamp, read from the committed
+  catalog — so a leader change does not restart it. Only a `P` the catalog
+  does not list yet (its frame not yet committed on this node) falls back to
+  `first_seen_ns` in the pass's monotonic clock. The two clocks are never
+  compared with each other. Cost accepted: a voter whose freeze takes longer
+  than the fastest node's freeze plus 5 s is left out of the record a little
+  earlier than before; the floor is unaffected.
+- **The re-offer covers every held set the catalog still lists as not
+  `Complete`,** above the row's committed report position, not only the
+  newest. As built, the cnc slots name only the newest instant's hashes, so a
+  node keeps a bounded (64-set) in-memory cache of each completed set's
+  `(row, hash)` list from its completion edge and re-offers older sets from
+  it; a node restarted after completing a set has no cache for it and
+  re-offers only the set its slots still name. The newest set is re-offered
+  even when the node's own catalog view lags its completion edge. Once per
+  distinct `(leader, term)`; a candidate does not re-offer (its hint is
+  stale); the normal send does not mark the leader as offered, so a set that
+  completes in the pass of a leader change still gets the full re-offer, at
+  the cost of at most one duplicate report per row per new leader.
+
+Result: proof (e) ticks 5/6/6/5/6, bar met; `two_fsm_lockstep` 3/3; the
+all-15 `lin_v2` green (Task 16 round 2). Open at the task review: a new
+leader appends its OWN report for an instant already older than the timeout
+at once, before followers' re-offers arrive, so more records name one or two
+voters than before (9 of 30 appends in (e)). §4.3's "one reporter is agreed"
+makes such a record move the floor — no less safe than `main`'s node-local
+floor, but thinner divergence coverage under leader churn; a short grace on
+a fresh leader is under ruling.
