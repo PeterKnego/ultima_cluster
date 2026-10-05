@@ -1587,13 +1587,17 @@ pub fn uc_node_cluster_artifact() -> Vec<Seed> {
     // hard-coding an offset that the settings/pins/reports lengths above
     // would silently shift.
     let mut lying_running_length = v3_running.clone();
-    let running_len = uc_protocol::v2::cluster_image::decode_cluster_image(&v3_running)
-        .expect("v3_running decodes")
-        .running
-        .len();
+    let decoded = uc_protocol::v2::cluster_image::decode_cluster_image(&v3_running)
+        .expect("v3_running decodes");
+    let running_len = decoded.running.len();
+    // Layout v4 (snapshot catalog): `running_len ‖ running ‖ catalog_len ‖
+    // catalog ‖ crc` — the running length prefix sits one whole catalog
+    // section above the CRC, not directly above it as in v3.
+    let catalog_len = decoded.catalog.len();
     assert!(running_len > 0, "the running blob must be non-empty to lie about");
-    let running_crc_at = lying_running_length.len() - 4;
-    let rl_offset = running_crc_at - running_len - 4;
+    let crc_at = lying_running_length.len() - 4;
+    let catalog_len_at = crc_at - catalog_len - 4;
+    let rl_offset = catalog_len_at - running_len - 4;
     lying_running_length[rl_offset..rl_offset + 4]
         .copy_from_slice(&0xFFFF_0000u32.to_le_bytes());
     let body_len = lying_running_length.len() - 4;
@@ -1608,6 +1612,19 @@ pub fn uc_node_cluster_artifact() -> Vec<Seed> {
         "a lying running length must be refused, not decoded"
     );
 
+    // Catalog spec (layout v4): the trailing `catalog` blob has its own
+    // length prefix and its own bound check — lie about that one too.
+    let mut lying_catalog_length = v3_running.clone();
+    lying_catalog_length[catalog_len_at..catalog_len_at + 4]
+        .copy_from_slice(&0xFFFF_0000u32.to_le_bytes());
+    let body_len = lying_catalog_length.len() - 4;
+    let crc = crc32fast::hash(&lying_catalog_length[..body_len]);
+    lying_catalog_length[body_len..].copy_from_slice(&crc.to_le_bytes());
+    assert!(
+        uc_protocol::v2::cluster_image::decode_cluster_image(&lying_catalog_length).is_none(),
+        "a lying catalog length must be refused, not decoded"
+    );
+
     vec![
         Seed::fixed("01-image", image),
         Seed::fixed("02-bad-crc", bad_crc),
@@ -1616,6 +1633,7 @@ pub fn uc_node_cluster_artifact() -> Vec<Seed> {
         Seed::fixed("05-lying-membership-length", lying_length),
         Seed::fixed("v3_running", v3_running),
         Seed::fixed("06-lying-running-length", lying_running_length),
+        Seed::fixed("07-lying-catalog-length", lying_catalog_length),
     ]
 }
 
@@ -1741,5 +1759,74 @@ pub fn uc_protocol_probe() -> Vec<Seed> {
         Seed::fixed("03-level-ack", level_ack),
         Seed::fixed("04-zero-own-min-ack", zero_own_min_ack),
         Seed::fixed("05-too-short", vec![0u8; 3]),
+    ]
+}
+
+/// `uc_protocol_status_body` — the catalog spec §5.1 `STATUS` body
+/// (`read_status_body`/`write_status_body`, 144 B, layout word
+/// `STATUS_LAYOUT_V2` at offset 12). A zero body at genesis, a populated body
+/// with every `Holdings` field non-zero and a sparse `sets_held` mask, a
+/// 16-byte pre-catalog (0.10.0) body — the mixed-version input the decoder
+/// must answer `None` on, since there is no wire-version word on node↔node
+/// datagrams (ruling R30) — a body with the wrong layout word, and a body one
+/// byte short of the length floor.
+pub fn uc_protocol_status_body() -> Vec<Seed> {
+    use uc_protocol::v2::datagram::{
+        Holdings, STATUS_BODY_LEN, STATUS_BODY_LEN_V1, STATUS_LAYOUT_V2, StatusBody, write_status_body,
+    };
+    let zero = StatusBody {
+        contiguous_position: 0,
+        receive_window: 0,
+        holdings: Holdings {
+            journal_first: 0,
+            durable: 0,
+            commit: 0,
+            applied: [0; 8],
+            free_bytes: 0,
+            journal_bytes: 0,
+            snapshots_bytes: 0,
+            catalog_position: 0,
+            sets_held: 0,
+        },
+    };
+    let mut genesis = vec![0u8; STATUS_BODY_LEN];
+    write_status_body(&mut genesis, &zero);
+
+    let populated = StatusBody {
+        contiguous_position: 0x0040_0000,
+        receive_window: 1 << 20,
+        holdings: Holdings {
+            journal_first: 0x1_0000,
+            durable: 0x3f_fe00,
+            commit: 0x3f_fc00,
+            applied: [0x3f_fc00, 0x3f_f800, 0, 0, 0, 0, 0, 0x3f_fc00],
+            free_bytes: 500 << 30,
+            journal_bytes: 3 << 20,
+            snapshots_bytes: 6 << 20,
+            catalog_position: 0xcbf2_9ce4_8422_2325,
+            sets_held: 0b1011,
+        },
+    };
+    let mut full = vec![0u8; STATUS_BODY_LEN];
+    write_status_body(&mut full, &populated);
+
+    // A 0.10.0 peer's 16-byte body: position ‖ window ‖ zero — refused by
+    // length, counted `status_refused` on the leader (ruling R30).
+    let mut v1 = vec![0u8; STATUS_BODY_LEN_V1];
+    v1[0..8].copy_from_slice(&0x0040_0000u64.to_le_bytes());
+    v1[8..12].copy_from_slice(&(1u32 << 20).to_le_bytes());
+
+    let mut wrong_layout = full.clone();
+    wrong_layout[12..16].copy_from_slice(&(STATUS_LAYOUT_V2 + 1).to_le_bytes());
+
+    let mut short = full.clone();
+    short.truncate(STATUS_BODY_LEN - 1);
+
+    vec![
+        Seed::fixed("01-genesis", genesis),
+        Seed::fixed("02-populated", full),
+        Seed::fixed("03-v1-16-byte", v1),
+        Seed::fixed("04-wrong-layout", wrong_layout),
+        Seed::fixed("05-one-short", short),
     ]
 }
