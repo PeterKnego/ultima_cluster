@@ -73,7 +73,7 @@ use crate::ipc::InstanceDir;
 use crate::read_round::ProbeRound;
 use crate::services::ServicesConfig;
 use uc_log::buffer::FrameRead;
-use uc_protocol::v2::catalog::{MAX_CATALOG_SETS, SetEntry};
+use uc_protocol::v2::catalog::{MAX_CATALOG_SETS, SetEntry, SetState};
 use uc_protocol::v2::datagram::{
     CONFIG_PROPOSAL_BODY_LEN, CONFIG_REPLY_BODY_LEN, ConfigProposalBody, ConfigReplyBody,
     DATAGRAM_HEADER_LEN, DGRAM_KIND_COMMIT_POSITION, DGRAM_KIND_CONFIG_PROPOSAL,
@@ -5517,13 +5517,12 @@ impl Consensus {
     #[cfg(test)]
     fn effective_floor_candidate(&self) -> u64 {
         let own = self.snapshot_set_position.load(Ordering::Acquire);
-        if self
+        if !self
             .cluster_view
-            .catalog_agreed_position
+            .catalog_has_complete
             .load(Ordering::Acquire)
-            == 0
         {
-            return own; // Empty: today's behaviour, no view clone
+            return own; // Empty (ruling R26): today's behaviour, no view clone
         }
         let inner = self.cluster_view.snapshot_inner();
         self.effective_floor_in(own, &inner.catalog)
@@ -5532,8 +5531,11 @@ impl Consensus {
     /// The body of [`Self::effective_floor_candidate`] over a catalog the
     /// caller already cloned. Three answers:
     ///
-    /// * **`Empty`** (no agreed set listed — catalog spec §4.5): `own`, which
-    ///   is today's behaviour, unchanged.
+    /// * **`Empty`** (no listed entry is `Complete` — catalog spec §4.5 as
+    ///   amended by catalog ruling R26): `own`, which is today's behaviour,
+    ///   unchanged. A catalog whose complete sets all DIVERGED is not
+    ///   `Empty`: it falls through to the agreed search below and, with
+    ///   nothing agreed, answers `0` — a diverged set is never the floor (D4).
     /// * **`own` is itself an agreed listed set**: `own`. This node holds it
     ///   by definition (it is its newest complete set), so the common case
     ///   costs no filesystem call.
@@ -5550,7 +5552,7 @@ impl Consensus {
     /// an error — the catalog's newest agreed set is a target to fetch, never
     /// a licence to purge what this node cannot rebuild from.
     fn effective_floor_in(&self, own: u64, catalog: &[SetEntry]) -> u64 {
-        if !catalog.iter().any(SetEntry::is_agreed) {
+        if !catalog.iter().any(|e| e.state == SetState::Complete) {
             return own;
         }
         for e in catalog.iter().rev() {
@@ -13497,6 +13499,48 @@ mod tests {
             h.cons.effective_floor_candidate(),
             3000,
             "Empty: today's behaviour"
+        );
+    }
+
+    /// Catalog ruling R26 (I2): `Empty` means "no `Complete` entry", not
+    /// "no agreed entry". A catalog whose only complete set DIVERGED is not
+    /// `Empty`, so the candidate is `0` (nothing moves) — never `own`, which
+    /// would make the diverged set this node's floor (D4).
+    #[test]
+    fn a_catalog_with_only_a_diverged_complete_set_moves_nothing() {
+        use uc_protocol::v2::catalog::{RowVerdict, SetKind};
+        use uc_protocol::v2::upgrade::RowRunning;
+        let h = harness_with_rows(&["a"]);
+        let mut st = h.cons.cluster_view.to_state();
+        let mut diverged = SetEntry::commanded(2000, SetKind::Full, 0);
+        diverged.state = SetState::Complete;
+        diverged.cluster.verdict = RowVerdict::Agreed;
+        diverged.rows[0].verdict = RowVerdict::Diverged;
+        st.catalog = vec![diverged];
+        st.running[0] = Some(RowRunning {
+            row: 0,
+            version: 1,
+            record_pos: 1,
+        });
+        h.cons.cluster_view.publish(&st);
+        assert!(
+            h.cons
+                .cluster_view
+                .catalog_has_complete
+                .load(Ordering::Acquire)
+        );
+        assert_eq!(
+            h.cons
+                .cluster_view
+                .catalog_agreed_position
+                .load(Ordering::Acquire),
+            0
+        );
+        h.cons.snapshot_set_position.store(2000, Ordering::Release);
+        assert_eq!(
+            h.cons.effective_floor_candidate(),
+            0,
+            "a diverged set is never the floor"
         );
     }
 

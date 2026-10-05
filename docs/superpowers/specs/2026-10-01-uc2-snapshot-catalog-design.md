@@ -495,6 +495,9 @@ before its `STATUS` is ever parsed.
   *current* `retain_sets` (retention is simply unchanged by that record).
   Only the leader's pre-append door (`validate`) refuses an operator's own
   `0` unconditionally, with `47`, so no operator can ever stage one.
+  **SUPERSEDED by R24 below** — "keep the current value" made the result
+  depend on how a node reached its state, which is the Critical defect R24
+  fixes.
 - **§4.4 step 3's "holds complete on disk" is a cache read, not a file
   check, outside one seam (ruling R12).** As drafted this reads as "ask the
   filesystem". As built, a node's effective-floor candidate is read from
@@ -605,3 +608,44 @@ before its `STATUS` is ever parsed.
   to point at. Added as Task 8b (after Task 8): `[settings] retain_sets`
   for genesis, the `retain_sets` key in the `settings apply` TOML, and
   `settings show`'s rendering of it.
+- **R24 — a v1/v2 `Settings` record reads `retain_sets = 1`, not `0`
+  (supersedes R10's "keep current"; final fix wave, Critical C1).** As built
+  through Task 13, a v1/v2 record decoded as `0` and `apply` kept the
+  current value; a node that installed a pre-flag-day v3 image (settings
+  tail a v2 record) then held `0` in its state forever while a node that
+  walked from genesis held `1` — every later cluster image differed, so the
+  cluster row read diverged at every instant. As built now:
+  `decode_settings` maps a v1/v2 record to `retain_sets = 1` (the
+  newest-only retention such a cluster actually ran); `install_snapshot`
+  normalises any `0` to `1`; `apply` normalises a `0` (reachable only on a
+  crafted v3 record — the door refuses an operator's) to `1` **from the
+  record alone**, never from the current state, so a replayed old record
+  wins like every other replayed field. Regression:
+  `a_v3_image_with_a_v2_settings_tail_converges_with_genesis` (byte-equal
+  images, both `1`). Upgrade step: commit one `uc2ctl settings apply` after
+  the flag day so every node's settings come from the log.
+- **R25 — an entry turning `Complete` drops every OLDER `Commanded` entry
+  that is not a pinned origin (final fix wave, Important I1).** §4.4 step 2
+  drops a stalled entry only once an AGREED set passes it. A node whose
+  newest v3 artifact was older than another's replays pre-flag-day
+  `SNAPSHOT` frames into `Commanded` entries no node ever reports on, so the
+  two catalogs differed for as long as retention took (~64 instants at the
+  cap). As built: `put_report`, on the edge where its entry becomes
+  `Complete` (agreed or not), drops older non-pinned `Commanded` entries.
+  Trade-off: a stalled instant stays visible until the NEXT set
+  **completes**, not until the next set agrees. Upgrade step: take one full
+  instant right before stopping and confirm every node's newest
+  `snap-*.ultcluster` is at the same P.
+- **R26 — `Empty` means "no `Complete` entry", not "no agreed entry"
+  (amends §4.5 and R13; final fix wave, Important I2).** As built through
+  Task 13, `effective_floor_in` treated a catalog with nothing AGREED as
+  `Empty` and fell back to `own` — so a cluster whose every complete set
+  diverged purged below a diverged set, breaking D4 outside the flag-day
+  window. As built now: `Empty` ⇔ no listed entry is `Complete`
+  (`ClusterState::catalog_empty`, published as
+  `ClusterView::catalog_has_complete`); a catalog whose complete sets all
+  diverged is not `Empty`, its agreed search finds nothing, and the
+  candidate is `0` — nothing moves. `uc2_catalog_agreed_position == 0`
+  still means "nothing agreed"; `uc2_catalog_empty` now reads
+  `catalog_has_complete` and is `1` iff no entry is `Complete`. Cost: journal
+  growth (never loss) on a cluster whose every set diverges.

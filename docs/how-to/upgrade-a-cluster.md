@@ -1020,12 +1020,29 @@ admits row `255`: the cluster artifact's own hash now joins the per-row
 completeness report, closing the "the cluster FSM's own artifact has no
 determinism check" gap. The replicated `Settings` record grows one field,
 `retain_sets: u16` (version 3, 35 B; a version-1 (`2.11.0`) or version-2
-(`2.12.0`) record is still accepted on read and reads `retain_sets` as `0`,
-"unset"). No existing
+(`2.12.0`) record is still accepted on read and reads `retain_sets` as `1`,
+today's newest-only retention). No existing
 layout changes anywhere, which is exactly why mixing is unsound rather than
 merely unsupported: a `0.10.0` peer applies the row-255 report and the wider
 `Settings` record as undecodable and silently diverges — its catalog never
 completes a set. **Stop every node before starting any node.**
+
+**Before stopping: take one full instant and line the artifacts up.** Run
+`uc2ctl snapshot` (not `--standby`) right before the window, wait for it to
+complete, and confirm every node's newest `snapshots/cluster/snap-*.ultcluster`
+is at the **same** position P. A node whose newest cluster artifact is older
+than another's replays the `SNAPSHOT` frames between the two on restart and
+lists them as commanded instants the others never see; those entries are
+dropped the moment the next set completes, but until then the nodes' catalogs
+— and so their cluster artifacts — differ, and the cluster row reads diverged.
+
+**After the flag day: commit one `uc2ctl settings apply`.** Every node must
+take its replicated settings — `retain_sets` included — from the log, not from
+whatever image or `node.toml` it started on. Apply the cluster's intended
+settings file once, on the leader, as soon as the cluster serves (re-applying
+the values it already runs is fine). Do not rely on `[settings] retain_sets`
+in `node.toml` for an upgraded cluster: `[settings]` seeds **genesis** only,
+and an upgraded cluster's genesis is long past.
 
 **cnc unchanged.** The catalog is not on the shmem page; it rides inside
 the cluster artifact and `/metrics` only. No cnc version bump, no node-local
@@ -1039,12 +1056,12 @@ prior image bump used. `snapshots/<row>/` and `snapshots/cluster/` are both
 untouched; there is no wipe for this flag day.
 
 **The `Empty` window.** A v1–v3 artifact — or a fresh genesis — starts with
-an empty catalog: no set has ever been agreed. Every reader takes a named
+an empty catalog: no set has ever completed. Every reader takes a named
 fallback in that state: the purge floor and every install source read as
 today's pre-catalog behaviour (the node's own newest complete set on disk),
 and the pruner keeps deleting on that same old rule rather than refusing to
 delete anything. The gauge `uc2_catalog_empty` is `1` for as long as this
-holds and `0` once the first instant completes and agrees — watch it after
+holds and `0` once the first instant completes — watch it after
 the upgrade to know when the cluster has actually started keeping the new
 replicated record, as opposed to merely running the new binary.
 

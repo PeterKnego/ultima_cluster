@@ -85,7 +85,7 @@ declared row's and the cluster artifact's reported hash match, spec §4.4)
 that diverged across nodes is never the floor, whatever `uc2ctl snapshot
 show`'s `set=` says — `set=` is the node-local, **on-disk** reading (a file
 listing); the floor is the catalog's, and the two can legitimately differ.
-Before the first instant agrees (the `Empty` state, `uc2_catalog_empty`),
+Before the first instant completes (the `Empty` state, `uc2_catalog_empty`),
 the floor falls back to today's behaviour: the newest complete set this
 node holds, file presence alone. On a learner-only cluster (`snapshot_target
 = "learners"`) a voter's effective floor does not move until it fetches

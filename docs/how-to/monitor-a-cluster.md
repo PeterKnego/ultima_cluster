@@ -427,9 +427,9 @@ replicated catalog's own view of that same set list:
 | `uc2_snapshot_freeze_seconds_sum` | counter | `service`, `row` | cumulative `freeze()` seconds for this row |
 | `uc2_snapshot_freeze_seconds_count` | counter | `service`, `row` | DISTINCT freeze durations sampled from this row's cnc word at scrape boundaries — a **lower bound** on freezes, not a count of them (see below) |
 | `uc2_catalog_sets` | gauge | none | how many sets the replicated catalog lists, any state, identical cluster-wide once caught up (catalog spec §9) |
-| `uc2_catalog_agreed_position` | gauge | none | the **cluster floor**: the newest set the catalog has marked AGREED, `0` while the catalog is `Empty` (the flag-day window before the first set agrees). This is the cluster-wide reading `uc2_snapshot_set_position` cannot be on a learner-only cluster |
-| `uc2_catalog_empty` | gauge | none | `1` while no set has agreed yet (`uc2_catalog_agreed_position == 0`), else `0` — a derived convenience so an alert does not have to spell out the `== 0` case itself |
-| `uc2_catalog_stalled` | gauge | none | listed sets still `Commanded` — not yet complete. No timeout is baked in here; a persistent nonzero reading is the signal, the same shape as `Uc2SnapshotStalled` |
+| `uc2_catalog_agreed_position` | gauge | none | the **cluster floor**: the newest set the catalog has marked AGREED, `0` while nothing has agreed — the catalog is `Empty` (the flag-day window before the first set completes) or every complete set diverged. This is the cluster-wide reading `uc2_snapshot_set_position` cannot be on a learner-only cluster |
+| `uc2_catalog_empty` | gauge | none | `1` while the catalog lists no **complete** set (the `Empty` state, in which a node's floor falls back to its own newest complete set), else `0`. Not the same as `uc2_catalog_agreed_position == 0`: a catalog whose complete sets all diverged reads `0` here and `0` there, and its floor moves nothing |
+| `uc2_catalog_stalled` | gauge | none | listed sets still `Commanded` — commanded instants not yet complete. No timeout is applied; a persistent nonzero reading is the signal, the same shape as `Uc2SnapshotStalled` |
 | `uc2_catalog_diverged` | gauge | none | row entries reading `Diverged` or `NoMajority`, summed across every listed set. Nonzero means some row's artifact hashes did not agree. Alert: `Uc2SnapshotSetDiverged`, re-sourced to this gauge — see below |
 
 The last three are a **stand-in for a histogram**: this exposition encoder has

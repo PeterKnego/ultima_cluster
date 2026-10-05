@@ -377,7 +377,7 @@ length. `SNAP_REPORT`/`SnapshotReport` (`CLUSTER` kind 5) admits row `255`
 — the cluster artifact's own hash, closing the gap recorded on the backlog
 since plan B3. `Settings` grows to encoding version 3 (35 B), adding
 `retain_sets: u16`; a version-1 or version-2 record is still accepted on
-read, with `retain_sets` reading `0` ("unset"). No existing layout changes
+read, with `retain_sets` reading `1` (the newest-only retention it ran). No existing layout changes
 anywhere, so a `0.10.0` peer's frames of these kinds still *parse* but
 decode as undecodable/unknown and are dropped — its cluster FSM silently
 diverges rather than refusing outright. Stop every node before starting any

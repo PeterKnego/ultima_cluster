@@ -10,7 +10,7 @@
 
 use std::io::{Read, Write};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering};
 
 use uc_consensus::config::{ClusterConfig, ProposeError};
 use uc_protocol::v2::catalog::{
@@ -226,8 +226,33 @@ impl ClusterState {
     /// show` reads, unchanged for rows `< CNC_MAX_SERVICES`; a report for the
     /// cluster row ([`CLUSTER_ROW`]) does NOT enter it — it exists only to
     /// fill a catalog entry's `cluster` field.
+    ///
+    /// Catalog ruling R25: when the report turns an entry `Complete` (agreed or
+    /// not), every OLDER `Commanded` entry that is not a pinned origin is
+    /// dropped. A `Commanded` entry older than a completed one can only be
+    /// an instant that will never complete — typically a pre-flag-day
+    /// `SNAPSHOT` frame one node replayed (its newest v3 artifact was older)
+    /// and another did not; keeping it until an AGREED set passes it would
+    /// diverge the cluster row for as long as retention takes. The cost: a
+    /// stalled instant stays visible only until the NEXT set completes.
     fn put_report(&mut self, r: SnapshotReport) {
+        let was_complete = self
+            .catalog
+            .iter()
+            .any(|e| e.position == r.position && e.state == SetState::Complete);
         self.fold_into_catalog(&r);
+        let now_complete = self
+            .catalog
+            .iter()
+            .any(|e| e.position == r.position && e.state == SetState::Complete);
+        if now_complete && !was_complete {
+            let pinned = self.pinned_origins();
+            self.catalog.retain(|e| {
+                e.position >= r.position
+                    || e.state != SetState::Commanded
+                    || pinned.contains(&e.position)
+            });
+        }
         if r.row != CLUSTER_ROW {
             match self.reports.iter().position(|q| q.row == r.row) {
                 Some(i) => self.reports[i] = r,
@@ -309,10 +334,10 @@ impl ClusterState {
         self.running_for(row).map_or(0, |r| r.version)
     }
 
-    /// Catalog spec §4.4: how many AGREED sets the cluster keeps. A `0`
-    /// (unset — it can only reach the state through an installed v1–v3
-    /// image: the door refuses it, and apply normalises a replayed one to
-    /// the current value) reads as `1`, today's newest-only retention.
+    /// Catalog spec §4.4: how many AGREED sets the cluster keeps. Never `0`
+    /// in the state (catalog ruling R24: a v1/v2 record decodes as `1`, and genesis,
+    /// apply and `install_snapshot` all normalise a `0` to `1`); the `max`
+    /// is a last guard, not a reading anyone relies on.
     pub fn retain_sets(&self) -> u16 {
         self.settings.retain_sets.max(1)
     }
@@ -430,10 +455,13 @@ impl ClusterState {
             .map(|e| e.position)
     }
 
-    /// Catalog spec §4.5: the `Empty` state — no agreed set listed, so every
-    /// reader takes today's fallback.
+    /// Catalog spec §4.5 as amended by catalog ruling R26: the `Empty`
+    /// state — no listed entry has reached `Complete`, so every reader takes
+    /// today's fallback. NOT "no agreed set": a catalog whose complete sets
+    /// all diverged is not `Empty` (the floor then stays where the last
+    /// agreed set put it; D4 — a diverged set is never the floor).
     pub fn catalog_empty(&self) -> bool {
-        self.newest_agreed_at_most(u64::MAX).is_none()
+        !self.catalog.iter().any(|e| e.state == SetState::Complete)
     }
 
     /// [`Self::genesis`] with an EMPTY membership and the default settings —
@@ -554,10 +582,10 @@ impl ClusterFsm {
     /// how much.
     pub fn validate(&self, cmd: &ClusterCommand) -> Result<(), ClusterRefusal> {
         self.validate_replicated(cmd)?;
-        // Ruling R10, the DOOR half: no operator may apply an unset `0`.
-        // `validate_replicated` accepts one — a pre-catalog record replayed
-        // from the journal decodes as `0` and must still apply (its other
-        // fields included) — and `apply` normalises it to the current value.
+        // Ruling R10, the DOOR half: no operator may apply a `0`.
+        // `validate_replicated` accepts one (it refuses only the upper
+        // bound), and `apply` reads it as `1` from the record alone
+        // (catalog ruling R24; a pre-catalog record already decodes as `1`).
         if let ClusterCommand::Settings(s) = cmd
             && s.retain_sets == 0
         {
@@ -657,10 +685,9 @@ impl ClusterFsm {
                 }
                 // Rulings R8/R10: above `MAX_RETAIN_SETS` the image could not
                 // carry the list with headroom for commanded instants —
-                // refused (47). `0` is NOT refused here: it is a pre-catalog
-                // record replayed from the journal, normalised at apply to
-                // the current value; the leader's door (`validate`) refuses
-                // it from an operator.
+                // refused (47). `0` is NOT refused here: `apply` reads it as
+                // `1` (catalog ruling R24); the leader's door (`validate`)
+                // refuses it from an operator.
                 if s.retain_sets > MAX_RETAIN_SETS {
                     return Err(ClusterRefusal::SettingsBounds("retain_sets"));
                 }
@@ -798,11 +825,16 @@ impl RawStateMachine for ClusterFsm {
                 // an operator record (absent keys = 0) cannot lower it, and
                 // every replica computes the same value.
                 let keep = self.state.settings.datagram_mtu.max(s.datagram_mtu);
-                // Ruling R10: a replayed pre-catalog record (`retain_sets =
-                // 0`) leaves retention as it is.
+                // Catalog ruling R24 (supersedes R10's "keep current"): a replayed
+                // pre-catalog record decodes with `retain_sets = 1` and wins
+                // like every other replayed field. A `0` can only arrive on
+                // a crafted v3 record (the leader's door refuses it); it is
+                // read as `1` from the record ALONE — never from the current
+                // state, which differs between a node that installed an old
+                // image and one that walked from genesis.
                 let mut s = s;
                 if s.retain_sets == 0 {
-                    s.retain_sets = self.state.settings.retain_sets;
+                    s.retain_sets = 1;
                 }
                 self.state.settings = s;
                 self.state.settings.datagram_mtu = keep;
@@ -950,8 +982,14 @@ impl SnapshotStateMachine for ClusterFsm {
             &decode_config(parts.membership).ok_or_else(|| bad("cluster image membership"))?,
         );
         let table = decode_schedule_table(parts.table).ok_or_else(|| bad("cluster image table"))?;
-        let settings =
+        let mut settings =
             decode_settings(parts.settings).ok_or_else(|| bad("cluster image settings"))?;
+        // Catalog ruling R24, belt and braces: a v1/v2 settings tail already decodes
+        // as `1`; any `0` that still arrives is normalised the same way, so
+        // an installed image and a genesis walk hold the same bytes.
+        if settings.retain_sets == 0 {
+            settings.retain_sets = 1;
+        }
         // Empty for a v1 image (the leaf hands both back as empty slices),
         // which decodes to an empty history rather than a refusal.
         //
@@ -1089,9 +1127,15 @@ pub struct ClusterView {
     /// atomics, and a leader that re-proposes the committed record (the
     /// jumbo rung raise) must re-propose a `retain_sets` the door accepts.
     pub retain_sets: AtomicU16,
-    /// Catalog spec §4.5: the newest AGREED set's position; `0` = the
-    /// `Empty` state (no agreed set yet — every reader takes the fallback).
+    /// Catalog spec §4.5: the newest AGREED set's position; `0` = nothing
+    /// agreed (the cluster floor moves nothing). NOT the `Empty` test since
+    /// catalog ruling R26 — that is [`Self::catalog_has_complete`].
     pub catalog_agreed_position: AtomicU64,
+    /// Catalog ruling R26: `true` ⇔ some listed entry is `Complete` (agreed
+    /// or not) — [`ClusterState::catalog_empty`] negated. `false` is the
+    /// `Empty` state, in which the node's floor falls back to its own newest
+    /// complete set; `uc2_catalog_empty` reads it, and so does the node.
+    pub catalog_has_complete: AtomicBool,
     /// How many sets the catalog lists (any state).
     pub catalog_len: AtomicU64,
     /// How many listed sets are still `Commanded` (catalog spec errata: no
@@ -1165,6 +1209,7 @@ impl ClusterView {
             versioned: AtomicU8::new(0),
             retain_sets: AtomicU16::new(0),
             catalog_agreed_position: AtomicU64::new(0),
+            catalog_has_complete: AtomicBool::new(false),
             catalog_len: AtomicU64::new(0),
             catalog_stalled: AtomicU64::new(0),
             catalog_diverged: AtomicU64::new(0),
@@ -1234,6 +1279,8 @@ impl ClusterView {
             st.newest_agreed_at_most(u64::MAX).unwrap_or(0),
             Ordering::Release,
         );
+        self.catalog_has_complete
+            .store(!st.catalog_empty(), Ordering::Release);
         self.catalog_len
             .store(st.catalog.len() as u64, Ordering::Release);
         self.catalog_stalled
@@ -2438,7 +2485,13 @@ mod tests {
             (SetState::Complete, RowVerdict::Diverged, 7)
         );
         assert_eq!(f.state().newest_agreed_at_most(u64::MAX), None);
-        assert!(f.state().catalog_empty());
+        assert!(
+            !f.state().catalog_empty(),
+            "ruling R26: a Complete-but-diverged set is not Empty"
+        );
+        let v = ClusterView::new(f.state());
+        assert_eq!(v.catalog_agreed_position.load(Ordering::Acquire), 0);
+        assert!(v.catalog_has_complete.load(Ordering::Acquire));
     }
 
     #[test]
@@ -2501,7 +2554,7 @@ mod tests {
     fn retain_sets_zero_and_above_the_bound_are_refused_with_47() {
         let f = fsm();
         // `0`: refused at the leader's door, accepted by the replicated half
-        // (a replayed pre-catalog record must still apply — ruling R10).
+        // (apply reads it as `1` — catalog ruling R24).
         let zero = settings_with_retain(&f, 0);
         assert_eq!(
             f.validate(&zero),
@@ -2578,7 +2631,7 @@ mod tests {
         assert_eq!(
             g.state().retain_sets(),
             1,
-            "an unset retain_sets reads as 1"
+            "a v3 image's retain_sets reads as 1"
         );
     }
 
@@ -2760,18 +2813,29 @@ mod tests {
         );
     }
 
+    /// Catalog ruling R24 (supersedes R10): a replayed pre-catalog (v2)
+    /// `Settings` record carries `retain_sets = 1` and wins like every other
+    /// replayed field — it does NOT keep the current value, which would make
+    /// the result depend on how this node reached its state.
     #[test]
-    fn a_replayed_pre_catalog_settings_record_keeps_the_current_retention() {
+    fn a_replayed_pre_catalog_settings_record_sets_retention_to_one() {
         let mut f = fsm();
         let cmd = settings_with_retain(&f, 3);
         assert_eq!(apply_at(&mut f, 100, &cmd), 0);
         let mut old = f.state().settings;
-        old.retain_sets = 0;
         old.admission_bytes = 12345;
-        assert_eq!(apply_at(&mut f, 200, &ClusterCommand::Settings(old)), 0);
+        let mut out = Vec::new();
+        let mut ctx = ApplyCtx::new(200, ClusterFsm::IDENTITY);
+        f.apply(&mut ctx, &v2_settings_body(old), &mut out);
+        assert_eq!(out, vec![0]);
         assert_eq!(f.state().settings.admission_bytes, 12345);
-        assert_eq!(f.state().retain_sets(), 3);
-        assert_eq!(f.state().settings.retain_sets, 3);
+        assert_eq!(f.state().retain_sets(), 1);
+        assert_eq!(f.state().settings.retain_sets, 1);
+        // A crafted v3 `0` (the door refuses an operator's) reads as 1 too.
+        let mut zero = f.state().settings;
+        zero.retain_sets = 0;
+        assert_eq!(apply_at(&mut f, 300, &ClusterCommand::Settings(zero)), 0);
+        assert_eq!(f.state().settings.retain_sets, 1);
     }
 
     #[test]
@@ -2839,5 +2903,149 @@ mod tests {
         assert_eq!(positions(&f), vec![1000, 2000], "2000 is the newest agreed");
         agreed_set(&mut f, 3000, 3100);
         assert_eq!(positions(&f), vec![1000, 3000]);
+    }
+
+    // ------------------------------------------------- final fix wave (C1/I1)
+
+    /// A REAL pre-flag-day (layout v3) image of `f`'s state whose settings
+    /// tail is the 33 B **v2** record a `0.10.0` node wrote — not a v3 record
+    /// inside a v3 image. Provenance: `f.freeze()` (v4), re-sealed with the
+    /// settings record truncated to `SETTINGS_LEN_V2` and its version word
+    /// set to 2, the empty catalog blob's zero length prefix dropped, the
+    /// layout word set to 3 and the CRC recomputed.
+    fn v3_image_with_v2_settings(f: &ClusterFsm) -> Vec<u8> {
+        let (v4, _) = f.freeze().unwrap();
+        let parts = decode_cluster_image(&v4).expect("own image decodes");
+        assert!(parts.catalog.is_empty(), "a v3 image carries no catalog");
+        let mut s = parts.settings.to_vec();
+        s.truncate(uc_protocol::v2::settings::SETTINGS_LEN_V2);
+        s[0..4].copy_from_slice(&2u32.to_le_bytes());
+        let mut img = Vec::new();
+        encode_cluster_image(
+            &ClusterImageParts {
+                settings: &s,
+                ..parts
+            },
+            &mut img,
+        )
+        .unwrap();
+        img.truncate(img.len() - 4); // CRC
+        let catalog_prefix = img.split_off(img.len() - 4);
+        assert_eq!(catalog_prefix, 0u32.to_le_bytes(), "empty catalog blob");
+        img[8..12].copy_from_slice(&3u32.to_le_bytes());
+        let crc = crc32fast::hash(&img);
+        img.extend_from_slice(&crc.to_le_bytes());
+        img
+    }
+
+    /// The same `Settings` command as a pre-flag-day v2 record on the wire
+    /// (33 B payload, version word 2) — what a journal replay of a `0.10.0`
+    /// `uc2ctl settings apply` hands `apply`.
+    fn v2_settings_body(s: Settings) -> Vec<u8> {
+        let mut b = body(&ClusterCommand::Settings(s));
+        b.truncate(CLUSTER_BODY_PREFIX_LEN + uc_protocol::v2::settings::SETTINGS_LEN_V2);
+        b[CLUSTER_BODY_PREFIX_LEN..CLUSTER_BODY_PREFIX_LEN + 4]
+            .copy_from_slice(&2u32.to_le_bytes());
+        b
+    }
+
+    /// C1 (ruling R24): a node that installed a pre-flag-day v3 image whose
+    /// settings tail is a v2 record and a node that reached the same
+    /// position from genesis must hold the SAME cluster state — byte-equal
+    /// images at every later instant — and both read `retain_sets = 1`.
+    /// Before the fix the installed node carried `retain_sets = 0` forever
+    /// (a replayed v2 record kept "the current value"), so the cluster row
+    /// diverged on every instant.
+    #[test]
+    fn a_v3_image_with_a_v2_settings_tail_converges_with_genesis() {
+        let mut a = fsm();
+        genesis_row(&mut a, 0, 100);
+        a.set_consumed(300);
+        let v3 = v3_image_with_v2_settings(&a);
+        let mut b = fsm();
+        assert_eq!(b.install_snapshot(300, &mut &v3[..]).unwrap(), 300);
+        for f in [&mut a, &mut b] {
+            // A replayed pre-flag-day `settings apply`, then two instants.
+            let mut s = f.state().settings;
+            s.admission_bytes = 4 << 20;
+            let mut out = Vec::new();
+            let mut ctx = ApplyCtx::new(400, ClusterFsm::IDENTITY);
+            f.apply(&mut ctx, &v2_settings_body(s), &mut out);
+            assert_eq!(out, vec![0]);
+            agreed_set(f, 1000, 1100);
+            agreed_set(f, 2000, 2100);
+            f.set_consumed(2200);
+        }
+        for f in [&a, &b] {
+            assert_eq!(f.state().retain_sets(), 1);
+            assert_eq!(f.state().settings.retain_sets, 1);
+        }
+        assert_eq!(
+            a.freeze().unwrap().0,
+            b.freeze().unwrap().0,
+            "a v3-image node and a genesis node froze different cluster images"
+        );
+    }
+
+    /// I1 (ruling R25): when an entry turns `Complete`, every OLDER
+    /// `Commanded` entry that is not a pinned origin is dropped — so a node
+    /// that replayed two pre-flag-day `SNAPSHOT` frames (never reported,
+    /// never completing) and a node that did not converge on the first
+    /// completion above them, agreed or not.
+    #[test]
+    fn stale_commanded_entries_drop_when_a_newer_set_completes() {
+        let mut a = fsm();
+        let mut b = fsm();
+        for f in [&mut a, &mut b] {
+            genesis_row(f, 0, 100);
+        }
+        a.on_snapshot_frame(500, false, 1);
+        a.on_snapshot_frame(700, false, 2);
+        assert_eq!(positions(&a), vec![500, 700]);
+        for f in [&mut a, &mut b] {
+            // P = 1000 completes DIVERGED (row 0's two hashes split 1–1–1):
+            // Complete, not agreed — the stale entries must still go.
+            f.on_snapshot_frame(1000, false, 3);
+            assert_eq!(
+                apply_at(f, 1100, &report(0, 1000, &[(0, 1), (1, 2), (2, 3)])),
+                0
+            );
+            assert_eq!(apply_at(f, 1110, &report(CLUSTER_ROW, 1000, &[(0, 1)])), 0);
+            f.set_consumed(1200);
+        }
+        assert_eq!(a.state().catalog[0..].len(), 1);
+        assert_eq!(a.state().catalog, b.state().catalog);
+        assert_eq!(a.freeze().unwrap().0, b.freeze().unwrap().0);
+    }
+
+    /// I1: a pinned origin is never the stale entry dropped.
+    #[test]
+    fn a_pinned_commanded_origin_survives_a_newer_completion() {
+        let mut f = fsm();
+        genesis_row(&mut f, 0, 100);
+        f.on_snapshot_frame(500, false, 1);
+        assert_eq!(
+            apply_at(
+                &mut f,
+                600,
+                &pin(0, pack_version(1, 0, 0), pack_version(1, 1, 0), 500)
+            ),
+            0
+        );
+        f.on_snapshot_frame(700, false, 2);
+        f.on_snapshot_frame(1000, false, 3);
+        assert_eq!(
+            apply_at(&mut f, 1100, &report(0, 1000, &[(0, 1), (1, 2), (2, 3)])),
+            0
+        );
+        assert_eq!(
+            apply_at(&mut f, 1110, &report(CLUSTER_ROW, 1000, &[(0, 1)])),
+            0
+        );
+        assert_eq!(
+            positions(&f),
+            vec![500, 1000],
+            "700 dropped, pinned 500 kept"
+        );
     }
 }

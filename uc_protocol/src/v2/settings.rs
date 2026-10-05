@@ -8,10 +8,13 @@
 
 /// Encoding version, first word of the payload. `3` since the catalog spec
 /// (`retain_sets`); a reader ACCEPTS `2` (the jumbo-flag-day shape, mapped to
-/// `retain_sets = 0`, "unset") and `1` (the `2.11.0` shape, mapped to
-/// `datagram_mtu = 0` and `retain_sets = 0`) because cluster artifacts and
-/// committed frames written by earlier releases persist across the upgrade —
-/// catalog spec §7, jumbo spec §5.5.
+/// `retain_sets = 1`) and `1` (the `2.11.0` shape, mapped to `datagram_mtu =
+/// 0` and `retain_sets = 1`) because cluster artifacts and committed frames
+/// written by earlier releases persist across the upgrade — catalog spec §7,
+/// jumbo spec §5.5. `1` is the retention a pre-catalog cluster actually ran
+/// (newest-only), and it is a function of the record alone, so a node that
+/// installed an old image and a node that started from genesis read the
+/// same value (ruling R24; a `0` here made their images diverge forever).
 pub const SETTINGS_VERSION: u32 = 3;
 /// The exact encoded length of a version-3 record — no trailing bytes.
 pub const SETTINGS_LEN: usize = 4 + 8 + 8 + 8 + 1 + 4 + 2; // 35
@@ -83,11 +86,12 @@ pub struct Settings {
     /// written by discovery, never by an operator file; the FSM keeps it
     /// monotone (`max(committed, incoming)`).
     pub datagram_mtu: u32,
-    /// Catalog spec §4.4: how many AGREED snapshot sets the cluster keeps.
-    /// `0` = unset (a v1/v2 record): a replayed one keeps the current
-    /// retention, and an installed v1–v3 image's reads as `1`.
-    /// `1..=MAX_RETAIN_SETS` (56) otherwise; the leader's door refuses `0`
-    /// and anything above (47), and apply refuses only the latter.
+    /// Catalog spec §4.4: how many AGREED snapshot sets the cluster keeps,
+    /// pinned origins kept in addition (ruling R21). A v1/v2 record decodes
+    /// as `1` — today's newest-only retention (ruling R24).
+    /// `1..=MAX_RETAIN_SETS`; the leader's door refuses `0` and anything
+    /// above (47), apply refuses only the latter, and the cluster FSM
+    /// normalises any `0` that still arrives to `1`.
     pub retain_sets: u16,
 }
 
@@ -101,7 +105,7 @@ impl Settings {
             datagram_mtu: 0,
             // Catalog spec errata (2026-10-04): genesis seeds `1` — today's
             // newest-only retention — because the FSM's door refuses `0`.
-            // `0` survives only as the "unset" reading of a v1/v2 record.
+            // A v1/v2 record decodes as `1` too (ruling R24).
             retain_sets: 1,
         }
     }
@@ -129,8 +133,8 @@ pub fn decode_settings(buf: &[u8]) -> Option<Settings> {
     }
     let version = u32::from_le_bytes(buf[0..4].try_into().unwrap());
     let (datagram_mtu, retain_sets) = match (version, buf.len()) {
-        (1, SETTINGS_LEN_V1) => (0, 0),
-        (2, SETTINGS_LEN_V2) => (u32::from_le_bytes(buf[29..33].try_into().unwrap()), 0),
+        (1, SETTINGS_LEN_V1) => (0, 1),
+        (2, SETTINGS_LEN_V2) => (u32::from_le_bytes(buf[29..33].try_into().unwrap()), 1),
         (3, SETTINGS_LEN) => (
             u32::from_le_bytes(buf[29..33].try_into().unwrap()),
             u16::from_le_bytes(buf[33..35].try_into().unwrap()),
@@ -202,11 +206,12 @@ mod tests {
     }
 
     /// Catalog spec §7: `retain_sets` round-trips on a v3 record; a v2
-    /// record (one word shorter, version 2) decodes with it read as `0`
-    /// ("unset"); a v3 HEADER on a v2 LENGTH is refused — the length is
-    /// exact per version, so a header cannot borrow another version's size.
+    /// record (one word shorter, version 2) decodes with retain_sets = 1 —
+    /// today's newest-only retention (ruling R24); a v3 HEADER on a v2
+    /// LENGTH is refused — the length is exact per version, so a header
+    /// cannot borrow another version's size.
     #[test]
-    fn settings_v3_round_trips_retain_sets_and_v2_reads_as_unset() {
+    fn settings_v3_round_trips_retain_sets_and_v2_reads_as_one() {
         let s = Settings {
             fsm_lag_bytes: 0,
             admission_bytes: 0,
@@ -221,10 +226,10 @@ mod tests {
         assert_eq!(&b[0..4], &3u32.to_le_bytes(), "version 3");
         assert_eq!(&b[33..35], &3u16.to_le_bytes(), "retain_sets @33");
         assert_eq!(decode_settings(&b), Some(s));
-        // a v2 record (33 B, version 2) decodes with retain_sets = 0 (unset)
+        // a v2 record (33 B, version 2) decodes with retain_sets = 1
         let mut v2 = b[..33].to_vec();
         v2[0..4].copy_from_slice(&2u32.to_le_bytes());
-        assert_eq!(decode_settings(&v2).map(|s| s.retain_sets), Some(0));
+        assert_eq!(decode_settings(&v2).map(|s| s.retain_sets), Some(1));
         // a v3 header on a v2 length is refused
         let mut bad = b[..33].to_vec();
         bad[0..4].copy_from_slice(&3u32.to_le_bytes());
@@ -245,6 +250,7 @@ mod tests {
         assert_eq!(v1.len(), SETTINGS_LEN_V1);
         let s = decode_settings(&v1).expect("v1 decodes");
         assert_eq!(s.datagram_mtu, 0);
+        assert_eq!(s.retain_sets, 1, "ruling R24: a v1 record reads as 1");
         assert_eq!(s.fsm_lag_bytes, 16 << 20);
         assert_eq!(s.snapshot_target, Target::Learners);
         // A v1 header with a v2 length (or the reverse) is refused: the

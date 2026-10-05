@@ -906,19 +906,19 @@ fn push_service_families(out: &mut String, s: &ObsSources, commit: u64, now: u64
     push_gauge(
         out,
         "uc2_catalog_agreed_position",
-        "The cluster floor: the newest AGREED set's position, 0 while the catalog is Empty (catalog spec §4.5/§9) — the flag-day window before any set has agreed. Unlike uc2_snapshot_set_position this is sound on a learner-only cluster: a voter that has never fetched still reads the agreed floor here.",
+        "The cluster floor: the newest AGREED set's position, 0 while nothing has agreed — the catalog is Empty (no complete set yet, the flag-day window), or every complete set diverged (catalog spec §4.5/§9). Unlike uc2_snapshot_set_position this is sound on a learner-only cluster: a voter that has never fetched still reads the agreed floor here.",
         catalog_agreed_position,
     );
     push_gauge(
         out,
         "uc2_catalog_empty",
-        "1 while no set has agreed yet (uc2_catalog_agreed_position == 0, catalog spec §4.5/§9), else 0 — a derived convenience so an alert does not have to spell out the == 0 case itself.",
-        u64::from(catalog_agreed_position == 0),
+        "1 while the catalog lists no COMPLETE set (catalog spec §4.5 as amended by ruling R26, §9), else 0 — the Empty state in which a node's purge floor falls back to its own newest complete set. NOT the same as uc2_catalog_agreed_position == 0: a catalog whose complete sets all diverged reads 0 here and 0 there, and its floor moves nothing.",
+        u64::from(!s.cluster_view.catalog_has_complete.load(Ordering::Acquire)),
     );
     push_gauge(
         out,
         "uc2_catalog_stalled",
-        "Listed sets still Commanded — not yet complete (catalog spec §9). No timeout is baked in here; the stalled() query's judgement decides what counts as stuck.",
+        "Listed sets still Commanded — commanded instants not yet complete (catalog spec §9). No timeout is applied: a set counts here from the moment its SNAPSHOT frame is applied until it completes or is retired.",
         s.cluster_view.catalog_stalled.load(Ordering::Acquire),
     );
     push_gauge(
@@ -1900,11 +1900,26 @@ mod tests {
         let stalled = SetEntry::commanded(8192, SetKind::Full, 0);
 
         let st = crate::cluster_fsm::ClusterState {
-            catalog: vec![agreed, diverged, stalled],
+            catalog: vec![agreed, diverged.clone(), stalled.clone()],
             ..crate::cluster_fsm::ClusterState::genesis_empty()
         };
         let mut s = synthetic_sources();
         s.cluster_view = Arc::new(crate::cluster_fsm::ClusterView::new(&st));
+
+        // Ruling R26: a catalog whose only complete set diverged is NOT
+        // Empty, even though nothing has agreed.
+        let only_diverged = crate::cluster_fsm::ClusterState {
+            catalog: vec![diverged, stalled],
+            ..crate::cluster_fsm::ClusterState::genesis_empty()
+        };
+        let mut d = synthetic_sources();
+        d.cluster_view = Arc::new(crate::cluster_fsm::ClusterView::new(&only_diverged));
+        let dtext = render_prometheus(&d);
+        assert!(
+            dtext.contains("\nuc2_catalog_agreed_position 0\n"),
+            "{dtext}"
+        );
+        assert!(dtext.contains("\nuc2_catalog_empty 0\n"), "{dtext}");
 
         let text = render_prometheus(&s);
         assert!(text.contains("\nuc2_catalog_sets 3\n"), "{text}");

@@ -230,7 +230,7 @@ transport setting, both measured closed-loop at inflight 1 on 8-vCPU
   JSON shape are both open); what exists now is five gauges on `/metrics`:
   `uc2_catalog_sets` (how many sets are listed), `uc2_catalog_agreed_position`
   (the cluster floor), `uc2_catalog_empty` (`1` while no set has ever
-  agreed — the flag-day/genesis fallback window, during which the floor and
+  completed — the flag-day/genesis fallback window, during which the floor and
   retention both run on today's pre-catalog rule instead),
   `uc2_catalog_stalled` and `uc2_catalog_diverged` (how many commanded or
   disagreeing sets are visible). `Uc2SnapshotSetDiverged` now keys on
