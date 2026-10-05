@@ -6807,18 +6807,27 @@ impl Consensus {
         self.publish_known_report_sets();
     }
 
-    /// Ruling R40: tell the probe which sets the cache already holds, so it
-    /// never hashes their artifacts. One lock per cache change — a
-    /// completion edge or a seed merge, never a pass.
+    /// Ruling R40: tell the probe which sets the cache already holds IN
+    /// FULL — every declared row plus the cluster row — so it never hashes
+    /// their artifacts. A THIN entry (a re-offer that fell back to the slots
+    /// after a restart and found only the rows they still name) is left out
+    /// on purpose: that is exactly the set the probe must hash. One lock per
+    /// cache change — a completion edge, a re-offer or a seed merge, never a
+    /// pass.
     fn publish_known_report_sets(&self) {
+        let full = self.services.ids().count() + 1;
         let mut g = self
             .report_seeds
             .inner
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         g.known.clear();
-        g.known
-            .extend(self.reported_sets.iter().map(|s| s.position));
+        g.known.extend(
+            self.reported_sets
+                .iter()
+                .filter(|s| s.n >= full)
+                .map(|s| s.position),
+        );
     }
 
     /// [`Self::cache_report_set`]'s insert, without publishing `known`.
@@ -16257,9 +16266,13 @@ mod tests {
         // This incarnation never ran the completion edge for P, and its
         // newest-complete-set word is still 0 (a restart recovers it from
         // the durable floor, which can sit below P): the cache is empty.
+        // What a restarted node's re-offer leaves behind when it falls back
+        // to the slots before its services re-attach: a THIN entry naming
+        // only row 255 (proof run (e), fix round). It must not stop the probe.
+        h.cons.cache_report_set(p, &[(CLUSTER_ROW, cluster_hash)]);
         assert!(
-            h.cons.reported_sets.is_empty(),
-            "precondition: nothing cached"
+            !h.cons.report_seeds.inner.lock().unwrap().known.contains(&p),
+            "a thin entry is not 'known' to the probe"
         );
 
         let mut seeder = ReportSeeder::new(
@@ -16464,10 +16477,19 @@ mod tests {
             &[(0, 0xF0), (1, 0xF1)],
             "an equally full one does"
         );
+        let full: Vec<u64> = h
+            .cons
+            .reported_sets
+            .iter()
+            .filter(|s| s.n == 2)
+            .map(|s| s.position)
+            .collect();
+        assert_eq!(full.len(), MAX_CATALOG_SETS - 1, "one thin entry");
         assert_eq!(
             h.cons.report_seeds.inner.lock().unwrap().known,
-            positions(&h),
-            "the probe is told what the cache holds"
+            full,
+            "the probe is told which sets the cache holds IN FULL; a thin one \
+             is left for it to hash"
         );
     }
 
