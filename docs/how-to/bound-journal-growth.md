@@ -93,7 +93,9 @@ node holds, file presence alone. On a learner-only cluster (`snapshot_target
 prunes the journal below its effective floor. Retention is the node's too,
 and it only deletes: it keeps the set at the persisted floor plus
 everything newer. `retain_sets` (default `1`) is how many agreed sets the
-replicated catalog keeps at all — see [Configuration §
+replicated catalog keeps at all, plus every pinned origin (a row's newest
+upgrade pin keeps its origin's set in addition, never counted toward
+`retain_sets`) — see [Configuration §
 `[settings]`](../reference/configuration.md#settings).
 
 `slack_bytes` retains a tail below the snapshot floor so that a

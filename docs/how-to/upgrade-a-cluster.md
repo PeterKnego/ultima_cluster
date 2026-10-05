@@ -1069,7 +1069,7 @@ replicated record, as opposed to merely running the new binary.
 `[settings]` (genesis) and a `uc2ctl settings apply` TOML file, it means
 `1` — today's newest-only retention, unchanged from before this flag day.
 Set it with [`uc2ctl settings apply`](../reference/uc2ctl.md#settings-apply)
-to keep more than one agreed set; `0` and anything above `56` are refused at
+to keep more than one agreed set; `0` and anything above `48` are refused at
 the door with `47 settings_bounds`. See
 [Configuration § `[settings]`](../reference/configuration.md#settings) and
 [How to keep the journal from growing without bound § Choose a slack and

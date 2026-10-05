@@ -29,11 +29,18 @@ pub use super::upgrade::{CLUSTER_ROW, is_report_row};
 /// datagram ceiling, since the list rides the cluster image, never a
 /// `CLUSTER` frame.
 pub const MAX_CATALOG_SETS: usize = 64;
-/// The largest `retain_sets` the cluster FSM's door accepts (ruling R8):
-/// `MAX_CATALOG_SETS` less eight entries of headroom, so a full complement
-/// of retained agreed sets still leaves room for commanded instants (and
-/// the pinned origins retention must keep) under the image's list bound.
-pub const MAX_RETAIN_SETS: u16 = (MAX_CATALOG_SETS - 8) as u16;
+/// The largest `retain_sets` the cluster FSM's door accepts (rulings R8,
+/// R29): `MAX_CATALOG_SETS` less sixteen entries of headroom. Since R21 a
+/// pinned origin is kept IN ADDITION to `retain_sets` (up to one per row,
+/// eight), and commanded instants still in flight need room beside them, so
+/// a full complement of retained agreed sets plus eight pins plus eight
+/// commanded entries still fits the image's list bound — `cap_catalog`
+/// never has to evict a retained agreed set.
+pub const MAX_RETAIN_SETS: u16 = (MAX_CATALOG_SETS - 16) as u16;
+
+// R29: retained sets + one pinned origin per row + as many commanded
+// entries again must fit the list bound.
+const _: () = assert!(MAX_RETAIN_SETS as usize + 2 * CNC_MAX_SERVICES <= MAX_CATALOG_SETS);
 /// `version u32 ‖ hash u64 ‖ verdict u8`.
 pub const ROW_ENTRY_LEN: usize = 4 + 8 + 1; // 13
 /// `position u64 ‖ kind u8 ‖ state u8 ‖ time_ns u64 ‖ rows[0..CNC_MAX_SERVICES]
@@ -314,8 +321,8 @@ mod tests {
     }
 
     #[test]
-    fn max_retain_sets_leaves_eight_entries_of_headroom() {
-        assert_eq!(MAX_RETAIN_SETS, 56);
-        assert_eq!(MAX_RETAIN_SETS as usize + 8, MAX_CATALOG_SETS);
+    fn max_retain_sets_leaves_sixteen_entries_of_headroom() {
+        assert_eq!(MAX_RETAIN_SETS, 48);
+        assert_eq!(MAX_RETAIN_SETS as usize + 16, MAX_CATALOG_SETS);
     }
 }

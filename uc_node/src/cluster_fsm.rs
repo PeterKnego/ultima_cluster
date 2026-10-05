@@ -380,29 +380,30 @@ impl ClusterState {
             .collect()
     }
 
-    /// Catalog spec §4.4 (as amended, rulings R3 and R9). Let `A` be the
-    /// agreed entries in position order. A removal candidate is an agreed
-    /// entry that is neither a pinned origin (any row's newest pin) nor the
-    /// newest agreed set. While `|A| > retain_sets()`, remove the oldest
-    /// candidate; stop when none remains. Then drop every entry (any state)
-    /// older than the oldest remaining agreed set — except a pinned origin,
-    /// which is never dropped here (belt-and-braces for D5). The newest
-    /// agreed set is never removed — it is the cluster floor.
+    /// Catalog spec §4.4 (as amended, rulings R3, R9 and R21): keep the
+    /// newest `retain_sets` agreed sets, PLUS every pinned origin. Let `U`
+    /// be the agreed entries that are NOT pinned origins (any row's newest
+    /// pin), in position order — a pinned origin is never counted toward
+    /// `retain_sets` and is never the victim. While `|U| > retain_sets()`,
+    /// remove the oldest entry of `U` that is not the newest agreed set;
+    /// stop when none remains. Then drop every entry (any state) older than
+    /// the oldest remaining agreed set — except a pinned origin, which is
+    /// never dropped here (belt-and-braces for D5). The newest agreed set is
+    /// never removed — it is the cluster floor.
     fn retire(&mut self) {
         let pinned = self.pinned_origins();
         let retain = self.retain_sets() as usize;
         loop {
-            let agreed: Vec<usize> = (0..self.catalog.len())
-                .filter(|&i| self.catalog[i].is_agreed())
+            let newest = self.catalog.iter().rposition(SetEntry::is_agreed);
+            let unpinned: Vec<usize> = (0..self.catalog.len())
+                .filter(|&i| {
+                    self.catalog[i].is_agreed() && !pinned.contains(&self.catalog[i].position)
+                })
                 .collect();
-            if agreed.len() <= retain {
+            if unpinned.len() <= retain {
                 break;
             }
-            let newest = *agreed.last().expect("len > retain >= 1");
-            let Some(&victim) = agreed
-                .iter()
-                .find(|&&i| i != newest && !pinned.contains(&self.catalog[i].position))
-            else {
+            let Some(&victim) = unpinned.iter().find(|&&i| Some(i) != newest) else {
                 break;
             };
             self.catalog.remove(victim);
@@ -2548,6 +2549,36 @@ mod tests {
         assert_eq!(apply_at(&mut f, 2600, &cmd), 0);
         assert_eq!(positions(&f), vec![1000, 2000], "the pinned origin stays");
         assert_eq!(f.state().newest_agreed_at_most(1500), Some(1000));
+    }
+
+    /// Ruling R21: a pinned origin is kept IN ADDITION to `retain_sets`,
+    /// never counted toward it. With `retain_sets = 2` and the oldest set
+    /// pinned, `[pin, A, B]` keeps all three; a fourth agreed set retires A
+    /// (the oldest UNPINNED one), never the pin.
+    #[test]
+    fn a_pinned_origin_does_not_count_toward_retain_sets() {
+        let mut f = fsm();
+        genesis_row(&mut f, 0, 100);
+        let cmd = settings_with_retain(&f, 2);
+        assert_eq!(apply_at(&mut f, 200, &cmd), 0);
+        agreed_set(&mut f, 1000, 1100);
+        assert_eq!(
+            apply_at(
+                &mut f,
+                1500,
+                &pin(0, pack_version(1, 0, 0), pack_version(1, 1, 0), 1000)
+            ),
+            0
+        );
+        agreed_set(&mut f, 2000, 2100);
+        agreed_set(&mut f, 3000, 3100);
+        assert_eq!(
+            positions(&f),
+            vec![1000, 2000, 3000],
+            "the pin is kept beside two retained sets"
+        );
+        agreed_set(&mut f, 4000, 4100);
+        assert_eq!(positions(&f), vec![1000, 3000, 4000], "A (2000) retires");
     }
 
     #[test]

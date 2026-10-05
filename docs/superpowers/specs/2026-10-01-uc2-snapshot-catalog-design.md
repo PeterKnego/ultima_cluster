@@ -427,18 +427,22 @@ before its `STATUS` is ever parsed.
 
 #### Errata (as built, 2026-10-04)
 
-- **§4.4 retention counts a pinned origin toward `retain_sets`, not beside
-  it (rulings R3, R21).** §4.4 step 1 reads as excepting a pinned origin
-  from the retiring sweep entirely, which would keep it without spending
-  one of the `retain_sets` slots. As built, `retire()`'s removal loop counts
-  every agreed entry — pinned or not — against `retain_sets` and only
-  refuses to pick a pinned entry as the *victim*; a pin therefore shrinks
-  effective retention by one for as long as it stands. This is the literal
-  reading of R3 and is **not yet** the intended rule: R21 restates it as
-  "keep the newest `retain_sets` agreed sets, PLUS every pinned origin"
-  (pins free, never counted), ruled but **not implemented** — it lands in
-  the final fix wave (Task 5's `retire()` and its test, Task 12 test 3, and
-  this section's wording).
+- **§4.4 retention keeps a pinned origin BESIDE `retain_sets`, never
+  counted toward it — as built (R21).** §4.4 step 1 reads as excepting a
+  pinned origin from the retiring sweep; through Task 13 `retire()` instead
+  counted every agreed entry — pinned or not — against `retain_sets` and
+  only refused to pick a pinned entry as the *victim* (the literal reading
+  of R3), so a pin shrank effective retention by one for as long as it
+  stood. R21 restates the rule as "keep the newest `retain_sets` agreed
+  sets, PLUS every pinned origin", and the final fix wave builds it:
+  `retire()` counts only agreed entries that are NOT pinned origins; while
+  that count exceeds `retain_sets` it removes the oldest unpinned agreed
+  entry that is not the newest agreed set; a pinned origin is never counted
+  and never the victim; the "drop everything older than the oldest
+  remaining agreed set, pins excepted" step is unchanged. Covered by
+  `a_pinned_origin_does_not_count_toward_retain_sets` and Task 12 test 3
+  (`[p1, p2 (pinned), p3]` keeps all three; `p4` retires `p1` and `p3`
+  survives on disk).
 - **§4.2's reports row does not say which version is recorded (ruling
   R4).** "Set `rows[r] = { version, hash: majority, verdict }`" names the
   field but not its value. As built, `version` is the version IN FORCE
@@ -453,12 +457,15 @@ before its `STATUS` is ever parsed.
   retained pin's `from`, which may not be the version that built it. Added
   to §4.3's body as its own paragraph.
 - **§4.4 names no upper bound on `retain_sets`; the door enforces one,
-  `MAX_RETAIN_SETS = 56` (ruling R8).** D5 says only `retain_sets ≥ 1`. The
-  catalog's list rides inside the cluster IMAGE, not a `CLUSTER` frame, so
-  its own retention bound is `MAX_CATALOG_SETS = 64` on the list itself —
-  and `retain_sets` is refused above `MAX_CATALOG_SETS − 8 = 56`, the eight
-  entries of headroom retention needs for commanded instants still in
-  flight and the pinned origins step 1 must also keep. `cap_catalog()` is
+  `MAX_RETAIN_SETS = 48` (rulings R8, R29).** D5 says only `retain_sets ≥
+  1`. The catalog's list rides inside the cluster IMAGE, not a `CLUSTER`
+  frame, so its own retention bound is `MAX_CATALOG_SETS = 64` on the list
+  itself. R8 refused `retain_sets` above `MAX_CATALOG_SETS − 8 = 56`; once
+  R21 kept pinned origins IN ADDITION to `retain_sets`, 56 retained + up to
+  8 pins + commanded headroom exceeded 64 and `cap_catalog` could evict a
+  retained agreed set, so R29 lowers it to `MAX_CATALOG_SETS − 16 = 48` —
+  eight entries for pins (one per row) and eight for commanded instants in
+  flight, pinned by a compile-time assert in `uc_protocol::v2::catalog`. `cap_catalog()` is
   the backstop this bound is meant to make unreachable: it evicts the
   oldest non-agreed entry first, then the oldest agreed entry that is
   neither a pinned origin nor the newest agreed set, and never the newest
@@ -675,3 +682,8 @@ before its `STATUS` is ever parsed.
   `cluster_agent::ClusterArtifactHash` — a two-word seqlock, published
   BEFORE `cluster_snapshot_pos` moves — and the report edge reads
   `hash_at(P)`, skipping row 255 when the word names another position.
+- **R29 — `MAX_RETAIN_SETS = MAX_CATALOG_SETS − 16 = 48` (final fix wave,
+  M6).** See the R8 bullet above: after R21, 56 retained sets plus eight
+  pins plus commanded headroom exceeded the 64-entry list and
+  `cap_catalog` would evict a retained agreed set. Cost: an operator who
+  wanted 49–56 retained sets (none exist before the backup tier).

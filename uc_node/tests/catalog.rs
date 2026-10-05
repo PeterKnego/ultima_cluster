@@ -17,7 +17,8 @@
 //!    next instant completes regardless;
 //! 3. `retain_sets = 2` retires the oldest agreed set — from the catalog and
 //!    from every node's disk — while the journal follows the newest agreed
-//!    set and a pinned origin outlives its retirement;
+//!    set and a pinned origin is kept beside the retained sets, never
+//!    counted toward `retain_sets` (ruling R21);
 //! 4. the flag-day window (a pre-catalog `v3` cluster artifact on disk) is
 //!    `Empty`, serves a joiner, keeps the set the node stands on, and ends
 //!    at the first agreed instant;
@@ -1099,21 +1100,23 @@ fn a_stalled_set_stays_commanded_and_the_next_instant_completes() {
     c.stop();
 }
 
-/// Catalog spec §4.4: `retain_sets = 2` keeps the two newest agreed sets,
-/// retires the oldest from the catalog AND from every node's disk, and a
-/// pinned origin outlives its own retirement; the journal floor follows the
-/// newest agreed set the node holds, not the oldest retained.
+/// Catalog spec §4.4 (ruling R21): `retain_sets = 2` keeps the two newest
+/// UNPINNED agreed sets plus every pinned origin, retires the oldest from the
+/// catalog AND from every node's disk, and a pinned origin is never counted
+/// and never retired; the journal floor follows the newest agreed set the
+/// node holds, not the oldest retained.
 ///
 /// Instants `p1`, `p2` (catalog `[p1, p2]`, journal purged past `p1`); a
-/// same-line pin naming `p2` as a row's origin; `p3` (catalog `[p2, p3]`,
-/// `p1`'s files gone from every node); `p4` — `p2` is now the oldest of three
-/// agreed sets and would retire, but it is a pinned origin, so the oldest
-/// UNPINNED set (`p3`) retires instead (as built: a pin counts toward
-/// `retain_sets` and is never the victim), the catalog reads `[p2, p4]`,
-/// and every node keeps `p2`'s files.
+/// same-line pin naming `p2` as a row's origin; `p3` — the unpinned agreed
+/// sets are `[p1, p3]`, exactly `retain_sets`, so nothing retires and the
+/// catalog reads `[p1, p2, p3]` (the pin costs no retention slot); `p4` —
+/// the unpinned sets are `[p1, p3, p4]`, so the oldest, `p1`, retires from
+/// the catalog and every node's disk, the catalog reads `[p2, p3, p4]`, and
+/// `p3` SURVIVES on disk beside the pinned `p2`.
 ///
-/// Red twins: skip the settings apply (retention 1 drops `p1` at `p2`), or
-/// skip the pin (`p2` leaves at `p4`).
+/// Red twins: skip the settings apply (retention 1 drops `p1` at `p2`), skip
+/// the pin (`p2` leaves at `p4`), or count the pin toward `retain_sets` (as
+/// built before R21: `p1` leaves at `p3` and `p3` at `p4`).
 #[test]
 fn retain_sets_2_retires_the_oldest_and_keeps_the_pinned_origin() {
     let _g = serialize();
@@ -1172,14 +1175,18 @@ fn retain_sets_2_retires_the_oldest_and_keeps_the_pinned_origin() {
     submit_frames(c.node(leader), 4000);
     let p3 = instant_until_complete(&c, leader, &all);
     await_agreed(&c, &all, p3);
-    await_until(
-        30,
-        "every node retired p1 from its catalog and its disk",
-        || {
-            all.iter()
-                .all(|&i| positions(c.node(i)) == vec![p2, p3] && none_on_disk(c.dir(i), &[0], p1))
-        },
-    );
+    // Ruling R21: the pinned p2 is not counted, so the unpinned agreed sets
+    // are [p1, p3] — exactly retain_sets — and nothing retires.
+    await_until(30, "every node lists [p1, p2, p3]", || {
+        all.iter()
+            .all(|&i| positions(c.node(i)) == vec![p1, p2, p3])
+    });
+    for &i in &all {
+        assert!(
+            holds_on_disk(c.dir(i), &[0], p1),
+            "node {i}: p1 is still retained — the pin cost no retention slot"
+        );
+    }
 
     submit_frames(c.node(leader), 4000);
     let p4 = instant_until_complete(&c, leader, &all);
@@ -1188,23 +1195,26 @@ fn retain_sets_2_retires_the_oldest_and_keeps_the_pinned_origin() {
     await_until(30, "every node's floor reached p4", || {
         all.iter().all(|&i| floor(&c, i) == p4)
     });
-    // As built (rulings R3/R9, `ClusterState::retire`): a pinned origin is
-    // never a removal candidate, but it COUNTS toward `retain_sets` — so with
-    // `[p2 (pinned), p3, p4]` agreed and `retain_sets = 2`, the oldest
-    // UNPINNED set (p3) retires and p2 stays.
-    await_until(30, "every node retired p3's files", || {
-        all.iter().all(|&i| none_on_disk(c.dir(i), &[0], p3))
+    // Ruling R21 (`ClusterState::retire`): a pinned origin is never counted
+    // toward `retain_sets` — with `[p1, p2 (pinned), p3, p4]` agreed and
+    // `retain_sets = 2`, the unpinned sets are [p1, p3, p4], so p1 (the
+    // oldest) retires and p2 and p3 both stay.
+    await_until(30, "every node retired p1's files", || {
+        all.iter().all(|&i| none_on_disk(c.dir(i), &[0], p1))
     });
     for &i in &all {
         assert_eq!(
             positions(c.node(i)),
-            vec![p2, p4],
-            "node {i}: p2 is the oldest agreed set but a pinned origin, so the oldest \
-             UNPINNED set retires instead and p2 stays listed"
+            vec![p2, p3, p4],
+            "node {i}: p1 retires; the pinned p2 is kept beside two retained sets"
         );
         assert!(
             holds_on_disk(c.dir(i), &[0], p2),
             "node {i}: the pinned origin's set must survive on disk"
+        );
+        assert!(
+            holds_on_disk(c.dir(i), &[0], p3),
+            "node {i}: p3 is retained (the pin does not take its slot) and survives on disk"
         );
         assert!(
             holds_on_disk(c.dir(i), &[0], p4),
