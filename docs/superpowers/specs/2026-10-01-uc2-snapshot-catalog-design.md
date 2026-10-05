@@ -892,3 +892,25 @@ voters than before (9 of 30 appends in (e)). §4.3's "one reporter is agreed"
 makes such a record move the floor — no less safe than `main`'s node-local
 floor, but thinner divergence coverage under leader churn; a short grace on
 a fresh leader is under ruling.
+
+**Settled (rulings R39–R41, 2026-10-05, Task 16 fix round).** (R39) The leader
+drops a report whose position is above its OWN log extent — an honest
+reporter applied to P, so P is committed, so the leader holds those bytes —
+counted as `snapshot_report_dropped reason=above_extent`, once a minute per
+reporter; this turns a forged position (crypto off) into a no-op instead of a
+permanent wedge of that row's agreement. A forged report below the extent at
+an unlisted position still appends by fallback timeout and is ignored by the
+catalog (§4.2, no entry); that is the crypto-off posture
+`docs/security/attack-surface.md` now names. (R40) The completed-set hash
+cache a node re-offers from is seeded from the artifacts it holds by the
+`uc2-holdings` thread — a row file's payload after the 24-byte `ULTSNAP2`
+envelope hashes to the slot's `artifact_hash`; row 255's bare image to the
+published word — one probe after a set is first seen complete, never from the
+consensus pass. A restarted node therefore re-offers its full evidence, and
+the one-voter records of round 2 are gone; the records that still name two of
+three voters are those where the third voter never built the set. (R41) Such
+a two-of-three matching record IS agreed and moves the floor: §4.3 already
+accepts one reporter, the purging node must additionally hold the set, and
+the absent voter has nothing a third report could have compared. A grace
+period on a fresh leader was analysed and declined: it would have changed
+none of the thin records.
