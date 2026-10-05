@@ -322,21 +322,59 @@ const FRAME_BYTES: u64 = 32 + PAYLOAD as u64;
 /// AHEAD of the traffic it was meant to follow (observed: a standby instant
 /// at P = 128 after 6000 "submitted" frames).
 fn submit_frames(node: &Node, n: u64) {
+    /// How long ONE frame may keep meeting a full ingress ring (Ruling R23:
+    /// fail by name, never hang).
+    const FULL_DEADLINE: Duration = Duration::from_secs(60);
+    let counters = || {
+        let c = node.counters();
+        format!(
+            "append={} commit={} durable={}",
+            c.append.load_acquire(),
+            c.commit.load_acquire(),
+            c.durable.load_acquire()
+        )
+    };
     let before = node.counters().append.load_acquire();
     for i in 0u64..n {
         let mut p = vec![0u8; PAYLOAD];
         p[..8].copy_from_slice(&i.to_le_bytes());
+        let mut first_full: Option<Instant> = None;
         loop {
             match node.submit(p.clone()) {
                 Ok(()) => break,
-                Err(_) => std::thread::yield_now(),
+                Err(uc_node::SubmitError::NotServing) => panic!(
+                    "submit_frames: frame {i} of {n} refused NotServing — leadership moved off \
+                     the node this fixture submits to. The fixture deliberately does NOT follow \
+                     leadership: re-shape the test (re-resolve the leader between phases), do \
+                     not add retries here ({})",
+                    counters()
+                ),
+                Err(uc_node::SubmitError::Full) => {
+                    let since = *first_full.get_or_insert_with(Instant::now);
+                    if since.elapsed() >= FULL_DEADLINE {
+                        panic!(
+                            "submit_frames: frame {i} of {n} met a full ingress ring for \
+                             {FULL_DEADLINE:?} — the log is not draining (a stalled `durable` \
+                             means the archive cannot write): {}",
+                            counters()
+                        );
+                    }
+                    std::thread::yield_now();
+                }
             }
         }
     }
     let target = before + n * FRAME_BYTES;
-    await_until(60, "the submitted frames committed", || {
-        node.counters().commit.load_acquire() >= target
-    });
+    let deadline = deadline_secs(60);
+    while node.counters().commit.load_acquire() < target {
+        assert!(
+            Instant::now() < deadline,
+            "submit_frames: the {n} submitted frames did not commit within 60 s \
+             (target commit {target}): {}",
+            counters()
+        );
+        std::thread::yield_now();
+    }
 }
 
 /// Wait until every running node's rows `rows` carry the snapshot-capability
@@ -1538,5 +1576,42 @@ fn learner_only_voters_do_not_purge_until_they_fetch() {
     );
     assert_eq!(floor(&c, 1), 0, "voter 1's floor never moved");
 
+    c.stop();
+}
+
+/// Ruling R23: the fixture fails BY NAME, never hangs. A follower answers
+/// `NotServing` to every submit, and [`submit_frames`] must panic on the
+/// first one — naming the frame and that leadership moved — rather than
+/// spin. Cheap: two voters, no services, no instant.
+#[test]
+fn submit_frames_fails_by_name_on_a_node_that_does_not_serve() {
+    let _g = serialize();
+    let o = Opts {
+        app: "catalog-fixture",
+        services: ServicesConfig::none_for_tests(),
+        purge: false,
+        settings: Settings::genesis_default(),
+    };
+    let c = spawn(2, 0, o, |_| true);
+    let leader = await_single_leader(&c, 30);
+    let follower = 1 - leader;
+    let t0 = Instant::now();
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        submit_frames(c.node(follower), 10)
+    }));
+    let elapsed = t0.elapsed();
+    let msg = r
+        .expect_err("submit_frames on a follower must panic, not return")
+        .downcast::<String>()
+        .map(|b| *b)
+        .unwrap_or_default();
+    assert!(
+        msg.contains("frame 0 of 10 refused NotServing") && msg.contains("leadership moved"),
+        "the panic must name the frame and the cause: {msg}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "it must fail at once, not after a deadline: {elapsed:?}"
+    );
     c.stop();
 }
