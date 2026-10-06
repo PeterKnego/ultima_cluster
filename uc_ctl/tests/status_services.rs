@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use uc_log::cnc::{CncPage, pack_service_status};
+use uc_log::cnc::{CncPage, RowRead, pack_service_status};
 use uc_net::fault::FaultConfig;
 use uc_node::{
     CryptoConfig, DEFAULT_JOURNAL_SEGMENT_BYTES, FsmLag, Node, NodeConfig, PurgePolicy,
@@ -107,7 +107,42 @@ fn status_prints_one_row_per_declared_fsm_including_an_absent_one() {
     );
     s0.status.store_release(pack_service_status(0, true, 1));
 
+    // #33: an attached row makes the node append that row's running-version
+    // GENESIS record, and the cluster agent rewrites the slot's row view on
+    // every batch it applies. Wait until that publication has landed before
+    // reading or writing the view: on a slow runner the record applies late,
+    // and a hand-stored view written before it was overwritten by it (nightly
+    // 2026-10-05/06, `running=unversioned running_pos=96` instead of the
+    // hand-stored 1.4.2 @ 640). After this point the idle single node applies
+    // nothing further, so the slot is ours.
+    let genesis_pos = {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            if let RowRead::View {
+                running: Some(_),
+                record_pos,
+                ..
+            } = s0.status.row_view()
+                && record_pos > 0
+            {
+                break record_pos;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "row 0's running-version genesis record never reached the slot"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    };
+
     let stdout = run_status(&dir);
+    let row_line = |stdout: &str, row: u8| -> String {
+        stdout
+            .lines()
+            .find(|l| l.trim_start().starts_with(&format!("row={row} ")))
+            .unwrap_or_else(|| panic!("no row={row} line in:\n{stdout}"))
+            .to_string()
+    };
 
     assert!(
         stdout.contains("services: declared=[0, 1] fsm_lag=8192 bytes"),
@@ -142,11 +177,13 @@ fn status_prints_one_row_per_declared_fsm_including_an_absent_one() {
     // The pre-existing sections are untouched.
     assert!(stdout.contains("config: version="), "{stdout}");
     assert!(stdout.contains("members:"), "{stdout}");
-    // Row 0 has no row view stored yet: `running=none`.
+    // Row 0 carries the node-written genesis view (an unversioned running
+    // version at the record's position); row 1, never attached, has none.
     assert!(
-        stdout.contains("row=0") && stdout.contains("running=none"),
+        row_line(&stdout, 0).contains(&format!("running=unversioned running_pos={genesis_pos}")),
         "{stdout}"
     );
+    assert!(row_line(&stdout, 1).contains("running=none"), "{stdout}");
 
     // #33 task 10: a row view on slot 0 — `running` present, at a named
     // record position — is rendered right after `artifact_hash=`.
@@ -156,12 +193,12 @@ fn status_prints_one_row_per_declared_fsm_including_an_absent_one() {
         640,
     );
     let stdout = run_status(&dir);
-    assert!(stdout.contains("running=1.4.2 running_pos=640"), "{stdout}");
-    // Row 1 still has no row view stored: `running=none`.
     assert!(
-        stdout.contains("row=1") && stdout.contains("running=none"),
+        row_line(&stdout, 0).contains("running=1.4.2 running_pos=640"),
         "{stdout}"
     );
+    // Row 1 still has no row view stored: `running=none`.
+    assert!(row_line(&stdout, 1).contains("running=none"), "{stdout}");
 
     node.stop();
 }
