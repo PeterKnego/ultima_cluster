@@ -16,7 +16,7 @@ use uc_log::agent::{AgentRunner, IdleStrategy};
 use uc_log::archive::{Archive, ArchiveConfig, ReplayFrame};
 use uc_log::buffer::{AppendError, Appender, LogBuffer};
 use uc_log::cnc::{CncMeta, CncPage};
-use uc_log::counters::PaddedAtomicU64;
+use uc_log::counters::{AppendLine, PaddedAtomicU64};
 use uc_log::region::Region;
 use uc_net::SoftTableWire;
 use uc_net::fault::{FaultConfig, FaultSocket};
@@ -290,7 +290,23 @@ pub fn load(leader: &Arc<LogBuffer>, live: &[&Arc<LogBuffer>], n_msgs: u64) -> u
     a.position()
 }
 
-pub fn await_pos(c: &PaddedAtomicU64, target: u64, what: &str) {
+/// Any position counter a test can wait on: the padded counters and
+/// `append`'s line (#78 gave `append` its own line type).
+pub trait PosCounter {
+    fn load_acquire(&self) -> u64;
+}
+impl PosCounter for PaddedAtomicU64 {
+    fn load_acquire(&self) -> u64 {
+        PaddedAtomicU64::load_acquire(self)
+    }
+}
+impl PosCounter for AppendLine {
+    fn load_acquire(&self) -> u64 {
+        AppendLine::load_acquire(self)
+    }
+}
+
+pub fn await_pos(c: &impl PosCounter, target: u64, what: &str) {
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         let v = c.load_acquire();

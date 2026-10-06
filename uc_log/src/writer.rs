@@ -166,7 +166,7 @@ mod tests {
         // `durable` counters keep the appender's and the writer's gates open.
         let mut pos = 0u64;
         let mut i = 0u32;
-        let mut ship = |a: &mut Appender, upto_frames: u32, i: &mut u32, pos: &mut u64| {
+        let ship = |a: &mut Appender, upto_frames: u32, i: &mut u32, pos: &mut u64| {
             // In chunks of 10 frames: the leader's own gate is
             // `durable + capacity`, so it must see each chunk archived.
             while *i < upto_frames {
