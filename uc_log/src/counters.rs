@@ -44,6 +44,72 @@ impl PaddedAtomicU64 {
 
 const _: () = assert!(std::mem::size_of::<PaddedAtomicU64>() == 64);
 
+/// `append`'s cache line: the position counter plus the follower receiver's
+/// WRITE RESERVE (#78), in the same 64 B line because the two words have the
+/// same writer in each role (the leader's appender writes `append` only; a
+/// follower's receiver writes both), so the line keeps one writer.
+///
+/// The reserve is the highest run END the receiver may have written into the
+/// ring — raised BEFORE the run's bytes are copied, with a release fence
+/// between. A validated reader bounds itself by
+/// `max(append + max_claim, reserve)`: `max_claim` covers the leader
+/// appender's in-flight write, but a follower's receiver writes whole
+/// datagram runs, and out-of-order runs above a gap, anywhere in
+/// `[contiguous, durable + capacity)` before it publishes `append`, so only
+/// the reserve bounds what a reader below `durable` can see overwritten.
+/// A page from a build without the word reads `0`, which degrades exactly to
+/// the `append + max_claim` bound — no flag day.
+#[repr(C, align(64))]
+pub struct AppendLine {
+    v: AtomicU64,
+    reserve: AtomicU64,
+    _pad: [u8; 48],
+}
+
+const _: () = assert!(std::mem::size_of::<AppendLine>() == 64);
+const _: () = assert!(std::mem::offset_of!(AppendLine, reserve) == 8);
+
+impl AppendLine {
+    pub fn new(v: u64) -> Self {
+        Self {
+            v: AtomicU64::new(v),
+            reserve: AtomicU64::new(0),
+            _pad: [0; 48],
+        }
+    }
+    #[inline]
+    pub fn load_acquire(&self) -> u64 {
+        self.v.load(Ordering::Acquire)
+    }
+    #[inline]
+    pub fn store_release(&self, v: u64) {
+        self.v.store(v, Ordering::Release)
+    }
+    /// The write reserve (#78); `0` on a page that never had one.
+    #[inline]
+    pub fn reserve_acquire(&self) -> u64 {
+        self.reserve.load(Ordering::Acquire)
+    }
+    /// Writer side of the #78 seqlock: raise the reserve to cover a run
+    /// ending at `end`, then fence, so a reader whose copy observes any byte
+    /// the caller writes AFTER this call observes the raised reserve on its
+    /// post-copy re-check (fence–fence synchronisation). Call it before every
+    /// ring write that can land beyond `append + max_claim`. Monotone between
+    /// primes; single writer (the follower's receiver).
+    #[inline]
+    pub fn raise_reserve(&self, end: u64) {
+        if end > self.reserve.load(Ordering::Relaxed) {
+            self.reserve.store(end, Ordering::Relaxed);
+        }
+        std::sync::atomic::fence(Ordering::Release);
+    }
+    /// Reset by [`LogCounters::prime`]: a prime discards the ring's content.
+    #[inline]
+    fn reset_reserve(&self, v: u64) {
+        self.reserve.store(v, Ordering::Release);
+    }
+}
+
 /// The M1+M2+M3 counter set. append: written only by the appender (leader) /
 /// receiver (follower), after the frame commit word (so any position below
 /// `append` is a committed frame). durable: written only by the archive,
@@ -57,7 +123,7 @@ const _: () = assert!(std::mem::size_of::<PaddedAtomicU64>() == 64);
 /// is re-derived live. (Commit persistence is revisited in M4/M5.)
 #[repr(C)]
 pub struct LogCounters {
-    pub append: PaddedAtomicU64,
+    pub append: AppendLine,
     pub durable: PaddedAtomicU64,
     pub sent: PaddedAtomicU64,
     pub commit: PaddedAtomicU64,
@@ -78,7 +144,7 @@ impl LogCounters {
     #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
         Self {
-            append: PaddedAtomicU64::new(0),
+            append: AppendLine::new(0),
             durable: PaddedAtomicU64::new(0),
             sent: PaddedAtomicU64::new(0),
             commit: PaddedAtomicU64::new(0),
@@ -94,6 +160,7 @@ impl LogCounters {
     /// `commit` is deliberately not primed (see the struct doc).
     pub fn prime(&self, pos: u64) {
         self.durable.store_release(pos);
+        self.append.reset_reserve(pos);
         self.append.store_release(pos);
         // A restart resends from durable; followers drop the duplicates.
         self.sent.store_release(pos);

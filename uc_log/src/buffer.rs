@@ -216,6 +216,16 @@ impl LogBuffer {
         2 * align_frame_len(HEADER_LEN + self.max_payload) as u64
     }
 
+    /// The highest stream position any writer may have touched given
+    /// `append`: the leader appender's in-flight claim, or the follower
+    /// receiver's published write reserve, whichever is further (#78). A
+    /// validated read of `[from, ..)` is sound only while this stays at or
+    /// below `from + capacity`, before AND after the copy.
+    #[inline]
+    fn write_extent(&self, append: u64) -> u64 {
+        (append + self.max_claim()).max(self.cnc.counters().append.reserve_acquire())
+    }
+
     #[inline]
     pub(crate) fn region(&self) -> &Region {
         &self.region
@@ -470,7 +480,7 @@ impl LogBuffer {
         if pos >= append {
             return FrameRead::NotCommitted;
         }
-        if append + self.max_claim() > pos + self.capacity {
+        if self.write_extent(append) > pos + self.capacity {
             return FrameRead::Overrun;
         }
         let off = self.offset(pos);
@@ -494,7 +504,7 @@ impl LogBuffer {
         std::sync::atomic::fence(Ordering::Acquire);
         // Re-validate: did the appender advance into our margin during the copy?
         let append_after = self.cnc.counters().append.load_acquire();
-        if append_after + self.max_claim() > pos + self.capacity {
+        if self.write_extent(append_after) > pos + self.capacity {
             return FrameRead::Overrun;
         }
         FrameRead::Frame(frame::read_header(out))
@@ -514,7 +524,7 @@ impl LogBuffer {
         if from >= append {
             return SliceRead::NotCommitted;
         }
-        if append + self.max_claim() > from + self.capacity {
+        if self.write_extent(append) > from + self.capacity {
             return SliceRead::Overrun;
         }
         let off = self.offset(from);
@@ -555,7 +565,7 @@ impl LogBuffer {
         // Seqlock re-check (see read_frame_validated for the fence rationale).
         std::sync::atomic::fence(Ordering::Acquire);
         let append_after = self.cnc.counters().append.load_acquire();
-        if append_after + self.max_claim() > from + self.capacity {
+        if self.write_extent(append_after) > from + self.capacity {
             return SliceRead::Overrun;
         }
         if walked == 0 {
