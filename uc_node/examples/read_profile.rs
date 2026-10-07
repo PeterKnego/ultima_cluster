@@ -342,6 +342,14 @@ struct ClientArgs {
     /// the occupancy ranking (see the module doc).
     #[arg(long)]
     service_pid: Option<u32>,
+    /// Attach to a node in ANY role, not only a serving leader. Snapshot reads
+    /// are answered by every node's own service (the query drain forwards a
+    /// non-linearizable read before its leader check), so this is how the
+    /// read-spread experiment loads a follower. Snapshot mode and
+    /// `--write-rate 0` only: a follower answers a linearizable read or a write
+    /// with NOT_LEADER, which would measure nothing.
+    #[arg(long, default_value_t = false)]
+    any_role: bool,
 }
 
 #[derive(clap::Args)]
@@ -935,11 +943,14 @@ fn run_read_measurement(
     mode: Mode,
     write_rate: u64,
     task_dirs: &[(u32, PathBuf)],
+    any_role: bool,
 ) -> (ReadStats, Vec<Occupancy>) {
     let cnc = CncPage::open_file(&instance_dir.join(CNC_FILE), app_id)
         .unwrap_or_else(|e| panic!("cnc attach {instance_dir:?}: {e}"));
     let client_id = cnc.status().next_client_id.fetch_add(1) as u32;
-    await_serving(&cnc, LEADER_WAIT);
+    if !any_role {
+        await_serving(&cnc, LEADER_WAIT);
+    }
 
     let (query_producer, _query_consumer) = MpscRing::open(&instance_dir.join(QUERY_RING))
         .unwrap_or_else(|e| panic!("open query.ring: {e}"))
@@ -1088,8 +1099,9 @@ fn run_read_measurement(
     'send: while Instant::now() < deadline {
         // Pause while the attached node is not a serving leader: without this a
         // leadership flip degenerates into a NOT_LEADER feedback flood that
-        // measures nothing (the m5_gate lesson).
-        if cnc.status().flags.load_acquire() & NODE_FLAG_CAN_SERVE == 0 {
+        // measures nothing (the m5_gate lesson). `--any-role` reads a follower
+        // on purpose, so it skips the gate.
+        if !any_role && cnc.status().flags.load_acquire() & NODE_FLAG_CAN_SERVE == 0 {
             thread::sleep(Duration::from_millis(1));
             continue;
         }
@@ -1438,6 +1450,7 @@ fn run_all(a: AllArgs) -> anyhow::Result<()> {
         a.mode,
         a.write_rate,
         &self_task_dirs(),
+        false,
     );
     print_read_report(a.mode, readers, a.write_rate, &stats, &occ);
     stop_cluster(nodes, services);
@@ -1489,6 +1502,11 @@ fn run_client_role(a: ClientArgs) -> anyhow::Result<()> {
              longer uses the occupancy ranking (see the module doc)."
         );
     }
+    anyhow::ensure!(
+        !a.any_role || (a.mode == Mode::Snap && a.write_rate == 0),
+        "--any-role takes --mode snap and --write-rate 0 only: a follower answers a \
+         linearizable read or a write with NOT_LEADER"
+    );
     let (stats, occ) = run_read_measurement(
         &a.instance_dir,
         &a.app_id,
@@ -1497,6 +1515,7 @@ fn run_client_role(a: ClientArgs) -> anyhow::Result<()> {
         a.mode,
         a.write_rate,
         &task_dirs,
+        a.any_role,
     );
     print_read_report(a.mode, readers, a.write_rate, &stats, &occ);
     anyhow::ensure!(
@@ -2052,6 +2071,7 @@ fn run_ladder(a: LadderArgs) -> anyhow::Result<()> {
                     mode,
                     write_rate,
                     &self_task_dirs(),
+                    false,
                 );
                 stop_cluster(nodes, services);
                 anyhow::ensure!(
