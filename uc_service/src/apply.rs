@@ -797,6 +797,28 @@ pub(crate) fn apply_cycle<S: RawStateMachine>(st: &mut ApplyState<S>) -> bool {
                     progressed = true;
                     break;
                 }
+                // #77: replay stopped AT a frame the journal holds whose end
+                // is above `min(commit, durable)` (commit can sit mid-frame).
+                // Rejoin at its start and end the cycle; the next one retries
+                // once commit has moved. Never the no-progress guard's gap
+                // case: reaching the frame proves the journal served this
+                // cursor, so any stall episode is over too.
+                Ok(Replay::AwaitCommit(at)) => {
+                    st.replay_wait = None;
+                    st.needs_replay = false;
+                    st.replay_stalled = None;
+                    let moved = at > cursor_before;
+                    st.follower.cursor = at;
+                    crate::attach::slot(&st.cnc, st.service_id)
+                        .applied
+                        .store_release(at);
+                    if moved {
+                        st.lag_waiting = false;
+                        st.announce_pending = true;
+                        progressed = true;
+                    }
+                    break;
+                }
                 // The covering artifact is above `min(commit, durable)`: the
                 // counters are still climbing toward it. Leave the cursor
                 // where it is and let the agent idle; the next cycle overruns
@@ -2140,6 +2162,18 @@ mod tests {
         dir: &tempfile::TempDir,
         instance_id: u128,
     ) -> (super::ApplyState<CountSm>, Vec<u64>, u64) {
+        a_lapped_row(dir, instance_id, true)
+    }
+
+    /// A row whose live ring has lapped its cursor (0), so `next_batch`
+    /// answers `Overrun` and the cycle replays from the journal. With
+    /// `drop_journal` the journal is then taken away (a below-floor row);
+    /// without it the journal retains every byte (#77's healthy lapped row).
+    fn a_lapped_row(
+        dir: &tempfile::TempDir,
+        instance_id: u128,
+        drop_journal: bool,
+    ) -> (super::ApplyState<CountSm>, Vec<u64>, u64) {
         let cnc = page(instance_id);
         cnc.store_services_declared(0b1);
         let buffer = std::sync::Arc::new(uc_log::buffer::LogBuffer::new(
@@ -2168,8 +2202,10 @@ mod tests {
         drop(archive);
         let head = cnc.counters().append.load_acquire();
         cnc.counters().commit.store_release(head);
-        std::fs::remove_dir_all(&journal_dir).unwrap();
-        std::fs::create_dir_all(&journal_dir).unwrap();
+        if drop_journal {
+            std::fs::remove_dir_all(&journal_dir).unwrap();
+            std::fs::create_dir_all(&journal_dir).unwrap();
+        }
 
         let egress_ring =
             uc_protocol::ring::BroadcastRing::create(&dir.path().join("egress.bc"), 1 << 16, 1024)
@@ -2212,6 +2248,65 @@ mod tests {
             snapshot_restore: None,
         };
         (st, pos, head)
+    }
+
+    /// #77: commit is a byte position, not a frame boundary — each node's
+    /// durable report is capped at `min_applied + fsm_lag`, an arbitrary byte,
+    /// and commit is their quorum order statistic — so `min(commit, durable)`
+    /// can sit inside the frame that starts at the cursor. Replay then
+    /// correctly refuses that frame (its end is above the target) and returns
+    /// the cursor unmoved. That is NOT a gap: the journal holds the frame, it
+    /// just is not committed whole yet. The no-progress guard read it as one,
+    /// forced the gap path, and fail-stopped a healthy row with
+    /// `SnapshotRequired` (nightly 2026-10-07: cursor 262144, target 262240,
+    /// a 128 B frame). The cycle must idle instead, and apply the frame once
+    /// commit passes its end.
+    #[test]
+    fn a_frame_straddling_the_apply_target_is_waited_on_not_treated_as_a_gap() {
+        let dir = scratch();
+        let (mut st, pos, head) = a_lapped_row(&dir, 0x7777, false);
+        assert!(st.snapshot_restore.is_none(), "no install capability");
+        // Commit 32 B into the first frame (frames are 96 B: 32 B header + 64).
+        let straddle = pos[0] + 32; // `append` returns the frame START
+        assert_eq!((pos[0], pos[1]), (0, 96), "the first frame is [0, 96)");
+        st.cnc.counters().commit.store_release(straddle);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let h = std::thread::spawn(move || {
+            let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                super::apply_cycle(&mut st)
+            }));
+            let msg = out.as_ref().err().map(|e| {
+                e.downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
+                    .unwrap_or_default()
+            });
+            let _ = tx.send(());
+            (msg, st)
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(10))
+            .expect("apply_cycle never returned");
+        let (msg, mut st) = h.join().unwrap();
+        assert!(
+            msg.is_none(),
+            "a frame straddling the target is not a gap, so no fail-stop: {msg:?}"
+        );
+        assert_eq!(st.follower.cursor, 0, "nothing whole is committed yet");
+        assert_eq!(st.replay_stalled, None, "no stall episode either");
+
+        // Commit passes the whole log: the next cycles apply all of it.
+        st.cnc.counters().commit.store_release(head);
+        for _ in 0..20 {
+            super::apply_cycle(&mut st);
+            if st.follower.cursor == head {
+                break;
+            }
+        }
+        assert_eq!(
+            st.follower.cursor, head,
+            "the row catches up once commit moves"
+        );
     }
 
     /// A replay pass that does NOT advance the cursor must hand the cycle
