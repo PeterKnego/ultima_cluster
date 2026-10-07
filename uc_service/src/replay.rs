@@ -51,6 +51,13 @@ pub(crate) enum Replay {
     /// budget). Every frame before it applied; the payload is the record's
     /// START, where the caller rejoins and ends its cycle.
     AwaitVersion(u64),
+    /// #77: the walk stopped at a frame the journal HOLDS whose end is above
+    /// the apply target `min(commit, durable)` — commit is a byte position,
+    /// not a frame boundary, so it can sit inside the next frame. Every frame
+    /// before it applied; the payload is that frame's START, where the caller
+    /// rejoins and ends its cycle until commit passes the frame's end. Never
+    /// a gap: the journal served the cursor.
+    AwaitCommit(u64),
 }
 
 /// Ruling P10's inputs: everything a replayed span needs in order to act on
@@ -448,6 +455,9 @@ pub(crate) fn replay_into<S: RawStateMachine>(
     // R13: `Some(record start)` once the scan meets a version record the
     // agent has not applied yet.
     let mut pending_at: Option<u64> = None;
+    // #77: `Some(frame start)` when the walk stopped at a frame straddling
+    // `target`.
+    let mut straddle_at: Option<u64> = None;
     reader
         .scan_from(start_pos, |_seq, base, payload| {
             // `target` is the ONE frontier captured above, shared with pass 1
@@ -470,6 +480,7 @@ pub(crate) fn replay_into<S: RawStateMachine>(
                 // cursor stays at this frame's start, and the live follower
                 // resumes exactly there.
                 if end > target {
+                    straddle_at = Some(pos);
                     return false;
                 }
                 // Dispatch MESSAGE frames, and TIMER frames addressed to THIS
@@ -619,6 +630,14 @@ pub(crate) fn replay_into<S: RawStateMachine>(
     }
     if let Some(at) = pending_at {
         return Ok(Replay::AwaitVersion(at));
+    }
+    // #77: stopped AT the cursor on a frame that straddles the target. The
+    // equality is what makes it safe: every walked frame moves `cursor` to
+    // its end, so `straddle_at == cursor` means no byte between the last
+    // applied frame and this one was skipped. Anything else falls back to
+    // `Rejoin` and the caller's no-progress guard, as before.
+    if straddle_at == Some(cursor) {
+        return Ok(Replay::AwaitCommit(cursor));
     }
     Ok(Replay::Rejoin(cursor))
 }

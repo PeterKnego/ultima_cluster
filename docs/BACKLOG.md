@@ -437,6 +437,11 @@ reviewer wants a workload to attack.
   wave because it is a change to the guard every reconstruction path runs
   through. Recorded 2026-09-21 (`.superpowers/sdd/2026-09-21-uc2-live-snapshot-reports/final-review.md`,
   Important 1).
+  **Still open after #77 (2026-10-07):** the detour also fired on a healthy
+  row whose next frame straddled `min(commit, durable)` — commit can sit
+  mid-frame — and fail-stopped it at the first ring lap. #77 fixed that one
+  misfire (`Replay::AwaitCommit`: a stop at a frame the journal holds is
+  never a gap); the widening itself is unchanged.
 - **`uc_gateway/tests/credits_wire.rs`'s latch test no longer exercises a
   declared node.**
   `a_connection_told_not_serving_is_never_served_later_on_the_same_socket`
