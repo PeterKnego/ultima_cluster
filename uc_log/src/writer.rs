@@ -55,6 +55,11 @@ impl PositionedWriter {
         if position < durable {
             return false;
         }
+        // #78: publish how far this write reaches BEFORE the bytes land, so a
+        // validated reader whose copy sees them fails its post-copy check.
+        b.counters()
+            .append
+            .raise_reserve(position + bytes.len() as u64);
         // SAFETY: [off, off+len) within capacity (wrap check above); bytes in
         // [append, durable+capacity) are writer-owned (single receiver per
         // buffer, the follower analog of the appender contract); visibility
@@ -138,6 +143,135 @@ mod tests {
     /// start — the archive had recorded a 32 B frame there (a NewTerm) and
     /// something replaced it with a 64 B data frame afterwards. The archive
     /// then fail-stops walking its own recorded region.
+    /// #78: a follower's validated reader must not return bytes the receiver
+    /// has already overwritten with the NEXT lap. The receiver writes a run
+    /// BEFORE it publishes `append`, and may write anywhere in
+    /// `[contiguous, durable + capacity)` — far past the `append + max_claim`
+    /// margin the reader's seqlock allows for (that margin is the LEADER
+    /// appender's in-flight bound). No concurrency is needed: write the run,
+    /// then read; both of the reader's checks see the same `append`.
+    ///
+    /// Shape (CAP 4096, 96 B frames, max_claim 576): the follower holds the
+    /// log up to `A` (> one lap), archived (`durable = A`). A reader at `F`
+    /// lags `A - F = 3232` — inside `(CAP - run, CAP - max_claim]` — and the
+    /// receiver accepts the next in-order run at `A` (len ≥ 1024), whose ring
+    /// image covers `F`'s offset.
+    #[test]
+    fn a_follower_reader_never_returns_bytes_the_receiver_overwrote_ahead_of_append() {
+        let (leader, lc) = buf();
+        let (follower, fc) = buf();
+        let mut a = Appender::new(Arc::clone(&leader), 7, 0);
+        let w = PositionedWriter::new(Arc::clone(&follower));
+        // Replicate leader → follower run by run, archiving as we go, so both
+        // `durable` counters keep the appender's and the writer's gates open.
+        let mut pos = 0u64;
+        let mut i = 0u32;
+        let ship = |a: &mut Appender, upto_frames: u32, i: &mut u32, pos: &mut u64| {
+            // In chunks of 10 frames: the leader's own gate is
+            // `durable + capacity`, so it must see each chunk archived.
+            while *i < upto_frames {
+                let chunk_end = (*i + 10).min(upto_frames);
+                while *i < chunk_end {
+                    a.append(2, *i, &[(*i % 251) as u8; 64]).unwrap();
+                    *i += 1;
+                }
+                let mut run = Vec::new();
+                while let SliceRead::Run(r) = leader.read_run_validated(*pos, 4096, &mut run) {
+                    assert!(w.write_run(*pos, &run[..r.bytes]), "replicate at {pos}");
+                    *pos += r.advance;
+                    fc.counters().append.store_release(*pos);
+                    fc.counters().durable.store_release(*pos);
+                    lc.counters().durable.store_release(*pos);
+                }
+            }
+        };
+        // Lap 0 plus some of lap 1: 60 frames × 96 B = 5760 B (+ wrap padding).
+        ship(&mut a, 60, &mut i, &mut pos);
+        let big_a = pos;
+        assert!(big_a > CAP, "the follower must be past one lap: {big_a}");
+        // The reader: the first lap-0 frame start at least 3264 B behind
+        // `append` (lap-0 frames sit on the 96 B grid; the wrap padding moves
+        // lap 1 off it, so `A - k * 96` would land mid-frame).
+        let f = (big_a - 3264).next_multiple_of(96);
+        let lag = big_a - f;
+        assert!(
+            lag + 576 <= CAP,
+            "the reader passes the seqlock pre-check: lag {lag}"
+        );
+        let mut before = Vec::new();
+        let SliceRead::Run(r0) = follower.read_run_validated(f, 4096, &mut before) else {
+            panic!("the reader's run at {f} must be readable before the overwrite");
+        };
+        let before = before[..r0.bytes].to_vec();
+
+        // The leader appends the next frames; the receiver accepts the in-order
+        // run at `A` and writes it — but has not yet published `append`.
+        while i < 72 {
+            a.append(2, i, &[0xEE; 64]).unwrap();
+            i += 1;
+        }
+        let mut run = Vec::new();
+        let SliceRead::Run(r) = leader.read_run_validated(big_a, 1408, &mut run) else {
+            panic!("leader run at {big_a}");
+        };
+        assert!(
+            r.bytes >= 1024,
+            "a datagram-sized run, past max_claim: {}",
+            r.bytes
+        );
+        assert!(
+            w.write_run(big_a, &run[..r.bytes]),
+            "the receiver accepts the run at A"
+        );
+
+        // The reader at F: Overrun is correct; a run is correct only if its
+        // bytes are still the lap the reader is at.
+        let mut after = Vec::new();
+        match follower.read_run_validated(f, 4096, &mut after) {
+            SliceRead::Overrun => {}
+            SliceRead::Run(r1) => {
+                let n = r1.bytes.min(before.len());
+                assert_eq!(
+                    &after[..n],
+                    &before[..n],
+                    "the reader at {f} returned the receiver's next-lap bytes as a valid run"
+                );
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+
+        // Liveness: a reader whose bytes the run does NOT reach still reads —
+        // the reserve is a precise bound, not a blanket Overrun. Its limit
+        // `from + CAP` must be at or above the run's end.
+        let run_end = big_a + r.bytes as u64;
+        let near = (run_end - CAP).next_multiple_of(96).max(f + 96);
+        let near = if near >= 4032 { 4096 } else { near }; // lap-0 frames end at 4032
+        let mut ok = Vec::new();
+        assert!(
+            matches!(
+                follower.read_run_validated(near, 4096, &mut ok),
+                SliceRead::Run(_)
+            ),
+            "a reader at {near} (limit {}) is past the run's reach ({run_end}) and must read",
+            near + CAP
+        );
+    }
+
+    /// #78: a prime discards the ring's content, so it resets the write
+    /// reserve to the primed position — a stale reserve from before a
+    /// restart or truncation would otherwise refuse reads until the stream
+    /// passed it.
+    #[test]
+    fn prime_resets_the_write_reserve() {
+        let (follower, fc) = buf();
+        let w = PositionedWriter::new(Arc::clone(&follower));
+        fc.counters().durable.store_release(0);
+        assert!(w.write_run(2048, &[0u8; 96]));
+        assert_eq!(fc.counters().append.reserve_acquire(), 2048 + 96);
+        fc.counters().prime(512);
+        assert_eq!(fc.counters().append.reserve_acquire(), 512);
+    }
+
     #[test]
     fn write_run_refuses_to_rewrite_what_the_archive_already_recorded() {
         let (follower, fc) = buf();

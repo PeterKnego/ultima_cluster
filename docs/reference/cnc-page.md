@@ -32,11 +32,13 @@ byte-for-byte; page 2 (`4096..8192`) is the service-slot band.
 ## Counters and status
 
 Each field occupies its own 64-byte stride. Every field has exactly one
-writer.
+writer. The one exception is `append`'s line, which carries a second word
+with the same writer.
 
 | Offset | Field | Writer |
 |---|---|---|
 | 256 | `append` | leader appender, or follower receiver |
+| 264 | `write_reserve` | follower receiver (#78) — the highest run end it may have written into the log buffer, raised before the bytes land; `0` on a page that never had one |
 | 320 | `durable` | archive agent |
 | 384 | `sent` | sender agent |
 | 448 | `commit` | consensus agent |
@@ -69,6 +71,14 @@ writer.
 | 4040 | `fsm_lag_bytes` | node (`0` ⇔ lockstep) — shares 4032's line. Since the cluster FSM (2.11.0) this is derived from the committed `Settings::fsm_lag_bytes` and **re-published when that setting moves**, not written once at boot. The record's own `0` means "derive at use" and lockstep is `u64::MAX` there, so `page_lag_from_setting` is the one place that maps the record's sentinels onto this word's |
 | 4048 | `log_time_ns` | **archive agent** (cnc 3.1, log time, 2.11.0) — the highest leader stamp the archive has recorded, ns since the Unix epoch. The third word of the `4032` line, and its only *live* writer until cnc 3.4: `4032`/`4040` are written once before publish and never again. **Never lowered.** A new leader seeds its stamp clamp from this word after the leader-open collapse; `/metrics` exports it as `uc2_log_time_ns` and `uc2ctl status` prints `log_time_ns=` (raw ns, not RFC 3339) |
 | 4056 | `cluster_applied` | **`uc2-cluster` agent** (cnc 3.4, #33) — the frame-END position the cluster FSM had applied `CLUSTER` frames up to when it last applied or installed something. Written only after a batch that applied or installed something, and at boot from the recovered state — not on every pass, which keeps the second live writer on the `4032` line rare — and always **after** that batch's row words (`running_version`/`running_record_pos`, below), with `Release`. So a reader that `Acquire`-loads `cluster_applied ≥ p` also sees every row's running-version words as of `p`. The reader is the service apply loop, only at a `CLUSTER` version record for its own row: it waits for this word to pass the record, then reads the row's verdict. `0` = nothing applied since boot. The fourth word of the `4032` line; `4064`–`4088` stay free |
+
+A follower's receiver writes whole datagram runs, and out-of-order runs above
+a gap, anywhere up to `durable + capacity` before it publishes `append`. A
+validated log reader therefore bounds itself by `max(append + max_claim,
+write_reserve)` before and after its copy, not by `append + max_claim` alone,
+which only covers the leader appender's in-flight write. A page without the
+word reads `0`, which gives the old bound: a node and a service from
+different builds behave no worse than the older of the two.
 
 Counters are absolute byte positions in the replicated log, not indices.
 `log_time_ns` is the one exception: it is a wall-clock nanosecond value, not a

@@ -1415,6 +1415,8 @@ mod tests {
         use uc_protocol::v2::cnc::*;
         assert_eq!(size_of::<LogCounters>(), 256);
         assert_eq!(CNC_OFF_DURABLE - CNC_OFF_APPEND, 64);
+        // #78: the write reserve is append's line's second word.
+        assert_eq!(CNC_OFF_WRITE_RESERVE - CNC_OFF_APPEND, 8);
         assert_eq!(size_of::<ServiceProgress>(), 192);
         assert_eq!(size_of::<NodeStatusV2>(), 448);
         assert_eq!(CNC_OFF_NEXT_CLIENT_ID - CNC_OFF_TERM, 384);

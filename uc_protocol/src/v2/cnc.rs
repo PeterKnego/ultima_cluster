@@ -85,6 +85,12 @@ pub const CNC_OFF_HEADER_CRC: usize = 124; // u32 LE, crc32 over [0..124) — wr
 
 // ---- counter lines (each one 64-byte cache line, single writer noted) -----
 pub const CNC_OFF_APPEND: usize = 256; // writer: leader appender / follower receiver
+/// #78: the follower receiver's WRITE RESERVE — the highest run end it may
+/// have written into the ring, raised before the bytes land. Second word of
+/// `append`'s line (same writer per role); validated readers bound
+/// themselves by `max(append + max_claim, reserve)`. `0` (a page from a
+/// build without it) degrades to the `append + max_claim` bound.
+pub const CNC_OFF_WRITE_RESERVE: usize = CNC_OFF_APPEND + 8;
 pub const CNC_OFF_DURABLE: usize = 320; // writer: archive agent
 pub const CNC_OFF_SENT: usize = 384; // writer: sender agent
 pub const CNC_OFF_COMMIT: usize = 448; // writer: consensus agent
