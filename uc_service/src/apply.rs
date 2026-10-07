@@ -885,7 +885,13 @@ pub(crate) fn apply_cycle<S: RawStateMachine>(st: &mut ApplyState<S>) -> bool {
             // < min(commit, durable)` (`next_batch` answers `CaughtUp`
             // first), and `durable` IS the archive's recorded frontier, so
             // every byte in `(cursor, target]` was recorded. A pass that
-            // applied none of them means the journal no longer RETAINS them.
+            // applied none of them means the journal no longer RETAINS them —
+            // with one exception that never reaches this guard: the frame at
+            // the cursor can END above `target` (commit is a byte position and
+            // can sit mid-frame), and then nothing whole is applicable yet.
+            // `replay_into` reports that as `Replay::AwaitCommit` (#77), which
+            // ends the cycle above; before it did, this guard read it as a gap
+            // and fail-stopped healthy rows at the first ring lap.
             //
             // So route it into the handling the gap guard already produces,
             // rather than idling: re-enter the replay with `gap_above` set to
