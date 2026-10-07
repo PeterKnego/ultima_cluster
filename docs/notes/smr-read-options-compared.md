@@ -144,16 +144,46 @@ throughput on a LAN. The remaining lever is **where the query runs.**
 `docs/benchmarks/uc2-read-spread-2026-10-07.md` measured the upper bound for
 moving reads to followers: snapshot reads on all 3 nodes vs on the leader only.
 
-- **Read capacity is per node.** Spread ÷ leader-only = **2.74** read-only and
-  **3.65** under 20k writes/s, against a pre-committed 2.4 bar. Follower
-  ReadIndex (C) and session tokens (I) therefore have real headroom, before
-  their own costs (a leader round per batch for C, an apply wait for both).
-- **A cheaper lever may come first.** Per node, reads ran 4–5× faster *with*
-  writes than without. The code suggests why: the service answers queries on its
-  apply thread, but query work does not count as progress for the thread's idle
-  ladder, so a read-only service sleeps between 64-query batches. That is a
-  hypothesis from reading the code, not yet tested. If it holds, fixing it lifts
-  every read path on every node.
+**What was tested: snapshot reads only (option K), not follower ReadIndex.**
+UC has no follower ReadIndex to test; a follower answers a linearizable read
+with `NOT_LEADER`. Every client sent snapshot reads: on the leader alone in one
+arm, and on all 3 nodes at once in the other (follower clients use the
+harness's `--any-role` flag). A snapshot read skips both costs a linearizable
+read pays: there is no quorum barrier, and no wait for the service to apply up
+to the read position. That makes the run an **upper bound** for moving reads to
+followers, chosen on purpose: if spread snapshot reads did not scale, no
+follower read path could.
+
+- **Proven: snapshot read capacity scales with the number of nodes answering.**
+  Spread ÷ leader-only = **2.74** read-only and **3.65** under 20k writes/s,
+  against a pre-committed 2.4 bar. The query work is per node and does not
+  funnel through the leader.
+- **Not proven: that follower ReadIndex (C) would scale the same way.** It adds
+  two costs this run did not include:
+  1. *A leader round per batch*: the follower asks the leader for a read
+     position, which the leader confirms with a quorum probe round. Batched
+     rounds cost about nothing on the leader (Rung A), so this probably does
+     not cap capacity, but that is inference.
+  2. *An apply wait on the follower*: it must apply up to the leader's commit
+     position before answering. Under write load that adds replication lag to
+     every read's latency. It need not cut throughput, since the follower
+     applies those writes anyway, but nobody has measured it.
+
+  Session tokens (I) carry only the apply wait.
+- **So "reads scale with nodes" holds today for snapshot reads only.**
+  Linearizable reads in UC are leader-only, so their capacity is one node's.
+  They would scale only if follower ReadIndex were built, and this run puts the
+  ceiling for that at about 2.7–3.6× on 3 nodes, minus whatever those costs
+  turn out to be.
+- **Side finding: a read-only service runs at a fraction of its read
+  capacity.** The service answers queries on its apply thread (at most 64 per
+  cycle), but query work does not count as progress for the thread's idle
+  ladder. A service with no writes therefore sleeps 50 µs between batches,
+  which caps it near 600k reads/s per node. A local smoke run (dev box, not
+  fleet data) measured 599k reads/s read-only by default vs 3.76M with
+  `UC2_APPLY_IDLE=spin`, and 3.32M with writes. This affects every read path
+  on every node, linearizable included. It is recorded in the bench doc
+  (§5.4); no fix has been made.
 
 ## Choosing, in short
 
