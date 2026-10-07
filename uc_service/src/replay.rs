@@ -458,8 +458,15 @@ pub(crate) fn replay_into<S: RawStateMachine>(
     // #77: `Some(frame start)` when the walk stopped at a frame straddling
     // `target`.
     let mut straddle_at: Option<u64> = None;
+    // #82 diagnostics: blocks seen, the first block's base, frames walked.
+    // Read only when a pass walks nothing (the line below), so free otherwise.
+    let mut blocks_seen = 0u64;
+    let mut first_block_base: Option<u64> = None;
+    let mut frames_walked = 0u64;
     reader
         .scan_from(start_pos, |_seq, base, payload| {
+            blocks_seen += 1;
+            first_block_base.get_or_insert(base);
             // `target` is the ONE frontier captured above, shared with pass 1
             // (fix round 3) — not re-read per block any more.
             let mut off = 0usize;
@@ -611,6 +618,7 @@ pub(crate) fn replay_into<S: RawStateMachine>(
                     }
                 }
                 cursor = end;
+                frames_walked += 1;
                 off += aligned;
             }
             true
@@ -638,6 +646,20 @@ pub(crate) fn replay_into<S: RawStateMachine>(
     // `Rejoin` and the caller's no-progress guard, as before.
     if straddle_at == Some(cursor) {
         return Ok(Replay::AwaitCommit(cursor));
+    }
+    if frames_walked == 0 {
+        // #82: a pass that walked nothing is what the caller's no-progress
+        // guard turns into a gap. Say WHY on the one line a supervisor or a CI
+        // log captures — the cause is not derivable from the guard's message.
+        eprintln!(
+            "uc_service: service {} replay walked no frame: start_pos={start_pos} \
+             journal_first={first} gap_above={gap_above:?} target={target} \
+             sm_last_applied={:?} blocks_seen={blocks_seen} \
+             first_block_base={first_block_base:?} straddle_at={straddle_at:?} \
+             returned_cursor={cursor}",
+            instant.service_id,
+            guard.last_applied(),
+        );
     }
     Ok(Replay::Rejoin(cursor))
 }

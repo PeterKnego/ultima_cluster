@@ -919,9 +919,9 @@ pub(crate) fn apply_cycle<S: RawStateMachine>(st: &mut ApplyState<S>) -> bool {
                     st.replay_stalled = Some(cursor);
                     eprintln!(
                         "uc_service: service {} replay made no progress at cursor {cursor} \
-                         (apply target {target}); the journal's retained prefix does not cover \
-                         this row — retrying the pass as a gap (install a covering snapshot, \
-                         or fail-stop)",
+                         (apply target {target}, cursor before the pass {cursor_before}); the \
+                         journal's retained prefix does not cover this row — retrying the pass \
+                         as a gap (install a covering snapshot, or fail-stop)",
                         st.service_id
                     );
                     continue;

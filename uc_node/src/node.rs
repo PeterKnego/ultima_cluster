@@ -5400,6 +5400,15 @@ impl Consensus {
         // this node's — never reported as ours, then or after a restart (the
         // receiver marked it on disk before the cluster artifact landed).
         self.note_foreign_set(pos);
+        // #82: but it IS held — every row artifact and the cluster artifact
+        // are on disk under their final names — so hand it to the same
+        // completeness path a store-only fetch uses. That path adopts it as
+        // `snapshot_set_position` (and the holdings bit) only once this
+        // node's durable frontier has reached it, which the floor adoption
+        // below delivers. Without this a voter that rejoined by session held
+        // a complete set yet reported none until its own rows froze at a
+        // LATER instant.
+        self.stored_set_pos.fetch_max(pos, Ordering::AcqRel);
         self.cnc
             .snapshots()
             .incoming_snapshot_pos
@@ -22097,6 +22106,43 @@ mod tests {
                 .foreign
                 .contains(&floor),
             "and so does the probe"
+        );
+    }
+
+    /// #82: a set a snapshot session installed is HELD here — its row and
+    /// cluster artifacts are on disk under their final names — so once this
+    /// node's log has reached the floor it must report it, exactly as a
+    /// store-only fetch does (`snapshot_set_position`, the holdings bit, a
+    /// `snapshot_set_complete` edge). It stays foreign (R42): held, never
+    /// reported as built here. Before the fix a voter that fell below the
+    /// floor and rejoined by session read `snapshot_set_position = 0` while
+    /// both artifacts sat on disk (nightly 2026-10-07, run 37689934032).
+    #[test]
+    fn a_session_installed_set_is_held_once_the_log_reaches_it() {
+        // A declared row whose slot never shows the instant: its service
+        // INSTALLS the session's artifact rather than freezing at P, so the
+        // locally-built completeness test (every row's `snapshot_pos == P`)
+        // can never fire here. Without a row that test is vacuously true and
+        // would hide the defect.
+        let mut h = harness_with_rows(&["fsm0"]);
+        let v1 = v1_of(&h);
+        let floor = 1u64 << 20;
+        install_cluster_artifact_for_test(&mut h, floor, &v1);
+        h.cons.incoming_cluster_pos.store(floor, Ordering::Release);
+        h.cons.incoming_snapshot.store(floor, Ordering::Release);
+        h.cons.do_work();
+        // The archive adopts the floor asynchronously; until durable reaches
+        // it the set is held back (never above this node's own log).
+        h.cons.cnc.counters().durable.store_release(floor);
+        h.cons.do_work();
+        assert_eq!(
+            h.cons.snapshot_set_position.load(Ordering::Acquire),
+            floor,
+            "a session-installed set is held, like a fetched one"
+        );
+        assert!(
+            h.cons.foreign_sets.contains(&floor),
+            "and still foreign (R42)"
         );
     }
 

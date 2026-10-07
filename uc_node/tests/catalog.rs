@@ -482,6 +482,9 @@ fn instant_until_complete(c: &Cluster, leader: usize, idxs: &[usize]) -> u64 {
             .map(|&i| c.node(i).snapshot_set_position())
             .collect();
         eprintln!("instant {p} abandoned (attempt {attempt}/{ATTEMPTS}): sets={sets:?}");
+        if attempt == 1 {
+            eprintln!("{}", dump_instant(c, leader, idxs, p));
+        }
         assert_ne!(
             attempt, 1,
             "instant {p} was abandoned on the FIRST attempt (spec §10)"
@@ -528,6 +531,34 @@ fn await_agreed(c: &Cluster, idxs: &[usize], p: u64) {
 /// length, first 32 bytes, and `SumSm`'s `total ‖ last` decoded past the
 /// 24-byte envelope — so a divergence says whether the FILES differ or only
 /// the reported hash does.
+/// #82: per-voter state when an instant is abandoned on its first attempt —
+/// which voter lags, and whether its row is behind, unattached, or frozen
+/// without a cluster artifact.
+fn dump_instant(c: &Cluster, leader: usize, idxs: &[usize], p: u64) -> String {
+    let mut out = format!("instant {p} dump (leader {leader}):");
+    for &i in idxs {
+        let n = c.node(i);
+        let k = n.counters();
+        let cnc = c.cnc(i);
+        let slot = cnc.service_slot(0);
+        let dir = &c.nodes[i].instance_dir;
+        out.push_str(&format!(
+            "\n  node {i}: set={} append={} durable={} commit={} row0 applied={} \
+             snapshot_pos={} status={:#x} | on disk at p: row0={} cluster={}",
+            n.snapshot_set_position(),
+            k.append.load_acquire(),
+            k.durable.load_acquire(),
+            k.commit.load_acquire(),
+            slot.applied.load_acquire(),
+            slot.snapshot_pos.load_acquire(),
+            slot.status.load_acquire(),
+            row_artifact(dir, 0, p).is_file(),
+            cluster_artifact(dir, p).is_file(),
+        ));
+    }
+    out
+}
+
 fn dump_row0(c: &Cluster, idxs: &[usize], p: u64) -> String {
     const ENVELOPE: usize = 24;
     let u64_at = |b: &[u8], o: usize| {
@@ -1029,6 +1060,14 @@ fn a_diverged_row_completes_the_set_but_never_moves_the_floor() {
         holds_on_disk(c.dir(joiner), &[0], p0),
         "the joiner holds the shipped set at p0"
     );
+    // The installed cluster artifact at p0 was frozen BEFORE p0's reports
+    // existed, so it lists p0 as `Commanded`; the joiner learns p0 is agreed
+    // only when its cluster agent applies the report records committed after
+    // it — which trails the archive's `durable` waited on above. Wait for the
+    // catalog, not just the log (a slow runner read 0 here, PR #83's nightly).
+    await_until(30, "the joiner's catalog agrees on p0", || {
+        agreed_position(c.node(joiner)) == p0
+    });
     assert_eq!(
         agreed_position(c.node(joiner)),
         p0,
