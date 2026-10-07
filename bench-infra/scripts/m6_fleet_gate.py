@@ -1593,10 +1593,12 @@ def rs_run_rung(hosts, members, arm, readers, write_rate, secs, admission_kib, o
     except RuntimeError as e:
         return None, str(e)
 
+    # Every host's log first: an invalid client must not cost the others' logs.
+    for i in idxs:
+        (out_dir / f"client-{tag}-h{i}.log").write_text(results[i][1])
     per_host = []
     for i in idxs:
         rc, out = results[i]
-        (out_dir / f"client-{tag}-h{i}.log").write_text(out)
         line = rp_extract_rung(out) if rc == 0 else None
         if line is None:
             tail = " | ".join(out.strip().splitlines()[-3:])
