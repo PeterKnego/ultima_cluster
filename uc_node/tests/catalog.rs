@@ -1060,6 +1060,14 @@ fn a_diverged_row_completes_the_set_but_never_moves_the_floor() {
         holds_on_disk(c.dir(joiner), &[0], p0),
         "the joiner holds the shipped set at p0"
     );
+    // The installed cluster artifact at p0 was frozen BEFORE p0's reports
+    // existed, so it lists p0 as `Commanded`; the joiner learns p0 is agreed
+    // only when its cluster agent applies the report records committed after
+    // it — which trails the archive's `durable` waited on above. Wait for the
+    // catalog, not just the log (a slow runner read 0 here, PR #83's nightly).
+    await_until(30, "the joiner's catalog agrees on p0", || {
+        agreed_position(c.node(joiner)) == p0
+    });
     assert_eq!(
         agreed_position(c.node(joiner)),
         p0,
