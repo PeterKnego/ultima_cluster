@@ -1894,7 +1894,9 @@ def main():
                                  f"put run artifacts on real disk")
             out_dir.mkdir(parents=True, exist_ok=True)
             members = ",".join(f"{i}@{addr[i]}" for i in range(3))
-            log(f"sweep: readers={sweep} x modes={list(RP_MODES)} x writes/s="
+            log(f"sweep: readers={sweep} x "
+                f"{'arms=' + str(list(RS_ARMS)) + ' x reps=' + str(args.rp_reps) if args.rp_spread else 'modes=' + str(list(RP_MODES))}"
+                f" x writes/s="
                 f"{[0, args.rp_write_rate] if args.rp_write_rate else [0]}, "
                 f"{args.rp_secs}s per rung, fresh cluster per rung")
             log("*** INSTRUMENT, not a gate: an unfavourable verdict still exits 0 ***")
