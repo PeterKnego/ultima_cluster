@@ -110,6 +110,14 @@ Checked against the code on 2026-10-07:
   barrier and goes straight to the service with no epoch check (same drain,
   `node.rs`). The client picks per query: `Consistency::Linearizable` or
   `Consistency::Snapshot` (`uc_client/src/engine.rs`).
+  **A note on the name:** UC's "snapshot read" is option K, a local read of
+  whatever the node's service has applied right now. It is called a snapshot
+  because the answer reflects one consistent applied position (a committed
+  prefix), but nobody chooses that position and nothing ties it to the
+  present. It is not H (a snapshot at a chosen time), not L (a retained version
+  at a chosen position), and unrelated to UC's snapshot artifacts (`SNAPSHOT`
+  instants, `ULTSNAP2` files). Wherever this note says "snapshot read" about UC,
+  read "K".
 - **A (read as command) is available to any application, with no framework
   support needed.** Define a command whose `apply` leaves the state untouched
   and returns the data as its `Response`. Apply runs only up to
@@ -144,7 +152,7 @@ throughput on a LAN. The remaining lever is **where the query runs.**
 `docs/benchmarks/uc2-read-spread-2026-10-07.md` measured the upper bound for
 moving reads to followers: snapshot reads on all 3 nodes vs on the leader only.
 
-**What was tested: snapshot reads only (option K), not follower ReadIndex.**
+**What was tested: UC snapshot reads only (option K, local reads), not follower ReadIndex.**
 UC has no follower ReadIndex to test; a follower answers a linearizable read
 with `NOT_LEADER`. Every client sent snapshot reads: on the leader alone in one
 arm, and on all 3 nodes at once in the other (follower clients use the
