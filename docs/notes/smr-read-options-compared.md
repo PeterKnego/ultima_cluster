@@ -136,6 +136,25 @@ Checked against the code on 2026-10-07:
   addresses everything by byte position, so I would be cheap to build: the token
   is a position the client already learns from its write's response.
 
+## Would another read path be faster in UC? (measured 2026-10-07)
+
+Rung A removed the barrier's cost: linearizable and snapshot reads are equal at
+plateau on the leader. So no certification scheme (a lease included) can win
+throughput on a LAN. The remaining lever is **where the query runs.**
+`docs/benchmarks/uc2-read-spread-2026-10-07.md` measured the upper bound for
+moving reads to followers: snapshot reads on all 3 nodes vs on the leader only.
+
+- **Read capacity is per node.** Spread ÷ leader-only = **2.74** read-only and
+  **3.65** under 20k writes/s, against a pre-committed 2.4 bar. Follower
+  ReadIndex (C) and session tokens (I) therefore have real headroom, before
+  their own costs (a leader round per batch for C, an apply wait for both).
+- **A cheaper lever may come first.** Per node, reads ran 4–5× faster *with*
+  writes than without. The code suggests why: the service answers queries on its
+  apply thread, but query work does not count as progress for the thread's idle
+  ladder, so a read-only service sleeps between 64-query batches. That is a
+  hypothesis from reading the code, not yet tested. If it holds, fixing it lifts
+  every read path on every node.
+
 ## Choosing, in short
 
 - **Default linearizable read:** ReadIndex, with probe rounds batched across
