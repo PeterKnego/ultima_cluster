@@ -124,7 +124,9 @@ design with these recorded rulings and gaps:
   3's teeth): clean run 585 reads, 0 violations; **T1** (node skips the wait,
   client guard off) 34 violations, caught; **T2** (node skips the wait,
   guard on) 0 violations with 112 stale answers caught by the client guard.
-  Known gap: the capstone does not assert that leader churn actually happened.
+  The final-review fix wave closed the churn gap (it now asserts at least one
+  isolation and one leader change) and added a read-only token-rotation phase
+  that isolates monotonic reads across nodes.
 - **Documentation owed (§8) done** except the `smr-read-options-compared.md`
   update, which lives on `bench/read-spread` and is not on this branch.
   `docs/reference/remote-protocol.md` was also moved to v2.

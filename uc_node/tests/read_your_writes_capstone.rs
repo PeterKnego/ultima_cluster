@@ -214,6 +214,43 @@ fn ryw_capstone_under_leader_churn() {
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let stale = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let reads = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let mono_reads = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+    // Monotonic-reads phase (no write in between): each monitor rotates ONE
+    // token across the nodes. Read via node A, take A's reader token, observe
+    // it on node B's reader, read via B, and so on. Each monitor is its own
+    // session, so a read that goes backwards is a violation. Writes come from
+    // the workers above, so the state keeps advancing underneath.
+    let monitors: Vec<_> = (0..2u64)
+        .map(|m| {
+            let dirs = c.dirs.clone();
+            let (checker, stop, mono_reads) = (checker.clone(), stop.clone(), mono_reads.clone());
+            std::thread::spawn(move || {
+                let session = 1000 + m;
+                let readers: Vec<Client> = dirs
+                    .iter()
+                    .map(|d| Client::connect(d, APP).unwrap())
+                    .collect();
+                let mut token = uc_client::ReadToken::NONE;
+                let mut k = m as usize;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let r = &readers[k % readers.len()];
+                    k += 1;
+                    r.observe(token);
+                    if let Ok(v) = r.query_read_your_writes::<(), u64>(&()) {
+                        mono_reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let _ = checker.lock().unwrap().record_read(session, v);
+                        token = r.read_token();
+                    } else {
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                }
+                for r in readers {
+                    r.shutdown();
+                }
+            })
+        })
+        .collect();
 
     let workers: Vec<_> = (0..workers_n)
         .map(|w| {
@@ -281,13 +318,20 @@ fn ryw_capstone_under_leader_churn() {
 
     // Churn: isolate the current leader for 600 ms every 1.5 s.
     let t0 = Instant::now();
+    let (mut isolations, mut leader_changes) = (0u64, 0u64);
     while t0.elapsed() < Duration::from_secs(secs) {
         std::thread::sleep(Duration::from_millis(1500));
         if let Some(l) = (0..3).find(|&i| c.nodes[i].can_serve()) {
             for f in (0..3).filter(|&i| i != l) {
                 cut(&c.nodes, l, f, &c.members);
             }
+            isolations += 1;
             std::thread::sleep(Duration::from_millis(600));
+            // A different node serving while `l` is cut off is a real
+            // leader change (the isolated one cannot serve a quorum).
+            if (0..3).any(|i| i != l && c.nodes[i].can_serve()) {
+                leader_changes += 1;
+            }
             for f in (0..3).filter(|&i| i != l) {
                 heal(&c.nodes, l, f, &c.members);
             }
@@ -297,11 +341,16 @@ fn ryw_capstone_under_leader_churn() {
     for w in workers {
         w.join().unwrap();
     }
+    for m in monitors {
+        m.join().unwrap();
+    }
     let violations = checker.lock().unwrap().violations().to_vec();
     let stale = stale.load(std::sync::atomic::Ordering::Relaxed);
     let reads = reads.load(std::sync::atomic::Ordering::Relaxed);
+    let mono_reads = mono_reads.load(std::sync::atomic::Ordering::Relaxed);
     println!(
-        "ryw capstone: reads={reads} violations={} stale_answers={stale}",
+        "ryw capstone: reads={reads} mono_reads={mono_reads} violations={} \
+         stale_answers={stale} isolations={isolations} leader_changes={leader_changes}",
         violations.len()
     );
     for s in svcs {
@@ -313,6 +362,14 @@ fn ryw_capstone_under_leader_churn() {
     assert!(
         reads > 100,
         "too few answered reads ({reads}) to judge anything"
+    );
+    assert!(
+        isolations >= 1 && leader_changes >= 1,
+        "the churn never happened (isolations={isolations}, leader_changes={leader_changes})"
+    );
+    assert!(
+        mono_reads > 50,
+        "too few token-rotation reads ({mono_reads}) to judge monotonic reads"
     );
     match tooth.as_deref() {
         None => assert!(violations.is_empty(), "RYW VIOLATION: {violations:?}"),
