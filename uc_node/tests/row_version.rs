@@ -886,7 +886,8 @@ impl Cluster {
     ///
     /// Retried, re-resolving the leader each time: status 2 (not the leader
     /// any more, or single-in-flight) and reason 54 `pin_no_set` (the set's
-    /// position is published a moment after the artifact lands). Anything
+    /// position is published a moment after the artifact lands) or 61
+    /// `pin_origin_not_agreed` (the catalog agrees it a moment after that). Anything
     /// else fails here, named.
     fn pin(&self, row: u8, from: u32, to: u32, origin: u64) -> (usize, u64) {
         self.try_pin(row, from, to, origin)
@@ -961,7 +962,9 @@ impl Cluster {
             if resp.status == 0 {
                 return Ok((l, resp.version));
             }
-            let racy = resp.status == 2 || resp.reason == uc_node::REASON_PIN_NO_SET;
+            let racy = resp.status == 2
+                || resp.reason == uc_node::REASON_PIN_NO_SET
+                || resp.reason == uc_node::REASON_PIN_ORIGIN_NOT_AGREED;
             if !(racy && Instant::now() < deadline) {
                 return Err((l, resp.status, resp.reason));
             }

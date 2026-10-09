@@ -433,7 +433,8 @@ impl Fixture {
 ///
 /// Only two answers are races and only those two are retried: status 2
 /// (single-in-flight) and reason 54 `pin_no_set` (the set's position is
-/// published a moment after the artifact lands). Anything else fails here,
+/// published a moment after the artifact lands) or 61 `pin_origin_not_agreed`
+/// (the catalog agrees it a moment after that). Anything else fails here,
 /// named.
 fn pin_via_admin(dir: &Path, cnc: &CncPage, row: u8, from: u32, to: u32, origin: u64) {
     use std::io::Write as _;
@@ -486,7 +487,9 @@ fn pin_via_admin(dir: &Path, cnc: &CncPage, row: u8, from: u32, to: u32, origin:
             );
             std::thread::yield_now();
         };
-        let racy = resp.status == 2 || resp.reason == uc_node::REASON_PIN_NO_SET;
+        let racy = resp.status == 2
+            || resp.reason == uc_node::REASON_PIN_NO_SET
+            || resp.reason == uc_node::REASON_PIN_ORIGIN_NOT_AGREED;
         if resp.status == 0 || !racy || Instant::now() >= deadline {
             assert_eq!(
                 resp.status, 0,

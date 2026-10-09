@@ -185,9 +185,9 @@ fn admin_request(
 /// `UpgradePin` record, then submit admin op 10 with the staged file's digest
 /// in the `id`/`ip`/`port` fields.
 ///
-/// Exactly two answers are RACES against this rig rather than errors in it,
-/// and only those two are retried until `timeout`: status 2 (the ordinary
-/// single-in-flight retry) and reason 54 `pin_no_set`, which compares
+/// Exactly three answers are RACES against this rig rather than errors in it,
+/// and only those are retried until `timeout`: status 2 (the ordinary
+/// single-in-flight retry), reason 54 `pin_no_set`, which compares
 /// `origin` against the node's NEWEST complete set — published by the cluster
 /// agent a moment after the row's own artifact appears. Every other refusal
 /// returns `Err` immediately, naming its status and reason, instead of being
@@ -219,7 +219,9 @@ pub fn pin_row(
         if resp.status == 0 {
             return Ok(resp);
         }
-        let racy = resp.status == 2 || resp.reason == uc_node::REASON_PIN_NO_SET;
+        let racy = resp.status == 2
+            || resp.reason == uc_node::REASON_PIN_NO_SET
+            || resp.reason == uc_node::REASON_PIN_ORIGIN_NOT_AGREED;
         if !racy || Instant::now() >= deadline {
             bail!(
                 "uc2ctl upgrade pin refused: status={} reason={}",

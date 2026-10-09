@@ -719,7 +719,8 @@ fn apply_retain_sets(c: &Cluster, leader: usize, n: u16) -> u64 {
 }
 
 /// `uc2ctl upgrade pin` on the leader, retried through `54 pin_no_set` (the
-/// set's position is published a moment after its artifact lands).
+/// set's position is published a moment after its artifact lands) or `61
+/// pin_origin_not_agreed` (the catalog agrees it a moment after that).
 fn pin(c: &Cluster, leader: usize, row: u8, version: u32, origin: u64) -> u64 {
     use uc_protocol::v2::upgrade::{UpgradePin, encode_upgrade_pin};
     let mut bytes = Vec::new();
@@ -745,7 +746,9 @@ fn pin(c: &Cluster, leader: usize, row: u8, version: u32, origin: u64) -> u64 {
             return pos;
         }
         assert!(
-            reason == uc_node::REASON_PIN_NO_SET && Instant::now() < deadline,
+            (reason == uc_node::REASON_PIN_NO_SET
+                || reason == uc_node::REASON_PIN_ORIGIN_NOT_AGREED)
+                && Instant::now() < deadline,
             "upgrade pin refused: status={status} reason={reason}"
         );
         std::thread::sleep(Duration::from_millis(20));
