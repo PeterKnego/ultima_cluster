@@ -245,6 +245,10 @@ pub const SOURCE_DISCOVERY: &str = "discovery";
 /// running version (#33 spec §6.1).
 pub const SOURCE_GENESIS: &str = "genesis";
 
+/// [`AuditRecord::source`] (and `actor`) for a `snapshot_fetch` the node
+/// issued on its own — snapshot-lifecycle spec §6's background auto-fetch.
+pub const SOURCE_AUTO: &str = "auto";
+
 /// #33 spec §6.1: the op code of the `row_genesis` audit record. AUDIT-ONLY:
 /// it never appears on the admin request line (no verb proposes a genesis —
 /// the leader does, from its own attached version), and 100 keeps it far
@@ -617,6 +621,33 @@ mod tests {
         assert!(
             r.is_err(),
             "an unwritable instance directory must refuse to open the audit log"
+        );
+    }
+
+    /// Snapshot-lifecycle spec §6: an auto-fetch is the existing
+    /// `snapshot_fetch` record with `actor = "auto"`.
+    #[test]
+    fn an_auto_fetch_record_names_actor_auto() {
+        let dir = tempdir();
+        let mut a = AuditLog::open(dir.path()).unwrap();
+        let mut r = rec(0);
+        r.actor = "auto";
+        r.op = 9;
+        r.op_name = op_name(9);
+        r.addr = None;
+        r.nonce = 0;
+        r.config_version = 4096;
+        r.source = SOURCE_AUTO;
+        a.record(&r).unwrap();
+        let text = std::fs::read_to_string(a.path()).unwrap();
+        assert!(text.contains(r#""actor":"auto""#), "{text}");
+        assert!(
+            text.contains(r#""op":9,"op_name":"snapshot_fetch""#),
+            "{text}"
+        );
+        assert!(
+            text.ends_with(",\"detail\":null,\"source\":\"auto\"}\n"),
+            "{text}"
         );
     }
 }

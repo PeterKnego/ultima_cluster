@@ -25,6 +25,7 @@ use uc_consensus::election::NodeId;
 use uc_protocol::identity::same_line;
 use uc_protocol::v2::catalog::{CLUSTER_ROW, RowVerdict, SetEntry, SetState};
 use uc_protocol::v2::datagram::Holdings;
+use uc_protocol::v2::upgrade::SnapshotReport;
 
 /// One node's last-advertised [`Holdings`] plus when it was recorded, for
 /// [`SoftTable::live`]'s staleness check.
@@ -269,6 +270,75 @@ pub fn start_set_for(row: u8, sets: &[SetEntry], held: &[u64], frontier: u64) ->
         );
     }
     (StartSet::default(), wait_above)
+}
+
+/// Plan ruling P1: whom to ask for a set, in order. Known holders first —
+/// `live_holders` (the leader's soft table; empty on a follower, which has
+/// none) and `builders` ([`builders_at`]) — then every other member; each
+/// tier learners first, then lowest node id (spec §6). Never `self_id`, no
+/// duplicates. A member that turns out not to hold the set answers nothing
+/// and costs one fetch timeout.
+pub fn fetch_candidates(
+    self_id: NodeId,
+    live_holders: &[NodeId],
+    builders: &[NodeId],
+    learners: &[NodeId],
+    voters: &[NodeId],
+) -> Vec<NodeId> {
+    let order = |v: &mut Vec<NodeId>| {
+        v.sort_unstable();
+        v.dedup();
+        v.sort_by_key(|id| (!learners.contains(id), *id));
+    };
+    let mut known: Vec<NodeId> = live_holders
+        .iter()
+        .chain(builders)
+        .copied()
+        .filter(|&id| id != self_id)
+        .collect();
+    order(&mut known);
+    let mut rest: Vec<NodeId> = learners
+        .iter()
+        .chain(voters)
+        .copied()
+        .filter(|id| *id != self_id && !known.contains(id))
+        .collect();
+    order(&mut rest);
+    known.extend(rest);
+    known
+}
+
+/// Plan ruling P1: the nodes that BUILT the set at `p` — reporters, in the
+/// committed `SnapshotReport` records at `p`, whose hash equals the catalog's
+/// row hash there. Replicated, so a follower knows them too. Empty when the
+/// catalog does not list `p` or the records have moved past it.
+pub fn builders_at(reports: &[SnapshotReport], sets: &[SetEntry], p: u64) -> Vec<NodeId> {
+    let Some(e) = sets.iter().find(|e| e.position == p) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for r in reports.iter().filter(|r| r.position == p) {
+        let Some(row) = e.rows.get(r.row as usize) else {
+            continue;
+        };
+        for &(id, h, _) in &r.hashes {
+            if h == row.hash && !out.contains(&id) {
+                out.push(id);
+            }
+        }
+    }
+    out
+}
+
+/// Review focus 5 / plan ruling P12: how many nodes reported the instant at
+/// `p` (the widest committed row record there); `0` when none is held.
+pub fn reporters_at(reports: &[SnapshotReport], p: u64) -> usize {
+    reports
+        .iter()
+        .filter(|r| r.position == p)
+        .map(|r| r.hashes.len())
+        .max()
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -575,5 +645,59 @@ mod tests {
         soft.record(1, holding(42, 0, 1001, 2000), 9_900);
         let c = q(&sets, &soft);
         assert_eq!(c.coverage_gaps(), vec![(1000, 2000)]);
+    }
+
+    /// Plan ruling P1: known holders (live soft entries, then builders) first,
+    /// learners first then lowest id; then every other member the same way;
+    /// never self; no duplicates.
+    #[test]
+    fn fetch_candidates_put_known_holders_first_learners_first_then_everyone_else() {
+        // self = 1; learners 4, 5; voters 0..=3; live holder 3; builders 4 and self.
+        let c = fetch_candidates(1, &[3], &[4, 1], &[5, 4], &[0, 1, 2, 3]);
+        assert_eq!(c, vec![4, 3, 5, 0, 2]);
+        assert_eq!(
+            fetch_candidates(0, &[], &[], &[], &[0]),
+            Vec::<NodeId>::new(),
+            "a solo node has nobody"
+        );
+    }
+
+    /// Plan ruling P1: the builders of the set at P are the reporters whose
+    /// hash matches the catalog's row hash at P.
+    #[test]
+    fn builders_are_the_reporters_of_the_catalogued_hash() {
+        let mut e = agreed(1000);
+        e.rows[0].hash = 7;
+        let reports = [SnapshotReport {
+            row: 0,
+            position: 1000,
+            hashes: vec![(0, 7, 1), (2, 8, 1), (3, 7, 1)],
+        }];
+        assert_eq!(builders_at(&reports, &[e.clone()], 1000), vec![0, 3]);
+        assert_eq!(
+            builders_at(&reports, &[e], 2000),
+            Vec::<NodeId>::new(),
+            "no entry at 2000"
+        );
+    }
+
+    /// Review focus 5: a set reported by exactly one node is visible as such.
+    #[test]
+    fn reporters_at_counts_the_reporters_of_one_instant() {
+        let reports = [
+            SnapshotReport {
+                row: 0,
+                position: 1000,
+                hashes: vec![(4, 7, 1)],
+            },
+            SnapshotReport {
+                row: 1,
+                position: 900,
+                hashes: vec![(0, 7, 1), (1, 7, 1)],
+            },
+        ];
+        assert_eq!(reporters_at(&reports, 1000), 1);
+        assert_eq!(reporters_at(&reports, 900), 2);
+        assert_eq!(reporters_at(&reports, 5), 0);
     }
 }

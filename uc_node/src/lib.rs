@@ -35,6 +35,9 @@
 //! `backup`, `ipc`, `obs`, `preflight`, `recovery`) are internal.
 
 pub mod audit;
+/// Snapshot-lifecycle spec §6–§7: the background auto-fetch decision — a
+/// pure state machine the consensus agent drives, plus its outcome counters.
+pub mod auto_fetch;
 pub mod backup;
 /// The snapshot catalog's query layer (catalog spec §4.3-§4.4): the soft
 /// per-node holdings table and the pure query functions over the replicated
