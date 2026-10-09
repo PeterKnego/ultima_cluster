@@ -282,7 +282,8 @@ impl ClusterState {
             version: self.version_at(r.row, r.position),
             hash: v.majority_hash.unwrap_or(0),
             verdict,
-            size: 0,
+            // Snapshot-lifecycle spec §7.2 / plan ruling P7.
+            size: uc_protocol::v2::upgrade::majority_size(r, &v),
         };
         let declared = self.declared_mask();
         let Some(e) = self.catalog.iter_mut().find(|e| e.position == r.position) else {
@@ -982,6 +983,11 @@ impl SnapshotStateMachine for ClusterFsm {
         // mismatch below, since the expected position is not part of the
         // wire image.
         let parts = decode_cluster_image(&img).ok_or_else(|| bad("cluster image"))?;
+        // Snapshot-lifecycle spec §7.2: a v1–v4 image stored the report and
+        // catalog blobs UNSIZED; they decode with every size 0 (unknown).
+        let sized = uc_protocol::v2::cluster_image::cluster_image_version(&img)
+            .ok_or_else(|| bad("cluster image"))?
+            >= 5;
         if parts.applied != position {
             return Err(bad("cluster image position"));
         }
@@ -1019,8 +1025,12 @@ impl SnapshotStateMachine for ClusterFsm {
         // exactly the reason it agrees on everything else here: it is
         // reading the same bytes in the same order.
         let pins = decode_pin_list(parts.pins).ok_or_else(|| bad("cluster image pins"))?;
-        let reports =
-            decode_report_list(parts.reports).ok_or_else(|| bad("cluster image reports"))?;
+        let reports = if sized {
+            decode_report_list(parts.reports)
+        } else {
+            uc_protocol::v2::upgrade::decode_report_list_unsized(parts.reports)
+        }
+        .ok_or_else(|| bad("cluster image reports"))?;
         let mut running = [None; CNC_MAX_SERVICES];
         if parts.running.is_empty() {
             // v1/v2 image (#33 spec §5.3): a pinned row runs its newest pin's
@@ -1048,11 +1058,15 @@ impl SnapshotStateMachine for ClusterFsm {
                 running[r.row as usize] = Some(r);
             }
         }
-        // Empty for a v1–v3 image: the catalog's `Empty` state (§4.5).
+        // Empty for a v1–v3 image: the catalog's `Empty` state (§4.5); a v4
+        // image's catalog is unsized (every size 0, see `sized` above).
         let catalog = if parts.catalog.is_empty() {
             Vec::new()
-        } else {
+        } else if sized {
             decode_set_list(parts.catalog).ok_or_else(|| bad("cluster image: catalog"))?
+        } else {
+            uc_protocol::v2::catalog::decode_set_list_unsized(parts.catalog)
+                .ok_or_else(|| bad("cluster image: catalog"))?
         };
         // The list is keyed by position, oldest first; `retire` and every
         // reader rely on that order, so an image that breaks it is refused
@@ -1155,6 +1169,11 @@ pub struct ClusterView {
     /// How many row entries (the cluster artifact's included) across the
     /// listed sets read `Diverged` or `NoMajority`.
     pub catalog_diverged: AtomicU64,
+    /// Snapshot-lifecycle spec §7.4: the newest AGREED set's total size
+    /// ([`SetEntry::total_size`]); `0` when unknown or none —
+    /// `uc2_snapshot_newest_agreed_bytes`, and the auto-fetch space check's
+    /// input.
+    pub catalog_newest_agreed_bytes: AtomicU64,
     /// Catalog ruling R16: a CONTENT hash of the listed sets
     /// ([`catalog_version_of`]) — the stamp a node's `Holdings.sets_held`
     /// is computed against, and the one a leader's query compares. Equal on
@@ -1248,6 +1267,7 @@ impl ClusterView {
             catalog_len: AtomicU64::new(0),
             catalog_stalled: AtomicU64::new(0),
             catalog_diverged: AtomicU64::new(0),
+            catalog_newest_agreed_bytes: AtomicU64::new(0),
             catalog_version: AtomicU64::new(0),
             inner: Mutex::new(ClusterViewInner {
                 membership: genesis.membership.clone(),
@@ -1324,6 +1344,14 @@ impl ClusterView {
             .store(stalled as u64, Ordering::Release);
         self.catalog_diverged
             .store(diverged as u64, Ordering::Release);
+        self.catalog_newest_agreed_bytes.store(
+            st.catalog
+                .iter()
+                .rev()
+                .find(|e| e.is_agreed())
+                .map_or(0, SetEntry::total_size),
+            Ordering::Release,
+        );
         self.catalog_version
             .store(catalog_version_of(&st.catalog), Ordering::Release);
         self.position.store(st.applied, Ordering::Release);
@@ -3215,5 +3243,174 @@ mod tests {
             vec![500, 1000],
             "700 dropped, pinned 500 kept"
         );
+    }
+
+    /// Snapshot-lifecycle spec §7.2: the row entry records the size reported
+    /// with the majority hash; the cluster row likewise.
+    #[test]
+    fn the_catalog_records_the_majority_hashs_size() {
+        let mut f = fsm();
+        genesis_row(&mut f, 0, 100);
+        f.on_snapshot_frame(4096, false, 1);
+        assert_eq!(
+            apply_at(
+                &mut f,
+                4200,
+                &report(0, 4096, &[(0, 7, 40), (1, 7, 40), (2, 8, 99)])
+            ),
+            0
+        );
+        assert_eq!(
+            apply_at(
+                &mut f,
+                4300,
+                &report(CLUSTER_ROW, 4096, &[(0, 9, 300), (1, 9, 300), (2, 9, 300)])
+            ),
+            0
+        );
+        let e = &f.state().catalog[0];
+        assert_eq!(
+            (e.rows[0].verdict, e.rows[0].size),
+            (RowVerdict::Diverged, 40)
+        );
+        assert_eq!(e.cluster.size, 300);
+    }
+
+    /// Snapshot-lifecycle spec §7.2: a v4 image (unsized report and catalog
+    /// blobs) installs with every size 0 — no refusal, no wipe.
+    #[test]
+    fn a_v4_image_installs_with_every_size_zero() {
+        let mut f = fsm();
+        genesis_row(&mut f, 0, 100);
+        f.on_snapshot_frame(1000, false, 1);
+        assert_eq!(apply_at(&mut f, 1100, &report(0, 1000, &[(0, 1, 40)])), 0);
+        assert_eq!(
+            apply_at(&mut f, 1110, &report(CLUSTER_ROW, 1000, &[(0, 2, 300)])),
+            0
+        );
+        f.set_consumed(1200);
+        let (img, _) = f.freeze().unwrap();
+        let v4 = rewrite_image_as_v4(&img);
+        let mut g = fsm();
+        assert_eq!(g.install_snapshot(1200, &mut &v4[..]).unwrap(), 1200);
+        let e = &g.state().catalog[0];
+        assert_eq!((e.rows[0].hash, e.rows[0].size), (1, 0));
+        assert_eq!((e.cluster.hash, e.cluster.size), (2, 0));
+        assert_eq!(
+            g.state().report_for(0).map(|r| r.hashes.clone()),
+            Some(vec![(0, 1, 0)])
+        );
+        assert!(
+            e.is_agreed(),
+            "agreement survives the migration; only sizes are unknown"
+        );
+    }
+
+    /// Review focus 4: the gauge word is 0 while the newest agreed set's size
+    /// is unknown — a pre-lifecycle set never reads as "too big".
+    #[test]
+    fn the_newest_agreed_bytes_word_is_zero_when_any_size_is_unknown() {
+        let mut f = fsm();
+        genesis_row(&mut f, 0, 100);
+        f.on_snapshot_frame(1000, false, 1);
+        assert_eq!(apply_at(&mut f, 1100, &report(0, 1000, &[(0, 1, 40)])), 0);
+        assert_eq!(
+            apply_at(&mut f, 1110, &report(CLUSTER_ROW, 1000, &[(0, 2, 0)])),
+            0
+        );
+        let v = ClusterView::new(f.state());
+        assert_eq!(v.catalog_newest_agreed_bytes.load(Ordering::Acquire), 0);
+        f.on_snapshot_frame(2000, false, 2);
+        assert_eq!(apply_at(&mut f, 2100, &report(0, 2000, &[(0, 1, 40)])), 0);
+        assert_eq!(
+            apply_at(&mut f, 2110, &report(CLUSTER_ROW, 2000, &[(0, 2, 300)])),
+            0
+        );
+        v.publish(f.state());
+        assert_eq!(v.catalog_newest_agreed_bytes.load(Ordering::Acquire), 340);
+    }
+
+    /// Task 3 review R1: `auto_fetch = false` is replicated state, so it
+    /// must survive a freeze/install — a node that installed the image and
+    /// the node that froze it then freeze byte-identical images (the
+    /// divergence class catalog ruling R24 fixed for `retain_sets`).
+    #[test]
+    fn auto_fetch_false_survives_an_install_and_the_images_stay_byte_equal() {
+        let mut a = fsm();
+        genesis_row(&mut a, 0, 100);
+        let mut s = a.state().settings;
+        s.auto_fetch = false;
+        assert_eq!(apply_at(&mut a, 200, &ClusterCommand::Settings(s)), 0);
+        assert!(!a.state().settings.auto_fetch);
+        a.set_consumed(300);
+        let (img, _) = a.freeze().unwrap();
+        let mut b = fsm();
+        assert!(
+            b.state().settings.auto_fetch,
+            "a fresh FSM starts with auto_fetch on"
+        );
+        assert_eq!(b.install_snapshot(300, &mut &img[..]).unwrap(), 300);
+        assert!(
+            !b.state().settings.auto_fetch,
+            "the install kept auto_fetch = false"
+        );
+        for f in [&mut a, &mut b] {
+            agreed_set(f, 1000, 1100);
+            f.set_consumed(1200);
+        }
+        assert!(!b.state().settings.auto_fetch);
+        assert_eq!(
+            a.freeze().unwrap().0,
+            b.freeze().unwrap().0,
+            "an installed node and the node that froze the image diverged"
+        );
+    }
+
+    /// Re-frame a v5 image as v4: the report and catalog blobs back to their
+    /// unsized widths, the version word to 4, the CRC recomputed.
+    fn rewrite_image_as_v4(img: &[u8]) -> Vec<u8> {
+        use uc_protocol::v2::catalog::{ROW_ENTRY_LEN, ROW_ENTRY_LEN_UNSIZED};
+        use uc_protocol::v2::cluster_image::{decode_cluster_image, encode_cluster_image};
+        use uc_protocol::v2::upgrade::{
+            SNAPSHOT_REPORT_ENTRY_LEN, SNAPSHOT_REPORT_ENTRY_LEN_UNSIZED,
+            SNAPSHOT_REPORT_HEADER_LEN,
+        };
+        let parts = decode_cluster_image(img).unwrap();
+        let mut reports = Vec::new();
+        let mut o = 0;
+        while o < parts.reports.len() {
+            let len = u32::from_le_bytes(parts.reports[o..o + 4].try_into().unwrap()) as usize;
+            let rec = &parts.reports[o + 4..o + 4 + len];
+            let mut old = rec[..SNAPSHOT_REPORT_HEADER_LEN].to_vec();
+            for e in rec[SNAPSHOT_REPORT_HEADER_LEN..].chunks(SNAPSHOT_REPORT_ENTRY_LEN) {
+                old.extend_from_slice(&e[..SNAPSHOT_REPORT_ENTRY_LEN_UNSIZED]);
+            }
+            reports.extend_from_slice(&(old.len() as u32).to_le_bytes());
+            reports.extend_from_slice(&old);
+            o += 4 + len;
+        }
+        let mut catalog = parts.catalog[..2].to_vec();
+        for set in parts.catalog[2..].chunks(18 + 9 * ROW_ENTRY_LEN) {
+            catalog.extend_from_slice(&set[..18]);
+            for r in set[18..].chunks(ROW_ENTRY_LEN) {
+                catalog.extend_from_slice(&r[..ROW_ENTRY_LEN_UNSIZED]);
+            }
+        }
+        let mut out = Vec::new();
+        encode_cluster_image(
+            &uc_protocol::v2::cluster_image::ClusterImageParts {
+                reports: &reports,
+                catalog: &catalog,
+                ..parts
+            },
+            &mut out,
+        )
+        .unwrap();
+        let body_end = out.len() - 4;
+        out.truncate(body_end);
+        out[8..12].copy_from_slice(&4u32.to_le_bytes());
+        let crc = crc32fast::hash(&out);
+        out.extend_from_slice(&crc.to_le_bytes());
+        out
     }
 }
