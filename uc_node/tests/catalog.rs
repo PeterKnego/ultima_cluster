@@ -1340,24 +1340,58 @@ fn retain_sets_2_retires_the_oldest_and_keeps_the_pinned_origin() {
     c.stop();
 }
 
-/// Rewrite a cluster artifact in place as the pre-catalog `v3` layout: drop
-/// the trailing catalog blob and its length prefix, set the version word to
-/// 3, re-CRC (`cluster_fsm.rs`'s `a_v3_image_installs_with_an_empty_catalog`,
+/// Rewrite a cluster artifact in place as the pre-catalog `v3` layout: the
+/// report blob narrowed to its unsized 12 B entries (snapshot-lifecycle spec
+/// §7.2 — a v3 image never carried sizes; `cluster_fsm.rs`'s
+/// `rewrite_image_as_v4` does the same), the trailing catalog blob and its
+/// length prefix dropped, the version word set to 3, re-CRC
+/// (`cluster_fsm.rs`'s `a_v3_image_installs_with_an_empty_catalog`,
 /// generalised to a non-empty catalog). This is what a `2.13.x` node left on
 /// disk before the flag day.
 fn rewrite_as_v3(path: &Path) {
+    use uc_protocol::v2::cluster_image::{
+        ClusterImageParts, decode_cluster_image, encode_cluster_image,
+    };
+    use uc_protocol::v2::upgrade::{
+        SNAPSHOT_REPORT_ENTRY_LEN, SNAPSHOT_REPORT_ENTRY_LEN_UNSIZED, SNAPSHOT_REPORT_HEADER_LEN,
+    };
     let img = std::fs::read(path).unwrap();
-    let cat = uc_protocol::v2::cluster_image::decode_cluster_image(&img)
-        .expect("a valid v4 image")
-        .catalog
-        .len();
-    let body_end = img.len() - 4;
-    let mut v3 = img[..body_end - 4 - cat].to_vec();
+    let parts = decode_cluster_image(&img).expect("a valid current image");
+    let mut reports = Vec::new();
+    let mut o = 0;
+    while o < parts.reports.len() {
+        let len = u32::from_le_bytes(parts.reports[o..o + 4].try_into().unwrap()) as usize;
+        let rec = &parts.reports[o + 4..o + 4 + len];
+        let mut old = rec[..SNAPSHOT_REPORT_HEADER_LEN].to_vec();
+        for e in rec[SNAPSHOT_REPORT_HEADER_LEN..].chunks(SNAPSHOT_REPORT_ENTRY_LEN) {
+            old.extend_from_slice(&e[..SNAPSHOT_REPORT_ENTRY_LEN_UNSIZED]);
+        }
+        reports.extend_from_slice(&(old.len() as u32).to_le_bytes());
+        reports.extend_from_slice(&old);
+        o += 4 + len;
+    }
+    let mut v3 = Vec::new();
+    encode_cluster_image(
+        &ClusterImageParts {
+            reports: &reports,
+            catalog: &[],
+            ..parts
+        },
+        &mut v3,
+    )
+    .unwrap();
+    v3.truncate(v3.len() - 4); // CRC
+    let catalog_prefix = v3.split_off(v3.len() - 4);
+    assert_eq!(catalog_prefix, 0u32.to_le_bytes(), "empty catalog blob");
     v3[8..12].copy_from_slice(&3u32.to_le_bytes());
     let crc = crc32fast::hash(&v3);
     v3.extend_from_slice(&crc.to_le_bytes());
-    let parts = uc_protocol::v2::cluster_image::decode_cluster_image(&v3).expect("a valid v3");
+    let parts = decode_cluster_image(&v3).expect("a valid v3");
     assert!(parts.catalog.is_empty());
+    assert!(
+        uc_protocol::v2::upgrade::decode_report_list_unsized(parts.reports).is_some(),
+        "the v3 report blob is unsized"
+    );
     std::fs::write(path, &v3).unwrap();
 }
 
