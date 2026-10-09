@@ -1214,8 +1214,7 @@ pub struct Node {
     /// `cfg.election_timeout_max_ns`, kept for [`Node::soft_stale_ns`].
     election_timeout_max_ns: u64,
     /// Snapshot-lifecycle spec §6: `uc2_snapshot_auto_fetch_total{outcome}`,
-    /// bumped by the consensus agent (Task 10 wires it into `ObsSources`).
-    #[allow(dead_code)]
+    /// bumped by the consensus agent and exported through `ObsSources`.
     auto_fetch_stats: Arc<crate::auto_fetch::AutoFetchStats>,
     /// Plan ruling P14: the `uc2-holdings` probe's free-space override
     /// ([`Node::set_free_bytes_for_test`]; `0` = the real `statvfs`).
@@ -3094,6 +3093,8 @@ impl Node {
             snapshot_set_position: Arc::clone(&self.snapshot_set_position),
             snapshot_row_incomplete: self.snapshot_row_incomplete.clone(),
             snapshot_fetched_position: Arc::clone(&self.snapshot_fetched_position),
+            snapshot_auto_fetch: Arc::clone(&self.auto_fetch_stats),
+            snapshot_holdings: Arc::clone(&self.holdings),
             snapshot_freeze: Arc::clone(&self.snapshot_freeze),
             crypto_enabled: self.crypto.is_some(),
             purge_enabled: self.purge_enabled,

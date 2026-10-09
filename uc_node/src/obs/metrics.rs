@@ -84,6 +84,11 @@ pub const CONTRACT_SERIES: &[&str] = &[
     "uc2_snapshot_standby_instant_position",
     "uc2_snapshot_set_position",
     "uc2_snapshot_fetched_position",
+    // Snapshot-lifecycle spec §6/§7.4: background auto-fetch, the newest
+    // agreed set's size, and the one verdict on whether it fits here.
+    "uc2_snapshot_auto_fetch_total",
+    "uc2_snapshot_newest_agreed_bytes",
+    "uc2_snapshot_wont_fit",
     // Snapshot-catalog spec §9: the replicated catalog's own gauges.
     "uc2_catalog_sets",
     "uc2_catalog_agreed_position",
@@ -883,15 +888,60 @@ fn push_service_families(out: &mut String, s: &ObsSources, commit: u64, now: u64
     push_gauge(
         out,
         "uc2_snapshot_set_position",
-        "The position of the newest COMPLETE snapshot set this node holds, 0 until the first one (coordinated-snapshot spec §5.3/§9). Agrees on a fully-fetched cluster; on a learner-only cluster voters legitimately read lower (they never fetch) — the cluster floor is uc2_catalog_agreed_position (catalog spec §9). Alert: Uc2SnapshotStalled.",
+        "The position of the newest COMPLETE snapshot set this node holds, 0 until the first one (coordinated-snapshot spec §5.3/§9). Voters fetch the newest agreed set automatically by default (snapshot-lifecycle spec), so this agrees across a caught-up cluster; it lags only while a fetch is pending, backing off, or skipped for space (uc2_snapshot_auto_fetch_total), or with [settings] auto_fetch = false — the cluster floor is uc2_catalog_agreed_position (catalog spec §9). Alert: Uc2SnapshotStalled.",
         s.snapshot_set_position.load(Ordering::Acquire),
     );
     push_gauge(
         out,
         "uc2_snapshot_fetched_position",
-        "The newest set this node FETCHED whole from a learner (coordinated-snapshot spec §5.7 item 4), 0 if it never has.",
+        "The position of the newest set this node FETCHED whole from another holder — a voter's automatic fetch or a manual uc2ctl snapshot fetch (coordinated-snapshot spec §5.7 item 4; snapshot-lifecycle spec), 0 if it never has.",
         s.snapshot_fetched_position.load(Ordering::Acquire),
     );
+    let auto_fetch_samples: Vec<(String, u64)> = crate::auto_fetch::Outcome::ALL
+        .iter()
+        .map(|o| {
+            (
+                format!("outcome=\"{}\"", o.label()),
+                s.snapshot_auto_fetch.get(*o),
+            )
+        })
+        .collect();
+    push_labeled(
+        out,
+        "uc2_snapshot_auto_fetch_total",
+        "Background fetches of the newest agreed snapshot set, by outcome (snapshot-lifecycle spec §6): ok (landed), refused (could not be issued), timeout (no answer in 60 s), no_space (skipped: the set would not fit with headroom — free < size + max(size/4, 1 GiB)), no_holder (every candidate tried; retried after 30 s).",
+        "counter",
+        &auto_fetch_samples,
+    );
+    let newest_agreed_bytes = s
+        .cluster_view
+        .catalog_newest_agreed_bytes
+        .load(Ordering::Acquire);
+    push_gauge(
+        out,
+        "uc2_snapshot_newest_agreed_bytes",
+        "The newest AGREED snapshot set's total size in bytes — its rows' and cluster artifact's (snapshot-lifecycle spec §7.4); 0 when no set is agreed or its size is unknown (a set catalogued before sizes existed).",
+        newest_agreed_bytes,
+    );
+    // Plan ruling PF11: the SAME probe figure and the SAME formula the
+    // auto-fetch space check uses (`auto_fetch::fits`); an unknown size never
+    // reads 1.
+    let free_bytes = s
+        .snapshot_holdings
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .free_bytes;
+    push_gauge(
+        out,
+        "uc2_snapshot_wont_fit",
+        "1 when the newest agreed snapshot set would fail the auto-fetch space check on this node — the uc2-holdings probe's free bytes < size + max(size/4, 1 GiB) (snapshot-lifecycle spec §7.3/§7.4) — else 0; 0 while the size is unknown. Read on every node, learners and auto_fetch = false included. Alert: Uc2SnapshotWontFit.",
+        u64::from(
+            newest_agreed_bytes > 0 && !crate::auto_fetch::fits(free_bytes, newest_agreed_bytes),
+        ),
+    );
+    // SPDX-License-Identifier: Apache-2.0
+    // Copyright 2026 Peter Knego
+
     // Snapshot-catalog spec §9: the replicated catalog's own gauges, read
     // straight off the ClusterView atomics at scrape time (one Acquire load
     // each, no lock) — the same seam as uc2_cluster_fsm_position above.
@@ -1779,6 +1829,8 @@ mod tests {
             snapshot_set_position: Arc::new(AtomicU64::new(0)),
             snapshot_row_incomplete: std::array::from_fn(|_| Arc::new(AtomicU64::new(0))),
             snapshot_fetched_position: Arc::new(AtomicU64::new(0)),
+            snapshot_auto_fetch: Arc::new(Default::default()),
+            snapshot_holdings: Arc::new(std::sync::Mutex::new(Default::default())),
             snapshot_freeze: Arc::new(SnapshotFreezeStats::default()),
             crypto_enabled: false,
             purge_enabled: false,
@@ -2043,9 +2095,98 @@ mod tests {
     fn the_contract_has_the_number_of_families_the_docs_state() {
         assert_eq!(
             CONTRACT_SERIES.len(),
-            122,
+            125,
             "if this is intentional, update the family count in \
              docs/how-to/monitor-a-cluster.md in the same commit"
+        );
+    }
+
+    /// Snapshot-lifecycle spec §6/§7.4: the auto-fetch counter renders all
+    /// five outcomes (zero included — an absent label is not alertable) and
+    /// the gauge reads the view's newest-agreed-bytes word.
+    #[test]
+    fn auto_fetch_outcomes_and_the_newest_agreed_bytes_render() {
+        let src = synthetic_sources();
+        src.snapshot_auto_fetch
+            .bump(crate::auto_fetch::Outcome::NoSpace);
+        src.cluster_view
+            .catalog_newest_agreed_bytes
+            .store(4096, Ordering::Release);
+        let text = render_prometheus(&src);
+        for (label, v) in [
+            ("ok", 0),
+            ("refused", 0),
+            ("timeout", 0),
+            ("no_space", 1),
+            ("no_holder", 0),
+        ] {
+            assert!(
+                text.contains(&format!(
+                    "\nuc2_snapshot_auto_fetch_total{{outcome=\"{label}\"}} {v}\n"
+                )),
+                "{label}: {text}"
+            );
+        }
+        assert!(
+            text.contains("# TYPE uc2_snapshot_auto_fetch_total counter"),
+            "{text}"
+        );
+        assert!(
+            text.contains("\nuc2_snapshot_newest_agreed_bytes 4096\n"),
+            "{text}"
+        );
+    }
+
+    /// Plan ruling PF11 / review focus 4: `uc2_snapshot_wont_fit` is the
+    /// auto-fetch space check's own verdict on the probe's free-bytes figure,
+    /// and an unknown size (0) never reads 1.
+    #[test]
+    fn the_wont_fit_gauge_is_the_fetch_checks_verdict() {
+        const GIB: u64 = 1 << 30;
+        let src = synthetic_sources();
+        let read = |size: u64, free: u64| {
+            src.cluster_view
+                .catalog_newest_agreed_bytes
+                .store(size, Ordering::Release);
+            src.snapshot_holdings.lock().unwrap().free_bytes = free;
+            let text = render_prometheus(&src);
+            assert!(
+                text.contains("# TYPE uc2_snapshot_wont_fit gauge"),
+                "{text}"
+            );
+            if text.contains("\nuc2_snapshot_wont_fit 1\n") {
+                1
+            } else {
+                assert!(text.contains("\nuc2_snapshot_wont_fit 0\n"), "{text}");
+                0
+            }
+        };
+        assert_eq!(read(4 * GIB, 2 * GIB), 1, "4 GiB set, 2 GiB free");
+        assert_eq!(
+            read(4 * GIB, 5 * GIB - 1),
+            1,
+            "one byte short of size + 1 GiB"
+        );
+        assert_eq!(read(4 * GIB, 5 * GIB), 0, "exactly fits");
+        assert_eq!(read(0, 0), 0, "unknown size never alarms");
+    }
+
+    /// Review focus 4: a set of unknown size (gauge 0) never fires
+    /// Uc2SnapshotWontFit — the shipped rule keys on the 0/1 verdict gauge,
+    /// which the test above pins to 0 for an unknown size.
+    #[test]
+    fn the_wont_fit_rule_keys_on_the_verdict_gauge() {
+        let rules = include_str!("../../../packaging/prometheus/uc2-alerts.yml");
+        let at = rules
+            .find("alert: Uc2SnapshotWontFit")
+            .expect("Uc2SnapshotWontFit ships");
+        let end = rules[at..]
+            .find("annotations:")
+            .map_or(rules.len(), |e| at + e);
+        assert!(
+            rules[at..end].contains("expr: uc2_snapshot_wont_fit > 0"),
+            "{}",
+            &rules[at..end]
         );
     }
 
@@ -2462,6 +2603,8 @@ mod tests {
             snapshot_set_position: Arc::new(AtomicU64::new(0)),
             snapshot_row_incomplete: std::array::from_fn(|_| Arc::new(AtomicU64::new(0))),
             snapshot_fetched_position: Arc::new(AtomicU64::new(0)),
+            snapshot_auto_fetch: Arc::new(Default::default()),
+            snapshot_holdings: Arc::new(std::sync::Mutex::new(Default::default())),
             snapshot_freeze: Arc::new(SnapshotFreezeStats::default()),
             crypto_enabled: false,
             purge_enabled: false,
@@ -2569,6 +2712,8 @@ mod tests {
             snapshot_set_position: Arc::new(AtomicU64::new(0)),
             snapshot_row_incomplete: std::array::from_fn(|_| Arc::new(AtomicU64::new(0))),
             snapshot_fetched_position: Arc::new(AtomicU64::new(0)),
+            snapshot_auto_fetch: Arc::new(Default::default()),
+            snapshot_holdings: Arc::new(std::sync::Mutex::new(Default::default())),
             snapshot_freeze: Arc::new(SnapshotFreezeStats::default()),
             crypto_enabled: false,
             purge_enabled: false,
@@ -2669,6 +2814,8 @@ mod tests {
             snapshot_set_position: Arc::new(AtomicU64::new(0)),
             snapshot_row_incomplete: std::array::from_fn(|_| Arc::new(AtomicU64::new(0))),
             snapshot_fetched_position: Arc::new(AtomicU64::new(0)),
+            snapshot_auto_fetch: Arc::new(Default::default()),
+            snapshot_holdings: Arc::new(std::sync::Mutex::new(Default::default())),
             snapshot_freeze: Arc::new(SnapshotFreezeStats::default()),
             crypto_enabled: false,
             purge_enabled: false,

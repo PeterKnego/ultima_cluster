@@ -359,6 +359,21 @@ groups:
     for: 60s
     labels: { severity: warning }
     annotations: { summary: "a listed snapshot set's row hashes did not agree across the nodes that reported it — a real divergence, not a catching-up node; run `uc2ctl upgrade show` for the per-node hash matrix and start with the row(s) it names" }
+  - alert: Uc2SnapshotWontFit
+    # Snapshot-lifecycle spec §7.4: the newest agreed snapshot set would fail
+    # the auto-fetch space check on this node — free < size + max(size/4,
+    # 1 GiB). uc2_snapshot_wont_fit is the node's own verdict, computed from
+    # the SAME uc2-holdings free-bytes figure and the SAME formula the fetch
+    # check uses (plan ruling PF11), not a re-derivation from the daemon-only
+    # uc2_free_disk_bytes. Fires on EVERY node (learners that build rather
+    # than fetch, and nodes with auto_fetch off, included): it warns before
+    # any download, and a node that cannot hold the newest set cannot purge
+    # below it either. The gauge is 0 for a set of unknown size (catalogued
+    # before sizes existed), so that never alarms.
+    expr: uc2_snapshot_wont_fit > 0
+    for: 5m
+    labels: { severity: warning }
+    annotations: { summary: "{{ $labels.instance }} cannot fit the newest agreed snapshot set with headroom — its auto-fetch is skipped (uc2_snapshot_auto_fetch_total{outcome=\"no_space\"}) and it will not purge below that set; free disk or shrink the state" }
   - alert: Uc2SnapshotHashDiverged
     # FSM upgrade lifecycle spec §6.5.2: every instance of a row applied the
     # same log from the same origin, so their artifacts at one instant must

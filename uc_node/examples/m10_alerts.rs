@@ -75,6 +75,7 @@ const ALL_SCENARIOS: &[&str] = &[
     "snapshot_stalled",
     "standby_snapshot_stalled",
     "snapshot_set_diverged",
+    "snapshot_wont_fit",
     "snapshot_hash_diverged",
     "mtu_discovery_stalled",
     "path_below_mtu",
@@ -213,6 +214,7 @@ fn run_scenario(name: &str, scratch_root: &Path) -> (SeriesFile, Disclosure) {
         "snapshot_stalled" => scenario_snapshot_stalled(),
         "standby_snapshot_stalled" => scenario_standby_snapshot_stalled(),
         "snapshot_set_diverged" => scenario_snapshot_set_diverged(),
+        "snapshot_wont_fit" => scenario_snapshot_wont_fit(),
         "snapshot_hash_diverged" => scenario_snapshot_hash_diverged(),
         "mtu_discovery_stalled" => scenario_mtu_discovery_stalled(),
         "path_below_mtu" => scenario_path_below_mtu(),
@@ -429,6 +431,8 @@ fn synthetic_sources_named(node_id: u32, name: Option<FsmName>) -> ObsSources {
         snapshot_set_position: Arc::new(AtomicU64::new(0)),
         snapshot_row_incomplete: std::array::from_fn(|_| Arc::new(AtomicU64::new(0))),
         snapshot_fetched_position: Arc::new(AtomicU64::new(0)),
+        snapshot_auto_fetch: Arc::new(Default::default()),
+        snapshot_holdings: Arc::new(std::sync::Mutex::new(Default::default())),
         snapshot_freeze: Arc::new(uc_node::obs::SnapshotFreezeStats::default()),
         crypto_enabled: false,
         purge_enabled: false,
@@ -1938,6 +1942,63 @@ fn scenario_snapshot_set_diverged() -> (SeriesFile, Disclosure) {
                      renders 1 through the real encoder — Uc2SnapshotSetDiverged's \
                      max(uc2_catalog_diverged) > 0 predicate, with no per-node comparison \
                      needed now that the catalog carries one node-agnostic verdict."
+                .into(),
+        },
+    )
+}
+
+// -------------------------------------------- snapshot_wont_fit (lifecycle)
+
+/// Uc2SnapshotWontFit — **synthetic, disclosed**. Snapshot-lifecycle spec
+/// §7.4 and plan ruling PF11: one synthetic `ObsSources` whose cluster view
+/// lists an AGREED set whose rows and cluster artifact total 4 GiB, on a
+/// node whose `uc2-holdings` probe reports 2 GiB free — below 4 GiB +
+/// max(1 GiB, 1 GiB). Producing it for real needs a multi-gigabyte set on a
+/// nearly full disk, out of proportion to this rule's share of the harness.
+fn scenario_snapshot_wont_fit() -> (SeriesFile, Disclosure) {
+    use uc_protocol::v2::catalog::{RowEntry, RowVerdict, SetEntry, SetKind, SetState};
+    const GIB: u64 = 1 << 30;
+    let src = synthetic_sources(0);
+    let mut st = src.cluster_view.to_state();
+    let mut set = SetEntry::commanded(8192, SetKind::Full, 0);
+    set.state = SetState::Complete;
+    set.rows[0] = RowEntry {
+        version: 0,
+        hash: 1,
+        verdict: RowVerdict::Agreed,
+        size: 4 * GIB - 4096,
+    };
+    set.cluster = RowEntry {
+        version: 0,
+        hash: 2,
+        verdict: RowVerdict::Agreed,
+        size: 4096,
+    };
+    st.catalog.push(set);
+    st.applied = 8192;
+    src.cluster_view.publish(&st);
+    src.snapshot_holdings.lock().unwrap().free_bytes = 2 * GIB;
+
+    let srv = ObsServer::serve(src.clone(), "127.0.0.1:0".parse().unwrap()).expect("bind");
+    let addr = srv.local_addr();
+    let mut sf = SeriesFile::new();
+    for _ in 0..3 {
+        sf.record_round("n0", &scrape(addr), &["uc2_snapshot_wont_fit"]);
+        thread::sleep(Duration::from_millis(200));
+    }
+    srv.stop();
+    (
+        sf,
+        Disclosure {
+            scenario: "snapshot_wont_fit",
+            rules: &["Uc2SnapshotWontFit"],
+            state: "synthetic",
+            method: "one synthetic ObsSources whose cluster view lists an AGREED set at 8192 \
+                     totalling 4 GiB (row 0 + cluster artifact) and whose holdings probe \
+                     reports 2 GiB free; the exporter renders uc2_snapshot_wont_fit = 1 from \
+                     the real ClusterView::publish and the auto-fetch space check's own \
+                     `fits` formula (free < size + max(size/4, 1 GiB)) - Uc2SnapshotWontFit's \
+                     uc2_snapshot_wont_fit > 0 predicate."
                 .into(),
         },
     )

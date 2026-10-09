@@ -277,6 +277,7 @@ RULE_META = {
     "Uc2SnapshotStalled": {"severity": "warning", "real": False, "scenario": "snapshot_stalled"},
     "Uc2StandbySnapshotStalled": {"severity": "warning", "real": False, "scenario": "standby_snapshot_stalled"},
     "Uc2SnapshotSetDiverged": {"severity": "warning", "real": False, "scenario": "snapshot_set_diverged"},
+    "Uc2SnapshotWontFit": {"severity": "warning", "real": False, "scenario": "snapshot_wont_fit"},
     "Uc2SnapshotHashDiverged": {"severity": "critical", "real": False, "scenario": "snapshot_hash_diverged"},
     "Uc2MtuDiscoveryStalled": {"severity": "warning", "real": False, "scenario": "mtu_discovery_stalled"},
     "Uc2PathBelowMtu": {"severity": "critical", "real": False, "scenario": "path_below_mtu"},
@@ -716,6 +717,18 @@ def build_Uc2SnapshotSetDiverged():
     return r
 
 
+def build_Uc2SnapshotWontFit():
+    # Snapshot-lifecycle spec §7.4 / plan ruling PF11: ONE unlabeled per-node
+    # 0/1 verdict gauge (uc2_snapshot_wont_fit), the build_Uc2SnapshotSetDiverged
+    # level shape; the exporter computed it with the fetch check's own formula.
+    rows = load_scenario("snapshot_wont_fit")
+    row = select(rows, "uc2_snapshot_wont_fit", {})
+    r = new_rule("warning", labels_from=row)
+    add_hold_last(r, row, "uc2_snapshot_wont_fit", 300)
+    r["eval_time"] = total_for(300)[0]
+    return r
+
+
 def build_Uc2SnapshotHashDiverged():
     # FSM upgrade lifecycle spec §6.5.2: a per-row gauge held > 0 — the
     # single-instance hold shape of build_Uc2AgentDead, with the rule's
@@ -806,6 +819,7 @@ RULE_BUILDERS = {
     "Uc2SnapshotStalled": build_Uc2SnapshotStalled,
     "Uc2StandbySnapshotStalled": build_Uc2StandbySnapshotStalled,
     "Uc2SnapshotSetDiverged": build_Uc2SnapshotSetDiverged,
+    "Uc2SnapshotWontFit": build_Uc2SnapshotWontFit,
     "Uc2SnapshotHashDiverged": build_Uc2SnapshotHashDiverged,
     "Uc2MtuDiscoveryStalled": build_Uc2MtuDiscoveryStalled,
     "Uc2PathBelowMtu": build_Uc2PathBelowMtu,
