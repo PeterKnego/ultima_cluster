@@ -554,6 +554,25 @@ for the same one-maintainer-decision reason as every prior carve-out on this
 line. The new `WholeStateSnapshot` helper trait (`uc_service::snapshots`) is
 additive — see [the state-machine contract § Snapshots](state-machine-contract.md#snapshots-required-the-instant-the-envelope-and-the-exclusive-frontier).
 
+### Read-your-writes reads (unreleased, next cut)
+
+Spec `docs/superpowers/specs/2026-10-08-uc2-read-your-writes-design.md`,
+explainer `docs/notes/uc2-read-your-writes-explained.md`. Two items, neither
+touches the node-to-node wire:
+
+- **`FLAG_V2_MIN_POSITION` and cnc `3.5`.** A new query flag whose record
+  carries an 8-byte `min_position` prefix, with the cnc page minor raised
+  from 3.4 to 3.5 and no layout change. Additive API (a minor): new
+  `query_read_your_writes*`, `query_at_least_on`, `read_token`, `observe` and
+  `ReadToken`. Because a 3.5 client attaches to a 3.4 page, the client refuses
+  a read-your-writes read with a non-zero token on such a page by name
+  (`ReadYourWritesUnsupported`) instead of sending a record an old node would
+  misread. A 3.4 client on a 3.5 page is refused by the usual minor check.
+- **Remote protocol v2.** `PROTOCOL_VERSION` 1 to 2 and the query flag
+  `FLAG_MIN_POSITION = 0x20`. A v1 client and a v2 edge refuse each other at
+  `HELLO` with `HELLO_REFUSED_VERSION`: upgrade gateways and remote clients
+  together. This retires the old statement that the remote protocol stays v1.
+
 ## Related
 
 - [Cut a release](../how-to/cut-a-release.md) — the lockstep bump, the tag,

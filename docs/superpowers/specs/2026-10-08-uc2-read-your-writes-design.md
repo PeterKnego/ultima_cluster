@@ -67,6 +67,53 @@ against `b7ebcc5`:
    re-sends in place after the backoff. The remote client's own guard (§5.5)
    uses that same in-place re-send instead of resolving the request.
 
+#### As built (2026-10-09) — deviations found while executing
+
+Plan execution (tasks 1 to 12, branch `design/session-reads`) followed the
+design with these recorded rulings and gaps:
+
+- **R1.** The client's version gate is written
+  `((page_version >> 16) & 0xFF) >= CNC_MIN_POSITION_MINOR`; the plan's
+  unparenthesised form is a type error under Rust precedence.
+- **R2.** `Client::connect` must work on a follower for snapshot and
+  read-your-writes reads (Errata 2). Task 7 asserts it, and also exercises
+  `Client::query_at_least_on` (explicit token) in the follower test.
+- **R3.** Task 7 adds that `query_at_least_on` assertion because Task 6's API
+  had only a compile-only doc-test.
+- **R4.** `uc_remote` has its **own `ReadToken`** newtype (same `u64`
+  representation, same 16-hex-digit `Display`/`FromStr`, `NONE`/`from_u64`/
+  `as_u64`), pinned equal in text to `uc_protocol`'s by a dev-dependency
+  test. `uc_protocol` stays a **dev-only** dependency of `uc_remote`, the
+  crate third parties copy; the plan's `pub use uc_protocol::v2::ipc::
+  ReadToken` was a plan defect. A caller bridging `uc_client` and `uc_remote`
+  converts through `as_u64`/`from_u64`.
+- **R5.** The gateway answers `SubmitError::ReadYourWritesUnsupported` (a 3.5
+  gateway beside a pre-3.5 node) with the **transient**
+  `RETRY_SERVICE_UNAVAILABLE`, not the permanent `RETRY_PAYLOAD_TOO_LARGE` it
+  shares with `ServiceNotDeclared`: it is an upgrade-ordering condition that
+  the node's upgrade clears, so the remote client keeps retrying within its
+  budget.
+- **R6.** The flood smoke (§6.4, §7) as the plan wrote it was vacuous: with
+  the follower's service running, at-durable tokens take the fast path and
+  never park (peak 0), so the cap was never exercised. The smoke **stops the
+  follower's service** for the flood window so `applied` freezes while
+  `durable` climbs. Measured: parked peak 4096 (= the cap) reached,
+  `refused_cap` about 1.87 M, commit progress under flood 602 to 609 commits,
+  forged tokens refused ahead. The test is `#[ignore]`d.
+- **Cross-row integration test not written.** §7 planned a test that a write
+  to one row gives read-your-writes on another. With single-node rows the
+  other row is trivially caught up, so such a test could not fail; the
+  property rests on the shared-cursor argument in §3.3 and on the parked
+  heaps being per row.
+- **Capstone results** (`uc_node/tests/read_your_writes_capstone.rs`, Errata
+  3's teeth): clean run 585 reads, 0 violations; **T1** (node skips the wait,
+  client guard off) 34 violations, caught; **T2** (node skips the wait,
+  guard on) 0 violations with 112 stale answers caught by the client guard.
+  Known gap: the capstone does not assert that leader churn actually happened.
+- **Documentation owed (§8) done** except the `smr-read-options-compared.md`
+  update, which lives on `bench/read-spread` and is not on this branch.
+  `docs/reference/remote-protocol.md` was also moved to v2.
+
 ## 1. Goals and non-goals
 
 **Goals**
