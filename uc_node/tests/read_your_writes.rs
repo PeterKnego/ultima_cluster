@@ -333,3 +333,105 @@ fn a_forged_token_is_refused_at_once() {
         n.stop();
     }
 }
+
+/// Smoke, not a gate (dev box): a flood of forged (`u64::MAX`) and
+/// at-`durable` tokens against a follower must not stall commit and must
+/// never park more than the cap (spec 2026-10-08 §6.4).
+#[test]
+#[ignore = "smoke: run explicitly; a busy dev box can starve the writer for reasons unrelated to reads"]
+fn token_floods_leave_commit_progress_and_the_parked_cap_intact() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use uc_protocol::ring::MpscRing;
+    use uc_protocol::v2::ipc::{
+        FLAG_V2_MIN_POSITION, MSG_V2_QUERY, extra_client, write_min_position_query_payload,
+    };
+    let mut c = spawn_cluster(3);
+    let leader = await_single_leader(&c.nodes, 30);
+    let svcs = start_services(&c);
+    let follower = (leader + 1) % 3;
+    let writer = Client::connect(&c.dirs[leader], APP).unwrap();
+    let commits_in = |secs: u64| {
+        let t0 = Instant::now();
+        let mut n = 0u64;
+        while t0.elapsed() < Duration::from_secs(secs) {
+            let _: u64 = writer.submit(&Cmd::Add(1)).unwrap();
+            n += 1;
+        }
+        n
+    };
+    let quiet = commits_in(3);
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let stats = c.nodes[follower].observability().min_position;
+    let peak = Arc::new(AtomicU64::new(0));
+    let sampler = {
+        let (stop, stats, peak) = (stop.clone(), stats.clone(), peak.clone());
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                peak.fetch_max(stats.parked.load(Ordering::Relaxed), Ordering::Relaxed);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        })
+    };
+    let flooders: Vec<_> = (0..8u32)
+        .map(|k| {
+            let dir = c.dirs[follower].clone();
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                let (p, _c) = MpscRing::open(&dir.join("query.ring"))
+                    .unwrap()
+                    .into_split();
+                let cnc = uc_log::cnc::CncPage::open_file(&dir.join("cnc2.dat"), APP).unwrap();
+                let q = bincode::serde::encode_to_vec((), bincode::config::standard()).unwrap();
+                let mut payload = Vec::new();
+                let (mut seq, mut forged) = (0u32, 0u64);
+                while !stop.load(Ordering::Relaxed) {
+                    let token = if seq % 2 == 0 {
+                        u64::MAX
+                    } else {
+                        cnc.counters().durable.load_acquire()
+                    };
+                    write_min_position_query_payload(0, token, &q, &mut payload);
+                    let extra = extra_client(0x7000_0000 + k, seq);
+                    if p.try_write(MSG_V2_QUERY, FLAG_V2_MIN_POSITION, extra, &payload)
+                        .is_ok()
+                    {
+                        if token == u64::MAX {
+                            forged += 1;
+                        }
+                        seq = seq.wrapping_add(1);
+                    }
+                }
+                forged
+            })
+        })
+        .collect();
+    let loaded = commits_in(3);
+    stop.store(true, Ordering::Relaxed);
+    let forged: u64 = flooders.into_iter().map(|h| h.join().unwrap()).sum();
+    sampler.join().unwrap();
+    std::thread::sleep(Duration::from_millis(500)); // let the node drain the ring
+    println!(
+        "commits: quiet={quiet} under-flood={loaded}; forged sent={forged}; peak parked={}",
+        peak.load(Ordering::Relaxed)
+    );
+    assert!(
+        loaded * 2 >= quiet,
+        "commit rate fell below half under the flood"
+    );
+    assert!(
+        peak.load(Ordering::Relaxed) <= uc_node::min_position::MAX_PARKED_MIN_POSITION_READS as u64
+    );
+    assert!(
+        stats.refused_ahead.load(Ordering::Relaxed) >= forged,
+        "every forged token refused, none parked"
+    );
+    writer.shutdown();
+    for s in svcs {
+        s.stop();
+    }
+    for n in c.nodes.drain(..) {
+        n.stop();
+    }
+}
