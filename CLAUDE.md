@@ -305,8 +305,8 @@ one log stream (#11); the release-ledger line (#5) is process, not code
   not counted, so a mixed cluster stalls commits rather than making unsound
   ones; upgrade all nodes together. The client↔gateway remote protocol is
   separate: v1 through `2.13.0`, **v2 on `main` as of read-your-writes**
-  (unreleased until the next cut; see the cnc bullet below). What is API vs. what is flag-day:
-  `docs/reference/semver-policy.md`.
+  (unreleased until the next cut; see the cnc bullet above). What is API vs.
+  what is flag-day: `docs/reference/semver-policy.md`.
 - **`2.11.0` (tagged 2026-09-08, `ff0f5b6`) is five features on one flag
   day** (FSM identity, log time and timers plan 1, the replicated schedule
   table, the cluster FSM, and coordinated snapshot instants): wire `0.6.0` →
@@ -761,7 +761,8 @@ Workspace crates:
   journal or installs a snapshot + tail-replays.
 - `uc_client` — sync local-shmem input-client SDK. Small dep set (no transport,
   no consensus); matcher over the broadcast response ring.
-- `uc_remote` — **M12a**: the remote wire protocol (protocol v2 since read-your-writes, unreleased until the next cut; v1 before: framed TCP,
+- `uc_remote` — **M12a**: the remote wire protocol (protocol v2 since
+  read-your-writes, unreleased until the next cut; v1 before: framed TCP,
   credit-gated flow control, `REDIRECT`/`LEADER_CHANGED`/`RETRY`) and
   `RemoteClient`, the pipelined, redirect-following, re-sending Rust
   implementation of it — for clients that cannot attach to shmem directly.

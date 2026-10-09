@@ -364,7 +364,8 @@ pub struct RemoteStats {
 /// One completed request.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RemoteResponse {
-    /// The log position the command was applied at (`0` for a query).
+    /// The log position the command was applied at; for a query answer, the
+    /// answering replica's applied frontier.
     pub position: u64,
     /// The state machine's response bytes.
     pub bytes: Bytes,

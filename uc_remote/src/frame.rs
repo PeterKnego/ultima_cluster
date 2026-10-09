@@ -42,6 +42,8 @@ pub const FLAG_ENVELOPED: u8 = 0x10;
 /// answers only from state applied at least that far.
 pub const FLAG_MIN_POSITION: u8 = 0x20;
 
+/// Lay out a read-your-writes QUERY payload: `min_position` (u64 LE) then the
+/// query bytes. `out` is cleared first.
 pub fn write_min_position_query(min_position: u64, query: &[u8], out: &mut Vec<u8>) {
     out.clear();
     out.reserve(8 + query.len());
@@ -49,6 +51,8 @@ pub fn write_min_position_query(min_position: u64, query: &[u8], out: &mut Vec<u
     out.extend_from_slice(query);
 }
 
+/// Split a `FLAG_MIN_POSITION` payload into its token and the query bytes;
+/// `None` when it is shorter than the 8-byte prefix.
 pub fn split_min_position_query(payload: &[u8]) -> Option<(u64, &[u8])> {
     if payload.len() < 8 {
         return None;
@@ -433,9 +437,10 @@ impl Retry {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn protocol_v2_and_the_min_position_flag_are_pinned() {
-        use super::*;
         assert_eq!(PROTOCOL_VERSION, 2);
         assert_eq!(FLAG_MIN_POSITION, 0x20);
         for f in [
@@ -452,8 +457,6 @@ mod tests {
         assert_eq!(split_min_position_query(&out), Some((77, &b"q"[..])));
         assert_eq!(split_min_position_query(&out[..7]), None);
     }
-
-    use super::*;
 
     #[test]
     fn hello_round_trips_and_rejects_short() {

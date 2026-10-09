@@ -117,7 +117,9 @@ leaves it clear for a snapshot read. `FLAG_MIN_POSITION` (`0x20`, protocol v2)
 makes it a read-your-writes read: the payload then starts with an 8-byte
 `min_position` (u64 LE), the client's read token, and the query bytes follow.
 A payload shorter than 8 bytes with the flag set is malformed and closes the
-connection. `FLAG_MIN_POSITION` takes precedence over `FLAG_LINEARIZABLE`. If the node is behind the token the edge answers
+connection. A `QUERY` carrying both `FLAG_MIN_POSITION` and
+`FLAG_LINEARIZABLE` is a protocol violation: the edge closes the connection.
+If the node is behind the token the edge answers
 `RETRY` (`RETRY_SERVICE_UNAVAILABLE`, transient) and the client re-sends in
 place after a backoff. A v1 client and a v2 edge (or the reverse) refuse each
 other at `HELLO` with `HELLO_REFUSED_VERSION`, since an old edge would read

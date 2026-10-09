@@ -573,6 +573,15 @@ touches the node-to-node wire:
   `HELLO` with `HELLO_REFUSED_VERSION`: upgrade gateways and remote clients
   together. This retires the old statement that the remote protocol stays v1.
 
+**API note.** `Consistency` (in `uc_client` and in `uc_remote`) gains the
+variant `ReadYourWrites`, `SubmitError` gains `ReadYourWritesUnsupported`, and
+`ClientError` gains `ReadYourWritesUnsupported`; `EngineStats` and
+`RemoteStats` gain a public field `stale_answers`. None of these types is
+`#[non_exhaustive]`, so an exhaustive `match` on the enums, or a struct
+literal of the stats, stops compiling downstream: the same documented
+minor-version hazard `Outcome` and `SubmitError` carried in M14b. Adding a
+variant or field is additive under this policy.
+
 ## Related
 
 - [Cut a release](../how-to/cut-a-release.md) — the lockstep bump, the tag,

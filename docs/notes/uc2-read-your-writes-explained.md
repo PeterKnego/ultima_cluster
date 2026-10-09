@@ -46,9 +46,9 @@ A read-your-writes query sends the token with the query. The node compares it
 with its applied position and:
 
 - already there: answers at once (the fast path, the same cost as a snapshot);
-- bytes held but not yet applied: parks the read for up to one second and
-  answers when it catches up;
-- the token is ahead of anything the node has received: answers RETRY at once.
+- the node's durable position has reached the token but it has not applied it
+  yet: parks the read for up to one second and answers when it catches up;
+- the token is ahead of the node's durable position: answers RETRY at once.
 
 A token is the same on every row (state machine), because all rows walk one
 log. A write to row 1 therefore gives you read-your-writes on row 0.
@@ -62,9 +62,28 @@ let v: u64 = c.query_read_your_writes(&())?;   // sees that write, on any node
 ```
 
 The client also refuses to accept an answer older than the token it sent
-(this guards against an applied position that briefly rewinds), re-asking
-instead. `Client::connect` on a follower now works for snapshot and
-read-your-writes reads; writes and linearizable reads still need the leader.
+(this guards against an applied position that briefly rewinds). The local SDK
+(`Client`, `PipelinedClient`) does **not** re-ask: the engine turns a stale or
+lagging answer into `Outcome::Retry`, which surfaces as
+`Err(ClientError::Retry)`. The caller retries, bounded, or moves to another
+node (only the remote client re-sends in place):
+
+```rust
+let mut v = None;
+for _ in 0..50 {
+    match c.query_read_your_writes::<_, u64>(&()) {
+        Ok(x) => { v = Some(x); break; }
+        Err(uc_client::ClientError::Retry) => std::thread::sleep(Duration::from_millis(20)),
+        Err(e) => return Err(e.into()),
+    }
+}
+```
+
+`Client::connect` has always attached with `serving_gate: false`, so it works
+on a follower for snapshot and read-your-writes reads (writes and
+linearizable reads still need the leader). The serving-gate change matters for
+`PipelinedClient` and `Engine`, whose `PipelinedConfig`/`EngineConfig` default
+to `serving_gate: true`.
 
 ### Across processes: carry the token
 
@@ -94,8 +113,8 @@ representation and text form; it crosses processes as text anyway.
 For a read-your-writes read, RETRY means **this node is behind your token**.
 It does not mean the cluster is unhealthy. Either wait a moment and retry the
 same node, or send the read to another node (the leader is always caught up
-with your writes). Remote clients get this re-send automatically inside the
-request timeout. Behind a multi-row lag barrier a slow sibling row can also
+with your writes). Remote clients re-send automatically inside the
+request timeout; local clients see `ClientError::Retry` and retry themselves. Behind a multi-row lag barrier a slow sibling row can also
 hold a row back past the one-second deadline; that is the barrier working.
 
 ## Version requirements

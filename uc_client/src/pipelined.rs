@@ -293,6 +293,8 @@ impl PipelinedClient {
         self.query_read_your_writes_on(0, q)
     }
 
+    /// Read-your-writes read against FSM `id` (spec 2026-10-08): any node
+    /// answers once it has applied this client's token.
     pub fn query_read_your_writes_on<Q: Serialize, QR: DeserializeOwned>(
         &self,
         id: u8,
@@ -317,10 +319,12 @@ impl PipelinedClient {
         })
     }
 
+    /// Get the current read token for this client (spec 2026-10-08).
     pub fn read_token(&self) -> ReadToken {
         self.send.lock().unwrap().read_token()
     }
 
+    /// Observe a read token, advancing this client's read frontier.
     pub fn observe(&self, token: ReadToken) {
         self.send.lock().unwrap().observe(token)
     }

@@ -4,7 +4,8 @@
 **Status:** design, approved section by section in a brainstorming session;
 amended 2026-10-09 with the `durable` bound and the parked-read structure
 (§5.1, §6.4), after review raised the denial-of-service question. Awaiting
-review of this written form. No code yet.
+review of this written form. Implemented on branch `design/session-reads`,
+unreleased (see the As built block).
 **Base:** `origin/main` @ `b7ebcc5`. Every file/line cited below was checked
 against that commit.
 **Motivation:** `docs/notes/smr-read-options-compared.md` (branch
@@ -100,6 +101,20 @@ design with these recorded rulings and gaps:
   `durable` climbs. Measured: parked peak 4096 (= the cap) reached,
   `refused_cap` about 1.87 M, commit progress under flood 602 to 609 commits,
   forged tokens refused ahead. The test is `#[ignore]`d.
+- **Errata 2's premise corrected.** "`Client::connect` on a follower fails the
+  serving gate" holds for `PipelinedConfig`/`EngineConfig` defaults
+  (`serving_gate: true`), not for `Client::connect`, which has always used
+  `serving_gate: false` (`uc_client/src/client.rs:71`). The local SDK also
+  does not re-ask on a stale answer: it surfaces `ClientError::Retry`.
+- **Not done, recorded.** (a) The perf smoke that the fast path is about equal
+  to a snapshot read was not run. (b) The Elle session pass was not attempted.
+  (c) There is no unit test that a lost leadership never RETRYs a min-position
+  read; it is structurally true (admission reads no leadership state).
+  (d) **R7:** the capstone has no snapshot/purge churn arm (gap; the
+  install-path jump of `applied` is covered by design and by the client
+  guard). (e) **R8:** a remote QUERY carrying both `FLAG_MIN_POSITION` and
+  `FLAG_LINEARIZABLE` is a protocol violation; the gateway closes the
+  connection, matching §4.1's drop of that combination on shmem.
 - **Cross-row integration test not written.** §7 planned a test that a write
   to one row gives read-your-writes on another. With single-node rows the
   other row is trivially caught up, so such a test could not fail; the

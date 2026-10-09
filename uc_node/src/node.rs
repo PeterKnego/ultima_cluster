@@ -9516,7 +9516,9 @@ impl Consensus {
 
     /// B's capture-recheck bracket for a min-position read: `Some(epoch)` iff
     /// an attached incarnation (`epoch >= 1`) has applied at least `token`
-    /// and was still the same incarnation after the check.
+    /// and was still the same incarnation after the check. The `e >= 1`
+    /// guard is the sentinel-collision rationale documented in
+    /// `advance_pending_reads`: epoch 0 is the skip-the-check sentinel.
     fn min_position_ready(&self, service_id: u8, token: u64) -> Option<u64> {
         let slot = self.cnc.service_slot(service_id as usize);
         let e = slot.epoch.load_acquire();
@@ -23833,10 +23835,6 @@ mod tests {
         );
     }
 
-    /// M14b: a snapshot read is forwarded to the NAMED id's ring (the harness
-    /// gets a second ring for id 1 for this test), payload unchanged
-    /// (`expected_epoch 0 ++ query`), and a linearizable read carries the id
-    /// into its PendingRead.
     /// Read-your-writes (spec 2026-10-08 §5.1). A harness with a row-1 ring
     /// whose consumer the test holds, and a min-position record writer.
     fn ryw_setup(
@@ -24032,6 +24030,10 @@ mod tests {
         assert!(h.cons.parked_reads.is_empty() && h.cons.pending_reads.is_empty());
     }
 
+    /// M14b: a snapshot read is forwarded to the NAMED id's ring (the harness
+    /// gets a second ring for id 1 for this test), payload unchanged
+    /// (`expected_epoch 0 ++ query`), and a linearizable read carries the id
+    /// into its PendingRead.
     #[test]
     fn queries_route_to_the_named_ids_ring_and_pending_reads_carry_the_id() {
         use uc_protocol::v2::ipc::{MSG_V2_QUERY, MSG_V2_SVC_QUERY, write_query_payload};

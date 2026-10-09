@@ -93,10 +93,10 @@ const WRITER_PARK: Duration = Duration::from_millis(5);
 const MAX_RETRY_SLEEP: Duration = Duration::from_secs(1);
 /// A `RETRY{retry_after_us: 0}` still backs off this much.
 const MIN_RETRY_SLEEP: Duration = Duration::from_micros(100);
-/// Backoff for a request an edge redirected to itself.
 /// Pause before re-sending a query whose answer came from state older than
 /// its read-your-writes token.
 const STALE_ANSWER_BACKOFF: Duration = Duration::from_millis(1);
+/// Backoff for a request an edge redirected to itself.
 const SELF_REDIRECT_BACKOFF: Duration = Duration::from_millis(10);
 /// The most bytes one re-send batch puts into a single `write_all_bytes`.
 const RESEND_BATCH_BYTES: usize = 64 * 1024;
