@@ -2512,6 +2512,10 @@ impl Node {
             holdings_catalog_version_seen: 0,
             holdings_catalog: Vec::with_capacity(MAX_CATALOG_SETS),
             holdings_held: Vec::with_capacity(2 * MAX_CATALOG_SETS),
+            start_sets: [crate::catalog::StartSet::default(); CNC_MAX_SERVICES],
+            start_sets_dirty: true,
+            start_set_wait_above: u64::MAX,
+            start_set_recomputes: 0,
         };
         // Cluster FSM (spec §4.5): arm from the RECOVERED view BEFORE the
         // consensus agent starts. The view already holds genesis or the
@@ -4129,6 +4133,16 @@ struct Consensus {
     /// the cluster artifact, added on every completion edge, dropped by the
     /// pruner. The effective floor reads it in place of a file check.
     holdings_held: Vec<u64>,
+    /// Snapshot-lifecycle spec §4.2: the start set last published per row.
+    start_sets: [crate::catalog::StartSet; CNC_MAX_SERVICES],
+    /// Spec §4.3: set by every edge that can change a start set - a catalog
+    /// change, a held-set change - and cleared by the recompute.
+    start_sets_dirty: bool,
+    /// The frontier at which a newer held agreed set becomes eligible
+    /// (`u64::MAX` = none): the only reason a clean pass recomputes.
+    start_set_wait_above: u64,
+    /// Recomputes run (test-visible; the steady-pass witness).
+    start_set_recomputes: u64,
 }
 
 impl Consensus {
@@ -4174,6 +4188,9 @@ impl Consensus {
         // in step 8 reads. Commit, apply and replication never wait on a
         // snapshot, so this is a poll and never a barrier.
         self.check_set_completeness();
+        // Snapshot-lifecycle spec §4: and the rows' START SETS - one `bool`
+        // test on a steady pass.
+        self.maybe_publish_start_sets();
         // Catalog erratum R37 item 4: and re-offer that set's reports to a
         // leader that has not had them. One `Acquire` load and a compare on
         // the steady path.
@@ -7706,7 +7723,60 @@ impl Consensus {
         let listed = &self.holdings_catalog;
         self.holdings_held
             .retain(|p| *p > newest || listed.contains(p));
+        self.start_sets_dirty = true;
         self.publish_sets_held(Some(catalog_version));
+    }
+
+    /// Snapshot-lifecycle spec §4.3: recompute only when the catalog or this
+    /// node's held list changed, or the frontier passed a newer held agreed
+    /// set. A steady pass is one `bool` test and one compare.
+    #[inline]
+    fn maybe_publish_start_sets(&mut self) {
+        if !self.start_sets_dirty {
+            if self.start_set_wait_above == u64::MAX {
+                return;
+            }
+            let c = self.cnc.counters();
+            let frontier = c.commit.load_acquire().min(c.durable.load_acquire());
+            if frontier < self.start_set_wait_above {
+                return;
+            }
+        }
+        self.publish_start_sets();
+    }
+
+    /// Spec §4.2: write each declared row's start set to its cnc slot - only
+    /// a row whose answer changed is written (`store_start_set`).
+    #[cold]
+    #[inline(never)]
+    fn publish_start_sets(&mut self) {
+        self.start_sets_dirty = false;
+        self.start_set_recomputes += 1;
+        let c = self.cnc.counters();
+        let frontier = c.commit.load_acquire().min(c.durable.load_acquire());
+        let inner = self.cluster_view.snapshot_inner();
+        let mut wait = u64::MAX;
+        for row in self.services.ids() {
+            let (s, w) =
+                crate::catalog::start_set_for(row, &inner.catalog, &self.holdings_held, frontier);
+            wait = wait.min(w);
+            if s != self.start_sets[row as usize] {
+                self.start_sets[row as usize] = s;
+                self.cnc
+                    .service_slot(row as usize)
+                    .snapshot_pos
+                    .store_start_set(s.position, s.version);
+                crate::obs_event!(
+                    Info,
+                    "start_set_published",
+                    node = self.id as u64,
+                    row = row as u64,
+                    position = s.position,
+                    version = s.version as u64
+                );
+            }
+        }
+        self.start_set_wait_above = wait;
     }
 
     /// Catalog spec §5.1: this node now holds the complete set at `p` (the
@@ -7716,6 +7786,7 @@ impl Consensus {
         if !self.holdings_held.contains(&p) {
             self.holdings_held.push(p);
         }
+        self.start_sets_dirty = true;
         self.publish_sets_held(None);
     }
 
@@ -7816,6 +7887,7 @@ impl Consensus {
         let before = self.holdings_held.len();
         self.holdings_held.retain(|h| *h >= p || keep.contains(h));
         if self.holdings_held.len() != before {
+            self.start_sets_dirty = true;
             self.publish_sets_held(None);
         }
         if removed > 0 || errors > 0 {
@@ -13900,6 +13972,10 @@ mod tests {
             holdings_catalog_version_seen: 0,
             holdings_catalog: Vec::with_capacity(MAX_CATALOG_SETS),
             holdings_held: Vec::with_capacity(2 * MAX_CATALOG_SETS),
+            start_sets: [crate::catalog::StartSet::default(); CNC_MAX_SERVICES],
+            start_sets_dirty: true,
+            start_set_wait_above: u64::MAX,
+            start_set_recomputes: 0,
         };
         // The LAST thing `Node::start_with_socket` does before spawning the
         // consensus agent, mirrored here so this harness exercises the same
@@ -14326,6 +14402,60 @@ mod tests {
                 format!("snap-{p1}.ultcluster"),
                 format!("snap-{p2}.ultcluster")
             ]
+        );
+    }
+
+    /// Snapshot-lifecycle spec §4.2-4.3: the consensus agent publishes the
+    /// row's start set on its cnc slot, moves it when the frontier passes a
+    /// newer held agreed set, and costs no recompute on a steady pass.
+    #[test]
+    fn the_start_set_is_published_and_recomputed_only_on_a_change() {
+        let mut h = harness_with_rows(&["a"]);
+        let mut st = h.cons.cluster_view.to_state();
+        let mut a = agreed_entry(1000);
+        a.rows[0].version = 7;
+        let mut b = agreed_entry(2000);
+        b.rows[0].version = 7;
+        st.catalog = vec![a, b];
+        // `refresh_from_view` acts only when the view's position moves.
+        st.applied += 1;
+        h.cons.cluster_view.publish(&st);
+        h.cons.refresh_from_view();
+        h.cons.note_set_held(1000);
+        h.cons.note_set_held(2000);
+        let cnc = Arc::clone(&h.cons.cnc);
+        let c = cnc.counters();
+        c.durable.store_release(1500);
+        c.commit.store_release(1500);
+        h.cons.maybe_publish_start_sets();
+        let slot = cnc.service_slot(0);
+        assert_eq!(slot.snapshot_pos.start_set(), Some((1000, 7)));
+        let n = h.cons.start_set_recomputes;
+        for _ in 0..1000 {
+            h.cons.maybe_publish_start_sets();
+        }
+        assert_eq!(
+            h.cons.start_set_recomputes, n,
+            "a steady pass recomputes nothing"
+        );
+        c.durable.store_release(2500);
+        c.commit.store_release(2500);
+        h.cons.maybe_publish_start_sets();
+        assert_eq!(
+            slot.snapshot_pos.start_set(),
+            Some((2000, 7)),
+            "the frontier passed 2000"
+        );
+        assert_eq!(h.cons.start_set_recomputes, n + 1);
+        st.catalog.clear();
+        st.applied += 1;
+        h.cons.cluster_view.publish(&st);
+        h.cons.refresh_from_view();
+        h.cons.maybe_publish_start_sets();
+        assert_eq!(
+            slot.snapshot_pos.start_set(),
+            None,
+            "an empty catalog publishes none"
         );
     }
 
