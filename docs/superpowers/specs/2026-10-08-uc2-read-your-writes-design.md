@@ -2,7 +2,9 @@
 
 **Date:** 2026-10-08
 **Status:** design, approved section by section in a brainstorming session;
-awaiting review of this written form. No code yet.
+amended 2026-10-09 with the `durable` bound and the parked-read structure
+(§5.1, §6.4), after review raised the denial-of-service question. Awaiting
+review of this written form. No code yet.
 **Base:** `origin/main` @ `b7ebcc5`. Every file/line cited below was checked
 against that commit.
 **Motivation:** `docs/notes/smr-read-options-compared.md` (branch
@@ -176,16 +178,42 @@ as is) from a write response's (a frame start, taken `+1`) by
 
 ### 5.1 Node (consensus agent)
 
-Both steps already run on every consensus pass regardless of role
+Both read steps already run on every consensus pass regardless of role
 (`uc_node/src/node.rs:4419-4424`: `drain_query_ring()` then
-`advance_pending_reads()`).
+`advance_pending_reads()`). Min-position reads get their own parked-read
+structure and their own advance step beside them; linearizable reads and
+`pending_reads` are untouched.
+
+**The three positions this section uses** (all per node, all byte offsets in
+the one log):
+
+- `durable`: how much of the log is on this node's disk.
+  `LogCounters.durable` (`uc_log/src/counters.rs:127`), published by the
+  archive agent after the journal sync (`uc_log/src/archive.rs:405-426`).
+  Local, and lowered only when the archive truncates an uncommitted tail
+  (`archive.rs` truncate paths).
+- this node's **view of commit**: `LogCounters.commit`. Monotone, but a
+  follower learns it from the leader after the bytes arrive, so it trails.
+- `applied`: the row's exclusive apply frontier,
+  `applied ≤ min(commit, durable)` (`uc_service/src/apply.rs`, the `head`
+  computed at the top of `apply_cycle`).
+
+Every legitimate token is a committed position (§3.4), so it is at or below
+the cluster's real commit. It can still be above a lagging node's `durable`,
+commit view and `applied`.
 
 **Admission (`drain_query_ring`, `node.rs:9332`)**, for a record carrying
 `FLAG_V2_MIN_POSITION`:
 
 1. Parse and strip the token. An unknown row gets `BAD_SERVICE`, as today.
 2. **No leadership gate.** Like a snapshot read, it is served on any role.
-3. **Fast path:** the same capture-recheck B uses. Capture the slot's epoch
+3. **The durable bound:** if `token > durable`, answer `RETRY` at once. This
+   node does not hold the bytes the token names: either it is lagging (the
+   write committed on a quorum without it), so a retry or another node is the
+   right answer, or the token is forged or from another cluster and nothing
+   would ever satisfy it. Either way, nothing is parked. This is the primary
+   defence against unsatisfiable tokens (§6.4).
+4. **Fast path:** the same capture-recheck B uses. Capture the slot's epoch
    `e`, require `e ≥ 1 ∧ applied ≥ token`, then require the epoch is still `e`.
    If so, forward at once with **`expected_epoch = e`**. This deliberately
    differs from a snapshot read, which forwards `0` ("skip the check"). With the
@@ -193,36 +221,54 @@ Both steps already run on every consensus pass regardless of role
    incarnation refuse with RETRY (its existing stale-epoch refusal in
    `drain_queries`), instead of answering from a rebuilt state that may be
    behind the token.
-4. **Slow path:** park a `PendingRead` with `phase = AwaitApplied`,
-   `commit_at = token`, `deadline_ns = now + READ_BARRIER_TIMEOUT_NS` (1 s,
-   `node.rs:376`). It never enters `AwaitQuorum`.
+5. **Cap:** if the node already holds `MAX_PARKED_MIN_POSITION_READS` parked
+   min-position reads, answer `RETRY` at once. The constant is fixed in the
+   plan (order of thousands).
+6. **Park:** otherwise the bytes are on this node, and it is waiting only to
+   learn they are committed and to apply them. Park the read (below) with
+   `deadline = now + READ_BARRIER_TIMEOUT_NS` (1 s, `node.rs:376`).
 
-**`PendingRead` gains `kind: ReadKind { Linearizable, MinPosition }`**
-(`node.rs:925`).
+Both refusals (3 and 5) are counted on a metric labelled by reason (`ahead` /
+`cap`), so a lagging node and an attack are visible.
 
-**Advancing (`advance_pending_reads`, `node.rs:9445`):**
+**Parked structure: per-row, cost driven by what is released.** A plain list
+scanned every pass would make the consensus agent's per-pass cost grow with
+the number of parked reads, which a client controls. Instead:
 
-- RETRY on deadline: both kinds.
-- RETRY on lost leadership (`!can_serve`): **`Linearizable` only.** A
-  `MinPosition` read does not depend on who leads.
-- Otherwise the existing `AwaitApplied` branch, unchanged: epoch capture,
-  `applied ≥ commit_at`, epoch recheck, forward with the real epoch, and restore
-  the read if `svc_query` is momentarily full.
+- a slab of parked reads (`client_id`, `local_seq`, row, query bytes, token,
+  deadline), indexed by a small id;
+- per row, a **min-heap of `(token, id)`**: the lowest token surfaces first, so
+  a high token never holds back a lower one;
+- one **FIFO of `(deadline, id)`**: every parked read gets the same timeout, so
+  admission order is deadline order and expiry pops from the front.
 
-**Rung A probe-round reset, tightened.** Today a round is dropped when
-`pending_reads` is empty (the head of `advance_pending_reads`). With
-`MinPosition` reads parked, the list may never be empty, so a stale round could
-linger. That is harmless to safety (the round-order gate still stops it
-certifying later reads), but it delays the next linearizable read behind a
-round that certifies nobody. The condition becomes "no read is in
-`AwaitQuorum`", the same test `maybe_issue_round` uses (`node.rs:9218`).
-Parked `MinPosition` reads never cause a probe round: `maybe_issue_round` only
-counts `AwaitQuorum` reads.
+**Advancing (`advance_min_position_reads`, a new step after
+`advance_pending_reads`):**
 
-**Cost.** On a caught-up node every `MinPosition` read takes the fast path:
-two atomic loads plus the epoch recheck, then the same forward a snapshot read
-does. The pending list holds only lagging reads, bounded by the client
-admission window, as linearizable reads are.
+- **Release:** for each row, while the heap's top has `token ≤ applied`, pop
+  it and run the same epoch capture / `applied` check / epoch recheck as the
+  fast path, then forward with the real epoch. If `svc_query` is momentarily
+  full, leave it at the top and stop for this row until the next pass.
+- **Expire:** while the FIFO's front has passed its deadline, answer `RETRY`
+  and drop it (entries already released are skipped as tombstones).
+- **No leadership dependence.** A min-position read is never RETRY'd for lost
+  or changed leadership.
+
+A pass that releases and expires nothing costs one heap peek per row with
+parked reads, plus one FIFO peek, whatever the number parked. Released and
+expired reads cost `O(log n)` each.
+
+**Why a read still needs a deadline after the durable bound.** A legitimate
+token at or below `durable` is committed and always resolves. A forged token
+can also be at or below `durable` if it names an uncommitted tail this node
+holds. If that tail is later truncated (`durable` drops), `applied` never
+reaches the token. The deadline turns that into RETRY.
+
+**Cost on the common path.** On a caught-up node every min-position read is
+admitted by one comparison against `durable` and the fast path: three atomic
+loads plus the epoch recheck, then the same forward a snapshot read does.
+Parking only ever holds reads for bytes the node already has, so parked reads
+live about as long as the node's commit-learning and apply lag.
 
 ### 5.2 Service
 
@@ -277,12 +323,14 @@ its deadline) follows `RemoteClient`'s existing RETRY handling.
 ### 6.1 Events that tokens survive
 
 - **Leader change.** Tokens are committed positions (§3.4), so a new leader
-  leaves them meaningful. A lagging node waits until it applies them.
+  leaves them meaningful. A node that already holds the bytes waits until it
+  applies them; one that does not yet hold them answers RETRY at once (§5.1).
 - **Truncation** removes only uncommitted bytes, which no token can name.
 - **Snapshot install** (below-floor joiner, restarted service): `applied`
   jumps forward, and the reads it unblocks are correct.
-- **Learners** serve min-position reads like any node; lag shows up as
-  waiting, then RETRY.
+- **Learners** serve min-position reads like any node. Lag shows up as an
+  immediate RETRY while the learner lacks the bytes, and as a short wait once
+  it holds them.
 
 ### 6.2 When the state behind the check moves
 
@@ -301,24 +349,43 @@ its deadline) follows `RemoteClient`'s existing RETRY handling.
 - **Multi-FSM lag barrier.** A row held behind a slower sibling may not reach
   the token before the deadline, so the read gets RETRY. That is the barrier
   working as designed, and it is documented.
-- **Halted or removed node.** `applied` stops, so min-position reads get RETRY
-  at the deadline, while snapshot reads keep answering stale data (as today).
+- **Halted or removed node.** `durable` and `applied` stop. Tokens above
+  `durable` get RETRY at once; tokens between `applied` and `durable` get RETRY
+  at the deadline. Snapshot reads keep answering stale data (as today).
 - **Booting node.** The existing `NodeBooting` attach refusal applies unchanged.
 
-### 6.4 Bad or unusual tokens
+### 6.4 Bad, forged and adversarial tokens
 
-- **Token from a cluster rebuilt from genesis.** Positions restart at 0, so the
-  old token points ahead of everything, and every read with it gets RETRY at
-  the deadline. Documented remedy: drop the token. A restore from backup keeps
-  positions and is unaffected. Embedding a cluster identity in the token was
-  considered and left out (YAGNI); `ReadToken` is opaque, so it can be added
-  later without changing the API shape.
+- **Tokens ahead of this node (`token > durable`)**: `RETRY` at once (§5.1
+  step 3). This covers a lagging node, a token from a cluster rebuilt from
+  genesis (positions restarted at 0, so the old token is ahead of everything),
+  and any forged token such as `u64::MAX`. Each costs one comparison and is
+  never parked. A restore from backup keeps positions and is unaffected.
+  Embedding a cluster identity in the token was considered and left out
+  (YAGNI); `ReadToken` is opaque, so it can be added later without changing
+  the API shape.
+- **Flooding with tokens just at `durable`**: such reads resolve as soon as
+  the node learns commit and applies, so they cannot be made to wait. Under
+  load, though, `applied` can trail `durable` by milliseconds, and at 64
+  admissions per pass that can still be many parked reads. The per-row heaps
+  keep the per-pass cost independent of how many are parked, and
+  `MAX_PARKED_MIN_POSITION_READS` bounds memory (§5.1 steps 5 and 6).
+- **Forged tokens inside an uncommitted tail** that is later truncated: never
+  satisfied, so `RETRY` at the deadline (§5.1).
+- **Who can attack.** Remote clients through `uc2-gateway` are the realistic
+  source: that path is reachable from the network. The gateway's global grant
+  budget already bounds what one gateway keeps in flight. Local shared-memory
+  clients are same-host processes that can write raw records past any SDK
+  limit; the bound, heaps and cap protect against them too, as defence in
+  depth.
 - **Malformed records** (§4.1) are dropped.
 
 ### 6.5 Back-pressure
 
 A parked read holds its client request slot until answered or RETRY, under the
-existing admission window. No new limit.
+existing admission window, and the node holds at most
+`MAX_PARKED_MIN_POSITION_READS` of them. Beyond the cap, reads get `RETRY`
+immediately.
 
 ## 7. Testing and proof
 
@@ -331,11 +398,14 @@ existing admission window. No new limit.
   positions taken as is; `fetch_max` never lowers; `observe` merges;
   `ReadToken` `Display`/`FromStr` round trip; token 0 sends a byte-identical
   snapshot record; the guard turns `position < token_sent` into `Retry`.
-- `uc_node`: fast path forwards immediately with the real epoch; slow path
-  parks then forwards when `applied` reaches the token; deadline → RETRY; lost
-  leadership does not RETRY a `MinPosition` read but still RETRYs a
-  `Linearizable` one; the tightened round reset drops a stale round when only
-  `MinPosition` reads are pending.
+- `uc_node`: `token > durable` → immediate RETRY, never parked (including
+  `u64::MAX`); fast path forwards immediately with the real epoch; slow path
+  parks then forwards when `applied` reaches the token; a lower token parked
+  after a higher one is released first; the cap → immediate RETRY; deadline →
+  RETRY (including a parked token whose tail is truncated); lost leadership
+  never RETRYs a min-position read; linearizable reads and Rung A behave
+  exactly as before (their tests unchanged and green); both refusal reasons
+  are counted.
 - `uc_service`: a query answer carries the cursor, not 0.
 
 **Fuzz:** extend the query-record decode coverage to the new flag and prefix
@@ -365,6 +435,11 @@ existing admission window. No new limit.
   both.
 - Elle: one session-guarantee pass **if** the list-append models in
   `scripts/elle_check.sh` support one (not checked at design time).
+
+**Adversarial:** under steady write load, a client floods a node with
+(a) `u64::MAX` tokens and (b) tokens exactly at `durable`, at the cap. Assert
+that commit keeps advancing at the unloaded rate within smoke tolerance, that
+no read is parked for (a), and that parked count never exceeds the cap for (b).
 
 **Remote:** a gateway end-to-end test (write through the leader's gateway,
 `ReadYourWrites`-read through a follower's gateway, see the write), and an
