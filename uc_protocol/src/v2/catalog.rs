@@ -147,14 +147,6 @@ impl SetEntry {
         }
     }
 
-    /// Agreement is FROZEN at completion (ruling R9): a `Complete` entry
-    /// whose cluster artifact and every REPORTED row are `Agreed`. Which
-    /// rows a set had to cover is judged once, when the entry turns
-    /// `Complete` (against the declared rows at that report); a row
-    /// declared LATER is `Unreported` in the entry and does not un-agree
-    /// it — otherwise adding a row would retroactively empty the catalog
-    /// and let retention drop a pinned origin. A `Commanded` entry is never
-    /// agreed.
     /// Snapshot-lifecycle spec §7.2: the set's byte size — every REPORTED
     /// row's size plus the cluster artifact's. `0` = unknown: the cluster
     /// artifact is unreported, or any reported component's size is `0` (a set
@@ -176,6 +168,14 @@ impl SetEntry {
         total
     }
 
+    /// Agreement is FROZEN at completion (ruling R9): a `Complete` entry
+    /// whose cluster artifact and every REPORTED row are `Agreed`. Which
+    /// rows a set had to cover is judged once, when the entry turns
+    /// `Complete` (against the declared rows at that report); a row
+    /// declared LATER is `Unreported` in the entry and does not un-agree
+    /// it — otherwise adding a row would retroactively empty the catalog
+    /// and let retention drop a pinned origin. A `Commanded` entry is never
+    /// agreed.
     pub fn is_agreed(&self) -> bool {
         self.state == SetState::Complete
             && self.cluster.verdict == RowVerdict::Agreed
@@ -495,5 +495,18 @@ mod tests {
         e.rows[3].size = 20;
         e.cluster.verdict = RowVerdict::Unreported;
         assert_eq!(e.total_size(), 0, "no cluster artifact report: unknown");
+    }
+
+    /// The decoders are exact-length: each refuses the other's width.
+    #[test]
+    fn sized_and_unsized_decoders_refuse_each_others_width() {
+        let e = SetEntry::commanded(1, SetKind::Full, 0);
+        let mut sized = Vec::new();
+        encode_set_list(&[e], &mut sized).unwrap();
+        assert_eq!(decode_set_list_unsized(&sized), None);
+        let mut old = vec![1u8, 0];
+        old.extend_from_slice(&[0u8; SET_ENTRY_LEN_UNSIZED]);
+        assert_eq!(decode_set_list(&old), None);
+        assert!(decode_set_list_unsized(&old).is_some());
     }
 }
