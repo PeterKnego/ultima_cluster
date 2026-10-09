@@ -348,7 +348,7 @@ fn token_floods_leave_commit_progress_and_the_parked_cap_intact() {
     };
     let mut c = spawn_cluster(3);
     let leader = await_single_leader(&c.nodes, 30);
-    let svcs = start_services(&c);
+    let mut svcs = start_services(&c);
     let follower = (leader + 1) % 3;
     let writer = Client::connect(&c.dirs[leader], APP).unwrap();
     let commits_in = |secs: u64| {
@@ -361,6 +361,10 @@ fn token_floods_leave_commit_progress_and_the_parked_cap_intact() {
         n
     };
     let quiet = commits_in(3);
+    // Freeze the follower's applied frontier (its durable keeps climbing), so
+    // every at-durable token parks and the cap is actually exercised.
+    svcs.remove(follower).stop();
+    let _: u64 = writer.submit(&Cmd::Add(1)).unwrap();
 
     let stop = Arc::new(AtomicBool::new(false));
     let stats = c.nodes[follower].observability().min_position;
@@ -385,7 +389,7 @@ fn token_floods_leave_commit_progress_and_the_parked_cap_intact() {
                 let cnc = uc_log::cnc::CncPage::open_file(&dir.join("cnc2.dat"), APP).unwrap();
                 let q = bincode::serde::encode_to_vec((), bincode::config::standard()).unwrap();
                 let mut payload = Vec::new();
-                let (mut seq, mut forged) = (0u32, 0u64);
+                let (mut seq, mut forged, mut durable_sent) = (0u32, 0u64, 0u64);
                 while !stop.load(Ordering::Relaxed) {
                     let token = if seq % 2 == 0 {
                         u64::MAX
@@ -399,26 +403,48 @@ fn token_floods_leave_commit_progress_and_the_parked_cap_intact() {
                     {
                         if token == u64::MAX {
                             forged += 1;
+                        } else {
+                            durable_sent += 1;
                         }
                         seq = seq.wrapping_add(1);
                     }
                 }
-                forged
+                (forged, durable_sent)
             })
         })
         .collect();
     let loaded = commits_in(3);
     stop.store(true, Ordering::Relaxed);
-    let forged: u64 = flooders.into_iter().map(|h| h.join().unwrap()).sum();
+    let (mut forged, mut durable_sent) = (0u64, 0u64);
+    for h in flooders {
+        let (f, d) = h.join().unwrap();
+        forged += f;
+        durable_sent += d;
+    }
     sampler.join().unwrap();
-    std::thread::sleep(Duration::from_millis(500)); // let the node drain the ring
+    // Let the node drain the ring: poll until every forged token is counted.
+    let t0 = Instant::now();
+    while stats.refused_ahead.load(Ordering::Relaxed) < forged
+        && t0.elapsed() < Duration::from_secs(5)
+    {
+        std::thread::sleep(Duration::from_millis(10));
+    }
     println!(
-        "commits: quiet={quiet} under-flood={loaded}; forged sent={forged}; peak parked={}",
+        "commits: quiet={quiet} under-flood={loaded}; forged sent={forged}; at-durable sent={durable_sent}; refused_cap={}; peak parked={}",
+        stats.refused_cap.load(Ordering::Relaxed),
         peak.load(Ordering::Relaxed)
     );
     assert!(
         loaded * 2 >= quiet,
         "commit rate fell below half under the flood"
+    );
+    assert!(
+        peak.load(Ordering::Relaxed) > 0,
+        "parking was never exercised"
+    );
+    assert!(
+        stats.refused_cap.load(Ordering::Relaxed) > 0,
+        "the cap was never hit"
     );
     assert!(
         peak.load(Ordering::Relaxed) <= uc_node::min_position::MAX_PARKED_MIN_POSITION_READS as u64
