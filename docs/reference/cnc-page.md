@@ -142,6 +142,8 @@ Fields within a slot (each its own 64 B line, one writer):
 | 128 | `epoch` | service, `fetch_add` at attach |
 | 192 | `output_completed` | service output agent |
 | 256 | `snapshot_pos` | service builder agent |
+| 264 | `start_set_pos` — newest agreed snapshot set this node holds at or below `min(commit, durable)`, `0` = none | node (consensus agent) |
+| 272 | `start_set_version` — low 32: packed version that built it | node (consensus agent) |
 | 320 | `heartbeat_ns` | service apply agent |
 | 384 | `lag_waits` | service apply agent (one per wait episode at the lag barrier) |
 | 448 | `name` (line 7) — `[u8; 32]`, NUL-padded FSM name | **node**, at `CncPage::init` (boot, once) — cnc 3.1, FSM identity |
@@ -149,6 +151,8 @@ Fields within a slot (each its own 64 B line, one writer):
 | 488 | `timers_pending` (line 7) — u64 count of this row's pending scheduled timers | **node** (consensus agent), republished every pass — cnc 3.1, log time. Since the cluster FSM (2.11.0) the timer heap is **leader-only**, so this is the leader's count and a follower always publishes `0` |
 | 496 | `freeze_ns` (line 7) — u64, the duration in nanoseconds of this row's **last** `freeze()` call | **service** (`on_snapshot_frame`), once per instant — coordinated snapshots, 2.11.0 |
 | 504 | `artifact_hash` (line 7) — u64, SHA-256[..8] of the row's newest artifact payload | **service** (builder agent), stored BEFORE `snapshot_pos` — plan B3 |
+
+The start-set pair is read by the service at attach and in overrun recovery (snapshot lifecycle); it is written version-then-position and read position-version-position.
 
 A slot whose `status` reads `0` has never been attached this page generation.
 The node re-creates the page at every boot, so incarnation and epoch restart
