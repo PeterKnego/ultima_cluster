@@ -1284,6 +1284,15 @@ impl CncPage {
         })
     }
 
+    /// The page header's version word (`major << 24 | minor << 16`), or
+    /// `None` for a page torn mid-rewrite (the same posture as
+    /// [`Self::try_meta`]). Read-your-writes (spec 2026-10-08, planning
+    /// erratum 1) needs it: `open_file` accepts an OLDER page minor, so an
+    /// attacher checks the minor itself before using a 3.5 feature.
+    pub fn header_version(&self) -> Option<u32> {
+        cnc::read_cnc_header(self.page()).map(|h| h.version)
+    }
+
     /// Non-panicking `instance_id` read straight off the header bytes — a cheap
     /// two-`u64` hot-path probe for liveness / node-restart detection against a
     /// page another process may be recreating IN PLACE (M5 final review #2b/#2c).
@@ -1786,6 +1795,12 @@ mod tests {
         drop(page);
         let r = CncPage::open_file(&p, "test-app").map(|_| ());
         assert!(matches!(r, Err(CncError::VersionMismatch { .. })), "{r:?}");
+    }
+
+    #[test]
+    fn header_version_reads_the_page_version() {
+        let page = CncPage::heap(&test_meta());
+        assert_eq!(page.header_version(), Some(CNC_V2_VERSION));
     }
 
     #[test]

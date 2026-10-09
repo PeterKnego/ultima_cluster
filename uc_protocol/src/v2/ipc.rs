@@ -66,6 +66,12 @@ pub const MSG_V2_SCHED: u16 = 8;
 
 /// `query.ring` `flags` bit 0: linearizable (vs. snapshot) read.
 pub const FLAG_V2_LINEARIZABLE: u16 = 1;
+/// `query.ring` `flags` bit 1 (read-your-writes, spec 2026-10-08 §4.1): the
+/// payload is `service_id: u8 ++ min_position: u64 LE ++ query bytes`, and the
+/// node answers only once the row's applied frontier is `>= min_position`.
+/// Never combined with [`FLAG_V2_LINEARIZABLE`]; a record carrying both is
+/// malformed and dropped.
+pub const FLAG_V2_MIN_POSITION: u16 = 2;
 /// `egress_service.broadcast` `flags` bit 0: response answers a query (vs. a
 /// submit).
 pub const FLAG_V2_IS_QUERY: u16 = 1;
@@ -103,6 +109,64 @@ pub fn write_query_payload(service_id: u8, query: &[u8], out: &mut Vec<u8>) {
     out.reserve(1 + query.len());
     out.push(service_id);
     out.extend_from_slice(query);
+}
+
+/// Read-your-writes: build a [`FLAG_V2_MIN_POSITION`] `query.ring` payload
+/// into `out` (cleared first).
+#[inline]
+pub fn write_min_position_query_payload(
+    service_id: u8,
+    min_position: u64,
+    query: &[u8],
+    out: &mut Vec<u8>,
+) {
+    out.clear();
+    out.reserve(9 + query.len());
+    out.push(service_id);
+    out.extend_from_slice(&min_position.to_le_bytes());
+    out.extend_from_slice(query);
+}
+
+/// Read-your-writes: split a [`FLAG_V2_MIN_POSITION`] payload into
+/// `(service_id, min_position, query)`. `None` below 9 bytes — a malformed
+/// record the node drops.
+#[inline]
+pub fn split_min_position_query_payload(payload: &[u8]) -> Option<(u8, u64, &[u8])> {
+    if payload.len() < 9 {
+        return None;
+    }
+    let min = u64::from_le_bytes(payload[1..9].try_into().ok()?);
+    Some((payload[0], min, &payload[9..]))
+}
+
+/// A read-your-writes token (spec 2026-10-08 §3): the lowest applied frontier
+/// a read may be answered from. Opaque to applications; printable as 16 hex
+/// digits so it can ride in a cookie or a header. `NONE` (0) means "no
+/// constraint" — a snapshot read.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ReadToken(u64);
+
+impl ReadToken {
+    pub const NONE: ReadToken = ReadToken(0);
+    pub const fn from_u64(v: u64) -> ReadToken {
+        ReadToken(v)
+    }
+    pub const fn as_u64(self) -> u64 {
+        self.0
+    }
+}
+
+impl core::fmt::Display for ReadToken {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{:016x}", self.0)
+    }
+}
+
+impl core::str::FromStr for ReadToken {
+    type Err = core::num::ParseIntError;
+    fn from_str(s: &str) -> Result<ReadToken, Self::Err> {
+        u64::from_str_radix(s, 16).map(ReadToken)
+    }
 }
 
 pub const SCHED_RECORD_LEN: usize = 17;
@@ -243,5 +307,54 @@ mod tests {
         // 0x0102_0304, local_seq = 0x0506_0708.
         let extra = extra_client(0x0102_0304, 0x0506_0708);
         assert_eq!(extra, [0x04, 0x03, 0x02, 0x01, 0x08, 0x07, 0x06, 0x05]);
+    }
+
+    #[test]
+    fn min_position_query_payload_round_trips_and_pins_the_layout() {
+        let mut out = Vec::new();
+        write_min_position_query_payload(3, 0x0102_0304_0506_0708, b"read", &mut out);
+        assert_eq!(out[0], 3);
+        assert_eq!(&out[1..9], &0x0102_0304_0506_0708u64.to_le_bytes());
+        assert_eq!(&out[9..], b"read");
+        assert_eq!(
+            split_min_position_query_payload(&out),
+            Some((3, 0x0102_0304_0506_0708, &b"read"[..]))
+        );
+        write_min_position_query_payload(0, 1, b"", &mut out);
+        assert_eq!(
+            split_min_position_query_payload(&out),
+            Some((0, 1, &b""[..]))
+        );
+    }
+
+    #[test]
+    fn a_min_position_payload_shorter_than_nine_bytes_does_not_split() {
+        for n in 0..9 {
+            assert_eq!(
+                split_min_position_query_payload(&vec![7u8; n]),
+                None,
+                "len {n}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_min_position_flag_is_the_next_free_query_bit() {
+        assert_eq!(FLAG_V2_LINEARIZABLE, 1);
+        assert_eq!(FLAG_V2_MIN_POSITION, 2);
+        assert_eq!(FLAG_V2_LINEARIZABLE & FLAG_V2_MIN_POSITION, 0);
+    }
+
+    #[test]
+    fn read_tokens_order_and_round_trip_through_text() {
+        let t = ReadToken::from_u64(0xdead_beef);
+        assert_eq!(t.as_u64(), 0xdead_beef);
+        assert_eq!(t.to_string(), "00000000deadbeef");
+        assert_eq!("00000000deadbeef".parse::<ReadToken>().unwrap(), t);
+        assert_eq!("deadbeef".parse::<ReadToken>().unwrap(), t);
+        assert!("not-hex".parse::<ReadToken>().is_err());
+        assert!(ReadToken::from_u64(1) < ReadToken::from_u64(2));
+        assert_eq!(ReadToken::NONE.as_u64(), 0);
+        assert_eq!(ReadToken::default(), ReadToken::NONE);
     }
 }
