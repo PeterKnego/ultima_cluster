@@ -1388,10 +1388,18 @@ fn rewrite_as_v3(path: &Path) {
     v3.extend_from_slice(&crc.to_le_bytes());
     let parts = decode_cluster_image(&v3).expect("a valid v3");
     assert!(parts.catalog.is_empty());
-    assert!(
-        uc_protocol::v2::upgrade::decode_report_list_unsized(parts.reports).is_some(),
-        "the v3 report blob is unsized"
-    );
+    let mut o = 0;
+    while o < parts.reports.len() {
+        let len = u32::from_le_bytes(parts.reports[o..o + 4].try_into().unwrap()) as usize;
+        let count = parts.reports[o + 4 + 1] as usize;
+        assert_eq!(
+            len,
+            SNAPSHOT_REPORT_HEADER_LEN + count * SNAPSHOT_REPORT_ENTRY_LEN_UNSIZED,
+            "the v3 report blob is unsized"
+        );
+        o += 4 + len;
+    }
+    assert!(uc_protocol::v2::upgrade::decode_report_list(parts.reports).is_some());
     std::fs::write(path, &v3).unwrap();
 }
 

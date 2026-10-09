@@ -75,9 +75,11 @@ pub const fn is_report_row(row: u8) -> bool {
 pub const SNAPSHOT_REPORT_HEADER_LEN: usize = 16;
 /// `node_id u32 ‖ hash u64 ‖ size u64` (snapshot-lifecycle spec §7.1).
 pub const SNAPSHOT_REPORT_ENTRY_LEN: usize = 20;
-/// The entry before sizes existed, `node_id u32 ‖ hash u64`. Read ONLY out
-/// of a v1–v4 cluster image's report blob (`decode_report_list_unsized`),
-/// with every size `0` (unknown). Never on a `CLUSTER` frame.
+/// The entry before sizes existed, `node_id u32 ‖ hash u64`. Never written;
+/// READ with every size `0` (unknown) wherever a pre-lifecycle record can
+/// still be met — a v1–v4 cluster image's report blob, and (ruling R2) a
+/// `CLUSTER kind = 5` record replayed from a journal that crossed the flag
+/// day. [`decode_snapshot_report`] infers the width from `count`.
 pub const SNAPSHOT_REPORT_ENTRY_LEN_UNSIZED: usize = 12;
 /// One entry per member at most — the leader collects one hash per node.
 pub const MAX_SNAPSHOT_REPORT_NODES: usize = MAX_MEMBERS;
@@ -131,29 +133,30 @@ pub fn encode_snapshot_report(r: &SnapshotReport, out: &mut Vec<u8>) -> Option<(
 
 /// Exact framing: `count` must match the length, reserved must be zero,
 /// and every rule `encode_snapshot_report` enforces holds on read too.
+///
+/// Ruling R2: the entry width is INFERRED from the length — with `count = n`
+/// from the header the body must be exactly `n × 20` (sized) or `n × 12`
+/// (pre-lifecycle, [`SNAPSHOT_REPORT_ENTRY_LEN_UNSIZED`]; every size reads
+/// `0`). Unambiguous because `n ≥ 1`. One decoder for apply, journal replay
+/// and image install, so the same bytes yield the same report on every node
+/// whichever path they arrive by.
 pub fn decode_snapshot_report(buf: &[u8]) -> Option<SnapshotReport> {
-    decode_report_with(buf, SNAPSHOT_REPORT_ENTRY_LEN)
-}
-
-/// A report in the layout a v1–v4 cluster image stored (12-byte entries):
-/// every size reads `0`. Only `ClusterFsm::install_snapshot` calls it.
-pub fn decode_snapshot_report_unsized(buf: &[u8]) -> Option<SnapshotReport> {
-    decode_report_with(buf, SNAPSHOT_REPORT_ENTRY_LEN_UNSIZED)
-}
-
-fn decode_report_with(buf: &[u8], entry_len: usize) -> Option<SnapshotReport> {
     if buf.len() < SNAPSHOT_REPORT_HEADER_LEN || buf[2..8] != [0; 6] {
         return None;
     }
     let row = buf[0];
     let n = buf[1] as usize;
-    if !is_report_row(row)
-        || n == 0
-        || n > MAX_SNAPSHOT_REPORT_NODES
-        || buf.len() != SNAPSHOT_REPORT_HEADER_LEN + n * entry_len
-    {
+    if !is_report_row(row) || n == 0 || n > MAX_SNAPSHOT_REPORT_NODES {
         return None;
     }
+    let body = buf.len() - SNAPSHOT_REPORT_HEADER_LEN;
+    let entry_len = if body == n * SNAPSHOT_REPORT_ENTRY_LEN {
+        SNAPSHOT_REPORT_ENTRY_LEN
+    } else if body == n * SNAPSHOT_REPORT_ENTRY_LEN_UNSIZED {
+        SNAPSHOT_REPORT_ENTRY_LEN_UNSIZED
+    } else {
+        return None;
+    };
     let position = u64::from_le_bytes(buf[8..16].try_into().ok()?);
     if position == 0 {
         return None;
@@ -354,26 +357,16 @@ pub fn encode_report_list(reports: &[SnapshotReport], out: &mut Vec<u8>) -> Opti
     Some(())
 }
 
+/// Each record goes through [`decode_snapshot_report`], so a blob of either
+/// entry width decodes (ruling R2) — a v1–v4 image's unsized blob included.
 pub fn decode_report_list(buf: &[u8]) -> Option<Vec<SnapshotReport>> {
-    decode_report_list_with(buf, decode_snapshot_report)
-}
-
-/// A v1–v4 cluster image's report blob (12-byte entries, sizes read `0`).
-pub fn decode_report_list_unsized(buf: &[u8]) -> Option<Vec<SnapshotReport>> {
-    decode_report_list_with(buf, decode_snapshot_report_unsized)
-}
-
-fn decode_report_list_with(
-    buf: &[u8],
-    one: fn(&[u8]) -> Option<SnapshotReport>,
-) -> Option<Vec<SnapshotReport>> {
     let mut out = Vec::new();
     let mut o = 0;
     while o < buf.len() {
         let len = u32::from_le_bytes(buf.get(o..o + 4)?.try_into().ok()?) as usize;
         o += 4;
         let end = o.checked_add(len)?;
-        out.push(one(buf.get(o..end)?)?);
+        out.push(decode_snapshot_report(buf.get(o..end)?)?);
         o = end;
     }
     Some(out)
@@ -486,31 +479,36 @@ mod tests {
         for e in b[SNAPSHOT_REPORT_HEADER_LEN..].chunks(SNAPSHOT_REPORT_ENTRY_LEN) {
             old.extend_from_slice(&e[..SNAPSHOT_REPORT_ENTRY_LEN_UNSIZED]);
         }
+        // Ruling R2: kind-5 records written before sizes existed are still
+        // in journals above the newest cluster artifact, so the live decoder
+        // infers the width from `count` and reads them with every size 0.
         assert_eq!(
             decode_snapshot_report(&old),
-            None,
-            "12-byte entries are refused on the live path"
-        );
-        assert_eq!(
-            decode_snapshot_report_unsized(&old),
             Some(SnapshotReport {
                 hashes: vec![(0, 7, 0), (2, 7, 0)],
                 ..r.clone()
-            })
+            }),
+            "12-byte entries decode on the live path with every size 0"
         );
+        // A body that is neither count × 20 nor count × 12 is refused.
+        for body_len in [0, 12, 16, 20, 24 + 1, 36, 40 + 12, 40 + 1, 24 - 1] {
+            let mut bad = b[..SNAPSHOT_REPORT_HEADER_LEN].to_vec();
+            bad.resize(SNAPSHOT_REPORT_HEADER_LEN + body_len, 0);
+            assert_eq!(
+                decode_snapshot_report(&bad),
+                None,
+                "count 2, body {body_len} B is neither 2 × 20 nor 2 × 12"
+            );
+        }
         let mut list = Vec::new();
         encode_report_list(std::slice::from_ref(&r), &mut list).unwrap();
         assert_eq!(decode_report_list(&list), Some(vec![r.clone()]));
         let mut old_list = (old.len() as u32).to_le_bytes().to_vec();
         old_list.extend_from_slice(&old);
         assert_eq!(
-            decode_report_list_unsized(&old_list).map(|l| l[0].hashes.clone()),
-            Some(vec![(0, 7, 0), (2, 7, 0)])
-        );
-        assert_eq!(
-            decode_report_list(&old_list),
-            None,
-            "the live list decoder refuses the old entry width"
+            decode_report_list(&old_list).map(|l| l[0].hashes.clone()),
+            Some(vec![(0, 7, 0), (2, 7, 0)]),
+            "a v1–v4 image's unsized report blob decodes, sizes 0"
         );
     }
 

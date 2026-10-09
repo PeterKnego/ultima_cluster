@@ -984,7 +984,8 @@ impl SnapshotStateMachine for ClusterFsm {
         // wire image.
         let parts = decode_cluster_image(&img).ok_or_else(|| bad("cluster image"))?;
         // Snapshot-lifecycle spec §7.2: a v1–v4 image stored the report and
-        // catalog blobs UNSIZED; they decode with every size 0 (unknown).
+        // catalog blobs UNSIZED; they decode with every size 0 (unknown). The
+        // catalog needs the version to pick its width; the reports do not.
         let sized = uc_protocol::v2::cluster_image::cluster_image_version(&img)
             .ok_or_else(|| bad("cluster image"))?
             >= 5;
@@ -1025,12 +1026,11 @@ impl SnapshotStateMachine for ClusterFsm {
         // exactly the reason it agrees on everything else here: it is
         // reading the same bytes in the same order.
         let pins = decode_pin_list(parts.pins).ok_or_else(|| bad("cluster image pins"))?;
-        let reports = if sized {
-            decode_report_list(parts.reports)
-        } else {
-            uc_protocol::v2::upgrade::decode_report_list_unsized(parts.reports)
-        }
-        .ok_or_else(|| bad("cluster image reports"))?;
+        // Ruling R2: `decode_snapshot_report` infers the entry width, so a
+        // v1–v4 image's unsized blob reads with every size 0 here exactly as
+        // a replayed pre-lifecycle kind-5 record does in `apply`.
+        let reports =
+            decode_report_list(parts.reports).ok_or_else(|| bad("cluster image reports"))?;
         let mut running = [None; CNC_MAX_SERVICES];
         if parts.running.is_empty() {
             // v1/v2 image (#33 spec §5.3): a pinned row runs its newest pin's
@@ -3363,6 +3363,62 @@ mod tests {
             a.freeze().unwrap().0,
             b.freeze().unwrap().0,
             "an installed node and the node that froze the image diverged"
+        );
+    }
+
+    /// Ruling R2: a kind-5 record written before sizes existed (12 B
+    /// entries) is replayed from the journal above the newest cluster
+    /// artifact on a node that crossed the flag day, while another node
+    /// installs a v4 image holding the same report. Same log, same state:
+    /// both read every size 0 and freeze byte-identical images.
+    #[test]
+    fn an_unsized_report_frame_and_a_v4_image_install_converge() {
+        fn unsized_report_body(cmd: &ClusterCommand) -> Vec<u8> {
+            use uc_protocol::v2::upgrade::{
+                SNAPSHOT_REPORT_ENTRY_LEN, SNAPSHOT_REPORT_ENTRY_LEN_UNSIZED,
+                SNAPSHOT_REPORT_HEADER_LEN,
+            };
+            let b = body(cmd);
+            let rec = &b[CLUSTER_BODY_PREFIX_LEN..];
+            let mut old = b[..CLUSTER_BODY_PREFIX_LEN + SNAPSHOT_REPORT_HEADER_LEN].to_vec();
+            for e in rec[SNAPSHOT_REPORT_HEADER_LEN..].chunks(SNAPSHOT_REPORT_ENTRY_LEN) {
+                old.extend_from_slice(&e[..SNAPSHOT_REPORT_ENTRY_LEN_UNSIZED]);
+            }
+            old
+        }
+        let row0 = report(0, 1000, &[(0, 1, 40), (1, 1, 40)]);
+        let cluster = report(CLUSTER_ROW, 1000, &[(0, 2, 300), (1, 2, 300)]);
+        // Node A replays the pre-lifecycle frames.
+        let mut a = fsm();
+        genesis_row(&mut a, 0, 100);
+        a.on_snapshot_frame(1000, false, 1);
+        for (pos, cmd) in [(1100, &row0), (1110, &cluster)] {
+            let mut out = Vec::new();
+            let mut ctx = ApplyCtx::new(pos, ClusterFsm::IDENTITY);
+            a.apply(&mut ctx, &unsized_report_body(cmd), &mut out);
+            assert_eq!(out, vec![0], "a 12 B-entry kind-5 record applies");
+        }
+        a.set_consumed(1200);
+        // Node B installs a v4 image of the same state.
+        let mut c = fsm();
+        genesis_row(&mut c, 0, 100);
+        c.on_snapshot_frame(1000, false, 1);
+        assert_eq!(apply_at(&mut c, 1100, &row0), 0);
+        assert_eq!(apply_at(&mut c, 1110, &cluster), 0);
+        c.set_consumed(1200);
+        let v4 = rewrite_image_as_v4(&c.freeze().unwrap().0);
+        let mut b = fsm();
+        assert_eq!(b.install_snapshot(1200, &mut &v4[..]).unwrap(), 1200);
+        assert_eq!(a.state().catalog, b.state().catalog);
+        assert_eq!(a.state().reports, b.state().reports);
+        assert_eq!(
+            a.state().report_for(0).map(|r| r.hashes.clone()),
+            Some(vec![(0, 1, 0), (1, 1, 0)])
+        );
+        assert_eq!(
+            a.freeze().unwrap().0,
+            b.freeze().unwrap().0,
+            "a replaying node and an installing node froze different images"
         );
     }
 
