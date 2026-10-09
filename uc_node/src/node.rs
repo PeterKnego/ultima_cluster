@@ -47,8 +47,8 @@ use uc_protocol::ring::{
 use uc_protocol::v2::cnc::{
     ADMIN_OP_SCHEDULE_APPLY, ADMIN_OP_SETTINGS_APPLY, ADMIN_OP_SNAPSHOT, ADMIN_OP_SNAPSHOT_FETCH,
     ADMIN_OP_UPGRADE_PIN, CNC_MAX_PEER_SLOTS, CNC_MAX_SERVICES, CNC_PEER_ROLE_LEARNER,
-    CNC_PEER_ROLE_VOTER, CNC_SVC_STATUS_SNAPSHOT_CAPABLE, NODE_FLAG_CAN_SERVE, NODE_FLAG_LEADER,
-    NODE_FLAG_LEARNER,
+    CNC_PEER_ROLE_VOTER, CNC_SVC_STATUS_ATTACHED, CNC_SVC_STATUS_SNAPSHOT_CAPABLE,
+    NODE_FLAG_CAN_SERVE, NODE_FLAG_LEADER, NODE_FLAG_LEARNER,
 };
 use uc_protocol::v2::config::{WireConfig, WireMember, decode_config, encode_config};
 use uc_protocol::v2::crypto::DGRAM_KIND_HS_KEY;
@@ -73,7 +73,7 @@ use crate::ipc::InstanceDir;
 use crate::read_round::ProbeRound;
 use crate::services::ServicesConfig;
 use uc_log::buffer::FrameRead;
-use uc_protocol::v2::catalog::{FOREIGN_SET_SUFFIX, MAX_CATALOG_SETS, SetEntry, SetState};
+use uc_protocol::v2::catalog::{FOREIGN_SET_SUFFIX, MAX_CATALOG_SETS, SetEntry, SetKind, SetState};
 use uc_protocol::v2::datagram::{
     CONFIG_PROPOSAL_BODY_LEN, CONFIG_REPLY_BODY_LEN, ConfigProposalBody, ConfigReplyBody,
     DATAGRAM_HEADER_LEN, DGRAM_KIND_COMMIT_POSITION, DGRAM_KIND_CONFIG_PROPOSAL,
@@ -1044,6 +1044,9 @@ struct PendingFetch {
     stored_before: u64,
     /// Pass-clock nanoseconds after which this record is dropped.
     deadline_ns: u64,
+    /// Snapshot-lifecycle spec §6: issued by auto-fetch (its outcome feeds
+    /// `uc2_snapshot_auto_fetch_total`), not by `uc2ctl snapshot fetch`.
+    auto: bool,
 }
 
 /// How long a `snapshot fetch` stays pending before this node forgets it.
@@ -1210,6 +1213,13 @@ pub struct Node {
     holdings: Arc<Mutex<Holdings>>,
     /// `cfg.election_timeout_max_ns`, kept for [`Node::soft_stale_ns`].
     election_timeout_max_ns: u64,
+    /// Snapshot-lifecycle spec §6: `uc2_snapshot_auto_fetch_total{outcome}`,
+    /// bumped by the consensus agent (Task 10 wires it into `ObsSources`).
+    #[allow(dead_code)]
+    auto_fetch_stats: Arc<crate::auto_fetch::AutoFetchStats>,
+    /// Plan ruling P14: the `uc2-holdings` probe's free-space override
+    /// ([`Node::set_free_bytes_for_test`]; `0` = the real `statvfs`).
+    free_override: Arc<AtomicU64>,
     // Held for the node's life: the instance flock and the IPC ring mmaps.
     _instance: InstanceDir,
     _rings: Rings,
@@ -1994,6 +2004,10 @@ impl Node {
         // directory walk there would couple commit to the filesystem's
         // metadata locks. The thread only reads two atomics and writes the
         // `Holdings` cell's byte fields.
+        // Plan ruling P14: the probe's free-space test seam, and the
+        // auto-fetch counters the consensus agent bumps.
+        let free_override = Arc::new(AtomicU64::new(0));
+        let auto_fetch_stats = Arc::new(crate::auto_fetch::AutoFetchStats::default());
         let mut holdings_probe = HoldingsProbe::new(
             Arc::clone(&holdings),
             cfg.instance_dir.clone(),
@@ -2006,7 +2020,8 @@ impl Node {
             cfg.services.ids().collect(),
             snap_root.clone(),
             instance.cluster_snapshot_dir(),
-        ));
+        ))
+        .with_free_override(Arc::clone(&free_override));
         let probe_base = std::time::Instant::now();
         let probe_cnc = Arc::clone(&cnc);
         let probe_first_base = Arc::clone(&archive_first_base);
@@ -2516,6 +2531,10 @@ impl Node {
             start_sets_dirty: true,
             start_set_wait_above: u64::MAX,
             start_set_recomputes: 0,
+            auto_fetch: crate::auto_fetch::AutoFetch::new(cfg.id),
+            auto_fetch_stats: Arc::clone(&auto_fetch_stats),
+            soft_wire: Arc::clone(&soft_wire),
+            soft_stale_ns: SOFT_STALE_FACTOR * cfg.election_timeout_max_ns,
         };
         // Cluster FSM (spec §4.5): arm from the RECOVERED view BEFORE the
         // consensus agent starts. The view already holds genesis or the
@@ -2581,6 +2600,8 @@ impl Node {
             soft_wire,
             holdings,
             election_timeout_max_ns: cfg.election_timeout_max_ns,
+            auto_fetch_stats,
+            free_override,
             _instance: instance,
             _rings: rings,
             // Stop order: consensus first (stops writing the term handle), then
@@ -2640,12 +2661,7 @@ impl Node {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
-        let mut t = crate::catalog::SoftTable::default();
-        for (id, addr) in membership.voters.iter().chain(membership.learners.iter()) {
-            if let Some((h, at)) = wire.get(&addr_of(*addr)) {
-                t.record(*id, *h, *at);
-            }
-        }
+        let mut t = soft_table_from_wire(&wire, &membership);
         // This node's own cache, stamped now: a node never sends itself a
         // `STATUS`, but it is as much a holder as any follower.
         let own = *self.holdings.lock().unwrap_or_else(|e| e.into_inner());
@@ -2657,6 +2673,15 @@ impl Node {
     /// — [`SOFT_STALE_FACTOR`] maximum election timeouts.
     pub fn soft_stale_ns(&self) -> u64 {
         SOFT_STALE_FACTOR * self.election_timeout_max_ns
+    }
+
+    /// Plan ruling P14 — TEST SEAM, not API: make this node's `uc2-holdings`
+    /// probe report `v` free bytes instead of `statvfs` (`0` restores the real
+    /// reading). Lets an end-to-end test exercise the spec §7.3 space check
+    /// without filling a disk.
+    #[doc(hidden)]
+    pub fn set_free_bytes_for_test(&self, v: u64) {
+        self.free_override.store(v, Ordering::Release);
     }
 
     /// M6 Task 4: the archive's lowest still-replayable position (the purge
@@ -4143,6 +4168,14 @@ struct Consensus {
     start_set_wait_above: u64,
     /// Recomputes run (test-visible; the steady-pass witness).
     start_set_recomputes: u64,
+    /// Snapshot-lifecycle spec §6: the background fetch decision.
+    auto_fetch: crate::auto_fetch::AutoFetch,
+    /// `uc2_snapshot_auto_fetch_total{outcome}` — shared with `ObsSources`.
+    auto_fetch_stats: Arc<crate::auto_fetch::AutoFetchStats>,
+    /// The sender's `STATUS` map — a LEADER's live holders (plan ruling P1).
+    soft_wire: Arc<Mutex<SoftTableWire>>,
+    /// [`Node::soft_stale_ns`]'s value, for the holder query.
+    soft_stale_ns: u64,
 }
 
 impl Consensus {
@@ -4539,6 +4572,9 @@ impl Consensus {
             did = true;
         }
         self.poll_pending_fetch();
+        // Snapshot-lifecycle spec §6: background auto-fetch of the newest
+        // agreed set — a few loads on the steady path.
+        self.maybe_auto_fetch();
 
         // 12. M7: clear the cnc `config_pending` mirror once commit has crossed
         // the adopted config's position — the entry is no longer at risk of a
@@ -10515,6 +10551,13 @@ impl Consensus {
         if learner_id == self.id || !self.cluster_view.membership().is_learner(learner_id) {
             return Err(FetchRefusal::NotALearner);
         }
+        self.issue_fetch(learner_id, position, false)
+    }
+
+    /// The body `start_fetch` always had, minus its learner door: auto-fetch
+    /// may pull from any member (plan ruling P1) — the source's sender serves
+    /// a `SNAP_REQUEST` whatever its role.
+    fn issue_fetch(&mut self, from: NodeId, position: u64, auto: bool) -> Result<(), FetchRefusal> {
         // Honour `PendingFetch`: one fetch at a time. A second request is
         // answered `retry` rather than quietly replacing a transfer that is
         // very likely still running (the receiver would drop the new one
@@ -10525,7 +10568,7 @@ impl Consensus {
         if position > self.cnc.counters().durable.load_acquire() {
             return Err(FetchRefusal::AboveDurable);
         }
-        let Some(&peer) = self.id_to_addr.get(&learner_id) else {
+        let Some(&peer) = self.id_to_addr.get(&from) else {
             return Err(FetchRefusal::UnknownPeer);
         };
         if self
@@ -10542,19 +10585,200 @@ impl Consensus {
             return Err(FetchRefusal::Retry);
         }
         self.pending_fetch = Some(PendingFetch {
-            learner: learner_id,
+            learner: from,
             position,
             stored_before: self.stored_set_pos.load(Ordering::Acquire),
             deadline_ns: self.pass_now_ns.saturating_add(FETCH_TIMEOUT_NS),
+            auto,
         });
         crate::obs_event!(
             Info,
             "snapshot_fetch_requested",
             node = self.id as u64,
-            from = learner_id as u64,
-            position = position
+            from = from as u64,
+            position = position,
+            actor = if auto { "auto" } else { "operator" }
         );
         Ok(())
+    }
+
+    /// Snapshot-lifecycle spec §6: fetch the newest agreed set this node does
+    /// not hold, in the background. Steady path (switch off, a fetch in
+    /// flight, nothing agreed, waiting out a delay, or already held): a few
+    /// loads and compares.
+    #[inline]
+    fn maybe_auto_fetch(&mut self) {
+        if !self.cluster_view.auto_fetch.load(Ordering::Acquire) || self.pending_fetch.is_some() {
+            return;
+        }
+        let n = self
+            .cluster_view
+            .catalog_agreed_position
+            .load(Ordering::Acquire);
+        if n == 0 || self.auto_fetch.quiet(n, self.pass_now_ns) || self.holdings_held.contains(&n) {
+            return;
+        }
+        self.auto_fetch_step(n);
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn auto_fetch_step(&mut self, n: u64) {
+        use crate::auto_fetch::{Outcome, SpaceCheck};
+        let now = self.pass_now_ns;
+        let durable = self.cnc.counters().durable.load_acquire();
+        let inner = self.cluster_view.snapshot_inner();
+        let building = self.local_build_pending(n, &inner);
+        if !self.auto_fetch.due(n, durable, building, now) {
+            return;
+        }
+        let total = self
+            .cluster_view
+            .catalog_newest_agreed_bytes
+            .load(Ordering::Acquire);
+        let free = self
+            .holdings
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .free_bytes;
+        match self.auto_fetch.check_space(total, free, now) {
+            SpaceCheck::NoSpace { first } => {
+                self.auto_fetch_stats.bump(Outcome::NoSpace);
+                if first {
+                    crate::obs_event!(
+                        Warn,
+                        "snapshot_fetch_skipped_no_space",
+                        node = self.id as u64,
+                        position = n,
+                        bytes = total,
+                        free_bytes = free
+                    );
+                }
+                return;
+            }
+            SpaceCheck::Unknown { first: true } => {
+                crate::obs_event!(
+                    Info,
+                    "snapshot_fetch_size_unknown",
+                    node = self.id as u64,
+                    position = n
+                );
+            }
+            SpaceCheck::Unknown { first: false } | SpaceCheck::Fits => {}
+        }
+        let candidates = self.auto_fetch_candidates(n, &inner);
+        let Some(from) = self.auto_fetch.pick(&candidates, now) else {
+            self.auto_fetch_stats.bump(Outcome::NoHolder);
+            crate::obs_event!(
+                Info,
+                "snapshot_fetch_no_holder",
+                node = self.id as u64,
+                position = n
+            );
+            return;
+        };
+        if crate::catalog::reporters_at(&inner.reports, n) == 1 && self.auto_fetch.first_thin() {
+            crate::obs_event!(
+                Warn,
+                "snapshot_fetch_single_reporter",
+                node = self.id as u64,
+                position = n
+            );
+        }
+        match self.issue_fetch(from, n, true) {
+            Ok(()) => self.audit_auto_fetch(from, n),
+            Err(_) => {
+                self.auto_fetch_stats.bump(Outcome::Refused);
+                self.auto_fetch.on_result(Outcome::Refused, now);
+            }
+        }
+    }
+
+    /// Plan ruling P8 as amended by controller ruling PF7: will this node
+    /// build the set at `n` itself? A standby set on a voter — never;
+    /// otherwise yes while any ATTACHED declared row has not frozen at `n`
+    /// (`snapshot_pos < n`). No `applied` clause: a row has applied past `n`
+    /// for the whole of its build window, so that clause read "not building"
+    /// exactly when a fetch would race the local builder. The caller's
+    /// [`crate::auto_fetch::AUTO_FETCH_BUILD_GUARD_NS`] bounds the hold, so a
+    /// row that never freezes cannot park auto-fetch forever.
+    fn local_build_pending(&self, n: u64, inner: &ClusterViewInner) -> bool {
+        let standby = inner
+            .catalog
+            .iter()
+            .find(|e| e.position == n)
+            .is_some_and(|e| e.kind == SetKind::Standby);
+        if standby && !inner.membership.is_learner(self.id) {
+            return false;
+        }
+        self.services.ids().any(|row| {
+            let s = self.cnc.service_slot(row as usize);
+            s.status.load_acquire() & CNC_SVC_STATUS_ATTACHED != 0
+                && s.snapshot_pos.load_acquire() < n
+        })
+    }
+
+    /// Plan ruling P1's candidate list for the set at `n`.
+    fn auto_fetch_candidates(&self, n: u64, inner: &ClusterViewInner) -> Vec<NodeId> {
+        let wire = self
+            .soft_wire
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let soft = soft_table_from_wire(&wire, &inner.membership);
+        let q = crate::catalog::CatalogQuery {
+            sets: &inner.catalog,
+            catalog_position: self.cluster_view.catalog_version.load(Ordering::Acquire),
+            soft: &soft,
+            now_ns: unix_now_ns(),
+            stale_ns: self.soft_stale_ns,
+        };
+        let live = q.holders(n);
+        let builders = crate::catalog::builders_at(&inner.reports, &inner.catalog, n);
+        let learners: Vec<NodeId> = inner
+            .membership
+            .learners
+            .iter()
+            .map(|(id, _)| *id)
+            .collect();
+        let voters: Vec<NodeId> = inner.membership.voters.iter().map(|(id, _)| *id).collect();
+        crate::catalog::fetch_candidates(self.id, &live, &builders, &learners, &voters)
+    }
+
+    /// Spec §6: the existing `snapshot_fetch` record (op 9), `actor = "auto"`
+    /// — written AFTER the issue, like `audit_datagram_mtu`, for its reason:
+    /// no request is waiting on an answer. `id` names the holder asked,
+    /// `config_version` the position.
+    fn audit_auto_fetch(&mut self, from: NodeId, position: u64) {
+        let rec = AuditRecord {
+            ts_ns: crate::obs::metrics::now_unix_ns(),
+            actor: crate::audit::SOURCE_AUTO,
+            origin: AuditOrigin::Local,
+            op: 9,
+            op_name: op_name(9),
+            id: from,
+            addr: None,
+            seq: 0,
+            nonce: 0,
+            outcome: AuditOutcome::Accepted,
+            reason: 0,
+            config_version: position,
+            detail: None,
+            source: crate::audit::SOURCE_AUTO,
+        };
+        if let Err(e) = self.audit.record(&rec) {
+            let err = e.to_string();
+            crate::obs_event!(
+                Error,
+                "admin_audit_failed",
+                node = self.id as u64,
+                seq = 0u64,
+                nonce = 0u64,
+                op = 9u64,
+                status = 0u64,
+                err = err.as_str(),
+            );
+        }
     }
 
     /// Retire a pending fetch once it has landed (the receiver published a
@@ -10569,6 +10793,11 @@ impl Consensus {
         let stored = self.stored_set_pos.load(Ordering::Acquire);
         if stored > p.stored_before {
             self.pending_fetch = None;
+            if p.auto {
+                self.auto_fetch_stats.bump(crate::auto_fetch::Outcome::Ok);
+                self.auto_fetch
+                    .on_result(crate::auto_fetch::Outcome::Ok, self.pass_now_ns);
+            }
             crate::obs_event!(
                 Info,
                 "snapshot_fetch_stored",
@@ -10578,6 +10807,12 @@ impl Consensus {
             );
         } else if self.pass_now_ns > p.deadline_ns {
             self.pending_fetch = None;
+            if p.auto {
+                self.auto_fetch_stats
+                    .bump(crate::auto_fetch::Outcome::Timeout);
+                self.auto_fetch
+                    .on_result(crate::auto_fetch::Outcome::Timeout, self.pass_now_ns);
+            }
             crate::obs_event!(
                 Warn,
                 "snapshot_fetch_timeout",
@@ -11969,6 +12204,8 @@ struct HoldingsProbe {
     probes: u64,
     /// Ruling R40: hashes held sets' artifacts for the report cache.
     seeder: Option<ReportSeeder>,
+    /// Plan ruling P14: a test's stand-in for `statvfs` (`0` = off).
+    free_override: Option<Arc<AtomicU64>>,
 }
 
 /// Ruling R40: the `uc2-holdings` probe's second job. For each complete set
@@ -12296,7 +12533,14 @@ impl HoldingsProbe {
             last_probe_ns: None,
             probes: 0,
             seeder: None,
+            free_override: None,
         }
+    }
+
+    /// Plan ruling P14: a test's stand-in for `statvfs` (`0` = off).
+    fn with_free_override(mut self, cell: Arc<AtomicU64>) -> Self {
+        self.free_override = Some(cell);
+        self
     }
 
     /// Ruling R40: also seed the report cache (see [`ReportSeeder`]).
@@ -12324,7 +12568,14 @@ impl HoldingsProbe {
     #[cold]
     fn probe(&mut self, durable: u64, first_base: u64) {
         self.probes += 1;
-        let free = crate::preflight::free_disk_bytes(&self.instance_dir);
+        let free = match self
+            .free_override
+            .as_ref()
+            .map(|c| c.load(Ordering::Acquire))
+        {
+            Some(v) if v != 0 => Some(v),
+            _ => crate::preflight::free_disk_bytes(&self.instance_dir),
+        };
         let journal =
             journal_bytes_estimate(durable, first_base, self.segment_bytes, self.preallocate);
         let snapshots = dir_bytes(&self.snap_root);
@@ -12395,6 +12646,24 @@ fn dir_bytes(dir: &Path) -> u64 {
 /// u16)`) as a real `SocketAddr` (IPv4-only — `uc_consensus` stays dep-free,
 /// so this conversion lives here). Inverse of `stored_member`'s ip/port
 /// extraction below.
+/// Catalog spec §5.3: a `SoftTable` from the sender's address-keyed `STATUS`
+/// map over `membership`. Only a LEADER's map is filled (`STATUS` goes to the
+/// leader), so on a follower this is empty — plan ruling P1's reason for the
+/// builders tier. Shared by `Node::soft_table` and the auto-fetch holder
+/// choice.
+fn soft_table_from_wire(
+    wire: &SoftTableWire,
+    membership: &ClusterConfig,
+) -> crate::catalog::SoftTable {
+    let mut t = crate::catalog::SoftTable::default();
+    for (id, addr) in membership.voters.iter().chain(membership.learners.iter()) {
+        if let Some((h, at)) = wire.get(&addr_of(*addr)) {
+            t.record(*id, *h, *at);
+        }
+    }
+    t
+}
+
 fn addr_of((ip, port): Addr) -> SocketAddr {
     SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::from(ip.to_be_bytes()), port))
 }
@@ -13705,6 +13974,13 @@ mod tests {
         // `cluster_snapshot_pos` — shared between the `uc2-cluster` agent this
         // harness drives by hand and the `Consensus` under test, exactly as
         // `Node::start_with_socket` shares them.
+        // Controller ruling PF14: the harness runs with auto-fetch OFF, so a
+        // test that drives passes over a catalog never finds a stray
+        // `pending_fetch`; auto-fetch's own tests switch it on.
+        let settings_genesis = Settings {
+            auto_fetch: false,
+            ..settings_genesis
+        };
         let cluster_genesis = ClusterState {
             membership: config.clone(),
             table: ScheduleTable { entries: vec![] },
@@ -13976,6 +14252,10 @@ mod tests {
             start_sets_dirty: true,
             start_set_wait_above: u64::MAX,
             start_set_recomputes: 0,
+            auto_fetch: crate::auto_fetch::AutoFetch::new(1),
+            auto_fetch_stats: Arc::new(Default::default()),
+            soft_wire: Arc::new(Mutex::new(SoftTableWire::new())),
+            soft_stale_ns: SOFT_STALE_FACTOR * 300,
         };
         // The LAST thing `Node::start_with_socket` does before spawning the
         // consensus agent, mirrored here so this harness exercises the same
@@ -24560,6 +24840,304 @@ mod tests {
             late_legitimately > 0,
             "no legitimately-late timer fired — rule 5's true branch was never taken, so \
              the seeds are not exercising the case it exists to distinguish"
+        );
+    }
+
+    /// Snapshot-lifecycle spec §6: the switch gates the whole path; a held
+    /// newest set issues nothing.
+    #[test]
+    fn auto_fetch_runs_only_while_the_switch_is_on_and_the_newest_agreed_set_is_unheld() {
+        use crate::auto_fetch::Outcome;
+        let mut h = harness_with_rows(&["a"]);
+        drive_to_serving_leader(&mut h);
+        let mut st = h.cons.cluster_view.to_state();
+        // A STANDBY set on this voter: nothing here will build it (plan
+        // ruling P8), whatever the harness's slot says.
+        let mut e = agreed_entry(1000);
+        e.kind = uc_protocol::v2::catalog::SetKind::Standby;
+        st.catalog = vec![e];
+        st.settings.auto_fetch = false;
+        h.cons.cluster_view.publish(&st);
+        let cnc = Arc::clone(&h.cons.cnc);
+        cnc.counters().durable.store_release(5000);
+        let attempts = |h: &Harness| {
+            u64::from(h.cons.pending_fetch.is_some())
+                + h.cons.auto_fetch_stats.get(Outcome::Refused)
+                + h.cons.auto_fetch_stats.get(Outcome::NoHolder)
+        };
+        for k in 0..3u64 {
+            h.cons.pass_now_ns = 10_000_000_000 * (k + 1);
+            h.cons.maybe_auto_fetch();
+        }
+        assert_eq!(attempts(&h), 0, "switch off: nothing");
+        st.settings.auto_fetch = true;
+        h.cons.cluster_view.publish(&st);
+        // Two passes 10 s apart: the second is past any stagger (node id × 250 ms).
+        for k in 3..5u64 {
+            h.cons.pass_now_ns = 10_000_000_000 * (k + 1);
+            h.cons.maybe_auto_fetch();
+        }
+        assert!(
+            attempts(&h) >= 1,
+            "switch on: the unheld newest agreed set is attempted"
+        );
+        h.cons.pending_fetch = None;
+        h.cons.note_set_held(1000);
+        let before = attempts(&h);
+        h.cons.pass_now_ns += 100_000_000_000;
+        h.cons.maybe_auto_fetch();
+        assert_eq!(attempts(&h), before, "held: nothing more");
+    }
+
+    /// Spec §6 visibility: a landed auto fetch counts `ok`, a deadline counts
+    /// `timeout`; an operator fetch counts neither.
+    #[test]
+    fn a_landed_auto_fetch_counts_ok_and_a_deadline_counts_timeout() {
+        use crate::auto_fetch::Outcome;
+        let mut h = harness_with_rows(&["a"]);
+        h.cons.pass_now_ns = 1_000;
+        h.cons.pending_fetch = Some(PendingFetch {
+            learner: 1,
+            position: 1000,
+            stored_before: 0,
+            deadline_ns: 1_000_000,
+            auto: true,
+        });
+        h.cons.stored_set_pos.store(1000, Ordering::Release);
+        h.cons.poll_pending_fetch();
+        assert_eq!(h.cons.auto_fetch_stats.get(Outcome::Ok), 1);
+        h.cons.pending_fetch = Some(PendingFetch {
+            learner: 1,
+            position: 2000,
+            stored_before: 1000,
+            deadline_ns: 2_000,
+            auto: true,
+        });
+        h.cons.pass_now_ns = 3_000;
+        h.cons.poll_pending_fetch();
+        assert_eq!(h.cons.auto_fetch_stats.get(Outcome::Timeout), 1);
+        h.cons.pending_fetch = Some(PendingFetch {
+            learner: 1,
+            position: 3000,
+            stored_before: 1000,
+            deadline_ns: 2_000,
+            auto: false,
+        });
+        h.cons.poll_pending_fetch();
+        assert_eq!(
+            h.cons.auto_fetch_stats.get(Outcome::Timeout),
+            1,
+            "an operator fetch is not counted"
+        );
+    }
+
+    /// Auto-fetch test helper: switch on, the given catalog, `durable` past
+    /// it — the shape every auto-fetch test below starts from.
+    fn auto_fetch_on(h: &mut Harness, catalog: Vec<SetEntry>) {
+        let mut st = h.cons.cluster_view.to_state();
+        st.catalog = catalog;
+        st.settings.auto_fetch = true;
+        h.cons.cluster_view.publish(&st);
+        h.cons.cnc.counters().durable.store_release(5000);
+    }
+
+    /// Auto-fetch test helper: one fetch issued (pending) or refused, or a
+    /// `no_holder` / `no_space` skip — anything the decision did.
+    fn auto_fetch_attempts(h: &Harness) -> u64 {
+        use crate::auto_fetch::Outcome;
+        u64::from(h.cons.pending_fetch.is_some())
+            + h.cons.auto_fetch_stats.get(Outcome::Refused)
+            + h.cons.auto_fetch_stats.get(Outcome::NoHolder)
+            + h.cons.auto_fetch_stats.get(Outcome::NoSpace)
+    }
+
+    /// Controller ruling PF7 (replacing plan ruling P8's `applied < N`
+    /// clause): an ATTACHED declared row whose `snapshot_pos` is below a FULL
+    /// set's N is still building it, and holds the fetch — for at most 30 s
+    /// from the first sighting of N, after which the fetch proceeds.
+    #[test]
+    fn a_row_still_building_holds_the_auto_fetch_for_at_most_thirty_seconds() {
+        use crate::auto_fetch::AUTO_FETCH_BUILD_GUARD_NS;
+        let mut h = harness_with_rows(&["a"]);
+        auto_fetch_on(&mut h, vec![agreed_entry(1000)]);
+        let slot = h.cons.cnc.service_slot(0);
+        slot.status
+            .store_release(uc_log::cnc::pack_service_status(0, true, 1));
+        slot.snapshot_pos.store_release(0);
+        // `applied` PAST N — the clause PF7 dropped would read "not building".
+        slot.applied.store_release(9000);
+        assert!(
+            h.cons
+                .local_build_pending(1000, &h.cons.cluster_view.snapshot_inner()),
+            "attached, snapshot_pos below N, full set: building"
+        );
+        let t0 = 10_000_000_000u64;
+        // Every 100 ms for just under the guard: held.
+        let mut t = t0;
+        while t < t0 + AUTO_FETCH_BUILD_GUARD_NS - 200_000_000 {
+            h.cons.pass_now_ns = t;
+            h.cons.maybe_auto_fetch();
+            t += 100_000_000;
+        }
+        assert_eq!(
+            auto_fetch_attempts(&h),
+            0,
+            "a row still building holds the fetch"
+        );
+        h.cons.pass_now_ns = t0 + AUTO_FETCH_BUILD_GUARD_NS + 1_000_000_000;
+        h.cons.maybe_auto_fetch();
+        assert!(
+            h.cons
+                .pending_fetch
+                .is_some_and(|p| p.auto && p.position == 1000),
+            "after 30 s the fetch proceeds: {:?}",
+            h.cons.pending_fetch
+        );
+    }
+
+    /// PF7's other half: a row that has frozen at N (`snapshot_pos >= N`),
+    /// an UNATTACHED row, or a standby set on a voter is not "building".
+    #[test]
+    fn a_frozen_or_unattached_row_or_a_voters_standby_set_is_not_building() {
+        let h = harness_with_rows(&["a"]);
+        let mut st = h.cons.cluster_view.to_state();
+        let mut standby = agreed_entry(2000);
+        standby.kind = uc_protocol::v2::catalog::SetKind::Standby;
+        st.catalog = vec![agreed_entry(1000), standby];
+        h.cons.cluster_view.publish(&st);
+        let inner = h.cons.cluster_view.snapshot_inner();
+        let slot = h.cons.cnc.service_slot(0);
+        slot.status
+            .store_release(uc_log::cnc::pack_service_status(0, false, 1));
+        slot.snapshot_pos.store_release(0);
+        assert!(!h.cons.local_build_pending(1000, &inner), "unattached");
+        slot.status
+            .store_release(uc_log::cnc::pack_service_status(0, true, 1));
+        assert!(
+            h.cons.local_build_pending(1000, &inner),
+            "attached, below N"
+        );
+        assert!(
+            !h.cons.local_build_pending(2000, &inner),
+            "a standby set on a voter: this node never builds it"
+        );
+        slot.snapshot_pos.store_release(1000);
+        assert!(!h.cons.local_build_pending(1000, &inner), "frozen at N");
+    }
+
+    /// Controller ruling PF8: the pass that sees an auto fetch LAND does not
+    /// decide again — `holdings_held` lists the fetched set only once the
+    /// completeness poll has adopted it, and until then N reads unheld.
+    #[test]
+    fn a_landed_auto_fetch_is_not_refetched_in_the_same_pass() {
+        use crate::auto_fetch::{AUTO_FETCH_RECHECK_NS, Outcome};
+        let mut h = harness_with_rows(&["a"]);
+        let mut e = agreed_entry(1000);
+        e.kind = uc_protocol::v2::catalog::SetKind::Standby;
+        auto_fetch_on(&mut h, vec![e]);
+        let t = 10_000_000_000u64;
+        h.cons.pass_now_ns = t;
+        h.cons.maybe_auto_fetch();
+        h.cons.pass_now_ns = t + 1_000_000_000;
+        h.cons.maybe_auto_fetch();
+        assert!(h.cons.pending_fetch.is_some(), "the first fetch was issued");
+        while h.fetch_rx.try_recv().is_ok() {}
+        // The receiver lands it.
+        h.cons.stored_set_pos.store(1000, Ordering::Release);
+        h.cons.poll_pending_fetch();
+        assert_eq!(h.cons.auto_fetch_stats.get(Outcome::Ok), 1);
+        h.cons.maybe_auto_fetch();
+        assert_eq!(auto_fetch_attempts(&h), 0, "same pass: nothing re-issued");
+        h.cons.pass_now_ns += AUTO_FETCH_RECHECK_NS - 1;
+        h.cons.maybe_auto_fetch();
+        assert_eq!(auto_fetch_attempts(&h), 0, "inside the recheck delay");
+        h.cons.note_set_held(1000);
+        h.cons.pass_now_ns += 1;
+        h.cons.maybe_auto_fetch();
+        assert_eq!(auto_fetch_attempts(&h), 0, "held by then: nothing");
+        assert!(
+            h.fetch_rx.try_recv().is_err(),
+            "one fetch on the route, ever"
+        );
+    }
+
+    /// Spec §7.3 wiring: a set whose known size does not fit the probe's free
+    /// figure is skipped (`no_space`), named ONCE, and nothing is issued.
+    #[test]
+    fn auto_fetch_skips_a_set_that_does_not_fit_and_names_it_once() {
+        use crate::auto_fetch::{AUTO_FETCH_BACKOFF_MIN_NS, Outcome};
+        let _obs = obs_capture_lock();
+        let mut h = harness_with_rows(&["a"]);
+        let mut e = agreed_entry(1000);
+        e.kind = uc_protocol::v2::catalog::SetKind::Standby;
+        // `total_size` is known only when the cluster artifact's size is too.
+        e.rows[0].size = 4 << 30;
+        e.cluster.size = 1 << 20;
+        auto_fetch_on(&mut h, vec![e]);
+        h.cons.holdings.lock().unwrap().free_bytes = 1 << 30;
+        let cap = ObsCapture::take();
+        let buf = cap.buf();
+        let mut t = 10_000_000_000u64;
+        for _ in 0..4 {
+            h.cons.pass_now_ns = t;
+            h.cons.maybe_auto_fetch();
+            t += 40 * AUTO_FETCH_BACKOFF_MIN_NS;
+        }
+        let text = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(h.cons.pending_fetch.is_none(), "nothing issued");
+        assert!(
+            h.cons.auto_fetch_stats.get(Outcome::NoSpace) >= 2,
+            "every skip counts"
+        );
+        assert_eq!(
+            text.matches("snapshot_fetch_skipped_no_space").count(),
+            1,
+            "named once per set: {text}"
+        );
+    }
+
+    /// Review focus 5 / plan ruling P12: fetching a set only ONE node
+    /// reported emits `snapshot_fetch_single_reporter` — once per set, not
+    /// once per attempt.
+    #[test]
+    fn a_set_reported_by_one_node_is_named_once() {
+        use crate::auto_fetch::Outcome;
+        let _obs = obs_capture_lock();
+        let mut h = harness_with_rows(&["a"]);
+        let mut e = agreed_entry(1000);
+        e.kind = uc_protocol::v2::catalog::SetKind::Standby;
+        let mut st = h.cons.cluster_view.to_state();
+        st.reports = vec![SnapshotReport {
+            row: 0,
+            position: 1000,
+            hashes: vec![(0, e.rows[0].hash, 1)],
+        }];
+        h.cons.cluster_view.publish(&st);
+        auto_fetch_on(&mut h, vec![e]);
+        let cap = ObsCapture::take();
+        let buf = cap.buf();
+        let mut t = 10_000_000_000u64;
+        for _ in 0..4 {
+            h.cons.pass_now_ns = t;
+            h.cons.maybe_auto_fetch();
+            // Let each issued fetch time out, so the next pass tries again.
+            while h.fetch_rx.try_recv().is_ok() {}
+            if let Some(p) = h.cons.pending_fetch {
+                h.cons.pass_now_ns = p.deadline_ns + 1;
+                h.cons.poll_pending_fetch();
+                t = h.cons.pass_now_ns;
+            }
+            t += 60_000_000_000;
+        }
+        let text = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(
+            h.cons.auto_fetch_stats.get(Outcome::Timeout) >= 2,
+            "several attempts: {text}"
+        );
+        assert_eq!(
+            text.matches("snapshot_fetch_single_reporter").count(),
+            1,
+            "named once per set: {text}"
         );
     }
 }

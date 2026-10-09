@@ -1581,7 +1581,18 @@ fn the_flag_day_window_is_empty_and_deletes_nothing() {
 #[test]
 fn a_killed_node_leaves_holders_after_the_stale_timeout() {
     let _g = serialize();
-    let mut c = spawn(2, 2, opts("catalog-stale", false), |_| true);
+    let mut c = spawn(
+        2,
+        2,
+        Opts {
+            settings: Settings {
+                auto_fetch: false,
+                ..Settings::genesis_default()
+            },
+            ..opts("catalog-stale", false)
+        },
+        |_| true,
+    );
     let mut learner2_svc = None;
     for i in c.running() {
         let s = start_sum(c.dir(i), c.app, i);
@@ -1680,7 +1691,18 @@ fn a_killed_node_leaves_holders_after_the_stale_timeout() {
 #[test]
 fn learner_only_voters_do_not_purge_until_they_fetch() {
     let _g = serialize();
-    let mut c = spawn(2, 1, opts("catalog-learner-only", true), |_| true);
+    let mut c = spawn(
+        2,
+        1,
+        Opts {
+            settings: Settings {
+                auto_fetch: false,
+                ..Settings::genesis_default()
+            },
+            ..opts("catalog-learner-only", true)
+        },
+        |_| true,
+    );
     start_sums(&mut c);
     let leader = await_single_leader(&c, 30);
     let learner = 2usize;
