@@ -1566,3 +1566,64 @@ fn the_payload_too_large_error_names_the_remedy() {
     let text = uc_remote::RemoteError::PayloadTooLarge.to_string();
     assert!(text.contains("force_jumbo_frames"), "{text}");
 }
+
+fn complete_one(poll: &mut uc_remote::RemotePollHalf) -> (u64, Option<u64>) {
+    let deadline = Instant::now() + WAIT;
+    let mut got = None;
+    while got.is_none() && Instant::now() < deadline {
+        poll.poll(|c| {
+            if let RemoteOutcome::Response { .. } = c.outcome {
+                got = Some((c.user_data, c.position));
+            }
+        });
+    }
+    got.expect("a response within WAIT")
+}
+
+#[test]
+fn a_zero_token_ryw_query_goes_out_as_a_plain_query() {
+    let edge = FakeEdge::spawn(Behaviour {
+        credits: 4,
+        ..Default::default()
+    });
+    let (send, mut poll) = RemoteEngine::connect(cfg(vec![edge.addr.clone()])).unwrap();
+    send.try_query(1, Consistency::ReadYourWrites, b"q")
+        .unwrap();
+    complete_one(&mut poll);
+    let q = edge.observed.queries.lock().unwrap().clone();
+    assert_eq!(q, vec![(0u8, b"q".to_vec())]);
+    send.shutdown();
+}
+
+#[test]
+fn a_ryw_query_carries_the_token_and_a_stale_answer_is_resent_not_completed() {
+    use uc_remote::frame::FLAG_MIN_POSITION;
+    let edge = FakeEdge::spawn(Behaviour {
+        credits: 4,
+        stale_query_once: true,
+        ..Default::default()
+    });
+    let (send, mut poll) = RemoteEngine::connect(cfg(vec![edge.addr.clone()])).unwrap();
+    send.try_submit(1, b"w").unwrap(); // seq 1, answered at position 64
+    assert_eq!(complete_one(&mut poll), (1, Some(64)));
+    assert_eq!(send.read_token().as_u64(), 65, "a write's position + 1");
+    send.try_query(2, Consistency::ReadYourWrites, b"q")
+        .unwrap(); // seq 2
+    let (ud, pos) = complete_one(&mut poll);
+    assert_eq!(
+        (ud, pos),
+        (2, Some(128)),
+        "completed by the re-send, not the stale answer"
+    );
+    let q = edge.observed.queries.lock().unwrap().clone();
+    let mut want = 65u64.to_le_bytes().to_vec();
+    want.extend_from_slice(b"q");
+    assert_eq!(q.len(), 2, "sent, answered stale, re-sent in place");
+    assert!(
+        q.iter().all(|(f, p)| *f == FLAG_MIN_POSITION && *p == want),
+        "{q:?}"
+    );
+    assert_eq!(send.stats().stale_answers, 1);
+    assert_eq!(send.read_token().as_u64(), 128);
+    send.shutdown();
+}

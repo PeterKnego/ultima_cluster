@@ -57,6 +57,7 @@ use bytes::Bytes;
 use crate::completion::OutcomeTag;
 use crate::error::RemoteError;
 use crate::link::Link;
+use uc_protocol::v2::ipc::ReadToken;
 
 // -------------------------------------------------------------- ceilings
 
@@ -329,6 +330,9 @@ pub struct RemoteStats {
     pub resends: u64,
     /// `RETRY` frames honoured (excluding `PAYLOAD_TOO_LARGE`, which is final).
     pub retries: u64,
+    /// Read-your-writes answers from state older than the token sent; each
+    /// was re-sent in place instead of completing.
+    pub stale_answers: u64,
     /// `UNKNOWN` frames received.
     pub unknown: u64,
     /// Responses flagged `EXPIRED` by the edge's session window.
@@ -378,6 +382,11 @@ pub enum Consistency {
     Linearizable,
     /// Answered from the local replica without a barrier round-trip.
     Snapshot,
+    /// Read-your-writes (spec 2026-10-08): answered by ANY node once its
+    /// service has applied at least this client's token - every write this
+    /// client had acknowledged, and every state a previous read returned.
+    /// Not linearizable: another client's recent write may be missing.
+    ReadYourWrites,
 }
 
 /// Why a `try_submit`/`try_query` was refused at the door. A refusal means the
@@ -542,6 +551,7 @@ impl RemoteSendHalf {
             crate::slots::ReqKind::Submit,
             user_data,
             cmd,
+            0,
         )
     }
 
@@ -561,17 +571,63 @@ impl RemoteSendHalf {
         consistency: Consistency,
         q: &[u8],
     ) -> Result<(), SubmitError> {
-        let flags = match consistency {
-            Consistency::Linearizable => crate::frame::FLAG_LINEARIZABLE,
-            Consistency::Snapshot => 0,
-        };
+        use crate::frame::{FLAG_LINEARIZABLE, FrameType};
+        use crate::slots::ReqKind;
+        match consistency {
+            Consistency::Linearizable => self.send(
+                FrameType::Query,
+                FLAG_LINEARIZABLE,
+                ReqKind::Query,
+                user_data,
+                q,
+                0,
+            ),
+            Consistency::Snapshot => {
+                self.send(FrameType::Query, 0, ReqKind::Query, user_data, q, 0)
+            }
+            Consistency::ReadYourWrites => {
+                let t = self.link.read_token.load(Ordering::Acquire);
+                self.try_query_at_least(user_data, q, ReadToken::from_u64(t))
+            }
+        }
+    }
+
+    /// A read-your-writes query with an explicit token. A zero token sends a
+    /// plain query with no prefix and no flag.
+    pub fn try_query_at_least(
+        &self,
+        user_data: u64,
+        q: &[u8],
+        token: ReadToken,
+    ) -> Result<(), SubmitError> {
+        use crate::frame::{FLAG_MIN_POSITION, FrameType};
+        use crate::slots::ReqKind;
+        if token.as_u64() == 0 {
+            return self.send(FrameType::Query, 0, ReqKind::Query, user_data, q, 0);
+        }
+        let mut buf = Vec::new();
+        crate::frame::write_min_position_query(token.as_u64(), q, &mut buf);
         self.send(
-            crate::frame::FrameType::Query,
-            flags,
-            crate::slots::ReqKind::Query,
+            FrameType::Query,
+            FLAG_MIN_POSITION,
+            ReqKind::Query,
             user_data,
-            q,
+            &buf,
+            token.as_u64(),
         )
+    }
+
+    /// The token this client has accumulated: its acknowledged writes
+    /// (position + 1) and the frontiers of the reads it has seen.
+    pub fn read_token(&self) -> ReadToken {
+        ReadToken::from_u64(self.link.read_token.load(Ordering::Acquire))
+    }
+
+    /// Raise the token (never lowers) - e.g. one handed over by another client.
+    pub fn observe(&self, token: ReadToken) {
+        self.link
+            .read_token
+            .fetch_max(token.as_u64(), Ordering::AcqRel);
     }
 
     /// Encode one request into the ring and record its slot. The whole submit
@@ -593,6 +649,7 @@ impl RemoteSendHalf {
         kind: crate::slots::ReqKind,
         user_data: u64,
         bytes: &[u8],
+        min_position: u64,
     ) -> Result<(), SubmitError> {
         use crate::frame::{HEADER_LEN, Header, MAX_FRAME_LEN, PROTOCOL_VERSION};
 
@@ -667,7 +724,15 @@ impl RemoteSendHalf {
         // it: a request that can never complete, against an `Ok(())` that
         // says it must. The staged bytes are not published, so they leave no
         // residue (see `OutRing::stage_frame`).
-        let claimed = slots.claim(seq, user_data, kind, deadline_ns, off, len);
+        let claimed = slots.claim_with_min_position(
+            seq,
+            user_data,
+            kind,
+            deadline_ns,
+            off,
+            len,
+            min_position,
+        );
         debug_assert!(
             claimed,
             "the window and the slot were both checked free above, and only this thread claims"

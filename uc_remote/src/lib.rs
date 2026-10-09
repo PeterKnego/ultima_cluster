@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Peter Knego
 
-//! `uc_remote`: the ultima_cluster remote protocol v1 (framed TCP) — a
+//! `uc_remote`: the ultima_cluster remote protocol v2 (framed TCP) — a
 //! deliberately tiny wire codec (`bytes`, `thiserror` only) meant to be easy
 //! to re-implement in a non-Rust gateway port. See
 //! `docs/reference/remote-protocol.md` and design spec §4.2.
 //!
 //! **Semver:** see `docs/reference/semver-policy.md`. Promised surface: the
-//! **wire format** — remote protocol v1 ([`frame::PROTOCOL_VERSION`]) — plus
+//! **wire format** — remote protocol v2 ([`frame::PROTOCOL_VERSION`]) — plus
 //! [`RemoteEngine`]'s halves and the [`RemoteClient`] convenience built on
 //! them. The Rust items that encode the wire are not themselves promised; a
 //! port re-implements the format, not this API.
@@ -31,3 +31,4 @@ pub use engine::{
     RemoteResponse, RemoteSendHalf, RemoteStats, RemoteWaitHandle, SubmitError,
 };
 pub use error::{FrameError, RemoteError};
+pub use uc_protocol::v2::ipc::ReadToken;

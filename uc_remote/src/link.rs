@@ -94,6 +94,9 @@ const MAX_RETRY_SLEEP: Duration = Duration::from_secs(1);
 /// A `RETRY{retry_after_us: 0}` still backs off this much.
 const MIN_RETRY_SLEEP: Duration = Duration::from_micros(100);
 /// Backoff for a request an edge redirected to itself.
+/// Pause before re-sending a query whose answer came from state older than
+/// its read-your-writes token.
+const STALE_ANSWER_BACKOFF: Duration = Duration::from_millis(1);
 const SELF_REDIRECT_BACKOFF: Duration = Duration::from_millis(10);
 /// The most bytes one re-send batch puts into a single `write_all_bytes`.
 const RESEND_BATCH_BYTES: usize = 64 * 1024;
@@ -171,6 +174,7 @@ pub(crate) struct StatCells {
     pub(crate) reconnects: AtomicU64,
     pub(crate) resends: AtomicU64,
     pub(crate) retries: AtomicU64,
+    pub(crate) stale_answers: AtomicU64,
     pub(crate) unknown: AtomicU64,
     pub(crate) expired: AtomicU64,
     pub(crate) max_credits_seen: AtomicU32,
@@ -188,6 +192,7 @@ impl StatCells {
             reconnects: self.reconnects.load(Ordering::Relaxed),
             resends: self.resends.load(Ordering::Relaxed),
             retries: self.retries.load(Ordering::Relaxed),
+            stale_answers: self.stale_answers.load(Ordering::Relaxed),
             unknown: self.unknown.load(Ordering::Relaxed),
             expired: self.expired.load(Ordering::Relaxed),
             max_credits_seen: self.max_credits_seen.load(Ordering::Relaxed),
@@ -262,6 +267,9 @@ pub(crate) struct Link {
     /// which is sound because `reclaim` stops at the oldest LIVE slot, so no
     /// live request is ever below this floor. Monotone.
     pub(crate) oldest_unreclaimed: AtomicU64,
+    /// The read-your-writes token: the highest position this client has seen
+    /// acknowledged or read (spec 2026-10-08 §5.5).
+    pub(crate) read_token: AtomicU64,
     stats: StatCells,
     t0: Instant,
     closed: AtomicBool,
@@ -311,6 +319,7 @@ impl Link {
             warned_over_standard: AtomicBool::new(false),
             probe_seq: AtomicU64::new(0),
             oldest_unreclaimed: AtomicU64::new(1),
+            read_token: AtomicU64::new(0),
             stats,
             t0: Instant::now(),
             closed: AtomicBool::new(false),
@@ -1520,7 +1529,31 @@ impl Reader {
                 if expired {
                     self.link.stats.expired.fetch_add(1, Ordering::Relaxed);
                 }
+                let (kind, min_sent) = self
+                    .link
+                    .slots
+                    .kind_and_min_position(h.seq)
+                    .unwrap_or((crate::slots::ReqKind::Submit, 0));
+                if kind == crate::slots::ReqKind::Query && !expired && meta.position < min_sent {
+                    // Read-your-writes guard (spec §5.5): an answer from state
+                    // older than the token we sent. Do not resolve; re-send in
+                    // place after a short backoff, as for a transient RETRY.
+                    self.link
+                        .stats
+                        .stale_answers
+                        .fetch_add(1, Ordering::Relaxed);
+                    self.link.queue_retransmit(h.seq, STALE_ANSWER_BACKOFF);
+                    credit_update(&self.link, self.generation, meta.credits, meta.acked_seq);
+                    return Act::Continue;
+                }
                 if let crate::slots::Resolve::Won { user_data } = self.link.slots.resolve(h.seq) {
+                    if !expired {
+                        let seen = match kind {
+                            crate::slots::ReqKind::Query => meta.position,
+                            crate::slots::ReqKind::Submit => meta.position.saturating_add(1),
+                        };
+                        self.link.read_token.fetch_max(seen, Ordering::AcqRel);
+                    }
                     let rec = Record {
                         user_data,
                         position: meta.position,

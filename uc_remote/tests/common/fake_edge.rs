@@ -96,6 +96,9 @@ pub struct Behaviour {
     /// only on the idle timer. Every later `RESPONSE` carries the reduced
     /// grant too, exactly as a real edge's `Conn::credits()` would.
     pub shrink_credits_to: Option<u32>,
+    /// Answer the first QUERY on each connection with position 0 (an answer
+    /// from state older than any token), the re-send then normally.
+    pub stale_query_once: bool,
 }
 
 impl Default for Behaviour {
@@ -118,6 +121,7 @@ impl Default for Behaviour {
             partial_frame_then_hang: false,
             delay: Duration::from_millis(1),
             shrink_credits_to: None,
+            stale_query_once: false,
         }
     }
 }
@@ -125,6 +129,8 @@ impl Default for Behaviour {
 /// What the edge actually saw, for assertions.
 #[derive(Default)]
 pub struct Observed {
+    /// Every QUERY frame as received: `(flags, payload)`.
+    pub queries: Mutex<Vec<(u8, Vec<u8>)>>,
     /// Accepted connections.
     pub conns: AtomicU32,
     /// `HELLO` frames read.
@@ -254,6 +260,7 @@ enum Action {
         seq: u64,
         is_query: bool,
         payload: Vec<u8>,
+        stale: bool,
     },
     Redirect {
         seq: u64,
@@ -382,6 +389,7 @@ fn serve(sock: TcpStream, b: Behaviour, o: Arc<Observed>, stop: Arc<AtomicBool>,
 
     // --- request loop
     let mut used_once = false;
+    let mut stale_used = false;
     let mut shrunk = false;
     loop {
         match rd.read_frame(READ_STALL_BUDGET) {
@@ -432,10 +440,17 @@ fn serve(sock: TcpStream, b: Behaviour, o: Arc<Observed>, stop: Arc<AtomicBool>,
                     } else {
                         let mut bytes = payload.to_vec();
                         bytes.reverse();
+                        if h.ty == FrameType::Query {
+                            o.queries.lock().unwrap().push((h.flags, payload.to_vec()));
+                        }
+                        let stale = h.ty == FrameType::Query
+                            && b.stale_query_once
+                            && !std::mem::replace(&mut stale_used, true);
                         Action::Respond {
                             seq: h.seq,
                             is_query: h.ty == FrameType::Query,
                             payload: bytes,
+                            stale,
                         }
                     };
                     let stop_after = matches!(action, Action::DropConn);
@@ -533,6 +548,7 @@ fn respond(
                 seq,
                 is_query,
                 payload,
+                stale,
             } => {
                 let mut flags = 0u8;
                 if is_query {
@@ -551,7 +567,7 @@ fn respond(
                 ResponseMeta {
                     credits,
                     acked_seq,
-                    position: seq * 64,
+                    position: if stale { 0 } else { seq * 64 },
                 }
                 .encode(&mut out);
                 out.extend_from_slice(&payload);
