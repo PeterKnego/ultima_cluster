@@ -230,6 +230,47 @@ impl CatalogQuery<'_> {
     }
 }
 
+/// Snapshot-lifecycle spec §4: one row's start set — `position == 0` = none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct StartSet {
+    pub position: u64,
+    /// The packed version that built the row's artifact (`RowEntry.version`).
+    pub version: u32,
+}
+
+/// Snapshot-lifecycle spec §4.1: row `row`'s start set — the NEWEST entry
+/// that (1) is agreed, (2) has `rows[row]` Agreed (a row the set did not
+/// report is not eligible for it), (3) this node holds complete on disk
+/// (`held`, the consensus agent's `holdings_held`), and (4) sits at or below
+/// `frontier = min(commit, durable)`. An empty catalog answers none.
+///
+/// The second value is the lowest position of a set that passes (1)-(3)
+/// but sits ABOVE `frontier` — when the frontier reaches it the answer
+/// changes, so the caller recomputes then (spec §4.3); `u64::MAX` = none.
+pub fn start_set_for(row: u8, sets: &[SetEntry], held: &[u64], frontier: u64) -> (StartSet, u64) {
+    let mut wait_above = u64::MAX;
+    for e in sets.iter().rev() {
+        let Some(r) = e.rows.get(row as usize) else {
+            break;
+        };
+        if !e.is_agreed() || r.verdict != RowVerdict::Agreed || !held.contains(&e.position) {
+            continue;
+        }
+        if e.position > frontier {
+            wait_above = wait_above.min(e.position);
+            continue;
+        }
+        return (
+            StartSet {
+                position: e.position,
+                version: r.version,
+            },
+            wait_above,
+        );
+    }
+    (StartSet::default(), wait_above)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -253,6 +294,84 @@ mod tests {
         let mut e = agreed(p);
         e.rows[0].verdict = RowVerdict::Diverged;
         e
+    }
+    fn agreed_v(p: u64, version: u32) -> SetEntry {
+        let mut e = agreed(p);
+        e.rows[0].version = version;
+        e
+    }
+
+    /// Snapshot-lifecycle spec §4.1: the newest entry that is agreed, whose
+    /// row is Agreed, that this node holds, at or below min(commit, durable).
+    #[test]
+    fn start_set_eligibility_table() {
+        let sets = [agreed_v(1000, 7), agreed_v(2000, 8), agreed_v(3000, 9)];
+        // agreed and held
+        assert_eq!(
+            start_set_for(0, &sets, &[1000, 2000, 3000], u64::MAX),
+            (
+                StartSet {
+                    position: 3000,
+                    version: 9
+                },
+                u64::MAX
+            )
+        );
+        // not held -> the newest held one
+        assert_eq!(start_set_for(0, &sets, &[1000], u64::MAX).0.position, 1000);
+        // above min(commit, durable) -> the older one, and the frontier to watch
+        assert_eq!(
+            start_set_for(0, &sets, &[1000, 2000, 3000], 2500),
+            (
+                StartSet {
+                    position: 2000,
+                    version: 8
+                },
+                3000
+            )
+        );
+        // row unreported in the set -> not eligible for that row
+        assert_eq!(
+            start_set_for(1, &sets, &[1000, 2000, 3000], u64::MAX).0,
+            StartSet::default()
+        );
+        // a diverged set is skipped
+        let with_div = [agreed_v(1000, 7), diverged(2000)];
+        assert_eq!(
+            start_set_for(0, &with_div, &[1000, 2000], u64::MAX)
+                .0
+                .position,
+            1000
+        );
+        // a Commanded entry is skipped
+        let cmd = [
+            agreed_v(1000, 7),
+            SetEntry::commanded(2000, SetKind::Full, 0),
+        ];
+        assert_eq!(
+            start_set_for(0, &cmd, &[1000, 2000], u64::MAX).0.position,
+            1000
+        );
+        // empty catalog -> none
+        assert_eq!(
+            start_set_for(0, &[], &[1000], u64::MAX),
+            (StartSet::default(), u64::MAX)
+        );
+    }
+
+    /// Review focus 1: a set still being fetched is not in the held list
+    /// until its LAST artifact is renamed into place (the completion edge),
+    /// so the publisher names the older held set - never a half-written one.
+    #[test]
+    fn start_set_skips_a_set_that_is_still_being_fetched() {
+        let sets = [agreed_v(1000, 7), agreed_v(2000, 7)];
+        let held_while_fetching_2000 = [1000];
+        assert_eq!(
+            start_set_for(0, &sets, &held_while_fetching_2000, u64::MAX)
+                .0
+                .position,
+            1000
+        );
     }
     fn holding(catalog_position: u64, sets_held: u64, first: u64, durable: u64) -> Holdings {
         Holdings {
