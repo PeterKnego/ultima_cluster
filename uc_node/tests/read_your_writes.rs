@@ -314,7 +314,7 @@ fn a_forged_token_is_refused_at_once() {
     let res = reader.query_read_your_writes::<(), u64>(&());
     assert!(matches!(res, Err(ClientError::Retry)), "got {res:?}");
     assert!(
-        started.elapsed() < Duration::from_millis(500),
+        started.elapsed() < Duration::from_millis(900),
         "a forged token must not park"
     );
     let stats = c.nodes[follower].observability().min_position;

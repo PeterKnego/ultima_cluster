@@ -10,6 +10,8 @@ use uc_gateway::{Edge, EdgeConfig, Member};
 use uc_lincheck::register::{Cmd, CmdResp};
 use uc_remote::{Consistency, RemoteClient, RemoteConfig};
 
+use uc_remote::frame::{FLAG_LINEARIZABLE, FLAG_MIN_POSITION};
+
 mod common;
 
 fn enc(c: &Cmd) -> Vec<u8> {
@@ -114,6 +116,64 @@ fn a_protocol_v1_client_is_refused_by_name() {
         HelloRefused::decode(&p).unwrap().reason,
         HELLO_REFUSED_VERSION
     );
+    edge.stop();
+    for s in &mut slots {
+        s.stop();
+    }
+}
+
+#[test]
+fn a_query_with_both_min_position_and_linearizable_closes_the_connection() {
+    use uc_remote::frame::{FrameType, Header};
+    let root = common::tempdir();
+    let mut slots = common::start_cluster(root.path(), 3);
+    let leader = common::await_single_leader(&slots, 30);
+    let edge = edge_on(&slots[leader].instance_dir);
+
+    let query = |flags: u8, seq: u64| {
+        let mut payload = 0u64.to_le_bytes().to_vec();
+        payload.extend_from_slice(&read_query());
+        (
+            Header {
+                ty: FrameType::Query,
+                flags,
+                version: uc_remote::frame::PROTOCOL_VERSION,
+                client_id: 7,
+                seq,
+            },
+            payload,
+        )
+    };
+
+    // Control: the min-position flag alone is answered (not a close).
+    let mut ok = common::dial_raw(edge.local_addr());
+    common::send_hello(&mut ok, 7, common::APP);
+    common::read_until(&mut ok, FrameType::HelloOk, Duration::from_secs(5)).expect("HELLO_OK");
+    let (h, p) = query(FLAG_MIN_POSITION, 1);
+    ok.write_frame(h, &p).unwrap();
+    let got = common::read_until(&mut ok, FrameType::Response, Duration::from_secs(10));
+    assert!(got.is_some(), "a plain min-position query is answered");
+
+    // Both flags: the edge closes, and no RESPONSE ever arrives.
+    let mut c = common::dial_raw(edge.local_addr());
+    common::send_hello(&mut c, 8, common::APP);
+    common::read_until(&mut c, FrameType::HelloOk, Duration::from_secs(5)).expect("HELLO_OK");
+    let (h, p) = query(FLAG_MIN_POSITION | FLAG_LINEARIZABLE, 1);
+    c.write_frame(h, &p).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut closed = false;
+    while std::time::Instant::now() < deadline {
+        match c.read_frame(common::READ_STALL) {
+            Ok(Some((h, _))) => assert_ne!(h.ty, FrameType::Response, "no RESPONSE for both flags"),
+            Ok(None) => {}
+            Err(_) => {
+                closed = true;
+                break;
+            }
+        }
+    }
+    assert!(closed, "the edge closes a query carrying both flags");
+
     edge.stop();
     for s in &mut slots {
         s.stop();

@@ -1360,6 +1360,12 @@ fn dispatch(
     // prefix. A malformed prefix is a protocol violation by a client that
     // spoke v2 at HELLO; drop the connection rather than guess.
     let (min_token, payload) = if is_query && h.flags & FLAG_MIN_POSITION != 0 {
+        // Both flags together are a protocol violation (ruling R8): the same
+        // combination is dropped on shmem (spec §4.1), so close, don't
+        // silently downgrade either.
+        if h.flags & FLAG_LINEARIZABLE != 0 {
+            return false;
+        }
         match split_min_position_query(payload) {
             Some((t, rest)) => (Some(uc_client::ReadToken::from_u64(t)), rest),
             None => return false,
@@ -1379,8 +1385,9 @@ fn dispatch(
     // holds only because some other crate's private ordering happens to check
     // first is not one this edge can make. Both paths write the same frame.
     let envelope = shared.cfg.session_envelope && !is_query;
-    // A min-position query also carries the engine's 8 token bytes and its
-    // 1-byte service id, matching the engine's own `wire_len`.
+    // For a read-your-writes query only, the engine's own `wire_len` also
+    // counts the 8 token bytes and the 1-byte service id, so count them here
+    // too; plain-query accounting is unchanged (no id byte).
     let wire_len = payload.len()
         + if envelope { SESSION_HEADER_LEN } else { 0 }
         + if min_token.is_some() { 9 } else { 0 };

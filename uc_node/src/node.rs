@@ -23926,6 +23926,34 @@ mod tests {
         assert!(h.cons.parked_reads.is_empty());
     }
 
+    /// The `e >= 1` sentinel guard (see `advance_pending_reads`): a slot whose
+    /// epoch is still 0 has no attached service incarnation, and 0 is the
+    /// "skip the stale-epoch check" sentinel on the wire, so a min-position
+    /// read must PARK there even when `applied >= token`, never forward.
+    #[test]
+    fn a_caught_up_read_on_an_epoch_zero_slot_parks_instead_of_forwarding() {
+        let mut h = harness();
+        let (p, mut svc1, _egress) = ryw_setup(&mut h);
+        h.cons.cnc.counters().durable.store_release(1000);
+        h.cons.cnc.service_slot(1).applied.store_release(800);
+        assert_eq!(h.cons.cnc.service_slot(1).epoch.load_acquire(), 0);
+        send_ryw(&p, 1, 800);
+        assert!(h.cons.drain_query_ring());
+        assert!(
+            svc1.try_read(&mut Vec::new()).unwrap().is_none(),
+            "must not forward with the epoch-0 sentinel"
+        );
+        assert_eq!(h.cons.parked_reads.len(), 1);
+        assert!(!h.cons.advance_min_position_reads());
+        // A real incarnation attaches: now it forwards, with that epoch.
+        h.cons.cnc.service_slot(1).epoch.store_release(2);
+        assert!(h.cons.advance_min_position_reads());
+        let mut buf = Vec::new();
+        svc1.try_read(&mut buf).unwrap().expect("forwarded");
+        assert_eq!(&buf[..8], &2u64.to_le_bytes());
+        assert!(h.cons.parked_reads.is_empty());
+    }
+
     #[test]
     fn a_lagging_read_parks_then_forwards_when_applied_reaches_the_token() {
         let mut h = harness();

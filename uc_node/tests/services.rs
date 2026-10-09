@@ -1207,8 +1207,27 @@ fn a_query_answer_carries_the_rows_applied_frontier() {
         let _: u64 = client.submit(&Cmd::Add(1)).unwrap();
     }
     let cnc = CncPage::open_file(&dir.path().join("cnc2.dat"), APP).unwrap();
-    let applied = cnc.service_slot(0).applied.load_acquire();
-    assert!(applied > 0);
+    // The service publishes a response inside its batch and stores `applied`
+    // after it, so `submit` can return before `applied` covers the last write:
+    // wait until `applied` is unchanged across three reads 10 ms apart.
+    let applied_before = {
+        let mut last = cnc.service_slot(0).applied.load_acquire();
+        let mut stable = 0;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while stable < 3 {
+            assert!(Instant::now() < deadline, "applied never settled");
+            std::thread::sleep(Duration::from_millis(10));
+            let now = cnc.service_slot(0).applied.load_acquire();
+            if now == last {
+                stable += 1;
+            } else {
+                stable = 0;
+                last = now;
+            }
+        }
+        last
+    };
+    assert!(applied_before > 0);
 
     let mut egress = BroadcastRing::open(&dir.path().join("egress_service.0.broadcast"))
         .unwrap()
@@ -1231,9 +1250,11 @@ fn a_query_answer_carries_the_rows_applied_frontier() {
                 assert_eq!(rec.msg_type, MSG_V2_RESPONSE);
                 assert_ne!(rec.flags & FLAG_V2_IS_QUERY, 0);
                 let pos = u64::from_le_bytes(buf[..8].try_into().unwrap());
-                assert_eq!(
-                    pos, applied,
-                    "no writes since: the answer reports exactly `applied`"
+                let applied_after = cnc.service_slot(0).applied.load_acquire();
+                assert!(pos > 0, "the answer carries a frontier, not 0");
+                assert!(
+                    applied_before <= pos && pos <= applied_after,
+                    "answer {pos} outside [{applied_before}, {applied_after}]"
                 );
                 break;
             }

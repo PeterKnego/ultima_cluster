@@ -1134,6 +1134,28 @@ fn a_ryw_query_carries_the_token_and_an_answer_below_it_is_a_retry() {
     );
 }
 
+/// Boundary: an answer whose position EQUALS the token sent satisfies it
+/// (`position >= token`): a Response, not a Retry, and the token stays put.
+#[test]
+fn an_answer_exactly_at_the_token_is_accepted() {
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    make_instance(dir.path(), "ryw2b", 1 << 20, 1 << 20);
+    let (s, mut p) = Engine::attach(dir.path(), "ryw2b", cfg()).unwrap();
+    s.observe(ReadToken::from_u64(5000));
+    s.try_query(7, b"q", Consistency::ReadYourWrites).unwrap();
+    let mut eg = egress(dir.path());
+    eg.write(
+        MSG_V2_RESPONSE,
+        FLAG_V2_IS_QUERY,
+        extra_client(s.client_id(), 0),
+        &response(5000, b"fresh"),
+    )
+    .unwrap();
+    assert_eq!(drain(&mut p), vec![(7, Some(5000), "resp:5".to_string())]);
+    assert_eq!(p.stats().stale_answers, 0);
+    assert_eq!(s.read_token(), ReadToken::from_u64(5000));
+}
+
 #[test]
 fn try_query_at_least_uses_its_own_token_not_the_automatic_one() {
     let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
