@@ -724,6 +724,10 @@ fn reason_str(reason: u32) -> &'static str {
         // the leader's own automatic append), listed here for completeness
         // with the rest of the 52-60 band.
         60 => "version_already_set",
+        // Snapshot-lifecycle spec §8: door-only, after 54.
+        61 => {
+            "pin_origin_not_agreed (the set at --origin is complete here but the catalog has not agreed it yet - reports can take ~5 s after the instant; retry, and check uc2_catalog_agreed_position reaches it)"
+        }
         _ => "unknown/malformed",
     }
 }
@@ -1800,6 +1804,18 @@ mod tests {
     /// has a running version); 52 is renamed `row_undeclared` — the same
     /// door check genesis now shares with `upgrade pin`, so the `pin_`
     /// prefix no longer names it precisely.
+    /// Snapshot-lifecycle spec §8: 61 names the not-yet-agreed origin and
+    /// tells the operator to retry.
+    #[test]
+    fn reason_str_names_61() {
+        assert!(
+            reason_str(61).starts_with("pin_origin_not_agreed"),
+            "{}",
+            reason_str(61)
+        );
+        assert!(reason_str(61).contains("retry"));
+    }
+
     #[test]
     fn reason_str_names_60_and_52() {
         assert_eq!(reason_str(60), "version_already_set");

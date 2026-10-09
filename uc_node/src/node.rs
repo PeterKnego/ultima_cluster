@@ -594,6 +594,12 @@ pub const REASON_REPORT_STALE: u32 = 59;
 /// version. FSM-only (`ClusterRefusal::VersionAlreadySet`): the leader's own
 /// genesis append validates first and simply skips a row that has one.
 pub const REASON_VERSION_ALREADY_SET: u32 = 60;
+/// Snapshot-lifecycle spec §8: the pin's origin is not an AGREED catalog
+/// entry — the set may still be collecting reports (up to ~5 s after the
+/// instant, `SNAP_REPORT_TIMEOUT_NS`), so `uc2ctl` says to retry. DOOR-ONLY
+/// (plan ruling P13): an Empty catalog (no `Complete` entry, catalog ruling
+/// R26) cannot check agreement, and the pin is then allowed with a log line.
+pub const REASON_PIN_ORIGIN_NOT_AGREED: u32 = 61;
 
 /// Jumbo spec §7.1: the datagram rung a committed `Settings::datagram_mtu`
 /// word means, and whether it had to be clamped to get there.
@@ -10396,6 +10402,26 @@ impl Consensus {
         if pin.origin != self.snapshot_set_position.load(Ordering::Acquire) {
             return self.refuse_upgrade_pin(REASON_PIN_NO_SET);
         }
+        // 61 (snapshot-lifecycle spec §8, door-only per plan ruling P13): the
+        // origin must be AGREED - a pin is a one-way door, and an unverified
+        // or diverged origin would spread a possibly bad state to every node.
+        // An Empty catalog cannot answer; the pin is allowed as before, and
+        // named.
+        if state.catalog_empty() {
+            crate::obs_event!(
+                Info,
+                "upgrade_pin_agreement_unchecked",
+                node = self.id as u64,
+                row = pin.row as u64,
+                origin = pin.origin
+            );
+        } else if !state
+            .catalog
+            .iter()
+            .any(|e| e.position == pin.origin && e.is_agreed())
+        {
+            return self.refuse_upgrade_pin(REASON_PIN_ORIGIN_NOT_AGREED);
+        }
         let cmd = ClusterCommand::UpgradePin(pin);
         if let Err(reason) = self.validate_cluster_command(&cmd) {
             return self.refuse_upgrade_pin(reason);
@@ -19922,6 +19948,81 @@ mod tests {
         assert_eq!(h.cons.last_cluster_append, before, "nothing was appended");
     }
 
+    /// Snapshot-lifecycle spec §8: a pin's origin must be an AGREED catalog
+    /// entry (61), except on an Empty catalog, where the pin is allowed as
+    /// before. Checked after 54, so a missing set still reads 54.
+    #[test]
+    fn upgrade_pin_origin_must_be_agreed_unless_the_catalog_is_empty() {
+        use uc_protocol::v2::catalog::{SetEntry, SetKind, SetState};
+        let mut h = harness_with_rows(&["a"]);
+        drive_to_serving_leader(&mut h);
+        h.cons
+            .cnc
+            .service_slot(0)
+            .status
+            .store_version(pack_version(1, 0, 0));
+        h.cons.snapshot_set_position.store(4096, Ordering::Release);
+        let pin = UpgradePin {
+            row: 0,
+            from: pack_version(1, 0, 0),
+            to: pack_version(1, 1, 0),
+            origin: 4096,
+        };
+        // A catalog with a Complete set elsewhere and 4096 still Commanded.
+        let mut st = h.cons.cluster_view.to_state();
+        let mut commanded = SetEntry::commanded(4096, SetKind::Full, 0);
+        commanded.state = SetState::Commanded;
+        st.catalog = vec![agreed_entry(2048), commanded];
+        h.cons.cluster_view.publish(&st);
+        stage_pin_for_test(&h, &pin);
+        assert_eq!(
+            sr(h.cons.apply_upgrade_pin_staged()),
+            (1, REASON_PIN_ORIGIN_NOT_AGREED),
+            "complete here, not yet agreed"
+        );
+        // Agreed now: accepted.
+        st.catalog = vec![agreed_entry(2048), agreed_entry(4096)];
+        h.cons.cluster_view.publish(&st);
+        stage_pin_for_test(&h, &pin);
+        assert_eq!(
+            sr(h.cons.apply_upgrade_pin_staged()).0,
+            0,
+            "agreed origin accepted"
+        );
+    }
+
+    /// An Empty catalog cannot check agreement: the pin is allowed as
+    /// before, and the node says so.
+    #[test]
+    fn upgrade_pin_on_an_empty_catalog_is_allowed_unchecked() {
+        let _obs = obs_capture_lock();
+        let mut h = harness_with_rows(&["a"]);
+        drive_to_serving_leader(&mut h);
+        h.cons
+            .cnc
+            .service_slot(0)
+            .status
+            .store_version(pack_version(1, 0, 0));
+        h.cons.snapshot_set_position.store(4096, Ordering::Release);
+        stage_pin_for_test(
+            &h,
+            &UpgradePin {
+                row: 0,
+                from: pack_version(1, 0, 0),
+                to: pack_version(1, 1, 0),
+                origin: 4096,
+            },
+        );
+        let cap = ObsCapture::take();
+        let buf = cap.buf();
+        assert_eq!(sr(h.cons.apply_upgrade_pin_staged()).0, 0);
+        let text = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(
+            text.contains(r#""event":"upgrade_pin_agreement_unchecked""#),
+            "the unchecked pin is named: {text}"
+        );
+    }
+
     /// #33 ruling R17 (spec D3, patch is free): the door's no-running-version
     /// half of 53 compares `from` with the attached word by LINE, as the
     /// FSM's `same_line(from, running)` clause and the pinned install's
@@ -20159,8 +20260,9 @@ mod tests {
                 REASON_PIN_DECODE,
                 REASON_REPORT_STALE,
                 REASON_VERSION_ALREADY_SET,
+                REASON_PIN_ORIGIN_NOT_AGREED,
             ),
-            (52, 53, 54, 55, 56, 57, 58, 59, 60)
+            (52, 53, 54, 55, 56, 57, 58, 59, 60, 61)
         );
     }
 
