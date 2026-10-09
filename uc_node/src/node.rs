@@ -3239,7 +3239,8 @@ struct PendingAdminFwd {
 struct ReportedSet {
     position: u64,
     n: usize,
-    reports: [(u8, u64); CNC_MAX_SERVICES + 1],
+    /// `(row, hash, size)`.
+    reports: [(u8, u64, u64); CNC_MAX_SERVICES + 1],
 }
 
 /// Ruling R40: the hand-off between the `uc2-holdings` probe thread, which
@@ -6794,7 +6795,8 @@ impl Consensus {
         // word for another position (a newer artifact already landed, or
         // none was ever hashed) skips the row: the set is not vouched for
         // here by the cluster row, and the next instant reports again.
-        let cluster_hash = self.cluster_artifact_hash.hash_at(p);
+        let cluster = self.cluster_artifact_hash.hash_and_size_at(p);
+        let snap_root = self.snap_root.clone();
         let row_reports = rows[..n].iter().filter_map(|&row| {
             // `snapshot_pos` FIRST (Acquire), then the hash — the reverse of
             // the builder's store order, which is what makes the pair
@@ -6809,13 +6811,20 @@ impl Consensus {
                 // function's doc).
                 (at, hash, slot.snapshot_pos.load_acquire())
             };
-            (at == p && still_at == p && hash != 0).then_some((row, hash))
+            // Snapshot-lifecycle spec §7.1: one `stat` per row, on this
+            // once-per-instant edge only (never a pass).
+            (at == p && still_at == p && hash != 0).then(|| {
+                let path = snap_root
+                    .join(row.to_string())
+                    .join(format!("{SNAP_PREFIX}{p}{SNAP_SUFFIX}"));
+                (row, hash, file_size(&path))
+            })
         });
         // Collected before the sends: the iterator above borrows `self.cnc`,
         // and every arm below needs `&mut self`. At most nine entries.
-        let mut reports = [(0u8, 0u64); CNC_MAX_SERVICES + 1];
+        let mut reports = [(0u8, 0u64, 0u64); CNC_MAX_SERVICES + 1];
         let mut m = 0usize;
-        for r in row_reports.chain(cluster_hash.map(|h| (CLUSTER_ROW, h))) {
+        for r in row_reports.chain(cluster.map(|(h, s)| (CLUSTER_ROW, h, s))) {
             reports[m] = r;
             m += 1;
         }
@@ -6832,7 +6841,7 @@ impl Consensus {
     /// found FEWER rows (a row has since frozen a newer instant) does not
     /// replace a fuller one. Node memory only: a restart forgets it, and a
     /// restarted node re-offers only what its slots still name.
-    fn cache_report_set(&mut self, p: u64, reports: &[(u8, u64)]) {
+    fn cache_report_set(&mut self, p: u64, reports: &[(u8, u64, u64)]) {
         if reports.is_empty() {
             return;
         }
@@ -6890,11 +6899,11 @@ impl Consensus {
 
     /// [`Self::cache_report_set`]'s insert, without publishing `known`.
     /// `true` when the cache changed (a new set, or a fuller one).
-    fn cache_report_set_quiet(&mut self, p: u64, reports: &[(u8, u64)]) -> bool {
+    fn cache_report_set_quiet(&mut self, p: u64, reports: &[(u8, u64, u64)]) -> bool {
         let mut set = ReportedSet {
             position: p,
             n: reports.len(),
-            reports: [(0u8, 0u64); CNC_MAX_SERVICES + 1],
+            reports: [(0u8, 0u64, 0u64); CNC_MAX_SERVICES + 1],
         };
         set.reports[..reports.len()].copy_from_slice(reports);
         match self.reported_sets.binary_search_by_key(&p, |s| s.position) {
@@ -6925,7 +6934,7 @@ impl Consensus {
     /// and counted when no leader is known. Split out of
     /// [`Self::send_snapshot_reports`] so the re-offer (ruling R38-2) can
     /// deliver a set whose hashes come from [`Self::cache_report_set`].
-    fn deliver_snapshot_reports(&mut self, p: u64, reports: &[(u8, u64)]) {
+    fn deliver_snapshot_reports(&mut self, p: u64, reports: &[(u8, u64, u64)]) {
         // A leader reports to ITSELF, in-process: the collector is this same
         // agent, so a datagram to our own address would only add latency and
         // a loss mode. The hint and the term are read once for the whole
@@ -6936,7 +6945,7 @@ impl Consensus {
         let leader_addr = (hint != u64::MAX)
             .then(|| self.id_to_addr.get(&(hint as NodeId)).copied())
             .flatten();
-        for &(row, hash) in reports {
+        for &(row, hash, size) in reports {
             if leader {
                 crate::obs_event!(
                     Info,
@@ -6945,8 +6954,7 @@ impl Consensus {
                     row = row as u64,
                     position = p
                 );
-                // Task 6 (snapshot lifecycle) passes the real size
-                self.on_snap_report(self.id, row, p, hash, 0);
+                self.on_snap_report(self.id, row, p, hash, size);
             } else if let Some(addr) = leader_addr {
                 let mut body = [0u8; SNAP_REPORT_BODY_LEN];
                 write_snap_report_body(
@@ -6956,7 +6964,7 @@ impl Consensus {
                         node_id: self.id,
                         position: p,
                         hash,
-                        size: 0, // Task 6 (snapshot lifecycle) passes the real size
+                        size,
                     },
                 );
                 // Position 0 on the header: the instant this report is ABOUT
@@ -12039,11 +12047,11 @@ impl ReportSeeder {
             let mut set = ReportedSet {
                 position: p,
                 n: 0,
-                reports: [(0u8, 0u64); CNC_MAX_SERVICES + 1],
+                reports: [(0u8, 0u64, 0u64); CNC_MAX_SERVICES + 1],
             };
             for (&row, path) in self.rows.iter().zip(&row_paths) {
                 if let Some(h) = hash_row_artifact(path, p) {
-                    set.reports[set.n] = (row, h);
+                    set.reports[set.n] = (row, h, file_size(path));
                     set.n += 1;
                 }
             }
@@ -12051,7 +12059,7 @@ impl ReportSeeder {
                 .cluster_dir
                 .join(format!("{SNAP_PREFIX}{p}{CLUSTER_SNAP_SUFFIX}"));
             if let Some(h) = hash_file_from(&cluster, 0) {
-                set.reports[set.n] = (CLUSTER_ROW, h);
+                set.reports[set.n] = (CLUSTER_ROW, h, file_size(&cluster));
                 set.n += 1;
             }
             if set.n == per_set {
@@ -12164,6 +12172,12 @@ fn hash_row_artifact(path: &Path, p: u64) -> Option<u64> {
         return None;
     }
     hash_reader(f)
+}
+
+/// Snapshot-lifecycle spec §7.1 (plan ruling P6): an artifact's byte length
+/// on disk, `0` (unknown) when it cannot be read. One `stat`.
+fn file_size(path: &Path) -> u64 {
+    std::fs::metadata(path).map_or(0, |m| m.len())
 }
 
 /// Ruling R40: [`hash_row_artifact`] for a file with no envelope (the cluster
@@ -14369,6 +14383,36 @@ mod tests {
         v
     }
 
+    /// Snapshot-lifecycle spec §7.1, plan ruling P6: the completion edge
+    /// reports each artifact's FILE length — a row's envelope included, the
+    /// cluster image whole — and the collected record carries them.
+    #[test]
+    fn completion_edge_reports_carry_artifact_file_sizes() {
+        use uc_protocol::v2::upgrade::CLUSTER_ROW;
+        let mut h = harness_with_rows(&["a"]);
+        drive_to_serving_leader(&mut h);
+        let p = 6048u64;
+        let membership = h.cons.cluster_view.membership();
+        install_cluster_artifact_for_test(&mut h, p, &membership);
+        assert_eq!(h.cluster.take_snapshot().unwrap(), p);
+        write_row_artifact(&h, 0, p, &[7u8; 57]);
+        h.row_published_at(0, p, uc_service::snapshots::artifact_hash_of(&[7u8; 57]));
+        h.cons.check_set_completeness();
+        let cluster_len = std::fs::metadata(
+            h.cons
+                .cluster_snapshot_dir
+                .join(format!("snap-{p}.ultcluster")),
+        )
+        .unwrap()
+        .len();
+        assert_eq!(h.cons.pending_reports_for(0)[0].sizes[&h.cons.id], 57);
+        assert_eq!(
+            h.cons.pending_reports_for(CLUSTER_ROW)[0].sizes[&h.cons.id],
+            cluster_len
+        );
+        assert!(cluster_len > 0);
+    }
+
     /// Catalog spec §5.1: a node that completes a set reports the cluster
     /// artifact's hash as row 255 beside its rows, hashed with the SAME
     /// function the service builder uses for a row (over the payload; the
@@ -16495,13 +16539,27 @@ mod tests {
             .cluster_artifact_hash
             .hash_at(p)
             .expect("the cluster agent published its artifact's hash");
+        // Snapshot-lifecycle P6: the sizes are the FILES' lengths.
+        let row_len =
+            std::fs::metadata(h.cons.snap_root.join("0").join(format!("snap-{p}.ultsnap")))
+                .unwrap()
+                .len();
+        let cluster_len = std::fs::metadata(
+            h.cons
+                .cluster_snapshot_dir
+                .join(format!("snap-{p}.ultcluster")),
+        )
+        .unwrap()
+        .len();
+        assert!(row_len > 0 && cluster_len > 0);
         // This incarnation never ran the completion edge for P, and its
         // newest-complete-set word is still 0 (a restart recovers it from
         // the durable floor, which can sit below P): the cache is empty.
         // What a restarted node's re-offer leaves behind when it falls back
         // to the slots before its services re-attach: a THIN entry naming
         // only row 255 (proof run (e), fix round). It must not stop the probe.
-        h.cons.cache_report_set(p, &[(CLUSTER_ROW, cluster_hash)]);
+        h.cons
+            .cache_report_set(p, &[(CLUSTER_ROW, cluster_hash, 0)]);
         assert!(
             !h.cons.report_seeds.inner.lock().unwrap().known.contains(&p),
             "a thin entry is not 'known' to the probe"
@@ -16526,8 +16584,11 @@ mod tests {
             .expect("the seed reached the consensus agent's cache");
         assert_eq!(
             &seeded.reports[..seeded.n],
-            &[(0u8, row_hash), (CLUSTER_ROW, cluster_hash)],
-            "row 0: the payload hash IS the slot's artifact_hash; row 255: the published word"
+            &[
+                (0u8, row_hash, row_len),
+                (CLUSTER_ROW, cluster_hash, cluster_len)
+            ],
+            "row 0: the payload hash IS the slot's artifact_hash; row 255: the published word; sizes are the files' lengths"
         );
 
         // The slots path computes the same list, so it does not change the
@@ -16569,9 +16630,9 @@ mod tests {
         let mut set = ReportedSet {
             position: p,
             n: 1,
-            reports: [(0u8, 0u64); CNC_MAX_SERVICES + 1],
+            reports: [(0u8, 0u64, 0u64); CNC_MAX_SERVICES + 1],
         };
-        set.reports[0] = (0, 0x5EED);
+        set.reports[0] = (0, 0x5EED, 0);
         h.cons.report_seeds.inner.lock().unwrap().offered.push(set);
         h.cons
             .report_seeds
@@ -16620,7 +16681,7 @@ mod tests {
         }];
         h.cons.cluster_view.publish(&st);
         for p in [reported, complete, unheld, eligible] {
-            h.cons.cache_report_set(p, &[(0, p)]);
+            h.cons.cache_report_set(p, &[(0, p, 0)]);
         }
         h.cons.holdings_held.extend([reported, complete, eligible]);
         h.cons
@@ -16645,8 +16706,8 @@ mod tests {
     fn a_new_leader_re_offers_every_cached_held_set_to_itself() {
         let mut h = harness_with_rows(&["a"]);
         let (p1, p2) = (5000u64, 6000u64);
-        h.cons.cache_report_set(p1, &[(0, 0x01)]);
-        h.cons.cache_report_set(p2, &[(0, 0x02)]);
+        h.cons.cache_report_set(p1, &[(0, 0x01, 0)]);
+        h.cons.cache_report_set(p2, &[(0, 0x02, 0)]);
         h.cons.holdings_held.extend([p1, p2]);
         publish_commanded_catalog(&mut h, &[(p1, 1), (p2, 2)]);
         h.cons.snapshot_set_position.store(p2, Ordering::Release);
@@ -16670,7 +16731,7 @@ mod tests {
         let mut h = harness_with_rows(&["a"]);
         let n = MAX_CATALOG_SETS as u64;
         for i in 1..=n {
-            h.cons.cache_report_set(i * 100, &[(0, i), (1, i)]);
+            h.cons.cache_report_set(i * 100, &[(0, i, 0), (1, i, 0)]);
         }
         let positions = |h: &Harness| {
             h.cons
@@ -16680,13 +16741,13 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert_eq!(h.cons.reported_sets.len(), MAX_CATALOG_SETS);
-        h.cons.cache_report_set(50, &[(0, 9)]);
+        h.cons.cache_report_set(50, &[(0, 9, 0)]);
         assert_eq!(
             positions(&h).first(),
             Some(&100),
             "older than a full cache: not admitted"
         );
-        h.cons.cache_report_set((n + 1) * 100, &[(0, 9)]);
+        h.cons.cache_report_set((n + 1) * 100, &[(0, 9, 0)]);
         assert_eq!(h.cons.reported_sets.len(), MAX_CATALOG_SETS);
         assert_eq!(
             (
@@ -16696,18 +16757,18 @@ mod tests {
             (Some(200), Some((n + 1) * 100)),
             "a newer set evicts the oldest"
         );
-        h.cons.cache_report_set(200, &[(0, 0xFF)]);
+        h.cons.cache_report_set(200, &[(0, 0xFF, 0)]);
         let e = h.cons.reported_sets[0];
         assert_eq!(
             &e.reports[..e.n],
-            &[(0, 2), (1, 2)],
+            &[(0, 2, 0), (1, 2, 0)],
             "fewer rows never replace"
         );
-        h.cons.cache_report_set(200, &[(0, 0xF0), (1, 0xF1)]);
+        h.cons.cache_report_set(200, &[(0, 0xF0, 0), (1, 0xF1, 0)]);
         let e = h.cons.reported_sets[0];
         assert_eq!(
             &e.reports[..e.n],
-            &[(0, 0xF0), (1, 0xF1)],
+            &[(0, 0xF0, 0), (1, 0xF1, 0)],
             "an equally full one does"
         );
         let full: Vec<u64> = h
@@ -16776,6 +16837,23 @@ mod tests {
         );
         publish_commanded_catalog(&mut h, &[(built, 1), (fetched, 2)]);
 
+        // Snapshot-lifecycle P6: the re-offer carries the FILES' lengths.
+        let row_len = std::fs::metadata(
+            h.cons
+                .snap_root
+                .join("0")
+                .join(format!("snap-{built}.ultsnap")),
+        )
+        .unwrap()
+        .len();
+        let cluster_len = std::fs::metadata(
+            h.cons
+                .cluster_snapshot_dir
+                .join(format!("snap-{built}.ultcluster")),
+        )
+        .unwrap()
+        .len();
+        assert!(row_len > 0 && cluster_len > 0);
         let mut seeder = report_seeder_for(&h);
         seeder.seed();
         seeder.seed();
@@ -16794,7 +16872,7 @@ mod tests {
                     node_id: 1,
                     position: built,
                     hash: built_hash,
-                    size: 0,
+                    size: row_len,
                 },
                 SnapReportBody {
                     row: CLUSTER_ROW,
@@ -16802,7 +16880,7 @@ mod tests {
                     position: built,
                     // The cluster file holds the same bytes as the row payload.
                     hash: built_hash,
-                    size: 0,
+                    size: cluster_len,
                 },
             ],
             "only the set this node built is re-offered, every row of it"
@@ -16922,7 +17000,7 @@ mod tests {
             .find(|s| s.position == p)
             .unwrap();
         assert_eq!(e.n, 2, "retried on the next probe and now full");
-        assert_eq!(e.reports[0], (0, good));
+        assert_eq!(e.reports[0], (0, good, original.len() as u64));
     }
 
     /// Ruling R42, review m-D: marking a set foreign evicts any report the
@@ -16933,7 +17011,7 @@ mod tests {
         let mut h = harness_with_rows(&["a"]);
         let p = 4096u64;
         h.cons
-            .cache_report_set(p, &[(0, 0x01), (CLUSTER_ROW, 0x02)]);
+            .cache_report_set(p, &[(0, 0x01, 0), (CLUSTER_ROW, 0x02, 0)]);
         assert!(h.cons.reported_sets.iter().any(|s| s.position == p));
         h.cons.stored_set_pos.store(p, Ordering::Release);
         h.cons.check_set_completeness(); // the fetch edge
@@ -16970,7 +17048,7 @@ mod tests {
         assert_eq!(h.cons.foreign_sets, vec![p]);
         // Everything else would offer it: cached, held, Commanded, newest.
         h.cons
-            .cache_report_set(p, &[(0, 0x01), (CLUSTER_ROW, 0x02)]);
+            .cache_report_set(p, &[(0, 0x01, 0), (CLUSTER_ROW, 0x02, 0)]);
         h.cons.holdings_held.push(p);
         publish_commanded_catalog(&mut h, &[(p, 1)]);
         h.cons.snapshot_set_position.store(p, Ordering::Release);
