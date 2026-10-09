@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-use uc_client::{Client, ClientError};
+use uc_client::Client;
 use uc_net::fault::FaultConfig;
 use uc_node::{Node, NodeConfig};
 use uc_service::{ApplyCtx, ServiceBuilder, ServiceConfig, StateMachine};
