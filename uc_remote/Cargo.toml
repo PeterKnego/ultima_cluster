@@ -21,12 +21,11 @@ thiserror = { workspace = true }
 # remote client COPIES — may take a UC dependency at all.
 uc_obs = { path = "../uc_obs", version = "2.13.0" }
 
-# Read-your-writes: `ReadToken` is ONE type shared with `uc_client`, so it is
-# re-exported from the crate that owns it. (Before this, `uc_protocol` was
-# dev-only; the wire ceilings in `engine.rs` are still local copies, pinned
-# against it by a test.)
-uc_protocol = { path = "../uc_protocol", version = "2.13.0" }
-
 [dev-dependencies]
 serde = { workspace = true }
 bincode = { workspace = true }
+# DEV-only, and deliberately so: `uc_remote` must not need the node's protocol
+# crate at runtime (see `BASELINE_PAYLOAD_CEILING`). This pins its local copies
+# of the two wire ceilings, and its `ReadToken` text format, against the crate
+# that owns them.
+uc_protocol = { path = "../uc_protocol", version = "2.13.0" }

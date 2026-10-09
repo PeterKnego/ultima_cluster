@@ -17,6 +17,7 @@ pub mod conn;
 pub mod engine;
 pub mod error;
 pub mod frame;
+mod token;
 
 pub(crate) mod completion;
 pub(crate) mod link;
@@ -31,4 +32,4 @@ pub use engine::{
     RemoteResponse, RemoteSendHalf, RemoteStats, RemoteWaitHandle, SubmitError,
 };
 pub use error::{FrameError, RemoteError};
-pub use uc_protocol::v2::ipc::ReadToken;
+pub use token::ReadToken;

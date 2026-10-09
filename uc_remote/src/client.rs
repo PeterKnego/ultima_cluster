@@ -28,7 +28,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use uc_protocol::v2::ipc::ReadToken;
+use crate::token::ReadToken;
 
 use bytes::Bytes;
 

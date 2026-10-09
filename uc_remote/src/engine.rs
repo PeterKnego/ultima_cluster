@@ -57,7 +57,7 @@ use bytes::Bytes;
 use crate::completion::OutcomeTag;
 use crate::error::RemoteError;
 use crate::link::Link;
-use uc_protocol::v2::ipc::ReadToken;
+use crate::token::ReadToken;
 
 // -------------------------------------------------------------- ceilings
 
