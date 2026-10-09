@@ -45,9 +45,9 @@ use uc_protocol::ring::{
 use uc_protocol::v2::cnc::{CNC_MAX_SERVICES, NODE_FLAG_CAN_SERVE};
 use uc_protocol::v2::datagram::MAX_PAYLOAD_DEFAULT;
 use uc_protocol::v2::ipc::{
-    FLAG_V2_IS_QUERY, FLAG_V2_LINEARIZABLE, MSG_V2_BAD_SERVICE, MSG_V2_NOT_LEADER, MSG_V2_QUERY,
-    MSG_V2_RESPONSE, MSG_V2_RETRY, MSG_V2_SUBMIT, client_from_extra, extra_client,
-    write_query_payload,
+    FLAG_V2_IS_QUERY, FLAG_V2_LINEARIZABLE, FLAG_V2_MIN_POSITION, MSG_V2_BAD_SERVICE,
+    MSG_V2_NOT_LEADER, MSG_V2_QUERY, MSG_V2_RESPONSE, MSG_V2_RETRY, MSG_V2_SUBMIT, ReadToken,
+    client_from_extra, extra_client, write_min_position_query_payload, write_query_payload,
 };
 
 use crate::error::ClientError;
@@ -141,6 +141,11 @@ pub enum Consistency {
     Linearizable,
     /// Answered from the local replica without a barrier round-trip.
     Snapshot,
+    /// Read-your-writes (spec 2026-10-08): answered by ANY node once its
+    /// service has applied at least this client's token - every write this
+    /// client had acknowledged, and every state a previous read returned.
+    /// Not linearizable: another client's recent write may be missing.
+    ReadYourWrites,
 }
 
 /// Jumbo spec §8: the remedy clause the developer notification carries.
@@ -201,6 +206,10 @@ pub enum SubmitError {
     /// Refused at the door — no slot claimed, nothing written.
     #[error("service id {id} is not declared on this node (declared set 0b{declared:b})")]
     ServiceNotDeclared { id: u8, declared: u64 },
+    /// A read-your-writes read with a non-zero token on a node older than
+    /// cnc 3.5, which cannot parse the token (spec planning erratum 1).
+    #[error("this node predates read-your-writes reads (cnc page older than 3.5)")]
+    ReadYourWritesUnsupported,
 }
 
 /// Per-field completion counters, `Relaxed`-loaded into an [`EngineStats`]
@@ -220,6 +229,7 @@ struct StatCells {
     restarts: AtomicU64,
     wrong_ring: AtomicU64,
     bad_service: AtomicU64,
+    stale_answers: AtomicU64,
 }
 
 impl StatCells {
@@ -237,6 +247,7 @@ impl StatCells {
             restarts: self.restarts.load(Ordering::Relaxed),
             wrong_ring: self.wrong_ring.load(Ordering::Relaxed),
             bad_service: self.bad_service.load(Ordering::Relaxed),
+            stale_answers: self.stale_answers.load(Ordering::Relaxed),
         }
     }
 }
@@ -259,6 +270,8 @@ pub struct EngineStats {
     pub wrong_ring: u64,
     /// M14b: `MSG_V2_BAD_SERVICE` answers (the node has no ring for the id).
     pub bad_service: u64,
+    /// Read-your-writes answers below the token sent, turned into Retry by the client guard.
+    pub stale_answers: u64,
 }
 
 /// State shared between a [`SendHalf`] (cloned, one per submitter thread) and
@@ -287,6 +300,11 @@ struct Shared {
     /// bury it (and cost a `stderr` write on the submit path).
     warned_over_standard: AtomicBool,
     serving_gate: bool,
+    /// Read-your-writes (spec 3): the highest exclusive applied frontier
+    /// this client has seen. Raised with `fetch_max` only.
+    token: AtomicU64,
+    /// cnc >= 3.5: the node parses `FLAG_V2_MIN_POSITION`. Read once at attach.
+    min_position_supported: bool,
     /// M14b: bit `i` set ⇔ FSM `i` exists on the attached node. A page
     /// reading 0 (a harness node) folds to `0b1`.
     declared: u64,
@@ -487,6 +505,9 @@ impl Engine {
         // would have raised rather than panicking the attaching process.
         let meta = cnc.try_meta().ok_or(uc_log::cnc::CncError::BadHeader)?;
         let instance_id = meta.instance_id;
+        let page_version = cnc
+            .header_version()
+            .ok_or(uc_log::cnc::CncError::BadHeader)?;
         // Door: an explicit `Some` pins it; `None` follows the node's LIVE
         // ceiling word, read per submit (see `EngineConfig::max_payload`).
         // The header bound comes along as the fallback for a page with no
@@ -554,6 +575,9 @@ impl Engine {
             header_max_payload,
             warned_over_standard: AtomicBool::new(false),
             serving_gate: cfg.serving_gate,
+            token: AtomicU64::new(0),
+            min_position_supported: ((page_version >> 16) & 0xFF)
+                >= uc_protocol::v2::cnc::CNC_MIN_POSITION_MINOR,
             declared,
             names,
         });
@@ -590,18 +614,22 @@ impl SendHalf {
         expected: u8,
         fan_in: bool,
         prefix: Option<u8>,
+        min_position: u64,
     ) -> Result<(), SubmitError> {
         let s = &self.shared;
         if s.dead.load(Ordering::Acquire) {
             let (attached, current) = s.restart.lock().unwrap().unwrap_or((s.instance_id, 0));
             return Err(SubmitError::InstanceRestart { attached, current });
         }
-        if s.serving_gate && s.cnc.status().flags.load_acquire() & NODE_FLAG_CAN_SERVE == 0 {
+        let gated = kind == ReqKind::Submit || flags & FLAG_V2_LINEARIZABLE != 0;
+        if gated && s.serving_gate && s.cnc.status().flags.load_acquire() & NODE_FLAG_CAN_SERVE == 0
+        {
             return Err(SubmitError::NotServing);
         }
         // The cap describes the WIRE payload (deviation 6): a query carries
         // its one-byte service id.
-        let wire_len = bytes.len() + usize::from(prefix.is_some());
+        let wire_len =
+            bytes.len() + usize::from(prefix.is_some()) + if min_position > 0 { 8 } else { 0 };
         let max = match s.max_payload {
             Some(m) => m,
             // Jumbo spec §7.3: the node's LIVE ceiling, one Acquire load. A
@@ -639,7 +667,7 @@ impl SendHalf {
         let deadline_ns = s.t0.elapsed().as_nanos() as u64 + s.timeout_ns;
         let seq = s
             .table
-            .claim(user_data, kind, deadline_ns, expected, fan_in)
+            .claim_with_min_position(user_data, kind, deadline_ns, expected, fan_in, min_position)
             .map_err(|_| SubmitError::Backpressure)?; // WindowFull and SlotBusy alike
         let extra = extra_client(s.client_id, seq as u32);
         let write_result = match prefix {
@@ -649,8 +677,13 @@ impl SendHalf {
                 // this half's scratch (SendHalf is !Sync; the RefCell is never
                 // contended).
                 let mut scratch = self.scratch.borrow_mut();
-                write_query_payload(id, bytes, &mut scratch);
-                ring.try_write(msg_type, flags, extra, &scratch)
+                if min_position > 0 {
+                    write_min_position_query_payload(id, min_position, bytes, &mut scratch);
+                    ring.try_write(msg_type, flags | FLAG_V2_MIN_POSITION, extra, &scratch)
+                } else {
+                    write_query_payload(id, bytes, &mut scratch);
+                    ring.try_write(msg_type, flags, extra, &scratch)
+                }
             }
         };
         finish_write(&s.table, &s.stats, seq, write_result)
@@ -729,6 +762,7 @@ impl SendHalf {
             expected,
             false,
             None,
+            0,
         )
     }
 
@@ -746,6 +780,7 @@ impl SendHalf {
             expected,
             true,
             None,
+            0,
         )
     }
 
@@ -768,11 +803,39 @@ impl SendHalf {
         query_bytes: &[u8],
         c: Consistency,
     ) -> Result<(), SubmitError> {
-        let expected = self.expect_one(id)?;
-        let flags = match c {
-            Consistency::Linearizable => FLAG_V2_LINEARIZABLE,
-            Consistency::Snapshot => 0,
+        let (flags, min) = match c {
+            Consistency::Linearizable => (FLAG_V2_LINEARIZABLE, 0),
+            Consistency::Snapshot => (0, 0),
+            Consistency::ReadYourWrites => (0, self.shared.token.load(Ordering::Acquire)),
         };
+        self.query_with_min(user_data, id, query_bytes, flags, min)
+    }
+
+    /// Read-your-writes with an EXPLICIT token, independent of this
+    /// client's automatic one (spec 5.3). The gateway relays each remote
+    /// client's own token through this.
+    pub fn try_query_at_least(
+        &self,
+        user_data: u64,
+        id: u8,
+        query_bytes: &[u8],
+        token: ReadToken,
+    ) -> Result<(), SubmitError> {
+        self.query_with_min(user_data, id, query_bytes, 0, token.as_u64())
+    }
+
+    fn query_with_min(
+        &self,
+        user_data: u64,
+        id: u8,
+        query_bytes: &[u8],
+        flags: u16,
+        min: u64,
+    ) -> Result<(), SubmitError> {
+        let expected = self.expect_one(id)?;
+        if min > 0 && !self.shared.min_position_supported {
+            return Err(SubmitError::ReadYourWritesUnsupported);
+        }
         self.send(
             &self.query,
             MSG_V2_QUERY,
@@ -783,7 +846,21 @@ impl SendHalf {
             expected,
             false,
             Some(id),
+            min,
         )
+    }
+
+    /// This client's read-your-writes token: hand it to another process
+    /// (cookie, header) and pass it to that client's `observe`.
+    pub fn read_token(&self) -> ReadToken {
+        ReadToken::from_u64(self.shared.token.load(Ordering::Acquire))
+    }
+
+    /// Merge a token carried in from elsewhere. Never lowers the token.
+    pub fn observe(&self, token: ReadToken) {
+        self.shared
+            .token
+            .fetch_max(token.as_u64(), Ordering::AcqRel);
     }
 
     pub fn client_id(&self) -> u32 {
@@ -994,12 +1071,38 @@ fn handle_record(
                 ReqKind::Submit
             };
             let position = u64::from_le_bytes(buf[..8].try_into().unwrap());
+            // Read-your-writes guard: the token this query was sent with,
+            // read BEFORE `resolve` frees the slot.
+            let min_sent = if delivered == ReqKind::Query {
+                shared.table.min_position(wire_seq)
+            } else {
+                0
+            };
             match shared.table.resolve(wire_seq, Some(delivered), Some(ring)) {
                 Resolve::Won {
                     user_data,
                     fan_in: false,
                     ..
                 } => {
+                    if delivered == ReqKind::Query
+                        && position < min_sent
+                        && !crate::mutation::guard_disabled()
+                    {
+                        shared.stats.stale_answers.fetch_add(1, Ordering::Relaxed);
+                        shared.stats.retry.fetch_add(1, Ordering::Relaxed);
+                        cb(Completion {
+                            user_data,
+                            position: None,
+                            outcome: Outcome::Retry,
+                        });
+                        return 1;
+                    }
+                    let seen = if delivered == ReqKind::Query {
+                        position
+                    } else {
+                        position.saturating_add(1)
+                    };
+                    shared.token.fetch_max(seen, Ordering::AcqRel);
                     shared.stats.responses.fetch_add(1, Ordering::Relaxed);
                     cb(Completion {
                         user_data,
@@ -1021,6 +1124,9 @@ fn handle_record(
                     let f = &mut fanin[shared.table.slot_index(wire_seq)];
                     f.push_piece(first, position, ring, &buf[8..]);
                     f.parts.sort_by_key(|p| p.0);
+                    shared
+                        .token
+                        .fetch_max(f.position.saturating_add(1), Ordering::AcqRel);
                     shared.stats.responses.fetch_add(1, Ordering::Relaxed);
                     cb(Completion {
                         user_data,

@@ -55,6 +55,7 @@
 mod client;
 mod engine;
 mod error;
+mod mutation;
 mod pipelined;
 mod slots;
 mod ticket;
@@ -68,4 +69,5 @@ pub use engine::{
 pub use error::ClientError;
 pub use pipelined::{PipelinedClient, PipelinedConfig};
 pub use ticket::{FanInTicket, Ticket};
+pub use uc_protocol::v2::ipc::ReadToken;
 pub use wait::WaitStrategy;

@@ -1519,8 +1519,11 @@ fn dispatch(
                 }
                 return !conn.is_closed();
             }
-            Err(SubmitError::ServiceNotDeclared { .. }) => {
-                // Unreachable: the edge never names a service id (protocol v1
+            Err(
+                SubmitError::ServiceNotDeclared { .. } | SubmitError::ReadYourWritesUnsupported,
+            ) => {
+                // Unreachable (ReadYourWritesUnsupported: the gateway runs
+                // beside a same-version node): the edge never names a service id (protocol v1
                 // has no selector), so every request goes to FSM 0. Handled
                 // like `PayloadTooLarge` — a permanent door refusal, not a
                 // transient the client should keep re-sending.

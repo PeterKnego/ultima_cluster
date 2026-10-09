@@ -69,11 +69,12 @@ pub(crate) enum Resolve {
 struct Slot {
     owner: AtomicU64, // FREE / RESERVED / seq+1
     user_data: AtomicU64,
-    deadline_ns: AtomicU64, // nanos since the engine's t0
-    kind: AtomicU8,         // ReqKind as u8
-    expected: AtomicU8,     // ring bitmask this request awaits
-    received: AtomicU8,     // ring bitmask that has answered so far
-    fan_in: AtomicBool,     // claim-time flag: was this issued as a fan-in?
+    deadline_ns: AtomicU64,  // nanos since the engine's t0
+    kind: AtomicU8,          // ReqKind as u8
+    expected: AtomicU8,      // ring bitmask this request awaits
+    received: AtomicU8,      // ring bitmask that has answered so far
+    fan_in: AtomicBool,      // claim-time flag: was this issued as a fan-in?
+    min_position: AtomicU64, // read-your-writes: the token this query was sent with (0 = none)
 }
 
 pub(crate) struct SlotTable {
@@ -100,6 +101,7 @@ impl SlotTable {
                 expected: AtomicU8::new(0),
                 received: AtomicU8::new(0),
                 fan_in: AtomicBool::new(false),
+                min_position: AtomicU64::new(0),
             })
             .collect::<Vec<_>>()
             .into_boxed_slice();
@@ -112,6 +114,7 @@ impl SlotTable {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn claim(
         &self,
         user_data: u64,
@@ -119,6 +122,45 @@ impl SlotTable {
         deadline_ns: u64,
         expected: u8,
         fan_in: bool,
+    ) -> Result<u64, ClaimError> {
+        self.claim_inner(user_data, kind, deadline_ns, expected, fan_in, 0)
+    }
+
+    /// Read-your-writes: claim a query slot that remembers the token it was
+    /// sent with, so the answer can be checked against it (spec 5.3 guard).
+    pub(crate) fn claim_with_min_position(
+        &self,
+        user_data: u64,
+        kind: ReqKind,
+        deadline_ns: u64,
+        expected: u8,
+        fan_in: bool,
+        min_position: u64,
+    ) -> Result<u64, ClaimError> {
+        self.claim_inner(user_data, kind, deadline_ns, expected, fan_in, min_position)
+    }
+
+    /// The token the live generation at `wire_seq` was sent with; 0 for a
+    /// free, reserved or other-generation slot. Read BEFORE `resolve` frees
+    /// it; a generation that changes in between makes `resolve` return `Miss`,
+    /// so a stale value here is never acted on (invariant 4).
+    pub(crate) fn min_position(&self, wire_seq: u32) -> u64 {
+        let slot = &self.slots[(wire_seq as usize) & self.mask];
+        let owner = slot.owner.load(Ordering::Acquire);
+        if owner == FREE || owner == RESERVED || (owner - 1) as u32 != wire_seq {
+            return 0;
+        }
+        slot.min_position.load(Ordering::Relaxed)
+    }
+
+    fn claim_inner(
+        &self,
+        user_data: u64,
+        kind: ReqKind,
+        deadline_ns: u64,
+        expected: u8,
+        fan_in: bool,
+        min_position: u64,
     ) -> Result<u64, ClaimError> {
         assert!(expected != 0, "expected mask must name at least one ring");
         if self.inflight.fetch_add(1, Ordering::AcqRel) >= self.max_inflight {
@@ -144,6 +186,7 @@ impl SlotTable {
         slot.expected.store(expected, Ordering::Relaxed);
         slot.received.store(0, Ordering::Relaxed);
         slot.fan_in.store(fan_in, Ordering::Relaxed);
+        slot.min_position.store(min_position, Ordering::Relaxed);
         // Phase 3: publish.
         slot.owner.store(seq + 1, Ordering::Release);
         Ok(seq)
@@ -330,6 +373,27 @@ impl SlotTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn min_position_is_read_back_for_the_live_generation_only() {
+        let t = SlotTable::new(4, 0);
+        let seq = t
+            .claim_with_min_position(1, ReqKind::Query, u64::MAX, 1, false, 777)
+            .unwrap();
+        assert_eq!(t.min_position(seq as u32), 777);
+        assert_eq!(
+            t.min_position(seq as u32 + 1),
+            0,
+            "another generation reads 0"
+        );
+        assert!(matches!(
+            t.resolve(seq as u32, Some(ReqKind::Query), Some(0)),
+            Resolve::Won { .. }
+        ));
+        assert_eq!(t.min_position(seq as u32), 0, "a freed slot reads 0");
+        let seq2 = t.claim(1, ReqKind::Query, u64::MAX, 1, false).unwrap();
+        assert_eq!(t.min_position(seq2 as u32), 0, "plain claim stores 0");
+    }
 
     #[test]
     fn claim_resolve_roundtrip_returns_user_data_and_decrements_inflight() {

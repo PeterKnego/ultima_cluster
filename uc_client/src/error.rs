@@ -90,6 +90,10 @@ pub enum ClientError {
     /// and no in-range id is either.
     #[error("service id {id} is not declared on this node (declared set 0b{declared:b})")]
     ServiceNotDeclared { id: u8, declared: u64 },
+    /// A read-your-writes read with a non-zero token on a node older than
+    /// cnc 3.5, which cannot parse the token (spec planning erratum 1).
+    #[error("this node predates read-your-writes reads (cnc page older than 3.5)")]
+    ReadYourWritesUnsupported,
     /// The node has not joined its cluster yet: the page carries FSM names on
     /// line 7 but `services_declared` still reads 0 — a state that exists only
     /// between the node's `create_file` (at `Node::start`) and its

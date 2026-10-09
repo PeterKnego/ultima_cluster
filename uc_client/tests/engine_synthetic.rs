@@ -1031,3 +1031,166 @@ fn payload_too_large_names_the_remedy() {
         "{mapped}"
     );
 }
+
+// ---- read-your-writes (Task 5) ----
+
+use uc_client::ReadToken;
+use uc_protocol::v2::ipc::{FLAG_V2_MIN_POSITION, split_min_position_query_payload};
+
+fn read_query_record(dir: &Path) -> (u16, Vec<u8>) {
+    let (_p, mut c) = MpscRing::open(&dir.join("query.ring"))
+        .unwrap()
+        .into_split();
+    let mut buf = Vec::new();
+    let rec = c.try_read(&mut buf).unwrap().expect("a query record");
+    (rec.flags, buf)
+}
+
+#[test]
+fn a_zero_token_sends_a_plain_snapshot_record() {
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    make_instance(dir.path(), "ryw0", 1 << 20, 1 << 20);
+    let (s, _p) = Engine::attach(dir.path(), "ryw0", cfg()).unwrap();
+    s.try_query(1, b"q", Consistency::ReadYourWrites).unwrap();
+    let (flags, payload) = read_query_record(dir.path());
+    assert_eq!(flags, 0);
+    assert_eq!(payload, [0, b'q']);
+}
+
+#[test]
+fn write_and_answer_positions_raise_the_token_by_the_right_rule() {
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    make_instance(dir.path(), "ryw1", 1 << 20, 1 << 20);
+    let (s, mut p) = Engine::attach(dir.path(), "ryw1", cfg()).unwrap();
+    let mut eg = egress(dir.path());
+    s.try_submit(1, b"w").unwrap();
+    eg.write(
+        MSG_V2_RESPONSE,
+        0,
+        extra_client(s.client_id(), 0),
+        &response(4096, b"ok"),
+    )
+    .unwrap();
+    drain(&mut p);
+    assert_eq!(
+        s.read_token(),
+        ReadToken::from_u64(4097),
+        "a write's frame START + 1"
+    );
+    s.try_query(2, b"q", Consistency::Snapshot).unwrap();
+    eg.write(
+        MSG_V2_RESPONSE,
+        FLAG_V2_IS_QUERY,
+        extra_client(s.client_id(), 1),
+        &response(8000, b"v"),
+    )
+    .unwrap();
+    drain(&mut p);
+    assert_eq!(
+        s.read_token(),
+        ReadToken::from_u64(8000),
+        "an answer's frontier, as is"
+    );
+    s.observe(ReadToken::from_u64(10));
+    assert_eq!(
+        s.read_token(),
+        ReadToken::from_u64(8000),
+        "observe never lowers"
+    );
+}
+
+#[test]
+fn a_ryw_query_carries_the_token_and_an_answer_below_it_is_a_retry() {
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    make_instance(dir.path(), "ryw2", 1 << 20, 1 << 20);
+    let (s, mut p) = Engine::attach(dir.path(), "ryw2", cfg()).unwrap();
+    s.observe(ReadToken::from_u64(5000));
+    s.try_query(7, b"q", Consistency::ReadYourWrites).unwrap();
+    let (flags, payload) = read_query_record(dir.path());
+    assert_eq!(flags, FLAG_V2_MIN_POSITION);
+    assert_eq!(
+        split_min_position_query_payload(&payload),
+        Some((0, 5000, &b"q"[..]))
+    );
+    let mut eg = egress(dir.path());
+    eg.write(
+        MSG_V2_RESPONSE,
+        FLAG_V2_IS_QUERY,
+        extra_client(s.client_id(), 0),
+        &response(4999, b"stale"),
+    )
+    .unwrap();
+    let got = drain(&mut p);
+    assert_eq!(
+        got,
+        vec![(7, None, "retry".to_string())],
+        "the guard: never hand stale data up"
+    );
+    assert_eq!(p.stats().stale_answers, 1);
+    assert_eq!(
+        s.read_token(),
+        ReadToken::from_u64(5000),
+        "a rejected answer does not move the token"
+    );
+}
+
+#[test]
+fn try_query_at_least_uses_its_own_token_not_the_automatic_one() {
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    make_instance(dir.path(), "ryw3", 1 << 20, 1 << 20);
+    let (s, _p) = Engine::attach(dir.path(), "ryw3", cfg()).unwrap();
+    s.observe(ReadToken::from_u64(9000));
+    s.try_query_at_least(1, 0, b"q", ReadToken::from_u64(42))
+        .unwrap();
+    let (_, payload) = read_query_record(dir.path());
+    assert_eq!(
+        split_min_position_query_payload(&payload),
+        Some((0, 42, &b"q"[..]))
+    );
+}
+
+#[test]
+fn ryw_on_an_old_page_is_refused_by_name() {
+    use uc_protocol::v2::cnc::{CNC_OFF_HEADER_CRC, CNC_OFF_VERSION};
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    make_instance(dir.path(), "ryw4", 1 << 20, 1 << 20);
+    // Rewrite the page as cnc 3.4 (crc recomputed): a 3.5 attacher accepts it.
+    let path = dir.path().join("cnc2.dat");
+    let mut raw = std::fs::read(&path).unwrap();
+    let v34: u32 = (3 << 24) | (4 << 16);
+    raw[CNC_OFF_VERSION..CNC_OFF_VERSION + 4].copy_from_slice(&v34.to_le_bytes());
+    let crc = crc32fast::hash(&raw[..CNC_OFF_HEADER_CRC]);
+    raw[CNC_OFF_HEADER_CRC..CNC_OFF_HEADER_CRC + 4].copy_from_slice(&crc.to_le_bytes());
+    std::fs::write(&path, &raw).unwrap();
+    let (s, _p) = Engine::attach(dir.path(), "ryw4", cfg()).unwrap();
+    s.try_query(1, b"q", Consistency::ReadYourWrites)
+        .expect("token 0: a plain snapshot read");
+    s.observe(ReadToken::from_u64(1));
+    assert!(matches!(
+        s.try_query(2, b"q", Consistency::ReadYourWrites),
+        Err(SubmitError::ReadYourWritesUnsupported)
+    ));
+}
+
+#[test]
+fn the_serving_gate_lets_any_node_reads_through() {
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    make_instance(dir.path(), "ryw5", 1 << 20, 1 << 20);
+    let gated = EngineConfig {
+        serving_gate: true,
+        ..cfg()
+    };
+    let (s, _p) = Engine::attach(dir.path(), "ryw5", gated).unwrap(); // CAN_SERVE clear
+    assert!(matches!(
+        s.try_submit(1, b"w"),
+        Err(SubmitError::NotServing)
+    ));
+    assert!(matches!(
+        s.try_query(2, b"q", Consistency::Linearizable),
+        Err(SubmitError::NotServing)
+    ));
+    s.try_query(3, b"q", Consistency::Snapshot)
+        .expect("snapshot reads pass the gate");
+    s.try_query(4, b"q", Consistency::ReadYourWrites)
+        .expect("ryw reads pass the gate");
+}
