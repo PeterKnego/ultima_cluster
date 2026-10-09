@@ -1187,3 +1187,61 @@ fn an_ageing_heartbeat_alone_emits_service_detached() {
     node.stop();
     uc_node::obs::log::stderr_for_tests();
 }
+
+/// Read-your-writes (spec 2026-10-08 §4.3): a query answer's position prefix
+/// is the service's applied frontier when it answered, not 0.
+#[test]
+fn a_query_answer_carries_the_rows_applied_frontier() {
+    use uc_protocol::ring::{BroadcastRing, MpscRing};
+    use uc_protocol::v2::ipc::{
+        FLAG_V2_IS_QUERY, MSG_V2_QUERY, MSG_V2_RESPONSE, client_from_extra, extra_client,
+        write_query_payload,
+    };
+    let _g = serialize();
+    let dir = tempdir();
+    let node = Node::start(config(dir.path(), names(&["count"], None))).unwrap();
+    wait_until("serving", || node.can_serve());
+    let svc = start_service::<CountSm>(dir.path());
+    let client = Client::connect(dir.path(), APP).unwrap();
+    for _ in 0..5 {
+        let _: u64 = client.submit(&Cmd::Add(1)).unwrap();
+    }
+    let cnc = CncPage::open_file(&dir.path().join("cnc2.dat"), APP).unwrap();
+    let applied = cnc.service_slot(0).applied.load_acquire();
+    assert!(applied > 0);
+
+    let mut egress = BroadcastRing::open(&dir.path().join("egress_service.0.broadcast"))
+        .unwrap()
+        .subscribe();
+    let (producer, _c) = MpscRing::open(&dir.path().join("query.ring"))
+        .unwrap()
+        .into_split();
+    let q = bincode::serde::encode_to_vec((), bincode::config::standard()).unwrap();
+    let mut payload = Vec::new();
+    write_query_payload(0, &q, &mut payload);
+    producer
+        .try_write(MSG_V2_QUERY, 0, extra_client(0x78, 1), &payload)
+        .unwrap();
+    let mut buf = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        assert!(Instant::now() < deadline, "no answer within 10 s");
+        match egress.try_read(&mut buf) {
+            Ok(Some(rec)) if client_from_extra(rec.header_extra) == (0x78, 1) => {
+                assert_eq!(rec.msg_type, MSG_V2_RESPONSE);
+                assert_ne!(rec.flags & FLAG_V2_IS_QUERY, 0);
+                let pos = u64::from_le_bytes(buf[..8].try_into().unwrap());
+                assert_eq!(
+                    pos, applied,
+                    "no writes since: the answer reports exactly `applied`"
+                );
+                break;
+            }
+            Ok(_) => std::thread::sleep(Duration::from_millis(1)),
+            Err(e) => panic!("egress read: {e}"),
+        }
+    }
+    client.shutdown();
+    svc.stop();
+    node.stop();
+}
