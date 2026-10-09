@@ -2514,6 +2514,7 @@ impl Node {
             fetch_tx,
             stored_set_pos: Arc::clone(&stored_set_pos),
             stored_above_durable: 0,
+            stored_set_noted: 0,
             snapshot_floor_hold: 0,
             snapshot_standby_learner,
             snapshot_standby_position,
@@ -4102,6 +4103,10 @@ struct Consensus {
     /// [`Consensus::check_set_completeness`], which treats it exactly like a
     /// locally produced set.
     stored_set_pos: Arc<AtomicU64>,
+    /// Controller ruling R7: the newest `stored_set_pos` value already noted
+    /// held by [`Self::check_set_completeness`] — the fetch edge's own
+    /// high-water mark, separate from the (monotone) set position.
+    stored_set_noted: u64,
     /// The `stored_set_pos` value this node has already named as being ABOVE
     /// its durable frontier (`0` = none outstanding). A latch, so a voter that
     /// stays behind the learner it fetched from logs the condition once rather
@@ -6730,12 +6735,20 @@ impl Consensus {
         // pass once the log catches up — named ONCE, on the edge, because a
         // node that stays behind would otherwise log every pass.
         //
-        // The `durable` load sits UNDER the `stored > seen` guard: on the
+        // The `durable` load sits UNDER the `stored > stored_set_noted` guard: on the
         // steady path (no fetch outstanding, or one already adopted) this
         // whole branch is the one `Acquire` load of `stored_set_pos` and a
         // compare.
+        //
+        // Controller ruling R7: the edge is `stored` passing the last FETCHED
+        // set noted (`stored_set_noted`), not the set position. A fetched set
+        // at or below a newer set this node already holds (a voter that
+        // missed a standby N and built a full N2 > N) is still complete on
+        // disk: it is noted HELD (and foreign, ruling R42) — otherwise
+        // auto-fetch never sees N held and fetches it again. The set
+        // position itself only moves UP, as before.
         let stored = self.stored_set_pos.load(Ordering::Acquire);
-        if stored > seen {
+        if stored > self.stored_set_noted {
             let durable = self.cnc.counters().durable.load_acquire();
             if stored > durable {
                 if self.stored_above_durable != stored {
@@ -6750,10 +6763,14 @@ impl Consensus {
                 }
             } else {
                 self.stored_above_durable = 0;
-                self.snapshot_set_position.store(stored, Ordering::Release);
+                self.stored_set_noted = stored;
                 self.note_set_held(stored);
                 // Ruling R42: another node's freeze — never reported as ours.
                 self.note_foreign_set(stored);
+                if stored > seen {
+                    self.snapshot_set_position.store(stored, Ordering::Release);
+                    seen = stored;
+                }
                 crate::obs_event!(
                     Info,
                     "snapshot_set_complete",
@@ -6761,7 +6778,6 @@ impl Consensus {
                     position = stored,
                     source = "fetch"
                 );
-                seen = stored;
             }
         }
         let p = self.cluster_snapshot_pos.load(Ordering::Acquire);
@@ -10812,6 +10828,11 @@ impl Consensus {
                     .bump(crate::auto_fetch::Outcome::Timeout);
                 self.auto_fetch
                     .on_result(crate::auto_fetch::Outcome::Timeout, self.pass_now_ns);
+            } else {
+                // Controller ruling R8 (plan ruling P15): an OPERATOR fetch's
+                // expiry parks the receiver's straggler slot too — auto-fetch
+                // waits out the same 1 s floor before clearing it.
+                self.auto_fetch.note_timeout(self.pass_now_ns);
             }
             crate::obs_event!(
                 Warn,
@@ -14235,6 +14256,7 @@ mod tests {
             fetch_tx,
             stored_set_pos,
             stored_above_durable: 0,
+            stored_set_noted: 0,
             snapshot_floor_hold: 0,
             snapshot_standby_learner: Arc::new(AtomicU32::new(0)),
             snapshot_standby_position: Arc::new(AtomicU64::new(0)),
@@ -25138,6 +25160,102 @@ mod tests {
             text.matches("snapshot_fetch_single_reporter").count(),
             1,
             "named once per set: {text}"
+        );
+    }
+
+    /// Controller ruling R7: a node that already holds a NEWER complete set
+    /// N2 than the newest agreed N (a voter that missed a standby N and built
+    /// a full N2 not yet agreed) fetches N exactly once, and N ends up HELD
+    /// through the real completion path — `snapshot_set_position` stays at
+    /// N2 (monotone). Before the fix the landed fetch was never noted held,
+    /// and auto-fetch re-fetched N forever.
+    #[test]
+    fn a_fetched_set_below_a_newer_held_set_is_held_and_fetched_once() {
+        use crate::auto_fetch::Outcome;
+        let mut h = harness_with_rows(&["a"]);
+        h.cons.snapshot_set_position.store(2000, Ordering::Release);
+        let mut n = agreed_entry(1000);
+        n.kind = uc_protocol::v2::catalog::SetKind::Standby;
+        let n2 = SetEntry::commanded(2000, uc_protocol::v2::catalog::SetKind::Full, 0);
+        auto_fetch_on(&mut h, vec![n, n2]);
+        assert_eq!(
+            h.cons
+                .cluster_view
+                .catalog_agreed_position
+                .load(Ordering::Acquire),
+            1000
+        );
+        let mut t = 10_000_000_000u64;
+        let mut fetches = 0;
+        // 50 passes 500 ms apart: 25 s, well inside one fetch timeout.
+        for _ in 0..50 {
+            h.cons.pass_now_ns = t;
+            h.cons.check_set_completeness();
+            h.cons.poll_pending_fetch();
+            h.cons.maybe_auto_fetch();
+            while let Ok(f) = h.fetch_rx.try_recv() {
+                assert_eq!(f.position, 1000);
+                fetches += 1;
+                // The receiver lands it (store-only): `stored_set_pos` moves.
+                h.cons.stored_set_pos.fetch_max(1000, Ordering::AcqRel);
+            }
+            t += 500_000_000;
+        }
+        assert_eq!(fetches, 1, "N fetched exactly once");
+        assert_eq!(h.cons.auto_fetch_stats.get(Outcome::Ok), 1);
+        assert!(
+            h.cons.holdings_held.contains(&1000),
+            "the landed set is held: {:?}",
+            h.cons.holdings_held
+        );
+        assert_eq!(
+            h.cons.snapshot_set_position.load(Ordering::Acquire),
+            2000,
+            "the set position stays monotone"
+        );
+    }
+
+    /// Controller ruling R8 (plan ruling P15): an OPERATOR fetch timing out
+    /// also sets the 1 s floor — the pass that sees it expire, and the next
+    /// second, issue no auto fetch.
+    #[test]
+    fn an_operator_fetch_timeout_holds_auto_fetch_for_the_floor() {
+        use crate::auto_fetch::AUTO_FETCH_BACKOFF_MIN_NS;
+        let mut h = harness_with_rows(&["a"]);
+        let mut e = agreed_entry(1000);
+        e.kind = uc_protocol::v2::catalog::SetKind::Standby;
+        auto_fetch_on(&mut h, vec![e]);
+        // N first seen while above durable: the stagger is spent by `t`.
+        h.cons.cnc.counters().durable.store_release(500);
+        let t0 = 10_000_000_000u64;
+        h.cons.pass_now_ns = t0;
+        h.cons.maybe_auto_fetch();
+        assert_eq!(auto_fetch_attempts(&h), 0);
+        h.cons.cnc.counters().durable.store_release(5000);
+        let t = t0 + 2_000_000_000;
+        h.cons.pending_fetch = Some(PendingFetch {
+            learner: 0,
+            position: 0,
+            stored_before: 0,
+            deadline_ns: t - 1,
+            auto: false,
+        });
+        h.cons.pass_now_ns = t;
+        h.cons.poll_pending_fetch();
+        assert!(h.cons.pending_fetch.is_none(), "the operator fetch expired");
+        h.cons.maybe_auto_fetch();
+        assert_eq!(auto_fetch_attempts(&h), 0, "same pass: held by the floor");
+        h.cons.pass_now_ns = t + AUTO_FETCH_BACKOFF_MIN_NS - 1;
+        h.cons.maybe_auto_fetch();
+        assert_eq!(auto_fetch_attempts(&h), 0, "inside the floor");
+        h.cons.pass_now_ns = t + AUTO_FETCH_BACKOFF_MIN_NS;
+        h.cons.maybe_auto_fetch();
+        assert!(
+            h.cons
+                .pending_fetch
+                .is_some_and(|p| p.auto && p.position == 1000),
+            "past the floor: {:?}",
+            h.cons.pending_fetch
         );
     }
 }

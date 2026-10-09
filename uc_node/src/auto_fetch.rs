@@ -18,9 +18,7 @@ pub const AUTO_FETCH_STAGGER_NS: u64 = 250_000_000;
 pub const AUTO_FETCH_BACKOFF_MIN_NS: u64 = 1_000_000_000;
 pub const AUTO_FETCH_BACKOFF_MAX_NS: u64 = 30_000_000_000;
 /// Plan ruling P9: how often a WAITING decision (set above durable, or still
-/// being built here) is looked at again — not every pass. Also the pause
-/// after an `ok` (controller ruling PF8), so the pass that saw the fetch land
-/// does not re-fetch the set before `holdings_held` lists it.
+/// being built here) is looked at again — not every pass.
 pub const AUTO_FETCH_RECHECK_NS: u64 = 100_000_000;
 /// Controller ruling PF7: how long a set this node is still BUILDING holds
 /// the fetch, measured from the first sighting of that set. A row that never
@@ -102,6 +100,15 @@ pub struct AutoFetch {
     next_attempt_ns: u64,
     /// The current rung of the 1 s → 30 s ladder (`0` = not backing off).
     backoff_ns: u64,
+    /// Controller ruling R8 (plan ruling P15): pass-clock ns before which NO
+    /// fetch is issued — `now + 1 s` on every fetch timeout this node
+    /// observes, auto or operator. Survives a retarget: a new fetch clears
+    /// the receiver's parked expired-fetch slot, so the floor is not the
+    /// target's but the node's.
+    not_before_ns: u64,
+    /// Controller ruling R7: `target` was fetched `ok` — never re-issued for
+    /// it in this incarnation, whatever `holdings_held` says.
+    fetched_ok: bool,
     /// Candidates already tried for `target`, in order (plan ruling P10).
     tried: Vec<NodeId>,
     no_space_named: bool,
@@ -117,6 +124,8 @@ impl AutoFetch {
             first_seen_ns: 0,
             next_attempt_ns: 0,
             backoff_ns: 0,
+            not_before_ns: 0,
+            fetched_ok: false,
             tried: Vec::new(),
             no_space_named: false,
             size_unknown_named: false,
@@ -149,10 +158,12 @@ impl AutoFetch {
             self.no_space_named = false;
             self.size_unknown_named = false;
             self.thin_named = false;
-            self.next_attempt_ns =
-                now_ns.saturating_add(u64::from(self.node_id) * AUTO_FETCH_STAGGER_NS);
+            self.fetched_ok = false;
+            self.next_attempt_ns = now_ns
+                .saturating_add(u64::from(self.node_id) * AUTO_FETCH_STAGGER_NS)
+                .max(self.not_before_ns);
         }
-        if now_ns < self.next_attempt_ns {
+        if self.fetched_ok || now_ns < self.next_attempt_ns {
             return false;
         }
         let guarded =
@@ -200,19 +211,36 @@ impl AutoFetch {
         }
     }
 
-    /// Spec §6: `ok` resets the ladder and waits [`AUTO_FETCH_RECHECK_NS`]
-    /// before the next decision (controller ruling PF8); `refused`/`timeout`
-    /// back off (the next attempt picks the next untried candidate).
+    /// Spec §6: `ok` resets the ladder and ends the chase for this target —
+    /// controller ruling R7: never re-issued for the same target, so the
+    /// steady pass reads [`Self::quiet`] until a newer set is agreed (this
+    /// subsumes PF8's recheck pause for the same target). `refused` backs
+    /// off; `timeout` backs off and sets the node's floor
+    /// ([`Self::note_timeout`]). The next attempt picks the next untried
+    /// candidate.
     pub fn on_result(&mut self, o: Outcome, now_ns: u64) {
         match o {
             Outcome::Ok => {
                 self.backoff_ns = 0;
                 self.tried.clear();
-                self.next_attempt_ns = now_ns.saturating_add(AUTO_FETCH_RECHECK_NS);
+                self.fetched_ok = true;
+                self.next_attempt_ns = u64::MAX;
             }
-            Outcome::Refused | Outcome::Timeout => self.back_off(now_ns),
+            Outcome::Refused => self.back_off(now_ns),
+            Outcome::Timeout => {
+                self.back_off(now_ns);
+                self.note_timeout(now_ns);
+            }
             Outcome::NoSpace | Outcome::NoHolder => {}
         }
+    }
+
+    /// Controller ruling R8 (plan ruling P15): a fetch — auto OR operator —
+    /// timed out at `now_ns`: issue nothing for [`AUTO_FETCH_BACKOFF_MIN_NS`],
+    /// for this target and any newer one.
+    pub fn note_timeout(&mut self, now_ns: u64) {
+        self.not_before_ns = now_ns.saturating_add(AUTO_FETCH_BACKOFF_MIN_NS);
+        self.next_attempt_ns = self.next_attempt_ns.max(self.not_before_ns);
     }
 
     /// Plan ruling P12: `true` the first time per set.
@@ -385,12 +413,56 @@ mod tests {
         assert!(a.due(1000, 9000, false, 0));
         assert_eq!(a.pick(&[5], 0), Some(5));
         a.on_result(Outcome::Timeout, 0);
+        // Controller ruling R8: a retarget does not jump the 1 s floor a
+        // timeout set (plan ruling P15) — the stagger is max'd with it.
         assert!(
-            a.due(2000, 9000, false, 1),
-            "a new target is due at once (node 0)"
+            !a.due(2000, 9000, false, 1),
+            "not before the floor, even for a new target"
         );
         assert_eq!(a.target(), 2000);
-        assert_eq!(a.pick(&[5], 1), Some(5), "5 is untried for the new target");
+        assert!(a.due(2000, 9000, false, AUTO_FETCH_BACKOFF_MIN_NS));
+        assert_eq!(
+            a.pick(&[5], AUTO_FETCH_BACKOFF_MIN_NS),
+            Some(5),
+            "5 is untried for the new target"
+        );
+    }
+
+    /// Controller ruling R8 (plan ruling P15): a retarget right after a
+    /// timeout waits at least the 1 s floor, whatever the stagger says.
+    #[test]
+    fn a_retarget_right_after_a_timeout_waits_the_floor() {
+        let mut a = AutoFetch::new(0);
+        assert!(a.due(1000, 9000, false, 0));
+        assert_eq!(a.pick(&[5], 0), Some(5));
+        let t = 5_000_000_000;
+        a.on_result(Outcome::Timeout, t);
+        assert!(!a.due(2000, 9000, false, t), "same pass: held");
+        assert!(a.quiet(2000, t + AUTO_FETCH_BACKOFF_MIN_NS - 1));
+        assert!(!a.due(2000, 9000, false, t + AUTO_FETCH_BACKOFF_MIN_NS - 1));
+        assert!(a.due(2000, 9000, false, t + AUTO_FETCH_BACKOFF_MIN_NS));
+        // A stagger longer than the floor still wins.
+        let mut b = AutoFetch::new(8);
+        b.note_timeout(t);
+        assert!(!b.due(2000, 9000, false, t), "first sighting at t");
+        assert!(!b.due(2000, 9000, false, t + AUTO_FETCH_BACKOFF_MIN_NS));
+        assert!(b.due(2000, 9000, false, t + 8 * AUTO_FETCH_STAGGER_NS));
+    }
+
+    /// Controller ruling R8: ANY fetch timeout this node observes — an
+    /// operator's too — sets the floor, for the current target and the next.
+    #[test]
+    fn an_operator_timeout_sets_the_floor() {
+        let mut a = AutoFetch::new(0);
+        assert!(!a.due(1000, 999, false, 0), "seen, waiting on durable");
+        let t = 5_000_000_000;
+        a.note_timeout(t);
+        assert!(!a.due(1000, 9000, false, t), "same target: held");
+        assert!(!a.due(1000, 9000, false, t + AUTO_FETCH_BACKOFF_MIN_NS - 1));
+        assert!(a.due(1000, 9000, false, t + AUTO_FETCH_BACKOFF_MIN_NS));
+        a.note_timeout(2 * t);
+        assert!(!a.due(2000, 9000, false, 2 * t), "next target: held too");
+        assert!(a.due(2000, 9000, false, 2 * t + AUTO_FETCH_BACKOFF_MIN_NS));
     }
 
     /// Review focus 4 + spec §7.3: an unknown size (0) is fetched without the
@@ -427,41 +499,34 @@ mod tests {
         assert_eq!(a.check_space(4 * GIB, 6 * GIB, 0), SpaceCheck::Fits);
     }
 
-    /// An `ok` resets the ladder: the next refusal or timeout backs off from
-    /// the 1 s floor again, and the tried list starts over. (Controller
-    /// ruling PF8 adds the recheck delay — the brief's original form asserted
-    /// `due` at the same instant; see the next test.)
+    /// Controller ruling R7 (belt and braces; supersedes PF8's recheck for
+    /// the SAME target): an `ok` for N is never re-issued for N in this
+    /// incarnation, even if `holdings_held` never lists it. A newer target
+    /// starts fresh — tried list and ladder reset.
     #[test]
-    fn ok_resets_the_backoff() {
-        let mut a = AutoFetch::new(0);
-        assert!(a.due(1000, 9000, false, 0));
-        assert_eq!(a.pick(&[5], 0), Some(5));
-        a.on_result(Outcome::Timeout, 0);
-        a.on_result(Outcome::Ok, 0);
-        let t = AUTO_FETCH_RECHECK_NS;
-        assert!(a.due(1000, 9000, false, t), "no backoff after ok");
-        assert_eq!(a.pick(&[5], t), Some(5), "the tried list starts over");
-        a.on_result(Outcome::Timeout, t);
-        assert!(
-            a.due(1000, 9000, false, t + AUTO_FETCH_BACKOFF_MIN_NS),
-            "the ladder restarts at its 1 s floor, not 2 s"
-        );
-    }
-
-    /// Controller ruling PF8: after `ok` the next decision waits
-    /// AUTO_FETCH_RECHECK_NS — the same pass could otherwise re-fetch N
-    /// before `holdings_held` lists it.
-    #[test]
-    fn an_ok_waits_the_recheck_delay_before_the_next_decision() {
+    fn an_ok_is_never_reissued_for_the_same_target() {
         let mut a = AutoFetch::new(0);
         assert!(a.due(1000, 9000, false, 0));
         assert_eq!(a.pick(&[5], 0), Some(5));
         a.on_result(Outcome::Ok, 7);
         assert!(a.quiet(1000, 7), "the same pass decides nothing");
-        assert!(a.quiet(1000, 7 + AUTO_FETCH_RECHECK_NS - 1));
-        assert!(!a.quiet(1000, 7 + AUTO_FETCH_RECHECK_NS));
-        assert!(!a.due(1000, 9000, false, 7 + AUTO_FETCH_RECHECK_NS - 1));
-        assert!(a.due(1000, 9000, false, 7 + AUTO_FETCH_RECHECK_NS));
+        assert!(a.quiet(1000, 7 + AUTO_FETCH_RECHECK_NS));
+        assert!(a.quiet(1000, 7 + 10 * AUTO_FETCH_BACKOFF_MAX_NS));
+        assert!(
+            !a.due(1000, 9000, false, 7 + 10 * AUTO_FETCH_BACKOFF_MAX_NS),
+            "N fetched ok: never again"
+        );
+        let t = 8 + 10 * AUTO_FETCH_BACKOFF_MAX_NS;
+        assert!(
+            a.due(2000, 9000, false, t),
+            "a newer target is due (node 0)"
+        );
+        assert_eq!(a.pick(&[5], t), Some(5), "fresh tried list");
+        a.on_result(Outcome::Timeout, t);
+        assert!(
+            a.due(2000, 9000, false, t + AUTO_FETCH_BACKOFF_MIN_NS),
+            "the ladder starts at its 1 s floor"
+        );
     }
 
     #[test]
