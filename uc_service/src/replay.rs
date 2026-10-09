@@ -92,9 +92,10 @@ pub(crate) struct ReplayInstant<'a, S: RawStateMachine> {
     /// live `min(commit, durable)`, past anything the attach saw.
     pub decided_to: u64,
     /// Snapshot-lifecycle spec §5: where the row would otherwise resume — the
-    /// live follower's cursor. The start set is installed only when strictly
-    /// ahead of BOTH this and the state machine's own position, so a row that
-    /// just installed its start set at attach never installs it again here.
+    /// live follower's cursor. Replay measures from the higher of this and the
+    /// state machine's own position (ruling R5): the start set is installed
+    /// only when strictly ahead of both, and the gap guard never re-installs
+    /// an artifact the row installed at attach (start set or pinned origin).
     pub resume: u64,
 }
 
@@ -242,7 +243,29 @@ pub(crate) fn replay_into<S: RawStateMachine>(
     // "succeed" with a hole in the middle of the state (the silent-gap bug
     // class). Instead: install a covering snapshot (if the SM can), else
     // fail-stop with the contract named.
-    let mut start_pos = guard.last_applied().unwrap_or(0);
+    //
+    // Task 8 ruling R5: "needed" is the HIGHER of the state machine's own
+    // cursor and the live follower's (`instant.resume`). Every frame below
+    // the follower's cursor is already reflected in the state machine — the
+    // live loop walked it, or an install at attach (start set, pinned origin)
+    // covers it — so measuring the gap from the follower never opens a hole.
+    // Measuring it from the SM's cursor alone (which an install leaves
+    // strictly below the tag, the exclusive frontier) made the overrun right
+    // after an install at P re-install the same artifact whenever the journal
+    // began at P. What gets APPLIED is unchanged: per-frame dispatch below
+    // still keys on `guard.last_applied()`.
+    //
+    // Unforced passes only. A FORCED pass (`gap_above`, F1 below) already
+    // measures from the follower: the apply loop records the stall at the
+    // follower's own unmoved cursor (`replay_stalled = Some(cursor)`), and
+    // the raise below lifts `first` above `max(start_pos, floor)`. Leaving
+    // the forced pass on the SM's cursor keeps it exactly as it was.
+    let sm_pos = guard.last_applied().unwrap_or(0);
+    let mut start_pos = if gap_above.is_none() {
+        sm_pos.max(instant.resume)
+    } else {
+        sm_pos
+    };
     // Snapshot-lifecycle spec §5, overrun recovery: jump on the node's start
     // set before the journal scan, when it moves the row forward and the row
     // may take one (plan ruling P5 — no pin now, no newer version record).

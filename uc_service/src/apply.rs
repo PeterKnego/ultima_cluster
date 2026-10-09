@@ -2433,6 +2433,87 @@ mod tests {
         assert_eq!(sm.last, Some(pos[1399]));
     }
 
+    /// Task 8 review Important-1 / ruling R5: a row that just installed an
+    /// artifact at P (a start set at attach, or a pinned origin) resumes its
+    /// FOLLOWER at P while its own cursor stays strictly below P (the tag is
+    /// an exclusive frontier). When the first batch after that is an
+    /// `Overrun` and the journal begins AT P (a below-floor joiner), the gap
+    /// guard must measure "needed" from the follower's cursor — every frame
+    /// below it is already in the image — and NOT install the same artifact a
+    /// second time. The tail above P is still applied, once.
+    #[test]
+    fn an_overrun_right_after_an_install_at_p_does_not_reinstall_it() {
+        for pinned in [false, true] {
+            let dir = scratch();
+            let (st, pos, head) = a_lapped_row(&dir, 0x5150 + pinned as u128, false);
+            // Purge the journal's prefix so it begins at a block base P.
+            let mut archive = uc_log::archive::Archive::open(uc_log::archive::ArchiveConfig {
+                segment_size_bytes: 16 * 1024,
+                preallocate_segments: false,
+                ..uc_log::archive::ArchiveConfig::new(&st.journal_dir)
+            })
+            .unwrap();
+            let p = archive.purge_below(pos[700]).unwrap();
+            drop(archive);
+            let k = pos
+                .iter()
+                .position(|&x| x == p)
+                .expect("P is a frame start");
+            assert!(k > 0, "the purge moved the journal's floor");
+
+            let store = crate::snapshots::SnapshotStore::open(dir.path(), 0).unwrap();
+            store
+                .publish(p, 0, |w| w.write_all(b"snap").map_err(Into::into))
+                .unwrap();
+            let installs = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let counted = Arc::clone(&installs);
+            let restore = super::SnapshotRestore::<CountSm> {
+                store,
+                install: Box::new(move |sm, at, _r| {
+                    counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    sm.last = Some(at - FRAME);
+                    Ok(at)
+                }),
+            };
+            // The state right after the install at P: the SM's own cursor is
+            // the frame below P, the follower sits AT P.
+            *st.sm.lock().unwrap() = CountSm {
+                applies: 0,
+                last: Some(pos[k - 1]),
+            };
+            let mut trigger = None;
+            let out = crate::replay::replay_into(
+                &st.sm,
+                &st.cnc,
+                &st.journal_dir,
+                Some(&restore),
+                crate::replay::ReplayInstant {
+                    trigger: &mut trigger,
+                    node_flags: 0,
+                    service_id: 0,
+                    pin: pinned.then_some((p, 0, 0)),
+                    decided_to: p,
+                    resume: p,
+                },
+                None,
+            )
+            .unwrap();
+            assert_eq!(
+                installs.load(std::sync::atomic::Ordering::Relaxed),
+                0,
+                "pinned={pinned}: the artifact at P installed once (at attach), never again"
+            );
+            assert!(matches!(out, crate::replay::Replay::Rejoin(c) if c == head));
+            let sm = st.sm.lock().unwrap();
+            assert_eq!(
+                sm.applies,
+                (pos.len() - k) as u64,
+                "pinned={pinned}: exactly the frames from P up, once"
+            );
+            assert_eq!(sm.last, Some(pos[pos.len() - 1]));
+        }
+    }
+
     /// M14c2 ruling K (`docs/benchmarks/uc2-m14c-*`): `uc_service_lag_waits_total`
     /// read 0 while a BOUNDED FSM sat parked at the barrier, because the cap
     /// landed MID-FRAME. `lag::plan` only says `Wait` when the cap is at or
