@@ -363,6 +363,33 @@ pub(crate) fn attach<S: RawStateMachine>(
         );
     }
 
+    // Snapshot-lifecycle spec §5 rule 2: an UNPINNED row installs its start
+    // set when it moves the row forward. Rule 1 (the pin path) already ran
+    // above and wins; `start_set_permitted` re-states it for the reader.
+    let mut start_set_at: Option<u64> = None;
+    if let Some(install_fn) = install.as_ref()
+        && crate::start_set::start_set_permitted(
+            pin,
+            &RowRead::View {
+                pin,
+                running,
+                record_pos: attach_record_pos,
+            },
+            attach_record_pos,
+        )
+    {
+        let frontier = {
+            let c = cnc.counters();
+            c.commit.load_acquire().min(c.durable.load_acquire())
+        };
+        let store = SnapshotStore::open(dir, row)?;
+        // Read before the call: `&mut sm` is the first argument.
+        let resume = sm.last_applied().unwrap_or(0);
+        start_set_at = crate::start_set::install_start_set(
+            &mut sm, s, row, resume, frontier, &store, install_fn,
+        )?;
+    }
+
     // 2. Open the log buffer file (read-only in spirit: the service only ever
     //    uses the read APIs; a v2.x hardening may map PROT_READ). Its max_claim
     //    margin must match the node's, so take max_payload from the cnc header.
@@ -436,9 +463,12 @@ pub(crate) fn attach<S: RawStateMachine>(
     // The SM's own cursor is deliberately left where `install_snapshot` put
     // it (strictly below the origin), so the apply loop's idempotency guard
     // dispatches the frame that starts exactly AT the origin.
-    let start_pos = match pin {
-        Some((origin, _, _)) => origin,
-        None => last_applied.unwrap_or(0),
+    // After a START-SET install (snapshot lifecycle §5) the same reasoning
+    // holds: resume AT the set's position.
+    let start_pos = match (pin, start_set_at) {
+        (Some((origin, _, _)), _) => origin,
+        (None, Some(at)) => at,
+        (None, None) => last_applied.unwrap_or(0),
     };
     // …and the pinned `start_pos` gets the SAME drift bound the unpinned one
     // was just given. `last_applied` was checked above, but the pinned arm

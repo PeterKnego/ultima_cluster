@@ -763,6 +763,7 @@ pub(crate) fn apply_cycle<S: RawStateMachine>(st: &mut ApplyState<S>) -> bool {
                     service_id: st.service_id,
                     pin: st.pin,
                     decided_to: st.attach_record_pos.max(st.follower.cursor),
+                    resume: st.follower.cursor,
                 },
                 // Plan B3 final review F1: a pass that already failed to move
                 // this cursor is evidence the journal cannot serve it — feed

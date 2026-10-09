@@ -91,6 +91,11 @@ pub(crate) struct ReplayInstant<'a, S: RawStateMachine> {
     /// "replay at attach" — it is every `Overrun`, and it walks up to the
     /// live `min(commit, durable)`, past anything the attach saw.
     pub decided_to: u64,
+    /// Snapshot-lifecycle spec §5: where the row would otherwise resume — the
+    /// live follower's cursor. The start set is installed only when strictly
+    /// ahead of BOTH this and the state machine's own position, so a row that
+    /// just installed its start set at attach never installs it again here.
+    pub resume: u64,
 }
 
 /// Ruling P10, pass 1: the START position of the LAST `SNAPSHOT` frame in the
@@ -238,6 +243,36 @@ pub(crate) fn replay_into<S: RawStateMachine>(
     // class). Instead: install a covering snapshot (if the SM can), else
     // fail-stop with the contract named.
     let mut start_pos = guard.last_applied().unwrap_or(0);
+    // Snapshot-lifecycle spec §5, overrun recovery: jump on the node's start
+    // set before the journal scan, when it moves the row forward and the row
+    // may take one (plan ruling P5 — no pin now, no newer version record).
+    // Before the gap guard below, so a jump that lands at or above the
+    // journal's first retained position needs no covering install at all.
+    if let Some(r) = restore {
+        let slot = crate::attach::slot(cnc, instant.service_id);
+        if crate::start_set::start_set_permitted(
+            instant.pin,
+            &slot.status.row_view(),
+            instant.decided_to,
+        ) {
+            let frontier = {
+                let c = cnc.counters();
+                c.commit.load_acquire().min(c.durable.load_acquire())
+            };
+            if let Some(at) = crate::start_set::install_start_set(
+                &mut *guard,
+                slot,
+                instant.service_id,
+                start_pos.max(instant.resume),
+                frontier,
+                &r.store,
+                &r.install,
+            )? {
+                start_pos = at;
+                cursor = at;
+            }
+        }
+    }
     let mut first = reader
         .first_meta()
         .map_err(|e| ServiceError::Replay(e.to_string()))?
