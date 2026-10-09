@@ -19,6 +19,54 @@ snapshot-read cost, with no node↔node protocol change.
 
 ---
 
+#### Errata (planning, 2026-10-09) — read these before the body
+
+Found while writing the implementation plan
+(`docs/superpowers/plans/2026-10-09-uc2-read-your-writes.md`), each checked
+against `b7ebcc5`:
+
+1. **§4.5 is half wrong: the cnc bump refuses only one direction.**
+   `version_compatible(local, peer)` accepts `peer_minor <= local_minor`
+   (`uc_protocol/src/v2/cnc.rs:593-599`). A 3.4 client on a 3.5 page is
+   refused, but a **3.5 client on a 3.4 page attaches**, and would send a
+   prefixed record that an old node misreads as query bytes. So the client
+   gates the flag itself: it reads the page's header version at attach
+   (new `CncPage::header_version`), and on a page older than 3.5 a
+   `ReadYourWrites` read with a non-zero token is refused at the door with
+   `SubmitError::ReadYourWritesUnsupported` (→
+   `ClientError::ReadYourWritesUnsupported`). A token of 0 still goes as a
+   plain snapshot read, which every page understands. The jumbo bump (3.2)
+   handled the same direction by degrading on a missing word; here degrading
+   silently would weaken the guarantee, so it refuses by name.
+2. **The client's serving gate blocks every query on a follower, not only
+   writes.** `SendHalf::send` refuses with `NotServing` whenever
+   `serving_gate` is on and the node is not a serving leader
+   (`uc_client/src/engine.rs`), and `PipelinedConfig::default()` and
+   `Client::connect` turn it on. So today a default `Client` on a follower
+   cannot send even a snapshot read. The gate now applies to **writes and
+   linearizable reads only**; `Snapshot` and `ReadYourWrites` reads pass it.
+   This also lets snapshot reads through a default `Client` on a follower,
+   which is the behaviour the snapshot mode always described.
+3. **§7's capstone teeth are restated.** Tooth (b), "the guard disabled while
+   `applied` is rewound", cannot be induced on demand in an in-process
+   cluster. And with the client guard on, tooth (a) (the node forwards
+   without waiting) is *masked*: the guard turns the stale answer into Retry,
+   so the checker sees nothing. The teeth become: **T1** node skips the wait
+   **and** the client guard is off → the checker must report a violation;
+   **T2** node skips the wait with the guard on → the checker must pass
+   **and** the engine's stale-answer counter must be non-zero (the guard
+   caught what the node let through). The rewind case is covered by a
+   synthetic unit test that feeds the engine an answer below the token sent.
+   The client's guard switch lives behind `uc_client`'s new
+   `mutation-testing` feature, which `uc_node`'s `mutation-testing` feature
+   turns on (`uc_client` is a normal dependency of `uc_node`).
+4. **The gateway relays parked reads with no extra work.** An engine-side
+   Retry for a read-your-writes query already becomes `RETRY` with
+   `RETRY_SERVICE_UNAVAILABLE` on the remote wire
+   (`uc_gateway/src/edge.rs`, the `Outcome::Retry` arm), and a remote client
+   re-sends in place after the backoff. The remote client's own guard (§5.5)
+   uses that same in-place re-send instead of resolving the request.
+
 ## 1. Goals and non-goals
 
 **Goals**
