@@ -232,7 +232,7 @@ requires `S: SnapshotStateMachine`), so in practice this refusal only fires
 for a row attached without the current Rust SDK — a non-Rust attacher, or a
 binary built before #67.
 
-Now wait for the complete set at P **on every node**. The pin's `54 pin_no_set`
+Now wait for the complete set at P **on every node**, **and** for the catalog to agree it (`uc2_catalog_agreed_position` reaches P) — the pin refuses `61 pin_origin_not_agreed` until then. The pin's `54 pin_no_set`
 is a door check on the **leader** alone, so it does not speak for the rest of
 the cluster; the node that has to have the artifact is every node, because in
 step 6 each one installs its own copy or refuses with `PinnedArtifactMissing`:
@@ -300,6 +300,7 @@ Refused by name, with the reason code the CLI prints:
 | 56 | `pin_digest` | the staged pin file's digest is not the one the request signed: a different file was staged than was signed, or it changed in between. Re-run `upgrade pin` |
 | 57 | `pin_missing` | no staged pin file on this node. Either `upgrade pin` was run against a different instance directory, or a successful apply already consumed it |
 | 58 | `pin_decode` | the staged file is not a decodable 20-byte `UpgradePin` record |
+| 61 | `pin_origin_not_agreed` | `--origin` is complete on this node but the snapshot catalog has not agreed it yet (reports take up to ~5 s after the instant). Retry after `uc2_catalog_agreed_position` reaches P. A diverged origin never becomes agreed: take a new instant. On a cluster with no complete set yet the pin is allowed unchecked |
 
 Every outcome — accepted or refused — is recorded in `audit.jsonl` as
 `upgrade_pin`.
