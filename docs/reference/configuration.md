@@ -31,7 +31,7 @@ Field names match the `NodeConfig` fields below. Four differ in shape:
 | `[purge]` with `below_snapshot_slack_bytes` — absent means disabled | `PurgePolicy` |
 | `[crypto]` with `enabled` (required), `key_path`, `allowlist_path`, optional `rotation_interval_ns` / `rotation_bytes` | `CryptoConfig` |
 | `[services]` with `names` — **required**, no default (FSM identity, 2.11.0) | `ServicesConfig` |
-| `[settings]` with `admission_bytes`, `fsm_lag` (a string), `snapshot_interval_bytes`, `snapshot_target` — optional; the **genesis seed** for the cluster's replicated settings record (the cluster FSM, 2.11.0) | `Settings` (`NodeConfig::settings_genesis`) |
+| `[settings]` with `admission_bytes`, `fsm_lag` (a string), `snapshot_interval_bytes`, `snapshot_target`, `retain_sets`, `auto_fetch` — optional; the **genesis seed** for the cluster's replicated settings record (the cluster FSM, 2.11.0) | `Settings` (`NodeConfig::settings_genesis`) |
 
 Two keys exist only in the file and have no `NodeConfig` field:
 
@@ -134,6 +134,7 @@ record cannot see the host it lands on.
 | `snapshot_interval_bytes` | `0` → on demand only | How much log the **leader** lets accrue before it appends another `SNAPSHOT` frame. `0` means **no cadence**: instants are operator-commanded only ([`uc2ctl snapshot`](uc2ctl.md#snapshot)), which is the default and matches purge being off by default. The clock measures from the last instant this leader *commanded*, and it is re-based to the append frontier at every leader open so election churn cannot become a snapshot storm — both make the cadence err late rather than early. A leader flapping faster than the interval therefore never snapshots on its own. |
 | `snapshot_target` | `"all"` | Who freezes for a **cadence-issued** instant: `"all"` (every node's rows) or `"learners"` (only a learner's — the standby form, so no voter pays the freeze and a voter picks the set up with [`uc2ctl snapshot fetch`](uc2ctl.md#snapshot-fetch)). Any other value is refused by name. `uc2ctl snapshot --standby` overrides it per command. |
 | `retain_sets` | `1` (today's newest-only retention) | The snapshot catalog (`0.11.0`, unreleased): how many **agreed** snapshot sets the cluster keeps — the purge floor and every install source follow the newest of them, not merely the newest set that happens to be on disk. Every pinned origin is kept **in addition** — never counted toward `retain_sets` and never retired while it is a row's newest pin. `1..=48` (`uc_protocol::v2::catalog::MAX_RETAIN_SETS`, the image's 64-entry list less room for eight pins and eight in-flight instants); `0` and anything above `48` are refused at the door with `47 settings_bounds`. Raising it retires nothing until the list grows that long; lowering it retires the oldest agreed sets at the next apply, pinned origins excepted. |
+| `auto_fetch` | `true` | Every node fetches the newest **agreed** snapshot set it does not hold, in the background, so it can purge below it and restart from it (snapshot lifecycle). `false`: on a learner-only cluster (`snapshot_target = "learners"`) voters then hold no set and never purge. Seeds genesis only; change it with `uc2ctl settings apply`. |
 
 Both `0` sentinels keep their meanings under that refusal: `fsm_lag = 0`
 ("derive this node's boot value") and `"lockstep"` are not byte bounds, so

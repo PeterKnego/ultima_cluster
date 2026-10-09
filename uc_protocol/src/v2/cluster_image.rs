@@ -4,8 +4,8 @@
 //! The cluster FSM's frozen snapshot image codec (cluster-FSM spec §4.7,
 //! §4.8): magic ‖ version u32 ‖ applied u64 ‖ table_position u64 ‖
 //! settings_position u64 ‖ membership (u32 len ‖ bytes) ‖ table (u32 len ‖
-//! bytes) ‖ settings (one whole [`SETTINGS_LEN`], [`SETTINGS_LEN_V2`] or
-//! [`SETTINGS_LEN_V1`] record — the record is self-versioned and
+//! bytes) ‖ settings (one whole [`SETTINGS_LEN`], [`SETTINGS_LEN_V3`],
+//! [`SETTINGS_LEN_V2`] or [`SETTINGS_LEN_V1`] record — the record is self-versioned and
 //! exact-length per version) ‖
 //! crc32 of everything before it. That is layout v1, still ACCEPTED on
 //! read. Layout v2 (plan B1 T3) appends two more length-prefixed blobs
@@ -47,7 +47,7 @@
 //! that dispatch for no gain — the image codec's own job is only the outer
 //! framing and the CRC.
 
-use super::settings::{SETTINGS_LEN, SETTINGS_LEN_V1, SETTINGS_LEN_V2};
+use super::settings::{SETTINGS_LEN, SETTINGS_LEN_V1, SETTINGS_LEN_V2, SETTINGS_LEN_V3};
 
 pub const CLUSTER_IMAGE_MAGIC: &[u8; 8] = b"UCCLUST1";
 /// The image layout's version, refused by [`decode_cluster_image`] when
@@ -238,7 +238,8 @@ pub fn decode_cluster_image(buf: &[u8]) -> Option<ClusterImageParts<'_>> {
         let sl = match u32_at(o)? {
             1 => SETTINGS_LEN_V1,
             2 => SETTINGS_LEN_V2,
-            3 => SETTINGS_LEN,
+            3 => SETTINGS_LEN_V3,
+            4 => SETTINGS_LEN,
             _ => return None,
         };
         let rest = body.len().checked_sub(o)?;
@@ -261,7 +262,8 @@ pub fn decode_cluster_image(buf: &[u8]) -> Option<ClusterImageParts<'_>> {
         let sl = match u32_at(o)? {
             1 => SETTINGS_LEN_V1,
             2 => SETTINGS_LEN_V2,
-            3 => SETTINGS_LEN,
+            3 => SETTINGS_LEN_V3,
+            4 => SETTINGS_LEN,
             _ => return None,
         };
         let settings = o.checked_add(sl).and_then(|end| body.get(o..end))?;
@@ -436,7 +438,7 @@ mod tests {
         v
     }
 
-    /// The CURRENT (`SETTINGS_LEN` B, version 3, `retain_sets` field
+    /// The CURRENT (`SETTINGS_LEN` B, version 4, `auto_fetch` field
     /// included) settings record: `encode_settings(&Settings::
     /// genesis_default())`'s bytes — `encode_settings` always emits the
     /// latest version, so this is no longer the 33 B v2 shape the name
@@ -551,8 +553,8 @@ mod tests {
         assert_eq!(v1.len(), 29);
         assert_eq!(v2.len(), SETTINGS_LEN);
 
-        // 28/31/34 bytes: none of the three valid settings-record lengths
-        // (29, 33, 35). The CRC is correct — this is the framing check
+        // 28/31/34 bytes: none of the four valid settings-record lengths
+        // (29, 33, 35, 36). The CRC is correct — this is the framing check
         // refusing it, not corruption.
         for bad_len in [28usize, 31, 34] {
             let mut tail = v2.clone();
@@ -584,7 +586,7 @@ mod tests {
     /// `SETTINGS_LEN`-byte tail claims `version = 1` is not a v1 record
     /// padded out, it is a length the codec cannot re-encode, so it is
     /// refused rather than silently truncated to 29. (Name kept from when
-    /// `SETTINGS_LEN` was 33; it is 35 now, catalog spec §7 — the test's
+    /// `SETTINGS_LEN` was 33; it is 36 now, snapshot-lifecycle spec §6 — the test's
     /// point is unchanged.)
     #[test]
     fn a_v1_image_whose_33_byte_tail_claims_version_1_is_refused() {

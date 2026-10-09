@@ -1703,6 +1703,7 @@ pub fn uc_protocol_settings() -> Vec<Seed> {
         snapshot_target: Target::Learners,
         datagram_mtu: 8960,
         retain_sets: 0,
+        auto_fetch: true,
     });
     // The version-1 shape `2.11.0` wrote — a live corpus value, not a
     // refusal: it decodes with `datagram_mtu = 0` (jumbo spec §5.5).

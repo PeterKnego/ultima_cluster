@@ -10188,7 +10188,7 @@ impl Consensus {
                 (0, 0, position)
             }
             Err(AppendError::WouldOverrun) => (2, 0, view_position),
-            // Unreachable: `SETTINGS_LEN` is 35 bytes. Refused rather than
+            // Unreachable: `SETTINGS_LEN` is 36 bytes. Refused rather than
             // retried, for `apply_schedule_table`'s reason.
             Err(AppendError::PayloadTooLarge) => self.refuse_settings(REASON_SETTINGS_DECODE),
         }

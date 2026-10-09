@@ -893,9 +893,10 @@ impl RawStateMachine for ClusterFsm {
 /// The frozen image: magic ‖ version u32 ‖ applied u64 ‖ table_position u64
 /// ‖ settings_position u64 ‖ membership (u32 len ‖ encode_config) ‖ table
 /// (u32 len ‖ encode_schedule_table) ‖ settings (one whole record — the
-/// decoder accepts all three settings versions: v1 (`SETTINGS_LEN_V1`, 29
-/// B), v2 (`SETTINGS_LEN_V2`, 33 B) and v3 (`SETTINGS_LEN`, 35 B, the only
-/// one `freeze` writes); v1/v2 read `retain_sets = 1`, catalog ruling R24) ‖
+/// decoder accepts all four settings versions: v1 (`SETTINGS_LEN_V1`, 29
+/// B), v2 (`SETTINGS_LEN_V2`, 33 B), v3 (`SETTINGS_LEN_V3`, 35 B) and v4
+/// (`SETTINGS_LEN`, 36 B, the only one `freeze` writes); v1/v2 read
+/// `retain_sets = 1` (catalog ruling R24), v1–v3 read `auto_fetch = true`) ‖
 /// pins (u32 len ‖ `encode_pin_list`) ‖ reports (u32 len ‖
 /// `encode_report_list`) ‖ running (u32 len ‖ `encode_running_list`, #33,
 /// layout **v3**) ‖ catalog (u32 len ‖ `encode_set_list`, the snapshot
@@ -1133,6 +1134,10 @@ pub struct ClusterView {
     /// atomics, and a leader that re-proposes the committed record (the
     /// jumbo rung raise) must re-propose a `retain_sets` the door accepts.
     pub retain_sets: AtomicU16,
+    /// Snapshot-lifecycle spec §6: the committed `auto_fetch` switch — read
+    /// by the consensus agent once per pass (one load, no lock), and by
+    /// [`Self::to_state`], so a re-proposed record carries it unchanged.
+    pub auto_fetch: AtomicBool,
     /// Catalog spec §4.5: the newest AGREED set's position; `0` = nothing
     /// agreed (the cluster floor moves nothing). NOT the `Empty` test since
     /// catalog ruling R26 — that is [`Self::catalog_has_complete`].
@@ -1237,6 +1242,7 @@ impl ClusterView {
             datagram_mtu: AtomicU32::new(0),
             versioned: AtomicU8::new(0),
             retain_sets: AtomicU16::new(0),
+            auto_fetch: AtomicBool::new(true),
             catalog_agreed_position: AtomicU64::new(0),
             catalog_has_complete: AtomicBool::new(false),
             catalog_len: AtomicU64::new(0),
@@ -1287,6 +1293,8 @@ impl ClusterView {
         self.datagram_mtu
             .store(st.settings.datagram_mtu, Ordering::Release);
         self.retain_sets.store(st.retain_sets(), Ordering::Release);
+        self.auto_fetch
+            .store(st.settings.auto_fetch, Ordering::Release);
         // Catalog gauges — like everything above, BEFORE `position`.
         let stalled = st
             .catalog
@@ -1422,6 +1430,7 @@ impl ClusterView {
                 // verbatim, and deliberately: a record rebuilt from this view
                 // and re-proposed must pass the door's `1..=64` bound.
                 retain_sets: self.retain_sets.load(Ordering::Acquire),
+                auto_fetch: self.auto_fetch.load(Ordering::Acquire),
             },
             settings_position: self.settings_position.load(Ordering::Acquire),
             applied: self.position.load(Ordering::Acquire),
@@ -1947,6 +1956,7 @@ mod tests {
             snapshot_target: uc_protocol::v2::settings::Target::Learners,
             datagram_mtu: 8832,
             retain_sets: 3,
+            auto_fetch: false,
         };
         let v = ClusterView::new(&st);
         assert_eq!(v.to_state(), st);
@@ -2722,6 +2732,21 @@ mod tests {
             1,
             "a v3 image's retain_sets reads as 1"
         );
+    }
+
+    /// Snapshot-lifecycle spec §6: the view carries `auto_fetch`, and
+    /// `to_state` returns it — a leader that re-proposes the committed record
+    /// (the jumbo rung raise) must not silently turn the switch back on.
+    #[test]
+    fn the_view_publishes_auto_fetch_and_to_state_returns_it() {
+        let mut st = fsm().state().clone();
+        st.settings.auto_fetch = false;
+        let v = ClusterView::new(&st);
+        assert!(!v.auto_fetch.load(Ordering::Acquire));
+        assert!(!v.to_state().settings.auto_fetch);
+        st.settings.auto_fetch = true;
+        v.publish(&st);
+        assert!(v.to_state().settings.auto_fetch);
     }
 
     #[test]

@@ -255,6 +255,7 @@ fsm_lag                 = "16MiB"      # or "lockstep"; absent = derive (buffer_
 snapshot_interval_bytes = 0            # 0 = on demand only
 snapshot_target         = "all"        # "all" or "learners"
 retain_sets             = 3            # 0.11.0, the snapshot catalog; absent = 1 (today's newest-only)
+auto_fetch              = true         # bool; absent = true (every node fetches the newest agreed set)
 ```
 
 An unknown key is refused locally by name, before anything is staged. The same
@@ -285,11 +286,11 @@ uc2ctl settings show --instance-dir <DIR> --app-id <ID>
 ```
 
 ```
-position=8192 admission_bytes=262144 fsm_lag=16MiB snapshot_interval_bytes=0 snapshot_target=all retain_sets=1 datagram_mtu=0 (baseline)
+position=8192 admission_bytes=262144 fsm_lag=16MiB snapshot_interval_bytes=0 snapshot_target=all retain_sets=1 auto_fetch=true datagram_mtu=0 (baseline)
 ```
 
 `fsm_lag` renders as `default` (the record's `0`), `lockstep`, a whole-MiB
-count, or a raw byte count when it is neither. `retain_sets` (`0.11.0`, the
+count, or a raw byte count when it is neither. `auto_fetch` (bool, absent = `true`) is whether every node fetches the newest agreed set in the background. `retain_sets` (`0.11.0`, the
 snapshot catalog, unreleased) is how many agreed snapshot sets the cluster
 keeps; `1` is the default and matches today's newest-only retention.
 `datagram_mtu` (2.12 pending)
