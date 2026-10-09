@@ -67,7 +67,7 @@ scrape_configs:
 ```
 
 `/metrics` serves `text/plain; version=0.0.4` — standard Prometheus text
-exposition. The full series contract — 122 families — is the
+exposition. The full series contract — 125 families — is the
 `CONTRACT_SERIES` array in
 [`uc_node/src/obs/metrics.rs`](../../uc_node/src/obs/metrics.rs); a test
 pins every family in that array against what the renderer actually emits, so
@@ -431,7 +431,10 @@ replicated catalog's own view of that same set list:
 | `uc2_snapshot_instant_position` | gauge | none | the last **full** instant this node **commanded as leader**, `0` if never. Leader-local: a follower's reading is whatever it last commanded in some earlier term, so never compare it across instances. A `--standby` instant does **not** advance it — see the next row |
 | `uc2_snapshot_standby_instant_position` | gauge | none | the last **standby** instant this node's `uc2-cluster` agent *acted on*, `0` if never. **Learner-only**: a voter skips every standby frame by design, so a voter always reads `0`. This is the gauge to watch on a `snapshot.target = learners` cluster — the leader is a voter, so its own instant gauge and set position tell you nothing about whether the standby work is happening |
 | `uc2_snapshot_set_position` | gauge | none | the newest **complete set** this node holds — its purge floor once persisted. `0` until the first one. Agrees on a fully-fetched cluster; on a **learner-only** cluster voters legitimately read lower (they never fetch), so this is not the cluster-wide floor to alert on — that is `uc2_catalog_agreed_position`, below |
-| `uc2_snapshot_fetched_position` | gauge | none | the newest set this node pulled whole from a learner with `uc2ctl snapshot fetch`, `0` if it never has. The standby return path's progress reading |
+| `uc2_snapshot_fetched_position` | gauge | none | the position of the newest set this node fetched whole from another holder — a voter's automatic fetch or a manual `uc2ctl snapshot fetch` — `0` if it never has |
+| `uc2_snapshot_auto_fetch_total` | counter | `outcome` | background fetches of the newest agreed set: `ok`, `refused`, `timeout`, `no_space`, `no_holder` (snapshot lifecycle). A rising `no_space` means this node cannot hold the newest set — see `Uc2SnapshotWontFit`. Flat at 0 with `[settings] auto_fetch = false` |
+| `uc2_snapshot_newest_agreed_bytes` | gauge | none | the newest agreed set's total size; 0 when none is agreed or its size is unknown (a set catalogued before sizes) |
+| `uc2_snapshot_wont_fit` | gauge | none | `1` when the newest agreed set fails the auto-fetch space check on this node (probe free bytes < size + `max(size / 4, 1 GiB)`), else `0`; `0` while the size is unknown. Read on every node regardless of `auto_fetch`. Alert: `Uc2SnapshotWontFit` |
 | `uc2_snapshot_row_incomplete_total` | counter | `service`, `row` | instants this row **owed a freeze for** and failed to reach before the next one superseded it. The row whose counter climbs is the row stopping all purging. A superseded standby instant on a voter is not counted — that row is *supposed* not to freeze for one |
 | `uc2_snapshot_freeze_seconds_max` | gauge | `service`, `row` | the longest `freeze()` this row has reported since the instant its node's rows are working on last advanced — the full one on a voter, the standby one on a learner; reset to `0` on the scrape after that moves |
 | `uc2_snapshot_freeze_seconds_sum` | counter | `service`, `row` | cumulative `freeze()` seconds for this row |
@@ -509,6 +512,16 @@ nodes that reported it, which is a real divergence regardless of who has
 fetched what. Firing means some row's artifact hashes disagree; run
 `uc2ctl upgrade show` for the per-node hash matrix and start with the row(s)
 it names.
+
+`Uc2SnapshotWontFit` (warning, `for: 5m`): `uc2_snapshot_wont_fit > 0` — the
+newest agreed snapshot set would not fit on this node with headroom: the
+`uc2-holdings` probe's free bytes are below the set's size plus
+`max(size / 4, 1 GiB)`, the same figure and formula the auto-fetch space check
+uses. It fires on every node, learners and `auto_fetch = false` nodes
+included, BEFORE any download: auto-fetch skips the set
+(`outcome="no_space"`, and one `snapshot_fetch_skipped_no_space` log record
+per set), so the node does not purge below it. Free disk, or shrink the
+state. A set of unknown size never fires it.
 
 **Snapshot-session refusals.** Five named counters drop a session outright and
 leave the joiner NAKing rather than installing a wrong or half set —
@@ -645,6 +658,7 @@ table:
 | `Uc2SnapshotStalled` (coordinated snapshots, 2.11.0) | this node has commanded **full** snapshot instants at least twice in 30m with no complete set landing — one FSM is silently stopping all purging | warning |
 | `Uc2StandbySnapshotStalled` (coordinated snapshots, 2.11.0) | this **learner** has acted on standby snapshot instants at least twice in 30m with no complete set landing — one of its rows is silently stopping the standby set. Cannot fire on a voter (a voter exports `uc2_snapshot_standby_instant_position = 0`) | warning |
 | `Uc2SnapshotSetDiverged` (snapshot catalog) | a listed set's row hashes did not agree across the nodes that reported it (`uc2_catalog_diverged > 0`), for 60s — run `uc2ctl upgrade show` for the per-node matrix | warning |
+| `Uc2SnapshotWontFit` (snapshot lifecycle) | the newest agreed set would not fit with headroom on this node, for 5m — free disk | warning |
 | `Uc2SnapshotHashDiverged` (FSM upgrade lifecycle, 2.13.0) | a node's artifact hash for a row's newest reported instant differs from the majority's, for 60s | critical |
 | `Uc2MtuDiscoveryStalled` (jumbo frames, 2.12.0) | this node has proven a larger datagram path than the cluster has committed, for 60s — some *other* member is holding discovery back, silent or narrower. Read `uc2_probe_min_mtu_bytes` on every node | warning |
 | `Uc2PathBelowMtu` (jumbo frames, 2.12.0) | the kernel refused a non-probe datagram for size in the last 5m: a path degraded below the committed rung (or below the 1408 B baseline). The rung is monotone and cannot be lowered — fix the path | critical |
