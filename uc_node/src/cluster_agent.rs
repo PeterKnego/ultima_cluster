@@ -1213,7 +1213,7 @@ mod tests {
         encode_row_genesis(&RowGenesis { row, version }, &mut payload);
         payload
     }
-    fn report_payload(row: u8, position: u64, hashes: &[(u32, u64)]) -> Vec<u8> {
+    fn report_payload(row: u8, position: u64, hashes: &[(u32, u64, u64)]) -> Vec<u8> {
         let mut payload = Vec::new();
         encode_snapshot_report(
             &SnapshotReport {
@@ -1372,7 +1372,7 @@ mod tests {
             .append_cluster(
                 1,
                 ClusterKind::SnapshotReport,
-                &report_payload(0, 4096, &[(0, 1), (1, 1), (2, 2)]),
+                &report_payload(0, 4096, &[(0, 1, 0), (1, 1, 0), (2, 2, 0)]),
             )
             .unwrap();
         cnc.counters().durable.store_release(end);

@@ -3285,6 +3285,9 @@ struct PendingSnapshotReport {
     position: u64,
     first_seen_ns: u64,
     hashes: BTreeMap<u32, u64>,
+    /// Snapshot-lifecycle spec §7.1: each reporter's artifact size, keyed like
+    /// `hashes` (a re-sent datagram overwrites with the same value).
+    sizes: BTreeMap<u32, u64>,
     /// Ruling R38-1: the instant's own log-time stamp, from the committed
     /// catalog's entry at `position` — `None` until this node's catalog lists
     /// it. When known, the timeout runs from IT in log time, so a leader
@@ -6942,7 +6945,8 @@ impl Consensus {
                     row = row as u64,
                     position = p
                 );
-                self.on_snap_report(self.id, row, p, hash);
+                // Task 6 (snapshot lifecycle) passes the real size
+                self.on_snap_report(self.id, row, p, hash, 0);
             } else if let Some(addr) = leader_addr {
                 let mut body = [0u8; SNAP_REPORT_BODY_LEN];
                 write_snap_report_body(
@@ -6952,6 +6956,7 @@ impl Consensus {
                         node_id: self.id,
                         position: p,
                         hash,
+                        size: 0, // Task 6 (snapshot lifecycle) passes the real size
                     },
                 );
                 // Position 0 on the header: the instant this report is ABOUT
@@ -7217,7 +7222,7 @@ impl Consensus {
     ///   row forever — a permanent stall of the catalog's floor. Logged as
     ///   `snapshot_report_dropped` with `reason = "above_extent"`, at most
     ///   once per reporting node per [`ABOVE_EXTENT_LOG_INTERVAL_NS`].
-    fn on_snap_report(&mut self, from: NodeId, row: u8, position: u64, hash: u64) {
+    fn on_snap_report(&mut self, from: NodeId, row: u8, position: u64, hash: u64, size: u64) {
         if !matches!(self.sm.role(), Role::Leader) {
             return;
         }
@@ -7253,6 +7258,7 @@ impl Consensus {
         let mut at = match list.binary_search_by_key(&position, |e| e.position) {
             Ok(i) => {
                 list[i].hashes.insert(from, hash);
+                list[i].sizes.insert(from, size);
                 return;
             }
             Err(i) => i,
@@ -7280,12 +7286,15 @@ impl Consensus {
         }
         let mut hashes = BTreeMap::new();
         hashes.insert(from, hash);
+        let mut sizes = BTreeMap::new();
+        sizes.insert(from, size);
         list.insert(
             at,
             PendingSnapshotReport {
                 position,
                 first_seen_ns: now,
                 hashes,
+                sizes,
                 instant_time_ns,
                 time_looked_up_at: view_at,
             },
@@ -7457,11 +7466,11 @@ impl Consensus {
                 // The payload, filtered against the config AS IT IS NOW — see
                 // this function's doc for why collection-time membership is not
                 // enough.
-                let hashes: Vec<(u32, u64)> = pend
+                let hashes: Vec<(u32, u64, u64)> = pend
                     .hashes
                     .iter()
                     .filter(|(id, _)| self.sm.config().contains(**id))
-                    .map(|(id, h)| (*id, *h))
+                    .map(|(id, h)| (*id, *h, pend.sizes.get(id).copied().unwrap_or(0)))
                     .collect();
                 // Every reporter has since left the config: there is nothing
                 // left to attest with, and an empty record is not even
@@ -9719,8 +9728,9 @@ impl Consensus {
                 row,
                 position,
                 hash,
+                size,
             } => {
-                self.on_snap_report(from, row, position, hash);
+                self.on_snap_report(from, row, position, hash, size);
                 return;
             }
         };
@@ -15056,12 +15066,14 @@ mod tests {
                     node_id: 1,
                     position: p,
                     hash: 0xA1A1_A1A1_A1A1_A1A1,
+                    size: 0,
                 },
                 SnapReportBody {
                     row: 1,
                     node_id: 1,
                     position: p,
                     hash: 0xB2B2_B2B2_B2B2_B2B2,
+                    size: 0,
                 },
             ],
             "one report per declared row, each carrying ITS row's hash"
@@ -15133,6 +15145,7 @@ mod tests {
                 node_id: 1,
                 position: p,
                 hash: 0xFEED_FACE_FEED_FACE,
+                size: 0,
             }],
             "row 1 is part of the set but has nothing to attest"
         );
@@ -15235,6 +15248,31 @@ mod tests {
 
     // ---- plan B3 T4: the leader collects the reports and appends the record ----
 
+    /// Snapshot-lifecycle spec §7.1: the committed record carries each
+    /// reporter's size beside its hash, in node-id order.
+    #[test]
+    fn a_collected_report_record_carries_each_reporters_size() {
+        let _obs = obs_capture_lock();
+        let mut h = harness_with_rows(&["a"]);
+        drive_to_serving_leader(&mut h);
+        h.cons.pass_mono_ns = 1_000;
+        let p = 6048u64;
+        h.cons.on_snap_report(2, 0, p, 0xA1, 40);
+        h.cons.on_snap_report(0, 0, p, 0xA1, 40);
+        h.cons.on_snap_report(1, 0, p, 0xA1, 0);
+        assert!(h.cons.maybe_append_snapshot_reports());
+        let end = h.cons.last_cluster_append;
+        h.commit_through(end);
+        assert_eq!(
+            h.cons
+                .cluster_view
+                .to_state()
+                .report_for(0)
+                .map(|r| r.hashes.clone()),
+            Some(vec![(0, 0xA1, 40), (1, 0xA1, 0), (2, 0xA1, 40)])
+        );
+    }
+
     /// Spec §6.5.2 item 3 as amended by ruling R-B3-1, the base case: the
     /// leader holds what arrives per `(row, instant)` and appends ONE `CLUSTER
     /// kind = 5` record the moment EVERY VOTER has reported — three of three
@@ -15259,17 +15297,17 @@ mod tests {
 
         let cap = ObsCapture::take();
         let buf = cap.buf();
-        h.cons.on_snap_report(1, 0, p, 0xA1);
+        h.cons.on_snap_report(1, 0, p, 0xA1, 0);
         assert!(
             !h.cons.maybe_append_snapshot_reports(),
             "one voter of three is not every voter"
         );
-        h.cons.on_snap_report(0, 0, p, 0xA1);
+        h.cons.on_snap_report(0, 0, p, 0xA1, 0);
         assert!(
             !h.cons.maybe_append_snapshot_reports(),
             "two of three is a QUORUM, and a quorum is not the trigger (ruling R-B3-1)"
         );
-        h.cons.on_snap_report(2, 0, p, 0xA1);
+        h.cons.on_snap_report(2, 0, p, 0xA1, 0);
         assert!(
             h.cons.maybe_append_snapshot_reports(),
             "every voter has reported — and the leader does not wait out its timeout"
@@ -15284,7 +15322,7 @@ mod tests {
             Some(&SnapshotReport {
                 row: 0,
                 position: p,
-                hashes: vec![(0, 0xA1), (1, 0xA1), (2, 0xA1)],
+                hashes: vec![(0, 0xA1, 0), (1, 0xA1, 0), (2, 0xA1, 0)],
             }),
             "the record holds all three hashes, ordered by node id"
         );
@@ -15327,8 +15365,8 @@ mod tests {
         h.cons.pass_mono_ns = 1_000;
         let p = 6048u64;
 
-        h.cons.on_snap_report(0, 0, p, 0xC1);
-        h.cons.on_snap_report(1, 0, p, 0xC1);
+        h.cons.on_snap_report(0, 0, p, 0xC1, 0);
+        h.cons.on_snap_report(1, 0, p, 0xC1, 0);
         assert!(
             !h.cons.maybe_append_snapshot_reports(),
             "two of three voters is a quorum, and a quorum is not the trigger"
@@ -15344,7 +15382,7 @@ mod tests {
         let state = h.cons.cluster_view.to_state();
         assert_eq!(
             state.report_for(0).map(|r| r.hashes.clone()),
-            Some(vec![(0, 0xC1), (1, 0xC1)]),
+            Some(vec![(0, 0xC1, 0), (1, 0xC1, 0)]),
             "the record names who DID report"
         );
         assert_eq!(h.cons.snapshot_reports_appended.load(Ordering::Relaxed), 1);
@@ -15361,7 +15399,7 @@ mod tests {
         // ...and the straggler that arrives afterwards is DROPPED: its instant
         // is no newer than the one the committed record already holds, and
         // re-appending it would churn the log for nothing.
-        h.cons.on_snap_report(2, 0, p, 0xC1);
+        h.cons.on_snap_report(2, 0, p, 0xC1, 0);
         assert!(
             h.cons.pending_snapshot_reports.is_empty(),
             "<= the held report's position"
@@ -15380,7 +15418,7 @@ mod tests {
         h.cons.pass_mono_ns = 1_000;
         let p = 6048u64;
 
-        h.cons.on_snap_report(1, 0, p, 0xB2);
+        h.cons.on_snap_report(1, 0, p, 0xB2, 0);
         assert!(!h.cons.maybe_append_snapshot_reports(), "one of three");
         h.cons.pass_mono_ns += SNAP_REPORT_TIMEOUT_NS - 1;
         assert!(
@@ -15401,7 +15439,7 @@ mod tests {
             Some(&SnapshotReport {
                 row: 0,
                 position: p,
-                hashes: vec![(1, 0xB2)],
+                hashes: vec![(1, 0xB2, 0)],
             }),
             "one reporter is a legitimate record — `verdict` reads it as agreed over one node"
         );
@@ -15690,7 +15728,7 @@ mod tests {
     fn a_snapshot_report_from_a_non_member_is_dropped() {
         let mut h = harness_with_rows(&["a"]);
         drive_to_serving_leader(&mut h);
-        h.cons.on_snap_report(99, 0, 6048, 0xC3);
+        h.cons.on_snap_report(99, 0, 6048, 0xC3, 0);
         assert!(
             h.cons.pending_snapshot_reports.is_empty(),
             "node 99 is in no config this cluster has adopted"
@@ -15715,14 +15753,14 @@ mod tests {
         h.cons.pass_mono_ns = 1_000;
         let p = 6048u64;
 
-        h.cons.on_snap_report(3, 0, p, 0xD4);
-        h.cons.on_snap_report(1, 0, p, 0xD4);
-        h.cons.on_snap_report(0, 0, p, 0xD4);
+        h.cons.on_snap_report(3, 0, p, 0xD4, 0);
+        h.cons.on_snap_report(1, 0, p, 0xD4, 0);
+        h.cons.on_snap_report(0, 0, p, 0xD4, 0);
         assert!(
             !h.cons.maybe_append_snapshot_reports(),
             "two voters plus a learner is not every VOTER — the learner cannot stand in for voter 2"
         );
-        h.cons.on_snap_report(2, 0, p, 0xD4);
+        h.cons.on_snap_report(2, 0, p, 0xD4, 0);
         assert!(h.cons.maybe_append_snapshot_reports());
 
         let end = h.cons.last_cluster_append;
@@ -15730,7 +15768,7 @@ mod tests {
         let state = h.cons.cluster_view.to_state();
         assert_eq!(
             state.report_for(0).map(|r| r.hashes.clone()),
-            Some(vec![(0, 0xD4), (1, 0xD4), (2, 0xD4), (3, 0xD4)]),
+            Some(vec![(0, 0xD4, 0), (1, 0xD4, 0), (2, 0xD4, 0), (3, 0xD4, 0)]),
             "the learner's hash IS in the record"
         );
     }
@@ -15751,11 +15789,11 @@ mod tests {
 
         let cap = ObsCapture::take();
         let buf = cap.buf();
-        h.cons.on_snap_report(0, 0, p1, 0x11);
-        h.cons.on_snap_report(1, 0, p1, 0x11);
+        h.cons.on_snap_report(0, 0, p1, 0x11, 0);
+        h.cons.on_snap_report(1, 0, p1, 0x11, 0);
         h.cons.pass_mono_ns += 1_000;
-        h.cons.on_snap_report(0, 0, p2, 0x22);
-        h.cons.on_snap_report(1, 0, p2, 0x22);
+        h.cons.on_snap_report(0, 0, p2, 0x22, 0);
+        h.cons.on_snap_report(1, 0, p2, 0x22, 0);
 
         let pending = h.cons.pending_reports_for(0);
         assert_eq!(
@@ -15787,7 +15825,7 @@ mod tests {
             "each instant runs its own clock"
         );
 
-        h.cons.on_snap_report(2, 0, p1, 0x11);
+        h.cons.on_snap_report(2, 0, p1, 0x11, 0);
         assert!(
             h.cons.maybe_append_snapshot_reports(),
             "the laggard's report completes p1"
@@ -15808,7 +15846,7 @@ mod tests {
             Some(&SnapshotReport {
                 row: 0,
                 position: p1,
-                hashes: vec![(0, 0x11), (1, 0x11), (2, 0x11)],
+                hashes: vec![(0, 0x11, 0), (1, 0x11, 0), (2, 0x11, 0)],
             })
         );
         assert_eq!(
@@ -15822,7 +15860,7 @@ mod tests {
         );
 
         // A LATE report at or below the committed report position is dropped.
-        h.cons.on_snap_report(2, 0, p1, 0x11);
+        h.cons.on_snap_report(2, 0, p1, 0x11, 0);
         assert_eq!(h.cons.pending_reports_for(0).len(), 1);
         assert_eq!(h.cons.pending_reports_for(0)[0].position, p2);
     }
@@ -15835,7 +15873,7 @@ mod tests {
     fn a_follower_collects_nothing() {
         let mut h = harness_with_rows(&["a"]);
         assert!(!matches!(h.cons.sm.role(), Role::Leader));
-        h.cons.on_snap_report(0, 0, 6048, 0xE5);
+        h.cons.on_snap_report(0, 0, 6048, 0xE5, 0);
         assert!(h.cons.pending_snapshot_reports.is_empty());
     }
 
@@ -15847,7 +15885,7 @@ mod tests {
         for halt in [false, true] {
             let mut h = harness_with_rows(&["a"]);
             drive_to_serving_leader(&mut h);
-            h.cons.on_snap_report(0, 0, 6048, 0xF6);
+            h.cons.on_snap_report(0, 0, 6048, 0xF6, 0);
             assert!(!h.cons.pending_snapshot_reports.is_empty());
             if halt {
                 h.cons.halt();
@@ -15886,10 +15924,10 @@ mod tests {
         let buf = cap.buf();
         for i in 1..=8u64 {
             h.cons.pass_mono_ns = i * SEC;
-            h.cons.on_snap_report(0, 0, at(i), 0xA0 + i);
-            h.cons.on_snap_report(1, 0, at(i), 0xA0 + i);
+            h.cons.on_snap_report(0, 0, at(i), 0xA0 + i, 0);
+            h.cons.on_snap_report(1, 0, at(i), 0xA0 + i, 0);
             if i > 1 {
-                h.cons.on_snap_report(2, 0, at(i - 1), 0xA0 + i - 1);
+                h.cons.on_snap_report(2, 0, at(i - 1), 0xA0 + i - 1, 0);
             }
             while h.cons.maybe_append_snapshot_reports() {
                 let end = h.cons.last_cluster_append;
@@ -15917,7 +15955,7 @@ mod tests {
             Some(&SnapshotReport {
                 row: 0,
                 position: at(7),
-                hashes: vec![(0, 0xA7), (1, 0xA7), (2, 0xA7)],
+                hashes: vec![(0, 0xA7, 0), (1, 0xA7, 0), (2, 0xA7, 0)],
             }),
             "the newest committed record is instant 7, with all three hashes"
         );
@@ -15936,9 +15974,9 @@ mod tests {
         let t0 = 1_000u64;
         let (p1, p2) = (4096u64, 5120u64);
         h.cons.pass_mono_ns = t0;
-        h.cons.on_snap_report(0, 0, p1, 0x11);
+        h.cons.on_snap_report(0, 0, p1, 0x11, 0);
         h.cons.pass_mono_ns = t0 + SEC;
-        h.cons.on_snap_report(0, 0, p2, 0x22);
+        h.cons.on_snap_report(0, 0, p2, 0x22, 0);
 
         h.cons.pass_mono_ns = t0 + SNAP_REPORT_TIMEOUT_NS - 1;
         assert!(
@@ -16001,13 +16039,13 @@ mod tests {
         drive_to_serving_leader(&mut h);
         h.cons.pass_mono_ns = 1_000;
         let (p1, p2) = (4096u64, 5120u64);
-        h.cons.on_snap_report(0, 0, p1, 0x11);
-        h.cons.on_snap_report(1, 0, p1, 0x11);
+        h.cons.on_snap_report(0, 0, p1, 0x11, 0);
+        h.cons.on_snap_report(1, 0, p1, 0x11, 0);
 
         let cap = ObsCapture::take();
         let buf = cap.buf();
         for id in 0..3u32 {
-            h.cons.on_snap_report(id, 0, p2, 0x22);
+            h.cons.on_snap_report(id, 0, p2, 0x22, 0);
         }
         let text = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
         assert!(
@@ -16044,7 +16082,7 @@ mod tests {
         h.commit_through(end);
         // A late report for the dropped instant is at or below the row's
         // committed report position, so it never re-opens it.
-        h.cons.on_snap_report(2, 0, p1, 0x11);
+        h.cons.on_snap_report(2, 0, p1, 0x11, 0);
         assert!(h.cons.pending_snapshot_reports.is_empty());
     }
 
@@ -16064,7 +16102,7 @@ mod tests {
         let cap = ObsCapture::take();
         let buf = cap.buf();
         for i in 0..=n {
-            h.cons.on_snap_report(0, 0, at(i), 0x50);
+            h.cons.on_snap_report(0, 0, at(i), 0x50, 0);
         }
         let text = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
         assert_eq!(
@@ -16086,7 +16124,7 @@ mod tests {
             "ascending, oldest surviving first"
         );
         buf.lock().unwrap().clear();
-        h.cons.on_snap_report(1, 0, at(0), 0x50);
+        h.cons.on_snap_report(1, 0, at(0), 0x50, 0);
         let text = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
         assert!(
             text.contains(r#""event":"snapshot_report_superseded""#)
@@ -16094,8 +16132,8 @@ mod tests {
             "a report older than a full row's every instant is the one dropped: {text}"
         );
 
-        h.cons.on_snap_report(1, 0, at(1), 0x50);
-        h.cons.on_snap_report(2, 0, at(1), 0x50);
+        h.cons.on_snap_report(1, 0, at(1), 0x50, 0);
+        h.cons.on_snap_report(2, 0, at(1), 0x50, 0);
         assert!(
             h.cons.maybe_append_snapshot_reports(),
             "the oldest SURVIVING instant still completes"
@@ -16157,6 +16195,7 @@ mod tests {
                 node_id: 1,
                 position: p,
                 hash: 0x0D0D_0D0D_0D0D_0D0D,
+                size: 0,
             }],
             "the newest complete set is re-offered to the new leader"
         );
@@ -16271,7 +16310,7 @@ mod tests {
         let p = 4096u64;
         publish_commanded_catalog(&mut h, &[(p, now - 6 * SEC)]);
         h.cons.pass_mono_ns = 1_000;
-        h.cons.on_snap_report(0, 0, p, 0x61);
+        h.cons.on_snap_report(0, 0, p, 0x61, 0);
         let cap = ObsCapture::take();
         let buf = cap.buf();
         assert!(
@@ -16300,7 +16339,7 @@ mod tests {
         let t0 = now - SEC;
         publish_commanded_catalog(&mut h, &[(p, t0)]);
         h.cons.pass_mono_ns = 1_000;
-        h.cons.on_snap_report(0, 0, p, 0x62);
+        h.cons.on_snap_report(0, 0, p, 0x62, 0);
         assert!(
             !h.cons.maybe_append_snapshot_reports(),
             "1 s old: still collecting"
@@ -16329,7 +16368,7 @@ mod tests {
         set_log_time(&mut h, 100 * SEC);
         let p = 4096u64;
         h.cons.pass_mono_ns = 1_000;
-        h.cons.on_snap_report(0, 0, p, 0x63);
+        h.cons.on_snap_report(0, 0, p, 0x63, 0);
         h.cons.pass_now_ns += 60 * SEC;
         assert!(
             !h.cons.maybe_append_snapshot_reports(),
@@ -16372,12 +16411,14 @@ mod tests {
                     node_id: 1,
                     position: p1,
                     hash: 0x0101,
+                    size: 0,
                 },
                 SnapReportBody {
                     row: 0,
                     node_id: 1,
                     position: p2,
                     hash: 0x0202,
+                    size: 0,
                 },
             ],
             "both Commanded sets this node holds, each with ITS hash"
@@ -16399,8 +16440,8 @@ mod tests {
         let extent = h.cons.cnc.counters().append.load_acquire();
         let cap = ObsCapture::take();
         let buf = cap.buf();
-        h.cons.on_snap_report(0, 0, extent + 1, 0x71);
-        h.cons.on_snap_report(0, 0, extent + 1, 0x71);
+        h.cons.on_snap_report(0, 0, extent + 1, 0x71, 0);
+        h.cons.on_snap_report(0, 0, extent + 1, 0x71, 0);
         let text = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
         assert!(
             h.cons.pending_snapshot_reports.is_empty(),
@@ -16411,7 +16452,7 @@ mod tests {
             1,
             "named, once per reporting node per interval: {text}"
         );
-        h.cons.on_snap_report(0, 0, extent, 0x72);
+        h.cons.on_snap_report(0, 0, extent, 0x72, 0);
         assert_eq!(
             h.cons
                 .pending_reports_for(0)
@@ -16545,6 +16586,7 @@ mod tests {
                 node_id: 1,
                 position: p,
                 hash: 0x5EED,
+                size: 0,
             }],
             "the seeded set reaches the leader already offered to, once"
         );
@@ -16574,7 +16616,7 @@ mod tests {
         st.reports = vec![SnapshotReport {
             row: 0,
             position: reported,
-            hashes: vec![(0, 0xAA)],
+            hashes: vec![(0, 0xAA, 0)],
         }];
         h.cons.cluster_view.publish(&st);
         for p in [reported, complete, unheld, eligible] {
@@ -16752,6 +16794,7 @@ mod tests {
                     node_id: 1,
                     position: built,
                     hash: built_hash,
+                    size: 0,
                 },
                 SnapReportBody {
                     row: CLUSTER_ROW,
@@ -16759,6 +16802,7 @@ mod tests {
                     position: built,
                     // The cluster file holds the same bytes as the row payload.
                     hash: built_hash,
+                    size: 0,
                 },
             ],
             "only the set this node built is re-offered, every row of it"
@@ -16966,7 +17010,7 @@ mod tests {
             .expect("settings append");
         let p = 6080u64;
         for id in 0..3u32 {
-            h.cons.on_snap_report(id, 0, p, 0x77);
+            h.cons.on_snap_report(id, 0, p, 0x77, 0);
         }
 
         assert!(
@@ -17002,7 +17046,7 @@ mod tests {
         let p = 6048u64;
         for row in [1u8, 0] {
             for id in 0..3u32 {
-                h.cons.on_snap_report(id, row, p, 0x99);
+                h.cons.on_snap_report(id, row, p, 0x99, 0);
             }
         }
 
@@ -17086,7 +17130,7 @@ mod tests {
         h.cons.pass_mono_ns = 1_000;
         let p = 6048u64;
         for id in 0..=7u32 {
-            h.cons.on_snap_report(id, 0, p, 0x100 + id as u64);
+            h.cons.on_snap_report(id, 0, p, 0x100 + id as u64, 0);
         }
         assert_eq!(h.cons.pending_reports_for(0)[0].hashes.len(), 8);
 
@@ -17100,7 +17144,7 @@ mod tests {
                 addr: member_addr(8),
             },
         );
-        h.cons.on_snap_report(8, 0, p, 0x108);
+        h.cons.on_snap_report(8, 0, p, 0x108, 0);
         assert_eq!(
             h.cons.pending_reports_for(0)[0].hashes.len(),
             9,
@@ -17117,12 +17161,12 @@ mod tests {
         let rec = state.report_for(0).expect("the record went in");
         assert_eq!(rec.hashes.len(), 8, "filtered to the current membership");
         assert!(
-            !rec.hashes.iter().any(|(id, _)| *id == 3),
+            !rec.hashes.iter().any(|(id, _, _)| *id == 3),
             "an ex-member's hash is not evidence about this cluster — and `verdict` \
              has no membership filter to drop it later"
         );
         assert!(
-            rec.hashes.iter().any(|(id, _)| *id == 8),
+            rec.hashes.iter().any(|(id, _, _)| *id == 8),
             "the node added inside the window is a member and its hash counts"
         );
     }
@@ -17144,7 +17188,7 @@ mod tests {
         );
         h.cons.pass_mono_ns = 1_000;
         let p = 6048u64;
-        h.cons.on_snap_report(3, 0, p, 0x33); // the only reporter, a learner
+        h.cons.on_snap_report(3, 0, p, 0x33, 0); // the only reporter, a learner
         adopt_config_no_pass(&mut h, ConfigOp::RemoveLearner { id: 3 });
 
         assert!(
@@ -17186,7 +17230,7 @@ mod tests {
         let p = 6048u64;
         for row in [0u8, 1] {
             for id in 0..3u32 {
-                h.cons.on_snap_report(id, row, p, 0x44);
+                h.cons.on_snap_report(id, row, p, 0x44, 0);
             }
         }
 
@@ -17197,7 +17241,7 @@ mod tests {
             .append_cluster_frame(&ClusterCommand::SnapshotReport(SnapshotReport {
                 row: 0,
                 position: p,
-                hashes: vec![(2, 0x44)],
+                hashes: vec![(2, 0x44, 0)],
             }))
             .expect("the record append");
         h.commit_through(end);
@@ -17226,7 +17270,7 @@ mod tests {
         assert_eq!(state.report_for(1).map(|r| r.position), Some(p));
         assert_eq!(
             state.report_for(0).map(|r| r.hashes.clone()),
-            Some(vec![(2, 0x44)]),
+            Some(vec![(2, 0x44, 0)]),
             "row 0 still holds the record that superseded the pending set"
         );
     }
@@ -17241,7 +17285,7 @@ mod tests {
         h.cons.do_work(); // one ordinary pass: `first_seen_ns` is then a real clock reading
         let p = 6048u64;
         for id in 0..3u32 {
-            h.cons.on_snap_report(id, 0, p, 0x88);
+            h.cons.on_snap_report(id, 0, p, 0x88, 0);
         }
 
         let before = h.cons.cnc.counters().append.load_acquire();

@@ -529,7 +529,7 @@ fn three_voters_agree() {
         report
             .hashes
             .iter()
-            .map(|(id, _)| *id)
+            .map(|(id, _, _)| *id)
             .collect::<Vec<u32>>(),
         vec![0u32, 1, 2],
         "every voter is attested, by node id — the leader holds the collection until \
@@ -618,8 +618,8 @@ fn one_divergent_node_is_named() {
         report
             .hashes
             .iter()
-            .filter(|(_, h)| *h == majority)
-            .map(|(id, _)| *id)
+            .filter(|(_, h, _)| *h == majority)
+            .map(|(id, _, _)| *id)
             .collect::<Vec<u32>>(),
         vec![0u32, 1],
         "the majority hash is the one nodes 0 and 1 hold: {report:?}"
@@ -706,7 +706,7 @@ fn a_learner_reports_but_does_not_count_toward_quorum() {
     let voters: Vec<u32> = report
         .hashes
         .iter()
-        .map(|(id, _)| *id)
+        .map(|(id, _, _)| *id)
         .filter(|id| *id < 2)
         .collect();
     assert_eq!(

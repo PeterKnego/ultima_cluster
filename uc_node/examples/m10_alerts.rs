@@ -1966,7 +1966,7 @@ fn scenario_snapshot_hash_diverged() -> (SeriesFile, Disclosure) {
     st.reports.push(uc_protocol::v2::upgrade::SnapshotReport {
         row: 0,
         position: 8192,
-        hashes: vec![(0, 0xAA), (1, 0xAA), (2, 0xBB)],
+        hashes: vec![(0, 0xAA, 0), (1, 0xAA, 0), (2, 0xBB, 0)],
     });
     st.applied = 8192;
     src.cluster_view.publish(&st);

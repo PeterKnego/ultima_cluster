@@ -2592,7 +2592,7 @@ mod tests {
         st.reports.push(uc_protocol::v2::upgrade::SnapshotReport {
             row: 0,
             position: 8192,
-            hashes: vec![(0, 1), (1, 1), (2, 2)],
+            hashes: vec![(0, 1, 0), (1, 1, 0), (2, 2, 0)],
         });
         sources.cluster_view.publish(&st);
 

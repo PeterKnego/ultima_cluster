@@ -2012,7 +2012,7 @@ mod tests {
             origin,
         })
     }
-    fn report(row: u8, position: u64, hashes: &[(u32, u64)]) -> ClusterCommand {
+    fn report(row: u8, position: u64, hashes: &[(u32, u64, u64)]) -> ClusterCommand {
         ClusterCommand::SnapshotReport(SnapshotReport {
             row,
             position,
@@ -2101,22 +2101,26 @@ mod tests {
     fn a_report_is_held_newest_per_row_and_a_stale_one_is_refused() {
         let mut f = fsm();
         assert_eq!(
-            apply_at(&mut f, 100, &report(0, 50, &[(0, 1), (1, 1), (2, 2)])),
+            apply_at(
+                &mut f,
+                100,
+                &report(0, 50, &[(0, 1, 0), (1, 1, 0), (2, 2, 0)])
+            ),
             0
         );
         assert_eq!(f.state().report_for(0).map(|r| r.position), Some(50));
         assert_eq!(
-            apply_at(&mut f, 200, &report(0, 40, &[(0, 1)])),
+            apply_at(&mut f, 200, &report(0, 40, &[(0, 1, 0)])),
             59,
             "below the held position"
         );
         assert_eq!(
-            apply_at(&mut f, 300, &report(0, 50, &[(0, 1), (1, 1)])),
+            apply_at(&mut f, 300, &report(0, 50, &[(0, 1, 0), (1, 1, 0)])),
             0,
             "equal replaces (a fuller vector for the same instant)"
         );
         assert_eq!(f.state().report_for(0).map(|r| r.hashes.len()), Some(2));
-        assert_eq!(apply_at(&mut f, 400, &report(3, 10, &[(0, 9)])), 0);
+        assert_eq!(apply_at(&mut f, 400, &report(3, 10, &[(0, 9, 0)])), 0);
         assert_eq!(f.state().reports.len(), 2, "one entry per row");
         assert_eq!(
             verdict(f.state().report_for(0).unwrap()),
@@ -2132,7 +2136,11 @@ mod tests {
     fn pins_and_reports_ride_the_image_and_an_old_image_installs_empty() {
         let mut f = fsm();
         apply_at(&mut f, 100, &pin(0, 1, 2, 50));
-        apply_at(&mut f, 200, &report(0, 50, &[(0, 1), (1, 2), (2, 2)]));
+        apply_at(
+            &mut f,
+            200,
+            &report(0, 50, &[(0, 1, 0), (1, 2, 0), (2, 2, 0)]),
+        );
         let (img, pos) = f.freeze().unwrap();
         assert_eq!(pos, 200);
         let mut g = ClusterFsm::new(genesis(), vec![]);
@@ -2403,7 +2411,7 @@ mod tests {
     fn the_view_publishes_pins_and_reports() {
         let mut f = fsm();
         apply_at(&mut f, 100, &pin(0, 1, 2, 50));
-        apply_at(&mut f, 200, &report(0, 50, &[(0, 1)]));
+        apply_at(&mut f, 200, &report(0, 50, &[(0, 1, 0)]));
         let v = ClusterView::new(&genesis());
         v.publish(f.state());
         let st = v.to_state();
@@ -2432,8 +2440,11 @@ mod tests {
     /// One agreed set at `p`: the SNAPSHOT frame, then row 0 and the cluster row report one hash each.
     fn agreed_set(f: &mut ClusterFsm, p: u64, at: u64) {
         f.on_snapshot_frame(p, false, p);
-        assert_eq!(apply_at(f, at, &report(0, p, &[(0, 1)])), 0);
-        assert_eq!(apply_at(f, at + 10, &report(CLUSTER_ROW, p, &[(0, 1)])), 0);
+        assert_eq!(apply_at(f, at, &report(0, p, &[(0, 1, 0)])), 0);
+        assert_eq!(
+            apply_at(f, at + 10, &report(CLUSTER_ROW, p, &[(0, 1, 0)])),
+            0
+        );
     }
     fn positions(f: &ClusterFsm) -> Vec<u64> {
         f.state().catalog.iter().map(|e| e.position).collect()
@@ -2470,7 +2481,7 @@ mod tests {
         genesis_row(&mut f, 0, 100);
         f.on_snapshot_frame(4096, false, 1);
         assert_eq!(
-            apply_at(&mut f, 4200, &report(0, 4096, &[(0, 7), (1, 7)])),
+            apply_at(&mut f, 4200, &report(0, 4096, &[(0, 7, 0), (1, 7, 0)])),
             0
         );
         assert_eq!(
@@ -2479,7 +2490,11 @@ mod tests {
             "cluster row still unreported"
         );
         assert_eq!(
-            apply_at(&mut f, 4300, &report(CLUSTER_ROW, 4096, &[(0, 9), (1, 9)])),
+            apply_at(
+                &mut f,
+                4300,
+                &report(CLUSTER_ROW, 4096, &[(0, 9, 0), (1, 9, 0)])
+            ),
             0
         );
         let e = &f.state().catalog[0];
@@ -2503,14 +2518,18 @@ mod tests {
         genesis_row(&mut f, 0, 100);
         f.on_snapshot_frame(4096, false, 1);
         assert_eq!(
-            apply_at(&mut f, 4200, &report(0, 4096, &[(0, 7), (1, 8), (2, 7)])),
+            apply_at(
+                &mut f,
+                4200,
+                &report(0, 4096, &[(0, 7, 0), (1, 8, 0), (2, 7, 0)])
+            ),
             0
         );
         assert_eq!(
             apply_at(
                 &mut f,
                 4300,
-                &report(CLUSTER_ROW, 4096, &[(0, 9), (1, 9), (2, 9)])
+                &report(CLUSTER_ROW, 4096, &[(0, 9, 0), (1, 9, 0), (2, 9, 0)])
             ),
             0
         );
@@ -2534,10 +2553,10 @@ mod tests {
         let mut f = fsm();
         genesis_row(&mut f, 0, 100);
         f.on_snapshot_frame(4096, false, 1);
-        assert_eq!(apply_at(&mut f, 4200, &report(0, 4096, &[(0, 7)])), 0);
-        assert_eq!(apply_at(&mut f, 4250, &report(5, 4096, &[(0, 7)])), 0); // row 5 never declared
+        assert_eq!(apply_at(&mut f, 4200, &report(0, 4096, &[(0, 7, 0)])), 0);
+        assert_eq!(apply_at(&mut f, 4250, &report(5, 4096, &[(0, 7, 0)])), 0); // row 5 never declared
         assert_eq!(
-            apply_at(&mut f, 4300, &report(CLUSTER_ROW, 4096, &[(0, 9)])),
+            apply_at(&mut f, 4300, &report(CLUSTER_ROW, 4096, &[(0, 9, 0)])),
             0
         );
         let e = &f.state().catalog[0];
@@ -2665,8 +2684,11 @@ mod tests {
         for f in [&mut a, &mut b] {
             genesis_row(f, 0, 100);
             f.on_snapshot_frame(1000, true, 5);
-            assert_eq!(apply_at(f, 1100, &report(0, 1000, &[(2, 1)])), 0);
-            assert_eq!(apply_at(f, 1110, &report(CLUSTER_ROW, 1000, &[(2, 1)])), 0);
+            assert_eq!(apply_at(f, 1100, &report(0, 1000, &[(2, 1, 0)])), 0);
+            assert_eq!(
+                apply_at(f, 1110, &report(CLUSTER_ROW, 1000, &[(2, 1, 0)])),
+                0
+            );
             f.set_consumed(1200);
         }
         let (ia, _) = a.freeze().unwrap();
@@ -2715,7 +2737,7 @@ mod tests {
         f.on_snapshot_frame(1500, false, 2); // stalled
         f.on_snapshot_frame(2000, false, 3);
         assert_eq!(
-            apply_at(&mut f, 2100, &report(0, 2000, &[(0, 1), (1, 2)])),
+            apply_at(&mut f, 2100, &report(0, 2000, &[(0, 1, 0), (1, 2, 0)])),
             0
         ); // NoMajority
         v.publish(f.state());
@@ -2739,9 +2761,9 @@ mod tests {
             to: pack_version(1, 1, 0),
         };
         assert_eq!(apply_at(&mut f, 4200, &ClusterCommand::UpgradePin(up)), 0);
-        assert_eq!(apply_at(&mut f, 4300, &report(0, 4096, &[(0, 7)])), 0);
+        assert_eq!(apply_at(&mut f, 4300, &report(0, 4096, &[(0, 7, 0)])), 0);
         assert_eq!(
-            apply_at(&mut f, 4400, &report(CLUSTER_ROW, 4096, &[(0, 9)])),
+            apply_at(&mut f, 4400, &report(CLUSTER_ROW, 4096, &[(0, 9, 0)])),
             0
         );
         let e = f
@@ -2753,9 +2775,9 @@ mod tests {
         assert_eq!(e.rows[0].version, pack_version(1, 0, 0), "from built it");
         // A later set, reported after the pin, was built by `to`.
         f.on_snapshot_frame(8192, false, 2);
-        assert_eq!(apply_at(&mut f, 8300, &report(0, 8192, &[(0, 8)])), 0);
+        assert_eq!(apply_at(&mut f, 8300, &report(0, 8192, &[(0, 8, 0)])), 0);
         assert_eq!(
-            apply_at(&mut f, 8400, &report(CLUSTER_ROW, 8192, &[(0, 9)])),
+            apply_at(&mut f, 8400, &report(CLUSTER_ROW, 8192, &[(0, 9, 0)])),
             0
         );
         let e = f
@@ -2896,9 +2918,9 @@ mod tests {
         assert_eq!(f.state().newest_agreed_at_most(u64::MAX), Some(2000));
         // A set at 3000 must now cover rows 0 AND 1.
         f.on_snapshot_frame(3000, false, 3);
-        assert_eq!(apply_at(&mut f, 3100, &report(0, 3000, &[(0, 1)])), 0);
+        assert_eq!(apply_at(&mut f, 3100, &report(0, 3000, &[(0, 1, 0)])), 0);
         assert_eq!(
-            apply_at(&mut f, 3110, &report(CLUSTER_ROW, 3000, &[(0, 1)])),
+            apply_at(&mut f, 3110, &report(CLUSTER_ROW, 3000, &[(0, 1, 0)])),
             0
         );
         assert_eq!(
@@ -2906,7 +2928,7 @@ mod tests {
             SetState::Commanded,
             "row 1 unreported"
         );
-        assert_eq!(apply_at(&mut f, 3120, &report(1, 3000, &[(0, 1)])), 0);
+        assert_eq!(apply_at(&mut f, 3120, &report(1, 3000, &[(0, 1, 0)])), 0);
         assert_eq!(f.state().newest_agreed_at_most(u64::MAX), Some(3000));
         let cmd = settings_with_retain(&f, 1);
         assert_eq!(apply_at(&mut f, 3200, &cmd), 0);
@@ -2948,9 +2970,9 @@ mod tests {
         genesis_row(&mut f, 0, 100);
         f.on_snapshot_frame(4096, false, 1);
         let before = f.state().catalog.clone();
-        assert_eq!(apply_at(&mut f, 4200, &report(0, 5000, &[(0, 7)])), 0);
+        assert_eq!(apply_at(&mut f, 4200, &report(0, 5000, &[(0, 7, 0)])), 0);
         assert_eq!(
-            apply_at(&mut f, 4300, &report(CLUSTER_ROW, 5000, &[(0, 7)])),
+            apply_at(&mut f, 4300, &report(CLUSTER_ROW, 5000, &[(0, 7, 0)])),
             0
         );
         assert_eq!(f.state().catalog, before);
@@ -2963,7 +2985,7 @@ mod tests {
         let mut f = fsm();
         f.on_snapshot_frame(4096, false, 1);
         assert_eq!(
-            apply_at(&mut f, 4200, &report(CLUSTER_ROW, 4096, &[(0, 9)])),
+            apply_at(&mut f, 4200, &report(CLUSTER_ROW, 4096, &[(0, 9, 0)])),
             0
         );
         assert!(f.state().reports.is_empty());
@@ -2977,11 +2999,15 @@ mod tests {
         genesis_row(&mut f, 0, 100);
         f.on_snapshot_frame(4096, true, 1);
         assert_eq!(
-            apply_at(&mut f, 4200, &report(0, 4096, &[(3, 7), (4, 7)])),
+            apply_at(&mut f, 4200, &report(0, 4096, &[(3, 7, 0), (4, 7, 0)])),
             0
         );
         assert_eq!(
-            apply_at(&mut f, 4300, &report(CLUSTER_ROW, 4096, &[(3, 9), (4, 9)])),
+            apply_at(
+                &mut f,
+                4300,
+                &report(CLUSTER_ROW, 4096, &[(3, 9, 0), (4, 9, 0)])
+            ),
             0
         );
         let e = &f.state().catalog[0];
@@ -3111,10 +3137,17 @@ mod tests {
             // Complete, not agreed — the stale entries must still go.
             f.on_snapshot_frame(1000, false, 3);
             assert_eq!(
-                apply_at(f, 1100, &report(0, 1000, &[(0, 1), (1, 2), (2, 3)])),
+                apply_at(
+                    f,
+                    1100,
+                    &report(0, 1000, &[(0, 1, 0), (1, 2, 0), (2, 3, 0)])
+                ),
                 0
             );
-            assert_eq!(apply_at(f, 1110, &report(CLUSTER_ROW, 1000, &[(0, 1)])), 0);
+            assert_eq!(
+                apply_at(f, 1110, &report(CLUSTER_ROW, 1000, &[(0, 1, 0)])),
+                0
+            );
             f.set_consumed(1200);
         }
         assert_eq!(a.state().catalog[0..].len(), 1);
@@ -3139,11 +3172,15 @@ mod tests {
         f.on_snapshot_frame(700, false, 2);
         f.on_snapshot_frame(1000, false, 3);
         assert_eq!(
-            apply_at(&mut f, 1100, &report(0, 1000, &[(0, 1), (1, 2), (2, 3)])),
+            apply_at(
+                &mut f,
+                1100,
+                &report(0, 1000, &[(0, 1, 0), (1, 2, 0), (2, 3, 0)])
+            ),
             0
         );
         assert_eq!(
-            apply_at(&mut f, 1110, &report(CLUSTER_ROW, 1000, &[(0, 1)])),
+            apply_at(&mut f, 1110, &report(CLUSTER_ROW, 1000, &[(0, 1, 0)])),
             0
         );
         assert_eq!(

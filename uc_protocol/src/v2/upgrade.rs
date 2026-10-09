@@ -73,11 +73,15 @@ pub const fn is_report_row(row: u8) -> bool {
 
 /// `row u8 @0 ‖ count u8 @1 ‖ reserved [u8; 6] @2 ‖ position u64 @8`.
 pub const SNAPSHOT_REPORT_HEADER_LEN: usize = 16;
-/// `node_id u32 ‖ hash u64`.
-pub const SNAPSHOT_REPORT_ENTRY_LEN: usize = 12;
+/// `node_id u32 ‖ hash u64 ‖ size u64` (snapshot-lifecycle spec §7.1).
+pub const SNAPSHOT_REPORT_ENTRY_LEN: usize = 20;
+/// The entry before sizes existed, `node_id u32 ‖ hash u64`. Read ONLY out
+/// of a v1–v4 cluster image's report blob (`decode_report_list_unsized`),
+/// with every size `0` (unknown). Never on a `CLUSTER` frame.
+pub const SNAPSHOT_REPORT_ENTRY_LEN_UNSIZED: usize = 12;
 /// One entry per member at most — the leader collects one hash per node.
 pub const MAX_SNAPSHOT_REPORT_NODES: usize = MAX_MEMBERS;
-/// 16 + 8 × 12: inside the 1312 B crypto-on ceiling at the baseline rung.
+/// 16 + 8 × 20 = 176: inside the 1312 B crypto-on ceiling at the baseline rung.
 pub const SNAPSHOT_REPORT_MAX_LEN: usize =
     SNAPSHOT_REPORT_HEADER_LEN + MAX_SNAPSHOT_REPORT_NODES * SNAPSHOT_REPORT_ENTRY_LEN;
 
@@ -89,12 +93,14 @@ pub const SNAPSHOT_REPORT_MAX_LEN: usize =
 pub struct SnapshotReport {
     pub row: u8,
     pub position: u64,
-    /// `(node_id, hash)`, strictly increasing by node id — the canonical
-    /// order, so identical observations always encode identically.
-    pub hashes: Vec<(u32, u64)>,
+    /// `(node_id, hash, size)`, strictly increasing by node id — the canonical
+    /// order, so identical observations always encode identically. `size` is
+    /// the artifact file's byte length (snapshot-lifecycle spec §7.1), `0` =
+    /// unknown.
+    pub hashes: Vec<(u32, u64, u64)>,
 }
 
-fn ids_strictly_increasing(hashes: &[(u32, u64)]) -> bool {
+fn ids_strictly_increasing(hashes: &[(u32, u64, u64)]) -> bool {
     hashes.windows(2).all(|w| w[0].0 < w[1].0)
 }
 
@@ -115,9 +121,10 @@ pub fn encode_snapshot_report(r: &SnapshotReport, out: &mut Vec<u8>) -> Option<(
     out.push(n as u8);
     out.extend_from_slice(&[0; 6]);
     out.extend_from_slice(&r.position.to_le_bytes());
-    for (id, h) in &r.hashes {
+    for (id, h, size) in &r.hashes {
         out.extend_from_slice(&id.to_le_bytes());
         out.extend_from_slice(&h.to_le_bytes());
+        out.extend_from_slice(&size.to_le_bytes());
     }
     Some(())
 }
@@ -125,6 +132,16 @@ pub fn encode_snapshot_report(r: &SnapshotReport, out: &mut Vec<u8>) -> Option<(
 /// Exact framing: `count` must match the length, reserved must be zero,
 /// and every rule `encode_snapshot_report` enforces holds on read too.
 pub fn decode_snapshot_report(buf: &[u8]) -> Option<SnapshotReport> {
+    decode_report_with(buf, SNAPSHOT_REPORT_ENTRY_LEN)
+}
+
+/// A report in the layout a v1–v4 cluster image stored (12-byte entries):
+/// every size reads `0`. Only `ClusterFsm::install_snapshot` calls it.
+pub fn decode_snapshot_report_unsized(buf: &[u8]) -> Option<SnapshotReport> {
+    decode_report_with(buf, SNAPSHOT_REPORT_ENTRY_LEN_UNSIZED)
+}
+
+fn decode_report_with(buf: &[u8], entry_len: usize) -> Option<SnapshotReport> {
     if buf.len() < SNAPSHOT_REPORT_HEADER_LEN || buf[2..8] != [0; 6] {
         return None;
     }
@@ -133,7 +150,7 @@ pub fn decode_snapshot_report(buf: &[u8]) -> Option<SnapshotReport> {
     if !is_report_row(row)
         || n == 0
         || n > MAX_SNAPSHOT_REPORT_NODES
-        || buf.len() != SNAPSHOT_REPORT_HEADER_LEN + n * SNAPSHOT_REPORT_ENTRY_LEN
+        || buf.len() != SNAPSHOT_REPORT_HEADER_LEN + n * entry_len
     {
         return None;
     }
@@ -146,8 +163,13 @@ pub fn decode_snapshot_report(buf: &[u8]) -> Option<SnapshotReport> {
     for _ in 0..n {
         let id = u32::from_le_bytes(buf[o..o + 4].try_into().ok()?);
         let h = u64::from_le_bytes(buf[o + 4..o + 12].try_into().ok()?);
-        hashes.push((id, h));
-        o += SNAPSHOT_REPORT_ENTRY_LEN;
+        let size = if entry_len == SNAPSHOT_REPORT_ENTRY_LEN {
+            u64::from_le_bytes(buf[o + 12..o + 20].try_into().ok()?)
+        } else {
+            0
+        };
+        hashes.push((id, h, size));
+        o += entry_len;
     }
     if !ids_strictly_increasing(&hashes) {
         return None;
@@ -189,14 +211,14 @@ pub fn verdict(r: &SnapshotReport) -> Verdict {
     let majority_hash = r
         .hashes
         .iter()
-        .map(|(_, h)| *h)
-        .find(|h| r.hashes.iter().filter(|(_, x)| x == h).count() * 2 > n);
+        .map(|(_, h, _)| *h)
+        .find(|h| r.hashes.iter().filter(|(_, x, _)| x == h).count() * 2 > n);
     let minority = match majority_hash {
         Some(m) => r
             .hashes
             .iter()
-            .filter(|(_, h)| *h != m)
-            .map(|(id, _)| *id)
+            .filter(|(_, h, _)| *h != m)
+            .map(|(id, _, _)| *id)
             .collect(),
         None => Vec::new(),
     };
@@ -205,6 +227,22 @@ pub fn verdict(r: &SnapshotReport) -> Verdict {
         majority_hash,
         minority,
     }
+}
+
+/// Snapshot-lifecycle spec §7.2, plan ruling P7: the size recorded for a row
+/// is the one reported WITH the majority hash — identical hashes imply
+/// identical bytes. The largest such, so a reporter whose `stat` failed (`0`)
+/// does not erase it; `0` when there is no majority.
+pub fn majority_size(r: &SnapshotReport, v: &Verdict) -> u64 {
+    let Some(m) = v.majority_hash else {
+        return 0;
+    };
+    r.hashes
+        .iter()
+        .filter(|(_, h, _)| *h == m)
+        .map(|(_, _, s)| *s)
+        .max()
+        .unwrap_or(0)
 }
 
 /// `row u8 @0 ‖ reserved [u8; 3] @1 ‖ version u32 @4` — exactly 8 bytes,
@@ -317,13 +355,25 @@ pub fn encode_report_list(reports: &[SnapshotReport], out: &mut Vec<u8>) -> Opti
 }
 
 pub fn decode_report_list(buf: &[u8]) -> Option<Vec<SnapshotReport>> {
+    decode_report_list_with(buf, decode_snapshot_report)
+}
+
+/// A v1–v4 cluster image's report blob (12-byte entries, sizes read `0`).
+pub fn decode_report_list_unsized(buf: &[u8]) -> Option<Vec<SnapshotReport>> {
+    decode_report_list_with(buf, decode_snapshot_report_unsized)
+}
+
+fn decode_report_list_with(
+    buf: &[u8],
+    one: fn(&[u8]) -> Option<SnapshotReport>,
+) -> Option<Vec<SnapshotReport>> {
     let mut out = Vec::new();
     let mut o = 0;
     while o < buf.len() {
         let len = u32::from_le_bytes(buf.get(o..o + 4)?.try_into().ok()?) as usize;
         o += 4;
         let end = o.checked_add(len)?;
-        out.push(decode_snapshot_report(buf.get(o..end)?)?);
+        out.push(one(buf.get(o..end)?)?);
         o = end;
     }
     Some(out)
@@ -402,7 +452,7 @@ mod tests {
         );
     }
 
-    fn report(hashes: &[(u32, u64)]) -> SnapshotReport {
+    fn report(hashes: &[(u32, u64, u64)]) -> SnapshotReport {
         SnapshotReport {
             row: 0,
             position: 4096,
@@ -410,9 +460,91 @@ mod tests {
         }
     }
 
+    /// Snapshot-lifecycle spec §7.1: entries are `(node_id u32, hash u64,
+    /// size u64)`; a v1–v4 cluster image's report blob still decodes, through
+    /// the UNSIZED decoders, with every size 0.
+    #[test]
+    fn report_entries_carry_sizes_and_the_unsized_layout_reads_zero() {
+        let r = SnapshotReport {
+            row: 1,
+            position: 4096,
+            hashes: vec![(0, 7, 100), (2, 7, 100)],
+        };
+        let mut b = Vec::new();
+        encode_snapshot_report(&r, &mut b).unwrap();
+        assert_eq!(
+            b.len(),
+            SNAPSHOT_REPORT_HEADER_LEN + 2 * SNAPSHOT_REPORT_ENTRY_LEN
+        );
+        assert_eq!(
+            &b[16 + 12..16 + 20],
+            &100u64.to_le_bytes(),
+            "size @12 of the first entry"
+        );
+        assert_eq!(decode_snapshot_report(&b), Some(r.clone()));
+        let mut old = b[..SNAPSHOT_REPORT_HEADER_LEN].to_vec();
+        for e in b[SNAPSHOT_REPORT_HEADER_LEN..].chunks(SNAPSHOT_REPORT_ENTRY_LEN) {
+            old.extend_from_slice(&e[..SNAPSHOT_REPORT_ENTRY_LEN_UNSIZED]);
+        }
+        assert_eq!(
+            decode_snapshot_report(&old),
+            None,
+            "12-byte entries are refused on the live path"
+        );
+        assert_eq!(
+            decode_snapshot_report_unsized(&old),
+            Some(SnapshotReport {
+                hashes: vec![(0, 7, 0), (2, 7, 0)],
+                ..r.clone()
+            })
+        );
+        let mut list = Vec::new();
+        encode_report_list(std::slice::from_ref(&r), &mut list).unwrap();
+        assert_eq!(decode_report_list(&list), Some(vec![r.clone()]));
+        let mut old_list = (old.len() as u32).to_le_bytes().to_vec();
+        old_list.extend_from_slice(&old);
+        assert_eq!(
+            decode_report_list_unsized(&old_list).map(|l| l[0].hashes.clone()),
+            Some(vec![(0, 7, 0), (2, 7, 0)])
+        );
+        assert_eq!(
+            decode_report_list(&old_list),
+            None,
+            "the live list decoder refuses the old entry width"
+        );
+    }
+
+    /// Snapshot-lifecycle spec §7.2 + plan ruling P7: the size recorded is the
+    /// one reported WITH the majority hash — the largest such, so one reporter
+    /// that could not size its artifact (0) does not erase the size; none
+    /// without a majority.
+    #[test]
+    fn majority_size_is_the_size_reported_with_the_majority_hash() {
+        let r = SnapshotReport {
+            row: 0,
+            position: 64,
+            hashes: vec![(0, 7, 100), (1, 7, 100), (2, 8, 999)],
+        };
+        assert_eq!(majority_size(&r, &verdict(&r)), 100);
+        let one_unknown = SnapshotReport {
+            hashes: vec![(0, 7, 0), (1, 7, 100)],
+            ..r.clone()
+        };
+        assert_eq!(majority_size(&one_unknown, &verdict(&one_unknown)), 100);
+        let split = SnapshotReport {
+            hashes: vec![(0, 7, 100), (1, 8, 200)],
+            ..r.clone()
+        };
+        assert_eq!(
+            majority_size(&split, &verdict(&split)),
+            0,
+            "no majority, no size"
+        );
+    }
+
     #[test]
     fn report_layout_is_frozen() {
-        let r = report(&[(0, 0xAA), (1, 0xAA), (2, 0xBB)]);
+        let r = report(&[(0, 0xAA, 0), (1, 0xAA, 0), (2, 0xBB, 0)]);
         let mut b = Vec::new();
         assert_eq!(encode_snapshot_report(&r, &mut b), Some(()));
         assert_eq!(
@@ -421,9 +553,9 @@ mod tests {
         );
         assert_eq!(
             (SNAPSHOT_REPORT_HEADER_LEN, SNAPSHOT_REPORT_ENTRY_LEN),
-            (16, 12)
+            (16, 20)
         );
-        assert_eq!(SNAPSHOT_REPORT_MAX_LEN, 112);
+        assert_eq!(SNAPSHOT_REPORT_MAX_LEN, 176);
         assert_eq!(MAX_SNAPSHOT_REPORT_NODES, 8);
         assert_eq!(b[0], 0, "row @0");
         assert_eq!(b[1], 3, "count @1");
@@ -438,17 +570,17 @@ mod tests {
     fn report_encoding_is_canonical() {
         let mut b = Vec::new();
         assert_eq!(
-            encode_snapshot_report(&report(&[(1, 1), (0, 1)]), &mut b),
+            encode_snapshot_report(&report(&[(1, 1, 0), (0, 1, 0)]), &mut b),
             None,
             "node ids must be strictly increasing"
         );
         assert_eq!(
-            encode_snapshot_report(&report(&[(1, 1), (1, 2)]), &mut b),
+            encode_snapshot_report(&report(&[(1, 1, 0), (1, 2, 0)]), &mut b),
             None,
             "duplicate id"
         );
         assert_eq!(encode_snapshot_report(&report(&[]), &mut b), None, "empty");
-        let nine: Vec<(u32, u64)> = (0..9).map(|i| (i, 7)).collect();
+        let nine: Vec<(u32, u64, u64)> = (0..9).map(|i| (i, 7, 0)).collect();
         assert_eq!(
             encode_snapshot_report(&report(&nine), &mut b),
             None,
@@ -456,7 +588,7 @@ mod tests {
         );
         // The decoder enforces the same rules on the wire.
         let mut ok = Vec::new();
-        encode_snapshot_report(&report(&[(0, 1), (2, 1)]), &mut ok).unwrap();
+        encode_snapshot_report(&report(&[(0, 1, 0), (2, 1, 0)]), &mut ok).unwrap();
         let mut swapped = ok.clone();
         swapped[16..20].copy_from_slice(&5u32.to_le_bytes()); // ids now 5, 2
         assert_eq!(decode_snapshot_report(&swapped), None);
@@ -480,7 +612,7 @@ mod tests {
         let r = SnapshotReport {
             row: CLUSTER_ROW,
             position: 4096,
-            hashes: vec![(0, 7), (1, 7)],
+            hashes: vec![(0, 7, 0), (1, 7, 0)],
         };
         let mut b = Vec::new();
         assert_eq!(encode_snapshot_report(&r, &mut b), Some(()));
@@ -494,7 +626,7 @@ mod tests {
             let r = SnapshotReport {
                 row,
                 position: 4096,
-                hashes: vec![(0, 7)],
+                hashes: vec![(0, 7, 0)],
             };
             assert_eq!(
                 encode_snapshot_report(&r, &mut Vec::new()),
@@ -517,28 +649,28 @@ mod tests {
 
     #[test]
     fn verdict_all_equal_majority_and_tie() {
-        let v = verdict(&report(&[(0, 9), (1, 9), (2, 9)]));
+        let v = verdict(&report(&[(0, 9, 0), (1, 9, 0), (2, 9, 0)]));
         assert_eq!(
             (v.agreed, v.majority_hash, v.minority),
             (true, Some(9), vec![])
         );
-        let v = verdict(&report(&[(0, 9), (1, 9), (2, 4)]));
+        let v = verdict(&report(&[(0, 9, 0), (1, 9, 0), (2, 4, 0)]));
         assert_eq!(
             (v.agreed, v.majority_hash, v.minority),
             (false, Some(9), vec![2])
         );
-        let v = verdict(&report(&[(0, 9), (1, 4)]));
+        let v = verdict(&report(&[(0, 9, 0), (1, 4, 0)]));
         assert_eq!(
             (v.agreed, v.majority_hash, v.minority),
             (false, None, vec![])
         );
-        let v = verdict(&report(&[(0, 1), (1, 2), (2, 3), (3, 3)]));
+        let v = verdict(&report(&[(0, 1, 0), (1, 2, 0), (2, 3, 0), (3, 3, 0)]));
         assert_eq!(
             (v.agreed, v.majority_hash, v.minority),
             (false, None, vec![]),
             "2 of 4 is not a majority"
         );
-        let v = verdict(&report(&[(0, 5)]));
+        let v = verdict(&report(&[(0, 5, 0)]));
         assert_eq!(
             (v.agreed, v.majority_hash, v.minority),
             (true, Some(5), vec![])
@@ -589,11 +721,11 @@ mod tests {
         assert_eq!(decode_pin_list(&[]), Some(vec![]));
 
         let reports = vec![
-            report(&[(0, 1), (1, 1)]),
+            report(&[(0, 1, 0), (1, 1, 0)]),
             SnapshotReport {
                 row: 1,
                 position: 8192,
-                hashes: vec![(0, 2)],
+                hashes: vec![(0, 2, 0)],
             },
         ];
         let mut b = Vec::new();
