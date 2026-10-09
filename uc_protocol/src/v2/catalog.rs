@@ -10,12 +10,14 @@
 //! ceiling (spec §4 "Sizing"). `core` + `alloc`, like its neighbours
 //! `v2::schedule`, `v2::settings` and `v2::upgrade`.
 //!
-//! Layout. One [`RowEntry`] is 13 B: `version u32 ‖ hash u64 ‖ verdict u8`.
-//! One [`SetEntry`] is [`SET_ENTRY_LEN`] = 135 B: `position u64 @0 ‖ kind u8
-//! @8 ‖ state u8 @9 ‖ time_ns u64 @10 ‖ rows[0..CNC_MAX_SERVICES] (13 B
-//! each) @18 ‖ cluster (one more [`RowEntry`]) @122`. The list itself is
+//! Layout. One [`RowEntry`] is 21 B: `version u32 ‖ hash u64 ‖ verdict u8 ‖
+//! size u64`. One [`SetEntry`] is [`SET_ENTRY_LEN`] = 207 B: `position u64 @0
+//! ‖ kind u8 @8 ‖ state u8 @9 ‖ time_ns u64 @10 ‖ rows[0..CNC_MAX_SERVICES]
+//! (21 B each) @18 ‖ cluster (one more [`RowEntry`]) @186`. The list itself is
 //! `count u16 ‖ count × SET_ENTRY_LEN`, nothing after — exact framing, like
-//! every other list codec in this crate.
+//! every other list codec in this crate. A v1–v4 cluster image stored 13 B
+//! row entries (135 B sets); [`decode_set_list_unsized`] reads those with
+//! every `size` 0.
 //!
 //! A `Retiring` set state existed in an earlier draft and was dropped
 //! before shipping (spec errata): a retired set simply LEAVES the list
@@ -52,14 +54,21 @@ pub const MAX_RETAIN_SETS: u16 = (MAX_CATALOG_SETS - 16) as u16;
 // R29: retained sets + one pinned origin per row + as many commanded
 // entries again must fit the list bound.
 const _: () = assert!(MAX_RETAIN_SETS as usize + 2 * CNC_MAX_SERVICES <= MAX_CATALOG_SETS);
-/// `version u32 ‖ hash u64 ‖ verdict u8`.
-pub const ROW_ENTRY_LEN: usize = 4 + 8 + 1; // 13
+/// `version u32 ‖ hash u64 ‖ verdict u8 ‖ size u64` (snapshot-lifecycle
+/// spec §7.2 appended `size`).
+pub const ROW_ENTRY_LEN: usize = 4 + 8 + 1 + 8; // 21
+/// The row entry a v1–v4 cluster image stored, without `size`. Read only by
+/// [`decode_set_list_unsized`].
+pub const ROW_ENTRY_LEN_UNSIZED: usize = 4 + 8 + 1; // 13
 /// `position u64 ‖ kind u8 ‖ state u8 ‖ time_ns u64 ‖ rows[0..CNC_MAX_SERVICES]
 /// ‖ cluster` — `CNC_MAX_SERVICES` row entries plus one more for `cluster`,
 /// i.e. `9 * ROW_ENTRY_LEN` since `CNC_MAX_SERVICES == 8`.
-pub const SET_ENTRY_LEN: usize = 8 + 1 + 1 + 8 + 9 * ROW_ENTRY_LEN; // 135
+pub const SET_ENTRY_LEN: usize = 8 + 1 + 1 + 8 + 9 * ROW_ENTRY_LEN; // 207
+/// The set entry a v1–v4 cluster image stored.
+pub const SET_ENTRY_LEN_UNSIZED: usize = 8 + 1 + 1 + 8 + 9 * ROW_ENTRY_LEN_UNSIZED; // 135
 
-const _: () = assert!(SET_ENTRY_LEN == 135);
+const _: () = assert!(SET_ENTRY_LEN == 207);
+const _: () = assert!(SET_ENTRY_LEN_UNSIZED == 135);
 const _: () = assert!(CNC_MAX_SERVICES == 8);
 
 /// Whether a coordinated instant froze every declared row and the cluster
@@ -105,6 +114,9 @@ pub struct RowEntry {
     pub version: u32,
     pub hash: u64,
     pub verdict: RowVerdict,
+    /// Snapshot-lifecycle spec §7.2: the artifact's byte size reported with
+    /// the majority hash; `0` = unknown (a set catalogued before sizes).
+    pub size: u64,
 }
 
 /// One coordinated snapshot instant's catalog record: the position it
@@ -143,6 +155,27 @@ impl SetEntry {
     /// it — otherwise adding a row would retroactively empty the catalog
     /// and let retention drop a pinned origin. A `Commanded` entry is never
     /// agreed.
+    /// Snapshot-lifecycle spec §7.2: the set's byte size — every REPORTED
+    /// row's size plus the cluster artifact's. `0` = unknown: the cluster
+    /// artifact is unreported, or any reported component's size is `0` (a set
+    /// catalogued before sizes existed).
+    pub fn total_size(&self) -> u64 {
+        if self.cluster.verdict == RowVerdict::Unreported || self.cluster.size == 0 {
+            return 0;
+        }
+        let mut total = self.cluster.size;
+        for r in &self.rows {
+            if r.verdict == RowVerdict::Unreported {
+                continue;
+            }
+            if r.size == 0 {
+                return 0;
+            }
+            total = total.saturating_add(r.size);
+        }
+        total
+    }
+
     pub fn is_agreed(&self) -> bool {
         self.state == SetState::Complete
             && self.cluster.verdict == RowVerdict::Agreed
@@ -157,9 +190,10 @@ fn encode_row_entry(r: &RowEntry, out: &mut Vec<u8>) {
     out.extend_from_slice(&r.version.to_le_bytes());
     out.extend_from_slice(&r.hash.to_le_bytes());
     out.push(r.verdict as u8);
+    out.extend_from_slice(&r.size.to_le_bytes());
 }
 
-fn decode_row_entry(buf: &[u8]) -> Option<RowEntry> {
+fn decode_row_entry(buf: &[u8], sized: bool) -> Option<RowEntry> {
     let version = u32::from_le_bytes(buf.get(0..4)?.try_into().ok()?);
     let hash = u64::from_le_bytes(buf.get(4..12)?.try_into().ok()?);
     let verdict = match *buf.get(12)? {
@@ -169,10 +203,16 @@ fn decode_row_entry(buf: &[u8]) -> Option<RowEntry> {
         3 => RowVerdict::NoMajority,
         _ => return None,
     };
+    let size = if sized {
+        u64::from_le_bytes(buf.get(13..21)?.try_into().ok()?)
+    } else {
+        0
+    };
     Some(RowEntry {
         version,
         hash,
         verdict,
+        size,
     })
 }
 
@@ -187,8 +227,13 @@ fn encode_set_entry(s: &SetEntry, out: &mut Vec<u8>) {
     encode_row_entry(&s.cluster, out);
 }
 
-fn decode_set_entry(buf: &[u8]) -> Option<SetEntry> {
-    if buf.len() != SET_ENTRY_LEN {
+fn decode_set_entry(buf: &[u8], sized: bool) -> Option<SetEntry> {
+    let (row_len, set_len) = if sized {
+        (ROW_ENTRY_LEN, SET_ENTRY_LEN)
+    } else {
+        (ROW_ENTRY_LEN_UNSIZED, SET_ENTRY_LEN_UNSIZED)
+    };
+    if buf.len() != set_len {
         return None;
     }
     let position = u64::from_le_bytes(buf.get(0..8)?.try_into().ok()?);
@@ -206,12 +251,12 @@ fn decode_set_entry(buf: &[u8]) -> Option<SetEntry> {
     let mut rows = [RowEntry::default(); CNC_MAX_SERVICES];
     let mut o = 18;
     for row in &mut rows {
-        *row = decode_row_entry(buf.get(o..o + ROW_ENTRY_LEN)?)?;
-        o += ROW_ENTRY_LEN;
+        *row = decode_row_entry(buf.get(o..o + row_len)?, sized)?;
+        o += row_len;
     }
-    let cluster = decode_row_entry(buf.get(o..o + ROW_ENTRY_LEN)?)?;
-    o += ROW_ENTRY_LEN;
-    debug_assert_eq!(o, SET_ENTRY_LEN);
+    let cluster = decode_row_entry(buf.get(o..o + row_len)?, sized)?;
+    o += row_len;
+    debug_assert_eq!(o, set_len);
     Some(SetEntry {
         position,
         kind,
@@ -241,15 +286,30 @@ pub fn encode_set_list(sets: &[SetEntry], out: &mut Vec<u8>) -> Option<()> {
 /// unknown `kind`/`state`/`verdict` value refuses the whole list rather
 /// than being silently coerced.
 pub fn decode_set_list(buf: &[u8]) -> Option<Vec<SetEntry>> {
+    decode_set_list_with(buf, true)
+}
+
+/// A v1–v4 cluster image's catalog blob: `count u16 ‖ count ×
+/// SET_ENTRY_LEN_UNSIZED`, every `size` read as `0` (unknown).
+pub fn decode_set_list_unsized(buf: &[u8]) -> Option<Vec<SetEntry>> {
+    decode_set_list_with(buf, false)
+}
+
+fn decode_set_list_with(buf: &[u8], sized: bool) -> Option<Vec<SetEntry>> {
+    let set_len = if sized {
+        SET_ENTRY_LEN
+    } else {
+        SET_ENTRY_LEN_UNSIZED
+    };
     let count = u16::from_le_bytes(buf.get(0..2)?.try_into().ok()?) as usize;
-    if count > MAX_CATALOG_SETS || buf.len() != 2 + count * SET_ENTRY_LEN {
+    if count > MAX_CATALOG_SETS || buf.len() != 2 + count * set_len {
         return None;
     }
     let mut out = Vec::with_capacity(count);
     let mut o = 2;
     for _ in 0..count {
-        out.push(decode_set_entry(buf.get(o..o + SET_ENTRY_LEN)?)?);
-        o += SET_ENTRY_LEN;
+        out.push(decode_set_entry(buf.get(o..o + set_len)?, sized)?);
+        o += set_len;
     }
     Some(out)
 }
@@ -265,11 +325,13 @@ mod tests {
             version: 0x0102_0003,
             hash: 0xAB,
             verdict: RowVerdict::Agreed,
+            size: 0,
         };
         e.cluster = RowEntry {
             version: 0,
             hash: 0xCD,
             verdict: RowVerdict::Diverged,
+            size: 0,
         };
         let mut b = Vec::new();
         encode_set_list(&[e.clone()], &mut b).unwrap();
@@ -282,9 +344,14 @@ mod tests {
         let row2 = 20 + 2 * ROW_ENTRY_LEN;
         assert_eq!(&b[row2..row2 + 4], &0x0102_0003u32.to_le_bytes());
         assert_eq!(
-            b[2 + SET_ENTRY_LEN - 1],
+            b[2 + SET_ENTRY_LEN - 9],
             2,
-            "cluster verdict diverged is the last byte"
+            "cluster verdict diverged precedes the 8-byte size"
+        );
+        assert_eq!(
+            &b[2 + SET_ENTRY_LEN - 8..],
+            &0u64.to_le_bytes(),
+            "size is the last 8 bytes"
         );
         assert_eq!(decode_set_list(&b), Some(vec![e]));
     }
@@ -313,6 +380,7 @@ mod tests {
             version: 1,
             hash: 1,
             verdict: RowVerdict::Agreed,
+            size: 0,
         };
         e.rows[0] = ok;
         e.rows[1] = ok;
@@ -335,5 +403,97 @@ mod tests {
     fn max_retain_sets_leaves_sixteen_entries_of_headroom() {
         assert_eq!(MAX_RETAIN_SETS, 48);
         assert_eq!(MAX_RETAIN_SETS as usize + 16, MAX_CATALOG_SETS);
+    }
+
+    /// Snapshot-lifecycle spec §7.2: a row entry is 21 B and a set entry 207 B.
+    #[test]
+    fn row_entries_carry_sizes_and_the_set_entry_is_207_bytes() {
+        assert_eq!((ROW_ENTRY_LEN, SET_ENTRY_LEN), (21, 207));
+        let mut e = SetEntry::commanded(4096, SetKind::Full, 77);
+        e.rows[0] = RowEntry {
+            version: 1,
+            hash: 0xAB,
+            verdict: RowVerdict::Agreed,
+            size: 0x0102_0304_0506_0708,
+        };
+        let mut b = Vec::new();
+        encode_set_list(&[e.clone()], &mut b).unwrap();
+        assert_eq!(b.len(), 2 + SET_ENTRY_LEN);
+        let row0 = 2 + 18;
+        assert_eq!(
+            &b[row0 + 13..row0 + 21],
+            &0x0102_0304_0506_0708u64.to_le_bytes(),
+            "size @13 of a row entry"
+        );
+        assert_eq!(decode_set_list(&b), Some(vec![e]));
+    }
+
+    /// A v1-v4 image's catalog blob decodes through the unsized decoder with
+    /// every size 0.
+    #[test]
+    fn an_unsized_set_list_decodes_with_every_size_zero() {
+        let mut e = SetEntry::commanded(4096, SetKind::Standby, 5);
+        e.state = SetState::Complete;
+        e.rows[0] = RowEntry {
+            version: 1,
+            hash: 9,
+            verdict: RowVerdict::Agreed,
+            size: 777,
+        };
+        e.cluster = RowEntry {
+            version: 0,
+            hash: 3,
+            verdict: RowVerdict::Agreed,
+            size: 55,
+        };
+        let mut sized = Vec::new();
+        encode_set_list(&[e.clone()], &mut sized).unwrap();
+        let mut old = sized[..2 + 18].to_vec();
+        for r in sized[2 + 18..].chunks(ROW_ENTRY_LEN) {
+            old.extend_from_slice(&r[..ROW_ENTRY_LEN_UNSIZED]);
+        }
+        assert_eq!(old.len(), 2 + SET_ENTRY_LEN_UNSIZED);
+        assert_eq!(
+            decode_set_list(&old),
+            None,
+            "the live decoder refuses the old width"
+        );
+        let got = decode_set_list_unsized(&old).unwrap();
+        assert_eq!(got[0].rows[0].size, 0);
+        assert_eq!(got[0].cluster.size, 0);
+        assert_eq!((got[0].rows[0].hash, got[0].cluster.hash), (9, 3));
+        assert_eq!(got[0].total_size(), 0, "unknown");
+    }
+
+    /// Spec §7.2: a set's size is its reported rows' plus the cluster
+    /// artifact's; any unknown (0) component makes the total unknown.
+    #[test]
+    fn total_size_sums_reported_rows_and_the_cluster_artifact() {
+        let mut e = SetEntry::commanded(1, SetKind::Full, 0);
+        e.state = SetState::Complete;
+        e.rows[0] = RowEntry {
+            version: 1,
+            hash: 1,
+            verdict: RowVerdict::Agreed,
+            size: 100,
+        };
+        e.rows[3] = RowEntry {
+            version: 1,
+            hash: 1,
+            verdict: RowVerdict::Agreed,
+            size: 20,
+        };
+        e.cluster = RowEntry {
+            version: 0,
+            hash: 1,
+            verdict: RowVerdict::Agreed,
+            size: 3,
+        };
+        assert_eq!(e.total_size(), 123, "Unreported rows contribute nothing");
+        e.rows[3].size = 0;
+        assert_eq!(e.total_size(), 0, "one unknown row makes the set unknown");
+        e.rows[3].size = 20;
+        e.cluster.verdict = RowVerdict::Unreported;
+        assert_eq!(e.total_size(), 0, "no cluster artifact report: unknown");
     }
 }

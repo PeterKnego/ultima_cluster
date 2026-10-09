@@ -282,6 +282,7 @@ impl ClusterState {
             version: self.version_at(r.row, r.position),
             hash: v.majority_hash.unwrap_or(0),
             verdict,
+            size: 0,
         };
         let declared = self.declared_mask();
         let Some(e) = self.catalog.iter_mut().find(|e| e.position == r.position) else {
@@ -2504,7 +2505,8 @@ mod tests {
             RowEntry {
                 version: pack_version(1, 0, 0),
                 hash: 7,
-                verdict: RowVerdict::Agreed
+                verdict: RowVerdict::Agreed,
+                size: 0,
             }
         );
         assert_eq!((e.cluster.hash, e.cluster.verdict), (9, RowVerdict::Agreed));

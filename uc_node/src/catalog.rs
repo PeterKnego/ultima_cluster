@@ -240,6 +240,7 @@ mod tests {
         version: 0x0102_0000,
         hash: 1,
         verdict: RowVerdict::Agreed,
+        size: 0,
     };
     fn agreed(p: u64) -> SetEntry {
         let mut e = SetEntry::commanded(p, SetKind::Full, p);

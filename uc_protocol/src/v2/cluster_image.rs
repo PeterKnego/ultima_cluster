@@ -20,7 +20,8 @@
 //! length-prefixed blob after `running`, before the CRC: catalog (u32 len ‖
 //! bytes) — the snapshot catalog's set list (`v2::catalog`'s
 //! `encode_set_list`), opaque here. v1–v3 images are still ACCEPTED on read,
-//! with `catalog` empty.
+//! with `catalog` empty. Layout v5 (snapshot-lifecycle spec §7.2) changes no
+//! framing: it marks that the opaque `reports` and `catalog` blobs carry sizes.
 //!
 //! Moved out of `uc_node::cluster_fsm` (plan 3, spec §4.8) so a fuzz target
 //! can reach the decoder without pulling in `ClusterFsm` — a below-floor
@@ -63,7 +64,12 @@ pub const CLUSTER_IMAGE_MAGIC: &[u8; 8] = b"UCCLUST1";
 /// after `running`. A v1–v3 image is still ACCEPTED on read, with `catalog`
 /// empty — the `Empty` state of catalog spec §4.5, since the flag day does
 /// not migrate sets built before the catalog existed.
-pub const CLUSTER_IMAGE_VERSION: u32 = 4;
+/// Bumped to 5 (snapshot-lifecycle spec §7.2): the `reports` blob's entries
+/// and the `catalog` blob's row entries carry a `size u64`. The OUTER framing
+/// is identical to v4 — the blobs are opaque here — so a v1–v4 image is still
+/// ACCEPTED; its reader picks the blob layout from [`cluster_image_version`]
+/// (`uc_node::cluster_fsm` decodes v1–v4 blobs with every size `0`).
+pub const CLUSTER_IMAGE_VERSION: u32 = 5;
 
 /// Bytes fixed before the two length-prefixed payloads: magic(8) ‖
 /// version(4) ‖ applied(8) ‖ table_position(8) ‖ settings_position(8).
@@ -303,6 +309,15 @@ pub fn decode_cluster_image(buf: &[u8]) -> Option<ClusterImageParts<'_>> {
         running,
         catalog,
     })
+}
+
+/// The version word of an image [`decode_cluster_image`] ACCEPTS, else
+/// `None`. The cluster FSM reads it to choose the sized (v5) or unsized
+/// (v1–v4) blob decoders; kept out of [`ClusterImageParts`] so a decoded image
+/// still re-encodes to parts that compare equal (the fuzz target's property).
+pub fn cluster_image_version(buf: &[u8]) -> Option<u32> {
+    decode_cluster_image(buf)?;
+    Some(u32::from_le_bytes(buf.get(8..12)?.try_into().ok()?))
 }
 
 #[cfg(test)]
@@ -704,7 +719,11 @@ mod tests {
         };
         let mut img = Vec::new();
         encode_cluster_image(&p, &mut img).unwrap();
-        assert_eq!(&img[8..12], &4u32.to_le_bytes(), "version 4");
+        assert_eq!(
+            &img[8..12],
+            &CLUSTER_IMAGE_VERSION.to_le_bytes(),
+            "current version"
+        );
         let d = decode_cluster_image(&img).unwrap();
         assert_eq!(
             (
@@ -843,7 +862,11 @@ mod tests {
         };
         let mut img = Vec::new();
         encode_cluster_image(&p, &mut img).unwrap();
-        assert_eq!(&img[8..12], &4u32.to_le_bytes(), "layout v4");
+        assert_eq!(
+            &img[8..12],
+            &CLUSTER_IMAGE_VERSION.to_le_bytes(),
+            "current layout"
+        );
         assert_eq!(decode_cluster_image(&img), Some(p));
 
         // The same parts without a catalog, re-framed as v3: drop the
@@ -873,5 +896,46 @@ mod tests {
         let l = img.len();
         let crc = crc32fast::hash(&img[..l - 4]);
         img[l - 4..].copy_from_slice(&crc.to_le_bytes());
+    }
+
+    /// Snapshot-lifecycle spec §7.2: images are written v5; the version word
+    /// of an accepted image is readable.
+    #[test]
+    fn images_are_v5_and_the_version_word_of_an_accepted_image_is_readable() {
+        assert_eq!(CLUSTER_IMAGE_VERSION, 5);
+        let (membership, table, settings) = genesis_parts();
+        let parts = ClusterImageParts {
+            applied: 300,
+            table_position: 0,
+            settings_position: 0,
+            membership: &membership,
+            table: &table,
+            settings: &settings,
+            pins: &[],
+            reports: &[],
+            running: &[],
+            catalog: &[],
+        };
+        let mut img = Vec::new();
+        encode_cluster_image(&parts, &mut img).unwrap();
+        assert_eq!(cluster_image_version(&img), Some(5));
+        let body_end = img.len() - 4;
+        let mut v4 = img[..body_end].to_vec();
+        v4[8..12].copy_from_slice(&4u32.to_le_bytes());
+        let crc = crc32fast::hash(&v4);
+        v4.extend_from_slice(&crc.to_le_bytes());
+        assert_eq!(cluster_image_version(&v4), Some(4));
+        assert_eq!(
+            decode_cluster_image(&v4),
+            Some(parts),
+            "v4 frames identically"
+        );
+        let mut bad = img.clone();
+        *bad.last_mut().unwrap() ^= 1;
+        assert_eq!(
+            cluster_image_version(&bad),
+            None,
+            "only an ACCEPTED image has a version"
+        );
     }
 }
