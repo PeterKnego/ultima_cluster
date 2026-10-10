@@ -5692,8 +5692,10 @@ impl Consensus {
             // it — and only here, inside the throttle.
             let inner = self.cluster_view.snapshot_inner();
             let candidate = self.effective_floor_in(own, &inner.catalog);
-            // Plan B2 T5 (fix round): the candidate floor is HELD at any
-            // pinned origin this node has not consumed yet.
+            // Plan B2 T5 (fix round), as amended by pin completion C7: the
+            // candidate floor is HELD at any pinned origin this node may not
+            // release yet (pin incomplete, or no completion set held here,
+            // or a `to` replay still below it).
             let service_pos = if candidate > self.snapshot_persisted_floor {
                 self.hold_floor_for_pins(&inner, candidate)
             } else {
@@ -15415,7 +15417,8 @@ mod tests {
 
     /// Plan B2 T5 (fix round), the other half of the pinned-origin
     /// guarantee: retention keeps the pinned artifacts, and the FLOOR is
-    /// held at a pinned origin this node has not consumed yet — so the
+    /// held at a pinned origin this node may not release yet (pin
+    /// completion C7: complete, a completion set held, `to` past it) — so the
     /// journal the pinned attach tail-replays from is still there when the
     /// new binary shows up.
     ///
@@ -15712,12 +15715,28 @@ mod tests {
         assert_eq!(h.cons.snapshot_persisted_floor, p2, "past it: released");
     }
 
-    /// Ruling C3, the other node: the pin is COMPLETE, but this node's row
-    /// is not consumed (its service still on `from`, or not back yet) and it
-    /// holds no completion set — it keeps holding, because its instance still
-    /// has to install the origin.
+    /// Ruling C8 (review m4): release is not monotone, so a hold can name
+    /// an origin BELOW the persisted floor (here: an incomplete pin at p1
+    /// after the floor already reached p2). The hold is clamped to the
+    /// persisted floor — the floor stays increase-only, and the latched
+    /// `snapshot_floor_held_for_pin` position never goes below it.
     #[test]
-    fn a_complete_pin_holds_on_a_node_that_has_neither_consumed_it_nor_holds_a_completion_set() {
+    fn a_hold_below_the_persisted_floor_returns_the_persisted_floor() {
+        let mut h = harness_with_rows(&["a"]);
+        let (p1, p2, record, p3) = (4096u64, 6016u64, 6400u64, 8192u64);
+        // Incomplete: the only listed set (p2) is below the pin record.
+        commit_pin_and_catalog(&h, p1, record, &[p2]);
+        h.cons.snapshot_persisted_floor = p2;
+        let inner = h.cons.cluster_view.snapshot_inner();
+        assert_eq!(h.cons.hold_floor_for_pins(&inner, p3), p2);
+        assert_eq!(h.cons.snapshot_floor_hold, p2, "the event names the floor");
+    }
+
+    /// Ruling C7, the other node: the pin is COMPLETE, but this node holds
+    /// no completion set (its service still on `from`, or not back yet) — it
+    /// keeps holding, because its instance still has to install the origin.
+    #[test]
+    fn a_complete_pin_holds_on_a_node_that_holds_no_completion_set() {
         let mut h = harness_with_rows(&["a"]);
         let (p1, p2, record) = (4096u64, 6016u64, 4500u64);
         let _to = commit_pin_and_catalog(&h, p1, record, &[p1, p2]);
