@@ -1057,6 +1057,61 @@ fn a_zero_token_sends_a_plain_snapshot_record() {
     assert_eq!(payload, [0, b'q']);
 }
 
+/// The effective token is max(what completions taught the poll half, what
+/// `observe` merged in): the two are separate words now (the poll half is the
+/// single writer of its own), and either may lead.
+#[test]
+fn observed_and_polled_tokens_combine_by_max_and_either_may_lead() {
+    use uc_protocol::v2::ipc::split_min_position_query_payload;
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    make_instance(dir.path(), "ryw-max", 1 << 20, 1 << 20);
+    let (s, mut p) = Engine::attach(dir.path(), "ryw-max", cfg()).unwrap();
+    let mut eg = egress(dir.path());
+    s.try_submit(1, b"w").unwrap();
+    eg.write(
+        MSG_V2_RESPONSE,
+        0,
+        extra_client(s.client_id(), 0),
+        &response(4096, b"ok"),
+    )
+    .unwrap();
+    drain(&mut p);
+    assert_eq!(s.read_token(), ReadToken::from_u64(4097));
+    s.observe(ReadToken::from_u64(10));
+    assert_eq!(
+        s.read_token(),
+        ReadToken::from_u64(4097),
+        "a lower observe changes nothing"
+    );
+    s.observe(ReadToken::from_u64(9000));
+    assert_eq!(s.read_token(), ReadToken::from_u64(9000), "observe leads");
+    s.try_query(2, b"q", Consistency::ReadYourWrites).unwrap();
+    let (_p, mut c) = MpscRing::open(&dir.path().join("query.ring"))
+        .unwrap()
+        .into_split();
+    let mut buf = Vec::new();
+    c.try_read(&mut buf).unwrap().expect("a query record");
+    assert_eq!(
+        split_min_position_query_payload(&buf),
+        Some((0, 9000, &b"q"[..])),
+        "the ryw query carries the observed token"
+    );
+    s.try_submit(3, b"w").unwrap();
+    eg.write(
+        MSG_V2_RESPONSE,
+        0,
+        extra_client(s.client_id(), 2),
+        &response(10_000, b"ok"),
+    )
+    .unwrap();
+    drain(&mut p);
+    assert_eq!(
+        s.read_token(),
+        ReadToken::from_u64(10_001),
+        "polled overtakes observed"
+    );
+}
+
 #[test]
 fn write_and_answer_positions_raise_the_token_by_the_right_rule() {
     let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();

@@ -218,6 +218,15 @@ struct Reconnect {
     epoch: u64,
 }
 
+/// One read-your-writes token word on its own cache line. The reader thread
+/// writes `Link::polled_token` per RESPONSE while the submitter reads other
+/// `Link` fields per request; sharing a line would make each response
+/// invalidate the line the submitter reads (false sharing). Rust does not
+/// guarantee field order, so the alignment is explicit.
+#[repr(align(64))]
+#[derive(Default)]
+pub(crate) struct TokenCell(pub(crate) AtomicU64);
+
 pub(crate) struct Link {
     pub(crate) cfg: RemoteConfig,
     pub(crate) client_id: u64,
@@ -267,9 +276,16 @@ pub(crate) struct Link {
     /// which is sound because `reclaim` stops at the oldest LIVE slot, so no
     /// live request is ever below this floor. Monotone.
     pub(crate) oldest_unreclaimed: AtomicU64,
-    /// The read-your-writes token: the highest position this client has seen
-    /// acknowledged or read (spec 2026-10-08 §5.5).
-    pub(crate) read_token: AtomicU64,
+    /// The read-your-writes token as completions taught it: the highest
+    /// position this client has seen acknowledged or read (spec 2026-10-08
+    /// §5.5). The reader thread is its SINGLE writer — it keeps the running
+    /// maximum in `Reader::polled_max` and publishes with one `Release` store,
+    /// only when it grows — so a RESPONSE costs no locked read-modify-write.
+    pub(crate) polled_token: TokenCell,
+    /// Tokens merged in by `observe` (submit side, rare), kept apart so the
+    /// reader stays the only writer of `polled_token`. The effective token is
+    /// the max of the two ([`Link::read_token`]).
+    pub(crate) observed_token: TokenCell,
     stats: StatCells,
     t0: Instant,
     closed: AtomicBool,
@@ -291,6 +307,16 @@ pub(crate) struct Link {
 }
 
 impl Link {
+    /// The effective read-your-writes token: what completions taught the
+    /// reader, or what `observe` merged in, whichever is higher.
+    #[inline]
+    pub(crate) fn read_token(&self) -> u64 {
+        self.polled_token
+            .0
+            .load(Ordering::Acquire)
+            .max(self.observed_token.0.load(Ordering::Acquire))
+    }
+
     pub(crate) fn start(cfg: RemoteConfig) -> Result<Arc<Link>, RemoteError> {
         cfg.validate()?;
         let client_id = cfg.client_id.unwrap_or_else(random_u64);
@@ -319,7 +345,8 @@ impl Link {
             warned_over_standard: AtomicBool::new(false),
             probe_seq: AtomicU64::new(0),
             oldest_unreclaimed: AtomicU64::new(1),
-            read_token: AtomicU64::new(0),
+            polled_token: TokenCell::default(),
+            observed_token: TokenCell::default(),
             stats,
             t0: Instant::now(),
             closed: AtomicBool::new(false),
@@ -1377,6 +1404,9 @@ fn sleep_watching(link: &Arc<Link>, total: Duration) {
 struct Reader {
     link: Arc<Link>,
     rd: FramedConn,
+    /// Read-your-writes: the running maximum this reader has published into
+    /// `Link::polled_token` (it is that word's only writer).
+    polled_max: u64,
     /// The generation of the connection in `rd`. Every complaint this thread
     /// makes names it, and every grant it reads off that connection is
     /// applied only while it is still current.
@@ -1392,6 +1422,7 @@ impl Reader {
         Reader {
             link,
             rd,
+            polled_max: 0,
             generation: 0,
             last_recv: now,
             last_sweep: now,
@@ -1552,7 +1583,10 @@ impl Reader {
                             crate::slots::ReqKind::Query => meta.position,
                             crate::slots::ReqKind::Submit => meta.position.saturating_add(1),
                         };
-                        self.link.read_token.fetch_max(seen, Ordering::AcqRel);
+                        if seen > self.polled_max {
+                            self.polled_max = seen;
+                            self.link.polled_token.0.store(seen, Ordering::Release);
+                        }
                     }
                     let rec = Record {
                         user_data,
@@ -2040,6 +2074,12 @@ fn random_u64() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    /// Each token word sits on its own cache line (see `TokenCell`).
+    #[test]
+    fn token_cells_are_cache_line_aligned() {
+        assert_eq!(std::mem::align_of::<super::TokenCell>(), 64);
+    }
+
     use super::*;
     use crate::frame::HelloOk;
     use std::net::TcpListener;

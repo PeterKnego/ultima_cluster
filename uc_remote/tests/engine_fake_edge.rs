@@ -1627,3 +1627,34 @@ fn a_ryw_query_carries_the_token_and_a_stale_answer_is_resent_not_completed() {
     assert_eq!(send.read_token().as_u64(), 128);
     send.shutdown();
 }
+
+/// The effective token is max(what RESPONSEs taught the reader thread, what
+/// `observe` merged in): the reader is the single writer of its own word, and
+/// either may lead.
+#[test]
+fn observed_and_polled_tokens_combine_by_max() {
+    let edge = FakeEdge::spawn(Behaviour {
+        credits: 4,
+        ..Default::default()
+    });
+    let (send, mut poll) = RemoteEngine::connect(cfg(vec![edge.addr.clone()])).unwrap();
+    send.try_submit(1, b"w").unwrap(); // seq 1, answered at position 64
+    assert_eq!(complete_one(&mut poll), (1, Some(64)));
+    assert_eq!(send.read_token().as_u64(), 65);
+    send.observe(uc_remote::ReadToken::from_u64(10));
+    assert_eq!(
+        send.read_token().as_u64(),
+        65,
+        "a lower observe changes nothing"
+    );
+    send.observe(uc_remote::ReadToken::from_u64(9000));
+    assert_eq!(send.read_token().as_u64(), 9000, "observe leads");
+    send.try_submit(2, b"w").unwrap(); // seq 2, answered at 128: polled 129 < 9000
+    assert_eq!(complete_one(&mut poll), (2, Some(128)));
+    assert_eq!(
+        send.read_token().as_u64(),
+        9000,
+        "a lower polled value does not lower it"
+    );
+    send.shutdown();
+}

@@ -587,7 +587,7 @@ impl RemoteSendHalf {
                 self.send(FrameType::Query, 0, ReqKind::Query, user_data, q, 0)
             }
             Consistency::ReadYourWrites => {
-                let t = self.link.read_token.load(Ordering::Acquire);
+                let t = self.link.read_token();
                 self.try_query_at_least(user_data, q, ReadToken::from_u64(t))
             }
         }
@@ -621,13 +621,14 @@ impl RemoteSendHalf {
     /// The token this client has accumulated: its acknowledged writes
     /// (position + 1) and the frontiers of the reads it has seen.
     pub fn read_token(&self) -> ReadToken {
-        ReadToken::from_u64(self.link.read_token.load(Ordering::Acquire))
+        ReadToken::from_u64(self.link.read_token())
     }
 
     /// Raise the token (never lowers) - e.g. one handed over by another client.
     pub fn observe(&self, token: ReadToken) {
         self.link
-            .read_token
+            .observed_token
+            .0
             .fetch_max(token.as_u64(), Ordering::AcqRel);
     }
 

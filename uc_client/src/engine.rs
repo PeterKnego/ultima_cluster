@@ -274,6 +274,37 @@ pub struct EngineStats {
     pub stale_answers: u64,
 }
 
+/// One read-your-writes token word on its own cache line. The poll half
+/// writes `Shared::polled_token` on responses while submit threads read the
+/// neighbouring read-mostly `Shared` fields on every request; sharing a line
+/// would make each response invalidate the line every submit reads (false
+/// sharing). Rust does not guarantee field order, so the alignment is explicit.
+#[repr(align(64))]
+#[derive(Default)]
+struct TokenCell(AtomicU64);
+
+impl Shared {
+    /// The effective read-your-writes token: what completions taught the poll
+    /// half, or what `observe` merged in, whichever is higher.
+    #[inline]
+    fn token(&self) -> u64 {
+        self.polled_token
+            .0
+            .load(Ordering::Acquire)
+            .max(self.observed_token.0.load(Ordering::Acquire))
+    }
+}
+
+/// Raise the poll half's token. Single writer: a plain compare on the local
+/// maximum, and one `Release` store only when it grows — no locked RMW.
+#[inline(always)]
+fn raise_polled(shared: &Shared, polled_max: &mut u64, seen: u64) {
+    if seen > *polled_max {
+        *polled_max = seen;
+        shared.polled_token.0.store(seen, Ordering::Release);
+    }
+}
+
 /// State shared between a [`SendHalf`] (cloned, one per submitter thread) and
 /// its single [`PollHalf`].
 struct Shared {
@@ -301,8 +332,16 @@ struct Shared {
     warned_over_standard: AtomicBool,
     serving_gate: bool,
     /// Read-your-writes (spec 3): the highest exclusive applied frontier
-    /// this client has seen. Raised with `fetch_max` only.
-    token: AtomicU64,
+    /// this client's completions have shown it. The poll half is its SINGLE
+    /// writer (it keeps the running maximum in `PollHalf::polled_max` and
+    /// publishes with one `Release` store, only when it grows), so the
+    /// completion path pays no locked read-modify-write per response.
+    polled_token: TokenCell,
+    /// Read-your-writes: tokens merged in from elsewhere by
+    /// [`SendHalf::observe`] (submit-side threads, rare), kept apart from
+    /// `polled_token` so the poll half stays its only writer. The effective
+    /// token is the max of the two.
+    observed_token: TokenCell,
     /// cnc >= 3.5: the node parses `FLAG_V2_MIN_POSITION`. Read once at attach.
     min_position_supported: bool,
     /// M14b: bit `i` set ⇔ FSM `i` exists on the attached node. A page
@@ -353,6 +392,9 @@ pub struct PollHalf {
     /// (bounded either way: ≤ 8 pieces per slot).
     fanin: Vec<FanIn>,
     cycle: u64,
+    /// Read-your-writes: the running maximum this poll half has published
+    /// into `Shared::polled_token` (it is that word's only writer).
+    polled_max: u64,
 }
 
 /// The pieces of one in-flight fan-in, buffered until the last one lands.
@@ -575,7 +617,8 @@ impl Engine {
             header_max_payload,
             warned_over_standard: AtomicBool::new(false),
             serving_gate: cfg.serving_gate,
-            token: AtomicU64::new(0),
+            polled_token: TokenCell::default(),
+            observed_token: TokenCell::default(),
             min_position_supported: ((page_version >> 16) & 0xFF)
                 >= uc_protocol::v2::cnc::CNC_MIN_POSITION_MINOR,
             declared,
@@ -596,6 +639,7 @@ impl Engine {
                 buf: Vec::new(),
                 fanin: (0..slots).map(|_| FanIn::default()).collect(),
                 cycle: 0,
+                polled_max: 0,
             },
         ))
     }
@@ -806,7 +850,7 @@ impl SendHalf {
         let (flags, min) = match c {
             Consistency::Linearizable => (FLAG_V2_LINEARIZABLE, 0),
             Consistency::Snapshot => (0, 0),
-            Consistency::ReadYourWrites => (0, self.shared.token.load(Ordering::Acquire)),
+            Consistency::ReadYourWrites => (0, self.shared.token()),
         };
         self.query_with_min(user_data, id, query_bytes, flags, min)
     }
@@ -853,13 +897,14 @@ impl SendHalf {
     /// This client's read-your-writes token: hand it to another process
     /// (cookie, header) and pass it to that client's `observe`.
     pub fn read_token(&self) -> ReadToken {
-        ReadToken::from_u64(self.shared.token.load(Ordering::Acquire))
+        ReadToken::from_u64(self.shared.token())
     }
 
     /// Merge a token carried in from elsewhere. Never lowers the token.
     pub fn observe(&self, token: ReadToken) {
         self.shared
-            .token
+            .observed_token
+            .0
             .fetch_max(token.as_u64(), Ordering::AcqRel);
     }
 
@@ -974,6 +1019,7 @@ impl PollHalf {
             egress_node,
             buf,
             fanin,
+            polled_max,
             ..
         } = self;
         let mut emitted = 0usize;
@@ -981,9 +1027,9 @@ impl PollHalf {
             emitted += maintenance(shared, &mut cb);
         }
         for (id, ring) in egress_services.iter_mut() {
-            emitted += drain_ring(ring, Some(*id), shared, buf, fanin, &mut cb);
+            emitted += drain_ring(ring, Some(*id), shared, buf, fanin, polled_max, &mut cb);
         }
-        emitted += drain_ring(egress_node, None, shared, buf, fanin, &mut cb);
+        emitted += drain_ring(egress_node, None, shared, buf, fanin, polled_max, &mut cb);
         emitted
     }
 
@@ -1020,12 +1066,15 @@ fn drain_ring(
     shared: &Shared,
     buf: &mut Vec<u8>,
     fanin: &mut [FanIn],
+    polled_max: &mut u64,
     cb: &mut impl FnMut(Completion<'_>),
 ) -> usize {
     let mut emitted = 0usize;
     for _ in 0..128 {
         match ring.try_read(buf) {
-            Ok(Some(rec)) => emitted += handle_record(shared, fanin, ring_id, &rec, buf, cb),
+            Ok(Some(rec)) => {
+                emitted += handle_record(shared, fanin, polled_max, ring_id, &rec, buf, cb)
+            }
             Ok(None) => break,
             Err(RingError::Overwritten) => {
                 // Spec §4 item 6: a stat, NOT an eager fail-all — the engine
@@ -1045,6 +1094,7 @@ fn drain_ring(
 fn handle_record(
     shared: &Shared,
     fanin: &mut [FanIn],
+    polled_max: &mut u64,
     ring_id: Option<u8>,
     rec: &RecordHeader,
     buf: &[u8],
@@ -1102,7 +1152,7 @@ fn handle_record(
                     } else {
                         position.saturating_add(1)
                     };
-                    shared.token.fetch_max(seen, Ordering::AcqRel);
+                    raise_polled(shared, polled_max, seen);
                     shared.stats.responses.fetch_add(1, Ordering::Relaxed);
                     cb(Completion {
                         user_data,
@@ -1124,9 +1174,7 @@ fn handle_record(
                     let f = &mut fanin[shared.table.slot_index(wire_seq)];
                     f.push_piece(first, position, ring, &buf[8..]);
                     f.parts.sort_by_key(|p| p.0);
-                    shared
-                        .token
-                        .fetch_max(f.position.saturating_add(1), Ordering::AcqRel);
+                    raise_polled(shared, polled_max, f.position.saturating_add(1));
                     shared.stats.responses.fetch_add(1, Ordering::Relaxed);
                     cb(Completion {
                         user_data,
@@ -1297,6 +1345,14 @@ mod tests {
     /// post-claim tail (`finish_write`) directly against a real,
     /// already-raced `SlotTable` gets full coverage of the fixed branch
     /// without that.
+    /// Each token word sits on its own cache line (false sharing with the
+    /// submit-read `Shared` fields; see `TokenCell`).
+    #[test]
+    fn token_cells_are_cache_line_aligned() {
+        assert_eq!(std::mem::align_of::<TokenCell>(), 64);
+        assert!(std::mem::size_of::<TokenCell>() >= 64);
+    }
+
     #[test]
     fn lost_release_after_a_concurrent_completion_reports_accepted_not_refused() {
         let table = SlotTable::new(8, 0);
