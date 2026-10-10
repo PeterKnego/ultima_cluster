@@ -1800,10 +1800,6 @@ mod tests {
         assert!(reason_str(50).contains("snapshot_above_durable"));
     }
 
-    /// #33 spec §6.3: 60 is `version_already_set` (genesis, the row already
-    /// has a running version); 52 is renamed `row_undeclared` — the same
-    /// door check genesis now shares with `upgrade pin`, so the `pin_`
-    /// prefix no longer names it precisely.
     /// Snapshot-lifecycle spec §8: 61 names the not-yet-agreed origin and
     /// tells the operator to retry.
     #[test]
@@ -1816,6 +1812,10 @@ mod tests {
         assert!(reason_str(61).contains("retry"));
     }
 
+    /// #33 spec §6.3: 60 is `version_already_set` (genesis, the row already
+    /// has a running version); 52 is renamed `row_undeclared` — the same
+    /// door check genesis now shares with `upgrade pin`, so the `pin_`
+    /// prefix no longer names it precisely.
     #[test]
     fn reason_str_names_60_and_52() {
         assert_eq!(reason_str(60), "version_already_set");

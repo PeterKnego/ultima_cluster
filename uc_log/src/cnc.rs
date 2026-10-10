@@ -1412,11 +1412,6 @@ mod tests {
         }
     }
 
-    /// In-place recreate (a node restart) must leave the previous
-    /// incarnation's state fully zeroed: `init` historically relied on
-    /// `.truncate(true)` for the zero page, and the SIGBUS fix (2026-08-16)
-    /// replaced truncate with an explicit in-mapping fill — this pins that
-    /// nothing leaks through a recreate.
     /// Snapshot-lifecycle spec §4.2: the pair round-trips, `0` reads as "no
     /// start set", the raw bytes sit at slot +264/+272, and `snapshot_pos`
     /// is untouched by it.
@@ -1447,6 +1442,11 @@ mod tests {
         );
     }
 
+    /// In-place recreate (a node restart) must leave the previous
+    /// incarnation's state fully zeroed: `init` historically relied on
+    /// `.truncate(true)` for the zero page, and the SIGBUS fix (2026-08-16)
+    /// replaced truncate with an explicit in-mapping fill — this pins that
+    /// nothing leaks through a recreate.
     #[test]
     fn recreate_in_place_zeroes_previous_incarnation_state() {
         let tmp = tempfile::NamedTempFile::new().unwrap();

@@ -619,11 +619,6 @@ pub const fn version_compatible(local: u32, peer: u32) -> bool {
 mod tests {
     use super::*;
 
-    /// M12d: `read_cnc_app_id` is total on `&[u8]` — a page too short for the
-    /// app_id field returns `""`, never a slice-index panic. The one-byte
-    /// boundary either side of the field's end is pinned so the guard cannot
-    /// drift off by one, and the full-page case must still decode (so the
-    /// test cannot pass by always returning `""`).
     /// Snapshot-lifecycle spec §4.2 (cnc 3.4, folded in): the start-set pair
     /// sits on the `snapshot_pos` line, right after it.
     #[test]
@@ -635,6 +630,11 @@ mod tests {
         assert_eq!(CNC_V2_VERSION, (3 << 24) | (4 << 16), "still cnc 3.4");
     }
 
+    /// M12d: `read_cnc_app_id` is total on `&[u8]` — a page too short for the
+    /// app_id field returns `""`, never a slice-index panic. The one-byte
+    /// boundary either side of the field's end is pinned so the guard cannot
+    /// drift off by one, and the full-page case must still decode (so the
+    /// test cannot pass by always returning `""`).
     #[test]
     fn short_pages_read_an_empty_app_id_not_a_panic() {
         for n in 0..CNC_OFF_APP_ID + 64 {

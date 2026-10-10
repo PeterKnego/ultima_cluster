@@ -12690,10 +12690,6 @@ fn dir_bytes(dir: &Path) -> u64 {
     total
 }
 
-/// The wire `Addr` tuple (`uc_consensus::config::Addr = (ip: u32, port:
-/// u16)`) as a real `SocketAddr` (IPv4-only — `uc_consensus` stays dep-free,
-/// so this conversion lives here). Inverse of `stored_member`'s ip/port
-/// extraction below.
 /// Catalog spec §5.3: a `SoftTable` from the sender's address-keyed `STATUS`
 /// map over `membership`. Only a LEADER's map is filled (`STATUS` goes to the
 /// leader), so on a follower this is empty — plan ruling P1's reason for the
@@ -12712,6 +12708,10 @@ fn soft_table_from_wire(
     t
 }
 
+/// The wire `Addr` tuple (`uc_consensus::config::Addr = (ip: u32, port:
+/// u16)`) as a real `SocketAddr` (IPv4-only — `uc_consensus` stays dep-free,
+/// so this conversion lives here). Inverse of `stored_member`'s ip/port
+/// extraction below.
 fn addr_of((ip, port): Addr) -> SocketAddr {
     SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::from(ip.to_be_bytes()), port))
 }
