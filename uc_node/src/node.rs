@@ -2543,6 +2543,7 @@ impl Node {
             start_sets_dirty: true,
             start_set_wait_above: u64::MAX,
             start_set_recomputes: 0,
+            start_set_gates: [None; CNC_MAX_SERVICES],
             auto_fetch: crate::auto_fetch::AutoFetch::new(cfg.id),
             auto_fetch_stats: Arc::clone(&auto_fetch_stats),
             auto_fetch_audit,
@@ -4189,6 +4190,10 @@ struct Consensus {
     start_set_wait_above: u64,
     /// Recomputes run (test-visible; the steady-pass witness).
     start_set_recomputes: u64,
+    /// Pin completion ruling C2: each row's [`crate::catalog::PinGate`] as
+    /// the last view change saw it. A pin record moves the gate without
+    /// changing the catalog, so a changed gate is a start-set edge too.
+    start_set_gates: [Option<crate::catalog::PinGate>; CNC_MAX_SERVICES],
     /// Snapshot-lifecycle spec §6: the background fetch decision.
     auto_fetch: crate::auto_fetch::AutoFetch,
     /// `uc2_snapshot_auto_fetch_total{outcome}` — shared with `ObsSources`.
@@ -5827,47 +5832,42 @@ impl Consensus {
             .is_file()
     }
 
-    /// Plan B2 T5 (fix round): the snapshot/purge floor must not pass a pinned
-    /// origin this node has not CONSUMED yet. Returns `candidate` clamped to
+    /// Plan B2 T5 (fix round), as amended by pin completion ruling C3: the
+    /// snapshot/purge floor must not pass a pinned origin this node may not
+    /// RELEASE yet ([`Self::pin_released`]). Returns `candidate` clamped to
     /// the lowest such origin.
     ///
-    /// Retention (plan B1) already keeps the pinned artifacts; this keeps the
+    /// Retention (plan B1) keeps the pinned artifacts; this keeps the
     /// JOURNAL they need. The two are one mechanism: a pinned attach installs
     /// the artifact at the origin and then tail-replays `(origin, target]`, and
     /// with the origin's artifact kept but the journal above it purged, the
-    /// service's gap guard meets `first > origin`, can install nothing this
-    /// binary is allowed to install (the only covering artifact is the newer
-    /// one `from` built) and fail-stops the apply thread of a service that
-    /// attached successfully. So between the pin and the swap, a cadence
-    /// instant may complete a set and may even be retained — it just may not
-    /// move this node's floor past the origin.
+    /// service's gap guard meets `first > origin`. So between the pin and its
+    /// completion, a cadence instant may complete a set and may even be
+    /// retained — it just may not move this node's floor past the origin.
     ///
-    /// **Consumed** is read off the row's own cnc slot, and it is three
-    /// conditions, all of them:
+    /// Before C3 the hold released as soon as THIS node's row had consumed
+    /// the pin (attached on `to`'s line, `applied >= candidate`). That let
+    /// the purge pass the origin while the pin was still in force, and a
+    /// later restart of the upgraded service re-ran the pinned install at
+    /// the origin, met the purged journal and installed the newer set on
+    /// top — two installs. Now the hold releases only once the pin is
+    /// COMPLETE (an agreed set its `to` line built above the pin record)
+    /// AND locally consumed or a completion set is held here; until then
+    /// every node holds the journal at the origin, so any instance still to
+    /// be upgraded can replay from it.
     ///
-    /// 1. the slot is ATTACHED — some service is live on this row;
-    /// 2. its attached version word equals the pin's `to` — the binary the
-    ///    pin names is the one that is here, not the old one still running or
-    ///    a third build;
-    /// 3. its published `applied` frontier has reached the CANDIDATE floor —
-    ///    it has replayed past everything this floor move is about to let the
-    ///    purge remove.
-    ///
-    /// The third is not redundant, and leaving it out leaves a real race
-    /// (found reviewing the first cut of this fix). A pinned attach installs
-    /// the artifact at the origin and RETURNS; its tail replay from the
-    /// origin up runs afterwards, on the apply thread. Releasing the hold at
-    /// attach lets the floor — and the purge behind it — move to the newer
-    /// set while that replay is still walking the journal it needs, and the
-    /// replay's next pass then meets `first > origin` with no artifact this
-    /// binary may install: the same fail-stop the hold exists to prevent,
-    /// through a narrower window. Keyed on `applied` the hold releases when
-    /// the row is genuinely past the cut, which is the thing that matters.
+    /// The "consumed" clause keeps its `applied >= candidate` half for the
+    /// race it was added for (found reviewing the first cut of B2 T5): a
+    /// pinned attach installs the artifact at the origin and RETURNS; its
+    /// tail replay from the origin up runs afterwards, on the apply thread,
+    /// and releasing at attach would let the purge race that replay.
     ///
     /// A row whose service has not come back yet holds the floor —
     /// deliberately, and visibly: `snapshot_floor_held_for_pin` names the
     /// hold, and an operator who has abandoned the upgrade clears it by
-    /// attaching `to` or by pinning forward, not by waiting.
+    /// attaching `to` or by pinning forward, not by waiting. After every
+    /// instance is upgraded, one agreed instant (`uc2ctl snapshot`) completes
+    /// the pin and releases it.
     ///
     /// Node-local: no replicated state changes, and a node that has already
     /// published a floor above a pinned origin is not pulled back (the floor
@@ -5883,23 +5883,13 @@ impl Consensus {
         for row in self.services.ids() {
             // The newest pin for this row — the same "last wins" rule
             // `pin_for` and the retention keep-set use.
-            let Some(pin) = inner.pins.iter().rev().find(|p| p.row == row) else {
+            let Some(gate) = crate::catalog::pin_gate(&inner.pins, &inner.running, row) else {
                 continue;
             };
-            let slot = self.cnc.service_slot(row as usize);
-            let (_, attached, _) = unpack_service_status(slot.status.load_acquire());
-            // Consumed: `to` is attached here AND it has already replayed past
-            // everything this floor move is about to let the purge remove.
-            // "`to`" means `to`'s LINE (#33 ruling R17, spec D3 — patch is
-            // free): a patch build of `to` attaches through the same pinned
-            // install, so it consumes the pin just as `to` itself would.
-            if attached
-                && uc_protocol::identity::same_line(slot.status.version(), pin.to)
-                && slot.applied.load_acquire() >= candidate
-            {
+            if self.pin_released(inner, row, &gate, candidate) {
                 continue;
             }
-            hold = hold.min(pin.origin);
+            hold = hold.min(gate.origin);
         }
         if hold >= candidate {
             self.snapshot_floor_hold = 0;
@@ -5916,6 +5906,60 @@ impl Consensus {
             );
         }
         hold
+    }
+
+    /// Pin completion ruling C3: may this node release `row`'s pin — stop
+    /// holding the floor (and the journal purge behind it) at the origin,
+    /// and let retention prune the origin's set — for a floor move to
+    /// `candidate`? Both halves are required:
+    ///
+    /// 1. the pin is COMPLETE ([`crate::catalog::pin_complete`], ruling C1):
+    ///    the catalog lists an agreed set the `to` line built above the pin
+    ///    record. Until then EVERY node keeps the origin and its journal,
+    ///    because any instance not yet upgraded still has to install the
+    ///    origin and replay from it;
+    /// 2. and LOCALLY, either the row is **consumed** here — three
+    ///    conditions, all of them: the slot is ATTACHED; its version word is
+    ///    on the pin's `to` LINE (#33 ruling R17, spec D3 — a patch build of
+    ///    `to` consumes it as `to` would); its published `applied` has
+    ///    reached `candidate` (the pinned attach returns before its tail
+    ///    replay runs, so attached alone would let the purge race that
+    ///    replay) — or this node HOLDS a completion set at or below
+    ///    `min(commit, durable)`, the start set a restarting service takes
+    ///    instead of the origin (ruling C2).
+    ///
+    /// Allocation-free and I/O-free: it reads the view the caller already
+    /// cloned, the slot words and `holdings_held`.
+    fn pin_released(
+        &self,
+        inner: &ClusterViewInner,
+        row: u8,
+        gate: &crate::catalog::PinGate,
+        candidate: u64,
+    ) -> bool {
+        if !crate::catalog::pin_complete(&inner.catalog, row, gate) {
+            return false;
+        }
+        let slot = self.cnc.service_slot(row as usize);
+        let (_, attached, _) = unpack_service_status(slot.status.load_acquire());
+        if attached
+            && uc_protocol::identity::same_line(slot.status.version(), gate.to)
+            && slot.applied.load_acquire() >= candidate
+        {
+            return true;
+        }
+        let c = self.cnc.counters();
+        let frontier = c.commit.load_acquire().min(c.durable.load_acquire());
+        crate::catalog::start_set_for(
+            row,
+            &inner.catalog,
+            &self.holdings_held,
+            frontier,
+            Some(gate),
+        )
+        .0
+        .position
+            != 0
     }
 
     /// Plan B3 T5: does this node know who leads its cluster? Either it IS
@@ -7829,8 +7873,18 @@ impl Consensus {
         let inner = self.cluster_view.snapshot_inner();
         let mut wait = u64::MAX;
         for row in self.services.ids() {
-            let (s, w) =
-                crate::catalog::start_set_for(row, &inner.catalog, &self.holdings_held, frontier);
+            // Pin completion ruling C2: a pinned row is offered only a
+            // completion set (an agreed set its `to` line built above the
+            // pin record) — the one the service's attach may take instead of
+            // the pinned install.
+            let gate = crate::catalog::pin_gate(&inner.pins, &inner.running, row);
+            let (s, w) = crate::catalog::start_set_for(
+                row,
+                &inner.catalog,
+                &self.holdings_held,
+                frontier,
+                gate.as_ref(),
+            );
             wait = wait.min(w);
             if s != self.start_sets[row as usize] {
                 self.start_sets[row as usize] = s;
@@ -7921,14 +7975,16 @@ impl Consensus {
         // whatever state — a listed set is the catalog's to retire, so the
         // pruner deletes only what the catalog no longer names (a stalled or
         // diverged set stays visible and alertable while it is listed).
+        //
+        // Pin completion ruling C3: a pinned origin is kept only until this
+        // node may release the pin ([`Self::pin_released`] for this cut);
+        // after that it is an ordinary set, kept only while the catalog
+        // lists it (the cluster FSM's retention stops protecting a completed
+        // pin's origin by the same predicate).
         let keep: Vec<u64> = (0..CNC_MAX_SERVICES as u8)
             .filter_map(|row| {
-                inner
-                    .pins
-                    .iter()
-                    .rev()
-                    .find(|p| p.row == row)
-                    .map(|p| p.origin)
+                let gate = crate::catalog::pin_gate(&inner.pins, &inner.running, row)?;
+                (!self.pin_released(inner, row, &gate, p)).then_some(gate.origin)
             })
             .chain(inner.catalog.iter().map(|e| e.position))
             .collect();
@@ -8444,6 +8500,15 @@ impl Consensus {
         if cv != self.holdings_catalog_version_seen {
             self.holdings_catalog_version_seen = cv;
             self.note_catalog_for_holdings(cv, &inner.catalog);
+        }
+        // Pin completion ruling C2: a new pin (or running record) changes
+        // which set a pinned row may start from, with no catalog change.
+        for row in self.services.ids() {
+            let gate = crate::catalog::pin_gate(&inner.pins, &inner.running, row);
+            if gate != self.start_set_gates[row as usize] {
+                self.start_set_gates[row as usize] = gate;
+                self.start_sets_dirty = true;
+            }
         }
         // The table METRICS are cluster-wide and unconditional (every node,
         // leader or follower) — gated only on the position actually moving,
@@ -14319,6 +14384,7 @@ mod tests {
             start_sets_dirty: true,
             start_set_wait_above: u64::MAX,
             start_set_recomputes: 0,
+            start_set_gates: [None; CNC_MAX_SERVICES],
             auto_fetch: crate::auto_fetch::AutoFetch::new(1),
             auto_fetch_stats: Arc::new(Default::default()),
             auto_fetch_audit,
@@ -15365,15 +15431,10 @@ mod tests {
         // since #33 ruling R17 the hold compares by line, and raw `1`/`2`
         // are both 0.0.x.
         let (from, to) = (pack_version(1, 0, 0), pack_version(2, 0, 0));
-        let mut st = h.cons.cluster_view.to_state();
-        st.pins.push(UpgradePin {
-            row: 0,
-            from,
-            to,
-            origin: p1,
-        });
-        st.applied = p1;
-        h.cons.cluster_view.publish(&st);
+        // Pin completion (ruling C3): the pin is COMPLETE — the catalog
+        // lists p2, agreed, built on `to`'s line above the pin record — so
+        // what this test varies is the LOCAL half, consumption.
+        commit_pin_and_catalog(&h, p1, p1 + 64, &[p2]);
         let slot = h.cons.cnc.service_slot(0);
         slot.status
             .store_release(uc_log::cnc::pack_service_status(0, true, 1));
@@ -15435,17 +15496,13 @@ mod tests {
     fn a_patch_build_of_the_pinned_to_consumes_the_pin() {
         let mut h = harness_with_rows(&["a"]);
         let (p1, p2) = (4096u64, 6016u64);
-        let (from, to) = (pack_version(1, 0, 0), pack_version(2, 0, 0));
+        let from = pack_version(1, 0, 0);
         let to_patch = pack_version(2, 0, 3);
-        let mut st = h.cons.cluster_view.to_state();
-        st.pins.push(UpgradePin {
-            row: 0,
-            from,
-            to,
-            origin: p1,
-        });
-        st.applied = p1;
-        h.cons.cluster_view.publish(&st);
+        // Pin completion (ruling C3): the pin is COMPLETE — the catalog
+        // lists p2, agreed, built on `to`'s line above the pin record — so
+        // what this test varies is the LOCAL half, consumption.
+        let to = commit_pin_and_catalog(&h, p1, p1 + 64, &[p2]);
+        assert_eq!(to, pack_version(2, 0, 0));
         let slot = h.cons.cnc.service_slot(0);
         slot.status
             .store_release(uc_log::cnc::pack_service_status(0, true, 1));
@@ -15504,6 +15561,181 @@ mod tests {
         h.advance_floor_timer();
         assert!(h.cons.maybe_persist_snapshot_floor());
         assert_eq!(h.cons.snapshot_persisted_floor, p1);
+    }
+
+    // ---- pin completion (rulings C1-C3) ----
+
+    /// Commit, in the harness's view, row 0 pinned at `origin` (`from` 1.0.0
+    /// → `to` 2.0.0) with its pin record at `record_pos`, and a catalog of
+    /// agreed sets at `sets`, each recording row 0 on `to`'s line — what
+    /// `version_at` reports for any set above the origin.
+    fn commit_pin_and_catalog(h: &Harness, origin: u64, record_pos: u64, sets: &[u64]) -> u32 {
+        use uc_protocol::v2::upgrade::RowRunning;
+        let (from, to) = (pack_version(1, 0, 0), pack_version(2, 0, 0));
+        let mut st = h.cons.cluster_view.to_state();
+        st.pins.push(UpgradePin {
+            row: 0,
+            from,
+            to,
+            origin,
+        });
+        st.running[0] = Some(RowRunning {
+            row: 0,
+            version: to,
+            record_pos,
+        });
+        st.catalog = sets
+            .iter()
+            .map(|&p| {
+                let mut e = agreed_entry(p);
+                e.rows[0].version = if p <= origin { from } else { to };
+                e
+            })
+            .collect();
+        st.applied = record_pos.max(sets.iter().copied().max().unwrap_or(0)) + 1;
+        h.cons.cluster_view.publish(&st);
+        to
+    }
+
+    /// Row 0's service attached at `version` with `applied` published.
+    fn attach_row0(h: &Harness, version: u32, applied: u64) {
+        let slot = h.cons.cnc.service_slot(0);
+        slot.status
+            .store_release(uc_log::cnc::pack_service_status(0, true, 1));
+        slot.status.store_version(version);
+        slot.applied.store_release(applied);
+    }
+
+    /// Brief test 2 (ruling C3): a row CONSUMED here — attached on `to`'s
+    /// line and replayed past the candidate — still holds the floor at the
+    /// origin while the pin is not complete. The only agreed set above the
+    /// origin sits at or below the pin record (the old binary froze it
+    /// before the pin committed), so it does not complete the pin, and the
+    /// origin's set stays on disk. Before C3 the hold released here.
+    #[test]
+    fn a_consumed_pin_holds_the_floor_until_the_pin_is_complete() {
+        let mut h = harness_with_rows(&["a"]);
+        let (p1, p2, record) = (4096u64, 6016u64, 6400u64);
+        for p in [p1, p2] {
+            write_row_artifact(&h, 0, p, b"x");
+            write_cluster_artifact(&h, p, b"c");
+        }
+        // The catalog lists p2 only, so the pruner can keep p1 below only
+        // through the PIN, not through a catalog listing.
+        let to = commit_pin_and_catalog(&h, p1, record, &[p2]);
+        attach_row0(&h, to, p2 + 1000);
+        h.row_froze_at(0, p2);
+        h.cluster_snapshot_pos.store(p2, Ordering::Release);
+        h.cons.check_set_completeness();
+        assert_eq!(h.cons.snapshot_set_position.load(Ordering::Relaxed), p2);
+
+        h.advance_floor_timer();
+        h.cons.maybe_persist_snapshot_floor();
+        assert_eq!(
+            h.cons.snapshot_persisted_floor, p1,
+            "consumed but not complete: the floor stays at the origin"
+        );
+        assert_eq!(h.cons.snapshot_floor_hold, p1);
+        h.cons.prune_snapshots_below(p2);
+        assert!(
+            list_row_artifacts(&h, 0).contains(&p1),
+            "the origin's set is kept while the pin is incomplete"
+        );
+    }
+
+    /// Ruling C3, the other node: the pin is COMPLETE, but this node's row
+    /// is not consumed (its service still on `from`, or not back yet) and it
+    /// holds no completion set — it keeps holding, because its instance still
+    /// has to install the origin.
+    #[test]
+    fn a_complete_pin_holds_on_a_node_that_has_neither_consumed_it_nor_holds_a_completion_set() {
+        let mut h = harness_with_rows(&["a"]);
+        let (p1, p2, record) = (4096u64, 6016u64, 4500u64);
+        let _to = commit_pin_and_catalog(&h, p1, record, &[p1, p2]);
+        attach_row0(&h, pack_version(1, 0, 0), p2 + 1000);
+        // `own` = p2 (the candidate) without this node HOLDING p2 as a
+        // catalogued completion set — `holdings_held` stays empty.
+        h.cons.snapshot_set_position.store(p2, Ordering::Release);
+        h.cons.cnc.counters().commit.store_release(p2 + 1000);
+        h.cons.cnc.counters().durable.store_release(p2 + 1000);
+        h.advance_floor_timer();
+        h.cons.maybe_persist_snapshot_floor();
+        assert_eq!(h.cons.snapshot_persisted_floor, p1);
+    }
+
+    /// Ruling C3: complete AND held — a node whose service has not come back
+    /// (detached) but which holds the completion set releases: a restarting
+    /// service starts from that set (ruling C2), not from the origin.
+    #[test]
+    fn a_complete_pin_releases_on_a_node_that_holds_a_completion_set() {
+        let mut h = harness_with_rows(&["a"]);
+        let (p1, p2, record) = (4096u64, 6016u64, 4500u64);
+        for p in [p1, p2] {
+            write_row_artifact(&h, 0, p, b"x");
+            write_cluster_artifact(&h, p, b"c");
+        }
+        // p1 is not listed: the FSM's retention retired it when p2 completed
+        // the pin (`retain_sets = 1`), so only the pin could still keep it.
+        let _to = commit_pin_and_catalog(&h, p1, record, &[p2]);
+        let slot = h.cons.cnc.service_slot(0);
+        slot.status
+            .store_release(uc_log::cnc::pack_service_status(0, false, 1));
+        h.row_froze_at(0, p2);
+        h.cluster_snapshot_pos.store(p2, Ordering::Release);
+        h.cons.check_set_completeness();
+        h.cons.note_set_held(p2);
+        h.cons.cnc.counters().commit.store_release(p2 + 1000);
+        h.cons.cnc.counters().durable.store_release(p2 + 1000);
+        h.advance_floor_timer();
+        assert!(h.cons.maybe_persist_snapshot_floor());
+        assert_eq!(
+            h.cons.snapshot_persisted_floor, p2,
+            "a held completion set releases the hold"
+        );
+        assert_eq!(h.cons.snapshot_floor_hold, 0);
+        assert_eq!(
+            list_row_artifacts(&h, 0),
+            vec![p2],
+            "and retention no longer keeps the origin"
+        );
+    }
+
+    /// Ruling C2, node side: the start set published for a PINNED row is the
+    /// newest held COMPLETION set — never the origin or a set at or below
+    /// the pin record — and a newly committed pin moves it with no catalog
+    /// change.
+    #[test]
+    fn a_pinned_row_is_published_only_a_completion_set() {
+        let mut h = harness_with_rows(&["a"]);
+        drive_to_serving_leader(&mut h);
+        let (p1, p2, p3) = (1000u64, 2000u64, 3000u64);
+        let mut st = h.cons.cluster_view.to_state();
+        st.catalog = vec![agreed_entry(p1), agreed_entry(p2), agreed_entry(p3)];
+        st.applied = p3; // the pin below publishes at a later position
+        h.cons.cluster_view.publish(&st);
+        h.cons.refresh_from_view();
+        h.cons.note_set_held(p1);
+        h.cons.note_set_held(p2);
+        h.cons.cnc.counters().commit.store_release(p3 + 10);
+        h.cons.cnc.counters().durable.store_release(p3 + 10);
+        h.cons.maybe_publish_start_sets();
+        let cnc = Arc::clone(&h.cons.cnc);
+        let slot = cnc.service_slot(0);
+        assert_eq!(slot.snapshot_pos.start_set().map(|s| s.0), Some(p2));
+
+        // A pin at p1 whose record is above p2: no held completion set.
+        let to = commit_pin_and_catalog(&h, p1, p2 + 100, &[p1, p2, p3]);
+        h.cons.refresh_from_view();
+        h.cons.maybe_publish_start_sets();
+        assert_eq!(
+            slot.snapshot_pos.start_set(),
+            None,
+            "the pin moved the gate: p2 sits below the record"
+        );
+        // Holding p3 — above the record, on `to`'s line — publishes it.
+        h.cons.note_set_held(p3);
+        h.cons.maybe_publish_start_sets();
+        assert_eq!(slot.snapshot_pos.start_set(), Some((p3, to)));
     }
 
     // ---- plan B3 T3: live snapshot-hash reports on the set-complete edge ----
