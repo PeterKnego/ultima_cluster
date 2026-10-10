@@ -3163,6 +3163,70 @@ mod tests {
         assert_eq!(positions(&f), vec![1000, 3000]);
     }
 
+    /// Fix round 1 (a): a current-layout image carries each row's running
+    /// record exactly — `record_pos` survives freeze/install unchanged, so a
+    /// node that installed the image computes pin completion (ruling C1)
+    /// from the same number as one that applied the records.
+    #[test]
+    fn a_current_image_round_trip_preserves_the_pin_record_position() {
+        let mut f = fsm();
+        genesis_row(&mut f, 0, 100);
+        agreed_set(&mut f, 1000, 1100);
+        assert_eq!(
+            apply_at(
+                &mut f,
+                1500,
+                &pin(0, pack_version(1, 0, 0), pack_version(1, 1, 0), 1000)
+            ),
+            0
+        );
+        f.on_snapshot_frame(1800, false, 1800);
+        let cmd = settings_with_retain(&f, 1);
+        assert_eq!(apply_at(&mut f, 2000, &cmd), 0);
+        assert_eq!(f.state().applied, 2000);
+        let (img, at) = f.freeze().unwrap();
+        let mut g = fsm();
+        g.install_snapshot(at, &mut &img[..]).unwrap();
+        assert_eq!(g.state().running_for(0).unwrap().record_pos, 1500);
+    }
+
+    /// Fix round 1 (b), the determinism test: one replica applies the
+    /// records, the other installs the image taken from the first at
+    /// `applied = 2000`, above the pin record (1500). A set strictly between
+    /// the two (1800) then agrees on both. Both must reach the same
+    /// `pinned_origins()`, the same retirement and byte-equal images.
+    #[test]
+    fn a_walked_and_an_installed_replica_retire_identically_after_a_pin() {
+        let mut f = fsm();
+        genesis_row(&mut f, 0, 100);
+        agreed_set(&mut f, 1000, 1100);
+        assert_eq!(
+            apply_at(
+                &mut f,
+                1500,
+                &pin(0, pack_version(1, 0, 0), pack_version(1, 1, 0), 1000)
+            ),
+            0
+        );
+        f.on_snapshot_frame(1800, false, 1800);
+        let cmd = settings_with_retain(&f, 1);
+        assert_eq!(apply_at(&mut f, 2000, &cmd), 0);
+        let (img, at) = f.freeze().unwrap();
+        let mut g = fsm();
+        g.install_snapshot(at, &mut &img[..]).unwrap();
+        for r in [&mut f, &mut g] {
+            agree(r, 1800, 2100);
+        }
+        // 1800 completes the pin (above the record 1500), so the origin is
+        // an ordinary set and `retain_sets = 1` retires it — on both.
+        assert_eq!(f.state().pinned_origins(), Vec::<u64>::new());
+        assert_eq!(f.state().pinned_origins(), g.state().pinned_origins());
+        assert_eq!(positions(&f), vec![1800]);
+        assert_eq!(positions(&f), positions(&g));
+        assert_eq!(f.state(), g.state());
+        assert_eq!(f.freeze().unwrap().0, g.freeze().unwrap().0);
+    }
+
     // ------------------------------------------------- final fix wave (C1/I1)
 
     /// A REAL pre-flag-day (layout v3) image of `f`'s state whose settings
