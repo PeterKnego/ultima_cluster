@@ -1549,8 +1549,8 @@ fn dispatch(
                 return !conn.is_closed();
             }
             Err(SubmitError::ReadYourWritesUnsupported) => {
-                // An upgrade-ordering condition (a 3.5 gateway beside a
-                // pre-3.5 node) that the node's upgrade clears: transient.
+                // An upgrade-ordering condition (a 3.4 gateway beside a
+                // pre-3.4 node) that the node's upgrade clears: transient.
                 if conn.unreserve(corr) {
                     shared.write_retry(conn, h.seq, RETRY_SERVICE_UNAVAILABLE, RETRY_BACKOFF_US);
                 }

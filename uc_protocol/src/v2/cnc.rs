@@ -70,16 +70,18 @@ pub const CNC_PAGE_LEN: usize = 8192;
 /// line). A 3.3 attacher on a 3.4 page finds no running-version words and
 /// refuses by name; a 3.4 attacher on a 3.3 page reads `0` (absent) at +48.
 ///
-/// 3.5 (read-your-writes, spec 2026-10-08): no layout change. `query.ring`
-/// records may carry `FLAG_V2_MIN_POSITION`, and query answers carry the
-/// row's applied frontier instead of 0. A 3.4 attacher is refused by the
-/// minor check; a 3.5 attacher on a 3.4 page is NOT (`version_compatible`
-/// accepts an older peer minor), so the client checks
-/// [`CNC_MIN_POSITION_MINOR`] itself before sending the flag.
-pub const CNC_V2_VERSION: u32 = (3 << 24) | (5 << 16);
+/// Read-your-writes (spec 2026-10-08), folded into the unreleased 3.4
+/// before release (the snapshot-lifecycle start-set words were folded in the
+/// same way): no layout change. `query.ring` records may carry
+/// `FLAG_V2_MIN_POSITION`, and query answers carry the row's applied frontier
+/// instead of 0. `version_compatible` accepts an OLDER peer minor, so a 3.4
+/// attacher on a released 3.3 page is not refused by the version check; the
+/// client checks [`CNC_MIN_POSITION_MINOR`] itself before sending the flag.
+pub const CNC_V2_VERSION: u32 = (3 << 24) | (4 << 16);
 
-/// The first cnc minor whose node parses `FLAG_V2_MIN_POSITION`.
-pub const CNC_MIN_POSITION_MINOR: u32 = 5;
+/// The first cnc minor whose node parses `FLAG_V2_MIN_POSITION` (folded into
+/// 3.4, which no release has shipped without it).
+pub const CNC_MIN_POSITION_MINOR: u32 = 4;
 
 // ---- header (byte offsets) ------------------------------------------------
 pub const CNC_OFF_MAGIC: usize = 0; // [u8; 8]
@@ -689,8 +691,8 @@ mod tests {
         write_cnc_header(&mut page, &h, "kv");
         // magic
         assert_eq!(&page[0..8], b"UC2CNC\0\0");
-        // version = (3<<24)|(5<<16) = 0x0305_0000 -> LE [0,0,5,3]
-        assert_eq!(&page[8..12], &[0x00, 0x00, 0x05, 0x03]);
+        // version = (3<<24)|(4<<16) = 0x0304_0000 -> LE [0,0,4,3]
+        assert_eq!(&page[8..12], &[0x00, 0x00, 0x04, 0x03]);
         // node_id = 7 -> LE [7,0,0,0]
         assert_eq!(&page[12..16], &[7, 0, 0, 0]);
     }
@@ -956,8 +958,8 @@ mod tests {
         // cnc 3.2: the live payload ceiling word (jumbo).
         // cnc 3.3 (plan B1): the row's pin words on the STATUS line, node-written.
         // cnc 3.4 (#33): the row's running-version words on the same line.
-        // cnc 3.5: read-your-writes, no layout change.
-        assert_eq!(CNC_V2_VERSION, (3 << 24) | (5 << 16));
+        // cnc 3.4 also carries read-your-writes (folded in), no layout change.
+        assert_eq!(CNC_V2_VERSION, (3 << 24) | (4 << 16));
         assert_eq!(CNC_SVC_OFF_UPGRADE_ORIGIN, 16);
         assert_eq!(CNC_SVC_OFF_PINNED_VERSION, 24);
         assert_eq!(CNC_SVC_OFF_PIN_SEQ, 32);
@@ -1020,13 +1022,13 @@ mod tests {
         assert_eq!(CNC_SVC_OFF_RUNNING_VERSION, 48);
         assert_eq!(CNC_SVC_OFF_RUNNING_RECORD_POS, 56);
         assert_eq!(CNC_OFF_CLUSTER_APPLIED, 4056);
-        assert_eq!(CNC_V2_VERSION, (3 << 24) | (5 << 16));
+        assert_eq!(CNC_V2_VERSION, (3 << 24) | (4 << 16));
     }
 
     #[test]
-    fn cnc_3_5_is_the_min_position_page() {
-        assert_eq!(CNC_V2_VERSION, (3 << 24) | (5 << 16));
-        assert_eq!(CNC_MIN_POSITION_MINOR, 5);
+    fn cnc_3_4_carries_the_min_position_flag() {
+        assert_eq!(CNC_V2_VERSION, (3 << 24) | (4 << 16));
+        assert_eq!(CNC_MIN_POSITION_MINOR, 4);
         assert_eq!((CNC_V2_VERSION >> 16) & 0xFF, CNC_MIN_POSITION_MINOR);
     }
 }

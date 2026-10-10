@@ -1231,11 +1231,12 @@ fn ryw_on_an_old_page_is_refused_by_name() {
     use uc_protocol::v2::cnc::{CNC_OFF_HEADER_CRC, CNC_OFF_VERSION};
     let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     make_instance(dir.path(), "ryw4", 1 << 20, 1 << 20);
-    // Rewrite the page as cnc 3.4 (crc recomputed): a 3.5 attacher accepts it.
+    // Rewrite the page as the released cnc 3.3 (crc recomputed): a 3.4
+    // attacher accepts an older minor, so the client must refuse by itself.
     let path = dir.path().join("cnc2.dat");
     let mut raw = std::fs::read(&path).unwrap();
-    let v34: u32 = (3 << 24) | (4 << 16);
-    raw[CNC_OFF_VERSION..CNC_OFF_VERSION + 4].copy_from_slice(&v34.to_le_bytes());
+    let v33: u32 = (3 << 24) | (3 << 16);
+    raw[CNC_OFF_VERSION..CNC_OFF_VERSION + 4].copy_from_slice(&v33.to_le_bytes());
     let crc = crc32fast::hash(&raw[..CNC_OFF_HEADER_CRC]);
     raw[CNC_OFF_HEADER_CRC..CNC_OFF_HEADER_CRC + 4].copy_from_slice(&crc.to_le_bytes());
     std::fs::write(&path, &raw).unwrap();

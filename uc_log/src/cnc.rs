@@ -1360,7 +1360,7 @@ impl CncPage {
     /// `None` for a page torn mid-rewrite (the same posture as
     /// [`Self::try_meta`]). Read-your-writes (spec 2026-10-08, planning
     /// erratum 1) needs it: `open_file` accepts an OLDER page minor, so an
-    /// attacher checks the minor itself before using a 3.5 feature.
+    /// attacher checks the minor itself before using a 3.4 read-your-writes feature.
     pub fn header_version(&self) -> Option<u32> {
         cnc::read_cnc_header(self.page()).map(|h| h.version)
     }

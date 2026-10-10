@@ -119,14 +119,15 @@ hold a row back past the one-second deadline; that is the barrier working.
 
 ## Version requirements
 
-- **cnc 3.5** (`FLAG_V2_MIN_POSITION`). The cnc page version rises from 3.4 to
-  3.5; a host's node, services and clients upgrade together. A 3.5 client
-  attaching to an older page refuses a read-your-writes read with a non-zero
-  token by name (`ReadYourWritesUnsupported`) rather than silently degrading.
-  A token of 0 still works everywhere.
+- **cnc 3.4** (`FLAG_V2_MIN_POSITION`), the cnc version of the next release
+  (released `2.13.0` is 3.3). A host's node, services and clients upgrade
+  together. A 3.4 client attaching to a 3.3 page refuses a read-your-writes
+  read with a non-zero token by name (`ReadYourWritesUnsupported`) rather than
+  silently degrading. A token of 0 still works everywhere.
 - **Remote protocol v2** (`FLAG_MIN_POSITION`). v1 clients and v2 gateways
-  refuse each other at `HELLO` (`HELLO_REFUSED_VERSION`). A 3.5 gateway beside
-  a pre-3.5 node answers the read with a transient RETRY: upgrade the node.
+  refuse each other at `HELLO` (`HELLO_REFUSED_VERSION`). A gateway beside a
+  node too old for read-your-writes answers the read with a transient RETRY:
+  upgrade the node.
 - The node-to-node wire does not change; there is no cluster flag day.
 
 ## Bad tokens

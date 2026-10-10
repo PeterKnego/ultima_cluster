@@ -70,6 +70,17 @@ against `b7ebcc5`:
 
 #### As built (2026-10-09) — deviations found while executing
 
+- **cnc version folded into 3.4 (2026-10-10, after merging `main`).** The body
+  and Errata 1 describe a bump to cnc 3.5. `main`'s snapshot-lifecycle work
+  had meanwhile folded its own cnc additions into the unreleased 3.4
+  (released `2.13.0` shipped 3.3) and pinned that in a test, so this feature
+  follows the same practice: `CNC_V2_VERSION` stays 3.4 and
+  `CNC_MIN_POSITION_MINOR` is 4. The client's own gate (Errata 1) now refuses
+  read-your-writes with a non-zero token on a released 3.3 page. Residual:
+  an unreleased dev build of 3.4 from before this feature would accept the
+  flag and misread it; none was released. Wherever this spec says 3.5, read
+  3.4.
+
 Plan execution (tasks 1 to 12, branch `design/session-reads`) followed the
 design with these recorded rulings and gaps:
 

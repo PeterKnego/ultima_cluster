@@ -207,8 +207,8 @@ pub enum SubmitError {
     #[error("service id {id} is not declared on this node (declared set 0b{declared:b})")]
     ServiceNotDeclared { id: u8, declared: u64 },
     /// A read-your-writes read with a non-zero token on a node older than
-    /// cnc 3.5, which cannot parse the token (spec planning erratum 1).
-    #[error("this node predates read-your-writes reads (cnc page older than 3.5)")]
+    /// cnc 3.4, which cannot parse the token (spec planning erratum 1).
+    #[error("this node predates read-your-writes reads (cnc page older than 3.4)")]
     ReadYourWritesUnsupported,
 }
 
@@ -342,7 +342,7 @@ struct Shared {
     /// `polled_token` so the poll half stays its only writer. The effective
     /// token is the max of the two.
     observed_token: TokenCell,
-    /// cnc >= 3.5: the node parses `FLAG_V2_MIN_POSITION`. Read once at attach.
+    /// cnc >= 3.4: the node parses `FLAG_V2_MIN_POSITION`. Read once at attach.
     min_position_supported: bool,
     /// M14b: bit `i` set ⇔ FSM `i` exists on the attached node. A page
     /// reading 0 (a harness node) folds to `0b1`.

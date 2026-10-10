@@ -277,12 +277,14 @@ one log stream (#11); the release-ledger line (#5) is process, not code
 
 ### Standing facts that bind new work
 
-- **cnc is 3.5 and the remote protocol is v2 (read-your-writes, unreleased
-  until the next cut).** `FLAG_V2_MIN_POSITION` on `query.ring` carries an
-  8-byte `min_position` prefix; the remote query flag is `FLAG_MIN_POSITION =
-  0x20`, and v1 and v2 remote peers refuse each other at `HELLO`
-  (`HELLO_REFUSED_VERSION`). A 3.5 client refuses a read-your-writes read with
-  a non-zero token on an older page by name (`ReadYourWritesUnsupported`).
+- **Read-your-writes is folded into the unreleased cnc 3.4, and the remote
+  protocol is v2 (both unreleased until the next cut).** `FLAG_V2_MIN_POSITION`
+  on `query.ring` carries an 8-byte `min_position` prefix; the remote query
+  flag is `FLAG_MIN_POSITION = 0x20`, and v1 and v2 remote peers refuse each
+  other at `HELLO` (`HELLO_REFUSED_VERSION`). A 3.4 client refuses a
+  read-your-writes read with a non-zero token on a released 3.3 page by name
+  (`ReadYourWritesUnsupported`). Unreleased cnc additions fold into 3.4
+  rather than bumping it (the snapshot-lifecycle start-set words did too).
   The node↔node wire is unchanged. `uc_remote` has its own `ReadToken` type
   (`uc_protocol` stays a dev-only dependency). Explainer
   `docs/notes/uc2-read-your-writes-explained.md`.

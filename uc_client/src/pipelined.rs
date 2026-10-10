@@ -450,7 +450,7 @@ impl PipelinedClient {
                     reclaim(user_data);
                     return Err(ClientError::ServiceNotDeclared { id, declared });
                 }
-                // Read-your-writes on a pre-3.5 node: refused at the door,
+                // Read-your-writes on a pre-3.4 node: refused at the door,
                 // nothing reached the ring.
                 Err(SubmitError::ReadYourWritesUnsupported) => {
                     reclaim(user_data);
