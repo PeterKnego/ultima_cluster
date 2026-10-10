@@ -1309,18 +1309,16 @@ fn two_fsm_slow_lockstep() {
 
 // ------------------------------------------- M14c2 T11: snapshot needs purge
 
-/// M14d run-1's lesson, pinned in-process: reconstruction after a service
-/// restart installs the newest snapshot ONLY when the journal no longer
-/// covers `start_pos` (`uc_service/src/replay.rs:73-78`'s gap guard) —
-/// AND ONLY once the live log buffer has WRAPPED PAST `start_pos`: below the
-/// wrap, a restart reads the still-live ring directly and touches neither
-/// the journal nor a snapshot, whatever the purge posture. With purge off,
-/// the journal always covers `start_pos` even past the wrap, so a
-/// snapshot capability alone never shortens a restart — the fresh service
-/// replays the whole journal, exactly as it would with no snapshots at all. With purge on AND past the wrap, the leader's journal prefix is
-/// dropped below the snapshot floor, so the fresh service's `start_pos` (0,
-/// an empty SM) is no longer covered and reconstruction installs the newest
-/// artifact once.
+/// Since the snapshot lifecycle (spec
+/// `2026-10-09-uc2-snapshot-lifecycle-design.md` D1/§5), a restarting service
+/// starts from the newest AGREED snapshot set its node holds, whether or not
+/// purge is on, and installs at most once (ruling R5). With purge off the
+/// restart installs that set although the journal still covers `start_pos`;
+/// with purge on it is the same single install (the replay gap guard no
+/// longer fires a second time). Both arms therefore expect exactly one
+/// install, which also pins that there is no double install. The
+/// correctness assertion in `restart_installs` (a linearizable query holds
+/// the last write) is what proves the rebuilt state.
 ///
 /// `InstallCounting` (`lincheck_v2` module) counts `install_snapshot` calls
 /// via the process-global `lincheck_v2::INSTALLS` static — see that static's
@@ -1398,14 +1396,14 @@ fn restart_installs(purge: bool) -> u32 {
     lincheck_v2::INSTALLS.store(0, Ordering::Relaxed);
     // A leader must exist right before the crash — `crash_and_restart_leader_service`
     // returns SILENTLY when `leader()` is momentarily `None` (fix round 1: without
-    // this, a transient no-leader window would make the purge-off `== 0` branch
-    // pass VACUOUSLY, no crash/restart/reconstruction ever attempted).
+    // this, a transient no-leader window would make the count check
+    // misleading, no crash/restart/reconstruction ever attempted).
     cluster.leader().expect("a leader before the crash");
     cluster.crash_and_restart_leader_service();
     eprintln!("[t11 purge={purge}] phase: crash_and_restart_leader_service returned");
     // Positive evidence the reconstructed SM is actually correct, not just that
-    // SOME path ran (fix round 1: `INSTALLS == 0` alone is also consistent with
-    // "no reconstruction happened at all" — this is the gap guard's actual point).
+    // SOME path ran (fix round 1: the install count alone is also consistent with
+    // "no reconstruction happened at all" — this assertion proves the rebuilt state).
     let got: Option<u64> = client.query_linearizable(&()).unwrap();
     assert_eq!(
         got,
@@ -1419,16 +1417,16 @@ fn restart_installs(purge: bool) -> u32 {
 }
 
 #[test]
-fn snapshot_restart_installs_only_with_purge() {
+fn snapshot_restart_installs_the_newest_agreed_set_exactly_once() {
     assert_eq!(
         restart_installs(false),
-        0,
-        "purge off: reconstruction must replay, never install (replay.rs gap guard)"
+        1,
+        "purge off: the restart installs the newest agreed set exactly once (spec D1/§5)"
     );
     assert_eq!(
         restart_installs(true),
         1,
-        "purge on: the newest artifact is installed exactly once"
+        "purge on: the same single install; the gap guard does not fire a second time (R5)"
     );
 }
 
