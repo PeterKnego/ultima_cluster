@@ -105,9 +105,11 @@ Every data file in the tier (artifact or chunk) is a **tier object**: a
 
 ```
 magic [u8;8] (ULTTOBJ1 artifact | ULTJCHK1 chunk) ‖ codec u8 (0 none, 1 zstd) ‖
-reserved [u8;7] ‖ raw_len u64 ‖ crc32c(raw bytes) u32 ‖ reserved u32 ‖
+reserved [u8;7] ‖ raw_len u64 ‖ crc32(raw bytes) u32 ‖ reserved u32 ‖
 from u64 ‖ to u64                      (chunk: the range; artifact: both 0)
-block := stored_len u32 ‖ raw_len u32 ‖ stored bytes      (raw_len ≤ 1 MiB)
+block := stored_len u32 ‖ raw_len u32 ‖ crc32(raw block) u32 ‖ stored bytes   (raw_len ≤ 1 MiB)
+
+CRC is CRC-32/IEEE via `crc32fast`, the cluster image's own checksum.
 ```
 
 - **Codec per object**, chosen by the writer (`[backup] compression`, §5.1);
@@ -191,7 +193,10 @@ compression = "zstd"             # "zstd" (default) | "none" — the tier object
 compression_level = 3            # zstd level, 1..=19
 ```
 
-Node-local (`node.toml`), not replicated: paths differ per host. The writer
+Node-local (`node.toml`), not replicated: paths differ per host. Parsed into
+`StartupOptions` and handed to the node through `StartOpts::backup` — not
+`NodeConfig`, which has no `Default` and ~50 literal call sites, and for the
+same reason `StartOpts::admin` lives there. The writer
 runs as its own thread, `uc2-backup`, outside the five polling agents, with
 the sleeping idle strategy the holdings runner uses; its I/O never runs on a
 hot agent. A learner is the recommended writer (operator docs); any member
