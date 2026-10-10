@@ -344,3 +344,82 @@ sets are much smaller, which is what makes every-node copies the default.
 5. A learner-only cluster with one learner and the switch on — voters fetch
    and purge on a set agreed over one reporter; the alert and docs must make
    that visible.
+
+#### Errata (as built, 2026-10-10)
+
+Where the build differs from or refines this spec; numbered as in the plan
+(`docs/superpowers/plans/2026-10-09-uc2-snapshot-lifecycle.md`, P) and the
+execution ledger (PF = pre-flight, R = execution rulings).
+
+- **P1 — fetch candidates on a follower.** The spec said to fetch from
+  `holders()`. That table is filled only on the leader, so on any node the
+  candidates are live holders, then the set's builders (the committed
+  reports whose hash matches the catalog's), then every other member, each
+  tier learners first then lowest id, never self. This is so a follower can
+  fetch at all.
+- **P2 — `refused` is local only.** The spec read a refusal as a holder's
+  answer. A holder that cannot serve sends nothing, so `refused` counts only
+  a fetch this node could not issue; a silent holder is `timeout`.
+- **P3 — the start set's version rule is by line.** The spec wrote
+  `start_set_version == S::VERSION`. The build uses `same_line`, as today's
+  unpinned install does (D5), so a patch-level version difference still
+  starts from the set.
+- **P4 — install-error fail-stop.** The spec said any failure falls back to
+  replay. A missing or unverifiable artifact does; an error from the state
+  machine's own `install_snapshot` is a fail-stop, because replaying onto a
+  half-mutated state would be silently wrong.
+- **P5 — overrun jump guard.** The overrun-recovery jump to the start set is
+  refused when the row now carries a pin or a version record above what the
+  walk decided, so the jump cannot skip the exact stop of #33.
+- **P6 — size is the file length.** The spec left `size` open. It is the
+  artifact file's length on disk, envelope included, since that is what a
+  fetch transfers.
+- **P7 — majority size is the largest.** The recorded size is the largest
+  reported with the majority hash; a reporter whose `stat` failed sends `0`
+  and must not erase it.
+- **P8, amended by PF7 — the build guard.** The plan said a node does not
+  fetch `N` while an attached row has `snapshot_pos < N` and `applied < N`.
+  Built: some attached declared row has `snapshot_pos < N` on a FULL instant
+  (not a standby instant on a voter), and the guard holds at most 30 s from
+  the first sighting of `N`, then the fetch proceeds. The `applied < N` clause
+  read false during the build window and let a fetch race the local builder.
+- **P9–P11 — waits.** Waiting re-checks every 100 ms; `no_holder` waits 30 s;
+  `no_space` backs off on the same ladder as `refused` and `timeout`, naming
+  the set once.
+- **P12 — thin agreement.** A set reported by exactly one node logs
+  `snapshot_fetch_single_reporter` once; this is the visibility Review focus 5
+  asked for.
+- **P13 — refusal 61 is door-only.** It is checked at the door, not at apply:
+  the catalog can retire entries between append and apply, and a refusal at
+  apply would fail an already-accepted request.
+- **P14 — test seam.** `Node::set_free_bytes_for_test` is a hidden test hook
+  that sets the free-bytes figure the holdings probe reports.
+- **P15 — inherited straggler residual.** A new fetch still clears the
+  receiver's single parked expired-fetch slot. Auto-fetch never issues one
+  while a fetch is pending and waits at least 1 s after a timeout.
+- **PF11 — one sampler, one extra gauge (addition to §7.4).** The node
+  exports `uc2_snapshot_wont_fit` (0/1), computed from the same free-bytes
+  figure and the same formula the fetch check uses (0 when the size is
+  unknown). `Uc2SnapshotWontFit` keys on `uc2_snapshot_wont_fit > 0`, so the
+  alert and the fetch cannot disagree.
+- **PF15 — zero-first pair, log once per position.** The start-set cnc words
+  are published zero-first (position zeroed, then version, then position) and
+  read position-version-position; the start rule logs once per position, not
+  once per call.
+- **R2 — the report decoder infers the entry width.** The spec added a
+  sized entry. The one decoder reads `n × 20` as sized and `n × 12` as
+  pre-lifecycle (every size 0), from the record's length, so apply, replay
+  and image install agree on bytes written before this change. The separate
+  unsized decoders were removed (R3).
+- **R5/R6 — no double install.** The replay gap guard measures from the
+  follower's resume point rather than the state machine's cursor, so a
+  below-floor joiner installs its start set once. On a forced pass the stall
+  cursor is already the follower's own, so the change applies to unforced
+  passes only.
+- **R7 — a fetched set is held even if older.** A completed store-only fetch
+  of `P <= snapshot_set_position` is still noted held (the files are on disk);
+  `snapshot_set_position` itself stays monotone. Auto-fetch also keeps a
+  per-target "fetched ok" flag so it never re-fetches the same set.
+- **R8 — a 1 s floor after any fetch timeout.** The floor is set on every
+  timeout, auto or operator's, and survives retargeting, so chasing a newer
+  set cannot bypass the straggler-residual wait of P15.
