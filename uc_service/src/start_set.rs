@@ -4,34 +4,54 @@
 //! Snapshot-lifecycle spec §5: the START RULE. At attach and in overrun
 //! recovery, a row installs the start set its node published on the cnc
 //! slot (`+264/+272`) when that moves the row forward, then replays only the
-//! tail. A pinned row takes its pin path instead (rule 1); every other case
-//! is today's behaviour (rule 3), and a set that cannot be read falls back
-//! to it by name (rule 4).
+//! tail. A pinned row takes its pin path instead (rule 1) until its pin is
+//! COMPLETE — a start set above the pin record, which only a completion set
+//! can be (pin completion ruling C2); every other case is today's behaviour
+//! (rule 3), and a set that cannot be read falls back to it by name (rule 4).
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use uc_log::cnc::{RowRead, ServiceSlot};
+use uc_log::cnc::RowRead;
 
 use crate::apply::InstallFn;
 use crate::config::ServiceError;
 use crate::snapshots::{SnapshotStore, verify_snapshot_envelope};
 use crate::traits::RawStateMachine;
 
-/// Spec §5 rule 1 and plan ruling P5: may this row take a start set at all?
-/// Never when it attached under a pin (the pin path has priority). In
-/// overrun recovery also never when the row's LIVE view now names a pin, or
-/// a version record whose frame END is above `decided_to` (jumping over it
-/// would skip the #33 exact stop), or the view is mid-publish. At attach the
-/// caller passes the view it just read and its own `record_pos`.
+/// Spec §5 rule 1 and plan ruling P5, as amended by pin completion ruling
+/// C2: may this row take the start set `set` (the pair read off the slot,
+/// ONCE, by the caller) at all?
+///
+/// * The live view must be readable and carry no version record whose frame
+///   END is above `decided_to` (jumping over it would skip the #33 exact
+///   stop). At attach the caller passes the view it just read and its own
+///   `record_pos`.
+/// * A PINNED row — pinned at attach (`attach_pin`) or in its live view —
+///   takes only a start set strictly ABOVE the pin record (`record_pos`): an
+///   agreed set its `to` line built after the pin, which is what completes
+///   the pin (ruling C1; the node publishes nothing else for a pinned row).
+///   Anything at or below the record may have been built by the old binary,
+///   so the pin path keeps priority there.
+/// * An unpinned row takes any start set (rule 2 decides whether it helps).
 pub(crate) fn start_set_permitted(
     attach_pin: Option<(u64, u32, u32)>,
     live: &RowRead,
     decided_to: u64,
+    set: Option<(u64, u32)>,
 ) -> bool {
-    if attach_pin.is_some() {
+    let RowRead::View {
+        pin, record_pos, ..
+    } = live
+    else {
+        return false;
+    };
+    if *record_pos > decided_to {
         return false;
     }
-    matches!(live, RowRead::View { pin: None, record_pos, .. } if *record_pos <= decided_to)
+    if attach_pin.is_none() && pin.is_none() {
+        return true;
+    }
+    set.is_some_and(|(pos, _)| pos > *record_pos)
 }
 
 /// Spec §5 rule 4 ("log once by name", controller ruling PF15): the last
@@ -48,7 +68,9 @@ fn first_log_for(row: u8, pos: u64) -> bool {
     LOGGED[row as usize].swap(pos, Ordering::Relaxed) != pos
 }
 
-/// Spec §5 rule 2: install the row's start set when it is strictly ahead of
+/// Spec §5 rule 2: install the row's start set `set` (the slot's pair, read
+/// once by the caller — the same read [`start_set_permitted`] judged) when it
+/// is strictly ahead of
 /// `resume` (where the row would otherwise resume), at or below `frontier`
 /// (`min(commit, durable)`), and built on this binary's LINE (plan ruling
 /// P3). `Ok(Some(p))`: installed — resume the follower AT `p` (the tag is an
@@ -58,14 +80,14 @@ fn first_log_for(row: u8, pos: u64) -> bool {
 /// P4) — it may have half-mutated the state.
 pub(crate) fn install_start_set<S: RawStateMachine>(
     sm: &mut S,
-    slot: &ServiceSlot,
+    set: Option<(u64, u32)>,
     row: u8,
     resume: u64,
     frontier: u64,
     store: &SnapshotStore,
     install: &InstallFn<S>,
 ) -> Result<Option<u64>, ServiceError> {
-    let Some((pos, version)) = slot.snapshot_pos.start_set() else {
+    let Some((pos, version)) = set else {
         return Ok(None);
     };
     if pos <= resume || pos > frontier {
@@ -205,7 +227,16 @@ mod tests {
         slot.snapshot_pos.store_start_set(4096, 0);
         let mut sm = fresh();
         assert_eq!(
-            install_start_set(&mut sm, slot, 0, 0, 8192, &store, &install()).unwrap(),
+            install_start_set(
+                &mut sm,
+                slot.snapshot_pos.start_set(),
+                0,
+                0,
+                8192,
+                &store,
+                &install()
+            )
+            .unwrap(),
             Some(4096)
         );
         assert_eq!((sm.total, sm.last), (77, Some(4064)));
@@ -232,13 +263,31 @@ mod tests {
         let (sm_cursor, follower_cursor) = (sm.last.unwrap(), 4096u64);
         let resume = sm_cursor.max(follower_cursor);
         assert_eq!(
-            install_start_set(&mut sm, slot, 0, resume, 16384, &store, &install()).unwrap(),
+            install_start_set(
+                &mut sm,
+                slot.snapshot_pos.start_set(),
+                0,
+                resume,
+                16384,
+                &store,
+                &install()
+            )
+            .unwrap(),
             None
         );
         // A newer start set published since: the overrun jumps to it.
         slot.snapshot_pos.store_start_set(8192, 0);
         assert_eq!(
-            install_start_set(&mut sm, slot, 0, resume, 16384, &store, &install()).unwrap(),
+            install_start_set(
+                &mut sm,
+                slot.snapshot_pos.start_set(),
+                0,
+                resume,
+                16384,
+                &store,
+                &install()
+            )
+            .unwrap(),
             Some(8192)
         );
         assert_eq!((sm.total, sm.last), (99, Some(8160)));
@@ -258,7 +307,16 @@ mod tests {
                 last: Some(resume),
             };
             assert_eq!(
-                install_start_set(&mut sm, slot, 0, resume, 8192, &store, &install()).unwrap(),
+                install_start_set(
+                    &mut sm,
+                    slot.snapshot_pos.start_set(),
+                    0,
+                    resume,
+                    8192,
+                    &store,
+                    &install()
+                )
+                .unwrap(),
                 None
             );
             assert_eq!(sm.total, 5, "untouched");
@@ -279,7 +337,16 @@ mod tests {
         let mut sm = fresh();
         // `Sum::VERSION` is 0 — line 0.0, not 1.0.
         assert_eq!(
-            install_start_set(&mut sm, slot, 0, 0, 8192, &store, &install()).unwrap(),
+            install_start_set(
+                &mut sm,
+                slot.snapshot_pos.start_set(),
+                0,
+                0,
+                8192,
+                &store,
+                &install()
+            )
+            .unwrap(),
             None
         );
         assert_eq!(sm.total, 0);
@@ -295,7 +362,16 @@ mod tests {
         slot.snapshot_pos.store_start_set(4096, 0);
         let mut sm = fresh();
         assert_eq!(
-            install_start_set(&mut sm, slot, 0, 0, 8192, &store, &install()).unwrap(),
+            install_start_set(
+                &mut sm,
+                slot.snapshot_pos.start_set(),
+                0,
+                0,
+                8192,
+                &store,
+                &install()
+            )
+            .unwrap(),
             None
         );
     }
@@ -311,7 +387,16 @@ mod tests {
         slot.snapshot_pos.store_start_set(4096, 0);
         let mut sm = fresh();
         assert_eq!(
-            install_start_set(&mut sm, slot, 0, 0, 8192, &store, &install()).unwrap(),
+            install_start_set(
+                &mut sm,
+                slot.snapshot_pos.start_set(),
+                0,
+                0,
+                8192,
+                &store,
+                &install()
+            )
+            .unwrap(),
             None
         );
         assert_eq!((sm.total, sm.last), (0, None));
@@ -327,7 +412,16 @@ mod tests {
         slot.snapshot_pos.store_start_set(4096, 0);
         let mut sm = fresh();
         assert_eq!(
-            install_start_set(&mut sm, slot, 0, 0, 4000, &store, &install()).unwrap(),
+            install_start_set(
+                &mut sm,
+                slot.snapshot_pos.start_set(),
+                0,
+                0,
+                4000,
+                &store,
+                &install()
+            )
+            .unwrap(),
             None
         );
     }
@@ -345,30 +439,56 @@ mod tests {
             Box::new(|_, _, _| Err(std::io::Error::other("injected").into()));
         let mut sm = fresh();
         assert!(matches!(
-            install_start_set(&mut sm, slot, 0, 0, 8192, &store, &failing),
+            install_start_set(
+                &mut sm,
+                slot.snapshot_pos.start_set(),
+                0,
+                0,
+                8192,
+                &store,
+                &failing
+            ),
             Err(ServiceError::Replay(_))
         ));
     }
 
-    /// Review focus 2 + spec §5 rule 1: a pinned row never takes the start
-    /// set, whatever the catalog's newest agreed set is.
+    /// Spec §5 rule 1 as amended by pin completion ruling C2: a pinned row
+    /// takes only a start set strictly above its pin record — never one at
+    /// or below it, whatever the catalog's newest agreed set is.
     #[test]
-    fn a_pinned_row_never_takes_the_start_set() {
+    fn a_pinned_row_takes_only_a_start_set_above_its_pin_record() {
         let unpinned = RowRead::View {
             pin: None,
             running: Some(0),
             record_pos: 100,
         };
-        assert!(start_set_permitted(None, &unpinned, 100));
+        let pinned = RowRead::View {
+            pin: Some((50, 0, 1)),
+            running: Some(1),
+            record_pos: 100,
+        };
+        assert!(start_set_permitted(None, &unpinned, 100, Some((80, 0))));
+        assert!(start_set_permitted(None, &unpinned, 100, None));
+        for set in [None, Some((50, 1)), Some((80, 1)), Some((100, 1))] {
+            assert!(
+                !start_set_permitted(Some((50, 0, 1)), &pinned, 100, set),
+                "pinned at attach, set {set:?} at or below the record"
+            );
+            assert!(
+                !start_set_permitted(Some((50, 0, 1)), &unpinned, 100, set),
+                "pinned at attach (live view unpinned), set {set:?}"
+            );
+        }
         assert!(
-            !start_set_permitted(Some((4096, 0, 0)), &unpinned, 100),
-            "pinned at attach"
+            start_set_permitted(Some((50, 0, 1)), &pinned, 100, Some((101, 1))),
+            "a completion set above the record"
         );
     }
 
     /// Plan ruling P5: in overrun recovery the jump is refused when the row's
-    /// live view now carries a pin, a version record committed above what the
-    /// walk has decided, or the view is mid-publish.
+    /// live view now carries a pin it has no completion set for, a version
+    /// record committed above what the walk has decided, or the view is
+    /// mid-publish.
     #[test]
     fn the_overrun_jump_is_refused_on_a_pinned_row_or_after_a_new_version_record() {
         let pinned_now = RowRead::View {
@@ -376,14 +496,28 @@ mod tests {
             running: Some(0),
             record_pos: 100,
         };
-        assert!(!start_set_permitted(None, &pinned_now, 100));
+        assert!(!start_set_permitted(None, &pinned_now, 100, Some((100, 0))));
+        assert!(
+            start_set_permitted(None, &pinned_now, 100, Some((9000, 0))),
+            "a completion set above the record is permitted (C2)"
+        );
         let newer_record = RowRead::View {
             pin: None,
             running: Some(0),
             record_pos: 9000,
         };
-        assert!(!start_set_permitted(None, &newer_record, 8000));
-        assert!(!start_set_permitted(None, &RowRead::Contended, 8000));
+        assert!(!start_set_permitted(
+            None,
+            &newer_record,
+            8000,
+            Some((9500, 0))
+        ));
+        assert!(!start_set_permitted(
+            None,
+            &RowRead::Contended,
+            8000,
+            Some((9500, 0))
+        ));
     }
 
     /// PF15 / spec §5 rule 4: "log once" — the fallback line is written once

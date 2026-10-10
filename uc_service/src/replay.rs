@@ -281,15 +281,19 @@ pub(crate) fn replay_into<S: RawStateMachine>(
     let pre_jump = start_pos;
     // Snapshot-lifecycle spec §5, overrun recovery: jump on the node's start
     // set before the journal scan, when it moves the row forward and the row
-    // may take one (plan ruling P5 — no pin now, no newer version record).
+    // may take one (plan ruling P5 — no newer version record; and, pin
+    // completion ruling C2, on a pinned row only a set above the pin record).
     // Before the gap guard below, so a jump that lands at or above the
     // journal's first retained position needs no covering install at all.
+    // The pair is read ONCE: the rule judges and the install uses that read.
     if let Some(r) = restore {
         let slot = crate::attach::slot(cnc, instant.service_id);
+        let set = slot.snapshot_pos.start_set();
         if crate::start_set::start_set_permitted(
             instant.pin,
             &slot.status.row_view(),
             instant.decided_to,
+            set,
         ) {
             let frontier = {
                 let c = cnc.counters();
@@ -297,7 +301,7 @@ pub(crate) fn replay_into<S: RawStateMachine>(
             };
             if let Some(at) = crate::start_set::install_start_set(
                 &mut *guard,
-                slot,
+                set,
                 instant.service_id,
                 start_pos.max(instant.resume),
                 frontier,

@@ -299,15 +299,67 @@ pub(crate) fn attach<S: RawStateMachine>(
         }
         (None, _) => {}
     }
-    // UNCONDITIONAL install (step 4): the artifact at the origin, built by
-    // the pin's `from`, replaces whatever state this state machine holds — a
-    // DURABLE state machine already above the origin is rewound to it and
-    // recomputes the tail under THIS version, exactly as its fresh peers do.
-    // There is no "already caught up, skip it" arm on purpose: the prefix
-    // below the origin was computed by `from`'s `apply`, and this binary's
-    // may mean something different by the same recorded command (spec §2.3).
+    // Pin completion ruling C2: read the node's start set ONCE, then re-read
+    // the row view and require it unchanged. The view (seqlock, cluster
+    // agent) and the start-set pair (zero-first, consensus agent) are two
+    // publications by two writers; the re-read makes the pair this attach
+    // judges belong to the view it decided on — a pin that moved between the
+    // two reads is refused as contended (transient: retry), never mixed. A
+    // stale pair under an unchanged view is harmless either way: the node
+    // offers a pinned row only completion sets, and `start_set_permitted`
+    // takes one only strictly above this view's pin record.
+    let start_set = s.snapshot_pos.start_set();
+    let view = RowRead::View {
+        pin,
+        running,
+        record_pos: attach_record_pos,
+    };
+    if s.status.row_view() != view {
+        return Err(ServiceError::PinUnreadable { row });
+    }
+    let take_start_set = install.is_some()
+        && crate::start_set::start_set_permitted(pin, &view, attach_record_pos, start_set);
     let mut sm = sm;
-    if let Some((origin, from, to)) = pin {
+    let mut start_set_at: Option<u64> = None;
+    // A pinned row whose pin is complete: the start set above the pin record
+    // REPLACES the origin install. `None` back from the install means the
+    // set did not move this state machine forward — already at or past a set
+    // on this binary's line (a durable state machine whose cursor is above
+    // the pin record was computed by `to`'s line: `from` stops at the
+    // record, #33) — or the set could not be used (another line, an
+    // unreadable artifact), in which case the pinned install below runs
+    // exactly as before.
+    let mut pinned_install = pin.is_some();
+    if take_start_set && let Some(install_fn) = install.as_ref() {
+        let frontier = {
+            let c = cnc.counters();
+            c.commit.load_acquire().min(c.durable.load_acquire())
+        };
+        let store = SnapshotStore::open(dir, row)?;
+        // Read before the call: `&mut sm` is the first argument.
+        let resume = sm.last_applied().unwrap_or(0);
+        start_set_at = crate::start_set::install_start_set(
+            &mut sm, start_set, row, resume, frontier, &store, install_fn,
+        )?;
+        // "Already past it" only for a set on THIS binary's line — the one
+        // kind a pinned row's completion set can be. A set from another
+        // line is never evidence about what computed this state machine's
+        // cursor, so it falls through to the pinned install.
+        let past_it = start_set
+            .is_some_and(|(p, v)| resume >= p && uc_protocol::identity::same_line(v, S::VERSION));
+        if start_set_at.is_some() || past_it {
+            pinned_install = false;
+        }
+    }
+    // The pinned install (step 4), for a pin that is not complete here: the
+    // artifact at the origin, built by the pin's `from`, replaces whatever
+    // state this state machine holds — a DURABLE state machine already above
+    // the origin is rewound to it and recomputes the tail under THIS
+    // version, exactly as its fresh peers do. There is no "already caught
+    // up, skip it" arm on purpose: the prefix below the origin was computed
+    // by `from`'s `apply`, and this binary's may mean something different by
+    // the same recorded command (spec §2.3).
+    if let (true, Some((origin, from, to))) = (pinned_install, pin) {
         let Some(install_fn) = install.as_ref() else {
             return Err(ServiceError::PinRequiresSnapshots {
                 name: S::IDENTITY.name.as_str().to_string(),
@@ -361,33 +413,6 @@ pub(crate) fn attach<S: RawStateMachine>(
              (from {from:#010x} to {to:#010x}, artifact built by {:#010x})",
             env.version
         );
-    }
-
-    // Snapshot-lifecycle spec §5 rule 2: an UNPINNED row installs its start
-    // set when it moves the row forward. Rule 1 (the pin path) already ran
-    // above and wins; `start_set_permitted` re-states it for the reader.
-    let mut start_set_at: Option<u64> = None;
-    if let Some(install_fn) = install.as_ref()
-        && crate::start_set::start_set_permitted(
-            pin,
-            &RowRead::View {
-                pin,
-                running,
-                record_pos: attach_record_pos,
-            },
-            attach_record_pos,
-        )
-    {
-        let frontier = {
-            let c = cnc.counters();
-            c.commit.load_acquire().min(c.durable.load_acquire())
-        };
-        let store = SnapshotStore::open(dir, row)?;
-        // Read before the call: `&mut sm` is the first argument.
-        let resume = sm.last_applied().unwrap_or(0);
-        start_set_at = crate::start_set::install_start_set(
-            &mut sm, s, row, resume, frontier, &store, install_fn,
-        )?;
     }
 
     // 2. Open the log buffer file (read-only in spirit: the service only ever
@@ -465,10 +490,13 @@ pub(crate) fn attach<S: RawStateMachine>(
     // dispatches the frame that starts exactly AT the origin.
     // After a START-SET install (snapshot lifecycle §5) the same reasoning
     // holds: resume AT the set's position.
-    let start_pos = match (pin, start_set_at) {
-        (Some((origin, _, _)), _) => origin,
-        (None, Some(at)) => at,
-        (None, None) => last_applied.unwrap_or(0),
+    // Pin completion (ruling C2): a pinned row that took its completion set
+    // resumes AT the set like any start-set install; one already past it
+    // resumes from its own cursor.
+    let start_pos = match (start_set_at, pin) {
+        (Some(at), _) => at,
+        (None, Some((origin, _, _))) if pinned_install => origin,
+        (None, _) => last_applied.unwrap_or(0),
     };
     // …and the pinned `start_pos` gets the SAME drift bound the unpinned one
     // was just given. `last_applied` was checked above, but the pinned arm
@@ -766,5 +794,127 @@ mod tests {
             }) => {}
             other => panic!("expected PinRequiresSnapshots, got {other:?}"),
         }
+    }
+
+    // ---- pin completion (ruling C2): the attach decision ----
+
+    /// A state machine whose install records the position and lands the
+    /// cursor just below it (the exclusive-frontier contract).
+    struct CursorSm {
+        last: Option<u64>,
+    }
+    impl crate::traits::RawStateMachine for CursorSm {
+        const NAME: &'static str = "count";
+        const VERSION: u32 = uc_protocol::identity::pack_version(2, 0, 0);
+        fn apply(&mut self, _ctx: &mut crate::ApplyCtx, _cmd: &[u8], _out: &mut Vec<u8>) {}
+        fn query(&self, _q: &[u8], _out: &mut Vec<u8>) {}
+        fn last_applied(&self) -> Option<u64> {
+            self.last
+        }
+    }
+
+    const FROM: u32 = uc_protocol::identity::pack_version(1, 0, 0);
+    const TO: u32 = uc_protocol::identity::pack_version(2, 0, 0);
+    const ORIGIN: u64 = 4096;
+    const RECORD: u64 = 4608;
+
+    /// Attach `CursorSm` (cursor `last`) to a row pinned `FROM → TO` at
+    /// `ORIGIN` with its record at `RECORD`, the node offering `set` as the
+    /// start set; artifacts at the origin (built by `FROM`) and at every
+    /// `(pos, version)` in `arts`. Returns the positions installed, in
+    /// order. The attach itself fails later (this scratch dir has no log
+    /// buffer); the decision under test is made before that.
+    fn pinned_attach_installs(
+        set: Option<(u64, u32)>,
+        arts: &[(u64, u32)],
+        last: Option<u64>,
+    ) -> Vec<u64> {
+        let dir = scratch();
+        let page = file_page(dir.path(), &["count"], Some(0b1));
+        let c = page.counters();
+        c.commit.store_release(1 << 20);
+        c.durable.store_release(1 << 20);
+        let slot = page.service_slot(0);
+        slot.status
+            .store_row_view(Some((ORIGIN, FROM, TO)), Some(TO), RECORD);
+        if let Some((p, v)) = set {
+            slot.snapshot_pos.store_start_set(p, v);
+        }
+        let store = crate::snapshots::SnapshotStore::open(dir.path(), 0).unwrap();
+        for &(p, v) in std::iter::once(&(ORIGIN, FROM)).chain(arts) {
+            store.publish(p, v, |w| Ok(w.write_all(b"x")?)).unwrap();
+        }
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let rec = std::sync::Arc::clone(&seen);
+        let install: crate::apply::InstallFn<CursorSm> = Box::new(
+            move |sm: &mut CursorSm, pos: u64, _src: &mut dyn std::io::Read| {
+                rec.lock().unwrap().push(pos);
+                sm.last = Some(pos - 32);
+                Ok(pos)
+            },
+        );
+        let cfg = crate::config::ServiceConfig::new(dir.path(), "boot-gap");
+        let _ = super::attach(&cfg, CursorSm { last }, Some(install));
+        drop(page);
+        seen.lock().unwrap().clone()
+    }
+
+    /// Ruling C2: a completion set (above the pin record, on this binary's
+    /// line) REPLACES the origin install — one install, at the set.
+    #[test]
+    fn a_completed_pin_attaches_from_the_start_set_instead_of_the_origin() {
+        let set = (8192, TO);
+        assert_eq!(pinned_attach_installs(Some(set), &[set], None), vec![8192]);
+    }
+
+    /// A set at or below the pin record is no completion set: the pinned
+    /// install runs exactly as before.
+    #[test]
+    fn a_start_set_at_or_below_the_pin_record_leaves_the_pinned_install() {
+        for p in [ORIGIN, RECORD] {
+            let set = (p, TO);
+            let arts: &[(u64, u32)] = if p == ORIGIN { &[] } else { &[set] };
+            assert_eq!(
+                pinned_attach_installs(Some(set), arts, None),
+                vec![ORIGIN],
+                "set at {p}"
+            );
+        }
+        assert_eq!(pinned_attach_installs(None, &[], None), vec![ORIGIN]);
+    }
+
+    /// A set above the record that this binary cannot use — another line,
+    /// or its artifact missing — falls back to the pinned install, and a set
+    /// on another line is no evidence that a durable cursor above it was
+    /// computed by `to`.
+    #[test]
+    fn an_unusable_start_set_falls_back_to_the_pinned_install() {
+        let other = (8192, FROM);
+        assert_eq!(
+            pinned_attach_installs(Some(other), &[other], None),
+            vec![ORIGIN]
+        );
+        assert_eq!(
+            pinned_attach_installs(Some((8192, TO)), &[], None),
+            vec![ORIGIN],
+            "artifact missing"
+        );
+        assert_eq!(
+            pinned_attach_installs(Some(other), &[other], Some(9000)),
+            vec![ORIGIN],
+            "a durable cursor past an off-line set is still rewound"
+        );
+    }
+
+    /// A durable state machine already at or past the completion set needs
+    /// no install at all: its cursor is above the pin record, which only
+    /// `to`'s line can apply past (#33: `from` stops at the record).
+    #[test]
+    fn a_durable_cursor_past_the_completion_set_installs_nothing() {
+        let set = (8192, TO);
+        assert_eq!(
+            pinned_attach_installs(Some(set), &[set], Some(9000)),
+            Vec::<u64>::new()
+        );
     }
 }

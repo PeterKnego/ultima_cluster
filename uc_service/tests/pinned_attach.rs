@@ -1339,6 +1339,148 @@ fn a_pin_above_the_recovered_artifact_is_published_before_the_declared_set() {
     node2.stop();
 }
 
+// ------------------------------------------------------- pin completion
+
+/// Every `install_snapshot` position [`CountingV2`] has seen, in order. Only
+/// [`a_completed_pin_restarts_from_the_completion_set_with_one_install`]
+/// builds a `CountingV2`, so no other test writes here.
+static COUNTED_INSTALLS: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
+
+/// [`DoublingRegisterSm`] (same `NAME`, same `VERSION` — the pin's `to`)
+/// that records every `install_snapshot` position in [`COUNTED_INSTALLS`],
+/// so a test can tell one install from two.
+#[derive(Default)]
+struct CountingV2(DoublingRegisterSm);
+
+impl StateMachine for CountingV2 {
+    const NAME: &'static str = <DoublingRegisterSm as StateMachine>::NAME;
+    const VERSION: u32 = V2;
+    type Command = RegCmd;
+    type Response = <DoublingRegisterSm as StateMachine>::Response;
+    type Query = ();
+    type QueryResponse = Option<u64>;
+
+    fn apply(&mut self, ctx: &mut ApplyCtx, cmd: RegCmd) -> Self::Response {
+        StateMachine::apply(&mut self.0, ctx, cmd)
+    }
+    fn query(&self, q: ()) -> Option<u64> {
+        StateMachine::query(&self.0, q)
+    }
+    fn last_applied(&self) -> Option<u64> {
+        StateMachine::last_applied(&self.0)
+    }
+}
+
+impl SnapshotStateMachine for CountingV2 {
+    type SnapshotHandle = <DoublingRegisterSm as SnapshotStateMachine>::SnapshotHandle;
+
+    fn freeze(&self) -> Result<(Self::SnapshotHandle, u64), uc_service::SnapshotError> {
+        self.0.freeze()
+    }
+    fn stream_snapshot(
+        h: Self::SnapshotHandle,
+        dst: &mut dyn std::io::Write,
+    ) -> Result<(), uc_service::SnapshotError> {
+        DoublingRegisterSm::stream_snapshot(h, dst)
+    }
+    fn install_snapshot(
+        &mut self,
+        p: u64,
+        src: &mut dyn std::io::Read,
+    ) -> Result<u64, uc_service::SnapshotError> {
+        COUNTED_INSTALLS.lock().unwrap().push(p);
+        self.0.install_snapshot(p, src)
+    }
+}
+
+/// Pin completion (snapshot-lifecycle errata, "pin completion (as built)",
+/// rulings C1–C3): purge on, a real pin, the pinned version attached and
+/// caught up, then an instant ABOVE the pin record that agrees. That set
+/// completes the pin, so the floor and the purge behind it move past the
+/// origin. A restart of the upgraded service must then start from the
+/// completion set — exactly ONE install, at the set, with the correct state.
+///
+/// Before the fix the restart re-ran the pinned install at the origin
+/// unconditionally; with the journal above the origin purged, the replay's
+/// gap guard then installed the newer set as well — two installs, origin
+/// first.
+#[test]
+fn a_completed_pin_restarts_from_the_completion_set_with_one_install() {
+    let (f, svc1) = Fixture::build_with_v1("pin-complete", Spec::purging());
+    let origin = f.p;
+    let cnc = f.cnc();
+    pin_via_admin(f.path(), &cnc, 0, V1, V2, origin);
+    wait_until("the pin reached the row's slot words", || {
+        cnc.service_slot(0).status.pin()
+            == uc_log::cnc::PinRead::Pinned {
+                origin,
+                from: V1,
+                to: V2,
+            }
+    });
+    wait_stopped_at_the_pin(svc1);
+    let record_pos = match cnc.service_slot(0).status.row_view() {
+        uc_log::cnc::RowRead::View { record_pos, .. } => record_pos,
+        uc_log::cnc::RowRead::Contended => panic!("row view contended"),
+    };
+    assert!(record_pos > origin, "the pin record sits above its origin");
+
+    let svc2 = ServiceBuilder::new(cfg(f.path(), f.app), CountingV2::default())
+        .start()
+        .unwrap();
+    wait_service_caught_up(&cnc);
+    assert_eq!(svc2.query(()), Some(CAS_NEW), "the pinned attach converged");
+
+    // The completion instant: above the pin record, built by `to`.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let p2 = loop {
+        let p = command_instant(&f.node);
+        assert!(p > record_pos, "P2={p} above the pin record {record_pos}");
+        if wait_for(Duration::from_millis(500), || {
+            artifact_path(f.path(), p).is_file()
+        }) {
+            break p;
+        }
+        assert!(Instant::now() < deadline, "no instant above the pin built");
+    };
+    wait_until("the set at P2 agreed", || {
+        f.node
+            .cluster_view()
+            .snapshot_inner()
+            .catalog
+            .iter()
+            .any(|e| e.position == p2 && e.is_agreed())
+    });
+    wait_until("the purge passed the origin", || {
+        f.node.archive_first_base() > origin
+    });
+
+    svc2.stop();
+    COUNTED_INSTALLS.lock().unwrap().clear();
+    let svc3 = ServiceBuilder::new(cfg(f.path(), f.app), CountingV2::default())
+        .start()
+        .unwrap();
+    wait_service_caught_up(&cnc);
+    assert_eq!(
+        svc3.query(()),
+        Some(CAS_NEW),
+        "the restart reproduces the upgraded row's state"
+    );
+    assert_eq!(
+        *COUNTED_INSTALLS.lock().unwrap(),
+        vec![p2],
+        "a completed pin restarts from the completion set, once \
+         (origin={origin}, record_pos={record_pos}, P2={p2})"
+    );
+    // Ruling C3: the completed pin is released — the origin is an ordinary
+    // set again, and retention prunes it.
+    wait_until("retention pruned the completed pin's origin", || {
+        !artifact_path(f.path(), origin).is_file()
+    });
+    svc3.stop();
+    f.stop();
+}
+
 // ------------------------------------------------- the durable-SM stand-in
 
 /// Walk the archived log `[0, end)` and apply every MESSAGE frame through
