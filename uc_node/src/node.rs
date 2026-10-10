@@ -10720,7 +10720,7 @@ impl Consensus {
                     position = n
                 );
             }
-            SpaceCheck::Unknown { first: false } | SpaceCheck::Fits => {}
+            SpaceCheck::Unknown { first: false } | SpaceCheck::FreeUnknown | SpaceCheck::Fits => {}
         }
         let candidates = self.auto_fetch_candidates(n, &inner);
         let Some(from) = self.auto_fetch.pick(&candidates, now) else {
@@ -12626,9 +12626,12 @@ impl HoldingsProbe {
         let snapshots = dir_bytes(&self.snap_root);
         let mut h = self.holdings.lock().unwrap_or_else(|e| e.into_inner());
         // A failed `statvfs` keeps the last reading rather than advertising
-        // a plausible-looking 0.
+        // a plausible-looking 0. A real reading is stored as at least 1, so
+        // 0 stays `auto_fetch::FREE_BYTES_UNKNOWN` — "never measured", which
+        // neither the space check nor `uc2_snapshot_wont_fit` reads as full
+        // (final review M6).
         if let Some(free) = free {
-            h.free_bytes = free;
+            h.free_bytes = free.max(1);
         }
         h.journal_bytes = journal;
         h.snapshots_bytes = snapshots;

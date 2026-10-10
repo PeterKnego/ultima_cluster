@@ -33,6 +33,19 @@ pub fn fits(free_bytes: u64, total: u64) -> bool {
     free_bytes >= total.saturating_add((total / 4).max(FETCH_HEADROOM_MIN_BYTES))
 }
 
+/// Final review M6: the `uc2-holdings` probe's free-bytes figure before its
+/// first successful `statvfs` (or after every one has failed) — UNKNOWN, not
+/// "no space". The probe stores a real reading as at least 1, so 0 is never a
+/// measurement.
+pub const FREE_BYTES_UNKNOWN: u64 = 0;
+
+/// Spec §7.3/§7.4 and plan ruling PF11: the one "won't fit" predicate the
+/// space check and `uc2_snapshot_wont_fit` share. An unknown size or an
+/// unknown free figure ([`FREE_BYTES_UNKNOWN`]) never reads as won't fit.
+pub fn wont_fit(free_bytes: u64, total: u64) -> bool {
+    total != 0 && free_bytes != FREE_BYTES_UNKNOWN && !fits(free_bytes, total)
+}
+
 /// Spec §6: `uc2_snapshot_auto_fetch_total{outcome}`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
@@ -83,8 +96,17 @@ impl AutoFetchStats {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpaceCheck {
     Fits,
-    Unknown { first: bool },
-    NoSpace { first: bool },
+    /// Final review M6: the free figure is not known yet (or `statvfs`
+    /// fails) — fetched without the check, like an unknown size, and
+    /// silently: a boot-time race must not spend the set's one `no_space`
+    /// warning on a false reading.
+    FreeUnknown,
+    Unknown {
+        first: bool,
+    },
+    NoSpace {
+        first: bool,
+    },
 }
 
 /// One node's auto-fetch decision state.
@@ -184,7 +206,10 @@ impl AutoFetch {
             self.size_unknown_named = true;
             return SpaceCheck::Unknown { first };
         }
-        if fits(free_bytes, total) {
+        if free_bytes == FREE_BYTES_UNKNOWN {
+            return SpaceCheck::FreeUnknown;
+        }
+        if !wont_fit(free_bytes, total) {
             return SpaceCheck::Fits;
         }
         let first = !self.no_space_named;
@@ -473,6 +498,27 @@ mod tests {
         assert!(a.due(1000, 9000, false, 0));
         assert_eq!(a.check_space(0, 0, 0), SpaceCheck::Unknown { first: true });
         assert_eq!(a.check_space(0, 0, 0), SpaceCheck::Unknown { first: false });
+    }
+
+    /// Final review M6: before the probe's first `statvfs` (or when every one
+    /// fails) the free figure is unknown, not zero — the fetch is never
+    /// refused `no_space` on it, nothing backs off, and the set's one
+    /// `no_space` warning is still unspent for a real reading.
+    #[test]
+    fn an_unknown_free_figure_never_refuses_with_no_space() {
+        let mut a = AutoFetch::new(0);
+        assert!(a.due(1000, 9000, false, 0));
+        assert_eq!(
+            a.check_space(4 * GIB, FREE_BYTES_UNKNOWN, 0),
+            SpaceCheck::FreeUnknown
+        );
+        assert!(!a.quiet(1000, 1), "no backoff on an unknown");
+        assert!(!wont_fit(FREE_BYTES_UNKNOWN, 4 * GIB));
+        assert_eq!(
+            a.check_space(4 * GIB, GIB, 0),
+            SpaceCheck::NoSpace { first: true },
+            "the first REAL shortfall is still the one named"
+        );
     }
 
     /// Spec §7.3 + plan ruling P11: no space → skipped, named once per set,

@@ -923,9 +923,9 @@ fn push_service_families(out: &mut String, s: &ObsSources, commit: u64, now: u64
         "The newest AGREED snapshot set's total size in bytes — its rows' and cluster artifact's (snapshot-lifecycle spec §7.4); 0 when no set is agreed or its size is unknown (a set catalogued before sizes existed).",
         newest_agreed_bytes,
     );
-    // Plan ruling PF11: the SAME probe figure and the SAME formula the
-    // auto-fetch space check uses (`auto_fetch::fits`); an unknown size never
-    // reads 1.
+    // Plan ruling PF11: the SAME probe figure and the SAME predicate the
+    // auto-fetch space check uses (`auto_fetch::wont_fit`); an unknown size,
+    // or a free figure not yet probed (final review M6), never reads 1.
     let free_bytes = s
         .snapshot_holdings
         .lock()
@@ -934,10 +934,8 @@ fn push_service_families(out: &mut String, s: &ObsSources, commit: u64, now: u64
     push_gauge(
         out,
         "uc2_snapshot_wont_fit",
-        "1 when the newest agreed snapshot set would fail the auto-fetch space check on this node — the uc2-holdings probe's free bytes < size + max(size/4, 1 GiB) (snapshot-lifecycle spec §7.3/§7.4) — else 0; 0 while the size is unknown. Read on every node, learners and auto_fetch = false included. Alert: Uc2SnapshotWontFit.",
-        u64::from(
-            newest_agreed_bytes > 0 && !crate::auto_fetch::fits(free_bytes, newest_agreed_bytes),
-        ),
+        "1 when the newest agreed snapshot set would fail the auto-fetch space check on this node — the uc2-holdings probe's free bytes < size + max(size/4, 1 GiB) (snapshot-lifecycle spec §7.3/§7.4) — else 0; 0 while the size, or this node's free bytes (before the first successful probe), is unknown. Read on every node, learners and auto_fetch = false included. Alert: Uc2SnapshotWontFit.",
+        u64::from(crate::auto_fetch::wont_fit(free_bytes, newest_agreed_bytes)),
     );
     // SPDX-License-Identifier: Apache-2.0
     // Copyright 2026 Peter Knego
@@ -2169,6 +2167,8 @@ mod tests {
         );
         assert_eq!(read(4 * GIB, 5 * GIB), 0, "exactly fits");
         assert_eq!(read(0, 0), 0, "unknown size never alarms");
+        // Final review M6: free bytes not yet probed (or every probe failed).
+        assert_eq!(read(4 * GIB, 0), 0, "unknown free figure never alarms");
     }
 
     /// Review focus 4: a set of unknown size (gauge 0) never fires
