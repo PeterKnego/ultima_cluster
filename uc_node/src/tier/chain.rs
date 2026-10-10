@@ -79,19 +79,11 @@ fn step(chunks: &[(u64, u64)], c: u64) -> Option<(u64, u64)> {
         .max_by_key(|&(_, t)| t)
 }
 
-/// Longest gap-free run of chunks from `start` (spec §4.5.4). The first chunk
-/// must BEGIN at `start` (a set's chain starts at its own position); later
-/// steps follow [`step`]. Returns `start` when none begins there.
+/// Longest gap-free run of chunks from `start` (spec §4.5.4), every step
+/// following [`step`] (ruling R3a: a set usually lies INSIDE a chunk).
+/// Returns `start` when no chunk covers it.
 pub fn reach_from(chunks: &[(u64, u64)], start: u64) -> u64 {
-    let Some(first) = chunks
-        .iter()
-        .copied()
-        .filter(|&(f, _)| f == start)
-        .max_by_key(|&(_, t)| t)
-    else {
-        return start;
-    };
-    let mut c = first.1;
+    let mut c = start;
     while let Some((_, t)) = step(chunks, c) {
         c = t;
     }
@@ -555,7 +547,8 @@ mod tests {
         let chunks = vec![(0, 64), (64, 128), (192, 256)];
         assert_eq!(reach_from(&chunks, 0), 128);
         assert_eq!(reach_from(&chunks, 192), 256);
-        assert_eq!(reach_from(&chunks, 100), 100);
+        assert_eq!(reach_from(&chunks, 100), 128);
+        assert_eq!(reach_from(&chunks, 130), 130);
         let l = TierListing {
             sets: vec![label(0), label(192)],
             incomplete_sets: vec![],
@@ -565,6 +558,22 @@ mod tests {
             watermark_of(&l),
             Some((192, 192, 256)),
             "the newer chain reaches further"
+        );
+    }
+
+    #[test]
+    fn a_set_inside_a_chunk_reaches_through_it() {
+        let chunks = vec![(0, 4096), (4096, 8192)];
+        assert_eq!(reach_from(&chunks, 1000), 8192);
+        let l = TierListing {
+            sets: vec![label(0), label(1000)],
+            incomplete_sets: vec![],
+            chunks: chunks.clone(),
+        };
+        assert_eq!(watermark_of(&l), Some((0, 1000, 8192)));
+        assert_eq!(
+            plan_chain(&chunks, 1000, 8192).unwrap(),
+            vec![(0, 4096), (4096, 8192)]
         );
     }
 
