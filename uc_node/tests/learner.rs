@@ -2229,8 +2229,8 @@ struct JoinFixture {
     _dir: tempfile::TempDir,
     voter: Node,
     /// The second voter, present only for [`JoinOpts::restart_shipper`] — it
-    /// is what holds the restarted leader's commit counter down (see the
-    /// fixture's own comment).
+    /// stays up across the shipper's restart and is what holds the restarted
+    /// leader's commit counter down (see the fixture's own comment).
     peer_voter: Option<Node>,
     learner: Node,
     /// The VOTER's instance dir. Unused since plan 1 task 5 re-pointed the
@@ -2263,8 +2263,9 @@ struct JoinOpts<'a> {
     /// fixtures; the restart case needs the table's frame-end position to
     /// land above the post-restart report ceiling — see `restart_shipper`.
     pre_frames: u64,
-    /// Stop and restart the voter between the purge and the joiner's first
-    /// NAK, and let NOTHING advance its commit counter afterwards.
+    /// Stop and restart the voter (the shipper) between the purge and the
+    /// joiner's first NAK, keep the second voter up, and let NOTHING advance
+    /// the restarted leader's commit counter afterwards.
     restart_shipper: bool,
 }
 
@@ -2356,9 +2357,12 @@ fn below_floor_join_with(app: &str, opts: JoinOpts<'_>) -> JoinFixture {
     // straight back to its whole log the moment it boots, and "before its
     // first commit advance" cannot be held open at all. With two voters the
     // quorum is both, so the peer's ceilinged report is the commit — and a
-    // peer whose declared row has no service pins it at `fsm_lag` forever.
-    // Its election window is skewed ~40x so node 0, the only node holding
-    // snapshot artifacts, is always the leader and always the shipper.
+    // JOINED peer whose declared row's `applied` reads 0 pins it at `fsm_lag`
+    // for as long as nothing moves that word. The peer is never restarted
+    // (see the restart block for why), and its election timeout is
+    // effectively infinite so it never campaigns: node 0, the only node
+    // holding snapshot artifacts, is always the leader and always the
+    // shipper, including after its own restart.
     let peer = opts.restart_shipper;
     let w_sock = peer.then(|| UdpSocket::bind("127.0.0.1:0").unwrap());
     let w_addr = w_sock.as_ref().map(|s| s.local_addr().unwrap());
@@ -2369,7 +2373,9 @@ fn below_floor_join_with(app: &str, opts: JoinOpts<'_>) -> JoinFixture {
     }
     let learners = vec![(l_id, l_addr)];
     const FAST_ELECTION_NS: (u64, u64) = (50_000_000, 100_000_000);
-    const SLOW_ELECTION_NS: (u64, u64) = (3_000_000_000, 5_000_000_000);
+    // Ten minutes: far past any test's life, so the peer never campaigns —
+    // not even while the shipper is down for its restart.
+    const SLOW_ELECTION_NS: (u64, u64) = (600_000_000_000, 601_000_000_000);
 
     let cfg = |id: NodeId, sock_addr: SocketAddr, d: PathBuf| NodeConfig {
         id,
@@ -2412,7 +2418,7 @@ fn below_floor_join_with(app: &str, opts: JoinOpts<'_>) -> JoinFixture {
     let w_dir = dir.path().join("v1");
     let mut voter =
         Node::start_with_socket(cfg(0, v_addr, v_dir.clone()), v_sock).expect("start voter");
-    let mut peer_voter = w_sock.map(|s| {
+    let peer_voter = w_sock.map(|s| {
         Node::start_with_socket(cfg(1, w_addr.unwrap(), w_dir.clone()), s)
             .expect("start peer voter")
     });
@@ -2427,10 +2433,12 @@ fn below_floor_join_with(app: &str, opts: JoinOpts<'_>) -> JoinFixture {
     // report is ceilinged at `fsm_lag` from the first byte and nothing ever
     // commits.
     let (mirror_stop, mirror_handle) = spawn_applied_mirror(std::sync::Arc::clone(&cnc), 0);
-    let peer_mirror = peer_voter.as_ref().map(|_| {
-        let p = CncPage::open_file(&w_dir.join("cnc2.dat"), app).expect("open peer cnc");
-        spawn_applied_mirror(p, 0)
-    });
+    let peer_cnc = peer_voter
+        .as_ref()
+        .map(|_| CncPage::open_file(&w_dir.join("cnc2.dat"), app).expect("open peer cnc"));
+    let peer_mirror = peer_cnc
+        .as_ref()
+        .map(|p| spawn_applied_mirror(std::sync::Arc::clone(p), 0));
 
     // Pre-traffic, so the table's frame lands high enough in the log that a
     // restarted shipper's report ceiling cannot reach it (see the restart
@@ -2511,16 +2519,28 @@ fn below_floor_join_with(app: &str, opts: JoinOpts<'_>) -> JoinFixture {
             });
         }
 
-        // Both voters go down and come back — a cluster restart, the honest
-        // shape of "the shipper was restarted". Nothing else is touched: the
-        // journals, the artifacts and the purged prefix are all still there.
+        // ONLY the shipper goes down and comes back; the peer voter stays up.
+        // Nothing else is touched: the journals, the artifacts and the purged
+        // prefix are all still there.
+        //
+        // This used to restart BOTH voters and lean on each fresh page's
+        // `applied` of 0 to pin the cluster's commit at `fsm_lag` — which was
+        // #95 itself (a whole-cluster cold restart that could never commit).
+        // With #95 fixed a node that has not yet JOINED reports uncapped, so a
+        // cold-restarted cluster commits its whole log and climbs straight past
+        // the table. The staging no longer depends on that defect: the peer
+        // here has ALREADY joined (it never went down), so its FSM report
+        // ceiling is live, and the row's `applied` is put back to 0 below.
         voter.stop();
-        if let Some(p) = peer_voter.take() {
-            p.stop();
+        // The peer's `applied` is whatever the stopped mirror last wrote (~ the
+        // log end), which would let its report — and so the commit — run past
+        // the table. Put it back to 0: the honest reading of a declared row
+        // with no service attached, which `spawn_applied_mirror` only ever
+        // stood in for while the fixture submitted.
+        if let Some(p) = peer_cnc.as_ref() {
+            p.service_slot(0).applied.store_release(0);
         }
         voter = Node::start(cfg(0, v_addr, v_dir.clone())).expect("restart the voter");
-        peer_voter =
-            w_addr.map(|a| Node::start(cfg(1, a, w_dir.clone())).expect("restart the peer voter"));
         cnc = CncPage::open_file(&v_dir.join("cnc2.dat"), app).expect("reopen voter cnc");
         // The cnc page is recreated ZEROED at every boot, and this fixture has
         // no real service to re-publish row 0's newest artifact position at
@@ -2533,20 +2553,23 @@ fn below_floor_join_with(app: &str, opts: JoinOpts<'_>) -> JoinFixture {
         // own `NewTerm` frame COMMITS (`ElectionSm::can_serve`), and the whole
         // point of this staging is that nothing above `fsm_lag` commits. That
         // is not a contrivance — it is exactly the state a cluster is in when
-        // a restarted peer's FSM has not caught up — and shipping a snapshot
-        // set is a SENDER-agent job that does not consult the serving flag.
+        // a peer's FSM has not caught up — and shipping a snapshot set is a
+        // SENDER-agent job that does not consult the serving flag. The peer
+        // never campaigns (its election timeout is ten minutes), so the
+        // restarted shipper wins on the peer's vote.
         await_until(30, "the restarted voter took the leadership again", || {
             voter.is_leader()
         });
-        // NOTHING advances the cluster's commit counter from here on: no
-        // client traffic, no ticks, no mirrored `applied` on either node.
+        // NOTHING advances the restarted leader's commit counter from here on:
+        // no client traffic, no ticks, no mirrored `applied` on either node.
         // `LogCounters` is deliberately not primed at boot
-        // (`uc_log/src/counters.rs:55`), and the PEER's report is clamped to
+        // (`uc_log/src/counters.rs:55`), so the leader re-derives commit from
+        // live reports, and the joined PEER's report is clamped to
         // `min_applied + fsm_lag` (`services::report_ceiling`) with
-        // `min_applied` back at 0 on its fresh page — so with a two-voter
-        // quorum the leader's commit sits at `fsm_lag` (`buffer_bytes / 4` =
-        // 64 KiB here) for as long as the test runs, far below a table frame
-        // that `pre_frames` put a quarter of a megabyte up the log.
+        // `min_applied` reset to 0 above — so with a two-voter quorum the
+        // leader's commit sits at `fsm_lag` (`buffer_bytes / 4` = 64 KiB here)
+        // for as long as the test runs, far below a table frame that
+        // `pre_frames` put a quarter of a megabyte up the log.
         let settle = Instant::now() + Duration::from_millis(500);
         while Instant::now() < settle {
             let c = voter.counters().commit.load_acquire();
@@ -2567,8 +2590,8 @@ fn below_floor_join_with(app: &str, opts: JoinOpts<'_>) -> JoinFixture {
         Node::start_with_socket(cfg(l_id, l_addr, l_dir.clone()), l_sock).expect("start learner");
     await_until(40, "learner caught up across the purged prefix", || {
         learner.counters().durable.load_acquire() >= frontier
-            // A restarted shipper's own commit counter is pinned at its report
-            // ceiling (see above), and a learner's commit is that number
+            // A restarted shipper's own commit counter is pinned at the peer
+            // voter's report ceiling (see above), and a learner's commit is that number
             // gossiped — so this half of the catch-up is meaningless there and
             // would simply time out. Durable + the floor assertion below are
             // what say the session completed.
@@ -2758,8 +2781,11 @@ fn a_leader_without_a_table_ships_none_and_the_joiner_installs_none() {
 /// gate would have shut); the artifact on the shipper's disk really carries
 /// the table; and the joiner's installed view really holds it at the same
 /// position. The pre-traffic in the fixture is what buys the first — the
-/// report ceiling after a restart is `0 + fsm_lag` = 64 KiB, and 2 000
-/// pre-frames put the table's frame end a quarter of a megabyte above it.
+/// still-running peer voter's report ceiling, with its row's `applied` at 0,
+/// is `0 + fsm_lag` = 64 KiB, and 2 000 pre-frames put the table's frame end a
+/// quarter of a megabyte above it. (Until #95 this was staged by restarting
+/// BOTH voters and relying on the cold-restart deadlock #95 fixed; only the
+/// shipper restarts now.)
 #[test]
 // Ruling P8: below-floor join needs a cluster artifact at the floor; until
 // Task 5 commands instants none exists.

@@ -406,15 +406,13 @@ reviewer wants a workload to attack.
   `uc2ctl catalog`, and a JSON shape meant for an AI to read —
   [spec §2 "Out"](superpowers/specs/2026-10-01-uc2-snapshot-catalog-design.md#2-scope),
   §6.3 and §12.
-- **A whole-cluster cold restart may never commit (reproduce on main).**
-  Found by the snapshot catalog's own test 4: when the log end sits past
-  `fsm_lag` at a cold start, `applied` stays `0`, the durable report ceiling
-  (`min_applied + fsm_lag`) pins at `fsm_lag`, the opening `NewTerm` frame
-  above it never commits, and every door answers `NodeBooting` forever —
-  worked around in that test with an applied-mirror stand-in rather than
-  fixed. Not yet verified on `main` without the catalog change; ruling R20
-  is "reproduce on main and ticket it, a flag-day defect if real", not "fix
-  it here". Recorded 2026-10-04.
+- **FIXED (#95, 2026-10-10): a whole-cluster cold restart never committed.**
+  Reproduced on `main` with explicit AND default `fsm_lag` (`uc_node/tests/cold_restart.rs`):
+  - At boot every row's `applied` reads `0`, so each node capped its durable reports at `0 + fsm_lag`.
+  - The new leader's `NewTerm` frame at the old log end could therefore never commit.
+  - A service cannot attach until its node has learned a commit (plan B3), so nothing could move `applied`. Every door answered `NodeBooting` forever.
+
+  The fix: until the node has joined (`declared_published`), pacing is measured from the log end the node booted with instead of `applied = 0`. The existing log can then commit, plus `fsm_lag` of new frames (always room for the `NewTerm` frame). A follower rejoining a live cluster stays paced. `learner.rs`'s restarted-shipper test had staged its scenario on this deadlock; it is restaged on a joined, unserviced peer's ordinary pacing. The catalog test-4 "applied mirror" workaround is removed. First recorded 2026-10-04 (catalog ruling R20).
 - **The `uc_service::apply` replay forward-progress guard has no counter.**
   Plan B3 T5 added a guard that hands the cycle back when a replay pass
   fails to advance the cursor (it used to spin forever, which also hung

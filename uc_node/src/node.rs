@@ -2393,6 +2393,7 @@ impl Node {
             test_now_ns: None,
             services: cfg.services,
             declared_published: false,
+            boot_durable: durable,
             declared_withheld_since_ns: None,
             declared_withheld_warned: false,
             snap_stats: Arc::clone(&route_drops),
@@ -3468,6 +3469,11 @@ struct Consensus {
     /// branch on a field that is already hot, not an atomic load (M14a: code
     /// in a hot loop's body costs even on paths that never run).
     declared_published: bool,
+    /// #95: the durable position this incarnation recovered at boot. Until
+    /// the node joins ([`Self::declared_published`]), FSM pacing measures
+    /// `fsm_lag` from here rather than from the fresh page's `applied = 0`
+    /// (see [`Self::publish_validated_frontier`]).
+    boot_durable: u64,
     /// Plan B3 final review F3: the `pass_mono_ns` of the first pass that
     /// found that gate SHUT, and whether the one `services_declared_withheld`
     /// warning has been emitted. Both are dead the moment the gate opens
@@ -12024,9 +12030,24 @@ impl Consensus {
         // than fsm_lag past the slowest FSM. `term_at(ceiling)` is the term
         // of the byte BELOW the ceiling (the same attestation as before:
         // `validated_term()` is `term_at(validated_up_to)`).
+        // #95: until this node has JOINED (published `services_declared`)
+        // no service can attach, so every row's `applied` is the fresh page's
+        // 0. Pacing at `0 + fsm_lag` held this node's reports below the new
+        // leader's NewTerm frame at the old log end — the very commit the
+        // join waits for — so a whole-cluster cold restart never committed.
+        // Before the join, pace from the log this node BOOTED with instead:
+        // the cluster's existing log may commit, plus `fsm_lag` of new frames
+        // (always room for the NewTerm frame: even lockstep's bound is one
+        // max-size frame). A follower rejoining a live, appending cluster
+        // stays paced at `fsm_lag` past what it already held.
+        let min_applied = if self.declared_published {
+            self.min_applied
+        } else {
+            self.min_applied.max(self.boot_durable)
+        };
         let ceiling = crate::services::report_ceiling(
             self.sm.validated_up_to(),
-            self.min_applied,
+            min_applied,
             self.fsm_lag_eff,
         );
         // Term first, then position (unchanged): a torn read fails the
@@ -14361,6 +14382,7 @@ mod tests {
             fsm_lag_eff: crate::services::fsm_lag_eff(&services, 1 << 16, 4096),
             services,
             declared_published: false,
+            boot_durable: 0,
             declared_withheld_since_ns: None,
             declared_withheld_warned: false,
             snap_stats: Arc::new(uc_net::receiver::FollowerStats::default()),
