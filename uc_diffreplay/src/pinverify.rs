@@ -457,6 +457,11 @@ mod sequence {
         /// [`scratch_dir_of`] the report.
         pub scratch: Option<PathBuf>,
         pub report: PathBuf,
+        /// Test hook (`--test-prune-origin`, hidden): delete the origin
+        /// artifact from the scratch instance dir right after the second
+        /// instant, standing in for the node's pruner (pin completion C7).
+        #[doc(hidden)]
+        pub test_prune_origin: bool,
     }
 
     /// The node for the length of a run, stopped on EVERY exit path — including
@@ -756,12 +761,23 @@ mod sequence {
             r.verdict = verdict(refusal_held, None, None);
             return Ok(r);
         }
+        // Save the origin artifact BEFORE the second instant: Q sits above
+        // the pin record and agrees on this one node, which completes the pin
+        // (pin completion C1), and once NEW has caught up to it the node may
+        // prune snap-P (C7) before the export below reads the instance dir.
+        let saved_origin = scratch.join(format!("origin-snap-{p}.ultsnap"));
+        std::fs::copy(live::artifact_path(&dir, a.row, p), &saved_origin)
+            .with_context(|| format!("saving the origin artifact snap-{p}"))?;
         // A second instant at Q, so the live state is an artifact NEW can project.
         let q = live::command_instant(node.node(), a.timeout)?;
         if !live::wait_for(|| live::artifact_path(&dir, a.row, q).is_file(), a.timeout) {
             bail!("row {} never published snap-{q}", a.row);
         }
         r.end = q;
+        if a.test_prune_origin {
+            std::fs::remove_file(live::artifact_path(&dir, a.row, p))
+                .with_context(|| format!("test hook: pruning snap-{p}"))?;
+        }
         match new.stop(a.timeout) {
             Ok(st) => r.notes.push(format!("NEW stopped at Q={q} with exit {st}")),
             Err(e) => r
@@ -793,7 +809,16 @@ mod sequence {
         let ec = match note_err(
             &mut r.notes,
             "exporting the corpus",
-            Corpus::export(&dir, &a.app_id, a.row, p, q, r.from, &exported),
+            Corpus::export_with_origin(
+                &dir,
+                &a.app_id,
+                a.row,
+                p,
+                q,
+                r.from,
+                &exported,
+                &saved_origin,
+            ),
         ) {
             Some(c) => c,
             None => return Ok(r),
