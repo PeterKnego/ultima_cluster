@@ -375,10 +375,19 @@ impl ClusterState {
         self.cap_catalog();
     }
 
-    /// Every row's newest pin origin — the sets retention must keep (D5).
+    /// Every row's newest pin origin whose pin is not yet COMPLETE — the
+    /// sets retention must keep (D5). Pin completion ruling C3: once the
+    /// catalog lists a completion set (an agreed set the pin's `to` line
+    /// built above the pin record, [`crate::catalog::pin_complete`]) the
+    /// origin is an ordinary agreed set, counted toward `retain_sets` and
+    /// retired like any other. Deterministic: a pure function of the
+    /// replicated pins, running records and catalog.
     fn pinned_origins(&self) -> Vec<u64> {
         (0..CNC_MAX_SERVICES as u8)
-            .filter_map(|row| self.pin_for(row).map(|p| p.origin))
+            .filter_map(|row| {
+                let gate = crate::catalog::pin_gate(&self.pins, &self.running, row)?;
+                (!crate::catalog::pin_complete(&self.catalog, row, &gate)).then_some(gate.origin)
+            })
             .collect()
     }
 
@@ -2644,10 +2653,22 @@ mod tests {
         assert_eq!(f.state().newest_agreed_at_most(1500), Some(1000));
     }
 
+    /// Report row 0 and the cluster row for the set at `p` (commanded
+    /// earlier), one hash each — the second half of [`agreed_set`].
+    fn agree(f: &mut ClusterFsm, p: u64, at: u64) {
+        assert_eq!(apply_at(f, at, &report(0, p, &[(0, 1, 0)])), 0);
+        assert_eq!(
+            apply_at(f, at + 10, &report(CLUSTER_ROW, p, &[(0, 1, 0)])),
+            0
+        );
+    }
+
     /// Ruling R21: a pinned origin is kept IN ADDITION to `retain_sets`,
-    /// never counted toward it. With `retain_sets = 2` and the oldest set
-    /// pinned, `[pin, A, B]` keeps all three; a fourth agreed set retires A
-    /// (the oldest UNPINNED one), never the pin.
+    /// never counted toward it — while the pin is INCOMPLETE. With
+    /// `retain_sets = 2` and the oldest set pinned, `[pin, A, B]` keeps all
+    /// three; a fourth agreed set retires A (the oldest UNPINNED one), never
+    /// the pin. A, B and C are commanded BELOW the pin record (agreed after
+    /// it), so none of them completes the pin (ruling C1's record bound).
     #[test]
     fn a_pinned_origin_does_not_count_toward_retain_sets() {
         let mut f = fsm();
@@ -2655,23 +2676,64 @@ mod tests {
         let cmd = settings_with_retain(&f, 2);
         assert_eq!(apply_at(&mut f, 200, &cmd), 0);
         agreed_set(&mut f, 1000, 1100);
+        for p in [2000, 3000, 4000] {
+            f.on_snapshot_frame(p, false, p);
+        }
         assert_eq!(
             apply_at(
                 &mut f,
-                1500,
+                4500,
                 &pin(0, pack_version(1, 0, 0), pack_version(1, 1, 0), 1000)
             ),
             0
         );
-        agreed_set(&mut f, 2000, 2100);
-        agreed_set(&mut f, 3000, 3100);
+        agree(&mut f, 2000, 4600);
+        agree(&mut f, 3000, 4700);
         assert_eq!(
             positions(&f),
-            vec![1000, 2000, 3000],
+            vec![1000, 2000, 3000, 4000],
             "the pin is kept beside two retained sets"
         );
-        agreed_set(&mut f, 4000, 4100);
+        agree(&mut f, 4000, 4800);
         assert_eq!(positions(&f), vec![1000, 3000, 4000], "A (2000) retires");
+    }
+
+    /// Pin completion ruling C3, the FSM half: an agreed set ABOVE the pin
+    /// record, on `to`'s line, completes the pin, and from that apply the
+    /// origin is an ordinary agreed set — counted toward `retain_sets` and
+    /// retired like any other. Deterministic: every replica applies the same
+    /// record and computes the same predicate.
+    #[test]
+    fn a_completed_pin_no_longer_protects_its_origin() {
+        let mut f = fsm();
+        genesis_row(&mut f, 0, 100);
+        let cmd = settings_with_retain(&f, 2);
+        assert_eq!(apply_at(&mut f, 200, &cmd), 0);
+        agreed_set(&mut f, 1000, 1100);
+        agreed_set(&mut f, 2000, 2100);
+        assert_eq!(
+            apply_at(
+                &mut f,
+                2500,
+                &pin(0, pack_version(1, 0, 0), pack_version(1, 1, 0), 2000)
+            ),
+            0
+        );
+        assert_eq!(positions(&f), vec![1000, 2000]);
+        // The first set above the record completes the pin: `[1000, 2000,
+        // 3000]` are now all unpinned, so the oldest retires.
+        agreed_set(&mut f, 3000, 3100);
+        let st = f.state();
+        let gate = crate::catalog::pin_gate(&st.pins, &st.running, 0).unwrap();
+        assert_eq!(gate.record_pos, 2500);
+        assert!(crate::catalog::pin_complete(&st.catalog, 0, &gate));
+        assert_eq!(positions(&f), vec![2000, 3000]);
+        agreed_set(&mut f, 4000, 4100);
+        assert_eq!(
+            positions(&f),
+            vec![3000, 4000],
+            "the completed pin's origin retires like any set"
+        );
     }
 
     #[test]
@@ -2956,14 +3018,6 @@ mod tests {
         assert_eq!(apply_at(&mut f, 200, &cmd), 0);
         agreed_set(&mut f, 1000, 1100);
         agreed_set(&mut f, 2000, 2100);
-        assert_eq!(
-            apply_at(
-                &mut f,
-                2300,
-                &pin(0, pack_version(1, 0, 0), pack_version(1, 1, 0), 1000)
-            ),
-            0
-        );
         genesis_row(&mut f, 1, 2500);
         assert!(
             f.state().catalog.iter().all(|e| e.is_agreed()),
@@ -2973,6 +3027,17 @@ mod tests {
         assert_eq!(f.state().newest_agreed_at_most(u64::MAX), Some(2000));
         // A set at 3000 must now cover rows 0 AND 1.
         f.on_snapshot_frame(3000, false, 3);
+        // Row 0 pinned at 1000 with its record ABOVE the frame, so the set
+        // at 3000 sits below the pin record and does not complete it (ruling
+        // C1) — the pinned origin must stay through retention below.
+        assert_eq!(
+            apply_at(
+                &mut f,
+                3050,
+                &pin(0, pack_version(1, 0, 0), pack_version(1, 1, 0), 1000)
+            ),
+            0
+        );
         assert_eq!(apply_at(&mut f, 3100, &report(0, 3000, &[(0, 1, 0)])), 0);
         assert_eq!(
             apply_at(&mut f, 3110, &report(CLUSTER_ROW, 3000, &[(0, 1, 0)])),
@@ -3076,17 +3141,25 @@ mod tests {
         let mut f = fsm();
         genesis_row(&mut f, 0, 100);
         agreed_set(&mut f, 1000, 1100);
+        // Both younger sets are commanded below the pin record, so neither
+        // completes the pin (ruling C1) and the origin stays protected.
+        f.on_snapshot_frame(2000, false, 2000);
+        f.on_snapshot_frame(3000, false, 3000);
         assert_eq!(
             apply_at(
                 &mut f,
-                1500,
+                3050,
                 &pin(0, pack_version(1, 0, 0), pack_version(1, 1, 0), 1000)
             ),
             0
         );
-        agreed_set(&mut f, 2000, 2100);
-        assert_eq!(positions(&f), vec![1000, 2000], "2000 is the newest agreed");
-        agreed_set(&mut f, 3000, 3100);
+        agree(&mut f, 2000, 3100);
+        assert_eq!(
+            positions(&f),
+            vec![1000, 2000, 3000],
+            "2000 is the newest agreed"
+        );
+        agree(&mut f, 3000, 3200);
         assert_eq!(positions(&f), vec![1000, 3000]);
     }
 
