@@ -1695,6 +1695,153 @@ def run_read_spread(hosts, members, sweep, secs, write_rate, admission_kib, reps
     return not failures, verdicts
 
 
+# ------------------------------------------------------ read-type matrix mode
+#
+# `--read-profile --rp-matrix`: every read type, on the leader and spread over
+# all three nodes, under a rising write load. Pre-committed questions and bars:
+# docs/benchmarks/uc2-read-types-under-writes-2026-10-10.md.
+#
+# An arm is (mode, placement):
+#   lin/leader  snap/leader  ryw/leader  snap/spread  ryw/spread
+# (a linearizable read is leader-only, so there is no lin/spread arm). For
+# every write rate in --rp-write-rates, each arm runs on a fresh cluster; the
+# write load comes from the leader-host client in every arm, so it is identical
+# across arms. Unlike the spread experiment, retries and a sagging depth are
+# RESULTS here (that is what read starvation looks like), not invalidity: a
+# rung is dropped only when a client crashes or two hosts serve.
+
+RM_ARMS = (("lin", "leader"), ("snap", "leader"), ("ryw", "leader"),
+           ("snap", "spread"), ("ryw", "spread"))
+
+
+def rm_client_args(host, leader_idx, idx, mode, readers, write_rate, secs):
+    follower = idx != leader_idx
+    args = [
+        "client", "--instance-dir", host.dir, "--app-id", APP,
+        "--secs", str(secs), "--readers", str(readers), "--mode", mode,
+        "--write-rate", str(0 if follower else write_rate),
+    ]
+    if follower:
+        args.append("--any-role")
+    return args
+
+
+def rm_run_rung(hosts, members, mode, place, readers, write_rate, secs, admission_kib,
+                out_dir, rep):
+    tag = f"w{write_rate}-{mode}-{place}-r{readers}-rep{rep}"
+    log(f"-- rung {tag}: booting a fresh 3-node cluster")
+    try:
+        leader = rp_start_cluster(hosts, members, admission_kib)
+    except RuntimeError as e:
+        return None, f"cluster bring-up failed: {e}"
+    if leader is None:
+        return None, f"no leader elected within {RP_LEADER_WAIT:.0f}s"
+    idxs = [leader] if place == "leader" else [0, 1, 2]
+    results = {}
+
+    def go(i):
+        args = rm_client_args(hosts[i], leader, i, mode, readers, write_rate, secs)
+        results[i] = hosts[i].run_foreground(args, timeout=secs + RP_CLIENT_SLACK)
+
+    threads = [threading.Thread(target=go, args=(i,)) for i in idxs]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    try:
+        rp_assert_single_serving(hosts, f"after rung {tag}")
+    except RuntimeError as e:
+        return None, str(e)
+    for i in idxs:
+        (out_dir / f"client-{tag}-h{i}.log").write_text(results[i][1])
+    per_host = []
+    for i in idxs:
+        rc, out = results[i]
+        line = rp_extract_rung(out) if rc == 0 else None
+        if line is None:
+            tail = " | ".join(out.strip().splitlines()[-3:])
+            return None, f"host {i} client exited {rc}, no rung line: {tail}"
+        r = json.loads(line)
+        resolved = r["reads"] + r["retried"] + r["not_leader"]
+        per_host.append({
+            "host": i, "role": "leader" if i == leader else "follower",
+            "reads_per_sec": r["reads_per_sec"], "p50_ms": r["p50_ms"], "p99_ms": r["p99_ms"],
+            "retried": r["retried"], "not_leader": r["not_leader"],
+            "retry_frac": (r["retried"] + r["not_leader"]) / resolved if resolved else 0.0,
+            "inflight_mean": r["inflight_mean"],
+            "writes_per_sec": r.get("writes_per_sec", 0.0),
+        })
+    lead = next(h for h in per_host if h["role"] == "leader")
+    rec = {
+        "mode": mode, "place": place, "readers_per_host": readers, "write_rate": write_rate,
+        "rep": rep,
+        "total_reads_per_sec": sum(h["reads_per_sec"] for h in per_host),
+        "writes_per_sec": lead["writes_per_sec"],
+        "p50_ms_max": max(h["p50_ms"] for h in per_host),
+        "p99_ms_max": max(h["p99_ms"] for h in per_host),
+        "retry_frac_max": max(h["retry_frac"] for h in per_host),
+        "depth_min_frac": min(h["inflight_mean"] for h in per_host) / readers,
+        "hosts": per_host,
+    }
+    return rec, "ok"
+
+
+def run_read_matrix(hosts, members, readers, write_rates, secs, admission_kib, reps, out_dir):
+    path = out_dir / "matrix-rungs.jsonl"
+    records, failures = [], []
+    total = len(write_rates) * len(RM_ARMS) * reps
+    n = 0
+    for rep in range(1, reps + 1):
+        for wr in write_rates:
+            # Rotate the arm order per (rep, rate) so no arm always runs first.
+            k = (rep + write_rates.index(wr)) % len(RM_ARMS)
+            arms = RM_ARMS[k:] + RM_ARMS[:k]
+            for mode, place in arms:
+                n += 1
+                log(f"== rung {n}/{total}: {mode}/{place} writes/s={wr} rep={rep} ==")
+                try:
+                    rec, detail = rm_run_rung(hosts, members, mode, place, readers, wr, secs,
+                                              admission_kib, out_dir, rep)
+                except Exception as e:
+                    rec, detail = None, f"orchestrator error: {e!r}"
+                finally:
+                    for h in hosts:
+                        try:
+                            h.teardown()
+                        except Exception:
+                            pass
+                if rec:
+                    records.append(rec)
+                    with path.open("a") as f:
+                        f.write(json.dumps(rec) + "\n")
+                    log(f"  reads {rec['total_reads_per_sec']:,.0f}/s  writes "
+                        f"{rec['writes_per_sec']:,.0f}/s  p50 {rec['p50_ms_max']:.3f}  p99 "
+                        f"{rec['p99_ms_max']:.3f} ms  retry {rec['retry_frac_max']:.1%}  depth "
+                        f"{rec['depth_min_frac']:.0%}")
+                else:
+                    log(f"  *** RUNG INVALID: {detail}")
+                    failures.append(f"{mode}/{place}/w{wr}/rep{rep}: {detail}")
+    log("== summary (mean over reps; p50/p99/retry = worst host) ==")
+    log(f"  {'writes/s':>9} {'arm':<12} {'reads/s':>11} {'writes ok/s':>12} {'p50 ms':>8} "
+        f"{'p99 ms':>8} {'retry':>7}")
+    for wr in write_rates:
+        for mode, place in RM_ARMS:
+            rs = [r for r in records if r["write_rate"] == wr and r["mode"] == mode
+                  and r["place"] == place]
+            if not rs:
+                log(f"  {wr:>9} {mode + '/' + place:<12} {'(no valid rung)':>11}")
+                continue
+            m = lambda k: sum(r[k] for r in rs) / len(rs)
+            log(f"  {wr:>9} {mode + '/' + place:<12} {m('total_reads_per_sec'):>11,.0f} "
+                f"{m('writes_per_sec'):>12,.0f} {m('p50_ms_max'):>8.3f} {m('p99_ms_max'):>8.3f} "
+                f"{m('retry_frac_max'):>7.1%}")
+    verdicts = [("rung-collection", not failures,
+                 f"{len(records)}/{total} rungs valid"
+                 + ("; " + " | ".join(failures) if failures else ""))]
+    log(f"artifacts: {out_dir}")
+    return not failures, verdicts
+
+
 # ---------------------------------------------------------------- entrypoints
 
 def build_local_hosts(gate_bin, root, count=4, ctl_bin=None, probe_bin=None):
@@ -1768,6 +1915,11 @@ def main():
     ap.add_argument("--rp-spread", action="store_true",
                     help="read-profile: the read-spread experiment (snapshot reads on the "
                          "leader only vs on all 3 hosts) instead of the lin/snap ladder")
+    ap.add_argument("--rp-matrix", action="store_true",
+                    help="read-profile: every read type (lin/snap/ryw) on the leader and "
+                         "spread, under each write rate in --rp-write-rates")
+    ap.add_argument("--rp-write-rates", default="0,20000,50000,100000,200000",
+                    help="read-matrix: comma-separated write loads (writes/s)")
     ap.add_argument("--rp-reps", type=int, default=2,
                     help="read-spread: repetitions per (arm, readers, mix) cell")
     ap.add_argument("--rp-out", default="",
@@ -1905,7 +2057,12 @@ def main():
             if args.local:
                 log("*** LOCAL: orchestration proof only — these numbers are NOT data "
                     "(3 nodes + 3 services + client share one box) ***")
-            if args.rp_spread:
+            if args.rp_matrix:
+                rates = [int(x) for x in args.rp_write_rates.split(",") if x.strip()]
+                ok, verdicts = run_read_matrix(
+                    hosts, members, sweep[-1], rates, args.rp_secs, args.rp_admission_kib,
+                    args.rp_reps, out_dir)
+            elif args.rp_spread:
                 ok, verdicts = run_read_spread(
                     hosts, members, sweep, args.rp_secs, args.rp_write_rate,
                     args.rp_admission_kib, args.rp_reps, out_dir)

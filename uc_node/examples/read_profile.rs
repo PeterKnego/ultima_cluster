@@ -183,8 +183,9 @@ use uc_node::{Node, NodeConfig};
 use uc_protocol::ring::{BroadcastConsumer, BroadcastRing, MpscRing, RingError};
 use uc_protocol::v2::cnc::NODE_FLAG_CAN_SERVE;
 use uc_protocol::v2::ipc::{
-    FLAG_V2_IS_QUERY, FLAG_V2_LINEARIZABLE, MSG_V2_NOT_LEADER, MSG_V2_QUERY, MSG_V2_RESPONSE,
-    MSG_V2_RETRY, MSG_V2_SUBMIT, client_from_extra, extra_client, write_query_payload,
+    FLAG_V2_IS_QUERY, FLAG_V2_LINEARIZABLE, FLAG_V2_MIN_POSITION, MSG_V2_NOT_LEADER,
+    MSG_V2_QUERY, MSG_V2_RESPONSE, MSG_V2_RETRY, MSG_V2_SUBMIT, client_from_extra, extra_client,
+    write_min_position_query_payload, write_query_payload,
 };
 use uc_service::{ApplyCtx, ServiceBuilder, ServiceConfig, StateMachine};
 
@@ -314,6 +315,12 @@ enum Mode {
     Lin,
     /// Snapshot read: forwarded straight to the service (`node.rs:1958`).
     Snap,
+    /// Read-your-writes read (`FLAG_V2_MIN_POSITION`): the token is the
+    /// attached node's OWN commit position at send time — the freshest token a
+    /// real client could carry (it has just seen a write commit), so this
+    /// exercises the wait/park path as hard as real use can. On the leader
+    /// that is "linearizable minus the quorum round".
+    Ryw,
 }
 
 #[derive(clap::Args)]
@@ -969,6 +976,7 @@ fn run_read_measurement(
     let flags = match mode {
         Mode::Lin => FLAG_V2_LINEARIZABLE,
         Mode::Snap => 0,
+        Mode::Ryw => FLAG_V2_MIN_POSITION,
     };
 
     let send_ns: Arc<Box<[AtomicU64]>> = Arc::new(
@@ -1119,7 +1127,15 @@ fn run_read_measurement(
         send_ns[idx].store(t0.elapsed().as_nanos() as u64, Ordering::Release);
         owner[idx].store(local_seq as u64 + 1, Ordering::Release);
         let extra = extra_client(client_id, local_seq);
-        write_query_payload(0, &query_bytes, &mut query_payload);
+        if mode == Mode::Ryw {
+            // Token 0 would be a plain snapshot read; a fresh cluster's commit
+            // is non-zero after genesis, and `max(1)` keeps the record a
+            // genuine min-position read even then.
+            let token = cnc.counters().commit.load_acquire().max(1);
+            write_min_position_query_payload(0, token, &query_bytes, &mut query_payload);
+        } else {
+            write_query_payload(0, &query_bytes, &mut query_payload);
+        }
         loop {
             match query_producer.try_write(MSG_V2_QUERY, flags, extra, &query_payload) {
                 Ok(()) => break,
@@ -1379,6 +1395,7 @@ fn print_read_report(mode: Mode, readers: u64, write_rate: u64, s: &ReadStats, o
     let arm = match mode {
         Mode::Lin => "linearizable (probe barrier)",
         Mode::Snap => "snapshot (no barrier)",
+        Mode::Ryw => "read-your-writes (token = node commit)",
     };
     println!();
     println!("========== uc2 read profile: {arm} ==========");
@@ -1503,7 +1520,7 @@ fn run_client_role(a: ClientArgs) -> anyhow::Result<()> {
         );
     }
     anyhow::ensure!(
-        !a.any_role || (a.mode == Mode::Snap && a.write_rate == 0),
+        !a.any_role || (a.mode != Mode::Lin && a.write_rate == 0),
         "--any-role takes --mode snap and --write-rate 0 only: a follower answers a \
          linearizable read or a write with NOT_LEADER"
     );
@@ -1582,6 +1599,9 @@ struct Rung {
     pub inflight_mean: f64,
     pub inflight_min: u64,
     pub regression: u64,
+    /// Writes the background writer got accepted per second of the run (the
+    /// write load actually achieved, vs `write_rate`, the target).
+    pub writes_per_sec: f64,
     /// Occupancy ranking, busiest (fewest yields) first, agent threads only.
     pub agents: Vec<AgentRank>,
 }
@@ -1609,6 +1629,11 @@ impl Rung {
             inflight_mean: s.inflight_mean,
             inflight_min: s.inflight_min,
             regression: s.regression,
+            writes_per_sec: if s.elapsed.as_secs_f64() > 0.0 {
+                s.writes_accepted as f64 / s.elapsed.as_secs_f64()
+            } else {
+                0.0
+            },
             agents: agent_rows(occ)
                 .into_iter()
                 .map(|o| AgentRank {
@@ -1624,6 +1649,7 @@ impl Rung {
         match self.mode {
             Mode::Lin => "lin",
             Mode::Snap => "snap",
+            Mode::Ryw => "ryw",
         }
     }
 
@@ -1631,6 +1657,7 @@ impl Rung {
         match self.mode {
             Mode::Lin => "linearizable",
             Mode::Snap => "snapshot",
+            Mode::Ryw => "read-your-writes",
         }
     }
 
@@ -1692,7 +1719,7 @@ fn rung_to_json(r: &Rung) -> String {
         "{{\"rung\":1,\"mode\":\"{}\",\"readers\":{},\"write_rate\":{},\"reads\":{},\
          \"reads_per_sec\":{},\"p50_ms\":{},\"p99_ms\":{},\"retried\":{},\"not_leader\":{},\
          \"overwritten\":{},\"inflight_at_end\":{},\"inflight_mean\":{},\"inflight_min\":{},\
-         \"regression\":{},\"agents\":[{}]}}",
+         \"regression\":{},\"writes_per_sec\":{},\"agents\":[{}]}}",
         r.mode_str(),
         r.readers,
         r.write_rate,
@@ -1707,6 +1734,7 @@ fn rung_to_json(r: &Rung) -> String {
         r.inflight_mean,
         r.inflight_min,
         r.regression,
+        r.writes_per_sec,
         agents
     )
 }
@@ -1779,6 +1807,7 @@ fn rung_from_json(line: &str) -> Option<Rung> {
     let mode = match json_str(head, "mode")? {
         "lin" => Mode::Lin,
         "snap" => Mode::Snap,
+        "ryw" => Mode::Ryw,
         _ => return None,
     };
     Some(Rung {
@@ -1796,6 +1825,7 @@ fn rung_from_json(line: &str) -> Option<Rung> {
         inflight_mean: json_f64(head, "inflight_mean").unwrap_or(0.0),
         inflight_min: json_u64(head, "inflight_min").unwrap_or(0),
         regression: json_u64(head, "regression").unwrap_or(0),
+        writes_per_sec: json_f64(head, "writes_per_sec").unwrap_or(0.0),
         agents,
     })
 }
@@ -2399,6 +2429,7 @@ mod tests {
             inflight_mean: readers as f64,
             inflight_min: readers,
             regression: 0,
+            writes_per_sec: 0.0,
             agents: vec![agent(top, 10, 100.0), agent("uc2-archive", 11, 1_000.0)],
         }
     }
