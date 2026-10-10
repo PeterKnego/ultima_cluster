@@ -37,7 +37,7 @@ instance directory, copied by hand (`uc_node/src/backup.rs`,
 
 - A **tier format** in a filesystem directory: agreed snapshot sets and the
   committed journal between them, position-keyed, safe for several writers
-  without locks (§4).
+  without locks, zstd-compressed per block (§4).
 - A **writer**: a background agent on nodes configured with `[backup]` (§5),
   including a **purge hold** on the writer's own node (§5.4).
 - The **watermark**: `CLUSTER` kind `7` `BackupWatermark`, one entry per tier,
@@ -76,6 +76,7 @@ instance directory, copied by hand (`uc_node/src/backup.rs`,
 | D8 | **Tier retention is a replicated policy the writer applies; the default keeps everything.** | One policy for several writers; a new backup never deletes until told to. Pinned data follows the maintainer's node rule: kept while the pin is incomplete, then ordinary retention. |
 | D9 | **One builder, four restores.** A whole-cluster restore and a fork require explicit confirmation; a single-node restore is **always under a new node id**. | A restored node's vote is empty by design; under a reused id that is a forgotten vote, which the replace-hardware rule already forbids (`change-cluster-membership.md` § Replace hardware). |
 | D10 | **A fork replays no side effects; every other restore replays them from the start set** (at-least-once). | A fork is a copy for inspection; its outputs already happened in the real world. Recovery keeps the existing at-least-once contract — an effect may repeat, none is skipped. |
+| D11 | **The tier compresses with zstd, per 1 MiB block, on by default; the node's own journal and snapshots stay uncompressed.** Checks are over raw bytes. | The tier is written once, read rarely and kept long — where CPU-for-space pays. Journal frames (32 B alignment padding, repeated headers) are the likely win; snapshots depend on the app, and incompressible blocks are stored raw. The node's journal is on the commit path and is the retransmit source, so compressing it is a separate measured question. Maintainer's call, 2026-10-10. |
 
 ## 4. The tier format
 
@@ -85,18 +86,49 @@ instance directory, copied by hand (`uc_node/src/backup.rs`,
 <target>/
   TIER                          tier identity (§4.2)
   sets/<P>/                     one agreed set, P = the instant's position (20-digit, zero-padded)
-      row-<id>.ultsnap          each declared row's artifact, byte for byte (ULTSNAP2 envelope included)
-      cluster.ultcluster        the cluster FSM's artifact at P
+      row-<id>.ultsnap          each declared row's artifact (ULTSNAP2 envelope included), in a tier object (§4.1.1)
+      cluster.ultcluster        the cluster FSM's artifact at P, in a tier object
       SET                       the set's label (§4.3) — written LAST
   journal/<from>-<to>.ultj      committed log bytes [from, to) (20-digit, zero-padded)
   .tmp/                         in-progress writes; anything here is garbage
 ```
 
-A `.ultj` chunk is a 32-byte header — magic `ULTJCHK1`, `from` u64 LE, `to`
-u64 LE, CRC32C of the body u32 LE, 4 reserved zero bytes — then exactly
-`to − from` bytes of the log, starting and ending on frame boundaries (both
-positions are frame ends, multiples of `FRAME_ALIGNMENT`). The body is the
-log's own frames, so a reader walks it with the existing frame iterator.
+A `.ultj` chunk holds exactly `to − from` bytes of the log, starting and
+ending on frame boundaries (both positions are frame ends, multiples of
+`FRAME_ALIGNMENT`), in a tier object. Its raw bytes are the log's own frames,
+so a reader walks them with the existing frame iterator.
+
+#### 4.1.1 Tier objects and compression
+
+Every data file in the tier (artifact or chunk) is a **tier object**: a
+48-byte header, then a sequence of blocks.
+
+```
+magic [u8;8] (ULTTOBJ1 artifact | ULTJCHK1 chunk) ‖ codec u8 (0 none, 1 zstd) ‖
+reserved [u8;7] ‖ raw_len u64 ‖ crc32c(raw bytes) u32 ‖ reserved u32 ‖
+from u64 ‖ to u64                      (chunk: the range; artifact: both 0)
+block := stored_len u32 ‖ raw_len u32 ‖ stored bytes      (raw_len ≤ 1 MiB)
+```
+
+- **Codec per object**, chosen by the writer (`[backup] compression`, §5.1);
+  every reader handles both. A zstd block is one independent zstd frame, so a
+  restore stopping at Q inside a chunk decompresses only the blocks it needs,
+  and damage costs one block. Restore streams block by block and never holds
+  a whole object in memory.
+- **Every check is over the raw bytes**: the header CRC, a chunk's frame walk,
+  the agreed artifact hash, the `Exists` comparison between writers (§5.2) and
+  `tier verify --deep`. Two writers with different codecs or levels therefore
+  produce equal objects by every rule a reader applies.
+- **Incompressible blocks are stored raw** (a zstd block whose output is not
+  smaller is written with `stored_len == raw_len` and the raw bytes, flagged
+  by equality), so an app that compresses its own snapshots pays almost
+  nothing.
+- **The node's own journal and snapshots are not compressed** — only the tier
+  is. The node's journal is on the commit path and is the retransmit source;
+  compressing it is a separate, measured question (`docs/BACKLOG.md`).
+- Dependency: the `zstd` crate (BSD-3/MIT; builds bundled C `zstd-sys`, the
+  workspace's first C dependency outside examples), admitted through
+  `deny.toml` and the MSRV 1.89 gate.
 
 ### 4.2 `TIER`
 
@@ -110,7 +142,8 @@ reader reads it. A writer whose `app_id` differs refuses the target by name
 
 Text, `key=value`: `position`, `kind` (`full`/`standby`), `time_ns` (the
 catalog entry's log time), then per row `row.<id>.hash`, `row.<id>.version`,
-`row.<id>.size`, and `cluster.hash`, `cluster.size`. The hashes are the
+`row.<id>.size`, and `cluster.hash`, `cluster.size` (sizes are RAW lengths,
+as the catalog records them; the stored length is the object's own business). The hashes are the
 **catalog's agreed hashes**, not the writer's recomputation; the writer
 checks its local files hash to them before copying (§5.2). A set directory
 without `SET` is not a set.
@@ -154,6 +187,8 @@ in-flight file is not taken from under it).
 target = "/mnt/uc-backup"        # required to enable; absent section = no writer
 chunk_bytes = "64MiB"            # cut a journal chunk at this much committed history
 quiet_interval = "60s"           # or after this long with any uncut history
+compression = "zstd"             # "zstd" (default) | "none" — the tier objects this writer writes
+compression_level = 3            # zstd level, 1..=19
 ```
 
 Node-local (`node.toml`), not replicated: paths differ per host. The writer
@@ -393,7 +428,10 @@ excluded by the 0.11.0 flag day.
 
 ## 11. Proof
 
-1. **Format** (`uc_node::tier` unit tests): write-once, `Exists` comparison,
+1. **Format** (`uc_node::tier` unit tests): tier-object round trip for both
+   codecs (incompressible block stored raw; partial read to a block boundary;
+   a corrupted block fails its CRC by name), write-once, `Exists` comparison
+   across codecs,
    `.tmp` cleanup age rule, `SET`-last visibility, chunk header + CRC round
    trip, chain computation with gaps and overlaps, overlap mismatch.
 2. **Writer** (in-process, `uc_node/tests/backup_tier.rs`): sets copied only
@@ -421,7 +459,10 @@ excluded by the 0.11.0 flag day.
    the kv example.
 9. **New node**: seeded from the tier, added, catches up; `restore_id_reused`
    refuses an existing id.
-10. Fuzz: a `uc_node_tier_chunk` target over the chunk header + frame walk.
+10. Fuzz: a `uc_node_tier_object` target over the tier-object header, block
+    decode (both codecs) and a chunk's frame walk.
+11. Size smoke (not a gate): raw vs stored bytes for the kv example's journal
+    and snapshots, recorded in the plan's ledger so the default is grounded.
 
 ## 12. Documentation
 

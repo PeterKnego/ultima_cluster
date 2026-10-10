@@ -400,6 +400,14 @@ reviewer wants a workload to attack.
   set is also open —
   [spec §2 "Out"](superpowers/specs/2026-10-01-uc2-snapshot-catalog-design.md#2-scope)
   and §12.
+- **Compressing the node's own journal (idea, unmeasured).** The backup tier
+  compresses what it writes off-node (spec
+  `superpowers/specs/2026-10-10-uc2-backup-tier-design.md` D11); the node's
+  live journal stays raw because the archive agent writes it on the commit
+  path and the sender resends straight from it. If node disk ever binds,
+  measure the archive hop alone with and without per-block zstd before
+  deciding — it would also change the on-disk block format (a flag day).
+  Recorded 2026-10-10.
 - **Project 4 (not this spec): the operator / AI surface.** A live read of
   the catalog that does not wait for the first cluster artifact (today only
   `read_committed_catalog`'s offline read and five `/metrics` gauges exist),
