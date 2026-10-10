@@ -225,6 +225,16 @@ pub(crate) fn replay_into<S: RawStateMachine>(
     instant: ReplayInstant<'_, S>,
     gap_above: Option<u64>,
 ) -> Result<Replay, ServiceError> {
+    // Task 8 ruling R6, checked: a forced pass's stall evidence is the
+    // follower's own unmoved cursor — the apply loop records
+    // `replay_stalled = Some(cursor)` and passes `resume = cursor` — so the
+    // two always name one position. A stale `gap_above` from an earlier
+    // cursor would raise the guard from the wrong place.
+    debug_assert!(
+        gap_above.is_none_or(|g| g == instant.resume),
+        "gap_above {gap_above:?} != resume {}",
+        instant.resume
+    );
     let reader = TailReader::open(journal_dir).map_err(|e| ServiceError::Replay(e.to_string()))?;
     let mut guard = sm.lock().unwrap();
     // The live rejoin point: advances over every frame walked (applied,
@@ -266,6 +276,9 @@ pub(crate) fn replay_into<S: RawStateMachine>(
     } else {
         sm_pos
     };
+    // Final review M1: where the pass stood BEFORE any start-set jump — the
+    // position F1's raise below measures from.
+    let pre_jump = start_pos;
     // Snapshot-lifecycle spec §5, overrun recovery: jump on the node's start
     // set before the journal scan, when it moves the row forward and the row
     // may take one (plan ruling P5 — no pin now, no newer version record).
@@ -315,8 +328,15 @@ pub(crate) fn replay_into<S: RawStateMachine>(
     // and constrains the covering artifact to sit strictly ABOVE that cursor —
     // so the install can only move the row forward, never rewind it onto a
     // journal tail that does not continue it.
+    //
+    // Final review M1: raised from `pre_jump`, not `start_pos`. The stall
+    // evidence is about `floor` (the follower's cursor), never about a start
+    // set this pass has just jumped to; raising from the jump's `at` demanded
+    // an artifact strictly above the one just installed — usually none, so a
+    // spurious `SnapshotRequired`. After a jump past `floor` the guard no
+    // longer fires and the scan runs from `at`.
     if let Some(floor) = gap_above {
-        first = first.max(start_pos.max(floor).saturating_add(1));
+        first = first.max(pre_jump.max(floor).saturating_add(1));
     }
     if first > start_pos {
         // A covering snapshot must reach at least `first` (so the snapshot's
@@ -711,7 +731,15 @@ pub(crate) fn replay_into<S: RawStateMachine>(
     // starting at the follower's cursor, R5, on a block based there). Safe
     // for the same reason: `start_pos` is `max(SM cursor, follower cursor)`
     // and every byte below the follower's cursor is already in the SM, so
-    // nothing below the straddling frame was skipped.
+    // nothing below the straddling frame was skipped. The other case,
+    // `start_pos == sm_pos >= resume`, cannot reach this branch at all:
+    // `sm_pos` is the start of a frame the SM already APPLIED, so its end
+    // was at or below an earlier target and targets never shrink — it
+    // cannot straddle this one. A forced pass (`gap_above`) starts at
+    // `sm_pos` too and, besides, meets F1's raised gap guard before any
+    // scan (pinned by `a_forced_pass_never_takes_the_start_pos_straddle_wait`);
+    // after a jump or an install, `cursor == start_pos` and the #77 test
+    // above already answered.
     if straddle_at == Some(start_pos) {
         return Ok(Replay::AwaitCommit(start_pos));
     }

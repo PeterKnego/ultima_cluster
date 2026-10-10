@@ -2073,15 +2073,23 @@ mod tests {
     }
 
     /// Final review M4: reaching a version record in a replay pass proves the
-    /// journal SERVED the cursor, so the stall episode is over even when the
-    /// follower's cursor did not move — `AwaitVersion` clears `replay_stalled`
-    /// unconditionally. Shape: the row already waits AT the record (cursor ==
-    /// the record, the SM's own frontier below it), the ring lapped meanwhile,
-    /// and a prior no-progress pass left a stall recorded. The forced gap pass
-    /// installs a covering artifact, replays the tail up to the record, and
-    /// rejoins AT it — the same cursor, so `moved` is false.
+    /// journal SERVED the cursor, so the stall episode is over —
+    /// `AwaitVersion` clears `replay_stalled` unconditionally. Shape: a prior
+    /// no-progress pass left a stall recorded AT the follower's lapped cursor
+    /// (frame 100, the SM's own frontier). The forced gap pass installs a
+    /// covering artifact above it, replays the tail up to the record, and
+    /// rejoins AT the record.
+    ///
+    /// Snapshot-lifecycle final wave (ruling R17): this test used to stage
+    /// the stall at frame 100 with the follower already waiting AT the record
+    /// — `gap_above != resume`, the state Task 8's ruling R6 argues
+    /// unreachable (a stall is recorded at the follower's own cursor, and a
+    /// lapped cursor never gets `Frames` to move it without clearing the
+    /// stall). `replay_into` now `debug_assert!`s R6, so the test stages the
+    /// reachable shape; the "without moving" half of M4 is guarded by that
+    /// assert instead.
     #[test]
-    fn a_replay_that_reaches_a_version_record_ends_the_stall_even_without_moving() {
+    fn a_replay_that_reaches_a_version_record_ends_the_stall() {
         let dir = scratch();
         let cnc = page(0x3434);
         cnc.store_services_declared(0b1);
@@ -2117,8 +2125,8 @@ mod tests {
 
         let (mut st, _cnc2, _sc2, _ap2, _dir2) = apply_state_for_test(CountSm::default());
         st.cnc = Arc::clone(&cnc);
-        // Waiting AT the record; the SM's own frontier is frame 100's end.
-        st.follower = uc_log::reader::LogFollower::new(std::sync::Arc::clone(&buffer), rec.0);
+        // Stalled at frame 100 (lapped), the SM's own frontier there too.
+        st.follower = uc_log::reader::LogFollower::new(std::sync::Arc::clone(&buffer), pos[100]);
         st.sm.lock().unwrap().last = Some(pos[100]);
         st.journal_dir = journal_dir;
         st.instance_id = 0x3434;
@@ -2144,7 +2152,7 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(5))
             .expect("a pending record must end the replay, not spin");
         assert!(progressed);
-        assert_eq!(st.follower.cursor, rec.0, "rejoined AT the record, unmoved");
+        assert_eq!(st.follower.cursor, rec.0, "rejoined AT the record");
         let sm = st.sm.try_lock().expect("not held, not poisoned");
         assert_eq!(
             sm.last,
@@ -2508,6 +2516,127 @@ mod tests {
             "exactly the frames from B up"
         );
         assert_eq!(sm.last, Some(pos[pos.len() - 1]));
+    }
+
+    /// Final review M1 (ruling R17): a FORCED pass (`gap_above`, plan B3 F1)
+    /// that first jumps to the node's start set at `at` must raise the gap
+    /// guard from where it stood BEFORE the jump. The stall evidence is about
+    /// the follower's cursor `b`, not `at`; raising from `at` demanded a
+    /// covering artifact strictly above the start set it had just installed,
+    /// found none (the start set IS the newest artifact), and fail-stopped a
+    /// healthy row with `SnapshotRequired`.
+    #[test]
+    fn a_forced_pass_that_jumps_to_a_start_set_measures_the_gap_from_before_the_jump() {
+        let dir = scratch();
+        let (st, pos, head) = a_lapped_row(&dir, 0x0e01, false);
+        let b = pos[500];
+        let j = 800;
+        let at = pos[j];
+        *st.sm.lock().unwrap() = CountSm {
+            applies: 0,
+            last: Some(pos[499]),
+        };
+        let store = crate::snapshots::SnapshotStore::open(dir.path(), 0).unwrap();
+        store
+            .publish(at, 0, |w| w.write_all(b"snap").map_err(Into::into))
+            .unwrap();
+        st.cnc.service_slot(0).snapshot_pos.store_start_set(at, 0);
+        let installs = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let counted = Arc::clone(&installs);
+        let restore = super::SnapshotRestore::<CountSm> {
+            store,
+            install: Box::new(move |sm, p, _r| {
+                counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                sm.last = Some(p - FRAME);
+                Ok(p)
+            }),
+        };
+        let mut trigger = None;
+        let out = crate::replay::replay_into(
+            &st.sm,
+            &st.cnc,
+            &st.journal_dir,
+            Some(&restore),
+            crate::replay::ReplayInstant {
+                trigger: &mut trigger,
+                node_flags: 0,
+                service_id: 0,
+                pin: None,
+                decided_to: b,
+                resume: b,
+            },
+            Some(b),
+        );
+        let out = match out {
+            Ok(o) => o,
+            Err(e) => panic!("a forced pass that jumped to the start set fail-stopped: {e}"),
+        };
+        assert_eq!(
+            installs.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the start set installed once, no covering install on top"
+        );
+        assert!(
+            matches!(out, crate::replay::Replay::Rejoin(c) if c == head),
+            "{out:?}"
+        );
+        let sm = st.sm.lock().unwrap();
+        assert_eq!(
+            sm.applies,
+            (pos.len() - j) as u64,
+            "exactly the frames from the start set up"
+        );
+    }
+
+    /// R14 re-review minor 1: a FORCED pass never takes the
+    /// `straddle_at == start_pos` wait. Same shape as the R14 test above (SM
+    /// at A, follower at B, the journal's first block based at B, commit 32 B
+    /// into B's frame), but forced: the pass starts at the SM's own cursor
+    /// and F1 raises the gap guard above `max(start_pos, B)`, so with no
+    /// install capability it is the named `SnapshotRequired` — the gap guard
+    /// runs before any scan, and the straddle at B is never reached.
+    #[test]
+    fn a_forced_pass_never_takes_the_start_pos_straddle_wait() {
+        let dir = scratch();
+        let (st, pos, _head) = a_lapped_row(&dir, 0x1415, false);
+        let mut archive = uc_log::archive::Archive::open(uc_log::archive::ArchiveConfig {
+            segment_size_bytes: 16 * 1024,
+            preallocate_segments: false,
+            ..uc_log::archive::ArchiveConfig::new(&st.journal_dir)
+        })
+        .unwrap();
+        let b = archive.purge_below(pos[700]).unwrap();
+        drop(archive);
+        let k = pos
+            .iter()
+            .position(|&x| x == b)
+            .expect("B is a frame start");
+        st.sm.lock().unwrap().last = Some(pos[k - 1]);
+        st.cnc.counters().commit.store_release(b + 32);
+        let mut trigger = None;
+        let out = crate::replay::replay_into::<CountSm>(
+            &st.sm,
+            &st.cnc,
+            &st.journal_dir,
+            None,
+            crate::replay::ReplayInstant {
+                trigger: &mut trigger,
+                node_flags: 0,
+                service_id: 0,
+                pin: None,
+                decided_to: b,
+                resume: b,
+            },
+            Some(b),
+        );
+        assert!(
+            matches!(
+                out,
+                Err(crate::config::ServiceError::SnapshotRequired { .. })
+            ),
+            "a forced pass is the gap guard, never the commit wait: {out:?}"
+        );
+        assert_eq!(st.sm.lock().unwrap().applies, 0);
     }
 
     /// Task 8 review Important-1 / ruling R5: a row that just installed an
