@@ -1324,29 +1324,21 @@ fn two_fsm_slow_lockstep() {
 /// via the process-global `lincheck_v2::INSTALLS` static — see that static's
 /// doc for the single-user-in-this-binary discipline this test relies on.
 ///
-/// **Adaptation found during TDD Step 3 (reported in task-11-report.md):**
-/// the gap guard is only ever CONSULTED when the apply loop's `next_batch`
-/// returns `Overrun` (`uc_service/src/apply.rs:361-365`) — i.e. when the
-/// fresh, empty service's `start_pos == 0` read is no longer covered by the
-/// LIVE ring buffer (`append + max_claim() > pos + capacity`,
-/// `uc_log/src/buffer.rs:415-419`), not merely by the archived journal. The
-/// brief's literal body (3000 writes against the harness's then-hardcoded
-/// 4 MiB ring, ~52 B/frame observed, ~156 KB total) never wraps that ring,
-/// so `crash_and_restart_leader_service` (node stays up, ring buffer
-/// untouched) reads position 0 straight off the still-live buffer and NEVER
-/// calls `replay_into` at all — `INSTALLS` measured 0, not 1, with purge on
-/// (confirmed empirically). First attempt at a fix (blowing `WRITE_COUNT` up
-/// to 100 000 to out-write the fixed 4 MiB ring) worked but made every run
-/// take 10+ minutes under this box's contention — a real hang risk, not just
-/// slow. The actual fix: `ClusterCfg::buffer_bytes` (added to the harness,
-/// `uc_node/tests/lincheck_v2/mod.rs`, default `1 << 22` byte-identical to
-/// the prior hardcoded value — every other capstone unaffected) lets this
-/// test shrink the RING instead of inflating the write volume, restoring the
-/// brief's original write count and its sub-30s budget.
+/// Since the snapshot lifecycle (spec D1/§5) the restarted service installs
+/// the newest agreed set its node holds through the start rule at attach,
+/// independent of whether the live ring has wrapped and of the purge posture;
+/// the replay gap guard does not install it a second time (R5). This test
+/// therefore no longer exercises the replay-only fallback (that is covered by
+/// the `start_set` unit tests). History: under the pre-lifecycle rule the
+/// install happened only via the gap guard, which needed the ring wrapped
+/// past `start_pos`, so `ClusterCfg::buffer_bytes` shrinks the RING (default
+/// `1 << 22`, unchanged for every other capstone) rather than inflating the
+/// write volume; the small ring is kept because it keeps the run short and
+/// still exercises the purge-on journal-gap path.
 fn restart_installs(purge: bool) -> u32 {
     // ~156 KB at 3000 writes (observed ~52 B/frame) comfortably exceeds a
     // 64 KiB ring — see the doc above for why the ring, not the write count,
-    // is what must be small.
+    // is kept small.
     const WRITE_COUNT: u64 = 3_000;
     const LAST_VALUE: u64 = WRITE_COUNT - 1;
     const RING_BYTES: u64 = 1 << 16; // 64 KiB
