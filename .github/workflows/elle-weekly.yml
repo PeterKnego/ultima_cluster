@@ -43,3 +43,16 @@ jobs:
           java-version: '21'
       - name: Elle mutation suite (control clean + 3 teeth caught)
         run: scripts/elle_mutation.sh
+      # The driver logs and elle-cli's stderr are the only record of WHY a tooth
+      # read "missing" or "checker-failed" — keep them when the suite fails
+      # (histories excluded: they are large and regenerable).
+      - name: Upload mutation logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: elle-mutation-logs
+          path: |
+            ~/.cache/uc2-elle-mut/*.log
+            ~/.cache/uc2-elle-mut/**/*.elle.err
+          if-no-files-found: ignore
+          retention-days: 14
