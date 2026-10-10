@@ -423,3 +423,13 @@ execution ledger (PF = pre-flight, R = execution rulings).
 - **R8 — a 1 s floor after any fetch timeout.** The floor is set on every
   timeout, auto or operator's, and survives retargeting, so chasing a newer
   set cannot bypass the straggler-residual wait of P15.
+- **R16 — a pinned row keeps starting from its pin's origin.** Rule 1 is
+  read literally: pins never retire, so a row that has ever been pinned
+  never takes a start set — the version rule the maintainer chose to keep;
+  relaxing it (a start set above the origin on the pin's `to` line) is a
+  `docs/BACKLOG.md` item under #66.
+- **R15 — the auto-fetch audit record is written off the consensus agent.**
+  The agent enqueues it into a bounded hand-off (16 records); the
+  `uc2-holdings` thread writes and fsyncs it, same fields and format. A full
+  queue drops and counts the record, named as `admin_audit_dropped` on the
+  next drain.

@@ -305,7 +305,9 @@ transport setting, both measured closed-loop at inflight 1 on 8-vCPU
   prints `uc_service: row N started from snap-P` on stderr, once per
   position. The node publishes the start set in two cnc slot words, `+264`
   (position) and `+272` (version), readable with the cnc decode. A pinned
-  row never takes it: the pin's origin wins.
+  row never takes it: the pin's origin wins. Pins never retire, so once a
+  row has been pinned it keeps restarting from its pin's origin and the start
+  set applies only to never-pinned rows (deliberate; backlog item under #66).
 - **Reading a refused fetch.** The node's own background fetch logs
   `snapshot_fetch_requested` with `actor=auto`; a miss logs
   `snapshot_fetch_timeout`, `snapshot_fetch_no_holder` (every candidate was
