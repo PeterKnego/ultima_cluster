@@ -962,8 +962,10 @@ pub(crate) fn apply_cycle<S: RawStateMachine>(st: &mut ApplyState<S>) -> bool {
     crate::attach::slot(&st.cnc, st.service_id)
         .heartbeat_ns
         .store_release(unix_ns());
-    drain_queries(st);
-    progressed
+    // Answering a read is progress too: without it a read-only service
+    // climbs `APPLY_IDLE` to its sleep rung under a steady read load and
+    // answers at most `QUERY_DRAIN_PER_CYCLE` reads per sleep.
+    drain_queries(st) || progressed
 }
 
 /// Out of line (M14a): drain a frame's schedule/consumed records and ship
@@ -1196,7 +1198,9 @@ fn refuse_queries<S: RawStateMachine>(st: &mut ApplyState<S>) {
     }
 }
 
-fn drain_queries<S: RawStateMachine>(st: &mut ApplyState<S>) {
+/// Returns `true` iff it consumed at least one record (answered, refused or
+/// dropped), which `apply_cycle` reports as progress.
+fn drain_queries<S: RawStateMachine>(st: &mut ApplyState<S>) -> bool {
     // This incarnation's epoch, CAPTURED AT ATTACH (M5 final review #5) — fixed
     // for this incarnation's life, NOT re-read live from the page. A newer
     // incarnation attaching to the same slot bumps its `epoch`; if we
@@ -1209,9 +1213,11 @@ fn drain_queries<S: RawStateMachine>(st: &mut ApplyState<S>) {
     let my_epoch = st.my_epoch;
     let applied = st.follower.cursor;
     let mut buf = Vec::new();
+    let mut consumed = false;
     for _ in 0..QUERY_DRAIN_PER_CYCLE {
         match st.svc_query.try_read(&mut buf) {
             Ok(Some(rec)) => {
+                consumed = true;
                 // Payload = expected_epoch u64 LE ++ query bytes. A record too
                 // short to hold the prefix is a protocol violation — drop it (a
                 // query has no recovery contract; the client times out/retries).
@@ -1240,6 +1246,7 @@ fn drain_queries<S: RawStateMachine>(st: &mut ApplyState<S>) {
             Err(_) => break,
         }
     }
+    consumed
 }
 
 fn unix_ns() -> u64 {
@@ -1620,6 +1627,38 @@ mod tests {
             recs.iter().any(|r| r.timer_id == 2),
             "written directly once leader"
         );
+    }
+
+    /// A cycle that applies nothing but answers a query made progress. If it
+    /// reported idle, a read-only service would climb `APPLY_IDLE`'s ladder to
+    /// its sleep rung under a steady read load and answer at most
+    /// `QUERY_DRAIN_PER_CYCLE` reads per sleep — the ~600k reads/s per node
+    /// cap the 2026-10-07 read-spread and 2026-10-10 read-types fleet runs
+    /// measured, against 2–3M under any write load.
+    #[test]
+    fn a_cycle_that_only_answers_queries_is_progress() {
+        let (mut st, _cnc, _sched, _appender, dir) = apply_state_for_test(CountSm::default());
+        // The helper drops its query producer; swap in a ring we can write.
+        let (mut queries, svc_query) = uc_protocol::ring::SpscRing::create(
+            &dir.path().join("svc_query.progress.ring"),
+            1 << 16,
+            1024,
+        )
+        .unwrap()
+        .into_split();
+        st.svc_query = svc_query;
+
+        assert!(
+            !super::apply_cycle(&mut st),
+            "nothing to apply or answer: idle"
+        );
+        let mut rec = st.my_epoch.to_le_bytes().to_vec();
+        rec.extend_from_slice(b"q");
+        queries
+            .try_write(uc_protocol::v2::ipc::MSG_V2_QUERY, 0, [0; 8], &rec)
+            .unwrap();
+        assert!(super::apply_cycle(&mut st), "answered a query: progress");
+        assert!(!super::apply_cycle(&mut st), "ring drained: idle again");
     }
 
     // ------------------- nightly 33488022809: replay must WAIT for a covering artifact
