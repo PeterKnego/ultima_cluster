@@ -299,6 +299,40 @@ transport setting, both measured closed-loop at inflight 1 on 8-vCPU
   frontier. Until a voter has fetched, a joiner below its floor is
   **redirected** to a learner that holds the set, so nothing wedges.
   → [Keep the journal from growing without bound](../how-to/bound-journal-growth.md)
+- **Restarts start from the newest agreed set** (snapshot lifecycle). An
+  unpinned row that restarts installs the node's **start set** when it is
+  ahead of the row's own state, then replays only the tail; the service
+  prints `uc_service: row N started from snap-P` on stderr, once per
+  position. The node publishes the start set in two cnc slot words, `+264`
+  (position) and `+272` (version), readable with the cnc decode. A pinned
+  row takes it only once its pin is **complete** — the catalog lists an
+  agreed set the pin's `to` line built above the pin record, and only such a
+  set is published for a pinned row; until then the pin's origin wins.
+- **Completing an upgrade pin.** After upgrading every instance of a pinned
+  row, take an instant (`uc2ctl snapshot`). Once it agrees, the pin is
+  complete — an agreed set above the pin record, on the `to` line (for a
+  `--patch` pin an old same-line build's set counts too): the row resumes
+  normal start (from that set) and normal retention, and the origin's set is
+  released — retired by the catalog, and pruned on each node once that node
+  holds the completion set (its own freeze or an auto-fetch) and its `to`
+  instance has caught up to it.
+  Until then **every** node keeps the origin's set and holds its journal at
+  the origin (`snapshot_floor_held_for_pin`), because an instance not yet
+  upgraded still has to install the origin and replay from it; a cluster
+  that never snapshots after an upgrade grows its journal without bound.
+- **Reading a refused fetch.** The node's own background fetch logs
+  `snapshot_fetch_requested` with `actor=auto`; a miss logs
+  `snapshot_fetch_timeout`, `snapshot_fetch_no_holder` (every candidate was
+  tried; the next attempt waits 30 s) or `snapshot_fetch_skipped_no_space`
+  (once per set). `snapshot_fetch_free_unknown` (warn, once per node start)
+  says this node's free-space reading never succeeded, so fetches proceed
+  with the space check off and `Uc2SnapshotWontFit` cannot fire for it.
+  `uc2_snapshot_auto_fetch_total{outcome}` counts each of
+  `ok`, `refused` (this node could not even issue the request), `timeout`
+  (a holder stayed silent), `no_space` and `no_holder`. Residual: a new
+  fetch drops the receiver's one parked late-answer slot, so a very late
+  datagram from an earlier holder can be lost; auto-fetch waits at least 1 s
+  after a timeout to keep that rare.
 - [Encrypt traffic between nodes](../how-to/encrypt-node-traffic.md) — key
   material, the flag-day rollout, health counters, and rotation; pair with
   `[admin] auth = "hmac"` — see its "Known interaction with admin

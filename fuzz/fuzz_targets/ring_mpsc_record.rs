@@ -6,7 +6,7 @@ use libfuzzer_sys::fuzz_target;
 use uc_protocol::ring::common::{
     COMMIT_LAP_MASK, SlotState, classify_commit_word, decode_record_slice,
 };
-use uc_protocol::v2::ipc::{MSG_V2_QUERY, split_query_payload};
+use uc_protocol::v2::ipc::{MSG_V2_QUERY, split_query_payload, split_min_position_query_payload};
 
 // The MPSC ingress ring is a writable mmap'd file that every client process
 // on the host can write. Its consumer — the node's consensus agent, the
@@ -40,6 +40,7 @@ fuzz_target!(|data: &[u8]| {
                 && hdr.msg_type == MSG_V2_QUERY
             {
                 let _ = split_query_payload(&buf);
+                let _ = split_min_position_query_payload(&buf);
             }
         }
         SlotState::Claimed { .. } | SlotState::Empty => {}

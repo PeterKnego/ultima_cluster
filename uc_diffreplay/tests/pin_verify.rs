@@ -91,6 +91,19 @@ fn pin_verify(
     app_id: &str,
     split: Option<u64>,
 ) -> Run {
+    pin_verify_with(corpus, old_args, new_args, to, app_id, split, &[])
+}
+
+/// [`pin_verify`] with extra flags appended (the hidden test hooks).
+fn pin_verify_with(
+    corpus: &Path,
+    old_args: &[&str],
+    new_args: &[&str],
+    to: &str,
+    app_id: &str,
+    split: Option<u64>,
+    extra: &[&str],
+) -> Run {
     let bin = common::register_replay_bin();
     let report = corpus.parent().unwrap().join(format!("{app_id}.json"));
     let mut c = Command::new(env!("CARGO_BIN_EXE_uc2-diffreplay"));
@@ -118,6 +131,7 @@ fn pin_verify(
     for a in new_args {
         c.arg("--new-arg").arg(a);
     }
+    c.args(extra);
     let out = c.output().unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
@@ -167,6 +181,33 @@ fn an_in_memory_register_passes_and_demonstrates_the_counterfactual() {
         rep.frontier > rep.origin,
         "OLD must have run past P before the stop"
     );
+}
+
+/// Pin completion (C7/C11): pin-verify's second instant Q agrees on its one
+/// node and completes the pin, so the node may prune the origin artifact
+/// before the corpus export reads it. `--test-prune-origin` makes that
+/// prune deterministic; the run must still export the corpus (from the
+/// origin pin-verify saved before Q) and PASS.
+#[test]
+fn a_pruned_origin_after_the_completing_instant_still_exports() {
+    let (_inst, corpus) = cas_corpus("pv-pruned");
+    let r = pin_verify_with(
+        &corpus,
+        &["serve"],
+        &["serve", "--double"],
+        "0.2.0",
+        "pv-pruned",
+        Some(WRITES),
+        &["--test-prune-origin"],
+    );
+    let rep = r.report.expect("report");
+    assert!(
+        !rep.notes.iter().any(|n| n.contains("exporting the corpus")),
+        "the export must not depend on the origin surviving Q: {:?}",
+        rep.notes
+    );
+    assert_eq!(rep.verdict, Verdict::Pass, "{}", r.stdout);
+    assert!(r.status.success(), "{}", r.stdout);
 }
 
 /// (b) The durable shape: `--durable` persists `(value, last_applied)`, so

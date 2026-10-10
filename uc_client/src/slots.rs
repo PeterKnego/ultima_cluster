@@ -7,7 +7,7 @@
 //!
 //! 1. A slot's `owner` word is `0` = FREE, `u64::MAX` = RESERVED (mid-claim, metadata not yet valid — resolve/sweep must skip), else `seq + 1` (the FULL u64 sequence: the generation tag; the wire only carries `seq as u32`).
 //!
-//! 2. Claim is three-phase: CAS `FREE -> RESERVED` (so a failed claim never stomps a live occupant's metadata), write metadata (`user_data`, `deadline_ns`, `kind`), publish `owner = seq + 1` with `Release`.
+//! 2. Claim is three-phase: CAS `FREE -> RESERVED` (so a failed claim never stomps a live occupant's metadata), write metadata (`user_data`, `deadline_ns`, `kind`, `min_position`), publish `owner = seq + 1` with `Release`.
 //!
 //! 3. Exactly-once resolution: whoever CASes `owner: seq+1 -> FREE` (AcqRel) owns the completion — resolve, sweep, drain_abort, and release all race through that single CAS, so a request completes exactly once.
 //!
@@ -17,7 +17,7 @@
 //!
 //! 6. `drain_abort` is exhaustive only after claims are quiesced — a claim racing the drain publishes after the scan passes and is backstopped by the deadline sweep, so pollers must keep sweeping unless claims are provably stopped.
 //!
-//! 7. `expected` (the ring bitmask a request awaits), `received` (the bitmask of rings that have answered so far) and `fan_in` (whether this request was issued as a fan-in, stored as a separate `AtomicBool`) are written in claim phase 2, under the RESERVED word — invisible to readers until the phase-3 publish. Thereafter `received` is touched by MULTI-RING (fan-in) requests only: `resolve` skips the `fetch_or` when `expected == bit` (a single-ring request — the overwhelmingly common one), because a set of one is opened and closed by its only piece, so the word would only ever hold that bit and nothing reads it. Exactly-once does not rest on `received` in either case: the gate is the single owner CAS (invariant 3), and a duplicate delivery for a completed single-ring generation is caught by the FREE/stale-seq checks at the top of `resolve` or loses that CAS. For the multi-ring case the `fetch_or` never races a concurrent re-claim of the same word: `release` is the ONLY cross-thread freer of a slot (it runs on the send thread, inside `engine.rs`'s `finish_write` — `resolve`/`sweep`/`drain_abort` are all poll-thread-only), and `release(seq)` is called only when that seq's ring write FAILED, meaning no response frame for that generation was ever transmitted and so no `resolve` call for it can be in flight to race the free. A `resolve` that is in flight therefore always targets a generation no concurrent `release` can be freeing, so the matching claim-time reset of `received` (phase 2, under RESERVED) and `resolve`'s `fetch_or` on it are always the same generation, never back-to-back generations racing across the free. This, plus invariant 4 (a stale wire_seq collision needs a 2^32-outstanding gap), also covers reading `expected`/`fan_in` from a newer generation: that read is confined to the same impossible window, and even there the completing `compare_exchange(owner, FREE)` would fail (return `Miss`), so a stale read is never acted on. `resolve` completes a slot on the single owner CAS when the last expected ring answers (for a multi-ring request, when its last bit lands in `received`) or a ring-less (`ring: None`) terminal answer arrives, whichever comes first — for a single-ring request the completing answer IS the last expected one, which is exactly why the `fetch_or` can be skipped there.
+//! 7. `min_position` (the read-your-writes token a query was sent with), `expected` (the ring bitmask a request awaits), `received` (the bitmask of rings that have answered so far) and `fan_in` (whether this request was issued as a fan-in, stored as a separate `AtomicBool`) are written in claim phase 2, under the RESERVED word — invisible to readers until the phase-3 publish. Thereafter `received` is touched by MULTI-RING (fan-in) requests only: `resolve` skips the `fetch_or` when `expected == bit` (a single-ring request — the overwhelmingly common one), because a set of one is opened and closed by its only piece, so the word would only ever hold that bit and nothing reads it. Exactly-once does not rest on `received` in either case: the gate is the single owner CAS (invariant 3), and a duplicate delivery for a completed single-ring generation is caught by the FREE/stale-seq checks at the top of `resolve` or loses that CAS. For the multi-ring case the `fetch_or` never races a concurrent re-claim of the same word: `release` is the ONLY cross-thread freer of a slot (it runs on the send thread, inside `engine.rs`'s `finish_write` — `resolve`/`sweep`/`drain_abort` are all poll-thread-only), and `release(seq)` is called only when that seq's ring write FAILED, meaning no response frame for that generation was ever transmitted and so no `resolve` call for it can be in flight to race the free. A `resolve` that is in flight therefore always targets a generation no concurrent `release` can be freeing, so the matching claim-time reset of `received` (phase 2, under RESERVED) and `resolve`'s `fetch_or` on it are always the same generation, never back-to-back generations racing across the free. This, plus invariant 4 (a stale wire_seq collision needs a 2^32-outstanding gap), also covers reading `expected`/`fan_in` from a newer generation: that read is confined to the same impossible window, and even there the completing `compare_exchange(owner, FREE)` would fail (return `Miss`), so a stale read is never acted on. `resolve` completes a slot on the single owner CAS when the last expected ring answers (for a multi-ring request, when its last bit lands in `received`) or a ring-less (`ring: None`) terminal answer arrives, whichever comes first — for a single-ring request the completing answer IS the last expected one, which is exactly why the `fetch_or` can be skipped there.
 //!
 //! 8. `resolve` reports `first` — whether the delivery it just recorded was the FIRST ring piece of this generation. For a multi-ring request that is `received == 0` before the `fetch_or`; for a single-ring request it is `true` by construction (a set of one has nothing preceding its only piece), decided without reading `received` at all. This exists because invariant 4's outstanding-gap argument protects the SLOT (freed and re-claimed under a fresh `expected`/`received`), not the engine-side fan-in piece buffer indexed by the same slot index: a partial fan-in ended by a ring-less terminal or the deadline sweep leaves pieces behind, and the generation 2^32 requests later at that index carries the SAME u32 wire seq — so a seq comparison cannot tell the two apart, while `first` (decided here, by the slot table) always can. The buffer resets on `first`, never on a seq change.
 
@@ -69,11 +69,12 @@ pub(crate) enum Resolve {
 struct Slot {
     owner: AtomicU64, // FREE / RESERVED / seq+1
     user_data: AtomicU64,
-    deadline_ns: AtomicU64, // nanos since the engine's t0
-    kind: AtomicU8,         // ReqKind as u8
-    expected: AtomicU8,     // ring bitmask this request awaits
-    received: AtomicU8,     // ring bitmask that has answered so far
-    fan_in: AtomicBool,     // claim-time flag: was this issued as a fan-in?
+    deadline_ns: AtomicU64,  // nanos since the engine's t0
+    kind: AtomicU8,          // ReqKind as u8
+    expected: AtomicU8,      // ring bitmask this request awaits
+    received: AtomicU8,      // ring bitmask that has answered so far
+    fan_in: AtomicBool,      // claim-time flag: was this issued as a fan-in?
+    min_position: AtomicU64, // read-your-writes: the token this query was sent with (0 = none)
 }
 
 pub(crate) struct SlotTable {
@@ -100,6 +101,7 @@ impl SlotTable {
                 expected: AtomicU8::new(0),
                 received: AtomicU8::new(0),
                 fan_in: AtomicBool::new(false),
+                min_position: AtomicU64::new(0),
             })
             .collect::<Vec<_>>()
             .into_boxed_slice();
@@ -112,6 +114,7 @@ impl SlotTable {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn claim(
         &self,
         user_data: u64,
@@ -119,6 +122,46 @@ impl SlotTable {
         deadline_ns: u64,
         expected: u8,
         fan_in: bool,
+    ) -> Result<u64, ClaimError> {
+        self.claim_inner(user_data, kind, deadline_ns, expected, fan_in, 0)
+    }
+
+    /// Read-your-writes: claim a query slot that remembers the token it was
+    /// sent with, so the answer can be checked against it (spec 5.3 guard).
+    pub(crate) fn claim_with_min_position(
+        &self,
+        user_data: u64,
+        kind: ReqKind,
+        deadline_ns: u64,
+        expected: u8,
+        fan_in: bool,
+        min_position: u64,
+    ) -> Result<u64, ClaimError> {
+        self.claim_inner(user_data, kind, deadline_ns, expected, fan_in, min_position)
+    }
+
+    /// The token the live generation at `wire_seq` was sent with; 0 for a
+    /// free, reserved or other-generation slot. Read BEFORE `resolve` frees
+    /// it; a generation that changes in between makes `resolve` return `Miss`,
+    /// so a stale value here is never acted on (invariant 7: `release` is the
+    /// only cross-thread freer, so a racing free cannot be in flight).
+    pub(crate) fn min_position(&self, wire_seq: u32) -> u64 {
+        let slot = &self.slots[(wire_seq as usize) & self.mask];
+        let owner = slot.owner.load(Ordering::Acquire);
+        if owner == FREE || owner == RESERVED || (owner - 1) as u32 != wire_seq {
+            return 0;
+        }
+        slot.min_position.load(Ordering::Relaxed)
+    }
+
+    fn claim_inner(
+        &self,
+        user_data: u64,
+        kind: ReqKind,
+        deadline_ns: u64,
+        expected: u8,
+        fan_in: bool,
+        min_position: u64,
     ) -> Result<u64, ClaimError> {
         assert!(expected != 0, "expected mask must name at least one ring");
         if self.inflight.fetch_add(1, Ordering::AcqRel) >= self.max_inflight {
@@ -144,6 +187,7 @@ impl SlotTable {
         slot.expected.store(expected, Ordering::Relaxed);
         slot.received.store(0, Ordering::Relaxed);
         slot.fan_in.store(fan_in, Ordering::Relaxed);
+        slot.min_position.store(min_position, Ordering::Relaxed);
         // Phase 3: publish.
         slot.owner.store(seq + 1, Ordering::Release);
         Ok(seq)
@@ -330,6 +374,27 @@ impl SlotTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn min_position_is_read_back_for_the_live_generation_only() {
+        let t = SlotTable::new(4, 0);
+        let seq = t
+            .claim_with_min_position(1, ReqKind::Query, u64::MAX, 1, false, 777)
+            .unwrap();
+        assert_eq!(t.min_position(seq as u32), 777);
+        assert_eq!(
+            t.min_position(seq as u32 + 1),
+            0,
+            "another generation reads 0"
+        );
+        assert!(matches!(
+            t.resolve(seq as u32, Some(ReqKind::Query), Some(0)),
+            Resolve::Won { .. }
+        ));
+        assert_eq!(t.min_position(seq as u32), 0, "a freed slot reads 0");
+        let seq2 = t.claim(1, ReqKind::Query, u64::MAX, 1, false).unwrap();
+        assert_eq!(t.min_position(seq2 as u32), 0, "plain claim stores 0");
+    }
 
     #[test]
     fn claim_resolve_roundtrip_returns_user_data_and_decrements_inflight() {

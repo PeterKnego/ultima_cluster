@@ -25,7 +25,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use uc_log::cnc::{AdminReq, CncPage};
+use uc_log::cnc::{AdminReq, CncPage, PinRead};
 use uc_net::fault::FaultConfig;
 use uc_node::{Node, NodeConfig, PurgePolicy};
 use uc_protocol::ring::{MpscProducer, MpscRing, RingError};
@@ -237,6 +237,8 @@ struct Fixture {
     app: &'static str,
     node: Node,
     p: u64,
+    /// The pin [`Fixture::pin_at`] last faked, for [`Fixture::assert_pin_held`].
+    faked_pin: std::cell::Cell<Option<(u64, u32, u32)>>,
 }
 
 /// How a [`Fixture`] is built. [`Spec::small`] is the purge-off shape every
@@ -384,7 +386,16 @@ impl Fixture {
                  follower overruns: append={append}, P={p}, capacity={BUFFER_BYTES}"
             );
         }
-        (Fixture { dir, app, node, p }, svc1)
+        (
+            Fixture {
+                dir,
+                app,
+                node,
+                p,
+                faked_pin: std::cell::Cell::new(None),
+            },
+            svc1,
+        )
     }
 
     fn path(&self) -> &Path {
@@ -399,21 +410,87 @@ impl Fixture {
         artifact_path(self.path(), self.p)
     }
 
-    /// Write the row's pin words directly on the page. Legitimate here: the
-    /// node's `uc2-cluster` agent only stores pin words for a row its FSM
-    /// state actually pins (`publish_view`'s `if let Some(p) =
-    /// st.pin_for(row)`), and no test in this file commits an `UpgradePin`
-    /// command — so the single-writer rule on those four words holds.
+    /// Write the row's pin words directly on the page. Legitimate here: no
+    /// test in this file commits an `UpgradePin` command through this path,
+    /// so the node's FSM holds no pin for the row.
+    ///
+    /// The node republishes EVERY row's pin and running words from COMMITTED
+    /// cluster state on every cluster publish (`ClusterAgent::publish_view`),
+    /// so a faked pin must be written AFTER the last cluster record: a
+    /// `SnapshotReport` (or any other record) that commits later wipes it,
+    /// and the attach then reads "unpinned, running v1" and refuses with
+    /// `VersionMismatch`. [`Fixture::pin_at`] therefore waits for the cluster
+    /// FSM to be quiet first ([`Fixture::wait_cluster_quiet`]), and
+    /// [`Fixture::assert_pin_held`] re-checks the slot right before a start.
     fn pin(&self, from: u32, to: u32) {
         self.pin_at(self.p, from, to);
     }
 
     /// [`Fixture::pin`] at an origin other than the fixture's instant.
     fn pin_at(&self, origin: u64, from: u32, to: u32) {
+        self.wait_cluster_quiet();
         self.cnc()
             .service_slot(0)
             .status
             .store_pin(origin, from, to);
+        self.faked_pin.set(Some((origin, from, to)));
+    }
+
+    /// Block until no cluster record can still be in flight: the log is
+    /// drained (`append == commit == durable`, so any accepted record is
+    /// committed), every set in the committed catalog is agreed (its reports
+    /// have all been applied), and the cluster agent's walk has consumed to
+    /// commit — all held across a short settle.
+    fn wait_cluster_quiet(&self) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut quiet_since: Option<(Instant, u64)> = None;
+        loop {
+            let c = self.node.counters();
+            let (append, commit, durable) = (
+                c.append.load_acquire(),
+                c.commit.load_acquire(),
+                c.durable.load_acquire(),
+            );
+            let view = self.node.cluster_view();
+            let agreed = view.snapshot_inner().catalog.iter().all(|e| e.is_agreed());
+            let walked = view.consumed.load(std::sync::atomic::Ordering::Acquire);
+            let quiet = append > 0
+                && append == commit
+                && append == durable
+                && agreed
+                && walked >= commit
+                && self.cnc().cluster_applied() <= walked;
+            match (quiet, quiet_since) {
+                (true, Some((since, at))) if at == commit => {
+                    if since.elapsed() > Duration::from_millis(200) {
+                        return;
+                    }
+                }
+                (true, _) => quiet_since = Some((Instant::now(), commit)),
+                (false, _) => quiet_since = None,
+            }
+            assert!(
+                Instant::now() < deadline,
+                "cluster FSM never went quiet (append={append} commit={commit} \
+                 durable={durable} walked={walked} agreed={agreed})"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    /// Assert the slot still reads the pin [`Fixture::pin_at`] faked — call it
+    /// right before `ServiceBuilder::start()`, so a pin wiped by a late
+    /// cluster publish fails HERE, named, rather than as a downstream
+    /// `VersionMismatch`. A no-op when this fixture faked no pin.
+    fn assert_pin_held(&self) {
+        if let Some((origin, from, to)) = self.faked_pin.get() {
+            assert_eq!(
+                self.cnc().service_slot(0).status.pin(),
+                PinRead::Pinned { origin, from, to },
+                "the faked pin was wiped before the attach: the node republishes \
+                 the row view from committed state"
+            );
+        }
     }
 
     fn stop(self) {
@@ -433,7 +510,8 @@ impl Fixture {
 ///
 /// Only two answers are races and only those two are retried: status 2
 /// (single-in-flight) and reason 54 `pin_no_set` (the set's position is
-/// published a moment after the artifact lands). Anything else fails here,
+/// published a moment after the artifact lands) or 61 `pin_origin_not_agreed`
+/// (the catalog agrees it a moment after that). Anything else fails here,
 /// named.
 fn pin_via_admin(dir: &Path, cnc: &CncPage, row: u8, from: u32, to: u32, origin: u64) {
     use std::io::Write as _;
@@ -486,7 +564,9 @@ fn pin_via_admin(dir: &Path, cnc: &CncPage, row: u8, from: u32, to: u32, origin:
             );
             std::thread::yield_now();
         };
-        let racy = resp.status == 2 || resp.reason == uc_node::REASON_PIN_NO_SET;
+        let racy = resp.status == 2
+            || resp.reason == uc_node::REASON_PIN_NO_SET
+            || resp.reason == uc_node::REASON_PIN_ORIGIN_NOT_AGREED;
         if resp.status == 0 || !racy || Instant::now() >= deadline {
             assert_eq!(
                 resp.status, 0,
@@ -495,6 +575,71 @@ fn pin_via_admin(dir: &Path, cnc: &CncPage, row: u8, from: u32, to: u32, origin:
             );
             return;
         }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// `uc2ctl settings apply`, in process: commit one replicated `Settings`
+/// record (`retain_sets = 2`, every other key at its genesis default). It is a
+/// cluster record that needs no attached service, which is what makes it a
+/// deterministic stand-in for a late `SnapshotReport`: the leader accepts and
+/// appends it, and it commits (and the agent republishes the row view)
+/// asynchronously. Returns once the leader has ACCEPTED it, not once it is
+/// applied.
+fn append_a_settings_record(dir: &Path, cnc: &CncPage) {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let mut settings = uc_protocol::v2::settings::Settings::genesis_default();
+    settings.retain_sets = 2;
+    let mut bytes = Vec::new();
+    uc_protocol::v2::settings::encode_settings(&settings, &mut bytes);
+    let (id, ip, port) = uc_node::staged_digest(&bytes);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let pending = dir.join(uc_node::SETTINGS_PENDING_FILE);
+        let tmp = dir.join(format!("{}.tmp", uc_node::SETTINGS_PENDING_FILE));
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp)
+                .unwrap();
+            f.write_all(&bytes).unwrap();
+            f.sync_all().unwrap();
+        }
+        std::fs::rename(&tmp, &pending).unwrap();
+        let seq = cnc.read_admin_req(0).map(|r| r.seq).unwrap_or(0) + 1;
+        cnc.write_admin_req(&AdminReq {
+            seq,
+            nonce: seq,
+            op: uc_protocol::v2::cnc::ADMIN_OP_SETTINGS_APPLY,
+            id,
+            ip,
+            port,
+        });
+        let resp_deadline = Instant::now() + Duration::from_secs(15);
+        let resp = loop {
+            if let Some(r) = cnc.read_admin_resp(seq) {
+                break r;
+            }
+            assert!(
+                Instant::now() < resp_deadline,
+                "admin response timed out for seq {seq}"
+            );
+            std::thread::yield_now();
+        };
+        if resp.status == 0 {
+            return;
+        }
+        // status 2 is single-in-flight: the only answer that is a race.
+        assert!(
+            resp.status == 2 && Instant::now() < deadline,
+            "settings apply refused: status={} reason={}",
+            resp.status,
+            resp.reason
+        );
         std::thread::sleep(Duration::from_millis(10));
     }
 }
@@ -527,6 +672,7 @@ fn a_stale_binary_is_refused_by_name_after_the_pin() {
     let applied_before = cnc.service_slot(0).applied.load_acquire();
     f.pin(V1, V2);
 
+    f.assert_pin_held();
     let err = ServiceBuilder::new(cfg(f.path(), f.app), RegisterSm::default())
         .start()
         .err()
@@ -564,6 +710,7 @@ fn the_pinned_version_installs_the_origin_unconditionally_and_recomputes_the_tai
     let f = Fixture::new("pin-install");
     f.pin(V1, V2);
 
+    f.assert_pin_held();
     let svc2 = ServiceBuilder::new(cfg(f.path(), f.app), DoublingRegisterSm::default())
         .start()
         .unwrap();
@@ -627,6 +774,7 @@ fn a_pinned_attach_converges_on_a_purging_cluster() {
     );
     f.pin(V1, V2);
 
+    f.assert_pin_held();
     let svc2 = ServiceBuilder::new(cfg(f.path(), f.app), DoublingRegisterSm::default())
         .start()
         .unwrap();
@@ -638,6 +786,29 @@ fn a_pinned_attach_converges_on_a_purging_cluster() {
         "a pinned attach on a purging cluster converges on v1's history, \
          not the counterfactual"
     );
+    assert_eq!(svc2.pinned(), Some((f.p, V1, V2)));
+    svc2.stop();
+    f.stop();
+}
+
+/// Regression for the CI flake of run 38038671733: `Fixture::pin` fakes the
+/// pin on the cnc page, and the node's cluster agent rewrites every row's pin
+/// words from COMMITTED state on each publish. A cluster record that commits
+/// after the poke (there, a late `SnapshotReport`; here a `Settings` record
+/// accepted just before it) wiped the pin, and the attach then read
+/// "unpinned, running v1" and refused with `VersionMismatch`. The fixture now
+/// waits for the cluster FSM to be quiet before it pokes; this test appends
+/// a record IMMEDIATELY before `pin` and fails if that wait ever regresses.
+#[test]
+fn a_faked_pin_survives_a_cluster_record_committing_just_before_it() {
+    let f = Fixture::new("pin-late-record");
+    append_a_settings_record(f.path(), &f.cnc());
+    f.pin(V1, V2);
+    f.assert_pin_held();
+    let svc2 = ServiceBuilder::new(cfg(f.path(), f.app), DoublingRegisterSm::default())
+        .start()
+        .unwrap();
+    wait_service_caught_up(&f.cnc());
     assert_eq!(svc2.pinned(), Some((f.p, V1, V2)));
     svc2.stop();
     f.stop();
@@ -724,6 +895,7 @@ fn a_durable_sm_above_the_origin_is_rewound_to_it() {
     );
 
     f.pin(V1, V2);
+    f.assert_pin_held();
     let svc2 = ServiceBuilder::new(cfg(f.path(), f.app), durable)
         .start()
         .unwrap();
@@ -753,6 +925,7 @@ fn a_pinned_origin_with_no_artifact_is_refused() {
     std::fs::remove_file(f.artifact()).unwrap();
     f.pin(V1, V2);
 
+    f.assert_pin_held();
     let err = ServiceBuilder::new(cfg(f.path(), f.app), DoublingRegisterSm::default())
         .start()
         .err()
@@ -780,6 +953,7 @@ fn a_pinned_artifact_built_by_the_wrong_version_is_refused() {
     assert!(!uc_protocol::identity::same_line(off_line, V1));
     f.pin(off_line, V2);
 
+    f.assert_pin_held();
     let err = ServiceBuilder::new(cfg(f.path(), f.app), DoublingRegisterSm::default())
         .start()
         .err()
@@ -812,6 +986,7 @@ fn a_pinned_artifact_built_by_a_patch_of_from_is_installed() {
     assert!(patch != V1 && uc_protocol::identity::same_line(patch, V1));
     f.pin(patch, V2);
 
+    f.assert_pin_held();
     let svc2 = ServiceBuilder::new(cfg(f.path(), f.app), DoublingRegisterSm::default())
         .start()
         .expect("a same-line artifact installs");
@@ -840,6 +1015,7 @@ fn a_patch_build_of_the_pinned_to_installs_the_origin() {
     f.pin(V1, to_patch);
 
     // Off-line (V1 = 0.0.0 against the pinned 0.2.x): refused by name.
+    f.assert_pin_held();
     let err = ServiceBuilder::new(cfg(f.path(), f.app), RegisterSm::default())
         .start()
         .err()
@@ -972,6 +1148,7 @@ fn a_pinned_attach_prefers_the_origin_over_a_later_artifact() {
     );
 
     f.pin(V1, V2);
+    f.assert_pin_held();
     let svc2 = ServiceBuilder::new(cfg(f.path(), f.app), DoublingRegisterSm::default())
         .start()
         .unwrap();
@@ -1104,6 +1281,7 @@ fn a_pinned_origin_above_the_durable_frontier_is_a_drift_refusal() {
         .unwrap();
 
     f.pin_at(origin, V1, V2);
+    f.assert_pin_held();
     let err = ServiceBuilder::new(cfg(f.path(), f.app), DoublingRegisterSm::default())
         .start()
         .err()
@@ -1150,7 +1328,9 @@ fn a_pinned_origin_above_the_durable_frontier_is_a_drift_refusal() {
 #[test]
 fn a_restarted_node_publishes_the_pin_before_the_declared_set() {
     let (f, svc1) = Fixture::build_with_v1("pin-bootorder", Spec::small());
-    let Fixture { dir, app, node, p } = f;
+    let Fixture {
+        dir, app, node, p, ..
+    } = f;
     let origin = p;
     let cnc = open_cnc(dir.path(), app);
 
@@ -1249,7 +1429,9 @@ fn a_restarted_node_publishes_the_pin_before_the_declared_set() {
 #[test]
 fn a_pin_above_the_recovered_artifact_is_published_before_the_declared_set() {
     let (f, svc1) = Fixture::build_with_v1("pin-abovecluster", Spec::small());
-    let Fixture { dir, app, node, p } = f;
+    let Fixture {
+        dir, app, node, p, ..
+    } = f;
     let origin = p;
     let cnc = open_cnc(dir.path(), app);
 
@@ -1334,6 +1516,148 @@ fn a_pin_above_the_recovered_artifact_is_published_before_the_declared_set() {
     );
     svc2.stop();
     node2.stop();
+}
+
+// ------------------------------------------------------- pin completion
+
+/// Every `install_snapshot` position [`CountingV2`] has seen, in order. Only
+/// [`a_completed_pin_restarts_from_the_completion_set_with_one_install`]
+/// builds a `CountingV2`, so no other test writes here.
+static COUNTED_INSTALLS: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
+
+/// [`DoublingRegisterSm`] (same `NAME`, same `VERSION` — the pin's `to`)
+/// that records every `install_snapshot` position in [`COUNTED_INSTALLS`],
+/// so a test can tell one install from two.
+#[derive(Default)]
+struct CountingV2(DoublingRegisterSm);
+
+impl StateMachine for CountingV2 {
+    const NAME: &'static str = <DoublingRegisterSm as StateMachine>::NAME;
+    const VERSION: u32 = V2;
+    type Command = RegCmd;
+    type Response = <DoublingRegisterSm as StateMachine>::Response;
+    type Query = ();
+    type QueryResponse = Option<u64>;
+
+    fn apply(&mut self, ctx: &mut ApplyCtx, cmd: RegCmd) -> Self::Response {
+        StateMachine::apply(&mut self.0, ctx, cmd)
+    }
+    fn query(&self, q: ()) -> Option<u64> {
+        StateMachine::query(&self.0, q)
+    }
+    fn last_applied(&self) -> Option<u64> {
+        StateMachine::last_applied(&self.0)
+    }
+}
+
+impl SnapshotStateMachine for CountingV2 {
+    type SnapshotHandle = <DoublingRegisterSm as SnapshotStateMachine>::SnapshotHandle;
+
+    fn freeze(&self) -> Result<(Self::SnapshotHandle, u64), uc_service::SnapshotError> {
+        self.0.freeze()
+    }
+    fn stream_snapshot(
+        h: Self::SnapshotHandle,
+        dst: &mut dyn std::io::Write,
+    ) -> Result<(), uc_service::SnapshotError> {
+        DoublingRegisterSm::stream_snapshot(h, dst)
+    }
+    fn install_snapshot(
+        &mut self,
+        p: u64,
+        src: &mut dyn std::io::Read,
+    ) -> Result<u64, uc_service::SnapshotError> {
+        COUNTED_INSTALLS.lock().unwrap().push(p);
+        self.0.install_snapshot(p, src)
+    }
+}
+
+/// Pin completion (snapshot-lifecycle errata, "pin completion (as built)",
+/// rulings C1–C3): purge on, a real pin, the pinned version attached and
+/// caught up, then an instant ABOVE the pin record that agrees. That set
+/// completes the pin, so the floor and the purge behind it move past the
+/// origin. A restart of the upgraded service must then start from the
+/// completion set — exactly ONE install, at the set, with the correct state.
+///
+/// Before the fix the restart re-ran the pinned install at the origin
+/// unconditionally; with the journal above the origin purged, the replay's
+/// gap guard then installed the newer set as well — two installs, origin
+/// first.
+#[test]
+fn a_completed_pin_restarts_from_the_completion_set_with_one_install() {
+    let (f, svc1) = Fixture::build_with_v1("pin-complete", Spec::purging());
+    let origin = f.p;
+    let cnc = f.cnc();
+    pin_via_admin(f.path(), &cnc, 0, V1, V2, origin);
+    wait_until("the pin reached the row's slot words", || {
+        cnc.service_slot(0).status.pin()
+            == uc_log::cnc::PinRead::Pinned {
+                origin,
+                from: V1,
+                to: V2,
+            }
+    });
+    wait_stopped_at_the_pin(svc1);
+    let record_pos = match cnc.service_slot(0).status.row_view() {
+        uc_log::cnc::RowRead::View { record_pos, .. } => record_pos,
+        uc_log::cnc::RowRead::Contended => panic!("row view contended"),
+    };
+    assert!(record_pos > origin, "the pin record sits above its origin");
+
+    let svc2 = ServiceBuilder::new(cfg(f.path(), f.app), CountingV2::default())
+        .start()
+        .unwrap();
+    wait_service_caught_up(&cnc);
+    assert_eq!(svc2.query(()), Some(CAS_NEW), "the pinned attach converged");
+
+    // The completion instant: above the pin record, built by `to`.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let p2 = loop {
+        let p = command_instant(&f.node);
+        assert!(p > record_pos, "P2={p} above the pin record {record_pos}");
+        if wait_for(Duration::from_millis(500), || {
+            artifact_path(f.path(), p).is_file()
+        }) {
+            break p;
+        }
+        assert!(Instant::now() < deadline, "no instant above the pin built");
+    };
+    wait_until("the set at P2 agreed", || {
+        f.node
+            .cluster_view()
+            .snapshot_inner()
+            .catalog
+            .iter()
+            .any(|e| e.position == p2 && e.is_agreed())
+    });
+    wait_until("the purge passed the origin", || {
+        f.node.archive_first_base() > origin
+    });
+
+    svc2.stop();
+    COUNTED_INSTALLS.lock().unwrap().clear();
+    let svc3 = ServiceBuilder::new(cfg(f.path(), f.app), CountingV2::default())
+        .start()
+        .unwrap();
+    wait_service_caught_up(&cnc);
+    assert_eq!(
+        svc3.query(()),
+        Some(CAS_NEW),
+        "the restart reproduces the upgraded row's state"
+    );
+    assert_eq!(
+        *COUNTED_INSTALLS.lock().unwrap(),
+        vec![p2],
+        "a completed pin restarts from the completion set, once \
+         (origin={origin}, record_pos={record_pos}, P2={p2})"
+    );
+    // Ruling C3: the completed pin is released — the origin is an ordinary
+    // set again, and retention prunes it.
+    wait_until("retention pruned the completed pin's origin", || {
+        !artifact_path(f.path(), origin).is_file()
+    });
+    svc3.stop();
+    f.stop();
 }
 
 // ------------------------------------------------- the durable-SM stand-in

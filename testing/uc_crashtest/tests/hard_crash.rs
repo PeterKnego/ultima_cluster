@@ -193,7 +193,7 @@ fn submit_cmd(conn: &mut Conn, cmd: &Cmd, deadline: Instant) -> SubmitOutcome {
             | Err(e @ ClientError::PayloadTooLarge { .. })
             // M14b: this harness only ever drives FSM 0, which every node
             // declares — naming an undeclared id here is a wiring bug.
-            | Err(e @ ClientError::ServiceNotDeclared { .. })
+            | Err(e @ ClientError::ServiceNotDeclared { .. }) | Err(e @ ClientError::ReadYourWritesUnsupported)
             // This harness drives by numeric row, never by name — UnknownFsm here
             // would be a wiring bug, same class as the arms above.
             | Err(e @ ClientError::UnknownFsm { .. })
@@ -242,7 +242,7 @@ fn submit_all_cmd(conn: &mut Conn, cmd: &Cmd, deadline: Instant) -> SubmitOutcom
             | Err(e @ ClientError::PayloadTooLarge { .. })
             // This harness only ever fans in over declared ids, so naming an
             // undeclared one here is a wiring bug.
-            | Err(e @ ClientError::ServiceNotDeclared { .. })
+            | Err(e @ ClientError::ServiceNotDeclared { .. }) | Err(e @ ClientError::ReadYourWritesUnsupported)
             // This harness drives by numeric row, never by name — UnknownFsm here
             // would be a wiring bug, same class as the arms above.
             | Err(e @ ClientError::UnknownFsm { .. })
@@ -296,7 +296,7 @@ fn submit_mixed(conn: &mut Conn, id: u8, cmd: &MixedCmd, deadline: Instant) -> S
             | Err(e @ ClientError::AppIdMismatch { .. })
             | Err(e @ ClientError::VersionMismatch { .. })
             | Err(e @ ClientError::PayloadTooLarge { .. })
-            | Err(e @ ClientError::ServiceNotDeclared { .. })
+            | Err(e @ ClientError::ServiceNotDeclared { .. }) | Err(e @ ClientError::ReadYourWritesUnsupported)
             | Err(e @ ClientError::UnknownFsm { .. })
             | Err(e @ ClientError::ShutDown) => return SubmitOutcome::Fatal(format!("{e:?}")),
         }
@@ -341,7 +341,7 @@ fn read_leader(conn: &mut Conn, deadline: Instant) -> ReadOutcome {
             | Err(e @ ClientError::VersionMismatch { .. })
             | Err(e @ ClientError::PayloadTooLarge { .. })
             // M14b: FSM 0 only, as in `submit_cmd` above.
-            | Err(e @ ClientError::ServiceNotDeclared { .. })
+            | Err(e @ ClientError::ServiceNotDeclared { .. }) | Err(e @ ClientError::ReadYourWritesUnsupported)
             // This harness drives by numeric row, never by name — UnknownFsm here
             // would be a wiring bug, same class as the arms above.
             | Err(e @ ClientError::UnknownFsm { .. })
@@ -553,7 +553,7 @@ fn worker2(
                             | Err(e @ ClientError::AppIdMismatch { .. })
                             | Err(e @ ClientError::VersionMismatch { .. })
                             | Err(e @ ClientError::PayloadTooLarge { .. })
-                            | Err(e @ ClientError::ServiceNotDeclared { .. })
+                            | Err(e @ ClientError::ServiceNotDeclared { .. }) | Err(e @ ClientError::ReadYourWritesUnsupported)
                             // This harness drives by numeric row, never by name — UnknownFsm here
                             // would be a wiring bug, same class as the arms above.
                             | Err(e @ ClientError::UnknownFsm { .. })
@@ -1486,7 +1486,7 @@ fn submit_cmd_multi(conn: &mut MultiConn, cmd: &Cmd, deadline: Instant) -> Submi
             | Err(e @ ClientError::PayloadTooLarge { .. })
             // M14b: this harness only ever drives FSM 0, which every node
             // declares — naming an undeclared id here is a wiring bug.
-            | Err(e @ ClientError::ServiceNotDeclared { .. })
+            | Err(e @ ClientError::ServiceNotDeclared { .. }) | Err(e @ ClientError::ReadYourWritesUnsupported)
             // This harness drives by numeric row, never by name — UnknownFsm here
             // would be a wiring bug, same class as the arms above.
             | Err(e @ ClientError::UnknownFsm { .. })
@@ -1533,7 +1533,7 @@ fn read_leader_multi(conn: &mut MultiConn, deadline: Instant) -> ReadOutcome {
             | Err(e @ ClientError::VersionMismatch { .. })
             | Err(e @ ClientError::PayloadTooLarge { .. })
             // M14b: FSM 0 only, as in `submit_cmd_multi` above.
-            | Err(e @ ClientError::ServiceNotDeclared { .. })
+            | Err(e @ ClientError::ServiceNotDeclared { .. }) | Err(e @ ClientError::ReadYourWritesUnsupported)
             // This harness drives by numeric row, never by name — UnknownFsm here
             // would be a wiring bug, same class as the arms above.
             | Err(e @ ClientError::UnknownFsm { .. })
@@ -2054,7 +2054,7 @@ fn timer_report_until_ok(dir: &Path, deadline: Instant) -> TimerReport {
                 Err(ClientError::Decode(_))
                 | Err(ClientError::AppIdMismatch { .. })
                 | Err(ClientError::VersionMismatch { .. })
-                | Err(ClientError::ServiceNotDeclared { .. })
+                | Err(ClientError::ServiceNotDeclared { .. }) | Err(ClientError::ReadYourWritesUnsupported)
                 | Err(ClientError::UnknownFsm { .. }) => {
                     panic!("harness bug reading the timer report")
                 }

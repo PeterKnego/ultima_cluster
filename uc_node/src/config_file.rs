@@ -233,6 +233,10 @@ struct SettingsSection {
     /// or anything above `MAX_RETAIN_SETS`.
     #[serde(default)]
     retain_sets: Option<u16>,
+    /// Snapshot-lifecycle spec §6: seeds the replicated `auto_fetch`. Absent
+    /// means `true` (every node keeps its own copy of the newest agreed set).
+    #[serde(default)]
+    auto_fetch: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -838,6 +842,7 @@ pub fn parse_str_with_env(
                 // is visible where the operator looks. An explicit value,
                 // in or out of the door's bound, passes through unchecked.
                 retain_sets: s.retain_sets.unwrap_or(1),
+                auto_fetch: s.auto_fetch.unwrap_or(true),
             }
         }
     };
@@ -1802,6 +1807,16 @@ level = "info"
         let toml = format!("{MINIMAL}\n[settings]\n");
         let (cfg, _) = load_str(&toml).unwrap();
         assert_eq!(cfg.settings_genesis.retain_sets, 1);
+    }
+
+    /// Snapshot-lifecycle spec §6: `[settings] auto_fetch` seeds genesis;
+    /// absent means `true`.
+    #[test]
+    fn settings_auto_fetch_seeds_genesis_and_defaults_to_true() {
+        let (cfg, _) = load_str(&format!("{MINIMAL}\n[settings]\nauto_fetch = false\n")).unwrap();
+        assert!(!cfg.settings_genesis.auto_fetch);
+        let (cfg, _) = load_str(&format!("{MINIMAL}\n[settings]\n")).unwrap();
+        assert!(cfg.settings_genesis.auto_fetch);
     }
 
     /// FSM identity + cluster FSM (spec §3.3, §6): `uc_` is reserved

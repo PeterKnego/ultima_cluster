@@ -72,6 +72,8 @@ struct Slot {
     /// for why the tag is part of the value rather than a separate check.
     attempts: AtomicU64,
     kind: AtomicU8,
+    /// The read-your-writes token this QUERY was sent with; `0` otherwise.
+    min_position: AtomicU64,
     /// `seq + 1` once this request's frame has been written, `0` otherwise —
     /// a generation tag rather than a flag, for the same reason.
     sent_seq: AtomicU64,
@@ -102,6 +104,7 @@ impl SlotTable {
                 len: AtomicU32::new(0),
                 attempts: AtomicU64::new(0),
                 kind: AtomicU8::new(0),
+                min_position: AtomicU64::new(0),
                 sent_seq: AtomicU64::new(0),
             })
             .collect::<Vec<_>>()
@@ -122,6 +125,7 @@ impl SlotTable {
     /// SUBMITTER ONLY. `false` = the window is full or the slot's previous
     /// occupant is still live; either way the caller reports backpressure and
     /// does NOT consume the seq.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn claim(
         &self,
         seq: u64,
@@ -130,6 +134,36 @@ impl SlotTable {
         deadline_ns: u64,
         off: u64,
         len: u32,
+    ) -> bool {
+        self.claim_inner(seq, user_data, kind, deadline_ns, off, len, 0)
+    }
+
+    /// As [`SlotTable::claim`], recording the read-your-writes token a QUERY
+    /// was sent with so the reader can guard the answer.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn claim_with_min_position(
+        &self,
+        seq: u64,
+        user_data: u64,
+        kind: ReqKind,
+        deadline_ns: u64,
+        off: u64,
+        len: u32,
+        min_position: u64,
+    ) -> bool {
+        self.claim_inner(seq, user_data, kind, deadline_ns, off, len, min_position)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn claim_inner(
+        &self,
+        seq: u64,
+        user_data: u64,
+        kind: ReqKind,
+        deadline_ns: u64,
+        off: u64,
+        len: u32,
+        min_position: u64,
     ) -> bool {
         if self.inflight.fetch_add(1, Ordering::AcqRel) >= self.max_inflight {
             self.inflight.fetch_sub(1, Ordering::AcqRel);
@@ -150,6 +184,7 @@ impl SlotTable {
         s.len.store(len, Ordering::Relaxed);
         s.attempts.store(0, Ordering::Relaxed);
         s.kind.store(kind as u8, Ordering::Relaxed);
+        s.min_position.store(min_position, Ordering::Relaxed);
         s.sent_seq.store(0, Ordering::Relaxed);
         s.owner.store(seq + 1, Ordering::Release);
         true
@@ -162,6 +197,21 @@ impl SlotTable {
     /// slot, so a `true` here cannot go stale under the caller.
     pub(crate) fn is_free(&self, seq: u64) -> bool {
         self.slot(seq).owner.load(Ordering::Acquire) == FREE
+    }
+
+    /// `(kind, token sent)` for the live generation at `seq`; `None` when the
+    /// slot holds another generation or nothing. Read BEFORE `resolve`.
+    pub(crate) fn kind_and_min_position(&self, seq: u64) -> Option<(ReqKind, u64)> {
+        let s = self.slot(seq);
+        if s.owner.load(Ordering::Acquire) != seq + 1 {
+            return None;
+        }
+        let kind = if s.kind.load(Ordering::Relaxed) == ReqKind::Query as u8 {
+            ReqKind::Query
+        } else {
+            ReqKind::Submit
+        };
+        Some((kind, s.min_position.load(Ordering::Relaxed)))
     }
 
     fn take(&self, seq: u64) -> Resolve {

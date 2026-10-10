@@ -238,26 +238,37 @@ pub fn recover(
 pub struct ClusterArtifactHash {
     pos: AtomicU64,
     hash: AtomicU64,
+    /// Snapshot-lifecycle spec §7.1 (plan ruling P6): the artifact's byte
+    /// length — the image the agent wrote, whole. Same publish discipline as
+    /// `hash`.
+    size: AtomicU64,
 }
 
 impl ClusterArtifactHash {
-    /// Publish `hash` as the hash of the artifact at `pos`.
-    pub fn publish(&self, pos: u64, hash: u64) {
+    /// Publish `hash` and `size` as the artifact at `pos`'s.
+    pub fn publish(&self, pos: u64, hash: u64, size: u64) {
         self.pos.store(0, Ordering::Relaxed);
         fence(Ordering::Release);
         self.hash.store(hash, Ordering::Relaxed);
+        self.size.store(size, Ordering::Relaxed);
         self.pos.store(pos, Ordering::Release);
     }
 
-    /// The hash of the artifact at `p`, or `None` when the published word is
-    /// for another position (or a publish is in flight).
-    pub fn hash_at(&self, p: u64) -> Option<u64> {
+    /// The `(hash, size)` of the artifact at `p`, or `None` when the published
+    /// word is for another position (or a publish is in flight).
+    pub fn hash_and_size_at(&self, p: u64) -> Option<(u64, u64)> {
         if p == 0 || self.pos.load(Ordering::Acquire) != p {
             return None;
         }
         let h = self.hash.load(Ordering::Relaxed);
+        let s = self.size.load(Ordering::Relaxed);
         fence(Ordering::Acquire);
-        (self.pos.load(Ordering::Relaxed) == p).then_some(h)
+        (self.pos.load(Ordering::Relaxed) == p).then_some((h, s))
+    }
+
+    /// The hash of the artifact at `p` (see [`Self::hash_and_size_at`]).
+    pub fn hash_at(&self, p: u64) -> Option<u64> {
+        self.hash_and_size_at(p).map(|(h, _)| h)
     }
 }
 
@@ -350,7 +361,11 @@ impl ClusterAgent {
         if snapshot_pos > 0
             && let Ok(img) = fs::read(artifact_path(&snapshot_dir, snapshot_pos))
         {
-            artifact_hash.publish(snapshot_pos, uc_service::snapshots::artifact_hash_of(&img));
+            artifact_hash.publish(
+                snapshot_pos,
+                uc_service::snapshots::artifact_hash_of(&img),
+                img.len() as u64,
+            );
         }
         cluster_snapshot_pos.store(snapshot_pos, Ordering::Release);
         let mut agent = ClusterAgent {
@@ -750,8 +765,11 @@ impl ClusterAgent {
             .fsm
             .install_snapshot(position, &mut &img[..])
             .map_err(|e| io::Error::other(e.to_string()))?;
-        self.artifact_hash
-            .publish(got, uc_service::snapshots::artifact_hash_of(&img));
+        self.artifact_hash.publish(
+            got,
+            uc_service::snapshots::artifact_hash_of(&img),
+            img.len() as u64,
+        );
         self.publish_view();
         // Ruling R5: an install is a batch that installed something, so it
         // writes `cluster_applied` too — same ordering rule as `do_work`'s
@@ -1062,7 +1080,11 @@ impl ClusterAgent {
         *snapshot_pos = pos;
         // Catalog ruling R28: the hash BEFORE the position, so a reader that
         // sees `cluster_snapshot_pos == pos` finds the word published.
-        artifact_hash.publish(pos, uc_service::snapshots::artifact_hash_of(&img));
+        artifact_hash.publish(
+            pos,
+            uc_service::snapshots::artifact_hash_of(&img),
+            img.len() as u64,
+        );
         cluster_snapshot_pos.store(pos, Ordering::Release);
         Ok(pos)
     }
@@ -1088,6 +1110,21 @@ mod tests {
 
     use super::*;
 
+    /// Snapshot-lifecycle spec §7.1 / plan ruling P6: the cluster agent
+    /// publishes the artifact's byte size beside its hash, under the same
+    /// position word.
+    #[test]
+    fn the_artifact_word_carries_the_size_for_its_position_only() {
+        let w = ClusterArtifactHash::default();
+        assert_eq!(w.hash_and_size_at(100), None);
+        w.publish(100, 0xAA, 4321);
+        assert_eq!(w.hash_and_size_at(100), Some((0xAA, 4321)));
+        assert_eq!(w.hash_at(100), Some(0xAA));
+        w.publish(200, 0xBB, 99);
+        assert_eq!(w.hash_and_size_at(100), None, "superseded");
+        assert_eq!(w.hash_and_size_at(200), Some((0xBB, 99)));
+    }
+
     /// Catalog ruling R28: the hash word answers only for the position it
     /// was published with, and a newer publish replaces the pair whole.
     #[test]
@@ -1095,10 +1132,10 @@ mod tests {
         let w = ClusterArtifactHash::default();
         assert_eq!(w.hash_at(0), None);
         assert_eq!(w.hash_at(100), None);
-        w.publish(100, 0xAA);
+        w.publish(100, 0xAA, 0);
         assert_eq!(w.hash_at(100), Some(0xAA));
         assert_eq!(w.hash_at(200), None);
-        w.publish(200, 0xBB);
+        w.publish(200, 0xBB, 0);
         assert_eq!(w.hash_at(100), None, "superseded");
         assert_eq!(w.hash_at(200), Some(0xBB));
     }
@@ -1213,7 +1250,7 @@ mod tests {
         encode_row_genesis(&RowGenesis { row, version }, &mut payload);
         payload
     }
-    fn report_payload(row: u8, position: u64, hashes: &[(u32, u64)]) -> Vec<u8> {
+    fn report_payload(row: u8, position: u64, hashes: &[(u32, u64, u64)]) -> Vec<u8> {
         let mut payload = Vec::new();
         encode_snapshot_report(
             &SnapshotReport {
@@ -1372,7 +1409,7 @@ mod tests {
             .append_cluster(
                 1,
                 ClusterKind::SnapshotReport,
-                &report_payload(0, 4096, &[(0, 1), (1, 1), (2, 2)]),
+                &report_payload(0, 4096, &[(0, 1, 0), (1, 1, 0), (2, 2, 0)]),
             )
             .unwrap();
         cnc.counters().durable.store_release(end);

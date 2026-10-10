@@ -13,6 +13,10 @@ rust-version.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
+[features]
+# Capstone tooth (spec 2026-10-08 planning erratum 3); inert unless UC2_CLIENT_MUTATION is set.
+mutation-testing = []
+
 [dependencies]
 uc_protocol = { path = "../uc_protocol", version = "2.13.0" }
 uc_log = { path = "../uc_log", version = "2.13.0" }
@@ -35,3 +39,4 @@ uc_node = { path = "../uc_node" }
 uc_service = { path = "../uc_service" }
 uc_net = { path = "../uc_net", version = "2.13.0" }
 tempfile = { workspace = true }
+crc32fast = { workspace = true }

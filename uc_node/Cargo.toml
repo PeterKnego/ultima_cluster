@@ -86,7 +86,7 @@ anyhow = { workspace = true }
 [features]
 # Fault injection for the elle mutation-testing tier. Off in every normal
 # build; even when compiled in, inert unless UC2_MUTATION is set.
-mutation-testing = ["uc_consensus/mutation-testing"]
+mutation-testing = ["uc_consensus/mutation-testing", "uc_client/mutation-testing"]
 
 # read_profile (leader-lease profile harness) carries unit tests for its
 # /proc occupancy parser; `test = true` makes `cargo test` run them.

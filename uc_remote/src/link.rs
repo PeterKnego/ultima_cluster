@@ -93,6 +93,9 @@ const WRITER_PARK: Duration = Duration::from_millis(5);
 const MAX_RETRY_SLEEP: Duration = Duration::from_secs(1);
 /// A `RETRY{retry_after_us: 0}` still backs off this much.
 const MIN_RETRY_SLEEP: Duration = Duration::from_micros(100);
+/// Pause before re-sending a query whose answer came from state older than
+/// its read-your-writes token.
+const STALE_ANSWER_BACKOFF: Duration = Duration::from_millis(1);
 /// Backoff for a request an edge redirected to itself.
 const SELF_REDIRECT_BACKOFF: Duration = Duration::from_millis(10);
 /// The most bytes one re-send batch puts into a single `write_all_bytes`.
@@ -171,6 +174,7 @@ pub(crate) struct StatCells {
     pub(crate) reconnects: AtomicU64,
     pub(crate) resends: AtomicU64,
     pub(crate) retries: AtomicU64,
+    pub(crate) stale_answers: AtomicU64,
     pub(crate) unknown: AtomicU64,
     pub(crate) expired: AtomicU64,
     pub(crate) max_credits_seen: AtomicU32,
@@ -188,6 +192,7 @@ impl StatCells {
             reconnects: self.reconnects.load(Ordering::Relaxed),
             resends: self.resends.load(Ordering::Relaxed),
             retries: self.retries.load(Ordering::Relaxed),
+            stale_answers: self.stale_answers.load(Ordering::Relaxed),
             unknown: self.unknown.load(Ordering::Relaxed),
             expired: self.expired.load(Ordering::Relaxed),
             max_credits_seen: self.max_credits_seen.load(Ordering::Relaxed),
@@ -212,6 +217,15 @@ struct Reconnect {
     /// readers; this field is what that mirror is derived from.
     epoch: u64,
 }
+
+/// One read-your-writes token word on its own cache line. The reader thread
+/// writes `Link::polled_token` per RESPONSE while the submitter reads other
+/// `Link` fields per request; sharing a line would make each response
+/// invalidate the line the submitter reads (false sharing). Rust does not
+/// guarantee field order, so the alignment is explicit.
+#[repr(align(64))]
+#[derive(Default)]
+pub(crate) struct TokenCell(pub(crate) AtomicU64);
 
 pub(crate) struct Link {
     pub(crate) cfg: RemoteConfig,
@@ -262,6 +276,16 @@ pub(crate) struct Link {
     /// which is sound because `reclaim` stops at the oldest LIVE slot, so no
     /// live request is ever below this floor. Monotone.
     pub(crate) oldest_unreclaimed: AtomicU64,
+    /// The read-your-writes token as completions taught it: the highest
+    /// position this client has seen acknowledged or read (spec 2026-10-08
+    /// §5.5). The reader thread is its SINGLE writer — it keeps the running
+    /// maximum in `Reader::polled_max` and publishes with one `Release` store,
+    /// only when it grows — so a RESPONSE costs no locked read-modify-write.
+    pub(crate) polled_token: TokenCell,
+    /// Tokens merged in by `observe` (submit side, rare), kept apart so the
+    /// reader stays the only writer of `polled_token`. The effective token is
+    /// the max of the two ([`Link::read_token`]).
+    pub(crate) observed_token: TokenCell,
     stats: StatCells,
     t0: Instant,
     closed: AtomicBool,
@@ -283,6 +307,16 @@ pub(crate) struct Link {
 }
 
 impl Link {
+    /// The effective read-your-writes token: what completions taught the
+    /// reader, or what `observe` merged in, whichever is higher.
+    #[inline]
+    pub(crate) fn read_token(&self) -> u64 {
+        self.polled_token
+            .0
+            .load(Ordering::Acquire)
+            .max(self.observed_token.0.load(Ordering::Acquire))
+    }
+
     pub(crate) fn start(cfg: RemoteConfig) -> Result<Arc<Link>, RemoteError> {
         cfg.validate()?;
         let client_id = cfg.client_id.unwrap_or_else(random_u64);
@@ -311,6 +345,8 @@ impl Link {
             warned_over_standard: AtomicBool::new(false),
             probe_seq: AtomicU64::new(0),
             oldest_unreclaimed: AtomicU64::new(1),
+            polled_token: TokenCell::default(),
+            observed_token: TokenCell::default(),
             stats,
             t0: Instant::now(),
             closed: AtomicBool::new(false),
@@ -1368,6 +1404,9 @@ fn sleep_watching(link: &Arc<Link>, total: Duration) {
 struct Reader {
     link: Arc<Link>,
     rd: FramedConn,
+    /// Read-your-writes: the running maximum this reader has published into
+    /// `Link::polled_token` (it is that word's only writer).
+    polled_max: u64,
     /// The generation of the connection in `rd`. Every complaint this thread
     /// makes names it, and every grant it reads off that connection is
     /// applied only while it is still current.
@@ -1383,6 +1422,7 @@ impl Reader {
         Reader {
             link,
             rd,
+            polled_max: 0,
             generation: 0,
             last_recv: now,
             last_sweep: now,
@@ -1520,7 +1560,34 @@ impl Reader {
                 if expired {
                     self.link.stats.expired.fetch_add(1, Ordering::Relaxed);
                 }
+                let (kind, min_sent) = self
+                    .link
+                    .slots
+                    .kind_and_min_position(h.seq)
+                    .unwrap_or((crate::slots::ReqKind::Submit, 0));
+                if kind == crate::slots::ReqKind::Query && !expired && meta.position < min_sent {
+                    // Read-your-writes guard (spec §5.5): an answer from state
+                    // older than the token we sent. Do not resolve; re-send in
+                    // place after a short backoff, as for a transient RETRY.
+                    self.link
+                        .stats
+                        .stale_answers
+                        .fetch_add(1, Ordering::Relaxed);
+                    self.link.queue_retransmit(h.seq, STALE_ANSWER_BACKOFF);
+                    credit_update(&self.link, self.generation, meta.credits, meta.acked_seq);
+                    return Act::Continue;
+                }
                 if let crate::slots::Resolve::Won { user_data } = self.link.slots.resolve(h.seq) {
+                    if !expired {
+                        let seen = match kind {
+                            crate::slots::ReqKind::Query => meta.position,
+                            crate::slots::ReqKind::Submit => meta.position.saturating_add(1),
+                        };
+                        if seen > self.polled_max {
+                            self.polled_max = seen;
+                            self.link.polled_token.0.store(seen, Ordering::Release);
+                        }
+                    }
                     let rec = Record {
                         user_data,
                         position: meta.position,
@@ -2007,6 +2074,12 @@ fn random_u64() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    /// Each token word sits on its own cache line (see `TokenCell`).
+    #[test]
+    fn token_cells_are_cache_line_aligned() {
+        assert_eq!(std::mem::align_of::<super::TokenCell>(), 64);
+    }
+
     use super::*;
     use crate::frame::HelloOk;
     use std::net::TcpListener;

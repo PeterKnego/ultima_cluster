@@ -18,6 +18,9 @@ pub(crate) enum Mutation {
     /// Linearizable reads skip the READ_PROBE quorum barrier (stale reads —
     /// a pure real-time anomaly, caught only by the strict elle model).
     SkipReadBarrier,
+    /// Read-your-writes capstone tooth T1/T2 (spec planning erratum 3): forward
+    /// a min-position read at admission, as a snapshot read, ignoring its token.
+    SkipMinPositionWait,
 }
 
 fn parse(v: Option<&str>) -> Option<Mutation> {
@@ -26,6 +29,7 @@ fn parse(v: Option<&str>) -> Option<Mutation> {
         Some("commit-quorum-minus-one") => Some(Mutation::CommitQuorumMinusOne),
         Some("skip-vote-order-check") => Some(Mutation::SkipVoteOrderCheck),
         Some("skip-read-barrier") => Some(Mutation::SkipReadBarrier),
+        Some("skip-min-position-wait") => Some(Mutation::SkipMinPositionWait),
         Some(other) => panic!("unknown UC2_MUTATION value: {other:?}"),
     }
 }
@@ -55,6 +59,10 @@ mod tests {
         assert_eq!(
             parse(Some("skip-read-barrier")),
             Some(Mutation::SkipReadBarrier)
+        );
+        assert_eq!(
+            parse(Some("skip-min-position-wait")),
+            Some(Mutation::SkipMinPositionWait)
         );
     }
 

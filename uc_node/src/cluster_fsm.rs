@@ -282,6 +282,8 @@ impl ClusterState {
             version: self.version_at(r.row, r.position),
             hash: v.majority_hash.unwrap_or(0),
             verdict,
+            // Snapshot-lifecycle spec §7.2 / plan ruling P7.
+            size: uc_protocol::v2::upgrade::majority_size(r, &v),
         };
         let declared = self.declared_mask();
         let Some(e) = self.catalog.iter_mut().find(|e| e.position == r.position) else {
@@ -373,10 +375,19 @@ impl ClusterState {
         self.cap_catalog();
     }
 
-    /// Every row's newest pin origin — the sets retention must keep (D5).
+    /// Every row's newest pin origin whose pin is not yet COMPLETE — the
+    /// sets retention must keep (D5). Pin completion ruling C3: once the
+    /// catalog lists a completion set (an agreed set the pin's `to` line
+    /// built above the pin record, [`crate::catalog::pin_complete`]) the
+    /// origin is an ordinary agreed set, counted toward `retain_sets` and
+    /// retired like any other. Deterministic: a pure function of the
+    /// replicated pins, running records and catalog.
     fn pinned_origins(&self) -> Vec<u64> {
         (0..CNC_MAX_SERVICES as u8)
-            .filter_map(|row| self.pin_for(row).map(|p| p.origin))
+            .filter_map(|row| {
+                let gate = crate::catalog::pin_gate(&self.pins, &self.running, row)?;
+                (!crate::catalog::pin_complete(&self.catalog, row, &gate)).then_some(gate.origin)
+            })
             .collect()
     }
 
@@ -892,9 +903,10 @@ impl RawStateMachine for ClusterFsm {
 /// The frozen image: magic ‖ version u32 ‖ applied u64 ‖ table_position u64
 /// ‖ settings_position u64 ‖ membership (u32 len ‖ encode_config) ‖ table
 /// (u32 len ‖ encode_schedule_table) ‖ settings (one whole record — the
-/// decoder accepts all three settings versions: v1 (`SETTINGS_LEN_V1`, 29
-/// B), v2 (`SETTINGS_LEN_V2`, 33 B) and v3 (`SETTINGS_LEN`, 35 B, the only
-/// one `freeze` writes); v1/v2 read `retain_sets = 1`, catalog ruling R24) ‖
+/// decoder accepts all four settings versions: v1 (`SETTINGS_LEN_V1`, 29
+/// B), v2 (`SETTINGS_LEN_V2`, 33 B), v3 (`SETTINGS_LEN_V3`, 35 B) and v4
+/// (`SETTINGS_LEN`, 36 B, the only one `freeze` writes); v1/v2 read
+/// `retain_sets = 1` (catalog ruling R24), v1–v3 read `auto_fetch = true`) ‖
 /// pins (u32 len ‖ `encode_pin_list`) ‖ reports (u32 len ‖
 /// `encode_report_list`) ‖ running (u32 len ‖ `encode_running_list`, #33,
 /// layout **v3**) ‖ catalog (u32 len ‖ `encode_set_list`, the snapshot
@@ -980,6 +992,12 @@ impl SnapshotStateMachine for ClusterFsm {
         // mismatch below, since the expected position is not part of the
         // wire image.
         let parts = decode_cluster_image(&img).ok_or_else(|| bad("cluster image"))?;
+        // Snapshot-lifecycle spec §7.2: a v1–v4 image stored the report and
+        // catalog blobs UNSIZED; they decode with every size 0 (unknown). The
+        // catalog needs the version to pick its width; the reports do not.
+        let sized = uc_protocol::v2::cluster_image::cluster_image_version(&img)
+            .ok_or_else(|| bad("cluster image"))?
+            >= 5;
         if parts.applied != position {
             return Err(bad("cluster image position"));
         }
@@ -1017,6 +1035,9 @@ impl SnapshotStateMachine for ClusterFsm {
         // exactly the reason it agrees on everything else here: it is
         // reading the same bytes in the same order.
         let pins = decode_pin_list(parts.pins).ok_or_else(|| bad("cluster image pins"))?;
+        // Ruling R2: `decode_snapshot_report` infers the entry width, so a
+        // v1–v4 image's unsized blob reads with every size 0 here exactly as
+        // a replayed pre-lifecycle kind-5 record does in `apply`.
         let reports =
             decode_report_list(parts.reports).ok_or_else(|| bad("cluster image reports"))?;
         let mut running = [None; CNC_MAX_SERVICES];
@@ -1046,11 +1067,15 @@ impl SnapshotStateMachine for ClusterFsm {
                 running[r.row as usize] = Some(r);
             }
         }
-        // Empty for a v1–v3 image: the catalog's `Empty` state (§4.5).
+        // Empty for a v1–v3 image: the catalog's `Empty` state (§4.5); a v4
+        // image's catalog is unsized (every size 0, see `sized` above).
         let catalog = if parts.catalog.is_empty() {
             Vec::new()
-        } else {
+        } else if sized {
             decode_set_list(parts.catalog).ok_or_else(|| bad("cluster image: catalog"))?
+        } else {
+            uc_protocol::v2::catalog::decode_set_list_unsized(parts.catalog)
+                .ok_or_else(|| bad("cluster image: catalog"))?
         };
         // The list is keyed by position, oldest first; `retire` and every
         // reader rely on that order, so an image that breaks it is refused
@@ -1132,6 +1157,10 @@ pub struct ClusterView {
     /// atomics, and a leader that re-proposes the committed record (the
     /// jumbo rung raise) must re-propose a `retain_sets` the door accepts.
     pub retain_sets: AtomicU16,
+    /// Snapshot-lifecycle spec §6: the committed `auto_fetch` switch — read
+    /// by the consensus agent once per pass (one load, no lock), and by
+    /// [`Self::to_state`], so a re-proposed record carries it unchanged.
+    pub auto_fetch: AtomicBool,
     /// Catalog spec §4.5: the newest AGREED set's position; `0` = nothing
     /// agreed (the cluster floor moves nothing). NOT the `Empty` test since
     /// catalog ruling R26 — that is [`Self::catalog_has_complete`].
@@ -1149,6 +1178,11 @@ pub struct ClusterView {
     /// How many row entries (the cluster artifact's included) across the
     /// listed sets read `Diverged` or `NoMajority`.
     pub catalog_diverged: AtomicU64,
+    /// Snapshot-lifecycle spec §7.4: the newest AGREED set's total size
+    /// ([`SetEntry::total_size`]); `0` when unknown or none —
+    /// `uc2_snapshot_newest_agreed_bytes`, and the auto-fetch space check's
+    /// input.
+    pub catalog_newest_agreed_bytes: AtomicU64,
     /// Catalog ruling R16: a CONTENT hash of the listed sets
     /// ([`catalog_version_of`]) — the stamp a node's `Holdings.sets_held`
     /// is computed against, and the one a leader's query compares. Equal on
@@ -1236,11 +1270,13 @@ impl ClusterView {
             datagram_mtu: AtomicU32::new(0),
             versioned: AtomicU8::new(0),
             retain_sets: AtomicU16::new(0),
+            auto_fetch: AtomicBool::new(true),
             catalog_agreed_position: AtomicU64::new(0),
             catalog_has_complete: AtomicBool::new(false),
             catalog_len: AtomicU64::new(0),
             catalog_stalled: AtomicU64::new(0),
             catalog_diverged: AtomicU64::new(0),
+            catalog_newest_agreed_bytes: AtomicU64::new(0),
             catalog_version: AtomicU64::new(0),
             inner: Mutex::new(ClusterViewInner {
                 membership: genesis.membership.clone(),
@@ -1286,6 +1322,8 @@ impl ClusterView {
         self.datagram_mtu
             .store(st.settings.datagram_mtu, Ordering::Release);
         self.retain_sets.store(st.retain_sets(), Ordering::Release);
+        self.auto_fetch
+            .store(st.settings.auto_fetch, Ordering::Release);
         // Catalog gauges — like everything above, BEFORE `position`.
         let stalled = st
             .catalog
@@ -1315,6 +1353,14 @@ impl ClusterView {
             .store(stalled as u64, Ordering::Release);
         self.catalog_diverged
             .store(diverged as u64, Ordering::Release);
+        self.catalog_newest_agreed_bytes.store(
+            st.catalog
+                .iter()
+                .rev()
+                .find(|e| e.is_agreed())
+                .map_or(0, SetEntry::total_size),
+            Ordering::Release,
+        );
         self.catalog_version
             .store(catalog_version_of(&st.catalog), Ordering::Release);
         self.position.store(st.applied, Ordering::Release);
@@ -1421,6 +1467,7 @@ impl ClusterView {
                 // verbatim, and deliberately: a record rebuilt from this view
                 // and re-proposed must pass the door's `1..=64` bound.
                 retain_sets: self.retain_sets.load(Ordering::Acquire),
+                auto_fetch: self.auto_fetch.load(Ordering::Acquire),
             },
             settings_position: self.settings_position.load(Ordering::Acquire),
             applied: self.position.load(Ordering::Acquire),
@@ -1946,6 +1993,7 @@ mod tests {
             snapshot_target: uc_protocol::v2::settings::Target::Learners,
             datagram_mtu: 8832,
             retain_sets: 3,
+            auto_fetch: false,
         };
         let v = ClusterView::new(&st);
         assert_eq!(v.to_state(), st);
@@ -2012,7 +2060,7 @@ mod tests {
             origin,
         })
     }
-    fn report(row: u8, position: u64, hashes: &[(u32, u64)]) -> ClusterCommand {
+    fn report(row: u8, position: u64, hashes: &[(u32, u64, u64)]) -> ClusterCommand {
         ClusterCommand::SnapshotReport(SnapshotReport {
             row,
             position,
@@ -2101,22 +2149,26 @@ mod tests {
     fn a_report_is_held_newest_per_row_and_a_stale_one_is_refused() {
         let mut f = fsm();
         assert_eq!(
-            apply_at(&mut f, 100, &report(0, 50, &[(0, 1), (1, 1), (2, 2)])),
+            apply_at(
+                &mut f,
+                100,
+                &report(0, 50, &[(0, 1, 0), (1, 1, 0), (2, 2, 0)])
+            ),
             0
         );
         assert_eq!(f.state().report_for(0).map(|r| r.position), Some(50));
         assert_eq!(
-            apply_at(&mut f, 200, &report(0, 40, &[(0, 1)])),
+            apply_at(&mut f, 200, &report(0, 40, &[(0, 1, 0)])),
             59,
             "below the held position"
         );
         assert_eq!(
-            apply_at(&mut f, 300, &report(0, 50, &[(0, 1), (1, 1)])),
+            apply_at(&mut f, 300, &report(0, 50, &[(0, 1, 0), (1, 1, 0)])),
             0,
             "equal replaces (a fuller vector for the same instant)"
         );
         assert_eq!(f.state().report_for(0).map(|r| r.hashes.len()), Some(2));
-        assert_eq!(apply_at(&mut f, 400, &report(3, 10, &[(0, 9)])), 0);
+        assert_eq!(apply_at(&mut f, 400, &report(3, 10, &[(0, 9, 0)])), 0);
         assert_eq!(f.state().reports.len(), 2, "one entry per row");
         assert_eq!(
             verdict(f.state().report_for(0).unwrap()),
@@ -2132,7 +2184,11 @@ mod tests {
     fn pins_and_reports_ride_the_image_and_an_old_image_installs_empty() {
         let mut f = fsm();
         apply_at(&mut f, 100, &pin(0, 1, 2, 50));
-        apply_at(&mut f, 200, &report(0, 50, &[(0, 1), (1, 2), (2, 2)]));
+        apply_at(
+            &mut f,
+            200,
+            &report(0, 50, &[(0, 1, 0), (1, 2, 0), (2, 2, 0)]),
+        );
         let (img, pos) = f.freeze().unwrap();
         assert_eq!(pos, 200);
         let mut g = ClusterFsm::new(genesis(), vec![]);
@@ -2403,7 +2459,7 @@ mod tests {
     fn the_view_publishes_pins_and_reports() {
         let mut f = fsm();
         apply_at(&mut f, 100, &pin(0, 1, 2, 50));
-        apply_at(&mut f, 200, &report(0, 50, &[(0, 1)]));
+        apply_at(&mut f, 200, &report(0, 50, &[(0, 1, 0)]));
         let v = ClusterView::new(&genesis());
         v.publish(f.state());
         let st = v.to_state();
@@ -2432,8 +2488,11 @@ mod tests {
     /// One agreed set at `p`: the SNAPSHOT frame, then row 0 and the cluster row report one hash each.
     fn agreed_set(f: &mut ClusterFsm, p: u64, at: u64) {
         f.on_snapshot_frame(p, false, p);
-        assert_eq!(apply_at(f, at, &report(0, p, &[(0, 1)])), 0);
-        assert_eq!(apply_at(f, at + 10, &report(CLUSTER_ROW, p, &[(0, 1)])), 0);
+        assert_eq!(apply_at(f, at, &report(0, p, &[(0, 1, 0)])), 0);
+        assert_eq!(
+            apply_at(f, at + 10, &report(CLUSTER_ROW, p, &[(0, 1, 0)])),
+            0
+        );
     }
     fn positions(f: &ClusterFsm) -> Vec<u64> {
         f.state().catalog.iter().map(|e| e.position).collect()
@@ -2470,7 +2529,7 @@ mod tests {
         genesis_row(&mut f, 0, 100);
         f.on_snapshot_frame(4096, false, 1);
         assert_eq!(
-            apply_at(&mut f, 4200, &report(0, 4096, &[(0, 7), (1, 7)])),
+            apply_at(&mut f, 4200, &report(0, 4096, &[(0, 7, 0), (1, 7, 0)])),
             0
         );
         assert_eq!(
@@ -2479,7 +2538,11 @@ mod tests {
             "cluster row still unreported"
         );
         assert_eq!(
-            apply_at(&mut f, 4300, &report(CLUSTER_ROW, 4096, &[(0, 9), (1, 9)])),
+            apply_at(
+                &mut f,
+                4300,
+                &report(CLUSTER_ROW, 4096, &[(0, 9, 0), (1, 9, 0)])
+            ),
             0
         );
         let e = &f.state().catalog[0];
@@ -2489,7 +2552,8 @@ mod tests {
             RowEntry {
                 version: pack_version(1, 0, 0),
                 hash: 7,
-                verdict: RowVerdict::Agreed
+                verdict: RowVerdict::Agreed,
+                size: 0,
             }
         );
         assert_eq!((e.cluster.hash, e.cluster.verdict), (9, RowVerdict::Agreed));
@@ -2503,14 +2567,18 @@ mod tests {
         genesis_row(&mut f, 0, 100);
         f.on_snapshot_frame(4096, false, 1);
         assert_eq!(
-            apply_at(&mut f, 4200, &report(0, 4096, &[(0, 7), (1, 8), (2, 7)])),
+            apply_at(
+                &mut f,
+                4200,
+                &report(0, 4096, &[(0, 7, 0), (1, 8, 0), (2, 7, 0)])
+            ),
             0
         );
         assert_eq!(
             apply_at(
                 &mut f,
                 4300,
-                &report(CLUSTER_ROW, 4096, &[(0, 9), (1, 9), (2, 9)])
+                &report(CLUSTER_ROW, 4096, &[(0, 9, 0), (1, 9, 0), (2, 9, 0)])
             ),
             0
         );
@@ -2534,10 +2602,10 @@ mod tests {
         let mut f = fsm();
         genesis_row(&mut f, 0, 100);
         f.on_snapshot_frame(4096, false, 1);
-        assert_eq!(apply_at(&mut f, 4200, &report(0, 4096, &[(0, 7)])), 0);
-        assert_eq!(apply_at(&mut f, 4250, &report(5, 4096, &[(0, 7)])), 0); // row 5 never declared
+        assert_eq!(apply_at(&mut f, 4200, &report(0, 4096, &[(0, 7, 0)])), 0);
+        assert_eq!(apply_at(&mut f, 4250, &report(5, 4096, &[(0, 7, 0)])), 0); // row 5 never declared
         assert_eq!(
-            apply_at(&mut f, 4300, &report(CLUSTER_ROW, 4096, &[(0, 9)])),
+            apply_at(&mut f, 4300, &report(CLUSTER_ROW, 4096, &[(0, 9, 0)])),
             0
         );
         let e = &f.state().catalog[0];
@@ -2585,10 +2653,22 @@ mod tests {
         assert_eq!(f.state().newest_agreed_at_most(1500), Some(1000));
     }
 
+    /// Report row 0 and the cluster row for the set at `p` (commanded
+    /// earlier), one hash each — the second half of [`agreed_set`].
+    fn agree(f: &mut ClusterFsm, p: u64, at: u64) {
+        assert_eq!(apply_at(f, at, &report(0, p, &[(0, 1, 0)])), 0);
+        assert_eq!(
+            apply_at(f, at + 10, &report(CLUSTER_ROW, p, &[(0, 1, 0)])),
+            0
+        );
+    }
+
     /// Ruling R21: a pinned origin is kept IN ADDITION to `retain_sets`,
-    /// never counted toward it. With `retain_sets = 2` and the oldest set
-    /// pinned, `[pin, A, B]` keeps all three; a fourth agreed set retires A
-    /// (the oldest UNPINNED one), never the pin.
+    /// never counted toward it — while the pin is INCOMPLETE. With
+    /// `retain_sets = 2` and the oldest set pinned, `[pin, A, B]` keeps all
+    /// three; a fourth agreed set retires A (the oldest UNPINNED one), never
+    /// the pin. A, B and C are commanded BELOW the pin record (agreed after
+    /// it), so none of them completes the pin (ruling C1's record bound).
     #[test]
     fn a_pinned_origin_does_not_count_toward_retain_sets() {
         let mut f = fsm();
@@ -2596,23 +2676,64 @@ mod tests {
         let cmd = settings_with_retain(&f, 2);
         assert_eq!(apply_at(&mut f, 200, &cmd), 0);
         agreed_set(&mut f, 1000, 1100);
+        for p in [2000, 3000, 4000] {
+            f.on_snapshot_frame(p, false, p);
+        }
         assert_eq!(
             apply_at(
                 &mut f,
-                1500,
+                4500,
                 &pin(0, pack_version(1, 0, 0), pack_version(1, 1, 0), 1000)
             ),
             0
         );
-        agreed_set(&mut f, 2000, 2100);
-        agreed_set(&mut f, 3000, 3100);
+        agree(&mut f, 2000, 4600);
+        agree(&mut f, 3000, 4700);
         assert_eq!(
             positions(&f),
-            vec![1000, 2000, 3000],
+            vec![1000, 2000, 3000, 4000],
             "the pin is kept beside two retained sets"
         );
-        agreed_set(&mut f, 4000, 4100);
+        agree(&mut f, 4000, 4800);
         assert_eq!(positions(&f), vec![1000, 3000, 4000], "A (2000) retires");
+    }
+
+    /// Pin completion ruling C3, the FSM half: an agreed set ABOVE the pin
+    /// record, on `to`'s line, completes the pin, and from that apply the
+    /// origin is an ordinary agreed set — counted toward `retain_sets` and
+    /// retired like any other. Deterministic: every replica applies the same
+    /// record and computes the same predicate.
+    #[test]
+    fn a_completed_pin_no_longer_protects_its_origin() {
+        let mut f = fsm();
+        genesis_row(&mut f, 0, 100);
+        let cmd = settings_with_retain(&f, 2);
+        assert_eq!(apply_at(&mut f, 200, &cmd), 0);
+        agreed_set(&mut f, 1000, 1100);
+        agreed_set(&mut f, 2000, 2100);
+        assert_eq!(
+            apply_at(
+                &mut f,
+                2500,
+                &pin(0, pack_version(1, 0, 0), pack_version(1, 1, 0), 2000)
+            ),
+            0
+        );
+        assert_eq!(positions(&f), vec![1000, 2000]);
+        // The first set above the record completes the pin: `[1000, 2000,
+        // 3000]` are now all unpinned, so the oldest retires.
+        agreed_set(&mut f, 3000, 3100);
+        let st = f.state();
+        let gate = crate::catalog::pin_gate(&st.pins, &st.running, 0).unwrap();
+        assert_eq!(gate.record_pos, 2500);
+        assert!(crate::catalog::pin_complete(&st.catalog, 0, &gate));
+        assert_eq!(positions(&f), vec![2000, 3000]);
+        agreed_set(&mut f, 4000, 4100);
+        assert_eq!(
+            positions(&f),
+            vec![3000, 4000],
+            "the completed pin's origin retires like any set"
+        );
     }
 
     #[test]
@@ -2665,8 +2786,11 @@ mod tests {
         for f in [&mut a, &mut b] {
             genesis_row(f, 0, 100);
             f.on_snapshot_frame(1000, true, 5);
-            assert_eq!(apply_at(f, 1100, &report(0, 1000, &[(2, 1)])), 0);
-            assert_eq!(apply_at(f, 1110, &report(CLUSTER_ROW, 1000, &[(2, 1)])), 0);
+            assert_eq!(apply_at(f, 1100, &report(0, 1000, &[(2, 1, 0)])), 0);
+            assert_eq!(
+                apply_at(f, 1110, &report(CLUSTER_ROW, 1000, &[(2, 1, 0)])),
+                0
+            );
             f.set_consumed(1200);
         }
         let (ia, _) = a.freeze().unwrap();
@@ -2700,6 +2824,21 @@ mod tests {
         );
     }
 
+    /// Snapshot-lifecycle spec §6: the view carries `auto_fetch`, and
+    /// `to_state` returns it — a leader that re-proposes the committed record
+    /// (the jumbo rung raise) must not silently turn the switch back on.
+    #[test]
+    fn the_view_publishes_auto_fetch_and_to_state_returns_it() {
+        let mut st = fsm().state().clone();
+        st.settings.auto_fetch = false;
+        let v = ClusterView::new(&st);
+        assert!(!v.auto_fetch.load(Ordering::Acquire));
+        assert!(!v.to_state().settings.auto_fetch);
+        st.settings.auto_fetch = true;
+        v.publish(&st);
+        assert!(v.to_state().settings.auto_fetch);
+    }
+
     #[test]
     fn the_view_publishes_the_catalog_and_its_gauges() {
         let mut f = fsm();
@@ -2715,7 +2854,7 @@ mod tests {
         f.on_snapshot_frame(1500, false, 2); // stalled
         f.on_snapshot_frame(2000, false, 3);
         assert_eq!(
-            apply_at(&mut f, 2100, &report(0, 2000, &[(0, 1), (1, 2)])),
+            apply_at(&mut f, 2100, &report(0, 2000, &[(0, 1, 0), (1, 2, 0)])),
             0
         ); // NoMajority
         v.publish(f.state());
@@ -2739,9 +2878,9 @@ mod tests {
             to: pack_version(1, 1, 0),
         };
         assert_eq!(apply_at(&mut f, 4200, &ClusterCommand::UpgradePin(up)), 0);
-        assert_eq!(apply_at(&mut f, 4300, &report(0, 4096, &[(0, 7)])), 0);
+        assert_eq!(apply_at(&mut f, 4300, &report(0, 4096, &[(0, 7, 0)])), 0);
         assert_eq!(
-            apply_at(&mut f, 4400, &report(CLUSTER_ROW, 4096, &[(0, 9)])),
+            apply_at(&mut f, 4400, &report(CLUSTER_ROW, 4096, &[(0, 9, 0)])),
             0
         );
         let e = f
@@ -2753,9 +2892,9 @@ mod tests {
         assert_eq!(e.rows[0].version, pack_version(1, 0, 0), "from built it");
         // A later set, reported after the pin, was built by `to`.
         f.on_snapshot_frame(8192, false, 2);
-        assert_eq!(apply_at(&mut f, 8300, &report(0, 8192, &[(0, 8)])), 0);
+        assert_eq!(apply_at(&mut f, 8300, &report(0, 8192, &[(0, 8, 0)])), 0);
         assert_eq!(
-            apply_at(&mut f, 8400, &report(CLUSTER_ROW, 8192, &[(0, 9)])),
+            apply_at(&mut f, 8400, &report(CLUSTER_ROW, 8192, &[(0, 9, 0)])),
             0
         );
         let e = f
@@ -2879,14 +3018,6 @@ mod tests {
         assert_eq!(apply_at(&mut f, 200, &cmd), 0);
         agreed_set(&mut f, 1000, 1100);
         agreed_set(&mut f, 2000, 2100);
-        assert_eq!(
-            apply_at(
-                &mut f,
-                2300,
-                &pin(0, pack_version(1, 0, 0), pack_version(1, 1, 0), 1000)
-            ),
-            0
-        );
         genesis_row(&mut f, 1, 2500);
         assert!(
             f.state().catalog.iter().all(|e| e.is_agreed()),
@@ -2896,9 +3027,20 @@ mod tests {
         assert_eq!(f.state().newest_agreed_at_most(u64::MAX), Some(2000));
         // A set at 3000 must now cover rows 0 AND 1.
         f.on_snapshot_frame(3000, false, 3);
-        assert_eq!(apply_at(&mut f, 3100, &report(0, 3000, &[(0, 1)])), 0);
+        // Row 0 pinned at 1000 with its record ABOVE the frame, so the set
+        // at 3000 sits below the pin record and does not complete it (ruling
+        // C1) — the pinned origin must stay through retention below.
         assert_eq!(
-            apply_at(&mut f, 3110, &report(CLUSTER_ROW, 3000, &[(0, 1)])),
+            apply_at(
+                &mut f,
+                3050,
+                &pin(0, pack_version(1, 0, 0), pack_version(1, 1, 0), 1000)
+            ),
+            0
+        );
+        assert_eq!(apply_at(&mut f, 3100, &report(0, 3000, &[(0, 1, 0)])), 0);
+        assert_eq!(
+            apply_at(&mut f, 3110, &report(CLUSTER_ROW, 3000, &[(0, 1, 0)])),
             0
         );
         assert_eq!(
@@ -2906,7 +3048,7 @@ mod tests {
             SetState::Commanded,
             "row 1 unreported"
         );
-        assert_eq!(apply_at(&mut f, 3120, &report(1, 3000, &[(0, 1)])), 0);
+        assert_eq!(apply_at(&mut f, 3120, &report(1, 3000, &[(0, 1, 0)])), 0);
         assert_eq!(f.state().newest_agreed_at_most(u64::MAX), Some(3000));
         let cmd = settings_with_retain(&f, 1);
         assert_eq!(apply_at(&mut f, 3200, &cmd), 0);
@@ -2948,9 +3090,9 @@ mod tests {
         genesis_row(&mut f, 0, 100);
         f.on_snapshot_frame(4096, false, 1);
         let before = f.state().catalog.clone();
-        assert_eq!(apply_at(&mut f, 4200, &report(0, 5000, &[(0, 7)])), 0);
+        assert_eq!(apply_at(&mut f, 4200, &report(0, 5000, &[(0, 7, 0)])), 0);
         assert_eq!(
-            apply_at(&mut f, 4300, &report(CLUSTER_ROW, 5000, &[(0, 7)])),
+            apply_at(&mut f, 4300, &report(CLUSTER_ROW, 5000, &[(0, 7, 0)])),
             0
         );
         assert_eq!(f.state().catalog, before);
@@ -2963,7 +3105,7 @@ mod tests {
         let mut f = fsm();
         f.on_snapshot_frame(4096, false, 1);
         assert_eq!(
-            apply_at(&mut f, 4200, &report(CLUSTER_ROW, 4096, &[(0, 9)])),
+            apply_at(&mut f, 4200, &report(CLUSTER_ROW, 4096, &[(0, 9, 0)])),
             0
         );
         assert!(f.state().reports.is_empty());
@@ -2977,11 +3119,15 @@ mod tests {
         genesis_row(&mut f, 0, 100);
         f.on_snapshot_frame(4096, true, 1);
         assert_eq!(
-            apply_at(&mut f, 4200, &report(0, 4096, &[(3, 7), (4, 7)])),
+            apply_at(&mut f, 4200, &report(0, 4096, &[(3, 7, 0), (4, 7, 0)])),
             0
         );
         assert_eq!(
-            apply_at(&mut f, 4300, &report(CLUSTER_ROW, 4096, &[(3, 9), (4, 9)])),
+            apply_at(
+                &mut f,
+                4300,
+                &report(CLUSTER_ROW, 4096, &[(3, 9, 0), (4, 9, 0)])
+            ),
             0
         );
         let e = &f.state().catalog[0];
@@ -2995,6 +3141,37 @@ mod tests {
         let mut f = fsm();
         genesis_row(&mut f, 0, 100);
         agreed_set(&mut f, 1000, 1100);
+        // Both younger sets are commanded below the pin record, so neither
+        // completes the pin (ruling C1) and the origin stays protected.
+        f.on_snapshot_frame(2000, false, 2000);
+        f.on_snapshot_frame(3000, false, 3000);
+        assert_eq!(
+            apply_at(
+                &mut f,
+                3050,
+                &pin(0, pack_version(1, 0, 0), pack_version(1, 1, 0), 1000)
+            ),
+            0
+        );
+        agree(&mut f, 2000, 3100);
+        assert_eq!(
+            positions(&f),
+            vec![1000, 2000, 3000],
+            "2000 is the newest agreed"
+        );
+        agree(&mut f, 3000, 3200);
+        assert_eq!(positions(&f), vec![1000, 3000]);
+    }
+
+    /// Fix round 1 (a): a current-layout image carries each row's running
+    /// record exactly — `record_pos` survives freeze/install unchanged, so a
+    /// node that installed the image computes pin completion (ruling C1)
+    /// from the same number as one that applied the records.
+    #[test]
+    fn a_current_image_round_trip_preserves_the_pin_record_position() {
+        let mut f = fsm();
+        genesis_row(&mut f, 0, 100);
+        agreed_set(&mut f, 1000, 1100);
         assert_eq!(
             apply_at(
                 &mut f,
@@ -3003,10 +3180,51 @@ mod tests {
             ),
             0
         );
-        agreed_set(&mut f, 2000, 2100);
-        assert_eq!(positions(&f), vec![1000, 2000], "2000 is the newest agreed");
-        agreed_set(&mut f, 3000, 3100);
-        assert_eq!(positions(&f), vec![1000, 3000]);
+        f.on_snapshot_frame(1800, false, 1800);
+        let cmd = settings_with_retain(&f, 1);
+        assert_eq!(apply_at(&mut f, 2000, &cmd), 0);
+        assert_eq!(f.state().applied, 2000);
+        let (img, at) = f.freeze().unwrap();
+        let mut g = fsm();
+        g.install_snapshot(at, &mut &img[..]).unwrap();
+        assert_eq!(g.state().running_for(0).unwrap().record_pos, 1500);
+    }
+
+    /// Fix round 1 (b), the determinism test: one replica applies the
+    /// records, the other installs the image taken from the first at
+    /// `applied = 2000`, above the pin record (1500). A set strictly between
+    /// the two (1800) then agrees on both. Both must reach the same
+    /// `pinned_origins()`, the same retirement and byte-equal images.
+    #[test]
+    fn a_walked_and_an_installed_replica_retire_identically_after_a_pin() {
+        let mut f = fsm();
+        genesis_row(&mut f, 0, 100);
+        agreed_set(&mut f, 1000, 1100);
+        assert_eq!(
+            apply_at(
+                &mut f,
+                1500,
+                &pin(0, pack_version(1, 0, 0), pack_version(1, 1, 0), 1000)
+            ),
+            0
+        );
+        f.on_snapshot_frame(1800, false, 1800);
+        let cmd = settings_with_retain(&f, 1);
+        assert_eq!(apply_at(&mut f, 2000, &cmd), 0);
+        let (img, at) = f.freeze().unwrap();
+        let mut g = fsm();
+        g.install_snapshot(at, &mut &img[..]).unwrap();
+        for r in [&mut f, &mut g] {
+            agree(r, 1800, 2100);
+        }
+        // 1800 completes the pin (above the record 1500), so the origin is
+        // an ordinary set and `retain_sets = 1` retires it — on both.
+        assert_eq!(f.state().pinned_origins(), Vec::<u64>::new());
+        assert_eq!(f.state().pinned_origins(), g.state().pinned_origins());
+        assert_eq!(positions(&f), vec![1800]);
+        assert_eq!(positions(&f), positions(&g));
+        assert_eq!(f.state(), g.state());
+        assert_eq!(f.freeze().unwrap().0, g.freeze().unwrap().0);
     }
 
     // ------------------------------------------------- final fix wave (C1/I1)
@@ -3111,10 +3329,17 @@ mod tests {
             // Complete, not agreed — the stale entries must still go.
             f.on_snapshot_frame(1000, false, 3);
             assert_eq!(
-                apply_at(f, 1100, &report(0, 1000, &[(0, 1), (1, 2), (2, 3)])),
+                apply_at(
+                    f,
+                    1100,
+                    &report(0, 1000, &[(0, 1, 0), (1, 2, 0), (2, 3, 0)])
+                ),
                 0
             );
-            assert_eq!(apply_at(f, 1110, &report(CLUSTER_ROW, 1000, &[(0, 1)])), 0);
+            assert_eq!(
+                apply_at(f, 1110, &report(CLUSTER_ROW, 1000, &[(0, 1, 0)])),
+                0
+            );
             f.set_consumed(1200);
         }
         assert_eq!(a.state().catalog[0..].len(), 1);
@@ -3139,11 +3364,15 @@ mod tests {
         f.on_snapshot_frame(700, false, 2);
         f.on_snapshot_frame(1000, false, 3);
         assert_eq!(
-            apply_at(&mut f, 1100, &report(0, 1000, &[(0, 1), (1, 2), (2, 3)])),
+            apply_at(
+                &mut f,
+                1100,
+                &report(0, 1000, &[(0, 1, 0), (1, 2, 0), (2, 3, 0)])
+            ),
             0
         );
         assert_eq!(
-            apply_at(&mut f, 1110, &report(CLUSTER_ROW, 1000, &[(0, 1)])),
+            apply_at(&mut f, 1110, &report(CLUSTER_ROW, 1000, &[(0, 1, 0)])),
             0
         );
         assert_eq!(
@@ -3151,5 +3380,230 @@ mod tests {
             vec![500, 1000],
             "700 dropped, pinned 500 kept"
         );
+    }
+
+    /// Snapshot-lifecycle spec §7.2: the row entry records the size reported
+    /// with the majority hash; the cluster row likewise.
+    #[test]
+    fn the_catalog_records_the_majority_hashs_size() {
+        let mut f = fsm();
+        genesis_row(&mut f, 0, 100);
+        f.on_snapshot_frame(4096, false, 1);
+        assert_eq!(
+            apply_at(
+                &mut f,
+                4200,
+                &report(0, 4096, &[(0, 7, 40), (1, 7, 40), (2, 8, 99)])
+            ),
+            0
+        );
+        assert_eq!(
+            apply_at(
+                &mut f,
+                4300,
+                &report(CLUSTER_ROW, 4096, &[(0, 9, 300), (1, 9, 300), (2, 9, 300)])
+            ),
+            0
+        );
+        let e = &f.state().catalog[0];
+        assert_eq!(
+            (e.rows[0].verdict, e.rows[0].size),
+            (RowVerdict::Diverged, 40)
+        );
+        assert_eq!(e.cluster.size, 300);
+    }
+
+    /// Snapshot-lifecycle spec §7.2: a v4 image (unsized report and catalog
+    /// blobs) installs with every size 0 — no refusal, no wipe.
+    #[test]
+    fn a_v4_image_installs_with_every_size_zero() {
+        let mut f = fsm();
+        genesis_row(&mut f, 0, 100);
+        f.on_snapshot_frame(1000, false, 1);
+        assert_eq!(apply_at(&mut f, 1100, &report(0, 1000, &[(0, 1, 40)])), 0);
+        assert_eq!(
+            apply_at(&mut f, 1110, &report(CLUSTER_ROW, 1000, &[(0, 2, 300)])),
+            0
+        );
+        f.set_consumed(1200);
+        let (img, _) = f.freeze().unwrap();
+        let v4 = rewrite_image_as_v4(&img);
+        let mut g = fsm();
+        assert_eq!(g.install_snapshot(1200, &mut &v4[..]).unwrap(), 1200);
+        let e = &g.state().catalog[0];
+        assert_eq!((e.rows[0].hash, e.rows[0].size), (1, 0));
+        assert_eq!((e.cluster.hash, e.cluster.size), (2, 0));
+        assert_eq!(
+            g.state().report_for(0).map(|r| r.hashes.clone()),
+            Some(vec![(0, 1, 0)])
+        );
+        assert!(
+            e.is_agreed(),
+            "agreement survives the migration; only sizes are unknown"
+        );
+    }
+
+    /// Review focus 4: the gauge word is 0 while the newest agreed set's size
+    /// is unknown — a pre-lifecycle set never reads as "too big".
+    #[test]
+    fn the_newest_agreed_bytes_word_is_zero_when_any_size_is_unknown() {
+        let mut f = fsm();
+        genesis_row(&mut f, 0, 100);
+        f.on_snapshot_frame(1000, false, 1);
+        assert_eq!(apply_at(&mut f, 1100, &report(0, 1000, &[(0, 1, 40)])), 0);
+        assert_eq!(
+            apply_at(&mut f, 1110, &report(CLUSTER_ROW, 1000, &[(0, 2, 0)])),
+            0
+        );
+        let v = ClusterView::new(f.state());
+        assert_eq!(v.catalog_newest_agreed_bytes.load(Ordering::Acquire), 0);
+        f.on_snapshot_frame(2000, false, 2);
+        assert_eq!(apply_at(&mut f, 2100, &report(0, 2000, &[(0, 1, 40)])), 0);
+        assert_eq!(
+            apply_at(&mut f, 2110, &report(CLUSTER_ROW, 2000, &[(0, 2, 300)])),
+            0
+        );
+        v.publish(f.state());
+        assert_eq!(v.catalog_newest_agreed_bytes.load(Ordering::Acquire), 340);
+    }
+
+    /// Task 3 review R1: `auto_fetch = false` is replicated state, so it
+    /// must survive a freeze/install — a node that installed the image and
+    /// the node that froze it then freeze byte-identical images (the
+    /// divergence class catalog ruling R24 fixed for `retain_sets`).
+    #[test]
+    fn auto_fetch_false_survives_an_install_and_the_images_stay_byte_equal() {
+        let mut a = fsm();
+        genesis_row(&mut a, 0, 100);
+        let mut s = a.state().settings;
+        s.auto_fetch = false;
+        assert_eq!(apply_at(&mut a, 200, &ClusterCommand::Settings(s)), 0);
+        assert!(!a.state().settings.auto_fetch);
+        a.set_consumed(300);
+        let (img, _) = a.freeze().unwrap();
+        let mut b = fsm();
+        assert!(
+            b.state().settings.auto_fetch,
+            "a fresh FSM starts with auto_fetch on"
+        );
+        assert_eq!(b.install_snapshot(300, &mut &img[..]).unwrap(), 300);
+        assert!(
+            !b.state().settings.auto_fetch,
+            "the install kept auto_fetch = false"
+        );
+        for f in [&mut a, &mut b] {
+            agreed_set(f, 1000, 1100);
+            f.set_consumed(1200);
+        }
+        assert!(!b.state().settings.auto_fetch);
+        assert_eq!(
+            a.freeze().unwrap().0,
+            b.freeze().unwrap().0,
+            "an installed node and the node that froze the image diverged"
+        );
+    }
+
+    /// Ruling R2: a kind-5 record written before sizes existed (12 B
+    /// entries) is replayed from the journal above the newest cluster
+    /// artifact on a node that crossed the flag day, while another node
+    /// installs a v4 image holding the same report. Same log, same state:
+    /// both read every size 0 and freeze byte-identical images.
+    #[test]
+    fn an_unsized_report_frame_and_a_v4_image_install_converge() {
+        fn unsized_report_body(cmd: &ClusterCommand) -> Vec<u8> {
+            use uc_protocol::v2::upgrade::{
+                SNAPSHOT_REPORT_ENTRY_LEN, SNAPSHOT_REPORT_ENTRY_LEN_UNSIZED,
+                SNAPSHOT_REPORT_HEADER_LEN,
+            };
+            let b = body(cmd);
+            let rec = &b[CLUSTER_BODY_PREFIX_LEN..];
+            let mut old = b[..CLUSTER_BODY_PREFIX_LEN + SNAPSHOT_REPORT_HEADER_LEN].to_vec();
+            for e in rec[SNAPSHOT_REPORT_HEADER_LEN..].chunks(SNAPSHOT_REPORT_ENTRY_LEN) {
+                old.extend_from_slice(&e[..SNAPSHOT_REPORT_ENTRY_LEN_UNSIZED]);
+            }
+            old
+        }
+        let row0 = report(0, 1000, &[(0, 1, 40), (1, 1, 40)]);
+        let cluster = report(CLUSTER_ROW, 1000, &[(0, 2, 300), (1, 2, 300)]);
+        // Node A replays the pre-lifecycle frames.
+        let mut a = fsm();
+        genesis_row(&mut a, 0, 100);
+        a.on_snapshot_frame(1000, false, 1);
+        for (pos, cmd) in [(1100, &row0), (1110, &cluster)] {
+            let mut out = Vec::new();
+            let mut ctx = ApplyCtx::new(pos, ClusterFsm::IDENTITY);
+            a.apply(&mut ctx, &unsized_report_body(cmd), &mut out);
+            assert_eq!(out, vec![0], "a 12 B-entry kind-5 record applies");
+        }
+        a.set_consumed(1200);
+        // Node B installs a v4 image of the same state.
+        let mut c = fsm();
+        genesis_row(&mut c, 0, 100);
+        c.on_snapshot_frame(1000, false, 1);
+        assert_eq!(apply_at(&mut c, 1100, &row0), 0);
+        assert_eq!(apply_at(&mut c, 1110, &cluster), 0);
+        c.set_consumed(1200);
+        let v4 = rewrite_image_as_v4(&c.freeze().unwrap().0);
+        let mut b = fsm();
+        assert_eq!(b.install_snapshot(1200, &mut &v4[..]).unwrap(), 1200);
+        assert_eq!(a.state().catalog, b.state().catalog);
+        assert_eq!(a.state().reports, b.state().reports);
+        assert_eq!(
+            a.state().report_for(0).map(|r| r.hashes.clone()),
+            Some(vec![(0, 1, 0), (1, 1, 0)])
+        );
+        assert_eq!(
+            a.freeze().unwrap().0,
+            b.freeze().unwrap().0,
+            "a replaying node and an installing node froze different images"
+        );
+    }
+
+    /// Re-frame a v5 image as v4: the report and catalog blobs back to their
+    /// unsized widths, the version word to 4, the CRC recomputed.
+    fn rewrite_image_as_v4(img: &[u8]) -> Vec<u8> {
+        use uc_protocol::v2::catalog::{ROW_ENTRY_LEN, ROW_ENTRY_LEN_UNSIZED};
+        use uc_protocol::v2::cluster_image::{decode_cluster_image, encode_cluster_image};
+        use uc_protocol::v2::upgrade::{
+            SNAPSHOT_REPORT_ENTRY_LEN, SNAPSHOT_REPORT_ENTRY_LEN_UNSIZED,
+            SNAPSHOT_REPORT_HEADER_LEN,
+        };
+        let parts = decode_cluster_image(img).unwrap();
+        let mut reports = Vec::new();
+        let mut o = 0;
+        while o < parts.reports.len() {
+            let len = u32::from_le_bytes(parts.reports[o..o + 4].try_into().unwrap()) as usize;
+            let rec = &parts.reports[o + 4..o + 4 + len];
+            let mut old = rec[..SNAPSHOT_REPORT_HEADER_LEN].to_vec();
+            for e in rec[SNAPSHOT_REPORT_HEADER_LEN..].chunks(SNAPSHOT_REPORT_ENTRY_LEN) {
+                old.extend_from_slice(&e[..SNAPSHOT_REPORT_ENTRY_LEN_UNSIZED]);
+            }
+            reports.extend_from_slice(&(old.len() as u32).to_le_bytes());
+            reports.extend_from_slice(&old);
+            o += 4 + len;
+        }
+        let mut catalog = parts.catalog[..2].to_vec();
+        for set in parts.catalog[2..].chunks(18 + 9 * ROW_ENTRY_LEN) {
+            catalog.extend_from_slice(&set[..18]);
+            for r in set[18..].chunks(ROW_ENTRY_LEN) {
+                catalog.extend_from_slice(&r[..ROW_ENTRY_LEN_UNSIZED]);
+            }
+        }
+        let mut out = Vec::new();
+        encode_cluster_image(
+            &uc_protocol::v2::cluster_image::ClusterImageParts {
+                reports: &reports,
+                catalog: &catalog,
+                ..parts
+            },
+            &mut out,
+        )
+        .unwrap();
+        let body_end = out.len() - 4;
+        out.truncate(body_end);
+        out[8..12].copy_from_slice(&4u32.to_le_bytes());
+        let crc = crc32fast::hash(&out);
+        out.extend_from_slice(&crc.to_le_bytes());
+        out
     }
 }

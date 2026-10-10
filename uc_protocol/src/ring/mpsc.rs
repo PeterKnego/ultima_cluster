@@ -254,6 +254,14 @@ impl MpscProducer {
     /// of this record was ever handed to the caller's peer. Callers that need
     /// exactly-once across such a retry ride
     /// `uc_service::session::Sessioned` like any other retry.
+    ///
+    /// `#[inline(always)]` (with [`Self::claim`]): this is the per-record
+    /// write of every client submit. When a caller's body grew past LLVM's
+    /// inlining budget the claim fell out of line and cost the client hop
+    /// about 5-6 % on the fleet (2026-10-10, read-your-writes); pinning it
+    /// keeps it inline regardless of the caller's size — the same remedy the
+    /// apply loop's per-frame callees got (CLAUDE.md, 2.11.0 apply-hop note).
+    #[inline(always)]
     pub fn try_write(
         &self,
         msg_type: u16,
@@ -408,6 +416,8 @@ impl MpscProducer {
 
     /// Claim a slot and write the record into it, leaving the slot's word
     /// CLAIMED. Returns without waiting for any other producer.
+    /// `#[inline(always)]`: see [`Self::try_write`].
+    #[inline(always)]
     fn claim(
         &self,
         msg_type: u16,

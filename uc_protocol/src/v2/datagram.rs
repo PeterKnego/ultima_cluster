@@ -539,19 +539,20 @@ pub fn read_probe_ack_body(buf: &[u8]) -> Option<ProbeAckBody> {
     })
 }
 
-pub const SNAP_REPORT_BODY_LEN: usize = 24;
+pub const SNAP_REPORT_BODY_LEN: usize = 32;
 
 /// Plan B3: "row `row` froze its artifact at `position` with hash `hash`" —
-/// the sending node's own id is `node_id` (the reporter, not necessarily this
-/// datagram's source address once a follower's forward is ever added; today
-/// it always is the source). LE: row 0, reserved 1..4 (zero), node_id 4..8,
-/// position 8..16, hash 16..24.
+/// the sending node's own id is `node_id`. Snapshot-lifecycle spec §7.1 adds
+/// `size`: the artifact FILE's byte length on disk (plan ruling P6), `0` =
+/// unknown. LE: row 0, reserved 1..4 (zero), node_id 4..8, position 8..16,
+/// hash 16..24, size 24..32.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SnapReportBody {
     pub row: u8,
     pub node_id: u32,
     pub position: u64,
     pub hash: u64,
+    pub size: u64,
 }
 
 pub fn write_snap_report_body(buf: &mut [u8], b: &SnapReportBody) {
@@ -560,6 +561,7 @@ pub fn write_snap_report_body(buf: &mut [u8], b: &SnapReportBody) {
     buf[4..8].copy_from_slice(&b.node_id.to_le_bytes());
     buf[8..16].copy_from_slice(&b.position.to_le_bytes());
     buf[16..24].copy_from_slice(&b.hash.to_le_bytes());
+    buf[24..32].copy_from_slice(&b.size.to_le_bytes());
 }
 
 /// Decode a `SNAP_REPORT` body, or `None` if `buf.len() != SNAP_REPORT_BODY_LEN`,
@@ -588,6 +590,7 @@ pub fn read_snap_report_body(buf: &[u8]) -> Option<SnapReportBody> {
         node_id: u32::from_le_bytes(buf[4..8].try_into().unwrap()),
         position,
         hash: u64::from_le_bytes(buf[16..24].try_into().unwrap()),
+        size: u64::from_le_bytes(buf[24..32].try_into().unwrap()),
     })
 }
 
@@ -1575,17 +1578,46 @@ mod tests {
         assert_eq!(read_probe_ack_body(&buf[..7]), None);
     }
 
+    /// Snapshot-lifecycle spec §7.1: the body grows to 32 B with the
+    /// artifact's byte size at @24. A 24-byte body (the unreleased draft of
+    /// 0.11.0) is refused by length, like any mixed flag day.
+    #[test]
+    fn snap_report_body_is_32_bytes_and_carries_the_artifact_size() {
+        assert_eq!(SNAP_REPORT_BODY_LEN, 32);
+        let b = SnapReportBody {
+            row: 1,
+            node_id: 2,
+            position: 4096,
+            hash: 7,
+            size: 0x0102_0304_0506_0708,
+        };
+        let mut buf = [0u8; SNAP_REPORT_BODY_LEN];
+        write_snap_report_body(&mut buf, &b);
+        assert_eq!(
+            &buf[24..32],
+            &0x0102_0304_0506_0708u64.to_le_bytes(),
+            "size @24"
+        );
+        assert_eq!(read_snap_report_body(&buf), Some(b));
+        assert_eq!(
+            read_snap_report_body(&buf[..24]),
+            None,
+            "a 24 B body is refused by length"
+        );
+    }
+
     /// FROZEN once shipped (plan B3): the kind number and the body, with an
     /// absolute wire pin like `probe_kinds_and_bodies_are_pinned`.
     #[test]
     fn snap_report_kind_and_body_are_pinned() {
         assert_eq!(DGRAM_KIND_SNAP_REPORT, 26);
-        assert_eq!(SNAP_REPORT_BODY_LEN, 24);
+        assert_eq!(SNAP_REPORT_BODY_LEN, 32);
         let b = SnapReportBody {
             row: 2,
             node_id: 0x0A0B_0C0D,
             position: 0x1_0000,
             hash: 0x0102_0304_0506_0708,
+            size: 0x1112_1314_1516_1718,
         };
         let mut buf = [0u8; SNAP_REPORT_BODY_LEN];
         write_snap_report_body(&mut buf, &b);
@@ -1599,6 +1631,7 @@ mod tests {
                 0x0D, 0x0C, 0x0B, 0x0A, // node_id
                 0, 0, 1, 0, 0, 0, 0, 0, // position = 0x10000
                 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, // hash
+                0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11, // size
             ]
         );
         // Refusals: too short, too long (exact-length like SnapRequest/Redirect).
@@ -1630,6 +1663,7 @@ mod tests {
                 node_id: 1,
                 position: 64,
                 hash: 9,
+                size: 9,
             },
         );
         assert_eq!(read_snap_report_body(&buf).map(|b| b.row), Some(255));

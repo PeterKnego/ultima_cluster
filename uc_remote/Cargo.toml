@@ -11,7 +11,7 @@ homepage.workspace = true
 rust-version.workspace = true
 keywords.workspace = true
 categories.workspace = true
-description = "ultima_cluster remote protocol v1 (framed TCP) and the Rust remote client"
+description = "ultima_cluster remote protocol v2 (framed TCP) and the Rust remote client"
 
 [dependencies]
 bytes = { workspace = true }
@@ -26,5 +26,6 @@ serde = { workspace = true }
 bincode = { workspace = true }
 # DEV-only, and deliberately so: `uc_remote` must not need the node's protocol
 # crate at runtime (see `BASELINE_PAYLOAD_CEILING`). This pins its local copies
-# of the two wire ceilings against the crate that owns them.
+# of the two wire ceilings, and its `ReadToken` text format, against the crate
+# that owns them.
 uc_protocol = { path = "../uc_protocol", version = "2.13.0" }

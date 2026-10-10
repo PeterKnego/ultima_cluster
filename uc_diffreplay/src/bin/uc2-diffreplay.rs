@@ -110,6 +110,11 @@ enum Sub {
         scratch: Option<PathBuf>,
         #[arg(long)]
         report: PathBuf,
+        /// Test hook: delete the origin artifact from the scratch instance
+        /// dir after the second instant, as the node's pruner may once the
+        /// pin completes — makes that race deterministic.
+        #[arg(long, hide = true)]
+        test_prune_origin: bool,
     },
 }
 
@@ -356,6 +361,7 @@ fn main() -> anyhow::Result<()> {
             timeout_secs,
             scratch,
             report,
+            test_prune_origin,
         } => {
             // An explicit `--scratch` is the operator's directory: never
             // removed, whatever the verdict. The default one is this run's
@@ -376,6 +382,7 @@ fn main() -> anyhow::Result<()> {
                 timeout: std::time::Duration::from_secs(timeout_secs),
                 scratch,
                 report: report.clone(),
+                test_prune_origin,
             };
             let r = pinverify::run(&a)?;
             r.write_json(std::fs::File::create(&report)?)?;

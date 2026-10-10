@@ -1369,6 +1369,7 @@ version = "2.13.0"
 dependencies = [
  "bincode",
  "bytes",
+ "crc32fast",
  "serde",
  "tempfile",
  "thiserror",

@@ -60,16 +60,19 @@ impl Egress {
             .write(MSG_V2_RESPONSE, 0, extra, &self.scratch);
     }
 
-    /// Publish a QUERY answer (Task 11): `MSG_V2_RESPONSE` with
-    /// `FLAG_V2_IS_QUERY`, echoing the `svc_query` record's `header_extra` (the
-    /// client identity the node stamped) so the client matcher routes it. Payload
-    /// is `position: u64 LE ++ query response bytes` — the SAME shape as a
-    /// submit response, so the client decodes both identically. The read barrier
-    /// does not thread a position through to the service, so the prefix is `0`
-    /// here (the client matcher skips those 8 bytes for query answers either way).
-    pub(crate) fn publish_query_answer(&mut self, header_extra: [u8; 8], resp: &[u8]) {
+    /// Publish a QUERY answer: `MSG_V2_RESPONSE` with `FLAG_V2_IS_QUERY`,
+    /// echoing the `svc_query` record's `header_extra`. The position prefix is
+    /// the row's applied frontier when the query ran (an EXCLUSIVE end —
+    /// read-your-writes spec 2026-10-08 §4.3), so a client can raise its token
+    /// from it and check it against the token it sent.
+    pub(crate) fn publish_query_answer(
+        &mut self,
+        header_extra: [u8; 8],
+        applied: u64,
+        resp: &[u8],
+    ) {
         self.scratch.clear();
-        self.scratch.extend_from_slice(&0u64.to_le_bytes());
+        self.scratch.extend_from_slice(&applied.to_le_bytes());
         self.scratch.extend_from_slice(resp);
         let _ = self.producer.write(
             MSG_V2_RESPONSE,

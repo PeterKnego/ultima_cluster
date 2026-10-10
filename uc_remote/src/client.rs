@@ -28,6 +28,8 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use crate::token::ReadToken;
+
 use bytes::Bytes;
 
 use crate::engine::{
@@ -97,6 +99,13 @@ impl Ticket {
     }
 }
 
+#[derive(Clone, Copy)]
+enum Req {
+    Submit,
+    Query(Consistency),
+    AtLeast(ReadToken),
+}
+
 /// A connected remote client. `Send + Sync`; share it behind an `Arc` or a
 /// reference — every method takes `&self`.
 ///
@@ -152,15 +161,32 @@ impl RemoteClient {
     /// blocks the full wait here and then waits out the request can spend
     /// ~2 x `request_timeout` in total.
     pub fn submit(&self, cmd: &[u8]) -> Result<Ticket, RemoteError> {
-        self.enqueue(None, cmd)
+        self.enqueue(Req::Submit, cmd)
     }
 
     /// Ask a question. Same admission accounting as [`RemoteClient::submit`].
     pub fn query(&self, q: &[u8], consistency: Consistency) -> Result<Ticket, RemoteError> {
-        self.enqueue(Some(consistency), q)
+        self.enqueue(Req::Query(consistency), q)
     }
 
-    fn enqueue(&self, q: Option<Consistency>, bytes: &[u8]) -> Result<Ticket, RemoteError> {
+    /// A read-your-writes query carrying an explicit token (e.g. one handed
+    /// over by another client). A zero token is a plain query.
+    pub fn query_at_least(&self, q: &[u8], token: ReadToken) -> Result<Ticket, RemoteError> {
+        self.enqueue(Req::AtLeast(token), q)
+    }
+
+    /// The token this client has accumulated (see
+    /// [`RemoteSendHalf::read_token`]).
+    pub fn read_token(&self) -> ReadToken {
+        self.send.lock().unwrap().read_token()
+    }
+
+    /// Raise the token; never lowers it.
+    pub fn observe(&self, token: ReadToken) {
+        self.send.lock().unwrap().observe(token)
+    }
+
+    fn enqueue(&self, q: Req, bytes: &[u8]) -> Result<Ticket, RemoteError> {
         let core = Arc::new(TicketCore::new());
         // The engine's `user_data` is an owned reference to the ticket; the
         // completion path (or a refusal below) turns it back with exactly one
@@ -171,8 +197,9 @@ impl RemoteClient {
             let r = {
                 let s = self.send.lock().unwrap();
                 match q {
-                    None => s.try_submit(user_data, bytes),
-                    Some(c) => s.try_query(user_data, c, bytes),
+                    Req::Submit => s.try_submit(user_data, bytes),
+                    Req::Query(c) => s.try_query(user_data, c, bytes),
+                    Req::AtLeast(t) => s.try_query_at_least(user_data, bytes, t),
                 }
             };
             match r {

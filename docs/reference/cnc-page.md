@@ -32,11 +32,13 @@ byte-for-byte; page 2 (`4096..8192`) is the service-slot band.
 ## Counters and status
 
 Each field occupies its own 64-byte stride. Every field has exactly one
-writer.
+writer. The one exception is `append`'s line, which carries a second word
+with the same writer.
 
 | Offset | Field | Writer |
 |---|---|---|
 | 256 | `append` | leader appender, or follower receiver |
+| 264 | `write_reserve` | follower receiver (#78) — the highest run end it may have written into the log buffer, raised before the bytes land; `0` on a page that never had one |
 | 320 | `durable` | archive agent |
 | 384 | `sent` | sender agent |
 | 448 | `commit` | consensus agent |
@@ -69,6 +71,14 @@ writer.
 | 4040 | `fsm_lag_bytes` | node (`0` ⇔ lockstep) — shares 4032's line. Since the cluster FSM (2.11.0) this is derived from the committed `Settings::fsm_lag_bytes` and **re-published when that setting moves**, not written once at boot. The record's own `0` means "derive at use" and lockstep is `u64::MAX` there, so `page_lag_from_setting` is the one place that maps the record's sentinels onto this word's |
 | 4048 | `log_time_ns` | **archive agent** (cnc 3.1, log time, 2.11.0) — the highest leader stamp the archive has recorded, ns since the Unix epoch. The third word of the `4032` line, and its only *live* writer until cnc 3.4: `4032`/`4040` are written once before publish and never again. **Never lowered.** A new leader seeds its stamp clamp from this word after the leader-open collapse; `/metrics` exports it as `uc2_log_time_ns` and `uc2ctl status` prints `log_time_ns=` (raw ns, not RFC 3339) |
 | 4056 | `cluster_applied` | **`uc2-cluster` agent** (cnc 3.4, #33) — the frame-END position the cluster FSM had applied `CLUSTER` frames up to when it last applied or installed something. Written only after a batch that applied or installed something, and at boot from the recovered state — not on every pass, which keeps the second live writer on the `4032` line rare — and always **after** that batch's row words (`running_version`/`running_record_pos`, below), with `Release`. So a reader that `Acquire`-loads `cluster_applied ≥ p` also sees every row's running-version words as of `p`. The reader is the service apply loop, only at a `CLUSTER` version record for its own row: it waits for this word to pass the record, then reads the row's verdict. `0` = nothing applied since boot. The fourth word of the `4032` line; `4064`–`4088` stay free |
+
+A follower's receiver writes whole datagram runs, and out-of-order runs above
+a gap, anywhere up to `durable + capacity` before it publishes `append`. A
+validated log reader therefore bounds itself by `max(append + max_claim,
+write_reserve)` before and after its copy, not by `append + max_claim` alone,
+which only covers the leader appender's in-flight write. A page without the
+word reads `0`, which gives the old bound: a node and a service from
+different builds behave no worse than the older of the two.
 
 Counters are absolute byte positions in the replicated log, not indices.
 `log_time_ns` is the one exception: it is a wall-clock nanosecond value, not a
@@ -116,7 +126,7 @@ An 8-entry band on page 2, one slot per declared FSM id (M14).
 | Slot stride | 512 B |
 | Slot count | 8 |
 
-Fields within a slot (each its own 64 B line, one writer):
+Fields within a slot (each its own 64 B line; most lines have one writer):
 
 | Slot offset | Field | Writer |
 |---|---|---|
@@ -132,6 +142,8 @@ Fields within a slot (each its own 64 B line, one writer):
 | 128 | `epoch` | service, `fetch_add` at attach |
 | 192 | `output_completed` | service output agent |
 | 256 | `snapshot_pos` | service builder agent |
+| 264 | `start_set_pos` — newest agreed snapshot set this node holds at or below `min(commit, durable)`, `0` = none | node (consensus agent) |
+| 272 | `start_set_version` — low 32: packed version that built it | node (consensus agent) |
 | 320 | `heartbeat_ns` | service apply agent |
 | 384 | `lag_waits` | service apply agent (one per wait episode at the lag barrier) |
 | 448 | `name` (line 7) — `[u8; 32]`, NUL-padded FSM name | **node**, at `CncPage::init` (boot, once) — cnc 3.1, FSM identity |
@@ -140,9 +152,11 @@ Fields within a slot (each its own 64 B line, one writer):
 | 496 | `freeze_ns` (line 7) — u64, the duration in nanoseconds of this row's **last** `freeze()` call | **service** (`on_snapshot_frame`), once per instant — coordinated snapshots, 2.11.0 |
 | 504 | `artifact_hash` (line 7) — u64, SHA-256[..8] of the row's newest artifact payload | **service** (builder agent), stored BEFORE `snapshot_pos` — plan B3 |
 
+The start-set pair is read by the service at attach and in overrun recovery (snapshot lifecycle). It is published **zero-first**: the node stores `0` in the position, then the version, then the new position with `Release`; a reader loads the position, the version, then the position again, takes the pair only if both position reads are the same non-zero value, retries a few times, and otherwise reads "none" (the row replays — always safe). The `snapshot_pos` line (`+256..+320`) therefore has two writers, both rare: the service builder agent writes `+256` once per instant, and the node's consensus agent writes `+264`/`+272` when the start set changes.
+
 A slot whose `status` reads `0` has never been attached this page generation.
 The node re-creates the page at every boot, so incarnation and epoch restart
-at 0 with the node. Line 0 (`status`/`version`) breaks the "one writer per
+at 0 with the node. The `snapshot_pos` line also has two writers (above). Line 0 (`status`/`version`) broke the "one writer per
 line" pattern first (cnc 3.3): the service still owns `status`/`version` at
 attach/detach, but `upgrade_origin`/`pinned_version`/`pin_seq`/`pinned_from`
 are node-written, republished by the `uc2-cluster` agent on every view

@@ -178,6 +178,58 @@ impl Client {
         self.inner.query_linearizable_on(id, q)?.wait()
     }
 
+    /// Read-your-writes read (spec 2026-10-08): answered by any node once it
+    /// has applied every write this client had acknowledged.
+    ///
+    /// ```no_run
+    /// # fn demo(c: &uc_client::Client) -> Result<(), uc_client::ClientError> {
+    /// let _: u64 = c.submit(&1u64)?;
+    /// let token = c.read_token(); // carry this to another process if needed
+    /// let v: u64 = c.query_read_your_writes(&())?;
+    /// # let _ = (token, v); Ok(()) }
+    /// ```
+    pub fn query_read_your_writes<Q: Serialize, QR: DeserializeOwned>(
+        &self,
+        q: &Q,
+    ) -> Result<QR, ClientError> {
+        self.inner.query_read_your_writes(q)?.wait()
+    }
+
+    /// Read-your-writes read against FSM `id` (spec 2026-10-08): any node
+    /// answers once it has applied this client's token.
+    pub fn query_read_your_writes_on<Q: Serialize, QR: DeserializeOwned>(
+        &self,
+        id: u8,
+        q: &Q,
+    ) -> Result<QR, ClientError> {
+        self.inner.query_read_your_writes_on(id, q)?.wait()
+    }
+
+    /// Read with an explicit token, ignoring this client's automatic one.
+    pub fn query_at_least_on<Q: Serialize, QR: DeserializeOwned>(
+        &self,
+        id: u8,
+        q: &Q,
+        token: crate::ReadToken,
+    ) -> Result<QR, ClientError> {
+        self.inner.query_at_least_on(id, q, token)?.wait()
+    }
+
+    /// Get the current read token for this client (spec 2026-10-08).
+    pub fn read_token(&self) -> crate::ReadToken {
+        self.inner.read_token()
+    }
+
+    /// Observe a read token, advancing this client's read frontier.
+    pub fn observe(&self, token: crate::ReadToken) {
+        self.inner.observe(token)
+    }
+
+    /// A point-in-time snapshot of the underlying engine's counters.
+    pub fn stats(&self) -> crate::EngineStats {
+        self.inner.stats()
+    }
+
     /// Stop the driver thread and fail every still-inflight request with
     /// [`ClientError::ShutDown`].
     pub fn shutdown(self) {

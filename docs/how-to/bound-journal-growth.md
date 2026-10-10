@@ -70,8 +70,29 @@ large enough for that to matter, take **standby** instants instead:
 `uc2ctl snapshot --standby` (or `snapshot_target = "learners"`) freezes only
 the learners, and a voter pulls the finished set with
 [`uc2ctl snapshot fetch --from <learner-id>`](../reference/uc2ctl.md#snapshot-fetch),
-which writes the artifacts without touching its state machines. The trade is
-explicit: a voter's floor moves when an operator fetches, not on its own.
+which writes the artifacts without touching its state machines. With `auto_fetch` on (the default) a voter fetches the set itself — see
+[below](#learner-only-clusters-voters-fetch-and-purge-by-default); with it off,
+a voter's floor moves only when an operator fetches.
+
+## Learner-only clusters: voters fetch and purge by default
+
+With `[settings] snapshot_target = "learners"` (or `uc2ctl snapshot
+--standby`) only learners freeze. Every node — voters included — then
+fetches the newest **agreed** set in the background (`auto_fetch`, on by
+default), holds it, and purges its journal below it; no `uc2ctl snapshot
+fetch` is needed. Watch `uc2_snapshot_auto_fetch_total{outcome}` and
+`Uc2SnapshotWontFit`: a node that cannot fit the set with headroom
+(`free < size + max(size/4, 1 GiB)`) skips it and does not purge.
+
+**One learner proves little.** A standby set is agreed over the learners
+that reported it; with ONE learner that is one reporter, and every voter
+then fetches and purges on a set nobody cross-checked. A node logs
+`snapshot_fetch_single_reporter` (warn) once per such set. Run two learners
+if the purge floor must rest on agreement.
+
+**Turning it off** (`uc2ctl settings apply` with `auto_fetch = false`):
+voters on a learner-only cluster then hold no set and never purge — the
+journal grows until you run `uc2ctl snapshot fetch` on each voter.
 
 ## Choose a slack and turn purging on
 
@@ -95,7 +116,7 @@ and it only deletes: it keeps the set at the persisted floor plus
 everything newer. `retain_sets` (default `1`) is how many agreed sets the
 replicated catalog keeps at all, plus every pinned origin (a row's newest
 upgrade pin keeps its origin's set in addition, never counted toward
-`retain_sets`) — see [Configuration §
+`retain_sets`, until an agreed instant after the upgrade completes the pin) — see [Configuration §
 `[settings]`](../reference/configuration.md#settings).
 
 `slack_bytes` retains a tail below the snapshot floor so that a

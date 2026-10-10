@@ -73,7 +73,7 @@ use crate::ticket::{Resolved, TicketCore, fan_in_ticket_pair, ticket_pair};
 use crate::wait::Idle;
 use crate::{
     ClientError, Completion, Consistency, Engine, EngineConfig, EngineStats, FanInTicket, Outcome,
-    PollHalf, SendHalf, SubmitError, Ticket, WaitStrategy,
+    PollHalf, ReadToken, SendHalf, SubmitError, Ticket, WaitStrategy,
 };
 
 /// How long `submit`/`query_*` retries `Backpressure`/`NotServing` before
@@ -284,6 +284,51 @@ impl PipelinedClient {
         })
     }
 
+    /// Read-your-writes read against FSM 0 (spec 2026-10-08): any node answers
+    /// once it has applied this client's token.
+    pub fn query_read_your_writes<Q: Serialize, QR: DeserializeOwned>(
+        &self,
+        q: &Q,
+    ) -> Result<Ticket<QR>, ClientError> {
+        self.query_read_your_writes_on(0, q)
+    }
+
+    /// Read-your-writes read against FSM `id` (spec 2026-10-08): any node
+    /// answers once it has applied this client's token.
+    pub fn query_read_your_writes_on<Q: Serialize, QR: DeserializeOwned>(
+        &self,
+        id: u8,
+        q: &Q,
+    ) -> Result<Ticket<QR>, ClientError> {
+        let bytes = encode(q)?;
+        self.dispatch(&bytes, true, move |send, ud, b| {
+            send.try_query_on(ud, id, b, Consistency::ReadYourWrites)
+        })
+    }
+
+    /// Read with an explicit token, ignoring this client's automatic one.
+    pub fn query_at_least_on<Q: Serialize, QR: DeserializeOwned>(
+        &self,
+        id: u8,
+        q: &Q,
+        token: ReadToken,
+    ) -> Result<Ticket<QR>, ClientError> {
+        let bytes = encode(q)?;
+        self.dispatch(&bytes, true, move |send, ud, b| {
+            send.try_query_at_least(ud, id, b, token)
+        })
+    }
+
+    /// Get the current read token for this client (spec 2026-10-08).
+    pub fn read_token(&self) -> ReadToken {
+        self.send.lock().unwrap().read_token()
+    }
+
+    /// Observe a read token, advancing this client's read frontier.
+    pub fn observe(&self, token: ReadToken) {
+        self.send.lock().unwrap().observe(token)
+    }
+
     pub fn client_id(&self) -> u32 {
         self.send.lock().unwrap().client_id()
     }
@@ -404,6 +449,12 @@ impl PipelinedClient {
                 Err(SubmitError::ServiceNotDeclared { id, declared }) => {
                     reclaim(user_data);
                     return Err(ClientError::ServiceNotDeclared { id, declared });
+                }
+                // Read-your-writes on a pre-3.4 node: refused at the door,
+                // nothing reached the ring.
+                Err(SubmitError::ReadYourWritesUnsupported) => {
+                    reclaim(user_data);
+                    return Err(ClientError::ReadYourWritesUnsupported);
                 }
             }
         }

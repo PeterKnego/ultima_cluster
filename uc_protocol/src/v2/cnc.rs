@@ -69,7 +69,19 @@ pub const CNC_PAGE_LEN: usize = 8192;
 /// `cluster_applied` at page-1 offset 4056 (the fourth word of the 4032
 /// line). A 3.3 attacher on a 3.4 page finds no running-version words and
 /// refuses by name; a 3.4 attacher on a 3.3 page reads `0` (absent) at +48.
+///
+/// Read-your-writes (spec 2026-10-08), folded into the unreleased 3.4
+/// before release (the snapshot-lifecycle start-set words were folded in the
+/// same way): no layout change. `query.ring` records may carry
+/// `FLAG_V2_MIN_POSITION`, and query answers carry the row's applied frontier
+/// instead of 0. `version_compatible` accepts an OLDER peer minor, so a 3.4
+/// attacher on a released 3.3 page is not refused by the version check; the
+/// client checks [`CNC_MIN_POSITION_MINOR`] itself before sending the flag.
 pub const CNC_V2_VERSION: u32 = (3 << 24) | (4 << 16);
+
+/// The first cnc minor whose node parses `FLAG_V2_MIN_POSITION` (folded into
+/// 3.4, which no release has shipped without it).
+pub const CNC_MIN_POSITION_MINOR: u32 = 4;
 
 // ---- header (byte offsets) ------------------------------------------------
 pub const CNC_OFF_MAGIC: usize = 0; // [u8; 8]
@@ -85,6 +97,12 @@ pub const CNC_OFF_HEADER_CRC: usize = 124; // u32 LE, crc32 over [0..124) — wr
 
 // ---- counter lines (each one 64-byte cache line, single writer noted) -----
 pub const CNC_OFF_APPEND: usize = 256; // writer: leader appender / follower receiver
+/// #78: the follower receiver's WRITE RESERVE — the highest run end it may
+/// have written into the ring, raised before the bytes land. Second word of
+/// `append`'s line (same writer per role); validated readers bound
+/// themselves by `max(append + max_claim, reserve)`. `0` (a page from a
+/// build without it) degrades to the `append + max_claim` bound.
+pub const CNC_OFF_WRITE_RESERVE: usize = CNC_OFF_APPEND + 8;
 pub const CNC_OFF_DURABLE: usize = 320; // writer: archive agent
 pub const CNC_OFF_SENT: usize = 384; // writer: sender agent
 pub const CNC_OFF_COMMIT: usize = 448; // writer: consensus agent
@@ -343,6 +361,8 @@ const _: () = assert!(
 //   +128 epoch           u64 (attach-time fetch_add, AcqRel)   writer: service (attach)
 //   +192 output_completed u64 position                         writer: service output agent
 //   +256 snapshot_pos    u64 position                          writer: service builder agent
+//   +264 start_set_pos   u64 position (0 = none)              writer: node (consensus agent)
+//   +272 start_set_version u64 (low 32 = packed version that built the artifact)  writer: node (consensus agent)
 //   +320 heartbeat_ns    u64 unix ns                           writer: service apply agent
 //   +384 lag_waits       u64 count                             writer: service apply agent
 //   +448 name            [u8; 32] NUL-padded FSM name          writer: node (init, boot-once)
@@ -452,6 +472,21 @@ pub const CNC_SVC_OFF_FREEZE_NS: usize = 496;
 /// stale hash from the previous instant). `uc2ctl status` and `/metrics`
 /// read it as the live determinism check's per-node report.
 pub const CNC_SVC_OFF_ARTIFACT_HASH: usize = 504;
+/// Snapshot-lifecycle spec §4.2 (cnc 3.4, folded in before release): the
+/// row's START SET — the newest agreed snapshot set this node holds at or
+/// below `min(commit, durable)`; `0` = none. Node-written (consensus agent,
+/// on change only), read by the service at attach and in overrun recovery.
+/// Shares the `snapshot_pos` line: both writers are rare (once per instant /
+/// per agreement) and the per-frame apply path never reads the line.
+/// Published as a pair with [`CNC_SVC_OFF_START_SET_VERSION`] through
+/// `uc_log::cnc::SnapshotPosLine::{store_start_set, start_set}`.
+pub const CNC_SVC_OFF_START_SET_POS: usize = 264;
+/// Low 32 bits: the packed version (`identity::pack_version`) that built the
+/// row's artifact at `start_set_pos` — the catalog's `RowEntry.version`.
+pub const CNC_SVC_OFF_START_SET_VERSION: usize = 272;
+const _: () = assert!(CNC_SVC_OFF_START_SET_POS == CNC_SVC_OFF_SNAPSHOT_POS + 8);
+const _: () = assert!(CNC_SVC_OFF_START_SET_VERSION == CNC_SVC_OFF_START_SET_POS + 8);
+const _: () = assert!(CNC_SVC_OFF_START_SET_VERSION + 8 <= CNC_SVC_OFF_HEARTBEAT_NS);
 const _: () = assert!(CNC_SVC_OFF_TIMERS_PENDING == CNC_SVC_OFF_IDENTITY_HASH + 8);
 const _: () = assert!(CNC_SVC_OFF_FREEZE_NS == CNC_SVC_OFF_TIMERS_PENDING + 8);
 const _: () = assert!(CNC_SVC_OFF_ARTIFACT_HASH == CNC_SVC_OFF_FREEZE_NS + 8);
@@ -595,6 +630,17 @@ pub const fn version_compatible(local: u32, peer: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Snapshot-lifecycle spec §4.2 (cnc 3.4, folded in): the start-set pair
+    /// sits on the `snapshot_pos` line, right after it.
+    #[test]
+    fn the_start_set_words_sit_on_the_snapshot_pos_line() {
+        assert_eq!(CNC_SVC_OFF_START_SET_POS, 264);
+        assert_eq!(CNC_SVC_OFF_START_SET_VERSION, 272);
+        assert_eq!(CNC_SVC_OFF_START_SET_POS, CNC_SVC_OFF_SNAPSHOT_POS + 8);
+        const { assert!(CNC_SVC_OFF_START_SET_VERSION + 8 <= CNC_SVC_OFF_HEARTBEAT_NS) };
+        assert_eq!(CNC_V2_VERSION, (3 << 24) | (4 << 16), "still cnc 3.4");
+    }
 
     /// M12d: `read_cnc_app_id` is total on `&[u8]` — a page too short for the
     /// app_id field returns `""`, never a slice-index panic. The one-byte
@@ -912,6 +958,7 @@ mod tests {
         // cnc 3.2: the live payload ceiling word (jumbo).
         // cnc 3.3 (plan B1): the row's pin words on the STATUS line, node-written.
         // cnc 3.4 (#33): the row's running-version words on the same line.
+        // cnc 3.4 also carries read-your-writes (folded in), no layout change.
         assert_eq!(CNC_V2_VERSION, (3 << 24) | (4 << 16));
         assert_eq!(CNC_SVC_OFF_UPGRADE_ORIGIN, 16);
         assert_eq!(CNC_SVC_OFF_PINNED_VERSION, 24);
@@ -976,5 +1023,12 @@ mod tests {
         assert_eq!(CNC_SVC_OFF_RUNNING_RECORD_POS, 56);
         assert_eq!(CNC_OFF_CLUSTER_APPLIED, 4056);
         assert_eq!(CNC_V2_VERSION, (3 << 24) | (4 << 16));
+    }
+
+    #[test]
+    fn cnc_3_4_carries_the_min_position_flag() {
+        assert_eq!(CNC_V2_VERSION, (3 << 24) | (4 << 16));
+        assert_eq!(CNC_MIN_POSITION_MINOR, 4);
+        assert_eq!((CNC_V2_VERSION >> 16) & 0xFF, CNC_MIN_POSITION_MINOR);
     }
 }

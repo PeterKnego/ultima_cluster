@@ -1,4 +1,4 @@
-# The remote protocol (v1)
+# The remote protocol (v2)
 
 The wire format `uc_gateway`'s `Edge` speaks with remote clients, and that
 `uc_remote`'s `RemoteClient` implements. This is the page a non-Rust port
@@ -19,7 +19,7 @@ Every frame starts with a fixed 24-byte header:
 | 0 | u32 | `len` | total frame length in bytes, header included (`HEADER_LEN + payload.len()`) |
 | 4 | u8 | `type` | frame type, see below |
 | 5 | u8 | `flags` | bitmask, see below |
-| 6 | u16 | `version` | protocol version; currently `1` (`PROTOCOL_VERSION`) |
+| 6 | u16 | `version` | protocol version; currently `2` (`PROTOCOL_VERSION`; v2 adds `FLAG_MIN_POSITION`, unreleased until the next cut) |
 | 8 | u64 | `client_id` | the client's self-asserted, stable identity |
 | 16 | u64 | `seq` | per-client monotonic sequence number |
 
@@ -65,6 +65,7 @@ does not tear the connection down for that alone.
 | `0x04` | `FLAG_REPLAYED` | `RESPONSE` | the `Sessioned` wrapper answered from its cache (`TAG_REPLAYED`) — the write did not re-apply |
 | `0x08` | `FLAG_EXPIRED` | `RESPONSE` | the `Sessioned` wrapper could not classify this `seq` (`TAG_EXPIRED`) — outcome unknowable, no response bytes follow |
 | `0x10` | `FLAG_ENVELOPED` | `RESPONSE` | the edge is running with `session_envelope = true` — `FLAG_REPLAYED`/`FLAG_EXPIRED` are meaningful only when this is set |
+| `0x20` | `FLAG_MIN_POSITION` | `QUERY` | read-your-writes: the payload is an 8-byte `min_position` (u64 LE) followed by the query bytes; the edge answers only once its node has applied at least that position (v2) |
 
 `FLAG_REPLAYED` and `FLAG_EXPIRED` are both lifted off the 1-byte
 `Sessioned` tag (`TAG_FRESH = 0` sets neither flag). They are never set
@@ -112,7 +113,17 @@ answer differently and the connect attempt aborts outright.
 No fixed payload struct — the payload is the opaque command/query bytes,
 verbatim. The gateway never interprets them (this is what makes the raw
 state-machine tier literally end-to-end). `QUERY` sets `FLAG_LINEARIZABLE` or
-leaves it clear for a snapshot read.
+leaves it clear for a snapshot read. `FLAG_MIN_POSITION` (`0x20`, protocol v2)
+makes it a read-your-writes read: the payload then starts with an 8-byte
+`min_position` (u64 LE), the client's read token, and the query bytes follow.
+A payload shorter than 8 bytes with the flag set is malformed and closes the
+connection. A `QUERY` carrying both `FLAG_MIN_POSITION` and
+`FLAG_LINEARIZABLE` is a protocol violation: the edge closes the connection.
+If the node is behind the token the edge answers
+`RETRY` (`RETRY_SERVICE_UNAVAILABLE`, transient) and the client re-sends in
+place after a backoff. A v1 client and a v2 edge (or the reverse) refuse each
+other at `HELLO` with `HELLO_REFUSED_VERSION`, since an old edge would read
+the prefix as query bytes.
 
 ### `RESPONSE` (type 6)
 
@@ -123,7 +134,7 @@ ResponseMeta::LEN` of them; `FLAG_EXPIRED` responses carry zero):
 |---|---|---|
 | 0 | u32 | `credits` — current grant, piggybacked on every response |
 | 4 | u64 | `acked_seq` — highest `seq` from this client the edge has answered |
-| 12 | u64 | `position` — the log position the command applied at (`0` for a query) |
+| 12 | u64 | `position` — the log position the command applied at; for a query answer (v2), the answering replica's applied frontier at answer time, which the client folds into its read token |
 | 20 | — | response bytes |
 
 `ResponseMeta::LEN = 20`.

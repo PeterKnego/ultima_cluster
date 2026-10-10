@@ -191,7 +191,11 @@ B1 put the pin on the log. B2 is what makes it bite.
   origin** (erratum 7, found in execution, not anticipated). B1 kept the
   artifacts; this keeps the journal they need. "Consumed on this node" is three
   clauses — the row is attached, its version word equals the pin's `to`, and it
-  has replayed past the cut. Obs `snapshot_floor_held_for_pin`.
+  has replayed past the cut. Obs `snapshot_floor_held_for_pin`. (Superseded
+  after `2.13.0` by pin completion: the hold releases only once the pin is
+  complete — an agreed set above the pin record, on `to`'s line — and this
+  node holds that set with no `to` instance still replaying below it; see
+  the snapshot lifecycle spec's errata, rulings C7–C8.)
 
 **The `snapshots/<row>/` wipe has a precondition, and it is not universal.**
 The row must be able to rebuild what was deleted: a durable state machine, or a

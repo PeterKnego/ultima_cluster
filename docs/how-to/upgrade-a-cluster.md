@@ -842,12 +842,24 @@ The two added steps are not optional:
     deployment), **start every node before attaching any service** — a
     service attached after node 0 and before node 1 spends its whole
     `boot_wait` waiting for a leader that cannot be elected yet.
-- **Take an instant AFTER the swap.** Once the pin is consumed the node's
-  floor is free to advance past the origin, and the origin's artifact becomes
-  prunable. A later restart of the row re-installs from the newest covering
-  artifact, which must be one built by the version now running — with
-  `snapshot_interval_bytes = 0` (the default) nothing takes that instant for
-  you, and the restart fail-stops instead.
+- **Take an instant AFTER the swap — it completes the pin.** Once every
+  instance of the row runs `to` and has caught up, run `uc2ctl snapshot`.
+  When that set AGREES (`uc2_snapshot_hash_mismatch` reads `0`; the catalog
+  lists it agreed) the pin is **complete**: the catalog lists an agreed set
+  above the pin record, on the `to` line. (For a cross-line pin only a `to`
+  build can freeze above the record — the old one stopped there. For a
+  `--patch` pin an old same-line build's set counts too, by the line
+  contract.) From then on the row is back to normal — a restarting service
+  starts from that set (the node's start set) instead of re-installing the
+  origin, and the origin's set is released to ordinary retention, with the
+  floor and the journal purge free to move past it. Each node releases once
+  it **holds** that set (its own freeze, or an auto-fetch) and any `to`
+  instance attached there has caught up to it.
+  **Until the pin completes, every node keeps the origin's set and holds its
+  journal at the origin**, because any instance not yet upgraded still has
+  to install the origin and replay from it; `snapshot_floor_held_for_pin`
+  names that hold. With `snapshot_interval_bytes = 0` (the default) nothing
+  takes that instant for you, and the journal grows until you do.
 
 See
 [`uc2ctl` § `upgrade pin`](../reference/uc2ctl.md#upgrade-pin) for the
@@ -880,7 +892,7 @@ then and the swap. If a node's purge floor has already advanced past the
 pinned origin by the time a v_new binary attaches, `install_snapshot` cannot
 land at `origin` at all — the journal below the floor is gone — and the
 attach path fail-stops rather than refusing cleanly by name. In practice the
-node holds its floor at any pinned origin it has not yet consumed
+node holds its floor at any pinned origin it has not yet released
 (`snapshot_floor_held_for_pin`, below) precisely to keep this from happening
 on the node that did the pinning. It stays a real risk for any node whose own
 floor can be above the origin when the pin lands, and that is **not only the
@@ -892,17 +904,22 @@ nothing at the door and fails at attach time just the same. Check the floor
 on every node, not just the laggards.
 
 **A pinned-but-abandoned upgrade holds the journal indefinitely.** A node
-holds its snapshot/purge floor at a row's pinned origin until that row is
-consumed **on that node** — attached on the pin's `to` line (a patch build of `to` counts) **and** replayed past
-the cut, not merely attached. `snapshot_floor_held_for_pin` (an `Info` obs
+holds its snapshot/purge floor at a row's pinned origin until the pin is
+**complete** — the catalog lists an agreed set above the pin record, on the
+`to` line: for a cross-line pin, an instant taken after enough instances run
+`to` to agree on it; for a `--patch` pin an old same-line build's set counts
+too — **and** the pin is released on that node: the node holds that
+completion set (its own freeze, or an auto-fetch) and no `to` instance
+attached there (a patch build of `to` counts) is still replaying below it. `snapshot_floor_held_for_pin` (an `Info` obs
 event, fields `node`, `position` the held floor, `candidate` the floor the
 node would otherwise publish) names the hold whenever it is in effect. An
 operator who pins an origin and then never swaps the binary — an abandoned
 upgrade — holds the journal at that origin for as long as the row stays
-pinned but unconsumed; there is no bound or alert on how long that can run
-(a bound/alert is plan D's, not shipped). Clear it by attaching `to` (finish
-the upgrade) or by pinning forward (a newer pin supersedes it), not by
-waiting.
+pinned but incomplete; there is no bound or alert on how long that can run
+(a bound/alert is plan D's, not shipped). Clear it by finishing the upgrade
+(attach `to` on every node, then take an instant that agrees) or by pinning
+forward (a newer pin supersedes it, and holds at its own origin until it
+completes), not by waiting.
 
 **After the flag day**, nothing is required of the operator beyond the wipe
 above. A cluster that never runs `uc2ctl upgrade pin` holds an empty pin list
@@ -1031,6 +1048,25 @@ layout changes anywhere, which is exactly why mixing is unsound rather than
 merely unsupported: a `0.10.0` peer applies the row-255 report and the wider
 `Settings` record as undecodable and silently diverges — its catalog never
 completes a set. **Stop every node before starting any node.**
+
+The same flag day also carries the **snapshot lifecycle**: the `SNAP_REPORT`
+datagram's body grows from 24 B to 32 B (the artifact's size), the
+`SnapshotReport` record's entries become `(node, hash, size)`, the
+replicated `Settings` record moves to v4 (`auto_fetch`, default on), and the
+cluster image to v5 (catalog row entries carry sizes). A v1–v4 cluster image
+still loads — its sets read with size 0 ("unknown"), which nothing refuses —
+and a v1–v3 settings record reads `auto_fetch = true`. Nothing on disk is
+cleared. A dev cluster built from `main` between the catalog merge and this
+change must also stop every node: a 24-byte report is refused by length.
+
+**A pinned row in a pre-#33 (v1/v2) cluster image.** Such an image has no
+running-version blob, so installing it restores a pin's record position as
+the image's `applied` position (at or above the true one). Pin completion
+(an agreed set above the pin record) is still judged identically on every
+node: sets formed after the flag day lie above that position on every node.
+The only residual is a cluster where one node installs a v1/v2 image while
+another walks the same span from genesis — the two could retire the pinned
+origin differently. Clear `snapshots/cluster/` on every node or on none.
 
 **Before stopping: take one full instant and line the artifacts up.** Run
 `uc2ctl snapshot` (not `--standby`) right before the window, wait for it to

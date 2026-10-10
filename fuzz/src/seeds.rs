@@ -234,6 +234,19 @@ pub fn uc_protocol_datagram() -> Vec<Seed> {
     );
     seeds.push(Seed::fixed("21-snap-begin-v4-bad-layout", datagram(DGRAM_KIND_SNAP_BEGIN, 0, 3, &b)));
 
+    // Snapshot-lifecycle spec §7.1: the 32-byte SNAP_REPORT body (size @24).
+    {
+        use uc_protocol::v2::datagram::{
+            DGRAM_KIND_SNAP_REPORT, SNAP_REPORT_BODY_LEN, SnapReportBody, write_snap_report_body,
+        };
+        let mut b = [0u8; SNAP_REPORT_BODY_LEN];
+        write_snap_report_body(
+            &mut b,
+            &SnapReportBody { row: 0, node_id: 2, position: 65536, hash: 0xA1B2, size: 4096 },
+        );
+        seeds.push(Seed::fixed("22-snap-report", datagram(DGRAM_KIND_SNAP_REPORT, 0, 3, &b)));
+    }
+
     seeds
 }
 
@@ -1369,7 +1382,7 @@ pub fn uc_protocol_cluster_frame() -> Vec<Seed> {
     use uc_protocol::v2::frame::{CLUSTER_BODY_PREFIX_LEN, ClusterKind, write_cluster_prefix};
     use uc_protocol::v2::schedule::{ScheduleEntry, ScheduleRule, ScheduleTable, encode_schedule_table};
     use uc_protocol::v2::settings::{Settings, encode_settings};
-    use uc_protocol::v2::upgrade::{RowGenesis, encode_row_genesis};
+    use uc_protocol::v2::upgrade::{RowGenesis, SnapshotReport, encode_row_genesis, encode_snapshot_report};
 
     fn prefixed(kind: ClusterKind, payload: &[u8]) -> Vec<u8> {
         let mut v = vec![0u8; CLUSTER_BODY_PREFIX_LEN];
@@ -1412,6 +1425,24 @@ pub fn uc_protocol_cluster_frame() -> Vec<Seed> {
         &mut genesis_bytes,
     );
 
+    // Snapshot-lifecycle spec §7.1: kind 5 with sized (20 B) entries.
+    let mut report_bytes = Vec::new();
+    encode_snapshot_report(
+        &SnapshotReport { row: 0, position: 4096, hashes: vec![(1, 0xAA, 512), (2, 0xAA, 512)] },
+        &mut report_bytes,
+    )
+    .expect("a two-entry report encodes");
+    // The pre-lifecycle 12 B-entry shape (width inferred from length, R2):
+    // header, then n x (id u32 | hash u64) - a live corpus value.
+    let mut report_unsized = report_bytes[..16].to_vec();
+    for (id, h) in [(1u32, 0xAAu64), (2, 0xAA)] {
+        report_unsized.extend_from_slice(&id.to_le_bytes());
+        report_unsized.extend_from_slice(&h.to_le_bytes());
+    }
+    // Body length is neither n x 12 nor n x 20 (n = 2, body 30): refused.
+    let mut report_bad_len = report_bytes.clone();
+    report_bad_len.truncate(16 + 30);
+
     let mut unknown_kind = vec![0u8; CLUSTER_BODY_PREFIX_LEN];
     unknown_kind[0] = 9;
 
@@ -1427,6 +1458,9 @@ pub fn uc_protocol_cluster_frame() -> Vec<Seed> {
         Seed::fixed("05-unknown-kind", unknown_kind),
         Seed::fixed("06-reserved-nonzero", reserved_nonzero),
         Seed::fixed("07-row-genesis", prefixed(ClusterKind::RowGenesis, &genesis_bytes)),
+        Seed::fixed("08-snapshot-report-sized", prefixed(ClusterKind::SnapshotReport, &report_bytes)),
+        Seed::fixed("09-snapshot-report-unsized", prefixed(ClusterKind::SnapshotReport, &report_unsized)),
+        Seed::fixed("10-snapshot-report-bad-width", prefixed(ClusterKind::SnapshotReport, &report_bad_len)),
     ]
 }
 
@@ -1490,10 +1524,70 @@ pub fn uc_protocol_cluster_image() -> Vec<Seed> {
     encode_cluster_image(&ClusterImageParts { running: &running, ..parts }, &mut v3_running)
         .expect("genesis parts are well under u32::MAX");
 
+    // Snapshot-lifecycle spec §7.2: a v5 image whose catalog lists one agreed
+    // set with sizes, and the same image re-framed as v4 (version word and
+    // CRC only - the leaf treats the blobs as opaque).
+    use uc_protocol::v2::catalog::{RowEntry, RowVerdict, SetEntry, SetKind, SetState, encode_set_list};
+    let mut set = SetEntry::commanded(4096, SetKind::Full, 7);
+    set.state = SetState::Complete;
+    set.rows[0] = RowEntry { version: 0, hash: 1, verdict: RowVerdict::Agreed, size: 40 };
+    set.cluster = RowEntry { version: 0, hash: 2, verdict: RowVerdict::Agreed, size: 300 };
+    let mut catalog = Vec::new();
+    encode_set_list(&[set], &mut catalog).expect("one set");
+    let mut v5_catalog = Vec::new();
+    encode_cluster_image(&ClusterImageParts { catalog: &catalog, ..parts }, &mut v5_catalog)
+        .expect("genesis parts are well under u32::MAX");
+    // A GENUINE v4 image (ruling R9): the catalog in the unsized 135 B
+    // SetEntry layout and the report blob in 12 B entries, version word 4,
+    // CRC recomputed - the byte surgery of uc_node's `rewrite_image_as_v4`.
+    // A real `install_snapshot` accepts it; the v5 catalog bytes under a v4
+    // word would be refused there.
+    use uc_protocol::v2::catalog::{ROW_ENTRY_LEN, ROW_ENTRY_LEN_UNSIZED, decode_set_list_unsized};
+    use uc_protocol::v2::cluster_image::decode_cluster_image;
+    use uc_protocol::v2::upgrade::{
+        SNAPSHOT_REPORT_ENTRY_LEN, SNAPSHOT_REPORT_ENTRY_LEN_UNSIZED, SNAPSHOT_REPORT_HEADER_LEN,
+        SnapshotReport, decode_snapshot_report, encode_snapshot_report,
+    };
+    let mut report_rec = Vec::new();
+    encode_snapshot_report(
+        &SnapshotReport { row: 0, position: 4096, hashes: vec![(1, 1, 40), (2, 1, 40)] },
+        &mut report_rec,
+    )
+    .expect("a two-entry report encodes");
+    let mut old_rec = report_rec[..SNAPSHOT_REPORT_HEADER_LEN].to_vec();
+    for e in report_rec[SNAPSHOT_REPORT_HEADER_LEN..].chunks(SNAPSHOT_REPORT_ENTRY_LEN) {
+        old_rec.extend_from_slice(&e[..SNAPSHOT_REPORT_ENTRY_LEN_UNSIZED]);
+    }
+    let mut v4_reports = (old_rec.len() as u32).to_le_bytes().to_vec();
+    v4_reports.extend_from_slice(&old_rec);
+    let mut v4_catalog = catalog[..2].to_vec();
+    for set in catalog[2..].chunks(18 + 9 * ROW_ENTRY_LEN) {
+        v4_catalog.extend_from_slice(&set[..18]);
+        for r in set[18..].chunks(ROW_ENTRY_LEN) {
+            v4_catalog.extend_from_slice(&r[..ROW_ENTRY_LEN_UNSIZED]);
+        }
+    }
+    let mut v4 = Vec::new();
+    encode_cluster_image(
+        &ClusterImageParts { reports: &v4_reports, catalog: &v4_catalog, ..parts },
+        &mut v4,
+    )
+    .expect("genesis parts are well under u32::MAX");
+    v4.truncate(v4.len() - 4);
+    v4[8..12].copy_from_slice(&4u32.to_le_bytes());
+    let crc = crc32fast::hash(&v4);
+    v4.extend_from_slice(&crc.to_le_bytes());
+    // A future layout change fails the generator, not the fuzzer.
+    let d = decode_cluster_image(&v4).expect("the v4 seed decodes through the leaf");
+    assert!(decode_set_list_unsized(d.catalog).is_some(), "v4 catalog is the unsized layout");
+    assert!(decode_snapshot_report(&d.reports[4..]).is_some(), "v4 report uses 12 B entries");
+
     vec![
         Seed::fixed("21-cluster-image", image),
         Seed::fixed("22-cluster-image-bad-crc", bad_crc),
         Seed::fixed("23-cluster-image-v3-running", v3_running),
+        Seed::fixed("24-cluster-image-v5-sized-catalog", v5_catalog),
+        Seed::fixed("25-cluster-image-v4-frame", v4),
     ]
 }
 
@@ -1703,6 +1797,7 @@ pub fn uc_protocol_settings() -> Vec<Seed> {
         snapshot_target: Target::Learners,
         datagram_mtu: 8960,
         retain_sets: 0,
+        auto_fetch: true,
     });
     // The version-1 shape `2.11.0` wrote — a live corpus value, not a
     // refusal: it decodes with `datagram_mtu = 0` (jumbo spec §5.5).
@@ -1710,6 +1805,14 @@ pub fn uc_protocol_settings() -> Vec<Seed> {
         let mut v = genesis.clone();
         v.truncate(SETTINGS_LEN_V1);
         v[0] = 1;
+        v
+    };
+    // Snapshot-lifecycle spec §6: the v3 shape (35 B, no auto_fetch) is a
+    // live corpus value - it decodes with auto_fetch = true.
+    let v3 = {
+        let mut v = genesis.clone();
+        v.truncate(SETTINGS_LEN_V3);
+        v[0] = 3;
         v
     };
     let mut bad_version = genesis.clone();
@@ -1727,6 +1830,7 @@ pub fn uc_protocol_settings() -> Vec<Seed> {
         Seed::fixed("05-trailing-byte", trailing),
         Seed::fixed("06-short", vec![0u8; 4]),
         Seed::fixed("07-version-1", v1),
+        Seed::fixed("08-version-3", v3),
     ]
 }
 

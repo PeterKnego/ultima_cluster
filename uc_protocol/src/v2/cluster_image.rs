@@ -4,8 +4,8 @@
 //! The cluster FSM's frozen snapshot image codec (cluster-FSM spec §4.7,
 //! §4.8): magic ‖ version u32 ‖ applied u64 ‖ table_position u64 ‖
 //! settings_position u64 ‖ membership (u32 len ‖ bytes) ‖ table (u32 len ‖
-//! bytes) ‖ settings (one whole [`SETTINGS_LEN`], [`SETTINGS_LEN_V2`] or
-//! [`SETTINGS_LEN_V1`] record — the record is self-versioned and
+//! bytes) ‖ settings (one whole [`SETTINGS_LEN`], [`SETTINGS_LEN_V3`],
+//! [`SETTINGS_LEN_V2`] or [`SETTINGS_LEN_V1`] record — the record is self-versioned and
 //! exact-length per version) ‖
 //! crc32 of everything before it. That is layout v1, still ACCEPTED on
 //! read. Layout v2 (plan B1 T3) appends two more length-prefixed blobs
@@ -20,7 +20,8 @@
 //! length-prefixed blob after `running`, before the CRC: catalog (u32 len ‖
 //! bytes) — the snapshot catalog's set list (`v2::catalog`'s
 //! `encode_set_list`), opaque here. v1–v3 images are still ACCEPTED on read,
-//! with `catalog` empty.
+//! with `catalog` empty. Layout v5 (snapshot-lifecycle spec §7.2) changes no
+//! framing: it marks that the opaque `reports` and `catalog` blobs carry sizes.
 //!
 //! Moved out of `uc_node::cluster_fsm` (plan 3, spec §4.8) so a fuzz target
 //! can reach the decoder without pulling in `ClusterFsm` — a below-floor
@@ -46,7 +47,7 @@
 //! that dispatch for no gain — the image codec's own job is only the outer
 //! framing and the CRC.
 
-use super::settings::{SETTINGS_LEN, SETTINGS_LEN_V1, SETTINGS_LEN_V2};
+use super::settings::{SETTINGS_LEN, SETTINGS_LEN_V1, SETTINGS_LEN_V2, SETTINGS_LEN_V3};
 
 pub const CLUSTER_IMAGE_MAGIC: &[u8; 8] = b"UCCLUST1";
 /// The image layout's version, refused by [`decode_cluster_image`] when
@@ -63,7 +64,12 @@ pub const CLUSTER_IMAGE_MAGIC: &[u8; 8] = b"UCCLUST1";
 /// after `running`. A v1–v3 image is still ACCEPTED on read, with `catalog`
 /// empty — the `Empty` state of catalog spec §4.5, since the flag day does
 /// not migrate sets built before the catalog existed.
-pub const CLUSTER_IMAGE_VERSION: u32 = 4;
+/// Bumped to 5 (snapshot-lifecycle spec §7.2): the `reports` blob's entries
+/// and the `catalog` blob's row entries carry a `size u64`. The OUTER framing
+/// is identical to v4 — the blobs are opaque here — so a v1–v4 image is still
+/// ACCEPTED; its reader picks the blob layout from [`cluster_image_version`]
+/// (`uc_node::cluster_fsm` decodes v1–v4 blobs with every size `0`).
+pub const CLUSTER_IMAGE_VERSION: u32 = 5;
 
 /// Bytes fixed before the two length-prefixed payloads: magic(8) ‖
 /// version(4) ‖ applied(8) ‖ table_position(8) ‖ settings_position(8).
@@ -232,7 +238,8 @@ pub fn decode_cluster_image(buf: &[u8]) -> Option<ClusterImageParts<'_>> {
         let sl = match u32_at(o)? {
             1 => SETTINGS_LEN_V1,
             2 => SETTINGS_LEN_V2,
-            3 => SETTINGS_LEN,
+            3 => SETTINGS_LEN_V3,
+            4 => SETTINGS_LEN,
             _ => return None,
         };
         let rest = body.len().checked_sub(o)?;
@@ -255,7 +262,8 @@ pub fn decode_cluster_image(buf: &[u8]) -> Option<ClusterImageParts<'_>> {
         let sl = match u32_at(o)? {
             1 => SETTINGS_LEN_V1,
             2 => SETTINGS_LEN_V2,
-            3 => SETTINGS_LEN,
+            3 => SETTINGS_LEN_V3,
+            4 => SETTINGS_LEN,
             _ => return None,
         };
         let settings = o.checked_add(sl).and_then(|end| body.get(o..end))?;
@@ -303,6 +311,15 @@ pub fn decode_cluster_image(buf: &[u8]) -> Option<ClusterImageParts<'_>> {
         running,
         catalog,
     })
+}
+
+/// The version word of an image [`decode_cluster_image`] ACCEPTS, else
+/// `None`. The cluster FSM reads it to choose the sized (v5) or unsized
+/// (v1–v4) blob decoders; kept out of [`ClusterImageParts`] so a decoded image
+/// still re-encodes to parts that compare equal (the fuzz target's property).
+pub fn cluster_image_version(buf: &[u8]) -> Option<u32> {
+    decode_cluster_image(buf)?;
+    Some(u32::from_le_bytes(buf.get(8..12)?.try_into().ok()?))
 }
 
 #[cfg(test)]
@@ -421,7 +438,7 @@ mod tests {
         v
     }
 
-    /// The CURRENT (`SETTINGS_LEN` B, version 3, `retain_sets` field
+    /// The CURRENT (`SETTINGS_LEN` B, version 4, `auto_fetch` field
     /// included) settings record: `encode_settings(&Settings::
     /// genesis_default())`'s bytes — `encode_settings` always emits the
     /// latest version, so this is no longer the 33 B v2 shape the name
@@ -536,8 +553,8 @@ mod tests {
         assert_eq!(v1.len(), 29);
         assert_eq!(v2.len(), SETTINGS_LEN);
 
-        // 28/31/34 bytes: none of the three valid settings-record lengths
-        // (29, 33, 35). The CRC is correct — this is the framing check
+        // 28/31/34 bytes: none of the four valid settings-record lengths
+        // (29, 33, 35, 36). The CRC is correct — this is the framing check
         // refusing it, not corruption.
         for bad_len in [28usize, 31, 34] {
             let mut tail = v2.clone();
@@ -569,7 +586,7 @@ mod tests {
     /// `SETTINGS_LEN`-byte tail claims `version = 1` is not a v1 record
     /// padded out, it is a length the codec cannot re-encode, so it is
     /// refused rather than silently truncated to 29. (Name kept from when
-    /// `SETTINGS_LEN` was 33; it is 35 now, catalog spec §7 — the test's
+    /// `SETTINGS_LEN` was 33; it is 36 now, snapshot-lifecycle spec §6 — the test's
     /// point is unchanged.)
     #[test]
     fn a_v1_image_whose_33_byte_tail_claims_version_1_is_refused() {
@@ -704,7 +721,11 @@ mod tests {
         };
         let mut img = Vec::new();
         encode_cluster_image(&p, &mut img).unwrap();
-        assert_eq!(&img[8..12], &4u32.to_le_bytes(), "version 4");
+        assert_eq!(
+            &img[8..12],
+            &CLUSTER_IMAGE_VERSION.to_le_bytes(),
+            "current version"
+        );
         let d = decode_cluster_image(&img).unwrap();
         assert_eq!(
             (
@@ -843,7 +864,11 @@ mod tests {
         };
         let mut img = Vec::new();
         encode_cluster_image(&p, &mut img).unwrap();
-        assert_eq!(&img[8..12], &4u32.to_le_bytes(), "layout v4");
+        assert_eq!(
+            &img[8..12],
+            &CLUSTER_IMAGE_VERSION.to_le_bytes(),
+            "current layout"
+        );
         assert_eq!(decode_cluster_image(&img), Some(p));
 
         // The same parts without a catalog, re-framed as v3: drop the
@@ -873,5 +898,46 @@ mod tests {
         let l = img.len();
         let crc = crc32fast::hash(&img[..l - 4]);
         img[l - 4..].copy_from_slice(&crc.to_le_bytes());
+    }
+
+    /// Snapshot-lifecycle spec §7.2: images are written v5; the version word
+    /// of an accepted image is readable.
+    #[test]
+    fn images_are_v5_and_the_version_word_of_an_accepted_image_is_readable() {
+        assert_eq!(CLUSTER_IMAGE_VERSION, 5);
+        let (membership, table, settings) = genesis_parts();
+        let parts = ClusterImageParts {
+            applied: 300,
+            table_position: 0,
+            settings_position: 0,
+            membership: &membership,
+            table: &table,
+            settings: &settings,
+            pins: &[],
+            reports: &[],
+            running: &[],
+            catalog: &[],
+        };
+        let mut img = Vec::new();
+        encode_cluster_image(&parts, &mut img).unwrap();
+        assert_eq!(cluster_image_version(&img), Some(5));
+        let body_end = img.len() - 4;
+        let mut v4 = img[..body_end].to_vec();
+        v4[8..12].copy_from_slice(&4u32.to_le_bytes());
+        let crc = crc32fast::hash(&v4);
+        v4.extend_from_slice(&crc.to_le_bytes());
+        assert_eq!(cluster_image_version(&v4), Some(4));
+        assert_eq!(
+            decode_cluster_image(&v4),
+            Some(parts),
+            "v4 frames identically"
+        );
+        let mut bad = img.clone();
+        *bad.last_mut().unwrap() ^= 1;
+        assert_eq!(
+            cluster_image_version(&bad),
+            None,
+            "only an ACCEPTED image has a version"
+        );
     }
 }

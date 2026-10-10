@@ -25,6 +25,7 @@ use uc_consensus::election::NodeId;
 use uc_protocol::identity::same_line;
 use uc_protocol::v2::catalog::{CLUSTER_ROW, RowVerdict, SetEntry, SetState};
 use uc_protocol::v2::datagram::Holdings;
+use uc_protocol::v2::upgrade::{RowRunning, SnapshotReport, UpgradePin};
 
 /// One node's last-advertised [`Holdings`] plus when it was recorded, for
 /// [`SoftTable::live`]'s staleness check.
@@ -230,6 +231,184 @@ impl CatalogQuery<'_> {
     }
 }
 
+/// Snapshot-lifecycle spec §4: one row's start set — `position == 0` = none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct StartSet {
+    pub position: u64,
+    /// The packed version that built the row's artifact (`RowEntry.version`).
+    pub version: u32,
+}
+
+/// Pin completion (snapshot-lifecycle errata, ruling C1): what a row's
+/// NEWEST pin requires before it is complete — the `to` line a completion set
+/// must have been built on, and the pin record's log position, which the set
+/// must sit strictly above.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PinGate {
+    pub origin: u64,
+    pub to: u32,
+    /// The frame END of the record that set the row's running version — the
+    /// newest pin's own record (`RowRunning.record_pos`; after a v1/v2
+    /// cluster-image install, the image's `applied`, which is at or above it
+    /// — conservative). `u64::MAX` when the row has no running record, so
+    /// such a pin is never complete.
+    pub record_pos: u64,
+}
+
+/// The row's [`PinGate`] — `None` for a row with no pin. One reading for
+/// every caller: the FSM's retention, the node's hold, pruner and start-set
+/// publisher all pass the same committed fields (`pins`, `running`).
+pub fn pin_gate(pins: &[UpgradePin], running: &[Option<RowRunning>], row: u8) -> Option<PinGate> {
+    let pin = pins.iter().rev().find(|p| p.row == row)?;
+    let record_pos = running
+        .get(row as usize)
+        .copied()
+        .flatten()
+        .map_or(u64::MAX, |r| r.record_pos);
+    Some(PinGate {
+        origin: pin.origin,
+        to: pin.to,
+        record_pos,
+    })
+}
+
+/// Ruling C1: does the catalog entry `e` COMPLETE `row`'s pin? Agreed as a
+/// whole, `row` itself `Agreed`, strictly ABOVE the pin record, and recorded
+/// on `to`'s line. The record bound is the load-bearing clause: the
+/// catalog's row version is DERIVED from the pin history
+/// (`ClusterState::version_at`), so a set between the origin and the pin's
+/// commit reads as `to` although the old binary built it.
+pub fn completes_pin(e: &SetEntry, row: u8, gate: &PinGate) -> bool {
+    e.is_agreed()
+        && e.position > gate.record_pos
+        && e.rows
+            .get(row as usize)
+            .is_some_and(|r| r.verdict == RowVerdict::Agreed && same_line(r.version, gate.to))
+}
+
+/// Ruling C1: is `row`'s pin complete — does the catalog list ANY completion
+/// set for it? Allocation-free; the cluster FSM's retention and the node's
+/// floor hold both ask it.
+pub fn pin_complete(sets: &[SetEntry], row: u8, gate: &PinGate) -> bool {
+    sets.iter().any(|e| completes_pin(e, row, gate))
+}
+
+/// Snapshot-lifecycle spec §4.1: row `row`'s start set — the NEWEST entry
+/// that (1) is agreed, (2) has `rows[row]` Agreed (a row the set did not
+/// report is not eligible for it), (3) this node holds complete on disk
+/// (`held`, the consensus agent's `holdings_held`), and (4) sits at or below
+/// `frontier = min(commit, durable)`. An empty catalog answers none.
+///
+/// Pin completion (ruling C2): for a PINNED row (`pin` is its [`PinGate`])
+/// only a completion set ([`completes_pin`]) is eligible — a row upgraded
+/// under a pin starts from a set its `to` line built above the pin record,
+/// never from one the old binary left behind.
+///
+/// The second value is the lowest position of a set that passes (1)-(3)
+/// but sits ABOVE `frontier` — when the frontier reaches it the answer
+/// changes, so the caller recomputes then (spec §4.3); `u64::MAX` = none.
+pub fn start_set_for(
+    row: u8,
+    sets: &[SetEntry],
+    held: &[u64],
+    frontier: u64,
+    pin: Option<&PinGate>,
+) -> (StartSet, u64) {
+    let mut wait_above = u64::MAX;
+    for e in sets.iter().rev() {
+        let Some(r) = e.rows.get(row as usize) else {
+            break;
+        };
+        if !e.is_agreed() || r.verdict != RowVerdict::Agreed || !held.contains(&e.position) {
+            continue;
+        }
+        if pin.is_some_and(|g| !completes_pin(e, row, g)) {
+            continue;
+        }
+        if e.position > frontier {
+            wait_above = wait_above.min(e.position);
+            continue;
+        }
+        return (
+            StartSet {
+                position: e.position,
+                version: r.version,
+            },
+            wait_above,
+        );
+    }
+    (StartSet::default(), wait_above)
+}
+
+/// Plan ruling P1: whom to ask for a set, in order. Known holders first —
+/// `live_holders` (the leader's soft table; empty on a follower, which has
+/// none) and `builders` ([`builders_at`]) — then every other member; each
+/// tier learners first, then lowest node id (spec §6). Never `self_id`, no
+/// duplicates. A member that turns out not to hold the set answers nothing
+/// and costs one fetch timeout.
+pub fn fetch_candidates(
+    self_id: NodeId,
+    live_holders: &[NodeId],
+    builders: &[NodeId],
+    learners: &[NodeId],
+    voters: &[NodeId],
+) -> Vec<NodeId> {
+    let order = |v: &mut Vec<NodeId>| {
+        v.sort_unstable();
+        v.dedup();
+        v.sort_by_key(|id| (!learners.contains(id), *id));
+    };
+    let mut known: Vec<NodeId> = live_holders
+        .iter()
+        .chain(builders)
+        .copied()
+        .filter(|&id| id != self_id)
+        .collect();
+    order(&mut known);
+    let mut rest: Vec<NodeId> = learners
+        .iter()
+        .chain(voters)
+        .copied()
+        .filter(|id| *id != self_id && !known.contains(id))
+        .collect();
+    order(&mut rest);
+    known.extend(rest);
+    known
+}
+
+/// Plan ruling P1: the nodes that BUILT the set at `p` — reporters, in the
+/// committed `SnapshotReport` records at `p`, whose hash equals the catalog's
+/// row hash there. Replicated, so a follower knows them too. Empty when the
+/// catalog does not list `p` or the records have moved past it.
+pub fn builders_at(reports: &[SnapshotReport], sets: &[SetEntry], p: u64) -> Vec<NodeId> {
+    let Some(e) = sets.iter().find(|e| e.position == p) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for r in reports.iter().filter(|r| r.position == p) {
+        let Some(row) = e.rows.get(r.row as usize) else {
+            continue;
+        };
+        for &(id, h, _) in &r.hashes {
+            if h == row.hash && !out.contains(&id) {
+                out.push(id);
+            }
+        }
+    }
+    out
+}
+
+/// Review focus 5 / plan ruling P12: how many nodes reported the instant at
+/// `p` (the widest committed row record there); `0` when none is held.
+pub fn reporters_at(reports: &[SnapshotReport], p: u64) -> usize {
+    reports
+        .iter()
+        .filter(|r| r.position == p)
+        .map(|r| r.hashes.len())
+        .max()
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -240,6 +419,7 @@ mod tests {
         version: 0x0102_0000,
         hash: 1,
         verdict: RowVerdict::Agreed,
+        size: 0,
     };
     fn agreed(p: u64) -> SetEntry {
         let mut e = SetEntry::commanded(p, SetKind::Full, p);
@@ -253,6 +433,245 @@ mod tests {
         e.rows[0].verdict = RowVerdict::Diverged;
         e
     }
+    fn agreed_v(p: u64, version: u32) -> SetEntry {
+        let mut e = agreed(p);
+        e.rows[0].version = version;
+        e
+    }
+
+    /// Snapshot-lifecycle spec §4.1: the newest entry that is agreed, whose
+    /// row is Agreed, that this node holds, at or below min(commit, durable).
+    #[test]
+    fn start_set_eligibility_table() {
+        let sets = [agreed_v(1000, 7), agreed_v(2000, 8), agreed_v(3000, 9)];
+        // agreed and held
+        assert_eq!(
+            start_set_for(0, &sets, &[1000, 2000, 3000], u64::MAX, None),
+            (
+                StartSet {
+                    position: 3000,
+                    version: 9
+                },
+                u64::MAX
+            )
+        );
+        // not held -> the newest held one
+        assert_eq!(
+            start_set_for(0, &sets, &[1000], u64::MAX, None).0.position,
+            1000
+        );
+        // above min(commit, durable) -> the older one, and the frontier to watch
+        assert_eq!(
+            start_set_for(0, &sets, &[1000, 2000, 3000], 2500, None),
+            (
+                StartSet {
+                    position: 2000,
+                    version: 8
+                },
+                3000
+            )
+        );
+        // row unreported in the set -> not eligible for that row
+        assert_eq!(
+            start_set_for(1, &sets, &[1000, 2000, 3000], u64::MAX, None).0,
+            StartSet::default()
+        );
+        // a diverged set is skipped
+        let with_div = [agreed_v(1000, 7), diverged(2000)];
+        assert_eq!(
+            start_set_for(0, &with_div, &[1000, 2000], u64::MAX, None)
+                .0
+                .position,
+            1000
+        );
+        // a Commanded entry is skipped
+        let cmd = [
+            agreed_v(1000, 7),
+            SetEntry::commanded(2000, SetKind::Full, 0),
+        ];
+        assert_eq!(
+            start_set_for(0, &cmd, &[1000, 2000], u64::MAX, None)
+                .0
+                .position,
+            1000
+        );
+        // empty catalog -> none
+        assert_eq!(
+            start_set_for(0, &[], &[1000], u64::MAX, None),
+            (StartSet::default(), u64::MAX)
+        );
+    }
+
+    /// Review focus 1: a set still being fetched is not in the held list
+    /// until its LAST artifact is renamed into place (the completion edge),
+    /// so the publisher names the older held set - never a half-written one.
+    #[test]
+    fn start_set_skips_a_set_that_is_still_being_fetched() {
+        let sets = [agreed_v(1000, 7), agreed_v(2000, 7)];
+        let held_while_fetching_2000 = [1000];
+        assert_eq!(
+            start_set_for(0, &sets, &held_while_fetching_2000, u64::MAX, None)
+                .0
+                .position,
+            1000
+        );
+    }
+
+    /// Pin completion ruling C1, the whole table: agreed as a whole, the row
+    /// itself Agreed, strictly above the pin record, on `to`'s line.
+    #[test]
+    fn completes_pin_table() {
+        let to = pack_version(1, 2, 0);
+        let gate = PinGate {
+            origin: 500,
+            to,
+            record_pos: 1000,
+        };
+        let above = agreed_v(2000, to);
+        assert!(completes_pin(&above, 0, &gate), "the plain case");
+        assert!(
+            completes_pin(&agreed_v(2000, pack_version(1, 2, 7)), 0, &gate),
+            "a patch of `to` is on its line"
+        );
+        assert!(
+            !completes_pin(&agreed_v(2000, pack_version(1, 1, 0)), 0, &gate),
+            "the wrong line (the old binary's) does not complete"
+        );
+        // Position bounds: strictly above the record — at it, or anywhere in
+        // (origin, record_pos], is not enough (test 4 below names why).
+        assert!(!completes_pin(&agreed_v(1000, to), 0, &gate));
+        assert!(!completes_pin(&agreed_v(500, to), 0, &gate));
+        assert!(completes_pin(&agreed_v(1001, to), 0, &gate));
+        // The set must be agreed as a whole…
+        let mut cmd = agreed_v(2000, to);
+        cmd.state = SetState::Commanded;
+        assert!(!completes_pin(&cmd, 0, &gate), "a commanded set");
+        let mut cluster_div = agreed_v(2000, to);
+        cluster_div.cluster.verdict = RowVerdict::Diverged;
+        assert!(
+            !completes_pin(&cluster_div, 0, &gate),
+            "cluster row diverged"
+        );
+        // …and the row itself must be Agreed.
+        for v in [
+            RowVerdict::Diverged,
+            RowVerdict::NoMajority,
+            RowVerdict::Unreported,
+        ] {
+            let mut e = agreed_v(2000, to);
+            e.rows[0].verdict = v;
+            assert!(!completes_pin(&e, 0, &gate), "row verdict {v:?}");
+        }
+        // Another row's agreement says nothing about this row.
+        assert!(!completes_pin(&above, 1, &gate), "row 1 unreported");
+        // A row with no running record never completes.
+        let no_record = PinGate {
+            record_pos: u64::MAX,
+            ..gate
+        };
+        assert!(!completes_pin(&agreed_v(u64::MAX - 1, to), 0, &no_record));
+        // `pin_complete` is "any entry completes".
+        assert!(pin_complete(&[agreed_v(800, to), above.clone()], 0, &gate));
+        assert!(!pin_complete(&[agreed_v(800, to)], 0, &gate));
+        assert!(!pin_complete(&[], 0, &gate));
+    }
+
+    /// Ruling C1's record bound (brief test 4): an agreed set ABOVE the
+    /// origin but at or below the pin record does NOT complete the pin, even
+    /// though the catalog records it on `to`'s line — `version_at` derives
+    /// the row version from the pin history, so a set the old binary froze
+    /// between the origin and the pin's commit reads as `to`.
+    #[test]
+    fn an_agreed_set_between_the_origin_and_the_pin_record_does_not_complete_it() {
+        let to = pack_version(2, 0, 0);
+        let gate = PinGate {
+            origin: 1000,
+            to,
+            record_pos: 3000,
+        };
+        let between = [agreed_v(1000, 7), agreed_v(2000, to), agreed_v(3000, to)];
+        assert!(!pin_complete(&between, 0, &gate));
+        // …nor is either one a start set for the pinned row.
+        assert_eq!(
+            start_set_for(0, &between, &[1000, 2000, 3000], u64::MAX, Some(&gate)),
+            (StartSet::default(), u64::MAX)
+        );
+    }
+
+    /// Ruling C2: a pinned row's start set is the newest COMPLETION set it
+    /// holds at or below the frontier; anything else is skipped.
+    #[test]
+    fn a_pinned_row_starts_only_from_a_completion_set() {
+        let to = pack_version(2, 0, 0);
+        let gate = PinGate {
+            origin: 1000,
+            to,
+            record_pos: 1500,
+        };
+        let sets = [agreed_v(1000, 7), agreed_v(2000, to), agreed_v(3000, to)];
+        assert_eq!(
+            start_set_for(0, &sets, &[1000, 2000, 3000], u64::MAX, Some(&gate)).0,
+            StartSet {
+                position: 3000,
+                version: to
+            }
+        );
+        assert_eq!(
+            start_set_for(0, &sets, &[1000, 2000], u64::MAX, Some(&gate)).0,
+            StartSet {
+                position: 2000,
+                version: to
+            },
+            "the newest HELD completion set"
+        );
+        assert_eq!(
+            start_set_for(0, &sets, &[1000], u64::MAX, Some(&gate)),
+            (StartSet::default(), u64::MAX),
+            "holding only the origin is no start set for a pinned row"
+        );
+        assert_eq!(
+            start_set_for(0, &sets, &[1000, 2000, 3000], 2500, Some(&gate)),
+            (
+                StartSet {
+                    position: 2000,
+                    version: to
+                },
+                3000
+            ),
+            "the frontier rule is unchanged"
+        );
+    }
+
+    /// The gate reads the row's NEWEST pin and its running record.
+    #[test]
+    fn pin_gate_reads_the_newest_pin_and_its_record() {
+        let pin = |origin, to| UpgradePin {
+            row: 0,
+            from: 1,
+            to,
+            origin,
+        };
+        let mut running = [None; uc_protocol::v2::cnc::CNC_MAX_SERVICES];
+        assert_eq!(pin_gate(&[], &running, 0), None);
+        let pins = [pin(100, 2), pin(400, 3)];
+        assert_eq!(
+            pin_gate(&pins, &running, 0),
+            Some(PinGate {
+                origin: 400,
+                to: 3,
+                record_pos: u64::MAX
+            }),
+            "no running record: never complete"
+        );
+        running[0] = Some(RowRunning {
+            row: 0,
+            version: 3,
+            record_pos: 480,
+        });
+        assert_eq!(pin_gate(&pins, &running, 0).unwrap().record_pos, 480);
+        assert_eq!(pin_gate(&pins, &running, 1), None, "row 1 has no pin");
+    }
+
     fn holding(catalog_position: u64, sets_held: u64, first: u64, durable: u64) -> Holdings {
         Holdings {
             catalog_position,
@@ -455,5 +874,59 @@ mod tests {
         soft.record(1, holding(42, 0, 1001, 2000), 9_900);
         let c = q(&sets, &soft);
         assert_eq!(c.coverage_gaps(), vec![(1000, 2000)]);
+    }
+
+    /// Plan ruling P1: known holders (live soft entries, then builders) first,
+    /// learners first then lowest id; then every other member the same way;
+    /// never self; no duplicates.
+    #[test]
+    fn fetch_candidates_put_known_holders_first_learners_first_then_everyone_else() {
+        // self = 1; learners 4, 5; voters 0..=3; live holder 3; builders 4 and self.
+        let c = fetch_candidates(1, &[3], &[4, 1], &[5, 4], &[0, 1, 2, 3]);
+        assert_eq!(c, vec![4, 3, 5, 0, 2]);
+        assert_eq!(
+            fetch_candidates(0, &[], &[], &[], &[0]),
+            Vec::<NodeId>::new(),
+            "a solo node has nobody"
+        );
+    }
+
+    /// Plan ruling P1: the builders of the set at P are the reporters whose
+    /// hash matches the catalog's row hash at P.
+    #[test]
+    fn builders_are_the_reporters_of_the_catalogued_hash() {
+        let mut e = agreed(1000);
+        e.rows[0].hash = 7;
+        let reports = [SnapshotReport {
+            row: 0,
+            position: 1000,
+            hashes: vec![(0, 7, 1), (2, 8, 1), (3, 7, 1)],
+        }];
+        assert_eq!(builders_at(&reports, &[e.clone()], 1000), vec![0, 3]);
+        assert_eq!(
+            builders_at(&reports, &[e], 2000),
+            Vec::<NodeId>::new(),
+            "no entry at 2000"
+        );
+    }
+
+    /// Review focus 5: a set reported by exactly one node is visible as such.
+    #[test]
+    fn reporters_at_counts_the_reporters_of_one_instant() {
+        let reports = [
+            SnapshotReport {
+                row: 0,
+                position: 1000,
+                hashes: vec![(4, 7, 1)],
+            },
+            SnapshotReport {
+                row: 1,
+                position: 900,
+                hashes: vec![(0, 7, 1), (1, 7, 1)],
+            },
+        ];
+        assert_eq!(reporters_at(&reports, 1000), 1);
+        assert_eq!(reporters_at(&reports, 900), 2);
+        assert_eq!(reporters_at(&reports, 5), 0);
     }
 }

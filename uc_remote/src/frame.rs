@@ -15,8 +15,10 @@
 
 pub use crate::error::FrameError;
 
-/// The wire protocol version this crate speaks.
-pub const PROTOCOL_VERSION: u16 = 1;
+/// Remote protocol 2 (read-your-writes, spec 2026-10-08 §4.4): QUERY frames
+/// may carry [`FLAG_MIN_POSITION`]. A v1 edge would read the prefix as query
+/// bytes, so v1 and v2 refuse each other at HELLO.
+pub const PROTOCOL_VERSION: u16 = 2;
 
 /// `len u32 | ty u8 | flags u8 | version u16 | client_id u64 | seq u64`.
 pub const HEADER_LEN: usize = 24;
@@ -36,6 +38,30 @@ pub const FLAG_REPLAYED: u8 = 0x04;
 pub const FLAG_EXPIRED: u8 = 0x08;
 /// RESPONSE: a session_envelope tag was present.
 pub const FLAG_ENVELOPED: u8 = 0x10;
+/// QUERY flag: the payload is `min_position: u64 LE ++ query`, and the edge
+/// answers only from state applied at least that far.
+pub const FLAG_MIN_POSITION: u8 = 0x20;
+
+/// Lay out a read-your-writes QUERY payload: `min_position` (u64 LE) then the
+/// query bytes. `out` is cleared first.
+pub fn write_min_position_query(min_position: u64, query: &[u8], out: &mut Vec<u8>) {
+    out.clear();
+    out.reserve(8 + query.len());
+    out.extend_from_slice(&min_position.to_le_bytes());
+    out.extend_from_slice(query);
+}
+
+/// Split a `FLAG_MIN_POSITION` payload into its token and the query bytes;
+/// `None` when it is shorter than the 8-byte prefix.
+pub fn split_min_position_query(payload: &[u8]) -> Option<(u64, &[u8])> {
+    if payload.len() < 8 {
+        return None;
+    }
+    Some((
+        u64::from_le_bytes(payload[..8].try_into().ok()?),
+        &payload[8..],
+    ))
+}
 
 // ---- RETRY reasons ------------------------------------------------------
 
@@ -412,6 +438,25 @@ impl Retry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn protocol_v2_and_the_min_position_flag_are_pinned() {
+        assert_eq!(PROTOCOL_VERSION, 2);
+        assert_eq!(FLAG_MIN_POSITION, 0x20);
+        for f in [
+            FLAG_LINEARIZABLE,
+            FLAG_IS_QUERY,
+            FLAG_REPLAYED,
+            FLAG_EXPIRED,
+            FLAG_ENVELOPED,
+        ] {
+            assert_eq!(f & FLAG_MIN_POSITION, 0);
+        }
+        let mut out = Vec::new();
+        write_min_position_query(77, b"q", &mut out);
+        assert_eq!(split_min_position_query(&out), Some((77, &b"q"[..])));
+        assert_eq!(split_min_position_query(&out[..7]), None);
+    }
 
     #[test]
     fn hello_round_trips_and_rejects_short() {
