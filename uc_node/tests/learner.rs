@@ -1169,6 +1169,21 @@ fn a_helper_fsm_learner_joins_a_purged_leader() {
     // The claim this test exists to prove: the helper-based FSM's value
     // converges after a real below-floor join through a real snapshot
     // session — not just that SOME bytes landed on disk.
+    // Compare at ONE frontier, taken now that the learner has caught up. The
+    // voter's value above was sampled at the "voter quiesced" commit, but
+    // that wait (node counters agree) can fire while submitted frames still
+    // sit in the ingress ring; they commit afterwards, so a learner sampled
+    // later legitimately holds MORE (nightly 2026-10-07: the voter read the
+    // first pass plus frames 0..10288 of the second; the learner the full
+    // two passes). Re-sample both once every row has applied to the same
+    // final commit.
+    let final_commit = voter.counters().commit.load_acquire();
+    await_until(60, "both rows applied to the same final commit", || {
+        v_cnc.service_slot(0).applied.load_acquire() >= final_commit
+            && l_cnc.service_slot(0).applied.load_acquire() >= final_commit
+    });
+    let mut voter_value = Vec::new();
+    v0.query_raw(&[], &mut voter_value);
     let mut learner_value = Vec::new();
     l0.query_raw(&[], &mut learner_value);
     assert_eq!(
