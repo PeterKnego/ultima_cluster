@@ -771,7 +771,23 @@ pub(crate) fn apply_cycle<S: RawStateMachine>(st: &mut ApplyState<S>) -> bool {
                 // nothing again (the guard below sets this, once).
                 st.replay_stalled,
             ) {
-                Ok(Replay::Rejoin(cursor)) => cursor,
+                // A pass that moved nothing returns the cursor it was given
+                // (`resume`, which IS `cursor_before`), so a Rejoin below it
+                // cannot be legitimate: every frame below the follower's
+                // cursor is already in the SM (R5), and the one rewind this
+                // loop knows — onto a version record — is `AwaitVersion` /
+                // `rewind_to_record` above, never this arm. Defence in
+                // depth: never rewind the follower, nor publish the slot's
+                // increase-only `applied`, below `cursor_before` (it used to
+                // drop to 0 on a zero-walk pass, and the forced gap pass then
+                // measured its guard from 0).
+                Ok(Replay::Rejoin(cursor)) => {
+                    debug_assert!(
+                        cursor >= cursor_before,
+                        "replay Rejoin({cursor}) below the follower's cursor {cursor_before}"
+                    );
+                    cursor.max(cursor_before)
+                }
                 // R13: replay reached a version record the agent has not
                 // applied yet — rejoin AT it and end the cycle, exactly as
                 // the live arm's `Pending` does. Never the gap guard's
@@ -2517,6 +2533,177 @@ mod tests {
             "exactly the frames from B up"
         );
         assert_eq!(sm.last, Some(pos[pos.len() - 1]));
+    }
+
+    /// A zero-walk replay that is NOT a straddle: the follower sits at B
+    /// (above 0), the SM at A (the frame below B), and the journal holds
+    /// nothing at all — an empty journal (`first = 0`, from `first_meta`
+    /// answering `None`) — so `replay_into`'s own gap test sees no hole and
+    /// the scan walks no frame.
+    /// The pass moved nothing, so it must report "no movement" — B — and the
+    /// cycle must never rewind the follower or publish `applied` below B. It
+    /// used to return `Rejoin(0)`: the follower rewound to 0, the slot's
+    /// increase-only `applied` dropped to 0, and the forced gap pass measured
+    /// its guard from 0, demanding an artifact strictly above the SM's A
+    /// rather than strictly above B.
+    #[test]
+    fn a_zero_walk_replay_never_rewinds_the_follower_or_applied() {
+        let dir = scratch();
+        let (mut st, pos, _head) = a_lapped_row(&dir, 0x2e40, true);
+        assert!(st.snapshot_restore.is_none(), "no install capability");
+        let a = pos[699];
+        let b = pos[700];
+        st.sm.lock().unwrap().last = Some(a);
+        st.follower.cursor = b;
+        let slot_applied = || crate::attach::slot(&st.cnc, 0).applied.load_acquire();
+        crate::attach::slot(&st.cnc, 0).applied.store_release(b);
+        assert_eq!(slot_applied(), b);
+
+        // Sample `applied` for the whole cycle: it must never dip below B.
+        let cnc = Arc::clone(&st.cnc);
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop2 = Arc::clone(&stop);
+        let sampler = std::thread::spawn(move || {
+            let mut min = u64::MAX;
+            while !stop2.load(std::sync::atomic::Ordering::Relaxed) {
+                min = min.min(crate::attach::slot(&cnc, 0).applied.load_acquire());
+            }
+            min.min(crate::attach::slot(&cnc, 0).applied.load_acquire())
+        });
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let h = std::thread::spawn(move || {
+            let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                super::apply_cycle(&mut st)
+            }));
+            let msg = out.as_ref().err().map(|e| {
+                e.downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
+                    .unwrap_or_default()
+            });
+            let _ = tx.send(());
+            (
+                msg,
+                st.follower.cursor,
+                st.replay_stalled,
+                Arc::clone(&st.cnc),
+            )
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(10))
+            .expect("apply_cycle never returned");
+        let (msg, cursor, stalled, cnc) = h.join().unwrap();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let min_applied = sampler.join().unwrap();
+
+        assert_eq!(
+            crate::attach::slot(&cnc, 0).applied.load_acquire(),
+            b,
+            "applied is increase-only: still B after the cycle"
+        );
+        assert!(
+            min_applied >= b,
+            "applied dipped to {min_applied} below B={b} during the cycle"
+        );
+        assert_eq!(cursor, b, "the follower never rewinds below B");
+        assert_eq!(stalled, Some(b), "the stall is recorded AT B, not at 0");
+        let msg = msg.expect("no install capability: the forced gap pass fail-stops");
+        let want = format!("first available {}", b + 1);
+        assert!(
+            msg.contains("SnapshotRequired") && msg.contains(&want),
+            "the forced pass measured its gap from B={b} (wanted `{want}`): {msg}"
+        );
+    }
+
+    /// The same zero-walk shape (an empty journal, `first = 0`), on
+    /// `replay_into` directly: an unforced pass
+    /// that walks no frame and neither installs nor jumps returns the cursor
+    /// it was GIVEN (`resume`), never 0.
+    #[test]
+    fn a_zero_walk_pass_returns_its_resume_cursor() {
+        let dir = scratch();
+        let (st, pos, _head) = a_lapped_row(&dir, 0x2e41, true);
+        let b = pos[700];
+        st.sm.lock().unwrap().last = Some(pos[699]);
+        let mut trigger = None;
+        let out = crate::replay::replay_into::<CountSm>(
+            &st.sm,
+            &st.cnc,
+            &st.journal_dir,
+            None,
+            crate::replay::ReplayInstant {
+                trigger: &mut trigger,
+                node_flags: 0,
+                service_id: 0,
+                pin: None,
+                decided_to: b,
+                resume: b,
+            },
+            None,
+        );
+        assert!(
+            matches!(out, Ok(crate::replay::Replay::Rejoin(c)) if c == b),
+            "a pass that moved nothing reports `Rejoin(resume)`: {out:?}"
+        );
+        assert_eq!(st.sm.lock().unwrap().applies, 0);
+    }
+
+    /// A walked frame never LOWERS the cursor an install set. A forced pass
+    /// installs a covering artifact at P, then `scan_from(P)` still yields the
+    /// covering segment — here a stale one whose frames all end below P (the
+    /// journal's later segments are gone). Walking those used to overwrite
+    /// the cursor with their lower ends, the result floored at `resume`, and
+    /// the caller saw no progress and repeated the forced install every cycle.
+    #[test]
+    fn a_stale_segment_walked_after_an_install_does_not_lower_the_cursor() {
+        let dir = scratch();
+        let (st, pos, _head) = a_lapped_row(&dir, 0x2e42, false);
+        // Keep only the journal's FIRST segment file: it ends far below P.
+        let mut segs: Vec<_> = std::fs::read_dir(&st.journal_dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.is_file())
+            .collect();
+        segs.sort();
+        assert!(segs.len() > 2, "the fixture spans several segments");
+        for p in &segs[1..] {
+            std::fs::remove_file(p).unwrap();
+        }
+        let b = pos[100];
+        let p = pos[1300];
+        st.sm.lock().unwrap().last = Some(pos[99]);
+        let store = crate::snapshots::SnapshotStore::open(dir.path(), 0).unwrap();
+        store
+            .publish(p, 0, |w| w.write_all(b"snap").map_err(Into::into))
+            .unwrap();
+        let restore = super::SnapshotRestore::<CountSm> {
+            store,
+            install: Box::new(|sm, at, _r| {
+                sm.last = Some(at - FRAME);
+                Ok(at)
+            }),
+        };
+        let mut trigger = None;
+        let out = crate::replay::replay_into(
+            &st.sm,
+            &st.cnc,
+            &st.journal_dir,
+            Some(&restore),
+            crate::replay::ReplayInstant {
+                trigger: &mut trigger,
+                node_flags: 0,
+                service_id: 0,
+                pin: None,
+                decided_to: b,
+                resume: b,
+            },
+            Some(b),
+        );
+        assert!(
+            matches!(out, Ok(crate::replay::Replay::Rejoin(c)) if c == p),
+            "the pass rejoins at the install point P={p}: {out:?}"
+        );
+        assert_eq!(st.sm.lock().unwrap().applies, 0, "nothing below P applied");
     }
 
     /// Final review M1 (ruling R17): a FORCED pass (`gap_above`, plan B3 F1)
