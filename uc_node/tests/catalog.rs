@@ -1353,25 +1353,27 @@ fn a_stalled_set_stays_commanded_and_the_next_instant_completes() {
     c.stop();
 }
 
-/// Catalog spec §4.4 (ruling R21): `retain_sets = 2` keeps the two newest
-/// UNPINNED agreed sets plus every pinned origin, retires the oldest from the
-/// catalog AND from every node's disk, and a pinned origin is never counted
-/// and never retired; the journal floor follows the newest agreed set the
-/// node holds, not the oldest retained.
+/// Catalog spec §4.4 (ruling R21) as amended by pin completion (ruling C3,
+/// brief test 3): `retain_sets = 2` keeps the two newest agreed sets, a
+/// pinned origin is kept beside them only while its pin is INCOMPLETE, and
+/// once an agreed set above the pin record completes the pin, the origin is
+/// an ordinary set — retired from the catalog and from every node's disk by
+/// normal retention — while the journal floor follows the newest agreed set.
 ///
 /// Instants `p1`, `p2` (catalog `[p1, p2]`, journal purged past `p1`); a
-/// same-line pin naming `p2` as a row's origin; `p3` — the unpinned agreed
-/// sets are `[p1, p3]`, exactly `retain_sets`, so nothing retires and the
-/// catalog reads `[p1, p2, p3]` (the pin costs no retention slot); `p4` —
-/// the unpinned sets are `[p1, p3, p4]`, so the oldest, `p1`, retires from
-/// the catalog and every node's disk, the catalog reads `[p2, p3, p4]`, and
-/// `p3` SURVIVES on disk beside the pinned `p2`.
+/// same-line pin naming `p2` as row 0's origin, with every node's row already
+/// attached on that line; `p3` — above the pin record, so it COMPLETES the
+/// pin: the unpinned agreed sets are `[p1, p2, p3]`, so `p1` retires and the
+/// catalog reads `[p2, p3]`; `p4` — `p2` is no longer protected, retires
+/// from the catalog and from every node's disk, and the catalog reads
+/// `[p3, p4]`.
 ///
-/// Red twins: skip the settings apply (retention 1 drops `p1` at `p2`), skip
-/// the pin (`p2` leaves at `p4`), or count the pin toward `retain_sets` (as
-/// built before R21: `p1` leaves at `p3` and `p3` at `p4`).
+/// Red twins: drop the completion clause from `ClusterState::pinned_origins`
+/// (the catalog keeps `p2` forever — `[p1, p2, p3]` then `[p2, p3, p4]`, the
+/// pre-C3 R21 shape), or from the node's pruner keep (the catalog drops `p2`
+/// but every node keeps its files).
 #[test]
-fn retain_sets_2_retires_the_oldest_and_keeps_the_pinned_origin() {
+fn retain_sets_2_keeps_a_pinned_origin_only_until_the_pin_completes() {
     let _g = serialize();
     let mut c = spawn(2, 1, opts("catalog-retain", true), |_| true);
     start_sums(&mut c);
@@ -1413,7 +1415,7 @@ fn retain_sets_2_retires_the_oldest_and_keeps_the_pinned_origin() {
 
     // A same-line pin naming p2 as row 0's origin.
     let version = c.cnc(leader).service_slot(0).status.version();
-    pin(&c, leader, 0, version, p2);
+    let record = pin(&c, leader, 0, version, p2);
     await_until(30, "every node committed the pin", || {
         all.iter().all(|&i| {
             c.node(i)
@@ -1427,19 +1429,13 @@ fn retain_sets_2_retires_the_oldest_and_keeps_the_pinned_origin() {
 
     submit_frames(c.node(leader), 4000);
     let p3 = instant_until_complete(&c, leader, &all);
+    assert!(p3 > record, "p3={p3} sits above the pin record {record}");
     await_agreed(&c, &all, p3);
-    // Ruling R21: the pinned p2 is not counted, so the unpinned agreed sets
-    // are [p1, p3] — exactly retain_sets — and nothing retires.
-    await_until(30, "every node lists [p1, p2, p3]", || {
-        all.iter()
-            .all(|&i| positions(c.node(i)) == vec![p1, p2, p3])
+    // Ruling C3: p3 completes the pin, so p2 is an ordinary agreed set and
+    // the unpinned agreed sets are [p1, p2, p3] — one over retain_sets.
+    await_until(30, "every node lists [p2, p3]", || {
+        all.iter().all(|&i| positions(c.node(i)) == vec![p2, p3])
     });
-    for &i in &all {
-        assert!(
-            holds_on_disk(c.dir(i), &[0], p1),
-            "node {i}: p1 is still retained — the pin cost no retention slot"
-        );
-    }
 
     submit_frames(c.node(leader), 4000);
     let p4 = instant_until_complete(&c, leader, &all);
@@ -1448,26 +1444,21 @@ fn retain_sets_2_retires_the_oldest_and_keeps_the_pinned_origin() {
     await_until(30, "every node's floor reached p4", || {
         all.iter().all(|&i| floor(&c, i) == p4)
     });
-    // Ruling R21 (`ClusterState::retire`): a pinned origin is never counted
-    // toward `retain_sets` — with `[p1, p2 (pinned), p3, p4]` agreed and
-    // `retain_sets = 2`, the unpinned sets are [p1, p3, p4], so p1 (the
-    // oldest) retires and p2 and p3 both stay.
-    await_until(30, "every node retired p1's files", || {
-        all.iter().all(|&i| none_on_disk(c.dir(i), &[0], p1))
+    await_until(30, "every node lists [p3, p4]", || {
+        all.iter().all(|&i| positions(c.node(i)) == vec![p3, p4])
     });
+    await_until(
+        30,
+        "every node retired p1's and the completed origin p2's files",
+        || {
+            all.iter()
+                .all(|&i| none_on_disk(c.dir(i), &[0], p1) && none_on_disk(c.dir(i), &[0], p2))
+        },
+    );
     for &i in &all {
-        assert_eq!(
-            positions(c.node(i)),
-            vec![p2, p3, p4],
-            "node {i}: p1 retires; the pinned p2 is kept beside two retained sets"
-        );
-        assert!(
-            holds_on_disk(c.dir(i), &[0], p2),
-            "node {i}: the pinned origin's set must survive on disk"
-        );
         assert!(
             holds_on_disk(c.dir(i), &[0], p3),
-            "node {i}: p3 is retained (the pin does not take its slot) and survives on disk"
+            "node {i}: p3 is retained and survives on disk"
         );
         assert!(
             holds_on_disk(c.dir(i), &[0], p4),
@@ -1480,8 +1471,7 @@ fn retain_sets_2_retires_the_oldest_and_keeps_the_pinned_origin() {
         assert!(
             b > p3 && b <= p4,
             "node {i}: the journal follows the newest agreed set p4 (first_base={b}, \
-             p3={p3}, p4={p4}) — a same-line pin is consumed by the attached row, so it \
-             holds artifacts, not journal"
+             p3={p3}, p4={p4}) — the floor passed the completed pin's origin"
         );
     }
 
