@@ -2048,11 +2048,17 @@ def main():
                                  f"put run artifacts on real disk")
             out_dir.mkdir(parents=True, exist_ok=True)
             members = ",".join(f"{i}@{addr[i]}" for i in range(3))
-            log(f"sweep: readers={sweep} x "
-                f"{'arms=' + str(list(RS_ARMS)) + ' x reps=' + str(args.rp_reps) if args.rp_spread else 'modes=' + str(list(RP_MODES))}"
-                f" x writes/s="
-                f"{[0, args.rp_write_rate] if args.rp_write_rate else [0]}, "
-                f"{args.rp_secs}s per rung, fresh cluster per rung")
+            if args.rp_matrix:
+                arms = [f"{m}/{p}" for m, p in RM_ARMS]
+                log(f"sweep: readers={sweep[-1]} x arms={arms} x reps={args.rp_reps} x "
+                    f"writes/s={[int(x) for x in args.rp_write_rates.split(',') if x.strip()]}, "
+                    f"{args.rp_secs}s per rung, fresh cluster per rung")
+            else:
+                log(f"sweep: readers={sweep} x "
+                    f"{'arms=' + str(list(RS_ARMS)) + ' x reps=' + str(args.rp_reps) if args.rp_spread else 'modes=' + str(list(RP_MODES))}"
+                    f" x writes/s="
+                    f"{[0, args.rp_write_rate] if args.rp_write_rate else [0]}, "
+                    f"{args.rp_secs}s per rung, fresh cluster per rung")
             log("*** INSTRUMENT, not a gate: an unfavourable verdict still exits 0 ***")
             if args.local:
                 log("*** LOCAL: orchestration proof only — these numbers are NOT data "
@@ -2097,12 +2103,22 @@ def main():
     for name, v_ok, detail in verdicts:
         log(f"  [{'PASS' if v_ok else 'FAIL'}] {name} — {detail}")
     if args.read_profile:
-        # The VERDICT is printed above by `read_profile decide`; this line is
-        # only about whether the instrument ran. Exit 1 means the measurement
-        # is not trustworthy (a read regression, or client failures on more
-        # than one rung) — never "the rule declined to justify Rung A".
-        log(f"RESULT: run {'OK' if ok else 'FAILED (harness)'} — the verdict is the "
-            f"`decide` block above, and does not affect this exit code")
+        # This line is only about whether the instrument ran. Exit 1 means the
+        # measurement is not trustworthy (a read regression, or client failures
+        # on more than one rung) — never "the rule declined to justify Rung A".
+        # Where the verdict is depends on the mode: the ladder shells out to
+        # `read_profile decide`, the spread run judges its own bar into the
+        # results list, and the matrix judges nothing (its bars are applied by
+        # hand to matrix-rungs.jsonl).
+        if args.rp_matrix:
+            where = ("NO automated verdict in matrix mode: judge the pre-committed bars "
+                     "from matrix-rungs.jsonl")
+        elif args.rp_spread:
+            where = "the verdict is the `verdict(write_rate=…)` lines above"
+        else:
+            where = "the verdict is the `decide` block above"
+        log(f"RESULT: run {'OK' if ok else 'FAILED (harness)'} — {where}, and it does not "
+            f"affect this exit code")
     else:
         log(f"RESULT: {'PASS' if ok else 'FAIL (honest)'}")
     sys.exit(0 if ok else 1)
