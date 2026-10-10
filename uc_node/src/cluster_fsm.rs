@@ -764,6 +764,8 @@ impl ClusterFsm {
                 ClusterCommand::SnapshotReport(decode_snapshot_report(payload)?)
             }
             ClusterKind::RowGenesis => ClusterCommand::RowGenesis(decode_row_genesis(payload)?),
+            // Task 5 wires the FSM; until then kind 7 is undecodable (verdict 42).
+            ClusterKind::BackupWatermark => return None,
         })
     }
 

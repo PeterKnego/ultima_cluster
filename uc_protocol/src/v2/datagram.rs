@@ -495,6 +495,10 @@ pub const DGRAM_KIND_PROBE_ACK: u8 = 25;
 /// probe pair (a hash is a hash regardless of who is leading), so a receiver
 /// admits it before the stale-term drop. `Scope::Pairwise`.
 pub const DGRAM_KIND_SNAP_REPORT: u8 = 26;
+/// Backup tier (spec §3a): a node reports a tier's watermark live; body =
+/// `crate::v2::backup`'s 40-byte report body. Term-independent like
+/// `SNAP_REPORT`. `Scope::Pairwise`.
+pub const DGRAM_KIND_BACKUP_REPORT: u8 = 27;
 
 /// The fixed prefix of a `PROBE` body: the rung, `u32 LE`. Everything after it
 /// is padding and carries nothing.
@@ -1581,6 +1585,11 @@ mod tests {
     /// Snapshot-lifecycle spec §7.1: the body grows to 32 B with the
     /// artifact's byte size at @24. A 24-byte body (the unreleased draft of
     /// 0.11.0) is refused by length, like any mixed flag day.
+    #[test]
+    fn backup_report_kind_is_27_and_pairwise_docs_hold() {
+        assert_eq!(DGRAM_KIND_BACKUP_REPORT, 27);
+    }
+
     #[test]
     fn snap_report_body_is_32_bytes_and_carries_the_artifact_size() {
         assert_eq!(SNAP_REPORT_BODY_LEN, 32);

@@ -247,6 +247,27 @@ pub fn uc_protocol_datagram() -> Vec<Seed> {
         seeds.push(Seed::fixed("22-snap-report", datagram(DGRAM_KIND_SNAP_REPORT, 0, 3, &b)));
     }
 
+    // Backup tier spec §3a: the 40-byte BACKUP_REPORT body.
+    {
+        use uc_protocol::v2::backup::{
+            BACKUP_REPORT_BODY_LEN, BackupWatermark, WatermarkOp, write_backup_report_body,
+        };
+        use uc_protocol::v2::datagram::DGRAM_KIND_BACKUP_REPORT;
+        let mut b = [0u8; BACKUP_REPORT_BODY_LEN];
+        write_backup_report_body(
+            &mut b,
+            &BackupWatermark {
+                op: WatermarkOp::Report,
+                tier_id: 1,
+                oldest_set: 65536,
+                newest_set: 131072,
+                through: 196608,
+                reporter: 2,
+            },
+        );
+        seeds.push(Seed::fixed("23-backup-report", datagram(DGRAM_KIND_BACKUP_REPORT, 0, 3, &b)));
+    }
+
     seeds
 }
 
@@ -1419,6 +1440,18 @@ pub fn uc_protocol_cluster_frame() -> Vec<Seed> {
     encode_settings(&Settings::genesis_default(), &mut settings_bytes);
 
     // #33: kind 6, a row's genesis running version (row 0 at 1.2.0).
+    let mut backup_bytes = Vec::new();
+    uc_protocol::v2::backup::encode_backup_watermark(
+        &uc_protocol::v2::backup::BackupWatermark {
+            op: uc_protocol::v2::backup::WatermarkOp::Report,
+            tier_id: 1,
+            oldest_set: 65536,
+            newest_set: 131072,
+            through: 196608,
+            reporter: 2,
+        },
+        &mut backup_bytes,
+    );
     let mut genesis_bytes = Vec::new();
     encode_row_genesis(
         &RowGenesis { row: 0, version: uc_protocol::identity::pack_version(1, 2, 0) },
@@ -1457,6 +1490,7 @@ pub fn uc_protocol_cluster_frame() -> Vec<Seed> {
         Seed::fixed("04-short", vec![0u8; 4]),
         Seed::fixed("05-unknown-kind", unknown_kind),
         Seed::fixed("06-reserved-nonzero", reserved_nonzero),
+        Seed::fixed("11-backup-watermark", prefixed(ClusterKind::BackupWatermark, &backup_bytes)),
         Seed::fixed("07-row-genesis", prefixed(ClusterKind::RowGenesis, &genesis_bytes)),
         Seed::fixed("08-snapshot-report-sized", prefixed(ClusterKind::SnapshotReport, &report_bytes)),
         Seed::fixed("09-snapshot-report-unsized", prefixed(ClusterKind::SnapshotReport, &report_unsized)),

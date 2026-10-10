@@ -84,6 +84,7 @@ The header is authenticated as AAD when wire crypto is enabled, and carries a
 | 24 | `PROBE` | pairwise (`0.8.0`, `2.12.0` — jumbo-frame MTU discovery) |
 | 25 | `PROBE_ACK` | pairwise (`0.8.0`, `2.12.0` — jumbo-frame MTU discovery) |
 | 26 | `SNAP_REPORT` | pairwise (0.9.0, 2.13.0 — live snapshot-hash reports) |
+| 27 | `BACKUP_REPORT` | pairwise (0.11.0, unreleased — backup-tier watermark reports; term-independent) |
 
 Kind **21** was `SNAP_TABLE` — the schedule table carried beside a session —
 and is **retired** (`DGRAM_KIND_SNAP_TABLE_RETIRED`). The table now rides the
@@ -257,6 +258,21 @@ rather than through the term-adopting consensus-kind path (kinds 5–11).
 the `CLUSTER kind = 5 SnapshotReport` payload (below) share: `row < 8 ||
 row == 255`.
 
+#### `BACKUP_REPORT` body (wire 0.11.0, backup tier)
+
+A node reports a backup tier's watermark, live, addressed to the leader
+(term-independent, pairwise). 40 bytes, exact-length; `CLUSTER kind = 7`
+carries the same five fields in a 48-byte payload (below). Valid iff
+`tier_id != 0` and `oldest_set <= newest_set <= through`.
+
+| bytes | field | width | meaning |
+|---|---|---|---|
+| 0..8 | `tier_id` | u64 | the registered tier (non-zero) |
+| 8..16 | `oldest_set` | u64 | position `P` of the oldest complete set in the tier |
+| 16..24 | `newest_set` | u64 | position `P` of the newest complete set |
+| 24..32 | `through` | u64 | journal position the tier's chunks cover through |
+| 32..40 | `reporter` | u64 | the reporting node's id |
+
 ### Administration
 
 | Kind | Name | Scope |
@@ -348,7 +364,7 @@ so the frame type is the only router there is. One type, one kind byte:
 
 | bytes | field | meaning |
 |---|---|---|
-| 0 | `kind` | `1` = Membership, `2` = ScheduleTable, `3` = Settings, `4` = UpgradePin, `5` = SnapshotReport, `6` = RowGenesis (0.10.0); `7` is **reserved** for project 3's backup watermark (catalog spec §7/§12) — not yet a `ClusterKind` variant, so it is refused today exactly like any other unassigned value; any other value is undecodable |
+| 0 | `kind` | `1` = Membership, `2` = ScheduleTable, `3` = Settings, `4` = UpgradePin, `5` = SnapshotReport, `6` = RowGenesis (0.10.0); `7` = BackupWatermark (0.11.0, backup tier); any other value is undecodable |
 | 1..8 | reserved | written as zero, and a **non-zero** reserved byte makes the body undecodable — the bytes are claimable by a later kind without ambiguity |
 | 8.. | `payload` | the kind's own encoding |
 
@@ -364,6 +380,7 @@ otherwise the kind plus the payload slice. Per kind:
 | `4` UpgradePin | **20 B** exactly: `row u8 @0 ‖ reserved [u8; 3] @1 ‖ from u32 @4 ‖ to u32 @8 ‖ origin u64 @12`. `row < 8`, `origin > 0`, reserved zero. An EVENT ("at `origin`, `row` went `from` → `to`"), kept as a per-row history of at most 4 in the cluster FSM and republished into the row's cnc status line (`+16`/`+24`) | `uc_protocol::v2::upgrade` |
 | `5` SnapshotReport | `row u8 @0 ‖ count u8 @1 ‖ reserved [u8; 6] @2 ‖ position u64 @8 ‖ count × (node_id u32 ‖ hash u64 ‖ size u64)`, `1 ≤ count ≤ 8` → **36–176 B** (`0.11.0`, the snapshot lifecycle: 20-byte entries; a pre-lifecycle record has 12-byte entries, 28–112 B, and is still decoded, every size `0` — the decoder infers the width from the length), node ids strictly increasing. The leader's collected per-node artifact hashes for `(row, position)`; the verdict (all equal / majority names minority / no majority) is recomputed by every reader, never carried | `uc_protocol::v2::upgrade` |
 | `6` RowGenesis (0.10.0, #33) | **8 B** exactly (`ROW_GENESIS_LEN`): `row u8 @0 ‖ reserved [u8; 3] @1 ‖ version u32 @4`. `row < 8`, reserved zero; `version` is a packed version and `0` is a legal value (an unversioned FSM). A recorded FACT, not an operator's change: the leader appends it on its own, once per row, naming the version of its own attached service when the row has no running version yet. Applied at commit, it sets the row's running version; refused `60 version_already_set` if the row already has one. An accepted `UpgradePin` (kind 4) sets the running version too, to its `to`, and is refused `53` when its `from` is not on the running line (same major.minor) | `uc_protocol::v2::upgrade` (`encode_row_genesis`/`decode_row_genesis`) |
+| `7` BackupWatermark (0.11.0, backup tier) | **48 B** exactly (`BACKUP_WATERMARK_LEN`): `op u8 @0 (0 Report, 1 Forget) ‖ reserved [u8; 7] @1 ‖ tier_id ‖ oldest_set ‖ newest_set ‖ through ‖ reporter` (five `u64 LE` @8..48). `tier_id != 0`; a Report needs `oldest_set <= newest_set <= through`; reserved zero. At most `MAX_BACKUP_TIERS = 4` tiers | `uc_protocol::v2::backup` (`encode_backup_watermark`/`decode_backup_watermark`) |
 
 The largest of the six is still the table at 1064 B, inside the 1312 B
 crypto-on ceiling at the 1408 B baseline rung — the floor the ceiling only
