@@ -619,6 +619,17 @@ fn metric(node: &Node, name: &str) -> u64 {
         .unwrap_or_else(|e| panic!("{name}: {e}"))
 }
 
+/// A failure dump's metric read: the sample whose line starts with `prefix`
+/// (`name ` or `name{labels} `), or `"absent"` — never a panic, so a dump
+/// cannot replace the failure it is explaining with one of its own.
+fn metric_or_absent(node: &Node, prefix: &str) -> String {
+    let text = uc_node::obs::metrics::render_prometheus(&node.observability());
+    text.lines()
+        .find_map(|l| l.strip_prefix(prefix))
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map_or_else(|| "absent".to_owned(), |v| v.to_string())
+}
+
 fn floor(c: &Cluster, i: usize) -> u64 {
     c.cnc(i).snapshots().node_snapshot_floor.load_acquire()
 }
@@ -662,10 +673,9 @@ fn dump_lifecycle(c: &Cluster, p: u64) -> String {
             .map(|o| {
                 format!(
                     "{o}={}",
-                    metric_labeled(
+                    metric_or_absent(
                         n,
-                        "uc2_snapshot_auto_fetch_total",
-                        &format!("outcome=\"{o}\"")
+                        &format!("uc2_snapshot_auto_fetch_total{{outcome=\"{o}\"}} ")
                     )
                 )
             })
@@ -683,7 +693,7 @@ fn dump_lifecycle(c: &Cluster, p: u64) -> String {
             floor(c, i),
             n.archive_first_base(),
             agreed_position(n),
-            metric(n, "uc2_snapshot_newest_agreed_bytes"),
+            metric_or_absent(n, "uc2_snapshot_newest_agreed_bytes "),
             k.commit.load_acquire(),
             k.durable.load_acquire(),
             slot.applied.load_acquire(),
@@ -707,10 +717,13 @@ fn await_or_dump(c: &Cluster, p: u64, secs: u64, msg: &str, mut f: impl FnMut() 
     }
 }
 
-/// [`await_capable`] over the nodes in `idxs` only.
+/// [`await_capable`] over the nodes in `idxs` only, with the per-node dump
+/// on failure.
 fn await_capable_on(c: &Cluster, idxs: &[usize], rows: &[usize]) {
     let pages: Vec<Arc<CncPage>> = idxs.iter().map(|&i| c.cnc(i)).collect();
-    await_until(
+    await_or_dump(
+        c,
+        0,
         30,
         "the named nodes' rows published the capability bit",
         || {
@@ -2001,6 +2014,10 @@ fn learner_only_voters_auto_fetch_the_agreed_set_and_purge_below_it() {
             &format!("voter {v} counted its fetch ok"),
             || metric_labeled(c.node(v), "uc2_snapshot_auto_fetch_total", "outcome=\"ok\"") >= 1,
         );
+        // Causally safe to read once: `audit_auto_fetch` writes (and fsyncs)
+        // this record on the consensus agent right after the fetch is ISSUED,
+        // and the fetch has since landed (set >= p, awaited above) — so the
+        // record was on disk before anything this test waited on happened.
         let audit = std::fs::read_to_string(c.dir(v).join("audit.jsonl")).unwrap_or_default();
         assert!(
             audit.lines().any(|l| l.contains("\"actor\":\"auto\"")
@@ -2097,8 +2114,13 @@ fn a_restarted_in_memory_service_starts_from_the_local_set() {
 /// Auto-fetch is off so the quiet voter's disk does not change under the
 /// test.
 ///
-/// Red twin: remove the 61 block in `apply_upgrade_pin` — the first pin is
-/// accepted, `(0, 0) != (1, 61)`.
+/// The window opens only when the leader completes the set (door rule 54)
+/// and its length is not ours to choose, so the premise is a bounded retry
+/// (ruling R10): an attempt that misses the window commands a fresh instant,
+/// up to three, and the test fails by name only when all three miss.
+///
+/// Red twin: remove the 61 block in `apply_upgrade_pin` — the first pin on
+/// the not-yet-agreed origin is accepted: "answered (0, 0), expected (1, 61)".
 #[test]
 fn a_pin_on_a_not_yet_agreed_origin_is_refused_61_then_accepted() {
     let _g = serialize();
@@ -2133,45 +2155,81 @@ fn a_pin_on_a_not_yet_agreed_origin_is_refused_61_then_accepted() {
         "p1 is listed agreed — the catalog is not Empty"
     );
 
-    submit_frames(c.node(leader), 2000);
-    let p2 = command_instant(c.node(leader));
-    await_or_dump(&c, p2, 30, "the leader completed the set at p2", || {
-        c.node(leader).snapshot_set_position() == p2
-    });
-    assert_ne!(
-        agreed_position(c.node(leader)),
-        p2,
-        "the premise: p2 must not be agreed yet (the quiet voter has not reported, and the \
-         report timeout has not run out)\n{}",
-        dump_lifecycle(&c, p2)
-    );
+    // The 61 window opens when the LEADER completes the set (door rule 54
+    // demands the origin be its newest complete set) and closes when the
+    // leader appends the row-0 record at the 5 s report timeout. Milliseconds
+    // of it are used locally; a slow runner may use more, so the premise is
+    // a bounded retry (`instant_until_complete`'s shape): an instant already
+    // agreed when the leader completes it, or a pin that lands after the
+    // window closed, is reported and a fresh instant tried, up to ATTEMPTS.
+    const ATTEMPTS: usize = 3;
     let version = c.cnc(leader).service_slot(0).status.version();
-    let (status, reason, _) = admin_staged(
-        c.dir(leader),
-        &c.cnc(leader),
-        uc_node::UPGRADE_PENDING_FILE,
-        ADMIN_OP_UPGRADE_PIN,
-        &pin_bytes(0, version, p2),
-    );
-    assert_eq!(
-        (status, reason),
-        (1, uc_node::REASON_PIN_ORIGIN_NOT_AGREED),
-        "complete on the leader, not yet agreed (the quiet voter has not reported)\n{}",
-        dump_lifecycle(&c, p2)
-    );
+    let mut refused_at = None;
+    for attempt in 1..=ATTEMPTS {
+        submit_frames(c.node(leader), 2000);
+        let commanded = Instant::now();
+        let p = command_instant(c.node(leader));
+        await_or_dump(&c, p, 30, "the leader completed the set at p", || {
+            c.node(leader).snapshot_set_position() == p
+        });
+        if agreed_position(c.node(leader)) == p {
+            eprintln!(
+                "attempt {attempt}/{ATTEMPTS}: {p} was already agreed when the leader completed \
+                 it ({:?} after the command) — the 61 window closed first",
+                commanded.elapsed()
+            );
+            continue;
+        }
+        let (status, reason, _) = admin_staged(
+            c.dir(leader),
+            &c.cnc(leader),
+            uc_node::UPGRADE_PENDING_FILE,
+            ADMIN_OP_UPGRADE_PIN,
+            &pin_bytes(0, version, p),
+        );
+        let elapsed = commanded.elapsed();
+        match (status, reason) {
+            (1, uc_node::REASON_PIN_ORIGIN_NOT_AGREED) => {
+                eprintln!(
+                    "attempt {attempt}/{ATTEMPTS}: pin on {p} refused 61, {elapsed:?} after the \
+                     command (window: the 5 s report timeout)"
+                );
+                refused_at = Some(p);
+                break;
+            }
+            (0, 0) if agreed_position(c.node(leader)) == p => {
+                eprintln!(
+                    "attempt {attempt}/{ATTEMPTS}: pin on {p} landed after the window closed \
+                     ({elapsed:?} after the command; the origin is agreed, so it was accepted)"
+                );
+            }
+            other => panic!(
+                "attempt {attempt}: pin on the not-yet-agreed {p} answered {other:?}, expected \
+                 (1, 61)\n{}",
+                dump_lifecycle(&c, p)
+            ),
+        }
+    }
+    let p2 = refused_at.unwrap_or_else(|| {
+        panic!(
+            "no attempt of {ATTEMPTS} reached the door inside the 61 window\n{}",
+            dump_lifecycle(&c, 0)
+        )
+    });
     assert!(
-        c.node(leader)
+        !c.node(leader)
             .cluster_view()
             .snapshot_inner()
             .pins
-            .is_empty(),
+            .iter()
+            .any(|pin| pin.origin == p2),
         "a refused pin commits nothing"
     );
 
     await_agreed(&c, &attached, p2);
     let at = pin(&c, leader, 0, version, p2);
     assert!(at > p2, "the pin was appended once the origin agreed");
-    await_until(30, "every attached node committed the pin", || {
+    await_or_dump(&c, p2, 30, "every attached node committed the pin", || {
         attached.iter().all(|&i| {
             c.node(i)
                 .cluster_view()
@@ -2202,13 +2260,19 @@ fn a_node_without_room_skips_the_fetch_names_it_and_reports_the_size() {
     let starved = *c.voters().iter().find(|&&i| i != leader).unwrap();
     let starved_id = c.nodes[starved].id;
     c.node(starved).set_free_bytes_for_test(1);
-    await_until(30, "the starved voter's probe reads the override", || {
-        c.node(starved)
-            .soft_table()
-            .by_node
-            .get(&starved_id)
-            .is_some_and(|e| e.holdings.free_bytes == 1)
-    });
+    await_or_dump(
+        &c,
+        0,
+        30,
+        "the starved voter's probe reads the override",
+        || {
+            c.node(starved)
+                .soft_table()
+                .by_node
+                .get(&starved_id)
+                .is_some_and(|e| e.holdings.free_bytes == 1)
+        },
+    );
     await_capable(&c, &[0]);
     submit_frames(c.node(leader), 3000);
     let p = command_standby_instant(c.node(leader));
