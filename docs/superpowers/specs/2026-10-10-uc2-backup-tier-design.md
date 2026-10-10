@@ -153,18 +153,21 @@ without `SET` is not a set.
 ### 4.4 The `BackupTarget` trait
 
 ```rust
-pub trait BackupTarget: Send {
-    /// Write `src` (exactly `len` bytes) at `path` iff absent: under .tmp/, fsync, rename,
-    /// fsync the directory. Present already → `Exists` (caller compares).
-    fn put_if_absent(&self, path: &TierPath, src: &mut dyn Read, len: u64) -> io::Result<Put>;
-    fn list(&self, dir: &TierPath) -> io::Result<Vec<String>>;
-    fn open(&self, path: &TierPath) -> io::Result<Box<dyn Read + Send>>;
-    fn delete(&self, path: &TierPath) -> io::Result<()>;   // absent → Ok
+pub trait BackupTarget: Send + Sync {
+    /// Create `path` iff absent: the callback writes a .tmp/ file; the target
+    /// fsyncs it, links it into place (refusing an existing name), fsyncs the
+    /// directory. Present already → `Exists` (the caller compares).
+    fn put_if_absent(&self, path: &str, write: &mut dyn FnMut(&mut File) -> Result<u64, TierError>) -> Result<Put, TierError>;
+    fn list(&self, dir: &str) -> Result<Vec<String>, TierError>;
+    fn open(&self, path: &str) -> Result<Option<File>, TierError>;
+    fn delete(&self, path: &str) -> Result<(), TierError>;   // absent → Ok
+    fn delete_dir_if_empty(&self, dir: &str) -> Result<(), TierError>;
 }
 ```
 
 `FsTarget` is the one implementation. Rename-into-place is the atomicity
-primitive; a crash leaves only `.tmp/` entries, which a writer removes when
+primitive (a hard link then unlink of the temporary name, so an existing
+final name is never replaced — POSIX `rename` would replace it); a crash leaves only `.tmp/` entries, which a writer removes when
 it starts (only entries older than one hour, so a concurrent writer's
 in-flight file is not taken from under it).
 
