@@ -139,6 +139,13 @@ pub(crate) const fn version_is_patch_only(v: u32) -> bool {
     v != 0 && v < 1 << 16
 }
 
+/// Pin completion ruling C2/C8: did a PINNED row's view move between the
+/// attach's decision and its start-set read? `reread` is called only for a
+/// pinned view, so an unpinned attach never re-reads and never refuses here.
+fn pinned_view_moved(view: &RowRead, reread: impl FnOnce() -> RowRead) -> bool {
+    matches!(view, RowRead::View { pin: Some(_), .. }) && reread() != *view
+}
+
 /// Run the 6-step attach. Steps 1–5 here; step 6 (spawn the threads) is the
 /// builder's job, after this returns.
 ///
@@ -300,21 +307,24 @@ pub(crate) fn attach<S: RawStateMachine>(
         (None, _) => {}
     }
     // Pin completion ruling C2: read the node's start set ONCE, then re-read
-    // the row view and require it unchanged. The view (seqlock, cluster
-    // agent) and the start-set pair (zero-first, consensus agent) are two
-    // publications by two writers; the re-read makes the pair this attach
-    // judges belong to the view it decided on — a pin that moved between the
-    // two reads is refused as contended (transient: retry), never mixed. A
-    // stale pair under an unchanged view is harmless either way: the node
-    // offers a pinned row only completion sets, and `start_set_permitted`
-    // takes one only strictly above this view's pin record.
+    // the row view and require it unchanged — for a PINNED row only (ruling
+    // C8: an unpinned attach gets no new refusal; it decides "no pin" as it
+    // always did, and a pin committed after that is the apply loop's exact
+    // stop). The view (seqlock, cluster agent) and the start-set pair
+    // (zero-first, consensus agent) are two publications by two writers;
+    // the re-read makes the pair this attach judges belong to the view it
+    // decided on — a pin that moved between the two reads is refused as
+    // contended (transient: retry), never mixed. A stale pair under an
+    // unchanged view is harmless either way: the node offers a pinned row
+    // only completion sets, and `start_set_permitted` takes one only
+    // strictly above this view's pin record.
     let start_set = s.snapshot_pos.start_set();
     let view = RowRead::View {
         pin,
         running,
         record_pos: attach_record_pos,
     };
-    if s.status.row_view() != view {
+    if pinned_view_moved(&view, || s.status.row_view()) {
         return Err(ServiceError::PinUnreadable { row });
     }
     let take_start_set = install.is_some()
@@ -325,8 +335,10 @@ pub(crate) fn attach<S: RawStateMachine>(
     // REPLACES the origin install. `None` back from the install means the
     // set did not move this state machine forward — already at or past a set
     // on this binary's line (a durable state machine whose cursor is above
-    // the pin record was computed by `to`'s line: `from` stops at the
-    // record, #33) — or the set could not be used (another line, an
+    // the pin record was computed by `to`'s line: for a cross-line pin
+    // `from` stops at the record, #33; for a `--patch` pin the old build is
+    // on the same line, which the line contract makes interchangeable) — or
+    // the set could not be used (another line, an
     // unreadable artifact), in which case the pinned install below runs
     // exactly as before.
     let mut pinned_install = pin.is_some();
@@ -916,5 +928,33 @@ mod tests {
             pinned_attach_installs(Some(set), &[set], Some(9000)),
             Vec::<u64>::new()
         );
+    }
+
+    /// Ruling C8 (review m3): the view re-read runs only for a pinned row —
+    /// an unpinned attach never re-reads, so it gets no new refusal.
+    #[test]
+    fn only_a_pinned_view_is_re_read() {
+        use uc_log::cnc::RowRead;
+        let unpinned = RowRead::View {
+            pin: None,
+            running: Some(1),
+            record_pos: 64,
+        };
+        assert!(!super::pinned_view_moved(&unpinned, || panic!(
+            "an unpinned view must not be re-read"
+        )));
+        let pinned = RowRead::View {
+            pin: Some((4096, 1, 2)),
+            running: Some(2),
+            record_pos: 4608,
+        };
+        assert!(!super::pinned_view_moved(&pinned, || pinned));
+        assert!(super::pinned_view_moved(&pinned, || RowRead::Contended));
+        let newer = RowRead::View {
+            pin: Some((8192, 2, 3)),
+            running: Some(3),
+            record_pos: 9000,
+        };
+        assert!(super::pinned_view_moved(&pinned, || newer));
     }
 }
