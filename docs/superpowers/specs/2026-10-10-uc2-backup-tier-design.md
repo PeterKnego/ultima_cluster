@@ -171,8 +171,16 @@ agreed hashes; on match copy each artifact with `put_if_absent`, then write
 `SET`. A local mismatch is not copied (`backup_set_hash_mismatch`, once per
 set) — the node holds a diverged copy, and another writer or a later fetch
 will supply the agreed one. Sets awaiting agreement wait; diverged sets are
-never copied. An `Exists` answer is compared by length and hash and is a
-silent success when equal, `tier_overlap_mismatch` when not.
+never copied. An `Exists` answer is compared by **envelope position and
+payload hash** (`artifact_hash_of`, which covers the payload only) and is a
+silent success when both match, `tier_overlap_mismatch` when not. Byte
+equality is deliberately not required: every member that took the instant
+builds its own copy of the set at P, and agreeing copies have identical
+payloads, but their `ULTSNAP2` envelopes may carry different patch versions
+of the same line (the lifecycle's start rule admits `same_line`, errata P3).
+So whichever writer finishes first supplies the tier's one copy per P, any
+agreeing copy is as good as any other, and `SET` records the version the
+catalog lists for the row, not the envelope's.
 
 ### 5.3 Journal
 
