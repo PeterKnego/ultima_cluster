@@ -477,6 +477,15 @@ impl AutoFetchAuditWriter {
     }
 }
 
+/// Review N1 / ruling R19: shutdown drops the writer (the holdings thread
+/// exits and drops its closure); whatever is still queued is written and
+/// fsynced (`AuditLog::record` syncs each line) rather than lost uncounted.
+impl Drop for AutoFetchAuditWriter {
+    fn drop(&mut self) {
+        self.drain();
+    }
+}
+
 /// The record's fields, in the one order both the file line and the obs
 /// mirror use. `addr` is `null` when the op carries no address.
 fn fields<'a>(r: &'a AuditRecord<'a>, addr: Option<&'a str>) -> [Field<'a>; 13] {
@@ -805,5 +814,26 @@ mod tests {
             text.ends_with(",\"detail\":null,\"source\":\"auto\"}\n"),
             "{text}"
         );
+    }
+
+    /// Review N1 / ruling R19: records queued when the writer goes away
+    /// (shutdown) are drained and fsynced, not dropped uncounted.
+    #[test]
+    fn records_queued_just_before_shutdown_reach_the_audit_file() {
+        let dir = tempdir();
+        let log = AuditLog::open(dir.path()).unwrap();
+        let path = log.path().to_path_buf();
+        let (q, w) = auto_fetch_audit_channel(log, 1);
+        for i in 0..3u64 {
+            assert!(q.push(AutoFetchAudit {
+                ts_ns: 100 + i,
+                from: 2,
+                position: 4096 * (i + 1),
+            }));
+        }
+        drop(w); // the shutdown: no drain was ever called
+        let text = std::fs::read_to_string(path).unwrap();
+        assert_eq!(text.lines().count(), 3, "{text}");
+        assert!(text.contains(r#""actor":"auto""#), "{text}");
     }
 }
