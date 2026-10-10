@@ -82,4 +82,89 @@ fix's cost was layout, not a callee falling out of line.
 
 ## 5. Results
 
-_Not yet run._
+Run 2026-10-10, 22:01–23:50 UTC, 3 × `c6id.2xlarge`, us-east-1, placement
+group. Fleet destroyed after the run; teardown verified by `terraform state
+list` returning 0 entries and an EC2 `describe_instances` showing no
+non-terminated instances.
+
+| row | measured | bar | verdict |
+|---|---|---|---|
+| a, N=1 | +0.117 % (worst sem 0.186 %, resolution 0.016 %) | not `outside resolution` negative | **INCONCLUSIVE** (noisy run) |
+| a, N=2 | +2.953 % (base arm sem 3.209 %: one 10.9M outlier run) | same | **INCONCLUSIVE** (noisy run) |
+| b | fix ÷ base 3.81–5.62 on every arm | ≥ 2.0 every arm | **PASS** |
+| c | spread arms 1.02 · 1.11 | ≥ 0.90 spread arms | **PASS** |
+
+### 5.1 Row a — write-path cost
+
+`scripts/apply_ab.sh 93a46cf3 c1410182 --pairs 8` on node2, run from a git
+bundle of this branch, before any cluster ran on the fleet; each arm built in
+its own git worktree and target dir. `min_rate` applied frames/s:
+
+| N | A base | B head | B′ head again | head vs base | resolution | worst sem |
+|---|---:|---:|---:|---:|---:|---:|
+| 1 | 14,765,618 | 14,782,918 | 14,780,594 | +0.117 % | 0.016 % | 0.186 % |
+| 2 | 14,087,043 | 14,503,079 | 14,501,165 | +2.953 % | 0.013 % | 3.209 % |
+
+`pace_stalls` was non-zero on every arm, so neither run is driver-bound.
+Both verdicts are `inconclusive (noisy run)`, which §2 says is reported as
+inconclusive, not as a pass. Description, not verdict: neither N shows a
+negative delta, and the −1.23 % the inlined variant read on the dev box (§4)
+did not appear for the out-of-line variant. More pairs would not settle it: a
+`within resolution` verdict needs arm sem below a ~0.015 % rebuild
+resolution, hundreds of pairs on this rig (the standing bar question in
+CLAUDE.md "Next up").
+
+### 5.2 Rows b and c — reads/s, mean of 2 reps
+
+| writes/s | arm | base | fix | fix ÷ base |
+|---:|---|---:|---:|---:|
+| 0 | lin/leader | 568,292 | 2,164,410 | **3.81** |
+| 0 | snap/leader | 574,814 | 3,126,619 | **5.44** |
+| 0 | ryw/leader | 607,077 | 3,157,766 | **5.20** |
+| 0 | snap/spread | 1,749,369 | 9,776,610 | **5.59** |
+| 0 | ryw/spread | 1,699,800 | 9,547,957 | **5.62** |
+| 20k | lin/leader | 2,109,217 | 1,872,292 | 0.89 |
+| 20k | snap/leader | 3,164,324 | 2,547,617 | 0.81 |
+| 20k | ryw/leader | 2,518,283 | 2,384,354 | 0.95 |
+| 20k | snap/spread | 8,937,256 | 9,093,314 | **1.02** |
+| 20k | ryw/spread | 8,591,082 | 9,515,825 | **1.11** |
+
+All 40 rungs valid (20 per tree), 0 retries on every host, every write target
+reached (19,999–20,000 writes/s). At 0 writes worst-host p99 fell from
+1.94–1.99 ms to 0.41–0.61 ms on every arm.
+
+- **Row b passes on every arm.** A read-only node now serves about 3.1M
+  snapshot or read-your-writes reads/s, where it served about 0.6M; the cap
+  recorded in `uc2-read-spread-2026-10-07.md` §5.4 is gone.
+- **Row c passes on both spread arms.** The leader arms are descriptive (§2):
+  0.81–0.95, inside their rep-to-rep spread (the fix arm's lin/leader reps
+  were 1.42M and 2.33M; snap/leader 2.23M and 2.86M). Whether the leader
+  arms lose a little under writes is not resolved by 2 reps.
+- With the fix, reads no longer run faster under writes than without: at the
+  leader, 0 writes now reads at or above 20k writes.
+
+### 5.3 What the numbers measure
+
+`read_profile`'s state machine is a counter: `apply` increments it, `query`
+returns it (`uc_node/examples/read_profile.rs`, `ProfileSm`). Writes are real
+64-byte commands (appended, replicated, made durable, committed, applied on
+every node) and reads are real queries through the rings and the service,
+each answer decoded and checked by the client's monotonic guard. So these
+are the read pipeline's ceiling, not an application's: a `query` that does
+real work adds its own cost per read and shrinks the share of time the old
+sleeps cost. The 3.8–5.6× is an upper bound for a cheap query.
+
+### 5.4 One invalid run, not used
+
+The first fix-tree matrix (run directory `fix/`, not committed) ran the
+**base** binary. The fix tree was rsync'd onto the hosts with `rsync -a`,
+which keeps the source's mtimes: `apply.rs` arrived dated 21:59, older than
+the 22:15 base build, so cargo's freshness check rebuilt nothing, and the
+driver's `prepare` step reported success. `nm` on the hosts' `read_profile`
+found no `uc_service::apply::drain_queries` symbol, which the
+`#[inline(never)]` fix creates. After `touch`ing `apply.rs` and rebuilding,
+every host's binary carried the symbol (checked before and after the valid
+run). That run's numbers matched the base (about 0.6M/s per node read-only)
+and are reported only as this cautionary note. Swapping trees on a host that
+has already built must change mtimes (`--no-times` or `--checksum`) or touch
+the changed files, and should be checked at the binary.
