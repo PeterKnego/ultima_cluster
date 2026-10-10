@@ -18,7 +18,7 @@
 
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering, fence};
 
 use uc_protocol::identity::FsmName;
 use uc_protocol::v2::cnc::{
@@ -493,6 +493,78 @@ const _: () = assert!(
         == cnc::CNC_SVC_OFF_ARTIFACT_HASH - cnc::CNC_SVC_OFF_NAME
 );
 
+/// The slot's `snapshot_pos` line (`+256..+320`): the service builder's
+/// `snapshot_pos` word, then (snapshot-lifecycle spec §4.2) the node's
+/// start-set pair. Two writers on one line, each owning its own words, both
+/// rare. `load_acquire`/`store_release` keep their `PaddedAtomicU64` meaning
+/// for `snapshot_pos`, so every existing call site is unchanged.
+#[repr(C, align(64))]
+pub struct SnapshotPosLine {
+    snapshot_pos: AtomicU64,
+    start_set_pos: AtomicU64,
+    start_set_version: AtomicU64,
+    _pad: [u8; 40],
+}
+
+impl SnapshotPosLine {
+    #[inline]
+    pub fn load_acquire(&self) -> u64 {
+        self.snapshot_pos.load(Ordering::Acquire)
+    }
+    #[inline]
+    pub fn store_release(&self, v: u64) {
+        self.snapshot_pos.store(v, Ordering::Release)
+    }
+    /// Node-side (consensus agent): publish row's start set. `pos` is zeroed
+    /// FIRST, then the version, then `pos` with Release — the
+    /// `ClusterArtifactHash::publish` pattern — so a reader that sees the same
+    /// non-zero `pos` on both sides of its version load read a version stored
+    /// for that `pos`. `pos == 0` publishes "none".
+    pub fn store_start_set(&self, pos: u64, version: u32) {
+        self.start_set_pos.store(0, Ordering::Relaxed);
+        fence(Ordering::Release);
+        self.start_set_version
+            .store(u64::from(version), Ordering::Relaxed);
+        self.start_set_pos.store(pos, Ordering::Release);
+    }
+    /// Service-side: the start set `(pos, version)`, or `None` for none — or
+    /// for a pair that would not read coherently in four tries (a publish in
+    /// flight each time). `None` is always safe: the row replays (spec §5
+    /// rule 3).
+    pub fn start_set(&self) -> Option<(u64, u32)> {
+        for _ in 0..4 {
+            let p = self.start_set_pos.load(Ordering::Acquire);
+            if p == 0 {
+                return None;
+            }
+            let v = self.start_set_version.load(Ordering::Relaxed) as u32;
+            fence(Ordering::Acquire);
+            if self.start_set_pos.load(Ordering::Relaxed) == p {
+                return Some((p, v));
+            }
+        }
+        None
+    }
+    /// Offset pins for `cnc_offsets_match_protocol_constants`.
+    #[doc(hidden)]
+    pub fn start_set_pos_ptr(&self) -> usize {
+        &self.start_set_pos as *const _ as usize
+    }
+    #[doc(hidden)]
+    pub fn start_set_version_ptr(&self) -> usize {
+        &self.start_set_version as *const _ as usize
+    }
+}
+const _: () = assert!(std::mem::size_of::<SnapshotPosLine>() == 64);
+const _: () = assert!(
+    std::mem::offset_of!(SnapshotPosLine, start_set_pos)
+        == cnc::CNC_SVC_OFF_START_SET_POS - cnc::CNC_SVC_OFF_SNAPSHOT_POS
+);
+const _: () = assert!(
+    std::mem::offset_of!(SnapshotPosLine, start_set_version)
+        == cnc::CNC_SVC_OFF_START_SET_VERSION - cnc::CNC_SVC_OFF_SNAPSHOT_POS
+);
+
 /// M14a: one per-service slot on page 2 — see `uc_protocol::v2::cnc`'s
 /// `CNC_OFF_SERVICE_SLOTS` doc for the writer-per-line table. Same shape as
 /// [`PeerSlot`]: every field its own cache line, `#[repr(C)]`, stride pinned.
@@ -502,7 +574,7 @@ pub struct ServiceSlot {
     pub applied: PaddedAtomicU64,
     pub epoch: PaddedAtomicU64,
     pub output_completed: PaddedAtomicU64,
-    pub snapshot_pos: PaddedAtomicU64,
+    pub snapshot_pos: SnapshotPosLine,
     pub heartbeat_ns: PaddedAtomicU64,
     pub lag_waits: PaddedAtomicU64,
     pub identity: ServiceIdentityLine,
@@ -1340,6 +1412,36 @@ mod tests {
         }
     }
 
+    /// Snapshot-lifecycle spec §4.2: the pair round-trips, `0` reads as "no
+    /// start set", the raw bytes sit at slot +264/+272, and `snapshot_pos`
+    /// is untouched by it.
+    #[test]
+    fn the_start_set_pair_round_trips_at_its_pinned_offsets() {
+        let page = CncPage::heap(&test_meta());
+        let slot = page.service_slot(3);
+        assert_eq!(slot.snapshot_pos.start_set(), None);
+        slot.snapshot_pos.store_release(4000);
+        slot.snapshot_pos.store_start_set(4096, 0x0102_0003);
+        assert_eq!(slot.snapshot_pos.start_set(), Some((4096, 0x0102_0003)));
+        assert_eq!(
+            slot.snapshot_pos.load_acquire(),
+            4000,
+            "snapshot_pos is its own word"
+        );
+        let raw = page.page();
+        let base = cnc::CNC_OFF_SERVICE_SLOTS + 3 * cnc::CNC_SERVICE_SLOT_STRIDE;
+        let word = |o: usize| u64::from_le_bytes(raw[base + o..base + o + 8].try_into().unwrap());
+        assert_eq!(word(cnc::CNC_SVC_OFF_START_SET_POS), 4096);
+        assert_eq!(word(cnc::CNC_SVC_OFF_START_SET_VERSION), 0x0102_0003);
+        slot.snapshot_pos.store_start_set(0, 0);
+        assert_eq!(slot.snapshot_pos.start_set(), None, "0 = none");
+        assert_eq!(
+            page.service_slot(2).snapshot_pos.start_set(),
+            None,
+            "slots are independent"
+        );
+    }
+
     /// In-place recreate (a node restart) must leave the previous
     /// incarnation's state fully zeroed: `init` historically relied on
     /// `.truncate(true)` for the zero page, and the SIGBUS fix (2026-08-16)
@@ -1532,6 +1634,14 @@ mod tests {
         assert_eq!(
             &s0.snapshot_pos as *const _ as usize - s0_base,
             cnc::CNC_SVC_OFF_SNAPSHOT_POS
+        );
+        assert_eq!(
+            s0.snapshot_pos.start_set_pos_ptr() - s0_base,
+            cnc::CNC_SVC_OFF_START_SET_POS
+        );
+        assert_eq!(
+            s0.snapshot_pos.start_set_version_ptr() - s0_base,
+            cnc::CNC_SVC_OFF_START_SET_VERSION
         );
         assert_eq!(
             &s0.heartbeat_ns as *const _ as usize - s0_base,

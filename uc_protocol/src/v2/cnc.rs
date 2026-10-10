@@ -349,6 +349,8 @@ const _: () = assert!(
 //   +128 epoch           u64 (attach-time fetch_add, AcqRel)   writer: service (attach)
 //   +192 output_completed u64 position                         writer: service output agent
 //   +256 snapshot_pos    u64 position                          writer: service builder agent
+//   +264 start_set_pos   u64 position (0 = none)              writer: node (consensus agent)
+//   +272 start_set_version u64 (low 32 = packed version that built the artifact)  writer: node (consensus agent)
 //   +320 heartbeat_ns    u64 unix ns                           writer: service apply agent
 //   +384 lag_waits       u64 count                             writer: service apply agent
 //   +448 name            [u8; 32] NUL-padded FSM name          writer: node (init, boot-once)
@@ -458,6 +460,21 @@ pub const CNC_SVC_OFF_FREEZE_NS: usize = 496;
 /// stale hash from the previous instant). `uc2ctl status` and `/metrics`
 /// read it as the live determinism check's per-node report.
 pub const CNC_SVC_OFF_ARTIFACT_HASH: usize = 504;
+/// Snapshot-lifecycle spec §4.2 (cnc 3.4, folded in before release): the
+/// row's START SET — the newest agreed snapshot set this node holds at or
+/// below `min(commit, durable)`; `0` = none. Node-written (consensus agent,
+/// on change only), read by the service at attach and in overrun recovery.
+/// Shares the `snapshot_pos` line: both writers are rare (once per instant /
+/// per agreement) and the per-frame apply path never reads the line.
+/// Published as a pair with [`CNC_SVC_OFF_START_SET_VERSION`] through
+/// `uc_log::cnc::SnapshotPosLine::{store_start_set, start_set}`.
+pub const CNC_SVC_OFF_START_SET_POS: usize = 264;
+/// Low 32 bits: the packed version (`identity::pack_version`) that built the
+/// row's artifact at `start_set_pos` — the catalog's `RowEntry.version`.
+pub const CNC_SVC_OFF_START_SET_VERSION: usize = 272;
+const _: () = assert!(CNC_SVC_OFF_START_SET_POS == CNC_SVC_OFF_SNAPSHOT_POS + 8);
+const _: () = assert!(CNC_SVC_OFF_START_SET_VERSION == CNC_SVC_OFF_START_SET_POS + 8);
+const _: () = assert!(CNC_SVC_OFF_START_SET_VERSION + 8 <= CNC_SVC_OFF_HEARTBEAT_NS);
 const _: () = assert!(CNC_SVC_OFF_TIMERS_PENDING == CNC_SVC_OFF_IDENTITY_HASH + 8);
 const _: () = assert!(CNC_SVC_OFF_FREEZE_NS == CNC_SVC_OFF_TIMERS_PENDING + 8);
 const _: () = assert!(CNC_SVC_OFF_ARTIFACT_HASH == CNC_SVC_OFF_FREEZE_NS + 8);
@@ -601,6 +618,17 @@ pub const fn version_compatible(local: u32, peer: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Snapshot-lifecycle spec §4.2 (cnc 3.4, folded in): the start-set pair
+    /// sits on the `snapshot_pos` line, right after it.
+    #[test]
+    fn the_start_set_words_sit_on_the_snapshot_pos_line() {
+        assert_eq!(CNC_SVC_OFF_START_SET_POS, 264);
+        assert_eq!(CNC_SVC_OFF_START_SET_VERSION, 272);
+        assert_eq!(CNC_SVC_OFF_START_SET_POS, CNC_SVC_OFF_SNAPSHOT_POS + 8);
+        const { assert!(CNC_SVC_OFF_START_SET_VERSION + 8 <= CNC_SVC_OFF_HEARTBEAT_NS) };
+        assert_eq!(CNC_V2_VERSION, (3 << 24) | (4 << 16), "still cnc 3.4");
+    }
 
     /// M12d: `read_cnc_app_id` is total on `&[u8]` — a page too short for the
     /// app_id field returns `""`, never a slice-index panic. The one-byte

@@ -255,6 +255,7 @@ fsm_lag                 = "16MiB"      # or "lockstep"; absent = derive (buffer_
 snapshot_interval_bytes = 0            # 0 = on demand only
 snapshot_target         = "all"        # "all" or "learners"
 retain_sets             = 3            # 0.11.0, the snapshot catalog; absent = 1 (today's newest-only)
+auto_fetch              = true         # bool; absent = true (every node fetches the newest agreed set)
 ```
 
 An unknown key is refused locally by name, before anything is staged. The same
@@ -285,11 +286,11 @@ uc2ctl settings show --instance-dir <DIR> --app-id <ID>
 ```
 
 ```
-position=8192 admission_bytes=262144 fsm_lag=16MiB snapshot_interval_bytes=0 snapshot_target=all retain_sets=1 datagram_mtu=0 (baseline)
+position=8192 admission_bytes=262144 fsm_lag=16MiB snapshot_interval_bytes=0 snapshot_target=all retain_sets=1 auto_fetch=true datagram_mtu=0 (baseline)
 ```
 
 `fsm_lag` renders as `default` (the record's `0`), `lockstep`, a whole-MiB
-count, or a raw byte count when it is neither. `retain_sets` (`0.11.0`, the
+count, or a raw byte count when it is neither. `auto_fetch` (bool, absent = `true`) is whether every node fetches the newest agreed set in the background. `retain_sets` (`0.11.0`, the
 snapshot catalog, unreleased) is how many agreed snapshot sets the cluster
 keeps; `1` is the default and matches today's newest-only retention.
 `datagram_mtu` (2.12 pending)
@@ -469,7 +470,8 @@ This is step 2 of the spec's S4 sequence — an upgrade is always
 swap the binary, start. Step 1's complete set at P must already exist on
 every node; step 2 records the intent to install it; only step 3 (stop/swap/
 start) touches a running service, and only then does a v_new attach read the
-pin and install `snap-<P>` unconditionally — see
+pin and install `snap-<P>` unconditionally (until an agreed instant after
+the swap completes the pin; then a restart starts from that set) — see
 `docs/superpowers/specs/2026-09-19-uc2-fsm-upgrade-lifecycle-design.md` §3 S4
 for the full sequence and its documented limits (a bounded window of
 already-emitted `on_committed` side effects between the pin and the stop is a
@@ -617,7 +619,7 @@ Output fields:
 | `log: commit / durable / append` | the three log counters, in bytes |
 | `members` | one line per occupied peer slot: `id`, `role`, `reported_durable`, and a staleness marker when `commit - reported_durable` exceeds the admission window |
 | `services` | the declared id list (cnc 4032's bitmask), the lag policy, and — since log time and timers (2.11.0) — `log_time_ns=<n>`, the log's clock read from cnc `4048`, in **raw nanoseconds since the Unix epoch**. It is not formatted as RFC 3339: the binary carries no date formatter, and the raw value is what the `uc2_log_time_ns` metric and the cnc word both hold. `0` means no leader has stamped anything this page generation — `fsm_lag=lockstep` or `fsm_lag=<N> bytes` (cnc 4040). A node started for a harness (`ServicesConfig::none_for_tests`) prints `declared=[] fsm_lag=n/a` and no rows: with nothing declared there is no lag policy to report, even though cnc 4040 still holds a resolved bound (since **2.8.1**; earlier releases printed that bound, or `lockstep` when it happened to read 0). **Since `2.13.0` a configured node prints the same `declared=[]` and no rows while it is still joining its cluster** — the node publishes its declared set from the consensus pass, not at `Node::start`, so an empty list on a node that should have rows means "not joined yet", not "misconfigured". Give it a moment and re-run; if it persists, the node is not hearing a leader or its cluster FSM is not reaching commit |
-| per-FSM rows | one line per **declared** row, attached or not, in this order: `row=`, `name=` (the row's declared FSM name, node-written at boot, cnc 3.1), `version=` (the attached service's packed version, or the literal `unversioned` if the packed value is 0 — unattached or an FSM that never set `const VERSION`), `hash=0x...` (the row's identity hash, cnc 3.1), `attached=` (the slot's ATTACHED bit), `epoch=` (incarnations since this node booted), `incarnation=` (the status word's counter), `applied=`, `lag=` (`commit − applied`), `snapshot_pos=`, `heartbeat_age=` (`never` if that FSM has not stamped since boot), `timers_pending=` (that row's pending scheduled timers, cnc slot line 7 `+488`), `upgrade_origin=` (the row's committed `UpgradePin` origin — the coordinated instant this row installs unconditionally at its next attach, `0` = no pin), `pinned=` (the version that pin names, `unversioned` when `upgrade_origin=0`), `pinned_from=` (the version the pin's origin artifact was BUILT by — the pinned install's cross-check version, `unversioned` when `upgrade_origin=0`), `artifact_hash=0x...` (the hash of the artifact this row's builder published at `snapshot_pos` — SHA-256 of the artifact PAYLOAD, envelope excluded, truncated to its first 8 bytes, from cnc slot line 7 `+504`; `0x0000000000000000` = this row has published no artifact on this node since boot). Because it is written by the builder immediately BEFORE `snapshot_pos`, `snapshot_pos=` and `artifact_hash=` on the same line always describe the same artifact. Comparing the pair across nodes is the manual form of the live check — for the cluster's own verdict use [`upgrade show`](#upgrade-show), which is computed from a committed record rather than from what each node happens to print. `name=`/`version=`/`hash=` are new since FSM identity, `timers_pending=` since log time and timers (both 2.11.0), and `upgrade_origin=`/`pinned=`/`pinned_from=`/`artifact_hash=` since the FSM upgrade lifecycle (cnc 3.3, `uc2ctl upgrade pin`/`show`); earlier releases printed only `attached=... epoch=... incarnation=...`. Last on the line, since cnc 3.4 (#33): `running=` — the row's committed **running version**, the version every service of this row must match in major.minor (a genesis record or a pin sets it; `none` = no record yet — while any declared row reads `none` on the leader, the leader admits no client writes; `unversioned` = a recorded version of `0`, which is a real version; `?` = the words could not be read consistently, never fabricated) — and `running_pos=` — the frame-end position of the record that set it (`0` with `running=none`; `?` with `running=?`). Unlike `version=`, which is whatever the attached binary says, `running=` is cluster state: identical on every node once caught up. A service attached at a `version=` off the `running=` line is either about to stop at that record or has stopped there (`applied=` at the record's start) |
+| per-FSM rows | one line per **declared** row, attached or not, in this order: `row=`, `name=` (the row's declared FSM name, node-written at boot, cnc 3.1), `version=` (the attached service's packed version, or the literal `unversioned` if the packed value is 0 — unattached or an FSM that never set `const VERSION`), `hash=0x...` (the row's identity hash, cnc 3.1), `attached=` (the slot's ATTACHED bit), `epoch=` (incarnations since this node booted), `incarnation=` (the status word's counter), `applied=`, `lag=` (`commit − applied`), `snapshot_pos=`, `heartbeat_age=` (`never` if that FSM has not stamped since boot), `timers_pending=` (that row's pending scheduled timers, cnc slot line 7 `+488`), `upgrade_origin=` (the row's committed `UpgradePin` origin — the coordinated instant this row installs unconditionally at its next attach until the pin completes, `0` = no pin), `pinned=` (the version that pin names, `unversioned` when `upgrade_origin=0`), `pinned_from=` (the version the pin's origin artifact was BUILT by — the pinned install's cross-check version, `unversioned` when `upgrade_origin=0`), `artifact_hash=0x...` (the hash of the artifact this row's builder published at `snapshot_pos` — SHA-256 of the artifact PAYLOAD, envelope excluded, truncated to its first 8 bytes, from cnc slot line 7 `+504`; `0x0000000000000000` = this row has published no artifact on this node since boot). Because it is written by the builder immediately BEFORE `snapshot_pos`, `snapshot_pos=` and `artifact_hash=` on the same line always describe the same artifact. Comparing the pair across nodes is the manual form of the live check — for the cluster's own verdict use [`upgrade show`](#upgrade-show), which is computed from a committed record rather than from what each node happens to print. `name=`/`version=`/`hash=` are new since FSM identity, `timers_pending=` since log time and timers (both 2.11.0), and `upgrade_origin=`/`pinned=`/`pinned_from=`/`artifact_hash=` since the FSM upgrade lifecycle (cnc 3.3, `uc2ctl upgrade pin`/`show`); earlier releases printed only `attached=... epoch=... incarnation=...`. Last on the line, since cnc 3.4 (#33): `running=` — the row's committed **running version**, the version every service of this row must match in major.minor (a genesis record or a pin sets it; `none` = no record yet — while any declared row reads `none` on the leader, the leader admits no client writes; `unversioned` = a recorded version of `0`, which is a real version; `?` = the words could not be read consistently, never fabricated) — and `running_pos=` — the frame-end position of the record that set it (`0` with `running=none`; `?` with `running=?`). Unlike `version=`, which is whatever the attached binary says, `running=` is cluster state: identical on every node once caught up. A service attached at a `version=` off the `running=` line is either about to stop at that record or has stopped there (`applied=` at the record's start) |
 
 ## Offline commands
 
@@ -765,6 +767,9 @@ uc2ctl audit --instance-dir <DIR> [--tail <N>] [--json]
   human-readable form (`<ts>  <actor>  <origin>  <op_name>  <id>  <addr>
   <outcome>(<reason>)  cfg=<version>`).
 
+A `snapshot_fetch` record with `actor` and `source` `auto` is the node's own
+background fetch (snapshot lifecycle), not an operator's.
+
 A line the summarizer cannot make sense of — a torn write from a crash
 mid-record, or a hand-edited file — prints as-is prefixed `? ` rather than
 being dropped or panicking; the whole point of this file is to never lose a
@@ -884,6 +889,7 @@ cluster FSM's refusal of a `RowGenesis` record.
 | 58 | `pin_decode` — the staged file is not a decodable 20-byte `UpgradePin` record |
 | 59 | `report_stale` — a `SnapshotReport` below the row's held report position. Never produced by `uc2ctl`; recorded here because it shares op 10's refusal band |
 | 60 | `version_already_set` — a `RowGenesis` record (`CLUSTER` kind 6) for a row that already has a running version: genesis records a row's first version once and never changes one (#33). Never returned to `uc2ctl` — genesis is the leader's own append, with no admin request behind it — and listed here because it shares the band. A refused genesis changes nothing: like every refused `CLUSTER` record it advances the cluster FSM's `applied` and the row keeps the version it already had |
+| 61 | `pin_origin_not_agreed` — `--origin` is a complete set on this node but the snapshot catalog has not AGREED it (every reporting node's hash must match; reports take up to ~5 s after the instant). Wait for that set to agree (`uc2_catalog_agreed_position` reaches it), or take a new instant (`uc2ctl snapshot`) and pin that; a set that diverged never agrees. (54 accepts only this node's newest complete set, so an older agreed origin is not a way out.) On a cluster whose catalog is still empty (no complete set yet), the pin is allowed unchecked and the node logs `upgrade_pin_agreement_unchecked` |
 
 Code `0` is not a `ProposeError`. It is the CLI's own malformed-op sentinel.
 

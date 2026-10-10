@@ -166,7 +166,11 @@ carries the SDK's `is pinned to version`), and NEW is started and must
 attach at `--to`, **say on its own stderr that it ran the pinned install**
 (`uc_service: row R pinned install of snap-P …`, which the harness requires
 for anything but a FAIL) and catch up to X. A second instant **Q** turns
-NEW's live state into an artifact anyone can project.
+NEW's live state into an artifact anyone can project. Q lies above the pin
+record and agrees, so it **completes the pin**, and the node may then prune
+`snap-P` from the scratch instance dir; the harness copies `snap-P` into its
+scratch before commanding Q, and the corpus export takes the origin from
+that copy.
 
 **The three projections and the verdict.** The harness then asks NEW for
 three views of the same span: its **live** state at Q (`NEW project` on the
@@ -217,8 +221,8 @@ durable state machine that quietly kept the state it had persisted would
 look the same, unless your version change happens to touch a command whose
 result depends on prior state — see the next paragraph, and prefer both.
 
-Scratch (the throwaway instance dir, both stderr files, the exported corpus
-and the traces) lands in `<report>.pinverify/`. It is **kept on a FAIL** and
+Scratch (the throwaway instance dir, the saved origin artifact, both stderr
+files, the exported corpus and the traces) lands in `<report>.pinverify/`. It is **kept on a FAIL** and
 swept on a PASS or an INCONCLUSIVE — so a failing run's evidence sits beside
 the report that names it. It is kept on a **rig** failure too, and that case
 looks different: a run that fails the *rig* rather than the *check* — "row 0

@@ -428,7 +428,12 @@ fn make_config(
         buffer_bytes: 1 << 22,
         max_payload: 256,
         admission_bytes_default: 256 * 1024,
-        settings_genesis: uc_protocol::v2::settings::Settings::genesis_default(),
+        // Snapshot lifecycle: this suite pins the MANUAL §5.7 fetch path —
+        // auto-fetch is `catalog.rs`'s to test.
+        settings_genesis: uc_protocol::v2::settings::Settings {
+            auto_fetch: false,
+            ..uc_protocol::v2::settings::Settings::genesis_default()
+        },
         force_jumbo_frames: false,
         election_timeout_min_ns: 150_000_000,
         election_timeout_max_ns: 300_000_000,
@@ -711,7 +716,12 @@ fn fresh_learner_joins_a_purged_leader_via_snapshot_session() {
         buffer_bytes: 1 << 18,
         max_payload: 256,
         admission_bytes_default: 256 * 1024,
-        settings_genesis: uc_protocol::v2::settings::Settings::genesis_default(),
+        // Snapshot lifecycle: this suite pins the MANUAL §5.7 fetch path —
+        // auto-fetch is `catalog.rs`'s to test.
+        settings_genesis: uc_protocol::v2::settings::Settings {
+            auto_fetch: false,
+            ..uc_protocol::v2::settings::Settings::genesis_default()
+        },
         force_jumbo_frames: false,
         election_timeout_min_ns: 50_000_000,
         election_timeout_max_ns: 100_000_000,
@@ -1061,7 +1071,12 @@ fn a_helper_fsm_learner_joins_a_purged_leader() {
         buffer_bytes: 1 << 18,
         max_payload: 256,
         admission_bytes_default: 256 * 1024,
-        settings_genesis: uc_protocol::v2::settings::Settings::genesis_default(),
+        // Snapshot lifecycle: this suite pins the MANUAL §5.7 fetch path —
+        // auto-fetch is `catalog.rs`'s to test.
+        settings_genesis: uc_protocol::v2::settings::Settings {
+            auto_fetch: false,
+            ..uc_protocol::v2::settings::Settings::genesis_default()
+        },
         force_jumbo_frames: false,
         election_timeout_min_ns: 50_000_000,
         election_timeout_max_ns: 100_000_000,
@@ -1366,7 +1381,12 @@ fn fresh_learner_joins_a_purged_two_fsm_leader_and_both_fsms_converge() {
         buffer_bytes: 1 << 18, // small ring: the learner's NAK from 0 falls below it
         max_payload: 256,
         admission_bytes_default: 256 * 1024,
-        settings_genesis: uc_protocol::v2::settings::Settings::genesis_default(),
+        // Snapshot lifecycle: this suite pins the MANUAL §5.7 fetch path —
+        // auto-fetch is `catalog.rs`'s to test.
+        settings_genesis: uc_protocol::v2::settings::Settings {
+            auto_fetch: false,
+            ..uc_protocol::v2::settings::Settings::genesis_default()
+        },
         force_jumbo_frames: false,
         election_timeout_min_ns: 50_000_000,
         election_timeout_max_ns: 100_000_000,
@@ -1604,7 +1624,12 @@ fn a_declared_set_mismatch_refuses_the_session_and_names_it_in_a_log_line() {
         buffer_bytes: 1 << 18,
         max_payload: 256,
         admission_bytes_default: 256 * 1024,
-        settings_genesis: uc_protocol::v2::settings::Settings::genesis_default(),
+        // Snapshot lifecycle: this suite pins the MANUAL §5.7 fetch path —
+        // auto-fetch is `catalog.rs`'s to test.
+        settings_genesis: uc_protocol::v2::settings::Settings {
+            auto_fetch: false,
+            ..uc_protocol::v2::settings::Settings::genesis_default()
+        },
         force_jumbo_frames: false,
         election_timeout_min_ns: 50_000_000,
         election_timeout_max_ns: 100_000_000,
@@ -1759,7 +1784,12 @@ fn a_joiner_whose_rows_are_named_in_the_other_order_is_refused_by_name_and_stall
         buffer_bytes: 1 << 18,
         max_payload: 256,
         admission_bytes_default: 256 * 1024,
-        settings_genesis: uc_protocol::v2::settings::Settings::genesis_default(),
+        // Snapshot lifecycle: this suite pins the MANUAL §5.7 fetch path —
+        // auto-fetch is `catalog.rs`'s to test.
+        settings_genesis: uc_protocol::v2::settings::Settings {
+            auto_fetch: false,
+            ..uc_protocol::v2::settings::Settings::genesis_default()
+        },
         force_jumbo_frames: false,
         election_timeout_min_ns: 50_000_000,
         election_timeout_max_ns: 100_000_000,
@@ -1931,7 +1961,12 @@ fn a_joiner_running_another_fsm_version_is_refused_with_both_versions() {
         buffer_bytes: 1 << 18,
         max_payload: 256,
         admission_bytes_default: 256 * 1024,
-        settings_genesis: uc_protocol::v2::settings::Settings::genesis_default(),
+        // Snapshot lifecycle: this suite pins the MANUAL §5.7 fetch path —
+        // auto-fetch is `catalog.rs`'s to test.
+        settings_genesis: uc_protocol::v2::settings::Settings {
+            auto_fetch: false,
+            ..uc_protocol::v2::settings::Settings::genesis_default()
+        },
         force_jumbo_frames: false,
         election_timeout_min_ns: 50_000_000,
         election_timeout_max_ns: 100_000_000,
@@ -2348,7 +2383,12 @@ fn below_floor_join_with(app: &str, opts: JoinOpts<'_>) -> JoinFixture {
         buffer_bytes: 1 << 18,
         max_payload: 256,
         admission_bytes_default: 256 * 1024,
-        settings_genesis: uc_protocol::v2::settings::Settings::genesis_default(),
+        // Snapshot lifecycle: this suite pins the MANUAL §5.7 fetch path —
+        // auto-fetch is `catalog.rs`'s to test.
+        settings_genesis: uc_protocol::v2::settings::Settings {
+            auto_fetch: false,
+            ..uc_protocol::v2::settings::Settings::genesis_default()
+        },
         force_jumbo_frames: false,
         election_timeout_min_ns: if id == 1 && peer {
             SLOW_ELECTION_NS.0
@@ -3248,7 +3288,12 @@ fn a_joiner_below_the_voters_floor_is_redirected_to_the_learner() {
         buffer_bytes: 1 << 18, // small ring: the joiner's NAK from 0 falls below it
         max_payload: 256,
         admission_bytes_default: 256 * 1024,
-        settings_genesis: uc_protocol::v2::settings::Settings::genesis_default(),
+        // Snapshot lifecycle: this suite pins the MANUAL §5.7 fetch path —
+        // auto-fetch is `catalog.rs`'s to test.
+        settings_genesis: uc_protocol::v2::settings::Settings {
+            auto_fetch: false,
+            ..uc_protocol::v2::settings::Settings::genesis_default()
+        },
         force_jumbo_frames: false,
         election_timeout_min_ns: 50_000_000,
         election_timeout_max_ns: 100_000_000,

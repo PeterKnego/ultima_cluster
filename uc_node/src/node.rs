@@ -47,8 +47,8 @@ use uc_protocol::ring::{
 use uc_protocol::v2::cnc::{
     ADMIN_OP_SCHEDULE_APPLY, ADMIN_OP_SETTINGS_APPLY, ADMIN_OP_SNAPSHOT, ADMIN_OP_SNAPSHOT_FETCH,
     ADMIN_OP_UPGRADE_PIN, CNC_MAX_PEER_SLOTS, CNC_MAX_SERVICES, CNC_PEER_ROLE_LEARNER,
-    CNC_PEER_ROLE_VOTER, CNC_SVC_STATUS_SNAPSHOT_CAPABLE, NODE_FLAG_CAN_SERVE, NODE_FLAG_LEADER,
-    NODE_FLAG_LEARNER,
+    CNC_PEER_ROLE_VOTER, CNC_SVC_STATUS_ATTACHED, CNC_SVC_STATUS_SNAPSHOT_CAPABLE,
+    NODE_FLAG_CAN_SERVE, NODE_FLAG_LEADER, NODE_FLAG_LEARNER,
 };
 use uc_protocol::v2::config::{WireConfig, WireMember, decode_config, encode_config};
 use uc_protocol::v2::crypto::DGRAM_KIND_HS_KEY;
@@ -73,7 +73,7 @@ use crate::ipc::InstanceDir;
 use crate::read_round::ProbeRound;
 use crate::services::ServicesConfig;
 use uc_log::buffer::FrameRead;
-use uc_protocol::v2::catalog::{FOREIGN_SET_SUFFIX, MAX_CATALOG_SETS, SetEntry, SetState};
+use uc_protocol::v2::catalog::{FOREIGN_SET_SUFFIX, MAX_CATALOG_SETS, SetEntry, SetKind, SetState};
 use uc_protocol::v2::datagram::{
     CONFIG_PROPOSAL_BODY_LEN, CONFIG_REPLY_BODY_LEN, ConfigProposalBody, ConfigReplyBody,
     DATAGRAM_HEADER_LEN, DGRAM_KIND_COMMIT_POSITION, DGRAM_KIND_CONFIG_PROPOSAL,
@@ -594,6 +594,12 @@ pub const REASON_REPORT_STALE: u32 = 59;
 /// version. FSM-only (`ClusterRefusal::VersionAlreadySet`): the leader's own
 /// genesis append validates first and simply skips a row that has one.
 pub const REASON_VERSION_ALREADY_SET: u32 = 60;
+/// Snapshot-lifecycle spec §8: the pin's origin is not an AGREED catalog
+/// entry — the set may still be collecting reports (up to ~5 s after the
+/// instant, `SNAP_REPORT_TIMEOUT_NS`), so `uc2ctl` says to retry. DOOR-ONLY
+/// (plan ruling P13): an Empty catalog (no `Complete` entry, catalog ruling
+/// R26) cannot check agreement, and the pin is then allowed with a log line.
+pub const REASON_PIN_ORIGIN_NOT_AGREED: u32 = 61;
 
 /// Jumbo spec §7.1: the datagram rung a committed `Settings::datagram_mtu`
 /// word means, and whether it had to be clamped to get there.
@@ -1044,6 +1050,9 @@ struct PendingFetch {
     stored_before: u64,
     /// Pass-clock nanoseconds after which this record is dropped.
     deadline_ns: u64,
+    /// Snapshot-lifecycle spec §6: issued by auto-fetch (its outcome feeds
+    /// `uc2_snapshot_auto_fetch_total`), not by `uc2ctl snapshot fetch`.
+    auto: bool,
 }
 
 /// How long a `snapshot fetch` stays pending before this node forgets it.
@@ -1210,6 +1219,12 @@ pub struct Node {
     holdings: Arc<Mutex<Holdings>>,
     /// `cfg.election_timeout_max_ns`, kept for [`Node::soft_stale_ns`].
     election_timeout_max_ns: u64,
+    /// Snapshot-lifecycle spec §6: `uc2_snapshot_auto_fetch_total{outcome}`,
+    /// bumped by the consensus agent and exported through `ObsSources`.
+    auto_fetch_stats: Arc<crate::auto_fetch::AutoFetchStats>,
+    /// Plan ruling P14: the `uc2-holdings` probe's free-space override
+    /// ([`Node::set_free_bytes_for_test`]; `0` = the real `statvfs`).
+    free_override: Arc<AtomicU64>,
     // Held for the node's life: the instance flock and the IPC ring mmaps.
     _instance: InstanceDir,
     _rings: Rings,
@@ -1994,6 +2009,10 @@ impl Node {
         // directory walk there would couple commit to the filesystem's
         // metadata locks. The thread only reads two atomics and writes the
         // `Holdings` cell's byte fields.
+        // Plan ruling P14: the probe's free-space test seam, and the
+        // auto-fetch counters the consensus agent bumps.
+        let free_override = Arc::new(AtomicU64::new(0));
+        let auto_fetch_stats = Arc::new(crate::auto_fetch::AutoFetchStats::default());
         let mut holdings_probe = HoldingsProbe::new(
             Arc::clone(&holdings),
             cfg.instance_dir.clone(),
@@ -2006,14 +2025,21 @@ impl Node {
             cfg.services.ids().collect(),
             snap_root.clone(),
             instance.cluster_snapshot_dir(),
-        ));
+        ))
+        .with_free_override(Arc::clone(&free_override));
         let probe_base = std::time::Instant::now();
         let probe_cnc = Arc::clone(&cnc);
         let probe_first_base = Arc::clone(&archive_first_base);
+        // Ruling R15 (final review I1): the auto-fetch audit record's write
+        // and `sync_data` run on this thread, not the consensus agent, which
+        // only enqueues. A second handle on the one `O_APPEND` file.
+        let (auto_fetch_audit, mut auto_fetch_audit_writer) =
+            crate::audit::auto_fetch_audit_channel(audit.try_clone()?, cfg.id);
         let holdings_runner = AgentRunner::spawn(
             "uc2-holdings",
             IdleStrategy::Sleep(HOLDINGS_THREAD_SLEEP),
             move || {
+                auto_fetch_audit_writer.drain();
                 holdings_probe.maybe_probe(
                     probe_base.elapsed().as_nanos() as u64,
                     probe_cnc.counters().durable.load_acquire(),
@@ -2499,6 +2525,7 @@ impl Node {
             fetch_tx,
             stored_set_pos: Arc::clone(&stored_set_pos),
             stored_above_durable: 0,
+            stored_set_noted: 0,
             snapshot_floor_hold: 0,
             snapshot_standby_learner,
             snapshot_standby_position,
@@ -2512,6 +2539,16 @@ impl Node {
             holdings_catalog_version_seen: 0,
             holdings_catalog: Vec::with_capacity(MAX_CATALOG_SETS),
             holdings_held: Vec::with_capacity(2 * MAX_CATALOG_SETS),
+            start_sets: [crate::catalog::StartSet::default(); CNC_MAX_SERVICES],
+            start_sets_dirty: true,
+            start_set_wait_above: u64::MAX,
+            start_set_recomputes: 0,
+            start_set_gates: [None; CNC_MAX_SERVICES],
+            auto_fetch: crate::auto_fetch::AutoFetch::new(cfg.id),
+            auto_fetch_stats: Arc::clone(&auto_fetch_stats),
+            auto_fetch_audit,
+            soft_wire: Arc::clone(&soft_wire),
+            soft_stale_ns: SOFT_STALE_FACTOR * cfg.election_timeout_max_ns,
         };
         // Cluster FSM (spec §4.5): arm from the RECOVERED view BEFORE the
         // consensus agent starts. The view already holds genesis or the
@@ -2577,6 +2614,8 @@ impl Node {
             soft_wire,
             holdings,
             election_timeout_max_ns: cfg.election_timeout_max_ns,
+            auto_fetch_stats,
+            free_override,
             _instance: instance,
             _rings: rings,
             // Stop order: consensus first (stops writing the term handle), then
@@ -2636,12 +2675,7 @@ impl Node {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
-        let mut t = crate::catalog::SoftTable::default();
-        for (id, addr) in membership.voters.iter().chain(membership.learners.iter()) {
-            if let Some((h, at)) = wire.get(&addr_of(*addr)) {
-                t.record(*id, *h, *at);
-            }
-        }
+        let mut t = soft_table_from_wire(&wire, &membership);
         // This node's own cache, stamped now: a node never sends itself a
         // `STATUS`, but it is as much a holder as any follower.
         let own = *self.holdings.lock().unwrap_or_else(|e| e.into_inner());
@@ -2653,6 +2687,15 @@ impl Node {
     /// — [`SOFT_STALE_FACTOR`] maximum election timeouts.
     pub fn soft_stale_ns(&self) -> u64 {
         SOFT_STALE_FACTOR * self.election_timeout_max_ns
+    }
+
+    /// Plan ruling P14 — TEST SEAM, not API: make this node's `uc2-holdings`
+    /// probe report `v` free bytes instead of `statvfs` (`0` restores the real
+    /// reading). Lets an end-to-end test exercise the spec §7.3 space check
+    /// without filling a disk.
+    #[doc(hidden)]
+    pub fn set_free_bytes_for_test(&self, v: u64) {
+        self.free_override.store(v, Ordering::Release);
     }
 
     /// M6 Task 4: the archive's lowest still-replayable position (the purge
@@ -3064,6 +3107,8 @@ impl Node {
             snapshot_set_position: Arc::clone(&self.snapshot_set_position),
             snapshot_row_incomplete: self.snapshot_row_incomplete.clone(),
             snapshot_fetched_position: Arc::clone(&self.snapshot_fetched_position),
+            snapshot_auto_fetch: Arc::clone(&self.auto_fetch_stats),
+            snapshot_holdings: Arc::clone(&self.holdings),
             snapshot_freeze: Arc::clone(&self.snapshot_freeze),
             crypto_enabled: self.crypto.is_some(),
             purge_enabled: self.purge_enabled,
@@ -3239,7 +3284,8 @@ struct PendingAdminFwd {
 struct ReportedSet {
     position: u64,
     n: usize,
-    reports: [(u8, u64); CNC_MAX_SERVICES + 1],
+    /// `(row, hash, size)`.
+    reports: [(u8, u64, u64); CNC_MAX_SERVICES + 1],
 }
 
 /// Ruling R40: the hand-off between the `uc2-holdings` probe thread, which
@@ -3285,6 +3331,9 @@ struct PendingSnapshotReport {
     position: u64,
     first_seen_ns: u64,
     hashes: BTreeMap<u32, u64>,
+    /// Snapshot-lifecycle spec §7.1: each reporter's artifact size, keyed like
+    /// `hashes` (a re-sent datagram overwrites with the same value).
+    sizes: BTreeMap<u32, u64>,
     /// Ruling R38-1: the instant's own log-time stamp, from the committed
     /// catalog's entry at `position` — `None` until this node's catalog lists
     /// it. When known, the timeout runs from IT in log time, so a leader
@@ -3845,7 +3894,9 @@ struct Consensus {
     /// than re-allocated out of `CncPage::try_meta()` on every request.
     admin_app_id: String,
     /// M12b (spec §5.3): the append-only admin audit file, opened at node
-    /// start and written by this agent alone. Every admin request's answer is
+    /// start and written by this agent (the one exception: the auto-fetch
+    /// record, which the `uc2-holdings` thread writes through a cloned
+    /// handle — ruling R15). Every admin request's answer is
     /// recorded here — with an fsync — BEFORE that answer is published; a
     /// record that fails to write turns the request into a
     /// [`REASON_AUDIT_FAILED`] refusal. The ONE exception is a byte-identical
@@ -4069,6 +4120,10 @@ struct Consensus {
     /// [`Consensus::check_set_completeness`], which treats it exactly like a
     /// locally produced set.
     stored_set_pos: Arc<AtomicU64>,
+    /// Controller ruling R7: the newest `stored_set_pos` value already noted
+    /// held by [`Self::check_set_completeness`] — the fetch edge's own
+    /// high-water mark, separate from the (monotone) set position.
+    stored_set_noted: u64,
     /// The `stored_set_pos` value this node has already named as being ABOVE
     /// its durable frontier (`0` = none outstanding). A latch, so a voter that
     /// stays behind the learner it fetched from logs the condition once rather
@@ -4125,6 +4180,32 @@ struct Consensus {
     /// the cluster artifact, added on every completion edge, dropped by the
     /// pruner. The effective floor reads it in place of a file check.
     holdings_held: Vec<u64>,
+    /// Snapshot-lifecycle spec §4.2: the start set last published per row.
+    start_sets: [crate::catalog::StartSet; CNC_MAX_SERVICES],
+    /// Spec §4.3: set by every edge that can change a start set - a catalog
+    /// change, a held-set change - and cleared by the recompute.
+    start_sets_dirty: bool,
+    /// The frontier at which a newer held agreed set becomes eligible
+    /// (`u64::MAX` = none): the only reason a clean pass recomputes.
+    start_set_wait_above: u64,
+    /// Recomputes run (test-visible; the steady-pass witness).
+    start_set_recomputes: u64,
+    /// Pin completion ruling C2: each row's [`crate::catalog::PinGate`] as
+    /// the last view change saw it. A pin record moves the gate without
+    /// changing the catalog, so a changed gate is a start-set edge too.
+    start_set_gates: [Option<crate::catalog::PinGate>; CNC_MAX_SERVICES],
+    /// Snapshot-lifecycle spec §6: the background fetch decision.
+    auto_fetch: crate::auto_fetch::AutoFetch,
+    /// `uc2_snapshot_auto_fetch_total{outcome}` — shared with `ObsSources`.
+    auto_fetch_stats: Arc<crate::auto_fetch::AutoFetchStats>,
+    /// Ruling R15 (final review I1): the hand-off that carries each issued
+    /// auto-fetch's `actor = "auto"` audit record to the `uc2-holdings`
+    /// thread, which writes and fsyncs it — never this agent.
+    auto_fetch_audit: crate::audit::AutoFetchAuditQueue,
+    /// The sender's `STATUS` map — a LEADER's live holders (plan ruling P1).
+    soft_wire: Arc<Mutex<SoftTableWire>>,
+    /// [`Node::soft_stale_ns`]'s value, for the holder query.
+    soft_stale_ns: u64,
 }
 
 impl Consensus {
@@ -4170,6 +4251,9 @@ impl Consensus {
         // in step 8 reads. Commit, apply and replication never wait on a
         // snapshot, so this is a poll and never a barrier.
         self.check_set_completeness();
+        // Snapshot-lifecycle spec §4: and the rows' START SETS - one `bool`
+        // test on a steady pass.
+        self.maybe_publish_start_sets();
         // Catalog erratum R37 item 4: and re-offer that set's reports to a
         // leader that has not had them. One `Acquire` load and a compare on
         // the steady path.
@@ -4518,6 +4602,9 @@ impl Consensus {
             did = true;
         }
         self.poll_pending_fetch();
+        // Snapshot-lifecycle spec §6: background auto-fetch of the newest
+        // agreed set — a few loads on the steady path.
+        self.maybe_auto_fetch();
 
         // 12. M7: clear the cnc `config_pending` mirror once commit has crossed
         // the adopted config's position — the entry is no longer at risk of a
@@ -5605,8 +5692,10 @@ impl Consensus {
             // it — and only here, inside the throttle.
             let inner = self.cluster_view.snapshot_inner();
             let candidate = self.effective_floor_in(own, &inner.catalog);
-            // Plan B2 T5 (fix round): the candidate floor is HELD at any
-            // pinned origin this node has not consumed yet.
+            // Plan B2 T5 (fix round), as amended by pin completion C7: the
+            // candidate floor is HELD at any pinned origin this node may not
+            // release yet (pin incomplete, or no completion set held here,
+            // or a `to` replay still below it).
             let service_pos = if candidate > self.snapshot_persisted_floor {
                 self.hold_floor_for_pins(&inner, candidate)
             } else {
@@ -5745,47 +5834,43 @@ impl Consensus {
             .is_file()
     }
 
-    /// Plan B2 T5 (fix round): the snapshot/purge floor must not pass a pinned
-    /// origin this node has not CONSUMED yet. Returns `candidate` clamped to
+    /// Plan B2 T5 (fix round), as amended by pin completion ruling C3: the
+    /// snapshot/purge floor must not pass a pinned origin this node may not
+    /// RELEASE yet ([`Self::pin_released`]). Returns `candidate` clamped to
     /// the lowest such origin.
     ///
-    /// Retention (plan B1) already keeps the pinned artifacts; this keeps the
+    /// Retention (plan B1) keeps the pinned artifacts; this keeps the
     /// JOURNAL they need. The two are one mechanism: a pinned attach installs
     /// the artifact at the origin and then tail-replays `(origin, target]`, and
     /// with the origin's artifact kept but the journal above it purged, the
-    /// service's gap guard meets `first > origin`, can install nothing this
-    /// binary is allowed to install (the only covering artifact is the newer
-    /// one `from` built) and fail-stops the apply thread of a service that
-    /// attached successfully. So between the pin and the swap, a cadence
-    /// instant may complete a set and may even be retained — it just may not
-    /// move this node's floor past the origin.
+    /// service's gap guard meets `first > origin`. So between the pin and its
+    /// completion, a cadence instant may complete a set and may even be
+    /// retained — it just may not move this node's floor past the origin.
     ///
-    /// **Consumed** is read off the row's own cnc slot, and it is three
-    /// conditions, all of them:
+    /// Before C3 the hold released as soon as THIS node's row had consumed
+    /// the pin (attached on `to`'s line, `applied >= candidate`). That let
+    /// the purge pass the origin while the pin was still in force, and a
+    /// later restart of the upgraded service re-ran the pinned install at
+    /// the origin, met the purged journal and installed the newer set on
+    /// top — two installs. Now (rulings C3/C7) the hold releases only once
+    /// the pin is COMPLETE (an agreed set its `to` line built above the pin
+    /// record) AND this node holds such a completion set AND no `to`
+    /// instance attached here is still replaying below it; until then this
+    /// node holds the journal at the origin, so an instance here can still
+    /// install the origin and replay from it.
     ///
-    /// 1. the slot is ATTACHED — some service is live on this row;
-    /// 2. its attached version word equals the pin's `to` — the binary the
-    ///    pin names is the one that is here, not the old one still running or
-    ///    a third build;
-    /// 3. its published `applied` frontier has reached the CANDIDATE floor —
-    ///    it has replayed past everything this floor move is about to let the
-    ///    purge remove.
-    ///
-    /// The third is not redundant, and leaving it out leaves a real race
-    /// (found reviewing the first cut of this fix). A pinned attach installs
-    /// the artifact at the origin and RETURNS; its tail replay from the
-    /// origin up runs afterwards, on the apply thread. Releasing the hold at
-    /// attach lets the floor — and the purge behind it — move to the newer
-    /// set while that replay is still walking the journal it needs, and the
-    /// replay's next pass then meets `first > origin` with no artifact this
-    /// binary may install: the same fail-stop the hold exists to prevent,
-    /// through a narrower window. Keyed on `applied` the hold releases when
-    /// the row is genuinely past the cut, which is the thing that matters.
+    /// The `applied` guard is the race B2 T5's first review found, moved
+    /// onto the completion set: a pinned attach installs the artifact at the
+    /// origin and RETURNS; its tail replay from the origin up runs
+    /// afterwards, on the apply thread, and releasing then would let the
+    /// purge race that replay.
     ///
     /// A row whose service has not come back yet holds the floor —
     /// deliberately, and visibly: `snapshot_floor_held_for_pin` names the
     /// hold, and an operator who has abandoned the upgrade clears it by
-    /// attaching `to` or by pinning forward, not by waiting.
+    /// finishing the upgrade or by pinning forward, not by waiting. After the
+    /// upgrade, one agreed instant above the pin record (`uc2ctl snapshot`)
+    /// completes the pin; each node releases once it holds that set.
     ///
     /// Node-local: no replicated state changes, and a node that has already
     /// published a floor above a pinned origin is not pulled back (the floor
@@ -5801,24 +5886,19 @@ impl Consensus {
         for row in self.services.ids() {
             // The newest pin for this row — the same "last wins" rule
             // `pin_for` and the retention keep-set use.
-            let Some(pin) = inner.pins.iter().rev().find(|p| p.row == row) else {
+            let Some(gate) = crate::catalog::pin_gate(&inner.pins, &inner.running, row) else {
                 continue;
             };
-            let slot = self.cnc.service_slot(row as usize);
-            let (_, attached, _) = unpack_service_status(slot.status.load_acquire());
-            // Consumed: `to` is attached here AND it has already replayed past
-            // everything this floor move is about to let the purge remove.
-            // "`to`" means `to`'s LINE (#33 ruling R17, spec D3 — patch is
-            // free): a patch build of `to` attaches through the same pinned
-            // install, so it consumes the pin just as `to` itself would.
-            if attached
-                && uc_protocol::identity::same_line(slot.status.version(), pin.to)
-                && slot.applied.load_acquire() >= candidate
-            {
+            if self.pin_released(inner, row, &gate) {
                 continue;
             }
-            hold = hold.min(pin.origin);
+            hold = hold.min(gate.origin);
         }
+        // Ruling C8 (review m4): release is not monotone — a row that stops
+        // being declared in newer sets, or a detach, can re-hold an origin
+        // the floor has already passed. The floor is increase-only, so the
+        // hold never names a position below it (and neither does the event).
+        let hold = hold.max(self.snapshot_persisted_floor);
         if hold >= candidate {
             self.snapshot_floor_hold = 0;
             return candidate;
@@ -5834,6 +5914,58 @@ impl Consensus {
             );
         }
         hold
+    }
+
+    /// Pin completion rulings C3/C7: may this node release `row`'s pin —
+    /// stop holding the floor (and the journal purge behind it) at the
+    /// origin, and let retention prune the origin's set? All three:
+    ///
+    /// 1. the pin is COMPLETE ([`crate::catalog::pin_complete`], ruling C1):
+    ///    the catalog lists an agreed set the `to` line built above the pin
+    ///    record. Until then EVERY node keeps the origin and its journal,
+    ///    because any instance not yet upgraded still has to install the
+    ///    origin and replay from it;
+    /// 2. this node HOLDS a completion set at or below `min(commit,
+    ///    durable)` — the start set the publisher offers a restarting
+    ///    service instead of the origin (ruling C2). Having consumed the pin
+    ///    is not enough (review I1): a node that holds no completion set can
+    ///    restart its row only through the pinned install, so it keeps the
+    ///    origin until it holds one (its own freeze or an auto-fetch);
+    /// 3. the row is NOT attached on the pin's `to` LINE with `applied`
+    ///    below that set (review m1): such an instance is still replaying
+    ///    its pinned install's tail, and releasing would purge the journal
+    ///    under it.
+    ///
+    /// Allocation-free and I/O-free: it reads the view the caller already
+    /// cloned, the slot words and `holdings_held`.
+    fn pin_released(
+        &self,
+        inner: &ClusterViewInner,
+        row: u8,
+        gate: &crate::catalog::PinGate,
+    ) -> bool {
+        if !crate::catalog::pin_complete(&inner.catalog, row, gate) {
+            return false;
+        }
+        let c = self.cnc.counters();
+        let frontier = c.commit.load_acquire().min(c.durable.load_acquire());
+        let set = crate::catalog::start_set_for(
+            row,
+            &inner.catalog,
+            &self.holdings_held,
+            frontier,
+            Some(gate),
+        )
+        .0
+        .position;
+        if set == 0 {
+            return false;
+        }
+        let slot = self.cnc.service_slot(row as usize);
+        let (_, attached, _) = unpack_service_status(slot.status.load_acquire());
+        !(attached
+            && uc_protocol::identity::same_line(slot.status.version(), gate.to)
+            && slot.applied.load_acquire() < set)
     }
 
     /// Plan B3 T5: does this node know who leads its cluster? Either it IS
@@ -6673,12 +6805,20 @@ impl Consensus {
         // pass once the log catches up — named ONCE, on the edge, because a
         // node that stays behind would otherwise log every pass.
         //
-        // The `durable` load sits UNDER the `stored > seen` guard: on the
+        // The `durable` load sits UNDER the `stored > stored_set_noted` guard: on the
         // steady path (no fetch outstanding, or one already adopted) this
         // whole branch is the one `Acquire` load of `stored_set_pos` and a
         // compare.
+        //
+        // Controller ruling R7: the edge is `stored` passing the last FETCHED
+        // set noted (`stored_set_noted`), not the set position. A fetched set
+        // at or below a newer set this node already holds (a voter that
+        // missed a standby N and built a full N2 > N) is still complete on
+        // disk: it is noted HELD (and foreign, ruling R42) — otherwise
+        // auto-fetch never sees N held and fetches it again. The set
+        // position itself only moves UP, as before.
         let stored = self.stored_set_pos.load(Ordering::Acquire);
-        if stored > seen {
+        if stored > self.stored_set_noted {
             let durable = self.cnc.counters().durable.load_acquire();
             if stored > durable {
                 if self.stored_above_durable != stored {
@@ -6693,10 +6833,14 @@ impl Consensus {
                 }
             } else {
                 self.stored_above_durable = 0;
-                self.snapshot_set_position.store(stored, Ordering::Release);
+                self.stored_set_noted = stored;
                 self.note_set_held(stored);
                 // Ruling R42: another node's freeze — never reported as ours.
                 self.note_foreign_set(stored);
+                if stored > seen {
+                    self.snapshot_set_position.store(stored, Ordering::Release);
+                    seen = stored;
+                }
                 crate::obs_event!(
                     Info,
                     "snapshot_set_complete",
@@ -6704,7 +6848,6 @@ impl Consensus {
                     position = stored,
                     source = "fetch"
                 );
-                seen = stored;
             }
         }
         let p = self.cluster_snapshot_pos.load(Ordering::Acquire);
@@ -6791,7 +6934,8 @@ impl Consensus {
         // word for another position (a newer artifact already landed, or
         // none was ever hashed) skips the row: the set is not vouched for
         // here by the cluster row, and the next instant reports again.
-        let cluster_hash = self.cluster_artifact_hash.hash_at(p);
+        let cluster = self.cluster_artifact_hash.hash_and_size_at(p);
+        let snap_root = self.snap_root.clone();
         let row_reports = rows[..n].iter().filter_map(|&row| {
             // `snapshot_pos` FIRST (Acquire), then the hash — the reverse of
             // the builder's store order, which is what makes the pair
@@ -6806,13 +6950,20 @@ impl Consensus {
                 // function's doc).
                 (at, hash, slot.snapshot_pos.load_acquire())
             };
-            (at == p && still_at == p && hash != 0).then_some((row, hash))
+            // Snapshot-lifecycle spec §7.1: one `stat` per row, on this
+            // once-per-instant edge only (never a pass).
+            (at == p && still_at == p && hash != 0).then(|| {
+                let path = snap_root
+                    .join(row.to_string())
+                    .join(format!("{SNAP_PREFIX}{p}{SNAP_SUFFIX}"));
+                (row, hash, file_size(&path))
+            })
         });
         // Collected before the sends: the iterator above borrows `self.cnc`,
         // and every arm below needs `&mut self`. At most nine entries.
-        let mut reports = [(0u8, 0u64); CNC_MAX_SERVICES + 1];
+        let mut reports = [(0u8, 0u64, 0u64); CNC_MAX_SERVICES + 1];
         let mut m = 0usize;
-        for r in row_reports.chain(cluster_hash.map(|h| (CLUSTER_ROW, h))) {
+        for r in row_reports.chain(cluster.map(|(h, s)| (CLUSTER_ROW, h, s))) {
             reports[m] = r;
             m += 1;
         }
@@ -6829,7 +6980,7 @@ impl Consensus {
     /// found FEWER rows (a row has since frozen a newer instant) does not
     /// replace a fuller one. Node memory only: a restart forgets it, and a
     /// restarted node re-offers only what its slots still name.
-    fn cache_report_set(&mut self, p: u64, reports: &[(u8, u64)]) {
+    fn cache_report_set(&mut self, p: u64, reports: &[(u8, u64, u64)]) {
         if reports.is_empty() {
             return;
         }
@@ -6887,11 +7038,11 @@ impl Consensus {
 
     /// [`Self::cache_report_set`]'s insert, without publishing `known`.
     /// `true` when the cache changed (a new set, or a fuller one).
-    fn cache_report_set_quiet(&mut self, p: u64, reports: &[(u8, u64)]) -> bool {
+    fn cache_report_set_quiet(&mut self, p: u64, reports: &[(u8, u64, u64)]) -> bool {
         let mut set = ReportedSet {
             position: p,
             n: reports.len(),
-            reports: [(0u8, 0u64); CNC_MAX_SERVICES + 1],
+            reports: [(0u8, 0u64, 0u64); CNC_MAX_SERVICES + 1],
         };
         set.reports[..reports.len()].copy_from_slice(reports);
         match self.reported_sets.binary_search_by_key(&p, |s| s.position) {
@@ -6922,7 +7073,7 @@ impl Consensus {
     /// and counted when no leader is known. Split out of
     /// [`Self::send_snapshot_reports`] so the re-offer (ruling R38-2) can
     /// deliver a set whose hashes come from [`Self::cache_report_set`].
-    fn deliver_snapshot_reports(&mut self, p: u64, reports: &[(u8, u64)]) {
+    fn deliver_snapshot_reports(&mut self, p: u64, reports: &[(u8, u64, u64)]) {
         // A leader reports to ITSELF, in-process: the collector is this same
         // agent, so a datagram to our own address would only add latency and
         // a loss mode. The hint and the term are read once for the whole
@@ -6933,7 +7084,7 @@ impl Consensus {
         let leader_addr = (hint != u64::MAX)
             .then(|| self.id_to_addr.get(&(hint as NodeId)).copied())
             .flatten();
-        for &(row, hash) in reports {
+        for &(row, hash, size) in reports {
             if leader {
                 crate::obs_event!(
                     Info,
@@ -6942,7 +7093,7 @@ impl Consensus {
                     row = row as u64,
                     position = p
                 );
-                self.on_snap_report(self.id, row, p, hash);
+                self.on_snap_report(self.id, row, p, hash, size);
             } else if let Some(addr) = leader_addr {
                 let mut body = [0u8; SNAP_REPORT_BODY_LEN];
                 write_snap_report_body(
@@ -6952,6 +7103,7 @@ impl Consensus {
                         node_id: self.id,
                         position: p,
                         hash,
+                        size,
                     },
                 );
                 // Position 0 on the header: the instant this report is ABOUT
@@ -7217,7 +7369,7 @@ impl Consensus {
     ///   row forever — a permanent stall of the catalog's floor. Logged as
     ///   `snapshot_report_dropped` with `reason = "above_extent"`, at most
     ///   once per reporting node per [`ABOVE_EXTENT_LOG_INTERVAL_NS`].
-    fn on_snap_report(&mut self, from: NodeId, row: u8, position: u64, hash: u64) {
+    fn on_snap_report(&mut self, from: NodeId, row: u8, position: u64, hash: u64, size: u64) {
         if !matches!(self.sm.role(), Role::Leader) {
             return;
         }
@@ -7253,6 +7405,7 @@ impl Consensus {
         let mut at = match list.binary_search_by_key(&position, |e| e.position) {
             Ok(i) => {
                 list[i].hashes.insert(from, hash);
+                list[i].sizes.insert(from, size);
                 return;
             }
             Err(i) => i,
@@ -7280,12 +7433,15 @@ impl Consensus {
         }
         let mut hashes = BTreeMap::new();
         hashes.insert(from, hash);
+        let mut sizes = BTreeMap::new();
+        sizes.insert(from, size);
         list.insert(
             at,
             PendingSnapshotReport {
                 position,
                 first_seen_ns: now,
                 hashes,
+                sizes,
                 instant_time_ns,
                 time_looked_up_at: view_at,
             },
@@ -7457,11 +7613,11 @@ impl Consensus {
                 // The payload, filtered against the config AS IT IS NOW — see
                 // this function's doc for why collection-time membership is not
                 // enough.
-                let hashes: Vec<(u32, u64)> = pend
+                let hashes: Vec<(u32, u64, u64)> = pend
                     .hashes
                     .iter()
                     .filter(|(id, _)| self.sm.config().contains(**id))
-                    .map(|(id, h)| (*id, *h))
+                    .map(|(id, h)| (*id, *h, pend.sizes.get(id).copied().unwrap_or(0)))
                     .collect();
                 // Every reporter has since left the config: there is nothing
                 // left to attest with, and an empty record is not even
@@ -7689,7 +7845,70 @@ impl Consensus {
         let listed = &self.holdings_catalog;
         self.holdings_held
             .retain(|p| *p > newest || listed.contains(p));
+        self.start_sets_dirty = true;
         self.publish_sets_held(Some(catalog_version));
+    }
+
+    /// Snapshot-lifecycle spec §4.3: recompute only when the catalog or this
+    /// node's held list changed, or the frontier passed a newer held agreed
+    /// set. A steady pass is one `bool` test and one compare.
+    #[inline]
+    fn maybe_publish_start_sets(&mut self) {
+        if !self.start_sets_dirty {
+            if self.start_set_wait_above == u64::MAX {
+                return;
+            }
+            let c = self.cnc.counters();
+            let frontier = c.commit.load_acquire().min(c.durable.load_acquire());
+            if frontier < self.start_set_wait_above {
+                return;
+            }
+        }
+        self.publish_start_sets();
+    }
+
+    /// Spec §4.2: write each declared row's start set to its cnc slot - only
+    /// a row whose answer changed is written (`store_start_set`).
+    #[cold]
+    #[inline(never)]
+    fn publish_start_sets(&mut self) {
+        self.start_sets_dirty = false;
+        self.start_set_recomputes += 1;
+        let c = self.cnc.counters();
+        let frontier = c.commit.load_acquire().min(c.durable.load_acquire());
+        let inner = self.cluster_view.snapshot_inner();
+        let mut wait = u64::MAX;
+        for row in self.services.ids() {
+            // Pin completion ruling C2: a pinned row is offered only a
+            // completion set (an agreed set its `to` line built above the
+            // pin record) — the one the service's attach may take instead of
+            // the pinned install.
+            let gate = crate::catalog::pin_gate(&inner.pins, &inner.running, row);
+            let (s, w) = crate::catalog::start_set_for(
+                row,
+                &inner.catalog,
+                &self.holdings_held,
+                frontier,
+                gate.as_ref(),
+            );
+            wait = wait.min(w);
+            if s != self.start_sets[row as usize] {
+                self.start_sets[row as usize] = s;
+                self.cnc
+                    .service_slot(row as usize)
+                    .snapshot_pos
+                    .store_start_set(s.position, s.version);
+                crate::obs_event!(
+                    Info,
+                    "start_set_published",
+                    node = self.id as u64,
+                    row = row as u64,
+                    position = s.position,
+                    version = s.version as u64
+                );
+            }
+        }
+        self.start_set_wait_above = wait;
     }
 
     /// Catalog spec §5.1: this node now holds the complete set at `p` (the
@@ -7699,6 +7918,7 @@ impl Consensus {
         if !self.holdings_held.contains(&p) {
             self.holdings_held.push(p);
         }
+        self.start_sets_dirty = true;
         self.publish_sets_held(None);
     }
 
@@ -7761,14 +7981,16 @@ impl Consensus {
         // whatever state — a listed set is the catalog's to retire, so the
         // pruner deletes only what the catalog no longer names (a stalled or
         // diverged set stays visible and alertable while it is listed).
+        //
+        // Pin completion ruling C3: a pinned origin is kept only until this
+        // node may release the pin ([`Self::pin_released`] for this cut);
+        // after that it is an ordinary set, kept only while the catalog
+        // lists it (the cluster FSM's retention stops protecting a completed
+        // pin's origin by the same predicate).
         let keep: Vec<u64> = (0..CNC_MAX_SERVICES as u8)
             .filter_map(|row| {
-                inner
-                    .pins
-                    .iter()
-                    .rev()
-                    .find(|p| p.row == row)
-                    .map(|p| p.origin)
+                let gate = crate::catalog::pin_gate(&inner.pins, &inner.running, row)?;
+                (!self.pin_released(inner, row, &gate)).then_some(gate.origin)
             })
             .chain(inner.catalog.iter().map(|e| e.position))
             .collect();
@@ -7799,6 +8021,7 @@ impl Consensus {
         let before = self.holdings_held.len();
         self.holdings_held.retain(|h| *h >= p || keep.contains(h));
         if self.holdings_held.len() != before {
+            self.start_sets_dirty = true;
             self.publish_sets_held(None);
         }
         if removed > 0 || errors > 0 {
@@ -8283,6 +8506,15 @@ impl Consensus {
         if cv != self.holdings_catalog_version_seen {
             self.holdings_catalog_version_seen = cv;
             self.note_catalog_for_holdings(cv, &inner.catalog);
+        }
+        // Pin completion ruling C2: a new pin (or running record) changes
+        // which set a pinned row may start from, with no catalog change.
+        for row in self.services.ids() {
+            let gate = crate::catalog::pin_gate(&inner.pins, &inner.running, row);
+            if gate != self.start_set_gates[row as usize] {
+                self.start_set_gates[row as usize] = gate;
+                self.start_sets_dirty = true;
+            }
         }
         // The table METRICS are cluster-wide and unconditional (every node,
         // leader or follower) — gated only on the position actually moving,
@@ -9719,8 +9951,9 @@ impl Consensus {
                 row,
                 position,
                 hash,
+                size,
             } => {
-                self.on_snap_report(from, row, position, hash);
+                self.on_snap_report(from, row, position, hash, size);
                 return;
             }
         };
@@ -10178,7 +10411,7 @@ impl Consensus {
                 (0, 0, position)
             }
             Err(AppendError::WouldOverrun) => (2, 0, view_position),
-            // Unreachable: `SETTINGS_LEN` is 35 bytes. Refused rather than
+            // Unreachable: `SETTINGS_LEN` is 36 bytes. Refused rather than
             // retried, for `apply_schedule_table`'s reason.
             Err(AppendError::PayloadTooLarge) => self.refuse_settings(REASON_SETTINGS_DECODE),
         }
@@ -10252,6 +10485,26 @@ impl Consensus {
         // name, rather than installing anything wrong.
         if pin.origin != self.snapshot_set_position.load(Ordering::Acquire) {
             return self.refuse_upgrade_pin(REASON_PIN_NO_SET);
+        }
+        // 61 (snapshot-lifecycle spec §8, door-only per plan ruling P13): the
+        // origin must be AGREED - a pin is a one-way door, and an unverified
+        // or diverged origin would spread a possibly bad state to every node.
+        // An Empty catalog cannot answer; the pin is allowed as before, and
+        // named.
+        if state.catalog_empty() {
+            crate::obs_event!(
+                Info,
+                "upgrade_pin_agreement_unchecked",
+                node = self.id as u64,
+                row = pin.row as u64,
+                origin = pin.origin
+            );
+        } else if !state
+            .catalog
+            .iter()
+            .any(|e| e.position == pin.origin && e.is_agreed())
+        {
+            return self.refuse_upgrade_pin(REASON_PIN_ORIGIN_NOT_AGREED);
         }
         let cmd = ClusterCommand::UpgradePin(pin);
         if let Err(reason) = self.validate_cluster_command(&cmd) {
@@ -10425,6 +10678,13 @@ impl Consensus {
         if learner_id == self.id || !self.cluster_view.membership().is_learner(learner_id) {
             return Err(FetchRefusal::NotALearner);
         }
+        self.issue_fetch(learner_id, position, false)
+    }
+
+    /// The body `start_fetch` always had, minus its learner door: auto-fetch
+    /// may pull from any member (plan ruling P1) — the source's sender serves
+    /// a `SNAP_REQUEST` whatever its role.
+    fn issue_fetch(&mut self, from: NodeId, position: u64, auto: bool) -> Result<(), FetchRefusal> {
         // Honour `PendingFetch`: one fetch at a time. A second request is
         // answered `retry` rather than quietly replacing a transfer that is
         // very likely still running (the receiver would drop the new one
@@ -10435,7 +10695,7 @@ impl Consensus {
         if position > self.cnc.counters().durable.load_acquire() {
             return Err(FetchRefusal::AboveDurable);
         }
-        let Some(&peer) = self.id_to_addr.get(&learner_id) else {
+        let Some(&peer) = self.id_to_addr.get(&from) else {
             return Err(FetchRefusal::UnknownPeer);
         };
         if self
@@ -10452,19 +10712,197 @@ impl Consensus {
             return Err(FetchRefusal::Retry);
         }
         self.pending_fetch = Some(PendingFetch {
-            learner: learner_id,
+            learner: from,
             position,
             stored_before: self.stored_set_pos.load(Ordering::Acquire),
             deadline_ns: self.pass_now_ns.saturating_add(FETCH_TIMEOUT_NS),
+            auto,
         });
         crate::obs_event!(
             Info,
             "snapshot_fetch_requested",
             node = self.id as u64,
-            from = learner_id as u64,
-            position = position
+            from = from as u64,
+            position = position,
+            actor = if auto { "auto" } else { "operator" }
         );
         Ok(())
+    }
+
+    /// Snapshot-lifecycle spec §6: fetch the newest agreed set this node does
+    /// not hold, in the background. Steady path (switch off, a fetch in
+    /// flight, nothing agreed, waiting out a delay, or already held): a few
+    /// loads and compares.
+    #[inline]
+    fn maybe_auto_fetch(&mut self) {
+        if !self.cluster_view.auto_fetch.load(Ordering::Acquire) || self.pending_fetch.is_some() {
+            return;
+        }
+        let n = self
+            .cluster_view
+            .catalog_agreed_position
+            .load(Ordering::Acquire);
+        if n == 0 || self.auto_fetch.quiet(n, self.pass_now_ns) || self.holdings_held.contains(&n) {
+            return;
+        }
+        self.auto_fetch_step(n);
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn auto_fetch_step(&mut self, n: u64) {
+        use crate::auto_fetch::{Outcome, SpaceCheck};
+        let now = self.pass_now_ns;
+        let durable = self.cnc.counters().durable.load_acquire();
+        let inner = self.cluster_view.snapshot_inner();
+        let building = self.local_build_pending(n, &inner);
+        if !self.auto_fetch.due(n, durable, building, now) {
+            return;
+        }
+        let total = self
+            .cluster_view
+            .catalog_newest_agreed_bytes
+            .load(Ordering::Acquire);
+        let free = self
+            .holdings
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .free_bytes;
+        match self.auto_fetch.check_space(total, free, now) {
+            SpaceCheck::NoSpace { first } => {
+                self.auto_fetch_stats.bump(Outcome::NoSpace);
+                if first {
+                    crate::obs_event!(
+                        Warn,
+                        "snapshot_fetch_skipped_no_space",
+                        node = self.id as u64,
+                        position = n,
+                        bytes = total,
+                        free_bytes = free
+                    );
+                }
+                return;
+            }
+            SpaceCheck::Unknown { first: true } => {
+                crate::obs_event!(
+                    Info,
+                    "snapshot_fetch_size_unknown",
+                    node = self.id as u64,
+                    position = n
+                );
+            }
+            SpaceCheck::FreeUnknown { first: true } => {
+                // Review N3 (once per incarnation): the space check is off
+                // on this node because its free-bytes figure never arrived.
+                crate::obs_event!(
+                    Warn,
+                    "snapshot_fetch_free_unknown",
+                    node = self.id as u64,
+                    position = n,
+                    bytes = total
+                );
+            }
+            SpaceCheck::Unknown { first: false }
+            | SpaceCheck::FreeUnknown { first: false }
+            | SpaceCheck::Fits => {}
+        }
+        let candidates = self.auto_fetch_candidates(n, &inner);
+        let Some(from) = self.auto_fetch.pick(&candidates, now) else {
+            self.auto_fetch_stats.bump(Outcome::NoHolder);
+            crate::obs_event!(
+                Info,
+                "snapshot_fetch_no_holder",
+                node = self.id as u64,
+                position = n
+            );
+            return;
+        };
+        if crate::catalog::reporters_at(&inner.reports, n) == 1 && self.auto_fetch.first_thin() {
+            crate::obs_event!(
+                Warn,
+                "snapshot_fetch_single_reporter",
+                node = self.id as u64,
+                position = n
+            );
+        }
+        match self.issue_fetch(from, n, true) {
+            Ok(()) => self.audit_auto_fetch(from, n),
+            Err(_) => {
+                self.auto_fetch_stats.bump(Outcome::Refused);
+                self.auto_fetch.on_result(Outcome::Refused, now);
+            }
+        }
+    }
+
+    /// Plan ruling P8 as amended by controller ruling PF7: will this node
+    /// build the set at `n` itself? A standby set on a voter — never;
+    /// otherwise yes while any ATTACHED declared row has not frozen at `n`
+    /// (`snapshot_pos < n`). No `applied` clause: a row has applied past `n`
+    /// for the whole of its build window, so that clause read "not building"
+    /// exactly when a fetch would race the local builder. The caller's
+    /// [`crate::auto_fetch::AUTO_FETCH_BUILD_GUARD_NS`] bounds the hold, so a
+    /// row that never freezes cannot park auto-fetch forever.
+    fn local_build_pending(&self, n: u64, inner: &ClusterViewInner) -> bool {
+        let standby = inner
+            .catalog
+            .iter()
+            .find(|e| e.position == n)
+            .is_some_and(|e| e.kind == SetKind::Standby);
+        if standby && !inner.membership.is_learner(self.id) {
+            return false;
+        }
+        self.services.ids().any(|row| {
+            let s = self.cnc.service_slot(row as usize);
+            s.status.load_acquire() & CNC_SVC_STATUS_ATTACHED != 0
+                && s.snapshot_pos.load_acquire() < n
+        })
+    }
+
+    /// Plan ruling P1's candidate list for the set at `n`.
+    fn auto_fetch_candidates(&self, n: u64, inner: &ClusterViewInner) -> Vec<NodeId> {
+        let wire = self
+            .soft_wire
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let soft = soft_table_from_wire(&wire, &inner.membership);
+        let q = crate::catalog::CatalogQuery {
+            sets: &inner.catalog,
+            catalog_position: self.cluster_view.catalog_version.load(Ordering::Acquire),
+            soft: &soft,
+            now_ns: unix_now_ns(),
+            stale_ns: self.soft_stale_ns,
+        };
+        let live = q.holders(n);
+        let builders = crate::catalog::builders_at(&inner.reports, &inner.catalog, n);
+        let learners: Vec<NodeId> = inner
+            .membership
+            .learners
+            .iter()
+            .map(|(id, _)| *id)
+            .collect();
+        let voters: Vec<NodeId> = inner.membership.voters.iter().map(|(id, _)| *id).collect();
+        crate::catalog::fetch_candidates(self.id, &live, &builders, &learners, &voters)
+    }
+
+    /// Spec §6: the existing `snapshot_fetch` record (op 9), `actor = "auto"`
+    /// — written AFTER the issue, like `audit_datagram_mtu`, for its reason:
+    /// no request is waiting on an answer. `id` names the holder asked,
+    /// `config_version` the position.
+    ///
+    /// Ruling R15 (final review I1): only ENQUEUED here — no file I/O on the
+    /// consensus agent. Unlike the discovery record (a handful per cluster
+    /// life), this one recurs once per agreed instant on every voter, the
+    /// leader included, so its `sync_data` would be a per-instant commit
+    /// stall. The `uc2-holdings` thread writes and fsyncs it within ~50 ms
+    /// ([`crate::audit::AutoFetchAuditWriter::drain`]); a full queue drops
+    /// the record, counts it, and the writer names the count.
+    fn audit_auto_fetch(&mut self, from: NodeId, position: u64) {
+        self.auto_fetch_audit.push(crate::audit::AutoFetchAudit {
+            ts_ns: crate::obs::metrics::now_unix_ns(),
+            from,
+            position,
+        });
     }
 
     /// Retire a pending fetch once it has landed (the receiver published a
@@ -10479,6 +10917,11 @@ impl Consensus {
         let stored = self.stored_set_pos.load(Ordering::Acquire);
         if stored > p.stored_before {
             self.pending_fetch = None;
+            if p.auto {
+                self.auto_fetch_stats.bump(crate::auto_fetch::Outcome::Ok);
+                self.auto_fetch
+                    .on_result(crate::auto_fetch::Outcome::Ok, self.pass_now_ns);
+            }
             crate::obs_event!(
                 Info,
                 "snapshot_fetch_stored",
@@ -10488,6 +10931,17 @@ impl Consensus {
             );
         } else if self.pass_now_ns > p.deadline_ns {
             self.pending_fetch = None;
+            if p.auto {
+                self.auto_fetch_stats
+                    .bump(crate::auto_fetch::Outcome::Timeout);
+                self.auto_fetch
+                    .on_result(crate::auto_fetch::Outcome::Timeout, self.pass_now_ns);
+            } else {
+                // Controller ruling R8 (plan ruling P15): an OPERATOR fetch's
+                // expiry parks the receiver's straggler slot too — auto-fetch
+                // waits out the same 1 s floor before clearing it.
+                self.auto_fetch.note_timeout(self.pass_now_ns);
+            }
             crate::obs_event!(
                 Warn,
                 "snapshot_fetch_timeout",
@@ -11879,6 +12333,8 @@ struct HoldingsProbe {
     probes: u64,
     /// Ruling R40: hashes held sets' artifacts for the report cache.
     seeder: Option<ReportSeeder>,
+    /// Plan ruling P14: a test's stand-in for `statvfs` (`0` = off).
+    free_override: Option<Arc<AtomicU64>>,
 }
 
 /// Ruling R40: the `uc2-holdings` probe's second job. For each complete set
@@ -12029,11 +12485,11 @@ impl ReportSeeder {
             let mut set = ReportedSet {
                 position: p,
                 n: 0,
-                reports: [(0u8, 0u64); CNC_MAX_SERVICES + 1],
+                reports: [(0u8, 0u64, 0u64); CNC_MAX_SERVICES + 1],
             };
             for (&row, path) in self.rows.iter().zip(&row_paths) {
                 if let Some(h) = hash_row_artifact(path, p) {
-                    set.reports[set.n] = (row, h);
+                    set.reports[set.n] = (row, h, file_size(path));
                     set.n += 1;
                 }
             }
@@ -12041,7 +12497,7 @@ impl ReportSeeder {
                 .cluster_dir
                 .join(format!("{SNAP_PREFIX}{p}{CLUSTER_SNAP_SUFFIX}"));
             if let Some(h) = hash_file_from(&cluster, 0) {
-                set.reports[set.n] = (CLUSTER_ROW, h);
+                set.reports[set.n] = (CLUSTER_ROW, h, file_size(&cluster));
                 set.n += 1;
             }
             if set.n == per_set {
@@ -12156,6 +12612,12 @@ fn hash_row_artifact(path: &Path, p: u64) -> Option<u64> {
     hash_reader(f)
 }
 
+/// Snapshot-lifecycle spec §7.1 (plan ruling P6): an artifact's byte length
+/// on disk, `0` (unknown) when it cannot be read. One `stat`.
+fn file_size(path: &Path) -> u64 {
+    std::fs::metadata(path).map_or(0, |m| m.len())
+}
+
 /// Ruling R40: [`hash_row_artifact`] for a file with no envelope (the cluster
 /// artifact's bare image), from byte `skip`.
 fn hash_file_from(path: &Path, skip: u64) -> Option<u64> {
@@ -12200,7 +12662,14 @@ impl HoldingsProbe {
             last_probe_ns: None,
             probes: 0,
             seeder: None,
+            free_override: None,
         }
+    }
+
+    /// Plan ruling P14: a test's stand-in for `statvfs` (`0` = off).
+    fn with_free_override(mut self, cell: Arc<AtomicU64>) -> Self {
+        self.free_override = Some(cell);
+        self
     }
 
     /// Ruling R40: also seed the report cache (see [`ReportSeeder`]).
@@ -12228,15 +12697,25 @@ impl HoldingsProbe {
     #[cold]
     fn probe(&mut self, durable: u64, first_base: u64) {
         self.probes += 1;
-        let free = crate::preflight::free_disk_bytes(&self.instance_dir);
+        let free = match self
+            .free_override
+            .as_ref()
+            .map(|c| c.load(Ordering::Acquire))
+        {
+            Some(v) if v != 0 => Some(v),
+            _ => crate::preflight::free_disk_bytes(&self.instance_dir),
+        };
         let journal =
             journal_bytes_estimate(durable, first_base, self.segment_bytes, self.preallocate);
         let snapshots = dir_bytes(&self.snap_root);
         let mut h = self.holdings.lock().unwrap_or_else(|e| e.into_inner());
         // A failed `statvfs` keeps the last reading rather than advertising
-        // a plausible-looking 0.
+        // a plausible-looking 0. A real reading is stored as at least 1, so
+        // 0 stays `auto_fetch::FREE_BYTES_UNKNOWN` — "never measured", which
+        // neither the space check nor `uc2_snapshot_wont_fit` reads as full
+        // (final review M6).
         if let Some(free) = free {
-            h.free_bytes = free;
+            h.free_bytes = free.max(1);
         }
         h.journal_bytes = journal;
         h.snapshots_bytes = snapshots;
@@ -12293,6 +12772,24 @@ fn dir_bytes(dir: &Path) -> u64 {
         }
     }
     total
+}
+
+/// Catalog spec §5.3: a `SoftTable` from the sender's address-keyed `STATUS`
+/// map over `membership`. Only a LEADER's map is filled (`STATUS` goes to the
+/// leader), so on a follower this is empty — plan ruling P1's reason for the
+/// builders tier. Shared by `Node::soft_table` and the auto-fetch holder
+/// choice.
+fn soft_table_from_wire(
+    wire: &SoftTableWire,
+    membership: &ClusterConfig,
+) -> crate::catalog::SoftTable {
+    let mut t = crate::catalog::SoftTable::default();
+    for (id, addr) in membership.voters.iter().chain(membership.learners.iter()) {
+        if let Some((h, at)) = wire.get(&addr_of(*addr)) {
+            t.record(*id, *h, *at);
+        }
+    }
+    t
 }
 
 /// The wire `Addr` tuple (`uc_consensus::config::Addr = (ip: u32, port:
@@ -13193,6 +13690,9 @@ mod tests {
         _cfg_obs_tx: mpsc::SyncSender<(u64, Vec<u8>)>,
         _ingress_tx: mpsc::SyncSender<Ingress>,
         _trunc_rx: mpsc::Receiver<ArchiveCmd>,
+        /// Ruling R15: the `uc2-holdings` thread's half of the auto-fetch
+        /// audit hand-off — a test drains it to stand in for that thread.
+        auto_fetch_audit_writer: crate::audit::AutoFetchAuditWriter,
         _dir: tempfile::TempDir,
     }
 
@@ -13609,6 +14109,13 @@ mod tests {
         // `cluster_snapshot_pos` — shared between the `uc2-cluster` agent this
         // harness drives by hand and the `Consensus` under test, exactly as
         // `Node::start_with_socket` shares them.
+        // Controller ruling PF14: the harness runs with auto-fetch OFF, so a
+        // test that drives passes over a catalog never finds a stray
+        // `pending_fetch`; auto-fetch's own tests switch it on.
+        let settings_genesis = Settings {
+            auto_fetch: false,
+            ..settings_genesis
+        };
         let cluster_genesis = ClusterState {
             membership: config.clone(),
             table: ScheduleTable { entries: vec![] },
@@ -13670,6 +14177,8 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
         );
 
+        let (auto_fetch_audit, auto_fetch_audit_writer) =
+            crate::audit::auto_fetch_audit_channel(AuditLog::open(dir.path()).unwrap(), 1);
         let mut cons = Consensus {
             reports_unattested: Arc::new(AtomicU64::new(0)),
             validated_frontier: Arc::new(AtomicU64::new(u64::MAX)),
@@ -13863,6 +14372,7 @@ mod tests {
             fetch_tx,
             stored_set_pos,
             stored_above_durable: 0,
+            stored_set_noted: 0,
             snapshot_floor_hold: 0,
             snapshot_standby_learner: Arc::new(AtomicU32::new(0)),
             snapshot_standby_position: Arc::new(AtomicU64::new(0)),
@@ -13876,6 +14386,16 @@ mod tests {
             holdings_catalog_version_seen: 0,
             holdings_catalog: Vec::with_capacity(MAX_CATALOG_SETS),
             holdings_held: Vec::with_capacity(2 * MAX_CATALOG_SETS),
+            start_sets: [crate::catalog::StartSet::default(); CNC_MAX_SERVICES],
+            start_sets_dirty: true,
+            start_set_wait_above: u64::MAX,
+            start_set_recomputes: 0,
+            start_set_gates: [None; CNC_MAX_SERVICES],
+            auto_fetch: crate::auto_fetch::AutoFetch::new(1),
+            auto_fetch_stats: Arc::new(Default::default()),
+            auto_fetch_audit,
+            soft_wire: Arc::new(Mutex::new(SoftTableWire::new())),
+            soft_stale_ns: SOFT_STALE_FACTOR * 300,
         };
         // The LAST thing `Node::start_with_socket` does before spawning the
         // consensus agent, mirrored here so this harness exercises the same
@@ -13898,6 +14418,7 @@ mod tests {
             _cfg_obs_tx: cfg_obs_tx,
             _ingress_tx: ingress_tx,
             _trunc_rx: trunc_rx,
+            auto_fetch_audit_writer,
             _dir: dir,
         }
     }
@@ -14305,6 +14826,60 @@ mod tests {
         );
     }
 
+    /// Snapshot-lifecycle spec §4.2-4.3: the consensus agent publishes the
+    /// row's start set on its cnc slot, moves it when the frontier passes a
+    /// newer held agreed set, and costs no recompute on a steady pass.
+    #[test]
+    fn the_start_set_is_published_and_recomputed_only_on_a_change() {
+        let mut h = harness_with_rows(&["a"]);
+        let mut st = h.cons.cluster_view.to_state();
+        let mut a = agreed_entry(1000);
+        a.rows[0].version = 7;
+        let mut b = agreed_entry(2000);
+        b.rows[0].version = 7;
+        st.catalog = vec![a, b];
+        // `refresh_from_view` acts only when the view's position moves.
+        st.applied += 1;
+        h.cons.cluster_view.publish(&st);
+        h.cons.refresh_from_view();
+        h.cons.note_set_held(1000);
+        h.cons.note_set_held(2000);
+        let cnc = Arc::clone(&h.cons.cnc);
+        let c = cnc.counters();
+        c.durable.store_release(1500);
+        c.commit.store_release(1500);
+        h.cons.maybe_publish_start_sets();
+        let slot = cnc.service_slot(0);
+        assert_eq!(slot.snapshot_pos.start_set(), Some((1000, 7)));
+        let n = h.cons.start_set_recomputes;
+        for _ in 0..1000 {
+            h.cons.maybe_publish_start_sets();
+        }
+        assert_eq!(
+            h.cons.start_set_recomputes, n,
+            "a steady pass recomputes nothing"
+        );
+        c.durable.store_release(2500);
+        c.commit.store_release(2500);
+        h.cons.maybe_publish_start_sets();
+        assert_eq!(
+            slot.snapshot_pos.start_set(),
+            Some((2000, 7)),
+            "the frontier passed 2000"
+        );
+        assert_eq!(h.cons.start_set_recomputes, n + 1);
+        st.catalog.clear();
+        st.applied += 1;
+        h.cons.cluster_view.publish(&st);
+        h.cons.refresh_from_view();
+        h.cons.maybe_publish_start_sets();
+        assert_eq!(
+            slot.snapshot_pos.start_set(),
+            None,
+            "an empty catalog publishes none"
+        );
+    }
+
     /// Catalog test helper: a `Complete` set at `p` whose cluster artifact
     /// and row 0 are `Agreed` — the shape `is_agreed` accepts.
     fn agreed_entry(p: u64) -> uc_protocol::v2::catalog::SetEntry {
@@ -14357,6 +14932,36 @@ mod tests {
             .collect();
         v.sort_unstable();
         v
+    }
+
+    /// Snapshot-lifecycle spec §7.1, plan ruling P6: the completion edge
+    /// reports each artifact's FILE length — a row's envelope included, the
+    /// cluster image whole — and the collected record carries them.
+    #[test]
+    fn completion_edge_reports_carry_artifact_file_sizes() {
+        use uc_protocol::v2::upgrade::CLUSTER_ROW;
+        let mut h = harness_with_rows(&["a"]);
+        drive_to_serving_leader(&mut h);
+        let p = 6048u64;
+        let membership = h.cons.cluster_view.membership();
+        install_cluster_artifact_for_test(&mut h, p, &membership);
+        assert_eq!(h.cluster.take_snapshot().unwrap(), p);
+        write_row_artifact(&h, 0, p, &[7u8; 57]);
+        h.row_published_at(0, p, uc_service::snapshots::artifact_hash_of(&[7u8; 57]));
+        h.cons.check_set_completeness();
+        let cluster_len = std::fs::metadata(
+            h.cons
+                .cluster_snapshot_dir
+                .join(format!("snap-{p}.ultcluster")),
+        )
+        .unwrap()
+        .len();
+        assert_eq!(h.cons.pending_reports_for(0)[0].sizes[&h.cons.id], 57);
+        assert_eq!(
+            h.cons.pending_reports_for(CLUSTER_ROW)[0].sizes[&h.cons.id],
+            cluster_len
+        );
+        assert!(cluster_len > 0);
     }
 
     /// Catalog spec §5.1: a node that completes a set reports the cluster
@@ -14812,7 +15417,8 @@ mod tests {
 
     /// Plan B2 T5 (fix round), the other half of the pinned-origin
     /// guarantee: retention keeps the pinned artifacts, and the FLOOR is
-    /// held at a pinned origin this node has not consumed yet — so the
+    /// held at a pinned origin this node may not release yet (pin
+    /// completion C7: complete, a completion set held, `to` past it) — so the
     /// journal the pinned attach tail-replays from is still there when the
     /// new binary shows up.
     ///
@@ -14827,40 +15433,39 @@ mod tests {
         let (p1, p2) = (4096u64, 6016u64);
 
         // Row 0 is pinned at p1 (`from` 1.0.0 → `to` 2.0.0) in the committed
-        // view, and its service is attached — but still at `from`, which is
-        // the whole window this hold exists for. Distinct LINES on purpose:
-        // since #33 ruling R17 the hold compares by line, and raw `1`/`2`
-        // are both 0.0.x.
-        let (from, to) = (pack_version(1, 0, 0), pack_version(2, 0, 0));
-        let mut st = h.cons.cluster_view.to_state();
-        st.pins.push(UpgradePin {
-            row: 0,
-            from,
-            to,
-            origin: p1,
-        });
-        st.applied = p1;
-        h.cons.cluster_view.publish(&st);
+        // view, and `to` is attached, replaying its pinned install's tail.
+        // The pin is COMPLETE (pin completion ruling C1: the catalog lists
+        // p2, agreed, built on `to`'s line above the pin record), so what
+        // this test varies is the LOCAL half of ruling C7: is the completion
+        // set a start set here, and is `to` past it.
+        let to = pack_version(2, 0, 0);
+        commit_pin_and_catalog(&h, p1, p1 + 64, &[p2]);
         let slot = h.cons.cnc.service_slot(0);
         slot.status
             .store_release(uc_log::cnc::pack_service_status(0, true, 1));
-        slot.status.store_version(from);
+        slot.status.store_version(to);
+        slot.applied.store_release(p1);
 
-        // A complete set at p2 — newer than the pinned origin.
+        // A complete set at p2 — newer than the pinned origin, a completion
+        // set (above the record, on `to`'s line) — durable here but not yet
+        // committed, so this node does not yet hold it AS A START SET.
         h.row_froze_at(0, p2);
         h.cluster_snapshot_pos.store(p2, Ordering::Release);
         h.cons.check_set_completeness();
+        h.cons.note_set_held(p2);
         assert_eq!(
             h.cons.snapshot_set_position.load(Ordering::Relaxed),
             p2,
             "precondition: the set at p2 is complete here"
         );
+        h.cons.cnc.counters().durable.store_release(p2 + 1000);
+        h.cons.cnc.counters().commit.store_release(p2 - 1);
 
         h.advance_floor_timer();
         assert!(h.cons.maybe_persist_snapshot_floor());
         assert_eq!(
             h.cons.snapshot_persisted_floor, p1,
-            "the floor stops at the unconsumed pin's origin, not at the newest set"
+            "the floor stops at the origin while no completion set is a start set here"
         );
         assert_eq!(
             h.cons.cnc.snapshots().node_snapshot_floor.load_acquire(),
@@ -14869,74 +15474,65 @@ mod tests {
         );
         assert_eq!(h.cons.snapshot_floor_hold, p1, "the hold is latched once");
 
-        // `to` attaches — but its tail replay has not reached p2 yet. The
-        // hold STAYS: the journal it is about to replay is exactly what the
-        // purge behind this floor move would remove.
-        h.cons.cnc.service_slot(0).status.store_version(to);
-        h.cons.cnc.service_slot(0).applied.store_release(p1);
+        // The set is now at or below `min(commit, durable)` — but `to` is
+        // attached and its tail replay has not reached p2 yet (ruling C7,
+        // review m1). The hold STAYS: the journal it is replaying is exactly
+        // what the purge behind this floor move would remove.
+        h.cons.cnc.counters().commit.store_release(p2 + 1000);
         h.advance_floor_timer();
         h.cons.maybe_persist_snapshot_floor();
         assert_eq!(
             h.cons.snapshot_persisted_floor, p1,
-            "attached at `to` is not enough — the row has not replayed past the cut"
+            "a `to` replay below the completion set holds the origin"
         );
 
-        // …and releases once the row's published frontier is past the
-        // candidate floor.
+        // …and releases once the row's published frontier reaches the set.
         h.cons.cnc.service_slot(0).applied.store_release(p2);
         h.advance_floor_timer();
         assert!(h.cons.maybe_persist_snapshot_floor());
         assert_eq!(
             h.cons.snapshot_persisted_floor, p2,
-            "a consumed pin holds nothing"
+            "a complete, held, caught-up pin holds nothing"
         );
         assert_eq!(h.cons.snapshot_floor_hold, 0, "and the latch is cleared");
     }
 
     /// #33 ruling R17 (spec D3, patch is free): the pin names a LINE, so a
-    /// row attached at a PATCH build of `to` that has replayed past the
-    /// candidate has consumed the pin — the hold releases. Before R17 the
-    /// check was exact and a row upgraded to a patch of `to` held the floor
-    /// forever. A build on another line (here: still `from`) keeps holding.
+    /// row attached at a PATCH build of `to` is a `to` instance — ruling
+    /// C7's replay guard sees it: below the completion set it holds, at the
+    /// set it releases.
     #[test]
     fn a_patch_build_of_the_pinned_to_consumes_the_pin() {
         let mut h = harness_with_rows(&["a"]);
         let (p1, p2) = (4096u64, 6016u64);
-        let (from, to) = (pack_version(1, 0, 0), pack_version(2, 0, 0));
         let to_patch = pack_version(2, 0, 3);
-        let mut st = h.cons.cluster_view.to_state();
-        st.pins.push(UpgradePin {
-            row: 0,
-            from,
-            to,
-            origin: p1,
-        });
-        st.applied = p1;
-        h.cons.cluster_view.publish(&st);
+        let to = commit_pin_and_catalog(&h, p1, p1 + 64, &[p2]);
+        assert_eq!(to, pack_version(2, 0, 0));
         let slot = h.cons.cnc.service_slot(0);
         slot.status
             .store_release(uc_log::cnc::pack_service_status(0, true, 1));
-        // Off-line (still `from`), past the candidate: holds.
-        slot.status.store_version(from);
-        slot.applied.store_release(p2);
+        slot.status.store_version(to_patch);
+        slot.applied.store_release(p1);
 
         h.row_froze_at(0, p2);
         h.cluster_snapshot_pos.store(p2, Ordering::Release);
         h.cons.check_set_completeness();
+        h.cons.note_set_held(p2);
+        h.cons.cnc.counters().commit.store_release(p2 + 1000);
+        h.cons.cnc.counters().durable.store_release(p2 + 1000);
         h.advance_floor_timer();
         assert!(h.cons.maybe_persist_snapshot_floor());
         assert_eq!(
             h.cons.snapshot_persisted_floor, p1,
-            "a row still on `from`'s line has not consumed the pin"
+            "a patch of `to` replaying below the set holds, as `to` would"
         );
 
-        // A patch of `to`, past the candidate: consumed.
-        h.cons.cnc.service_slot(0).status.store_version(to_patch);
+        h.cons.cnc.service_slot(0).applied.store_release(p2);
         h.advance_floor_timer();
         assert!(h.cons.maybe_persist_snapshot_floor());
         assert_eq!(
             h.cons.snapshot_persisted_floor, p2,
-            "a patch build of `to` consumes the pin"
+            "a patch build of `to` past the set releases"
         );
         assert_eq!(h.cons.snapshot_floor_hold, 0);
     }
@@ -14971,6 +15567,263 @@ mod tests {
         h.advance_floor_timer();
         assert!(h.cons.maybe_persist_snapshot_floor());
         assert_eq!(h.cons.snapshot_persisted_floor, p1);
+    }
+
+    // ---- pin completion (rulings C1-C3) ----
+
+    /// Commit, in the harness's view, row 0 pinned at `origin` (`from` 1.0.0
+    /// → `to` 2.0.0) with its pin record at `record_pos`, and a catalog of
+    /// agreed sets at `sets`, each recording row 0 on `to`'s line — what
+    /// `version_at` reports for any set above the origin.
+    fn commit_pin_and_catalog(h: &Harness, origin: u64, record_pos: u64, sets: &[u64]) -> u32 {
+        use uc_protocol::v2::upgrade::RowRunning;
+        let (from, to) = (pack_version(1, 0, 0), pack_version(2, 0, 0));
+        let mut st = h.cons.cluster_view.to_state();
+        st.pins.push(UpgradePin {
+            row: 0,
+            from,
+            to,
+            origin,
+        });
+        st.running[0] = Some(RowRunning {
+            row: 0,
+            version: to,
+            record_pos,
+        });
+        st.catalog = sets
+            .iter()
+            .map(|&p| {
+                let mut e = agreed_entry(p);
+                e.rows[0].version = if p <= origin { from } else { to };
+                e
+            })
+            .collect();
+        st.applied = record_pos.max(sets.iter().copied().max().unwrap_or(0)) + 1;
+        h.cons.cluster_view.publish(&st);
+        to
+    }
+
+    /// Row 0's service attached at `version` with `applied` published.
+    fn attach_row0(h: &Harness, version: u32, applied: u64) {
+        let slot = h.cons.cnc.service_slot(0);
+        slot.status
+            .store_release(uc_log::cnc::pack_service_status(0, true, 1));
+        slot.status.store_version(version);
+        slot.applied.store_release(applied);
+    }
+
+    /// Brief test 2 (ruling C3): a row CONSUMED here — attached on `to`'s
+    /// line and replayed past the candidate — still holds the floor at the
+    /// origin while the pin is not complete. The only agreed set above the
+    /// origin sits at or below the pin record (the old binary froze it
+    /// before the pin committed), so it does not complete the pin, and the
+    /// origin's set stays on disk. Before C3 the hold released here.
+    #[test]
+    fn a_consumed_pin_holds_the_floor_until_the_pin_is_complete() {
+        let mut h = harness_with_rows(&["a"]);
+        let (p1, p2, record) = (4096u64, 6016u64, 6400u64);
+        for p in [p1, p2] {
+            write_row_artifact(&h, 0, p, b"x");
+            write_cluster_artifact(&h, p, b"c");
+        }
+        // The catalog lists p2 only, so the pruner can keep p1 below only
+        // through the PIN, not through a catalog listing.
+        let to = commit_pin_and_catalog(&h, p1, record, &[p2]);
+        attach_row0(&h, to, p2 + 1000);
+        h.row_froze_at(0, p2);
+        h.cluster_snapshot_pos.store(p2, Ordering::Release);
+        h.cons.check_set_completeness();
+        assert_eq!(h.cons.snapshot_set_position.load(Ordering::Relaxed), p2);
+
+        h.advance_floor_timer();
+        h.cons.maybe_persist_snapshot_floor();
+        assert_eq!(
+            h.cons.snapshot_persisted_floor, p1,
+            "consumed but not complete: the floor stays at the origin"
+        );
+        assert_eq!(h.cons.snapshot_floor_hold, p1);
+        h.cons.prune_snapshots_below(p2);
+        assert!(
+            list_row_artifacts(&h, 0).contains(&p1),
+            "the origin's set is kept while the pin is incomplete"
+        );
+    }
+
+    /// Ruling C7 (review I1): the pin is COMPLETE (an agreed set p3 above
+    /// the record) and the row is CONSUMED here — attached on `to`'s line,
+    /// replayed past the candidate p2 (an agreed set between the origin and
+    /// the record) — but this node holds NO completion set. A restart here
+    /// can only take the pinned install, so the origin and its journal must
+    /// stay: the floor holds at the origin and the pruner keeps `snap-p1`.
+    #[test]
+    fn a_consumed_node_without_a_completion_set_keeps_the_origin() {
+        let mut h = harness_with_rows(&["a"]);
+        let (p1, p2, record, p3) = (4096u64, 6016u64, 6400u64, 8192u64);
+        for p in [p1, p2] {
+            write_row_artifact(&h, 0, p, b"x");
+            write_cluster_artifact(&h, p, b"c");
+        }
+        let to = commit_pin_and_catalog(&h, p1, record, &[p2, p3]);
+        attach_row0(&h, to, p2 + 1000);
+        h.row_froze_at(0, p2);
+        h.cluster_snapshot_pos.store(p2, Ordering::Release);
+        h.cons.check_set_completeness();
+        h.cons.cnc.counters().commit.store_release(p3 + 1000);
+        h.cons.cnc.counters().durable.store_release(p3 + 1000);
+        h.advance_floor_timer();
+        h.cons.maybe_persist_snapshot_floor();
+        assert_eq!(
+            h.cons.snapshot_persisted_floor, p1,
+            "consumed but no completion set held: the floor holds at the origin"
+        );
+        h.cons.prune_snapshots_below(p2);
+        assert!(
+            list_row_artifacts(&h, 0).contains(&p1),
+            "the origin a restart here still needs is kept"
+        );
+    }
+
+    /// Ruling C7 (review m1): a completion set p2 is held, but the `to`
+    /// instance attached here is still replaying below it (its pinned
+    /// install's tail) — releasing would purge the journal under that
+    /// replay. The node keeps holding until `applied` reaches the set.
+    #[test]
+    fn a_held_completion_set_waits_for_an_attached_replay_below_it() {
+        let mut h = harness_with_rows(&["a"]);
+        let (p1, record, p2) = (4096u64, 4500u64, 6016u64);
+        for p in [p1, p2] {
+            write_row_artifact(&h, 0, p, b"x");
+            write_cluster_artifact(&h, p, b"c");
+        }
+        let to = commit_pin_and_catalog(&h, p1, record, &[p2]);
+        attach_row0(&h, to, p1 + 100);
+        h.row_froze_at(0, p2);
+        h.cluster_snapshot_pos.store(p2, Ordering::Release);
+        h.cons.check_set_completeness();
+        h.cons.note_set_held(p2);
+        h.cons.cnc.counters().commit.store_release(p2 + 1000);
+        h.cons.cnc.counters().durable.store_release(p2 + 1000);
+        h.advance_floor_timer();
+        h.cons.maybe_persist_snapshot_floor();
+        assert_eq!(
+            h.cons.snapshot_persisted_floor, p1,
+            "an attached `to` replay below the set holds the origin"
+        );
+        h.cons.cnc.service_slot(0).applied.store_release(p2);
+        h.advance_floor_timer();
+        assert!(h.cons.maybe_persist_snapshot_floor());
+        assert_eq!(h.cons.snapshot_persisted_floor, p2, "past it: released");
+    }
+
+    /// Ruling C8 (review m4): release is not monotone, so a hold can name
+    /// an origin BELOW the persisted floor (here: an incomplete pin at p1
+    /// after the floor already reached p2). The hold is clamped to the
+    /// persisted floor — the floor stays increase-only, and the latched
+    /// `snapshot_floor_held_for_pin` position never goes below it.
+    #[test]
+    fn a_hold_below_the_persisted_floor_returns_the_persisted_floor() {
+        let mut h = harness_with_rows(&["a"]);
+        let (p1, p2, record, p3) = (4096u64, 6016u64, 6400u64, 8192u64);
+        // Incomplete: the only listed set (p2) is below the pin record.
+        commit_pin_and_catalog(&h, p1, record, &[p2]);
+        h.cons.snapshot_persisted_floor = p2;
+        let inner = h.cons.cluster_view.snapshot_inner();
+        assert_eq!(h.cons.hold_floor_for_pins(&inner, p3), p2);
+        assert_eq!(h.cons.snapshot_floor_hold, p2, "the event names the floor");
+    }
+
+    /// Ruling C7, the other node: the pin is COMPLETE, but this node holds
+    /// no completion set (its service still on `from`, or not back yet) — it
+    /// keeps holding, because its instance still has to install the origin.
+    #[test]
+    fn a_complete_pin_holds_on_a_node_that_holds_no_completion_set() {
+        let mut h = harness_with_rows(&["a"]);
+        let (p1, p2, record) = (4096u64, 6016u64, 4500u64);
+        let _to = commit_pin_and_catalog(&h, p1, record, &[p1, p2]);
+        attach_row0(&h, pack_version(1, 0, 0), p2 + 1000);
+        // `own` = p2 (the candidate) without this node HOLDING p2 as a
+        // catalogued completion set — `holdings_held` stays empty.
+        h.cons.snapshot_set_position.store(p2, Ordering::Release);
+        h.cons.cnc.counters().commit.store_release(p2 + 1000);
+        h.cons.cnc.counters().durable.store_release(p2 + 1000);
+        h.advance_floor_timer();
+        h.cons.maybe_persist_snapshot_floor();
+        assert_eq!(h.cons.snapshot_persisted_floor, p1);
+    }
+
+    /// Ruling C3: complete AND held — a node whose service has not come back
+    /// (detached) but which holds the completion set releases: a restarting
+    /// service starts from that set (ruling C2), not from the origin.
+    #[test]
+    fn a_complete_pin_releases_on_a_node_that_holds_a_completion_set() {
+        let mut h = harness_with_rows(&["a"]);
+        let (p1, p2, record) = (4096u64, 6016u64, 4500u64);
+        for p in [p1, p2] {
+            write_row_artifact(&h, 0, p, b"x");
+            write_cluster_artifact(&h, p, b"c");
+        }
+        // p1 is not listed: the FSM's retention retired it when p2 completed
+        // the pin (`retain_sets = 1`), so only the pin could still keep it.
+        let _to = commit_pin_and_catalog(&h, p1, record, &[p2]);
+        let slot = h.cons.cnc.service_slot(0);
+        slot.status
+            .store_release(uc_log::cnc::pack_service_status(0, false, 1));
+        h.row_froze_at(0, p2);
+        h.cluster_snapshot_pos.store(p2, Ordering::Release);
+        h.cons.check_set_completeness();
+        h.cons.note_set_held(p2);
+        h.cons.cnc.counters().commit.store_release(p2 + 1000);
+        h.cons.cnc.counters().durable.store_release(p2 + 1000);
+        h.advance_floor_timer();
+        assert!(h.cons.maybe_persist_snapshot_floor());
+        assert_eq!(
+            h.cons.snapshot_persisted_floor, p2,
+            "a held completion set releases the hold"
+        );
+        assert_eq!(h.cons.snapshot_floor_hold, 0);
+        assert_eq!(
+            list_row_artifacts(&h, 0),
+            vec![p2],
+            "and retention no longer keeps the origin"
+        );
+    }
+
+    /// Ruling C2, node side: the start set published for a PINNED row is the
+    /// newest held COMPLETION set — never the origin or a set at or below
+    /// the pin record — and a newly committed pin moves it with no catalog
+    /// change.
+    #[test]
+    fn a_pinned_row_is_published_only_a_completion_set() {
+        let mut h = harness_with_rows(&["a"]);
+        drive_to_serving_leader(&mut h);
+        let (p1, p2, p3) = (1000u64, 2000u64, 3000u64);
+        let mut st = h.cons.cluster_view.to_state();
+        st.catalog = vec![agreed_entry(p1), agreed_entry(p2), agreed_entry(p3)];
+        st.applied = p3; // the pin below publishes at a later position
+        h.cons.cluster_view.publish(&st);
+        h.cons.refresh_from_view();
+        h.cons.note_set_held(p1);
+        h.cons.note_set_held(p2);
+        h.cons.cnc.counters().commit.store_release(p3 + 10);
+        h.cons.cnc.counters().durable.store_release(p3 + 10);
+        h.cons.maybe_publish_start_sets();
+        let cnc = Arc::clone(&h.cons.cnc);
+        let slot = cnc.service_slot(0);
+        assert_eq!(slot.snapshot_pos.start_set().map(|s| s.0), Some(p2));
+
+        // A pin at p1 whose record is above p2: no held completion set.
+        let to = commit_pin_and_catalog(&h, p1, p2 + 100, &[p1, p2, p3]);
+        h.cons.refresh_from_view();
+        h.cons.maybe_publish_start_sets();
+        assert_eq!(
+            slot.snapshot_pos.start_set(),
+            None,
+            "the pin moved the gate: p2 sits below the record"
+        );
+        // Holding p3 — above the record, on `to`'s line — publishes it.
+        h.cons.note_set_held(p3);
+        h.cons.maybe_publish_start_sets();
+        assert_eq!(slot.snapshot_pos.start_set(), Some((p3, to)));
     }
 
     // ---- plan B3 T3: live snapshot-hash reports on the set-complete edge ----
@@ -15056,12 +15909,14 @@ mod tests {
                     node_id: 1,
                     position: p,
                     hash: 0xA1A1_A1A1_A1A1_A1A1,
+                    size: 0,
                 },
                 SnapReportBody {
                     row: 1,
                     node_id: 1,
                     position: p,
                     hash: 0xB2B2_B2B2_B2B2_B2B2,
+                    size: 0,
                 },
             ],
             "one report per declared row, each carrying ITS row's hash"
@@ -15133,6 +15988,7 @@ mod tests {
                 node_id: 1,
                 position: p,
                 hash: 0xFEED_FACE_FEED_FACE,
+                size: 0,
             }],
             "row 1 is part of the set but has nothing to attest"
         );
@@ -15235,6 +16091,31 @@ mod tests {
 
     // ---- plan B3 T4: the leader collects the reports and appends the record ----
 
+    /// Snapshot-lifecycle spec §7.1: the committed record carries each
+    /// reporter's size beside its hash, in node-id order.
+    #[test]
+    fn a_collected_report_record_carries_each_reporters_size() {
+        let _obs = obs_capture_lock();
+        let mut h = harness_with_rows(&["a"]);
+        drive_to_serving_leader(&mut h);
+        h.cons.pass_mono_ns = 1_000;
+        let p = 6048u64;
+        h.cons.on_snap_report(2, 0, p, 0xA1, 40);
+        h.cons.on_snap_report(0, 0, p, 0xA1, 40);
+        h.cons.on_snap_report(1, 0, p, 0xA1, 0);
+        assert!(h.cons.maybe_append_snapshot_reports());
+        let end = h.cons.last_cluster_append;
+        h.commit_through(end);
+        assert_eq!(
+            h.cons
+                .cluster_view
+                .to_state()
+                .report_for(0)
+                .map(|r| r.hashes.clone()),
+            Some(vec![(0, 0xA1, 40), (1, 0xA1, 0), (2, 0xA1, 40)])
+        );
+    }
+
     /// Spec §6.5.2 item 3 as amended by ruling R-B3-1, the base case: the
     /// leader holds what arrives per `(row, instant)` and appends ONE `CLUSTER
     /// kind = 5` record the moment EVERY VOTER has reported — three of three
@@ -15259,17 +16140,17 @@ mod tests {
 
         let cap = ObsCapture::take();
         let buf = cap.buf();
-        h.cons.on_snap_report(1, 0, p, 0xA1);
+        h.cons.on_snap_report(1, 0, p, 0xA1, 0);
         assert!(
             !h.cons.maybe_append_snapshot_reports(),
             "one voter of three is not every voter"
         );
-        h.cons.on_snap_report(0, 0, p, 0xA1);
+        h.cons.on_snap_report(0, 0, p, 0xA1, 0);
         assert!(
             !h.cons.maybe_append_snapshot_reports(),
             "two of three is a QUORUM, and a quorum is not the trigger (ruling R-B3-1)"
         );
-        h.cons.on_snap_report(2, 0, p, 0xA1);
+        h.cons.on_snap_report(2, 0, p, 0xA1, 0);
         assert!(
             h.cons.maybe_append_snapshot_reports(),
             "every voter has reported — and the leader does not wait out its timeout"
@@ -15284,7 +16165,7 @@ mod tests {
             Some(&SnapshotReport {
                 row: 0,
                 position: p,
-                hashes: vec![(0, 0xA1), (1, 0xA1), (2, 0xA1)],
+                hashes: vec![(0, 0xA1, 0), (1, 0xA1, 0), (2, 0xA1, 0)],
             }),
             "the record holds all three hashes, ordered by node id"
         );
@@ -15327,8 +16208,8 @@ mod tests {
         h.cons.pass_mono_ns = 1_000;
         let p = 6048u64;
 
-        h.cons.on_snap_report(0, 0, p, 0xC1);
-        h.cons.on_snap_report(1, 0, p, 0xC1);
+        h.cons.on_snap_report(0, 0, p, 0xC1, 0);
+        h.cons.on_snap_report(1, 0, p, 0xC1, 0);
         assert!(
             !h.cons.maybe_append_snapshot_reports(),
             "two of three voters is a quorum, and a quorum is not the trigger"
@@ -15344,7 +16225,7 @@ mod tests {
         let state = h.cons.cluster_view.to_state();
         assert_eq!(
             state.report_for(0).map(|r| r.hashes.clone()),
-            Some(vec![(0, 0xC1), (1, 0xC1)]),
+            Some(vec![(0, 0xC1, 0), (1, 0xC1, 0)]),
             "the record names who DID report"
         );
         assert_eq!(h.cons.snapshot_reports_appended.load(Ordering::Relaxed), 1);
@@ -15361,7 +16242,7 @@ mod tests {
         // ...and the straggler that arrives afterwards is DROPPED: its instant
         // is no newer than the one the committed record already holds, and
         // re-appending it would churn the log for nothing.
-        h.cons.on_snap_report(2, 0, p, 0xC1);
+        h.cons.on_snap_report(2, 0, p, 0xC1, 0);
         assert!(
             h.cons.pending_snapshot_reports.is_empty(),
             "<= the held report's position"
@@ -15380,7 +16261,7 @@ mod tests {
         h.cons.pass_mono_ns = 1_000;
         let p = 6048u64;
 
-        h.cons.on_snap_report(1, 0, p, 0xB2);
+        h.cons.on_snap_report(1, 0, p, 0xB2, 0);
         assert!(!h.cons.maybe_append_snapshot_reports(), "one of three");
         h.cons.pass_mono_ns += SNAP_REPORT_TIMEOUT_NS - 1;
         assert!(
@@ -15401,7 +16282,7 @@ mod tests {
             Some(&SnapshotReport {
                 row: 0,
                 position: p,
-                hashes: vec![(1, 0xB2)],
+                hashes: vec![(1, 0xB2, 0)],
             }),
             "one reporter is a legitimate record — `verdict` reads it as agreed over one node"
         );
@@ -15690,7 +16571,7 @@ mod tests {
     fn a_snapshot_report_from_a_non_member_is_dropped() {
         let mut h = harness_with_rows(&["a"]);
         drive_to_serving_leader(&mut h);
-        h.cons.on_snap_report(99, 0, 6048, 0xC3);
+        h.cons.on_snap_report(99, 0, 6048, 0xC3, 0);
         assert!(
             h.cons.pending_snapshot_reports.is_empty(),
             "node 99 is in no config this cluster has adopted"
@@ -15715,14 +16596,14 @@ mod tests {
         h.cons.pass_mono_ns = 1_000;
         let p = 6048u64;
 
-        h.cons.on_snap_report(3, 0, p, 0xD4);
-        h.cons.on_snap_report(1, 0, p, 0xD4);
-        h.cons.on_snap_report(0, 0, p, 0xD4);
+        h.cons.on_snap_report(3, 0, p, 0xD4, 0);
+        h.cons.on_snap_report(1, 0, p, 0xD4, 0);
+        h.cons.on_snap_report(0, 0, p, 0xD4, 0);
         assert!(
             !h.cons.maybe_append_snapshot_reports(),
             "two voters plus a learner is not every VOTER — the learner cannot stand in for voter 2"
         );
-        h.cons.on_snap_report(2, 0, p, 0xD4);
+        h.cons.on_snap_report(2, 0, p, 0xD4, 0);
         assert!(h.cons.maybe_append_snapshot_reports());
 
         let end = h.cons.last_cluster_append;
@@ -15730,7 +16611,7 @@ mod tests {
         let state = h.cons.cluster_view.to_state();
         assert_eq!(
             state.report_for(0).map(|r| r.hashes.clone()),
-            Some(vec![(0, 0xD4), (1, 0xD4), (2, 0xD4), (3, 0xD4)]),
+            Some(vec![(0, 0xD4, 0), (1, 0xD4, 0), (2, 0xD4, 0), (3, 0xD4, 0)]),
             "the learner's hash IS in the record"
         );
     }
@@ -15751,11 +16632,11 @@ mod tests {
 
         let cap = ObsCapture::take();
         let buf = cap.buf();
-        h.cons.on_snap_report(0, 0, p1, 0x11);
-        h.cons.on_snap_report(1, 0, p1, 0x11);
+        h.cons.on_snap_report(0, 0, p1, 0x11, 0);
+        h.cons.on_snap_report(1, 0, p1, 0x11, 0);
         h.cons.pass_mono_ns += 1_000;
-        h.cons.on_snap_report(0, 0, p2, 0x22);
-        h.cons.on_snap_report(1, 0, p2, 0x22);
+        h.cons.on_snap_report(0, 0, p2, 0x22, 0);
+        h.cons.on_snap_report(1, 0, p2, 0x22, 0);
 
         let pending = h.cons.pending_reports_for(0);
         assert_eq!(
@@ -15787,7 +16668,7 @@ mod tests {
             "each instant runs its own clock"
         );
 
-        h.cons.on_snap_report(2, 0, p1, 0x11);
+        h.cons.on_snap_report(2, 0, p1, 0x11, 0);
         assert!(
             h.cons.maybe_append_snapshot_reports(),
             "the laggard's report completes p1"
@@ -15808,7 +16689,7 @@ mod tests {
             Some(&SnapshotReport {
                 row: 0,
                 position: p1,
-                hashes: vec![(0, 0x11), (1, 0x11), (2, 0x11)],
+                hashes: vec![(0, 0x11, 0), (1, 0x11, 0), (2, 0x11, 0)],
             })
         );
         assert_eq!(
@@ -15822,7 +16703,7 @@ mod tests {
         );
 
         // A LATE report at or below the committed report position is dropped.
-        h.cons.on_snap_report(2, 0, p1, 0x11);
+        h.cons.on_snap_report(2, 0, p1, 0x11, 0);
         assert_eq!(h.cons.pending_reports_for(0).len(), 1);
         assert_eq!(h.cons.pending_reports_for(0)[0].position, p2);
     }
@@ -15835,7 +16716,7 @@ mod tests {
     fn a_follower_collects_nothing() {
         let mut h = harness_with_rows(&["a"]);
         assert!(!matches!(h.cons.sm.role(), Role::Leader));
-        h.cons.on_snap_report(0, 0, 6048, 0xE5);
+        h.cons.on_snap_report(0, 0, 6048, 0xE5, 0);
         assert!(h.cons.pending_snapshot_reports.is_empty());
     }
 
@@ -15847,7 +16728,7 @@ mod tests {
         for halt in [false, true] {
             let mut h = harness_with_rows(&["a"]);
             drive_to_serving_leader(&mut h);
-            h.cons.on_snap_report(0, 0, 6048, 0xF6);
+            h.cons.on_snap_report(0, 0, 6048, 0xF6, 0);
             assert!(!h.cons.pending_snapshot_reports.is_empty());
             if halt {
                 h.cons.halt();
@@ -15886,10 +16767,10 @@ mod tests {
         let buf = cap.buf();
         for i in 1..=8u64 {
             h.cons.pass_mono_ns = i * SEC;
-            h.cons.on_snap_report(0, 0, at(i), 0xA0 + i);
-            h.cons.on_snap_report(1, 0, at(i), 0xA0 + i);
+            h.cons.on_snap_report(0, 0, at(i), 0xA0 + i, 0);
+            h.cons.on_snap_report(1, 0, at(i), 0xA0 + i, 0);
             if i > 1 {
-                h.cons.on_snap_report(2, 0, at(i - 1), 0xA0 + i - 1);
+                h.cons.on_snap_report(2, 0, at(i - 1), 0xA0 + i - 1, 0);
             }
             while h.cons.maybe_append_snapshot_reports() {
                 let end = h.cons.last_cluster_append;
@@ -15917,7 +16798,7 @@ mod tests {
             Some(&SnapshotReport {
                 row: 0,
                 position: at(7),
-                hashes: vec![(0, 0xA7), (1, 0xA7), (2, 0xA7)],
+                hashes: vec![(0, 0xA7, 0), (1, 0xA7, 0), (2, 0xA7, 0)],
             }),
             "the newest committed record is instant 7, with all three hashes"
         );
@@ -15936,9 +16817,9 @@ mod tests {
         let t0 = 1_000u64;
         let (p1, p2) = (4096u64, 5120u64);
         h.cons.pass_mono_ns = t0;
-        h.cons.on_snap_report(0, 0, p1, 0x11);
+        h.cons.on_snap_report(0, 0, p1, 0x11, 0);
         h.cons.pass_mono_ns = t0 + SEC;
-        h.cons.on_snap_report(0, 0, p2, 0x22);
+        h.cons.on_snap_report(0, 0, p2, 0x22, 0);
 
         h.cons.pass_mono_ns = t0 + SNAP_REPORT_TIMEOUT_NS - 1;
         assert!(
@@ -16001,13 +16882,13 @@ mod tests {
         drive_to_serving_leader(&mut h);
         h.cons.pass_mono_ns = 1_000;
         let (p1, p2) = (4096u64, 5120u64);
-        h.cons.on_snap_report(0, 0, p1, 0x11);
-        h.cons.on_snap_report(1, 0, p1, 0x11);
+        h.cons.on_snap_report(0, 0, p1, 0x11, 0);
+        h.cons.on_snap_report(1, 0, p1, 0x11, 0);
 
         let cap = ObsCapture::take();
         let buf = cap.buf();
         for id in 0..3u32 {
-            h.cons.on_snap_report(id, 0, p2, 0x22);
+            h.cons.on_snap_report(id, 0, p2, 0x22, 0);
         }
         let text = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
         assert!(
@@ -16044,7 +16925,7 @@ mod tests {
         h.commit_through(end);
         // A late report for the dropped instant is at or below the row's
         // committed report position, so it never re-opens it.
-        h.cons.on_snap_report(2, 0, p1, 0x11);
+        h.cons.on_snap_report(2, 0, p1, 0x11, 0);
         assert!(h.cons.pending_snapshot_reports.is_empty());
     }
 
@@ -16064,7 +16945,7 @@ mod tests {
         let cap = ObsCapture::take();
         let buf = cap.buf();
         for i in 0..=n {
-            h.cons.on_snap_report(0, 0, at(i), 0x50);
+            h.cons.on_snap_report(0, 0, at(i), 0x50, 0);
         }
         let text = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
         assert_eq!(
@@ -16086,7 +16967,7 @@ mod tests {
             "ascending, oldest surviving first"
         );
         buf.lock().unwrap().clear();
-        h.cons.on_snap_report(1, 0, at(0), 0x50);
+        h.cons.on_snap_report(1, 0, at(0), 0x50, 0);
         let text = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
         assert!(
             text.contains(r#""event":"snapshot_report_superseded""#)
@@ -16094,8 +16975,8 @@ mod tests {
             "a report older than a full row's every instant is the one dropped: {text}"
         );
 
-        h.cons.on_snap_report(1, 0, at(1), 0x50);
-        h.cons.on_snap_report(2, 0, at(1), 0x50);
+        h.cons.on_snap_report(1, 0, at(1), 0x50, 0);
+        h.cons.on_snap_report(2, 0, at(1), 0x50, 0);
         assert!(
             h.cons.maybe_append_snapshot_reports(),
             "the oldest SURVIVING instant still completes"
@@ -16157,6 +17038,7 @@ mod tests {
                 node_id: 1,
                 position: p,
                 hash: 0x0D0D_0D0D_0D0D_0D0D,
+                size: 0,
             }],
             "the newest complete set is re-offered to the new leader"
         );
@@ -16271,7 +17153,7 @@ mod tests {
         let p = 4096u64;
         publish_commanded_catalog(&mut h, &[(p, now - 6 * SEC)]);
         h.cons.pass_mono_ns = 1_000;
-        h.cons.on_snap_report(0, 0, p, 0x61);
+        h.cons.on_snap_report(0, 0, p, 0x61, 0);
         let cap = ObsCapture::take();
         let buf = cap.buf();
         assert!(
@@ -16300,7 +17182,7 @@ mod tests {
         let t0 = now - SEC;
         publish_commanded_catalog(&mut h, &[(p, t0)]);
         h.cons.pass_mono_ns = 1_000;
-        h.cons.on_snap_report(0, 0, p, 0x62);
+        h.cons.on_snap_report(0, 0, p, 0x62, 0);
         assert!(
             !h.cons.maybe_append_snapshot_reports(),
             "1 s old: still collecting"
@@ -16329,7 +17211,7 @@ mod tests {
         set_log_time(&mut h, 100 * SEC);
         let p = 4096u64;
         h.cons.pass_mono_ns = 1_000;
-        h.cons.on_snap_report(0, 0, p, 0x63);
+        h.cons.on_snap_report(0, 0, p, 0x63, 0);
         h.cons.pass_now_ns += 60 * SEC;
         assert!(
             !h.cons.maybe_append_snapshot_reports(),
@@ -16372,12 +17254,14 @@ mod tests {
                     node_id: 1,
                     position: p1,
                     hash: 0x0101,
+                    size: 0,
                 },
                 SnapReportBody {
                     row: 0,
                     node_id: 1,
                     position: p2,
                     hash: 0x0202,
+                    size: 0,
                 },
             ],
             "both Commanded sets this node holds, each with ITS hash"
@@ -16399,8 +17283,8 @@ mod tests {
         let extent = h.cons.cnc.counters().append.load_acquire();
         let cap = ObsCapture::take();
         let buf = cap.buf();
-        h.cons.on_snap_report(0, 0, extent + 1, 0x71);
-        h.cons.on_snap_report(0, 0, extent + 1, 0x71);
+        h.cons.on_snap_report(0, 0, extent + 1, 0x71, 0);
+        h.cons.on_snap_report(0, 0, extent + 1, 0x71, 0);
         let text = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
         assert!(
             h.cons.pending_snapshot_reports.is_empty(),
@@ -16411,7 +17295,7 @@ mod tests {
             1,
             "named, once per reporting node per interval: {text}"
         );
-        h.cons.on_snap_report(0, 0, extent, 0x72);
+        h.cons.on_snap_report(0, 0, extent, 0x72, 0);
         assert_eq!(
             h.cons
                 .pending_reports_for(0)
@@ -16454,13 +17338,27 @@ mod tests {
             .cluster_artifact_hash
             .hash_at(p)
             .expect("the cluster agent published its artifact's hash");
+        // Snapshot-lifecycle P6: the sizes are the FILES' lengths.
+        let row_len =
+            std::fs::metadata(h.cons.snap_root.join("0").join(format!("snap-{p}.ultsnap")))
+                .unwrap()
+                .len();
+        let cluster_len = std::fs::metadata(
+            h.cons
+                .cluster_snapshot_dir
+                .join(format!("snap-{p}.ultcluster")),
+        )
+        .unwrap()
+        .len();
+        assert!(row_len > 0 && cluster_len > 0);
         // This incarnation never ran the completion edge for P, and its
         // newest-complete-set word is still 0 (a restart recovers it from
         // the durable floor, which can sit below P): the cache is empty.
         // What a restarted node's re-offer leaves behind when it falls back
         // to the slots before its services re-attach: a THIN entry naming
         // only row 255 (proof run (e), fix round). It must not stop the probe.
-        h.cons.cache_report_set(p, &[(CLUSTER_ROW, cluster_hash)]);
+        h.cons
+            .cache_report_set(p, &[(CLUSTER_ROW, cluster_hash, 0)]);
         assert!(
             !h.cons.report_seeds.inner.lock().unwrap().known.contains(&p),
             "a thin entry is not 'known' to the probe"
@@ -16485,8 +17383,11 @@ mod tests {
             .expect("the seed reached the consensus agent's cache");
         assert_eq!(
             &seeded.reports[..seeded.n],
-            &[(0u8, row_hash), (CLUSTER_ROW, cluster_hash)],
-            "row 0: the payload hash IS the slot's artifact_hash; row 255: the published word"
+            &[
+                (0u8, row_hash, row_len),
+                (CLUSTER_ROW, cluster_hash, cluster_len)
+            ],
+            "row 0: the payload hash IS the slot's artifact_hash; row 255: the published word; sizes are the files' lengths"
         );
 
         // The slots path computes the same list, so it does not change the
@@ -16528,9 +17429,9 @@ mod tests {
         let mut set = ReportedSet {
             position: p,
             n: 1,
-            reports: [(0u8, 0u64); CNC_MAX_SERVICES + 1],
+            reports: [(0u8, 0u64, 0u64); CNC_MAX_SERVICES + 1],
         };
-        set.reports[0] = (0, 0x5EED);
+        set.reports[0] = (0, 0x5EED, 0);
         h.cons.report_seeds.inner.lock().unwrap().offered.push(set);
         h.cons
             .report_seeds
@@ -16545,6 +17446,7 @@ mod tests {
                 node_id: 1,
                 position: p,
                 hash: 0x5EED,
+                size: 0,
             }],
             "the seeded set reaches the leader already offered to, once"
         );
@@ -16574,11 +17476,11 @@ mod tests {
         st.reports = vec![SnapshotReport {
             row: 0,
             position: reported,
-            hashes: vec![(0, 0xAA)],
+            hashes: vec![(0, 0xAA, 0)],
         }];
         h.cons.cluster_view.publish(&st);
         for p in [reported, complete, unheld, eligible] {
-            h.cons.cache_report_set(p, &[(0, p)]);
+            h.cons.cache_report_set(p, &[(0, p, 0)]);
         }
         h.cons.holdings_held.extend([reported, complete, eligible]);
         h.cons
@@ -16603,8 +17505,8 @@ mod tests {
     fn a_new_leader_re_offers_every_cached_held_set_to_itself() {
         let mut h = harness_with_rows(&["a"]);
         let (p1, p2) = (5000u64, 6000u64);
-        h.cons.cache_report_set(p1, &[(0, 0x01)]);
-        h.cons.cache_report_set(p2, &[(0, 0x02)]);
+        h.cons.cache_report_set(p1, &[(0, 0x01, 0)]);
+        h.cons.cache_report_set(p2, &[(0, 0x02, 0)]);
         h.cons.holdings_held.extend([p1, p2]);
         publish_commanded_catalog(&mut h, &[(p1, 1), (p2, 2)]);
         h.cons.snapshot_set_position.store(p2, Ordering::Release);
@@ -16628,7 +17530,7 @@ mod tests {
         let mut h = harness_with_rows(&["a"]);
         let n = MAX_CATALOG_SETS as u64;
         for i in 1..=n {
-            h.cons.cache_report_set(i * 100, &[(0, i), (1, i)]);
+            h.cons.cache_report_set(i * 100, &[(0, i, 0), (1, i, 0)]);
         }
         let positions = |h: &Harness| {
             h.cons
@@ -16638,13 +17540,13 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert_eq!(h.cons.reported_sets.len(), MAX_CATALOG_SETS);
-        h.cons.cache_report_set(50, &[(0, 9)]);
+        h.cons.cache_report_set(50, &[(0, 9, 0)]);
         assert_eq!(
             positions(&h).first(),
             Some(&100),
             "older than a full cache: not admitted"
         );
-        h.cons.cache_report_set((n + 1) * 100, &[(0, 9)]);
+        h.cons.cache_report_set((n + 1) * 100, &[(0, 9, 0)]);
         assert_eq!(h.cons.reported_sets.len(), MAX_CATALOG_SETS);
         assert_eq!(
             (
@@ -16654,18 +17556,18 @@ mod tests {
             (Some(200), Some((n + 1) * 100)),
             "a newer set evicts the oldest"
         );
-        h.cons.cache_report_set(200, &[(0, 0xFF)]);
+        h.cons.cache_report_set(200, &[(0, 0xFF, 0)]);
         let e = h.cons.reported_sets[0];
         assert_eq!(
             &e.reports[..e.n],
-            &[(0, 2), (1, 2)],
+            &[(0, 2, 0), (1, 2, 0)],
             "fewer rows never replace"
         );
-        h.cons.cache_report_set(200, &[(0, 0xF0), (1, 0xF1)]);
+        h.cons.cache_report_set(200, &[(0, 0xF0, 0), (1, 0xF1, 0)]);
         let e = h.cons.reported_sets[0];
         assert_eq!(
             &e.reports[..e.n],
-            &[(0, 0xF0), (1, 0xF1)],
+            &[(0, 0xF0, 0), (1, 0xF1, 0)],
             "an equally full one does"
         );
         let full: Vec<u64> = h
@@ -16734,6 +17636,23 @@ mod tests {
         );
         publish_commanded_catalog(&mut h, &[(built, 1), (fetched, 2)]);
 
+        // Snapshot-lifecycle P6: the re-offer carries the FILES' lengths.
+        let row_len = std::fs::metadata(
+            h.cons
+                .snap_root
+                .join("0")
+                .join(format!("snap-{built}.ultsnap")),
+        )
+        .unwrap()
+        .len();
+        let cluster_len = std::fs::metadata(
+            h.cons
+                .cluster_snapshot_dir
+                .join(format!("snap-{built}.ultcluster")),
+        )
+        .unwrap()
+        .len();
+        assert!(row_len > 0 && cluster_len > 0);
         let mut seeder = report_seeder_for(&h);
         seeder.seed();
         seeder.seed();
@@ -16752,6 +17671,7 @@ mod tests {
                     node_id: 1,
                     position: built,
                     hash: built_hash,
+                    size: row_len,
                 },
                 SnapReportBody {
                     row: CLUSTER_ROW,
@@ -16759,6 +17679,7 @@ mod tests {
                     position: built,
                     // The cluster file holds the same bytes as the row payload.
                     hash: built_hash,
+                    size: cluster_len,
                 },
             ],
             "only the set this node built is re-offered, every row of it"
@@ -16878,7 +17799,7 @@ mod tests {
             .find(|s| s.position == p)
             .unwrap();
         assert_eq!(e.n, 2, "retried on the next probe and now full");
-        assert_eq!(e.reports[0], (0, good));
+        assert_eq!(e.reports[0], (0, good, original.len() as u64));
     }
 
     /// Ruling R42, review m-D: marking a set foreign evicts any report the
@@ -16889,7 +17810,7 @@ mod tests {
         let mut h = harness_with_rows(&["a"]);
         let p = 4096u64;
         h.cons
-            .cache_report_set(p, &[(0, 0x01), (CLUSTER_ROW, 0x02)]);
+            .cache_report_set(p, &[(0, 0x01, 0), (CLUSTER_ROW, 0x02, 0)]);
         assert!(h.cons.reported_sets.iter().any(|s| s.position == p));
         h.cons.stored_set_pos.store(p, Ordering::Release);
         h.cons.check_set_completeness(); // the fetch edge
@@ -16926,7 +17847,7 @@ mod tests {
         assert_eq!(h.cons.foreign_sets, vec![p]);
         // Everything else would offer it: cached, held, Commanded, newest.
         h.cons
-            .cache_report_set(p, &[(0, 0x01), (CLUSTER_ROW, 0x02)]);
+            .cache_report_set(p, &[(0, 0x01, 0), (CLUSTER_ROW, 0x02, 0)]);
         h.cons.holdings_held.push(p);
         publish_commanded_catalog(&mut h, &[(p, 1)]);
         h.cons.snapshot_set_position.store(p, Ordering::Release);
@@ -16966,7 +17887,7 @@ mod tests {
             .expect("settings append");
         let p = 6080u64;
         for id in 0..3u32 {
-            h.cons.on_snap_report(id, 0, p, 0x77);
+            h.cons.on_snap_report(id, 0, p, 0x77, 0);
         }
 
         assert!(
@@ -17002,7 +17923,7 @@ mod tests {
         let p = 6048u64;
         for row in [1u8, 0] {
             for id in 0..3u32 {
-                h.cons.on_snap_report(id, row, p, 0x99);
+                h.cons.on_snap_report(id, row, p, 0x99, 0);
             }
         }
 
@@ -17086,7 +18007,7 @@ mod tests {
         h.cons.pass_mono_ns = 1_000;
         let p = 6048u64;
         for id in 0..=7u32 {
-            h.cons.on_snap_report(id, 0, p, 0x100 + id as u64);
+            h.cons.on_snap_report(id, 0, p, 0x100 + id as u64, 0);
         }
         assert_eq!(h.cons.pending_reports_for(0)[0].hashes.len(), 8);
 
@@ -17100,7 +18021,7 @@ mod tests {
                 addr: member_addr(8),
             },
         );
-        h.cons.on_snap_report(8, 0, p, 0x108);
+        h.cons.on_snap_report(8, 0, p, 0x108, 0);
         assert_eq!(
             h.cons.pending_reports_for(0)[0].hashes.len(),
             9,
@@ -17117,12 +18038,12 @@ mod tests {
         let rec = state.report_for(0).expect("the record went in");
         assert_eq!(rec.hashes.len(), 8, "filtered to the current membership");
         assert!(
-            !rec.hashes.iter().any(|(id, _)| *id == 3),
+            !rec.hashes.iter().any(|(id, _, _)| *id == 3),
             "an ex-member's hash is not evidence about this cluster — and `verdict` \
              has no membership filter to drop it later"
         );
         assert!(
-            rec.hashes.iter().any(|(id, _)| *id == 8),
+            rec.hashes.iter().any(|(id, _, _)| *id == 8),
             "the node added inside the window is a member and its hash counts"
         );
     }
@@ -17144,7 +18065,7 @@ mod tests {
         );
         h.cons.pass_mono_ns = 1_000;
         let p = 6048u64;
-        h.cons.on_snap_report(3, 0, p, 0x33); // the only reporter, a learner
+        h.cons.on_snap_report(3, 0, p, 0x33, 0); // the only reporter, a learner
         adopt_config_no_pass(&mut h, ConfigOp::RemoveLearner { id: 3 });
 
         assert!(
@@ -17186,7 +18107,7 @@ mod tests {
         let p = 6048u64;
         for row in [0u8, 1] {
             for id in 0..3u32 {
-                h.cons.on_snap_report(id, row, p, 0x44);
+                h.cons.on_snap_report(id, row, p, 0x44, 0);
             }
         }
 
@@ -17197,7 +18118,7 @@ mod tests {
             .append_cluster_frame(&ClusterCommand::SnapshotReport(SnapshotReport {
                 row: 0,
                 position: p,
-                hashes: vec![(2, 0x44)],
+                hashes: vec![(2, 0x44, 0)],
             }))
             .expect("the record append");
         h.commit_through(end);
@@ -17226,7 +18147,7 @@ mod tests {
         assert_eq!(state.report_for(1).map(|r| r.position), Some(p));
         assert_eq!(
             state.report_for(0).map(|r| r.hashes.clone()),
-            Some(vec![(2, 0x44)]),
+            Some(vec![(2, 0x44, 0)]),
             "row 0 still holds the record that superseded the pending set"
         );
     }
@@ -17241,7 +18162,7 @@ mod tests {
         h.cons.do_work(); // one ordinary pass: `first_seen_ns` is then a real clock reading
         let p = 6048u64;
         for id in 0..3u32 {
-            h.cons.on_snap_report(id, 0, p, 0x88);
+            h.cons.on_snap_report(id, 0, p, 0x88, 0);
         }
 
         let before = h.cons.cnc.counters().append.load_acquire();
@@ -19367,6 +20288,81 @@ mod tests {
         assert_eq!(h.cons.last_cluster_append, before, "nothing was appended");
     }
 
+    /// Snapshot-lifecycle spec §8: a pin's origin must be an AGREED catalog
+    /// entry (61), except on an Empty catalog, where the pin is allowed as
+    /// before. Checked after 54, so a missing set still reads 54.
+    #[test]
+    fn upgrade_pin_origin_must_be_agreed_unless_the_catalog_is_empty() {
+        use uc_protocol::v2::catalog::{SetEntry, SetKind, SetState};
+        let mut h = harness_with_rows(&["a"]);
+        drive_to_serving_leader(&mut h);
+        h.cons
+            .cnc
+            .service_slot(0)
+            .status
+            .store_version(pack_version(1, 0, 0));
+        h.cons.snapshot_set_position.store(4096, Ordering::Release);
+        let pin = UpgradePin {
+            row: 0,
+            from: pack_version(1, 0, 0),
+            to: pack_version(1, 1, 0),
+            origin: 4096,
+        };
+        // A catalog with a Complete set elsewhere and 4096 still Commanded.
+        let mut st = h.cons.cluster_view.to_state();
+        let mut commanded = SetEntry::commanded(4096, SetKind::Full, 0);
+        commanded.state = SetState::Commanded;
+        st.catalog = vec![agreed_entry(2048), commanded];
+        h.cons.cluster_view.publish(&st);
+        stage_pin_for_test(&h, &pin);
+        assert_eq!(
+            sr(h.cons.apply_upgrade_pin_staged()),
+            (1, REASON_PIN_ORIGIN_NOT_AGREED),
+            "complete here, not yet agreed"
+        );
+        // Agreed now: accepted.
+        st.catalog = vec![agreed_entry(2048), agreed_entry(4096)];
+        h.cons.cluster_view.publish(&st);
+        stage_pin_for_test(&h, &pin);
+        assert_eq!(
+            sr(h.cons.apply_upgrade_pin_staged()).0,
+            0,
+            "agreed origin accepted"
+        );
+    }
+
+    /// An Empty catalog cannot check agreement: the pin is allowed as
+    /// before, and the node says so.
+    #[test]
+    fn upgrade_pin_on_an_empty_catalog_is_allowed_unchecked() {
+        let _obs = obs_capture_lock();
+        let mut h = harness_with_rows(&["a"]);
+        drive_to_serving_leader(&mut h);
+        h.cons
+            .cnc
+            .service_slot(0)
+            .status
+            .store_version(pack_version(1, 0, 0));
+        h.cons.snapshot_set_position.store(4096, Ordering::Release);
+        stage_pin_for_test(
+            &h,
+            &UpgradePin {
+                row: 0,
+                from: pack_version(1, 0, 0),
+                to: pack_version(1, 1, 0),
+                origin: 4096,
+            },
+        );
+        let cap = ObsCapture::take();
+        let buf = cap.buf();
+        assert_eq!(sr(h.cons.apply_upgrade_pin_staged()).0, 0);
+        let text = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(
+            text.contains(r#""event":"upgrade_pin_agreement_unchecked""#),
+            "the unchecked pin is named: {text}"
+        );
+    }
+
     /// #33 ruling R17 (spec D3, patch is free): the door's no-running-version
     /// half of 53 compares `from` with the attached word by LINE, as the
     /// FSM's `same_line(from, running)` clause and the pinned install's
@@ -19604,8 +20600,9 @@ mod tests {
                 REASON_PIN_DECODE,
                 REASON_REPORT_STALE,
                 REASON_VERSION_ALREADY_SET,
+                REASON_PIN_ORIGIN_NOT_AGREED,
             ),
-            (52, 53, 54, 55, 56, 57, 58, 59, 60)
+            (52, 53, 54, 55, 56, 57, 58, 59, 60, 61)
         );
     }
 
@@ -24308,6 +25305,481 @@ mod tests {
             late_legitimately > 0,
             "no legitimately-late timer fired — rule 5's true branch was never taken, so \
              the seeds are not exercising the case it exists to distinguish"
+        );
+    }
+
+    /// Snapshot-lifecycle spec §6: the switch gates the whole path; a held
+    /// newest set issues nothing.
+    #[test]
+    fn auto_fetch_runs_only_while_the_switch_is_on_and_the_newest_agreed_set_is_unheld() {
+        use crate::auto_fetch::Outcome;
+        let mut h = harness_with_rows(&["a"]);
+        drive_to_serving_leader(&mut h);
+        let mut st = h.cons.cluster_view.to_state();
+        // A STANDBY set on this voter: nothing here will build it (plan
+        // ruling P8), whatever the harness's slot says.
+        let mut e = agreed_entry(1000);
+        e.kind = uc_protocol::v2::catalog::SetKind::Standby;
+        st.catalog = vec![e];
+        st.settings.auto_fetch = false;
+        h.cons.cluster_view.publish(&st);
+        let cnc = Arc::clone(&h.cons.cnc);
+        cnc.counters().durable.store_release(5000);
+        let attempts = |h: &Harness| {
+            u64::from(h.cons.pending_fetch.is_some())
+                + h.cons.auto_fetch_stats.get(Outcome::Refused)
+                + h.cons.auto_fetch_stats.get(Outcome::NoHolder)
+        };
+        for k in 0..3u64 {
+            h.cons.pass_now_ns = 10_000_000_000 * (k + 1);
+            h.cons.maybe_auto_fetch();
+        }
+        assert_eq!(attempts(&h), 0, "switch off: nothing");
+        st.settings.auto_fetch = true;
+        h.cons.cluster_view.publish(&st);
+        // Two passes 10 s apart: the second is past any stagger (node id × 250 ms).
+        for k in 3..5u64 {
+            h.cons.pass_now_ns = 10_000_000_000 * (k + 1);
+            h.cons.maybe_auto_fetch();
+        }
+        assert!(
+            attempts(&h) >= 1,
+            "switch on: the unheld newest agreed set is attempted"
+        );
+        h.cons.pending_fetch = None;
+        h.cons.note_set_held(1000);
+        let before = attempts(&h);
+        h.cons.pass_now_ns += 100_000_000_000;
+        h.cons.maybe_auto_fetch();
+        assert_eq!(attempts(&h), before, "held: nothing more");
+    }
+
+    /// Spec §6 visibility: a landed auto fetch counts `ok`, a deadline counts
+    /// `timeout`; an operator fetch counts neither.
+    #[test]
+    fn a_landed_auto_fetch_counts_ok_and_a_deadline_counts_timeout() {
+        use crate::auto_fetch::Outcome;
+        let mut h = harness_with_rows(&["a"]);
+        h.cons.pass_now_ns = 1_000;
+        h.cons.pending_fetch = Some(PendingFetch {
+            learner: 1,
+            position: 1000,
+            stored_before: 0,
+            deadline_ns: 1_000_000,
+            auto: true,
+        });
+        h.cons.stored_set_pos.store(1000, Ordering::Release);
+        h.cons.poll_pending_fetch();
+        assert_eq!(h.cons.auto_fetch_stats.get(Outcome::Ok), 1);
+        h.cons.pending_fetch = Some(PendingFetch {
+            learner: 1,
+            position: 2000,
+            stored_before: 1000,
+            deadline_ns: 2_000,
+            auto: true,
+        });
+        h.cons.pass_now_ns = 3_000;
+        h.cons.poll_pending_fetch();
+        assert_eq!(h.cons.auto_fetch_stats.get(Outcome::Timeout), 1);
+        h.cons.pending_fetch = Some(PendingFetch {
+            learner: 1,
+            position: 3000,
+            stored_before: 1000,
+            deadline_ns: 2_000,
+            auto: false,
+        });
+        h.cons.poll_pending_fetch();
+        assert_eq!(
+            h.cons.auto_fetch_stats.get(Outcome::Timeout),
+            1,
+            "an operator fetch is not counted"
+        );
+    }
+
+    /// Auto-fetch test helper: switch on, the given catalog, `durable` past
+    /// it — the shape every auto-fetch test below starts from.
+    fn auto_fetch_on(h: &mut Harness, catalog: Vec<SetEntry>) {
+        let mut st = h.cons.cluster_view.to_state();
+        st.catalog = catalog;
+        st.settings.auto_fetch = true;
+        h.cons.cluster_view.publish(&st);
+        h.cons.cnc.counters().durable.store_release(5000);
+    }
+
+    /// Auto-fetch test helper: one fetch issued (pending) or refused, or a
+    /// `no_holder` / `no_space` skip — anything the decision did.
+    fn auto_fetch_attempts(h: &Harness) -> u64 {
+        use crate::auto_fetch::Outcome;
+        u64::from(h.cons.pending_fetch.is_some())
+            + h.cons.auto_fetch_stats.get(Outcome::Refused)
+            + h.cons.auto_fetch_stats.get(Outcome::NoHolder)
+            + h.cons.auto_fetch_stats.get(Outcome::NoSpace)
+    }
+
+    /// Controller ruling PF7 (replacing plan ruling P8's `applied < N`
+    /// clause): an ATTACHED declared row whose `snapshot_pos` is below a FULL
+    /// set's N is still building it, and holds the fetch — for at most 30 s
+    /// from the first sighting of N, after which the fetch proceeds.
+    #[test]
+    fn a_row_still_building_holds_the_auto_fetch_for_at_most_thirty_seconds() {
+        use crate::auto_fetch::AUTO_FETCH_BUILD_GUARD_NS;
+        let mut h = harness_with_rows(&["a"]);
+        auto_fetch_on(&mut h, vec![agreed_entry(1000)]);
+        let slot = h.cons.cnc.service_slot(0);
+        slot.status
+            .store_release(uc_log::cnc::pack_service_status(0, true, 1));
+        slot.snapshot_pos.store_release(0);
+        // `applied` PAST N — the clause PF7 dropped would read "not building".
+        slot.applied.store_release(9000);
+        assert!(
+            h.cons
+                .local_build_pending(1000, &h.cons.cluster_view.snapshot_inner()),
+            "attached, snapshot_pos below N, full set: building"
+        );
+        let t0 = 10_000_000_000u64;
+        // Every 100 ms for just under the guard: held.
+        let mut t = t0;
+        while t < t0 + AUTO_FETCH_BUILD_GUARD_NS - 200_000_000 {
+            h.cons.pass_now_ns = t;
+            h.cons.maybe_auto_fetch();
+            t += 100_000_000;
+        }
+        assert_eq!(
+            auto_fetch_attempts(&h),
+            0,
+            "a row still building holds the fetch"
+        );
+        h.cons.pass_now_ns = t0 + AUTO_FETCH_BUILD_GUARD_NS + 1_000_000_000;
+        h.cons.maybe_auto_fetch();
+        assert!(
+            h.cons
+                .pending_fetch
+                .is_some_and(|p| p.auto && p.position == 1000),
+            "after 30 s the fetch proceeds: {:?}",
+            h.cons.pending_fetch
+        );
+    }
+
+    /// PF7's other half: a row that has frozen at N (`snapshot_pos >= N`),
+    /// an UNATTACHED row, or a standby set on a voter is not "building".
+    #[test]
+    fn a_frozen_or_unattached_row_or_a_voters_standby_set_is_not_building() {
+        let h = harness_with_rows(&["a"]);
+        let mut st = h.cons.cluster_view.to_state();
+        let mut standby = agreed_entry(2000);
+        standby.kind = uc_protocol::v2::catalog::SetKind::Standby;
+        st.catalog = vec![agreed_entry(1000), standby];
+        h.cons.cluster_view.publish(&st);
+        let inner = h.cons.cluster_view.snapshot_inner();
+        let slot = h.cons.cnc.service_slot(0);
+        slot.status
+            .store_release(uc_log::cnc::pack_service_status(0, false, 1));
+        slot.snapshot_pos.store_release(0);
+        assert!(!h.cons.local_build_pending(1000, &inner), "unattached");
+        slot.status
+            .store_release(uc_log::cnc::pack_service_status(0, true, 1));
+        assert!(
+            h.cons.local_build_pending(1000, &inner),
+            "attached, below N"
+        );
+        assert!(
+            !h.cons.local_build_pending(2000, &inner),
+            "a standby set on a voter: this node never builds it"
+        );
+        slot.snapshot_pos.store_release(1000);
+        assert!(!h.cons.local_build_pending(1000, &inner), "frozen at N");
+    }
+
+    /// Controller ruling PF8: the pass that sees an auto fetch LAND does not
+    /// decide again — `holdings_held` lists the fetched set only once the
+    /// completeness poll has adopted it, and until then N reads unheld.
+    #[test]
+    fn a_landed_auto_fetch_is_not_refetched_in_the_same_pass() {
+        use crate::auto_fetch::{AUTO_FETCH_RECHECK_NS, Outcome};
+        let mut h = harness_with_rows(&["a"]);
+        let mut e = agreed_entry(1000);
+        e.kind = uc_protocol::v2::catalog::SetKind::Standby;
+        auto_fetch_on(&mut h, vec![e]);
+        let t = 10_000_000_000u64;
+        h.cons.pass_now_ns = t;
+        h.cons.maybe_auto_fetch();
+        h.cons.pass_now_ns = t + 1_000_000_000;
+        h.cons.maybe_auto_fetch();
+        assert!(h.cons.pending_fetch.is_some(), "the first fetch was issued");
+        while h.fetch_rx.try_recv().is_ok() {}
+        // The receiver lands it.
+        h.cons.stored_set_pos.store(1000, Ordering::Release);
+        h.cons.poll_pending_fetch();
+        assert_eq!(h.cons.auto_fetch_stats.get(Outcome::Ok), 1);
+        h.cons.maybe_auto_fetch();
+        assert_eq!(auto_fetch_attempts(&h), 0, "same pass: nothing re-issued");
+        h.cons.pass_now_ns += AUTO_FETCH_RECHECK_NS - 1;
+        h.cons.maybe_auto_fetch();
+        assert_eq!(auto_fetch_attempts(&h), 0, "inside the recheck delay");
+        h.cons.note_set_held(1000);
+        h.cons.pass_now_ns += 1;
+        h.cons.maybe_auto_fetch();
+        assert_eq!(auto_fetch_attempts(&h), 0, "held by then: nothing");
+        assert!(
+            h.fetch_rx.try_recv().is_err(),
+            "one fetch on the route, ever"
+        );
+    }
+
+    /// Spec §7.3 wiring: a set whose known size does not fit the probe's free
+    /// figure is skipped (`no_space`), named ONCE, and nothing is issued.
+    #[test]
+    fn auto_fetch_skips_a_set_that_does_not_fit_and_names_it_once() {
+        use crate::auto_fetch::{AUTO_FETCH_BACKOFF_MIN_NS, Outcome};
+        let _obs = obs_capture_lock();
+        let mut h = harness_with_rows(&["a"]);
+        let mut e = agreed_entry(1000);
+        e.kind = uc_protocol::v2::catalog::SetKind::Standby;
+        // `total_size` is known only when the cluster artifact's size is too.
+        e.rows[0].size = 4 << 30;
+        e.cluster.size = 1 << 20;
+        auto_fetch_on(&mut h, vec![e]);
+        h.cons.holdings.lock().unwrap().free_bytes = 1 << 30;
+        let cap = ObsCapture::take();
+        let buf = cap.buf();
+        let mut t = 10_000_000_000u64;
+        for _ in 0..4 {
+            h.cons.pass_now_ns = t;
+            h.cons.maybe_auto_fetch();
+            t += 40 * AUTO_FETCH_BACKOFF_MIN_NS;
+        }
+        let text = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(h.cons.pending_fetch.is_none(), "nothing issued");
+        assert!(
+            h.cons.auto_fetch_stats.get(Outcome::NoSpace) >= 2,
+            "every skip counts"
+        );
+        assert_eq!(
+            text.matches("snapshot_fetch_skipped_no_space").count(),
+            1,
+            "named once per set: {text}"
+        );
+    }
+
+    /// Review focus 5 / plan ruling P12: fetching a set only ONE node
+    /// reported emits `snapshot_fetch_single_reporter` — once per set, not
+    /// once per attempt.
+    #[test]
+    fn a_set_reported_by_one_node_is_named_once() {
+        use crate::auto_fetch::Outcome;
+        let _obs = obs_capture_lock();
+        let mut h = harness_with_rows(&["a"]);
+        let mut e = agreed_entry(1000);
+        e.kind = uc_protocol::v2::catalog::SetKind::Standby;
+        let mut st = h.cons.cluster_view.to_state();
+        st.reports = vec![SnapshotReport {
+            row: 0,
+            position: 1000,
+            hashes: vec![(0, e.rows[0].hash, 1)],
+        }];
+        h.cons.cluster_view.publish(&st);
+        auto_fetch_on(&mut h, vec![e]);
+        let cap = ObsCapture::take();
+        let buf = cap.buf();
+        let mut t = 10_000_000_000u64;
+        for _ in 0..4 {
+            h.cons.pass_now_ns = t;
+            h.cons.maybe_auto_fetch();
+            // Let each issued fetch time out, so the next pass tries again.
+            while h.fetch_rx.try_recv().is_ok() {}
+            if let Some(p) = h.cons.pending_fetch {
+                h.cons.pass_now_ns = p.deadline_ns + 1;
+                h.cons.poll_pending_fetch();
+                t = h.cons.pass_now_ns;
+            }
+            t += 60_000_000_000;
+        }
+        let text = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(
+            h.cons.auto_fetch_stats.get(Outcome::Timeout) >= 2,
+            "several attempts: {text}"
+        );
+        assert_eq!(
+            text.matches("snapshot_fetch_single_reporter").count(),
+            1,
+            "named once per set: {text}"
+        );
+    }
+
+    /// Ruling R15 (final review I1): issuing an auto-fetch does NO file I/O
+    /// on the consensus agent — the audit file is byte-identical after the
+    /// issuing pass — and the record the `uc2-holdings` writer drains is the
+    /// same `snapshot_fetch` line, field for field, the inline write made.
+    #[test]
+    fn an_auto_fetch_audit_record_is_enqueued_on_the_pass_and_written_by_the_drain() {
+        let mut h = harness_with_rows(&["a"]);
+        let mut e = agreed_entry(1000);
+        e.kind = uc_protocol::v2::catalog::SetKind::Standby;
+        let mut st = h.cons.cluster_view.to_state();
+        st.reports = vec![SnapshotReport {
+            row: 0,
+            position: 1000,
+            hashes: vec![(0, e.rows[0].hash, 1)],
+        }];
+        h.cons.cluster_view.publish(&st);
+        auto_fetch_on(&mut h, vec![e]);
+        let path = h.cons.audit.path().to_path_buf();
+        let before = std::fs::read(&path).unwrap();
+        let mut t = 10_000_000_000u64;
+        while h.cons.pending_fetch.is_none() {
+            assert!(t < 100 * 10_000_000_000, "no auto fetch was ever issued");
+            h.cons.pass_now_ns = t;
+            h.cons.maybe_auto_fetch();
+            t += 10_000_000_000;
+        }
+        let from = h.cons.pending_fetch.unwrap().learner;
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "the issuing pass wrote nothing to audit.jsonl"
+        );
+        assert_eq!(h.auto_fetch_audit_writer.drain(), 1, "one record queued");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let line = text.lines().last().expect("the drained record");
+        let expected = format!(
+            "\"event\":\"admin_op\",\"actor\":\"auto\",\"origin\":\"local\",\"op\":9,\
+             \"op_name\":\"snapshot_fetch\",\"id\":{from},\"addr\":null,\"seq\":0,\"nonce\":0,\
+             \"outcome\":\"accepted\",\"reason\":0,\"config_version\":1000,\"detail\":null,\
+             \"source\":\"auto\"}}"
+        );
+        assert!(line.ends_with(&expected), "{line}\n  vs ...{expected}");
+        assert_eq!(h.auto_fetch_audit_writer.drain(), 0, "drained once");
+    }
+
+    /// Ruling R15: a full hand-off never blocks the consensus agent and never
+    /// loses a record silently — the overflow is dropped, counted, and named
+    /// (`admin_audit_dropped count=`) on the writer's next drain.
+    #[test]
+    fn a_full_auto_fetch_audit_queue_drops_counts_and_names_the_overflow() {
+        use crate::audit::{AUTO_FETCH_AUDIT_QUEUE, AutoFetchAudit};
+        let _obs = obs_capture_lock();
+        let mut h = harness_with_rows(&["a"]);
+        for k in 0..AUTO_FETCH_AUDIT_QUEUE + 3 {
+            let queued = h.cons.auto_fetch_audit.push(AutoFetchAudit {
+                ts_ns: 1,
+                from: 2,
+                position: k as u64,
+            });
+            assert_eq!(queued, k < AUTO_FETCH_AUDIT_QUEUE, "record {k}");
+        }
+        let cap = ObsCapture::take();
+        let buf = cap.buf();
+        assert_eq!(h.auto_fetch_audit_writer.drain(), AUTO_FETCH_AUDIT_QUEUE);
+        let text = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(
+            text.lines()
+                .any(|l| l.contains("\"admin_audit_dropped\"") && l.contains("\"count\":3")),
+            "{text}"
+        );
+        let file = std::fs::read_to_string(h.cons.audit.path()).unwrap();
+        assert_eq!(file.lines().count(), AUTO_FETCH_AUDIT_QUEUE);
+        assert_eq!(h.auto_fetch_audit_writer.drain(), 0);
+        let again = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert_eq!(
+            again.matches("admin_audit_dropped").count(),
+            1,
+            "the count is named once, then reset"
+        );
+    }
+
+    /// Controller ruling R7: a node that already holds a NEWER complete set
+    /// N2 than the newest agreed N (a voter that missed a standby N and built
+    /// a full N2 not yet agreed) fetches N exactly once, and N ends up HELD
+    /// through the real completion path — `snapshot_set_position` stays at
+    /// N2 (monotone). Before the fix the landed fetch was never noted held,
+    /// and auto-fetch re-fetched N forever.
+    #[test]
+    fn a_fetched_set_below_a_newer_held_set_is_held_and_fetched_once() {
+        use crate::auto_fetch::Outcome;
+        let mut h = harness_with_rows(&["a"]);
+        h.cons.snapshot_set_position.store(2000, Ordering::Release);
+        let mut n = agreed_entry(1000);
+        n.kind = uc_protocol::v2::catalog::SetKind::Standby;
+        let n2 = SetEntry::commanded(2000, uc_protocol::v2::catalog::SetKind::Full, 0);
+        auto_fetch_on(&mut h, vec![n, n2]);
+        assert_eq!(
+            h.cons
+                .cluster_view
+                .catalog_agreed_position
+                .load(Ordering::Acquire),
+            1000
+        );
+        let mut t = 10_000_000_000u64;
+        let mut fetches = 0;
+        // 50 passes 500 ms apart: 25 s, well inside one fetch timeout.
+        for _ in 0..50 {
+            h.cons.pass_now_ns = t;
+            h.cons.check_set_completeness();
+            h.cons.poll_pending_fetch();
+            h.cons.maybe_auto_fetch();
+            while let Ok(f) = h.fetch_rx.try_recv() {
+                assert_eq!(f.position, 1000);
+                fetches += 1;
+                // The receiver lands it (store-only): `stored_set_pos` moves.
+                h.cons.stored_set_pos.fetch_max(1000, Ordering::AcqRel);
+            }
+            t += 500_000_000;
+        }
+        assert_eq!(fetches, 1, "N fetched exactly once");
+        assert_eq!(h.cons.auto_fetch_stats.get(Outcome::Ok), 1);
+        assert!(
+            h.cons.holdings_held.contains(&1000),
+            "the landed set is held: {:?}",
+            h.cons.holdings_held
+        );
+        assert_eq!(
+            h.cons.snapshot_set_position.load(Ordering::Acquire),
+            2000,
+            "the set position stays monotone"
+        );
+    }
+
+    /// Controller ruling R8 (plan ruling P15): an OPERATOR fetch timing out
+    /// also sets the 1 s floor — the pass that sees it expire, and the next
+    /// second, issue no auto fetch.
+    #[test]
+    fn an_operator_fetch_timeout_holds_auto_fetch_for_the_floor() {
+        use crate::auto_fetch::AUTO_FETCH_BACKOFF_MIN_NS;
+        let mut h = harness_with_rows(&["a"]);
+        let mut e = agreed_entry(1000);
+        e.kind = uc_protocol::v2::catalog::SetKind::Standby;
+        auto_fetch_on(&mut h, vec![e]);
+        // N first seen while above durable: the stagger is spent by `t`.
+        h.cons.cnc.counters().durable.store_release(500);
+        let t0 = 10_000_000_000u64;
+        h.cons.pass_now_ns = t0;
+        h.cons.maybe_auto_fetch();
+        assert_eq!(auto_fetch_attempts(&h), 0);
+        h.cons.cnc.counters().durable.store_release(5000);
+        let t = t0 + 2_000_000_000;
+        h.cons.pending_fetch = Some(PendingFetch {
+            learner: 0,
+            position: 0,
+            stored_before: 0,
+            deadline_ns: t - 1,
+            auto: false,
+        });
+        h.cons.pass_now_ns = t;
+        h.cons.poll_pending_fetch();
+        assert!(h.cons.pending_fetch.is_none(), "the operator fetch expired");
+        h.cons.maybe_auto_fetch();
+        assert_eq!(auto_fetch_attempts(&h), 0, "same pass: held by the floor");
+        h.cons.pass_now_ns = t + AUTO_FETCH_BACKOFF_MIN_NS - 1;
+        h.cons.maybe_auto_fetch();
+        assert_eq!(auto_fetch_attempts(&h), 0, "inside the floor");
+        h.cons.pass_now_ns = t + AUTO_FETCH_BACKOFF_MIN_NS;
+        h.cons.maybe_auto_fetch();
+        assert!(
+            h.cons
+                .pending_fetch
+                .is_some_and(|p| p.auto && p.position == 1000),
+            "past the floor: {:?}",
+            h.cons.pending_fetch
         );
     }
 }

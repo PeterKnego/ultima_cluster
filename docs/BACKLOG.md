@@ -374,7 +374,9 @@ reviewer wants a workload to attack.
   2026-09-21 as erratum 6 of the FSM upgrade lifecycle spec's "Errata (plan
   B3, as built)"; closed by
   [the snapshot catalog design](superpowers/specs/2026-10-01-uc2-snapshot-catalog-design.md).
-- **Project 2 (not this spec): the lifecycle rule that USES the catalog.**
+- **Project 2: the lifecycle rule that USES the catalog — TAKEN UP 2026-10-09**, designed in
+  [the lifecycle spec](superpowers/specs/2026-10-09-uc2-snapshot-lifecycle-design.md), plan
+  `docs/superpowers/plans/2026-10-09-uc2-snapshot-lifecycle.md`; #48 (holder preference) closes with this work. Original entry:
   "Load the newest agreed set ahead of me, replay from there" at restart,
   catch-up, join and upgrade; when a short catch-up should replay instead of
   installing; holder preference among `holders()` (locality, learner-first).
@@ -383,6 +385,14 @@ reviewer wants a workload to attack.
   itself —
   [spec §2 "Out"](superpowers/specs/2026-10-01-uc2-snapshot-catalog-design.md#2-scope)
   and §12.
+- **Auto-fetch can re-download an agreed set that is never noted held.** An
+  operator `uc2ctl snapshot fetch` with no position can store a newer,
+  not-yet-agreed set; a later auto-fetch of the newest agreed set below it
+  then lands without moving `stored_set_pos` (`fetch_max`), times out after
+  60 s and retries on the backoff ladder. It stops once the newer set agrees
+  (normally within ~5 s) and persists only if that set diverged, which
+  `Uc2SnapshotSetDiverged` already alerts. Snapshot lifecycle final review
+  M3, 2026-10-10 (the Task 9 ledger had called it unreachable).
 - **Project 3 (not this spec): the backup tier.** Long off-node retention,
   restore from it, and a "backed up through P" watermark — `CLUSTER` kind
   `7` is reserved for the watermark record and nothing more is built yet;
