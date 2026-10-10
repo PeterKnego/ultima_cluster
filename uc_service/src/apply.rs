@@ -1200,6 +1200,11 @@ fn refuse_queries<S: RawStateMachine>(st: &mut ApplyState<S>) {
 
 /// Returns `true` iff it consumed at least one record (answered, refused or
 /// dropped), which `apply_cycle` reports as progress.
+///
+/// Out of line: it runs once per cycle, not per frame, and inlined it reshapes
+/// `apply_cycle`'s frame loop. The `consumed` flag alone cost the write path
+/// 1.2 % in `apply_bench` through layout, with no callee leaving the loop.
+#[inline(never)]
 fn drain_queries<S: RawStateMachine>(st: &mut ApplyState<S>) -> bool {
     // This incarnation's epoch, CAPTURED AT ATTACH (M5 final review #5) — fixed
     // for this incarnation's life, NOT re-read live from the page. A newer
