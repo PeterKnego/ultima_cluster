@@ -523,7 +523,10 @@ uses. It fires on every node, learners and `auto_fetch = false` nodes
 included, BEFORE any download: auto-fetch skips the set
 (`outcome="no_space"`, and one `snapshot_fetch_skipped_no_space` log record
 per set), so the node does not purge below it. Free disk, or shrink the
-state. A set of unknown size never fires it.
+state. A set of unknown size never fires it, and neither does an unknown
+free-space reading on this node (the `statvfs` probe never succeeded): the
+check is off and the node logs one `snapshot_fetch_free_unknown` warning per
+start instead.
 
 **Snapshot-session refusals.** Five named counters drop a session outright and
 leave the joiner NAKing rather than installing a wrong or half set —

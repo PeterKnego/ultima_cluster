@@ -10720,7 +10720,20 @@ impl Consensus {
                     position = n
                 );
             }
-            SpaceCheck::Unknown { first: false } | SpaceCheck::FreeUnknown | SpaceCheck::Fits => {}
+            SpaceCheck::FreeUnknown { first: true } => {
+                // Review N3 (once per incarnation): the space check is off
+                // on this node because its free-bytes figure never arrived.
+                crate::obs_event!(
+                    Warn,
+                    "snapshot_fetch_free_unknown",
+                    node = self.id as u64,
+                    position = n,
+                    bytes = total
+                );
+            }
+            SpaceCheck::Unknown { first: false }
+            | SpaceCheck::FreeUnknown { first: false }
+            | SpaceCheck::Fits => {}
         }
         let candidates = self.auto_fetch_candidates(n, &inner);
         let Some(from) = self.auto_fetch.pick(&candidates, now) else {

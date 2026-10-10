@@ -369,7 +369,9 @@ groups:
     # than fetch, and nodes with auto_fetch off, included): it warns before
     # any download, and a node that cannot hold the newest set cannot purge
     # below it either. The gauge is 0 for a set of unknown size (catalogued
-    # before sizes existed), so that never alarms.
+    # before sizes existed) and for a node whose free-bytes reading is
+    # unknown (statvfs never succeeded; it logs one snapshot_fetch_free_unknown
+    # warning instead), so neither alarms.
     expr: uc2_snapshot_wont_fit > 0
     for: 5m
     labels: { severity: warning }

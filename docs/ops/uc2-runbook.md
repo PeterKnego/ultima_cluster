@@ -312,7 +312,10 @@ transport setting, both measured closed-loop at inflight 1 on 8-vCPU
   `snapshot_fetch_requested` with `actor=auto`; a miss logs
   `snapshot_fetch_timeout`, `snapshot_fetch_no_holder` (every candidate was
   tried; the next attempt waits 30 s) or `snapshot_fetch_skipped_no_space`
-  (once per set). `uc2_snapshot_auto_fetch_total{outcome}` counts each of
+  (once per set). `snapshot_fetch_free_unknown` (warn, once per node start)
+  says this node's free-space reading never succeeded, so fetches proceed
+  with the space check off and `Uc2SnapshotWontFit` cannot fire for it.
+  `uc2_snapshot_auto_fetch_total{outcome}` counts each of
   `ok`, `refused` (this node could not even issue the request), `timeout`
   (a holder stayed silent), `no_space` and `no_holder`. Residual: a new
   fetch drops the receiver's one parked late-answer slot, so a very late

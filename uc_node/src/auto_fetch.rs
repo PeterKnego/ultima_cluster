@@ -98,9 +98,13 @@ pub enum SpaceCheck {
     Fits,
     /// Final review M6: the free figure is not known yet (or `statvfs`
     /// fails) — fetched without the check, like an unknown size, and
-    /// silently: a boot-time race must not spend the set's one `no_space`
-    /// warning on a false reading.
-    FreeUnknown,
+    /// silently as to `no_space`: a boot-time race must not spend the set's
+    /// one `no_space` warning on a false reading. `first` is true once per
+    /// incarnation (review N3): the caller logs one warn that the space
+    /// check is off.
+    FreeUnknown {
+        first: bool,
+    },
     Unknown {
         first: bool,
     },
@@ -135,6 +139,9 @@ pub struct AutoFetch {
     tried: Vec<NodeId>,
     no_space_named: bool,
     size_unknown_named: bool,
+    /// Review N3: the free-space-unknown warning is once per incarnation, so
+    /// it is NOT reset when the target changes.
+    free_unknown_named: bool,
     thin_named: bool,
 }
 
@@ -151,6 +158,7 @@ impl AutoFetch {
             tried: Vec::new(),
             no_space_named: false,
             size_unknown_named: false,
+            free_unknown_named: false,
             thin_named: false,
         }
     }
@@ -207,7 +215,9 @@ impl AutoFetch {
             return SpaceCheck::Unknown { first };
         }
         if free_bytes == FREE_BYTES_UNKNOWN {
-            return SpaceCheck::FreeUnknown;
+            let first = !self.free_unknown_named;
+            self.free_unknown_named = true;
+            return SpaceCheck::FreeUnknown { first };
         }
         if !wont_fit(free_bytes, total) {
             return SpaceCheck::Fits;
@@ -510,7 +520,12 @@ mod tests {
         assert!(a.due(1000, 9000, false, 0));
         assert_eq!(
             a.check_space(4 * GIB, FREE_BYTES_UNKNOWN, 0),
-            SpaceCheck::FreeUnknown
+            SpaceCheck::FreeUnknown { first: true }
+        );
+        // once per incarnation: not again, not even for a new target
+        assert_eq!(
+            a.check_space(4 * GIB, FREE_BYTES_UNKNOWN, 0),
+            SpaceCheck::FreeUnknown { first: false }
         );
         assert!(!a.quiet(1000, 1), "no backoff on an unknown");
         assert!(!wont_fit(FREE_BYTES_UNKNOWN, 4 * GIB));
@@ -518,6 +533,12 @@ mod tests {
             a.check_space(4 * GIB, GIB, 0),
             SpaceCheck::NoSpace { first: true },
             "the first REAL shortfall is still the one named"
+        );
+        // a new target does not re-arm the free-unknown warning
+        assert!(a.due(2000, 9000, false, 5));
+        assert_eq!(
+            a.check_space(4 * GIB, FREE_BYTES_UNKNOWN, 5),
+            SpaceCheck::FreeUnknown { first: false }
         );
     }
 
