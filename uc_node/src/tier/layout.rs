@@ -79,7 +79,7 @@ pub struct TierInfo {
 impl TierInfo {
     pub fn render(&self) -> String {
         format!(
-            "format={TIER_FORMAT}\napp_id={}\ntier_id={}\ncreated_ns={}\n",
+            "format={TIER_FORMAT}\napp_id={}\ntier_id={:#018x}\ncreated_ns={}\n",
             self.app_id, self.tier_id, self.created_ns
         )
     }
@@ -106,9 +106,13 @@ impl TierInfo {
                 format!("format {format:?}, expected {TIER_FORMAT:?}"),
             ));
         }
+        let tier_id = num("TIER", "tier_id", id.ok_or_else(|| miss("tier_id"))?)?;
+        if tier_id == 0 {
+            return Err(bad("TIER", "tier_id must be non-zero"));
+        }
         Ok(TierInfo {
             app_id: app.ok_or_else(|| miss("app_id"))?.to_string(),
-            tier_id: num("TIER", "tier_id", id.ok_or_else(|| miss("tier_id"))?)?,
+            tier_id,
             created_ns: num(
                 "TIER",
                 "created_ns",
@@ -301,5 +305,97 @@ mod tests {
             cluster_size: 50,
         };
         assert_eq!(SetLabel::parse(&s.render()).unwrap(), s);
+    }
+
+    #[test]
+    fn tier_id_renders_hex_and_zero_is_refused() {
+        let t = TierInfo {
+            app_id: "kv".into(),
+            tier_id: 0xabc,
+            created_ns: 5,
+        };
+        assert!(t.render().contains("tier_id=0x0000000000000abc\n"));
+        assert!(
+            TierInfo::parse("format=uc2-tier-v1\napp_id=kv\ntier_id=0x0\ncreated_ns=0\n").is_err()
+        );
+    }
+
+    #[test]
+    fn set_label_parse_refuses_duplicate_missing_and_unknown_keys() {
+        let s = SetLabel {
+            position: 8,
+            kind: SetKind::Standby,
+            time_ns: 1,
+            rows: vec![RowLabel {
+                row: 0,
+                hash: 1,
+                version: 2,
+                size: 3,
+            }],
+            cluster_hash: 4,
+            cluster_size: 5,
+        };
+        let good = s.render();
+        assert_eq!(SetLabel::parse(&good).unwrap(), s);
+        assert!(
+            SetLabel::parse(&format!("{good}position=9\n")).is_err(),
+            "duplicate"
+        );
+        assert!(
+            SetLabel::parse(&format!("{good}row.0.size=9\n")).is_err(),
+            "duplicate row key"
+        );
+        assert!(
+            SetLabel::parse(&format!("{good}bogus=1\n")).is_err(),
+            "unknown"
+        );
+        let missing: String = good
+            .lines()
+            .filter(|l| !l.starts_with("time_ns"))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        assert!(SetLabel::parse(&missing).is_err(), "missing");
+        let missing: String = good
+            .lines()
+            .filter(|l| !l.starts_with("row.0.hash"))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        assert!(SetLabel::parse(&missing).is_err(), "missing row key");
+    }
+
+    #[test]
+    fn from_catalog_keeps_agreed_rows_by_row_id() {
+        use uc_protocol::v2::catalog::RowEntry;
+        let mut e = SetEntry::commanded(4096, SetKind::Full, 7);
+        let row = |version, hash, size, verdict| RowEntry {
+            version,
+            hash,
+            verdict,
+            size,
+        };
+        e.rows[0] = row(1, 0xa, 100, RowVerdict::Agreed);
+        e.rows[1] = row(9, 0xb, 999, RowVerdict::Unreported);
+        e.rows[2] = row(3, 0xc, 300, RowVerdict::Agreed);
+        e.cluster = row(0, 0xd, 50, RowVerdict::Agreed);
+        let l = SetLabel::from_catalog(&e);
+        assert_eq!(
+            l.rows,
+            vec![
+                RowLabel {
+                    row: 0,
+                    hash: 0xa,
+                    version: 1,
+                    size: 100
+                },
+                RowLabel {
+                    row: 2,
+                    hash: 0xc,
+                    version: 3,
+                    size: 300
+                },
+            ]
+        );
+        assert_eq!((l.position, l.kind, l.time_ns), (4096, SetKind::Full, 7));
+        assert_eq!((l.cluster_hash, l.cluster_size), (0xd, 50));
     }
 }

@@ -102,14 +102,28 @@ impl BackupTarget for FsTarget {
         drop(f);
         let fin = self.root.join(path);
         let parent = fin.parent().unwrap_or(&self.root).to_path_buf();
-        std::fs::create_dir_all(&parent)?;
-        // hard_link fails with AlreadyExists when the final name exists: the
-        // atomic "iff absent" (rename would silently replace).
-        let linked = std::fs::hard_link(&tmp, &fin);
+        let placed = std::fs::create_dir_all(&parent).and_then(|()| {
+            // hard_link fails with AlreadyExists when the final name exists:
+            // the atomic "iff absent" (rename would silently replace).
+            std::fs::hard_link(&tmp, &fin)
+        });
         let _ = std::fs::remove_file(&tmp);
-        match linked {
+        match placed {
             Ok(()) => {
-                fsync_dir(&parent)?;
+                // create_dir_all may have made several ancestors: fsync every
+                // directory from the leaf parent up to the root so none of
+                // the new entries can be lost to a crash.
+                let mut d = parent.as_path();
+                loop {
+                    fsync_dir(d)?;
+                    if d == self.root {
+                        break;
+                    }
+                    match d.parent() {
+                        Some(p) if p.starts_with(&self.root) => d = p,
+                        _ => break,
+                    }
+                }
                 Ok(Put::Written(stored))
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(Put::Exists),
@@ -260,6 +274,41 @@ mod tests {
         assert!(t.list(".tmp").unwrap().is_empty(), "Exists removes its tmp");
         std::fs::write(d.path().join(".tmp/stale"), b"x").unwrap();
         assert_eq!(t.clean_tmp(Duration::ZERO).unwrap(), 1);
+    }
+
+    #[test]
+    fn a_failing_callback_leaves_nothing_behind() {
+        let d = tmp();
+        let t = FsTarget::new(d.path());
+        let e = t
+            .put_if_absent("sets/1/x", &mut |f: &mut File| {
+                f.write_all(b"partial")?;
+                Err(TierError::Refused("boom".into()))
+            })
+            .map(|_| ())
+            .unwrap_err();
+        assert!(e.to_string().contains("boom"));
+        assert!(!d.path().join("sets/1/x").exists());
+        assert!(t.list(".tmp").unwrap().is_empty());
+    }
+
+    #[test]
+    fn two_racing_creators_agree_on_one_tier() {
+        let d = tmp();
+        let t = std::sync::Arc::new(FsTarget::new(d.path()));
+        let gate = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let hs: Vec<_> = (1..=2u64)
+            .map(|i| {
+                let (t, gate) = (t.clone(), gate.clone());
+                std::thread::spawn(move || {
+                    gate.wait();
+                    open_or_create_tier(&*t, "kv", i).unwrap()
+                })
+            })
+            .collect();
+        let a: Vec<_> = hs.into_iter().map(|h| h.join().unwrap()).collect();
+        assert_eq!(a[0], a[1]);
+        assert_eq!(read_tier(&*t).unwrap().unwrap(), a[0]);
     }
 
     #[test]
