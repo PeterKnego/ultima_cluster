@@ -217,7 +217,7 @@ Two version numbers are deliberately *outside* this policy, because semver's
 
 - **The node-to-node wire protocol** (`uc_protocol::version::CURRENT`,
   currently `0.11.0` (the snapshot catalog's `STATUS` body, `SNAP_REPORT`
-  row 255 and `Settings` v3; unreleased as this is written — `0.10.0`
+  row 255 and `Settings` v3, then the snapshot lifecycle's 32 B `SNAP_REPORT`, 20-byte `SnapshotReport` entries and `Settings` v4; unreleased as this is written — `0.10.0`
   shipped #33's row running version, also unreleased; `0.9.0` shipped in
   `2.13.0`) — see [wire protocol](wire-protocol.md)).
 - **The `cnc.dat` page layout** (`CNC_V2_VERSION`, currently cnc `3.4`

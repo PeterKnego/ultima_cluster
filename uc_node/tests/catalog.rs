@@ -619,8 +619,141 @@ fn metric(node: &Node, name: &str) -> u64 {
         .unwrap_or_else(|e| panic!("{name}: {e}"))
 }
 
+/// A failure dump's metric read: the sample whose line starts with `prefix`
+/// (`name ` or `name{labels} `), or `"absent"` — never a panic, so a dump
+/// cannot replace the failure it is explaining with one of its own.
+fn metric_or_absent(node: &Node, prefix: &str) -> String {
+    let text = uc_node::obs::metrics::render_prometheus(&node.observability());
+    text.lines()
+        .find_map(|l| l.strip_prefix(prefix))
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map_or_else(|| "absent".to_owned(), |v| v.to_string())
+}
+
 fn floor(c: &Cluster, i: usize) -> u64 {
     c.cnc(i).snapshots().node_snapshot_floor.load_acquire()
+}
+
+/// One labeled sample, e.g.
+/// `metric_labeled(n, "uc2_snapshot_auto_fetch_total", "outcome=\"ok\"")`.
+fn metric_labeled(node: &Node, name: &str, labels: &str) -> u64 {
+    let text = uc_node::obs::metrics::render_prometheus(&node.observability());
+    let prefix = format!("{name}{{{labels}}} ");
+    text.lines()
+        .find_map(|l| l.strip_prefix(&prefix))
+        .unwrap_or_else(|| panic!("no {name}{{{labels}}} sample in:\n{text}"))
+        .trim()
+        .parse()
+        .unwrap_or_else(|e| panic!("{name}{{{labels}}}: {e}"))
+}
+
+/// The five `uc2_snapshot_auto_fetch_total` outcomes (snapshot-lifecycle
+/// spec §6).
+const FETCH_OUTCOMES: [&str; 5] = ["ok", "refused", "timeout", "no_space", "no_holder"];
+
+/// Snapshot-lifecycle failure-path diagnostic: per node, everything the five
+/// lifecycle tests wait on — set position, persisted floor, purge base, the
+/// catalog's agreed position and the newest-agreed size, the row's start set
+/// and applied, the free-bytes figure the space check reads, and every
+/// auto-fetch outcome counter.
+fn dump_lifecycle(c: &Cluster, p: u64) -> String {
+    let mut out = format!("lifecycle dump at p={p}:");
+    for i in c.running() {
+        let n = c.node(i);
+        let k = n.counters();
+        let cnc = c.cnc(i);
+        let slot = cnc.service_slot(0);
+        let free = n
+            .soft_table()
+            .by_node
+            .get(&c.nodes[i].id)
+            .map(|e| e.holdings.free_bytes);
+        let fetches: Vec<String> = FETCH_OUTCOMES
+            .iter()
+            .map(|o| {
+                format!(
+                    "{o}={}",
+                    metric_or_absent(
+                        n,
+                        &format!("uc2_snapshot_auto_fetch_total{{outcome=\"{o}\"}} ")
+                    )
+                )
+            })
+            .collect();
+        out.push_str(&format!(
+            "\n  node {i}{}: set={} floor={} first_base={} agreed={} agreed_bytes={} \
+             commit={} durable={} row0 applied={} start_set={:?} status={:#x} free={free:?} \
+             fetch[{}] | on disk at p: {}",
+            if c.nodes[i].is_learner {
+                " (learner)"
+            } else {
+                ""
+            },
+            n.snapshot_set_position(),
+            floor(c, i),
+            n.archive_first_base(),
+            agreed_position(n),
+            metric_or_absent(n, "uc2_snapshot_newest_agreed_bytes "),
+            k.commit.load_acquire(),
+            k.durable.load_acquire(),
+            slot.applied.load_acquire(),
+            slot.snapshot_pos.start_set(),
+            slot.status.load_acquire(),
+            fetches.join(" "),
+            holds_on_disk(c.dir(i), &[0], p),
+        ));
+    }
+    out
+}
+
+/// [`await_until`] that prints [`dump_lifecycle`] before it fails.
+fn await_or_dump(c: &Cluster, p: u64, secs: u64, msg: &str, mut f: impl FnMut() -> bool) {
+    let deadline = deadline_secs(secs);
+    while !f() {
+        if Instant::now() >= deadline {
+            panic!("{msg} (within {secs} s)\n{}", dump_lifecycle(c, p));
+        }
+        std::thread::yield_now();
+    }
+}
+
+/// [`await_capable`] over the nodes in `idxs` only, with the per-node dump
+/// on failure.
+fn await_capable_on(c: &Cluster, idxs: &[usize], rows: &[usize]) {
+    let pages: Vec<Arc<CncPage>> = idxs.iter().map(|&i| c.cnc(i)).collect();
+    await_or_dump(
+        c,
+        0,
+        30,
+        "the named nodes' rows published the capability bit",
+        || {
+            pages.iter().all(|p| {
+                rows.iter().all(|&r| {
+                    p.service_slot(r).status.load_acquire() & CNC_SVC_STATUS_SNAPSHOT_CAPABLE != 0
+                })
+            })
+        },
+    );
+}
+
+/// The process-global obs sink, captured for a scope and restored to stderr
+/// on drop (a panic's unwind included); [`serialize`] keeps captures from
+/// overlapping.
+struct ObsCapture(Arc<Mutex<Vec<u8>>>);
+
+impl ObsCapture {
+    fn take() -> Self {
+        Self(uc_node::obs::log::capture_for_tests())
+    }
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().unwrap_or_else(|e| e.into_inner())).into_owned()
+    }
+}
+
+impl Drop for ObsCapture {
+    fn drop(&mut self) {
+        uc_node::obs::log::stderr_for_tests();
+    }
 }
 
 fn row_artifact(dir: &Path, row: u8, p: u64) -> PathBuf {
@@ -718,9 +851,9 @@ fn apply_retain_sets(c: &Cluster, leader: usize, n: u16) -> u64 {
     pos
 }
 
-/// `uc2ctl upgrade pin` on the leader, retried through `54 pin_no_set` (the
-/// set's position is published a moment after its artifact lands).
-fn pin(c: &Cluster, leader: usize, row: u8, version: u32, origin: u64) -> u64 {
+/// The staged bytes of `uc2ctl upgrade pin` naming `origin` as `row`'s
+/// origin, same line (`from == to == version`).
+fn pin_bytes(row: u8, version: u32, origin: u64) -> Vec<u8> {
     use uc_protocol::v2::upgrade::{UpgradePin, encode_upgrade_pin};
     let mut bytes = Vec::new();
     encode_upgrade_pin(
@@ -732,6 +865,14 @@ fn pin(c: &Cluster, leader: usize, row: u8, version: u32, origin: u64) -> u64 {
         },
         &mut bytes,
     );
+    bytes
+}
+
+/// `uc2ctl upgrade pin` on the leader, retried through `54 pin_no_set` (the
+/// set's position is published a moment after its artifact lands) or `61
+/// pin_origin_not_agreed` (the catalog agrees it a moment after that).
+fn pin(c: &Cluster, leader: usize, row: u8, version: u32, origin: u64) -> u64 {
+    let bytes = pin_bytes(row, version, origin);
     let deadline = deadline_secs(30);
     loop {
         let (status, reason, pos) = admin_staged(
@@ -745,7 +886,9 @@ fn pin(c: &Cluster, leader: usize, row: u8, version: u32, origin: u64) -> u64 {
             return pos;
         }
         assert!(
-            reason == uc_node::REASON_PIN_NO_SET && Instant::now() < deadline,
+            (reason == uc_node::REASON_PIN_NO_SET
+                || reason == uc_node::REASON_PIN_ORIGIN_NOT_AGREED)
+                && Instant::now() < deadline,
             "upgrade pin refused: status={status} reason={reason}"
         );
         std::thread::sleep(Duration::from_millis(20));
@@ -768,6 +911,10 @@ struct SumSm {
 
 static SALT: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 
+/// Snapshot-lifecycle e2e 3: frames each node's [`SumSm`] applied in this
+/// process — how a restart's replay length is read.
+static APPLIES: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+
 impl SumSm {
     fn on(node: usize) -> SumSm {
         SumSm {
@@ -782,6 +929,7 @@ impl uc_service::RawStateMachine for SumSm {
     const NAME: &'static str = "sum";
 
     fn apply(&mut self, ctx: &mut uc_service::ApplyCtx, cmd: &[u8], out: &mut Vec<u8>) {
+        APPLIES[self.node].fetch_add(1, Ordering::Relaxed);
         if cmd.len() >= 8 {
             self.total = self
                 .total
@@ -1205,25 +1353,27 @@ fn a_stalled_set_stays_commanded_and_the_next_instant_completes() {
     c.stop();
 }
 
-/// Catalog spec §4.4 (ruling R21): `retain_sets = 2` keeps the two newest
-/// UNPINNED agreed sets plus every pinned origin, retires the oldest from the
-/// catalog AND from every node's disk, and a pinned origin is never counted
-/// and never retired; the journal floor follows the newest agreed set the
-/// node holds, not the oldest retained.
+/// Catalog spec §4.4 (ruling R21) as amended by pin completion (ruling C3,
+/// brief test 3): `retain_sets = 2` keeps the two newest agreed sets, a
+/// pinned origin is kept beside them only while its pin is INCOMPLETE, and
+/// once an agreed set above the pin record completes the pin, the origin is
+/// an ordinary set — retired from the catalog and from every node's disk by
+/// normal retention — while the journal floor follows the newest agreed set.
 ///
 /// Instants `p1`, `p2` (catalog `[p1, p2]`, journal purged past `p1`); a
-/// same-line pin naming `p2` as a row's origin; `p3` — the unpinned agreed
-/// sets are `[p1, p3]`, exactly `retain_sets`, so nothing retires and the
-/// catalog reads `[p1, p2, p3]` (the pin costs no retention slot); `p4` —
-/// the unpinned sets are `[p1, p3, p4]`, so the oldest, `p1`, retires from
-/// the catalog and every node's disk, the catalog reads `[p2, p3, p4]`, and
-/// `p3` SURVIVES on disk beside the pinned `p2`.
+/// same-line pin naming `p2` as row 0's origin, with every node's row already
+/// attached on that line; `p3` — above the pin record, so it COMPLETES the
+/// pin: the unpinned agreed sets are `[p1, p2, p3]`, so `p1` retires and the
+/// catalog reads `[p2, p3]`; `p4` — `p2` is no longer protected, retires
+/// from the catalog and from every node's disk, and the catalog reads
+/// `[p3, p4]`.
 ///
-/// Red twins: skip the settings apply (retention 1 drops `p1` at `p2`), skip
-/// the pin (`p2` leaves at `p4`), or count the pin toward `retain_sets` (as
-/// built before R21: `p1` leaves at `p3` and `p3` at `p4`).
+/// Red twins: drop the completion clause from `ClusterState::pinned_origins`
+/// (the catalog keeps `p2` forever — `[p1, p2, p3]` then `[p2, p3, p4]`, the
+/// pre-C3 R21 shape), or from the node's pruner keep (the catalog drops `p2`
+/// but every node keeps its files).
 #[test]
-fn retain_sets_2_retires_the_oldest_and_keeps_the_pinned_origin() {
+fn retain_sets_2_keeps_a_pinned_origin_only_until_the_pin_completes() {
     let _g = serialize();
     let mut c = spawn(2, 1, opts("catalog-retain", true), |_| true);
     start_sums(&mut c);
@@ -1265,7 +1415,7 @@ fn retain_sets_2_retires_the_oldest_and_keeps_the_pinned_origin() {
 
     // A same-line pin naming p2 as row 0's origin.
     let version = c.cnc(leader).service_slot(0).status.version();
-    pin(&c, leader, 0, version, p2);
+    let record = pin(&c, leader, 0, version, p2);
     await_until(30, "every node committed the pin", || {
         all.iter().all(|&i| {
             c.node(i)
@@ -1279,19 +1429,13 @@ fn retain_sets_2_retires_the_oldest_and_keeps_the_pinned_origin() {
 
     submit_frames(c.node(leader), 4000);
     let p3 = instant_until_complete(&c, leader, &all);
+    assert!(p3 > record, "p3={p3} sits above the pin record {record}");
     await_agreed(&c, &all, p3);
-    // Ruling R21: the pinned p2 is not counted, so the unpinned agreed sets
-    // are [p1, p3] — exactly retain_sets — and nothing retires.
-    await_until(30, "every node lists [p1, p2, p3]", || {
-        all.iter()
-            .all(|&i| positions(c.node(i)) == vec![p1, p2, p3])
+    // Ruling C3: p3 completes the pin, so p2 is an ordinary agreed set and
+    // the unpinned agreed sets are [p1, p2, p3] — one over retain_sets.
+    await_until(30, "every node lists [p2, p3]", || {
+        all.iter().all(|&i| positions(c.node(i)) == vec![p2, p3])
     });
-    for &i in &all {
-        assert!(
-            holds_on_disk(c.dir(i), &[0], p1),
-            "node {i}: p1 is still retained — the pin cost no retention slot"
-        );
-    }
 
     submit_frames(c.node(leader), 4000);
     let p4 = instant_until_complete(&c, leader, &all);
@@ -1300,26 +1444,21 @@ fn retain_sets_2_retires_the_oldest_and_keeps_the_pinned_origin() {
     await_until(30, "every node's floor reached p4", || {
         all.iter().all(|&i| floor(&c, i) == p4)
     });
-    // Ruling R21 (`ClusterState::retire`): a pinned origin is never counted
-    // toward `retain_sets` — with `[p1, p2 (pinned), p3, p4]` agreed and
-    // `retain_sets = 2`, the unpinned sets are [p1, p3, p4], so p1 (the
-    // oldest) retires and p2 and p3 both stay.
-    await_until(30, "every node retired p1's files", || {
-        all.iter().all(|&i| none_on_disk(c.dir(i), &[0], p1))
+    await_until(30, "every node lists [p3, p4]", || {
+        all.iter().all(|&i| positions(c.node(i)) == vec![p3, p4])
     });
+    await_until(
+        30,
+        "every node retired p1's and the completed origin p2's files",
+        || {
+            all.iter()
+                .all(|&i| none_on_disk(c.dir(i), &[0], p1) && none_on_disk(c.dir(i), &[0], p2))
+        },
+    );
     for &i in &all {
-        assert_eq!(
-            positions(c.node(i)),
-            vec![p2, p3, p4],
-            "node {i}: p1 retires; the pinned p2 is kept beside two retained sets"
-        );
-        assert!(
-            holds_on_disk(c.dir(i), &[0], p2),
-            "node {i}: the pinned origin's set must survive on disk"
-        );
         assert!(
             holds_on_disk(c.dir(i), &[0], p3),
-            "node {i}: p3 is retained (the pin does not take its slot) and survives on disk"
+            "node {i}: p3 is retained and survives on disk"
         );
         assert!(
             holds_on_disk(c.dir(i), &[0], p4),
@@ -1332,32 +1471,73 @@ fn retain_sets_2_retires_the_oldest_and_keeps_the_pinned_origin() {
         assert!(
             b > p3 && b <= p4,
             "node {i}: the journal follows the newest agreed set p4 (first_base={b}, \
-             p3={p3}, p4={p4}) — a same-line pin is consumed by the attached row, so it \
-             holds artifacts, not journal"
+             p3={p3}, p4={p4}) — the floor passed the completed pin's origin"
         );
     }
 
     c.stop();
 }
 
-/// Rewrite a cluster artifact in place as the pre-catalog `v3` layout: drop
-/// the trailing catalog blob and its length prefix, set the version word to
-/// 3, re-CRC (`cluster_fsm.rs`'s `a_v3_image_installs_with_an_empty_catalog`,
+/// Rewrite a cluster artifact in place as the pre-catalog `v3` layout: the
+/// report blob narrowed to its unsized 12 B entries (snapshot-lifecycle spec
+/// §7.2 — a v3 image never carried sizes; `cluster_fsm.rs`'s
+/// `rewrite_image_as_v4` does the same), the trailing catalog blob and its
+/// length prefix dropped, the version word set to 3, re-CRC
+/// (`cluster_fsm.rs`'s `a_v3_image_installs_with_an_empty_catalog`,
 /// generalised to a non-empty catalog). This is what a `2.13.x` node left on
 /// disk before the flag day.
 fn rewrite_as_v3(path: &Path) {
+    use uc_protocol::v2::cluster_image::{
+        ClusterImageParts, decode_cluster_image, encode_cluster_image,
+    };
+    use uc_protocol::v2::upgrade::{
+        SNAPSHOT_REPORT_ENTRY_LEN, SNAPSHOT_REPORT_ENTRY_LEN_UNSIZED, SNAPSHOT_REPORT_HEADER_LEN,
+    };
     let img = std::fs::read(path).unwrap();
-    let cat = uc_protocol::v2::cluster_image::decode_cluster_image(&img)
-        .expect("a valid v4 image")
-        .catalog
-        .len();
-    let body_end = img.len() - 4;
-    let mut v3 = img[..body_end - 4 - cat].to_vec();
+    let parts = decode_cluster_image(&img).expect("a valid current image");
+    let mut reports = Vec::new();
+    let mut o = 0;
+    while o < parts.reports.len() {
+        let len = u32::from_le_bytes(parts.reports[o..o + 4].try_into().unwrap()) as usize;
+        let rec = &parts.reports[o + 4..o + 4 + len];
+        let mut old = rec[..SNAPSHOT_REPORT_HEADER_LEN].to_vec();
+        for e in rec[SNAPSHOT_REPORT_HEADER_LEN..].chunks(SNAPSHOT_REPORT_ENTRY_LEN) {
+            old.extend_from_slice(&e[..SNAPSHOT_REPORT_ENTRY_LEN_UNSIZED]);
+        }
+        reports.extend_from_slice(&(old.len() as u32).to_le_bytes());
+        reports.extend_from_slice(&old);
+        o += 4 + len;
+    }
+    let mut v3 = Vec::new();
+    encode_cluster_image(
+        &ClusterImageParts {
+            reports: &reports,
+            catalog: &[],
+            ..parts
+        },
+        &mut v3,
+    )
+    .unwrap();
+    v3.truncate(v3.len() - 4); // CRC
+    let catalog_prefix = v3.split_off(v3.len() - 4);
+    assert_eq!(catalog_prefix, 0u32.to_le_bytes(), "empty catalog blob");
     v3[8..12].copy_from_slice(&3u32.to_le_bytes());
     let crc = crc32fast::hash(&v3);
     v3.extend_from_slice(&crc.to_le_bytes());
-    let parts = uc_protocol::v2::cluster_image::decode_cluster_image(&v3).expect("a valid v3");
+    let parts = decode_cluster_image(&v3).expect("a valid v3");
     assert!(parts.catalog.is_empty());
+    let mut o = 0;
+    while o < parts.reports.len() {
+        let len = u32::from_le_bytes(parts.reports[o..o + 4].try_into().unwrap()) as usize;
+        let count = parts.reports[o + 4 + 1] as usize;
+        assert_eq!(
+            len,
+            SNAPSHOT_REPORT_HEADER_LEN + count * SNAPSHOT_REPORT_ENTRY_LEN_UNSIZED,
+            "the v3 report blob is unsized"
+        );
+        o += 4 + len;
+    }
+    assert!(uc_protocol::v2::upgrade::decode_report_list(parts.reports).is_some());
     std::fs::write(path, &v3).unwrap();
 }
 
@@ -1539,7 +1719,18 @@ fn the_flag_day_window_is_empty_and_deletes_nothing() {
 #[test]
 fn a_killed_node_leaves_holders_after_the_stale_timeout() {
     let _g = serialize();
-    let mut c = spawn(2, 2, opts("catalog-stale", false), |_| true);
+    let mut c = spawn(
+        2,
+        2,
+        Opts {
+            settings: Settings {
+                auto_fetch: false,
+                ..Settings::genesis_default()
+            },
+            ..opts("catalog-stale", false)
+        },
+        |_| true,
+    );
     let mut learner2_svc = None;
     for i in c.running() {
         let s = start_sum(c.dir(i), c.app, i);
@@ -1624,8 +1815,16 @@ fn a_killed_node_leaves_holders_after_the_stale_timeout() {
 /// do not hold — until a fetch lands it on one of them, and then only that
 /// one's floor moves.
 ///
-/// Red twin: assert a voter's `archive_first_base > 0` after the 10 s hold —
-/// it is not; or drop the fetch — voter 0's floor never moves.
+/// Snapshot-lifecycle spec §11 e2e 2: with `[settings] auto_fetch = false`
+/// voters on a learner-only cluster hold nothing and never purge — the
+/// documented trade of the switch — and every
+/// `uc2_snapshot_auto_fetch_total` outcome stays 0 on them: the switch off
+/// attempts nothing.
+///
+/// Red twins: assert a voter's `archive_first_base > 0` after the 10 s hold —
+/// it is not; drop the fetch — voter 0's floor never moves; flip the
+/// fixture's `auto_fetch` to `true` — "voter 0 holds nothing" fails inside
+/// the hold.
 ///
 /// Which assertions are the CATALOG's teeth: the no-purge half alone ("a
 /// voter that holds nothing purges nothing") would pass on a pre-catalog
@@ -1638,7 +1837,18 @@ fn a_killed_node_leaves_holders_after_the_stale_timeout() {
 #[test]
 fn learner_only_voters_do_not_purge_until_they_fetch() {
     let _g = serialize();
-    let mut c = spawn(2, 1, opts("catalog-learner-only", true), |_| true);
+    let mut c = spawn(
+        2,
+        1,
+        Opts {
+            settings: Settings {
+                auto_fetch: false,
+                ..Settings::genesis_default()
+            },
+            ..opts("catalog-learner-only", true)
+        },
+        |_| true,
+    );
     start_sums(&mut c);
     let leader = await_single_leader(&c, 30);
     let learner = 2usize;
@@ -1665,23 +1875,48 @@ fn learner_only_voters_do_not_purge_until_they_fetch() {
     assert!(p > SEG, "need >1 segment below p (p={p})");
 
     submit_frames(c.node(leader), 6000);
-    std::thread::sleep(Duration::from_secs(10));
+    // A negative, so it is HELD for a span (twice the 5 s report timeout,
+    // many purge ticks and auto-fetch passes) and asserted throughout,
+    // rather than read once after a sleep.
+    await_until(30, "every voter learned the agreed standby set", || {
+        [0usize, 1].iter().all(|&v| agreed_position(c.node(v)) == p)
+    });
+    let hold = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < hold {
+        for v in [0usize, 1] {
+            assert_eq!(
+                c.node(v).snapshot_set_position(),
+                0,
+                "voter {v} holds nothing\n{}",
+                dump_lifecycle(&c, p)
+            );
+            assert_eq!(
+                c.node(v).archive_first_base(),
+                0,
+                "voter {v} must not purge below a set it does not hold"
+            );
+            assert_eq!(
+                agreed_position(c.node(v)),
+                p,
+                "…though it knows the cluster floor"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // Snapshot-lifecycle spec §11 e2e 2: the switch off attempts NOTHING —
+    // not a fetch that failed, not a skip; every outcome reads 0.
     for v in [0usize, 1] {
-        assert_eq!(
-            c.node(v).archive_first_base(),
-            0,
-            "voter {v} must not purge below a set it does not hold"
-        );
-        assert_eq!(
-            agreed_position(c.node(v)),
-            p,
-            "…though it knows the cluster floor"
-        );
-        assert_eq!(
-            c.node(v).snapshot_set_position(),
-            0,
-            "voter {v} holds nothing"
-        );
+        for outcome in FETCH_OUTCOMES {
+            assert_eq!(
+                metric_labeled(
+                    c.node(v),
+                    "uc2_snapshot_auto_fetch_total",
+                    &format!("outcome=\"{outcome}\"")
+                ),
+                0,
+                "voter {v}: auto_fetch = false attempts nothing ({outcome})"
+            );
+        }
     }
     await_until(
         30,
@@ -1706,6 +1941,409 @@ fn learner_only_voters_do_not_purge_until_they_fetch() {
     );
     assert_eq!(floor(&c, 1), 0, "voter 1's floor never moved");
 
+    c.stop();
+}
+
+// --------------------------------------------- snapshot lifecycle (spec §11)
+
+/// Snapshot-lifecycle spec §11 e2e 1: a learner-only cluster with auto-fetch
+/// ON (the genesis default). After a standby instant every voter fetches the
+/// agreed set in the background, holds it, and purges below it — no operator
+/// step. Each voter counts the fetch `ok`, audits it as `actor = "auto"`, and
+/// — the set was agreed over ONE reporter — names that (review focus 5).
+///
+/// Red twin: make `maybe_auto_fetch` return at its first line — "voter 0
+/// auto-fetched the agreed set" times out.
+#[test]
+fn learner_only_voters_auto_fetch_the_agreed_set_and_purge_below_it() {
+    let _g = serialize();
+    let obs = ObsCapture::take();
+    let mut c = spawn(2, 1, opts("lifecycle-auto-fetch", true), |_| true);
+    start_sums(&mut c);
+    let leader = await_single_leader(&c, 30);
+    let learner = 2usize;
+    await_capable(&c, &[0]);
+    submit_frames(c.node(leader), 6000);
+    let p = command_standby_instant(c.node(leader));
+    await_or_dump(&c, p, 60, "the learner completed the standby set", || {
+        c.node(learner).snapshot_set_position() >= p
+    });
+    await_agreed(&c, &[0, 1, 2], p);
+    assert!(p > SEG, "need >1 segment below p (p={p})");
+    for v in [0usize, 1] {
+        await_or_dump(
+            &c,
+            p,
+            90,
+            &format!("voter {v} auto-fetched the agreed set"),
+            || c.node(v).snapshot_set_position() >= p,
+        );
+        assert!(
+            holds_on_disk(c.dir(v), &[0], p),
+            "voter {v} holds the set on disk"
+        );
+    }
+    submit_frames(c.node(leader), 6000);
+    for v in [0usize, 1] {
+        await_or_dump(
+            &c,
+            p,
+            60,
+            &format!("voter {v} persisted the fetched set and purged below it"),
+            || floor(&c, v) == p && c.node(v).archive_first_base() > 0,
+        );
+        let base = c.node(v).archive_first_base();
+        assert!(
+            base <= p,
+            "voter {v} purged at most to the fetched set (first_base={base}, p={p})"
+        );
+        await_or_dump(
+            &c,
+            p,
+            30,
+            &format!("voter {v} counted its fetch ok"),
+            || metric_labeled(c.node(v), "uc2_snapshot_auto_fetch_total", "outcome=\"ok\"") >= 1,
+        );
+        // Awaited, not read once: since ruling R15 the consensus agent only
+        // ENQUEUES this record at the issue; the `uc2-holdings` thread writes
+        // and fsyncs it on its next wake (50 ms), so it is not causally
+        // ordered before the fetch landing this test waited on.
+        let audit_path = c.dir(v).join("audit.jsonl");
+        let has_auto = || {
+            std::fs::read_to_string(&audit_path)
+                .unwrap_or_default()
+                .lines()
+                .any(|l| {
+                    l.contains("\"actor\":\"auto\"") && l.contains("\"op_name\":\"snapshot_fetch\"")
+                })
+        };
+        await_or_dump(
+            &c,
+            p,
+            10,
+            &format!("voter {v}: an auto snapshot_fetch audit record"),
+            has_auto,
+        );
+    }
+    let p_text = p.to_string();
+    assert!(
+        obs.text()
+            .lines()
+            .any(|l| l.contains("snapshot_fetch_single_reporter") && l.contains(&p_text)),
+        "a set agreed over one learner must be named as such"
+    );
+    c.stop();
+}
+
+/// Snapshot-lifecycle spec §11 e2e 3: a voter's in-memory service restarted
+/// after an agreed instant installs the node's START SET at attach and
+/// replays only the tail — `applied` jumps to the set rather than climbing
+/// from 0.
+///
+/// Read race-free through [`APPLIES`]: `SumSm` counts a frame BEFORE the
+/// service publishes `applied` past it, so the count read once `applied` is
+/// first seen at or above `p` covers every frame the restarted service
+/// applied to get there. Climbing from 0 makes that ≈ 4000 (every frame
+/// below `p`); a start-set install makes it ≈ 0.
+///
+/// Red twin: make `install_start_set` return `Ok(None)` at its top — the
+/// restart replays from 0 and the count reads ≈ 4000.
+#[test]
+fn a_restarted_in_memory_service_starts_from_the_local_set() {
+    let _g = serialize();
+    let mut c = spawn(3, 0, opts("lifecycle-start-set", false), |_| true);
+    let leader = await_single_leader(&c, 30);
+    let v = *c.voters().iter().find(|&&i| i != leader).unwrap();
+    let mut v_svc = None;
+    for i in c.running() {
+        let s = start_sum(&c.nodes[i].instance_dir, c.app, i);
+        if i == v {
+            v_svc = Some(s);
+        } else {
+            c.svcs.push(stopper(s));
+        }
+    }
+    await_capable(&c, &[0]);
+    submit_frames(c.node(leader), 4000);
+    let p = instant_until_complete(&c, leader, &[0, 1, 2]);
+    await_agreed(&c, &[0, 1, 2], p);
+    let version = <SumSm as uc_service::RawStateMachine>::VERSION;
+    let page = c.cnc(v);
+    await_or_dump(&c, p, 30, "the node published its start set", || {
+        page.service_slot(0).snapshot_pos.start_set() == Some((p, version))
+    });
+    submit_frames(c.node(leader), 500);
+    v_svc.take().unwrap().stop();
+    APPLIES[v].store(0, Ordering::Relaxed);
+    let svc = start_sum(c.dir(v), c.app, v);
+    await_or_dump(
+        &c,
+        p,
+        60,
+        "the restarted row applied to the start set",
+        || page.service_slot(0).applied.load_acquire() >= p,
+    );
+    let at_set = APPLIES[v].load(Ordering::Relaxed);
+    assert!(
+        at_set < 1000,
+        "the restarted row applied {at_set} frames to reach the start set {p} — it climbed \
+         from 0 (≈4000) instead of installing the set (≈0)"
+    );
+    await_applied(&c, leader, &[v], &[0]);
+    let replayed = APPLIES[v].load(Ordering::Relaxed);
+    assert!(
+        replayed < 2000,
+        "the restart applied {replayed} frames — it replayed from 0 (≈4500) instead of the \
+         tail (≈500)"
+    );
+    c.svcs.push(stopper(svc));
+    c.stop();
+}
+
+/// Snapshot-lifecycle spec §11 e2e 4: a pin naming an origin that is
+/// complete on the leader but not yet AGREED is refused `61
+/// pin_origin_not_agreed`; once agreement lands the same pin is accepted.
+///
+/// Controller ruling PF4: the door lets a pin through on an EMPTY catalog by
+/// design, and the first instant on a fresh cluster leaves it empty — so a
+/// first instant is taken and agreed (the catalog is then non-empty), and the
+/// pin names the SECOND. "Not yet agreed" is made deterministic by one voter
+/// whose row never attaches: it never reports, so the leader holds each
+/// instant's row-0 record for the full 5 s report timeout
+/// (`SNAP_REPORT_TIMEOUT_NS`) — the window the refused pin lands in.
+/// Auto-fetch is off so the quiet voter's disk does not change under the
+/// test.
+///
+/// The window opens only when the leader completes the set (door rule 54)
+/// and its length is not ours to choose, so the premise is a bounded retry
+/// (ruling R10): an attempt that misses the window commands a fresh instant,
+/// up to three, and the test fails by name only when all three miss.
+///
+/// Red twin: remove the 61 block in `apply_upgrade_pin` — the first pin on
+/// the not-yet-agreed origin is accepted: "answered (0, 0), expected (1, 61)".
+#[test]
+fn a_pin_on_a_not_yet_agreed_origin_is_refused_61_then_accepted() {
+    let _g = serialize();
+    let mut c = spawn(
+        3,
+        0,
+        Opts {
+            settings: Settings {
+                auto_fetch: false,
+                ..Settings::genesis_default()
+            },
+            ..opts("lifecycle-pin-agreed", false)
+        },
+        |_| true,
+    );
+    let leader = await_single_leader(&c, 30);
+    let quiet = *c.voters().iter().find(|&&i| i != leader).unwrap();
+    let attached: Vec<usize> = c.running().into_iter().filter(|&i| i != quiet).collect();
+    for &i in &attached {
+        let s = start_sum(&c.nodes[i].instance_dir, c.app, i);
+        c.svcs.push(stopper(s));
+    }
+    await_capable_on(&c, &attached, &[0]);
+    submit_frames(c.node(leader), 2000);
+
+    // The first instant, agreed (after the report timeout): the catalog is
+    // no longer Empty, so the door must answer for agreement.
+    let p1 = instant_until_complete(&c, leader, &attached);
+    await_agreed(&c, &attached, p1);
+    assert!(
+        entry(c.node(leader), p1).is_some_and(|e| e.is_agreed()),
+        "p1 is listed agreed — the catalog is not Empty"
+    );
+
+    // The 61 window opens when the LEADER completes the set (door rule 54
+    // demands the origin be its newest complete set) and closes when the
+    // leader appends the row-0 record at the 5 s report timeout. Milliseconds
+    // of it are used locally; a slow runner may use more, so the premise is
+    // a bounded retry (`instant_until_complete`'s shape): an instant already
+    // agreed when the leader completes it, or a pin that lands after the
+    // window closed, is reported and a fresh instant tried, up to ATTEMPTS.
+    const ATTEMPTS: usize = 3;
+    let version = c.cnc(leader).service_slot(0).status.version();
+    let mut refused_at = None;
+    for attempt in 1..=ATTEMPTS {
+        submit_frames(c.node(leader), 2000);
+        let commanded = Instant::now();
+        let p = command_instant(c.node(leader));
+        await_or_dump(&c, p, 30, "the leader completed the set at p", || {
+            c.node(leader).snapshot_set_position() == p
+        });
+        if agreed_position(c.node(leader)) == p {
+            eprintln!(
+                "attempt {attempt}/{ATTEMPTS}: {p} was already agreed when the leader completed \
+                 it ({:?} after the command) — the 61 window closed first",
+                commanded.elapsed()
+            );
+            continue;
+        }
+        let (status, reason, _) = admin_staged(
+            c.dir(leader),
+            &c.cnc(leader),
+            uc_node::UPGRADE_PENDING_FILE,
+            ADMIN_OP_UPGRADE_PIN,
+            &pin_bytes(0, version, p),
+        );
+        let elapsed = commanded.elapsed();
+        match (status, reason) {
+            (1, uc_node::REASON_PIN_ORIGIN_NOT_AGREED) => {
+                eprintln!(
+                    "attempt {attempt}/{ATTEMPTS}: pin on {p} refused 61, {elapsed:?} after the \
+                     command (window: the 5 s report timeout)"
+                );
+                refused_at = Some(p);
+                break;
+            }
+            (0, 0) if agreed_position(c.node(leader)) == p => {
+                eprintln!(
+                    "attempt {attempt}/{ATTEMPTS}: pin on {p} landed after the window closed \
+                     ({elapsed:?} after the command; the origin is agreed, so it was accepted)"
+                );
+            }
+            other => panic!(
+                "attempt {attempt}: pin on the not-yet-agreed {p} answered {other:?}, expected \
+                 (1, 61)\n{}",
+                dump_lifecycle(&c, p)
+            ),
+        }
+    }
+    let p2 = refused_at.unwrap_or_else(|| {
+        panic!(
+            "no attempt of {ATTEMPTS} reached the door inside the 61 window\n{}",
+            dump_lifecycle(&c, 0)
+        )
+    });
+    assert!(
+        !c.node(leader)
+            .cluster_view()
+            .snapshot_inner()
+            .pins
+            .iter()
+            .any(|pin| pin.origin == p2),
+        "a refused pin commits nothing"
+    );
+
+    await_agreed(&c, &attached, p2);
+    let at = pin(&c, leader, 0, version, p2);
+    assert!(at > p2, "the pin was appended once the origin agreed");
+    await_or_dump(&c, p2, 30, "every attached node committed the pin", || {
+        attached.iter().all(|&i| {
+            c.node(i)
+                .cluster_view()
+                .snapshot_inner()
+                .pins
+                .iter()
+                .any(|pin| pin.origin == p2)
+        })
+    });
+    c.stop();
+}
+
+/// Snapshot-lifecycle spec §11 e2e 5: a node whose free space is below the
+/// §7.3 check skips the fetch (`no_space`), names it once with the set's
+/// position, downloads nothing, and its gauge reports the agreed set's
+/// (known) size. The other voter, with room, fetches as usual.
+///
+/// Red twin: make `auto_fetch::fits` return `true` unconditionally — the
+/// starved voter fetches, and "a no_space skip" never counts.
+#[test]
+fn a_node_without_room_skips_the_fetch_names_it_and_reports_the_size() {
+    let _g = serialize();
+    let obs = ObsCapture::take();
+    let mut c = spawn(2, 1, opts("lifecycle-no-space", true), |_| true);
+    start_sums(&mut c);
+    let leader = await_single_leader(&c, 30);
+    let learner = 2usize;
+    let starved = *c.voters().iter().find(|&&i| i != leader).unwrap();
+    let starved_id = c.nodes[starved].id;
+    c.node(starved).set_free_bytes_for_test(1);
+    await_or_dump(
+        &c,
+        0,
+        30,
+        "the starved voter's probe reads the override",
+        || {
+            c.node(starved)
+                .soft_table()
+                .by_node
+                .get(&starved_id)
+                .is_some_and(|e| e.holdings.free_bytes == 1)
+        },
+    );
+    await_capable(&c, &[0]);
+    submit_frames(c.node(leader), 3000);
+    let p = command_standby_instant(c.node(leader));
+    await_or_dump(&c, p, 60, "the learner completed the standby set", || {
+        c.node(learner).snapshot_set_position() >= p
+    });
+    await_agreed(&c, &[0, 1, 2], p);
+    await_or_dump(&c, p, 90, "the leader auto-fetched the set", || {
+        c.node(leader).snapshot_set_position() >= p
+    });
+    await_or_dump(
+        &c,
+        p,
+        30,
+        "the starved voter counted a no_space skip",
+        || {
+            metric_labeled(
+                c.node(starved),
+                "uc2_snapshot_auto_fetch_total",
+                "outcome=\"no_space\"",
+            ) >= 1
+        },
+    );
+    // A negative, held across several backoff retries rather than read once.
+    let hold = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < hold {
+        assert_eq!(
+            c.node(starved).snapshot_set_position(),
+            0,
+            "no download on the starved voter\n{}",
+            dump_lifecycle(&c, p)
+        );
+        assert_eq!(
+            metric_labeled(
+                c.node(starved),
+                "uc2_snapshot_auto_fetch_total",
+                "outcome=\"ok\""
+            ),
+            0,
+            "the starved voter fetched nothing"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let total = entry(c.node(starved), p).unwrap().total_size();
+    assert!(
+        total > 0,
+        "a set catalogued after this change has a known size"
+    );
+    assert_eq!(
+        metric(c.node(starved), "uc2_snapshot_newest_agreed_bytes"),
+        total,
+        "the starved voter's gauge reports the agreed set's size"
+    );
+    let p_text = p.to_string();
+    let starved_field = format!("\"node\":{starved_id}");
+    let named: Vec<String> = obs
+        .text()
+        .lines()
+        .filter(|l| l.contains("snapshot_fetch_skipped_no_space") && l.contains(&starved_field))
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(
+        named.len(),
+        1,
+        "the skip is named ONCE by the starved voter: {named:?}"
+    );
+    assert!(
+        named[0].contains(&p_text),
+        "the skip names the set's position {p}: {}",
+        named[0]
+    );
     c.stop();
 }
 

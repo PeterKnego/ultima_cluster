@@ -262,6 +262,7 @@ pub enum NetEvent {
         row: u8,
         position: u64,
         hash: u64,
+        size: u64,
     },
 }
 
@@ -2097,6 +2098,7 @@ impl FollowerReceiver {
                     row: b.row,
                     position: b.position,
                     hash: b.hash,
+                    size: b.size,
                 };
                 let idx = ev.kind_idx();
                 if self.route.try_send(ev).is_err() {
@@ -4384,6 +4386,7 @@ mod tests {
                 node_id: 7,
                 position: 8192,
                 hash: 0xDEAD_BEEF_0000_0001,
+                size: 0,
             },
         );
         // Term ABOVE the receiver's own — must NOT be term-filtered.
@@ -4400,11 +4403,12 @@ mod tests {
                     row,
                     position,
                     hash,
+                    size,
                 } = ev
                 {
                     assert_eq!(
-                        (from, row, position, hash),
-                        (7, 3, 8192, 0xDEAD_BEEF_0000_0001)
+                        (from, row, position, hash, size),
+                        (7, 3, 8192, 0xDEAD_BEEF_0000_0001, 0)
                     );
                     saw = true;
                 }

@@ -108,6 +108,51 @@ impl Corpus {
         version: u32,
         out: &Path,
     ) -> anyhow::Result<Corpus> {
+        Corpus::export_inner(instance_dir, app_id, row, origin, end, version, out, None)
+    }
+
+    /// [`Corpus::export`], with the origin artifact taken from
+    /// `origin_artifact` — a copy the caller saved earlier — whenever the
+    /// backup did not carry it. Pin completion (C7) lets a node prune a
+    /// pinned origin once an agreed instant above the pin record is held, so
+    /// a caller that commands such an instant before exporting (pin-verify)
+    /// saves the origin first. Behind the default `export` feature.
+    #[cfg(feature = "export")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn export_with_origin(
+        instance_dir: &Path,
+        app_id: &str,
+        row: u8,
+        origin: u64,
+        end: u64,
+        version: u32,
+        out: &Path,
+        origin_artifact: &Path,
+    ) -> anyhow::Result<Corpus> {
+        Corpus::export_inner(
+            instance_dir,
+            app_id,
+            row,
+            origin,
+            end,
+            version,
+            out,
+            Some(origin_artifact),
+        )
+    }
+
+    #[cfg(feature = "export")]
+    #[allow(clippy::too_many_arguments)]
+    fn export_inner(
+        instance_dir: &Path,
+        app_id: &str,
+        row: u8,
+        origin: u64,
+        end: u64,
+        version: u32,
+        out: &Path,
+        origin_artifact: Option<&Path>,
+    ) -> anyhow::Result<Corpus> {
         uc_node::backup::backup_instance(instance_dir, out)
             .map_err(|e| anyhow::anyhow!("backup: {e}"))?;
         let m = CorpusManifest {
@@ -119,6 +164,21 @@ impl Corpus {
         };
         m.write(out)?;
         let c = Corpus::open(out)?;
+        if let Some(saved) = origin_artifact
+            && !c.artifact().is_file()
+        {
+            let dst = c.artifact();
+            if let Some(parent) = dst.parent() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("creating {}", parent.display()))?;
+            }
+            std::fs::copy(saved, &dst).with_context(|| {
+                format!(
+                    "copying the saved origin {} into the corpus",
+                    saved.display()
+                )
+            })?;
+        }
         if !c.artifact().is_file() {
             bail!(
                 "no artifact for row {row} at origin {origin}: {}",

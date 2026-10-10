@@ -35,6 +35,9 @@
 //! `backup`, `ipc`, `obs`, `preflight`, `recovery`) are internal.
 
 pub mod audit;
+/// Snapshot-lifecycle spec §6–§7: the background auto-fetch decision — a
+/// pure state machine the consensus agent drives, plus its outcome counters.
+pub mod auto_fetch;
 pub mod backup;
 /// The snapshot catalog's query layer (catalog spec §4.3-§4.4): the soft
 /// per-node holdings table and the pure query functions over the replicated
@@ -86,12 +89,12 @@ pub use node::{
     PurgePolicy, REASON_AUDIT_FAILED, REASON_AUTH_BAD_TAG, REASON_AUTH_EXPIRED,
     REASON_AUTH_MISSING, REASON_AUTH_UNKNOWN_KEY, REASON_PIN_DECODE, REASON_PIN_DIGEST,
     REASON_PIN_FROM_MISMATCH, REASON_PIN_MISSING, REASON_PIN_NO_SET, REASON_PIN_NOT_MONOTONE,
-    REASON_PIN_ROW_UNDECLARED, REASON_REPORT_STALE, REASON_SCHEDULE_DECODE, REASON_SCHEDULE_DIGEST,
-    REASON_SCHEDULE_MISSING, REASON_SCHEDULE_TOO_LARGE, REASON_SCHEDULE_UNKNOWN_FSM,
-    REASON_SETTINGS_BOUNDS, REASON_SETTINGS_DECODE, REASON_SETTINGS_DIGEST,
-    REASON_SETTINGS_MISSING, REASON_SNAPSHOT_ABOVE_DURABLE, REASON_SNAPSHOT_NO_LEARNER,
-    REASON_SNAPSHOT_UNSUPPORTED, REASON_VERSION_ALREADY_SET, SnapshotRefusal, StartOpts,
-    SubmitError, fetch_position,
+    REASON_PIN_ORIGIN_NOT_AGREED, REASON_PIN_ROW_UNDECLARED, REASON_REPORT_STALE,
+    REASON_SCHEDULE_DECODE, REASON_SCHEDULE_DIGEST, REASON_SCHEDULE_MISSING,
+    REASON_SCHEDULE_TOO_LARGE, REASON_SCHEDULE_UNKNOWN_FSM, REASON_SETTINGS_BOUNDS,
+    REASON_SETTINGS_DECODE, REASON_SETTINGS_DIGEST, REASON_SETTINGS_MISSING,
+    REASON_SNAPSHOT_ABOVE_DURABLE, REASON_SNAPSHOT_NO_LEARNER, REASON_SNAPSHOT_UNSUPPORTED,
+    REASON_VERSION_ALREADY_SET, SnapshotRefusal, StartOpts, SubmitError, fetch_position,
 };
 pub use services::{FsmLag, ServicesConfig};
 /// Time-and-timers §6: the per-row timer counters carried by

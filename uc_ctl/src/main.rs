@@ -724,6 +724,10 @@ fn reason_str(reason: u32) -> &'static str {
         // the leader's own automatic append), listed here for completeness
         // with the rest of the 52-60 band.
         60 => "version_already_set",
+        // Snapshot-lifecycle spec §8: door-only, after 54.
+        61 => {
+            "pin_origin_not_agreed (the set at --origin is complete here but the catalog has not agreed it - wait for it to agree, which takes up to ~5 s after the instant (watch uc2_catalog_agreed_position reach it), or take a new instant (uc2ctl snapshot) and pin that; a set that diverged never agrees)"
+        }
         _ => "unknown/malformed",
     }
 }
@@ -1794,6 +1798,21 @@ mod tests {
         assert!(reason_str(48).contains("snapshot_unsupported"));
         assert!(reason_str(49).contains("snapshot_no_learner"));
         assert!(reason_str(50).contains("snapshot_above_durable"));
+    }
+
+    /// Snapshot-lifecycle spec §8: 61 names the not-agreed origin and the
+    /// two ways out — wait for that set to agree, or take a new instant and pin
+    /// that (54 refuses an older agreed set) — and
+    /// never a bare "retry": a diverged set never agrees (final review M8).
+    #[test]
+    fn reason_str_names_61() {
+        let r = reason_str(61);
+        assert!(r.starts_with("pin_origin_not_agreed"), "{r}");
+        assert!(r.contains("wait for it to agree"), "{r}");
+        assert!(r.contains("take a new instant"), "{r}");
+        assert!(!r.contains("pick an agreed origin"), "{r}");
+        assert!(r.contains("diverged never agrees"), "{r}");
+        assert!(!r.contains("retry"), "{r}");
     }
 
     /// #33 spec §6.3: 60 is `version_already_set` (genesis, the row already

@@ -141,6 +141,13 @@ pub struct ObsSources {
     /// Spec §5.7 item 4: the newest set this node FETCHED whole from a
     /// learner (`uc2_snapshot_fetched_position`), `0` if it never has.
     pub snapshot_fetched_position: Arc<AtomicU64>,
+    /// Snapshot-lifecycle spec §6: `uc2_snapshot_auto_fetch_total{outcome}`,
+    /// the SAME allocation the consensus agent bumps.
+    pub snapshot_auto_fetch: Arc<crate::auto_fetch::AutoFetchStats>,
+    /// The `uc2-holdings` probe's cached reading — the free-bytes figure the
+    /// auto-fetch space check uses. `uc2_snapshot_wont_fit` is computed from
+    /// it with that check's own formula (plan ruling PF11: one sampler).
+    pub snapshot_holdings: Arc<std::sync::Mutex<uc_protocol::v2::datagram::Holdings>>,
     /// Spec §9: process-local per-row freeze-duration bookkeeping the
     /// exporter derives from the row's cnc slot word each scrape — see
     /// [`metrics::SnapshotFreezeStats`].
@@ -235,6 +242,8 @@ impl ObsSources {
             snapshot_set_position: Arc::new(AtomicU64::new(0)),
             snapshot_row_incomplete: std::array::from_fn(|_| Arc::new(AtomicU64::new(0))),
             snapshot_fetched_position: Arc::new(AtomicU64::new(0)),
+            snapshot_auto_fetch: Arc::new(Default::default()),
+            snapshot_holdings: Arc::new(std::sync::Mutex::new(Default::default())),
             snapshot_freeze: Arc::new(SnapshotFreezeStats::default()),
             crypto_enabled: false,
             purge_enabled: false,

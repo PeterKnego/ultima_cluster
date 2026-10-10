@@ -46,6 +46,7 @@ mod session;
 /// operational tooling read the snapshot directory directly (e.g. the M6 Task
 /// 3 e2e test cross-checks the cnc marker against `SnapshotStore::newest`).
 pub mod snapshots;
+mod start_set;
 /// `Tagged<ROW, S>`: run one state-machine type at several rows (harnesses
 /// only, spec §3.3) — see the module doc.
 pub mod tagged;

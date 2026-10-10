@@ -489,6 +489,7 @@ every node:
 | 58 | `pin_decode` | door | the staged file is not a 20-byte `UpgradePin` record |
 | 59 | `report_stale` | replicated | a `SnapshotReport` below the row's held report position |
 | 60 | `version_already_set` | replicated | a `RowGenesis` (wire `0.10.0`) for a row that already has a running version — genesis records a row's first version once and never changes one |
+| 61 | `pin_origin_not_agreed` | door | origin must be an agreed catalog set (Empty catalog: allowed, logged) |
 
 The door reads are **advisory**, not authoritative: `to_state()` can pair a
 freshly-read `applied` position with pins that are a tick stale, so a door

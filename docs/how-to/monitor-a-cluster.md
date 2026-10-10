@@ -67,7 +67,7 @@ scrape_configs:
 ```
 
 `/metrics` serves `text/plain; version=0.0.4` — standard Prometheus text
-exposition. The full series contract — 124 families — is the
+exposition. The full series contract — 127 families — is the
 `CONTRACT_SERIES` array in
 [`uc_node/src/obs/metrics.rs`](../../uc_node/src/obs/metrics.rs); a test
 pins every family in that array against what the renderer actually emits, so
@@ -422,16 +422,21 @@ Since coordinated snapshot instants, a snapshot is something the whole cluster
 takes at one log position **P** on the leader's command
 ([the explainer](../notes/uc2-cluster-fsm-explained.md#instants-one-position-one-set)),
 and the purge floor moves only when the **complete set** at P is on disk.
-Thirteen families — the first eight are the coordinated-snapshot gauges and
-counters; the last five, added with the snapshot catalog (spec §9), are the
-replicated catalog's own view of that same set list:
+Sixteen families — eight coordinated-snapshot gauges and counters; three
+added with the snapshot lifecycle (`uc2_snapshot_auto_fetch_total`,
+`uc2_snapshot_newest_agreed_bytes`, `uc2_snapshot_wont_fit`); and the last
+five, added with the snapshot catalog (spec §9), the replicated catalog's own
+view of that same set list:
 
 | family | type | labels | meaning |
 |---|---|---|---|
 | `uc2_snapshot_instant_position` | gauge | none | the last **full** instant this node **commanded as leader**, `0` if never. Leader-local: a follower's reading is whatever it last commanded in some earlier term, so never compare it across instances. A `--standby` instant does **not** advance it — see the next row |
 | `uc2_snapshot_standby_instant_position` | gauge | none | the last **standby** instant this node's `uc2-cluster` agent *acted on*, `0` if never. **Learner-only**: a voter skips every standby frame by design, so a voter always reads `0`. This is the gauge to watch on a `snapshot.target = learners` cluster — the leader is a voter, so its own instant gauge and set position tell you nothing about whether the standby work is happening |
-| `uc2_snapshot_set_position` | gauge | none | the newest **complete set** this node holds — its purge floor once persisted. `0` until the first one. Agrees on a fully-fetched cluster; on a **learner-only** cluster voters legitimately read lower (they never fetch), so this is not the cluster-wide floor to alert on — that is `uc2_catalog_agreed_position`, below |
-| `uc2_snapshot_fetched_position` | gauge | none | the newest set this node pulled whole from a learner with `uc2ctl snapshot fetch`, `0` if it never has. The standby return path's progress reading |
+| `uc2_snapshot_set_position` | gauge | none | the newest **complete set** this node holds — its purge floor once persisted. `0` until the first one. Agrees on a fully-fetched cluster; on a **learner-only** cluster a voter holds a set only once it has fetched it (`auto_fetch`, on by default, does so in the background), so voters legitimately read lower while a fetch is pending and stay lower with `[settings] auto_fetch = false` — this is not the cluster-wide floor to alert on — that is `uc2_catalog_agreed_position`, below |
+| `uc2_snapshot_fetched_position` | gauge | none | the position of the newest set this node fetched whole from another holder — a voter's automatic fetch or a manual `uc2ctl snapshot fetch` — `0` if it never has |
+| `uc2_snapshot_auto_fetch_total` | counter | `outcome` | background fetches of the newest agreed set: `ok`, `refused`, `timeout`, `no_space`, `no_holder` (snapshot lifecycle). A rising `no_space` means this node cannot hold the newest set — see `Uc2SnapshotWontFit`. Flat at 0 with `[settings] auto_fetch = false`. A node logs `snapshot_fetch_single_reporter` (warn) once for a set that only one node reported |
+| `uc2_snapshot_newest_agreed_bytes` | gauge | none | the newest agreed set's total size; 0 when none is agreed or its size is unknown (a set catalogued before sizes) |
+| `uc2_snapshot_wont_fit` | gauge | none | `1` when the newest agreed set fails the auto-fetch space check on this node (probe free bytes < size + `max(size / 4, 1 GiB)`), else `0`; `0` while the size, or this node's free bytes (before the probe's first successful `statvfs`), is unknown. Read on every node regardless of `auto_fetch`. Alert: `Uc2SnapshotWontFit` |
 | `uc2_snapshot_row_incomplete_total` | counter | `service`, `row` | instants this row **owed a freeze for** and failed to reach before the next one superseded it. The row whose counter climbs is the row stopping all purging. A superseded standby instant on a voter is not counted — that row is *supposed* not to freeze for one |
 | `uc2_snapshot_freeze_seconds_max` | gauge | `service`, `row` | the longest `freeze()` this row has reported since the instant its node's rows are working on last advanced — the full one on a voter, the standby one on a learner; reset to `0` on the scrape after that moves |
 | `uc2_snapshot_freeze_seconds_sum` | counter | `service`, `row` | cumulative `freeze()` seconds for this row |
@@ -442,7 +447,7 @@ replicated catalog's own view of that same set list:
 | `uc2_catalog_stalled` | gauge | none | listed sets still `Commanded` — commanded instants not yet complete. No timeout is applied; a persistent nonzero reading is the signal, the same shape as `Uc2SnapshotStalled` |
 | `uc2_catalog_diverged` | gauge | none | row entries reading `Diverged` or `NoMajority`, summed across every listed set. Nonzero means some row's artifact hashes did not agree. Alert: `Uc2SnapshotSetDiverged`, re-sourced to this gauge — see below |
 
-The last three are a **stand-in for a histogram**: this exposition encoder has
+The three `uc2_snapshot_freeze_seconds_*` families are a **stand-in for a histogram**: this exposition encoder has
 no histogram type, so a max gauge plus a sum/count pair carries the
 distribution's shape (`_sum / _count` is the mean, `_max` the tail). All three
 are derived from the cnc slot's `freeze_ns` word once per **scrape**, never
@@ -509,6 +514,19 @@ nodes that reported it, which is a real divergence regardless of who has
 fetched what. Firing means some row's artifact hashes disagree; run
 `uc2ctl upgrade show` for the per-node hash matrix and start with the row(s)
 it names.
+
+`Uc2SnapshotWontFit` (warning, `for: 5m`): `uc2_snapshot_wont_fit > 0` — the
+newest agreed snapshot set would not fit on this node with headroom: the
+`uc2-holdings` probe's free bytes are below the set's size plus
+`max(size / 4, 1 GiB)`, the same figure and formula the auto-fetch space check
+uses. It fires on every node, learners and `auto_fetch = false` nodes
+included, BEFORE any download: auto-fetch skips the set
+(`outcome="no_space"`, and one `snapshot_fetch_skipped_no_space` log record
+per set), so the node does not purge below it. Free disk, or shrink the
+state. A set of unknown size never fires it, and neither does an unknown
+free-space reading on this node (the `statvfs` probe never succeeded): the
+check is off and the node logs one `snapshot_fetch_free_unknown` warning per
+start instead.
 
 **Snapshot-session refusals.** Five named counters drop a session outright and
 leave the joiner NAKing rather than installing a wrong or half set —
@@ -645,6 +663,7 @@ table:
 | `Uc2SnapshotStalled` (coordinated snapshots, 2.11.0) | this node has commanded **full** snapshot instants at least twice in 30m with no complete set landing — one FSM is silently stopping all purging | warning |
 | `Uc2StandbySnapshotStalled` (coordinated snapshots, 2.11.0) | this **learner** has acted on standby snapshot instants at least twice in 30m with no complete set landing — one of its rows is silently stopping the standby set. Cannot fire on a voter (a voter exports `uc2_snapshot_standby_instant_position = 0`) | warning |
 | `Uc2SnapshotSetDiverged` (snapshot catalog) | a listed set's row hashes did not agree across the nodes that reported it (`uc2_catalog_diverged > 0`), for 60s — run `uc2ctl upgrade show` for the per-node matrix | warning |
+| `Uc2SnapshotWontFit` (snapshot lifecycle) | the newest agreed set would not fit with headroom on this node, for 5m — free disk | warning |
 | `Uc2SnapshotHashDiverged` (FSM upgrade lifecycle, 2.13.0) | a node's artifact hash for a row's newest reported instant differs from the majority's, for 60s | critical |
 | `Uc2MtuDiscoveryStalled` (jumbo frames, 2.12.0) | this node has proven a larger datagram path than the cluster has committed, for 60s — some *other* member is holding discovery back, silent or narrower. Read `uc2_probe_min_mtu_bytes` on every node | warning |
 | `Uc2PathBelowMtu` (jumbo frames, 2.12.0) | the kernel refused a non-probe datagram for size in the last 5m: a path degraded below the committed rung (or below the 1408 B baseline). The rung is monotone and cannot be lowered — fix the path | critical |
@@ -780,7 +799,7 @@ flooding.
 | `log_truncated` | `node`, `epoch`, `to` | the log was cut back to position `to` as part of reconciliation epoch `epoch` |
 | `log_wiped` | `node` | a stronger case of the above: no common prefix with the leader, so the node truncated to 0 and will rejoin from the snapshot floor (`wipes_total` also increments) |
 | `snapshot_installed` | `node`, `pos`, `table_position` | the incoming-snapshot floor advanced to `pos`. **This fires whenever the floor marker moves, including the sub-case where the node already held the bytes and only the marker advanced** — it means "this node adopted a snapshot floor," not necessarily "a snapshot transfer happened." Don't read it as proof of a wire transfer. `table_position` (`2.11.0`) is the schedule-table position this node holds once the install is done: the carried table's on the fiat path a below-floor joiner takes, and this node's own, unchanged, on the mid-life path that adopts nothing. Note the **pinned install itself is not an obs event**: `uc2ctl upgrade pin`'s effect on the *cluster FSM* is `upgrade_pin_applied` (below), but a service process actually installing a pinned artifact at attach reports with a plain `eprintln!("uc_service: …")` line on the service's OWN stderr, outside this stream — there is no `pinned_install` event on the node's JSON log. |
-| `snapshot_floor_held_for_pin` (FSM upgrade lifecycle, 2.13.0) | `node`, `position`, `candidate` | this node's snapshot/purge floor is HELD at `position` — a pinned origin some row has not yet consumed (attached on the pin's `to` line — a patch build of `to` counts — **and** replayed past the cut) — instead of advancing to `candidate`, the position it would otherwise publish. Fires once per change in the held position, not once per pass. An upgrade that was pinned and then abandoned holds the floor here indefinitely; clear it by finishing the upgrade (attach a build on `to`'s line) or by pinning the row forward, not by waiting — see [Upgrade a cluster § 2.13.0](upgrade-a-cluster.md#wire--cnc-change-in-2130-upgrade-pins-and-snapshot-reports-090-cnc-33). |
+| `snapshot_floor_held_for_pin` (FSM upgrade lifecycle, 2.13.0) | `node`, `position`, `candidate` | this node's snapshot/purge floor is HELD at `position` — a pinned origin whose pin is not yet complete (no agreed set the `to` line built above the pin record) or not yet released here (this node does not hold that completion set, or a `to` instance attached here — a patch build counts — is still replaying below it) — instead of advancing to `candidate`, the position it would otherwise publish. Fires once per change in the held position, not once per pass. An upgrade that was pinned and then abandoned holds the floor here indefinitely; clear it by finishing the upgrade (a build on `to`'s line on every node, then an instant that agrees) or by pinning the row forward, not by waiting — see [Upgrade a cluster § 2.13.0](upgrade-a-cluster.md#wire--cnc-change-in-2130-upgrade-pins-and-snapshot-reports-090-cnc-33). |
 | `config_adopted` | `node`, `position`, `version`, `prev_position` | a new `ClusterConfig` (version `version`) was adopted at `position`, superseding the one at `prev_position` |
 | `halt_removed` | `node`, `term`, `msg` | this node is not a member of the just-adopted config and has fail-stopped (parked permanently; the process keeps running but never serves again) |
 | `stepdown_removed` | `node`, `term`, `msg` | this node's own self-removal just committed while it was leader; it fail-stopped the same way as `halt_removed` |

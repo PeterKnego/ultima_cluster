@@ -53,6 +53,7 @@ struct SettingsFile {
     snapshot_interval_bytes: Option<u64>,
     snapshot_target: Option<String>,
     retain_sets: Option<u16>,
+    auto_fetch: Option<bool>,
 }
 
 /// TOML text -> a validated [`Settings`]. Every key is optional; an absent
@@ -120,6 +121,8 @@ pub fn parse_settings(toml_text: &str) -> Result<Settings, String> {
         // visible where the operator looks. An explicit value, in or out of
         // the door's bound, passes through unchecked.
         retain_sets: file.retain_sets.unwrap_or(1),
+        // Snapshot-lifecycle spec §6: absent means on — the spec's default.
+        auto_fetch: file.auto_fetch.unwrap_or(true),
     })
 }
 
@@ -217,10 +220,10 @@ fn render_fsm_lag(bytes: u64) -> String {
 /// **Field-ordering contract.** The line is `key=value` pairs in a FIXED
 /// order — `position`, `admission_bytes`, `fsm_lag`,
 /// `snapshot_interval_bytes`, `snapshot_target`, `retain_sets`,
-/// `datagram_mtu` (with its `(baseline|discovered)` suffix last) — and that
+/// `auto_fetch`, `datagram_mtu` (with its `(baseline|discovered)` suffix last) — and that
 /// order is part of the output contract `docs/reference/uc2ctl.md` prints
 /// and scripts may split on. A new field goes BEFORE `datagram_mtu`'s
-/// parenthesised suffix (as `retain_sets` did) or after it; existing keys
+/// parenthesised suffix (as `retain_sets` and `auto_fetch` did) or after it; existing keys
 /// are never reordered or renamed.
 fn render_settings_line(position: u64, settings: &Settings) -> String {
     let fsm_lag = render_fsm_lag(settings.fsm_lag_bytes);
@@ -239,10 +242,11 @@ fn render_settings_line(position: u64, settings: &Settings) -> String {
     format!(
         "position={position} admission_bytes={} fsm_lag={fsm_lag} \
          snapshot_interval_bytes={} snapshot_target={target} retain_sets={} \
-         datagram_mtu={} ({rung})",
+         auto_fetch={} datagram_mtu={} ({rung})",
         settings.admission_bytes,
         settings.snapshot_interval_bytes,
         settings.retain_sets,
+        settings.auto_fetch,
         settings.datagram_mtu,
     )
 }
@@ -284,6 +288,7 @@ mod tests {
                 snapshot_target: Target::Learners,
                 datagram_mtu: 0,
                 retain_sets: 3,
+                auto_fetch: true,
             }
         );
         assert_eq!(parse_settings("").unwrap(), Settings::genesis_default());
@@ -395,5 +400,20 @@ mod tests {
         s.retain_sets = 4;
         let line = render_settings_line(0, &s);
         assert!(line.contains("retain_sets=4"), "{line}");
+    }
+
+    /// Snapshot-lifecycle spec §6: `auto_fetch` is an operator key; absent
+    /// means `true`; `settings show` prints it after `retain_sets`.
+    #[test]
+    fn auto_fetch_parses_defaults_to_true_and_shows() {
+        assert!(!parse_settings("auto_fetch = false\n").unwrap().auto_fetch);
+        assert!(parse_settings("").unwrap().auto_fetch);
+        let mut s = Settings::genesis_default();
+        s.auto_fetch = false;
+        let line = render_settings_line(9, &s);
+        assert!(
+            line.contains("retain_sets=1 auto_fetch=false datagram_mtu="),
+            "{line}"
+        );
     }
 }

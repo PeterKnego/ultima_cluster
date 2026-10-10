@@ -401,7 +401,7 @@ procedure forbids it.)
 
 ## 12. Open questions for the next projects
 
-- Project 2: the restart rule's threshold for "far enough behind to install
+- Project 2 → designed in `2026-10-09-uc2-snapshot-lifecycle-design.md` (no byte threshold: D1). Originally: the restart rule's threshold for "far enough behind to install
   rather than replay", and holder preference (locality, learner-first).
 - Project 3: the watermark record's shape (kind 7 reserved here), and
   whether a node may retire below the catalog's `retain_sets` once the tier
