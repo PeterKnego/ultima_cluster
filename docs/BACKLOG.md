@@ -374,7 +374,9 @@ reviewer wants a workload to attack.
   2026-09-21 as erratum 6 of the FSM upgrade lifecycle spec's "Errata (plan
   B3, as built)"; closed by
   [the snapshot catalog design](superpowers/specs/2026-10-01-uc2-snapshot-catalog-design.md).
-- **Project 2 (not this spec): the lifecycle rule that USES the catalog.**
+- **Project 2: the lifecycle rule that USES the catalog — TAKEN UP 2026-10-09**, designed in
+  [the lifecycle spec](superpowers/specs/2026-10-09-uc2-snapshot-lifecycle-design.md), plan
+  `docs/superpowers/plans/2026-10-09-uc2-snapshot-lifecycle.md`; #48 (holder preference) closes with this work. Original entry:
   "Load the newest agreed set ahead of me, replay from there" at restart,
   catch-up, join and upgrade; when a short catch-up should replay instead of
   installing; holder preference among `holders()` (locality, learner-first).

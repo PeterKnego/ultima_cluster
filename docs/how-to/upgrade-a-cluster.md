@@ -1032,6 +1032,16 @@ merely unsupported: a `0.10.0` peer applies the row-255 report and the wider
 `Settings` record as undecodable and silently diverges — its catalog never
 completes a set. **Stop every node before starting any node.**
 
+The same flag day also carries the **snapshot lifecycle**: the `SNAP_REPORT`
+datagram's body grows from 24 B to 32 B (the artifact's size), the
+`SnapshotReport` record's entries become `(node, hash, size)`, the
+replicated `Settings` record moves to v4 (`auto_fetch`, default on), and the
+cluster image to v5 (catalog row entries carry sizes). A v1–v4 cluster image
+still loads — its sets read with size 0 ("unknown"), which nothing refuses —
+and a v1–v3 settings record reads `auto_fetch = true`. Nothing on disk is
+cleared. A dev cluster built from `main` between the catalog merge and this
+change must also stop every node: a 24-byte report is refused by length.
+
 **Before stopping: take one full instant and line the artifacts up.** Run
 `uc2ctl snapshot` (not `--standby`) right before the window, wait for it to
 complete, and confirm every node's newest `snapshots/cluster/snap-*.ultcluster`

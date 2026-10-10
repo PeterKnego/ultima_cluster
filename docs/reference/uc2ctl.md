@@ -766,6 +766,9 @@ uc2ctl audit --instance-dir <DIR> [--tail <N>] [--json]
   human-readable form (`<ts>  <actor>  <origin>  <op_name>  <id>  <addr>
   <outcome>(<reason>)  cfg=<version>`).
 
+A `snapshot_fetch` record with `actor` and `source` `auto` is the node's own
+background fetch (snapshot lifecycle), not an operator's.
+
 A line the summarizer cannot make sense of — a torn write from a crash
 mid-record, or a hand-edited file — prints as-is prefixed `? ` rather than
 being dropped or panicking; the whole point of this file is to never lose a

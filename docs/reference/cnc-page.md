@@ -126,7 +126,7 @@ An 8-entry band on page 2, one slot per declared FSM id (M14).
 | Slot stride | 512 B |
 | Slot count | 8 |
 
-Fields within a slot (each its own 64 B line, one writer):
+Fields within a slot (each its own 64 B line; most lines have one writer):
 
 | Slot offset | Field | Writer |
 |---|---|---|
@@ -152,11 +152,11 @@ Fields within a slot (each its own 64 B line, one writer):
 | 496 | `freeze_ns` (line 7) — u64, the duration in nanoseconds of this row's **last** `freeze()` call | **service** (`on_snapshot_frame`), once per instant — coordinated snapshots, 2.11.0 |
 | 504 | `artifact_hash` (line 7) — u64, SHA-256[..8] of the row's newest artifact payload | **service** (builder agent), stored BEFORE `snapshot_pos` — plan B3 |
 
-The start-set pair is read by the service at attach and in overrun recovery (snapshot lifecycle); it is written version-then-position and read position-version-position.
+The start-set pair is read by the service at attach and in overrun recovery (snapshot lifecycle). It is published **zero-first**: the node stores `0` in the position, then the version, then the new position with `Release`; a reader loads the position, the version, then the position again, takes the pair only if both position reads are the same non-zero value, retries a few times, and otherwise reads "none" (the row replays — always safe). The `snapshot_pos` line (`+256..+320`) therefore has two writers, both rare: the service builder agent writes `+256` once per instant, and the node's consensus agent writes `+264`/`+272` when the start set changes.
 
 A slot whose `status` reads `0` has never been attached this page generation.
 The node re-creates the page at every boot, so incarnation and epoch restart
-at 0 with the node. Line 0 (`status`/`version`) breaks the "one writer per
+at 0 with the node. The `snapshot_pos` line also has two writers (above). Line 0 (`status`/`version`) broke the "one writer per
 line" pattern first (cnc 3.3): the service still owns `status`/`version` at
 attach/detach, but `upgrade_origin`/`pinned_version`/`pin_seq`/`pinned_from`
 are node-written, republished by the `uc2-cluster` agent on every view
