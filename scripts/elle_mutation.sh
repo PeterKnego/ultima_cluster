@@ -75,17 +75,38 @@ gen() {
 hist() { echo "$MUT_DIR/$1/${2#elle_}/history.edn"; }
 
 # valid_under <consistency-model> <history>: echoes the "valid?" flag (true|false|
-# unknown|missing). Bounds the JVM heap so a pathological history fails loudly
-# instead of ballooning into the OOM killer.
+# unknown), "missing" when the driver wrote no history, or "checker-failed" when
+# elle-cli produced no verdict. Bounds the JVM heap so a pathological history
+# fails loudly instead of ballooning into the OOM killer.
+#
+# The verdict comes from elle-cli's PLAIN output (`<path>\t<valid?>`), the same
+# way `elle_check.sh`'s `verdict` reads it — never from `--verbose`. A mutated
+# history is anomaly-rich, and pretty-printing its verbose JSON report ran the
+# JVM out of heap at the 2–3 GiB this tier allows (2026-10-04 weekly red: the
+# truncated JSON read as "missing" and the message blamed the driver), while
+# the plain run decides the same history in ~1.5 GiB. elle-cli's stderr goes
+# to `<history>.elle.err`, so a checker failure names its cause.
 valid_under() {
     [ -f "$2" ] || { echo missing; return; }
-    local out
+    local out v
     out="$("$JAVA" "-Xmx$JAVA_XMX" -jar "$JAR" --model list-append \
-        --consistency-models "$1" --verbose "$2" 2>/dev/null)" || true
-    # jq on EMPTY stdin exits 0 with no output, so guard it — else an elle-cli
-    # crash would silently yield "" instead of the intended "missing".
-    [ -n "$out" ] || { echo missing; return; }
-    printf '%s' "$out" | jq -r '(.["valid?"])|tostring' 2>/dev/null || echo missing
+        --consistency-models "$1" "$2" 2>"$2.$1.elle.err")" || true
+    v="$(printf '%s\n' "$out" | awk 'END { print $NF }')"
+    case "$v" in
+        true|false|unknown) echo "$v" ;;
+        *) echo checker-failed ;;
+    esac
+}
+
+# why_not <valid?> <history> <model> <driver log>: the cause of a non-verdict,
+# for a FAIL message — the driver and the checker fail for different reasons
+# and need different remedies.
+why_not() {
+    case "$1" in
+        missing) echo "the driver wrote no history — see $4" ;;
+        checker-failed) echo "elle-cli gave no verdict (OOM? raise ELLE_JAVA_XMX) — see $2.$3.elle.err" ;;
+        *) echo "see $4" ;;
+    esac
 }
 
 fail() { echo "FAIL: $1" >&2; exit 1; }
@@ -94,14 +115,14 @@ echo "== CONTROL: feature-on build, UC2_MUTATION unset — every pass must be cl
 # commit-quorum's pass: strict-clean control.
 ec="$(gen ctl_cq elle_mut_commit_quorum "" ELLE_TARGET_OPS=4000 ELLE_MIN_FAULTS=4 ELLE_WORKERS=4)"
 [ "$ec" = 0 ] || fail "control commit_quorum pass errored (exit $ec) — see $MUT_DIR/ctl_cq.log"
-v="$(valid_under "$STRICT_MODEL" "$(hist ctl_cq elle_mut_commit_quorum)")"
-[ "$v" = true ] || fail "control commit_quorum not strict-clean (valid?=$v) — feature not inert"
+h="$(hist ctl_cq elle_mut_commit_quorum)"; v="$(valid_under "$STRICT_MODEL" "$h")"
+[ "$v" = true ] || fail "control commit_quorum not strict-clean (valid?=$v: $(why_not "$v" "$h" "$STRICT_MODEL" "$MUT_DIR/ctl_cq.log")) — feature not inert"
 # read-barrier's directed pass: strict-clean control (its reads simply fail —
 # a non-leader refuses them — so no stale read is ever recorded).
 ec="$(gen ctl_rb elle_mut_read_barrier "" ELLE_MIN_FAULTS=6)"
 [ "$ec" = 0 ] || fail "control read_barrier pass errored (exit $ec) — see $MUT_DIR/ctl_rb.log"
-v="$(valid_under "$STRICT_MODEL" "$(hist ctl_rb elle_mut_read_barrier)")"
-[ "$v" = true ] || fail "control read_barrier not strict-clean (valid?=$v) — feature not inert"
+h="$(hist ctl_rb elle_mut_read_barrier)"; v="$(valid_under "$STRICT_MODEL" "$h")"
+[ "$v" = true ] || fail "control read_barrier not strict-clean (valid?=$v: $(why_not "$v" "$h" "$STRICT_MODEL" "$MUT_DIR/ctl_rb.log")) — feature not inert"
 # vote-order's pass: a clean control simply passes (reconverges every cycle).
 ec="$(gen ctl_vo elle_mut_vote_order "" ELLE_TARGET_OPS=3000 ELLE_MIN_FAULTS=10 ELLE_WORKERS=4 ELLE_HOLD_MS=3000)"
 [ "$ec" = 0 ] || fail "control vote_order pass hard-failed (exit $ec) — feature not inert"
@@ -111,14 +132,14 @@ echo "== TOOTH 1/3: commit-quorum-minus-one — elle verdict must flip to INVALI
 ec="$(gen cq elle_mut_commit_quorum commit-quorum-minus-one ELLE_TARGET_OPS=4000 ELLE_MIN_FAULTS=4 ELLE_WORKERS=4)"
 h="$(hist cq elle_mut_commit_quorum)"
 vs="$(valid_under serializable "$h")"; vst="$(valid_under "$STRICT_MODEL" "$h")"
-[ "$vst" = false ] || fail "commit-quorum NOT caught (strict valid?=$vst; if 'missing' the driver crashed — see $MUT_DIR/cq.log) — raise dose, never weaken"
+[ "$vst" = false ] || fail "commit-quorum NOT caught (strict valid?=$vst: $(why_not "$vst" "$h" "$STRICT_MODEL" "$MUT_DIR/cq.log")) — a real verdict of true means raise dose, never weaken"
 echo "OK: commit-quorum CAUGHT (serializable valid?=$vs, strict valid?=$vst)"
 
 echo "== TOOTH 2/3: skip-read-barrier — STRICT-ONLY real-time anomaly =="
 ec="$(gen rb elle_mut_read_barrier skip-read-barrier ELLE_MIN_FAULTS=6)"
 h="$(hist rb elle_mut_read_barrier)"
 vs="$(valid_under serializable "$h")"; vst="$(valid_under "$STRICT_MODEL" "$h")"
-[ "$vst" = false ] || fail "read-barrier NOT caught under strict model (valid?=$vst; if 'missing' the driver crashed — see $MUT_DIR/rb.log) — raise dose"
+[ "$vst" = false ] || fail "read-barrier NOT caught under strict model (valid?=$vst: $(why_not "$vst" "$h" "$STRICT_MODEL" "$MUT_DIR/rb.log")) — a real verdict of true means raise dose"
 # The whole point of this tooth: invisible to plain serializability.
 [ "$vs" = true ] || echo "  note: expected serializable-clean (valid?=true) but got '$vs' — a stale read is a pure real-time anomaly; strict caught it regardless"
 echo "OK: read-barrier CAUGHT under strict model only (serializable valid?=$vs, strict valid?=$vst)"
