@@ -453,7 +453,8 @@ for a service attached without the current Rust SDK (a non-Rust attacher, or a b
 row 0 is pinned to origin 73792 but /srv/uc2/nN/snapshots/0/snap-73792.ultsnap does not exist on this node — the set at the origin was pruned or never fetched; take `uc2ctl snapshot fetch` or re-pin at a retained instant
 ```
 
-**5. Otherwise the artifact at the origin is installed unconditionally**, and
+**5. Otherwise the artifact at the origin is installed unconditionally**
+(until the pin is complete — see step 7), and
 the tail above P is replayed under the new version. There is no "already caught
 up, skip it" arm: a durable state machine sitting above P is **rewound to P**
 and recomputes the span above it, exactly as its fresh peers do. The artifact's
@@ -491,6 +492,16 @@ curl -s http://hostN:9600/metrics | grep uc2_snapshot_hash_mismatch
 
 `0` on every node, at the new version, with every pre-upgrade value intact,
 is the upgrade done.
+
+**That instant also completes the pin.** A pin is complete once the catalog
+lists an agreed set that the `to` line built above the pin record — the
+instant above, once it agrees. From then on the row is back to normal start
+and retention: a restarting service starts from that set instead of
+re-installing the origin, and the origin's set is retired like any other,
+with the floor and the journal purge free to move past it. Until then every
+node keeps the origin's set and holds its journal at the origin
+(`snapshot_floor_held_for_pin`), because an instance not yet upgraded still
+has to install the origin and replay from it.
 
 **Since `2.13.0` you do not hash the files by hand.** Every node hashes its
 row artifact as the builder streams it and reports `(row, position, hash)` to
@@ -588,13 +599,15 @@ the point of no return at the moment the pin commits, not at the moment you
 stop the services.
 
 One more consequence of abandoning a pinned upgrade: a node **holds its
-snapshot/purge floor at the pinned origin** until that row is consumed there
-(attached on the pin's `to` line — a patch build of `to` counts — **and**
-replayed past the cut), and logs
-`snapshot_floor_held_for_pin` when it does. A pin placed and then left alone
-holds the journal at that origin **indefinitely** — there is no bound and no
-alert on the hold. Clear it by finishing the upgrade or by pinning the row
-forward to a newer origin, not by waiting
+snapshot/purge floor at the pinned origin** until the pin is complete (an
+agreed set the `to` line built above the pin record — step 7's instant) and
+released there (the row consumed on that node: attached on the pin's `to`
+line, a patch build counts, **and** replayed past the cut; or the node holds
+that completion set), and logs `snapshot_floor_held_for_pin` while it holds.
+A pin placed and then left alone holds the journal at that origin
+**indefinitely** — there is no bound and no alert on the hold. Clear it by
+finishing the upgrade (every instance on `to`, then an instant that agrees)
+or by pinning the row forward to a newer origin, not by waiting
 ([Limits](../reference/limits.md)).
 
 ## Afterwards: close axis H
@@ -608,7 +621,8 @@ deleted in the **next** version, not this one, once both of these hold:
   binary will ever decode those bytes again; and
 - the **oldest artifact any node could still reconstruct that row from is at or
   above that origin** — check each node's `snapshots/<row>/` listing and its
-  purge floor, remembering that a pinned origin's set is retained on purpose.
+  purge floor, remembering that a pinned origin's set is retained on purpose
+  until the pin completes.
 
 Neither quantity is exposed as one fleet-wide reading, so until you have
 checked both on every node, **keep the arm**: an axis-H failure is silent, and

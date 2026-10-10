@@ -314,7 +314,11 @@ only the gap guard acted on could leave such an SM stuck on its own history.
 [`uc_log::cnc::PinRead`](cnc-page.md), a tri-state: `NoPin` / `Pinned {
 origin, from, to }` / `Contended`) BEFORE publishing anything to the slot,
 and — when `to == S::VERSION` — installs `snap-<origin>` **unconditionally**,
-overriding whatever the state machine's own `last_applied()` says. `attach`
+overriding whatever the state machine's own `last_applied()` says. That holds
+until the pin is **complete** (an agreed set the `to` line built above the pin
+record is catalogued): from then on the node offers that set as the row's
+start set, and `attach` installs it instead of the origin — or nothing, when a
+durable state machine already sits at or past it. `attach`
 takes the install capability from `S: SnapshotStateMachine`, which every
 [`ServiceBuilder::start`](../../uc_service/src/lib.rs) carries since #67. The
 gap guard's own expected version is the pin's `from` **only for the artifact

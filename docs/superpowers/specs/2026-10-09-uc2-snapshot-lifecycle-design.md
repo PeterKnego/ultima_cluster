@@ -427,9 +427,56 @@ execution ledger (PF = pre-flight, R = execution rulings).
   read literally: pins never retire, so a row that has ever been pinned
   never takes a start set — the version rule the maintainer chose to keep;
   relaxing it (a start set above the origin on the pin's `to` line) is a
-  `docs/BACKLOG.md` item under #66.
+  `docs/BACKLOG.md` item under #66. **Superseded by "pin completion (as
+  built)" below:** a pinned row keeps starting from its origin only until
+  its pin is complete.
 - **R15 — the auto-fetch audit record is written off the consensus agent.**
   The agent enqueues it into a bounded hand-off (16 records); the
   `uc2-holdings` thread writes and fsyncs it, same fields and format. A full
   queue drops and counts the record, named as `admin_audit_dropped` on the
   next drain.
+- **Pin completion (as built), rulings C1–C3.** The maintainer's rule:
+  "pinned snapshot and journal should be available as long as all FSMs are
+  not upgraded; once upgraded it can continue with normal snapshot+journal
+  retention policies." Before this, a pin never completed: attach installed
+  the origin on every attach forever, retention kept the origin forever, and
+  the journal hold released per node as soon as that node's row had consumed
+  the pin — so with purge on, a restart of an upgraded service re-installed
+  the origin, met the purged journal, and installed the newer set on top
+  (two installs; measured, not a fail-stop).
+  - **C1 — completion.** A row's pin is COMPLETE iff the committed catalog
+    lists an entry `e` with `e.is_agreed()`, `e.rows[row].verdict ==
+    Agreed`, `e.position > record_pos` (the pin record's frame end — the
+    row's `RowRunning.record_pos`; after a v1/v2 cluster-image install, the
+    image's `applied`, which is conservative), and `same_line(e.rows[row]
+    .version, pin.to)`. The record bound is load-bearing: the catalog's row
+    version is derived from pin history (`version_at`), so a set between the
+    origin and the pin's commit reads as `to` although `from` built it. One
+    predicate, `uc_node::catalog::{pin_gate, completes_pin, pin_complete}`,
+    used by every reader below.
+  - **C2 — start.** No cnc change. The node publishes a start set for a
+    pinned row only if it is a completion set held on this node (newest, at
+    or below `min(commit, durable)`), and recomputes when a pin record moves
+    the gate as well as on a catalog change. At attach, a pinned row whose
+    published start set sits strictly above the view's `record_pos` takes
+    the start-set path INSTEAD of the origin install (the version gate is
+    unchanged); a durable state machine already at or past a set on its own
+    line installs nothing; a set it cannot use (another line, an unreadable
+    artifact) falls back to the pinned install. The start-set pair is read
+    once and the row view re-read after it; a view that moved between the
+    two reads is refused `PinUnreadable` (retry). Overrun recovery applies
+    the same rule (`start_set_permitted` takes the pair it judged).
+  - **C3 — release.** A row's pin is released on a node only when it is
+    COMPLETE and, locally, the row is consumed there (attached on `to`'s
+    line and replayed past the candidate floor, the B2 T5 rule) or the node
+    holds a completion set. Before release EVERY node keeps the origin's set
+    and holds the floor and journal purge at the origin
+    (`snapshot_floor_held_for_pin`); after it, normal retention and the
+    normal floor apply. The cluster FSM's retention stops protecting a
+    COMPLETE pin's origin by the same predicate (deterministic: a function
+    of the replicated pins, running records and catalog), so the catalog
+    retires the origin like any agreed set and each node's pruner deletes it
+    once released there. Consequence: R21 (a pinned origin is never counted
+    toward `retain_sets`) holds only while the pin is incomplete. Cost,
+    accepted by the maintainer: a cluster that never takes an instant after
+    an upgrade grows its journal without bound.

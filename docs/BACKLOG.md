@@ -385,15 +385,6 @@ reviewer wants a workload to attack.
   itself —
   [spec §2 "Out"](superpowers/specs/2026-10-01-uc2-snapshot-catalog-design.md#2-scope)
   and §12.
-- **[#66](https://github.com/PeterKnego/ultima_cluster/issues/66): allow a
-  start set above the pin origin whose version is on the pin's `to` line.**
-  As built, a row that has EVER been pinned keeps starting from its pin's
-  origin — there is no unpin, so the start set never applies to it, and a
-  restart after an upgrade replays from the origin (or installs twice, the
-  origin then a covering set). Deliberate for now: it is the version rule the
-  maintainer chose to keep (ruling R16). The start rule's line check
-  (`same_line` against the pin's `to`) already makes the relaxation safe.
-  Found by the snapshot lifecycle's final review (I2), 2026-10-10.
 - **Auto-fetch can re-download an agreed set that is never noted held.** An
   operator `uc2ctl snapshot fetch` with no position can store a newer,
   not-yet-agreed set; a later auto-fetch of the newest agreed set below it

@@ -842,12 +842,19 @@ The two added steps are not optional:
     deployment), **start every node before attaching any service** — a
     service attached after node 0 and before node 1 spends its whole
     `boot_wait` waiting for a leader that cannot be elected yet.
-- **Take an instant AFTER the swap.** Once the pin is consumed the node's
-  floor is free to advance past the origin, and the origin's artifact becomes
-  prunable. A later restart of the row re-installs from the newest covering
-  artifact, which must be one built by the version now running — with
-  `snapshot_interval_bytes = 0` (the default) nothing takes that instant for
-  you, and the restart fail-stops instead.
+- **Take an instant AFTER the swap — it completes the pin.** Once every
+  instance of the row runs `to` and has caught up, run `uc2ctl snapshot`.
+  When that set AGREES (`uc2_snapshot_hash_mismatch` reads `0`; the catalog
+  lists it agreed) the pin is **complete**: an agreed set the `to` line
+  built above the pin record. From then on the row is back to normal — a
+  restarting service starts from that set (the node's start set) instead of
+  re-installing the origin, and the origin's set is released to ordinary
+  retention, with the floor and the journal purge free to move past it.
+  **Until the pin completes, every node keeps the origin's set and holds its
+  journal at the origin**, because any instance not yet upgraded still has
+  to install the origin and replay from it; `snapshot_floor_held_for_pin`
+  names that hold. With `snapshot_interval_bytes = 0` (the default) nothing
+  takes that instant for you, and the journal grows until you do.
 
 See
 [`uc2ctl` § `upgrade pin`](../reference/uc2ctl.md#upgrade-pin) for the
@@ -892,17 +899,21 @@ nothing at the door and fails at attach time just the same. Check the floor
 on every node, not just the laggards.
 
 **A pinned-but-abandoned upgrade holds the journal indefinitely.** A node
-holds its snapshot/purge floor at a row's pinned origin until that row is
-consumed **on that node** — attached on the pin's `to` line (a patch build of `to` counts) **and** replayed past
-the cut, not merely attached. `snapshot_floor_held_for_pin` (an `Info` obs
+holds its snapshot/purge floor at a row's pinned origin until the pin is
+**complete** — the catalog lists an agreed set the `to` line built above the
+pin record, which takes every instance upgraded and one instant after — **and**
+the pin is released on that node: the row is consumed there (attached on
+the pin's `to` line, a patch build of `to` counts, **and** replayed past the
+cut, not merely attached) or the node holds that completion set. `snapshot_floor_held_for_pin` (an `Info` obs
 event, fields `node`, `position` the held floor, `candidate` the floor the
 node would otherwise publish) names the hold whenever it is in effect. An
 operator who pins an origin and then never swaps the binary — an abandoned
 upgrade — holds the journal at that origin for as long as the row stays
-pinned but unconsumed; there is no bound or alert on how long that can run
-(a bound/alert is plan D's, not shipped). Clear it by attaching `to` (finish
-the upgrade) or by pinning forward (a newer pin supersedes it), not by
-waiting.
+pinned but incomplete; there is no bound or alert on how long that can run
+(a bound/alert is plan D's, not shipped). Clear it by finishing the upgrade
+(attach `to` on every node, then take an instant that agrees) or by pinning
+forward (a newer pin supersedes it, and holds at its own origin until it
+completes), not by waiting.
 
 **After the flag day**, nothing is required of the operator beyond the wipe
 above. A cluster that never runs `uc2ctl upgrade pin` holds an empty pin list

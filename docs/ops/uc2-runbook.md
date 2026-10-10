@@ -305,9 +305,18 @@ transport setting, both measured closed-loop at inflight 1 on 8-vCPU
   prints `uc_service: row N started from snap-P` on stderr, once per
   position. The node publishes the start set in two cnc slot words, `+264`
   (position) and `+272` (version), readable with the cnc decode. A pinned
-  row never takes it: the pin's origin wins. Pins never retire, so once a
-  row has been pinned it keeps restarting from its pin's origin and the start
-  set applies only to never-pinned rows (deliberate; backlog item under #66).
+  row takes it only once its pin is **complete** — the catalog lists an
+  agreed set the pin's `to` line built above the pin record, and only such a
+  set is published for a pinned row; until then the pin's origin wins.
+- **Completing an upgrade pin.** After upgrading every instance of a pinned
+  row, take an instant (`uc2ctl snapshot`). Once it agrees, the pin is
+  complete: the row resumes normal start (from that set) and normal
+  retention, and the origin's set is released — retired by the catalog and
+  pruned on each node that has consumed the pin or holds the completion set.
+  Until then **every** node keeps the origin's set and holds its journal at
+  the origin (`snapshot_floor_held_for_pin`), because an instance not yet
+  upgraded still has to install the origin and replay from it; a cluster
+  that never snapshots after an upgrade grows its journal without bound.
 - **Reading a refused fetch.** The node's own background fetch logs
   `snapshot_fetch_requested` with `actor=auto`; a miss logs
   `snapshot_fetch_timeout`, `snapshot_fetch_no_holder` (every candidate was
