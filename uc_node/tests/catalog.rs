@@ -1606,38 +1606,11 @@ fn the_flag_day_window_is_empty_and_deletes_nothing() {
     for &v in &voters {
         c.nodes[v].start();
     }
-    // WORKAROUND for a cold-restart wedge that is NOT the catalog's (it
-    // reproduces with the v3 rewrite skipped): on a fresh boot every row's
-    // `applied` reads 0, so each voter's durable REPORT is capped at
-    // `0 + fsm_lag` (64 KiB on this ring, M14a's report ceiling) and the new
-    // leader's NewTerm frame at the log end (MiB in) can never commit; and
-    // since plan B3 a service cannot attach until its node has learned a
-    // commit (`NodeBooting`). Neither side can move first. The stand-in
-    // `learner.rs` uses for an un-serviced row (`spawn_applied_mirror`)
-    // breaks it: mirror `durable` into row 0's `applied` until the node
-    // publishes its declared set, then stop and let the real service attach.
-    let mirror_stop = Arc::new(AtomicBool::new(false));
-    let mirrors: Vec<_> = voters
-        .iter()
-        .map(|&v| {
-            let cnc = c.cnc(v);
-            let stop = Arc::clone(&mirror_stop);
-            std::thread::spawn(move || {
-                while !stop.load(Ordering::Relaxed) {
-                    let d = cnc.counters().durable.load_acquire();
-                    cnc.service_slot(0).applied.store_release(d);
-                    std::thread::sleep(Duration::from_micros(200));
-                }
-            })
-        })
-        .collect();
+    // #95 (fixed) made the old `applied` mirror here unnecessary: a node that
+    // has not yet joined reports uncapped, so the cold restart commits alone.
     await_until(60, "every restarted voter joined its cluster", || {
         voters.iter().all(|&v| c.cnc(v).services_declared() != 0)
     });
-    mirror_stop.store(true, Ordering::Relaxed);
-    for m in mirrors {
-        m.join().unwrap();
-    }
     start_sums(&mut c);
     let leader = await_single_leader(&c, 30);
     await_capable(&c, &[0]);
