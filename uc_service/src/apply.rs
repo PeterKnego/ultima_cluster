@@ -2536,9 +2536,9 @@ mod tests {
 
     /// A zero-walk replay that is NOT a straddle: the follower sits at B
     /// (above 0), the SM at A (the frame below B), and the journal holds
-    /// nothing at or above B while answering `first = 0` (the "stale block
-    /// based at 0" shape the forward-progress guard's comment names), so
-    /// `replay_into`'s own gap test sees no hole and the scan walks no frame.
+    /// nothing at all — an empty journal (`first = 0`, from `first_meta`
+    /// answering `None`) — so `replay_into`'s own gap test sees no hole and
+    /// the scan walks no frame.
     /// The pass moved nothing, so it must report "no movement" — B — and the
     /// cycle must never rewind the follower or publish `applied` below B. It
     /// used to return `Rejoin(0)`: the follower rewound to 0, the slot's
@@ -2609,7 +2609,8 @@ mod tests {
         );
     }
 
-    /// The same zero-walk shape, on `replay_into` directly: an unforced pass
+    /// The same zero-walk shape (an empty journal, `first = 0`), on
+    /// `replay_into` directly: an unforced pass
     /// that walks no frame and neither installs nor jumps returns the cursor
     /// it was GIVEN (`resume`), never 0.
     #[test]
@@ -2639,6 +2640,64 @@ mod tests {
             "a pass that moved nothing reports `Rejoin(resume)`: {out:?}"
         );
         assert_eq!(st.sm.lock().unwrap().applies, 0);
+    }
+
+    /// A walked frame never LOWERS the cursor an install set. A forced pass
+    /// installs a covering artifact at P, then `scan_from(P)` still yields the
+    /// covering segment — here a stale one whose frames all end below P (the
+    /// journal's later segments are gone). Walking those used to overwrite
+    /// the cursor with their lower ends, the result floored at `resume`, and
+    /// the caller saw no progress and repeated the forced install every cycle.
+    #[test]
+    fn a_stale_segment_walked_after_an_install_does_not_lower_the_cursor() {
+        let dir = scratch();
+        let (st, pos, _head) = a_lapped_row(&dir, 0x2e42, false);
+        // Keep only the journal's FIRST segment file: it ends far below P.
+        let mut segs: Vec<_> = std::fs::read_dir(&st.journal_dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.is_file())
+            .collect();
+        segs.sort();
+        assert!(segs.len() > 2, "the fixture spans several segments");
+        for p in &segs[1..] {
+            std::fs::remove_file(p).unwrap();
+        }
+        let b = pos[100];
+        let p = pos[1300];
+        st.sm.lock().unwrap().last = Some(pos[99]);
+        let store = crate::snapshots::SnapshotStore::open(dir.path(), 0).unwrap();
+        store
+            .publish(p, 0, |w| w.write_all(b"snap").map_err(Into::into))
+            .unwrap();
+        let restore = super::SnapshotRestore::<CountSm> {
+            store,
+            install: Box::new(|sm, at, _r| {
+                sm.last = Some(at - FRAME);
+                Ok(at)
+            }),
+        };
+        let mut trigger = None;
+        let out = crate::replay::replay_into(
+            &st.sm,
+            &st.cnc,
+            &st.journal_dir,
+            Some(&restore),
+            crate::replay::ReplayInstant {
+                trigger: &mut trigger,
+                node_flags: 0,
+                service_id: 0,
+                pin: None,
+                decided_to: b,
+                resume: b,
+            },
+            Some(b),
+        );
+        assert!(
+            matches!(out, Ok(crate::replay::Replay::Rejoin(c)) if c == p),
+            "the pass rejoins at the install point P={p}: {out:?}"
+        );
+        assert_eq!(st.sm.lock().unwrap().applies, 0, "nothing below P applied");
     }
 
     /// Final review M1 (ruling R17): a FORCED pass (`gap_above`, plan B3 F1)

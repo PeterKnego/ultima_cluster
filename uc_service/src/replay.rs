@@ -705,7 +705,11 @@ pub(crate) fn replay_into<S: RawStateMachine>(
                         );
                     }
                 }
-                cursor = Some(end);
+                // Never LOWER the cursor: an install or a start-set jump set
+                // it to its landing point, and `scan_from` still yields the
+                // covering segment, whose frames may all end below it (a
+                // stale segment). Overwriting would rejoin below the install.
+                cursor = Some(cursor.map_or(end, |c| c.max(end)));
                 frames_walked += 1;
                 off += aligned;
             }
