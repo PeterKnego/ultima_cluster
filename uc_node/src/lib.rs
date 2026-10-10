@@ -54,6 +54,7 @@ pub mod cluster_fsm;
 pub mod config_file;
 pub mod ipc;
 mod log_clock;
+pub mod min_position;
 #[cfg(feature = "mutation-testing")]
 pub(crate) mod mutation;
 mod node;

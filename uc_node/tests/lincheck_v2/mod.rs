@@ -1835,7 +1835,7 @@ pub fn submit_cmd<C: serde::Serialize, R: serde::de::DeserializeOwned>(
             | Err(e @ ClientError::PayloadTooLarge { .. })
             // M14b: this harness only ever drives FSM 0, which every node
             // declares — naming an undeclared id here is a wiring bug.
-            | Err(e @ ClientError::ServiceNotDeclared { .. })
+            | Err(e @ ClientError::ServiceNotDeclared { .. }) | Err(e @ ClientError::ReadYourWritesUnsupported)
             // This harness drives by numeric id, never by name — UnknownFsm here
             // would be a wiring bug, same class as the arms above.
             | Err(e @ ClientError::UnknownFsm { .. })
@@ -1897,7 +1897,7 @@ pub fn submit_all_cmd<C: serde::Serialize, R: serde::de::DeserializeOwned>(
             | Err(e @ ClientError::PayloadTooLarge { .. })
             // This harness only ever fans in over declared ids, so naming an
             // undeclared one here is a wiring bug.
-            | Err(e @ ClientError::ServiceNotDeclared { .. })
+            | Err(e @ ClientError::ServiceNotDeclared { .. }) | Err(e @ ClientError::ReadYourWritesUnsupported)
             // This harness drives by numeric id, never by name — UnknownFsm here
             // would be a wiring bug, same class as the arms above.
             | Err(e @ ClientError::UnknownFsm { .. })
@@ -1957,7 +1957,7 @@ pub fn submit_cmd_to<C: serde::Serialize, R: serde::de::DeserializeOwned>(
             | Err(e @ ClientError::AppIdMismatch { .. })
             | Err(e @ ClientError::VersionMismatch { .. })
             | Err(e @ ClientError::PayloadTooLarge { .. })
-            | Err(e @ ClientError::ServiceNotDeclared { .. })
+            | Err(e @ ClientError::ServiceNotDeclared { .. }) | Err(e @ ClientError::ReadYourWritesUnsupported)
             | Err(e @ ClientError::UnknownFsm { .. })
             | Err(e @ ClientError::ShutDown) => return SubmitOutcome::Fatal(format!("{e:?}")),
         }
@@ -2011,7 +2011,7 @@ pub fn read_leader<Q: serde::Serialize, QR: serde::de::DeserializeOwned>(
             | Err(e @ ClientError::VersionMismatch { .. })
             | Err(e @ ClientError::PayloadTooLarge { .. })
             // M14b: FSM 0 only, as in `submit_cmd` above.
-            | Err(e @ ClientError::ServiceNotDeclared { .. })
+            | Err(e @ ClientError::ServiceNotDeclared { .. }) | Err(e @ ClientError::ReadYourWritesUnsupported)
             // This harness drives by numeric id, never by name — UnknownFsm here
             // would be a wiring bug, same class as the arms above.
             | Err(e @ ClientError::UnknownFsm { .. })
@@ -2065,7 +2065,7 @@ pub fn read_leader_on<Q: serde::Serialize, QR: serde::de::DeserializeOwned>(
             | Err(e @ ClientError::AppIdMismatch { .. })
             | Err(e @ ClientError::VersionMismatch { .. })
             | Err(e @ ClientError::PayloadTooLarge { .. })
-            | Err(e @ ClientError::ServiceNotDeclared { .. })
+            | Err(e @ ClientError::ServiceNotDeclared { .. }) | Err(e @ ClientError::ReadYourWritesUnsupported)
             // This harness drives by numeric id, never by name — UnknownFsm here
             // would be a wiring bug, same class as the arms above.
             | Err(e @ ClientError::UnknownFsm { .. })

@@ -116,10 +116,11 @@ use uc_log::cnc::CncPage;
 use uc_protocol::ring::RingWaitHandle;
 use uc_remote::conn::FramedConn;
 use uc_remote::frame::{
-    FLAG_ENVELOPED, FLAG_EXPIRED, FLAG_IS_QUERY, FLAG_LINEARIZABLE, FLAG_REPLAYED, FrameType,
-    HELLO_REFUSED_APP_ID, HELLO_REFUSED_BUSY, HELLO_REFUSED_FAULTED, HELLO_REFUSED_VERSION, Header,
-    Hello, HelloOk, HelloRefused, Leader, PROTOCOL_VERSION, RETRY_NOT_SERVING,
-    RETRY_PAYLOAD_TOO_LARGE, RETRY_SERVICE_UNAVAILABLE, ResponseMeta, Retry, Status, encode_frame,
+    FLAG_ENVELOPED, FLAG_EXPIRED, FLAG_IS_QUERY, FLAG_LINEARIZABLE, FLAG_MIN_POSITION,
+    FLAG_REPLAYED, FrameType, HELLO_REFUSED_APP_ID, HELLO_REFUSED_BUSY, HELLO_REFUSED_FAULTED,
+    HELLO_REFUSED_VERSION, Header, Hello, HelloOk, HelloRefused, Leader, PROTOCOL_VERSION,
+    RETRY_NOT_SERVING, RETRY_PAYLOAD_TOO_LARGE, RETRY_SERVICE_UNAVAILABLE, ResponseMeta, Retry,
+    Status, encode_frame, split_min_position_query,
 };
 
 use crate::config::{ConfigError, EdgeConfig};
@@ -1355,6 +1356,24 @@ fn dispatch(
         return false;
     }
 
+    // Read-your-writes (remote protocol 2): strip and keep the min-position
+    // prefix. A malformed prefix is a protocol violation by a client that
+    // spoke v2 at HELLO; drop the connection rather than guess.
+    let (min_token, payload) = if is_query && h.flags & FLAG_MIN_POSITION != 0 {
+        // Both flags together are a protocol violation (ruling R8): the same
+        // combination is dropped on shmem (spec §4.1), so close, don't
+        // silently downgrade either.
+        if h.flags & FLAG_LINEARIZABLE != 0 {
+            return false;
+        }
+        match split_min_position_query(payload) {
+            Some((t, rest)) => (Some(uc_client::ReadToken::from_u64(t)), rest),
+            None => return false,
+        }
+    } else {
+        (None, payload)
+    };
+
     // The envelope rides inside the node's payload budget, so it counts.
     //
     // This check is redundant by design: the `Engine` reads the same live cnc
@@ -1366,7 +1385,12 @@ fn dispatch(
     // holds only because some other crate's private ordering happens to check
     // first is not one this edge can make. Both paths write the same frame.
     let envelope = shared.cfg.session_envelope && !is_query;
-    let wire_len = payload.len() + if envelope { SESSION_HEADER_LEN } else { 0 };
+    // For a read-your-writes query only, the engine's own `wire_len` also
+    // counts the 8 token bytes and the 1-byte service id, so count them here
+    // too; plain-query accounting is unchanged (no id byte).
+    let wire_len = payload.len()
+        + if envelope { SESSION_HEADER_LEN } else { 0 }
+        + if min_token.is_some() { 9 } else { 0 };
     let live_max = shared.live_max_payload();
     if wire_len > live_max {
         // Terminal for the client — `RemoteClient` maps this reason to a hard
@@ -1446,12 +1470,17 @@ fn dispatch(
             }
         }
         let res = if is_query {
-            let c = if h.flags & FLAG_LINEARIZABLE != 0 {
-                Consistency::Linearizable
-            } else {
-                Consistency::Snapshot
-            };
-            send.try_query(user_data, body, c)
+            match min_token {
+                Some(token) => send.try_query_at_least(user_data, 0, body, token),
+                None => {
+                    let c = if h.flags & FLAG_LINEARIZABLE != 0 {
+                        Consistency::Linearizable
+                    } else {
+                        Consistency::Snapshot
+                    };
+                    send.try_query(user_data, body, c)
+                }
+            }
         } else {
             send.try_submit(user_data, body)
         };
@@ -1516,6 +1545,14 @@ fn dispatch(
                 shared.warn_payload_too_large(len, max);
                 if conn.unreserve(corr) {
                     shared.write_retry(conn, h.seq, RETRY_PAYLOAD_TOO_LARGE, 0);
+                }
+                return !conn.is_closed();
+            }
+            Err(SubmitError::ReadYourWritesUnsupported) => {
+                // An upgrade-ordering condition (a 3.4 gateway beside a
+                // pre-3.4 node) that the node's upgrade clears: transient.
+                if conn.unreserve(corr) {
+                    shared.write_retry(conn, h.seq, RETRY_SERVICE_UNAVAILABLE, RETRY_BACKOFF_US);
                 }
                 return !conn.is_closed();
             }

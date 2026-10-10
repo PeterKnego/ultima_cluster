@@ -277,6 +277,17 @@ one log stream (#11); the release-ledger line (#5) is process, not code
 
 ### Standing facts that bind new work
 
+- **Read-your-writes is folded into the unreleased cnc 3.4, and the remote
+  protocol is v2 (both unreleased until the next cut).** `FLAG_V2_MIN_POSITION`
+  on `query.ring` carries an 8-byte `min_position` prefix; the remote query
+  flag is `FLAG_MIN_POSITION = 0x20`, and v1 and v2 remote peers refuse each
+  other at `HELLO` (`HELLO_REFUSED_VERSION`). A 3.4 client refuses a
+  read-your-writes read with a non-zero token on a released 3.3 page by name
+  (`ReadYourWritesUnsupported`). Unreleased cnc additions fold into 3.4
+  rather than bumping it (the snapshot-lifecycle start-set words did too).
+  The node↔node wire is unchanged. `uc_remote` has its own `ReadToken` type
+  (`uc_protocol` stays a dev-only dependency). Explainer
+  `docs/notes/uc2-read-your-writes-explained.md`.
 - **The wire protocol SHIPPED is 0.9.0** (`2.13.0`, cnc `3.3`, tagged
   2026-09-22); `0.8.0` + cnc `3.2` was `2.12.0`. `0.9.0` adds `CLUSTER`
   kinds 4 `UpgradePin` and 5 `SnapshotReport` plus pairwise `SNAP_REPORT` 26,
@@ -295,8 +306,9 @@ one log stream (#11); the release-ledger line (#5) is process, not code
   mixed-version** — a 0.4.0 peer's durable report reads as unattested and is
   not counted, so a mixed cluster stalls commits rather than making unsound
   ones; upgrade all nodes together. The client↔gateway remote protocol is
-  separate and stays v1. What is API vs. what is flag-day:
-  `docs/reference/semver-policy.md`.
+  separate: v1 through `2.13.0`, **v2 on `main` as of read-your-writes**
+  (unreleased until the next cut; see the cnc bullet above). What is API vs.
+  what is flag-day: `docs/reference/semver-policy.md`.
 - **`2.11.0` (tagged 2026-09-08, `ff0f5b6`) is five features on one flag
   day** (FSM identity, log time and timers plan 1, the replicated schedule
   table, the cluster FSM, and coordinated snapshot instants): wire `0.6.0` →
@@ -751,7 +763,8 @@ Workspace crates:
   journal or installs a snapshot + tail-replays.
 - `uc_client` — sync local-shmem input-client SDK. Small dep set (no transport,
   no consensus); matcher over the broadcast response ring.
-- `uc_remote` — **M12a**: the remote wire protocol (protocol v1: framed TCP,
+- `uc_remote` — **M12a**: the remote wire protocol (protocol v2 since
+  read-your-writes, unreleased until the next cut; v1 before: framed TCP,
   credit-gated flow control, `REDIRECT`/`LEADER_CHANGED`/`RETRY`) and
   `RemoteClient`, the pipelined, redirect-following, re-sending Rust
   implementation of it — for clients that cannot attach to shmem directly.

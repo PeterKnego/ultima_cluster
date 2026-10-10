@@ -1191,6 +1191,7 @@ fn drain_queries<S: RawStateMachine>(st: &mut ApplyState<S>) {
     // fail-stops the node-restart case; this is the same-node service-restart
     // case, where `instance_id` is unchanged so #2c does not fire.)
     let my_epoch = st.my_epoch;
+    let applied = st.follower.cursor;
     let mut buf = Vec::new();
     for _ in 0..QUERY_DRAIN_PER_CYCLE {
         match st.svc_query.try_read(&mut buf) {
@@ -1215,7 +1216,7 @@ fn drain_queries<S: RawStateMachine>(st: &mut ApplyState<S>) {
                 st.resp_buf.clear();
                 st.sm.lock().unwrap().query(&buf[8..], &mut st.resp_buf);
                 st.egress
-                    .publish_query_answer(rec.header_extra, &st.resp_buf);
+                    .publish_query_answer(rec.header_extra, applied, &st.resp_buf);
             }
             Ok(None) => break,
             // Corrupt record (bad crc/magic): stop this cycle; the next retries

@@ -102,6 +102,8 @@ pub const CONTRACT_SERIES: &[&str] = &[
     "uc2_settings_position",
     "uc2_schedule_entries",
     "uc2_schedule_apply_refused_total",
+    "uc2_read_min_position_refused_total",
+    "uc2_read_min_position_parked",
     // FSM upgrade lifecycle (plan B3): the live snapshot-hash report path.
     "uc2_snapshot_reports_sent_total",
     "uc2_snapshot_reports_unsent_total",
@@ -1007,6 +1009,28 @@ fn push_service_families(out: &mut String, s: &ObsSources, commit: u64, now: u64
         "`uc2ctl schedule apply` requests this node refused (bad digest, missing or undecodable staged file, or an entry naming an undeclared FSM). Retries are NOT counted: neither the one a follower answers (the staged file is node-local, so the request is never forwarded) nor the one the leader answers while the previous cluster command is still above commit (single-in-flight).",
         s.schedule_apply_refused.load(Ordering::Relaxed),
     );
+    push_labeled(
+        out,
+        "uc2_read_min_position_refused_total",
+        "Read-your-writes reads this node answered RETRY at admission without parking: reason=\"ahead\" when the token named bytes this node does not hold (a lagging node, or a forged or stale token), reason=\"cap\" when the parked set was full. Deadline RETRYs of parked reads are not counted here.",
+        "counter",
+        &[
+            (
+                "reason=\"ahead\"".to_string(),
+                s.min_position.refused_ahead.load(Ordering::Relaxed),
+            ),
+            (
+                "reason=\"cap\"".to_string(),
+                s.min_position.refused_cap.load(Ordering::Relaxed),
+            ),
+        ],
+    );
+    push_gauge(
+        out,
+        "uc2_read_min_position_parked",
+        "Read-your-writes reads parked on this node right now, waiting for their row's applied frontier to reach their token.",
+        s.min_position.parked.load(Ordering::Relaxed),
+    );
     push_counter(
         out,
         "uc2_snapshot_reports_sent_total",
@@ -1812,6 +1836,7 @@ mod tests {
             schedule_entries: Arc::new(AtomicU64::new(0)),
             log_clock_smear_ns: Arc::new(AtomicU64::new(0)),
             schedule_apply_refused: Arc::new(AtomicU64::new(0)),
+            min_position: Arc::new(Default::default()),
             snapshot_reports_sent: Arc::new(AtomicU64::new(0)),
             snapshot_reports_unsent: Arc::new(AtomicU64::new(0)),
             snapshot_reports_appended: Arc::new(AtomicU64::new(0)),
@@ -2093,7 +2118,7 @@ mod tests {
     fn the_contract_has_the_number_of_families_the_docs_state() {
         assert_eq!(
             CONTRACT_SERIES.len(),
-            125,
+            127,
             "if this is intentional, update the family count in \
              docs/how-to/monitor-a-cluster.md in the same commit"
         );
@@ -2588,6 +2613,7 @@ mod tests {
             schedule_entries: Arc::new(AtomicU64::new(0)),
             log_clock_smear_ns: Arc::new(AtomicU64::new(0)),
             schedule_apply_refused: Arc::new(AtomicU64::new(0)),
+            min_position: Arc::new(Default::default()),
             snapshot_reports_sent: Arc::new(AtomicU64::new(0)),
             snapshot_reports_unsent: Arc::new(AtomicU64::new(0)),
             snapshot_reports_appended: Arc::new(AtomicU64::new(0)),
@@ -2697,6 +2723,7 @@ mod tests {
             schedule_entries: Arc::new(AtomicU64::new(0)),
             log_clock_smear_ns: Arc::new(AtomicU64::new(0)),
             schedule_apply_refused: Arc::new(AtomicU64::new(0)),
+            min_position: Arc::new(Default::default()),
             snapshot_reports_sent: Arc::new(AtomicU64::new(0)),
             snapshot_reports_unsent: Arc::new(AtomicU64::new(0)),
             snapshot_reports_appended: Arc::new(AtomicU64::new(0)),
@@ -2799,6 +2826,7 @@ mod tests {
             schedule_entries: Arc::new(AtomicU64::new(0)),
             log_clock_smear_ns: Arc::new(AtomicU64::new(0)),
             schedule_apply_refused: Arc::new(AtomicU64::new(0)),
+            min_position: Arc::new(Default::default()),
             snapshot_reports_sent: Arc::new(AtomicU64::new(0)),
             snapshot_reports_unsent: Arc::new(AtomicU64::new(0)),
             snapshot_reports_appended: Arc::new(AtomicU64::new(0)),

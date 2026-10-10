@@ -70,6 +70,9 @@ pub struct ObsSources {
     pub log_clock_smear_ns: Arc<AtomicU64>,
     /// Plan 2: `schedule apply` requests this node refused, for any reason.
     pub schedule_apply_refused: Arc<AtomicU64>,
+    /// Read-your-writes: refused min-position reads by reason, and the parked
+    /// gauge — the SAME allocation the consensus agent bumps.
+    pub min_position: Arc<crate::min_position::MinPositionReadStats>,
     /// Plan B3 (spec §6.5.2): live `SNAP_REPORT`s this node put on the wire
     /// to the leader on a set-complete edge, and ones it dropped because it
     /// knew of no leader to send them to. Both are FOLLOWER counters by
@@ -221,6 +224,7 @@ impl ObsSources {
             schedule_entries: Arc::new(AtomicU64::new(0)),
             log_clock_smear_ns: Arc::new(AtomicU64::new(0)),
             schedule_apply_refused: Arc::new(AtomicU64::new(0)),
+            min_position: Arc::new(Default::default()),
             snapshot_reports_sent: Arc::new(AtomicU64::new(0)),
             snapshot_reports_unsent: Arc::new(AtomicU64::new(0)),
             snapshot_reports_appended: Arc::new(AtomicU64::new(0)),

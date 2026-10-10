@@ -554,6 +554,36 @@ for the same one-maintainer-decision reason as every prior carve-out on this
 line. The new `WholeStateSnapshot` helper trait (`uc_service::snapshots`) is
 additive — see [the state-machine contract § Snapshots](state-machine-contract.md#snapshots-required-the-instant-the-envelope-and-the-exclusive-frontier).
 
+### Read-your-writes reads (unreleased, next cut)
+
+Spec `docs/superpowers/specs/2026-10-08-uc2-read-your-writes-design.md`,
+explainer `docs/notes/uc2-read-your-writes-explained.md`. Two items, neither
+touches the node-to-node wire:
+
+- **`FLAG_V2_MIN_POSITION`, folded into cnc `3.4`.** A new query flag whose
+  record carries an 8-byte `min_position` prefix, with no layout change. It is
+  folded into the unreleased cnc 3.4 rather than bumping it (released `2.13.0`
+  shipped 3.3). Additive API (a minor): new `query_read_your_writes*`,
+  `query_at_least_on`, `read_token`, `observe` and `ReadToken`. Because a 3.4
+  client attaches to a 3.3 page (`version_compatible` accepts an older
+  minor), the client refuses a read-your-writes read with a non-zero token on
+  such a page by name (`ReadYourWritesUnsupported`) instead of sending a
+  record an old node would misread. Dev builds of 3.4 from before this
+  feature would accept the flag and misread it; none was released.
+- **Remote protocol v2.** `PROTOCOL_VERSION` 1 to 2 and the query flag
+  `FLAG_MIN_POSITION = 0x20`. A v1 client and a v2 edge refuse each other at
+  `HELLO` with `HELLO_REFUSED_VERSION`: upgrade gateways and remote clients
+  together. This retires the old statement that the remote protocol stays v1.
+
+**API note.** `Consistency` (in `uc_client` and in `uc_remote`) gains the
+variant `ReadYourWrites`, `SubmitError` gains `ReadYourWritesUnsupported`, and
+`ClientError` gains `ReadYourWritesUnsupported`; `EngineStats` and
+`RemoteStats` gain a public field `stale_answers`. None of these types is
+`#[non_exhaustive]`, so an exhaustive `match` on the enums, or a struct
+literal of the stats, stops compiling downstream: the same documented
+minor-version hazard `Outcome` and `SubmitError` carried in M14b. Adding a
+variant or field is additive under this policy.
+
 ## Related
 
 - [Cut a release](../how-to/cut-a-release.md) — the lockstep bump, the tag,

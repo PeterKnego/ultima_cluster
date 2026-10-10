@@ -57,9 +57,9 @@ use uc_protocol::v2::frame::{
     align_frame_len, read_cluster_prefix,
 };
 use uc_protocol::v2::ipc::{
-    FLAG_V2_LINEARIZABLE, MSG_V2_BAD_SERVICE, MSG_V2_NOT_LEADER, MSG_V2_RETRY, MSG_V2_SCHED,
-    MSG_V2_SVC_QUERY, SchedOp, client_from_extra, extra_client, read_sched_record,
-    split_query_payload,
+    FLAG_V2_LINEARIZABLE, FLAG_V2_MIN_POSITION, MSG_V2_BAD_SERVICE, MSG_V2_NOT_LEADER,
+    MSG_V2_RETRY, MSG_V2_SCHED, MSG_V2_SVC_QUERY, SchedOp, client_from_extra, extra_client,
+    read_sched_record, split_min_position_query_payload, split_query_payload,
 };
 
 use crate::audit::{
@@ -1150,6 +1150,8 @@ pub struct Node {
     schedule_entries_pub: Arc<AtomicU64>,
     log_clock_smear_pub: Arc<AtomicU64>,
     schedule_refused: Arc<AtomicU64>,
+    /// Read-your-writes counters and gauge, shared with the consensus agent.
+    min_position_stats: Arc<crate::min_position::MinPositionReadStats>,
     /// Plan B3 (spec §6.5.2): the consensus agent's two `SNAP_REPORT` wire
     /// counters and its two leader-side collector counters — the SAME `Arc`s
     /// it bumps, handed on by `observability()`.
@@ -2266,6 +2268,7 @@ impl Node {
         // Plan 2 (spec §6): refused `schedule apply` requests, shared with
         // `Node::observability` (`uc2_schedule_apply_refused_total`).
         let schedule_refused = Arc::new(AtomicU64::new(0));
+        let min_position_stats = Arc::new(crate::min_position::MinPositionReadStats::default());
         // Plan B3 (spec §6.5.2): the live snapshot-hash report counters,
         // shared with `Node::observability` the same way.
         let snapshot_reports_sent = Arc::new(AtomicU64::new(0));
@@ -2396,6 +2399,10 @@ impl Node {
             last_snap_refusals: (0, 0, 0, 0, 0),
             min_applied: u64::MAX,
             pending_reads: Vec::new(),
+            parked_reads: crate::min_position::ParkedReads::new(
+                crate::min_position::MAX_PARKED_MIN_POSITION_READS,
+            ),
+            min_position_stats: Arc::clone(&min_position_stats),
             current_round: None,
             next_round_seq: 1,
             next_nonce: 0,
@@ -2594,6 +2601,7 @@ impl Node {
             schedule_entries_pub,
             log_clock_smear_pub,
             schedule_refused,
+            min_position_stats,
             snapshot_reports_sent,
             snapshot_reports_unsent,
             snapshot_reports_appended,
@@ -3092,6 +3100,7 @@ impl Node {
             schedule_entries: Arc::clone(&self.schedule_entries_pub),
             log_clock_smear_ns: Arc::clone(&self.log_clock_smear_pub),
             schedule_apply_refused: Arc::clone(&self.schedule_refused),
+            min_position: Arc::clone(&self.min_position_stats),
             snapshot_reports_sent: Arc::clone(&self.snapshot_reports_sent),
             snapshot_reports_unsent: Arc::clone(&self.snapshot_reports_unsent),
             snapshot_reports_appended: Arc::clone(&self.snapshot_reports_appended),
@@ -3484,6 +3493,11 @@ struct Consensus {
     /// (the ReadIndex barrier state machine). Small — one entry per outstanding
     /// client read; walked every duty cycle (bounded by outstanding reads).
     pending_reads: Vec<PendingRead>,
+    /// Read-your-writes (spec 2026-10-08 §5.1): min-position reads waiting
+    /// for their row's applied frontier. Separate from `pending_reads` so
+    /// linearizable reads and Rung A are untouched.
+    parked_reads: crate::min_position::ParkedReads,
+    min_position_stats: Arc<crate::min_position::MinPositionReadStats>,
     /// Rung A: the single in-flight READ_PROBE round, if any. At most one
     /// exists; it certifies exactly the reads waiting when it was issued.
     current_round: Option<ProbeRound>,
@@ -4506,6 +4520,9 @@ impl Consensus {
         // `feed_net`; once quorum + service catch-up hold, forward the read to
         // the service; on deadline or lost leadership, answer `MSG_V2_RETRY`.
         did |= self.advance_pending_reads();
+        // 3e. Read-your-writes: release caught-up min-position reads, RETRY
+        // expired ones (spec 2026-10-08 §5.1).
+        did |= self.advance_min_position_reads();
 
         // 4. Feed the tick — the ONLY place real time enters the SM.
         //
@@ -9569,6 +9586,10 @@ impl Consensus {
                 Ok(Some(rec)) => {
                     did = true;
                     let (client_id, local_seq) = client_from_extra(rec.header_extra);
+                    if rec.flags & FLAG_V2_MIN_POSITION != 0 {
+                        self.admit_min_position_read(client_id, local_seq, rec.flags, &buf);
+                        continue;
+                    }
                     // M14b: `service_id: u8 ++ query`. No id byte = malformed,
                     // dropped (the service drops short svc_query records the
                     // same way; the SDK always writes the prefix).
@@ -9666,6 +9687,110 @@ impl Consensus {
         // of 2; the other is advance_pending_reads, which chains rounds while
         // demand persists).
         self.maybe_issue_round();
+        did
+    }
+
+    /// Read-your-writes admission (spec 2026-10-08 §5.1, steps 1-6).
+    fn admit_min_position_read(&mut self, client_id: u32, local_seq: u32, flags: u16, buf: &[u8]) {
+        if flags & FLAG_V2_LINEARIZABLE != 0 {
+            return; // malformed: never both (§4.1); dropped like an id-less record
+        }
+        let Some((service_id, token, query)) = split_min_position_query_payload(buf) else {
+            return; // shorter than 9 bytes: malformed, dropped
+        };
+        if !self.has_service_ring(service_id) {
+            self.send_bad_service(client_id, local_seq, service_id);
+            return;
+        }
+        #[cfg(feature = "mutation-testing")]
+        if matches!(
+            crate::mutation::active(),
+            Some(crate::mutation::Mutation::SkipMinPositionWait)
+        ) {
+            self.forward_svc_query(service_id, client_id, local_seq, 0, query);
+            return;
+        }
+        // Step 3, the durable bound: this node does not hold the bytes the
+        // token names, so waiting could be forever (a forged token) or is
+        // someone else's job (a lagging node). Never parked.
+        if token > self.cnc.counters().durable.load_acquire() {
+            self.min_position_stats
+                .refused_ahead
+                .fetch_add(1, Ordering::Relaxed);
+            self.send_retry(client_id, local_seq);
+            return;
+        }
+        // Step 4, the fast path.
+        if let Some(e) = self.min_position_ready(service_id, token)
+            && self.forward_svc_query(service_id, client_id, local_seq, e, query)
+        {
+            return;
+        }
+        // Steps 5-6: park, or refuse at the cap.
+        let read = crate::min_position::ParkedRead {
+            client_id,
+            local_seq,
+            service_id,
+            query: query.to_vec(),
+            token,
+            deadline_ns: self.now_ns() + READ_BARRIER_TIMEOUT_NS,
+        };
+        if let Err(read) = self.parked_reads.park(read) {
+            self.min_position_stats
+                .refused_cap
+                .fetch_add(1, Ordering::Relaxed);
+            self.send_retry(read.client_id, read.local_seq);
+        }
+        self.min_position_stats
+            .parked
+            .store(self.parked_reads.len() as u64, Ordering::Relaxed);
+    }
+
+    /// B's capture-recheck bracket for a min-position read: `Some(epoch)` iff
+    /// an attached incarnation (`epoch >= 1`) has applied at least `token`
+    /// and was still the same incarnation after the check. The `e >= 1`
+    /// guard is the sentinel-collision rationale documented in
+    /// `advance_pending_reads`: epoch 0 is the skip-the-check sentinel.
+    fn min_position_ready(&self, service_id: u8, token: u64) -> Option<u64> {
+        let slot = self.cnc.service_slot(service_id as usize);
+        let e = slot.epoch.load_acquire();
+        let applied = slot.applied.load_acquire();
+        (e >= 1 && applied >= token && slot.epoch.load_acquire() == e).then_some(e)
+    }
+
+    /// Release parked reads whose row has caught up (lowest token first) and
+    /// RETRY those past their deadline. A pass that releases and expires
+    /// nothing costs one heap peek per row with parked reads.
+    fn advance_min_position_reads(&mut self) -> bool {
+        if self.parked_reads.is_empty() {
+            return false;
+        }
+        let mut did = false;
+        for row in 0..CNC_MAX_SERVICES as u8 {
+            while let Some(token) = self.parked_reads.peek_token(row) {
+                let Some(e) = self.min_position_ready(row, token) else {
+                    break;
+                };
+                let r = self.parked_reads.pop(row).expect("peeked");
+                if !self.forward_svc_query(r.service_id, r.client_id, r.local_seq, e, &r.query) {
+                    // svc_query momentarily full: keep it (a slot was just
+                    // freed, so this cannot hit the cap) and try next pass.
+                    let _ = self.parked_reads.park(r);
+                    break;
+                }
+                did = true;
+            }
+        }
+        let now = self.now_ns();
+        let mut expired = Vec::new();
+        self.parked_reads.expire(now, |r| expired.push(r));
+        for r in expired {
+            self.send_retry(r.client_id, r.local_seq);
+            did = true;
+        }
+        self.min_position_stats
+            .parked
+            .store(self.parked_reads.len() as u64, Ordering::Relaxed);
         did
     }
 
@@ -14242,6 +14367,10 @@ mod tests {
             last_snap_refusals: (0, 0, 0, 0, 0),
             min_applied: u64::MAX,
             pending_reads: Vec::new(),
+            parked_reads: crate::min_position::ParkedReads::new(
+                crate::min_position::MAX_PARKED_MIN_POSITION_READS,
+            ),
+            min_position_stats: Arc::new(Default::default()),
             current_round: None,
             next_round_seq: 1,
             next_nonce: 0,
@@ -24701,6 +24830,229 @@ mod tests {
                 (MSG_V2_BAD_SERVICE, (9, 2), vec![200]),
             ]
         );
+    }
+
+    /// Read-your-writes (spec 2026-10-08 §5.1). A harness with a row-1 ring
+    /// whose consumer the test holds, and a min-position record writer.
+    fn ryw_setup(
+        h: &mut Harness,
+    ) -> (
+        uc_protocol::ring::MpscProducer,
+        SpscConsumer,
+        uc_protocol::ring::BroadcastConsumer,
+    ) {
+        let (svc1_producer, svc1_consumer) =
+            SpscRing::create(&h._dir.path().join("svc_query.1.ring"), 4096, 1024)
+                .unwrap()
+                .into_split();
+        h.cons.svc_query[1] = Some(svc1_producer);
+        let (producer, _c) = MpscRing::open(&h._dir.path().join("query.ring"))
+            .unwrap()
+            .into_split();
+        let node_egress = BroadcastRing::open(&h._dir.path().join("egress_node.broadcast"))
+            .unwrap()
+            .subscribe();
+        (producer, svc1_consumer, node_egress)
+    }
+
+    fn send_ryw(p: &uc_protocol::ring::MpscProducer, seq: u32, token: u64) {
+        use uc_protocol::v2::ipc::{
+            FLAG_V2_MIN_POSITION, MSG_V2_QUERY, write_min_position_query_payload,
+        };
+        let mut payload = Vec::new();
+        write_min_position_query_payload(1, token, b"q", &mut payload);
+        p.try_write(
+            MSG_V2_QUERY,
+            FLAG_V2_MIN_POSITION,
+            extra_client(9, seq),
+            &payload,
+        )
+        .unwrap();
+    }
+
+    fn node_answers(e: &mut uc_protocol::ring::BroadcastConsumer) -> Vec<(u16, (u32, u32))> {
+        let mut buf = Vec::new();
+        let mut out = Vec::new();
+        while let Ok(Some(rec)) = e.try_read(&mut buf) {
+            out.push((rec.msg_type, client_from_extra(rec.header_extra)));
+        }
+        out
+    }
+
+    #[test]
+    fn a_token_above_durable_is_refused_and_never_parked() {
+        let mut h = harness(); // NOT driven to leader: no leadership gate applies
+        let (p, mut svc1, mut egress) = ryw_setup(&mut h);
+        h.cons.cnc.counters().durable.store_release(1000);
+        send_ryw(&p, 1, 1001);
+        send_ryw(&p, 2, u64::MAX);
+        assert!(h.cons.drain_query_ring());
+        assert!(h.cons.parked_reads.is_empty());
+        assert_eq!(
+            node_answers(&mut egress),
+            vec![(MSG_V2_RETRY, (9, 1)), (MSG_V2_RETRY, (9, 2))]
+        );
+        assert!(svc1.try_read(&mut Vec::new()).unwrap().is_none());
+        assert_eq!(
+            h.cons
+                .min_position_stats
+                .refused_ahead
+                .load(Ordering::Relaxed),
+            2
+        );
+    }
+
+    #[test]
+    fn a_caught_up_read_forwards_at_once_with_the_real_epoch() {
+        let mut h = harness();
+        let (p, mut svc1, _egress) = ryw_setup(&mut h);
+        h.cons.cnc.counters().durable.store_release(1000);
+        h.cons.cnc.service_slot(1).applied.store_release(800);
+        h.cons.cnc.service_slot(1).epoch.store_release(3);
+        send_ryw(&p, 1, 800);
+        assert!(h.cons.drain_query_ring());
+        let mut buf = Vec::new();
+        let rec = svc1.try_read(&mut buf).unwrap().expect("forwarded");
+        assert_eq!(rec.msg_type, MSG_V2_SVC_QUERY);
+        assert_eq!(
+            &buf[..8],
+            &3u64.to_le_bytes(),
+            "the real epoch, not the 0 sentinel"
+        );
+        assert_eq!(&buf[8..], b"q", "id and token stripped");
+        assert!(h.cons.parked_reads.is_empty());
+    }
+
+    /// The `e >= 1` sentinel guard (see `advance_pending_reads`): a slot whose
+    /// epoch is still 0 has no attached service incarnation, and 0 is the
+    /// "skip the stale-epoch check" sentinel on the wire, so a min-position
+    /// read must PARK there even when `applied >= token`, never forward.
+    #[test]
+    fn a_caught_up_read_on_an_epoch_zero_slot_parks_instead_of_forwarding() {
+        let mut h = harness();
+        let (p, mut svc1, _egress) = ryw_setup(&mut h);
+        h.cons.cnc.counters().durable.store_release(1000);
+        h.cons.cnc.service_slot(1).applied.store_release(800);
+        assert_eq!(h.cons.cnc.service_slot(1).epoch.load_acquire(), 0);
+        send_ryw(&p, 1, 800);
+        assert!(h.cons.drain_query_ring());
+        assert!(
+            svc1.try_read(&mut Vec::new()).unwrap().is_none(),
+            "must not forward with the epoch-0 sentinel"
+        );
+        assert_eq!(h.cons.parked_reads.len(), 1);
+        assert!(!h.cons.advance_min_position_reads());
+        // A real incarnation attaches: now it forwards, with that epoch.
+        h.cons.cnc.service_slot(1).epoch.store_release(2);
+        assert!(h.cons.advance_min_position_reads());
+        let mut buf = Vec::new();
+        svc1.try_read(&mut buf).unwrap().expect("forwarded");
+        assert_eq!(&buf[..8], &2u64.to_le_bytes());
+        assert!(h.cons.parked_reads.is_empty());
+    }
+
+    #[test]
+    fn a_lagging_read_parks_then_forwards_when_applied_reaches_the_token() {
+        let mut h = harness();
+        let (p, mut svc1, _egress) = ryw_setup(&mut h);
+        h.cons.cnc.counters().durable.store_release(1000);
+        h.cons.cnc.service_slot(1).epoch.store_release(1);
+        h.cons.cnc.service_slot(1).applied.store_release(500);
+        send_ryw(&p, 1, 900); // parked: 500 < 900 <= 1000
+        send_ryw(&p, 2, 600); // parked, LOWER token, admitted later
+        assert!(h.cons.drain_query_ring());
+        assert_eq!(h.cons.parked_reads.len(), 2);
+        assert!(!h.cons.advance_min_position_reads());
+        h.cons.cnc.service_slot(1).applied.store_release(700);
+        assert!(h.cons.advance_min_position_reads());
+        let mut buf = Vec::new();
+        let rec = svc1
+            .try_read(&mut buf)
+            .unwrap()
+            .expect("the lower token released first");
+        assert_eq!(client_from_extra(rec.header_extra), (9, 2));
+        assert!(svc1.try_read(&mut buf).unwrap().is_none());
+        h.cons.cnc.service_slot(1).applied.store_release(900);
+        assert!(h.cons.advance_min_position_reads());
+        let rec = svc1
+            .try_read(&mut buf)
+            .unwrap()
+            .expect("then the higher one");
+        assert_eq!(client_from_extra(rec.header_extra), (9, 1));
+        assert!(h.cons.parked_reads.is_empty());
+    }
+
+    #[test]
+    fn a_parked_read_past_its_deadline_is_retried() {
+        // `now_ns()` is the real monotonic clock (no test override), so park
+        // directly with a deadline already in the past.
+        let mut h = harness();
+        let (_p, _svc1, mut egress) = ryw_setup(&mut h);
+        h.cons.cnc.service_slot(1).epoch.store_release(1);
+        h.cons
+            .parked_reads
+            .park(crate::min_position::ParkedRead {
+                client_id: 9,
+                local_seq: 1,
+                service_id: 1,
+                query: b"q".to_vec(),
+                token: 900,
+                deadline_ns: 0,
+            })
+            .unwrap();
+        assert!(h.cons.advance_min_position_reads());
+        assert_eq!(node_answers(&mut egress), vec![(MSG_V2_RETRY, (9, 1))]);
+        assert!(h.cons.parked_reads.is_empty());
+    }
+
+    #[test]
+    fn the_cap_refuses_with_retry() {
+        let mut h = harness();
+        let (p, _svc1, mut egress) = ryw_setup(&mut h);
+        h.cons.parked_reads = crate::min_position::ParkedReads::new(1);
+        h.cons.cnc.counters().durable.store_release(1000);
+        h.cons.cnc.service_slot(1).epoch.store_release(1);
+        send_ryw(&p, 1, 900);
+        send_ryw(&p, 2, 900);
+        assert!(h.cons.drain_query_ring());
+        assert_eq!(h.cons.parked_reads.len(), 1);
+        assert_eq!(node_answers(&mut egress), vec![(MSG_V2_RETRY, (9, 2))]);
+        assert_eq!(
+            h.cons
+                .min_position_stats
+                .refused_cap
+                .load(Ordering::Relaxed),
+            1
+        );
+    }
+
+    #[test]
+    fn min_position_and_linearizable_together_is_dropped() {
+        use uc_protocol::v2::ipc::{
+            FLAG_V2_MIN_POSITION, MSG_V2_QUERY, write_min_position_query_payload,
+        };
+        let mut h = harness();
+        let (p, mut svc1, mut egress) = ryw_setup(&mut h);
+        let mut payload = Vec::new();
+        write_min_position_query_payload(1, 0, b"q", &mut payload);
+        p.try_write(
+            MSG_V2_QUERY,
+            FLAG_V2_MIN_POSITION | FLAG_V2_LINEARIZABLE,
+            extra_client(9, 1),
+            &payload,
+        )
+        .unwrap();
+        p.try_write(
+            MSG_V2_QUERY,
+            FLAG_V2_MIN_POSITION,
+            extra_client(9, 2),
+            &[1, 2, 3],
+        )
+        .unwrap(); // shorter than 9 bytes
+        assert!(h.cons.drain_query_ring());
+        assert!(node_answers(&mut egress).is_empty());
+        assert!(svc1.try_read(&mut Vec::new()).unwrap().is_none());
+        assert!(h.cons.parked_reads.is_empty() && h.cons.pending_reads.is_empty());
     }
 
     /// M14b: a snapshot read is forwarded to the NAMED id's ring (the harness

@@ -88,6 +88,7 @@ fn synthetic_server() -> (ObsServer, ObsSources) {
         schedule_entries: Arc::new(AtomicU64::new(0)),
         log_clock_smear_ns: Arc::new(AtomicU64::new(0)),
         schedule_apply_refused: Arc::new(AtomicU64::new(0)),
+        min_position: Arc::new(Default::default()),
         snapshot_reports_sent: Arc::new(AtomicU64::new(0)),
         snapshot_reports_unsent: Arc::new(AtomicU64::new(0)),
         snapshot_reports_appended: Arc::new(AtomicU64::new(0)),
