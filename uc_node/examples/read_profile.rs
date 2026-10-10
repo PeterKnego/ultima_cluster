@@ -183,8 +183,9 @@ use uc_node::{Node, NodeConfig};
 use uc_protocol::ring::{BroadcastConsumer, BroadcastRing, MpscRing, RingError};
 use uc_protocol::v2::cnc::NODE_FLAG_CAN_SERVE;
 use uc_protocol::v2::ipc::{
-    FLAG_V2_IS_QUERY, FLAG_V2_LINEARIZABLE, MSG_V2_NOT_LEADER, MSG_V2_QUERY, MSG_V2_RESPONSE,
-    MSG_V2_RETRY, MSG_V2_SUBMIT, client_from_extra, extra_client, write_query_payload,
+    FLAG_V2_IS_QUERY, FLAG_V2_LINEARIZABLE, FLAG_V2_MIN_POSITION, MSG_V2_NOT_LEADER, MSG_V2_QUERY,
+    MSG_V2_RESPONSE, MSG_V2_RETRY, MSG_V2_SUBMIT, client_from_extra, extra_client,
+    write_min_position_query_payload, write_query_payload,
 };
 use uc_service::{ApplyCtx, ServiceBuilder, ServiceConfig, StateMachine};
 
@@ -314,6 +315,12 @@ enum Mode {
     Lin,
     /// Snapshot read: forwarded straight to the service (`node.rs:1958`).
     Snap,
+    /// Read-your-writes read (`FLAG_V2_MIN_POSITION`): the token is the
+    /// attached node's OWN commit position at send time — the freshest token a
+    /// real client could carry (it has just seen a write commit), so this
+    /// exercises the wait/park path as hard as real use can. On the leader
+    /// that is "linearizable minus the quorum round".
+    Ryw,
 }
 
 #[derive(clap::Args)]
@@ -342,6 +349,14 @@ struct ClientArgs {
     /// the occupancy ranking (see the module doc).
     #[arg(long)]
     service_pid: Option<u32>,
+    /// Attach to a node in ANY role, not only a serving leader. Snapshot reads
+    /// are answered by every node's own service (the query drain forwards a
+    /// non-linearizable read before its leader check), so this is how the
+    /// read-spread experiment loads a follower. Snapshot mode and
+    /// `--write-rate 0` only: a follower answers a linearizable read or a write
+    /// with NOT_LEADER, which would measure nothing.
+    #[arg(long, default_value_t = false)]
+    any_role: bool,
 }
 
 #[derive(clap::Args)]
@@ -927,6 +942,7 @@ fn poll_egress(ring: &mut BroadcastConsumer, ctx: &MatcherCtx, buf: &mut Vec<u8>
 /// forwards it straight to the service (`node.rs:1956-1958`). Everything else —
 /// admission, the per-cycle drain cap, the service, the egress path — is
 /// identical, so the delta between arms IS the barrier's end-to-end cost.
+#[allow(clippy::too_many_arguments)]
 fn run_read_measurement(
     instance_dir: &Path,
     app_id: &str,
@@ -935,11 +951,14 @@ fn run_read_measurement(
     mode: Mode,
     write_rate: u64,
     task_dirs: &[(u32, PathBuf)],
+    any_role: bool,
 ) -> (ReadStats, Vec<Occupancy>) {
     let cnc = CncPage::open_file(&instance_dir.join(CNC_FILE), app_id)
         .unwrap_or_else(|e| panic!("cnc attach {instance_dir:?}: {e}"));
     let client_id = cnc.status().next_client_id.fetch_add(1) as u32;
-    await_serving(&cnc, LEADER_WAIT);
+    if !any_role {
+        await_serving(&cnc, LEADER_WAIT);
+    }
 
     let (query_producer, _query_consumer) = MpscRing::open(&instance_dir.join(QUERY_RING))
         .unwrap_or_else(|e| panic!("open query.ring: {e}"))
@@ -958,6 +977,7 @@ fn run_read_measurement(
     let flags = match mode {
         Mode::Lin => FLAG_V2_LINEARIZABLE,
         Mode::Snap => 0,
+        Mode::Ryw => FLAG_V2_MIN_POSITION,
     };
 
     let send_ns: Arc<Box<[AtomicU64]>> = Arc::new(
@@ -1088,8 +1108,9 @@ fn run_read_measurement(
     'send: while Instant::now() < deadline {
         // Pause while the attached node is not a serving leader: without this a
         // leadership flip degenerates into a NOT_LEADER feedback flood that
-        // measures nothing (the m5_gate lesson).
-        if cnc.status().flags.load_acquire() & NODE_FLAG_CAN_SERVE == 0 {
+        // measures nothing (the m5_gate lesson). `--any-role` reads a follower
+        // on purpose, so it skips the gate.
+        if !any_role && cnc.status().flags.load_acquire() & NODE_FLAG_CAN_SERVE == 0 {
             thread::sleep(Duration::from_millis(1));
             continue;
         }
@@ -1107,7 +1128,15 @@ fn run_read_measurement(
         send_ns[idx].store(t0.elapsed().as_nanos() as u64, Ordering::Release);
         owner[idx].store(local_seq as u64 + 1, Ordering::Release);
         let extra = extra_client(client_id, local_seq);
-        write_query_payload(0, &query_bytes, &mut query_payload);
+        if mode == Mode::Ryw {
+            // Token 0 would be a plain snapshot read; a fresh cluster's commit
+            // is non-zero after genesis, and `max(1)` keeps the record a
+            // genuine min-position read even then.
+            let token = cnc.counters().commit.load_acquire().max(1);
+            write_min_position_query_payload(0, token, &query_bytes, &mut query_payload);
+        } else {
+            write_query_payload(0, &query_bytes, &mut query_payload);
+        }
         loop {
             match query_producer.try_write(MSG_V2_QUERY, flags, extra, &query_payload) {
                 Ok(()) => break,
@@ -1367,6 +1396,7 @@ fn print_read_report(mode: Mode, readers: u64, write_rate: u64, s: &ReadStats, o
     let arm = match mode {
         Mode::Lin => "linearizable (probe barrier)",
         Mode::Snap => "snapshot (no barrier)",
+        Mode::Ryw => "read-your-writes (token = node commit)",
     };
     println!();
     println!("========== uc2 read profile: {arm} ==========");
@@ -1438,6 +1468,7 @@ fn run_all(a: AllArgs) -> anyhow::Result<()> {
         a.mode,
         a.write_rate,
         &self_task_dirs(),
+        false,
     );
     print_read_report(a.mode, readers, a.write_rate, &stats, &occ);
     stop_cluster(nodes, services);
@@ -1489,6 +1520,11 @@ fn run_client_role(a: ClientArgs) -> anyhow::Result<()> {
              longer uses the occupancy ranking (see the module doc)."
         );
     }
+    anyhow::ensure!(
+        !a.any_role || (a.mode != Mode::Lin && a.write_rate == 0),
+        "--any-role takes --mode snap and --write-rate 0 only: a follower answers a \
+         linearizable read or a write with NOT_LEADER"
+    );
     let (stats, occ) = run_read_measurement(
         &a.instance_dir,
         &a.app_id,
@@ -1497,6 +1533,7 @@ fn run_client_role(a: ClientArgs) -> anyhow::Result<()> {
         a.mode,
         a.write_rate,
         &task_dirs,
+        a.any_role,
     );
     print_read_report(a.mode, readers, a.write_rate, &stats, &occ);
     anyhow::ensure!(
@@ -1563,6 +1600,9 @@ struct Rung {
     pub inflight_mean: f64,
     pub inflight_min: u64,
     pub regression: u64,
+    /// Writes the background writer got accepted per second of the run (the
+    /// write load actually achieved, vs `write_rate`, the target).
+    pub writes_per_sec: f64,
     /// Occupancy ranking, busiest (fewest yields) first, agent threads only.
     pub agents: Vec<AgentRank>,
 }
@@ -1590,6 +1630,11 @@ impl Rung {
             inflight_mean: s.inflight_mean,
             inflight_min: s.inflight_min,
             regression: s.regression,
+            writes_per_sec: if s.elapsed.as_secs_f64() > 0.0 {
+                s.writes_accepted as f64 / s.elapsed.as_secs_f64()
+            } else {
+                0.0
+            },
             agents: agent_rows(occ)
                 .into_iter()
                 .map(|o| AgentRank {
@@ -1605,6 +1650,7 @@ impl Rung {
         match self.mode {
             Mode::Lin => "lin",
             Mode::Snap => "snap",
+            Mode::Ryw => "ryw",
         }
     }
 
@@ -1612,6 +1658,7 @@ impl Rung {
         match self.mode {
             Mode::Lin => "linearizable",
             Mode::Snap => "snapshot",
+            Mode::Ryw => "read-your-writes",
         }
     }
 
@@ -1673,7 +1720,7 @@ fn rung_to_json(r: &Rung) -> String {
         "{{\"rung\":1,\"mode\":\"{}\",\"readers\":{},\"write_rate\":{},\"reads\":{},\
          \"reads_per_sec\":{},\"p50_ms\":{},\"p99_ms\":{},\"retried\":{},\"not_leader\":{},\
          \"overwritten\":{},\"inflight_at_end\":{},\"inflight_mean\":{},\"inflight_min\":{},\
-         \"regression\":{},\"agents\":[{}]}}",
+         \"regression\":{},\"writes_per_sec\":{},\"agents\":[{}]}}",
         r.mode_str(),
         r.readers,
         r.write_rate,
@@ -1688,6 +1735,7 @@ fn rung_to_json(r: &Rung) -> String {
         r.inflight_mean,
         r.inflight_min,
         r.regression,
+        r.writes_per_sec,
         agents
     )
 }
@@ -1760,6 +1808,7 @@ fn rung_from_json(line: &str) -> Option<Rung> {
     let mode = match json_str(head, "mode")? {
         "lin" => Mode::Lin,
         "snap" => Mode::Snap,
+        "ryw" => Mode::Ryw,
         _ => return None,
     };
     Some(Rung {
@@ -1777,6 +1826,7 @@ fn rung_from_json(line: &str) -> Option<Rung> {
         inflight_mean: json_f64(head, "inflight_mean").unwrap_or(0.0),
         inflight_min: json_u64(head, "inflight_min").unwrap_or(0),
         regression: json_u64(head, "regression").unwrap_or(0),
+        writes_per_sec: json_f64(head, "writes_per_sec").unwrap_or(0.0),
         agents,
     })
 }
@@ -2052,6 +2102,7 @@ fn run_ladder(a: LadderArgs) -> anyhow::Result<()> {
                     mode,
                     write_rate,
                     &self_task_dirs(),
+                    false,
                 );
                 stop_cluster(nodes, services);
                 anyhow::ensure!(
@@ -2379,6 +2430,7 @@ mod tests {
             inflight_mean: readers as f64,
             inflight_min: readers,
             regression: 0,
+            writes_per_sec: 0.0,
             agents: vec![agent(top, 10, 100.0), agent("uc2-archive", 11, 1_000.0)],
         }
     }
