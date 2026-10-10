@@ -165,7 +165,7 @@ pub trait BackupTarget: Send + Sync {
 }
 ```
 
-`FsTarget` is the one implementation. Rename-into-place is the atomicity
+`FsTarget` is the one implementation. Link-into-place is the atomicity
 primitive (a hard link then unlink of the temporary name, so an existing
 final name is never replaced — POSIX `rename` would replace it); a crash leaves only `.tmp/` entries, which a writer removes when
 it starts (only entries older than one hour, so a concurrent writer's
