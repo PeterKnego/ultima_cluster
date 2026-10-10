@@ -34,7 +34,9 @@ use crate::traits::{ApplyCtx, RawStateMachine, TimerEvent};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Replay {
     /// Replay ran: the byte cursor after the last applied/skipped frame — the
-    /// point at which the live [`LogFollower`] resumes.
+    /// point at which the live [`LogFollower`] resumes. Never below the
+    /// pass's `ReplayInstant::resume`: a pass that moved nothing returns
+    /// exactly that cursor ("no movement"), never 0.
     ///
     /// [`LogFollower`]: uc_log::reader::LogFollower
     Rejoin(u64),
@@ -239,7 +241,11 @@ pub(crate) fn replay_into<S: RawStateMachine>(
     let mut guard = sm.lock().unwrap();
     // The live rejoin point: advances over every frame walked (applied,
     // idempotently-skipped, or padding). Stays a frame boundary throughout.
-    let mut cursor = 0u64;
+    // `None` until a walked frame, an install or a start-set jump SETS it, so
+    // "never moved" cannot be confused with "moved to 0": a pass that moved
+    // nothing reports the cursor it was given (`instant.resume`), never 0 —
+    // which the caller would publish as `applied` and its follower cursor.
+    let mut cursor: Option<u64> = None;
     // Reused response scratch: replay never publishes (see the doc), so the
     // response bytes are written and dropped — one buffer for the whole pass.
     let mut scratch = Vec::with_capacity(256);
@@ -309,7 +315,7 @@ pub(crate) fn replay_into<S: RawStateMachine>(
                 &r.install,
             )? {
                 start_pos = at;
-                cursor = at;
+                cursor = Some(at);
             }
         }
     }
@@ -452,7 +458,7 @@ pub(crate) fn replay_into<S: RawStateMachine>(
                 // (`installed >= first`, so the journal's retained tail is a
                 // contiguous continuation — no hole.)
                 start_pos = installed;
-                cursor = installed;
+                cursor = Some(installed);
             }
             // A covering artifact exists but sits ABOVE the live target: the
             // journal's tail `[first, target]` cannot yet meet it. Not a gap —
@@ -699,7 +705,7 @@ pub(crate) fn replay_into<S: RawStateMachine>(
                         );
                     }
                 }
-                cursor = end;
+                cursor = Some(end);
                 frames_walked += 1;
                 off += aligned;
             }
@@ -726,12 +732,14 @@ pub(crate) fn replay_into<S: RawStateMachine>(
     // its end, so `straddle_at == cursor` means no byte between the last
     // applied frame and this one was skipped. Anything else falls back to
     // `Rejoin` and the caller's no-progress guard, as before.
-    if straddle_at == Some(cursor) {
-        return Ok(Replay::AwaitCommit(cursor));
+    if let Some(at) = straddle_at
+        && cursor == Some(at)
+    {
+        return Ok(Replay::AwaitCommit(at));
     }
     // Ruling R14: the same wait when the straddling frame is the FIRST one
     // the scan met — it starts exactly at `start_pos`, so the walk stopped
-    // before moving `cursor` off 0 (nightly 38011932517: an unforced pass
+    // before setting `cursor` at all (nightly 38011932517: an unforced pass
     // starting at the follower's cursor, R5, on a block based there). Safe
     // for the same reason: `start_pos` is `max(SM cursor, follower cursor)`
     // and every byte below the follower's cursor is already in the SM, so
@@ -742,11 +750,24 @@ pub(crate) fn replay_into<S: RawStateMachine>(
     // cannot straddle this one. A forced pass (`gap_above`) starts at
     // `sm_pos` too and, besides, meets F1's raised gap guard before any
     // scan (pinned by `a_forced_pass_never_takes_the_start_pos_straddle_wait`);
-    // after a jump or an install, `cursor == start_pos` and the #77 test
+    // after a jump or an install, `cursor == Some(start_pos)` and the #77 test
     // above already answered.
     if straddle_at == Some(start_pos) {
         return Ok(Replay::AwaitCommit(start_pos));
     }
+    // A pass that moved nothing — or whose walk ended below the cursor it was
+    // given — reports NO movement: `instant.resume`. Every frame below
+    // `resume` is already reflected in the state machine (R5), so a walked
+    // cursor below it is not a rejoin point but a journal that does not
+    // continue this row (a segment whose blocks all end below `resume`); the
+    // caller's no-progress guard turns `Rejoin(resume)` into the forced gap
+    // pass, measured from `resume`. Returning the local cursor instead
+    // rewound the follower and the slot's increase-only `applied` (to 0 on a
+    // zero-walk pass) and made the forced pass measure its gap from there.
+    let rejoin = match cursor {
+        Some(c) if c >= instant.resume => c,
+        _ => instant.resume,
+    };
     if frames_walked == 0 {
         // #82: a pass that walked nothing is what the caller's no-progress
         // guard turns into a gap. Say WHY on the one line a supervisor or a CI
@@ -756,10 +777,10 @@ pub(crate) fn replay_into<S: RawStateMachine>(
              journal_first={first} gap_above={gap_above:?} target={target} \
              sm_last_applied={:?} blocks_seen={blocks_seen} \
              first_block_base={first_block_base:?} straddle_at={straddle_at:?} \
-             returned_cursor={cursor}",
+             returned_cursor={rejoin}",
             instant.service_id,
             guard.last_applied(),
         );
     }
-    Ok(Replay::Rejoin(cursor))
+    Ok(Replay::Rejoin(rejoin))
 }
