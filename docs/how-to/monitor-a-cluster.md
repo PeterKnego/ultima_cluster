@@ -422,15 +422,17 @@ Since coordinated snapshot instants, a snapshot is something the whole cluster
 takes at one log position **P** on the leader's command
 ([the explainer](../notes/uc2-cluster-fsm-explained.md#instants-one-position-one-set)),
 and the purge floor moves only when the **complete set** at P is on disk.
-Thirteen families — the first eight are the coordinated-snapshot gauges and
-counters; the last five, added with the snapshot catalog (spec §9), are the
-replicated catalog's own view of that same set list:
+Sixteen families — eight coordinated-snapshot gauges and counters; three
+added with the snapshot lifecycle (`uc2_snapshot_auto_fetch_total`,
+`uc2_snapshot_newest_agreed_bytes`, `uc2_snapshot_wont_fit`); and the last
+five, added with the snapshot catalog (spec §9), the replicated catalog's own
+view of that same set list:
 
 | family | type | labels | meaning |
 |---|---|---|---|
 | `uc2_snapshot_instant_position` | gauge | none | the last **full** instant this node **commanded as leader**, `0` if never. Leader-local: a follower's reading is whatever it last commanded in some earlier term, so never compare it across instances. A `--standby` instant does **not** advance it — see the next row |
 | `uc2_snapshot_standby_instant_position` | gauge | none | the last **standby** instant this node's `uc2-cluster` agent *acted on*, `0` if never. **Learner-only**: a voter skips every standby frame by design, so a voter always reads `0`. This is the gauge to watch on a `snapshot.target = learners` cluster — the leader is a voter, so its own instant gauge and set position tell you nothing about whether the standby work is happening |
-| `uc2_snapshot_set_position` | gauge | none | the newest **complete set** this node holds — its purge floor once persisted. `0` until the first one. Agrees on a fully-fetched cluster; on a **learner-only** cluster voters legitimately read lower (they never fetch), so this is not the cluster-wide floor to alert on — that is `uc2_catalog_agreed_position`, below |
+| `uc2_snapshot_set_position` | gauge | none | the newest **complete set** this node holds — its purge floor once persisted. `0` until the first one. Agrees on a fully-fetched cluster; on a **learner-only** cluster a voter holds a set only once it has fetched it (`auto_fetch`, on by default, does so in the background), so voters legitimately read lower while a fetch is pending and stay lower with `[settings] auto_fetch = false` — this is not the cluster-wide floor to alert on — that is `uc2_catalog_agreed_position`, below |
 | `uc2_snapshot_fetched_position` | gauge | none | the position of the newest set this node fetched whole from another holder — a voter's automatic fetch or a manual `uc2ctl snapshot fetch` — `0` if it never has |
 | `uc2_snapshot_auto_fetch_total` | counter | `outcome` | background fetches of the newest agreed set: `ok`, `refused`, `timeout`, `no_space`, `no_holder` (snapshot lifecycle). A rising `no_space` means this node cannot hold the newest set — see `Uc2SnapshotWontFit`. Flat at 0 with `[settings] auto_fetch = false`. A node logs `snapshot_fetch_single_reporter` (warn) once for a set that only one node reported |
 | `uc2_snapshot_newest_agreed_bytes` | gauge | none | the newest agreed set's total size; 0 when none is agreed or its size is unknown (a set catalogued before sizes) |
@@ -445,7 +447,7 @@ replicated catalog's own view of that same set list:
 | `uc2_catalog_stalled` | gauge | none | listed sets still `Commanded` — commanded instants not yet complete. No timeout is applied; a persistent nonzero reading is the signal, the same shape as `Uc2SnapshotStalled` |
 | `uc2_catalog_diverged` | gauge | none | row entries reading `Diverged` or `NoMajority`, summed across every listed set. Nonzero means some row's artifact hashes did not agree. Alert: `Uc2SnapshotSetDiverged`, re-sourced to this gauge — see below |
 
-The last three are a **stand-in for a histogram**: this exposition encoder has
+The three `uc2_snapshot_freeze_seconds_*` families are a **stand-in for a histogram**: this exposition encoder has
 no histogram type, so a max gauge plus a sum/count pair carries the
 distribution's shape (`_sum / _count` is the mean, `_max` the tail). All three
 are derived from the cnc slot's `freeze_ns` word once per **scrape**, never
