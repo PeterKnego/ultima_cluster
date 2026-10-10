@@ -173,7 +173,9 @@ pub fn op_name(op: u32) -> &'static str {
 }
 
 /// One audit record. Borrowed throughout — a record is formatted and written
-/// synchronously at the call site, never queued.
+/// synchronously at the call site, never queued (an auto-fetch record is
+/// queued as plain [`AutoFetchAudit`] data and built on the writer, ruling
+/// R15).
 #[derive(Debug)]
 pub struct AuditRecord<'a> {
     /// Unix nanoseconds (`crate::obs::metrics::now_unix_ns`).
@@ -256,7 +258,9 @@ pub const SOURCE_AUTO: &str = "auto";
 pub const AUDIT_OP_ROW_GENESIS: u32 = 100;
 
 /// The append-only admin audit file. Opened once at node start and owned by
-/// the consensus agent (the only writer).
+/// the consensus agent; the one other writer is the `uc2-holdings` thread's
+/// [`AutoFetchAuditWriter`] (ruling R15), through a [`AuditLog::try_clone`]
+/// handle — `O_APPEND`, so the two interleave whole lines.
 #[derive(Debug)]
 pub struct AuditLog {
     file: File,
@@ -306,9 +310,9 @@ impl AuditLog {
         let fields = fields(r, addr.as_deref());
         let line = format_line_at(r.ts_ns as u128, None, "admin_op", &fields);
         // One `write_all` under `O_APPEND`: the offset is taken by the kernel
-        // at write time, so records from a concurrent appender (there is
-        // none today — the consensus agent is the only writer — but a
-        // `uc2ctl` verb could become one) interleave whole, never mid-line.
+        // at write time, so records from a concurrent appender (the
+        // `uc2-holdings` thread's auto-fetch writer, ruling R15) interleave
+        // whole, never mid-line.
         // A write that FAILS partway can still leave a line without its
         // trailing `\n`; that is the recognizable signature of the failure
         // this `?` reports, and the request it belongs to is refused rather
@@ -318,6 +322,158 @@ impl AuditLog {
         self.file.sync_data()?;
         crate::obs::log::emit(LogLevel::Info, "admin_op", &fields);
         Ok(())
+    }
+
+    /// A second handle on the same append-only file (`O_APPEND` shared, so a
+    /// record from either handle lands whole at the end). Used once at node
+    /// start for [`AutoFetchAuditWriter`], the off-agent writer.
+    pub fn try_clone(&self) -> std::io::Result<AuditLog> {
+        Ok(AuditLog {
+            file: self.file.try_clone()?,
+            path: self.path.clone(),
+        })
+    }
+}
+
+/// Snapshot-lifecycle final review I1 (ruling R15): how many auto-fetch audit
+/// records may wait between the consensus agent's issue and the
+/// `uc2-holdings` thread's drain. Auto-fetches are issued at most one at a
+/// time per node, with a 60 s timeout between retries of one target, and the
+/// writer drains every 50 ms — so a full queue means the writer is stuck, not
+/// that the rate is high.
+pub const AUTO_FETCH_AUDIT_QUEUE: usize = 16;
+
+/// The varying fields of one auto-fetch audit record (spec §6's
+/// `snapshot_fetch`, op 9, `actor = "auto"`). Plain data, so the consensus
+/// agent hands it over with no allocation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AutoFetchAudit {
+    /// Unix nanoseconds at the issue (taken on the consensus agent, so the
+    /// record's time is the fetch's, not the drain's).
+    pub ts_ns: u64,
+    /// The holder asked (the record's `id`).
+    pub from: u32,
+    /// The set's position (the record's `config_version`).
+    pub position: u64,
+}
+
+impl AutoFetchAudit {
+    /// The record, field for field what the consensus agent wrote inline
+    /// before ruling R15 moved the write off it.
+    pub fn record(&self) -> AuditRecord<'static> {
+        AuditRecord {
+            ts_ns: self.ts_ns,
+            actor: SOURCE_AUTO,
+            origin: AuditOrigin::Local,
+            op: 9,
+            op_name: op_name(9),
+            id: self.from,
+            addr: None,
+            seq: 0,
+            nonce: 0,
+            outcome: AuditOutcome::Accepted,
+            reason: 0,
+            config_version: self.position,
+            detail: None,
+            source: SOURCE_AUTO,
+        }
+    }
+}
+
+/// Ruling R15: the consensus agent's half of the auto-fetch audit hand-off.
+/// [`Self::push`] never blocks, never allocates and does no file I/O: the
+/// bounded channel's slots are allocated once, here. An audit log must not
+/// lose records silently, so a full queue drops the NEW record and counts it;
+/// the writer names the count on its next drain.
+#[derive(Debug)]
+pub struct AutoFetchAuditQueue {
+    tx: std::sync::mpsc::SyncSender<AutoFetchAudit>,
+    dropped: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl AutoFetchAuditQueue {
+    /// Hand one record to the writer; `false` if the queue was full (or the
+    /// writer is gone) and the record was dropped and counted.
+    pub fn push(&self, r: AutoFetchAudit) -> bool {
+        match self.tx.try_send(r) {
+            Ok(()) => true,
+            Err(_) => {
+                self.dropped
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                false
+            }
+        }
+    }
+}
+
+/// Ruling R15: the `uc2-holdings` thread's half — writes and `sync_data`s
+/// each queued record through [`AuditLog::record`] (the same line, the same
+/// `info` mirror), off the consensus agent.
+#[derive(Debug)]
+pub struct AutoFetchAuditWriter {
+    rx: std::sync::mpsc::Receiver<AutoFetchAudit>,
+    dropped: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    log: AuditLog,
+    node: u32,
+}
+
+/// Ruling R15: the bounded hand-off between the consensus agent (which
+/// issues auto-fetches) and the thread that records them in `log`.
+pub fn auto_fetch_audit_channel(
+    log: AuditLog,
+    node: u32,
+) -> (AutoFetchAuditQueue, AutoFetchAuditWriter) {
+    let (tx, rx) = std::sync::mpsc::sync_channel(AUTO_FETCH_AUDIT_QUEUE);
+    let dropped = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    (
+        AutoFetchAuditQueue {
+            tx,
+            dropped: std::sync::Arc::clone(&dropped),
+        },
+        AutoFetchAuditWriter {
+            rx,
+            dropped,
+            log,
+            node,
+        },
+    )
+}
+
+impl AutoFetchAuditWriter {
+    /// Write every queued record; first name any records dropped since the
+    /// last drain (`Warn admin_audit_dropped count=`). A failed write is the
+    /// same loud `admin_audit_failed` the inline write emitted — there is no
+    /// answer to withhold. Returns the records written.
+    pub fn drain(&mut self) -> usize {
+        let dropped = self.dropped.swap(0, std::sync::atomic::Ordering::Relaxed);
+        if dropped != 0 {
+            crate::obs_event!(
+                Warn,
+                "admin_audit_dropped",
+                node = self.node as u64,
+                op = 9u64,
+                count = dropped
+            );
+        }
+        let mut n = 0;
+        while let Ok(r) = self.rx.try_recv() {
+            if let Err(e) = self.log.record(&r.record()) {
+                let err = e.to_string();
+                crate::obs_event!(
+                    Error,
+                    "admin_audit_failed",
+                    node = self.node as u64,
+                    seq = 0u64,
+                    nonce = 0u64,
+                    op = 9u64,
+                    status = 0u64,
+                    err = err.as_str(),
+                );
+            } else {
+                n += 1;
+            }
+        }
+        n
     }
 }
 

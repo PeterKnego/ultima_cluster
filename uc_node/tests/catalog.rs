@@ -2014,15 +2014,25 @@ fn learner_only_voters_auto_fetch_the_agreed_set_and_purge_below_it() {
             &format!("voter {v} counted its fetch ok"),
             || metric_labeled(c.node(v), "uc2_snapshot_auto_fetch_total", "outcome=\"ok\"") >= 1,
         );
-        // Causally safe to read once: `audit_auto_fetch` writes (and fsyncs)
-        // this record on the consensus agent right after the fetch is ISSUED,
-        // and the fetch has since landed (set >= p, awaited above) — so the
-        // record was on disk before anything this test waited on happened.
-        let audit = std::fs::read_to_string(c.dir(v).join("audit.jsonl")).unwrap_or_default();
-        assert!(
-            audit.lines().any(|l| l.contains("\"actor\":\"auto\"")
-                && l.contains("\"op_name\":\"snapshot_fetch\"")),
-            "voter {v}: no auto snapshot_fetch audit record:\n{audit}"
+        // Awaited, not read once: since ruling R15 the consensus agent only
+        // ENQUEUES this record at the issue; the `uc2-holdings` thread writes
+        // and fsyncs it on its next wake (50 ms), so it is not causally
+        // ordered before the fetch landing this test waited on.
+        let audit_path = c.dir(v).join("audit.jsonl");
+        let has_auto = || {
+            std::fs::read_to_string(&audit_path)
+                .unwrap_or_default()
+                .lines()
+                .any(|l| {
+                    l.contains("\"actor\":\"auto\"") && l.contains("\"op_name\":\"snapshot_fetch\"")
+                })
+        };
+        await_or_dump(
+            &c,
+            p,
+            10,
+            &format!("voter {v}: an auto snapshot_fetch audit record"),
+            has_auto,
         );
     }
     let p_text = p.to_string();

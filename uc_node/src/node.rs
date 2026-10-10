@@ -2030,10 +2030,16 @@ impl Node {
         let probe_base = std::time::Instant::now();
         let probe_cnc = Arc::clone(&cnc);
         let probe_first_base = Arc::clone(&archive_first_base);
+        // Ruling R15 (final review I1): the auto-fetch audit record's write
+        // and `sync_data` run on this thread, not the consensus agent, which
+        // only enqueues. A second handle on the one `O_APPEND` file.
+        let (auto_fetch_audit, mut auto_fetch_audit_writer) =
+            crate::audit::auto_fetch_audit_channel(audit.try_clone()?, cfg.id);
         let holdings_runner = AgentRunner::spawn(
             "uc2-holdings",
             IdleStrategy::Sleep(HOLDINGS_THREAD_SLEEP),
             move || {
+                auto_fetch_audit_writer.drain();
                 holdings_probe.maybe_probe(
                     probe_base.elapsed().as_nanos() as u64,
                     probe_cnc.counters().durable.load_acquire(),
@@ -2539,6 +2545,7 @@ impl Node {
             start_set_recomputes: 0,
             auto_fetch: crate::auto_fetch::AutoFetch::new(cfg.id),
             auto_fetch_stats: Arc::clone(&auto_fetch_stats),
+            auto_fetch_audit,
             soft_wire: Arc::clone(&soft_wire),
             soft_stale_ns: SOFT_STALE_FACTOR * cfg.election_timeout_max_ns,
         };
@@ -3886,7 +3893,9 @@ struct Consensus {
     /// than re-allocated out of `CncPage::try_meta()` on every request.
     admin_app_id: String,
     /// M12b (spec §5.3): the append-only admin audit file, opened at node
-    /// start and written by this agent alone. Every admin request's answer is
+    /// start and written by this agent (the one exception: the auto-fetch
+    /// record, which the `uc2-holdings` thread writes through a cloned
+    /// handle — ruling R15). Every admin request's answer is
     /// recorded here — with an fsync — BEFORE that answer is published; a
     /// record that fails to write turns the request into a
     /// [`REASON_AUDIT_FAILED`] refusal. The ONE exception is a byte-identical
@@ -4184,6 +4193,10 @@ struct Consensus {
     auto_fetch: crate::auto_fetch::AutoFetch,
     /// `uc2_snapshot_auto_fetch_total{outcome}` — shared with `ObsSources`.
     auto_fetch_stats: Arc<crate::auto_fetch::AutoFetchStats>,
+    /// Ruling R15 (final review I1): the hand-off that carries each issued
+    /// auto-fetch's `actor = "auto"` audit record to the `uc2-holdings`
+    /// thread, which writes and fsyncs it — never this agent.
+    auto_fetch_audit: crate::audit::AutoFetchAuditQueue,
     /// The sender's `STATUS` map — a LEADER's live holders (plan ruling P1).
     soft_wire: Arc<Mutex<SoftTableWire>>,
     /// [`Node::soft_stale_ns`]'s value, for the holder query.
@@ -10792,36 +10805,20 @@ impl Consensus {
     /// — written AFTER the issue, like `audit_datagram_mtu`, for its reason:
     /// no request is waiting on an answer. `id` names the holder asked,
     /// `config_version` the position.
+    ///
+    /// Ruling R15 (final review I1): only ENQUEUED here — no file I/O on the
+    /// consensus agent. Unlike the discovery record (a handful per cluster
+    /// life), this one recurs once per agreed instant on every voter, the
+    /// leader included, so its `sync_data` would be a per-instant commit
+    /// stall. The `uc2-holdings` thread writes and fsyncs it within ~50 ms
+    /// ([`crate::audit::AutoFetchAuditWriter::drain`]); a full queue drops
+    /// the record, counts it, and the writer names the count.
     fn audit_auto_fetch(&mut self, from: NodeId, position: u64) {
-        let rec = AuditRecord {
+        self.auto_fetch_audit.push(crate::audit::AutoFetchAudit {
             ts_ns: crate::obs::metrics::now_unix_ns(),
-            actor: crate::audit::SOURCE_AUTO,
-            origin: AuditOrigin::Local,
-            op: 9,
-            op_name: op_name(9),
-            id: from,
-            addr: None,
-            seq: 0,
-            nonce: 0,
-            outcome: AuditOutcome::Accepted,
-            reason: 0,
-            config_version: position,
-            detail: None,
-            source: crate::audit::SOURCE_AUTO,
-        };
-        if let Err(e) = self.audit.record(&rec) {
-            let err = e.to_string();
-            crate::obs_event!(
-                Error,
-                "admin_audit_failed",
-                node = self.id as u64,
-                seq = 0u64,
-                nonce = 0u64,
-                op = 9u64,
-                status = 0u64,
-                err = err.as_str(),
-            );
-        }
+            from,
+            position,
+        });
     }
 
     /// Retire a pending fetch once it has landed (the receiver published a
@@ -13606,6 +13603,9 @@ mod tests {
         _cfg_obs_tx: mpsc::SyncSender<(u64, Vec<u8>)>,
         _ingress_tx: mpsc::SyncSender<Ingress>,
         _trunc_rx: mpsc::Receiver<ArchiveCmd>,
+        /// Ruling R15: the `uc2-holdings` thread's half of the auto-fetch
+        /// audit hand-off — a test drains it to stand in for that thread.
+        auto_fetch_audit_writer: crate::audit::AutoFetchAuditWriter,
         _dir: tempfile::TempDir,
     }
 
@@ -14090,6 +14090,8 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
         );
 
+        let (auto_fetch_audit, auto_fetch_audit_writer) =
+            crate::audit::auto_fetch_audit_channel(AuditLog::open(dir.path()).unwrap(), 1);
         let mut cons = Consensus {
             reports_unattested: Arc::new(AtomicU64::new(0)),
             validated_frontier: Arc::new(AtomicU64::new(u64::MAX)),
@@ -14303,6 +14305,7 @@ mod tests {
             start_set_recomputes: 0,
             auto_fetch: crate::auto_fetch::AutoFetch::new(1),
             auto_fetch_stats: Arc::new(Default::default()),
+            auto_fetch_audit,
             soft_wire: Arc::new(Mutex::new(SoftTableWire::new())),
             soft_stale_ns: SOFT_STALE_FACTOR * 300,
         };
@@ -14327,6 +14330,7 @@ mod tests {
             _cfg_obs_tx: cfg_obs_tx,
             _ingress_tx: ingress_tx,
             _trunc_rx: trunc_rx,
+            auto_fetch_audit_writer,
             _dir: dir,
         }
     }
@@ -25263,6 +25267,87 @@ mod tests {
             text.matches("snapshot_fetch_single_reporter").count(),
             1,
             "named once per set: {text}"
+        );
+    }
+
+    /// Ruling R15 (final review I1): issuing an auto-fetch does NO file I/O
+    /// on the consensus agent — the audit file is byte-identical after the
+    /// issuing pass — and the record the `uc2-holdings` writer drains is the
+    /// same `snapshot_fetch` line, field for field, the inline write made.
+    #[test]
+    fn an_auto_fetch_audit_record_is_enqueued_on_the_pass_and_written_by_the_drain() {
+        let mut h = harness_with_rows(&["a"]);
+        let mut e = agreed_entry(1000);
+        e.kind = uc_protocol::v2::catalog::SetKind::Standby;
+        let mut st = h.cons.cluster_view.to_state();
+        st.reports = vec![SnapshotReport {
+            row: 0,
+            position: 1000,
+            hashes: vec![(0, e.rows[0].hash, 1)],
+        }];
+        h.cons.cluster_view.publish(&st);
+        auto_fetch_on(&mut h, vec![e]);
+        let path = h.cons.audit.path().to_path_buf();
+        let before = std::fs::read(&path).unwrap();
+        let mut t = 10_000_000_000u64;
+        while h.cons.pending_fetch.is_none() {
+            assert!(t < 100 * 10_000_000_000, "no auto fetch was ever issued");
+            h.cons.pass_now_ns = t;
+            h.cons.maybe_auto_fetch();
+            t += 10_000_000_000;
+        }
+        let from = h.cons.pending_fetch.unwrap().learner;
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "the issuing pass wrote nothing to audit.jsonl"
+        );
+        assert_eq!(h.auto_fetch_audit_writer.drain(), 1, "one record queued");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let line = text.lines().last().expect("the drained record");
+        let expected = format!(
+            "\"event\":\"admin_op\",\"actor\":\"auto\",\"origin\":\"local\",\"op\":9,\
+             \"op_name\":\"snapshot_fetch\",\"id\":{from},\"addr\":null,\"seq\":0,\"nonce\":0,\
+             \"outcome\":\"accepted\",\"reason\":0,\"config_version\":1000,\"detail\":null,\
+             \"source\":\"auto\"}}"
+        );
+        assert!(line.ends_with(&expected), "{line}\n  vs ...{expected}");
+        assert_eq!(h.auto_fetch_audit_writer.drain(), 0, "drained once");
+    }
+
+    /// Ruling R15: a full hand-off never blocks the consensus agent and never
+    /// loses a record silently — the overflow is dropped, counted, and named
+    /// (`admin_audit_dropped count=`) on the writer's next drain.
+    #[test]
+    fn a_full_auto_fetch_audit_queue_drops_counts_and_names_the_overflow() {
+        use crate::audit::{AUTO_FETCH_AUDIT_QUEUE, AutoFetchAudit};
+        let _obs = obs_capture_lock();
+        let mut h = harness_with_rows(&["a"]);
+        for k in 0..AUTO_FETCH_AUDIT_QUEUE + 3 {
+            let queued = h.cons.auto_fetch_audit.push(AutoFetchAudit {
+                ts_ns: 1,
+                from: 2,
+                position: k as u64,
+            });
+            assert_eq!(queued, k < AUTO_FETCH_AUDIT_QUEUE, "record {k}");
+        }
+        let cap = ObsCapture::take();
+        let buf = cap.buf();
+        assert_eq!(h.auto_fetch_audit_writer.drain(), AUTO_FETCH_AUDIT_QUEUE);
+        let text = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(
+            text.lines()
+                .any(|l| l.contains("\"admin_audit_dropped\"") && l.contains("\"count\":3")),
+            "{text}"
+        );
+        let file = std::fs::read_to_string(h.cons.audit.path()).unwrap();
+        assert_eq!(file.lines().count(), AUTO_FETCH_AUDIT_QUEUE);
+        assert_eq!(h.auto_fetch_audit_writer.drain(), 0);
+        let again = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert_eq!(
+            again.matches("admin_audit_dropped").count(),
+            1,
+            "the count is named once, then reset"
         );
     }
 
