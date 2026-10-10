@@ -494,8 +494,11 @@ curl -s http://hostN:9600/metrics | grep uc2_snapshot_hash_mismatch
 is the upgrade done.
 
 **That instant also completes the pin.** A pin is complete once the catalog
-lists an agreed set that the `to` line built above the pin record — the
-instant above, once it agrees. From then on the row is back to normal start
+lists an agreed set above the pin record, on the `to` line — the instant
+above, once it agrees. (For a pin that changes the line only a `to` build can
+freeze above the record; for a `--patch` pin an old same-line build's set
+counts too.) Each node then releases the origin once it holds that set — its
+own freeze or an auto-fetch — and its `to` instance has caught up to it. From then on the row is back to normal start
 and retention: a restarting service starts from that set instead of
 re-installing the origin, and the origin's set is retired like any other,
 with the floor and the journal purge free to move past it. Until then every
@@ -600,10 +603,10 @@ stop the services.
 
 One more consequence of abandoning a pinned upgrade: a node **holds its
 snapshot/purge floor at the pinned origin** until the pin is complete (an
-agreed set the `to` line built above the pin record — step 7's instant) and
-released there (the row consumed on that node: attached on the pin's `to`
-line, a patch build counts, **and** replayed past the cut; or the node holds
-that completion set), and logs `snapshot_floor_held_for_pin` while it holds.
+agreed set above the pin record, on the `to` line — step 7's instant) and
+released there (the node holds that completion set and no `to` instance
+attached there is still replaying below it), and logs
+`snapshot_floor_held_for_pin` while it holds.
 A pin placed and then left alone holds the journal at that origin
 **indefinitely** — there is no bound and no alert on the hold. Clear it by
 finishing the upgrade (every instance on `to`, then an instant that agrees)

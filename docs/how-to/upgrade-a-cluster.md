@@ -845,11 +845,16 @@ The two added steps are not optional:
 - **Take an instant AFTER the swap — it completes the pin.** Once every
   instance of the row runs `to` and has caught up, run `uc2ctl snapshot`.
   When that set AGREES (`uc2_snapshot_hash_mismatch` reads `0`; the catalog
-  lists it agreed) the pin is **complete**: an agreed set the `to` line
-  built above the pin record. From then on the row is back to normal — a
-  restarting service starts from that set (the node's start set) instead of
-  re-installing the origin, and the origin's set is released to ordinary
-  retention, with the floor and the journal purge free to move past it.
+  lists it agreed) the pin is **complete**: the catalog lists an agreed set
+  above the pin record, on the `to` line. (For a cross-line pin only a `to`
+  build can freeze above the record — the old one stopped there. For a
+  `--patch` pin an old same-line build's set counts too, by the line
+  contract.) From then on the row is back to normal — a restarting service
+  starts from that set (the node's start set) instead of re-installing the
+  origin, and the origin's set is released to ordinary retention, with the
+  floor and the journal purge free to move past it. Each node releases once
+  it **holds** that set (its own freeze, or an auto-fetch) and any `to`
+  instance attached there has caught up to it.
   **Until the pin completes, every node keeps the origin's set and holds its
   journal at the origin**, because any instance not yet upgraded still has
   to install the origin and replay from it; `snapshot_floor_held_for_pin`
@@ -887,7 +892,7 @@ then and the swap. If a node's purge floor has already advanced past the
 pinned origin by the time a v_new binary attaches, `install_snapshot` cannot
 land at `origin` at all — the journal below the floor is gone — and the
 attach path fail-stops rather than refusing cleanly by name. In practice the
-node holds its floor at any pinned origin it has not yet consumed
+node holds its floor at any pinned origin it has not yet released
 (`snapshot_floor_held_for_pin`, below) precisely to keep this from happening
 on the node that did the pinning. It stays a real risk for any node whose own
 floor can be above the origin when the pin lands, and that is **not only the
@@ -900,11 +905,12 @@ on every node, not just the laggards.
 
 **A pinned-but-abandoned upgrade holds the journal indefinitely.** A node
 holds its snapshot/purge floor at a row's pinned origin until the pin is
-**complete** — the catalog lists an agreed set the `to` line built above the
-pin record, which takes every instance upgraded and one instant after — **and**
-the pin is released on that node: the row is consumed there (attached on
-the pin's `to` line, a patch build of `to` counts, **and** replayed past the
-cut, not merely attached) or the node holds that completion set. `snapshot_floor_held_for_pin` (an `Info` obs
+**complete** — the catalog lists an agreed set above the pin record, on the
+`to` line: for a cross-line pin, an instant taken after enough instances run
+`to` to agree on it; for a `--patch` pin an old same-line build's set counts
+too — **and** the pin is released on that node: the node holds that
+completion set (its own freeze, or an auto-fetch) and no `to` instance
+attached there (a patch build of `to` counts) is still replaying below it. `snapshot_floor_held_for_pin` (an `Info` obs
 event, fields `node`, `position` the held floor, `candidate` the floor the
 node would otherwise publish) names the hold whenever it is in effect. An
 operator who pins an origin and then never swaps the binary — an abandoned

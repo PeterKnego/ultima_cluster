@@ -466,10 +466,10 @@ execution ledger (PF = pre-flight, R = execution rulings).
     once and the row view re-read after it; a view that moved between the
     two reads is refused `PinUnreadable` (retry). Overrun recovery applies
     the same rule (`start_set_permitted` takes the pair it judged).
-  - **C3 — release.** A row's pin is released on a node only when it is
-    COMPLETE and, locally, the row is consumed there (attached on `to`'s
-    line and replayed past the candidate floor, the B2 T5 rule) or the node
-    holds a completion set. Before release EVERY node keeps the origin's set
+  - **C3 — release** (local condition superseded by C7 below). A row's pin
+    is released on a node only when it is COMPLETE and, locally, the row is
+    consumed there (attached on `to`'s line and replayed past the candidate
+    floor, the B2 T5 rule) or the node holds a completion set. Before release EVERY node keeps the origin's set
     and holds the floor and journal purge at the origin
     (`snapshot_floor_held_for_pin`); after it, normal retention and the
     normal floor apply. The cluster FSM's retention stops protecting a
@@ -480,6 +480,27 @@ execution ledger (PF = pre-flight, R = execution rulings).
     toward `retain_sets`) holds only while the pin is incomplete. Cost,
     accepted by the maintainer: a cluster that never takes an instant after
     an upgrade grows its journal without bound.
+  - **C7 — release needs a held completion set (supersedes C3's local
+    condition; review I1, m1).** A node releases a pin (journal hold AND
+    pruner keep) iff the pin is complete, this node HOLDS a completion set at
+    or below `min(commit, durable)`, and the row is not attached on `to`'s
+    line with `applied` below that set. "Consumed" alone no longer releases:
+    a consumed node with no completion set can restart its row only through
+    the pinned install, so it keeps the origin and its journal until it
+    holds one (its own freeze or an auto-fetch). The `applied` guard keeps a
+    pinned install's in-flight tail replay from being purged under.
+  - **C8 — three refinements (review m2–m4).** (m2) Completion is an agreed
+    set above the pin record on `to`'s line. For a `--patch` (same-line) pin
+    an old same-line build is not stopped at the record, so a set it froze
+    counts — sound by the line contract alone; C4's exact-stop argument (a
+    durable cursor above the record was computed by `to`) covers cross-line
+    pins only. (m3) The attach's view re-read and its `PinUnreadable`
+    refusal run only for a pinned row; an unpinned attach gets no new
+    refusal. (m4) Release is not monotone — a row that stops being declared
+    in newer sets turns `pin_complete` false again, and a detach can drop the
+    local condition — so `hold_floor_for_pins` clamps its result to at least
+    the persisted floor: the floor stays increase-only and
+    `snapshot_floor_held_for_pin` never names a position below it.
   - **C6 — images and `record_pos`.** v3+ cluster images carry each row's
     exact running `record_pos` (the `running` blob), so an installed replica
     judges completion exactly as a walked one (regression tests in

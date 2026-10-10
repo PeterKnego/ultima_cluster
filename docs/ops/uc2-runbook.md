@@ -310,9 +310,12 @@ transport setting, both measured closed-loop at inflight 1 on 8-vCPU
   set is published for a pinned row; until then the pin's origin wins.
 - **Completing an upgrade pin.** After upgrading every instance of a pinned
   row, take an instant (`uc2ctl snapshot`). Once it agrees, the pin is
-  complete: the row resumes normal start (from that set) and normal
-  retention, and the origin's set is released — retired by the catalog and
-  pruned on each node that has consumed the pin or holds the completion set.
+  complete — an agreed set above the pin record, on the `to` line (for a
+  `--patch` pin an old same-line build's set counts too): the row resumes
+  normal start (from that set) and normal retention, and the origin's set is
+  released — retired by the catalog, and pruned on each node once that node
+  holds the completion set (its own freeze or an auto-fetch) and its `to`
+  instance has caught up to it.
   Until then **every** node keeps the origin's set and holds its journal at
   the origin (`snapshot_floor_held_for_pin`), because an instance not yet
   upgraded still has to install the origin and replay from it; a cluster
