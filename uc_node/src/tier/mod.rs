@@ -1,7 +1,9 @@
 //! Backup tier (spec `2026-10-10-uc2-backup-tier-design.md`): the off-node
 //! copy of the cluster's agreed history — format, target, chain, retention,
 //! the `uc2-backup` writer and the offline restore builder.
+pub mod layout;
 pub mod object;
+pub mod target;
 
 #[derive(Debug, thiserror::Error)]
 pub enum TierError {
