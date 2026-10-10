@@ -1053,6 +1053,15 @@ and a v1–v3 settings record reads `auto_fetch = true`. Nothing on disk is
 cleared. A dev cluster built from `main` between the catalog merge and this
 change must also stop every node: a 24-byte report is refused by length.
 
+**A pinned row in a pre-#33 (v1/v2) cluster image.** Such an image has no
+running-version blob, so installing it restores a pin's record position as
+the image's `applied` position (at or above the true one). Pin completion
+(an agreed set above the pin record) is still judged identically on every
+node: sets formed after the flag day lie above that position on every node.
+The only residual is a cluster where one node installs a v1/v2 image while
+another walks the same span from genesis — the two could retire the pinned
+origin differently. Clear `snapshots/cluster/` on every node or on none.
+
 **Before stopping: take one full instant and line the artifacts up.** Run
 `uc2ctl snapshot` (not `--standby`) right before the window, wait for it to
 complete, and confirm every node's newest `snapshots/cluster/snap-*.ultcluster`

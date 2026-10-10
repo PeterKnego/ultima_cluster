@@ -480,3 +480,11 @@ execution ledger (PF = pre-flight, R = execution rulings).
     toward `retain_sets`) holds only while the pin is incomplete. Cost,
     accepted by the maintainer: a cluster that never takes an instant after
     an upgrade grows its journal without bound.
+  - **C6 — images and `record_pos`.** v3+ cluster images carry each row's
+    exact running `record_pos` (the `running` blob), so an installed replica
+    judges completion exactly as a walked one (regression tests in
+    `cluster_fsm.rs`). A pre-#33 (v1/v2) image restores a pin's record
+    position as the image's `applied`; sets formed after the flag day lie
+    above it on every node, so completion is judged identically. Accepted
+    residual: one node installs a v1/v2 image while another walks the same
+    span from genesis — clear `snapshots/cluster/` on every node or none.
