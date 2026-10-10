@@ -300,7 +300,7 @@ Refused by name, with the reason code the CLI prints:
 | 56 | `pin_digest` | the staged pin file's digest is not the one the request signed: a different file was staged than was signed, or it changed in between. Re-run `upgrade pin` |
 | 57 | `pin_missing` | no staged pin file on this node. Either `upgrade pin` was run against a different instance directory, or a successful apply already consumed it |
 | 58 | `pin_decode` | the staged file is not a decodable 20-byte `UpgradePin` record |
-| 61 | `pin_origin_not_agreed` | `--origin` is complete on this node but the snapshot catalog has not agreed it yet (reports take up to ~5 s after the instant). Wait for the origin's set to agree (`uc2_catalog_agreed_position` reaches P), or pick an agreed origin; it never agrees if the set diverged — then take a new instant. On a cluster with no complete set yet the pin is allowed unchecked |
+| 61 | `pin_origin_not_agreed` | `--origin` is complete on this node but the snapshot catalog has not agreed it yet (reports take up to ~5 s after the instant). Wait for that set to agree (`uc2_catalog_agreed_position` reaches P), or take a new instant (`uc2ctl snapshot`) and pin that; a set that diverged never agrees. (54 accepts only this node's newest complete set, so an older agreed origin is not a way out.) On a cluster with no complete set yet the pin is allowed unchecked |
 
 Every outcome — accepted or refused — is recorded in `audit.jsonl` as
 `upgrade_pin`.

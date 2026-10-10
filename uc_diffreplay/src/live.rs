@@ -189,7 +189,10 @@ fn admin_request(
 /// and only those are retried until `timeout`: status 2 (the ordinary
 /// single-in-flight retry), reason 54 `pin_no_set`, which compares
 /// `origin` against the node's NEWEST complete set — published by the cluster
-/// agent a moment after the row's own artifact appears. Every other refusal
+/// agent a moment after the row's own artifact appears, and reason 61
+/// `pin_origin_not_agreed` (the catalog agrees the set a moment after the
+/// instant; a diverged set never does, so it ends in a named error at
+/// `timeout`). Every other refusal
 /// returns `Err` immediately, naming its status and reason, instead of being
 /// re-sent for the whole timeout and then reported as one.
 pub fn pin_row(

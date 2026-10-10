@@ -244,7 +244,7 @@ refused by length, like any mixed flag day).
 | Many instants in a burst | one fetch per node at a time, chasing the newest |
 | Not enough space | `no_space`, obs event, alert; no download |
 | Disk fills anyway (another writer) | today's ENOSPC fail-stop |
-| Pin origin not agreed yet | refusal 61; retry after agreement |
+| Pin origin not agreed yet | refusal 61; wait for that set to agree, or take a new instant and pin that (a diverged set never agrees) |
 | Empty catalog | start rule and pin door keep today's behaviour |
 
 ## 11. Proof
