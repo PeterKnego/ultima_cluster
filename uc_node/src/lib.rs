@@ -68,6 +68,7 @@ pub mod preflight;
 mod read_round;
 pub mod recovery;
 pub mod services;
+pub mod tier;
 pub(crate) mod timers;
 
 /// Catalog spec §4.4: the soft per-node holdings table, re-exported so the

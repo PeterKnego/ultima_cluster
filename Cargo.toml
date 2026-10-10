@@ -48,6 +48,7 @@ memmap2 = "0.9"
 parking_lot = "0.12"
 page_size = "0.6"
 crc32fast = "1"
+zstd = { version = "0.13", default-features = false }
 fs2 = "0.4"
 rand = "0.9"
 
