@@ -2582,7 +2582,12 @@ mod tests {
                     .unwrap_or_default()
             });
             let _ = tx.send(());
-            (msg, st.follower.cursor, st.replay_stalled, st.cnc)
+            (
+                msg,
+                st.follower.cursor,
+                st.replay_stalled,
+                Arc::clone(&st.cnc),
+            )
         });
         rx.recv_timeout(std::time::Duration::from_secs(10))
             .expect("apply_cycle never returned");
