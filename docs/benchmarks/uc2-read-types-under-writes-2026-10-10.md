@@ -198,3 +198,11 @@ What that does to the bars:
    2026-09-17), at the cost of a core per service. This run left it unset
    (the default ladder, 50 µs sleep rung), as a deployment would; the
    2026-10-07 local smoke showed `spin` lifting read-only reads about 6×.
+
+## Follow-up (2026-10-10, appended after the results above)
+
+The read-only idle cap is fixed on branch `fix/query-drain-progress`:
+`apply_cycle` now counts answered queries as progress. Fleet A/B in
+[`uc2-query-drain-progress-2026-10-10.md`](uc2-query-drain-progress-2026-10-10.md):
+read-only reads rose 3.8–5.6× on every arm. The numbers above were measured
+before the fix and stand as recorded.
