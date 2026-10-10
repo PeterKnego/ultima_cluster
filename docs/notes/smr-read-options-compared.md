@@ -139,10 +139,16 @@ Checked against the code on 2026-10-07:
   for a WAN or cross-region deployment, where each probe is a full wide-area
   round trip, and only as its own project. Keeping it out preserves a UC-wide
   property: **clocks drive liveness, never safety.**
-- **Not offered today:** session tokens (I), time-addressed reads (H; `query`
-  gets no `time_ns` by design) and historical reads at a position (L). UC
-  addresses everything by byte position, so I would be cheap to build: the token
-  is a position the client already learns from its write's response.
+- **Session tokens (I) are implemented** as read-your-writes reads (PR #88,
+  on `main`, unreleased until the next cut): the token is the byte position the
+  client learns from its write's response, and any node answers once it has
+  applied that far. See
+  [`uc2-read-your-writes-explained.md`](uc2-read-your-writes-explained.md); the
+  2026-10-10 fleet run
+  ([`uc2-read-types-under-writes-2026-10-10.md`](../benchmarks/uc2-read-types-under-writes-2026-10-10.md))
+  measured them at about a snapshot read's cost.
+- **Not offered today:** time-addressed reads (H; `query` gets no `time_ns` by
+  design) and historical reads at a position (L).
 
 ## Would another read path be faster in UC? (measured 2026-10-07)
 
