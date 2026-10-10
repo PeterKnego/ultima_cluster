@@ -705,6 +705,16 @@ pub(crate) fn replay_into<S: RawStateMachine>(
     if straddle_at == Some(cursor) {
         return Ok(Replay::AwaitCommit(cursor));
     }
+    // Ruling R14: the same wait when the straddling frame is the FIRST one
+    // the scan met — it starts exactly at `start_pos`, so the walk stopped
+    // before moving `cursor` off 0 (nightly 38011932517: an unforced pass
+    // starting at the follower's cursor, R5, on a block based there). Safe
+    // for the same reason: `start_pos` is `max(SM cursor, follower cursor)`
+    // and every byte below the follower's cursor is already in the SM, so
+    // nothing below the straddling frame was skipped.
+    if straddle_at == Some(start_pos) {
+        return Ok(Replay::AwaitCommit(start_pos));
+    }
     if frames_walked == 0 {
         // #82: a pass that walked nothing is what the caller's no-progress
         // guard turns into a gap. Say WHY on the one line a supervisor or a CI

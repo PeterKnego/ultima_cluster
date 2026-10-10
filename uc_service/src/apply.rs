@@ -2433,6 +2433,83 @@ mod tests {
         assert_eq!(sm.last, Some(pos[1399]));
     }
 
+    /// Ruling R14 (nightly 38011932517, `catalog::the_flag_day_window_is_empty_
+    /// and_deletes_nothing`): R5 starts an unforced pass at the follower's
+    /// cursor B, above the SM's last applied frame A. When the journal's block
+    /// is based exactly at B and its first frame straddles the apply target,
+    /// the walk stops before walking ANY frame, so its local cursor is still
+    /// 0 and #77's `straddle_at == cursor` test missed it: `Rejoin(0)`, no
+    /// progress, a forced gap pass, and a `SnapshotRequired` fail-stop on a
+    /// healthy row. A straddle at the scan's own start is the same wait.
+    #[test]
+    fn a_straddle_at_the_follower_cursor_above_the_sm_is_waited_on_not_a_gap() {
+        let dir = scratch();
+        let (mut st, pos, head) = a_lapped_row(&dir, 0x1414, false);
+        assert!(st.snapshot_restore.is_none(), "no install capability");
+        // A journal whose first block is based at B (a frame start).
+        let mut archive = uc_log::archive::Archive::open(uc_log::archive::ArchiveConfig {
+            segment_size_bytes: 16 * 1024,
+            preallocate_segments: false,
+            ..uc_log::archive::ArchiveConfig::new(&st.journal_dir)
+        })
+        .unwrap();
+        let b = archive.purge_below(pos[700]).unwrap();
+        drop(archive);
+        let k = pos
+            .iter()
+            .position(|&x| x == b)
+            .expect("B is a frame start");
+        // SM at A (the frame below B), follower at B, commit 32 B into B's frame.
+        st.sm.lock().unwrap().last = Some(pos[k - 1]);
+        st.follower.cursor = b;
+        st.cnc.counters().commit.store_release(b + 32);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let h = std::thread::spawn(move || {
+            let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                super::apply_cycle(&mut st)
+            }));
+            let msg = out.as_ref().err().map(|e| {
+                e.downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
+                    .unwrap_or_default()
+            });
+            let _ = tx.send(());
+            (msg, st)
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(10))
+            .expect("apply_cycle never returned");
+        let (msg, mut st) = h.join().unwrap();
+        assert!(
+            msg.is_none(),
+            "a frame straddling the target at the follower's cursor is not a gap: {msg:?}"
+        );
+        assert_eq!(st.follower.cursor, b, "the follower waits AT B");
+        assert_eq!(st.replay_stalled, None, "no stall episode");
+        assert_eq!(st.sm.lock().unwrap().applies, 0, "nothing applied yet");
+
+        // Commit passes the whole log: the row applies from B up, once.
+        st.cnc.counters().commit.store_release(head);
+        for _ in 0..20 {
+            super::apply_cycle(&mut st);
+            if st.follower.cursor == head {
+                break;
+            }
+        }
+        assert_eq!(
+            st.follower.cursor, head,
+            "the row catches up once commit moves"
+        );
+        let sm = st.sm.lock().unwrap();
+        assert_eq!(
+            sm.applies,
+            (pos.len() - k) as u64,
+            "exactly the frames from B up"
+        );
+        assert_eq!(sm.last, Some(pos[pos.len() - 1]));
+    }
+
     /// Task 8 review Important-1 / ruling R5: a row that just installed an
     /// artifact at P (a start set at attach, or a pinned origin) resumes its
     /// FOLLOWER at P while its own cursor stays strictly below P (the tag is
