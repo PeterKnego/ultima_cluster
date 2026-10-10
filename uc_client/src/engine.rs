@@ -714,22 +714,26 @@ impl SendHalf {
             .claim_with_min_position(user_data, kind, deadline_ns, expected, fan_in, min_position)
             .map_err(|_| SubmitError::Backpressure)?; // WindowFull and SlotBusy alike
         let extra = extra_client(s.client_id, seq as u32);
-        let write_result = match prefix {
-            None => ring.try_write(msg_type, flags, extra, bytes),
+        // ONE `try_write` call site. Every extra copy of the ring write
+        // inlined here grows `send` past LLVM's inlining budget, and the
+        // ring's per-record `MpscProducer::claim` then falls out of line on
+        // EVERY submit (measured: a third call site cost the client hop
+        // about 5-6 % on the fleet, 2026-10-10). Queries assemble their
+        // payload out of line, then share the one write.
+        let scratch;
+        let (wire_flags, payload): (u16, &[u8]) = match prefix {
+            None => (flags, bytes),
             Some(id) => {
-                // One `try_write` takes one slice: assemble `id ++ bytes` in
-                // this half's scratch (SendHalf is !Sync; the RefCell is never
-                // contended).
-                let mut scratch = self.scratch.borrow_mut();
-                if min_position > 0 {
-                    write_min_position_query_payload(id, min_position, bytes, &mut scratch);
-                    ring.try_write(msg_type, flags | FLAG_V2_MIN_POSITION, extra, &scratch)
-                } else {
-                    write_query_payload(id, bytes, &mut scratch);
-                    ring.try_write(msg_type, flags, extra, &scratch)
-                }
+                // One `try_write` takes one slice: assemble the query payload
+                // in this half's scratch (SendHalf is !Sync; the RefCell is
+                // never contended).
+                let mut buf = self.scratch.borrow_mut();
+                let wire_flags = assemble_query(&mut buf, id, min_position, bytes, flags);
+                scratch = buf;
+                (wire_flags, &scratch[..])
             }
         };
+        let write_result = ring.try_write(msg_type, wire_flags, extra, payload);
         finish_write(&s.table, &s.stats, seq, write_result)
     }
 
@@ -939,6 +943,21 @@ impl SendHalf {
     /// Current inflight count (claimed, not-yet-completed slots).
     pub fn inflight(&self) -> u64 {
         self.shared.table.inflight()
+    }
+}
+
+/// Build a `query.ring` payload (`service_id ++ [min_position ++] query`)
+/// into `out` and return the record flags to send it with. Out of line on
+/// purpose: it keeps `SendHalf::send`'s body small enough that the per-submit
+/// ring write stays inlined (see the comment at its one `try_write`).
+#[inline(never)]
+fn assemble_query(out: &mut Vec<u8>, id: u8, min_position: u64, query: &[u8], flags: u16) -> u16 {
+    if min_position > 0 {
+        write_min_position_query_payload(id, min_position, query, out);
+        flags | FLAG_V2_MIN_POSITION
+    } else {
+        write_query_payload(id, query, out);
+        flags
     }
 }
 
