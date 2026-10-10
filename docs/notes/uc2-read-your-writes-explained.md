@@ -1,8 +1,8 @@
 # Read-your-writes reads, explained
 
-*Unreleased: lands with the next cut. Spec:
+**Status:** unreleased, lands with the next cut. Spec:
 [`2026-10-08-uc2-read-your-writes-design.md`](../superpowers/specs/2026-10-08-uc2-read-your-writes-design.md)
-(read its Errata and As built blocks first).*
+(read its Errata and As built blocks first).
 
 ## The problem
 
@@ -13,9 +13,9 @@ UC has always had two ways to read:
   the leader serves it.
 - **Snapshot**: answered from whatever the local node has applied so far.
   Cheap, and any node can answer, so read capacity scales with the number of
-  nodes (see
-  [`docs/benchmarks/uc2-read-spread-2026-10-07.md`](../benchmarks/uc2-read-spread-2026-10-07.md):
-  2.74x read-only, 3.65x under write load). But a follower may not have applied
+  nodes (the read-spread fleet run of 2026-10-07,
+  `docs/benchmarks/uc2-read-spread-2026-10-07.md` on branch `bench/read-spread`,
+  not yet on `main`: 2.74x read-only, 3.65x under write load). But a follower may not have applied
   the write you were just told succeeded, so you can read your own past.
 
 **Read-your-writes** is the third mode. It reads on any node at close to
@@ -145,7 +145,7 @@ hold a row back past the one-second deadline; that is the barrier working.
 
 ## See also
 
-- [`smr-read-options-compared.md`](smr-read-options-compared.md): the
+- `docs/notes/smr-read-options-compared.md`: the
   comparison that motivated this. It lives on branch `bench/read-spread` and
   is not on `main` yet; its "not implemented" entry for this option is to be
   moved to implemented when it merges.
