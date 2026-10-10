@@ -183,8 +183,8 @@ use uc_node::{Node, NodeConfig};
 use uc_protocol::ring::{BroadcastConsumer, BroadcastRing, MpscRing, RingError};
 use uc_protocol::v2::cnc::NODE_FLAG_CAN_SERVE;
 use uc_protocol::v2::ipc::{
-    FLAG_V2_IS_QUERY, FLAG_V2_LINEARIZABLE, FLAG_V2_MIN_POSITION, MSG_V2_NOT_LEADER,
-    MSG_V2_QUERY, MSG_V2_RESPONSE, MSG_V2_RETRY, MSG_V2_SUBMIT, client_from_extra, extra_client,
+    FLAG_V2_IS_QUERY, FLAG_V2_LINEARIZABLE, FLAG_V2_MIN_POSITION, MSG_V2_NOT_LEADER, MSG_V2_QUERY,
+    MSG_V2_RESPONSE, MSG_V2_RETRY, MSG_V2_SUBMIT, client_from_extra, extra_client,
     write_min_position_query_payload, write_query_payload,
 };
 use uc_service::{ApplyCtx, ServiceBuilder, ServiceConfig, StateMachine};
@@ -942,6 +942,7 @@ fn poll_egress(ring: &mut BroadcastConsumer, ctx: &MatcherCtx, buf: &mut Vec<u8>
 /// forwards it straight to the service (`node.rs:1956-1958`). Everything else —
 /// admission, the per-cycle drain cap, the service, the egress path — is
 /// identical, so the delta between arms IS the barrier's end-to-end cost.
+#[allow(clippy::too_many_arguments)]
 fn run_read_measurement(
     instance_dir: &Path,
     app_id: &str,
