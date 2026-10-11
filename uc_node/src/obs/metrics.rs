@@ -113,6 +113,8 @@ pub const CONTRACT_SERIES: &[&str] = &[
     "uc2_backup_reports_sent_total",
     "uc2_backup_reports_unsent_total",
     "uc2_backup_reports_appended_total",
+    // Backup-tier spec §5.4: the writer node's purge hold let go for space.
+    "uc2_backup_hold_released_total",
     // FSM upgrade lifecycle (plan B1)
     "uc2_upgrade_pin_origin",
     "uc2_upgrade_pin_version",
@@ -1077,6 +1079,12 @@ fn push_service_families(out: &mut String, s: &ObsSources, commit: u64, now: u64
         "BackupWatermark records (CLUSTER kind 7) this node placed on the log while leading — at most one per tier per commit round trip; reports no further than the committed entry are dropped before appending. A follower appends none.",
         s.backup_reports_appended.load(Ordering::Relaxed),
     );
+    push_counter(
+        out,
+        "uc2_backup_hold_released_total",
+        "Times low space released this node's backup purge hold (backup-tier spec §5.4): free bytes fell below one chunk_bytes plus the auto-fetch headroom, so the node purged past journal its backup tier lacks and the writer will record a chain gap when it resumes. Counted once per episode; 0 on a node with no [backup] writer.",
+        s.backup_hold_released.load(Ordering::Relaxed),
+    );
     push_gauge(
         out,
         "uc_services_declared",
@@ -1866,6 +1874,7 @@ mod tests {
             backup_reports_sent: Arc::new(AtomicU64::new(0)),
             backup_reports_unsent: Arc::new(AtomicU64::new(0)),
             backup_reports_appended: Arc::new(AtomicU64::new(0)),
+            backup_hold_released: Arc::new(AtomicU64::new(0)),
             cluster_view: test_cluster_view(),
             probe: uc_net::probe::ProbeTable::new(uc_net::probe::ProbeCadence::default()),
             commands_over_standard: Arc::new(AtomicU64::new(0)),
@@ -2143,7 +2152,7 @@ mod tests {
     fn the_contract_has_the_number_of_families_the_docs_state() {
         assert_eq!(
             CONTRACT_SERIES.len(),
-            130,
+            131,
             "if this is intentional, update the family count in \
              docs/how-to/monitor-a-cluster.md in the same commit"
         );
@@ -2646,6 +2655,7 @@ mod tests {
             backup_reports_sent: Arc::new(AtomicU64::new(0)),
             backup_reports_unsent: Arc::new(AtomicU64::new(0)),
             backup_reports_appended: Arc::new(AtomicU64::new(0)),
+            backup_hold_released: Arc::new(AtomicU64::new(0)),
             cluster_view: test_cluster_view(),
             probe: uc_net::probe::ProbeTable::new(uc_net::probe::ProbeCadence::default()),
             commands_over_standard: Arc::new(AtomicU64::new(0)),
@@ -2759,6 +2769,7 @@ mod tests {
             backup_reports_sent: Arc::new(AtomicU64::new(0)),
             backup_reports_unsent: Arc::new(AtomicU64::new(0)),
             backup_reports_appended: Arc::new(AtomicU64::new(0)),
+            backup_hold_released: Arc::new(AtomicU64::new(0)),
             cluster_view: test_cluster_view(),
             probe: uc_net::probe::ProbeTable::new(uc_net::probe::ProbeCadence::default()),
             commands_over_standard: Arc::new(AtomicU64::new(0)),
@@ -2865,6 +2876,7 @@ mod tests {
             backup_reports_sent: Arc::new(AtomicU64::new(0)),
             backup_reports_unsent: Arc::new(AtomicU64::new(0)),
             backup_reports_appended: Arc::new(AtomicU64::new(0)),
+            backup_hold_released: Arc::new(AtomicU64::new(0)),
             cluster_view: test_cluster_view(),
             probe: uc_net::probe::ProbeTable::new(uc_net::probe::ProbeCadence::default()),
             commands_over_standard: Arc::new(AtomicU64::new(0)),

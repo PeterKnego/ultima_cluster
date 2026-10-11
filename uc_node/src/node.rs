@@ -1213,6 +1213,9 @@ pub struct Node {
     backup_reports_sent: Arc<AtomicU64>,
     backup_reports_unsent: Arc<AtomicU64>,
     backup_reports_appended: Arc<AtomicU64>,
+    /// Backup-tier spec §5.4: `uc2_backup_hold_released_total` — the SAME
+    /// `Arc` [`Consensus::backup_purge_cap`] bumps.
+    backup_hold_released: Arc<AtomicU64>,
     /// Backup-tier spec §6.2: the backup writer's newest chain watermark,
     /// waiting for the consensus agent to take it — the SAME slot
     /// `Consensus::backup_claim` reads.
@@ -1752,6 +1755,12 @@ impl Node {
         // Backup-tier spec §5.3: the `uc2-backup` writer's handle on the
         // journal (raw block reads, ruling PF2), taken for the same reason.
         let backup_journal = backup.as_ref().map(|_| archive.journal_arc());
+        // Spec §5.4: the writer's shared state exists before the agents that
+        // read it — the consensus agent (the purge hold and the keep hold)
+        // and the archive agent (the same cap, applied defensively).
+        let backup_shared = backup
+            .as_ref()
+            .map(|_| Arc::new(crate::tier::writer::WriterShared::default()));
         // A learner never leads, so its sender streams to no one: give it a solo
         // (empty) fan-out with a cluster size of 1, which also sidesteps flow
         // control's leader-in-cluster invariant (from a learner's view every voter
@@ -2053,6 +2062,7 @@ impl Node {
         let arc_collapse_slot = collapse_slot.clone();
         let arc_first_base = Arc::clone(&archive_first_base);
         let arc_prime_gen = Arc::clone(&prime_generation);
+        let arc_backup = backup_shared.clone();
         // Forensic trace for the 2026-08-16 acked-write-loss hunt: every journal
         // cut is rare (elections only), so an env-gated line per cut is free.
         let trunc_trace = std::env::var("UC2_TRUNC_TRACE").is_ok();
@@ -2202,19 +2212,32 @@ impl Node {
                         arc_collapse_slot.post(epoch, to);
                     }
                     ArchiveCmd::Purge { below } => {
+                        // Backup-tier spec §5.4: the writer's purge hold,
+                        // applied again here, defensively — the consensus
+                        // agent already clamped `below`, but a command sent
+                        // before a re-arm must not cut past the tier. The
+                        // cap is a pure read of the writer's shared state
+                        // (the release decision stays with consensus), so
+                        // no second copy of the space rule lives here.
+                        let below = match arc_backup.as_deref().and_then(|b| b.purge_cap()) {
+                            Some(cap) => below.min(cap),
+                            None => below,
+                        };
                         // Best-effort: a failed purge logs + drops (retries next
                         // interval). Correctness never depends on a block still
                         // being present — a reader below the floor recovers via
                         // the snapshot path (Task 5 same-host, Task 6 remote).
-                        match archive.purge_below(below) {
-                            Ok(new_first) => {
-                                arc_first_base.store(new_first, Ordering::Release);
-                            }
-                            Err(e) => {
-                                eprintln!(
-                                    "uc_node: archive purge_below({below}) failed: {e} \
-                                     (dropped; retries next interval)"
-                                );
+                        if below > archive.first_base() {
+                            match archive.purge_below(below) {
+                                Ok(new_first) => {
+                                    arc_first_base.store(new_first, Ordering::Release);
+                                }
+                                Err(e) => {
+                                    eprintln!(
+                                        "uc_node: archive purge_below({below}) failed: {e} \
+                                         (dropped; retries next interval)"
+                                    );
+                                }
                             }
                         }
                     }
@@ -2350,6 +2373,7 @@ impl Node {
         let backup_reports_unsent = Arc::new(AtomicU64::new(0));
         let backup_reports_appended = Arc::new(AtomicU64::new(0));
         let backup_claim: Arc<Mutex<Option<BackupWatermark>>> = Arc::new(Mutex::new(None));
+        let backup_hold_released = Arc::new(AtomicU64::new(0));
         let schedule_pos_pub = Arc::new(AtomicU64::new(0));
         let schedule_entries_pub = Arc::new(AtomicU64::new(0));
         let log_clock_smear_pub = Arc::new(AtomicU64::new(0));
@@ -2520,6 +2544,9 @@ impl Node {
             backup_reports_sent: Arc::clone(&backup_reports_sent),
             backup_reports_unsent: Arc::clone(&backup_reports_unsent),
             backup_reports_appended: Arc::clone(&backup_reports_appended),
+            backup_shared: backup_shared.clone(),
+            backup_chunk_bytes: backup.as_ref().map_or(0, |b| b.chunk_bytes),
+            backup_hold_released: Arc::clone(&backup_hold_released),
             backup_claim: Arc::clone(&backup_claim),
             pending_backup_reports: BTreeMap::new(),
             pending_snapshot_reports: HashMap::new(),
@@ -2657,9 +2684,8 @@ impl Node {
         // Backup-tier spec §5.1: the `uc2-backup` writer — its own sleeping
         // thread, never a polling agent; appended LAST to `agents` so the
         // five agent indices `/healthz` reads never shift.
-        let (backup_shared, backup_runner) = match (backup, backup_journal) {
-            (Some(bcfg), Some(journal)) => {
-                let shared = Arc::new(crate::tier::writer::WriterShared::default());
+        let backup_runner = match (backup, backup_journal, &backup_shared) {
+            (Some(bcfg), Some(journal), Some(shared)) => {
                 let target = Box::new(crate::tier::target::FsTarget::new(bcfg.target.clone()));
                 let mut writer = crate::tier::writer::Writer::new(
                     bcfg,
@@ -2671,7 +2697,7 @@ impl Node {
                     Arc::clone(&archive_first_base),
                     Arc::clone(&cluster_view),
                     Arc::clone(&backup_claim),
-                    Arc::clone(&shared),
+                    Arc::clone(shared),
                     target,
                 );
                 let base = std::time::Instant::now();
@@ -2680,9 +2706,9 @@ impl Node {
                     IdleStrategy::Sleep(BACKUP_THREAD_SLEEP),
                     move || writer.step(base.elapsed().as_nanos() as u64),
                 )?;
-                (Some(shared), Some(runner))
+                Some(runner)
             }
-            _ => (None, None),
+            _ => None,
         };
 
         Ok(Node {
@@ -2722,6 +2748,7 @@ impl Node {
             backup_reports_sent,
             backup_reports_unsent,
             backup_reports_appended,
+            backup_hold_released,
             backup_claim,
             reports_implausible,
             reports_unattested,
@@ -3245,6 +3272,7 @@ impl Node {
             backup_reports_sent: Arc::clone(&self.backup_reports_sent),
             backup_reports_unsent: Arc::clone(&self.backup_reports_unsent),
             backup_reports_appended: Arc::clone(&self.backup_reports_appended),
+            backup_hold_released: Arc::clone(&self.backup_hold_released),
             cluster_view: Arc::clone(&self.cluster_view),
             probe: Arc::clone(&self.probe_table),
             commands_over_standard: Arc::clone(&self.commands_over_standard),
@@ -3912,6 +3940,16 @@ struct Consensus {
     backup_reports_sent: Arc<AtomicU64>,
     backup_reports_unsent: Arc<AtomicU64>,
     backup_reports_appended: Arc<AtomicU64>,
+    /// Backup-tier spec §5.4: the `uc2-backup` writer's shared state when
+    /// this node runs one (`None` without `[backup]`). Its `progress` caps
+    /// the purge target and its `set_hold` joins retention's keep list,
+    /// both until low space releases them ([`Self::backup_purge_cap`]).
+    backup_shared: Option<Arc<crate::tier::writer::WriterShared>>,
+    /// `[backup] chunk_bytes`: the space rule's size (`auto_fetch::fits`
+    /// over one chunk). Unused without a writer.
+    backup_chunk_bytes: u64,
+    /// `uc2_backup_hold_released_total`: releases, once per episode.
+    backup_hold_released: Arc<AtomicU64>,
     /// Backup-tier spec §6.2: the backup writer's newest watermark claim
     /// (written by the `uc2-backup` thread, Task 8), TAKEN by
     /// [`Consensus::take_backup_claim`] once per pass. A newer claim simply
@@ -5902,6 +5940,11 @@ impl Consensus {
                 candidate
             };
             if service_pos > self.snapshot_persisted_floor {
+                // Backup-tier spec §5.4: settle the hold's release state
+                // before retention reads the writer's keep hold.
+                if self.backup_shared.is_some() {
+                    self.backup_purge_cap();
+                }
                 self.state
                     .store_snapshot_floor(service_pos)
                     .expect("snapshot floor persist fail-stop (journal I/O)");
@@ -5932,12 +5975,25 @@ impl Consensus {
             }
         }
         if let PurgePolicy::BelowSnapshot { slack_bytes } = self.purge_policy {
-            let target = self.snapshot_persisted_floor.saturating_sub(slack_bytes);
+            let mut target = self.snapshot_persisted_floor.saturating_sub(slack_bytes);
+            let first_base = self.archive_first_base.load(Ordering::Acquire);
+            // Backup-tier spec §5.4: on a writer's node, never purge journal
+            // the tier lacks. Read only when a purge is due, so an idle node
+            // never reaches it; a clamp that leaves nothing to do counts as
+            // `held`, stamping the throttle like a pin hold does.
+            if target > first_base
+                && self.backup_shared.is_some()
+                && let Some(cap) = self.backup_purge_cap()
+                && cap < target
+            {
+                target = cap;
+                held = true;
+            }
             // Only command a purge that would actually advance the floor. The
             // archive acks by advancing `archive_first_base`; `try_send` (not
             // `send`) keeps a full channel from blocking the consensus loop — a
             // dropped purge is harmless (best-effort, retried next tick).
-            if target > self.archive_first_base.load(Ordering::Acquire) {
+            if target > first_base {
                 let _ = self.trunc_tx.try_send(ArchiveCmd::Purge { below: target });
                 did = true;
             }
@@ -5949,6 +6005,58 @@ impl Consensus {
         // idle strategy hot for as long as an upgrade takes to swap its
         // binary.
         did
+    }
+
+    /// Backup-tier spec §5.4: the purge cap the `uc2-backup` writer's hold
+    /// puts on this node — its `progress` (`0`, no chain yet, holds every
+    /// purge) — or `None` when it holds nothing: no writer, a writer that
+    /// stopped for good (ruling R9a), or a hold released for space.
+    ///
+    /// The release rule lives here, the one place it is decided: released
+    /// while the node's free bytes fail `auto_fetch::fits` for one
+    /// `chunk_bytes` (an unknown free figure never releases), re-armed when
+    /// they fit again; each edge logs once. Out of line and off the
+    /// per-pass path: only the throttled floor persister calls it, and only
+    /// when a purge or a floor move is actually due.
+    #[inline(never)]
+    fn backup_purge_cap(&mut self) -> Option<u64> {
+        use crate::auto_fetch::{FREE_BYTES_UNKNOWN, fits};
+        let shared = self.backup_shared.as_ref()?;
+        if shared.stopped.load(Ordering::Acquire) {
+            return None;
+        }
+        let free = self
+            .holdings
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .free_bytes;
+        let released = shared.hold_released.load(Ordering::Acquire);
+        if free != FREE_BYTES_UNKNOWN {
+            let low = !fits(free, self.backup_chunk_bytes);
+            if low != released {
+                shared.hold_released.store(low, Ordering::Release);
+                let progress = shared.progress.load(Ordering::Acquire);
+                if low {
+                    self.backup_hold_released.fetch_add(1, Ordering::Relaxed);
+                    crate::obs_event!(
+                        Warn,
+                        "backup_hold_released",
+                        node = self.id as u64,
+                        progress = progress,
+                        free_bytes = free
+                    );
+                } else {
+                    crate::obs_event!(
+                        Info,
+                        "backup_hold_rearmed",
+                        node = self.id as u64,
+                        progress = progress,
+                        free_bytes = free
+                    );
+                }
+            }
+        }
+        shared.purge_cap()
     }
 
     /// Catalog spec §4.4: this node's EFFECTIVE floor candidate — the newest
@@ -8193,6 +8301,9 @@ impl Consensus {
                 (!self.pin_released(inner, row, &gate)).then_some(gate.origin)
             })
             .chain(inner.catalog.iter().map(|e| e.position))
+            // Backup-tier spec §5.4: the set the writer will copy next
+            // survives until it is in the tier (released with the hold).
+            .chain(self.backup_shared.as_ref().and_then(|b| b.keep()))
             .collect();
         // The DECLARED rows — the same set `check_set_completeness` reads, so
         // the pruner only ever touches artifact families the set is made of.
@@ -14808,6 +14919,9 @@ mod tests {
             backup_reports_sent: Arc::new(AtomicU64::new(0)),
             backup_reports_unsent: Arc::new(AtomicU64::new(0)),
             backup_reports_appended: Arc::new(AtomicU64::new(0)),
+            backup_shared: None,
+            backup_chunk_bytes: 0,
+            backup_hold_released: Arc::new(AtomicU64::new(0)),
             backup_claim: Arc::new(Mutex::new(None)),
             pending_backup_reports: BTreeMap::new(),
             pending_snapshot_reports: HashMap::new(),
@@ -15800,6 +15914,114 @@ mod tests {
                 "cluster artifact at {p} survives"
             );
         }
+    }
+
+    /// Backup-tier spec §5.4 (Task 9): on a writer's node the keep list
+    /// gains the writer's keep hold — the set it is about to copy, or
+    /// waiting to — so retention cannot delete it first; a released hold
+    /// keeps nothing extra.
+    #[test]
+    fn the_pruner_keeps_the_backup_writers_set_hold() {
+        let mut h = harness_with_rows(&["a"]);
+        for p in [1000u64, 2000, 3000] {
+            write_row_artifact(&h, 0, p, b"x");
+            write_cluster_artifact(&h, p, b"c");
+        }
+        let mut st = h.cons.cluster_view.to_state();
+        st.catalog = vec![agreed_entry(3000)];
+        h.cons.cluster_view.publish(&st);
+        let shared = Arc::new(crate::tier::writer::WriterShared::default());
+        shared.set_hold.store(1000, Ordering::Release);
+        h.cons.backup_shared = Some(Arc::clone(&shared));
+        h.cons.prune_snapshots_below(3000);
+        assert_eq!(
+            list_row_artifacts(&h, 0),
+            vec![1000, 3000],
+            "2000 deleted; 1000 is the writer's keep hold; 3000 is listed"
+        );
+        assert!(
+            h.cons
+                .cluster_snapshot_dir
+                .join("snap-1000.ultcluster")
+                .exists()
+        );
+        shared.hold_released.store(true, Ordering::Release);
+        h.cons.prune_snapshots_below(3000);
+        assert_eq!(list_row_artifacts(&h, 0), vec![3000], "released: not kept");
+    }
+
+    /// Backup-tier spec §5.4 (Task 9): the purge target on a writer's node
+    /// is clamped to the writer's progress (`0`, no chain yet, holds every
+    /// purge); low space releases the hold — counted once per episode — and
+    /// space coming back re-arms it; a stopped writer holds nothing.
+    #[test]
+    fn the_backup_hold_caps_the_purge_at_the_writers_progress() {
+        use uc_protocol::v2::upgrade::RowRunning;
+        let mut h = harness_with_rows(&["a"]);
+        h.cons.purge_policy = PurgePolicy::BelowSnapshot { slack_bytes: 0 };
+        let shared = Arc::new(crate::tier::writer::WriterShared::default());
+        h.cons.backup_shared = Some(Arc::clone(&shared));
+        h.cons.backup_chunk_bytes = 1 << 20;
+        h.cons.holdings.lock().unwrap().free_bytes = 1 << 40;
+        let (agreed, own) = (4096u64, 6016u64);
+        let mut st = h.cons.cluster_view.to_state();
+        st.catalog = vec![agreed_entry(agreed)];
+        st.running[0] = Some(RowRunning {
+            row: 0,
+            version: 1,
+            record_pos: 1,
+        });
+        h.cons.cluster_view.publish(&st);
+        h.cons.snapshot_set_position.store(own, Ordering::Release);
+        h.cons.note_set_held(agreed);
+        let purge = |h: &mut Harness| -> Option<u64> {
+            h.advance_floor_timer();
+            h.cons.maybe_persist_snapshot_floor();
+            let mut last = None;
+            while let Ok(cmd) = h._trunc_rx.try_recv() {
+                if let ArchiveCmd::Purge { below } = cmd {
+                    last = Some(below);
+                }
+            }
+            last
+        };
+        let released = |h: &Harness| h.cons.backup_hold_released.load(Ordering::Relaxed);
+
+        assert_eq!(purge(&mut h), None, "no chain yet: no purge at all");
+        assert_eq!(h.cons.snapshot_persisted_floor, agreed, "the floor moves");
+
+        shared.progress.store(2048, Ordering::Release);
+        assert_eq!(purge(&mut h), Some(2048), "clamped to progress");
+        h.cons.archive_first_base.store(2048, Ordering::Release);
+        assert_eq!(purge(&mut h), None, "at the cap: nothing to do");
+
+        h.cons.holdings.lock().unwrap().free_bytes = 1;
+        assert_eq!(purge(&mut h), Some(agreed), "released: the full target");
+        assert!(shared.hold_released.load(Ordering::Acquire));
+        assert_eq!(released(&h), 1);
+        assert_eq!(purge(&mut h), Some(agreed));
+        assert_eq!(released(&h), 1, "once per episode");
+
+        h.cons.holdings.lock().unwrap().free_bytes = crate::auto_fetch::FREE_BYTES_UNKNOWN;
+        assert_eq!(purge(&mut h), Some(agreed), "unknown space keeps the state");
+        assert!(shared.hold_released.load(Ordering::Acquire));
+
+        h.cons.holdings.lock().unwrap().free_bytes = 1 << 40;
+        assert_eq!(purge(&mut h), None, "re-armed: held at progress again");
+        assert!(!shared.hold_released.load(Ordering::Acquire));
+
+        h.cons.holdings.lock().unwrap().free_bytes = 1;
+        assert_eq!(purge(&mut h), Some(agreed));
+        assert_eq!(released(&h), 2, "a second episode counts again");
+        h.cons.holdings.lock().unwrap().free_bytes = 1 << 40;
+        assert_eq!(purge(&mut h), None);
+
+        shared.stopped.store(true, Ordering::Release);
+        assert_eq!(
+            purge(&mut h),
+            Some(agreed),
+            "a stopped writer holds nothing"
+        );
     }
 
     /// Catalog spec §5.2 (D6), catalog ruling R27: the filesystem half of

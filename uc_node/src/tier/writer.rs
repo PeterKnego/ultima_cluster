@@ -153,15 +153,43 @@ pub struct WriterShared {
     /// The end of the chain this writer last confirmed in the tier (0 =
     /// none): the purge hold.
     pub progress: AtomicU64,
-    /// The newest agreed set this node holds that the tier still lacks (0 =
-    /// none): the keep hold.
+    /// The set this node holds that the writer will copy next — eligible
+    /// now, or deferred until the chain reaches it ([`keep_hold`]); 0 =
+    /// none: the keep hold.
     pub set_hold: AtomicU64,
-    /// Task 9: the hold was released for lack of space.
+    /// Spec §5.4: the holds are released for lack of space. Set and cleared
+    /// by the node's consensus agent (`Consensus::backup_purge_cap`), never
+    /// by the writer.
     pub hold_released: AtomicBool,
     /// The writer refused its target for good (foreign or overlap
-    /// mismatch); `Uc2BackupWriterError`.
+    /// mismatch); `Uc2BackupWriterError`. A stopped writer holds nothing
+    /// (ruling R9a): its alert covers it.
     pub stopped: AtomicBool,
     pub stats: WriterStats,
+}
+
+impl WriterShared {
+    /// Spec §5.4: the highest position this node may purge below — the end
+    /// of the chain the writer last confirmed in the tier (`0` before it
+    /// has one: hold every purge) — or `None` when nothing is held (the
+    /// hold released for space, or the writer stopped for good). Pure
+    /// reads; the release decision is the consensus agent's.
+    pub fn purge_cap(&self) -> Option<u64> {
+        if self.stopped.load(Ordering::Acquire) || self.hold_released.load(Ordering::Acquire) {
+            return None;
+        }
+        Some(self.progress.load(Ordering::Acquire))
+    }
+
+    /// The set the node's retention must keep for the writer, under the
+    /// same release rule as [`Self::purge_cap`].
+    pub fn keep(&self) -> Option<u64> {
+        if self.stopped.load(Ordering::Acquire) || self.hold_released.load(Ordering::Acquire) {
+            return None;
+        }
+        let p = self.set_hold.load(Ordering::Acquire);
+        (p != 0).then_some(p)
+    }
 }
 
 /// One local artifact of a set, opened once: hashing and copying read the
@@ -299,6 +327,22 @@ fn pick_set(held_newest_first: &[u64], through: Option<u64>, first_base: u64) ->
         return held_newest_first.iter().copied().find(|&p| p >= first_base);
     }
     None
+}
+
+/// The keep hold (Task 9): the held set the writer will copy — the one
+/// [`pick_set`] picks now, or, while every set is deferred (the journal
+/// still reaches the chain end), the lowest held set above `through`, which
+/// the chain passes first. `None` when no held set can ever be picked (the
+/// gap case with every held set below `first_base`).
+fn keep_hold(held_newest_first: &[u64], through: Option<u64>, first_base: u64) -> Option<u64> {
+    if let Some(p) = pick_set(held_newest_first, through, first_base) {
+        return Some(p);
+    }
+    let t = through?;
+    if first_base > t {
+        return None;
+    }
+    held_newest_first.iter().copied().filter(|&p| p > t).min()
 }
 
 /// What one step of a [`FrameCursor`] found.
@@ -731,13 +775,14 @@ impl Writer {
                 held.push((label, files));
             }
         }
-        // The keep hold (Task 9): the newest held set the tier still lacks —
-        // about to be copied, or deferred until the chain passes it.
-        let hold = held.first().map_or(0, |(l, _)| l.position);
-        self.shared.set_hold.store(hold, Ordering::Release);
         let through = self.wm.map(|(_, _, t)| t);
         loop {
             let positions: Vec<u64> = held.iter().map(|(l, _)| l.position).collect();
+            // The keep hold (Task 9): the set about to be copied, or the
+            // deferred one the chain reaches next — re-derived after a
+            // mismatched set drops out.
+            let hold = keep_hold(&positions, through, first_base).unwrap_or(0);
+            self.shared.set_hold.store(hold, Ordering::Release);
             let Some(p) = pick_set(&positions, through, first_base) else {
                 return Ok(false); // nothing eligible: deferred, or none held
             };
@@ -1204,6 +1249,55 @@ mod tests {
         );
         // (b) still wins over (c) for a set inside the old chain.
         assert_eq!(pick_set(&[1200, 400], Some(600), 800), Some(400));
+    }
+
+    /// Task 9 (Task 8 review carry): the keep hold names the set the writer
+    /// will actually copy — `pick_set`'s answer now, or, while deferred, the
+    /// set the chain reaches next (the lowest held set above `through`, the
+    /// journal still reaching the chain end). A held set `pick_set` can never
+    /// use (below `first_base` in the gap case) is not held.
+    #[test]
+    fn the_keep_hold_is_the_set_the_writer_will_copy() {
+        // Eligible now: whatever `pick_set` picks.
+        assert_eq!(keep_hold(&[900, 500], None, 0), Some(900));
+        assert_eq!(keep_hold(&[900, 500, 300], Some(600), 0), Some(500));
+        assert_eq!(keep_hold(&[1200, 900], Some(600), 800), Some(1200));
+        // Deferred: the lowest set above the chain end, which the chain
+        // passes first.
+        assert_eq!(keep_hold(&[1200, 900], Some(600), 100), Some(900));
+        assert_eq!(keep_hold(&[900], Some(600), 600), Some(900));
+        // The gap case with every held set below `first_base`: nothing
+        // `pick_set` can ever copy, so nothing is held (the old rule held
+        // 700 here).
+        assert_eq!(keep_hold(&[700], Some(600), 800), None);
+        // Nothing held.
+        assert_eq!(keep_hold(&[], None, 0), None);
+        assert_eq!(keep_hold(&[], Some(600), 0), None);
+    }
+
+    /// Task 9: the purge cap a node reads — the writer's progress while the
+    /// hold is armed (`0` = no chain yet holds everything), none once the
+    /// hold is released for space or the writer has stopped for good.
+    #[test]
+    fn the_purge_cap_is_progress_unless_released_or_stopped() {
+        let s = WriterShared::default();
+        assert_eq!(s.purge_cap(), Some(0), "no chain yet: hold everything");
+        s.progress.store(4096, Ordering::Release);
+        assert_eq!(s.purge_cap(), Some(4096));
+        s.hold_released.store(true, Ordering::Release);
+        assert_eq!(s.purge_cap(), None, "released for space");
+        s.hold_released.store(false, Ordering::Release);
+        s.set_hold.store(3000, Ordering::Release);
+        assert_eq!(s.keep(), Some(3000));
+        s.stopped.store(true, Ordering::Release);
+        assert_eq!(s.purge_cap(), None, "a stopped writer holds nothing");
+        assert_eq!(s.keep(), None);
+        s.stopped.store(false, Ordering::Release);
+        s.hold_released.store(true, Ordering::Release);
+        assert_eq!(s.keep(), None);
+        s.hold_released.store(false, Ordering::Release);
+        s.set_hold.store(0, Ordering::Release);
+        assert_eq!(s.keep(), None, "0 = no set held");
     }
 
     /// A journal that cannot supply the range is named as the journal, not

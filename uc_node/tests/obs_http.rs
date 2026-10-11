@@ -96,6 +96,7 @@ fn synthetic_server() -> (ObsServer, ObsSources) {
         backup_reports_sent: Arc::new(AtomicU64::new(0)),
         backup_reports_unsent: Arc::new(AtomicU64::new(0)),
         backup_reports_appended: Arc::new(AtomicU64::new(0)),
+        backup_hold_released: Arc::new(AtomicU64::new(0)),
         cluster_view: Arc::new(uc_node::ClusterView::new(
             &uc_node::ClusterState::genesis_empty(),
         )),

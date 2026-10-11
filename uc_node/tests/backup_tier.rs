@@ -1331,4 +1331,192 @@ mod writer_e2e {
             "only the foreign TIER is on the target: {names:?}"
         );
     }
+
+    // ------------------------------------------------- the purge hold (Task 9)
+
+    /// Makes `dir` unwritable (0o500) for the guard's life and restores
+    /// 0o755 on drop, so a failed assertion still leaves the tempdir
+    /// removable.
+    struct Unwritable(PathBuf);
+
+    impl Unwritable {
+        fn new(dir: &Path) -> Unwritable {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::create_dir_all(dir).expect("mkdir");
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o500)).expect("chmod");
+            Unwritable(dir.to_path_buf())
+        }
+    }
+
+    impl Drop for Unwritable {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+
+    /// `rounds` × (6000 frames, an instant on every node in `idxs`, agreed).
+    /// Returns the last instant.
+    fn churn(c: &Cluster, idxs: &[usize], rounds: usize) -> u64 {
+        let mut p = 0;
+        for _ in 0..rounds {
+            let l = await_single_leader(c, 30);
+            submit_frames(c.node(l), 6000);
+            p = instant_until_complete(c, l, idxs);
+            await_agreed(c, idxs, p);
+        }
+        p
+    }
+
+    /// Spec §5.4: the writer's node never purges journal its tier lacks. The
+    /// target cannot be created at all (its parent forbids it), so the
+    /// writer has no chain — progress `0` — and its node purges NOTHING,
+    /// while a voter without a writer purges as usual over the same history.
+    #[test]
+    fn the_writers_node_does_not_purge_journal_the_tier_lacks() {
+        let _g = serialize();
+        let tier = tmp_tier();
+        let parent = tier.path().join("locked");
+        let _lock = Unwritable::new(&parent);
+        let cfg = writer_cfg(&parent.join("tier"), 1 << 20, Duration::from_millis(300));
+        let mut c = spawn(3, 0, opts("tier-hold", true), |i| {
+            (i == 1).then(|| cfg.clone())
+        });
+        start_sums(&mut c);
+        await_single_leader(&c, 30);
+        await_capable(&c);
+        let all = c.running();
+        churn(&c, &all, 3);
+        await_until(60, "a non-writer voter purged", || {
+            c.node(0).archive_first_base() > 0 && c.node(2).archive_first_base() > 0
+        });
+        // Give the writer node's persister every chance to purge too.
+        std::thread::sleep(Duration::from_secs(1));
+        let shared = c.node(1).backup_writer().unwrap();
+        assert!(shared.stats.errors(WriterError::Unavailable) >= 1);
+        assert_eq!(shared.progress.load(Ordering::Acquire), 0, "no chain");
+        assert_eq!(
+            c.node(1).archive_first_base(),
+            0,
+            "the writer's node purged journal its tier lacks (others at {} / {})",
+            c.node(0).archive_first_base(),
+            c.node(2).archive_first_base()
+        );
+        assert!(c.node(1).snapshot_set_position() > 0);
+        let _keep = c.stop();
+    }
+
+    /// Spec §5.4: the hold lets go when space runs low. A writer with a
+    /// chain loses its target (scratch area unwritable), the cluster moves
+    /// on, and its node holds its journal at the chain end. Low space (the
+    /// test seam) releases the hold — counted once — and the node purges
+    /// past the chain end. Space and target back: the writer names the gap
+    /// and starts a NEW chain at a set at or above its journal's start.
+    #[test]
+    fn the_hold_lets_go_when_space_runs_low_and_records_a_gap() {
+        let _g = serialize();
+        let tier = tmp_tier();
+        let cfg = writer_cfg(tier.path(), 1 << 20, Duration::from_millis(300));
+        let mut c = spawn(3, 0, opts("tier-release", true), |i| {
+            (i == 1).then(|| cfg.clone())
+        });
+        start_sums(&mut c);
+        let l = await_single_leader(&c, 30);
+        await_capable(&c);
+        let all = c.running();
+        submit_frames(c.node(l), 2000);
+        let p0 = instant_until_complete(&c, l, &all);
+        await_agreed(&c, &all, p0);
+        submit_frames(c.node(l), 2000);
+        let t0 = c.node(l).counters().commit.load_acquire();
+        await_watermark(&c, l, 60, |w| w.through >= t0);
+        let shared = c.node(1).backup_writer().unwrap();
+
+        let guard = Unwritable::new(&tier.path().join(".tmp"));
+        let p_last = churn(&c, &all, 3);
+        await_until(30, "the writer lost its target", || {
+            shared.stats.errors(WriterError::Unavailable) >= 1
+        });
+        let held_at = shared.progress.load(Ordering::Acquire);
+        assert!(held_at >= t0 && held_at < p_last);
+        await_until(
+            60,
+            "the non-writer voters purged past the chain end",
+            || c.node(0).archive_first_base() > held_at && c.node(2).archive_first_base() > held_at,
+        );
+        std::thread::sleep(Duration::from_secs(1));
+        assert_eq!(shared.progress.load(Ordering::Acquire), held_at);
+        let fb = c.node(1).archive_first_base();
+        assert!(
+            fb <= held_at,
+            "the writer's node purged to {fb}, past its chain end {held_at}"
+        );
+        // The keep hold is the deferred set the chain reaches next (the
+        // writer rescans on its retry ladder, up to 60 s apart).
+        await_until(90, "the keep hold names the deferred set", || {
+            shared.set_hold.load(Ordering::Acquire) == p_last
+        });
+        let released = || {
+            c.node(1)
+                .observability()
+                .backup_hold_released
+                .load(Ordering::Relaxed)
+        };
+        assert_eq!(released(), 0);
+
+        c.node(1).set_free_bytes_for_test(1);
+        await_until(30, "low space released the hold", || {
+            c.node(1).archive_first_base() > held_at
+        });
+        assert!(shared.hold_released.load(Ordering::Acquire));
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(released(), 1, "one release per episode");
+        let fb = c.node(1).archive_first_base();
+
+        drop(guard);
+        c.node(1).set_free_bytes_for_test(0);
+        let w = await_watermark(&c, l, 120, |w| w.oldest_set > held_at);
+        assert!(
+            w.oldest_set >= fb,
+            "the new chain starts at a set ({}) at or above the journal's start {fb}",
+            w.oldest_set
+        );
+        assert!(
+            shared.stats.gaps.load(Ordering::Relaxed) >= 1,
+            "gap counted"
+        );
+        // The next floor move re-arms the hold.
+        churn(&c, &all, 1);
+        await_until(30, "space back: the hold re-armed", || {
+            !shared.hold_released.load(Ordering::Acquire)
+        });
+        assert_eq!(released(), 1);
+        let _keep = c.stop();
+    }
+
+    /// Ruling R9a: a writer that stopped for good (a foreign `TIER`)
+    /// releases its hold entirely — its node purges like any other.
+    #[test]
+    fn a_stopped_writer_releases_its_hold() {
+        let _g = serialize();
+        let tier = tmp_tier();
+        open_or_create_tier(&FsTarget::new(tier.path()), "other", 1).unwrap();
+        let cfg = writer_cfg(tier.path(), 1 << 20, Duration::from_millis(300));
+        let mut c = spawn(3, 0, opts("tier-stopped", true), |i| {
+            (i == 1).then(|| cfg.clone())
+        });
+        start_sums(&mut c);
+        await_single_leader(&c, 30);
+        await_capable(&c);
+        let shared = c.node(1).backup_writer().unwrap();
+        await_until(30, "the writer stopped", || {
+            shared.stopped.load(Ordering::Acquire)
+        });
+        let all = c.running();
+        churn(&c, &all, 3);
+        await_until(60, "the stopped writer's node purged", || {
+            c.node(1).archive_first_base() > 0
+        });
+        let _keep = c.stop();
+    }
 }
