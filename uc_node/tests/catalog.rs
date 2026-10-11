@@ -2076,6 +2076,76 @@ fn a_restarted_in_memory_service_starts_from_the_local_set() {
     c.stop();
 }
 
+/// #98: an instant commanded before the row's first client command freezes
+/// an EMPTY image — `RegisterSm`'s cursor is `None`, because nothing was
+/// applied. A service restarted on that start set must start from it (and
+/// then apply what comes after), not fail-stop on "left the state machine
+/// at None". `SumSm` cannot show this: its image always records a cursor
+/// (`unwrap_or(0)`), so the real `RegisterSm` the capstone met it with is
+/// the fixture.
+///
+/// Red twin (as found): the restarted `start()` returns `Replay("start-set
+/// install at P left the state machine at None …")`.
+#[test]
+fn a_service_restarted_on_a_set_frozen_before_any_write_starts_from_it() {
+    use uc_lincheck::register::{Cmd, RegisterSm};
+    let _g = serialize();
+    let start_register = |dir: &Path, app: &str| {
+        uc_service::ServiceBuilder::new(svc_cfg(dir, app), RegisterSm::default())
+            .start()
+            .expect("service start")
+    };
+    let mut c = spawn(
+        3,
+        0,
+        Opts {
+            services: ServicesConfig::single(<RegisterSm as uc_service::StateMachine>::NAME),
+            ..opts("lifecycle-empty-set", false)
+        },
+        |_| true,
+    );
+    let leader = await_single_leader(&c, 30);
+    let v = *c.voters().iter().find(|&&i| i != leader).unwrap();
+    let mut v_svc = None;
+    for i in c.running() {
+        let s = start_register(&c.nodes[i].instance_dir, c.app);
+        if i == v {
+            v_svc = Some(s);
+        } else {
+            c.svcs.push(stopper(s));
+        }
+    }
+    await_capable(&c, &[0]);
+    // No client command before the instant: every row freezes empty.
+    let p = instant_until_complete(&c, leader, &[0, 1, 2]);
+    await_agreed(&c, &[0, 1, 2], p);
+    let version = <RegisterSm as uc_service::StateMachine>::VERSION;
+    let page = c.cnc(v);
+    await_or_dump(&c, p, 30, "the node published its start set", || {
+        page.service_slot(0).snapshot_pos.start_set() == Some((p, version))
+    });
+    v_svc.take().unwrap().stop();
+    let svc = start_register(c.dir(v), c.app);
+    await_or_dump(
+        &c,
+        p,
+        60,
+        "the restarted row applied to the start set",
+        || page.service_slot(0).applied.load_acquire() >= p,
+    );
+    // …and it continues: a write after the set reaches the restarted row.
+    let write =
+        bincode::serde::encode_to_vec(Cmd::Write(42), bincode::config::standard()).expect("encode");
+    let target = c.node(leader).counters().append.load_acquire() + 32 + write.len() as u64;
+    c.node(leader).submit(write).expect("submit");
+    await_until(60, "the write committed", || {
+        c.node(leader).counters().commit.load_acquire() >= target
+    });
+    await_applied(&c, leader, &[v], &[0]);
+    c.svcs.push(stopper(svc));
+    c.stop();
+}
+
 /// Snapshot-lifecycle spec §11 e2e 4: a pin naming an origin that is
 /// complete on the leader but not yet AGREED is refused `61
 /// pin_origin_not_agreed`; once agreement lands the same pin is accepted.

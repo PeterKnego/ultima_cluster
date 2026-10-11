@@ -339,10 +339,6 @@ journal the tier does not yet hold. Three consequences:
 
 ## Known limits
 
-- A set taken before a row applied anything cannot start a service. If you
-  restore to such a set, the row's service refuses to attach
-  ([#98](https://github.com/PeterKnego/ultima_cluster/issues/98)). Sets taken
-  after the first command applied are fine.
 - A cluster registers at most four tiers. `uc2ctl tier forget` frees a slot;
   the tier's files stay.
 - A writer never rewrites an object. A target that silently changes a

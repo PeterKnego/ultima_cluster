@@ -68,6 +68,22 @@ fn first_log_for(row: u8, pos: u64) -> bool {
     LOGGED[row as usize].swap(pos, Ordering::Relaxed) != pos
 }
 
+/// The trait-contract check after an install at the tag `pos` (the start
+/// set here, the pinned origin in `attach`): `install_snapshot` returned
+/// `pos`, and left the state machine's cursor strictly BELOW it. The tag is
+/// an EXCLUSIVE frontier, so a cursor at or above `pos` claims the frame
+/// starting at `pos`, and the apply loop's idempotency guard would skip it.
+///
+/// `None` passes (#98): it is how an image frozen before the row applied
+/// anything restores, and it sits below every tag exactly as a recorded
+/// cursor does. Nothing resumes from it: both callers resume the follower
+/// AT `pos`, and overrun recovery measures from the higher of this cursor
+/// and the follower's (Task 8 ruling R5), as it already does for any
+/// recorded cursor far below the tag.
+pub(crate) fn install_landed(pos: u64, installed: u64, cursor: Option<u64>) -> bool {
+    installed == pos && cursor < Some(pos)
+}
+
 /// Spec §5 rule 2: install the row's start set `set` (the slot's pair, read
 /// once by the caller — the same read [`start_set_permitted`] judged) when it
 /// is strictly ahead of
@@ -127,12 +143,9 @@ pub(crate) fn install_start_set<S: RawStateMachine>(
     }
     let installed = (install)(sm, pos, &mut file)
         .map_err(|e| ServiceError::Replay(format!("start-set install at {pos}: {e}")))?;
-    // The same two trait-contract checks the pinned install makes: the tag
-    // is an EXCLUSIVE frontier, so a cursor left AT or above `pos` swallows
-    // the frame starting at `pos`, and a cursor left at `None` would restart
-    // the replay from genesis on top of the installed image.
+    // The same trait-contract check the pinned install makes.
     let cursor = sm.last_applied();
-    if installed != pos || cursor.is_none() || cursor >= Some(pos) {
+    if !install_landed(pos, installed, cursor) {
         return Err(ServiceError::Replay(format!(
             "start-set install at {pos} left the state machine at {cursor:?} \
              (returned {installed}); install_snapshot must land at the tag \
@@ -450,6 +463,84 @@ mod tests {
             ),
             Err(ServiceError::Replay(_))
         ));
+    }
+
+    /// #98: a set frozen before the row applied anything carries an EMPTY
+    /// image whose cursor is `None` — a state machine with nothing applied
+    /// has no position to report. It installs like any other set: both
+    /// callers resume AT the returned tag, never at the state machine's own
+    /// cursor, and `None` sits below every tag exactly as a recorded cursor
+    /// does.
+    #[test]
+    fn a_start_set_frozen_before_the_row_applied_anything_is_installed() {
+        let (p, dir) = (page(), scratch());
+        let store = SnapshotStore::open(dir.path(), 0).unwrap();
+        publish(&store, 128, 0, 0);
+        let slot = p.service_slot(0);
+        slot.snapshot_pos.store_start_set(128, 0);
+        let empty: InstallFn<Sum> = Box::new(|sm: &mut Sum, pos, src| {
+            let mut b = [0u8; 16];
+            src.read_exact(&mut b)?;
+            sm.total = 0;
+            sm.last = None;
+            Ok(pos)
+        });
+        let mut sm = fresh();
+        assert_eq!(
+            install_start_set(
+                &mut sm,
+                slot.snapshot_pos.start_set(),
+                0,
+                0,
+                8192,
+                &store,
+                &empty
+            )
+            .unwrap(),
+            Some(128)
+        );
+        assert_eq!((sm.total, sm.last), (0, None));
+    }
+
+    /// The exclusive-frontier check survives #98: a cursor left AT the tag
+    /// (or above it) claims the frame starting there, which the resumed
+    /// follower would then skip — still a fail-stop, as is a wrong return.
+    #[test]
+    fn an_install_leaving_the_cursor_at_the_tag_is_a_fail_stop() {
+        let (p, dir) = (page(), scratch());
+        let store = SnapshotStore::open(dir.path(), 0).unwrap();
+        publish(&store, 4096, 0, 77);
+        let slot = p.service_slot(0);
+        slot.snapshot_pos.store_start_set(4096, 0);
+        let at_tag: InstallFn<Sum> = Box::new(|sm: &mut Sum, pos, _| {
+            sm.last = Some(pos);
+            Ok(pos)
+        });
+        let mut sm = fresh();
+        assert!(matches!(
+            install_start_set(
+                &mut sm,
+                slot.snapshot_pos.start_set(),
+                0,
+                0,
+                8192,
+                &store,
+                &at_tag
+            ),
+            Err(ServiceError::Replay(_))
+        ));
+    }
+
+    /// The post-install predicate both install sites share (the start set
+    /// here, the pinned origin in `attach`).
+    #[test]
+    fn install_landed_admits_any_cursor_strictly_below_the_tag() {
+        assert!(install_landed(4096, 4096, None), "#98: an empty image");
+        assert!(install_landed(4096, 4096, Some(0)));
+        assert!(install_landed(4096, 4096, Some(4064)));
+        assert!(!install_landed(4096, 4096, Some(4096)), "cursor at the tag");
+        assert!(!install_landed(4096, 4096, Some(4128)), "cursor above it");
+        assert!(!install_landed(4096, 4064, None), "returned another tag");
     }
 
     /// Spec §5 rule 1 as amended by pin completion ruling C2: a pinned row
