@@ -1519,4 +1519,63 @@ mod writer_e2e {
         });
         let _keep = c.stop();
     }
+
+    /// Ruling R9b: with `retain_sets = 1` (the default), every new agreed
+    /// instant retires the previous set from the catalog — so a set above
+    /// the chain end must reach the tier BEFORE the next instant, not when
+    /// `chunk_bytes` or `quiet_interval` next cuts. Here neither ever cuts
+    /// (64 MiB, 60 s): only set boundaries drive the chain, and each of
+    /// three instants must land in the tier, on one chain from `S0`.
+    #[test]
+    fn frequent_instants_each_reach_the_tier() {
+        let _g = serialize();
+        let tier = tmp_tier();
+        let cfg = writer_cfg(tier.path(), 64 << 20, Duration::from_secs(60));
+        let mut c = spawn(3, 0, opts("tier-frequent", false), |i| {
+            (i == 1).then(|| cfg.clone())
+        });
+        start_sums(&mut c);
+        let l = await_single_leader(&c, 30);
+        await_capable(&c);
+        let all = c.running();
+        submit_frames(c.node(l), 200);
+        let s0 = instant_until_complete(&c, l, &all);
+        await_agreed(&c, &all, s0);
+        await_watermark(&c, l, 30, |w| w.oldest_set == s0);
+        let t = FsTarget::new(tier.path());
+        let mut sets = Vec::new();
+        for _ in 0..3 {
+            submit_frames(c.node(l), 2000); // ~256 KiB
+            let p = instant_until_complete(&c, l, &all);
+            await_agreed(&c, &all, p);
+            await_until(20, &format!("set {p} reached the tier"), || {
+                list_tier(&t).unwrap().sets.iter().any(|x| x.position == p)
+            });
+            sets.push(p);
+        }
+        let last = *sets.last().unwrap();
+        let w = await_watermark(&c, l, 30, |w| w.newest_set == last);
+        assert_eq!(w.oldest_set, s0, "one chain from S0: {w:?}");
+        let shared = c.node(1).backup_writer().unwrap();
+        assert_eq!(shared.stats.gaps.load(Ordering::Relaxed), 0, "no gap");
+        let _keep = c.stop();
+        let listing = list_tier(&t).unwrap();
+        for p in std::iter::once(s0).chain(sets.iter().copied()) {
+            assert!(
+                listing.sets.iter().any(|x| x.position == p),
+                "set {p} complete in the tier: {listing:?}"
+            );
+        }
+        assert!(reach_from(&listing.chunks, s0) >= w.through);
+        assert!(
+            listing
+                .chunks
+                .iter()
+                .all(|&(_, to)| to == s0 || sets.contains(&to)),
+            "every chunk ends at a set boundary: {:?} (sets {sets:?})",
+            listing.chunks
+        );
+        let report = verify(&t, true).unwrap();
+        assert!(report.findings.is_empty(), "{:?}", report.findings);
+    }
 }

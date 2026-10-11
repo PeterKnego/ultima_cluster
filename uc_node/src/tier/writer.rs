@@ -240,6 +240,10 @@ pub struct Writer {
     /// `(E, C)` of the last quiet cut declined because `[E, C)` held only
     /// tier bookkeeping: not re-walked until either moves.
     quiet_declined: Option<(u64, u64)>,
+    /// Ruling R9b: the agreed, locally held set `pick_set` is deferring
+    /// (above the chain end, journal still reaching it). The next cut ends
+    /// exactly at it, so it is copied before the catalog retires it.
+    deferred: Option<u64>,
 }
 
 fn journal_err(e: impl std::fmt::Display) -> TierError {
@@ -343,6 +347,51 @@ fn keep_hold(held_newest_first: &[u64], through: Option<u64>, first_base: u64) -
         return None;
     }
     held_newest_first.iter().copied().filter(|&p| p > t).min()
+}
+
+/// Ruling R9b: the cut's limit from the chain end `e` under the ceiling
+/// `c`, and whether a deferred set forces it now. A deferred set `P` in
+/// `(e, c]` makes the cut end exactly at `P` (a frame end: the `SNAPSHOT`
+/// frame ends there) — or, when `P` lies more than one `chunk_bytes` away,
+/// at the last frame end within one chunk, one step at a time. Otherwise
+/// (none deferred, or `P` above `C`) the ordinary rules apply.
+fn cut_limit(e: u64, c: u64, chunk_bytes: u64, deferred: Option<u64>) -> (u64, bool) {
+    let chunk_end = e.saturating_add(chunk_bytes);
+    match deferred {
+        Some(p) if p > e && p <= c => (p.min(chunk_end), true),
+        _ => (c.min(chunk_end), false),
+    }
+}
+
+/// Pass 1 of a cut: walk `[e, …)` to the last frame end within `limit` (at
+/// least one frame when one fits under `c`). `(to, crc of the canonical
+/// bytes, holds anything but tier bookkeeping)`; `None` when the journal
+/// no longer holds `e`.
+fn walk_cut(
+    journal: &Journal,
+    e: u64,
+    c: u64,
+    limit: u64,
+) -> Result<Option<(u64, u32, bool)>, TierError> {
+    let Some(mut cur) = FrameCursor::open(journal, e)? else {
+        return Ok(None);
+    };
+    let mut crc = crc32fast::Hasher::new();
+    let mut scratch = Vec::new();
+    let mut substantive = false;
+    loop {
+        let lim = if cur.pos == e { c } else { limit };
+        scratch.clear();
+        match cur.next_frame(lim, &mut scratch)? {
+            Walk::Frame => {
+                crc.update(&scratch);
+                substantive |= !is_tier_bookkeeping(&scratch);
+            }
+            Walk::Limit => break,
+            Walk::Gone => return Ok(None),
+        }
+    }
+    Ok(Some((cur.pos, crc.finalize(), substantive)))
 }
 
 /// What one step of a [`FrameCursor`] found.
@@ -541,6 +590,7 @@ impl Writer {
             last_offer: None,
             gap_logged: None,
             quiet_declined: None,
+            deferred: None,
         }
     }
 
@@ -783,6 +833,11 @@ impl Writer {
             // mismatched set drops out.
             let hold = keep_hold(&positions, through, first_base).unwrap_or(0);
             self.shared.set_hold.store(hold, Ordering::Release);
+            // Ruling R9b: a held set above the chain end, waiting for it.
+            self.deferred = match through {
+                Some(t) if hold > t && first_base <= t => Some(hold),
+                _ => None,
+            };
             let Some(p) = pick_set(&positions, through, first_base) else {
                 return Ok(false); // nothing eligible: deferred, or none held
             };
@@ -949,44 +1004,32 @@ impl Writer {
             self.note_gap(e, first_base);
             return Ok(false); // the set phase starts the next chain
         }
-        let last = self.last_cut_ns.unwrap_or(now_ns);
-        let quiet = self.cfg.quiet_interval.as_nanos() as u64;
-        if c - e < self.cfg.chunk_bytes && now_ns.saturating_sub(last) < quiet {
-            return Ok(false);
-        }
+        let (limit, to_set) = cut_limit(e, c, self.cfg.chunk_bytes, self.deferred);
         let full = c - e >= self.cfg.chunk_bytes;
-        if !full && self.quiet_declined == Some((e, c)) {
-            return Ok(false);
+        // Ruling R9b: a deferred set's boundary is cut at once — not after
+        // `chunk_bytes` or `quiet_interval` — and is substantive by
+        // definition, so the quiet-cut filter never declines it.
+        if !to_set {
+            let last = self.last_cut_ns.unwrap_or(now_ns);
+            let quiet = self.cfg.quiet_interval.as_nanos() as u64;
+            if !full && now_ns.saturating_sub(last) < quiet {
+                return Ok(false);
+            }
+            if !full && self.quiet_declined == Some((e, c)) {
+                return Ok(false);
+            }
         }
-        let limit = c.min(e + self.cfg.chunk_bytes);
 
         // Pass 1: the last frame end within the limit (at least one frame
         // when one fits under C), and the CRC of the canonical bytes.
         let journal = &*self.journal;
-        let Some(mut cur) = FrameCursor::open(journal, e)? else {
+        let Some((to, crc, substantive)) = walk_cut(journal, e, c, limit)? else {
             return Ok(false); // purged under us; the next pass sees the gap
         };
-        let mut crc = crc32fast::Hasher::new();
-        let mut scratch = Vec::new();
-        let mut substantive = false;
-        loop {
-            let lim = if cur.pos == e { c } else { limit };
-            scratch.clear();
-            match cur.next_frame(lim, &mut scratch)? {
-                Walk::Frame => {
-                    crc.update(&scratch);
-                    substantive |= !is_tier_bookkeeping(&scratch);
-                }
-                Walk::Limit => break,
-                Walk::Gone => return Ok(false),
-            }
-        }
-        let to = cur.pos;
-        if to == e || (!full && !substantive) {
+        if to == e || (!full && !to_set && !substantive) {
             self.quiet_declined = Some((e, c));
             return Ok(false);
         }
-        let crc = crc.finalize();
 
         // Pass 2: stream the same range into the tier object; a second walk
         // that saw different bytes refuses the object before it is placed.
@@ -1273,6 +1316,41 @@ mod tests {
         // Nothing held.
         assert_eq!(keep_hold(&[], None, 0), None);
         assert_eq!(keep_hold(&[], Some(600), 0), None);
+    }
+
+    /// Ruling R9b: a deferred set `P` ends the next cut exactly at `P`; a
+    /// `P` more than one chunk away ends it at the last frame end within
+    /// `through + chunk_bytes`; no deferred set (or `P` above `C`) keeps
+    /// the ordinary limit and no forcing.
+    #[test]
+    fn a_deferred_set_ends_the_cut_at_its_position() {
+        // The limit rule.
+        assert_eq!(cut_limit(0, 192, 1 << 20, Some(128)), (128, true));
+        assert_eq!(cut_limit(0, 192, 100, Some(128)), (100, true));
+        assert_eq!(cut_limit(0, 192, 1 << 20, None), (192, false));
+        assert_eq!(cut_limit(0, 192, 100, None), (100, false));
+        assert_eq!(cut_limit(0, 192, 1 << 20, Some(256)), (192, false), "P > C");
+        assert_eq!(
+            cut_limit(128, 192, 1 << 20, Some(128)),
+            (192, false),
+            "P <= E"
+        );
+        // …and the walk lands on frame ends: three 64 B frames, P = 128.
+        let d = tempdir();
+        let block = [
+            frame(FRAME_TYPE_MESSAGE, 40, 1),
+            frame(FRAME_TYPE_MESSAGE, 40, 2),
+            frame(FRAME_TYPE_MESSAGE, 40, 3),
+        ]
+        .concat();
+        let j = journal_with(d.path(), &[(0, block)]);
+        let to = |chunk, deferred| {
+            let (limit, _) = cut_limit(0, 192, chunk, deferred);
+            walk_cut(&j, 0, 192, limit).unwrap().unwrap().0
+        };
+        assert_eq!(to(1 << 20, Some(128)), 128, "exactly at P");
+        assert_eq!(to(100, Some(128)), 64, "last frame end within one chunk");
+        assert_eq!(to(1 << 20, None), 192, "the old rule: up to C");
     }
 
     /// Task 9: the purge cap a node reads — the writer's progress while the
