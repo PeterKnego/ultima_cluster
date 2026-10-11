@@ -3172,8 +3172,17 @@ fn a_voter_fetches_a_learners_set_store_only_and_its_floor_moves() {
         "the fetching voter must hold no set before the fetch"
     );
 
-    // Claim 1: the named refusal, before anything is pending.
-    let above = v_node.counters().durable.load_acquire() + 4096;
+    // Claim 1: the named refusal, before anything is pending. The target must
+    // stay above this voter's durable frontier until `request_fetch` reads
+    // it: the leader keeps appending small CLUSTER frames after the instant
+    // (snapshot reports), so a few KiB of headroom raced a catching-up voter
+    // in CI. Clear the leader's log end by 1 MiB, which nothing here reaches.
+    let above = v_node
+        .counters()
+        .durable
+        .load_acquire()
+        .max(f.node(f.leader).counters().append.load_acquire())
+        + (1 << 20);
     assert_eq!(
         v_node.request_fetch(learner_id, Some(above)),
         Err(uc_node::FetchRefusal::AboveDurable),
