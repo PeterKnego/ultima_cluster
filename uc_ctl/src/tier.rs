@@ -87,7 +87,7 @@ pub fn show(target: &Path, instance_dir: Option<&Path>) -> anyhow::Result<()> {
         println!("restorable: none (no complete set with journal after it)");
     }
     for (a, b) in ranges {
-        println!("restorable: [{a}, {b}] (a frame end Q with {a} < Q <= {b})");
+        println!("restorable: ({a}, {b}] (a frame end Q with {a} < Q <= {b})");
     }
     if let Some(d) = instance_dir {
         match uc_node::cluster_agent::read_committed_backups(d)

@@ -381,6 +381,25 @@ fn cut_limit(e: u64, c: u64, chunk_bytes: u64, deferred: Option<u64>) -> (u64, b
     }
 }
 
+/// Rulings R8b + R11a: whether a cut that is neither full nor forced by a
+/// deferred set is declined. A range holding only tier bookkeeping
+/// (padding, `BackupWatermark`) is declined — otherwise an idle writer
+/// would back up its own reports forever — EXCEPT once when the chain ends
+/// exactly at its newest complete set (`through == newest_set`): a set
+/// with no byte of chain after it is not restorable (a restore point lies
+/// strictly above its set), and on an idle cluster nothing but bookkeeping
+/// ever follows it. After that one cut `through > newest_set`, so the skip
+/// holds again.
+fn declines_quiet_cut(
+    full: bool,
+    to_set: bool,
+    substantive: bool,
+    through: u64,
+    newest_set: u64,
+) -> bool {
+    !full && !to_set && !substantive && through != newest_set
+}
+
 /// Pass 1 of a cut: walk `[e, …)` to the last frame end within `limit` (at
 /// least one frame when one fits under `c`). `(to, crc of the canonical
 /// bytes, holds anything but tier bookkeeping)`; `None` when the journal
@@ -1152,7 +1171,7 @@ impl Writer {
     // ---------------------------------------------------------- journal
 
     fn cut_one_chunk(&mut self, now_ns: u64) -> Result<bool, TierError> {
-        let Some((_, _, e)) = self.wm else {
+        let Some((_, newest_set, e)) = self.wm else {
             return Ok(false); // no set in the tier yet: nothing to extend
         };
         let k = self.cnc.counters();
@@ -1187,7 +1206,7 @@ impl Writer {
         let Some((to, crc, substantive)) = walk_cut(journal, e, c, limit)? else {
             return Ok(false); // purged under us; the next pass sees the gap
         };
-        if to == e || (!full && !to_set && !substantive) {
+        if to == e || declines_quiet_cut(full, to_set, substantive, e, newest_set) {
             self.quiet_declined = Some((e, c));
             return Ok(false);
         }
@@ -1341,6 +1360,23 @@ mod tests {
     /// and every frame's alignment slack zeroed; and a walk that reaches the
     /// journal's end (`durable`) stops there instead of reading a block that
     /// does not exist yet (the bug a quiet cut at exactly `C == durable` hit).
+    /// Rulings R8b + R11a: a bookkeeping-only quiet cut is declined unless
+    /// the chain ends exactly at its newest set; a substantive, full or
+    /// set-forced cut always goes ahead.
+    #[test]
+    fn a_bookkeeping_only_quiet_cut_runs_once_past_a_set_that_ends_the_chain() {
+        // Bookkeeping only, chain ends at the newest set: cut.
+        assert!(!declines_quiet_cut(false, false, false, 4096, 4096));
+        // Bookkeeping only, chain already past the newest set: skip.
+        assert!(declines_quiet_cut(false, false, false, 5000, 4096));
+        // Substantive: cut either way.
+        assert!(!declines_quiet_cut(false, false, true, 5000, 4096));
+        assert!(!declines_quiet_cut(false, false, true, 4096, 4096));
+        // Full or forced by a deferred set: never declined.
+        assert!(!declines_quiet_cut(true, false, false, 5000, 4096));
+        assert!(!declines_quiet_cut(false, true, false, 5000, 4096));
+    }
+
     #[test]
     fn the_walk_is_raw_canonical_and_stops_at_the_limit() {
         let d = tempdir();

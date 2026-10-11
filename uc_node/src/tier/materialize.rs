@@ -78,8 +78,9 @@ fn corrupt(what: impl Into<String>, detail: impl Into<String>) -> TierError {
 }
 
 /// Every `(set, reach)` a restore can start from — a complete set with at
-/// least one byte of chain after it — merged into disjoint `[a, b]` ranges.
-/// A restore point Q is a frame end with `a < Q <= b`.
+/// least one byte of chain after it — merged into disjoint ranges `(a, b]`:
+/// a restore point Q is a frame end with `a < Q <= b`, never a set position
+/// itself (ruling R11a).
 pub fn restorable_ranges(l: &TierListing) -> Vec<(u64, u64)> {
     let mut spans: Vec<(u64, u64)> = l
         .sets
@@ -105,7 +106,7 @@ fn unreachable(l: &TierListing, why: &str) -> TierError {
     } else {
         ranges
             .iter()
-            .map(|(a, b)| format!("[{a}, {b}]"))
+            .map(|(a, b)| format!("({a}, {b}]"))
             .collect::<Vec<_>>()
             .join(", ")
     };
@@ -796,7 +797,7 @@ mod tests {
             let d = out(&fx, &format!("q{q}"));
             let m = refusal(materialize(&t, Some(q), &d, Mode::Recovery, 1));
             assert!(m.contains("restore_point_unreachable"), "{q}: {m}");
-            assert!(m.contains("restorable [1024, 4096]"), "{q}: {m}");
+            assert!(m.contains("restorable (1024, 4096]"), "{q}: {m}");
             assert!(!d.exists(), "{q}: a refusal leaves no directory");
         }
     }

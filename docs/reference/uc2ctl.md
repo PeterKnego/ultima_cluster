@@ -824,9 +824,9 @@ identity (`tier_id`, `app_id`, `created_ns`), every complete set (position,
 kind, time, row count, and how far its chain reaches), every set directory
 with no `SET` label (`INCOMPLETE` — an interrupted copy, never a restore
 start), every journal chunk `[from, to)`, the watermark (`oldest_set`,
-`newest_set`, `through`), and one `restorable: [a, b]` line per range a
+`newest_set`, `through`), and one `restorable: (a, b]` line per range a
 restore can be built in — a restore point `Q` is a frame end with
-`a < Q <= b`. With `--instance-dir`, it also prints the committed backup
+`a < Q <= b`, never a set position itself. With `--instance-dir`, it also prints the committed backup
 watermarks that node's newest cluster artifact holds, marking the one that
 is this tier (`no cluster artifact yet` until that node's first instant).
 Filesystem-only; the node may be running.
@@ -889,7 +889,7 @@ it again if the command created it):
 - `TargetNotEmpty` — `<DIR>`'s `journal/`, `state/` or `snapshots/` is not
   empty (volatile leftovers such as `cnc2.dat` and an unheld
   `instance.lock` are fine);
-- `restore_point_unreachable: restorable [a, b] …` — `Q` is outside every
+- `restore_point_unreachable: restorable (a, b] …` — `Q` is outside every
   restorable range, at a set position (an empty journal span), or not a frame
   end;
 - `restore set <S> incomplete: <object> missing`, or `tier_set_mismatch` —

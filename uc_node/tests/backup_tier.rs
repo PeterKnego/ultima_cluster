@@ -982,6 +982,77 @@ mod writer_e2e {
         drop(fresh);
     }
 
+    /// Ruling R11a: an IDLE cluster's freshly copied set must become
+    /// restorable. After the instant only bookkeeping frames (padding, the
+    /// writer's own `BackupWatermark` reports) follow it, which R8b's quiet
+    /// filter declines — so the writer allows ONE bookkeeping-only cut when
+    /// the chain ends exactly at its newest set. The tier's `through` then
+    /// passes the set, a restore builds and verifies, and over several more
+    /// quiet intervals no further chunk is cut (the R8b loop stays broken).
+    /// (In this fixture the instant's own `SnapshotReport` frames — CLUSTER
+    /// kind 5, substantive — already follow the set, so this guards the
+    /// outcome; the predicate's exception is pinned by the writer's unit
+    /// test.)
+    #[test]
+    fn an_idle_clusters_new_set_becomes_restorable() {
+        let _g = serialize();
+        let tier = tmp_tier();
+        let cfg = writer_cfg(tier.path(), 64 << 20, Duration::from_millis(500));
+        let mut c = spawn(3, 0, opts("tier-idle", false), |i| {
+            (i == 1).then(|| cfg.clone())
+        });
+        start_sums(&mut c);
+        let l = await_single_leader(&c, 30);
+        await_capable(&c);
+        let all = c.running();
+        submit_frames(c.node(l), 50);
+        let s = instant_until_complete(&c, l, &all);
+        await_agreed(&c, &all, s);
+        // No client traffic from here on.
+
+        let t = FsTarget::new(tier.path());
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let through = loop {
+            let l = list_tier(&t).unwrap();
+            if let Some((_, newest, through)) = watermark_of(&l)
+                && newest == s
+                && through > s
+            {
+                break through;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the idle tier never reached past its set {s}: {l:?}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+
+        let fresh = tempfile::Builder::new()
+            .prefix("uc2-tier-idle-restore-")
+            .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+            .expect("tempdir");
+        let nd = fresh.path().join("r");
+        let m = materialize(&t, None, &nd, Mode::Recovery, 1).expect("materialize");
+        assert_eq!(m.start_set, s);
+        assert!(m.q >= through);
+        let rep = uc_node::backup::verify_artifact(&nd).expect("verify accepts");
+        assert_eq!((rep.journal_first_base, rep.journal_last_pos), (s, m.q));
+
+        // The loop stays broken: once the tier has settled, six more quiet
+        // intervals add at most one chunk (an endless bookkeeping loop would
+        // add one per interval).
+        std::thread::sleep(Duration::from_millis(1500));
+        let settled = list_tier(&t).unwrap().chunks.len();
+        std::thread::sleep(Duration::from_millis(3000));
+        let after = list_tier(&t).unwrap().chunks;
+        assert!(
+            after.len() <= settled + 1,
+            "an idle tier kept cutting chunks: {settled} -> {} ({after:?})",
+            after.len()
+        );
+        let _keep = c.stop();
+    }
+
     /// Spec §5.3: with less than `chunk_bytes` of new history, the writer
     /// still cuts once `quiet_interval` has passed — a quiet cluster's tail
     /// reaches the tier within seconds, not at the next 64 MiB.
