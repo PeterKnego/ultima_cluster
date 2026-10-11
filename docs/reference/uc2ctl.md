@@ -87,13 +87,14 @@ window.
 Sub-commands are: `add-learner`, `promote`, `demote`, `remove-learner`,
 `remove-voter`, `schedule apply`, `schedule show`, `settings apply`,
 `settings show`, `snapshot`, `snapshot fetch`, `snapshot show`,
-`upgrade pin`, `upgrade show`, `status`.
+`upgrade pin`, `upgrade show`, `tier forget`, `status`.
 
 Every mutating one is a **cluster-FSM command** since 2.11.0: the
 reconfiguration ops append `CLUSTER kind = 1` (Membership), `schedule apply`
 appends `CLUSTER kind = 2`, `settings apply` appends `CLUSTER kind = 3`, and
 — since the FSM upgrade lifecycle — `upgrade pin` appends `CLUSTER kind = 4`
-(`UpgradePin`). The operator-facing surface is unchanged; what changed is
+(`UpgradePin`), and `tier forget` appends `CLUSTER kind = 7`
+(`BackupWatermark`, a `Forget`). The operator-facing surface is unchanged; what changed is
 that one internal state machine now applies all of these at commit
 ([the cluster FSM explainer](../notes/uc2-cluster-fsm-explained.md)).
 **Single in flight, across all of them**: the leader answers `retry` while
@@ -593,6 +594,31 @@ its record commits — see
 The cluster FSM's own artifact (`service_id = 255`) is **not** reported —
 `SnapshotReport.row` covers declared rows `0..8` only.
 
+### `tier forget`
+
+```
+uc2ctl tier forget --tier-id <ID> --instance-dir <DIR> --app-id <ID> [--admin-key <FILE>]
+```
+
+Drops one backup tier's committed watermark from the cluster state — admin
+op **11**, audited `tier_forget`. `--tier-id` is the tier's 64-bit id as its
+`TIER` label carries it, `0x…` hex or decimal. The id does not fit one admin
+request field, so it travels split: its low 32 bits in `id`, its high 32 in
+`ip`, `port = 0` (the audit record's `detail` names the whole id as `tier
+<16 hex digits>`).
+
+Leader-only and single-in-flight like every `CLUSTER` command: a follower,
+or a leader with a previous `CLUSTER` command still above commit, answers
+`retry` — re-run it, against the node the leader hint names. On success it
+prints `forgotten: tier <hex> position=<P>`, where `P` is the `Forget`
+record's frame-END position. An id no tier is registered under is refused
+**62 `tier_unknown`**.
+
+Forgetting touches **only the cluster's record**: the tier's files are
+untouched, and a writer still pointed at the tier re-registers it on its next
+report. To retire a tier for good, remove its `[backup]` section from every
+node first, then forget it.
+
 ### `status`
 
 Prints the node's current config version and pending state, per-member
@@ -851,8 +877,10 @@ its own band for the same reason. 48–50 (2.11.0) are the coordinated-snapshot
 ops' own (`uc_node::REASON_SNAPSHOT_*`), split across `snapshot` (48, 49) and
 `snapshot fetch` (50). 51 is `schedule apply`'s own, added later. 52–59 (FSM
 upgrade lifecycle) are `upgrade pin`'s own (`uc_node::REASON_PIN_*` and
-`report_stale`), in their own band for the same reason, and 60 (#33) is the
-cluster FSM's refusal of a `RowGenesis` record.
+`report_stale`), in their own band for the same reason, 60 (#33) is the
+cluster FSM's refusal of a `RowGenesis` record, 61 (the snapshot catalog) is
+`upgrade pin`'s door check on an unagreed origin, and 62 (the backup tier) is
+`tier forget`'s refusal of an id no tier is registered under.
 
 | Code | Reason |
 |---|---|
@@ -895,6 +923,7 @@ cluster FSM's refusal of a `RowGenesis` record.
 | 59 | `report_stale` — a `SnapshotReport` below the row's held report position. Never produced by `uc2ctl`; recorded here because it shares op 10's refusal band |
 | 60 | `version_already_set` — a `RowGenesis` record (`CLUSTER` kind 6) for a row that already has a running version: genesis records a row's first version once and never changes one (#33). Never returned to `uc2ctl` — genesis is the leader's own append, with no admin request behind it — and listed here because it shares the band. A refused genesis changes nothing: like every refused `CLUSTER` record it advances the cluster FSM's `applied` and the row keeps the version it already had |
 | 61 | `pin_origin_not_agreed` — `--origin` is a complete set on this node but the snapshot catalog has not AGREED it (every reporting node's hash must match; reports take up to ~5 s after the instant). Wait for that set to agree (`uc2_catalog_agreed_position` reaches it), or take a new instant (`uc2ctl snapshot`) and pin that; a set that diverged never agrees. (54 accepts only this node's newest complete set, so an older agreed origin is not a way out.) On a cluster whose catalog is still empty (no complete set yet), the pin is allowed unchecked and the node logs `upgrade_pin_agreement_unchecked` |
+| 62 | `tier_unknown` — `uc2ctl tier forget --tier-id T` names a tier the committed cluster state does not hold: no backup writer has reported it, or it was already forgotten. Check the id against the tier's `TIER` label. Refused by the cluster FSM's own acceptance check (`BackupWatermark` `Forget`, `CLUSTER` kind 7), so nothing is appended |
 
 Code `0` is not a `ProposeError`. It is the CLI's own malformed-op sentinel.
 

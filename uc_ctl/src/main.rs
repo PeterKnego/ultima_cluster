@@ -79,6 +79,7 @@ use clap::{Parser, Subcommand};
 mod schedule;
 mod settings;
 mod snapshot;
+mod tier;
 mod upgrade;
 
 use uc_crypto::admin::{AdminKey, AdminMessage, generate_key_file, sign};
@@ -323,6 +324,42 @@ struct SettingsShowArgs {
     common: CommonArgs,
 }
 
+// ---------------------------------------------------------------- backup tier: tier
+
+#[derive(clap::Args)]
+struct TierArgs {
+    #[command(subcommand)]
+    cmd: TierCmd,
+}
+
+#[derive(Subcommand)]
+enum TierCmd {
+    /// Drop one tier's committed watermark (`ADMIN_OP_TIER_FORGET`, wire op
+    /// 11). Leader-only; refused `62 tier_unknown` when no tier has that id.
+    /// The tier's files are untouched, and a writer still pointed at it
+    /// re-registers it on its next report.
+    Forget(TierForgetArgs),
+}
+
+#[derive(clap::Args)]
+struct TierForgetArgs {
+    #[command(flatten)]
+    common: CommonArgs,
+    /// The tier's id, as the tier's `TIER` label carries it: `0x…` hex, or
+    /// decimal.
+    #[arg(long, value_parser = parse_hex_u64)]
+    tier_id: u64,
+}
+
+/// `0x…`/`0X…` hex, else decimal — a `u64`.
+fn parse_hex_u64(s: &str) -> Result<u64, String> {
+    let r = match s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        Some(hex) => u64::from_str_radix(hex, 16),
+        None => s.parse::<u64>(),
+    };
+    r.map_err(|e| format!("{s:?} is not a u64 (0x-prefixed hex or decimal): {e}"))
+}
+
 // ---------------------------------------------------------------- FSM upgrade lifecycle plan B1: upgrade
 
 #[derive(clap::Args)]
@@ -555,6 +592,10 @@ enum Cmd {
     /// coordinated instant (`ADMIN_OP_UPGRADE_PIN`, wire op 10) or show the
     /// committed pin history and hash verdicts.
     Upgrade(UpgradeArgs),
+    /// Backup-tier spec §6.3: manage the cluster's registered backup tiers
+    /// — `forget` drops one tier's committed watermark
+    /// (`ADMIN_OP_TIER_FORGET`, wire op 11).
+    Tier(TierArgs),
 }
 
 fn main() {
@@ -599,6 +640,9 @@ fn main() {
                 args.patch,
             ),
             UpgradeCmd::Show(args) => upgrade::show(&args.common),
+        },
+        Cmd::Tier(a) => match a.cmd {
+            TierCmd::Forget(args) => tier::forget(&args.common, args.tier_id),
         },
     };
     if let Err(e) = r {
@@ -727,6 +771,11 @@ fn reason_str(reason: u32) -> &'static str {
         // Snapshot-lifecycle spec §8: door-only, after 54.
         61 => {
             "pin_origin_not_agreed (the set at --origin is complete here but the catalog has not agreed it - wait for it to agree, which takes up to ~5 s after the instant (watch uc2_catalog_agreed_position reach it), or take a new instant (uc2ctl snapshot) and pin that; a set that diverged never agrees)"
+        }
+        // Backup-tier spec §6.3: `tier forget` named a tier the committed
+        // cluster state does not hold.
+        62 => {
+            "tier_unknown (no registered backup tier has that id — check it against the tier's TIER label)"
         }
         _ => "unknown/malformed",
     }
@@ -1823,6 +1872,53 @@ mod tests {
     fn reason_str_names_60_and_52() {
         assert_eq!(reason_str(60), "version_already_set");
         assert_eq!(reason_str(52), "row_undeclared");
+    }
+
+    /// Backup-tier spec §6.3: 62 names the unknown tier of a `tier forget`.
+    #[test]
+    fn reason_str_names_62() {
+        assert!(
+            reason_str(62).starts_with("tier_unknown"),
+            "{}",
+            reason_str(62)
+        );
+    }
+
+    /// `--tier-id` takes `0x…` hex or decimal; anything else is an error.
+    #[test]
+    fn parse_hex_u64_takes_hex_or_decimal() {
+        assert_eq!(
+            parse_hex_u64("0x0123456789abcdef"),
+            Ok(0x0123_4567_89AB_CDEF)
+        );
+        assert_eq!(parse_hex_u64("0XFF"), Ok(255));
+        assert_eq!(parse_hex_u64("42"), Ok(42));
+        assert!(parse_hex_u64("0x").is_err());
+        assert!(parse_hex_u64("abc").is_err());
+        assert!(parse_hex_u64("0x1_0000_0000_0000_0000").is_err());
+    }
+
+    /// `uc2ctl tier forget --tier-id <id>` parses to the variant and value.
+    #[test]
+    fn tier_forget_parses() {
+        let cli = Cli::try_parse_from([
+            "uc2ctl",
+            "tier",
+            "forget",
+            "--tier-id",
+            "0xff",
+            "--instance-dir",
+            "/x",
+            "--app-id",
+            "a",
+        ])
+        .expect("parses");
+        match cli.cmd {
+            Cmd::Tier(TierArgs {
+                cmd: TierCmd::Forget(f),
+            }) => assert_eq!(f.tier_id, 255),
+            _ => panic!("wrong variant"),
+        }
     }
 
     // Fix round 1 (Important): every `uc2ctl snapshot ...` invocation shape

@@ -109,6 +109,10 @@ pub const CONTRACT_SERIES: &[&str] = &[
     "uc2_snapshot_reports_unsent_total",
     "uc2_snapshot_reports_appended_total",
     "uc2_snapshot_reports_timed_out_total",
+    // Backup-tier spec §6.2: the watermark report path.
+    "uc2_backup_reports_sent_total",
+    "uc2_backup_reports_unsent_total",
+    "uc2_backup_reports_appended_total",
     // FSM upgrade lifecycle (plan B1)
     "uc2_upgrade_pin_origin",
     "uc2_upgrade_pin_version",
@@ -1055,6 +1059,24 @@ fn push_service_families(out: &mut String, s: &ObsSources, commit: u64, now: u64
         "The subset of uc2_snapshot_reports_appended_total that went in on the 5 s collection timeout rather than on every voter reporting. A brief run around a failover or a restart is expected; a rate that keeps pace with the appended counter means the records name too few voters to tell a divergent replica from an absent one, and an upgrade pin adjudicated from them is thinner evidence than it looks — check uc2_snapshot_reports_unsent_total and the set-completion gauges on the quiet nodes.",
         s.snapshot_reports_timed_out.load(Ordering::Relaxed),
     );
+    push_counter(
+        out,
+        "uc2_backup_reports_sent_total",
+        "BACKUP_REPORT datagrams this node handed the transport for the leader — one per backup-writer watermark claim taken while following (backup-tier spec §6.2). A LEADER hands its own writer's claim straight to its coalescer, so it exports 0 here. It counts the hand-off, not the delivery.",
+        s.backup_reports_sent.load(Ordering::Relaxed),
+    );
+    push_counter(
+        out,
+        "uc2_backup_reports_unsent_total",
+        "Polls of the backup writer's claim that found no leader to address (no leader hint, or one this node cannot resolve). The claim is put back and resent on the next poll (every 10 ms), so this counts passes without a leader, not lost watermarks; a brief run around a failover is expected, a sustained climb means this node's tier never reaches the committed watermark.",
+        s.backup_reports_unsent.load(Ordering::Relaxed),
+    );
+    push_counter(
+        out,
+        "uc2_backup_reports_appended_total",
+        "BackupWatermark records (CLUSTER kind 7) this node placed on the log while leading — at most one per tier per commit round trip; reports no further than the committed entry are dropped before appending. A follower appends none.",
+        s.backup_reports_appended.load(Ordering::Relaxed),
+    );
     push_gauge(
         out,
         "uc_services_declared",
@@ -1841,6 +1863,9 @@ mod tests {
             snapshot_reports_unsent: Arc::new(AtomicU64::new(0)),
             snapshot_reports_appended: Arc::new(AtomicU64::new(0)),
             snapshot_reports_timed_out: Arc::new(AtomicU64::new(0)),
+            backup_reports_sent: Arc::new(AtomicU64::new(0)),
+            backup_reports_unsent: Arc::new(AtomicU64::new(0)),
+            backup_reports_appended: Arc::new(AtomicU64::new(0)),
             cluster_view: test_cluster_view(),
             probe: uc_net::probe::ProbeTable::new(uc_net::probe::ProbeCadence::default()),
             commands_over_standard: Arc::new(AtomicU64::new(0)),
@@ -2118,7 +2143,7 @@ mod tests {
     fn the_contract_has_the_number_of_families_the_docs_state() {
         assert_eq!(
             CONTRACT_SERIES.len(),
-            127,
+            130,
             "if this is intentional, update the family count in \
              docs/how-to/monitor-a-cluster.md in the same commit"
         );
@@ -2618,6 +2643,9 @@ mod tests {
             snapshot_reports_unsent: Arc::new(AtomicU64::new(0)),
             snapshot_reports_appended: Arc::new(AtomicU64::new(0)),
             snapshot_reports_timed_out: Arc::new(AtomicU64::new(0)),
+            backup_reports_sent: Arc::new(AtomicU64::new(0)),
+            backup_reports_unsent: Arc::new(AtomicU64::new(0)),
+            backup_reports_appended: Arc::new(AtomicU64::new(0)),
             cluster_view: test_cluster_view(),
             probe: uc_net::probe::ProbeTable::new(uc_net::probe::ProbeCadence::default()),
             commands_over_standard: Arc::new(AtomicU64::new(0)),
@@ -2728,6 +2756,9 @@ mod tests {
             snapshot_reports_unsent: Arc::new(AtomicU64::new(0)),
             snapshot_reports_appended: Arc::new(AtomicU64::new(0)),
             snapshot_reports_timed_out: Arc::new(AtomicU64::new(0)),
+            backup_reports_sent: Arc::new(AtomicU64::new(0)),
+            backup_reports_unsent: Arc::new(AtomicU64::new(0)),
+            backup_reports_appended: Arc::new(AtomicU64::new(0)),
             cluster_view: test_cluster_view(),
             probe: uc_net::probe::ProbeTable::new(uc_net::probe::ProbeCadence::default()),
             commands_over_standard: Arc::new(AtomicU64::new(0)),
@@ -2831,6 +2862,9 @@ mod tests {
             snapshot_reports_unsent: Arc::new(AtomicU64::new(0)),
             snapshot_reports_appended: Arc::new(AtomicU64::new(0)),
             snapshot_reports_timed_out: Arc::new(AtomicU64::new(0)),
+            backup_reports_sent: Arc::new(AtomicU64::new(0)),
+            backup_reports_unsent: Arc::new(AtomicU64::new(0)),
+            backup_reports_appended: Arc::new(AtomicU64::new(0)),
             cluster_view: test_cluster_view(),
             probe: uc_net::probe::ProbeTable::new(uc_net::probe::ProbeCadence::default()),
             commands_over_standard: Arc::new(AtomicU64::new(0)),

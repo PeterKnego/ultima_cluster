@@ -128,9 +128,10 @@ impl AuditOrigin {
 /// `6 = schedule_apply` (time-and-timers plan 2 — the replicated schedule
 /// table), `7 = settings_apply` (cluster-FSM spec §6 — the replicated
 /// settings record), `8 = snapshot` and `9 = snapshot_fetch`
-/// (coordinated-snapshot spec §5.5/§5.7). None of the last four is a
+/// (coordinated-snapshot spec §5.5/§5.7), `10 = upgrade_pin` and
+/// `11 = tier_forget` (backup-tier spec §6.3). None of 6–11 is a
 /// configuration change and none reaches `wire_to_config_op`. An op outside
-/// 1..=9 is recorded as `"unknown"` rather than dropped — a malformed request
+/// 1..=11 is recorded as `"unknown"` rather than dropped — a malformed request
 /// is exactly the kind of thing an audit log exists to keep.
 ///
 /// For both STAGED-FILE ops the record's `id`/`addr` fields carry the staged
@@ -145,6 +146,14 @@ impl AuditOrigin {
 /// For `upgrade_pin` (plan B1) the `id`/`ip`/`port` carry the staged file's
 /// digest, exactly as for ops 6 and 7, and `config_version` is the appended
 /// frame's END position (or the committed cluster position on a refusal).
+///
+/// For `tier_forget` (backup-tier spec §6.3) the `u64` tier id is split
+/// across the request line: its LOW 32 bits in `id`, its HIGH 32 in `ip`
+/// (so `addr` renders the high half as `a.b.c.d:0`, or `null` when it is
+/// zero — read `detail`, which names the whole id as `tier <16 hex
+/// digits>`), `port` is `0`, and `config_version`
+/// is the `Forget` frame's END position (or the committed cluster position
+/// on a refusal or a retry).
 ///
 /// For the DISCOVERY `settings_apply` (`source = "discovery"`, jumbo spec §9)
 /// there is no signed staged file and no operator: `id` carries the datagram
@@ -167,6 +176,7 @@ pub fn op_name(op: u32) -> &'static str {
         8 => "snapshot",
         9 => "snapshot_fetch",
         10 => "upgrade_pin",
+        11 => "tier_forget",
         AUDIT_OP_ROW_GENESIS => "row_genesis",
         _ => "unknown",
     }
@@ -707,7 +717,8 @@ mod tests {
         assert_eq!(op_name(8), "snapshot");
         assert_eq!(op_name(9), "snapshot_fetch");
         assert_eq!(op_name(10), "upgrade_pin");
-        assert_eq!(op_name(11), "unknown");
+        assert_eq!(op_name(11), "tier_forget");
+        assert_eq!(op_name(12), "unknown");
         assert_eq!(op_name(AUDIT_OP_ROW_GENESIS), "row_genesis");
         assert_eq!(op_name(99), "unknown");
         assert_eq!(op_name(2), "promote");
