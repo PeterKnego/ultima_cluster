@@ -11022,7 +11022,15 @@ impl Consensus {
     ///   latches at once, whatever CLUSTER command is in flight; after the
     ///   latch a second uncommitted change is the kernel's `config_pending`
     ///   to refuse, so no single-in-flight gate is needed here (one was, from
-    ///   #100 until main CI showed a fresh leader answering retry). Without
+    ///   #100 until main CI showed a fresh leader answering retry). The latch
+    ///   is attempted HERE too, not only in `do_work` step 3a: a single-node
+    ///   leader's `serving` flips on the tick (step 4), after 3a and before
+    ///   step 5 publishes `can_serve`, so a request written against that
+    ///   first serving pass reached step 11 with the latch still unset and
+    ///   was answered retry (main CI red after #102,
+    ///   `admin_auth::hmac_policy_accepts_a_valid_signature`). The attempt is
+    ///   idempotent and keeps every gate of its own, so the retry now stands
+    ///   only while the latch genuinely cannot set. Without
     ///   the latch gate, a forced
     ///   leader (`force-single-member`, `tier fork`) whose commit has passed
     ///   the forced record could append `k+2` built on the forced `k+1` before
@@ -11036,6 +11044,12 @@ impl Consensus {
         };
         match self.sm.propose_config(config_op, self.admission_bytes) {
             Ok(new_cfg) => {
+                if !self.membership_reconciled_latched {
+                    // `Ok` above proved `can_serve`; the reconcile keeps its
+                    // own cursor and in-flight gates, so this is exactly the
+                    // step-3a attempt one pass early (see the doc comment).
+                    self.maybe_reconcile_forced_membership();
+                }
                 if !self.membership_reconciled_latched {
                     return (2, 0, self.cnc.config_version());
                 }
@@ -19991,26 +20005,60 @@ mod tests {
     /// Task 12 fix round 2: an admin membership change answers retry while
     /// this leader has not carried its kernel config into the cluster FSM
     /// (`membership_reconciled_latched`), and is accepted once it has.
+    ///
+    /// Since the inline latch attempt in `propose_and_append` (main CI red
+    /// after #102, `admin_auth::hmac_policy_accepts_a_valid_signature`) the
+    /// retry stands only while the latch genuinely CANNOT set: here the
+    /// kernel adopted a config at a position the cluster agent has not
+    /// consumed yet (`consumed < config_position`), the forced-config shape
+    /// the latch exists for. Once the walk catches up the same request is
+    /// accepted.
     #[test]
     fn a_membership_change_waits_for_the_forced_config_reconcile() {
         let mut h = harness();
-        drive_to_serving_leader(&mut h);
+        let append = drive_to_serving_leader(&mut h);
         assert!(!h.cons.membership_reconciled_latched, "no pass has run yet");
+        // The kernel runs ahead of the cluster FSM: a config at the append
+        // frontier, above whatever the cluster agent has consumed.
+        let ahead = h
+            .cons
+            .sm
+            .config()
+            .clone()
+            .apply(uc_consensus::config::ConfigOp::AddLearner {
+                id: 9,
+                addr: (0x7f00_0001, 7009),
+            })
+            .expect("a fresh learner id");
+        h.cons.feed(Event::ConfigObserved {
+            position: append,
+            config: ahead,
+        });
+        assert_eq!(h.cons.sm.config_position(), append);
+        h.cons
+            .cluster_view
+            .consumed
+            .store(append - 32, Ordering::Release);
         let v0 = h.cons.sm.config().version;
         let (status, reason, _) = h.cons.propose_and_append(1, 7, 0x7f00_0001, 7007);
         assert_eq!(
             (status, reason),
             (2, 0),
-            "retry until the reconcile latched"
+            "retry while the cluster agent is still below the kernel's config"
         );
+        assert!(!h.cons.membership_reconciled_latched, "nothing latched");
         assert_eq!(h.cons.sm.config().version, v0, "nothing adopted on retry");
-        h.cons.membership_reconciled_latched = true;
+        h.cons
+            .cluster_view
+            .consumed
+            .store(append, Ordering::Release);
         let (status, reason, version) = h.cons.propose_and_append(1, 7, 0x7f00_0001, 7007);
         assert_eq!(
             (status, reason, version),
             (0, 0, v0 + 1),
-            "accepted once latched"
+            "accepted once the walk caught up and the latch could set"
         );
+        assert!(h.cons.membership_reconciled_latched);
     }
 
     /// main CI red after #100 (`admin_auth::filesystem_policy_ignores_the_auth_line`):
@@ -20039,6 +20087,33 @@ mod tests {
             (status, reason, version),
             (0, 0, v0 + 1),
             "an ordinary add-learner is accepted with another CLUSTER command in flight"
+        );
+    }
+
+    /// main CI red after #102 (`admin_auth::hmac_policy_accepts_a_valid_signature`):
+    /// a single-node leader's `serving` flips in `rank_leader`, which runs on
+    /// the TICK (do_work step 4) and on follower Reports, never on its own
+    /// `DurableAdvanced`. Step 3a — the latch — runs BEFORE the tick, step 5
+    /// publishes `can_serve`, and step 11 handles the admin slot: a request
+    /// written between steps 5 and 11 of that one pass reached
+    /// `propose_and_append` with the latch unset and was answered retry.
+    /// The admin path now attempts the latch itself, so an ordinary serving
+    /// leader accepts a membership change on the first pass it serves.
+    #[test]
+    fn a_serving_leader_latches_inline_and_accepts_membership_before_any_pass() {
+        let mut h = harness();
+        drive_to_serving_leader(&mut h);
+        assert!(!h.cons.membership_reconciled_latched, "no pass has run yet");
+        let v0 = h.cons.sm.config().version;
+        let (status, reason, version) = h.cons.propose_and_append(1, 7, 0x7f00_0001, 7007);
+        assert_eq!(
+            (status, reason, version),
+            (0, 0, v0 + 1),
+            "an ordinary leader's first membership change is accepted, not retried"
+        );
+        assert!(
+            h.cons.membership_reconciled_latched,
+            "the admin path latched on its own"
         );
     }
 
