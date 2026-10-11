@@ -28,26 +28,18 @@ deposed leader can never collect the quorum, so it can never certify a read.
 
 ## What it costs
 
-Measured on a 3-host AWS fleet (`docs/benchmarks/uc2-read-profile-2026-07-26.md`):
-linearizable reads sustained 244,052/s against 585,414/s for the same reads with
-the barrier removed. **The barrier costs roughly 58% of read capacity.**
+Measured on 3 × `c9gd.4xlarge` with 1,024 reads in flight
+(`docs/benchmarks/uc2-read-types-under-writes-c9gd-2026-10-11.md`): linearizable reads
+sustain 3.88 M/s against 7.05 M/s for the same reads with the barrier removed
+(snapshot reads), and 2.89 M/s against 5.07 M/s beside 2 M committed
+writes/s. **The barrier costs about 45 % of the leader's read capacity.** What
+remains after batching (below) is the quorum round each batch waits for, and
+the fact that only the leader can answer. Reads that can live with
+read-your-writes semantics run on any node at 4.4–5.8× the linearizable
+capacity (`docs/notes/uc2-read-your-writes-explained.md`).
 
-**Measured since.** After Rung A (below) the 2026-07-26 re-run read the barrier
-as free — linearizable and snapshot reads equal at ~540 k/s — but both arms
-were sitting on the apply agent's read-only idle-sleep cap, found in
-`docs/benchmarks/uc2-read-spread-2026-10-07.md` (§5.4) and removed on
-2026-10-10. With the cap gone the barrier costs about **30 %** of the leader's
-read capacity on `c6id.2xlarge` (2.16 M linearizable vs 3.13 M snapshot,
-read-only) and **45 %** on Graviton (3.88 M vs 7.05 M read-only; 2.89 M vs
-5.07 M at 2 M committed writes/s —
-`docs/benchmarks/uc2-read-types-under-writes-c9gd-2026-10-11.md`), at 1,024
-reads in flight. Batching removed the per-read probe round; what remains is
-the quorum round each batch still waits for, and the leader-only placement.
-Reads that can live with read-your-writes semantics go to any node at 4.4–5.8×
-the linearizable capacity (`docs/notes/uc2-read-your-writes-explained.md`).
-
-The reason is that today *every single read does its own check*. A thousand reads
-arriving together fire a thousand separate "am I still leader?" rounds — asking
+Before Rung A, *every single read did its own check*. A thousand reads
+arriving together fired a thousand separate "am I still leader?" rounds — asking
 the same question a thousand times and getting the same answer.
 
 ## The batching idea (Rung A)
@@ -118,7 +110,7 @@ Worth knowing, because it is a common source of confusion when reading the code:
   frontier to reach its position. Two different waits, two different purposes.
 - **A snapshot (non-linearizable) read skips both.** It is forwarded straight to
   the service. That is what makes it a useful experimental control — the same
-  path minus the barrier — and it is how the 58% figure above was measured.
+  path minus the barrier — and it is how the barrier's cost above is measured.
 - **The barrier is not what protects against a crashed service.** That is the
   service-epoch backstop and the capture-recheck bracket, which defend a
   different race (the service restarting mid-query).

@@ -28,14 +28,13 @@ numbers by clock speed.
   ([convoy explainer](../notes/uc2-m13-mpsc-publish-convoy-explained.md)).
   Starved polling threads degrade non-linearly — do not run a loaded node on
   fewer cores than the processes you co-locate on it.
-- **Reads are per node; put them on followers.** A node answers about
-  6–7 M snapshot reads/s on a `c9gd.4xlarge` (about 3 M on a `c6id.2xlarge`)
-  at 1,024 reads in flight, read-your-writes at 0.8–1.0× that, linearizable
-  (leader only) at 0.55–0.7× — and followers serving reads cost the write
-  path nothing measurable up to 2 M committed writes/s. Spread read-your-writes
-  or snapshot reads over every node before buying a bigger leader
-  ([read types under writes, Graviton](../benchmarks/uc2-read-types-under-writes-c9gd-2026-10-11.md),
-  [read spread](../benchmarks/uc2-read-spread-2026-10-07.md)).
+- **Reads are per node; put them on followers.** A `c9gd.4xlarge` node
+  answers about 7 M snapshot reads/s at 1,024 reads in flight,
+  read-your-writes at 0.8–0.85× that, linearizable (leader only) at 0.55× —
+  and followers serving reads cost the write path nothing measurable up to
+  2 M committed writes/s. Spread read-your-writes or snapshot reads over every
+  node before buying a bigger leader
+  ([read types under writes, Graviton](../benchmarks/uc2-read-types-under-writes-c9gd-2026-10-11.md)).
 - **Do not pin by default.** Pinning trades throughput for variance: it
   tightened p50 spread 31–37× in our runs but cost 9–20 % of mean
   throughput, and on a 16-core no-SMT host the unpinned scheduler beat every

@@ -58,12 +58,8 @@ generation only.
 | [M2 — replication stream](/docs/benchmarks/uc2-m2-gate-2026-07-10.md) | **235–323 MB/s durable per follower** · 2.3–3.2× the ≥ 100 MB/s bar — clean *and* under 0.5 % injected loss (34,870 NAKs served, `overruns 0`) | 3-host fleet |
 | [M6 — learner join + purge](/docs/benchmarks/uc2-m6-gate-2026-07-12.md) | commit-rate dip **0.9 %** (gate < 10 %); below-floor reconstruction worst **2.80 s** over 5 purge cycles, zero read divergence | 4-host fleet |
 | [M7 — live reconfiguration](/docs/benchmarks/uc2-m7-gate-2026-07-13.md) | per-transition dip **0.0–4.7 %** (gate < 10 %); leader self-removal handoff **3.22 s** (gate < 10 s), zero committed loss | 5-host fleet |
-| [Read profile — before](/docs/benchmarks/uc2-read-profile-2026-07-26.md) | linearizable 244,052 reads/s vs snapshot 585,414 — **the barrier costs ~58 %** | 3-host fleet |
-| [Read profile — after Rung A](/docs/benchmarks/uc2-read-profile-2026-07-26-after-rung-a.md) | **542,065 reads/s (2.2×)** — barrier cost read as ≤ 0.0 % read-only, 3.3 % mixed; *both arms were on the idle-sleep cap found 2026-10-07 — see the arc below* | 3-host fleet |
-| [Read spread](/docs/benchmarks/uc2-read-spread-2026-10-07.md) | snapshot read capacity is **per node**: spread over 3 hosts **2.74×** the leader alone read-only, **3.65×** under 20 k writes/s | 3-host fleet, `c6id.2xlarge` |
-| [Read types under writes](/docs/benchmarks/uc2-read-types-under-writes-2026-10-10.md) | read-your-writes costs **about a snapshot read** (0.94–1.10 on the leader); spread over 3 nodes **3.2–4.6×** linearizable; no read type starved up to 199 k writes/s | 3-host fleet, `c6id.2xlarge` |
-| [Query drain counts as progress](/docs/benchmarks/uc2-query-drain-progress-2026-10-10.md) | the read-only idle cap removed: reads **3.8–5.6×** on every arm (≈ 0.6 M → 2.2–3.2 M/s per node) | 3-host fleet, `c6id.2xlarge` |
-| [Read types under writes — Graviton, writes to the ceiling](/docs/benchmarks/uc2-read-types-under-writes-c9gd-2026-10-11.md) | **15.1 M read-your-writes reads/s across 3 nodes beside 2 M committed writes/s, p99 0.34 ms**; write ceiling with reads alongside **4.6–5.3 M committed/s**; no read type starved to 2 M; ryw/leader ÷ snap/leader **0.83 — FAIL** (≥ 0.90 bar kept) | 3-host fleet, `c9gd.4xlarge` |
+| [Read types under writes — Graviton, writes to the ceiling](/docs/benchmarks/uc2-read-types-under-writes-c9gd-2026-10-11.md) | **15.1 M read-your-writes reads/s across 3 nodes beside 2 M committed writes/s, p99 0.34 ms**; 20.7 M snapshot reads/s read-only; write ceiling with reads alongside **4.6–5.3 M committed/s**; no read type starved to 2 M; linearizable = 0.55× snapshot on the leader; ryw/leader ÷ snap/leader **0.83 — FAIL** (≥ 0.90 bar kept) | 3-host fleet, `c9gd.4xlarge` |
+| Superseded read records: [read profile](/docs/benchmarks/uc2-read-profile-2026-07-26.md) · [after Rung A](/docs/benchmarks/uc2-read-profile-2026-07-26-after-rung-a.md) · [read spread](/docs/benchmarks/uc2-read-spread-2026-10-07.md) · [read types under writes](/docs/benchmarks/uc2-read-types-under-writes-2026-10-10.md) · [query-drain fix](/docs/benchmarks/uc2-query-drain-progress-2026-10-10.md) | earlier fleets and, for the two July records, both arms on the read-only idle cap found 2026-10-07; their numbers stand in their own files and are superseded by the row above | `c6id.2xlarge` |
 | [M4 — leader failover](/docs/benchmarks/uc2-m4-gate-2026-07-11.md) | p50 **202.1 ms**, p90 279.3 ms, max 394.1 ms · **10/10 zero committed loss** | 4-vCPU sandbox, loopback — *fleet not yet run* |
 | [M8 — opt-in wire crypto](/docs/benchmarks/uc2-m8-gate-2026-07-29.md) | encrypted throughput **94.1 % of cleartext**, AES-NI confirmed | 4-vCPU dev box — *ratio only; fleet open* |
 | [M1 — solo append+fsync](/docs/benchmarks/uc2-m1-gate-2026-07-09.md) | sandbox smoke on **tmpfs**, where `fdatasync` is nearly free — an upper bound, explicitly **not** the gate | 4-vCPU sandbox |
@@ -80,35 +76,26 @@ The most instructive sequence here, because it shows the method rather than a
 number.
 
 Linearizable reads run a quorum read-barrier, and nobody knew what it cost. A
-fleet measurement answered it: linearizable reads plateaued at 244,052/s against
-585,414/s for snapshot reads — a **41.7 % ratio, so the barrier was eating ~58 %
-of read capacity.** A decide rule was committed beforehand stating what result
-would justify building the optimization ("Rung A", batch-probe coalescing). The
-measurement met it.
+fleet measurement in July found it eating more than half of read capacity
+because every read ran its own probe round; a decide rule committed beforehand
+said what result would justify batching the rounds ("Rung A"), and the
+measurement met it. After Rung A the *same* rule was re-run and reported the
+barrier as free — which later turned out to be the instrument, not the
+barrier: both arms were sitting on the apply agent's read-only idle-sleep cap,
+found in the read-spread run of 2026-10-07 and removed on 2026-10-10.
 
-After Rung A landed, the *same* pre-committed rule was re-run against the same
-fleet class and the same sweep — and returned **"Rung A NOT JUSTIFIED — the
-barrier costs at most 0.0 % (read-only) / 3.3 % (mixed)."**
+With the cap gone and writes pushed to the ceiling on Graviton (2026-10-11):
+**the barrier costs about 45 % of the leader's read capacity** at 1,024 reads
+in flight (3.88 M linearizable vs 7.05 M snapshot reads/s read-only, 2.89 M vs
+5.07 M beside 2 M committed writes/s). The lever that moves reads is placement,
+not the barrier: read-your-writes reads spread over the followers give
+**4.4–5.8×** the linearizable path, 15.1 M/s beside 2 M committed writes/s
+([record](/docs/benchmarks/uc2-read-types-under-writes-c9gd-2026-10-11.md)).
 
-That is the rule working exactly as intended: it said *build this* when the cost
-was 58 %, and *this is no longer worth building* once the cost was gone.
-Linearizable reads went from 244,052/s to **542,065/s (2.2×)**, reaching 100.2 %
-of snapshot-read capacity — the barrier is now free.
-
-**Corrected 2026-10-11.** "Free" was an artifact of the instrument, not a
-property of the barrier: in that re-run both arms sat on the apply agent's
-read-only idle-sleep cap (about 550 k reads/s per node, whatever the read
-type), found in the [read spread](/docs/benchmarks/uc2-read-spread-2026-10-07.md)
-run (§5.4) and removed by the
-[query-drain fix](/docs/benchmarks/uc2-query-drain-progress-2026-10-10.md). With
-the cap gone the same ratio reads **0.69** read-only on `c6id` (2.16 M vs
-3.13 M) and **0.55** on Graviton (3.88 M vs 7.05 M), 0.51–0.60 under writes:
-at 1,024 reads in flight the barrier costs **30–45 % of the leader's read
-capacity**. The rule itself did what it should — it just ran against a ceiling
-nobody had seen. The lever that did move reads is placement, not the barrier:
-read-your-writes reads spread over the followers give **4.4–5.8×** the
-linearizable path
-([Graviton run](/docs/benchmarks/uc2-read-types-under-writes-c9gd-2026-10-11.md)).
+The rule did its job both times — it said *build this* when the cost was real,
+and it reported an artifact faithfully when the instrument was capped. What it
+could not do was see the cap. That is why a result's provenance is stated per
+record, and why a superseded record stays in its file instead of being edited.
 
 ---
 
