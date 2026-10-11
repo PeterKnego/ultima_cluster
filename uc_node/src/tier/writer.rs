@@ -216,6 +216,9 @@ struct LocalFile {
     /// hashed whole.
     envelope_at: Option<u64>,
     hash: u64,
+    /// The label's size for it (`0` = unknown): the raw length the placed
+    /// object must have.
+    size: u64,
 }
 
 pub struct Writer {
@@ -562,6 +565,128 @@ impl Read for ChunkReader<'_> {
     }
 }
 
+/// Put one artifact (write-once); an existing one is compared.
+fn put_artifact(
+    t: &dyn BackupTarget,
+    codec: Codec,
+    level: i32,
+    f: &mut LocalFile,
+    stats: &WriterStats,
+) -> Result<(), TierError> {
+    f.file.seek(SeekFrom::Start(0))?;
+    let (src, len) = (&mut f.file, f.len);
+    let put = t.put_if_absent(&f.tier_name, &mut |dst| {
+        src.seek(SeekFrom::Start(0))?;
+        write_object(dst, MAGIC_ARTIFACT, codec, level, 0, 0, src, len)
+    })?;
+    match put {
+        Put::Written(n) => {
+            stats.bytes_set.fetch_add(n, Ordering::Relaxed);
+            Ok(())
+        }
+        Put::Exists => compare_artifact(t, f),
+    }
+}
+
+/// Spec §5.2: an existing artifact is compared by envelope position and
+/// payload hash (rows) or hash (cluster) — never byte equality, since
+/// two members' agreeing copies may differ in their envelopes' version.
+fn compare_artifact(t: &dyn BackupTarget, f: &LocalFile) -> Result<(), TierError> {
+    let mismatch = || TierError::OverlapMismatch(f.tier_name.clone());
+    let Some(obj) = t.open(&f.tier_name)? else {
+        return Err(mismatch());
+    };
+    let mut r = ObjectReader::open(obj).map_err(|_| mismatch())?;
+    let same = match f.envelope_at {
+        Some(p) => row_identity(&mut r).map_err(|_| mismatch())? == Some((p, f.hash)),
+        None => hash_stream(&mut r).map_err(|_| mismatch())? == f.hash,
+    };
+    if same { Ok(()) } else { Err(mismatch()) }
+}
+
+/// Ruling R10b: the objects of `files` NOT present in the tier right now.
+/// A present object whose raw length is not the one this writer would
+/// place (the local file's, and the label's when known) is refused as an
+/// overlap mismatch — write-once, it cannot be repaired.
+fn absent_objects(t: &dyn BackupTarget, files: &[LocalFile]) -> Result<Vec<usize>, TierError> {
+    let mut absent = Vec::new();
+    for (i, f) in files.iter().enumerate() {
+        let Some(obj) = t.open(&f.tier_name)? else {
+            absent.push(i);
+            continue;
+        };
+        let mismatch = || TierError::OverlapMismatch(f.tier_name.clone());
+        let raw = ObjectReader::open(obj)
+            .map_err(|_| mismatch())?
+            .header()
+            .raw_len;
+        if raw != f.len || (f.size != 0 && raw != f.size) {
+            return Err(mismatch());
+        }
+    }
+    Ok(absent)
+}
+
+/// How many times [`place_set`] re-places objects that vanished before it
+/// gives the pass up to the retry ladder.
+const PLACE_ROUNDS: usize = 3;
+
+/// Copy one set: every artifact, then — ruling R10b, spec §4.5.2 ("every
+/// file `SET` names is present while `SET` is") — re-check that each one is
+/// still in the tier with its raw length, re-placing any that vanished
+/// (another writer's retention may have cleared the directory as aged
+/// residue while an upload sat in `.tmp`), and only then put `SET`.
+fn place_set(
+    t: &dyn BackupTarget,
+    codec: Codec,
+    level: i32,
+    label: &SetLabel,
+    files: &mut [LocalFile],
+    stats: &WriterStats,
+) -> Result<(), TierError> {
+    for f in files.iter_mut() {
+        put_artifact(t, codec, level, f, stats)?;
+    }
+    let mut rounds = 0;
+    loop {
+        let absent = absent_objects(t, files)?;
+        if absent.is_empty() {
+            break;
+        }
+        rounds += 1;
+        if rounds > PLACE_ROUNDS {
+            return Err(TierError::Refused(format!(
+                "set {}: {} object(s) keep vanishing before SET",
+                label.position,
+                absent.len()
+            )));
+        }
+        for i in absent {
+            put_artifact(t, codec, level, &mut files[i], stats)?;
+        }
+    }
+    let text = label.render();
+    let put = t.put_if_absent(&set_label(label.position), &mut |dst| {
+        io::Write::write_all(dst, text.as_bytes())?;
+        Ok(text.len() as u64)
+    })?;
+    match put {
+        Put::Written(n) => {
+            stats.bytes_set.fetch_add(n, Ordering::Relaxed);
+        }
+        Put::Exists => {
+            let mut s = String::new();
+            if let Some(mut f) = t.open(&set_label(label.position))? {
+                f.read_to_string(&mut s)?;
+            }
+            if SetLabel::parse(&s).ok().as_ref() != Some(label) {
+                return Err(TierError::OverlapMismatch(set_label(label.position)));
+            }
+        }
+    }
+    Ok(())
+}
+
 impl Writer {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -764,8 +889,10 @@ impl Writer {
     /// oldest kept set to `through` (module docs of [`retention`]), so the
     /// `progress` the next refresh stores cannot move back.
     fn retain(&mut self) -> Result<bool, TierError> {
-        let policy = RetentionPolicy::from_view(&self.view);
+        // `consumed` FIRST: the policy and the view read after it are at
+        // least as new as the walk the R10a gate checks.
         let consumed = self.view.consumed.load(Ordering::Acquire);
+        let policy = RetentionPolicy::from_view(&self.view);
         let inner = self.view.snapshot_inner();
         let mut done = retention::Deleted::default();
         // Deletions already made count even when a later one fails.
@@ -944,7 +1071,7 @@ impl Writer {
     fn open_local_set(&self, label: &SetLabel) -> Result<Option<Vec<LocalFile>>, TierError> {
         let p = label.position;
         let mut out = Vec::with_capacity(label.rows.len() + 1);
-        let mut want: Vec<(PathBuf, String, Option<u64>, u64)> = label
+        let mut want: Vec<(PathBuf, String, Option<u64>, u64, u64)> = label
             .rows
             .iter()
             .map(|r| {
@@ -953,6 +1080,7 @@ impl Writer {
                     row_object(p, r.row),
                     Some(p),
                     r.hash,
+                    r.size,
                 )
             })
             .collect();
@@ -964,8 +1092,9 @@ impl Writer {
             cluster_object(p),
             None,
             label.cluster_hash,
+            label.cluster_size,
         ));
-        for (path, tier_name, envelope_at, hash) in want {
+        for (path, tier_name, envelope_at, hash, size) in want {
             let file = match File::open(&path) {
                 Ok(f) => f,
                 Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -978,6 +1107,7 @@ impl Writer {
                 len,
                 envelope_at,
                 hash,
+                size,
             });
         }
         Ok(Some(out))
@@ -1001,41 +1131,14 @@ impl Writer {
 
     fn copy_set(&mut self, label: &SetLabel, files: &mut [LocalFile]) -> Result<(), TierError> {
         let (codec, level) = (self.cfg.compression, self.cfg.compression_level);
-        for f in files.iter_mut() {
-            f.file.seek(SeekFrom::Start(0))?;
-            let (src, len) = (&mut f.file, f.len);
-            let put = self.target.put_if_absent(&f.tier_name, &mut |dst| {
-                src.seek(SeekFrom::Start(0))?;
-                write_object(dst, MAGIC_ARTIFACT, codec, level, 0, 0, src, len)
-            })?;
-            match put {
-                Put::Written(n) => {
-                    self.shared.stats.bytes_set.fetch_add(n, Ordering::Relaxed);
-                }
-                Put::Exists => self.compare_artifact(f)?,
-            }
-        }
-        let text = label.render();
-        let put = self
-            .target
-            .put_if_absent(&set_label(label.position), &mut |dst| {
-                io::Write::write_all(dst, text.as_bytes())?;
-                Ok(text.len() as u64)
-            })?;
-        match put {
-            Put::Written(n) => {
-                self.shared.stats.bytes_set.fetch_add(n, Ordering::Relaxed);
-            }
-            Put::Exists => {
-                let mut s = String::new();
-                if let Some(mut f) = self.target.open(&set_label(label.position))? {
-                    f.read_to_string(&mut s)?;
-                }
-                if SetLabel::parse(&s).ok().as_ref() != Some(label) {
-                    return Err(TierError::OverlapMismatch(set_label(label.position)));
-                }
-            }
-        }
+        place_set(
+            &*self.target,
+            codec,
+            level,
+            label,
+            files,
+            &self.shared.stats,
+        )?;
         crate::obs_event!(
             Info,
             "backup_set_copied",
@@ -1044,22 +1147,6 @@ impl Writer {
             rows = label.rows.len() as u64
         );
         Ok(())
-    }
-
-    /// Spec §5.2: an existing artifact is compared by envelope position and
-    /// payload hash (rows) or hash (cluster) — never byte equality, since
-    /// two members' agreeing copies may differ in their envelopes' version.
-    fn compare_artifact(&self, f: &LocalFile) -> Result<(), TierError> {
-        let mismatch = || TierError::OverlapMismatch(f.tier_name.clone());
-        let Some(obj) = self.target.open(&f.tier_name)? else {
-            return Err(mismatch());
-        };
-        let mut r = ObjectReader::open(obj).map_err(|_| mismatch())?;
-        let same = match f.envelope_at {
-            Some(p) => row_identity(&mut r).map_err(|_| mismatch())? == Some((p, f.hash)),
-            None => hash_stream(&mut r).map_err(|_| mismatch())? == f.hash,
-        };
-        if same { Ok(()) } else { Err(mismatch()) }
     }
 
     // ---------------------------------------------------------- journal
@@ -1462,6 +1549,163 @@ mod tests {
         let mut out = Vec::new();
         assert!(r.read_to_end(&mut out).is_err());
         assert_eq!(r.journal_failed.as_deref(), Some("purged under the cut"));
+    }
+
+    /// Wraps an `FsTarget`; the first time the LAST object of a set is
+    /// placed it deletes the first one (another writer's retention clearing
+    /// the directory as aged residue mid-copy), and it logs every put.
+    struct VanishOnce {
+        inner: crate::tier::target::FsTarget,
+        last: String,
+        victim: String,
+        fired: Mutex<bool>,
+        puts: Mutex<Vec<String>>,
+    }
+
+    impl BackupTarget for VanishOnce {
+        fn put_if_absent(
+            &self,
+            path: &str,
+            write: &mut dyn FnMut(&mut File) -> Result<u64, TierError>,
+        ) -> Result<Put, TierError> {
+            self.puts.lock().unwrap().push(path.to_string());
+            let r = self.inner.put_if_absent(path, write)?;
+            let mut fired = self.fired.lock().unwrap();
+            if path == self.last && !*fired {
+                *fired = true;
+                self.inner.delete(&self.victim)?;
+            }
+            Ok(r)
+        }
+        fn list(&self, dir: &str) -> Result<Vec<String>, TierError> {
+            self.inner.list(dir)
+        }
+        fn open(&self, path: &str) -> Result<Option<File>, TierError> {
+            self.inner.open(path)
+        }
+        fn delete(&self, path: &str) -> Result<(), TierError> {
+            self.inner.delete(path)
+        }
+        fn delete_dir_if_empty(&self, dir: &str) -> Result<(), TierError> {
+            self.inner.delete_dir_if_empty(dir)
+        }
+    }
+
+    /// Ruling R10b: an object deleted between the object puts and the
+    /// `SET` put is placed again BEFORE `SET`, and the tier verifies clean.
+    #[test]
+    fn set_is_written_only_after_a_vanished_object_is_restored() {
+        use crate::tier::layout::RowLabel;
+        let d = tempdir();
+        let src = d.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let p = 4096u64;
+        let payload = vec![7u8; 3000];
+        let mut row = Vec::new();
+        uc_service::snapshots::write_snapshot_envelope(&mut row, p, 1).unwrap();
+        row.extend_from_slice(&payload);
+        let cluster = vec![9u8; 500];
+        std::fs::write(src.join("row"), &row).unwrap();
+        std::fs::write(src.join("cluster"), &cluster).unwrap();
+        let h = |b: &[u8]| hash_stream(&mut &b[..]).unwrap();
+        let label = SetLabel {
+            position: p,
+            kind: uc_protocol::v2::catalog::SetKind::Full,
+            time_ns: 1,
+            rows: vec![RowLabel {
+                row: 0,
+                hash: h(&payload),
+                version: 1,
+                size: row.len() as u64,
+            }],
+            cluster_hash: h(&cluster),
+            cluster_size: cluster.len() as u64,
+        };
+        let local = |name: &str, tier_name: String, env, hash, size| LocalFile {
+            tier_name,
+            file: File::open(src.join(name)).unwrap(),
+            len: std::fs::metadata(src.join(name)).unwrap().len(),
+            envelope_at: env,
+            hash,
+            size,
+        };
+        let mut files = vec![
+            local(
+                "row",
+                row_object(p, 0),
+                Some(p),
+                h(&payload),
+                row.len() as u64,
+            ),
+            local(
+                "cluster",
+                cluster_object(p),
+                None,
+                h(&cluster),
+                cluster.len() as u64,
+            ),
+        ];
+        let tier = d.path().join("tier");
+        let t = VanishOnce {
+            inner: crate::tier::target::FsTarget::new(&tier),
+            last: cluster_object(p),
+            victim: row_object(p, 0),
+            fired: Mutex::new(false),
+            puts: Mutex::new(Vec::new()),
+        };
+        let stats = WriterStats::default();
+        place_set(&t, Codec::Zstd, 1, &label, &mut files, &stats).unwrap();
+        let puts = t.puts.lock().unwrap().clone();
+        eprintln!("puts: {puts:?}");
+        assert_eq!(
+            puts,
+            vec![
+                row_object(p, 0),
+                cluster_object(p),
+                row_object(p, 0),
+                set_label(p)
+            ],
+            "the vanished row object is re-placed, then SET"
+        );
+        assert!(*t.fired.lock().unwrap());
+        let report = crate::tier::chain::verify(&t, true).unwrap();
+        assert_eq!(report.sets, 1);
+        assert!(report.findings.is_empty(), "{:?}", report.findings);
+    }
+
+    /// A present object of the wrong raw length cannot be repaired
+    /// (write-once): refused as an overlap mismatch, and no `SET`.
+    #[test]
+    fn a_short_object_already_in_the_tier_refuses_the_set() {
+        let d = tempdir();
+        let src = d.path().join("cluster");
+        std::fs::write(&src, vec![1u8; 100]).unwrap();
+        let tier = d.path().join("tier");
+        let t = crate::tier::target::FsTarget::new(&tier);
+        t.put_if_absent(&cluster_object(64), &mut |f| {
+            write_object(
+                f,
+                MAGIC_ARTIFACT,
+                Codec::None,
+                0,
+                0,
+                0,
+                &mut &[1u8; 40][..],
+                40,
+            )
+        })
+        .unwrap();
+        let files = [LocalFile {
+            tier_name: cluster_object(64),
+            file: File::open(&src).unwrap(),
+            len: 100,
+            envelope_at: None,
+            hash: 0,
+            size: 100,
+        }];
+        let e = absent_objects(&t, &files).unwrap_err();
+        assert!(matches!(e, TierError::OverlapMismatch(_)), "{e}");
+        assert!(t.open(&set_label(64)).unwrap().is_none());
     }
 
     #[test]

@@ -210,7 +210,14 @@ impl BackupTarget for FsTarget {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e.into()),
         };
-        for ent in std::fs::read_dir(&path)? {
+        // Another writer's retention may remove the directory between the
+        // two calls: that is "absent", not a failed pass.
+        let rd = match std::fs::read_dir(&path) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        for ent in rd {
             let m = match ent?.metadata() {
                 Ok(m) => m,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
