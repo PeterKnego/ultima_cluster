@@ -282,8 +282,9 @@ mod writer_e2e {
     use uc_consensus::election::NodeId;
     use uc_log::cnc::CncPage;
     use uc_net::fault::FaultConfig;
-    use uc_node::tier::chain::{list_tier, reach_from, verify};
+    use uc_node::tier::chain::{list_tier, reach_from, verify, watermark_of};
     use uc_node::tier::layout::chunk_object;
+    use uc_node::tier::materialize::{Mode, materialize};
     use uc_node::tier::object::{Codec, ObjectReader};
     use uc_node::tier::target::{BackupTarget, FsTarget, open_or_create_tier};
     use uc_node::tier::writer::{BackupConfig, WriterError};
@@ -896,6 +897,89 @@ mod writer_e2e {
         let _keep = c.stop();
         let n = assert_chunks_match(&t, &journal_frames(&dirs[l]));
         assert!(n > 20_000, "chunks hold the submitted frames ({n})");
+    }
+
+    /// Spec §8.1/§8.2, whole-cluster restore: a writer backs up a 3-voter
+    /// cluster; every node stops; the builder materialises the tier at its
+    /// `through` into three FRESH instance directories (Recovery, same Q on
+    /// all three); `verify_artifact` accepts each; three nodes and their
+    /// services boot on them unchanged, elect a leader, commit a new write
+    /// past Q and complete a coordinated instant.
+    #[test]
+    fn materialize_builds_a_dir_verify_accepts_and_a_node_boots_from() {
+        let _g = serialize();
+        let tier = tmp_tier();
+        let cfg = writer_cfg(tier.path(), 1 << 20, Duration::from_millis(500));
+        let mut c = spawn(3, 0, opts("tier-restore", false), |i| {
+            (i == 1).then(|| cfg.clone())
+        });
+        start_sums(&mut c);
+        let l = await_single_leader(&c, 30);
+        await_capable(&c);
+        let all = c.running();
+        submit_frames(c.node(l), 500);
+        let p = instant_until_complete(&c, l, &all);
+        await_agreed(&c, &all, p);
+        submit_frames(c.node(l), 3000);
+        let target = c.node(l).counters().commit.load_acquire();
+        await_watermark(&c, l, 60, |w| w.newest_set == p && w.through >= target);
+
+        // Stop everything: services, then nodes.
+        for h in c.nodes.iter_mut() {
+            if let Some(s) = h.svc.take() {
+                s();
+            }
+        }
+        for h in c.nodes.iter_mut() {
+            h.stop();
+        }
+
+        let t = FsTarget::new(tier.path());
+        let (_, _, through) = watermark_of(&list_tier(&t).unwrap()).expect("a watermark");
+        assert!(through >= target, "the tier holds the committed writes");
+        let fresh = tempfile::Builder::new()
+            .prefix("uc2-tier-restored-")
+            .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+            .expect("tempdir");
+        for (i, h) in c.nodes.iter_mut().enumerate() {
+            let nd = fresh.path().join(format!("r{i}"));
+            let m = materialize(&t, Some(through), &nd, Mode::Recovery, 7).expect("materialize");
+            assert_eq!((m.q, m.mode), (through, Mode::Recovery));
+            assert!(m.start_set >= p && m.start_set < through);
+            let rep = uc_node::backup::verify_artifact(&nd).expect("verify accepts");
+            assert_eq!(
+                (rep.journal_first_base, rep.journal_last_pos),
+                (m.start_set, through)
+            );
+            // Re-home node i onto its restored directory: same id, address,
+            // membership and app; no writer.
+            let old = std::mem::replace(&mut h.cfg, Box::new(|| unreachable!()));
+            let d = nd.clone();
+            h.cfg = Box::new(move || NodeConfig {
+                instance_dir: d.clone(),
+                ..old()
+            });
+            h.dir = nd;
+            h.backup = None;
+        }
+
+        for h in c.nodes.iter_mut() {
+            h.start();
+        }
+        start_sums(&mut c);
+        let l2 = await_single_leader(&c, 60);
+        await_capable(&c);
+        submit_frames(c.node(l2), 10);
+        let commit = c.node(l2).counters().commit.load_acquire();
+        assert!(
+            commit > through,
+            "a new write committed past Q ({commit} <= {through})"
+        );
+        let all = c.running();
+        let p2 = instant_until_complete(&c, l2, &all);
+        assert!(p2 > through, "the instant lies past Q");
+        let _keep = c.stop();
+        drop(fresh);
     }
 
     /// Spec §5.3: with less than `chunk_bytes` of new history, the writer

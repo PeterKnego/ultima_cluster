@@ -13527,7 +13527,7 @@ fn stored_to_cluster(s: &StoredConfig) -> ClusterConfig {
 }
 
 /// `ClusterConfig` -> `StoredConfig`, for persisting a `ConfigRecord`.
-fn cluster_to_stored(c: &ClusterConfig) -> StoredConfig {
+pub(crate) fn cluster_to_stored(c: &ClusterConfig) -> StoredConfig {
     StoredConfig {
         version: c.version,
         voters: c

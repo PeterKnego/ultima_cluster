@@ -17,7 +17,7 @@ Every command in [Sub-commands](#sub-commands) below (`add-learner` through
 purely through the cnc page's admin request/response slots, and both
 `--instance-dir` and `--app-id` are checked against that live node.
 
-The six commands under [Offline commands](#offline-commands) are different in
+The commands under [Offline commands](#offline-commands) are different in
 kind, not just in name: `backup`, `verify-backup`, and `restore` are
 filesystem-only and never touch a running node's cnc admin band at all (the
 node may be running throughout a `backup`, since it never talks to it);
@@ -26,7 +26,10 @@ directly and **refuses if a node is running**; `gen-admin-key` and `audit`
 (M12b, `v2.6.0`) are filesystem-only in the same sense as `backup` — `audit`
 even works against an instance directory that has never had a node in it
 yet, and `gen-admin-key` doesn't take `--instance-dir` at all, only a
-destination path. None of the six accept `--app-id` in the same sense as the
+destination path. The backup tier's `tier show`, `tier verify` and `tier
+restore` (`0.11.0`, unreleased) read a tier's files directly and never a node's
+admin band; `tier restore` refuses an instance directory a running node
+holds. None of these accept `--app-id` in the same sense as the
 admin-band commands — most don't take it at all (there is nothing on disk to
 check it against), and `force-single-member` takes it purely as a typed
 confirmation guard, not as anything validated against a live node.
@@ -655,7 +658,8 @@ Output fields:
 ## Offline commands
 
 `backup`, `verify-backup`, `restore` (M11 Task 2), `force-single-member`
-(M11 Task 4), and `gen-admin-key`/`audit` (M12b, `v2.6.0`). See
+(M11 Task 4), `gen-admin-key`/`audit` (M12b, `v2.6.0`), and the backup tier's
+`tier show`/`tier verify`/`tier restore` (`0.11.0`, unreleased). See
 [the offline-vs-admin-band distinction](#admin-band-commands-vs-offline-commands)
 above. Task walkthroughs: [Back up a cluster](../how-to/back-up-a-cluster.md),
 [Recover from quorum loss](../how-to/recover-from-quorum-loss.md),
@@ -808,6 +812,91 @@ record silently. See
 [Change cluster membership](../how-to/change-cluster-membership.md#read-the-audit-log)
 and [Instance directory](instance-directory.md) for the file's durability
 class (`O_APPEND`, `fsync` per record, no rotation).
+
+### `tier show`
+
+```
+uc2ctl tier show --target <TIER> [--instance-dir <DIR>]
+```
+
+Reads a backup tier (the `[backup] target` path) and prints its `TIER`
+identity (`tier_id`, `app_id`, `created_ns`), every complete set (position,
+kind, time, row count, and how far its chain reaches), every set directory
+with no `SET` label (`INCOMPLETE` — an interrupted copy, never a restore
+start), every journal chunk `[from, to)`, the watermark (`oldest_set`,
+`newest_set`, `through`), and one `restorable: [a, b]` line per range a
+restore can be built in — a restore point `Q` is a frame end with
+`a < Q <= b`. With `--instance-dir`, it also prints the committed backup
+watermarks that node's newest cluster artifact holds, marking the one that
+is this tier (`no cluster artifact yet` until that node's first instant).
+Filesystem-only; the node may be running.
+
+### `tier verify`
+
+```
+uc2ctl tier verify --target <TIER> [--deep]
+```
+
+Checks every chunk (header against name, block CRCs, a whole-frame walk to
+its end), byte equality wherever two chunks overlap, and every `SET`'s
+objects present at their stated raw sizes; a set directory without a `SET`
+label is reported `tier_set_incomplete`. `--deep` also re-hashes every
+artifact against its `SET` hash (a row's hash covers the payload after its
+24-byte envelope, whose position must equal the set's). Prints
+`tier verify: <sets> sets, <chunks> chunks, <n> findings`, then one
+`finding: …` line per finding, each naming the object; **exits 1 when there
+is any finding**, 0 when there is none. Read-only.
+
+### `tier restore`
+
+```
+uc2ctl tier restore --target <TIER> [--at <Q>] --instance-dir <DIR> --confirm-cluster <APP_ID>
+uc2ctl tier restore --target <TIER> [--at <Q>] --instance-dir <DIR> --new-node --node-id <N>
+```
+
+Builds an instance directory a node boots from unchanged, as of `Q`
+(`--at`, default the tier's furthest reach — the `through` of `tier show`).
+The start set `S` is the newest complete set below `Q` whose chain reaches
+`Q`. The builder copies `S`'s artifacts (each checked against its `SET` size
+and hash), writes the chain's bytes `[S, Q)` into a fresh journal, and
+writes `state/` itself: snapshot floor `S`, a term map derived from the
+restored frame headers, the membership the cluster artifact at `S` carries
+as the config record (position `S`), **no vote**, and the output-progress
+marker at `S`. It leaves a `RESTORED` file (`tier_id`, `start_set`, `q`,
+`mode`, `created_ns`) for the audit trail; nothing reads it. Everything is
+assembled under `<DIR>/.restore-tmp/`, checked by the same verification as
+[`verify-backup`](#verify-backup), and only then renamed into place.
+
+Exactly one of:
+
+- `--confirm-cluster <APP_ID>` — **whole-cluster restore**: run it on every
+  node, with the same `--target` and the same `--at`, then start every node.
+  It must equal the tier's `app_id` or nothing is built. It prints
+  `restoring as of <Q>; history after <Q> is discarded on every node restored
+  this way` before building. Every node starts from identical history with
+  no vote, so the first election is ordinary. This is the quorum-loss
+  domain: a restore of fewer than all nodes beside a live majority is not
+  what this verb is for.
+- `--new-node --node-id <N>` — **one replacement node** seeded from the tier
+  instead of a peer's snapshot session. `N` must be a new id: one that is a
+  voter, learner or tombstone in the restored membership is refused
+  `restore_id_reused`. Start the node, then add it with `uc2ctl add-learner`.
+
+Refusals, each by name, each leaving `<DIR>` exactly as it was (and removing
+it again if the command created it):
+
+- a running node holds `<DIR>`'s `instance.lock`;
+- `TargetNotEmpty` — `<DIR>`'s `journal/`, `state/` or `snapshots/` is not
+  empty (volatile leftovers such as `cnc2.dat` and an unheld
+  `instance.lock` are fine);
+- `restore_point_unreachable: restorable [a, b] …` — `Q` is outside every
+  restorable range, at a set position (an empty journal span), or not a frame
+  end;
+- `restore set <S> incomplete: <object> missing`, or `tier_set_mismatch` —
+  an artifact vanished during the build or does not match its `SET`;
+- a chain gap, a corrupt chunk or an overlap mismatch, as `tier verify`
+  names them;
+- any finding of the final verification of the assembled directory.
 
 ## Response statuses
 

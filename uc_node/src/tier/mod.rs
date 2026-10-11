@@ -3,6 +3,7 @@
 //! the `uc2-backup` writer and the offline restore builder.
 pub mod chain;
 pub mod layout;
+pub mod materialize;
 pub mod object;
 pub mod retention;
 pub mod target;

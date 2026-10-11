@@ -53,6 +53,14 @@
 //! uc2ctl force-single-member --instance-dir D --app-id A --node-id N --confirm-cluster A
 //! ```
 //!
+//! The backup tier adds three OFFLINE verbs over a tier's files (spec §8):
+//!
+//! ```text
+//! uc2ctl tier show    --target T [--instance-dir D]
+//! uc2ctl tier verify  --target T [--deep]
+//! uc2ctl tier restore --target T [--at Q] --instance-dir D (--confirm-cluster A | --new-node --node-id N)
+//! ```
+//!
 //! From a source checkout, without installing:
 //!
 //! ```text
@@ -339,6 +347,64 @@ enum TierCmd {
     /// The tier's files are untouched, and a writer still pointed at it
     /// re-registers it on its next report.
     Forget(TierForgetArgs),
+    /// OFFLINE: the tier's identity, every set and chunk, the restorable
+    /// watermark; with `--instance-dir`, that node's committed watermarks
+    /// beside it.
+    Show(TierShowArgs),
+    /// OFFLINE: chunk CRCs and frame walks, overlap equality, every `SET`'s
+    /// files present at their stated sizes; `--deep` re-hashes every
+    /// artifact. Exits 1 on any finding, each printed.
+    Verify(TierVerifyArgs),
+    /// OFFLINE (spec §8): build an instance directory from the tier as of
+    /// `--at` (default: the tier's furthest reach). Whole-cluster restore
+    /// (`--confirm-cluster <app_id>`, run on every node with the same
+    /// `--at`) or one replacement node (`--new-node --node-id N`, a NEW id).
+    Restore(TierRestoreArgs),
+}
+
+#[derive(clap::Args)]
+struct TierShowArgs {
+    /// The tier's root: the `[backup] target` path.
+    #[arg(long)]
+    target: PathBuf,
+    /// A node's instance directory: also print its committed watermarks.
+    #[arg(long)]
+    instance_dir: Option<PathBuf>,
+}
+
+#[derive(clap::Args)]
+struct TierVerifyArgs {
+    #[arg(long)]
+    target: PathBuf,
+    /// Re-hash every artifact against its `SET` hash.
+    #[arg(long)]
+    deep: bool,
+}
+
+#[derive(clap::Args)]
+#[command(group(clap::ArgGroup::new("restore_mode").required(true).args(["confirm_cluster", "new_node"])))]
+struct TierRestoreArgs {
+    #[arg(long)]
+    target: PathBuf,
+    /// The restore point Q: a frame end inside a restorable range (`tier
+    /// show`). Default: the tier's furthest reach.
+    #[arg(long)]
+    at: Option<u64>,
+    /// The instance directory to build. No node may hold it, and its
+    /// `journal/`, `state/`, `snapshots/` must be absent or empty.
+    #[arg(long)]
+    instance_dir: PathBuf,
+    /// Whole-cluster restore: type the tier's `app_id` to confirm the
+    /// data-loss boundary (history after Q is discarded).
+    #[arg(long)]
+    confirm_cluster: Option<String>,
+    /// One replacement node under a new id (`--node-id`), refused
+    /// `restore_id_reused` when the id is in the restored membership.
+    #[arg(long, requires = "node_id")]
+    new_node: bool,
+    /// The replacement node's new id (with `--new-node` only).
+    #[arg(long, requires = "new_node", conflicts_with = "confirm_cluster")]
+    node_id: Option<u32>,
 }
 
 #[derive(clap::Args)]
@@ -592,9 +658,9 @@ enum Cmd {
     /// coordinated instant (`ADMIN_OP_UPGRADE_PIN`, wire op 10) or show the
     /// committed pin history and hash verdicts.
     Upgrade(UpgradeArgs),
-    /// Backup-tier spec §6.3: manage the cluster's registered backup tiers
-    /// — `forget` drops one tier's committed watermark
-    /// (`ADMIN_OP_TIER_FORGET`, wire op 11).
+    /// Backup-tier spec §6.3/§8: `forget` drops one tier's committed
+    /// watermark (`ADMIN_OP_TIER_FORGET`, wire op 11); `show`, `verify` and
+    /// `restore` work offline on the tier's files.
     Tier(TierArgs),
 }
 
@@ -643,6 +709,17 @@ fn main() {
         },
         Cmd::Tier(a) => match a.cmd {
             TierCmd::Forget(args) => tier::forget(&args.common, args.tier_id),
+            TierCmd::Show(args) => tier::show(&args.target, args.instance_dir.as_deref()),
+            TierCmd::Verify(args) => tier::verify(&args.target, args.deep),
+            TierCmd::Restore(args) => {
+                let mode = match args.node_id {
+                    Some(node_id) if args.new_node => tier::RestoreMode::NewNode(node_id),
+                    _ => {
+                        tier::RestoreMode::Cluster(args.confirm_cluster.clone().unwrap_or_default())
+                    }
+                };
+                tier::restore(&args.target, args.at, &args.instance_dir, mode)
+            }
         },
     };
     if let Err(e) = r {
@@ -1918,6 +1995,95 @@ mod tests {
                 cmd: TierCmd::Forget(f),
             }) => assert_eq!(f.tier_id, 255),
             _ => panic!("wrong variant"),
+        }
+    }
+
+    /// `tier show/verify/restore` parse; restore needs exactly one of
+    /// `--confirm-cluster` and `--new-node --node-id`.
+    #[test]
+    fn tier_offline_verbs_parse() {
+        let p = |args: &[&str]| {
+            let mut v = vec!["uc2ctl", "tier"];
+            v.extend_from_slice(args);
+            Cli::try_parse_from(v)
+        };
+        match p(&["show", "--target", "/t", "--instance-dir", "/d"])
+            .unwrap()
+            .cmd
+        {
+            Cmd::Tier(TierArgs {
+                cmd: TierCmd::Show(a),
+            }) => assert_eq!(a.instance_dir, Some(PathBuf::from("/d"))),
+            _ => panic!("wrong variant"),
+        }
+        match p(&["verify", "--target", "/t", "--deep"]).unwrap().cmd {
+            Cmd::Tier(TierArgs {
+                cmd: TierCmd::Verify(a),
+            }) => assert!(a.deep),
+            _ => panic!("wrong variant"),
+        }
+        let ok = [
+            &[
+                "restore",
+                "--target",
+                "/t",
+                "--instance-dir",
+                "/d",
+                "--confirm-cluster",
+                "app",
+            ][..],
+            &[
+                "restore",
+                "--target",
+                "/t",
+                "--at",
+                "4096",
+                "--instance-dir",
+                "/d",
+                "--new-node",
+                "--node-id",
+                "7",
+            ][..],
+        ];
+        for a in ok {
+            assert!(p(a).is_ok(), "{a:?}");
+        }
+        let bad = [
+            &["restore", "--target", "/t", "--instance-dir", "/d"][..],
+            &[
+                "restore",
+                "--target",
+                "/t",
+                "--instance-dir",
+                "/d",
+                "--new-node",
+            ][..],
+            &[
+                "restore",
+                "--target",
+                "/t",
+                "--instance-dir",
+                "/d",
+                "--node-id",
+                "7",
+                "--confirm-cluster",
+                "a",
+            ][..],
+            &[
+                "restore",
+                "--target",
+                "/t",
+                "--instance-dir",
+                "/d",
+                "--confirm-cluster",
+                "a",
+                "--new-node",
+                "--node-id",
+                "7",
+            ][..],
+        ];
+        for a in bad {
+            assert!(p(a).is_err(), "{a:?}");
         }
     }
 
