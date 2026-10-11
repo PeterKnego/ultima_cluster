@@ -59,6 +59,11 @@ End to end through the SDK — client submit, consensus, apply, response — wit
 payloads, inflight 4096, through `uc_client`'s public `Engine` — the **local
 shared-memory client**, co-located with the leader
 → [architecture sweep](/docs/benchmarks/uc2-arch-sweep-c8id-vs-c9gd-2026-08-31.md).
+**Reads scale with the nodes that answer:** on the same Graviton fleet,
+read-your-writes reads spread over the 3 nodes ran at **15.1 M/s beside 2 M
+committed writes/s at p99 0.34 ms**, and with reads alongside the cluster
+committed **4.6–5.3 M writes/s** at its unpaced ceiling
+→ [read types under writes](/docs/benchmarks/uc2-read-types-under-writes-c9gd-2026-10-11.md).
 A client connecting remotely through a gateway pays a measured toll on top:
 ~0.5× direct on one connection, ~0.9× aggregate
 → [M13 on ARM](/docs/benchmarks/uc2-m13-remote-on-arm-2026-09-01.md)

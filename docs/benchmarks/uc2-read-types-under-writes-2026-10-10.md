@@ -206,3 +206,13 @@ The read-only idle cap is fixed on branch `fix/query-drain-progress`:
 [`uc2-query-drain-progress-2026-10-10.md`](uc2-query-drain-progress-2026-10-10.md):
 read-only reads rose 3.8–5.6× on every arm. The numbers above were measured
 before the fix and stand as recorded.
+
+## Follow-up (2026-10-11, appended after the results above)
+
+The same five arms ran on 3 × `c9gd.4xlarge` with write rungs up to 2 M/s and
+an unpaced ceiling:
+[`uc2-read-types-under-writes-c9gd-2026-10-11.md`](uc2-read-types-under-writes-c9gd-2026-10-11.md).
+Reads there run 1.6–2.2× the 200 k column here; no read type starved up to
+2 M committed writes/s; and the leader-side read-your-writes ÷ snapshot ratio
+read 0.83 against the same ≥ 0.90 bar, recorded as a miss. The numbers above
+stand as recorded.
