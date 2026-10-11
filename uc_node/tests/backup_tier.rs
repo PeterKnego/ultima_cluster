@@ -1178,6 +1178,142 @@ mod writer_e2e {
         drop(fresh);
     }
 
+    /// Ruling RF1 (final review F1): a whole-cluster restore at a Q BELOW
+    /// the tier's reach R rolls the history back, and the restored cluster
+    /// writes a different history past Q. Its writer, restarted on the SAME
+    /// target, must not append that history to the old chain `[S, R)`:
+    /// the restore fenced the tier (`fence/<Q>`), the writer stops by name
+    /// (`backup_target_fenced`), the tier gains nothing, and the writer's
+    /// purge hold is released (a stopped writer holds nothing, R9a).
+    #[test]
+    fn a_restore_below_the_reach_fences_the_tier_and_its_writer_stops() {
+        let _g = serialize();
+        let tier = tmp_tier();
+        let cfg = writer_cfg(tier.path(), 1 << 20, Duration::from_millis(300));
+        let mut c = spawn(3, 0, opts("tier-fence", false), |i| {
+            (i == 1).then(|| cfg.clone())
+        });
+        start_sums(&mut c);
+        let l = await_single_leader(&c, 30);
+        await_capable(&c);
+        let all = c.running();
+        submit_settled(&c, 500);
+        let p = instant_until_complete(&c, l, &all);
+        await_agreed(&c, &all, p);
+        let lead = submit_settled(&c, 1000);
+        let t1 = c.node(lead).counters().commit.load_acquire();
+        // Q: a chain end the tier reached (a chunk end, so a frame end).
+        let q = await_watermark(&c, l, 60, |w| w.newest_set == p && w.through >= t1).through;
+        let lead = submit_settled(&c, 1000);
+        let t2 = c.node(lead).counters().commit.load_acquire();
+        await_watermark(&c, l, 60, |w| w.through >= t2);
+        for h in c.nodes.iter_mut() {
+            if let Some(s) = h.svc.take() {
+                s();
+            }
+        }
+        for h in c.nodes.iter_mut() {
+            h.stop();
+        }
+
+        let t = FsTarget::new(tier.path());
+        let before = list_tier(&t).unwrap();
+        let (_, _, reach) = watermark_of(&before).expect("a watermark");
+        assert!(
+            p < q && q < reach,
+            "precondition: S={p} < Q={q} < R={reach}"
+        );
+        let fresh = tempfile::Builder::new()
+            .prefix("uc2-tier-fenced-")
+            .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+            .expect("tempdir");
+        for (i, h) in c.nodes.iter_mut().enumerate() {
+            let nd = fresh.path().join(format!("r{i}"));
+            let m = materialize(&t, Some(q), &nd, Mode::Recovery, 7).expect("materialize");
+            assert_eq!(m.q, q);
+            let old = std::mem::replace(&mut h.cfg, Box::new(|| unreachable!()));
+            let d = nd.clone();
+            h.cfg = Box::new(move || NodeConfig {
+                instance_dir: d.clone(),
+                ..old()
+            });
+            h.dir = nd;
+            // Node 1 keeps its `[backup]` writer on the SAME target.
+        }
+        let listed = list_tier(&t).unwrap();
+        assert_eq!(listed.fences, vec![q], "the restore fenced the tier at Q");
+
+        for h in c.nodes.iter_mut() {
+            h.start();
+        }
+        start_sums(&mut c);
+        let l2 = await_single_leader(&c, 60);
+        await_capable(&c);
+        // A NEW history past Q: an instant P' inside the abandoned (Q, R]
+        // — an unfenced writer copies it as a set "inside the chain" (pick
+        // case (b)) — then more than R, which it would cut from R onto the
+        // old chain.
+        let lead = submit_settled(&c, (reach - q) / FRAME_BYTES / 2);
+        let all = c.running();
+        let p2 = instant_until_complete(&c, lead, &all);
+        await_agreed(&c, &all, p2);
+        assert!(
+            q < p2 && p2 < reach,
+            "precondition: Q={q} < P'={p2} < R={reach}"
+        );
+        let lead = submit_settled(&c, (reach - q) / FRAME_BYTES + 1000);
+        let commit = c.node(lead).counters().commit.load_acquire();
+        assert!(
+            commit > reach,
+            "the new history passes R ({commit} <= {reach})"
+        );
+        let shared = c.node(1).backup_writer().expect("node 1 runs a writer");
+        // Several quiet intervals for a writer that is going to write.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !shared.stopped.load(Ordering::Acquire) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        std::thread::sleep(Duration::from_millis(1500));
+        let after = list_tier(&t).unwrap();
+        let new_chunks: Vec<(u64, u64)> = after
+            .chunks
+            .iter()
+            .copied()
+            .filter(|ch| !before.chunks.contains(ch))
+            .collect();
+        let new_sets: Vec<u64> = after
+            .sets
+            .iter()
+            .map(|s| s.position)
+            .filter(|p| !before.sets.iter().any(|b| b.position == *p))
+            .collect();
+        assert!(
+            new_chunks.is_empty() && new_sets.is_empty(),
+            "the writer appended the restored cluster's NEW history to the rolled-back chain \
+             (S={p}, Q={q}, R={reach}): new chunks {new_chunks:?}, new sets {new_sets:?}, tier \
+             reach now {:?}; writer errors {:?}",
+            watermark_of(&after),
+            WriterError::ALL
+                .iter()
+                .map(|e| (e.label(), shared.stats.errors(*e)))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            shared.stopped.load(Ordering::Acquire),
+            "the writer stopped on the fenced target"
+        );
+        assert_eq!(
+            shared.stats.errors(WriterError::Fenced),
+            1,
+            "backup_target_fenced counted once"
+        );
+        assert_eq!(shared.purge_cap(), None, "a stopped writer holds nothing");
+        assert_eq!(shared.keep(), None);
+        let _ = l2;
+        let _keep = c.stop();
+        drop(fresh);
+    }
+
     /// Ruling R11a: an IDLE cluster's freshly copied set must become
     /// restorable. After the instant only bookkeeping frames (padding, the
     /// writer's own `BackupWatermark` reports) follow it, which R8b's quiet

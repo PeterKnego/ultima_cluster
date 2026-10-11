@@ -132,6 +132,9 @@ pub fn verify(target: &Path, deep: bool) -> anyhow::Result<()> {
         rep.chunks,
         rep.findings.len()
     );
+    for i in &rep.info {
+        println!("info: {i}");
+    }
     for f in &rep.findings {
         println!("finding: {f}");
     }
@@ -206,6 +209,17 @@ pub fn restore(
         info.tier_id,
         m.mode
     );
+    if m.fenced {
+        println!(
+            "fenced: {} — Q lies below the tier's reach, so this tier's history past {} is \
+             abandoned; every writer refuses this target from now on (backup_target_fenced). \
+             Restore every other node at the same --at, then point every node's [backup] target \
+             at a NEW, empty directory before starting them (this tier stays readable for \
+             further restores)",
+            uc_node::tier::layout::fence_object(m.q),
+            m.q
+        );
+    }
     Ok(())
 }
 

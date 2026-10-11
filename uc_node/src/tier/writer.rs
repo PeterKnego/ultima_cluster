@@ -24,7 +24,7 @@
 //! durable)`, read before the walk; committed bytes are never truncated, so
 //! nothing the writer reads below `C` can be replaced by a failover.
 use super::TierError;
-use super::chain::{TierListing, list_tier, watermark_of};
+use super::chain::{TierListing, list_fences, list_tier, watermark_of};
 use super::layout::{SetLabel, TierInfo, chunk_object, cluster_object, row_object, set_label};
 use super::object::{Codec, MAGIC_ARTIFACT, MAGIC_CHUNK, ObjectReader, write_object};
 use super::retention::{self, RetentionPolicy};
@@ -113,15 +113,22 @@ pub enum WriterError {
     /// This node's journal could not supply a range (read error, purged
     /// under the cut); retried on the ladder. Not the target's fault.
     JournalUnavailable = 4,
+    /// Ruling RF1: the target carries a `fence/<Q>` (a restore rolled its
+    /// history back); the writer stopped.
+    Fenced = 5,
+    /// C5: the target's filesystem cannot hard-link; the writer stopped.
+    NoHardlinks = 6,
 }
 
 impl WriterError {
-    pub const ALL: [WriterError; 5] = [
+    pub const ALL: [WriterError; 7] = [
         WriterError::Foreign,
         WriterError::Unavailable,
         WriterError::OverlapMismatch,
         WriterError::HashMismatch,
         WriterError::JournalUnavailable,
+        WriterError::Fenced,
+        WriterError::NoHardlinks,
     ];
 
     pub fn label(self) -> &'static str {
@@ -131,6 +138,8 @@ impl WriterError {
             WriterError::OverlapMismatch => "overlap_mismatch",
             WriterError::HashMismatch => "hash_mismatch",
             WriterError::JournalUnavailable => "journal_unavailable",
+            WriterError::Fenced => "fenced",
+            WriterError::NoHardlinks => "no_hardlinks",
         }
     }
 }
@@ -147,7 +156,7 @@ pub struct WriterStats {
     pub sets_deleted: AtomicU64,
     /// Journal chunks this writer's retention deleted from the tier.
     pub chunks_deleted: AtomicU64,
-    errors: [AtomicU64; 5],
+    errors: [AtomicU64; WriterError::ALL.len()],
 }
 
 impl WriterStats {
@@ -176,10 +185,16 @@ pub struct WriterShared {
     /// by the node's consensus agent (`Consensus::backup_purge_cap`), never
     /// by the writer.
     pub hold_released: AtomicBool,
-    /// The writer refused its target for good (foreign or overlap
-    /// mismatch); `Uc2BackupWriterError`. A stopped writer holds nothing
-    /// (ruling R9a): its alert covers it.
+    /// The writer refused its target for good (foreign, overlap mismatch,
+    /// fenced, no hard links); exported as `uc2_backup_writer_stopped`
+    /// (`Uc2BackupWriterStopped`). A stopped writer holds nothing (ruling
+    /// R9a): its alert covers it.
     pub stopped: AtomicBool,
+    /// Test seam (F2): while set, the writer's duty cycle does nothing — a
+    /// writer lagging behind its peers (a slow target) without a target
+    /// error. Never set outside tests.
+    #[doc(hidden)]
+    pub paused_for_test: AtomicBool,
     pub stats: WriterStats,
 }
 
@@ -759,7 +774,10 @@ impl Writer {
     /// One bounded duty cycle — at most one set or one chunk; `true` =
     /// progress (the runner then skips its sleep).
     pub fn step(&mut self, now_ns: u64) -> bool {
-        if self.stopped || now_ns < self.retry_at_ns {
+        if self.stopped
+            || now_ns < self.retry_at_ns
+            || self.shared.paused_for_test.load(Ordering::Relaxed)
+        {
             return false;
         }
         match self.work(now_ns) {
@@ -822,6 +840,28 @@ impl Writer {
                 );
                 self.stop("tier_overlap_mismatch");
             }
+            TierError::Fenced(_, q) => {
+                self.shared.stats.count(WriterError::Fenced);
+                crate::obs_event!(
+                    Warn,
+                    "backup_target_fenced",
+                    node = self.node_id as u64,
+                    target = target.as_str(),
+                    q = q
+                );
+                self.stop("backup_target_fenced");
+            }
+            TierError::NoHardlinks(_, err) => {
+                self.shared.stats.count(WriterError::NoHardlinks);
+                crate::obs_event!(
+                    Warn,
+                    "target_no_hardlinks",
+                    node = self.node_id as u64,
+                    target = target.as_str(),
+                    err = err.as_str()
+                );
+                self.stop("target_no_hardlinks");
+            }
             TierError::Journal(msg) => {
                 self.shared.stats.count(WriterError::JournalUnavailable);
                 if !self.journal_unavailable {
@@ -868,6 +908,11 @@ impl Writer {
         if self.tier.is_none() {
             self.target.clean_tmp(TMP_MAX_AGE)?;
             let info = open_or_create_tier(&*self.target, &self.app_id, wall_ns())?;
+            // Ruling RF1: a fenced target is refused before anything is
+            // copied (the refresh below re-checks on every listing).
+            if let Some(&q) = list_fences(&*self.target)?.first() {
+                return Err(self.fenced(q));
+            }
             crate::obs_event!(
                 Info,
                 "backup_tier_opened",
@@ -946,8 +991,17 @@ impl Writer {
         Ok(done.any())
     }
 
+    fn fenced(&self, q: u64) -> TierError {
+        TierError::Fenced(self.cfg.target.display().to_string(), q)
+    }
+
     fn refresh(&mut self, now_ns: u64) -> Result<(), TierError> {
         let l = list_tier(&*self.target)?;
+        // Ruling RF1: a restore fenced the tier while this writer ran (or
+        // between its open and its first listing): never extend it.
+        if let Some(&q) = l.fences.first() {
+            return Err(self.fenced(q));
+        }
         let wm = watermark_of(&l);
         // A new chain that does not connect to the old one: the tier's
         // history now has a hole between the old reach and the new start.
@@ -1017,10 +1071,19 @@ impl Writer {
         }
         self.scan_due = false;
         self.scanned_key = key;
+        // A set whose SET label is corrupt (F4) counts as present: copying
+        // it again would only meet the unparsable label (`Exists`) and stop
+        // the writer as an overlap mismatch. `tier verify` names it.
         let have: BTreeSet<u64> = self
             .listing
             .as_ref()
-            .map(|l| l.sets.iter().map(|s| s.position).collect())
+            .map(|l| {
+                l.sets
+                    .iter()
+                    .map(|s| s.position)
+                    .chain(l.corrupt_sets.iter().copied())
+                    .collect()
+            })
             .unwrap_or_default();
         // Spec §7: a catalog set retention would delete again the moment it
         // landed (the policy over the tier plus it) is never (re)copied —

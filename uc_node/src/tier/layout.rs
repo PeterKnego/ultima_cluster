@@ -27,6 +27,20 @@ pub fn chunk_object(from: u64, to: u64) -> String {
     format!("journal/{from:020}-{to:020}.ultj")
 }
 
+/// The directory of restore fences (ruling RF1).
+pub const FENCE_DIR: &str = "fence";
+
+/// Ruling RF1: the write-once object a restore below the tier's reach
+/// leaves at `fence/<Q:020>`. Its presence makes every writer refuse the
+/// target (`backup_target_fenced`); reads ignore it.
+pub fn fence_object(q: u64) -> String {
+    format!("{FENCE_DIR}/{q:020}")
+}
+
+pub fn parse_fence_name(name: &str) -> Option<u64> {
+    parse_pos(name)
+}
+
 fn parse_pos(s: &str) -> Option<u64> {
     if s.len() == 20 && s.bytes().all(|b| b.is_ascii_digit()) {
         s.parse().ok()
@@ -119,6 +133,33 @@ impl TierInfo {
                 created.ok_or_else(|| miss("created_ns"))?,
             )?,
         })
+    }
+}
+
+/// The body of a `fence/<Q>` object: `key=value` lines. Audit only — the
+/// object's NAME is what writers key on; nothing parses the body to decide.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FenceInfo {
+    /// The restore point the tier's history was rolled back to.
+    pub q: u64,
+    /// The tier's reach when the fence was written (history past `q` up to
+    /// here is the abandoned branch).
+    pub reach: u64,
+    pub created_ns: u64,
+    /// The restoring cluster's `app_id` (the tier's own).
+    pub app_id: String,
+    /// The instance directory the restore built.
+    pub restored_into: String,
+}
+
+impl FenceInfo {
+    pub fn render(&self) -> String {
+        // A path with a newline would break the line format: keep it on one.
+        let into = self.restored_into.replace(['\n', '\r'], " ");
+        format!(
+            "q={}\nreach={}\ncreated_ns={}\napp_id={}\nrestored_into={into}\n",
+            self.q, self.reach, self.created_ns, self.app_id
+        )
     }
 }
 

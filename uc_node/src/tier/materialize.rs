@@ -26,7 +26,7 @@ use uc_service::snapshots::{SNAPSHOT_ENVELOPE_LEN, SnapshotStore, decode_snapsho
 
 use super::TierError;
 use super::chain::{TierListing, list_tier, reach_from, read_range};
-use super::layout::{SetLabel, cluster_object, row_object};
+use super::layout::{FenceInfo, SetLabel, cluster_object, fence_object, row_object};
 use super::object::{MAGIC_ARTIFACT, ObjectReader};
 use super::target::{BackupTarget, read_tier};
 use crate::cluster_agent;
@@ -66,6 +66,9 @@ pub struct Materialized {
     pub start_set: u64,
     pub q: u64,
     pub mode: Mode,
+    /// Ruling RF1: this build fenced the tier at `q` (or found the fence a
+    /// sibling restore at the same Q already wrote).
+    pub fenced: bool,
 }
 
 /// The assembly directory under `out_dir`.
@@ -195,6 +198,16 @@ pub fn materialize(
 }
 
 /// [`materialize`] with the start set optionally named ([`restore_point_from`]).
+///
+/// Ruling RF1: a [`Mode::Recovery`] build at a Q below the tier's reach
+/// rolls the cluster's history back — every node restored this way
+/// continues from Q with history the tier's `(Q, reach]` does not hold — so
+/// once the directory is placed, the build fences the tier with a
+/// write-once `fence/<Q>` ([`fence_tier`]). A writer refuses a fenced
+/// target (`backup_target_fenced`), so the new history can never be
+/// appended to the old chain. A restore at the reach writes no fence (the
+/// history continues unchanged); a fork never fences (its new `app_id` is
+/// already refused by `TIER`).
 pub fn materialize_from(
     t: &dyn BackupTarget,
     from: Option<u64>,
@@ -202,6 +215,55 @@ pub fn materialize_from(
     out_dir: &Path,
     mode: Mode,
     now_ns: u64,
+) -> Result<Materialized, TierError> {
+    build_dir(
+        t,
+        from,
+        q,
+        out_dir,
+        mode,
+        now_ns,
+        matches!(mode, Mode::Recovery),
+    )
+}
+
+/// Ruling RF1: write `fence/<q>` when `q` lies below `reach`. `Exists` is
+/// fine — several nodes restored from one tier at one Q name one fence.
+pub fn fence_tier(
+    t: &dyn BackupTarget,
+    q: u64,
+    reach: u64,
+    app_id: &str,
+    restored_into: &Path,
+    now_ns: u64,
+) -> Result<bool, TierError> {
+    if q >= reach {
+        return Ok(false);
+    }
+    let text = FenceInfo {
+        q,
+        reach,
+        created_ns: now_ns,
+        app_id: app_id.to_string(),
+        restored_into: restored_into.display().to_string(),
+    }
+    .render();
+    t.put_if_absent(&fence_object(q), &mut |f| {
+        f.write_all(text.as_bytes())?;
+        Ok(text.len() as u64)
+    })?;
+    Ok(true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_dir(
+    t: &dyn BackupTarget,
+    from: Option<u64>,
+    q: Option<u64>,
+    out_dir: &Path,
+    mode: Mode,
+    now_ns: u64,
+    fence: bool,
 ) -> Result<Materialized, TierError> {
     refuse_target(out_dir)?;
     let info = read_tier(t)?.ok_or_else(|| refused("no tier at the target (no TIER file)"))?;
@@ -218,7 +280,7 @@ pub fn materialize_from(
     // the instance lock creates the directory, `instance.lock`, `journal/`
     // and `state/` when they are absent.
     let created = !out_dir.exists();
-    let before: Vec<(PathBuf, bool)> = ["instance.lock", "journal", "state"]
+    let before: Vec<(PathBuf, bool)> = ["instance.lock", "journal", "state", "snapshots"]
         .iter()
         .map(|n| {
             let p = out_dir.join(n);
@@ -261,13 +323,35 @@ pub fn materialize_from(
             })?;
         place(&tmp, out_dir)
     })();
+    // Ruling RF1: the fence goes LAST, after the directory is placed, and
+    // under the instance lock. A fence that cannot be written un-places the
+    // build: a restored history below the reach must never boot beside a
+    // tier its writers would extend.
+    let built = built.and_then(|()| {
+        if !fence {
+            return Ok(false);
+        }
+        let reach = restorable_ranges(&listing)
+            .iter()
+            .map(|&(_, b)| b)
+            .max()
+            .unwrap_or(q);
+        fence_tier(t, q, reach, &info.app_id, out_dir, now_ns).map_err(|e| {
+            unbuild(out_dir, created, &before);
+            refused(format!(
+                "restore: could not write the tier's fence/{q:020} (the restored directory \
+                     was removed again): {e}"
+            ))
+        })
+    });
     match built {
-        Ok(()) => {
+        Ok(fenced) => {
             drop(lock);
             Ok(Materialized {
                 start_set: s,
                 q,
                 mode,
+                fenced,
             })
         }
         Err(e) => {
@@ -436,7 +520,8 @@ pub fn export_corpus(
                 label.rows.iter().map(|r| r.row).collect::<Vec<_>>()
             ))
         })?;
-    let m = materialize_from(t, Some(s), Some(q), out, Mode::Recovery, now_ns)?;
+    // A corpus is a read of the tier, not a rollback: never a fence.
+    let m = build_dir(t, Some(s), Some(q), out, Mode::Recovery, now_ns, false)?;
     Ok(CorpusFields {
         app_id: info.app_id,
         row,
@@ -1107,6 +1192,72 @@ mod tests {
                 .unwrap()
                 .contains("mode=fork:1\n")
         );
+    }
+
+    /// Ruling RF1: a Recovery restore below the tier's reach leaves a
+    /// write-once `fence/<Q>` (a second node restored at the same Q finds
+    /// it there, which is fine); a restore AT the reach, a fork and an
+    /// export-corpus write none; reads ignore a fence.
+    #[test]
+    fn a_restore_below_the_reach_fences_the_tier_and_one_at_the_reach_does_not() {
+        use crate::tier::chain::list_fences;
+        use crate::tier::layout::fence_object;
+        let fx = fixture();
+        let t = FsTarget::new(&fx.tier);
+        // At the reach (4096): the history continues unchanged — no fence.
+        let m = materialize(&t, Some(4096), &out(&fx, "at"), Mode::Recovery, 1).unwrap();
+        assert!(!m.fenced);
+        assert!(
+            list_fences(&t).unwrap().is_empty(),
+            "Q == reach fences nothing"
+        );
+        // A fork below the reach never fences (its new app_id already
+        // keeps it off this tier); neither does a corpus export.
+        fork_with(&t, Some(2560), &out(&fx, "fork"), "kv-fork", 1, 1, |_| {
+            Ok(crate::recovery::ForceReport {
+                old_version: 1,
+                new_version: 2,
+                durable: 2560,
+                dropped_peers: vec![],
+            })
+        })
+        .unwrap();
+        export_corpus(&t, 0, None, 2560, &out(&fx, "corpus"), 1).unwrap();
+        assert!(
+            list_fences(&t).unwrap().is_empty(),
+            "fork/export never fence"
+        );
+        // Below the reach: fenced at Q, written after the dir is placed.
+        let d = out(&fx, "below");
+        let m = materialize(&t, Some(2560), &d, Mode::Recovery, 9).unwrap();
+        assert_eq!((m.q, m.fenced), (2560, true));
+        assert!(d.join(RESTORED_FILE).is_file());
+        assert_eq!(list_fences(&t).unwrap(), vec![2560]);
+        let body = fs::read_to_string(fx.tier.join(fence_object(2560))).unwrap();
+        assert!(
+            body.starts_with("q=2560\nreach=4096\ncreated_ns=9\napp_id=restore-app\n"),
+            "{body}"
+        );
+        // Restoring the next node from the same tier at the same Q: the
+        // fence is already there (Exists), the restore still succeeds.
+        materialize(&t, Some(2560), &out(&fx, "below2"), Mode::Recovery, 10).unwrap();
+        assert_eq!(list_fences(&t).unwrap(), vec![2560]);
+        // Reads ignore the fence: the full reach still restores.
+        materialize(&t, None, &out(&fx, "again"), Mode::Recovery, 11).unwrap();
+        let l = list_tier(&t).unwrap();
+        assert_eq!(l.fences, vec![2560]);
+        assert_eq!(restorable_ranges(&l), vec![(1024, 4096)]);
+        // `tier verify` reports the fence as info, never a finding; `tier
+        // show` lists it.
+        let r = crate::tier::chain::verify(&t, false).unwrap();
+        assert!(r.findings.is_empty(), "{:?}", r.findings);
+        assert!(
+            r.info.iter().any(|i| i.contains("tier_fenced")),
+            "{:?}",
+            r.info
+        );
+        let info = read_tier(&t).unwrap().unwrap();
+        assert!(crate::tier::chain::render_show(&info, &l).contains("fence: 2560"));
     }
 
     #[test]

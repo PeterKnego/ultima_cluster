@@ -58,9 +58,37 @@ fn fsync_dir(p: &Path) -> Result<(), TierError> {
     Ok(())
 }
 
+/// C5: `link(2)` failures that mean the filesystem cannot hard-link at all
+/// (SMB/CIFS and some FUSE mounts answer `EPERM`/`EOPNOTSUPP`; `.tmp` on
+/// another mount than the object answers `EXDEV`) — never a transient.
+fn no_hardlinks(e: &std::io::Error) -> bool {
+    matches!(
+        e.raw_os_error(),
+        Some(libc::EPERM) | Some(libc::EXDEV) | Some(libc::EOPNOTSUPP)
+    )
+}
+
 impl FsTarget {
     pub fn new(root: impl Into<PathBuf>) -> FsTarget {
         FsTarget { root: root.into() }
+    }
+
+    /// `create_dir_all` may have made several ancestors: fsync every
+    /// directory from `leaf` up to the root so none of the new entries can
+    /// be lost to a crash.
+    fn fsync_up(&self, leaf: &Path) -> Result<(), TierError> {
+        let mut d = leaf;
+        loop {
+            fsync_dir(d)?;
+            if d == self.root {
+                break;
+            }
+            match d.parent() {
+                Some(p) if p.starts_with(&self.root) => d = p,
+                _ => break,
+            }
+        }
+        Ok(())
     }
 
     pub fn root(&self) -> &Path {
@@ -127,23 +155,21 @@ impl BackupTarget for FsTarget {
         let _ = std::fs::remove_file(&tmp);
         match placed {
             Ok(()) => {
-                // create_dir_all may have made several ancestors: fsync every
-                // directory from the leaf parent up to the root so none of
-                // the new entries can be lost to a crash.
-                let mut d = parent.as_path();
-                loop {
-                    fsync_dir(d)?;
-                    if d == self.root {
-                        break;
-                    }
-                    match d.parent() {
-                        Some(p) if p.starts_with(&self.root) => d = p,
-                        _ => break,
-                    }
-                }
+                self.fsync_up(&parent)?;
                 Ok(Put::Written(stored))
             }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(Put::Exists),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                // C1: the entry may be another writer's that is not durable
+                // yet (it linked it and has not fsynced the directories).
+                // `Exists` lets this writer advance its progress — and so its
+                // node's purge cap — on that entry, so make it durable first.
+                self.fsync_up(&parent)?;
+                Ok(Put::Exists)
+            }
+            Err(e) if no_hardlinks(&e) => Err(TierError::NoHardlinks(
+                self.root.display().to_string(),
+                e.to_string(),
+            )),
             Err(e) => Err(e.into()),
         }
     }

@@ -2,8 +2,8 @@
 //! streamed range reads and offline verify/show.
 use super::TierError;
 use super::layout::{
-    SET_FILE, SetLabel, TierInfo, chunk_object, cluster_object, parse_chunk_name, parse_set_dir,
-    row_object, set_dir,
+    FENCE_DIR, SET_FILE, SetLabel, TierInfo, chunk_object, cluster_object, fence_object,
+    parse_chunk_name, parse_fence_name, parse_set_dir, row_object, set_dir,
 };
 use super::object::{MAGIC_ARTIFACT, MAGIC_CHUNK, ObjectReader};
 use super::target::BackupTarget;
@@ -17,6 +17,13 @@ pub struct TierListing {
     pub sets: Vec<SetLabel>,
     pub incomplete_sets: Vec<u64>,
     pub chunks: Vec<(u64, u64)>,
+    /// F4: sets whose `SET` label exists but does not parse, or names
+    /// another position than its directory. Never a start; `verify` reports
+    /// each as `tier_set_label_corrupt`; everything else lists on.
+    pub corrupt_sets: Vec<u64>,
+    /// Ruling RF1: the restore points named by `fence/<Q>` objects. A
+    /// writer refuses a fenced target; reads ignore fences.
+    pub fences: Vec<u64>,
 }
 
 /// Receives `(position, bytes)` pieces of a range read.
@@ -29,44 +36,85 @@ fn corrupt(what: impl Into<String>, detail: impl Into<String>) -> TierError {
     }
 }
 
-/// A set is complete iff its `SET` label exists; a directory without one is
-/// an interrupted write (the label is written last) and never a start.
+/// A set's `SET` label: `Ok(None)` when absent (an interrupted write — the
+/// label is written last), `Err` when present but unusable (it does not
+/// parse, or names another position than its directory).
+fn read_label(t: &dyn BackupTarget, p: u64) -> Result<Option<Result<SetLabel, String>>, TierError> {
+    let Some(mut f) = t.open(&format!("{}/{SET_FILE}", set_dir(p)))? else {
+        return Ok(None);
+    };
+    let mut s = String::new();
+    // A label that is not UTF-8 is as corrupt as one that does not parse.
+    if let Err(e) = f.read_to_string(&mut s) {
+        if e.kind() == std::io::ErrorKind::InvalidData {
+            return Ok(Some(Err("not UTF-8 text".to_string())));
+        }
+        return Err(e.into());
+    }
+    Ok(Some(match SetLabel::parse(&s) {
+        Err(e) => Err(e.to_string()),
+        Ok(l) if l.position != p => Err(format!(
+            "position {} disagrees with its directory",
+            l.position
+        )),
+        Ok(l) => Ok(l),
+    }))
+}
+
+/// A set is complete iff its `SET` label exists and parses; a directory
+/// without one is an interrupted write (the label is written last) and
+/// never a start. A label that exists but is unusable marks the set
+/// corrupt (F4) — listed apart, never a start, and never fatal to the
+/// listing: one bad object must not brick the writer, retention or restore.
 pub fn list_tier(t: &dyn BackupTarget) -> Result<TierListing, TierError> {
     let mut sets = Vec::new();
     let mut incomplete = Vec::new();
+    let mut corrupt_sets = Vec::new();
     for name in t.list("sets")? {
         let Some(p) = parse_set_dir(&name) else {
             continue;
         };
-        match t.open(&format!("{}/{SET_FILE}", set_dir(p)))? {
+        match read_label(t, p)? {
             None => incomplete.push(p),
-            Some(mut f) => {
-                let mut s = String::new();
-                f.read_to_string(&mut s)?;
-                let l = SetLabel::parse(&s)?;
-                if l.position != p {
-                    return Err(corrupt(
-                        format!("SET of {p}"),
-                        format!("position {} disagrees with its directory", l.position),
-                    ));
-                }
-                sets.push(l);
-            }
+            Some(Err(_)) => corrupt_sets.push(p),
+            Some(Ok(l)) => sets.push(l),
         }
     }
     sets.sort_by_key(|l| l.position);
     incomplete.sort_unstable();
+    corrupt_sets.sort_unstable();
     let mut chunks: Vec<(u64, u64)> = t
         .list("journal")?
         .iter()
         .filter_map(|n| parse_chunk_name(n))
         .collect();
     chunks.sort_unstable();
+    let mut fences: Vec<u64> = t
+        .list(FENCE_DIR)?
+        .iter()
+        .filter_map(|n| parse_fence_name(n))
+        .collect();
+    fences.sort_unstable();
     Ok(TierListing {
         sets,
         incomplete_sets: incomplete,
         chunks,
+        corrupt_sets,
+        fences,
     })
+}
+
+/// Ruling RF1: the restore points of the target's `fence/` objects, sorted.
+/// Cheaper than a full [`list_tier`]; a writer checks it when it opens a
+/// target.
+pub fn list_fences(t: &dyn BackupTarget) -> Result<Vec<u64>, TierError> {
+    let mut f: Vec<u64> = t
+        .list(FENCE_DIR)?
+        .iter()
+        .filter_map(|n| parse_fence_name(n))
+        .collect();
+    f.sort_unstable();
+    Ok(f)
 }
 
 /// The chunk extending a chain at cursor `c`: `from <= c < to`, greatest `to`
@@ -274,6 +322,9 @@ pub struct VerifyReport {
     pub sets: usize,
     pub chunks: usize,
     pub findings: Vec<String>,
+    /// Informational lines that are not findings (ruling RF1: the tier's
+    /// restore fences) — `tier verify` prints them and still exits 0.
+    pub info: Vec<String>,
 }
 
 fn stream_object(
@@ -328,7 +379,26 @@ pub fn verify(t: &dyn BackupTarget, deep: bool) -> Result<VerifyReport, TierErro
         sets: l.sets.len(),
         chunks: l.chunks.len(),
         findings: Vec::new(),
+        info: Vec::new(),
     };
+    for &q in &l.fences {
+        rep.info.push(format!(
+            "tier_fenced: {} — a restore rolled this tier's history back to {q}; writers refuse \
+             this target (backup_target_fenced), reads and further restores are unaffected",
+            fence_object(q)
+        ));
+    }
+    for &p in &l.corrupt_sets {
+        let why = match read_label(t, p) {
+            Ok(Some(Err(why))) => why,
+            Ok(_) => "changed while verifying".to_string(),
+            Err(e) => e.to_string(),
+        };
+        rep.findings.push(format!(
+            "tier_set_label_corrupt: sets/{p:020}/{SET_FILE}: {why} (the set is never a restore \
+             start)"
+        ));
+    }
     for p in &l.incomplete_sets {
         rep.findings.push(format!(
             "tier_set_incomplete: sets/{p:020} has no {SET_FILE} label"
@@ -431,6 +501,11 @@ pub fn render_show(info: &TierInfo, l: &TierListing) -> String {
     for p in &l.incomplete_sets {
         s.push_str(&format!("  set {p} INCOMPLETE (no label)\n"));
     }
+    for p in &l.corrupt_sets {
+        s.push_str(&format!(
+            "  set {p} CORRUPT (its SET label does not parse; tier_set_label_corrupt)\n"
+        ));
+    }
     s.push_str(&format!("chunks: {}\n", l.chunks.len()));
     for (f, t) in &l.chunks {
         s.push_str(&format!("  [{f}, {t})\n"));
@@ -441,13 +516,21 @@ pub fn render_show(info: &TierInfo, l: &TierListing) -> String {
         )),
         None => s.push_str("watermark: none (no complete set)\n"),
     }
+    for q in &l.fences {
+        s.push_str(&format!(
+            "fence: {q} (a restore rolled the history back to {q}; writers refuse this target — \
+             point [backup] target at a new, empty directory)\n"
+        ));
+    }
     s
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tier::layout::{RowLabel, chunk_object, cluster_object, row_object, set_label};
+    use crate::tier::layout::{
+        RowLabel, TierInfo, chunk_object, cluster_object, row_object, set_label,
+    };
     use crate::tier::object::{Codec, MAGIC_ARTIFACT, MAGIC_CHUNK, write_object};
     use crate::tier::target::FsTarget;
     use std::io::Cursor;
@@ -552,6 +635,8 @@ mod tests {
         let l = TierListing {
             sets: vec![label(0), label(192)],
             incomplete_sets: vec![],
+            corrupt_sets: vec![],
+            fences: vec![],
             chunks,
         };
         assert_eq!(
@@ -568,6 +653,8 @@ mod tests {
         let l = TierListing {
             sets: vec![label(0), label(1000)],
             incomplete_sets: vec![],
+            corrupt_sets: vec![],
+            fences: vec![],
             chunks: chunks.clone(),
         };
         assert_eq!(watermark_of(&l), Some((0, 1000, 8192)));
@@ -627,6 +714,59 @@ mod tests {
         assert_eq!(l.incomplete_sets, vec![64]);
         assert_eq!(watermark_of(&l), None);
         assert!(!verify(&t, false).unwrap().findings.is_empty());
+    }
+
+    /// F4: one SET that does not parse (or names another position) does
+    /// not brick the tier: that set is listed as corrupt and left out of
+    /// `sets`, every other set and chunk still lists, and verify names it.
+    #[test]
+    fn an_unparsable_set_label_is_corrupt_not_fatal() {
+        let d = tmp();
+        let t = FsTarget::new(d.path());
+        put_label(&t, &label(64));
+        put_chunk(&t, 64, 128);
+        put_set_files_without_label(&t, 96);
+        t.put_if_absent(&set_label(96), &mut |f| {
+            use std::io::Write;
+            f.write_all(b"garbage\n")?;
+            Ok(8)
+        })
+        .unwrap();
+        let mut liar = label(160);
+        liar.position = 161;
+        t.put_if_absent(&set_label(160), &mut |f| {
+            use std::io::Write;
+            let s = liar.render();
+            f.write_all(s.as_bytes())?;
+            Ok(s.len() as u64)
+        })
+        .unwrap();
+        let l = list_tier(&t).expect("a corrupt SET must not fail the listing");
+        assert_eq!(
+            l.sets.iter().map(|s| s.position).collect::<Vec<_>>(),
+            vec![64]
+        );
+        assert_eq!(l.corrupt_sets, vec![96, 160]);
+        assert_eq!(watermark_of(&l), Some((64, 64, 128)));
+        let r = verify(&t, false).unwrap();
+        assert_eq!(
+            r.findings
+                .iter()
+                .filter(|f| f.contains("tier_set_label_corrupt"))
+                .count(),
+            2,
+            "{:?}",
+            r.findings
+        );
+        let shown = render_show(
+            &TierInfo {
+                app_id: "kv".into(),
+                tier_id: 1,
+                created_ns: 0,
+            },
+            &l,
+        );
+        assert!(shown.contains("CORRUPT"), "{shown}");
     }
 
     #[test]

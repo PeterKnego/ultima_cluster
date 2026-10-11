@@ -21,6 +21,20 @@ pub enum TierError {
     OverlapMismatch(String),
     #[error("{0}")]
     Refused(String),
+    /// Ruling RF1: the target carries `fence/<Q>` — a restore rolled this
+    /// tier's history back to Q, so no writer may extend it.
+    #[error(
+        "tier target {0}: its history was rolled back at {1} by a restore (fence/{1:020}); point \
+         [backup] target at a new, empty directory (backup_target_fenced)"
+    )]
+    Fenced(String, u64),
+    /// C5: the target's filesystem cannot hard-link (SMB/CIFS and some FUSE
+    /// mounts), which `put_if_absent` needs for its atomic "iff absent".
+    #[error(
+        "tier target {0} cannot hard-link ({1}); the backup target needs a filesystem with hard \
+         links (target_no_hardlinks)"
+    )]
+    NoHardlinks(String, String),
     /// The node's own journal could not supply a range (a read error, a
     /// block purged under the cut) — not the target's fault.
     #[error("journal: {0}")]
