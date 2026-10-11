@@ -12679,10 +12679,23 @@ impl Consensus {
         } else {
             self.min_applied.max(self.boot_durable)
         };
+        // #99: never pace below the current term's opening frame. The term
+        // map's entry for `current_term` is the NewTerm frame's position (the
+        // archive's term walk stamps `(term, base)` there, and the leader's
+        // own map opens the term at it); the frame is header-only, 32 bytes,
+        // and never preceded by padding at frame-aligned offsets — the second
+        // 32 bytes are margin. 0 until this node has seen the term open.
+        let term_open_end = match self.sm.term_map().last() {
+            Some(&(t, base)) if t == self.sm.current_term() => {
+                base.saturating_add(2 * uc_protocol::v2::frame::FRAME_ALIGNMENT as u64)
+            }
+            _ => 0,
+        };
         let ceiling = crate::services::report_ceiling(
             self.sm.validated_up_to(),
             min_applied,
             self.fsm_lag_eff,
+            term_open_end,
         );
         // Term first, then position (unchanged): a torn read fails the
         // leader's attestation check, the safe direction.

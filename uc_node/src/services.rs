@@ -475,10 +475,24 @@ pub const SERVICE_STALE_NS: u64 = 3_000_000_000;
 /// Q (spec §5.3): what this node attests toward the leader's commit ranking
 /// — never more than it has validated, never more than `fsm_lag` past its
 /// slowest FSM. Reporting less than you hold is always safe in Raft.
-pub fn report_ceiling(validated_up_to: u64, min_applied: u64, fsm_lag_eff: Option<u64>) -> u64 {
+///
+/// #99: `term_open_end` is a FLOOR under the `fsm_lag` bound — the end of the
+/// current term's opening (NewTerm) frame, or 0 when this node has not seen
+/// it. A new leader advances commit only once a quorum reports past that
+/// frame (Raft §5.4.2), so a bound below it can never be lifted: the
+/// services sit at the old commit, nothing new commits, nothing applies, and
+/// the bound never moves. The floor admits that one frame — and with it the
+/// deposed term's tail below it, which the new leader's first commit carries
+/// anyway — and nothing past it; pacing holds everything after.
+pub fn report_ceiling(
+    validated_up_to: u64,
+    min_applied: u64,
+    fsm_lag_eff: Option<u64>,
+    term_open_end: u64,
+) -> u64 {
     match fsm_lag_eff {
         None => validated_up_to,
-        Some(lag) => validated_up_to.min(min_applied.saturating_add(lag)),
+        Some(lag) => validated_up_to.min(min_applied.saturating_add(lag).max(term_open_end)),
     }
 }
 
@@ -864,18 +878,48 @@ mod tests {
 
     #[test]
     fn report_ceiling_never_exceeds_validated_and_is_inert_without_fsms() {
-        assert_eq!(report_ceiling(10_000, 2_000, Some(4_096)), 6_096);
-        assert_eq!(report_ceiling(10_000, 9_000, Some(4_096)), 10_000);
+        assert_eq!(report_ceiling(10_000, 2_000, Some(4_096), 0), 6_096);
+        assert_eq!(report_ceiling(10_000, 9_000, Some(4_096), 0), 10_000);
         assert_eq!(
-            report_ceiling(10_000, 0, Some(4_096)),
+            report_ceiling(10_000, 0, Some(4_096), 0),
             4_096,
             "absent FSMs cap the report at the bound"
         );
         assert_eq!(
-            report_ceiling(10_000, u64::MAX, Some(4_096)),
+            report_ceiling(10_000, u64::MAX, Some(4_096), 0),
             10_000,
             "saturating add"
         );
-        assert_eq!(report_ceiling(10_000, 0, None), 10_000);
+        assert_eq!(report_ceiling(10_000, 0, None, 0), 10_000);
+    }
+
+    /// #99: the current term's NewTerm frame must commit before ANY commit
+    /// advance (Raft §5.4.2 clamp), so pacing must never hold a report below
+    /// it. The #99 numbers: applied = commit = 512448, lag 64 KiB, the new
+    /// leader's term opens at the old log end 680704 — the bare bound
+    /// (577984) can never reach its NewTerm frame and commit deadlocks.
+    #[test]
+    fn report_ceiling_always_admits_the_current_terms_opening_frame() {
+        let open_end = 680_704 + 64;
+        assert_eq!(
+            report_ceiling(700_000, 512_448, Some(64 * 1024), open_end),
+            open_end,
+            "the term's opening frame is reportable however far past the bound"
+        );
+        assert_eq!(
+            report_ceiling(680_000, 512_448, Some(64 * 1024), open_end),
+            680_000,
+            "still never past validated"
+        );
+        assert_eq!(
+            report_ceiling(700_000, 690_000, Some(64 * 1024), open_end),
+            700_000,
+            "an ordinary bound above the opening frame is unchanged"
+        );
+        assert_eq!(
+            report_ceiling(10_000_000, 512_448, Some(64 * 1024), open_end),
+            open_end,
+            "the floor admits only the opening frame — pacing still holds the rest"
+        );
     }
 }
