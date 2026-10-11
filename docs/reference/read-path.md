@@ -69,7 +69,7 @@ cluster per rung —
 | Linearizable reads, no writes | 3.88 M/s, p99 0.32 ms |
 | Linearizable reads, 200 k committed writes/s | 3.13 M/s, p99 0.41 ms |
 | Linearizable reads, 2 M committed writes/s | 2.89 M/s, p99 0.47 ms |
-| Relative to a snapshot read on the leader | 0.55 read-only; 0.51–0.60 under writes |
+| Relative to a snapshot read on the leader | 0.55 read-only; 0.50–0.60 under writes |
 | Read-your-writes spread over 3 nodes ÷ linearizable on the leader | 4.4–5.8× |
 
 ## Diagnostic signatures

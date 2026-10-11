@@ -31,11 +31,10 @@ labelled as one — including where that makes a number look worse.
 
 ## Headline
 
-| | |
-|---|---|
-| **3.79 M responses/s @ p50 ~0.3 ms, p99 ≤ 1.0 ms** | End to end through the SDK via the **local shmem client**, quorum-durable acks; 2025-generation hardware (`c9gd.4xlarge`), unpinned, n=8. Not a gate — a characterization sweep. Remote clients through a gateway pay a toll on top: ~0.5× per connection, ~0.9× aggregate (M13 rows below) |
-| **1.64 M responses/s @ p99 0.771 ms** | The M5 *gate*, on the 2020-generation fleet (`c6id.2xlarge`): quorum-fsync'd, reads linearizable. p50 0.600 ms, p90 0.682 ms |
-| **Failover p50 202 ms, 10/10 zero committed loss** | Sandbox/loopback; fleet confirmation outstanding |
+|||
+|-|-|
+| **2 M committed writes/s alongside 15.1 M read-your-writes reads/s, p99 0.34 ms** | Quorum-durable writes, reads spread over 3 nodes; every read type at every write rate to 2 M/s at p99 0.21–0.47 ms; unpaced ceiling 4.6–5.3 M committed writes/s with reads alongside. 2025-generation hardware (`c9gd.4xlarge`), 2 reps per cell. Not a gate — an instrument run ([record](/docs/benchmarks/uc2-read-types-under-writes-c9gd-2026-10-11.md)) |
+
 
 CPU generation alone moves these headline numbers ~2× in rate and ~4× in p50
 — the [architecture sweep](/docs/benchmarks/uc2-arch-sweep-c8id-vs-c9gd-2026-08-31.md)
@@ -139,15 +138,3 @@ The gate harnesses are `uc_node/examples/{m4,m5,m6,m7}_gate.rs` and
 `read_profile.rs`; each carries its own `node` / `service` / `client` roles so
 the fleet orchestrator can start one process per host.
 
----
-
-## Open work
-
-- **M4's fleet arm.** Failover is timeout-dominated and real NVMe fsync is faster
-  than the sandbox's ext4, so the sandbox p50 is a conservative upper bound. What
-  the fleet run would confirm is real-LAN detection timing, which loopback cannot
-  speak to.
-- **M8's fleet ratio.** The 94.1 % is a dev-box measurement; the record lists a
-  cross-host confirmation as open.
-- **M1** has never had a fleet arm. It is superseded in practice by M3 and M5,
-  which measure the same path end to end on real hardware.

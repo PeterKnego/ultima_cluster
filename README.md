@@ -2,7 +2,7 @@
 
 A clustered application server, built on strong [core principles](CORE_PRINCIPLES.md), 
 allowing you to write applications that are correct, resilient and high performance.
-Built on the state-of-the-art State Machine Replication architecture, with a full non-blocking design measured at 3.8M operations per second with p99 ≤ 1ms on current-generation hardware.
+Built on the state-of-the-art State Machine Replication architecture, with a full non-blocking design measured at 2M writes per second alongside 15M reads per second, p99 under 0.5 ms, on current-generation hardware.
 
 ## What it is
 
@@ -50,20 +50,19 @@ occasional snapshots are persisted), and correctness comes from the guaranteed
 order of commands across every state machine in the cluster — not from locks,
 transactions or conflict resolution.
 
-### High-perf: 3.8 M responses/s, p50 ~0.3 ms, p99 ≤ 1 ms
+### High-perf: 2 M writes/s alongside 15 M reads/s, p99 < 0.5 ms
 
-End to end through the SDK — client submit, consensus, apply, response — with
-**every operation quorum-durable before it is acked**. Mean of 8 runs
-3.79 M/s (span 3.55–4.17 M), p50 0.27–0.35 ms in 7 of 8 runs, p99 never above
-1.0 ms. Measured 2026-08-31 on 3 × `c9gd.4xlarge` (16-core Graviton), 64 B
-payloads, inflight 4096, through `uc_client`'s public `Engine` — the **local
-shared-memory client**, co-located with the leader
-→ [architecture sweep](/docs/benchmarks/uc2-arch-sweep-c8id-vs-c9gd-2026-08-31.md).
-**Reads scale with the nodes that answer:** on the same Graviton fleet,
-read-your-writes reads spread over the 3 nodes ran at **15.1 M/s beside 2 M
-committed writes/s at p99 0.34 ms**, and with reads alongside the cluster
-committed **4.6–5.3 M writes/s** at its unpaced ceiling
+**Every write quorum-durable before it is acked.** On 3 × `c9gd.4xlarge`
+(16-core Graviton), the cluster committed **2 M writes/s while serving 15.1 M
+read-your-writes reads/s** spread over its 3 nodes, worst-host p99 0.34 ms.
+Every read type at every write rate from 0 to 2 M/s stayed at p99
+0.21–0.47 ms. Pushed unpaced, it committed **4.6–5.3 M writes/s** with reads
+alongside, at p99 1.2–1.5 ms on the leader. Measured 2026-10-11
 → [read types under writes](/docs/benchmarks/uc2-read-types-under-writes-c9gd-2026-10-11.md).
+Write-only and end to end through the SDK's local shared-memory `Engine`
+client (submit, consensus, apply, response), the same fleet type ran
+3.79 M responses/s at p50 ~0.3 ms, p99 ≤ 1.0 ms
+→ [architecture sweep](/docs/benchmarks/uc2-arch-sweep-c8id-vs-c9gd-2026-08-31.md).
 A client connecting remotely through a gateway pays a measured toll on top:
 ~0.5× direct on one connection, ~0.9× aggregate
 → [M13 on ARM](/docs/benchmarks/uc2-m13-remote-on-arm-2026-09-01.md)

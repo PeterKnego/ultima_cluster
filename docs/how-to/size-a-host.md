@@ -30,7 +30,8 @@ numbers by clock speed.
   fewer cores than the processes you co-locate on it.
 - **Reads are per node; put them on followers.** A `c9gd.4xlarge` node
   answers about 7 M snapshot reads/s at 1,024 reads in flight,
-  read-your-writes at 0.8–0.85× that, linearizable (leader only) at 0.55× —
+  read-your-writes at 0.83× that (0.78–0.91× under writes), linearizable
+  (leader only) at 0.55× —
   and followers serving reads cost the write path nothing measurable up to
   2 M committed writes/s. Spread read-your-writes or snapshot reads over every
   node before buying a bigger leader
