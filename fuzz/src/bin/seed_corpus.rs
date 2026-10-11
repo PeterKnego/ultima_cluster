@@ -83,6 +83,7 @@ fn main() -> std::io::Result<()> {
         "uc_node_cluster_artifact",
         seeds::uc_node_cluster_artifact(),
     )?;
+    write_target(root, "uc_node_tier_object", seeds::uc_node_tier_object())?;
     write_target(root, "uc_service_session", seeds::uc_service_session())?;
     write_target(
         root,

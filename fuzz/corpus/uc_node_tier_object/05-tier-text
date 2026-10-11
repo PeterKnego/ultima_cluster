@@ -1,0 +1,4 @@
+format=uc2-tier-v1
+app_id=fuzz-app
+tier_id=0x123456789abcdef0
+created_ns=1700000000000000000

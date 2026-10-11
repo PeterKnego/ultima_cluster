@@ -17,7 +17,7 @@ Every command in [Sub-commands](#sub-commands) below (`add-learner` through
 purely through the cnc page's admin request/response slots, and both
 `--instance-dir` and `--app-id` are checked against that live node.
 
-The six commands under [Offline commands](#offline-commands) are different in
+The commands under [Offline commands](#offline-commands) are different in
 kind, not just in name: `backup`, `verify-backup`, and `restore` are
 filesystem-only and never touch a running node's cnc admin band at all (the
 node may be running throughout a `backup`, since it never talks to it);
@@ -26,7 +26,10 @@ directly and **refuses if a node is running**; `gen-admin-key` and `audit`
 (M12b, `v2.6.0`) are filesystem-only in the same sense as `backup` — `audit`
 even works against an instance directory that has never had a node in it
 yet, and `gen-admin-key` doesn't take `--instance-dir` at all, only a
-destination path. None of the six accept `--app-id` in the same sense as the
+destination path. The backup tier's `tier show`, `tier verify`, `tier
+restore`, `tier fork` and `tier export-corpus` (`0.11.0`, unreleased) read a
+tier's files directly and never a node's admin band; `tier restore` and `tier
+fork` refuse an instance directory a running node holds. None of these accept `--app-id` in the same sense as the
 admin-band commands — most don't take it at all (there is nothing on disk to
 check it against), and `force-single-member` takes it purely as a typed
 confirmation guard, not as anything validated against a live node.
@@ -87,13 +90,14 @@ window.
 Sub-commands are: `add-learner`, `promote`, `demote`, `remove-learner`,
 `remove-voter`, `schedule apply`, `schedule show`, `settings apply`,
 `settings show`, `snapshot`, `snapshot fetch`, `snapshot show`,
-`upgrade pin`, `upgrade show`, `status`.
+`upgrade pin`, `upgrade show`, `tier forget`, `status`.
 
 Every mutating one is a **cluster-FSM command** since 2.11.0: the
 reconfiguration ops append `CLUSTER kind = 1` (Membership), `schedule apply`
 appends `CLUSTER kind = 2`, `settings apply` appends `CLUSTER kind = 3`, and
 — since the FSM upgrade lifecycle — `upgrade pin` appends `CLUSTER kind = 4`
-(`UpgradePin`). The operator-facing surface is unchanged; what changed is
+(`UpgradePin`), and `tier forget` appends `CLUSTER kind = 7`
+(`BackupWatermark`, a `Forget`). The operator-facing surface is unchanged; what changed is
 that one internal state machine now applies all of these at commit
 ([the cluster FSM explainer](../notes/uc2-cluster-fsm-explained.md)).
 **Single in flight, across all of them**: the leader answers `retry` while
@@ -256,6 +260,8 @@ snapshot_interval_bytes = 0            # 0 = on demand only
 snapshot_target         = "all"        # "all" or "learners"
 retain_sets             = 3            # 0.11.0, the snapshot catalog; absent = 1 (today's newest-only)
 auto_fetch              = true         # bool; absent = true (every node fetches the newest agreed set)
+backup_retain_sets      = 0            # u16; absent/0 = a backup tier keeps every set
+backup_retain_age       = "30d"        # "<n>(s|m|h|d)"; absent/0 = no age rule
 ```
 
 An unknown key is refused locally by name, before anything is staged. The same
@@ -286,13 +292,16 @@ uc2ctl settings show --instance-dir <DIR> --app-id <ID>
 ```
 
 ```
-position=8192 admission_bytes=262144 fsm_lag=16MiB snapshot_interval_bytes=0 snapshot_target=all retain_sets=1 auto_fetch=true datagram_mtu=0 (baseline)
+position=8192 admission_bytes=262144 fsm_lag=16MiB snapshot_interval_bytes=0 snapshot_target=all retain_sets=1 auto_fetch=true backup_retain_sets=0 backup_retain_age_secs=0 datagram_mtu=0 (baseline)
 ```
 
 `fsm_lag` renders as `default` (the record's `0`), `lockstep`, a whole-MiB
 count, or a raw byte count when it is neither. `auto_fetch` (bool, absent = `true`) is whether every node fetches the newest agreed set in the background. `retain_sets` (`0.11.0`, the
 snapshot catalog, unreleased) is how many agreed snapshot sets the cluster
 keeps; `1` is the default and matches today's newest-only retention.
+`backup_retain_sets` and `backup_retain_age_secs` (backup tier, `0.11.0`,
+unreleased) bound how long a backup tier keeps its sets (`0` = no rule); the
+file spells the age as `backup_retain_age = "30d"`.
 `datagram_mtu` (2.12 pending)
 is the committed datagram rung: `0 (baseline)` is the `MTU_DEFAULT` every
 cluster starts from, and a rung the leader's path-MTU discovery committed
@@ -588,6 +597,31 @@ its record commits — see
 The cluster FSM's own artifact (`service_id = 255`) is **not** reported —
 `SnapshotReport.row` covers declared rows `0..8` only.
 
+### `tier forget`
+
+```
+uc2ctl tier forget --tier-id <ID> --instance-dir <DIR> --app-id <ID> [--admin-key <FILE>]
+```
+
+Drops one backup tier's committed watermark from the cluster state — admin
+op **11**, audited `tier_forget`. `--tier-id` is the tier's 64-bit id as its
+`TIER` label carries it, `0x…` hex or decimal. The id does not fit one admin
+request field, so it travels split: its low 32 bits in `id`, its high 32 in
+`ip`, `port = 0` (the audit record's `detail` names the whole id as `tier
+<16 hex digits>`).
+
+Leader-only and single-in-flight like every `CLUSTER` command: a follower,
+or a leader with a previous `CLUSTER` command still above commit, answers
+`retry` — re-run it, against the node the leader hint names. On success it
+prints `forgotten: tier <hex> position=<P>`, where `P` is the `Forget`
+record's frame-END position. An id no tier is registered under is refused
+**62 `tier_unknown`**.
+
+Forgetting touches **only the cluster's record**: the tier's files are
+untouched, and a writer still pointed at the tier re-registers it on its next
+report. To retire a tier for good, remove its `[backup]` section from every
+node first, then forget it.
+
 ### `status`
 
 Prints the node's current config version and pending state, per-member
@@ -624,7 +658,9 @@ Output fields:
 ## Offline commands
 
 `backup`, `verify-backup`, `restore` (M11 Task 2), `force-single-member`
-(M11 Task 4), and `gen-admin-key`/`audit` (M12b, `v2.6.0`). See
+(M11 Task 4), `gen-admin-key`/`audit` (M12b, `v2.6.0`), and the backup tier's
+`tier show`/`tier verify`/`tier restore`/`tier fork`/`tier export-corpus`
+(`0.11.0`, unreleased). See
 [the offline-vs-admin-band distinction](#admin-band-commands-vs-offline-commands)
 above. Task walkthroughs: [Back up a cluster](../how-to/back-up-a-cluster.md),
 [Recover from quorum loss](../how-to/recover-from-quorum-loss.md),
@@ -727,7 +763,10 @@ member of the recovered config.
 On success, prints the exact data-loss statement first, then the resulting
 report (`old_version`, `new_version`, `durable`, `dropped_peers`). Every peer
 but the survivor is **dropped from the config, not tombstoned** — they
-wipe-and-rejoin later as fresh learners; see
+wipe-and-rejoin later as fresh learners. The command rewrites only the
+node's own config record; at the survivor's first leadership it appends the
+single-voter membership as a cluster command, so the replicated cluster
+state follows once that commits. See
 [Recover from quorum loss](../how-to/recover-from-quorum-loss.md). A one-way
 door: there is no "undo" verb.
 
@@ -777,6 +816,185 @@ record silently. See
 [Change cluster membership](../how-to/change-cluster-membership.md#read-the-audit-log)
 and [Instance directory](instance-directory.md) for the file's durability
 class (`O_APPEND`, `fsync` per record, no rotation).
+
+### `tier show`
+
+```
+uc2ctl tier show --target <TIER> [--instance-dir <DIR>]
+```
+
+Reads a backup tier (the `[backup] target` path) and prints its `TIER`
+identity (`tier_id`, `app_id`, `created_ns`), every complete set (position,
+kind, time, row count, and how far its chain reaches), every set directory
+with no `SET` label (`INCOMPLETE` — an interrupted copy, never a restore
+start), every set whose `SET` label does not parse (`CORRUPT`, never a
+restore start), every journal chunk `[from, to)`, the watermark
+(`oldest_set`, `newest_set`, `through`), one `fence: <Q>` line per restore
+fence (see [`tier restore`](#tier-restore)), and one `restorable: (a, b]` line per range a
+restore can be built in — a restore point `Q` is a frame end with
+`a < Q <= b`, never a set position itself. With `--instance-dir`, it also prints the committed backup
+watermarks that node's newest cluster artifact holds, marking the one that
+is this tier (`no cluster artifact yet` until that node's first instant).
+Filesystem-only; the node may be running.
+
+### `tier verify`
+
+```
+uc2ctl tier verify --target <TIER> [--deep]
+```
+
+Checks every chunk (header against name, block CRCs, a whole-frame walk to
+its end), byte equality wherever two chunks overlap, and every `SET`'s
+objects present at their stated raw sizes; a set directory without a `SET`
+label is reported `tier_set_incomplete`, and a `SET` label that does not
+parse (or names another position) `tier_set_label_corrupt`. `--deep` also re-hashes every
+artifact against its `SET` hash (a row's hash covers the payload after its
+24-byte envelope, whose position must equal the set's). Prints
+`tier verify: <sets> sets, <chunks> chunks, <n> findings`, then one
+`finding: …` line per finding, each naming the object; **exits 1 when there
+is any finding**, 0 when there is none. A restore fence is printed as an
+`info: tier_fenced: …` line before the findings and is not a finding.
+Read-only.
+
+### `tier restore`
+
+```
+uc2ctl tier restore --target <TIER> [--at <Q>] --instance-dir <DIR> --confirm-cluster <APP_ID>
+uc2ctl tier restore --target <TIER> [--at <Q>] --instance-dir <DIR> --new-node --node-id <N>
+```
+
+Builds an instance directory a node boots from unchanged, as of `Q`
+(`--at`, default the tier's furthest reach — the `through` of `tier show`).
+The start set `S` is the newest complete set below `Q` whose chain reaches
+`Q`. The builder copies `S`'s artifacts (each checked against its `SET` size
+and hash), writes the chain's bytes `[S, Q)` into a fresh journal, and
+writes `state/` itself: snapshot floor `S`, a term map derived from the
+restored frame headers, the membership the cluster artifact at `S` carries
+as the config record (position `S`), **no vote**, and the output-progress
+marker at `S`. It leaves a `RESTORED` file (`tier_id`, `start_set`, `q`,
+`mode`, `created_ns`) for the audit trail; nothing reads it. Everything is
+assembled under `<DIR>/.restore-tmp/`, checked by the same verification as
+[`verify-backup`](#verify-backup), and only then renamed into place.
+
+Exactly one of:
+
+- `--confirm-cluster <APP_ID>` — **whole-cluster restore**: run it on every
+  node, with the same `--target` and the same `--at`, then start every node.
+  It must equal the tier's `app_id` or nothing is built. It prints
+  `restoring as of <Q>; history after <Q> is discarded on every node restored
+  this way` before building. Every node starts from identical history with
+  no vote, so the first election is ordinary. This is the quorum-loss
+  domain: a restore of fewer than all nodes beside a live majority is not
+  what this verb is for.
+- `--new-node --node-id <N>` — one replacement node seeded from the tier.
+  **Refused in this release** (`new_node_unsupported`, before anything is
+  read or built): the restored term map starts at `S` and cannot align with
+  a live leader's lineage, so the node would be cut below its floor. Add a
+  replacement node with a fresh, empty instance directory and the normal
+  join (a snapshot session from its peers).
+
+**A restore below the reach fences the tier.** When `Q` lies below the
+tier's furthest reach, the restored cluster will write a history past `Q`
+that the tier's `(Q, reach]` does not hold. After `<DIR>` is placed, the
+builder writes the write-once object `fence/<Q>` (`q`, `reach`,
+`created_ns`, `app_id`, `restored_into`) to the tier and prints `fenced:
+fence/<Q> …`; a fence it cannot write removes the placed directory again and
+refuses. Every writer refuses a fenced target (`backup_target_fenced`,
+`uc2_backup_errors_total{reason="fenced"}`) and stops, so point every
+writer's `[backup] target` at a new, empty directory before starting the
+restored nodes. Reads (`tier show`/`verify`/`restore`/`fork`/`export-corpus`)
+ignore fences; restoring the other nodes at the same `Q` finds the fence
+already there. A restore at the reach writes none; `tier fork` and `tier
+export-corpus` never do.
+
+The builder holds `<DIR>`'s exclusive `instance.lock` for the whole build,
+as `force-single-member` does, so a node started there mid-build refuses.
+While the assembled directories are renamed into place a `RESTORING` marker
+sits in `<DIR>`; a crash in that window leaves it.
+
+Refusals, each by name, each leaving `<DIR>` exactly as it was (and removing
+it again if the command created it):
+
+- a running node holds `<DIR>`'s `instance.lock`;
+- `<DIR>` carries a `RESTORING` marker — an earlier restore was interrupted
+  while placing; remove its `journal/`, `state/`, `snapshots/` and
+  `RESTORING`, then restore again;
+- `TargetNotEmpty` — `<DIR>`'s `journal/`, `state/` or `snapshots/` is not
+  empty (volatile leftovers such as `cnc2.dat` and an unheld
+  `instance.lock` are fine);
+- `restore_point_unreachable: restorable (a, b] …` — `Q` is outside every
+  restorable range, at a set position (an empty journal span), or not a frame
+  end;
+- `restore set <S> incomplete: <object> missing`, or `tier_set_mismatch` —
+  an artifact vanished during the build or does not match its `SET`;
+- a chain gap, a corrupt chunk or an overlap mismatch, as `tier verify`
+  names them;
+- any finding of the final verification of the assembled directory.
+
+### `tier fork`
+
+```
+uc2ctl tier fork --target <TIER> [--at <Q>] --instance-dir <DIR> --app-id <NEW> --node-id <N>
+```
+
+Builds a **separate cluster** as of `Q` (`--at`, default the tier's furthest
+reach) in `<DIR>`: the same build as `tier restore`, with two differences.
+The output-progress marker is `Q`, not `S` — a fork replays **no** side
+effects: every output at or below `Q` already happened in the real world, so
+the fork's output handler sees only commands committed after it boots. Then
+the [`force-single-member`](#force-single-member) plan is applied to the
+result: `N` becomes the only voter at its recorded address, config version
+one past the restored one, every other member dropped (not tombstoned). The
+`RESTORED` file records `mode=fork:<N>`.
+
+It prints `forking as of <Q> into a separate cluster "<NEW>" with node <N> as
+its single voter; no output at or below <Q> is replayed` before building,
+then `forked: … config_version=<V> dropped=[…]` and the next step.
+
+Start node `N` on `<DIR>` with `app_id = "<NEW>"` in its `node.toml`. At its
+first leadership the node appends the single-voter membership as a cluster
+command, so the replicated cluster state (`uc2ctl status`, the cluster
+artifact) agrees with the forced config once that commits; until it has,
+membership changes answer `retry`. Grow the fork with
+[`add-learner`](#add-learner) and [`promote`](#promote).
+
+The fork inherits the source tier's watermark entry in its cluster state.
+It does not hold a purge (the hold is local to a writer), but it **alerts**:
+nothing advances it on the fork, so `uc2_backup_lag_bytes` grows with every
+commit and `Uc2BackupBehind` fires past 256 MiB. Run `uc2ctl tier forget
+--tier-id <id>` on the fork once its first leader is up.
+
+Refusals, each by name, each building nothing — the `tier restore` list,
+plus:
+
+- `fork_same_app_id` — `--app-id` is the tier's own `app_id`. A fork is a
+  separate cluster and must not be confusable with its source;
+- `fork_node_unknown` — `N` is not a voter or learner (or is a tombstone) of
+  the membership as of `Q`.
+
+### `tier export-corpus`
+
+```
+uc2ctl tier export-corpus --target <TIER> --row <R> [--from <S>] --to <Q> --out <DIR>
+```
+
+Builds a [diff-replay](../how-to/diff-replay.md) **corpus** from the tier:
+the `tier restore` build of `[S, Q)` into `<DIR>` (a whole-cluster recovery
+build — `<DIR>` is never booted), plus a `CORPUS` manifest in the
+`uc2-corpus-v1` format `uc2-diffreplay` reads, written by `uc_diffreplay`'s
+own writer: `app_id` (the tier's), `row`, `origin = S`, `end = Q`, and
+`version` — the row's version as the start set's `SET` records it. `S` is
+`--from` when given (a complete set below `Q` whose chain reaches `Q`),
+else the newest such set. Prints `exported: <DIR> row=… origin=… end=…
+version=0x… tier=0x…`. Then, for example:
+
+```
+uc2-diffreplay determinism --corpus <DIR> --bin <your-service-binary> --report det.json
+```
+
+Refusals: the `tier restore` list (`restore_point_unreachable` names an `S`
+that is not a complete set or whose chain does not reach `Q`), plus
+`corpus_row_unknown` — the start set holds no artifact for `--row`.
 
 ## Response statuses
 
@@ -846,8 +1064,10 @@ its own band for the same reason. 48–50 (2.11.0) are the coordinated-snapshot
 ops' own (`uc_node::REASON_SNAPSHOT_*`), split across `snapshot` (48, 49) and
 `snapshot fetch` (50). 51 is `schedule apply`'s own, added later. 52–59 (FSM
 upgrade lifecycle) are `upgrade pin`'s own (`uc_node::REASON_PIN_*` and
-`report_stale`), in their own band for the same reason, and 60 (#33) is the
-cluster FSM's refusal of a `RowGenesis` record.
+`report_stale`), in their own band for the same reason, 60 (#33) is the
+cluster FSM's refusal of a `RowGenesis` record, 61 (the snapshot catalog) is
+`upgrade pin`'s door check on an unagreed origin, and 62 (the backup tier) is
+`tier forget`'s refusal of an id no tier is registered under.
 
 | Code | Reason |
 |---|---|
@@ -890,6 +1110,7 @@ cluster FSM's refusal of a `RowGenesis` record.
 | 59 | `report_stale` — a `SnapshotReport` below the row's held report position. Never produced by `uc2ctl`; recorded here because it shares op 10's refusal band |
 | 60 | `version_already_set` — a `RowGenesis` record (`CLUSTER` kind 6) for a row that already has a running version: genesis records a row's first version once and never changes one (#33). Never returned to `uc2ctl` — genesis is the leader's own append, with no admin request behind it — and listed here because it shares the band. A refused genesis changes nothing: like every refused `CLUSTER` record it advances the cluster FSM's `applied` and the row keeps the version it already had |
 | 61 | `pin_origin_not_agreed` — `--origin` is a complete set on this node but the snapshot catalog has not AGREED it (every reporting node's hash must match; reports take up to ~5 s after the instant). Wait for that set to agree (`uc2_catalog_agreed_position` reaches it), or take a new instant (`uc2ctl snapshot`) and pin that; a set that diverged never agrees. (54 accepts only this node's newest complete set, so an older agreed origin is not a way out.) On a cluster whose catalog is still empty (no complete set yet), the pin is allowed unchecked and the node logs `upgrade_pin_agreement_unchecked` |
+| 62 | `tier_unknown` — `uc2ctl tier forget --tier-id T` names a tier the committed cluster state does not hold: no backup writer has reported it, or it was already forgotten. Check the id against the tier's `TIER` label. Refused by the cluster FSM's own acceptance check (`BackupWatermark` `Forget`, `CLUSTER` kind 7), so nothing is appended |
 
 Code `0` is not a `ProposeError`. It is the CLI's own malformed-op sentinel.
 

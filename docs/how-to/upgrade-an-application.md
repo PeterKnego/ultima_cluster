@@ -595,6 +595,32 @@ service that will not start. The only way back that needs no new build is:
    (`uc2ctl restore` — see [Back up a cluster](back-up-a-cluster.md)), and
 2. start the old service binary.
 
+**If you back up to a [tier](back-up-to-a-tier.md)**, the tier holds a
+protected rollback set for any unfinished pin: retention never deletes the
+newest set below the pin's record, or the journal from it to the record.
+Stop every node, then on each one restore to a frame end `Q` after that set
+and before the pin record:
+
+```bash
+uc2ctl tier show --target /mnt/uc-backup   # find the set and the restorable range
+uc2ctl tier restore --target /mnt/uc-backup --at Q \
+    --instance-dir /srv/uc2/nN --confirm-cluster APP
+```
+
+Restore **every** member (learners and writers too) at the same `Q`, each
+into an empty instance directory (move the old one aside and keep it until
+the rollback is verified); see
+[Whole-cluster restore](back-up-to-a-tier.md#whole-cluster-restore). The same
+loss rule applies: every write committed after `Q` is gone, and
+`on_committed` runs again for the commands between the set and `Q`. This `Q`
+lies below the tier's reach, so the restore **fences** the tier
+(`fence/<Q>`): before you start the nodes, point every writer's `[backup]
+target` at a new, empty directory, or its writer stops with
+`backup_target_fenced`
+([After a restore below the reach](back-up-to-a-tier.md#after-a-restore-below-the-reach)).
+The old tier stays readable for another restore. Then start the old service
+binary. The pin record is above `Q`, so the restored cluster is not pinned.
+
 **Every write acknowledged since that backup is lost.** That is the whole
 reason step 1 is not optional, and why
 [S8](../reference/application-sdlc.md#s8-decide-the-point-of-no-return) puts

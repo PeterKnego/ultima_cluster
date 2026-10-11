@@ -44,11 +44,14 @@ use uc_protocol::ring::{
     BroadcastProducer, BroadcastRing, MpscConsumer, MpscRing, RingError, SpscConsumer,
     SpscProducer, SpscRing,
 };
+use uc_protocol::v2::backup::{
+    BACKUP_REPORT_BODY_LEN, BackupTierEntry, BackupWatermark, WatermarkOp, write_backup_report_body,
+};
 use uc_protocol::v2::cnc::{
     ADMIN_OP_SCHEDULE_APPLY, ADMIN_OP_SETTINGS_APPLY, ADMIN_OP_SNAPSHOT, ADMIN_OP_SNAPSHOT_FETCH,
-    ADMIN_OP_UPGRADE_PIN, CNC_MAX_PEER_SLOTS, CNC_MAX_SERVICES, CNC_PEER_ROLE_LEARNER,
-    CNC_PEER_ROLE_VOTER, CNC_SVC_STATUS_ATTACHED, CNC_SVC_STATUS_SNAPSHOT_CAPABLE,
-    NODE_FLAG_CAN_SERVE, NODE_FLAG_LEADER, NODE_FLAG_LEARNER,
+    ADMIN_OP_TIER_FORGET, ADMIN_OP_UPGRADE_PIN, CNC_MAX_PEER_SLOTS, CNC_MAX_SERVICES,
+    CNC_PEER_ROLE_LEARNER, CNC_PEER_ROLE_VOTER, CNC_SVC_STATUS_ATTACHED,
+    CNC_SVC_STATUS_SNAPSHOT_CAPABLE, NODE_FLAG_CAN_SERVE, NODE_FLAG_LEADER, NODE_FLAG_LEARNER,
 };
 use uc_protocol::v2::config::{WireConfig, WireMember, decode_config, encode_config};
 use uc_protocol::v2::crypto::DGRAM_KIND_HS_KEY;
@@ -76,14 +79,14 @@ use uc_log::buffer::FrameRead;
 use uc_protocol::v2::catalog::{FOREIGN_SET_SUFFIX, MAX_CATALOG_SETS, SetEntry, SetKind, SetState};
 use uc_protocol::v2::datagram::{
     CONFIG_PROPOSAL_BODY_LEN, CONFIG_REPLY_BODY_LEN, ConfigProposalBody, ConfigReplyBody,
-    DATAGRAM_HEADER_LEN, DGRAM_KIND_COMMIT_POSITION, DGRAM_KIND_CONFIG_PROPOSAL,
-    DGRAM_KIND_CONFIG_REPLY, DGRAM_KIND_READ_PROBE, DGRAM_KIND_READ_PROBE_ACK,
-    DGRAM_KIND_REQUEST_VOTE, DGRAM_KIND_SNAP_REPORT, DGRAM_KIND_TERM_MAP, DGRAM_KIND_VOTE,
-    DatagramHeader, Holdings, JUMBO_MIN_RUNG, MAX_PAYLOAD_DEFAULT, MAX_TERM_MAP_WIRE_ENTRIES,
-    MTU_DEFAULT, READ_PROBE_BODY_LEN, REQUEST_VOTE_BODY_LEN, ReadProbeBody, RequestVoteBody,
-    SNAP_REPORT_BODY_LEN, SnapReportBody, TERM_MAP_ENTRY_LEN, TERM_MAP_HEADER_LEN,
-    TermMapEntryWire, VOTE_BODY_LEN, VoteBody, is_rung, payload_ceiling,
-    write_config_proposal_body, write_config_reply_body, write_datagram_header,
+    DATAGRAM_HEADER_LEN, DGRAM_KIND_BACKUP_REPORT, DGRAM_KIND_COMMIT_POSITION,
+    DGRAM_KIND_CONFIG_PROPOSAL, DGRAM_KIND_CONFIG_REPLY, DGRAM_KIND_READ_PROBE,
+    DGRAM_KIND_READ_PROBE_ACK, DGRAM_KIND_REQUEST_VOTE, DGRAM_KIND_SNAP_REPORT,
+    DGRAM_KIND_TERM_MAP, DGRAM_KIND_VOTE, DatagramHeader, Holdings, JUMBO_MIN_RUNG,
+    MAX_PAYLOAD_DEFAULT, MAX_TERM_MAP_WIRE_ENTRIES, MTU_DEFAULT, READ_PROBE_BODY_LEN,
+    REQUEST_VOTE_BODY_LEN, ReadProbeBody, RequestVoteBody, SNAP_REPORT_BODY_LEN, SnapReportBody,
+    TERM_MAP_ENTRY_LEN, TERM_MAP_HEADER_LEN, TermMapEntryWire, VOTE_BODY_LEN, VoteBody, is_rung,
+    payload_ceiling, write_config_proposal_body, write_config_reply_body, write_datagram_header,
     write_read_probe_body, write_request_vote_body, write_snap_report_body, write_term_map_body,
     write_vote_body,
 };
@@ -329,6 +332,11 @@ pub struct StartOpts {
     /// the instance directory's permissions ARE the admin boundary, and the
     /// cnc auth line is ignored entirely.
     pub admin: AdminPolicy,
+    /// Backup-tier spec §5.1: `[backup]` — `Some` runs the `uc2-backup`
+    /// writer thread into that target. Here rather than on [`NodeConfig`]
+    /// for the reason `admin` is: `NodeConfig` has no `Default` and many
+    /// literal call sites.
+    pub backup: Option<crate::tier::writer::BackupConfig>,
 }
 
 /// Ingress queue depth (M5 replaces this with the client submit ring).
@@ -401,13 +409,50 @@ pub const SOFT_STALE_FACTOR: u64 = 3;
 /// one copy old.
 const HOLDINGS_COPY_NS: u64 = 10_000_000;
 
+/// Backup-tier spec §6.2: the pass-clock spacing at which the consensus agent
+/// looks in the backup writer's claim slot. The writer itself wakes every
+/// 100 ms, so polling ten times as often adds no visible latency while the
+/// steady pass pays one `u64` compare instead of a lock.
+const BACKUP_CLAIM_POLL_NS: u64 = 10_000_000;
+
 /// Catalog spec §5.2 (D6): the filesystem probe's spacing — free bytes,
 /// journal bytes and snapshot bytes change seconds apart.
 const HOLDINGS_PROBE_NS: u64 = 1_000_000_000;
+/// Ruling R8e: fold `w` into the leader's pending report for its tier —
+/// per-field maxima (`through`, `newest_set`, `oldest_set` clamped to at
+/// most `newest_set`, as the cluster FSM applies them), so two writers'
+/// reports can each contribute what they know (one the furthest chain, the
+/// other a set copied late). `reporter` follows the report that leads on
+/// `(through, newest_set)`.
+fn coalesce_backup_report(held: &mut BackupWatermark, w: &BackupWatermark) {
+    if (w.through, w.newest_set) > (held.through, held.newest_set) {
+        held.reporter = w.reporter;
+    }
+    held.through = held.through.max(w.through);
+    held.newest_set = held.newest_set.max(w.newest_set);
+    held.oldest_set = held.oldest_set.max(w.oldest_set).min(held.newest_set);
+}
+
+/// Ruling R8e: does report `w` move the committed entry `e` forward in ANY
+/// field the cluster FSM would take (`put_backup_watermark`)? The FSM
+/// ignores a report whose `through` is BEHIND the committed one outright, so
+/// that is a no-op whatever its sets say; at an equal or later `through`,
+/// any of `through`, `newest_set` or `oldest_set` moving up is news — a set
+/// copied after the chain already passed it (Task 8), or retention moving
+/// the oldest set at an unchanged `through` (Task 10).
+fn backup_report_advances(w: &BackupWatermark, e: &BackupTierEntry) -> bool {
+    w.through >= e.through
+        && (w.through > e.through || w.newest_set > e.newest_set || w.oldest_set > e.oldest_set)
+}
+
 /// Catalog ruling R27: the `uc2-holdings` thread's sleep between wakes. The
 /// probe itself runs at most once per [`HOLDINGS_PROBE_NS`]; this only bounds
 /// how long a node stop waits to join the thread.
 const HOLDINGS_THREAD_SLEEP: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Backup-tier spec §5.1: the `uc2-backup` writer thread's sleep between
+/// idle steps (a step that made progress skips it).
+const BACKUP_THREAD_SLEEP: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// Plan B3 final review F3: how long (monotonic ns, the pass's own clock) the
 /// attach gate (`Consensus::maybe_publish_declared`) may stay shut before the
@@ -600,6 +645,10 @@ pub const REASON_VERSION_ALREADY_SET: u32 = 60;
 /// (plan ruling P13): an Empty catalog (no `Complete` entry, catalog ruling
 /// R26) cannot check agreement, and the pin is then allowed with a log line.
 pub const REASON_PIN_ORIGIN_NOT_AGREED: u32 = 61;
+/// Backup-tier spec §6.1: a `BackupWatermark` `Forget` (admin op 11,
+/// `uc2ctl tier forget`) naming no registered tier. The FSM's own
+/// (`ClusterRefusal::TierUnknown`), so the door and the apply loop agree.
+pub const REASON_TIER_UNKNOWN: u32 = 62;
 
 /// Jumbo spec §7.1: the datagram rung a committed `Settings::datagram_mtu`
 /// word means, and whether it had to be clamped to get there.
@@ -1159,6 +1208,18 @@ pub struct Node {
     snapshot_reports_unsent: Arc<AtomicU64>,
     snapshot_reports_appended: Arc<AtomicU64>,
     snapshot_reports_timed_out: Arc<AtomicU64>,
+    /// Backup-tier spec §6.2: the consensus agent's three `BACKUP_REPORT`
+    /// counters — the SAME `Arc`s it bumps, handed on by `observability()`.
+    backup_reports_sent: Arc<AtomicU64>,
+    backup_reports_unsent: Arc<AtomicU64>,
+    backup_reports_appended: Arc<AtomicU64>,
+    /// Backup-tier spec §5.4: `uc2_backup_hold_released_total` — the SAME
+    /// `Arc` [`Consensus::backup_purge_cap`] bumps.
+    backup_hold_released: Arc<AtomicU64>,
+    /// Backup-tier spec §6.2: the backup writer's newest chain watermark,
+    /// waiting for the consensus agent to take it — the SAME slot
+    /// `Consensus::backup_claim` reads.
+    backup_claim: Arc<Mutex<Option<BackupWatermark>>>,
     reports_implausible: Arc<AtomicU64>,
     /// Protocol 0.5.0: reports DECLINED because their content attestation
     /// (`durable_term`) disagreed with our own term map. Mirrored out of the
@@ -1231,6 +1292,9 @@ pub struct Node {
     _instance: InstanceDir,
     _rings: Rings,
     agents: Vec<AgentRunner>,
+    /// Backup-tier spec §5: the `uc2-backup` writer's shared state, when
+    /// `[backup]` configured one.
+    backup_writer: Option<Arc<crate::tier::writer::WriterShared>>,
 }
 
 impl Node {
@@ -1262,7 +1326,11 @@ impl Node {
     /// business in a `Clone`-able, config-file-shaped struct that tests and
     /// harnesses copy around.
     pub fn start_with(cfg: NodeConfig, opts: StartOpts) -> io::Result<Node> {
-        let StartOpts { socket, admin } = opts;
+        let StartOpts {
+            socket,
+            admin,
+            backup,
+        } = opts;
         let sock = match socket {
             Some(sock) => sock,
             None => UdpSocket::bind(cfg.bind)?,
@@ -1684,6 +1752,15 @@ impl Node {
         // because `archive` itself is moved into the archive agent's
         // closure below before the cluster agent is constructed.
         let cluster_journal = archive.journal_arc();
+        // Backup-tier spec §5.3: the `uc2-backup` writer's handle on the
+        // journal (raw block reads, ruling PF2), taken for the same reason.
+        let backup_journal = backup.as_ref().map(|_| archive.journal_arc());
+        // Spec §5.4: the writer's shared state exists before the agents that
+        // read it — the consensus agent (the purge hold and the keep hold)
+        // and the archive agent (the same cap, applied defensively).
+        let backup_shared = backup
+            .as_ref()
+            .map(|_| Arc::new(crate::tier::writer::WriterShared::default()));
         // A learner never leads, so its sender streams to no one: give it a solo
         // (empty) fan-out with a cluster size of 1, which also sidesteps flow
         // control's leader-in-cluster invariant (from a learner's view every voter
@@ -1985,6 +2062,7 @@ impl Node {
         let arc_collapse_slot = collapse_slot.clone();
         let arc_first_base = Arc::clone(&archive_first_base);
         let arc_prime_gen = Arc::clone(&prime_generation);
+        let arc_backup = backup_shared.clone();
         // Forensic trace for the 2026-08-16 acked-write-loss hunt: every journal
         // cut is rare (elections only), so an env-gated line per cut is free.
         let trunc_trace = std::env::var("UC2_TRUNC_TRACE").is_ok();
@@ -2134,19 +2212,32 @@ impl Node {
                         arc_collapse_slot.post(epoch, to);
                     }
                     ArchiveCmd::Purge { below } => {
+                        // Backup-tier spec §5.4: the writer's purge hold,
+                        // applied again here, defensively — the consensus
+                        // agent already clamped `below`, but a command sent
+                        // before a re-arm must not cut past the tier. The
+                        // cap is a pure read of the writer's shared state
+                        // (the release decision stays with consensus), so
+                        // no second copy of the space rule lives here.
+                        let below = match arc_backup.as_deref().and_then(|b| b.purge_cap()) {
+                            Some(cap) => below.min(cap),
+                            None => below,
+                        };
                         // Best-effort: a failed purge logs + drops (retries next
                         // interval). Correctness never depends on a block still
                         // being present — a reader below the floor recovers via
                         // the snapshot path (Task 5 same-host, Task 6 remote).
-                        match archive.purge_below(below) {
-                            Ok(new_first) => {
-                                arc_first_base.store(new_first, Ordering::Release);
-                            }
-                            Err(e) => {
-                                eprintln!(
-                                    "uc_node: archive purge_below({below}) failed: {e} \
-                                     (dropped; retries next interval)"
-                                );
+                        if below > archive.first_base() {
+                            match archive.purge_below(below) {
+                                Ok(new_first) => {
+                                    arc_first_base.store(new_first, Ordering::Release);
+                                }
+                                Err(e) => {
+                                    eprintln!(
+                                        "uc_node: archive purge_below({below}) failed: {e} \
+                                         (dropped; retries next interval)"
+                                    );
+                                }
                             }
                         }
                     }
@@ -2275,6 +2366,14 @@ impl Node {
         let snapshot_reports_unsent = Arc::new(AtomicU64::new(0));
         let snapshot_reports_appended = Arc::new(AtomicU64::new(0));
         let snapshot_reports_timed_out = Arc::new(AtomicU64::new(0));
+        // Backup-tier spec §6.2: the watermark report path's counters and the
+        // writer → consensus hand-off slot (Task 8's `uc2-backup` thread is
+        // the writer), shared with `Node` the same way.
+        let backup_reports_sent = Arc::new(AtomicU64::new(0));
+        let backup_reports_unsent = Arc::new(AtomicU64::new(0));
+        let backup_reports_appended = Arc::new(AtomicU64::new(0));
+        let backup_claim: Arc<Mutex<Option<BackupWatermark>>> = Arc::new(Mutex::new(None));
+        let backup_hold_released = Arc::new(AtomicU64::new(0));
         let schedule_pos_pub = Arc::new(AtomicU64::new(0));
         let schedule_entries_pub = Arc::new(AtomicU64::new(0));
         let log_clock_smear_pub = Arc::new(AtomicU64::new(0));
@@ -2428,6 +2527,7 @@ impl Node {
             view_position_seen: u64::MAX, // see the field: the first refresh must always run
             last_cluster_append: 0,
             rows_versioned_latched: false,
+            membership_reconciled_latched: false,
             next_version_gate_log_ns: 0,
             schedule_position: 0,
             last_armed_table_position: 0,
@@ -2442,6 +2542,14 @@ impl Node {
             snapshot_reports_unsent: Arc::clone(&snapshot_reports_unsent),
             snapshot_reports_appended: Arc::clone(&snapshot_reports_appended),
             snapshot_reports_timed_out: Arc::clone(&snapshot_reports_timed_out),
+            backup_reports_sent: Arc::clone(&backup_reports_sent),
+            backup_reports_unsent: Arc::clone(&backup_reports_unsent),
+            backup_reports_appended: Arc::clone(&backup_reports_appended),
+            backup_shared: backup_shared.clone(),
+            backup_chunk_bytes: backup.as_ref().map_or(0, |b| b.chunk_bytes),
+            backup_hold_released: Arc::clone(&backup_hold_released),
+            backup_claim: Arc::clone(&backup_claim),
+            pending_backup_reports: BTreeMap::new(),
             pending_snapshot_reports: HashMap::new(),
             report_leader_seen: None,
             reported_sets: Vec::with_capacity(MAX_CATALOG_SETS),
@@ -2542,6 +2650,7 @@ impl Node {
             snapshot_cadence_refused: 0,
             holdings: Arc::clone(&holdings),
             holdings_next_copy_ns: 0,
+            backup_claim_next_ns: 0,
             holdings_fs_ops: 0,
             holdings_seeded: false,
             holdings_catalog_version_seen: 0,
@@ -2572,6 +2681,36 @@ impl Node {
             AgentRunner::spawn("uc2-consensus", IdleStrategy::Yield, move || {
                 consensus.do_work()
             })?;
+
+        // Backup-tier spec §5.1: the `uc2-backup` writer — its own sleeping
+        // thread, never a polling agent; appended LAST to `agents` so the
+        // five agent indices `/healthz` reads never shift.
+        let backup_runner = match (backup, backup_journal, &backup_shared) {
+            (Some(bcfg), Some(journal), Some(shared)) => {
+                let target = Box::new(crate::tier::target::FsTarget::new(bcfg.target.clone()));
+                let mut writer = crate::tier::writer::Writer::new(
+                    bcfg,
+                    cfg.app_id.clone(),
+                    cfg.id,
+                    cfg.instance_dir.clone(),
+                    journal,
+                    Arc::clone(&cnc),
+                    Arc::clone(&archive_first_base),
+                    Arc::clone(&cluster_view),
+                    Arc::clone(&backup_claim),
+                    Arc::clone(shared),
+                    target,
+                );
+                let base = std::time::Instant::now();
+                let runner = AgentRunner::spawn(
+                    "uc2-backup",
+                    IdleStrategy::Sleep(BACKUP_THREAD_SLEEP),
+                    move || writer.step(base.elapsed().as_nanos() as u64),
+                )?;
+                Some(runner)
+            }
+            _ => None,
+        };
 
         Ok(Node {
             node_id: cfg.id,
@@ -2607,6 +2746,11 @@ impl Node {
             snapshot_reports_unsent,
             snapshot_reports_appended,
             snapshot_reports_timed_out,
+            backup_reports_sent,
+            backup_reports_unsent,
+            backup_reports_appended,
+            backup_hold_released,
+            backup_claim,
             reports_implausible,
             reports_unattested,
             archive_first_base,
@@ -2642,7 +2786,12 @@ impl Node {
                 // label in `/healthz`); last, so its index never shifts the
                 // five above.
                 holdings_runner,
-            ],
+            ]
+            .into_iter()
+            // Backup-tier spec §5.1: last of all (see its spawn above).
+            .chain(backup_runner)
+            .collect(),
+            backup_writer: backup_shared,
         })
     }
 
@@ -2696,6 +2845,21 @@ impl Node {
     /// — [`SOFT_STALE_FACTOR`] maximum election timeouts.
     pub fn soft_stale_ns(&self) -> u64 {
         SOFT_STALE_FACTOR * self.election_timeout_max_ns
+    }
+
+    /// Backup-tier spec §5: the `uc2-backup` writer's progress, holds and
+    /// counters — `None` when this node runs no writer.
+    pub fn backup_writer(&self) -> Option<Arc<crate::tier::writer::WriterShared>> {
+        self.backup_writer.clone()
+    }
+
+    /// Backup-tier spec §6.2 — TEST SEAM, not API: put `w` into this node's
+    /// backup-claim slot exactly as the `uc2-backup` writer thread does
+    /// (Task 8), so an end-to-end test can drive the report path without a
+    /// tier. The consensus agent takes it on its next pass.
+    #[doc(hidden)]
+    pub fn offer_backup_claim_for_test(&self, w: BackupWatermark) {
+        *self.backup_claim.lock().unwrap_or_else(|e| e.into_inner()) = Some(w);
     }
 
     /// Plan ruling P14 — TEST SEAM, not API: make this node's `uc2-holdings`
@@ -3106,6 +3270,11 @@ impl Node {
             snapshot_reports_unsent: Arc::clone(&self.snapshot_reports_unsent),
             snapshot_reports_appended: Arc::clone(&self.snapshot_reports_appended),
             snapshot_reports_timed_out: Arc::clone(&self.snapshot_reports_timed_out),
+            backup_reports_sent: Arc::clone(&self.backup_reports_sent),
+            backup_reports_unsent: Arc::clone(&self.backup_reports_unsent),
+            backup_reports_appended: Arc::clone(&self.backup_reports_appended),
+            backup_hold_released: Arc::clone(&self.backup_hold_released),
+            backup_writer: self.backup_writer.clone(),
             cluster_view: Arc::clone(&self.cluster_view),
             probe: Arc::clone(&self.probe_table),
             commands_over_standard: Arc::clone(&self.commands_over_standard),
@@ -3648,6 +3817,17 @@ struct Consensus {
     /// incarnation — a committed version is never removed (a pin replaces
     /// it, never clears it), so once open the steady state is one bool test.
     rows_versioned_latched: bool,
+    /// Ruling PF-fork: `true` once this incarnation, leading, has seen the
+    /// committed cluster FSM's membership at least as new as the kernel's
+    /// adopted config — or has appended the `Membership` command that makes
+    /// it so, or has found a position-0 config it must not write (a wipe).
+    /// LATCHED: after boot the kernel's config moves only through
+    /// `Membership` frames, which the FSM applies at commit, so apart from a
+    /// wipe's by-fiat config (position 0, excluded) only an offline rewrite
+    /// of `config.state` (`force-single-member`, `tier fork`) can leave the
+    /// two apart, and it can only have happened before boot. While `false`,
+    /// admin membership changes answer retry (`propose_and_append`).
+    membership_reconciled_latched: bool,
     /// Throttle for `version_gate_waiting` (on `pass_mono_ns`): the next
     /// pass at or after which the closed gate may log again.
     next_version_gate_log_ns: u64,
@@ -3763,6 +3943,39 @@ struct Consensus {
     /// `Node::observability` exactly as `snapshot_reports_sent` is.
     snapshot_reports_appended: Arc<AtomicU64>,
     snapshot_reports_timed_out: Arc<AtomicU64>,
+    /// Backup-tier spec §6.2: `BACKUP_REPORT` datagrams this node handed the
+    /// transport for the leader (`uc2_backup_reports_sent_total`), claims it
+    /// could not deliver because it knew of no leader — put back for the
+    /// next pass, so this counts PASSES without a leader, not lost reports
+    /// (`uc2_backup_reports_unsent_total`) — and `BackupWatermark` records
+    /// it placed while leading (`uc2_backup_reports_appended_total`). A
+    /// leader reports to itself in-process and moves neither wire counter.
+    backup_reports_sent: Arc<AtomicU64>,
+    backup_reports_unsent: Arc<AtomicU64>,
+    backup_reports_appended: Arc<AtomicU64>,
+    /// Backup-tier spec §5.4: the `uc2-backup` writer's shared state when
+    /// this node runs one (`None` without `[backup]`). Its `progress` caps
+    /// the purge target and its `set_hold` joins retention's keep list,
+    /// both until low space releases them ([`Self::backup_purge_cap`]).
+    backup_shared: Option<Arc<crate::tier::writer::WriterShared>>,
+    /// `[backup] chunk_bytes`: the space rule's size (`auto_fetch::fits`
+    /// over one chunk). Unused without a writer.
+    backup_chunk_bytes: u64,
+    /// `uc2_backup_hold_released_total`: releases, once per episode.
+    backup_hold_released: Arc<AtomicU64>,
+    /// Backup-tier spec §6.2: the backup writer's newest watermark claim
+    /// (written by the `uc2-backup` thread, Task 8), TAKEN by
+    /// [`Consensus::take_backup_claim`] once per pass. A newer claim simply
+    /// replaces an untaken one: a watermark is a frontier, so only the
+    /// newest matters.
+    backup_claim: Arc<Mutex<Option<BackupWatermark>>>,
+    /// Backup-tier spec §6.2: the leader's per-tier coalescer, filled by
+    /// [`Consensus::on_backup_report`] (furthest `through` wins) and drained
+    /// one tier per pass by [`Consensus::maybe_append_backup_watermark`].
+    /// Cleared on every leader exit for `last_cluster_append`'s reason. A
+    /// `BTreeMap` so "lowest tier first" is its iteration order; bounded in
+    /// practice by the members' configured tiers (each writer reports one).
+    pending_backup_reports: BTreeMap<u64, BackupWatermark>,
     ingress_rx: mpsc::Receiver<Ingress>,
     trunc_tx: mpsc::SyncSender<ArchiveCmd>,
     trunc_slot: TruncationSlot,
@@ -4181,6 +4394,10 @@ struct Consensus {
     /// pass pays one `u64` compare and the lock is taken ~100 times a
     /// second, not once per pass.
     holdings_next_copy_ns: u64,
+    /// Backup-tier spec §6.2: the pass-clock instant `backup_claim` is next
+    /// looked at — [`BACKUP_CLAIM_POLL_NS`] apart, for `holdings_next_copy_ns`'s
+    /// reason (one compare per pass, not one lock).
+    backup_claim_next_ns: u64,
     /// THE D6 WITNESS: every file check the consensus agent's holdings
     /// writers make. Only the one boot seed in
     /// [`Self::note_catalog_for_holdings`] may move it; the D6 tests assert
@@ -4299,6 +4516,11 @@ impl Consensus {
         // `HOLDINGS_COPY_NS` of pass clock — one compare on every other pass.
         if now_wall >= self.holdings_next_copy_ns {
             self.refresh_holdings();
+        }
+        // Backup-tier spec §6.2: the backup writer's newest watermark claim,
+        // every `BACKUP_CLAIM_POLL_NS` of pass clock — one compare otherwise.
+        if now_wall >= self.backup_claim_next_ns {
+            self.poll_backup_claim();
         }
         // Jumbo spec §6/§5.4: THIS pass's gate answer, evaluated once, here —
         // ahead of every step that acts as a serving node. A node that has not
@@ -4506,6 +4728,35 @@ impl Consensus {
         // the call is skipped — a committed version is never removed.
         if serving && !hold_clients && !self.rows_versioned_latched {
             did |= self.maybe_append_row_genesis();
+        }
+        // 3a'''''. Backup-tier spec §6.2: the leader's backup watermark — the
+        // fifth leader-issued `CLUSTER` append, same gate, same reason. One
+        // `is_empty` test on the steady path (no tier reporting).
+        if serving && !hold_clients && !self.pending_backup_reports.is_empty() {
+            did |= self.maybe_append_backup_watermark();
+        }
+        // 3a. Ruling PF-fork: a kernel config written offline (the
+        // quorum-loss force, a tier fork) carried into the cluster FSM — the
+        // sixth leader-issued `CLUSTER` append, same gate, same reason. One
+        // field test once latched, which the first leading pass of an
+        // ordinary incarnation does.
+        //
+        // Gated on CONSENSUS serving, not this pass's `serving` (fix round 3,
+        // ruling R12c): `serving` also needs `jumbo_gate_open`, and a startup
+        // gate can pend for a long time on a SILENT member — while the latch
+        // is unset every membership change answers retry, including removing
+        // that silent member, the operator's remedy. The admin path itself
+        // needs only `sm.can_serve()` (`propose_config`), and so does this
+        // append: it is the same kind of frame, appended the same way, so the
+        // reconcile both latches AND appends under the jumbo gate. It still
+        // keeps `!hold_clients` (false whenever the gate is pending, since no
+        // timer fires then), so it never lands between two due timers.
+        if !self.membership_reconciled_latched
+            && !hold_clients
+            && self.leader_flag.load(Ordering::Relaxed)
+            && self.sm.can_serve()
+        {
+            did |= self.maybe_reconcile_forced_membership();
         }
         if serving && !hold_clients {
             did |= self.drain_ingress();
@@ -5725,6 +5976,11 @@ impl Consensus {
                 candidate
             };
             if service_pos > self.snapshot_persisted_floor {
+                // Backup-tier spec §5.4: settle the hold's release state
+                // before retention reads the writer's keep hold.
+                if self.backup_shared.is_some() {
+                    self.backup_purge_cap();
+                }
                 self.state
                     .store_snapshot_floor(service_pos)
                     .expect("snapshot floor persist fail-stop (journal I/O)");
@@ -5755,12 +6011,25 @@ impl Consensus {
             }
         }
         if let PurgePolicy::BelowSnapshot { slack_bytes } = self.purge_policy {
-            let target = self.snapshot_persisted_floor.saturating_sub(slack_bytes);
+            let mut target = self.snapshot_persisted_floor.saturating_sub(slack_bytes);
+            let first_base = self.archive_first_base.load(Ordering::Acquire);
+            // Backup-tier spec §5.4: on a writer's node, never purge journal
+            // the tier lacks. Read only when a purge is due, so an idle node
+            // never reaches it; a clamp that leaves nothing to do counts as
+            // `held`, stamping the throttle like a pin hold does.
+            if target > first_base
+                && self.backup_shared.is_some()
+                && let Some(cap) = self.backup_purge_cap()
+                && cap < target
+            {
+                target = cap;
+                held = true;
+            }
             // Only command a purge that would actually advance the floor. The
             // archive acks by advancing `archive_first_base`; `try_send` (not
             // `send`) keeps a full channel from blocking the consensus loop — a
             // dropped purge is harmless (best-effort, retried next tick).
-            if target > self.archive_first_base.load(Ordering::Acquire) {
+            if target > first_base {
                 let _ = self.trunc_tx.try_send(ArchiveCmd::Purge { below: target });
                 did = true;
             }
@@ -5772,6 +6041,58 @@ impl Consensus {
         // idle strategy hot for as long as an upgrade takes to swap its
         // binary.
         did
+    }
+
+    /// Backup-tier spec §5.4: the purge cap the `uc2-backup` writer's hold
+    /// puts on this node — its `progress` (`0`, no chain yet, holds every
+    /// purge) — or `None` when it holds nothing: no writer, a writer that
+    /// stopped for good (ruling R9a), or a hold released for space.
+    ///
+    /// The release rule lives here, the one place it is decided: released
+    /// while the node's free bytes fail `auto_fetch::fits` for one
+    /// `chunk_bytes` (an unknown free figure never releases), re-armed when
+    /// they fit again; each edge logs once. Out of line and off the
+    /// per-pass path: only the throttled floor persister calls it, and only
+    /// when a purge or a floor move is actually due.
+    #[inline(never)]
+    fn backup_purge_cap(&mut self) -> Option<u64> {
+        use crate::auto_fetch::{FREE_BYTES_UNKNOWN, fits};
+        let shared = self.backup_shared.as_ref()?;
+        if shared.stopped.load(Ordering::Acquire) {
+            return None;
+        }
+        let free = self
+            .holdings
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .free_bytes;
+        let released = shared.hold_released.load(Ordering::Acquire);
+        if free != FREE_BYTES_UNKNOWN {
+            let low = !fits(free, self.backup_chunk_bytes);
+            if low != released {
+                shared.hold_released.store(low, Ordering::Release);
+                let progress = shared.progress.load(Ordering::Acquire);
+                if low {
+                    self.backup_hold_released.fetch_add(1, Ordering::Relaxed);
+                    crate::obs_event!(
+                        Warn,
+                        "backup_hold_released",
+                        node = self.id as u64,
+                        progress = progress,
+                        free_bytes = free
+                    );
+                } else {
+                    crate::obs_event!(
+                        Info,
+                        "backup_hold_rearmed",
+                        node = self.id as u64,
+                        progress = progress,
+                        free_bytes = free
+                    );
+                }
+            }
+        }
+        shared.purge_cap()
     }
 
     /// Catalog spec §4.4: this node's EFFECTIVE floor candidate — the newest
@@ -8016,6 +8337,9 @@ impl Consensus {
                 (!self.pin_released(inner, row, &gate)).then_some(gate.origin)
             })
             .chain(inner.catalog.iter().map(|e| e.position))
+            // Backup-tier spec §5.4: the set the writer will copy next
+            // survives until it is in the tier (released with the hold).
+            .chain(self.backup_shared.as_ref().and_then(|b| b.keep()))
             .collect();
         // The DECLARED rows — the same set `check_set_completeness` reads, so
         // the pruner only ever touches artifact families the set is made of.
@@ -8114,6 +8438,254 @@ impl Consensus {
                 true
             }
             Err(_) => false, // WouldOverrun: next check
+        }
+    }
+
+    /// Backup-tier spec §6.2: take the backup writer's claim, if one is
+    /// waiting, and deliver it. Called every [`BACKUP_CLAIM_POLL_NS`] of
+    /// pass clock; out of line so the pass body does not grow (M14a).
+    #[inline(never)]
+    fn poll_backup_claim(&mut self) {
+        self.backup_claim_next_ns = self.pass_now_ns.saturating_add(BACKUP_CLAIM_POLL_NS);
+        let claim = self
+            .backup_claim
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if let Some(w) = claim {
+            self.deliver_backup_report(w);
+        }
+    }
+
+    /// Backup-tier spec §6.2: hand one watermark to the leader — in-process
+    /// when this node leads ([`Self::on_backup_report`]), a pairwise
+    /// `BACKUP_REPORT` datagram to the leader-hint's address otherwise (the
+    /// shape of [`Self::deliver_snapshot_reports`]). With no leader known the
+    /// claim goes BACK into the slot for the next poll — unlike a snapshot
+    /// report, a watermark is not about a moment: it is the writer's current
+    /// frontier, and the next leader needs it just the same. A newer claim
+    /// the writer put there meanwhile wins; ours is dropped, not merged (the
+    /// writer's claims only move forward).
+    fn deliver_backup_report(&mut self, w: BackupWatermark) {
+        if matches!(self.sm.role(), Role::Leader) {
+            self.on_backup_report(self.id, w);
+            return;
+        }
+        let hint = self.cnc.status().leader_hint.load_acquire();
+        let leader_addr = (hint != u64::MAX)
+            .then(|| self.id_to_addr.get(&(hint as NodeId)).copied())
+            .flatten();
+        if let Some(addr) = leader_addr {
+            let mut body = [0u8; BACKUP_REPORT_BODY_LEN];
+            write_backup_report_body(&mut body, &w);
+            let term = self.sm.current_term();
+            // Position 0 on the header, for `SNAP_REPORT`'s reason: what the
+            // report is about is in the body.
+            self.send(addr, DGRAM_KIND_BACKUP_REPORT, 0, term, &body);
+            self.backup_reports_sent.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.backup_reports_unsent.fetch_add(1, Ordering::Relaxed);
+            let mut slot = self.backup_claim.lock().unwrap_or_else(|e| e.into_inner());
+            if slot.is_none() {
+                *slot = Some(w);
+            }
+        }
+    }
+
+    /// Backup-tier spec §6.2: the leader's coalescer. Leader only; `from`
+    /// must be a member of the adopted configuration (a learner's writer
+    /// reports too — learners are members). Keeps, per tier, the report with
+    /// the greatest `through` (ties: the greatest `newest_set`), so a burst
+    /// of reports between two appends costs one record. Whether the kept one
+    /// is ahead of the COMMITTED entry is [`Self::maybe_append_backup_watermark`]'s
+    /// question, asked at append time against the then-current view.
+    fn on_backup_report(&mut self, from: NodeId, w: BackupWatermark) {
+        if !matches!(self.sm.role(), Role::Leader) || !self.sm.config().contains(from) {
+            return;
+        }
+        if w.op != WatermarkOp::Report {
+            return;
+        }
+        match self.pending_backup_reports.get_mut(&w.tier_id) {
+            Some(held) => coalesce_backup_report(held, &w),
+            None => {
+                self.pending_backup_reports.insert(w.tier_id, w);
+            }
+        }
+    }
+
+    /// Ruling PF-fork (backup-tier Task 12): carry a kernel config that no
+    /// `Membership` frame carries into the cluster FSM.
+    ///
+    /// `force_single_member` (the quorum-loss tool, and `tier fork` on the
+    /// directory it materialises) rewrites only `config.state`: the kernel
+    /// boots on the forced single voter, but the cluster FSM — its artifact
+    /// and every `Membership` frame in the journal — still names the old
+    /// members, and nothing would ever change that (uc_sim's inv12 wants the
+    /// FSM's membership to be a committed prefix of the kernel's). So the
+    /// leader appends the kernel's adopted config as a `Membership` command,
+    /// through the one ordinary append path (`append_cluster_frame`):
+    ///
+    /// * only once the cluster agent has CONSUMED past the kernel record's
+    ///   position — below that a frame carrying the config may still be on
+    ///   its way to the FSM, as it is for every ordinary change in flight;
+    /// * only when the committed view's version is OLDER than the kernel's,
+    ///   which, consumed past the record, no ordinary history produces —
+    ///   except a wipe-and-rejoin, whose truncate-to-0 keeps its current
+    ///   (possibly uncommitted) config by fiat at position 0; a position-0
+    ///   kernel config is therefore never appended;
+    /// * single-in-flight like every leader-issued kind, and refused (then
+    ///   given up for the incarnation, logged) unless the FSM's own
+    ///   `validate` accepts it — the version must chain, `view + 1`, which the
+    ///   force's `recovered + 1` does by construction.
+    ///
+    /// The kernel re-observes its own config at append (`ConfigObserved` is
+    /// version-gated: an equal version is a no-op), so the append changes
+    /// nothing but the FSM. `#[inline(never)]` for
+    /// `maybe_append_row_genesis`'s reason.
+    #[inline(never)]
+    fn maybe_reconcile_forced_membership(&mut self) -> bool {
+        // `consumed` is stored after the structured view (`publish`), so the
+        // membership read below is at least as new as the cursor.
+        let consumed = self.cluster_view.consumed.load(Ordering::Acquire);
+        if consumed < self.sm.config_position() {
+            return false; // a frame carrying the kernel's config may still apply
+        }
+        let view_position = self.cluster_view.position.load(Ordering::Acquire);
+        if self.last_cluster_append > view_position {
+            return false; // single-in-flight: a CLUSTER command is above commit
+        }
+        let committed = self.cluster_view.membership();
+        let kernel = self.sm.config().clone();
+        if committed.version >= kernel.version {
+            self.membership_reconciled_latched = true;
+            return false;
+        }
+        if self.sm.config_position() == 0 {
+            // A wipe-and-rejoin (`ElectionSm`'s truncate-to-0 arm) keeps its
+            // CURRENT config by fiat at position 0, possibly an UNCOMMITTED
+            // one — not something to write into the cluster's state. A
+            // forced record always sits at the survivor's durable frontier,
+            // which is past genesis, so only a wipe lands here: not ours.
+            self.membership_reconciled_latched = true;
+            return false;
+        }
+        let cmd = ClusterCommand::Membership(kernel.clone());
+        if let Err(reason) = self.validate_cluster_command(&cmd) {
+            crate::obs_event!(
+                Warn,
+                "membership_reconcile_refused",
+                node = self.id as u64,
+                kernel_version = kernel.version,
+                fsm_version = committed.version,
+                reason = reason as u64
+            );
+            self.membership_reconciled_latched = true;
+            return false;
+        }
+        match self.append_cluster_frame(&cmd) {
+            Ok(position) => {
+                crate::obs_event!(
+                    Info,
+                    "membership_reconciled",
+                    node = self.id as u64,
+                    kernel_version = kernel.version,
+                    fsm_version = committed.version,
+                    position = position
+                );
+                self.membership_reconciled_latched = true;
+                true
+            }
+            Err(_) => false, // WouldOverrun: next pass
+        }
+    }
+
+    /// Backup-tier spec §6.2: append ONE pending tier's watermark (the lowest
+    /// tier id) as a `BackupWatermark` (`CLUSTER` kind 7), under the
+    /// single-in-flight rule every leader-issued `CLUSTER` append obeys.
+    /// A pending entry that moves no field of the committed entry forward
+    /// (ruling R8e, [`backup_report_advances`]), or names an unregistered
+    /// tier while `MAX_BACKUP_TIERS` are held (C2), is dropped first — the FSM
+    /// would apply it as a no-op, and
+    /// appending it would hold the single-in-flight gate shut for a commit
+    /// round trip to say nothing. `WouldOverrun` keeps the entry for the
+    /// next pass. `#[inline(never)]` for `maybe_append_row_genesis`'s reason.
+    #[inline(never)]
+    fn maybe_append_backup_watermark(&mut self) -> bool {
+        let view_position = self.cluster_view.position.load(Ordering::Acquire);
+        if self.last_cluster_append > view_position {
+            return false; // single-in-flight: a CLUSTER command is above commit
+        }
+        let committed = self.cluster_view.backups();
+        // Final review C2: while MAX_BACKUP_TIERS are registered, a report
+        // for an unregistered tier applies as a no-op (`backup_tiers_full`)
+        // and its writer re-offers it every 10 s — drop it here instead of
+        // appending a no-op frame forever.
+        let full = committed.len() >= uc_protocol::v2::backup::MAX_BACKUP_TIERS;
+        self.pending_backup_reports.retain(|tier, w| {
+            match committed.iter().find(|e| e.tier_id == *tier) {
+                Some(e) => backup_report_advances(w, e),
+                None => !full,
+            }
+        });
+        let Some((&tier, &w)) = self.pending_backup_reports.iter().next() else {
+            return false;
+        };
+        let cmd = ClusterCommand::BackupWatermark(w);
+        if self.validate_cluster_command(&cmd).is_err() {
+            // A `Report` is never refused (spec §6.1); belt and braces.
+            self.pending_backup_reports.remove(&tier);
+            return false;
+        }
+        match self.append_cluster_frame(&cmd) {
+            Ok(position) => {
+                self.pending_backup_reports.remove(&tier);
+                self.backup_reports_appended.fetch_add(1, Ordering::Relaxed);
+                crate::obs_event!(
+                    Info,
+                    "backup_watermark_appended",
+                    node = self.id as u64,
+                    tier = tier,
+                    through = w.through,
+                    reporter = w.reporter,
+                    position = position
+                );
+                true
+            }
+            Err(_) => false, // WouldOverrun: next pass
+        }
+    }
+
+    /// Backup-tier spec §6.3: the leader half of `ADMIN_OP_TIER_FORGET`. The
+    /// reply triple is `(status, reason, version)`: `0` with the frame-END
+    /// position on an append, `1 62 tier_unknown` when no committed entry
+    /// has that id, `2` (retry) while a previous `CLUSTER` command is above
+    /// commit or the ring is momentarily full. The version on a refusal or a
+    /// retry is the committed cluster position.
+    fn apply_tier_forget(&mut self, tier_id: u64) -> (u32, u32, u64) {
+        let view_position = self.cluster_view.position.load(Ordering::Acquire);
+        if self.last_cluster_append > view_position {
+            return (2, 0, view_position);
+        }
+        let cmd = ClusterCommand::BackupWatermark(BackupWatermark {
+            op: WatermarkOp::Forget,
+            tier_id,
+            oldest_set: 0,
+            newest_set: 0,
+            through: 0,
+            reporter: 0,
+        });
+        if let Err(reason) = self.validate_cluster_command(&cmd) {
+            return (1, reason, view_position);
+        }
+        match self.append_cluster_frame(&cmd) {
+            Ok(position) => {
+                // A writer still reporting this tier would re-register it at
+                // once from the coalescer; the operator forgot it NOW.
+                self.pending_backup_reports.remove(&tier_id);
+                (0, 0, position)
+            }
+            Err(_) => (2, 0, view_position),
         }
     }
 
@@ -10087,6 +10659,13 @@ impl Consensus {
                 self.on_snap_report(from, row, position, hash, size);
                 return;
             }
+            // Backup-tier spec §6.2: a follower's backup watermark. Handled
+            // inline like `SnapReport` — the coalescer is this agent's own
+            // state; `on_backup_report` does the leader and membership checks.
+            NetEvent::BackupReport { from, w } => {
+                self.on_backup_report(from, w);
+                return;
+            }
         };
         self.feed(event);
     }
@@ -10248,6 +10827,35 @@ impl Consensus {
             self.write_admin_reply(req.seq, status, reason, version);
             return;
         }
+        // Backup-tier spec §6.3: `tier forget` (op 11). Beside the SNAPSHOT
+        // pair and for op 8's reason: a `CLUSTER` command, not a
+        // configuration change, so it never reaches `propose_and_append` and
+        // is never forwarded — a follower answers retry and `uc2ctl` re-sends
+        // to the node the leader hint names. The `u64` tier id rides the
+        // request line split: low 32 bits in `id`, high 32 in `ip`.
+        if req.op == ADMIN_OP_TIER_FORGET {
+            let tier_id = (u64::from(req.ip) << 32) | u64::from(req.id);
+            // `appender.is_some()` alongside the role, for the staged-file
+            // ops' reason (a leader awaiting its leader-open ack).
+            let leader = matches!(self.sm.role(), Role::Leader) && self.appender.is_some();
+            let (status, reason, version) = if leader {
+                self.apply_tier_forget(tier_id)
+            } else {
+                (2, 0, self.cluster_view.position.load(Ordering::Acquire))
+            };
+            let detail = format!("tier {tier_id:016x}");
+            let (status, reason) = self.audit_admin_detailed(
+                actor.as_deref(),
+                AuditOrigin::Local,
+                audited,
+                status,
+                reason,
+                version,
+                Some(detail.as_str()),
+            );
+            self.write_admin_reply(req.seq, status, reason, version);
+            return;
+        }
         if matches!(self.sm.role(), Role::Leader) {
             let (status, reason, version) =
                 self.propose_and_append(req.op, req.id, req.ip, req.port);
@@ -10404,12 +11012,27 @@ impl Consensus {
     ///   `append_config_frame` feeds back on a SUCCESSFUL append — so a failed
     ///   append leaves the SM bit-for-bit as it was before this call; nothing
     ///   here can leave a half-adopted config behind for the retry to trip over.
+    /// * `2, 0, current_version` — also retry (Task 12 fix round 2) while this
+    ///   leader has not yet carried its kernel config into the cluster FSM
+    ///   (`membership_reconciled_latched`, Ruling PF-fork), or while another
+    ///   `CLUSTER` command is above the committed view (the single-in-flight
+    ///   gate every leader-issued kind obeys). Without the first, a forced
+    ///   leader (`force-single-member`, `tier fork`) whose commit has passed
+    ///   the forced record could append `k+2` built on the forced `k+1` before
+    ///   the reconcile appends `k+1`: the FSM, still at `k`, refuses `k+2`
+    ///   (versions chain `view + 1`), the reconcile's `k+1` is then refused
+    ///   too, and the FSM keeps the source's membership for good. A refusal
+    ///   is still answered first, so the gate never hides one.
     fn propose_and_append(&mut self, op: u32, id: u32, ip: u32, port: u16) -> (u32, u32, u64) {
         let Some(config_op) = wire_to_config_op(op, id, ip, port) else {
             return (1, REASON_MALFORMED_OP, self.cnc.config_version());
         };
         match self.sm.propose_config(config_op, self.admission_bytes) {
             Ok(new_cfg) => {
+                let view_position = self.cluster_view.position.load(Ordering::Acquire);
+                if !self.membership_reconciled_latched || self.last_cluster_append > view_position {
+                    return (2, 0, self.cnc.config_version());
+                }
                 let version = new_cfg.version;
                 match self.append_cluster_frame(&ClusterCommand::Membership(new_cfg)) {
                     Ok(_position) => (0, 0, version),
@@ -10542,7 +11165,7 @@ impl Consensus {
                 (0, 0, position)
             }
             Err(AppendError::WouldOverrun) => (2, 0, view_position),
-            // Unreachable: `SETTINGS_LEN` is 36 bytes. Refused rather than
+            // Unreachable: `SETTINGS_LEN` is 46 bytes. Refused rather than
             // retried, for `apply_schedule_table`'s reason.
             Err(AppendError::PayloadTooLarge) => self.refuse_settings(REASON_SETTINGS_DECODE),
         }
@@ -11626,6 +12249,10 @@ impl Consensus {
                 // to place, this node no longer appends, and every reporter
                 // reports again at its next instant.
                 self.pending_snapshot_reports.clear();
+                // Backup-tier spec §6.2: and so do the backup watermarks not
+                // yet appended — what is committed stays, and a writer
+                // reports its frontier again on its next advancing pass.
+                self.pending_backup_reports.clear();
                 // Coordinated-snapshot spec §5.5: the snapshot instant's
                 // single-in-flight gate opens for the identical reason. The
                 // metric (`snapshot_instant_pub`) is deliberately NOT reset —
@@ -11932,6 +12559,7 @@ impl Consensus {
         // node will never make.
         self.last_cluster_append = 0;
         self.pending_snapshot_reports.clear();
+        self.pending_backup_reports.clear();
         self.snapshot_last_commanded = 0;
         self.snapshot_last_commanded_standby = false;
         self.can_serve_flag.store(false, Ordering::Release);
@@ -13042,7 +13670,7 @@ fn stored_to_cluster(s: &StoredConfig) -> ClusterConfig {
 }
 
 /// `ClusterConfig` -> `StoredConfig`, for persisting a `ConfigRecord`.
-fn cluster_to_stored(c: &ClusterConfig) -> StoredConfig {
+pub(crate) fn cluster_to_stored(c: &ClusterConfig) -> StoredConfig {
     StoredConfig {
         version: c.version,
         voters: c
@@ -14273,6 +14901,7 @@ mod tests {
             reports: vec![],
             running: [None; uc_protocol::v2::cnc::CNC_MAX_SERVICES],
             catalog: Vec::new(),
+            backups: Vec::new(),
         };
         let cluster_view = Arc::new(ClusterView::new(&cluster_genesis));
         let cluster_snapshot_pos = Arc::new(AtomicU64::new(0));
@@ -14416,6 +15045,7 @@ mod tests {
             view_position_seen: u64::MAX,
             last_cluster_append: 0,
             rows_versioned_latched: false,
+            membership_reconciled_latched: false,
             next_version_gate_log_ns: 0,
             schedule_position: 0,
             last_armed_table_position: 0,
@@ -14430,6 +15060,14 @@ mod tests {
             snapshot_reports_unsent: Arc::new(AtomicU64::new(0)),
             snapshot_reports_appended: Arc::new(AtomicU64::new(0)),
             snapshot_reports_timed_out: Arc::new(AtomicU64::new(0)),
+            backup_reports_sent: Arc::new(AtomicU64::new(0)),
+            backup_reports_unsent: Arc::new(AtomicU64::new(0)),
+            backup_reports_appended: Arc::new(AtomicU64::new(0)),
+            backup_shared: None,
+            backup_chunk_bytes: 0,
+            backup_hold_released: Arc::new(AtomicU64::new(0)),
+            backup_claim: Arc::new(Mutex::new(None)),
+            pending_backup_reports: BTreeMap::new(),
             pending_snapshot_reports: HashMap::new(),
             report_leader_seen: None,
             reported_sets: Vec::with_capacity(MAX_CATALOG_SETS),
@@ -14532,6 +15170,7 @@ mod tests {
             snapshot_cadence_refused: 0,
             holdings: Arc::new(Mutex::new(Holdings::default())),
             holdings_next_copy_ns: 0,
+            backup_claim_next_ns: 0,
             holdings_fs_ops: 0,
             holdings_seeded: false,
             holdings_catalog_version_seen: 0,
@@ -15419,6 +16058,114 @@ mod tests {
                 "cluster artifact at {p} survives"
             );
         }
+    }
+
+    /// Backup-tier spec §5.4 (Task 9): on a writer's node the keep list
+    /// gains the writer's keep hold — the set it is about to copy, or
+    /// waiting to — so retention cannot delete it first; a released hold
+    /// keeps nothing extra.
+    #[test]
+    fn the_pruner_keeps_the_backup_writers_set_hold() {
+        let mut h = harness_with_rows(&["a"]);
+        for p in [1000u64, 2000, 3000] {
+            write_row_artifact(&h, 0, p, b"x");
+            write_cluster_artifact(&h, p, b"c");
+        }
+        let mut st = h.cons.cluster_view.to_state();
+        st.catalog = vec![agreed_entry(3000)];
+        h.cons.cluster_view.publish(&st);
+        let shared = Arc::new(crate::tier::writer::WriterShared::default());
+        shared.set_hold.store(1000, Ordering::Release);
+        h.cons.backup_shared = Some(Arc::clone(&shared));
+        h.cons.prune_snapshots_below(3000);
+        assert_eq!(
+            list_row_artifacts(&h, 0),
+            vec![1000, 3000],
+            "2000 deleted; 1000 is the writer's keep hold; 3000 is listed"
+        );
+        assert!(
+            h.cons
+                .cluster_snapshot_dir
+                .join("snap-1000.ultcluster")
+                .exists()
+        );
+        shared.hold_released.store(true, Ordering::Release);
+        h.cons.prune_snapshots_below(3000);
+        assert_eq!(list_row_artifacts(&h, 0), vec![3000], "released: not kept");
+    }
+
+    /// Backup-tier spec §5.4 (Task 9): the purge target on a writer's node
+    /// is clamped to the writer's progress (`0`, no chain yet, holds every
+    /// purge); low space releases the hold — counted once per episode — and
+    /// space coming back re-arms it; a stopped writer holds nothing.
+    #[test]
+    fn the_backup_hold_caps_the_purge_at_the_writers_progress() {
+        use uc_protocol::v2::upgrade::RowRunning;
+        let mut h = harness_with_rows(&["a"]);
+        h.cons.purge_policy = PurgePolicy::BelowSnapshot { slack_bytes: 0 };
+        let shared = Arc::new(crate::tier::writer::WriterShared::default());
+        h.cons.backup_shared = Some(Arc::clone(&shared));
+        h.cons.backup_chunk_bytes = 1 << 20;
+        h.cons.holdings.lock().unwrap().free_bytes = 1 << 40;
+        let (agreed, own) = (4096u64, 6016u64);
+        let mut st = h.cons.cluster_view.to_state();
+        st.catalog = vec![agreed_entry(agreed)];
+        st.running[0] = Some(RowRunning {
+            row: 0,
+            version: 1,
+            record_pos: 1,
+        });
+        h.cons.cluster_view.publish(&st);
+        h.cons.snapshot_set_position.store(own, Ordering::Release);
+        h.cons.note_set_held(agreed);
+        let purge = |h: &mut Harness| -> Option<u64> {
+            h.advance_floor_timer();
+            h.cons.maybe_persist_snapshot_floor();
+            let mut last = None;
+            while let Ok(cmd) = h._trunc_rx.try_recv() {
+                if let ArchiveCmd::Purge { below } = cmd {
+                    last = Some(below);
+                }
+            }
+            last
+        };
+        let released = |h: &Harness| h.cons.backup_hold_released.load(Ordering::Relaxed);
+
+        assert_eq!(purge(&mut h), None, "no chain yet: no purge at all");
+        assert_eq!(h.cons.snapshot_persisted_floor, agreed, "the floor moves");
+
+        shared.progress.store(2048, Ordering::Release);
+        assert_eq!(purge(&mut h), Some(2048), "clamped to progress");
+        h.cons.archive_first_base.store(2048, Ordering::Release);
+        assert_eq!(purge(&mut h), None, "at the cap: nothing to do");
+
+        h.cons.holdings.lock().unwrap().free_bytes = 1;
+        assert_eq!(purge(&mut h), Some(agreed), "released: the full target");
+        assert!(shared.hold_released.load(Ordering::Acquire));
+        assert_eq!(released(&h), 1);
+        assert_eq!(purge(&mut h), Some(agreed));
+        assert_eq!(released(&h), 1, "once per episode");
+
+        h.cons.holdings.lock().unwrap().free_bytes = crate::auto_fetch::FREE_BYTES_UNKNOWN;
+        assert_eq!(purge(&mut h), Some(agreed), "unknown space keeps the state");
+        assert!(shared.hold_released.load(Ordering::Acquire));
+
+        h.cons.holdings.lock().unwrap().free_bytes = 1 << 40;
+        assert_eq!(purge(&mut h), None, "re-armed: held at progress again");
+        assert!(!shared.hold_released.load(Ordering::Acquire));
+
+        h.cons.holdings.lock().unwrap().free_bytes = 1;
+        assert_eq!(purge(&mut h), Some(agreed));
+        assert_eq!(released(&h), 2, "a second episode counts again");
+        h.cons.holdings.lock().unwrap().free_bytes = 1 << 40;
+        assert_eq!(purge(&mut h), None);
+
+        shared.stopped.store(true, Ordering::Release);
+        assert_eq!(
+            purge(&mut h),
+            Some(agreed),
+            "a stopped writer holds nothing"
+        );
     }
 
     /// Catalog spec §5.2 (D6), catalog ruling R27: the filesystem half of
@@ -19222,6 +19969,53 @@ mod tests {
         assert!(h.cons.can_serve_flag.load(Ordering::Acquire));
     }
 
+    /// Task 12 fix round 2: an admin membership change answers retry while
+    /// this leader has not carried its kernel config into the cluster FSM
+    /// (`membership_reconciled_latched`), and is accepted once it has.
+    #[test]
+    fn a_membership_change_waits_for_the_forced_config_reconcile() {
+        let mut h = harness();
+        drive_to_serving_leader(&mut h);
+        assert!(!h.cons.membership_reconciled_latched, "no pass has run yet");
+        let v0 = h.cons.sm.config().version;
+        let (status, reason, _) = h.cons.propose_and_append(1, 7, 0x7f00_0001, 7007);
+        assert_eq!(
+            (status, reason),
+            (2, 0),
+            "retry until the reconcile latched"
+        );
+        assert_eq!(h.cons.sm.config().version, v0, "nothing adopted on retry");
+        h.cons.membership_reconciled_latched = true;
+        let (status, reason, version) = h.cons.propose_and_append(1, 7, 0x7f00_0001, 7007);
+        assert_eq!(
+            (status, reason, version),
+            (0, 0, v0 + 1),
+            "accepted once latched"
+        );
+    }
+
+    /// Fix round 3 (ruling R12c): the latch sets on an ordinary leader whose
+    /// jumbo startup gate is still PENDING — else a gate pending on a silent
+    /// member would refuse (retry) the very membership change that removes
+    /// it.
+    #[test]
+    fn the_reconcile_latch_sets_while_the_jumbo_gate_is_pending() {
+        let mut h = harness();
+        drive_to_serving_leader(&mut h);
+        let peers = mtu_peers(&h);
+        h.cons.probe_table.set_peers(&peers);
+        arm_force_gate(&mut h);
+        assert!(!h.cons.membership_reconciled_latched);
+        pass_checking_the_gate(&mut h);
+        assert!(!h.cons.jumbo_gate_open, "the gate is pending");
+        assert!(
+            h.cons.membership_reconciled_latched,
+            "the latch sets on a consensus-serving leader whatever the jumbo gate says"
+        );
+        let (status, _, _) = h.cons.propose_and_append(5, 0, 0, 0);
+        assert_ne!(status, 2, "removing a member is not answered retry");
+    }
+
     /// Review minor 5: "holds serving" was ADVISORY on a leader. `can_serve`
     /// and the cnc bit were masked off the gate, but step 3's `serving` and the
     /// read barrier were not — so a gate-pending leader went on appending
@@ -20739,6 +21533,10 @@ mod tests {
             REASON_VERSION_ALREADY_SET,
             ClusterRefusal::VersionAlreadySet.reason_code()
         );
+        assert_eq!(
+            REASON_TIER_UNKNOWN,
+            ClusterRefusal::TierUnknown.reason_code()
+        );
         // And the band itself, so a shift shows up here too.
         assert_eq!(
             (
@@ -20752,8 +21550,9 @@ mod tests {
                 REASON_REPORT_STALE,
                 REASON_VERSION_ALREADY_SET,
                 REASON_PIN_ORIGIN_NOT_AGREED,
+                REASON_TIER_UNKNOWN,
             ),
-            (52, 53, 54, 55, 56, 57, 58, 59, 60, 61)
+            (52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62)
         );
     }
 
@@ -20861,6 +21660,7 @@ mod tests {
                     reports: vec![],
                     running: [None; uc_protocol::v2::cnc::CNC_MAX_SERVICES],
                     catalog: Vec::new(),
+                    backups: Vec::new(),
                 },
                 vec![hash],
             ),
@@ -20960,6 +21760,7 @@ mod tests {
                     reports: vec![],
                     running: [None; uc_protocol::v2::cnc::CNC_MAX_SERVICES],
                     catalog: Vec::new(),
+                    backups: Vec::new(),
                 },
                 vec![hash],
             ),
@@ -23161,6 +23962,7 @@ mod tests {
                 reports: vec![],
                 running: [None; uc_protocol::v2::cnc::CNC_MAX_SERVICES],
                 catalog: Vec::new(),
+                backups: Vec::new(),
             },
             Vec::new(),
         );
@@ -26155,5 +26957,258 @@ mod tests {
             "past the floor: {:?}",
             h.cons.pending_fetch
         );
+    }
+
+    // ---- backup-tier spec §6.2: the report path's coalescer and claim slot ----
+
+    fn bw(tier: u64, newest: u64, through: u64, reporter: u64) -> BackupWatermark {
+        BackupWatermark {
+            op: WatermarkOp::Report,
+            tier_id: tier,
+            oldest_set: 0,
+            newest_set: newest,
+            through,
+            reporter,
+        }
+    }
+
+    /// Spec §6.2: per tier, the furthest `through` wins (ties: the furthest
+    /// `newest_set`); an older report never replaces a newer one; a report
+    /// from a non-member, or arriving at a follower, is ignored.
+    #[test]
+    fn backup_reports_coalesce_per_tier_to_the_furthest_through() {
+        let mut follower = harness();
+        follower.cons.on_backup_report(0, bw(7, 1, 100, 0));
+        assert!(
+            follower.cons.pending_backup_reports.is_empty(),
+            "a follower coalesces nothing"
+        );
+
+        let mut h = harness();
+        drive_to_serving_leader(&mut h);
+        h.cons.on_backup_report(0, bw(7, 10, 100, 0));
+        h.cons.on_backup_report(2, bw(7, 30, 300, 2));
+        h.cons.on_backup_report(0, bw(7, 20, 200, 0));
+        assert_eq!(h.cons.pending_backup_reports[&7], bw(7, 30, 300, 2));
+        // Tie on `through`: the further `newest_set` wins, a lesser one not.
+        h.cons.on_backup_report(0, bw(7, 40, 300, 0));
+        h.cons.on_backup_report(2, bw(7, 35, 300, 2));
+        assert_eq!(h.cons.pending_backup_reports[&7], bw(7, 40, 300, 0));
+        // Another tier is its own entry; a non-member is ignored.
+        h.cons.on_backup_report(1, bw(9, 1, 50, 1));
+        h.cons.on_backup_report(99, bw(11, 1, 50, 99));
+        assert_eq!(
+            h.cons
+                .pending_backup_reports
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![7, 9]
+        );
+    }
+
+    /// Ruling R8e (4): coalescing keeps per-field maxima — the furthest
+    /// `through` from one report, the newest set from another.
+    #[test]
+    fn backup_report_coalescing_keeps_per_field_maxima() {
+        let mut h = harness();
+        drive_to_serving_leader(&mut h);
+        h.cons.on_backup_report(0, bw(7, 10, 100, 0));
+        h.cons.on_backup_report(2, bw(7, 20, 90, 2));
+        let held = h.cons.pending_backup_reports[&7];
+        assert_eq!((held.through, held.newest_set), (100, 20));
+        assert_eq!(held.reporter, 0, "the reporter of the furthest through");
+        // oldest_set: the max, clamped to the coalesced newest.
+        let mut a = bw(7, 50, 100, 0);
+        a.oldest_set = 40;
+        coalesce_backup_report(
+            &mut a,
+            &BackupWatermark {
+                oldest_set: 45,
+                ..bw(7, 45, 80, 1)
+            },
+        );
+        assert_eq!((a.oldest_set, a.newest_set, a.through), (45, 50, 100));
+    }
+
+    /// Ruling R8e (1)–(3): the leader keeps a report iff it moves ANY field of
+    /// the committed entry forward, at a `through` the FSM does not ignore.
+    #[test]
+    fn a_backup_report_is_kept_iff_it_moves_a_field_forward() {
+        let e = BackupTierEntry {
+            tier_id: 7,
+            oldest_set: 10,
+            newest_set: 20,
+            through: 100,
+            reporter: 0,
+            updated_pos: 0,
+        };
+        let w = |oldest, newest, through| BackupWatermark {
+            oldest_set: oldest,
+            ..bw(7, newest, through, 1)
+        };
+        // (1) equal through, newer newest_set.
+        assert!(backup_report_advances(&w(10, 30, 100), &e));
+        // (2) equal through and newest, higher oldest_set.
+        assert!(backup_report_advances(&w(15, 20, 100), &e));
+        // through up alone.
+        assert!(backup_report_advances(&w(10, 20, 101), &e));
+        // (3) behind or equal in every field.
+        assert!(!backup_report_advances(&w(10, 20, 100), &e));
+        assert!(!backup_report_advances(&w(5, 10, 50), &e));
+        // A through behind the committed one is a no-op in the FSM, whatever
+        // its sets say.
+        assert!(!backup_report_advances(&w(15, 30, 99), &e));
+
+        // Through the leader, against a committed entry `e`: (3) is dropped
+        // before it is appended; (1) and (2) are appended.
+        for (report, appended) in [
+            (w(10, 20, 100), false),
+            (w(10, 30, 100), true),
+            (w(15, 20, 100), true),
+        ] {
+            let mut h = harness();
+            drive_to_serving_leader(&mut h);
+            let mut st = h.cons.cluster_view.to_state();
+            st.backups.push(e);
+            st.applied = h.cons.last_cluster_append;
+            h.cons.cluster_view.publish(&st);
+            h.cons.on_backup_report(0, report);
+            assert_eq!(
+                h.cons.maybe_append_backup_watermark(),
+                appended,
+                "{report:?}"
+            );
+            assert!(h.cons.pending_backup_reports.is_empty(), "{report:?}");
+        }
+    }
+
+    /// Final review C2: with MAX_BACKUP_TIERS tiers registered, a report
+    /// for a FIFTH tier would apply as a no-op (`backup_tiers_full`), and
+    /// its writer re-offers every 10 s — so the leader drops it instead of
+    /// appending a no-op kind-7 frame forever. A registered tier still
+    /// appends; with a free slot the unregistered tier appends as before.
+    #[test]
+    fn a_report_for_an_unregistered_tier_is_dropped_while_the_table_is_full() {
+        use uc_protocol::v2::backup::MAX_BACKUP_TIERS;
+        let entry = |tier_id| BackupTierEntry {
+            tier_id,
+            oldest_set: 10,
+            newest_set: 20,
+            through: 100,
+            reporter: 0,
+            updated_pos: 0,
+        };
+        for (held, report, appended) in [
+            (MAX_BACKUP_TIERS, bw(99, 30, 200, 1), false),
+            (MAX_BACKUP_TIERS, bw(1, 30, 200, 1), true),
+            (MAX_BACKUP_TIERS - 1, bw(99, 30, 200, 1), true),
+        ] {
+            let mut h = harness();
+            drive_to_serving_leader(&mut h);
+            let mut st = h.cons.cluster_view.to_state();
+            for t in 1..=held as u64 {
+                st.backups.push(entry(t));
+            }
+            st.applied = h.cons.last_cluster_append;
+            h.cons.cluster_view.publish(&st);
+            h.cons.on_backup_report(0, report);
+            assert_eq!(
+                h.cons.maybe_append_backup_watermark(),
+                appended,
+                "{held} held, {report:?}"
+            );
+            assert!(
+                h.cons.pending_backup_reports.is_empty(),
+                "{held} held, {report:?}: dropped or appended, never kept"
+            );
+        }
+    }
+
+    /// Spec §6.2: ONE tier per pass (the lowest id), under the single-in-
+    /// flight rule — a second call before the first commits appends nothing
+    /// and keeps the other tier pending.
+    #[test]
+    fn backup_watermark_appends_one_tier_per_pass_single_in_flight() {
+        let mut h = harness();
+        drive_to_serving_leader(&mut h);
+        h.cons.on_backup_report(0, bw(9, 1, 50, 0));
+        h.cons.on_backup_report(0, bw(7, 1, 60, 0));
+        assert!(h.cons.maybe_append_backup_watermark());
+        assert_eq!(
+            h.cons
+                .pending_backup_reports
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![9],
+            "the lowest tier went first"
+        );
+        assert_eq!(h.cons.backup_reports_appended.load(Ordering::Relaxed), 1);
+        assert!(
+            !h.cons.maybe_append_backup_watermark(),
+            "single-in-flight: the first record is still above commit"
+        );
+        assert_eq!(h.cons.backup_reports_appended.load(Ordering::Relaxed), 1);
+    }
+
+    /// Spec §6.2: with no leader known the claim is put BACK and counted
+    /// `unsent` — but a newer claim the writer placed meanwhile is kept, not
+    /// overwritten by the older one being returned.
+    #[test]
+    fn a_claim_with_no_leader_goes_back_unless_a_newer_one_arrived() {
+        let mut h = harness();
+        h.cons.cnc.status().leader_hint.store_release(u64::MAX);
+        *h.cons.backup_claim.lock().unwrap() = Some(bw(7, 1, 100, 1));
+        h.cons.poll_backup_claim();
+        assert_eq!(*h.cons.backup_claim.lock().unwrap(), Some(bw(7, 1, 100, 1)));
+        assert_eq!(h.cons.backup_reports_unsent.load(Ordering::Relaxed), 1);
+        assert_eq!(h.cons.backup_reports_sent.load(Ordering::Relaxed), 0);
+
+        *h.cons.backup_claim.lock().unwrap() = Some(bw(7, 2, 200, 1));
+        h.cons.deliver_backup_report(bw(7, 1, 100, 1));
+        assert_eq!(
+            *h.cons.backup_claim.lock().unwrap(),
+            Some(bw(7, 2, 200, 1)),
+            "the newer claim wins"
+        );
+    }
+
+    /// For `last_cluster_append`'s reason: both leader exits drop the
+    /// not-yet-appended watermarks.
+    #[test]
+    fn both_leader_exits_clear_the_pending_backup_reports() {
+        for halt in [false, true] {
+            let mut h = harness();
+            drive_to_serving_leader(&mut h);
+            h.cons.on_backup_report(0, bw(7, 1, 100, 0));
+            assert!(!h.cons.pending_backup_reports.is_empty());
+            if halt {
+                h.cons.halt();
+            } else {
+                h.cons.feed(Event::RequestVote {
+                    from: 0,
+                    new_term: 9,
+                    last_term: 9,
+                    last_durable: 1 << 20,
+                });
+            }
+            assert!(
+                h.cons.pending_backup_reports.is_empty(),
+                "leader exit (halt = {halt}) drops the pending watermarks"
+            );
+        }
+    }
+
+    /// Spec §6.3: admin op 11's leader half refuses 62 for a tier the
+    /// committed view does not hold, and appends nothing.
+    #[test]
+    fn tier_forget_refuses_an_unknown_tier_with_62() {
+        let mut h = harness();
+        drive_to_serving_leader(&mut h);
+        let before = h.cons.last_cluster_append;
+        let (status, reason, _) = h.cons.apply_tier_forget(0xABCD);
+        assert_eq!((status, reason), (1, REASON_TIER_UNKNOWN));
+        assert_eq!(h.cons.last_cluster_append, before, "nothing appended");
     }
 }

@@ -22,6 +22,11 @@
 //! `encode_set_list`), opaque here. v1–v3 images are still ACCEPTED on read,
 //! with `catalog` empty. Layout v5 (snapshot-lifecycle spec §7.2) changes no
 //! framing: it marks that the opaque `reports` and `catalog` blobs carry sizes.
+//! Layout v6 (backup-tier spec §6.1) appends one more length-prefixed blob
+//! after `catalog`, before the CRC: backups (u32 len ‖ bytes) — the
+//! registered backup tiers' committed watermarks (`v2::backup`'s
+//! `encode_backup_list`), opaque here. v1–v5 images are still ACCEPTED on
+//! read, with `backups` empty.
 //!
 //! Moved out of `uc_node::cluster_fsm` (plan 3, spec §4.8) so a fuzz target
 //! can reach the decoder without pulling in `ClusterFsm` — a below-floor
@@ -47,7 +52,9 @@
 //! that dispatch for no gain — the image codec's own job is only the outer
 //! framing and the CRC.
 
-use super::settings::{SETTINGS_LEN, SETTINGS_LEN_V1, SETTINGS_LEN_V2, SETTINGS_LEN_V3};
+use super::settings::{
+    SETTINGS_LEN, SETTINGS_LEN_V1, SETTINGS_LEN_V2, SETTINGS_LEN_V3, SETTINGS_LEN_V4,
+};
 
 pub const CLUSTER_IMAGE_MAGIC: &[u8; 8] = b"UCCLUST1";
 /// The image layout's version, refused by [`decode_cluster_image`] when
@@ -69,7 +76,11 @@ pub const CLUSTER_IMAGE_MAGIC: &[u8; 8] = b"UCCLUST1";
 /// is identical to v4 — the blobs are opaque here — so a v1–v4 image is still
 /// ACCEPTED; its reader picks the blob layout from [`cluster_image_version`]
 /// (`uc_node::cluster_fsm` decodes v1–v4 blobs with every size `0`).
-pub const CLUSTER_IMAGE_VERSION: u32 = 5;
+/// Bumped to 6 (backup-tier spec §6.1): a trailing length-prefixed `backups`
+/// blob after `catalog`. A v1–v5 image is still ACCEPTED on read, with
+/// `backups` empty — a cluster upgraded across the flag day has no backup
+/// tier registered until its first report commits.
+pub const CLUSTER_IMAGE_VERSION: u32 = 6;
 
 /// Bytes fixed before the two length-prefixed payloads: magic(8) ‖
 /// version(4) ‖ applied(8) ‖ table_position(8) ‖ settings_position(8).
@@ -116,6 +127,9 @@ pub struct ClusterImageParts<'a> {
     /// The `v2::catalog` set-list bytes (opaque here; empty for a v1–v3
     /// image or a cluster whose catalog holds no set).
     pub catalog: &'a [u8],
+    /// The `v2::backup` tier-list bytes (opaque here; empty for a v1–v5
+    /// image or a cluster with no backup tier registered).
+    pub backups: &'a [u8],
 }
 
 /// Append the encoded image (magic through the trailing CRC) to `out`. The
@@ -169,6 +183,9 @@ pub fn encode_cluster_image(p: &ClusterImageParts<'_>, out: &mut Vec<u8>) -> Opt
     let catalog_len = payload_len_prefix(p.catalog.len())?;
     out.extend_from_slice(&catalog_len.to_le_bytes());
     out.extend_from_slice(p.catalog);
+    let backups_len = payload_len_prefix(p.backups.len())?;
+    out.extend_from_slice(&backups_len.to_le_bytes());
+    out.extend_from_slice(p.backups);
     let crc = crc32fast::hash(&out[start..]);
     out.extend_from_slice(&crc.to_le_bytes());
     Some(())
@@ -223,7 +240,7 @@ pub fn decode_cluster_image(buf: &[u8]) -> Option<ClusterImageParts<'_>> {
     o += 4;
     let table = o.checked_add(tl).and_then(|end| body.get(o..end))?;
     o += tl;
-    let (settings, pins, reports, running, catalog) = if version == 1 {
+    let (settings, pins, reports, running, catalog, backups) = if version == 1 {
         // 2.11.0/2.12.0 layout: the remainder is exactly one settings
         // record, self-versioned and exact-length per version
         // (`settings::decode_settings`) — never a slice that could run past
@@ -239,7 +256,8 @@ pub fn decode_cluster_image(buf: &[u8]) -> Option<ClusterImageParts<'_>> {
             1 => SETTINGS_LEN_V1,
             2 => SETTINGS_LEN_V2,
             3 => SETTINGS_LEN_V3,
-            4 => SETTINGS_LEN,
+            4 => SETTINGS_LEN_V4,
+            5 => SETTINGS_LEN,
             _ => return None,
         };
         let rest = body.len().checked_sub(o)?;
@@ -252,18 +270,20 @@ pub fn decode_cluster_image(buf: &[u8]) -> Option<ClusterImageParts<'_>> {
             &body[body.len()..],
             &body[body.len()..],
             &body[body.len()..],
+            &body[body.len()..],
         )
     } else {
-        // v2/v3/v4: the settings record is sized by ITS OWN version word
+        // v2–v6: the settings record is sized by ITS OWN version word
         // (the record is exact-length per version), then two length-prefixed
         // blobs (pins, reports), then — v3 and later — a third
-        // length-prefixed blob (running), then — v4 only — a fourth
-        // (catalog), then nothing.
+        // length-prefixed blob (running), then — v4 and later — a fourth
+        // (catalog), then — v6 and later — a fifth (backups), then nothing.
         let sl = match u32_at(o)? {
             1 => SETTINGS_LEN_V1,
             2 => SETTINGS_LEN_V2,
             3 => SETTINGS_LEN_V3,
-            4 => SETTINGS_LEN,
+            4 => SETTINGS_LEN_V4,
+            5 => SETTINGS_LEN,
             _ => return None,
         };
         let settings = o.checked_add(sl).and_then(|end| body.get(o..end))?;
@@ -294,10 +314,19 @@ pub fn decode_cluster_image(buf: &[u8]) -> Option<ClusterImageParts<'_>> {
         } else {
             &body[body.len()..]
         };
+        let backups = if version >= 6 {
+            let bl = u32_at(o)? as usize;
+            o += 4;
+            let b = o.checked_add(bl).and_then(|end| body.get(o..end))?;
+            o += bl;
+            b
+        } else {
+            &body[body.len()..]
+        };
         if o != body.len() {
             return None;
         }
-        (settings, pins, reports, running, catalog)
+        (settings, pins, reports, running, catalog, backups)
     };
     Some(ClusterImageParts {
         applied,
@@ -310,11 +339,12 @@ pub fn decode_cluster_image(buf: &[u8]) -> Option<ClusterImageParts<'_>> {
         reports,
         running,
         catalog,
+        backups,
     })
 }
 
 /// The version word of an image [`decode_cluster_image`] ACCEPTS, else
-/// `None`. The cluster FSM reads it to choose the sized (v5) or unsized
+/// `None`. The cluster FSM reads it to choose the sized (v5 and later) or unsized
 /// (v1–v4) blob decoders; kept out of [`ClusterImageParts`] so a decoded image
 /// still re-encodes to parts that compare equal (the fuzz target's property).
 pub fn cluster_image_version(buf: &[u8]) -> Option<u32> {
@@ -495,6 +525,7 @@ mod tests {
             reports: &[],
             running: &[],
             catalog: &[],
+            backups: &[],
         };
         // encode_cluster_image now always writes the v2 layout (with two
         // trailing, empty, length-prefixed pin/report blobs), so it no
@@ -543,6 +574,7 @@ mod tests {
                 reports: &[],
                 running: &[],
                 catalog: &[],
+                backups: &[],
             };
             let mut img = Vec::new();
             encode_cluster_image(&parts, &mut img).expect("well under u32::MAX");
@@ -570,6 +602,7 @@ mod tests {
                 reports: &[],
                 running: &[],
                 catalog: &[],
+                backups: &[],
             };
             let mut img = Vec::new();
             encode_cluster_image(&parts, &mut img).expect("well under u32::MAX");
@@ -643,6 +676,7 @@ mod tests {
             reports: &[],
             running: &[],
             catalog: &[],
+            backups: &[],
         };
         let mut img = Vec::new();
         encode_cluster_image(&parts, &mut img).expect("well under u32::MAX");
@@ -698,6 +732,7 @@ mod tests {
             reports: &[],
             running: &[],
             catalog: &[],
+            backups: &[],
         };
         assert_eq!(encode_cluster_image(&parts, &mut out), Some(()));
         assert!(decode_cluster_image(&out).is_some());
@@ -718,6 +753,7 @@ mod tests {
             reports: &reports,
             running: &[],
             catalog: &[],
+            backups: &[],
         };
         let mut img = Vec::new();
         encode_cluster_image(&p, &mut img).unwrap();
@@ -770,6 +806,7 @@ mod tests {
             reports: &[],
             running: &[],
             catalog: &[],
+            backups: &[],
         };
         let mut img = Vec::new();
         encode_cluster_image(&p, &mut img).unwrap();
@@ -795,6 +832,7 @@ mod tests {
             reports: &[],
             running: &running,
             catalog: &[],
+            backups: &[],
         };
         let mut img = Vec::new();
         encode_cluster_image(&p, &mut img).unwrap();
@@ -861,6 +899,7 @@ mod tests {
             reports: &[],
             running: &running,
             catalog: &catalog,
+            backups: &[],
         };
         let mut img = Vec::new();
         encode_cluster_image(&p, &mut img).unwrap();
@@ -872,12 +911,13 @@ mod tests {
         assert_eq!(decode_cluster_image(&img), Some(p));
 
         // The same parts without a catalog, re-framed as v3: drop the
-        // 4-byte zero catalog prefix, write version 3, re-seal.
+        // 4-byte zero catalog prefix (and, since v6, the 4-byte zero
+        // backups prefix after it), write version 3, re-seal.
         let mut v4_empty = Vec::new();
         encode_cluster_image(&ClusterImageParts { catalog: &[], ..p }, &mut v4_empty).unwrap();
         let l = v4_empty.len();
-        assert_eq!(&v4_empty[l - 8..l - 4], &0u32.to_le_bytes());
-        let mut v3 = v4_empty[..l - 8].to_vec();
+        assert_eq!(&v4_empty[l - 12..l - 4], &[0u8; 8]);
+        let mut v3 = v4_empty[..l - 12].to_vec();
         v3[8..12].copy_from_slice(&3u32.to_le_bytes());
         let crc = crc32fast::hash(&v3);
         v3.extend_from_slice(&crc.to_le_bytes());
@@ -887,7 +927,8 @@ mod tests {
 
         // A catalog length one past what is there is refused (exact framing).
         let mut bad = img.clone();
-        let off = img.len() - 4 - catalog.len() - 4;
+        // CRC(4) ‖ empty backups prefix(4, v6) ‖ catalog ‖ its prefix.
+        let off = img.len() - 4 - 4 - catalog.len() - 4;
         bad[off..off + 4].copy_from_slice(&(catalog.len() as u32 + 1).to_le_bytes());
         fix_crc(&mut bad);
         assert_eq!(decode_cluster_image(&bad), None);
@@ -900,11 +941,12 @@ mod tests {
         img[l - 4..].copy_from_slice(&crc.to_le_bytes());
     }
 
-    /// Snapshot-lifecycle spec §7.2: images are written v5; the version word
-    /// of an accepted image is readable.
+    /// Snapshot-lifecycle spec §7.2 / backup-tier spec §6.1: images are
+    /// written v6; the version word of an accepted image is readable. (Was
+    /// `images_are_v5_…` before the backups blob.)
     #[test]
-    fn images_are_v5_and_the_version_word_of_an_accepted_image_is_readable() {
-        assert_eq!(CLUSTER_IMAGE_VERSION, 5);
+    fn images_are_v6_and_the_version_word_of_an_accepted_image_is_readable() {
+        assert_eq!(CLUSTER_IMAGE_VERSION, 6);
         let (membership, table, settings) = genesis_parts();
         let parts = ClusterImageParts {
             applied: 300,
@@ -917,12 +959,22 @@ mod tests {
             reports: &[],
             running: &[],
             catalog: &[],
+            backups: &[],
         };
         let mut img = Vec::new();
         encode_cluster_image(&parts, &mut img).unwrap();
-        assert_eq!(cluster_image_version(&img), Some(5));
+        assert_eq!(cluster_image_version(&img), Some(6));
+        // A v5 image = this one minus the empty backups blob's zero length
+        // prefix, version word 5, re-sealed.
         let body_end = img.len() - 4;
-        let mut v4 = img[..body_end].to_vec();
+        assert_eq!(&img[body_end - 4..body_end], &0u32.to_le_bytes());
+        let mut v5 = img[..body_end - 4].to_vec();
+        v5[8..12].copy_from_slice(&5u32.to_le_bytes());
+        let crc = crc32fast::hash(&v5);
+        v5.extend_from_slice(&crc.to_le_bytes());
+        assert_eq!(cluster_image_version(&v5), Some(5));
+        // And v4 frames identically to v5 (no framing change at v5).
+        let mut v4 = v5[..v5.len() - 4].to_vec();
         v4[8..12].copy_from_slice(&4u32.to_le_bytes());
         let crc = crc32fast::hash(&v4);
         v4.extend_from_slice(&crc.to_le_bytes());
@@ -930,7 +982,7 @@ mod tests {
         assert_eq!(
             decode_cluster_image(&v4),
             Some(parts),
-            "v4 frames identically"
+            "v4 frames identically to v5"
         );
         let mut bad = img.clone();
         *bad.last_mut().unwrap() ^= 1;
@@ -939,5 +991,61 @@ mod tests {
             None,
             "only an ACCEPTED image has a version"
         );
+    }
+
+    /// Backup-tier spec §6.1: layout v6 appends a trailing length-prefixed
+    /// `backups` blob after `catalog` (opaque here — the `v2::backup`
+    /// tier-list bytes). A v5 image (a v6 image with no backups prefix and
+    /// version word 5) still decodes, with `backups` empty; a backups length
+    /// that runs past the CRC is refused, and so is a v5-framed image that
+    /// still carries the extra prefix (exact consumption).
+    #[test]
+    fn v6_image_round_trips_a_backups_blob_and_v5_reads_empty() {
+        let catalog = [5u8; 33];
+        let backups = [9u8; 49];
+        let p = ClusterImageParts {
+            applied: 8192,
+            table_position: 0,
+            settings_position: 0,
+            membership: b"m",
+            table: b"t",
+            settings: &v2_settings(),
+            pins: &[],
+            reports: &[],
+            running: &[],
+            catalog: &catalog,
+            backups: &backups,
+        };
+        let mut img = Vec::new();
+        encode_cluster_image(&p, &mut img).unwrap();
+        assert_eq!(&img[8..12], &6u32.to_le_bytes(), "current layout");
+        assert_eq!(decode_cluster_image(&img), Some(p));
+
+        // The same parts without backups, re-framed as v5.
+        let mut v6_empty = Vec::new();
+        encode_cluster_image(&ClusterImageParts { backups: &[], ..p }, &mut v6_empty).unwrap();
+        let l = v6_empty.len();
+        assert_eq!(&v6_empty[l - 8..l - 4], &0u32.to_le_bytes());
+        let mut v5 = v6_empty[..l - 8].to_vec();
+        v5[8..12].copy_from_slice(&5u32.to_le_bytes());
+        let crc = crc32fast::hash(&v5);
+        v5.extend_from_slice(&crc.to_le_bytes());
+        let d = decode_cluster_image(&v5).expect("a v5 image still decodes");
+        assert_eq!(d.catalog, &catalog[..]);
+        assert_eq!(d.backups, &[] as &[u8]);
+
+        // A v6 image re-labelled v5 keeps a trailing prefix a v5 reader
+        // does not consume: refused.
+        let mut relabelled = v6_empty.clone();
+        relabelled[8..12].copy_from_slice(&5u32.to_le_bytes());
+        fix_crc(&mut relabelled);
+        assert_eq!(decode_cluster_image(&relabelled), None);
+
+        // A backups length one past what is there is refused.
+        let mut bad = img.clone();
+        let off = img.len() - 4 - backups.len() - 4;
+        bad[off..off + 4].copy_from_slice(&(backups.len() as u32 + 1).to_le_bytes());
+        fix_crc(&mut bad);
+        assert_eq!(decode_cluster_image(&bad), None);
     }
 }

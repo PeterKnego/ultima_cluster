@@ -93,6 +93,9 @@ impl ProtocolVersion {
 // window never opens and replication to it stalls; a 0.10.0 leader accepts a
 // 144 B body and ignores the tail; and a 0.10.0 peer drops the row-255 report
 // as undecodable, so its catalog never completes a set, in silence.
+// + backup tier 3a: `CLUSTER` kind 7 `BackupWatermark`, pairwise datagram 27
+// `BACKUP_REPORT`, Settings v5, cluster image v6 — a 0.10.0 peer drops kind 27
+// and refuses kind 7 as undecodable; same flag day.
 pub const CURRENT: ProtocolVersion = ProtocolVersion::new(0, 11, 0);
 pub const MIN_COMPATIBLE: ProtocolVersion = ProtocolVersion::new(0, 1, 0);
 

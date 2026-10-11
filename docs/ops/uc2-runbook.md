@@ -354,6 +354,64 @@ transport setting, both measured closed-loop at inflight 1 on 8-vCPU
 
 ## When something is wrong
 
+- **`Uc2BackupBehind` fires** (backup tier). The tier named by the `tier`
+  label (16 hex digits; `uc2ctl tier show --target T --instance-dir D`
+  prints the same id as `0x…`) is more than 256 MiB of
+  committed log behind for 15m. The alert keys on the level of
+  `uc2_backup_lag_bytes`, which only the leader exports; it does not fire
+  because commit moved while `uc2_backup_through` stood still — an idle
+  cluster's commit creeps on watermark and snapshot-report frames and the
+  writer cuts no chunk for them. Find the writer node (the one whose
+  `uc2_backup_bytes_written_total` is moving, or should be), then read its
+  `uc2_backup_errors_total{reason}` and its `uc2-backup` log lines: an
+  unreachable or full target is `unavailable`, a journal it cannot read is
+  `journal_unavailable`. If no node runs a writer for that tier, nothing
+  advances it — start one or `uc2ctl tier forget` the tier. **On a fork, or a
+  cluster restored from the tier whose writers moved to a new target**, the
+  inherited entry for the old tier is never advanced and this alert fires by
+  design: `uc2ctl tier forget --tier-id 0x…` that old id.
+- **`Uc2BackupHoldReleased` fires.** A writer node ran low on disk and let go
+  of the journal it was holding for its tier (`backup_hold_released` in its
+  log), so ordinary purging resumed and the tier will have a hole. Free disk
+  on that node first. When the writer resumes it counts
+  `uc2_backup_chain_gaps_total` and the tier's chain restarts from a later
+  set — earlier positions are no longer restorable from that tier. Fix what
+  held the writer back (`Uc2BackupBehind`, the errors counter) so it does not
+  recur.
+- **`Uc2BackupWriterError` fires.** The `reason` label decides. `foreign`:
+  the target's `TIER` object names another cluster — the writer has STOPPED
+  and will not touch it; point `[backup] target` at the right place and
+  restart the node. `overlap_mismatch`: an object already in the tier
+  disagrees with this node's journal — also STOPPED; do not overwrite the
+  tier, investigate which cluster wrote it. `unavailable`: target I/O, retried
+  on a ladder; check the target's reachability, permissions and space.
+  `journal_unavailable`: this node's own journal could not supply a range
+  (read error, or purged under the cut); retried. `hash_mismatch`: a local
+  snapshot set does not match the catalog's agreed hashes, so it was skipped —
+  run `uc2ctl upgrade show` and treat it as a divergent replica. `fenced`: a
+  restore rolled this target's history back (`fence/<Q>`; `tier show` lists
+  it) — STOPPED; point `[backup] target` at a NEW, empty directory and
+  restart the node (never delete the fence to reuse the old tier: its
+  history past Q is not this cluster's). `no_hardlinks`: the target's
+  filesystem cannot hard-link (SMB/CIFS, some FUSE mounts) — STOPPED; move
+  the target to a filesystem that can. This alert looks back 10 minutes;
+  a stopped writer keeps `Uc2BackupWriterStopped` firing.
+- **`Uc2BackupWriterStopped` fires.** `uc2_backup_writer_stopped == 1`: the
+  node's writer refused its target for good (`foreign`, `overlap_mismatch`,
+  `fenced` or `no_hardlinks` — the errors counter and the
+  `backup_writer_stopped` log line say which) and holds nothing, so the node
+  purges as if it had no writer and the tier falls behind. Act on the reason
+  as under `Uc2BackupWriterError`, then restart the node; the gauge clears on
+  restart.
+- **After a whole-cluster restore from a tier** (`uc2ctl tier restore` on
+  every member, same `--at Q`, each into an empty instance dir — keep the
+  moved-aside originals until the restored cluster is verified). If `Q` was
+  below the tier's reach, the restore fenced the tier: before starting the
+  nodes, point every writer's `[backup] target` at a new, empty directory.
+  Once the new tier reports, `uc2ctl tier forget` the old tier's id, or
+  `Uc2BackupBehind` fires on it. `on_committed` runs again for the commands
+  between the start set and `Q` (at-least-once).
+
 - **A node refuses to start with `cluster_artifact_corrupt`** (2.11.0).
   The `uc2-cluster` agent found its newest `snapshots/cluster/snap-<pos>.ultcluster`
   and the image failed a check — magic, version, CRC32, or a bounds check

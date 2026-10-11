@@ -53,6 +53,14 @@
 //! uc2ctl force-single-member --instance-dir D --app-id A --node-id N --confirm-cluster A
 //! ```
 //!
+//! The backup tier adds three OFFLINE verbs over a tier's files (spec §8):
+//!
+//! ```text
+//! uc2ctl tier show    --target T [--instance-dir D]
+//! uc2ctl tier verify  --target T [--deep]
+//! uc2ctl tier restore --target T [--at Q] --instance-dir D (--confirm-cluster A | --new-node --node-id N)
+//! ```
+//!
 //! From a source checkout, without installing:
 //!
 //! ```text
@@ -79,6 +87,7 @@ use clap::{Parser, Subcommand};
 mod schedule;
 mod settings;
 mod snapshot;
+mod tier;
 mod upgrade;
 
 use uc_crypto::admin::{AdminKey, AdminMessage, generate_key_file, sign};
@@ -323,6 +332,150 @@ struct SettingsShowArgs {
     common: CommonArgs,
 }
 
+// ---------------------------------------------------------------- backup tier: tier
+
+#[derive(clap::Args)]
+struct TierArgs {
+    #[command(subcommand)]
+    cmd: TierCmd,
+}
+
+#[derive(Subcommand)]
+enum TierCmd {
+    /// Drop one tier's committed watermark (`ADMIN_OP_TIER_FORGET`, wire op
+    /// 11). Leader-only; refused `62 tier_unknown` when no tier has that id.
+    /// The tier's files are untouched, and a writer still pointed at it
+    /// re-registers it on its next report.
+    Forget(TierForgetArgs),
+    /// OFFLINE: the tier's identity, every set and chunk, the restorable
+    /// watermark; with `--instance-dir`, that node's committed watermarks
+    /// beside it.
+    Show(TierShowArgs),
+    /// OFFLINE: chunk CRCs and frame walks, overlap equality, every `SET`'s
+    /// files present at their stated sizes; `--deep` re-hashes every
+    /// artifact. Exits 1 on any finding, each printed.
+    Verify(TierVerifyArgs),
+    /// OFFLINE (spec §8): build an instance directory from the tier as of
+    /// `--at` (default: the tier's furthest reach). Whole-cluster restore
+    /// (`--confirm-cluster <app_id>`, run on every node with the same
+    /// `--at`) or one replacement node (`--new-node --node-id N`, a NEW id).
+    Restore(TierRestoreArgs),
+    /// OFFLINE (spec §8.2): build a SEPARATE cluster from the tier as of
+    /// `--at`: materialise with output progress at Q (no side effect at or
+    /// below Q is replayed), then force `--node-id` (a member as of Q) to
+    /// the single voter. Refused `fork_same_app_id` when `--app-id` is the
+    /// tier's own. Boot it under `--app-id`; grow it with add-learner and
+    /// promote.
+    Fork(TierForkArgs),
+    /// OFFLINE (spec §8.2): a diff-replay corpus — the restore of `[S, Q)`
+    /// into `--out` plus its `CORPUS` manifest (`origin = S`, `end = Q`, the
+    /// row's version from the set). `uc2-diffreplay --corpus` reads it.
+    ExportCorpus(TierExportCorpusArgs),
+}
+
+#[derive(clap::Args)]
+struct TierForkArgs {
+    #[arg(long)]
+    target: PathBuf,
+    /// The fork point Q: a frame end inside a restorable range (`tier
+    /// show`). Default: the tier's furthest reach.
+    #[arg(long)]
+    at: Option<u64>,
+    /// The instance directory to build (absent or empty, no node on it).
+    #[arg(long)]
+    instance_dir: PathBuf,
+    /// The fork's app id. Must differ from the tier's.
+    #[arg(long)]
+    app_id: String,
+    /// The member (voter or learner as of Q) the fork keeps as its single
+    /// voter, at its recorded address.
+    #[arg(long)]
+    node_id: u32,
+}
+
+#[derive(clap::Args)]
+struct TierExportCorpusArgs {
+    #[arg(long)]
+    target: PathBuf,
+    /// The service row whose corpus this is.
+    #[arg(long)]
+    row: u8,
+    /// The origin set S (default: the newest complete set below `--to`
+    /// whose chain reaches it).
+    #[arg(long)]
+    from: Option<u64>,
+    /// The end Q: a frame end the chain from S reaches.
+    #[arg(long)]
+    to: u64,
+    /// The corpus directory to build (absent or empty).
+    #[arg(long)]
+    out: PathBuf,
+}
+
+#[derive(clap::Args)]
+struct TierShowArgs {
+    /// The tier's root: the `[backup] target` path.
+    #[arg(long)]
+    target: PathBuf,
+    /// A node's instance directory: also print its committed watermarks.
+    #[arg(long)]
+    instance_dir: Option<PathBuf>,
+}
+
+#[derive(clap::Args)]
+struct TierVerifyArgs {
+    #[arg(long)]
+    target: PathBuf,
+    /// Re-hash every artifact against its `SET` hash.
+    #[arg(long)]
+    deep: bool,
+}
+
+#[derive(clap::Args)]
+#[command(group(clap::ArgGroup::new("restore_mode").required(true).args(["confirm_cluster", "new_node"])))]
+struct TierRestoreArgs {
+    #[arg(long)]
+    target: PathBuf,
+    /// The restore point Q: a frame end inside a restorable range (`tier
+    /// show`). Default: the tier's furthest reach.
+    #[arg(long)]
+    at: Option<u64>,
+    /// The instance directory to build. No node may hold it, and its
+    /// `journal/`, `state/`, `snapshots/` must be absent or empty.
+    #[arg(long)]
+    instance_dir: PathBuf,
+    /// Whole-cluster restore: type the tier's `app_id` to confirm the
+    /// data-loss boundary (history after Q is discarded).
+    #[arg(long)]
+    confirm_cluster: Option<String>,
+    /// One replacement node under a new id (`--node-id`), refused
+    /// `restore_id_reused` when the id is in the restored membership.
+    #[arg(long, requires = "node_id")]
+    new_node: bool,
+    /// The replacement node's new id (with `--new-node` only).
+    #[arg(long, requires = "new_node", conflicts_with = "confirm_cluster")]
+    node_id: Option<u32>,
+}
+
+#[derive(clap::Args)]
+struct TierForgetArgs {
+    #[command(flatten)]
+    common: CommonArgs,
+    /// The tier's id, as the tier's `TIER` label carries it: `0x…` hex, or
+    /// decimal.
+    #[arg(long, value_parser = parse_hex_u64)]
+    tier_id: u64,
+}
+
+/// `0x…`/`0X…` hex, else decimal — a `u64`.
+fn parse_hex_u64(s: &str) -> Result<u64, String> {
+    let r = match s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        Some(hex) => u64::from_str_radix(hex, 16),
+        None => s.parse::<u64>(),
+    };
+    r.map_err(|e| format!("{s:?} is not a u64 (0x-prefixed hex or decimal): {e}"))
+}
+
 // ---------------------------------------------------------------- FSM upgrade lifecycle plan B1: upgrade
 
 #[derive(clap::Args)]
@@ -555,6 +708,10 @@ enum Cmd {
     /// coordinated instant (`ADMIN_OP_UPGRADE_PIN`, wire op 10) or show the
     /// committed pin history and hash verdicts.
     Upgrade(UpgradeArgs),
+    /// Backup-tier spec §6.3/§8: `forget` drops one tier's committed
+    /// watermark (`ADMIN_OP_TIER_FORGET`, wire op 11); `show`, `verify` and
+    /// `restore` work offline on the tier's files.
+    Tier(TierArgs),
 }
 
 fn main() {
@@ -599,6 +756,30 @@ fn main() {
                 args.patch,
             ),
             UpgradeCmd::Show(args) => upgrade::show(&args.common),
+        },
+        Cmd::Tier(a) => match a.cmd {
+            TierCmd::Forget(args) => tier::forget(&args.common, args.tier_id),
+            TierCmd::Show(args) => tier::show(&args.target, args.instance_dir.as_deref()),
+            TierCmd::Verify(args) => tier::verify(&args.target, args.deep),
+            TierCmd::Restore(args) => {
+                let mode = match args.node_id {
+                    Some(node_id) if args.new_node => tier::RestoreMode::NewNode(node_id),
+                    _ => {
+                        tier::RestoreMode::Cluster(args.confirm_cluster.clone().unwrap_or_default())
+                    }
+                };
+                tier::restore(&args.target, args.at, &args.instance_dir, mode)
+            }
+            TierCmd::Fork(args) => tier::fork(
+                &args.target,
+                args.at,
+                &args.instance_dir,
+                &args.app_id,
+                args.node_id,
+            ),
+            TierCmd::ExportCorpus(args) => {
+                tier::export_corpus(&args.target, args.row, args.from, args.to, &args.out)
+            }
         },
     };
     if let Err(e) = r {
@@ -727,6 +908,11 @@ fn reason_str(reason: u32) -> &'static str {
         // Snapshot-lifecycle spec §8: door-only, after 54.
         61 => {
             "pin_origin_not_agreed (the set at --origin is complete here but the catalog has not agreed it - wait for it to agree, which takes up to ~5 s after the instant (watch uc2_catalog_agreed_position reach it), or take a new instant (uc2ctl snapshot) and pin that; a set that diverged never agrees)"
+        }
+        // Backup-tier spec §6.3: `tier forget` named a tier the committed
+        // cluster state does not hold.
+        62 => {
+            "tier_unknown (no registered backup tier has that id — check it against the tier's TIER label)"
         }
         _ => "unknown/malformed",
     }
@@ -1823,6 +2009,200 @@ mod tests {
     fn reason_str_names_60_and_52() {
         assert_eq!(reason_str(60), "version_already_set");
         assert_eq!(reason_str(52), "row_undeclared");
+    }
+
+    /// Backup-tier spec §6.3: 62 names the unknown tier of a `tier forget`.
+    #[test]
+    fn reason_str_names_62() {
+        assert!(
+            reason_str(62).starts_with("tier_unknown"),
+            "{}",
+            reason_str(62)
+        );
+    }
+
+    /// `--tier-id` takes `0x…` hex or decimal; anything else is an error.
+    #[test]
+    fn parse_hex_u64_takes_hex_or_decimal() {
+        assert_eq!(
+            parse_hex_u64("0x0123456789abcdef"),
+            Ok(0x0123_4567_89AB_CDEF)
+        );
+        assert_eq!(parse_hex_u64("0XFF"), Ok(255));
+        assert_eq!(parse_hex_u64("42"), Ok(42));
+        assert!(parse_hex_u64("0x").is_err());
+        assert!(parse_hex_u64("abc").is_err());
+        assert!(parse_hex_u64("0x1_0000_0000_0000_0000").is_err());
+    }
+
+    /// `uc2ctl tier forget --tier-id <id>` parses to the variant and value.
+    #[test]
+    fn tier_forget_parses() {
+        let cli = Cli::try_parse_from([
+            "uc2ctl",
+            "tier",
+            "forget",
+            "--tier-id",
+            "0xff",
+            "--instance-dir",
+            "/x",
+            "--app-id",
+            "a",
+        ])
+        .expect("parses");
+        match cli.cmd {
+            Cmd::Tier(TierArgs {
+                cmd: TierCmd::Forget(f),
+            }) => assert_eq!(f.tier_id, 255),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    /// `tier show/verify/restore` parse; restore needs exactly one of
+    /// `--confirm-cluster` and `--new-node --node-id`.
+    #[test]
+    fn tier_offline_verbs_parse() {
+        let p = |args: &[&str]| {
+            let mut v = vec!["uc2ctl", "tier"];
+            v.extend_from_slice(args);
+            Cli::try_parse_from(v)
+        };
+        match p(&["show", "--target", "/t", "--instance-dir", "/d"])
+            .unwrap()
+            .cmd
+        {
+            Cmd::Tier(TierArgs {
+                cmd: TierCmd::Show(a),
+            }) => assert_eq!(a.instance_dir, Some(PathBuf::from("/d"))),
+            _ => panic!("wrong variant"),
+        }
+        match p(&["verify", "--target", "/t", "--deep"]).unwrap().cmd {
+            Cmd::Tier(TierArgs {
+                cmd: TierCmd::Verify(a),
+            }) => assert!(a.deep),
+            _ => panic!("wrong variant"),
+        }
+        let ok = [
+            &[
+                "restore",
+                "--target",
+                "/t",
+                "--instance-dir",
+                "/d",
+                "--confirm-cluster",
+                "app",
+            ][..],
+            &[
+                "restore",
+                "--target",
+                "/t",
+                "--at",
+                "4096",
+                "--instance-dir",
+                "/d",
+                "--new-node",
+                "--node-id",
+                "7",
+            ][..],
+        ];
+        for a in ok {
+            assert!(p(a).is_ok(), "{a:?}");
+        }
+        let bad = [
+            &["restore", "--target", "/t", "--instance-dir", "/d"][..],
+            &[
+                "restore",
+                "--target",
+                "/t",
+                "--instance-dir",
+                "/d",
+                "--new-node",
+            ][..],
+            &[
+                "restore",
+                "--target",
+                "/t",
+                "--instance-dir",
+                "/d",
+                "--node-id",
+                "7",
+                "--confirm-cluster",
+                "a",
+            ][..],
+            &[
+                "restore",
+                "--target",
+                "/t",
+                "--instance-dir",
+                "/d",
+                "--confirm-cluster",
+                "a",
+                "--new-node",
+                "--node-id",
+                "7",
+            ][..],
+        ];
+        for a in bad {
+            assert!(p(a).is_err(), "{a:?}");
+        }
+    }
+
+    /// `tier fork` needs `--app-id` and `--node-id`; `tier export-corpus`
+    /// needs `--row`, `--to` and `--out`, `--from` optional.
+    #[test]
+    fn tier_fork_and_export_corpus_parse() {
+        let p = |args: &[&str]| {
+            let mut v = vec!["uc2ctl", "tier"];
+            v.extend_from_slice(args);
+            Cli::try_parse_from(v)
+        };
+        let fork = [
+            "fork",
+            "--target",
+            "/t",
+            "--at",
+            "4096",
+            "--instance-dir",
+            "/d",
+            "--app-id",
+            "f",
+            "--node-id",
+            "2",
+        ];
+        match p(&fork).unwrap().cmd {
+            Cmd::Tier(TierArgs {
+                cmd: TierCmd::Fork(a),
+            }) => assert_eq!((a.at, a.app_id.as_str(), a.node_id), (Some(4096), "f", 2)),
+            _ => panic!("wrong variant"),
+        }
+        assert!(p(&fork[..fork.len() - 2]).is_err(), "--node-id is required");
+        assert!(p(&fork[..fork.len() - 4]).is_err(), "--app-id is required");
+        let ex = [
+            "export-corpus",
+            "--target",
+            "/t",
+            "--row",
+            "1",
+            "--to",
+            "8192",
+            "--out",
+            "/o",
+        ];
+        match p(&ex).unwrap().cmd {
+            Cmd::Tier(TierArgs {
+                cmd: TierCmd::ExportCorpus(a),
+            }) => assert_eq!((a.row, a.from, a.to), (1, None, 8192)),
+            _ => panic!("wrong variant"),
+        }
+        let mut with_from = ex.to_vec();
+        with_from.extend_from_slice(&["--from", "4096"]);
+        match p(&with_from).unwrap().cmd {
+            Cmd::Tier(TierArgs {
+                cmd: TierCmd::ExportCorpus(a),
+            }) => assert_eq!(a.from, Some(4096)),
+            _ => panic!("wrong variant"),
+        }
+        assert!(p(&ex[..5]).is_err(), "--to and --out are required");
     }
 
     // Fix round 1 (Important): every `uc2ctl snapshot ...` invocation shape

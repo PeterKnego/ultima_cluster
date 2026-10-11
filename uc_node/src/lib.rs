@@ -68,6 +68,7 @@ pub mod preflight;
 mod read_round;
 pub mod recovery;
 pub mod services;
+pub mod tier;
 pub(crate) mod timers;
 
 /// Catalog spec §4.4: the soft per-node holdings table, re-exported so the
@@ -94,7 +95,8 @@ pub use node::{
     REASON_SCHEDULE_TOO_LARGE, REASON_SCHEDULE_UNKNOWN_FSM, REASON_SETTINGS_BOUNDS,
     REASON_SETTINGS_DECODE, REASON_SETTINGS_DIGEST, REASON_SETTINGS_MISSING,
     REASON_SNAPSHOT_ABOVE_DURABLE, REASON_SNAPSHOT_NO_LEARNER, REASON_SNAPSHOT_UNSUPPORTED,
-    REASON_VERSION_ALREADY_SET, SnapshotRefusal, StartOpts, SubmitError, fetch_position,
+    REASON_TIER_UNKNOWN, REASON_VERSION_ALREADY_SET, SnapshotRefusal, StartOpts, SubmitError,
+    fetch_position,
 };
 pub use services::{FsmLag, ServicesConfig};
 /// Time-and-timers §6: the per-row timer counters carried by

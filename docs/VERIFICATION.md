@@ -29,7 +29,7 @@ record it summarizes; where the two disagree, the dated record wins.
 | **Elle** | Checked on real processes | Transactional safety (serializable and strict), single- and two-FSM — plus a mutation tier proving the harness has teeth |
 | **Multi-process crashtest** | Checked on real processes | Recovery correctness under `SIGKILL` mid-load — single- and two-FSM |
 | **loom** | Exhaustive over interleavings | The frame-visibility memory protocol, the MPSC ring's per-record commit protocol, **and the Broadcast ring's seqlock read barrier** |
-| **Fuzzing (libFuzzer)** | Checked under coverage-guided input search | Totality of the twenty-four decoders that see bytes the process did not write |
+| **Fuzzing (libFuzzer)** | Checked under coverage-guided input search | Totality of the twenty-six decoders that see bytes the process did not write |
 | **Miri** | Checked under a symbolic interpreter | Undefined behaviour in the pure wire/journal decoders and `uc_remote`'s Vec-backed SPSC internals (**not** the file-backed rings) |
 | **Veil** | Bug-hunting only — **never the record** | Bounded model checking of the election and reconfiguration planes |
 | **`log_clock` unit suite** | Ordinary unit tests | The monotonic log clock's pure arithmetic (`uc_node::log_clock`): steady state, forward-step adoption, backward-step smear and full retirement, tolerance, multiple resamples against a smear in flight (`a_smear_in_flight_is_not_re_reported_and_the_gauge_counts_down`: one step reported, the remaining-smear gauge strictly falling, no undershoot, over 3 000 resamples), a seeded-random step sequence, and `bracket_sample`/`resample_slow` against the real clock — 17 tests, `cargo test -p uc_node --lib log_clock` |
@@ -1021,7 +1021,7 @@ failure in Rust, but on a node it is a fail-stop: the datagram path runs on the
 receiver agent and `apply` runs on the service's apply thread, so a panic there
 takes the process down. Availability is the thing being defended here.
 
-### The twenty-four targets
+### The twenty-six targets
 
 | Target | Seam, and why its input is untrusted |
 |---|---|
@@ -1049,6 +1049,8 @@ takes the process down. Availability is the thing being defended here.
 | `uc_service_snapshot_envelope` | coordinated snapshots — `uc_service::snapshots::decode_snapshot_envelope`, the 24-byte `ULTSNAP2` header every artifact file now begins with (since `2.13.0`; a pre-`2.13.0` `ULTSNAP1` header is refused by name, `EnvelopeError::Legacy`, not decoded as version 0). A pure decoder, total on any slice, and the one check standing between a renamed or mis-copied (or wrong-version) artifact and an install that would silently leave a span of frames unapplied or cross a version boundary uncaught. |
 | `uc_node_cluster_artifact` | `ClusterFsm::install_snapshot` — the cluster IMAGE a below-floor joiner installs **by fiat** off a snapshot session, and a restarting node reads off disk. CRC32 is a checksum, not a MAC, so every length-prefixed read behind it is attacker-chosen. |
 | `uc_protocol_probe` | jumbo spec §4.2 — `uc_protocol::v2::datagram`'s path-MTU probe codecs, `read_probe_rung` and `read_probe_ack_body`/`write_probe_ack_body`. `Scope::Pairwise`: reached by any peer that can put a UDP datagram on the wire, ahead of the commit rule that consumes the result. |
+| `uc_protocol_status_body` | `uc_protocol::v2::datagram::{read_status_body, write_status_body}` — the fixed-length status body. A PROPERTY target: anything the reader accepts must re-encode and read back equal. |
+| `uc_node_tier_object` | backup-tier spec §4 — `uc_node::tier::object::ObjectReader` over an arbitrary object stream (48-byte header, 1 MiB blocks with length and CRC, both codecs, read bounded to 64 MiB) plus `layout::SetLabel::parse` and `TierInfo::parse` on lossy UTF-8. The tier is a directory on a mount an operator points at, so a restore, `verify` or fork meets whatever bytes that mount holds. |
 
 ### Method
 

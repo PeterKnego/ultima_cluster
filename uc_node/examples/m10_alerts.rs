@@ -76,6 +76,10 @@ const ALL_SCENARIOS: &[&str] = &[
     "standby_snapshot_stalled",
     "snapshot_set_diverged",
     "snapshot_wont_fit",
+    "backup_behind",
+    "backup_hold_released",
+    "backup_writer_error",
+    "backup_writer_stopped",
     "snapshot_hash_diverged",
     "mtu_discovery_stalled",
     "path_below_mtu",
@@ -215,6 +219,10 @@ fn run_scenario(name: &str, scratch_root: &Path) -> (SeriesFile, Disclosure) {
         "standby_snapshot_stalled" => scenario_standby_snapshot_stalled(),
         "snapshot_set_diverged" => scenario_snapshot_set_diverged(),
         "snapshot_wont_fit" => scenario_snapshot_wont_fit(),
+        "backup_behind" => scenario_backup_behind(),
+        "backup_hold_released" => scenario_backup_hold_released(),
+        "backup_writer_error" => scenario_backup_writer_error(),
+        "backup_writer_stopped" => scenario_backup_writer_stopped(),
         "snapshot_hash_diverged" => scenario_snapshot_hash_diverged(),
         "mtu_discovery_stalled" => scenario_mtu_discovery_stalled(),
         "path_below_mtu" => scenario_path_below_mtu(),
@@ -419,6 +427,11 @@ fn synthetic_sources_named(node_id: u32, name: Option<FsmName>) -> ObsSources {
         snapshot_reports_unsent: Arc::new(AtomicU64::new(0)),
         snapshot_reports_appended: Arc::new(AtomicU64::new(0)),
         snapshot_reports_timed_out: Arc::new(AtomicU64::new(0)),
+        backup_reports_sent: Arc::new(AtomicU64::new(0)),
+        backup_reports_unsent: Arc::new(AtomicU64::new(0)),
+        backup_reports_appended: Arc::new(AtomicU64::new(0)),
+        backup_hold_released: Arc::new(AtomicU64::new(0)),
+        backup_writer: None,
         probe: uc_net::probe::ProbeTable::new(uc_net::probe::ProbeCadence::default()),
         commands_over_standard: Arc::new(AtomicU64::new(0)),
         cluster_view: Arc::new(uc_node::ClusterView::new(
@@ -2000,6 +2013,155 @@ fn scenario_snapshot_wont_fit() -> (SeriesFile, Disclosure) {
                      the real ClusterView::publish and the auto-fetch space check's own \
                      `fits` formula (free < size + max(size/4, 1 GiB)) - Uc2SnapshotWontFit's \
                      uc2_snapshot_wont_fit > 0 predicate."
+                .into(),
+        },
+    )
+}
+
+// ------------------------------------------------ backup tier (spec §6.4)
+
+/// Uc2BackupBehind - **synthetic, disclosed**: a synthetic leader whose
+/// commit counter reads 512 MiB and whose cluster view lists one tier with
+/// `through = 0`, so the real exporter renders `uc2_backup_lag_bytes` =
+/// 512 MiB. Producing it for real needs a target that stays unreachable
+/// while 256 MiB commits.
+fn scenario_backup_behind() -> (SeriesFile, Disclosure) {
+    let src = synthetic_sources(0);
+    src.cnc.status().flags.store_release(NODE_FLAG_LEADER);
+    src.cnc.counters().commit.store_release(512 << 20);
+    let mut st = src.cluster_view.to_state();
+    st.backups.push(uc_protocol::v2::backup::BackupTierEntry {
+        tier_id: 0xabc,
+        oldest_set: 4096,
+        newest_set: 4096,
+        through: 0,
+        reporter: 1,
+        updated_pos: 4096,
+    });
+    src.cluster_view.publish(&st);
+    let srv = ObsServer::serve(src.clone(), "127.0.0.1:0".parse().unwrap()).expect("bind");
+    let addr = srv.local_addr();
+    let mut sf = SeriesFile::new();
+    for _ in 0..3 {
+        sf.record_round("n0", &scrape(addr), &["uc2_backup_lag_bytes"]);
+        thread::sleep(Duration::from_millis(200));
+    }
+    srv.stop();
+    (
+        sf,
+        Disclosure {
+            scenario: "backup_behind",
+            rules: &["Uc2BackupBehind"],
+            state: "synthetic",
+            method: "one synthetic leader ObsSources: commit counter 512 MiB and a cluster view \
+                     (real ClusterView::publish) listing one tier with through = 0; the exporter \
+                     renders uc2_backup_lag_bytes = commit - through = 512 MiB, above the rule's \
+                     268435456 threshold."
+                .into(),
+        },
+    )
+}
+
+/// Uc2BackupHoldReleased - **synthetic, disclosed**: the counter the node's
+/// consensus agent bumps on a low-space release is bumped directly after one
+/// baseline scrape (the real trigger needs a nearly full disk under a live
+/// writer).
+fn scenario_backup_hold_released() -> (SeriesFile, Disclosure) {
+    let sources = synthetic_sources(0);
+    let srv = ObsServer::serve(sources.clone(), "127.0.0.1:0".parse().unwrap()).expect("bind");
+    let addr = srv.local_addr();
+    let families = ["uc2_backup_hold_released_total"];
+    let mut sf = SeriesFile::new();
+    sf.record_round("n0", &scrape(addr), &families);
+    sources.backup_hold_released.fetch_add(1, Ordering::Relaxed);
+    thread::sleep(Duration::from_millis(200));
+    for _ in 0..3 {
+        sf.record_round("n0", &scrape(addr), &families);
+        thread::sleep(Duration::from_millis(200));
+    }
+    srv.stop();
+    (
+        sf,
+        Disclosure {
+            scenario: "backup_hold_released",
+            rules: &["Uc2BackupHoldReleased"],
+            state: "synthetic",
+            method: "synthetic ObsSources: backup_hold_released bumped by 1 after one baseline \
+                     scrape (the real trigger - free space below one chunk plus headroom under a \
+                     live backup writer - needs a nearly full disk); rendered through the real \
+                     exporter."
+                .into(),
+        },
+    )
+}
+
+/// Uc2BackupWriterError - **synthetic, disclosed**: a `WriterShared` with
+/// one `unavailable` error counted after a baseline scrape (the real trigger
+/// is a target failing I/O under a live writer).
+fn scenario_backup_writer_error() -> (SeriesFile, Disclosure) {
+    use uc_node::tier::writer::{WriterError, WriterShared};
+    let mut sources = synthetic_sources(0);
+    let w = Arc::new(WriterShared::default());
+    sources.backup_writer = Some(Arc::clone(&w));
+    let srv = ObsServer::serve(sources, "127.0.0.1:0".parse().unwrap()).expect("bind");
+    let addr = srv.local_addr();
+    let families = ["uc2_backup_errors_total"];
+    let mut sf = SeriesFile::new();
+    sf.record_round("n0", &scrape(addr), &families);
+    w.stats.count(WriterError::Unavailable);
+    thread::sleep(Duration::from_millis(200));
+    for _ in 0..3 {
+        sf.record_round("n0", &scrape(addr), &families);
+        thread::sleep(Duration::from_millis(200));
+    }
+    srv.stop();
+    (
+        sf,
+        Disclosure {
+            scenario: "backup_writer_error",
+            rules: &["Uc2BackupWriterError"],
+            state: "synthetic",
+            method: "synthetic ObsSources carrying a WriterShared whose stats counted one \
+                     `unavailable` error after a baseline scrape (the real trigger - a target \
+                     failing I/O under a live writer - is not hosted in-process); rendered \
+                     through the real exporter."
+                .into(),
+        },
+    )
+}
+
+/// Uc2BackupWriterStopped - **synthetic, disclosed**: a `WriterShared`
+/// whose `stopped` flag is raised after a baseline scrape — what the writer
+/// sets on a fenced (or foreign, overlap-mismatched, no-hard-link) target;
+/// the real trigger needs a restore below the tier's reach and a restart.
+fn scenario_backup_writer_stopped() -> (SeriesFile, Disclosure) {
+    use uc_node::tier::writer::{WriterError, WriterShared};
+    let mut sources = synthetic_sources(0);
+    let w = Arc::new(WriterShared::default());
+    sources.backup_writer = Some(Arc::clone(&w));
+    let srv = ObsServer::serve(sources, "127.0.0.1:0".parse().unwrap()).expect("bind");
+    let addr = srv.local_addr();
+    let families = ["uc2_backup_writer_stopped"];
+    let mut sf = SeriesFile::new();
+    sf.record_round("n0", &scrape(addr), &families);
+    w.stats.count(WriterError::Fenced);
+    w.stopped.store(true, Ordering::Release);
+    thread::sleep(Duration::from_millis(200));
+    for _ in 0..3 {
+        sf.record_round("n0", &scrape(addr), &families);
+        thread::sleep(Duration::from_millis(200));
+    }
+    srv.stop();
+    (
+        sf,
+        Disclosure {
+            scenario: "backup_writer_stopped",
+            rules: &["Uc2BackupWriterStopped"],
+            state: "synthetic",
+            method: "synthetic ObsSources carrying a WriterShared whose writer counted one \
+                     `fenced` error and raised `stopped` after a baseline scrape (the real \
+                     trigger - a writer restarted on a target a restore fenced - is not hosted \
+                     in-process); rendered through the real exporter."
                 .into(),
         },
     )

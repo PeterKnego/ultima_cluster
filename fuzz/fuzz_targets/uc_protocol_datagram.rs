@@ -3,6 +3,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
+use uc_protocol::v2::backup::read_backup_report_body;
 use uc_protocol::v2::datagram::*;
 
 // Models the receiver's pre-auth path: a datagram of any length arrives; the
@@ -24,6 +25,7 @@ fuzz_target!(|data: &[u8]| {
     let _ = read_snap_request_body(body);
     let _ = read_snap_redirect_body(body);
     let _ = read_snap_report_body(body);
+    let _ = read_backup_report_body(body);
     let _ = read_request_vote_body(body);
     let _ = read_vote_body(body);
     let _ = read_nak_body(body);

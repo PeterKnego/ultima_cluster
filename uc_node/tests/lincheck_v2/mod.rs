@@ -264,6 +264,13 @@ pub struct ClusterCfg {
     /// straight off a still-live buffer) sets this small instead of writing
     /// an enormous volume through the default 4 MiB ring.
     pub buffer_bytes: u64,
+    /// Backup-tier T14: static LEARNERS booted beside the `n` voters (ids
+    /// `n..n + learners`, every node's `NodeConfig::learners` seed). `0` (the
+    /// default) is byte-for-byte the pre-T14 posture.
+    pub learners: usize,
+    /// Backup-tier T14: the genesis `Settings::fsm_lag_bytes`. `0` (the
+    /// default) is `Settings::genesis_default()`'s "derive at use".
+    pub fsm_lag_bytes: u64,
 }
 
 impl Default for ClusterCfg {
@@ -275,6 +282,8 @@ impl Default for ClusterCfg {
             crypto: false,
             services: FsmSet::Single,
             buffer_bytes: 1 << 22,
+            learners: 0,
+            fsm_lag_bytes: 0,
         }
     }
 }
@@ -309,9 +318,11 @@ fn services_config<SM: SnapshotStateMachine>(ccfg: ClusterCfg) -> uc_node::Servi
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn make_config<SM: SnapshotStateMachine>(
     id: NodeId,
     members: Vec<(NodeId, SocketAddr)>,
+    learners: Vec<(NodeId, SocketAddr)>,
     instance_dir: PathBuf,
     addr: SocketAddr,
     faults: FaultConfig,
@@ -341,14 +352,17 @@ fn make_config<SM: SnapshotStateMachine>(
         buffer_bytes: ccfg.buffer_bytes as usize,
         max_payload: 256,
         admission_bytes_default: 256 * 1024,
-        settings_genesis: uc_protocol::v2::settings::Settings::genesis_default(),
+        settings_genesis: uc_protocol::v2::settings::Settings {
+            fsm_lag_bytes: ccfg.fsm_lag_bytes,
+            ..uc_protocol::v2::settings::Settings::genesis_default()
+        },
         force_jumbo_frames: false,
         election_timeout_min_ns: timeout_min_ns,
         election_timeout_max_ns: timeout_max_ns,
         seed: seed_for(id as usize),
         faults,
         purge: ccfg.purge,
-        learners: Vec::new(),
+        learners,
         journal_segment_bytes: ccfg.journal_segment_bytes,
         crypto,
         services: services_config::<SM>(ccfg),
@@ -435,6 +449,33 @@ fn spawn_service_timer_opt(
     matches!(ccfg.services, FsmSet::TwoTimed { .. }).then(|| spawn_service_timer(dir))
 }
 
+/// Boot one node on its pre-bound socket, with the filesystem admin policy
+/// (what `Node::start_with_socket` takes) and an optional `[backup]` writer.
+fn start_node(
+    cfg: NodeConfig,
+    sock: UdpSocket,
+    backup: Option<uc_node::tier::writer::BackupConfig>,
+) -> std::io::Result<Node> {
+    Node::start_with(
+        cfg,
+        uc_node::StartOpts {
+            socket: Some(sock),
+            backup,
+            ..Default::default()
+        },
+    )
+}
+
+/// Slot `i`'s `[backup]`, if the cluster gave it the writer.
+fn backup_for(
+    backup: &Option<(usize, uc_node::tier::writer::BackupConfig)>,
+    i: usize,
+) -> Option<uc_node::tier::writer::BackupConfig> {
+    backup
+        .as_ref()
+        .and_then(|(at, cfg)| (*at == i).then(|| cfg.clone()))
+}
+
 // ------------------------------------------------------------------ one slot
 
 /// One cluster member: its fixed identity/address/dir plus the live node +
@@ -502,6 +543,12 @@ pub struct LinClusterV2<
 > {
     nodes: Vec<NodeSlot<SM, SM1>>,
     members: Vec<(NodeId, SocketAddr)>,
+    /// Backup-tier T14: the static learners (`ClusterCfg::learners`), slots
+    /// `members.len()..` of `nodes`; empty in every other posture.
+    learner_members: Vec<(NodeId, SocketAddr)>,
+    /// Backup-tier T14: `(slot index, [backup])` — that one node runs the
+    /// `uc2-backup` writer on every (re)boot; `None` everywhere else.
+    backup: Option<(usize, uc_node::tier::writer::BackupConfig)>,
     faults: FaultConfig,
     ccfg: ClusterCfg,
     root: PathBuf,
@@ -542,14 +589,31 @@ impl<SM: SnapshotStateMachine + Default, SM1: SnapshotStateMachine + StateMachin
     /// (M6 Task 10 purge-churn capstone). The posture is retained so every
     /// restart reuses it.
     pub fn start_cfg(root: &Path, n: usize, faults: FaultConfig, ccfg: ClusterCfg) -> Self {
-        let socks: Vec<UdpSocket> = (0..n)
+        Self::start_cfg_backup(root, n, faults, ccfg, None)
+    }
+
+    /// Backup-tier T14: [`start_cfg`](Self::start_cfg) plus a `[backup]`
+    /// writer on slot `backup.0` (a separate argument because
+    /// `BackupConfig` holds a path and `ClusterCfg` is `Copy`). `n` counts
+    /// the voters; `ccfg.learners` more slots follow them.
+    pub fn start_cfg_backup(
+        root: &Path,
+        n: usize,
+        faults: FaultConfig,
+        ccfg: ClusterCfg,
+        backup: Option<(usize, uc_node::tier::writer::BackupConfig)>,
+    ) -> Self {
+        let total = n + ccfg.learners;
+        let socks: Vec<UdpSocket> = (0..total)
             .map(|_| UdpSocket::bind("127.0.0.1:0").expect("bind"))
             .collect();
-        let members: Vec<(NodeId, SocketAddr)> = socks
+        let all: Vec<(NodeId, SocketAddr)> = socks
             .iter()
             .enumerate()
             .map(|(i, s)| (i as NodeId, s.local_addr().unwrap()))
             .collect();
+        let members = all[..n].to_vec();
+        let learner_members = all[n..].to_vec();
 
         // M8 Task 15: provision crypto material up front (base members plus,
         // for a `spare_node` cluster, the whole spare id block) so every
@@ -557,7 +621,7 @@ impl<SM: SnapshotStateMachine + Default, SM1: SnapshotStateMachine + StateMachin
         // spare's cycle — can look its own `CryptoConfig` up by id.
         let crypto = ccfg
             .crypto
-            .then(|| write_crypto_material(root, &crypto_ids_for(n, ccfg.spare_node)));
+            .then(|| write_crypto_material(root, &crypto_ids_for(total, ccfg.spare_node)));
         let crypto_config_for = |id: NodeId| -> CryptoConfig {
             match &crypto {
                 Some(m) => CryptoConfig::Enabled {
@@ -569,20 +633,21 @@ impl<SM: SnapshotStateMachine + Default, SM1: SnapshotStateMachine + StateMachin
             }
         };
 
-        let mut nodes = Vec::with_capacity(n);
+        let mut nodes = Vec::with_capacity(total);
         for (i, sock) in socks.into_iter().enumerate() {
-            let addr = members[i].1;
+            let addr = all[i].1;
             let instance_dir = root.join(format!("n{i}"));
             let cfg = make_config::<SM>(
                 i as NodeId,
                 members.clone(),
+                learner_members.clone(),
                 instance_dir.clone(),
                 addr,
                 faults,
                 ccfg,
                 crypto_config_for(i as NodeId),
             );
-            let node = Node::start_with_socket(cfg, sock).expect("node start");
+            let node = start_node(cfg, sock, backup_for(&backup, i)).expect("node start");
             nodes.push(NodeSlot {
                 id: i as NodeId,
                 addr,
@@ -629,6 +694,8 @@ impl<SM: SnapshotStateMachine + Default, SM1: SnapshotStateMachine + StateMachin
         Self {
             nodes,
             members,
+            learner_members,
+            backup,
             faults,
             ccfg,
             root: root.to_owned(),
@@ -925,13 +992,15 @@ impl<SM: SnapshotStateMachine + Default, SM1: SnapshotStateMachine + StateMachin
         let cfg = make_config::<SM>(
             id,
             self.members.clone(),
+            self.learner_members.clone(),
             dir.clone(),
             addr,
             self.faults,
             self.ccfg,
             crypto,
         );
-        let node = Node::start_with_socket(cfg, sock).expect("leader node restart");
+        let node =
+            start_node(cfg, sock, backup_for(&self.backup, li)).expect("leader node restart");
         let service = spawn_service(&dir);
         let service1 = spawn_service1::<SM1>(&dir, self.ccfg);
         let service_timer = spawn_service_timer_opt(&dir, self.ccfg);
@@ -1161,6 +1230,77 @@ impl<SM: SnapshotStateMachine + Default, SM1: SnapshotStateMachine + StateMachin
         }
     }
 
+    /// Backup-tier T14: slot `i`'s live node, if it is up.
+    pub fn node(&self, i: usize) -> Option<&Node> {
+        self.nodes[i].node.as_ref()
+    }
+
+    /// Backup-tier T14: [`stop`](Self::stop) without consuming the cluster —
+    /// every node then its services, each slot keeping its id, address and
+    /// directory so [`restart_on_dirs`](Self::restart_on_dirs) can boot the
+    /// same membership again.
+    pub fn stop_all(&mut self) {
+        assert!(self.spare.is_none(), "stop_all with a spare in flight");
+        for s in &mut self.nodes {
+            if let Some(node) = s.node.take() {
+                node.stop();
+            }
+            if let Some(service) = s.service.take() {
+                service.stop();
+            }
+            if let Some(s1) = s.service1.take() {
+                s1.stop();
+            }
+            if let Some(st) = s.service_timer.take() {
+                st.stop();
+            }
+        }
+    }
+
+    /// Backup-tier T14: re-home every slot onto `dirs[i]` (a restored
+    /// instance directory) and boot the whole cluster there — same ids, same
+    /// addresses, same posture — every node first, then the services (the
+    /// two passes [`start_cfg`](Self::start_cfg) documents). `backup`
+    /// replaces the writer assignment (`None`: no writer after the restore).
+    /// The membership a restored node boots with is its `state/config.state`,
+    /// not these seeds; the seeds only have to name the same addresses.
+    pub fn restart_on_dirs(
+        &mut self,
+        dirs: &[PathBuf],
+        backup: Option<(usize, uc_node::tier::writer::BackupConfig)>,
+    ) {
+        assert_eq!(dirs.len(), self.nodes.len(), "one restored dir per slot");
+        assert!(
+            self.nodes
+                .iter()
+                .all(|s| s.node.is_none() && s.service.is_none()),
+            "restart_on_dirs on a live cluster — stop_all first"
+        );
+        self.backup = backup;
+        for (i, dir) in dirs.iter().enumerate() {
+            let (id, addr) = (self.nodes[i].id, self.nodes[i].addr);
+            let cfg = make_config::<SM>(
+                id,
+                self.members.clone(),
+                self.learner_members.clone(),
+                dir.clone(),
+                addr,
+                self.faults,
+                self.ccfg,
+                self.crypto_config_for(id),
+            );
+            let node = start_node(cfg, rebind(addr), backup_for(&self.backup, i))
+                .expect("restored node start");
+            self.nodes[i].instance_dir = dir.clone();
+            self.nodes[i].node = Some(node);
+        }
+        for slot in &mut self.nodes {
+            slot.service = Some(spawn_service(&slot.instance_dir));
+            slot.service1 = spawn_service1::<SM1>(&slot.instance_dir, self.ccfg);
+            slot.service_timer = spawn_service_timer_opt(&slot.instance_dir, self.ccfg);
+        }
+    }
+
     /// Time-and-timers T11: node `node`'s row-1 [`TimerSm`] record, read
     /// straight off the live service on the apply thread (`query_raw` — the
     /// typed `Service::query` is typed-tier only, and `Timed<S>` is a RAW
@@ -1319,6 +1459,7 @@ impl<SM: SnapshotStateMachine + Default, SM1: SnapshotStateMachine + StateMachin
                 let cfg = make_config::<SM>(
                     id,
                     self.members.clone(),
+                    self.learner_members.clone(),
                     dir.clone(),
                     spare_addr,
                     self.faults,

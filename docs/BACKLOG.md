@@ -393,13 +393,47 @@ reviewer wants a workload to attack.
   (normally within ~5 s) and persists only if that set diverged, which
   `Uc2SnapshotSetDiverged` already alerts. Snapshot lifecycle final review
   M3, 2026-10-10 (the Task 9 ledger had called it unreachable).
-- **Project 3 (not this spec): the backup tier.** Long off-node retention,
-  restore from it, and a "backed up through P" watermark — `CLUSTER` kind
-  `7` is reserved for the watermark record and nothing more is built yet;
-  whether a node may retire below `retain_sets` once the tier confirms a
-  set is also open —
-  [spec §2 "Out"](superpowers/specs/2026-10-01-uc2-snapshot-catalog-design.md#2-scope)
-  and §12.
+- **Project 3: the backup tier.** **3a implemented on `design/backup-tier`
+  (not yet released); 3b open:** the writer, the watermark (`CLUSTER` kind
+  `7`), in-tier retention, `uc2ctl tier show/verify/restore/fork/export-corpus/forget`
+  ([how-to](how-to/back-up-to-a-tier.md),
+  [spec](superpowers/specs/2026-10-10-uc2-backup-tier-design.md)). Open for 3b
+  (spec §14): whether a node may retire sets below `retain_sets` and purge
+  below its floor once the watermark covers them, and with how many tiers
+  confirming; fetching a set or journal span from the tier at start or join,
+  and whether that replaces every-node copies (lifecycle spec D3); whether
+  3b's deletions require a verify pass of the tier first (§13). Origin:
+  [snapshot catalog spec §2 "Out"](superpowers/specs/2026-10-01-uc2-snapshot-catalog-design.md#2-scope)
+  and §12. Also open: a set frozen before a row applied anything cannot start a
+  service ([#98](https://github.com/PeterKnego/ultima_cluster/issues/98)).
+  - **3b: tier-seeded replacement node** (ruling R12a, 2026-10-11). The
+    restored term map's first entry is (term, S); reconcile against a live
+    leader finds no alignment and cuts to 0 (archive fail-stop
+    `PositionPurged`). Fix direction: seed the lineage at/below the floor from
+    the leader's shipped map, as the snapshot-session joiner does on
+    `AdoptFloor`; the ignored e2e
+    `a_new_node_seeded_from_the_tier_joins_and_catches_up` is the acceptance
+    test. Until then `uc2ctl tier restore --new-node` refuses
+    `new_node_unsupported`.
+  - **3b: retention's view gate, the origin-set edge** (ruling R10a, deferred
+    by the 3a final review, 2026-10-11). Retention runs only once the
+    writer's view has consumed past the tier's newest complete set, on the
+    reasoning that a pin whose rollback set is in the tier has its record
+    below that set. A pin whose record lies ABOVE the newest tier set is not
+    covered by that argument: in the narrow window before the view applies
+    the record, a pass does not see the pin. Today that pin can protect only
+    the newest set, which is never deleted; the edge is a set that lands in
+    the tier inside that window. Narrow and unobserved — settle it (gate on a
+    later position, or show the window empty) before 3b lets nodes delete on
+    the tier's word.
+- **Compressing the node's own journal (idea, unmeasured).** The backup tier
+  compresses what it writes off-node (spec
+  `superpowers/specs/2026-10-10-uc2-backup-tier-design.md` D11); the node's
+  live journal stays raw because the archive agent writes it on the commit
+  path and the sender resends straight from it. If node disk ever binds,
+  measure the archive hop alone with and without per-block zstd before
+  deciding — it would also change the on-disk block format (a flag day).
+  Recorded 2026-10-10.
 - **Project 4 (not this spec): the operator / AI surface.** A live read of
   the catalog that does not wait for the first cluster artifact (today only
   `read_committed_catalog`'s offline read and five `/metrics` gauges exist),

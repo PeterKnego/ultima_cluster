@@ -27,28 +27,29 @@ use std::time::Instant;
 use uc_crypto::{CryptoError, NodeId, ReceiveHalf};
 use uc_log::buffer::LogBuffer;
 use uc_log::writer::PositionedWriter;
+use uc_protocol::v2::backup::read_backup_report_body;
 use uc_protocol::v2::crypto::{
     CRYPTO_OVERHEAD, DGRAM_KIND_HS_INIT, DGRAM_KIND_HS_KEY, DGRAM_KIND_HS_RESP,
 };
 use uc_protocol::v2::datagram::{
     APPEND_POSITION_BODY_LEN, AppendPositionBody, ConfigProposalBody, ConfigReplyBody,
-    DATAGRAM_HEADER_LEN, DGRAM_KIND_APPEND_POSITION, DGRAM_KIND_COMMIT_POSITION,
-    DGRAM_KIND_CONFIG_PROPOSAL, DGRAM_KIND_CONFIG_REPLY, DGRAM_KIND_DATA, DGRAM_KIND_HEARTBEAT,
-    DGRAM_KIND_NAK, DGRAM_KIND_PROBE, DGRAM_KIND_PROBE_ACK, DGRAM_KIND_READ_PROBE,
-    DGRAM_KIND_READ_PROBE_ACK, DGRAM_KIND_REQUEST_VOTE, DGRAM_KIND_SNAP_BEGIN,
-    DGRAM_KIND_SNAP_CHUNK, DGRAM_KIND_SNAP_DONE, DGRAM_KIND_SNAP_NAK, DGRAM_KIND_SNAP_REDIRECT,
-    DGRAM_KIND_SNAP_REPORT, DGRAM_KIND_SNAP_REQUEST, DGRAM_KIND_STATUS, DGRAM_KIND_TERM_MAP,
-    DGRAM_KIND_VOTE, DatagramHeader, Holdings, MAX_TERM_MAP_WIRE_ENTRIES, NAK_BODY_LEN, NakBody,
-    PROBE_ACK_BODY_LEN, ProbeAckBody, REQUEST_VOTE_BODY_LEN, RequestVoteBody, SNAP_BEGIN_FIXED_LEN,
-    SNAP_BEGIN_LAYOUT_V4, SNAP_NAK_BODY_LEN, SNAP_REQUEST_BODY_LEN, STATUS_BODY_LEN, SnapBeginBody,
-    SnapNakBody, SnapRequestBody, StatusBody, TermMapEntryWire, VOTE_BODY_LEN, VoteBody,
-    read_append_position_body, read_config_proposal_body, read_config_reply_body,
-    read_datagram_header, read_nak_body, read_probe_ack_body, read_probe_rung,
-    read_read_probe_body, read_request_vote_body, read_snap_begin_body, read_snap_nak_body,
-    read_snap_redirect_body, read_snap_report_body, read_snap_request_body, read_status_body,
-    read_term_map_body, read_vote_body, write_append_position_body, write_datagram_header,
-    write_nak_body, write_probe_ack_body, write_snap_begin_body, write_snap_nak_body,
-    write_snap_request_body, write_status_body,
+    DATAGRAM_HEADER_LEN, DGRAM_KIND_APPEND_POSITION, DGRAM_KIND_BACKUP_REPORT,
+    DGRAM_KIND_COMMIT_POSITION, DGRAM_KIND_CONFIG_PROPOSAL, DGRAM_KIND_CONFIG_REPLY,
+    DGRAM_KIND_DATA, DGRAM_KIND_HEARTBEAT, DGRAM_KIND_NAK, DGRAM_KIND_PROBE, DGRAM_KIND_PROBE_ACK,
+    DGRAM_KIND_READ_PROBE, DGRAM_KIND_READ_PROBE_ACK, DGRAM_KIND_REQUEST_VOTE,
+    DGRAM_KIND_SNAP_BEGIN, DGRAM_KIND_SNAP_CHUNK, DGRAM_KIND_SNAP_DONE, DGRAM_KIND_SNAP_NAK,
+    DGRAM_KIND_SNAP_REDIRECT, DGRAM_KIND_SNAP_REPORT, DGRAM_KIND_SNAP_REQUEST, DGRAM_KIND_STATUS,
+    DGRAM_KIND_TERM_MAP, DGRAM_KIND_VOTE, DatagramHeader, Holdings, MAX_TERM_MAP_WIRE_ENTRIES,
+    NAK_BODY_LEN, NakBody, PROBE_ACK_BODY_LEN, ProbeAckBody, REQUEST_VOTE_BODY_LEN,
+    RequestVoteBody, SNAP_BEGIN_FIXED_LEN, SNAP_BEGIN_LAYOUT_V4, SNAP_NAK_BODY_LEN,
+    SNAP_REQUEST_BODY_LEN, STATUS_BODY_LEN, SnapBeginBody, SnapNakBody, SnapRequestBody,
+    StatusBody, TermMapEntryWire, VOTE_BODY_LEN, VoteBody, read_append_position_body,
+    read_config_proposal_body, read_config_reply_body, read_datagram_header, read_nak_body,
+    read_probe_ack_body, read_probe_rung, read_read_probe_body, read_request_vote_body,
+    read_snap_begin_body, read_snap_nak_body, read_snap_redirect_body, read_snap_report_body,
+    read_snap_request_body, read_status_body, read_term_map_body, read_vote_body,
+    write_append_position_body, write_datagram_header, write_nak_body, write_probe_ack_body,
+    write_snap_begin_body, write_snap_nak_body, write_snap_request_body, write_status_body,
 };
 use uc_protocol::v2::frame::{self, FRAME_TYPE_PADDING, HEADER_LEN, align_frame_len};
 
@@ -264,6 +265,15 @@ pub enum NetEvent {
         hash: u64,
         size: u64,
     },
+    /// Backup-tier spec §6.2 (kind 27): a backup writer's chain watermark
+    /// for one tier, sent to the leader. `from` is the body's `reporter` (a
+    /// node id, like kind 26's `node_id` — the leader's coalescer checks it
+    /// is a member). Term-independent: routed before the stale-term drop,
+    /// exactly as `SnapReport` is.
+    BackupReport {
+        from: u32,
+        w: uc_protocol::v2::backup::BackupWatermark,
+    },
 }
 
 impl NetEvent {
@@ -284,12 +294,13 @@ impl NetEvent {
             NetEvent::ConfigReply { .. } => 9,
             NetEvent::SnapRedirect { .. } => 10,
             NetEvent::SnapReport { .. } => 11,
+            NetEvent::BackupReport { .. } => 12,
         }
     }
 }
 
 /// Number of [`NetEvent`] kinds (the width of the per-kind drop counters).
-pub const NET_EVENT_KINDS: usize = 12;
+pub const NET_EVENT_KINDS: usize = 13;
 
 /// Parse a consensus-plane datagram (kinds 5–11) into a [`NetEvent`], RAW — no
 /// term filter (the SM adopts higher terms). `from` is the datagram's source
@@ -2100,6 +2111,23 @@ impl FollowerReceiver {
                     hash: b.hash,
                     size: b.size,
                 };
+                let idx = ev.kind_idx();
+                if self.route.try_send(ev).is_err() {
+                    self.stats.net_drops[idx].fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            return;
+        }
+        // Backup-tier spec §6.2: kind 27 is term-independent for kind 26's
+        // reason (a watermark is a fact about a tier, not about this term),
+        // so it is decoded here, before the stale-term drop. `reporter` is a
+        // node id on the wire as a `u64`; one that does not fit a `u32` names
+        // no member and is dropped here rather than truncated into one.
+        if h.kind == DGRAM_KIND_BACKUP_REPORT {
+            if let Some(w) = read_backup_report_body(&d[DATAGRAM_HEADER_LEN..])
+                && let Ok(from) = u32::try_from(w.reporter)
+            {
+                let ev = NetEvent::BackupReport { from, w };
                 let idx = ev.kind_idx();
                 if self.route.try_send(ev).is_err() {
                     self.stats.net_drops[idx].fetch_add(1, Ordering::Relaxed);
@@ -4426,6 +4454,73 @@ mod tests {
         assert!(
             rx.try_recv().is_err(),
             "a malformed SNAP_REPORT body must not route"
+        );
+    }
+
+    /// Backup-tier spec §6.2 (kind 27): a valid `BACKUP_REPORT` yields
+    /// `NetEvent::BackupReport` — `from` is the body's `reporter`, as kind
+    /// 26's `from` is its body's `node_id` — at a term ABOVE the receiver's
+    /// own (term-independent, routed before the stale-term drop). A body that
+    /// fails its own decode (`oldest_set > newest_set`), one whose `reporter`
+    /// does not fit a node id, and a short one yield nothing.
+    #[test]
+    fn backup_report_kind_routes_raw_and_rejects_a_malformed_body() {
+        use uc_protocol::v2::backup::{
+            BACKUP_REPORT_BODY_LEN, BackupWatermark, WatermarkOp, write_backup_report_body,
+        };
+
+        let b = buffer();
+        let mut leader = FakeLeader::new();
+        let (tx, rx) = mpsc::sync_channel::<NetEvent>(16);
+        let mut r = follower_routed(&b, leader.addr(), tx);
+        let to = r.local_addr();
+
+        let want = BackupWatermark {
+            op: WatermarkOp::Report,
+            tier_id: 0xABCD_0000_0000_0001,
+            oldest_set: 4096,
+            newest_set: 8192,
+            through: 12288,
+            reporter: 2,
+        };
+        let mut body = vec![0u8; BACKUP_REPORT_BODY_LEN];
+        write_backup_report_body(&mut body, &want);
+        leader.send(to, DGRAM_KIND_BACKUP_REPORT, 0, TERM + 9, &body);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut saw = false;
+        while !saw {
+            assert!(Instant::now() < deadline, "BACKUP_REPORT never routed");
+            r.do_work();
+            while let Ok(ev) = rx.try_recv() {
+                if let NetEvent::BackupReport { from, w } = ev {
+                    assert_eq!((from, w), (2, want));
+                    saw = true;
+                }
+            }
+        }
+
+        // Malformed: oldest_set above newest_set.
+        let mut bad_w = want;
+        bad_w.oldest_set = 9000;
+        let mut bad = vec![0u8; BACKUP_REPORT_BODY_LEN];
+        write_backup_report_body(&mut bad, &bad_w);
+        leader.send(to, DGRAM_KIND_BACKUP_REPORT, 0, TERM + 9, &bad);
+        // A reporter no node id can name.
+        let mut wide_w = want;
+        wide_w.reporter = u64::from(u32::MAX) + 1;
+        let mut wide = vec![0u8; BACKUP_REPORT_BODY_LEN];
+        write_backup_report_body(&mut wide, &wide_w);
+        leader.send(to, DGRAM_KIND_BACKUP_REPORT, 0, TERM + 9, &wide);
+        // Short.
+        leader.send(to, DGRAM_KIND_BACKUP_REPORT, 0, TERM + 9, &body[..39]);
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while Instant::now() < deadline {
+            r.do_work();
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "a malformed BACKUP_REPORT body must not route"
         );
     }
 

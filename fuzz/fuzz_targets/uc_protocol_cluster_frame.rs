@@ -5,6 +5,7 @@
 use libfuzzer_sys::fuzz_target;
 use uc_protocol::v2::frame::{ClusterKind, read_cluster_prefix};
 use uc_protocol::v2::{config::decode_config, schedule::decode_schedule_table, settings::decode_settings};
+use uc_protocol::v2::backup::decode_backup_watermark;
 use uc_protocol::v2::upgrade::{decode_row_genesis, decode_snapshot_report, decode_upgrade_pin};
 
 // The CLUSTER body every node decodes off the log, kind-dispatched: total on any slice.
@@ -28,6 +29,9 @@ fuzz_target!(|data: &[u8]| {
             }
             ClusterKind::RowGenesis => {
                 let _ = decode_row_genesis(payload);
+            }
+            ClusterKind::BackupWatermark => {
+                let _ = decode_backup_watermark(payload);
             }
         }
     }

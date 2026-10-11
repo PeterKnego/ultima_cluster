@@ -66,6 +66,7 @@ fn start_node(root: &Path, name: &str, policy: AdminPolicy) -> (Node, PathBuf) {
     let opts = uc_node::StartOpts {
         socket: Some(sock),
         admin: policy,
+        backup: None,
     };
     let node = Node::start_with(cfg, opts).expect("start");
     (node, instance_dir)

@@ -1457,6 +1457,7 @@ fn cluster_genesis() -> uc_node::ClusterState {
         reports: Vec::new(),
         running: [None; uc_protocol::v2::cnc::CNC_MAX_SERVICES],
         catalog: Vec::new(),
+        backups: Vec::new(),
     }
 }
 

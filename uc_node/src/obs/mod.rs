@@ -91,6 +91,23 @@ pub struct ObsSources {
     /// upgrade pin read from one is thinner evidence than it looks.
     pub snapshot_reports_appended: Arc<AtomicU64>,
     pub snapshot_reports_timed_out: Arc<AtomicU64>,
+    /// Backup-tier spec §6.2: the watermark report path. `sent` / `unsent`
+    /// are a FOLLOWER's wire counters (`BACKUP_REPORT` datagrams handed the
+    /// transport; polls that found no leader and put the claim back), and
+    /// `appended` is the LEADER's `BackupWatermark` records placed. A
+    /// leader reports to itself in-process and moves neither wire counter.
+    pub backup_reports_sent: Arc<AtomicU64>,
+    pub backup_reports_unsent: Arc<AtomicU64>,
+    pub backup_reports_appended: Arc<AtomicU64>,
+    /// Backup-tier spec §5.4: how often low space released this node's backup
+    /// purge hold (`uc2_backup_hold_released_total`), once per episode.
+    pub backup_hold_released: Arc<AtomicU64>,
+    /// Backup-tier spec §6.4: the `uc2-backup` writer's shared stats — the
+    /// SAME allocation the writer thread bumps. `None` on a node with no
+    /// `[backup]` writer; its writer-side series then render `0` (the
+    /// convention `uc2_backup_hold_released_total` already follows), so a
+    /// family is never absent.
+    pub backup_writer: Option<Arc<crate::tier::writer::WriterShared>>,
     /// Cluster FSM (spec §9): the cluster FSM's published view — the SAME
     /// allocation the `uc2-cluster` agent publishes into. Two gauges are read
     /// straight off its atomics AT SCRAPE TIME (`uc2_cluster_fsm_position`
@@ -229,6 +246,11 @@ impl ObsSources {
             snapshot_reports_unsent: Arc::new(AtomicU64::new(0)),
             snapshot_reports_appended: Arc::new(AtomicU64::new(0)),
             snapshot_reports_timed_out: Arc::new(AtomicU64::new(0)),
+            backup_reports_sent: Arc::new(AtomicU64::new(0)),
+            backup_reports_unsent: Arc::new(AtomicU64::new(0)),
+            backup_reports_appended: Arc::new(AtomicU64::new(0)),
+            backup_hold_released: Arc::new(AtomicU64::new(0)),
+            backup_writer: None,
             cluster_view: Arc::new(crate::cluster_fsm::ClusterView::new(
                 &crate::cluster_fsm::ClusterState::genesis_empty(),
             )),

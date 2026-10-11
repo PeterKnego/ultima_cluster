@@ -189,6 +189,12 @@ pub const ADMIN_OP_SNAPSHOT_FETCH: u32 = 9;
 /// first ten bytes of its SHA-256 ride `id ‖ ip ‖ port`, exactly as ops 6
 /// and 7 do. Leader-only, node-local, single-in-flight.
 pub const ADMIN_OP_UPGRADE_PIN: u32 = 10;
+/// Backup-tier spec §6.3: `uc2ctl tier forget`. Drop one tier's committed
+/// watermark (a `BackupWatermark` `Forget`, `CLUSTER` kind 7). The `u64`
+/// tier id is split across the request line: low 32 bits in `id`, high 32 in
+/// `ip`, `port = 0`. Leader-only (a follower answers `retry`),
+/// single-in-flight; refused `62 tier_unknown` when no entry has that id.
+pub const ADMIN_OP_TIER_FORGET: u32 = 11;
 /// M7 — admin RESPONSE line (writer: consensus agent). seq u64 @+0 echoes the
 /// request seq (written LAST, release); status u32 @+8, reason u32 @+12,
 /// version u64 @+16.
@@ -1015,6 +1021,8 @@ mod tests {
         assert_eq!(ADMIN_OP_SNAPSHOT_FETCH, 9);
         // FSM upgrade lifecycle (plan B1): `uc2ctl upgrade pin`.
         assert_eq!(ADMIN_OP_UPGRADE_PIN, 10);
+        // Backup-tier spec §6.3: `uc2ctl tier forget`.
+        assert_eq!(ADMIN_OP_TIER_FORGET, 11);
     }
 
     #[test]

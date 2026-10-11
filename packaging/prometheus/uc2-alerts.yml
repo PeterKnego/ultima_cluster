@@ -441,3 +441,44 @@ groups:
     annotations:
       summary: "{{ $labels.instance }} has held its jumbo startup gate for 5m"
       description: "This node has not proven the cluster's committed datagram rung to a quorum of voters (one voter, for a learner) and is not ready. Read its jumbo_join_gate_holding log records for the members short of the rung, then uc2_probe_min_mtu_bytes on those members; with wire crypto on, check uc_crypto_handshake_failures_total too."
+
+  - alert: Uc2BackupBehind
+    # Backup-tier spec §6.4 / ruling R8b: the tier is more than 256 MiB of
+    # committed log behind. Keyed on the LEVEL of uc2_backup_lag_bytes
+    # (commit - through, leader-only, per tier), NOT on "commit moved while
+    # through stood still": an idle cluster's commit creeps on watermark and
+    # snapshot-report frames, and the writer deliberately cuts no chunk for a
+    # bookkeeping-only span, so through legitimately sits still there. 256 MiB
+    # is well over the default 64 MiB chunk, so a healthy writer between cuts
+    # never reaches it.
+    expr: uc2_backup_lag_bytes > 268435456
+    for: 15m
+    labels: { severity: warning }
+    annotations: { summary: "backup tier {{ $labels.tier }} is {{ $value | humanize1024 }}B of committed log behind", description: "The tier named by the `tier` label (16 hex digits; `uc2ctl tier show`) has not received the journal up to the committed log for 15m. Check uc2_backup_errors_total{reason} and the uc2-backup writer's log lines on the writer node, the target's free space and reachability, and that a writer node is up (a tier no node reports for stays behind)." }
+  - alert: Uc2BackupHoldReleased
+    # Backup-tier spec §5.4: low disk made a writer node let go of its purge
+    # hold. The node has purged (or will) journal the tier does not yet hold,
+    # so the writer will record a chain gap and the tier can no longer restore
+    # to a position inside it. Counted once per episode.
+    expr: increase(uc2_backup_hold_released_total[10m]) > 0
+    labels: { severity: warning }
+    annotations: { summary: "{{ $labels.instance }} released its backup purge hold for lack of disk", description: "Free space fell below one chunk plus the auto-fetch headroom, so the node purged past journal its backup tier lacks; expect uc2_backup_chain_gaps_total to rise when the writer resumes. Free disk on the node and fix the writer that fell behind (Uc2BackupBehind, uc2_backup_errors_total)." }
+  - alert: Uc2BackupWriterError
+    # Backup-tier spec §6.4: the writer counted an error. foreign,
+    # overlap_mismatch, fenced and no_hardlinks stop the writer for good (it
+    # then holds nothing, and Uc2BackupWriterStopped keeps firing after this
+    # rule's window passes); the others are retried on a ladder, so a short
+    # run on a flaky target is expected to clear on its own and does not
+    # re-fire once it does.
+    expr: increase(uc2_backup_errors_total[10m]) > 0
+    labels: { severity: warning }
+    annotations: { summary: "{{ $labels.instance }} backup writer error: reason {{ $labels.reason }}", description: "The `reason` label says which: foreign / overlap_mismatch (target disagrees with this cluster; the writer STOPPED, restart needs a fixed target), fenced (a restore rolled the target's history back; the writer STOPPED, point [backup] target at a new empty directory), no_hardlinks (the target's filesystem cannot hard-link; the writer STOPPED), unavailable (target I/O), hash_mismatch (a local set does not match the catalog), journal_unavailable (this node's own journal could not supply a range). See the runbook's backup-tier alerts." }
+  - alert: Uc2BackupWriterStopped
+    # Final review F3: a writer that stopped for good (foreign,
+    # overlap_mismatch, fenced, no_hardlinks) stays stopped until its node
+    # restarts, with its purge hold released — but Uc2BackupWriterError keys
+    # on increase() and goes quiet ~10m later. This rule keys on the level.
+    expr: uc2_backup_writer_stopped == 1
+    for: 1m
+    labels: { severity: warning }
+    annotations: { summary: "{{ $labels.instance }} backup writer has stopped for good", description: "The uc2-backup writer on this node refused its target and stopped (uc2_backup_errors_total{reason} says why: foreign, overlap_mismatch, fenced or no_hardlinks). It copies nothing and holds no purge, so the tier falls behind. Fix the [backup] target (for fenced: a new, empty directory) and restart the node. See the runbook's backup-tier alerts." }

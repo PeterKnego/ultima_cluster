@@ -27,6 +27,7 @@
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::Deserialize;
 use uc_consensus::election::NodeId;
@@ -38,6 +39,8 @@ use uc_protocol::v2::settings::{FSM_LAG_LOCKSTEP, Settings, Target};
 use crate::obs::log::LogLevel;
 use crate::preflight::{ObsOptions, StartupOptions};
 use crate::services::{FsmLag, ServicesConfig};
+use crate::tier::object::Codec;
+use crate::tier::writer::{BackupConfig, MIN_CHUNK_BYTES};
 use crate::{CryptoConfig, DEFAULT_JOURNAL_SEGMENT_BYTES, NodeConfig, PurgePolicy};
 
 #[derive(Debug, thiserror::Error)]
@@ -237,6 +240,168 @@ struct SettingsSection {
     /// means `true` (every node keeps its own copy of the newest agreed set).
     #[serde(default)]
     auto_fetch: Option<bool>,
+    /// Backup-tier spec: seeds the replicated `backup_retain_sets` (how many
+    /// complete sets a tier keeps). Absent means `0` — keep them all.
+    #[serde(default)]
+    backup_retain_sets: Option<u16>,
+    /// Backup-tier spec: seeds `backup_retain_age_secs`, written as
+    /// `<n>(s|m|h|d)` (see [`parse_duration_secs`]). Absent means `0` — no
+    /// age rule.
+    #[serde(default)]
+    backup_retain_age: Option<String>,
+}
+
+/// Parse a duration of the form `<digits>(s|m|h|d)` into seconds. No
+/// spaces, signs or fractions. The error text leads with `field`, so the
+/// caller's message names the offending key.
+pub fn parse_duration_secs(field: &str, s: &str) -> Result<u64, String> {
+    let bad = || format!("{field}: {s:?} is not a duration (want <digits>(s|m|h|d), e.g. \"30d\")");
+    let unit = s.chars().last().ok_or_else(bad)?;
+    let mult: u64 = match unit {
+        's' => 1,
+        'm' => 60,
+        'h' => 3600,
+        'd' => 86_400,
+        _ => return Err(bad()),
+    };
+    let digits = &s[..s.len() - 1];
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(bad());
+    }
+    let n: u64 = digits.parse().map_err(|_| bad())?;
+    n.checked_mul(mult)
+        .ok_or_else(|| format!("{field}: {s:?} overflows 64-bit seconds"))
+}
+
+/// Backup-tier spec §5.1: `[backup]`, node-local. Absent means no writer;
+/// present, `target` is required (`backup.target`). Sizes and durations are
+/// strings (`"64MiB"`, `"60s"`), parsed by [`parse_bytes`]/[`parse_duration`].
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BackupSection {
+    #[serde(default)]
+    target: Option<PathBuf>,
+    #[serde(default)]
+    chunk_bytes: Option<String>,
+    #[serde(default)]
+    quiet_interval: Option<String>,
+    #[serde(default)]
+    compression: Option<String>,
+    #[serde(default)]
+    compression_level: Option<i32>,
+}
+
+/// Parse a byte size `<digits>[KiB|MiB|GiB]` (no suffix = bytes). The error
+/// text leads with `field`.
+pub fn parse_bytes(field: &str, s: &str) -> Result<u64, String> {
+    let (digits, shift) = if let Some(d) = s.strip_suffix("GiB") {
+        (d, 30)
+    } else if let Some(d) = s.strip_suffix("MiB") {
+        (d, 20)
+    } else if let Some(d) = s.strip_suffix("KiB") {
+        (d, 10)
+    } else {
+        (s, 0)
+    };
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(format!(
+            "{field}: {s:?} is not a byte size (want <digits>[KiB|MiB|GiB], e.g. \"64MiB\")"
+        ));
+    }
+    let n: u64 = digits
+        .parse()
+        .map_err(|_| format!("{field}: {digits:?} does not fit in u64"))?;
+    n.checked_shl(shift)
+        .filter(|v| shift == 0 || *v >> shift == n)
+        .ok_or_else(|| format!("{field}: {s:?} overflows u64"))
+}
+
+/// Parse a duration `<digits>(ms|s|m|h)`. Sub-second granularity, unlike
+/// [`parse_duration_secs`] (which also takes days and returns seconds). The
+/// error text leads with `field`.
+pub fn parse_duration(field: &str, s: &str) -> Result<Duration, String> {
+    let bad =
+        || format!("{field}: {s:?} is not a duration (want <digits>(ms|s|m|h), e.g. \"60s\")");
+    let (digits, mult_ms): (&str, u64) = if let Some(d) = s.strip_suffix("ms") {
+        (d, 1)
+    } else if let Some(d) = s.strip_suffix('s') {
+        (d, 1_000)
+    } else if let Some(d) = s.strip_suffix('m') {
+        (d, 60_000)
+    } else if let Some(d) = s.strip_suffix('h') {
+        (d, 3_600_000)
+    } else {
+        return Err(bad());
+    };
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(bad());
+    }
+    let n: u64 = digits.parse().map_err(|_| bad())?;
+    n.checked_mul(mult_ms)
+        .map(Duration::from_millis)
+        .ok_or_else(|| format!("{field}: {s:?} overflows"))
+}
+
+/// `[backup]` → [`BackupConfig`], with the spec §5.1 refusals by name.
+fn parse_backup(b: BackupSection) -> Result<BackupConfig, ConfigError> {
+    let inv = |field: &'static str, detail: String| ConfigError::Invalid { field, detail };
+    let target = match b.target {
+        Some(t) if !t.as_os_str().is_empty() => t,
+        _ => {
+            return Err(inv(
+                "backup.target",
+                "backup.target is required in a [backup] section: the mounted directory the \
+                 tier is written to (remove the section to run no writer)"
+                    .into(),
+            ));
+        }
+    };
+    let mut cfg = BackupConfig {
+        target,
+        ..BackupConfig::default()
+    };
+    if let Some(s) = b.chunk_bytes {
+        cfg.chunk_bytes =
+            parse_bytes("backup.chunk_bytes", &s).map_err(|e| inv("backup.chunk_bytes", e))?;
+        if cfg.chunk_bytes < MIN_CHUNK_BYTES {
+            return Err(inv(
+                "backup.chunk_bytes",
+                format!("backup.chunk_bytes: {s:?} is below the 1MiB minimum"),
+            ));
+        }
+    }
+    if let Some(s) = b.quiet_interval {
+        cfg.quiet_interval = parse_duration("backup.quiet_interval", &s)
+            .map_err(|e| inv("backup.quiet_interval", e))?;
+        if cfg.quiet_interval.is_zero() {
+            return Err(inv(
+                "backup.quiet_interval",
+                format!("backup.quiet_interval: {s:?} must be greater than zero"),
+            ));
+        }
+    }
+    if let Some(s) = b.compression {
+        cfg.compression = match s.as_str() {
+            "zstd" => Codec::Zstd,
+            "none" => Codec::None,
+            _ => {
+                return Err(inv(
+                    "backup.compression",
+                    format!("backup.compression: {s:?} is not \"zstd\" or \"none\""),
+                ));
+            }
+        };
+    }
+    if let Some(l) = b.compression_level {
+        if !(1..=19).contains(&l) {
+            return Err(inv(
+                "backup.compression_level",
+                format!("backup.compression_level: {l} is outside 1..=19"),
+            ));
+        }
+        cfg.compression_level = l;
+    }
+    Ok(cfg)
 }
 
 #[derive(Debug, Deserialize)]
@@ -303,6 +468,9 @@ struct NodeConfigFile {
     /// Absent means [`Settings::genesis_default`].
     #[serde(default)]
     settings: Option<SettingsSection>,
+    /// Backup-tier spec §5.1: the `uc2-backup` writer. Absent means none.
+    #[serde(default)]
+    backup: Option<BackupSection>,
 }
 
 fn default_buffer_bytes() -> usize {
@@ -618,6 +786,7 @@ pub fn parse_str_with_env(
         });
     }
 
+    let backup = f.backup.map(parse_backup).transpose()?;
     let purge = match f.purge {
         Some(p) => PurgePolicy::BelowSnapshot {
             slack_bytes: p.below_snapshot_slack_bytes,
@@ -827,6 +996,16 @@ pub fn parse_str_with_env(
                     });
                 }
             };
+            let backup_retain_age_secs =
+                match s.backup_retain_age.as_deref() {
+                    None => 0,
+                    Some(raw) => parse_duration_secs("settings.backup_retain_age", raw).map_err(
+                        |detail| ConfigError::Invalid {
+                            field: "settings.backup_retain_age",
+                            detail,
+                        },
+                    )?,
+                };
             Settings {
                 fsm_lag_bytes,
                 admission_bytes: s.admission_bytes.unwrap_or(0),
@@ -843,6 +1022,8 @@ pub fn parse_str_with_env(
                 // in or out of the door's bound, passes through unchecked.
                 retain_sets: s.retain_sets.unwrap_or(1),
                 auto_fetch: s.auto_fetch.unwrap_or(true),
+                backup_retain_sets: s.backup_retain_sets.unwrap_or(0),
+                backup_retain_age_secs,
             }
         }
     };
@@ -887,6 +1068,7 @@ pub fn parse_str_with_env(
                 metrics_bind,
             },
             admin,
+            backup,
         },
     ))
 }
@@ -1819,6 +2001,54 @@ level = "info"
         assert!(cfg.settings_genesis.auto_fetch);
     }
 
+    /// Backup-tier spec: `[settings] backup_retain_sets` / `backup_retain_age`
+    /// seed genesis; absent means `0` (keep everything).
+    #[test]
+    fn settings_backup_retention_seeds_genesis_and_defaults_to_zero() {
+        let (cfg, _) = load_str(&format!(
+            "{MINIMAL}\n[settings]\nbackup_retain_sets = 5\nbackup_retain_age = \"30d\"\n"
+        ))
+        .unwrap();
+        assert_eq!(cfg.settings_genesis.backup_retain_sets, 5);
+        assert_eq!(cfg.settings_genesis.backup_retain_age_secs, 2_592_000);
+        let (cfg, _) = load_str(&format!("{MINIMAL}\n[settings]\n")).unwrap();
+        assert_eq!(cfg.settings_genesis.backup_retain_sets, 0);
+        assert_eq!(cfg.settings_genesis.backup_retain_age_secs, 0);
+        let err = load_str(&format!(
+            "{MINIMAL}\n[settings]\nbackup_retain_age = \"30 days\"\n"
+        ))
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("settings.backup_retain_age"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn parse_duration_secs_accepts_units_and_names_the_field() {
+        assert_eq!(parse_duration_secs("f", "90s"), Ok(90));
+        assert_eq!(parse_duration_secs("f", "2m"), Ok(120));
+        assert_eq!(parse_duration_secs("f", "3h"), Ok(10_800));
+        assert_eq!(parse_duration_secs("f", "30d"), Ok(2_592_000));
+        assert_eq!(parse_duration_secs("f", "0s"), Ok(0));
+        for bad in [
+            "", "d", "30", "1.5h", " 5s", "5 s", "-5s", "5w", "+5s", "5ds",
+        ] {
+            let e = parse_duration_secs("backup_retain_age", bad).unwrap_err();
+            assert!(e.starts_with("backup_retain_age"), "{bad:?}: {e}");
+        }
+        assert!(
+            parse_duration_secs("f", "99999999999999999999d")
+                .unwrap_err()
+                .starts_with('f')
+        );
+        assert!(
+            parse_duration_secs("f", "9999999999999999d")
+                .unwrap_err()
+                .starts_with('f')
+        );
+    }
+
     /// FSM identity + cluster FSM (spec §3.3, §6): `uc_` is reserved
     /// (`uc_cluster`) — a `node.toml` naming a service with that prefix
     /// refuses to start.
@@ -1908,5 +2138,123 @@ level = "info"
         assert_eq!(opts.admin.keys.len(), 1);
         assert_eq!(opts.admin.keys[0].name, "ops-alice");
         assert_eq!(opts.admin.request_ttl_ms, 5000);
+    }
+
+    /// Backup-tier spec §5.1: `[backup]` absent → no writer; present with a
+    /// target → the defaults for everything else.
+    #[test]
+    fn backup_section_absent_is_none_and_bare_target_gets_the_defaults() {
+        let (_c, o) = load_str(MINIMAL).unwrap();
+        assert_eq!(o.backup, None);
+        let (_c, o) = load_str(&format!(
+            "{MINIMAL}\n[backup]\ntarget = \"/mnt/uc-backup\"\n"
+        ))
+        .unwrap();
+        assert_eq!(
+            o.backup,
+            Some(BackupConfig {
+                target: "/mnt/uc-backup".into(),
+                ..BackupConfig::default()
+            })
+        );
+        let d = BackupConfig::default();
+        assert_eq!(
+            (
+                d.chunk_bytes,
+                d.quiet_interval,
+                d.compression,
+                d.compression_level
+            ),
+            (64 << 20, Duration::from_secs(60), Codec::Zstd, 3)
+        );
+    }
+
+    #[test]
+    fn backup_section_parses_every_key() {
+        let (_c, o) = load_str(&format!(
+            "{MINIMAL}\n[backup]\ntarget = \"/t\"\nchunk_bytes = \"8MiB\"\n\
+             quiet_interval = \"500ms\"\ncompression = \"none\"\ncompression_level = 19\n"
+        ))
+        .unwrap();
+        assert_eq!(
+            o.backup.unwrap(),
+            BackupConfig {
+                target: "/t".into(),
+                chunk_bytes: 8 << 20,
+                quiet_interval: Duration::from_millis(500),
+                compression: Codec::None,
+                compression_level: 19,
+                ..BackupConfig::default()
+            }
+        );
+    }
+
+    /// Spec §5.1 refusals, each by its field's name.
+    #[test]
+    fn backup_section_refusals_name_the_field() {
+        let cases: [(&str, &str); 7] = [
+            ("chunk_bytes = \"64MiB\"", "backup.target"),
+            ("target = \"\"", "backup.target"),
+            (
+                "target = \"/t\"\ncompression_level = 0",
+                "backup.compression_level",
+            ),
+            (
+                "target = \"/t\"\ncompression_level = 20",
+                "backup.compression_level",
+            ),
+            (
+                "target = \"/t\"\nchunk_bytes = \"512KiB\"",
+                "backup.chunk_bytes",
+            ),
+            (
+                "target = \"/t\"\ncompression = \"lz4\"",
+                "backup.compression",
+            ),
+            (
+                "target = \"/t\"\nquiet_interval = \"0s\"",
+                "backup.quiet_interval",
+            ),
+        ];
+        for (body, want) in cases {
+            match load_str(&format!("{MINIMAL}\n[backup]\n{body}\n")) {
+                Err(ConfigError::Invalid { field, detail }) => {
+                    assert_eq!(field, want, "{body}: {detail}");
+                    assert!(detail.starts_with(want), "{body}: {detail}");
+                }
+                other => panic!("{body}: expected Invalid({want}), got {other:?}"),
+            }
+        }
+        // `deny_unknown_fields` inside the section too.
+        assert!(
+            load_str(&format!(
+                "{MINIMAL}\n[backup]\ntarget = \"/t\"\ntargte = 1\n"
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn parse_bytes_and_parse_duration_take_their_units() {
+        assert_eq!(parse_bytes("f", "4096"), Ok(4096));
+        assert_eq!(parse_bytes("f", "3KiB"), Ok(3 << 10));
+        assert_eq!(parse_bytes("f", "64MiB"), Ok(64 << 20));
+        assert_eq!(parse_bytes("f", "2GiB"), Ok(2 << 30));
+        for bad in ["", "MiB", "1.5MiB", "-1", "64mb", "99999999999999999999GiB"] {
+            assert!(
+                parse_bytes("f", bad).unwrap_err().starts_with('f'),
+                "{bad:?}"
+            );
+        }
+        assert_eq!(parse_duration("f", "500ms"), Ok(Duration::from_millis(500)));
+        assert_eq!(parse_duration("f", "60s"), Ok(Duration::from_secs(60)));
+        assert_eq!(parse_duration("f", "2m"), Ok(Duration::from_secs(120)));
+        assert_eq!(parse_duration("f", "1h"), Ok(Duration::from_secs(3600)));
+        for bad in ["", "s", "60", "1d", "1.5s", "-1s", "99999999999999999999h"] {
+            assert!(
+                parse_duration("f", bad).unwrap_err().starts_with('f'),
+                "{bad:?}"
+            );
+        }
     }
 }

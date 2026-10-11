@@ -247,6 +247,27 @@ pub fn uc_protocol_datagram() -> Vec<Seed> {
         seeds.push(Seed::fixed("22-snap-report", datagram(DGRAM_KIND_SNAP_REPORT, 0, 3, &b)));
     }
 
+    // Backup tier spec §3a: the 40-byte BACKUP_REPORT body.
+    {
+        use uc_protocol::v2::backup::{
+            BACKUP_REPORT_BODY_LEN, BackupWatermark, WatermarkOp, write_backup_report_body,
+        };
+        use uc_protocol::v2::datagram::DGRAM_KIND_BACKUP_REPORT;
+        let mut b = [0u8; BACKUP_REPORT_BODY_LEN];
+        write_backup_report_body(
+            &mut b,
+            &BackupWatermark {
+                op: WatermarkOp::Report,
+                tier_id: 1,
+                oldest_set: 65536,
+                newest_set: 131072,
+                through: 196608,
+                reporter: 2,
+            },
+        );
+        seeds.push(Seed::fixed("23-backup-report", datagram(DGRAM_KIND_BACKUP_REPORT, 0, 3, &b)));
+    }
+
     seeds
 }
 
@@ -1419,6 +1440,18 @@ pub fn uc_protocol_cluster_frame() -> Vec<Seed> {
     encode_settings(&Settings::genesis_default(), &mut settings_bytes);
 
     // #33: kind 6, a row's genesis running version (row 0 at 1.2.0).
+    let mut backup_bytes = Vec::new();
+    uc_protocol::v2::backup::encode_backup_watermark(
+        &uc_protocol::v2::backup::BackupWatermark {
+            op: uc_protocol::v2::backup::WatermarkOp::Report,
+            tier_id: 1,
+            oldest_set: 65536,
+            newest_set: 131072,
+            through: 196608,
+            reporter: 2,
+        },
+        &mut backup_bytes,
+    );
     let mut genesis_bytes = Vec::new();
     encode_row_genesis(
         &RowGenesis { row: 0, version: uc_protocol::identity::pack_version(1, 2, 0) },
@@ -1457,6 +1490,7 @@ pub fn uc_protocol_cluster_frame() -> Vec<Seed> {
         Seed::fixed("04-short", vec![0u8; 4]),
         Seed::fixed("05-unknown-kind", unknown_kind),
         Seed::fixed("06-reserved-nonzero", reserved_nonzero),
+        Seed::fixed("11-backup-watermark", prefixed(ClusterKind::BackupWatermark, &backup_bytes)),
         Seed::fixed("07-row-genesis", prefixed(ClusterKind::RowGenesis, &genesis_bytes)),
         Seed::fixed("08-snapshot-report-sized", prefixed(ClusterKind::SnapshotReport, &report_bytes)),
         Seed::fixed("09-snapshot-report-unsized", prefixed(ClusterKind::SnapshotReport, &report_unsized)),
@@ -1506,6 +1540,7 @@ pub fn uc_protocol_cluster_image() -> Vec<Seed> {
         reports: &[],
         running: &[],
         catalog: &[],
+        backups: &[],
     };
     let mut image = Vec::new();
     encode_cluster_image(&parts, &mut image).expect("genesis parts are well under u32::MAX");
@@ -1536,6 +1571,24 @@ pub fn uc_protocol_cluster_image() -> Vec<Seed> {
     encode_set_list(&[set], &mut catalog).expect("one set");
     let mut v5_catalog = Vec::new();
     encode_cluster_image(&ClusterImageParts { catalog: &catalog, ..parts }, &mut v5_catalog)
+        .expect("genesis parts are well under u32::MAX");
+    // Backup-tier spec §6.1: a v6 image whose trailing `backups` blob lists
+    // one registered tier.
+    use uc_protocol::v2::backup::{BackupTierEntry, encode_backup_list};
+    let mut backups = Vec::new();
+    encode_backup_list(
+        &[BackupTierEntry {
+            tier_id: 7,
+            oldest_set: 1024,
+            newest_set: 4096,
+            through: 8192,
+            reporter: 2,
+            updated_pos: 9000,
+        }],
+        &mut backups,
+    );
+    let mut v6_backups = Vec::new();
+    encode_cluster_image(&ClusterImageParts { backups: &backups, ..parts }, &mut v6_backups)
         .expect("genesis parts are well under u32::MAX");
     // A GENUINE v4 image (ruling R9): the catalog in the unsized 135 B
     // SetEntry layout and the report blob in 12 B entries, version word 4,
@@ -1573,7 +1626,8 @@ pub fn uc_protocol_cluster_image() -> Vec<Seed> {
         &mut v4,
     )
     .expect("genesis parts are well under u32::MAX");
-    v4.truncate(v4.len() - 4);
+    // CRC and (v6) the empty backups blob's zero length prefix.
+    v4.truncate(v4.len() - 8);
     v4[8..12].copy_from_slice(&4u32.to_le_bytes());
     let crc = crc32fast::hash(&v4);
     v4.extend_from_slice(&crc.to_le_bytes());
@@ -1588,6 +1642,7 @@ pub fn uc_protocol_cluster_image() -> Vec<Seed> {
         Seed::fixed("23-cluster-image-v3-running", v3_running),
         Seed::fixed("24-cluster-image-v5-sized-catalog", v5_catalog),
         Seed::fixed("25-cluster-image-v4-frame", v4),
+        Seed::fixed("26-cluster-image-v6-backups", v6_backups),
     ]
 }
 
@@ -1654,6 +1709,23 @@ pub fn uc_node_cluster_artifact() -> Vec<Seed> {
     );
     let (v3_running, _pos) = fsm.freeze().expect("freeze the cluster image after a genesis");
 
+    // Backup tier (kind 7): the same FSM after one tier's watermark report —
+    // a v6 image whose trailing `backups` blob is non-empty.
+    fsm.apply(
+        &mut ApplyCtx::for_sm::<ClusterFsm>(1280),
+        &body(&ClusterCommand::BackupWatermark(uc_protocol::v2::backup::BackupWatermark {
+            op: uc_protocol::v2::backup::WatermarkOp::Report,
+            tier_id: 7,
+            oldest_set: 320,
+            newest_set: 640,
+            through: 960,
+            reporter: 1,
+        })),
+        &mut out,
+    );
+    assert_eq!(out, [0], "the watermark report is accepted");
+    let (v6_backups, _pos) = fsm.freeze().expect("freeze the cluster image after a report");
+
     let mut bad_crc = image.clone();
     *bad_crc.last_mut().expect("non-empty image") ^= 1;
 
@@ -1684,13 +1756,15 @@ pub fn uc_node_cluster_artifact() -> Vec<Seed> {
     let decoded = uc_protocol::v2::cluster_image::decode_cluster_image(&v3_running)
         .expect("v3_running decodes");
     let running_len = decoded.running.len();
-    // Layout v4 (snapshot catalog): `running_len ‖ running ‖ catalog_len ‖
-    // catalog ‖ crc` — the running length prefix sits one whole catalog
-    // section above the CRC, not directly above it as in v3.
+    // Layout v6: `running_len ‖ running ‖ catalog_len ‖ catalog ‖
+    // backups_len ‖ backups ‖ crc` — the running length prefix sits a whole
+    // catalog section and a whole backups section above the CRC.
     let catalog_len = decoded.catalog.len();
+    let backups_len = decoded.backups.len();
     assert!(running_len > 0, "the running blob must be non-empty to lie about");
     let crc_at = lying_running_length.len() - 4;
-    let catalog_len_at = crc_at - catalog_len - 4;
+    let backups_len_at = crc_at - backups_len - 4;
+    let catalog_len_at = backups_len_at - catalog_len - 4;
     let rl_offset = catalog_len_at - running_len - 4;
     lying_running_length[rl_offset..rl_offset + 4]
         .copy_from_slice(&0xFFFF_0000u32.to_le_bytes());
@@ -1719,6 +1793,22 @@ pub fn uc_node_cluster_artifact() -> Vec<Seed> {
         "a lying catalog length must be refused, not decoded"
     );
 
+    // Backup tier (layout v6): the trailing `backups` blob's own length
+    // prefix and bound check.
+    let mut lying_backups_length = v6_backups.clone();
+    let d6 = uc_protocol::v2::cluster_image::decode_cluster_image(&v6_backups)
+        .expect("v6_backups decodes");
+    assert!(!d6.backups.is_empty(), "the backups blob must be non-empty to lie about");
+    let bl_at = lying_backups_length.len() - 4 - d6.backups.len() - 4;
+    lying_backups_length[bl_at..bl_at + 4].copy_from_slice(&0xFFFF_0000u32.to_le_bytes());
+    let body_len = lying_backups_length.len() - 4;
+    let crc = crc32fast::hash(&lying_backups_length[..body_len]);
+    lying_backups_length[body_len..].copy_from_slice(&crc.to_le_bytes());
+    assert!(
+        uc_protocol::v2::cluster_image::decode_cluster_image(&lying_backups_length).is_none(),
+        "a lying backups length must be refused, not decoded"
+    );
+
     vec![
         Seed::fixed("01-image", image),
         Seed::fixed("02-bad-crc", bad_crc),
@@ -1728,6 +1818,8 @@ pub fn uc_node_cluster_artifact() -> Vec<Seed> {
         Seed::fixed("v3_running", v3_running),
         Seed::fixed("06-lying-running-length", lying_running_length),
         Seed::fixed("07-lying-catalog-length", lying_catalog_length),
+        Seed::fixed("08-v6-backups", v6_backups),
+        Seed::fixed("09-lying-backups-length", lying_backups_length),
     ]
 }
 
@@ -1775,6 +1867,63 @@ pub fn uc_service_snapshot_envelope() -> Vec<Seed> {
     ]
 }
 
+/// `uc_node_tier_object` — the backup tier's three untrusted-bytes readers
+/// (backup-tier spec §4): the 48-byte-header object stream (both codecs and
+/// both magics), and the `TIER` / `SET` key=value texts.
+pub fn uc_node_tier_object() -> Vec<Seed> {
+    use std::io::Cursor;
+    use uc_node::tier::layout::{RowLabel, SetLabel, TierInfo};
+    use uc_protocol::v2::catalog::SetKind;
+    use uc_node::tier::object::{Codec, MAGIC_CHUNK, write_object};
+
+    fn object(magic: [u8; 8], codec: Codec, raw: &[u8]) -> Vec<u8> {
+        let mut out = Cursor::new(Vec::new());
+        write_object(
+            &mut out,
+            magic,
+            codec,
+            3,
+            0,
+            raw.len() as u64,
+            &mut Cursor::new(raw),
+            raw.len() as u64,
+        )
+        .expect("a Vec never fails");
+        out.into_inner()
+    }
+
+    let raw: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+    let none = object(MAGIC_CHUNK, Codec::None, &raw);
+    let zstd = object(MAGIC_CHUNK, Codec::Zstd, &raw);
+    let mut bad_crc = none.clone();
+    let last = bad_crc.len() - 1;
+    bad_crc[last] ^= 0xFF;
+    let tier = TierInfo {
+        app_id: "fuzz-app".into(),
+        tier_id: 0x1234_5678_9abc_def0,
+        created_ns: 1_700_000_000_000_000_000,
+    }
+    .render();
+    let set = SetLabel {
+        position: 4096,
+        kind: SetKind::Full,
+        time_ns: 1_700_000_000_000_000_000,
+        rows: vec![RowLabel { row: 0, hash: 0xfeed, version: 0x0001_0000, size: 77 }],
+        cluster_hash: 0xbeef,
+        cluster_size: 88,
+    }
+    .render();
+
+    vec![
+        Seed::fixed("01-chunk-none", none.clone()),
+        Seed::fixed("02-chunk-zstd", zstd),
+        Seed::fixed("03-block-crc-flipped", bad_crc),
+        Seed::fixed("04-header-only", none[..48].to_vec()),
+        Seed::fixed("05-tier-text", tier.into_bytes()),
+        Seed::fixed("06-set-text", set.into_bytes()),
+    ]
+}
+
 /// `uc_protocol_settings` — the replicated settings record (cluster-FSM spec
 /// §6, jumbo spec §5.5): the genesis default, a non-default encoding, the
 /// version-1 shape a `2.11.0` node wrote (still accepted), and the three
@@ -1798,6 +1947,8 @@ pub fn uc_protocol_settings() -> Vec<Seed> {
         datagram_mtu: 8960,
         retain_sets: 0,
         auto_fetch: true,
+        backup_retain_sets: 4,
+        backup_retain_age_secs: 2_592_000,
     });
     // The version-1 shape `2.11.0` wrote — a live corpus value, not a
     // refusal: it decodes with `datagram_mtu = 0` (jumbo spec §5.5).
@@ -1813,6 +1964,14 @@ pub fn uc_protocol_settings() -> Vec<Seed> {
         let mut v = genesis.clone();
         v.truncate(SETTINGS_LEN_V3);
         v[0] = 3;
+        v
+    };
+    // Backup-tier spec: the v4 shape (36 B, no backup retention) is a live
+    // corpus value - it decodes with both backup fields 0.
+    let v4 = {
+        let mut v = genesis.clone();
+        v.truncate(SETTINGS_LEN_V4);
+        v[0] = 4;
         v
     };
     let mut bad_version = genesis.clone();
@@ -1831,6 +1990,7 @@ pub fn uc_protocol_settings() -> Vec<Seed> {
         Seed::fixed("06-short", vec![0u8; 4]),
         Seed::fixed("07-version-1", v1),
         Seed::fixed("08-version-3", v3),
+        Seed::fixed("09-version-4", v4),
     ]
 }
 

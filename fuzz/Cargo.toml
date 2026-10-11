@@ -215,6 +215,13 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "uc_node_tier_object"
+path = "fuzz_targets/uc_node_tier_object.rs"
+test = false
+doc = false
+bench = false
+
 # one [[bin]] per target.
 
 [workspace]
