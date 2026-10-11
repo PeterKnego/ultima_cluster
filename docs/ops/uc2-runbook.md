@@ -355,7 +355,8 @@ transport setting, both measured closed-loop at inflight 1 on 8-vCPU
 ## When something is wrong
 
 - **`Uc2BackupBehind` fires** (backup tier). The tier named by the `tier`
-  label (16 hex digits; `uc2ctl tier show --target T --instance-dir D` prints the same id as `0x…`) is more than 256 MiB of
+  label (16 hex digits; `uc2ctl tier show --target T --instance-dir D`
+  prints the same id as `0x…`) is more than 256 MiB of
   committed log behind for 15m. The alert keys on the level of
   `uc2_backup_lag_bytes`, which only the leader exports; it does not fire
   because commit moved while `uc2_backup_through` stood still — an idle

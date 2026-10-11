@@ -76,7 +76,7 @@ record, which is current. The replicated one lags.
 
 ## Restore
 
-A restore picks the newest complete set at or below Q whose chain reaches Q.
+A restore picks the newest complete set strictly below Q whose chain reaches Q.
 It checks every artifact against the hashes in `SET`. It builds a journal
 holding exactly `[S, Q)`, sets the snapshot floor to S, and writes the state
 files fresh. There is no vote file. Each restored node comes up knowing

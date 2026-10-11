@@ -83,7 +83,7 @@ it. Both default to `0`, which means "keep everything".
 | Setting | Meaning |
 |---|---|
 | `backup_retain_sets` | Always keep at least this many of the newest complete sets. |
-| `backup_retain_age` | Always keep sets younger than this (`30d`, `12h`, `90m`, `600s`), by the cluster's log time. |
+| `backup_retain_age` | Always keep sets younger than this (`30d`, `12h`, `90m`, `600s`), measured back from the newest set's log time, not from now. |
 
 A set is deleted only when it falls outside **both** limits. The newest
 complete set is never deleted. A set that an unfinished upgrade pin needs as
@@ -128,8 +128,10 @@ up to `through` is in the tier as an unbroken chain from `oldest_set`.
 
 ### Metrics and alerts
 
-All series carry a `tier` label of 16 hex digits (the id from `tier show`,
-without the `0x`).
+Only the three gauges (`uc2_backup_through`, `uc2_backup_oldest_set`,
+`uc2_backup_lag_bytes`) carry a `tier` label. Its value is the id from
+`tier show` as 16 hex digits, without the `0x` that `tier show` prints. The
+other series carry the labels shown, or none.
 
 | Series | Meaning |
 |---|---|
@@ -140,7 +142,7 @@ without the `0x`).
 | `uc2_backup_errors_total{reason}` | `foreign`, `unavailable`, `overlap_mismatch`, `hash_mismatch`, `journal_unavailable`. |
 | `uc2_backup_chain_gaps_total` | Times the tier's chain restarted from a later set. |
 | `uc2_backup_hold_released_total` | Times the writer let go of its purge hold for lack of disk. |
-| `uc2_backup_retention_deleted_total` | Sets this writer deleted. |
+| `uc2_backup_retention_deleted_total` | Objects this writer deleted from the tier, by `kind` (`set` or `chunk`). |
 
 Three alerts ship in `packaging/prometheus/uc2-alerts.yml`:
 
