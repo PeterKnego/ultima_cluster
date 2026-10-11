@@ -2184,6 +2184,7 @@ level = "info"
                 quiet_interval: Duration::from_millis(500),
                 compression: Codec::None,
                 compression_level: 19,
+                ..BackupConfig::default()
             }
         );
     }

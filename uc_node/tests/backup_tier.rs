@@ -364,10 +364,16 @@ mod writer_e2e {
     struct Opts {
         app: &'static str,
         purge: bool,
+        /// Genesis `Settings::backup_retain_sets` (0 = keep everything).
+        retain_sets: u16,
     }
 
     fn opts(app: &'static str, purge: bool) -> Opts {
-        Opts { app, purge }
+        Opts {
+            app,
+            purge,
+            retain_sets: 0,
+        }
     }
 
     struct Cluster {
@@ -449,7 +455,10 @@ mod writer_e2e {
                 buffer_bytes: if o.purge { 1 << 18 } else { 1 << 22 },
                 max_payload: 256,
                 admission_bytes_default: 256 * 1024,
-                settings_genesis: Settings::genesis_default(),
+                settings_genesis: Settings {
+                    backup_retain_sets: o.retain_sets,
+                    ..Settings::genesis_default()
+                },
                 force_jumbo_frames: false,
                 election_timeout_min_ns: 150_000_000,
                 election_timeout_max_ns: 300_000_000,
@@ -659,6 +668,7 @@ mod writer_e2e {
             quiet_interval: quiet,
             compression: Codec::Zstd,
             compression_level: 3,
+            ..BackupConfig::default()
         }
     }
 
@@ -1577,5 +1587,129 @@ mod writer_e2e {
         );
         let report = verify(&t, true).unwrap();
         assert!(report.findings.is_empty(), "{:?}", report.findings);
+    }
+
+    /// What must never move backward while retention runs: the committed
+    /// watermark's `through` and the writer's `progress` (the purge cap).
+    #[derive(Default)]
+    struct Monotone {
+        through: u64,
+        progress: u64,
+        samples: u64,
+    }
+
+    impl Monotone {
+        fn sample(&mut self, c: &Cluster, l: usize, writer: usize) -> Option<BackupTierEntry> {
+            let w = watermark(c.node(l));
+            if let Some(w) = &w {
+                assert!(
+                    w.through >= self.through,
+                    "the committed through moved back: {} -> {w:?}",
+                    self.through
+                );
+                self.through = w.through;
+            }
+            let shared = c.node(writer).backup_writer().unwrap();
+            let p = shared.progress.load(Ordering::Acquire);
+            assert!(
+                p >= self.progress,
+                "the writer's progress moved back: {} -> {p}",
+                self.progress
+            );
+            self.progress = p;
+            self.samples += 1;
+            w
+        }
+
+        fn await_wm(
+            &mut self,
+            c: &Cluster,
+            l: usize,
+            writer: usize,
+            secs: u64,
+            mut f: impl FnMut(&BackupTierEntry) -> bool,
+        ) -> BackupTierEntry {
+            let deadline = Instant::now() + Duration::from_secs(secs);
+            loop {
+                if let Some(w) = self.sample(c, l, writer)
+                    && f(&w)
+                {
+                    return w;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "watermark never satisfied; last = {:?}",
+                    watermark(c.node(l))
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
+
+    /// Spec §7: `backup_retain_sets = 1`, committed at genesis. Each new
+    /// instant reaches the tier and retention then deletes every older set
+    /// (its `SET` first) and the chunks wholly below the newest; the writer
+    /// reports the new `oldest_set`, which commits at an unchanged `through`
+    /// (ruling R8e) until `oldest_set == newest_set`. Neither the committed
+    /// `through` nor the writer's `progress` ever moves back, and the tier
+    /// that is left verifies clean.
+    #[test]
+    fn retention_deletes_old_sets_and_reports_the_new_oldest() {
+        let _g = serialize();
+        let tier = tmp_tier();
+        let mut cfg = writer_cfg(tier.path(), 64 << 20, Duration::from_secs(60));
+        cfg.retention_interval = Duration::from_millis(200);
+        let mut o = opts("tier-retain", false);
+        o.retain_sets = 1;
+        let mut c = spawn(3, 0, o, |i| (i == 1).then(|| cfg.clone()));
+        start_sums(&mut c);
+        let l = await_single_leader(&c, 30);
+        await_capable(&c);
+        let all = c.running();
+        let mut m = Monotone::default();
+        submit_frames(c.node(l), 200);
+        let s0 = instant_until_complete(&c, l, &all);
+        await_agreed(&c, &all, s0);
+        m.await_wm(&c, l, 1, 30, |w| w.oldest_set == s0);
+        let mut sets = Vec::new();
+        for _ in 0..3 {
+            submit_frames(c.node(l), 2000);
+            let p = instant_until_complete(&c, l, &all);
+            await_agreed(&c, &all, p);
+            m.await_wm(&c, l, 1, 30, |w| w.newest_set == p);
+            sets.push(p);
+        }
+        let last = *sets.last().unwrap();
+        let w = m.await_wm(&c, l, 1, 30, |w| {
+            w.oldest_set == last && w.newest_set == last
+        });
+        let shared = c.node(1).backup_writer().unwrap();
+        assert!(
+            shared.stats.sets_deleted.load(Ordering::Relaxed) >= 3,
+            "S0 and the two older instants were deleted"
+        );
+        assert!(shared.stats.chunks_deleted.load(Ordering::Relaxed) >= 1);
+        assert_eq!(shared.stats.gaps.load(Ordering::Relaxed), 0, "no gap");
+        let _keep = c.stop();
+        let t = FsTarget::new(tier.path());
+        let listing = list_tier(&t).unwrap();
+        assert_eq!(
+            listing.sets.iter().map(|s| s.position).collect::<Vec<_>>(),
+            [last],
+            "only the newest set is left: {listing:?}"
+        );
+        assert!(listing.incomplete_sets.is_empty(), "{listing:?}");
+        assert!(
+            listing.chunks.iter().all(|&(_, to)| to > last),
+            "every chunk wholly below the newest set is gone: {:?}",
+            listing.chunks
+        );
+        assert!(reach_from(&listing.chunks, last) >= w.through);
+        let report = verify(&t, true).unwrap();
+        assert!(report.findings.is_empty(), "{:?}", report.findings);
+        eprintln!(
+            "retention: S0={s0} sets={sets:?} final={w:?} samples={}",
+            m.samples
+        );
     }
 }

@@ -4,6 +4,7 @@
 pub mod chain;
 pub mod layout;
 pub mod object;
+pub mod retention;
 pub mod target;
 pub mod writer;
 

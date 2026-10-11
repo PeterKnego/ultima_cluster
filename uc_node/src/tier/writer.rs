@@ -27,6 +27,7 @@ use super::TierError;
 use super::chain::{TierListing, list_tier, watermark_of};
 use super::layout::{SetLabel, TierInfo, chunk_object, cluster_object, row_object, set_label};
 use super::object::{Codec, MAGIC_ARTIFACT, MAGIC_CHUNK, ObjectReader, write_object};
+use super::retention::{self, RetentionPolicy};
 use super::target::{BackupTarget, Put, open_or_create_tier};
 use crate::cluster_fsm::ClusterView;
 use sha2::Digest;
@@ -54,6 +55,9 @@ pub const MIN_CHUNK_BYTES: u64 = 1 << 20;
 pub const DEFAULT_QUIET_INTERVAL: Duration = Duration::from_secs(60);
 /// `[backup] compression_level` default (zstd).
 pub const DEFAULT_COMPRESSION_LEVEL: i32 = 3;
+/// How often a writer runs tier retention (spec §7) — at most once per
+/// this interval, after its copy work.
+pub const DEFAULT_RETENTION_INTERVAL: Duration = Duration::from_secs(60);
 /// `.tmp/` entries older than this are crash residue (spec §4.4).
 const TMP_MAX_AGE: Duration = Duration::from_secs(3600);
 /// The cached tier listing is refreshed at least this often (another
@@ -75,6 +79,10 @@ pub struct BackupConfig {
     pub quiet_interval: Duration,
     pub compression: Codec,
     pub compression_level: i32,
+    /// The retention pass's interval ([`DEFAULT_RETENTION_INTERVAL`]). NOT
+    /// a `[backup]` key — the loader always takes the default; tests
+    /// shorten it.
+    pub retention_interval: Duration,
 }
 
 impl Default for BackupConfig {
@@ -85,6 +93,7 @@ impl Default for BackupConfig {
             quiet_interval: DEFAULT_QUIET_INTERVAL,
             compression: Codec::Zstd,
             compression_level: DEFAULT_COMPRESSION_LEVEL,
+            retention_interval: DEFAULT_RETENTION_INTERVAL,
         }
     }
 }
@@ -134,6 +143,10 @@ pub struct WriterStats {
     pub bytes_journal: AtomicU64,
     /// Chain gaps this writer saw (`backup_chain_gap`, spec §5.3).
     pub gaps: AtomicU64,
+    /// Sets this writer's retention deleted from the tier (spec §7).
+    pub sets_deleted: AtomicU64,
+    /// Journal chunks this writer's retention deleted from the tier.
+    pub chunks_deleted: AtomicU64,
     errors: [AtomicU64; 5],
 }
 
@@ -244,6 +257,8 @@ pub struct Writer {
     /// (above the chain end, journal still reaching it). The next cut ends
     /// exactly at it, so it is copied before the catalog retires it.
     deferred: Option<u64>,
+    /// When the last retention pass ran (spec §7); `None` = never.
+    last_retention_ns: Option<u64>,
 }
 
 fn journal_err(e: impl std::fmt::Display) -> TierError {
@@ -591,6 +606,7 @@ impl Writer {
             gap_logged: None,
             quiet_declined: None,
             deferred: None,
+            last_retention_ns: None,
         }
     }
 
@@ -725,8 +741,58 @@ impl Writer {
         } else {
             false
         };
+        // Spec §7: retention after the copy work, at most once per
+        // `retention_interval`. A deletion refreshes the listing, so the
+        // offer below names the new `oldest_set` at once.
+        let interval = self.cfg.retention_interval.as_nanos() as u64;
+        if self
+            .last_retention_ns
+            .is_none_or(|at| now_ns.saturating_sub(at) >= interval)
+        {
+            self.last_retention_ns = Some(now_ns);
+            if self.retain()? {
+                self.refresh(now_ns)?;
+            }
+        }
         self.maybe_offer(now_ns);
         Ok(progress)
+    }
+
+    /// One retention pass over a fresh listing (spec §7.2): the committed
+    /// policy and pin protection decide, [`retention::apply`] deletes.
+    /// `true` when anything was deleted. Never touches the chain from the
+    /// oldest kept set to `through` (module docs of [`retention`]), so the
+    /// `progress` the next refresh stores cannot move back.
+    fn retain(&mut self) -> Result<bool, TierError> {
+        let policy = RetentionPolicy::from_view(&self.view);
+        if policy.keeps_all() {
+            return Ok(false);
+        }
+        let l = list_tier(&*self.target)?;
+        let positions: Vec<u64> = l.sets.iter().map(|s| s.position).collect();
+        let prot = retention::protection(&self.view.snapshot_inner(), &positions);
+        let (sets, chunks) = retention::plan(&l.sets, &l.chunks, &policy, &prot);
+        if sets.is_empty() && chunks.is_empty() {
+            return Ok(false);
+        }
+        retention::apply(&*self.target, &sets, &chunks)?;
+        let stats = &self.shared.stats;
+        stats
+            .sets_deleted
+            .fetch_add(sets.len() as u64, Ordering::Relaxed);
+        stats
+            .chunks_deleted
+            .fetch_add(chunks.len() as u64, Ordering::Relaxed);
+        crate::obs_event!(
+            Info,
+            "backup_retention_deleted",
+            node = self.node_id as u64,
+            sets = sets.len() as u64,
+            chunks = chunks.len() as u64,
+            oldest_deleted = sets.first().copied().unwrap_or(0),
+            protected = prot.sets.len() as u64
+        );
+        Ok(true)
     }
 
     fn refresh(&mut self, now_ns: u64) -> Result<(), TierError> {
@@ -805,6 +871,14 @@ impl Writer {
             .as_ref()
             .map(|l| l.sets.iter().map(|s| s.position).collect())
             .unwrap_or_default();
+        // Spec §7: under a retention policy a catalog set below the tier's
+        // oldest complete set is never (re)copied — it is one retention
+        // deleted (or would delete), and copying it back would thrash.
+        let floor = if RetentionPolicy::from_view(&self.view).keeps_all() {
+            0
+        } else {
+            have.first().copied().unwrap_or(0)
+        };
         let mut todo: Vec<SetLabel> = self
             .view
             .snapshot_inner()
@@ -812,6 +886,7 @@ impl Writer {
             .iter()
             .filter(|e| {
                 e.is_agreed()
+                    && e.position >= floor
                     && !have.contains(&e.position)
                     && !self.mismatched.contains(&e.position)
             })
