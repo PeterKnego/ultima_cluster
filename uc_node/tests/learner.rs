@@ -2523,23 +2523,16 @@ fn below_floor_join_with(app: &str, opts: JoinOpts<'_>) -> JoinFixture {
         // Nothing else is touched: the journals, the artifacts and the purged
         // prefix are all still there.
         //
-        // This used to restart BOTH voters and lean on each fresh page's
-        // `applied` of 0 to pin the cluster's commit at `fsm_lag` — which was
-        // #95 itself (a whole-cluster cold restart that could never commit).
-        // With #95 fixed a node that has not yet JOINED reports uncapped, so a
-        // cold-restarted cluster commits its whole log and climbs straight past
-        // the table. The staging no longer depends on that defect: the peer
-        // here has ALREADY joined (it never went down), so its FSM report
-        // ceiling is live, and the row's `applied` is put back to 0 below.
+        // History: this once staged a restarted leader whose commit stayed
+        // BELOW the table frame for the whole test, first by leaning on #95
+        // (a whole-cluster cold restart never committed), then on #99 (the
+        // joined peer's report capped below the new leader's NewTerm frame).
+        // Both were deadlocks, both are fixed, and that state is now only
+        // transient (between the election and the NewTerm commit). The
+        // property it guarded — shipping a set never consults commit — is
+        // pinned by `uc_node`'s unit test
+        // `snapshot_set_for_ships_the_cluster_artifact_with_commit_at_zero`.
         voter.stop();
-        // The peer's `applied` is whatever the stopped mirror last wrote (~ the
-        // log end), which would let its report — and so the commit — run past
-        // the table. Put it back to 0: the honest reading of a declared row
-        // with no service attached, which `spawn_applied_mirror` only ever
-        // stood in for while the fixture submitted.
-        if let Some(p) = peer_cnc.as_ref() {
-            p.service_slot(0).applied.store_release(0);
-        }
         voter = Node::start(cfg(0, v_addr, v_dir.clone())).expect("restart the voter");
         cnc = CncPage::open_file(&v_dir.join("cnc2.dat"), app).expect("reopen voter cnc");
         // The cnc page is recreated ZEROED at every boot, and this fixture has
@@ -2549,37 +2542,11 @@ fn below_floor_join_with(app: &str, opts: JoinOpts<'_>) -> JoinFixture {
         // outright ("missing artifact") and there is no residual to test.
         cnc.service_slot(0).snapshot_pos.store_release(floor);
         cnc.snapshots().service_snapshot_pos.store_release(floor);
-        // `is_leader`, not `can_serve`: a leader starts SERVING only once its
-        // own `NewTerm` frame COMMITS (`ElectionSm::can_serve`), and the whole
-        // point of this staging is that nothing above `fsm_lag` commits. That
-        // is not a contrivance — it is exactly the state a cluster is in when
-        // a peer's FSM has not caught up — and shipping a snapshot set is a
-        // SENDER-agent job that does not consult the serving flag. The peer
-        // never campaigns (its election timeout is ten minutes), so the
-        // restarted shipper wins on the peer's vote.
+        // The peer never campaigns (its election timeout is ten minutes), so
+        // the restarted shipper wins on the peer's vote.
         await_until(30, "the restarted voter took the leadership again", || {
             voter.is_leader()
         });
-        // NOTHING advances the restarted leader's commit counter from here on:
-        // no client traffic, no ticks, no mirrored `applied` on either node.
-        // `LogCounters` is deliberately not primed at boot
-        // (`uc_log/src/counters.rs:55`), so the leader re-derives commit from
-        // live reports, and the joined PEER's report is clamped to
-        // `min_applied + fsm_lag` (`services::report_ceiling`) with
-        // `min_applied` reset to 0 above — so with a two-voter quorum the
-        // leader's commit sits at `fsm_lag` (`buffer_bytes / 4` = 64 KiB here)
-        // for as long as the test runs, far below a table frame that
-        // `pre_frames` put a quarter of a megabyte up the log.
-        let settle = Instant::now() + Duration::from_millis(500);
-        while Instant::now() < settle {
-            let c = voter.counters().commit.load_acquire();
-            assert!(
-                c < table_position.max(1),
-                "the restarted cluster's commit ({c}) climbed past the table at \
-                 {table_position} — the residual is no longer staged"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
     }
 
     let first_base = voter.archive_first_base();
@@ -2775,22 +2742,18 @@ fn a_leader_without_a_table_ships_none_and_the_joiner_installs_none() {
 /// agent is constructed, so a node that has just booted can ship it on its
 /// first NAK.
 ///
-/// **What makes the staging real, and not a green test proving nothing.**
-/// Three assertions below, in order: the shipper's commit counter really is
-/// below the table's frame position when the joiner is served (so the retired
-/// gate would have shut); the artifact on the shipper's disk really carries
-/// the table; and the joiner's installed view really holds it at the same
-/// position. The pre-traffic in the fixture is what buys the first — the
-/// still-running peer voter's report ceiling, with its row's `applied` at 0,
-/// is `0 + fsm_lag` = 64 KiB, and 2 000 pre-frames put the table's frame end a
-/// quarter of a megabyte above it. (Until #95 this was staged by restarting
-/// BOTH voters and relying on the cold-restart deadlock #95 fixed; only the
-/// shipper restarts now.)
+/// **What it checks now.** The artifact on the restarted shipper's disk
+/// really carries the table, and the joiner's installed view really holds it
+/// at the same position. It used to ALSO stage the shipper's commit below the
+/// table frame (so the retired gate would have shut), leaning first on the
+/// #95 and then on the #99 deadlock; both are fixed, that state is now only a
+/// transient between the election and the new leader's NewTerm commit, and
+/// "shipping never consults commit" is pinned by the `uc_node` unit test
+/// `snapshot_set_for_ships_the_cluster_artifact_with_commit_at_zero`.
 #[test]
 // Ruling P8: below-floor join needs a cluster artifact at the floor; until
 // Task 5 commands instants none exists.
-fn a_joiner_served_by_a_leader_restarted_before_its_first_commit_advance_still_installs_the_table()
-{
+fn a_joiner_served_by_a_restarted_leader_still_installs_the_table() {
     let _g = serialize();
     let table = two_far_future_entries();
     let f = below_floor_join_with(
@@ -2803,17 +2766,6 @@ fn a_joiner_served_by_a_leader_restarted_before_its_first_commit_advance_still_i
             pre_frames: 2_000,
             restart_shipper: true,
         },
-    );
-
-    // 1. The staging: the shipper's commit counter is BELOW the table's frame
-    //    position — the state the retired gate read as "I know of no
-    //    committed table".
-    let commit = f.voter.counters().commit.load_acquire();
-    assert!(
-        commit < f.table_position,
-        "the residual is not staged: the restarted shipper's commit ({commit}) already \
-         reached the table at {}",
-        f.table_position
     );
 
     // 2. The artifact is the thing that travelled, and it carries the table.

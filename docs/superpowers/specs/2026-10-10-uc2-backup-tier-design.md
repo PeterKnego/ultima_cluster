@@ -686,6 +686,7 @@ ledger (PF = pre-flight, R = execution rulings, by task).
   applied anything (cursor `None`) is refused fatally by the start-set install
   — #98, outside the tier. The capstone takes its first set after 20 acked
   mutations; no assertion was loosened.
+- **Resolved (#99).** The post-election commit stall below is fixed (the report ceiling never sits below the current term's opening frame); the fast-CI skip is removed and the gap test runs in the fast list again. Kept for the record:
 - **Known residual (#99), RF6 — fast CI skips the gap test.** `backup_tier`
   runs in fast CI (ruling R16a), in its own step with `--skip
   two_writers_share_a_target_and_the_watermark_never_crosses_a_gap`: that

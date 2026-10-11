@@ -73,14 +73,7 @@ jobs:
           --test smoke --test failover --test learner
           --test purge_safety --test query_barrier
           --test admin_auth --test daemon_refusals --test timers
-          --test cold_restart
-      # Its own step so the skip below touches only this binary. The gap
-      # test can hit #99 (the post-election commit stall on main) under a
-      # loaded runner; nightly still runs it via `cargo test --workspace`.
-      - name: Tests (uc_node backup tier, minus the #99-prone gap test)
-        run: >
-          cargo test -p uc_node --test backup_tier --
-          --skip two_writers_share_a_target_and_the_watermark_never_crosses_a_gap
+          --test cold_restart --test post_election_stall --test backup_tier
 
   # MSRV floor gate. Reads the floor from Cargo.toml's `rust-version`
   # (`[workspace.package]`, single source of truth — see that field's

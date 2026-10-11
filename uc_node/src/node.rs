@@ -12679,10 +12679,23 @@ impl Consensus {
         } else {
             self.min_applied.max(self.boot_durable)
         };
+        // #99: never pace below the current term's opening frame. The term
+        // map's entry for `current_term` is the NewTerm frame's position (the
+        // archive's term walk stamps `(term, base)` there, and the leader's
+        // own map opens the term at it); the frame is header-only, 32 bytes,
+        // and never preceded by padding at frame-aligned offsets — the second
+        // 32 bytes are margin. 0 until this node has seen the term open.
+        let term_open_end = match self.sm.term_map().last() {
+            Some(&(t, base)) if t == self.sm.current_term() => {
+                base.saturating_add(2 * uc_protocol::v2::frame::FRAME_ALIGNMENT as u64)
+            }
+            _ => 0,
+        };
         let ceiling = crate::services::report_ceiling(
             self.sm.validated_up_to(),
             min_applied,
             self.fsm_lag_eff,
+            term_open_end,
         );
         // Term first, then position (unchanged): a torn read fails the
         // leader's attestation check, the safe direction.
@@ -26156,6 +26169,47 @@ mod tests {
         let d = root.join(id.to_string());
         std::fs::create_dir_all(&d).unwrap();
         std::fs::write(d.join(format!("snap-{pos}.ultsnap")), bytes).unwrap();
+    }
+
+    /// The "retired gate" guard, at the unit level: a node whose COMMIT
+    /// counter sits below its whole set — a freshly restarted leader before
+    /// its NewTerm commits — still ships the complete set at its floor,
+    /// CLUSTER artifact (and so the schedule table it carries) included. The
+    /// shipping decision reads the durable floor and the files, never commit.
+    /// `learner.rs` used to stage this end to end by leaning on the #95 and
+    /// then the #99 commit deadlocks; with both fixed the state is only
+    /// transient, so this is where the property lives now.
+    #[test]
+    fn snapshot_set_for_ships_the_cluster_artifact_with_commit_at_zero() {
+        let dir = decline_scratch();
+        let root = dir.path().join("snapshots");
+        let cnc = test_cnc();
+        let services = crate::services::ServicesConfig::from_names(&["a"], None).unwrap();
+        let cluster_dir = dir.path().join("snapshots").join("cluster");
+        std::fs::create_dir_all(&cluster_dir).unwrap();
+        const P: u64 = 262_144;
+        cnc.snapshots().node_snapshot_floor.store_release(P);
+        write_artifact(&root, 0, P, b"fsm-0 artifact");
+        std::fs::write(
+            crate::cluster_agent::artifact_path(&cluster_dir, P),
+            b"cluster image with the table",
+        )
+        .unwrap();
+        assert_eq!(
+            cnc.counters().commit.load_acquire(),
+            0,
+            "commit sits below the whole set"
+        );
+        let latch = AtomicU8::new(SNAP_DECLINE_NONE);
+        let set = snapshot_set_for(&cnc, &root, &services, &cluster_dir, 7, &latch)
+            .expect("the set at the floor ships whatever commit reads");
+        assert!(
+            set.artifacts
+                .iter()
+                .any(|a| a.service_id == CLUSTER_ARTIFACT_ID && a.snapshot_pos == P),
+            "the cluster artifact rides the session: {:?}",
+            set.artifacts
+        );
     }
 
     /// M14c controller amendment 2 (M14c2 T10b): the snapshot source names a
