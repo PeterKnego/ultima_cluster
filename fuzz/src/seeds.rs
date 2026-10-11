@@ -1867,6 +1867,63 @@ pub fn uc_service_snapshot_envelope() -> Vec<Seed> {
     ]
 }
 
+/// `uc_node_tier_object` — the backup tier's three untrusted-bytes readers
+/// (backup-tier spec §4): the 48-byte-header object stream (both codecs and
+/// both magics), and the `TIER` / `SET` key=value texts.
+pub fn uc_node_tier_object() -> Vec<Seed> {
+    use std::io::Cursor;
+    use uc_node::tier::layout::{RowLabel, SetLabel, TierInfo};
+    use uc_protocol::v2::catalog::SetKind;
+    use uc_node::tier::object::{Codec, MAGIC_CHUNK, write_object};
+
+    fn object(magic: [u8; 8], codec: Codec, raw: &[u8]) -> Vec<u8> {
+        let mut out = Cursor::new(Vec::new());
+        write_object(
+            &mut out,
+            magic,
+            codec,
+            3,
+            0,
+            raw.len() as u64,
+            &mut Cursor::new(raw),
+            raw.len() as u64,
+        )
+        .expect("a Vec never fails");
+        out.into_inner()
+    }
+
+    let raw: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+    let none = object(MAGIC_CHUNK, Codec::None, &raw);
+    let zstd = object(MAGIC_CHUNK, Codec::Zstd, &raw);
+    let mut bad_crc = none.clone();
+    let last = bad_crc.len() - 1;
+    bad_crc[last] ^= 0xFF;
+    let tier = TierInfo {
+        app_id: "fuzz-app".into(),
+        tier_id: 0x1234_5678_9abc_def0,
+        created_ns: 1_700_000_000_000_000_000,
+    }
+    .render();
+    let set = SetLabel {
+        position: 4096,
+        kind: SetKind::Full,
+        time_ns: 1_700_000_000_000_000_000,
+        rows: vec![RowLabel { row: 0, hash: 0xfeed, version: 0x0001_0000, size: 77 }],
+        cluster_hash: 0xbeef,
+        cluster_size: 88,
+    }
+    .render();
+
+    vec![
+        Seed::fixed("01-chunk-none", none.clone()),
+        Seed::fixed("02-chunk-zstd", zstd),
+        Seed::fixed("03-block-crc-flipped", bad_crc),
+        Seed::fixed("04-header-only", none[..48].to_vec()),
+        Seed::fixed("05-tier-text", tier.into_bytes()),
+        Seed::fixed("06-set-text", set.into_bytes()),
+    ]
+}
+
 /// `uc_protocol_settings` — the replicated settings record (cluster-FSM spec
 /// §6, jumbo spec §5.5): the genesis default, a non-default encoding, the
 /// version-1 shape a `2.11.0` node wrote (still accepted), and the three

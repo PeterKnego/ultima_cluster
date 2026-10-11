@@ -67,7 +67,10 @@ not a silent one — see
 [Diagnose a node](diagnose-a-node.md#is-the-disk-about-to-fill) under "When
 something is wrong" below.
 
-- [Back up a cluster](back-up-a-cluster.md) — an ordered-copy artifact taken
+- [Back up to a tier](back-up-to-a-tier.md) — the recommended backup: a
+  writer copies the cluster's agreed history off-node; restore to a chosen
+  point, fork, or export a diff-replay corpus.
+- [Back up a cluster](back-up-a-cluster.md) — the per-node tool: an ordered-copy artifact taken
   from a live, loaded node, verified before you trust it, restorable onto a
   new host. The minority-restore rule lives here.
 - [Recover from quorum loss](recover-from-quorum-loss.md) — a majority of

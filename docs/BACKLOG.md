@@ -393,13 +393,19 @@ reviewer wants a workload to attack.
   (normally within ~5 s) and persists only if that set diverged, which
   `Uc2SnapshotSetDiverged` already alerts. Snapshot lifecycle final review
   M3, 2026-10-10 (the Task 9 ledger had called it unreachable).
-- **Project 3 (not this spec): the backup tier.** Long off-node retention,
-  restore from it, and a "backed up through P" watermark — `CLUSTER` kind
-  `7` is reserved for the watermark record and nothing more is built yet;
-  whether a node may retire below `retain_sets` once the tier confirms a
-  set is also open —
-  [spec §2 "Out"](superpowers/specs/2026-10-01-uc2-snapshot-catalog-design.md#2-scope)
-  and §12.
+- **Project 3: the backup tier.** **3a implemented on `design/backup-tier`
+  (not yet released); 3b open:** the writer, the watermark (`CLUSTER` kind
+  `7`), in-tier retention, `uc2ctl tier show/verify/restore/fork/export-corpus/forget`
+  ([how-to](how-to/back-up-to-a-tier.md),
+  [spec](superpowers/specs/2026-10-10-uc2-backup-tier-design.md)). Open for 3b
+  (spec §14): whether a node may retire sets below `retain_sets` and purge
+  below its floor once the watermark covers them, and with how many tiers
+  confirming; fetching a set or journal span from the tier at start or join,
+  and whether that replaces every-node copies (lifecycle spec D3); whether
+  3b's deletions require a verify pass of the tier first (§13). Origin:
+  [snapshot catalog spec §2 "Out"](superpowers/specs/2026-10-01-uc2-snapshot-catalog-design.md#2-scope)
+  and §12. Also open: a set frozen before a row applied anything cannot start a
+  service ([#98](https://github.com/PeterKnego/ultima_cluster/issues/98)).
   - **3b: tier-seeded replacement node** (ruling R12a, 2026-10-11). The
     restored term map's first entry is (term, S); reconcile against a live
     leader finds no alignment and cuts to 0 (archive fail-stop

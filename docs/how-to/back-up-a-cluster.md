@@ -10,6 +10,12 @@ cluster serving again with data loss stated up front, that is
 [what a backup is not](#what-a-backup-is-not) at the bottom of this page
 before you decide which one you need.
 
+> **Recommended path.** For off-node backups with a recorded recovery point,
+> history you can restore to, and a one-command rollback after an upgrade pin,
+> use a backup tier: [Back up to a tier](back-up-to-a-tier.md). This page
+> describes the per-node tool, which stays as the low-level one: it copies one
+> node's disk and records nothing about how far the copy reaches.
+
 ## What gets copied
 
 `uc2ctl backup` copies exactly the node's **durable** subdirectories —
