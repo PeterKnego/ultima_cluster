@@ -24,7 +24,7 @@
 //! durable)`, read before the walk; committed bytes are never truncated, so
 //! nothing the writer reads below `C` can be replaced by a failover.
 use super::TierError;
-use super::chain::{TierListing, list_fences, list_tier, watermark_of};
+use super::chain::{TierListing, list_fences, list_tier, reach_from, watermark_of};
 use super::layout::{SetLabel, TierInfo, chunk_object, cluster_object, row_object, set_label};
 use super::object::{Codec, MAGIC_ARTIFACT, MAGIC_CHUNK, ObjectReader, write_object};
 use super::retention::{self, RetentionPolicy};
@@ -366,6 +366,26 @@ fn pick_set(held_newest_first: &[u64], through: Option<u64>, first_base: u64) ->
         return held_newest_first.iter().copied().find(|&p| p >= first_base);
     }
     None
+}
+
+/// Ruling RF2: a gap in the tier BELOW its `through` that this node's
+/// journal can fill — the lowest chain end `e` with `first_base <= e <
+/// through` — and the set that starts the next chain above it. Another
+/// writer whose journal no longer reached the chain end (a learner that
+/// joined below the floor, a hold released for space) started a newer
+/// chain at its own set; this node still holds `[e, next)`, so it fills it
+/// first, cutting toward `next` (R9b's cut-to-set) until the chains join.
+/// While such a gap exists, `e` — not `through` — is this writer's
+/// progress, so its node never purges the bytes the gap needs.
+fn fillable_gap(l: &TierListing, through: u64, first_base: u64) -> Option<(u64, u64)> {
+    let e = l
+        .sets
+        .iter()
+        .map(|s| reach_from(&l.chunks, s.position))
+        .filter(|&r| first_base <= r && r < through)
+        .min()?;
+    let next = l.sets.iter().map(|s| s.position).filter(|&p| p > e).min()?;
+    Some((e, next))
 }
 
 /// The keep hold (Task 9): the held set the writer will copy — the one
@@ -1011,13 +1031,32 @@ impl Writer {
             self.note_gap(old_through, oldest);
         }
         self.wm = wm;
-        if let Some((_, _, through)) = self.wm {
-            self.shared.progress.store(through, Ordering::Release);
-        }
         self.listing = Some(l);
+        // Ruling RF2: the purge cap is the fillable chain end while a gap
+        // below `through` exists, else `through`.
+        let first_base = self.first_base.load(Ordering::Acquire);
+        if let Some((end, _)) = self.chain_end(first_base) {
+            self.shared.progress.store(end, Ordering::Release);
+        }
         self.listed_at_ns = now_ns;
         self.scan_due = true;
         Ok(())
+    }
+
+    /// `(the chain end this writer extends, the set a gap fill cuts
+    /// toward)`: the fillable chain end and the next chain's set while a
+    /// gap below `through` exists ([`fillable_gap`], ruling RF2), else
+    /// `(through, None)`. `None` without a watermark.
+    fn chain_end(&self, first_base: u64) -> Option<(u64, Option<u64>)> {
+        let (_, _, through) = self.wm?;
+        let gap = self
+            .listing
+            .as_ref()
+            .and_then(|l| fillable_gap(l, through, first_base));
+        Some(match gap {
+            Some((e, next)) => (e, Some(next)),
+            None => (through, None),
+        })
     }
 
     /// `backup_chain_gap{from, to}`, once per chain end `from` — seen either
@@ -1110,7 +1149,10 @@ impl Writer {
                 held.push((label, files));
             }
         }
-        let through = self.wm.map(|(_, _, t)| t);
+        // Ruling RF2: while a fillable gap lies below `through`, sets are
+        // picked and deferred against its lower end — a held set above it
+        // waits until the fill reaches it.
+        let through = self.chain_end(first_base).map(|(e, _)| e);
         loop {
             let positions: Vec<u64> = held.iter().map(|(l, _)| l.position).collect();
             // The keep hold (Task 9): the set about to be copied, or the
@@ -1236,7 +1278,9 @@ impl Writer {
     // ---------------------------------------------------------- journal
 
     fn cut_one_chunk(&mut self, now_ns: u64) -> Result<bool, TierError> {
-        let Some((_, newest_set, e)) = self.wm else {
+        let first_base = self.first_base.load(Ordering::Acquire);
+        let (Some((_, newest_set, _)), Some((e, fill_to))) = (self.wm, self.chain_end(first_base))
+        else {
             return Ok(false); // no set in the tier yet: nothing to extend
         };
         let k = self.cnc.counters();
@@ -1244,12 +1288,17 @@ impl Writer {
         if c <= e {
             return Ok(false);
         }
-        let first_base = self.first_base.load(Ordering::Acquire);
         if first_base > e {
             self.note_gap(e, first_base);
             return Ok(false); // the set phase starts the next chain
         }
-        let (limit, to_set) = cut_limit(e, c, self.cfg.chunk_bytes, self.deferred);
+        // Ruling RF2: a gap fill ends at the next chain's set (or at a held
+        // set below it, whichever comes first) — R9b's cut-to-set.
+        let deferred = match (self.deferred.filter(|&p| p > e), fill_to) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        let (limit, to_set) = cut_limit(e, c, self.cfg.chunk_bytes, deferred);
         let full = c - e >= self.cfg.chunk_bytes;
         // Ruling R9b: a deferred set's boundary is cut at once — not after
         // `chunk_bytes` or `quiet_interval` — and is substantive by
@@ -1554,6 +1603,54 @@ mod tests {
         );
         // (b) still wins over (c) for a set inside the old chain.
         assert_eq!(pick_set(&[1200, 400], Some(600), 800), Some(400));
+    }
+
+    /// Ruling RF2: the lowest chain end below `through` this node's journal
+    /// still holds, and the set starting the next chain above it; none when
+    /// the journal starts past every lower end (a real gap) or there is
+    /// only one chain.
+    #[test]
+    fn a_fillable_gap_is_the_lowest_chain_end_the_journal_still_holds() {
+        use uc_protocol::v2::catalog::SetKind;
+        let set = |p| SetLabel {
+            position: p,
+            kind: SetKind::Full,
+            time_ns: 1,
+            rows: vec![],
+            cluster_hash: 0,
+            cluster_size: 0,
+        };
+        let l = TierListing {
+            sets: vec![set(100), set(900)],
+            incomplete_sets: vec![],
+            chunks: vec![(100, 300), (300, 400), (900, 1200)],
+            corrupt_sets: vec![],
+            fences: vec![],
+        };
+        // A's chain ends at 400, B's starts at 900 and reaches 1200.
+        assert_eq!(fillable_gap(&l, 1200, 0), Some((400, 900)));
+        assert_eq!(fillable_gap(&l, 1200, 400), Some((400, 900)));
+        // This node's journal starts past 400: nothing it can fill.
+        assert_eq!(fillable_gap(&l, 1200, 401), None);
+        // One chain only: no gap.
+        let one = TierListing {
+            sets: vec![set(100)],
+            chunks: vec![(100, 300), (300, 400)],
+            ..l.clone()
+        };
+        assert_eq!(fillable_gap(&one, 400, 0), None);
+        // Partly filled: the end moved up, the target set did not.
+        let part = TierListing {
+            chunks: vec![(100, 300), (300, 400), (400, 650), (900, 1200)],
+            ..l.clone()
+        };
+        assert_eq!(fillable_gap(&part, 1200, 0), Some((650, 900)));
+        // Joined: no gap.
+        let joined = TierListing {
+            chunks: vec![(100, 300), (300, 400), (400, 900), (900, 1200)],
+            ..l
+        };
+        assert_eq!(fillable_gap(&joined, 1200, 0), None);
     }
 
     /// Task 9 (Task 8 review carry): the keep hold names the set the writer

@@ -1798,6 +1798,148 @@ mod writer_e2e {
         eprintln!("watermarks seen: {seen:?}");
     }
 
+    /// Ruling RF2 (final review F2): two LIVE writers on one target. Writer
+    /// A has a chain `S0 … e_A` and lags (paused — a slow target); its node
+    /// holds its journal from `e_A`. Writer B, a learner that joins below
+    /// the floor, starts a NEWER chain at the set it installed, `P_B >
+    /// e_A`, which becomes the tier's `through`. A resumed must FILL `[e_A,
+    /// P_B)` from its own journal before anything else — its purge cap the
+    /// fillable chain end, never `through` — so the two chains join, and
+    /// A's node never purges past its own chain end while the gap exists.
+    #[test]
+    fn a_lagging_writer_fills_the_gap_below_a_newer_chain() {
+        let _g = serialize();
+        let tier = tmp_tier();
+        let cfg = writer_cfg(tier.path(), 1 << 20, Duration::from_millis(300));
+        let mut c = spawn(3, 2, opts("tier-fill", true), |i| {
+            (i >= 3).then(|| cfg.clone())
+        });
+        // Writer B (node 4) joins later, below the floor.
+        c.nodes[4].stop();
+        start_sums(&mut c);
+        let l = await_single_leader(&c, 30);
+        await_capable(&c);
+        let running = c.running();
+        let voters = c.voters();
+        submit_settled(&c, 4000);
+        let s0 = instant_until_complete(&c, l, &running);
+        await_agreed(&c, &running, s0);
+        let lead = submit_settled(&c, 4000);
+        let t0 = c.node(lead).counters().commit.load_acquire();
+        await_watermark(&c, l, 60, |w| w.through >= t0);
+
+        // Writer A lags: its duty cycle stops; a cut in flight lands.
+        let a = c.node(3).backup_writer().expect("A runs a writer");
+        a.paused_for_test.store(true, Ordering::Relaxed);
+        std::thread::sleep(Duration::from_secs(1));
+        let t = FsTarget::new(tier.path());
+        let e_a = reach_from(&list_tier(&t).unwrap().chunks, s0);
+        assert!(e_a >= t0, "A's chain reached the committed writes");
+        let mut p_last = s0;
+        for _ in 0..3 {
+            let lead = submit_settled(&c, 6000);
+            p_last = instant_until_complete(&c, lead, &running);
+            await_agreed(&c, &running, p_last);
+        }
+        await_until(60, "every voter purged past A's chain end", || {
+            voters.iter().all(|&v| c.node(v).archive_first_base() > e_a)
+        });
+        assert!(
+            c.node(3).archive_first_base() <= e_a,
+            "A's node holds its journal from its chain end"
+        );
+
+        // Writer B joins below the floor and starts a newer chain.
+        c.nodes[4].start();
+        c.nodes[4].start_service(c.app, 4);
+        submit_settled(&c, 2000);
+        let deadline = Instant::now() + Duration::from_secs(90);
+        let p_b = loop {
+            let l = list_tier(&t).unwrap();
+            if let Some((oldest, _, through)) = watermark_of(&l)
+                && oldest > e_a
+                && through > oldest
+            {
+                break oldest;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "writer B never started a newer chain: {l:?}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert!(p_b >= p_last, "B's chain starts at the set it installed");
+        assert_eq!(
+            reach_from(&list_tier(&t).unwrap().chunks, s0),
+            e_a,
+            "precondition: nothing filled [e_A, P_B) while A lagged"
+        );
+
+        // A resumes. While the gap exists A's node never purges past the
+        // lower chain's end (read first_base BEFORE the listing: the end
+        // only grows). Sampled from the moment A resumes, then again across
+        // one more instant, which moves every floor.
+        let mut samples = 0u64;
+        let mut sample = |c: &Cluster| -> bool {
+            let fb = c.node(3).archive_first_base();
+            let l = list_tier(&t).unwrap();
+            let lower = reach_from(&l.chunks, s0);
+            let (_, _, through) = watermark_of(&l).expect("a watermark");
+            samples += 1;
+            assert!(
+                lower >= through || fb <= lower,
+                "A's node purged to {fb}, past its own chain end {lower} while the gap \
+                 [{lower}, {p_b}) exists (S0={s0} e_A={e_a} through={through})"
+            );
+            lower >= through
+        };
+        a.paused_for_test.store(false, Ordering::Relaxed);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !sample(&c) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let lead = submit_settled(&c, 2000);
+        let all = c.running();
+        let p_more = instant_until_complete(&c, lead, &all);
+        await_agreed(&c, &all, p_more);
+        let deadline = Instant::now() + Duration::from_secs(90);
+        while !sample(&c) {
+            assert!(
+                Instant::now() < deadline,
+                "the chains never joined: S0={s0} e_A={e_a} P_B={p_b}; tier {:?}",
+                list_tier(&t).unwrap()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let lead = submit_settled(&c, 2000);
+        let t2 = c.node(lead).counters().commit.load_acquire();
+        let w = await_watermark(&c, l, 60, |w| w.through >= t2);
+        let b = c.node(4).backup_writer().unwrap();
+        let _keep = c.stop();
+        let listing = list_tier(&t).unwrap();
+        assert!(
+            chain_covers(&listing.chunks, e_a, p_b),
+            "[e_A, P_B) = [{e_a}, {p_b}) filled: {:?}",
+            listing.chunks
+        );
+        assert!(
+            reach_from(&listing.chunks, s0) >= w.through,
+            "the chain from S0 reaches the final through {}: {:?}",
+            w.through,
+            listing.chunks
+        );
+        let report = verify(&t, true).unwrap();
+        assert!(report.findings.is_empty(), "{:?}", report.findings);
+        assert_eq!(a.stats.errors(WriterError::OverlapMismatch), 0);
+        assert_eq!(b.stats.errors(WriterError::OverlapMismatch), 0);
+        eprintln!("fill: S0={s0} e_A={e_a} P_B={p_b} final={w:?} samples={samples}");
+    }
+
+    /// `[from, to)` is covered by one gap-free run of chunks.
+    fn chain_covers(chunks: &[(u64, u64)], from: u64, to: u64) -> bool {
+        reach_from(chunks, from) >= to
+    }
+
     /// Spec §4.2 / §10: a target whose `TIER` names another `app_id` is
     /// refused by name and nothing is written to it — not a set, not a
     /// chunk, not a temporary file.
