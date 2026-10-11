@@ -35,6 +35,16 @@ pub trait BackupTarget: Send + Sync {
         let _ = older_than;
         Ok(0)
     }
+    /// How long ago anything in `dir` last changed — the newest
+    /// modification time over the directory itself and its entries — or
+    /// `None` when absent or unknown. Retention removes an incomplete set
+    /// directory only when this is old (spec §7.2), so an in-flight copy is
+    /// never raced; a target that cannot tell keeps the default, and
+    /// retention then never removes one.
+    fn newest_entry_age(&self, dir: &str) -> Result<Option<Duration>, TierError> {
+        let _ = dir;
+        Ok(None)
+    }
 }
 
 pub struct FsTarget {
@@ -191,6 +201,25 @@ impl BackupTarget for FsTarget {
 
     fn clean_tmp(&self, older_than: Duration) -> Result<usize, TierError> {
         FsTarget::clean_tmp(self, older_than)
+    }
+
+    fn newest_entry_age(&self, dir: &str) -> Result<Option<Duration>, TierError> {
+        let path = self.root.join(dir);
+        let mut newest = match std::fs::metadata(&path) {
+            Ok(m) => m.modified()?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        for ent in std::fs::read_dir(&path)? {
+            let m = match ent?.metadata() {
+                Ok(m) => m,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e.into()),
+            };
+            newest = newest.max(m.modified()?);
+        }
+        // A clock that reads before the mtime: treat as just changed.
+        Ok(Some(newest.elapsed().unwrap_or_default()))
     }
 }
 

@@ -765,34 +765,37 @@ impl Writer {
     /// `progress` the next refresh stores cannot move back.
     fn retain(&mut self) -> Result<bool, TierError> {
         let policy = RetentionPolicy::from_view(&self.view);
-        if policy.keeps_all() {
-            return Ok(false);
-        }
-        let l = list_tier(&*self.target)?;
-        let positions: Vec<u64> = l.sets.iter().map(|s| s.position).collect();
-        let prot = retention::protection(&self.view.snapshot_inner(), &positions);
-        let (sets, chunks) = retention::plan(&l.sets, &l.chunks, &policy, &prot);
-        if sets.is_empty() && chunks.is_empty() {
-            return Ok(false);
-        }
-        retention::apply(&*self.target, &sets, &chunks)?;
+        let consumed = self.view.consumed.load(Ordering::Acquire);
+        let inner = self.view.snapshot_inner();
+        let mut done = retention::Deleted::default();
+        // Deletions already made count even when a later one fails.
+        let res = retention::run_pass(
+            &*self.target,
+            &policy,
+            &inner,
+            consumed,
+            TMP_MAX_AGE,
+            &mut done,
+        );
         let stats = &self.shared.stats;
-        stats
-            .sets_deleted
-            .fetch_add(sets.len() as u64, Ordering::Relaxed);
+        stats.sets_deleted.fetch_add(done.sets, Ordering::Relaxed);
         stats
             .chunks_deleted
-            .fetch_add(chunks.len() as u64, Ordering::Relaxed);
-        crate::obs_event!(
-            Info,
-            "backup_retention_deleted",
-            node = self.node_id as u64,
-            sets = sets.len() as u64,
-            chunks = chunks.len() as u64,
-            oldest_deleted = sets.first().copied().unwrap_or(0),
-            protected = prot.sets.len() as u64
-        );
-        Ok(true)
+            .fetch_add(done.chunks, Ordering::Relaxed);
+        if done.any() {
+            crate::obs_event!(
+                Info,
+                "backup_retention_deleted",
+                node = self.node_id as u64,
+                sets = done.sets,
+                chunks = done.chunks,
+                incomplete = done.incomplete,
+                oldest_deleted = done.oldest_set,
+                failed = res.is_err()
+            );
+        }
+        res?;
+        Ok(done.any())
     }
 
     fn refresh(&mut self, now_ns: u64) -> Result<(), TierError> {
@@ -871,26 +874,22 @@ impl Writer {
             .as_ref()
             .map(|l| l.sets.iter().map(|s| s.position).collect())
             .unwrap_or_default();
-        // Spec §7: under a retention policy a catalog set below the tier's
-        // oldest complete set is never (re)copied — it is one retention
-        // deleted (or would delete), and copying it back would thrash.
-        let floor = if RetentionPolicy::from_view(&self.view).keeps_all() {
-            0
-        } else {
-            have.first().copied().unwrap_or(0)
-        };
-        let mut todo: Vec<SetLabel> = self
-            .view
-            .snapshot_inner()
+        // Spec §7: a catalog set retention would delete again the moment it
+        // landed (the policy over the tier plus it) is never (re)copied —
+        // otherwise every set retention deletes comes straight back.
+        let policy = RetentionPolicy::from_view(&self.view);
+        let inner = self.view.snapshot_inner();
+        let tier_sets: &[SetLabel] = self.listing.as_ref().map_or(&[], |l| &l.sets);
+        let mut todo: Vec<SetLabel> = inner
             .catalog
             .iter()
             .filter(|e| {
                 e.is_agreed()
-                    && e.position >= floor
                     && !have.contains(&e.position)
                     && !self.mismatched.contains(&e.position)
             })
             .map(SetLabel::from_catalog)
+            .filter(|l| !retention::recopy_blocked(tier_sets, l, &policy, &inner))
             .collect();
         todo.sort_by_key(|l| std::cmp::Reverse(l.position));
         // The sets this node holds whole on disk, newest first.

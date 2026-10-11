@@ -133,24 +133,156 @@ pub fn deletable_chunks(
         .collect()
 }
 
+/// What a retention pass deleted — counted as it goes, so a pass that
+/// fails midway still reports what it already removed. A set counts once
+/// its `SET` label is gone (it stops counting in the tier at that moment).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Deleted {
+    pub sets: u64,
+    pub chunks: u64,
+    /// Incomplete set directories cleared (crash residue).
+    pub incomplete: u64,
+    /// The lowest complete set deleted (`0` = none).
+    pub oldest_set: u64,
+}
+
+impl Deleted {
+    pub fn any(&self) -> bool {
+        self.sets + self.chunks + self.incomplete > 0
+    }
+}
+
+/// Remove one set directory: `SET` first, then the rest
+/// ([`remove_set_rest`]). Missing files are `Ok`.
+fn remove_set(t: &dyn BackupTarget, p: u64) -> Result<(), TierError> {
+    t.delete(&set_label(p))?;
+    remove_set_rest(t, p)
+}
+
+/// Every entry of a set directory but `SET`, then the directory (if empty).
+fn remove_set_rest(t: &dyn BackupTarget, p: u64) -> Result<(), TierError> {
+    let dir = set_dir(p);
+    for name in t.list(&dir)? {
+        if name != SET_FILE {
+            t.delete(&format!("{dir}/{name}"))?;
+        }
+    }
+    t.delete_dir_if_empty(&dir)
+}
+
+/// [`apply`], counting into `done` as each step lands.
+pub fn apply_counted(
+    t: &dyn BackupTarget,
+    sets: &[u64],
+    chunks: &[(u64, u64)],
+    done: &mut Deleted,
+) -> Result<(), TierError> {
+    for &p in sets {
+        t.delete(&set_label(p))?;
+        done.sets += 1;
+        if done.oldest_set == 0 || p < done.oldest_set {
+            done.oldest_set = p;
+        }
+        remove_set_rest(t, p)?;
+    }
+    for &(from, to) in chunks {
+        t.delete(&chunk_object(from, to))?;
+        done.chunks += 1;
+    }
+    Ok(())
+}
+
 /// Delete `sets` then `chunks`, in the spec §7.2 order: per set its `SET`
 /// label first, then every other object in its directory, then the
 /// directory itself (if empty); the chunks last. Idempotent.
 pub fn apply(t: &dyn BackupTarget, sets: &[u64], chunks: &[(u64, u64)]) -> Result<(), TierError> {
-    for &p in sets {
-        t.delete(&set_label(p))?;
-        let dir = set_dir(p);
-        for name in t.list(&dir)? {
-            if name != SET_FILE {
-                t.delete(&format!("{dir}/{name}"))?;
-            }
+    apply_counted(t, sets, chunks, &mut Deleted::default())
+}
+
+/// Ruling R10a: plan retention only once this node's committed cluster view
+/// has walked (`ClusterView::consumed`) at least to the newest COMPLETE set
+/// in the tier. A lagging view may not yet hold the pin (or the settings)
+/// that protects a set another writer already copied; skip the pass until
+/// it catches up. An empty tier is trivially caught up.
+pub fn view_caught_up(consumed: u64, tier_sets: &[SetLabel]) -> bool {
+    tier_sets.iter().all(|s| s.position <= consumed)
+}
+
+/// Spec §7: would retention delete `cand` again the moment it landed in
+/// the tier? The policy and pin protection over the tier's complete sets
+/// plus `cand`. The writer never copies such a set — whether it lies below
+/// the oldest set or above a protected one — so a deleted set does not come
+/// straight back; a set the policy would KEEP is still (back)filled.
+pub fn recopy_blocked(
+    tier: &[SetLabel],
+    cand: &SetLabel,
+    p: &RetentionPolicy,
+    inner: &ClusterViewInner,
+) -> bool {
+    if p.keeps_all() {
+        return false;
+    }
+    let mut sets: Vec<SetLabel> = tier
+        .iter()
+        .filter(|s| s.position != cand.position)
+        .cloned()
+        .collect();
+    sets.push(cand.clone());
+    let positions: Vec<u64> = sets.iter().map(|s| s.position).collect();
+    deletable_sets(&sets, p, &protection(inner, &positions)).contains(&cand.position)
+}
+
+/// Incomplete set directories (no `SET`) strictly below the oldest kept
+/// complete set — a deletion interrupted between its `SET` and its
+/// directory, never a start. `None` (no complete set) = none.
+pub fn stale_incomplete(incomplete: &[u64], oldest_kept: Option<u64>) -> Vec<u64> {
+    let Some(o) = oldest_kept else {
+        return Vec::new();
+    };
+    incomplete.iter().copied().filter(|&p| p < o).collect()
+}
+
+/// One retention pass over the tier (spec §7.2): list it, skip unless the
+/// view has caught up (R10a), then delete the policy's sets (`SET` first),
+/// the aged incomplete set directories below the oldest kept set (older
+/// than `incomplete_max_age` by [`BackupTarget::newest_entry_age`], so a
+/// lagging writer's in-flight copy is never raced) and the chunks wholly
+/// below the oldest kept set. `Ok(false)` = skipped for R10a.
+pub fn run_pass(
+    t: &dyn BackupTarget,
+    p: &RetentionPolicy,
+    inner: &ClusterViewInner,
+    consumed: u64,
+    incomplete_max_age: std::time::Duration,
+    done: &mut Deleted,
+) -> Result<bool, TierError> {
+    let l = super::chain::list_tier(t)?;
+    if !view_caught_up(consumed, &l.sets) {
+        return Ok(false);
+    }
+    let positions: Vec<u64> = l.sets.iter().map(|s| s.position).collect();
+    let prot = protection(inner, &positions);
+    let (sets, chunks) = plan(&l.sets, &l.chunks, p, &prot);
+    let oldest_kept = positions
+        .iter()
+        .copied()
+        .filter(|q| !sets.contains(q))
+        .min();
+    let mut residue = Vec::new();
+    for q in stale_incomplete(&l.incomplete_sets, oldest_kept) {
+        if t.newest_entry_age(&set_dir(q))?
+            .is_some_and(|age| age >= incomplete_max_age)
+        {
+            residue.push(q);
         }
-        t.delete_dir_if_empty(&dir)?;
     }
-    for &(from, to) in chunks {
-        t.delete(&chunk_object(from, to))?;
+    apply_counted(t, &sets, &[], done)?;
+    for q in residue {
+        remove_set(t, q)?;
+        done.incomplete += 1;
     }
-    Ok(())
+    apply_counted(t, &[], &chunks, done)?;
+    Ok(true)
 }
 
 /// One retention pass's decision over a listing: the sets and chunks to
@@ -394,6 +526,79 @@ mod tests {
         );
     }
 
+    /// Age-only: a set whose log time is NEWER than the newest set's (a
+    /// clock oddity across leaders) reads as age 0 and is kept.
+    #[test]
+    fn a_set_newer_by_log_time_than_the_newest_is_kept() {
+        let sets = [label(100, 1), label(200, 50), label(300, 10)];
+        assert_eq!(deletable_sets(&sets, &pol(0, 5), &none()), vec![100]);
+    }
+
+    /// Ruling R10a: plan only once the view has walked to the tier's
+    /// newest complete set.
+    #[test]
+    fn retention_waits_for_the_view_to_reach_the_newest_tier_set() {
+        assert!(view_caught_up(0, &[]), "an empty tier is caught up");
+        let sets = [label(100, 1), label(500, 2)];
+        assert!(!view_caught_up(499, &sets));
+        assert!(view_caught_up(500, &sets));
+        assert!(view_caught_up(9_000, &sets));
+    }
+
+    /// Fix round 1 / IMPORTANT 1: the copy filter blocks a set retention
+    /// would delete again — below the oldest set AND above a protected one
+    /// — and lets through what the policy keeps.
+    #[test]
+    fn the_copy_filter_does_not_recopy_a_set_deleted_above_a_protected_one() {
+        // The pin test's state after one pass with keep_sets = 1: 200
+        // (origin) and 300 (rollback) protected, 100 and 400 deleted.
+        let mut inner = inner_with_pin(200, 350);
+        inner.catalog = vec![agreed_on(200, pack_version(1, 0, 0))];
+        let tier = [label(200, 2), label(300, 3), label(500, 5)];
+        let p = pol(1, 0);
+        assert!(recopy_blocked(&tier, &label(400, 4), &p, &inner), "above");
+        assert!(recopy_blocked(&tier, &label(100, 1), &p, &inner), "below");
+        assert!(!recopy_blocked(&tier, &label(600, 6), &p, &inner), "newer");
+        // keep-everything: nothing is blocked (backfill as before)
+        assert!(!recopy_blocked(&tier, &label(400, 4), &pol(0, 0), &inner));
+        // an age policy that KEEPS an older set lets it be backfilled
+        let plain = ClusterView::new(&ClusterState::genesis_empty()).snapshot_inner();
+        let t2 = [label(300, 3), label(500, 5)];
+        assert!(!recopy_blocked(&t2, &label(100, 1), &pol(0, 10), &plain));
+        assert!(recopy_blocked(&t2, &label(100, 1), &pol(0, 2), &plain));
+    }
+
+    /// A pin whose rollback set IS the oldest kept set, with chunks
+    /// straddling it: the straddlers and the span stay, the chain from the
+    /// rollback set is whole, and only chunks wholly below it go.
+    #[test]
+    fn a_pins_rollback_set_as_the_oldest_kept_keeps_its_straddling_chunks() {
+        let inner = inner_with_pin(300, 350); // origin = rollback = 300
+        let sets = [label(100, 1), label(200, 2), label(300, 3), label(400, 4)];
+        let prot = protection(&inner, &[100, 200, 300, 400]);
+        assert_eq!(prot.sets, vec![300]);
+        assert_eq!(prot.spans, vec![(300, 350)]);
+        let chunks = [
+            (100, 200),
+            (200, 300),
+            (250, 300),
+            (150, 320),
+            (280, 310),
+            (300, 420),
+        ];
+        let (del, gone) = plan(&sets, &chunks, &pol(1, 0), &prot);
+        assert_eq!(del, vec![100, 200]);
+        assert_eq!(gone, vec![(100, 200), (200, 300), (250, 300)]);
+        let left: Vec<(u64, u64)> = chunks
+            .iter()
+            .copied()
+            .filter(|c| !gone.contains(c))
+            .collect();
+        let reach = crate::tier::chain::reach_from;
+        assert_eq!(reach(&left, 300), reach(&chunks, 300));
+        assert_eq!(reach(&left, 400), reach(&chunks, 400));
+    }
+
     /// A fake target that records every mutating call in order.
     struct Recording {
         log: Mutex<Vec<String>>,
@@ -455,6 +660,144 @@ mod tests {
                 format!("rm {}", chunk_object(0, 100)),
             ]
         );
+    }
+
+    /// A target whose deletes start failing after `ok` of them.
+    struct Failing {
+        ok: Mutex<usize>,
+    }
+
+    impl BackupTarget for Failing {
+        fn put_if_absent(
+            &self,
+            _: &str,
+            _: &mut dyn FnMut(&mut File) -> Result<u64, TierError>,
+        ) -> Result<crate::tier::target::Put, TierError> {
+            unreachable!()
+        }
+        fn list(&self, _: &str) -> Result<Vec<String>, TierError> {
+            Ok(Vec::new())
+        }
+        fn open(&self, _: &str) -> Result<Option<File>, TierError> {
+            Ok(None)
+        }
+        fn delete(&self, _: &str) -> Result<(), TierError> {
+            let mut ok = self.ok.lock().unwrap();
+            if *ok == 0 {
+                return Err(TierError::Refused("target down".into()));
+            }
+            *ok -= 1;
+            Ok(())
+        }
+        fn delete_dir_if_empty(&self, _: &str) -> Result<(), TierError> {
+            Ok(())
+        }
+    }
+
+    /// A pass that fails midway still counts what it already deleted.
+    #[test]
+    fn a_failed_apply_counts_the_deletions_already_made() {
+        // both SET deletes land, then one chunk, then the second fails.
+        let t = Failing { ok: Mutex::new(3) };
+        let mut done = Deleted::default();
+        let e = apply_counted(&t, &[100, 200], &[(0, 100), (100, 200)], &mut done);
+        assert!(e.is_err());
+        assert_eq!(
+            done,
+            Deleted {
+                sets: 2,
+                chunks: 1,
+                incomplete: 0,
+                oldest_set: 100
+            }
+        );
+    }
+
+    fn scratch() -> tempfile::TempDir {
+        let root = std::env::var("CARGO_TARGET_TMPDIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| {
+                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/uc_node_tests")
+            });
+        std::fs::create_dir_all(&root).unwrap();
+        tempfile::Builder::new()
+            .prefix("uc2-tier-")
+            .tempdir_in(&root)
+            .unwrap()
+    }
+
+    /// Age every entry of a set directory, then the directory, by `by`.
+    fn age_dir(dir: &std::path::Path, by: std::time::Duration) {
+        let when = std::time::SystemTime::now() - by;
+        for ent in std::fs::read_dir(dir).unwrap() {
+            File::options()
+                .write(true)
+                .open(ent.unwrap().path())
+                .unwrap()
+                .set_modified(when)
+                .unwrap();
+        }
+        File::open(dir).unwrap().set_modified(when).unwrap();
+    }
+
+    /// Fix round 1 / IMPORTANT 2: a set directory whose `SET` is gone (a
+    /// deletion interrupted midway) below the oldest kept set is cleared by
+    /// one pass once it is old; a fresh one, or one above the oldest kept
+    /// set, is left alone.
+    #[test]
+    fn a_pass_clears_aged_incomplete_set_dirs_below_the_oldest_kept_set() {
+        let dir = scratch();
+        let t = crate::tier::target::FsTarget::new(dir.path());
+        let hour = std::time::Duration::from_secs(3600);
+        for p in [300u64, 400] {
+            let sd = dir.path().join(set_dir(p));
+            std::fs::create_dir_all(&sd).unwrap();
+            std::fs::write(sd.join("SET"), label(p, p).render()).unwrap();
+        }
+        for p in [100u64, 200, 500] {
+            let sd = dir.path().join(set_dir(p));
+            std::fs::create_dir_all(&sd).unwrap();
+            std::fs::write(sd.join("row-0.ultsnap"), b"x").unwrap();
+        }
+        age_dir(&dir.path().join(set_dir(100)), hour * 2);
+        age_dir(&dir.path().join(set_dir(500)), hour * 2);
+        let inner = ClusterView::new(&ClusterState::genesis_empty()).snapshot_inner();
+        let mut done = Deleted::default();
+        // keep-everything still clears residue
+        assert!(run_pass(&t, &pol(0, 0), &inner, u64::MAX, hour, &mut done).unwrap());
+        assert_eq!(done.incomplete, 1);
+        assert_eq!((done.sets, done.chunks), (0, 0));
+        assert!(
+            !dir.path().join(set_dir(100)).exists(),
+            "aged + below: cleared"
+        );
+        assert!(dir.path().join(set_dir(200)).exists(), "fresh: kept");
+        assert!(
+            dir.path().join(set_dir(500)).exists(),
+            "above oldest kept: kept"
+        );
+        let l = crate::tier::chain::list_tier(&t).unwrap();
+        assert_eq!(l.incomplete_sets, vec![200, 500]);
+    }
+
+    /// R10a through the pass: a view short of the newest tier set skips.
+    #[test]
+    fn a_pass_is_skipped_while_the_view_lags_the_tier() {
+        let dir = scratch();
+        let t = crate::tier::target::FsTarget::new(dir.path());
+        for p in [100u64, 200] {
+            let sd = dir.path().join(set_dir(p));
+            std::fs::create_dir_all(&sd).unwrap();
+            std::fs::write(sd.join("SET"), label(p, p).render()).unwrap();
+        }
+        let inner = ClusterView::new(&ClusterState::genesis_empty()).snapshot_inner();
+        let mut done = Deleted::default();
+        let hour = std::time::Duration::from_secs(3600);
+        assert!(!run_pass(&t, &pol(1, 0), &inner, 199, hour, &mut done).unwrap());
+        assert!(!done.any());
+        assert!(run_pass(&t, &pol(1, 0), &inner, 200, hour, &mut done).unwrap());
+        assert_eq!(done.sets, 1);
+        assert!(!dir.path().join(set_dir(100)).exists());
     }
 
     /// On a real filesystem target: idempotent, a missing file is `Ok`, and
