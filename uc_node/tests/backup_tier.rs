@@ -137,9 +137,63 @@ fn entry(node: &Node, tier: u64) -> Option<BackupTierEntry> {
         .find(|e| e.tier_id == tier)
 }
 
+/// Every node's current term. The tests below make their EXACT counter
+/// claims (who sent, who appended, how many records) only over a span in
+/// which no term moved: a loaded box can stall the whole process past an
+/// election timeout, and an election legitimately moves the claim to another
+/// node and can drop a leader's pending reports (ruling R8e's note). Across
+/// an election they still assert every committed outcome.
+fn terms(c: &Cluster) -> Vec<u32> {
+    c.nodes.iter().map(|n| n.current_term()).collect()
+}
+
+/// `backup_reports_appended` summed over every node: a record appended by
+/// any leader of the span, which survives an election.
+fn appended_total(c: &Cluster) -> u64 {
+    c.nodes
+        .iter()
+        .map(|n| {
+            n.observability()
+                .backup_reports_appended
+                .load(Ordering::Relaxed)
+        })
+        .sum()
+}
+
+/// Offer each `(node, claim)` and wait until `done` holds, offering them
+/// again every 500 ms — what the real writer does with an unchanged claim
+/// (`REOFFER_NS`, every 10 s), because one delivery can be lost for good: a
+/// follower still naming a deposed leader sends to a node that drops it, and
+/// a leader that steps down drops its pending reports. An offer the leader
+/// already holds or has committed appends nothing more (single-in-flight,
+/// then the R8e advance filter), so re-offering never inflates a count.
+fn offer_until(
+    c: &Cluster,
+    claims: &[(usize, BackupWatermark)],
+    secs: u64,
+    msg: &str,
+    mut done: impl FnMut() -> bool,
+) {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    loop {
+        for &(i, w) in claims {
+            c.nodes[i].offer_backup_claim_for_test(w);
+        }
+        let next = Instant::now() + Duration::from_millis(500);
+        while Instant::now() < next {
+            if done() {
+                return;
+            }
+            assert!(Instant::now() < deadline, "{msg}");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+}
+
 /// Spec §6.2, the base case: a follower's writer claim is delivered to the
-/// leader as ONE `BACKUP_REPORT` datagram (the follower's `sent` counter),
-/// the leader appends ONE `BackupWatermark` (its `appended` counter), and
+/// leader as a `BACKUP_REPORT` datagram (the follower's `sent` counter — a
+/// re-offer sends again and appends nothing), the leader appends ONE
+/// `BackupWatermark` (its `appended` counter), and
 /// the committed entry — the claim's fields, `reporter` the follower — is
 /// identical on all three nodes.
 #[test]
@@ -150,15 +204,17 @@ fn a_follower_report_reaches_the_leader_and_commits_one_watermark() {
     let follower = (leader + 1) % 3;
     let tier = 0x7E57_0000_0000_0001;
     let w = report(tier, 4096, 8192, 12288, follower as u64);
+    let t0 = terms(&c);
 
-    c.nodes[follower].offer_backup_claim_for_test(w);
+    offer_until(
+        &c,
+        &[(follower, w)],
+        20,
+        "the watermark never committed everywhere",
+        || c.nodes.iter().all(|n| entry(n, tier).is_some()),
+    );
 
     for (i, n) in c.nodes.iter().enumerate() {
-        await_until(
-            20,
-            &format!("node {i} never committed the watermark"),
-            || entry(n, tier).is_some(),
-        );
         let e = entry(n, tier).unwrap();
         assert_eq!(
             (e.oldest_set, e.newest_set, e.through, e.reporter),
@@ -167,8 +223,13 @@ fn a_follower_report_reaches_the_leader_and_commits_one_watermark() {
         );
         assert_eq!(n.cluster_view().backups().len(), 1, "node {i}: one tier");
     }
+    if terms(&c) != t0 {
+        eprintln!("an election moved leadership mid-test; exact counters not judged");
+        c.stop();
+        return;
+    }
     let fobs = c.nodes[follower].observability();
-    assert_eq!(fobs.backup_reports_sent.load(Ordering::Relaxed), 1);
+    assert!(fobs.backup_reports_sent.load(Ordering::Relaxed) >= 1);
     assert_eq!(fobs.backup_reports_appended.load(Ordering::Relaxed), 0);
     let lobs = c.nodes[leader].observability();
     assert_eq!(
@@ -184,8 +245,8 @@ fn a_follower_report_reaches_the_leader_and_commits_one_watermark() {
 /// `through` wins)". Two followers report the same tier; whatever order the
 /// leader sees them in, the committed entry ends at the FURTHER one. Then a
 /// report BEHIND the committed entry (a slower writer's older news) is
-/// dropped at the leader before it is ever appended — `appended` does not
-/// move and the committed entry does not change — while one AHEAD appends.
+/// dropped at the leader before it is ever appended — no node's `appended`
+/// moves and the committed entry does not change — while one AHEAD appends.
 #[test]
 fn two_claims_for_one_tier_coalesce_to_the_furthest() {
     let _g = serialize();
@@ -193,55 +254,80 @@ fn two_claims_for_one_tier_coalesce_to_the_furthest() {
     let leader = await_single_leader(&c.nodes, 20);
     let (fa, fb) = ((leader + 1) % 3, (leader + 2) % 3);
     let tier = 0x7E57_0000_0000_0002;
+    let t0 = terms(&c);
 
-    c.nodes[fa].offer_backup_claim_for_test(report(tier, 64, 128, 4096, fa as u64));
-    c.nodes[fb].offer_backup_claim_for_test(report(tier, 64, 256, 8192, fb as u64));
+    offer_until(
+        &c,
+        &[
+            (fa, report(tier, 64, 128, 4096, fa as u64)),
+            (fb, report(tier, 64, 256, 8192, fb as u64)),
+        ],
+        20,
+        "not every node reached the furthest",
+        || {
+            c.nodes
+                .iter()
+                .all(|n| entry(n, tier).is_some_and(|e| e.through == 8192))
+        },
+    );
     for (i, n) in c.nodes.iter().enumerate() {
-        await_until(20, &format!("node {i} never reached the furthest"), || {
-            entry(n, tier).is_some_and(|e| e.through == 8192)
-        });
         let e = entry(n, tier).unwrap();
         assert_eq!((e.newest_set, e.reporter), (256, fb as u64), "node {i}");
     }
-    let lobs = c.nodes[leader].observability();
-    let appended = lobs.backup_reports_appended.load(Ordering::Relaxed);
-    assert!(
-        (1..=2).contains(&appended),
-        "two reports for one tier append at most two records, got {appended}"
-    );
+    let appended = appended_total(&c);
+    if terms(&c) == t0 {
+        assert!(
+            (1..=2).contains(&appended),
+            "two reports for one tier append at most two records, got {appended}"
+        );
+    }
 
-    // Behind the committed entry: never appended.
-    c.nodes[fa].offer_backup_claim_for_test(report(tier, 64, 128, 4096, fa as u64));
-    await_until(
-        10,
-        "the stale report never reached the follower's wire",
-        || {
-            c.nodes[fa]
-                .observability()
-                .backup_reports_sent
-                .load(Ordering::Relaxed)
-                >= 2
-        },
-    );
+    // Behind the committed entry: never appended, by any leader. Offered
+    // the same way (an election can lose one delivery); whichever node
+    // leads drops it against the committed entry.
+    let sent_before = c.nodes[fa]
+        .observability()
+        .backup_reports_sent
+        .load(Ordering::Relaxed);
+    let t1 = terms(&c);
+    let stale = report(tier, 64, 128, 4096, fa as u64);
+    c.nodes[fa].offer_backup_claim_for_test(stale);
+    await_until(10, "the stale report never left the follower", || {
+        c.nodes[fa]
+            .observability()
+            .backup_reports_sent
+            .load(Ordering::Relaxed)
+            > sent_before
+            || terms(&c) != t1
+    });
     std::thread::sleep(Duration::from_millis(300));
     assert_eq!(
-        lobs.backup_reports_appended.load(Ordering::Relaxed),
+        appended_total(&c),
         appended,
         "a report no further than the committed entry is dropped, not appended"
     );
-    assert_eq!(entry(&c.nodes[leader], tier).unwrap().through, 8192);
+    for n in &c.nodes {
+        assert_eq!(entry(n, tier).unwrap().through, 8192);
+    }
 
     // Ahead of it: appended, and committed everywhere.
-    c.nodes[fa].offer_backup_claim_for_test(report(tier, 128, 512, 16384, fa as u64));
-    for (i, n) in c.nodes.iter().enumerate() {
-        await_until(20, &format!("node {i} never took the newer report"), || {
-            entry(n, tier).is_some_and(|e| e.through == 16384)
-        });
-    }
-    assert_eq!(
-        lobs.backup_reports_appended.load(Ordering::Relaxed),
-        appended + 1
+    let t2 = terms(&c);
+    offer_until(
+        &c,
+        &[(fa, report(tier, 128, 512, 16384, fa as u64))],
+        20,
+        "not every node took the newer report",
+        || {
+            c.nodes
+                .iter()
+                .all(|n| entry(n, tier).is_some_and(|e| e.through == 16384))
+        },
     );
+    if terms(&c) == t2 {
+        assert_eq!(appended_total(&c), appended + 1);
+    } else {
+        assert!(appended_total(&c) > appended);
+    }
     c.stop();
 }
 
@@ -253,11 +339,18 @@ fn a_leaders_own_claim_commits_without_a_datagram() {
     let c = spawn_cluster(3);
     let leader = await_single_leader(&c.nodes, 20);
     let tier = 0x7E57_0000_0000_0003;
-    c.nodes[leader].offer_backup_claim_for_test(report(tier, 0, 0, 512, leader as u64));
-    for (i, n) in c.nodes.iter().enumerate() {
-        await_until(20, &format!("node {i} never committed"), || {
-            entry(n, tier).is_some()
-        });
+    let t0 = terms(&c);
+    offer_until(
+        &c,
+        &[(leader, report(tier, 0, 0, 512, leader as u64))],
+        20,
+        "not every node committed",
+        || c.nodes.iter().all(|n| entry(n, tier).is_some()),
+    );
+    if terms(&c) != t0 {
+        eprintln!("an election moved leadership mid-test; exact counters not judged");
+        c.stop();
+        return;
     }
     let lobs = c.nodes[leader].observability();
     assert_eq!(lobs.backup_reports_sent.load(Ordering::Relaxed), 0);
@@ -583,6 +676,52 @@ mod writer_e2e {
         at
     }
 
+    /// [`submit_following`] for a test that runs long enough to see an
+    /// election under a loaded box: the same leader-following submit, then
+    /// [`await_settled`] instead of waiting on the node that took the last
+    /// frame — if that node is deposed, its uncommitted tail is truncated
+    /// and never commits. Frames lost that way are simply lost; the caller
+    /// counts no frames, only positions the cluster then commits. Returns
+    /// the settled leader.
+    fn submit_settled(c: &Cluster, n: u64) -> usize {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut left = n;
+        while left > 0 {
+            assert!(Instant::now() < deadline, "no leader took the writes");
+            let Some(i) = c.running().into_iter().find(|&i| c.node(i).can_serve()) else {
+                std::thread::yield_now();
+                continue;
+            };
+            left -= submit_some(c.node(i), left, 3_000_000 + left);
+        }
+        await_settled(c)
+    }
+
+    /// Wait until whichever running node leads has committed everything it
+    /// appended, following an election that lands meanwhile (the deposed
+    /// leader's uncommitted tail is truncated and never commits, so waiting
+    /// on ITS append position would wait forever). Returns that leader.
+    fn await_settled(c: &Cluster) -> usize {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            assert!(
+                Instant::now() < deadline,
+                "no leader committed its own appends within 60 s"
+            );
+            let Some(l) = c.running().into_iter().find(|&i| c.node(i).can_serve()) else {
+                std::thread::yield_now();
+                continue;
+            };
+            let target = c.node(l).counters().append.load_acquire();
+            while c.node(l).can_serve() && Instant::now() < deadline {
+                if c.node(l).counters().commit.load_acquire() >= target {
+                    return l;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+    }
+
     /// Submit `n` frames on the leader and wait until they committed.
     fn submit_frames(node: &Node, n: u64) {
         let before = node.counters().append.load_acquire();
@@ -593,12 +732,25 @@ mod writer_e2e {
         });
     }
 
+    /// Command an instant and wait until every node in `idxs` holds its
+    /// complete set; returns its position. `leader` is a hint: an election
+    /// that lands meanwhile moves the command to whichever node now serves
+    /// (a deposed leader answers `Retry` for good).
     fn instant_until_complete(c: &Cluster, leader: usize, idxs: &[usize]) -> u64 {
+        let mut leader = leader;
         for _ in 0..5 {
+            let deadline = Instant::now() + Duration::from_secs(60);
             let p = loop {
                 match c.node(leader).command_snapshot(false) {
                     Ok(p) => break p,
                     Err(uc_node::SnapshotRefusal::Retry) => {
+                        assert!(Instant::now() < deadline, "no leader took the instant");
+                        if !c.node(leader).can_serve()
+                            && let Some(i) =
+                                c.running().into_iter().find(|&i| c.node(i).can_serve())
+                        {
+                            leader = i;
+                        }
                         std::thread::sleep(Duration::from_millis(5))
                     }
                     Err(e) => panic!("uc2ctl snapshot refused: {e}"),
@@ -1361,6 +1513,11 @@ mod writer_e2e {
         start_sums(&mut c);
         let l = await_single_leader(&c, 30);
         await_capable(&c);
+        // `l` is the OBSERVER below (its committed view and commit counter),
+        // never assumed to stay leader: this test runs long enough that an
+        // election under a loaded box is routine, so every write follows
+        // leadership (`submit_settled`) and every instant is commanded on
+        // whichever voter then serves (`instant_until_complete`).
         let voters = c.voters();
         let all = c.running();
         let mut seen: Vec<BackupTierEntry> = Vec::new();
@@ -1372,11 +1529,11 @@ mod writer_e2e {
             }
         };
 
-        submit_frames(c.node(l), 4000);
+        submit_settled(&c, 4000);
         let p0 = instant_until_complete(&c, l, &all);
         await_agreed(&c, &all, p0);
-        submit_frames(c.node(l), 4000);
-        let t0 = c.node(l).counters().commit.load_acquire();
+        let lead = submit_settled(&c, 4000);
+        let t0 = c.node(lead).counters().commit.load_acquire();
         await_watermark(&c, l, 60, |w| w.through >= t0);
         record(&c, &mut seen);
 
@@ -1386,8 +1543,8 @@ mod writer_e2e {
         let tier_end = watermark(c.node(l)).unwrap().through;
         let mut p_last = p0;
         for _ in 0..3 {
-            submit_frames(c.node(l), 6000);
-            p_last = instant_until_complete(&c, l, &voters);
+            let lead = submit_settled(&c, 6000);
+            p_last = instant_until_complete(&c, lead, &voters);
             await_agreed(&c, &voters, p_last);
             record(&c, &mut seen);
         }
@@ -1401,8 +1558,8 @@ mod writer_e2e {
         // its journal starts there — a gap from the tier's end.
         c.nodes[4].start();
         c.nodes[4].start_service(c.app, 4);
-        submit_frames(c.node(l), 2000);
-        let t1 = c.node(l).counters().commit.load_acquire();
+        let lead = submit_settled(&c, 2000);
+        let t1 = c.node(lead).counters().commit.load_acquire();
         let deadline = Instant::now() + Duration::from_secs(90);
         loop {
             record(&c, &mut seen);
@@ -1428,8 +1585,8 @@ mod writer_e2e {
         // Writer A returns too; both share the target from here.
         c.nodes[3].start();
         c.nodes[3].start_service(c.app, 3);
-        submit_frames(c.node(l), 4000);
-        let t2 = c.node(l).counters().commit.load_acquire();
+        let lead = submit_settled(&c, 4000);
+        let t2 = c.node(lead).counters().commit.load_acquire();
         let deadline = Instant::now() + Duration::from_secs(90);
         loop {
             record(&c, &mut seen);
