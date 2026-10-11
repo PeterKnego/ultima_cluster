@@ -365,8 +365,11 @@ fn a_whole_cluster_restore_is_linearizable_up_to_q_and_shows_nothing_after() {
     let mut respawned = cluster.supervise_services();
 
     // Run the load out, and far enough past S that a restore at the
-    // sentinel replays more than 4 × fsm_lag.
-    await_until(60, "the log passed S + 4 x fsm_lag", || {
+    // sentinel replays more than 4 × fsm_lag. Throughput-bound, so the
+    // budget is a hang guard sized for nightly's DEBUG build on a 4-vCPU
+    // runner: a debug run on a 32-thread dev box spent ~17 s here (the
+    // whole load phase 26.5 s against `LOAD` = 8 s).
+    await_until(180, "the log passed S + 4 x fsm_lag", || {
         respawned += cluster.supervise_services();
         let li = cluster.leader()?;
         let commit = cluster.node(li)?.counters().commit.load_acquire();
