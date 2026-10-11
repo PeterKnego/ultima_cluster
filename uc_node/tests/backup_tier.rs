@@ -1030,12 +1030,12 @@ mod writer_e2e {
         start_sums(&mut c);
         let l = await_single_leader(&c, 30);
         await_capable(&c);
-        submit_frames(c.node(l), 2000);
+        submit_settled(&c, 2000);
         let all = c.running();
         let p = instant_until_complete(&c, l, &all);
         await_agreed(&c, &all, p);
-        submit_frames(c.node(l), 20_000);
-        let target = c.node(l).counters().commit.load_acquire();
+        let lead = submit_settled(&c, 20_000);
+        let target = c.node(lead).counters().commit.load_acquire();
         let w = await_watermark(&c, l, 60, |w| w.newest_set == p && w.through >= target);
         let wn = c.node(3);
         let ceiling = wn
@@ -1103,11 +1103,11 @@ mod writer_e2e {
         let l = await_single_leader(&c, 30);
         await_capable(&c);
         let all = c.running();
-        submit_frames(c.node(l), 500);
+        submit_settled(&c, 500);
         let p = instant_until_complete(&c, l, &all);
         await_agreed(&c, &all, p);
-        submit_frames(c.node(l), 3000);
-        let target = c.node(l).counters().commit.load_acquire();
+        let lead = submit_settled(&c, 3000);
+        let target = c.node(lead).counters().commit.load_acquire();
         // The SumSm total as of `target`: every submit above has committed,
         // and no client write follows, so a restore at any Q >= target must
         // answer the same.
@@ -1165,7 +1165,7 @@ mod writer_e2e {
             total_before,
             "the restored cluster answers as the original did at Q"
         );
-        submit_frames(c.node(l2), 10);
+        let l2 = submit_settled(&c, 10);
         let commit = c.node(l2).counters().commit.load_acquire();
         assert!(
             commit > through,
@@ -1337,7 +1337,7 @@ mod writer_e2e {
         let l = await_single_leader(&c, 30);
         await_capable(&c);
         let all = c.running();
-        submit_frames(c.node(l), 50);
+        submit_settled(&c, 50);
         let s = instant_until_complete(&c, l, &all);
         await_agreed(&c, &all, s);
         // No client traffic from here on.
@@ -1399,12 +1399,12 @@ mod writer_e2e {
         start_sums(&mut c);
         let l = await_single_leader(&c, 30);
         await_capable(&c);
-        submit_frames(c.node(l), 200);
+        submit_settled(&c, 200);
         let all = c.running();
         let p = instant_until_complete(&c, l, &all);
         await_agreed(&c, &all, p);
-        submit_frames(c.node(l), 1);
-        let target = c.node(l).counters().commit.load_acquire();
+        let lead = submit_settled(&c, 1);
+        let target = c.node(lead).counters().commit.load_acquire();
         let started = Instant::now();
         let w = await_watermark(&c, l, 10, |w| w.through >= target);
         assert!(
@@ -1449,15 +1449,15 @@ mod writer_e2e {
         let l = await_single_leader(&c, 30);
         await_capable(&c);
         let all = c.running();
-        submit_frames(c.node(l), 200);
+        submit_settled(&c, 200);
         let s0 = instant_until_complete(&c, l, &all);
         await_agreed(&c, &all, s0);
-        submit_frames(c.node(l), 200);
+        submit_settled(&c, 200);
         let w0 = await_watermark(&c, l, 30, |w| w.through > s0);
         assert_eq!(w0.oldest_set, s0);
 
         // A second instant just after a cut: P lies above the chain end.
-        submit_frames(c.node(l), 300);
+        submit_settled(&c, 300);
         let p = instant_until_complete(&c, l, &all);
         let at_p = watermark(c.node(l)).unwrap();
         assert!(
@@ -1466,7 +1466,7 @@ mod writer_e2e {
             at_p.through
         );
         await_agreed(&c, &all, p);
-        submit_frames(c.node(l), 100);
+        submit_settled(&c, 100);
 
         // No further load: the cut after P makes P eligible, and the report
         // that names it as `newest_set` at an UNCHANGED `through` commits
@@ -1526,13 +1526,14 @@ mod writer_e2e {
             .collect();
         let mut c = spawn(3, 0, opts("tier-trunc", false), |i| Some(cfgs[i].clone()));
         start_sums(&mut c);
-        let old = await_single_leader(&c, 30);
+        let first = await_single_leader(&c, 30);
         await_capable(&c);
-        submit_frames(c.node(old), 500);
+        submit_settled(&c, 500);
         let all = c.running();
-        let p = instant_until_complete(&c, old, &all);
+        let p = instant_until_complete(&c, first, &all);
         await_agreed(&c, &all, p);
-        submit_frames(c.node(old), 500);
+        // Whoever leads NOW is the one cut off below (every voter writes).
+        let old = submit_settled(&c, 500);
         let commit0 = c.node(old).counters().commit.load_acquire();
         await_watermark(&c, old, 30, |w| w.through >= commit0);
 
@@ -1605,8 +1606,13 @@ mod writer_e2e {
             "the old leader truncated its uncommitted suffix",
             || c.node(old).truncations() > truncs_before,
         );
-        let new = submit_following(&c, 500);
+        // The position to wait on is the commit BEFORE the 500 frames
+        // below, never after them: the tail past the last client frame is
+        // tier bookkeeping (BackupWatermark reports) a quiet cut declines,
+        // so a commit read after the writes may never be backed up. The 500
+        // substantive frames past `target` guarantee a cut reaches it.
         let target = c.node(new).counters().commit.load_acquire();
+        let new = submit_following(&c, 500);
         // Wait for the old leader's writer to back up past the doomed range,
         // but compare frames FIRST if it never does: a chunk of doomed bytes
         // ends off the surviving log's frame grid, so a writer that wrote
@@ -1956,11 +1962,11 @@ mod writer_e2e {
         start_sums(&mut c);
         let l = await_single_leader(&c, 30);
         await_capable(&c);
-        submit_frames(c.node(l), 500);
+        submit_settled(&c, 500);
         let all = c.running();
         let p = instant_until_complete(&c, l, &all);
         await_agreed(&c, &all, p);
-        submit_frames(c.node(l), 500);
+        submit_settled(&c, 500);
         let shared = c.node(2).backup_writer().unwrap();
         await_until(10, "the writer refused the foreign target", || {
             shared.stats.errors(WriterError::Foreign) == 1
@@ -2014,8 +2020,7 @@ mod writer_e2e {
     fn churn(c: &Cluster, idxs: &[usize], rounds: usize) -> u64 {
         let mut p = 0;
         for _ in 0..rounds {
-            let l = await_single_leader(c, 30);
-            submit_frames(c.node(l), 6000);
+            let l = submit_settled(c, 6000);
             p = instant_until_complete(c, l, idxs);
             await_agreed(c, idxs, p);
         }
@@ -2078,11 +2083,11 @@ mod writer_e2e {
         let l = await_single_leader(&c, 30);
         await_capable(&c);
         let all = c.running();
-        submit_frames(c.node(l), 2000);
+        submit_settled(&c, 2000);
         let p0 = instant_until_complete(&c, l, &all);
         await_agreed(&c, &all, p0);
-        submit_frames(c.node(l), 2000);
-        let t0 = c.node(l).counters().commit.load_acquire();
+        let lead = submit_settled(&c, 2000);
+        let t0 = c.node(lead).counters().commit.load_acquire();
         await_watermark(&c, l, 60, |w| w.through >= t0);
         let shared = c.node(1).backup_writer().unwrap();
 
@@ -2192,14 +2197,14 @@ mod writer_e2e {
         let l = await_single_leader(&c, 30);
         await_capable(&c);
         let all = c.running();
-        submit_frames(c.node(l), 200);
+        submit_settled(&c, 200);
         let s0 = instant_until_complete(&c, l, &all);
         await_agreed(&c, &all, s0);
         await_watermark(&c, l, 30, |w| w.oldest_set == s0);
         let t = FsTarget::new(tier.path());
         let mut sets = Vec::new();
         for _ in 0..3 {
-            submit_frames(c.node(l), 2000); // ~256 KiB
+            submit_settled(&c, 2000); // ~256 KiB
             let p = instant_until_complete(&c, l, &all);
             await_agreed(&c, &all, p);
             await_until(20, &format!("set {p} reached the tier"), || {
@@ -2311,13 +2316,13 @@ mod writer_e2e {
         await_capable(&c);
         let all = c.running();
         let mut m = Monotone::default();
-        submit_frames(c.node(l), 200);
+        submit_settled(&c, 200);
         let s0 = instant_until_complete(&c, l, &all);
         await_agreed(&c, &all, s0);
         m.await_wm(&c, l, 1, 30, |w| w.oldest_set == s0);
         let mut sets = Vec::new();
         for _ in 0..3 {
-            submit_frames(c.node(l), 2000);
+            submit_settled(&c, 2000);
             let p = instant_until_complete(&c, l, &all);
             await_agreed(&c, &all, p);
             m.await_wm(&c, l, 1, 30, |w| w.newest_set == p);
@@ -2385,11 +2390,11 @@ mod writer_e2e {
         let l = await_single_leader(&c, 30);
         await_capable(&c);
         let all = c.running();
-        submit_frames(c.node(l), n1);
+        submit_settled(&c, n1);
         let p = instant_until_complete(&c, l, &all);
         await_agreed(&c, &all, p);
-        submit_frames(c.node(l), n2);
-        let target = c.node(l).counters().commit.load_acquire();
+        let lead = submit_settled(&c, n2);
+        let target = c.node(lead).counters().commit.load_acquire();
         await_watermark(&c, l, 60, |w| w.newest_set == p && w.through >= target);
         (c, tier, p, target)
     }

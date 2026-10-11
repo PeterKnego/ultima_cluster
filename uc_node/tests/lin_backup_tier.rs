@@ -65,8 +65,16 @@ use uc_service::{ApplyCtx, SnapshotError, SnapshotStateMachine, StateMachine};
 const FSM_LAG: u64 = 64 * 1024;
 /// Review Focus 5: Q − S must exceed the lag bound by a wide margin.
 const MIN_REPLAY: u64 = 4 * FSM_LAG;
-/// Outside every value the workers write (`1..1000`).
+/// Outside every value the workers write (`1..1000`). Each sentinel
+/// attempt writes `SENTINEL + attempt`, so the acknowledged one is told
+/// apart from an indeterminate earlier attempt (which may have committed
+/// BELOW Q and may legitimately be read after the restore).
 const SENTINEL: u64 = 1_000_000;
+/// The sentinel's client id in the history.
+const SENTINEL_CLIENT: u32 = 99;
+/// How many acknowledged non-sentinel mutations must land past Q before the
+/// load stops — the non-vacuity of assertion 1's truncation.
+const MIN_POST_Q: usize = 5;
 /// The post-restore write (assertion 3).
 const AFTER: u64 = 2_000_000;
 const VOTERS: usize = 3;
@@ -379,24 +387,36 @@ fn a_whole_cluster_restore_is_linearizable_up_to_q_and_shows_nothing_after() {
     // The sentinel: its frame start is Q. Retried until it is acknowledged
     // (an indeterminate attempt stays in the history as optional).
     let mut conn = WorkerConn::new(voter_dirs.clone(), 0);
-    let q = await_until(60, "the sentinel write acknowledged", || {
+    let mut attempt = 0u64;
+    let (q, sentinel) = await_until(60, "the sentinel write acknowledged", || {
+        attempt += 1;
+        let v = SENTINEL + attempt;
         match do_op(
             &mut conn,
-            99,
-            Op::Write(SENTINEL),
+            SENTINEL_CLIENT,
+            Op::Write(v),
             &history,
             &positions,
             Instant::now() + Duration::from_secs(10),
         ) {
-            (_, Some(Pos::Mut(p))) => Some(p),
+            (_, Some(Pos::Mut(p))) => Some((p, v)),
             _ => None,
         }
     });
     conn.drop_client();
 
-    // History the restore must not show: keep loading past Q, then let the
-    // tier's chain reach past it.
-    std::thread::sleep(Duration::from_millis(1500));
+    // History the restore must not show: keep loading until the workers
+    // have acknowledged MIN_POST_Q mutations at or past Q (awaited, not a
+    // fixed sleep), then let the tier's chain reach past it.
+    await_until(60, "workers acknowledged mutations past Q", || {
+        let n = positions
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|p| matches!(p, Pos::Mut(m) if *m > q))
+            .count();
+        (n >= MIN_POST_Q).then_some(())
+    });
     stop_workers.store(true, Ordering::Relaxed);
     for h in workers {
         h.join().expect("worker");
@@ -492,7 +512,11 @@ fn a_whole_cluster_restore_is_linearizable_up_to_q_and_shows_nothing_after() {
         .max()
         .expect("acknowledged mutations below Q");
     for &(v, la) in &seen {
-        assert_ne!(v, Some(SENTINEL), "the write AT Q is visible after restore");
+        assert_ne!(
+            v,
+            Some(sentinel),
+            "the acknowledged write AT Q is visible after restore"
+        );
         let la = la.expect("the restored register applied something");
         assert!(la < q, "the restored register applied {la} >= Q {q}");
         assert!(
@@ -508,6 +532,9 @@ fn a_whole_cluster_restore_is_linearizable_up_to_q_and_shows_nothing_after() {
     );
 
     // Assertion 1: truncate the pre-stop history to what lies below Q.
+    // `dropped` counts acknowledged NON-sentinel ops at or past Q: the
+    // sentinel itself always lies at Q, so counting it made the
+    // non-vacuity check below vacuous.
     let (mut kept_ok, mut kept_ind, mut dropped) = (0usize, 0usize, 0usize);
     let truncated: Vec<Entry> = entries
         .iter()
@@ -526,7 +553,7 @@ fn a_whole_cluster_restore_is_linearizable_up_to_q_and_shows_nothing_after() {
             };
             if keep {
                 kept_ok += 1;
-            } else {
+            } else if e.client != SENTINEL_CLIENT {
                 dropped += 1;
             }
             keep
@@ -544,8 +571,8 @@ fn a_whole_cluster_restore_is_linearizable_up_to_q_and_shows_nothing_after() {
         wall.elapsed().as_secs_f64()
     );
     assert!(
-        dropped > 0,
-        "non-vacuity: no acknowledged op lay at or after Q"
+        dropped >= MIN_POST_Q,
+        "non-vacuity: only {dropped} acknowledged non-sentinel ops lay at or after Q"
     );
     match check_register(&truncated) {
         Verdict::Linearizable => {}
