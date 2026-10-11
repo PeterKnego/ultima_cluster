@@ -28,6 +28,13 @@ pub trait BackupTarget: Send + Sync {
     /// Absent is `Ok`.
     fn delete(&self, path: &str) -> Result<(), TierError>;
     fn delete_dir_if_empty(&self, dir: &str) -> Result<(), TierError>;
+    /// Remove `.tmp` entries older than `older_than` (crash residue, spec
+    /// §4.4); returns how many. A target with no scratch area keeps the
+    /// default, which removes nothing.
+    fn clean_tmp(&self, older_than: Duration) -> Result<usize, TierError> {
+        let _ = older_than;
+        Ok(0)
+    }
 }
 
 pub struct FsTarget {
@@ -180,6 +187,10 @@ impl BackupTarget for FsTarget {
             }
             Err(e) => Err(e.into()),
         }
+    }
+
+    fn clean_tmp(&self, older_than: Duration) -> Result<usize, TierError> {
+        FsTarget::clean_tmp(self, older_than)
     }
 }
 

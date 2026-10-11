@@ -45,6 +45,9 @@ see [startup refusals](#startup-refusals).
 [Admin authentication](#admin-authentication) below for why it lives on
 `StartOpts` instead.
 
+**`[backup]`** has none either: it is node-local and is handed to the node as
+`StartOpts::backup` — see [`[backup]`](#backup) below.
+
 ### `[log]` and `[metrics]`
 
 Reserved in M9 (accepted-but-inert, so a config written ahead of the release
@@ -146,6 +149,45 @@ neither is refused.
 own sentinel there (`FSM_LAG_LOCKSTEP = u64::MAX`) rather than reusing the cnc
 page's `0`. You never write that number: `"lockstep"` in the TOML is what maps
 onto it.
+
+### `[backup]`
+
+The backup tier's writer (spec
+`docs/superpowers/specs/2026-10-10-uc2-backup-tier-design.md` §5). Optional;
+**absent means this node runs no writer**. Node-local, not replicated: the
+target path differs per host. Present, it starts one `uc2-backup` thread
+that copies every **agreed** snapshot set this node holds and the
+**committed** journal after it (never above `min(commit, durable)`) into the
+target, and reports the chain it extends to the leader as the tier's
+watermark. A learner is the recommended writer; any member may be one, and
+several may share one target.
+
+```toml
+[backup]
+target = "/mnt/uc-backup"        # required
+chunk_bytes = "64MiB"            # cut a journal chunk at this much committed history
+quiet_interval = "60s"           # ...or after this long with any uncut history
+compression = "zstd"             # "zstd" | "none"
+compression_level = 3            # zstd level
+```
+
+| key | default | rule |
+|---|---|---|
+| `target` | — | **required**; the tier's directory (a mounted path). Its `TIER` file names the cluster's `app_id`; a target naming another `app_id` is refused by name (`backup_target_foreign`) and nothing is written to it |
+| `chunk_bytes` | `"64MiB"` | `<digits>[KiB\|MiB\|GiB]`, at least `1MiB`. A chunk may exceed it by one frame |
+| `quiet_interval` | `"60s"` | `<digits>(ms\|s\|m\|h)`, greater than zero. A quiet cut is skipped while the uncut history holds only the tier's own watermark records (otherwise an idle cluster would back up its own report every interval) |
+| `compression` | `"zstd"` | `"zstd"` or `"none"`: how THIS writer stores its tier objects; every reader handles both |
+| `compression_level` | `3` | `1..=19` |
+
+Every refusal names its key: `backup.target`, `backup.chunk_bytes`,
+`backup.quiet_interval`, `backup.compression`, `backup.compression_level`;
+an unknown key inside the section is refused like any other.
+
+Journal chunks are the log's own frames, byte for byte, except two spans no
+reader interprets — a padding frame's body and each frame's alignment slack
+— which the writer zeroes, so every writer's copy of a committed range is
+identical (a follower's padding body is whatever its own ring held: padding
+travels header-only).
 
 ## Startup refusals
 

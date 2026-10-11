@@ -142,6 +142,7 @@ impl NodeH {
         let opts = StartOpts {
             socket: Some(sock),
             admin: policy,
+            backup: None,
         };
         self.node = Some(Node::start_with(cfg, opts).expect("restart"));
     }
@@ -231,6 +232,7 @@ fn spawn_cluster_with(n: usize, policy: AdminPolicy, services: uc_node::Services
         let opts = StartOpts {
             socket: Some(sock),
             admin: policy.clone(),
+            backup: None,
         };
         let node = Node::start_with(cfg, opts).expect("start");
         nodes.push(NodeH {

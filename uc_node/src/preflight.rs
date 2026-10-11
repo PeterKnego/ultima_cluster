@@ -135,6 +135,10 @@ pub struct StartupOptions {
     /// into a real [`uc_crypto::admin::AdminPolicy`] — see
     /// `uc2-node.rs::main`.
     pub admin: AdminSection,
+    /// Backup-tier spec §5.1: `[backup]` as loaded from the config file —
+    /// `None` (no section) runs no writer. Handed to the node through
+    /// [`crate::StartOpts::backup`], never through `NodeConfig`.
+    pub backup: Option<crate::tier::writer::BackupConfig>,
 }
 
 /// M10 observability options: `[log]`/`[metrics]` from the config file,

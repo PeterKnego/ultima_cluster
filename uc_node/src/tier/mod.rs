@@ -5,6 +5,7 @@ pub mod chain;
 pub mod layout;
 pub mod object;
 pub mod target;
+pub mod writer;
 
 #[derive(Debug, thiserror::Error)]
 pub enum TierError {

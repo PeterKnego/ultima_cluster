@@ -91,6 +91,7 @@ fn tier_forget_removes_a_tier_and_refuses_62_for_an_unknown_one() {
         uc_node::StartOpts {
             socket: Some(sock),
             admin: AdminPolicy::Filesystem,
+            backup: None,
         },
     )
     .expect("start");

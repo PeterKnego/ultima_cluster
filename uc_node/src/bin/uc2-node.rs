@@ -131,6 +131,7 @@ fn main() -> ExitCode {
         StartOpts {
             socket: None,
             admin,
+            backup: opts.backup.clone(),
         },
     ) {
         Ok(n) => n,

@@ -332,6 +332,11 @@ pub struct StartOpts {
     /// the instance directory's permissions ARE the admin boundary, and the
     /// cnc auth line is ignored entirely.
     pub admin: AdminPolicy,
+    /// Backup-tier spec §5.1: `[backup]` — `Some` runs the `uc2-backup`
+    /// writer thread into that target. Here rather than on [`NodeConfig`]
+    /// for the reason `admin` is: `NodeConfig` has no `Default` and many
+    /// literal call sites.
+    pub backup: Option<crate::tier::writer::BackupConfig>,
 }
 
 /// Ingress queue depth (M5 replaces this with the client submit ring).
@@ -417,6 +422,10 @@ const HOLDINGS_PROBE_NS: u64 = 1_000_000_000;
 /// probe itself runs at most once per [`HOLDINGS_PROBE_NS`]; this only bounds
 /// how long a node stop waits to join the thread.
 const HOLDINGS_THREAD_SLEEP: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Backup-tier spec §5.1: the `uc2-backup` writer thread's sleep between
+/// idle steps (a step that made progress skips it).
+const BACKUP_THREAD_SLEEP: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// Plan B3 final review F3: how long (monotonic ns, the pass's own clock) the
 /// attach gate (`Consensus::maybe_publish_declared`) may stay shut before the
@@ -1253,6 +1262,9 @@ pub struct Node {
     _instance: InstanceDir,
     _rings: Rings,
     agents: Vec<AgentRunner>,
+    /// Backup-tier spec §5: the `uc2-backup` writer's shared state, when
+    /// `[backup]` configured one.
+    backup_writer: Option<Arc<crate::tier::writer::WriterShared>>,
 }
 
 impl Node {
@@ -1284,7 +1296,11 @@ impl Node {
     /// business in a `Clone`-able, config-file-shaped struct that tests and
     /// harnesses copy around.
     pub fn start_with(cfg: NodeConfig, opts: StartOpts) -> io::Result<Node> {
-        let StartOpts { socket, admin } = opts;
+        let StartOpts {
+            socket,
+            admin,
+            backup,
+        } = opts;
         let sock = match socket {
             Some(sock) => sock,
             None => UdpSocket::bind(cfg.bind)?,
@@ -1706,6 +1722,9 @@ impl Node {
         // because `archive` itself is moved into the archive agent's
         // closure below before the cluster agent is constructed.
         let cluster_journal = archive.journal_arc();
+        // Backup-tier spec §5.3: the `uc2-backup` writer's handle on the
+        // journal (raw block reads, ruling PF2), taken for the same reason.
+        let backup_journal = backup.as_ref().map(|_| archive.journal_arc());
         // A learner never leads, so its sender streams to no one: give it a solo
         // (empty) fan-out with a cluster size of 1, which also sidesteps flow
         // control's leader-in-cluster invariant (from a learner's view every voter
@@ -2608,6 +2627,37 @@ impl Node {
                 consensus.do_work()
             })?;
 
+        // Backup-tier spec §5.1: the `uc2-backup` writer — its own sleeping
+        // thread, never a polling agent; appended LAST to `agents` so the
+        // five agent indices `/healthz` reads never shift.
+        let (backup_shared, backup_runner) = match (backup, backup_journal) {
+            (Some(bcfg), Some(journal)) => {
+                let shared = Arc::new(crate::tier::writer::WriterShared::default());
+                let target = Box::new(crate::tier::target::FsTarget::new(bcfg.target.clone()));
+                let mut writer = crate::tier::writer::Writer::new(
+                    bcfg,
+                    cfg.app_id.clone(),
+                    cfg.id,
+                    cfg.instance_dir.clone(),
+                    journal,
+                    Arc::clone(&cnc),
+                    Arc::clone(&archive_first_base),
+                    Arc::clone(&cluster_view),
+                    Arc::clone(&backup_claim),
+                    Arc::clone(&shared),
+                    target,
+                );
+                let base = std::time::Instant::now();
+                let runner = AgentRunner::spawn(
+                    "uc2-backup",
+                    IdleStrategy::Sleep(BACKUP_THREAD_SLEEP),
+                    move || writer.step(base.elapsed().as_nanos() as u64),
+                )?;
+                (Some(shared), Some(runner))
+            }
+            _ => (None, None),
+        };
+
         Ok(Node {
             node_id: cfg.id,
             cnc,
@@ -2681,7 +2731,12 @@ impl Node {
                 // label in `/healthz`); last, so its index never shifts the
                 // five above.
                 holdings_runner,
-            ],
+            ]
+            .into_iter()
+            // Backup-tier spec §5.1: last of all (see its spawn above).
+            .chain(backup_runner)
+            .collect(),
+            backup_writer: backup_shared,
         })
     }
 
@@ -2742,6 +2797,12 @@ impl Node {
     /// (Task 8), so an end-to-end test can drive the report path without a
     /// tier. The consensus agent takes it on its next pass.
     #[doc(hidden)]
+    /// Backup-tier spec §5: the `uc2-backup` writer's progress, holds and
+    /// counters — `None` when this node runs no writer.
+    pub fn backup_writer(&self) -> Option<Arc<crate::tier::writer::WriterShared>> {
+        self.backup_writer.clone()
+    }
+
     pub fn offer_backup_claim_for_test(&self, w: BackupWatermark) {
         *self.backup_claim.lock().unwrap_or_else(|e| e.into_inner()) = Some(w);
     }
