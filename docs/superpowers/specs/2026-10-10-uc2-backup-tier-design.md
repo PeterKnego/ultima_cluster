@@ -597,8 +597,11 @@ ledger (PF = pre-flight, R = execution rulings, by task).
   (any writer's chunks count — bytes in the tier are backed up whoever wrote
   them), not on this writer's own chain alone, and it clamps the journal purge
   target (sets are covered by the writer's keep list). A STOPPED writer
-  (foreign target, overlap mismatch) RELEASES its hold: it can never progress,
-  and `Uc2BackupWriterError` already alerts.
+  (foreign target, overlap mismatch, and since the final review a fenced
+  target or one without hard links) RELEASES its hold: it can never
+  progress, and `Uc2BackupWriterStopped` alerts on it for as long as it
+  stays stopped. RF2 below refines the key: while a gap this node can fill
+  lies below `through`, the hold is that gap's lower chain end.
 - **R10a — retention waits for the view (§7.2).** A writer plans retention only
   once its committed cluster view has consumed at least to the newest complete
   set in the tier. Any pin whose rollback set is in the tier has its record
@@ -663,8 +666,10 @@ ledger (PF = pre-flight, R = execution rulings, by task).
   (an earlier reconfig would break the FSM's version chain for good), and the
   check runs under CONSENSUS serving, not client serving, so a jumbo join gate
   pending on a silent member cannot block removing it (R12c). The fork's
-  inherited `backups` entry is cosmetic (the purge hold is writer-local) and
-  documented: the operator may `uc2ctl tier forget` it (R12b).
+  inherited `backups` entry holds no purge (the hold is writer-local) but is
+  NOT cosmetic: nothing advances it on the fork, so `uc2_backup_lag_bytes`
+  grows and `Uc2BackupBehind` fires; the docs say to `uc2ctl tier forget` it
+  on the fork (R12b, corrected by the final review's C3).
 - **R7a — `--tier-id` (§6.3).** `uc2ctl tier forget --tier-id <id>` (hex
   `0x…` or decimal) is a flag, not the positional sketched in §6.3.
 - **PF3 — `CORPUS` (§8.2).** `uc_ctl → uc_diffreplay` with
@@ -681,8 +686,75 @@ ledger (PF = pre-flight, R = execution rulings, by task).
   applied anything (cursor `None`) is refused fatally by the start-set install
   — #98, outside the tier. The capstone takes its first set after 20 acked
   mutations; no assertion was loosened.
-- **Known residual (#99).** `backup_tier` runs in fast CI (ruling R16a), and
-  its gap test can still fail on a loaded runner because of #99, the
-  post-election commit stall on main: when the log end sits more than
-  `fsm_lag` past `applied` at an election, every follower's report ceiling
-  stays below the new leader's NewTerm frame and commit never advances.
+- **Known residual (#99), RF6 — fast CI skips the gap test.** `backup_tier`
+  runs in fast CI (ruling R16a), in its own step with `--skip
+  two_writers_share_a_target_and_the_watermark_never_crosses_a_gap`: that
+  test can fail on a loaded runner because of #99, the post-election commit
+  stall on main (when the log end sits more than `fsm_lag` past `applied` at
+  an election, every follower's report ceiling stays below the new leader's
+  NewTerm frame and commit never advances). Nightly still runs it through
+  `cargo test --workspace`. The other writer e2e tests submit through
+  whichever node serves instead of pinning the first leader.
+- **RF1 — a restore below the reach FENCES the tier (§8.1/§8.2, final review
+  F1).** A whole-cluster restore at Q below the tier's reach R is a rollback:
+  the restored cluster writes a new history past Q while the tier's `(Q, R]`
+  holds the old one, and every check the tier has (SET hashes, CRCs, overlap
+  compares, chain continuity) sees only what is in the tier. A writer
+  restarted on the same target would take E = R and append the new history
+  to the old chain (the e2e's RED: it copied the new history's set P' ∈
+  (Q, R] into the old chain). As built: a `Mode::Recovery` build with Q < R
+  writes the write-once object `fence/<Q:020>` (`q`, `reach`, `created_ns`,
+  `app_id`, `restored_into`) via `put_if_absent` LAST, after the instance
+  directory is placed and under its lock; a fence that cannot be written
+  un-places the build and refuses. `Exists` is fine (several nodes restored at
+  one Q). A writer refuses a target holding any `fence/` object — checked
+  right after `open_or_create_tier` and on every listing — by name,
+  `backup_target_fenced` (`TierError::Fenced`, `reason="fenced"`), as a
+  stopping error, so its purge hold is released (R9a). Reads ignore fences:
+  `tier show` lists them, `tier verify` prints them as `info:` lines (not
+  findings), and restore/fork/export-corpus build from a fenced tier as
+  before. A restore at R writes no fence; a fork and an export-corpus never
+  do. The `fence/` directory is a new top-level name in §4.1's layout.
+- **RF2 — fill first, cap at the fillable chain end (§5.3/§5.4, final review
+  F2; refines R9a).** Writer B whose journal no longer reaches the chain end
+  (a learner joined below the floor, a released hold) starts a newer chain
+  at its set P > through_A, and P's chain becomes the tier's `through`. Before
+  RF2, writer A then extended from P, leaving `[e_A, P)` unfilled although
+  its journal held it, and its purge cap jumped to P so its node purged
+  exactly that span. As built: a writer looks for the lowest chain end e with
+  `first_base ≤ e < through` among its listing's sets (`fillable_gap`); while
+  one exists it picks/defers sets against e instead of `through`, cuts from e
+  with the next chain's set as the cut-to-set target (R9b, combined with any
+  held deferred set below it), and reports e — not `through` — as its
+  `progress`, the purge cap. Once the chains join, `through` applies again.
+  Accepted cost: the committed `oldest_set` (forward-only in the FSM) may
+  already have jumped to P and does not come back — an understatement of the
+  tier's reach, the safe direction; documented in the how-to.
+- **F3 — the stopped writer as a level.** `Uc2BackupWriterError` keys on
+  `increase(uc2_backup_errors_total[10m])` and goes quiet ~10 minutes after a
+  writer stops for good, while it stays stopped with its hold released. New
+  contract gauges `uc2_backup_writer_stopped` (0/1, the writer's `stopped`
+  flag; 0 on a node with no writer) and `uc2_backup_hold_released` (0/1, the
+  level behind the released-hold counter), and the rule
+  `Uc2BackupWriterStopped` (`uc2_backup_writer_stopped == 1`, `for: 1m`,
+  warning) with its `m10_alerts` scenario `backup_writer_stopped`. The
+  contract has 142 families. The stopping reasons are `foreign`,
+  `overlap_mismatch`, `fenced` (RF1) and `no_hardlinks`: a `hard_link`
+  failure with `EPERM`/`EXDEV`/`EOPNOTSUPP` means the target's filesystem
+  cannot hard-link and is named `target_no_hardlinks` (final review C5)
+  rather than retried as `unavailable` forever.
+- **F4 — one corrupt `SET` does not brick the tier (§4.5.2).** A `SET` label
+  that does not parse (or names another position than its directory) used to
+  fail `list_tier` outright, and with it the writer, retention and every
+  restore. As built the set is listed apart in `TierListing::corrupt_sets`,
+  is never a start, `tier verify` reports `tier_set_label_corrupt` naming
+  why, `tier show` marks it `CORRUPT`, and everything else lists on. The
+  writer counts a corrupt set as present (re-copying it would only meet the
+  unparsable label and stop as an overlap mismatch).
+- **C1, C2 — two small hardenings.** `FsTarget::put_if_absent` fsyncs the
+  parent directory chain before answering `Exists`, so a second writer never
+  advances its progress (and purge cap) on another writer's not-yet-durable
+  entry. The leader drops a report for an UNREGISTERED tier while
+  `MAX_BACKUP_TIERS` are held (it would apply as a `backup_tiers_full` no-op,
+  re-offered every 10 s forever), inside the existing out-of-line
+  `maybe_append_backup_watermark`.

@@ -607,9 +607,19 @@ uc2ctl tier restore --target /mnt/uc-backup --at Q \
     --instance-dir /srv/uc2/nN --confirm-cluster APP
 ```
 
-The same loss rule applies: every write committed after `Q` is gone. Then
-start the old service binary. The pin record is above `Q`, so the restored
-cluster is not pinned.
+Restore **every** member (learners and writers too) at the same `Q`, each
+into an empty instance directory (move the old one aside and keep it until
+the rollback is verified); see
+[Whole-cluster restore](back-up-to-a-tier.md#whole-cluster-restore). The same
+loss rule applies: every write committed after `Q` is gone, and
+`on_committed` runs again for the commands between the set and `Q`. This `Q`
+lies below the tier's reach, so the restore **fences** the tier
+(`fence/<Q>`): before you start the nodes, point every writer's `[backup]
+target` at a new, empty directory, or its writer stops with
+`backup_target_fenced`
+([After a restore below the reach](back-up-to-a-tier.md#after-a-restore-below-the-reach)).
+The old tier stays readable for another restore. Then start the old service
+binary. The pin record is above `Q`, so the restored cluster is not pinned.
 
 **Every write acknowledged since that backup is lost.** That is the whole
 reason step 1 is not optional, and why

@@ -173,7 +173,7 @@ compression_level = 3            # zstd level
 
 | key | default | rule |
 |---|---|---|
-| `target` | — | **required**; the tier's directory (a mounted path). Its `TIER` file names the cluster's `app_id`; a target naming another `app_id` is refused by name (`backup_target_foreign`) and nothing is written to it |
+| `target` | — | **required**; the tier's directory (a mounted path). Its `TIER` file names the cluster's `app_id`; a target naming another `app_id` is refused by name (`backup_target_foreign`) and nothing is written to it; so is a target a restore below its reach has fenced (`fence/<Q>`, `backup_target_fenced` — use a new, empty directory). Its filesystem must support hard links (`target_no_hardlinks` otherwise) |
 | `chunk_bytes` | `"64MiB"` | `<digits>[KiB\|MiB\|GiB]`, at least `1MiB`. A chunk may exceed it by one frame |
 | `quiet_interval` | `"60s"` | `<digits>(ms\|s\|m\|h)`, greater than zero. A quiet cut is skipped while the uncut history holds only the tier's own watermark records (otherwise an idle cluster would back up its own report every interval) |
 | `compression` | `"zstd"` | `"zstd"` or `"none"`: how THIS writer stores its tier objects; every reader handles both |

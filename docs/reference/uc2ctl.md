@@ -827,8 +827,10 @@ Reads a backup tier (the `[backup] target` path) and prints its `TIER`
 identity (`tier_id`, `app_id`, `created_ns`), every complete set (position,
 kind, time, row count, and how far its chain reaches), every set directory
 with no `SET` label (`INCOMPLETE` — an interrupted copy, never a restore
-start), every journal chunk `[from, to)`, the watermark (`oldest_set`,
-`newest_set`, `through`), and one `restorable: (a, b]` line per range a
+start), every set whose `SET` label does not parse (`CORRUPT`, never a
+restore start), every journal chunk `[from, to)`, the watermark
+(`oldest_set`, `newest_set`, `through`), one `fence: <Q>` line per restore
+fence (see [`tier restore`](#tier-restore)), and one `restorable: (a, b]` line per range a
 restore can be built in — a restore point `Q` is a frame end with
 `a < Q <= b`, never a set position itself. With `--instance-dir`, it also prints the committed backup
 watermarks that node's newest cluster artifact holds, marking the one that
@@ -844,12 +846,15 @@ uc2ctl tier verify --target <TIER> [--deep]
 Checks every chunk (header against name, block CRCs, a whole-frame walk to
 its end), byte equality wherever two chunks overlap, and every `SET`'s
 objects present at their stated raw sizes; a set directory without a `SET`
-label is reported `tier_set_incomplete`. `--deep` also re-hashes every
+label is reported `tier_set_incomplete`, and a `SET` label that does not
+parse (or names another position) `tier_set_label_corrupt`. `--deep` also re-hashes every
 artifact against its `SET` hash (a row's hash covers the payload after its
 24-byte envelope, whose position must equal the set's). Prints
 `tier verify: <sets> sets, <chunks> chunks, <n> findings`, then one
 `finding: …` line per finding, each naming the object; **exits 1 when there
-is any finding**, 0 when there is none. Read-only.
+is any finding**, 0 when there is none. A restore fence is printed as an
+`info: tier_fenced: …` line before the findings and is not a finding.
+Read-only.
 
 ### `tier restore`
 
@@ -887,6 +892,20 @@ Exactly one of:
   a live leader's lineage, so the node would be cut below its floor. Add a
   replacement node with a fresh, empty instance directory and the normal
   join (a snapshot session from its peers).
+
+**A restore below the reach fences the tier.** When `Q` lies below the
+tier's furthest reach, the restored cluster will write a history past `Q`
+that the tier's `(Q, reach]` does not hold. After `<DIR>` is placed, the
+builder writes the write-once object `fence/<Q>` (`q`, `reach`,
+`created_ns`, `app_id`, `restored_into`) to the tier and prints `fenced:
+fence/<Q> …`; a fence it cannot write removes the placed directory again and
+refuses. Every writer refuses a fenced target (`backup_target_fenced`,
+`uc2_backup_errors_total{reason="fenced"}`) and stops, so point every
+writer's `[backup] target` at a new, empty directory before starting the
+restored nodes. Reads (`tier show`/`verify`/`restore`/`fork`/`export-corpus`)
+ignore fences; restoring the other nodes at the same `Q` finds the fence
+already there. A restore at the reach writes none; `tier fork` and `tier
+export-corpus` never do.
 
 The builder holds `<DIR>`'s exclusive `instance.lock` for the whole build,
 as `force-single-member` does, so a node started there mid-build refuses.
@@ -940,9 +959,10 @@ membership changes answer `retry`. Grow the fork with
 [`add-learner`](#add-learner) and [`promote`](#promote).
 
 The fork inherits the source tier's watermark entry in its cluster state.
-That is cosmetic — the purge hold is local to a writer, and the fork has
-none until you configure one — and `uc2ctl tier forget --tier-id <id>` on
-the fork drops it.
+It does not hold a purge (the hold is local to a writer), but it **alerts**:
+nothing advances it on the fork, so `uc2_backup_lag_bytes` grows with every
+commit and `Uc2BackupBehind` fires past 256 MiB. Run `uc2ctl tier forget
+--tier-id <id>` on the fork once its first leader is up.
 
 Refusals, each by name, each building nothing — the `tier restore` list,
 plus:

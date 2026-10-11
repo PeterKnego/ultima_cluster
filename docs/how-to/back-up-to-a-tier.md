@@ -23,10 +23,20 @@ hold the journal it has not yet copied (see
 Several nodes may share one target. They write the same bytes, so a second
 writer is a spare, not a conflict. If two nodes disagree about an object
 already in the tier, the writer that sees it **stops** and raises an alert.
+If one writer falls behind and another, whose journal no longer reaches back
+that far, starts a newer chain, the writer that still holds the missing span
+fills it first, so the two chains join (and its node does not purge that
+span meanwhile). The committed `oldest_set` may already have moved to the
+newer chain's set and does not move back: it then understates how far back
+the tier reaches, never overstates it.
 
 The target is a directory path. It must be a mounted filesystem you trust to
 keep files (a network mount, an attached volume). The writer never rewrites
-an object it has written.
+an object it has written. **The filesystem must support hard links**: every
+object is placed with a hard link, which is what makes "write only if
+absent" atomic. SMB/CIFS and some FUSE mounts do not; on one, the writer
+stops with `uc2_backup_errors_total{reason="no_hardlinks"}`
+(`target_no_hardlinks` in its log).
 
 ## 2. Configure the writer
 
@@ -46,7 +56,7 @@ compression_level = 3       # zstd level, 1 to 19
 |---|---|---|
 | `target` | none (required) | The tier's root. First use creates the tier; later use checks it belongs to this cluster. |
 | `chunk_bytes` | `64MiB` | A chunk is cut when this much committed log is uncopied. Minimum `1MiB`. |
-| `quiet_interval` | `60s` | A chunk is also cut when any uncopied history is older than this. Must be above zero. |
+| `quiet_interval` | `60s` | A chunk is also cut when any uncopied history is older than this. Must be above zero. Units `ms`, `s`, `m`, `h`. |
 | `compression` | `"zstd"` | Compresses every object this writer writes, per 1 MiB block. Readers handle both. |
 | `compression_level` | `3` | zstd level, `1..=19`. |
 
@@ -62,9 +72,11 @@ A tier belongs to one cluster. If the target already holds a tier for another
 - **Sets.** Every coordinated snapshot set that the cluster agrees on. The
   writer checks its local files against the agreed hashes before copying. A
   set that does not match is skipped.
-- **Journal chunks.** The committed log, byte for byte. Padding frames are
-  the one exception: their bodies are zeroed, because padding bytes are not
-  replicated and each node's copy of them differs.
+- **Journal chunks.** The committed log, byte for byte, with two spans
+  zeroed: a padding frame's body, and every frame's alignment slack (the
+  bytes between a frame's length and its 32-byte-aligned end). Neither is
+  replicated content, so each node's copy of them differs; nothing reads
+  them.
 
 Snapshot instants decide where sets come from. If you have not set
 `snapshot_interval_bytes`, take instants yourself with `uc2ctl snapshot`
@@ -83,7 +95,11 @@ it. Both default to `0`, which means "keep everything".
 | Setting | Meaning |
 |---|---|
 | `backup_retain_sets` | Always keep at least this many of the newest complete sets. |
-| `backup_retain_age` | Always keep sets younger than this (`30d`, `12h`, `90m`, `600s`), measured back from the newest set's log time, not from now. |
+| `backup_retain_age` | Always keep sets younger than this (`30d`, `12h`, `90m`, `600s`), measured back from the newest set's log time, not from now. Units `s`, `m`, `h`, `d`. |
+
+The two duration keys take different units on purpose:
+`[backup] quiet_interval` is `ms|s|m|h` (it is short), `backup_retain_age` is
+`s|m|h|d` (it is long). Neither takes a fraction or a space.
 
 A set is deleted only when it falls outside **both** limits. The newest
 complete set is never deleted. A set that an unfinished upgrade pin needs as
@@ -117,8 +133,11 @@ uc2ctl tier show --target /mnt/uc-backup --instance-dir /srv/uc2/n0
 ```
 
 It prints the tier's id (as `0x…`) and `app_id`, every set (position, kind,
-time, rows), every chunk range, the watermark, and the **restorable
-range**, written `(S, reach]`. A restore point is a frame end `Q` with
+time, rows), every chunk range, the watermark, any **fence** (see
+[After a restore below the reach](#after-a-restore-below-the-reach)), and the
+**restorable range**, written `(S, reach]`. A set whose marker file does not
+parse is listed as `CORRUPT` and is never a restore start; the rest of the
+tier lists and restores as usual. A restore point is a frame end `Q` with
 `S < Q <= reach`. A set's own position is not a restore point: the restored
 journal would be empty. Take the next frame end after it.
 
@@ -139,19 +158,26 @@ other series carry the labels shown, or none.
 | `uc2_backup_oldest_set` | The oldest restorable set. |
 | `uc2_backup_lag_bytes` | Committed log the tier does not hold yet. Leader only. |
 | `uc2_backup_bytes_written_total{kind}` | Stored bytes this writer wrote, `set` or `journal`. |
-| `uc2_backup_errors_total{reason}` | `foreign`, `unavailable`, `overlap_mismatch`, `hash_mismatch`, `journal_unavailable`. |
+| `uc2_backup_errors_total{reason}` | `foreign`, `unavailable`, `overlap_mismatch`, `hash_mismatch`, `journal_unavailable`, `fenced`, `no_hardlinks`. |
+| `uc2_backup_writer_stopped` | `1` while this node's writer has stopped for good; `0` otherwise and on a node with no writer. |
+| `uc2_backup_hold_released` | `1` while low disk has this node's purge hold released. |
 | `uc2_backup_chain_gaps_total` | Times the tier's chain restarted from a later set. |
 | `uc2_backup_hold_released_total` | Times the writer let go of its purge hold for lack of disk. |
 | `uc2_backup_retention_deleted_total` | Objects this writer deleted from the tier, by `kind` (`set` or `chunk`). |
 
-Three alerts ship in `packaging/prometheus/uc2-alerts.yml`:
+Four alerts ship in `packaging/prometheus/uc2-alerts.yml`:
 
 - `Uc2BackupBehind`: the tier is over 256 MiB of committed log behind for 15
   minutes. An idle cluster does not trip it.
 - `Uc2BackupHoldReleased`: a writer node ran low on disk and let its tier
   fall behind its purge. The tier will have a gap.
-- `Uc2BackupWriterError`: the writer counted an error. `foreign` and
-  `overlap_mismatch` stop the writer for good.
+- `Uc2BackupWriterError`: the writer counted an error. `foreign`,
+  `overlap_mismatch`, `fenced` and `no_hardlinks` stop the writer for good.
+  This rule looks at the last 10 minutes only, so it goes quiet while the
+  writer stays stopped.
+- `Uc2BackupWriterStopped`: the writer has stopped for good and stays
+  stopped (`uc2_backup_writer_stopped == 1` for a minute). It keeps firing
+  until you fix the target and restart the node.
 
 What to do for each is in the
 [runbook](../ops/uc2-runbook.md#when-something-is-wrong).
@@ -165,7 +191,9 @@ uc2ctl tier verify --target /mnt/uc-backup --deep
 
 `verify` is offline. It checks each chunk's CRCs and frame walk, that
 overlapping chunks agree, and that every set's marker names files that are
-present at the stated size. It prints each finding and exits `1` on any.
+present at the stated size. It prints each finding and exits `1` on any. A
+marker that does not parse is the finding `tier_set_label_corrupt`. A fence
+is printed as an `info:` line, not a finding.
 `--deep` also re-hashes every artifact against its marker. Run `--deep` on a
 schedule and before you rely on a restore.
 
@@ -181,20 +209,62 @@ name until you remove what was half-placed.
 
 ### Whole-cluster restore
 
-```bash
-# stop every node first, then on EACH node, with the same --at:
-uc2ctl tier restore --target /mnt/uc-backup --at Q \
-    --instance-dir /srv/uc2/nN --confirm-cluster APP
-```
+Every member is restored: voters, learners and writers alike, all from the
+**same tier** with the **same `--at`**. A member started on its old data
+next to restored ones brings back the history you are discarding.
 
-Without `--at`, Q is the tier's furthest reach.
+1. Stop every service, then every node.
+2. On each node, move its old instance directory aside. Do not delete it
+   until the restored cluster has been verified; it is your way back. A
+   restore refuses a directory whose `journal/`, `state/` or `snapshots/` is
+   not empty.
+3. On each node, restore into the now-empty path:
+
+   ```bash
+   mv /srv/uc2/nN /srv/uc2/nN.before-restore
+   uc2ctl tier restore --target /mnt/uc-backup --at Q \
+       --instance-dir /srv/uc2/nN --confirm-cluster APP
+   ```
+
+   Without `--at`, Q is the tier's furthest reach. Pick Q once (`tier show`)
+   and pass it to every node: two members restored at different points
+   disagree about history.
+4. If Q lies below the tier's reach, point every writer's `[backup] target`
+   at a **new, empty** directory before you start it (see
+   [After a restore below the reach](#after-a-restore-below-the-reach)).
+5. Start every node, then attach services and clients.
 
 **The data-loss boundary: everything the cluster committed after Q is gone.**
 Typing the tier's `app_id` after `--confirm-cluster` is how you acknowledge
 that. Each node comes up with identical history and **no vote**, so the first
 election is ordinary. This is the same domain as
 [quorum-loss recovery](recover-from-quorum-loss.md), not the minority-restore
-rule. Start every node, then attach services and clients.
+rule.
+
+**Side effects replay.** A restored node's output progress is the start set
+S, not Q, so `on_committed` runs again for every command in `(S, Q]` — the
+usual at-least-once contract. Make side effects idempotent, or fork instead
+(a fork replays none).
+
+### After a restore below the reach
+
+A restore at a Q below the tier's reach rolls history back: the restored
+cluster writes a new history past Q, which the tier's `(Q, reach]` does not
+hold. If a writer kept the same target, it would append that new history to
+the old chain, and a later restore would build state that never existed.
+
+So such a restore leaves a **fence** in the tier, `fence/<Q>`, written after
+the instance directory is placed. A writer **refuses a fenced target**: it
+logs `backup_target_fenced`, counts
+`uc2_backup_errors_total{reason="fenced"}`, stops and holds nothing
+(`Uc2BackupWriterStopped`). Point every writer at a new, empty directory;
+the new tier starts with the first set the restored cluster agrees on.
+
+The old tier stays readable: `tier show` lists the fence, `tier verify`
+prints it as `info`, and you can restore from it again (any Q it still
+covers). Restoring several nodes at the same Q writes one fence. A restore at
+the reach writes none, because the history continues unchanged; a fork never
+writes one.
 
 ### Fork
 
@@ -213,9 +283,13 @@ uc2ctl tier fork --target /mnt/uc-backup --at Q \
 - **A fork never replays outputs.** Its output progress starts at Q, so no
   side effect at or below Q (no email sent, no call made) happens again.
   Anything the service does from Q on is new work in a new cluster.
-- The fork carries the source tier's watermark entry in its cluster state.
-  It is cosmetic and the fork never writes to that tier. Drop it with
-  `uc2ctl tier forget --tier-id 0x…` if it clutters `tier show`.
+- The fork carries the source tier's watermark entry in its cluster state,
+  and that entry **alerts**: nothing advances it on the fork, so
+  `uc2_backup_lag_bytes` grows with every commit and `Uc2BackupBehind` fires
+  once it passes 256 MiB. Run `uc2ctl tier forget --tier-id 0x…` on the fork
+  right after its first leader is up. The same holds for a whole-cluster
+  restore whose writers moved to a new target: forget the old tier's id
+  once the new one reports.
 - Right after boot, membership changes answer `retry` until the fork's first
   config commits. Retry after a moment.
 
@@ -245,8 +319,9 @@ journal the tier does not yet hold. Three consequences:
 - If the writer's disk runs low, it lets go of the hold and purges anyway
   (`Uc2BackupHoldReleased`). The tier then has a gap and restores to points
   inside it are no longer possible.
-- A writer that has stopped (a foreign target, a mismatch) releases its hold
-  at once. Fix the cause and restart the node.
+- A writer that has stopped (a foreign or fenced target, a mismatch, a
+  filesystem without hard links) releases its hold at once. Fix the cause
+  and restart the node.
 
 ## What the tier does not do yet
 

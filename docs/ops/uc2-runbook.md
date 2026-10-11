@@ -366,7 +366,10 @@ transport setting, both measured closed-loop at inflight 1 on 8-vCPU
   `uc2_backup_errors_total{reason}` and its `uc2-backup` log lines: an
   unreachable or full target is `unavailable`, a journal it cannot read is
   `journal_unavailable`. If no node runs a writer for that tier, nothing
-  advances it — start one or `uc2ctl tier forget` the tier.
+  advances it — start one or `uc2ctl tier forget` the tier. **On a fork, or a
+  cluster restored from the tier whose writers moved to a new target**, the
+  inherited entry for the old tier is never advanced and this alert fires by
+  design: `uc2ctl tier forget --tier-id 0x…` that old id.
 - **`Uc2BackupHoldReleased` fires.** A writer node ran low on disk and let go
   of the journal it was holding for its tier (`backup_hold_released` in its
   log), so ordinary purging resumed and the tier will have a hole. Free disk
@@ -385,7 +388,29 @@ transport setting, both measured closed-loop at inflight 1 on 8-vCPU
   `journal_unavailable`: this node's own journal could not supply a range
   (read error, or purged under the cut); retried. `hash_mismatch`: a local
   snapshot set does not match the catalog's agreed hashes, so it was skipped —
-  run `uc2ctl upgrade show` and treat it as a divergent replica.
+  run `uc2ctl upgrade show` and treat it as a divergent replica. `fenced`: a
+  restore rolled this target's history back (`fence/<Q>`; `tier show` lists
+  it) — STOPPED; point `[backup] target` at a NEW, empty directory and
+  restart the node (never delete the fence to reuse the old tier: its
+  history past Q is not this cluster's). `no_hardlinks`: the target's
+  filesystem cannot hard-link (SMB/CIFS, some FUSE mounts) — STOPPED; move
+  the target to a filesystem that can. This alert looks back 10 minutes;
+  a stopped writer keeps `Uc2BackupWriterStopped` firing.
+- **`Uc2BackupWriterStopped` fires.** `uc2_backup_writer_stopped == 1`: the
+  node's writer refused its target for good (`foreign`, `overlap_mismatch`,
+  `fenced` or `no_hardlinks` — the errors counter and the
+  `backup_writer_stopped` log line say which) and holds nothing, so the node
+  purges as if it had no writer and the tier falls behind. Act on the reason
+  as under `Uc2BackupWriterError`, then restart the node; the gauge clears on
+  restart.
+- **After a whole-cluster restore from a tier** (`uc2ctl tier restore` on
+  every member, same `--at Q`, each into an empty instance dir — keep the
+  moved-aside originals until the restored cluster is verified). If `Q` was
+  below the tier's reach, the restore fenced the tier: before starting the
+  nodes, point every writer's `[backup] target` at a new, empty directory.
+  Once the new tier reports, `uc2ctl tier forget` the old tier's id, or
+  `Uc2BackupBehind` fires on it. `on_committed` runs again for the commands
+  between the start set and `Q` (at-least-once).
 
 - **A node refuses to start with `cluster_artifact_corrupt`** (2.11.0).
   The `uc2-cluster` agent found its newest `snapshots/cluster/snap-<pos>.ultcluster`

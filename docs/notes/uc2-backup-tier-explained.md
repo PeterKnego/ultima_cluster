@@ -31,11 +31,15 @@ sets/<P>/row-<id>.ultsnap    one snapshot artifact per row at position P
 sets/<P>/cluster.ultcluster  the cluster's own state at P
 sets/<P>/SET                 written last; names the files above
 journal/<from>-<to>.ultj     committed log bytes from..to
+fence/<Q>                    a restore rolled the history back to Q
 ```
 
 `SET` goes in last. A set without it is not a set. A reader that finds `SET`
 can rely on every file it names being there. That is how a crash halfway
-through a copy, or a deletion halfway through, never shows as a good set.
+through a copy, or a deletion halfway through, never shows as a good set. A
+`SET` that exists but does not parse marks its set corrupt: it is listed
+apart and never used as a start, and the rest of the tier stays usable. One
+bad object must not take every other set down with it.
 
 Objects are split into 1 MiB blocks. Each block has its length and a CRC of
 its raw bytes, and zstd compresses the block. The check is on the raw bytes,
@@ -60,6 +64,15 @@ If the tier lacks a stretch of log (the writer's node purged it before the
 copy), the chain breaks. The tier starts a new chain from a later set. The old
 reach stays where it was, and `uc2_backup_chain_gaps_total` counts the break.
 
+A newer chain can also appear while some writer still holds the missing
+stretch: one writer lags, and another, whose journal starts later (a learner
+that joined from a snapshot), starts a chain at its own set. The lagging
+writer then fills the gap first, cutting toward the newer chain's set until
+the two join, and until they do it holds its node's purge at its own chain
+end, not at the newer chain's end. Otherwise it would extend from the newer
+chain's end, and its node would purge exactly the stretch only it could
+still copy.
+
 ## The watermark
 
 The writer tells the cluster how far the tier reaches, and the leader commits
@@ -70,9 +83,11 @@ backed up?" the same way, and `uc2_backup_through` agrees on all of them.
 A tier can have several writers. They each report. The cluster keeps the
 furthest claim for each field, and the oldest never passes the newest.
 
-The watermark is also what the purge hold reads. The writer's node holds its
-own purge back to the end of the chain it last confirmed, using its own
-record, which is current. The replicated one lags.
+The purge hold does not read the committed watermark. The writer's node
+holds its own purge back to the end of the chain the writer last confirmed in
+its own listing of the tier, which is current; the replicated watermark lags.
+While a gap it can fill lies below the tier's reach, that end is the lower
+chain's end.
 
 ## Restore
 
@@ -87,6 +102,15 @@ gone.
 A fork is the same build, with two differences: its output progress is
 set to Q, so side effects at or below Q do not happen again, and the result
 is cut down to one voter under a new `app_id`.
+
+A restore below the reach is a rollback. The restored cluster writes a new
+history past Q, and the tier's `(Q, reach]` holds the old one. Every later
+check — set hashes, CRCs, overlap compares — looks only at what is in the
+tier, so a writer that kept appending would mix the two histories without
+any check noticing, and a later restore would build state that never
+existed. So the restore leaves a fence, `fence/<Q>`, and every writer
+refuses a fenced target by name. Writers move to a new, empty target; the
+fenced tier stays readable for further restores.
 
 ## What we learned building it
 
@@ -120,10 +144,12 @@ unfinished upgrade pin. A node whose view had not yet seen the pin would not
 protect it. So retention runs only once the writer's view has consumed past the
 tier's newest set.
 
-**Byte-exact, except for padding.** Chunks copy the journal exactly. Padding is
-the one exception, because it travels as a header with no body: each node
-fills the gap with whatever its own buffer held. Two writers on one tier would
-fail the overlap check over bytes that mean nothing. So padding bodies are
+**Byte-exact, except for bytes nothing reads.** Chunks copy the journal
+exactly, with two exceptions. A padding frame travels as a header with no
+body, so each node fills the body with whatever its own buffer held. And
+every frame is padded to a 32-byte boundary; those alignment bytes are not
+replicated either. Two writers on one tier would fail the overlap check over
+bytes that mean nothing. So padding bodies and alignment slack are both
 zeroed.
 
 **Say what is not done.** A replacement node seeded from the tier looks easy
