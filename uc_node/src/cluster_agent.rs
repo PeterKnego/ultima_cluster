@@ -41,6 +41,7 @@ use uc_log::archive::replay_journal_from;
 use uc_log::buffer::LogBuffer;
 use uc_log::cnc::CncPage;
 use uc_log::reader::{Batch, LogFollower};
+use uc_protocol::v2::backup::{BackupTierEntry, WatermarkOp, decode_backup_watermark};
 use uc_protocol::v2::catalog::SetEntry;
 use uc_protocol::v2::cnc::NODE_FLAG_LEARNER;
 use uc_protocol::v2::frame::{
@@ -179,6 +180,25 @@ pub fn read_committed_catalog(instance_dir: &Path) -> io::Result<(u64, Vec<SetEn
     let (fsm, _) = recover(&snapshot_dir_of(instance_dir), genesis, Vec::new())?;
     let st = fsm.state();
     Ok((st.applied, st.catalog.clone(), st.declared_mask()))
+}
+
+/// Backup-tier spec §6.1: the registered backup tiers' committed
+/// watermarks in this instance directory's newest cluster artifact, with the
+/// artifact's position — `read_committed_settings`'s contract and its
+/// staleness caveat, verbatim (`None` when there is no artifact yet).
+pub fn read_committed_backups(
+    instance_dir: &Path,
+) -> io::Result<Option<(u64, Vec<BackupTierEntry>)>> {
+    let (fsm, start) = recover(
+        &snapshot_dir_of(instance_dir),
+        ClusterState::genesis_empty(),
+        Vec::new(),
+    )?;
+    if start == 0 {
+        return Ok(None);
+    }
+    let st = fsm.state();
+    Ok(Some((st.applied, st.backups.clone())))
 }
 
 /// Recovery (spec §4.7): the newest `snap-*.ultcluster` under `dir`, or
@@ -429,19 +449,29 @@ impl ClusterAgent {
         }
     }
 
-    /// Plan B1: name what an ACCEPTED pin, report or (#33) row-genesis
-    /// record did, at the time it did it. `row` is the payload's first byte,
-    /// the same for all three kinds.
+    /// Plan B1: name what an ACCEPTED pin, report, (#33) row-genesis or
+    /// (backup tier) watermark record did, at the time it did it. `body` is
+    /// the whole CLUSTER body (prefix and payload); `row` is the payload's
+    /// first byte, the same for the first three kinds.
     /// A report's verdict is recomputed here from FSM state, not stored.
+    ///
+    /// A watermark's outcome is read back off the state the same way, with
+    /// no extra plumbing out of `apply`: positions are unique per frame, so
+    /// the tier's entry carries `updated_pos == position` exactly when THIS
+    /// report moved it. Otherwise the report was stale (the tier is
+    /// registered) or the cluster was full (it is not). Both are logged, not
+    /// counted — there is no metric for them yet.
     ///
     /// Takes `fsm` rather than `&self` — same reason as
     /// [`Self::freeze_and_write`]: `do_work`'s call site is inside the
     /// `Batch::Frames` loop, where `iter` already holds a borrow of
     /// `self.follower`, so a whole-`self` receiver here would conflict.
-    fn note_applied(fsm: &ClusterFsm, kind: u8, row: u8, accepted: bool, position: u64) {
+    fn note_applied(fsm: &ClusterFsm, body: &[u8], accepted: bool, position: u64) {
         if !accepted {
             return;
         }
+        let kind = body.first().copied().unwrap_or(0);
+        let row = body.get(CLUSTER_BODY_PREFIX_LEN).copied().unwrap_or(0);
         let st = fsm.state();
         match ClusterKind::from_u8(kind) {
             Some(ClusterKind::UpgradePin) => {
@@ -495,6 +525,47 @@ impl ClusterAgent {
                             majority_hash = v.majority_hash.unwrap_or(0)
                         );
                     }
+                }
+            }
+            Some(ClusterKind::BackupWatermark) => {
+                // Accepted, so the payload decoded in `apply`.
+                let Some(w) = body
+                    .get(CLUSTER_BODY_PREFIX_LEN..)
+                    .and_then(decode_backup_watermark)
+                else {
+                    return;
+                };
+                match (w.op, st.backup_for(w.tier_id)) {
+                    (WatermarkOp::Forget, _) => crate::obs_event!(
+                        Info,
+                        "backup_tier_forgotten",
+                        position = position,
+                        tier = w.tier_id
+                    ),
+                    (WatermarkOp::Report, Some(e)) if e.updated_pos == position => {
+                        crate::obs_event!(
+                            Info,
+                            "backup_watermark_applied",
+                            position = position,
+                            tier = e.tier_id,
+                            through = e.through
+                        )
+                    }
+                    (WatermarkOp::Report, Some(e)) => crate::obs_event!(
+                        Info,
+                        "backup_report_stale",
+                        position = position,
+                        tier = w.tier_id,
+                        through = w.through,
+                        held_through = e.through
+                    ),
+                    (WatermarkOp::Report, None) => crate::obs_event!(
+                        Warn,
+                        "backup_tiers_full",
+                        position = position,
+                        tier = w.tier_id,
+                        registered = st.backups.len() as u64
+                    ),
                 }
             }
             _ => {}
@@ -664,13 +735,7 @@ impl ClusterAgent {
                             accepted = accepted as u64,
                             reason = self.out.first().copied().unwrap_or(0) as u64
                         );
-                        Self::note_applied(
-                            &self.fsm,
-                            payload.first().copied().unwrap_or(0),
-                            payload.get(CLUSTER_BODY_PREFIX_LEN).copied().unwrap_or(0),
-                            accepted,
-                            end,
-                        );
+                        Self::note_applied(&self.fsm, payload, accepted, end);
                         applied_any = true;
                     }
                 }
@@ -931,16 +996,7 @@ impl ClusterAgent {
                             .with_term(rf.header.leadership_term_id);
                         self.fsm.apply(&mut ctx, &rf.payload, &mut self.out);
                         let accepted = self.out.first() == Some(&0);
-                        Self::note_applied(
-                            &self.fsm,
-                            rf.payload.first().copied().unwrap_or(0),
-                            rf.payload
-                                .get(CLUSTER_BODY_PREFIX_LEN)
-                                .copied()
-                                .unwrap_or(0),
-                            accepted,
-                            end,
-                        );
+                        Self::note_applied(&self.fsm, &rf.payload, accepted, end);
                         applied_any = true;
                         frames += 1;
                     }
@@ -1196,6 +1252,7 @@ mod tests {
             reports: vec![],
             running: [None; uc_protocol::v2::cnc::CNC_MAX_SERVICES],
             catalog: Vec::new(),
+            backups: Vec::new(),
         }
     }
 
@@ -1441,6 +1498,51 @@ mod tests {
         // running list rides the same reader.
         assert_eq!(running[1].map(|r| r.version), Some(6));
         assert_eq!(running[0], None);
+    }
+
+    #[test]
+    fn read_committed_backups_reads_the_artifact_or_says_none() {
+        use uc_protocol::v2::backup::{BackupWatermark, WatermarkOp, encode_backup_watermark};
+        let report = |tier: u64, through: u64| {
+            let mut b = Vec::new();
+            encode_backup_watermark(
+                &BackupWatermark {
+                    op: WatermarkOp::Report,
+                    tier_id: tier,
+                    oldest_set: 64,
+                    newest_set: 128,
+                    through,
+                    reporter: 2,
+                },
+                &mut b,
+            );
+            b
+        };
+        let (buffer, cnc, dir) = world();
+        assert!(read_committed_backups(dir.path()).unwrap().is_none());
+        let mut app = buffer.appender_for_test(0);
+        app.set_now(1);
+        let e1 = app
+            .append_cluster(1, ClusterKind::BackupWatermark, &report(7, 4096))
+            .unwrap();
+        // Stale: accepted, changes nothing (logged `backup_report_stale`).
+        let end = app
+            .append_cluster(1, ClusterKind::BackupWatermark, &report(7, 2048))
+            .unwrap();
+        cnc.counters().durable.store_release(end);
+        cnc.counters().commit.store_release(end);
+        let (mut agent, view) = agent_over(&buffer, &cnc, dir.path());
+        assert!(agent.do_work());
+        assert_eq!(view.backups().len(), 1);
+        let p = agent.take_snapshot().unwrap();
+        let (pos, tiers) = read_committed_backups(dir.path()).unwrap().unwrap();
+        assert_eq!(pos, p);
+        assert_eq!(tiers.len(), 1);
+        assert_eq!(
+            (tiers[0].tier_id, tiers[0].through, tiers[0].updated_pos),
+            (7, 4096, e1)
+        );
+        assert_eq!(tiers, view.backups());
     }
 
     #[test]

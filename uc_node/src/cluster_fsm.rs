@@ -13,6 +13,10 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering};
 
 use uc_consensus::config::{ClusterConfig, ProposeError};
+use uc_protocol::v2::backup::{
+    BackupTierEntry, BackupWatermark, MAX_BACKUP_TIERS, WatermarkOp, decode_backup_list,
+    decode_backup_watermark, encode_backup_list, encode_backup_watermark,
+};
 use uc_protocol::v2::catalog::{
     CLUSTER_ROW, MAX_CATALOG_SETS, MAX_RETAIN_SETS, RowEntry, RowVerdict, SetEntry, SetKind,
     SetState, decode_set_list, encode_set_list,
@@ -45,12 +49,14 @@ use crate::node::{cluster_to_wire, wire_to_cluster_config};
 /// directly; re-exported here under their original names since nothing in
 /// this crate's public surface should have to change to follow the move. See
 /// [`uc_protocol::v2::cluster_image::CLUSTER_IMAGE_VERSION`] for the layout
-/// history: the image is now version `4` (#33 added the trailing per-row
+/// history: the image is now version `6` (#33 added the trailing per-row
 /// `running` blob in v3; the snapshot catalog added the trailing `catalog`
-/// blob in v4), and versions `1`–`3` are still read — a pre-#33 image
-/// migrates each pinned row's running version from its newest pin
-/// (`install_snapshot`, #33 spec §5.3), and a pre-catalog image installs
-/// with an EMPTY catalog (catalog spec §4.5's `Empty` state).
+/// blob in v4; v5 sized the report and catalog entries; the backup tier
+/// added the trailing `backups` blob in v6), and versions `1`–`5` are still
+/// read — a pre-#33 image migrates each pinned row's running version from
+/// its newest pin (`install_snapshot`, #33 spec §5.3), a pre-catalog image
+/// installs with an EMPTY catalog (catalog spec §4.5's `Empty` state), and a
+/// pre-backup-tier image installs with NO registered tier.
 pub use uc_protocol::v2::cluster_image::{CLUSTER_IMAGE_MAGIC, CLUSTER_IMAGE_VERSION};
 
 /// The staged table file an admin client writes under the instance directory
@@ -153,6 +159,12 @@ pub struct ClusterState {
     /// `cluster`), and trimmed by [`Self::retire`]. Empty at genesis and
     /// after installing a v1–v3 image: the `Empty` state (§4.5).
     pub catalog: Vec<SetEntry>,
+    /// Backup-tier spec §6.1: each registered backup tier's committed
+    /// watermark, in first-report order, at most [`MAX_BACKUP_TIERS`] —
+    /// fed by `BackupWatermark` reports ([`Self::put_backup_watermark`]) and
+    /// trimmed only by an operator's `Forget`. Empty at genesis and after
+    /// installing a v1–v5 image.
+    pub backups: Vec<BackupTierEntry>,
 }
 
 impl ClusterState {
@@ -184,7 +196,50 @@ impl ClusterState {
             reports: Vec::new(),
             running: [None; CNC_MAX_SERVICES],
             catalog: Vec::new(),
+            backups: Vec::new(),
         }
+    }
+
+    /// Backup-tier spec §6.1: fold one tier's `Report` into its entry. Every
+    /// rule is a function of the held entry and the record alone, so every
+    /// replica lands on the same entry:
+    ///
+    /// - a known tier whose report is behind (`w.through < through`) is
+    ///   STALE: nothing changes (the apply still answers `0` — stale news is
+    ///   not a refusal);
+    /// - otherwise `through` and `newest_set` move forward only, `oldest_set`
+    ///   moves forward but never above the (new) `newest_set`, and `reporter`
+    ///   / `updated_pos` name this record;
+    /// - an unknown tier is inserted while fewer than [`MAX_BACKUP_TIERS`]
+    ///   are registered, and otherwise ignored (the cluster is FULL).
+    ///
+    /// A `Forget` is not handled here — `apply` removes the entry.
+    pub fn put_backup_watermark(&mut self, w: &BackupWatermark, position: u64) {
+        if let Some(e) = self.backups.iter_mut().find(|e| e.tier_id == w.tier_id) {
+            if w.through < e.through {
+                return;
+            }
+            let newest = e.newest_set.max(w.newest_set);
+            e.oldest_set = e.oldest_set.max(w.oldest_set).min(newest);
+            e.newest_set = newest;
+            e.through = w.through;
+            e.reporter = w.reporter;
+            e.updated_pos = position;
+        } else if self.backups.len() < MAX_BACKUP_TIERS {
+            self.backups.push(BackupTierEntry {
+                tier_id: w.tier_id,
+                oldest_set: w.oldest_set.min(w.newest_set),
+                newest_set: w.newest_set,
+                through: w.through,
+                reporter: w.reporter,
+                updated_pos: position,
+            });
+        }
+    }
+
+    /// The registered tier's committed watermark, if any.
+    pub fn backup_for(&self, tier_id: u64) -> Option<&BackupTierEntry> {
+        self.backups.iter().find(|e| e.tier_id == tier_id)
     }
 
     /// #33: the row's running version, if one has been recorded. An
@@ -498,6 +553,9 @@ pub enum ClusterCommand {
     /// #33 spec §4.1 / §6.1: the leader's own attached version for a row
     /// with no running version yet — a recorded fact, never a change.
     RowGenesis(RowGenesis),
+    /// Backup-tier spec §6.1: a tier's watermark report, or an operator's
+    /// `Forget` of a registered tier.
+    BackupWatermark(BackupWatermark),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -513,6 +571,8 @@ pub enum ClusterRefusal {
     ReportStale,
     /// #33: a `RowGenesis` for a row that already has a running version.
     VersionAlreadySet,
+    /// Backup-tier spec §6.1: a `Forget` naming no registered tier.
+    TierUnknown,
 }
 
 impl ClusterRefusal {
@@ -521,7 +581,8 @@ impl ClusterRefusal {
     /// The pin/report codes are the 52–59 band, plan B1; 52/54/56–58 are
     /// door-only and live in `uc_node::node`, so they never appear here.
     /// 60 (#33) is `version_already_set`, a `RowGenesis` for a row that
-    /// already runs a recorded version.
+    /// already runs a recorded version. 62 (backup tier) is `tier_unknown`,
+    /// a `Forget` naming no registered tier.
     pub fn reason_code(&self) -> u32 {
         match self {
             ClusterRefusal::Membership(e) => ClusterConfig::reason_code(e),
@@ -532,6 +593,7 @@ impl ClusterRefusal {
             ClusterRefusal::PinNotMonotone => 55,
             ClusterRefusal::ReportStale => 59,
             ClusterRefusal::VersionAlreadySet => 60,
+            ClusterRefusal::TierUnknown => 62,
         }
     }
 }
@@ -747,6 +809,15 @@ impl ClusterFsm {
                 }
                 Ok(())
             }
+            ClusterCommand::BackupWatermark(w) => {
+                // Backup-tier spec §6.1: only a `Forget` can be refused — a
+                // stale or tier-full `Report` is accepted and changes
+                // nothing (`ClusterState::put_backup_watermark`).
+                if w.op == WatermarkOp::Forget && self.state.backup_for(w.tier_id).is_none() {
+                    return Err(ClusterRefusal::TierUnknown);
+                }
+                Ok(())
+            }
         }
     }
 
@@ -764,8 +835,9 @@ impl ClusterFsm {
                 ClusterCommand::SnapshotReport(decode_snapshot_report(payload)?)
             }
             ClusterKind::RowGenesis => ClusterCommand::RowGenesis(decode_row_genesis(payload)?),
-            // Task 5 wires the FSM; until then kind 7 is undecodable (verdict 42).
-            ClusterKind::BackupWatermark => return None,
+            ClusterKind::BackupWatermark => {
+                ClusterCommand::BackupWatermark(decode_backup_watermark(payload)?)
+            }
         })
     }
 
@@ -801,6 +873,10 @@ impl ClusterFsm {
             ClusterCommand::RowGenesis(g) => {
                 encode_row_genesis(g, out);
                 ClusterKind::RowGenesis
+            }
+            ClusterCommand::BackupWatermark(w) => {
+                encode_backup_watermark(w, out);
+                ClusterKind::BackupWatermark
             }
         }
     }
@@ -874,6 +950,11 @@ impl RawStateMachine for ClusterFsm {
                     record_pos: ctx.position,
                 });
             }
+            ClusterCommand::BackupWatermark(w) => match w.op {
+                WatermarkOp::Report => self.state.put_backup_watermark(&w, ctx.position),
+                // `validate_replicated` refused an unknown tier above.
+                WatermarkOp::Forget => self.state.backups.retain(|e| e.tier_id != w.tier_id),
+            },
         }
         out.push(0);
     }
@@ -893,6 +974,8 @@ impl RawStateMachine for ClusterFsm {
             }
             // #33: the running list, one entry per recorded row, row order.
             Some(6) => encode_running_list(&self.running_list(), out),
+            // Backup tier: the registered tiers' committed watermarks.
+            Some(7) => encode_backup_list(&self.state.backups, out),
             _ => {}
         }
     }
@@ -912,8 +995,10 @@ impl RawStateMachine for ClusterFsm {
 /// pins (u32 len ‖ `encode_pin_list`) ‖ reports (u32 len ‖
 /// `encode_report_list`) ‖ running (u32 len ‖ `encode_running_list`, #33,
 /// layout **v3**) ‖ catalog (u32 len ‖ `encode_set_list`, the snapshot
-/// catalog, layout **v4**; empty for an `Empty` catalog) ‖ crc32 of
-/// everything before it. The pin and report blobs are
+/// catalog, layout **v4**; empty for an `Empty` catalog) ‖ backups (u32 len
+/// ‖ `encode_backup_list`, the registered backup tiers, layout **v6**; empty
+/// when none is registered) ‖ crc32 of everything before it. (Layout **v5**
+/// changed no framing: it sized the report and catalog entries.) The pin and report blobs are
 /// image layout **v2** (plan B1): a v1 image — one a `2.12.0` node wrote
 /// before this release, which a restarting node still reads off its own
 /// disk — carries neither and installs with both histories EMPTY, the same
@@ -950,6 +1035,11 @@ impl SnapshotStateMachine for ClusterFsm {
                 SnapshotError::Codec("cluster image: catalog exceeds MAX_CATALOG_SETS".into())
             })?;
         }
+        // Like the catalog, NO tier is an empty blob, not a zero-count list.
+        let mut backups = Vec::new();
+        if !self.state.backups.is_empty() {
+            encode_backup_list(&self.state.backups, &mut backups);
+        }
         let mut img = Vec::new();
         encode_cluster_image(
             &ClusterImageParts {
@@ -963,6 +1053,7 @@ impl SnapshotStateMachine for ClusterFsm {
                 reports: &reports,
                 running: &running,
                 catalog: &catalog,
+                backups: &backups,
             },
             &mut img,
         )
@@ -1085,6 +1176,13 @@ impl SnapshotStateMachine for ClusterFsm {
         if catalog.windows(2).any(|w| w[0].position >= w[1].position) {
             return Err(bad("cluster image: catalog out of order"));
         }
+        // Empty for a v1–v5 image: no tier registered. The list decoder
+        // enforces `count <= MAX_BACKUP_TIERS` and unique tier ids.
+        let backups = if parts.backups.is_empty() {
+            Vec::new()
+        } else {
+            decode_backup_list(parts.backups).ok_or_else(|| bad("cluster image: backups"))?
+        };
         self.state = ClusterState {
             membership,
             table,
@@ -1096,6 +1194,7 @@ impl SnapshotStateMachine for ClusterFsm {
             reports,
             running,
             catalog,
+            backups,
         };
         Ok(parts.applied)
     }
@@ -1212,6 +1311,10 @@ pub struct ClusterViewInner {
     /// query module and the node's floor reader take it with the rest of
     /// the structured state.
     pub catalog: Vec<SetEntry>,
+    /// Backup-tier spec §6.1: the registered tiers' committed watermarks,
+    /// under the same lock — the `Forget` door validates against
+    /// [`ClusterView::to_state`], which must carry them.
+    pub backups: Vec<BackupTierEntry>,
 }
 
 impl ClusterViewInner {
@@ -1288,6 +1391,7 @@ impl ClusterView {
                 reports: genesis.reports.clone(),
                 running: genesis.running,
                 catalog: genesis.catalog.clone(),
+                backups: genesis.backups.clone(),
             }),
         };
         v.publish(genesis);
@@ -1307,6 +1411,7 @@ impl ClusterView {
             g.reports.clone_from(&st.reports);
             g.running = st.running;
             g.catalog.clone_from(&st.catalog);
+            g.backups.clone_from(&st.backups);
         }
         // `CNC_MAX_SERVICES == 8` rows, so the mask fits a byte.
         self.versioned
@@ -1395,6 +1500,13 @@ impl ClusterView {
             .flatten()
     }
 
+    /// Backup tier: the registered tiers' committed watermarks, under the
+    /// inner lock — a clone of one small list (at most [`MAX_BACKUP_TIERS`]
+    /// entries) rather than a whole [`Self::snapshot_inner`].
+    pub fn backups(&self) -> Vec<BackupTierEntry> {
+        self.inner.lock().unwrap().backups.clone()
+    }
+
     pub fn snapshot_inner(&self) -> ClusterViewInner {
         self.inner.lock().unwrap().clone()
     }
@@ -1477,6 +1589,7 @@ impl ClusterView {
             reports: inner.reports,
             running: inner.running,
             catalog: inner.catalog,
+            backups: inner.backups,
         }
     }
     pub fn membership(&self) -> ClusterConfig {
@@ -1515,6 +1628,7 @@ mod tests {
             reports: vec![],
             running: [None; CNC_MAX_SERVICES],
             catalog: vec![],
+            backups: vec![],
         }
     }
     /// `Addr = (ip: u32 network-order, port: u16)` — the same encoding
@@ -2273,13 +2387,17 @@ mod tests {
                 reports: &[],
                 running: &[],
                 catalog: &[],
+                backups: &[],
             },
             &mut img,
         )
         .unwrap();
-        // Strip the CRC, the empty catalog blob's zero length prefix (v4)
-        // and the empty running blob's zero length prefix.
+        // Strip the CRC, the empty backups blob's zero length prefix (v6),
+        // the empty catalog blob's zero length prefix (v4) and the empty
+        // running blob's zero length prefix.
         img.truncate(img.len() - 4);
+        let backups_prefix = img.split_off(img.len() - 4);
+        assert_eq!(backups_prefix, 0u32.to_le_bytes(), "empty backups blob");
         let catalog_prefix = img.split_off(img.len() - 4);
         assert_eq!(catalog_prefix, 0u32.to_le_bytes(), "empty catalog blob");
         let prefix = img.split_off(img.len() - 4);
@@ -2811,7 +2929,10 @@ mod tests {
         f.set_consumed(300);
         let (img, _) = f.freeze().unwrap();
         let body_end = img.len() - 4;
-        let mut v3 = img[..body_end - 4].to_vec(); // drop the 4-byte empty-catalog length prefix
+        // Drop the 4-byte empty-backups (v6) and empty-catalog (v4) length
+        // prefixes.
+        assert_eq!(&img[body_end - 8..body_end], &[0u8; 8]);
+        let mut v3 = img[..body_end - 8].to_vec();
         v3[8..12].copy_from_slice(&3u32.to_le_bytes());
         let crc = crc32fast::hash(&v3);
         v3.extend_from_slice(&crc.to_le_bytes());
@@ -2915,12 +3036,13 @@ mod tests {
         f.on_snapshot_frame(2000, true, 2);
         f.set_consumed(3000);
         let (img, _) = f.freeze().unwrap();
-        // The catalog blob is the image's tail before the CRC:
-        // count u16 ‖ 2 × SET_ENTRY_LEN.
+        // The catalog blob ends just before the (empty, v6) backups blob's
+        // 4-byte zero length prefix and the CRC: count u16 ‖ 2 × SET_ENTRY_LEN.
         use uc_protocol::v2::catalog::SET_ENTRY_LEN;
-        let body_end = img.len() - 4;
+        assert_eq!(&img[img.len() - 8..img.len() - 4], &0u32.to_le_bytes());
+        let body_end = img.len() - 8;
         let first = body_end - 2 * SET_ENTRY_LEN;
-        let mut bad = img[..body_end].to_vec();
+        let mut bad = img[..img.len() - 4].to_vec();
         let a = bad[first..first + SET_ENTRY_LEN].to_vec();
         let b = bad[first + SET_ENTRY_LEN..body_end].to_vec();
         bad[first..first + SET_ENTRY_LEN].copy_from_slice(&b);
@@ -3233,9 +3355,9 @@ mod tests {
 
     /// A REAL pre-flag-day (layout v3) image of `f`'s state whose settings
     /// tail is the 33 B **v2** record a `0.10.0` node wrote — not a v3 record
-    /// inside a v3 image. Provenance: `f.freeze()` (v4), re-sealed with the
+    /// inside a v3 image. Provenance: `f.freeze()` (v6), re-sealed with the
     /// settings record truncated to `SETTINGS_LEN_V2` and its version word
-    /// set to 2, the empty catalog blob's zero length prefix dropped, the
+    /// set to 2, the empty backups and catalog blobs' zero length prefixes dropped, the
     /// layout word set to 3 and the CRC recomputed.
     fn v3_image_with_v2_settings(f: &ClusterFsm) -> Vec<u8> {
         let (v4, _) = f.freeze().unwrap();
@@ -3254,6 +3376,8 @@ mod tests {
         )
         .unwrap();
         img.truncate(img.len() - 4); // CRC
+        let backups_prefix = img.split_off(img.len() - 4);
+        assert_eq!(backups_prefix, 0u32.to_le_bytes(), "empty backups blob");
         let catalog_prefix = img.split_off(img.len() - 4);
         assert_eq!(catalog_prefix, 0u32.to_le_bytes(), "empty catalog blob");
         img[8..12].copy_from_slice(&3u32.to_le_bytes());
@@ -3561,8 +3685,9 @@ mod tests {
         );
     }
 
-    /// Re-frame a v5 image as v4: the report and catalog blobs back to their
-    /// unsized widths, the version word to 4, the CRC recomputed.
+    /// Re-frame a v6 image (with no backup tier) as v4: the report and
+    /// catalog blobs back to their unsized widths, the empty backups prefix
+    /// dropped, the version word to 4, the CRC recomputed.
     fn rewrite_image_as_v4(img: &[u8]) -> Vec<u8> {
         use uc_protocol::v2::catalog::{ROW_ENTRY_LEN, ROW_ENTRY_LEN_UNSIZED};
         use uc_protocol::v2::cluster_image::{decode_cluster_image, encode_cluster_image};
@@ -3603,9 +3728,233 @@ mod tests {
         .unwrap();
         let body_end = out.len() - 4;
         out.truncate(body_end);
+        // v4 has no backups blob: drop its (empty) length prefix.
+        let backups_prefix = out.split_off(out.len() - 4);
+        assert_eq!(backups_prefix, 0u32.to_le_bytes(), "empty backups blob");
         out[8..12].copy_from_slice(&4u32.to_le_bytes());
         let crc = crc32fast::hash(&out);
         out.extend_from_slice(&crc.to_le_bytes());
         out
+    }
+
+    // ---- Backup tier (backup-tier spec §6.1): CLUSTER kind 7 ----
+
+    fn wm(tier: u64, oldest: u64, newest: u64, through: u64, reporter: u64) -> BackupWatermark {
+        BackupWatermark {
+            op: WatermarkOp::Report,
+            tier_id: tier,
+            oldest_set: oldest,
+            newest_set: newest,
+            through,
+            reporter,
+        }
+    }
+    fn forget(tier: u64) -> BackupWatermark {
+        BackupWatermark {
+            op: WatermarkOp::Forget,
+            tier_id: tier,
+            oldest_set: 0,
+            newest_set: 0,
+            through: 0,
+            reporter: 0,
+        }
+    }
+    fn apply(f: &mut ClusterFsm, pos: u64, cmd: ClusterCommand) {
+        assert_eq!(apply_at(f, pos, &cmd), 0, "{cmd:?} at {pos} is accepted");
+    }
+    fn apply_verdict(f: &mut ClusterFsm, pos: u64, cmd: ClusterCommand) -> u8 {
+        apply_at(f, pos, &cmd)
+    }
+    fn freeze(f: &ClusterFsm) -> Vec<u8> {
+        f.freeze().unwrap().0
+    }
+    fn install(img: &[u8]) -> ClusterFsm {
+        let pos = decode_cluster_image(img).expect("image decodes").applied;
+        let mut g = fsm();
+        assert_eq!(g.install_snapshot(pos, &mut &img[..]).unwrap(), pos);
+        g
+    }
+    /// `f`'s image re-framed at an older layout `version` (only `5` is
+    /// supported: v6 minus the backups blob and its length prefix, version
+    /// word rewritten, CRC recomputed).
+    fn image_with_version(f: &ClusterFsm, version: u32) -> Vec<u8> {
+        assert_eq!(version, 5, "only the v5 re-frame is built here");
+        let img = freeze(f);
+        let parts = decode_cluster_image(&img).unwrap();
+        let mut out = Vec::new();
+        encode_cluster_image(
+            &ClusterImageParts {
+                backups: &[],
+                ..parts
+            },
+            &mut out,
+        )
+        .unwrap();
+        out.truncate(out.len() - 4); // CRC
+        let prefix = out.split_off(out.len() - 4);
+        assert_eq!(prefix, 0u32.to_le_bytes(), "empty backups blob");
+        out[8..12].copy_from_slice(&version.to_le_bytes());
+        let crc = crc32fast::hash(&out);
+        out.extend_from_slice(&crc.to_le_bytes());
+        out
+    }
+
+    #[test]
+    fn a_watermark_moves_forward_only_and_oldest_stays_below_newest() {
+        let mut f = fsm();
+        apply(
+            &mut f,
+            10,
+            ClusterCommand::BackupWatermark(wm(7, 64, 128, 4096, 2)),
+        );
+        apply(
+            &mut f,
+            11,
+            ClusterCommand::BackupWatermark(wm(7, 64, 128, 2048, 3)),
+        ); // stale
+        let b = &f.state().backups;
+        assert_eq!(
+            (b[0].through, b[0].reporter, b[0].updated_pos),
+            (4096, 2, 10)
+        );
+        // A report whose own oldest exceeds its newest never reaches apply:
+        // the kind-7 decoder refuses it (Task 4), so `apply` answers 42.
+        assert_eq!(
+            apply_verdict(
+                &mut f,
+                12,
+                ClusterCommand::BackupWatermark(wm(7, 9999, 256, 8192, 3))
+            ),
+            42
+        );
+        apply(
+            &mut f,
+            13,
+            ClusterCommand::BackupWatermark(wm(7, 200, 256, 8192, 3)),
+        );
+        let b = &f.state().backups[0];
+        assert_eq!(
+            (
+                b.oldest_set,
+                b.newest_set,
+                b.through,
+                b.reporter,
+                b.updated_pos
+            ),
+            (200, 256, 8192, 3, 13)
+        );
+        // newest never moves back: a fresher `through` with an older newest
+        // set keeps the held newest.
+        apply(
+            &mut f,
+            14,
+            ClusterCommand::BackupWatermark(wm(7, 64, 128, 9000, 4)),
+        );
+        let b = &f.state().backups[0];
+        assert_eq!((b.oldest_set, b.newest_set, b.through), (200, 256, 9000));
+        // The clamp itself, on the state rule directly (no valid wire record
+        // can trip it): oldest clamps to newest.
+        let mut st = f.state().clone();
+        st.put_backup_watermark(&wm(7, 9999, 256, 9500, 3), 15);
+        let b = &st.backups[0];
+        assert_eq!(
+            (b.oldest_set, b.newest_set, b.through),
+            (256, 256, 9500),
+            "oldest clamps to newest"
+        );
+    }
+
+    #[test]
+    fn a_fifth_tier_is_ignored_and_forget_refuses_an_unknown_tier_with_62() {
+        let mut f = fsm();
+        for id in 1..=5 {
+            apply(
+                &mut f,
+                id,
+                ClusterCommand::BackupWatermark(wm(id, 0, 0, 64, 1)),
+            );
+        }
+        assert_eq!(f.state().backups.len(), MAX_BACKUP_TIERS);
+        assert!(!f.state().backups.iter().any(|e| e.tier_id == 5));
+        assert_eq!(
+            apply_verdict(&mut f, 20, ClusterCommand::BackupWatermark(forget(99))),
+            62
+        );
+        assert_eq!(
+            apply_verdict(&mut f, 21, ClusterCommand::BackupWatermark(forget(1))),
+            0
+        );
+        assert_eq!(f.state().backups.len(), 3);
+        assert_eq!(ClusterRefusal::TierUnknown.reason_code(), 62);
+        // The door refuses it too, off the VIEW's state (`to_state` carries
+        // the tier list).
+        let view = ClusterView::new(f.state());
+        assert_eq!(
+            f.validate(&ClusterCommand::BackupWatermark(forget(1))),
+            Err(ClusterRefusal::TierUnknown)
+        );
+        let door = ClusterFsm::new(view.to_state(), vec![]);
+        assert_eq!(
+            door.validate(&ClusterCommand::BackupWatermark(forget(1))),
+            Err(ClusterRefusal::TierUnknown)
+        );
+        assert_eq!(
+            door.validate(&ClusterCommand::BackupWatermark(forget(2))),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn backups_survive_freeze_and_install_and_a_v5_image_loads_with_none() {
+        let mut f = fsm();
+        apply(
+            &mut f,
+            10,
+            ClusterCommand::BackupWatermark(wm(7, 64, 128, 4096, 2)),
+        );
+        let img = freeze(&f);
+        let g = install(&img);
+        assert_eq!(g.state().backups, f.state().backups);
+        assert_eq!(g.state().backups.len(), 1);
+        let v5 = image_with_version(&f, 5);
+        assert!(install(&v5).state().backups.is_empty());
+    }
+
+    #[test]
+    fn the_watermark_command_round_trips_and_query_7_lists_the_tiers() {
+        for w in [wm(7, 64, 128, 4096, 2), forget(3)] {
+            let cmd = ClusterCommand::BackupWatermark(w);
+            let mut payload = Vec::new();
+            let kind = ClusterFsm::encode_command(&cmd, &mut payload);
+            assert_eq!(kind, ClusterKind::BackupWatermark);
+            assert_eq!(ClusterFsm::decode_command(kind, &payload), Some(cmd));
+        }
+        let mut f = fsm();
+        let mut out = Vec::new();
+        f.query(&[7], &mut out);
+        assert_eq!(decode_backup_list(&out), Some(vec![]));
+        apply(
+            &mut f,
+            10,
+            ClusterCommand::BackupWatermark(wm(7, 64, 128, 4096, 2)),
+        );
+        apply(
+            &mut f,
+            20,
+            ClusterCommand::BackupWatermark(wm(9, 0, 0, 512, 1)),
+        );
+        f.query(&[7], &mut out);
+        let l = decode_backup_list(&out).unwrap();
+        assert_eq!(l, f.state().backups);
+        assert_eq!(
+            l.iter()
+                .map(|e| (e.tier_id, e.updated_pos))
+                .collect::<Vec<_>>(),
+            vec![(7, 10), (9, 20)]
+        );
+        // The view publishes the list.
+        let view = ClusterView::new(f.state());
+        assert_eq!(view.backups(), f.state().backups);
+        assert_eq!(view.to_state().backups, f.state().backups);
     }
 }

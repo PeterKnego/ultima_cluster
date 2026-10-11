@@ -600,6 +600,10 @@ pub const REASON_VERSION_ALREADY_SET: u32 = 60;
 /// (plan ruling P13): an Empty catalog (no `Complete` entry, catalog ruling
 /// R26) cannot check agreement, and the pin is then allowed with a log line.
 pub const REASON_PIN_ORIGIN_NOT_AGREED: u32 = 61;
+/// Backup-tier spec §6.1: a `BackupWatermark` `Forget` (admin op 11,
+/// `uc2ctl tier forget`) naming no registered tier. The FSM's own
+/// (`ClusterRefusal::TierUnknown`), so the door and the apply loop agree.
+pub const REASON_TIER_UNKNOWN: u32 = 62;
 
 /// Jumbo spec §7.1: the datagram rung a committed `Settings::datagram_mtu`
 /// word means, and whether it had to be clamped to get there.
@@ -14273,6 +14277,7 @@ mod tests {
             reports: vec![],
             running: [None; uc_protocol::v2::cnc::CNC_MAX_SERVICES],
             catalog: Vec::new(),
+            backups: Vec::new(),
         };
         let cluster_view = Arc::new(ClusterView::new(&cluster_genesis));
         let cluster_snapshot_pos = Arc::new(AtomicU64::new(0));
@@ -20739,6 +20744,10 @@ mod tests {
             REASON_VERSION_ALREADY_SET,
             ClusterRefusal::VersionAlreadySet.reason_code()
         );
+        assert_eq!(
+            REASON_TIER_UNKNOWN,
+            ClusterRefusal::TierUnknown.reason_code()
+        );
         // And the band itself, so a shift shows up here too.
         assert_eq!(
             (
@@ -20752,8 +20761,9 @@ mod tests {
                 REASON_REPORT_STALE,
                 REASON_VERSION_ALREADY_SET,
                 REASON_PIN_ORIGIN_NOT_AGREED,
+                REASON_TIER_UNKNOWN,
             ),
-            (52, 53, 54, 55, 56, 57, 58, 59, 60, 61)
+            (52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62)
         );
     }
 
@@ -20861,6 +20871,7 @@ mod tests {
                     reports: vec![],
                     running: [None; uc_protocol::v2::cnc::CNC_MAX_SERVICES],
                     catalog: Vec::new(),
+                    backups: Vec::new(),
                 },
                 vec![hash],
             ),
@@ -20960,6 +20971,7 @@ mod tests {
                     reports: vec![],
                     running: [None; uc_protocol::v2::cnc::CNC_MAX_SERVICES],
                     catalog: Vec::new(),
+                    backups: Vec::new(),
                 },
                 vec![hash],
             ),
@@ -23161,6 +23173,7 @@ mod tests {
                 reports: vec![],
                 running: [None; uc_protocol::v2::cnc::CNC_MAX_SERVICES],
                 catalog: Vec::new(),
+                backups: Vec::new(),
             },
             Vec::new(),
         );

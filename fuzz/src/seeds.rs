@@ -1540,6 +1540,7 @@ pub fn uc_protocol_cluster_image() -> Vec<Seed> {
         reports: &[],
         running: &[],
         catalog: &[],
+        backups: &[],
     };
     let mut image = Vec::new();
     encode_cluster_image(&parts, &mut image).expect("genesis parts are well under u32::MAX");
@@ -1570,6 +1571,24 @@ pub fn uc_protocol_cluster_image() -> Vec<Seed> {
     encode_set_list(&[set], &mut catalog).expect("one set");
     let mut v5_catalog = Vec::new();
     encode_cluster_image(&ClusterImageParts { catalog: &catalog, ..parts }, &mut v5_catalog)
+        .expect("genesis parts are well under u32::MAX");
+    // Backup-tier spec §6.1: a v6 image whose trailing `backups` blob lists
+    // one registered tier.
+    use uc_protocol::v2::backup::{BackupTierEntry, encode_backup_list};
+    let mut backups = Vec::new();
+    encode_backup_list(
+        &[BackupTierEntry {
+            tier_id: 7,
+            oldest_set: 1024,
+            newest_set: 4096,
+            through: 8192,
+            reporter: 2,
+            updated_pos: 9000,
+        }],
+        &mut backups,
+    );
+    let mut v6_backups = Vec::new();
+    encode_cluster_image(&ClusterImageParts { backups: &backups, ..parts }, &mut v6_backups)
         .expect("genesis parts are well under u32::MAX");
     // A GENUINE v4 image (ruling R9): the catalog in the unsized 135 B
     // SetEntry layout and the report blob in 12 B entries, version word 4,
@@ -1607,7 +1626,8 @@ pub fn uc_protocol_cluster_image() -> Vec<Seed> {
         &mut v4,
     )
     .expect("genesis parts are well under u32::MAX");
-    v4.truncate(v4.len() - 4);
+    // CRC and (v6) the empty backups blob's zero length prefix.
+    v4.truncate(v4.len() - 8);
     v4[8..12].copy_from_slice(&4u32.to_le_bytes());
     let crc = crc32fast::hash(&v4);
     v4.extend_from_slice(&crc.to_le_bytes());
@@ -1622,6 +1642,7 @@ pub fn uc_protocol_cluster_image() -> Vec<Seed> {
         Seed::fixed("23-cluster-image-v3-running", v3_running),
         Seed::fixed("24-cluster-image-v5-sized-catalog", v5_catalog),
         Seed::fixed("25-cluster-image-v4-frame", v4),
+        Seed::fixed("26-cluster-image-v6-backups", v6_backups),
     ]
 }
 
@@ -1688,6 +1709,23 @@ pub fn uc_node_cluster_artifact() -> Vec<Seed> {
     );
     let (v3_running, _pos) = fsm.freeze().expect("freeze the cluster image after a genesis");
 
+    // Backup tier (kind 7): the same FSM after one tier's watermark report —
+    // a v6 image whose trailing `backups` blob is non-empty.
+    fsm.apply(
+        &mut ApplyCtx::for_sm::<ClusterFsm>(1280),
+        &body(&ClusterCommand::BackupWatermark(uc_protocol::v2::backup::BackupWatermark {
+            op: uc_protocol::v2::backup::WatermarkOp::Report,
+            tier_id: 7,
+            oldest_set: 320,
+            newest_set: 640,
+            through: 960,
+            reporter: 1,
+        })),
+        &mut out,
+    );
+    assert_eq!(out, [0], "the watermark report is accepted");
+    let (v6_backups, _pos) = fsm.freeze().expect("freeze the cluster image after a report");
+
     let mut bad_crc = image.clone();
     *bad_crc.last_mut().expect("non-empty image") ^= 1;
 
@@ -1718,13 +1756,15 @@ pub fn uc_node_cluster_artifact() -> Vec<Seed> {
     let decoded = uc_protocol::v2::cluster_image::decode_cluster_image(&v3_running)
         .expect("v3_running decodes");
     let running_len = decoded.running.len();
-    // Layout v4 (snapshot catalog): `running_len ‖ running ‖ catalog_len ‖
-    // catalog ‖ crc` — the running length prefix sits one whole catalog
-    // section above the CRC, not directly above it as in v3.
+    // Layout v6: `running_len ‖ running ‖ catalog_len ‖ catalog ‖
+    // backups_len ‖ backups ‖ crc` — the running length prefix sits a whole
+    // catalog section and a whole backups section above the CRC.
     let catalog_len = decoded.catalog.len();
+    let backups_len = decoded.backups.len();
     assert!(running_len > 0, "the running blob must be non-empty to lie about");
     let crc_at = lying_running_length.len() - 4;
-    let catalog_len_at = crc_at - catalog_len - 4;
+    let backups_len_at = crc_at - backups_len - 4;
+    let catalog_len_at = backups_len_at - catalog_len - 4;
     let rl_offset = catalog_len_at - running_len - 4;
     lying_running_length[rl_offset..rl_offset + 4]
         .copy_from_slice(&0xFFFF_0000u32.to_le_bytes());
@@ -1753,6 +1793,22 @@ pub fn uc_node_cluster_artifact() -> Vec<Seed> {
         "a lying catalog length must be refused, not decoded"
     );
 
+    // Backup tier (layout v6): the trailing `backups` blob's own length
+    // prefix and bound check.
+    let mut lying_backups_length = v6_backups.clone();
+    let d6 = uc_protocol::v2::cluster_image::decode_cluster_image(&v6_backups)
+        .expect("v6_backups decodes");
+    assert!(!d6.backups.is_empty(), "the backups blob must be non-empty to lie about");
+    let bl_at = lying_backups_length.len() - 4 - d6.backups.len() - 4;
+    lying_backups_length[bl_at..bl_at + 4].copy_from_slice(&0xFFFF_0000u32.to_le_bytes());
+    let body_len = lying_backups_length.len() - 4;
+    let crc = crc32fast::hash(&lying_backups_length[..body_len]);
+    lying_backups_length[body_len..].copy_from_slice(&crc.to_le_bytes());
+    assert!(
+        uc_protocol::v2::cluster_image::decode_cluster_image(&lying_backups_length).is_none(),
+        "a lying backups length must be refused, not decoded"
+    );
+
     vec![
         Seed::fixed("01-image", image),
         Seed::fixed("02-bad-crc", bad_crc),
@@ -1762,6 +1818,8 @@ pub fn uc_node_cluster_artifact() -> Vec<Seed> {
         Seed::fixed("v3_running", v3_running),
         Seed::fixed("06-lying-running-length", lying_running_length),
         Seed::fixed("07-lying-catalog-length", lying_catalog_length),
+        Seed::fixed("08-v6-backups", v6_backups),
+        Seed::fixed("09-lying-backups-length", lying_backups_length),
     ]
 }
 

@@ -1481,8 +1481,8 @@ fn retain_sets_2_keeps_a_pinned_origin_only_until_the_pin_completes() {
 /// Rewrite a cluster artifact in place as the pre-catalog `v3` layout: the
 /// report blob narrowed to its unsized 12 B entries (snapshot-lifecycle spec
 /// §7.2 — a v3 image never carried sizes; `cluster_fsm.rs`'s
-/// `rewrite_image_as_v4` does the same), the trailing catalog blob and its
-/// length prefix dropped, the version word set to 3, re-CRC
+/// `rewrite_image_as_v4` does the same), the trailing catalog and backups
+/// blobs and their length prefixes dropped, the version word set to 3, re-CRC
 /// (`cluster_fsm.rs`'s `a_v3_image_installs_with_an_empty_catalog`,
 /// generalised to a non-empty catalog). This is what a `2.13.x` node left on
 /// disk before the flag day.
@@ -1513,12 +1513,15 @@ fn rewrite_as_v3(path: &Path) {
         &ClusterImageParts {
             reports: &reports,
             catalog: &[],
+            backups: &[],
             ..parts
         },
         &mut v3,
     )
     .unwrap();
     v3.truncate(v3.len() - 4); // CRC
+    let backups_prefix = v3.split_off(v3.len() - 4);
+    assert_eq!(backups_prefix, 0u32.to_le_bytes(), "empty backups blob");
     let catalog_prefix = v3.split_off(v3.len() - 4);
     assert_eq!(catalog_prefix, 0u32.to_le_bytes(), "empty catalog blob");
     v3[8..12].copy_from_slice(&3u32.to_le_bytes());

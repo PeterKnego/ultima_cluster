@@ -95,7 +95,8 @@ pub use node::{
     REASON_SCHEDULE_TOO_LARGE, REASON_SCHEDULE_UNKNOWN_FSM, REASON_SETTINGS_BOUNDS,
     REASON_SETTINGS_DECODE, REASON_SETTINGS_DIGEST, REASON_SETTINGS_MISSING,
     REASON_SNAPSHOT_ABOVE_DURABLE, REASON_SNAPSHOT_NO_LEARNER, REASON_SNAPSHOT_UNSUPPORTED,
-    REASON_VERSION_ALREADY_SET, SnapshotRefusal, StartOpts, SubmitError, fetch_position,
+    REASON_TIER_UNKNOWN, REASON_VERSION_ALREADY_SET, SnapshotRefusal, StartOpts, SubmitError,
+    fetch_position,
 };
 pub use services::{FsmLag, ServicesConfig};
 /// Time-and-timers §6: the per-row timer counters carried by
