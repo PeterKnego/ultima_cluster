@@ -197,7 +197,9 @@ follower read path could.
   fleet data) measured 599k reads/s read-only by default vs 3.76M with
   `UC2_APPLY_IDLE=spin`, and 3.32M with writes. This affects every read path
   on every node, linearizable included. It is recorded in the bench doc
-  (§5.4); no fix has been made.
+  (§5.4). **Fixed** by counting answered queries as apply progress: on the
+  fleet, read-only reads rose 3.8–5.6× on every arm
+  ([`uc2-query-drain-progress-2026-10-10.md`](../benchmarks/uc2-query-drain-progress-2026-10-10.md)).
 
 ## Choosing, in short
 
