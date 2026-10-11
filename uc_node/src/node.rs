@@ -8604,7 +8604,8 @@ impl Consensus {
     /// tier id) as a `BackupWatermark` (`CLUSTER` kind 7), under the
     /// single-in-flight rule every leader-issued `CLUSTER` append obeys.
     /// A pending entry that moves no field of the committed entry forward
-    /// (ruling R8e, [`backup_report_advances`]) is dropped first — the FSM
+    /// (ruling R8e, [`backup_report_advances`]), or names an unregistered
+    /// tier while `MAX_BACKUP_TIERS` are held (C2), is dropped first — the FSM
     /// would apply it as a no-op, and
     /// appending it would hold the single-in-flight gate shut for a commit
     /// round trip to say nothing. `WouldOverrun` keeps the entry for the
@@ -8616,11 +8617,16 @@ impl Consensus {
             return false; // single-in-flight: a CLUSTER command is above commit
         }
         let committed = self.cluster_view.backups();
+        // Final review C2: while MAX_BACKUP_TIERS are registered, a report
+        // for an unregistered tier applies as a no-op (`backup_tiers_full`)
+        // and its writer re-offers it every 10 s — drop it here instead of
+        // appending a no-op frame forever.
+        let full = committed.len() >= uc_protocol::v2::backup::MAX_BACKUP_TIERS;
         self.pending_backup_reports.retain(|tier, w| {
-            committed
-                .iter()
-                .find(|e| e.tier_id == *tier)
-                .is_none_or(|e| backup_report_advances(w, e))
+            match committed.iter().find(|e| e.tier_id == *tier) {
+                Some(e) => backup_report_advances(w, e),
+                None => !full,
+            }
         });
         let Some((&tier, &w)) = self.pending_backup_reports.iter().next() else {
             return false;
@@ -27074,6 +27080,48 @@ mod tests {
                 "{report:?}"
             );
             assert!(h.cons.pending_backup_reports.is_empty(), "{report:?}");
+        }
+    }
+
+    /// Final review C2: with MAX_BACKUP_TIERS tiers registered, a report
+    /// for a FIFTH tier would apply as a no-op (`backup_tiers_full`), and
+    /// its writer re-offers every 10 s — so the leader drops it instead of
+    /// appending a no-op kind-7 frame forever. A registered tier still
+    /// appends; with a free slot the unregistered tier appends as before.
+    #[test]
+    fn a_report_for_an_unregistered_tier_is_dropped_while_the_table_is_full() {
+        use uc_protocol::v2::backup::MAX_BACKUP_TIERS;
+        let entry = |tier_id| BackupTierEntry {
+            tier_id,
+            oldest_set: 10,
+            newest_set: 20,
+            through: 100,
+            reporter: 0,
+            updated_pos: 0,
+        };
+        for (held, report, appended) in [
+            (MAX_BACKUP_TIERS, bw(99, 30, 200, 1), false),
+            (MAX_BACKUP_TIERS, bw(1, 30, 200, 1), true),
+            (MAX_BACKUP_TIERS - 1, bw(99, 30, 200, 1), true),
+        ] {
+            let mut h = harness();
+            drive_to_serving_leader(&mut h);
+            let mut st = h.cons.cluster_view.to_state();
+            for t in 1..=held as u64 {
+                st.backups.push(entry(t));
+            }
+            st.applied = h.cons.last_cluster_append;
+            h.cons.cluster_view.publish(&st);
+            h.cons.on_backup_report(0, report);
+            assert_eq!(
+                h.cons.maybe_append_backup_watermark(),
+                appended,
+                "{held} held, {report:?}"
+            );
+            assert!(
+                h.cons.pending_backup_reports.is_empty(),
+                "{held} held, {report:?}: dropped or appended, never kept"
+            );
         }
     }
 

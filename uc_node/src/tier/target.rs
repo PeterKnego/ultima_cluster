@@ -384,6 +384,21 @@ mod tests {
         assert_eq!(read_tier(&*t).unwrap().unwrap(), a[0]);
     }
 
+    /// C5: the `link(2)` errors that mean "this filesystem cannot
+    /// hard-link" are named; anything else stays a generic I/O failure.
+    #[test]
+    fn hard_link_refusals_are_named_no_hardlinks() {
+        let e = |n| std::io::Error::from_raw_os_error(n);
+        for n in [libc::EPERM, libc::EXDEV, libc::EOPNOTSUPP, libc::ENOTSUP] {
+            assert!(no_hardlinks(&e(n)), "{n}");
+        }
+        for n in [libc::EACCES, libc::ENOSPC, libc::EIO] {
+            assert!(!no_hardlinks(&e(n)), "{n}");
+        }
+        let msg = TierError::NoHardlinks("t".into(), "x".into()).to_string();
+        assert!(msg.contains("target_no_hardlinks"), "{msg}");
+    }
+
     #[test]
     fn a_foreign_tier_is_refused_by_name() {
         let d = tmp();
