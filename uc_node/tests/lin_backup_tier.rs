@@ -346,20 +346,9 @@ fn a_whole_cluster_restore_is_linearizable_up_to_q_and_shows_nothing_after() {
     let filler = spawn_filler(&voter_dirs, &stop_filler);
     let load_start = Instant::now();
 
-    // The one set S, commanded early and under load — but only once the
-    // register has applied something: a `RegisterSm` frozen before its first
-    // command records no cursor (`last_applied == None`), and the start-set
-    // install refuses an image that leaves the cursor at `None` (see the
-    // task report — a finding outside the tier).
-    await_until(30, "the register applied its first mutations", || {
-        let n = positions
-            .lock()
-            .unwrap()
-            .values()
-            .filter(|p| matches!(p, Pos::Mut(_)))
-            .count();
-        (n >= 20).then_some(())
-    });
+    // The one set S, commanded early and under load. It may freeze the
+    // register before its first command (an empty image, cursor `None`);
+    // that set restores like any other since #98.
     let s_set = cluster.instant_until_complete(30);
     let t = FsTarget::new(tier.path());
     await_until(60, "the writer copied set S to the tier", || {

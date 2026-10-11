@@ -405,15 +405,15 @@ pub(crate) fn attach<S: RawStateMachine>(
             })?;
         let installed = (install_fn)(&mut sm, origin, &mut file)
             .map_err(|e| ServiceError::Replay(format!("pinned install at {origin}: {e}")))?;
-        // Two post-install checks on the TRAIT contract, because nothing
-        // downstream can catch either: the tag is an EXCLUSIVE frontier, so a
-        // cursor left AT or above `origin` swallows the frame starting at
-        // `origin`, and a cursor left at `None` restarts the whole replay
-        // from genesis under THIS version — the counterfactual this install
-        // exists to avoid. (`None >= Some(_)` is false, so the `None` case
-        // needs its own clause.)
+        // The post-install check on the TRAIT contract, because nothing
+        // downstream can catch a miss: the tag is an EXCLUSIVE frontier, so
+        // a cursor left AT or above `origin` swallows the frame starting at
+        // `origin`. A `None` cursor — an origin frozen before the row applied
+        // anything — passes (#98): the follower resumes AT `origin` below,
+        // and overrun recovery measures from the follower (ruling R5), so it
+        // never replays the prefix under THIS version.
         let cursor = sm.last_applied();
-        if installed != origin || cursor.is_none() || cursor >= Some(origin) {
+        if !crate::start_set::install_landed(origin, installed, cursor) {
             return Err(ServiceError::Replay(format!(
                 "pinned install at {origin} left the state machine at {cursor:?} \
                  (returned {installed}); install_snapshot must land at the tag \

@@ -404,8 +404,9 @@ reviewer wants a workload to attack.
   and whether that replaces every-node copies (lifecycle spec D3); whether
   3b's deletions require a verify pass of the tier first (§13). Origin:
   [snapshot catalog spec §2 "Out"](superpowers/specs/2026-10-01-uc2-snapshot-catalog-design.md#2-scope)
-  and §12. Also open: a set frozen before a row applied anything cannot start a
-  service ([#98](https://github.com/PeterKnego/ultima_cluster/issues/98)).
+  and §12. (A set frozen before a row applied anything could not start a
+  service, [#98](https://github.com/PeterKnego/ultima_cluster/issues/98) —
+  fixed 2026-10-11.)
   - **3b: tier-seeded replacement node** (ruling R12a, 2026-10-11). The
     restored term map's first entry is (term, S); reconcile against a live
     leader finds no alignment and cuts to 0 (archive fail-stop
