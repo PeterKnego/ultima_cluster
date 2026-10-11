@@ -1108,12 +1108,42 @@ mod writer_e2e {
         await_agreed(&c, &all, p);
         let lead = submit_settled(&c, 3000);
         let target = c.node(lead).counters().commit.load_acquire();
-        // The SumSm total as of `target`: every submit above has committed,
-        // and no client write follows, so a restore at any Q >= target must
-        // answer the same.
-        let total_before = query_total(&c, l);
+        // The oracle: the SumSm total once EVERY submit has applied. `submit`
+        // only enqueues on the ingress ring and the leader appends later, so
+        // `target` (read right after the last submit) can sit below the end of
+        // the batch — CI once read the total with 3000 of 3500 writes still in
+        // the ring. A write moves the total only after it is appended,
+        // committed and applied, so a total that holds still across three
+        // linearizable reads 300 ms apart has every write in it.
+        let mut total_before = query_total(&c, l);
+        let mut still = 0;
+        let settle = Instant::now() + Duration::from_secs(60);
+        while still < 3 {
+            assert!(Instant::now() < settle, "the SumSm total never settled");
+            std::thread::sleep(Duration::from_millis(300));
+            let t = query_total(&c, l);
+            still = if t == total_before { still + 1 } else { 0 };
+            total_before = t;
+        }
         assert_ne!(total_before, 0, "the writes moved the total");
         await_watermark(&c, l, 60, |w| w.newest_set == p && w.through >= target);
+        // ...and the tier must hold the LAST client write. The writer's next
+        // quiet cut (500 ms here) takes every substantive frame up to commit;
+        // after that only bookkeeping follows, which it deliberately never
+        // backs up — so `through` stops moving once it covers the last write.
+        // Wait for it to hold still for 4 quiet intervals.
+        let mut last = watermark(c.node(l)).map(|w| w.through);
+        let mut since = Instant::now();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while since.elapsed() < Duration::from_secs(2) {
+            assert!(Instant::now() < deadline, "the tier's reach never settled");
+            std::thread::sleep(Duration::from_millis(50));
+            let now = watermark(c.node(l)).map(|w| w.through);
+            if now != last {
+                last = now;
+                since = Instant::now();
+            }
+        }
 
         // Stop everything: services, then nodes.
         for h in c.nodes.iter_mut() {
