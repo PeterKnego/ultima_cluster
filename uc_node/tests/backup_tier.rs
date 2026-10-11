@@ -743,6 +743,16 @@ mod writer_e2e {
         cfg
     }
 
+    /// A linearizable read of the SumSm total through node `i`. SumSm
+    /// answers its raw 8-byte LE total; bincode decodes `[u8; 8]` as exactly
+    /// those 8 bytes.
+    fn query_total(c: &Cluster, i: usize) -> u64 {
+        let client = uc_client::Client::connect(&c.nodes[i].dir, c.app).expect("client");
+        let raw: [u8; 8] = client.query_linearizable(&()).expect("linearizable query");
+        client.shutdown();
+        u64::from_le_bytes(raw)
+    }
+
     // ------------------------------------------------- reading the tier back
 
     /// One frame read out of a tier chunk: `(position, term, type, payload)`.
@@ -922,6 +932,11 @@ mod writer_e2e {
         await_agreed(&c, &all, p);
         submit_frames(c.node(l), 3000);
         let target = c.node(l).counters().commit.load_acquire();
+        // The SumSm total as of `target`: every submit above has committed,
+        // and no client write follows, so a restore at any Q >= target must
+        // answer the same.
+        let total_before = query_total(&c, l);
+        assert_ne!(total_before, 0, "the writes moved the total");
         await_watermark(&c, l, 60, |w| w.newest_set == p && w.through >= target);
 
         // Stop everything: services, then nodes.
@@ -969,6 +984,11 @@ mod writer_e2e {
         start_sums(&mut c);
         let l2 = await_single_leader(&c, 60);
         await_capable(&c);
+        assert_eq!(
+            query_total(&c, l2),
+            total_before,
+            "the restored cluster answers as the original did at Q"
+        );
         submit_frames(c.node(l2), 10);
         let commit = c.node(l2).counters().commit.load_acquire();
         assert!(

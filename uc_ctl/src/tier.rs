@@ -151,6 +151,15 @@ pub fn data_loss_line(q: u64) -> String {
     format!("restoring as of {q}; history after {q} is discarded on every node restored this way")
 }
 
+/// What `tier restore --new-node` prints instead of the data-loss line: the
+/// cluster loses nothing; the node is seeded at Q and catches up.
+pub fn new_node_line(node_id: u32, q: u64) -> String {
+    format!(
+        "seeding new node {node_id} as of {q}; once added it catches up from the live cluster \
+         (nothing is discarded)"
+    )
+}
+
 /// `tier restore`: refuse a `--confirm-cluster` that is not the tier's
 /// `app_id`, print the data-loss line, then build `instance_dir`.
 pub fn restore(
@@ -176,7 +185,10 @@ pub fn restore(
     };
     let l = list_tier(&t).map_err(|e| tier_err("restore", e))?;
     let (_, q) = restore_point(&l, at).map_err(|e| tier_err("restore", e))?;
-    println!("{}", data_loss_line(q));
+    match mode {
+        Mode::NewNode { node_id } => println!("{}", new_node_line(node_id, q)),
+        _ => println!("{}", data_loss_line(q)),
+    }
     let now_ns = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
@@ -193,7 +205,9 @@ pub fn restore(
     );
     if let Mode::NewNode { node_id } = m.mode {
         println!(
-            "next: start node {node_id} on this directory, then `uc2ctl add-learner --id {node_id} …` against the live cluster"
+            "next: start node {node_id} on this directory, then add it to the live cluster \
+             (`uc2ctl add`, spec §8.2: `uc2ctl add-learner --id {node_id} --addr <ip:port>`, \
+             then `uc2ctl promote` if it is to vote)"
         );
     }
     Ok(())
@@ -233,6 +247,8 @@ mod tests {
         let e = restore(&tier, None, &out, RestoreMode::Cluster("app".into())).unwrap_err();
         assert!(e.to_string().contains("restore_point_unreachable"), "{e}");
         assert!(!out.exists());
+        assert!(!new_node_line(7, 4096).contains("discarded on every node"));
+        assert!(new_node_line(7, 4096).contains("catches up from the live cluster"));
         assert_eq!(
             data_loss_line(4096),
             "restoring as of 4096; history after 4096 is discarded on every node restored this way"

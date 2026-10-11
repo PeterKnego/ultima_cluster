@@ -15,10 +15,11 @@
 
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use sha2::Digest;
 use uc_journal::{Journal, JournalConfig};
+use uc_log::archive::{Archive, ArchiveConfig};
 use uc_log::state::{ConfigRecord, NodeState, TermMapEntry};
 use uc_protocol::v2::frame::{FRAME_TYPE_PADDING, HEADER_LEN, align_frame_len, read_header};
 use uc_service::snapshots::{SNAPSHOT_ENVELOPE_LEN, SnapshotStore, decode_snapshot_envelope};
@@ -63,6 +64,10 @@ pub struct Materialized {
 pub const RESTORE_TMP: &str = ".restore-tmp";
 /// The audit-trail file the builder leaves; nothing reads it.
 pub const RESTORED_FILE: &str = "RESTORED";
+/// Present in `out_dir` only while the assembled directories are being
+/// renamed into place; a crash there leaves it, and the next restore into
+/// that directory refuses by name.
+pub const RESTORING_FILE: &str = "RESTORING";
 /// One journal block's cap — the archive's own (`ArchiveConfig::new`).
 const MAX_BLOCK_BYTES: usize = 1 << 20;
 
@@ -165,8 +170,30 @@ pub fn materialize(
         .expect("restore_point picks a listed set")
         .clone();
 
+    // What exists now, so a refusal can put `out_dir` back as it was: taking
+    // the instance lock creates the directory, `instance.lock`, `journal/`
+    // and `state/` when they are absent.
     let created = !out_dir.exists();
-    fs::create_dir_all(out_dir)?;
+    let before: Vec<(PathBuf, bool)> = ["instance.lock", "journal", "state"]
+        .iter()
+        .map(|n| {
+            let p = out_dir.join(n);
+            let e = p.exists();
+            (p, e)
+        })
+        .collect();
+    // Held for the whole build, the way `force-single-member` holds it: a
+    // node started on `out_dir` mid-build refuses rather than racing us.
+    let lock = match crate::ipc::InstanceDir::acquire(out_dir) {
+        Ok(l) => Some(l),
+        Err(e) => {
+            undo_target(out_dir, created, &before);
+            return Err(match e {
+                crate::ipc::IpcError::AlreadyRunning(_) => running(out_dir),
+                other => TierError::Io(io::Error::other(other.to_string())),
+            });
+        }
+    };
     let tmp = out_dir.join(RESTORE_TMP);
     let built = (|| {
         if tmp.exists() {
@@ -191,17 +218,45 @@ pub fn materialize(
         place(&tmp, out_dir)
     })();
     match built {
-        Ok(()) => Ok(Materialized {
-            start_set: s,
-            q,
-            mode,
-        }),
+        Ok(()) => {
+            drop(lock);
+            Ok(Materialized {
+                start_set: s,
+                q,
+                mode,
+            })
+        }
         Err(e) => {
             let _ = fs::remove_dir_all(&tmp);
-            if created {
-                let _ = fs::remove_dir(out_dir);
-            }
+            drop(lock);
+            undo_target(out_dir, created, &before);
             Err(e)
+        }
+    }
+}
+
+fn running(out_dir: &Path) -> TierError {
+    refused(format!(
+        "{}: a running node holds this instance directory's instance.lock — stop it first",
+        out_dir.display()
+    ))
+}
+
+/// Best effort: remove what this call created in `out_dir` (the whole
+/// directory when it did not exist; else the lock file and the empty
+/// durable directories that taking the lock made).
+fn undo_target(out_dir: &Path, created: bool, before: &[(PathBuf, bool)]) {
+    if created {
+        let _ = fs::remove_dir_all(out_dir);
+        return;
+    }
+    for (p, existed) in before {
+        if !existed {
+            if p.is_dir() {
+                let _ = fs::remove_dir(p); // empty, or it stays
+            } else {
+                let _ = fs::remove_file(p);
+            }
         }
     }
 }
@@ -213,8 +268,13 @@ const DURABLE_DIRS: [&str; 3] = ["journal", "state", "snapshots"];
 /// (`cnc2.dat`, rings, an unheld lock) are fine.
 fn refuse_target(out_dir: &Path) -> Result<(), TierError> {
     if crate::ipc::probe_instance_lock(out_dir)? == crate::ipc::InstanceLock::Held {
+        return Err(running(out_dir));
+    }
+    if out_dir.join(RESTORING_FILE).exists() {
         return Err(refused(format!(
-            "{}: a running node holds this instance directory's instance.lock — stop it first",
+            "{}: carries a {RESTORING_FILE} marker — an earlier tier restore was interrupted \
+             while moving its directories into place, so journal/, state/ and snapshots/ may be \
+             half-placed; remove those and {RESTORING_FILE}, then restore again",
             out_dir.display()
         )));
     }
@@ -266,34 +326,47 @@ fn build(
             format!("installed at {at}, set is {s}"),
         ));
     }
-    let membership = fsm.state().membership.clone();
+    let stored = crate::node::cluster_to_stored(&fsm.state().membership);
+    let record = ConfigRecord {
+        position: s,
+        config: stored.clone(),
+        prev_position: s,
+        prev: stored,
+    };
+
+    let terms = write_journal(t, l, s, q, &tmp.join("journal"))?;
+
     if let Mode::NewNode { node_id } = mode {
-        let m = &membership;
-        if m.voters.iter().any(|(id, _)| *id == node_id)
-            || m.learners.iter().any(|(id, _)| *id == node_id)
+        // Ruling R11c: the membership the restored node BOOTS with — the
+        // artifact's at S with every Membership frame in [S, Q) folded in,
+        // by the same `rederive_config` boot runs — not the one at S alone.
+        let archive = Archive::open(ArchiveConfig {
+            preallocate_segments: false,
+            ..ArchiveConfig::new(tmp.join("journal"))
+        })
+        .map_err(|e| TierError::Journal(e.to_string()))?;
+        let boot = crate::node::rederive_config(&archive, record.clone())
+            .map_err(|e| TierError::Journal(e.to_string()))?;
+        let m = &boot.config;
+        if m.voters.iter().any(|x| x.id == node_id)
+            || m.learners.iter().any(|x| x.id == node_id)
             || m.tombstones.contains(&node_id)
         {
             return Err(refused(format!(
                 "restore_id_reused: node id {node_id} is a voter, learner or tombstone of the \
-                 membership at set {s} — a replacement node takes a NEW id, then `uc2ctl add`"
+                 membership this node would boot with (version {}, position {}) — a \
+                 replacement node takes a NEW id, then `uc2ctl add` (`add-learner`)",
+                m.version, boot.position
             )));
         }
     }
 
-    let terms = write_journal(t, l, s, q, &tmp.join("journal"))?;
-
     fs::create_dir_all(tmp.join("state"))?;
     let state = NodeState::open(&tmp.join("state")).map_err(io::Error::other)?;
-    let stored = crate::node::cluster_to_stored(&membership);
     state.store_snapshot_floor(s).map_err(io::Error::other)?;
     state.store_term_map(&terms).map_err(io::Error::other)?;
     state
-        .store_config_record(&ConfigRecord {
-            position: s,
-            config: stored.clone(),
-            prev_position: s,
-            prev: stored,
-        })
+        .store_config_record(&record)
         .map_err(io::Error::other)?;
     state
         .store_output_progress(match mode {
@@ -391,7 +464,13 @@ struct BlockWriter {
 
 impl BlockWriter {
     fn take(&mut self, pos: u64, bytes: &[u8]) -> Result<(), TierError> {
-        debug_assert_eq!(pos, self.pending_base + self.pending.len() as u64);
+        let expect = self.pending_base + self.pending.len() as u64;
+        if pos != expect {
+            return Err(corrupt(
+                "tier chain",
+                format!("range read jumped to {pos}, expected {expect}"),
+            ));
+        }
         self.pending.extend_from_slice(bytes);
         let mut off = 0usize;
         while self.pending.len() - off >= HEADER_LEN {
@@ -505,19 +584,46 @@ fn sync_dir(p: &Path) -> io::Result<()> {
 
 /// Rename the assembled durable directories (then `RESTORED`) into
 /// `out_dir`, replacing the empty ones `refuse_target` allowed, and drop the
-/// assembly directory.
+/// assembly directory. A `RESTORING` marker brackets the renames: a crash
+/// between them leaves it, and the next restore refuses by name. An I/O
+/// error moves what was already renamed back (best effort) and clears the
+/// marker only when that succeeded.
 fn place(tmp: &Path, out_dir: &Path) -> Result<(), TierError> {
     for d in ["journal", "state"] {
         sync_dir(&tmp.join(d))?;
     }
-    for d in DURABLE_DIRS {
-        let dst = out_dir.join(d);
-        if dst.is_dir() {
-            fs::remove_dir(&dst)?; // empty, checked by `refuse_target`
-        }
-        fs::rename(tmp.join(d), &dst)?;
+    let marker = out_dir.join(RESTORING_FILE);
+    {
+        let mut f = File::create(&marker)?;
+        f.write_all(b"tier restore placing journal/, state/, snapshots/\n")?;
+        f.sync_all()?;
     }
-    fs::rename(tmp.join(RESTORED_FILE), out_dir.join(RESTORED_FILE))?;
+    sync_dir(out_dir)?;
+    let mut moved: Vec<&str> = Vec::new();
+    let r = (|| -> io::Result<()> {
+        for d in DURABLE_DIRS {
+            let dst = out_dir.join(d);
+            if dst.is_dir() {
+                fs::remove_dir(&dst)?; // empty, checked by `refuse_target`
+            }
+            fs::rename(tmp.join(d), &dst)?;
+            moved.push(d);
+        }
+        fs::rename(tmp.join(RESTORED_FILE), out_dir.join(RESTORED_FILE))?;
+        moved.push(RESTORED_FILE);
+        sync_dir(out_dir)
+    })();
+    if let Err(e) = r {
+        let back = moved
+            .iter()
+            .rev()
+            .all(|d| fs::rename(out_dir.join(d), tmp.join(d)).is_ok());
+        if back {
+            let _ = fs::remove_file(&marker);
+        }
+        return Err(e.into());
+    }
+    fs::remove_file(&marker)?;
     fs::remove_dir(tmp)?;
     sync_dir(out_dir)?;
     Ok(())
@@ -530,10 +636,8 @@ mod tests {
     use crate::tier::object::{Codec, MAGIC_CHUNK, write_object};
     use crate::tier::target::{FsTarget, Put, open_or_create_tier};
     use std::io::Cursor;
-    use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, Ordering};
     use uc_consensus::config::ClusterConfig;
-    use uc_log::archive::{Archive, ArchiveConfig};
     use uc_protocol::v2::catalog::SetKind;
     use uc_protocol::v2::frame::FRAME_TYPE_MESSAGE;
     use uc_service::SnapshotStateMachine;
@@ -914,6 +1018,97 @@ mod tests {
         fs::create_dir_all(d.join("state")).unwrap(); // empty: allowed
         materialize(&t, None, &d, Mode::Recovery, 1).unwrap();
         assert!(d.join("instance.lock").is_file(), "volatile leftovers stay");
+    }
+
+    /// One `CLUSTER kind=Membership` frame carrying `c`, term 3.
+    fn membership_frame(c: &ClusterConfig, prev_position: u64) -> Vec<u8> {
+        use uc_protocol::v2::frame::{CLUSTER_BODY_PREFIX_LEN, ClusterKind, FRAME_TYPE_CLUSTER};
+        let mut body = vec![0u8; CLUSTER_BODY_PREFIX_LEN];
+        uc_protocol::v2::frame::write_cluster_prefix(&mut body, ClusterKind::Membership);
+        uc_protocol::v2::config::encode_config(
+            &crate::node::cluster_to_wire(c, prev_position),
+            &mut body,
+        );
+        let len = HEADER_LEN + body.len();
+        let mut f = vec![0u8; align_frame_len(len)];
+        f[0..4].copy_from_slice(&(len as u32).to_le_bytes());
+        f[4] = FRAME_TYPE_CLUSTER;
+        f[8..12].copy_from_slice(&3u32.to_le_bytes());
+        f[HEADER_LEN..len].copy_from_slice(&body);
+        f
+    }
+
+    /// Ruling R11c: an id added by a Membership frame in (S, Q] is the
+    /// membership the restored node boots with (`rederive_config` folds it
+    /// in), so `--new-node` with that id is refused; another new id is not.
+    #[test]
+    fn new_node_refuses_an_id_a_membership_frame_after_the_set_added() {
+        let d = tmp();
+        let tier = d.path().join("tier");
+        let t = FsTarget::new(&tier);
+        open_or_create_tier(&t, APP, 1).unwrap();
+        put(
+            &t,
+            &crate::tier::layout::chunk_object(0, 2048),
+            MAGIC_CHUNK,
+            0,
+            2048,
+            &frames(0, 2048, term_at),
+        );
+        let mut grown = membership();
+        grown.version = 5;
+        grown.learners.push((7, (0x7f00_0001, 7007)));
+        let mut b = membership_frame(&grown, 1024);
+        let start = 2048 + b.len() as u64;
+        b.extend(frames(start, start + 4 * FRAME, |_| 3));
+        let end = 2048 + b.len() as u64;
+        put(
+            &t,
+            &crate::tier::layout::chunk_object(2048, end),
+            MAGIC_CHUNK,
+            2048,
+            end,
+            &b,
+        );
+        put_set(&t, 1024);
+
+        let out7 = d.path().join("id7");
+        let m = refusal(materialize(
+            &t,
+            None,
+            &out7,
+            Mode::NewNode { node_id: 7 },
+            1,
+        ));
+        assert!(
+            m.contains("restore_id_reused") && m.contains("version 5"),
+            "{m}"
+        );
+        assert!(!out7.exists());
+        let out8 = d.path().join("id8");
+        let r = materialize(&t, None, &out8, Mode::NewNode { node_id: 8 }, 1).unwrap();
+        assert_eq!((r.start_set, r.q), (1024, end));
+        // The record the builder writes stays the set's; boot folds the frame.
+        let st = NodeState::open(&out8.join("state")).unwrap();
+        assert_eq!(st.config_record().unwrap().config.version, 4);
+    }
+
+    /// A crash while renaming into place leaves `RESTORING`; the next
+    /// restore into that directory refuses by name and touches nothing.
+    #[test]
+    fn an_interrupted_placement_marker_is_refused_by_name() {
+        let fx = fixture();
+        let t = FsTarget::new(&fx.tier);
+        let d = out(&fx, "half-placed");
+        fs::create_dir_all(&d).unwrap();
+        fs::write(d.join(RESTORING_FILE), b"x").unwrap();
+        let m = refusal(materialize(&t, None, &d, Mode::Recovery, 1));
+        assert!(m.contains(RESTORING_FILE), "{m}");
+        assert_eq!(fs::read_dir(&d).unwrap().count(), 1, "untouched");
+        // A completed restore leaves no marker behind.
+        let d2 = out(&fx, "placed");
+        materialize(&t, None, &d2, Mode::Recovery, 1).unwrap();
+        assert!(!d2.join(RESTORING_FILE).exists());
     }
 
     #[test]

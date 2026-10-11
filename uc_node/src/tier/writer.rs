@@ -1356,10 +1356,6 @@ mod tests {
         j
     }
 
-    /// Ruling PF2 + the canonical form: raw frames, a padding frame's body
-    /// and every frame's alignment slack zeroed; and a walk that reaches the
-    /// journal's end (`durable`) stops there instead of reading a block that
-    /// does not exist yet (the bug a quiet cut at exactly `C == durable` hit).
     /// Rulings R8b + R11a: a bookkeeping-only quiet cut is declined unless
     /// the chain ends exactly at its newest set; a substantive, full or
     /// set-forced cut always goes ahead.
@@ -1377,6 +1373,10 @@ mod tests {
         assert!(!declines_quiet_cut(false, true, false, 5000, 4096));
     }
 
+    /// Ruling PF2 + the canonical form: raw frames, a padding frame's body
+    /// and every frame's alignment slack zeroed; and a walk that reaches the
+    /// journal's end (`durable`) stops there instead of reading a block that
+    /// does not exist yet (the bug a quiet cut at exactly `C == durable` hit).
     #[test]
     fn the_walk_is_raw_canonical_and_stops_at_the_limit() {
         let d = tempdir();

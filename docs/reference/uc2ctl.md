@@ -880,12 +880,26 @@ Exactly one of:
 - `--new-node --node-id <N>` — **one replacement node** seeded from the tier
   instead of a peer's snapshot session. `N` must be a new id: one that is a
   voter, learner or tombstone in the restored membership is refused
-  `restore_id_reused`. Start the node, then add it with `uc2ctl add-learner`.
+  `restore_id_reused` — checked against the membership the node will boot
+  with: the cluster artifact's at `S` plus every Membership frame in
+  `[S, Q)`. It prints `seeding new node <N> as of <Q>; once added it catches
+  up from the live cluster (nothing is discarded)` instead of the data-loss
+  line. Start the node, then add it (spec §8.2's `uc2ctl add`:
+  [`add-learner`](#add-learner), then [`promote`](#promote) if it is to
+  vote).
+
+The builder holds `<DIR>`'s exclusive `instance.lock` for the whole build,
+as `force-single-member` does, so a node started there mid-build refuses.
+While the assembled directories are renamed into place a `RESTORING` marker
+sits in `<DIR>`; a crash in that window leaves it.
 
 Refusals, each by name, each leaving `<DIR>` exactly as it was (and removing
 it again if the command created it):
 
 - a running node holds `<DIR>`'s `instance.lock`;
+- `<DIR>` carries a `RESTORING` marker — an earlier restore was interrupted
+  while placing; remove its `journal/`, `state/`, `snapshots/` and
+  `RESTORING`, then restore again;
 - `TargetNotEmpty` — `<DIR>`'s `journal/`, `state/` or `snapshots/` is not
   empty (volatile leftovers such as `cnc2.dat` and an unheld
   `instance.lock` are fine);
