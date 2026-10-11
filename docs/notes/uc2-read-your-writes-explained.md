@@ -13,23 +13,20 @@ UC has always had two ways to read:
   the leader serves it.
 - **Snapshot**: answered from whatever the local node has applied so far.
   Cheap, and any node can answer, so read capacity scales with the number of
-  nodes (see
-  [`docs/benchmarks/uc2-read-spread-2026-10-07.md`](../benchmarks/uc2-read-spread-2026-10-07.md):
-  2.74x read-only, 3.65x under write load; on Graviton 20.7 M snapshot
-  reads/s across three `c9gd.4xlarge` nodes,
-  [`uc2-read-types-under-writes-c9gd-2026-10-11.md`](../benchmarks/uc2-read-types-under-writes-c9gd-2026-10-11.md)).
+  nodes: 20.7 M snapshot reads/s across three `c9gd.4xlarge` nodes against
+  7.05 M on the leader alone
+  ([`uc2-read-types-under-writes-c9gd-2026-10-11.md`](../benchmarks/uc2-read-types-under-writes-c9gd-2026-10-11.md)).
   But a follower may not have applied the write you were just told succeeded,
   so you can read your own past.
 
 **Read-your-writes** is the third mode. It reads on any node at close to
 snapshot cost, and guarantees you see everything you have written or read
-before, and never go backwards. Measured: spread over three nodes it runs at
-0.92–0.98 of snapshot reads on `c6id.2xlarge` and 0.81–0.85 on `c9gd.4xlarge`
-— 16.9 M reads/s read-only and **15.1 M/s beside 2 M committed writes/s at
-p99 0.34 ms** on the Graviton fleet; on the leader alone it costs about what a
-snapshot read costs on `c6id` (0.94–1.10) but 15–20 % more on Graviton
-(0.78–0.91, a recorded miss of the ≥ 0.90 bar, open for an A/B of the fast
-path). Either way it is 3.2–5.8× the linearizable path's capacity.
+before, and never go backwards. Measured on the same Graviton fleet: spread
+over three nodes it runs at 0.81–0.85 of snapshot reads — 16.9 M reads/s
+read-only and **15.1 M/s beside 2 M committed writes/s at p99 0.34 ms** — and
+at 4.4–5.8× the linearizable path's capacity. On the leader alone it costs
+15–20 % more than a snapshot read (0.78–0.91, a recorded miss of the ≥ 0.90
+bar, open for an A/B of the fast path).
 
 | mode | guarantee | where it runs |
 |---|---|---|

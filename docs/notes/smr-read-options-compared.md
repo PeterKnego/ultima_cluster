@@ -144,26 +144,26 @@ Checked against the code on 2026-10-07:
   client learns from its write's response, and any node answers once it has
   applied that far. See
   [`uc2-read-your-writes-explained.md`](uc2-read-your-writes-explained.md); the
-  2026-10-10 fleet run
-  ([`uc2-read-types-under-writes-2026-10-10.md`](../benchmarks/uc2-read-types-under-writes-2026-10-10.md))
-  measured them at about a snapshot read's cost on `c6id.2xlarge`; the
-  2026-10-11 run on Graviton
+  2026-10-11 fleet run on Graviton
   ([`uc2-read-types-under-writes-c9gd-2026-10-11.md`](../benchmarks/uc2-read-types-under-writes-c9gd-2026-10-11.md))
-  pushed writes to the ceiling — 15 M read-your-writes reads/s across 3 nodes
-  beside 2 M committed writes/s at p99 under 0.5 ms, and 4.6–5.3 M committed
-  writes/s with reads alongside at the unpaced ceiling — and found the
-  leader-side read-your-writes read at 0.78–0.91 of a snapshot read there, a
-  recorded miss of its ≥ 0.90 bar.
+  measured them at 15.1 M reads/s across 3 nodes beside 2 M committed
+  writes/s at p99 0.34 ms, 4.4–5.8× the linearizable path; on the leader
+  alone a read-your-writes read costs 15–20 % more than a snapshot read
+  (0.78–0.91, a recorded miss of the ≥ 0.90 bar).
 - **Not offered today:** time-addressed reads (H; `query` gets no `time_ns` by
   design) and historical reads at a position (L).
 
-## Would another read path be faster in UC? (measured 2026-10-07)
+## Would another read path be faster in UC? (measured 2026-10-07, re-measured on Graviton 2026-10-11)
 
-Rung A removed the barrier's cost: linearizable and snapshot reads are equal at
-plateau on the leader. So no certification scheme (a lease included) can win
-throughput on a LAN. The remaining lever is **where the query runs.**
-`docs/benchmarks/uc2-read-spread-2026-10-07.md` measured the upper bound for
-moving reads to followers: snapshot reads on all 3 nodes vs on the leader only.
+The barrier costs about 45 % of the leader's read capacity (3.88 M linearizable
+vs 7.05 M snapshot reads/s read-only on `c9gd.4xlarge`, 2.89 M vs 5.07 M beside
+2 M committed writes/s —
+[`uc2-read-types-under-writes-c9gd-2026-10-11.md`](../benchmarks/uc2-read-types-under-writes-c9gd-2026-10-11.md)),
+and no certification scheme (a lease included) removes the leader-only
+placement. The bigger lever is **where the query runs.**
+`docs/benchmarks/uc2-read-spread-2026-10-07.md` set the pre-committed bar for
+moving reads to followers (snapshot reads on all 3 nodes vs on the leader
+only) and the Graviton run re-measured it.
 
 **What was tested: UC snapshot reads only (option K, local reads), not follower ReadIndex.**
 UC has no follower ReadIndex to test; a follower answers a linearizable read
@@ -176,9 +176,10 @@ followers, chosen on purpose: if spread snapshot reads did not scale, no
 follower read path could.
 
 - **Proven: snapshot read capacity scales with the number of nodes answering.**
-  Spread ÷ leader-only = **2.74** read-only and **3.65** under 20k writes/s,
-  against a pre-committed 2.4 bar. The query work is per node and does not
-  funnel through the leader.
+  Spread ÷ leader-only = **2.94** read-only (20.7 M vs 7.05 M reads/s) and
+  **3.50** beside 2 M committed writes/s (17.7 M vs 5.07 M), against the
+  pre-committed 2.4 bar. The query work is per node and does not funnel
+  through the leader.
 - **Not proven: that follower ReadIndex (C) would scale the same way.** It adds
   two costs this run did not include:
   1. *A leader round per batch*: the follower asks the leader for a read
@@ -193,20 +194,17 @@ follower read path could.
   Session tokens (I) carry only the apply wait.
 - **So "reads scale with nodes" holds today for snapshot reads only.**
   Linearizable reads in UC are leader-only, so their capacity is one node's.
-  They would scale only if follower ReadIndex were built, and this run puts the
-  ceiling for that at about 2.7–3.6× on 3 nodes, minus whatever those costs
-  turn out to be.
-- **Side finding: a read-only service runs at a fraction of its read
-  capacity.** The service answers queries on its apply thread (at most 64 per
-  cycle), but query work does not count as progress for the thread's idle
-  ladder. A service with no writes therefore sleeps 50 µs between batches,
-  which caps it near 600k reads/s per node. A local smoke run (dev box, not
-  fleet data) measured 599k reads/s read-only by default vs 3.76M with
-  `UC2_APPLY_IDLE=spin`, and 3.32M with writes. This affects every read path
-  on every node, linearizable included. It is recorded in the bench doc
-  (§5.4). **Fixed** by counting answered queries as apply progress: on the
-  fleet, read-only reads rose 3.8–5.6× on every arm
-  ([`uc2-query-drain-progress-2026-10-10.md`](../benchmarks/uc2-query-drain-progress-2026-10-10.md)).
+  They would scale only if follower ReadIndex were built, and the spread
+  measurement puts the ceiling for that at about 2.9–3.5× on 3 nodes, minus
+  whatever those costs turn out to be. Read-your-writes reads, which carry
+  only the apply wait, measured 4.4–5.8× the linearizable path on Graviton.
+- **Side finding, fixed: a read-only service used to run at a fraction of its
+  read capacity.** The service answers queries on its apply thread, and query
+  work did not count as progress for the thread's idle ladder, so a service
+  with no writes slept between batches and every read path on every node was
+  capped. Fixed 2026-10-10 by counting answered queries as apply progress
+  ([`uc2-query-drain-progress-2026-10-10.md`](../benchmarks/uc2-query-drain-progress-2026-10-10.md));
+  the Graviton numbers above are post-fix.
 
 ## Choosing, in short
 
