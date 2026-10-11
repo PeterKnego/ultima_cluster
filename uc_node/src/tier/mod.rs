@@ -19,4 +19,8 @@ pub enum TierError {
     OverlapMismatch(String),
     #[error("{0}")]
     Refused(String),
+    /// The node's own journal could not supply a range (a read error, a
+    /// block purged under the cut) — not the target's fault.
+    #[error("journal: {0}")]
+    Journal(String),
 }

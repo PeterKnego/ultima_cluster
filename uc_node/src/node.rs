@@ -2792,17 +2792,17 @@ impl Node {
         SOFT_STALE_FACTOR * self.election_timeout_max_ns
     }
 
-    /// Backup-tier spec §6.2 — TEST SEAM, not API: put `w` into this node's
-    /// backup-claim slot exactly as the `uc2-backup` writer thread does
-    /// (Task 8), so an end-to-end test can drive the report path without a
-    /// tier. The consensus agent takes it on its next pass.
-    #[doc(hidden)]
     /// Backup-tier spec §5: the `uc2-backup` writer's progress, holds and
     /// counters — `None` when this node runs no writer.
     pub fn backup_writer(&self) -> Option<Arc<crate::tier::writer::WriterShared>> {
         self.backup_writer.clone()
     }
 
+    /// Backup-tier spec §6.2 — TEST SEAM, not API: put `w` into this node's
+    /// backup-claim slot exactly as the `uc2-backup` writer thread does
+    /// (Task 8), so an end-to-end test can drive the report path without a
+    /// tier. The consensus agent takes it on its next pass.
+    #[doc(hidden)]
     pub fn offer_backup_claim_for_test(&self, w: BackupWatermark) {
         *self.backup_claim.lock().unwrap_or_else(|e| e.into_inner()) = Some(w);
     }

@@ -101,14 +101,18 @@ pub enum WriterError {
     /// A local set's files do not hash to the catalog's agreed hashes; the
     /// set is skipped (counted once per set).
     HashMismatch = 3,
+    /// This node's journal could not supply a range (read error, purged
+    /// under the cut); retried on the ladder. Not the target's fault.
+    JournalUnavailable = 4,
 }
 
 impl WriterError {
-    pub const ALL: [WriterError; 4] = [
+    pub const ALL: [WriterError; 5] = [
         WriterError::Foreign,
         WriterError::Unavailable,
         WriterError::OverlapMismatch,
         WriterError::HashMismatch,
+        WriterError::JournalUnavailable,
     ];
 
     pub fn label(self) -> &'static str {
@@ -117,6 +121,7 @@ impl WriterError {
             WriterError::Unavailable => "unavailable",
             WriterError::OverlapMismatch => "overlap_mismatch",
             WriterError::HashMismatch => "hash_mismatch",
+            WriterError::JournalUnavailable => "journal_unavailable",
         }
     }
 }
@@ -129,7 +134,7 @@ pub struct WriterStats {
     pub bytes_journal: AtomicU64,
     /// Chain gaps this writer saw (`backup_chain_gap`, spec §5.3).
     pub gaps: AtomicU64,
-    errors: [AtomicU64; 4],
+    errors: [AtomicU64; 5],
 }
 
 impl WriterStats {
@@ -188,6 +193,8 @@ pub struct Writer {
     tier: Option<TierInfo>,
     stopped: bool,
     unavailable: bool,
+    /// A `backup_journal_unavailable` episode is open (logged once).
+    journal_unavailable: bool,
     backoff_ns: u64,
     retry_at_ns: u64,
     listing: Option<TierListing>,
@@ -196,7 +203,8 @@ pub struct Writer {
     listed_at_ns: u64,
     /// Rescan the catalog when the view moved or the listing refreshed.
     scan_due: bool,
-    scanned_view_pos: u64,
+    /// `(view position, first_base)` at the last catalog scan.
+    scanned_key: (u64, u64),
     last_cut_ns: Option<u64>,
     mismatched: BTreeSet<u64>,
     last_offer: Option<(BackupWatermark, u64)>,
@@ -207,10 +215,7 @@ pub struct Writer {
 }
 
 fn journal_err(e: impl std::fmt::Display) -> TierError {
-    TierError::Corrupt {
-        what: "journal".into(),
-        detail: e.to_string(),
-    }
+    TierError::Journal(e.to_string())
 }
 
 fn wall_ns() -> u64 {
@@ -268,6 +273,32 @@ fn is_tier_bookkeeping(frame: &[u8]) -> bool {
         ),
         _ => false,
     }
+}
+
+/// Which held set (positions newest first) the writer may copy now
+/// (ruling R8d). A set extends the history the tier already has, so it is
+/// copied only when it cannot start a second chain beside a live one:
+/// (a) the tier has no watermark yet — the newest held set starts it;
+/// (b) `P <= through` — the set lies inside the chain (newest such first);
+/// (c) the gap case, `first_base > through` — this node's journal no longer
+///     reaches the chain end, so the newest held set at or above
+///     `first_base` starts the next chain (spec §5.3).
+///
+/// Otherwise every set is DEFERRED until the chain passes it: copying a set
+/// above the chain end at once would make `watermark_of` report that set's
+/// own (P, P, P), leave `[through, P)` uncopied, and jump the cluster's
+/// forward-only `oldest_set` on a healthy cluster.
+fn pick_set(held_newest_first: &[u64], through: Option<u64>, first_base: u64) -> Option<u64> {
+    let Some(t) = through else {
+        return held_newest_first.first().copied();
+    };
+    if let Some(&p) = held_newest_first.iter().find(|&&p| p <= t) {
+        return Some(p);
+    }
+    if first_base > t {
+        return held_newest_first.iter().copied().find(|&p| p >= first_base);
+    }
+    None
 }
 
 /// What one step of a [`FrameCursor`] found.
@@ -374,6 +405,27 @@ struct ChunkReader<'a> {
     buf: Vec<u8>,
     at: usize,
     crc: crc32fast::Hasher,
+    /// Set when the journal (not the destination) failed the read, so the
+    /// caller can name the journal rather than the target.
+    journal_failed: Option<String>,
+}
+
+impl ChunkReader<'_> {
+    fn new(cur: FrameCursor<'_>, to: u64) -> ChunkReader<'_> {
+        ChunkReader {
+            cur,
+            to,
+            buf: Vec::new(),
+            at: 0,
+            crc: crc32fast::Hasher::new(),
+            journal_failed: None,
+        }
+    }
+
+    fn journal_error(&mut self, msg: String) -> io::Error {
+        self.journal_failed = Some(msg.clone());
+        io::Error::other(msg)
+    }
 }
 
 impl Read for ChunkReader<'_> {
@@ -387,13 +439,12 @@ impl Read for ChunkReader<'_> {
             match self.cur.next_frame(self.to, &mut self.buf) {
                 Ok(Walk::Frame) => self.crc.update(&self.buf),
                 Ok(Walk::Limit) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "a frame passes the chunk's end on the second walk",
+                    return Err(self.journal_error(
+                        "a frame passes the chunk's end on the second walk".into(),
                     ));
                 }
-                Ok(Walk::Gone) => return Err(io::Error::other("journal purged under the cut")),
-                Err(e) => return Err(io::Error::other(e.to_string())),
+                Ok(Walk::Gone) => return Err(self.journal_error("purged under the cut".into())),
+                Err(e) => return Err(self.journal_error(e.to_string())),
             }
         }
         let n = dst.len().min(self.buf.len() - self.at);
@@ -433,13 +484,14 @@ impl Writer {
             tier: None,
             stopped: false,
             unavailable: false,
+            journal_unavailable: false,
             backoff_ns: 0,
             retry_at_ns: 0,
             listing: None,
             wm: None,
             listed_at_ns: 0,
             scan_due: true,
-            scanned_view_pos: u64::MAX,
+            scanned_key: (u64::MAX, u64::MAX),
             last_cut_ns: None,
             mismatched: BTreeSet::new(),
             last_offer: None,
@@ -456,6 +508,7 @@ impl Writer {
         }
         match self.work(now_ns) {
             Ok(progress) => {
+                self.journal_unavailable = false;
                 if self.unavailable {
                     self.unavailable = false;
                     crate::obs_event!(
@@ -513,6 +566,19 @@ impl Writer {
                 );
                 self.stop("tier_overlap_mismatch");
             }
+            TierError::Journal(msg) => {
+                self.shared.stats.count(WriterError::JournalUnavailable);
+                if !self.journal_unavailable {
+                    self.journal_unavailable = true;
+                    crate::obs_event!(
+                        Warn,
+                        "backup_journal_unavailable",
+                        node = self.node_id as u64,
+                        err = msg.as_str()
+                    );
+                }
+                self.back_off(now_ns);
+            }
             other => {
                 self.shared.stats.count(WriterError::Unavailable);
                 if !self.unavailable {
@@ -525,15 +591,21 @@ impl Writer {
                         err = other.to_string().as_str()
                     );
                 }
-                self.backoff_ns = if self.backoff_ns == 0 {
-                    RETRY_MIN_NS
-                } else {
-                    (self.backoff_ns * 2).min(RETRY_MAX_NS)
-                };
-                self.retry_at_ns = now_ns.saturating_add(self.backoff_ns);
-                self.listing = None;
+                self.back_off(now_ns);
             }
         }
+    }
+
+    /// The retry ladder (spec §10): 1 s doubling to 60 s; the listing is
+    /// re-read on the retry.
+    fn back_off(&mut self, now_ns: u64) {
+        self.backoff_ns = if self.backoff_ns == 0 {
+            RETRY_MIN_NS
+        } else {
+            (self.backoff_ns * 2).min(RETRY_MAX_NS)
+        };
+        self.retry_at_ns = now_ns.saturating_add(self.backoff_ns);
+        self.listing = None;
     }
 
     fn work(&mut self, now_ns: u64) -> Result<bool, TierError> {
@@ -627,11 +699,13 @@ impl Writer {
 
     fn copy_one_set(&mut self) -> Result<bool, TierError> {
         let view_pos = self.view.position.load(Ordering::Acquire);
-        if !self.scan_due && view_pos == self.scanned_view_pos {
+        let first_base = self.first_base.load(Ordering::Acquire);
+        let key = (view_pos, first_base);
+        if !self.scan_due && key == self.scanned_key {
             return Ok(false);
         }
         self.scan_due = false;
-        self.scanned_view_pos = view_pos;
+        self.scanned_key = key;
         let have: BTreeSet<u64> = self
             .listing
             .as_ref()
@@ -642,20 +716,36 @@ impl Writer {
             .snapshot_inner()
             .catalog
             .iter()
-            .filter(|e| e.is_agreed() && !have.contains(&e.position))
+            .filter(|e| {
+                e.is_agreed()
+                    && !have.contains(&e.position)
+                    && !self.mismatched.contains(&e.position)
+            })
             .map(SetLabel::from_catalog)
             .collect();
         todo.sort_by_key(|l| std::cmp::Reverse(l.position));
+        // The sets this node holds whole on disk, newest first.
+        let mut held: Vec<(SetLabel, Vec<LocalFile>)> = Vec::new();
         for label in todo {
-            if self.mismatched.contains(&label.position) {
-                continue;
+            if let Some(files) = self.open_local_set(&label)? {
+                held.push((label, files));
             }
-            let Some(mut files) = self.open_local_set(&label)? else {
-                continue;
+        }
+        // The keep hold (Task 9): the newest held set the tier still lacks —
+        // about to be copied, or deferred until the chain passes it.
+        let hold = held.first().map_or(0, |(l, _)| l.position);
+        self.shared.set_hold.store(hold, Ordering::Release);
+        let through = self.wm.map(|(_, _, t)| t);
+        loop {
+            let positions: Vec<u64> = held.iter().map(|(l, _)| l.position).collect();
+            let Some(p) = pick_set(&positions, through, first_base) else {
+                return Ok(false); // nothing eligible: deferred, or none held
             };
-            self.shared
-                .set_hold
-                .store(label.position, Ordering::Release);
+            let i = positions
+                .iter()
+                .position(|&x| x == p)
+                .expect("picked from held");
+            let (label, mut files) = held.remove(i);
             if let Some(why) = Self::check_local_hashes(&mut files)? {
                 self.mismatched.insert(label.position);
                 self.shared.stats.count(WriterError::HashMismatch);
@@ -669,12 +759,10 @@ impl Writer {
                 continue;
             }
             self.copy_set(&label, &mut files)?;
-            // The next pass rescans (the listing refresh sets `scan_due`)
-            // and moves the hold to the next set, or clears it.
+            // The listing refresh after a copy sets `scan_due`: the next pass
+            // rescans and moves the hold on.
             return Ok(true);
         }
-        self.shared.set_hold.store(0, Ordering::Release);
-        Ok(false)
     }
 
     /// Every artifact of `label` on this node's disk, opened; `None` when
@@ -863,14 +951,16 @@ impl Writer {
             let Some(cur) = FrameCursor::open(journal, e)? else {
                 return Err(journal_err("purged under the cut"));
             };
-            let mut src = ChunkReader {
-                cur,
-                to,
-                buf: Vec::new(),
-                at: 0,
-                crc: crc32fast::Hasher::new(),
+            let mut src = ChunkReader::new(cur, to);
+            let n = match write_object(dst, MAGIC_CHUNK, codec, level, e, to, &mut src, to - e) {
+                Ok(n) => n,
+                Err(err) => {
+                    return Err(match src.journal_failed.take() {
+                        Some(msg) => TierError::Journal(msg),
+                        None => err,
+                    });
+                }
             };
-            let n = write_object(dst, MAGIC_CHUNK, codec, level, e, to, &mut src, to - e)?;
             if src.crc.clone().finalize() != crc {
                 return Err(journal_err(format!("[{e}, {to}) read differently twice")));
             }
@@ -911,16 +1001,10 @@ impl Writer {
         let Some(cur) = FrameCursor::open(&self.journal, from)? else {
             return Ok(()); // purged meanwhile; the header already agreed
         };
-        let mut ours = ChunkReader {
-            cur,
-            to,
-            buf: Vec::new(),
-            at: 0,
-            crc: crc32fast::Hasher::new(),
-        };
+        let mut ours = ChunkReader::new(cur, to);
         let (mut a, mut b) = (vec![0u8; 1 << 16], vec![0u8; 1 << 16]);
         loop {
-            let n = fill(&mut ours, &mut a)?;
+            let n = fill(&mut ours, &mut a).map_err(|e| journal_err(e.to_string()))?;
             let m = fill(&mut theirs, &mut b).map_err(|_| mismatch())?;
             if n != m || a[..n] != b[..m] {
                 return Err(mismatch());
@@ -1053,13 +1137,7 @@ mod tests {
         assert_eq!((cur.pos, out.len()), (160, 96));
 
         // The second-pass reader yields the same bytes.
-        let mut r = ChunkReader {
-            cur: FrameCursor::open(&j, 0).unwrap().unwrap(),
-            to: 256,
-            buf: Vec::new(),
-            at: 0,
-            crc: crc32fast::Hasher::new(),
-        };
+        let mut r = ChunkReader::new(FrameCursor::open(&j, 0).unwrap().unwrap(), 256);
         let mut got = Vec::new();
         r.read_to_end(&mut got).unwrap();
         assert_eq!(got, want);
@@ -1099,6 +1177,45 @@ mod tests {
         assert!(is_tier_bookkeeping(&cluster(ClusterKind::BackupWatermark)));
         assert!(!is_tier_bookkeeping(&cluster(ClusterKind::Settings)));
         assert!(!is_tier_bookkeeping(&frame(FRAME_TYPE_MESSAGE, 64, 0)));
+    }
+
+    /// Ruling R8d: (a) no watermark → the newest held set; (b) a set at or
+    /// below `through` → copied (newest such); (c) the gap case → the newest
+    /// held set at or above `first_base`; otherwise every set waits.
+    #[test]
+    fn a_set_is_copied_only_inside_the_chain_or_to_start_one() {
+        // (a) an empty tier starts at the newest held set.
+        assert_eq!(pick_set(&[900, 500], None, 0), Some(900));
+        assert_eq!(pick_set(&[], None, 0), None);
+        // (b) inside the chain: newest set at or below `through`.
+        assert_eq!(pick_set(&[900, 500, 300], Some(600), 0), Some(500));
+        assert_eq!(pick_set(&[600], Some(600), 0), Some(600));
+        // Defer: above the chain end and the journal still reaches it — the
+        // chain must pass P first (no second chain on a healthy cluster).
+        assert_eq!(pick_set(&[900], Some(600), 100), None);
+        assert_eq!(pick_set(&[900], Some(600), 600), None);
+        // (c) the gap: the journal starts past the chain end; the newest held
+        // set at or above `first_base` starts the next chain.
+        assert_eq!(pick_set(&[1200, 900, 700], Some(600), 800), Some(1200));
+        assert_eq!(
+            pick_set(&[700], Some(600), 800),
+            None,
+            "below first_base: unusable"
+        );
+        // (b) still wins over (c) for a set inside the old chain.
+        assert_eq!(pick_set(&[1200, 400], Some(600), 800), Some(400));
+    }
+
+    /// A journal that cannot supply the range is named as the journal, not
+    /// the target (fix round 1).
+    #[test]
+    fn a_journal_short_of_the_range_is_a_journal_error() {
+        let d = tempdir();
+        let j = journal_with(d.path(), &[(0, frame(FRAME_TYPE_MESSAGE, 64, 0))]);
+        let mut r = ChunkReader::new(FrameCursor::open(&j, 0).unwrap().unwrap(), 128);
+        let mut out = Vec::new();
+        assert!(r.read_to_end(&mut out).is_err());
+        assert_eq!(r.journal_failed.as_deref(), Some("purged under the cut"));
     }
 
     #[test]

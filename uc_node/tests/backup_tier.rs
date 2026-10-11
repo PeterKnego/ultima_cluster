@@ -933,6 +933,88 @@ mod writer_e2e {
         let _keep = c.stop();
     }
 
+    /// Ruling R8d / spec §5.3: a newly agreed set ABOVE the chain end is
+    /// deferred until the chain passes it, then copied INTO the chain — it
+    /// never starts a second chain on a healthy cluster. A live writer with
+    /// a long quiet interval holds the tier at `S0 … E`; an instant `P > E`
+    /// is taken; the committed watermark's `oldest_set` must stay `S0` at
+    /// every sample until `through > P`, set `P` must end up in the tier,
+    /// the chain from `S0` must reach `through`, and no gap is counted.
+    #[test]
+    fn a_second_instant_above_the_chain_end_extends_the_chain_not_a_new_one() {
+        let _g = serialize();
+        let tier = tmp_tier();
+        let cfg = writer_cfg(tier.path(), 64 << 20, Duration::from_secs(3));
+        let mut c = spawn(3, 0, opts("tier-second", false), |i| {
+            (i == 1).then(|| cfg.clone())
+        });
+        start_sums(&mut c);
+        let l = await_single_leader(&c, 30);
+        await_capable(&c);
+        let all = c.running();
+        submit_frames(c.node(l), 200);
+        let s0 = instant_until_complete(&c, l, &all);
+        await_agreed(&c, &all, s0);
+        submit_frames(c.node(l), 200);
+        let w0 = await_watermark(&c, l, 30, |w| w.through > s0);
+        assert_eq!(w0.oldest_set, s0);
+
+        // A second instant just after a cut: P lies above the chain end.
+        submit_frames(c.node(l), 300);
+        let p = instant_until_complete(&c, l, &all);
+        let at_p = watermark(c.node(l)).unwrap();
+        assert!(
+            at_p.through < p,
+            "precondition: the chain end {} must lie below the new instant {p}",
+            at_p.through
+        );
+        await_agreed(&c, &all, p);
+        submit_frames(c.node(l), 100);
+
+        // Keep loading: the leader commits a report only when `through`
+        // advances (Task 7), so `newest_set = P` lands with the cut after
+        // the one that made P eligible.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut samples = 0u64;
+        let mut next_load = Instant::now();
+        let last = loop {
+            if Instant::now() >= next_load {
+                submit_frames(c.node(l), 50);
+                next_load = Instant::now() + Duration::from_millis(500);
+            }
+            let w = watermark(c.node(l)).unwrap();
+            samples += 1;
+            assert_eq!(
+                w.oldest_set, s0,
+                "the watermark started a new chain at a healthy instant: {w:?} (S0 = {s0}, P = {p})"
+            );
+            if w.through > p && w.newest_set == p {
+                break w;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the chain never passed P = {p} with P in the tier: {w:?}"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        };
+        let shared = c.node(1).backup_writer().unwrap();
+        assert_eq!(
+            shared.stats.gaps.load(Ordering::Relaxed),
+            0,
+            "no backup_chain_gap on a healthy cluster"
+        );
+        let _keep = c.stop();
+        let listing = list_tier(&FsTarget::new(tier.path())).unwrap();
+        assert!(listing.sets.iter().any(|x| x.position == s0));
+        assert!(listing.sets.iter().any(|x| x.position == p), "{listing:?}");
+        assert!(
+            reach_from(&listing.chunks, s0) >= last.through,
+            "the chain from S0 reaches through: {:?}",
+            listing.chunks
+        );
+        eprintln!("second instant: S0={s0} P={p} final={last:?} samples={samples}");
+    }
+
     /// Spec §5.3 / §11.2, the Review-Focus-1 test: a chunk never holds
     /// bytes a failover truncated. EVERY voter runs a writer into its own
     /// tier, so whichever node leads is a writer. The leader is cut off from
