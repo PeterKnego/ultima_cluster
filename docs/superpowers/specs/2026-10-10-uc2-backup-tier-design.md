@@ -532,3 +532,152 @@ excluded by the 0.11.0 flag day.
    rollback set is protected exactly until completion, then ages out.
 5. A whole-cluster restore at a Q far past the start set (more than `fsm_lag`
    of replay) — the restored cluster must elect and commit (§13).
+
+#### Errata (as built, 2026-10-11)
+
+Where the build differs from or refines this spec; numbered as in the plan
+(`docs/superpowers/plans/2026-10-10-uc2-backup-tier.md`) and its execution
+ledger (PF = pre-flight, R = execution rulings, by task).
+
+- **PF1, R3a — the chain rule, first step included (§4.5).** A chunk extends
+  a chain at cursor c iff `from ≤ c < to`; among those the greatest `to`
+  wins, in both `reach_from` and `plan_chain`. "The chunk starting at the
+  cursor" was loose prose: chunks are cut at chain ends, not at sets, so a set
+  usually falls INSIDE a chunk, and a begin-at-start rule would leave every
+  newer set reaching nothing — restore would fall back to the oldest set, and
+  once retention deleted it the tier would restore nothing.
+- **PF2, R8a — raw journal blocks, padding bodies zeroed (§5.3).** The writer
+  does not re-serialise frames from `replay_journal_from` (`Replay` skips
+  padding, so the log could not be reproduced). It reads the archived blocks
+  raw (`find_block` + `Journal::read`), slices `[E, end)` and walks frame
+  headers only to find the last frame end ≤ C. Padding-frame bodies and
+  alignment slack are zeroed in the chunk: those bytes are not replicated
+  (padding travels header-only and each node archives its own leftovers), so
+  byte-exact copies would trip `tier_overlap_mismatch` between two honest
+  writers. Every other byte is the log's own.
+- **R8b, R11a(ii) — bookkeeping-only quiet cuts (§5.3).** A quiet cut whose
+  range holds only padding and `BackupWatermark` frames is skipped — else
+  each report's own kind-7 frame would re-trigger a cut forever on an idle
+  cluster. One such cut IS allowed when the tier's `through` equals its newest
+  complete set's position, so a freshly copied set on an idle cluster gets a
+  chunk past it and becomes restorable; after that cut `through` is past the
+  set and the skip applies again. (In practice an instant's own
+  `SnapshotReport` frames already follow S, so the exception is defensive.)
+  `Uc2BackupBehind` keys on the level of `uc2_backup_lag_bytes` (> 256 MiB),
+  not on "commit moved while `through` stood still", for the same reason.
+- **R8c — the gap event (§5.3).** `backup_chain_gap` also fires when the
+  watermark jumps past the old reach, not only when the writer's own journal
+  no longer reaches E; the writer's shared state gains `stopped` and `gaps`.
+- **R8d, superseded by R9b — CUT TO THE SET (§5.2/§5.3).** Copying a set above
+  the chain end would start a new bare chain (`watermark_of` prefers the
+  set's reach) and abandon `[E_old, P)` at every instant. R8d deferred such a
+  set until the chain passed it; with instants more frequent than chunk cuts
+  and `retain_sets = 1` every deferred set left the catalog first, so the tier
+  never gained a second set. As built: a set is copied when the tier has no
+  watermark yet, when P ≤ `through`, or in the gap case (the newest held set ≥
+  `first_base`); otherwise the writer's next cut ends exactly at P (several
+  chunks if `P − through > chunk_bytes`), then copies P. Smaller chunks at
+  instant boundaries are the cost.
+- **R8e — the leader keeps a report that moves ANY field (§6.2).** The
+  leader's filter dropped a report unless `through` moved, which blocked a
+  late set copy (`newest_set`) and retention's `oldest_set` advance at an
+  unchanged `through` — on an idle cluster indefinitely. As built the leader
+  keeps a report iff it moves any of `through`, `newest_set`, `oldest_set`
+  forward against the committed entry, and coalescing keeps per-field maxima
+  (`oldest_set` clamped ≤ `newest_set`). A report whose `through` is BEHIND the
+  committed entry is still dropped whole (the FSM would no-op it). A follower
+  with no known leader puts the claim back in its slot, and the writer
+  re-offers an unchanged claim every 10 s, because a leader change drops the
+  leader's pending reports.
+- **R5a — the `oldest_set` clamp (§6.1).** The clamp of `oldest_set` to
+  `newest_set` at apply is defensive: the record decoder already refuses
+  `oldest_set > newest_set` (42), and for any accepted record the clamp
+  cannot bind. It is tested through `ClusterState::put_backup_watermark`.
+- **R9a — the purge hold (§5.4).** The hold is keyed on the TIER's `through`
+  (any writer's chunks count — bytes in the tier are backed up whoever wrote
+  them), not on this writer's own chain alone, and it clamps the journal purge
+  target (sets are covered by the writer's keep list). A STOPPED writer
+  (foreign target, overlap mismatch) RELEASES its hold: it can never progress,
+  and `Uc2BackupWriterError` already alerts.
+- **R10a — retention waits for the view (§7.2).** A writer plans retention only
+  once its committed cluster view has consumed at least to the newest complete
+  set in the tier. Any pin whose rollback set is in the tier has its record
+  below that set, so a view past it has applied the pin; a lagging view would
+  not yet hold the pin that protects a set another writer copied.
+- **The copy filter never re-copies a set retention would delete (§5.2/§7).**
+  A catalog set the policy (with pin protection) would delete the moment it
+  landed is not copied — whether it lies below the oldest set or above a
+  protected one — or every deleted set would come straight back. Incomplete
+  set directories (no `SET`) below the oldest kept set are removed once their
+  newest entry is older than one hour (`BackupTarget::newest_entry_age`), so a
+  partially deleted set does not stay a `tier verify` finding forever.
+- **R10b — `SET` only after every object is confirmed (§4.5.2).** Retention's
+  age guard cannot see an upload in flight, so a set directory being filled can
+  lose objects to a concurrent deletion. Before putting `SET`, `copy_set`
+  re-lists the directory and confirms every object it is about to name is
+  present with a matching header length, re-placing any that vanished. A
+  delete landing between the last check and the `SET` put remains a residual
+  window, bounded by the placement rounds and the retry ladder.
+- **`BackupConfig::retention_interval` (§5.1).** The retention pass runs every
+  60 s (`DEFAULT_RETENTION_INTERVAL`). This is a field of `BackupConfig` for
+  tests to shorten, NOT a `[backup]` key — the loader always takes the default.
+- **`[backup]` via `StartOpts` (§5.1).** As specified, and as built:
+  `StartupOptions` → `StartOpts::backup: Option<BackupConfig>`, never a
+  `NodeConfig` field. The writer thread `uc2-backup` sleeps 100 ms when idle
+  and is appended LAST to the node's agents, so `/healthz`'s indices 0–4 are
+  unchanged.
+- **D11 as built — the tier object (§4.1.1).** CRC-32/IEEE via `crc32fast`
+  (now a regular dependency of `uc_node`), over the raw bytes: once per object
+  in the header and once per block, so damage is located to one ≤ 1 MiB block.
+  A reader refuses a raw total that differs from the header's `raw_len`.
+- **R11a(i) — restore points are `(S, reach]` (§6.1, §8.1).** A restore point Q
+  is a frame end with `S < Q ≤ reach`: the start set strictly below Q. Q == S
+  is refused, because an empty restored journal reopens at durable 0. The
+  watermark therefore means "any frame end in `(oldest_set, through]`", not
+  `[oldest_set, through]`.
+- **R11c — the new-node id check (§8.2).** `--new-node` must check the id
+  against the membership the restored node will BOOT with — the artifact at S
+  plus every `Membership` frame in `[S, Q)`, the same fold `rederive_config`
+  does — not the membership at S alone: an id added in `(S, Q]` would boot as an
+  existing member with an empty vote, D9's forbidden case. (Moot in 3a after
+  R12a, kept for 3b.) The builder also writes a `RESTORING` marker first and
+  removes it last, and holds `instance.lock` for the whole build.
+- **R11d — there is no `uc2ctl add` (§8.2).** The verbs are `add-learner` then
+  `promote`; the docs and hints name both.
+- **R12a — `--new-node` is refused, deferred to 3b (§8.2).** A tier-seeded node
+  joining a LIVE cluster is cut to 0 by term-map reconcile (its restored map
+  `[(t, S)]` against the leader's `[(t, 0)]` has no alignment →
+  `Truncate{to: 0}`), then fail-stops the archive on `PositionPurged`.
+  `uc2ctl tier restore --new-node` refuses by name (`new_node_unsupported`,
+  pointing at the ordinary snapshot-session join); the fix is node-side
+  lineage seeding and is 3b's. Its e2e stays `#[ignore]`d as 3b's acceptance
+  test. Whole-cluster restore is unaffected (every node shares `[(t, S)]`).
+- **PF-fork, R12b, R12c — the fork's membership (§8.2, §13).**
+  `force_single_member` works and the fork leads alone, but its cluster FSM
+  still names the old voters. As built the leader appends the kernel's config
+  as a `Membership` command at first leadership when the FSM's version is
+  older — once the cluster agent has consumed past the kernel record,
+  single-in-flight, refused (and given up for the incarnation) unless the FSM
+  validates it — which also heals the existing force-single-member inv12
+  hole. Until that check has latched, admin membership requests answer retry
+  (an earlier reconfig would break the FSM's version chain for good), and the
+  check runs under CONSENSUS serving, not client serving, so a jumbo join gate
+  pending on a silent member cannot block removing it (R12c). The fork's
+  inherited `backups` entry is cosmetic (the purge hold is writer-local) and
+  documented: the operator may `uc2ctl tier forget` it (R12b).
+- **R7a — `--tier-id` (§6.3).** `uc2ctl tier forget --tier-id <id>` (hex
+  `0x…` or decimal) is a flag, not the positional sketched in §6.3.
+- **PF3 — `CORPUS` (§8.2).** `uc_ctl → uc_diffreplay` with
+  `default-features = false` is acyclic, so export-corpus writes `CORPUS`
+  through `CorpusManifest::write` — one writer of the format.
+- **PF4 — test scratch.** Tier unit tests use `cluster_agent.rs`'s `tempdir()`
+  pattern (`CARGO_TARGET_TMPDIR`, else the target tree), prefix `uc2-tier-`;
+  never `/tmp`.
+- **PF-cold — the cold start (§13).** The risk was real: a whole-cluster cold
+  restart with the log end well past `fsm_lag` beyond applied deadlocked
+  (attach waits for join, commit waits for apply) — #95, fixed by PR #96 before
+  the capstone (§11.6) ran.
+- **R14a — the capstone's start set (§11.6).** A set frozen before a row has
+  applied anything (cursor `None`) is refused fatally by the start-set install
+  — #98, outside the tier. The capstone takes its first set after 20 acked
+  mutations; no assertion was loosened.
