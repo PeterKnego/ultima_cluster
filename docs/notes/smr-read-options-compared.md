@@ -146,7 +146,14 @@ Checked against the code on 2026-10-07:
   [`uc2-read-your-writes-explained.md`](uc2-read-your-writes-explained.md); the
   2026-10-10 fleet run
   ([`uc2-read-types-under-writes-2026-10-10.md`](../benchmarks/uc2-read-types-under-writes-2026-10-10.md))
-  measured them at about a snapshot read's cost.
+  measured them at about a snapshot read's cost on `c6id.2xlarge`; the
+  2026-10-11 run on Graviton
+  ([`uc2-read-types-under-writes-c9gd-2026-10-11.md`](../benchmarks/uc2-read-types-under-writes-c9gd-2026-10-11.md))
+  pushed writes to the ceiling — 15 M read-your-writes reads/s across 3 nodes
+  beside 2 M committed writes/s at p99 under 0.5 ms, and 4.6–5.3 M committed
+  writes/s with reads alongside at the unpaced ceiling — and found the
+  leader-side read-your-writes read at 0.78–0.91 of a snapshot read there, a
+  recorded miss of its ≥ 0.90 bar.
 - **Not offered today:** time-addressed reads (H; `query` gets no `time_ns` by
   design) and historical reads at a position (L).
 
