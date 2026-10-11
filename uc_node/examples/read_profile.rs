@@ -828,6 +828,11 @@ struct ReadStats {
     writes_attempted: u64,
     writes_accepted: u64,
     writes_dropped: u64,
+    /// The cluster's commit counter advance over the send window, in bytes
+    /// per second. A write "accepted" above only entered the ingress ring;
+    /// this is what the cluster actually committed while the reads ran
+    /// (queries never append, so it is the write load, frame-sized).
+    commit_bytes_per_sec: f64,
     elapsed: Duration,
     reads_per_sec: f64,
     p50_ms: f64,
@@ -1081,6 +1086,7 @@ fn run_read_measurement(
     // attach, before drain) so boot-time yields do not pollute the rate.
     let occ_before = sample_all(task_dirs);
     let occ_t0 = Instant::now();
+    let commit_at_t0 = cnc.counters().commit.load_acquire();
 
     let deadline = t0 + Duration::from_secs(secs);
 
@@ -1174,6 +1180,15 @@ fn run_read_measurement(
     // End of the send window: stop the write load and the depth sampler here,
     // BEFORE the drain, so neither describes (or perturbs) the tail.
     writer_stop.store(true, Ordering::Relaxed);
+    let commit_bytes_per_sec = if occ_secs > 0.0 {
+        cnc.counters()
+            .commit
+            .load_acquire()
+            .saturating_sub(commit_at_t0) as f64
+            / occ_secs
+    } else {
+        0.0
+    };
     depth_sampler.join().expect("depth sampler thread panicked");
     let writes = match writer {
         Some(w) => {
@@ -1237,6 +1252,7 @@ fn run_read_measurement(
             writes_attempted: writes.0,
             writes_accepted: writes.1,
             writes_dropped: writes.2,
+            commit_bytes_per_sec,
             elapsed,
             reads_per_sec,
             p50_ms,
@@ -1452,6 +1468,10 @@ fn print_read_report(mode: Mode, readers: u64, write_rate: u64, s: &ReadStats, o
         "background writes/s   : target {write_rate}, accepted {}, dropped {} (of {} attempts)",
         s.writes_accepted, s.writes_dropped, s.writes_attempted
     );
+    println!(
+        "cluster commit advance : {:.0} bytes/s over the send window",
+        s.commit_bytes_per_sec
+    );
     println!("reads resolved        : {}", s.reads);
     println!("retries               : {}", s.retried);
     println!("not_leader redirects  : {}", s.not_leader);
@@ -1665,6 +1685,9 @@ struct Rung {
     /// ring and never reached the node.
     pub writes_attempted: u64,
     pub writes_dropped: u64,
+    /// The cluster's commit advance over the send window (bytes/s): the
+    /// committed write load, as opposed to ring-accepted.
+    pub commit_bytes_per_sec: f64,
     /// Occupancy ranking, busiest (fewest yields) first, agent threads only.
     pub agents: Vec<AgentRank>,
 }
@@ -1687,6 +1710,7 @@ impl Rung {
             write_unpaced,
             writes_attempted: s.writes_attempted,
             writes_dropped: s.writes_dropped,
+            commit_bytes_per_sec: s.commit_bytes_per_sec,
             reads: s.reads,
             reads_per_sec: s.reads_per_sec,
             p50_ms: s.p50_ms,
@@ -1789,7 +1813,8 @@ fn rung_to_json(r: &Rung) -> String {
          \"reads_per_sec\":{},\"p50_ms\":{},\"p99_ms\":{},\"retried\":{},\"not_leader\":{},\
          \"overwritten\":{},\"inflight_at_end\":{},\"inflight_mean\":{},\"inflight_min\":{},\
          \"regression\":{},\"writes_per_sec\":{},\"write_threads\":{},\"write_unpaced\":{},\
-         \"writes_attempted\":{},\"writes_dropped\":{},\"agents\":[{}]}}",
+         \"writes_attempted\":{},\"writes_dropped\":{},\"commit_bytes_per_sec\":{},\
+         \"agents\":[{}]}}",
         r.mode_str(),
         r.readers,
         r.write_rate,
@@ -1809,6 +1834,7 @@ fn rung_to_json(r: &Rung) -> String {
         r.write_unpaced,
         r.writes_attempted,
         r.writes_dropped,
+        r.commit_bytes_per_sec,
         agents
     )
 }
@@ -1912,6 +1938,7 @@ fn rung_from_json(line: &str) -> Option<Rung> {
         write_unpaced: json_bool(head, "write_unpaced").unwrap_or(false),
         writes_attempted: json_u64(head, "writes_attempted").unwrap_or(0),
         writes_dropped: json_u64(head, "writes_dropped").unwrap_or(0),
+        commit_bytes_per_sec: json_f64(head, "commit_bytes_per_sec").unwrap_or(0.0),
         agents,
     })
 }
@@ -2522,6 +2549,7 @@ mod tests {
             write_unpaced: false,
             writes_attempted: 0,
             writes_dropped: 0,
+            commit_bytes_per_sec: 0.0,
             agents: vec![agent(top, 10, 100.0), agent("uc2-archive", 11, 1_000.0)],
         }
     }

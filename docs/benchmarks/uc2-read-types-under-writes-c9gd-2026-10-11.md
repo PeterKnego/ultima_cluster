@@ -63,9 +63,18 @@ PR #97), so the 0-writes column is a real baseline, not the idle-sleep cap the
 ## 2. Questions and bars
 
 **Q1 — the write ceiling with reads alongside (reported, no bar).** For each
-arm: accepted writes/s at the `max` rung, the fraction of attempts dropped
-there, and the highest paced rung whose accepted rate reached ≥ 95 % of its
-target. This is the number the README's 3.8 M/s is compared against — that
+arm: **committed** writes/s at the `max` rung — the cluster's commit counter
+advance over the send window divided by the frame size (the harness reads the
+cnc commit word at the window's start and end; the frame size is checked at a
+paced rung, where committed bytes ÷ accepted writes must give one constant) —
+beside the ring-accepted writes/s, the fraction of attempts dropped on a full
+ring, and the highest paced rung whose accepted rate reached ≥ 95 % of its
+target. *Amended before the run, after a 5 s smoke of the `max` rung showed
+ring-accepted rates (4.6–5.9 M/s) that the cluster could not plausibly have
+committed: a write "accepted" by the ingress ring can still be turned away at
+the node's admission window, and this harness discards write responses, so
+only the commit counter says what was committed. The accepted number stays
+in the record as what the writer did; the committed number is the answer.* This is the number the README's 3.8 M/s is compared against — that
 figure came from a pipelined `uc_client::Engine` with 4,096 writes in flight
 and no reads; this harness's writer is an unwindowed `try_write` loop, so the
 two are not the same instrument, and a lower ceiling here is expected. What is
@@ -100,6 +109,7 @@ fleets; this says whether reads move the same way.
 and a sagging in-flight depth are results, not invalidity. A missing rep makes
 that cell's verdict INCONCLUSIVE. A paced rung whose accepted rate is below 95 %
 of its target is reported at its accepted rate and flagged as writer-bound.
+Q4's "accepted, not targeted" write rate means the committed rate from Q1.
 
 ## 3. What this does not measure
 

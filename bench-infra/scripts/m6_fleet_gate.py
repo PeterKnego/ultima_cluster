@@ -1796,6 +1796,7 @@ def rm_run_rung(hosts, members, mode, place, readers, write_rate, secs, admissio
             "writes_dropped": r.get("writes_dropped", 0),
             "write_threads": r.get("write_threads", 1),
             "write_unpaced": r.get("write_unpaced", False),
+            "commit_bytes_per_sec": r.get("commit_bytes_per_sec", 0.0),
         })
     lead = next(h for h in per_host if h["role"] == "leader")
     rec = {
@@ -1807,6 +1808,9 @@ def rm_run_rung(hosts, members, mode, place, readers, write_rate, secs, admissio
                                 if lead["writes_attempted"] else 0.0),
         "write_threads": lead["write_threads"],
         "write_unpaced": lead["write_unpaced"],
+        # The cluster's commit advance (bytes/s) seen from the leader host: the
+        # committed write load. Divide by the frame size for frames/s.
+        "commit_bytes_per_sec": lead["commit_bytes_per_sec"],
         "p50_ms_max": max(h["p50_ms"] for h in per_host),
         "p99_ms_max": max(h["p99_ms"] for h in per_host),
         "retry_frac_max": max(h["retry_frac"] for h in per_host),
@@ -1847,7 +1851,8 @@ def run_read_matrix(hosts, members, readers, write_rates, secs, admission_kib, r
                         f.write(json.dumps(rec) + "\n")
                     log(f"  reads {rec['total_reads_per_sec']:,.0f}/s  writes "
                         f"{rec['writes_per_sec']:,.0f}/s (dropped "
-                        f"{rec['writes_dropped_frac']:.1%})  p50 {rec['p50_ms_max']:.3f}  p99 "
+                        f"{rec['writes_dropped_frac']:.1%}, commit "
+                        f"{rec['commit_bytes_per_sec'] / 1e6:,.1f} MB/s)  p50 {rec['p50_ms_max']:.3f}  p99 "
                         f"{rec['p99_ms_max']:.3f} ms  retry {rec['retry_frac_max']:.1%}  depth "
                         f"{rec['depth_min_frac']:.0%}")
                 else:
