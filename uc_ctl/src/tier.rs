@@ -323,17 +323,18 @@ mod tests {
         let out = d.path().join("out");
         let e = restore(&tier, None, &out, RestoreMode::Cluster("app".into())).unwrap_err();
         assert!(e.to_string().contains("no TIER"), "{e}");
+        // Ruling R12a: `--new-node` is refused by name BEFORE the target is
+        // opened — here it has no TIER, which the open would have named.
+        let e = restore(&tier, None, &out, RestoreMode::NewNode(9)).unwrap_err();
+        assert!(e.to_string().contains("new_node_unsupported"), "{e}");
+        assert!(!e.to_string().contains("no TIER"), "{e}");
+        assert!(!out.exists());
         uc_node::tier::target::open_or_create_tier(&FsTarget::new(&tier), "app", 1).unwrap();
         let e = restore(&tier, None, &out, RestoreMode::Cluster("other".into())).unwrap_err();
         assert!(e.to_string().contains("--confirm-cluster"), "{e}");
         // The right app_id on a tier with no set: unreachable, by name.
         let e = restore(&tier, None, &out, RestoreMode::Cluster("app".into())).unwrap_err();
         assert!(e.to_string().contains("restore_point_unreachable"), "{e}");
-        assert!(!out.exists());
-        // Ruling R12a: `--new-node` is refused by name before the target is
-        // even opened (a target with no TIER would otherwise name that).
-        let e = restore(&tier, None, &out, RestoreMode::NewNode(9)).unwrap_err();
-        assert!(e.to_string().contains("new_node_unsupported"), "{e}");
         assert!(!out.exists());
         assert_eq!(
             data_loss_line(4096),

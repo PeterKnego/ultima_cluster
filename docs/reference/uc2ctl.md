@@ -935,8 +935,14 @@ then `forked: … config_version=<V> dropped=[…]` and the next step.
 Start node `N` on `<DIR>` with `app_id = "<NEW>"` in its `node.toml`. At its
 first leadership the node appends the single-voter membership as a cluster
 command, so the replicated cluster state (`uc2ctl status`, the cluster
-artifact) agrees with the forced config once that commits. Grow the fork with
+artifact) agrees with the forced config once that commits; until it has,
+membership changes answer `retry`. Grow the fork with
 [`add-learner`](#add-learner) and [`promote`](#promote).
+
+The fork inherits the source tier's watermark entry in its cluster state.
+That is cosmetic — the purge hold is local to a writer, and the fork has
+none until you configure one — and `uc2ctl tier forget --tier-id <id>` on
+the fork drops it.
 
 Refusals, each by name, each building nothing — the `tier restore` list,
 plus:

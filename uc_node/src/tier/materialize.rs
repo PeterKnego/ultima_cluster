@@ -306,6 +306,23 @@ pub fn fork(
     node_id: u32,
     now_ns: u64,
 ) -> Result<Forked, TierError> {
+    fork_with(t, q, out_dir, new_app_id, node_id, now_ns, |d| {
+        crate::recovery::force_single_member(d, node_id)
+    })
+}
+
+/// [`fork`] with the force step injectable (a test seam: the build's own
+/// `fork_node_unknown` check leaves no ordinary way to make the real force
+/// fail after a good build).
+fn fork_with(
+    t: &dyn BackupTarget,
+    q: Option<u64>,
+    out_dir: &Path,
+    new_app_id: &str,
+    node_id: u32,
+    now_ns: u64,
+    force: impl FnOnce(&Path) -> io::Result<crate::recovery::ForceReport>,
+) -> Result<Forked, TierError> {
     let info = read_tier(t)?.ok_or_else(|| refused("no tier at the target (no TIER file)"))?;
     if new_app_id == info.app_id {
         return Err(refused(format!(
@@ -313,17 +330,66 @@ pub fn fork(
              separate cluster and must run under a new app_id"
         )));
     }
+    // What exists now, so a failed force can put `out_dir` back the way the
+    // builder's own refusals do — a materialised multi-voter clone of the
+    // source must never be left bootable.
+    let created = !out_dir.exists();
+    let before: Vec<(PathBuf, bool)> = ["instance.lock", "journal", "state", "snapshots"]
+        .iter()
+        .map(|n| {
+            let p = out_dir.join(n);
+            let e = p.exists();
+            (p, e)
+        })
+        .collect();
     let materialized = materialize(t, q, out_dir, Mode::Fork { node_id }, now_ns)?;
-    let force = crate::recovery::force_single_member(out_dir, node_id).map_err(|e| {
+    let done = force(out_dir).map_err(|e| {
         refused(format!(
-            "fork: {} was materialized but force-single-member failed: {e}",
-            out_dir.display()
+            "fork: force-single-member failed on the built directory (removed again): {e}"
         ))
-    })?;
+    });
+    let force = match done.and_then(|f| {
+        append_restored(out_dir, &format!("app_id={new_app_id}\n"))?;
+        Ok(f)
+    }) {
+        Ok(f) => f,
+        Err(e) => {
+            unbuild(out_dir, created, &before);
+            return Err(e);
+        }
+    };
     Ok(Forked {
         materialized,
         force,
     })
+}
+
+/// Append one `key=value` line to the placed `RESTORED` audit file.
+fn append_restored(out_dir: &Path, line: &str) -> io::Result<()> {
+    let mut f = fs::OpenOptions::new()
+        .append(true)
+        .open(out_dir.join(RESTORED_FILE))?;
+    f.write_all(line.as_bytes())?;
+    f.sync_all()
+}
+
+/// Undo a PLACED build: remove what the build placed (the durable
+/// directories and `RESTORED`), recreate the durable directories that were
+/// there (empty) before, then [`undo_target`] for the rest.
+fn unbuild(out_dir: &Path, created: bool, before: &[(PathBuf, bool)]) {
+    if created {
+        let _ = fs::remove_dir_all(out_dir);
+        return;
+    }
+    let _ = fs::remove_file(out_dir.join(RESTORED_FILE));
+    for d in DURABLE_DIRS {
+        let p = out_dir.join(d);
+        let _ = fs::remove_dir_all(&p);
+        if before.iter().any(|(b, e)| *b == p && *e) {
+            let _ = fs::create_dir(&p);
+        }
+    }
+    undo_target(out_dir, created, before);
 }
 
 /// What [`export_corpus`] built: the fields of the diff-replay `CORPUS`
@@ -1265,6 +1331,71 @@ mod tests {
         let d2 = out(&fx, "placed");
         materialize(&t, None, &d2, Mode::Recovery, 1).unwrap();
         assert!(!d2.join(RESTORING_FILE).exists());
+    }
+
+    #[test]
+    fn fork_refuses_an_id_outside_the_membership_or_tombstoned() {
+        let fx = fixture();
+        let t = FsTarget::new(&fx.tier);
+        // 9 is the fixture's tombstone; 7 was never a member.
+        for id in [9, 7] {
+            let d = out(&fx, &format!("fork{id}"));
+            let m = fork(&t, None, &d, "other", id, 1)
+                .map(|f| f.materialized)
+                .map_err(|e| e.to_string())
+                .expect_err("refused");
+            assert!(m.contains("fork_node_unknown"), "{id}: {m}");
+            assert!(!d.exists(), "{id}: nothing built");
+        }
+        let d = out(&fx, "fork-same");
+        let m = fork(&t, None, &d, APP, 0, 1)
+            .map(|f| f.materialized)
+            .map_err(|e| e.to_string())
+            .expect_err("refused");
+        assert!(m.contains("fork_same_app_id"), "{m}");
+        assert!(!d.exists());
+        // A good fork records its new app id beside the mode.
+        let d = out(&fx, "fork-ok");
+        let f = fork(&t, None, &d, "other", 0, 1).unwrap();
+        assert_eq!(f.force.dropped_peers, vec![1, 2, 5]);
+        let r = fs::read_to_string(d.join(RESTORED_FILE)).unwrap();
+        assert!(
+            r.contains("mode=fork:0\n") && r.contains("app_id=other\n"),
+            "{r}"
+        );
+    }
+
+    /// A force that fails AFTER a good build leaves nothing bootable: a
+    /// directory the fork created is removed; a pre-existing one is put
+    /// back as it was (its empty durable dir and volatile files kept).
+    #[test]
+    fn a_fork_whose_force_fails_unbuilds_the_directory() {
+        let fx = fixture();
+        let t = FsTarget::new(&fx.tier);
+        let fail = |_: &Path| -> io::Result<crate::recovery::ForceReport> {
+            Err(io::Error::other("injected"))
+        };
+        let d = out(&fx, "fork-fail-new");
+        let e = fork_with(&t, None, &d, "other", 0, 1, fail).unwrap_err();
+        assert!(e.to_string().contains("injected"), "{e}");
+        assert!(!d.exists(), "a created directory is removed");
+
+        let d = out(&fx, "fork-fail-old");
+        fs::create_dir_all(d.join("journal")).unwrap();
+        fs::write(d.join("cnc2.dat"), b"x").unwrap();
+        fork_with(&t, None, &d, "other", 0, 1, fail).unwrap_err();
+        assert!(d.join("journal").is_dir());
+        assert_eq!(fs::read_dir(d.join("journal")).unwrap().count(), 0);
+        for gone in [
+            "state",
+            "snapshots",
+            RESTORED_FILE,
+            RESTORING_FILE,
+            RESTORE_TMP,
+        ] {
+            assert!(!d.join(gone).exists(), "{gone} left behind");
+        }
+        assert!(d.join("cnc2.dat").is_file(), "volatile leftovers kept");
     }
 
     #[test]

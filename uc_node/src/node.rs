@@ -3819,10 +3819,13 @@ struct Consensus {
     /// Ruling PF-fork: `true` once this incarnation, leading, has seen the
     /// committed cluster FSM's membership at least as new as the kernel's
     /// adopted config — or has appended the `Membership` command that makes
-    /// it so. LATCHED: after boot the kernel's config moves only through
-    /// `Membership` frames, which the FSM applies at commit, so only an
-    /// offline rewrite of `config.state` (`force-single-member`, `tier fork`)
-    /// can leave the two apart, and it can only have happened before boot.
+    /// it so, or has found a position-0 config it must not write (a wipe).
+    /// LATCHED: after boot the kernel's config moves only through
+    /// `Membership` frames, which the FSM applies at commit, so apart from a
+    /// wipe's by-fiat config (position 0, excluded) only an offline rewrite
+    /// of `config.state` (`force-single-member`, `tier fork`) can leave the
+    /// two apart, and it can only have happened before boot. While `false`,
+    /// admin membership changes answer retry (`propose_and_append`).
     membership_reconciled_latched: bool,
     /// Throttle for `version_gate_waiting` (on `pass_mono_ns`): the next
     /// pass at or after which the closed gate may log again.
@@ -8511,7 +8514,10 @@ impl Consensus {
     ///   position — below that a frame carrying the config may still be on
     ///   its way to the FSM, as it is for every ordinary change in flight;
     /// * only when the committed view's version is OLDER than the kernel's,
-    ///   which, consumed past the record, no ordinary history produces;
+    ///   which, consumed past the record, no ordinary history produces —
+    ///   except a wipe-and-rejoin, whose truncate-to-0 keeps its current
+    ///   (possibly uncommitted) config by fiat at position 0; a position-0
+    ///   kernel config is therefore never appended;
     /// * single-in-flight like every leader-issued kind, and refused (then
     ///   given up for the incarnation, logged) unless the FSM's own
     ///   `validate` accepts it — the version must chain, `view + 1`, which the
@@ -8536,6 +8542,15 @@ impl Consensus {
         let committed = self.cluster_view.membership();
         let kernel = self.sm.config().clone();
         if committed.version >= kernel.version {
+            self.membership_reconciled_latched = true;
+            return false;
+        }
+        if self.sm.config_position() == 0 {
+            // A wipe-and-rejoin (`ElectionSm`'s truncate-to-0 arm) keeps its
+            // CURRENT config by fiat at position 0, possibly an UNCOMMITTED
+            // one — not something to write into the cluster's state. A
+            // forced record always sits at the survivor's durable frontier,
+            // which is past genesis, so only a wipe lands here: not ours.
             self.membership_reconciled_latched = true;
             return false;
         }
@@ -10975,12 +10990,27 @@ impl Consensus {
     ///   `append_config_frame` feeds back on a SUCCESSFUL append — so a failed
     ///   append leaves the SM bit-for-bit as it was before this call; nothing
     ///   here can leave a half-adopted config behind for the retry to trip over.
+    /// * `2, 0, current_version` — also retry (Task 12 fix round 2) while this
+    ///   leader has not yet carried its kernel config into the cluster FSM
+    ///   (`membership_reconciled_latched`, Ruling PF-fork), or while another
+    ///   `CLUSTER` command is above the committed view (the single-in-flight
+    ///   gate every leader-issued kind obeys). Without the first, a forced
+    ///   leader (`force-single-member`, `tier fork`) whose commit has passed
+    ///   the forced record could append `k+2` built on the forced `k+1` before
+    ///   the reconcile appends `k+1`: the FSM, still at `k`, refuses `k+2`
+    ///   (versions chain `view + 1`), the reconcile's `k+1` is then refused
+    ///   too, and the FSM keeps the source's membership for good. A refusal
+    ///   is still answered first, so the gate never hides one.
     fn propose_and_append(&mut self, op: u32, id: u32, ip: u32, port: u16) -> (u32, u32, u64) {
         let Some(config_op) = wire_to_config_op(op, id, ip, port) else {
             return (1, REASON_MALFORMED_OP, self.cnc.config_version());
         };
         match self.sm.propose_config(config_op, self.admission_bytes) {
             Ok(new_cfg) => {
+                let view_position = self.cluster_view.position.load(Ordering::Acquire);
+                if !self.membership_reconciled_latched || self.last_cluster_append > view_position {
+                    return (2, 0, self.cnc.config_version());
+                }
                 let version = new_cfg.version;
                 match self.append_cluster_frame(&ClusterCommand::Membership(new_cfg)) {
                     Ok(_position) => (0, 0, version),

@@ -1992,6 +1992,25 @@ mod writer_e2e {
             },
         )
         .expect("start the fork");
+        // Fix round 2: an admin membership change issued the moment the
+        // fork boots must not race ahead of the reconcile — the leader
+        // answers retry until the forced config is in the FSM, then the
+        // learner chains on top of it (`admin_ok` loops on retry).
+        let learner = UdpSocket::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let (lip, lport) = match learner {
+            SocketAddr::V4(a) => (u32::from(*a.ip()), a.port()),
+            SocketAddr::V6(_) => unreachable!(),
+        };
+        let fcnc = CncPage::open_file(&fd.join("cnc2.dat"), "fork").expect("fork cnc");
+        let v = admin_ok(&fcnc, 1 /* AddLearner */, 7, lip, lport);
+        assert_eq!(
+            v,
+            old_version + 2,
+            "the learner chains on the forced config"
+        );
         await_until(30, "the fork never led alone", || node.can_serve());
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let svc = uc_service::ServiceBuilder::new(svc_cfg(&fd, "fork"), SumSm::on(0))
@@ -2000,7 +2019,10 @@ mod writer_e2e {
             .expect("service on the fork");
         await_until(30, "the fork's FSM membership follows the kernel", || {
             let m = node.cluster_view().membership();
-            m.voters.len() == 1 && m.voters[0].0 == 0 && m.version == old_version + 1
+            m.voters.len() == 1
+                && m.voters[0].0 == 0
+                && m.learners.iter().map(|l| l.0).collect::<Vec<_>>() == [7]
+                && m.version == old_version + 2
         });
         submit_frames(&node, 1);
         await_until(30, "the one new output was delivered", || {
@@ -2036,6 +2058,8 @@ mod writer_e2e {
         node.stop();
         let rc = uc_node::recovery::recovered_config(&fd).expect("recovered config");
         assert_eq!(rc.voters.iter().map(|v| v.0).collect::<Vec<_>>(), vec![0]);
+        assert_eq!(rc.learners.iter().map(|v| v.0).collect::<Vec<_>>(), vec![7]);
+        assert_eq!(rc.version, old_version + 2);
         drop(fresh);
     }
 
