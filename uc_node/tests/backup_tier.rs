@@ -693,6 +693,13 @@ mod writer_e2e {
     fn submit_settled(c: &Cluster, n: u64) -> usize {
         let deadline = Instant::now() + Duration::from_secs(60);
         let mut left = n;
+        // `Node::submit` only ENQUEUES; the leader appends later. So the last
+        // batch is known to be in the log only once that node's `append` has
+        // grown by at least `accepted * FRAME_BYTES` from where it stood
+        // before the batch (other frames — cluster, timers — only add).
+        // Without this floor CI read commit with most of a batch still in
+        // the ingress queue (#100's restore and fence tests).
+        let mut floor: Option<(usize, u64)> = None;
         while left > 0 {
             assert!(
                 Instant::now() < deadline,
@@ -702,9 +709,14 @@ mod writer_e2e {
                 std::thread::yield_now();
                 continue;
             };
-            left -= submit_some(c.node(i), left, 3_000_000 + left);
+            let before = c.node(i).counters().append.load_acquire();
+            let took = submit_some(c.node(i), left, 3_000_000 + left);
+            left -= took;
+            if took > 0 {
+                floor = Some((i, before + took * FRAME_BYTES));
+            }
         }
-        await_settled(c)
+        await_settled_from(c, floor)
     }
 
     /// Wait until whichever running node leads has committed everything it
@@ -718,7 +730,13 @@ mod writer_e2e {
     /// end sat more than `fsm_lag` past `applied` at the election, so every
     /// follower's report ceiling (`applied + fsm_lag`) sits below the new
     /// leader's NewTerm frame and nothing ever commits again.
-    fn await_settled(c: &Cluster) -> usize {
+    ///
+    /// `floor`: when the serving node is the one that took the last batch,
+    /// wait until its `append` has reached the batch's end before taking the
+    /// commit target. A different leader means that batch's unreplicated tail
+    /// was truncated, so the floor no longer applies and the leader's own
+    /// `append` is the target.
+    fn await_settled_from(c: &Cluster, floor: Option<(usize, u64)>) -> usize {
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             assert!(
@@ -729,9 +747,21 @@ mod writer_e2e {
                 std::thread::yield_now();
                 continue;
             };
-            let target = c.node(l).counters().append.load_acquire();
+            let need = floor.and_then(|(i, f)| (i == l).then_some(f));
+            let mut target: Option<u64> = None;
             while c.node(l).can_serve() && Instant::now() < deadline {
-                if c.node(l).counters().commit.load_acquire() >= target {
+                let t = match target {
+                    Some(t) => t,
+                    None => {
+                        let append = c.node(l).counters().append.load_acquire();
+                        if need.is_some_and(|f| append < f) {
+                            std::thread::sleep(Duration::from_millis(2));
+                            continue; // the batch is still in the ingress queue
+                        }
+                        *target.insert(append)
+                    }
+                };
+                if c.node(l).counters().commit.load_acquire() >= t {
                     return l;
                 }
                 std::thread::sleep(Duration::from_millis(2));

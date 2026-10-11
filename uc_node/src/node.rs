@@ -8551,10 +8551,10 @@ impl Consensus {
         if consumed < self.sm.config_position() {
             return false; // a frame carrying the kernel's config may still apply
         }
-        let view_position = self.cluster_view.position.load(Ordering::Acquire);
-        if self.last_cluster_append > view_position {
-            return false; // single-in-flight: a CLUSTER command is above commit
-        }
+        // Decide "nothing to reconcile" BEFORE the in-flight gate: an ordinary
+        // leader (versions equal) must latch even while its row genesis or
+        // settings rung is above commit, or every admin membership change
+        // answers retry right after an election (main CI red after #100).
         let committed = self.cluster_view.membership();
         let kernel = self.sm.config().clone();
         if committed.version >= kernel.version {
@@ -8569,6 +8569,10 @@ impl Consensus {
             // which is past genesis, so only a wipe lands here: not ours.
             self.membership_reconciled_latched = true;
             return false;
+        }
+        let view_position = self.cluster_view.position.load(Ordering::Acquire);
+        if self.last_cluster_append > view_position {
+            return false; // single-in-flight, for OUR append only
         }
         let cmd = ClusterCommand::Membership(kernel.clone());
         if let Err(reason) = self.validate_cluster_command(&cmd) {
@@ -11014,9 +11018,12 @@ impl Consensus {
     ///   here can leave a half-adopted config behind for the retry to trip over.
     /// * `2, 0, current_version` — also retry (Task 12 fix round 2) while this
     ///   leader has not yet carried its kernel config into the cluster FSM
-    ///   (`membership_reconciled_latched`, Ruling PF-fork), or while another
-    ///   `CLUSTER` command is above the committed view (the single-in-flight
-    ///   gate every leader-issued kind obeys). Without the first, a forced
+    ///   (`membership_reconciled_latched`, Ruling PF-fork). An ordinary leader
+    ///   latches at once, whatever CLUSTER command is in flight; after the
+    ///   latch a second uncommitted change is the kernel's `config_pending`
+    ///   to refuse, so no single-in-flight gate is needed here (one was, from
+    ///   #100 until main CI showed a fresh leader answering retry). Without
+    ///   the latch gate, a forced
     ///   leader (`force-single-member`, `tier fork`) whose commit has passed
     ///   the forced record could append `k+2` built on the forced `k+1` before
     ///   the reconcile appends `k+1`: the FSM, still at `k`, refuses `k+2`
@@ -11029,8 +11036,7 @@ impl Consensus {
         };
         match self.sm.propose_config(config_op, self.admission_bytes) {
             Ok(new_cfg) => {
-                let view_position = self.cluster_view.position.load(Ordering::Acquire);
-                if !self.membership_reconciled_latched || self.last_cluster_append > view_position {
+                if !self.membership_reconciled_latched {
                     return (2, 0, self.cnc.config_version());
                 }
                 let version = new_cfg.version;
@@ -19991,6 +19997,35 @@ mod tests {
             (status, reason, version),
             (0, 0, v0 + 1),
             "accepted once latched"
+        );
+    }
+
+    /// main CI red after #100 (`admin_auth::filesystem_policy_ignores_the_auth_line`):
+    /// an ORDINARY leader — kernel and cluster FSM at the same membership
+    /// version — must latch even while another CLUSTER command (here the
+    /// fresh leader's row genesis / settings rung) is above the committed
+    /// view, and an admin membership change must then be accepted, as before
+    /// #100. The in-flight gate only matters right before the reconcile's
+    /// OWN append; a later change is serialised by the kernel's
+    /// `config_pending` anyway.
+    #[test]
+    fn an_ordinary_leader_latches_and_accepts_membership_with_a_cluster_command_in_flight() {
+        let mut h = harness();
+        drive_to_serving_leader(&mut h);
+        let view = h.cons.cluster_view.position.load(Ordering::Acquire);
+        h.cons.last_cluster_append = view + 4096; // a CLUSTER command above commit
+        assert!(!h.cons.membership_reconciled_latched);
+        h.cons.maybe_reconcile_forced_membership();
+        assert!(
+            h.cons.membership_reconciled_latched,
+            "equal versions need no reconcile: latch whatever is in flight"
+        );
+        let v0 = h.cons.sm.config().version;
+        let (status, reason, version) = h.cons.propose_and_append(1, 7, 0x7f00_0001, 7007);
+        assert_eq!(
+            (status, reason, version),
+            (0, 0, v0 + 1),
+            "an ordinary add-learner is accepted with another CLUSTER command in flight"
         );
     }
 
