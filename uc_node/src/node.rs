@@ -45,7 +45,7 @@ use uc_protocol::ring::{
     SpscProducer, SpscRing,
 };
 use uc_protocol::v2::backup::{
-    BACKUP_REPORT_BODY_LEN, BackupWatermark, WatermarkOp, write_backup_report_body,
+    BACKUP_REPORT_BODY_LEN, BackupTierEntry, BackupWatermark, WatermarkOp, write_backup_report_body,
 };
 use uc_protocol::v2::cnc::{
     ADMIN_OP_SCHEDULE_APPLY, ADMIN_OP_SETTINGS_APPLY, ADMIN_OP_SNAPSHOT, ADMIN_OP_SNAPSHOT_FETCH,
@@ -418,6 +418,33 @@ const BACKUP_CLAIM_POLL_NS: u64 = 10_000_000;
 /// Catalog spec §5.2 (D6): the filesystem probe's spacing — free bytes,
 /// journal bytes and snapshot bytes change seconds apart.
 const HOLDINGS_PROBE_NS: u64 = 1_000_000_000;
+/// Ruling R8e: fold `w` into the leader's pending report for its tier —
+/// per-field maxima (`through`, `newest_set`, `oldest_set` clamped to at
+/// most `newest_set`, as the cluster FSM applies them), so two writers'
+/// reports can each contribute what they know (one the furthest chain, the
+/// other a set copied late). `reporter` follows the report that leads on
+/// `(through, newest_set)`.
+fn coalesce_backup_report(held: &mut BackupWatermark, w: &BackupWatermark) {
+    if (w.through, w.newest_set) > (held.through, held.newest_set) {
+        held.reporter = w.reporter;
+    }
+    held.through = held.through.max(w.through);
+    held.newest_set = held.newest_set.max(w.newest_set);
+    held.oldest_set = held.oldest_set.max(w.oldest_set).min(held.newest_set);
+}
+
+/// Ruling R8e: does report `w` move the committed entry `e` forward in ANY
+/// field the cluster FSM would take (`put_backup_watermark`)? The FSM
+/// ignores a report whose `through` is BEHIND the committed one outright, so
+/// that is a no-op whatever its sets say; at an equal or later `through`,
+/// any of `through`, `newest_set` or `oldest_set` moving up is news — a set
+/// copied after the chain already passed it (Task 8), or retention moving
+/// the oldest set at an unchanged `through` (Task 10).
+fn backup_report_advances(w: &BackupWatermark, e: &BackupTierEntry) -> bool {
+    w.through >= e.through
+        && (w.through > e.through || w.newest_set > e.newest_set || w.oldest_set > e.oldest_set)
+}
+
 /// Catalog ruling R27: the `uc2-holdings` thread's sleep between wakes. The
 /// probe itself runs at most once per [`HOLDINGS_PROBE_NS`]; this only bounds
 /// how long a node stop waits to join the thread.
@@ -8333,11 +8360,7 @@ impl Consensus {
             return;
         }
         match self.pending_backup_reports.get_mut(&w.tier_id) {
-            Some(held) => {
-                if (w.through, w.newest_set) > (held.through, held.newest_set) {
-                    *held = w;
-                }
-            }
+            Some(held) => coalesce_backup_report(held, &w),
             None => {
                 self.pending_backup_reports.insert(w.tier_id, w);
             }
@@ -8347,8 +8370,9 @@ impl Consensus {
     /// Backup-tier spec §6.2: append ONE pending tier's watermark (the lowest
     /// tier id) as a `BackupWatermark` (`CLUSTER` kind 7), under the
     /// single-in-flight rule every leader-issued `CLUSTER` append obeys.
-    /// A pending entry whose `through` is no further than the committed
-    /// entry's is dropped first — the FSM would apply it as a no-op, and
+    /// A pending entry that moves no field of the committed entry forward
+    /// (ruling R8e, [`backup_report_advances`]) is dropped first — the FSM
+    /// would apply it as a no-op, and
     /// appending it would hold the single-in-flight gate shut for a commit
     /// round trip to say nothing. `WouldOverrun` keeps the entry for the
     /// next pass. `#[inline(never)]` for `maybe_append_row_genesis`'s reason.
@@ -8360,9 +8384,10 @@ impl Consensus {
         }
         let committed = self.cluster_view.backups();
         self.pending_backup_reports.retain(|tier, w| {
-            !committed
+            committed
                 .iter()
-                .any(|e| e.tier_id == *tier && w.through <= e.through)
+                .find(|e| e.tier_id == *tier)
+                .is_none_or(|e| backup_report_advances(w, e))
         });
         let Some((&tier, &w)) = self.pending_backup_reports.iter().next() else {
             return false;
@@ -26567,6 +26592,82 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![7, 9]
         );
+    }
+
+    /// Ruling R8e (4): coalescing keeps per-field maxima — the furthest
+    /// `through` from one report, the newest set from another.
+    #[test]
+    fn backup_report_coalescing_keeps_per_field_maxima() {
+        let mut h = harness();
+        drive_to_serving_leader(&mut h);
+        h.cons.on_backup_report(0, bw(7, 10, 100, 0));
+        h.cons.on_backup_report(2, bw(7, 20, 90, 2));
+        let held = h.cons.pending_backup_reports[&7];
+        assert_eq!((held.through, held.newest_set), (100, 20));
+        assert_eq!(held.reporter, 0, "the reporter of the furthest through");
+        // oldest_set: the max, clamped to the coalesced newest.
+        let mut a = bw(7, 50, 100, 0);
+        a.oldest_set = 40;
+        coalesce_backup_report(
+            &mut a,
+            &BackupWatermark {
+                oldest_set: 45,
+                ..bw(7, 45, 80, 1)
+            },
+        );
+        assert_eq!((a.oldest_set, a.newest_set, a.through), (45, 50, 100));
+    }
+
+    /// Ruling R8e (1)–(3): the leader keeps a report iff it moves ANY field of
+    /// the committed entry forward, at a `through` the FSM does not ignore.
+    #[test]
+    fn a_backup_report_is_kept_iff_it_moves_a_field_forward() {
+        let e = BackupTierEntry {
+            tier_id: 7,
+            oldest_set: 10,
+            newest_set: 20,
+            through: 100,
+            reporter: 0,
+            updated_pos: 0,
+        };
+        let w = |oldest, newest, through| BackupWatermark {
+            oldest_set: oldest,
+            ..bw(7, newest, through, 1)
+        };
+        // (1) equal through, newer newest_set.
+        assert!(backup_report_advances(&w(10, 30, 100), &e));
+        // (2) equal through and newest, higher oldest_set.
+        assert!(backup_report_advances(&w(15, 20, 100), &e));
+        // through up alone.
+        assert!(backup_report_advances(&w(10, 20, 101), &e));
+        // (3) behind or equal in every field.
+        assert!(!backup_report_advances(&w(10, 20, 100), &e));
+        assert!(!backup_report_advances(&w(5, 10, 50), &e));
+        // A through behind the committed one is a no-op in the FSM, whatever
+        // its sets say.
+        assert!(!backup_report_advances(&w(15, 30, 99), &e));
+
+        // Through the leader, against a committed entry `e`: (3) is dropped
+        // before it is appended; (1) and (2) are appended.
+        for (report, appended) in [
+            (w(10, 20, 100), false),
+            (w(10, 30, 100), true),
+            (w(15, 20, 100), true),
+        ] {
+            let mut h = harness();
+            drive_to_serving_leader(&mut h);
+            let mut st = h.cons.cluster_view.to_state();
+            st.backups.push(e);
+            st.applied = h.cons.last_cluster_append;
+            h.cons.cluster_view.publish(&st);
+            h.cons.on_backup_report(0, report);
+            assert_eq!(
+                h.cons.maybe_append_backup_watermark(),
+                appended,
+                "{report:?}"
+            );
+            assert!(h.cons.pending_backup_reports.is_empty(), "{report:?}");
+        }
     }
 
     /// Spec §6.2: ONE tier per pass (the lowest id), under the single-in-

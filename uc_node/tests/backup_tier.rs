@@ -971,17 +971,12 @@ mod writer_e2e {
         await_agreed(&c, &all, p);
         submit_frames(c.node(l), 100);
 
-        // Keep loading: the leader commits a report only when `through`
-        // advances (Task 7), so `newest_set = P` lands with the cut after
-        // the one that made P eligible.
+        // No further load: the cut after P makes P eligible, and the report
+        // that names it as `newest_set` at an UNCHANGED `through` commits
+        // (ruling R8e).
         let deadline = Instant::now() + Duration::from_secs(30);
         let mut samples = 0u64;
-        let mut next_load = Instant::now();
         let last = loop {
-            if Instant::now() >= next_load {
-                submit_frames(c.node(l), 50);
-                next_load = Instant::now() + Duration::from_millis(500);
-            }
             let w = watermark(c.node(l)).unwrap();
             samples += 1;
             assert_eq!(
