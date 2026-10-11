@@ -881,20 +881,12 @@ Exactly one of:
   no vote, so the first election is ordinary. This is the quorum-loss
   domain: a restore of fewer than all nodes beside a live majority is not
   what this verb is for.
-- `--new-node --node-id <N>` — **one replacement node** seeded from the tier
-  instead of a peer's snapshot session. `N` must be a new id: one that is a
-  voter, learner or tombstone in the restored membership is refused
-  `restore_id_reused` — checked against the membership the node will boot
-  with: the cluster artifact's at `S` plus every Membership frame in
-  `[S, Q)`. It prints `seeding new node <N> as of <Q>; once added it catches
-  up from the live cluster (nothing is discarded)` instead of the data-loss
-  line. Start the node, then add it (spec §8.2's `uc2ctl add`:
-  [`add-learner`](#add-learner), then [`promote`](#promote) if it is to
-  vote). **Not yet usable against a live cluster** (unreleased): the seeded
-  node's term map begins at `S` rather than at its term's true base, so the
-  leader's term-map reconcile cuts it to position 0, below its snapshot
-  floor, and the node fail-stops. Until that is fixed, seed a replacement
-  node through the ordinary snapshot session.
+- `--new-node --node-id <N>` — one replacement node seeded from the tier.
+  **Refused in this release** (`new_node_unsupported`, before anything is
+  read or built): the restored term map starts at `S` and cannot align with
+  a live leader's lineage, so the node would be cut below its floor. Add a
+  replacement node with a fresh, empty instance directory and the normal
+  join (a snapshot session from its peers).
 
 The builder holds `<DIR>`'s exclusive `instance.lock` for the whole build,
 as `force-single-member` does, so a node started there mid-build refuses.

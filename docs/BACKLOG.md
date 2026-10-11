@@ -400,6 +400,15 @@ reviewer wants a workload to attack.
   set is also open —
   [spec §2 "Out"](superpowers/specs/2026-10-01-uc2-snapshot-catalog-design.md#2-scope)
   and §12.
+  - **3b: tier-seeded replacement node** (ruling R12a, 2026-10-11). The
+    restored term map's first entry is (term, S); reconcile against a live
+    leader finds no alignment and cuts to 0 (archive fail-stop
+    `PositionPurged`). Fix direction: seed the lineage at/below the floor from
+    the leader's shipped map, as the snapshot-session joiner does on
+    `AdoptFloor`; the ignored e2e
+    `a_new_node_seeded_from_the_tier_joins_and_catches_up` is the acceptance
+    test. Until then `uc2ctl tier restore --new-node` refuses
+    `new_node_unsupported`.
 - **Compressing the node's own journal (idea, unmeasured).** The backup tier
   compresses what it writes off-node (spec
   `superpowers/specs/2026-10-10-uc2-backup-tier-design.md` D11); the node's

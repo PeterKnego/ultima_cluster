@@ -239,11 +239,11 @@ fn tier_restore_and_fork_refuse_by_name_and_build() {
             out_s,
             "--new-node",
             "--node-id",
-            "0",
+            "9",
         ],
     );
     assert_eq!(r.status, 1, "{r:?}");
-    assert!(r.stderr.contains("restore_id_reused"), "{r:?}");
+    assert!(r.stderr.contains("new_node_unsupported"), "{r:?}");
     assert!(!out.exists());
 
     let at = through.to_string();

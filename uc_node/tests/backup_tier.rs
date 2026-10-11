@@ -2112,7 +2112,7 @@ mod writer_e2e {
     /// floor cannot truncate below it. Observed with `UC2_TRUNC_TRACE=1`:
     /// `cut to=0 durable=230880 own_tail=[(1, 38528)] lead_head=[(1, 0)]`.
     #[test]
-    #[ignore = "design finding: reconcile cuts a tier-seeded node to 0 (term map starts at (term, S)); see the Task 12 report"]
+    #[ignore = "project 3b / ruling R12a: reconcile cuts a tier-seeded node to 0 (term map starts at (term, S))"]
     fn a_new_node_seeded_from_the_tier_joins_and_catches_up() {
         let _g = serialize();
         let (mut c, tier, p, _target) = tiered("tier-new-node", 300, 1500);

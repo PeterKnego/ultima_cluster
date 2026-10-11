@@ -38,6 +38,13 @@ pub enum Mode {
     /// Whole-cluster restore: every node rebuilt from the same tier and Q.
     Recovery,
     /// One replacement node, seeded from the tier under a NEW id.
+    ///
+    /// NOT SAFE against a live cluster yet (ruling R12a, project 3b): the
+    /// restored term map's first entry is `(term, S)`, a live leader ships
+    /// the term's true base, and reconcile cuts the node to 0 — below its
+    /// floor, an archive fail-stop. `uc2ctl tier restore --new-node` refuses
+    /// `new_node_unsupported`; the variant stays for the ignored acceptance
+    /// test until the lineage is seeded at/below the floor.
     NewNode { node_id: u32 },
     /// A separate cluster as of Q (`uc2ctl tier fork`), to be forced onto
     /// `node_id` as its single voter ([`fork`]).
