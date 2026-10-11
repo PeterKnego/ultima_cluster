@@ -37,6 +37,7 @@ use std::path::Path;
 
 use serde::Deserialize;
 
+use uc_node::config_file::parse_duration_secs;
 use uc_node::services::{FsmLag, parse_fsm_lag};
 use uc_protocol::v2::cnc::ADMIN_OP_SETTINGS_APPLY;
 use uc_protocol::v2::settings::{FSM_LAG_LOCKSTEP, Settings, Target, encode_settings};
@@ -54,6 +55,8 @@ struct SettingsFile {
     snapshot_target: Option<String>,
     retain_sets: Option<u16>,
     auto_fetch: Option<bool>,
+    backup_retain_sets: Option<u16>,
+    backup_retain_age: Option<String>,
 }
 
 /// TOML text -> a validated [`Settings`]. Every key is optional; an absent
@@ -104,6 +107,12 @@ pub fn parse_settings(toml_text: &str) -> Result<Settings, String> {
         }
     };
 
+    // Backup-tier spec: `"30d"`-style; absent means `0` (no age rule).
+    let backup_retain_age_secs = match file.backup_retain_age.as_deref() {
+        None => 0,
+        Some(raw) => parse_duration_secs("backup_retain_age", raw)?,
+    };
+
     Ok(Settings {
         admission_bytes: file.admission_bytes.unwrap_or(0),
         fsm_lag_bytes,
@@ -123,6 +132,9 @@ pub fn parse_settings(toml_text: &str) -> Result<Settings, String> {
         retain_sets: file.retain_sets.unwrap_or(1),
         // Snapshot-lifecycle spec §6: absent means on — the spec's default.
         auto_fetch: file.auto_fetch.unwrap_or(true),
+        // Backup-tier spec: absent means `0` — a tier keeps every set.
+        backup_retain_sets: file.backup_retain_sets.unwrap_or(0),
+        backup_retain_age_secs,
     })
 }
 
@@ -220,10 +232,11 @@ fn render_fsm_lag(bytes: u64) -> String {
 /// **Field-ordering contract.** The line is `key=value` pairs in a FIXED
 /// order — `position`, `admission_bytes`, `fsm_lag`,
 /// `snapshot_interval_bytes`, `snapshot_target`, `retain_sets`,
-/// `auto_fetch`, `datagram_mtu` (with its `(baseline|discovered)` suffix last) — and that
+/// `auto_fetch`, `backup_retain_sets`, `backup_retain_age_secs`,
+/// `datagram_mtu` (with its `(baseline|discovered)` suffix last) — and that
 /// order is part of the output contract `docs/reference/uc2ctl.md` prints
 /// and scripts may split on. A new field goes BEFORE `datagram_mtu`'s
-/// parenthesised suffix (as `retain_sets` and `auto_fetch` did) or after it; existing keys
+/// parenthesised suffix (as `retain_sets`, `auto_fetch` and the backup keys did) or after it; existing keys
 /// are never reordered or renamed.
 fn render_settings_line(position: u64, settings: &Settings) -> String {
     let fsm_lag = render_fsm_lag(settings.fsm_lag_bytes);
@@ -242,11 +255,14 @@ fn render_settings_line(position: u64, settings: &Settings) -> String {
     format!(
         "position={position} admission_bytes={} fsm_lag={fsm_lag} \
          snapshot_interval_bytes={} snapshot_target={target} retain_sets={} \
-         auto_fetch={} datagram_mtu={} ({rung})",
+         auto_fetch={} backup_retain_sets={} backup_retain_age_secs={} \
+         datagram_mtu={} ({rung})",
         settings.admission_bytes,
         settings.snapshot_interval_bytes,
         settings.retain_sets,
         settings.auto_fetch,
+        settings.backup_retain_sets,
+        settings.backup_retain_age_secs,
         settings.datagram_mtu,
     )
 }
@@ -289,6 +305,8 @@ mod tests {
                 datagram_mtu: 0,
                 retain_sets: 3,
                 auto_fetch: true,
+                backup_retain_sets: 0,
+                backup_retain_age_secs: 0,
             }
         );
         assert_eq!(parse_settings("").unwrap(), Settings::genesis_default());
@@ -412,7 +430,28 @@ mod tests {
         s.auto_fetch = false;
         let line = render_settings_line(9, &s);
         assert!(
-            line.contains("retain_sets=1 auto_fetch=false datagram_mtu="),
+            line.contains("retain_sets=1 auto_fetch=false backup_retain_sets=0"),
+            "{line}"
+        );
+    }
+
+    /// Backup-tier spec: `backup_retain_sets` / `backup_retain_age` are
+    /// operator keys; absent means `0`; `settings show` prints both BEFORE
+    /// `datagram_mtu`.
+    #[test]
+    fn backup_retention_parses_and_shows() {
+        let s = parse_settings("backup_retain_sets = 6\nbackup_retain_age = \"30d\"\n").unwrap();
+        assert_eq!(s.backup_retain_sets, 6);
+        assert_eq!(s.backup_retain_age_secs, 2_592_000);
+        let d = parse_settings("").unwrap();
+        assert_eq!((d.backup_retain_sets, d.backup_retain_age_secs), (0, 0));
+        let e = parse_settings("backup_retain_age = \"soon\"\n").unwrap_err();
+        assert!(e.starts_with("backup_retain_age"), "{e}");
+        let line = render_settings_line(3, &s);
+        assert!(
+            line.contains(
+                "auto_fetch=true backup_retain_sets=6 backup_retain_age_secs=2592000 datagram_mtu="
+            ),
             "{line}"
         );
     }

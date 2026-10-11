@@ -52,7 +52,9 @@
 //! that dispatch for no gain — the image codec's own job is only the outer
 //! framing and the CRC.
 
-use super::settings::{SETTINGS_LEN, SETTINGS_LEN_V1, SETTINGS_LEN_V2, SETTINGS_LEN_V3};
+use super::settings::{
+    SETTINGS_LEN, SETTINGS_LEN_V1, SETTINGS_LEN_V2, SETTINGS_LEN_V3, SETTINGS_LEN_V4,
+};
 
 pub const CLUSTER_IMAGE_MAGIC: &[u8; 8] = b"UCCLUST1";
 /// The image layout's version, refused by [`decode_cluster_image`] when
@@ -254,7 +256,8 @@ pub fn decode_cluster_image(buf: &[u8]) -> Option<ClusterImageParts<'_>> {
             1 => SETTINGS_LEN_V1,
             2 => SETTINGS_LEN_V2,
             3 => SETTINGS_LEN_V3,
-            4 => SETTINGS_LEN,
+            4 => SETTINGS_LEN_V4,
+            5 => SETTINGS_LEN,
             _ => return None,
         };
         let rest = body.len().checked_sub(o)?;
@@ -279,7 +282,8 @@ pub fn decode_cluster_image(buf: &[u8]) -> Option<ClusterImageParts<'_>> {
             1 => SETTINGS_LEN_V1,
             2 => SETTINGS_LEN_V2,
             3 => SETTINGS_LEN_V3,
-            4 => SETTINGS_LEN,
+            4 => SETTINGS_LEN_V4,
+            5 => SETTINGS_LEN,
             _ => return None,
         };
         let settings = o.checked_add(sl).and_then(|end| body.get(o..end))?;

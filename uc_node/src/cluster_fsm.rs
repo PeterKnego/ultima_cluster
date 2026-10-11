@@ -733,6 +733,11 @@ impl ClusterFsm {
                 if s.snapshot_interval_bytes == u64::MAX {
                     return Err(ClusterRefusal::SettingsBounds("snapshot.interval_bytes"));
                 }
+                // Backup-tier spec: `u64::MAX` seconds is the reserved
+                // sentinel (an age that overflows every clock sum).
+                if s.backup_retain_age_secs == u64::MAX {
+                    return Err(ClusterRefusal::SettingsBounds("backup_retain_age_secs"));
+                }
                 // I1: the one settings value whose too-SMALL side is
                 // unrecoverable. `report_ceiling` caps an attested frontier
                 // at `min_applied + fsm_lag`; below one max-size frame that
@@ -1262,6 +1267,12 @@ pub struct ClusterView {
     /// by the consensus agent once per pass (one load, no lock), and by
     /// [`Self::to_state`], so a re-proposed record carries it unchanged.
     pub auto_fetch: AtomicBool,
+    /// Backup-tier spec: the committed `backup_retain_sets` (`0` = keep
+    /// all), carried so [`Self::to_state`] re-proposes it unchanged.
+    pub backup_retain_sets: AtomicU16,
+    /// Backup-tier spec: the committed `backup_retain_age_secs` (`0` = no
+    /// age rule), carried for the same reason.
+    pub backup_retain_age_secs: AtomicU64,
     /// Catalog spec §4.5: the newest AGREED set's position; `0` = nothing
     /// agreed (the cluster floor moves nothing). NOT the `Empty` test since
     /// catalog ruling R26 — that is [`Self::catalog_has_complete`].
@@ -1376,6 +1387,8 @@ impl ClusterView {
             versioned: AtomicU8::new(0),
             retain_sets: AtomicU16::new(0),
             auto_fetch: AtomicBool::new(true),
+            backup_retain_sets: AtomicU16::new(0),
+            backup_retain_age_secs: AtomicU64::new(0),
             catalog_agreed_position: AtomicU64::new(0),
             catalog_has_complete: AtomicBool::new(false),
             catalog_len: AtomicU64::new(0),
@@ -1431,6 +1444,10 @@ impl ClusterView {
         self.retain_sets.store(st.retain_sets(), Ordering::Release);
         self.auto_fetch
             .store(st.settings.auto_fetch, Ordering::Release);
+        self.backup_retain_sets
+            .store(st.settings.backup_retain_sets, Ordering::Release);
+        self.backup_retain_age_secs
+            .store(st.settings.backup_retain_age_secs, Ordering::Release);
         // Catalog gauges — like everything above, BEFORE `position`.
         let stalled = st
             .catalog
@@ -1582,6 +1599,8 @@ impl ClusterView {
                 // and re-proposed must pass the door's `1..=64` bound.
                 retain_sets: self.retain_sets.load(Ordering::Acquire),
                 auto_fetch: self.auto_fetch.load(Ordering::Acquire),
+                backup_retain_sets: self.backup_retain_sets.load(Ordering::Acquire),
+                backup_retain_age_secs: self.backup_retain_age_secs.load(Ordering::Acquire),
             },
             settings_position: self.settings_position.load(Ordering::Acquire),
             applied: self.position.load(Ordering::Acquire),
@@ -2110,6 +2129,8 @@ mod tests {
             datagram_mtu: 8832,
             retain_sets: 3,
             auto_fetch: false,
+            backup_retain_sets: 0,
+            backup_retain_age_secs: 0,
         };
         let v = ClusterView::new(&st);
         assert_eq!(v.to_state(), st);
@@ -2854,6 +2875,40 @@ mod tests {
             vec![3000, 4000],
             "the completed pin's origin retires like any set"
         );
+    }
+
+    /// Backup-tier spec: `backup_retain_age_secs = u64::MAX` is the reserved
+    /// sentinel, refused 47 by both halves; any other value passes.
+    #[test]
+    fn backup_retain_age_secs_max_is_refused_with_47() {
+        let f = fsm();
+        let mut s = f.state().settings;
+        s.backup_retain_age_secs = u64::MAX;
+        let bad = ClusterCommand::Settings(s);
+        for r in [f.validate(&bad), f.validate_replicated(&bad)] {
+            assert_eq!(
+                r,
+                Err(ClusterRefusal::SettingsBounds("backup_retain_age_secs"))
+            );
+        }
+        s.backup_retain_age_secs = u64::MAX - 1;
+        s.backup_retain_sets = u16::MAX;
+        assert_eq!(f.validate(&ClusterCommand::Settings(s)), Ok(()));
+    }
+
+    /// Backup-tier spec: the view carries both retention fields and
+    /// `to_state` returns them.
+    #[test]
+    fn the_view_publishes_backup_retention_and_to_state_returns_it() {
+        let mut st = fsm().state().clone();
+        st.settings.backup_retain_sets = 4;
+        st.settings.backup_retain_age_secs = 2_592_000;
+        let v = ClusterView::new(&st);
+        assert_eq!(v.backup_retain_sets.load(Ordering::Acquire), 4);
+        assert_eq!(v.to_state().settings.backup_retain_age_secs, 2_592_000);
+        st.settings.backup_retain_sets = 0;
+        v.publish(&st);
+        assert_eq!(v.to_state().settings.backup_retain_sets, 0);
     }
 
     #[test]

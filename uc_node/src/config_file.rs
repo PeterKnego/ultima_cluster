@@ -237,6 +237,37 @@ struct SettingsSection {
     /// means `true` (every node keeps its own copy of the newest agreed set).
     #[serde(default)]
     auto_fetch: Option<bool>,
+    /// Backup-tier spec: seeds the replicated `backup_retain_sets` (how many
+    /// complete sets a tier keeps). Absent means `0` — keep them all.
+    #[serde(default)]
+    backup_retain_sets: Option<u16>,
+    /// Backup-tier spec: seeds `backup_retain_age_secs`, written as
+    /// `<n>(s|m|h|d)` (see [`parse_duration_secs`]). Absent means `0` — no
+    /// age rule.
+    #[serde(default)]
+    backup_retain_age: Option<String>,
+}
+
+/// Parse a duration of the form `<digits>(s|m|h|d)` into seconds. No
+/// spaces, signs or fractions. The error text leads with `field`, so the
+/// caller's message names the offending key.
+pub fn parse_duration_secs(field: &str, s: &str) -> Result<u64, String> {
+    let bad = || format!("{field}: {s:?} is not a duration (want <digits>(s|m|h|d), e.g. \"30d\")");
+    let unit = s.chars().last().ok_or_else(bad)?;
+    let mult: u64 = match unit {
+        's' => 1,
+        'm' => 60,
+        'h' => 3600,
+        'd' => 86_400,
+        _ => return Err(bad()),
+    };
+    let digits = &s[..s.len() - 1];
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(bad());
+    }
+    let n: u64 = digits.parse().map_err(|_| bad())?;
+    n.checked_mul(mult)
+        .ok_or_else(|| format!("{field}: {s:?} overflows 64-bit seconds"))
 }
 
 #[derive(Debug, Deserialize)]
@@ -827,6 +858,16 @@ pub fn parse_str_with_env(
                     });
                 }
             };
+            let backup_retain_age_secs =
+                match s.backup_retain_age.as_deref() {
+                    None => 0,
+                    Some(raw) => parse_duration_secs("settings.backup_retain_age", raw).map_err(
+                        |detail| ConfigError::Invalid {
+                            field: "settings.backup_retain_age",
+                            detail,
+                        },
+                    )?,
+                };
             Settings {
                 fsm_lag_bytes,
                 admission_bytes: s.admission_bytes.unwrap_or(0),
@@ -843,6 +884,8 @@ pub fn parse_str_with_env(
                 // in or out of the door's bound, passes through unchecked.
                 retain_sets: s.retain_sets.unwrap_or(1),
                 auto_fetch: s.auto_fetch.unwrap_or(true),
+                backup_retain_sets: s.backup_retain_sets.unwrap_or(0),
+                backup_retain_age_secs,
             }
         }
     };
@@ -1817,6 +1860,54 @@ level = "info"
         assert!(!cfg.settings_genesis.auto_fetch);
         let (cfg, _) = load_str(&format!("{MINIMAL}\n[settings]\n")).unwrap();
         assert!(cfg.settings_genesis.auto_fetch);
+    }
+
+    /// Backup-tier spec: `[settings] backup_retain_sets` / `backup_retain_age`
+    /// seed genesis; absent means `0` (keep everything).
+    #[test]
+    fn settings_backup_retention_seeds_genesis_and_defaults_to_zero() {
+        let (cfg, _) = load_str(&format!(
+            "{MINIMAL}\n[settings]\nbackup_retain_sets = 5\nbackup_retain_age = \"30d\"\n"
+        ))
+        .unwrap();
+        assert_eq!(cfg.settings_genesis.backup_retain_sets, 5);
+        assert_eq!(cfg.settings_genesis.backup_retain_age_secs, 2_592_000);
+        let (cfg, _) = load_str(&format!("{MINIMAL}\n[settings]\n")).unwrap();
+        assert_eq!(cfg.settings_genesis.backup_retain_sets, 0);
+        assert_eq!(cfg.settings_genesis.backup_retain_age_secs, 0);
+        let err = load_str(&format!(
+            "{MINIMAL}\n[settings]\nbackup_retain_age = \"30 days\"\n"
+        ))
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("settings.backup_retain_age"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn parse_duration_secs_accepts_units_and_names_the_field() {
+        assert_eq!(parse_duration_secs("f", "90s"), Ok(90));
+        assert_eq!(parse_duration_secs("f", "2m"), Ok(120));
+        assert_eq!(parse_duration_secs("f", "3h"), Ok(10_800));
+        assert_eq!(parse_duration_secs("f", "30d"), Ok(2_592_000));
+        assert_eq!(parse_duration_secs("f", "0s"), Ok(0));
+        for bad in [
+            "", "d", "30", "1.5h", " 5s", "5 s", "-5s", "5w", "+5s", "5ds",
+        ] {
+            let e = parse_duration_secs("backup_retain_age", bad).unwrap_err();
+            assert!(e.starts_with("backup_retain_age"), "{bad:?}: {e}");
+        }
+        assert!(
+            parse_duration_secs("f", "99999999999999999999d")
+                .unwrap_err()
+                .starts_with('f')
+        );
+        assert!(
+            parse_duration_secs("f", "9999999999999999d")
+                .unwrap_err()
+                .starts_with('f')
+        );
     }
 
     /// FSM identity + cluster FSM (spec §3.3, §6): `uc_` is reserved

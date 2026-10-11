@@ -1890,6 +1890,8 @@ pub fn uc_protocol_settings() -> Vec<Seed> {
         datagram_mtu: 8960,
         retain_sets: 0,
         auto_fetch: true,
+        backup_retain_sets: 4,
+        backup_retain_age_secs: 2_592_000,
     });
     // The version-1 shape `2.11.0` wrote — a live corpus value, not a
     // refusal: it decodes with `datagram_mtu = 0` (jumbo spec §5.5).
@@ -1905,6 +1907,14 @@ pub fn uc_protocol_settings() -> Vec<Seed> {
         let mut v = genesis.clone();
         v.truncate(SETTINGS_LEN_V3);
         v[0] = 3;
+        v
+    };
+    // Backup-tier spec: the v4 shape (36 B, no backup retention) is a live
+    // corpus value - it decodes with both backup fields 0.
+    let v4 = {
+        let mut v = genesis.clone();
+        v.truncate(SETTINGS_LEN_V4);
+        v[0] = 4;
         v
     };
     let mut bad_version = genesis.clone();
@@ -1923,6 +1933,7 @@ pub fn uc_protocol_settings() -> Vec<Seed> {
         Seed::fixed("06-short", vec![0u8; 4]),
         Seed::fixed("07-version-1", v1),
         Seed::fixed("08-version-3", v3),
+        Seed::fixed("09-version-4", v4),
     ]
 }
 
