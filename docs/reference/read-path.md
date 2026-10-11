@@ -60,13 +60,24 @@ flight is answered `MSG_V2_RETRY`.
 
 ## Observed envelope
 
-Measured on a 3-host `c6id.2xlarge` fleet;
-[full record](../benchmarks/uc2-read-profile-2026-07-26-after-rung-a.md).
+1,024 reads in flight on the leader host, 20 s rungs, fresh cluster per rung.
 
-| Measure | Value |
-|---|---|
-| Linearizable reads | ~953,000/s at p50 1.08 ms, under 20,000 writes/s |
-| Relative to barrier-less throughput | within ~3% |
+| Measure | `c6id.2xlarge` (2026-10-10) | `c9gd.4xlarge` (2026-10-11) |
+|---|---|---|
+| Linearizable reads, no writes | 2.16 M/s (after the idle-cap fix) | 3.88 M/s, p99 0.32 ms |
+| Linearizable reads, 200 k writes/s | 1.93 M/s | 3.13 M/s, p99 0.41 ms |
+| Linearizable reads, 2 M writes/s | — | 2.89 M/s, p99 0.47 ms |
+| Relative to a snapshot read on the leader | 0.69 read-only; 0.74–0.90 under writes | 0.55 read-only; 0.51–0.60 under writes |
+| Read-your-writes spread over 3 nodes ÷ linearizable on the leader | 3.2–4.6× | 4.4–5.8× |
+
+Records: [`uc2-read-types-under-writes-2026-10-10.md`](../benchmarks/uc2-read-types-under-writes-2026-10-10.md),
+[`uc2-query-drain-progress-2026-10-10.md`](../benchmarks/uc2-query-drain-progress-2026-10-10.md),
+[`uc2-read-types-under-writes-c9gd-2026-10-11.md`](../benchmarks/uc2-read-types-under-writes-c9gd-2026-10-11.md).
+The 2026-07-26 figure (~953,000/s at p50 1.08 ms under 20,000 writes/s,
+"within ~3 %" of barrier-less —
+[record](../benchmarks/uc2-read-profile-2026-07-26-after-rung-a.md)) was
+measured with both arms on the read-only idle cap later removed, and is kept
+as history, not as the envelope.
 | A single read with no concurrent reads | one probe RTT, ~0.16 ms p50 on LAN |
 
 Batching gains appear only under concurrent reads.

@@ -339,6 +339,18 @@ struct ClientArgs {
     /// Background writes/sec (0 = the read-only arm).
     #[arg(long, default_value_t = 0)]
     write_rate: u64,
+    /// Writer threads for the background write load. Each has its own
+    /// client id and its own ingress producer; `--write-rate` is split evenly
+    /// across them. One thread paces fine to a few hundred k/s; above that the
+    /// pacing loop itself is the ceiling, which is what more threads lift.
+    #[arg(long, default_value_t = 1)]
+    write_threads: u32,
+    /// UNPACED writes: every writer thread submits as fast as the ingress ring
+    /// accepts (yielding on a full ring). The accepted rate is the result;
+    /// `--write-rate` is ignored as a target (pass 0). This is the "writes as
+    /// far as they go" arm, not a rate rung.
+    #[arg(long, default_value_t = false)]
+    write_unpaced: bool,
     /// PID of the node process, for /proc agent-occupancy sampling. Omit to
     /// skip its threads (the client cannot see another process's threads).
     #[arg(long)]
@@ -816,6 +828,11 @@ struct ReadStats {
     writes_attempted: u64,
     writes_accepted: u64,
     writes_dropped: u64,
+    /// The cluster's commit counter advance over the send window, in bytes
+    /// per second. A write "accepted" above only entered the ingress ring;
+    /// this is what the cluster actually committed while the reads ran
+    /// (queries never append, so it is the write load, frame-sized).
+    commit_bytes_per_sec: f64,
     elapsed: Duration,
     reads_per_sec: f64,
     p50_ms: f64,
@@ -950,6 +967,8 @@ fn run_read_measurement(
     readers: u64,
     mode: Mode,
     write_rate: u64,
+    write_threads: u32,
+    write_unpaced: bool,
     task_dirs: &[(u32, PathBuf)],
     any_role: bool,
 ) -> (ReadStats, Vec<Occupancy>) {
@@ -1054,12 +1073,20 @@ fn run_read_measurement(
     // writes running on through the drain would keep loading the node while the
     // read tail is being collected.
     let writer_stop = Arc::new(AtomicBool::new(false));
-    let writer = spawn_writer(instance_dir, app_id, write_rate, Arc::clone(&writer_stop));
+    let writer = spawn_writer(
+        instance_dir,
+        app_id,
+        write_rate,
+        write_threads,
+        write_unpaced,
+        Arc::clone(&writer_stop),
+    );
 
     // Sample agent occupancy across the measurement window only (after warm-up
     // attach, before drain) so boot-time yields do not pollute the rate.
     let occ_before = sample_all(task_dirs);
     let occ_t0 = Instant::now();
+    let commit_at_t0 = cnc.counters().commit.load_acquire();
 
     let deadline = t0 + Duration::from_secs(secs);
 
@@ -1153,11 +1180,22 @@ fn run_read_measurement(
     // End of the send window: stop the write load and the depth sampler here,
     // BEFORE the drain, so neither describes (or perturbs) the tail.
     writer_stop.store(true, Ordering::Relaxed);
+    let commit_bytes_per_sec = if occ_secs > 0.0 {
+        cnc.counters()
+            .commit
+            .load_acquire()
+            .saturating_sub(commit_at_t0) as f64
+            / occ_secs
+    } else {
+        0.0
+    };
     depth_sampler.join().expect("depth sampler thread panicked");
     let writes = match writer {
         Some(w) => {
             let counters = Arc::clone(&w.counters);
-            w.handle.join().expect("writer thread panicked");
+            for h in w.handles {
+                h.join().expect("writer thread panicked");
+            }
             counters.snapshot()
         }
         None => (0, 0, 0),
@@ -1214,6 +1252,7 @@ fn run_read_measurement(
             writes_attempted: writes.0,
             writes_accepted: writes.1,
             writes_dropped: writes.2,
+            commit_bytes_per_sec,
             elapsed,
             reads_per_sec,
             p50_ms,
@@ -1328,7 +1367,7 @@ impl WriterCounters {
 }
 
 struct WriterHandle {
-    handle: thread::JoinHandle<()>,
+    handles: Vec<thread::JoinHandle<()>>,
     counters: Arc<WriterCounters>,
 }
 
@@ -1346,50 +1385,74 @@ fn spawn_writer(
     instance_dir: &Path,
     app_id: &str,
     write_rate: u64,
+    write_threads: u32,
+    write_unpaced: bool,
     stop: Arc<AtomicBool>,
 ) -> Option<WriterHandle> {
-    if write_rate == 0 {
+    if write_rate == 0 && !write_unpaced {
         return None;
     }
-    let dir = instance_dir.to_path_buf();
-    let app_id = app_id.to_string();
+    let threads = write_threads.max(1) as u64;
     let counters = Arc::new(WriterCounters::default());
-    let thread_counters = Arc::clone(&counters);
-    let handle = thread::Builder::new()
-        .name("rp-writer".into())
-        .spawn(move || {
-            let cnc = CncPage::open_file(&dir.join(CNC_FILE), &app_id)
-                .unwrap_or_else(|e| panic!("writer cnc attach: {e}"));
-            let client_id = cnc.status().next_client_id.fetch_add(1) as u32;
-            let (ingress, _c) = MpscRing::open(&dir.join(INGRESS_RING))
-                .unwrap_or_else(|e| panic!("writer open ingress.ring: {e}"))
-                .into_split();
-            let payload =
-                bincode::serde::encode_to_vec(vec![0xABu8; 64], bincode::config::standard())
-                    .expect("encode write payload");
-            let period = Duration::from_nanos(1_000_000_000 / write_rate.max(1));
-            let mut local_seq: u32 = 0;
-            let mut next = Instant::now();
-            while !stop.load(Ordering::Relaxed) {
-                let now = Instant::now();
-                if now < next {
-                    thread::sleep((next - now).min(Duration::from_millis(1)));
-                    continue;
+    let mut handles = Vec::with_capacity(threads as usize);
+    for t in 0..threads {
+        let dir = instance_dir.to_path_buf();
+        let app_id = app_id.to_string();
+        let thread_counters = Arc::clone(&counters);
+        let stop = Arc::clone(&stop);
+        // Split the target evenly; the first thread takes the remainder so the
+        // sum is exactly `write_rate`. Unpaced threads have no target.
+        let my_rate = write_rate / threads + if t == 0 { write_rate % threads } else { 0 };
+        let handle = thread::Builder::new()
+            .name(format!("rp-writer{t}"))
+            .spawn(move || {
+                let cnc = CncPage::open_file(&dir.join(CNC_FILE), &app_id)
+                    .unwrap_or_else(|e| panic!("writer cnc attach: {e}"));
+                let client_id = cnc.status().next_client_id.fetch_add(1) as u32;
+                let (ingress, _c) = MpscRing::open(&dir.join(INGRESS_RING))
+                    .unwrap_or_else(|e| panic!("writer open ingress.ring: {e}"))
+                    .into_split();
+                let payload =
+                    bincode::serde::encode_to_vec(vec![0xABu8; 64], bincode::config::standard())
+                        .expect("encode write payload");
+                let period = Duration::from_nanos(1_000_000_000 / my_rate.max(1));
+                let mut local_seq: u32 = 0;
+                let mut next = Instant::now();
+                while !stop.load(Ordering::Relaxed) {
+                    if !write_unpaced {
+                        let now = Instant::now();
+                        if now < next {
+                            thread::sleep((next - now).min(Duration::from_millis(1)));
+                            continue;
+                        }
+                        next += period;
+                    }
+                    if cnc.status().flags.load_acquire() & NODE_FLAG_CAN_SERVE == 0 {
+                        if write_unpaced {
+                            thread::yield_now();
+                        }
+                        continue;
+                    }
+                    let extra = extra_client(client_id, local_seq);
+                    let res = ingress.try_write(MSG_V2_SUBMIT, 0, extra, &payload);
+                    let full = matches!(res, Err(RingError::Full));
+                    if let Err(e) = thread_counters.record(res) {
+                        panic!("writer ingress.ring error: {e}");
+                    }
+                    local_seq = local_seq.wrapping_add(1);
+                    // Unpaced on a full ring: give the node's drain a turn
+                    // instead of hammering the commit word (the M13 convoy
+                    // lesson: a publish spin under oversubscription slows the
+                    // very consumer it is waiting on).
+                    if full && write_unpaced {
+                        thread::yield_now();
+                    }
                 }
-                next += period;
-                if cnc.status().flags.load_acquire() & NODE_FLAG_CAN_SERVE == 0 {
-                    continue;
-                }
-                let extra = extra_client(client_id, local_seq);
-                let res = ingress.try_write(MSG_V2_SUBMIT, 0, extra, &payload);
-                if let Err(e) = thread_counters.record(res) {
-                    panic!("writer ingress.ring error: {e}");
-                }
-                local_seq = local_seq.wrapping_add(1);
-            }
-        })
-        .expect("spawn writer thread");
-    Some(WriterHandle { handle, counters })
+            })
+            .expect("spawn writer thread");
+        handles.push(handle);
+    }
+    Some(WriterHandle { handles, counters })
 }
 
 fn print_read_report(mode: Mode, readers: u64, write_rate: u64, s: &ReadStats, occ: &[Occupancy]) {
@@ -1404,6 +1467,10 @@ fn print_read_report(mode: Mode, readers: u64, write_rate: u64, s: &ReadStats, o
     println!(
         "background writes/s   : target {write_rate}, accepted {}, dropped {} (of {} attempts)",
         s.writes_accepted, s.writes_dropped, s.writes_attempted
+    );
+    println!(
+        "cluster commit advance : {:.0} bytes/s over the send window",
+        s.commit_bytes_per_sec
     );
     println!("reads resolved        : {}", s.reads);
     println!("retries               : {}", s.retried);
@@ -1467,6 +1534,8 @@ fn run_all(a: AllArgs) -> anyhow::Result<()> {
         readers,
         a.mode,
         a.write_rate,
+        1,
+        false,
         &self_task_dirs(),
         false,
     );
@@ -1521,10 +1590,11 @@ fn run_client_role(a: ClientArgs) -> anyhow::Result<()> {
         );
     }
     anyhow::ensure!(
-        !a.any_role || (a.mode != Mode::Lin && a.write_rate == 0),
-        "--any-role takes --mode snap and --write-rate 0 only: a follower answers a \
-         linearizable read or a write with NOT_LEADER"
+        !a.any_role || (a.mode != Mode::Lin && a.write_rate == 0 && !a.write_unpaced),
+        "--any-role takes --mode snap and --write-rate 0 (not --write-unpaced) only: a \
+         follower answers a linearizable read or a write with NOT_LEADER"
     );
+    anyhow::ensure!(a.write_threads >= 1, "--write-threads must be at least 1");
     let (stats, occ) = run_read_measurement(
         &a.instance_dir,
         &a.app_id,
@@ -1532,6 +1602,8 @@ fn run_client_role(a: ClientArgs) -> anyhow::Result<()> {
         readers,
         a.mode,
         a.write_rate,
+        a.write_threads,
+        a.write_unpaced,
         &task_dirs,
         a.any_role,
     );
@@ -1560,6 +1632,8 @@ fn run_client_role(a: ClientArgs) -> anyhow::Result<()> {
             readers,
             a.mode,
             a.write_rate,
+            a.write_threads,
+            a.write_unpaced,
             &stats,
             &occ
         ))
@@ -1603,6 +1677,17 @@ struct Rung {
     /// Writes the background writer got accepted per second of the run (the
     /// write load actually achieved, vs `write_rate`, the target).
     pub writes_per_sec: f64,
+    /// Writer threads, and whether they ran unpaced (then `write_rate` is a
+    /// label, not a target, and `writes_per_sec` is the ceiling found).
+    pub write_threads: u32,
+    pub write_unpaced: bool,
+    /// Totals behind `writes_per_sec`: a dropped write hit a full ingress
+    /// ring and never reached the node.
+    pub writes_attempted: u64,
+    pub writes_dropped: u64,
+    /// The cluster's commit advance over the send window (bytes/s): the
+    /// committed write load, as opposed to ring-accepted.
+    pub commit_bytes_per_sec: f64,
     /// Occupancy ranking, busiest (fewest yields) first, agent threads only.
     pub agents: Vec<AgentRank>,
 }
@@ -1612,6 +1697,8 @@ impl Rung {
         readers: u64,
         mode: Mode,
         write_rate: u64,
+        write_threads: u32,
+        write_unpaced: bool,
         s: &ReadStats,
         occ: &[Occupancy],
     ) -> Rung {
@@ -1619,6 +1706,11 @@ impl Rung {
             readers,
             mode,
             write_rate,
+            write_threads,
+            write_unpaced,
+            writes_attempted: s.writes_attempted,
+            writes_dropped: s.writes_dropped,
+            commit_bytes_per_sec: s.commit_bytes_per_sec,
             reads: s.reads,
             reads_per_sec: s.reads_per_sec,
             p50_ms: s.p50_ms,
@@ -1720,7 +1812,9 @@ fn rung_to_json(r: &Rung) -> String {
         "{{\"rung\":1,\"mode\":\"{}\",\"readers\":{},\"write_rate\":{},\"reads\":{},\
          \"reads_per_sec\":{},\"p50_ms\":{},\"p99_ms\":{},\"retried\":{},\"not_leader\":{},\
          \"overwritten\":{},\"inflight_at_end\":{},\"inflight_mean\":{},\"inflight_min\":{},\
-         \"regression\":{},\"writes_per_sec\":{},\"agents\":[{}]}}",
+         \"regression\":{},\"writes_per_sec\":{},\"write_threads\":{},\"write_unpaced\":{},\
+         \"writes_attempted\":{},\"writes_dropped\":{},\"commit_bytes_per_sec\":{},\
+         \"agents\":[{}]}}",
         r.mode_str(),
         r.readers,
         r.write_rate,
@@ -1736,6 +1830,11 @@ fn rung_to_json(r: &Rung) -> String {
         r.inflight_min,
         r.regression,
         r.writes_per_sec,
+        r.write_threads,
+        r.write_unpaced,
+        r.writes_attempted,
+        r.writes_dropped,
+        r.commit_bytes_per_sec,
         agents
     )
 }
@@ -1776,6 +1875,14 @@ fn json_u64(line: &str, key: &str) -> Option<u64> {
 
 fn json_f64(line: &str, key: &str) -> Option<f64> {
     json_field(line, key)?.parse().ok()
+}
+
+fn json_bool(line: &str, key: &str) -> Option<bool> {
+    match json_field(line, key)? {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
 }
 
 /// Parse one rung JSON line. Returns `None` for anything that is not one (blank
@@ -1827,6 +1934,11 @@ fn rung_from_json(line: &str) -> Option<Rung> {
         inflight_min: json_u64(head, "inflight_min").unwrap_or(0),
         regression: json_u64(head, "regression").unwrap_or(0),
         writes_per_sec: json_f64(head, "writes_per_sec").unwrap_or(0.0),
+        write_threads: json_u64(head, "write_threads").unwrap_or(1) as u32,
+        write_unpaced: json_bool(head, "write_unpaced").unwrap_or(false),
+        writes_attempted: json_u64(head, "writes_attempted").unwrap_or(0),
+        writes_dropped: json_u64(head, "writes_dropped").unwrap_or(0),
+        commit_bytes_per_sec: json_f64(head, "commit_bytes_per_sec").unwrap_or(0.0),
         agents,
     })
 }
@@ -2101,6 +2213,8 @@ fn run_ladder(a: LadderArgs) -> anyhow::Result<()> {
                     readers,
                     mode,
                     write_rate,
+                    1,
+                    false,
                     &self_task_dirs(),
                     false,
                 );
@@ -2117,7 +2231,7 @@ fn run_ladder(a: LadderArgs) -> anyhow::Result<()> {
                         stats.inflight_at_end
                     );
                 }
-                let r = Rung::from_stats(readers, mode, write_rate, &stats, &occ);
+                let r = Rung::from_stats(readers, mode, write_rate, 1, false, &stats, &occ);
                 // Health goes on the rung line, not just in the report: a rung
                 // that collapsed into retries has a LOW rate, which is the same
                 // shape as the result that justifies building Rung A.
@@ -2431,6 +2545,11 @@ mod tests {
             inflight_min: readers,
             regression: 0,
             writes_per_sec: 0.0,
+            write_threads: 1,
+            write_unpaced: false,
+            writes_attempted: 0,
+            writes_dropped: 0,
+            commit_bytes_per_sec: 0.0,
             agents: vec![agent(top, 10, 100.0), agent("uc2-archive", 11, 1_000.0)],
         }
     }
