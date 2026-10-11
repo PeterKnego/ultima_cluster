@@ -4739,7 +4739,22 @@ impl Consensus {
         // sixth leader-issued `CLUSTER` append, same gate, same reason. One
         // field test once latched, which the first leading pass of an
         // ordinary incarnation does.
-        if serving && !hold_clients && !self.membership_reconciled_latched {
+        //
+        // Gated on CONSENSUS serving, not this pass's `serving` (fix round 3,
+        // ruling R12c): `serving` also needs `jumbo_gate_open`, and a startup
+        // gate can pend for a long time on a SILENT member — while the latch
+        // is unset every membership change answers retry, including removing
+        // that silent member, the operator's remedy. The admin path itself
+        // needs only `sm.can_serve()` (`propose_config`), and so does this
+        // append: it is the same kind of frame, appended the same way, so the
+        // reconcile both latches AND appends under the jumbo gate. It still
+        // keeps `!hold_clients` (false whenever the gate is pending, since no
+        // timer fires then), so it never lands between two due timers.
+        if !self.membership_reconciled_latched
+            && !hold_clients
+            && self.leader_flag.load(Ordering::Relaxed)
+            && self.sm.can_serve()
+        {
             did |= self.maybe_reconcile_forced_membership();
         }
         if serving && !hold_clients {
@@ -19945,6 +19960,53 @@ mod tests {
         pass_checking_the_gate(&mut h);
         assert_eq!(h.cons.jumbo_gate, Some(JumboGate::Passed));
         assert!(h.cons.can_serve_flag.load(Ordering::Acquire));
+    }
+
+    /// Task 12 fix round 2: an admin membership change answers retry while
+    /// this leader has not carried its kernel config into the cluster FSM
+    /// (`membership_reconciled_latched`), and is accepted once it has.
+    #[test]
+    fn a_membership_change_waits_for_the_forced_config_reconcile() {
+        let mut h = harness();
+        drive_to_serving_leader(&mut h);
+        assert!(!h.cons.membership_reconciled_latched, "no pass has run yet");
+        let v0 = h.cons.sm.config().version;
+        let (status, reason, _) = h.cons.propose_and_append(1, 7, 0x7f00_0001, 7007);
+        assert_eq!(
+            (status, reason),
+            (2, 0),
+            "retry until the reconcile latched"
+        );
+        assert_eq!(h.cons.sm.config().version, v0, "nothing adopted on retry");
+        h.cons.membership_reconciled_latched = true;
+        let (status, reason, version) = h.cons.propose_and_append(1, 7, 0x7f00_0001, 7007);
+        assert_eq!(
+            (status, reason, version),
+            (0, 0, v0 + 1),
+            "accepted once latched"
+        );
+    }
+
+    /// Fix round 3 (ruling R12c): the latch sets on an ordinary leader whose
+    /// jumbo startup gate is still PENDING — else a gate pending on a silent
+    /// member would refuse (retry) the very membership change that removes
+    /// it.
+    #[test]
+    fn the_reconcile_latch_sets_while_the_jumbo_gate_is_pending() {
+        let mut h = harness();
+        drive_to_serving_leader(&mut h);
+        let peers = mtu_peers(&h);
+        h.cons.probe_table.set_peers(&peers);
+        arm_force_gate(&mut h);
+        assert!(!h.cons.membership_reconciled_latched);
+        pass_checking_the_gate(&mut h);
+        assert!(!h.cons.jumbo_gate_open, "the gate is pending");
+        assert!(
+            h.cons.membership_reconciled_latched,
+            "the latch sets on a consensus-serving leader whatever the jumbo gate says"
+        );
+        let (status, _, _) = h.cons.propose_and_append(5, 0, 0, 0);
+        assert_ne!(status, 2, "removing a member is not answered retry");
     }
 
     /// Review minor 5: "holds serving" was ADVISORY on a leader. `can_serve`
