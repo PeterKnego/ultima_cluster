@@ -50,6 +50,13 @@ rand = { workspace = true }
 toml = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
+# `tier export-corpus` writes the diff-replay `CORPUS` manifest with the
+# harness's own writer (`CorpusManifest::write`), so the format has one
+# author. `default-features = false`: no `export`/`pin-verify`, so no node
+# spawning and no second path to `uc_node` (already a dependency above).
+# Acyclic: `uc_diffreplay` never depends on `uc_ctl`, and it publishes
+# before `uc_ctl` (`docs/how-to/cut-a-release.md` §6).
+uc_diffreplay = { path = "../uc_diffreplay", version = "2.13.0", default-features = false }
 
 [dev-dependencies]
 # admin_auth_bin.rs starts a real node IN-PROCESS (uc_node is already a
@@ -60,3 +67,11 @@ uc_net = { path = "../uc_net", version = "2.13.0" }
 # shape `uc_node/tests/learner.rs`'s `SumSm` uses.
 uc_service = { path = "../uc_service", version = "2.13.0" }
 tempfile = { workspace = true }
+# tier_bin.rs: the kv example is the diff-replay subject of `tier
+# export-corpus`'s end-to-end test (its `KvSm` fills the tier in process; the
+# `kv-service` binary replays the corpus). `publish = false` crate, so no
+# `version =` — cargo strips an unversioned path dev-dependency on package.
+kv_store = { path = "../examples/kv" }
+# tier_bin.rs submits the kv commands over the real shmem path (`Engine`,
+# the bytes-level client), as `kv_store`'s own corpus generator does.
+uc_client = { path = "../uc_client", version = "2.13.0" }

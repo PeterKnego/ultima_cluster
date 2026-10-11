@@ -9,14 +9,18 @@
 //! `(ip << 32) | id`. Leader-only: a follower answers retry, and the
 //! operator re-runs it against the node the leader hint names.
 //!
-//! `show`, `verify` and `restore` are OFFLINE (spec §8): they read the
-//! target's files directly, never a node's admin band.
+//! `show`, `verify`, `restore`, `fork` and `export-corpus` are OFFLINE
+//! (spec §8): they read the target's files directly, never a node's admin
+//! band.
 
 use std::path::Path;
 
 use uc_node::tier::TierError;
 use uc_node::tier::chain::{list_tier, render_show, verify as verify_tier};
-use uc_node::tier::materialize::{Mode, materialize, restorable_ranges, restore_point};
+use uc_node::tier::materialize::{
+    Mode, export_corpus as export_corpus_dir, fork as fork_dir, materialize, restorable_ranges,
+    restore_point,
+};
 use uc_node::tier::target::{FsTarget, read_tier};
 use uc_protocol::v2::cnc::ADMIN_OP_TIER_FORGET;
 
@@ -189,12 +193,8 @@ pub fn restore(
         Mode::NewNode { node_id } => println!("{}", new_node_line(node_id, q)),
         _ => println!("{}", data_loss_line(q)),
     }
-    let now_ns = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
-    let m =
-        materialize(&t, Some(q), instance_dir, mode, now_ns).map_err(|e| tier_err("restore", e))?;
+    let m = materialize(&t, Some(q), instance_dir, mode, now_ns())
+        .map_err(|e| tier_err("restore", e))?;
     println!(
         "restored: {} start_set={} q={} tier={:#018x} mode={:?}",
         instance_dir.display(),
@@ -210,6 +210,93 @@ pub fn restore(
              then `uc2ctl promote` if it is to vote)"
         );
     }
+    Ok(())
+}
+
+fn now_ns() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+}
+
+/// What `tier fork` prints before it builds anything.
+pub fn fork_line(app_id: &str, node_id: u32, q: u64) -> String {
+    format!(
+        "forking as of {q} into a separate cluster {app_id:?} with node {node_id} as its single \
+         voter; no output at or below {q} is replayed"
+    )
+}
+
+/// `tier fork`: refuse `fork_same_app_id`, print the fork line, build
+/// `instance_dir` and force `node_id` to the single voter.
+pub fn fork(
+    target: &Path,
+    at: Option<u64>,
+    instance_dir: &Path,
+    app_id: &str,
+    node_id: u32,
+) -> anyhow::Result<()> {
+    let (t, info) = open_target("fork", target)?;
+    if app_id == info.app_id {
+        anyhow::bail!(
+            "tier fork: refusing: fork_same_app_id: --app-id {app_id:?} is the tier's own app_id \
+             — a fork is a separate cluster and runs under a new app_id"
+        );
+    }
+    let l = list_tier(&t).map_err(|e| tier_err("fork", e))?;
+    let (_, q) = restore_point(&l, at).map_err(|e| tier_err("fork", e))?;
+    println!("{}", fork_line(app_id, node_id, q));
+    let f = fork_dir(&t, Some(q), instance_dir, app_id, node_id, now_ns())
+        .map_err(|e| tier_err("fork", e))?;
+    println!(
+        "forked: {} start_set={} q={} tier={:#018x} app_id={app_id} node_id={node_id} \
+         config_version={} dropped={:?}",
+        instance_dir.display(),
+        f.materialized.start_set,
+        f.materialized.q,
+        info.tier_id,
+        f.force.new_version,
+        f.force.dropped_peers
+    );
+    println!(
+        "next: start node {node_id} on this directory under app_id {app_id:?} (its first \
+         leadership commits the single-voter membership into the cluster state); grow it with \
+         `uc2ctl add-learner` then `uc2ctl promote`"
+    );
+    Ok(())
+}
+
+/// `tier export-corpus`: the restore of `[S, Q)` into `out`, then the
+/// diff-replay `CORPUS` manifest, written by `uc_diffreplay`'s own writer.
+pub fn export_corpus(
+    target: &Path,
+    row: u8,
+    from: Option<u64>,
+    to: u64,
+    out: &Path,
+) -> anyhow::Result<()> {
+    let (t, info) = open_target("export-corpus", target)?;
+    let c = export_corpus_dir(&t, row, from, to, out, now_ns())
+        .map_err(|e| tier_err("export-corpus", e))?;
+    let m = uc_diffreplay::corpus::CorpusManifest {
+        app_id: c.app_id,
+        row: c.row,
+        origin: c.origin,
+        end: c.end,
+        version: c.version,
+    };
+    m.write(out)
+        .map_err(|e| anyhow::anyhow!("tier export-corpus: {e:#}"))?;
+    println!(
+        "exported: {} row={} origin={} end={} version={:#x} tier={:#018x}",
+        out.display(),
+        m.row,
+        m.origin,
+        m.end,
+        m.version,
+        info.tier_id
+    );
     Ok(())
 }
 

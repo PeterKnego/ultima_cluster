@@ -2527,6 +2527,7 @@ impl Node {
             view_position_seen: u64::MAX, // see the field: the first refresh must always run
             last_cluster_append: 0,
             rows_versioned_latched: false,
+            membership_reconciled_latched: false,
             next_version_gate_log_ns: 0,
             schedule_position: 0,
             last_armed_table_position: 0,
@@ -3815,6 +3816,14 @@ struct Consensus {
     /// incarnation — a committed version is never removed (a pin replaces
     /// it, never clears it), so once open the steady state is one bool test.
     rows_versioned_latched: bool,
+    /// Ruling PF-fork: `true` once this incarnation, leading, has seen the
+    /// committed cluster FSM's membership at least as new as the kernel's
+    /// adopted config — or has appended the `Membership` command that makes
+    /// it so. LATCHED: after boot the kernel's config moves only through
+    /// `Membership` frames, which the FSM applies at commit, so only an
+    /// offline rewrite of `config.state` (`force-single-member`, `tier fork`)
+    /// can leave the two apart, and it can only have happened before boot.
+    membership_reconciled_latched: bool,
     /// Throttle for `version_gate_waiting` (on `pass_mono_ns`): the next
     /// pass at or after which the closed gate may log again.
     next_version_gate_log_ns: u64,
@@ -4721,6 +4730,14 @@ impl Consensus {
         // `is_empty` test on the steady path (no tier reporting).
         if serving && !hold_clients && !self.pending_backup_reports.is_empty() {
             did |= self.maybe_append_backup_watermark();
+        }
+        // 3a. Ruling PF-fork: a kernel config written offline (the
+        // quorum-loss force, a tier fork) carried into the cluster FSM — the
+        // sixth leader-issued `CLUSTER` append, same gate, same reason. One
+        // field test once latched, which the first leading pass of an
+        // ordinary incarnation does.
+        if serving && !hold_clients && !self.membership_reconciled_latched {
+            did |= self.maybe_reconcile_forced_membership();
         }
         if serving && !hold_clients {
             did |= self.drain_ingress();
@@ -8475,6 +8492,80 @@ impl Consensus {
             None => {
                 self.pending_backup_reports.insert(w.tier_id, w);
             }
+        }
+    }
+
+    /// Ruling PF-fork (backup-tier Task 12): carry a kernel config that no
+    /// `Membership` frame carries into the cluster FSM.
+    ///
+    /// `force_single_member` (the quorum-loss tool, and `tier fork` on the
+    /// directory it materialises) rewrites only `config.state`: the kernel
+    /// boots on the forced single voter, but the cluster FSM — its artifact
+    /// and every `Membership` frame in the journal — still names the old
+    /// members, and nothing would ever change that (uc_sim's inv12 wants the
+    /// FSM's membership to be a committed prefix of the kernel's). So the
+    /// leader appends the kernel's adopted config as a `Membership` command,
+    /// through the one ordinary append path (`append_cluster_frame`):
+    ///
+    /// * only once the cluster agent has CONSUMED past the kernel record's
+    ///   position — below that a frame carrying the config may still be on
+    ///   its way to the FSM, as it is for every ordinary change in flight;
+    /// * only when the committed view's version is OLDER than the kernel's,
+    ///   which, consumed past the record, no ordinary history produces;
+    /// * single-in-flight like every leader-issued kind, and refused (then
+    ///   given up for the incarnation, logged) unless the FSM's own
+    ///   `validate` accepts it — the version must chain, `view + 1`, which the
+    ///   force's `recovered + 1` does by construction.
+    ///
+    /// The kernel re-observes its own config at append (`ConfigObserved` is
+    /// version-gated: an equal version is a no-op), so the append changes
+    /// nothing but the FSM. `#[inline(never)]` for
+    /// `maybe_append_row_genesis`'s reason.
+    #[inline(never)]
+    fn maybe_reconcile_forced_membership(&mut self) -> bool {
+        // `consumed` is stored after the structured view (`publish`), so the
+        // membership read below is at least as new as the cursor.
+        let consumed = self.cluster_view.consumed.load(Ordering::Acquire);
+        if consumed < self.sm.config_position() {
+            return false; // a frame carrying the kernel's config may still apply
+        }
+        let view_position = self.cluster_view.position.load(Ordering::Acquire);
+        if self.last_cluster_append > view_position {
+            return false; // single-in-flight: a CLUSTER command is above commit
+        }
+        let committed = self.cluster_view.membership();
+        let kernel = self.sm.config().clone();
+        if committed.version >= kernel.version {
+            self.membership_reconciled_latched = true;
+            return false;
+        }
+        let cmd = ClusterCommand::Membership(kernel.clone());
+        if let Err(reason) = self.validate_cluster_command(&cmd) {
+            crate::obs_event!(
+                Warn,
+                "membership_reconcile_refused",
+                node = self.id as u64,
+                kernel_version = kernel.version,
+                fsm_version = committed.version,
+                reason = reason as u64
+            );
+            self.membership_reconciled_latched = true;
+            return false;
+        }
+        match self.append_cluster_frame(&cmd) {
+            Ok(position) => {
+                crate::obs_event!(
+                    Info,
+                    "membership_reconciled",
+                    node = self.id as u64,
+                    kernel_version = kernel.version,
+                    fsm_version = committed.version,
+                    position = position
+                );
+                self.membership_reconciled_latched = true;
+                true
+            }
+            Err(_) => false, // WouldOverrun: next pass
         }
     }
 
@@ -14902,6 +14993,7 @@ mod tests {
             view_position_seen: u64::MAX,
             last_cluster_append: 0,
             rows_versioned_latched: false,
+            membership_reconciled_latched: false,
             next_version_gate_log_ns: 0,
             schedule_position: 0,
             last_armed_table_position: 0,

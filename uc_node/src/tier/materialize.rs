@@ -39,8 +39,9 @@ pub enum Mode {
     Recovery,
     /// One replacement node, seeded from the tier under a NEW id.
     NewNode { node_id: u32 },
-    /// A separate cluster as of Q (`uc2ctl tier fork`).
-    Fork,
+    /// A separate cluster as of Q (`uc2ctl tier fork`), to be forced onto
+    /// `node_id` as its single voter ([`fork`]).
+    Fork { node_id: u32 },
 }
 
 impl Mode {
@@ -48,7 +49,7 @@ impl Mode {
         match self {
             Mode::Recovery => "recovery".to_string(),
             Mode::NewNode { node_id } => format!("new-node:{node_id}"),
-            Mode::Fork => "fork".to_string(),
+            Mode::Fork { node_id } => format!("fork:{node_id}"),
         }
     }
 }
@@ -126,6 +127,17 @@ fn unreachable(l: &TierListing, why: &str) -> TierError {
 /// Whether Q is a frame end is only known while streaming — [`materialize`]
 /// checks it there.
 pub fn restore_point(l: &TierListing, q: Option<u64>) -> Result<(u64, u64), TierError> {
+    restore_point_from(l, None, q)
+}
+
+/// [`restore_point`] with the start set optionally named (`export-corpus
+/// --from S`): S must be a complete set strictly below Q whose chain reaches
+/// Q; refused with the restorable ranges otherwise.
+pub fn restore_point_from(
+    l: &TierListing,
+    from: Option<u64>,
+    q: Option<u64>,
+) -> Result<(u64, u64), TierError> {
     let spans: Vec<(u64, u64)> = l
         .sets
         .iter()
@@ -139,6 +151,19 @@ pub fn restore_point(l: &TierListing, q: Option<u64>) -> Result<(u64, u64), Tier
             .max()
             .ok_or_else(|| unreachable(l, "the tier has no complete set"))?,
     };
+    if let Some(s) = from {
+        return match spans.iter().find(|&&(p, _)| p == s) {
+            None => Err(unreachable(
+                l,
+                &format!("asked S={s}, which is not a complete set in the tier"),
+            )),
+            Some(&(p, r)) if p < q && r >= q => Ok((s, q)),
+            Some(_) => Err(unreachable(
+                l,
+                &format!("asked S={s} Q={q}: the chain from S does not reach Q"),
+            )),
+        };
+    }
     spans
         .iter()
         .filter(|&&(p, r)| p < q && r >= q)
@@ -159,10 +184,22 @@ pub fn materialize(
     mode: Mode,
     now_ns: u64,
 ) -> Result<Materialized, TierError> {
+    materialize_from(t, None, q, out_dir, mode, now_ns)
+}
+
+/// [`materialize`] with the start set optionally named ([`restore_point_from`]).
+pub fn materialize_from(
+    t: &dyn BackupTarget,
+    from: Option<u64>,
+    q: Option<u64>,
+    out_dir: &Path,
+    mode: Mode,
+    now_ns: u64,
+) -> Result<Materialized, TierError> {
     refuse_target(out_dir)?;
     let info = read_tier(t)?.ok_or_else(|| refused("no tier at the target (no TIER file)"))?;
     let listing = list_tier(t)?;
-    let (s, q) = restore_point(&listing, q)?;
+    let (s, q) = restore_point_from(&listing, from, q)?;
     let label = listing
         .sets
         .iter()
@@ -233,6 +270,107 @@ pub fn materialize(
             Err(e)
         }
     }
+}
+
+/// What [`fork`] built: the materialized directory and the forced config.
+#[derive(Debug)]
+pub struct Forked {
+    pub materialized: Materialized,
+    pub force: crate::recovery::ForceReport,
+}
+
+/// Spec §8.2 `uc2ctl tier fork`: a separate cluster as of Q. Refuses
+/// `fork_same_app_id` when `new_app_id` is the tier's own `app_id`;
+/// materialises with `output_progress = Q` (D10: a fork replays no side
+/// effects), then applies the `force-single-member` plan to the result so
+/// `node_id` boots as the only voter.
+///
+/// `force_single_member` rewrites only `config.state`; the cluster FSM's
+/// membership (in the artifact and the journal) still names the source's
+/// members. The forked node closes that itself at its first leadership:
+/// the consensus agent appends the kernel's config as a `Membership`
+/// command whenever its adopted config is newer than the committed view's
+/// and no frame carrying it is left to apply (Ruling PF-fork).
+pub fn fork(
+    t: &dyn BackupTarget,
+    q: Option<u64>,
+    out_dir: &Path,
+    new_app_id: &str,
+    node_id: u32,
+    now_ns: u64,
+) -> Result<Forked, TierError> {
+    let info = read_tier(t)?.ok_or_else(|| refused("no tier at the target (no TIER file)"))?;
+    if new_app_id == info.app_id {
+        return Err(refused(format!(
+            "fork_same_app_id: the fork's app_id {new_app_id:?} is the tier's own — a fork is a \
+             separate cluster and must run under a new app_id"
+        )));
+    }
+    let materialized = materialize(t, q, out_dir, Mode::Fork { node_id }, now_ns)?;
+    let force = crate::recovery::force_single_member(out_dir, node_id).map_err(|e| {
+        refused(format!(
+            "fork: {} was materialized but force-single-member failed: {e}",
+            out_dir.display()
+        ))
+    })?;
+    Ok(Forked {
+        materialized,
+        force,
+    })
+}
+
+/// What [`export_corpus`] built: the fields of the diff-replay `CORPUS`
+/// manifest (`uc_diffreplay::corpus::CorpusManifest`), which the caller
+/// writes — `uc_node` does not link the harness.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CorpusFields {
+    pub app_id: String,
+    pub row: u8,
+    pub origin: u64,
+    pub end: u64,
+    pub version: u32,
+}
+
+/// Spec §8.2 `uc2ctl tier export-corpus`: a recovery materialisation of
+/// `[S, Q)` into `out` (S = `from`, or the newest set the chain to Q starts
+/// from) plus the manifest fields: `origin = S`, `end = Q`, and the row's
+/// version as its `SET` records it. Refuses `corpus_row_unknown` when the
+/// start set holds no artifact for `row`.
+pub fn export_corpus(
+    t: &dyn BackupTarget,
+    row: u8,
+    from: Option<u64>,
+    to: u64,
+    out: &Path,
+    now_ns: u64,
+) -> Result<CorpusFields, TierError> {
+    let info = read_tier(t)?.ok_or_else(|| refused("no tier at the target (no TIER file)"))?;
+    let listing = list_tier(t)?;
+    let (s, q) = restore_point_from(&listing, from, Some(to))?;
+    let label = listing
+        .sets
+        .iter()
+        .find(|l| l.position == s)
+        .expect("restore_point_from picks a listed set");
+    let version = label
+        .rows
+        .iter()
+        .find(|r| r.row == row)
+        .map(|r| r.version)
+        .ok_or_else(|| {
+            refused(format!(
+                "corpus_row_unknown: set {s} holds no artifact for row {row} (rows {:?})",
+                label.rows.iter().map(|r| r.row).collect::<Vec<_>>()
+            ))
+        })?;
+    let m = materialize_from(t, Some(s), Some(q), out, Mode::Recovery, now_ns)?;
+    Ok(CorpusFields {
+        app_id: info.app_id,
+        row,
+        origin: m.start_set,
+        end: m.q,
+        version,
+    })
 }
 
 fn running(out_dir: &Path) -> TierError {
@@ -336,7 +474,7 @@ fn build(
 
     let terms = write_journal(t, l, s, q, &tmp.join("journal"))?;
 
-    if let Mode::NewNode { node_id } = mode {
+    if let Mode::NewNode { node_id } | Mode::Fork { node_id } = mode {
         // Ruling R11c: the membership the restored node BOOTS with — the
         // artifact's at S with every Membership frame in [S, Q) folded in,
         // by the same `rederive_config` boot runs — not the one at S alone.
@@ -348,10 +486,21 @@ fn build(
         let boot = crate::node::rederive_config(&archive, record.clone())
             .map_err(|e| TierError::Journal(e.to_string()))?;
         let m = &boot.config;
-        if m.voters.iter().any(|x| x.id == node_id)
-            || m.learners.iter().any(|x| x.id == node_id)
-            || m.tombstones.contains(&node_id)
-        {
+        let member =
+            m.voters.iter().any(|x| x.id == node_id) || m.learners.iter().any(|x| x.id == node_id);
+        if matches!(mode, Mode::Fork { .. }) {
+            // `force-single-member` keeps a voter or learner of this
+            // membership at its recorded address; checked here, before
+            // anything is placed, rather than after the build.
+            if !member || m.tombstones.contains(&node_id) {
+                return Err(refused(format!(
+                    "fork_node_unknown: node id {node_id} is not a live voter or learner of \
+                     the membership as of Q (version {}, position {}) — a fork keeps one of \
+                     the source cluster's members as its single voter",
+                    m.version, boot.position
+                )));
+            }
+        } else if member || m.tombstones.contains(&node_id) {
             return Err(refused(format!(
                 "restore_id_reused: node id {node_id} is a voter, learner or tombstone of the \
                  membership this node would boot with (version {}, position {}) — a \
@@ -370,7 +519,7 @@ fn build(
         .map_err(io::Error::other)?;
     state
         .store_output_progress(match mode {
-            Mode::Fork => q,
+            Mode::Fork { .. } => q,
             Mode::Recovery | Mode::NewNode { .. } => s,
         })
         .map_err(io::Error::other)?;
@@ -877,13 +1026,13 @@ mod tests {
 
         // A fork keeps Q as its output-progress marker.
         let d = out(&fx, "n2");
-        materialize(&t, Some(2560), &d, Mode::Fork, 1).unwrap();
+        materialize(&t, Some(2560), &d, Mode::Fork { node_id: 1 }, 1).unwrap();
         let st = NodeState::open(&d.join("state")).unwrap();
         assert_eq!(st.output_progress(), 2560);
         assert!(
             fs::read_to_string(d.join(RESTORED_FILE))
                 .unwrap()
-                .contains("mode=fork\n")
+                .contains("mode=fork:1\n")
         );
     }
 

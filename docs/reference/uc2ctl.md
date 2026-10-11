@@ -26,10 +26,10 @@ directly and **refuses if a node is running**; `gen-admin-key` and `audit`
 (M12b, `v2.6.0`) are filesystem-only in the same sense as `backup` — `audit`
 even works against an instance directory that has never had a node in it
 yet, and `gen-admin-key` doesn't take `--instance-dir` at all, only a
-destination path. The backup tier's `tier show`, `tier verify` and `tier
-restore` (`0.11.0`, unreleased) read a tier's files directly and never a node's
-admin band; `tier restore` refuses an instance directory a running node
-holds. None of these accept `--app-id` in the same sense as the
+destination path. The backup tier's `tier show`, `tier verify`, `tier
+restore`, `tier fork` and `tier export-corpus` (`0.11.0`, unreleased) read a
+tier's files directly and never a node's admin band; `tier restore` and `tier
+fork` refuse an instance directory a running node holds. None of these accept `--app-id` in the same sense as the
 admin-band commands — most don't take it at all (there is nothing on disk to
 check it against), and `force-single-member` takes it purely as a typed
 confirmation guard, not as anything validated against a live node.
@@ -659,7 +659,8 @@ Output fields:
 
 `backup`, `verify-backup`, `restore` (M11 Task 2), `force-single-member`
 (M11 Task 4), `gen-admin-key`/`audit` (M12b, `v2.6.0`), and the backup tier's
-`tier show`/`tier verify`/`tier restore` (`0.11.0`, unreleased). See
+`tier show`/`tier verify`/`tier restore`/`tier fork`/`tier export-corpus`
+(`0.11.0`, unreleased). See
 [the offline-vs-admin-band distinction](#admin-band-commands-vs-offline-commands)
 above. Task walkthroughs: [Back up a cluster](../how-to/back-up-a-cluster.md),
 [Recover from quorum loss](../how-to/recover-from-quorum-loss.md),
@@ -762,7 +763,10 @@ member of the recovered config.
 On success, prints the exact data-loss statement first, then the resulting
 report (`old_version`, `new_version`, `durable`, `dropped_peers`). Every peer
 but the survivor is **dropped from the config, not tombstoned** — they
-wipe-and-rejoin later as fresh learners; see
+wipe-and-rejoin later as fresh learners. The command rewrites only the
+node's own config record; at the survivor's first leadership it appends the
+single-voter membership as a cluster command, so the replicated cluster
+state follows once that commits. See
 [Recover from quorum loss](../how-to/recover-from-quorum-loss.md). A one-way
 door: there is no "undo" verb.
 
@@ -886,7 +890,11 @@ Exactly one of:
   up from the live cluster (nothing is discarded)` instead of the data-loss
   line. Start the node, then add it (spec §8.2's `uc2ctl add`:
   [`add-learner`](#add-learner), then [`promote`](#promote) if it is to
-  vote).
+  vote). **Not yet usable against a live cluster** (unreleased): the seeded
+  node's term map begins at `S` rather than at its term's true base, so the
+  leader's term-map reconcile cuts it to position 0, below its snapshot
+  floor, and the node fail-stops. Until that is fixed, seed a replacement
+  node through the ordinary snapshot session.
 
 The builder holds `<DIR>`'s exclusive `instance.lock` for the whole build,
 as `force-single-member` does, so a node started there mid-build refuses.
@@ -911,6 +919,64 @@ it again if the command created it):
 - a chain gap, a corrupt chunk or an overlap mismatch, as `tier verify`
   names them;
 - any finding of the final verification of the assembled directory.
+
+### `tier fork`
+
+```
+uc2ctl tier fork --target <TIER> [--at <Q>] --instance-dir <DIR> --app-id <NEW> --node-id <N>
+```
+
+Builds a **separate cluster** as of `Q` (`--at`, default the tier's furthest
+reach) in `<DIR>`: the same build as `tier restore`, with two differences.
+The output-progress marker is `Q`, not `S` — a fork replays **no** side
+effects: every output at or below `Q` already happened in the real world, so
+the fork's output handler sees only commands committed after it boots. Then
+the [`force-single-member`](#force-single-member) plan is applied to the
+result: `N` becomes the only voter at its recorded address, config version
+one past the restored one, every other member dropped (not tombstoned). The
+`RESTORED` file records `mode=fork:<N>`.
+
+It prints `forking as of <Q> into a separate cluster "<NEW>" with node <N> as
+its single voter; no output at or below <Q> is replayed` before building,
+then `forked: … config_version=<V> dropped=[…]` and the next step.
+
+Start node `N` on `<DIR>` with `app_id = "<NEW>"` in its `node.toml`. At its
+first leadership the node appends the single-voter membership as a cluster
+command, so the replicated cluster state (`uc2ctl status`, the cluster
+artifact) agrees with the forced config once that commits. Grow the fork with
+[`add-learner`](#add-learner) and [`promote`](#promote).
+
+Refusals, each by name, each building nothing — the `tier restore` list,
+plus:
+
+- `fork_same_app_id` — `--app-id` is the tier's own `app_id`. A fork is a
+  separate cluster and must not be confusable with its source;
+- `fork_node_unknown` — `N` is not a voter or learner (or is a tombstone) of
+  the membership as of `Q`.
+
+### `tier export-corpus`
+
+```
+uc2ctl tier export-corpus --target <TIER> --row <R> [--from <S>] --to <Q> --out <DIR>
+```
+
+Builds a [diff-replay](../how-to/diff-replay.md) **corpus** from the tier:
+the `tier restore` build of `[S, Q)` into `<DIR>` (a whole-cluster recovery
+build — `<DIR>` is never booted), plus a `CORPUS` manifest in the
+`uc2-corpus-v1` format `uc2-diffreplay` reads, written by `uc_diffreplay`'s
+own writer: `app_id` (the tier's), `row`, `origin = S`, `end = Q`, and
+`version` — the row's version as the start set's `SET` records it. `S` is
+`--from` when given (a complete set below `Q` whose chain reaches `Q`),
+else the newest such set. Prints `exported: <DIR> row=… origin=… end=…
+version=0x… tier=0x…`. Then, for example:
+
+```
+uc2-diffreplay determinism --corpus <DIR> --bin <your-service-binary> --report det.json
+```
+
+Refusals: the `tier restore` list (`restore_point_unreachable` names an `S`
+that is not a complete set or whose chain does not reach `Q`), plus
+`corpus_row_unknown` — the start set holds no artifact for `--row`.
 
 ## Response statuses
 

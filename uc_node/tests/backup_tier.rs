@@ -1887,4 +1887,329 @@ mod writer_e2e {
             m.samples
         );
     }
+
+    // ------------------------------------------- Task 12: fork, new node
+
+    /// An `OutputHandler` that records every position it is called with.
+    struct Outs(Arc<std::sync::Mutex<Vec<u64>>>);
+
+    impl uc_service::RawOutputHandler<SumSm> for Outs {
+        async fn on_committed(
+            &self,
+            position: u64,
+            _cmd: &[u8],
+            _state: &SumSm,
+        ) -> Result<(), uc_service::OutputError> {
+            self.0.lock().unwrap().push(position);
+            Ok(())
+        }
+    }
+
+    /// A 3-voter cluster with a writer on node 1, `n1` frames, an agreed
+    /// instant, `n2` more frames, and a watermark through the last of them.
+    /// Returns `(cluster, tier, set, committed)`.
+    fn tiered(app: &'static str, n1: u64, n2: u64) -> (Cluster, tempfile::TempDir, u64, u64) {
+        let tier = tmp_tier();
+        let cfg = writer_cfg(tier.path(), 1 << 20, Duration::from_millis(500));
+        let mut c = spawn(3, 0, opts(app, false), |i| (i == 1).then(|| cfg.clone()));
+        start_sums(&mut c);
+        let l = await_single_leader(&c, 30);
+        await_capable(&c);
+        let all = c.running();
+        submit_frames(c.node(l), n1);
+        let p = instant_until_complete(&c, l, &all);
+        await_agreed(&c, &all, p);
+        submit_frames(c.node(l), n2);
+        let target = c.node(l).counters().commit.load_acquire();
+        await_watermark(&c, l, 60, |w| w.newest_set == p && w.through >= target);
+        (c, tier, p, target)
+    }
+
+    /// Spec §8.2, D10, Ruling PF-fork: `tier fork` builds a separate cluster
+    /// as of Q. It boots ALONE under a new app id (`force-single-member` on
+    /// the result), its cluster FSM's committed membership follows the
+    /// kernel's single voter (the leader appends the `Membership` command the
+    /// force left owed), and the outputs that already happened at or below Q
+    /// are never replayed: one new command, one `on_committed` call.
+    #[test]
+    fn a_fork_boots_alone_under_its_new_app_id_and_replays_no_outputs() {
+        let _g = serialize();
+        let (c, tier, _p, target) = tiered("tier-fork-src", 300, 1000);
+        let old_version = c.node(0).config_version();
+        let _keep = c.stop();
+
+        let t = FsTarget::new(tier.path());
+        let (_, _, through) = watermark_of(&list_tier(&t).unwrap()).expect("a watermark");
+        assert!(through >= target);
+        let fresh = tempfile::Builder::new()
+            .prefix("uc2-tier-fork-")
+            .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+            .expect("tempdir");
+        let fd = fresh.path().join("f0");
+        let f =
+            uc_node::tier::materialize::fork(&t, Some(through), &fd, "fork", 0, 3).expect("fork");
+        assert_eq!(f.materialized.q, through);
+        assert_eq!(f.materialized.mode, Mode::Fork { node_id: 0 });
+        assert_eq!(f.force.dropped_peers, vec![1, 2]);
+        let rc = uc_node::recovery::recovered_config(&fd).expect("recovered config");
+        assert_eq!(
+            rc.voters.iter().map(|v| v.0).collect::<Vec<_>>(),
+            vec![0],
+            "the kernel's config is the single voter"
+        );
+        assert_eq!(rc.version, old_version + 1);
+
+        // Boot it alone, under the new app id, on a fresh address.
+        let sock = UdpSocket::bind("127.0.0.1:0").expect("bind");
+        let addr = sock.local_addr().unwrap();
+        let cfg = NodeConfig {
+            id: 0,
+            members: vec![(0, addr)],
+            learners: Vec::new(),
+            bind: addr,
+            instance_dir: fd.clone(),
+            app_id: "fork".into(),
+            buffer_bytes: 1 << 22,
+            max_payload: 256,
+            admission_bytes_default: 256 * 1024,
+            settings_genesis: Settings::genesis_default(),
+            force_jumbo_frames: false,
+            election_timeout_min_ns: 150_000_000,
+            election_timeout_max_ns: 300_000_000,
+            seed: 0xF0F0,
+            faults: FaultConfig::default(),
+            purge: PurgePolicy::Disabled,
+            journal_segment_bytes: uc_node::DEFAULT_JOURNAL_SEGMENT_BYTES,
+            crypto: uc_node::CryptoConfig::Disabled,
+            services: ServicesConfig::single(<SumSm as uc_service::RawStateMachine>::NAME),
+        };
+        let node = Node::start_with(
+            cfg,
+            StartOpts {
+                socket: Some(sock),
+                admin: AdminPolicy::Filesystem,
+                backup: None,
+            },
+        )
+        .expect("start the fork");
+        await_until(30, "the fork never led alone", || node.can_serve());
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let svc = uc_service::ServiceBuilder::new(svc_cfg(&fd, "fork"), SumSm::on(0))
+            .raw_output_handler(Outs(seen.clone()))
+            .start()
+            .expect("service on the fork");
+        await_until(30, "the fork's FSM membership follows the kernel", || {
+            let m = node.cluster_view().membership();
+            m.voters.len() == 1 && m.voters[0].0 == 0 && m.version == old_version + 1
+        });
+        submit_frames(&node, 1);
+        await_until(30, "the one new output was delivered", || {
+            !seen.lock().unwrap().is_empty()
+        });
+        // Give a stray replay time to show itself.
+        std::thread::sleep(Duration::from_millis(500));
+        let calls = seen.lock().unwrap().clone();
+        assert_eq!(
+            calls.len(),
+            1,
+            "exactly the new command's output: {calls:?}"
+        );
+        assert!(
+            calls[0] >= through,
+            "no output at or below Q={through} is replayed: {calls:?}"
+        );
+        // The membership holds across an instant (the FSM's artifact).
+        let p = loop {
+            match node.command_snapshot(false) {
+                Ok(p) => break p,
+                Err(uc_node::SnapshotRefusal::Retry) => {
+                    std::thread::sleep(Duration::from_millis(5))
+                }
+                Err(e) => panic!("snapshot refused on the fork: {e}"),
+            }
+        };
+        await_until(30, "the fork's instant completed", || {
+            node.snapshot_set_position() >= p
+        });
+        assert_eq!(node.cluster_view().membership().voters.len(), 1);
+        svc.stop();
+        node.stop();
+        let rc = uc_node::recovery::recovered_config(&fd).expect("recovered config");
+        assert_eq!(rc.voters.iter().map(|v| v.0).collect::<Vec<_>>(), vec![0]);
+        drop(fresh);
+    }
+
+    /// Spec §8.2: a fork under the tier's own app id is refused by name and
+    /// builds nothing.
+    #[test]
+    fn fork_refuses_the_same_app_id() {
+        let _g = serialize();
+        let (c, tier, _p, _target) = tiered("tier-fork-same", 50, 50);
+        let _keep = c.stop();
+        let t = FsTarget::new(tier.path());
+        let fresh = tempfile::Builder::new()
+            .prefix("uc2-tier-fork-same-")
+            .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+            .expect("tempdir");
+        let fd = fresh.path().join("f");
+        let e = uc_node::tier::materialize::fork(&t, None, &fd, "tier-fork-same", 0, 1)
+            .expect_err("same app id refused");
+        assert!(e.to_string().contains("fork_same_app_id"), "{e}");
+        assert!(!fd.exists(), "nothing was built");
+        let e = uc_node::tier::materialize::fork(&t, None, &fd, "other", 42, 1)
+            .expect_err("an id outside the membership is refused");
+        assert!(e.to_string().contains("fork_node_unknown"), "{e}");
+        assert!(!fd.exists(), "nothing was built");
+    }
+
+    /// The `uc2ctl` admin flow minus the bin (reconfig.rs's helper).
+    fn admin_ok(cnc: &CncPage, op: u32, id: u32, ip: u32, port: u16) -> u64 {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let old = cnc.read_admin_req(0).map(|r| r.seq).unwrap_or(0);
+            let seq = old + 1;
+            cnc.write_admin_req(&uc_log::cnc::AdminReq {
+                seq,
+                nonce: rand::random::<u64>(),
+                op,
+                id,
+                ip,
+                port,
+            });
+            let resp = loop {
+                if let Some(r) = cnc.read_admin_resp(seq) {
+                    break r;
+                }
+                assert!(Instant::now() < deadline, "admin op {op} timed out");
+                std::thread::yield_now();
+            };
+            match resp.status {
+                0 => return resp.version,
+                2 => {}
+                1 if matches!(resp.reason, 2 | 3 | 10) => {}
+                _ => panic!(
+                    "admin op {op} on {id} refused: status={} reason={}",
+                    resp.status, resp.reason
+                ),
+            }
+            assert!(Instant::now() < deadline, "admin op {op} never accepted");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Spec §8.2 + the R8a carry: a node seeded from the tier under a NEW id
+    /// joins a LIVE, appending cluster as a learner, catches up, rides a
+    /// leader change, and once promoted its durable reports carry the quorum
+    /// (one other voter is down) — no truncation, no wipe, no unattested
+    /// report anywhere. Its term map starts at (term, S) and its padding
+    /// bodies are zero where peers hold leftover bytes; neither may matter.
+    ///
+    /// IGNORED — a design-level finding (Task 12 report): the seeded node's
+    /// term map is `[(term, S)]`, the leader ships `[(term, 0)]`, and
+    /// `uc_consensus::reconcile` finds no aligned entry, so it cuts at
+    /// `min(durable, leader[0].base) = 0`. The archive then fail-stops
+    /// (`PositionPurged { pos: 0, first_base: S }`) because a node with a
+    /// floor cannot truncate below it. Observed with `UC2_TRUNC_TRACE=1`:
+    /// `cut to=0 durable=230880 own_tail=[(1, 38528)] lead_head=[(1, 0)]`.
+    #[test]
+    #[ignore = "design finding: reconcile cuts a tier-seeded node to 0 (term map starts at (term, S)); see the Task 12 report"]
+    fn a_new_node_seeded_from_the_tier_joins_and_catches_up() {
+        let _g = serialize();
+        let (mut c, tier, p, _target) = tiered("tier-new-node", 300, 1500);
+        let t = FsTarget::new(tier.path());
+        let fresh = tempfile::Builder::new()
+            .prefix("uc2-tier-new-node-")
+            .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+            .expect("tempdir");
+        let nd = fresh.path().join("n9");
+        let m = materialize(&t, None, &nd, Mode::NewNode { node_id: 9 }, 5).expect("seed");
+        assert!(m.start_set >= p);
+
+        // The cluster keeps appending while node 9 is added and boots.
+        let l = await_single_leader(&c, 30);
+        submit_frames(c.node(l), 500);
+        let sock9 = UdpSocket::bind("127.0.0.1:0").expect("bind 9");
+        let addr9 = sock9.local_addr().unwrap();
+        let (ip9, port9) = match addr9 {
+            SocketAddr::V4(a) => (u32::from(*a.ip()), a.port()),
+            SocketAddr::V6(_) => unreachable!(),
+        };
+        let cnc_l = c.cnc(l);
+        admin_ok(&cnc_l, 1 /* AddLearner */, 9, ip9, port9);
+        let voters: Vec<(NodeId, SocketAddr)> =
+            (0..3).map(|i| (i as NodeId, c.nodes[i].addr)).collect();
+        let d9 = nd.clone();
+        let app = c.app;
+        let cfg9: Box<dyn Fn() -> NodeConfig> = Box::new(move || NodeConfig {
+            id: 9,
+            members: voters.clone(),
+            learners: Vec::new(),
+            bind: addr9,
+            instance_dir: d9.clone(),
+            app_id: app.into(),
+            buffer_bytes: 1 << 22,
+            max_payload: 256,
+            admission_bytes_default: 256 * 1024,
+            settings_genesis: Settings::genesis_default(),
+            force_jumbo_frames: false,
+            election_timeout_min_ns: 150_000_000,
+            election_timeout_max_ns: 300_000_000,
+            seed: 0x9999,
+            faults: FaultConfig::default(),
+            purge: PurgePolicy::Disabled,
+            journal_segment_bytes: uc_node::DEFAULT_JOURNAL_SEGMENT_BYTES,
+            crypto: uc_node::CryptoConfig::Disabled,
+            services: ServicesConfig::single(<SumSm as uc_service::RawStateMachine>::NAME),
+        });
+        let mut h9 = NodeH {
+            addr: addr9,
+            dir: nd.clone(),
+            is_learner: true,
+            cfg: cfg9,
+            backup: None,
+            sock: Some(sock9),
+            node: None,
+            svc: None,
+        };
+        h9.start();
+        h9.start_service(app, 9);
+        c.nodes.push(h9);
+        let n9 = c.nodes.len() - 1;
+
+        // Load while it catches up, then a leader change mid-catch-up.
+        submit_frames(c.node(l), 1000);
+        c.nodes[l].stop();
+        let l2 = submit_following(&c, 1000);
+        assert_ne!(l2, l);
+        let commit = c.node(l2).counters().commit.load_acquire();
+        await_until(60, "node 9 caught up to the new leader's commit", || {
+            c.node(n9).counters().durable.load_acquire() >= commit
+        });
+
+        // Promote it: with node `l` down, 3 of the 4 voters are live, so
+        // every commit from here needs node 9's (attested) durable report.
+        admin_ok(&c.cnc(l2), 2 /* PromoteLearner */, 9, 0, 0);
+        await_until(30, "node 9 adopted its promotion", || {
+            c.node(n9).config_version() >= c.node(l2).config_version()
+        });
+        let l3 = submit_following(&c, 500);
+        let commit = c.node(l3).counters().commit.load_acquire();
+        await_until(60, "node 9 holds the new commits", || {
+            c.node(n9).counters().durable.load_acquire() >= commit
+        });
+        let total = query_total(&c, l3);
+        assert_eq!(query_total(&c, n9), total, "node 9 serves the same state");
+
+        assert_eq!(c.node(n9).truncations(), 0, "node 9 truncated nothing");
+        assert_eq!(c.node(n9).wipes(), 0, "node 9 was never wiped");
+        for i in c.running() {
+            assert_eq!(
+                c.node(i).reports_unattested(),
+                0,
+                "node {i} declined an unattested report"
+            );
+        }
+        let _keep = c.stop();
+        drop(fresh);
+    }
 }

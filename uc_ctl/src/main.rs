@@ -360,6 +360,56 @@ enum TierCmd {
     /// (`--confirm-cluster <app_id>`, run on every node with the same
     /// `--at`) or one replacement node (`--new-node --node-id N`, a NEW id).
     Restore(TierRestoreArgs),
+    /// OFFLINE (spec §8.2): build a SEPARATE cluster from the tier as of
+    /// `--at`: materialise with output progress at Q (no side effect at or
+    /// below Q is replayed), then force `--node-id` (a member as of Q) to
+    /// the single voter. Refused `fork_same_app_id` when `--app-id` is the
+    /// tier's own. Boot it under `--app-id`; grow it with add-learner and
+    /// promote.
+    Fork(TierForkArgs),
+    /// OFFLINE (spec §8.2): a diff-replay corpus — the restore of `[S, Q)`
+    /// into `--out` plus its `CORPUS` manifest (`origin = S`, `end = Q`, the
+    /// row's version from the set). `uc2-diffreplay --corpus` reads it.
+    ExportCorpus(TierExportCorpusArgs),
+}
+
+#[derive(clap::Args)]
+struct TierForkArgs {
+    #[arg(long)]
+    target: PathBuf,
+    /// The fork point Q: a frame end inside a restorable range (`tier
+    /// show`). Default: the tier's furthest reach.
+    #[arg(long)]
+    at: Option<u64>,
+    /// The instance directory to build (absent or empty, no node on it).
+    #[arg(long)]
+    instance_dir: PathBuf,
+    /// The fork's app id. Must differ from the tier's.
+    #[arg(long)]
+    app_id: String,
+    /// The member (voter or learner as of Q) the fork keeps as its single
+    /// voter, at its recorded address.
+    #[arg(long)]
+    node_id: u32,
+}
+
+#[derive(clap::Args)]
+struct TierExportCorpusArgs {
+    #[arg(long)]
+    target: PathBuf,
+    /// The service row whose corpus this is.
+    #[arg(long)]
+    row: u8,
+    /// The origin set S (default: the newest complete set below `--to`
+    /// whose chain reaches it).
+    #[arg(long)]
+    from: Option<u64>,
+    /// The end Q: a frame end the chain from S reaches.
+    #[arg(long)]
+    to: u64,
+    /// The corpus directory to build (absent or empty).
+    #[arg(long)]
+    out: PathBuf,
 }
 
 #[derive(clap::Args)]
@@ -719,6 +769,16 @@ fn main() {
                     }
                 };
                 tier::restore(&args.target, args.at, &args.instance_dir, mode)
+            }
+            TierCmd::Fork(args) => tier::fork(
+                &args.target,
+                args.at,
+                &args.instance_dir,
+                &args.app_id,
+                args.node_id,
+            ),
+            TierCmd::ExportCorpus(args) => {
+                tier::export_corpus(&args.target, args.row, args.from, args.to, &args.out)
             }
         },
     };
@@ -2085,6 +2145,64 @@ mod tests {
         for a in bad {
             assert!(p(a).is_err(), "{a:?}");
         }
+    }
+
+    /// `tier fork` needs `--app-id` and `--node-id`; `tier export-corpus`
+    /// needs `--row`, `--to` and `--out`, `--from` optional.
+    #[test]
+    fn tier_fork_and_export_corpus_parse() {
+        let p = |args: &[&str]| {
+            let mut v = vec!["uc2ctl", "tier"];
+            v.extend_from_slice(args);
+            Cli::try_parse_from(v)
+        };
+        let fork = [
+            "fork",
+            "--target",
+            "/t",
+            "--at",
+            "4096",
+            "--instance-dir",
+            "/d",
+            "--app-id",
+            "f",
+            "--node-id",
+            "2",
+        ];
+        match p(&fork).unwrap().cmd {
+            Cmd::Tier(TierArgs {
+                cmd: TierCmd::Fork(a),
+            }) => assert_eq!((a.at, a.app_id.as_str(), a.node_id), (Some(4096), "f", 2)),
+            _ => panic!("wrong variant"),
+        }
+        assert!(p(&fork[..fork.len() - 2]).is_err(), "--node-id is required");
+        assert!(p(&fork[..fork.len() - 4]).is_err(), "--app-id is required");
+        let ex = [
+            "export-corpus",
+            "--target",
+            "/t",
+            "--row",
+            "1",
+            "--to",
+            "8192",
+            "--out",
+            "/o",
+        ];
+        match p(&ex).unwrap().cmd {
+            Cmd::Tier(TierArgs {
+                cmd: TierCmd::ExportCorpus(a),
+            }) => assert_eq!((a.row, a.from, a.to), (1, None, 8192)),
+            _ => panic!("wrong variant"),
+        }
+        let mut with_from = ex.to_vec();
+        with_from.extend_from_slice(&["--from", "4096"]);
+        match p(&with_from).unwrap().cmd {
+            Cmd::Tier(TierArgs {
+                cmd: TierCmd::ExportCorpus(a),
+            }) => assert_eq!(a.from, Some(4096)),
+            _ => panic!("wrong variant"),
+        }
+        assert!(p(&ex[..5]).is_err(), "--to and --out are required");
     }
 
     // Fix round 1 (Important): every `uc2ctl snapshot ...` invocation shape
