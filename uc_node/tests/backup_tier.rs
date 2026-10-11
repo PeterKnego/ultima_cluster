@@ -686,10 +686,12 @@ mod writer_e2e {
     ///
     /// Issue #99: a "no leader took the writes" / "no leader committed its
     /// own appends within 60 s" / "no instant completed" failure under load
-    /// is the post-election commit stall on main, not this test's: the log
-    /// end sat more than `fsm_lag` past `applied` at the election, so every
-    /// follower's report ceiling (`applied + fsm_lag`) sits below the new
-    /// leader's NewTerm frame and nothing ever commits again.
+    /// was the post-election commit stall, now fixed: the log end sat more
+    /// than `fsm_lag` past `applied` at the election, so every follower's
+    /// report ceiling (`applied + fsm_lag`) sat below the new leader's NewTerm
+    /// frame and nothing ever committed again. The ceiling now never sits
+    /// below the current term's opening frame; a recurrence means that fix
+    /// regressed (`uc_node/tests/post_election_stall.rs` pins it).
     fn submit_settled(c: &Cluster, n: u64) -> usize {
         let deadline = Instant::now() + Duration::from_secs(60);
         let mut left = n;
@@ -726,10 +728,12 @@ mod writer_e2e {
     ///
     /// Issue #99: a "no leader took the writes" / "no leader committed its
     /// own appends within 60 s" / "no instant completed" failure under load
-    /// is the post-election commit stall on main, not this test's: the log
-    /// end sat more than `fsm_lag` past `applied` at the election, so every
-    /// follower's report ceiling (`applied + fsm_lag`) sits below the new
-    /// leader's NewTerm frame and nothing ever commits again.
+    /// was the post-election commit stall, now fixed: the log end sat more
+    /// than `fsm_lag` past `applied` at the election, so every follower's
+    /// report ceiling (`applied + fsm_lag`) sat below the new leader's NewTerm
+    /// frame and nothing ever committed again. The ceiling now never sits
+    /// below the current term's opening frame; a recurrence means that fix
+    /// regressed (`uc_node/tests/post_election_stall.rs` pins it).
     ///
     /// `floor`: when the serving node is the one that took the last batch,
     /// wait until its `append` has reached the batch's end before taking the
@@ -786,10 +790,12 @@ mod writer_e2e {
     ///
     /// Issue #99: a "no leader took the writes" / "no leader committed its
     /// own appends within 60 s" / "no instant completed" failure under load
-    /// is the post-election commit stall on main, not this test's: the log
-    /// end sat more than `fsm_lag` past `applied` at the election, so every
-    /// follower's report ceiling (`applied + fsm_lag`) sits below the new
-    /// leader's NewTerm frame and nothing ever commits again.
+    /// was the post-election commit stall, now fixed: the log end sat more
+    /// than `fsm_lag` past `applied` at the election, so every follower's
+    /// report ceiling (`applied + fsm_lag`) sat below the new leader's NewTerm
+    /// frame and nothing ever committed again. The ceiling now never sits
+    /// below the current term's opening frame; a recurrence means that fix
+    /// regressed (`uc_node/tests/post_election_stall.rs` pins it).
     fn instant_until_complete(c: &Cluster, leader: usize, idxs: &[usize]) -> u64 {
         let mut leader = leader;
         for _ in 0..5 {
@@ -1729,10 +1735,10 @@ mod writer_e2e {
     /// watermark claim `[oldest_set, through)` across a gap in the final
     /// tier.
     ///
-    /// Issue #99: under load an election mid-test can hit the post-election
-    /// commit stall on main (log end more than `fsm_lag` past `applied`, so
-    /// the report ceiling sits below the new leader's NewTerm frame) — it
-    /// fails here as "no leader took the writes" / "no leader committed its
+    /// Issue #99 (fixed): under load an election mid-test used to hit the
+    /// post-election commit stall (log end more than `fsm_lag` past
+    /// `applied`, so the report ceiling sat below the new leader's NewTerm
+    /// frame) — it failed here as "no leader took the writes" / "no leader committed its
     /// own appends within 60 s" / "no instant completed", a product defect,
     /// not this test's. Also seen twice while deflaking, unexplained: "no
     /// single leader elected" — no election at all for 20 s after start,

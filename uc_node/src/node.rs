@@ -26171,6 +26171,47 @@ mod tests {
         std::fs::write(d.join(format!("snap-{pos}.ultsnap")), bytes).unwrap();
     }
 
+    /// The "retired gate" guard, at the unit level: a node whose COMMIT
+    /// counter sits below its whole set — a freshly restarted leader before
+    /// its NewTerm commits — still ships the complete set at its floor,
+    /// CLUSTER artifact (and so the schedule table it carries) included. The
+    /// shipping decision reads the durable floor and the files, never commit.
+    /// `learner.rs` used to stage this end to end by leaning on the #95 and
+    /// then the #99 commit deadlocks; with both fixed the state is only
+    /// transient, so this is where the property lives now.
+    #[test]
+    fn snapshot_set_for_ships_the_cluster_artifact_with_commit_at_zero() {
+        let dir = decline_scratch();
+        let root = dir.path().join("snapshots");
+        let cnc = test_cnc();
+        let services = crate::services::ServicesConfig::from_names(&["a"], None).unwrap();
+        let cluster_dir = dir.path().join("snapshots").join("cluster");
+        std::fs::create_dir_all(&cluster_dir).unwrap();
+        const P: u64 = 262_144;
+        cnc.snapshots().node_snapshot_floor.store_release(P);
+        write_artifact(&root, 0, P, b"fsm-0 artifact");
+        std::fs::write(
+            crate::cluster_agent::artifact_path(&cluster_dir, P),
+            b"cluster image with the table",
+        )
+        .unwrap();
+        assert_eq!(
+            cnc.counters().commit.load_acquire(),
+            0,
+            "commit sits below the whole set"
+        );
+        let latch = AtomicU8::new(SNAP_DECLINE_NONE);
+        let set = snapshot_set_for(&cnc, &root, &services, &cluster_dir, 7, &latch)
+            .expect("the set at the floor ships whatever commit reads");
+        assert!(
+            set.artifacts
+                .iter()
+                .any(|a| a.service_id == CLUSTER_ARTIFACT_ID && a.snapshot_pos == P),
+            "the cluster artifact rides the session: {:?}",
+            set.artifacts
+        );
+    }
+
     /// M14c controller amendment 2 (M14c2 T10b): the snapshot source names a
     /// DECLINE once per distinct reason, not once per NAK. A below-floor peer
     /// re-NAKs on a timer, so the un-latched version would log at the NAK rate.
