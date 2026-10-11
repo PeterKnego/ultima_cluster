@@ -681,3 +681,8 @@ ledger (PF = pre-flight, R = execution rulings, by task).
   applied anything (cursor `None`) is refused fatally by the start-set install
   — #98, outside the tier. The capstone takes its first set after 20 acked
   mutations; no assertion was loosened.
+- **Known residual (#99).** `backup_tier` runs in fast CI (ruling R16a), and
+  its gap test can still fail on a loaded runner because of #99, the
+  post-election commit stall on main: when the log end sits more than
+  `fsm_lag` past `applied` at an election, every follower's report ceiling
+  stays below the new leader's NewTerm frame and commit never advances.

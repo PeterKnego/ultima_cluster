@@ -683,11 +683,21 @@ mod writer_e2e {
     /// and never commits. Frames lost that way are simply lost; the caller
     /// counts no frames, only positions the cluster then commits. Returns
     /// the settled leader.
+    ///
+    /// Issue #99: a "no leader took the writes" / "no leader committed its
+    /// own appends within 60 s" / "no instant completed" failure under load
+    /// is the post-election commit stall on main, not this test's: the log
+    /// end sat more than `fsm_lag` past `applied` at the election, so every
+    /// follower's report ceiling (`applied + fsm_lag`) sits below the new
+    /// leader's NewTerm frame and nothing ever commits again.
     fn submit_settled(c: &Cluster, n: u64) -> usize {
         let deadline = Instant::now() + Duration::from_secs(60);
         let mut left = n;
         while left > 0 {
-            assert!(Instant::now() < deadline, "no leader took the writes");
+            assert!(
+                Instant::now() < deadline,
+                "no leader took the writes (if under load, see #99)"
+            );
             let Some(i) = c.running().into_iter().find(|&i| c.node(i).can_serve()) else {
                 std::thread::yield_now();
                 continue;
@@ -701,12 +711,19 @@ mod writer_e2e {
     /// appended, following an election that lands meanwhile (the deposed
     /// leader's uncommitted tail is truncated and never commits, so waiting
     /// on ITS append position would wait forever). Returns that leader.
+    ///
+    /// Issue #99: a "no leader took the writes" / "no leader committed its
+    /// own appends within 60 s" / "no instant completed" failure under load
+    /// is the post-election commit stall on main, not this test's: the log
+    /// end sat more than `fsm_lag` past `applied` at the election, so every
+    /// follower's report ceiling (`applied + fsm_lag`) sits below the new
+    /// leader's NewTerm frame and nothing ever commits again.
     fn await_settled(c: &Cluster) -> usize {
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             assert!(
                 Instant::now() < deadline,
-                "no leader committed its own appends within 60 s"
+                "no leader committed its own appends within 60 s (if under load, see #99)"
             );
             let Some(l) = c.running().into_iter().find(|&i| c.node(i).can_serve()) else {
                 std::thread::yield_now();
@@ -736,6 +753,13 @@ mod writer_e2e {
     /// complete set; returns its position. `leader` is a hint: an election
     /// that lands meanwhile moves the command to whichever node now serves
     /// (a deposed leader answers `Retry` for good).
+    ///
+    /// Issue #99: a "no leader took the writes" / "no leader committed its
+    /// own appends within 60 s" / "no instant completed" failure under load
+    /// is the post-election commit stall on main, not this test's: the log
+    /// end sat more than `fsm_lag` past `applied` at the election, so every
+    /// follower's report ceiling (`applied + fsm_lag`) sits below the new
+    /// leader's NewTerm frame and nothing ever commits again.
     fn instant_until_complete(c: &Cluster, leader: usize, idxs: &[usize]) -> u64 {
         let mut leader = leader;
         for _ in 0..5 {
@@ -764,7 +788,7 @@ mod writer_e2e {
                 std::thread::yield_now();
             }
         }
-        panic!("no instant completed");
+        panic!("no instant completed (if under load, see #99)");
     }
 
     fn await_agreed(c: &Cluster, idxs: &[usize], p: u64) {
@@ -1502,6 +1526,16 @@ mod writer_e2e {
     /// the watermark's `oldest_set` jumps; at no point does any committed
     /// watermark claim `[oldest_set, through)` across a gap in the final
     /// tier.
+    ///
+    /// Issue #99: under load an election mid-test can hit the post-election
+    /// commit stall on main (log end more than `fsm_lag` past `applied`, so
+    /// the report ceiling sits below the new leader's NewTerm frame) — it
+    /// fails here as "no leader took the writes" / "no leader committed its
+    /// own appends within 60 s" / "no instant completed", a product defect,
+    /// not this test's. Also seen twice while deflaking, unexplained: "no
+    /// single leader elected" — no election at all for 20 s after start,
+    /// only under a SIGSTOP stopper whose scripts may have left a STOP
+    /// un-continued; never reproduced with a logged stopper (0/104).
     #[test]
     fn two_writers_share_a_target_and_the_watermark_never_crosses_a_gap() {
         let _g = serialize();
