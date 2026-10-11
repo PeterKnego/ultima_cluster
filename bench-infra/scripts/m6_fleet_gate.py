@@ -1714,20 +1714,41 @@ RM_ARMS = (("lin", "leader"), ("snap", "leader"), ("ryw", "leader"),
            ("snap", "spread"), ("ryw", "spread"))
 
 
-def rm_client_args(host, leader_idx, idx, mode, readers, write_rate, secs):
+# A write-rate token is an int (writes/s target) or the string "max": the
+# leader-host client then runs `--write-unpaced` and the accepted rate IS the
+# result (the "writes as far as they go" rung). Followers never write.
+RM_MAX = "max"
+
+
+def rm_parse_rates(text):
+    rates = []
+    for x in text.split(","):
+        x = x.strip()
+        if not x:
+            continue
+        rates.append(RM_MAX if x.lower() == RM_MAX else int(x))
+    return rates
+
+
+def rm_client_args(host, leader_idx, idx, mode, readers, write_rate, secs, write_threads=1):
     follower = idx != leader_idx
+    unpaced = write_rate == RM_MAX
     args = [
         "client", "--instance-dir", host.dir, "--app-id", APP,
         "--secs", str(secs), "--readers", str(readers), "--mode", mode,
-        "--write-rate", str(0 if follower else write_rate),
+        "--write-rate", str(0 if (follower or unpaced) else write_rate),
     ]
     if follower:
         args.append("--any-role")
+    else:
+        args += ["--write-threads", str(write_threads)]
+        if unpaced:
+            args.append("--write-unpaced")
     return args
 
 
 def rm_run_rung(hosts, members, mode, place, readers, write_rate, secs, admission_kib,
-                out_dir, rep):
+                out_dir, rep, write_threads=1):
     tag = f"w{write_rate}-{mode}-{place}-r{readers}-rep{rep}"
     log(f"-- rung {tag}: booting a fresh 3-node cluster")
     try:
@@ -1740,7 +1761,8 @@ def rm_run_rung(hosts, members, mode, place, readers, write_rate, secs, admissio
     results = {}
 
     def go(i):
-        args = rm_client_args(hosts[i], leader, i, mode, readers, write_rate, secs)
+        args = rm_client_args(hosts[i], leader, i, mode, readers, write_rate, secs,
+                              write_threads)
         results[i] = hosts[i].run_foreground(args, timeout=secs + RP_CLIENT_SLACK)
 
     threads = [threading.Thread(target=go, args=(i,)) for i in idxs]
@@ -1770,6 +1792,10 @@ def rm_run_rung(hosts, members, mode, place, readers, write_rate, secs, admissio
             "retry_frac": (r["retried"] + r["not_leader"]) / resolved if resolved else 0.0,
             "inflight_mean": r["inflight_mean"],
             "writes_per_sec": r.get("writes_per_sec", 0.0),
+            "writes_attempted": r.get("writes_attempted", 0),
+            "writes_dropped": r.get("writes_dropped", 0),
+            "write_threads": r.get("write_threads", 1),
+            "write_unpaced": r.get("write_unpaced", False),
         })
     lead = next(h for h in per_host if h["role"] == "leader")
     rec = {
@@ -1777,6 +1803,10 @@ def rm_run_rung(hosts, members, mode, place, readers, write_rate, secs, admissio
         "rep": rep,
         "total_reads_per_sec": sum(h["reads_per_sec"] for h in per_host),
         "writes_per_sec": lead["writes_per_sec"],
+        "writes_dropped_frac": (lead["writes_dropped"] / lead["writes_attempted"]
+                                if lead["writes_attempted"] else 0.0),
+        "write_threads": lead["write_threads"],
+        "write_unpaced": lead["write_unpaced"],
         "p50_ms_max": max(h["p50_ms"] for h in per_host),
         "p99_ms_max": max(h["p99_ms"] for h in per_host),
         "retry_frac_max": max(h["retry_frac"] for h in per_host),
@@ -1786,7 +1816,8 @@ def rm_run_rung(hosts, members, mode, place, readers, write_rate, secs, admissio
     return rec, "ok"
 
 
-def run_read_matrix(hosts, members, readers, write_rates, secs, admission_kib, reps, out_dir):
+def run_read_matrix(hosts, members, readers, write_rates, secs, admission_kib, reps, out_dir,
+                    write_threads=1):
     path = out_dir / "matrix-rungs.jsonl"
     records, failures = [], []
     total = len(write_rates) * len(RM_ARMS) * reps
@@ -1801,7 +1832,7 @@ def run_read_matrix(hosts, members, readers, write_rates, secs, admission_kib, r
                 log(f"== rung {n}/{total}: {mode}/{place} writes/s={wr} rep={rep} ==")
                 try:
                     rec, detail = rm_run_rung(hosts, members, mode, place, readers, wr, secs,
-                                              admission_kib, out_dir, rep)
+                                              admission_kib, out_dir, rep, write_threads)
                 except Exception as e:
                     rec, detail = None, f"orchestrator error: {e!r}"
                 finally:
@@ -1815,7 +1846,8 @@ def run_read_matrix(hosts, members, readers, write_rates, secs, admission_kib, r
                     with path.open("a") as f:
                         f.write(json.dumps(rec) + "\n")
                     log(f"  reads {rec['total_reads_per_sec']:,.0f}/s  writes "
-                        f"{rec['writes_per_sec']:,.0f}/s  p50 {rec['p50_ms_max']:.3f}  p99 "
+                        f"{rec['writes_per_sec']:,.0f}/s (dropped "
+                        f"{rec['writes_dropped_frac']:.1%})  p50 {rec['p50_ms_max']:.3f}  p99 "
                         f"{rec['p99_ms_max']:.3f} ms  retry {rec['retry_frac_max']:.1%}  depth "
                         f"{rec['depth_min_frac']:.0%}")
                 else:
@@ -1918,6 +1950,9 @@ def main():
     ap.add_argument("--rp-matrix", action="store_true",
                     help="read-profile: every read type (lin/snap/ryw) on the leader and "
                          "spread, under each write rate in --rp-write-rates")
+    ap.add_argument("--rp-write-threads", type=int, default=1,
+                    help="read-profile matrix: writer threads on the leader-host client "
+                         "(the target rate is split across them; `max` runs them unpaced)")
     ap.add_argument("--rp-write-rates", default="0,20000,50000,100000,200000",
                     help="read-matrix: comma-separated write loads (writes/s)")
     ap.add_argument("--rp-reps", type=int, default=2,
@@ -2051,7 +2086,8 @@ def main():
             if args.rp_matrix:
                 arms = [f"{m}/{p}" for m, p in RM_ARMS]
                 log(f"sweep: readers={sweep[-1]} x arms={arms} x reps={args.rp_reps} x "
-                    f"writes/s={[int(x) for x in args.rp_write_rates.split(',') if x.strip()]}, "
+                    f"writes/s={rm_parse_rates(args.rp_write_rates)} x "
+                    f"writer threads={args.rp_write_threads}, "
                     f"{args.rp_secs}s per rung, fresh cluster per rung")
             else:
                 log(f"sweep: readers={sweep} x "
@@ -2064,10 +2100,10 @@ def main():
                 log("*** LOCAL: orchestration proof only — these numbers are NOT data "
                     "(3 nodes + 3 services + client share one box) ***")
             if args.rp_matrix:
-                rates = [int(x) for x in args.rp_write_rates.split(",") if x.strip()]
+                rates = rm_parse_rates(args.rp_write_rates)
                 ok, verdicts = run_read_matrix(
                     hosts, members, sweep[-1], rates, args.rp_secs, args.rp_admission_kib,
-                    args.rp_reps, out_dir)
+                    args.rp_reps, out_dir, args.rp_write_threads)
             elif args.rp_spread:
                 ok, verdicts = run_read_spread(
                     hosts, members, sweep, args.rp_secs, args.rp_write_rate,
