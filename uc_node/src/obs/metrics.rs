@@ -122,6 +122,11 @@ pub const CONTRACT_SERIES: &[&str] = &[
     "uc2_backup_lag_bytes",
     "uc2_backup_bytes_written_total",
     "uc2_backup_errors_total",
+    // Final review F3: the stopped writer and the released hold as LEVELS
+    // (an `increase()` over the counters goes quiet after its window while
+    // the writer stays stopped).
+    "uc2_backup_writer_stopped",
+    "uc2_backup_hold_released",
     "uc2_backup_chain_gaps_total",
     "uc2_backup_retention_deleted_total",
     "uc2_backup_reports_stale_total",
@@ -767,9 +772,21 @@ fn push_backup_tier_families(out: &mut String, s: &ObsSources, commit: u64) {
     push_labeled(
         out,
         "uc2_backup_errors_total",
-        "Errors this node's backup writer counted, by reason: foreign (the target's TIER names another app_id; the writer stopped), unavailable (target I/O, retried), overlap_mismatch (an existing object disagrees; the writer stopped), hash_mismatch (a local set does not match the catalog's hashes; skipped), journal_unavailable (this node's own journal could not supply a range; retried). Alert: Uc2BackupWriterError.",
+        "Errors this node's backup writer counted, by reason: foreign (the target's TIER names another app_id; the writer stopped), unavailable (target I/O, retried), overlap_mismatch (an existing object disagrees; the writer stopped), hash_mismatch (a local set does not match the catalog's hashes; skipped), journal_unavailable (this node's own journal could not supply a range; retried), fenced (a restore rolled the target's history back — fence/<Q>; the writer stopped), no_hardlinks (the target's filesystem cannot hard-link; the writer stopped). Alert: Uc2BackupWriterError; a stopped writer also raises Uc2BackupWriterStopped.",
         "counter",
         &errors,
+    );
+    push_gauge(
+        out,
+        "uc2_backup_writer_stopped",
+        "1 while this node's backup writer has stopped for good (foreign, overlap_mismatch, fenced or no_hardlinks — uc2_backup_errors_total names which) and holds nothing: its node purges as if it had no writer, and the tier receives nothing from it until the node restarts with a fixed [backup] target. 0 otherwise, and 0 on a node with no [backup] writer. Alert: Uc2BackupWriterStopped.",
+        w.map_or(0, |w| u64::from(w.stopped.load(Ordering::Acquire))),
+    );
+    push_gauge(
+        out,
+        "uc2_backup_hold_released",
+        "1 while low space has this node's backup purge hold released (backup-tier spec §5.4; the level behind uc2_backup_hold_released_total): the node purges past journal its tier lacks. Cleared when space returns and the floor next moves. 0 on a node with no [backup] writer.",
+        w.map_or(0, |w| u64::from(w.hold_released.load(Ordering::Acquire))),
     );
     push_counter(
         out,
@@ -2285,7 +2302,7 @@ mod tests {
     fn the_contract_has_the_number_of_families_the_docs_state() {
         assert_eq!(
             CONTRACT_SERIES.len(),
-            140,
+            142,
             "if this is intentional, update the family count in \
              docs/how-to/monitor-a-cluster.md in the same commit"
         );
@@ -2416,6 +2433,12 @@ mod tests {
             e.contains("expr: increase(uc2_backup_errors_total[10m]) > 0"),
             "{e}"
         );
+        // F3: a permanently stopped writer stays alerting after the
+        // counter's window — the rule keys on the level gauge.
+        let st = rule_block("Uc2BackupWriterStopped");
+        assert!(st.contains("expr: uc2_backup_writer_stopped == 1"), "{st}");
+        assert!(st.contains("for: 1m"), "{st}");
+        assert!(st.contains("severity: warning"), "{st}");
     }
 
     fn with_one_tier(through: u64) -> ObsSources {
@@ -2475,6 +2498,10 @@ mod tests {
             "uc2_backup_errors_total{reason=\"journal_unavailable\"} 0",
             "uc2_backup_chain_gaps_total 0",
             "uc2_backup_retention_deleted_total{kind=\"chunk\"} 0",
+            "uc2_backup_errors_total{reason=\"fenced\"} 0",
+            "uc2_backup_errors_total{reason=\"no_hardlinks\"} 0",
+            "uc2_backup_writer_stopped 0",
+            "uc2_backup_hold_released 0",
         ] {
             assert!(t.contains(&format!("\n{l}\n")), "{l}: {t}");
         }
@@ -2483,6 +2510,8 @@ mod tests {
         w.stats.gaps.store(2, Ordering::Relaxed);
         w.stats.chunks_deleted.store(3, Ordering::Relaxed);
         w.stats.sets_deleted.store(1, Ordering::Relaxed);
+        w.stopped.store(true, Ordering::Release);
+        w.hold_released.store(true, Ordering::Release);
         s.backup_writer = Some(w);
         let t = render_prometheus(&s);
         for l in [
@@ -2490,6 +2519,8 @@ mod tests {
             "uc2_backup_chain_gaps_total 2",
             "uc2_backup_retention_deleted_total{kind=\"chunk\"} 3",
             "uc2_backup_retention_deleted_total{kind=\"set\"} 1",
+            "uc2_backup_writer_stopped 1",
+            "uc2_backup_hold_released 1",
         ] {
             assert!(t.contains(&format!("\n{l}\n")), "{l}: {t}");
         }

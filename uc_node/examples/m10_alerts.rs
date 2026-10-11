@@ -79,6 +79,7 @@ const ALL_SCENARIOS: &[&str] = &[
     "backup_behind",
     "backup_hold_released",
     "backup_writer_error",
+    "backup_writer_stopped",
     "snapshot_hash_diverged",
     "mtu_discovery_stalled",
     "path_below_mtu",
@@ -221,6 +222,7 @@ fn run_scenario(name: &str, scratch_root: &Path) -> (SeriesFile, Disclosure) {
         "backup_behind" => scenario_backup_behind(),
         "backup_hold_released" => scenario_backup_hold_released(),
         "backup_writer_error" => scenario_backup_writer_error(),
+        "backup_writer_stopped" => scenario_backup_writer_stopped(),
         "snapshot_hash_diverged" => scenario_snapshot_hash_diverged(),
         "mtu_discovery_stalled" => scenario_mtu_discovery_stalled(),
         "path_below_mtu" => scenario_path_below_mtu(),
@@ -2123,6 +2125,43 @@ fn scenario_backup_writer_error() -> (SeriesFile, Disclosure) {
                      `unavailable` error after a baseline scrape (the real trigger - a target \
                      failing I/O under a live writer - is not hosted in-process); rendered \
                      through the real exporter."
+                .into(),
+        },
+    )
+}
+
+/// Uc2BackupWriterStopped - **synthetic, disclosed**: a `WriterShared`
+/// whose `stopped` flag is raised after a baseline scrape — what the writer
+/// sets on a fenced (or foreign, overlap-mismatched, no-hard-link) target;
+/// the real trigger needs a restore below the tier's reach and a restart.
+fn scenario_backup_writer_stopped() -> (SeriesFile, Disclosure) {
+    use uc_node::tier::writer::{WriterError, WriterShared};
+    let mut sources = synthetic_sources(0);
+    let w = Arc::new(WriterShared::default());
+    sources.backup_writer = Some(Arc::clone(&w));
+    let srv = ObsServer::serve(sources, "127.0.0.1:0".parse().unwrap()).expect("bind");
+    let addr = srv.local_addr();
+    let families = ["uc2_backup_writer_stopped"];
+    let mut sf = SeriesFile::new();
+    sf.record_round("n0", &scrape(addr), &families);
+    w.stats.count(WriterError::Fenced);
+    w.stopped.store(true, Ordering::Release);
+    thread::sleep(Duration::from_millis(200));
+    for _ in 0..3 {
+        sf.record_round("n0", &scrape(addr), &families);
+        thread::sleep(Duration::from_millis(200));
+    }
+    srv.stop();
+    (
+        sf,
+        Disclosure {
+            scenario: "backup_writer_stopped",
+            rules: &["Uc2BackupWriterStopped"],
+            state: "synthetic",
+            method: "synthetic ObsSources carrying a WriterShared whose writer counted one \
+                     `fenced` error and raised `stopped` after a baseline scrape (the real \
+                     trigger - a writer restarted on a target a restore fenced - is not hosted \
+                     in-process); rendered through the real exporter."
                 .into(),
         },
     )

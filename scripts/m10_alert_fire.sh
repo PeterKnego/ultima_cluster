@@ -281,6 +281,7 @@ RULE_META = {
     "Uc2BackupBehind": {"severity": "warning", "real": False, "scenario": "backup_behind"},
     "Uc2BackupHoldReleased": {"severity": "warning", "real": False, "scenario": "backup_hold_released"},
     "Uc2BackupWriterError": {"severity": "warning", "real": False, "scenario": "backup_writer_error"},
+    "Uc2BackupWriterStopped": {"severity": "warning", "real": False, "scenario": "backup_writer_stopped"},
     "Uc2SnapshotHashDiverged": {"severity": "critical", "real": False, "scenario": "snapshot_hash_diverged"},
     "Uc2MtuDiscoveryStalled": {"severity": "warning", "real": False, "scenario": "mtu_discovery_stalled"},
     "Uc2PathBelowMtu": {"severity": "critical", "real": False, "scenario": "path_below_mtu"},
@@ -766,6 +767,17 @@ def build_Uc2BackupWriterError():
     return r
 
 
+def build_Uc2BackupWriterStopped():
+    # Final review F3: `uc2_backup_writer_stopped == 1` for 1m - an
+    # unlabeled per-node 0/1 LEVEL gauge, the build_Uc2SnapshotWontFit shape.
+    rows = load_scenario("backup_writer_stopped")
+    row = select(rows, "uc2_backup_writer_stopped", {})
+    r = new_rule("warning", labels_from=row)
+    add_hold_last(r, row, "uc2_backup_writer_stopped", 60)
+    r["eval_time"] = total_for(60)[0]
+    return r
+
+
 def build_Uc2SnapshotHashDiverged():
     # FSM upgrade lifecycle spec §6.5.2: a per-row gauge held > 0 — the
     # single-instance hold shape of build_Uc2AgentDead, with the rule's
@@ -860,6 +872,7 @@ RULE_BUILDERS = {
     "Uc2BackupBehind": build_Uc2BackupBehind,
     "Uc2BackupHoldReleased": build_Uc2BackupHoldReleased,
     "Uc2BackupWriterError": build_Uc2BackupWriterError,
+    "Uc2BackupWriterStopped": build_Uc2BackupWriterStopped,
     "Uc2SnapshotHashDiverged": build_Uc2SnapshotHashDiverged,
     "Uc2MtuDiscoveryStalled": build_Uc2MtuDiscoveryStalled,
     "Uc2PathBelowMtu": build_Uc2PathBelowMtu,
