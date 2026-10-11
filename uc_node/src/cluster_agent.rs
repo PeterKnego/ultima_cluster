@@ -459,14 +459,21 @@ impl ClusterAgent {
     /// no extra plumbing out of `apply`: positions are unique per frame, so
     /// the tier's entry carries `updated_pos == position` exactly when THIS
     /// report moved it. Otherwise the report was stale (the tier is
-    /// registered) or the cluster was full (it is not). Both are logged, not
-    /// counted — there is no metric for them yet.
+    /// registered) or the cluster was full (it is not). Both are logged and
+    /// counted on the view (`uc2_backup_reports_stale_total`,
+    /// `uc2_backup_tiers_full_total`).
     ///
     /// Takes `fsm` rather than `&self` — same reason as
     /// [`Self::freeze_and_write`]: `do_work`'s call site is inside the
     /// `Batch::Frames` loop, where `iter` already holds a borrow of
     /// `self.follower`, so a whole-`self` receiver here would conflict.
-    fn note_applied(fsm: &ClusterFsm, body: &[u8], accepted: bool, position: u64) {
+    fn note_applied(
+        fsm: &ClusterFsm,
+        view: &ClusterView,
+        body: &[u8],
+        accepted: bool,
+        position: u64,
+    ) {
         if !accepted {
             return;
         }
@@ -551,21 +558,27 @@ impl ClusterAgent {
                             through = e.through
                         )
                     }
-                    (WatermarkOp::Report, Some(e)) => crate::obs_event!(
-                        Info,
-                        "backup_report_stale",
-                        position = position,
-                        tier = w.tier_id,
-                        through = w.through,
-                        held_through = e.through
-                    ),
-                    (WatermarkOp::Report, None) => crate::obs_event!(
-                        Warn,
-                        "backup_tiers_full",
-                        position = position,
-                        tier = w.tier_id,
-                        registered = st.backups.len() as u64
-                    ),
+                    (WatermarkOp::Report, Some(e)) => {
+                        view.backup_reports_stale.fetch_add(1, Ordering::Relaxed);
+                        crate::obs_event!(
+                            Info,
+                            "backup_report_stale",
+                            position = position,
+                            tier = w.tier_id,
+                            through = w.through,
+                            held_through = e.through
+                        )
+                    }
+                    (WatermarkOp::Report, None) => {
+                        view.backup_tiers_full.fetch_add(1, Ordering::Relaxed);
+                        crate::obs_event!(
+                            Warn,
+                            "backup_tiers_full",
+                            position = position,
+                            tier = w.tier_id,
+                            registered = st.backups.len() as u64
+                        )
+                    }
                 }
             }
             _ => {}
@@ -735,7 +748,7 @@ impl ClusterAgent {
                             accepted = accepted as u64,
                             reason = self.out.first().copied().unwrap_or(0) as u64
                         );
-                        Self::note_applied(&self.fsm, payload, accepted, end);
+                        Self::note_applied(&self.fsm, &self.view, payload, accepted, end);
                         applied_any = true;
                     }
                 }
@@ -996,7 +1009,7 @@ impl ClusterAgent {
                             .with_term(rf.header.leadership_term_id);
                         self.fsm.apply(&mut ctx, &rf.payload, &mut self.out);
                         let accepted = self.out.first() == Some(&0);
-                        Self::note_applied(&self.fsm, &rf.payload, accepted, end);
+                        Self::note_applied(&self.fsm, &self.view, &rf.payload, accepted, end);
                         applied_any = true;
                         frames += 1;
                     }
@@ -1500,6 +1513,41 @@ mod tests {
         assert_eq!(running[0], None);
     }
 
+    /// Spec §6.1: a report for a fifth tier is dropped and COUNTED
+    /// (`uc2_backup_tiers_full_total`), not only logged.
+    #[test]
+    fn a_report_for_a_fifth_tier_counts_tiers_full() {
+        use uc_protocol::v2::backup::{BackupWatermark, WatermarkOp, encode_backup_watermark};
+        let (buffer, cnc, dir) = world();
+        let mut app = buffer.appender_for_test(0);
+        app.set_now(1);
+        let mut end = 0;
+        for tier in 1..=5u64 {
+            let mut b = Vec::new();
+            encode_backup_watermark(
+                &BackupWatermark {
+                    op: WatermarkOp::Report,
+                    tier_id: tier,
+                    oldest_set: 64,
+                    newest_set: 128,
+                    through: 4096,
+                    reporter: 2,
+                },
+                &mut b,
+            );
+            end = app
+                .append_cluster(1, ClusterKind::BackupWatermark, &b)
+                .unwrap();
+        }
+        cnc.counters().durable.store_release(end);
+        cnc.counters().commit.store_release(end);
+        let (mut agent, view) = agent_over(&buffer, &cnc, dir.path());
+        assert!(agent.do_work());
+        assert_eq!(view.backups().len(), 4);
+        assert_eq!(view.backup_tiers_full.load(Ordering::Relaxed), 1);
+        assert_eq!(view.backup_reports_stale.load(Ordering::Relaxed), 0);
+    }
+
     #[test]
     fn read_committed_backups_reads_the_artifact_or_says_none() {
         use uc_protocol::v2::backup::{BackupWatermark, WatermarkOp, encode_backup_watermark};
@@ -1543,6 +1591,10 @@ mod tests {
             (7, 4096, e1)
         );
         assert_eq!(tiers, view.backups());
+        // The stale report was counted where it was logged; the full-table
+        // counter stayed put (one tier registered of four).
+        assert_eq!(view.backup_reports_stale.load(Ordering::Relaxed), 1);
+        assert_eq!(view.backup_tiers_full.load(Ordering::Relaxed), 0);
     }
 
     #[test]

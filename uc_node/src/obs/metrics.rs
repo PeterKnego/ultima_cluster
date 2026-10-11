@@ -115,6 +115,17 @@ pub const CONTRACT_SERIES: &[&str] = &[
     "uc2_backup_reports_appended_total",
     // Backup-tier spec §5.4: the writer node's purge hold let go for space.
     "uc2_backup_hold_released_total",
+    // Backup-tier spec §6.4: the committed watermark gauges (leader's view)
+    // and the writer node's own counters.
+    "uc2_backup_through",
+    "uc2_backup_oldest_set",
+    "uc2_backup_lag_bytes",
+    "uc2_backup_bytes_written_total",
+    "uc2_backup_errors_total",
+    "uc2_backup_chain_gaps_total",
+    "uc2_backup_retention_deleted_total",
+    "uc2_backup_reports_stale_total",
+    "uc2_backup_tiers_full_total",
     // FSM upgrade lifecycle (plan B1)
     "uc2_upgrade_pin_origin",
     "uc2_upgrade_pin_version",
@@ -676,6 +687,126 @@ fn push_histogram(
 /// `Consensus::publish_service_mins`) — they now mean "the slowest FSM".
 /// `uc_service_epoch`'s aggregate is the exception: it is FSM 0's epoch
 /// (M14a retired page 1's `service_epoch`), not a min.
+/// Backup-tier spec §6.4. The three gauges read the committed tier list off
+/// the cluster view (one entry per registered tier, label `tier` = the
+/// tier id in 16 hex digits); `uc2_backup_lag_bytes` is `commit - through`
+/// (saturating) on the LEADER only and `0` on a follower — like the other
+/// leader-authoritative bands, so a fleet-wide `max()` is the leader's
+/// reading and a follower never alerts on a commit it merely mirrors. The
+/// counters read the writer's own stats; a node with no `[backup]` writer
+/// renders them as `0` (never absent).
+fn push_backup_tier_families(out: &mut String, s: &ObsSources, commit: u64) {
+    use crate::tier::writer::WriterError;
+    let is_leader = s.cnc.status().flags.load_acquire() & NODE_FLAG_LEADER != 0;
+    let tiers = s.cluster_view.backups();
+    let label =
+        |t: &uc_protocol::v2::backup::BackupTierEntry| format!("tier=\"{:016x}\"", t.tier_id);
+    let through: Vec<(String, u64)> = tiers.iter().map(|t| (label(t), t.through)).collect();
+    let oldest: Vec<(String, u64)> = tiers.iter().map(|t| (label(t), t.oldest_set)).collect();
+    let lag: Vec<(String, u64)> = tiers
+        .iter()
+        .map(|t| {
+            (
+                label(t),
+                if is_leader {
+                    commit.saturating_sub(t.through)
+                } else {
+                    0
+                },
+            )
+        })
+        .collect();
+    push_labeled(
+        out,
+        "uc2_backup_through",
+        "The committed backup watermark per registered tier: the frame-END position through which the tier holds an unbroken journal chain (backup-tier spec §6.4). Read from the replicated cluster view, so it is the same on every node once caught up.",
+        "gauge",
+        &through,
+    );
+    push_labeled(
+        out,
+        "uc2_backup_oldest_set",
+        "Position of the oldest snapshot set the tier still holds, per registered tier (0 = none yet) — the earliest point a restore from that tier can start at.",
+        "gauge",
+        &oldest,
+    );
+    push_labeled(
+        out,
+        "uc2_backup_lag_bytes",
+        "Committed log bytes the tier has not yet received: uc2_commit_bytes minus uc2_backup_through, per tier, saturating at 0. Exported on the LEADER only (0 on a follower). An idle cluster still creeps up on watermark and snapshot-report frames, which the writer deliberately does not cut a chunk for, so alert on the level (Uc2BackupBehind: > 256 MiB), not on through standing still.",
+        "gauge",
+        &lag,
+    );
+    let w = s.backup_writer.as_deref();
+    let stat = |f: fn(&crate::tier::writer::WriterStats) -> u64| w.map_or(0, |w| f(&w.stats));
+    push_labeled(
+        out,
+        "uc2_backup_bytes_written_total",
+        "Stored bytes this node's backup writer placed in the tier, by kind: set (snapshot artifacts and SET markers) or journal (journal chunks). 0 on a node with no [backup] writer.",
+        "counter",
+        &[
+            (
+                "kind=\"set\"".to_string(),
+                stat(|s| s.bytes_set.load(Ordering::Relaxed)),
+            ),
+            (
+                "kind=\"journal\"".to_string(),
+                stat(|s| s.bytes_journal.load(Ordering::Relaxed)),
+            ),
+        ],
+    );
+    let errors: Vec<(String, u64)> = WriterError::ALL
+        .iter()
+        .map(|r| {
+            (
+                format!("reason=\"{}\"", r.label()),
+                w.map_or(0, |w| w.stats.errors(*r)),
+            )
+        })
+        .collect();
+    push_labeled(
+        out,
+        "uc2_backup_errors_total",
+        "Errors this node's backup writer counted, by reason: foreign (the target's TIER names another app_id; the writer stopped), unavailable (target I/O, retried), overlap_mismatch (an existing object disagrees; the writer stopped), hash_mismatch (a local set does not match the catalog's hashes; skipped), journal_unavailable (this node's own journal could not supply a range; retried). Alert: Uc2BackupWriterError.",
+        "counter",
+        &errors,
+    );
+    push_counter(
+        out,
+        "uc2_backup_chain_gaps_total",
+        "Journal chain gaps this node's backup writer saw: the node purged journal the tier did not yet hold (backup-tier spec §5.3), so the tier's chain restarts from a later set. 0 on a node with no [backup] writer.",
+        stat(|s| s.gaps.load(Ordering::Relaxed)),
+    );
+    push_labeled(
+        out,
+        "uc2_backup_retention_deleted_total",
+        "Objects this node's backup writer's retention deleted from the tier (backup-tier spec §7), by kind: set (a whole snapshot set) or chunk (a journal chunk). 0 on a node with no [backup] writer.",
+        "counter",
+        &[
+            (
+                "kind=\"set\"".to_string(),
+                stat(|s| s.sets_deleted.load(Ordering::Relaxed)),
+            ),
+            (
+                "kind=\"chunk\"".to_string(),
+                stat(|s| s.chunks_deleted.load(Ordering::Relaxed)),
+            ),
+        ],
+    );
+    push_counter(
+        out,
+        "uc2_backup_reports_stale_total",
+        "BackupWatermark records this node's cluster FSM applied that changed nothing because the tier already held a higher through (backup-tier spec §6.1). Counted on every node, since every node applies the record; a handful around a failover is expected.",
+        s.cluster_view.backup_reports_stale.load(Ordering::Relaxed),
+    );
+    push_counter(
+        out,
+        "uc2_backup_tiers_full_total",
+        "BackupWatermark records this node's cluster FSM refused to register because MAX_BACKUP_TIERS (4) tiers are already held. Any increase means a fifth target is reporting and is being ignored; free a slot with `uc2ctl tier forget`.",
+        s.cluster_view.backup_tiers_full.load(Ordering::Relaxed),
+    );
+}
+
 fn push_service_families(out: &mut String, s: &ObsSources, commit: u64, now: u64) {
     let rows = service_rows(s, commit, now);
     let service = s.cnc.service();
@@ -1085,6 +1216,7 @@ fn push_service_families(out: &mut String, s: &ObsSources, commit: u64, now: u64
         "Times low space released this node's backup purge hold (backup-tier spec §5.4): free bytes fell below one chunk_bytes plus the auto-fetch headroom, so the node purged past journal its backup tier lacks and the writer will record a chain gap when it resumes. Counted once per episode; 0 on a node with no [backup] writer.",
         s.backup_hold_released.load(Ordering::Relaxed),
     );
+    push_backup_tier_families(out, s, commit);
     push_gauge(
         out,
         "uc_services_declared",
@@ -1875,6 +2007,7 @@ mod tests {
             backup_reports_unsent: Arc::new(AtomicU64::new(0)),
             backup_reports_appended: Arc::new(AtomicU64::new(0)),
             backup_hold_released: Arc::new(AtomicU64::new(0)),
+            backup_writer: None,
             cluster_view: test_cluster_view(),
             probe: uc_net::probe::ProbeTable::new(uc_net::probe::ProbeCadence::default()),
             commands_over_standard: Arc::new(AtomicU64::new(0)),
@@ -2152,7 +2285,7 @@ mod tests {
     fn the_contract_has_the_number_of_families_the_docs_state() {
         assert_eq!(
             CONTRACT_SERIES.len(),
-            131,
+            140,
             "if this is intentional, update the family count in \
              docs/how-to/monitor-a-cluster.md in the same commit"
         );
@@ -2247,6 +2380,119 @@ mod tests {
             "{}",
             &rules[at..end]
         );
+    }
+
+    fn rule_block(name: &str) -> String {
+        let rules = include_str!("../../../packaging/prometheus/uc2-alerts.yml");
+        let at = rules
+            .find(&format!("alert: {name}"))
+            .unwrap_or_else(|| panic!("{name} ships"));
+        let end = rules[at..]
+            .find("annotations:")
+            .map_or(rules.len(), |e| at + e);
+        rules[at..end].to_string()
+    }
+
+    /// Ruling R8b: the behind rule keys on the lag LEVEL, not on "through
+    /// stood still while commit moved" (an idle cluster's commit creeps on
+    /// bookkeeping frames the writer deliberately does not cut a chunk for).
+    #[test]
+    fn the_backup_behind_rule_keys_on_the_lag_level_not_on_motion() {
+        let b = rule_block("Uc2BackupBehind");
+        assert!(b.contains("expr: uc2_backup_lag_bytes > 268435456"), "{b}");
+        assert!(b.contains("for: 15m"), "{b}");
+        assert!(!b.contains("changes("), "{b}");
+    }
+
+    #[test]
+    fn the_backup_hold_and_error_rules_key_on_their_counters() {
+        let h = rule_block("Uc2BackupHoldReleased");
+        assert!(
+            h.contains("expr: increase(uc2_backup_hold_released_total[10m]) > 0"),
+            "{h}"
+        );
+        let e = rule_block("Uc2BackupWriterError");
+        assert!(
+            e.contains("expr: increase(uc2_backup_errors_total[10m]) > 0"),
+            "{e}"
+        );
+    }
+
+    fn with_one_tier(through: u64) -> ObsSources {
+        let s = synthetic_sources();
+        s.cnc.counters().commit.store_release(10_000);
+        let mut st = crate::cluster_fsm::ClusterState::genesis_empty();
+        st.backups.push(uc_protocol::v2::backup::BackupTierEntry {
+            tier_id: 0xabc,
+            oldest_set: 64,
+            newest_set: 128,
+            through,
+            reporter: 2,
+            updated_pos: 9,
+        });
+        s.cluster_view.publish(&st);
+        s
+    }
+
+    /// Spec §6.4: the lag gauge is `commit - through` on the leader and `0`
+    /// on a follower; through / oldest_set are the committed view anywhere.
+    #[test]
+    fn backup_lag_is_commit_minus_through_on_a_leader_and_zero_on_a_follower() {
+        let s = with_one_tier(4_000);
+        s.cnc.status().flags.store_release(0);
+        let t = render_prometheus(&s);
+        assert!(
+            t.contains("\nuc2_backup_through{tier=\"0000000000000abc\"} 4000\n"),
+            "{t}"
+        );
+        assert!(
+            t.contains("\nuc2_backup_oldest_set{tier=\"0000000000000abc\"} 64\n"),
+            "{t}"
+        );
+        assert!(
+            t.contains("\nuc2_backup_lag_bytes{tier=\"0000000000000abc\"} 0\n"),
+            "{t}"
+        );
+        s.cnc.status().flags.store_release(NODE_FLAG_LEADER);
+        let t = render_prometheus(&s);
+        assert!(
+            t.contains("\nuc2_backup_lag_bytes{tier=\"0000000000000abc\"} 6000\n"),
+            "{t}"
+        );
+        // Saturates when through is past this node's commit view.
+        let s = with_one_tier(99_999);
+        s.cnc.status().flags.store_release(NODE_FLAG_LEADER);
+        assert!(render_prometheus(&s).contains("_lag_bytes{tier=\"0000000000000abc\"} 0\n"));
+    }
+
+    #[test]
+    fn backup_writer_counters_render_zero_without_a_writer_and_the_stats_with_one() {
+        let mut s = synthetic_sources();
+        let t = render_prometheus(&s);
+        for l in [
+            "uc2_backup_bytes_written_total{kind=\"set\"} 0",
+            "uc2_backup_bytes_written_total{kind=\"journal\"} 0",
+            "uc2_backup_errors_total{reason=\"journal_unavailable\"} 0",
+            "uc2_backup_chain_gaps_total 0",
+            "uc2_backup_retention_deleted_total{kind=\"chunk\"} 0",
+        ] {
+            assert!(t.contains(&format!("\n{l}\n")), "{l}: {t}");
+        }
+        let w = Arc::new(crate::tier::writer::WriterShared::default());
+        w.stats.bytes_journal.store(77, Ordering::Relaxed);
+        w.stats.gaps.store(2, Ordering::Relaxed);
+        w.stats.chunks_deleted.store(3, Ordering::Relaxed);
+        w.stats.sets_deleted.store(1, Ordering::Relaxed);
+        s.backup_writer = Some(w);
+        let t = render_prometheus(&s);
+        for l in [
+            "uc2_backup_bytes_written_total{kind=\"journal\"} 77",
+            "uc2_backup_chain_gaps_total 2",
+            "uc2_backup_retention_deleted_total{kind=\"chunk\"} 3",
+            "uc2_backup_retention_deleted_total{kind=\"set\"} 1",
+        ] {
+            assert!(t.contains(&format!("\n{l}\n")), "{l}: {t}");
+        }
     }
 
     /// Time-and-timers gate row c: both histograms render the standard
@@ -2656,6 +2902,7 @@ mod tests {
             backup_reports_unsent: Arc::new(AtomicU64::new(0)),
             backup_reports_appended: Arc::new(AtomicU64::new(0)),
             backup_hold_released: Arc::new(AtomicU64::new(0)),
+            backup_writer: None,
             cluster_view: test_cluster_view(),
             probe: uc_net::probe::ProbeTable::new(uc_net::probe::ProbeCadence::default()),
             commands_over_standard: Arc::new(AtomicU64::new(0)),
@@ -2770,6 +3017,7 @@ mod tests {
             backup_reports_unsent: Arc::new(AtomicU64::new(0)),
             backup_reports_appended: Arc::new(AtomicU64::new(0)),
             backup_hold_released: Arc::new(AtomicU64::new(0)),
+            backup_writer: None,
             cluster_view: test_cluster_view(),
             probe: uc_net::probe::ProbeTable::new(uc_net::probe::ProbeCadence::default()),
             commands_over_standard: Arc::new(AtomicU64::new(0)),
@@ -2877,6 +3125,7 @@ mod tests {
             backup_reports_unsent: Arc::new(AtomicU64::new(0)),
             backup_reports_appended: Arc::new(AtomicU64::new(0)),
             backup_hold_released: Arc::new(AtomicU64::new(0)),
+            backup_writer: None,
             cluster_view: test_cluster_view(),
             probe: uc_net::probe::ProbeTable::new(uc_net::probe::ProbeCadence::default()),
             commands_over_standard: Arc::new(AtomicU64::new(0)),

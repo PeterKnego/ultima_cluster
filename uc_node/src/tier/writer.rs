@@ -155,7 +155,9 @@ impl WriterStats {
         self.errors[r as usize].load(Ordering::Relaxed)
     }
 
-    fn count(&self, r: WriterError) {
+    /// Count one error. Public so the alert harness (`m10_alerts`) can drive
+    /// the exporter without a real target failing.
+    pub fn count(&self, r: WriterError) {
         self.errors[r as usize].fetch_add(1, Ordering::Relaxed);
     }
 }

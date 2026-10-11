@@ -67,7 +67,7 @@ scrape_configs:
 ```
 
 `/metrics` serves `text/plain; version=0.0.4` — standard Prometheus text
-exposition. The full series contract — 131 families — is the
+exposition. The full series contract — 140 families — is the
 `CONTRACT_SERIES` array in
 [`uc_node/src/obs/metrics.rs`](../../uc_node/src/obs/metrics.rs); a test
 pins every family in that array against what the renderer actually emits, so
@@ -301,6 +301,15 @@ replicated schedule table — plus four **off-contract** timing families
 | `uc2_backup_reports_unsent_total` (backup tier) | counter | none | polls of the backup writer's claim that found **no leader** to address; the claim is put back and resent on the next poll (every 10 ms), so this counts passes without a leader, not lost watermarks. A brief run around a failover is expected; a sustained climb means this node's tier never reaches the committed watermark |
 | `uc2_backup_reports_appended_total` (backup tier) | counter | none | `BackupWatermark` records (`CLUSTER` kind 7) this node placed **while leading** — at most one per tier per commit round trip, after coalescing reports to the furthest `through`; a report no further than the committed entry is dropped, not appended. A follower appends none |
 | `uc2_backup_hold_released_total` (backup tier) | counter | none | times low space **released** this node's backup purge hold: free bytes fell below one `chunk_bytes` plus the auto-fetch headroom (`max(chunk_bytes / 4, 1 GiB)`), so the node purged journal its backup tier lacks and the writer will record a chain gap (`backup_chain_gap`) when it resumes. Once per episode; `0` on a node with no `[backup]` writer. Free space, then check the tier's chain |
+| `uc2_backup_through` (backup tier) | gauge | `tier` | the committed backup watermark per registered tier (`tier` is the tier id as 16 hex digits): the frame-END position through which the tier holds an unbroken journal chain. Read from the replicated cluster view, so identical on every node once caught up |
+| `uc2_backup_oldest_set` (backup tier) | gauge | `tier` | position of the oldest snapshot set the tier still holds (`0` = none yet) — the earliest point a restore from it can start at |
+| `uc2_backup_lag_bytes` (backup tier) | gauge | `tier` | `uc2_commit_bytes` minus `uc2_backup_through`, saturating at 0. **Leader only; `0` on a follower** (like the peer band). An idle cluster still creeps up on watermark and snapshot-report frames the writer deliberately cuts no chunk for, so alert on the level, not on `through` standing still. Alert: `Uc2BackupBehind` |
+| `uc2_backup_bytes_written_total` (backup tier) | counter | `kind` | stored bytes this node's writer placed in the tier: `set` (artifacts and `SET` markers) or `journal` (chunks). `0` on a node with no `[backup]` writer |
+| `uc2_backup_errors_total` (backup tier) | counter | `reason` | writer errors: `foreign` and `overlap_mismatch` stop the writer for good; `unavailable` (target I/O) and `journal_unavailable` (this node's own journal could not supply a range) are retried; `hash_mismatch` skips a set. All five reasons render, zeros included. Alert: `Uc2BackupWriterError` |
+| `uc2_backup_chain_gaps_total` (backup tier) | counter | none | chain gaps the writer recorded: the node purged journal the tier did not yet hold (`backup_chain_gap`) |
+| `uc2_backup_retention_deleted_total` (backup tier) | counter | `kind` | objects the writer's retention deleted from the tier: `set` or `chunk` |
+| `uc2_backup_reports_stale_total` (backup tier) | counter | none | `BackupWatermark` records this node's cluster FSM applied that changed nothing because the tier already held a higher `through`. Counted on every node; a few around a failover are expected |
+| `uc2_backup_tiers_full_total` (backup tier) | counter | none | watermark records refused because `MAX_BACKUP_TIERS` (4) tiers are already registered; any increase means a fifth target is reporting and ignored — free a slot with `uc2ctl tier forget` |
 
 **One alert rule**, `Uc2LogTimeFrozen` (warning, `for: 30s`):
 `uc2_log_time_lag_seconds > 5 and on(instance) uc2_is_leader == 1`. The
@@ -401,7 +410,7 @@ The `uc2_agent_alive` family covers **five** agents — `consensus`, `sender`,
 `receiver`, `archive`, and `cluster` (the `uc2-cluster` agent, labelled like
 its four siblings without the thread-name prefix).
 
-**Thirteen records** go with them — eight at info, five at warn:
+**Seventeen records** go with them — ten at info (one of those, `snapshot_report_dropped`, warns for one reason), seven at warn:
 
 | Event | Level | Fields | Means, and what to do |
 |---|---|---|---|
@@ -671,6 +680,9 @@ table:
 | `Uc2StandbySnapshotStalled` (coordinated snapshots, 2.11.0) | this **learner** has acted on standby snapshot instants at least twice in 30m with no complete set landing — one of its rows is silently stopping the standby set. Cannot fire on a voter (a voter exports `uc2_snapshot_standby_instant_position = 0`) | warning |
 | `Uc2SnapshotSetDiverged` (snapshot catalog) | a listed set's row hashes did not agree across the nodes that reported it (`uc2_catalog_diverged > 0`), for 60s — run `uc2ctl upgrade show` for the per-node matrix | warning |
 | `Uc2SnapshotWontFit` (snapshot lifecycle) | the newest agreed set would not fit with headroom on this node, for 5m — free disk | warning |
+| `Uc2BackupBehind` (backup tier) | a tier is more than 256 MiB of committed log behind (`uc2_backup_lag_bytes > 268435456`, leader-reported) for 15m. Keyed on the level, not on `through` standing still: an idle cluster's commit creeps on bookkeeping frames the writer does not cut for. The `tier` label names the tier | warning |
+| `Uc2BackupHoldReleased` (backup tier) | a writer node let go of its backup purge hold for lack of disk in the last 10m; expect a chain gap | warning |
+| `Uc2BackupWriterError` (backup tier) | a writer counted an error in the last 10m; the `reason` label says which | warning |
 | `Uc2SnapshotHashDiverged` (FSM upgrade lifecycle, 2.13.0) | a node's artifact hash for a row's newest reported instant differs from the majority's, for 60s | critical |
 | `Uc2MtuDiscoveryStalled` (jumbo frames, 2.12.0) | this node has proven a larger datagram path than the cluster has committed, for 60s — some *other* member is holding discovery back, silent or narrower. Read `uc2_probe_min_mtu_bytes` on every node | warning |
 | `Uc2PathBelowMtu` (jumbo frames, 2.12.0) | the kernel refused a non-probe datagram for size in the last 5m: a path degraded below the committed rung (or below the 1408 B baseline). The rung is monotone and cannot be lowered — fix the path | critical |

@@ -1276,6 +1276,16 @@ pub struct ClusterView {
     /// Catalog spec §4.5: the newest AGREED set's position; `0` = nothing
     /// agreed (the cluster floor moves nothing). NOT the `Empty` test since
     /// catalog ruling R26 — that is [`Self::catalog_has_complete`].
+    /// Backup-tier spec §6.1/§6.4: `BackupWatermark` reports the FSM accepted
+    /// but that changed nothing because the tier already held a higher
+    /// `through` (`uc2_backup_reports_stale_total`), and reports for a tier
+    /// that could not be registered because `MAX_BACKUP_TIERS` were already
+    /// held (`uc2_backup_tiers_full_total`). Bumped by the `uc2-cluster`
+    /// agent where it logs `backup_report_stale` / `backup_tiers_full`; they
+    /// ride the view because that is the allocation `ObsSources` already
+    /// shares with the exporter.
+    pub backup_reports_stale: AtomicU64,
+    pub backup_tiers_full: AtomicU64,
     pub catalog_agreed_position: AtomicU64,
     /// Catalog ruling R26: `true` ⇔ some listed entry is `Complete` (agreed
     /// or not) — [`ClusterState::catalog_empty`] negated. `false` is the
@@ -1389,6 +1399,8 @@ impl ClusterView {
             auto_fetch: AtomicBool::new(true),
             backup_retain_sets: AtomicU16::new(0),
             backup_retain_age_secs: AtomicU64::new(0),
+            backup_reports_stale: AtomicU64::new(0),
+            backup_tiers_full: AtomicU64::new(0),
             catalog_agreed_position: AtomicU64::new(0),
             catalog_has_complete: AtomicBool::new(false),
             catalog_len: AtomicU64::new(0),

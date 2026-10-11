@@ -354,6 +354,38 @@ transport setting, both measured closed-loop at inflight 1 on 8-vCPU
 
 ## When something is wrong
 
+- **`Uc2BackupBehind` fires** (backup tier). The tier named by the `tier`
+  label (16 hex digits; `uc2ctl tier show`) is more than 256 MiB of
+  committed log behind for 15m. The alert keys on the level of
+  `uc2_backup_lag_bytes`, which only the leader exports; it does not fire
+  because commit moved while `uc2_backup_through` stood still — an idle
+  cluster's commit creeps on watermark and snapshot-report frames and the
+  writer cuts no chunk for them. Find the writer node (the one whose
+  `uc2_backup_bytes_written_total` is moving, or should be), then read its
+  `uc2_backup_errors_total{reason}` and its `uc2-backup` log lines: an
+  unreachable or full target is `unavailable`, a journal it cannot read is
+  `journal_unavailable`. If no node runs a writer for that tier, nothing
+  advances it — start one or `uc2ctl tier forget` the tier.
+- **`Uc2BackupHoldReleased` fires.** A writer node ran low on disk and let go
+  of the journal it was holding for its tier (`backup_hold_released` in its
+  log), so ordinary purging resumed and the tier will have a hole. Free disk
+  on that node first. When the writer resumes it counts
+  `uc2_backup_chain_gaps_total` and the tier's chain restarts from a later
+  set — earlier positions are no longer restorable from that tier. Fix what
+  held the writer back (`Uc2BackupBehind`, the errors counter) so it does not
+  recur.
+- **`Uc2BackupWriterError` fires.** The `reason` label decides. `foreign`:
+  the target's `TIER` object names another cluster — the writer has STOPPED
+  and will not touch it; point `[backup] target` at the right place and
+  restart the node. `overlap_mismatch`: an object already in the tier
+  disagrees with this node's journal — also STOPPED; do not overwrite the
+  tier, investigate which cluster wrote it. `unavailable`: target I/O, retried
+  on a ladder; check the target's reachability, permissions and space.
+  `journal_unavailable`: this node's own journal could not supply a range
+  (read error, or purged under the cut); retried. `hash_mismatch`: a local
+  snapshot set does not match the catalog's agreed hashes, so it was skipped —
+  run `uc2ctl upgrade show` and treat it as a divergent replica.
+
 - **A node refuses to start with `cluster_artifact_corrupt`** (2.11.0).
   The `uc2-cluster` agent found its newest `snapshots/cluster/snap-<pos>.ultcluster`
   and the image failed a check — magic, version, CRC32, or a bounds check

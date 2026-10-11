@@ -3274,6 +3274,7 @@ impl Node {
             backup_reports_unsent: Arc::clone(&self.backup_reports_unsent),
             backup_reports_appended: Arc::clone(&self.backup_reports_appended),
             backup_hold_released: Arc::clone(&self.backup_hold_released),
+            backup_writer: self.backup_writer.clone(),
             cluster_view: Arc::clone(&self.cluster_view),
             probe: Arc::clone(&self.probe_table),
             commands_over_standard: Arc::clone(&self.commands_over_standard),

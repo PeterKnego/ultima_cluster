@@ -97,6 +97,7 @@ fn synthetic_server() -> (ObsServer, ObsSources) {
         backup_reports_unsent: Arc::new(AtomicU64::new(0)),
         backup_reports_appended: Arc::new(AtomicU64::new(0)),
         backup_hold_released: Arc::new(AtomicU64::new(0)),
+        backup_writer: None,
         cluster_view: Arc::new(uc_node::ClusterView::new(
             &uc_node::ClusterState::genesis_empty(),
         )),
@@ -515,4 +516,33 @@ fn timer_and_log_time_families_are_in_the_contract() {
             "{name}"
         );
     }
+}
+
+/// Backup-tier spec §6.4: a scrape of a node with no `[backup]` writer still
+/// carries every new family (zeros, never absent), so a `rate()` or an alert
+/// never meets a missing series.
+#[test]
+fn a_scrape_carries_every_backup_tier_family() {
+    let (srv, _sources) = synthetic_server();
+    let (status, body) = get(srv.local_addr(), "/metrics");
+    assert_eq!(status, 200);
+    for name in [
+        "uc2_backup_through",
+        "uc2_backup_oldest_set",
+        "uc2_backup_lag_bytes",
+        "uc2_backup_bytes_written_total",
+        "uc2_backup_errors_total",
+        "uc2_backup_chain_gaps_total",
+        "uc2_backup_retention_deleted_total",
+        "uc2_backup_reports_stale_total",
+        "uc2_backup_tiers_full_total",
+    ] {
+        assert!(body.contains(&format!("# TYPE {name} ")), "{name}: {body}");
+        assert!(
+            uc_node::obs::metrics::CONTRACT_SERIES.contains(&name),
+            "{name}"
+        );
+    }
+    assert!(body.contains("\nuc2_backup_chain_gaps_total 0\n"), "{body}");
+    srv.stop();
 }

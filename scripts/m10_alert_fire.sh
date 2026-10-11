@@ -278,6 +278,9 @@ RULE_META = {
     "Uc2StandbySnapshotStalled": {"severity": "warning", "real": False, "scenario": "standby_snapshot_stalled"},
     "Uc2SnapshotSetDiverged": {"severity": "warning", "real": False, "scenario": "snapshot_set_diverged"},
     "Uc2SnapshotWontFit": {"severity": "warning", "real": False, "scenario": "snapshot_wont_fit"},
+    "Uc2BackupBehind": {"severity": "warning", "real": False, "scenario": "backup_behind"},
+    "Uc2BackupHoldReleased": {"severity": "warning", "real": False, "scenario": "backup_hold_released"},
+    "Uc2BackupWriterError": {"severity": "warning", "real": False, "scenario": "backup_writer_error"},
     "Uc2SnapshotHashDiverged": {"severity": "critical", "real": False, "scenario": "snapshot_hash_diverged"},
     "Uc2MtuDiscoveryStalled": {"severity": "warning", "real": False, "scenario": "mtu_discovery_stalled"},
     "Uc2PathBelowMtu": {"severity": "critical", "real": False, "scenario": "path_below_mtu"},
@@ -729,6 +732,40 @@ def build_Uc2SnapshotWontFit():
     return r
 
 
+def build_Uc2BackupBehind():
+    # Backup-tier spec §6.4 / ruling R8b: a per-tier LEVEL gauge held over
+    # 256 MiB for 15m - the build_Uc2SnapshotWontFit shape over
+    # uc2_backup_lag_bytes{tier}.
+    rows = load_scenario("backup_behind")
+    row = select(rows, "uc2_backup_lag_bytes", {})
+    r = new_rule("warning", labels_from=row)
+    add_hold_last(r, row, "uc2_backup_lag_bytes", 900)
+    r["eval_time"] = total_for(900)[0]
+    return r
+
+
+def build_Uc2BackupHoldReleased():
+    # `increase(uc2_backup_hold_released_total[10m]) > 0`, no `for:` - the
+    # build_Uc2PathBelowMtu shape: the real 0->1 step lands inside the range.
+    rows = load_scenario("backup_hold_released")
+    row = select(rows, "uc2_backup_hold_released_total", {})
+    r = new_rule("warning", labels_from=row)
+    add_literal(r, row, "uc2_backup_hold_released_total", 600)
+    r["eval_time"] = (len(row["values"]) - 1) * INTERVAL
+    return r
+
+
+def build_Uc2BackupWriterError():
+    # `increase(uc2_backup_errors_total[10m]) > 0`, no `for:` - same shape,
+    # over the labelled counter's `unavailable` series.
+    rows = load_scenario("backup_writer_error")
+    row = select(rows, "uc2_backup_errors_total", {"reason": "unavailable"})
+    r = new_rule("warning", labels_from=row)
+    add_literal(r, row, "uc2_backup_errors_total", 600)
+    r["eval_time"] = (len(row["values"]) - 1) * INTERVAL
+    return r
+
+
 def build_Uc2SnapshotHashDiverged():
     # FSM upgrade lifecycle spec §6.5.2: a per-row gauge held > 0 — the
     # single-instance hold shape of build_Uc2AgentDead, with the rule's
@@ -820,6 +857,9 @@ RULE_BUILDERS = {
     "Uc2StandbySnapshotStalled": build_Uc2StandbySnapshotStalled,
     "Uc2SnapshotSetDiverged": build_Uc2SnapshotSetDiverged,
     "Uc2SnapshotWontFit": build_Uc2SnapshotWontFit,
+    "Uc2BackupBehind": build_Uc2BackupBehind,
+    "Uc2BackupHoldReleased": build_Uc2BackupHoldReleased,
+    "Uc2BackupWriterError": build_Uc2BackupWriterError,
     "Uc2SnapshotHashDiverged": build_Uc2SnapshotHashDiverged,
     "Uc2MtuDiscoveryStalled": build_Uc2MtuDiscoveryStalled,
     "Uc2PathBelowMtu": build_Uc2PathBelowMtu,
