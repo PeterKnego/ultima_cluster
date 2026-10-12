@@ -463,6 +463,15 @@ groups:
     expr: increase(uc2_backup_hold_released_total[10m]) > 0
     labels: { severity: warning }
     annotations: { summary: "{{ $labels.instance }} released its backup purge hold for lack of disk", description: "Free space fell below one chunk plus the auto-fetch headroom, so the node purged past journal its backup tier lacks; expect uc2_backup_chain_gaps_total to rise when the writer resumes. Free disk on the node and fix the writer that fell behind (Uc2BackupBehind, uc2_backup_errors_total)." }
+  - alert: Uc2BackupGateReleased
+    # Backup-tier 3b spec §5.2: low disk made a node let go of its purge
+    # gate (purge_requires_tiers). The node has purged (or will) journal that
+    # fewer than K backup tiers confirm, so a restore of a tier below the
+    # node's journal start can no longer be re-bridged from this node. Counted
+    # once per episode.
+    expr: increase(uc2_backup_gate_released_total[10m]) > 0
+    labels: { severity: warning }
+    annotations: { summary: "{{ $labels.instance }} released its backup purge gate for lack of disk", description: "Free space fell below one chunk plus the auto-fetch headroom, so the node purged past the K-th confirmed backup tier (uc2_purge_gate_position). Free disk on the node and fix the tiers that fell behind (Uc2BackupBehind, uc2_backup_errors_total); uc2_backup_gate_released shows whether the release still holds." }
   - alert: Uc2BackupWriterError
     # Backup-tier spec §6.4: the writer counted an error. foreign,
     # overlap_mismatch, fenced and no_hardlinks stop the writer for good (it

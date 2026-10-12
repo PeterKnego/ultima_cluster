@@ -131,6 +131,11 @@ pub const CONTRACT_SERIES: &[&str] = &[
     "uc2_backup_retention_deleted_total",
     "uc2_backup_reports_stale_total",
     "uc2_backup_tiers_full_total",
+    // Backup-tier 3b spec §5.2: the K-th-tier purge gate and its low-space
+    // release (a counter and its level).
+    "uc2_purge_gate_position",
+    "uc2_backup_gate_released",
+    "uc2_backup_gate_released_total",
     // FSM upgrade lifecycle (plan B1)
     "uc2_upgrade_pin_origin",
     "uc2_upgrade_pin_version",
@@ -788,6 +793,21 @@ fn push_backup_tier_families(out: &mut String, s: &ObsSources, commit: u64) {
         "1 while low space has this node's backup purge hold released (backup-tier spec §5.4; the level behind uc2_backup_hold_released_total): the node purges past journal its tier lacks. Cleared when space returns and the floor next moves. 0 on a node with no [backup] writer.",
         w.map_or(0, |w| u64::from(w.hold_released.load(Ordering::Acquire))),
     );
+    // Backup-tier 3b: the gate position is HEADER-ONLY while K = 0 (no gate;
+    // `u64::MAX` is the in-memory sentinel, never a sample).
+    let gate = s.purge_gate.load(Ordering::Acquire);
+    let gate_help = "The journal-purge gate (backup-tier 3b spec §5.2): the K-th highest confirmed backup `through` among the committed tiers, K being the replicated purge_requires_tiers; 0 while fewer than K tiers are registered (every purge held). No sample while K = 0. Computed on every node whether or not [purge] is on, but only a node with [purge] on is held by it.";
+    if gate == u64::MAX {
+        push_labeled(out, "uc2_purge_gate_position", gate_help, "gauge", &[]);
+    } else {
+        push_gauge(out, "uc2_purge_gate_position", gate_help, gate);
+    }
+    push_gauge(
+        out,
+        "uc2_backup_gate_released",
+        "1 while low space has released this node's purge gate (backup-tier 3b spec §5.2; the level behind uc2_backup_gate_released_total): the node purges past the K-th confirmed tier. Cleared when space returns. Alert: Uc2BackupGateReleased.",
+        u64::from(s.backup_gate_released_level.load(Ordering::Acquire)),
+    );
     push_counter(
         out,
         "uc2_backup_chain_gaps_total",
@@ -1232,6 +1252,12 @@ fn push_service_families(out: &mut String, s: &ObsSources, commit: u64, now: u64
         "uc2_backup_hold_released_total",
         "Times low space released this node's backup purge hold (backup-tier spec §5.4): free bytes fell below one chunk_bytes plus the auto-fetch headroom, so the node purged past journal its backup tier lacks and the writer will record a chain gap when it resumes. Counted once per episode; 0 on a node with no [backup] writer.",
         s.backup_hold_released.load(Ordering::Relaxed),
+    );
+    push_counter(
+        out,
+        "uc2_backup_gate_released_total",
+        "Times low space released this node's purge gate (backup-tier 3b spec §5.2): free bytes fell below one chunk plus the auto-fetch headroom, so the node purged past the K-th confirmed tier. Counted once per episode. Alert: Uc2BackupGateReleased.",
+        s.backup_gate_released.load(Ordering::Relaxed),
     );
     push_backup_tier_families(out, s, commit);
     push_gauge(
@@ -2024,6 +2050,9 @@ mod tests {
             backup_reports_unsent: Arc::new(AtomicU64::new(0)),
             backup_reports_appended: Arc::new(AtomicU64::new(0)),
             backup_hold_released: Arc::new(AtomicU64::new(0)),
+            purge_gate: Arc::new(AtomicU64::new(u64::MAX)),
+            backup_gate_released: Arc::new(AtomicU64::new(0)),
+            backup_gate_released_level: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             backup_writer: None,
             cluster_view: test_cluster_view(),
             probe: uc_net::probe::ProbeTable::new(uc_net::probe::ProbeCadence::default()),
@@ -2302,7 +2331,7 @@ mod tests {
     fn the_contract_has_the_number_of_families_the_docs_state() {
         assert_eq!(
             CONTRACT_SERIES.len(),
-            142,
+            145,
             "if this is intentional, update the family count in \
              docs/how-to/monitor-a-cluster.md in the same commit"
         );
@@ -2439,6 +2468,41 @@ mod tests {
         assert!(st.contains("expr: uc2_backup_writer_stopped == 1"), "{st}");
         assert!(st.contains("for: 1m"), "{st}");
         assert!(st.contains("severity: warning"), "{st}");
+    }
+
+    #[test]
+    fn the_backup_gate_rule_keys_on_its_counter() {
+        let g = rule_block("Uc2BackupGateReleased");
+        assert!(
+            g.contains("expr: increase(uc2_backup_gate_released_total[10m]) > 0"),
+            "{g}"
+        );
+        assert!(g.contains("severity: warning"), "{g}");
+    }
+
+    #[test]
+    fn the_purge_gate_gauge_is_header_only_at_k_zero_and_a_sample_otherwise() {
+        let s = synthetic_sources();
+        let t = render_prometheus(&s);
+        assert!(
+            t.contains("\n# TYPE uc2_purge_gate_position gauge\n"),
+            "{t}"
+        );
+        assert!(
+            !t.contains("\nuc2_purge_gate_position "),
+            "no sample at K=0"
+        );
+        s.purge_gate.store(4096, Ordering::Release);
+        s.backup_gate_released.store(2, Ordering::Release);
+        s.backup_gate_released_level.store(true, Ordering::Release);
+        let t = render_prometheus(&s);
+        for l in [
+            "uc2_purge_gate_position 4096",
+            "uc2_backup_gate_released 1",
+            "uc2_backup_gate_released_total 2",
+        ] {
+            assert!(t.contains(&format!("\n{l}\n")), "{l}: {t}");
+        }
     }
 
     fn with_one_tier(through: u64) -> ObsSources {
@@ -2933,6 +2997,9 @@ mod tests {
             backup_reports_unsent: Arc::new(AtomicU64::new(0)),
             backup_reports_appended: Arc::new(AtomicU64::new(0)),
             backup_hold_released: Arc::new(AtomicU64::new(0)),
+            purge_gate: Arc::new(AtomicU64::new(u64::MAX)),
+            backup_gate_released: Arc::new(AtomicU64::new(0)),
+            backup_gate_released_level: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             backup_writer: None,
             cluster_view: test_cluster_view(),
             probe: uc_net::probe::ProbeTable::new(uc_net::probe::ProbeCadence::default()),
@@ -3048,6 +3115,9 @@ mod tests {
             backup_reports_unsent: Arc::new(AtomicU64::new(0)),
             backup_reports_appended: Arc::new(AtomicU64::new(0)),
             backup_hold_released: Arc::new(AtomicU64::new(0)),
+            purge_gate: Arc::new(AtomicU64::new(u64::MAX)),
+            backup_gate_released: Arc::new(AtomicU64::new(0)),
+            backup_gate_released_level: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             backup_writer: None,
             cluster_view: test_cluster_view(),
             probe: uc_net::probe::ProbeTable::new(uc_net::probe::ProbeCadence::default()),
@@ -3156,6 +3226,9 @@ mod tests {
             backup_reports_unsent: Arc::new(AtomicU64::new(0)),
             backup_reports_appended: Arc::new(AtomicU64::new(0)),
             backup_hold_released: Arc::new(AtomicU64::new(0)),
+            purge_gate: Arc::new(AtomicU64::new(u64::MAX)),
+            backup_gate_released: Arc::new(AtomicU64::new(0)),
+            backup_gate_released_level: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             backup_writer: None,
             cluster_view: test_cluster_view(),
             probe: uc_net::probe::ProbeTable::new(uc_net::probe::ProbeCadence::default()),

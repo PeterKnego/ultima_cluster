@@ -184,11 +184,11 @@ pub fn read_committed_catalog(instance_dir: &Path) -> io::Result<(u64, Vec<SetEn
 
 /// Backup-tier spec §6.1: the registered backup tiers' committed
 /// watermarks in this instance directory's newest cluster artifact, with the
-/// artifact's position — `read_committed_settings`'s contract and its
+/// artifact's position and the committed `purge_requires_tiers` (K) — `read_committed_settings`'s contract and its
 /// staleness caveat, verbatim (`None` when there is no artifact yet).
 pub fn read_committed_backups(
     instance_dir: &Path,
-) -> io::Result<Option<(u64, Vec<BackupTierEntry>)>> {
+) -> io::Result<Option<(u64, Vec<BackupTierEntry>, u8)>> {
     let (fsm, start) = recover(
         &snapshot_dir_of(instance_dir),
         ClusterState::genesis_empty(),
@@ -198,7 +198,11 @@ pub fn read_committed_backups(
         return Ok(None);
     }
     let st = fsm.state();
-    Ok(Some((st.applied, st.backups.clone())))
+    Ok(Some((
+        st.applied,
+        st.backups.clone(),
+        st.settings.purge_requires_tiers,
+    )))
 }
 
 /// Recovery (spec §4.7): the newest `snap-*.ultcluster` under `dir`, or
@@ -1583,8 +1587,9 @@ mod tests {
         assert!(agent.do_work());
         assert_eq!(view.backups().len(), 1);
         let p = agent.take_snapshot().unwrap();
-        let (pos, tiers) = read_committed_backups(dir.path()).unwrap().unwrap();
+        let (pos, tiers, k) = read_committed_backups(dir.path()).unwrap().unwrap();
         assert_eq!(pos, p);
+        assert_eq!(k, 0, "genesis K");
         assert_eq!(tiers.len(), 1);
         assert_eq!(
             (tiers[0].tier_id, tiers[0].through, tiers[0].updated_pos),

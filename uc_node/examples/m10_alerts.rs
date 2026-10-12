@@ -78,6 +78,7 @@ const ALL_SCENARIOS: &[&str] = &[
     "snapshot_wont_fit",
     "backup_behind",
     "backup_hold_released",
+    "backup_gate_released",
     "backup_writer_error",
     "backup_writer_stopped",
     "snapshot_hash_diverged",
@@ -221,6 +222,7 @@ fn run_scenario(name: &str, scratch_root: &Path) -> (SeriesFile, Disclosure) {
         "snapshot_wont_fit" => scenario_snapshot_wont_fit(),
         "backup_behind" => scenario_backup_behind(),
         "backup_hold_released" => scenario_backup_hold_released(),
+        "backup_gate_released" => scenario_backup_gate_released(),
         "backup_writer_error" => scenario_backup_writer_error(),
         "backup_writer_stopped" => scenario_backup_writer_stopped(),
         "snapshot_hash_diverged" => scenario_snapshot_hash_diverged(),
@@ -431,6 +433,9 @@ fn synthetic_sources_named(node_id: u32, name: Option<FsmName>) -> ObsSources {
         backup_reports_unsent: Arc::new(AtomicU64::new(0)),
         backup_reports_appended: Arc::new(AtomicU64::new(0)),
         backup_hold_released: Arc::new(AtomicU64::new(0)),
+        purge_gate: Arc::new(AtomicU64::new(u64::MAX)),
+        backup_gate_released: Arc::new(AtomicU64::new(0)),
+        backup_gate_released_level: Arc::new(AtomicBool::new(false)),
         backup_writer: None,
         probe: uc_net::probe::ProbeTable::new(uc_net::probe::ProbeCadence::default()),
         commands_over_standard: Arc::new(AtomicU64::new(0)),
@@ -2087,6 +2092,39 @@ fn scenario_backup_hold_released() -> (SeriesFile, Disclosure) {
             rules: &["Uc2BackupHoldReleased"],
             state: "synthetic",
             method: "synthetic ObsSources: backup_hold_released bumped by 1 after one baseline \
+                     scrape (the real trigger - free space below one chunk plus headroom under a \
+                     live backup writer - needs a nearly full disk); rendered through the real \
+                     exporter."
+                .into(),
+        },
+    )
+}
+
+/// Uc2BackupGateReleased - **synthetic, disclosed**: the counter the node's
+/// consensus agent bumps on a low-space gate release is bumped directly after one
+/// baseline scrape (the real trigger needs a nearly full disk under a live
+/// writer).
+fn scenario_backup_gate_released() -> (SeriesFile, Disclosure) {
+    let sources = synthetic_sources(0);
+    let srv = ObsServer::serve(sources.clone(), "127.0.0.1:0".parse().unwrap()).expect("bind");
+    let addr = srv.local_addr();
+    let families = ["uc2_backup_gate_released_total"];
+    let mut sf = SeriesFile::new();
+    sf.record_round("n0", &scrape(addr), &families);
+    sources.backup_gate_released.fetch_add(1, Ordering::Relaxed);
+    thread::sleep(Duration::from_millis(200));
+    for _ in 0..3 {
+        sf.record_round("n0", &scrape(addr), &families);
+        thread::sleep(Duration::from_millis(200));
+    }
+    srv.stop();
+    (
+        sf,
+        Disclosure {
+            scenario: "backup_gate_released",
+            rules: &["Uc2BackupGateReleased"],
+            state: "synthetic",
+            method: "synthetic ObsSources: backup_gate_released bumped by 1 after one baseline \
                      scrape (the real trigger - free space below one chunk plus headroom under a \
                      live backup writer - needs a nearly full disk); rendered through the real \
                      exporter."

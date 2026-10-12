@@ -1216,6 +1216,11 @@ pub struct Node {
     /// Backup-tier spec §5.4: `uc2_backup_hold_released_total` — the SAME
     /// `Arc` [`Consensus::backup_purge_cap`] bumps.
     backup_hold_released: Arc<AtomicU64>,
+    /// Backup-tier 3b: the gate's three observability handles — the SAME
+    /// `Arc`s [`Consensus::purge_gate`] writes.
+    purge_gate: Arc<AtomicU64>,
+    backup_gate_released: Arc<AtomicU64>,
+    backup_gate_released_level: Arc<AtomicBool>,
     /// Backup-tier spec §6.2: the backup writer's newest chain watermark,
     /// waiting for the consensus agent to take it — the SAME slot
     /// `Consensus::backup_claim` reads.
@@ -2068,6 +2073,10 @@ impl Node {
         let arc_first_base = Arc::clone(&archive_first_base);
         let arc_prime_gen = Arc::clone(&prime_generation);
         let arc_backup = backup_shared.clone();
+        let purge_gate = Arc::new(AtomicU64::new(u64::MAX));
+        let backup_gate_released = Arc::new(AtomicU64::new(0));
+        let backup_gate_released_level = Arc::new(AtomicBool::new(false));
+        let arc_gate = Arc::clone(&purge_gate);
         // Forensic trace for the 2026-08-16 acked-write-loss hunt: every journal
         // cut is rare (elections only), so an env-gated line per cut is free.
         let trunc_trace = std::env::var("UC2_TRUNC_TRACE").is_ok();
@@ -2228,6 +2237,9 @@ impl Node {
                             Some(cap) => below.min(cap),
                             None => below,
                         };
+                        // Backup-tier 3b: the K-th tier's gate, defensively
+                        // (`u64::MAX` = none; consensus drops it on release).
+                        let below = below.min(arc_gate.load(Ordering::Acquire));
                         // Best-effort: a failed purge logs + drops (retries next
                         // interval). Correctness never depends on a block still
                         // being present — a reader below the floor recovers via
@@ -2553,6 +2565,11 @@ impl Node {
             backup_shared: backup_shared.clone(),
             backup_chunk_bytes: backup.as_ref().map_or(0, |b| b.chunk_bytes),
             backup_hold_released: Arc::clone(&backup_hold_released),
+            purge_gate: Arc::clone(&purge_gate),
+            backup_gate_released: Arc::clone(&backup_gate_released),
+            backup_gate_released_level: Arc::clone(&backup_gate_released_level),
+            gate_released: false,
+            gate_tick: 0,
             backup_claim: Arc::clone(&backup_claim),
             pending_backup_reports: BTreeMap::new(),
             pending_snapshot_reports: HashMap::new(),
@@ -2755,6 +2772,9 @@ impl Node {
             backup_reports_unsent,
             backup_reports_appended,
             backup_hold_released,
+            purge_gate,
+            backup_gate_released,
+            backup_gate_released_level,
             backup_claim,
             reports_implausible,
             reports_unattested,
@@ -3292,6 +3312,9 @@ impl Node {
             backup_reports_unsent: Arc::clone(&self.backup_reports_unsent),
             backup_reports_appended: Arc::clone(&self.backup_reports_appended),
             backup_hold_released: Arc::clone(&self.backup_hold_released),
+            purge_gate: Arc::clone(&self.purge_gate),
+            backup_gate_released: Arc::clone(&self.backup_gate_released),
+            backup_gate_released_level: Arc::clone(&self.backup_gate_released_level),
             backup_writer: self.backup_writer.clone(),
             cluster_view: Arc::clone(&self.cluster_view),
             probe: Arc::clone(&self.probe_table),
@@ -3981,6 +4004,20 @@ struct Consensus {
     backup_chunk_bytes: u64,
     /// `uc2_backup_hold_released_total`: releases, once per episode.
     backup_hold_released: Arc<AtomicU64>,
+    /// Backup-tier 3b spec §5.2: the journal-purge gate — `u64::MAX` when
+    /// K = 0, else `gate_position(K, tiers)` (0 = hold everything). Stored
+    /// on every node (purge on or off) so the gauge reads; the archive agent
+    /// holds the SAME `Arc` and clamps a `Purge` to it.
+    purge_gate: Arc<AtomicU64>,
+    /// The low-space release latch ([`Self::purge_gate`]).
+    gate_released: bool,
+    /// `uc2_backup_gate_released_total`, and the `uc2_backup_gate_released`
+    /// level gauge.
+    backup_gate_released: Arc<AtomicU64>,
+    backup_gate_released_level: Arc<AtomicBool>,
+    /// Idle-pass counter: refreshes the gate gauge on a node whose floor
+    /// persister takes the cheap exit.
+    gate_tick: u32,
     /// Backup-tier spec §6.2: the backup writer's newest watermark claim
     /// (written by the `uc2-backup` thread, Task 8), TAKEN by
     /// [`Consensus::take_backup_claim`] once per pass. A newer claim simply
@@ -5979,6 +6016,13 @@ impl Consensus {
         // Cheap exit every cycle when there is neither a newer floor to persist
         // nor a purge policy that might have outstanding work.
         if !may_move && !purge_on {
+            // RA7: the gauge still reads on a node with nothing to persist
+            // and no purge — refreshed every 4096th idle pass (one atomic
+            // load when K = 0) rather than locking the view every cycle.
+            self.gate_tick = self.gate_tick.wrapping_add(1);
+            if self.gate_tick % 4096 == 1 {
+                self.purge_gate();
+            }
             return false;
         }
         let now = self.now_ns();
@@ -5988,6 +6032,9 @@ impl Consensus {
         if !floor_elapsed {
             return false;
         }
+        // Backup-tier 3b: compute (and store) the gate once per throttled
+        // evaluation; the purge branch below clamps with it.
+        let gate = self.purge_gate();
 
         let mut did = false;
         // `held`: `own` could have moved the floor but the candidate did not
@@ -6060,6 +6107,15 @@ impl Consensus {
                 target = cap;
                 held = true;
             }
+            // Backup-tier 3b spec §5.2: hold the journal at the K-th confirmed
+            // tier. Clamps the purge TARGET only — never the snapshot floor,
+            // never raises a target; released on low space (`purge_gate`).
+            if let Some(g) = gate
+                && g < target
+            {
+                target = g;
+                held = true;
+            }
             // Only command a purge that would actually advance the floor. The
             // archive acks by advancing `archive_first_base`; `try_send` (not
             // `send`) keeps a full channel from blocking the consensus loop — a
@@ -6076,6 +6132,69 @@ impl Consensus {
         // idle strategy hot for as long as an upgrade takes to swap its
         // binary.
         did
+    }
+
+    /// Backup-tier 3b spec §5.2/§5.4: the journal-purge gate. ALWAYS computes
+    /// and stores [`Self::purge_gate`] (RA7: the gauge reads with purge off
+    /// too); returns the clamp to apply — `Some(gate)` — only when `[purge]`
+    /// is on, K >= 1 and the gate is not released for low space. The release
+    /// rule is `backup_purge_cap`'s: low free bytes (an unknown figure never
+    /// releases) fail `fits` for one chunk — the writer's `chunk_bytes` when
+    /// this node has a writer, else the default (PF3, a writerless node's
+    /// `backup_chunk_bytes` is 0); each edge logs once.
+    #[inline(never)]
+    fn purge_gate(&mut self) -> Option<u64> {
+        use crate::auto_fetch::{FREE_BYTES_UNKNOWN, fits};
+        let k = self
+            .cluster_view
+            .purge_requires_tiers
+            .load(Ordering::Acquire);
+        let gate = crate::tier::gate_position(k, &self.cluster_view.backups());
+        let value = gate.unwrap_or(u64::MAX);
+        if self.purge_gate.load(Ordering::Relaxed) != value {
+            self.purge_gate.store(value, Ordering::Release);
+        }
+        let gate = gate?;
+        if !matches!(self.purge_policy, PurgePolicy::BelowSnapshot { .. }) {
+            return None;
+        }
+        let free = self
+            .holdings
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .free_bytes;
+        if free != FREE_BYTES_UNKNOWN {
+            let chunk = if self.backup_shared.is_some() {
+                self.backup_chunk_bytes
+            } else {
+                crate::tier::writer::DEFAULT_CHUNK_BYTES
+            };
+            let low = !fits(free, chunk);
+            if low != self.gate_released {
+                self.gate_released = low;
+                self.backup_gate_released_level
+                    .store(low, Ordering::Release);
+                if low {
+                    self.backup_gate_released.fetch_add(1, Ordering::Relaxed);
+                    crate::obs_event!(
+                        Warn,
+                        "backup_gate_released",
+                        node = self.id as u64,
+                        gate = gate,
+                        free_bytes = free
+                    );
+                } else {
+                    crate::obs_event!(
+                        Info,
+                        "backup_gate_rearmed",
+                        node = self.id as u64,
+                        gate = gate,
+                        free_bytes = free
+                    );
+                }
+            }
+        }
+        if self.gate_released { None } else { Some(gate) }
     }
 
     /// Backup-tier spec §5.4: the purge cap the `uc2-backup` writer's hold
@@ -15137,6 +15256,11 @@ mod tests {
             backup_shared: None,
             backup_chunk_bytes: 0,
             backup_hold_released: Arc::new(AtomicU64::new(0)),
+            purge_gate: Arc::new(AtomicU64::new(u64::MAX)),
+            gate_released: false,
+            backup_gate_released: Arc::new(AtomicU64::new(0)),
+            backup_gate_released_level: Arc::new(AtomicBool::new(false)),
+            gate_tick: 0,
             backup_claim: Arc::new(Mutex::new(None)),
             pending_backup_reports: BTreeMap::new(),
             pending_snapshot_reports: HashMap::new(),
@@ -16163,6 +16287,118 @@ mod tests {
         shared.hold_released.store(true, Ordering::Release);
         h.cons.prune_snapshots_below(3000);
         assert_eq!(list_row_artifacts(&h, 0), vec![3000], "released: not kept");
+    }
+
+    /// Backup-tier 3b (Task 7): the K-th confirmed tier gates the journal
+    /// purge; low space releases it, counted once per episode.
+    #[test]
+    fn the_gate_caps_the_purge_at_the_kth_tier_and_releases_on_low_space() {
+        let mut h = harness_with_rows(&["a"]);
+        h.cons.purge_policy = PurgePolicy::BelowSnapshot { slack_bytes: 0 };
+        h.cons.holdings.lock().unwrap().free_bytes = 1 << 40;
+        let floor = 65_536u64;
+        let mut st = h.cons.cluster_view.to_state();
+        st.catalog = vec![agreed_entry(floor)];
+        st.running[0] = Some(uc_protocol::v2::upgrade::RowRunning {
+            row: 0,
+            version: 1,
+            record_pos: 1,
+        });
+        st.settings.purge_requires_tiers = 1;
+        st.backups = vec![gate_entry(1, 4096)];
+        h.cons.cluster_view.publish(&st);
+        h.cons.snapshot_set_position.store(floor, Ordering::Release);
+        h.cons.cnc.counters().durable.store_release(floor + 1000);
+        h.cons.note_set_held(floor);
+        let purge = |h: &mut Harness| -> Option<u64> {
+            h.advance_floor_timer();
+            h.cons.maybe_persist_snapshot_floor();
+            let mut last = None;
+            while let Ok(cmd) = h._trunc_rx.try_recv() {
+                if let ArchiveCmd::Purge { below } = cmd {
+                    last = Some(below);
+                }
+            }
+            last
+        };
+        let released = |h: &Harness| h.cons.backup_gate_released.load(Ordering::Relaxed);
+        let level = |h: &Harness| h.cons.backup_gate_released_level.load(Ordering::Relaxed);
+
+        assert_eq!(purge(&mut h), Some(4096), "clamped to the K-th tier");
+        assert_eq!(h.cons.purge_gate.load(Ordering::Relaxed), 4096);
+        assert_eq!(h.cons.snapshot_persisted_floor, floor, "floor untouched");
+
+        h.cons.holdings.lock().unwrap().free_bytes = 1;
+        assert_eq!(purge(&mut h), Some(floor), "released: the full target");
+        assert_eq!(released(&h), 1);
+        assert!(level(&h));
+        assert_eq!(purge(&mut h), Some(floor));
+        assert_eq!(released(&h), 1, "once per episode");
+
+        h.cons.holdings.lock().unwrap().free_bytes = 1 << 40;
+        assert_eq!(purge(&mut h), Some(4096), "re-armed");
+        assert!(!level(&h));
+        assert_eq!(released(&h), 1);
+    }
+
+    #[test]
+    fn k_above_the_registered_count_holds_everything_without_a_release() {
+        let mut h = harness_with_rows(&["a"]);
+        h.cons.purge_policy = PurgePolicy::BelowSnapshot { slack_bytes: 0 };
+        h.cons.holdings.lock().unwrap().free_bytes = 1 << 40;
+        let floor = 65_536u64;
+        let mut st = h.cons.cluster_view.to_state();
+        st.catalog = vec![agreed_entry(floor)];
+        st.running[0] = Some(uc_protocol::v2::upgrade::RowRunning {
+            row: 0,
+            version: 1,
+            record_pos: 1,
+        });
+        st.settings.purge_requires_tiers = 2;
+        st.backups = vec![gate_entry(1, 4096)];
+        h.cons.cluster_view.publish(&st);
+        h.cons.snapshot_set_position.store(floor, Ordering::Release);
+        h.cons.cnc.counters().durable.store_release(floor + 1000);
+        h.cons.note_set_held(floor);
+        for _ in 0..20 {
+            h.advance_floor_timer();
+            h.cons.maybe_persist_snapshot_floor();
+            while let Ok(cmd) = h._trunc_rx.try_recv() {
+                assert!(
+                    !matches!(cmd, ArchiveCmd::Purge { .. }),
+                    "a gate of 0 purges nothing"
+                );
+            }
+        }
+        assert_eq!(h.cons.backup_gate_released.load(Ordering::Relaxed), 0);
+        assert!(!h.cons.backup_gate_released_level.load(Ordering::Relaxed));
+        assert_eq!(h.cons.purge_gate.load(Ordering::Relaxed), 0);
+    }
+
+    /// RA7: the gauge value is stored with purge OFF, and nothing clamps.
+    #[test]
+    fn the_gate_atomic_is_stored_with_purge_off() {
+        let mut h = harness_with_rows(&["a"]);
+        let mut st = h.cons.cluster_view.to_state();
+        st.settings.purge_requires_tiers = 1;
+        st.backups = vec![gate_entry(1, 777)];
+        h.cons.cluster_view.publish(&st);
+        for _ in 0..5000 {
+            h.cons.maybe_persist_snapshot_floor();
+        }
+        assert_eq!(h.cons.purge_gate.load(Ordering::Relaxed), 777);
+        assert_eq!(h.cons.backup_gate_released.load(Ordering::Relaxed), 0);
+    }
+
+    fn gate_entry(tier_id: u64, through: u64) -> uc_protocol::v2::backup::BackupTierEntry {
+        uc_protocol::v2::backup::BackupTierEntry {
+            tier_id,
+            oldest_set: 0,
+            newest_set: 0,
+            through,
+            reporter: 1,
+            updated_pos: 0,
+        }
     }
 
     /// Backup-tier spec §5.4 (Task 9): the purge target on a writer's node

@@ -102,6 +102,14 @@ pub struct ObsSources {
     /// Backup-tier spec §5.4: how often low space released this node's backup
     /// purge hold (`uc2_backup_hold_released_total`), once per episode.
     pub backup_hold_released: Arc<AtomicU64>,
+    /// Backup-tier 3b spec §5.2: the journal-purge gate position
+    /// (`uc2_purge_gate_position`; `u64::MAX` = K is 0, header-only), the
+    /// low-space gate release count (`uc2_backup_gate_released_total`) and
+    /// its level (`uc2_backup_gate_released`) — the SAME `Arc`s the
+    /// consensus agent writes.
+    pub purge_gate: Arc<AtomicU64>,
+    pub backup_gate_released: Arc<AtomicU64>,
+    pub backup_gate_released_level: Arc<AtomicBool>,
     /// Backup-tier spec §6.4: the `uc2-backup` writer's shared stats — the
     /// SAME allocation the writer thread bumps. `None` on a node with no
     /// `[backup]` writer; its writer-side series then render `0` (the
@@ -250,6 +258,9 @@ impl ObsSources {
             backup_reports_unsent: Arc::new(AtomicU64::new(0)),
             backup_reports_appended: Arc::new(AtomicU64::new(0)),
             backup_hold_released: Arc::new(AtomicU64::new(0)),
+            purge_gate: Arc::new(AtomicU64::new(u64::MAX)),
+            backup_gate_released: Arc::new(AtomicU64::new(0)),
+            backup_gate_released_level: Arc::new(AtomicBool::new(false)),
             backup_writer: None,
             cluster_view: Arc::new(crate::cluster_fsm::ClusterView::new(
                 &crate::cluster_fsm::ClusterState::genesis_empty(),

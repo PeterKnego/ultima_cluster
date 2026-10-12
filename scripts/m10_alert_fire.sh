@@ -280,6 +280,7 @@ RULE_META = {
     "Uc2SnapshotWontFit": {"severity": "warning", "real": False, "scenario": "snapshot_wont_fit"},
     "Uc2BackupBehind": {"severity": "warning", "real": False, "scenario": "backup_behind"},
     "Uc2BackupHoldReleased": {"severity": "warning", "real": False, "scenario": "backup_hold_released"},
+    "Uc2BackupGateReleased": {"severity": "warning", "real": False, "scenario": "backup_gate_released"},
     "Uc2BackupWriterError": {"severity": "warning", "real": False, "scenario": "backup_writer_error"},
     "Uc2BackupWriterStopped": {"severity": "warning", "real": False, "scenario": "backup_writer_stopped"},
     "Uc2SnapshotHashDiverged": {"severity": "critical", "real": False, "scenario": "snapshot_hash_diverged"},
@@ -756,6 +757,17 @@ def build_Uc2BackupHoldReleased():
     return r
 
 
+def build_Uc2BackupGateReleased():
+    # `increase(uc2_backup_gate_released_total[10m]) > 0`, no `for:` - the
+    # build_Uc2PathBelowMtu shape: the real 0->1 step lands inside the range.
+    rows = load_scenario("backup_gate_released")
+    row = select(rows, "uc2_backup_gate_released_total", {})
+    r = new_rule("warning", labels_from=row)
+    add_literal(r, row, "uc2_backup_gate_released_total", 600)
+    r["eval_time"] = (len(row["values"]) - 1) * INTERVAL
+    return r
+
+
 def build_Uc2BackupWriterError():
     # `increase(uc2_backup_errors_total[10m]) > 0`, no `for:` - same shape,
     # over the labelled counter's `unavailable` series.
@@ -871,6 +883,7 @@ RULE_BUILDERS = {
     "Uc2SnapshotWontFit": build_Uc2SnapshotWontFit,
     "Uc2BackupBehind": build_Uc2BackupBehind,
     "Uc2BackupHoldReleased": build_Uc2BackupHoldReleased,
+    "Uc2BackupGateReleased": build_Uc2BackupGateReleased,
     "Uc2BackupWriterError": build_Uc2BackupWriterError,
     "Uc2BackupWriterStopped": build_Uc2BackupWriterStopped,
     "Uc2SnapshotHashDiverged": build_Uc2SnapshotHashDiverged,

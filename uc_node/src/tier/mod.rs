@@ -9,6 +9,19 @@ pub mod retention;
 pub mod target;
 pub mod writer;
 
+/// Backup-tier 3b spec §5.2: the journal-purge gate for `purge_requires_tiers
+/// = k` — the K-th highest confirmed `through` among the committed tiers
+/// (`None` for K = 0: no gate); `0` when fewer than K tiers are registered,
+/// which holds every purge. Pure: no I/O, the node and `tier show` share it.
+pub fn gate_position(k: u8, tiers: &[uc_protocol::v2::backup::BackupTierEntry]) -> Option<u64> {
+    if k == 0 {
+        return None;
+    }
+    let mut through: Vec<u64> = tiers.iter().map(|t| t.through).collect();
+    through.sort_unstable_by(|a, b| b.cmp(a));
+    Some(through.get(k as usize - 1).copied().unwrap_or(0))
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum TierError {
     #[error("tier io: {0}")]
@@ -39,4 +52,40 @@ pub enum TierError {
     /// block purged under the cut) — not the target's fault.
     #[error("journal: {0}")]
     Journal(String),
+}
+
+#[cfg(test)]
+mod gate_tests {
+    use super::gate_position;
+    use uc_protocol::v2::backup::BackupTierEntry;
+
+    fn e(tier_id: u64, through: u64) -> BackupTierEntry {
+        BackupTierEntry {
+            tier_id,
+            oldest_set: 0,
+            newest_set: 0,
+            through,
+            reporter: 1,
+            updated_pos: 0,
+        }
+    }
+
+    #[test]
+    fn gate_position_for_0_1_2_and_4_tiers_k_above_the_count_and_a_forgotten_tier() {
+        assert_eq!(gate_position(0, &[]), None);
+        assert_eq!(gate_position(0, &[e(1, 500)]), None);
+        assert_eq!(gate_position(1, &[e(1, 500)]), Some(500));
+        let two = [e(1, 500), e(2, 900)];
+        assert_eq!(gate_position(1, &two), Some(900));
+        assert_eq!(gate_position(2, &two), Some(500));
+        let four = [e(1, 700), e(2, 300), e(3, 900), e(4, 100)];
+        assert_eq!(gate_position(4, &four), Some(100));
+        assert_eq!(gate_position(3, &four), Some(300));
+        assert_eq!(
+            gate_position(3, &two),
+            Some(0),
+            "K above the count holds all"
+        );
+        assert_eq!(gate_position(2, &two[..1]), Some(0), "a forgotten tier");
+    }
 }
