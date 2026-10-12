@@ -158,16 +158,6 @@ pub fn data_loss_line(q: u64) -> String {
     format!("restoring as of {q}; history after {q} is discarded on every node restored this way")
 }
 
-/// Ruling R12a: why `tier restore --new-node` is refused in this release.
-pub fn new_node_unsupported(node_id: u32) -> String {
-    format!(
-        "tier restore: refusing: new_node_unsupported: a tier-seeded replacement node (id \
-         {node_id}) is not supported yet — its restored term map starts at the set and cannot \
-         align with a live leader's lineage; add a replacement node with a fresh, empty \
-         instance dir and the normal join (a snapshot session from its peers)"
-    )
-}
-
 /// `tier restore`: refuse a `--confirm-cluster` that is not the tier's
 /// `app_id`, print the data-loss line, then build `instance_dir`.
 pub fn restore(
@@ -176,11 +166,6 @@ pub fn restore(
     instance_dir: &Path,
     mode: RestoreMode,
 ) -> anyhow::Result<()> {
-    if let RestoreMode::NewNode(node_id) = mode {
-        // Ruling R12a: deferred to project 3b — refused before anything is
-        // read or built.
-        anyhow::bail!("{}", new_node_unsupported(node_id));
-    }
     let (t, info) = open_target("restore", target)?;
     let mode = match mode {
         RestoreMode::Cluster(confirm) => {
@@ -194,7 +179,7 @@ pub fn restore(
             }
             Mode::Recovery
         }
-        RestoreMode::NewNode(_) => unreachable!("refused above (R12a)"),
+        RestoreMode::NewNode(node_id) => Mode::NewNode { node_id },
     };
     let l = list_tier(&t).map_err(|e| tier_err("restore", e))?;
     let (_, q) = restore_point(&l, at).map_err(|e| tier_err("restore", e))?;
@@ -209,6 +194,12 @@ pub fn restore(
         info.tier_id,
         m.mode
     );
+    if let Mode::NewNode { node_id } = m.mode {
+        println!(
+            "next: start this node, then `uc2ctl add-learner {node_id}` (with its address) \
+             against the live cluster and, once it has caught up, `uc2ctl promote {node_id}`"
+        );
+    }
     if m.fenced {
         println!(
             "fenced: {} — Q lies below the tier's reach, so this tier's history past {} is \
@@ -337,11 +328,8 @@ mod tests {
         let out = d.path().join("out");
         let e = restore(&tier, None, &out, RestoreMode::Cluster("app".into())).unwrap_err();
         assert!(e.to_string().contains("no TIER"), "{e}");
-        // Ruling R12a: `--new-node` is refused by name BEFORE the target is
-        // opened — here it has no TIER, which the open would have named.
         let e = restore(&tier, None, &out, RestoreMode::NewNode(9)).unwrap_err();
-        assert!(e.to_string().contains("new_node_unsupported"), "{e}");
-        assert!(!e.to_string().contains("no TIER"), "{e}");
+        assert!(e.to_string().contains("no TIER"), "{e}");
         assert!(!out.exists());
         uc_node::tier::target::open_or_create_tier(&FsTarget::new(&tier), "app", 1).unwrap();
         let e = restore(&tier, None, &out, RestoreMode::Cluster("other".into())).unwrap_err();

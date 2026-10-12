@@ -448,7 +448,8 @@ struct TierRestoreArgs {
     /// data-loss boundary (history after Q is discarded).
     #[arg(long)]
     confirm_cluster: Option<String>,
-    /// One replacement node under a new id (`--node-id`), refused
+    /// One replacement node under a new id (`--node-id`); it then
+    /// joins the live cluster via `add-learner` / `promote`. Refused
     /// `restore_id_reused` when the id is in the restored membership.
     #[arg(long, requires = "node_id")]
     new_node: bool,

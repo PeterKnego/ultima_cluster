@@ -2730,16 +2730,7 @@ mod writer_e2e {
     /// (one other voter is down) — no truncation, no wipe, no unattested
     /// report anywhere. Its term map starts at (term, S) and its padding
     /// bodies are zero where peers hold leftover bytes; neither may matter.
-    ///
-    /// IGNORED — a design-level finding (Task 12 report): the seeded node's
-    /// term map is `[(term, S)]`, the leader ships `[(term, 0)]`, and
-    /// `uc_consensus::reconcile` finds no aligned entry, so it cuts at
-    /// `min(durable, leader[0].base) = 0`. The archive then fail-stops
-    /// (`PositionPurged { pos: 0, first_base: S }`) because a node with a
-    /// floor cannot truncate below it. Observed with `UC2_TRUNC_TRACE=1`:
-    /// `cut to=0 durable=230880 own_tail=[(1, 38528)] lead_head=[(1, 0)]`.
     #[test]
-    #[ignore = "project 3b / ruling R12a: reconcile cuts a tier-seeded node to 0 (term map starts at (term, S))"]
     fn a_new_node_seeded_from_the_tier_joins_and_catches_up() {
         let _g = serialize();
         let (mut c, tier, p, _target) = tiered("tier-new-node", 300, 1500);
@@ -2802,6 +2793,11 @@ mod writer_e2e {
         h9.start_service(app, 9);
         c.nodes.push(h9);
         let n9 = c.nodes.len() - 1;
+        assert_eq!(
+            c.node(n9).archive_first_base(),
+            m.start_set,
+            "journal_first stays S"
+        );
 
         // Load while it catches up, then a leader change mid-catch-up.
         submit_frames(c.node(l), 1000);
@@ -2825,8 +2821,20 @@ mod writer_e2e {
             c.node(n9).counters().durable.load_acquire() >= commit
         });
         let total = query_total(&c, l3);
-        assert_eq!(query_total(&c, n9), total, "node 9 serves the same state");
+        // Node 9 is a follower (a linearizable read is leader-only), so read
+        // its applied state and wait for it to reach the leader's total.
+        await_until(30, "node 9 serves the same state", || {
+            let client = uc_client::Client::connect(&c.nodes[n9].dir, c.app).expect("client");
+            let raw: Result<[u8; 8], _> = client.query_snapshot(&());
+            client.shutdown();
+            raw.is_ok_and(|r| u64::from_le_bytes(r) == total)
+        });
 
+        assert_eq!(
+            c.node(n9).archive_first_base(),
+            m.start_set,
+            "journal_first stays S"
+        );
         assert_eq!(c.node(n9).truncations(), 0, "node 9 truncated nothing");
         assert_eq!(c.node(n9).wipes(), 0, "node 9 was never wiped");
         for i in c.running() {

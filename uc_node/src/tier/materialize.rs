@@ -3,7 +3,7 @@
 //! [`materialize`] turns a tier into an instance directory a node boots from
 //! unchanged: the start set's artifacts, a fresh journal holding the chain's
 //! bytes `[S, Q)`, and a `state/` the builder WRITES (never copies) — the
-//! snapshot floor S, a term map derived from the restored frame headers, the
+//! snapshot floor S, the set's committed term-map lineage followed by the terms derived from the restored frame headers, the
 //! cluster artifact's membership as the config record at S, no vote, and the
 //! output-progress marker per mode. Everything is assembled under
 //! `<out_dir>/.restore-tmp/`, checked by [`crate::backup::verify_artifact`],
@@ -39,12 +39,9 @@ pub enum Mode {
     Recovery,
     /// One replacement node, seeded from the tier under a NEW id.
     ///
-    /// NOT SAFE against a live cluster yet (ruling R12a, project 3b): the
-    /// restored term map's first entry is `(term, S)`, a live leader ships
-    /// the term's true base, and reconcile cuts the node to 0 — below its
-    /// floor, an archive fail-stop. `uc2ctl tier restore --new-node` refuses
-    /// `new_node_unsupported`; the variant stays for the ignored acceptance
-    /// test until the lineage is seeded at/below the floor.
+    /// The restored term map is the `SET`'s committed lineage ++ the terms
+    /// derived from the frames in `[S, Q)`, so reconcile against a live
+    /// leader aligns instead of cutting below the floor.
     NewNode { node_id: u32 },
     /// A separate cluster as of Q (`uc2ctl tier fork`), to be forced onto
     /// `node_id` as its single voter ([`fork`]).
@@ -630,7 +627,18 @@ fn build(
         prev: stored,
     };
 
-    let terms = write_journal(t, l, s, q, &tmp.join("journal"))?;
+    // The restored map is the committed map truncated at Q: the writer's
+    // lineage (strictly below S) ++ the terms the frames in [S, Q) open
+    // above the lineage's last (a term that merely continues across S is
+    // in the lineage and not re-stamped at S; one that opens at S is not).
+    let last_lineage_term = label.lineage.last().map_or(0, |&(t, _)| t);
+    let derived = write_journal(t, l, s, q, &tmp.join("journal"), last_lineage_term)?;
+    let terms: Vec<TermMapEntry> = label
+        .lineage
+        .iter()
+        .map(|&(term, base)| TermMapEntry { term, base })
+        .chain(derived)
+        .collect();
 
     if let Mode::NewNode { node_id } | Mode::Fork { node_id } = mode {
         // Ruling R11c: the membership the restored node BOOTS with — the
@@ -833,7 +841,7 @@ impl BlockWriter {
 }
 
 /// Step 4: the chain's bytes `[s, q)` into a fresh journal at `dir`, in
-/// frame-aligned blocks of at most 1 MiB; returns the term map of the span.
+/// frame-aligned blocks of at most 1 MiB; returns the terms the span opens above `last_lineage_term`.
 /// Q must be a frame end — a stream that stops inside a frame is refused.
 fn write_journal(
     t: &dyn BackupTarget,
@@ -841,6 +849,7 @@ fn write_journal(
     s: u64,
     q: u64,
     dir: &Path,
+    last_lineage_term: u32,
 ) -> Result<Vec<TermMapEntry>, TierError> {
     let journal = Journal::open(JournalConfig {
         preallocate_segments: false,
@@ -855,7 +864,7 @@ fn write_journal(
         block: Vec::new(),
         block_base: s,
         terms: Vec::new(),
-        last_term: 0,
+        last_term: last_lineage_term,
     };
     read_range(t, &l.chunks, s, q, &mut |pos, bytes| w.take(pos, bytes))?;
     if !w.pending.is_empty() || w.pending_base != q {
@@ -1037,6 +1046,10 @@ mod tests {
 
     /// One complete set at `p`: row 0 and the cluster artifact, then `SET`.
     fn put_set(t: &dyn BackupTarget, p: u64) {
+        put_set_with(t, p, vec![(1, 0)]);
+    }
+
+    fn put_set_with(t: &dyn BackupTarget, p: u64, lineage: Vec<(u32, u64)>) {
         let (row, hash) = row_bytes(p);
         put(t, &row_object(p, 0), MAGIC_ARTIFACT, p, p, &row);
         let cl = cluster_bytes(p);
@@ -1053,7 +1066,7 @@ mod tests {
             }],
             cluster_hash: artifact_hash_of(&cl),
             cluster_size: cl.len() as u64,
-            lineage: vec![(1, 0)],
+            lineage,
         };
         let text = label.render();
         t.put_if_absent(&set_label(p), &mut |f| {
@@ -1138,7 +1151,7 @@ mod tests {
         );
 
         // An explicit Q inside the older set's chain: S = 1024, the term map
-        // carries every term change in [S, Q), the config record is the
+        // is the SET's lineage followed by every term change in [S, Q), the config record is the
         // cluster artifact's membership at S, and no vote exists.
         let d = out(&fx, "n1");
         let m = materialize(&t, Some(2560), &d, Mode::Recovery, 1).unwrap();
@@ -1150,10 +1163,7 @@ mod tests {
         assert_eq!(
             st.term_map(),
             vec![
-                TermMapEntry {
-                    term: 1,
-                    base: 1024
-                },
+                TermMapEntry { term: 1, base: 0 },
                 TermMapEntry {
                     term: 2,
                     base: 1536
@@ -1192,6 +1202,71 @@ mod tests {
             fs::read_to_string(d.join(RESTORED_FILE))
                 .unwrap()
                 .contains("mode=fork:1\n")
+        );
+    }
+
+    /// A tier with one chunk `[s, q)` and one `SET` at `s` carrying `lineage`.
+    fn lineage_tier(lineage: Vec<(u32, u64)>, s: u64, q: u64, term_at: impl Fn(u64) -> u32) -> Fx {
+        let d = tmp();
+        let tier = d.path().join("tier");
+        let t = FsTarget::new(&tier);
+        open_or_create_tier(&t, APP, 1).unwrap();
+        put(
+            &t,
+            &crate::tier::layout::chunk_object(s, q),
+            MAGIC_CHUNK,
+            s,
+            q,
+            &frames(s, q, term_at),
+        );
+        put_set_with(&t, s, lineage);
+        Fx {
+            root: d.path().to_path_buf(),
+            _d: d,
+            tier,
+        }
+    }
+
+    fn entries(v: &[(u32, u64)]) -> Vec<TermMapEntry> {
+        v.iter()
+            .map(|&(term, base)| TermMapEntry { term, base })
+            .collect()
+    }
+
+    /// RA1: the lineage is strictly below S, so a term that opens exactly at
+    /// S is not in it and must be derived with base S; a term that merely
+    /// continues across S is in the lineage and must not be re-stamped at S.
+    #[test]
+    fn a_term_opening_exactly_at_s_is_derived_not_recorded() {
+        let lin = vec![(1, 0), (2, 4096)];
+        let (s, q) = (20_000, 20_000 + 8 * FRAME);
+
+        let fx = lineage_tier(lin.clone(), s, q, |_| 3);
+        let t = FsTarget::new(&fx.tier);
+        let d = out(&fx, "opens");
+        materialize(&t, Some(q), &d, Mode::Recovery, 1).unwrap();
+        let st = NodeState::open(&d.join("state")).unwrap();
+        assert_eq!(st.term_map(), entries(&[(1, 0), (2, 4096), (3, 20_000)]));
+
+        let fx = lineage_tier(lin, s, q, |_| 2);
+        let t = FsTarget::new(&fx.tier);
+        let d = out(&fx, "continues");
+        materialize(&t, Some(q), &d, Mode::Recovery, 1).unwrap();
+        let st = NodeState::open(&d.join("state")).unwrap();
+        assert_eq!(st.term_map(), entries(&[(1, 0), (2, 4096)]));
+    }
+
+    #[test]
+    fn materialize_term_map_equals_a_live_nodes_map_truncated_to_q() {
+        let lin = vec![(1, 0), (2, 4096), (3, 20_000)];
+        let fx = lineage_tier(lin, 24_000, 40_000, |p| if p < 30_016 { 3 } else { 4 });
+        let t = FsTarget::new(&fx.tier);
+        let d = out(&fx, "n");
+        materialize(&t, Some(40_000), &d, Mode::Recovery, 1).unwrap();
+        let st = NodeState::open(&d.join("state")).unwrap();
+        assert_eq!(
+            st.term_map(),
+            entries(&[(1, 0), (2, 4096), (3, 20_000), (4, 30_016)])
         );
     }
 
