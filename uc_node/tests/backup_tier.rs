@@ -411,6 +411,8 @@ mod writer_e2e {
         is_learner: bool,
         cfg: Box<dyn Fn() -> NodeConfig>,
         backup: Option<BackupConfig>,
+        /// `[tier_source]` (3b spec §6.1); `None` = none configured.
+        tier_source: Option<PathBuf>,
         sock: Option<UdpSocket>,
         node: Option<Node>,
         svc: Option<Box<dyn FnOnce()>>,
@@ -424,7 +426,7 @@ mod writer_e2e {
                 socket: Some(sock),
                 admin: AdminPolicy::Filesystem,
                 backup: self.backup.clone(),
-                tier_source: None,
+                tier_source: self.tier_source.clone(),
             };
             self.node = Some(Node::start_with((self.cfg)(), opts).expect("start node"));
         }
@@ -464,6 +466,10 @@ mod writer_e2e {
         retain_sets: u16,
         /// Genesis `Settings::purge_requires_tiers` (0 = no gate).
         purge_requires_tiers: u8,
+        /// Genesis `Settings::auto_fetch`.
+        auto_fetch: bool,
+        /// Genesis `Settings::snapshot_target = learners` (standby instants).
+        standby: bool,
     }
 
     fn opts(app: &'static str, purge: bool) -> Opts {
@@ -472,6 +478,8 @@ mod writer_e2e {
             purge,
             retain_sets: 0,
             purge_requires_tiers: 0,
+            auto_fetch: true,
+            standby: false,
         }
     }
 
@@ -524,6 +532,17 @@ mod writer_e2e {
         o: Opts,
         writer: impl Fn(usize) -> Option<BackupConfig>,
     ) -> Cluster {
+        spawn_with(n_voters, n_learners, o, writer, |_| None)
+    }
+
+    /// [`spawn`], with node `i`'s `[tier_source]` = `source(i)`.
+    fn spawn_with(
+        n_voters: usize,
+        n_learners: usize,
+        o: Opts,
+        writer: impl Fn(usize) -> Option<BackupConfig>,
+        source: impl Fn(usize) -> Option<PathBuf>,
+    ) -> Cluster {
         let dir = tempfile::Builder::new()
             .prefix("uc2-backup-writer-")
             .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
@@ -557,6 +576,12 @@ mod writer_e2e {
                 settings_genesis: Settings {
                     backup_retain_sets: o.retain_sets,
                     purge_requires_tiers: o.purge_requires_tiers,
+                    auto_fetch: o.auto_fetch,
+                    snapshot_target: if o.standby {
+                        uc_protocol::v2::settings::Target::Learners
+                    } else {
+                        Settings::genesis_default().snapshot_target
+                    },
                     ..Settings::genesis_default()
                 },
                 force_jumbo_frames: false,
@@ -583,6 +608,7 @@ mod writer_e2e {
                 is_learner: i >= n_voters,
                 cfg,
                 backup: writer(i),
+                tier_source: source(i),
                 sock: Some(sock),
                 node: None,
                 svc: None,
@@ -2891,6 +2917,168 @@ mod writer_e2e {
         }
     }
 
+    /// One labelled sample of `name` on `node`'s `/metrics` (catalog.rs's
+    /// helper).
+    fn metric_labeled(node: &Node, name: &str, labels: &str) -> u64 {
+        let text = uc_node::obs::metrics::render_prometheus(&node.observability());
+        let prefix = format!("{name}{{{labels}}} ");
+        text.lines()
+            .find_map(|l| l.strip_prefix(&prefix))
+            .unwrap_or_else(|| panic!("no {name}{{{labels}}} sample in:\n{text}"))
+            .trim()
+            .parse()
+            .unwrap_or_else(|e| panic!("{name}{{{labels}}}: {e}"))
+    }
+
+    fn fetched(node: &Node, source: &str) -> u64 {
+        metric_labeled(
+            node,
+            "uc2_snapshot_fetch_total",
+            &format!("source=\"{source}\""),
+        )
+    }
+
+    /// Restores the stderr log sink when a capturing test ends (pass or
+    /// panic).
+    struct CaptureGuard;
+
+    impl Drop for CaptureGuard {
+        fn drop(&mut self) {
+            uc_node::obs::log::stderr_for_tests();
+        }
+    }
+
+    /// The captured log lines naming `event`.
+    fn obs_lines(buf: &std::sync::Mutex<Vec<u8>>, event: &str) -> Vec<String> {
+        let text =
+            String::from_utf8_lossy(&buf.lock().unwrap_or_else(|e| e.into_inner())).into_owned();
+        let needle = format!("\"event\":\"{event}\"");
+        text.lines()
+            .filter(|l| l.contains(needle.as_str()))
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Command a STANDBY instant (following leadership) and wait until the
+    /// learner `learner` holds its set; returns its position.
+    fn standby_instant(c: &Cluster, learner: usize) -> u64 {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let p = loop {
+            assert!(Instant::now() < deadline, "no leader took the instant");
+            let Some(l) = c.running().into_iter().find(|&i| c.node(i).can_serve()) else {
+                std::thread::sleep(Duration::from_millis(5));
+                continue;
+            };
+            match c.node(l).command_snapshot(true) {
+                Ok(p) => break p,
+                Err(uc_node::SnapshotRefusal::Retry) => {
+                    std::thread::sleep(Duration::from_millis(5))
+                }
+                Err(e) => panic!("uc2ctl snapshot --standby refused: {e}"),
+            }
+        };
+        await_until(60, "the learner holds the standby set", || {
+            c.node(learner).snapshot_set_position() >= p
+        });
+        p
+    }
+
+    /// `uc2ctl snapshot fetch --from <learner> --position <p>` on node `at`
+    /// (admin op 9: the position rides in `ip ‖ port`, `fetch_position`).
+    fn snapshot_fetch(c: &Cluster, at: usize, learner: usize, p: u64) {
+        let (ip, port) = (p as u32, (p >> 32) as u16);
+        assert_eq!(uc_node::fetch_position(ip, port), p);
+        admin_ok(&c.cnc(at), 9, learner as u32, ip, port);
+    }
+
+    /// 3b spec §6.2, deterministic by construction (ruling RA4): no voter
+    /// fetches on its own (`auto_fetch = false`) and no voter builds a
+    /// standby set, so a voter's set can only come from the fetch the test
+    /// triggers, and only once the tier holds it. Node 0 has a tier source:
+    /// the first set comes from the tier, verified against the catalog; the
+    /// second — never written to the tier, the writer is paused — is
+    /// declined by the tier once (`no_set`) and taken from the learner.
+    #[test]
+    fn a_store_only_fetch_takes_the_set_from_the_tier_and_from_a_peer_when_the_tier_lacks_it() {
+        let _g = serialize();
+        let buf = uc_node::obs::log::capture_for_tests();
+        let _restore = CaptureGuard;
+        let tier = tmp_tier();
+        let cfg = writer_cfg(tier.path(), 1 << 20, Duration::from_millis(300));
+        let o = Opts {
+            auto_fetch: false,
+            standby: true,
+            ..opts("tier-fetch", false)
+        };
+        let src = tier.path().to_path_buf();
+        let mut c = spawn_with(
+            3,
+            1,
+            o,
+            |i| (i == 3).then(|| cfg.clone()),
+            |i| (i == 0 || i == 2).then(|| src.clone()),
+        );
+        start_sums(&mut c);
+        await_single_leader(&c, 30);
+        await_capable(&c);
+
+        // P1 reaches the tier; only then does node 0 fetch it.
+        submit_settled(&c, 500);
+        let p1 = standby_instant(&c, 3);
+        await_agreed(&c, &[0, 3], p1);
+        await_watermark(&c, 0, 60, |w| w.newest_set == p1);
+        assert_eq!(
+            c.node(0).snapshot_set_position(),
+            0,
+            "a voter holds no standby set on its own"
+        );
+        snapshot_fetch(&c, 0, 3, p1);
+        await_until(60, "node 0 took P1 from the tier", || {
+            fetched(c.node(0), "tier") == 1
+        });
+        await_until(30, "node 0 holds P1", || {
+            c.node(0).snapshot_set_position() == p1
+        });
+        assert_eq!(fetched(c.node(0), "peer"), 0, "no peer session for P1");
+        assert_eq!(c.node(0).tier_fetches_spawned(), 1);
+        assert!(
+            obs_lines(&buf, "tier_fetch_declined").is_empty(),
+            "the tier served P1: {:?}",
+            obs_lines(&buf, "tier_fetch_declined")
+        );
+
+        // P2 never reaches the tier: the writer is paused before it exists.
+        let shared = c.node(3).backup_writer().expect("node 3 runs a writer");
+        shared.paused_for_test.store(true, Ordering::Release);
+        submit_settled(&c, 500);
+        let p2 = standby_instant(&c, 3);
+        assert!(p2 > p1);
+        await_agreed(&c, &[0, 3], p2);
+        snapshot_fetch(&c, 0, 3, p2);
+        await_until(60, "node 0 took P2 from the learner", || {
+            fetched(c.node(0), "peer") == 1
+        });
+        await_until(30, "node 0 holds P2", || {
+            c.node(0).snapshot_set_position() == p2
+        });
+        assert_eq!(fetched(c.node(0), "tier"), 1, "the tier served P1 only");
+        assert_eq!(
+            c.node(0).tier_fetches_spawned(),
+            1,
+            "no copy was started for P2"
+        );
+        let declined = obs_lines(&buf, "tier_fetch_declined");
+        assert_eq!(declined.len(), 1, "named once: {declined:?}");
+        assert!(
+            declined[0].contains(&format!("\"position\":{p2}"))
+                && declined[0].contains("\"reason\":\"no_set\""),
+            "{}",
+            declined[0]
+        );
+        shared.paused_for_test.store(false, Ordering::Release);
+        let _keep = c.stop();
+    }
+
     /// Spec §8.2 + the R8a carry: a node seeded from the tier under a NEW id
     /// joins a LIVE, appending cluster as a learner, catches up, rides a
     /// leader change, and once promoted its durable reports carry the quorum
@@ -2952,6 +3140,7 @@ mod writer_e2e {
             is_learner: true,
             cfg: cfg9,
             backup: None,
+            tier_source: None,
             sock: Some(sock9),
             node: None,
             svc: None,

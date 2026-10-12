@@ -169,6 +169,9 @@ pub struct ObsSources {
     /// Snapshot-lifecycle spec §6: `uc2_snapshot_auto_fetch_total{outcome}`,
     /// the SAME allocation the consensus agent bumps.
     pub snapshot_auto_fetch: Arc<crate::auto_fetch::AutoFetchStats>,
+    /// Backup-tier 3b spec §6.6: `uc2_snapshot_fetch_total{source}`, the
+    /// SAME allocation the consensus agent bumps.
+    pub snapshot_fetch_source: Arc<crate::tier::source::FetchSourceStats>,
     /// The `uc2-holdings` probe's cached reading — the free-bytes figure the
     /// auto-fetch space check uses. `uc2_snapshot_wont_fit` is computed from
     /// it with that check's own formula (plan ruling PF11: one sampler).
@@ -276,6 +279,7 @@ impl ObsSources {
             snapshot_row_incomplete: std::array::from_fn(|_| Arc::new(AtomicU64::new(0))),
             snapshot_fetched_position: Arc::new(AtomicU64::new(0)),
             snapshot_auto_fetch: Arc::new(Default::default()),
+            snapshot_fetch_source: Arc::new(Default::default()),
             snapshot_holdings: Arc::new(std::sync::Mutex::new(Default::default())),
             snapshot_freeze: Arc::new(SnapshotFreezeStats::default()),
             crypto_enabled: false,

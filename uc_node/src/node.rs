@@ -1110,8 +1110,10 @@ pub enum FetchRefusal {
 /// receiver agent to run. Kept so a second request does not silently pile up
 /// behind the first, and so the operator's verb becomes re-runnable again
 /// once the fetch has either landed or plainly failed.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 struct PendingFetch {
+    /// The member a PEER fetch asks — and, for a tier fetch, the member the
+    /// fallback asks if the tier copy fails.
     learner: NodeId,
     /// The position asked for; `0` = "the learner's newest", which is why the
     /// completion test below is `stored_set_pos` MOVING rather than reaching
@@ -1125,6 +1127,17 @@ struct PendingFetch {
     /// Snapshot-lifecycle spec §6: issued by auto-fetch (its outcome feeds
     /// `uc2_snapshot_auto_fetch_total`), not by `uc2ctl snapshot fetch`.
     auto: bool,
+    /// Backup-tier 3b spec §6.2: where the set is coming from.
+    source: FetchSource,
+}
+
+/// Backup-tier 3b spec §6.2: a store-only fetch runs as a `uc2-tier-fetch`
+/// copy from this node's tier source, or as a peer session through the
+/// receiver agent.
+#[derive(Debug)]
+enum FetchSource {
+    Tier(crate::tier::source::TierFetch),
+    Peer,
 }
 
 /// How long a `snapshot fetch` stays pending before this node forgets it.
@@ -1313,6 +1326,10 @@ pub struct Node {
     /// Snapshot-lifecycle spec §6: `uc2_snapshot_auto_fetch_total{outcome}`,
     /// bumped by the consensus agent and exported through `ObsSources`.
     auto_fetch_stats: Arc<crate::auto_fetch::AutoFetchStats>,
+    /// `uc2_snapshot_fetch_total{source}` (3b spec §6.6).
+    fetch_source_stats: Arc<crate::tier::source::FetchSourceStats>,
+    /// 3b spec §6.1: the tier source, for its test seams.
+    tier_source: Option<Arc<crate::tier::source::TierSource>>,
     /// Plan ruling P14: the `uc2-holdings` probe's free-space override
     /// ([`Node::set_free_bytes_for_test`]; `0` = the real `statvfs`).
     free_override: Arc<AtomicU64>,
@@ -2097,6 +2114,10 @@ impl Node {
         let (fetch_tx, fetch_rx) = mpsc::sync_channel::<SnapFetch>(1);
         receiver.set_fetch_route(fetch_rx);
         let stored_set_pos = receiver.stored_set_pos();
+        // Ruling PF4: taken after `set_snapshot_intake` above, so the clone
+        // carries the install route too (Task 13's tier install uses it).
+        let intake_signals = receiver.intake_signals();
+        let fetch_source_stats = Arc::new(crate::tier::source::FetchSourceStats::default());
         // Validated frontier, published by the consensus agent and read by the
         // receiver so its AppendPosition reports attest validated bytes only.
         let validated_frontier = Arc::new(AtomicU64::new(durable));
@@ -2610,6 +2631,9 @@ impl Node {
             backup_shared: backup_shared.clone(),
             backup_chunk_bytes: backup.as_ref().map_or(0, |b| b.chunk_bytes),
             tier_source: tier_source_handle.clone(),
+            intake_signals: intake_signals.clone(),
+            tier_declined_position: 0,
+            fetch_source_stats: Arc::clone(&fetch_source_stats),
             backup_hold_released: Arc::clone(&backup_hold_released),
             purge_gate: Arc::clone(&purge_gate),
             effective_gate,
@@ -2840,6 +2864,8 @@ impl Node {
             holdings,
             election_timeout_max_ns: cfg.election_timeout_max_ns,
             auto_fetch_stats,
+            fetch_source_stats,
+            tier_source: tier_source_handle,
             free_override,
             _instance: instance,
             _rings: rings,
@@ -2923,6 +2949,24 @@ impl Node {
     /// counters — `None` when this node runs no writer.
     pub fn backup_writer(&self) -> Option<Arc<crate::tier::writer::WriterShared>> {
         self.backup_writer.clone()
+    }
+
+    /// Backup-tier 3b — TEST SEAM, not API: every later `uc2-tier-fetch`
+    /// thread sleeps `per_artifact` before copying each artifact (default
+    /// 0), so a test can hold a tier copy open. A no-op without a tier
+    /// source.
+    #[doc(hidden)]
+    pub fn set_tier_fetch_delay_for_test(&self, per_artifact: Duration) {
+        if let Some(src) = &self.tier_source {
+            src.set_fetch_delay_for_test(per_artifact);
+        }
+    }
+
+    /// Backup-tier 3b — TEST SEAM, not API: how many `uc2-tier-fetch`
+    /// threads this node has started (0 without a tier source).
+    #[doc(hidden)]
+    pub fn tier_fetches_spawned(&self) -> u64 {
+        self.tier_source.as_ref().map_or(0, |s| s.fetches_spawned())
     }
 
     /// Backup-tier spec §6.2 — TEST SEAM, not API: put `w` into this node's
@@ -3375,6 +3419,7 @@ impl Node {
             snapshot_row_incomplete: self.snapshot_row_incomplete.clone(),
             snapshot_fetched_position: Arc::clone(&self.snapshot_fetched_position),
             snapshot_auto_fetch: Arc::clone(&self.auto_fetch_stats),
+            snapshot_fetch_source: Arc::clone(&self.fetch_source_stats),
             snapshot_holdings: Arc::clone(&self.holdings),
             snapshot_freeze: Arc::clone(&self.snapshot_freeze),
             crypto_enabled: self.crypto.is_some(),
@@ -4051,8 +4096,16 @@ struct Consensus {
     backup_chunk_bytes: u64,
     /// Backup-tier 3b spec §6.1: the read-only tier this node may fetch
     /// snapshot sets from (Tasks 12/13 consume it).
-    #[allow(dead_code)]
     tier_source: Option<Arc<crate::tier::source::TierSource>>,
+    /// Ruling PF4: the receiver's completion signals, which a
+    /// `uc2-tier-fetch` thread raises for a set it copied from the tier.
+    intake_signals: uc_net::receiver::SnapIntakeSignals,
+    /// Ruling RA4: the set position `tier_fetch_declined` was last logged
+    /// for, so a fetch re-issued for the same P names it once.
+    tier_declined_position: u64,
+    /// `uc2_snapshot_fetch_total{source}` — the SAME allocation `/metrics`
+    /// reads.
+    fetch_source_stats: Arc<crate::tier::source::FetchSourceStats>,
     /// `uc2_backup_hold_released_total`: releases, once per episode.
     backup_hold_released: Arc<AtomicU64>,
     /// Backup-tier 3b spec §5.2: the journal-purge gate — `u64::MAX` when
@@ -11696,6 +11749,11 @@ impl Consensus {
     /// The body `start_fetch` always had, minus its learner door: auto-fetch
     /// may pull from any member (plan ruling P1) — the source's sender serves
     /// a `SNAP_REQUEST` whatever its role.
+    ///
+    /// Backup-tier 3b spec §6.2: a node with a tier source tries the tier
+    /// FIRST — a `uc2-tier-fetch` thread copies the set, verified against
+    /// the catalog — and asks `from` only when the tier cannot serve P
+    /// (named once per position, `tier_fetch_declined`).
     fn issue_fetch(&mut self, from: NodeId, position: u64, auto: bool) -> Result<(), FetchRefusal> {
         // Honour `PendingFetch`: one fetch at a time. A second request is
         // answered `retry` rather than quietly replacing a transfer that is
@@ -11707,6 +11765,106 @@ impl Consensus {
         if position > self.cnc.counters().durable.load_acquire() {
             return Err(FetchRefusal::AboveDurable);
         }
+        // `0` names no set ("the learner's newest"): only a peer resolves it.
+        if position != 0
+            && let Some(src) = self.tier_source.clone()
+        {
+            match self.tier_fetch_plan(&src, position) {
+                Ok((label, entry)) => {
+                    let fetch = crate::tier::source::spawn_fetch(
+                        src,
+                        self.snap_root.clone(),
+                        label,
+                        entry,
+                        crate::tier::source::FetchMode::StoreOnly,
+                        self.intake_signals.clone(),
+                    );
+                    self.pending_fetch = Some(PendingFetch {
+                        learner: from,
+                        position,
+                        stored_before: self.stored_set_pos.load(Ordering::Acquire),
+                        deadline_ns: self.pass_now_ns.saturating_add(FETCH_TIMEOUT_NS),
+                        auto,
+                        source: FetchSource::Tier(fetch),
+                    });
+                    crate::obs_event!(
+                        Info,
+                        "snapshot_fetch_requested",
+                        node = self.id as u64,
+                        from = from as u64,
+                        position = position,
+                        actor = if auto { "auto" } else { "operator" },
+                        source = "tier"
+                    );
+                    return Ok(());
+                }
+                Err(reason) => self.note_tier_fetch_declined(position, reason),
+            }
+        }
+        self.issue_fetch_peer(from, position, auto)
+    }
+
+    /// Backup-tier 3b spec §6.2 step 1, once per fetch DECISION (never per
+    /// pass — `registered_through` and the `SET` read are file I/O): can the
+    /// tier serve the agreed set at `position`? `Ok` = its `SET` and the
+    /// catalog entry the copy is verified against (D8); `Err` = the
+    /// `tier_fetch_declined` reason.
+    #[cold]
+    #[inline(never)]
+    fn tier_fetch_plan(
+        &self,
+        src: &crate::tier::source::TierSource,
+        position: u64,
+    ) -> Result<(crate::tier::layout::SetLabel, SetEntry), &'static str> {
+        let Some(through) = src.registered_through(&self.cluster_view.backups()) else {
+            return Err("not_registered");
+        };
+        // Spec §6.1: never read beyond the registered `through`.
+        if position > through {
+            return Err("no_set");
+        }
+        let Some(entry) = self
+            .cluster_view
+            .snapshot_inner()
+            .catalog
+            .into_iter()
+            .find(|e| e.position == position && e.is_agreed())
+        else {
+            // No agreed catalog entry to verify a copy against (D8).
+            return Err("not_agreed");
+        };
+        match crate::tier::chain::read_label(src.target(), position) {
+            Ok(Some(Ok(label))) => Ok((label, entry)),
+            Ok(Some(Err(_))) => Err("lineage"),
+            Ok(None) => Err("no_set"),
+            Err(_) => Err("io"),
+        }
+    }
+
+    /// Ruling RA4: `tier_fetch_declined{position, reason}`, once per set
+    /// position — a fetch re-issued (or re-tried by auto-fetch) for the same
+    /// P does not repeat it.
+    fn note_tier_fetch_declined(&mut self, position: u64, reason: &str) {
+        if self.tier_declined_position == position {
+            return;
+        }
+        self.tier_declined_position = position;
+        crate::obs_event!(
+            Info,
+            "tier_fetch_declined",
+            node = self.id as u64,
+            position = position,
+            reason = reason
+        );
+    }
+
+    /// The peer fetch: hand the pull to the receiver agent.
+    fn issue_fetch_peer(
+        &mut self,
+        from: NodeId,
+        position: u64,
+        auto: bool,
+    ) -> Result<(), FetchRefusal> {
         let Some(&peer) = self.id_to_addr.get(&from) else {
             return Err(FetchRefusal::UnknownPeer);
         };
@@ -11729,6 +11887,7 @@ impl Consensus {
             stored_before: self.stored_set_pos.load(Ordering::Acquire),
             deadline_ns: self.pass_now_ns.saturating_add(FETCH_TIMEOUT_NS),
             auto,
+            source: FetchSource::Peer,
         });
         crate::obs_event!(
             Info,
@@ -11736,7 +11895,8 @@ impl Consensus {
             node = self.id as u64,
             from = from as u64,
             position = position,
-            actor = if auto { "auto" } else { "operator" }
+            actor = if auto { "auto" } else { "operator" },
+            source = "peer"
         );
         Ok(())
     }
@@ -11923,45 +12083,97 @@ impl Consensus {
     /// Costs one predictable branch per pass; the clock is this pass's, never a
     /// fresh reading.
     fn poll_pending_fetch(&mut self) {
-        let Some(p) = self.pending_fetch else {
+        let Some(p) = self.pending_fetch.as_mut() else {
             return;
         };
+        if let FetchSource::Tier(f) = &mut p.source {
+            match f.try_finish() {
+                Some(Ok(_lineage)) => {
+                    let p = self.pending_fetch.take().expect("matched above");
+                    self.fetch_stored(&p, p.position, "tier");
+                }
+                Some(Err(reason)) => {
+                    // Spec §6.2 step 4: what the copy wrote is gone (the
+                    // thread removed it); fall back to the peer AT ONCE.
+                    let p = self.pending_fetch.take().expect("matched above");
+                    self.note_tier_fetch_declined(p.position, &reason);
+                    if self
+                        .issue_fetch_peer(p.learner, p.position, p.auto)
+                        .is_err()
+                        && p.auto
+                    {
+                        self.auto_fetch_stats
+                            .bump(crate::auto_fetch::Outcome::Refused);
+                        self.auto_fetch
+                            .on_result(crate::auto_fetch::Outcome::Refused, self.pass_now_ns);
+                    }
+                }
+                None if self.pass_now_ns > p.deadline_ns => {
+                    // A wedged tier mount: forget the record (the thread is
+                    // detached; should it ever finish, its set is simply
+                    // held — the completeness path needs no record).
+                    let p = self.pending_fetch.take().expect("matched above");
+                    self.fetch_timed_out(&p, false);
+                }
+                None => {}
+            }
+            return;
+        }
         let stored = self.stored_set_pos.load(Ordering::Acquire);
         if stored > p.stored_before {
-            self.pending_fetch = None;
-            if p.auto {
-                self.auto_fetch_stats.bump(crate::auto_fetch::Outcome::Ok);
-                self.auto_fetch
-                    .on_result(crate::auto_fetch::Outcome::Ok, self.pass_now_ns);
-            }
-            crate::obs_event!(
-                Info,
-                "snapshot_fetch_stored",
-                node = self.id as u64,
-                from = p.learner as u64,
-                position = stored
-            );
+            let p = self.pending_fetch.take().expect("matched above");
+            self.fetch_stored(&p, stored, "peer");
         } else if self.pass_now_ns > p.deadline_ns {
-            self.pending_fetch = None;
-            if p.auto {
-                self.auto_fetch_stats
-                    .bump(crate::auto_fetch::Outcome::Timeout);
-                self.auto_fetch
-                    .on_result(crate::auto_fetch::Outcome::Timeout, self.pass_now_ns);
-            } else {
-                // Controller ruling R8 (plan ruling P15): an OPERATOR fetch's
-                // expiry parks the receiver's straggler slot too — auto-fetch
-                // waits out the same 1 s floor before clearing it.
-                self.auto_fetch.note_timeout(self.pass_now_ns);
-            }
-            crate::obs_event!(
-                Warn,
-                "snapshot_fetch_timeout",
-                node = self.id as u64,
-                from = p.learner as u64,
-                position = p.position
-            );
+            let p = self.pending_fetch.take().expect("matched above");
+            self.fetch_timed_out(&p, true);
         }
+    }
+
+    /// A pending fetch landed: count it by source (and as auto-fetch's
+    /// `ok`), and name it.
+    fn fetch_stored(&mut self, p: &PendingFetch, position: u64, source: &str) {
+        let counter = if source == "tier" {
+            &self.fetch_source_stats.tier
+        } else {
+            &self.fetch_source_stats.peer
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+        if p.auto {
+            self.auto_fetch_stats.bump(crate::auto_fetch::Outcome::Ok);
+            self.auto_fetch
+                .on_result(crate::auto_fetch::Outcome::Ok, self.pass_now_ns);
+        }
+        crate::obs_event!(
+            Info,
+            "snapshot_fetch_stored",
+            node = self.id as u64,
+            from = p.learner as u64,
+            position = position,
+            source = source
+        );
+    }
+
+    /// A pending fetch's deadline passed. `peer`: the receiver's arm
+    /// expired too, so an operator fetch parks its straggler slot.
+    fn fetch_timed_out(&mut self, p: &PendingFetch, peer: bool) {
+        if p.auto {
+            self.auto_fetch_stats
+                .bump(crate::auto_fetch::Outcome::Timeout);
+            self.auto_fetch
+                .on_result(crate::auto_fetch::Outcome::Timeout, self.pass_now_ns);
+        } else if peer {
+            // Controller ruling R8 (plan ruling P15): an OPERATOR fetch's
+            // expiry parks the receiver's straggler slot too — auto-fetch
+            // waits out the same 1 s floor before clearing it.
+            self.auto_fetch.note_timeout(self.pass_now_ns);
+        }
+        crate::obs_event!(
+            Warn,
+            "snapshot_fetch_timeout",
+            node = self.id as u64,
+            from = p.learner as u64,
+            position = p.position
+        );
     }
 
     /// Count + name one refused `schedule apply` and build its reply triple.
@@ -15440,6 +15652,12 @@ mod tests {
             cluster_snapshot_dir: dir.path().join("snapshots").join("cluster"),
             pending_fetch: None,
             fetch_tx,
+            intake_signals: uc_net::receiver::SnapIntakeSignals::new(
+                Arc::clone(&stored_set_pos),
+                None,
+            ),
+            tier_declined_position: 0,
+            fetch_source_stats: Arc::new(Default::default()),
             stored_set_pos,
             stored_above_durable: 0,
             stored_set_noted: 0,
@@ -27137,6 +27355,7 @@ mod tests {
             stored_before: 0,
             deadline_ns: 1_000_000,
             auto: true,
+            source: FetchSource::Peer,
         });
         h.cons.stored_set_pos.store(1000, Ordering::Release);
         h.cons.poll_pending_fetch();
@@ -27147,6 +27366,7 @@ mod tests {
             stored_before: 1000,
             deadline_ns: 2_000,
             auto: true,
+            source: FetchSource::Peer,
         });
         h.cons.pass_now_ns = 3_000;
         h.cons.poll_pending_fetch();
@@ -27157,6 +27377,7 @@ mod tests {
             stored_before: 1000,
             deadline_ns: 2_000,
             auto: false,
+            source: FetchSource::Peer,
         });
         h.cons.poll_pending_fetch();
         assert_eq!(
@@ -27224,6 +27445,7 @@ mod tests {
         assert!(
             h.cons
                 .pending_fetch
+                .as_ref()
                 .is_some_and(|p| p.auto && p.position == 1000),
             "after 30 s the fetch proceeds: {:?}",
             h.cons.pending_fetch
@@ -27357,7 +27579,7 @@ mod tests {
             h.cons.maybe_auto_fetch();
             // Let each issued fetch time out, so the next pass tries again.
             while h.fetch_rx.try_recv().is_ok() {}
-            if let Some(p) = h.cons.pending_fetch {
+            if let Some(p) = &h.cons.pending_fetch {
                 h.cons.pass_now_ns = p.deadline_ns + 1;
                 h.cons.poll_pending_fetch();
                 t = h.cons.pass_now_ns;
@@ -27402,7 +27624,7 @@ mod tests {
             h.cons.maybe_auto_fetch();
             t += 10_000_000_000;
         }
-        let from = h.cons.pending_fetch.unwrap().learner;
+        let from = h.cons.pending_fetch.as_ref().unwrap().learner;
         assert_eq!(
             std::fs::read(&path).unwrap(),
             before,
@@ -27533,6 +27755,7 @@ mod tests {
             stored_before: 0,
             deadline_ns: t - 1,
             auto: false,
+            source: FetchSource::Peer,
         });
         h.cons.pass_now_ns = t;
         h.cons.poll_pending_fetch();
@@ -27547,6 +27770,7 @@ mod tests {
         assert!(
             h.cons
                 .pending_fetch
+                .as_ref()
                 .is_some_and(|p| p.auto && p.position == 1000),
             "past the floor: {:?}",
             h.cons.pending_fetch

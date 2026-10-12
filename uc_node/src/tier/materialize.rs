@@ -696,7 +696,7 @@ fn build(
 /// the raw length, the hash (over the payload after the 24-byte envelope for
 /// a row, over the whole image for the cluster artifact), and a row's
 /// envelope position.
-fn copy_artifact(
+pub(crate) fn copy_artifact(
     t: &dyn BackupTarget,
     s: u64,
     path: &str,

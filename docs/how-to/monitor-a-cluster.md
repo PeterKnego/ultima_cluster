@@ -67,7 +67,7 @@ scrape_configs:
 ```
 
 `/metrics` serves `text/plain; version=0.0.4` — standard Prometheus text
-exposition. The full series contract — 145 families — is the
+exposition. The full series contract — 146 families — is the
 `CONTRACT_SERIES` array in
 [`uc_node/src/obs/metrics.rs`](../../uc_node/src/obs/metrics.rs); a test
 pins every family in that array against what the renderer actually emits, so
@@ -453,6 +453,7 @@ view of that same set list:
 | `uc2_snapshot_set_position` | gauge | none | the newest **complete set** this node holds — its purge floor once persisted. `0` until the first one. Agrees on a fully-fetched cluster; on a **learner-only** cluster a voter holds a set only once it has fetched it (`auto_fetch`, on by default, does so in the background), so voters legitimately read lower while a fetch is pending and stay lower with `[settings] auto_fetch = false` — this is not the cluster-wide floor to alert on — that is `uc2_catalog_agreed_position`, below |
 | `uc2_snapshot_fetched_position` | gauge | none | the position of the newest set this node fetched whole from another holder — a voter's automatic fetch or a manual `uc2ctl snapshot fetch` — `0` if it never has |
 | `uc2_snapshot_auto_fetch_total` | counter | `outcome` | background fetches of the newest agreed set: `ok`, `refused`, `timeout`, `no_space`, `no_holder` (snapshot lifecycle). A rising `no_space` means this node cannot hold the newest set — see `Uc2SnapshotWontFit`. Flat at 0 with `[settings] auto_fetch = false`. A node logs `snapshot_fetch_single_reporter` (warn) once for a set that only one node reported |
+| `uc2_snapshot_fetch_total` | counter | `source` | store-only fetches (automatic or `uc2ctl snapshot fetch`) that landed, by where the set came from: `tier` (copied from this node's `[tier_source]` or `[backup]` target, verified against the catalog) or `peer` (a snapshot session, including the fallback after the tier declined — `tier_fetch_declined`) (backup tier 3b) |
 | `uc2_snapshot_newest_agreed_bytes` | gauge | none | the newest agreed set's total size; 0 when none is agreed or its size is unknown (a set catalogued before sizes) |
 | `uc2_snapshot_wont_fit` | gauge | none | `1` when the newest agreed set fails the auto-fetch space check on this node (probe free bytes < size + `max(size / 4, 1 GiB)`), else `0`; `0` while the size, or this node's free bytes (before the probe's first successful `statvfs`), is unknown. Read on every node regardless of `auto_fetch`. Alert: `Uc2SnapshotWontFit` |
 | `uc2_snapshot_row_incomplete_total` | counter | `service`, `row` | instants this row **owed a freeze for** and failed to reach before the next one superseded it. The row whose counter climbs is the row stopping all purging. A superseded standby instant on a voter is not counted — that row is *supposed* not to freeze for one |
@@ -570,7 +571,8 @@ agent names each one in a `snapshot_session_refused` record as it happens.
 | `snapshot_cadence_refused` | warn | `node`, `reason`, `detail` | the `snapshot_interval_bytes` cadence tried to issue an instant and was refused — `48`/`49`, with `detail` naming the row. **Latched**: a cluster with one non-snapshotting row would otherwise emit this every pass, forever |
 | `snapshot_set_retained` | info | `node`, `position`, `removed`, `errors` | the node's retention sweep unlinked `removed` artifacts below the persisted floor at `position`. `errors` non-zero means a file it meant to delete would not go — check permissions and free space |
 | `snapshot_set_held_above_durable` | warn | `node`, `position`, `durable` | a set is on disk at a position above what this node has made durable, so the floor is deliberately **not** moved yet. Transient while the node catches up |
-| `snapshot_fetch_requested` / `snapshot_fetch_stored` | info | `node`, `from`, `position` | a `uc2ctl snapshot fetch` was sent to learner `from`, and later landed. The pair brackets the pull |
+| `snapshot_fetch_requested` / `snapshot_fetch_stored` | info | `node`, `from`, `position`, `source` | a store-only fetch was started and later landed; `source` is `tier` (a copy from the node's tier source) or `peer` (a snapshot session from `from`). The pair brackets the pull |
+| `tier_fetch_declined` | info | `node`, `position`, `reason` | the tier source could not serve the set at `position` and the fetch fell back to a peer: `not_registered` (the tier's id is not in the committed watermark), `no_set` (no `SET` at or below the registered `through`), `not_agreed` (no agreed catalog entry to verify against), `lineage` (a malformed `SET`), `verify` (an artifact disagrees with the catalog), `io`. Once per set position |
 | `snapshot_fetch_timeout` | warn | `node`, `from`, `position` | the pull got no answer inside the 60 s intake deadline. Nothing was stored; re-run the verb |
 | `snapshot_redirect_followed` / `snapshot_redirect_unknown` | info / warn | `node`, `from`, `position` | this joiner was redirected to node `from` for the set at `position` and followed it — or was redirected to a node it does not know, which it dropped. The **sending** side has no record of its own (the redirect leaves `uc_net`, which carries no logging dependency); its witness is the leader's `snap_redirects` counter |
 

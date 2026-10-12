@@ -87,6 +87,8 @@ pub const CONTRACT_SERIES: &[&str] = &[
     // Snapshot-lifecycle spec §6/§7.4: background auto-fetch, the newest
     // agreed set's size, and the one verdict on whether it fits here.
     "uc2_snapshot_auto_fetch_total",
+    // Backup-tier 3b spec §6.6: landed store-only fetches by source.
+    "uc2_snapshot_fetch_total",
     "uc2_snapshot_newest_agreed_bytes",
     "uc2_snapshot_wont_fit",
     // Snapshot-catalog spec §9: the replicated catalog's own gauges.
@@ -1089,6 +1091,22 @@ fn push_service_families(out: &mut String, s: &ObsSources, commit: u64, now: u64
         "counter",
         &auto_fetch_samples,
     );
+    push_labeled(
+        out,
+        "uc2_snapshot_fetch_total",
+        "Store-only snapshot-set fetches (automatic or uc2ctl snapshot fetch) that LANDED on this node, by where the set came from (backup-tier 3b spec §6.2/§6.6): tier (copied from this node's [tier_source] or [backup] target, verified against the catalog) or peer (a snapshot session from another member — including the fallback after the tier declined, named by the tier_fetch_declined log line).",
+        "counter",
+        &[
+            (
+                "source=\"tier\"".to_string(),
+                s.snapshot_fetch_source.tier.load(Ordering::Relaxed),
+            ),
+            (
+                "source=\"peer\"".to_string(),
+                s.snapshot_fetch_source.peer.load(Ordering::Relaxed),
+            ),
+        ],
+    );
     let newest_agreed_bytes = s
         .cluster_view
         .catalog_newest_agreed_bytes
@@ -2066,6 +2084,7 @@ mod tests {
             snapshot_row_incomplete: std::array::from_fn(|_| Arc::new(AtomicU64::new(0))),
             snapshot_fetched_position: Arc::new(AtomicU64::new(0)),
             snapshot_auto_fetch: Arc::new(Default::default()),
+            snapshot_fetch_source: Arc::new(Default::default()),
             snapshot_holdings: Arc::new(std::sync::Mutex::new(Default::default())),
             snapshot_freeze: Arc::new(SnapshotFreezeStats::default()),
             crypto_enabled: false,
@@ -2331,7 +2350,7 @@ mod tests {
     fn the_contract_has_the_number_of_families_the_docs_state() {
         assert_eq!(
             CONTRACT_SERIES.len(),
-            145,
+            146,
             "if this is intentional, update the family count in \
              docs/how-to/monitor-a-cluster.md in the same commit"
         );
@@ -3014,6 +3033,7 @@ mod tests {
             snapshot_row_incomplete: std::array::from_fn(|_| Arc::new(AtomicU64::new(0))),
             snapshot_fetched_position: Arc::new(AtomicU64::new(0)),
             snapshot_auto_fetch: Arc::new(Default::default()),
+            snapshot_fetch_source: Arc::new(Default::default()),
             snapshot_holdings: Arc::new(std::sync::Mutex::new(Default::default())),
             snapshot_freeze: Arc::new(SnapshotFreezeStats::default()),
             crypto_enabled: false,
@@ -3132,6 +3152,7 @@ mod tests {
             snapshot_row_incomplete: std::array::from_fn(|_| Arc::new(AtomicU64::new(0))),
             snapshot_fetched_position: Arc::new(AtomicU64::new(0)),
             snapshot_auto_fetch: Arc::new(Default::default()),
+            snapshot_fetch_source: Arc::new(Default::default()),
             snapshot_holdings: Arc::new(std::sync::Mutex::new(Default::default())),
             snapshot_freeze: Arc::new(SnapshotFreezeStats::default()),
             crypto_enabled: false,
@@ -3243,6 +3264,7 @@ mod tests {
             snapshot_row_incomplete: std::array::from_fn(|_| Arc::new(AtomicU64::new(0))),
             snapshot_fetched_position: Arc::new(AtomicU64::new(0)),
             snapshot_auto_fetch: Arc::new(Default::default()),
+            snapshot_fetch_source: Arc::new(Default::default()),
             snapshot_holdings: Arc::new(std::sync::Mutex::new(Default::default())),
             snapshot_freeze: Arc::new(SnapshotFreezeStats::default()),
             crypto_enabled: false,
