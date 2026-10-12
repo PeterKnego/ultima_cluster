@@ -179,6 +179,9 @@ pub struct InvariantChecker {
     /// inv10 (M14b): per-node last outgoing durable report, reset to 0 at every
     /// legitimate report discontinuity (see [`InvariantChecker::on_report_reset`]).
     last_report: Vec<u64>,
+    /// inv14 (backup tier 3b): per-node log end `Q` of the set the node was
+    /// seeded from (0 = never seeded). A seeded node is never cut below it.
+    pub seeded_floor: Vec<u64>,
 }
 
 impl InvariantChecker {
@@ -193,6 +196,7 @@ impl InvariantChecker {
             committed_hw: vec![0; n],
             last_commit: vec![0; n],
             last_report: vec![0; n],
+            seeded_floor: vec![0; n],
         }
     }
 
@@ -568,6 +572,20 @@ impl InvariantChecker {
         step: u64,
     ) -> Result<(), InvariantViolation> {
         let i = node as usize;
+        // Invariant 14 — seeded lineage: a node restored from a set with its
+        // log to `q` carries the cluster's committed map truncated at `q`, so
+        // no reconcile may cut it below `q`. Checked before inv4 so a seeded
+        // cut is named by the sharper invariant.
+        if self.seeded_floor[i] > 0 && to < self.seeded_floor[i] {
+            return Err(self.viol(
+                "seeded lineage (inv14)",
+                step,
+                format!(
+                    "node {node} seeded from a set with log to {} was cut to {to} by leader map {leader:?} against own {own_before:?}",
+                    self.seeded_floor[i]
+                ),
+            ));
+        }
         // Invariant 4 — committed-never-truncated (per node): never below what
         // this node itself has certified as committed.
         if to < self.committed_hw[i] {
@@ -977,6 +995,22 @@ mod tests {
     /// A genesis config with the given node ids as voters (synthetic addrs).
     fn gcfg(voters: &[NodeId]) -> ClusterConfig {
         ClusterConfig::genesis(voters.iter().map(|&v| (v, (v, 1))).collect(), Vec::new())
+    }
+
+    #[test]
+    fn inv14_catches_a_seeded_node_cut_below_its_log_end() {
+        let mut c = InvariantChecker::new(1, 3);
+        c.seeded_floor[1] = 1000;
+        let own = vec![(1, 0), (2, 600)];
+        let leader = vec![(1, 0), (3, 500)];
+        let err = c.on_truncate(1, 500, &own, &leader, 7).unwrap_err();
+        assert_eq!(err.invariant, "seeded lineage (inv14)", "{err}");
+        // At or above the floor, and on an unseeded node, it is not inv14.
+        assert!(
+            c.on_truncate(1, 1000, &own, &[(1, 0), (3, 1000)], 7)
+                .is_ok()
+        );
+        assert!(c.on_truncate(0, 500, &own, &leader, 7).is_ok());
     }
 
     #[test]

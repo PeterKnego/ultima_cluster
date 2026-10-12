@@ -58,7 +58,7 @@ fn nasty_reconcile_config(seed: u64) -> SimConfig {
         // A long run: the C-1 phantom needs a divergent ex-leader's large raw
         // durable to persist in a live leader's CommitTracker while a third node
         // lags — that alignment takes churn to build up.
-        max_steps: 40_000,
+        max_steps: 60_000,
         // High loss + duplication drives leader churn (→ divergent tails →
         // truncations) and, crucially, the DUPLICATE term map that lands
         // mid-truncation — the C-1 trigger. Crash rate is kept modest: past
@@ -257,7 +257,7 @@ fn raw_m3_data_plane_phantom_commit_is_caught() {
     });
     w.run_until_leader().expect("setup: elect first leader");
     let x = w.current_leader().unwrap(); // term-1 leader = future divergent ex-leader X
-    w.run_steps(300)
+    w.run_steps(500)
         .expect("setup: commit a genuine prefix on all three");
     let others: Vec<usize> = (0..3).filter(|&i| i != x).collect();
     let (a, b) = (others[0], others[1]);
@@ -272,12 +272,12 @@ fn raw_m3_data_plane_phantom_commit_is_caught() {
     );
     let l = w.current_leader().unwrap(); // the new higher-term leader L
     let g = if l == a { b } else { a }; // the third node = lagging follower G
-    w.run_steps(300)
+    w.run_steps(500)
         .expect("setup: L commits with G past the old prefix");
     // Now cut L off from G: G lags (frozen), and L keeps appending its own term's
     // bytes (own durable runs ahead, but commit stalls — no quorum).
     w.partition(l, g);
-    w.run_steps(300)
+    w.run_steps(500)
         .expect("setup: L's own log runs ahead of the stalled commit");
     // Partially heal: reconnect ONLY X <-> L. Under RawM3 X raw-reports its
     // divergent durable to L before reconciliation repairs it; L ranks that report
@@ -380,7 +380,7 @@ fn idle_cluster_reconciles_divergent_node_via_gossip_floor() {
     });
     w.run_until_leader().expect("setup: elect first leader");
     let old = w.current_leader().unwrap();
-    w.run_steps(300)
+    w.run_steps(500)
         .expect("setup: genuine committed prefix on all three");
 
     // Isolate the term-1 leader: it keeps appending an uncommitted divergent
@@ -630,6 +630,67 @@ fn run_storm_with_instants(w: &mut World, budget: u64) -> Result<usize, Invarian
     Ok(w.instants().len())
 }
 
+/// `run_storm_with_instants` minus its closing `w.run()`: that drain spends the
+/// world's whole `max_steps` budget (steps are global), so a scenario that
+/// interleaves storms with crashes and seedings must not call it.
+fn storm_steps(w: &mut World, budget: u64) -> Result<(), InvariantViolation> {
+    for _ in 0..(budget / STORM_INSTANT_STEPS) {
+        if let Some(l) = w.current_leader() {
+            w.command_snapshot(l, false);
+        }
+        w.run_steps(STORM_INSTANT_STEPS)?;
+    }
+    Ok(())
+}
+
+/// Seed a crashed node from a (modelled) set the way `materialize` would, then
+/// restart it. Returns whether a seeding happened.
+fn seed_and_restart(w: &mut World, victim: usize) -> bool {
+    if let Err(v) = w.run_until_leader() {
+        panic!("waiting for a leader before seeding node {victim}: {v}");
+    }
+    let Some(l) = w.current_leader() else {
+        let _ = w.restart(victim);
+        return false;
+    };
+    let commit = w.node_commit_high_water(l);
+    let q = commit / 2 + commit / 4;
+    let s = q / 2;
+    let ok = q > s + 1 && w.seed_from_set(victim, s, q);
+    if let Err(v) = w.restart(victim) {
+        panic!("restart of seeded node {victim}: {v}");
+    }
+    ok
+}
+
+#[test]
+fn inv14_a_set_seeded_node_is_never_cut_below_its_log_end() {
+    let mut w = World::new(SimConfig {
+        n_nodes: 3,
+        seed: 14,
+        max_steps: 1_000_000,
+        drop_per_million: 20_000,
+        dup_per_million: 5_000,
+        ..SimConfig::default()
+    });
+    w.run_until_leader().expect("first leader");
+    let mut seeded = 0u32;
+    for round in 0..40 {
+        storm_steps(&mut w, 1_000).expect("storm");
+        if round % 4 == 3 {
+            let victim = (round / 4) % 3;
+            w.crash(victim);
+            storm_steps(&mut w, 500).expect("storm while down");
+            if seed_and_restart(&mut w, victim) {
+                seeded += 1;
+            }
+        }
+    }
+    assert!(seeded >= 5, "non-vacuity: {seeded} seedings");
+    assert!(w.seeded_checks() > 0);
+    assert_eq!(w.wipes(), 0, "a seeded node never wiped");
+}
+
 #[test]
 fn fuzz_default_seeds() {
     // Every arm below commands instants (`run_storm_with_instants`): inv11 is
@@ -703,6 +764,40 @@ fn fuzz_default_seeds() {
         }
         sets += (0..3).map(|i| w.complete_sets(i).len()).sum::<usize>();
     }
+    // Fourth arm: a crashed node is re-seeded from a modelled set (the backup
+    // tier's `materialize`) every 2 000 steps — inv14 must hold under the
+    // storm's drops, dups and leader churn.
+    let mut seeded = 0u32;
+    for seed in 0..50u64 {
+        let mut w = World::new(SimConfig {
+            n_nodes: 3,
+            seed,
+            max_steps: 60_000,
+            drop_per_million: 20_000,
+            dup_per_million: 5_000,
+            ..SimConfig::default()
+        });
+        if let Err(v) = w.run_until_leader() {
+            panic!("seed {seed} (seeded, boot): {v}");
+        }
+        for round in 0..10usize {
+            if let Err(v) = storm_steps(&mut w, 2_000) {
+                panic!("seed {seed} (seeded): {v}");
+            }
+            let victim = (seed as usize + round) % 3;
+            w.crash(victim);
+            if let Err(v) = w.run_steps(500) {
+                panic!("seed {seed} (seeded, down): {v}");
+            }
+            if seed_and_restart(&mut w, victim) {
+                seeded += 1;
+            }
+        }
+        if let Err(v) = w.run() {
+            panic!("seed {seed} (seeded, drain): {v}");
+        }
+    }
+    assert!(seeded > 100, "the seeded arm must seed ({seeded} seedings)");
     // A capped node's applied frontier is what the ceiling clamps, so the
     // third arm is also the one where a node lags instants its peers complete
     // — inv11's non-prefix shape, arrived at by the storm rather than by a
@@ -742,6 +837,39 @@ fn fuzz_heavy_seeds() {
         instants > 20_000,
         "the heavy tier must actually command instants ({instants} over 1000 runs)"
     );
+    // Seeded arm: a crashed node re-seeded from a modelled set (inv14).
+    let mut seeded = 0u32;
+    for seed in 0..1000u64 {
+        let n = if seed % 4 == 0 { 5 } else { 3 };
+        let mut w = World::new(SimConfig {
+            n_nodes: n,
+            seed,
+            max_steps: 60_000,
+            drop_per_million: 50_000,
+            dup_per_million: 10_000,
+            ..SimConfig::default()
+        });
+        if let Err(v) = w.run_until_leader() {
+            panic!("seed {seed} (heavy seeded, boot): {v}");
+        }
+        for round in 0..10usize {
+            if let Err(v) = storm_steps(&mut w, 2_000) {
+                panic!("seed {seed} (heavy seeded): {v}");
+            }
+            let victim = (seed as usize + round) % n;
+            w.crash(victim);
+            if let Err(v) = w.run_steps(500) {
+                panic!("seed {seed} (heavy seeded, down): {v}");
+            }
+            if seed_and_restart(&mut w, victim) {
+                seeded += 1;
+            }
+        }
+        if let Err(v) = w.run() {
+            panic!("seed {seed} (heavy seeded, drain): {v}");
+        }
+    }
+    assert!(seeded > 2_000, "heavy seeded arm must seed ({seeded})");
     // The 1000-seed storm against the REAL intake-gate mechanism (guarded, as the
     // node ships it). ADDED alongside the Gated tier above — Mechanism is the
     // discipline the node actually runs, so it gets its own heavy fuzz.
@@ -848,7 +976,7 @@ fn add_promote_demote_remove_cycle_under_faults() {
         ..SimConfig::default()
     });
     w.run_until_leader().expect("elect");
-    w.run_steps(300).expect("a genuine committed prefix");
+    w.run_steps(500).expect("a genuine committed prefix");
 
     // add-learner (a fresh id joins as learner; id 7 has no process behind it —
     // the config pipeline neither knows nor cares).
@@ -973,7 +1101,7 @@ fn second_learner_admitted_after_prior_config_history_converges() {
     });
     w.run_until_leader()
         .expect("elect among the 3 genesis voters");
-    w.run_steps(300).expect("a genuine committed prefix");
+    w.run_steps(500).expect("a genuine committed prefix");
 
     // v1: admit node 3 as a learner. It must not halt (it is being ADDED,
     // not removed) — and node 4 (still entirely genesis-absent) must be
@@ -1148,7 +1276,7 @@ fn leader_self_removal_steps_down_after_commit_and_c_new_elects() {
     });
     w.run_until_leader().expect("elect L1");
     let l1 = w.current_leader().unwrap();
-    w.run_steps(300).expect("a genuine committed prefix");
+    w.run_steps(500).expect("a genuine committed prefix");
 
     assert_eq!(
         propose_ok(&mut w, ConfigOp::RemoveVoter { id: l1 as u32 }),
@@ -1203,7 +1331,7 @@ fn truncation_below_config_frame_reverts() {
     });
     w.run_until_leader().expect("elect L1");
     let l1 = w.current_leader().unwrap();
-    w.run_steps(300)
+    w.run_steps(500)
         .expect("a genuine committed prefix on all three");
     // Isolate the leader FIRST, then propose: the frame lands ONLY in its own
     // stream — an uncommitted config on a soon-divergent lineage.
@@ -1293,7 +1421,7 @@ fn counterfactual_no_revert_breaks_inv8() {
     });
     w.run_until_leader().expect("elect L1");
     let l1 = w.current_leader().unwrap();
-    w.run_steps(300).expect("a genuine committed prefix");
+    w.run_steps(500).expect("a genuine committed prefix");
     w.partition_node(l1);
     assert_eq!(
         w.propose_config(
@@ -1357,7 +1485,7 @@ fn stage_config_observation_under_the_latch(hold: bool) -> (World, usize, u64) {
     });
     w.run_until_leader().expect("elect L1");
     let l1 = w.current_leader().unwrap();
-    w.run_steps(300).expect("a committed prefix");
+    w.run_steps(500).expect("a committed prefix");
     let f = (0..N).find(|&i| i != l1).unwrap();
     let others: Vec<usize> = (0..N).filter(|&i| i != l1 && i != f).collect();
     // No data frames from here on: the only bytes past the prefix are P and,
@@ -1529,7 +1657,7 @@ fn counterfactual_no_serving_gate_produces_disjoint_quorum_commit() {
                 break;
             }
             Err(ProposeError::NotCaughtUp { .. }) => {
-                w.run_steps(300).expect("learner catches up");
+                w.run_steps(500).expect("learner catches up");
             }
             Err(e) => panic!("unexpected refusal: {e:?}"),
         }
@@ -1782,7 +1910,7 @@ fn rebooted_unreconciled_voter_must_not_certify_phantom_commit() {
     w.run_until_leader()
         .expect("setup: elect the term-1 leader");
     let v = w.current_leader().unwrap();
-    w.run_steps(300)
+    w.run_steps(500)
         .expect("setup: genuine committed prefix on all three");
     let others: Vec<usize> = (0..3).filter(|&i| i != v).collect();
     let (a, b) = (others[0], others[1]);
@@ -1799,7 +1927,7 @@ fn rebooted_unreconciled_voter_must_not_certify_phantom_commit() {
     );
     let l2 = w.current_leader().unwrap();
     let f = if l2 == a { b } else { a };
-    w.run_steps(300)
+    w.run_steps(500)
         .expect("setup: term-2 commits past the old prefix; V's tail grows");
 
     // Phase 3: cut L2 from F and open V<->F. F times out and campaigns; V
@@ -2083,7 +2211,7 @@ fn old_term_range_must_not_commit_before_new_term_quorum() {
 /// world is not itself an invariant breach and the caller asserts on the count.
 fn churn_membership(w: &mut World, rounds: usize) -> Result<u64, InvariantViolation> {
     w.run_until_leader()?;
-    w.run_steps(300)?; // a genuine committed prefix before the first frame
+    w.run_steps(500)?; // a genuine committed prefix before the first frame
     let mut appended = 0u64;
     for round in 0..rounds {
         // A FRESH id each round: removing a learner tombstones its id
@@ -2280,7 +2408,7 @@ fn drive_to_candidate_lagged(seed: u64, handle_keyed: bool) -> Option<(World, us
     });
     w.run_until_leader().ok()?;
     let l1 = w.current_leader()?;
-    w.run_steps(300).ok()?;
+    w.run_steps(500).ok()?;
     let others: Vec<usize> = (0..3).filter(|&i| i != l1).collect();
     let (a, b) = (others[0], others[1]);
     w.partition(l1, a);
@@ -2289,7 +2417,7 @@ fn drive_to_candidate_lagged(seed: u64, handle_keyed: bool) -> Option<(World, us
         .ok()?;
     let l2 = w.current_leader()?;
     let f = if l2 == a { b } else { a };
-    w.run_steps(300).ok()?;
+    w.run_steps(500).ok()?;
     w.partition(l2, f);
     w.unpartition(l1, f);
     // Step finely; the instant f is a closed-gate follower at term >= 3, isolate
