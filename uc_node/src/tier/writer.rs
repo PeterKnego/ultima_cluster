@@ -169,6 +169,11 @@ pub struct WriterStats {
     /// Journal chunks this writer's retention deleted from the tier.
     pub chunks_deleted: AtomicU64,
     errors: [AtomicU64; WriterError::ALL.len()],
+    /// Read-backs performed (objects re-read through the target). Wiring
+    /// seam: a restarted writer must not re-read what the committed entry
+    /// covers.
+    #[doc(hidden)]
+    pub readbacks_total: AtomicU64,
 }
 
 impl WriterStats {
@@ -213,15 +218,14 @@ pub struct WriterShared {
     /// after every `store_term_map`. Empty until the first publish (boot).
     /// The writer derives each set's lineage from it ([`lineage_below`]).
     pub term_map: Mutex<Vec<(u32, u64)>>,
-    /// The committed watermark entry for THIS writer's tier, published by
-    /// the consensus agent beside `term_map` (`publish_backup_confirmed`,
-    /// on every cluster-view move). `None` until the cluster has committed a
-    /// report for the tier. Objects the entry already covers (chunk `to <=
-    /// through`, set `position <= newest_set`) are not re-read (RA2).
-    pub confirmed: Mutex<Option<BackupTierEntry>>,
-    /// The tier's id as the writer learned it from `open_or_create_tier`
-    /// (`0` = not yet): how the node selects the committed entry.
-    pub tier_id: AtomicU64,
+    /// Every committed tier watermark entry (at most `MAX_BACKUP_TIERS`),
+    /// published unfiltered by the consensus agent beside `term_map` on each
+    /// cluster-view move (`publish_backup_confirmed`). The writer selects its
+    /// own tier's entry by the `tier_id` it learned from the target, at use,
+    /// so a restarted writer trusts the committed entry on its very first
+    /// refresh. Objects the entry covers (chunk `to <= through`, set
+    /// `position <= newest_set`) are not re-read (RA2).
+    pub confirmed_all: Mutex<Vec<BackupTierEntry>>,
 }
 
 /// What [`readback`] re-reads.
@@ -329,6 +333,7 @@ impl Verifier {
         if !force && self.verified.contains(&key) {
             return true;
         }
+        stats.readbacks_total.fetch_add(1, Ordering::Relaxed);
         match readback(t, obj) {
             Ok(()) => {
                 self.suspect.remove(&key);
@@ -582,6 +587,10 @@ pub struct Writer {
     /// `wm` above stays the placement view, so the writer never re-cuts over
     /// a persistently bad object.
     report_wm: Option<(u64, u64, u64)>,
+    /// Positions of the sets in the last verified listing: retention's
+    /// candidates (an unverified set is the operator's, never a reason to
+    /// delete a verified one).
+    verified_sets: BTreeSet<u64>,
 }
 
 fn journal_err(e: impl std::fmt::Display) -> TierError {
@@ -1101,6 +1110,7 @@ impl Writer {
             deferrals: Deferrals::default(),
             verifier: Verifier::default(),
             report_wm: None,
+            verified_sets: BTreeSet::new(),
         }
     }
 
@@ -1253,7 +1263,6 @@ impl Writer {
                 target = self.cfg.target.display().to_string().as_str(),
                 tier_id = info.tier_id
             );
-            self.shared.tier_id.store(info.tier_id, Ordering::Release);
             self.tier = Some(info);
             self.last_cut_ns.get_or_insert(now_ns);
         }
@@ -1302,6 +1311,7 @@ impl Writer {
             &inner,
             consumed,
             TMP_MAX_AGE,
+            Some(&self.verified_sets),
             &mut done,
         );
         let stats = &self.shared.stats;
@@ -1348,11 +1358,15 @@ impl Writer {
         // Ruling PF2 (as amended): the REPORT and the purge cap see only
         // objects that were confirmed or re-read; placement keeps the raw
         // listing.
-        let confirmed = *self
+        let tier_id = self.tier.as_ref().map_or(0, |t| t.tier_id);
+        let confirmed = self
             .shared
-            .confirmed
+            .confirmed_all
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .find(|e| e.tier_id == tier_id)
+            .copied();
         let ver = self.verifier.verified_listing(
             &*self.target,
             &self.shared.stats,
@@ -1361,6 +1375,7 @@ impl Writer {
             confirmed.as_ref(),
         );
         self.report_wm = watermark_of(&ver);
+        self.verified_sets = ver.sets.iter().map(|s| s.position).collect();
         self.listing = Some(l);
         // Ruling RF2: the purge cap is the fillable chain end while a gap
         // below `through` exists, else `through`.
@@ -2720,5 +2735,75 @@ mod tests {
         let n = spy.total_opens();
         v.verified_listing(&spy, &stats, 1, &raw, None);
         assert_eq!(spy.total_opens(), n);
+    }
+
+    /// Wiring (round 1, finding 1): a writer built over a tier the cluster
+    /// has already committed an entry for does not re-read the covered
+    /// objects on its FIRST refresh — the entries are published unfiltered
+    /// and selected by the tier id the writer learns when it opens the tier.
+    #[test]
+    fn a_restarted_writer_trusts_the_committed_entry_on_its_first_refresh() {
+        use crate::cluster_fsm::{ClusterState, ClusterView};
+        let run = |entries: &dyn Fn(u64) -> Vec<BackupTierEntry>| -> (u64, u64, u64) {
+            let d = tempdir();
+            let (spy, _) = tier_fixture(d.path());
+            let info = crate::tier::target::open_or_create_tier(&spy, "app", 1).unwrap();
+            let mut st = ClusterState::genesis_empty();
+            st.backups = entries(info.tier_id);
+            let view = Arc::new(ClusterView::new(&st));
+            view.publish(&st);
+            let shared = Arc::new(WriterShared::default());
+            *shared.confirmed_all.lock().unwrap() = view.backups();
+            let cnc = CncPage::heap(&uc_log::cnc::CncMeta {
+                node_id: 1,
+                instance_id: 0,
+                app_id: "app".into(),
+                buffer_bytes: 1 << 16,
+                max_payload: 4096,
+                services: std::array::from_fn(|_| None),
+            });
+            let cfg = BackupConfig {
+                target: d.path().join("tier"),
+                ..BackupConfig::default()
+            };
+            let mut w = Writer::new(
+                cfg,
+                "app".into(),
+                1,
+                d.path().join("inst"),
+                Arc::new(journal_with(d.path(), &[])),
+                cnc,
+                Arc::new(AtomicU64::new(0)),
+                view,
+                Arc::new(Mutex::new(None)),
+                Arc::clone(&shared),
+                Box::new(spy),
+            );
+            w.step(1);
+            (
+                shared.stats.readbacks_total.load(Ordering::Relaxed),
+                shared.stats.errors(WriterError::Readback),
+                shared.progress.load(Ordering::Relaxed),
+            )
+        };
+        let (reads, errs, progress) = run(&|id| {
+            vec![
+                BackupTierEntry {
+                    tier_id: id ^ 1,
+                    ..entry(0, 0)
+                },
+                BackupTierEntry {
+                    tier_id: id,
+                    ..entry(256, 128)
+                },
+            ]
+        });
+        assert_eq!((reads, errs, progress), (0, 0, 256), "covered: no re-read");
+        let (reads, errs, progress) = run(&|_| Vec::new());
+        assert_eq!(
+            (reads, errs, progress),
+            (4, 0, 256),
+            "no entry: row, cluster, two chunks"
+        );
     }
 }

@@ -5816,19 +5816,18 @@ impl Consensus {
         }
     }
 
-    /// Backup-tier 3b (RA2): publish the committed watermark entry for the
-    /// writer's own tier, so the writer skips re-reading what the cluster
-    /// already confirmed. Called from [`Self::refresh_from_view`] on every
-    /// cluster-view move (one `Copy` entry under the lock). Until the writer
-    /// has learned its `tier_id`, or while the cluster has committed nothing
-    /// for it, `None` is published and the writer re-reads conservatively.
+    /// Backup-tier 3b (RA2): publish ALL committed tier watermark entries
+    /// (at most `MAX_BACKUP_TIERS`) to the writer, unfiltered: the writer
+    /// selects its own tier's entry by the id it learns from the target, so
+    /// a restarted writer trusts the committed entry on its first refresh
+    /// (no ordering against tier-id discovery). Called from
+    /// [`Self::refresh_from_view`] on every cluster-view move.
     fn publish_backup_confirmed(&self, backups: &[uc_protocol::v2::backup::BackupTierEntry]) {
         if let Some(shared) = &self.backup_shared {
-            let id = shared.tier_id.load(Ordering::Acquire);
-            let entry = (id != 0)
-                .then(|| backups.iter().find(|b| b.tier_id == id).copied())
-                .flatten();
-            *shared.confirmed.lock().unwrap_or_else(|e| e.into_inner()) = entry;
+            *shared
+                .confirmed_all
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = backups.to_vec();
         }
     }
 
