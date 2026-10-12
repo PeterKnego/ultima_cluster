@@ -78,11 +78,16 @@ Three things are still missing:
 lineage=<t1>:<b1>,<t2>:<b2>,…,<tn>:<bn>
 ```
 
-the writer's term map entries with `base ≤ S` at the time it writes the set,
-ascending, `term` and `base` in decimal. The last entry is the term that
-covers S. Every entry is at or below S ≤ the writer's commit, so it describes
-committed bytes: a data-stamped entry below commit is the cluster's real
-history (the reconcile module's safety contract), never a guess. The writer's
+the writer's term map entries with `base < S` (strictly) at the time it
+writes the set, ascending, `term` and `base` in decimal. The last entry is the
+term that covers the bytes just below S. Every entry starts strictly below
+S ≤ the writer's commit, so it describes committed bytes: a data-stamped entry
+below commit is the cluster's real history (the reconcile module's safety
+contract), never a guess. An entry AT S is excluded on purpose: the bytes at S
+are the first bytes of the chain after the set, not the set, and a term opened
+exactly at S may not be committed when the writer copies the set (a new
+leader's opening frame landing on the instant). Restore derives a term that
+starts at S from the chain's frame headers (§4.2) like any later one. The writer's
 map is its full map, not the 64-entry wire window, so the line can hold every
 term in the cluster's life; there is no cap.
 
@@ -95,7 +100,9 @@ A set whose `SET` has no `lineage` line is refused by every 3b reader
 `materialize` (3a §8.1 step 5) writes `term_map.state` as the `SET`'s
 lineage followed by the terms derived from the frame headers in `[S, Q)`
 whose term is above the lineage's last — instead of 3a's map derived from
-`[S, Q)` alone. Boot's `rederive_term_map` then has nothing to add. Every
+`[S, Q)` alone. The derivation is seeded with the lineage's last term, so the
+term covering S is never re-stamped at S (3a's R12a shape); a term that opens
+exactly at S is a higher term in the first frame and gets its entry `(t, S)`. Boot's `rederive_term_map` then has nothing to add. Every
 mode uses it: whole-cluster restore, `--new-node`, fork and corpus export.
 
 ### 4.3 `--new-node`
@@ -115,6 +122,9 @@ test.
 - Unit: `materialize`'s `term_map.state` equals a live node's map truncated
   to Q, for a history with several terms below S and one in `[S, Q)`.
 - Unit: a `SET` without `lineage` is refused by name.
+- Unit: a writer whose map has a term opening exactly at S records the
+  lineage without it, and restore derives `(t, S)` from the chain; a `SET`
+  whose lineage's last base is `≥ S` is refused (`set_lineage_malformed`).
 - E2E (the un-ignored test): restore `--new-node` from a tier of a live
   3-node cluster under load, `add-learner`, assert the node keeps its log
   (no truncation below Q, its `journal_first` stays S) and reaches commit.
@@ -149,8 +159,16 @@ holds purge back further.
 
 ### 5.3 The writer's read-back
 
-Before the writer includes an object in a report (3a §5.5), it reopens it
-through the target and checks it: every block's CRC and the header CRC over
+Every object a writer creates is reopened through the target and checked
+before it counts. An object a writer finds already in place — another
+writer's, or its own from before a restart — is checked once too, unless the
+cluster's committed watermark entry for the tier already covers it (a chunk
+ending at or below `through`, a set at or below `newest_set`): those were
+checked by the writer that created them. So a restart or a second writer never
+re-reads the tier's history, while anything written just before a crash is
+checked when the writer comes back. (Residual: a creator that crashes between
+writing a set below `newest_set` and checking it leaves that one set
+unchecked; `tier verify` covers it.) The check: every block's CRC and the header CRC over
 the raw bytes; for a chunk, the frame walk over `[from, to)`; for an
 artifact, its raw hash against the `SET`'s agreed hash. Only objects that
 pass advance the reported chain. A failure leaves the report where it was,
@@ -218,13 +236,17 @@ tries the tier first. For an agreed set P in the catalog:
 
 1. The tier has `sets/<P>/SET` (P ≤ the registered `through`).
 2. Copy every artifact into `snapshots/<row>/` and `snapshots/cluster/`
-   through the same temp-file-and-rename path a peer fetch uses, so a service
-   never sees a half-written artifact.
+   through a temp file and a rename, as a peer fetch does, so a service never
+   sees a half-written artifact. The tier copy's temp names are its own
+   (`incoming-<P>.tier.part`), so a peer session for the same P that the leader
+   opens after giving up on the tier never shares a file with it; both are
+   verified against the same catalog hash, so whichever renames last leaves
+   the same bytes.
 3. Verify each artifact's raw hash against the **catalog's** agreed hash for
    P (D8), and the `SET`'s versions against the catalog's.
 4. Any failure — no such set, an unreadable object, a mismatch — deletes what
    step 2 wrote and falls back to the peer fetch at once, logging
-   `tier_fetch_declined` with the reason.
+   `tier_fetch_declined` with the reason, once per set position.
 
 Success is the ordinary completeness path: the set is held, reported and
 counted like a peer-fetched one.
