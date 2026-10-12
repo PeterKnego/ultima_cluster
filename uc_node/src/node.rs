@@ -424,6 +424,16 @@ const HOLDINGS_PROBE_NS: u64 = 1_000_000_000;
 /// reports can each contribute what they know (one the furthest chain, the
 /// other a set copied late). `reporter` follows the report that leads on
 /// `(through, newest_set)`.
+/// Archive-side defensive purge clamp: the writer's cap (`None` = no hold or
+/// released) and the EFFECTIVE gate (`u64::MAX` = no gate, K = 0, or released
+/// for low space — set by `Consensus::purge_gate`). A command sent before a
+/// re-arm must not cut past either; a released hold must not be re-imposed.
+fn clamp_purge_below(below: u64, writer_cap: Option<u64>, effective_gate: u64) -> u64 {
+    below
+        .min(writer_cap.unwrap_or(u64::MAX))
+        .min(effective_gate)
+}
+
 fn coalesce_backup_report(held: &mut BackupWatermark, w: &BackupWatermark) {
     if (w.through, w.newest_set) > (held.through, held.newest_set) {
         held.reporter = w.reporter;
@@ -2076,7 +2086,8 @@ impl Node {
         let purge_gate = Arc::new(AtomicU64::new(u64::MAX));
         let backup_gate_released = Arc::new(AtomicU64::new(0));
         let backup_gate_released_level = Arc::new(AtomicBool::new(false));
-        let arc_gate = Arc::clone(&purge_gate);
+        let effective_gate = Arc::new(AtomicU64::new(u64::MAX));
+        let arc_gate = Arc::clone(&effective_gate);
         // Forensic trace for the 2026-08-16 acked-write-loss hunt: every journal
         // cut is rare (elections only), so an env-gated line per cut is free.
         let trunc_trace = std::env::var("UC2_TRUNC_TRACE").is_ok();
@@ -2233,13 +2244,11 @@ impl Node {
                         // cap is a pure read of the writer's shared state
                         // (the release decision stays with consensus), so
                         // no second copy of the space rule lives here.
-                        let below = match arc_backup.as_deref().and_then(|b| b.purge_cap()) {
-                            Some(cap) => below.min(cap),
-                            None => below,
-                        };
-                        // Backup-tier 3b: the K-th tier's gate, defensively
-                        // (`u64::MAX` = none; consensus drops it on release).
-                        let below = below.min(arc_gate.load(Ordering::Acquire));
+                        let below = clamp_purge_below(
+                            below,
+                            arc_backup.as_deref().and_then(|b| b.purge_cap()),
+                            arc_gate.load(Ordering::Acquire),
+                        );
                         // Best-effort: a failed purge logs + drops (retries next
                         // interval). Correctness never depends on a block still
                         // being present — a reader below the floor recovers via
@@ -2566,6 +2575,7 @@ impl Node {
             backup_chunk_bytes: backup.as_ref().map_or(0, |b| b.chunk_bytes),
             backup_hold_released: Arc::clone(&backup_hold_released),
             purge_gate: Arc::clone(&purge_gate),
+            effective_gate,
             backup_gate_released: Arc::clone(&backup_gate_released),
             backup_gate_released_level: Arc::clone(&backup_gate_released_level),
             gate_released: false,
@@ -4009,6 +4019,10 @@ struct Consensus {
     /// on every node (purge on or off) so the gauge reads; the archive agent
     /// holds the SAME `Arc` and clamps a `Purge` to it.
     purge_gate: Arc<AtomicU64>,
+    /// What the ARCHIVE agent clamps a `Purge` to: the gate while it applies,
+    /// `u64::MAX` while released, K = 0 or purge off (the `purge_cap()`
+    /// shape). `purge_gate` stays the gauge value.
+    effective_gate: Arc<AtomicU64>,
     /// The low-space release latch ([`Self::purge_gate`]).
     gate_released: bool,
     /// `uc2_backup_gate_released_total`, and the `uc2_backup_gate_released`
@@ -6144,6 +6158,15 @@ impl Consensus {
     /// `backup_chunk_bytes` is 0); each edge logs once.
     #[inline(never)]
     fn purge_gate(&mut self) -> Option<u64> {
+        let clamp = self.purge_gate_inner();
+        let eff = clamp.unwrap_or(u64::MAX);
+        if self.effective_gate.load(Ordering::Relaxed) != eff {
+            self.effective_gate.store(eff, Ordering::Release);
+        }
+        clamp
+    }
+
+    fn purge_gate_inner(&mut self) -> Option<u64> {
         use crate::auto_fetch::{FREE_BYTES_UNKNOWN, fits};
         let k = self
             .cluster_view
@@ -15257,6 +15280,7 @@ mod tests {
             backup_chunk_bytes: 0,
             backup_hold_released: Arc::new(AtomicU64::new(0)),
             purge_gate: Arc::new(AtomicU64::new(u64::MAX)),
+            effective_gate: Arc::new(AtomicU64::new(u64::MAX)),
             gate_released: false,
             backup_gate_released: Arc::new(AtomicU64::new(0)),
             backup_gate_released_level: Arc::new(AtomicBool::new(false)),
@@ -16330,6 +16354,16 @@ mod tests {
 
         h.cons.holdings.lock().unwrap().free_bytes = 1;
         assert_eq!(purge(&mut h), Some(floor), "released: the full target");
+        assert_eq!(
+            h.cons.effective_gate.load(Ordering::Relaxed),
+            u64::MAX,
+            "released: the archive's gate is lifted"
+        );
+        assert_eq!(
+            h.cons.purge_gate.load(Ordering::Relaxed),
+            4096,
+            "gauge keeps the gate"
+        );
         assert_eq!(released(&h), 1);
         assert!(level(&h));
         assert_eq!(purge(&mut h), Some(floor));
@@ -16337,6 +16371,7 @@ mod tests {
 
         h.cons.holdings.lock().unwrap().free_bytes = 1 << 40;
         assert_eq!(purge(&mut h), Some(4096), "re-armed");
+        assert_eq!(h.cons.effective_gate.load(Ordering::Relaxed), 4096);
         assert!(!level(&h));
         assert_eq!(released(&h), 1);
     }
@@ -16388,6 +16423,22 @@ mod tests {
         }
         assert_eq!(h.cons.purge_gate.load(Ordering::Relaxed), 777);
         assert_eq!(h.cons.backup_gate_released.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn the_archive_clamp_honours_a_released_gate() {
+        assert_eq!(
+            clamp_purge_below(65_536, None, u64::MAX),
+            65_536,
+            "released"
+        );
+        assert_eq!(clamp_purge_below(65_536, None, 4096), 4096, "applied");
+        assert_eq!(clamp_purge_below(65_536, Some(2048), 4096), 2048);
+        assert_eq!(
+            clamp_purge_below(1000, Some(2048), 4096),
+            1000,
+            "never raises"
+        );
     }
 
     fn gate_entry(tier_id: u64, through: u64) -> uc_protocol::v2::backup::BackupTierEntry {
