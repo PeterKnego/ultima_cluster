@@ -326,6 +326,7 @@ mod tests {
             rows: Vec::new(),
             cluster_hash: 1,
             cluster_size: 1,
+            lineage: vec![(1, 0)],
         }
     }
 

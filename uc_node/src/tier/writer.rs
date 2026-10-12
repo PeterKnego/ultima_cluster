@@ -735,7 +735,7 @@ fn place_set(
             if let Some(mut f) = t.open(&set_label(label.position))? {
                 f.read_to_string(&mut s)?;
             }
-            if SetLabel::parse(&s).ok().as_ref() != Some(label) {
+            if !SetLabel::parse(&s).is_ok_and(|e| e.agrees_with(label)) {
                 return Err(TierError::OverlapMismatch(set_label(label.position)));
             }
         }
@@ -1138,9 +1138,13 @@ impl Writer {
                     && !have.contains(&e.position)
                     && !self.mismatched.contains(&e.position)
             })
-            .map(SetLabel::from_catalog)
+            .map(|e| SetLabel::from_catalog(e, Vec::new()))
             .filter(|l| !retention::recopy_blocked(tier_sets, l, &policy, &inner))
             .collect();
+        // Task 3 fills the lineage; until then a set cannot be written.
+        if todo.iter().any(|l| l.lineage.is_empty()) {
+            return Ok(false);
+        }
         todo.sort_by_key(|l| std::cmp::Reverse(l.position));
         // The sets this node holds whole on disk, newest first.
         let mut held: Vec<(SetLabel, Vec<LocalFile>)> = Vec::new();
@@ -1619,6 +1623,7 @@ mod tests {
             rows: vec![],
             cluster_hash: 0,
             cluster_size: 0,
+            lineage: vec![(1, 0)],
         };
         let l = TierListing {
             sets: vec![set(100), set(900)],
@@ -1818,6 +1823,7 @@ mod tests {
             }],
             cluster_hash: h(&cluster),
             cluster_size: cluster.len() as u64,
+            lineage: vec![(1, 0)],
         };
         let local = |name: &str, tier_name: String, env, hash, size| LocalFile {
             tier_name,
@@ -1914,5 +1920,84 @@ mod tests {
         s.count(WriterError::HashMismatch);
         assert_eq!(s.errors(WriterError::HashMismatch), 1);
         assert_eq!(s.errors(WriterError::Foreign), 0);
+    }
+
+    #[test]
+    fn place_set_accepts_a_lineage_suffix_and_refuses_a_conflict() {
+        use crate::tier::layout::RowLabel;
+        let d = tempdir();
+        let src = d.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let p = 4096u64;
+        let mut row = Vec::new();
+        uc_service::snapshots::write_snapshot_envelope(&mut row, p, 1).unwrap();
+        row.extend_from_slice(&[7u8; 300]);
+        let cluster = vec![9u8; 100];
+        std::fs::write(src.join("row"), &row).unwrap();
+        std::fs::write(src.join("cluster"), &cluster).unwrap();
+        let h = |b: &[u8]| hash_stream(&mut &b[..]).unwrap();
+        let label = |lineage: Vec<(u32, u64)>| SetLabel {
+            position: p,
+            kind: uc_protocol::v2::catalog::SetKind::Full,
+            time_ns: 1,
+            rows: vec![RowLabel {
+                row: 0,
+                hash: h(&row[24..]),
+                version: 1,
+                size: row.len() as u64,
+            }],
+            cluster_hash: h(&cluster),
+            cluster_size: cluster.len() as u64,
+            lineage,
+        };
+        let files = || {
+            let local = |name: &str, tier_name: String, env, hash, size| LocalFile {
+                tier_name,
+                file: File::open(src.join(name)).unwrap(),
+                len: std::fs::metadata(src.join(name)).unwrap().len(),
+                envelope_at: env,
+                hash,
+                size,
+            };
+            vec![
+                local(
+                    "row",
+                    row_object(p, 0),
+                    Some(p),
+                    h(&row[24..]),
+                    row.len() as u64,
+                ),
+                local(
+                    "cluster",
+                    cluster_object(p),
+                    None,
+                    h(&cluster),
+                    cluster.len() as u64,
+                ),
+            ]
+        };
+        let t = crate::tier::target::FsTarget::new(d.path().join("tier"));
+        let stats = WriterStats::default();
+        let full = vec![(1, 0), (2, 10), (3, 20)];
+        place_set(&t, Codec::Zstd, 1, &label(full), &mut files(), &stats).unwrap();
+        place_set(
+            &t,
+            Codec::Zstd,
+            1,
+            &label(vec![(2, 10), (3, 20)]),
+            &mut files(),
+            &stats,
+        )
+        .unwrap();
+        let e = place_set(
+            &t,
+            Codec::Zstd,
+            1,
+            &label(vec![(2, 11), (3, 20)]),
+            &mut files(),
+            &stats,
+        )
+        .unwrap_err();
+        assert!(matches!(e, TierError::OverlapMismatch(_)), "{e:?}");
     }
 }

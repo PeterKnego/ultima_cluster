@@ -1053,6 +1053,7 @@ mod tests {
             }],
             cluster_hash: artifact_hash_of(&cl),
             cluster_size: cl.len() as u64,
+            lineage: vec![(1, 0)],
         };
         let text = label.render();
         t.put_if_absent(&set_label(p), &mut |f| {

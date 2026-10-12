@@ -558,6 +558,7 @@ mod tests {
             rows: vec![],
             cluster_hash: 0,
             cluster_size: 0,
+            lineage: vec![(1, 0)],
         }
     }
 
