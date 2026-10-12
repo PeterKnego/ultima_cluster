@@ -10906,6 +10906,7 @@ impl Consensus {
             }
             // Backup-tier 3b Task 13 handles the follower's install; until
             // then the request is observed and ignored.
+            // Task 13: compare `from` with id_to_addr(leader_hint), then act.
             NetEvent::TierInstall { .. } => return,
         };
         self.feed(event);

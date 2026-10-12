@@ -276,12 +276,11 @@ pub enum NetEvent {
         w: uc_protocol::v2::backup::BackupWatermark,
     },
     /// Backup-tier 3b spec §6.3 (kind 28): the leader asks this below-floor
-    /// follower to install from its own tier. Term-gated and leader-only
-    /// (the datagram's term is the current term and the sender is the
-    /// current leader). `from` is the leader's node id, resolved through the
-    /// receiver's `SocketAddr -> NodeId` map (only populated when crypto is on).
+    /// follower to install from its own tier. Term-gated like `SnapRedirect`.
+    /// `from` is the datagram's source address (present with crypto on or
+    /// off); the node checks it is the leader.
     TierInstall {
-        from: NodeId,
+        from: SocketAddr,
         floor: u64,
         commit: u64,
     },
@@ -2457,15 +2456,11 @@ impl FollowerReceiver {
                 }
             }
             // Backup-tier 3b spec §6.3: the leader's tier-install request.
-            // Term-gated above; additionally the sender must be the leader
-            // this receiver follows, and resolvable to a member id.
+            // Term-gated above; the node checks `from` is the leader.
             DGRAM_KIND_TIER_INSTALL => {
-                if from == self.cfg.leader
-                    && let Some(id) = self.peer_id_of(from)
-                    && let Some(b) = read_tier_install_body(&d[DATAGRAM_HEADER_LEN..])
-                {
+                if let Some(b) = read_tier_install_body(&d[DATAGRAM_HEADER_LEN..]) {
                     let ev = NetEvent::TierInstall {
-                        from: id,
+                        from,
                         floor: b.floor,
                         commit: b.commit,
                     };
@@ -5153,10 +5148,10 @@ mod tests {
     }
 
     /// Backup-tier 3b (kinds 28/29): `TIER_INSTALL` routes as
-    /// `NetEvent::TierInstall` only at the current term, from the leader, with
-    /// a well-formed body; `TIER_INSTALL_STATUS` demuxes to the sender route.
+    /// `NetEvent::TierInstall` (by source address, crypto off) only at the
+    /// current term with a well-formed body, a stale term being counted; `TIER_INSTALL_STATUS` demuxes to the sender route.
     #[test]
-    fn tier_install_kinds_route_term_gated_and_leader_only() {
+    fn tier_install_kinds_route_by_address_without_crypto() {
         use uc_protocol::v2::datagram::{
             TIER_INSTALL_BODY_LEN, TIER_INSTALL_STATUS_BODY_LEN, TierInstallBody,
             TierInstallReason, TierInstallState, TierInstallStatusBody, write_tier_install_body,
@@ -5166,7 +5161,7 @@ mod tests {
         let mut leader = FakeLeader::new();
         let (tx, rx) = mpsc::sync_channel::<NetEvent>(16);
         let mut r = follower_routed(&b, leader.addr(), tx);
-        r.peer_ids.insert(leader.addr(), 7u32);
+        assert!(r.peer_ids.is_empty(), "crypto off: no peer ids");
         let (ctx, crx) = mpsc::sync_channel::<CtrlMsg>(16);
         r.set_sender_route(ctx);
         let to = r.local_addr();
@@ -5190,7 +5185,7 @@ mod tests {
                 commit,
             }) = rx.try_recv()
             {
-                assert_eq!((from, floor, commit), (7, 4096, 8192));
+                assert_eq!((from, floor, commit), (leader.addr(), 4096, 8192));
                 break;
             }
         }
@@ -5201,9 +5196,6 @@ mod tests {
         bad[8..16].copy_from_slice(&8192u64.to_le_bytes());
         leader.send(to, DGRAM_KIND_TIER_INSTALL, 0, TERM, &bad);
         leader.send(to, DGRAM_KIND_TIER_INSTALL, 0, TERM, &body[..15]);
-        // A non-leader sender yields nothing.
-        let mut other = FakeLeader::new();
-        other.send(to, DGRAM_KIND_TIER_INSTALL, 0, TERM, &body);
 
         let st = TierInstallStatusBody {
             state: TierInstallState::Declined,
