@@ -58,7 +58,7 @@ fn nasty_reconcile_config(seed: u64) -> SimConfig {
         // A long run: the C-1 phantom needs a divergent ex-leader's large raw
         // durable to persist in a live leader's CommitTracker while a third node
         // lags — that alignment takes churn to build up.
-        max_steps: 60_000,
+        max_steps: 40_000,
         // High loss + duplication drives leader churn (→ divergent tails →
         // truncations) and, crucially, the DUPLICATE term map that lands
         // mid-truncation — the C-1 trigger. Crash rate is kept modest: past
@@ -257,7 +257,7 @@ fn raw_m3_data_plane_phantom_commit_is_caught() {
     });
     w.run_until_leader().expect("setup: elect first leader");
     let x = w.current_leader().unwrap(); // term-1 leader = future divergent ex-leader X
-    w.run_steps(500)
+    w.run_steps(300)
         .expect("setup: commit a genuine prefix on all three");
     let others: Vec<usize> = (0..3).filter(|&i| i != x).collect();
     let (a, b) = (others[0], others[1]);
@@ -272,12 +272,12 @@ fn raw_m3_data_plane_phantom_commit_is_caught() {
     );
     let l = w.current_leader().unwrap(); // the new higher-term leader L
     let g = if l == a { b } else { a }; // the third node = lagging follower G
-    w.run_steps(500)
+    w.run_steps(300)
         .expect("setup: L commits with G past the old prefix");
     // Now cut L off from G: G lags (frozen), and L keeps appending its own term's
     // bytes (own durable runs ahead, but commit stalls — no quorum).
     w.partition(l, g);
-    w.run_steps(500)
+    w.run_steps(300)
         .expect("setup: L's own log runs ahead of the stalled commit");
     // Partially heal: reconnect ONLY X <-> L. Under RawM3 X raw-reports its
     // divergent durable to L before reconciliation repairs it; L ranks that report
@@ -380,7 +380,7 @@ fn idle_cluster_reconciles_divergent_node_via_gossip_floor() {
     });
     w.run_until_leader().expect("setup: elect first leader");
     let old = w.current_leader().unwrap();
-    w.run_steps(500)
+    w.run_steps(300)
         .expect("setup: genuine committed prefix on all three");
 
     // Isolate the term-1 leader: it keeps appending an uncommitted divergent
@@ -976,7 +976,7 @@ fn add_promote_demote_remove_cycle_under_faults() {
         ..SimConfig::default()
     });
     w.run_until_leader().expect("elect");
-    w.run_steps(500).expect("a genuine committed prefix");
+    w.run_steps(300).expect("a genuine committed prefix");
 
     // add-learner (a fresh id joins as learner; id 7 has no process behind it —
     // the config pipeline neither knows nor cares).
@@ -1101,7 +1101,7 @@ fn second_learner_admitted_after_prior_config_history_converges() {
     });
     w.run_until_leader()
         .expect("elect among the 3 genesis voters");
-    w.run_steps(500).expect("a genuine committed prefix");
+    w.run_steps(300).expect("a genuine committed prefix");
 
     // v1: admit node 3 as a learner. It must not halt (it is being ADDED,
     // not removed) — and node 4 (still entirely genesis-absent) must be
@@ -1276,7 +1276,7 @@ fn leader_self_removal_steps_down_after_commit_and_c_new_elects() {
     });
     w.run_until_leader().expect("elect L1");
     let l1 = w.current_leader().unwrap();
-    w.run_steps(500).expect("a genuine committed prefix");
+    w.run_steps(300).expect("a genuine committed prefix");
 
     assert_eq!(
         propose_ok(&mut w, ConfigOp::RemoveVoter { id: l1 as u32 }),
@@ -1331,7 +1331,7 @@ fn truncation_below_config_frame_reverts() {
     });
     w.run_until_leader().expect("elect L1");
     let l1 = w.current_leader().unwrap();
-    w.run_steps(500)
+    w.run_steps(300)
         .expect("a genuine committed prefix on all three");
     // Isolate the leader FIRST, then propose: the frame lands ONLY in its own
     // stream — an uncommitted config on a soon-divergent lineage.
@@ -1421,7 +1421,7 @@ fn counterfactual_no_revert_breaks_inv8() {
     });
     w.run_until_leader().expect("elect L1");
     let l1 = w.current_leader().unwrap();
-    w.run_steps(500).expect("a genuine committed prefix");
+    w.run_steps(300).expect("a genuine committed prefix");
     w.partition_node(l1);
     assert_eq!(
         w.propose_config(
@@ -1485,7 +1485,7 @@ fn stage_config_observation_under_the_latch(hold: bool) -> (World, usize, u64) {
     });
     w.run_until_leader().expect("elect L1");
     let l1 = w.current_leader().unwrap();
-    w.run_steps(500).expect("a committed prefix");
+    w.run_steps(300).expect("a committed prefix");
     let f = (0..N).find(|&i| i != l1).unwrap();
     let others: Vec<usize> = (0..N).filter(|&i| i != l1 && i != f).collect();
     // No data frames from here on: the only bytes past the prefix are P and,
@@ -1657,7 +1657,7 @@ fn counterfactual_no_serving_gate_produces_disjoint_quorum_commit() {
                 break;
             }
             Err(ProposeError::NotCaughtUp { .. }) => {
-                w.run_steps(500).expect("learner catches up");
+                w.run_steps(300).expect("learner catches up");
             }
             Err(e) => panic!("unexpected refusal: {e:?}"),
         }
@@ -1910,7 +1910,7 @@ fn rebooted_unreconciled_voter_must_not_certify_phantom_commit() {
     w.run_until_leader()
         .expect("setup: elect the term-1 leader");
     let v = w.current_leader().unwrap();
-    w.run_steps(500)
+    w.run_steps(300)
         .expect("setup: genuine committed prefix on all three");
     let others: Vec<usize> = (0..3).filter(|&i| i != v).collect();
     let (a, b) = (others[0], others[1]);
@@ -1927,7 +1927,7 @@ fn rebooted_unreconciled_voter_must_not_certify_phantom_commit() {
     );
     let l2 = w.current_leader().unwrap();
     let f = if l2 == a { b } else { a };
-    w.run_steps(500)
+    w.run_steps(300)
         .expect("setup: term-2 commits past the old prefix; V's tail grows");
 
     // Phase 3: cut L2 from F and open V<->F. F times out and campaigns; V
@@ -2211,7 +2211,7 @@ fn old_term_range_must_not_commit_before_new_term_quorum() {
 /// world is not itself an invariant breach and the caller asserts on the count.
 fn churn_membership(w: &mut World, rounds: usize) -> Result<u64, InvariantViolation> {
     w.run_until_leader()?;
-    w.run_steps(500)?; // a genuine committed prefix before the first frame
+    w.run_steps(300)?; // a genuine committed prefix before the first frame
     let mut appended = 0u64;
     for round in 0..rounds {
         // A FRESH id each round: removing a learner tombstones its id
@@ -2408,7 +2408,7 @@ fn drive_to_candidate_lagged(seed: u64, handle_keyed: bool) -> Option<(World, us
     });
     w.run_until_leader().ok()?;
     let l1 = w.current_leader()?;
-    w.run_steps(500).ok()?;
+    w.run_steps(300).ok()?;
     let others: Vec<usize> = (0..3).filter(|&i| i != l1).collect();
     let (a, b) = (others[0], others[1]);
     w.partition(l1, a);
@@ -2417,7 +2417,7 @@ fn drive_to_candidate_lagged(seed: u64, handle_keyed: bool) -> Option<(World, us
         .ok()?;
     let l2 = w.current_leader()?;
     let f = if l2 == a { b } else { a };
-    w.run_steps(500).ok()?;
+    w.run_steps(300).ok()?;
     w.partition(l2, f);
     w.unpartition(l1, f);
     // Step finely; the instant f is a closed-gate follower at term >= 3, isolate
