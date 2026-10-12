@@ -491,3 +491,85 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod lineage_property {
+    use super::*;
+
+    /// A committed map with `n` terms whose bases climb by `step`.
+    fn committed_map(n: u32, step: u64) -> Vec<(u32, u64)> {
+        (1..=n).map(|t| (t, (t as u64 - 1) * step)).collect()
+    }
+    fn wire_tail(m: &[(u32, u64)]) -> Vec<(u32, u64)> {
+        m[m.len().saturating_sub(MAX_TERM_MAP_WIRE_ENTRIES)..].to_vec()
+    }
+    /// What `materialize` writes after 3b: the entries at or below S, then every
+    /// term whose base lies in (S, Q) — i.e. the committed map truncated at Q.
+    fn seeded_from_set(m: &[(u32, u64)], s: u64, q: u64) -> Vec<(u32, u64)> {
+        m.iter()
+            .copied()
+            .filter(|&(_, b)| b <= s || b < q)
+            .collect()
+    }
+    /// What 3a wrote (ruling R12a): the term covering S stamped AT S.
+    fn seeded_from_frames_only(m: &[(u32, u64)], s: u64, q: u64) -> Vec<(u32, u64)> {
+        let covering = m
+            .iter()
+            .rev()
+            .find(|&&(_, b)| b <= s)
+            .map(|&(t, _)| t)
+            .unwrap();
+        let mut v = vec![(covering, s)];
+        v.extend(m.iter().copied().filter(|&(t, b)| t > covering && b < q));
+        v
+    }
+
+    #[test]
+    fn a_set_seeded_map_aligns_and_keeps_everything_up_to_q() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for _ in 0..2000 {
+            let n = (next() % 400 + 1) as u32;
+            let step = next() % 5000 + 64;
+            let m = committed_map(n, step);
+            let end = (n as u64) * step;
+            let s = next() % end;
+            let q = s + 1 + next() % (end - s);
+            let own = seeded_from_set(&m, s, q);
+            let leader = wire_tail(&m);
+            if leader[0].1 > q {
+                // More than 64 terms opened after Q: today's wipe-and-rejoin, not A's case.
+                assert!(matches!(
+                    reconcile(&own, q, &leader),
+                    Reconcile::NoCommonPrefix
+                ));
+                continue;
+            }
+            match reconcile(&own, q, &leader) {
+                Reconcile::Ok(o) => assert!(
+                    o.valid_up_to >= q,
+                    "n={n} s={s} q={q} cut to {}",
+                    o.valid_up_to
+                ),
+                Reconcile::NoCommonPrefix => panic!("n={n} s={s} q={q}: no common prefix"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_frames_only_map_is_cut_which_is_ruling_r12a() {
+        let m = committed_map(1, 1 << 20); // one term, base 0 — the e2e's shape
+        let (s, q) = (38_528, 230_880);
+        let own = seeded_from_frames_only(&m, s, q);
+        assert_eq!(own, vec![(1, s)]);
+        match reconcile(&own, q, &wire_tail(&m)) {
+            Reconcile::Ok(o) => assert_eq!(o.valid_up_to, 0, "the cut R12a observed"),
+            Reconcile::NoCommonPrefix => panic!("R12a's cut, not a wipe"),
+        }
+    }
+}
