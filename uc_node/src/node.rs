@@ -343,13 +343,30 @@ pub struct StartOpts {
     pub tier_source: Option<std::path::PathBuf>,
 }
 
+/// Where a resolved tier source's path came from — which decides what a
+/// FOREIGN tier there means (coordinator ruling on Task 10).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceOrigin {
+    /// An explicit `[tier_source]`: a foreign tier refuses to start
+    /// (`tier_source_foreign`).
+    Explicit,
+    /// Implied by the node's own `[backup]` target: a foreign tier is not
+    /// used as a source (logged `tier_source_unavailable`), and the writer's
+    /// own `backup_target_foreign` stop names it, as in 3a.
+    Backup,
+}
+
 /// 3b spec §6.1: the tier a node reads as a source — `[tier_source]` if
-/// given, else its own `[backup]` target, else none (peers only).
+/// given, else its own `[backup]` target, else none (peers only) — and
+/// which of the two it was.
 pub fn resolve_tier_source(
     tier_source: Option<std::path::PathBuf>,
     backup: Option<&crate::tier::writer::BackupConfig>,
-) -> Option<std::path::PathBuf> {
-    tier_source.or_else(|| backup.map(|b| b.target.clone()))
+) -> Option<(std::path::PathBuf, SourceOrigin)> {
+    match tier_source {
+        Some(p) => Some((p, SourceOrigin::Explicit)),
+        None => backup.map(|b| (b.target.clone(), SourceOrigin::Backup)),
+    }
 }
 
 /// Ingress queue depth (M5 replaces this with the client submit ring).
@@ -1416,25 +1433,51 @@ impl Node {
             .validate("NodeConfig::services fsm_lag", cfg.buffer_bytes as u64)
             .map_err(|d| io::Error::new(io::ErrorKind::InvalidInput, d))?;
 
-        // Backup-tier 3b spec §6.1: the read-only tier source. A tier of
-        // another cluster is a named refusal; an absent or unreadable one is
-        // logged and every fetch falls back to peers.
+        // Backup-tier 3b spec §6.1: the read-only tier source. An EXPLICIT
+        // `[tier_source]` of another cluster is a named refusal; one implied
+        // by `[backup]` is simply not used (the writer's own
+        // `backup_target_foreign` stop names it, as in 3a). An absent or
+        // unreadable one is logged and every fetch falls back to peers.
         let tier_source_handle = match resolve_tier_source(tier_source, backup.as_ref()) {
-            Some(path) => {
-                let src =
-                    crate::tier::source::TierSource::open(&path, &cfg.app_id).map_err(|e| {
-                        io::Error::other(format!("node {} refuses to start: {e}", cfg.id))
-                    })?;
-                if let Some(detail) = src.unavailable() {
+            Some((path, origin)) => match crate::tier::source::TierSource::open(&path, &cfg.app_id)
+            {
+                Ok(src) => {
+                    if let Some(detail) = src.unavailable() {
+                        uc_obs::obs_event!(
+                            Warn,
+                            "tier_source_unavailable",
+                            path = path.display().to_string().as_str(),
+                            detail = detail.as_str()
+                        );
+                    }
+                    Some(Arc::new(src))
+                }
+                Err(e) if origin == SourceOrigin::Backup => {
+                    // Not the refusal's text: an implied source is not
+                    // refused, only left unused.
+                    let detail = match e {
+                        crate::tier::TierError::SourceForeign {
+                            tier_app_id,
+                            app_id,
+                            ..
+                        } => format!("foreign: TIER names app_id {tier_app_id}, not {app_id}"),
+                        other => format!("foreign: {other}"),
+                    };
                     uc_obs::obs_event!(
                         Warn,
                         "tier_source_unavailable",
                         path = path.display().to_string().as_str(),
                         detail = detail.as_str()
                     );
+                    None
                 }
-                Some(Arc::new(src))
-            }
+                Err(e) => {
+                    return Err(io::Error::other(format!(
+                        "node {} refuses to start: {e}",
+                        cfg.id
+                    )));
+                }
+            },
             None => None,
         };
 
@@ -2633,6 +2676,7 @@ impl Node {
             tier_source: tier_source_handle.clone(),
             intake_signals: intake_signals.clone(),
             tier_declined_position: 0,
+            tier_failed_position: 0,
             fetch_source_stats: Arc::clone(&fetch_source_stats),
             backup_hold_released: Arc::clone(&backup_hold_released),
             purge_gate: Arc::clone(&purge_gate),
@@ -4103,6 +4147,9 @@ struct Consensus {
     /// Ruling RA4: the set position `tier_fetch_declined` was last logged
     /// for, so a fetch re-issued for the same P names it once.
     tier_declined_position: u64,
+    /// The set position whose tier COPY last failed here (verify, io,
+    /// timeout): later fetches of it go straight to a peer.
+    tier_failed_position: u64,
     /// `uc2_snapshot_fetch_total{source}` — the SAME allocation `/metrics`
     /// reads.
     fetch_source_stats: Arc<crate::tier::source::FetchSourceStats>,
@@ -11765,43 +11812,64 @@ impl Consensus {
         if position > self.cnc.counters().durable.load_acquire() {
             return Err(FetchRefusal::AboveDurable);
         }
-        // `0` names no set ("the learner's newest"): only a peer resolves it.
-        if position != 0
-            && let Some(src) = self.tier_source.clone()
-        {
-            match self.tier_fetch_plan(&src, position) {
-                Ok((label, entry)) => {
-                    let fetch = crate::tier::source::spawn_fetch(
-                        src,
-                        self.snap_root.clone(),
-                        label,
-                        entry,
-                        crate::tier::source::FetchMode::StoreOnly,
-                        self.intake_signals.clone(),
-                    );
-                    self.pending_fetch = Some(PendingFetch {
-                        learner: from,
-                        position,
-                        stored_before: self.stored_set_pos.load(Ordering::Acquire),
-                        deadline_ns: self.pass_now_ns.saturating_add(FETCH_TIMEOUT_NS),
-                        auto,
-                        source: FetchSource::Tier(fetch),
-                    });
-                    crate::obs_event!(
-                        Info,
-                        "snapshot_fetch_requested",
-                        node = self.id as u64,
-                        from = from as u64,
-                        position = position,
-                        actor = if auto { "auto" } else { "operator" },
-                        source = "tier"
-                    );
-                    return Ok(());
-                }
-                Err(reason) => self.note_tier_fetch_declined(position, reason),
-            }
+        if self.try_tier_fetch(from, position, auto) {
+            return Ok(());
         }
         self.issue_fetch_peer(from, position, auto)
+    }
+
+    /// Backup-tier 3b spec §6.2: start a store-only copy of the set at
+    /// `position` from this node's tier source, if it can serve it; `false`
+    /// (after naming why, once per position) sends the caller to a peer.
+    /// `from` is the peer the fallback asks — `self.id` when none was chosen
+    /// yet (auto-fetch tries the tier BEFORE picking a holder), in which case
+    /// a failed copy re-runs the auto-fetch step's peer-candidate logic.
+    fn try_tier_fetch(&mut self, from: NodeId, position: u64, auto: bool) -> bool {
+        // `0` names no set ("the learner's newest"): only a peer resolves it.
+        // A set whose tier COPY already failed here goes to a peer.
+        if position == 0
+            || position == self.tier_failed_position
+            || position > self.cnc.counters().durable.load_acquire()
+        {
+            return false;
+        }
+        let Some(src) = self.tier_source.clone() else {
+            return false;
+        };
+        match self.tier_fetch_plan(&src, position) {
+            Ok((label, entry)) => {
+                let fetch = crate::tier::source::spawn_fetch(
+                    src,
+                    self.snap_root.clone(),
+                    label,
+                    entry,
+                    crate::tier::source::FetchMode::StoreOnly,
+                    self.intake_signals.clone(),
+                );
+                self.pending_fetch = Some(PendingFetch {
+                    learner: from,
+                    position,
+                    stored_before: self.stored_set_pos.load(Ordering::Acquire),
+                    deadline_ns: self.pass_now_ns.saturating_add(FETCH_TIMEOUT_NS),
+                    auto,
+                    source: FetchSource::Tier(fetch),
+                });
+                crate::obs_event!(
+                    Info,
+                    "snapshot_fetch_requested",
+                    node = self.id as u64,
+                    from = "tier",
+                    position = position,
+                    actor = if auto { "auto" } else { "operator" },
+                    source = "tier"
+                );
+                true
+            }
+            Err(reason) => {
+                self.note_tier_fetch_declined(position, reason);
+                false
+            }
+        }
     }
 
     /// Backup-tier 3b spec §6.2 step 1, once per fetch DECISION (never per
@@ -11978,6 +12046,13 @@ impl Consensus {
             | SpaceCheck::FreeUnknown { first: false }
             | SpaceCheck::Fits => {}
         }
+        // Backup-tier 3b spec §6.2: the tier first — even with no peer
+        // holder. The peer-candidate logic below runs only when it cannot
+        // serve `n` (named once per position). No `snapshot_fetch` audit
+        // record: it names a member, and none was asked.
+        if self.try_tier_fetch(self.id, n, true) {
+            return;
+        }
         let candidates = self.auto_fetch_candidates(n, &inner);
         let Some(from) = self.auto_fetch.pick(&candidates, now) else {
             self.auto_fetch_stats.bump(Outcome::NoHolder);
@@ -12087,35 +12162,39 @@ impl Consensus {
             return;
         };
         if let FetchSource::Tier(f) = &mut p.source {
-            match f.try_finish() {
+            let failed = match f.try_finish() {
                 Some(Ok(_lineage)) => {
                     let p = self.pending_fetch.take().expect("matched above");
                     self.fetch_stored(&p, p.position, "tier");
+                    return;
                 }
-                Some(Err(reason)) => {
-                    // Spec §6.2 step 4: what the copy wrote is gone (the
-                    // thread removed it); fall back to the peer AT ONCE.
-                    let p = self.pending_fetch.take().expect("matched above");
-                    self.note_tier_fetch_declined(p.position, &reason);
-                    if self
-                        .issue_fetch_peer(p.learner, p.position, p.auto)
-                        .is_err()
-                        && p.auto
-                    {
-                        self.auto_fetch_stats
-                            .bump(crate::auto_fetch::Outcome::Refused);
-                        self.auto_fetch
-                            .on_result(crate::auto_fetch::Outcome::Refused, self.pass_now_ns);
-                    }
-                }
-                None if self.pass_now_ns > p.deadline_ns => {
-                    // A wedged tier mount: forget the record (the thread is
-                    // detached; should it ever finish, its set is simply
-                    // held — the completeness path needs no record).
-                    let p = self.pending_fetch.take().expect("matched above");
-                    self.fetch_timed_out(&p, false);
-                }
-                None => {}
+                Some(Err(reason)) => reason,
+                // Coordinator ruling: a copy past the deadline is a failure
+                // like any other. The thread is DETACHED (its handle dropped
+                // with the record, never joined here): should it ever finish,
+                // its late `publish_stored` is harmless — the word is
+                // `fetch_max`, and completeness requires the files.
+                None if self.pass_now_ns > p.deadline_ns => "timeout".to_string(),
+                None => return,
+            };
+            // Spec §6.2 step 4: what the copy wrote is gone (the thread
+            // removed it); fall back to a peer AT ONCE.
+            let p = self.pending_fetch.take().expect("matched above");
+            self.tier_failed_position = p.position;
+            self.note_tier_fetch_declined(p.position, &failed);
+            if p.learner == self.id {
+                // Auto-fetch tried the tier before choosing a holder: choose
+                // one now (the tier is skipped for this position).
+                self.auto_fetch_step(p.position);
+            } else if self
+                .issue_fetch_peer(p.learner, p.position, p.auto)
+                .is_err()
+                && p.auto
+            {
+                self.auto_fetch_stats
+                    .bump(crate::auto_fetch::Outcome::Refused);
+                self.auto_fetch
+                    .on_result(crate::auto_fetch::Outcome::Refused, self.pass_now_ns);
             }
             return;
         }
@@ -12125,7 +12204,7 @@ impl Consensus {
             self.fetch_stored(&p, stored, "peer");
         } else if self.pass_now_ns > p.deadline_ns {
             let p = self.pending_fetch.take().expect("matched above");
-            self.fetch_timed_out(&p, true);
+            self.fetch_timed_out(&p);
         }
     }
 
@@ -12143,25 +12222,36 @@ impl Consensus {
             self.auto_fetch
                 .on_result(crate::auto_fetch::Outcome::Ok, self.pass_now_ns);
         }
-        crate::obs_event!(
-            Info,
-            "snapshot_fetch_stored",
-            node = self.id as u64,
-            from = p.learner as u64,
-            position = position,
-            source = source
-        );
+        if source == "tier" {
+            crate::obs_event!(
+                Info,
+                "snapshot_fetch_stored",
+                node = self.id as u64,
+                from = "tier",
+                position = position,
+                source = source
+            );
+        } else {
+            crate::obs_event!(
+                Info,
+                "snapshot_fetch_stored",
+                node = self.id as u64,
+                from = p.learner as u64,
+                position = position,
+                source = source
+            );
+        }
     }
 
-    /// A pending fetch's deadline passed. `peer`: the receiver's arm
-    /// expired too, so an operator fetch parks its straggler slot.
-    fn fetch_timed_out(&mut self, p: &PendingFetch, peer: bool) {
+    /// A pending PEER fetch's deadline passed (the receiver's arm expired
+    /// too, so an operator fetch parks its straggler slot).
+    fn fetch_timed_out(&mut self, p: &PendingFetch) {
         if p.auto {
             self.auto_fetch_stats
                 .bump(crate::auto_fetch::Outcome::Timeout);
             self.auto_fetch
                 .on_result(crate::auto_fetch::Outcome::Timeout, self.pass_now_ns);
-        } else if peer {
+        } else {
             // Controller ruling R8 (plan ruling P15): an OPERATOR fetch's
             // expiry parks the receiver's straggler slot too — auto-fetch
             // waits out the same 1 s floor before clearing it.
@@ -15657,6 +15747,7 @@ mod tests {
                 None,
             ),
             tier_declined_position: 0,
+            tier_failed_position: 0,
             fetch_source_stats: Arc::new(Default::default()),
             stored_set_pos,
             stored_above_durable: 0,
@@ -27734,6 +27825,53 @@ mod tests {
     /// Controller ruling R8 (plan ruling P15): an OPERATOR fetch timing out
     /// also sets the 1 s floor — the pass that sees it expire, and the next
     /// second, issue no auto fetch.
+    /// Coordinator ruling (Task 12): a tier copy still running at the fetch
+    /// deadline is a failure like `done == Err` — the record is cleared, the
+    /// thread detached, `tier_fetch_declined{reason="timeout"}` named, and
+    /// the peer path issued AT ONCE; the tier is skipped for that position
+    /// from then on.
+    #[test]
+    fn a_tier_fetch_past_its_deadline_falls_back_to_the_peer() {
+        let mut h = harness_with_rows(&["a"]);
+        let t = 10_000_000_000u64;
+        h.cons.pending_fetch = Some(PendingFetch {
+            learner: 2,
+            position: 4096,
+            stored_before: 0,
+            deadline_ns: t,
+            auto: false,
+            source: FetchSource::Tier(crate::tier::source::TierFetch::never_finishing_for_test(
+                4096,
+            )),
+        });
+        h.cons.pass_now_ns = t;
+        h.cons.poll_pending_fetch();
+        assert!(
+            matches!(
+                h.cons.pending_fetch.as_ref().map(|p| &p.source),
+                Some(FetchSource::Tier(_))
+            ),
+            "at the deadline the copy is still waited on"
+        );
+        assert!(h.fetch_rx.try_recv().is_err(), "no peer asked yet");
+        h.cons.pass_now_ns = t + 1;
+        h.cons.poll_pending_fetch();
+        let asked = h.fetch_rx.try_recv().expect("the peer was asked at once");
+        assert_eq!(asked.peer, h.cons.id_to_addr[&2]);
+        assert_eq!(asked.position, 4096);
+        assert_eq!(asked.mode, IntakeMode::StoreOnly);
+        assert!(matches!(
+            h.cons.pending_fetch.as_ref().map(|p| &p.source),
+            Some(FetchSource::Peer)
+        ));
+        assert_eq!(h.cons.tier_declined_position, 4096, "named once");
+        assert_eq!(
+            h.cons.tier_failed_position, 4096,
+            "the tier is skipped for it"
+        );
+        assert!(!h.cons.try_tier_fetch(2, 4096, false));
+    }
+
     #[test]
     fn an_operator_fetch_timeout_holds_auto_fetch_for_the_floor() {
         use crate::auto_fetch::AUTO_FETCH_BACKOFF_MIN_NS;
@@ -28033,7 +28171,7 @@ mod tests {
 
 #[cfg(test)]
 mod tier_source_resolve_tests {
-    use super::resolve_tier_source;
+    use super::{SourceOrigin, resolve_tier_source};
     use crate::tier::writer::BackupConfig;
     use std::path::PathBuf;
 
@@ -28046,11 +28184,15 @@ mod tier_source_resolve_tests {
         assert_eq!(resolve_tier_source(None, None), None);
         assert_eq!(
             resolve_tier_source(None, Some(&b)),
-            Some(PathBuf::from("/b"))
+            Some((PathBuf::from("/b"), SourceOrigin::Backup))
         );
         assert_eq!(
             resolve_tier_source(Some("/s".into()), Some(&b)),
-            Some(PathBuf::from("/s"))
+            Some((PathBuf::from("/s"), SourceOrigin::Explicit))
+        );
+        assert_eq!(
+            resolve_tier_source(Some("/s".into()), None),
+            Some((PathBuf::from("/s"), SourceOrigin::Explicit))
         );
     }
 }

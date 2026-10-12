@@ -2317,10 +2317,17 @@ mod writer_e2e {
     /// Stage a settings record at `<dir>/settings.pending` and drive admin
     /// op 7 on that (leader) node, as `uc2ctl settings apply` does.
     fn apply_gate_k(c: &Cluster, leader: usize, k: u8) {
+        apply_settings(c, leader, |s| s.purge_requires_tiers = k);
+    }
+
+    /// `uc2ctl settings apply` in-process: the leader's committed settings
+    /// with `edit` applied, staged and signed; waits until every running
+    /// node has committed them.
+    fn apply_settings(c: &Cluster, leader: usize, edit: impl FnOnce(&mut Settings)) {
         use std::io::Write as _;
         use std::os::unix::fs::OpenOptionsExt as _;
         let mut s = c.node(leader).cluster_view().to_state().settings;
-        s.purge_requires_tiers = k;
+        edit(&mut s);
         let mut bytes = Vec::new();
         uc_protocol::v2::settings::encode_settings(&s, &mut bytes);
         let (id, ip, port) = uc_node::staged_digest(&bytes);
@@ -2343,15 +2350,10 @@ mod writer_e2e {
             ip,
             port,
         );
-        await_until(30, "the new K committed on every node", || {
-            (0..3).all(|i| {
-                c.node(i)
-                    .cluster_view()
-                    .to_state()
-                    .settings
-                    .purge_requires_tiers
-                    == k
-            })
+        await_until(30, "the new settings committed on every node", || {
+            c.running()
+                .into_iter()
+                .all(|i| c.node(i).cluster_view().to_state().settings == s)
         });
     }
 
@@ -3076,6 +3078,46 @@ mod writer_e2e {
             declined[0]
         );
         shared.paused_for_test.store(false, Ordering::Release);
+        let _keep = c.stop();
+    }
+
+    /// Coordinator ruling (Task 12): auto-fetch tries the tier FIRST, before
+    /// choosing a peer holder. Deterministic: auto-fetch is switched on only
+    /// once the standby set is in the tier, and every voter has a source.
+    #[test]
+    fn auto_fetch_takes_the_set_from_the_tier_with_no_operator_verb() {
+        let _g = serialize();
+        let tier = tmp_tier();
+        let cfg = writer_cfg(tier.path(), 1 << 20, Duration::from_millis(300));
+        let o = Opts {
+            auto_fetch: false,
+            standby: true,
+            ..opts("tier-auto", false)
+        };
+        let src = tier.path().to_path_buf();
+        let mut c = spawn_with(
+            3,
+            1,
+            o,
+            |i| (i == 3).then(|| cfg.clone()),
+            |i| (i < 3).then(|| src.clone()),
+        );
+        start_sums(&mut c);
+        await_single_leader(&c, 30);
+        await_capable(&c);
+        submit_settled(&c, 500);
+        let p = standby_instant(&c, 3);
+        await_agreed(&c, &[0, 1, 2, 3], p);
+        await_watermark(&c, 0, 60, |w| w.newest_set == p);
+        let l = await_single_leader(&c, 30);
+        apply_settings(&c, l, |s| s.auto_fetch = true);
+        await_until(60, "every voter auto-fetched the set from the tier", || {
+            (0..3)
+                .all(|i| fetched(c.node(i), "tier") == 1 && c.node(i).snapshot_set_position() == p)
+        });
+        for i in 0..3 {
+            assert_eq!(fetched(c.node(i), "peer"), 0, "node {i} asked no peer");
+        }
         let _keep = c.stop();
     }
 

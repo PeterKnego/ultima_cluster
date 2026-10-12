@@ -138,6 +138,18 @@ impl std::fmt::Debug for TierFetch {
 }
 
 impl TierFetch {
+    /// A fetch that never finishes (no thread) — for the node's timeout
+    /// tests.
+    #[cfg(test)]
+    pub(crate) fn never_finishing_for_test(position: u64) -> TierFetch {
+        TierFetch {
+            position,
+            copied: Arc::new(AtomicU64::new(0)),
+            done: Arc::new(Mutex::new(None)),
+            handle: None,
+        }
+    }
+
     /// The thread's result once it has finished (joining it), else `None`.
     /// Non-blocking until `done` is set; the join after that is the
     /// thread's last few instructions.
@@ -183,7 +195,8 @@ fn label_matches_catalog(label: &SetLabel, e: &SetEntry) -> bool {
         && e.cluster.verdict == RowVerdict::Agreed
 }
 
-/// The files one fetch has created, so a failure removes exactly them.
+/// What one fetch has created, so a failure removes exactly that and leaves
+/// the snapshot root as it was.
 #[derive(Default)]
 struct Written {
     /// `.tier.part` temp files not yet renamed.
@@ -191,14 +204,33 @@ struct Written {
     /// Final names THIS fetch created (a final already present before the
     /// rename — a peer session's or a local build's — is never removed).
     finals: Vec<PathBuf>,
+    /// The `snap-<P>.foreign` marker, if THIS fetch created it.
+    marker: Option<PathBuf>,
+    /// Directories THIS fetch created (removed only if left empty).
+    dirs: Vec<PathBuf>,
 }
 
 impl Written {
     fn undo(&mut self) {
-        for p in self.parts.drain(..).chain(self.finals.drain(..)) {
+        let files = self.parts.drain(..).chain(self.finals.drain(..));
+        for p in files.chain(self.marker.take()) {
             let _ = std::fs::remove_file(&p);
         }
+        // `remove_dir` refuses a non-empty directory, so a directory
+        // something else wrote into meanwhile stays.
+        for d in self.dirs.drain(..).rev() {
+            let _ = std::fs::remove_dir(&d);
+        }
     }
+}
+
+/// The marker [`write_foreign_marker`] makes for the set at `p` under
+/// `root` (`<root>/cluster/snap-<P>.foreign`).
+fn marker_path(root: &Path, p: u64) -> PathBuf {
+    root.join("cluster").join(format!(
+        "snap-{p}{}",
+        uc_protocol::v2::catalog::FOREIGN_SET_SUFFIX
+    ))
 }
 
 /// The thread body: copy, verify, rename every artifact; `Err(reason)` on
@@ -243,6 +275,13 @@ fn copy_set(
         }
         let (part, fin) = artifact_paths(root, row, p);
         let dir = part.parent().expect("artifact paths have a directory");
+        // The marker lives in `<root>/cluster/`; note both dirs before
+        // either can be created.
+        for d in [dir.to_path_buf(), root.join("cluster")] {
+            if !d.exists() && !w.dirs.contains(&d) {
+                w.dirs.push(d);
+            }
+        }
         std::fs::create_dir_all(dir).map_err(|_| "io".to_string())?;
         w.parts.push(part.clone());
         if let Err(e) = copy_artifact(t, p, &object, &part, size, hash, enveloped) {
@@ -258,7 +297,12 @@ fn copy_set(
         // Ruling R42 (review m-A): the set is marked "not built here",
         // durably, before ANY of its artifacts becomes visible — exactly
         // what a peer session does.
+        let marker = marker_path(root, p);
+        let had_marker = marker.exists();
         write_foreign_marker(&fin, p).map_err(|_| "io".to_string())?;
+        if !had_marker && w.marker.is_none() {
+            w.marker = Some(marker);
+        }
         let existed = fin.exists();
         std::fs::rename(&part, &fin).map_err(|_| "io".to_string())?;
         w.parts.retain(|x| x != &part);
@@ -580,12 +624,12 @@ mod tests {
         let (r, stored) = run(&fx);
         assert_eq!(r, Err("verify".to_string()));
         assert_eq!(stored.load(Ordering::Acquire), 0, "nothing is signalled");
-        // The rows landed before the cluster object failed; both are gone.
-        // (The marker stays: it names a set this node did not build, and a
-        // peer session for the same P re-uses it.)
-        assert_eq!(
-            files(&fx.root),
-            vec!["cluster/snap-4096.foreign".to_string()]
+        // The rows landed before the cluster object failed; they, the
+        // marker and the directories the copy made are all gone.
+        assert!(
+            std::fs::read_dir(&fx.root).unwrap().next().is_none(),
+            "the snapshot root is as it was: {:?}",
+            files(&fx.root)
         );
     }
 
@@ -595,7 +639,7 @@ mod tests {
         fx.entry.rows[2].version = VERSION + 1;
         let (r, _) = run(&fx);
         assert_eq!(r, Err("verify".to_string()));
-        assert!(files(&fx.root).is_empty(), "{:?}", files(&fx.root));
+        assert!(std::fs::read_dir(&fx.root).unwrap().next().is_none());
     }
 
     #[test]

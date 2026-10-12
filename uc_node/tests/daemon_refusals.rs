@@ -362,3 +362,61 @@ fn daemon_refuses_a_tier_source_of_another_app_id() {
     assert!(err.contains("tier_source_foreign"), "got: {err}");
     assert!(!err.contains("backup_target_foreign"), "got: {err}");
 }
+
+/// Coordinator ruling on Task 10: a tier source IMPLIED by `[backup]` (no
+/// `[tier_source]`) whose `TIER` belongs to another cluster does NOT refuse
+/// to start — it is not used as a source (`tier_source_unavailable`, detail
+/// `foreign: …`), and the writer's own 3a `backup_target_foreign` stop
+/// names it. Started = the cnc page appears while the child lives; then a
+/// SIGTERM must exit 0.
+#[test]
+fn daemon_starts_with_a_foreign_backup_target_and_no_tier_source() {
+    use std::time::{Duration, Instant};
+    let dir = scratch();
+    let tier = dir.path().join("tier");
+    std::fs::create_dir_all(&tier).unwrap();
+    std::fs::write(
+        tier.join("TIER"),
+        "format=uc2-tier-v1\napp_id=someone-else\ntier_id=0x0000000000000007\ncreated_ns=1\n",
+    )
+    .unwrap();
+    let extra = format!("{VALID_TAIL}\n[backup]\ntarget = \"{}\"\n", tier.display());
+    let (cfg, inst) = write_config(dir.path(), 19874, &extra);
+    let child = Command::new(env!("CARGO_BIN_EXE_uc2-node"))
+        .arg("--config")
+        .arg(&cfg)
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    struct KillOnDrop(Option<std::process::Child>);
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            if let Some(mut c) = self.0.take() {
+                let _ = c.kill();
+                let _ = c.wait();
+            }
+        }
+    }
+    let mut guard = KillOnDrop(Some(child));
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !inst.join("cnc2.dat").exists() {
+        if let Some(status) = guard.0.as_mut().expect("armed").try_wait().unwrap() {
+            panic!("the daemon exited before creating its cnc page: {status:?}");
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timeout waiting for the cnc page"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let child = guard.0.take().expect("armed");
+    unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+    let out = child.wait_with_output().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{:?}; stderr: {err}", out.status);
+    assert!(!err.contains("tier_source_foreign"), "got: {err}");
+    assert!(
+        err.contains("\"event\":\"tier_source_unavailable\"") && err.contains("foreign: "),
+        "the implied source is named unavailable, got: {err}"
+    );
+}
