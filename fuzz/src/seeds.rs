@@ -1911,6 +1911,7 @@ pub fn uc_node_tier_object() -> Vec<Seed> {
         rows: vec![RowLabel { row: 0, hash: 0xfeed, version: 0x0001_0000, size: 77 }],
         cluster_hash: 0xbeef,
         cluster_size: 88,
+        lineage: vec![(1, 0)],
     }
     .render();
 
