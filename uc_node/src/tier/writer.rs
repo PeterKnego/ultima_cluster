@@ -24,14 +24,19 @@
 //! durable)`, read before the walk; committed bytes are never truncated, so
 //! nothing the writer reads below `C` can be replaced by a failover.
 use super::TierError;
-use super::chain::{TierListing, list_fences, list_tier, reach_from, watermark_of};
-use super::layout::{SetLabel, TierInfo, chunk_object, cluster_object, row_object, set_label};
+use super::chain::{
+    TierListing, list_fences, list_tier, reach_from, read_label, stream_object, walk_chunk,
+    watermark_of,
+};
+use super::layout::{
+    RowLabel, SetLabel, TierInfo, chunk_object, cluster_object, row_object, set_label,
+};
 use super::object::{Codec, MAGIC_ARTIFACT, MAGIC_CHUNK, ObjectReader, write_object};
 use super::retention::{self, RetentionPolicy};
 use super::target::{BackupTarget, Put, open_or_create_tier};
 use crate::cluster_fsm::ClusterView;
 use sha2::Digest;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -40,7 +45,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use uc_journal::Journal;
 use uc_log::cnc::CncPage;
-use uc_protocol::v2::backup::{BackupWatermark, WatermarkOp};
+use uc_protocol::v2::backup::{BackupTierEntry, BackupWatermark, WatermarkOp};
 use uc_protocol::v2::frame::{
     ClusterKind, FRAME_TYPE_CLUSTER, FRAME_TYPE_PADDING, HEADER_LEN, align_frame_len,
     read_cluster_prefix, read_header,
@@ -118,10 +123,15 @@ pub enum WriterError {
     Fenced = 5,
     /// C5: the target's filesystem cannot hard-link; the writer stopped.
     NoHardlinks = 6,
+    /// Ruling PF2 (as amended): an object failed its re-read through the
+    /// target (header, a block CRC, the frame walk, the hash against `SET`).
+    /// It does not count toward the report; counted on every failing re-read
+    /// (a retry re-reads it next pass), never stops the writer.
+    Readback = 7,
 }
 
 impl WriterError {
-    pub const ALL: [WriterError; 7] = [
+    pub const ALL: [WriterError; 8] = [
         WriterError::Foreign,
         WriterError::Unavailable,
         WriterError::OverlapMismatch,
@@ -129,6 +139,7 @@ impl WriterError {
         WriterError::JournalUnavailable,
         WriterError::Fenced,
         WriterError::NoHardlinks,
+        WriterError::Readback,
     ];
 
     pub fn label(self) -> &'static str {
@@ -140,6 +151,7 @@ impl WriterError {
             WriterError::JournalUnavailable => "journal_unavailable",
             WriterError::Fenced => "fenced",
             WriterError::NoHardlinks => "no_hardlinks",
+            WriterError::Readback => "readback",
         }
     }
 }
@@ -201,6 +213,243 @@ pub struct WriterShared {
     /// after every `store_term_map`. Empty until the first publish (boot).
     /// The writer derives each set's lineage from it ([`lineage_below`]).
     pub term_map: Mutex<Vec<(u32, u64)>>,
+    /// The committed watermark entry for THIS writer's tier, published by
+    /// the consensus agent beside `term_map` (`publish_backup_confirmed`,
+    /// on every cluster-view move). `None` until the cluster has committed a
+    /// report for the tier. Objects the entry already covers (chunk `to <=
+    /// through`, set `position <= newest_set`) are not re-read (RA2).
+    pub confirmed: Mutex<Option<BackupTierEntry>>,
+    /// The tier's id as the writer learned it from `open_or_create_tier`
+    /// (`0` = not yet): how the node selects the committed entry.
+    pub tier_id: AtomicU64,
+}
+
+/// What [`readback`] re-reads.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ReadbackObject<'a> {
+    /// A journal chunk `[from, to)`: header vs name, every block CRC, the
+    /// frame walk ending exactly at `to`.
+    Chunk { from: u64, to: u64 },
+    /// A row artifact: block CRCs, raw length, envelope position and payload
+    /// hash against the `SET` label.
+    Row {
+        set: &'a SetLabel,
+        row: &'a RowLabel,
+    },
+    /// The cluster artifact: block CRCs, raw length and hash against `SET`.
+    Cluster { set: &'a SetLabel },
+    /// The `SET` label itself: present, parses, names its directory.
+    Label { set: &'a SetLabel },
+}
+
+impl ReadbackObject<'_> {
+    fn key(&self) -> String {
+        match *self {
+            ReadbackObject::Chunk { from, to } => chunk_object(from, to),
+            ReadbackObject::Row { set, row } => row_object(set.position, row.row),
+            ReadbackObject::Cluster { set } => cluster_object(set.position),
+            ReadbackObject::Label { set } => set_label(set.position),
+        }
+    }
+}
+
+/// Re-read one object through the target, draining its reader to EOF (so
+/// the header CRC and every block CRC are checked) and checking what the
+/// object must say. `Ok(())` on pass.
+pub(crate) fn readback(t: &dyn BackupTarget, obj: ReadbackObject<'_>) -> Result<(), TierError> {
+    let bad = |what: String, detail: String| TierError::Corrupt { what, detail };
+    match obj {
+        ReadbackObject::Chunk { from, to } => walk_chunk(t, (from, to), None, &mut |_, _| Ok(())),
+        ReadbackObject::Row { set, row } => {
+            let path = row_object(set.position, row.row);
+            let (len, d) = stream_object(t, &path, Some(SNAPSHOT_ENVELOPE_LEN), true)?;
+            if len != row.size {
+                return Err(bad(
+                    path,
+                    format!("raw length {len} != SET size {}", row.size),
+                ));
+            }
+            match d {
+                Some((ep, hash)) if ep == set.position && hash == row.hash => Ok(()),
+                Some((ep, hash)) => Err(bad(
+                    path,
+                    format!(
+                        "envelope position {ep} / hash {hash:#018x} disagree with SET ({} / {:#018x})",
+                        set.position, row.hash
+                    ),
+                )),
+                None => Err(bad(path, "no deep identity".into())),
+            }
+        }
+        ReadbackObject::Cluster { set } => {
+            let path = cluster_object(set.position);
+            let (len, d) = stream_object(t, &path, None, true)?;
+            if len != set.cluster_size {
+                return Err(bad(
+                    path,
+                    format!("raw length {len} != SET size {}", set.cluster_size),
+                ));
+            }
+            match d {
+                Some((_, hash)) if hash == set.cluster_hash => Ok(()),
+                _ => Err(bad(path, "hash disagrees with SET".into())),
+            }
+        }
+        ReadbackObject::Label { set } => match read_label(t, set.position)? {
+            Some(Ok(l)) if l.agrees_with(set) => Ok(()),
+            _ => Err(bad(set_label(set.position), "SET label unusable".into())),
+        },
+    }
+}
+
+/// Ruling PF2 (as amended by RA2): which of the tier's objects count toward
+/// the report. Owns the names this process has already re-read.
+#[derive(Debug, Default)]
+pub(crate) struct Verifier {
+    /// Objects this process re-read and found good.
+    verified: HashSet<String>,
+    /// Objects this writer CREATED whose read-back failed: the watermark's
+    /// coverage rule does not vouch for them, so they are re-read each pass
+    /// until they pass (a failure is not remembered otherwise).
+    suspect: HashSet<String>,
+}
+
+impl Verifier {
+    /// Re-read `obj` now (unless already verified, or `force`), counting and
+    /// logging a failure. `true` = the object counts.
+    fn check(
+        &mut self,
+        t: &dyn BackupTarget,
+        stats: &WriterStats,
+        node: u32,
+        obj: ReadbackObject<'_>,
+        force: bool,
+    ) -> bool {
+        let key = obj.key();
+        if !force && self.verified.contains(&key) {
+            return true;
+        }
+        match readback(t, obj) {
+            Ok(()) => {
+                self.suspect.remove(&key);
+                self.verified.insert(key);
+                true
+            }
+            Err(e) => {
+                stats.count(WriterError::Readback);
+                crate::obs_event!(
+                    Warn,
+                    "backup_readback_failed",
+                    node = node as u64,
+                    object = key.as_str(),
+                    detail = e.to_string().as_str()
+                );
+                self.verified.remove(&key);
+                false
+            }
+        }
+    }
+
+    /// An object this writer just created: always re-read, whatever the
+    /// committed watermark says (the two-writer case, RA2). A failure marks
+    /// it suspect so coverage cannot vouch for it.
+    fn created(
+        &mut self,
+        t: &dyn BackupTarget,
+        stats: &WriterStats,
+        node: u32,
+        obj: ReadbackObject<'_>,
+    ) {
+        let key = obj.key();
+        if !self.check(t, stats, node, obj, true) {
+            self.suspect.insert(key);
+        }
+    }
+
+    fn created_set(
+        &mut self,
+        t: &dyn BackupTarget,
+        stats: &WriterStats,
+        node: u32,
+        set: &SetLabel,
+        made: &[String],
+    ) {
+        for r in &set.rows {
+            if made.contains(&row_object(set.position, r.row)) {
+                self.created(t, stats, node, ReadbackObject::Row { set, row: r });
+            }
+        }
+        if made.contains(&cluster_object(set.position)) {
+            self.created(t, stats, node, ReadbackObject::Cluster { set });
+        }
+        if made.contains(&set_label(set.position)) {
+            self.created(t, stats, node, ReadbackObject::Label { set });
+        }
+    }
+
+    fn covered(&self, key: &str, by_watermark: bool) -> bool {
+        by_watermark && !self.suspect.contains(key)
+    }
+
+    /// The listing filtered to objects that count: confirmed by `confirmed`
+    /// (the committed watermark entry for this tier; `None` = nothing
+    /// confirmed) or re-read and checked by this writer. Placement keeps the
+    /// raw listing; only the report and the purge cap use this one.
+    pub(crate) fn verified_listing(
+        &mut self,
+        t: &dyn BackupTarget,
+        stats: &WriterStats,
+        node: u32,
+        raw: &TierListing,
+        confirmed: Option<&BackupTierEntry>,
+    ) -> TierListing {
+        let mut out = TierListing {
+            sets: Vec::new(),
+            incomplete_sets: raw.incomplete_sets.clone(),
+            chunks: Vec::new(),
+            corrupt_sets: raw.corrupt_sets.clone(),
+            fences: raw.fences.clone(),
+        };
+        for s in &raw.sets {
+            let by_wm = confirmed.is_some_and(|c| s.position <= c.newest_set);
+            let mut ok = true;
+            for r in &s.rows {
+                let key = row_object(s.position, r.row);
+                if !self.covered(&key, by_wm) {
+                    ok &= self.check(
+                        t,
+                        stats,
+                        node,
+                        ReadbackObject::Row { set: s, row: r },
+                        false,
+                    );
+                }
+            }
+            let key = cluster_object(s.position);
+            if !self.covered(&key, by_wm) {
+                ok &= self.check(t, stats, node, ReadbackObject::Cluster { set: s }, false);
+            }
+            // The label was parsed by the listing this pass; a suspect one
+            // (this writer created it and its read-back failed) is re-read.
+            let key = set_label(s.position);
+            if self.suspect.contains(&key) {
+                ok &= self.check(t, stats, node, ReadbackObject::Label { set: s }, false);
+            }
+            if ok {
+                out.sets.push(s.clone());
+            }
+        }
+        for &(from, to) in &raw.chunks {
+            let by_wm = confirmed.is_some_and(|c| to <= c.through);
+            let key = chunk_object(from, to);
+            if self.covered(&key, by_wm)
+                || self.check(t, stats, node, ReadbackObject::Chunk { from, to }, false)
+            {
+                out.chunks.push((from, to));
+            }
+        }
+        out
+    }
 }
 
 /// Spec §4.1 (RA1): the committed lineage below a set at `s` — the terms
@@ -326,6 +575,13 @@ pub struct Writer {
     last_retention_ns: Option<u64>,
     /// RA6: consecutive no-lineage deferrals of one set position.
     deferrals: Deferrals,
+    /// Ruling PF2 (as amended): the objects that count toward the report.
+    /// (The brief's `verified: HashSet<String>` lives in the [`Verifier`].)
+    verifier: Verifier,
+    /// `watermark_of` over the VERIFIED listing: what is reported. The raw
+    /// `wm` above stays the placement view, so the writer never re-cuts over
+    /// a persistently bad object.
+    report_wm: Option<(u64, u64, u64)>,
 }
 
 fn journal_err(e: impl std::fmt::Display) -> TierError {
@@ -675,7 +931,7 @@ fn put_artifact(
     level: i32,
     f: &mut LocalFile,
     stats: &WriterStats,
-) -> Result<(), TierError> {
+) -> Result<bool, TierError> {
     f.file.seek(SeekFrom::Start(0))?;
     let (src, len) = (&mut f.file, f.len);
     let put = t.put_if_absent(&f.tier_name, &mut |dst| {
@@ -685,9 +941,9 @@ fn put_artifact(
     match put {
         Put::Written(n) => {
             stats.bytes_set.fetch_add(n, Ordering::Relaxed);
-            Ok(())
+            Ok(true)
         }
-        Put::Exists => compare_artifact(t, f),
+        Put::Exists => compare_artifact(t, f).map(|()| false),
     }
 }
 
@@ -739,6 +995,7 @@ const PLACE_ROUNDS: usize = 3;
 /// still in the tier with its raw length, re-placing any that vanished
 /// (another writer's retention may have cleared the directory as aged
 /// residue while an upload sat in `.tmp`), and only then put `SET`.
+/// Returns the names THIS call created (the writer reads each back, RA2).
 fn place_set(
     t: &dyn BackupTarget,
     codec: Codec,
@@ -746,9 +1003,12 @@ fn place_set(
     label: &SetLabel,
     files: &mut [LocalFile],
     stats: &WriterStats,
-) -> Result<(), TierError> {
+) -> Result<Vec<String>, TierError> {
+    let mut made = Vec::new();
     for f in files.iter_mut() {
-        put_artifact(t, codec, level, f, stats)?;
+        if put_artifact(t, codec, level, f, stats)? {
+            made.push(f.tier_name.clone());
+        }
     }
     let mut rounds = 0;
     loop {
@@ -765,7 +1025,9 @@ fn place_set(
             )));
         }
         for i in absent {
-            put_artifact(t, codec, level, &mut files[i], stats)?;
+            if put_artifact(t, codec, level, &mut files[i], stats)? {
+                made.push(files[i].tier_name.clone());
+            }
         }
     }
     let text = label.render();
@@ -776,6 +1038,7 @@ fn place_set(
     match put {
         Put::Written(n) => {
             stats.bytes_set.fetch_add(n, Ordering::Relaxed);
+            made.push(set_label(label.position));
         }
         Put::Exists => {
             let mut s = String::new();
@@ -787,7 +1050,7 @@ fn place_set(
             }
         }
     }
-    Ok(())
+    Ok(made)
 }
 
 impl Writer {
@@ -836,6 +1099,8 @@ impl Writer {
             deferred: None,
             last_retention_ns: None,
             deferrals: Deferrals::default(),
+            verifier: Verifier::default(),
+            report_wm: None,
         }
     }
 
@@ -988,6 +1253,7 @@ impl Writer {
                 target = self.cfg.target.display().to_string().as_str(),
                 tier_id = info.tier_id
             );
+            self.shared.tier_id.store(info.tier_id, Ordering::Release);
             self.tier = Some(info);
             self.last_cut_ns.get_or_insert(now_ns);
         }
@@ -1079,11 +1345,27 @@ impl Writer {
             self.note_gap(old_through, oldest);
         }
         self.wm = wm;
+        // Ruling PF2 (as amended): the REPORT and the purge cap see only
+        // objects that were confirmed or re-read; placement keeps the raw
+        // listing.
+        let confirmed = *self
+            .shared
+            .confirmed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let ver = self.verifier.verified_listing(
+            &*self.target,
+            &self.shared.stats,
+            self.node_id,
+            &l,
+            confirmed.as_ref(),
+        );
+        self.report_wm = watermark_of(&ver);
         self.listing = Some(l);
         // Ruling RF2: the purge cap is the fillable chain end while a gap
         // below `through` exists, else `through`.
         let first_base = self.first_base.load(Ordering::Acquire);
-        if let Some((end, _)) = self.chain_end(first_base) {
+        if let Some((end, _)) = Self::chain_end_of(Some(&ver), self.report_wm, first_base) {
             self.shared.progress.store(end, Ordering::Release);
         }
         self.listed_at_ns = now_ns;
@@ -1096,11 +1378,18 @@ impl Writer {
     /// gap below `through` exists ([`fillable_gap`], ruling RF2), else
     /// `(through, None)`. `None` without a watermark.
     fn chain_end(&self, first_base: u64) -> Option<(u64, Option<u64>)> {
-        let (_, _, through) = self.wm?;
-        let gap = self
-            .listing
-            .as_ref()
-            .and_then(|l| fillable_gap(l, through, first_base));
+        Self::chain_end_of(self.listing.as_ref(), self.wm, first_base)
+    }
+
+    /// [`Self::chain_end`] over any listing and its watermark: the raw pair
+    /// for placement, the verified pair for the purge cap.
+    fn chain_end_of(
+        l: Option<&TierListing>,
+        wm: Option<(u64, u64, u64)>,
+        first_base: u64,
+    ) -> Option<(u64, Option<u64>)> {
+        let (_, _, through) = wm?;
+        let gap = l.and_then(|l| fillable_gap(l, through, first_base));
         Some(match gap {
             Some((e, next)) => (e, Some(next)),
             None => (through, None),
@@ -1126,7 +1415,7 @@ impl Writer {
     }
 
     fn maybe_offer(&mut self, now_ns: u64) {
-        let (Some(info), Some((oldest, newest, through))) = (&self.tier, self.wm) else {
+        let (Some(info), Some((oldest, newest, through))) = (&self.tier, self.report_wm) else {
             return;
         };
         let w = BackupWatermark {
@@ -1328,7 +1617,7 @@ impl Writer {
 
     fn copy_set(&mut self, label: &SetLabel, files: &mut [LocalFile]) -> Result<(), TierError> {
         let (codec, level) = (self.cfg.compression, self.cfg.compression_level);
-        place_set(
+        let made = place_set(
             &*self.target,
             codec,
             level,
@@ -1336,6 +1625,15 @@ impl Writer {
             files,
             &self.shared.stats,
         )?;
+        // RA2: whatever this writer created is read back before it can
+        // advance the report, whatever the watermark already says.
+        self.verifier.created_set(
+            &*self.target,
+            &self.shared.stats,
+            self.node_id,
+            label,
+            &made,
+        );
         crate::obs_event!(
             Info,
             "backup_set_copied",
@@ -1425,6 +1723,12 @@ impl Writer {
                     .stats
                     .bytes_journal
                     .fetch_add(n, Ordering::Relaxed);
+                self.verifier.created(
+                    &*self.target,
+                    &self.shared.stats,
+                    self.node_id,
+                    ReadbackObject::Chunk { from: e, to },
+                );
             }
             Put::Exists => self.compare_chunk(&name, e, to, crc)?,
         }
@@ -2098,5 +2402,323 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(e, TierError::OverlapMismatch(_)), "{e:?}");
+    }
+
+    /// Records every `open`; can serve one named object with a flipped byte
+    /// (`corrupt`) or fail its next open with an I/O error (`fail_once`).
+    struct Spy {
+        inner: crate::tier::target::FsTarget,
+        scratch: PathBuf,
+        opens: Mutex<Vec<String>>,
+        corrupt: Mutex<Option<String>>,
+        fail_once: Mutex<Option<String>>,
+    }
+
+    impl Spy {
+        fn new(root: &Path, scratch: &Path) -> Spy {
+            std::fs::create_dir_all(scratch).unwrap();
+            Spy {
+                inner: crate::tier::target::FsTarget::new(root),
+                scratch: scratch.to_path_buf(),
+                opens: Mutex::new(Vec::new()),
+                corrupt: Mutex::new(None),
+                fail_once: Mutex::new(None),
+            }
+        }
+        fn opened(&self, name: &str) -> usize {
+            self.opens
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|n| *n == name)
+                .count()
+        }
+        fn total_opens(&self) -> usize {
+            self.opens.lock().unwrap().len()
+        }
+    }
+
+    impl BackupTarget for Spy {
+        fn put_if_absent(
+            &self,
+            path: &str,
+            write: &mut dyn FnMut(&mut File) -> Result<u64, TierError>,
+        ) -> Result<Put, TierError> {
+            self.inner.put_if_absent(path, write)
+        }
+        fn list(&self, dir: &str) -> Result<Vec<String>, TierError> {
+            self.inner.list(dir)
+        }
+        fn open(&self, path: &str) -> Result<Option<File>, TierError> {
+            self.opens.lock().unwrap().push(path.to_string());
+            if self.fail_once.lock().unwrap().as_deref() == Some(path) {
+                *self.fail_once.lock().unwrap() = None;
+                return Err(TierError::Io(io::Error::other("injected open failure")));
+            }
+            let Some(mut f) = self.inner.open(path)? else {
+                return Ok(None);
+            };
+            if self.corrupt.lock().unwrap().as_deref() != Some(path) {
+                return Ok(Some(f));
+            }
+            let mut bytes = Vec::new();
+            f.read_to_end(&mut bytes).unwrap();
+            let last = bytes.len() - 1;
+            bytes[last] ^= 0xff;
+            let mut out = tempfile::tempfile_in(&self.scratch).unwrap();
+            io::Write::write_all(&mut out, &bytes).unwrap();
+            out.seek(SeekFrom::Start(0)).unwrap();
+            Ok(Some(out))
+        }
+        fn delete(&self, path: &str) -> Result<(), TierError> {
+            self.inner.delete(path)
+        }
+        fn delete_dir_if_empty(&self, dir: &str) -> Result<(), TierError> {
+            self.inner.delete_dir_if_empty(dir)
+        }
+    }
+
+    /// Two 64 B frames per chunk, written straight into the tier.
+    fn put_chunk(t: &dyn BackupTarget, from: u64, to: u64) {
+        let n = ((to - from) / 64) as usize;
+        let bytes: Vec<u8> = (0..n)
+            .flat_map(|i| frame(FRAME_TYPE_MESSAGE, 64, i as u8))
+            .collect();
+        t.put_if_absent(&chunk_object(from, to), &mut |f| {
+            write_object(
+                f,
+                MAGIC_CHUNK,
+                Codec::None,
+                0,
+                from,
+                to,
+                &mut &bytes[..],
+                bytes.len() as u64,
+            )
+        })
+        .unwrap();
+    }
+
+    /// A one-row set at `p`: local files in `src`, the label, the files.
+    fn set_fixture(src: &Path, p: u64) -> (SetLabel, Vec<LocalFile>) {
+        std::fs::create_dir_all(src).unwrap();
+        let mut row = Vec::new();
+        uc_service::snapshots::write_snapshot_envelope(&mut row, p, 1).unwrap();
+        row.extend_from_slice(&[7u8; 300]);
+        let cluster = vec![9u8; 100];
+        std::fs::write(src.join("row"), &row).unwrap();
+        std::fs::write(src.join("cluster"), &cluster).unwrap();
+        let h = |b: &[u8]| hash_stream(&mut &b[..]).unwrap();
+        let label = SetLabel {
+            position: p,
+            kind: uc_protocol::v2::catalog::SetKind::Full,
+            time_ns: 1,
+            rows: vec![RowLabel {
+                row: 0,
+                hash: h(&row[SNAPSHOT_ENVELOPE_LEN..]),
+                version: 1,
+                size: row.len() as u64,
+            }],
+            cluster_hash: h(&cluster),
+            cluster_size: cluster.len() as u64,
+            lineage: vec![(1, 0)],
+        };
+        let local = |name: &str, tier_name: String, env, hash, size| LocalFile {
+            tier_name,
+            file: File::open(src.join(name)).unwrap(),
+            len: std::fs::metadata(src.join(name)).unwrap().len(),
+            envelope_at: env,
+            hash,
+            size,
+        };
+        let files = vec![
+            local(
+                "row",
+                row_object(p, 0),
+                Some(p),
+                label.rows[0].hash,
+                row.len() as u64,
+            ),
+            local(
+                "cluster",
+                cluster_object(p),
+                None,
+                label.cluster_hash,
+                cluster.len() as u64,
+            ),
+        ];
+        (label, files)
+    }
+
+    fn entry(through: u64, newest_set: u64) -> BackupTierEntry {
+        BackupTierEntry {
+            tier_id: 1,
+            oldest_set: newest_set,
+            newest_set,
+            through,
+            reporter: 1,
+            updated_pos: 0,
+        }
+    }
+
+    /// A tier with one set at 128 and chunks [128,192), [192,256).
+    fn tier_fixture(d: &Path) -> (Spy, SetLabel) {
+        let spy = Spy::new(&d.join("tier"), &d.join("scratch"));
+        let (label, mut files) = set_fixture(&d.join("src"), 128);
+        place_set(
+            &spy,
+            Codec::None,
+            0,
+            &label,
+            &mut files,
+            &WriterStats::default(),
+        )
+        .unwrap();
+        put_chunk(&spy, 128, 192);
+        put_chunk(&spy, 192, 256);
+        spy.opens.lock().unwrap().clear();
+        (spy, label)
+    }
+
+    #[test]
+    fn an_injected_readback_failure_leaves_the_report_unmoved_and_counts_readback() {
+        let d = tempdir();
+        let (spy, _) = tier_fixture(d.path());
+        *spy.corrupt.lock().unwrap() = Some(chunk_object(192, 256));
+        let stats = WriterStats::default();
+        let mut v = Verifier::default();
+        let raw = list_tier(&spy).unwrap();
+        assert_eq!(
+            watermark_of(&raw),
+            Some((128, 128, 256)),
+            "the raw listing reaches b"
+        );
+        let ver = v.verified_listing(&spy, &stats, 1, &raw, None);
+        assert_eq!(
+            watermark_of(&ver),
+            Some((128, 128, 192)),
+            "through a, not b"
+        );
+        assert_eq!(stats.errors(WriterError::Readback), 1);
+        // The failure is not remembered: a retry re-reads it, still bad.
+        let again = v.verified_listing(&spy, &stats, 1, &raw, None);
+        assert_eq!(watermark_of(&again), Some((128, 128, 192)));
+        assert_eq!(stats.errors(WriterError::Readback), 2);
+        // Fix the byte: the next call reports b.
+        *spy.corrupt.lock().unwrap() = None;
+        let fixed = v.verified_listing(&spy, &stats, 1, &raw, None);
+        assert_eq!(watermark_of(&fixed), Some((128, 128, 256)));
+        assert_eq!(stats.errors(WriterError::Readback), 2);
+    }
+
+    #[test]
+    fn a_failed_open_is_a_failed_readback_and_a_retry_passes() {
+        let d = tempdir();
+        let (spy, _) = tier_fixture(d.path());
+        *spy.fail_once.lock().unwrap() = Some(chunk_object(128, 192));
+        let stats = WriterStats::default();
+        let mut v = Verifier::default();
+        let raw = list_tier(&spy).unwrap();
+        let ver = v.verified_listing(&spy, &stats, 1, &raw, None);
+        assert_eq!(
+            watermark_of(&ver),
+            Some((128, 128, 128)),
+            "no chunk counts: the first failed"
+        );
+        assert_eq!(stats.errors(WriterError::Readback), 1);
+        let ver = v.verified_listing(&spy, &stats, 1, &raw, None);
+        assert_eq!(watermark_of(&ver), Some((128, 128, 256)));
+    }
+
+    #[test]
+    fn a_set_with_one_bad_artifact_does_not_count() {
+        let d = tempdir();
+        let (spy, _) = tier_fixture(d.path());
+        *spy.corrupt.lock().unwrap() = Some(row_object(128, 0));
+        let stats = WriterStats::default();
+        let mut v = Verifier::default();
+        let raw = list_tier(&spy).unwrap();
+        assert_eq!(raw.sets.len(), 1);
+        let ver = v.verified_listing(&spy, &stats, 1, &raw, None);
+        assert!(
+            ver.sets.is_empty(),
+            "the set is absent from the verified listing"
+        );
+        assert_eq!(watermark_of(&ver), None);
+        assert_eq!(stats.errors(WriterError::Readback), 1);
+        // The raw listing (placement) still has it, so it is never re-copied.
+        assert_eq!(raw.sets.len(), 1);
+    }
+
+    /// RA2: the coverage rule vouches only for objects somebody else made.
+    #[test]
+    fn an_object_this_writer_creates_is_read_back_before_it_counts() {
+        let d = tempdir();
+        let spy = Spy::new(&d.path().join("tier"), &d.path().join("scratch"));
+        let (label, mut files) = set_fixture(&d.path().join("src"), 128);
+        let stats = WriterStats::default();
+        let made = place_set(&spy, Codec::None, 0, &label, &mut files, &stats).unwrap();
+        assert_eq!(made.len(), 3, "two artifacts and SET");
+        let confirmed = entry(256, 4096); // the watermark is far past this set
+        // A good one: opened once by the read-back, counts.
+        let mut v = Verifier::default();
+        let before = spy.opened(&row_object(128, 0));
+        v.created_set(&spy, &stats, 1, &label, &made);
+        assert_eq!(spy.opened(&row_object(128, 0)) - before, 1);
+        let raw = list_tier(&spy).unwrap();
+        assert_eq!(
+            v.verified_listing(&spy, &stats, 1, &raw, Some(&confirmed))
+                .sets
+                .len(),
+            1
+        );
+        assert_eq!(stats.errors(WriterError::Readback), 0);
+        // A corrupt one: covered by the watermark's newest_set, but this
+        // writer made it and its read-back failed, so it does not count.
+        let mut v = Verifier::default();
+        *spy.corrupt.lock().unwrap() = Some(row_object(128, 0));
+        v.created_set(&spy, &stats, 1, &label, &made);
+        assert_eq!(stats.errors(WriterError::Readback), 1);
+        let ver = v.verified_listing(&spy, &stats, 1, &raw, Some(&confirmed));
+        assert!(
+            ver.sets.is_empty(),
+            "coverage does not vouch for a failed creation"
+        );
+        *spy.corrupt.lock().unwrap() = None;
+        let ver = v.verified_listing(&spy, &stats, 1, &raw, Some(&confirmed));
+        assert_eq!(ver.sets.len(), 1, "a retry re-reads it and it passes");
+    }
+
+    #[test]
+    fn objects_the_watermark_already_confirms_are_not_reread() {
+        let d = tempdir();
+        let (spy, _) = tier_fixture(d.path());
+        let stats = WriterStats::default();
+        let raw = list_tier(&spy).unwrap();
+        spy.opens.lock().unwrap().clear();
+        // Confirmed: through a = 192, newest_set = 128.
+        let mut v = Verifier::default();
+        let ver = v.verified_listing(&spy, &stats, 1, &raw, Some(&entry(192, 128)));
+        assert_eq!(
+            spy.opened(&chunk_object(128, 192)),
+            0,
+            "[.., a) is confirmed"
+        );
+        assert_eq!(spy.opened(&row_object(128, 0)), 0);
+        assert_eq!(spy.opened(&cluster_object(128)), 0);
+        assert_eq!(spy.opened(&chunk_object(192, 256)), 1, "[a, b) is not");
+        assert_eq!(watermark_of(&ver), Some((128, 128, 256)));
+        // No committed entry: every object is opened once…
+        spy.opens.lock().unwrap().clear();
+        let mut v = Verifier::default();
+        v.verified_listing(&spy, &stats, 1, &raw, None);
+        assert_eq!(spy.opened(&chunk_object(128, 192)), 1);
+        assert_eq!(spy.opened(&chunk_object(192, 256)), 1);
+        assert_eq!(spy.opened(&row_object(128, 0)), 1);
+        assert_eq!(spy.opened(&cluster_object(128)), 1);
+        // …and a second call opens nothing.
+        let n = spy.total_opens();
+        v.verified_listing(&spy, &stats, 1, &raw, None);
+        assert_eq!(spy.total_opens(), n);
     }
 }

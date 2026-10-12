@@ -777,7 +777,7 @@ fn push_backup_tier_families(out: &mut String, s: &ObsSources, commit: u64) {
     push_labeled(
         out,
         "uc2_backup_errors_total",
-        "Errors this node's backup writer counted, by reason: foreign (the target's TIER names another app_id; the writer stopped), unavailable (target I/O, retried), overlap_mismatch (an existing object disagrees; the writer stopped), hash_mismatch (a local set does not match the catalog's hashes; skipped), journal_unavailable (this node's own journal could not supply a range; retried), fenced (a restore rolled the target's history back — fence/<Q>; the writer stopped), no_hardlinks (the target's filesystem cannot hard-link; the writer stopped). Alert: Uc2BackupWriterError; a stopped writer also raises Uc2BackupWriterStopped.",
+        "Errors this node's backup writer counted, by reason: foreign (the target's TIER names another app_id; the writer stopped), unavailable (target I/O, retried), overlap_mismatch (an existing object disagrees; the writer stopped), hash_mismatch (a local set does not match the catalog's hashes; skipped), journal_unavailable (this node's own journal could not supply a range; retried), fenced (a restore rolled the target's history back — fence/<Q>; the writer stopped), no_hardlinks (the target's filesystem cannot hard-link; the writer stopped), readback (an object failed its re-read through the target and does not count toward the report; retried each pass). Alert: Uc2BackupWriterError; a stopped writer also raises Uc2BackupWriterStopped.",
         "counter",
         &errors,
     );
@@ -2564,6 +2564,7 @@ mod tests {
             "uc2_backup_retention_deleted_total{kind=\"chunk\"} 0",
             "uc2_backup_errors_total{reason=\"fenced\"} 0",
             "uc2_backup_errors_total{reason=\"no_hardlinks\"} 0",
+            "uc2_backup_errors_total{reason=\"readback\"} 0",
             "uc2_backup_writer_stopped 0",
             "uc2_backup_hold_released 0",
         ] {

@@ -5816,6 +5816,22 @@ impl Consensus {
         }
     }
 
+    /// Backup-tier 3b (RA2): publish the committed watermark entry for the
+    /// writer's own tier, so the writer skips re-reading what the cluster
+    /// already confirmed. Called from [`Self::refresh_from_view`] on every
+    /// cluster-view move (one `Copy` entry under the lock). Until the writer
+    /// has learned its `tier_id`, or while the cluster has committed nothing
+    /// for it, `None` is published and the writer re-reads conservatively.
+    fn publish_backup_confirmed(&self, backups: &[uc_protocol::v2::backup::BackupTierEntry]) {
+        if let Some(shared) = &self.backup_shared {
+            let id = shared.tier_id.load(Ordering::Acquire);
+            let entry = (id != 0)
+                .then(|| backups.iter().find(|b| b.tier_id == id).copied())
+                .flatten();
+            *shared.confirmed.lock().unwrap_or_else(|e| e.into_inner()) = entry;
+        }
+    }
+
     /// M6 Task 6. When the receiver completes an inbound snapshot transfer it
     /// raises `incoming_snapshot`; sample it and, on a new position, mirror it to
     /// the cnc observability slot and — when our own durable frontier is below it
@@ -9274,6 +9290,7 @@ impl Consensus {
         }
         self.view_position_seen = vp;
         let inner = self.cluster_view.snapshot_inner();
+        self.publish_backup_confirmed(&inner.backups);
         // Catalog spec §5.1: `sets_held` is a bitmap over THIS view's list,
         // stamped with its content hash (ruling R16) — recomputed only when
         // that hash moved, not on every cursor move. `publish` stores the

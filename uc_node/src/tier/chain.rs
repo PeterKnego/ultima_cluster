@@ -39,7 +39,10 @@ fn corrupt(what: impl Into<String>, detail: impl Into<String>) -> TierError {
 /// A set's `SET` label: `Ok(None)` when absent (an interrupted write — the
 /// label is written last), `Err` when present but unusable (it does not
 /// parse, or names another position than its directory).
-fn read_label(t: &dyn BackupTarget, p: u64) -> Result<Option<Result<SetLabel, String>>, TierError> {
+pub(crate) fn read_label(
+    t: &dyn BackupTarget,
+    p: u64,
+) -> Result<Option<Result<SetLabel, String>>, TierError> {
     let Some(mut f) = t.open(&format!("{}/{SET_FILE}", set_dir(p)))? else {
         return Ok(None);
     };
@@ -176,7 +179,7 @@ pub fn plan_chain(chunks: &[(u64, u64)], from: u64, to: u64) -> Result<Vec<(u64,
 /// Open and stream one chunk: header checks, per-frame walk, optional
 /// byte-equality against the overlap with `prev`. `sink` gets every raw byte
 /// of the chunk, frame-aligned pieces, with the position of the first byte.
-fn walk_chunk(
+pub(crate) fn walk_chunk(
     t: &dyn BackupTarget,
     ch: (u64, u64),
     prev: Option<(u64, u64)>,
@@ -327,7 +330,7 @@ pub struct VerifyReport {
     pub info: Vec<String>,
 }
 
-fn stream_object(
+pub(crate) fn stream_object(
     t: &dyn BackupTarget,
     path: &str,
     deep_hash_skip: Option<usize>,

@@ -481,7 +481,7 @@ groups:
     # re-fire once it does.
     expr: increase(uc2_backup_errors_total[10m]) > 0
     labels: { severity: warning }
-    annotations: { summary: "{{ $labels.instance }} backup writer error: reason {{ $labels.reason }}", description: "The `reason` label says which: foreign / overlap_mismatch (target disagrees with this cluster; the writer STOPPED, restart needs a fixed target), fenced (a restore rolled the target's history back; the writer STOPPED, point [backup] target at a new empty directory), no_hardlinks (the target's filesystem cannot hard-link; the writer STOPPED), unavailable (target I/O), hash_mismatch (a local set does not match the catalog), journal_unavailable (this node's own journal could not supply a range). See the runbook's backup-tier alerts." }
+    annotations: { summary: "{{ $labels.instance }} backup writer error: reason {{ $labels.reason }}", description: "The `reason` label says which: foreign / overlap_mismatch (target disagrees with this cluster; the writer STOPPED, restart needs a fixed target), fenced (a restore rolled the target's history back; the writer STOPPED, point [backup] target at a new empty directory), no_hardlinks (the target's filesystem cannot hard-link; the writer STOPPED), unavailable (target I/O), hash_mismatch (a local set does not match the catalog), journal_unavailable (this node's own journal could not supply a range), readback (an object in the tier failed its re-read and does not count toward the report; run `uc2ctl tier verify`). See the runbook's backup-tier alerts." }
   - alert: Uc2BackupWriterStopped
     # Final review F3: a writer that stopped for good (foreign,
     # overlap_mismatch, fenced, no_hardlinks) stays stopped until its node
