@@ -92,6 +92,7 @@ fn tier_forget_removes_a_tier_and_refuses_62_for_an_unknown_one() {
             socket: Some(sock),
             admin: AdminPolicy::Filesystem,
             backup: None,
+            tier_source: None,
         },
     )
     .expect("start");

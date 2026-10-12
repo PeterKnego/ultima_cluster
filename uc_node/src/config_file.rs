@@ -347,6 +347,29 @@ pub fn parse_duration(field: &str, s: &str) -> Result<Duration, String> {
         .ok_or_else(|| format!("{field}: {s:?} overflows"))
 }
 
+/// Backup-tier 3b spec §6.1: `[tier_source]`, node-local. One key: the mounted
+/// tier this node may fetch snapshot sets from, read-only.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TierSourceSection {
+    #[serde(default)]
+    target: Option<PathBuf>,
+}
+
+/// `[tier_source]` → its path; `tier_source.target` is required.
+fn parse_tier_source(s: TierSourceSection) -> Result<PathBuf, ConfigError> {
+    match s.target {
+        Some(t) if !t.as_os_str().is_empty() => Ok(t),
+        _ => Err(ConfigError::Invalid {
+            field: "tier_source.target",
+            detail: "tier_source.target is required in a [tier_source] section: the mounted \
+                     directory of a backup tier this node may fetch snapshots from (remove \
+                     the section to fetch from peers only)"
+                .into(),
+        }),
+    }
+}
+
 /// `[backup]` → [`BackupConfig`], with the spec §5.1 refusals by name.
 fn parse_backup(b: BackupSection) -> Result<BackupConfig, ConfigError> {
     let inv = |field: &'static str, detail: String| ConfigError::Invalid { field, detail };
@@ -476,6 +499,10 @@ struct NodeConfigFile {
     /// Backup-tier spec §5.1: the `uc2-backup` writer. Absent means none.
     #[serde(default)]
     backup: Option<BackupSection>,
+    /// Backup-tier 3b spec §6.1: a read-only tier to fetch from. Absent
+    /// means the `[backup]` target (if any), else peers only.
+    #[serde(default)]
+    tier_source: Option<TierSourceSection>,
 }
 
 fn default_buffer_bytes() -> usize {
@@ -792,6 +819,7 @@ pub fn parse_str_with_env(
     }
 
     let backup = f.backup.map(parse_backup).transpose()?;
+    let tier_source = f.tier_source.map(parse_tier_source).transpose()?;
     let purge = match f.purge {
         Some(p) => PurgePolicy::BelowSnapshot {
             slack_bytes: p.below_snapshot_slack_bytes,
@@ -1075,6 +1103,7 @@ pub fn parse_str_with_env(
             },
             admin,
             backup,
+            tier_source,
         },
     ))
 }
@@ -2186,6 +2215,27 @@ level = "info"
             ),
             (64 << 20, Duration::from_secs(60), Codec::Zstd, 3)
         );
+    }
+
+    #[test]
+    fn tier_source_section_parses_its_one_key_and_refuses_others() {
+        let (_c, o) = load_str(MINIMAL).unwrap();
+        assert_eq!(o.tier_source, None);
+        let (_c, o) =
+            load_str(&format!("{MINIMAL}\n[tier_source]\ntarget = \"/mnt/x\"\n")).unwrap();
+        assert_eq!(o.tier_source, Some(PathBuf::from("/mnt/x")));
+        for body in ["", "target = \"\""] {
+            match load_str(&format!("{MINIMAL}\n[tier_source]\n{body}\n")) {
+                Err(ConfigError::Invalid { field, .. }) => assert_eq!(field, "tier_source.target"),
+                other => panic!("{body:?}: {other:?}"),
+            }
+        }
+        assert!(matches!(
+            load_str(&format!(
+                "{MINIMAL}\n[tier_source]\ntarget = \"/t\"\nx = 1\n"
+            )),
+            Err(ConfigError::Parse { .. })
+        ));
     }
 
     #[test]

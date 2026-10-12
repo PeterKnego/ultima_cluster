@@ -132,6 +132,7 @@ fn main() -> ExitCode {
             socket: None,
             admin,
             backup: opts.backup.clone(),
+            tier_source: opts.tier_source.clone(),
         },
     ) {
         Ok(n) => n,

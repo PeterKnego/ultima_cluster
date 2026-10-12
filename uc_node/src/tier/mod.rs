@@ -6,6 +6,7 @@ pub mod layout;
 pub mod materialize;
 pub mod object;
 pub mod retention;
+pub mod source;
 pub mod target;
 pub mod writer;
 
@@ -30,6 +31,17 @@ pub enum TierError {
     Corrupt { what: String, detail: String },
     #[error("tier target {0} belongs to app_id {1}, not {2} (backup_target_foreign)")]
     Foreign(String, String, String),
+    /// 3b spec §6.1: a `[tier_source]` whose `TIER` names another cluster.
+    /// Distinct from [`Foreign`](Self::Foreign) so an operator can tell the
+    /// read-only source from the writer's target.
+    #[error(
+        "tier source {path} belongs to app_id {tier_app_id}, not {app_id} (tier_source_foreign)"
+    )]
+    SourceForeign {
+        path: String,
+        tier_app_id: String,
+        app_id: String,
+    },
     #[error("tier overlap mismatch at {0} (tier_overlap_mismatch)")]
     OverlapMismatch(String),
     #[error("{0}")]

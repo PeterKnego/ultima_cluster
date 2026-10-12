@@ -91,6 +91,7 @@ fn spawn_cluster(n: usize) -> Cluster {
             socket: Some(sock),
             admin: AdminPolicy::Filesystem,
             backup: None,
+            tier_source: None,
         };
         nodes.push(Node::start_with(cfg, opts).expect("start"));
     }
@@ -423,6 +424,7 @@ mod writer_e2e {
                 socket: Some(sock),
                 admin: AdminPolicy::Filesystem,
                 backup: self.backup.clone(),
+                tier_source: None,
             };
             self.node = Some(Node::start_with((self.cfg)(), opts).expect("start node"));
         }
@@ -2756,6 +2758,7 @@ mod writer_e2e {
                 socket: Some(sock),
                 admin: AdminPolicy::Filesystem,
                 backup: None,
+                tier_source: None,
             },
         )
         .expect("start the fork");

@@ -337,6 +337,19 @@ pub struct StartOpts {
     /// for the reason `admin` is: `NodeConfig` has no `Default` and many
     /// literal call sites.
     pub backup: Option<crate::tier::writer::BackupConfig>,
+    /// Backup-tier 3b spec §6.1: `[tier_source]` — a read-only tier to fetch
+    /// snapshot sets from. Resolved with `backup` by
+    /// [`resolve_tier_source`]. Here for the reason `backup` is.
+    pub tier_source: Option<std::path::PathBuf>,
+}
+
+/// 3b spec §6.1: the tier a node reads as a source — `[tier_source]` if
+/// given, else its own `[backup]` target, else none (peers only).
+pub fn resolve_tier_source(
+    tier_source: Option<std::path::PathBuf>,
+    backup: Option<&crate::tier::writer::BackupConfig>,
+) -> Option<std::path::PathBuf> {
+    tier_source.or_else(|| backup.map(|b| b.target.clone()))
 }
 
 /// Ingress queue depth (M5 replaces this with the client submit ring).
@@ -1345,6 +1358,7 @@ impl Node {
             socket,
             admin,
             backup,
+            tier_source,
         } = opts;
         let sock = match socket {
             Some(sock) => sock,
@@ -1384,6 +1398,28 @@ impl Node {
         cfg.services
             .validate("NodeConfig::services fsm_lag", cfg.buffer_bytes as u64)
             .map_err(|d| io::Error::new(io::ErrorKind::InvalidInput, d))?;
+
+        // Backup-tier 3b spec §6.1: the read-only tier source. A tier of
+        // another cluster is a named refusal; an absent or unreadable one is
+        // logged and every fetch falls back to peers.
+        let tier_source_handle = match resolve_tier_source(tier_source, backup.as_ref()) {
+            Some(path) => {
+                let src =
+                    crate::tier::source::TierSource::open(&path, &cfg.app_id).map_err(|e| {
+                        io::Error::other(format!("node {} refuses to start: {e}", cfg.id))
+                    })?;
+                if let Some(detail) = src.unavailable() {
+                    uc_obs::obs_event!(
+                        Warn,
+                        "tier_source_unavailable",
+                        path = path.display().to_string().as_str(),
+                        detail = detail.as_str()
+                    );
+                }
+                Some(Arc::new(src))
+            }
+            None => None,
+        };
 
         let instance = InstanceDir::acquire(&cfg.instance_dir).map_err(to_io)?;
 
@@ -2573,6 +2609,7 @@ impl Node {
             backup_reports_appended: Arc::clone(&backup_reports_appended),
             backup_shared: backup_shared.clone(),
             backup_chunk_bytes: backup.as_ref().map_or(0, |b| b.chunk_bytes),
+            tier_source: tier_source_handle.clone(),
             backup_hold_released: Arc::clone(&backup_hold_released),
             purge_gate: Arc::clone(&purge_gate),
             effective_gate,
@@ -4012,6 +4049,10 @@ struct Consensus {
     /// `[backup] chunk_bytes`: the space rule's size (`auto_fetch::fits`
     /// over one chunk). Unused without a writer.
     backup_chunk_bytes: u64,
+    /// Backup-tier 3b spec §6.1: the read-only tier this node may fetch
+    /// snapshot sets from (Tasks 12/13 consume it).
+    #[allow(dead_code)]
+    tier_source: Option<Arc<crate::tier::source::TierSource>>,
     /// `uc2_backup_hold_released_total`: releases, once per episode.
     backup_hold_released: Arc<AtomicU64>,
     /// Backup-tier 3b spec §5.2: the journal-purge gate — `u64::MAX` when
@@ -15294,6 +15335,7 @@ mod tests {
             backup_reports_appended: Arc::new(AtomicU64::new(0)),
             backup_shared: None,
             backup_chunk_bytes: 0,
+            tier_source: None,
             backup_hold_released: Arc::new(AtomicU64::new(0)),
             purge_gate: Arc::new(AtomicU64::new(u64::MAX)),
             effective_gate: Arc::new(AtomicU64::new(u64::MAX)),
@@ -27758,5 +27800,29 @@ mod tests {
         let (status, reason, _) = h.cons.apply_tier_forget(0xABCD);
         assert_eq!((status, reason), (1, REASON_TIER_UNKNOWN));
         assert_eq!(h.cons.last_cluster_append, before, "nothing appended");
+    }
+}
+
+#[cfg(test)]
+mod tier_source_resolve_tests {
+    use super::resolve_tier_source;
+    use crate::tier::writer::BackupConfig;
+    use std::path::PathBuf;
+
+    #[test]
+    fn a_backup_only_node_reads_its_own_target_and_tier_source_wins() {
+        let b = BackupConfig {
+            target: "/b".into(),
+            ..BackupConfig::default()
+        };
+        assert_eq!(resolve_tier_source(None, None), None);
+        assert_eq!(
+            resolve_tier_source(None, Some(&b)),
+            Some(PathBuf::from("/b"))
+        );
+        assert_eq!(
+            resolve_tier_source(Some("/s".into()), Some(&b)),
+            Some(PathBuf::from("/s"))
+        );
     }
 }

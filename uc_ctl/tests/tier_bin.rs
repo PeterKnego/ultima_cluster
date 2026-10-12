@@ -165,6 +165,7 @@ fn kv_tier() -> (tempfile::TempDir, PathBuf, u64, u64) {
                 quiet_interval: Duration::from_millis(300),
                 ..BackupConfig::default()
             }),
+            tier_source: None,
         },
     )
     .expect("start");

@@ -336,3 +336,29 @@ fn daemon_refuses_a_uc_prefixed_service_name() {
         out.status
     );
 }
+
+/// Backup-tier 3b spec §6.1: a `[tier_source]` whose `TIER` belongs to another
+/// cluster refuses to start by name (`tier_source_foreign`), not as a
+/// writer-side `backup_target_foreign`.
+#[test]
+fn daemon_refuses_a_tier_source_of_another_app_id() {
+    let dir = scratch();
+    let tier = dir.path().join("tier");
+    std::fs::create_dir_all(&tier).unwrap();
+    std::fs::write(
+        tier.join("TIER"),
+        "format=uc2-tier-v1\napp_id=someone-else\ntier_id=0x0000000000000007\ncreated_ns=1\n",
+    )
+    .unwrap();
+    let extra = format!(
+        "{VALID_TAIL}\n[tier_source]\ntarget = \"{}\"\n",
+        tier.display()
+    );
+    let (cfg, _inst) = write_config(dir.path(), 19873, &extra);
+
+    let out = run(&cfg);
+    assert!(!out.status.success(), "must refuse to start");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("tier_source_foreign"), "got: {err}");
+    assert!(!err.contains("backup_target_foreign"), "got: {err}");
+}

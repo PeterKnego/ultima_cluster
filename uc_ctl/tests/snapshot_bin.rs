@@ -81,6 +81,7 @@ fn start_node(root: &Path, name: &str) -> (Node, PathBuf) {
         socket: Some(sock),
         admin: AdminPolicy::Filesystem,
         backup: None,
+        tier_source: None,
     };
     let node = Node::start_with(cfg, opts).expect("start");
     (node, instance_dir)
