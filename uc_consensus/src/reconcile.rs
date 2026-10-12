@@ -526,6 +526,7 @@ mod lineage_property {
 
     #[test]
     fn a_set_seeded_map_aligns_and_keeps_everything_up_to_q() {
+        let mut aligned = 0u32;
         let mut seed = 0x9e37_79b9_7f4a_7c15u64;
         let mut next = || {
             seed ^= seed << 13;
@@ -551,14 +552,22 @@ mod lineage_property {
                 continue;
             }
             match reconcile(&own, q, &leader) {
-                Reconcile::Ok(o) => assert!(
-                    o.valid_up_to >= q,
-                    "n={n} s={s} q={q} cut to {}",
-                    o.valid_up_to
-                ),
+                Reconcile::Ok(o) => {
+                    assert!(
+                        o.valid_up_to >= q,
+                        "n={n} s={s} q={q} cut to {}",
+                        o.valid_up_to
+                    );
+                    aligned += 1;
+                }
                 Reconcile::NoCommonPrefix => panic!("n={n} s={s} q={q}: no common prefix"),
             }
         }
+        eprintln!("lineage_property: {aligned} of 2000 iterations exercised alignment");
+        assert!(
+            aligned >= 500,
+            "non-vacuity: only {aligned} of 2000 iterations exercised alignment"
+        );
     }
 
     #[test]
