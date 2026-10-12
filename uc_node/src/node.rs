@@ -1758,9 +1758,14 @@ impl Node {
         // Spec §5.4: the writer's shared state exists before the agents that
         // read it — the consensus agent (the purge hold and the keep hold)
         // and the archive agent (the same cap, applied defensively).
-        let backup_shared = backup
-            .as_ref()
-            .map(|_| Arc::new(crate::tier::writer::WriterShared::default()));
+        let backup_shared = backup.as_ref().map(|_| {
+            let shared = crate::tier::writer::WriterShared::default();
+            // Boot publish (3b): the recovered, re-derived map — published
+            // even when it needed no rewrite, so the writer's first pass
+            // already has a lineage to record.
+            *shared.term_map.lock().unwrap_or_else(|e| e.into_inner()) = sm.term_map().to_vec();
+            Arc::new(shared)
+        });
         // A learner never leads, so its sender streams to no one: give it a solo
         // (empty) fan-out with a cluster size of 1, which also sidesteps flow
         // control's leader-in-cluster invariant (from a learner's view every voter
@@ -2877,6 +2882,19 @@ impl Node {
     /// driver runs, this advances to at most the snapshot floor.
     pub fn archive_first_base(&self) -> u64 {
         self.archive_first_base.load(Ordering::Acquire)
+    }
+
+    /// Backup-tier 3b — TEST SEAM, not API: the node's term map as the
+    /// writer sees it (`WriterShared::term_map`), or, on a node with no
+    /// writer, the persisted map read from the state dir.
+    #[doc(hidden)]
+    pub fn term_map_for_test(&self) -> Vec<(u32, u64)> {
+        if let Some(w) = &self.backup_writer {
+            return w.term_map.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        }
+        NodeState::open(&self._instance.state_dir())
+            .map(|s| to_pairs(&s.term_map()))
+            .unwrap_or_default()
     }
 
     /// Cluster-FSM spec §4.1/§4.5: the cluster FSM's own published view
@@ -5731,6 +5749,16 @@ impl Consensus {
         self.publish_peer_band();
     }
 
+    /// Backup-tier 3b: publish the SM's full in-memory term map to the
+    /// writer, right after a `store_term_map` made it durable. A no-op
+    /// without a writer.
+    fn publish_term_map(&self) {
+        if let Some(shared) = &self.backup_shared {
+            *shared.term_map.lock().unwrap_or_else(|e| e.into_inner()) =
+                self.sm.term_map().to_vec();
+        }
+    }
+
     /// M6 Task 6. When the receiver completes an inbound snapshot transfer it
     /// raises `incoming_snapshot`; sample it and, on a new position, mirror it to
     /// the cnc observability slot and — when our own durable frontier is below it
@@ -5793,6 +5821,7 @@ impl Consensus {
                 self.state
                     .store_term_map(&map)
                     .expect("term-map persist fail-stop");
+                self.publish_term_map();
             }
             // M7 Task 6 / cluster-FSM spec §5.6: the snapshot session carried
             // the leader's membership alongside the lineage — inside the
@@ -12200,6 +12229,7 @@ impl Consensus {
                 self.state
                     .store_term_map(&map)
                     .expect("term-map persist fail-stop");
+                self.publish_term_map();
                 // (Plan 1 task 5: no schedule-record revert here any more. The
                 // table lives in the cluster FSM, which advances only at
                 // COMMIT, and the collapse cuts only this node's own
@@ -12362,6 +12392,7 @@ impl Consensus {
                 self.state
                     .store_term_map(&to_entries(&new_map))
                     .expect("term-map persist fail-stop");
+                self.publish_term_map();
                 // M7 Task 6: persist-revert-BEFORE-truncate — the SAME discipline as
                 // the term-map persist immediately above. If this truncation drops
                 // the currently-adopted config FRAME (`to` lands strictly below its
@@ -12434,6 +12465,7 @@ impl Consensus {
                 self.state
                     .store_term_map(&to_entries(&new_map))
                     .expect("term-map persist fail-stop");
+                self.publish_term_map();
             }
             Action::Fatal { reason } => {
                 panic!("consensus fatal (fail-stop): {reason}");

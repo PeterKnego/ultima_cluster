@@ -196,6 +196,48 @@ pub struct WriterShared {
     #[doc(hidden)]
     pub paused_for_test: AtomicBool,
     pub stats: WriterStats,
+    /// The node's full in-memory term map (`ElectionSm::term_map()`) as last
+    /// persisted — `(term, base)` pairs, published by the consensus agent
+    /// after every `store_term_map`. Empty until the first publish (boot).
+    /// The writer derives each set's lineage from it ([`lineage_below`]).
+    pub term_map: Mutex<Vec<(u32, u64)>>,
+}
+
+/// Spec §4.1 (RA1): the committed lineage below a set at `s` — the terms
+/// whose base is STRICTLY below `s`. A term opened exactly at `s` has no
+/// bytes under the set, so it is not part of what the set sits on.
+pub fn lineage_below(term_map: &[(u32, u64)], s: u64) -> Vec<(u32, u64)> {
+    term_map.iter().copied().filter(|&(_, b)| b < s).collect()
+}
+
+/// RA6: how many consecutive passes deferred the same set for want of a
+/// lineage. Normally one or two (the first pass after boot, before the map
+/// is published); a persistent run means the map no longer reaches below the
+/// set, which deserves one line in the log.
+#[derive(Debug, Default)]
+struct Deferrals {
+    cur: Option<(u64, u32)>,
+}
+
+/// Consecutive deferrals of one set position that raise `tier_set_deferred`.
+const DEFERRALS_BEFORE_WARN: u32 = 10;
+
+impl Deferrals {
+    /// Count a deferral of the set at `position`; true exactly on the
+    /// [`DEFERRALS_BEFORE_WARN`]th consecutive one. A different position
+    /// restarts the count.
+    fn note(&mut self, position: u64) -> bool {
+        let n = match self.cur {
+            Some((p, n)) if p == position => n.saturating_add(1),
+            _ => 1,
+        };
+        self.cur = Some((position, n));
+        n == DEFERRALS_BEFORE_WARN
+    }
+
+    fn clear(&mut self) {
+        self.cur = None;
+    }
 }
 
 impl WriterShared {
@@ -279,6 +321,8 @@ pub struct Writer {
     deferred: Option<u64>,
     /// When the last retention pass ran (spec §7); `None` = never.
     last_retention_ns: Option<u64>,
+    /// RA6: consecutive no-lineage deferrals of one set position.
+    deferrals: Deferrals,
 }
 
 fn journal_err(e: impl std::fmt::Display) -> TierError {
@@ -788,6 +832,7 @@ impl Writer {
             quiet_declined: None,
             deferred: None,
             last_retention_ns: None,
+            deferrals: Deferrals::default(),
         }
     }
 
@@ -1130,6 +1175,12 @@ impl Writer {
         let policy = RetentionPolicy::from_view(&self.view);
         let inner = self.view.snapshot_inner();
         let tier_sets: &[SetLabel] = self.listing.as_ref().map_or(&[], |l| &l.sets);
+        let term_map = self
+            .shared
+            .term_map
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         let mut todo: Vec<SetLabel> = inner
             .catalog
             .iter()
@@ -1138,13 +1189,26 @@ impl Writer {
                     && !have.contains(&e.position)
                     && !self.mismatched.contains(&e.position)
             })
-            .map(|e| SetLabel::from_catalog(e, Vec::new()))
+            .map(|e| SetLabel::from_catalog(e, lineage_below(&term_map, e.position)))
             .filter(|l| !retention::recopy_blocked(tier_sets, l, &policy, &inner))
             .collect();
-        // Task 3 fills the lineage; until then a set cannot be written.
-        if todo.iter().any(|l| l.lineage.is_empty()) {
+        // A set with no lineage cannot be written (its SET would be
+        // refused): defer, and rescan next pass — the map may simply not be
+        // published yet. RA6: the tenth consecutive deferral of one set
+        // says so once.
+        if let Some(pos) = todo
+            .iter()
+            .filter(|l| l.lineage.is_empty())
+            .map(|l| l.position)
+            .max()
+        {
+            if self.deferrals.note(pos) {
+                crate::obs_event!(Warn, "tier_set_deferred", position = pos);
+            }
+            self.scan_due = true;
             return Ok(false);
         }
+        self.deferrals.clear();
         todo.sort_by_key(|l| std::cmp::Reverse(l.position));
         // The sets this node holds whole on disk, newest first.
         let mut held: Vec<(SetLabel, Vec<LocalFile>)> = Vec::new();
@@ -1427,6 +1491,38 @@ pub fn local_row_artifact(instance_dir: &Path, row: u8, p: u64) -> PathBuf {
 mod tests {
     use super::*;
     use uc_journal::JournalConfig;
+
+    /// RA1: a term opened exactly at S has no bytes below the set.
+    #[test]
+    fn a_term_opened_exactly_at_s_is_not_in_the_lineage() {
+        const S: u64 = 8192;
+        let map = [(1, 0), (2, 4096), (3, S)];
+        assert_eq!(lineage_below(&map, S), vec![(1, 0), (2, 4096)]);
+        assert!(lineage_below(&[], S).is_empty());
+        assert!(lineage_below(&[(1, S)], S).is_empty());
+    }
+
+    /// RA6: ten consecutive deferrals of one set raise the warning exactly
+    /// once; a different set or a success restarts the count.
+    #[test]
+    fn a_set_deferred_ten_passes_logs_tier_set_deferred_once() {
+        let mut d = Deferrals::default();
+        let fired = (0..25).filter(|_| d.note(4096)).count();
+        assert_eq!(fired, 1, "one warning over 25 deferrals of one set");
+        let mut d = Deferrals::default();
+        for _ in 0..9 {
+            assert!(!d.note(4096));
+        }
+        assert!(!d.note(8192), "a different set restarts the count");
+        for _ in 0..8 {
+            assert!(!d.note(8192));
+        }
+        assert!(d.note(8192), "tenth consecutive for 8192");
+        d.clear();
+        for _ in 0..9 {
+            assert!(!d.note(8192), "a success restarted the count");
+        }
+    }
     use uc_protocol::v2::frame::{
         CLUSTER_BODY_PREFIX_LEN, FRAME_TYPE_MESSAGE, FrameHeader, write_cluster_prefix,
         write_header_except_length,

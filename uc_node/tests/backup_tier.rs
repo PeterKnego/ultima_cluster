@@ -1090,6 +1090,25 @@ mod writer_e2e {
         let t = FsTarget::new(tier.path());
         let listing = list_tier(&t).unwrap();
         assert!(listing.sets.iter().any(|s| s.position == p), "{listing:?}");
+        // 3b: the SET records the committed lineage strictly below the set.
+        let mut text = String::new();
+        std::io::Read::read_to_string(
+            &mut t
+                .open(&uc_node::tier::layout::set_label(p))
+                .unwrap()
+                .expect("SET present"),
+            &mut text,
+        )
+        .unwrap();
+        let label = uc_node::tier::layout::SetLabel::parse(&text).expect("SET parses");
+        let expect: Vec<(u32, u64)> = c
+            .node(1)
+            .term_map_for_test()
+            .into_iter()
+            .filter(|&(_, b)| b < p)
+            .collect();
+        assert!(!label.lineage.is_empty());
+        assert_eq!(label.lineage, expect);
         assert!(
             listing.chunks.len() >= 2,
             "1 MiB chunks over ~2.5 MiB of history: {:?}",
@@ -1859,6 +1878,11 @@ mod writer_e2e {
             );
             assert!(listing.sets.iter().any(|s| s.position == w.oldest_set));
         }
+        assert!(
+            listing.corrupt_sets.is_empty(),
+            "the two writers' lineages agreed: {:?}",
+            listing.corrupt_sets
+        );
         let report = verify(&t, true).unwrap();
         assert!(report.findings.is_empty(), "{:?}", report.findings);
         assert!(
