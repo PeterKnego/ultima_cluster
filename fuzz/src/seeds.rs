@@ -1950,6 +1950,7 @@ pub fn uc_protocol_settings() -> Vec<Seed> {
         auto_fetch: true,
         backup_retain_sets: 4,
         backup_retain_age_secs: 2_592_000,
+        purge_requires_tiers: 2,
     });
     // The version-1 shape `2.11.0` wrote — a live corpus value, not a
     // refusal: it decodes with `datagram_mtu = 0` (jumbo spec §5.5).
@@ -1975,6 +1976,14 @@ pub fn uc_protocol_settings() -> Vec<Seed> {
         v[0] = 4;
         v
     };
+    // Backup-tier 3b: the v5 shape (46 B, no purge_requires_tiers) is a live
+    // corpus value - it decodes with purge_requires_tiers = 0.
+    let v5 = {
+        let mut v = genesis.clone();
+        v.truncate(SETTINGS_LEN_V5);
+        v[0] = 5;
+        v
+    };
     let mut bad_version = genesis.clone();
     bad_version[0] = 3;
     let mut bad_target = genesis.clone();
@@ -1992,6 +2001,7 @@ pub fn uc_protocol_settings() -> Vec<Seed> {
         Seed::fixed("07-version-1", v1),
         Seed::fixed("08-version-3", v3),
         Seed::fixed("09-version-4", v4),
+        Seed::fixed("10-version-5", v5),
     ]
 }
 

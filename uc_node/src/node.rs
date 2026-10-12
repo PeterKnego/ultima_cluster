@@ -11220,7 +11220,7 @@ impl Consensus {
                 (0, 0, position)
             }
             Err(AppendError::WouldOverrun) => (2, 0, view_position),
-            // Unreachable: `SETTINGS_LEN` is 46 bytes. Refused rather than
+            // Unreachable: `SETTINGS_LEN` is 47 bytes. Refused rather than
             // retried, for `apply_schedule_table`'s reason.
             Err(AppendError::PayloadTooLarge) => self.refuse_settings(REASON_SETTINGS_DECODE),
         }
@@ -22416,9 +22416,20 @@ mod tests {
             "a refused apply leaves the staged file for the operator to re-sign"
         );
 
+        // (f) backup-tier 3b: `purge_requires_tiers` above `MAX_BACKUP_TIERS`.
+        stage_settings_for_test(
+            &h,
+            &Settings {
+                purge_requires_tiers: 5,
+                ..Settings::genesis_default()
+            },
+        );
+        let (status, reason, _) = h.cons.apply_settings_staged();
+        assert_eq!((status, reason), (1, REASON_SETTINGS_BOUNDS));
+
         assert_eq!(
             h.cons.last_cluster_append, 0,
-            "nothing was appended by any of the five refusals"
+            "nothing was appended by any of the six refusals"
         );
     }
 

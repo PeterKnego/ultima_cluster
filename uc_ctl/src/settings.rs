@@ -57,6 +57,7 @@ struct SettingsFile {
     auto_fetch: Option<bool>,
     backup_retain_sets: Option<u16>,
     backup_retain_age: Option<String>,
+    purge_requires_tiers: Option<u8>,
 }
 
 /// TOML text -> a validated [`Settings`]. Every key is optional; an absent
@@ -135,6 +136,7 @@ pub fn parse_settings(toml_text: &str) -> Result<Settings, String> {
         // Backup-tier spec: absent means `0` — a tier keeps every set.
         backup_retain_sets: file.backup_retain_sets.unwrap_or(0),
         backup_retain_age_secs,
+        purge_requires_tiers: file.purge_requires_tiers.unwrap_or(0),
     })
 }
 
@@ -232,7 +234,7 @@ fn render_fsm_lag(bytes: u64) -> String {
 /// **Field-ordering contract.** The line is `key=value` pairs in a FIXED
 /// order — `position`, `admission_bytes`, `fsm_lag`,
 /// `snapshot_interval_bytes`, `snapshot_target`, `retain_sets`,
-/// `auto_fetch`, `backup_retain_sets`, `backup_retain_age_secs`,
+/// `auto_fetch`, `backup_retain_sets`, `backup_retain_age_secs`, `purge_requires_tiers`,
 /// `datagram_mtu` (with its `(baseline|discovered)` suffix last) — and that
 /// order is part of the output contract `docs/reference/uc2ctl.md` prints
 /// and scripts may split on. A new field goes BEFORE `datagram_mtu`'s
@@ -255,7 +257,7 @@ fn render_settings_line(position: u64, settings: &Settings) -> String {
     format!(
         "position={position} admission_bytes={} fsm_lag={fsm_lag} \
          snapshot_interval_bytes={} snapshot_target={target} retain_sets={} \
-         auto_fetch={} backup_retain_sets={} backup_retain_age_secs={} \
+         auto_fetch={} backup_retain_sets={} backup_retain_age_secs={} purge_requires_tiers={} \
          datagram_mtu={} ({rung})",
         settings.admission_bytes,
         settings.snapshot_interval_bytes,
@@ -263,6 +265,7 @@ fn render_settings_line(position: u64, settings: &Settings) -> String {
         settings.auto_fetch,
         settings.backup_retain_sets,
         settings.backup_retain_age_secs,
+        settings.purge_requires_tiers,
         settings.datagram_mtu,
     )
 }
@@ -307,6 +310,7 @@ mod tests {
                 auto_fetch: true,
                 backup_retain_sets: 0,
                 backup_retain_age_secs: 0,
+                purge_requires_tiers: 0,
             }
         );
         assert_eq!(parse_settings("").unwrap(), Settings::genesis_default());
@@ -450,8 +454,32 @@ mod tests {
         let line = render_settings_line(3, &s);
         assert!(
             line.contains(
-                "auto_fetch=true backup_retain_sets=6 backup_retain_age_secs=2592000 datagram_mtu="
+                "auto_fetch=true backup_retain_sets=6 backup_retain_age_secs=2592000 purge_requires_tiers=0 datagram_mtu="
             ),
+            "{line}"
+        );
+    }
+
+    /// Backup-tier 3b: `purge_requires_tiers` is an operator key; absent
+    /// means `0`; `settings show` prints it right BEFORE `datagram_mtu`.
+    /// Bounds are the FSM door's business, not the CLI's.
+    #[test]
+    fn purge_requires_tiers_parses_and_shows() {
+        let s = parse_settings(
+            "backup_retain_sets = 6\nbackup_retain_age = \"30d\"\npurge_requires_tiers = 2\n",
+        )
+        .unwrap();
+        assert_eq!(s.purge_requires_tiers, 2);
+        assert_eq!(parse_settings("").unwrap().purge_requires_tiers, 0);
+        assert_eq!(
+            parse_settings("purge_requires_tiers = 9\n")
+                .unwrap()
+                .purge_requires_tiers,
+            9
+        );
+        let line = render_settings_line(3, &s);
+        assert!(
+            line.contains("backup_retain_age_secs=2592000 purge_requires_tiers=2 datagram_mtu="),
             "{line}"
         );
     }

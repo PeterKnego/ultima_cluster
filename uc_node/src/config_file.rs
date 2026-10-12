@@ -249,6 +249,11 @@ struct SettingsSection {
     /// age rule.
     #[serde(default)]
     backup_retain_age: Option<String>,
+    /// Backup-tier 3b: seeds `purge_requires_tiers` (K, how many backup
+    /// tiers must confirm a position before any node purges below it).
+    /// Absent means `0` — the gate is off. Bounds are the FSM door's.
+    #[serde(default)]
+    purge_requires_tiers: Option<u8>,
 }
 
 /// Parse a duration of the form `<digits>(s|m|h|d)` into seconds. No
@@ -1024,6 +1029,7 @@ pub fn parse_str_with_env(
                 auto_fetch: s.auto_fetch.unwrap_or(true),
                 backup_retain_sets: s.backup_retain_sets.unwrap_or(0),
                 backup_retain_age_secs,
+                purge_requires_tiers: s.purge_requires_tiers.unwrap_or(0),
             }
         }
     };
@@ -1999,6 +2005,19 @@ level = "info"
         assert!(!cfg.settings_genesis.auto_fetch);
         let (cfg, _) = load_str(&format!("{MINIMAL}\n[settings]\n")).unwrap();
         assert!(cfg.settings_genesis.auto_fetch);
+    }
+
+    /// Backup-tier 3b: `[settings] purge_requires_tiers` seeds genesis;
+    /// absent means `0` (purge gate off).
+    #[test]
+    fn settings_purge_requires_tiers_seeds_genesis_and_defaults_to_zero() {
+        let (cfg, _) = load_str(&format!(
+            "{MINIMAL}\n[settings]\npurge_requires_tiers = 2\n"
+        ))
+        .unwrap();
+        assert_eq!(cfg.settings_genesis.purge_requires_tiers, 2);
+        let (cfg, _) = load_str(&format!("{MINIMAL}\n[settings]\n")).unwrap();
+        assert_eq!(cfg.settings_genesis.purge_requires_tiers, 0);
     }
 
     /// Backup-tier spec: `[settings] backup_retain_sets` / `backup_retain_age`
