@@ -10904,6 +10904,9 @@ impl Consensus {
                 self.on_backup_report(from, w);
                 return;
             }
+            // Backup-tier 3b Task 13 handles the follower's install; until
+            // then the request is observed and ignored.
+            NetEvent::TierInstall { .. } => return,
         };
         self.feed(event);
     }

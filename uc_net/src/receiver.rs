@@ -39,15 +39,16 @@ use uc_protocol::v2::datagram::{
     DGRAM_KIND_READ_PROBE, DGRAM_KIND_READ_PROBE_ACK, DGRAM_KIND_REQUEST_VOTE,
     DGRAM_KIND_SNAP_BEGIN, DGRAM_KIND_SNAP_CHUNK, DGRAM_KIND_SNAP_DONE, DGRAM_KIND_SNAP_NAK,
     DGRAM_KIND_SNAP_REDIRECT, DGRAM_KIND_SNAP_REPORT, DGRAM_KIND_SNAP_REQUEST, DGRAM_KIND_STATUS,
-    DGRAM_KIND_TERM_MAP, DGRAM_KIND_VOTE, DatagramHeader, Holdings, MAX_TERM_MAP_WIRE_ENTRIES,
-    NAK_BODY_LEN, NakBody, PROBE_ACK_BODY_LEN, ProbeAckBody, REQUEST_VOTE_BODY_LEN,
-    RequestVoteBody, SNAP_BEGIN_FIXED_LEN, SNAP_BEGIN_LAYOUT_V4, SNAP_NAK_BODY_LEN,
-    SNAP_REQUEST_BODY_LEN, STATUS_BODY_LEN, SnapBeginBody, SnapNakBody, SnapRequestBody,
-    StatusBody, TermMapEntryWire, VOTE_BODY_LEN, VoteBody, read_append_position_body,
-    read_config_proposal_body, read_config_reply_body, read_datagram_header, read_nak_body,
-    read_probe_ack_body, read_probe_rung, read_read_probe_body, read_request_vote_body,
-    read_snap_begin_body, read_snap_nak_body, read_snap_redirect_body, read_snap_report_body,
-    read_snap_request_body, read_status_body, read_term_map_body, read_vote_body,
+    DGRAM_KIND_TERM_MAP, DGRAM_KIND_TIER_INSTALL, DGRAM_KIND_TIER_INSTALL_STATUS, DGRAM_KIND_VOTE,
+    DatagramHeader, Holdings, MAX_TERM_MAP_WIRE_ENTRIES, NAK_BODY_LEN, NakBody, PROBE_ACK_BODY_LEN,
+    ProbeAckBody, REQUEST_VOTE_BODY_LEN, RequestVoteBody, SNAP_BEGIN_FIXED_LEN,
+    SNAP_BEGIN_LAYOUT_V4, SNAP_NAK_BODY_LEN, SNAP_REQUEST_BODY_LEN, STATUS_BODY_LEN, SnapBeginBody,
+    SnapNakBody, SnapRequestBody, StatusBody, TermMapEntryWire, VOTE_BODY_LEN, VoteBody,
+    read_append_position_body, read_config_proposal_body, read_config_reply_body,
+    read_datagram_header, read_nak_body, read_probe_ack_body, read_probe_rung,
+    read_read_probe_body, read_request_vote_body, read_snap_begin_body, read_snap_nak_body,
+    read_snap_redirect_body, read_snap_report_body, read_snap_request_body, read_status_body,
+    read_term_map_body, read_tier_install_body, read_tier_install_status_body, read_vote_body,
     write_append_position_body, write_datagram_header, write_nak_body, write_probe_ack_body,
     write_snap_begin_body, write_snap_nak_body, write_snap_request_body, write_status_body,
 };
@@ -274,6 +275,16 @@ pub enum NetEvent {
         from: u32,
         w: uc_protocol::v2::backup::BackupWatermark,
     },
+    /// Backup-tier 3b spec §6.3 (kind 28): the leader asks this below-floor
+    /// follower to install from its own tier. Term-gated and leader-only
+    /// (the datagram's term is the current term and the sender is the
+    /// current leader). `from` is the leader's node id, resolved through the
+    /// receiver's `SocketAddr -> NodeId` map (only populated when crypto is on).
+    TierInstall {
+        from: NodeId,
+        floor: u64,
+        commit: u64,
+    },
 }
 
 impl NetEvent {
@@ -295,12 +306,13 @@ impl NetEvent {
             NetEvent::SnapRedirect { .. } => 10,
             NetEvent::SnapReport { .. } => 11,
             NetEvent::BackupReport { .. } => 12,
+            NetEvent::TierInstall { .. } => 13,
         }
     }
 }
 
 /// Number of [`NetEvent`] kinds (the width of the per-kind drop counters).
-pub const NET_EVENT_KINDS: usize = 13;
+pub const NET_EVENT_KINDS: usize = 14;
 
 /// Parse a consensus-plane datagram (kinds 5–11) into a [`NetEvent`], RAW — no
 /// term filter (the SM adopts higher terms). `from` is the datagram's source
@@ -2442,6 +2454,33 @@ impl FollowerReceiver {
                     if self.route.try_send(ev).is_err() {
                         self.stats.net_drops[idx].fetch_add(1, Ordering::Relaxed);
                     }
+                }
+            }
+            // Backup-tier 3b spec §6.3: the leader's tier-install request.
+            // Term-gated above; additionally the sender must be the leader
+            // this receiver follows, and resolvable to a member id.
+            DGRAM_KIND_TIER_INSTALL => {
+                if from == self.cfg.leader
+                    && let Some(id) = self.peer_id_of(from)
+                    && let Some(b) = read_tier_install_body(&d[DATAGRAM_HEADER_LEN..])
+                {
+                    let ev = NetEvent::TierInstall {
+                        from: id,
+                        floor: b.floor,
+                        commit: b.commit,
+                    };
+                    let idx = ev.kind_idx();
+                    if self.route.try_send(ev).is_err() {
+                        self.stats.net_drops[idx].fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+            // The follower's answer, demuxed to our sender (leader role).
+            DGRAM_KIND_TIER_INSTALL_STATUS if self.sender_route.is_some() => {
+                if let Some(b) = read_tier_install_status_body(&d[DATAGRAM_HEADER_LEN..])
+                    && let Some(route) = &self.sender_route
+                {
+                    let _ = route.try_send(CtrlMsg::TierInstallStatus { from, body: b });
                 }
             }
             _ => {} // NAK/STATUS with no sender_route installed (follower role)
@@ -5111,6 +5150,90 @@ mod tests {
             }
         }
         assert_eq!(st.statuses_refused.load(Relaxed), 2);
+    }
+
+    /// Backup-tier 3b (kinds 28/29): `TIER_INSTALL` routes as
+    /// `NetEvent::TierInstall` only at the current term, from the leader, with
+    /// a well-formed body; `TIER_INSTALL_STATUS` demuxes to the sender route.
+    #[test]
+    fn tier_install_kinds_route_term_gated_and_leader_only() {
+        use uc_protocol::v2::datagram::{
+            TIER_INSTALL_BODY_LEN, TIER_INSTALL_STATUS_BODY_LEN, TierInstallBody,
+            TierInstallReason, TierInstallState, TierInstallStatusBody, write_tier_install_body,
+            write_tier_install_status_body,
+        };
+        let b = buffer();
+        let mut leader = FakeLeader::new();
+        let (tx, rx) = mpsc::sync_channel::<NetEvent>(16);
+        let mut r = follower_routed(&b, leader.addr(), tx);
+        r.peer_ids.insert(leader.addr(), 7u32);
+        let (ctx, crx) = mpsc::sync_channel::<CtrlMsg>(16);
+        r.set_sender_route(ctx);
+        let to = r.local_addr();
+
+        let mut body = [0u8; TIER_INSTALL_BODY_LEN];
+        write_tier_install_body(
+            &mut body,
+            &TierInstallBody {
+                floor: 4096,
+                commit: 8192,
+            },
+        );
+        leader.send(to, DGRAM_KIND_TIER_INSTALL, 0, TERM, &body);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            assert!(Instant::now() < deadline, "TIER_INSTALL never routed");
+            r.do_work();
+            if let Ok(NetEvent::TierInstall {
+                from,
+                floor,
+                commit,
+            }) = rx.try_recv()
+            {
+                assert_eq!((from, floor, commit), (7, 4096, 8192));
+                break;
+            }
+        }
+        // Stale term, floor > commit, and a short body all yield nothing.
+        leader.send(to, DGRAM_KIND_TIER_INSTALL, 0, TERM + 1, &body);
+        let mut bad = [0u8; TIER_INSTALL_BODY_LEN];
+        bad[0..8].copy_from_slice(&9000u64.to_le_bytes());
+        bad[8..16].copy_from_slice(&8192u64.to_le_bytes());
+        leader.send(to, DGRAM_KIND_TIER_INSTALL, 0, TERM, &bad);
+        leader.send(to, DGRAM_KIND_TIER_INSTALL, 0, TERM, &body[..15]);
+        // A non-leader sender yields nothing.
+        let mut other = FakeLeader::new();
+        other.send(to, DGRAM_KIND_TIER_INSTALL, 0, TERM, &body);
+
+        let st = TierInstallStatusBody {
+            state: TierInstallState::Declined,
+            reason: TierInstallReason::NoSet,
+            position: 4096,
+            copied: 0,
+        };
+        let mut sb = [0u8; TIER_INSTALL_STATUS_BODY_LEN];
+        write_tier_install_status_body(&mut sb, &st);
+        leader.send(to, DGRAM_KIND_TIER_INSTALL_STATUS, 0, TERM, &sb);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            assert!(
+                Instant::now() < deadline,
+                "TIER_INSTALL_STATUS never demuxed"
+            );
+            r.do_work();
+            if let Ok(CtrlMsg::TierInstallStatus { from, body }) = crx.try_recv() {
+                assert_eq!((from, body), (leader.addr(), st));
+                break;
+            }
+        }
+        let until = Instant::now() + Duration::from_millis(500);
+        while Instant::now() < until {
+            r.do_work();
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "a refused TIER_INSTALL must not route"
+        );
     }
 
     /// Leader-role node composition (M4): the unified `FollowerReceiver` with a

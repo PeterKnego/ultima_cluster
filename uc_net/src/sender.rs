@@ -120,6 +120,11 @@ pub enum CtrlMsg {
         from: SocketAddr,
         body: SnapRequestBody,
     },
+    /// Backup-tier 3b spec §6.3: a follower's answer to `TIER_INSTALL`.
+    TierInstallStatus {
+        from: SocketAddr,
+        body: uc_protocol::v2::datagram::TierInstallStatusBody,
+    },
     /// M7 (spec 2026-07-13): the consensus agent adopted a new `ClusterConfig`
     /// (`Action::ConfigAdopted`) — rebuild the fan-out + flow control from it.
     /// `followers` and `learners` are DISJOINT sets (voters-minus-self,
@@ -1159,6 +1164,8 @@ impl Sender {
                     }
                 }
                 CtrlMsg::SnapRequest { from, body } => self.on_snap_request(from, body),
+                // Backup-tier 3b Task 14 consumes this; until then it is drained.
+                CtrlMsg::TierInstallStatus { .. } => {}
                 CtrlMsg::SetPeers {
                     followers,
                     learners,

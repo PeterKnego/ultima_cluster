@@ -26,6 +26,8 @@ fuzz_target!(|data: &[u8]| {
     let _ = read_snap_redirect_body(body);
     let _ = read_snap_report_body(body);
     let _ = read_backup_report_body(body);
+    let _ = uc_protocol::v2::datagram::read_tier_install_body(body);
+    let _ = uc_protocol::v2::datagram::read_tier_install_status_body(body);
     let _ = read_request_vote_body(body);
     let _ = read_vote_body(body);
     let _ = read_nak_body(body);
