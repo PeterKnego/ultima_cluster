@@ -5753,9 +5753,15 @@ impl Consensus {
     /// writer, right after a `store_term_map` made it durable. A no-op
     /// without a writer.
     fn publish_term_map(&self) {
+        self.publish_term_map_from(self.sm.term_map());
+    }
+
+    /// As [`Self::publish_term_map`], for a site that persisted a map the SM
+    /// has not adopted yet (the truncate emits the pruned map; the SM adopts
+    /// it only on the matching `Truncated` ack): publish what was PERSISTED.
+    fn publish_term_map_from(&self, map: &[(u32, u64)]) {
         if let Some(shared) = &self.backup_shared {
-            *shared.term_map.lock().unwrap_or_else(|e| e.into_inner()) =
-                self.sm.term_map().to_vec();
+            *shared.term_map.lock().unwrap_or_else(|e| e.into_inner()) = map.to_vec();
         }
     }
 
@@ -12392,7 +12398,7 @@ impl Consensus {
                 self.state
                     .store_term_map(&to_entries(&new_map))
                     .expect("term-map persist fail-stop");
-                self.publish_term_map();
+                self.publish_term_map_from(&new_map);
                 // M7 Task 6: persist-revert-BEFORE-truncate — the SAME discipline as
                 // the term-map persist immediately above. If this truncation drops
                 // the currently-adopted config FRAME (`to` lands strictly below its
@@ -12465,7 +12471,7 @@ impl Consensus {
                 self.state
                     .store_term_map(&to_entries(&new_map))
                     .expect("term-map persist fail-stop");
-                self.publish_term_map();
+                self.publish_term_map_from(&new_map);
             }
             Action::Fatal { reason } => {
                 panic!("consensus fatal (fail-stop): {reason}");
@@ -22593,6 +22599,38 @@ mod tests {
             "the Truncated ack completes reconciliation and reopens"
         );
         assert!(h.cons.pending_truncation.is_none());
+    }
+
+    /// Backup-tier 3b: at `Action::Truncate` the SM has not adopted the
+    /// pruned map yet (it does on the `Truncated` ack), so the writer's cell
+    /// must carry the map that was PERSISTED, not `sm.term_map()`.
+    #[test]
+    fn truncate_publishes_the_persisted_pruned_map_to_the_writer() {
+        let mut h = harness();
+        let shared = Arc::new(crate::tier::writer::WriterShared::default());
+        h.cons.backup_shared = Some(Arc::clone(&shared));
+        h.cons.feed(Event::RequestVote {
+            from: 0,
+            new_term: 3,
+            last_term: 1,
+            last_durable: 7000,
+        });
+        h.cons.feed(Event::TermMapReceived {
+            term: 3,
+            entries: vec![(1, 0), (3, 4096)],
+        });
+        assert!(
+            h.cons.pending_truncation.is_some(),
+            "a truncate was emitted"
+        );
+        let persisted = to_pairs(&h.cons.state.term_map());
+        let published = shared.term_map.lock().unwrap().clone();
+        assert_eq!(published, persisted, "the cell equals term_map.state");
+        assert_ne!(
+            published,
+            h.cons.sm.term_map().to_vec(),
+            "the SM still holds the pre-truncation map"
+        );
     }
 
     /// T7 review finding 1: `last_config_reply` (leader-side nonce dedup) and

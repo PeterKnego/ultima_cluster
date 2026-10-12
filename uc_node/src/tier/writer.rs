@@ -210,33 +210,36 @@ pub fn lineage_below(term_map: &[(u32, u64)], s: u64) -> Vec<(u32, u64)> {
     term_map.iter().copied().filter(|&(_, b)| b < s).collect()
 }
 
-/// RA6: how many consecutive passes deferred the same set for want of a
-/// lineage. Normally one or two (the first pass after boot, before the map
-/// is published); a persistent run means the map no longer reaches below the
-/// set, which deserves one line in the log.
+/// RA6: per-set count of consecutive passes that deferred the set for want
+/// of a lineage. Normally one or two (the first pass after boot, before the
+/// map is published); a persistent run means the map no longer reaches below
+/// that set, which deserves one line in the log.
 #[derive(Debug, Default)]
 struct Deferrals {
-    cur: Option<(u64, u32)>,
+    counts: std::collections::HashMap<u64, u32>,
 }
 
 /// Consecutive deferrals of one set position that raise `tier_set_deferred`.
 const DEFERRALS_BEFORE_WARN: u32 = 10;
 
 impl Deferrals {
-    /// Count a deferral of the set at `position`; true exactly on the
-    /// [`DEFERRALS_BEFORE_WARN`]th consecutive one. A different position
-    /// restarts the count.
-    fn note(&mut self, position: u64) -> bool {
-        let n = match self.cur {
-            Some((p, n)) if p == position => n.saturating_add(1),
-            _ => 1,
-        };
-        self.cur = Some((position, n));
-        n == DEFERRALS_BEFORE_WARN
-    }
-
-    fn clear(&mut self) {
-        self.cur = None;
+    /// One pass deferred exactly `positions`. Each is counted; a position
+    /// absent from this pass (copied, retired, or now has a lineage) loses
+    /// its count, so only CONSECUTIVE deferrals add up. Returns the
+    /// positions on their [`DEFERRALS_BEFORE_WARN`]th consecutive deferral
+    /// (once each).
+    fn pass(&mut self, positions: &[u64]) -> Vec<u64> {
+        let mut next = std::collections::HashMap::new();
+        let mut fired = Vec::new();
+        for &p in positions {
+            let n = self.counts.get(&p).copied().unwrap_or(0).saturating_add(1);
+            if n == DEFERRALS_BEFORE_WARN {
+                fired.push(p);
+            }
+            next.insert(p, n);
+        }
+        self.counts = next;
+        fired
     }
 }
 
@@ -1193,22 +1196,22 @@ impl Writer {
             .filter(|l| !retention::recopy_blocked(tier_sets, l, &policy, &inner))
             .collect();
         // A set with no lineage cannot be written (its SET would be
-        // refused): defer, and rescan next pass — the map may simply not be
-        // published yet. RA6: the tenth consecutive deferral of one set
-        // says so once.
-        if let Some(pos) = todo
+        // refused): it is deferred ALONE — the rest of the pass goes on —
+        // and the catalog is rescanned next pass, since the map may simply
+        // not be published yet (a published map is not part of the scan
+        // key). RA6: the tenth consecutive deferral of one set says so once.
+        let deferred: Vec<u64> = todo
             .iter()
             .filter(|l| l.lineage.is_empty())
             .map(|l| l.position)
-            .max()
-        {
-            if self.deferrals.note(pos) {
-                crate::obs_event!(Warn, "tier_set_deferred", position = pos);
-            }
-            self.scan_due = true;
-            return Ok(false);
+            .collect();
+        for pos in self.deferrals.pass(&deferred) {
+            crate::obs_event!(Warn, "tier_set_deferred", position = pos);
         }
-        self.deferrals.clear();
+        if !deferred.is_empty() {
+            self.scan_due = true;
+            todo.retain(|l| !l.lineage.is_empty());
+        }
         todo.sort_by_key(|l| std::cmp::Reverse(l.position));
         // The sets this node holds whole on disk, newest first.
         let mut held: Vec<(SetLabel, Vec<LocalFile>)> = Vec::new();
@@ -1503,24 +1506,24 @@ mod tests {
     }
 
     /// RA6: ten consecutive deferrals of one set raise the warning exactly
-    /// once; a different set or a success restarts the count.
+    /// once, per set; a set that stops being deferred restarts its count.
     #[test]
     fn a_set_deferred_ten_passes_logs_tier_set_deferred_once() {
         let mut d = Deferrals::default();
-        let fired = (0..25).filter(|_| d.note(4096)).count();
-        assert_eq!(fired, 1, "one warning over 25 deferrals of one set");
+        let fired: Vec<u64> = (0..25).flat_map(|_| d.pass(&[4096])).collect();
+        assert_eq!(fired, vec![4096], "one warning over 25 deferrals");
         let mut d = Deferrals::default();
         for _ in 0..9 {
-            assert!(!d.note(4096));
+            assert!(d.pass(&[4096, 8192]).is_empty());
         }
-        assert!(!d.note(8192), "a different set restarts the count");
-        for _ in 0..8 {
-            assert!(!d.note(8192));
-        }
-        assert!(d.note(8192), "tenth consecutive for 8192");
-        d.clear();
+        assert_eq!(d.pass(&[4096, 8192]), vec![4096, 8192], "each its own 10th");
+        let mut d = Deferrals::default();
         for _ in 0..9 {
-            assert!(!d.note(8192), "a success restarted the count");
+            d.pass(&[4096]);
+        }
+        assert!(d.pass(&[]).is_empty(), "copied: count dropped");
+        for _ in 0..9 {
+            assert!(d.pass(&[4096]).is_empty(), "restarted from one");
         }
     }
     use uc_protocol::v2::frame::{

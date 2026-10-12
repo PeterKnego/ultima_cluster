@@ -1140,6 +1140,45 @@ mod writer_e2e {
         assert!(n > 20_000, "chunks hold the submitted frames ({n})");
     }
 
+    /// 3b / RA6: a set with no lineage is deferred ALONE. The writer's
+    /// published map is replaced by one whose first term opens AT the older
+    /// set (so nothing lies strictly below it) but below the newer one: the
+    /// newer set is copied while the older is left out of the tier.
+    #[test]
+    fn a_lineage_less_set_is_deferred_alone_and_a_newer_one_is_copied() {
+        let _g = serialize();
+        let tier = tmp_tier();
+        let cfg = writer_cfg(tier.path(), 1 << 20, Duration::from_millis(300));
+        let mut c = spawn(3, 1, opts("tier-defer", false), |i| {
+            (i == 3).then(|| cfg.clone())
+        });
+        start_sums(&mut c);
+        let l = await_single_leader(&c, 30);
+        await_capable(&c);
+        let shared = c.node(3).backup_writer().expect("node 3 runs a writer");
+        shared.paused_for_test.store(true, Ordering::Release);
+        let all = c.running();
+        submit_settled(&c, 2000);
+        let p1 = instant_until_complete(&c, l, &all);
+        await_agreed(&c, &all, p1);
+        submit_settled(&c, 2000);
+        let p2 = instant_until_complete(&c, l, &all);
+        await_agreed(&c, &all, p2);
+        assert!(p2 > p1);
+        *shared.term_map.lock().unwrap() = vec![(1, p1)];
+        shared.paused_for_test.store(false, Ordering::Release);
+        let w = await_watermark(&c, l, 60, |w| w.newest_set == p2);
+        assert_eq!(w.oldest_set, p2, "the deferred set is not in the chain");
+        let t = FsTarget::new(tier.path());
+        let listing = list_tier(&t).unwrap();
+        assert!(listing.sets.iter().any(|s| s.position == p2), "{listing:?}");
+        assert!(
+            !listing.sets.iter().any(|s| s.position == p1),
+            "the lineage-less set waits: {listing:?}"
+        );
+        let _keep = c.stop();
+    }
+
     /// Spec §8.1/§8.2, whole-cluster restore: a writer backs up a 3-voter
     /// cluster; every node stops; the builder materialises the tier at its
     /// `through` into three FRESH instance directories (Recovery, same Q on
