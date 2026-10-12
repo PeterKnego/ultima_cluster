@@ -460,6 +460,8 @@ mod writer_e2e {
         purge: bool,
         /// Genesis `Settings::backup_retain_sets` (0 = keep everything).
         retain_sets: u16,
+        /// Genesis `Settings::purge_requires_tiers` (0 = no gate).
+        purge_requires_tiers: u8,
     }
 
     fn opts(app: &'static str, purge: bool) -> Opts {
@@ -467,6 +469,7 @@ mod writer_e2e {
             app,
             purge,
             retain_sets: 0,
+            purge_requires_tiers: 0,
         }
     }
 
@@ -551,6 +554,7 @@ mod writer_e2e {
                 admission_bytes_default: 256 * 1024,
                 settings_genesis: Settings {
                     backup_retain_sets: o.retain_sets,
+                    purge_requires_tiers: o.purge_requires_tiers,
                     ..Settings::genesis_default()
                 },
                 force_jumbo_frames: false,
@@ -2279,6 +2283,166 @@ mod writer_e2e {
             !shared.hold_released.load(Ordering::Acquire)
         });
         assert_eq!(released(), 1);
+        let _keep = c.stop();
+    }
+
+    /// Stage a settings record at `<dir>/settings.pending` and drive admin
+    /// op 7 on that (leader) node, as `uc2ctl settings apply` does.
+    fn apply_gate_k(c: &Cluster, leader: usize, k: u8) {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut s = c.node(leader).cluster_view().to_state().settings;
+        s.purge_requires_tiers = k;
+        let mut bytes = Vec::new();
+        uc_protocol::v2::settings::encode_settings(&s, &mut bytes);
+        let (id, ip, port) = uc_node::staged_digest(&bytes);
+        let dir = &c.dirs()[leader];
+        let tmp = dir.join("settings.pending.tmp");
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)
+            .expect("stage");
+        f.write_all(&bytes).unwrap();
+        f.sync_all().unwrap();
+        std::fs::rename(&tmp, dir.join("settings.pending")).unwrap();
+        admin_ok(
+            &c.cnc(leader),
+            uc_protocol::v2::cnc::ADMIN_OP_SETTINGS_APPLY,
+            id,
+            ip,
+            port,
+        );
+        await_until(30, "the new K committed on every node", || {
+            (0..3).all(|i| {
+                c.node(i)
+                    .cluster_view()
+                    .to_state()
+                    .settings
+                    .purge_requires_tiers
+                    == k
+            })
+        });
+    }
+
+    /// Backup-gated purge (spec §12): with K = 1 every node holds its
+    /// journal at the confirmed tier; a low-space node lets go (once) while
+    /// the others still hold; K above the registered count stops purging
+    /// cleanly (no release), and K back resumes it.
+    #[test]
+    fn every_node_holds_its_purge_at_the_tier_and_a_low_space_node_lets_go() {
+        let _g = serialize();
+        let tier = tmp_tier();
+        let cfg = writer_cfg(tier.path(), 1 << 20, Duration::from_millis(300));
+        let mut o = opts("tier-gate", true);
+        o.purge_requires_tiers = 1;
+        let mut c = spawn(3, 0, o, |i| (i == 1).then(|| cfg.clone()));
+        start_sums(&mut c);
+        let l = await_single_leader(&c, 30);
+        await_capable(&c);
+        let all = c.running();
+        submit_settled(&c, 2000);
+        let p0 = instant_until_complete(&c, l, &all);
+        await_agreed(&c, &all, p0);
+        let lead = submit_settled(&c, 2000);
+        let t0 = c.node(lead).counters().commit.load_acquire();
+        await_watermark(&c, l, 60, |w| w.through >= t0);
+        churn(&c, &all, 3);
+
+        // Every node holds at the tier on EVERY poll, not just at the end.
+        let end = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < end {
+            for &i in &all {
+                let through = watermark(c.node(l)).expect("watermark").through;
+                let fb = c.node(i).archive_first_base();
+                assert!(
+                    fb <= through,
+                    "node {i} purged to {fb}, past the tier {through}"
+                );
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        let gate_count = |i: usize| {
+            c.node(i)
+                .observability()
+                .backup_gate_released
+                .load(Ordering::Relaxed)
+        };
+        let gate_level = |i: usize| {
+            c.node(i)
+                .observability()
+                .backup_gate_released_level
+                .load(Ordering::Relaxed)
+        };
+        assert!(all.iter().all(|&i| gate_count(i) == 0 && !gate_level(i)));
+
+        // Pause the writer: the tier stops advancing while the cluster moves on.
+        let shared = c.node(1).backup_writer().expect("writer on node 1");
+        shared.paused_for_test.store(true, Ordering::Relaxed);
+        std::thread::sleep(Duration::from_millis(600));
+        let through = watermark(c.node(l)).expect("watermark").through;
+        churn(&c, &all, 2);
+        std::thread::sleep(Duration::from_secs(1));
+        for i in [0usize, 2] {
+            let fb = c.node(i).archive_first_base();
+            assert!(
+                fb <= through,
+                "node {i} purged to {fb}, past the tier {through}"
+            );
+        }
+
+        // Node 2 runs low on space: it alone lets go, once.
+        c.node(2).set_free_bytes_for_test(1);
+        await_until(30, "node 2 purged past the tier", || {
+            c.node(2).archive_first_base() > through
+        });
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(gate_count(2), 1, "one release per episode");
+        assert!(gate_level(2));
+        assert_eq!((gate_count(0), gate_count(1)), (0, 0));
+        assert!(
+            c.node(0).archive_first_base() <= through,
+            "node 0 still holds"
+        );
+        assert!(
+            c.node(1).archive_first_base() <= through,
+            "node 1 still holds"
+        );
+        c.node(2).set_free_bytes_for_test(0);
+        await_until(30, "node 2's release level cleared", || !gate_level(2));
+        assert_eq!(gate_count(2), 1, "the counter is monotone");
+
+        // Spec §12.3: K above the registered count stops purging cleanly.
+        shared.paused_for_test.store(false, Ordering::Relaxed);
+        await_watermark(&c, l, 60, |w| w.through > through);
+        apply_gate_k(&c, l, 2);
+        std::thread::sleep(Duration::from_secs(1));
+        let before: Vec<u64> = all
+            .iter()
+            .map(|&i| c.node(i).archive_first_base())
+            .collect();
+        churn(&c, &all, 1);
+        std::thread::sleep(Duration::from_secs(5));
+        let after: Vec<u64> = all
+            .iter()
+            .map(|&i| c.node(i).archive_first_base())
+            .collect();
+        assert_eq!(before, after, "K=2 over one tier: no node's journal moves");
+        assert_eq!(
+            (gate_count(0), gate_count(1), gate_count(2)),
+            (0, 0, 1),
+            "an under-registered gate is a hold, not a release"
+        );
+        assert!(all.iter().all(|&i| !gate_level(i)));
+
+        // K back to 1: purge resumes.
+        apply_gate_k(&c, l, 1);
+        churn(&c, &all, 1);
+        await_until(60, "purge resumed at K=1", || {
+            c.node(0).archive_first_base() > before[0]
+        });
         let _keep = c.stop();
     }
 
