@@ -1164,15 +1164,7 @@ enum FetchSource {
 const TIER_INSTALL_STATUS_EVERY_NS: u64 = 1_000_000_000;
 
 /// The `tier_install_declined` line's `reason`.
-fn tier_install_reason_name(r: TierInstallReason) -> &'static str {
-    match r {
-        TierInstallReason::None => "none",
-        TierInstallReason::NoSource => "no_source",
-        TierInstallReason::NoSet => "no_set",
-        TierInstallReason::Verify => "verify",
-        TierInstallReason::NotRegistered => "not_registered",
-    }
-}
+use crate::tier::source::install_reason_name as tier_install_reason_name;
 
 /// How long a `snapshot fetch` stays pending before this node forgets it.
 ///
@@ -2714,7 +2706,16 @@ impl Node {
             tier_verify_failed: 0,
             tier_draining: Vec::new(),
             tier_install: None,
-            tier_install_lineage: Vec::new(),
+            tier_install_body: TierInstallBody {
+                floor: 0,
+                commit: 0,
+                s: 0,
+                row_hash: [0; 8],
+                row_version: [0; 8],
+                row_size: [0; 8],
+                cluster_hash: 0,
+                cluster_size: 0,
+            },
             pending_install_lineage: None,
             tier_install_leader: SocketAddr::from(([0, 0, 0, 0], 0)),
             tier_install_last_status_ns: 0,
@@ -4213,12 +4214,10 @@ struct Consensus {
     /// (`FetchMode::Install`) — at most one; a second request while it runs
     /// answers `installing`, never a second thread.
     tier_install: Option<crate::tier::source::TierFetch>,
-    /// The `SET` lineage of the set [`Self::tier_install`] is copying,
-    /// captured at spawn. Its thread raises the install signals BEFORE it
-    /// reports `done`, so `maybe_adopt_incoming_snapshot` can see the set
-    /// land while the copy still reads as running: it adopts THIS lineage
-    /// then, never the leader's map.
-    tier_install_lineage: Vec<(u32, u64)>,
+    /// The `TIER_INSTALL` body the running install was spawned for — what
+    /// a plan-time decline names (final review I2: the plan runs on the
+    /// thread, so its decline arrives after the request was answered).
+    tier_install_body: TierInstallBody,
     /// Spec §6.3 step 3: a finished tier install's `(S, lineage)`, which
     /// `maybe_adopt_incoming_snapshot` adopts (A) in place of
     /// `last_leader_map` when it adopts S. Set only when S is above what the
@@ -6104,16 +6103,26 @@ impl Consensus {
         // (`durable >= pos`: a late install, ruling on spec §8).
         let lineage = match self.pending_install_lineage.take() {
             Some((p, l)) if p == pos => l,
-            // The install's thread raised these signals and has not yet
-            // reported `done`: the same set, so the same lineage.
-            _ if self
-                .tier_install
-                .as_ref()
-                .is_some_and(|f| f.position == pos) =>
-            {
-                self.tier_install_lineage.clone()
-            }
-            _ => self.last_leader_map.clone(),
+            _ => match self.tier_install.as_ref() {
+                // Final review I1: an install still running at or below
+                // `pos` that a cancel still stops has NOT published — so
+                // the set landing is a SESSION's (the leader gave up on the
+                // tier and the session won). Cancel the copy, so two paths
+                // never finish on one follower, drain it, and adopt the
+                // session's lineage.
+                Some(f) if f.position <= pos && f.cancel() => {
+                    let f = self.tier_install.take().expect("matched above");
+                    self.tier_draining.push(f);
+                    self.last_leader_map.clone()
+                }
+                // The install's thread raised these signals and has not yet
+                // reported `done` (its publish won any cancel): the same
+                // set, so the `SET`'s lineage, never the leader's map.
+                Some(f) if f.position == pos => {
+                    f.lineage().unwrap_or_else(|| self.last_leader_map.clone())
+                }
+                _ => self.last_leader_map.clone(),
+            },
         };
         // Ruling R42: a session-installed set is the leader's freeze, not
         // this node's — never reported as ours, then or after a restart (the
@@ -12008,77 +12017,46 @@ impl Consensus {
             self.note_tier_fetch_declined(position, "draining");
             return false;
         }
-        match self.tier_fetch_plan(&src, position) {
-            Ok((label, entry)) => {
-                let fetch = crate::tier::source::spawn_fetch(
-                    src,
-                    self.snap_root.clone(),
-                    label,
-                    entry,
-                    crate::tier::source::FetchMode::StoreOnly,
-                    self.intake_signals.clone(),
-                );
-                self.pending_fetch = Some(PendingFetch {
-                    learner: from,
-                    position,
-                    stored_before: self.stored_set_pos.load(Ordering::Acquire),
-                    deadline_ns: self.pass_now_ns.saturating_add(FETCH_TIMEOUT_NS),
-                    auto,
-                    source: FetchSource::Tier(fetch),
-                });
-                crate::obs_event!(
-                    Info,
-                    "snapshot_fetch_requested",
-                    node = self.id as u64,
-                    from = "tier",
-                    position = position,
-                    actor = if auto { "auto" } else { "operator" },
-                    source = "tier"
-                );
-                true
-            }
-            Err(reason) => {
-                self.note_tier_fetch_declined(position, reason);
-                false
-            }
-        }
-    }
-
-    /// Backup-tier 3b spec §6.2 step 1, once per fetch DECISION (never per
-    /// pass — `registered_through` and the `SET` read are file I/O): can the
-    /// tier serve the agreed set at `position`? `Ok` = its `SET` and the
-    /// catalog entry the copy is verified against (D8); `Err` = the
-    /// `tier_fetch_declined` reason.
-    #[cold]
-    #[inline(never)]
-    fn tier_fetch_plan(
-        &self,
-        src: &crate::tier::source::TierSource,
-        position: u64,
-    ) -> Result<(crate::tier::layout::SetLabel, SetEntry), &'static str> {
-        let Some(through) = src.registered_through(&self.cluster_view.backups()) else {
-            return Err("not_registered");
-        };
-        // Spec §6.1: never read beyond the registered `through`.
-        if position > through {
-            return Err("no_set");
-        }
-        let Some(entry) = self
-            .cluster_view
-            .snapshot_inner()
+        // Final review I2: the plan's tier reads (`TIER`, the registration,
+        // the `SET`) run on the fetch thread, never here — a hung tier would
+        // wedge the consensus agent. The node hands it what it already holds
+        // in memory: the committed `backups` (the registration / `through`
+        // cap, spec §6.1) and the agreed catalog entry the copy is verified
+        // against (D8). A plan-time decline comes back through `done` and
+        // `poll_pending_fetch` falls back to the peer, as for a failed copy.
+        let inner = self.cluster_view.snapshot_inner();
+        let entry = inner
             .catalog
             .into_iter()
-            .find(|e| e.position == position && e.is_agreed())
-        else {
-            // No agreed catalog entry to verify a copy against (D8).
-            return Err("not_agreed");
-        };
-        match crate::tier::chain::read_label(src.target(), position) {
-            Ok(Some(Ok(label))) => Ok((label, entry)),
-            Ok(Some(Err(_))) => Err("lineage"),
-            Ok(None) => Err("no_set"),
-            Err(_) => Err("io"),
-        }
+            .find(|e| e.position == position && e.is_agreed());
+        let fetch = crate::tier::source::spawn_fetch(
+            src,
+            self.snap_root.clone(),
+            crate::tier::source::FetchPlan::StoreOnly {
+                position,
+                entry,
+                backups: inner.backups,
+            },
+            self.intake_signals.clone(),
+        );
+        self.pending_fetch = Some(PendingFetch {
+            learner: from,
+            position,
+            stored_before: self.stored_set_pos.load(Ordering::Acquire),
+            deadline_ns: self.pass_now_ns.saturating_add(FETCH_TIMEOUT_NS),
+            auto,
+            source: FetchSource::Tier(fetch),
+        });
+        crate::obs_event!(
+            Info,
+            "snapshot_fetch_requested",
+            node = self.id as u64,
+            from = "tier",
+            position = position,
+            actor = if auto { "auto" } else { "operator" },
+            source = "tier"
+        );
+        true
     }
 
     /// Ruling RA4: `tier_fetch_declined{position, reason}`, once per set
@@ -12115,19 +12093,22 @@ impl Consensus {
     /// - an install already running answers `installing` (review focus 1:
     ///   one copy per node; a NEW leader asking takes over the reports);
     /// - one finished but not yet adopted answers `installed` again;
-    /// - no source → `declined(no_source)` at once;
-    /// - else [`crate::tier::source::check_install_set`] on the set the
+    /// - no source → `declined(no_source)` at once; a tier copy of S
+    ///   already running or draining → `declined(no_set)` at once;
+    /// - else (final review I2) spawn the `uc2-tier-fetch` thread in
+    ///   `FetchPlan::Install` and answer `installing{S, 0}` at once. The
+    ///   THREAD does every tier read: `TIER` must read and be this cluster's
+    ///   ([`crate::tier::source::TierSource::is_ours`] — no registration,
+    ///   ruling F1, so a later `tier forget` cannot reach a running copy),
+    ///   then [`crate::tier::source::check_install_set`] on the set the
     ///   leader NAMED (`body.s`, its `SET` read from the tier) against the
     ///   verdict the body CARRIES — never this node's catalog, which a new
-    ///   learner does not have (controller ruling) — and no registration
-    ///   either (ruling F1): only `TIER` must read and be this cluster's
-    ///   ([`crate::tier::source::TierSource::is_ours`]), so a later `tier
-    ///   forget` cannot reach a running copy; `Err` → `declined(reason)`,
-    ///   `Ok` → spawn the copy in `FetchMode::Install` and answer
-    ///   `installing{S, 0}`.
+    ///   learner does not have (controller ruling) — then (final review I4)
+    ///   [`crate::tier::source::lineage_consistent`] against the leader's
+    ///   map and this node's term. A plan-time `Err` reaches the leader as
+    ///   `declined(reason)` after the `installing` (`poll_tier_install`).
     ///
-    /// File I/O (the `TIER` read, the one `SET` read) happens once per
-    /// request, never per pass.
+    /// No file I/O here: the consensus agent never touches the tier.
     #[cold]
     #[inline(never)]
     fn on_tier_install(&mut self, from: SocketAddr, term: u32, body: &TierInstallBody) {
@@ -12197,62 +12178,46 @@ impl Consensus {
             self.decline_tier_install(from, body, TierInstallReason::NoSource, "");
             return;
         };
-        // Ruling F1: an install needs no registration — the leader's carried
-        // verdict is the proof the set at S is the cluster's (a brand-new
-        // learner's view registers no tier). Only `TIER` must be ours.
-        let ours = src.is_ours();
-        let mut detail = "";
-        // Only the set the leader NAMED is read — one `SET` label, not a
-        // listing. A set a cancelled store-only copy is still draining (or a
+        // A set a cancelled store-only copy is still draining (or a
         // store-only copy is copying) is "no set" for this request: two
         // threads must never share `incoming-<P>.tier.part`, and the leader
         // names one S, so there is no other set to fall back to here.
-        let sets = match ours {
-            false => Vec::new(),
-            true if self.tier_copy_running_at(body.s) => {
-                detail = "draining";
-                Vec::new()
-            }
-            true => match crate::tier::chain::read_label(src.target(), body.s) {
-                Ok(Some(Ok(label))) => vec![label],
-                Ok(None) => Vec::new(),
-                Ok(Some(Err(_))) => {
-                    detail = "lineage";
-                    Vec::new()
-                }
-                Err(_) => {
-                    detail = "io";
-                    Vec::new()
-                }
-            },
-        };
-        match crate::tier::source::check_install_set(body, ours, &sets) {
-            Err(reason) => self.decline_tier_install(from, body, reason, detail),
-            Ok((label, entry)) => {
-                let position = label.position;
-                self.tier_install_lineage = label.lineage.clone();
-                self.tier_install = Some(crate::tier::source::spawn_fetch(
-                    src,
-                    self.snap_root.clone(),
-                    label,
-                    entry,
-                    crate::tier::source::FetchMode::Install,
-                    self.intake_signals.clone(),
-                ));
-                self.tier_install_leader = from;
-                self.tier_install_last_status_ns = self.pass_now_ns;
-                self.tier_install_decline_logged = None;
-                crate::obs_event!(
-                    Info,
-                    "tier_install_started",
-                    node = self.id as u64,
-                    position = position,
-                    floor = body.floor,
-                    commit = body.commit
-                );
-                self.send_tier_install_status(from, TierInstallState::Installing, position, 0);
-            }
+        // Node state, no I/O: decided here.
+        if self.tier_copy_running_at(body.s) {
+            self.decline_tier_install(from, body, TierInstallReason::NoSet, "draining");
+            return;
         }
+        // Final review I2: everything else that reads the tier — `TIER`
+        // (ruling F1: an install needs no registration, only `TIER` must be
+        // ours), the one `SET` the leader named, the check against the
+        // verdict the body carries, and (final review I4) the `SET`'s lineage
+        // against the leader's map and this node's term — runs on the
+        // `uc2-tier-fetch` thread before it copies a byte. `installing{S, 0}`
+        // is answered NOW; a plan-time decline follows as `declined(reason)`
+        // from `poll_tier_install`, which the leader's sender handles as it
+        // handles any decline after `installing` (session + hold).
+        self.tier_install = Some(crate::tier::source::spawn_fetch(
+            src,
+            self.snap_root.clone(),
+            crate::tier::source::FetchPlan::Install {
+                body: *body,
+                leader_map: self.last_leader_map.clone(),
+                current_term: self.sm.current_term(),
+            },
+            self.intake_signals.clone(),
+        ));
+        self.tier_install_body = *body;
+        self.tier_install_leader = from;
+        self.tier_install_last_status_ns = self.pass_now_ns;
+        crate::obs_event!(
+            Info,
+            "tier_install_started",
+            node = self.id as u64,
+            position = body.s,
+            floor = body.floor,
+            commit = body.commit
+        );
+        self.send_tier_install_status(from, TierInstallState::Installing, body.s, 0);
     }
 
     /// A tier copy of `position` is running (store-only) or draining.
@@ -12290,10 +12255,8 @@ impl Consensus {
         };
         let position = f.position;
         self.tier_install = None;
-        let lineage = std::mem::take(&mut self.tier_install_lineage);
         match result {
             Ok(set_lineage) => {
-                debug_assert_eq!(set_lineage, lineage, "the thread hands back the SET's");
                 // Already adopted (on the running-lineage path, or a newer set
                 // landed meanwhile): nothing is left for the handler to take.
                 if position > self.adopted_incoming {
@@ -12302,6 +12265,7 @@ impl Consensus {
                 self.tier_install_stats
                     .installed
                     .fetch_add(1, Ordering::Relaxed);
+                self.tier_install_decline_logged = None;
                 crate::obs_event!(
                     Info,
                     "tier_install_done",
@@ -12310,15 +12274,21 @@ impl Consensus {
                 );
                 self.send_tier_install_status(to, TierInstallState::Installed, position, 0);
             }
+            // Final review I2: the thread's PLAN declined (nothing was
+            // copied) — exactly the door-time decline it used to be, now
+            // after the `installing` the node answered at spawn.
+            Err(crate::tier::source::FetchError::Plan { reason, detail }) => {
+                let body = self.tier_install_body;
+                let reason = crate::tier::source::install_reason_of(
+                    &crate::tier::source::FetchError::Plan { reason, detail },
+                );
+                self.decline_tier_install(to, &body, reason, detail);
+            }
             Err(why) => {
                 // The set vanished under the copy (retention) is `no_set`;
                 // anything else — a mismatch, an unreadable object — is
                 // `verify`. The line names the copy's own reason too.
-                let reason = if why == "no_set" {
-                    TierInstallReason::NoSet
-                } else {
-                    TierInstallReason::Verify
-                };
+                let reason = crate::tier::source::install_reason_of(&why);
                 self.tier_install_stats
                     .declined
                     .fetch_add(1, Ordering::Relaxed);
@@ -12328,7 +12298,7 @@ impl Consensus {
                     node = self.id as u64,
                     position = position,
                     reason = tier_install_reason_name(reason),
-                    detail = why.as_str()
+                    detail = why.reason()
                 );
                 self.send_tier_install_decline(to, reason, position);
             }
@@ -12654,34 +12624,47 @@ impl Consensus {
             return;
         };
         if let FetchSource::Tier(f) = &mut p.source {
+            use crate::tier::source::FetchError;
             let failed = match f.try_finish() {
                 Some(Ok(_lineage)) => {
                     let p = self.pending_fetch.take().expect("matched above");
                     self.fetch_stored(&p, p.position, "tier");
                     return;
                 }
-                Some(Err(reason)) => reason,
+                Some(Err(e)) => e,
                 // Review C1: a copy past the deadline is CANCELLED (it then
                 // renames and publishes nothing, and removes only its own
                 // temp files — the peer session below writes the same final
                 // names) and drained: kept until its thread reports, never
-                // joined while running.
-                None if self.pass_now_ns > p.deadline_ns => "timeout".to_string(),
+                // joined while running. (Final review I2: that includes a
+                // thread still in its PLAN — a hung tier read.)
+                None if self.pass_now_ns > p.deadline_ns => FetchError::Copy("timeout".into()),
                 None => return,
             };
             let mut p = self.pending_fetch.take().expect("matched above");
             if let FetchSource::Tier(f) = std::mem::replace(&mut p.source, FetchSource::Peer)
-                && failed == "timeout"
+                && failed.reason() == "timeout"
             {
                 f.cancel();
                 self.tier_draining.push(f);
             }
-            if failed == "verify" {
-                self.tier_verify_failed = p.position;
+            match &failed {
+                // Final review I2: decided by the thread's plan (nothing was
+                // copied) — named once per (position, reason), as when the
+                // plan ran here (ruling RA4).
+                FetchError::Plan { reason, .. } => {
+                    self.note_tier_fetch_declined(p.position, reason)
+                }
+                // Spec §6.2 step 4: what the copy wrote is gone (or,
+                // cancelled, is left to the peer) — always named (review I2).
+                FetchError::Copy(reason) => {
+                    if reason == "verify" {
+                        self.tier_verify_failed = p.position;
+                    }
+                    self.name_tier_fetch_declined(p.position, reason);
+                }
             }
-            // Spec §6.2 step 4: what the copy wrote is gone (or, cancelled,
-            // is left to the peer); fall back to a peer AT ONCE.
-            self.name_tier_fetch_declined(p.position, &failed);
+            // Fall back to a peer AT ONCE.
             if p.learner == self.id {
                 // Auto-fetch tried the tier before choosing a holder: choose
                 // one now, skipping the tier for this fallback only.
@@ -16251,7 +16234,16 @@ mod tests {
             tier_verify_failed: 0,
             tier_draining: Vec::new(),
             tier_install: None,
-            tier_install_lineage: Vec::new(),
+            tier_install_body: TierInstallBody {
+                floor: 0,
+                commit: 0,
+                s: 0,
+                row_hash: [0; 8],
+                row_version: [0; 8],
+                row_size: [0; 8],
+                cluster_hash: 0,
+                cluster_size: 0,
+            },
             pending_install_lineage: None,
             tier_install_leader: SocketAddr::from(([0, 0, 0, 0], 0)),
             tier_install_last_status_ns: 0,
@@ -28483,7 +28475,9 @@ mod tests {
         assert!(!h.cons.try_tier_fetch(2, 4096, false));
         assert_eq!(h.cons.tier_declined, (4096, "draining".to_string()));
         // Retired (joined) once its thread reports.
-        *h.cons.tier_draining[0].done.lock().unwrap() = Some(Err("cancelled".into()));
+        *h.cons.tier_draining[0].done.lock().unwrap() = Some(Err(
+            crate::tier::source::FetchError::Copy("cancelled".into()),
+        ));
         h.cons.poll_pending_fetch();
         assert!(h.cons.tier_draining.is_empty());
     }
@@ -28507,6 +28501,11 @@ mod tests {
             let (leader, a0) = report_peer_socket();
             let (other, a2) = report_peer_socket();
             let mut h = harness_with_rows_and_peers(&["a"], &[(0, a0), (2, a2)]);
+            // The fixture's `SET` lineage reaches term 3: this node is at a
+            // term at least that (final review I4 refuses a line naming a
+            // term above the node's own).
+            h.cons.feed_net(NetEvent::LeaderActivity { term: 3 });
+            assert_eq!(h.cons.sm.current_term(), 3);
             h.cons.cnc.status().leader_hint.store_release(0);
             // Below the floor, below S: a request for S is something to copy
             // (at or past S it is answered `installed` with no copy).
@@ -28599,6 +28598,18 @@ mod tests {
             }
         }
 
+        /// Wait until `n` tier copies have STARTED (final review I2: the
+        /// plan runs on the thread, so a copy starts after the request was
+        /// answered).
+        fn await_copies(fx: &SetFx, n: u64) {
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            while fx.src.fetches_spawned() < n {
+                assert!(std::time::Instant::now() < deadline, "copy never started");
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            assert_eq!(fx.src.fetches_spawned(), n);
+        }
+
         /// Poll the running install (as the pass does) until it has ended.
         fn finish(h: &mut Harness) {
             let deadline = std::time::Instant::now() + Duration::from_secs(30);
@@ -28667,9 +28678,16 @@ mod tests {
             assert_eq!(
                 statuses(&leader),
                 vec![status(TierInstallState::Installing, P, 0)],
+            );
+            // The thread's plan passed (no `not_registered`): its copy
+            // started. (Not finished here: its install signal would wait on
+            // the harness's one-slot cluster channel, which the first
+            // install already filled.)
+            await_copies(&fx, 2);
+            assert!(
+                statuses(&leader).is_empty(),
                 "a forgotten (unregistered) tier still serves an install"
             );
-            assert_eq!(fx.src.fetches_spawned(), 2);
             assert_eq!(
                 h.cons.tier_install_stats.declined.load(Ordering::Relaxed),
                 0
@@ -28678,8 +28696,9 @@ mod tests {
 
         /// Ruling D8 at install time, the leader as the authority: the
         /// tier's `SET` names a row version other than the one the body
-        /// carries — `declined(verify)` before any copy, no thread, and
-        /// nothing under `snapshots/`.
+        /// carries — `declined(verify)` before any copy (after the
+        /// `installing` answered at spawn: the check runs on the thread,
+        /// final review I2), and nothing under `snapshots/`.
         #[test]
         fn an_install_whose_set_disagrees_with_the_catalog_declines_and_leaves_nothing() {
             let fx = set_fx(false);
@@ -28688,10 +28707,15 @@ mod tests {
             let mut body = body_for(&fx, 0, 8000);
             body.row_version[2] += 1;
             ask_with(&mut h, &leader, body);
-            assert!(h.cons.tier_install.is_none());
+            // Final review I2: the check reads the tier's `SET`, so it runs
+            // on the thread; `installing` first, then the decline.
+            finish(&mut h);
             assert_eq!(
                 statuses(&leader),
-                vec![declined(TierInstallReason::Verify, P)]
+                vec![
+                    status(TierInstallState::Installing, P, 0),
+                    declined(TierInstallReason::Verify, P)
+                ]
             );
             assert_eq!(fx.src.fetches_spawned(), 0, "refused before any copy");
             assert_eq!(files_under(&h.cons.snap_root), before, "nothing written");
@@ -28738,7 +28762,7 @@ mod tests {
             let (mut h, leader, other) = rig(&fx, Some(8000));
             ask(&mut h, &fx, &leader);
             ask(&mut h, &fx, &leader);
-            assert_eq!(fx.src.fetches_spawned(), 1, "one uc2-tier-fetch thread");
+            await_copies(&fx, 1);
             let got = statuses(&leader);
             assert_eq!(got.len(), 2, "{got:?}");
             assert!(
@@ -28844,14 +28868,19 @@ mod tests {
 
         /// The copy's thread raises the install signals BEFORE it reports
         /// `done`: a pass that sees the set land in between still adopts the
-        /// `SET`'s lineage (captured at spawn), never the leader's map.
+        /// `SET`'s lineage (recorded once its plan passed), never the
+        /// leader's map.
         #[test]
         fn a_set_landing_before_its_copy_reports_still_adopts_the_sets_lineage() {
             let mut h = harness_with_rows(&["a"]);
             h.cons.cnc.counters().durable.store_release(1024);
             h.cons.last_leader_map = vec![(9, 0)];
-            h.cons.tier_install = Some(crate::tier::source::TierFetch::never_finishing_for_test(P));
-            h.cons.tier_install_lineage = vec![(1, 0), (3, 2048)];
+            // The thread is past its publish (a cancel can no longer stop
+            // it) and recorded the `SET`'s lineage when its plan passed.
+            h.cons.tier_install = Some(crate::tier::source::TierFetch::publishing_for_test(
+                P,
+                vec![(1, 0), (3, 2048)],
+            ));
             h.cons.incoming_cluster_pos.store(P, Ordering::Release);
             h.cons.incoming_snapshot.store(P, Ordering::Release);
             h.cons.cluster_installed.store(P, Ordering::Release);
@@ -28863,6 +28892,78 @@ mod tests {
             h.cons.poll_tier_install();
             assert!(h.cons.tier_install.is_none());
             assert_eq!(h.cons.pending_install_lineage, None);
+        }
+
+        /// Final review I1: the leader gave up on the tier (no progress)
+        /// and opened a session, which lands a set at or above the running
+        /// install's S first. Adopting it CANCELS the install — moved to
+        /// draining, never finishing as a second path — and the session's
+        /// lineage (the leader's map) is the one adopted.
+        #[test]
+        fn a_session_landing_at_or_above_s_cancels_the_running_install() {
+            for at in [P, P + 1024] {
+                let mut h = harness_with_rows(&["a"]);
+                h.cons.cnc.counters().durable.store_release(1024);
+                h.cons.last_leader_map = vec![(9, 0)];
+                h.cons.tier_install =
+                    Some(crate::tier::source::TierFetch::never_finishing_for_test(P));
+                h.cons.incoming_cluster_pos.store(at, Ordering::Release);
+                h.cons.incoming_snapshot.store(at, Ordering::Release);
+                h.cons.cluster_installed.store(at, Ordering::Release);
+                assert!(h.cons.maybe_adopt_incoming_snapshot());
+                assert!(h.cons.tier_install.is_none(), "no longer running");
+                assert_eq!(h.cons.tier_draining.len(), 1, "drained, at {at}");
+                assert!(h.cons.tier_draining[0].is_cancelled());
+                assert_eq!(h.cons.sm.term_map(), &[(9, 0)][..], "the session's map");
+                // Nothing more is answered for it: it is not polled as an
+                // install any more.
+                h.cons.poll_tier_install();
+                assert_eq!(
+                    h.cons.tier_install_stats.installed.load(Ordering::Relaxed),
+                    0
+                );
+            }
+            // A session BELOW S leaves the install running.
+            let mut h = harness_with_rows(&["a"]);
+            h.cons.cnc.counters().durable.store_release(512);
+            h.cons.tier_install = Some(crate::tier::source::TierFetch::never_finishing_for_test(P));
+            h.cons.incoming_cluster_pos.store(1024, Ordering::Release);
+            h.cons.incoming_snapshot.store(1024, Ordering::Release);
+            h.cons.cluster_installed.store(1024, Ordering::Release);
+            assert!(h.cons.maybe_adopt_incoming_snapshot());
+            assert!(h.cons.tier_install.is_some());
+            assert!(!h.cons.tier_install.as_ref().unwrap().is_cancelled());
+        }
+
+        /// Final review I4: a `SET` lineage whose base for a term the
+        /// leader's map also holds is not the leader's (one flipped digit,
+        /// still well-formed) is `declined(verify)` before any copy —
+        /// nothing adopted, nothing under `snapshots/`.
+        #[test]
+        fn an_install_whose_lineage_disagrees_with_the_leaders_map_declines_verify() {
+            let fx = set_fx(false);
+            let (mut h, leader, _) = rig(&fx, Some(8000));
+            // The fixture's line is [(1, 0), (3, 2048)]; the leader says 3
+            // began at 2049.
+            h.cons.last_leader_map = vec![(3, 2049)];
+            let before = files_under(&h.cons.snap_root);
+            ask(&mut h, &fx, &leader);
+            finish(&mut h);
+            assert_eq!(
+                statuses(&leader),
+                vec![
+                    status(TierInstallState::Installing, P, 0),
+                    declined(TierInstallReason::Verify, P)
+                ]
+            );
+            assert_eq!(files_under(&h.cons.snap_root), before, "root clean");
+            assert_eq!(fx.src.fetches_spawned(), 0, "no copy started");
+            assert_eq!(h.cons.incoming_snapshot.load(Ordering::Acquire), 0);
+            assert_eq!(h.cons.pending_install_lineage, None, "nothing adopted");
+            assert_eq!(
+                h.cons.tier_install_stats.declined.load(Ordering::Relaxed),
+                1
+            );
         }
 
         /// Task 14 finding: a follower that knows no leader yet (just
@@ -28909,7 +29010,7 @@ mod tests {
             // The same request at the current term is served.
             ask_at(&mut h, &leader, t, body_for(&fx, 0, 8000));
             assert_eq!(h.cons.cnc.status().leader_hint.load_acquire(), 0);
-            assert_eq!(fx.src.fetches_spawned(), 1);
+            await_copies(&fx, 1);
         }
 
         /// Task 14 ruling: a request for an S this node is already durable
@@ -28960,9 +29061,13 @@ mod tests {
             let mut body = body_for(&fx, 0, 8000);
             body.s = P + 32;
             ask_with(&mut h, &leader, body);
+            finish(&mut h);
             assert_eq!(
                 statuses(&leader),
-                vec![declined(TierInstallReason::NoSet, P + 32)]
+                vec![
+                    status(TierInstallState::Installing, P + 32, 0),
+                    declined(TierInstallReason::NoSet, P + 32)
+                ]
             );
             // A store-only copy of exactly S still draining: no set either.
             h.cons

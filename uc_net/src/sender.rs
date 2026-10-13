@@ -5770,6 +5770,46 @@ mod tests {
             assert!(kinds(&x.f[0]).contains(&DGRAM_KIND_TIER_INSTALL));
         }
 
+        /// Final review I2: the follower answers `installing{S, 0}` at
+        /// once and decides on its fetch thread; a plan-time decline then
+        /// arrives AFTER the `installing`. It opens the session in that pass
+        /// and enters the 30 s hold exactly as a decline with no
+        /// `installing` before it does.
+        #[test]
+        fn a_decline_after_installing_opens_the_session_and_holds() {
+            let mut x = fx(1);
+            let a = x.f[0].addr();
+            x.s.on_nak(a, 0, 96);
+            x.s.do_work();
+            x.s.on_tier_install_status(a, installing(0));
+            x.s.do_work();
+            assert_eq!(sessions(&x.s), 0, "installing: held");
+            advance(&mut x.s, Duration::from_millis(300));
+            x.tx.send(CtrlMsg::TierInstallStatus {
+                from: a,
+                body: status(TierInstallState::Declined, TierInstallReason::Verify, 0),
+            })
+            .unwrap();
+            x.s.do_work();
+            assert_eq!(sessions(&x.s), 1, "the decline opens the session at once");
+            assert!(x.s.snap.as_ref().is_some_and(|s| s.peer == a));
+            assert!(x.s.tier_waits.is_empty());
+            assert_eq!(
+                x.s.stats().tier_install_timeouts.load(Ordering::Relaxed),
+                0,
+                "a decline is not a timeout"
+            );
+            close_session(&mut x.s);
+            kinds(&x.f[0]);
+            // In the hold: the next below-floor NAK is a session, not a
+            // second TIER_INSTALL.
+            advance(&mut x.s, Duration::from_secs(29));
+            x.s.on_nak(a, 0, 96);
+            x.s.do_work();
+            assert_eq!((sent(&x.s), sessions(&x.s)), (1, 2));
+            assert!(!kinds(&x.f[0]).contains(&DGRAM_KIND_TIER_INSTALL));
+        }
+
         #[test]
         fn installing_with_rising_copied_holds_the_session_ten_seconds_past_the_last_rise() {
             let mut x = fx(1);

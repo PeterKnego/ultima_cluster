@@ -597,7 +597,16 @@ fn build(
     // Artifacts first: a set that vanishes is refused before any journal work.
     for r in &label.rows {
         let dst = SnapshotStore::open(tmp, r.row)?.path_for(s);
-        copy_artifact(t, s, &row_object(s, r.row), &dst, r.size, r.hash, true)?;
+        copy_artifact(
+            t,
+            s,
+            &row_object(s, r.row),
+            &dst,
+            r.size,
+            r.hash,
+            Some(r.version),
+            None,
+        )?;
     }
     let cdir = cluster_agent::snapshot_dir_of(tmp);
     fs::create_dir_all(&cdir)?;
@@ -608,7 +617,8 @@ fn build(
         &cluster_agent::artifact_path(&cdir, s),
         label.cluster_size,
         label.cluster_hash,
-        false,
+        None,
+        None,
     )?;
     sync_dir(&cdir)?;
 
@@ -695,7 +705,15 @@ fn build(
 /// Stream one artifact object to `dst`, checking it against its `SET` row:
 /// the raw length, the hash (over the payload after the 24-byte envelope for
 /// a row, over the whole image for the cluster artifact), and a row's
-/// envelope position.
+/// envelope position AND version. `envelope_version` is `Some(v)` for a row
+/// artifact (`v` = the `SET` row's version, which the caller has already
+/// matched to the catalog's — final review Q1: the hash does not cover the
+/// envelope, so a flipped version word would otherwise pass), `None` for the
+/// cluster artifact. `progress`, when given, is called with every block's
+/// length as it is written
+/// (final review I1: a tier install's `copied` must move while one large
+/// artifact streams, not only between artifacts).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn copy_artifact(
     t: &dyn BackupTarget,
     s: u64,
@@ -703,8 +721,10 @@ pub(crate) fn copy_artifact(
     dst: &Path,
     size: u64,
     hash: u64,
-    enveloped: bool,
+    envelope_version: Option<u32>,
+    progress: Option<&dyn Fn(u64)>,
 ) -> Result<(), TierError> {
+    let enveloped = envelope_version.is_some();
     let f = t
         .open(path)?
         .ok_or_else(|| refused(format!("restore set {s} incomplete: {path} missing")))?;
@@ -730,6 +750,9 @@ pub(crate) fn copy_artifact(
         }
         out.write_all(&buf[..n])?;
         n_total += n as u64;
+        if let Some(bump) = progress {
+            bump(n as u64);
+        }
         let mut piece = &buf[..n];
         if enveloped && head.len() < SNAPSHOT_ENVELOPE_LEN {
             let take = (SNAPSHOT_ENVELOPE_LEN - head.len()).min(piece.len());
@@ -750,6 +773,13 @@ pub(crate) fn copy_artifact(
             return Err(refused(format!(
                 "restore set {s}: {path} envelope position {} != set (tier_set_mismatch)",
                 env.position
+            )));
+        }
+        if Some(env.version) != envelope_version {
+            return Err(refused(format!(
+                "restore set {s}: {path} envelope version {:#x} != SET {:#x} (tier_set_mismatch)",
+                env.version,
+                envelope_version.unwrap_or_default()
             )));
         }
     }
