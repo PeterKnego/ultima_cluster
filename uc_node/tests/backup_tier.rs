@@ -3393,7 +3393,6 @@ mod writer_e2e {
     /// whose voters have all purged — the leader asks it to install S from
     /// its tier first, it does, and no snapshot session is ever opened.
     #[test]
-    #[ignore = "pending a ruling (Task 14 finding F1): a brand-new learner's cluster view registers no tier, so it declines not_registered"]
     fn a_learner_with_a_tier_source_joins_a_purged_cluster_from_the_tier() {
         let _g = serialize();
         let buf = uc_node::obs::log::capture_for_tests();
@@ -3431,7 +3430,6 @@ mod writer_e2e {
     /// against the leader's carried hash, it declines, and the session
     /// installs the set instead.
     #[test]
-    #[ignore = "pending a ruling (Task 14 finding F1): a brand-new learner's cluster view registers no tier, so it declines not_registered"]
     fn a_corrupt_tier_artifact_declines_and_the_session_installs_it() {
         let _g = serialize();
         let buf = uc_node::obs::log::capture_for_tests();
@@ -3541,7 +3539,6 @@ mod writer_e2e {
     /// from the copy it already runs — no second copy, no session on either
     /// leader — and the learner reaches commit.
     #[test]
-    #[ignore = "pending a ruling (Task 14 finding F1): a brand-new learner's cluster view registers no tier, so it declines not_registered"]
     fn a_leader_change_mid_install_opens_no_second_path() {
         let _g = serialize();
         let buf = uc_node::obs::log::capture_for_tests();

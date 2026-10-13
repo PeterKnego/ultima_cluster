@@ -12088,12 +12088,14 @@ impl Consensus {
     /// - else [`crate::tier::source::check_install_set`] on the set the
     ///   leader NAMED (`body.s`, its `SET` read from the tier) against the
     ///   verdict the body CARRIES — never this node's catalog, which a new
-    ///   learner does not have (controller ruling) — with `through` read ONCE here and
-    ///   never again for this copy (a later `tier forget` does not reach a
-    ///   running copy); `Err` → `declined(reason)`, `Ok` → spawn the copy in
-    ///   `FetchMode::Install` and answer `installing{S, 0}`.
+    ///   learner does not have (controller ruling) — and no registration
+    ///   either (ruling F1): only `TIER` must read and be this cluster's
+    ///   ([`crate::tier::source::TierSource::is_ours`]), so a later `tier
+    ///   forget` cannot reach a running copy; `Err` → `declined(reason)`,
+    ///   `Ok` → spawn the copy in `FetchMode::Install` and answer
+    ///   `installing{S, 0}`.
     ///
-    /// File I/O (`registered_through`, the one `SET` read) happens once per
+    /// File I/O (the `TIER` read, the one `SET` read) happens once per
     /// request, never per pass.
     #[cold]
     #[inline(never)]
@@ -12105,6 +12107,8 @@ impl Consensus {
         // NAK), it identifies the term's leader exactly as that gossip
         // would. Without this a restarted follower drops the request and the
         // leader waits out its 2 s answer timeout before the session.
+        // Safe: the receiver's term gate admits only the current term, and
+        // a term has one leader.
         if self.cnc.status().leader_hint.load_acquire() == u64::MAX {
             self.learn_leader_hint(from, self.sm.current_term());
         }
@@ -12155,20 +12159,23 @@ impl Consensus {
             self.decline_tier_install(from, body, TierInstallReason::NoSource, "");
             return;
         };
-        let through = src.registered_through(&self.cluster_view.backups());
+        // Ruling F1: an install needs no registration — the leader's carried
+        // verdict is the proof the set at S is the cluster's (a brand-new
+        // learner's view registers no tier). Only `TIER` must be ours.
+        let ours = src.is_ours();
         let mut detail = "";
         // Only the set the leader NAMED is read — one `SET` label, not a
         // listing. A set a cancelled store-only copy is still draining (or a
         // store-only copy is copying) is "no set" for this request: two
         // threads must never share `incoming-<P>.tier.part`, and the leader
         // names one S, so there is no other set to fall back to here.
-        let sets = match through {
-            None => Vec::new(),
-            Some(_) if self.tier_copy_running_at(body.s) => {
+        let sets = match ours {
+            false => Vec::new(),
+            true if self.tier_copy_running_at(body.s) => {
                 detail = "draining";
                 Vec::new()
             }
-            Some(_) => match crate::tier::chain::read_label(src.target(), body.s) {
+            true => match crate::tier::chain::read_label(src.target(), body.s) {
                 Ok(Some(Ok(label))) => vec![label],
                 Ok(None) => Vec::new(),
                 Ok(Some(Err(_))) => {
@@ -12181,7 +12188,7 @@ impl Consensus {
                 }
             },
         };
-        match crate::tier::source::check_install_set(body, through, &sets) {
+        match crate::tier::source::check_install_set(body, ours, &sets) {
             Err(reason) => self.decline_tier_install(from, body, reason, detail),
             Ok((label, entry)) => {
                 let position = label.position;
@@ -12203,8 +12210,7 @@ impl Consensus {
                     node = self.id as u64,
                     position = position,
                     floor = body.floor,
-                    commit = body.commit,
-                    through = through.unwrap_or(0)
+                    commit = body.commit
                 );
                 self.send_tier_install_status(from, TierInstallState::Installing, position, 0);
             }
@@ -28478,11 +28484,13 @@ mod tests {
             out
         }
 
-        /// `through` is read ONCE, when the request arrives: a `tier forget`
-        /// committed while the copy runs does not reach it (it completes and
-        /// answers `installed`); the NEXT request reads the new view.
+        /// Ruling F1 regression guard: a `tier forget` committed while the
+        /// copy runs changes nothing — the copy completes and answers
+        /// `installed` — and, registration never being consulted for an
+        /// install, a later request with the tier still forgotten is served
+        /// too.
         #[test]
-        fn a_running_install_keeps_its_captured_through() {
+        fn a_running_install_is_unaffected_by_a_later_tier_forget() {
             let fx = set_fx(false);
             fx.src.set_fetch_delay_for_test(Duration::from_millis(150));
             let (mut h, leader, _) = rig(&fx, Some(8000));
@@ -28516,12 +28524,13 @@ mod tests {
             ask(&mut h, &fx, &leader);
             assert_eq!(
                 statuses(&leader),
-                vec![declined(TierInstallReason::NotRegistered, P)]
+                vec![status(TierInstallState::Installing, P, 0)],
+                "a forgotten (unregistered) tier still serves an install"
             );
-            assert_eq!(fx.src.fetches_spawned(), 1);
+            assert_eq!(fx.src.fetches_spawned(), 2);
             assert_eq!(
                 h.cons.tier_install_stats.declined.load(Ordering::Relaxed),
-                1
+                0
             );
         }
 

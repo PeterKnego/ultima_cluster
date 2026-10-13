@@ -76,6 +76,14 @@ impl TierSource {
         }
     }
 
+    /// `TIER` reads and names this cluster's `app_id` — all a `TIER_INSTALL`
+    /// asks of the tier itself (Task 14 ruling F1: the leader's carried
+    /// verdict proves the set; a brand-new learner's view registers no tier,
+    /// so registration cannot be the test there). Re-reads `TIER`.
+    pub fn is_ours(&self) -> bool {
+        self.unavailable().is_none()
+    }
+
     /// The committed `through` for this tier, or `None` when `TIER` is
     /// unreadable, foreign, or its id is not registered in `backups`.
     /// Re-reads `TIER` on each call, so a tier mounted later works.
@@ -495,10 +503,12 @@ pub fn install_expect(body: &TierInstallBody, label: &SetLabel) -> SetEntry {
 /// chose S (the newest agreed set in `[floor, commit]`, Task 14) and
 /// carries its catalog verdict; the follower checks only what the leader
 /// cannot know:
-/// - `through` None (no `TIER`, a foreign one, or an id the cluster has not
-///   registered) → `NotRegistered`;
-/// - `body.s` outside `[floor, min(commit, through)]` → `NoSet` (the reader
-///   already refuses `s` outside `[floor, commit]`; re-checked here);
+/// - `ours` false (`TIER` unreadable or foreign — [`TierSource::is_ours`])
+///   → `NotRegistered`. Registration is NOT consulted (Task 14 ruling F1):
+///   the leader's carried verdict is the proof the set at S is the
+///   cluster's, and a brand-new learner's view registers no tier;
+/// - `body.s` outside `[floor, commit]` → `NoSet` (the reader already
+///   refuses it; re-checked here);
 /// - no `SET` at exactly `body.s` among `sets` → `NoSet`;
 /// - a `SET` whose rows / versions / hashes / sizes disagree with the
 ///   carried verdict → `Verify`, before any copy (ruling D8).
@@ -507,13 +517,13 @@ pub fn install_expect(body: &TierInstallBody, label: &SetLabel) -> SetEntry {
 /// the copy is verified against. Pure.
 pub fn check_install_set(
     body: &TierInstallBody,
-    through: Option<u64>,
+    ours: bool,
     sets: &[SetLabel],
 ) -> Result<(SetLabel, SetEntry), TierInstallReason> {
-    let Some(through) = through else {
+    if !ours {
         return Err(TierInstallReason::NotRegistered);
-    };
-    if body.s < body.floor || body.s > body.commit.min(through) {
+    }
+    if body.s < body.floor || body.s > body.commit {
         return Err(TierInstallReason::NoSet);
     }
     let Some(label) = sets.iter().find(|l| l.position == body.s) else {
@@ -530,8 +540,10 @@ pub fn check_install_set(
 /// `TIER_INSTALL` body naming the set a below-floor follower should install
 /// from its tier, carrying this node's committed verdict for it. S is the
 /// newest AGREED set with `floor <= S <= commit` that is also at most the
-/// highest committed `through` over the registered tiers (the leader cannot
-/// tell which tier the follower reads, so the best-covered one bounds it);
+/// highest committed `newest_set` over the registered tiers (the leader
+/// cannot tell which tier the follower reads, so the best-covered one bounds
+/// it; ruling F4: not `through`, which can reach P before the set at P is
+/// copied — R9b cut-to-set);
 /// only if none qualifies, the newest agreed set in `[floor, commit]` (the
 /// follower's tier may still hold it). `None` = no agreed set in range at
 /// all: skip the exchange and open the session. Rows: each `Agreed` row's
@@ -542,16 +554,16 @@ pub fn leader_install_body(
     catalog: &[SetEntry],
     backups: &[BackupTierEntry],
 ) -> Option<TierInstallBody> {
-    let through = backups.iter().map(|b| b.through).max();
+    let newest = backups.iter().map(|b| b.newest_set).max();
     let in_range = |e: &&SetEntry| e.is_agreed() && floor <= e.position && e.position <= commit;
-    let newest = |bound: u64| {
+    let newest_in = |bound: u64| {
         catalog
             .iter()
             .filter(in_range)
             .filter(|e| e.position <= bound)
             .max_by_key(|e| e.position)
     };
-    let e = through.and_then(newest).or_else(|| newest(u64::MAX))?;
+    let e = newest.and_then(newest_in).or_else(|| newest_in(u64::MAX))?;
     let mut b = TierInstallBody {
         floor,
         commit,
@@ -948,11 +960,11 @@ pub(crate) mod tests {
         b
     }
 
-    /// Ruling PF6 as amended, exhaustively over a small space: a body that
-    /// survives the reader is accepted iff its `s` is at most `through` and
-    /// the tier holds a `SET` at exactly `s` — never below the floor, never
-    /// above commit or `through`; `NotRegistered` exactly when `through` is
-    /// None; `NoSet` otherwise. Which S to name is the leader's (Task 14).
+    /// Ruling PF6 as amended (and Task 14 F1), exhaustively over a small
+    /// space: a body that survives the reader is accepted iff the tier is
+    /// ours and holds a `SET` at exactly `s` — never below the floor, never
+    /// above commit; `NotRegistered` exactly when the tier is not ours;
+    /// `NoSet` otherwise. Which S to name is the leader's.
     #[test]
     fn check_install_set_never_lands_below_the_floor_or_above_commit() {
         use uc_protocol::v2::datagram::{
@@ -971,25 +983,21 @@ pub(crate) mod tests {
                         assert!(floor > commit || s < floor || s > commit);
                         continue;
                     };
-                    for through in std::iter::once(None).chain((0..=12u64).map(Some)) {
+                    for ours in [false, true] {
                         cases += 1;
-                        let want = through.is_some_and(|t| s <= t) && AT.contains(&s);
-                        match check_install_set(&body, through, &sets) {
+                        let want = ours && AT.contains(&s);
+                        match check_install_set(&body, ours, &sets) {
                             Ok((l, e)) => {
                                 oks += 1;
-                                assert!(want, "{floor} {commit} {s} {through:?}");
-                                let t = through.unwrap();
+                                assert!(want, "{floor} {commit} {s} {ours}");
                                 assert_eq!(l.position, s);
-                                assert!(floor <= s && s <= commit.min(t));
+                                assert!(floor <= s && s <= commit);
                                 assert_eq!(e.position, s);
                                 assert!(e.is_agreed(), "the body's verdict is agreed");
                             }
-                            Err(TierInstallReason::NotRegistered) => assert!(through.is_none()),
+                            Err(TierInstallReason::NotRegistered) => assert!(!ours),
                             Err(TierInstallReason::NoSet) => {
-                                assert!(
-                                    through.is_some() && !want,
-                                    "{floor} {commit} {s} {through:?}"
-                                );
+                                assert!(ours && !want, "{floor} {commit} {s} {ours}");
                             }
                             Err(r) => panic!("unexpected reason {r:?}"),
                         }
@@ -1001,25 +1009,29 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn check_install_set_refuses_an_unregistered_tier() {
+    fn check_install_set_refuses_an_unreadable_or_foreign_tier() {
         let sets = [label_at(5)];
         let body = body_at(0, 10, 5);
         assert_eq!(
-            check_install_set(&body, None, &sets).err(),
+            check_install_set(&body, false, &sets).err(),
             Some(TierInstallReason::NotRegistered),
-            "the named set in the tier does not make an unregistered tier servable"
+            "the named set in the tier does not make a foreign tier servable"
         );
         assert_eq!(
-            check_install_set(&body, Some(10), &sets)
+            check_install_set(&body, true, &sets)
                 .map(|(l, _)| l.position)
                 .ok(),
-            Some(5)
+            Some(5),
+            "no registration needed (ruling F1)"
         );
-        assert_eq!(
-            check_install_set(&body, Some(4), &sets).err(),
-            Some(TierInstallReason::NoSet),
-            "never past the registered through"
-        );
+        // `is_ours` is the source of `ours`: no TIER, a foreign TIER → false.
+        let d = tmp();
+        let src = TierSource::open(d.path(), "mine").expect("absent TIER opens");
+        assert!(!src.is_ours(), "no TIER");
+        put_tier(d.path(), "theirs", 7);
+        assert!(!src.is_ours(), "a foreign TIER");
+        put_tier(d.path(), "mine", 7);
+        assert!(src.is_ours());
     }
 
     /// Ruling D8 with the leader as the authority: a body built from the
@@ -1030,19 +1042,19 @@ pub(crate) mod tests {
         let fx = set_fx(false);
         let body = body_for(&fx, 0, 8000);
         let (l, e) =
-            check_install_set(&body, Some(8000), std::slice::from_ref(&fx.label)).expect("matches");
+            check_install_set(&body, true, std::slice::from_ref(&fx.label)).expect("matches");
         assert_eq!(l, fx.label);
         assert!(label_matches_catalog(&l, &e));
         let mut v = body;
         v.row_version[2] += 1;
         assert_eq!(
-            check_install_set(&v, Some(8000), std::slice::from_ref(&fx.label)).err(),
+            check_install_set(&v, true, std::slice::from_ref(&fx.label)).err(),
             Some(TierInstallReason::Verify)
         );
         let mut h = body;
         h.cluster_hash ^= 1;
         assert_eq!(
-            check_install_set(&h, Some(8000), std::slice::from_ref(&fx.label)).err(),
+            check_install_set(&h, true, std::slice::from_ref(&fx.label)).err(),
             Some(TierInstallReason::Verify)
         );
     }
@@ -1051,7 +1063,7 @@ pub(crate) mod tests {
     /// the best-covered tier's `through`; else the newest agreed in range;
     /// none in range → `None`. Never a non-agreed set, never outside range.
     #[test]
-    fn leader_install_body_names_the_newest_agreed_set_the_tiers_cover() {
+    fn leader_install_body_names_the_newest_agreed_set_the_tiers_hold() {
         use uc_protocol::v2::catalog::SetKind;
         let set = |p: u64, agreed: bool| {
             let mut e = SetEntry::commanded(p, SetKind::Full, p);
@@ -1074,11 +1086,13 @@ pub(crate) mod tests {
             e.state = SetState::Complete;
             e
         };
-        let tier = |through: u64| BackupTierEntry {
-            tier_id: through + 1,
+        // Ruling F4: the bound is `newest_set`; `through` (the journal
+        // watermark) runs far past it here, and must not widen the choice.
+        let tier = |newest: u64| BackupTierEntry {
+            tier_id: newest + 1,
             oldest_set: 0,
-            newest_set: through,
-            through,
+            newest_set: newest,
+            through: newest + 10_000,
             reporter: 1,
             updated_pos: 1,
         };
@@ -1091,7 +1105,8 @@ pub(crate) mod tests {
         let s_of = |floor, commit, b: &[BackupTierEntry]| {
             leader_install_body(floor, commit, &cat, b).map(|b| b.s)
         };
-        // Bounded by the highest through (two tiers: 1500 and 2500 → 2500).
+        // Bounded by the highest newest set (1500 and 2500 → 2500), not by
+        // `through` (12 500, which would admit 4000).
         assert_eq!(s_of(0, 5000, &[tier(1500), tier(2500)]), Some(2000));
         // Never the diverged 3000, even when through covers it.
         assert_eq!(s_of(2500, 3500, &[tier(3500)]), None);
