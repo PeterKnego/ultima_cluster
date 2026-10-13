@@ -416,10 +416,17 @@ reviewer wants a workload to attack.
     below it; restore writes that as the node's map, so reconcile aligns with
     a live leader.
   - **3b: retention's view gate, the origin-set edge** (ruling R10a, deferred
-    by the 3a final review, 2026-10-11) — **resolved by 3b.** Nothing is
-    deleted on the tier's word alone any more: the writer reads back every
-    object it creates, and retention counts only verified sets, so an
-    unverified newest set never causes a verified older set's deletion.
+    by the 3a final review, 2026-10-11). Retention runs only once the
+    writer's view has consumed past the tier's newest complete set, on the
+    reasoning that a pin whose rollback set is in the tier has its record
+    below that set. A pin whose record lies ABOVE the newest tier set is not
+    covered by that argument: in the narrow window before the view applies
+    the record, a pass does not see the pin. Today that pin can protect only
+    the newest set, which is never deleted; the edge is a set that lands in
+    the tier inside that window. Narrow and unobserved — settle it (gate on a
+    later position, or show the window empty) before nodes delete on the
+    tier's word. **Still open:** 3b shipped with this edge unsettled: nodes
+    now delete on the tier's word; the window remains narrow and unobserved.
 - **Compressing the node's own journal (idea, unmeasured).** The backup tier
   compresses what it writes off-node (spec
   `superpowers/specs/2026-10-10-uc2-backup-tier-design.md` D11); the node's
