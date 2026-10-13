@@ -125,6 +125,21 @@ of needing a full snapshot install. Size it to your worst-case follower lag: too
 small and ordinary lag triggers snapshot sessions, too large and you keep
 journal you meant to reclaim.
 
+### Purge with a tier
+
+Purge deletes the only local copy of the log below the floor. If a backup
+tier holds that history, you can make every node's purge wait for it:
+`purge_requires_tiers = K` in the replicated settings (`uc2ctl settings apply`;
+`0`, the default, is off, and 1 to 4 is the number of tiers that must
+confirm). With it on, a node's purge floor never passes the K-th highest
+confirmed `through` among the registered tiers, and with fewer than K tiers
+registered nothing is purged beyond the other holds. It only holds purge back;
+`[purge]` must still be on. Older history then lives only in the tier, so its
+retention decides how far back a restore reaches, and a node whose free space
+runs low lets go of the hold (`backup_gate_released`, alert
+`Uc2BackupGateReleased`). See
+[Back up to a tier § Backup-gated purge](back-up-to-a-tier.md#backup-gated-purge).
+
 ## Confirm it is working
 
 ```bash
@@ -169,6 +184,13 @@ assemble one declines by name rather than shipping half.
 If the node that would serve it is a voter that has not fetched a standby set
 — or one restored from a backup taken before its own floor — it answers with a
 **redirect** to a learner that does hold the set, and the joiner asks there.
+
+If the node has a backup tier it can read (`[backup]` or `[tier_source]`), the
+leader first asks it to **install a set from the tier**: the node copies and
+verifies the set against the cluster's catalog, adopts it and its term history,
+and continues from there, so the leader ships nothing large. The snapshot
+session is the fallback if the node has no source, declines, or stalls. See
+[Back up to a tier § The tier as a source](back-up-to-a-tier.md#the-tier-as-a-source).
 
 A restarted node does **not** prefill its send ring from the journal. A
 below-ring catch-up gap is served on demand by deep-NAK replay instead.

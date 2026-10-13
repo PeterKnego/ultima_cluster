@@ -85,6 +85,8 @@ The header is authenticated as AAD when wire crypto is enabled, and carries a
 | 25 | `PROBE_ACK` | pairwise (`0.8.0`, `2.12.0` — jumbo-frame MTU discovery) |
 | 26 | `SNAP_REPORT` | pairwise (0.9.0, 2.13.0 — live snapshot-hash reports) |
 | 27 | `BACKUP_REPORT` | pairwise (0.11.0, unreleased — backup-tier watermark reports; term-independent) |
+| 28 | `TIER_INSTALL` | pairwise (0.11.0, unreleased — backup tier 3b; leader → follower, term-gated) |
+| 29 | `TIER_INSTALL_STATUS` | pairwise (0.11.0, unreleased — backup tier 3b; follower → leader) |
 
 Kind **21** was `SNAP_TABLE` — the schedule table carried beside a session —
 and is **retired** (`DGRAM_KIND_SNAP_TABLE_RETIRED`). The table now rides the
@@ -273,6 +275,57 @@ carries the same five fields in a 48-byte payload (below). Valid iff
 | 24..32 | `through` | u64 | journal position the tier's chunks cover through |
 | 32..40 | `reporter` | u64 | the reporting node's id |
 
+#### `TIER_INSTALL` body (wire 0.11.0, backup tier 3b)
+
+Where the leader would open a snapshot session for a follower whose NAK falls
+below its purge floor, it first sends this: "install the set S from your
+tier". The leader names S and **carries its catalog verdict** for it, the way
+`SNAP_BEGIN` carries identity claims, so a follower with an empty catalog (a
+new learner) verifies the tier's copy against the leader's agreed values, not
+the tier's own `SET`. S is the leader's newest agreed set with `floor <= S <=
+commit` that is at or below the tiers' highest committed `newest_set`, else the
+newest agreed set in range. Fixed 200 bytes, little-endian, no padding:
+
+| bytes | field | width | meaning |
+|---|---|---|---|
+| 0..8 | `floor` | u64 | the leader's purge floor |
+| 8..16 | `commit` | u64 | the leader's commit position |
+| 16..24 | `s` | u64 | the set to install |
+| 24..88 | `row_hash` | [u64; 8] | per row, the agreed artifact hash; `0` = the row is not in the set |
+| 88..120 | `row_version` | [u32; 8] | per row, the `S::VERSION` that built it |
+| 120..184 | `row_size` | [u64; 8] | per row, the artifact's size |
+| 184..192 | `cluster_hash` | u64 | the cluster artifact's agreed hash |
+| 192..200 | `cluster_size` | u64 | the cluster artifact's size |
+
+A reader refuses any other length, `floor > commit`, and `s` outside
+`[floor, commit]`. Unset rows are zero.
+
+#### `TIER_INSTALL_STATUS` body (wire 0.11.0, backup tier 3b)
+
+The follower's answer, repeated about once a second while it works. Fixed 24
+bytes, little-endian: `state u8 @0 ‖ reason u8 @1 ‖ reserved [u8; 6] @2 ‖
+position u64 @8 ‖ copied u64 @16`.
+
+| `state` | name | meaning |
+|---|---|---|
+| 0 | `declined` | not installing; `reason` says why, `position` is `s` when known |
+| 1 | `installing` | `position` = S, `copied` = bytes copied so far |
+| 2 | `installed` | `position` = S |
+
+| `reason` | name | meaning |
+|---|---|---|
+| 0 | `none` | not a decline |
+| 1 | `no_source` | the follower has no readable tier source |
+| 2 | `no_set` | the tier holds no set it could install for this `floor`/`commit`/`s` |
+| 3 | `verify` | a copied object failed the leader's carried hash, version or size |
+| 4 | `not_registered` | the follower's tier is unreadable or belongs to another cluster |
+
+The leader falls back to a snapshot session on a decline, after 2 s with no
+answer, or after 10 s with `copied` not rising; a decline or timeout holds the
+peer off the tier for 30 s, and an `installed` answer earns a 10 s settling
+grace. The install needs no committed registration of the follower's tier: the
+leader's verdict is the proof.
+
 ### Administration
 
 | Kind | Name | Scope |
@@ -376,7 +429,7 @@ otherwise the kind plus the payload slice. Per kind:
 |---|---|---|
 | `1` Membership | the `ClusterConfig` encoding `CONFIG` carried through `0.6.0`, unchanged | `uc_protocol::v2::config` |
 | `2` ScheduleTable | the whole table — an 8-byte header plus `count × 33` bytes, at most `MAX_SCHEDULE_ENTRIES = 32`, so **≤ 1064 B**. Layout below | `uc_protocol::v2::schedule` |
-| `3` Settings | `SETTINGS_LEN = 46` bytes exactly (**`0.11.0`**, the backup tier; was 36 at version 4 in the snapshot lifecycle, 35 at version 3 in the snapshot catalog, 33 through `2.12.0`, 29 through `2.11.0`): `version u32 = 5 ‖ fsm_lag_bytes u64 @4 ‖ admission_bytes u64 @12 ‖ snapshot_interval_bytes u64 @20 ‖ snapshot_target u8 @28 ‖ datagram_mtu u32 @29 ‖ retain_sets u16 @33 ‖ auto_fetch u8 @35 ‖ backup_retain_sets u16 @36 ‖ backup_retain_age_secs u64 @38` (`auto_fetch` nonzero = on; `u64::MAX` age refused 47). Versions 1–4 still decode; `auto_fetch` then reads true (v1–v3) and both backup fields read `0`. `0` in any u64 means "derive at use"; `fsm_lag_bytes = u64::MAX` (`FSM_LAG_LOCKSTEP`) means lockstep; `snapshot_target` is `0` = all, `1` = learners; `datagram_mtu` is `0` (= the `MTU_DEFAULT` baseline) or a member of `RUNGS`, discovered and monotone, never operator-written; `retain_sets` is how many AGREED catalog sets the cluster keeps — `1..=48` (`MAX_RETAIN_SETS`), refused above that, and at `0` from an operator, by the leader's door (`47 settings_bounds`); a `0` that still reaches `apply` reads as `1`. A **version `3`** record (35 B) is still ACCEPTED and reads `auto_fetch = true`. A **version `2`** record — 33 B, `SETTINGS_LEN_V2`, the `2.12.0` shape — is still ACCEPTED on read and maps `retain_sets` to `1` (the newest-only retention such a cluster ran); a **version `1`** record — 29 B, `SETTINGS_LEN_V1`, the `2.11.0` shape — is still ACCEPTED and maps `datagram_mtu` to `0` and `retain_sets` to `1`, because the cluster artifact and committed `CLUSTER` frames survive the upgrade; an encoder always writes version 5. No trailing bytes are tolerated, and no other `(version, len)` pair decodes | `uc_protocol::v2::settings` |
+| `3` Settings | `SETTINGS_LEN = 47` bytes exactly (**`0.11.0`**, backup tier 3b; was 46 at version 5 in the backup tier, 36 at version 4 in the snapshot lifecycle, 35 at version 3 in the snapshot catalog, 33 through `2.12.0`, 29 through `2.11.0`): `version u32 = 6 ‖ fsm_lag_bytes u64 @4 ‖ admission_bytes u64 @12 ‖ snapshot_interval_bytes u64 @20 ‖ snapshot_target u8 @28 ‖ datagram_mtu u32 @29 ‖ retain_sets u16 @33 ‖ auto_fetch u8 @35 ‖ backup_retain_sets u16 @36 ‖ backup_retain_age_secs u64 @38 ‖ purge_requires_tiers u8 @46` (`auto_fetch` nonzero = on; `u64::MAX` age refused 47; `purge_requires_tiers` is `0` = off or `1..=4`, above 4 refused 47). Versions 1–5 still decode; `auto_fetch` then reads true (v1–v3), both backup fields read `0` (v1–v4) and `purge_requires_tiers` reads `0` (v1–v5). `0` in any u64 means "derive at use"; `fsm_lag_bytes = u64::MAX` (`FSM_LAG_LOCKSTEP`) means lockstep; `snapshot_target` is `0` = all, `1` = learners; `datagram_mtu` is `0` (= the `MTU_DEFAULT` baseline) or a member of `RUNGS`, discovered and monotone, never operator-written; `retain_sets` is how many AGREED catalog sets the cluster keeps — `1..=48` (`MAX_RETAIN_SETS`), refused above that, and at `0` from an operator, by the leader's door (`47 settings_bounds`); a `0` that still reaches `apply` reads as `1`. A **version `3`** record (35 B) is still ACCEPTED and reads `auto_fetch = true`. A **version `2`** record — 33 B, `SETTINGS_LEN_V2`, the `2.12.0` shape — is still ACCEPTED on read and maps `retain_sets` to `1` (the newest-only retention such a cluster ran); a **version `1`** record — 29 B, `SETTINGS_LEN_V1`, the `2.11.0` shape — is still ACCEPTED and maps `datagram_mtu` to `0` and `retain_sets` to `1`, because the cluster artifact and committed `CLUSTER` frames survive the upgrade; an encoder always writes version 6. No trailing bytes are tolerated, and no other `(version, len)` pair decodes | `uc_protocol::v2::settings` |
 | `4` UpgradePin | **20 B** exactly: `row u8 @0 ‖ reserved [u8; 3] @1 ‖ from u32 @4 ‖ to u32 @8 ‖ origin u64 @12`. `row < 8`, `origin > 0`, reserved zero. An EVENT ("at `origin`, `row` went `from` → `to`"), kept as a per-row history of at most 4 in the cluster FSM and republished into the row's cnc status line (`+16`/`+24`) | `uc_protocol::v2::upgrade` |
 | `5` SnapshotReport | `row u8 @0 ‖ count u8 @1 ‖ reserved [u8; 6] @2 ‖ position u64 @8 ‖ count × (node_id u32 ‖ hash u64 ‖ size u64)`, `1 ≤ count ≤ 8` → **36–176 B** (`0.11.0`, the snapshot lifecycle: 20-byte entries; a pre-lifecycle record has 12-byte entries, 28–112 B, and is still decoded, every size `0` — the decoder infers the width from the length), node ids strictly increasing. The leader's collected per-node artifact hashes for `(row, position)`; the verdict (all equal / majority names minority / no majority) is recomputed by every reader, never carried | `uc_protocol::v2::upgrade` |
 | `6` RowGenesis (0.10.0, #33) | **8 B** exactly (`ROW_GENESIS_LEN`): `row u8 @0 ‖ reserved [u8; 3] @1 ‖ version u32 @4`. `row < 8`, reserved zero; `version` is a packed version and `0` is a legal value (an unversioned FSM). A recorded FACT, not an operator's change: the leader appends it on its own, once per row, naming the version of its own attached service when the row has no running version yet. Applied at commit, it sets the row's running version; refused `60 version_already_set` if the row already has one. An accepted `UpgradePin` (kind 4) sets the running version too, to its `to`, and is refused `53` when its `from` is not on the running line (same major.minor) | `uc_protocol::v2::upgrade` (`encode_row_genesis`/`decode_row_genesis`) |

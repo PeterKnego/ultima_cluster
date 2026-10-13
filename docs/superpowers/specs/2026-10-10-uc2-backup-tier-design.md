@@ -655,6 +655,7 @@ ledger (PF = pre-flight, R = execution rulings, by task).
   pointing at the ordinary snapshot-session join); the fix is node-side
   lineage seeding and is 3b's. Its e2e stays `#[ignore]`d as 3b's acceptance
   test. Whole-cluster restore is unaffected (every node shares `[(t, S)]`).
+  Closed by 3b (Task 4).
 - **PF-fork, R12b, R12c — the fork's membership (§8.2, §13).**
   `force_single_member` works and the fork leads alone, but its cluster FSM
   still names the old voters. As built the leader appends the kernel's config

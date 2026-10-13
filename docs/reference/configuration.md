@@ -140,6 +140,7 @@ record cannot see the host it lands on.
 | `auto_fetch` | `true` | Every node fetches the newest **agreed** snapshot set it does not hold, in the background, so it can purge below it and restart from it (snapshot lifecycle). `false`: on a learner-only cluster (`snapshot_target = "learners"`) voters then hold no set and never purge. Seeds genesis only; change it with `uc2ctl settings apply`. |
 | `backup_retain_sets` | `0` → keep every set | Backup tier (`0.11.0`, unreleased): how many complete sets a backup tier keeps; older sets are pruned once the count is exceeded. `0` = no count rule. A `u16`. Seeds genesis only; change it later with `uc2ctl settings apply`. |
 | `backup_retain_age` | `0` → no age rule | Backup tier (`0.11.0`, unreleased): a tier set older than this may be pruned. A string `"<n>(s\|m\|h\|d)"` (e.g. `"30d"`; no spaces, no fractions), replicated as `backup_retain_age_secs`. `u64::MAX` seconds is the reserved sentinel and is refused with reason 47. Seeds genesis only. |
+| `purge_requires_tiers` | `0` → off | Backup tier 3b (`0.11.0`, unreleased): when `1..=4`, every node holds its purge floor at or below the K-th highest confirmed `through` among the registered tiers (K = this value); fewer than K registered means no purge beyond the other holds. Purge still needs `[purge]` on. Above `4` is refused with `47 settings_bounds`. Seeds genesis only; change it with `uc2ctl settings apply`; `settings show` prints it. See [Back up to a tier § Backup-gated purge](../how-to/back-up-to-a-tier.md#backup-gated-purge). |
 
 Both `0` sentinels keep their meanings under that refusal: `fsm_lag = 0`
 ("derive this node's boot value") and `"lockstep"` are not byte bounds, so
@@ -189,6 +190,27 @@ reader interprets — a padding frame's body and each frame's alignment slack
 identical (a follower's padding body is whatever its own ring held: padding
 travels header-only).
 
+### `[tier_source]`
+
+Backup tier 3b (spec `docs/superpowers/specs/2026-10-12-uc2-backup-tier-3b-design.md`
+§6). Optional, node-local and **read-only**: a mounted backup tier this node
+may read sets from, in front of its peers. Any node may have it. A node with
+`[backup]` already reads its own `target` as a source and needs no section.
+
+```toml
+[tier_source]
+target = "/mnt/uc-backup"        # required
+```
+
+| key | default | rule |
+|---|---|---|
+| `target` | — | **required**; the tier's directory. Opened at boot: its `TIER` file must name this cluster's `app_id` or the node refuses to start (`tier_source_foreign`, below). An unreachable tier does not refuse: the node starts, logs `tier_source_unavailable`, and fetches from peers. |
+
+A node uses a source only while its tier is registered in the committed
+watermark for store-only fetches, and never reads beyond that entry's
+`through`; a below-floor install needs only that the tier belongs to this
+cluster. See [Back up to a tier § The tier as a source](../how-to/back-up-to-a-tier.md#the-tier-as-a-source).
+
 ## Startup refusals
 
 `uc2-node` refuses to start, naming the field, rather than failing later in a
@@ -220,6 +242,7 @@ replaces:
 | top-level `admission_bytes` is refused, pointing at `[settings]` | The same change: the admission window is cluster-wide, and its effective value used to change silently on failover. |
 | `settings.fsm_lag` must parse | M14a's rule, now on the seed: an unparsable string (wrong suffix, spaces, a fraction) is refused by name rather than silently falling back to the derived bound. |
 | `settings.snapshot_target` must be `"all"` or `"learners"` | The cluster FSM (2.11.0): an unknown target would silently pick one. |
+| an explicit `[tier_source]` must name this cluster's `app_id` | Backup tier 3b: `tier_source_foreign`, the same check the writer makes of `[backup]`. A source merely *implied* from `[backup]` that is foreign does **not** refuse: it logs `tier_source_unavailable{detail="foreign: …"}`, is not used, and the writer's `backup_target_foreign` stop applies as before. |
 
 The RAM-backed-filesystem refusal has two override channels, and **neither is
 silent** — the override suppresses the refusal, never the notice, and the

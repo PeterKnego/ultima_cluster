@@ -108,9 +108,11 @@ Consistency, SubmitError}`) are in the same position and are covered too.
   line formats, additively.** `audit.jsonl` gains a **13th key**, `source`
   (`"operator"` on every admin request, `"discovery"` on the `settings_apply`
   a node writes itself when the committed rung rises), appended LAST so every
-  byte before it is unchanged. The audit line's key ORDER is a contract
+  byte before it is unchanged. Backup tier 3b (unreleased) appends a **14th**,
+  `fetch_source` (`"tier"` or `"peer"` on a snapshot-fetch record, `null`
+  elsewhere), on the same rule. The audit line's key ORDER is a contract
   (`uc_node::audit`, which shares one formatter with `uc_node::obs::log`), and
-  the rule that makes a 13th key a minor change rather than a breaking one is:
+  the rule that makes a 13th or 14th key a minor change rather than a breaking one is:
   **keys are appended, never reordered, renamed or removed**, and a reader
   looks fields up by name — `uc2ctl audit` and the test readers do. `uc_node`
   is not in the promised-surface table, so this is not semver-governed API, but
