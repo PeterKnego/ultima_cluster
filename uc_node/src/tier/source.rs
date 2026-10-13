@@ -8,7 +8,7 @@ use super::layout::{SetLabel, cluster_object, row_object};
 use super::materialize::copy_artifact;
 use super::target::{BackupTarget, FsTarget, read_tier};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -125,6 +125,12 @@ pub struct TierFetch {
     pub copied: Arc<AtomicU64>,
     /// `Some` once the thread has finished — its last act.
     pub done: Arc<Mutex<Option<FetchResult>>>,
+    /// Review C1: set by [`Self::cancel`] (the node gave up on this copy and
+    /// fell back to a peer, whose session writes the SAME final names). The
+    /// thread checks it before every marker write and rename and before it
+    /// publishes; once set it renames nothing, publishes nothing, and its
+    /// cleanup removes only its own `.tier.part` files.
+    cancelled: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
 }
 
@@ -146,8 +152,19 @@ impl TierFetch {
             position,
             copied: Arc::new(AtomicU64::new(0)),
             done: Arc::new(Mutex::new(None)),
+            cancelled: Arc::new(AtomicBool::new(false)),
             handle: None,
         }
+    }
+
+    /// Review C1: cancel the copy. Non-blocking; the caller keeps the
+    /// `TierFetch` (draining) until [`Self::try_finish`] returns `Some`.
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
     }
 
     /// The thread's result once it has finished (joining it), else `None`.
@@ -211,6 +228,18 @@ struct Written {
 }
 
 impl Written {
+    /// Review C1: a CANCELLED copy's finals and marker may by now belong to
+    /// the peer session that replaced it (same names, same verified bytes):
+    /// only its own `.tier.part` temp files are its to remove.
+    fn undo_parts_only(&mut self) {
+        for p in self.parts.drain(..) {
+            let _ = std::fs::remove_file(&p);
+        }
+        self.finals.clear();
+        self.marker = None;
+        self.dirs.clear();
+    }
+
     fn undo(&mut self) {
         let files = self.parts.drain(..).chain(self.finals.drain(..));
         for p in files.chain(self.marker.take()) {
@@ -242,8 +271,10 @@ fn copy_set(
     label: &SetLabel,
     expect: &SetEntry,
     copied: &AtomicU64,
+    cancelled: &AtomicBool,
     w: &mut Written,
 ) -> Result<PathBuf, String> {
+    let gone = || cancelled.load(Ordering::Acquire);
     let p = label.position;
     if !label_matches_catalog(label, expect) {
         return Err("verify".into());
@@ -297,6 +328,9 @@ fn copy_set(
         // Ruling R42 (review m-A): the set is marked "not built here",
         // durably, before ANY of its artifacts becomes visible — exactly
         // what a peer session does.
+        if gone() {
+            return Err("cancelled".into());
+        }
         let marker = marker_path(root, p);
         let had_marker = marker.exists();
         write_foreign_marker(&fin, p).map_err(|_| "io".to_string())?;
@@ -304,6 +338,9 @@ fn copy_set(
             w.marker = Some(marker);
         }
         let existed = fin.exists();
+        if gone() {
+            return Err("cancelled".into());
+        }
         std::fs::rename(&part, &fin).map_err(|_| "io".to_string())?;
         w.parts.retain(|x| x != &part);
         if !existed {
@@ -343,13 +380,24 @@ pub fn spawn_fetch(
     let copied = Arc::new(AtomicU64::new(0));
     let done: Arc<Mutex<Option<FetchResult>>> = Arc::new(Mutex::new(None));
     src.fetches_spawned.fetch_add(1, Ordering::Relaxed);
-    let (c2, d2) = (Arc::clone(&copied), Arc::clone(&done));
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let (c2, d2, x2) = (
+        Arc::clone(&copied),
+        Arc::clone(&done),
+        Arc::clone(&cancelled),
+    );
     let body = move || {
         let mut w = Written::default();
         let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            copy_set(&src, &root, &label, &expect, &c2, &mut w)
+            copy_set(&src, &root, &label, &expect, &c2, &x2, &mut w)
         }));
         let result = match run {
+            // Review C1: cancelled (now or at any point) — touch nothing
+            // but this copy's own temp files, signal nothing.
+            _ if x2.load(Ordering::Acquire) => {
+                w.undo_parts_only();
+                Err("cancelled".to_string())
+            }
             Ok(Ok(cluster_final)) => {
                 match mode {
                     FetchMode::StoreOnly => signals.publish_stored(position),
@@ -384,6 +432,7 @@ pub fn spawn_fetch(
         position,
         copied,
         done,
+        cancelled,
         handle,
     }
 }
@@ -640,6 +689,59 @@ mod tests {
         let (r, _) = run(&fx);
         assert_eq!(r, Err("verify".to_string()));
         assert!(std::fs::read_dir(&fx.root).unwrap().next().is_none());
+    }
+
+    /// Review C1: a copy cancelled mid-flight (the node fell back to a peer,
+    /// whose session writes the same final names) renames nothing more,
+    /// signals nothing, and removes only its own `.tier.part` files — never
+    /// a final or the marker, which may now be the peer's.
+    #[test]
+    fn a_cancelled_copy_leaves_the_peers_finals_and_marker_alone() {
+        let fx = set_fx(false);
+        fx.src.set_fetch_delay_for_test(Duration::from_millis(400));
+        let stored = Arc::new(AtomicU64::new(0));
+        let mut f = spawn_fetch(
+            Arc::clone(&fx.src),
+            fx.root.clone(),
+            fx.label.clone(),
+            fx.entry.clone(),
+            FetchMode::StoreOnly,
+            SnapIntakeSignals::new(Arc::clone(&stored), None),
+        );
+        let first = fx.root.join("0/snap-4096.ultsnap");
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while !first.exists() {
+            assert!(std::time::Instant::now() < deadline, "row 0 never landed");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        f.cancel();
+        assert!(f.is_cancelled());
+        // The peer session's copy of row 2 lands under the final name, and
+        // the tier loses its cluster object (a late failure, were it to run).
+        let peer_final = fx.root.join("2/snap-4096.ultsnap");
+        std::fs::create_dir_all(peer_final.parent().unwrap()).unwrap();
+        std::fs::write(&peer_final, b"the peer's row 2").unwrap();
+        fx.src.target().delete(&cluster_object(P)).unwrap();
+        let r = loop {
+            if let Some(r) = f.try_finish() {
+                break r;
+            }
+            assert!(std::time::Instant::now() < deadline, "never finished");
+            std::thread::sleep(Duration::from_millis(2));
+        };
+        assert_eq!(r, Err("cancelled".to_string()));
+        assert_eq!(stored.load(Ordering::Acquire), 0, "nothing signalled");
+        assert_eq!(std::fs::read(&peer_final).unwrap(), b"the peer's row 2");
+        assert_eq!(std::fs::read(&first).unwrap(), fx.row, "a final is kept");
+        assert!(
+            fx.root.join("cluster/snap-4096.foreign").exists(),
+            "marker kept"
+        );
+        assert!(
+            !files(&fx.root).iter().any(|f| f.ends_with(".tier.part")),
+            "{:?}",
+            files(&fx.root)
+        );
     }
 
     #[test]

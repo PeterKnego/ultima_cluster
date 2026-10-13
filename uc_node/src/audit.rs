@@ -19,7 +19,7 @@
 //! *fresh* decision is recorded before that decision is published.
 //!
 //! ```json
-//! {"ts_ns":1755600000000000000,"event":"admin_op","actor":"ops-alice","origin":"local","op":1,"op_name":"add_learner","id":4,"addr":"10.0.0.4:9100","seq":12,"nonce":880,"outcome":"accepted","reason":0,"config_version":7,"detail":null,"source":"operator"}
+//! {"ts_ns":1755600000000000000,"event":"admin_op","actor":"ops-alice","origin":"local","op":1,"op_name":"add_learner","id":4,"addr":"10.0.0.4:9100","seq":12,"nonce":880,"outcome":"accepted","reason":0,"config_version":7,"detail":null,"source":"operator","fetch_source":null}
 //! ```
 //!
 //! **Not every record is an admin request.** Jumbo spec §9: when path-MTU
@@ -243,6 +243,11 @@ pub struct AuditRecord<'a> {
     /// `uc2ctl audit` and the `admin_auth` test reader both look fields up by
     /// name, so the addition is additive for them.
     pub source: &'static str,
+    /// Backup-tier 3b review I3: on an auto-fetch record (op 9, `source =
+    /// "auto"`), where the set came from — `"tier"` or `"peer"`; `None`
+    /// (rendered `null`) on every other record. The file's 14th key, added
+    /// LAST — additive, like `source` (`docs/reference/semver-policy.md`).
+    pub fetch_source: Option<&'static str>,
 }
 
 /// [`AuditRecord::source`] for a record the node answered somebody for.
@@ -365,6 +370,10 @@ pub struct AutoFetchAudit {
     pub from: u32,
     /// The set's position (the record's `config_version`).
     pub position: u64,
+    /// Backup-tier 3b review I3: where the set is being fetched from —
+    /// `"tier"` (then `from` is this node's OWN id: it served itself) or
+    /// `"peer"`. The record's `fetch_source`.
+    pub source: &'static str,
 }
 
 impl AutoFetchAudit {
@@ -386,6 +395,7 @@ impl AutoFetchAudit {
             config_version: self.position,
             detail: None,
             source: SOURCE_AUTO,
+            fetch_source: Some(self.source),
         }
     }
 }
@@ -498,7 +508,7 @@ impl Drop for AutoFetchAuditWriter {
 
 /// The record's fields, in the one order both the file line and the obs
 /// mirror use. `addr` is `null` when the op carries no address.
-fn fields<'a>(r: &'a AuditRecord<'a>, addr: Option<&'a str>) -> [Field<'a>; 13] {
+fn fields<'a>(r: &'a AuditRecord<'a>, addr: Option<&'a str>) -> [Field<'a>; 14] {
     [
         Field {
             key: "actor",
@@ -558,6 +568,13 @@ fn fields<'a>(r: &'a AuditRecord<'a>, addr: Option<&'a str>) -> [Field<'a>; 13] 
             key: "source",
             value: FieldValue::Str(r.source),
         },
+        Field {
+            key: "fetch_source",
+            value: match r.fetch_source {
+                Some(s) => FieldValue::Str(s),
+                None => FieldValue::Null,
+            },
+        },
     ]
 }
 
@@ -605,6 +622,7 @@ mod tests {
             config_version: 7,
             detail: None,
             source: SOURCE_OPERATOR,
+            fetch_source: None,
         }
     }
 
@@ -619,7 +637,8 @@ mod tests {
             "{\"ts_ns\":1755600000000000000,\"event\":\"admin_op\",\"actor\":\"ops-alice\",\
              \"origin\":\"local\",\"op\":1,\"op_name\":\"add_learner\",\"id\":4,\
              \"addr\":\"10.0.0.4:9100\",\"seq\":12,\"nonce\":880,\"outcome\":\"accepted\",\
-             \"reason\":0,\"config_version\":7,\"detail\":null,\"source\":\"operator\"}\n"
+             \"reason\":0,\"config_version\":7,\"detail\":null,\"source\":\"operator\",\
+             \"fetch_source\":null}\n"
         );
     }
 
@@ -644,7 +663,7 @@ mod tests {
             "{text}"
         );
         assert!(
-            text.ends_with(",\"detail\":null,\"source\":\"discovery\"}\n"),
+            text.ends_with(",\"detail\":null,\"source\":\"discovery\",\"fetch_source\":null}\n"),
             "{text}"
         );
     }
@@ -822,7 +841,38 @@ mod tests {
             "{text}"
         );
         assert!(
-            text.ends_with(",\"detail\":null,\"source\":\"auto\"}\n"),
+            text.ends_with(",\"detail\":null,\"source\":\"auto\",\"fetch_source\":null}\n"),
+            "{text}"
+        );
+    }
+
+    /// Backup-tier 3b review I3: the queued auto-fetch record names where
+    /// the set came from — `"peer"` with the holder asked, `"tier"` with
+    /// the node's OWN id (it served itself).
+    #[test]
+    fn an_auto_fetch_record_names_its_fetch_source() {
+        let dir = tempdir();
+        let mut a = AuditLog::open(dir.path()).unwrap();
+        for (from, source) in [(2, "peer"), (7, "tier")] {
+            let q = AutoFetchAudit {
+                ts_ns: 1,
+                from,
+                position: 4096,
+                source,
+            };
+            a.record(&q.record()).unwrap();
+        }
+        let text = std::fs::read_to_string(a.path()).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2, "{text}");
+        assert!(
+            lines[0].contains("\"id\":2,")
+                && lines[0].ends_with("\"source\":\"auto\",\"fetch_source\":\"peer\"}"),
+            "{text}"
+        );
+        assert!(
+            lines[1].contains("\"id\":7,")
+                && lines[1].ends_with("\"source\":\"auto\",\"fetch_source\":\"tier\"}"),
             "{text}"
         );
     }
@@ -840,6 +890,7 @@ mod tests {
                 ts_ns: 100 + i,
                 from: 2,
                 position: 4096 * (i + 1),
+                source: "peer",
             }));
         }
         drop(w); // the shutdown: no drain was ever called

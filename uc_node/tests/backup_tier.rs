@@ -3117,6 +3117,18 @@ mod writer_e2e {
         });
         for i in 0..3 {
             assert_eq!(fetched(c.node(i), "peer"), 0, "node {i} asked no peer");
+            // Review I3: audited, with the node's OWN id — it served itself.
+            let audit = c.nodes[i].dir.join("audit.jsonl");
+            await_until(10, "the tier-served auto-fetch is audited", || {
+                std::fs::read_to_string(&audit).is_ok_and(|t| {
+                    t.lines().any(|l| {
+                        l.contains("\"op_name\":\"snapshot_fetch\"")
+                            && l.contains(&format!("\"id\":{i},"))
+                            && l.contains(&format!("\"config_version\":{p},"))
+                            && l.ends_with("\"fetch_source\":\"tier\"}")
+                    })
+                })
+            });
         }
         let _keep = c.stop();
     }

@@ -2675,8 +2675,9 @@ impl Node {
             backup_chunk_bytes: backup.as_ref().map_or(0, |b| b.chunk_bytes),
             tier_source: tier_source_handle.clone(),
             intake_signals: intake_signals.clone(),
-            tier_declined_position: 0,
-            tier_failed_position: 0,
+            tier_declined: (0, String::new()),
+            tier_verify_failed: 0,
+            tier_draining: Vec::new(),
             fetch_source_stats: Arc::clone(&fetch_source_stats),
             backup_hold_released: Arc::clone(&backup_hold_released),
             purge_gate: Arc::clone(&purge_gate),
@@ -4144,12 +4145,21 @@ struct Consensus {
     /// Ruling PF4: the receiver's completion signals, which a
     /// `uc2-tier-fetch` thread raises for a set it copied from the tier.
     intake_signals: uc_net::receiver::SnapIntakeSignals,
-    /// Ruling RA4: the set position `tier_fetch_declined` was last logged
-    /// for, so a fetch re-issued for the same P names it once.
-    tier_declined_position: u64,
-    /// The set position whose tier COPY last failed here (verify, io,
-    /// timeout): later fetches of it go straight to a peer.
-    tier_failed_position: u64,
+    /// Ruling RA4 / review I2: the `(position, reason)` a PLAN-time
+    /// `tier_fetch_declined` was last logged for, so a decision re-taken for
+    /// the same P and the same reason names it once. Copy-time failures
+    /// (`verify`, `io`, `timeout`) are always named — once per fetch.
+    tier_declined: (u64, String),
+    /// Review I1: the set position whose tier copy last failed `verify`
+    /// here — the tier's copy of it is corrupt, so AUTO-fetch stops trying
+    /// it (an operator fetch still does). Transient failures (`io`,
+    /// `timeout`) skip the tier only for the fallback that follows them.
+    tier_verify_failed: u64,
+    /// Review C1: tier copies cancelled at their deadline, kept until their
+    /// thread reports (then joined). No tier copy of a draining position is
+    /// started (plan-time reason `draining`): two threads must never write
+    /// the same `incoming-<P>.tier.part`.
+    tier_draining: Vec<crate::tier::source::TierFetch>,
     /// `uc2_snapshot_fetch_total{source}` — the SAME allocation `/metrics`
     /// reads.
     fetch_source_stats: Arc<crate::tier::source::FetchSourceStats>,
@@ -9134,6 +9144,7 @@ impl Consensus {
             config_version: position,
             detail: Some(&detail),
             source: crate::audit::SOURCE_GENESIS,
+            fetch_source: None,
         };
         if let Err(e) = self.audit.record(&rec) {
             let err = e.to_string();
@@ -9185,6 +9196,7 @@ impl Consensus {
             config_version: position,
             detail: None,
             source: crate::audit::SOURCE_DISCOVERY,
+            fetch_source: None,
         };
         if let Err(e) = self.audit.record(&rec) {
             let err = e.to_string();
@@ -11802,6 +11814,18 @@ impl Consensus {
     /// the catalog — and asks `from` only when the tier cannot serve P
     /// (named once per position, `tier_fetch_declined`).
     fn issue_fetch(&mut self, from: NodeId, position: u64, auto: bool) -> Result<(), FetchRefusal> {
+        self.issue_fetch_checked(from, position, auto, true)
+    }
+
+    /// [`Self::issue_fetch`]'s door checks, then the tier (when `tier`) and
+    /// the peer.
+    fn issue_fetch_checked(
+        &mut self,
+        from: NodeId,
+        position: u64,
+        auto: bool,
+        tier: bool,
+    ) -> Result<(), FetchRefusal> {
         // Honour `PendingFetch`: one fetch at a time. A second request is
         // answered `retry` rather than quietly replacing a transfer that is
         // very likely still running (the receiver would drop the new one
@@ -11812,7 +11836,7 @@ impl Consensus {
         if position > self.cnc.counters().durable.load_acquire() {
             return Err(FetchRefusal::AboveDurable);
         }
-        if self.try_tier_fetch(from, position, auto) {
+        if tier && self.try_tier_fetch(from, position, auto) {
             return Ok(());
         }
         self.issue_fetch_peer(from, position, auto)
@@ -11826,9 +11850,9 @@ impl Consensus {
     /// a failed copy re-runs the auto-fetch step's peer-candidate logic.
     fn try_tier_fetch(&mut self, from: NodeId, position: u64, auto: bool) -> bool {
         // `0` names no set ("the learner's newest"): only a peer resolves it.
-        // A set whose tier COPY already failed here goes to a peer.
+        // A set the tier holds corrupt goes to a peer under auto-fetch.
         if position == 0
-            || position == self.tier_failed_position
+            || (auto && position == self.tier_verify_failed)
             || position > self.cnc.counters().durable.load_acquire()
         {
             return false;
@@ -11836,6 +11860,10 @@ impl Consensus {
         let Some(src) = self.tier_source.clone() else {
             return false;
         };
+        if self.tier_draining.iter().any(|f| f.position == position) {
+            self.note_tier_fetch_declined(position, "draining");
+            return false;
+        }
         match self.tier_fetch_plan(&src, position) {
             Ok((label, entry)) => {
                 let fetch = crate::tier::source::spawn_fetch(
@@ -11913,10 +11941,17 @@ impl Consensus {
     /// position — a fetch re-issued (or re-tried by auto-fetch) for the same
     /// P does not repeat it.
     fn note_tier_fetch_declined(&mut self, position: u64, reason: &str) {
-        if self.tier_declined_position == position {
+        if self.tier_declined.0 == position && self.tier_declined.1 == reason {
             return;
         }
-        self.tier_declined_position = position;
+        self.tier_declined = (position, reason.to_string());
+        self.name_tier_fetch_declined(position, reason);
+    }
+
+    /// The `tier_fetch_declined` line itself — called unlatched for a
+    /// copy-time failure (review I2: tier corruption must never be hidden
+    /// behind an earlier plan-time line for the same P).
+    fn name_tier_fetch_declined(&self, position: u64, reason: &str) {
         crate::obs_event!(
             Info,
             "tier_fetch_declined",
@@ -11985,12 +12020,15 @@ impl Consensus {
         if n == 0 || self.auto_fetch.quiet(n, self.pass_now_ns) || self.holdings_held.contains(&n) {
             return;
         }
-        self.auto_fetch_step(n);
+        self.auto_fetch_step(n, false);
     }
 
+    /// `skip_tier`: review I1 — the fallback right after a failed tier copy
+    /// of `n` goes straight to the peer-candidate logic; the next round
+    /// (`maybe_auto_fetch`) tries the tier again.
     #[cold]
     #[inline(never)]
-    fn auto_fetch_step(&mut self, n: u64) {
+    fn auto_fetch_step(&mut self, n: u64, skip_tier: bool) {
         use crate::auto_fetch::{Outcome, SpaceCheck};
         let now = self.pass_now_ns;
         let durable = self.cnc.counters().durable.load_acquire();
@@ -12048,9 +12086,10 @@ impl Consensus {
         }
         // Backup-tier 3b spec §6.2: the tier first — even with no peer
         // holder. The peer-candidate logic below runs only when it cannot
-        // serve `n` (named once per position). No `snapshot_fetch` audit
-        // record: it names a member, and none was asked.
-        if self.try_tier_fetch(self.id, n, true) {
+        // serve `n`. Review I3: audited with the node's OWN id (it served
+        // itself) and `fetch_source = "tier"`.
+        if !skip_tier && self.try_tier_fetch(self.id, n, true) {
+            self.audit_auto_fetch(self.id, n, "tier");
             return;
         }
         let candidates = self.auto_fetch_candidates(n, &inner);
@@ -12072,8 +12111,9 @@ impl Consensus {
                 position = n
             );
         }
-        match self.issue_fetch(from, n, true) {
-            Ok(()) => self.audit_auto_fetch(from, n),
+        // The tier was tried (or skipped) above: peers only from here.
+        match self.issue_fetch_checked(from, n, true, false) {
+            Ok(()) => self.audit_auto_fetch(from, n, "peer"),
             Err(_) => {
                 self.auto_fetch_stats.bump(Outcome::Refused);
                 self.auto_fetch.on_result(Outcome::Refused, now);
@@ -12144,11 +12184,12 @@ impl Consensus {
     /// stall. The `uc2-holdings` thread writes and fsyncs it within ~50 ms
     /// ([`crate::audit::AutoFetchAuditWriter::drain`]); a full queue drops
     /// the record, counts it, and the writer names the count.
-    fn audit_auto_fetch(&mut self, from: NodeId, position: u64) {
+    fn audit_auto_fetch(&mut self, from: NodeId, position: u64, source: &'static str) {
         self.auto_fetch_audit.push(crate::audit::AutoFetchAudit {
             ts_ns: crate::obs::metrics::now_unix_ns(),
             from,
             position,
+            source,
         });
     }
 
@@ -12158,6 +12199,11 @@ impl Consensus {
     /// Costs one predictable branch per pass; the clock is this pass's, never a
     /// fresh reading.
     fn poll_pending_fetch(&mut self) {
+        if !self.tier_draining.is_empty() {
+            // Review C1: a cancelled copy is retired (joined) once its
+            // thread has reported.
+            self.tier_draining.retain_mut(|f| f.try_finish().is_none());
+        }
         let Some(p) = self.pending_fetch.as_mut() else {
             return;
         };
@@ -12169,23 +12215,31 @@ impl Consensus {
                     return;
                 }
                 Some(Err(reason)) => reason,
-                // Coordinator ruling: a copy past the deadline is a failure
-                // like any other. The thread is DETACHED (its handle dropped
-                // with the record, never joined here): should it ever finish,
-                // its late `publish_stored` is harmless — the word is
-                // `fetch_max`, and completeness requires the files.
+                // Review C1: a copy past the deadline is CANCELLED (it then
+                // renames and publishes nothing, and removes only its own
+                // temp files — the peer session below writes the same final
+                // names) and drained: kept until its thread reports, never
+                // joined while running.
                 None if self.pass_now_ns > p.deadline_ns => "timeout".to_string(),
                 None => return,
             };
-            // Spec §6.2 step 4: what the copy wrote is gone (the thread
-            // removed it); fall back to a peer AT ONCE.
-            let p = self.pending_fetch.take().expect("matched above");
-            self.tier_failed_position = p.position;
-            self.note_tier_fetch_declined(p.position, &failed);
+            let mut p = self.pending_fetch.take().expect("matched above");
+            if let FetchSource::Tier(f) = std::mem::replace(&mut p.source, FetchSource::Peer)
+                && failed == "timeout"
+            {
+                f.cancel();
+                self.tier_draining.push(f);
+            }
+            if failed == "verify" {
+                self.tier_verify_failed = p.position;
+            }
+            // Spec §6.2 step 4: what the copy wrote is gone (or, cancelled,
+            // is left to the peer); fall back to a peer AT ONCE.
+            self.name_tier_fetch_declined(p.position, &failed);
             if p.learner == self.id {
                 // Auto-fetch tried the tier before choosing a holder: choose
-                // one now (the tier is skipped for this position).
-                self.auto_fetch_step(p.position);
+                // one now, skipping the tier for this fallback only.
+                self.auto_fetch_step(p.position, true);
             } else if self
                 .issue_fetch_peer(p.learner, p.position, p.auto)
                 .is_err()
@@ -12530,6 +12584,7 @@ impl Consensus {
             // record in the file that does not is discovery's own
             // `settings_apply` (jumbo spec §9) — see `audit_datagram_mtu`.
             source: crate::audit::SOURCE_OPERATOR,
+            fetch_source: None,
         };
         match self.audit.record(&rec) {
             Ok(()) => (status, reason),
@@ -15746,8 +15801,9 @@ mod tests {
                 Arc::clone(&stored_set_pos),
                 None,
             ),
-            tier_declined_position: 0,
-            tier_failed_position: 0,
+            tier_declined: (0, String::new()),
+            tier_verify_failed: 0,
+            tier_draining: Vec::new(),
             fetch_source_stats: Arc::new(Default::default()),
             stored_set_pos,
             stored_above_durable: 0,
@@ -27728,7 +27784,7 @@ mod tests {
             "\"event\":\"admin_op\",\"actor\":\"auto\",\"origin\":\"local\",\"op\":9,\
              \"op_name\":\"snapshot_fetch\",\"id\":{from},\"addr\":null,\"seq\":0,\"nonce\":0,\
              \"outcome\":\"accepted\",\"reason\":0,\"config_version\":1000,\"detail\":null,\
-             \"source\":\"auto\"}}"
+             \"source\":\"auto\",\"fetch_source\":\"peer\"}}"
         );
         assert!(line.ends_with(&expected), "{line}\n  vs ...{expected}");
         assert_eq!(h.auto_fetch_audit_writer.drain(), 0, "drained once");
@@ -27747,6 +27803,7 @@ mod tests {
                 ts_ns: 1,
                 from: 2,
                 position: k as u64,
+                source: "peer",
             });
             assert_eq!(queued, k < AUTO_FETCH_AUDIT_QUEUE, "record {k}");
         }
@@ -27825,11 +27882,11 @@ mod tests {
     /// Controller ruling R8 (plan ruling P15): an OPERATOR fetch timing out
     /// also sets the 1 s floor — the pass that sees it expire, and the next
     /// second, issue no auto fetch.
-    /// Coordinator ruling (Task 12): a tier copy still running at the fetch
-    /// deadline is a failure like `done == Err` — the record is cleared, the
-    /// thread detached, `tier_fetch_declined{reason="timeout"}` named, and
-    /// the peer path issued AT ONCE; the tier is skipped for that position
-    /// from then on.
+    /// Coordinator ruling (Task 12) + review C1: a tier copy still running at
+    /// the fetch deadline is a failure like `done == Err` — the record is
+    /// cleared, the copy CANCELLED and kept draining (joined once it
+    /// reports), `tier_fetch_declined{reason="timeout"}` named, and the peer
+    /// path issued AT ONCE; no second copy of that P starts while it drains.
     #[test]
     fn a_tier_fetch_past_its_deadline_falls_back_to_the_peer() {
         let mut h = harness_with_rows(&["a"]);
@@ -27864,12 +27921,19 @@ mod tests {
             h.cons.pending_fetch.as_ref().map(|p| &p.source),
             Some(FetchSource::Peer)
         ));
-        assert_eq!(h.cons.tier_declined_position, 4096, "named once");
-        assert_eq!(
-            h.cons.tier_failed_position, 4096,
-            "the tier is skipped for it"
-        );
+        assert_eq!(h.cons.tier_draining.len(), 1, "cancelled and draining");
+        assert!(h.cons.tier_draining[0].is_cancelled());
+        // A second copy of the same P is never started while one drains:
+        // two threads would share `incoming-<P>.tier.part`.
+        h.cons.tier_source = Some(Arc::new(
+            crate::tier::source::TierSource::open(&h.cons.snap_root.join("no-tier"), "t").unwrap(),
+        ));
         assert!(!h.cons.try_tier_fetch(2, 4096, false));
+        assert_eq!(h.cons.tier_declined, (4096, "draining".to_string()));
+        // Retired (joined) once its thread reports.
+        *h.cons.tier_draining[0].done.lock().unwrap() = Some(Err("cancelled".into()));
+        h.cons.poll_pending_fetch();
+        assert!(h.cons.tier_draining.is_empty());
     }
 
     #[test]
