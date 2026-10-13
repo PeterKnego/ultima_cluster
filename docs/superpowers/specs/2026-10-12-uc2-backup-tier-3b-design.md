@@ -541,3 +541,33 @@ RA2 (§5.3, read-back) and RA3 (§6.2, `.tier.part` temp names) was amended
 - **Task 15 (§9) — the lin capstone's tier-join test runs its body on a 16 MiB
   thread.** A debug build overflowed the 2 MiB test-thread stack (nightly runs
   the capstones in debug); the oversized frame was not isolated.
+- **Final review I1 — install progress per block; the session wins (§6.3).**
+  `copied` rose only after a whole artifact was copied, so the leader's 10 s
+  no-progress rule fired on any one artifact slower than 10 s, opened a
+  session, and the follower's copy kept running — two paths. `copy_artifact`
+  now reports every block (≤ 1 MiB) it streams. And a running install is
+  CANCELLED when the follower adopts a session-installed set at or above its
+  S: the thread's publish and the node's cancel are one compare-exchange, so
+  exactly one wins; a cancelled install is drained like a timed-out
+  store-only copy and the session's lineage is adopted.
+- **Final review I3 — purge holds until the node has joined (§5.4).** At boot
+  the cluster view (K, `backups`) may be the recovered artifact's until the
+  cluster agent's walk reaches commit, so a K raise or a `tier forget`
+  committed after the newest artifact is invisible. With `[purge]` on, the
+  gate is `0` (every purge held) until `declared_published` — the attach
+  gate's own predicate — whatever K reads; `uc2_purge_gate_position` and the
+  archive's effective gate read `0` meanwhile.
+- **Final review I2 — no tier I/O on the consensus agent (§6.2, §6.3).** Every
+  tier read (`TIER`, the registration check, the `SET`) runs on the
+  `uc2-tier-fetch` thread; the node hands it in-memory inputs only. A
+  `TIER_INSTALL` is answered `installing{S, 0}` at once and a plan-time
+  decline follows as `declined(reason)`, which the leader handles as any
+  decline after `installing` (session + 30 s hold). `TierSource::open` at
+  boot is the one read left on the node's own thread.
+- **Final review I4 — the adopted lineage is cross-checked (§6.3).** Before
+  copying, the install thread requires every `SET` lineage entry whose term
+  the leader's last map also holds to carry the leader's base, and the line's
+  last term ≤ the node's current term; else `declined(verify)`,
+  `detail = "lineage_mismatch"`, nothing written. A flipped digit in a
+  well-formed line is otherwise adopted, and reconcile then cuts below the
+  adopted floor (`PositionPurged`).
