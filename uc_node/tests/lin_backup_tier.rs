@@ -604,6 +604,20 @@ fn snap_sessions(node: &uc_node::Node) -> u64 {
 /// over the whole history holds. Only the added learner has a tier source.
 #[test]
 fn a_learner_joining_from_the_tier_mid_load_keeps_the_history_linearizable() {
+    // The body runs on a 16 MiB stack: in a DEBUG build the unoptimised
+    // frames of the node-start / metrics-render path it drives from the test
+    // thread overflow the default 2 MiB test stack (release does not). No
+    // house pattern for this exists in the repo.
+    std::thread::Builder::new()
+        .name("tier-join".into())
+        .stack_size(16 << 20)
+        .spawn(a_learner_joining_body)
+        .expect("spawn")
+        .join()
+        .unwrap_or_else(|e| std::panic::resume_unwind(e));
+}
+
+fn a_learner_joining_body() {
     const DEFAULT_SEED: u64 = 0x7135;
     let seed: u64 = std::env::var("LIN_SEED")
         .ok()
