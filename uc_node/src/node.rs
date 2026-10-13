@@ -4234,8 +4234,10 @@ struct Consensus {
     /// `uc2_tier_install_total{outcome="installed"|"declined"}` — the SAME
     /// allocation `/metrics` reads.
     tier_install_stats: Arc<crate::tier::source::TierInstallStats>,
-    /// The door-time decline reason last LOGGED, so a leader re-asking for
-    /// the same reason names it once; reset when an install starts.
+    /// The door- or plan-time decline reason last LOGGED, so a leader
+    /// re-asking for the same reason names it once; reset when an install
+    /// succeeds (final review I2: the plan runs on the thread, so "an install
+    /// started" is no longer known at the door).
     tier_install_decline_logged: Option<TierInstallReason>,
     /// `TIER_INSTALL`s dropped because their sender is not this node's
     /// leader (the receiver gates the term only); the first is logged.
@@ -11988,8 +11990,11 @@ impl Consensus {
     }
 
     /// Backup-tier 3b spec §6.2: start a store-only copy of the set at
-    /// `position` from this node's tier source, if it can serve it; `false`
-    /// (after naming why, once per position) sends the caller to a peer.
+    /// `position` from this node's tier source; `false` (no source, a
+    /// position the tier cannot be asked for, or — named once per position —
+    /// a copy of it still draining) sends the caller to a peer. Whether the
+    /// tier can serve P is decided on the fetch thread (final review I2); a
+    /// plan-time decline falls back to the peer from `poll_pending_fetch`.
     /// `from` is the peer the fallback asks — `self.id` when none was chosen
     /// yet (auto-fetch tries the tier BEFORE picking a holder), in which case
     /// a failed copy re-runs the auto-fetch step's peer-candidate logic.
@@ -12305,8 +12310,8 @@ impl Consensus {
         }
     }
 
-    /// A door-time decline: counted, answered, and named once per reason
-    /// until an install starts.
+    /// A door- or plan-time decline: counted, answered, and named once per
+    /// reason until an install succeeds.
     fn decline_tier_install(
         &mut self,
         to: SocketAddr,
