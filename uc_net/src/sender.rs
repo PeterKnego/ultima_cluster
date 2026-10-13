@@ -306,6 +306,12 @@ const TIER_INSTALL_STALL_NS: u64 = 10_000_000_000;
 /// NAKs go straight to the session path for this long — no second
 /// `TIER_INSTALL` while the first answer still stands.
 const TIER_INSTALL_DECLINE_HOLD_NS: u64 = 30_000_000_000;
+/// Review round 2: after `installed{S}` a healthy follower still NAKs below
+/// the floor until its adoption lands (the cluster agent's install ack), so
+/// for this long such a NAK opens nothing and asks nothing; past it (and
+/// within [`TIER_INSTALL_DECLINE_HOLD_NS`]) the adoption is taken as stuck
+/// and the follower is held like a decline and served by a session.
+const TIER_INSTALL_SETTLE_NS: u64 = 10_000_000_000;
 
 /// One outstanding `TIER_INSTALL` exchange — at most one PER PEER (RA5), and
 /// independent of every other peer's and of the single snapshot session.
@@ -682,10 +688,11 @@ pub struct Sender {
     /// RA5: followers that declined or timed out, and until when (`now_ns`)
     /// their below-floor NAKs skip the tier and go straight to a session.
     tier_declined: HashMap<SocketAddr, u64>,
-    /// Review round 1: followers that answered `installed{S}`, with S and
+    /// Review rounds 1–2: followers that answered `installed{S}`, with S and
     /// when (`now_ns`). A below-floor NAK from one within
-    /// [`TIER_INSTALL_DECLINE_HOLD_NS`] of its answer is treated as a
-    /// decline (held, served by a session) — the backstop for a follower
+    /// [`TIER_INSTALL_SETTLE_NS`] opens nothing; from then until
+    /// [`TIER_INSTALL_DECLINE_HOLD_NS`] it is treated as a decline (held,
+    /// served by a session) — the backstop for a follower
     /// whose adoption is stuck, which would otherwise answer `installed` to
     /// every request while still NAKing below the floor, forever.
     tier_installed: HashMap<SocketAddr, (u64, u64)>,
@@ -1721,8 +1728,16 @@ impl Sender {
         {
             return false;
         }
-        // Answered `installed` less than the hold ago and STILL below the
-        // floor: its adoption did not take — treat it as a decline.
+        // Answered `installed` and still below the floor. Within the settling
+        // grace its adoption is still landing: open nothing, ask nothing —
+        // handled like a live wait, so (like one) NOT counted as an overrun:
+        // the NAK is accounted for, not unservable. Past the grace but within
+        // the hold its adoption did not take: treat it as a decline.
+        if let Some(&(_, at)) = self.tier_installed.get(&to)
+            && now.saturating_sub(at) < TIER_INSTALL_SETTLE_NS
+        {
+            return true;
+        }
         if let Some((_, at)) = self.tier_installed.remove(&to)
             && now.saturating_sub(at) < TIER_INSTALL_DECLINE_HOLD_NS
         {
@@ -5780,9 +5795,10 @@ mod tests {
             assert_eq!(x.s.stats().tier_install_timeouts.load(Ordering::Relaxed), 1);
         }
 
-        /// Review round 1: `installed` is remembered. A below-floor NAK
-        /// within 30 s of it means the adoption did not take — held and
-        /// served by a session, not asked again; past 30 s, asked again.
+        /// Review rounds 1–2: `installed` is remembered. A below-floor NAK
+        /// within 10 s of it is the adoption still landing — nothing opens,
+        /// nothing is asked; from 10 s to 30 s the adoption is stuck — held
+        /// and served by a session, not asked again; past 30 s, asked again.
         #[test]
         fn a_second_below_floor_nak_after_installed_takes_the_session() {
             let mut x = fx(1);
@@ -5794,10 +5810,25 @@ mod tests {
                 status(TierInstallState::Installed, TierInstallReason::None, 0),
             );
             assert!(x.s.tier_installed.contains_key(&a));
+            let overruns = || x.s.stats().overruns.load(Ordering::Relaxed);
+            let before = overruns();
             advance(&mut x.s, Duration::from_secs(1));
             x.s.on_nak(a, 0, 96);
             x.s.do_work();
-            assert_eq!((sent(&x.s), sessions(&x.s)), (1, 1), "session, no re-ask");
+            assert_eq!((sent(&x.s), sessions(&x.s)), (1, 0), "settling: nothing");
+            assert_eq!(
+                x.s.stats().overruns.load(Ordering::Relaxed),
+                before,
+                "not an overrun"
+            );
+            advance(&mut x.s, Duration::from_secs(10));
+            x.s.on_nak(a, 0, 96);
+            x.s.do_work();
+            assert_eq!(
+                (sent(&x.s), sessions(&x.s)),
+                (1, 1),
+                "stuck: session, no re-ask"
+            );
             assert!(x.s.tier_declined.contains_key(&a), "held like a decline");
             // Installed at t, the next below-floor NAK at t + 31 s: the
             // record has lapsed, so the follower is asked again.
