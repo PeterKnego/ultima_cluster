@@ -6441,6 +6441,20 @@ impl Consensus {
 
     fn purge_gate_inner(&mut self) -> Option<u64> {
         use crate::auto_fetch::{FREE_BYTES_UNKNOWN, fits};
+        let purge_on = matches!(self.purge_policy, PurgePolicy::BelowSnapshot { .. });
+        // Final review I3: K and `backups` are read from the cluster view,
+        // which at boot is the RECOVERED artifact's until the cluster agent's
+        // walk reaches commit — a K raise or a `tier forget` committed after
+        // the newest artifact is invisible until then. So, purge on, the gate
+        // holds EVERYTHING (`0`) until this node has JOINED — the attach
+        // gate's own predicate (`declared_published`: leader known, commit
+        // learned, the walk consumed to commit) — whatever K reads.
+        if purge_on && !self.declared_published {
+            if self.purge_gate.load(Ordering::Relaxed) != 0 {
+                self.purge_gate.store(0, Ordering::Release);
+            }
+            return Some(0);
+        }
         let k = self
             .cluster_view
             .purge_requires_tiers
@@ -6450,10 +6464,21 @@ impl Consensus {
         if self.purge_gate.load(Ordering::Relaxed) != value {
             self.purge_gate.store(value, Ordering::Release);
         }
-        let gate = gate?;
-        if !matches!(self.purge_policy, PurgePolicy::BelowSnapshot { .. }) {
-            return None;
-        }
+        let gate = match gate {
+            Some(g) if purge_on => g,
+            // Final review I6a: no gate now (K = 0) or purge off — clear a
+            // low-space release latched while there was one, so its level
+            // gauge does not read "released" for a gate that no longer
+            // exists (the effective gate is lifted by the caller: `None`).
+            _ => {
+                if self.gate_released {
+                    self.gate_released = false;
+                    self.backup_gate_released_level
+                        .store(false, Ordering::Release);
+                }
+                return None;
+            }
+        };
         let free = self
             .holdings
             .lock()
@@ -16949,6 +16974,8 @@ mod tests {
     fn the_floor_persists_at_the_newest_agreed_set_held_not_at_own() {
         use uc_protocol::v2::upgrade::RowRunning;
         let mut h = harness_with_rows(&["a"]);
+        // A joined node: final review I3 holds every purge before that.
+        h.cons.declared_published = true;
         h.cons.purge_policy = PurgePolicy::BelowSnapshot { slack_bytes: 0 };
         let (agreed, own) = (4096u64, 6016u64);
         assert!(own <= h.cons.cnc.counters().durable.load_acquire());
@@ -17175,6 +17202,7 @@ mod tests {
     #[test]
     fn the_gate_caps_the_purge_at_the_kth_tier_and_releases_on_low_space() {
         let mut h = harness_with_rows(&["a"]);
+        h.cons.declared_published = true;
         h.cons.purge_policy = PurgePolicy::BelowSnapshot { slack_bytes: 0 };
         h.cons.holdings.lock().unwrap().free_bytes = 1 << 40;
         let floor = 65_536u64;
@@ -17236,6 +17264,7 @@ mod tests {
     #[test]
     fn k_above_the_registered_count_holds_everything_without_a_release() {
         let mut h = harness_with_rows(&["a"]);
+        h.cons.declared_published = true;
         h.cons.purge_policy = PurgePolicy::BelowSnapshot { slack_bytes: 0 };
         h.cons.holdings.lock().unwrap().free_bytes = 1 << 40;
         let floor = 65_536u64;
@@ -17265,6 +17294,97 @@ mod tests {
         assert_eq!(h.cons.backup_gate_released.load(Ordering::Relaxed), 0);
         assert!(!h.cons.backup_gate_released_level.load(Ordering::Relaxed));
         assert_eq!(h.cons.purge_gate.load(Ordering::Relaxed), 0);
+    }
+
+    /// Final review I3: with purge on, a node that has not JOINED (the
+    /// attach gate's `declared_published`) purges nothing over many passes —
+    /// even with K = 0, which would gate nothing — because its view of K and
+    /// `backups` may still be the recovered artifact's. The gauge and the
+    /// archive's effective gate read 0 meanwhile; once joined, the purge
+    /// resumes to the full target.
+    #[test]
+    fn purge_holds_until_the_node_has_joined_whatever_k_reads() {
+        let mut h = harness_with_rows(&["a"]);
+        h.cons.purge_policy = PurgePolicy::BelowSnapshot { slack_bytes: 0 };
+        h.cons.holdings.lock().unwrap().free_bytes = 1 << 40;
+        let floor = 65_536u64;
+        let mut st = h.cons.cluster_view.to_state();
+        st.catalog = vec![agreed_entry(floor)];
+        st.running[0] = Some(uc_protocol::v2::upgrade::RowRunning {
+            row: 0,
+            version: 1,
+            record_pos: 1,
+        });
+        st.settings.purge_requires_tiers = 0;
+        h.cons.cluster_view.publish(&st);
+        h.cons.snapshot_set_position.store(floor, Ordering::Release);
+        h.cons.cnc.counters().durable.store_release(floor + 1000);
+        h.cons.note_set_held(floor);
+        assert!(!h.cons.declared_published, "precondition: not joined");
+        let mut purges = Vec::new();
+        for _ in 0..20 {
+            h.advance_floor_timer();
+            h.cons.maybe_persist_snapshot_floor();
+            while let Ok(cmd) = h._trunc_rx.try_recv() {
+                if let ArchiveCmd::Purge { below } = cmd {
+                    purges.push(below);
+                }
+            }
+            assert_eq!(h.cons.purge_gate.load(Ordering::Relaxed), 0, "gauge");
+            assert_eq!(h.cons.effective_gate.load(Ordering::Relaxed), 0);
+        }
+        // A `Purge` may be COMMANDED, but only at or below the gate of 0 —
+        // which purges nothing.
+        assert!(purges.iter().all(|&b| b == 0), "{purges:?}");
+        h.cons.declared_published = true;
+        h.advance_floor_timer();
+        h.cons.maybe_persist_snapshot_floor();
+        let mut last = None;
+        while let Ok(cmd) = h._trunc_rx.try_recv() {
+            if let ArchiveCmd::Purge { below } = cmd {
+                last = Some(below);
+            }
+        }
+        assert_eq!(last, Some(floor), "joined: K = 0 gates nothing");
+        assert_eq!(h.cons.purge_gate.load(Ordering::Relaxed), u64::MAX);
+        assert_eq!(h.cons.effective_gate.load(Ordering::Relaxed), u64::MAX);
+    }
+
+    /// Final review I6a: a gate released for low space, then taken away
+    /// (K drops to 0, or purge turned off), clears its release latch and
+    /// level gauge and lifts the effective gate — it does not read
+    /// "released" for a gate that no longer exists, and a later gate starts
+    /// armed.
+    #[test]
+    fn a_gate_that_goes_away_while_released_clears_its_latch() {
+        for purge_off in [false, true] {
+            let mut h = harness_with_rows(&["a"]);
+            h.cons.declared_published = true;
+            h.cons.purge_policy = PurgePolicy::BelowSnapshot { slack_bytes: 0 };
+            h.cons.holdings.lock().unwrap().free_bytes = 1;
+            let mut st = h.cons.cluster_view.to_state();
+            st.settings.purge_requires_tiers = 1;
+            st.backups = vec![gate_entry(1, 4096)];
+            h.cons.cluster_view.publish(&st);
+            assert_eq!(h.cons.purge_gate(), None, "released for low space");
+            assert!(h.cons.gate_released);
+            assert!(h.cons.backup_gate_released_level.load(Ordering::Relaxed));
+            if purge_off {
+                h.cons.purge_policy = PurgePolicy::Disabled;
+            } else {
+                st.settings.purge_requires_tiers = 0;
+                h.cons.cluster_view.publish(&st);
+            }
+            assert_eq!(h.cons.purge_gate(), None);
+            assert!(!h.cons.gate_released, "latch cleared ({purge_off})");
+            assert!(!h.cons.backup_gate_released_level.load(Ordering::Relaxed));
+            assert_eq!(h.cons.effective_gate.load(Ordering::Relaxed), u64::MAX);
+            assert_eq!(
+                h.cons.purge_gate.load(Ordering::Relaxed),
+                if purge_off { 4096 } else { u64::MAX },
+                "the gauge still reads the gate with purge off"
+            );
+        }
     }
 
     /// RA7: the gauge value is stored with purge OFF, and nothing clamps.
@@ -17317,6 +17437,8 @@ mod tests {
     fn the_backup_hold_caps_the_purge_at_the_writers_progress() {
         use uc_protocol::v2::upgrade::RowRunning;
         let mut h = harness_with_rows(&["a"]);
+        // A joined node: final review I3 holds every purge before that.
+        h.cons.declared_published = true;
         h.cons.purge_policy = PurgePolicy::BelowSnapshot { slack_bytes: 0 };
         let shared = Arc::new(crate::tier::writer::WriterShared::default());
         h.cons.backup_shared = Some(Arc::clone(&shared));
