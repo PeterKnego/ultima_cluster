@@ -2720,6 +2720,7 @@ impl Node {
             tier_install_last_status_ns: 0,
             tier_install_decline_logged: None,
             tier_install_not_leader: 0,
+            tier_install_stale_term: 0,
             fetch_source_stats: Arc::clone(&fetch_source_stats),
             tier_install_stats: Arc::clone(&tier_install_stats),
             backup_hold_released: Arc::clone(&backup_hold_released),
@@ -4240,6 +4241,11 @@ struct Consensus {
     /// `TIER_INSTALL`s dropped because their sender is not this node's
     /// leader (the receiver gates the term only); the first is logged.
     tier_install_not_leader: u64,
+    /// `TIER_INSTALL`s dropped because the term they were admitted at is no
+    /// longer this node's term by the time the consensus agent reads them
+    /// (review round 1: the SM can move on between the receiver's gate and
+    /// here).
+    tier_install_stale_term: u64,
     /// `uc2_backup_hold_released_total`: releases, once per episode.
     backup_hold_released: Arc<AtomicU64>,
     /// Backup-tier 3b spec §5.2: the journal-purge gate — `u64::MAX` when
@@ -11121,8 +11127,8 @@ impl Consensus {
             // follower to install from its own tier. Handled inline — the
             // copy is this agent's own state; the receiver gated the term
             // only, so `on_tier_install` checks the sender IS the leader.
-            NetEvent::TierInstall { from, body } => {
-                self.on_tier_install(from, &body);
+            NetEvent::TierInstall { from, term, body } => {
+                self.on_tier_install(from, term, &body);
                 return;
             }
         };
@@ -12099,18 +12105,25 @@ impl Consensus {
     /// request, never per pass.
     #[cold]
     #[inline(never)]
-    fn on_tier_install(&mut self, from: SocketAddr, body: &TierInstallBody) {
-        // The receiver admitted this at exactly the current term, and only a
-        // leader-role sender emits kind 28 — so, with no leader known yet (a
-        // node just restarted or just past an election learns the hint from
-        // commit gossip, which can trail the leader's first answer to its
-        // NAK), it identifies the term's leader exactly as that gossip
-        // would. Without this a restarted follower drops the request and the
-        // leader waits out its 2 s answer timeout before the session.
-        // Safe: the receiver's term gate admits only the current term, and
-        // a term has one leader.
+    fn on_tier_install(&mut self, from: SocketAddr, term: u32, body: &TierInstallBody) {
+        // Re-checked HERE, not only at the receiver's gate: the SM may have
+        // moved to a newer term since the datagram was admitted, and a
+        // request from an older term's leader must neither be served nor
+        // teach the hint.
+        if term != self.sm.current_term() {
+            self.tier_install_stale_term += 1;
+            return;
+        }
+        // Only a leader-role sender emits kind 28, so with no leader known
+        // yet (a node just restarted or just past an election learns the
+        // hint from commit gossip, which can trail the leader's first answer
+        // to its NAK), a current-term request identifies the term's leader
+        // exactly as that gossip would. Without this a restarted follower
+        // drops the request and the leader waits out its 2 s answer timeout.
+        // Safe: `term` is the datagram's own, equal to the current term
+        // (checked just above), and a term has one leader.
         if self.cnc.status().leader_hint.load_acquire() == u64::MAX {
-            self.learn_leader_hint(from, self.sm.current_term());
+            self.learn_leader_hint(from, term);
         }
         let hint = self.cnc.status().leader_hint.load_acquire();
         let leader = (hint != u64::MAX)
@@ -16219,6 +16232,7 @@ mod tests {
             tier_install_last_status_ns: 0,
             tier_install_decline_logged: None,
             tier_install_not_leader: 0,
+            tier_install_stale_term: 0,
             fetch_source_stats: Arc::new(Default::default()),
             tier_install_stats: Arc::new(Default::default()),
             stored_set_pos,
@@ -28409,8 +28423,14 @@ mod tests {
         }
 
         fn ask_with(h: &mut Harness, from: &UdpSocket, body: TierInstallBody) {
+            ask_at(h, from, h.cons.sm.current_term(), body);
+        }
+
+        /// [`ask_with`], admitted at `term` (the datagram header's).
+        fn ask_at(h: &mut Harness, from: &UdpSocket, term: u32, body: TierInstallBody) {
             h.cons.feed_net(NetEvent::TierInstall {
                 from: from.local_addr().unwrap(),
+                term,
                 body: Box::new(body),
             });
         }
@@ -28747,6 +28767,27 @@ mod tests {
                 statuses(&leader),
                 vec![declined(TierInstallReason::NoSource, P)]
             );
+        }
+
+        /// Review round 1: a kind 28 admitted at term T but read after the SM
+        /// moved to T+1 is ignored — counted, no answer, no copy, and the
+        /// hint is not taught (T's leader is not T+1's).
+        #[test]
+        fn a_tier_install_from_a_term_the_sm_has_left_is_ignored() {
+            let fx = set_fx(false);
+            let (mut h, leader, _) = rig(&fx, Some(8000));
+            h.cons.cnc.status().leader_hint.store_release(u64::MAX);
+            let t = h.cons.sm.current_term();
+            ask_at(&mut h, &leader, t.wrapping_sub(1), body_for(&fx, 0, 8000));
+            assert_eq!(h.cons.tier_install_stale_term, 1);
+            assert_eq!(h.cons.cnc.status().leader_hint.load_acquire(), u64::MAX);
+            assert!(h.cons.tier_install.is_none());
+            assert_eq!(fx.src.fetches_spawned(), 0);
+            assert!(statuses(&leader).is_empty());
+            // The same request at the current term is served.
+            ask_at(&mut h, &leader, t, body_for(&fx, 0, 8000));
+            assert_eq!(h.cons.cnc.status().leader_hint.load_acquire(), 0);
+            assert_eq!(fx.src.fetches_spawned(), 1);
         }
 
         /// Task 14 ruling: a request for an S this node is already durable

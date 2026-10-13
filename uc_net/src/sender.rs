@@ -682,6 +682,13 @@ pub struct Sender {
     /// RA5: followers that declined or timed out, and until when (`now_ns`)
     /// their below-floor NAKs skip the tier and go straight to a session.
     tier_declined: HashMap<SocketAddr, u64>,
+    /// Review round 1: followers that answered `installed{S}`, with S and
+    /// when (`now_ns`). A below-floor NAK from one within
+    /// [`TIER_INSTALL_DECLINE_HOLD_NS`] of its answer is treated as a
+    /// decline (held, served by a session) — the backstop for a follower
+    /// whose adoption is stuck, which would otherwise answer `installed` to
+    /// every request while still NAKing below the floor, forever.
+    tier_installed: HashMap<SocketAddr, (u64, u64)>,
 }
 
 /// Catalog spec §5.3: the sender's half of the leader's soft table — each
@@ -875,6 +882,7 @@ impl Sender {
             tier_install_source: None,
             tier_waits: HashMap::new(),
             tier_declined: HashMap::new(),
+            tier_installed: HashMap::new(),
         }
     }
 
@@ -1662,9 +1670,13 @@ impl Sender {
 
     /// Clear every tier-install wait and hold (leadership lost or regained).
     fn drop_tier_state(&mut self) {
-        if !self.tier_waits.is_empty() || !self.tier_declined.is_empty() {
+        if !self.tier_waits.is_empty()
+            || !self.tier_declined.is_empty()
+            || !self.tier_installed.is_empty()
+        {
             self.tier_waits.clear();
             self.tier_declined.clear();
+            self.tier_installed.clear();
         }
     }
 
@@ -1707,6 +1719,15 @@ impl Sender {
             .get(&to)
             .is_some_and(|&until| now < until)
         {
+            return false;
+        }
+        // Answered `installed` less than the hold ago and STILL below the
+        // floor: its adoption did not take — treat it as a decline.
+        if let Some((_, at)) = self.tier_installed.remove(&to)
+            && now.saturating_sub(at) < TIER_INSTALL_DECLINE_HOLD_NS
+        {
+            self.tier_declined
+                .insert(to, now.saturating_add(TIER_INSTALL_DECLINE_HOLD_NS));
             return false;
         }
         if self.snap.as_ref().is_some_and(|s| s.peer == to) {
@@ -1767,8 +1788,11 @@ impl Sender {
                 }
             }
             // The follower holds the set: its next NAK is above the floor.
+            // Remembered, so one that is not (a stuck adoption) is served by
+            // a session rather than asked again (review round 1).
             TierInstallState::Installed => {
                 self.tier_waits.remove(&from);
+                self.tier_installed.insert(from, (body.position, now));
             }
         }
     }
@@ -5754,6 +5778,41 @@ mod tests {
                 "10 s without a rise: the session serves it"
             );
             assert_eq!(x.s.stats().tier_install_timeouts.load(Ordering::Relaxed), 1);
+        }
+
+        /// Review round 1: `installed` is remembered. A below-floor NAK
+        /// within 30 s of it means the adoption did not take — held and
+        /// served by a session, not asked again; past 30 s, asked again.
+        #[test]
+        fn a_second_below_floor_nak_after_installed_takes_the_session() {
+            let mut x = fx(1);
+            let a = x.f[0].addr();
+            x.s.on_nak(a, 0, 96);
+            x.s.do_work();
+            x.s.on_tier_install_status(
+                a,
+                status(TierInstallState::Installed, TierInstallReason::None, 0),
+            );
+            assert!(x.s.tier_installed.contains_key(&a));
+            advance(&mut x.s, Duration::from_secs(1));
+            x.s.on_nak(a, 0, 96);
+            x.s.do_work();
+            assert_eq!((sent(&x.s), sessions(&x.s)), (1, 1), "session, no re-ask");
+            assert!(x.s.tier_declined.contains_key(&a), "held like a decline");
+            // Installed at t, the next below-floor NAK at t + 31 s: the
+            // record has lapsed, so the follower is asked again.
+            let mut y = fx(1);
+            let b = y.f[0].addr();
+            y.s.on_nak(b, 0, 96);
+            y.s.do_work();
+            y.s.on_tier_install_status(
+                b,
+                status(TierInstallState::Installed, TierInstallReason::None, 0),
+            );
+            advance(&mut y.s, Duration::from_secs(31));
+            y.s.on_nak(b, 0, 96);
+            y.s.do_work();
+            assert_eq!((sent(&y.s), sessions(&y.s)), (2, 0), "asked again");
         }
 
         #[test]

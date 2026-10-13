@@ -283,6 +283,10 @@ pub enum NetEvent {
     /// does not widen every `NetEvent` on the route.
     TierInstall {
         from: SocketAddr,
+        /// The datagram's header term, as admitted: the node re-checks it
+        /// against its CURRENT term at the point of use (the SM can move on
+        /// between admission and consumption).
+        term: u32,
         body: Box<uc_protocol::v2::datagram::TierInstallBody>,
     },
 }
@@ -2535,6 +2539,7 @@ impl FollowerReceiver {
                 if let Some(b) = read_tier_install_body(&d[DATAGRAM_HEADER_LEN..]) {
                     let ev = NetEvent::TierInstall {
                         from,
+                        term: h.leadership_term_id,
                         body: Box::new(b),
                     };
                     let idx = ev.kind_idx();
@@ -5223,8 +5228,8 @@ mod tests {
         loop {
             assert!(Instant::now() < deadline, "TIER_INSTALL never routed");
             r.do_work();
-            if let Ok(NetEvent::TierInstall { from, body }) = rx.try_recv() {
-                assert_eq!((from, *body), (leader.addr(), sent));
+            if let Ok(NetEvent::TierInstall { from, term, body }) = rx.try_recv() {
+                assert_eq!((from, term, *body), (leader.addr(), TERM, sent));
                 break;
             }
         }
