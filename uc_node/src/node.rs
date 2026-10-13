@@ -2077,6 +2077,20 @@ impl Node {
             }
             Some((hint_learner.load(Ordering::Relaxed), position))
         }));
+        // Backup-tier 3b spec §6.3 (Task 14 ruling): which set a below-floor
+        // follower is asked to install from its own tier — the leader's
+        // newest agreed set in `[floor, commit]` that the registered tiers
+        // cover, with this node's committed verdict for it. The view is
+        // built below, after the cluster FSM recovers; until it is filled
+        // (boot only) the closure answers `None` and the session path
+        // serves, as before. The sender never touches the view itself.
+        let tier_install_view: Arc<std::sync::OnceLock<Arc<ClusterView>>> =
+            Arc::new(std::sync::OnceLock::new());
+        let tiv = Arc::clone(&tier_install_view);
+        sender.set_tier_install_source(Arc::new(move |floor, commit| {
+            let inner = tiv.get()?.snapshot_inner();
+            crate::tier::source::leader_install_body(floor, commit, &inner.catalog, &inner.backups)
+        }));
 
         // M6 Task 9: the per-peer observability band, cnc-slot order (voters
         // first, then learners), capped at the fixed slot count — already
@@ -2541,6 +2555,7 @@ impl Node {
                 .collect(),
         )?;
         let cluster_view = Arc::new(ClusterView::new(cluster_fsm.state()));
+        let _ = tier_install_view.set(Arc::clone(&cluster_view));
         let mut cluster_agent = crate::cluster_agent::ClusterAgent::new(
             Arc::clone(&buffer),
             Arc::clone(&cnc),
@@ -12083,6 +12098,16 @@ impl Consensus {
     #[cold]
     #[inline(never)]
     fn on_tier_install(&mut self, from: SocketAddr, body: &TierInstallBody) {
+        // The receiver admitted this at exactly the current term, and only a
+        // leader-role sender emits kind 28 — so, with no leader known yet (a
+        // node just restarted or just past an election learns the hint from
+        // commit gossip, which can trail the leader's first answer to its
+        // NAK), it identifies the term's leader exactly as that gossip
+        // would. Without this a restarted follower drops the request and the
+        // leader waits out its 2 s answer timeout before the session.
+        if self.cnc.status().leader_hint.load_acquire() == u64::MAX {
+            self.learn_leader_hint(from, self.sm.current_term());
+        }
         let hint = self.cnc.status().leader_hint.load_acquire();
         let leader = (hint != u64::MAX)
             .then(|| self.id_to_addr.get(&(hint as NodeId)).copied())
@@ -12118,6 +12143,13 @@ impl Consensus {
                 return;
             }
             self.pending_install_lineage = None;
+        }
+        // Already at or past S (a stale or repeated request — a session, or
+        // an earlier copy, got here first): nothing to copy, and a late
+        // `publish_installed` would re-arm the receiver below what it adopted.
+        if body.s <= self.cnc.counters().durable.load_acquire() {
+            self.send_tier_install_status(from, TierInstallState::Installed, body.s, 0);
+            return;
         }
         let Some(src) = self.tier_source.clone() else {
             self.decline_tier_install(from, body, TierInstallReason::NoSource, "");
@@ -12254,7 +12286,7 @@ impl Consensus {
                     reason = tier_install_reason_name(reason),
                     detail = why.as_str()
                 );
-                self.send_tier_install_decline(to, reason);
+                self.send_tier_install_decline(to, reason, position);
             }
         }
     }
@@ -12284,16 +12316,23 @@ impl Consensus {
                 detail = detail
             );
         }
-        self.send_tier_install_decline(to, reason);
+        self.send_tier_install_decline(to, reason, body.s);
     }
 
-    fn send_tier_install_decline(&mut self, to: SocketAddr, reason: TierInstallReason) {
+    /// `position` = the set S the decline is about (the leader matches
+    /// declines by peer, never by position; this is for the reader).
+    fn send_tier_install_decline(
+        &mut self,
+        to: SocketAddr,
+        reason: TierInstallReason,
+        position: u64,
+    ) {
         self.send_tier_install_body(
             to,
             TierInstallStatusBody {
                 state: TierInstallState::Declined,
                 reason,
-                position: 0,
+                position,
                 copied: 0,
             },
         );
@@ -28327,6 +28366,9 @@ mod tests {
             let (other, a2) = report_peer_socket();
             let mut h = harness_with_rows_and_peers(&["a"], &[(0, a0), (2, a2)]);
             h.cons.cnc.status().leader_hint.store_release(0);
+            // Below the floor, below S: a request for S is something to copy
+            // (at or past S it is answered `installed` with no copy).
+            h.cons.cnc.counters().durable.store_release(1024);
             put_tier(&fx._d.path().join("tier"), "mine", TIER_ID);
             h.cons.tier_source = Some(Arc::clone(&fx.src));
             publish(&mut h, fx, through);
@@ -28399,11 +28441,12 @@ mod tests {
             }
         }
 
-        fn declined(reason: TierInstallReason) -> TierInstallStatusBody {
+        /// A decline names the set it is about (Task 14 ruling).
+        fn declined(reason: TierInstallReason, position: u64) -> TierInstallStatusBody {
             TierInstallStatusBody {
                 state: TierInstallState::Declined,
                 reason,
-                position: 0,
+                position,
                 copied: 0,
             }
         }
@@ -28473,7 +28516,7 @@ mod tests {
             ask(&mut h, &fx, &leader);
             assert_eq!(
                 statuses(&leader),
-                vec![declined(TierInstallReason::NotRegistered)]
+                vec![declined(TierInstallReason::NotRegistered, P)]
             );
             assert_eq!(fx.src.fetches_spawned(), 1);
             assert_eq!(
@@ -28495,7 +28538,10 @@ mod tests {
             body.row_version[2] += 1;
             ask_with(&mut h, &leader, body);
             assert!(h.cons.tier_install.is_none());
-            assert_eq!(statuses(&leader), vec![declined(TierInstallReason::Verify)]);
+            assert_eq!(
+                statuses(&leader),
+                vec![declined(TierInstallReason::Verify, P)]
+            );
             assert_eq!(fx.src.fetches_spawned(), 0, "refused before any copy");
             assert_eq!(files_under(&h.cons.snap_root), before, "nothing written");
             assert_eq!(
@@ -28524,7 +28570,7 @@ mod tests {
                 statuses(&leader),
                 vec![
                     status(TierInstallState::Installing, P, 0),
-                    declined(TierInstallReason::Verify)
+                    declined(TierInstallReason::Verify, P)
                 ]
             );
             assert_eq!(files_under(&h.cons.snap_root), before, "nothing written");
@@ -28589,10 +28635,11 @@ mod tests {
         fn a_late_tier_install_below_durable_adopts_nothing() {
             let fx = set_fx(false);
             let (mut h, leader, _) = rig(&fx, Some(8000));
-            assert!(h.cons.cnc.counters().durable.load_acquire() > P);
             while h._trunc_rx.try_recv().is_ok() {}
             let map_before = h.cons.sm.term_map().to_vec();
             ask(&mut h, &fx, &leader);
+            // The session overtook the copy: durable passes S meanwhile.
+            h.cons.cnc.counters().durable.store_release(2 * P);
             finish(&mut h);
             assert_eq!(
                 statuses(&leader),
@@ -28667,6 +28714,59 @@ mod tests {
             assert_eq!(h.cons.pending_install_lineage, None);
         }
 
+        /// Task 14 finding: a follower that knows no leader yet (just
+        /// restarted: the hint is learned from commit gossip, which can
+        /// trail the leader's answer to its first NAK) learns it from the
+        /// current-term request itself and answers at once — else the
+        /// leader waits out its 2 s answer timeout. An address that is not
+        /// a member still teaches nothing and is dropped.
+        #[test]
+        fn a_tier_install_with_no_leader_known_learns_it_from_the_request() {
+            let fx = set_fx(false);
+            let (mut h, leader, _) = rig(&fx, Some(8000));
+            h.cons.tier_source = None;
+            h.cons.cnc.status().leader_hint.store_release(u64::MAX);
+            let stranger = UdpSocket::bind("127.0.0.1:0").unwrap();
+            stranger.set_nonblocking(true).unwrap();
+            ask(&mut h, &fx, &stranger);
+            assert_eq!(h.cons.cnc.status().leader_hint.load_acquire(), u64::MAX);
+            assert_eq!(h.cons.tier_install_not_leader, 1);
+            assert!(statuses(&stranger).is_empty());
+            ask(&mut h, &fx, &leader);
+            assert_eq!(h.cons.cnc.status().leader_hint.load_acquire(), 0);
+            assert_eq!(
+                statuses(&leader),
+                vec![declined(TierInstallReason::NoSource, P)]
+            );
+        }
+
+        /// Task 14 ruling: a request for an S this node is already durable
+        /// at or past (a stale or repeated request — a session got there
+        /// first) answers `installed{S}` at once: no copy, no thread, not
+        /// counted either way — and it is answered before the source check.
+        #[test]
+        fn a_tier_install_at_or_below_durable_answers_installed_without_a_copy() {
+            let fx = set_fx(false);
+            let (mut h, leader, _) = rig(&fx, Some(8000));
+            h.cons.tier_source = None;
+            h.cons.cnc.counters().durable.store_release(P);
+            ask(&mut h, &fx, &leader);
+            assert_eq!(
+                statuses(&leader),
+                vec![status(TierInstallState::Installed, P, 0)]
+            );
+            assert!(h.cons.tier_install.is_none());
+            assert_eq!(fx.src.fetches_spawned(), 0);
+            let st = &h.cons.tier_install_stats;
+            assert_eq!(
+                (
+                    st.installed.load(Ordering::Relaxed),
+                    st.declined.load(Ordering::Relaxed)
+                ),
+                (0, 0)
+            );
+        }
+
         /// No source: `declined(no_source)` at once, counted, nothing spawned.
         #[test]
         fn a_tier_install_without_a_source_declines_at_once() {
@@ -28676,7 +28776,7 @@ mod tests {
             ask(&mut h, &fx, &leader);
             assert_eq!(
                 statuses(&leader),
-                vec![declined(TierInstallReason::NoSource)]
+                vec![declined(TierInstallReason::NoSource, P)]
             );
             assert!(h.cons.tier_install.is_none());
             assert_eq!(
@@ -28688,13 +28788,19 @@ mod tests {
             let mut body = body_for(&fx, 0, 8000);
             body.s = P + 32;
             ask_with(&mut h, &leader, body);
-            assert_eq!(statuses(&leader), vec![declined(TierInstallReason::NoSet)]);
+            assert_eq!(
+                statuses(&leader),
+                vec![declined(TierInstallReason::NoSet, P + 32)]
+            );
             // A store-only copy of exactly S still draining: no set either.
             h.cons
                 .tier_draining
                 .push(crate::tier::source::TierFetch::never_finishing_for_test(P));
             ask(&mut h, &fx, &leader);
-            assert_eq!(statuses(&leader), vec![declined(TierInstallReason::NoSet)]);
+            assert_eq!(
+                statuses(&leader),
+                vec![declined(TierInstallReason::NoSet, P)]
+            );
             assert_eq!(fx.src.fetches_spawned(), 0);
         }
     }

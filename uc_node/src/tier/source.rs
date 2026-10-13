@@ -17,6 +17,20 @@ use uc_protocol::v2::backup::BackupTierEntry;
 use uc_protocol::v2::catalog::{RowEntry, RowVerdict, SetEntry, SetState};
 use uc_protocol::v2::datagram::{TierInstallBody, TierInstallReason};
 
+/// TEST SEAM: the fetch delay every [`TierSource`] opened from now on
+/// starts with ([`set_boot_fetch_delay_for_test`]); 0 by default.
+static BOOT_FETCH_DELAY_NS: AtomicU64 = AtomicU64::new(0);
+
+/// TEST SEAM, not API: every tier source OPENED after this call starts with
+/// `per_artifact` as its fetch delay — for a test whose node asks for a copy
+/// before `Node::start_with` returns (a below-floor learner is asked within
+/// its first round trip, so `Node::set_tier_fetch_delay_for_test` comes too
+/// late). Process-global: a test using it must serialize and reset it.
+#[doc(hidden)]
+pub fn set_boot_fetch_delay_for_test(per_artifact: Duration) {
+    BOOT_FETCH_DELAY_NS.store(per_artifact.as_nanos() as u64, Ordering::Relaxed);
+}
+
 pub struct TierSource {
     target: Arc<FsTarget>,
     app_id: String,
@@ -46,7 +60,7 @@ impl TierSource {
         Ok(TierSource {
             target,
             app_id: app_id.to_string(),
-            fetch_delay_ns: AtomicU64::new(0),
+            fetch_delay_ns: AtomicU64::new(BOOT_FETCH_DELAY_NS.load(Ordering::Relaxed)),
             fetches_spawned: AtomicU64::new(0),
         })
     }
@@ -510,6 +524,52 @@ pub fn check_install_set(
         return Err(TierInstallReason::Verify);
     }
     Ok((label.clone(), expect))
+}
+
+/// Backup-tier 3b spec §6.3 (Task 14 ruling), the LEADER: the
+/// `TIER_INSTALL` body naming the set a below-floor follower should install
+/// from its tier, carrying this node's committed verdict for it. S is the
+/// newest AGREED set with `floor <= S <= commit` that is also at most the
+/// highest committed `through` over the registered tiers (the leader cannot
+/// tell which tier the follower reads, so the best-covered one bounds it);
+/// only if none qualifies, the newest agreed set in `[floor, commit]` (the
+/// follower's tier may still hold it). `None` = no agreed set in range at
+/// all: skip the exchange and open the session. Rows: each `Agreed` row's
+/// hash/version/size in its slot, the rest zero. Pure.
+pub fn leader_install_body(
+    floor: u64,
+    commit: u64,
+    catalog: &[SetEntry],
+    backups: &[BackupTierEntry],
+) -> Option<TierInstallBody> {
+    let through = backups.iter().map(|b| b.through).max();
+    let in_range = |e: &&SetEntry| e.is_agreed() && floor <= e.position && e.position <= commit;
+    let newest = |bound: u64| {
+        catalog
+            .iter()
+            .filter(in_range)
+            .filter(|e| e.position <= bound)
+            .max_by_key(|e| e.position)
+    };
+    let e = through.and_then(newest).or_else(|| newest(u64::MAX))?;
+    let mut b = TierInstallBody {
+        floor,
+        commit,
+        s: e.position,
+        row_hash: [0; 8],
+        row_version: [0; 8],
+        row_size: [0; 8],
+        cluster_hash: e.cluster.hash,
+        cluster_size: e.cluster.size,
+    };
+    for (i, r) in e.rows.iter().enumerate() {
+        if r.verdict == RowVerdict::Agreed {
+            b.row_hash[i] = r.hash;
+            b.row_version[i] = r.version;
+            b.row_size[i] = r.size;
+        }
+    }
+    Some(b)
 }
 
 #[cfg(test)]
@@ -985,5 +1045,70 @@ pub(crate) mod tests {
             check_install_set(&h, Some(8000), std::slice::from_ref(&fx.label)).err(),
             Some(TierInstallReason::Verify)
         );
+    }
+
+    /// Task 14 ruling: the newest agreed set in `[floor, commit]` bounded by
+    /// the best-covered tier's `through`; else the newest agreed in range;
+    /// none in range → `None`. Never a non-agreed set, never outside range.
+    #[test]
+    fn leader_install_body_names_the_newest_agreed_set_the_tiers_cover() {
+        use uc_protocol::v2::catalog::SetKind;
+        let set = |p: u64, agreed: bool| {
+            let mut e = SetEntry::commanded(p, SetKind::Full, p);
+            e.rows[0] = RowEntry {
+                version: 3,
+                hash: p ^ 0xAB,
+                verdict: if agreed {
+                    RowVerdict::Agreed
+                } else {
+                    RowVerdict::Diverged
+                },
+                size: p + 1,
+            };
+            e.cluster = RowEntry {
+                version: 0,
+                hash: p ^ 0xCD,
+                verdict: RowVerdict::Agreed,
+                size: 5,
+            };
+            e.state = SetState::Complete;
+            e
+        };
+        let tier = |through: u64| BackupTierEntry {
+            tier_id: through + 1,
+            oldest_set: 0,
+            newest_set: through,
+            through,
+            reporter: 1,
+            updated_pos: 1,
+        };
+        let cat = [
+            set(1000, true),
+            set(2000, true),
+            set(3000, false),
+            set(4000, true),
+        ];
+        let s_of = |floor, commit, b: &[BackupTierEntry]| {
+            leader_install_body(floor, commit, &cat, b).map(|b| b.s)
+        };
+        // Bounded by the highest through (two tiers: 1500 and 2500 → 2500).
+        assert_eq!(s_of(0, 5000, &[tier(1500), tier(2500)]), Some(2000));
+        // Never the diverged 3000, even when through covers it.
+        assert_eq!(s_of(2500, 3500, &[tier(3500)]), None);
+        // No tier covers anything in range → the newest agreed in range.
+        assert_eq!(s_of(1500, 5000, &[tier(1200)]), Some(4000));
+        assert_eq!(s_of(0, 5000, &[]), Some(4000));
+        // Commit bounds it; the floor bounds it.
+        assert_eq!(s_of(0, 3999, &[]), Some(2000));
+        assert_eq!(s_of(4001, 9000, &[]), None);
+        // The body carries the set's verdict.
+        let b = leader_install_body(0, 5000, &cat, &[tier(1500)]).unwrap();
+        assert_eq!((b.floor, b.commit, b.s), (0, 5000, 1000));
+        assert_eq!(
+            (b.row_hash[0], b.row_version[0], b.row_size[0]),
+            (1000 ^ 0xAB, 3, 1001)
+        );
+        assert_eq!(&b.row_hash[1..], &[0; 7]);
+        assert_eq!((b.cluster_hash, b.cluster_size), (1000 ^ 0xCD, 5));
     }
 }

@@ -1112,7 +1112,7 @@ fn push_service_families(out: &mut String, s: &ObsSources, commit: u64, now: u64
     push_labeled(
         out,
         "uc2_tier_install_total",
-        "TIER_INSTALL requests (backup-tier 3b spec §6.3/§6.6) by outcome: installed (this below-floor node installed a set from its own tier) and declined (it answered declined — no source, the named set absent from its tier, an unregistered tier, or a set that failed verification against the leader's carried verdict), both counted by the follower.",
+        "TIER_INSTALL requests (backup-tier 3b spec §6.3/§6.6) by outcome: installed (this below-floor node installed a set from its own tier) and declined (it answered declined — no source, the named set absent from its tier, an unregistered tier, or a set that failed verification against the leader's carried verdict), both counted by the follower; and timeout (the LEADER gave up on an installing follower whose copy made no progress for 10 s and served it by a snapshot session), counted by the leader.",
         "counter",
         &[
             (
@@ -1122,6 +1122,10 @@ fn push_service_families(out: &mut String, s: &ObsSources, commit: u64, now: u64
             (
                 "outcome=\"declined\"".to_string(),
                 s.tier_install.declined.load(Ordering::Relaxed),
+            ),
+            (
+                "outcome=\"timeout\"".to_string(),
+                s.sender.tier_install_timeouts.load(Ordering::Relaxed),
             ),
         ],
     );

@@ -3257,4 +3257,344 @@ mod writer_e2e {
         let _keep = c.stop();
         drop(fresh);
     }
+
+    // ------------------------------------------- TIER_INSTALL (spec §6.3)
+
+    /// A purged 3-voter cluster whose tier (written by node 1) covers every
+    /// voter's purge floor: returns it, the tier, and S — the newest set the
+    /// tier holds, which is at or above every voter's floor.
+    fn purged_with_tier(app: &'static str) -> (Cluster, tempfile::TempDir, u64) {
+        let tier = tmp_tier();
+        let cfg = writer_cfg(tier.path(), 1 << 20, Duration::from_millis(300));
+        let mut c = spawn(3, 0, opts(app, true), |i| (i == 1).then(|| cfg.clone()));
+        start_sums(&mut c);
+        await_single_leader(&c, 30);
+        await_capable(&c);
+        let all = c.running();
+        churn(&c, &all, 3);
+        await_until(60, "every voter purged", || {
+            all.iter().all(|&i| c.node(i).archive_first_base() > 0)
+        });
+        let floor = all
+            .iter()
+            .map(|&i| c.node(i).archive_first_base())
+            .max()
+            .unwrap();
+        // Quiesced: the tier's newest set IS the newest agreed set — else
+        // the leader may name an agreed set the writer has not copied yet
+        // (its `through` can run past a set it has not written) and the
+        // learner would decline `no_set` for a reason this test is not about.
+        let newest_agreed = |c: &Cluster| {
+            c.node(0)
+                .cluster_view()
+                .snapshot_inner()
+                .catalog
+                .iter()
+                .filter(|e| e.is_agreed())
+                .map(|e| e.position)
+                .max()
+        };
+        let w = await_watermark(&c, 0, 60, |w| {
+            w.newest_set >= floor
+                && w.through >= w.newest_set
+                && Some(w.newest_set) == newest_agreed(&c)
+        });
+        (c, tier, w.newest_set)
+    }
+
+    /// Add a brand-new learner (id `id`, fresh instance dir, its own
+    /// `[tier_source]`) to the running cluster through the leader and start
+    /// its node — and, iff `service`, then its service (which blocks until
+    /// the node has JOINED, i.e. past its install); returns its index in
+    /// `c.nodes`.
+    fn start_learner(
+        c: &mut Cluster,
+        leader: usize,
+        id: u32,
+        tier_source: Option<PathBuf>,
+        service: bool,
+    ) -> usize {
+        let sock = UdpSocket::bind("127.0.0.1:0").expect("bind learner");
+        let addr = sock.local_addr().unwrap();
+        let (ip, port) = match addr {
+            SocketAddr::V4(a) => (u32::from(*a.ip()), a.port()),
+            SocketAddr::V6(_) => unreachable!(),
+        };
+        admin_ok(&c.cnc(leader), 1 /* AddLearner */, id, ip, port);
+        let voters: Vec<(NodeId, SocketAddr)> =
+            (0..3).map(|i| (i as NodeId, c.nodes[i].addr)).collect();
+        let dir = c._dir.path().join(format!("n{id}"));
+        let d = dir.clone();
+        let app = c.app;
+        let cfg: Box<dyn Fn() -> NodeConfig> = Box::new(move || NodeConfig {
+            id: id as NodeId,
+            members: voters.clone(),
+            learners: Vec::new(),
+            bind: addr,
+            instance_dir: d.clone(),
+            app_id: app.into(),
+            buffer_bytes: 1 << 22,
+            max_payload: 256,
+            admission_bytes_default: 256 * 1024,
+            settings_genesis: Settings::genesis_default(),
+            force_jumbo_frames: false,
+            election_timeout_min_ns: 150_000_000,
+            election_timeout_max_ns: 300_000_000,
+            seed: 0x7171 ^ id as u64,
+            faults: FaultConfig::default(),
+            purge: PurgePolicy::Disabled,
+            journal_segment_bytes: uc_node::DEFAULT_JOURNAL_SEGMENT_BYTES,
+            crypto: uc_node::CryptoConfig::Disabled,
+            services: ServicesConfig::single(<SumSm as uc_service::RawStateMachine>::NAME),
+        });
+        let mut h = NodeH {
+            addr,
+            dir,
+            is_learner: true,
+            cfg,
+            backup: None,
+            tier_source,
+            sock: Some(sock),
+            node: None,
+            svc: None,
+        };
+        h.start();
+        if service {
+            h.start_service(app, id as usize);
+        }
+        c.nodes.push(h);
+        c.nodes.len() - 1
+    }
+
+    fn snap_sessions(node: &Node) -> u64 {
+        node.observability()
+            .sender
+            .snap_sessions
+            .load(Ordering::Relaxed)
+    }
+
+    fn tier_install(node: &Node, outcome: &str) -> u64 {
+        metric_labeled(
+            node,
+            "uc2_tier_install_total",
+            &format!("outcome=\"{outcome}\""),
+        )
+    }
+
+    /// Wait until `n` is durable at the commit `l` had when called.
+    fn await_caught_up(c: &Cluster, l: usize, n: usize) {
+        let commit = c.node(l).counters().commit.load_acquire();
+        await_until(90, "the learner caught up to the leader's commit", || {
+            c.node(n).counters().durable.load_acquire() >= commit
+        });
+    }
+
+    /// Spec §6.3: a brand-new learner with a tier source joins a cluster
+    /// whose voters have all purged — the leader asks it to install S from
+    /// its tier first, it does, and no snapshot session is ever opened.
+    #[test]
+    #[ignore = "pending a ruling (Task 14 finding F1): a brand-new learner's cluster view registers no tier, so it declines not_registered"]
+    fn a_learner_with_a_tier_source_joins_a_purged_cluster_from_the_tier() {
+        let _g = serialize();
+        let buf = uc_node::obs::log::capture_for_tests();
+        let _restore = CaptureGuard;
+        let (mut c, tier, s) = purged_with_tier("tier-src");
+        let l = await_single_leader(&c, 30);
+        let n = start_learner(&mut c, l, 3, Some(tier.path().to_path_buf()), true);
+        await_caught_up(&c, l, n);
+        assert_eq!(
+            snap_sessions(c.node(l)),
+            0,
+            "no session: {:?}",
+            obs_lines(&buf, "tier_install_declined")
+        );
+        assert!(
+            c.node(l)
+                .observability()
+                .sender
+                .tier_install_sent
+                .load(Ordering::Relaxed)
+                >= 1
+        );
+        assert_eq!(tier_install(c.node(n), "installed"), 1);
+        assert_eq!(tier_install(c.node(n), "declined"), 0);
+        assert!(
+            c.node(n).archive_first_base() >= s,
+            "the learner's journal starts at the installed set ({} < {s})",
+            c.node(n).archive_first_base()
+        );
+        let _keep = c.stop();
+    }
+
+    /// Spec §6.3 + D8: one byte of the tier's row artifact flipped after
+    /// the writer confirmed it — the learner's copy fails verification
+    /// against the leader's carried hash, it declines, and the session
+    /// installs the set instead.
+    #[test]
+    #[ignore = "pending a ruling (Task 14 finding F1): a brand-new learner's cluster view registers no tier, so it declines not_registered"]
+    fn a_corrupt_tier_artifact_declines_and_the_session_installs_it() {
+        let _g = serialize();
+        let buf = uc_node::obs::log::capture_for_tests();
+        let _restore = CaptureGuard;
+        let (mut c, tier, s) = purged_with_tier("tier-corrupt");
+        let obj = tier.path().join(uc_node::tier::layout::row_object(s, 0));
+        let mut bytes = std::fs::read(&obj).expect("the tier holds S's row artifact");
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0x5A;
+        std::fs::write(&obj, &bytes).unwrap();
+        let l = await_single_leader(&c, 30);
+        let n = start_learner(&mut c, l, 3, Some(tier.path().to_path_buf()), true);
+        await_caught_up(&c, l, n);
+        assert_eq!(tier_install(c.node(n), "declined"), 1);
+        assert_eq!(tier_install(c.node(n), "installed"), 0);
+        let declined = obs_lines(&buf, "tier_install_declined");
+        assert!(
+            declined.iter().any(|d| d.contains("\"reason\":\"verify\"")),
+            "declined for verification: {declined:?}"
+        );
+        // `>= 1`, not `== 1`: see the no-source test's note.
+        assert!(snap_sessions(c.node(l)) >= 1, "the session installed it");
+        assert_eq!(
+            c.node(l)
+                .observability()
+                .sender
+                .tier_install_sent
+                .load(Ordering::Relaxed),
+            1,
+            "asked once; the decline's hold covers the re-NAKs"
+        );
+        let _keep = c.stop();
+    }
+
+    /// Review focus 5: a voter with NO tier source, restarted after its
+    /// peers purged past it, declines `no_source` at once and the session
+    /// opens within one round trip — not after the 2 s answer timeout.
+    #[test]
+    fn a_voter_without_a_source_declines_at_once_and_the_session_serves_it() {
+        let _g = serialize();
+        let buf = uc_node::obs::log::capture_for_tests();
+        let _restore = CaptureGuard;
+        let o = Opts {
+            auto_fetch: false,
+            ..opts("tier-nosrc", true)
+        };
+        let mut c = spawn(3, 0, o, |_| None);
+        start_sums(&mut c);
+        let l0 = await_single_leader(&c, 30);
+        await_capable(&c);
+        let down = (l0 + 1) % 3;
+        let up: Vec<usize> = (0..3).filter(|&i| i != down).collect();
+        let behind = c.node(down).counters().durable.load_acquire();
+        c.nodes[down].stop();
+        churn(&c, &up, 3);
+        await_until(60, "the live voters purged past the stopped one", || {
+            up.iter().all(|&i| c.node(i).archive_first_base() > behind)
+        });
+        let l = await_single_leader(&c, 30);
+        let stats = c.node(l).observability().sender.clone();
+        assert_eq!(stats.tier_install_sent.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.snap_sessions.load(Ordering::Relaxed), 0);
+        let app = c.app;
+        c.nodes[down].start();
+        // Time the leader's two edges: the request, then the session.
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let (mut asked, mut opened) = (None, None);
+        while opened.is_none() {
+            assert!(Instant::now() < deadline, "no session opened");
+            let now = Instant::now();
+            if asked.is_none() && stats.tier_install_sent.load(Ordering::Relaxed) >= 1 {
+                asked = Some(now);
+            }
+            if stats.snap_sessions.load(Ordering::Relaxed) >= 1 {
+                opened = Some(now);
+            }
+            std::thread::yield_now();
+        }
+        let asked = asked.expect("the leader asked before it opened a session");
+        let gap = opened.unwrap() - asked;
+        assert!(
+            gap < Duration::from_secs(1),
+            "session opened {gap:?} after the ask; ignored: {:?}; declined: {:?}",
+            obs_lines(&buf, "tier_install_ignored"),
+            obs_lines(&buf, "tier_install_declined")
+        );
+        c.nodes[down].start_service(app, down);
+        await_caught_up(&c, l, down);
+        // Not `== 1`: a below-floor joiner re-NAKs until its adoption
+        // sticks, so the session path opens more than once (learner.rs's
+        // M14c2 note measured 3). The hold is what this pins: asked ONCE.
+        assert!(stats.snap_sessions.load(Ordering::Relaxed) >= 1);
+        assert_eq!(stats.tier_install_sent.load(Ordering::Relaxed), 1);
+        let declined = obs_lines(&buf, "tier_install_declined");
+        assert_eq!(declined.len(), 1, "logged once: {declined:?}");
+        assert!(
+            declined[0].contains("\"reason\":\"no_source\""),
+            "{}",
+            declined[0]
+        );
+        eprintln!("tier_install -> session gap: {gap:?}");
+        let _keep = c.stop();
+    }
+
+    /// Review focus 1: the leader stops while the learner's tier copy is
+    /// running. The new leader asks again, the learner answers `installing`
+    /// from the copy it already runs — no second copy, no session on either
+    /// leader — and the learner reaches commit.
+    #[test]
+    #[ignore = "pending a ruling (Task 14 finding F1): a brand-new learner's cluster view registers no tier, so it declines not_registered"]
+    fn a_leader_change_mid_install_opens_no_second_path() {
+        let _g = serialize();
+        let buf = uc_node::obs::log::capture_for_tests();
+        let _restore = CaptureGuard;
+        let (mut c, tier, _s) = purged_with_tier("tier-failover");
+        let l = await_single_leader(&c, 30);
+        let old = c.node(l).observability().sender.clone();
+        // 2 s per artifact, set before the learner's node opens its source:
+        // it is asked within its first round trip, before `start` returns.
+        struct ResetDelay;
+        impl Drop for ResetDelay {
+            fn drop(&mut self) {
+                uc_node::tier::source::set_boot_fetch_delay_for_test(Duration::ZERO);
+            }
+        }
+        let _reset = ResetDelay;
+        uc_node::tier::source::set_boot_fetch_delay_for_test(Duration::from_secs(2));
+        // Node only: its service would block until the node has joined,
+        // which is past the install this test needs to catch mid-copy.
+        let n = start_learner(&mut c, l, 3, Some(tier.path().to_path_buf()), false);
+        uc_node::tier::source::set_boot_fetch_delay_for_test(Duration::ZERO);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while c.node(n).tier_fetches_spawned() != 1 {
+            assert!(
+                Instant::now() < deadline,
+                "the learner's tier copy never started; declined: {:?}; ignored: {:?}; sent: {}",
+                obs_lines(&buf, "tier_install_declined"),
+                obs_lines(&buf, "tier_install_ignored"),
+                old.tier_install_sent.load(Ordering::Relaxed)
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(tier_install(c.node(n), "installed"), 0, "still copying");
+        assert_eq!(old.tier_install_sent.load(Ordering::Relaxed), 1);
+        c.nodes[l].stop();
+        let l2 = submit_following(&c, 200);
+        assert_ne!(l2, l);
+        let new = c.node(l2).observability().sender.clone();
+        await_until(60, "the new leader asked the learner", || {
+            new.tier_install_sent.load(Ordering::Relaxed) == 1
+        });
+        let app = c.app;
+        c.nodes[n].start_service(app, 3);
+        await_caught_up(&c, l2, n);
+        // Not `== 1` here: `installed` clears the wait with no hold, and the
+        // learner re-NAKs below the floor until its adoption sticks, so the
+        // new leader may ask again — answered `installed` with no copy,
+        // which the spawn count pins.
+        assert!(new.tier_install_sent.load(Ordering::Relaxed) >= 1);
+        assert_eq!(c.node(n).tier_fetches_spawned(), 1, "one copy, ever");
+        assert_eq!(tier_install(c.node(n), "installed"), 1);
+        assert_eq!(old.snap_sessions.load(Ordering::Relaxed), 0);
+        assert_eq!(new.snap_sessions.load(Ordering::Relaxed), 0);
+        let _keep = c.stop();
+    }
 }
