@@ -312,6 +312,9 @@ replicated schedule table — plus four **off-contract** timing families
 | `uc2_backup_retention_deleted_total` (backup tier) | counter | `kind` | objects the writer's retention deleted from the tier: `set` or `chunk` |
 | `uc2_backup_reports_stale_total` (backup tier) | counter | none | `BackupWatermark` records this node's cluster FSM applied that changed nothing because the tier already held a higher `through`. Counted on every node; a few around a failover are expected |
 | `uc2_backup_tiers_full_total` (backup tier) | counter | none | watermark records refused because `MAX_BACKUP_TIERS` (4) tiers are already registered; any increase means a fifth target is reporting and ignored — free a slot with `uc2ctl tier forget` |
+| `uc2_purge_gate_position` (backup tier 3b) | gauge | none | the journal-purge gate: the K-th highest confirmed backup `through` among the committed tiers, K being the replicated `purge_requires_tiers`; `0` while fewer than K tiers are registered (every purge held). **Header only (no sample) while K = 0.** Computed on every node, but only a node with `[purge]` on is held by it |
+| `uc2_backup_gate_released` (backup tier 3b) | gauge | none | `1` while low space has this node's purge gate released (the level behind `uc2_backup_gate_released_total`): the node purges past the K-th confirmed tier. Cleared when space returns. Alert: `Uc2BackupGateReleased` |
+| `uc2_backup_gate_released_total` (backup tier 3b) | counter | none | times low space released this node's purge gate: free bytes fell below one chunk plus the auto-fetch headroom, so the node purged past the K-th confirmed tier. Once per episode. Alert: `Uc2BackupGateReleased` |
 
 **One alert rule**, `Uc2LogTimeFrozen` (warning, `for: 30s`):
 `uc2_log_time_lag_seconds > 5 and on(instance) uc2_is_leader == 1`. The

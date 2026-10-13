@@ -3534,6 +3534,114 @@ mod writer_e2e {
         let _keep = c.stop();
     }
 
+    /// Spec §6.5: with a tier source on every voter, `auto_fetch = false` is
+    /// a supported configuration — voters copy no learner-built (standby)
+    /// set, and a voter restarted below the floor catches up through the
+    /// tier install (§6.3), never a session.
+    #[test]
+    fn auto_fetch_off_with_a_tier_source_restarts_a_voter_through_the_tier() {
+        let _g = serialize();
+        let buf = uc_node::obs::log::capture_for_tests();
+        let _restore = CaptureGuard;
+        let tier = tmp_tier();
+        let cfg = writer_cfg(tier.path(), 1 << 20, Duration::from_millis(300));
+        let o = Opts {
+            auto_fetch: false,
+            standby: true,
+            ..opts("tier-nofetch", true)
+        };
+        let src = tier.path().to_path_buf();
+        let mut c = spawn_with(
+            3,
+            1,
+            o,
+            |i| (i == 3).then(|| cfg.clone()),
+            |i| (i < 3).then(|| src.clone()),
+        );
+        start_sums(&mut c);
+        await_single_leader(&c, 30);
+        await_capable(&c);
+
+        // Two standby sets, built by the learner and written to the tier.
+        submit_settled(&c, 500);
+        let p1 = standby_instant(&c, 3);
+        submit_settled(&c, 500);
+        let p2 = standby_instant(&c, 3);
+        assert!(p2 > p1);
+        await_watermark(&c, 0, 60, |w| w.newest_set == p2);
+        // No voter fetched, and none holds either standby set.
+        for i in 0..3 {
+            assert_eq!(
+                fetched(c.node(i), "tier"),
+                0,
+                "node {i} fetched from the tier"
+            );
+            assert_eq!(
+                fetched(c.node(i), "peer"),
+                0,
+                "node {i} fetched from a peer"
+            );
+            assert!(
+                c.node(i).snapshot_set_position() < p1,
+                "node {i} holds a standby set ({} >= {p1})",
+                c.node(i).snapshot_set_position()
+            );
+        }
+
+        // Stop a follower, then purge the live nodes past its position.
+        let l0 = await_single_leader(&c, 30);
+        let down = (0..3).find(|&i| i != l0).unwrap();
+        let up: Vec<usize> = (0..4).filter(|&i| i != down).collect();
+        let behind = c.node(down).counters().durable.load_acquire();
+        c.nodes[down].stop();
+        churn(&c, &up, 3);
+        await_until(60, "the live voters purged past the stopped one", || {
+            (0..3)
+                .filter(|&i| i != down)
+                .all(|i| c.node(i).archive_first_base() > behind)
+        });
+        // Quiesce: the tier's newest set is the newest agreed one, so the
+        // set the leader names is one the tier holds.
+        let l = await_single_leader(&c, 30);
+        let newest_agreed = |c: &Cluster| {
+            c.node(l)
+                .cluster_view()
+                .snapshot_inner()
+                .catalog
+                .iter()
+                .filter(|e| e.is_agreed())
+                .map(|e| e.position)
+                .max()
+        };
+        await_watermark(&c, l, 60, |w| {
+            w.through >= w.newest_set && Some(w.newest_set) == newest_agreed(&c)
+        });
+        let stats = c.node(l).observability().sender.clone();
+        let sessions = stats.snap_sessions.load(Ordering::Relaxed);
+        let asked = stats.tier_install_sent.load(Ordering::Relaxed);
+
+        let app = c.app;
+        c.nodes[down].start();
+        c.nodes[down].start_service(app, down);
+        await_caught_up(&c, l, down);
+        assert_eq!(
+            tier_install(c.node(down), "installed"),
+            1,
+            "declined: {:?}",
+            obs_lines(&buf, "tier_install_declined")
+        );
+        assert_eq!(tier_install(c.node(down), "declined"), 0);
+        assert_eq!(
+            stats.snap_sessions.load(Ordering::Relaxed),
+            sessions,
+            "no session opened: {:?}",
+            obs_lines(&buf, "tier_install_declined")
+        );
+        assert_eq!(stats.tier_install_sent.load(Ordering::Relaxed), asked + 1);
+        assert_eq!(fetched(c.node(down), "peer"), 0);
+        let _keep = c.stop();
+    }
+
     /// Review focus 1: the leader stops while the learner's tier copy is
     /// running. The new leader asks again, the learner answers `installing`
     /// from the copy it already runs — no second copy, no session on either
