@@ -29,10 +29,12 @@ use uc_protocol::v2::crypto::CRYPTO_OVERHEAD;
 use uc_protocol::v2::datagram::read_snap_begin_body;
 use uc_protocol::v2::datagram::{
     DATAGRAM_HEADER_LEN, DGRAM_KIND_DATA, DGRAM_KIND_HEARTBEAT, DGRAM_KIND_PROBE,
-    DGRAM_KIND_SNAP_BEGIN, DGRAM_KIND_SNAP_CHUNK, DGRAM_KIND_SNAP_REDIRECT, DatagramHeader,
-    Holdings, MTU_BOUND, MTU_DEFAULT, PROBE_RUNG_LEN, SNAP_BEGIN_FIXED_LEN, SNAP_BEGIN_LAYOUT_V4,
-    SNAP_REDIRECT_BODY_LEN, SnapBeginBody, SnapRedirectBody, SnapRequestBody,
-    write_datagram_header, write_probe_rung, write_snap_begin_body, write_snap_redirect_body,
+    DGRAM_KIND_SNAP_BEGIN, DGRAM_KIND_SNAP_CHUNK, DGRAM_KIND_SNAP_REDIRECT,
+    DGRAM_KIND_TIER_INSTALL, DatagramHeader, Holdings, MTU_BOUND, MTU_DEFAULT, PROBE_RUNG_LEN,
+    SNAP_BEGIN_FIXED_LEN, SNAP_BEGIN_LAYOUT_V4, SNAP_REDIRECT_BODY_LEN, SnapBeginBody,
+    SnapRedirectBody, SnapRequestBody, TIER_INSTALL_BODY_LEN, TierInstallBody, TierInstallState,
+    TierInstallStatusBody, write_datagram_header, write_probe_rung, write_snap_begin_body,
+    write_snap_redirect_body, write_tier_install_body,
 };
 use uc_protocol::v2::frame::{
     FRAME_ALIGNMENT, FRAME_TYPE_PADDING, HEADER_LEN, align_frame_len, read_header,
@@ -119,6 +121,11 @@ pub enum CtrlMsg {
     SnapRequest {
         from: SocketAddr,
         body: SnapRequestBody,
+    },
+    /// Backup-tier 3b spec §6.3: a follower's answer to `TIER_INSTALL`.
+    TierInstallStatus {
+        from: SocketAddr,
+        body: TierInstallStatusBody,
     },
     /// M7 (spec 2026-07-13): the consensus agent adopted a new `ClusterConfig`
     /// (`Action::ConfigAdopted`) — rebuild the fan-out + flow control from it.
@@ -278,6 +285,54 @@ pub type SnapshotSource = Arc<dyn Fn(Option<u64>) -> Option<SnapshotSet> + Send 
 /// here: `uc_net` owns the datagram, `uc_node` owns membership and the
 /// standby instants it commanded.
 pub type SnapRedirectHint = Arc<dyn Fn() -> Option<(u32, u64)> + Send + Sync>;
+
+/// Backup-tier 3b spec §6.3: the set a below-floor follower should install
+/// from its own tier, named by the LEADER with its committed catalog's
+/// verdict for it. Called with `(floor, commit)` — this node's first
+/// archived base (what the journal replay could not serve below) and its
+/// commit counter — and answers the whole `TIER_INSTALL` body, or `None`
+/// when no agreed set lies in `[floor, commit]` (the exchange is skipped and
+/// the session opens as before). The POLICY (which set) lives in the node,
+/// which owns the catalog; `uc_net` owns only the exchange and its timers.
+pub type TierInstallSource = Arc<dyn Fn(u64, u64) -> Option<TierInstallBody> + Send + Sync>;
+
+/// Spec §6.3: a follower that has not answered a `TIER_INSTALL` within this
+/// long is served by a snapshot session instead.
+const TIER_INSTALL_ANSWER_NS: u64 = 2_000_000_000;
+/// Spec §6.3: an `installing` follower whose `copied` has not risen for this
+/// long is given up on (a timeout, counted) and served by a session.
+const TIER_INSTALL_STALL_NS: u64 = 10_000_000_000;
+/// Spec §6.3 (RA5): after a decline OR a timeout, this follower's below-floor
+/// NAKs go straight to the session path for this long — no second
+/// `TIER_INSTALL` while the first answer still stands.
+const TIER_INSTALL_DECLINE_HOLD_NS: u64 = 30_000_000_000;
+/// Review round 2: after `installed{S}` a healthy follower still NAKs below
+/// the floor until its adoption lands (the cluster agent's install ack), so
+/// for this long such a NAK opens nothing and asks nothing; past it (and
+/// within [`TIER_INSTALL_DECLINE_HOLD_NS`]) the adoption is taken as stuck
+/// and the follower is held like a decline and served by a session.
+const TIER_INSTALL_SETTLE_NS: u64 = 10_000_000_000;
+
+/// One outstanding `TIER_INSTALL` exchange — at most one PER PEER (RA5), and
+/// independent of every other peer's and of the single snapshot session.
+/// Dropped with leadership (the role gate in [`Sender::do_work`]).
+struct TierInstallWait {
+    peer: SocketAddr,
+    /// When the request went out (`Sender::now_ns`).
+    sent_ns: u64,
+    /// Any `installing` answer has arrived: the 2 s answer rule is replaced
+    /// by the 10 s progress rule.
+    answered: bool,
+    /// The set the follower reports copying (informational: declines and
+    /// reports are matched by PEER, never by position).
+    position: u64,
+    last_copied: u64,
+    /// The last time `copied` rose (or the first answer arrived).
+    last_progress_ns: u64,
+    /// A `declined` answer arrived; the next [`Sender::drive_tier_waits`]
+    /// removes the wait and opens the session.
+    declined: bool,
+}
 
 /// One artifact inside an in-flight outbound session. `base` is its first
 /// byte's STREAM-GLOBAL offset (the session is one concatenated byte stream
@@ -475,6 +530,17 @@ pub struct SenderStats {
     /// probing a rung the local route cannot carry is how the ladder finds the
     /// ceiling. Kept separate so the alert's counter stays clean.
     pub probe_emsgsize: AtomicU64,
+    /// Backup-tier 3b spec §6.3: `TIER_INSTALL` requests put on the wire —
+    /// one per below-floor episode per follower, before any session.
+    pub tier_install_sent: AtomicU64,
+    /// Spec §6.6 `uc2_tier_install_total{outcome="timeout"}`: an
+    /// `installing` follower made no progress for 10 s and was served by a
+    /// session instead.
+    pub tier_install_timeouts: AtomicU64,
+    /// A `TIER_INSTALL_STATUS` from an address with no outstanding request —
+    /// a late answer to an exchange already closed (a timeout, a leader
+    /// change), or, crypto off, a spoofed source address. Dropped.
+    pub tier_install_status_unexpected: AtomicU64,
 }
 
 pub struct Sender {
@@ -611,6 +677,25 @@ pub struct Sender {
     /// crate knows no node ids — the node maps them through membership).
     /// `None` = nothing recorded (harness senders).
     soft: Option<Arc<Mutex<SoftTableWire>>>,
+    /// Backup-tier 3b spec §6.3: who names the set a below-floor follower
+    /// should install from its tier. `None` = never ask (harness senders,
+    /// and a below-floor NAK opens a session exactly as before).
+    tier_install_source: Option<TierInstallSource>,
+    /// RA5: one outstanding exchange per follower, keyed by its address —
+    /// which is also the only address whose `TIER_INSTALL_STATUS` is acted
+    /// on (crypto off, kind 29's `from` is unauthenticated).
+    tier_waits: HashMap<SocketAddr, TierInstallWait>,
+    /// RA5: followers that declined or timed out, and until when (`now_ns`)
+    /// their below-floor NAKs skip the tier and go straight to a session.
+    tier_declined: HashMap<SocketAddr, u64>,
+    /// Review rounds 1–2: followers that answered `installed{S}`, with S and
+    /// when (`now_ns`). A below-floor NAK from one within
+    /// [`TIER_INSTALL_SETTLE_NS`] opens nothing; from then until
+    /// [`TIER_INSTALL_DECLINE_HOLD_NS`] it is treated as a decline (held,
+    /// served by a session) — the backstop for a follower
+    /// whose adoption is stuck, which would otherwise answer `installed` to
+    /// every request while still NAKing below the floor, forever.
+    tier_installed: HashMap<SocketAddr, (u64, u64)>,
 }
 
 /// Catalog spec §5.3: the sender's half of the leader's soft table — each
@@ -801,6 +886,10 @@ impl Sender {
             probe: None,
             live_mtu: None,
             soft: None,
+            tier_install_source: None,
+            tier_waits: HashMap::new(),
+            tier_declined: HashMap::new(),
+            tier_installed: HashMap::new(),
         }
     }
 
@@ -845,6 +934,15 @@ impl Sender {
     /// durable floor marker, so a session only ever ships a fully-published file.
     pub fn set_snapshot_source(&mut self, src: SnapshotSource) {
         self.snapshot_source = Some(src);
+    }
+
+    /// Backup-tier 3b spec §6.3: wire the leader's choice of the set a
+    /// below-floor follower installs from its own tier. With it, such a
+    /// follower's first below-floor NAK sends a `TIER_INSTALL` and waits
+    /// (2 s for an answer, 10 s per stall) before any session; without it,
+    /// the NAK opens a session as it always has.
+    pub fn set_tier_install_source(&mut self, src: TierInstallSource) {
+        self.tier_install_source = Some(src);
     }
 
     /// Wire the redirect policy (coordinated-snapshot spec §5.7 item 6).
@@ -1159,6 +1257,9 @@ impl Sender {
                     }
                 }
                 CtrlMsg::SnapRequest { from, body } => self.on_snap_request(from, body),
+                CtrlMsg::TierInstallStatus { from, body } => {
+                    self.on_tier_install_status(from, body)
+                }
                 CtrlMsg::SetPeers {
                     followers,
                     learners,
@@ -1211,9 +1312,18 @@ impl Sender {
             // adopt it so we stream only the fresh term's tail, never re-stream
             // (which would regress the counter under a slower cached cursor).
             self.sent = self.buffer.counters().sent.load_acquire();
+            // A fresh term asks afresh: nothing an earlier term of ours
+            // waited on or was told still stands (a flip we never observed
+            // as `false` would otherwise carry it over).
+            self.drop_tier_state();
         }
         self.was_leader = leader_role;
         if !leader_role {
+            // Spec §6.3: the tier-install exchange is leader state — a
+            // demoted node waits on nothing and holds no declines; the new
+            // leader asks the follower again (and the follower, already
+            // copying, answers it `installing`).
+            self.drop_tier_state();
             // Coordinated-snapshot spec §5.7 item 4: a session opened by a
             // peer's `SNAP_REQUEST` is driven WHATEVER this node's role is —
             // the intended source is a LEARNER, and a learner is never the
@@ -1230,6 +1340,13 @@ impl Sender {
 
         if let Some((to, pos, len)) = self.naks.pop_front() {
             self.serve_nak(to, pos, len);
+            did = true;
+        }
+        // Spec §6.3: expire tier-install waits — one emptiness check per pass
+        // when nothing is outstanding, the body out of line.
+        if (!self.tier_waits.is_empty() || !self.tier_declined.is_empty())
+            && self.serve_tier_waits()
+        {
             did = true;
         }
 
@@ -1471,6 +1588,12 @@ impl Sender {
                     // unrecoverable overrun. Bounded to `REPLAY_DGRAMS_PER_NAK`
                     // datagrams — the follower re-NAKs the remainder.
                     if !self.serve_nak_from_journal(to, p, end) {
+                        // Backup-tier 3b spec §6.3: first ask the follower to
+                        // install a named set from its own tier — or, while
+                        // that exchange is outstanding, do nothing at all.
+                        if self.try_tier_install(to) {
+                            break;
+                        }
                         // Below the purge floor: gone from ring AND journal. M6
                         // Task 6 — upgrade to a snapshot session (ship the newest
                         // durable snapshot file to this peer) instead of counting
@@ -1548,6 +1671,190 @@ impl Sender {
             p = block_end;
         }
         served_any
+    }
+
+    // -- Backup-tier 3b spec §6.3: TIER_INSTALL, the leader ---------------------
+
+    /// Clear every tier-install wait and hold (leadership lost or regained).
+    fn drop_tier_state(&mut self) {
+        if !self.tier_waits.is_empty()
+            || !self.tier_declined.is_empty()
+            || !self.tier_installed.is_empty()
+        {
+            self.tier_waits.clear();
+            self.tier_declined.clear();
+            self.tier_installed.clear();
+        }
+    }
+
+    /// This node's purge floor as the replay path sees it: the first
+    /// archived block's base (0 with no journal or an empty one). One block
+    /// read, on the cold below-floor path only.
+    fn journal_floor(&self) -> u64 {
+        let Some(j) = self.replay.as_ref() else {
+            return 0;
+        };
+        let Some(first) = j.first_seq() else {
+            return 0;
+        };
+        match j.read(first) {
+            Ok(Some((base, _))) => base,
+            _ => 0,
+        }
+    }
+
+    /// The below-floor NAK from `to`, before any session (spec §6.3, RA5):
+    /// `true` = a `TIER_INSTALL` exchange with `to` is outstanding (just
+    /// sent, or already waiting) and the caller opens nothing; `false` = go
+    /// on to the session path — no source wired, `to` declined or timed out
+    /// within the 30 s hold, a session is already serving `to`, no agreed
+    /// set lies in `[floor, commit]`, or the request could not be sealed.
+    /// Per peer: another follower's wait, or a session serving another
+    /// follower, does not stop this one being asked.
+    #[cold]
+    #[inline(never)]
+    fn try_tier_install(&mut self, to: SocketAddr) -> bool {
+        let Some(src) = self.tier_install_source.clone() else {
+            return false;
+        };
+        if self.tier_waits.contains_key(&to) {
+            return true;
+        }
+        let now = self.now_ns();
+        if self
+            .tier_declined
+            .get(&to)
+            .is_some_and(|&until| now < until)
+        {
+            return false;
+        }
+        // Answered `installed` and still below the floor. Within the settling
+        // grace its adoption is still landing: open nothing, ask nothing —
+        // handled like a live wait, so (like one) NOT counted as an overrun:
+        // the NAK is accounted for, not unservable. Past the grace but within
+        // the hold its adoption did not take: treat it as a decline.
+        if let Some(&(_, at)) = self.tier_installed.get(&to)
+            && now.saturating_sub(at) < TIER_INSTALL_SETTLE_NS
+        {
+            return true;
+        }
+        if let Some((_, at)) = self.tier_installed.remove(&to)
+            && now.saturating_sub(at) < TIER_INSTALL_DECLINE_HOLD_NS
+        {
+            self.tier_declined
+                .insert(to, now.saturating_add(TIER_INSTALL_DECLINE_HOLD_NS));
+            return false;
+        }
+        if self.snap.as_ref().is_some_and(|s| s.peer == to) {
+            return false;
+        }
+        let commit = self.buffer.counters().commit.load_acquire();
+        let floor = self.journal_floor();
+        let Some(body) = src(floor, commit) else {
+            return false;
+        };
+        debug_assert!(body.floor <= body.s && body.s <= body.commit);
+        let mut buf = [0u8; TIER_INSTALL_BODY_LEN];
+        write_tier_install_body(&mut buf, &body);
+        if !self.assemble_snap(to, body.s, DGRAM_KIND_TIER_INSTALL, &buf) {
+            return false;
+        }
+        Self::send_counted(&mut self.sock, &self.stats, &self.scratch, to);
+        self.stats.tier_install_sent.fetch_add(1, Ordering::Relaxed);
+        self.tier_waits.insert(
+            to,
+            TierInstallWait {
+                peer: to,
+                sent_ns: now,
+                answered: false,
+                position: body.s,
+                last_copied: 0,
+                last_progress_ns: now,
+                declined: false,
+            },
+        );
+        true
+    }
+
+    /// A follower's `TIER_INSTALL_STATUS` (kind 29). Acted on ONLY from the
+    /// address this node asked — crypto off that address is unauthenticated,
+    /// so anything else is dropped and counted. Matched by peer, never by
+    /// position.
+    fn on_tier_install_status(&mut self, from: SocketAddr, body: TierInstallStatusBody) {
+        let now = self.now_ns();
+        let Some(w) = self.tier_waits.get_mut(&from) else {
+            self.stats
+                .tier_install_status_unexpected
+                .fetch_add(1, Ordering::Relaxed);
+            return;
+        };
+        debug_assert_eq!(w.peer, from);
+        match body.state {
+            TierInstallState::Declined => w.declined = true,
+            TierInstallState::Installing => {
+                if !w.answered {
+                    w.answered = true;
+                    w.last_progress_ns = now;
+                }
+                w.position = body.position;
+                if body.copied > w.last_copied {
+                    w.last_copied = body.copied;
+                    w.last_progress_ns = now;
+                }
+            }
+            // The follower holds the set: its next NAK is above the floor.
+            // Remembered, so one that is not (a stuck adoption) is served by
+            // a session rather than asked again (review round 1).
+            TierInstallState::Installed => {
+                self.tier_waits.remove(&from);
+                self.tier_installed.insert(from, (body.position, now));
+            }
+        }
+    }
+
+    /// Expire the waits (spec §6.3) and prune lapsed holds. Returns the
+    /// followers to serve by a session now: unanswered for 2 s, declined, or
+    /// stalled 10 s (a counted timeout). Each is held 30 s — a timeout like a
+    /// decline (RA5) — so its next below-floor NAK goes straight to a session.
+    fn drive_tier_waits(&mut self) -> Vec<SocketAddr> {
+        let now = self.now_ns();
+        self.tier_declined.retain(|_, until| now < *until);
+        let mut expired = Vec::new();
+        let stats = &self.stats;
+        self.tier_waits.retain(|&peer, w| {
+            let gone = if w.declined {
+                true
+            } else if !w.answered {
+                now.saturating_sub(w.sent_ns) >= TIER_INSTALL_ANSWER_NS
+            } else if now.saturating_sub(w.last_progress_ns) >= TIER_INSTALL_STALL_NS {
+                stats.tier_install_timeouts.fetch_add(1, Ordering::Relaxed);
+                true
+            } else {
+                false
+            };
+            if gone {
+                expired.push(peer);
+            }
+            !gone
+        });
+        for &peer in &expired {
+            self.tier_declined
+                .insert(peer, now.saturating_add(TIER_INSTALL_DECLINE_HOLD_NS));
+        }
+        expired
+    }
+
+    /// [`Self::drive_tier_waits`], then a session for each expired follower
+    /// — one at a time, as ever: one the slot cannot take now is left to its
+    /// next NAK, which the hold sends straight to the session path.
+    #[cold]
+    #[inline(never)]
+    fn serve_tier_waits(&mut self) -> bool {
+        let expired = self.drive_tier_waits();
+        for &peer in &expired {
+            self.try_open_snap_session(peer, None);
+        }
+        !expired.is_empty()
     }
 
     // -- M6 Task 6: snapshot session -----------------------------------------
@@ -5225,5 +5532,467 @@ mod tests {
             s.stats().overruns.load(Ordering::Relaxed) > before,
             "still a counted overrun: the NAK went unserved here"
         );
+    }
+
+    // -- Backup-tier 3b spec §6.3: TIER_INSTALL, the leader -----------------
+
+    mod tier_install {
+        use super::*;
+        use uc_protocol::v2::datagram::{
+            DGRAM_KIND_TIER_INSTALL, TierInstallReason, read_tier_install_body,
+        };
+
+        /// A leader whose ring is primed far ahead (so a NAK at 0 is below
+        /// every floor and there is no journal: the Overrun branch), with
+        /// one set at 4096 for a session and a tier-install source that
+        /// names S = commit. `n` followers; the ctrl sender and the role
+        /// flag are handed back.
+        struct Fx {
+            s: Sender,
+            f: Vec<Fake>,
+            tx: mpsc::SyncSender<CtrlMsg>,
+            role: Arc<AtomicBool>,
+            _dir: tempfile::TempDir,
+        }
+
+        fn fx(n: usize) -> Fx {
+            let f: Vec<Fake> = (0..n).map(|_| Fake::new()).collect();
+            let dir = tempfile::tempdir().unwrap();
+            let snap_path = dir.path().join("snap-4096.ultsnap");
+            std::fs::write(&snap_path, t17_snapshot_bytes()).unwrap();
+            let total = T17_SNAP_LEN as u64;
+            let b = buffer();
+            b.counters().prime(4 * b.capacity());
+            b.counters().commit.store_release(4 * b.capacity());
+            let (tx, rx) = mpsc::sync_channel(64);
+            let mut cfg = SenderConfig::new(9);
+            cfg.heartbeat_ns = u64::MAX;
+            let role = always_leader();
+            let mut s = Sender::new(
+                Arc::clone(&b),
+                FaultSocket::bind("127.0.0.1:0").unwrap(),
+                f.iter().map(Fake::addr).collect(),
+                3,
+                rx,
+                cfg,
+                term_handle(9),
+                Arc::clone(&role),
+            );
+            let cluster = cluster_artifact(dir.path(), 4096);
+            s.set_snapshot_source(Arc::new(move |_at| {
+                Some(SnapshotSet {
+                    services_declared: 0b1,
+                    identity: ident(0b1),
+                    version: [0; 8],
+                    artifacts: vec![
+                        SnapArtifact {
+                            service_id: 0,
+                            snapshot_pos: 4096,
+                            path: snap_path.clone(),
+                            len: total,
+                        },
+                        cluster.clone(),
+                    ],
+                })
+            }));
+            s.set_tier_install_source(Arc::new(|floor, commit| {
+                Some(TierInstallBody {
+                    floor,
+                    commit,
+                    s: commit,
+                    row_hash: [0; 8],
+                    row_version: [0; 8],
+                    row_size: [0; 8],
+                    cluster_hash: 7,
+                    cluster_size: 9,
+                })
+            }));
+            Fx {
+                s,
+                f,
+                tx,
+                role,
+                _dir: dir,
+            }
+        }
+
+        /// Virtual time: move the sender's clock base back by `d`.
+        fn advance(s: &mut Sender, d: Duration) {
+            s.base = s.base.checked_sub(d).expect("monotonic clock this old");
+        }
+
+        /// The kinds queued on `f` right now (loopback delivers before
+        /// `send_to` returns, so a short grace suffices).
+        fn kinds(f: &Fake) -> Vec<u8> {
+            let mut out = Vec::new();
+            let mut buf = [0u8; MTU_BOUND + 64];
+            let deadline = Instant::now() + Duration::from_millis(30);
+            while Instant::now() < deadline {
+                if let Some((n, _)) = f.sock.recv_from(&mut buf).unwrap() {
+                    let h = read_datagram_header(&buf[..n]).unwrap();
+                    if h.kind == DGRAM_KIND_TIER_INSTALL {
+                        let b = read_tier_install_body(&buf[DATAGRAM_HEADER_LEN..n])
+                            .expect("a well-formed 200 B TIER_INSTALL body");
+                        assert_eq!(b.s, h.position, "the header names S too");
+                    }
+                    out.push(h.kind);
+                } else {
+                    std::thread::yield_now();
+                }
+            }
+            out
+        }
+
+        fn status(
+            state: TierInstallState,
+            reason: TierInstallReason,
+            copied: u64,
+        ) -> TierInstallStatusBody {
+            TierInstallStatusBody {
+                state,
+                reason,
+                position: 0,
+                copied,
+            }
+        }
+        fn declined() -> TierInstallStatusBody {
+            status(TierInstallState::Declined, TierInstallReason::NoSource, 0)
+        }
+        fn installing(copied: u64) -> TierInstallStatusBody {
+            status(
+                TierInstallState::Installing,
+                TierInstallReason::None,
+                copied,
+            )
+        }
+
+        fn sessions(s: &Sender) -> u64 {
+            s.stats().snap_sessions.load(Ordering::Relaxed)
+        }
+        fn sent(s: &Sender) -> u64 {
+            s.stats().tier_install_sent.load(Ordering::Relaxed)
+        }
+        fn close_session(s: &mut Sender) {
+            let (peer, session) = {
+                let x = s.snap.as_ref().expect("a session is open");
+                (x.peer, x.session)
+            };
+            s.on_snap_done(peer, session);
+        }
+
+        #[test]
+        fn a_below_floor_nak_sends_tier_install_before_any_session() {
+            let mut x = fx(1);
+            let a = x.f[0].addr();
+            x.s.on_nak(a, 0, 96);
+            x.s.do_work();
+            assert_eq!(kinds(&x.f[0]), vec![DGRAM_KIND_TIER_INSTALL]);
+            assert_eq!(sent(&x.s), 1);
+            assert_eq!(sessions(&x.s), 0, "no session while the follower is asked");
+            // A re-NAK while the exchange is outstanding opens nothing and
+            // asks nothing again.
+            x.s.on_nak(a, 0, 96);
+            x.s.do_work();
+            assert!(kinds(&x.f[0]).is_empty());
+            assert_eq!((sent(&x.s), sessions(&x.s)), (1, 0));
+            // Kind 29 from an address this node did not ask is dropped and
+            // counted (crypto off its `from` is unauthenticated).
+            let stranger: SocketAddr = "127.0.0.1:9".parse().unwrap();
+            x.tx.send(CtrlMsg::TierInstallStatus {
+                from: stranger,
+                body: declined(),
+            })
+            .unwrap();
+            x.s.do_work();
+            assert_eq!(
+                x.s.stats()
+                    .tier_install_status_unexpected
+                    .load(Ordering::Relaxed),
+                1
+            );
+            assert_eq!(sessions(&x.s), 0, "a stranger's decline opens nothing");
+            assert!(x.s.tier_waits.contains_key(&a));
+        }
+
+        #[test]
+        fn no_answer_in_two_seconds_opens_the_session() {
+            let mut x = fx(1);
+            let a = x.f[0].addr();
+            x.s.on_nak(a, 0, 96);
+            x.s.do_work();
+            advance(&mut x.s, Duration::from_millis(1900));
+            x.s.do_work();
+            assert_eq!(sessions(&x.s), 0, "1.9 s: still waiting");
+            advance(&mut x.s, Duration::from_millis(200));
+            x.s.do_work();
+            assert_eq!(sessions(&x.s), 1, "2.1 s unanswered: the session serves it");
+            assert!(x.s.snap.as_ref().is_some_and(|s| s.peer == a));
+            assert!(x.s.tier_waits.is_empty());
+            assert_eq!(
+                x.s.stats().tier_install_timeouts.load(Ordering::Relaxed),
+                0,
+                "an unanswered request is not a stalled copy"
+            );
+        }
+
+        #[test]
+        fn a_decline_opens_the_session_at_once_and_is_remembered_for_thirty_seconds() {
+            let mut x = fx(1);
+            let a = x.f[0].addr();
+            x.s.on_nak(a, 0, 96);
+            x.s.do_work();
+            x.tx.send(CtrlMsg::TierInstallStatus {
+                from: a,
+                body: declined(),
+            })
+            .unwrap();
+            x.s.do_work();
+            assert_eq!(
+                sessions(&x.s),
+                1,
+                "a decline opens the session in that pass"
+            );
+            close_session(&mut x.s);
+            kinds(&x.f[0]);
+            // Within the hold: the next below-floor NAK goes straight to a
+            // session, no second TIER_INSTALL.
+            advance(&mut x.s, Duration::from_secs(29));
+            x.s.on_nak(a, 0, 96);
+            x.s.do_work();
+            assert_eq!((sent(&x.s), sessions(&x.s)), (1, 2));
+            assert!(!kinds(&x.f[0]).contains(&DGRAM_KIND_TIER_INSTALL));
+            close_session(&mut x.s);
+            // Past it: asked again.
+            advance(&mut x.s, Duration::from_millis(1100));
+            x.s.on_nak(a, 0, 96);
+            x.s.do_work();
+            assert_eq!((sent(&x.s), sessions(&x.s)), (2, 2));
+            assert!(kinds(&x.f[0]).contains(&DGRAM_KIND_TIER_INSTALL));
+        }
+
+        /// Final review I2: the follower answers `installing{S, 0}` at
+        /// once and decides on its fetch thread; a plan-time decline then
+        /// arrives AFTER the `installing`. It opens the session in that pass
+        /// and enters the 30 s hold exactly as a decline with no
+        /// `installing` before it does.
+        #[test]
+        fn a_decline_after_installing_opens_the_session_and_holds() {
+            let mut x = fx(1);
+            let a = x.f[0].addr();
+            x.s.on_nak(a, 0, 96);
+            x.s.do_work();
+            x.s.on_tier_install_status(a, installing(0));
+            x.s.do_work();
+            assert_eq!(sessions(&x.s), 0, "installing: held");
+            advance(&mut x.s, Duration::from_millis(300));
+            x.tx.send(CtrlMsg::TierInstallStatus {
+                from: a,
+                body: status(TierInstallState::Declined, TierInstallReason::Verify, 0),
+            })
+            .unwrap();
+            x.s.do_work();
+            assert_eq!(sessions(&x.s), 1, "the decline opens the session at once");
+            assert!(x.s.snap.as_ref().is_some_and(|s| s.peer == a));
+            assert!(x.s.tier_waits.is_empty());
+            assert_eq!(
+                x.s.stats().tier_install_timeouts.load(Ordering::Relaxed),
+                0,
+                "a decline is not a timeout"
+            );
+            close_session(&mut x.s);
+            kinds(&x.f[0]);
+            // In the hold: the next below-floor NAK is a session, not a
+            // second TIER_INSTALL.
+            advance(&mut x.s, Duration::from_secs(29));
+            x.s.on_nak(a, 0, 96);
+            x.s.do_work();
+            assert_eq!((sent(&x.s), sessions(&x.s)), (1, 2));
+            assert!(!kinds(&x.f[0]).contains(&DGRAM_KIND_TIER_INSTALL));
+        }
+
+        #[test]
+        fn installing_with_rising_copied_holds_the_session_ten_seconds_past_the_last_rise() {
+            let mut x = fx(1);
+            let a = x.f[0].addr();
+            x.s.on_nak(a, 0, 96);
+            x.s.do_work();
+            x.s.on_tier_install_status(a, installing(0));
+            advance(&mut x.s, Duration::from_secs(9));
+            x.s.on_tier_install_status(a, installing(100));
+            x.s.do_work();
+            advance(&mut x.s, Duration::from_secs(9));
+            // A report that does not rise refreshes nothing.
+            x.s.on_tier_install_status(a, installing(100));
+            x.s.do_work();
+            assert_eq!(sessions(&x.s), 0, "18 s in, 9 s past the last rise: held");
+            advance(&mut x.s, Duration::from_millis(1100));
+            x.s.do_work();
+            assert_eq!(
+                sessions(&x.s),
+                1,
+                "10 s without a rise: the session serves it"
+            );
+            assert_eq!(x.s.stats().tier_install_timeouts.load(Ordering::Relaxed), 1);
+        }
+
+        /// Review rounds 1–2: `installed` is remembered. A below-floor NAK
+        /// within 10 s of it is the adoption still landing — nothing opens,
+        /// nothing is asked; from 10 s to 30 s the adoption is stuck — held
+        /// and served by a session, not asked again; past 30 s, asked again.
+        #[test]
+        fn a_second_below_floor_nak_after_installed_takes_the_session() {
+            let mut x = fx(1);
+            let a = x.f[0].addr();
+            x.s.on_nak(a, 0, 96);
+            x.s.do_work();
+            x.s.on_tier_install_status(
+                a,
+                status(TierInstallState::Installed, TierInstallReason::None, 0),
+            );
+            assert!(x.s.tier_installed.contains_key(&a));
+            let overruns = || x.s.stats().overruns.load(Ordering::Relaxed);
+            let before = overruns();
+            advance(&mut x.s, Duration::from_secs(1));
+            x.s.on_nak(a, 0, 96);
+            x.s.do_work();
+            assert_eq!((sent(&x.s), sessions(&x.s)), (1, 0), "settling: nothing");
+            assert_eq!(
+                x.s.stats().overruns.load(Ordering::Relaxed),
+                before,
+                "not an overrun"
+            );
+            advance(&mut x.s, Duration::from_secs(10));
+            x.s.on_nak(a, 0, 96);
+            x.s.do_work();
+            assert_eq!(
+                (sent(&x.s), sessions(&x.s)),
+                (1, 1),
+                "stuck: session, no re-ask"
+            );
+            assert!(x.s.tier_declined.contains_key(&a), "held like a decline");
+            // Installed at t, the next below-floor NAK at t + 31 s: the
+            // record has lapsed, so the follower is asked again.
+            let mut y = fx(1);
+            let b = y.f[0].addr();
+            y.s.on_nak(b, 0, 96);
+            y.s.do_work();
+            y.s.on_tier_install_status(
+                b,
+                status(TierInstallState::Installed, TierInstallReason::None, 0),
+            );
+            advance(&mut y.s, Duration::from_secs(31));
+            y.s.on_nak(b, 0, 96);
+            y.s.do_work();
+            assert_eq!((sent(&y.s), sessions(&y.s)), (2, 0), "asked again");
+        }
+
+        #[test]
+        fn installed_opens_nothing() {
+            let mut x = fx(1);
+            let a = x.f[0].addr();
+            x.s.on_nak(a, 0, 96);
+            x.s.do_work();
+            x.s.on_tier_install_status(
+                a,
+                status(TierInstallState::Installed, TierInstallReason::None, 0),
+            );
+            x.s.do_work();
+            advance(&mut x.s, Duration::from_secs(11));
+            x.s.do_work();
+            assert_eq!(sessions(&x.s), 0);
+            assert!(x.s.tier_waits.is_empty() && x.s.tier_declined.is_empty());
+            assert_eq!(x.s.stats().tier_install_timeouts.load(Ordering::Relaxed), 0);
+        }
+
+        /// RA5: the exchange is PER PEER — neither another follower's wait
+        /// nor a session serving another follower stops one being asked.
+        #[test]
+        fn two_below_floor_followers_each_get_tier_install() {
+            let mut x = fx(2);
+            let (a, b) = (x.f[0].addr(), x.f[1].addr());
+            x.s.on_nak(a, 0, 96);
+            x.s.on_nak(b, 0, 96);
+            x.s.do_work(); // one NAK per pass
+            x.s.do_work();
+            assert_eq!(kinds(&x.f[0]), vec![DGRAM_KIND_TIER_INSTALL]);
+            assert_eq!(kinds(&x.f[1]), vec![DGRAM_KIND_TIER_INSTALL]);
+            assert_eq!((sent(&x.s), sessions(&x.s)), (2, 0));
+            assert_eq!(x.s.tier_waits.len(), 2);
+            // A declines: its session opens; B's wait is untouched.
+            x.s.on_tier_install_status(a, declined());
+            x.s.do_work();
+            assert_eq!(sessions(&x.s), 1);
+            assert!(x.s.tier_waits.contains_key(&b));
+            // B declines while A's session holds the slot: B is held, and
+            // its next NAK takes the session path (busy: an overrun).
+            x.s.on_tier_install_status(b, declined());
+            x.s.do_work();
+            assert_eq!(sessions(&x.s), 1, "one session at a time");
+            assert!(x.s.tier_declined.contains_key(&b));
+            close_session(&mut x.s);
+            x.s.on_nak(b, 0, 96);
+            x.s.do_work();
+            assert_eq!((sent(&x.s), sessions(&x.s)), (2, 2));
+        }
+
+        /// RA5: a 10 s stall is held like a decline — the same follower's
+        /// next below-floor NAK goes straight to the session path.
+        #[test]
+        fn a_timeout_is_held_like_a_decline() {
+            let mut x = fx(1);
+            let a = x.f[0].addr();
+            x.s.on_nak(a, 0, 96);
+            x.s.do_work();
+            x.s.on_tier_install_status(a, installing(1));
+            advance(&mut x.s, Duration::from_millis(10_100));
+            x.s.do_work();
+            assert_eq!(sessions(&x.s), 1);
+            assert_eq!(x.s.stats().tier_install_timeouts.load(Ordering::Relaxed), 1);
+            close_session(&mut x.s);
+            kinds(&x.f[0]);
+            x.s.on_nak(a, 0, 96);
+            x.s.do_work();
+            assert_eq!((sent(&x.s), sessions(&x.s)), (1, 2));
+            assert!(!kinds(&x.f[0]).contains(&DGRAM_KIND_TIER_INSTALL));
+        }
+
+        /// The wait state is leader state: a demotion drops it, so a late
+        /// answer is unexpected and nothing opens; re-promoted, the
+        /// follower is asked afresh.
+        #[test]
+        fn leadership_loss_drops_the_tier_waits() {
+            let mut x = fx(1);
+            let a = x.f[0].addr();
+            x.s.on_nak(a, 0, 96);
+            x.s.do_work();
+            x.role.store(false, Ordering::Relaxed);
+            x.s.do_work();
+            assert!(x.s.tier_waits.is_empty());
+            x.s.on_tier_install_status(a, declined());
+            assert_eq!(
+                x.s.stats()
+                    .tier_install_status_unexpected
+                    .load(Ordering::Relaxed),
+                1
+            );
+            x.role.store(true, Ordering::Relaxed);
+            x.s.do_work();
+            assert_eq!(sessions(&x.s), 0);
+            x.s.on_nak(a, 0, 96);
+            x.s.do_work();
+            assert_eq!((sent(&x.s), sessions(&x.s)), (2, 0));
+        }
+
+        /// No agreed set in range (the source answers `None`): the exchange
+        /// is skipped and the session opens as before.
+        #[test]
+        fn no_agreed_set_in_range_opens_the_session_as_before() {
+            let mut x = fx(1);
+            let a = x.f[0].addr();
+            x.s.set_tier_install_source(Arc::new(|_, _| None));
+            x.s.on_nak(a, 0, 96);
+            x.s.do_work();
+            assert_eq!((sent(&x.s), sessions(&x.s)), (0, 1));
+        }
     }
 }

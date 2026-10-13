@@ -165,6 +165,7 @@ fn kv_tier() -> (tempfile::TempDir, PathBuf, u64, u64) {
                 quiet_interval: Duration::from_millis(300),
                 ..BackupConfig::default()
             }),
+            tier_source: None,
         },
     )
     .expect("start");
@@ -242,9 +243,10 @@ fn tier_restore_and_fork_refuse_by_name_and_build() {
             "9",
         ],
     );
-    assert_eq!(r.status, 1, "{r:?}");
-    assert!(r.stderr.contains("new_node_unsupported"), "{r:?}");
-    assert!(!out.exists());
+    assert_eq!(r.status, 0, "{r:?}");
+    assert!(r.stdout.contains("restored:"), "{r:?}");
+    assert!(r.stdout.contains("add-learner 9"), "{r:?}");
+    std::fs::remove_dir_all(&out).unwrap();
 
     let at = through.to_string();
     let r = run(

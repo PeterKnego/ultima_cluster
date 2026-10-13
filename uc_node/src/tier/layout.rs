@@ -179,6 +179,8 @@ pub struct SetLabel {
     pub rows: Vec<RowLabel>,
     pub cluster_hash: u64,
     pub cluster_size: u64,
+    /// The cluster's term map strictly below `position`: `(term, base)`.
+    pub lineage: Vec<(u32, u64)>,
 }
 
 impl SetLabel {
@@ -191,6 +193,7 @@ impl SetLabel {
             "position={}\nkind={kind}\ntime_ns={}\n",
             self.position, self.time_ns
         );
+        s.push_str(&format!("lineage={}\n", render_lineage(&self.lineage)));
         let mut rows = self.rows.clone();
         rows.sort_by_key(|r| r.row);
         for r in rows {
@@ -209,6 +212,7 @@ impl SetLabel {
     pub fn parse(text: &str) -> Result<SetLabel, TierError> {
         let (mut position, mut kind, mut time_ns) = (None, None, None);
         let (mut chash, mut csize) = (None, None);
+        let mut lineage: Option<&str> = None;
         // row id -> [hash, version, size]
         let mut rows: std::collections::BTreeMap<u8, [Option<u64>; 3]> = Default::default();
         for (k, v) in pairs("SET", text)? {
@@ -224,6 +228,7 @@ impl SetLabel {
                 "time_ns" => dup(time_ns.replace(num("SET", k, v)?).is_some())?,
                 "cluster.hash" => dup(chash.replace(num("SET", k, v)?).is_some())?,
                 "cluster.size" => dup(csize.replace(num("SET", k, v)?).is_some())?,
+                "lineage" => dup(lineage.replace(v).is_some())?,
                 "kind" => {
                     let kd = match v {
                         "full" => SetKind::Full,
@@ -254,6 +259,11 @@ impl SetLabel {
             }
         }
         let miss = |k: &str| bad("SET", format!("missing key {k:?}"));
+        let position = position.ok_or_else(|| miss("position"))?;
+        let lineage = parse_lineage(
+            lineage.ok_or_else(|| bad("SET", "set_lineage_missing"))?,
+            position,
+        )?;
         let mut out = Vec::new();
         for (row, [h, v, s]) in rows {
             let version = u32::try_from(v.ok_or_else(|| miss(&format!("row.{row}.version")))?)
@@ -266,18 +276,31 @@ impl SetLabel {
             });
         }
         Ok(SetLabel {
-            position: position.ok_or_else(|| miss("position"))?,
+            position,
             kind: kind.ok_or_else(|| miss("kind"))?,
             time_ns: time_ns.ok_or_else(|| miss("time_ns"))?,
             rows: out,
             cluster_hash: chash.ok_or_else(|| miss("cluster.hash"))?,
             cluster_size: csize.ok_or_else(|| miss("cluster.size"))?,
+            lineage,
         })
+    }
+
+    /// Every field equal except `lineage`, which agrees iff the shorter is a
+    /// suffix of the longer (PF1).
+    pub fn agrees_with(&self, other: &SetLabel) -> bool {
+        self.position == other.position
+            && self.kind == other.kind
+            && self.time_ns == other.time_ns
+            && self.rows == other.rows
+            && self.cluster_hash == other.cluster_hash
+            && self.cluster_size == other.cluster_size
+            && lineage_agrees(&self.lineage, &other.lineage)
     }
 
     /// The label of a catalog entry: rows whose verdict is `Agreed`, in row
     /// order; the cluster artifact's hash and size from `e.cluster`.
-    pub fn from_catalog(e: &SetEntry) -> SetLabel {
+    pub fn from_catalog(e: &SetEntry, lineage: Vec<(u32, u64)>) -> SetLabel {
         SetLabel {
             position: e.position,
             kind: e.kind,
@@ -296,8 +319,60 @@ impl SetLabel {
                 .collect(),
             cluster_hash: e.cluster.hash,
             cluster_size: e.cluster.size,
+            lineage,
         }
     }
+}
+
+/// Two lineages agree iff the shorter is a suffix of the longer; an empty
+/// one (never a valid lineage) agrees only with another empty one.
+pub fn lineage_agrees(a: &[(u32, u64)], b: &[(u32, u64)]) -> bool {
+    let (short, long) = if a.len() <= b.len() { (a, b) } else { (b, a) };
+    if short.is_empty() {
+        return long.is_empty();
+    }
+    long.ends_with(short)
+}
+
+/// `t:b,t:b` (decimal).
+pub fn render_lineage(l: &[(u32, u64)]) -> String {
+    l.iter()
+        .map(|(t, b)| format!("{t}:{b}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+pub fn parse_lineage(v: &str, position: u64) -> Result<Vec<(u32, u64)>, TierError> {
+    let mal = |d: String| bad("SET", format!("set_lineage_malformed: {d}"));
+    if v.is_empty() {
+        return Err(mal("empty".into()));
+    }
+    let dec = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    let mut out: Vec<(u32, u64)> = Vec::new();
+    for item in v.split(',') {
+        let (t, b) = item
+            .split_once(':')
+            .filter(|(t, b)| dec(t) && dec(b))
+            .ok_or_else(|| mal(format!("item {item:?} is not term:base")))?;
+        let t: u32 = t.parse().map_err(|_| mal(format!("term in {item:?}")))?;
+        let b: u64 = b.parse().map_err(|_| mal(format!("base in {item:?}")))?;
+        if let Some(&(pt, pb)) = out.last() {
+            if t <= pt {
+                return Err(mal(format!("terms not strictly increasing at {item:?}")));
+            }
+            if b <= pb {
+                return Err(mal(format!("bases not strictly increasing at {item:?}")));
+            }
+        }
+        out.push((t, b));
+    }
+    let last = out.last().map_or(0, |&(_, b)| b);
+    if last >= position {
+        return Err(mal(format!(
+            "last base {last} not below position {position}"
+        )));
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -344,6 +419,7 @@ mod tests {
             }],
             cluster_hash: 2,
             cluster_size: 50,
+            lineage: vec![(1, 0)],
         };
         assert_eq!(SetLabel::parse(&s.render()).unwrap(), s);
     }
@@ -375,6 +451,7 @@ mod tests {
             }],
             cluster_hash: 4,
             cluster_size: 5,
+            lineage: vec![(1, 0)],
         };
         let good = s.render();
         assert_eq!(SetLabel::parse(&good).unwrap(), s);
@@ -418,7 +495,7 @@ mod tests {
         e.rows[1] = row(9, 0xb, 999, RowVerdict::Unreported);
         e.rows[2] = row(3, 0xc, 300, RowVerdict::Agreed);
         e.cluster = row(0, 0xd, 50, RowVerdict::Agreed);
-        let l = SetLabel::from_catalog(&e);
+        let l = SetLabel::from_catalog(&e, vec![(1, 0)]);
         assert_eq!(
             l.rows,
             vec![
@@ -438,5 +515,83 @@ mod tests {
         );
         assert_eq!((l.position, l.kind, l.time_ns), (4096, SetKind::Full, 7));
         assert_eq!((l.cluster_hash, l.cluster_size), (0xd, 50));
+    }
+
+    fn sample_label() -> SetLabel {
+        SetLabel {
+            position: 100_000,
+            kind: SetKind::Full,
+            time_ns: 5,
+            rows: vec![
+                RowLabel {
+                    row: 0,
+                    hash: 1,
+                    version: 1,
+                    size: 10,
+                },
+                RowLabel {
+                    row: 1,
+                    hash: 2,
+                    version: 2,
+                    size: 20,
+                },
+            ],
+            cluster_hash: 3,
+            cluster_size: 30,
+            lineage: vec![(1, 0)],
+        }
+    }
+
+    #[test]
+    fn set_renders_and_parses_its_lineage() {
+        let mut l = sample_label();
+        l.lineage = vec![(1, 0), (3, 4096), (4, 90_112)];
+        l.position = 100_000;
+        let text = l.render();
+        assert!(text.contains("\nlineage=1:0,3:4096,4:90112\n"));
+        assert_eq!(SetLabel::parse(&text).unwrap(), l);
+    }
+
+    #[test]
+    fn a_set_without_lineage_is_refused_by_name() {
+        let text = sample_label()
+            .render()
+            .lines()
+            .filter(|l| !l.starts_with("lineage="))
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        let e = SetLabel::parse(&text).unwrap_err().to_string();
+        assert!(e.contains("set_lineage_missing"), "{e}");
+    }
+
+    #[test]
+    fn parse_refuses_a_lineage_at_or_above_the_position_or_out_of_order() {
+        for (bad, why) in [
+            ("lineage=1:0,2:200000", "above position"),
+            ("lineage=1:0,2:100000", "at position - RA1: strictly below"),
+            ("lineage=2:0,1:4096", "terms not increasing"),
+            ("lineage=1:4096,2:0", "bases not increasing"),
+            ("lineage=", "empty"),
+            ("lineage=1-0", "shape"),
+            ("lineage=1:0x10", "hex is not decimal"),
+        ] {
+            let mut l = sample_label();
+            l.position = 100_000;
+            l.lineage = vec![(1, 0)];
+            let text = l.render().replace("lineage=1:0", bad);
+            let e = SetLabel::parse(&text).unwrap_err().to_string();
+            assert!(e.contains("set_lineage_malformed"), "{why}: {e}");
+        }
+    }
+
+    #[test]
+    fn lineage_agreement_is_suffix_agreement() {
+        let full = [(1u32, 0u64), (2, 10), (3, 20)];
+        assert!(lineage_agrees(&full, &full[1..]));
+        assert!(lineage_agrees(&full[1..], &full));
+        assert!(!lineage_agrees(&full, &[(1, 0), (3, 20)]));
+        assert!(!lineage_agrees(&full, &[(2, 11), (3, 20)]));
+        assert!(!lineage_agrees(&full, &[]));
     }
 }

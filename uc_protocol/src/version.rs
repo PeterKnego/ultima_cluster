@@ -96,6 +96,8 @@ impl ProtocolVersion {
 // + backup tier 3a: `CLUSTER` kind 7 `BackupWatermark`, pairwise datagram 27
 // `BACKUP_REPORT`, Settings v5, cluster image v6 — a 0.10.0 peer drops kind 27
 // and refuses kind 7 as undecodable; same flag day.
+// + backup tier 3b: pairwise 28 `TIER_INSTALL` / 29 `TIER_INSTALL_STATUS`,
+// Settings v6, `SET` lineage — a 0.10.0 peer drops both kinds; same flag day.
 pub const CURRENT: ProtocolVersion = ProtocolVersion::new(0, 11, 0);
 pub const MIN_COMPATIBLE: ProtocolVersion = ProtocolVersion::new(0, 1, 0);
 

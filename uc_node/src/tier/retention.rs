@@ -254,15 +254,26 @@ pub fn run_pass(
     inner: &ClusterViewInner,
     consumed: u64,
     incomplete_max_age: std::time::Duration,
+    verified: Option<&BTreeSet<u64>>,
     done: &mut Deleted,
 ) -> Result<bool, TierError> {
     let l = super::chain::list_tier(t)?;
     if !view_caught_up(consumed, &l.sets) {
         return Ok(false);
     }
-    let positions: Vec<u64> = l.sets.iter().map(|s| s.position).collect();
+    // `verified`: only sets the writer confirmed or re-read count (PF2 as
+    // amended); `None` = every listed set (offline callers, tests).
+    let positions: Vec<u64> = l
+        .sets
+        .iter()
+        .map(|s| s.position)
+        .filter(|q| verified.is_none_or(|v| v.contains(q)))
+        .collect();
     let prot = protection(inner, &positions);
-    let (sets, chunks) = plan(&l.sets, &l.chunks, p, &prot);
+    let (sets, chunks) = match verified {
+        None => plan(&l.sets, &l.chunks, p, &prot),
+        Some(v) => plan_verified(&l.sets, &l.chunks, v, p, &prot),
+    };
     let oldest_kept = positions
         .iter()
         .copied()
@@ -283,6 +294,36 @@ pub fn run_pass(
     }
     apply_counted(t, &[], &chunks, done)?;
     Ok(true)
+}
+
+/// [`plan`] over only the VERIFIED sets (`verified` positions): the keep
+/// window, "newest" and the age base are computed among verified sets, so an
+/// unverified set is never the reason a verified one is deleted, and is
+/// itself never a candidate (it is the operator's, named by `tier verify`).
+/// Chunks are kept below the oldest set that stays, verified or not.
+pub fn plan_verified(
+    sets: &[SetLabel],
+    chunks: &[(u64, u64)],
+    verified: &BTreeSet<u64>,
+    p: &RetentionPolicy,
+    prot: &Protection,
+) -> (Vec<u64>, Vec<(u64, u64)>) {
+    if p.keeps_all() {
+        return (Vec::new(), Vec::new());
+    }
+    let counted: Vec<SetLabel> = sets
+        .iter()
+        .filter(|s| verified.contains(&s.position))
+        .cloned()
+        .collect();
+    let del = deletable_sets(&counted, p, prot);
+    let oldest_kept = sets
+        .iter()
+        .map(|s| s.position)
+        .filter(|q| !del.contains(q))
+        .min();
+    let chunks = oldest_kept.map_or_else(Vec::new, |o| deletable_chunks(chunks, o, prot));
+    (del, chunks)
 }
 
 /// One retention pass's decision over a listing: the sets and chunks to
@@ -326,6 +367,7 @@ mod tests {
             rows: Vec::new(),
             cluster_hash: 1,
             cluster_size: 1,
+            lineage: vec![(1, 0)],
         }
     }
 
@@ -764,7 +806,7 @@ mod tests {
         let inner = ClusterView::new(&ClusterState::genesis_empty()).snapshot_inner();
         let mut done = Deleted::default();
         // keep-everything still clears residue
-        assert!(run_pass(&t, &pol(0, 0), &inner, u64::MAX, hour, &mut done).unwrap());
+        assert!(run_pass(&t, &pol(0, 0), &inner, u64::MAX, hour, None, &mut done).unwrap());
         assert_eq!(done.incomplete, 1);
         assert_eq!((done.sets, done.chunks), (0, 0));
         assert!(
@@ -793,9 +835,9 @@ mod tests {
         let inner = ClusterView::new(&ClusterState::genesis_empty()).snapshot_inner();
         let mut done = Deleted::default();
         let hour = std::time::Duration::from_secs(3600);
-        assert!(!run_pass(&t, &pol(1, 0), &inner, 199, hour, &mut done).unwrap());
+        assert!(!run_pass(&t, &pol(1, 0), &inner, 199, hour, None, &mut done).unwrap());
         assert!(!done.any());
-        assert!(run_pass(&t, &pol(1, 0), &inner, 200, hour, &mut done).unwrap());
+        assert!(run_pass(&t, &pol(1, 0), &inner, 200, hour, None, &mut done).unwrap());
         assert_eq!(done.sets, 1);
         assert!(!dir.path().join(set_dir(100)).exists());
     }
@@ -830,5 +872,23 @@ mod tests {
         let l = crate::tier::chain::list_tier(&t).unwrap();
         assert_eq!(l.sets.iter().map(|s| s.position).collect::<Vec<_>>(), [200]);
         assert!(l.incomplete_sets.is_empty());
+    }
+
+    /// Round 1, finding 2: with `keep_sets = 1` the newest set is the newest
+    /// VERIFIED one; an unverified set above it is untouched and never the
+    /// reason the verified one below is deleted.
+    #[test]
+    fn retention_counts_only_verified_sets() {
+        let sets = [label(100, 0), label(200, 0), label(300, 0)];
+        let verified: BTreeSet<u64> = [100, 200].into();
+        let (del, _) = plan_verified(&sets, &[], &verified, &pol(1, 0), &Protection::default());
+        assert_eq!(
+            del,
+            vec![100],
+            "200 is the newest verified; 300 is untouched"
+        );
+        // The unverified-newest case the raw rule got wrong:
+        let (raw, _) = plan(&sets, &[], &pol(1, 0), &Protection::default());
+        assert_eq!(raw, vec![100, 200]);
     }
 }

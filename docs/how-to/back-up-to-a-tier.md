@@ -122,6 +122,12 @@ Retention runs on the writer, and only once its view of the cluster has
 caught up. Deleting is idempotent: any writer may do it. The set's marker
 file is removed first, so a reader never sees a half-deleted set as whole.
 
+Retention counts only **verified** sets. The writer decides which set is the
+newest, and the keep window (count and age), over the sets it has verified:
+read back clean, or confirmed by the committed watermark. An unverified newest
+set is neither the reason an older verified set is deleted nor deleted itself.
+It is yours to deal with, and `uc2ctl tier verify` names it.
+
 ## 4. Read the tier
 
 `uc2ctl tier show` reads the tier's files directly. It needs no running
@@ -158,19 +164,25 @@ other series carry the labels shown, or none.
 | `uc2_backup_oldest_set` | The oldest restorable set. |
 | `uc2_backup_lag_bytes` | Committed log the tier does not hold yet. Leader only. |
 | `uc2_backup_bytes_written_total{kind}` | Stored bytes this writer wrote, `set` or `journal`. |
-| `uc2_backup_errors_total{reason}` | `foreign`, `unavailable`, `overlap_mismatch`, `hash_mismatch`, `journal_unavailable`, `fenced`, `no_hardlinks`. |
+| `uc2_backup_errors_total{reason}` | `foreign`, `unavailable`, `overlap_mismatch`, `hash_mismatch`, `journal_unavailable`, `fenced`, `no_hardlinks`, `readback`. |
 | `uc2_backup_writer_stopped` | `1` while this node's writer has stopped for good; `0` otherwise and on a node with no writer. |
 | `uc2_backup_hold_released` | `1` while low disk has this node's purge hold released. |
 | `uc2_backup_chain_gaps_total` | Times the tier's chain restarted from a later set. |
 | `uc2_backup_hold_released_total` | Times the writer let go of its purge hold for lack of disk. |
 | `uc2_backup_retention_deleted_total` | Objects this writer deleted from the tier, by `kind` (`set` or `chunk`). |
+| `uc2_purge_gate_position` | The position every node's purge is held at or below when `purge_requires_tiers` is on (header only while it is `0`). |
+| `uc2_backup_gate_released`, `uc2_backup_gate_released_total` | The level / count of low-disk releases of that gate. |
+| `uc2_snapshot_fetch_total{source}` | Store-only fetches by where they came from, `tier` or `peer`. |
+| `uc2_tier_install_total{outcome}` | Below-floor installs from the tier: `installed`, `declined` or `timeout`. |
 
-Four alerts ship in `packaging/prometheus/uc2-alerts.yml`:
+Five alerts ship in `packaging/prometheus/uc2-alerts.yml`:
 
 - `Uc2BackupBehind`: the tier is over 256 MiB of committed log behind for 15
   minutes. An idle cluster does not trip it.
 - `Uc2BackupHoldReleased`: a writer node ran low on disk and let its tier
   fall behind its purge. The tier will have a gap.
+- `Uc2BackupGateReleased`: a node let go of the backup-gated purge for lack
+  of disk and purged past the tier.
 - `Uc2BackupWriterError`: the writer counted an error. `foreign`,
   `overlap_mismatch`, `fenced` and `no_hardlinks` stop the writer for good.
   This rule looks at the last 10 minutes only, so it goes quiet while the
@@ -266,6 +278,36 @@ covers). Restoring several nodes at the same Q writes one fence. A restore at
 the reach writes none, because the history continues unchanged; a fork never
 writes one.
 
+### Replace a node from the tier
+
+A node that is lost for good can be rebuilt from the tier and joined to the
+live cluster, with no copy of the log from a peer.
+
+```bash
+uc2ctl tier restore --target /mnt/uc-backup --new-node --node-id N \
+    --instance-dir /srv/uc2/nN
+```
+
+Start the node, then add it the usual way:
+
+```bash
+uc2ctl add-learner N ...
+uc2ctl promote N ...        # if it should vote
+```
+
+`--new-node` refuses an id that is in the membership the node would boot with
+(`restore_id_reused`): use a fresh id, or remove the old member first. The
+restored node keeps its log up to Q, which it holds from the set S the
+restore started at, and replication continues from there. It works because
+every set in the tier records the cluster's term history below it (its
+*lineage*), and restore writes that into the node's term map; see
+[the tier as a holder](../notes/uc2-backup-tier-explained.md#the-tier-as-a-holder).
+A set backed up by a pre-3b writer has no lineage and is refused
+(`set_lineage_missing`).
+
+A node with a `[tier_source]` that is added empty needs no restore at all:
+see [The tier as a source](#the-tier-as-a-source).
+
 ### Fork
 
 A fork starts a **separate** cluster from the tier as of Q. Use it to
@@ -315,7 +357,8 @@ set is the way. See
 Purge is off by default. Where it is on, the writer's node will not purge
 journal the tier does not yet hold. Three consequences:
 
-- Another node's purge is unaffected; only the writer's node holds.
+- Another node's purge is unaffected by default; only the writer's node holds
+  (see [Backup-gated purge](#backup-gated-purge) to make every node hold).
 - If the writer's disk runs low, it lets go of the hold and purges anyway
   (`Uc2BackupHoldReleased`). The tier then has a gap and restores to points
   inside it are no longer possible.
@@ -323,17 +366,135 @@ journal the tier does not yet hold. Three consequences:
   filesystem without hard links) releases its hold at once. Fix the cause
   and restart the node.
 
+### Backup-gated purge
+
+By default only the writer's node holds its purge at the tier. To make
+**every** node hold, set the replicated setting `purge_requires_tiers` to K
+(1 to 4; `0`, the default, is off):
+
+```toml
+# settings.toml
+purge_requires_tiers = 1
+```
+
+```bash
+uc2ctl settings apply settings.toml ...
+uc2ctl settings show ...
+```
+
+With K on, every node keeps its purge floor at or below the K-th highest
+confirmed `through` among the tiers registered in the cluster (`uc2ctl tier
+show --instance-dir` marks the K entries that count). Fewer than K tiers
+registered means no gate position, and **no purge beyond the other holds**:
+raising K above the registered count stops purge cleanly and it resumes when
+a tier registers. The gate only holds purge back. It never causes one, and
+purge still needs `[purge]` on.
+
+**Read this before turning it on.** With the gate on, history older than a
+node's newest agreed set lives **only in the tier**. The tier's retention
+(`backup_retain_sets`, `backup_retain_age`) therefore decides how far back a
+restore can go: what the tier prunes is gone from the cluster altogether.
+
+Two behaviours to expect:
+
+- **The read-back.** The writer reads back every object it creates, right
+  after writing it, and an object counts only when it reads back clean. An
+  object it finds already in place is re-read only if it lies above the
+  committed `through` (chunks) or `newest_set` (sets), so a restarted writer
+  does not re-read the tier's history. A failure leaves the report where it
+  was, counts `uc2_backup_errors_total{reason="readback"}`, logs
+  `backup_readback_failed` naming the object, and fires
+  `Uc2BackupWriterError`. The writer retries at its next pass. A persistently
+  bad object is yours: `uc2ctl tier verify` names it.
+- **The low-space release.** A node whose free space falls below one
+  `chunk_bytes` (64 MiB on a node that is not a writer) stops applying the
+  gate, purges as its other holds allow, and logs `backup_gate_released` once
+  per episode (`backup_gate_rearmed` when it comes back). `Uc2BackupGateReleased`
+  fires. The tier then has a gap, as it does for a writer's release.
+
+- **Until the node has joined.** A node with `[purge]` on purges nothing at
+  all until it has joined its cluster (leader known, commit learned, its
+  cluster-FSM walk caught up to commit — the same point at which a service
+  may attach), whatever K reads. Until then its view of K and of the tiers
+  may still be the snapshot it booted from, which can miss a K raise or a
+  `tier forget` committed since. The gauge reads `0` meanwhile.
+
+`uc2_purge_gate_position` shows the gate each node computes (it is exported
+with K = 0 too, header only).
+
+## The tier as a source
+
+A node can read sets from the tier instead of asking a peer, which keeps a
+large copy off the nodes that are serving.
+
+```toml
+[tier_source]
+target = "/mnt/uc-backup"
+```
+
+The section is node-local and read-only. A node with `[backup]` already reads
+its own `target` this way and needs no `[tier_source]`. At boot the node opens
+`TIER`; an **explicit** `[tier_source]` whose `app_id` is another cluster's
+refuses to start (`tier_source_foreign`). A source implied from `[backup]`
+that is foreign does not refuse: it logs `tier_source_unavailable` and is not
+used, and the writer's own `backup_target_foreign` stop applies as before.
+An unreachable tier is the same: the node starts and falls back to peers.
+
+What the node takes from it:
+
+- **A store-only fetch** (auto-fetch, `uc2ctl snapshot fetch`) tries the tier
+  first, then peers, even when no peer holds the set. After a `verify` failure
+  auto-fetch skips the tier for that position; `uc2ctl snapshot fetch` still
+  tries it. The set must be one the tier's registered entry covers
+  (never beyond its `through`). Each artifact is copied to a temp name
+  (`incoming-<P>.tier.part`), renamed into place and checked against the
+  cluster's agreed hash and version, so the cluster's catalog, not the tier,
+  is the authority. Any failure removes the copy and falls back to a peer,
+  logging `tier_fetch_declined{position, reason}`. `uc2_snapshot_fetch_total{source}`
+  counts tier and peer fetches.
+- **A below-floor install.** When a follower's NAK falls below the leader's
+  purge floor the leader asks its tier first (`TIER_INSTALL`) instead of
+  opening a snapshot session. The leader names the set and carries its
+  catalog verdict. A follower with a source answers `installing` at once and
+  does all its tier reads on a fetch thread, never on the consensus agent:
+  it reads the set, checks it and its lineage (against the leader's term map
+  and its own term), copies, verifies, installs and adopts the set's lineage,
+  then answers `installed`; a check that fails is a `declined` after the
+  `installing`. A follower with no source answers `declined` at once. An
+  install needs no committed registration of the follower's tier, only that
+  the tier belongs to this cluster. Events: `tier_install_started`,
+  `tier_install_done`, `tier_install_declined{reason}`. A request from an
+  address that is not this node's leader is dropped and logged
+  `tier_install_ignored`; a node already at or past S simply answers
+  `installed`.
+  `uc2_tier_install_total{outcome}` counts them.
+
+Timings, per peer: the leader falls back to a snapshot session if the follower
+does not answer in **2 s** or shows no progress for **10 s**. A decline or a
+timeout holds the peer off the tier for **30 s**. After `installed`, a **10 s
+settling grace** applies: a below-floor NAK from that peer opens nothing
+while its next report arrives; after 10 s it is treated like a decline (a
+session), and after 30 s it is asked again.
+
+A new learner with a mounted source therefore catches up from the tier on its
+first below-floor NAK and the leader ships it nothing large. A tier set the
+writer could not yet place logs `tier_set_deferred` after ten deferrals.
+
+### `auto_fetch = false` with a source on every voter
+
+`auto_fetch = false` is a supported configuration when every voter has a tier
+source: voters stop copying the learner-built (standby) sets, which can be
+large, and a voter restarted below the floor catches up through the tier
+install above. Without a source on a voter, `auto_fetch = false` leaves that
+voter on the peer session, as before.
+
 ## What the tier does not do yet
 
-- **Nodes never delete anything because of the tier.** Local snapshot and
-  journal retention are exactly as before. Nothing is purged sooner because
-  the tier has a copy.
-- **No tier-seeded new node.** `uc2ctl tier restore --new-node` is refused
-  (`new_node_unsupported`). A replacement node joins from its peers, with a
-  fresh, empty instance directory, the usual way. Seeding a node from the
-  tier is planned work.
-- **Nodes do not fetch from the tier.** A node that falls behind still
-  catches up from peers.
+- **Local snapshot retention ignores the tier.** Sets are kept per
+  `retain_sets` as before. Journal purge follows the tier only when
+  `purge_requires_tiers` is on.
+- **The tier is not a live log.** A node reads sets from it, never its
+  journal; the log above a peer's purge floor always comes from peers.
 - **Offline commands only.** `show`, `verify` and the restores read files.
   Only `tier forget` talks to a node (leader only).
 

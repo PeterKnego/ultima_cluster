@@ -1397,6 +1397,107 @@ impl<SM: SnapshotStateMachine + Default, SM1: SnapshotStateMachine + StateMachin
         }
     }
 
+    /// Backup-tier T15: add the spare as a LEARNER at runtime, started with
+    /// `[tier_source]` = `tier_source` (ONLY this node gets one; the base
+    /// nodes keep `None`). Same order as the spare cycle's `Idle` step —
+    /// node up, `AddLearner` accepted, THEN the service — retried on a
+    /// transient refusal (a fresh id each time: the tombstone rule). Leaves
+    /// the cycle in `Added` so [`stop`](Self::stop) tears the spare down.
+    /// Returns the learner's id. Requires `ClusterCfg::spare_node`.
+    pub fn add_learner_from_tier(&mut self, tier_source: PathBuf, secs: u64) -> NodeId {
+        assert_eq!(self.spare_phase, SparePhase::Idle, "spare already in use");
+        let spare_addr = self
+            .spare_addr
+            .expect("add_learner_from_tier requires ClusterCfg::spare_node");
+        let spare_root = self.spare_root.clone().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(secs);
+        loop {
+            let li = self.leader().unwrap_or_else(|| {
+                assert!(Instant::now() < deadline, "no leader to add a learner");
+                usize::MAX
+            });
+            if li == usize::MAX {
+                std::thread::sleep(Duration::from_millis(20));
+                continue;
+            }
+            let leader_cnc = Self::open_cnc(&self.nodes[li].instance_dir);
+            if leader_cnc.config_pending() != 0 {
+                assert!(Instant::now() < deadline, "config change stayed pending");
+                std::thread::sleep(Duration::from_millis(20));
+                continue;
+            }
+            let id = self.next_spare_id;
+            self.next_spare_id += 1;
+            let dir = spare_root.join(format!("id{id}"));
+            std::fs::create_dir_all(&dir).expect("spare instance dir");
+            let cfg = make_config::<SM>(
+                id,
+                self.members.clone(),
+                self.learner_members.clone(),
+                dir.clone(),
+                spare_addr,
+                self.faults,
+                self.ccfg,
+                self.crypto_config_for(id),
+            );
+            let node = Node::start_with(
+                cfg,
+                uc_node::StartOpts {
+                    socket: Some(rebind(spare_addr)),
+                    tier_source: Some(tier_source.clone()),
+                    ..Default::default()
+                },
+            )
+            .expect("spare node start");
+            let (ip, port) = Self::addr_to_wire(spare_addr);
+            let resp = Self::admin_request(&leader_cnc, 1 /* AddLearner */, id, ip, port, 10);
+            if resp.status == 0 {
+                let mut slot = NodeSlot {
+                    id,
+                    addr: spare_addr,
+                    instance_dir: dir.clone(),
+                    node: Some(node),
+                    service: None,
+                    service1: None,
+                    service_timer: None,
+                };
+                slot.service = Some(spawn_service(&dir));
+                slot.service1 = spawn_service1::<SM1>(&dir, self.ccfg);
+                slot.service_timer = spawn_service_timer_opt(&dir, self.ccfg);
+                self.spare = Some(slot);
+                self.spare_phase = SparePhase::Added;
+                self.config_ops_accepted += 1;
+                return id;
+            }
+            node.stop();
+            assert!(
+                Instant::now() < deadline,
+                "AddLearner never accepted: {resp:?}"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// Final review I5: the spare's instance dir, while it is added.
+    pub fn spare_dir(&self) -> Option<PathBuf> {
+        self.spare.as_ref().map(|s| s.instance_dir.clone())
+    }
+
+    /// Backup-tier T15: the spare's live node, if there is one.
+    pub fn spare_node(&self) -> Option<&Node> {
+        self.spare.as_ref().and_then(|s| s.node.as_ref())
+    }
+
+    /// Backup-tier T15: the least `archive_first_base` over the live BASE
+    /// voters `0..n` (`0` when none is up) — `> S` proves every voter purged.
+    pub fn min_voter_archive_first_base(&self, n: usize) -> u64 {
+        self.nodes[..n]
+            .iter()
+            .map(|s| s.node.as_ref().map_or(0, |n| n.archive_first_base()))
+            .min()
+            .unwrap_or(0)
+    }
+
     /// M7 Task 10: drive the spare's cycle one step at a time —
     /// add-learner -> promote -> demote -> remove-learner — allocating a
     /// FRESH id (monotonic from 100) at the start of every cycle (the

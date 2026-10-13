@@ -102,6 +102,14 @@ pub struct ObsSources {
     /// Backup-tier spec §5.4: how often low space released this node's backup
     /// purge hold (`uc2_backup_hold_released_total`), once per episode.
     pub backup_hold_released: Arc<AtomicU64>,
+    /// Backup-tier 3b spec §5.2: the journal-purge gate position
+    /// (`uc2_purge_gate_position`; `u64::MAX` = K is 0, header-only), the
+    /// low-space gate release count (`uc2_backup_gate_released_total`) and
+    /// its level (`uc2_backup_gate_released`) — the SAME `Arc`s the
+    /// consensus agent writes.
+    pub purge_gate: Arc<AtomicU64>,
+    pub backup_gate_released: Arc<AtomicU64>,
+    pub backup_gate_released_level: Arc<AtomicBool>,
     /// Backup-tier spec §6.4: the `uc2-backup` writer's shared stats — the
     /// SAME allocation the writer thread bumps. `None` on a node with no
     /// `[backup]` writer; its writer-side series then render `0` (the
@@ -161,6 +169,13 @@ pub struct ObsSources {
     /// Snapshot-lifecycle spec §6: `uc2_snapshot_auto_fetch_total{outcome}`,
     /// the SAME allocation the consensus agent bumps.
     pub snapshot_auto_fetch: Arc<crate::auto_fetch::AutoFetchStats>,
+    /// Backup-tier 3b spec §6.6: `uc2_snapshot_fetch_total{source}`, the
+    /// SAME allocation the consensus agent bumps.
+    pub snapshot_fetch_source: Arc<crate::tier::source::FetchSourceStats>,
+    /// Backup-tier 3b spec §6.6: `uc2_tier_install_total{outcome}`'s
+    /// follower half (`installed`, `declined`), the SAME allocation the
+    /// consensus agent bumps.
+    pub tier_install: Arc<crate::tier::source::TierInstallStats>,
     /// The `uc2-holdings` probe's cached reading — the free-bytes figure the
     /// auto-fetch space check uses. `uc2_snapshot_wont_fit` is computed from
     /// it with that check's own formula (plan ruling PF11: one sampler).
@@ -250,6 +265,9 @@ impl ObsSources {
             backup_reports_unsent: Arc::new(AtomicU64::new(0)),
             backup_reports_appended: Arc::new(AtomicU64::new(0)),
             backup_hold_released: Arc::new(AtomicU64::new(0)),
+            purge_gate: Arc::new(AtomicU64::new(u64::MAX)),
+            backup_gate_released: Arc::new(AtomicU64::new(0)),
+            backup_gate_released_level: Arc::new(AtomicBool::new(false)),
             backup_writer: None,
             cluster_view: Arc::new(crate::cluster_fsm::ClusterView::new(
                 &crate::cluster_fsm::ClusterState::genesis_empty(),
@@ -265,6 +283,8 @@ impl ObsSources {
             snapshot_row_incomplete: std::array::from_fn(|_| Arc::new(AtomicU64::new(0))),
             snapshot_fetched_position: Arc::new(AtomicU64::new(0)),
             snapshot_auto_fetch: Arc::new(Default::default()),
+            snapshot_fetch_source: Arc::new(Default::default()),
+            tier_install: Arc::new(Default::default()),
             snapshot_holdings: Arc::new(std::sync::Mutex::new(Default::default())),
             snapshot_freeze: Arc::new(SnapshotFreezeStats::default()),
             crypto_enabled: false,

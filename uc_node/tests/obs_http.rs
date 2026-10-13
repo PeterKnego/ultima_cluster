@@ -97,6 +97,9 @@ fn synthetic_server() -> (ObsServer, ObsSources) {
         backup_reports_unsent: Arc::new(AtomicU64::new(0)),
         backup_reports_appended: Arc::new(AtomicU64::new(0)),
         backup_hold_released: Arc::new(AtomicU64::new(0)),
+        purge_gate: Arc::new(AtomicU64::new(u64::MAX)),
+        backup_gate_released: Arc::new(AtomicU64::new(0)),
+        backup_gate_released_level: Arc::new(AtomicBool::new(false)),
         backup_writer: None,
         cluster_view: Arc::new(uc_node::ClusterView::new(
             &uc_node::ClusterState::genesis_empty(),
@@ -112,6 +115,8 @@ fn synthetic_server() -> (ObsServer, ObsSources) {
         snapshot_row_incomplete: std::array::from_fn(|_| Arc::new(AtomicU64::new(0))),
         snapshot_fetched_position: Arc::new(AtomicU64::new(0)),
         snapshot_auto_fetch: Arc::new(Default::default()),
+        snapshot_fetch_source: Arc::new(Default::default()),
+        tier_install: Arc::new(Default::default()),
         snapshot_holdings: Arc::new(std::sync::Mutex::new(Default::default())),
         snapshot_freeze: Arc::new(uc_node::obs::SnapshotFreezeStats::default()),
         crypto_enabled: false,

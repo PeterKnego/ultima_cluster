@@ -139,6 +139,12 @@ of a set. The writer used to write `SET` over files retention had just removed.
 Now it re-lists the set's directory and confirms each file is present, at the
 right size, immediately before it writes `SET`.
 
+**Count only what was checked.** Retention decides which set is the newest,
+and the keep window by count and age, over the sets the writer has verified:
+read back, or confirmed by the committed watermark. An unverified newest set
+never causes an older verified set to be deleted, and is never deleted itself.
+It is the operator's, and `tier verify` names it.
+
 **Do not trust a lagging view.** Retention protects the rollback point of an
 unfinished upgrade pin. A node whose view had not yet seen the pin would not
 protect it. So retention runs only once the writer's view has consumed past the
@@ -152,7 +158,70 @@ replicated either. Two writers on one tier would fail the overlap check over
 bytes that mean nothing. So padding bodies and alignment slack are both
 zeroed.
 
-**Say what is not done.** A replacement node seeded from the tier looks easy
-and is not. Its lineage would start at the set, and a live leader cannot find
-a common point with it. Joining from peers already works for a replacement
-node, so this ships later, on its own design.
+**Say what is not done.** 3a shipped without a tier-seeded replacement node
+because its lineage would start at the set, and a live leader cannot find a
+common point with that. 3b fixes it by recording the lineage; see below.
+
+## The tier as a holder
+
+3a made the tier a copy that a person restores from. 3b lets the cluster lean
+on it: a node can be built from it and join, purge can wait for it, and a node
+can read from it instead of asking a peer.
+
+**Why a node needs the lineage.** A node's term map says which term wrote
+which stretch of the log. The node itself does not need it to run. The
+*leader* needs it: when a follower reconnects, the leader compares the two
+maps to find the last point they agree on (log matching), and truncates the
+follower back to it. The map is a receipt the leader checks, not state the
+node uses. A node restored at a set S used to have a map that began at S. The
+leader's map began at 0. They share no entry, the leader finds no point of
+agreement, and the node was cut to nothing. So each `SET` now records the
+writer's map below S (its `lineage`, entries with `base < S`), and restore
+starts the node's map from it. The two maps agree on every term below S, and
+the node keeps its log.
+
+**Why the leader carries the verdict.** A new learner has an empty catalog: it
+has never seen the cluster's agreed hashes, so it cannot tell a good tier set
+from a bad one. When the leader asks a below-floor follower to install from
+its tier, it names the set and sends what it knows about it: each artifact's
+agreed hash, version and size. The follower checks every copied object against
+that. The leader's committed catalog is the authority, as it is for a snapshot
+session; the tier is shared storage and is trusted for bytes, not for what
+they should be. For the same reason an install asks nothing of the tier's
+committed registration: the verdict is the proof.
+
+**The gate.** Purge deletes the only local copy of the log below a node's
+floor. With `purge_requires_tiers = K`, every node holds its floor at or below
+the K-th highest `through` the cluster has confirmed among its tiers. The gate
+is one more hold: the journal purge target is the minimum over the floor minus
+slack, the writer's own hold and the gate. A node that has just booted holds
+everything until it has joined its cluster, because until its cluster-FSM walk
+reaches commit it may not yet see a K raise or a `tier forget`. For that
+to be safe the confirmation has to mean something, so the writer reads back
+each object it creates before it counts. The price is that older history then
+lives only in the tier, and its retention sets how far back a restore goes. A
+node about to run out of disk lets the gate go, because a stopped node is a
+worse loss than a gap in the tier, and an alert says so.
+
+**The source.** A node with a `[tier_source]` (or a `[backup]`, which implies
+one) tries the tier before peers, both for a store-only fetch and when it falls
+below the leader's floor. That keeps a large copy off the nodes that are
+serving. A failure never blocks: the node falls back to a peer at once. An
+install that succeeded gets a short settling grace. The follower's next report
+still shows the old position for a moment, and without the grace the leader
+would read that as a failure and open a snapshot session for a node that had
+already installed.
+
+**One thing to know about the lineage an install adopts.** It is the tier
+set's own line. The rows and the cluster artifact are hash-verified against
+the leader's verdict, but the term-map line is parsed and range-checked, not
+covered by a hash. So before it copies anything, the follower checks the line
+against what it already knows: every term that also appears in the leader's
+last term map must start at the same position there, and the line may name no
+term newer than the follower's own. A line that fails either check (a flipped
+digit is enough) is declined as `verify`, nothing is copied, and the leader
+serves the node by a snapshot session instead. A wrong line that got through
+would not make the node serve wrong data, but it could make the next reconcile
+cut below the floor it just adopted, which stops the node
+(`PositionPurged`). Terms older than the leader's map reaches are not
+checked, because the leader has nothing to compare them with.

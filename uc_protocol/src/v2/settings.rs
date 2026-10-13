@@ -17,12 +17,17 @@
 /// (newest-only), and it is a function of the record alone, so a node that
 /// installed an old image and a node that started from genesis read the
 /// same value (ruling R24; a `0` here made their images diverge forever).
-pub const SETTINGS_VERSION: u32 = 5;
-/// The exact encoded length of a version-5 record — no trailing bytes.
+pub const SETTINGS_VERSION: u32 = 6;
+/// The exact encoded length of a version-6 record — no trailing bytes.
+/// Version 6 (backup-tier 3b) appends `purge_requires_tiers u8 @46`: how
+/// many backup tiers must confirm a position before any node may purge
+/// below it (`0` = off); `1`–`5` decode it as `0`.
+pub const SETTINGS_LEN: usize = 4 + 8 + 8 + 8 + 1 + 4 + 2 + 1 + 2 + 8 + 1; // 47
+/// The exact length of a version-5 record, accepted on decode only.
 /// Version 5 (backup-tier spec) appends `backup_retain_sets u16 @36` and
 /// `backup_retain_age_secs u64 @38`; `1`–`4` decode both as `0` (no tier
 /// retention).
-pub const SETTINGS_LEN: usize = 4 + 8 + 8 + 8 + 1 + 4 + 2 + 1 + 2 + 8; // 46
+pub const SETTINGS_LEN_V5: usize = 4 + 8 + 8 + 8 + 1 + 4 + 2 + 1 + 2 + 8; // 46
 /// The exact length of a version-4 record (`auto_fetch`, no backup
 /// retention), accepted on decode only.
 pub const SETTINGS_LEN_V4: usize = 4 + 8 + 8 + 8 + 1 + 4 + 2 + 1; // 36
@@ -115,6 +120,10 @@ pub struct Settings {
     /// Backup-tier spec: a tier set older than this many seconds may be
     /// pruned; `0` = no age rule. `u64::MAX` is refused at the door (47).
     pub backup_retain_age_secs: u64,
+    /// Backup-tier 3b: how many backup tiers must confirm a position before
+    /// any node may purge below it; `0` = off, `1..=MAX_BACKUP_TIERS` = on.
+    /// `0` for every v1–v5 record.
+    pub purge_requires_tiers: u8,
 }
 
 impl Settings {
@@ -132,6 +141,7 @@ impl Settings {
             auto_fetch: true,
             backup_retain_sets: 0,
             backup_retain_age_secs: 0,
+            purge_requires_tiers: 0,
         }
     }
 }
@@ -147,11 +157,12 @@ pub fn encode_settings(s: &Settings, out: &mut Vec<u8>) {
     out.push(s.auto_fetch as u8);
     out.extend_from_slice(&s.backup_retain_sets.to_le_bytes());
     out.extend_from_slice(&s.backup_retain_age_secs.to_le_bytes());
+    out.push(s.purge_requires_tiers);
 }
 
-/// Total: `None` on any (version, length) pair other than the five this
+/// Total: `None` on any (version, length) pair other than the six this
 /// reader knows — `(1, SETTINGS_LEN_V1)`, `(2, SETTINGS_LEN_V2)`,
-/// `(3, SETTINGS_LEN_V3)`, `(4, SETTINGS_LEN_V4)` and `(5, SETTINGS_LEN)` — an unknown target byte,
+/// `(3, SETTINGS_LEN_V3)`, `(4, SETTINGS_LEN_V4)`, `(5, SETTINGS_LEN_V5)` and `(6, SETTINGS_LEN)` — an unknown target byte,
 /// or an `auto_fetch` byte other than 0/1. The length is EXACT PER
 /// VERSION, so a header with another version's length (or the reverse) is
 /// refused rather than read as a prefix; the pair check up front makes every
@@ -161,21 +172,23 @@ pub fn decode_settings(buf: &[u8]) -> Option<Settings> {
         return None;
     }
     let version = u32::from_le_bytes(buf[0..4].try_into().unwrap());
-    let (datagram_mtu, retain_sets, auto_fetch, backup) = match (version, buf.len()) {
-        (1, SETTINGS_LEN_V1) => (0, 1, true, (0, 0)),
+    let (datagram_mtu, retain_sets, auto_fetch, backup, purge_tiers) = match (version, buf.len()) {
+        (1, SETTINGS_LEN_V1) => (0, 1, true, (0, 0), 0),
         (2, SETTINGS_LEN_V2) => (
             u32::from_le_bytes(buf[29..33].try_into().unwrap()),
             1,
             true,
             (0, 0),
+            0,
         ),
         (3, SETTINGS_LEN_V3) => (
             u32::from_le_bytes(buf[29..33].try_into().unwrap()),
             u16::from_le_bytes(buf[33..35].try_into().unwrap()),
             true,
             (0, 0),
+            0,
         ),
-        (4, SETTINGS_LEN_V4) | (5, SETTINGS_LEN) => (
+        (4, SETTINGS_LEN_V4) | (5, SETTINGS_LEN_V5) | (6, SETTINGS_LEN) => (
             u32::from_le_bytes(buf[29..33].try_into().unwrap()),
             u16::from_le_bytes(buf[33..35].try_into().unwrap()),
             match buf[35] {
@@ -183,7 +196,7 @@ pub fn decode_settings(buf: &[u8]) -> Option<Settings> {
                 1 => true,
                 _ => return None,
             },
-            if version == 5 {
+            if version >= 5 {
                 (
                     u16::from_le_bytes(buf[36..38].try_into().unwrap()),
                     u64::from_le_bytes(buf[38..46].try_into().unwrap()),
@@ -191,6 +204,7 @@ pub fn decode_settings(buf: &[u8]) -> Option<Settings> {
             } else {
                 (0, 0)
             },
+            if version == 6 { buf[46] } else { 0 },
         ),
         _ => return None,
     };
@@ -212,6 +226,7 @@ pub fn decode_settings(buf: &[u8]) -> Option<Settings> {
         auto_fetch,
         backup_retain_sets: backup.0,
         backup_retain_age_secs: backup.1,
+        purge_requires_tiers: purge_tiers,
     })
 }
 
@@ -230,9 +245,11 @@ mod tests {
         // catalog spec §7): version u32 @0, fsm_lag_bytes u64 @4,
         // admission_bytes u64 @12, snapshot_interval_bytes u64 @20, target
         // u8 @28, datagram_mtu u32 @29, retain_sets u16 @33, auto_fetch u8 @35,
-        // backup_retain_sets u16 @36, backup_retain_age_secs u64 @38.
-        assert_eq!(SETTINGS_VERSION, 5);
-        assert_eq!(SETTINGS_LEN, 46);
+        // backup_retain_sets u16 @36, backup_retain_age_secs u64 @38,
+        // purge_requires_tiers u8 @46.
+        assert_eq!(SETTINGS_VERSION, 6);
+        assert_eq!(SETTINGS_LEN, 47);
+        assert_eq!(SETTINGS_LEN_V5, 46);
         assert_eq!(SETTINGS_LEN_V4, 36);
         assert_eq!(SETTINGS_LEN_V3, 35);
         assert_eq!(SETTINGS_LEN_V2, 33);
@@ -256,11 +273,12 @@ mod tests {
             auto_fetch: false,
             backup_retain_sets: 0,
             backup_retain_age_secs: 0,
+            purge_requires_tiers: 0,
         };
         let mut out = Vec::new();
         encode_settings(&s, &mut out);
         assert_eq!(out.len(), SETTINGS_LEN);
-        assert_eq!(&out[0..4], &5u32.to_le_bytes());
+        assert_eq!(&out[0..4], &6u32.to_le_bytes());
         assert_eq!(out[28], 1);
         assert_eq!(&out[29..33], &8960u32.to_le_bytes());
         assert_eq!(&out[33..35], &3u16.to_le_bytes());
@@ -285,11 +303,12 @@ mod tests {
             auto_fetch: true,
             backup_retain_sets: 0,
             backup_retain_age_secs: 0,
+            purge_requires_tiers: 0,
         };
         let mut b = Vec::new();
         encode_settings(&s, &mut b);
         assert_eq!(b.len(), SETTINGS_LEN);
-        assert_eq!(&b[0..4], &5u32.to_le_bytes(), "version 5");
+        assert_eq!(&b[0..4], &6u32.to_le_bytes(), "version 6");
         assert_eq!(&b[33..35], &3u16.to_le_bytes(), "retain_sets @33");
         assert_eq!(decode_settings(&b), Some(s));
         // the same fields as a v3 record (35 B, version 3) round-trip
@@ -339,7 +358,7 @@ mod tests {
     fn settings_v4_round_trips_auto_fetch_and_v1_to_v3_read_true() {
         assert_eq!(
             (SETTINGS_VERSION, SETTINGS_LEN, SETTINGS_LEN_V3),
-            (5, 46, 35)
+            (6, 47, 35)
         );
         assert!(Settings::genesis_default().auto_fetch, "default on");
         let s = Settings {
@@ -349,7 +368,7 @@ mod tests {
         let mut b = Vec::new();
         encode_settings(&s, &mut b);
         assert_eq!(b.len(), SETTINGS_LEN);
-        assert_eq!(&b[0..4], &5u32.to_le_bytes());
+        assert_eq!(&b[0..4], &6u32.to_le_bytes());
         assert_eq!(b[35], 0, "auto_fetch @35");
         assert_eq!(decode_settings(&b), Some(s));
         let mut v3 = b[..SETTINGS_LEN_V3].to_vec();
@@ -379,7 +398,7 @@ mod tests {
     fn settings_v5_round_trips_backup_retention_and_v1_to_v4_read_zero() {
         assert_eq!(
             (SETTINGS_VERSION, SETTINGS_LEN, SETTINGS_LEN_V4),
-            (5, 46, 36)
+            (6, 47, 36)
         );
         let g = Settings::genesis_default();
         assert_eq!((g.backup_retain_sets, g.backup_retain_age_secs), (0, 0));
@@ -391,7 +410,7 @@ mod tests {
         let mut b = Vec::new();
         encode_settings(&s, &mut b);
         assert_eq!(b.len(), SETTINGS_LEN);
-        assert_eq!(&b[0..4], &5u32.to_le_bytes());
+        assert_eq!(&b[0..4], &6u32.to_le_bytes());
         assert_eq!(&b[36..38], &7u16.to_le_bytes());
         assert_eq!(&b[38..46], &2_592_000u64.to_le_bytes());
         assert_eq!(decode_settings(&b), Some(s));
@@ -411,16 +430,53 @@ mod tests {
         assert_eq!(decode_settings(&short), None, "a v5 header on a v4 length");
     }
 
+    /// Backup-tier 3b: v6 appends `purge_requires_tiers u8 @46`; v1-v5
+    /// records decode it as `0` (purge gate off).
+    #[test]
+    fn settings_v6_round_trips_purge_requires_tiers_and_v1_to_v5_read_zero() {
+        assert_eq!(
+            (SETTINGS_VERSION, SETTINGS_LEN, SETTINGS_LEN_V5),
+            (6, 47, 46)
+        );
+        let g = Settings::genesis_default();
+        assert_eq!(g.purge_requires_tiers, 0);
+        let s = Settings {
+            purge_requires_tiers: 3,
+            ..g
+        };
+        let mut b = Vec::new();
+        encode_settings(&s, &mut b);
+        assert_eq!(b.len(), SETTINGS_LEN);
+        assert_eq!(&b[0..4], &6u32.to_le_bytes());
+        assert_eq!(b[46], 3);
+        assert_eq!(decode_settings(&b), Some(s));
+        for (ver, len) in [
+            (5u32, SETTINGS_LEN_V5),
+            (4, SETTINGS_LEN_V4),
+            (3, SETTINGS_LEN_V3),
+            (2, SETTINGS_LEN_V2),
+            (1, SETTINGS_LEN_V1),
+        ] {
+            let mut old = b[..len].to_vec();
+            old[0..4].copy_from_slice(&ver.to_le_bytes());
+            let d = decode_settings(&old).unwrap();
+            assert_eq!(d.purge_requires_tiers, 0);
+        }
+        let mut short = b[..SETTINGS_LEN_V5].to_vec();
+        short[0..4].copy_from_slice(&6u32.to_le_bytes());
+        assert_eq!(decode_settings(&short), None, "a v6 header on a v5 length");
+    }
+
     #[test]
     fn decode_is_total_and_refuses_unknown_version_and_target() {
         assert!(decode_settings(&[]).is_none());
         let mut out = Vec::new();
         encode_settings(&Settings::genesis_default(), &mut out);
-        // `1`..=`5` are all REAL versions now, so the unknown-version
-        // case is `6`.
-        let mut v6 = out.clone();
-        v6[0] = 6;
-        assert!(decode_settings(&v6).is_none());
+        // `1`..=`6` are all REAL versions now, so the unknown-version
+        // case is `7`.
+        let mut v7 = out.clone();
+        v7[0] = 7;
+        assert!(decode_settings(&v7).is_none());
         let mut t9 = out.clone();
         t9[28] = 9;
         assert!(decode_settings(&t9).is_none());

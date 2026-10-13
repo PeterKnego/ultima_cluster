@@ -77,6 +77,8 @@ const SENTINEL_CLIENT: u32 = 99;
 const MIN_POST_Q: usize = 5;
 /// The post-restore write (assertion 3).
 const AFTER: u64 = 2_000_000;
+/// The live ring of the join test (see there).
+const RING_BYTES: u64 = 1 << 18;
 const VOTERS: usize = 3;
 const WRITER: usize = 3; // the learner's slot
 
@@ -568,6 +570,231 @@ fn a_whole_cluster_restore_is_linearizable_up_to_q_and_shows_nothing_after() {
         Verdict::Violation => {
             dump_history(&entries, &positions, seed);
             panic!("LINEARIZABILITY VIOLATION across the restore (seed={seed})");
+        }
+        Verdict::Inconclusive => {
+            dump_history(&entries, &positions, seed);
+            panic!("checker Inconclusive (seed={seed})");
+        }
+    }
+}
+
+// ------------------------------------------- a learner joins from the tier
+
+fn tier_install(node: &uc_node::Node, outcome: &str) -> u64 {
+    let text = uc_node::obs::metrics::render_prometheus(&node.observability());
+    let prefix = format!("uc2_tier_install_total{{outcome=\"{outcome}\"}} ");
+    text.lines()
+        .find_map(|l| l.strip_prefix(&prefix))
+        .unwrap_or_else(|| panic!("no uc2_tier_install_total sample in:\n{text}"))
+        .trim()
+        .parse()
+        .expect("sample value")
+}
+
+fn snap_sessions(node: &uc_node::Node) -> u64 {
+    node.observability()
+        .sender
+        .snap_sessions
+        .load(Ordering::Relaxed)
+}
+
+/// Spec §11.6 / plan Task 15: purge is ON, the workers keep running, and a
+/// LEARNER added at runtime with a `[tier_source]` installs the leader-named
+/// set from its tier (no snapshot session) and tail-replays; the WGL verdict
+/// over the whole history holds. Only the added learner has a tier source.
+#[test]
+fn a_learner_joining_from_the_tier_mid_load_keeps_the_history_linearizable() {
+    // The body runs on a 16 MiB stack: in a DEBUG build the unoptimised
+    // frames of the node-start / metrics-render path it drives from the test
+    // thread overflow the default 2 MiB test stack (release does not). No
+    // house pattern for this exists in the repo.
+    std::thread::Builder::new()
+        .name("tier-join".into())
+        .stack_size(16 << 20)
+        .spawn(a_learner_joining_body)
+        .expect("spawn")
+        .join()
+        .unwrap_or_else(|e| std::panic::resume_unwind(e));
+}
+
+fn a_learner_joining_body() {
+    const DEFAULT_SEED: u64 = 0x7135;
+    let seed: u64 = std::env::var("LIN_SEED")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_SEED);
+
+    let _g = serialize();
+    let wall = Instant::now();
+    let root = tempdir("uc2-lin-tier-join-");
+    let tier = tempdir("uc2-lin-tier-join-target-");
+    let backup = BackupConfig {
+        target: tier.path().to_path_buf(),
+        quiet_interval: Duration::from_millis(500),
+        ..BackupConfig::default()
+    };
+    let ccfg = ClusterCfg {
+        purge: uc_node::PurgePolicy::BelowSnapshot { slack_bytes: 0 },
+        journal_segment_bytes: 64 * 1024,
+        // A small live ring, so a position-0 learner is below the ring too:
+        // without it the leader repairs from the 4 MiB buffer and the join
+        // never needs the journal, the tier or a session.
+        buffer_bytes: RING_BYTES,
+        learners: 1,
+        spare_node: true,
+        fsm_lag_bytes: FSM_LAG,
+        ..ClusterCfg::default()
+    };
+    let mut cluster: LinClusterV2<PosRegister> = LinClusterV2::start_cfg_backup(
+        root.path(),
+        VOTERS,
+        FaultConfig::default(),
+        ccfg,
+        Some((WRITER, backup)),
+    );
+    cluster.await_single_serving(30);
+
+    let voter_dirs = Arc::new(cluster.dirs()[..VOTERS].to_vec());
+    let history = Arc::new(History::default());
+    let positions: Positions = Arc::default();
+    let stop_workers = Arc::new(AtomicBool::new(false));
+    let stop_filler = Arc::new(AtomicBool::new(false));
+    let workers = spawn_workers(&voter_dirs, &history, &positions, &stop_workers, seed);
+    let filler = spawn_filler(&voter_dirs, &stop_filler);
+    let t = FsTarget::new(tier.path());
+
+    // Phase 1: a first set under load, then the log well past it, then a
+    // second set — its floor is what the voters purge to.
+    let s1 = cluster.instant_until_complete(30);
+    await_until(180, "the log passed S1 + 4 x fsm_lag", || {
+        let li = cluster.leader()?;
+        let commit = cluster.node(li)?.counters().commit.load_acquire();
+        (commit > s1 + MIN_REPLAY).then_some(())
+    });
+    let s2 = cluster.instant_until_complete(30);
+    assert!(s2 > s1);
+
+    // Phase 2: S2 and the journal past it are in the tier.
+    await_until(60, "the writer copied set S2 to the tier", || {
+        let l = list_tier(&t).ok()?;
+        l.sets.iter().any(|s| s.position == s2).then_some(())
+    });
+    await_until(60, "the tier's through passed S2", || {
+        let (_, _, through) = watermark_of(&list_tier(&t).ok()?)?;
+        (through > s2).then_some(())
+    });
+
+    // Phase 3: every voter has purged AND the log has lapped the live ring
+    // (a fresh learner at position 0 is below both the journal start and the
+    // buffer, so only a snapshot-shaped install can seat it).
+    let floor = await_until(120, "every voter purged its journal prefix", || {
+        let f = cluster.min_voter_archive_first_base(VOTERS);
+        let li = cluster.leader()?;
+        let commit = cluster.node(li)?.counters().commit.load_acquire();
+        (f > 0 && commit > 2 * RING_BYTES).then_some(f)
+    });
+
+    // Phase 4: a learner joins mid-load, from the tier.
+    let sessions_before = {
+        let li = cluster.leader().expect("leader");
+        snap_sessions(cluster.node(li).unwrap())
+    };
+    let joined = Instant::now();
+    let id = cluster.add_learner_from_tier(tier.path().to_path_buf(), 60);
+    let target_commit = {
+        let li = cluster.leader().expect("leader");
+        cluster.node(li).unwrap().counters().commit.load_acquire()
+    };
+    await_until(120, "the tier install landed on the new learner", || {
+        let n = cluster.spare_node()?;
+        (tier_install(n, "installed") >= 1).then_some(())
+    });
+    await_until(
+        120,
+        "the new learner reached the commit seen at its add",
+        || {
+            let n = cluster.spare_node()?;
+            (n.counters().commit.load_acquire() >= target_commit).then_some(())
+        },
+    );
+    let join_secs = joined.elapsed().as_secs_f64();
+    let learner = cluster.spare_node().expect("learner");
+    assert_eq!(
+        tier_install(learner, "installed"),
+        1,
+        "exactly one tier install"
+    );
+    let li = cluster.leader().expect("leader after the join");
+    assert_eq!(
+        snap_sessions(cluster.node(li).unwrap()),
+        sessions_before,
+        "the leader opened no snapshot session for the tier join"
+    );
+    assert_eq!(sessions_before, 0, "no snapshot session at all in this run");
+    assert!(
+        learner.archive_first_base() > 0,
+        "the learner's journal starts at its installed floor, not at zero"
+    );
+
+    // Phase 5: the load runs on with the learner in the cluster.
+    let acked_before = positions.lock().unwrap().len();
+    await_until(60, "workers kept acknowledging after the join", || {
+        (positions.lock().unwrap().len() >= acked_before + 10).then_some(())
+    });
+    stop_workers.store(true, Ordering::Relaxed);
+    for h in workers {
+        h.join().expect("worker");
+    }
+    stop_filler.store(true, Ordering::Relaxed);
+    let fillers = filler.join().expect("filler");
+
+    // Final review I5: the tier-installed learner's APPLIED state equals the
+    // leader's at one common position — read on each node's own dir (a
+    // snapshot read; the learner serves no linearizable one) with the load
+    // stopped, until both report the same `last_applied`.
+    let learner_dir = cluster.spare_dir().expect("the learner's dir");
+    let read = |dir: &std::path::Path| -> Option<(Option<u64>, Option<u64>)> {
+        let client = uc_client::Client::connect(dir, lincheck_v2::APP).ok()?;
+        let r = client
+            .query_snapshot::<(), (Option<u64>, Option<u64>)>(&())
+            .ok();
+        client.shutdown();
+        r
+    };
+    let (value, at) = await_until(60, "the learner's state equals the leader's", || {
+        let li = cluster.leader()?;
+        let lead = read(&cluster.dirs()[li])?;
+        let mine = read(&learner_dir)?;
+        (lead.1.is_some() && lead == mine).then_some(mine)
+    });
+    assert!(
+        at.is_some_and(|p| p > s2),
+        "the common position is past the installed set ({at:?} vs {s2})"
+    );
+    cluster.stop();
+
+    // ---- the verdict over the whole history
+    let entries = Arc::try_unwrap(history)
+        .ok()
+        .expect("sole history owner")
+        .into_entries();
+    let positions = positions.lock().unwrap().clone();
+    let ok = entries
+        .iter()
+        .filter(|e| matches!(e.outcome, Outcome::Ok(_)))
+        .count();
+    eprintln!(
+        "[lin_backup_tier/join] seed={seed} S1={s1} S2={s2} voter_floor={floor} learner={id} \
+         ok={ok} total={} fillers={fillers} join={join_secs:.1}s wall={:.1}s \
+         learner_state={value:?}@{at:?}",
+        entries.len(),
+        wall.elapsed().as_secs_f64()
+    );
+    match check_register(&entries) {
+        Verdict::Linearizable => {}
+        Verdict::Violation => {
+            dump_history(&entries, &positions, seed);
+            panic!("LINEARIZABILITY VIOLATION across the tier join (seed={seed})");
         }
         Verdict::Inconclusive => {
             dump_history(&entries, &positions, seed);

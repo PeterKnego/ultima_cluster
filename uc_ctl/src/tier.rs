@@ -22,6 +22,7 @@ use uc_node::tier::materialize::{
     restore_point,
 };
 use uc_node::tier::target::{FsTarget, read_tier};
+use uc_protocol::v2::backup::BackupTierEntry;
 use uc_protocol::v2::cnc::ADMIN_OP_TIER_FORGET;
 
 use crate::CommonArgs;
@@ -98,26 +99,45 @@ pub fn show(target: &Path, instance_dir: Option<&Path>) -> anyhow::Result<()> {
             .map_err(|e| anyhow::anyhow!("tier show: {}: {e}", d.display()))?
         {
             None => println!("committed (instance dir): no cluster artifact yet"),
-            Some((pos, entries)) => {
-                println!("committed (instance dir, cluster artifact at {pos}):");
-                if entries.is_empty() {
-                    println!("  no registered tier");
-                }
-                for e in entries {
-                    let mark = if e.tier_id == info.tier_id {
-                        " (this tier)"
-                    } else {
-                        ""
-                    };
-                    println!(
-                        "  tier {:#018x}{mark} oldest_set={} newest_set={} through={} reporter={}",
-                        e.tier_id, e.oldest_set, e.newest_set, e.through, e.reporter
-                    );
-                }
+            Some((pos, entries, k)) => {
+                print!("{}", render_committed(pos, &entries, k, info.tier_id))
             }
         }
     }
     Ok(())
+}
+
+/// The committed-watermark block of `tier show --instance-dir`: one line per
+/// registered tier, and the `k` highest-`through` entries — the ones the
+/// purge gate counts (backup-tier 3b) — marked `(counts toward K=<k>)`.
+fn render_committed(pos: u64, entries: &[BackupTierEntry], k: u8, this_tier: u64) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "committed (instance dir, cluster artifact at {pos}): purge_requires_tiers={k}"
+    );
+    if entries.is_empty() {
+        out.push_str("  no registered tier\n");
+    }
+    let mut order: Vec<usize> = (0..entries.len()).collect();
+    order.sort_by(|&a, &b| entries[b].through.cmp(&entries[a].through));
+    let counted: Vec<usize> = order.into_iter().take(k as usize).collect();
+    for (i, e) in entries.iter().enumerate() {
+        let mut marks = String::new();
+        if e.tier_id == this_tier {
+            marks.push_str(" (this tier)");
+        }
+        if counted.contains(&i) {
+            let _ = write!(marks, " (counts toward K={k})");
+        }
+        let _ = writeln!(
+            out,
+            "  tier {:#018x}{marks} oldest_set={} newest_set={} through={} reporter={}",
+            e.tier_id, e.oldest_set, e.newest_set, e.through, e.reporter
+        );
+    }
+    out
 }
 
 /// `tier verify [--deep]`: prints every finding; an error (exit 1) when
@@ -158,16 +178,6 @@ pub fn data_loss_line(q: u64) -> String {
     format!("restoring as of {q}; history after {q} is discarded on every node restored this way")
 }
 
-/// Ruling R12a: why `tier restore --new-node` is refused in this release.
-pub fn new_node_unsupported(node_id: u32) -> String {
-    format!(
-        "tier restore: refusing: new_node_unsupported: a tier-seeded replacement node (id \
-         {node_id}) is not supported yet — its restored term map starts at the set and cannot \
-         align with a live leader's lineage; add a replacement node with a fresh, empty \
-         instance dir and the normal join (a snapshot session from its peers)"
-    )
-}
-
 /// `tier restore`: refuse a `--confirm-cluster` that is not the tier's
 /// `app_id`, print the data-loss line, then build `instance_dir`.
 pub fn restore(
@@ -176,11 +186,6 @@ pub fn restore(
     instance_dir: &Path,
     mode: RestoreMode,
 ) -> anyhow::Result<()> {
-    if let RestoreMode::NewNode(node_id) = mode {
-        // Ruling R12a: deferred to project 3b — refused before anything is
-        // read or built.
-        anyhow::bail!("{}", new_node_unsupported(node_id));
-    }
     let (t, info) = open_target("restore", target)?;
     let mode = match mode {
         RestoreMode::Cluster(confirm) => {
@@ -194,7 +199,7 @@ pub fn restore(
             }
             Mode::Recovery
         }
-        RestoreMode::NewNode(_) => unreachable!("refused above (R12a)"),
+        RestoreMode::NewNode(node_id) => Mode::NewNode { node_id },
     };
     let l = list_tier(&t).map_err(|e| tier_err("restore", e))?;
     let (_, q) = restore_point(&l, at).map_err(|e| tier_err("restore", e))?;
@@ -209,6 +214,12 @@ pub fn restore(
         info.tier_id,
         m.mode
     );
+    if let Mode::NewNode { node_id } = m.mode {
+        println!(
+            "next: start this node, then `uc2ctl add-learner {node_id}` (with its address) \
+             against the live cluster and, once it has caught up, `uc2ctl promote {node_id}`"
+        );
+    }
     if m.fenced {
         println!(
             "fenced: {} — Q lies below the tier's reach, so this tier's history past {} is \
@@ -314,6 +325,33 @@ pub fn export_corpus(
 mod tests {
     use super::*;
 
+    #[test]
+    fn tier_show_marks_the_k_highest_through_entries() {
+        let e = |tier_id, through| BackupTierEntry {
+            tier_id,
+            oldest_set: 1,
+            newest_set: 2,
+            through,
+            reporter: 3,
+            updated_pos: 0,
+        };
+        let out = render_committed(99, &[e(1, 500), e(2, 900), e(3, 100)], 2, 2);
+        assert!(
+            out.contains("artifact at 99): purge_requires_tiers=2\n"),
+            "{out}"
+        );
+        let line = |id: u64| {
+            out.lines()
+                .find(|l| l.contains(&format!("{id:#018x}")))
+                .unwrap()
+        };
+        assert!(line(1).contains("(counts toward K=2)"), "{out}");
+        assert!(line(2).contains("(this tier) (counts toward K=2)"), "{out}");
+        assert!(!line(3).contains("counts toward"), "{out}");
+        let none = render_committed(1, &[e(1, 5)], 0, 9);
+        assert!(!none.contains("counts toward"), "{none}");
+    }
+
     fn tmp() -> tempfile::TempDir {
         let root = std::env::var("CARGO_TARGET_TMPDIR")
             .map(std::path::PathBuf::from)
@@ -337,11 +375,8 @@ mod tests {
         let out = d.path().join("out");
         let e = restore(&tier, None, &out, RestoreMode::Cluster("app".into())).unwrap_err();
         assert!(e.to_string().contains("no TIER"), "{e}");
-        // Ruling R12a: `--new-node` is refused by name BEFORE the target is
-        // opened — here it has no TIER, which the open would have named.
         let e = restore(&tier, None, &out, RestoreMode::NewNode(9)).unwrap_err();
-        assert!(e.to_string().contains("new_node_unsupported"), "{e}");
-        assert!(!e.to_string().contains("no TIER"), "{e}");
+        assert!(e.to_string().contains("no TIER"), "{e}");
         assert!(!out.exists());
         uc_node::tier::target::open_or_create_tier(&FsTarget::new(&tier), "app", 1).unwrap();
         let e = restore(&tier, None, &out, RestoreMode::Cluster("other".into())).unwrap_err();

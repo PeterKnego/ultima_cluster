@@ -39,15 +39,16 @@ use uc_protocol::v2::datagram::{
     DGRAM_KIND_READ_PROBE, DGRAM_KIND_READ_PROBE_ACK, DGRAM_KIND_REQUEST_VOTE,
     DGRAM_KIND_SNAP_BEGIN, DGRAM_KIND_SNAP_CHUNK, DGRAM_KIND_SNAP_DONE, DGRAM_KIND_SNAP_NAK,
     DGRAM_KIND_SNAP_REDIRECT, DGRAM_KIND_SNAP_REPORT, DGRAM_KIND_SNAP_REQUEST, DGRAM_KIND_STATUS,
-    DGRAM_KIND_TERM_MAP, DGRAM_KIND_VOTE, DatagramHeader, Holdings, MAX_TERM_MAP_WIRE_ENTRIES,
-    NAK_BODY_LEN, NakBody, PROBE_ACK_BODY_LEN, ProbeAckBody, REQUEST_VOTE_BODY_LEN,
-    RequestVoteBody, SNAP_BEGIN_FIXED_LEN, SNAP_BEGIN_LAYOUT_V4, SNAP_NAK_BODY_LEN,
-    SNAP_REQUEST_BODY_LEN, STATUS_BODY_LEN, SnapBeginBody, SnapNakBody, SnapRequestBody,
-    StatusBody, TermMapEntryWire, VOTE_BODY_LEN, VoteBody, read_append_position_body,
-    read_config_proposal_body, read_config_reply_body, read_datagram_header, read_nak_body,
-    read_probe_ack_body, read_probe_rung, read_read_probe_body, read_request_vote_body,
-    read_snap_begin_body, read_snap_nak_body, read_snap_redirect_body, read_snap_report_body,
-    read_snap_request_body, read_status_body, read_term_map_body, read_vote_body,
+    DGRAM_KIND_TERM_MAP, DGRAM_KIND_TIER_INSTALL, DGRAM_KIND_TIER_INSTALL_STATUS, DGRAM_KIND_VOTE,
+    DatagramHeader, Holdings, MAX_TERM_MAP_WIRE_ENTRIES, NAK_BODY_LEN, NakBody, PROBE_ACK_BODY_LEN,
+    ProbeAckBody, REQUEST_VOTE_BODY_LEN, RequestVoteBody, SNAP_BEGIN_FIXED_LEN,
+    SNAP_BEGIN_LAYOUT_V4, SNAP_NAK_BODY_LEN, SNAP_REQUEST_BODY_LEN, STATUS_BODY_LEN, SnapBeginBody,
+    SnapNakBody, SnapRequestBody, StatusBody, TermMapEntryWire, VOTE_BODY_LEN, VoteBody,
+    read_append_position_body, read_config_proposal_body, read_config_reply_body,
+    read_datagram_header, read_nak_body, read_probe_ack_body, read_probe_rung,
+    read_read_probe_body, read_request_vote_body, read_snap_begin_body, read_snap_nak_body,
+    read_snap_redirect_body, read_snap_report_body, read_snap_request_body, read_status_body,
+    read_term_map_body, read_tier_install_body, read_tier_install_status_body, read_vote_body,
     write_append_position_body, write_datagram_header, write_nak_body, write_probe_ack_body,
     write_snap_begin_body, write_snap_nak_body, write_snap_request_body, write_status_body,
 };
@@ -274,6 +275,20 @@ pub enum NetEvent {
         from: u32,
         w: uc_protocol::v2::backup::BackupWatermark,
     },
+    /// Backup-tier 3b spec §6.3 (kind 28): the leader asks this below-floor
+    /// follower to install from its own tier. Term-gated like `SnapRedirect`.
+    /// `from` is the datagram's source address (present with crypto on or
+    /// off); the node checks it is the leader. The body (200 B: the set S
+    /// and the leader's catalog verdict for it) is boxed so this rare event
+    /// does not widen every `NetEvent` on the route.
+    TierInstall {
+        from: SocketAddr,
+        /// The datagram's header term, as admitted: the node re-checks it
+        /// against its CURRENT term at the point of use (the SM can move on
+        /// between admission and consumption).
+        term: u32,
+        body: Box<uc_protocol::v2::datagram::TierInstallBody>,
+    },
 }
 
 impl NetEvent {
@@ -295,12 +310,13 @@ impl NetEvent {
             NetEvent::SnapRedirect { .. } => 10,
             NetEvent::SnapReport { .. } => 11,
             NetEvent::BackupReport { .. } => 12,
+            NetEvent::TierInstall { .. } => 13,
         }
     }
 }
 
 /// Number of [`NetEvent`] kinds (the width of the per-kind drop counters).
-pub const NET_EVENT_KINDS: usize = 13;
+pub const NET_EVENT_KINDS: usize = 14;
 
 /// Parse a consensus-plane datagram (kinds 5–11) into a [`NetEvent`], RAW — no
 /// term filter (the SM adopts higher terms). `from` is the datagram's source
@@ -551,6 +567,12 @@ pub struct FollowerStats {
     /// timeout, reports/gossip on their floors. Surfaced so a wedged consensus
     /// agent is diagnosable rather than silent.
     pub net_drops: [AtomicU64; NET_EVENT_KINDS],
+    /// Backup-tier 3b, final review I6e: a well-formed `TIER_INSTALL_STATUS`
+    /// (kind 29) this receiver could not hand to a sender — none is
+    /// installed (this node is not in the leader role, so it asked nobody),
+    /// or the sender's control channel was full. Dropped, never acted on;
+    /// counted so a stray or late answer is visible rather than silent.
+    pub tier_install_status_dropped: AtomicU64,
     pub naks_sent: AtomicU64,
     pub statuses_sent: AtomicU64,
     pub append_positions_sent: AtomicU64,
@@ -808,6 +830,106 @@ pub type IncomingSnapshotSignal = (
     mpsc::SyncSender<(u64, PathBuf)>,
 );
 
+/// Backup-tier 3b ruling PF4: every signal a COMPLETED snapshot intake
+/// raises, in one place, so the receiver's own session completion
+/// ([`FollowerReceiver`]'s `snap_complete`) and the node's `uc2-tier-fetch`
+/// thread — which lands the same set from a backup tier instead of a peer —
+/// share ONE implementation of "the set is on disk, tell the node". Cloned
+/// out of the receiver with [`FollowerReceiver::intake_signals`] once
+/// [`FollowerReceiver::set_snapshot_intake`] has wired the install route.
+///
+/// The caller's contract is the receiver's: every artifact of the set is
+/// already fsync'd, foreign-marked and renamed under its final name before
+/// either `publish_*` is called.
+#[derive(Clone)]
+pub struct SnapIntakeSignals {
+    /// See [`FollowerReceiver::stored_set_pos`].
+    stored_set_pos: Arc<AtomicU64>,
+    /// The install route ([`IncomingSnapshotSignal`]); `None` until
+    /// `set_snapshot_intake` wires one (unit tests, non-node embeddings).
+    incoming: Option<IncomingSnapshotSignal>,
+    /// M6 Task 8: a completed INSTALL awaiting the consensus agent's
+    /// `AdoptFloor` FORWARD re-prime — the floor, `0` = none. Shared (not a
+    /// receiver-local field) because an install the tier thread completes
+    /// must re-sync the receiver's gap tracker exactly as a session's does;
+    /// only the receiver reads and clears it.
+    adopt_pending: Arc<AtomicU64>,
+}
+
+impl SnapIntakeSignals {
+    /// Signals over `stored_set_pos` with no install route (the shape a
+    /// receiver starts with, and a store-only test fixture's).
+    pub fn new(stored_set_pos: Arc<AtomicU64>, incoming: Option<IncomingSnapshotSignal>) -> Self {
+        SnapIntakeSignals {
+            stored_set_pos,
+            incoming,
+            adopt_pending: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// Coordinated-snapshot spec §5.7 item 4 (Ruling P4'): a STORE-ONLY
+    /// intake's whole effect on the node — the set at `pos` is present.
+    /// Nothing is published, routed or adopted: this node is a VOTER above
+    /// P, not a joiner, and the words those paths write belong to other
+    /// agents (the rows' `snapshot_pos` to the service builders,
+    /// `cluster_snapshot_pos` to the `uc2-cluster` agent). Its floor moves
+    /// through the consensus agent's ordinary completeness poll, from this
+    /// one word. `fetch_max`: two writers (a peer session and the tier
+    /// thread) may complete sets out of order, and the word never goes back.
+    pub fn publish_stored(&self, pos: u64) {
+        self.stored_set_pos.fetch_max(pos, Ordering::AcqRel);
+    }
+
+    /// An INSTALL intake's tail: hand the cluster artifact at
+    /// `cluster_pos` (`cluster_artifact`, its final path) to the
+    /// `uc2-cluster` agent, then signal the consensus agent to adopt
+    /// `floor`, then arm the receiver's forward gap-tracker re-sync.
+    ///
+    /// Cluster-FSM spec §5.6: the CLUSTER ARTIFACT and its position go
+    /// BEFORE the floor signal — the consensus agent's install handler
+    /// samples the floor (Acquire) and only then reads the cluster position
+    /// and waits for the agent's ack, so doing both first is what guarantees
+    /// it sees THIS transfer's artifact rather than a stale or absent one.
+    /// The agent owns the cluster FSM (it runs on its own thread), which is
+    /// why this is a route and not an install here.
+    ///
+    /// A BLOCKING `send`, deliberately — not `try_send`. A dropped hand-off
+    /// would leave the consensus agent waiting forever for an ack that never
+    /// comes. The channel is sized for the one install a session produces,
+    /// so in practice it never blocks; the only `Err` is a disconnected
+    /// `uc2-cluster` agent, and that failure is NAMED below rather than
+    /// discarded — the floor is published either way (the artifacts are
+    /// renamed on disk and a peer must not be left re-NAKing), so an
+    /// operator whose node then never adopts it needs this line to know why.
+    pub fn publish_installed(&self, floor: u64, cluster_pos: u64, cluster_artifact: PathBuf) {
+        if let Some((slot, cell, tx)) = &self.incoming {
+            cell.store(cluster_pos, Ordering::Release);
+            if tx.send((cluster_pos, cluster_artifact.clone())).is_err() {
+                // `uc_net` has no logging dependency (the node layer owns the
+                // naming for this crate), so this is the same `eprintln!`
+                // shape `snap_open_failed` uses. Not latched: it can only
+                // happen once per dead agent, and the node is on its way down.
+                eprintln!(
+                    "uc_net: the uc2-cluster agent is gone -- cannot install the snapshot \
+                     session's cluster artifact {} at position {}. This node will adopt the \
+                     session's floor with the cluster row (membership, schedule table, \
+                     settings) it booted with",
+                    cluster_artifact.display(),
+                    cluster_pos
+                );
+            }
+            // Signal the consensus agent to adopt the floor + mirror
+            // observability.
+            slot.store(floor, Ordering::Release);
+        }
+        // Arm the forward gap-tracker resync: once the consensus agent's
+        // AdoptFloor re-primes the shared `append` up to this position, the
+        // receiver rebuilds its tracker forward so it NAKs the retained
+        // `[floor, frontier)` tail (M6 Task 8).
+        self.adopt_pending.store(floor, Ordering::Release);
+    }
+}
+
 /// Coordinated-snapshot spec §5.7 items 5–6: one fetch the NODE layer asks
 /// this receiver to start. The node resolves the learner's `NodeId` to an
 /// address (membership is its business, not `uc_net`'s) and says what a
@@ -1040,35 +1162,13 @@ pub struct FollowerReceiver {
     /// installed. Instead we re-ack it, which is exactly what the leader is
     /// waiting for.
     snap_last_done: Option<SnapDone>,
-    /// M6 Task 6: node-internal signal — the position of the newest COMPLETE
-    /// inbound snapshot (written on rename). The consensus agent samples it to
-    /// issue `ArchiveCmd::AdoptFloor` and mirror it to cnc. `None` in unit tests.
-    incoming_snapshot_pos: Option<Arc<AtomicU64>>,
-    /// Cluster-FSM spec §5.6: companion cell for `incoming_snapshot_pos` —
-    /// the position of the CLUSTER ARTIFACT the SAME completed transfer
-    /// carried. Written in `snap_complete` BEFORE `incoming_snapshot_pos` is
-    /// stored (so the consensus agent, which samples the position `Acquire`
-    /// first, can never read a stale one), and what its install handler waits
-    /// for the `uc2-cluster` agent to acknowledge before adopting the floor.
-    incoming_cluster_pos: Option<Arc<AtomicU64>>,
-    /// Cluster-FSM spec §5.6: the route the completed session's cluster
-    /// artifact takes to the `uc2-cluster` agent, which owns the cluster FSM
-    /// and installs it (`ClusterAgent::install_from`). Sent BEFORE
-    /// `incoming_snapshot_pos` is stored, for the same reason the cell above
-    /// is written first.
-    cluster_install: Option<mpsc::SyncSender<(u64, PathBuf)>>,
-    /// Coordinated-snapshot spec §5.7 item 4 (Ruling P4'): the position of the
-    /// newest complete set this node has STORED from a learner — written
-    /// (`Release`) only after every artifact of that set, rows and cluster
-    /// alike, has been fsync'd and renamed into place. The consensus agent's
-    /// completeness poll reads it and treats the set exactly like one this
-    /// node built itself (spec §5.3). Nothing else is published: this is the
-    /// whole of a store-only intake's effect on the node.
-    ///
-    /// Always present (unlike the `Option` cells above) so
-    /// [`FollowerReceiver::stored_set_pos`] can hand the node a handle
-    /// whether or not an intake is configured.
-    stored_set_pos: Arc<AtomicU64>,
+    /// Backup-tier 3b ruling PF4: every signal a completed intake raises —
+    /// the store-only completion word (`stored_set_pos`, spec §5.7 item 4,
+    /// Ruling P4'), and for an INSTALL the floor cell, the cluster
+    /// artifact's position cell, the route to the `uc2-cluster` agent and
+    /// the forward re-sync arm. Shared with the node's `uc2-tier-fetch`
+    /// thread, which raises the same signals for a set copied from a tier.
+    signals: SnapIntakeSignals,
     /// Coordinated-snapshot spec §5.7 items 5–6: fetches the NODE layer asks
     /// this agent to start — admin op 9 (`StoreOnly`) and a `SNAP_REDIRECT`
     /// the node resolved to an address (`Install`). Drained once per duty
@@ -1106,14 +1206,6 @@ pub struct FollowerReceiver {
     /// M6 Task 6: config for the inbound-transfer NAK timer (RTT delay + seed).
     snap_nak_cfg: NakConfig,
     snap_seed: u64,
-    /// M6 Task 8: a completed snapshot install awaiting the consensus agent's
-    /// `AdoptFloor` FORWARD re-prime. Set to the snapshot position on
-    /// `snap_complete`; once the buffer's `append` reaches it (the archive adopted
-    /// the floor), the receiver rebuilds its gap tracker FORWARD to the new floor so
-    /// it NAKs the retained `[floor, frontier)` tail instead of re-requesting the
-    /// purged prefix. Cleared once applied. Distinct from the backward truncation
-    /// re-prime, which is unambiguous from the counter alone.
-    snap_adopt_pending: Option<u64>,
     /// M6 Task 9 (straddle hardening): a node-internal generation counter bumped
     /// by the archive/consensus agent on every `LogCounters::prime(to)` (truncate,
     /// AdoptFloor, BecomeLeader collapse). The DATA arm samples it before reading
@@ -1246,7 +1338,7 @@ fn discard_snap_parts(parts: Vec<SnapPart>) {
 /// `<root>/cluster/snap-P.ultcluster`); `pos` is its `P`. A marker already
 /// present was made durable when it was created, so the common case — every
 /// rename after a session's first — is one `stat`.
-fn write_foreign_marker(final_path: &Path, pos: u64) -> std::io::Result<()> {
+pub fn write_foreign_marker(final_path: &Path, pos: u64) -> std::io::Result<()> {
     let root = final_path
         .parent()
         .and_then(Path::parent)
@@ -1406,17 +1498,13 @@ impl FollowerReceiver {
             snap_intake: None,
             snap_begin_undecodable_latched: false,
             snap_last_done: None,
-            incoming_snapshot_pos: None,
-            incoming_cluster_pos: None,
-            cluster_install: None,
-            stored_set_pos: Arc::new(AtomicU64::new(0)),
+            signals: SnapIntakeSignals::new(Arc::new(AtomicU64::new(0)), None),
             fetch_rx: None,
             armed_fetch: None,
             last_expired_fetch: None,
             fetch_session_seq: 0,
             snap_nak_cfg: snap_nak,
             snap_seed,
-            snap_adopt_pending: None,
             prime_gen: None,
             #[cfg(test)]
             straddle_hook: None,
@@ -1548,10 +1636,8 @@ impl FollowerReceiver {
         self.snap_dir = Some(snap_root);
         self.own_identity = own_identity;
         self.own_versions = Some(own_versions);
-        if let Some((pos, cluster_pos, cluster_install)) = incoming {
-            self.incoming_snapshot_pos = Some(pos);
-            self.incoming_cluster_pos = Some(cluster_pos);
-            self.cluster_install = Some(cluster_install);
+        if let Some(incoming) = incoming {
+            self.signals.incoming = Some(incoming);
         }
     }
 
@@ -1560,7 +1646,14 @@ impl FollowerReceiver {
     /// at construction and its consensus agent polls it — see
     /// [`FollowerStats`]' sibling doc and `Consensus::check_set_completeness`.
     pub fn stored_set_pos(&self) -> Arc<AtomicU64> {
-        Arc::clone(&self.stored_set_pos)
+        Arc::clone(&self.signals.stored_set_pos)
+    }
+
+    /// Backup-tier 3b ruling PF4: a handle on this receiver's completion
+    /// signals, for the node's `uc2-tier-fetch` thread. Take it AFTER
+    /// [`Self::set_snapshot_intake`], which wires the install route.
+    pub fn intake_signals(&self) -> SnapIntakeSignals {
+        self.signals.clone()
     }
 
     /// Coordinated-snapshot spec §5.7 items 5–6: wire the node's fetch route.
@@ -1650,7 +1743,9 @@ impl FollowerReceiver {
         // to reason about. (The M6 snapshot-install path keeps its own
         // `resync_after_snapshot_install`: it is gated on an adopt-floor that
         // must have been applied first.)
-        if append > self.rebuilt.contiguous() && self.snap_adopt_pending.is_none() {
+        if append > self.rebuilt.contiguous()
+            && self.signals.adopt_pending.load(Ordering::Acquire) == 0
+        {
             self.rebuilt = Rebuilt::new(append);
             self.last_published = append;
             self.leader_append = self.leader_append.max(append);
@@ -2444,6 +2539,38 @@ impl FollowerReceiver {
                     }
                 }
             }
+            // Backup-tier 3b spec §6.3: the leader's tier-install request.
+            // Term-gated above; the node checks `from` is the leader.
+            DGRAM_KIND_TIER_INSTALL => {
+                if let Some(b) = read_tier_install_body(&d[DATAGRAM_HEADER_LEN..]) {
+                    let ev = NetEvent::TierInstall {
+                        from,
+                        term: h.leadership_term_id,
+                        body: Box::new(b),
+                    };
+                    let idx = ev.kind_idx();
+                    if self.route.try_send(ev).is_err() {
+                        self.stats.net_drops[idx].fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+            // The follower's answer, demuxed to our sender (leader role).
+            // With no sender installed (not the leader role) it is dropped
+            // and counted (final review I6e).
+            DGRAM_KIND_TIER_INSTALL_STATUS => {
+                if let Some(b) = read_tier_install_status_body(&d[DATAGRAM_HEADER_LEN..]) {
+                    let routed = self.sender_route.as_ref().is_some_and(|route| {
+                        route
+                            .try_send(CtrlMsg::TierInstallStatus { from, body: b })
+                            .is_ok()
+                    });
+                    if !routed {
+                        self.stats
+                            .tier_install_status_dropped
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
             _ => {} // NAK/STATUS with no sender_route installed (follower role)
         }
     }
@@ -3042,30 +3169,9 @@ impl FollowerReceiver {
         // `uc2-cluster` agent). Its floor moves through the consensus agent's
         // ordinary completeness poll, from this one word.
         if intake.mode == IntakeMode::StoreOnly {
-            self.stored_set_pos.store(floor, Ordering::Release);
+            self.signals.publish_stored(floor);
             return;
         }
-        // Cluster-FSM spec §5.6: hand the CLUSTER ARTIFACT to the
-        // `uc2-cluster` agent, and publish its position, BEFORE the floor
-        // signal — the consensus agent's install handler samples the floor
-        // (Acquire) and only then reads the cluster position and waits for the
-        // agent's ack, so doing both first is what guarantees it sees THIS
-        // transfer's artifact rather than a stale or absent one. The agent
-        // owns the cluster FSM (it runs on its own thread), which is why this
-        // is a route and not an install here.
-        //
-        // A BLOCKING `send`, deliberately — not `try_send`. A dropped
-        // hand-off would leave the consensus agent waiting forever for an ack
-        // that never comes, and there is nothing else this receiver could
-        // usefully do with a set whose cluster image it cannot deliver. The
-        // channel is sized for the one install a session produces, so in
-        // practice it never blocks; the only `Err` is a disconnected
-        // `uc2-cluster` agent, and that failure is NAMED below rather than
-        // discarded — the floor is published either way (the artifacts are
-        // renamed on disk and the peer must not be left re-NAKing), so an
-        // operator whose node then never adopts it needs this line to know
-        // why.
-        //
         // `expect`, not a silent skip: `snap_complete` is only reached once
         // `cluster_received` is set, so the part is there by construction.
         // Skipping quietly would be the worst outcome — the cluster-position
@@ -3077,32 +3183,11 @@ impl FollowerReceiver {
             .iter()
             .find(|p| p.service_id == CLUSTER_ARTIFACT_ID)
             .expect("a session completes only once its CLUSTER ARTIFACT is renamed (§5.6)");
-        if let Some(cell) = &self.incoming_cluster_pos {
-            cell.store(p.snapshot_pos, Ordering::Release);
-        }
-        if let Some(tx) = &self.cluster_install
-            && tx.send((p.snapshot_pos, p.final_path.clone())).is_err()
-        {
-            // `uc_net` has no logging dependency (the node layer owns the
-            // naming for this crate), so this is the same `eprintln!` shape
-            // `snap_open_failed` uses. Not latched: it can only happen once
-            // per dead agent, and the node is on its way down.
-            eprintln!(
-                "uc_net: the uc2-cluster agent is gone -- cannot install the snapshot session's \
-                 cluster artifact {} at position {}. This node will adopt the session's floor \
-                 with the cluster row (membership, schedule table, settings) it booted with",
-                p.final_path.display(),
-                p.snapshot_pos
-            );
-        }
-        // Signal the consensus agent to adopt the floor + mirror observability.
-        if let Some(slot) = &self.incoming_snapshot_pos {
-            slot.store(floor, Ordering::Release);
-        }
-        // Arm the forward gap-tracker resync: once the consensus agent's AdoptFloor
-        // re-primes the shared `append` up to this position, rebuild our tracker
-        // forward so we NAK the retained `[floor, frontier)` tail (M6 Task 8).
-        self.snap_adopt_pending = Some(floor);
+        // Cluster-FSM spec §5.6: the cluster artifact goes to the
+        // `uc2-cluster` agent BEFORE the floor signal — see
+        // `SnapIntakeSignals::publish_installed`.
+        self.signals
+            .publish_installed(floor, p.snapshot_pos, p.final_path.clone());
         self.stats.datagrams.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -3266,14 +3351,16 @@ impl FollowerReceiver {
     /// re-primes the shared `append` counter FORWARD to the snapshot floor. Unlike
     /// the backward truncation re-prime, a forward move is indistinguishable from a
     /// leader's own append by the counter alone — so this resync is gated on an
-    /// actual completed install (`snap_adopt_pending`). Once `append` has reached
-    /// the adopted floor, rebuild the gap tracker there so the next NAK requests the
+    /// actual completed install (`SnapIntakeSignals::adopt_pending`). Once
+    /// `append` has reached the adopted floor, rebuild the gap tracker there so
+    /// the next NAK requests the
     /// retained tail (not the purged prefix, which would loop the session forever),
     /// then disarm.
     fn resync_after_snapshot_install(&mut self) {
-        let Some(floor) = self.snap_adopt_pending else {
+        let floor = self.signals.adopt_pending.load(Ordering::Acquire);
+        if floor == 0 {
             return;
-        };
+        }
         let append = self.buffer.counters().append.load_acquire();
         if append < floor {
             return; // AdoptFloor not applied yet
@@ -3290,7 +3377,14 @@ impl FollowerReceiver {
                 .truncation_resyncs
                 .fetch_add(1, Ordering::Relaxed);
         }
-        self.snap_adopt_pending = None;
+        // Cleared only if no NEWER install re-armed it meanwhile (the tier
+        // thread writes this cell from another thread).
+        let _ = self.signals.adopt_pending.compare_exchange(
+            floor,
+            0,
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        );
     }
 
     /// Emit a SNAP_NAK for the first gap in the inbound transfer (RTT-delayed,
@@ -5111,6 +5205,131 @@ mod tests {
             }
         }
         assert_eq!(st.statuses_refused.load(Relaxed), 2);
+    }
+
+    /// Backup-tier 3b (kinds 28/29): `TIER_INSTALL` routes as
+    /// `NetEvent::TierInstall` (by source address, crypto off) only at the
+    /// current term with a well-formed body, a stale term being counted; `TIER_INSTALL_STATUS` demuxes to the sender route.
+    #[test]
+    fn tier_install_kinds_route_by_address_without_crypto() {
+        use uc_protocol::v2::datagram::{
+            TIER_INSTALL_BODY_LEN, TIER_INSTALL_STATUS_BODY_LEN, TierInstallBody,
+            TierInstallReason, TierInstallState, TierInstallStatusBody, write_tier_install_body,
+            write_tier_install_status_body,
+        };
+        let b = buffer();
+        let mut leader = FakeLeader::new();
+        let (tx, rx) = mpsc::sync_channel::<NetEvent>(16);
+        let mut r = follower_routed(&b, leader.addr(), tx);
+        assert!(r.peer_ids.is_empty(), "crypto off: no peer ids");
+        let (ctx, crx) = mpsc::sync_channel::<CtrlMsg>(16);
+        r.set_sender_route(ctx);
+        let to = r.local_addr();
+
+        let sent = TierInstallBody {
+            floor: 4096,
+            commit: 8192,
+            s: 6144,
+            row_hash: [0x51, 0, 0, 0, 0, 0, 0, 0],
+            row_version: [7, 0, 0, 0, 0, 0, 0, 0],
+            row_size: [100, 0, 0, 0, 0, 0, 0, 0],
+            cluster_hash: 0xC1,
+            cluster_size: 50,
+        };
+        let mut body = [0u8; TIER_INSTALL_BODY_LEN];
+        write_tier_install_body(&mut body, &sent);
+        leader.send(to, DGRAM_KIND_TIER_INSTALL, 0, TERM, &body);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            assert!(Instant::now() < deadline, "TIER_INSTALL never routed");
+            r.do_work();
+            if let Ok(NetEvent::TierInstall { from, term, body }) = rx.try_recv() {
+                assert_eq!((from, term, *body), (leader.addr(), TERM, sent));
+                break;
+            }
+        }
+        // Stale term, floor > commit, and a short body all yield nothing.
+        leader.send(to, DGRAM_KIND_TIER_INSTALL, 0, TERM + 1, &body);
+        let mut bad = [0u8; TIER_INSTALL_BODY_LEN];
+        write_tier_install_body(
+            &mut bad,
+            &TierInstallBody {
+                floor: 9000,
+                ..sent
+            },
+        );
+        leader.send(to, DGRAM_KIND_TIER_INSTALL, 0, TERM, &bad);
+        leader.send(to, DGRAM_KIND_TIER_INSTALL, 0, TERM, &body[..15]);
+
+        let st = TierInstallStatusBody {
+            state: TierInstallState::Declined,
+            reason: TierInstallReason::NoSet,
+            position: 4096,
+            copied: 0,
+        };
+        let mut sb = [0u8; TIER_INSTALL_STATUS_BODY_LEN];
+        write_tier_install_status_body(&mut sb, &st);
+        leader.send(to, DGRAM_KIND_TIER_INSTALL_STATUS, 0, TERM, &sb);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            assert!(
+                Instant::now() < deadline,
+                "TIER_INSTALL_STATUS never demuxed"
+            );
+            r.do_work();
+            if let Ok(CtrlMsg::TierInstallStatus { from, body }) = crx.try_recv() {
+                assert_eq!((from, body), (leader.addr(), st));
+                break;
+            }
+        }
+        let until = Instant::now() + Duration::from_millis(500);
+        while Instant::now() < until {
+            r.do_work();
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "a refused TIER_INSTALL must not route"
+        );
+    }
+
+    /// Final review I6e: kind 29 at a node with no sender route (not the
+    /// leader role) is dropped and counted.
+    #[test]
+    fn a_tier_install_status_with_no_sender_route_is_counted() {
+        use uc_protocol::v2::datagram::{
+            TIER_INSTALL_STATUS_BODY_LEN, TierInstallReason, TierInstallState,
+            TierInstallStatusBody, write_tier_install_status_body,
+        };
+        let b = buffer();
+        let mut leader = FakeLeader::new();
+        let mut r = follower(&b, leader.addr());
+        let mut sb = [0u8; TIER_INSTALL_STATUS_BODY_LEN];
+        write_tier_install_status_body(
+            &mut sb,
+            &TierInstallStatusBody {
+                state: TierInstallState::Installed,
+                reason: TierInstallReason::None,
+                position: 4096,
+                copied: 0,
+            },
+        );
+        leader.send(r.local_addr(), DGRAM_KIND_TIER_INSTALL_STATUS, 0, TERM, &sb);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while r
+            .stats()
+            .tier_install_status_dropped
+            .load(Ordering::Relaxed)
+            == 0
+        {
+            assert!(Instant::now() < deadline, "kind 29 never counted");
+            r.do_work();
+        }
+        assert_eq!(
+            r.stats()
+                .tier_install_status_dropped
+                .load(Ordering::Relaxed),
+            1
+        );
     }
 
     /// Leader-role node composition (M4): the unified `FollowerReceiver` with a
@@ -7728,7 +7947,7 @@ mod tests {
             "...and hands nothing to the uc2-cluster agent: nothing is installed by fiat"
         );
         assert!(
-            r.snap_adopt_pending.is_none(),
+            r.signals.adopt_pending.load(Ordering::Acquire) == 0,
             "...and arms no floor adoption"
         );
         // It still ACKS: the learner's session slot must be freed.

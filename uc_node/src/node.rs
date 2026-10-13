@@ -82,13 +82,15 @@ use uc_protocol::v2::datagram::{
     DATAGRAM_HEADER_LEN, DGRAM_KIND_BACKUP_REPORT, DGRAM_KIND_COMMIT_POSITION,
     DGRAM_KIND_CONFIG_PROPOSAL, DGRAM_KIND_CONFIG_REPLY, DGRAM_KIND_READ_PROBE,
     DGRAM_KIND_READ_PROBE_ACK, DGRAM_KIND_REQUEST_VOTE, DGRAM_KIND_SNAP_REPORT,
-    DGRAM_KIND_TERM_MAP, DGRAM_KIND_VOTE, DatagramHeader, Holdings, JUMBO_MIN_RUNG,
-    MAX_PAYLOAD_DEFAULT, MAX_TERM_MAP_WIRE_ENTRIES, MTU_DEFAULT, READ_PROBE_BODY_LEN,
-    REQUEST_VOTE_BODY_LEN, ReadProbeBody, RequestVoteBody, SNAP_REPORT_BODY_LEN, SnapReportBody,
-    TERM_MAP_ENTRY_LEN, TERM_MAP_HEADER_LEN, TermMapEntryWire, VOTE_BODY_LEN, VoteBody, is_rung,
-    payload_ceiling, write_config_proposal_body, write_config_reply_body, write_datagram_header,
+    DGRAM_KIND_TERM_MAP, DGRAM_KIND_TIER_INSTALL_STATUS, DGRAM_KIND_VOTE, DatagramHeader, Holdings,
+    JUMBO_MIN_RUNG, MAX_PAYLOAD_DEFAULT, MAX_TERM_MAP_WIRE_ENTRIES, MTU_DEFAULT,
+    READ_PROBE_BODY_LEN, REQUEST_VOTE_BODY_LEN, ReadProbeBody, RequestVoteBody,
+    SNAP_REPORT_BODY_LEN, SnapReportBody, TERM_MAP_ENTRY_LEN, TERM_MAP_HEADER_LEN,
+    TIER_INSTALL_STATUS_BODY_LEN, TermMapEntryWire, TierInstallBody, TierInstallReason,
+    TierInstallState, TierInstallStatusBody, VOTE_BODY_LEN, VoteBody, is_rung, payload_ceiling,
+    write_config_proposal_body, write_config_reply_body, write_datagram_header,
     write_read_probe_body, write_request_vote_body, write_snap_report_body, write_term_map_body,
-    write_vote_body,
+    write_tier_install_status_body, write_vote_body,
 };
 use uc_protocol::v2::schedule::{
     MAX_SCHEDULE_ENTRIES, SCHEDULE_ENTRY_LEN, SCHEDULE_HEADER_LEN, ScheduleRule,
@@ -337,6 +339,36 @@ pub struct StartOpts {
     /// for the reason `admin` is: `NodeConfig` has no `Default` and many
     /// literal call sites.
     pub backup: Option<crate::tier::writer::BackupConfig>,
+    /// Backup-tier 3b spec §6.1: `[tier_source]` — a read-only tier to fetch
+    /// snapshot sets from. Resolved with `backup` by
+    /// [`resolve_tier_source`]. Here for the reason `backup` is.
+    pub tier_source: Option<std::path::PathBuf>,
+}
+
+/// Where a resolved tier source's path came from — which decides what a
+/// FOREIGN tier there means (coordinator ruling on Task 10).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceOrigin {
+    /// An explicit `[tier_source]`: a foreign tier refuses to start
+    /// (`tier_source_foreign`).
+    Explicit,
+    /// Implied by the node's own `[backup]` target: a foreign tier is not
+    /// used as a source (logged `tier_source_unavailable`), and the writer's
+    /// own `backup_target_foreign` stop names it, as in 3a.
+    Backup,
+}
+
+/// 3b spec §6.1: the tier a node reads as a source — `[tier_source]` if
+/// given, else its own `[backup]` target, else none (peers only) — and
+/// which of the two it was.
+pub fn resolve_tier_source(
+    tier_source: Option<std::path::PathBuf>,
+    backup: Option<&crate::tier::writer::BackupConfig>,
+) -> Option<(std::path::PathBuf, SourceOrigin)> {
+    match tier_source {
+        Some(p) => Some((p, SourceOrigin::Explicit)),
+        None => backup.map(|b| (b.target.clone(), SourceOrigin::Backup)),
+    }
 }
 
 /// Ingress queue depth (M5 replaces this with the client submit ring).
@@ -424,6 +456,16 @@ const HOLDINGS_PROBE_NS: u64 = 1_000_000_000;
 /// reports can each contribute what they know (one the furthest chain, the
 /// other a set copied late). `reporter` follows the report that leads on
 /// `(through, newest_set)`.
+/// Archive-side defensive purge clamp: the writer's cap (`None` = no hold or
+/// released) and the EFFECTIVE gate (`u64::MAX` = no gate, K = 0, or released
+/// for low space — set by `Consensus::purge_gate`). A command sent before a
+/// re-arm must not cut past either; a released hold must not be re-imposed.
+fn clamp_purge_below(below: u64, writer_cap: Option<u64>, effective_gate: u64) -> u64 {
+    below
+        .min(writer_cap.unwrap_or(u64::MAX))
+        .min(effective_gate)
+}
+
 fn coalesce_backup_report(held: &mut BackupWatermark, w: &BackupWatermark) {
     if (w.through, w.newest_set) > (held.through, held.newest_set) {
         held.reporter = w.reporter;
@@ -1087,8 +1129,10 @@ pub enum FetchRefusal {
 /// receiver agent to run. Kept so a second request does not silently pile up
 /// behind the first, and so the operator's verb becomes re-runnable again
 /// once the fetch has either landed or plainly failed.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 struct PendingFetch {
+    /// The member a PEER fetch asks — and, for a tier fetch, the member the
+    /// fallback asks if the tier copy fails.
     learner: NodeId,
     /// The position asked for; `0` = "the learner's newest", which is why the
     /// completion test below is `stored_set_pos` MOVING rather than reaching
@@ -1102,7 +1146,25 @@ struct PendingFetch {
     /// Snapshot-lifecycle spec §6: issued by auto-fetch (its outcome feeds
     /// `uc2_snapshot_auto_fetch_total`), not by `uc2ctl snapshot fetch`.
     auto: bool,
+    /// Backup-tier 3b spec §6.2: where the set is coming from.
+    source: FetchSource,
 }
+
+/// Backup-tier 3b spec §6.2: a store-only fetch runs as a `uc2-tier-fetch`
+/// copy from this node's tier source, or as a peer session through the
+/// receiver agent.
+#[derive(Debug)]
+enum FetchSource {
+    Tier(crate::tier::source::TierFetch),
+    Peer,
+}
+
+/// Backup-tier 3b spec §6.3: a running tier install reports `installing`
+/// this often (the leader holds the session while `copied` rises).
+const TIER_INSTALL_STATUS_EVERY_NS: u64 = 1_000_000_000;
+
+/// The `tier_install_declined` line's `reason`.
+use crate::tier::source::install_reason_name as tier_install_reason_name;
 
 /// How long a `snapshot fetch` stays pending before this node forgets it.
 ///
@@ -1216,6 +1278,11 @@ pub struct Node {
     /// Backup-tier spec §5.4: `uc2_backup_hold_released_total` — the SAME
     /// `Arc` [`Consensus::backup_purge_cap`] bumps.
     backup_hold_released: Arc<AtomicU64>,
+    /// Backup-tier 3b: the gate's three observability handles — the SAME
+    /// `Arc`s [`Consensus::purge_gate`] writes.
+    purge_gate: Arc<AtomicU64>,
+    backup_gate_released: Arc<AtomicU64>,
+    backup_gate_released_level: Arc<AtomicBool>,
     /// Backup-tier spec §6.2: the backup writer's newest chain watermark,
     /// waiting for the consensus agent to take it — the SAME slot
     /// `Consensus::backup_claim` reads.
@@ -1285,6 +1352,12 @@ pub struct Node {
     /// Snapshot-lifecycle spec §6: `uc2_snapshot_auto_fetch_total{outcome}`,
     /// bumped by the consensus agent and exported through `ObsSources`.
     auto_fetch_stats: Arc<crate::auto_fetch::AutoFetchStats>,
+    /// `uc2_snapshot_fetch_total{source}` (3b spec §6.6).
+    fetch_source_stats: Arc<crate::tier::source::FetchSourceStats>,
+    /// `uc2_tier_install_total{outcome}`, the follower's half (3b spec §6.6).
+    tier_install_stats: Arc<crate::tier::source::TierInstallStats>,
+    /// 3b spec §6.1: the tier source, for its test seams.
+    tier_source: Option<Arc<crate::tier::source::TierSource>>,
     /// Plan ruling P14: the `uc2-holdings` probe's free-space override
     /// ([`Node::set_free_bytes_for_test`]; `0` = the real `statvfs`).
     free_override: Arc<AtomicU64>,
@@ -1330,6 +1403,7 @@ impl Node {
             socket,
             admin,
             backup,
+            tier_source,
         } = opts;
         let sock = match socket {
             Some(sock) => sock,
@@ -1369,6 +1443,54 @@ impl Node {
         cfg.services
             .validate("NodeConfig::services fsm_lag", cfg.buffer_bytes as u64)
             .map_err(|d| io::Error::new(io::ErrorKind::InvalidInput, d))?;
+
+        // Backup-tier 3b spec §6.1: the read-only tier source. An EXPLICIT
+        // `[tier_source]` of another cluster is a named refusal; one implied
+        // by `[backup]` is simply not used (the writer's own
+        // `backup_target_foreign` stop names it, as in 3a). An absent or
+        // unreadable one is logged and every fetch falls back to peers.
+        let tier_source_handle = match resolve_tier_source(tier_source, backup.as_ref()) {
+            Some((path, origin)) => match crate::tier::source::TierSource::open(&path, &cfg.app_id)
+            {
+                Ok(src) => {
+                    if let Some(detail) = src.unavailable() {
+                        uc_obs::obs_event!(
+                            Warn,
+                            "tier_source_unavailable",
+                            path = path.display().to_string().as_str(),
+                            detail = detail.as_str()
+                        );
+                    }
+                    Some(Arc::new(src))
+                }
+                Err(e) if origin == SourceOrigin::Backup => {
+                    // Not the refusal's text: an implied source is not
+                    // refused, only left unused.
+                    let detail = match e {
+                        crate::tier::TierError::SourceForeign {
+                            tier_app_id,
+                            app_id,
+                            ..
+                        } => format!("foreign: TIER names app_id {tier_app_id}, not {app_id}"),
+                        other => format!("foreign: {other}"),
+                    };
+                    uc_obs::obs_event!(
+                        Warn,
+                        "tier_source_unavailable",
+                        path = path.display().to_string().as_str(),
+                        detail = detail.as_str()
+                    );
+                    None
+                }
+                Err(e) => {
+                    return Err(io::Error::other(format!(
+                        "node {} refuses to start: {e}",
+                        cfg.id
+                    )));
+                }
+            },
+            None => None,
+        };
 
         let instance = InstanceDir::acquire(&cfg.instance_dir).map_err(to_io)?;
 
@@ -1758,9 +1880,14 @@ impl Node {
         // Spec §5.4: the writer's shared state exists before the agents that
         // read it — the consensus agent (the purge hold and the keep hold)
         // and the archive agent (the same cap, applied defensively).
-        let backup_shared = backup
-            .as_ref()
-            .map(|_| Arc::new(crate::tier::writer::WriterShared::default()));
+        let backup_shared = backup.as_ref().map(|_| {
+            let shared = crate::tier::writer::WriterShared::default();
+            // Boot publish (3b): the recovered, re-derived map — published
+            // even when it needed no rewrite, so the writer's first pass
+            // already has a lineage to record.
+            *shared.term_map.lock().unwrap_or_else(|e| e.into_inner()) = sm.term_map().to_vec();
+            Arc::new(shared)
+        });
         // A learner never leads, so its sender streams to no one: give it a solo
         // (empty) fan-out with a cluster size of 1, which also sidesteps flow
         // control's leader-in-cluster invariant (from a learner's view every voter
@@ -1942,6 +2069,20 @@ impl Node {
             }
             Some((hint_learner.load(Ordering::Relaxed), position))
         }));
+        // Backup-tier 3b spec §6.3 (Task 14 ruling): which set a below-floor
+        // follower is asked to install from its own tier — the leader's
+        // newest agreed set in `[floor, commit]` that the registered tiers
+        // cover, with this node's committed verdict for it. The view is
+        // built below, after the cluster FSM recovers; until it is filled
+        // (boot only) the closure answers `None` and the session path
+        // serves, as before. The sender never touches the view itself.
+        let tier_install_view: Arc<std::sync::OnceLock<Arc<ClusterView>>> =
+            Arc::new(std::sync::OnceLock::new());
+        let tiv = Arc::clone(&tier_install_view);
+        sender.set_tier_install_source(Arc::new(move |floor, commit| {
+            let inner = tiv.get()?.snapshot_inner();
+            crate::tier::source::leader_install_body(floor, commit, &inner.catalog, &inner.backups)
+        }));
 
         // M6 Task 9: the per-peer observability band, cnc-slot order (voters
         // first, then learners), capped at the fixed slot count — already
@@ -2041,6 +2182,11 @@ impl Node {
         let (fetch_tx, fetch_rx) = mpsc::sync_channel::<SnapFetch>(1);
         receiver.set_fetch_route(fetch_rx);
         let stored_set_pos = receiver.stored_set_pos();
+        // Ruling PF4: taken after `set_snapshot_intake` above, so the clone
+        // carries the install route too (Task 13's tier install uses it).
+        let intake_signals = receiver.intake_signals();
+        let fetch_source_stats = Arc::new(crate::tier::source::FetchSourceStats::default());
+        let tier_install_stats = Arc::new(crate::tier::source::TierInstallStats::default());
         // Validated frontier, published by the consensus agent and read by the
         // receiver so its AppendPosition reports attest validated bytes only.
         let validated_frontier = Arc::new(AtomicU64::new(durable));
@@ -2063,6 +2209,11 @@ impl Node {
         let arc_first_base = Arc::clone(&archive_first_base);
         let arc_prime_gen = Arc::clone(&prime_generation);
         let arc_backup = backup_shared.clone();
+        let purge_gate = Arc::new(AtomicU64::new(u64::MAX));
+        let backup_gate_released = Arc::new(AtomicU64::new(0));
+        let backup_gate_released_level = Arc::new(AtomicBool::new(false));
+        let effective_gate = Arc::new(AtomicU64::new(u64::MAX));
+        let arc_gate = Arc::clone(&effective_gate);
         // Forensic trace for the 2026-08-16 acked-write-loss hunt: every journal
         // cut is rare (elections only), so an env-gated line per cut is free.
         let trunc_trace = std::env::var("UC2_TRUNC_TRACE").is_ok();
@@ -2219,10 +2370,11 @@ impl Node {
                         // cap is a pure read of the writer's shared state
                         // (the release decision stays with consensus), so
                         // no second copy of the space rule lives here.
-                        let below = match arc_backup.as_deref().and_then(|b| b.purge_cap()) {
-                            Some(cap) => below.min(cap),
-                            None => below,
-                        };
+                        let below = clamp_purge_below(
+                            below,
+                            arc_backup.as_deref().and_then(|b| b.purge_cap()),
+                            arc_gate.load(Ordering::Acquire),
+                        );
                         // Best-effort: a failed purge logs + drops (retries next
                         // interval). Correctness never depends on a block still
                         // being present — a reader below the floor recovers via
@@ -2395,6 +2547,7 @@ impl Node {
                 .collect(),
         )?;
         let cluster_view = Arc::new(ClusterView::new(cluster_fsm.state()));
+        let _ = tier_install_view.set(Arc::clone(&cluster_view));
         let mut cluster_agent = crate::cluster_agent::ClusterAgent::new(
             Arc::clone(&buffer),
             Arc::clone(&cnc),
@@ -2547,7 +2700,37 @@ impl Node {
             backup_reports_appended: Arc::clone(&backup_reports_appended),
             backup_shared: backup_shared.clone(),
             backup_chunk_bytes: backup.as_ref().map_or(0, |b| b.chunk_bytes),
+            tier_source: tier_source_handle.clone(),
+            intake_signals: intake_signals.clone(),
+            tier_declined: (0, String::new()),
+            tier_verify_failed: 0,
+            tier_draining: Vec::new(),
+            tier_install: None,
+            tier_install_body: TierInstallBody {
+                floor: 0,
+                commit: 0,
+                s: 0,
+                row_hash: [0; 8],
+                row_version: [0; 8],
+                row_size: [0; 8],
+                cluster_hash: 0,
+                cluster_size: 0,
+            },
+            pending_install_lineage: None,
+            tier_install_leader: SocketAddr::from(([0, 0, 0, 0], 0)),
+            tier_install_last_status_ns: 0,
+            tier_install_decline_logged: None,
+            tier_install_not_leader: 0,
+            tier_install_stale_term: 0,
+            fetch_source_stats: Arc::clone(&fetch_source_stats),
+            tier_install_stats: Arc::clone(&tier_install_stats),
             backup_hold_released: Arc::clone(&backup_hold_released),
+            purge_gate: Arc::clone(&purge_gate),
+            effective_gate,
+            backup_gate_released: Arc::clone(&backup_gate_released),
+            backup_gate_released_level: Arc::clone(&backup_gate_released_level),
+            gate_released: false,
+            gate_tick: 0,
             backup_claim: Arc::clone(&backup_claim),
             pending_backup_reports: BTreeMap::new(),
             pending_snapshot_reports: HashMap::new(),
@@ -2750,6 +2933,9 @@ impl Node {
             backup_reports_unsent,
             backup_reports_appended,
             backup_hold_released,
+            purge_gate,
+            backup_gate_released,
+            backup_gate_released_level,
             backup_claim,
             reports_implausible,
             reports_unattested,
@@ -2768,6 +2954,9 @@ impl Node {
             holdings,
             election_timeout_max_ns: cfg.election_timeout_max_ns,
             auto_fetch_stats,
+            fetch_source_stats,
+            tier_install_stats,
+            tier_source: tier_source_handle,
             free_override,
             _instance: instance,
             _rings: rings,
@@ -2853,6 +3042,24 @@ impl Node {
         self.backup_writer.clone()
     }
 
+    /// Backup-tier 3b — TEST SEAM, not API: every later `uc2-tier-fetch`
+    /// thread sleeps `per_artifact` before copying each artifact (default
+    /// 0), so a test can hold a tier copy open. A no-op without a tier
+    /// source.
+    #[doc(hidden)]
+    pub fn set_tier_fetch_delay_for_test(&self, per_artifact: Duration) {
+        if let Some(src) = &self.tier_source {
+            src.set_fetch_delay_for_test(per_artifact);
+        }
+    }
+
+    /// Backup-tier 3b — TEST SEAM, not API: how many `uc2-tier-fetch`
+    /// threads this node has started (0 without a tier source).
+    #[doc(hidden)]
+    pub fn tier_fetches_spawned(&self) -> u64 {
+        self.tier_source.as_ref().map_or(0, |s| s.fetches_spawned())
+    }
+
     /// Backup-tier spec §6.2 — TEST SEAM, not API: put `w` into this node's
     /// backup-claim slot exactly as the `uc2-backup` writer thread does
     /// (Task 8), so an end-to-end test can drive the report path without a
@@ -2877,6 +3084,19 @@ impl Node {
     /// driver runs, this advances to at most the snapshot floor.
     pub fn archive_first_base(&self) -> u64 {
         self.archive_first_base.load(Ordering::Acquire)
+    }
+
+    /// Backup-tier 3b — TEST SEAM, not API: the node's term map as the
+    /// writer sees it (`WriterShared::term_map`), or, on a node with no
+    /// writer, the persisted map read from the state dir.
+    #[doc(hidden)]
+    pub fn term_map_for_test(&self) -> Vec<(u32, u64)> {
+        if let Some(w) = &self.backup_writer {
+            return w.term_map.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        }
+        NodeState::open(&self._instance.state_dir())
+            .map(|s| to_pairs(&s.term_map()))
+            .unwrap_or_default()
     }
 
     /// Cluster-FSM spec §4.1/§4.5: the cluster FSM's own published view
@@ -3274,6 +3494,9 @@ impl Node {
             backup_reports_unsent: Arc::clone(&self.backup_reports_unsent),
             backup_reports_appended: Arc::clone(&self.backup_reports_appended),
             backup_hold_released: Arc::clone(&self.backup_hold_released),
+            purge_gate: Arc::clone(&self.purge_gate),
+            backup_gate_released: Arc::clone(&self.backup_gate_released),
+            backup_gate_released_level: Arc::clone(&self.backup_gate_released_level),
             backup_writer: self.backup_writer.clone(),
             cluster_view: Arc::clone(&self.cluster_view),
             probe: Arc::clone(&self.probe_table),
@@ -3287,6 +3510,8 @@ impl Node {
             snapshot_row_incomplete: self.snapshot_row_incomplete.clone(),
             snapshot_fetched_position: Arc::clone(&self.snapshot_fetched_position),
             snapshot_auto_fetch: Arc::clone(&self.auto_fetch_stats),
+            snapshot_fetch_source: Arc::clone(&self.fetch_source_stats),
+            tier_install: Arc::clone(&self.tier_install_stats),
             snapshot_holdings: Arc::clone(&self.holdings),
             snapshot_freeze: Arc::clone(&self.snapshot_freeze),
             crypto_enabled: self.crypto.is_some(),
@@ -3961,8 +4186,87 @@ struct Consensus {
     /// `[backup] chunk_bytes`: the space rule's size (`auto_fetch::fits`
     /// over one chunk). Unused without a writer.
     backup_chunk_bytes: u64,
+    /// Backup-tier 3b spec §6.1: the read-only tier this node may fetch
+    /// snapshot sets from (Tasks 12/13 consume it).
+    tier_source: Option<Arc<crate::tier::source::TierSource>>,
+    /// Ruling PF4: the receiver's completion signals, which a
+    /// `uc2-tier-fetch` thread raises for a set it copied from the tier.
+    intake_signals: uc_net::receiver::SnapIntakeSignals,
+    /// Ruling RA4 / review I2: the `(position, reason)` a PLAN-time
+    /// `tier_fetch_declined` was last logged for, so a decision re-taken for
+    /// the same P and the same reason names it once. Copy-time failures
+    /// (`verify`, `io`, `timeout`) are always named — once per fetch.
+    tier_declined: (u64, String),
+    /// Review I1: the set position whose tier copy last failed `verify`
+    /// here — the tier's copy of it is corrupt, so AUTO-fetch stops trying
+    /// it (an operator fetch still does). Transient failures (`io`,
+    /// `timeout`) skip the tier only for the fallback that follows them.
+    tier_verify_failed: u64,
+    /// Review C1: tier copies cancelled at their deadline, kept until their
+    /// thread reports (then joined). No tier copy of a draining position is
+    /// started (plan-time reason `draining`): two threads must never write
+    /// the same `incoming-<P>.tier.part`.
+    tier_draining: Vec<crate::tier::source::TierFetch>,
+    /// `uc2_snapshot_fetch_total{source}` — the SAME allocation `/metrics`
+    /// reads.
+    fetch_source_stats: Arc<crate::tier::source::FetchSourceStats>,
+    /// Backup-tier 3b spec §6.3: the running `TIER_INSTALL` copy
+    /// (`FetchMode::Install`) — at most one; a second request while it runs
+    /// answers `installing`, never a second thread.
+    tier_install: Option<crate::tier::source::TierFetch>,
+    /// The `TIER_INSTALL` body the running install was spawned for — what
+    /// a plan-time decline names (final review I2: the plan runs on the
+    /// thread, so its decline arrives after the request was answered).
+    tier_install_body: TierInstallBody,
+    /// Spec §6.3 step 3: a finished tier install's `(S, lineage)`, which
+    /// `maybe_adopt_incoming_snapshot` adopts (A) in place of
+    /// `last_leader_map` when it adopts S. Set only when S is above what the
+    /// handler has already adopted, and taken by the next adoption whatever
+    /// its position, so it never outlives the install it belongs to.
+    pending_install_lineage: Option<(u64, Vec<(u32, u64)>)>,
+    /// Where the running install's `TIER_INSTALL_STATUS` goes: the leader
+    /// that asked LAST (a new leader asking while it runs takes over the
+    /// progress reports — review focus 1).
+    tier_install_leader: SocketAddr,
+    /// `pass_now_ns` of the last status sent for the running install (the
+    /// 1 s `installing` cadence).
+    tier_install_last_status_ns: u64,
+    /// `uc2_tier_install_total{outcome="installed"|"declined"}` — the SAME
+    /// allocation `/metrics` reads.
+    tier_install_stats: Arc<crate::tier::source::TierInstallStats>,
+    /// The door- or plan-time decline reason last LOGGED, so a leader
+    /// re-asking for the same reason names it once; reset when an install
+    /// succeeds (final review I2: the plan runs on the thread, so "an install
+    /// started" is no longer known at the door).
+    tier_install_decline_logged: Option<TierInstallReason>,
+    /// `TIER_INSTALL`s dropped because their sender is not this node's
+    /// leader (the receiver gates the term only); the first is logged.
+    tier_install_not_leader: u64,
+    /// `TIER_INSTALL`s dropped because the term they were admitted at is no
+    /// longer this node's term by the time the consensus agent reads them
+    /// (review round 1: the SM can move on between the receiver's gate and
+    /// here).
+    tier_install_stale_term: u64,
     /// `uc2_backup_hold_released_total`: releases, once per episode.
     backup_hold_released: Arc<AtomicU64>,
+    /// Backup-tier 3b spec §5.2: the journal-purge gate — `u64::MAX` when
+    /// K = 0, else `gate_position(K, tiers)` (0 = hold everything). Stored
+    /// on every node (purge on or off) so the gauge reads; the archive agent
+    /// holds the SAME `Arc` and clamps a `Purge` to it.
+    purge_gate: Arc<AtomicU64>,
+    /// What the ARCHIVE agent clamps a `Purge` to: the gate while it applies,
+    /// `u64::MAX` while released, K = 0 or purge off (the `purge_cap()`
+    /// shape). `purge_gate` stays the gauge value.
+    effective_gate: Arc<AtomicU64>,
+    /// The low-space release latch ([`Self::purge_gate`]).
+    gate_released: bool,
+    /// `uc2_backup_gate_released_total`, and the `uc2_backup_gate_released`
+    /// level gauge.
+    backup_gate_released: Arc<AtomicU64>,
+    backup_gate_released_level: Arc<AtomicBool>,
+    /// Idle-pass counter: refreshes the gate gauge on a node whose floor
+    /// persister takes the cheap exit.
+    gate_tick: u32,
     /// Backup-tier spec §6.2: the backup writer's newest watermark claim
     /// (written by the `uc2-backup` thread, Task 8), TAKEN by
     /// [`Consensus::take_backup_claim`] once per pass. A newer claim simply
@@ -4835,6 +5139,12 @@ impl Consensus {
 
         // 9. Sample the receiver's completed-inbound-snapshot signal (M6 Task 6);
         // on a new value, adopt it as the archive floor and mirror it to cnc.
+        // Backup-tier 3b spec §6.3: a running tier install is polled first
+        // (its 1 s `installing` cadence, its completion), so a set it just
+        // finished is adopted in this same pass. One branch when none runs.
+        if self.tier_install.is_some() {
+            self.poll_tier_install();
+        }
         did |= self.maybe_adopt_incoming_snapshot();
 
         // 10. Publish the per-peer observability band + archive floor (M6 Task 9).
@@ -5731,6 +6041,37 @@ impl Consensus {
         self.publish_peer_band();
     }
 
+    /// Backup-tier 3b: publish the SM's full in-memory term map to the
+    /// writer, right after a `store_term_map` made it durable. A no-op
+    /// without a writer.
+    fn publish_term_map(&self) {
+        self.publish_term_map_from(self.sm.term_map());
+    }
+
+    /// As [`Self::publish_term_map`], for a site that persisted a map the SM
+    /// has not adopted yet (the truncate emits the pruned map; the SM adopts
+    /// it only on the matching `Truncated` ack): publish what was PERSISTED.
+    fn publish_term_map_from(&self, map: &[(u32, u64)]) {
+        if let Some(shared) = &self.backup_shared {
+            *shared.term_map.lock().unwrap_or_else(|e| e.into_inner()) = map.to_vec();
+        }
+    }
+
+    /// Backup-tier 3b (RA2): publish ALL committed tier watermark entries
+    /// (at most `MAX_BACKUP_TIERS`) to the writer, unfiltered: the writer
+    /// selects its own tier's entry by the id it learns from the target, so
+    /// a restarted writer trusts the committed entry on its first refresh
+    /// (no ordering against tier-id discovery). Called from
+    /// [`Self::refresh_from_view`] on every cluster-view move.
+    fn publish_backup_confirmed(&self, backups: &[uc_protocol::v2::backup::BackupTierEntry]) {
+        if let Some(shared) = &self.backup_shared {
+            *shared
+                .confirmed_all
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = backups.to_vec();
+        }
+    }
+
     /// M6 Task 6. When the receiver completes an inbound snapshot transfer it
     /// raises `incoming_snapshot`; sample it and, on a new position, mirror it to
     /// the cnc observability slot and — when our own durable frontier is below it
@@ -5757,6 +6098,34 @@ impl Consensus {
             return false;
         }
         self.adopted_incoming = pos;
+        // Backup-tier 3b spec §6.3 step 3 (A): a set installed from THIS
+        // node's tier carries its own lineage (the `SET`'s); a session's set
+        // the leader's map. Taken here, on every adoption, so a finished
+        // install's lineage is cleared even when nothing below adopts it
+        // (`durable >= pos`: a late install, ruling on spec §8).
+        let lineage = match self.pending_install_lineage.take() {
+            Some((p, l)) if p == pos => l,
+            _ => match self.tier_install.as_ref() {
+                // Final review I1: an install still running at or below
+                // `pos` that a cancel still stops has NOT published — so
+                // the set landing is a SESSION's (the leader gave up on the
+                // tier and the session won). Cancel the copy, so two paths
+                // never finish on one follower, drain it, and adopt the
+                // session's lineage.
+                Some(f) if f.position <= pos && f.cancel() => {
+                    let f = self.tier_install.take().expect("matched above");
+                    self.tier_draining.push(f);
+                    self.last_leader_map.clone()
+                }
+                // The install's thread raised these signals and has not yet
+                // reported `done` (its publish won any cancel): the same
+                // set, so the `SET`'s lineage, never the leader's map.
+                Some(f) if f.position == pos => {
+                    f.lineage().unwrap_or_else(|| self.last_leader_map.clone())
+                }
+                _ => self.last_leader_map.clone(),
+            },
+        };
         // Ruling R42: a session-installed set is the leader's freeze, not
         // this node's — never reported as ours, then or after a restart (the
         // receiver marked it on disk before the cluster artifact landed).
@@ -5787,12 +6156,13 @@ impl Consensus {
             // clamp a truncate below the adopted floor (a PositionPurged fail-stop).
             // Persist-before-adopt: the seeded map is durable before the floor moves,
             // so a crash in the window recovers a map consistent with the floor.
-            if !self.last_leader_map.is_empty() {
-                self.sm.adopt_snapshot_lineage(&self.last_leader_map);
+            if !lineage.is_empty() {
+                self.sm.adopt_snapshot_lineage(&lineage);
                 let map = to_entries(self.sm.term_map());
                 self.state
                     .store_term_map(&map)
                     .expect("term-map persist fail-stop");
+                self.publish_term_map();
             }
             // M7 Task 6 / cluster-FSM spec §5.6: the snapshot session carried
             // the leader's membership alongside the lineage — inside the
@@ -5944,6 +6314,13 @@ impl Consensus {
         // Cheap exit every cycle when there is neither a newer floor to persist
         // nor a purge policy that might have outstanding work.
         if !may_move && !purge_on {
+            // RA7: the gauge still reads on a node with nothing to persist
+            // and no purge — refreshed every 4096th idle pass (one atomic
+            // load when K = 0) rather than locking the view every cycle.
+            self.gate_tick = self.gate_tick.wrapping_add(1);
+            if self.gate_tick % 4096 == 1 {
+                self.purge_gate();
+            }
             return false;
         }
         let now = self.now_ns();
@@ -5953,6 +6330,9 @@ impl Consensus {
         if !floor_elapsed {
             return false;
         }
+        // Backup-tier 3b: compute (and store) the gate once per throttled
+        // evaluation; the purge branch below clamps with it.
+        let gate = self.purge_gate();
 
         let mut did = false;
         // `held`: `own` could have moved the floor but the candidate did not
@@ -6025,6 +6405,15 @@ impl Consensus {
                 target = cap;
                 held = true;
             }
+            // Backup-tier 3b spec §5.2: hold the journal at the K-th confirmed
+            // tier. Clamps the purge TARGET only — never the snapshot floor,
+            // never raises a target; released on low space (`purge_gate`).
+            if let Some(g) = gate
+                && g < target
+            {
+                target = g;
+                held = true;
+            }
             // Only command a purge that would actually advance the floor. The
             // archive acks by advancing `archive_first_base`; `try_send` (not
             // `send`) keeps a full channel from blocking the consensus loop — a
@@ -6041,6 +6430,103 @@ impl Consensus {
         // idle strategy hot for as long as an upgrade takes to swap its
         // binary.
         did
+    }
+
+    /// Backup-tier 3b spec §5.2/§5.4: the journal-purge gate. ALWAYS computes
+    /// and stores [`Self::purge_gate`] (RA7: the gauge reads with purge off
+    /// too); returns the clamp to apply — `Some(gate)` — only when `[purge]`
+    /// is on, K >= 1 and the gate is not released for low space. The release
+    /// rule is `backup_purge_cap`'s: low free bytes (an unknown figure never
+    /// releases) fail `fits` for one chunk — the writer's `chunk_bytes` when
+    /// this node has a writer, else the default (PF3, a writerless node's
+    /// `backup_chunk_bytes` is 0); each edge logs once.
+    #[inline(never)]
+    fn purge_gate(&mut self) -> Option<u64> {
+        let clamp = self.purge_gate_inner();
+        let eff = clamp.unwrap_or(u64::MAX);
+        if self.effective_gate.load(Ordering::Relaxed) != eff {
+            self.effective_gate.store(eff, Ordering::Release);
+        }
+        clamp
+    }
+
+    fn purge_gate_inner(&mut self) -> Option<u64> {
+        use crate::auto_fetch::{FREE_BYTES_UNKNOWN, fits};
+        let purge_on = matches!(self.purge_policy, PurgePolicy::BelowSnapshot { .. });
+        // Final review I3: K and `backups` are read from the cluster view,
+        // which at boot is the RECOVERED artifact's until the cluster agent's
+        // walk reaches commit — a K raise or a `tier forget` committed after
+        // the newest artifact is invisible until then. So, purge on, the gate
+        // holds EVERYTHING (`0`) until this node has JOINED — the attach
+        // gate's own predicate (`declared_published`: leader known, commit
+        // learned, the walk consumed to commit) — whatever K reads.
+        if purge_on && !self.declared_published {
+            if self.purge_gate.load(Ordering::Relaxed) != 0 {
+                self.purge_gate.store(0, Ordering::Release);
+            }
+            return Some(0);
+        }
+        let k = self
+            .cluster_view
+            .purge_requires_tiers
+            .load(Ordering::Acquire);
+        let gate = crate::tier::gate_position(k, &self.cluster_view.backups());
+        let value = gate.unwrap_or(u64::MAX);
+        if self.purge_gate.load(Ordering::Relaxed) != value {
+            self.purge_gate.store(value, Ordering::Release);
+        }
+        let gate = match gate {
+            Some(g) if purge_on => g,
+            // Final review I6a: no gate now (K = 0) or purge off — clear a
+            // low-space release latched while there was one, so its level
+            // gauge does not read "released" for a gate that no longer
+            // exists (the effective gate is lifted by the caller: `None`).
+            _ => {
+                if self.gate_released {
+                    self.gate_released = false;
+                    self.backup_gate_released_level
+                        .store(false, Ordering::Release);
+                }
+                return None;
+            }
+        };
+        let free = self
+            .holdings
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .free_bytes;
+        if free != FREE_BYTES_UNKNOWN {
+            let chunk = if self.backup_shared.is_some() {
+                self.backup_chunk_bytes
+            } else {
+                crate::tier::writer::DEFAULT_CHUNK_BYTES
+            };
+            let low = !fits(free, chunk);
+            if low != self.gate_released {
+                self.gate_released = low;
+                self.backup_gate_released_level
+                    .store(low, Ordering::Release);
+                if low {
+                    self.backup_gate_released.fetch_add(1, Ordering::Relaxed);
+                    crate::obs_event!(
+                        Warn,
+                        "backup_gate_released",
+                        node = self.id as u64,
+                        gate = gate,
+                        free_bytes = free
+                    );
+                } else {
+                    crate::obs_event!(
+                        Info,
+                        "backup_gate_rearmed",
+                        node = self.id as u64,
+                        gate = gate,
+                        free_bytes = free
+                    );
+                }
+            }
+        }
+        if self.gate_released { None } else { Some(gate) }
     }
 
     /// Backup-tier spec §5.4: the purge cap the `uc2-backup` writer's hold
@@ -8801,6 +9287,7 @@ impl Consensus {
             config_version: position,
             detail: Some(&detail),
             source: crate::audit::SOURCE_GENESIS,
+            fetch_source: None,
         };
         if let Err(e) = self.audit.record(&rec) {
             let err = e.to_string();
@@ -8852,6 +9339,7 @@ impl Consensus {
             config_version: position,
             detail: None,
             source: crate::audit::SOURCE_DISCOVERY,
+            fetch_source: None,
         };
         if let Err(e) = self.audit.record(&rec) {
             let err = e.to_string();
@@ -9097,6 +9585,7 @@ impl Consensus {
         }
         self.view_position_seen = vp;
         let inner = self.cluster_view.snapshot_inner();
+        self.publish_backup_confirmed(&inner.backups);
         // Catalog spec §5.1: `sets_held` is a bitmap over THIS view's list,
         // stamped with its content hash (ruling R16) — recomputed only when
         // that hash moved, not on every cursor move. `publish` stores the
@@ -10670,6 +11159,14 @@ impl Consensus {
                 self.on_backup_report(from, w);
                 return;
             }
+            // Backup-tier 3b spec §6.3: the leader asks this below-floor
+            // follower to install from its own tier. Handled inline — the
+            // copy is this agent's own state; the receiver gated the term
+            // only, so `on_tier_install` checks the sender IS the leader.
+            NetEvent::TierInstall { from, term, body } => {
+                self.on_tier_install(from, term, &body);
+                return;
+            }
         };
         self.feed(event);
     }
@@ -11185,7 +11682,7 @@ impl Consensus {
                 (0, 0, position)
             }
             Err(AppendError::WouldOverrun) => (2, 0, view_position),
-            // Unreachable: `SETTINGS_LEN` is 46 bytes. Refused rather than
+            // Unreachable: `SETTINGS_LEN` is 47 bytes. Refused rather than
             // retried, for `apply_schedule_table`'s reason.
             Err(AppendError::PayloadTooLarge) => self.refuse_settings(REASON_SETTINGS_DECODE),
         }
@@ -11458,7 +11955,24 @@ impl Consensus {
     /// The body `start_fetch` always had, minus its learner door: auto-fetch
     /// may pull from any member (plan ruling P1) — the source's sender serves
     /// a `SNAP_REQUEST` whatever its role.
+    ///
+    /// Backup-tier 3b spec §6.2: a node with a tier source tries the tier
+    /// FIRST — a `uc2-tier-fetch` thread copies the set, verified against
+    /// the catalog — and asks `from` only when the tier cannot serve P
+    /// (named once per position, `tier_fetch_declined`).
     fn issue_fetch(&mut self, from: NodeId, position: u64, auto: bool) -> Result<(), FetchRefusal> {
+        self.issue_fetch_checked(from, position, auto, true)
+    }
+
+    /// [`Self::issue_fetch`]'s door checks, then the tier (when `tier`) and
+    /// the peer.
+    fn issue_fetch_checked(
+        &mut self,
+        from: NodeId,
+        position: u64,
+        auto: bool,
+        tier: bool,
+    ) -> Result<(), FetchRefusal> {
         // Honour `PendingFetch`: one fetch at a time. A second request is
         // answered `retry` rather than quietly replacing a transfer that is
         // very likely still running (the receiver would drop the new one
@@ -11469,6 +11983,412 @@ impl Consensus {
         if position > self.cnc.counters().durable.load_acquire() {
             return Err(FetchRefusal::AboveDurable);
         }
+        if tier && self.try_tier_fetch(from, position, auto) {
+            return Ok(());
+        }
+        self.issue_fetch_peer(from, position, auto)
+    }
+
+    /// Backup-tier 3b spec §6.2: start a store-only copy of the set at
+    /// `position` from this node's tier source; `false` (no source, a
+    /// position the tier cannot be asked for, or — named once per position —
+    /// a copy of it still draining) sends the caller to a peer. Whether the
+    /// tier can serve P is decided on the fetch thread (final review I2); a
+    /// plan-time decline falls back to the peer from `poll_pending_fetch`.
+    /// `from` is the peer the fallback asks — `self.id` when none was chosen
+    /// yet (auto-fetch tries the tier BEFORE picking a holder), in which case
+    /// a failed copy re-runs the auto-fetch step's peer-candidate logic.
+    fn try_tier_fetch(&mut self, from: NodeId, position: u64, auto: bool) -> bool {
+        // `0` names no set ("the learner's newest"): only a peer resolves it.
+        // A set the tier holds corrupt goes to a peer under auto-fetch.
+        if position == 0
+            || (auto && position == self.tier_verify_failed)
+            || position > self.cnc.counters().durable.load_acquire()
+        {
+            return false;
+        }
+        let Some(src) = self.tier_source.clone() else {
+            return false;
+        };
+        // A tier INSTALL of the same set (spec §6.3) writes the same
+        // `.tier.part` names too; it is above durable while it runs, so this
+        // is a belt to the `position > durable` braces above.
+        if self.tier_draining.iter().any(|f| f.position == position)
+            || self
+                .tier_install
+                .as_ref()
+                .is_some_and(|f| f.position == position)
+        {
+            self.note_tier_fetch_declined(position, "draining");
+            return false;
+        }
+        // Final review I2: the plan's tier reads (`TIER`, the registration,
+        // the `SET`) run on the fetch thread, never here — a hung tier would
+        // wedge the consensus agent. The node hands it what it already holds
+        // in memory: the committed `backups` (the registration / `through`
+        // cap, spec §6.1) and the agreed catalog entry the copy is verified
+        // against (D8). A plan-time decline comes back through `done` and
+        // `poll_pending_fetch` falls back to the peer, as for a failed copy.
+        let inner = self.cluster_view.snapshot_inner();
+        let entry = inner
+            .catalog
+            .into_iter()
+            .find(|e| e.position == position && e.is_agreed());
+        let fetch = crate::tier::source::spawn_fetch(
+            src,
+            self.snap_root.clone(),
+            crate::tier::source::FetchPlan::StoreOnly {
+                position,
+                entry,
+                backups: inner.backups,
+            },
+            self.intake_signals.clone(),
+        );
+        self.pending_fetch = Some(PendingFetch {
+            learner: from,
+            position,
+            stored_before: self.stored_set_pos.load(Ordering::Acquire),
+            deadline_ns: self.pass_now_ns.saturating_add(FETCH_TIMEOUT_NS),
+            auto,
+            source: FetchSource::Tier(fetch),
+        });
+        crate::obs_event!(
+            Info,
+            "snapshot_fetch_requested",
+            node = self.id as u64,
+            from = "tier",
+            position = position,
+            actor = if auto { "auto" } else { "operator" },
+            source = "tier"
+        );
+        true
+    }
+
+    /// Ruling RA4: `tier_fetch_declined{position, reason}`, once per set
+    /// position — a fetch re-issued (or re-tried by auto-fetch) for the same
+    /// P does not repeat it.
+    fn note_tier_fetch_declined(&mut self, position: u64, reason: &str) {
+        if self.tier_declined.0 == position && self.tier_declined.1 == reason {
+            return;
+        }
+        self.tier_declined = (position, reason.to_string());
+        self.name_tier_fetch_declined(position, reason);
+    }
+
+    /// The `tier_fetch_declined` line itself — called unlatched for a
+    /// copy-time failure (review I2: tier corruption must never be hidden
+    /// behind an earlier plan-time line for the same P).
+    fn name_tier_fetch_declined(&self, position: u64, reason: &str) {
+        crate::obs_event!(
+            Info,
+            "tier_fetch_declined",
+            node = self.id as u64,
+            position = position,
+            reason = reason
+        );
+    }
+
+    /// Backup-tier 3b spec §6.3, the follower: the leader asks this
+    /// below-floor node to install the set S it NAMES (`floor <= S <= commit`)
+    /// from its own tier, verified against the catalog verdict it carries. Rules, in order:
+    ///
+    /// - a sender that is not this node's leader (`leader_hint`'s address)
+    ///   is dropped and counted — the receiver gated the term only (Task 11
+    ///   ruling: its id map is crypto-only);
+    /// - an install already running answers `installing` (review focus 1:
+    ///   one copy per node; a NEW leader asking takes over the reports);
+    /// - one finished but not yet adopted answers `installed` again;
+    /// - no source → `declined(no_source)` at once; a tier copy of S
+    ///   already running or draining → `declined(no_set)` at once;
+    /// - else (final review I2) spawn the `uc2-tier-fetch` thread in
+    ///   `FetchPlan::Install` and answer `installing{S, 0}` at once. The
+    ///   THREAD does every tier read: `TIER` must read and be this cluster's
+    ///   ([`crate::tier::source::TierSource::is_ours`] — no registration,
+    ///   ruling F1, so a later `tier forget` cannot reach a running copy),
+    ///   then [`crate::tier::source::check_install_set`] on the set the
+    ///   leader NAMED (`body.s`, its `SET` read from the tier) against the
+    ///   verdict the body CARRIES — never this node's catalog, which a new
+    ///   learner does not have (controller ruling) — then (final review I4)
+    ///   [`crate::tier::source::lineage_consistent`] against the leader's
+    ///   map and this node's term. A plan-time `Err` reaches the leader as
+    ///   `declined(reason)` after the `installing` (`poll_tier_install`).
+    ///
+    /// No file I/O here: the consensus agent never touches the tier.
+    #[cold]
+    #[inline(never)]
+    fn on_tier_install(&mut self, from: SocketAddr, term: u32, body: &TierInstallBody) {
+        // Re-checked HERE, not only at the receiver's gate: the SM may have
+        // moved to a newer term since the datagram was admitted, and a
+        // request from an older term's leader must neither be served nor
+        // teach the hint.
+        if term != self.sm.current_term() {
+            self.tier_install_stale_term += 1;
+            return;
+        }
+        // Only a leader-role sender emits kind 28, so with no leader known
+        // yet (a node just restarted or just past an election learns the
+        // hint from commit gossip, which can trail the leader's first answer
+        // to its NAK), a current-term request identifies the term's leader
+        // exactly as that gossip would. Without this a restarted follower
+        // drops the request and the leader waits out its 2 s answer timeout.
+        // Safe: `term` is the datagram's own, equal to the current term
+        // (checked just above), and a term has one leader.
+        if self.cnc.status().leader_hint.load_acquire() == u64::MAX {
+            self.learn_leader_hint(from, term);
+        }
+        let hint = self.cnc.status().leader_hint.load_acquire();
+        let leader = (hint != u64::MAX)
+            .then(|| self.id_to_addr.get(&(hint as NodeId)).copied())
+            .flatten();
+        if leader != Some(from) {
+            self.tier_install_not_leader += 1;
+            if self.tier_install_not_leader == 1 {
+                crate::obs_event!(
+                    Info,
+                    "tier_install_ignored",
+                    node = self.id as u64,
+                    from = from.to_string().as_str(),
+                    reason = "not_leader"
+                );
+            }
+            return;
+        }
+        if let Some(f) = &self.tier_install {
+            let (position, copied) = (f.position, f.copied.load(Ordering::Relaxed));
+            self.tier_install_leader = from;
+            self.tier_install_last_status_ns = self.pass_now_ns;
+            self.send_tier_install_status(from, TierInstallState::Installing, position, copied);
+            return;
+        }
+        // Finished, its adoption still waiting on the cluster agent's ack:
+        // `installed` again, not a second copy — unless a later intake has
+        // since overwritten the signal, in which case nothing will adopt S
+        // and the request is decided afresh.
+        if let Some((position, _)) = &self.pending_install_lineage {
+            let position = *position;
+            if self.incoming_snapshot.load(Ordering::Acquire) == position {
+                self.send_tier_install_status(from, TierInstallState::Installed, position, 0);
+                return;
+            }
+            self.pending_install_lineage = None;
+        }
+        // Already at or past S (a stale or repeated request — a session, or
+        // an earlier copy, got here first): nothing to copy, and a late
+        // `publish_installed` would re-arm the receiver below what it adopted.
+        if body.s <= self.cnc.counters().durable.load_acquire() {
+            self.send_tier_install_status(from, TierInstallState::Installed, body.s, 0);
+            return;
+        }
+        let Some(src) = self.tier_source.clone() else {
+            self.decline_tier_install(from, body, TierInstallReason::NoSource, "");
+            return;
+        };
+        // A set a cancelled store-only copy is still draining (or a
+        // store-only copy is copying) is "no set" for this request: two
+        // threads must never share `incoming-<P>.tier.part`, and the leader
+        // names one S, so there is no other set to fall back to here.
+        // Node state, no I/O: decided here.
+        if self.tier_copy_running_at(body.s) {
+            self.decline_tier_install(from, body, TierInstallReason::NoSet, "draining");
+            return;
+        }
+        // Final review I2: everything else that reads the tier — `TIER`
+        // (ruling F1: an install needs no registration, only `TIER` must be
+        // ours), the one `SET` the leader named, the check against the
+        // verdict the body carries, and (final review I4) the `SET`'s lineage
+        // against the leader's map and this node's term — runs on the
+        // `uc2-tier-fetch` thread before it copies a byte. `installing{S, 0}`
+        // is answered NOW; a plan-time decline follows as `declined(reason)`
+        // from `poll_tier_install`, which the leader's sender handles as it
+        // handles any decline after `installing` (session + hold).
+        self.tier_install = Some(crate::tier::source::spawn_fetch(
+            src,
+            self.snap_root.clone(),
+            crate::tier::source::FetchPlan::Install {
+                body: *body,
+                leader_map: self.last_leader_map.clone(),
+                current_term: self.sm.current_term(),
+            },
+            self.intake_signals.clone(),
+        ));
+        self.tier_install_body = *body;
+        self.tier_install_leader = from;
+        self.tier_install_last_status_ns = self.pass_now_ns;
+        crate::obs_event!(
+            Info,
+            "tier_install_started",
+            node = self.id as u64,
+            position = body.s,
+            floor = body.floor,
+            commit = body.commit
+        );
+        self.send_tier_install_status(from, TierInstallState::Installing, body.s, 0);
+    }
+
+    /// A tier copy of `position` is running (store-only) or draining.
+    fn tier_copy_running_at(&self, position: u64) -> bool {
+        self.tier_draining.iter().any(|f| f.position == position)
+            || matches!(
+                &self.pending_fetch,
+                Some(PendingFetch { source: FetchSource::Tier(f), .. }) if f.position == position
+            )
+    }
+
+    /// The running install, each pass while one runs: its `installing`
+    /// report every second to the leader that asked last, and its end —
+    /// `Ok(lineage)` held for `maybe_adopt_incoming_snapshot` (the thread
+    /// already raised the install signals) and answered `installed` once;
+    /// `Err` (its files already removed) answered `declined`.
+    #[cold]
+    #[inline(never)]
+    fn poll_tier_install(&mut self) {
+        let Some(f) = self.tier_install.as_mut() else {
+            return;
+        };
+        let to = self.tier_install_leader;
+        let Some(result) = f.try_finish() else {
+            if self
+                .pass_now_ns
+                .saturating_sub(self.tier_install_last_status_ns)
+                >= TIER_INSTALL_STATUS_EVERY_NS
+            {
+                let (position, copied) = (f.position, f.copied.load(Ordering::Relaxed));
+                self.tier_install_last_status_ns = self.pass_now_ns;
+                self.send_tier_install_status(to, TierInstallState::Installing, position, copied);
+            }
+            return;
+        };
+        let position = f.position;
+        self.tier_install = None;
+        match result {
+            Ok(set_lineage) => {
+                // Already adopted (on the running-lineage path, or a newer set
+                // landed meanwhile): nothing is left for the handler to take.
+                if position > self.adopted_incoming {
+                    self.pending_install_lineage = Some((position, set_lineage));
+                }
+                self.tier_install_stats
+                    .installed
+                    .fetch_add(1, Ordering::Relaxed);
+                self.tier_install_decline_logged = None;
+                crate::obs_event!(
+                    Info,
+                    "tier_install_done",
+                    node = self.id as u64,
+                    position = position
+                );
+                self.send_tier_install_status(to, TierInstallState::Installed, position, 0);
+            }
+            // Final review I2: the thread's PLAN declined (nothing was
+            // copied) — exactly the door-time decline it used to be, now
+            // after the `installing` the node answered at spawn.
+            Err(crate::tier::source::FetchError::Plan { reason, detail }) => {
+                let body = self.tier_install_body;
+                let reason = crate::tier::source::install_reason_of(
+                    &crate::tier::source::FetchError::Plan { reason, detail },
+                );
+                self.decline_tier_install(to, &body, reason, detail);
+            }
+            Err(why) => {
+                // The set vanished under the copy (retention) is `no_set`;
+                // anything else — a mismatch, an unreadable object — is
+                // `verify`. The line names the copy's own reason too.
+                let reason = crate::tier::source::install_reason_of(&why);
+                self.tier_install_stats
+                    .declined
+                    .fetch_add(1, Ordering::Relaxed);
+                crate::obs_event!(
+                    Info,
+                    "tier_install_declined",
+                    node = self.id as u64,
+                    position = position,
+                    reason = tier_install_reason_name(reason),
+                    detail = why.reason()
+                );
+                self.send_tier_install_decline(to, reason, position);
+            }
+        }
+    }
+
+    /// A door- or plan-time decline: counted, answered, and named once per
+    /// reason until an install succeeds.
+    fn decline_tier_install(
+        &mut self,
+        to: SocketAddr,
+        body: &TierInstallBody,
+        reason: TierInstallReason,
+        detail: &str,
+    ) {
+        self.tier_install_stats
+            .declined
+            .fetch_add(1, Ordering::Relaxed);
+        if self.tier_install_decline_logged != Some(reason) {
+            self.tier_install_decline_logged = Some(reason);
+            crate::obs_event!(
+                Info,
+                "tier_install_declined",
+                node = self.id as u64,
+                position = body.s,
+                floor = body.floor,
+                commit = body.commit,
+                reason = tier_install_reason_name(reason),
+                detail = detail
+            );
+        }
+        self.send_tier_install_decline(to, reason, body.s);
+    }
+
+    /// `position` = the set S the decline is about (the leader matches
+    /// declines by peer, never by position; this is for the reader).
+    fn send_tier_install_decline(
+        &mut self,
+        to: SocketAddr,
+        reason: TierInstallReason,
+        position: u64,
+    ) {
+        self.send_tier_install_body(
+            to,
+            TierInstallStatusBody {
+                state: TierInstallState::Declined,
+                reason,
+                position,
+                copied: 0,
+            },
+        );
+    }
+
+    fn send_tier_install_status(
+        &mut self,
+        to: SocketAddr,
+        state: TierInstallState,
+        position: u64,
+        copied: u64,
+    ) {
+        self.send_tier_install_body(
+            to,
+            TierInstallStatusBody {
+                state,
+                reason: TierInstallReason::None,
+                position,
+                copied,
+            },
+        );
+    }
+
+    fn send_tier_install_body(&mut self, to: SocketAddr, b: TierInstallStatusBody) {
+        let mut body = [0u8; TIER_INSTALL_STATUS_BODY_LEN];
+        write_tier_install_status_body(&mut body, &b);
+        let term = self.sm.current_term();
+        self.send(to, DGRAM_KIND_TIER_INSTALL_STATUS, b.position, term, &body);
+    }
+
+    /// The peer fetch: hand the pull to the receiver agent.
+    fn issue_fetch_peer(
+        &mut self,
+        from: NodeId,
+        position: u64,
+        auto: bool,
+    ) -> Result<(), FetchRefusal> {
         let Some(&peer) = self.id_to_addr.get(&from) else {
             return Err(FetchRefusal::UnknownPeer);
         };
@@ -11491,6 +12411,7 @@ impl Consensus {
             stored_before: self.stored_set_pos.load(Ordering::Acquire),
             deadline_ns: self.pass_now_ns.saturating_add(FETCH_TIMEOUT_NS),
             auto,
+            source: FetchSource::Peer,
         });
         crate::obs_event!(
             Info,
@@ -11498,7 +12419,8 @@ impl Consensus {
             node = self.id as u64,
             from = from as u64,
             position = position,
-            actor = if auto { "auto" } else { "operator" }
+            actor = if auto { "auto" } else { "operator" },
+            source = "peer"
         );
         Ok(())
     }
@@ -11519,12 +12441,15 @@ impl Consensus {
         if n == 0 || self.auto_fetch.quiet(n, self.pass_now_ns) || self.holdings_held.contains(&n) {
             return;
         }
-        self.auto_fetch_step(n);
+        self.auto_fetch_step(n, false);
     }
 
+    /// `skip_tier`: review I1 — the fallback right after a failed tier copy
+    /// of `n` goes straight to the peer-candidate logic; the next round
+    /// (`maybe_auto_fetch`) tries the tier again.
     #[cold]
     #[inline(never)]
-    fn auto_fetch_step(&mut self, n: u64) {
+    fn auto_fetch_step(&mut self, n: u64, skip_tier: bool) {
         use crate::auto_fetch::{Outcome, SpaceCheck};
         let now = self.pass_now_ns;
         let durable = self.cnc.counters().durable.load_acquire();
@@ -11580,6 +12505,14 @@ impl Consensus {
             | SpaceCheck::FreeUnknown { first: false }
             | SpaceCheck::Fits => {}
         }
+        // Backup-tier 3b spec §6.2: the tier first — even with no peer
+        // holder. The peer-candidate logic below runs only when it cannot
+        // serve `n`. Review I3: audited with the node's OWN id (it served
+        // itself) and `fetch_source = "tier"`.
+        if !skip_tier && self.try_tier_fetch(self.id, n, true) {
+            self.audit_auto_fetch(self.id, n, "tier");
+            return;
+        }
         let candidates = self.auto_fetch_candidates(n, &inner);
         let Some(from) = self.auto_fetch.pick(&candidates, now) else {
             self.auto_fetch_stats.bump(Outcome::NoHolder);
@@ -11599,8 +12532,9 @@ impl Consensus {
                 position = n
             );
         }
-        match self.issue_fetch(from, n, true) {
-            Ok(()) => self.audit_auto_fetch(from, n),
+        // The tier was tried (or skipped) above: peers only from here.
+        match self.issue_fetch_checked(from, n, true, false) {
+            Ok(()) => self.audit_auto_fetch(from, n, "peer"),
             Err(_) => {
                 self.auto_fetch_stats.bump(Outcome::Refused);
                 self.auto_fetch.on_result(Outcome::Refused, now);
@@ -11671,11 +12605,12 @@ impl Consensus {
     /// stall. The `uc2-holdings` thread writes and fsyncs it within ~50 ms
     /// ([`crate::audit::AutoFetchAuditWriter::drain`]); a full queue drops
     /// the record, counts it, and the writer names the count.
-    fn audit_auto_fetch(&mut self, from: NodeId, position: u64) {
+    fn audit_auto_fetch(&mut self, from: NodeId, position: u64, source: &'static str) {
         self.auto_fetch_audit.push(crate::audit::AutoFetchAudit {
             ts_ns: crate::obs::metrics::now_unix_ns(),
             from,
             position,
+            source,
         });
     }
 
@@ -11685,45 +12620,138 @@ impl Consensus {
     /// Costs one predictable branch per pass; the clock is this pass's, never a
     /// fresh reading.
     fn poll_pending_fetch(&mut self) {
-        let Some(p) = self.pending_fetch else {
+        if !self.tier_draining.is_empty() {
+            // Review C1: a cancelled copy is retired (joined) once its
+            // thread has reported.
+            self.tier_draining.retain_mut(|f| f.try_finish().is_none());
+        }
+        let Some(p) = self.pending_fetch.as_mut() else {
             return;
         };
+        if let FetchSource::Tier(f) = &mut p.source {
+            use crate::tier::source::FetchError;
+            let failed = match f.try_finish() {
+                Some(Ok(_lineage)) => {
+                    let p = self.pending_fetch.take().expect("matched above");
+                    self.fetch_stored(&p, p.position, "tier");
+                    return;
+                }
+                Some(Err(e)) => e,
+                // Review C1: a copy past the deadline is CANCELLED (it then
+                // renames and publishes nothing, and removes only its own
+                // temp files — the peer session below writes the same final
+                // names) and drained: kept until its thread reports, never
+                // joined while running. (Final review I2: that includes a
+                // thread still in its PLAN — a hung tier read.)
+                None if self.pass_now_ns > p.deadline_ns => FetchError::Copy("timeout".into()),
+                None => return,
+            };
+            let mut p = self.pending_fetch.take().expect("matched above");
+            if let FetchSource::Tier(f) = std::mem::replace(&mut p.source, FetchSource::Peer)
+                && failed.reason() == "timeout"
+            {
+                f.cancel();
+                self.tier_draining.push(f);
+            }
+            match &failed {
+                // Final review I2: decided by the thread's plan (nothing was
+                // copied) — named once per (position, reason), as when the
+                // plan ran here (ruling RA4).
+                FetchError::Plan { reason, .. } => {
+                    self.note_tier_fetch_declined(p.position, reason)
+                }
+                // Spec §6.2 step 4: what the copy wrote is gone (or,
+                // cancelled, is left to the peer) — always named (review I2).
+                FetchError::Copy(reason) => {
+                    if reason == "verify" {
+                        self.tier_verify_failed = p.position;
+                    }
+                    self.name_tier_fetch_declined(p.position, reason);
+                }
+            }
+            // Fall back to a peer AT ONCE.
+            if p.learner == self.id {
+                // Auto-fetch tried the tier before choosing a holder: choose
+                // one now, skipping the tier for this fallback only.
+                self.auto_fetch_step(p.position, true);
+            } else if self
+                .issue_fetch_peer(p.learner, p.position, p.auto)
+                .is_err()
+                && p.auto
+            {
+                self.auto_fetch_stats
+                    .bump(crate::auto_fetch::Outcome::Refused);
+                self.auto_fetch
+                    .on_result(crate::auto_fetch::Outcome::Refused, self.pass_now_ns);
+            }
+            return;
+        }
         let stored = self.stored_set_pos.load(Ordering::Acquire);
         if stored > p.stored_before {
-            self.pending_fetch = None;
-            if p.auto {
-                self.auto_fetch_stats.bump(crate::auto_fetch::Outcome::Ok);
-                self.auto_fetch
-                    .on_result(crate::auto_fetch::Outcome::Ok, self.pass_now_ns);
-            }
+            let p = self.pending_fetch.take().expect("matched above");
+            self.fetch_stored(&p, stored, "peer");
+        } else if self.pass_now_ns > p.deadline_ns {
+            let p = self.pending_fetch.take().expect("matched above");
+            self.fetch_timed_out(&p);
+        }
+    }
+
+    /// A pending fetch landed: count it by source (and as auto-fetch's
+    /// `ok`), and name it.
+    fn fetch_stored(&mut self, p: &PendingFetch, position: u64, source: &str) {
+        let counter = if source == "tier" {
+            &self.fetch_source_stats.tier
+        } else {
+            &self.fetch_source_stats.peer
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+        if p.auto {
+            self.auto_fetch_stats.bump(crate::auto_fetch::Outcome::Ok);
+            self.auto_fetch
+                .on_result(crate::auto_fetch::Outcome::Ok, self.pass_now_ns);
+        }
+        if source == "tier" {
+            crate::obs_event!(
+                Info,
+                "snapshot_fetch_stored",
+                node = self.id as u64,
+                from = "tier",
+                position = position,
+                source = source
+            );
+        } else {
             crate::obs_event!(
                 Info,
                 "snapshot_fetch_stored",
                 node = self.id as u64,
                 from = p.learner as u64,
-                position = stored
-            );
-        } else if self.pass_now_ns > p.deadline_ns {
-            self.pending_fetch = None;
-            if p.auto {
-                self.auto_fetch_stats
-                    .bump(crate::auto_fetch::Outcome::Timeout);
-                self.auto_fetch
-                    .on_result(crate::auto_fetch::Outcome::Timeout, self.pass_now_ns);
-            } else {
-                // Controller ruling R8 (plan ruling P15): an OPERATOR fetch's
-                // expiry parks the receiver's straggler slot too — auto-fetch
-                // waits out the same 1 s floor before clearing it.
-                self.auto_fetch.note_timeout(self.pass_now_ns);
-            }
-            crate::obs_event!(
-                Warn,
-                "snapshot_fetch_timeout",
-                node = self.id as u64,
-                from = p.learner as u64,
-                position = p.position
+                position = position,
+                source = source
             );
         }
+    }
+
+    /// A pending PEER fetch's deadline passed (the receiver's arm expired
+    /// too, so an operator fetch parks its straggler slot).
+    fn fetch_timed_out(&mut self, p: &PendingFetch) {
+        if p.auto {
+            self.auto_fetch_stats
+                .bump(crate::auto_fetch::Outcome::Timeout);
+            self.auto_fetch
+                .on_result(crate::auto_fetch::Outcome::Timeout, self.pass_now_ns);
+        } else {
+            // Controller ruling R8 (plan ruling P15): an OPERATOR fetch's
+            // expiry parks the receiver's straggler slot too — auto-fetch
+            // waits out the same 1 s floor before clearing it.
+            self.auto_fetch.note_timeout(self.pass_now_ns);
+        }
+        crate::obs_event!(
+            Warn,
+            "snapshot_fetch_timeout",
+            node = self.id as u64,
+            from = p.learner as u64,
+            position = p.position
+        );
     }
 
     /// Count + name one refused `schedule apply` and build its reply triple.
@@ -11990,6 +13018,7 @@ impl Consensus {
             // record in the file that does not is discovery's own
             // `settings_apply` (jumbo spec §9) — see `audit_datagram_mtu`.
             source: crate::audit::SOURCE_OPERATOR,
+            fetch_source: None,
         };
         match self.audit.record(&rec) {
             Ok(()) => (status, reason),
@@ -12200,6 +13229,7 @@ impl Consensus {
                 self.state
                     .store_term_map(&map)
                     .expect("term-map persist fail-stop");
+                self.publish_term_map();
                 // (Plan 1 task 5: no schedule-record revert here any more. The
                 // table lives in the cluster FSM, which advances only at
                 // COMMIT, and the collapse cuts only this node's own
@@ -12362,6 +13392,7 @@ impl Consensus {
                 self.state
                     .store_term_map(&to_entries(&new_map))
                     .expect("term-map persist fail-stop");
+                self.publish_term_map_from(&new_map);
                 // M7 Task 6: persist-revert-BEFORE-truncate — the SAME discipline as
                 // the term-map persist immediately above. If this truncation drops
                 // the currently-adopted config FRAME (`to` lands strictly below its
@@ -12434,6 +13465,7 @@ impl Consensus {
                 self.state
                     .store_term_map(&to_entries(&new_map))
                     .expect("term-map persist fail-stop");
+                self.publish_term_map_from(&new_map);
             }
             Action::Fatal { reason } => {
                 panic!("consensus fatal (fail-stop): {reason}");
@@ -15098,7 +16130,14 @@ mod tests {
             backup_reports_appended: Arc::new(AtomicU64::new(0)),
             backup_shared: None,
             backup_chunk_bytes: 0,
+            tier_source: None,
             backup_hold_released: Arc::new(AtomicU64::new(0)),
+            purge_gate: Arc::new(AtomicU64::new(u64::MAX)),
+            effective_gate: Arc::new(AtomicU64::new(u64::MAX)),
+            gate_released: false,
+            backup_gate_released: Arc::new(AtomicU64::new(0)),
+            backup_gate_released_level: Arc::new(AtomicBool::new(false)),
+            gate_tick: 0,
             backup_claim: Arc::new(Mutex::new(None)),
             pending_backup_reports: BTreeMap::new(),
             pending_snapshot_reports: HashMap::new(),
@@ -15192,6 +16231,32 @@ mod tests {
             cluster_snapshot_dir: dir.path().join("snapshots").join("cluster"),
             pending_fetch: None,
             fetch_tx,
+            intake_signals: uc_net::receiver::SnapIntakeSignals::new(
+                Arc::clone(&stored_set_pos),
+                None,
+            ),
+            tier_declined: (0, String::new()),
+            tier_verify_failed: 0,
+            tier_draining: Vec::new(),
+            tier_install: None,
+            tier_install_body: TierInstallBody {
+                floor: 0,
+                commit: 0,
+                s: 0,
+                row_hash: [0; 8],
+                row_version: [0; 8],
+                row_size: [0; 8],
+                cluster_hash: 0,
+                cluster_size: 0,
+            },
+            pending_install_lineage: None,
+            tier_install_leader: SocketAddr::from(([0, 0, 0, 0], 0)),
+            tier_install_last_status_ns: 0,
+            tier_install_decline_logged: None,
+            tier_install_not_leader: 0,
+            tier_install_stale_term: 0,
+            fetch_source_stats: Arc::new(Default::default()),
+            tier_install_stats: Arc::new(Default::default()),
             stored_set_pos,
             stored_above_durable: 0,
             stored_set_noted: 0,
@@ -15906,6 +16971,8 @@ mod tests {
     fn the_floor_persists_at_the_newest_agreed_set_held_not_at_own() {
         use uc_protocol::v2::upgrade::RowRunning;
         let mut h = harness_with_rows(&["a"]);
+        // A joined node: final review I3 holds every purge before that.
+        h.cons.declared_published = true;
         h.cons.purge_policy = PurgePolicy::BelowSnapshot { slack_bytes: 0 };
         let (agreed, own) = (4096u64, 6016u64);
         assert!(own <= h.cons.cnc.counters().durable.load_acquire());
@@ -16127,6 +17194,238 @@ mod tests {
         assert_eq!(list_row_artifacts(&h, 0), vec![3000], "released: not kept");
     }
 
+    /// Backup-tier 3b (Task 7): the K-th confirmed tier gates the journal
+    /// purge; low space releases it, counted once per episode.
+    #[test]
+    fn the_gate_caps_the_purge_at_the_kth_tier_and_releases_on_low_space() {
+        let mut h = harness_with_rows(&["a"]);
+        h.cons.declared_published = true;
+        h.cons.purge_policy = PurgePolicy::BelowSnapshot { slack_bytes: 0 };
+        h.cons.holdings.lock().unwrap().free_bytes = 1 << 40;
+        let floor = 65_536u64;
+        let mut st = h.cons.cluster_view.to_state();
+        st.catalog = vec![agreed_entry(floor)];
+        st.running[0] = Some(uc_protocol::v2::upgrade::RowRunning {
+            row: 0,
+            version: 1,
+            record_pos: 1,
+        });
+        st.settings.purge_requires_tiers = 1;
+        st.backups = vec![gate_entry(1, 4096)];
+        h.cons.cluster_view.publish(&st);
+        h.cons.snapshot_set_position.store(floor, Ordering::Release);
+        h.cons.cnc.counters().durable.store_release(floor + 1000);
+        h.cons.note_set_held(floor);
+        let purge = |h: &mut Harness| -> Option<u64> {
+            h.advance_floor_timer();
+            h.cons.maybe_persist_snapshot_floor();
+            let mut last = None;
+            while let Ok(cmd) = h._trunc_rx.try_recv() {
+                if let ArchiveCmd::Purge { below } = cmd {
+                    last = Some(below);
+                }
+            }
+            last
+        };
+        let released = |h: &Harness| h.cons.backup_gate_released.load(Ordering::Relaxed);
+        let level = |h: &Harness| h.cons.backup_gate_released_level.load(Ordering::Relaxed);
+
+        assert_eq!(purge(&mut h), Some(4096), "clamped to the K-th tier");
+        assert_eq!(h.cons.purge_gate.load(Ordering::Relaxed), 4096);
+        assert_eq!(h.cons.snapshot_persisted_floor, floor, "floor untouched");
+
+        h.cons.holdings.lock().unwrap().free_bytes = 1;
+        assert_eq!(purge(&mut h), Some(floor), "released: the full target");
+        assert_eq!(
+            h.cons.effective_gate.load(Ordering::Relaxed),
+            u64::MAX,
+            "released: the archive's gate is lifted"
+        );
+        assert_eq!(
+            h.cons.purge_gate.load(Ordering::Relaxed),
+            4096,
+            "gauge keeps the gate"
+        );
+        assert_eq!(released(&h), 1);
+        assert!(level(&h));
+        assert_eq!(purge(&mut h), Some(floor));
+        assert_eq!(released(&h), 1, "once per episode");
+
+        h.cons.holdings.lock().unwrap().free_bytes = 1 << 40;
+        assert_eq!(purge(&mut h), Some(4096), "re-armed");
+        assert_eq!(h.cons.effective_gate.load(Ordering::Relaxed), 4096);
+        assert!(!level(&h));
+        assert_eq!(released(&h), 1);
+    }
+
+    #[test]
+    fn k_above_the_registered_count_holds_everything_without_a_release() {
+        let mut h = harness_with_rows(&["a"]);
+        h.cons.declared_published = true;
+        h.cons.purge_policy = PurgePolicy::BelowSnapshot { slack_bytes: 0 };
+        h.cons.holdings.lock().unwrap().free_bytes = 1 << 40;
+        let floor = 65_536u64;
+        let mut st = h.cons.cluster_view.to_state();
+        st.catalog = vec![agreed_entry(floor)];
+        st.running[0] = Some(uc_protocol::v2::upgrade::RowRunning {
+            row: 0,
+            version: 1,
+            record_pos: 1,
+        });
+        st.settings.purge_requires_tiers = 2;
+        st.backups = vec![gate_entry(1, 4096)];
+        h.cons.cluster_view.publish(&st);
+        h.cons.snapshot_set_position.store(floor, Ordering::Release);
+        h.cons.cnc.counters().durable.store_release(floor + 1000);
+        h.cons.note_set_held(floor);
+        for _ in 0..20 {
+            h.advance_floor_timer();
+            h.cons.maybe_persist_snapshot_floor();
+            while let Ok(cmd) = h._trunc_rx.try_recv() {
+                assert!(
+                    !matches!(cmd, ArchiveCmd::Purge { .. }),
+                    "a gate of 0 purges nothing"
+                );
+            }
+        }
+        assert_eq!(h.cons.backup_gate_released.load(Ordering::Relaxed), 0);
+        assert!(!h.cons.backup_gate_released_level.load(Ordering::Relaxed));
+        assert_eq!(h.cons.purge_gate.load(Ordering::Relaxed), 0);
+    }
+
+    /// Final review I3: with purge on, a node that has not JOINED (the
+    /// attach gate's `declared_published`) purges nothing over many passes —
+    /// even with K = 0, which would gate nothing — because its view of K and
+    /// `backups` may still be the recovered artifact's. The gauge and the
+    /// archive's effective gate read 0 meanwhile; once joined, the purge
+    /// resumes to the full target.
+    #[test]
+    fn purge_holds_until_the_node_has_joined_whatever_k_reads() {
+        let mut h = harness_with_rows(&["a"]);
+        h.cons.purge_policy = PurgePolicy::BelowSnapshot { slack_bytes: 0 };
+        h.cons.holdings.lock().unwrap().free_bytes = 1 << 40;
+        let floor = 65_536u64;
+        let mut st = h.cons.cluster_view.to_state();
+        st.catalog = vec![agreed_entry(floor)];
+        st.running[0] = Some(uc_protocol::v2::upgrade::RowRunning {
+            row: 0,
+            version: 1,
+            record_pos: 1,
+        });
+        st.settings.purge_requires_tiers = 0;
+        h.cons.cluster_view.publish(&st);
+        h.cons.snapshot_set_position.store(floor, Ordering::Release);
+        h.cons.cnc.counters().durable.store_release(floor + 1000);
+        h.cons.note_set_held(floor);
+        assert!(!h.cons.declared_published, "precondition: not joined");
+        let mut purges = Vec::new();
+        for _ in 0..20 {
+            h.advance_floor_timer();
+            h.cons.maybe_persist_snapshot_floor();
+            while let Ok(cmd) = h._trunc_rx.try_recv() {
+                if let ArchiveCmd::Purge { below } = cmd {
+                    purges.push(below);
+                }
+            }
+            assert_eq!(h.cons.purge_gate.load(Ordering::Relaxed), 0, "gauge");
+            assert_eq!(h.cons.effective_gate.load(Ordering::Relaxed), 0);
+        }
+        // A `Purge` may be COMMANDED, but only at or below the gate of 0 —
+        // which purges nothing.
+        assert!(purges.iter().all(|&b| b == 0), "{purges:?}");
+        h.cons.declared_published = true;
+        h.advance_floor_timer();
+        h.cons.maybe_persist_snapshot_floor();
+        let mut last = None;
+        while let Ok(cmd) = h._trunc_rx.try_recv() {
+            if let ArchiveCmd::Purge { below } = cmd {
+                last = Some(below);
+            }
+        }
+        assert_eq!(last, Some(floor), "joined: K = 0 gates nothing");
+        assert_eq!(h.cons.purge_gate.load(Ordering::Relaxed), u64::MAX);
+        assert_eq!(h.cons.effective_gate.load(Ordering::Relaxed), u64::MAX);
+    }
+
+    /// Final review I6a: a gate released for low space, then taken away
+    /// (K drops to 0, or purge turned off), clears its release latch and
+    /// level gauge and lifts the effective gate — it does not read
+    /// "released" for a gate that no longer exists, and a later gate starts
+    /// armed.
+    #[test]
+    fn a_gate_that_goes_away_while_released_clears_its_latch() {
+        for purge_off in [false, true] {
+            let mut h = harness_with_rows(&["a"]);
+            h.cons.declared_published = true;
+            h.cons.purge_policy = PurgePolicy::BelowSnapshot { slack_bytes: 0 };
+            h.cons.holdings.lock().unwrap().free_bytes = 1;
+            let mut st = h.cons.cluster_view.to_state();
+            st.settings.purge_requires_tiers = 1;
+            st.backups = vec![gate_entry(1, 4096)];
+            h.cons.cluster_view.publish(&st);
+            assert_eq!(h.cons.purge_gate(), None, "released for low space");
+            assert!(h.cons.gate_released);
+            assert!(h.cons.backup_gate_released_level.load(Ordering::Relaxed));
+            if purge_off {
+                h.cons.purge_policy = PurgePolicy::Disabled;
+            } else {
+                st.settings.purge_requires_tiers = 0;
+                h.cons.cluster_view.publish(&st);
+            }
+            assert_eq!(h.cons.purge_gate(), None);
+            assert!(!h.cons.gate_released, "latch cleared ({purge_off})");
+            assert!(!h.cons.backup_gate_released_level.load(Ordering::Relaxed));
+            assert_eq!(h.cons.effective_gate.load(Ordering::Relaxed), u64::MAX);
+            assert_eq!(
+                h.cons.purge_gate.load(Ordering::Relaxed),
+                if purge_off { 4096 } else { u64::MAX },
+                "the gauge still reads the gate with purge off"
+            );
+        }
+    }
+
+    /// RA7: the gauge value is stored with purge OFF, and nothing clamps.
+    #[test]
+    fn the_gate_atomic_is_stored_with_purge_off() {
+        let mut h = harness_with_rows(&["a"]);
+        let mut st = h.cons.cluster_view.to_state();
+        st.settings.purge_requires_tiers = 1;
+        st.backups = vec![gate_entry(1, 777)];
+        h.cons.cluster_view.publish(&st);
+        for _ in 0..5000 {
+            h.cons.maybe_persist_snapshot_floor();
+        }
+        assert_eq!(h.cons.purge_gate.load(Ordering::Relaxed), 777);
+        assert_eq!(h.cons.backup_gate_released.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn the_archive_clamp_honours_a_released_gate() {
+        assert_eq!(
+            clamp_purge_below(65_536, None, u64::MAX),
+            65_536,
+            "released"
+        );
+        assert_eq!(clamp_purge_below(65_536, None, 4096), 4096, "applied");
+        assert_eq!(clamp_purge_below(65_536, Some(2048), 4096), 2048);
+        assert_eq!(
+            clamp_purge_below(1000, Some(2048), 4096),
+            1000,
+            "never raises"
+        );
+    }
+
+    fn gate_entry(tier_id: u64, through: u64) -> uc_protocol::v2::backup::BackupTierEntry {
+        uc_protocol::v2::backup::BackupTierEntry {
+            tier_id,
+            oldest_set: 0,
+            newest_set: 0,
+            through,
+            reporter: 1,
+            updated_pos: 0,
+        }
+    }
+
     /// Backup-tier spec §5.4 (Task 9): the purge target on a writer's node
     /// is clamped to the writer's progress (`0`, no chain yet, holds every
     /// purge); low space releases the hold — counted once per episode — and
@@ -16135,6 +17434,8 @@ mod tests {
     fn the_backup_hold_caps_the_purge_at_the_writers_progress() {
         use uc_protocol::v2::upgrade::RowRunning;
         let mut h = harness_with_rows(&["a"]);
+        // A joined node: final review I3 holds every purge before that.
+        h.cons.declared_published = true;
         h.cons.purge_policy = PurgePolicy::BelowSnapshot { slack_bytes: 0 };
         let shared = Arc::new(crate::tier::writer::WriterShared::default());
         h.cons.backup_shared = Some(Arc::clone(&shared));
@@ -22378,9 +23679,20 @@ mod tests {
             "a refused apply leaves the staged file for the operator to re-sign"
         );
 
+        // (f) backup-tier 3b: `purge_requires_tiers` above `MAX_BACKUP_TIERS`.
+        stage_settings_for_test(
+            &h,
+            &Settings {
+                purge_requires_tiers: 5,
+                ..Settings::genesis_default()
+            },
+        );
+        let (status, reason, _) = h.cons.apply_settings_staged();
+        assert_eq!((status, reason), (1, REASON_SETTINGS_BOUNDS));
+
         assert_eq!(
             h.cons.last_cluster_append, 0,
-            "nothing was appended by any of the five refusals"
+            "nothing was appended by any of the six refusals"
         );
     }
 
@@ -22561,6 +23873,38 @@ mod tests {
             "the Truncated ack completes reconciliation and reopens"
         );
         assert!(h.cons.pending_truncation.is_none());
+    }
+
+    /// Backup-tier 3b: at `Action::Truncate` the SM has not adopted the
+    /// pruned map yet (it does on the `Truncated` ack), so the writer's cell
+    /// must carry the map that was PERSISTED, not `sm.term_map()`.
+    #[test]
+    fn truncate_publishes_the_persisted_pruned_map_to_the_writer() {
+        let mut h = harness();
+        let shared = Arc::new(crate::tier::writer::WriterShared::default());
+        h.cons.backup_shared = Some(Arc::clone(&shared));
+        h.cons.feed(Event::RequestVote {
+            from: 0,
+            new_term: 3,
+            last_term: 1,
+            last_durable: 7000,
+        });
+        h.cons.feed(Event::TermMapReceived {
+            term: 3,
+            entries: vec![(1, 0), (3, 4096)],
+        });
+        assert!(
+            h.cons.pending_truncation.is_some(),
+            "a truncate was emitted"
+        );
+        let persisted = to_pairs(&h.cons.state.term_map());
+        let published = shared.term_map.lock().unwrap().clone();
+        assert_eq!(published, persisted, "the cell equals term_map.state");
+        assert_ne!(
+            published,
+            h.cons.sm.term_map().to_vec(),
+            "the SM still holds the pre-truncation map"
+        );
     }
 
     /// T7 review finding 1: `last_config_reply` (leader-side nonce dedup) and
@@ -26707,6 +28051,7 @@ mod tests {
             stored_before: 0,
             deadline_ns: 1_000_000,
             auto: true,
+            source: FetchSource::Peer,
         });
         h.cons.stored_set_pos.store(1000, Ordering::Release);
         h.cons.poll_pending_fetch();
@@ -26717,6 +28062,7 @@ mod tests {
             stored_before: 1000,
             deadline_ns: 2_000,
             auto: true,
+            source: FetchSource::Peer,
         });
         h.cons.pass_now_ns = 3_000;
         h.cons.poll_pending_fetch();
@@ -26727,6 +28073,7 @@ mod tests {
             stored_before: 1000,
             deadline_ns: 2_000,
             auto: false,
+            source: FetchSource::Peer,
         });
         h.cons.poll_pending_fetch();
         assert_eq!(
@@ -26794,6 +28141,7 @@ mod tests {
         assert!(
             h.cons
                 .pending_fetch
+                .as_ref()
                 .is_some_and(|p| p.auto && p.position == 1000),
             "after 30 s the fetch proceeds: {:?}",
             h.cons.pending_fetch
@@ -26927,7 +28275,7 @@ mod tests {
             h.cons.maybe_auto_fetch();
             // Let each issued fetch time out, so the next pass tries again.
             while h.fetch_rx.try_recv().is_ok() {}
-            if let Some(p) = h.cons.pending_fetch {
+            if let Some(p) = &h.cons.pending_fetch {
                 h.cons.pass_now_ns = p.deadline_ns + 1;
                 h.cons.poll_pending_fetch();
                 t = h.cons.pass_now_ns;
@@ -26972,7 +28320,7 @@ mod tests {
             h.cons.maybe_auto_fetch();
             t += 10_000_000_000;
         }
-        let from = h.cons.pending_fetch.unwrap().learner;
+        let from = h.cons.pending_fetch.as_ref().unwrap().learner;
         assert_eq!(
             std::fs::read(&path).unwrap(),
             before,
@@ -26985,7 +28333,7 @@ mod tests {
             "\"event\":\"admin_op\",\"actor\":\"auto\",\"origin\":\"local\",\"op\":9,\
              \"op_name\":\"snapshot_fetch\",\"id\":{from},\"addr\":null,\"seq\":0,\"nonce\":0,\
              \"outcome\":\"accepted\",\"reason\":0,\"config_version\":1000,\"detail\":null,\
-             \"source\":\"auto\"}}"
+             \"source\":\"auto\",\"fetch_source\":\"peer\"}}"
         );
         assert!(line.ends_with(&expected), "{line}\n  vs ...{expected}");
         assert_eq!(h.auto_fetch_audit_writer.drain(), 0, "drained once");
@@ -27004,6 +28352,7 @@ mod tests {
                 ts_ns: 1,
                 from: 2,
                 position: k as u64,
+                source: "peer",
             });
             assert_eq!(queued, k < AUTO_FETCH_AUDIT_QUEUE, "record {k}");
         }
@@ -27082,6 +28431,662 @@ mod tests {
     /// Controller ruling R8 (plan ruling P15): an OPERATOR fetch timing out
     /// also sets the 1 s floor — the pass that sees it expire, and the next
     /// second, issue no auto fetch.
+    /// Coordinator ruling (Task 12) + review C1: a tier copy still running at
+    /// the fetch deadline is a failure like `done == Err` — the record is
+    /// cleared, the copy CANCELLED and kept draining (joined once it
+    /// reports), `tier_fetch_declined{reason="timeout"}` named, and the peer
+    /// path issued AT ONCE; no second copy of that P starts while it drains.
+    #[test]
+    fn a_tier_fetch_past_its_deadline_falls_back_to_the_peer() {
+        let mut h = harness_with_rows(&["a"]);
+        let t = 10_000_000_000u64;
+        h.cons.pending_fetch = Some(PendingFetch {
+            learner: 2,
+            position: 4096,
+            stored_before: 0,
+            deadline_ns: t,
+            auto: false,
+            source: FetchSource::Tier(crate::tier::source::TierFetch::never_finishing_for_test(
+                4096,
+            )),
+        });
+        h.cons.pass_now_ns = t;
+        h.cons.poll_pending_fetch();
+        assert!(
+            matches!(
+                h.cons.pending_fetch.as_ref().map(|p| &p.source),
+                Some(FetchSource::Tier(_))
+            ),
+            "at the deadline the copy is still waited on"
+        );
+        assert!(h.fetch_rx.try_recv().is_err(), "no peer asked yet");
+        h.cons.pass_now_ns = t + 1;
+        h.cons.poll_pending_fetch();
+        let asked = h.fetch_rx.try_recv().expect("the peer was asked at once");
+        assert_eq!(asked.peer, h.cons.id_to_addr[&2]);
+        assert_eq!(asked.position, 4096);
+        assert_eq!(asked.mode, IntakeMode::StoreOnly);
+        assert!(matches!(
+            h.cons.pending_fetch.as_ref().map(|p| &p.source),
+            Some(FetchSource::Peer)
+        ));
+        assert_eq!(h.cons.tier_draining.len(), 1, "cancelled and draining");
+        assert!(h.cons.tier_draining[0].is_cancelled());
+        // A second copy of the same P is never started while one drains:
+        // two threads would share `incoming-<P>.tier.part`.
+        h.cons.tier_source = Some(Arc::new(
+            crate::tier::source::TierSource::open(&h.cons.snap_root.join("no-tier"), "t").unwrap(),
+        ));
+        assert!(!h.cons.try_tier_fetch(2, 4096, false));
+        assert_eq!(h.cons.tier_declined, (4096, "draining".to_string()));
+        // Retired (joined) once its thread reports.
+        *h.cons.tier_draining[0].done.lock().unwrap() = Some(Err(
+            crate::tier::source::FetchError::Copy("cancelled".into()),
+        ));
+        h.cons.poll_pending_fetch();
+        assert!(h.cons.tier_draining.is_empty());
+    }
+
+    /// Backup-tier 3b spec §6.3, the follower half of `TIER_INSTALL`.
+    mod tier_install {
+        use super::*;
+        use crate::tier::source::tests::{P, SetFx, body_for, put_tier, set_fx};
+        use uc_protocol::v2::backup::BackupTierEntry;
+        use uc_protocol::v2::datagram::read_tier_install_status_body;
+
+        const TIER_ID: u64 = 7;
+
+        /// A follower (id 1) whose leader is node 0 at `leader`'s address
+        /// (node 2 at `other`'s), a tier source holding `fx`'s set at P, the
+        /// set agreed in the catalog, and the tier registered at `through`.
+        /// The node's OWN catalog is empty — a brand-new learner's — so every
+        /// verdict comes from the body (controller ruling on concern 5).
+        /// The install signals are wired as a real receiver's are.
+        fn rig(fx: &SetFx, through: Option<u64>) -> (Harness, UdpSocket, UdpSocket) {
+            let (leader, a0) = report_peer_socket();
+            let (other, a2) = report_peer_socket();
+            let mut h = harness_with_rows_and_peers(&["a"], &[(0, a0), (2, a2)]);
+            // The fixture's `SET` lineage reaches term 3: this node is at a
+            // term at least that (final review I4 refuses a line naming a
+            // term above the node's own).
+            h.cons.feed_net(NetEvent::LeaderActivity { term: 3 });
+            assert_eq!(h.cons.sm.current_term(), 3);
+            h.cons.cnc.status().leader_hint.store_release(0);
+            // Below the floor, below S: a request for S is something to copy
+            // (at or past S it is answered `installed` with no copy).
+            h.cons.cnc.counters().durable.store_release(1024);
+            put_tier(&fx._d.path().join("tier"), "mine", TIER_ID);
+            h.cons.tier_source = Some(Arc::clone(&fx.src));
+            publish(&mut h, fx, through);
+            h.cons.intake_signals = uc_net::receiver::SnapIntakeSignals::new(
+                Arc::clone(&h.cons.stored_set_pos),
+                Some((
+                    Arc::clone(&h.cons.incoming_snapshot),
+                    Arc::clone(&h.cons.incoming_cluster_pos),
+                    h.cluster_install_tx.clone(),
+                )),
+            );
+            (h, leader, other)
+        }
+
+        fn publish(h: &mut Harness, _fx: &SetFx, through: Option<u64>) {
+            let mut st = h.cons.cluster_view.to_state();
+            st.catalog = Vec::new();
+            st.backups = through
+                .map(|t| {
+                    vec![BackupTierEntry {
+                        tier_id: TIER_ID,
+                        oldest_set: P,
+                        newest_set: P,
+                        through: t,
+                        reporter: 0,
+                        updated_pos: 0,
+                    }]
+                })
+                .unwrap_or_default();
+            st.applied += 1;
+            h.cons.cluster_view.publish(&st);
+        }
+
+        fn ask_with(h: &mut Harness, from: &UdpSocket, body: TierInstallBody) {
+            ask_at(h, from, h.cons.sm.current_term(), body);
+        }
+
+        /// [`ask_with`], admitted at `term` (the datagram header's).
+        fn ask_at(h: &mut Harness, from: &UdpSocket, term: u32, body: TierInstallBody) {
+            h.cons.feed_net(NetEvent::TierInstall {
+                from: from.local_addr().unwrap(),
+                term,
+                body: Box::new(body),
+            });
+        }
+
+        /// The leader names `fx`'s set and carries its catalog verdict.
+        fn ask(h: &mut Harness, fx: &SetFx, from: &UdpSocket) {
+            ask_with(h, from, body_for(fx, 0, 8000));
+        }
+
+        /// Every `TIER_INSTALL_STATUS` waiting on `sock`, oldest first.
+        fn statuses(sock: &UdpSocket) -> Vec<TierInstallStatusBody> {
+            let mut out = Vec::new();
+            let mut buf = [0u8; 2048];
+            while let Ok((n, _)) = sock.recv_from(&mut buf) {
+                let Some(hdr) = read_datagram_header(&buf[..n]) else {
+                    continue;
+                };
+                if hdr.kind == DGRAM_KIND_TIER_INSTALL_STATUS {
+                    out.push(
+                        read_tier_install_status_body(&buf[DATAGRAM_HEADER_LEN..n])
+                            .expect("this node's own status body decodes"),
+                    );
+                }
+            }
+            out
+        }
+
+        fn status(state: TierInstallState, position: u64, copied: u64) -> TierInstallStatusBody {
+            TierInstallStatusBody {
+                state,
+                reason: TierInstallReason::None,
+                position,
+                copied,
+            }
+        }
+
+        /// A decline names the set it is about (Task 14 ruling).
+        fn declined(reason: TierInstallReason, position: u64) -> TierInstallStatusBody {
+            TierInstallStatusBody {
+                state: TierInstallState::Declined,
+                reason,
+                position,
+                copied: 0,
+            }
+        }
+
+        /// Wait until `n` tier copies have STARTED (final review I2: the
+        /// plan runs on the thread, so a copy starts after the request was
+        /// answered).
+        fn await_copies(fx: &SetFx, n: u64) {
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            while fx.src.fetches_spawned() < n {
+                assert!(std::time::Instant::now() < deadline, "copy never started");
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            assert_eq!(fx.src.fetches_spawned(), n);
+        }
+
+        /// Poll the running install (as the pass does) until it has ended.
+        fn finish(h: &mut Harness) {
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            while h.cons.tier_install.is_some() {
+                assert!(std::time::Instant::now() < deadline, "install never ended");
+                std::thread::sleep(Duration::from_millis(2));
+                h.cons.poll_tier_install();
+            }
+        }
+
+        /// Every FILE under `dir`, recursively (directories may remain).
+        fn files_under(dir: &Path) -> Vec<PathBuf> {
+            let mut out = Vec::new();
+            let Ok(rd) = std::fs::read_dir(dir) else {
+                return out;
+            };
+            for e in rd {
+                let p = e.unwrap().path();
+                if p.is_dir() {
+                    out.extend(files_under(&p));
+                } else {
+                    out.push(p);
+                }
+            }
+            out
+        }
+
+        /// Ruling F1 regression guard: a `tier forget` committed while the
+        /// copy runs changes nothing — the copy completes and answers
+        /// `installed` — and, registration never being consulted for an
+        /// install, a later request with the tier still forgotten is served
+        /// too.
+        #[test]
+        fn a_running_install_is_unaffected_by_a_later_tier_forget() {
+            let fx = set_fx(false);
+            fx.src.set_fetch_delay_for_test(Duration::from_millis(150));
+            let (mut h, leader, _) = rig(&fx, Some(8000));
+            ask(&mut h, &fx, &leader);
+            assert!(h.cons.tier_install.is_some(), "the copy started");
+            assert_eq!(
+                statuses(&leader),
+                vec![status(TierInstallState::Installing, P, 0)]
+            );
+            // The tier is forgotten while the copy runs.
+            publish(&mut h, &fx, None);
+            assert_eq!(
+                fx.src.registered_through(&h.cons.cluster_view.backups()),
+                None
+            );
+            finish(&mut h);
+            assert_eq!(
+                statuses(&leader),
+                vec![status(TierInstallState::Installed, P, 0)]
+            );
+            assert_eq!(
+                h.cons.tier_install_stats.installed.load(Ordering::Relaxed),
+                1
+            );
+            assert!(h.cons.snap_root.join("0/snap-4096.ultsnap").exists());
+            // The set is adopted (this node already covers it: nothing below
+            // the floor moves) and the lineage cleared.
+            h.cons.cluster_installed.store(P, Ordering::Release);
+            assert!(h.cons.maybe_adopt_incoming_snapshot());
+            assert_eq!(h.cons.pending_install_lineage, None);
+            ask(&mut h, &fx, &leader);
+            assert_eq!(
+                statuses(&leader),
+                vec![status(TierInstallState::Installing, P, 0)],
+            );
+            // The thread's plan passed (no `not_registered`): its copy
+            // started. (Not finished here: its install signal would wait on
+            // the harness's one-slot cluster channel, which the first
+            // install already filled.)
+            await_copies(&fx, 2);
+            assert!(
+                statuses(&leader).is_empty(),
+                "a forgotten (unregistered) tier still serves an install"
+            );
+            assert_eq!(
+                h.cons.tier_install_stats.declined.load(Ordering::Relaxed),
+                0
+            );
+        }
+
+        /// Ruling D8 at install time, the leader as the authority: the
+        /// tier's `SET` names a row version other than the one the body
+        /// carries — `declined(verify)` before any copy (after the
+        /// `installing` answered at spawn: the check runs on the thread,
+        /// final review I2), and nothing under `snapshots/`.
+        #[test]
+        fn an_install_whose_set_disagrees_with_the_catalog_declines_and_leaves_nothing() {
+            let fx = set_fx(false);
+            let (mut h, leader, _) = rig(&fx, Some(8000));
+            let before = files_under(&h.cons.snap_root);
+            let mut body = body_for(&fx, 0, 8000);
+            body.row_version[2] += 1;
+            ask_with(&mut h, &leader, body);
+            // Final review I2: the check reads the tier's `SET`, so it runs
+            // on the thread; `installing` first, then the decline.
+            finish(&mut h);
+            assert_eq!(
+                statuses(&leader),
+                vec![
+                    status(TierInstallState::Installing, P, 0),
+                    declined(TierInstallReason::Verify, P)
+                ]
+            );
+            assert_eq!(fx.src.fetches_spawned(), 0, "refused before any copy");
+            assert_eq!(files_under(&h.cons.snap_root), before, "nothing written");
+            assert_eq!(
+                h.cons.tier_install_stats.declined.load(Ordering::Relaxed),
+                1
+            );
+            assert_eq!(
+                h.cons.tier_install_stats.installed.load(Ordering::Relaxed),
+                0
+            );
+            assert_eq!(h.cons.incoming_snapshot.load(Ordering::Acquire), 0);
+            assert_eq!(h.cons.pending_install_lineage, None);
+        }
+
+        /// A copy that fails AFTER the check (the tier's cluster object holds
+        /// other bytes than the carried hash) is `declined(verify)` too, and
+        /// removes what it wrote.
+        #[test]
+        fn a_copy_that_fails_verification_declines_and_leaves_nothing() {
+            let fx = set_fx(true);
+            let (mut h, leader, _) = rig(&fx, Some(8000));
+            let before = files_under(&h.cons.snap_root);
+            ask(&mut h, &fx, &leader);
+            finish(&mut h);
+            assert_eq!(
+                statuses(&leader),
+                vec![
+                    status(TierInstallState::Installing, P, 0),
+                    declined(TierInstallReason::Verify, P)
+                ]
+            );
+            assert_eq!(files_under(&h.cons.snap_root), before, "nothing written");
+            assert_eq!(h.cons.incoming_snapshot.load(Ordering::Acquire), 0);
+        }
+
+        /// Review focus 1, the follower half: a second `TIER_INSTALL` while
+        /// one copy runs answers `installing` — never a second thread — and a
+        /// NEW leader asking takes over the progress reports.
+        #[test]
+        fn a_second_tier_install_while_one_runs_answers_installing_not_a_second_thread() {
+            let fx = set_fx(false);
+            fx.src.set_fetch_delay_for_test(Duration::from_millis(500));
+            let (mut h, leader, other) = rig(&fx, Some(8000));
+            ask(&mut h, &fx, &leader);
+            ask(&mut h, &fx, &leader);
+            await_copies(&fx, 1);
+            let got = statuses(&leader);
+            assert_eq!(got.len(), 2, "{got:?}");
+            assert!(
+                got.iter()
+                    .all(|s| s.state == TierInstallState::Installing && s.position == P),
+                "{got:?}"
+            );
+            // Within the second: no cadence report yet.
+            h.cons.pass_now_ns += 999_999_999;
+            h.cons.poll_tier_install();
+            assert!(statuses(&leader).is_empty());
+            // Leadership moves to node 2, which asks again: same copy, and
+            // the reports now go to it.
+            h.cons.cnc.status().leader_hint.store_release(2);
+            ask(&mut h, &fx, &other);
+            assert_eq!(fx.src.fetches_spawned(), 1);
+            assert_eq!(statuses(&other).len(), 1);
+            // The old leader is no leader now: its request is dropped.
+            ask(&mut h, &fx, &leader);
+            assert!(statuses(&leader).is_empty());
+            assert_eq!(h.cons.tier_install_not_leader, 1);
+            h.cons.pass_now_ns += TIER_INSTALL_STATUS_EVERY_NS;
+            h.cons.poll_tier_install();
+            assert!(
+                h.cons.tier_install.is_some(),
+                "still copying (1.5 s of delay)"
+            );
+            let got = statuses(&other);
+            assert_eq!(got.len(), 1, "the 1 s report, to the new leader: {got:?}");
+            assert_eq!(got[0].state, TierInstallState::Installing);
+            assert!(statuses(&leader).is_empty());
+            finish(&mut h);
+            let got = statuses(&other);
+            assert_eq!(got.last(), Some(&status(TierInstallState::Installed, P, 0)));
+            assert!(statuses(&leader).is_empty());
+            assert_eq!(fx.src.fetches_spawned(), 1);
+        }
+
+        /// Spec §8 ("the leader opens the session after 10 s"): the leader
+        /// gave up, and this node is durable past S by the time the tier copy
+        /// finishes. The handler's `durable < pos` guard adopts nothing —
+        /// no lineage, no config, no floor — the held lineage is cleared,
+        /// and `installed` is still answered.
+        #[test]
+        fn a_late_tier_install_below_durable_adopts_nothing() {
+            let fx = set_fx(false);
+            let (mut h, leader, _) = rig(&fx, Some(8000));
+            while h._trunc_rx.try_recv().is_ok() {}
+            let map_before = h.cons.sm.term_map().to_vec();
+            ask(&mut h, &fx, &leader);
+            // The session overtook the copy: durable passes S meanwhile.
+            h.cons.cnc.counters().durable.store_release(2 * P);
+            finish(&mut h);
+            assert_eq!(
+                statuses(&leader),
+                vec![
+                    status(TierInstallState::Installing, P, 0),
+                    status(TierInstallState::Installed, P, 0)
+                ]
+            );
+            assert_eq!(
+                h.cons.pending_install_lineage.as_ref().map(|p| p.0),
+                Some(P)
+            );
+            h.cons.cluster_installed.store(P, Ordering::Release);
+            assert!(h.cons.maybe_adopt_incoming_snapshot());
+            assert_eq!(h.cons.adopted_incoming, P);
+            assert_eq!(h.cons.pending_install_lineage, None, "cleared");
+            assert_eq!(h.cons.sm.term_map(), &map_before[..], "no lineage adopted");
+            while let Ok(cmd) = h._trunc_rx.try_recv() {
+                assert!(
+                    !matches!(cmd, ArchiveCmd::AdoptFloor { .. }),
+                    "no floor adopted"
+                );
+            }
+        }
+
+        /// Spec §6.3 step 3 (A): a below-floor node installing from its tier
+        /// adopts the `SET`'s lineage, not the leader's last map, and S as its
+        /// floor.
+        #[test]
+        fn a_tier_install_adopts_the_sets_lineage_not_the_leaders_map() {
+            let fx = set_fx(false);
+            let (mut h, leader, _) = rig(&fx, Some(8000));
+            h.cons.cnc.counters().durable.store_release(1024);
+            h.cons.last_leader_map = vec![(9, 0)];
+            while h._trunc_rx.try_recv().is_ok() {}
+            ask(&mut h, &fx, &leader);
+            finish(&mut h);
+            assert_eq!(statuses(&leader).len(), 2);
+            h.cons.cluster_installed.store(P, Ordering::Release);
+            assert!(h.cons.maybe_adopt_incoming_snapshot());
+            assert_eq!(h.cons.sm.term_map(), &fx.label.lineage[..]);
+            assert_eq!(h.cons.pending_install_lineage, None);
+            let mut floor = None;
+            while let Ok(cmd) = h._trunc_rx.try_recv() {
+                if let ArchiveCmd::AdoptFloor { pos } = cmd {
+                    floor = Some(pos);
+                }
+            }
+            assert_eq!(floor, Some(P));
+        }
+
+        /// The copy's thread raises the install signals BEFORE it reports
+        /// `done`: a pass that sees the set land in between still adopts the
+        /// `SET`'s lineage (recorded once its plan passed), never the
+        /// leader's map.
+        #[test]
+        fn a_set_landing_before_its_copy_reports_still_adopts_the_sets_lineage() {
+            let mut h = harness_with_rows(&["a"]);
+            h.cons.cnc.counters().durable.store_release(1024);
+            h.cons.last_leader_map = vec![(9, 0)];
+            // The thread is past its publish (a cancel can no longer stop
+            // it) and recorded the `SET`'s lineage when its plan passed.
+            h.cons.tier_install = Some(crate::tier::source::TierFetch::publishing_for_test(
+                P,
+                vec![(1, 0), (3, 2048)],
+            ));
+            h.cons.incoming_cluster_pos.store(P, Ordering::Release);
+            h.cons.incoming_snapshot.store(P, Ordering::Release);
+            h.cons.cluster_installed.store(P, Ordering::Release);
+            assert!(h.cons.maybe_adopt_incoming_snapshot());
+            assert_eq!(h.cons.sm.term_map(), &[(1, 0), (3, 2048)][..]);
+            // Its `done` then arrives: already adopted, nothing is held.
+            *h.cons.tier_install.as_ref().unwrap().done.lock().unwrap() =
+                Some(Ok(vec![(1, 0), (3, 2048)]));
+            h.cons.poll_tier_install();
+            assert!(h.cons.tier_install.is_none());
+            assert_eq!(h.cons.pending_install_lineage, None);
+        }
+
+        /// Final review I1: the leader gave up on the tier (no progress)
+        /// and opened a session, which lands a set at or above the running
+        /// install's S first. Adopting it CANCELS the install — moved to
+        /// draining, never finishing as a second path — and the session's
+        /// lineage (the leader's map) is the one adopted.
+        #[test]
+        fn a_session_landing_at_or_above_s_cancels_the_running_install() {
+            for at in [P, P + 1024] {
+                let mut h = harness_with_rows(&["a"]);
+                h.cons.cnc.counters().durable.store_release(1024);
+                h.cons.last_leader_map = vec![(9, 0)];
+                h.cons.tier_install =
+                    Some(crate::tier::source::TierFetch::never_finishing_for_test(P));
+                h.cons.incoming_cluster_pos.store(at, Ordering::Release);
+                h.cons.incoming_snapshot.store(at, Ordering::Release);
+                h.cons.cluster_installed.store(at, Ordering::Release);
+                assert!(h.cons.maybe_adopt_incoming_snapshot());
+                assert!(h.cons.tier_install.is_none(), "no longer running");
+                assert_eq!(h.cons.tier_draining.len(), 1, "drained, at {at}");
+                assert!(h.cons.tier_draining[0].is_cancelled());
+                assert_eq!(h.cons.sm.term_map(), &[(9, 0)][..], "the session's map");
+                // Nothing more is answered for it: it is not polled as an
+                // install any more.
+                h.cons.poll_tier_install();
+                assert_eq!(
+                    h.cons.tier_install_stats.installed.load(Ordering::Relaxed),
+                    0
+                );
+            }
+            // A session BELOW S leaves the install running.
+            let mut h = harness_with_rows(&["a"]);
+            h.cons.cnc.counters().durable.store_release(512);
+            h.cons.tier_install = Some(crate::tier::source::TierFetch::never_finishing_for_test(P));
+            h.cons.incoming_cluster_pos.store(1024, Ordering::Release);
+            h.cons.incoming_snapshot.store(1024, Ordering::Release);
+            h.cons.cluster_installed.store(1024, Ordering::Release);
+            assert!(h.cons.maybe_adopt_incoming_snapshot());
+            assert!(h.cons.tier_install.is_some());
+            assert!(!h.cons.tier_install.as_ref().unwrap().is_cancelled());
+        }
+
+        /// Final review I4: a `SET` lineage whose base for a term the
+        /// leader's map also holds is not the leader's (one flipped digit,
+        /// still well-formed) is `declined(verify)` before any copy —
+        /// nothing adopted, nothing under `snapshots/`.
+        #[test]
+        fn an_install_whose_lineage_disagrees_with_the_leaders_map_declines_verify() {
+            let fx = set_fx(false);
+            let (mut h, leader, _) = rig(&fx, Some(8000));
+            // The fixture's line is [(1, 0), (3, 2048)]; the leader says 3
+            // began at 2049.
+            h.cons.last_leader_map = vec![(3, 2049)];
+            let before = files_under(&h.cons.snap_root);
+            ask(&mut h, &fx, &leader);
+            finish(&mut h);
+            assert_eq!(
+                statuses(&leader),
+                vec![
+                    status(TierInstallState::Installing, P, 0),
+                    declined(TierInstallReason::Verify, P)
+                ]
+            );
+            assert_eq!(files_under(&h.cons.snap_root), before, "root clean");
+            assert_eq!(fx.src.fetches_spawned(), 0, "no copy started");
+            assert_eq!(h.cons.incoming_snapshot.load(Ordering::Acquire), 0);
+            assert_eq!(h.cons.pending_install_lineage, None, "nothing adopted");
+            assert_eq!(
+                h.cons.tier_install_stats.declined.load(Ordering::Relaxed),
+                1
+            );
+        }
+
+        /// Task 14 finding: a follower that knows no leader yet (just
+        /// restarted: the hint is learned from commit gossip, which can
+        /// trail the leader's answer to its first NAK) learns it from the
+        /// current-term request itself and answers at once — else the
+        /// leader waits out its 2 s answer timeout. An address that is not
+        /// a member still teaches nothing and is dropped.
+        #[test]
+        fn a_tier_install_with_no_leader_known_learns_it_from_the_request() {
+            let fx = set_fx(false);
+            let (mut h, leader, _) = rig(&fx, Some(8000));
+            h.cons.tier_source = None;
+            h.cons.cnc.status().leader_hint.store_release(u64::MAX);
+            let stranger = UdpSocket::bind("127.0.0.1:0").unwrap();
+            stranger.set_nonblocking(true).unwrap();
+            ask(&mut h, &fx, &stranger);
+            assert_eq!(h.cons.cnc.status().leader_hint.load_acquire(), u64::MAX);
+            assert_eq!(h.cons.tier_install_not_leader, 1);
+            assert!(statuses(&stranger).is_empty());
+            ask(&mut h, &fx, &leader);
+            assert_eq!(h.cons.cnc.status().leader_hint.load_acquire(), 0);
+            assert_eq!(
+                statuses(&leader),
+                vec![declined(TierInstallReason::NoSource, P)]
+            );
+        }
+
+        /// Review round 1: a kind 28 admitted at term T but read after the SM
+        /// moved to T+1 is ignored — counted, no answer, no copy, and the
+        /// hint is not taught (T's leader is not T+1's).
+        #[test]
+        fn a_tier_install_from_a_term_the_sm_has_left_is_ignored() {
+            let fx = set_fx(false);
+            let (mut h, leader, _) = rig(&fx, Some(8000));
+            h.cons.cnc.status().leader_hint.store_release(u64::MAX);
+            let t = h.cons.sm.current_term();
+            ask_at(&mut h, &leader, t.wrapping_sub(1), body_for(&fx, 0, 8000));
+            assert_eq!(h.cons.tier_install_stale_term, 1);
+            assert_eq!(h.cons.cnc.status().leader_hint.load_acquire(), u64::MAX);
+            assert!(h.cons.tier_install.is_none());
+            assert_eq!(fx.src.fetches_spawned(), 0);
+            assert!(statuses(&leader).is_empty());
+            // The same request at the current term is served.
+            ask_at(&mut h, &leader, t, body_for(&fx, 0, 8000));
+            assert_eq!(h.cons.cnc.status().leader_hint.load_acquire(), 0);
+            await_copies(&fx, 1);
+        }
+
+        /// Task 14 ruling: a request for an S this node is already durable
+        /// at or past (a stale or repeated request — a session got there
+        /// first) answers `installed{S}` at once: no copy, no thread, not
+        /// counted either way — and it is answered before the source check.
+        #[test]
+        fn a_tier_install_at_or_below_durable_answers_installed_without_a_copy() {
+            let fx = set_fx(false);
+            let (mut h, leader, _) = rig(&fx, Some(8000));
+            h.cons.tier_source = None;
+            h.cons.cnc.counters().durable.store_release(P);
+            ask(&mut h, &fx, &leader);
+            assert_eq!(
+                statuses(&leader),
+                vec![status(TierInstallState::Installed, P, 0)]
+            );
+            assert!(h.cons.tier_install.is_none());
+            assert_eq!(fx.src.fetches_spawned(), 0);
+            let st = &h.cons.tier_install_stats;
+            assert_eq!(
+                (
+                    st.installed.load(Ordering::Relaxed),
+                    st.declined.load(Ordering::Relaxed)
+                ),
+                (0, 0)
+            );
+        }
+
+        /// No source: `declined(no_source)` at once, counted, nothing spawned.
+        #[test]
+        fn a_tier_install_without_a_source_declines_at_once() {
+            let fx = set_fx(false);
+            let (mut h, leader, _) = rig(&fx, Some(8000));
+            h.cons.tier_source = None;
+            ask(&mut h, &fx, &leader);
+            assert_eq!(
+                statuses(&leader),
+                vec![declined(TierInstallReason::NoSource, P)]
+            );
+            assert!(h.cons.tier_install.is_none());
+            assert_eq!(
+                h.cons.tier_install_stats.declined.load(Ordering::Relaxed),
+                1
+            );
+            // A named set the tier does not hold: no set.
+            h.cons.tier_source = Some(Arc::clone(&fx.src));
+            let mut body = body_for(&fx, 0, 8000);
+            body.s = P + 32;
+            ask_with(&mut h, &leader, body);
+            finish(&mut h);
+            assert_eq!(
+                statuses(&leader),
+                vec![
+                    status(TierInstallState::Installing, P + 32, 0),
+                    declined(TierInstallReason::NoSet, P + 32)
+                ]
+            );
+            // A store-only copy of exactly S still draining: no set either.
+            h.cons
+                .tier_draining
+                .push(crate::tier::source::TierFetch::never_finishing_for_test(P));
+            ask(&mut h, &fx, &leader);
+            assert_eq!(
+                statuses(&leader),
+                vec![declined(TierInstallReason::NoSet, P)]
+            );
+            assert_eq!(fx.src.fetches_spawned(), 0);
+        }
+    }
+
     #[test]
     fn an_operator_fetch_timeout_holds_auto_fetch_for_the_floor() {
         use crate::auto_fetch::AUTO_FETCH_BACKOFF_MIN_NS;
@@ -27103,6 +29108,7 @@ mod tests {
             stored_before: 0,
             deadline_ns: t - 1,
             auto: false,
+            source: FetchSource::Peer,
         });
         h.cons.pass_now_ns = t;
         h.cons.poll_pending_fetch();
@@ -27117,6 +29123,7 @@ mod tests {
         assert!(
             h.cons
                 .pending_fetch
+                .as_ref()
                 .is_some_and(|p| p.auto && p.position == 1000),
             "past the floor: {:?}",
             h.cons.pending_fetch
@@ -27374,5 +29381,33 @@ mod tests {
         let (status, reason, _) = h.cons.apply_tier_forget(0xABCD);
         assert_eq!((status, reason), (1, REASON_TIER_UNKNOWN));
         assert_eq!(h.cons.last_cluster_append, before, "nothing appended");
+    }
+}
+
+#[cfg(test)]
+mod tier_source_resolve_tests {
+    use super::{SourceOrigin, resolve_tier_source};
+    use crate::tier::writer::BackupConfig;
+    use std::path::PathBuf;
+
+    #[test]
+    fn a_backup_only_node_reads_its_own_target_and_tier_source_wins() {
+        let b = BackupConfig {
+            target: "/b".into(),
+            ..BackupConfig::default()
+        };
+        assert_eq!(resolve_tier_source(None, None), None);
+        assert_eq!(
+            resolve_tier_source(None, Some(&b)),
+            Some((PathBuf::from("/b"), SourceOrigin::Backup))
+        );
+        assert_eq!(
+            resolve_tier_source(Some("/s".into()), Some(&b)),
+            Some((PathBuf::from("/s"), SourceOrigin::Explicit))
+        );
+        assert_eq!(
+            resolve_tier_source(Some("/s".into()), None),
+            Some((PathBuf::from("/s"), SourceOrigin::Explicit))
+        );
     }
 }

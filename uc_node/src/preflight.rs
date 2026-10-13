@@ -139,6 +139,10 @@ pub struct StartupOptions {
     /// `None` (no section) runs no writer. Handed to the node through
     /// [`crate::StartOpts::backup`], never through `NodeConfig`.
     pub backup: Option<crate::tier::writer::BackupConfig>,
+    /// Backup-tier 3b spec §6.1: `[tier_source] target` — a read-only tier
+    /// this node may fetch snapshot sets from. Handed to the node through
+    /// [`crate::StartOpts::tier_source`].
+    pub tier_source: Option<std::path::PathBuf>,
 }
 
 /// M10 observability options: `[log]`/`[metrics]` from the config file,

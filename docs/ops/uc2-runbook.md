@@ -378,6 +378,31 @@ transport setting, both measured closed-loop at inflight 1 on 8-vCPU
   set — earlier positions are no longer restorable from that tier. Fix what
   held the writer back (`Uc2BackupBehind`, the errors counter) so it does not
   recur.
+- **`Uc2BackupGateReleased` fires.** A node with backup-gated purge on
+  (`purge_requires_tiers`) ran low on disk and let go of the gate
+  (`backup_gate_released` in its log), so it purged journal that fewer than K
+  tiers confirm. Free disk on that node first; `uc2_backup_gate_released`
+  shows whether the release still holds (`backup_gate_rearmed` when it ends).
+  Then fix what held the tiers back (`Uc2BackupBehind`, the errors counter),
+  or the cluster will do it again. Positions before that node's journal start
+  are restorable only from the tier.
+- **`backup_readback_failed` appears.** The writer put an object in the tier
+  that did not read back clean, so its report does not advance past it
+  (`uc2_backup_errors_total{reason="readback"}`, `Uc2BackupWriterError`). It
+  retries each pass. If it persists, run `uc2ctl tier verify --deep --target
+  …`: it names the object; the target's storage is the usual cause.
+- **`tier_install_declined` appears** on a node that fell below the leader's
+  purge floor. The leader asked it to install from its tier and it could not;
+  `reason` says why (`no_source`: no `[tier_source]`/`[backup]` on this node;
+  `not_registered`: the tier is unreadable or another cluster's; `no_set`:
+  the tier holds no usable set at or above the floor; `verify`: a copied
+  object disagreed with the leader's hash, or the set's term-map line
+  disagreed with the leader's, `detail="lineage_mismatch"`). The leader opens an ordinary
+  snapshot session after it, so nothing is lost. A node that should have
+  installed from the tier: check the mount and `tier verify`.
+- **`tier_set_deferred` appears** on a writer: it has put a set off ten
+  passes running. Look at whether the node recently restarted; it clears when
+  the writer's term map reaches below the set.
 - **`Uc2BackupWriterError` fires.** The `reason` label decides. `foreign`:
   the target's `TIER` object names another cluster — the writer has STOPPED
   and will not touch it; point `[backup] target` at the right place and

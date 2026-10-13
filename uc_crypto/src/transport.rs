@@ -154,7 +154,8 @@ use uc_protocol::v2::datagram::{
     DGRAM_KIND_READ_PROBE, DGRAM_KIND_READ_PROBE_ACK, DGRAM_KIND_REQUEST_VOTE,
     DGRAM_KIND_SNAP_BEGIN, DGRAM_KIND_SNAP_CHUNK, DGRAM_KIND_SNAP_DONE, DGRAM_KIND_SNAP_NAK,
     DGRAM_KIND_SNAP_REDIRECT, DGRAM_KIND_SNAP_REPORT, DGRAM_KIND_SNAP_REQUEST, DGRAM_KIND_STATUS,
-    DGRAM_KIND_TERM_MAP, DGRAM_KIND_VOTE, OFF_DGRAM_KEY_EPOCH, read_datagram_header,
+    DGRAM_KIND_TERM_MAP, DGRAM_KIND_TIER_INSTALL, DGRAM_KIND_TIER_INSTALL_STATUS, DGRAM_KIND_VOTE,
+    OFF_DGRAM_KEY_EPOCH, read_datagram_header,
 };
 use zeroize::Zeroizing;
 
@@ -332,7 +333,10 @@ impl Transport {
             // Plan B3: a live snapshot-hash report is addressed to one peer
             // (the leader) like every other SNAP kind.
             | DGRAM_KIND_SNAP_REPORT
-            | DGRAM_KIND_BACKUP_REPORT => Scope::Pairwise,
+            | DGRAM_KIND_BACKUP_REPORT
+            // Backup tier 3b: leader <-> one follower.
+            | DGRAM_KIND_TIER_INSTALL
+            | DGRAM_KIND_TIER_INSTALL_STATUS => Scope::Pairwise,
 
             // Bootstrap: no session exists yet, so neither AEAD scope
             // applies — see [`Scope::Unsealed`]'s doc. Named explicitly
@@ -1842,6 +1846,18 @@ mod tests {
         assert_eq!(Transport::scope_of(DGRAM_KIND_SNAP_REPORT), Scope::Pairwise);
         assert_eq!(
             Transport::scope_of(DGRAM_KIND_BACKUP_REPORT),
+            Scope::Pairwise
+        );
+    }
+
+    #[test]
+    fn tier_install_kinds_are_pairwise() {
+        assert_eq!(
+            Transport::scope_of(DGRAM_KIND_TIER_INSTALL),
+            Scope::Pairwise
+        );
+        assert_eq!(
+            Transport::scope_of(DGRAM_KIND_TIER_INSTALL_STATUS),
             Scope::Pairwise
         );
     }

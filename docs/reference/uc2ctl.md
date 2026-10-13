@@ -262,6 +262,7 @@ retain_sets             = 3            # 0.11.0, the snapshot catalog; absent = 
 auto_fetch              = true         # bool; absent = true (every node fetches the newest agreed set)
 backup_retain_sets      = 0            # u16; absent/0 = a backup tier keeps every set
 backup_retain_age       = "30d"        # "<n>(s|m|h|d)"; absent/0 = no age rule
+purge_requires_tiers    = 0            # 0..=4 (3b); absent/0 = off; K = purge waits for K tiers' through
 ```
 
 An unknown key is refused locally by name, before anything is staged. The same
@@ -292,7 +293,7 @@ uc2ctl settings show --instance-dir <DIR> --app-id <ID>
 ```
 
 ```
-position=8192 admission_bytes=262144 fsm_lag=16MiB snapshot_interval_bytes=0 snapshot_target=all retain_sets=1 auto_fetch=true backup_retain_sets=0 backup_retain_age_secs=0 datagram_mtu=0 (baseline)
+position=8192 admission_bytes=262144 fsm_lag=16MiB snapshot_interval_bytes=0 snapshot_target=all retain_sets=1 auto_fetch=true backup_retain_sets=0 backup_retain_age_secs=0 purge_requires_tiers=0 datagram_mtu=0 (baseline)
 ```
 
 `fsm_lag` renders as `default` (the record's `0`), `lockstep`, a whole-MiB
@@ -302,6 +303,10 @@ keeps; `1` is the default and matches today's newest-only retention.
 `backup_retain_sets` and `backup_retain_age_secs` (backup tier, `0.11.0`,
 unreleased) bound how long a backup tier keeps its sets (`0` = no rule); the
 file spells the age as `backup_retain_age = "30d"`.
+`purge_requires_tiers` (backup tier 3b, unreleased) is K, the number of
+backup tiers whose confirmed `through` every node's purge waits for (`0` =
+off, the default; `1..=4`); `settings show` prints it before `datagram_mtu`.
+See [Back up to a tier § Backup-gated purge](../how-to/back-up-to-a-tier.md#backup-gated-purge).
 `datagram_mtu` (2.12 pending)
 is the committed datagram rung: `0 (baseline)` is the `MTU_DEFAULT` every
 cluster starts from, and a rung the leader's path-MTU discovery committed
@@ -381,6 +386,13 @@ Status `0` means the pull is **underway**, not that it arrived:
 ```
 accepted: fetch of position 73792 from node 1 is underway — not yet a promise it arrived; …
 ```
+
+Since backup tier 3b the node tries its **backup tier first** (`[backup]` or
+`[tier_source]`, when the set is within a registered entry's `through`), checks
+each artifact against the cluster's agreed hash, and falls back to `--from`
+when the tier lacks the set or a check fails (`tier_fetch_declined`). The
+artifacts land the same way either way. The audit record's `fetch_source`
+says which served it (`"tier"` or `"peer"`).
 
 Poll `uc2_snapshot_fetched_position` (or `snapshot show`) for the landing.
 `50 snapshot_above_durable` refuses a position above this node's own durable
@@ -807,7 +819,10 @@ uc2ctl audit --instance-dir <DIR> [--tail <N>] [--json]
   <outcome>(<reason>)  cfg=<version>`).
 
 A `snapshot_fetch` record with `actor` and `source` `auto` is the node's own
-background fetch (snapshot lifecycle), not an operator's.
+background fetch (snapshot lifecycle), not an operator's. Its 14th key,
+`fetch_source` (backup tier 3b), is `"tier"` or `"peer"` on a fetch record
+(the node's own id in the member field for an auto-fetch the tier served) and
+`null` on every other record.
 
 A line the summarizer cannot make sense of — a torn write from a crash
 mid-record, or a hand-edited file — prints as-is prefixed `? ` rather than
@@ -834,7 +849,10 @@ fence (see [`tier restore`](#tier-restore)), and one `restorable: (a, b]` line p
 restore can be built in — a restore point `Q` is a frame end with
 `a < Q <= b`, never a set position itself. With `--instance-dir`, it also prints the committed backup
 watermarks that node's newest cluster artifact holds, marking the one that
-is this tier (`no cluster artifact yet` until that node's first instant).
+is this tier (`no cluster artifact yet` until that node's first instant), the
+setting `purge_requires_tiers=<K>`, and a `(counts toward K=<k>)` marker on
+the K entries with the highest `through` (when K is above the number of
+entries the gate is `0` and nothing counts: purge waits).
 Filesystem-only; the node may be running.
 
 ### `tier verify`
@@ -868,8 +886,8 @@ Builds an instance directory a node boots from unchanged, as of `Q`
 The start set `S` is the newest complete set below `Q` whose chain reaches
 `Q`. The builder copies `S`'s artifacts (each checked against its `SET` size
 and hash), writes the chain's bytes `[S, Q)` into a fresh journal, and
-writes `state/` itself: snapshot floor `S`, a term map derived from the
-restored frame headers, the membership the cluster artifact at `S` carries
+writes `state/` itself: snapshot floor `S`, a term map (the set's recorded lineage, then the terms
+derived from the restored frame headers), the membership the cluster artifact at `S` carries
 as the config record (position `S`), **no vote**, and the output-progress
 marker at `S`. It leaves a `RESTORED` file (`tier_id`, `start_set`, `q`,
 `mode`, `created_ns`) for the audit trail; nothing reads it. Everything is
@@ -886,12 +904,16 @@ Exactly one of:
   no vote, so the first election is ordinary. This is the quorum-loss
   domain: a restore of fewer than all nodes beside a live majority is not
   what this verb is for.
-- `--new-node --node-id <N>` — one replacement node seeded from the tier.
-  **Refused in this release** (`new_node_unsupported`, before anything is
-  read or built): the restored term map starts at `S` and cannot align with
-  a live leader's lineage, so the node would be cut below its floor. Add a
-  replacement node with a fresh, empty instance directory and the normal
-  join (a snapshot session from its peers).
+- `--new-node --node-id <N>` — one replacement node seeded from the tier,
+  to join a **live** cluster. `N` must not be in the membership the node
+  would boot with (the cluster artifact at `S` folded with every `Membership`
+  frame in `[S, Q)`; `restore_id_reused`). The restored term map is the set's
+  recorded lineage (the cluster's terms below `S`) followed by the terms of
+  the restored frames, so a live leader's map aligns with it and the node's
+  log is kept. Start it, then run [`add-learner N`](#add-learner) and, if it
+  should vote, [`promote N`](#promote). A set with no `lineage` is refused
+  (`set_lineage_missing`; `set_lineage_malformed` when it is inconsistent).
+  Every restore mode writes the lineage into `term_map.state`.
 
 **A restore below the reach fences the tier.** When `Q` lies below the
 tier's furthest reach, the restored cluster will write a history past `Q`
@@ -1095,7 +1117,7 @@ cluster FSM's refusal of a `RowGenesis` record, 61 (the snapshot catalog) is
 | 44 | `settings_digest` — the staged settings file's digest is not the one the request signed: a different file was staged than was signed, or it changed in between. Re-run `settings apply` |
 | 45 | `settings_missing` — no staged settings file on this node. Either `settings apply` was run against a different instance directory, or a successful apply already consumed it |
 | 46 | `settings_decode` — the staged file is not a decodable settings record (wrong length, unknown encoding version, or an unknown `snapshot_target` byte) |
-| 47 | `settings_bounds` — a field is out of range; the node's refusal detail and the audit record name which. Four values are out of range: `admission_bytes` or `snapshot_interval_bytes` equal to `u64::MAX` (the reserved sentinel); an `fsm_lag` byte bound **below 1376 B** — one max-size frame; and, since `0.11.0` (the snapshot catalog, unreleased), `retain_sets` equal to `0` or above `48` (`uc_protocol::v2::catalog::MAX_RETAIN_SETS`) from an operator's own `settings apply`. A REPLAYED older (version 1 or 2) record carries no `retain_sets` and reads it as `1`; it is never refused here. A sub-frame lag pins the report ceiling (`min_applied + fsm_lag`) inside the next frame and stops commit cluster-wide **permanently**, since changing a replicated setting needs a command that commits; `"lockstep"` is how you ask for the tightest pacing. `fsm_lag = "0"` (derive) and `"lockstep"` are sentinels, not bounds, and are never refused here |
+| 47 | `settings_bounds` — a field is out of range; the node's refusal detail and the audit record name which field. Seven fields are checked: `datagram_mtu` other than `0` or a ladder rung; `admission_bytes`, `snapshot_interval_bytes` or `backup_retain_age_secs` equal to `u64::MAX` (the reserved sentinel); an `fsm_lag` byte bound **below 1376 B** — one max-size frame; since `0.11.0` (the snapshot catalog), `retain_sets` above `48` (`uc_protocol::v2::catalog::MAX_RETAIN_SETS`), or equal to `0` from an operator's own `settings apply`; and `purge_requires_tiers` above `4` (`MAX_BACKUP_TIERS`; backup tier 3b, `0` is off). A REPLAYED older (version 1 or 2) record carries no `retain_sets` and reads it as `1`; it is never refused here. A sub-frame lag pins the report ceiling (`min_applied + fsm_lag`) inside the next frame and stops commit cluster-wide **permanently**, since changing a replicated setting needs a command that commits; `"lockstep"` is how you ask for the tightest pacing. `fsm_lag = "0"` (derive) and `"lockstep"` are sentinels, not bounds, and are never refused here |
 | 48 | `snapshot_unsupported` — a declared row lacks the snapshot capability bit, so it would ignore the `SNAPSHOT` frame and the set at P could never complete. Since #67 every Rust SDK service sets this bit unconditionally (`ServiceBuilder::start()` requires `S: SnapshotStateMachine`), so this is now the backstop for a service attached without the current Rust SDK (a non-Rust attacher, or a binary built before #67). The audit record's `detail` field names the row; it is refused by name rather than left with a floor that never moves |
 | 49 | `snapshot_no_learner` — `uc2ctl snapshot --standby` with no learner in the committed membership. Only a learner freezes for a standby instant, so with none there nothing anywhere would build the set |
 | 50 | `snapshot_above_durable` — `uc2ctl snapshot fetch --position P` names a P above this node's own durable frontier. A voter must not adopt a floor above what it has made durable. Usually an operator typo, or a learner transiently ahead of this voter; legitimate again once this node's log catches up |

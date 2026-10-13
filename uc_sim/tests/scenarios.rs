@@ -630,6 +630,67 @@ fn run_storm_with_instants(w: &mut World, budget: u64) -> Result<usize, Invarian
     Ok(w.instants().len())
 }
 
+/// `run_storm_with_instants` minus its closing `w.run()`: that drain spends the
+/// world's whole `max_steps` budget (steps are global), so a scenario that
+/// interleaves storms with crashes and seedings must not call it.
+fn storm_steps(w: &mut World, budget: u64) -> Result<(), InvariantViolation> {
+    for _ in 0..(budget / STORM_INSTANT_STEPS) {
+        if let Some(l) = w.current_leader() {
+            w.command_snapshot(l, false);
+        }
+        w.run_steps(STORM_INSTANT_STEPS)?;
+    }
+    Ok(())
+}
+
+/// Seed a crashed node from a (modelled) set the way `materialize` would, then
+/// restart it. Returns whether a seeding happened.
+fn seed_and_restart(w: &mut World, victim: usize) -> bool {
+    if let Err(v) = w.run_until_leader() {
+        panic!("waiting for a leader before seeding node {victim}: {v}");
+    }
+    let Some(l) = w.current_leader() else {
+        let _ = w.restart(victim);
+        return false;
+    };
+    let commit = w.node_commit_high_water(l);
+    let q = commit / 2 + commit / 4;
+    let s = q / 2;
+    let ok = q > s + 1 && w.seed_from_set(victim, s, q);
+    if let Err(v) = w.restart(victim) {
+        panic!("restart of seeded node {victim}: {v}");
+    }
+    ok
+}
+
+#[test]
+fn inv14_a_set_seeded_node_is_never_cut_below_its_log_end() {
+    let mut w = World::new(SimConfig {
+        n_nodes: 3,
+        seed: 14,
+        max_steps: 1_000_000,
+        drop_per_million: 20_000,
+        dup_per_million: 5_000,
+        ..SimConfig::default()
+    });
+    w.run_until_leader().expect("first leader");
+    let mut seeded = 0u32;
+    for round in 0..40 {
+        storm_steps(&mut w, 1_000).expect("storm");
+        if round % 4 == 3 {
+            let victim = (round / 4) % 3;
+            w.crash(victim);
+            storm_steps(&mut w, 500).expect("storm while down");
+            if seed_and_restart(&mut w, victim) {
+                seeded += 1;
+            }
+        }
+    }
+    assert!(seeded >= 5, "non-vacuity: {seeded} seedings");
+    assert!(w.seeded_checks() > 0);
+    assert_eq!(w.wipes(), 0, "a seeded node never wiped");
+}
+
 #[test]
 fn fuzz_default_seeds() {
     // Every arm below commands instants (`run_storm_with_instants`): inv11 is
@@ -703,6 +764,40 @@ fn fuzz_default_seeds() {
         }
         sets += (0..3).map(|i| w.complete_sets(i).len()).sum::<usize>();
     }
+    // Fourth arm: a crashed node is re-seeded from a modelled set (the backup
+    // tier's `materialize`) every 2 000 steps — inv14 must hold under the
+    // storm's drops, dups and leader churn.
+    let mut seeded = 0u32;
+    for seed in 0..50u64 {
+        let mut w = World::new(SimConfig {
+            n_nodes: 3,
+            seed,
+            max_steps: 60_000,
+            drop_per_million: 20_000,
+            dup_per_million: 5_000,
+            ..SimConfig::default()
+        });
+        if let Err(v) = w.run_until_leader() {
+            panic!("seed {seed} (seeded, boot): {v}");
+        }
+        for round in 0..10usize {
+            if let Err(v) = storm_steps(&mut w, 2_000) {
+                panic!("seed {seed} (seeded): {v}");
+            }
+            let victim = (seed as usize + round) % 3;
+            w.crash(victim);
+            if let Err(v) = w.run_steps(500) {
+                panic!("seed {seed} (seeded, down): {v}");
+            }
+            if seed_and_restart(&mut w, victim) {
+                seeded += 1;
+            }
+        }
+        if let Err(v) = w.run() {
+            panic!("seed {seed} (seeded, drain): {v}");
+        }
+    }
+    assert!(seeded > 100, "the seeded arm must seed ({seeded} seedings)");
     // A capped node's applied frontier is what the ceiling clamps, so the
     // third arm is also the one where a node lags instants its peers complete
     // — inv11's non-prefix shape, arrived at by the storm rather than by a
@@ -742,6 +837,39 @@ fn fuzz_heavy_seeds() {
         instants > 20_000,
         "the heavy tier must actually command instants ({instants} over 1000 runs)"
     );
+    // Seeded arm: a crashed node re-seeded from a modelled set (inv14).
+    let mut seeded = 0u32;
+    for seed in 0..1000u64 {
+        let n = if seed % 4 == 0 { 5 } else { 3 };
+        let mut w = World::new(SimConfig {
+            n_nodes: n,
+            seed,
+            max_steps: 60_000,
+            drop_per_million: 50_000,
+            dup_per_million: 10_000,
+            ..SimConfig::default()
+        });
+        if let Err(v) = w.run_until_leader() {
+            panic!("seed {seed} (heavy seeded, boot): {v}");
+        }
+        for round in 0..10usize {
+            if let Err(v) = storm_steps(&mut w, 2_000) {
+                panic!("seed {seed} (heavy seeded): {v}");
+            }
+            let victim = (seed as usize + round) % n;
+            w.crash(victim);
+            if let Err(v) = w.run_steps(500) {
+                panic!("seed {seed} (heavy seeded, down): {v}");
+            }
+            if seed_and_restart(&mut w, victim) {
+                seeded += 1;
+            }
+        }
+        if let Err(v) = w.run() {
+            panic!("seed {seed} (heavy seeded, drain): {v}");
+        }
+    }
+    assert!(seeded > 2_000, "heavy seeded arm must seed ({seeded})");
     // The 1000-seed storm against the REAL intake-gate mechanism (guarded, as the
     // node ships it). ADDED alongside the Gated tier above — Mechanism is the
     // discipline the node actually runs, so it gets its own heavy fuzz.

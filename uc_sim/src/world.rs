@@ -946,6 +946,9 @@ pub struct World {
     // stats
     stat_leaders: u32,
     stat_truncations: u32,
+    /// Reconcile outcomes (persisted map / truncation) observed on a node with an
+    /// inv14 seeded floor — the non-vacuity count for the seeded-lineage check.
+    stat_seeded_checks: u64,
     stat_wipes: u32,
     stat_restarts: u32,
     stat_stale_vote_window: u64,
@@ -1092,6 +1095,7 @@ impl World {
             quiet: false,
             stat_leaders: 0,
             stat_truncations: 0,
+            stat_seeded_checks: 0,
             stat_wipes: 0,
             stat_restarts: 0,
             stat_stale_vote_window: 0,
@@ -3191,9 +3195,15 @@ impl World {
                 }
             }
             Action::PersistTermMap { new_map } => {
+                if self.checker.seeded_floor[node] > 0 {
+                    self.stat_seeded_checks += 1;
+                }
                 self.nodes[node].term_map = new_map;
             }
             Action::Truncate { epoch, to, new_map } => {
+                if self.checker.seeded_floor[node] > 0 {
+                    self.stat_seeded_checks += 1;
+                }
                 let own_before = self.nodes[node].map_before_reconcile.clone();
                 let leader = self.nodes[node].last_leader_map.clone();
                 self.checker
@@ -3781,6 +3791,46 @@ impl World {
     pub fn restart(&mut self, node: usize) -> Result<(), InvariantViolation> {
         let now = self.now;
         self.on_restart(node, now)
+    }
+
+    /// Rebuild a CRASHED node as the backup tier's `materialize` would from a
+    /// set at `s` with the log to `q` (`s < q <=` the cluster-wide committed
+    /// frontier, `checker.global_max_commit`): its term map becomes the current
+    /// leader's map truncated at `q`, `durable`/`append`/`commit` become `q`, and
+    /// the checker records `q` as the node's seeded floor (inv14) and committed
+    /// high-water. `s` is informational (the sim models no set artifacts and no
+    /// bytes below `s`; content identity is `term_at(map, pos)`). Returns false
+    /// (no-op) when the node is up, no leader is known, or `q` is out of range.
+    pub fn seed_from_set(&mut self, node: usize, s: u64, q: u64) -> bool {
+        if self.nodes[node].up || self.nodes[node].halted || s >= q {
+            return false;
+        }
+        let Some(l) = self.current_leader() else {
+            return false;
+        };
+        if q > self.checker.global_max_commit {
+            return false;
+        }
+        let map: Vec<(u32, u64)> = self.nodes[l]
+            .term_map
+            .iter()
+            .copied()
+            .filter(|&(_, base)| base < q)
+            .collect();
+        let nd = &mut self.nodes[node];
+        nd.term_map = map;
+        nd.durable = q;
+        nd.durable_absorbed = q;
+        nd.append = q;
+        nd.commit = q;
+        self.checker.committed_hw[node] = self.checker.committed_hw[node].max(q);
+        self.checker.seeded_floor[node] = self.checker.seeded_floor[node].max(q);
+        true
+    }
+
+    /// Reconcile outcomes a seeded node has gone through (inv14 non-vacuity).
+    pub fn seeded_checks(&self) -> u64 {
+        self.stat_seeded_checks
     }
 
     /// Arm a one-shot: crash a node the moment its next `Truncate` action fires.

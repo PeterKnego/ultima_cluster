@@ -499,6 +499,13 @@ pub const DGRAM_KIND_SNAP_REPORT: u8 = 26;
 /// `crate::v2::backup`'s 40-byte report body. Term-independent like
 /// `SNAP_REPORT`. `Scope::Pairwise`.
 pub const DGRAM_KIND_BACKUP_REPORT: u8 = 27;
+/// Backup tier 3b (spec §6.3): the leader asks a below-floor follower to
+/// install from its own tier before a snapshot session is opened. Body =
+/// [`TierInstallBody`]. Term-gated, leader -> follower. `Scope::Pairwise`.
+pub const DGRAM_KIND_TIER_INSTALL: u8 = 28;
+/// Backup tier 3b (spec §6.3): the follower's answer, and its progress
+/// reports. Body = [`TierInstallStatusBody`]. `Scope::Pairwise`.
+pub const DGRAM_KIND_TIER_INSTALL_STATUS: u8 = 29;
 
 /// The fixed prefix of a `PROBE` body: the rung, `u32 LE`. Everything after it
 /// is padding and carries nothing.
@@ -595,6 +602,156 @@ pub fn read_snap_report_body(buf: &[u8]) -> Option<SnapReportBody> {
         position,
         hash: u64::from_le_bytes(buf[16..24].try_into().unwrap()),
         size: u64::from_le_bytes(buf[24..32].try_into().unwrap()),
+    })
+}
+
+pub const TIER_INSTALL_BODY_LEN: usize = 200;
+pub const TIER_INSTALL_STATUS_BODY_LEN: usize = 24;
+
+/// Row slots a `TIER_INSTALL` body carries — one per cnc service slot.
+pub const TIER_INSTALL_ROWS: usize = crate::v2::cnc::CNC_MAX_SERVICES;
+
+/// `TIER_INSTALL` (3b spec §6.3, controller ruling on Task 13 concern 5):
+/// the leader names the set S the follower is to install and CARRIES the
+/// leader's catalog verdict for it — per row the agreed hash, the version
+/// that built it and its size, and the cluster artifact's hash and size —
+/// the way `SNAP_BEGIN` carries identity claims. A brand-new learner has no
+/// catalog of its own, so it verifies the tier's copy against THESE (ruling
+/// D8 holds with the leader as the authority) rather than trusting the
+/// tier's own `SET`. A row with `row_hash == 0` is not in the set.
+///
+/// Fixed 200 B, LE: floor 0..8, commit 8..16, s 16..24, row_hash[8]
+/// 24..88, row_version[8] (u32) 88..120, row_size[8] 120..184,
+/// cluster_hash 184..192, cluster_size 192..200. Unset rows are zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TierInstallBody {
+    pub floor: u64,
+    pub commit: u64,
+    pub s: u64,
+    pub row_hash: [u64; TIER_INSTALL_ROWS],
+    pub row_version: [u32; TIER_INSTALL_ROWS],
+    pub row_size: [u64; TIER_INSTALL_ROWS],
+    pub cluster_hash: u64,
+    pub cluster_size: u64,
+}
+
+pub fn write_tier_install_body(out: &mut [u8; TIER_INSTALL_BODY_LEN], b: &TierInstallBody) {
+    out[0..8].copy_from_slice(&b.floor.to_le_bytes());
+    out[8..16].copy_from_slice(&b.commit.to_le_bytes());
+    out[16..24].copy_from_slice(&b.s.to_le_bytes());
+    for i in 0..TIER_INSTALL_ROWS {
+        out[24 + 8 * i..32 + 8 * i].copy_from_slice(&b.row_hash[i].to_le_bytes());
+        out[88 + 4 * i..92 + 4 * i].copy_from_slice(&b.row_version[i].to_le_bytes());
+        out[120 + 8 * i..128 + 8 * i].copy_from_slice(&b.row_size[i].to_le_bytes());
+    }
+    out[184..192].copy_from_slice(&b.cluster_hash.to_le_bytes());
+    out[192..200].copy_from_slice(&b.cluster_size.to_le_bytes());
+}
+
+/// Decode a `TIER_INSTALL` body: exactly 200 bytes and
+/// `floor <= s <= commit`.
+pub fn read_tier_install_body(buf: &[u8]) -> Option<TierInstallBody> {
+    if buf.len() != TIER_INSTALL_BODY_LEN {
+        return None;
+    }
+    let u64_at = |o: usize| u64::from_le_bytes(buf[o..o + 8].try_into().unwrap());
+    let u32_at = |o: usize| u32::from_le_bytes(buf[o..o + 4].try_into().unwrap());
+    let (floor, commit, s) = (u64_at(0), u64_at(8), u64_at(16));
+    if floor > commit || s < floor || s > commit {
+        return None;
+    }
+    Some(TierInstallBody {
+        floor,
+        commit,
+        s,
+        row_hash: core::array::from_fn(|i| u64_at(24 + 8 * i)),
+        row_version: core::array::from_fn(|i| u32_at(88 + 4 * i)),
+        row_size: core::array::from_fn(|i| u64_at(120 + 8 * i)),
+        cluster_hash: u64_at(184),
+        cluster_size: u64_at(192),
+    })
+}
+
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TierInstallState {
+    Declined = 0,
+    Installing = 1,
+    Installed = 2,
+}
+
+impl TierInstallState {
+    pub fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(Self::Declined),
+            1 => Some(Self::Installing),
+            2 => Some(Self::Installed),
+            _ => None,
+        }
+    }
+}
+
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TierInstallReason {
+    None = 0,
+    NoSource = 1,
+    NoSet = 2,
+    Verify = 3,
+    NotRegistered = 4,
+}
+
+impl TierInstallReason {
+    pub fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(Self::None),
+            1 => Some(Self::NoSource),
+            2 => Some(Self::NoSet),
+            3 => Some(Self::Verify),
+            4 => Some(Self::NotRegistered),
+            _ => None,
+        }
+    }
+}
+
+/// `TIER_INSTALL_STATUS`. LE: state 0, reason 1, reserved 2..8 (zero),
+/// position 8..16, copied 16..24.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TierInstallStatusBody {
+    pub state: TierInstallState,
+    pub reason: TierInstallReason,
+    pub position: u64,
+    pub copied: u64,
+}
+
+pub fn write_tier_install_status_body(
+    out: &mut [u8; TIER_INSTALL_STATUS_BODY_LEN],
+    b: &TierInstallStatusBody,
+) {
+    out[0] = b.state as u8;
+    out[1] = b.reason as u8;
+    out[2..8].fill(0);
+    out[8..16].copy_from_slice(&b.position.to_le_bytes());
+    out[16..24].copy_from_slice(&b.copied.to_le_bytes());
+}
+
+/// Decode a `TIER_INSTALL_STATUS` body: exactly 24 bytes, reserved zero,
+/// known state and reason, `Declined` carries a reason, the others none.
+pub fn read_tier_install_status_body(buf: &[u8]) -> Option<TierInstallStatusBody> {
+    if buf.len() != TIER_INSTALL_STATUS_BODY_LEN || buf[2..8] != [0; 6] {
+        return None;
+    }
+    let state = TierInstallState::from_u8(buf[0])?;
+    let reason = TierInstallReason::from_u8(buf[1])?;
+    let reason_none = reason == TierInstallReason::None;
+    if (state == TierInstallState::Declined) == reason_none {
+        return None;
+    }
+    Some(TierInstallStatusBody {
+        state,
+        reason,
+        position: u64::from_le_bytes(buf[8..16].try_into().unwrap()),
+        copied: u64::from_le_bytes(buf[16..24].try_into().unwrap()),
     })
 }
 
@@ -1585,6 +1742,125 @@ mod tests {
     /// Snapshot-lifecycle spec §7.1: the body grows to 32 B with the
     /// artifact's byte size at @24. A 24-byte body (the unreleased draft of
     /// 0.11.0) is refused by length, like any mixed flag day.
+    #[test]
+    fn tier_install_kinds_and_bodies_are_pinned() {
+        assert_eq!(DGRAM_KIND_TIER_INSTALL, 28);
+        assert_eq!(DGRAM_KIND_TIER_INSTALL_STATUS, 29);
+        let b = TierInstallBody {
+            floor: 0x0102_0304_0506_0708,
+            commit: 0x1112_1314_1516_1718,
+            s: 0x0a0b_0c0d_0e0f_1011,
+            row_hash: core::array::from_fn(|i| 0xA0 + i as u64),
+            row_version: core::array::from_fn(|i| 0x0100_0000 + i as u32),
+            row_size: core::array::from_fn(|i| 0xC0 + i as u64),
+            cluster_hash: 0xD0D1,
+            cluster_size: 0xE0E1,
+        };
+        let mut buf = [0u8; TIER_INSTALL_BODY_LEN];
+        write_tier_install_body(&mut buf, &b);
+        let mut want = [0u8; TIER_INSTALL_BODY_LEN];
+        want[0..8].copy_from_slice(&[0x08, 7, 6, 5, 4, 3, 2, 1]);
+        want[8..16].copy_from_slice(&[0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11]);
+        want[16..24].copy_from_slice(&[0x11, 0x10, 0x0f, 0x0e, 0x0d, 0x0c, 0x0b, 0x0a]);
+        for i in 0..8 {
+            want[24 + 8 * i] = 0xA0 + i as u8; // row_hash[i]
+            want[88 + 4 * i] = i as u8; // row_version[i] = 0x0100_000i
+            want[88 + 4 * i + 3] = 0x01;
+            want[120 + 8 * i] = 0xC0 + i as u8; // row_size[i]
+        }
+        want[184] = 0xD1;
+        want[185] = 0xD0;
+        want[192] = 0xE1;
+        want[193] = 0xE0;
+        assert_eq!(buf, want, "absolute bytes of the 200 B layout");
+        assert_eq!(TIER_INSTALL_BODY_LEN, 200);
+        assert_eq!(read_tier_install_body(&buf), Some(b));
+        assert!(read_tier_install_body(&buf[..199]).is_none());
+        assert!(read_tier_install_body(&[buf.as_slice(), &[0]].concat()).is_none());
+        assert!(
+            read_tier_install_body(&buf[..16]).is_none(),
+            "the old 16 B body"
+        );
+        for (floor, commit, s, why) in [
+            (9, 8, 8, "floor > commit"),
+            (4, 8, 3, "s < floor"),
+            (4, 8, 9, "s > commit"),
+        ] {
+            let mut bb = [0u8; TIER_INSTALL_BODY_LEN];
+            write_tier_install_body(
+                &mut bb,
+                &TierInstallBody {
+                    floor,
+                    commit,
+                    s,
+                    ..b
+                },
+            );
+            assert!(read_tier_install_body(&bb).is_none(), "{why}");
+        }
+        let mut ok = [0u8; TIER_INSTALL_BODY_LEN];
+        write_tier_install_body(
+            &mut ok,
+            &TierInstallBody {
+                floor: 4,
+                commit: 8,
+                s: 8,
+                ..b
+            },
+        );
+        assert!(
+            read_tier_install_body(&ok).is_some(),
+            "s == commit is valid"
+        );
+
+        let s = TierInstallStatusBody {
+            state: TierInstallState::Declined,
+            reason: TierInstallReason::NoSet,
+            position: 0x0102_0304_0506_0708,
+            copied: 0x1112_1314_1516_1718,
+        };
+        let mut sb = [0u8; TIER_INSTALL_STATUS_BODY_LEN];
+        write_tier_install_status_body(&mut sb, &s);
+        assert_eq!(
+            sb,
+            [
+                0, 2, 0, 0, 0, 0, 0, 0, 0x08, 7, 6, 5, 4, 3, 2, 1, 0x18, 0x17, 0x16, 0x15, 0x14,
+                0x13, 0x12, 0x11
+            ]
+        );
+        assert_eq!(read_tier_install_status_body(&sb), Some(s));
+        assert!(read_tier_install_status_body(&sb[..23]).is_none());
+        assert!(read_tier_install_status_body(&[sb.as_slice(), &[0]].concat()).is_none());
+        let mut x = sb;
+        x[3] = 1;
+        assert!(read_tier_install_status_body(&x).is_none(), "reserved");
+        let mut x = sb;
+        x[0] = 3;
+        assert!(read_tier_install_status_body(&x).is_none(), "unknown state");
+        let mut x = sb;
+        x[1] = 5;
+        assert!(
+            read_tier_install_status_body(&x).is_none(),
+            "unknown reason"
+        );
+        let mut x = sb;
+        x[1] = 0;
+        assert!(
+            read_tier_install_status_body(&x).is_none(),
+            "Declined needs a reason"
+        );
+        for st in [1u8, 2] {
+            let mut x = sb;
+            x[0] = st;
+            assert!(
+                read_tier_install_status_body(&x).is_none(),
+                "ok states carry no reason"
+            );
+            x[1] = 0;
+            assert!(read_tier_install_status_body(&x).is_some());
+        }
+    }
+
     #[test]
     fn backup_report_kind_is_27_and_pairwise_docs_hold() {
         assert_eq!(DGRAM_KIND_BACKUP_REPORT, 27);

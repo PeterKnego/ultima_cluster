@@ -91,6 +91,7 @@ fn spawn_cluster(n: usize) -> Cluster {
             socket: Some(sock),
             admin: AdminPolicy::Filesystem,
             backup: None,
+            tier_source: None,
         };
         nodes.push(Node::start_with(cfg, opts).expect("start"));
     }
@@ -410,6 +411,8 @@ mod writer_e2e {
         is_learner: bool,
         cfg: Box<dyn Fn() -> NodeConfig>,
         backup: Option<BackupConfig>,
+        /// `[tier_source]` (3b spec §6.1); `None` = none configured.
+        tier_source: Option<PathBuf>,
         sock: Option<UdpSocket>,
         node: Option<Node>,
         svc: Option<Box<dyn FnOnce()>>,
@@ -423,6 +426,7 @@ mod writer_e2e {
                 socket: Some(sock),
                 admin: AdminPolicy::Filesystem,
                 backup: self.backup.clone(),
+                tier_source: self.tier_source.clone(),
             };
             self.node = Some(Node::start_with((self.cfg)(), opts).expect("start node"));
         }
@@ -460,6 +464,12 @@ mod writer_e2e {
         purge: bool,
         /// Genesis `Settings::backup_retain_sets` (0 = keep everything).
         retain_sets: u16,
+        /// Genesis `Settings::purge_requires_tiers` (0 = no gate).
+        purge_requires_tiers: u8,
+        /// Genesis `Settings::auto_fetch`.
+        auto_fetch: bool,
+        /// Genesis `Settings::snapshot_target = learners` (standby instants).
+        standby: bool,
     }
 
     fn opts(app: &'static str, purge: bool) -> Opts {
@@ -467,6 +477,9 @@ mod writer_e2e {
             app,
             purge,
             retain_sets: 0,
+            purge_requires_tiers: 0,
+            auto_fetch: true,
+            standby: false,
         }
     }
 
@@ -519,6 +532,17 @@ mod writer_e2e {
         o: Opts,
         writer: impl Fn(usize) -> Option<BackupConfig>,
     ) -> Cluster {
+        spawn_with(n_voters, n_learners, o, writer, |_| None)
+    }
+
+    /// [`spawn`], with node `i`'s `[tier_source]` = `source(i)`.
+    fn spawn_with(
+        n_voters: usize,
+        n_learners: usize,
+        o: Opts,
+        writer: impl Fn(usize) -> Option<BackupConfig>,
+        source: impl Fn(usize) -> Option<PathBuf>,
+    ) -> Cluster {
         let dir = tempfile::Builder::new()
             .prefix("uc2-backup-writer-")
             .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
@@ -551,6 +575,13 @@ mod writer_e2e {
                 admission_bytes_default: 256 * 1024,
                 settings_genesis: Settings {
                     backup_retain_sets: o.retain_sets,
+                    purge_requires_tiers: o.purge_requires_tiers,
+                    auto_fetch: o.auto_fetch,
+                    snapshot_target: if o.standby {
+                        uc_protocol::v2::settings::Target::Learners
+                    } else {
+                        Settings::genesis_default().snapshot_target
+                    },
                     ..Settings::genesis_default()
                 },
                 force_jumbo_frames: false,
@@ -577,6 +608,7 @@ mod writer_e2e {
                 is_learner: i >= n_voters,
                 cfg,
                 backup: writer(i),
+                tier_source: source(i),
                 sock: Some(sock),
                 node: None,
                 svc: None,
@@ -1090,6 +1122,25 @@ mod writer_e2e {
         let t = FsTarget::new(tier.path());
         let listing = list_tier(&t).unwrap();
         assert!(listing.sets.iter().any(|s| s.position == p), "{listing:?}");
+        // 3b: the SET records the committed lineage strictly below the set.
+        let mut text = String::new();
+        std::io::Read::read_to_string(
+            &mut t
+                .open(&uc_node::tier::layout::set_label(p))
+                .unwrap()
+                .expect("SET present"),
+            &mut text,
+        )
+        .unwrap();
+        let label = uc_node::tier::layout::SetLabel::parse(&text).expect("SET parses");
+        let expect: Vec<(u32, u64)> = c
+            .node(1)
+            .term_map_for_test()
+            .into_iter()
+            .filter(|&(_, b)| b < p)
+            .collect();
+        assert!(!label.lineage.is_empty());
+        assert_eq!(label.lineage, expect);
         assert!(
             listing.chunks.len() >= 2,
             "1 MiB chunks over ~2.5 MiB of history: {:?}",
@@ -1119,6 +1170,45 @@ mod writer_e2e {
         let _keep = c.stop();
         let n = assert_chunks_match(&t, &journal_frames(&dirs[l]));
         assert!(n > 20_000, "chunks hold the submitted frames ({n})");
+    }
+
+    /// 3b / RA6: a set with no lineage is deferred ALONE. The writer's
+    /// published map is replaced by one whose first term opens AT the older
+    /// set (so nothing lies strictly below it) but below the newer one: the
+    /// newer set is copied while the older is left out of the tier.
+    #[test]
+    fn a_lineage_less_set_is_deferred_alone_and_a_newer_one_is_copied() {
+        let _g = serialize();
+        let tier = tmp_tier();
+        let cfg = writer_cfg(tier.path(), 1 << 20, Duration::from_millis(300));
+        let mut c = spawn(3, 1, opts("tier-defer", false), |i| {
+            (i == 3).then(|| cfg.clone())
+        });
+        start_sums(&mut c);
+        let l = await_single_leader(&c, 30);
+        await_capable(&c);
+        let shared = c.node(3).backup_writer().expect("node 3 runs a writer");
+        shared.paused_for_test.store(true, Ordering::Release);
+        let all = c.running();
+        submit_settled(&c, 2000);
+        let p1 = instant_until_complete(&c, l, &all);
+        await_agreed(&c, &all, p1);
+        submit_settled(&c, 2000);
+        let p2 = instant_until_complete(&c, l, &all);
+        await_agreed(&c, &all, p2);
+        assert!(p2 > p1);
+        *shared.term_map.lock().unwrap() = vec![(1, p1)];
+        shared.paused_for_test.store(false, Ordering::Release);
+        let w = await_watermark(&c, l, 60, |w| w.newest_set == p2);
+        assert_eq!(w.oldest_set, p2, "the deferred set is not in the chain");
+        let t = FsTarget::new(tier.path());
+        let listing = list_tier(&t).unwrap();
+        assert!(listing.sets.iter().any(|s| s.position == p2), "{listing:?}");
+        assert!(
+            !listing.sets.iter().any(|s| s.position == p1),
+            "the lineage-less set waits: {listing:?}"
+        );
+        let _keep = c.stop();
     }
 
     /// Spec §8.1/§8.2, whole-cluster restore: a writer backs up a 3-voter
@@ -1859,6 +1949,11 @@ mod writer_e2e {
             );
             assert!(listing.sets.iter().any(|s| s.position == w.oldest_set));
         }
+        assert!(
+            listing.corrupt_sets.is_empty(),
+            "the two writers' lineages agreed: {:?}",
+            listing.corrupt_sets
+        );
         let report = verify(&t, true).unwrap();
         assert!(report.findings.is_empty(), "{:?}", report.findings);
         assert!(
@@ -2219,6 +2314,168 @@ mod writer_e2e {
         let _keep = c.stop();
     }
 
+    /// Stage a settings record at `<dir>/settings.pending` and drive admin
+    /// op 7 on that (leader) node, as `uc2ctl settings apply` does.
+    fn apply_gate_k(c: &Cluster, leader: usize, k: u8) {
+        apply_settings(c, leader, |s| s.purge_requires_tiers = k);
+    }
+
+    /// `uc2ctl settings apply` in-process: the leader's committed settings
+    /// with `edit` applied, staged and signed; waits until every running
+    /// node has committed them.
+    fn apply_settings(c: &Cluster, leader: usize, edit: impl FnOnce(&mut Settings)) {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut s = c.node(leader).cluster_view().to_state().settings;
+        edit(&mut s);
+        let mut bytes = Vec::new();
+        uc_protocol::v2::settings::encode_settings(&s, &mut bytes);
+        let (id, ip, port) = uc_node::staged_digest(&bytes);
+        let dir = &c.dirs()[leader];
+        let tmp = dir.join("settings.pending.tmp");
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)
+            .expect("stage");
+        f.write_all(&bytes).unwrap();
+        f.sync_all().unwrap();
+        std::fs::rename(&tmp, dir.join("settings.pending")).unwrap();
+        admin_ok(
+            &c.cnc(leader),
+            uc_protocol::v2::cnc::ADMIN_OP_SETTINGS_APPLY,
+            id,
+            ip,
+            port,
+        );
+        await_until(30, "the new settings committed on every node", || {
+            c.running()
+                .into_iter()
+                .all(|i| c.node(i).cluster_view().to_state().settings == s)
+        });
+    }
+
+    /// Backup-gated purge (spec §12): with K = 1 every node holds its
+    /// journal at the confirmed tier; a low-space node lets go (once) while
+    /// the others still hold; K above the registered count stops purging
+    /// cleanly (no release), and K back resumes it.
+    #[test]
+    fn every_node_holds_its_purge_at_the_tier_and_a_low_space_node_lets_go() {
+        let _g = serialize();
+        let tier = tmp_tier();
+        let cfg = writer_cfg(tier.path(), 1 << 20, Duration::from_millis(300));
+        let mut o = opts("tier-gate", true);
+        o.purge_requires_tiers = 1;
+        let mut c = spawn(3, 0, o, |i| (i == 1).then(|| cfg.clone()));
+        start_sums(&mut c);
+        let l = await_single_leader(&c, 30);
+        await_capable(&c);
+        let all = c.running();
+        submit_settled(&c, 2000);
+        let p0 = instant_until_complete(&c, l, &all);
+        await_agreed(&c, &all, p0);
+        let lead = submit_settled(&c, 2000);
+        let t0 = c.node(lead).counters().commit.load_acquire();
+        await_watermark(&c, l, 60, |w| w.through >= t0);
+        churn(&c, &all, 3);
+
+        // Every node holds at the tier on EVERY poll, not just at the end.
+        let end = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < end {
+            for &i in &all {
+                let through = watermark(c.node(l)).expect("watermark").through;
+                let fb = c.node(i).archive_first_base();
+                assert!(
+                    fb <= through,
+                    "node {i} purged to {fb}, past the tier {through}"
+                );
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        let gate_count = |i: usize| {
+            c.node(i)
+                .observability()
+                .backup_gate_released
+                .load(Ordering::Relaxed)
+        };
+        let gate_level = |i: usize| {
+            c.node(i)
+                .observability()
+                .backup_gate_released_level
+                .load(Ordering::Relaxed)
+        };
+        assert!(all.iter().all(|&i| gate_count(i) == 0 && !gate_level(i)));
+
+        // Pause the writer: the tier stops advancing while the cluster moves on.
+        let shared = c.node(1).backup_writer().expect("writer on node 1");
+        shared.paused_for_test.store(true, Ordering::Relaxed);
+        std::thread::sleep(Duration::from_millis(600));
+        let through = watermark(c.node(l)).expect("watermark").through;
+        churn(&c, &all, 2);
+        std::thread::sleep(Duration::from_secs(1));
+        for i in [0usize, 2] {
+            let fb = c.node(i).archive_first_base();
+            assert!(
+                fb <= through,
+                "node {i} purged to {fb}, past the tier {through}"
+            );
+        }
+
+        // Node 2 runs low on space: it alone lets go, once.
+        c.node(2).set_free_bytes_for_test(1);
+        await_until(30, "node 2 purged past the tier", || {
+            c.node(2).archive_first_base() > through
+        });
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(gate_count(2), 1, "one release per episode");
+        assert!(gate_level(2));
+        assert_eq!((gate_count(0), gate_count(1)), (0, 0));
+        assert!(
+            c.node(0).archive_first_base() <= through,
+            "node 0 still holds"
+        );
+        assert!(
+            c.node(1).archive_first_base() <= through,
+            "node 1 still holds"
+        );
+        c.node(2).set_free_bytes_for_test(0);
+        await_until(30, "node 2's release level cleared", || !gate_level(2));
+        assert_eq!(gate_count(2), 1, "the counter is monotone");
+
+        // Spec §12.3: K above the registered count stops purging cleanly.
+        shared.paused_for_test.store(false, Ordering::Relaxed);
+        await_watermark(&c, l, 60, |w| w.through > through);
+        apply_gate_k(&c, l, 2);
+        std::thread::sleep(Duration::from_secs(1));
+        let before: Vec<u64> = all
+            .iter()
+            .map(|&i| c.node(i).archive_first_base())
+            .collect();
+        churn(&c, &all, 1);
+        std::thread::sleep(Duration::from_secs(5));
+        let after: Vec<u64> = all
+            .iter()
+            .map(|&i| c.node(i).archive_first_base())
+            .collect();
+        assert_eq!(before, after, "K=2 over one tier: no node's journal moves");
+        assert_eq!(
+            (gate_count(0), gate_count(1), gate_count(2)),
+            (0, 0, 1),
+            "an under-registered gate is a hold, not a release"
+        );
+        assert!(all.iter().all(|&i| !gate_level(i)));
+
+        // K back to 1: purge resumes.
+        apply_gate_k(&c, l, 1);
+        churn(&c, &all, 1);
+        await_until(60, "purge resumed at K=1", || {
+            c.node(0).archive_first_base() > before[0]
+        });
+        let _keep = c.stop();
+    }
+
     /// Ruling R9a: a writer that stopped for good (a foreign `TIER`)
     /// releases its hold entirely — its node purges like any other.
     #[test]
@@ -2529,6 +2786,7 @@ mod writer_e2e {
                 socket: Some(sock),
                 admin: AdminPolicy::Filesystem,
                 backup: None,
+                tier_source: None,
             },
         )
         .expect("start the fork");
@@ -2661,22 +2919,227 @@ mod writer_e2e {
         }
     }
 
+    /// One labelled sample of `name` on `node`'s `/metrics` (catalog.rs's
+    /// helper).
+    fn metric_labeled(node: &Node, name: &str, labels: &str) -> u64 {
+        let text = uc_node::obs::metrics::render_prometheus(&node.observability());
+        let prefix = format!("{name}{{{labels}}} ");
+        text.lines()
+            .find_map(|l| l.strip_prefix(&prefix))
+            .unwrap_or_else(|| panic!("no {name}{{{labels}}} sample in:\n{text}"))
+            .trim()
+            .parse()
+            .unwrap_or_else(|e| panic!("{name}{{{labels}}}: {e}"))
+    }
+
+    fn fetched(node: &Node, source: &str) -> u64 {
+        metric_labeled(
+            node,
+            "uc2_snapshot_fetch_total",
+            &format!("source=\"{source}\""),
+        )
+    }
+
+    /// Restores the stderr log sink when a capturing test ends (pass or
+    /// panic).
+    struct CaptureGuard;
+
+    impl Drop for CaptureGuard {
+        fn drop(&mut self) {
+            uc_node::obs::log::stderr_for_tests();
+        }
+    }
+
+    /// The captured log lines naming `event`.
+    fn obs_lines(buf: &std::sync::Mutex<Vec<u8>>, event: &str) -> Vec<String> {
+        let text =
+            String::from_utf8_lossy(&buf.lock().unwrap_or_else(|e| e.into_inner())).into_owned();
+        let needle = format!("\"event\":\"{event}\"");
+        text.lines()
+            .filter(|l| l.contains(needle.as_str()))
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Command a STANDBY instant (following leadership) and wait until the
+    /// learner `learner` holds its set; returns its position.
+    fn standby_instant(c: &Cluster, learner: usize) -> u64 {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let p = loop {
+            assert!(Instant::now() < deadline, "no leader took the instant");
+            let Some(l) = c.running().into_iter().find(|&i| c.node(i).can_serve()) else {
+                std::thread::sleep(Duration::from_millis(5));
+                continue;
+            };
+            match c.node(l).command_snapshot(true) {
+                Ok(p) => break p,
+                Err(uc_node::SnapshotRefusal::Retry) => {
+                    std::thread::sleep(Duration::from_millis(5))
+                }
+                Err(e) => panic!("uc2ctl snapshot --standby refused: {e}"),
+            }
+        };
+        await_until(60, "the learner holds the standby set", || {
+            c.node(learner).snapshot_set_position() >= p
+        });
+        p
+    }
+
+    /// `uc2ctl snapshot fetch --from <learner> --position <p>` on node `at`
+    /// (admin op 9: the position rides in `ip ‖ port`, `fetch_position`).
+    fn snapshot_fetch(c: &Cluster, at: usize, learner: usize, p: u64) {
+        let (ip, port) = (p as u32, (p >> 32) as u16);
+        assert_eq!(uc_node::fetch_position(ip, port), p);
+        admin_ok(&c.cnc(at), 9, learner as u32, ip, port);
+    }
+
+    /// 3b spec §6.2, deterministic by construction (ruling RA4): no voter
+    /// fetches on its own (`auto_fetch = false`) and no voter builds a
+    /// standby set, so a voter's set can only come from the fetch the test
+    /// triggers, and only once the tier holds it. Node 0 has a tier source:
+    /// the first set comes from the tier, verified against the catalog; the
+    /// second — never written to the tier, the writer is paused — is
+    /// declined by the tier once (`no_set`) and taken from the learner.
+    #[test]
+    fn a_store_only_fetch_takes_the_set_from_the_tier_and_from_a_peer_when_the_tier_lacks_it() {
+        let _g = serialize();
+        let buf = uc_node::obs::log::capture_for_tests();
+        let _restore = CaptureGuard;
+        let tier = tmp_tier();
+        let cfg = writer_cfg(tier.path(), 1 << 20, Duration::from_millis(300));
+        let o = Opts {
+            auto_fetch: false,
+            standby: true,
+            ..opts("tier-fetch", false)
+        };
+        let src = tier.path().to_path_buf();
+        let mut c = spawn_with(
+            3,
+            1,
+            o,
+            |i| (i == 3).then(|| cfg.clone()),
+            |i| (i == 0 || i == 2).then(|| src.clone()),
+        );
+        start_sums(&mut c);
+        await_single_leader(&c, 30);
+        await_capable(&c);
+
+        // P1 reaches the tier; only then does node 0 fetch it.
+        submit_settled(&c, 500);
+        let p1 = standby_instant(&c, 3);
+        await_agreed(&c, &[0, 3], p1);
+        await_watermark(&c, 0, 60, |w| w.newest_set == p1);
+        assert_eq!(
+            c.node(0).snapshot_set_position(),
+            0,
+            "a voter holds no standby set on its own"
+        );
+        snapshot_fetch(&c, 0, 3, p1);
+        await_until(60, "node 0 took P1 from the tier", || {
+            fetched(c.node(0), "tier") == 1
+        });
+        await_until(30, "node 0 holds P1", || {
+            c.node(0).snapshot_set_position() == p1
+        });
+        assert_eq!(fetched(c.node(0), "peer"), 0, "no peer session for P1");
+        assert_eq!(c.node(0).tier_fetches_spawned(), 1);
+        assert!(
+            obs_lines(&buf, "tier_fetch_declined").is_empty(),
+            "the tier served P1: {:?}",
+            obs_lines(&buf, "tier_fetch_declined")
+        );
+
+        // P2 never reaches the tier: the writer is paused before it exists.
+        let shared = c.node(3).backup_writer().expect("node 3 runs a writer");
+        shared.paused_for_test.store(true, Ordering::Release);
+        submit_settled(&c, 500);
+        let p2 = standby_instant(&c, 3);
+        assert!(p2 > p1);
+        await_agreed(&c, &[0, 3], p2);
+        snapshot_fetch(&c, 0, 3, p2);
+        await_until(60, "node 0 took P2 from the learner", || {
+            fetched(c.node(0), "peer") == 1
+        });
+        await_until(30, "node 0 holds P2", || {
+            c.node(0).snapshot_set_position() == p2
+        });
+        assert_eq!(fetched(c.node(0), "tier"), 1, "the tier served P1 only");
+        assert_eq!(
+            c.node(0).tier_fetches_spawned(),
+            1,
+            "no copy was started for P2"
+        );
+        let declined = obs_lines(&buf, "tier_fetch_declined");
+        assert_eq!(declined.len(), 1, "named once: {declined:?}");
+        assert!(
+            declined[0].contains(&format!("\"position\":{p2}"))
+                && declined[0].contains("\"reason\":\"no_set\""),
+            "{}",
+            declined[0]
+        );
+        shared.paused_for_test.store(false, Ordering::Release);
+        let _keep = c.stop();
+    }
+
+    /// Coordinator ruling (Task 12): auto-fetch tries the tier FIRST, before
+    /// choosing a peer holder. Deterministic: auto-fetch is switched on only
+    /// once the standby set is in the tier, and every voter has a source.
+    #[test]
+    fn auto_fetch_takes_the_set_from_the_tier_with_no_operator_verb() {
+        let _g = serialize();
+        let tier = tmp_tier();
+        let cfg = writer_cfg(tier.path(), 1 << 20, Duration::from_millis(300));
+        let o = Opts {
+            auto_fetch: false,
+            standby: true,
+            ..opts("tier-auto", false)
+        };
+        let src = tier.path().to_path_buf();
+        let mut c = spawn_with(
+            3,
+            1,
+            o,
+            |i| (i == 3).then(|| cfg.clone()),
+            |i| (i < 3).then(|| src.clone()),
+        );
+        start_sums(&mut c);
+        await_single_leader(&c, 30);
+        await_capable(&c);
+        submit_settled(&c, 500);
+        let p = standby_instant(&c, 3);
+        await_agreed(&c, &[0, 1, 2, 3], p);
+        await_watermark(&c, 0, 60, |w| w.newest_set == p);
+        let l = await_single_leader(&c, 30);
+        apply_settings(&c, l, |s| s.auto_fetch = true);
+        await_until(60, "every voter auto-fetched the set from the tier", || {
+            (0..3)
+                .all(|i| fetched(c.node(i), "tier") == 1 && c.node(i).snapshot_set_position() == p)
+        });
+        for i in 0..3 {
+            assert_eq!(fetched(c.node(i), "peer"), 0, "node {i} asked no peer");
+            // Review I3: audited, with the node's OWN id — it served itself.
+            let audit = c.nodes[i].dir.join("audit.jsonl");
+            await_until(10, "the tier-served auto-fetch is audited", || {
+                std::fs::read_to_string(&audit).is_ok_and(|t| {
+                    t.lines().any(|l| {
+                        l.contains("\"op_name\":\"snapshot_fetch\"")
+                            && l.contains(&format!("\"id\":{i},"))
+                            && l.contains(&format!("\"config_version\":{p},"))
+                            && l.ends_with("\"fetch_source\":\"tier\"}")
+                    })
+                })
+            });
+        }
+        let _keep = c.stop();
+    }
+
     /// Spec §8.2 + the R8a carry: a node seeded from the tier under a NEW id
     /// joins a LIVE, appending cluster as a learner, catches up, rides a
     /// leader change, and once promoted its durable reports carry the quorum
     /// (one other voter is down) — no truncation, no wipe, no unattested
     /// report anywhere. Its term map starts at (term, S) and its padding
     /// bodies are zero where peers hold leftover bytes; neither may matter.
-    ///
-    /// IGNORED — a design-level finding (Task 12 report): the seeded node's
-    /// term map is `[(term, S)]`, the leader ships `[(term, 0)]`, and
-    /// `uc_consensus::reconcile` finds no aligned entry, so it cuts at
-    /// `min(durable, leader[0].base) = 0`. The archive then fail-stops
-    /// (`PositionPurged { pos: 0, first_base: S }`) because a node with a
-    /// floor cannot truncate below it. Observed with `UC2_TRUNC_TRACE=1`:
-    /// `cut to=0 durable=230880 own_tail=[(1, 38528)] lead_head=[(1, 0)]`.
     #[test]
-    #[ignore = "project 3b / ruling R12a: reconcile cuts a tier-seeded node to 0 (term map starts at (term, S))"]
     fn a_new_node_seeded_from_the_tier_joins_and_catches_up() {
         let _g = serialize();
         let (mut c, tier, p, _target) = tiered("tier-new-node", 300, 1500);
@@ -2731,6 +3194,7 @@ mod writer_e2e {
             is_learner: true,
             cfg: cfg9,
             backup: None,
+            tier_source: None,
             sock: Some(sock9),
             node: None,
             svc: None,
@@ -2739,6 +3203,11 @@ mod writer_e2e {
         h9.start_service(app, 9);
         c.nodes.push(h9);
         let n9 = c.nodes.len() - 1;
+        assert_eq!(
+            c.node(n9).archive_first_base(),
+            m.start_set,
+            "journal_first stays S"
+        );
 
         // Load while it catches up, then a leader change mid-catch-up.
         submit_frames(c.node(l), 1000);
@@ -2762,8 +3231,20 @@ mod writer_e2e {
             c.node(n9).counters().durable.load_acquire() >= commit
         });
         let total = query_total(&c, l3);
-        assert_eq!(query_total(&c, n9), total, "node 9 serves the same state");
+        // Node 9 is a follower (a linearizable read is leader-only), so read
+        // its applied state and wait for it to reach the leader's total.
+        await_until(30, "node 9 serves the same state", || {
+            let client = uc_client::Client::connect(&c.nodes[n9].dir, c.app).expect("client");
+            let raw: Result<[u8; 8], _> = client.query_snapshot(&());
+            client.shutdown();
+            raw.is_ok_and(|r| u64::from_le_bytes(r) == total)
+        });
 
+        assert_eq!(
+            c.node(n9).archive_first_base(),
+            m.start_set,
+            "journal_first stays S"
+        );
         assert_eq!(c.node(n9).truncations(), 0, "node 9 truncated nothing");
         assert_eq!(c.node(n9).wipes(), 0, "node 9 was never wiped");
         for i in c.running() {
@@ -2775,5 +3256,469 @@ mod writer_e2e {
         }
         let _keep = c.stop();
         drop(fresh);
+    }
+
+    // ------------------------------------------- TIER_INSTALL (spec §6.3)
+
+    /// A purged 3-voter cluster whose tier (written by node 1) covers every
+    /// voter's purge floor: returns it, the tier, and S — the newest set the
+    /// tier holds, which is at or above every voter's floor.
+    fn purged_with_tier(app: &'static str) -> (Cluster, tempfile::TempDir, u64) {
+        let tier = tmp_tier();
+        let cfg = writer_cfg(tier.path(), 1 << 20, Duration::from_millis(300));
+        let mut c = spawn(3, 0, opts(app, true), |i| (i == 1).then(|| cfg.clone()));
+        start_sums(&mut c);
+        await_single_leader(&c, 30);
+        await_capable(&c);
+        let all = c.running();
+        churn(&c, &all, 3);
+        await_until(60, "every voter purged", || {
+            all.iter().all(|&i| c.node(i).archive_first_base() > 0)
+        });
+        let floor = all
+            .iter()
+            .map(|&i| c.node(i).archive_first_base())
+            .max()
+            .unwrap();
+        // Quiesced: the tier's newest set IS the newest agreed set — else
+        // the leader may name an agreed set the writer has not copied yet
+        // (its `through` can run past a set it has not written) and the
+        // learner would decline `no_set` for a reason this test is not about.
+        let newest_agreed = |c: &Cluster| {
+            c.node(0)
+                .cluster_view()
+                .snapshot_inner()
+                .catalog
+                .iter()
+                .filter(|e| e.is_agreed())
+                .map(|e| e.position)
+                .max()
+        };
+        let w = await_watermark(&c, 0, 60, |w| {
+            w.newest_set >= floor
+                && w.through >= w.newest_set
+                && Some(w.newest_set) == newest_agreed(&c)
+        });
+        (c, tier, w.newest_set)
+    }
+
+    /// Add a brand-new learner (id `id`, fresh instance dir, its own
+    /// `[tier_source]`) to the running cluster through the leader and start
+    /// its node — and, iff `service`, then its service (which blocks until
+    /// the node has JOINED, i.e. past its install); returns its index in
+    /// `c.nodes`.
+    fn start_learner(
+        c: &mut Cluster,
+        leader: usize,
+        id: u32,
+        tier_source: Option<PathBuf>,
+        service: bool,
+    ) -> usize {
+        let sock = UdpSocket::bind("127.0.0.1:0").expect("bind learner");
+        let addr = sock.local_addr().unwrap();
+        let (ip, port) = match addr {
+            SocketAddr::V4(a) => (u32::from(*a.ip()), a.port()),
+            SocketAddr::V6(_) => unreachable!(),
+        };
+        admin_ok(&c.cnc(leader), 1 /* AddLearner */, id, ip, port);
+        let voters: Vec<(NodeId, SocketAddr)> =
+            (0..3).map(|i| (i as NodeId, c.nodes[i].addr)).collect();
+        let dir = c._dir.path().join(format!("n{id}"));
+        let d = dir.clone();
+        let app = c.app;
+        let cfg: Box<dyn Fn() -> NodeConfig> = Box::new(move || NodeConfig {
+            id: id as NodeId,
+            members: voters.clone(),
+            learners: Vec::new(),
+            bind: addr,
+            instance_dir: d.clone(),
+            app_id: app.into(),
+            buffer_bytes: 1 << 22,
+            max_payload: 256,
+            admission_bytes_default: 256 * 1024,
+            settings_genesis: Settings::genesis_default(),
+            force_jumbo_frames: false,
+            election_timeout_min_ns: 150_000_000,
+            election_timeout_max_ns: 300_000_000,
+            seed: 0x7171 ^ id as u64,
+            faults: FaultConfig::default(),
+            purge: PurgePolicy::Disabled,
+            journal_segment_bytes: uc_node::DEFAULT_JOURNAL_SEGMENT_BYTES,
+            crypto: uc_node::CryptoConfig::Disabled,
+            services: ServicesConfig::single(<SumSm as uc_service::RawStateMachine>::NAME),
+        });
+        let mut h = NodeH {
+            addr,
+            dir,
+            is_learner: true,
+            cfg,
+            backup: None,
+            tier_source,
+            sock: Some(sock),
+            node: None,
+            svc: None,
+        };
+        h.start();
+        if service {
+            h.start_service(app, id as usize);
+        }
+        c.nodes.push(h);
+        c.nodes.len() - 1
+    }
+
+    fn snap_sessions(node: &Node) -> u64 {
+        node.observability()
+            .sender
+            .snap_sessions
+            .load(Ordering::Relaxed)
+    }
+
+    fn tier_install(node: &Node, outcome: &str) -> u64 {
+        metric_labeled(
+            node,
+            "uc2_tier_install_total",
+            &format!("outcome=\"{outcome}\""),
+        )
+    }
+
+    /// Wait until `n` is durable at the commit `l` had when called.
+    fn await_caught_up(c: &Cluster, l: usize, n: usize) {
+        let commit = c.node(l).counters().commit.load_acquire();
+        await_until(90, "the learner caught up to the leader's commit", || {
+            c.node(n).counters().durable.load_acquire() >= commit
+        });
+    }
+
+    /// Final review I5: the learner's APPLIED state (a snapshot read on its
+    /// own dir — a follower serves no linearizable read) reaches the leader's
+    /// linearizable total. Called with the cluster quiet, so both name the
+    /// state at one common position: the leader's commit.
+    fn await_serves_leaders_total(c: &Cluster, l: usize, n: usize) -> u64 {
+        let total = query_total(c, l);
+        await_until(60, "the learner serves the leader's total", || {
+            let client = uc_client::Client::connect(&c.nodes[n].dir, c.app).expect("client");
+            let raw: Result<[u8; 8], _> = client.query_snapshot(&());
+            client.shutdown();
+            raw.is_ok_and(|r| u64::from_le_bytes(r) == total)
+        });
+        total
+    }
+
+    /// Spec §6.3: a brand-new learner with a tier source joins a cluster
+    /// whose voters have all purged — the leader asks it to install S from
+    /// its tier first, it does, and no snapshot session is ever opened.
+    #[test]
+    fn a_learner_with_a_tier_source_joins_a_purged_cluster_from_the_tier() {
+        let _g = serialize();
+        let buf = uc_node::obs::log::capture_for_tests();
+        let _restore = CaptureGuard;
+        let (mut c, tier, s) = purged_with_tier("tier-src");
+        let l = await_single_leader(&c, 30);
+        let n = start_learner(&mut c, l, 3, Some(tier.path().to_path_buf()), true);
+        await_caught_up(&c, l, n);
+        // Final review I5: the tier-installed state is the cluster's, not
+        // merely a journal at the right position.
+        let total = await_serves_leaders_total(&c, l, n);
+        assert!(total > 0, "the churn summed something");
+        assert_eq!(
+            snap_sessions(c.node(l)),
+            0,
+            "no session: {:?}",
+            obs_lines(&buf, "tier_install_declined")
+        );
+        assert!(
+            c.node(l)
+                .observability()
+                .sender
+                .tier_install_sent
+                .load(Ordering::Relaxed)
+                >= 1
+        );
+        assert_eq!(tier_install(c.node(n), "installed"), 1);
+        assert_eq!(tier_install(c.node(n), "declined"), 0);
+        assert!(
+            c.node(n).archive_first_base() >= s,
+            "the learner's journal starts at the installed set ({} < {s})",
+            c.node(n).archive_first_base()
+        );
+        let _keep = c.stop();
+    }
+
+    /// Spec §6.3 + D8: one byte of the tier's row artifact flipped after
+    /// the writer confirmed it — the learner's copy fails verification
+    /// against the leader's carried hash, it declines, and the session
+    /// installs the set instead.
+    #[test]
+    fn a_corrupt_tier_artifact_declines_and_the_session_installs_it() {
+        let _g = serialize();
+        let buf = uc_node::obs::log::capture_for_tests();
+        let _restore = CaptureGuard;
+        let (mut c, tier, s) = purged_with_tier("tier-corrupt");
+        let obj = tier.path().join(uc_node::tier::layout::row_object(s, 0));
+        let mut bytes = std::fs::read(&obj).expect("the tier holds S's row artifact");
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0x5A;
+        std::fs::write(&obj, &bytes).unwrap();
+        let l = await_single_leader(&c, 30);
+        let n = start_learner(&mut c, l, 3, Some(tier.path().to_path_buf()), true);
+        await_caught_up(&c, l, n);
+        assert_eq!(tier_install(c.node(n), "declined"), 1);
+        assert_eq!(tier_install(c.node(n), "installed"), 0);
+        let declined = obs_lines(&buf, "tier_install_declined");
+        assert!(
+            declined.iter().any(|d| d.contains("\"reason\":\"verify\"")),
+            "declined for verification: {declined:?}"
+        );
+        // `>= 1`, not `== 1`: see the no-source test's note.
+        assert!(snap_sessions(c.node(l)) >= 1, "the session installed it");
+        assert_eq!(
+            c.node(l)
+                .observability()
+                .sender
+                .tier_install_sent
+                .load(Ordering::Relaxed),
+            1,
+            "asked once; the decline's hold covers the re-NAKs"
+        );
+        let _keep = c.stop();
+    }
+
+    /// Review focus 5: a voter with NO tier source, restarted after its
+    /// peers purged past it, declines `no_source` at once and the session
+    /// opens within one round trip — not after the 2 s answer timeout.
+    #[test]
+    fn a_voter_without_a_source_declines_at_once_and_the_session_serves_it() {
+        let _g = serialize();
+        let buf = uc_node::obs::log::capture_for_tests();
+        let _restore = CaptureGuard;
+        let o = Opts {
+            auto_fetch: false,
+            ..opts("tier-nosrc", true)
+        };
+        let mut c = spawn(3, 0, o, |_| None);
+        start_sums(&mut c);
+        let l0 = await_single_leader(&c, 30);
+        await_capable(&c);
+        let down = (l0 + 1) % 3;
+        let up: Vec<usize> = (0..3).filter(|&i| i != down).collect();
+        let behind = c.node(down).counters().durable.load_acquire();
+        c.nodes[down].stop();
+        churn(&c, &up, 3);
+        await_until(60, "the live voters purged past the stopped one", || {
+            up.iter().all(|&i| c.node(i).archive_first_base() > behind)
+        });
+        let l = await_single_leader(&c, 30);
+        let stats = c.node(l).observability().sender.clone();
+        assert_eq!(stats.tier_install_sent.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.snap_sessions.load(Ordering::Relaxed), 0);
+        let app = c.app;
+        c.nodes[down].start();
+        // Time the leader's two edges: the request, then the session.
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let (mut asked, mut opened) = (None, None);
+        while opened.is_none() {
+            assert!(Instant::now() < deadline, "no session opened");
+            let now = Instant::now();
+            if asked.is_none() && stats.tier_install_sent.load(Ordering::Relaxed) >= 1 {
+                asked = Some(now);
+            }
+            if stats.snap_sessions.load(Ordering::Relaxed) >= 1 {
+                opened = Some(now);
+            }
+            std::thread::yield_now();
+        }
+        let asked = asked.expect("the leader asked before it opened a session");
+        let gap = opened.unwrap() - asked;
+        assert!(
+            gap < Duration::from_secs(1),
+            "session opened {gap:?} after the ask; ignored: {:?}; declined: {:?}",
+            obs_lines(&buf, "tier_install_ignored"),
+            obs_lines(&buf, "tier_install_declined")
+        );
+        c.nodes[down].start_service(app, down);
+        await_caught_up(&c, l, down);
+        // Not `== 1`: a below-floor joiner re-NAKs until its adoption
+        // sticks, so the session path opens more than once (learner.rs's
+        // M14c2 note measured 3). The hold is what this pins: asked ONCE.
+        assert!(stats.snap_sessions.load(Ordering::Relaxed) >= 1);
+        assert_eq!(stats.tier_install_sent.load(Ordering::Relaxed), 1);
+        let declined = obs_lines(&buf, "tier_install_declined");
+        assert_eq!(declined.len(), 1, "logged once: {declined:?}");
+        assert!(
+            declined[0].contains("\"reason\":\"no_source\""),
+            "{}",
+            declined[0]
+        );
+        eprintln!("tier_install -> session gap: {gap:?}");
+        let _keep = c.stop();
+    }
+
+    /// Spec §6.5: with a tier source on every voter, `auto_fetch = false` is
+    /// a supported configuration — voters copy no learner-built (standby)
+    /// set, and a voter restarted below the floor catches up through the
+    /// tier install (§6.3), never a session.
+    #[test]
+    fn auto_fetch_off_with_a_tier_source_restarts_a_voter_through_the_tier() {
+        let _g = serialize();
+        let buf = uc_node::obs::log::capture_for_tests();
+        let _restore = CaptureGuard;
+        let tier = tmp_tier();
+        let cfg = writer_cfg(tier.path(), 1 << 20, Duration::from_millis(300));
+        let o = Opts {
+            auto_fetch: false,
+            standby: true,
+            ..opts("tier-nofetch", true)
+        };
+        let src = tier.path().to_path_buf();
+        let mut c = spawn_with(
+            3,
+            1,
+            o,
+            |i| (i == 3).then(|| cfg.clone()),
+            |i| (i < 3).then(|| src.clone()),
+        );
+        start_sums(&mut c);
+        await_single_leader(&c, 30);
+        await_capable(&c);
+
+        // Two standby sets, built by the learner and written to the tier.
+        submit_settled(&c, 500);
+        let p1 = standby_instant(&c, 3);
+        submit_settled(&c, 500);
+        let p2 = standby_instant(&c, 3);
+        assert!(p2 > p1);
+        await_watermark(&c, 0, 60, |w| w.newest_set == p2);
+        // No voter fetched, and none holds either standby set.
+        for i in 0..3 {
+            assert_eq!(
+                fetched(c.node(i), "tier"),
+                0,
+                "node {i} fetched from the tier"
+            );
+            assert_eq!(
+                fetched(c.node(i), "peer"),
+                0,
+                "node {i} fetched from a peer"
+            );
+            assert!(
+                c.node(i).snapshot_set_position() < p1,
+                "node {i} holds a standby set ({} >= {p1})",
+                c.node(i).snapshot_set_position()
+            );
+        }
+
+        // Stop a follower, then purge the live nodes past its position.
+        let l0 = await_single_leader(&c, 30);
+        let down = (0..3).find(|&i| i != l0).unwrap();
+        let up: Vec<usize> = (0..4).filter(|&i| i != down).collect();
+        let behind = c.node(down).counters().durable.load_acquire();
+        c.nodes[down].stop();
+        churn(&c, &up, 3);
+        await_until(60, "the live voters purged past the stopped one", || {
+            (0..3)
+                .filter(|&i| i != down)
+                .all(|i| c.node(i).archive_first_base() > behind)
+        });
+        // Quiesce: the tier's newest set is the newest agreed one, so the
+        // set the leader names is one the tier holds.
+        let l = await_single_leader(&c, 30);
+        let newest_agreed = |c: &Cluster| {
+            c.node(l)
+                .cluster_view()
+                .snapshot_inner()
+                .catalog
+                .iter()
+                .filter(|e| e.is_agreed())
+                .map(|e| e.position)
+                .max()
+        };
+        await_watermark(&c, l, 60, |w| {
+            w.through >= w.newest_set && Some(w.newest_set) == newest_agreed(&c)
+        });
+        let stats = c.node(l).observability().sender.clone();
+        let sessions = stats.snap_sessions.load(Ordering::Relaxed);
+        let asked = stats.tier_install_sent.load(Ordering::Relaxed);
+
+        let app = c.app;
+        c.nodes[down].start();
+        c.nodes[down].start_service(app, down);
+        await_caught_up(&c, l, down);
+        assert_eq!(
+            tier_install(c.node(down), "installed"),
+            1,
+            "declined: {:?}",
+            obs_lines(&buf, "tier_install_declined")
+        );
+        assert_eq!(tier_install(c.node(down), "declined"), 0);
+        assert_eq!(
+            stats.snap_sessions.load(Ordering::Relaxed),
+            sessions,
+            "no session opened: {:?}",
+            obs_lines(&buf, "tier_install_declined")
+        );
+        assert_eq!(stats.tier_install_sent.load(Ordering::Relaxed), asked + 1);
+        assert_eq!(fetched(c.node(down), "peer"), 0);
+        let _keep = c.stop();
+    }
+
+    /// Review focus 1: the leader stops while the learner's tier copy is
+    /// running. The new leader asks again, the learner answers `installing`
+    /// from the copy it already runs — no second copy, no session on either
+    /// leader — and the learner reaches commit.
+    #[test]
+    fn a_leader_change_mid_install_opens_no_second_path() {
+        let _g = serialize();
+        let buf = uc_node::obs::log::capture_for_tests();
+        let _restore = CaptureGuard;
+        let (mut c, tier, _s) = purged_with_tier("tier-failover");
+        let l = await_single_leader(&c, 30);
+        let old = c.node(l).observability().sender.clone();
+        // 2 s per artifact, set before the learner's node opens its source:
+        // it is asked within its first round trip, before `start` returns.
+        struct ResetDelay;
+        impl Drop for ResetDelay {
+            fn drop(&mut self) {
+                uc_node::tier::source::set_boot_fetch_delay_for_test(Duration::ZERO);
+            }
+        }
+        let _reset = ResetDelay;
+        uc_node::tier::source::set_boot_fetch_delay_for_test(Duration::from_secs(2));
+        // Node only: its service would block until the node has joined,
+        // which is past the install this test needs to catch mid-copy.
+        let n = start_learner(&mut c, l, 3, Some(tier.path().to_path_buf()), false);
+        uc_node::tier::source::set_boot_fetch_delay_for_test(Duration::ZERO);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while c.node(n).tier_fetches_spawned() != 1 {
+            assert!(
+                Instant::now() < deadline,
+                "the learner's tier copy never started; declined: {:?}; ignored: {:?}; sent: {}",
+                obs_lines(&buf, "tier_install_declined"),
+                obs_lines(&buf, "tier_install_ignored"),
+                old.tier_install_sent.load(Ordering::Relaxed)
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(tier_install(c.node(n), "installed"), 0, "still copying");
+        assert_eq!(old.tier_install_sent.load(Ordering::Relaxed), 1);
+        c.nodes[l].stop();
+        let l2 = submit_following(&c, 200);
+        assert_ne!(l2, l);
+        let new = c.node(l2).observability().sender.clone();
+        await_until(60, "the new leader asked the learner", || {
+            new.tier_install_sent.load(Ordering::Relaxed) == 1
+        });
+        let app = c.app;
+        c.nodes[n].start_service(app, 3);
+        await_caught_up(&c, l2, n);
+        // Not `== 1` here: `installed` clears the wait with no hold, and the
+        // learner re-NAKs below the floor until its adoption sticks, so the
+        // new leader may ask again — answered `installed` with no copy,
+        // which the spawn count pins.
+        assert!(new.tier_install_sent.load(Ordering::Relaxed) >= 1);
+        assert_eq!(c.node(n).tier_fetches_spawned(), 1, "one copy, ever");
+        assert_eq!(tier_install(c.node(n), "installed"), 1);
+        assert_eq!(old.snap_sessions.load(Ordering::Relaxed), 0);
+        assert_eq!(new.snap_sessions.load(Ordering::Relaxed), 0);
+        let _keep = c.stop();
     }
 }
