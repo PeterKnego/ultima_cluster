@@ -747,6 +747,30 @@ fn a_learner_joining_body() {
     }
     stop_filler.store(true, Ordering::Relaxed);
     let fillers = filler.join().expect("filler");
+
+    // Final review I5: the tier-installed learner's APPLIED state equals the
+    // leader's at one common position — read on each node's own dir (a
+    // snapshot read; the learner serves no linearizable one) with the load
+    // stopped, until both report the same `last_applied`.
+    let learner_dir = cluster.spare_dir().expect("the learner's dir");
+    let read = |dir: &std::path::Path| -> Option<(Option<u64>, Option<u64>)> {
+        let client = uc_client::Client::connect(dir, lincheck_v2::APP).ok()?;
+        let r = client
+            .query_snapshot::<(), (Option<u64>, Option<u64>)>(&())
+            .ok();
+        client.shutdown();
+        r
+    };
+    let (value, at) = await_until(60, "the learner's state equals the leader's", || {
+        let li = cluster.leader()?;
+        let lead = read(&cluster.dirs()[li])?;
+        let mine = read(&learner_dir)?;
+        (lead.1.is_some() && lead == mine).then_some(mine)
+    });
+    assert!(
+        at.is_some_and(|p| p > s2),
+        "the common position is past the installed set ({at:?} vs {s2})"
+    );
     cluster.stop();
 
     // ---- the verdict over the whole history
@@ -761,7 +785,8 @@ fn a_learner_joining_body() {
         .count();
     eprintln!(
         "[lin_backup_tier/join] seed={seed} S1={s1} S2={s2} voter_floor={floor} learner={id} \
-         ok={ok} total={} fillers={fillers} join={join_secs:.1}s wall={:.1}s",
+         ok={ok} total={} fillers={fillers} join={join_secs:.1}s wall={:.1}s \
+         learner_state={value:?}@{at:?}",
         entries.len(),
         wall.elapsed().as_secs_f64()
     );

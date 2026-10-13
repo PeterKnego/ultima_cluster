@@ -3389,6 +3389,21 @@ mod writer_e2e {
         });
     }
 
+    /// Final review I5: the learner's APPLIED state (a snapshot read on its
+    /// own dir — a follower serves no linearizable read) reaches the leader's
+    /// linearizable total. Called with the cluster quiet, so both name the
+    /// state at one common position: the leader's commit.
+    fn await_serves_leaders_total(c: &Cluster, l: usize, n: usize) -> u64 {
+        let total = query_total(c, l);
+        await_until(60, "the learner serves the leader's total", || {
+            let client = uc_client::Client::connect(&c.nodes[n].dir, c.app).expect("client");
+            let raw: Result<[u8; 8], _> = client.query_snapshot(&());
+            client.shutdown();
+            raw.is_ok_and(|r| u64::from_le_bytes(r) == total)
+        });
+        total
+    }
+
     /// Spec §6.3: a brand-new learner with a tier source joins a cluster
     /// whose voters have all purged — the leader asks it to install S from
     /// its tier first, it does, and no snapshot session is ever opened.
@@ -3401,6 +3416,10 @@ mod writer_e2e {
         let l = await_single_leader(&c, 30);
         let n = start_learner(&mut c, l, 3, Some(tier.path().to_path_buf()), true);
         await_caught_up(&c, l, n);
+        // Final review I5: the tier-installed state is the cluster's, not
+        // merely a journal at the right position.
+        let total = await_serves_leaders_total(&c, l, n);
+        assert!(total > 0, "the churn summed something");
         assert_eq!(
             snap_sessions(c.node(l)),
             0,

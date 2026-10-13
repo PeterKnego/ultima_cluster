@@ -1478,6 +1478,11 @@ impl<SM: SnapshotStateMachine + Default, SM1: SnapshotStateMachine + StateMachin
         }
     }
 
+    /// Final review I5: the spare's instance dir, while it is added.
+    pub fn spare_dir(&self) -> Option<PathBuf> {
+        self.spare.as_ref().map(|s| s.instance_dir.clone())
+    }
+
     /// Backup-tier T15: the spare's live node, if there is one.
     pub fn spare_node(&self) -> Option<&Node> {
         self.spare.as_ref().and_then(|s| s.node.as_ref())
