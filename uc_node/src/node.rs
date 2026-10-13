@@ -82,13 +82,15 @@ use uc_protocol::v2::datagram::{
     DATAGRAM_HEADER_LEN, DGRAM_KIND_BACKUP_REPORT, DGRAM_KIND_COMMIT_POSITION,
     DGRAM_KIND_CONFIG_PROPOSAL, DGRAM_KIND_CONFIG_REPLY, DGRAM_KIND_READ_PROBE,
     DGRAM_KIND_READ_PROBE_ACK, DGRAM_KIND_REQUEST_VOTE, DGRAM_KIND_SNAP_REPORT,
-    DGRAM_KIND_TERM_MAP, DGRAM_KIND_VOTE, DatagramHeader, Holdings, JUMBO_MIN_RUNG,
-    MAX_PAYLOAD_DEFAULT, MAX_TERM_MAP_WIRE_ENTRIES, MTU_DEFAULT, READ_PROBE_BODY_LEN,
-    REQUEST_VOTE_BODY_LEN, ReadProbeBody, RequestVoteBody, SNAP_REPORT_BODY_LEN, SnapReportBody,
-    TERM_MAP_ENTRY_LEN, TERM_MAP_HEADER_LEN, TermMapEntryWire, VOTE_BODY_LEN, VoteBody, is_rung,
-    payload_ceiling, write_config_proposal_body, write_config_reply_body, write_datagram_header,
+    DGRAM_KIND_TERM_MAP, DGRAM_KIND_TIER_INSTALL_STATUS, DGRAM_KIND_VOTE, DatagramHeader, Holdings,
+    JUMBO_MIN_RUNG, MAX_PAYLOAD_DEFAULT, MAX_TERM_MAP_WIRE_ENTRIES, MTU_DEFAULT,
+    READ_PROBE_BODY_LEN, REQUEST_VOTE_BODY_LEN, ReadProbeBody, RequestVoteBody,
+    SNAP_REPORT_BODY_LEN, SnapReportBody, TERM_MAP_ENTRY_LEN, TERM_MAP_HEADER_LEN,
+    TIER_INSTALL_STATUS_BODY_LEN, TermMapEntryWire, TierInstallReason, TierInstallState,
+    TierInstallStatusBody, VOTE_BODY_LEN, VoteBody, is_rung, payload_ceiling,
+    write_config_proposal_body, write_config_reply_body, write_datagram_header,
     write_read_probe_body, write_request_vote_body, write_snap_report_body, write_term_map_body,
-    write_vote_body,
+    write_tier_install_status_body, write_vote_body,
 };
 use uc_protocol::v2::schedule::{
     MAX_SCHEDULE_ENTRIES, SCHEDULE_ENTRY_LEN, SCHEDULE_HEADER_LEN, ScheduleRule,
@@ -1157,6 +1159,21 @@ enum FetchSource {
     Peer,
 }
 
+/// Backup-tier 3b spec §6.3: a running tier install reports `installing`
+/// this often (the leader holds the session while `copied` rises).
+const TIER_INSTALL_STATUS_EVERY_NS: u64 = 1_000_000_000;
+
+/// The `tier_install_declined` line's `reason`.
+fn tier_install_reason_name(r: TierInstallReason) -> &'static str {
+    match r {
+        TierInstallReason::None => "none",
+        TierInstallReason::NoSource => "no_source",
+        TierInstallReason::NoSet => "no_set",
+        TierInstallReason::Verify => "verify",
+        TierInstallReason::NotRegistered => "not_registered",
+    }
+}
+
 /// How long a `snapshot fetch` stays pending before this node forgets it.
 ///
 /// Fix round 2 (Ruling P11): **the receiver agent's own arm deadline**, not a
@@ -1345,6 +1362,8 @@ pub struct Node {
     auto_fetch_stats: Arc<crate::auto_fetch::AutoFetchStats>,
     /// `uc2_snapshot_fetch_total{source}` (3b spec §6.6).
     fetch_source_stats: Arc<crate::tier::source::FetchSourceStats>,
+    /// `uc2_tier_install_total{outcome}`, the follower's half (3b spec §6.6).
+    tier_install_stats: Arc<crate::tier::source::TierInstallStats>,
     /// 3b spec §6.1: the tier source, for its test seams.
     tier_source: Option<Arc<crate::tier::source::TierSource>>,
     /// Plan ruling P14: the `uc2-holdings` probe's free-space override
@@ -2161,6 +2180,7 @@ impl Node {
         // carries the install route too (Task 13's tier install uses it).
         let intake_signals = receiver.intake_signals();
         let fetch_source_stats = Arc::new(crate::tier::source::FetchSourceStats::default());
+        let tier_install_stats = Arc::new(crate::tier::source::TierInstallStats::default());
         // Validated frontier, published by the consensus agent and read by the
         // receiver so its AppendPosition reports attest validated bytes only.
         let validated_frontier = Arc::new(AtomicU64::new(durable));
@@ -2678,7 +2698,15 @@ impl Node {
             tier_declined: (0, String::new()),
             tier_verify_failed: 0,
             tier_draining: Vec::new(),
+            tier_install: None,
+            tier_install_lineage: Vec::new(),
+            pending_install_lineage: None,
+            tier_install_leader: SocketAddr::from(([0, 0, 0, 0], 0)),
+            tier_install_last_status_ns: 0,
+            tier_install_decline_logged: None,
+            tier_install_not_leader: 0,
             fetch_source_stats: Arc::clone(&fetch_source_stats),
+            tier_install_stats: Arc::clone(&tier_install_stats),
             backup_hold_released: Arc::clone(&backup_hold_released),
             purge_gate: Arc::clone(&purge_gate),
             effective_gate,
@@ -2910,6 +2938,7 @@ impl Node {
             election_timeout_max_ns: cfg.election_timeout_max_ns,
             auto_fetch_stats,
             fetch_source_stats,
+            tier_install_stats,
             tier_source: tier_source_handle,
             free_override,
             _instance: instance,
@@ -3465,6 +3494,7 @@ impl Node {
             snapshot_fetched_position: Arc::clone(&self.snapshot_fetched_position),
             snapshot_auto_fetch: Arc::clone(&self.auto_fetch_stats),
             snapshot_fetch_source: Arc::clone(&self.fetch_source_stats),
+            tier_install: Arc::clone(&self.tier_install_stats),
             snapshot_holdings: Arc::clone(&self.holdings),
             snapshot_freeze: Arc::clone(&self.snapshot_freeze),
             crypto_enabled: self.crypto.is_some(),
@@ -4163,6 +4193,38 @@ struct Consensus {
     /// `uc2_snapshot_fetch_total{source}` — the SAME allocation `/metrics`
     /// reads.
     fetch_source_stats: Arc<crate::tier::source::FetchSourceStats>,
+    /// Backup-tier 3b spec §6.3: the running `TIER_INSTALL` copy
+    /// (`FetchMode::Install`) — at most one; a second request while it runs
+    /// answers `installing`, never a second thread.
+    tier_install: Option<crate::tier::source::TierFetch>,
+    /// The `SET` lineage of the set [`Self::tier_install`] is copying,
+    /// captured at spawn. Its thread raises the install signals BEFORE it
+    /// reports `done`, so `maybe_adopt_incoming_snapshot` can see the set
+    /// land while the copy still reads as running: it adopts THIS lineage
+    /// then, never the leader's map.
+    tier_install_lineage: Vec<(u32, u64)>,
+    /// Spec §6.3 step 3: a finished tier install's `(S, lineage)`, which
+    /// `maybe_adopt_incoming_snapshot` adopts (A) in place of
+    /// `last_leader_map` when it adopts S. Set only when S is above what the
+    /// handler has already adopted, and taken by the next adoption whatever
+    /// its position, so it never outlives the install it belongs to.
+    pending_install_lineage: Option<(u64, Vec<(u32, u64)>)>,
+    /// Where the running install's `TIER_INSTALL_STATUS` goes: the leader
+    /// that asked LAST (a new leader asking while it runs takes over the
+    /// progress reports — review focus 1).
+    tier_install_leader: SocketAddr,
+    /// `pass_now_ns` of the last status sent for the running install (the
+    /// 1 s `installing` cadence).
+    tier_install_last_status_ns: u64,
+    /// `uc2_tier_install_total{outcome="installed"|"declined"}` — the SAME
+    /// allocation `/metrics` reads.
+    tier_install_stats: Arc<crate::tier::source::TierInstallStats>,
+    /// The door-time decline reason last LOGGED, so a leader re-asking for
+    /// the same reason names it once; reset when an install starts.
+    tier_install_decline_logged: Option<TierInstallReason>,
+    /// `TIER_INSTALL`s dropped because their sender is not this node's
+    /// leader (the receiver gates the term only); the first is logged.
+    tier_install_not_leader: u64,
     /// `uc2_backup_hold_released_total`: releases, once per episode.
     backup_hold_released: Arc<AtomicU64>,
     /// Backup-tier 3b spec §5.2: the journal-purge gate — `u64::MAX` when
@@ -5055,6 +5117,12 @@ impl Consensus {
 
         // 9. Sample the receiver's completed-inbound-snapshot signal (M6 Task 6);
         // on a new value, adopt it as the archive floor and mirror it to cnc.
+        // Backup-tier 3b spec §6.3: a running tier install is polled first
+        // (its 1 s `installing` cadence, its completion), so a set it just
+        // finished is adopted in this same pass. One branch when none runs.
+        if self.tier_install.is_some() {
+            self.poll_tier_install();
+        }
         did |= self.maybe_adopt_incoming_snapshot();
 
         // 10. Publish the per-peer observability band + archive floor (M6 Task 9).
@@ -6008,6 +6076,24 @@ impl Consensus {
             return false;
         }
         self.adopted_incoming = pos;
+        // Backup-tier 3b spec §6.3 step 3 (A): a set installed from THIS
+        // node's tier carries its own lineage (the `SET`'s); a session's set
+        // the leader's map. Taken here, on every adoption, so a finished
+        // install's lineage is cleared even when nothing below adopts it
+        // (`durable >= pos`: a late install, ruling on spec §8).
+        let lineage = match self.pending_install_lineage.take() {
+            Some((p, l)) if p == pos => l,
+            // The install's thread raised these signals and has not yet
+            // reported `done`: the same set, so the same lineage.
+            _ if self
+                .tier_install
+                .as_ref()
+                .is_some_and(|f| f.position == pos) =>
+            {
+                self.tier_install_lineage.clone()
+            }
+            _ => self.last_leader_map.clone(),
+        };
         // Ruling R42: a session-installed set is the leader's freeze, not
         // this node's — never reported as ours, then or after a restart (the
         // receiver marked it on disk before the cluster artifact landed).
@@ -6038,8 +6124,8 @@ impl Consensus {
             // clamp a truncate below the adopted floor (a PositionPurged fail-stop).
             // Persist-before-adopt: the seeded map is durable before the floor moves,
             // so a crash in the window recovers a map consistent with the floor.
-            if !self.last_leader_map.is_empty() {
-                self.sm.adopt_snapshot_lineage(&self.last_leader_map);
+            if !lineage.is_empty() {
+                self.sm.adopt_snapshot_lineage(&lineage);
                 let map = to_entries(self.sm.term_map());
                 self.state
                     .store_term_map(&map)
@@ -11016,10 +11102,18 @@ impl Consensus {
                 self.on_backup_report(from, w);
                 return;
             }
-            // Backup-tier 3b Task 13 handles the follower's install; until
-            // then the request is observed and ignored.
-            // Task 13: compare `from` with id_to_addr(leader_hint), then act.
-            NetEvent::TierInstall { .. } => return,
+            // Backup-tier 3b spec §6.3: the leader asks this below-floor
+            // follower to install from its own tier. Handled inline — the
+            // copy is this agent's own state; the receiver gated the term
+            // only, so `on_tier_install` checks the sender IS the leader.
+            NetEvent::TierInstall {
+                from,
+                floor,
+                commit,
+            } => {
+                self.on_tier_install(from, floor, commit);
+                return;
+            }
         };
         self.feed(event);
     }
@@ -11860,7 +11954,15 @@ impl Consensus {
         let Some(src) = self.tier_source.clone() else {
             return false;
         };
-        if self.tier_draining.iter().any(|f| f.position == position) {
+        // A tier INSTALL of the same set (spec §6.3) writes the same
+        // `.tier.part` names too; it is above durable while it runs, so this
+        // is a belt to the `position > durable` braces above.
+        if self.tier_draining.iter().any(|f| f.position == position)
+            || self
+                .tier_install
+                .as_ref()
+                .is_some_and(|f| f.position == position)
+        {
             self.note_tier_fetch_declined(position, "draining");
             return false;
         }
@@ -11959,6 +12061,266 @@ impl Consensus {
             position = position,
             reason = reason
         );
+    }
+
+    /// Backup-tier 3b spec §6.3, the follower: the leader asks this
+    /// below-floor node to install a set S with `floor <= S <= commit` from
+    /// its own tier. Rules, in order:
+    ///
+    /// - a sender that is not this node's leader (`leader_hint`'s address)
+    ///   is dropped and counted — the receiver gated the term only (Task 11
+    ///   ruling: its id map is crypto-only);
+    /// - an install already running answers `installing` (review focus 1:
+    ///   one copy per node; a NEW leader asking takes over the reports);
+    /// - one finished but not yet adopted answers `installed` again;
+    /// - no source → `declined(no_source)` at once;
+    /// - else [`crate::tier::source::choose_install_set`] over the tier's
+    ///   listing and this node's catalog, with `through` read ONCE here and
+    ///   never again for this copy (a later `tier forget` does not reach a
+    ///   running copy); `Err` → `declined(reason)`, `Ok` → spawn the copy in
+    ///   `FetchMode::Install` and answer `installing{S, 0}`.
+    ///
+    /// File I/O (`registered_through`, the listing) happens once per
+    /// request, never per pass.
+    #[cold]
+    #[inline(never)]
+    fn on_tier_install(&mut self, from: SocketAddr, floor: u64, commit: u64) {
+        let hint = self.cnc.status().leader_hint.load_acquire();
+        let leader = (hint != u64::MAX)
+            .then(|| self.id_to_addr.get(&(hint as NodeId)).copied())
+            .flatten();
+        if leader != Some(from) {
+            self.tier_install_not_leader += 1;
+            if self.tier_install_not_leader == 1 {
+                crate::obs_event!(
+                    Info,
+                    "tier_install_ignored",
+                    node = self.id as u64,
+                    from = from.to_string().as_str(),
+                    reason = "not_leader"
+                );
+            }
+            return;
+        }
+        if let Some(f) = &self.tier_install {
+            let (position, copied) = (f.position, f.copied.load(Ordering::Relaxed));
+            self.tier_install_leader = from;
+            self.tier_install_last_status_ns = self.pass_now_ns;
+            self.send_tier_install_status(from, TierInstallState::Installing, position, copied);
+            return;
+        }
+        // Finished, its adoption still waiting on the cluster agent's ack:
+        // `installed` again, not a second copy — unless a later intake has
+        // since overwritten the signal, in which case nothing will adopt S
+        // and the request is decided afresh.
+        if let Some((position, _)) = &self.pending_install_lineage {
+            let position = *position;
+            if self.incoming_snapshot.load(Ordering::Acquire) == position {
+                self.send_tier_install_status(from, TierInstallState::Installed, position, 0);
+                return;
+            }
+            self.pending_install_lineage = None;
+        }
+        let Some(src) = self.tier_source.clone() else {
+            self.decline_tier_install(from, floor, commit, TierInstallReason::NoSource, "");
+            return;
+        };
+        let through = src.registered_through(&self.cluster_view.backups());
+        let mut detail = "";
+        let sets = match through {
+            None => Vec::new(),
+            Some(_) => match crate::tier::chain::list_tier(src.target()) {
+                // A set a cancelled store-only copy is still draining (or a
+                // store-only copy is running) is not a candidate: two threads
+                // must never share `incoming-<P>.tier.part`. Treating the
+                // whole request as "no set" would refuse a servable older
+                // set, so the newest OTHER set in range is chosen instead,
+                // and only when none is left is the answer `no_set`.
+                Ok(listing) => listing
+                    .sets
+                    .into_iter()
+                    .filter(|l| !self.tier_copy_running_at(l.position))
+                    .collect(),
+                Err(_) => {
+                    detail = "io";
+                    Vec::new()
+                }
+            },
+        };
+        let catalog = self.cluster_view.snapshot_inner().catalog;
+        match crate::tier::source::choose_install_set(floor, commit, through, &sets, &catalog) {
+            Err(reason) => self.decline_tier_install(from, floor, commit, reason, detail),
+            Ok((label, entry)) => {
+                let position = label.position;
+                self.tier_install_lineage = label.lineage.clone();
+                self.tier_install = Some(crate::tier::source::spawn_fetch(
+                    src,
+                    self.snap_root.clone(),
+                    label,
+                    entry,
+                    crate::tier::source::FetchMode::Install,
+                    self.intake_signals.clone(),
+                ));
+                self.tier_install_leader = from;
+                self.tier_install_last_status_ns = self.pass_now_ns;
+                self.tier_install_decline_logged = None;
+                crate::obs_event!(
+                    Info,
+                    "tier_install_started",
+                    node = self.id as u64,
+                    position = position,
+                    floor = floor,
+                    commit = commit,
+                    through = through.unwrap_or(0)
+                );
+                self.send_tier_install_status(from, TierInstallState::Installing, position, 0);
+            }
+        }
+    }
+
+    /// A tier copy of `position` is running (store-only) or draining.
+    fn tier_copy_running_at(&self, position: u64) -> bool {
+        self.tier_draining.iter().any(|f| f.position == position)
+            || matches!(
+                &self.pending_fetch,
+                Some(PendingFetch { source: FetchSource::Tier(f), .. }) if f.position == position
+            )
+    }
+
+    /// The running install, each pass while one runs: its `installing`
+    /// report every second to the leader that asked last, and its end —
+    /// `Ok(lineage)` held for `maybe_adopt_incoming_snapshot` (the thread
+    /// already raised the install signals) and answered `installed` once;
+    /// `Err` (its files already removed) answered `declined`.
+    #[cold]
+    #[inline(never)]
+    fn poll_tier_install(&mut self) {
+        let Some(f) = self.tier_install.as_mut() else {
+            return;
+        };
+        let to = self.tier_install_leader;
+        let Some(result) = f.try_finish() else {
+            if self
+                .pass_now_ns
+                .saturating_sub(self.tier_install_last_status_ns)
+                >= TIER_INSTALL_STATUS_EVERY_NS
+            {
+                let (position, copied) = (f.position, f.copied.load(Ordering::Relaxed));
+                self.tier_install_last_status_ns = self.pass_now_ns;
+                self.send_tier_install_status(to, TierInstallState::Installing, position, copied);
+            }
+            return;
+        };
+        let position = f.position;
+        self.tier_install = None;
+        let lineage = std::mem::take(&mut self.tier_install_lineage);
+        match result {
+            Ok(set_lineage) => {
+                debug_assert_eq!(set_lineage, lineage, "the thread hands back the SET's");
+                // Already adopted (on the running-lineage path, or a newer set
+                // landed meanwhile): nothing is left for the handler to take.
+                if position > self.adopted_incoming {
+                    self.pending_install_lineage = Some((position, set_lineage));
+                }
+                self.tier_install_stats
+                    .installed
+                    .fetch_add(1, Ordering::Relaxed);
+                crate::obs_event!(
+                    Info,
+                    "tier_install_done",
+                    node = self.id as u64,
+                    position = position
+                );
+                self.send_tier_install_status(to, TierInstallState::Installed, position, 0);
+            }
+            Err(why) => {
+                // The set vanished under the copy (retention) is `no_set`;
+                // anything else — a mismatch, an unreadable object — is
+                // `verify`. The line names the copy's own reason too.
+                let reason = if why == "no_set" {
+                    TierInstallReason::NoSet
+                } else {
+                    TierInstallReason::Verify
+                };
+                self.tier_install_stats
+                    .declined
+                    .fetch_add(1, Ordering::Relaxed);
+                crate::obs_event!(
+                    Info,
+                    "tier_install_declined",
+                    node = self.id as u64,
+                    position = position,
+                    reason = tier_install_reason_name(reason),
+                    detail = why.as_str()
+                );
+                self.send_tier_install_decline(to, reason);
+            }
+        }
+    }
+
+    /// A door-time decline: counted, answered, and named once per reason
+    /// until an install starts.
+    fn decline_tier_install(
+        &mut self,
+        to: SocketAddr,
+        floor: u64,
+        commit: u64,
+        reason: TierInstallReason,
+        detail: &str,
+    ) {
+        self.tier_install_stats
+            .declined
+            .fetch_add(1, Ordering::Relaxed);
+        if self.tier_install_decline_logged != Some(reason) {
+            self.tier_install_decline_logged = Some(reason);
+            crate::obs_event!(
+                Info,
+                "tier_install_declined",
+                node = self.id as u64,
+                floor = floor,
+                commit = commit,
+                reason = tier_install_reason_name(reason),
+                detail = detail
+            );
+        }
+        self.send_tier_install_decline(to, reason);
+    }
+
+    fn send_tier_install_decline(&mut self, to: SocketAddr, reason: TierInstallReason) {
+        self.send_tier_install_body(
+            to,
+            TierInstallStatusBody {
+                state: TierInstallState::Declined,
+                reason,
+                position: 0,
+                copied: 0,
+            },
+        );
+    }
+
+    fn send_tier_install_status(
+        &mut self,
+        to: SocketAddr,
+        state: TierInstallState,
+        position: u64,
+        copied: u64,
+    ) {
+        self.send_tier_install_body(
+            to,
+            TierInstallStatusBody {
+                state,
+                reason: TierInstallReason::None,
+                position,
+                copied,
+            },
+        );
+    }
+
+    fn send_tier_install_body(&mut self, to: SocketAddr, b: TierInstallStatusBody) {
+        let mut body = [0u8; TIER_INSTALL_STATUS_BODY_LEN];
+        write_tier_install_status_body(&mut body, &b);
+        let term = self.sm.current_term();
+        self.send(to, DGRAM_KIND_TIER_INSTALL_STATUS, b.position, term, &body);
     }
 
     /// The peer fetch: hand the pull to the receiver agent.
@@ -15804,7 +16166,15 @@ mod tests {
             tier_declined: (0, String::new()),
             tier_verify_failed: 0,
             tier_draining: Vec::new(),
+            tier_install: None,
+            tier_install_lineage: Vec::new(),
+            pending_install_lineage: None,
+            tier_install_leader: SocketAddr::from(([0, 0, 0, 0], 0)),
+            tier_install_last_status_ns: 0,
+            tier_install_decline_logged: None,
+            tier_install_not_leader: 0,
             fetch_source_stats: Arc::new(Default::default()),
+            tier_install_stats: Arc::new(Default::default()),
             stored_set_pos,
             stored_above_durable: 0,
             stored_set_noted: 0,
@@ -27934,6 +28304,366 @@ mod tests {
         *h.cons.tier_draining[0].done.lock().unwrap() = Some(Err("cancelled".into()));
         h.cons.poll_pending_fetch();
         assert!(h.cons.tier_draining.is_empty());
+    }
+
+    /// Backup-tier 3b spec §6.3, the follower half of `TIER_INSTALL`.
+    mod tier_install {
+        use super::*;
+        use crate::tier::source::tests::{P, SetFx, VERSION, put_tier, set_fx};
+        use uc_protocol::v2::backup::BackupTierEntry;
+        use uc_protocol::v2::datagram::read_tier_install_status_body;
+
+        const TIER_ID: u64 = 7;
+
+        /// A follower (id 1) whose leader is node 0 at `leader`'s address
+        /// (node 2 at `other`'s), a tier source holding `fx`'s set at P, the
+        /// set agreed in the catalog, and the tier registered at `through`.
+        /// The install signals are wired as a real receiver's are.
+        fn rig(fx: &SetFx, through: Option<u64>) -> (Harness, UdpSocket, UdpSocket) {
+            let (leader, a0) = report_peer_socket();
+            let (other, a2) = report_peer_socket();
+            let mut h = harness_with_rows_and_peers(&["a"], &[(0, a0), (2, a2)]);
+            h.cons.cnc.status().leader_hint.store_release(0);
+            put_tier(&fx._d.path().join("tier"), "mine", TIER_ID);
+            h.cons.tier_source = Some(Arc::clone(&fx.src));
+            publish(&mut h, fx, through);
+            h.cons.intake_signals = uc_net::receiver::SnapIntakeSignals::new(
+                Arc::clone(&h.cons.stored_set_pos),
+                Some((
+                    Arc::clone(&h.cons.incoming_snapshot),
+                    Arc::clone(&h.cons.incoming_cluster_pos),
+                    h.cluster_install_tx.clone(),
+                )),
+            );
+            (h, leader, other)
+        }
+
+        fn publish(h: &mut Harness, fx: &SetFx, through: Option<u64>) {
+            let mut st = h.cons.cluster_view.to_state();
+            st.catalog = vec![fx.entry.clone()];
+            st.backups = through
+                .map(|t| {
+                    vec![BackupTierEntry {
+                        tier_id: TIER_ID,
+                        oldest_set: P,
+                        newest_set: P,
+                        through: t,
+                        reporter: 0,
+                        updated_pos: 0,
+                    }]
+                })
+                .unwrap_or_default();
+            st.applied += 1;
+            h.cons.cluster_view.publish(&st);
+        }
+
+        fn ask(h: &mut Harness, from: &UdpSocket, floor: u64, commit: u64) {
+            h.cons.feed_net(NetEvent::TierInstall {
+                from: from.local_addr().unwrap(),
+                floor,
+                commit,
+            });
+        }
+
+        /// Every `TIER_INSTALL_STATUS` waiting on `sock`, oldest first.
+        fn statuses(sock: &UdpSocket) -> Vec<TierInstallStatusBody> {
+            let mut out = Vec::new();
+            let mut buf = [0u8; 2048];
+            while let Ok((n, _)) = sock.recv_from(&mut buf) {
+                let Some(hdr) = read_datagram_header(&buf[..n]) else {
+                    continue;
+                };
+                if hdr.kind == DGRAM_KIND_TIER_INSTALL_STATUS {
+                    out.push(
+                        read_tier_install_status_body(&buf[DATAGRAM_HEADER_LEN..n])
+                            .expect("this node's own status body decodes"),
+                    );
+                }
+            }
+            out
+        }
+
+        fn status(state: TierInstallState, position: u64, copied: u64) -> TierInstallStatusBody {
+            TierInstallStatusBody {
+                state,
+                reason: TierInstallReason::None,
+                position,
+                copied,
+            }
+        }
+
+        fn declined(reason: TierInstallReason) -> TierInstallStatusBody {
+            TierInstallStatusBody {
+                state: TierInstallState::Declined,
+                reason,
+                position: 0,
+                copied: 0,
+            }
+        }
+
+        /// Poll the running install (as the pass does) until it has ended.
+        fn finish(h: &mut Harness) {
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            while h.cons.tier_install.is_some() {
+                assert!(std::time::Instant::now() < deadline, "install never ended");
+                std::thread::sleep(Duration::from_millis(2));
+                h.cons.poll_tier_install();
+            }
+        }
+
+        /// Every FILE under `dir`, recursively (directories may remain).
+        fn files_under(dir: &Path) -> Vec<PathBuf> {
+            let mut out = Vec::new();
+            let Ok(rd) = std::fs::read_dir(dir) else {
+                return out;
+            };
+            for e in rd {
+                let p = e.unwrap().path();
+                if p.is_dir() {
+                    out.extend(files_under(&p));
+                } else {
+                    out.push(p);
+                }
+            }
+            out
+        }
+
+        /// `through` is read ONCE, when the request arrives: a `tier forget`
+        /// committed while the copy runs does not reach it (it completes and
+        /// answers `installed`); the NEXT request reads the new view.
+        #[test]
+        fn a_running_install_keeps_its_captured_through() {
+            let fx = set_fx(false);
+            fx.src.set_fetch_delay_for_test(Duration::from_millis(150));
+            let (mut h, leader, _) = rig(&fx, Some(8000));
+            ask(&mut h, &leader, 0, 8000);
+            assert!(h.cons.tier_install.is_some(), "the copy started");
+            assert_eq!(
+                statuses(&leader),
+                vec![status(TierInstallState::Installing, P, 0)]
+            );
+            // The tier is forgotten while the copy runs.
+            publish(&mut h, &fx, None);
+            assert_eq!(
+                fx.src.registered_through(&h.cons.cluster_view.backups()),
+                None
+            );
+            finish(&mut h);
+            assert_eq!(
+                statuses(&leader),
+                vec![status(TierInstallState::Installed, P, 0)]
+            );
+            assert_eq!(
+                h.cons.tier_install_stats.installed.load(Ordering::Relaxed),
+                1
+            );
+            assert!(h.cons.snap_root.join("0/snap-4096.ultsnap").exists());
+            // The set is adopted (this node already covers it: nothing below
+            // the floor moves) and the lineage cleared.
+            h.cons.cluster_installed.store(P, Ordering::Release);
+            assert!(h.cons.maybe_adopt_incoming_snapshot());
+            assert_eq!(h.cons.pending_install_lineage, None);
+            ask(&mut h, &leader, 0, 8000);
+            assert_eq!(
+                statuses(&leader),
+                vec![declined(TierInstallReason::NotRegistered)]
+            );
+            assert_eq!(fx.src.fetches_spawned(), 1);
+            assert_eq!(
+                h.cons.tier_install_stats.declined.load(Ordering::Relaxed),
+                1
+            );
+        }
+
+        /// Ruling D8 at install time: the tier's `SET` names a row version
+        /// the catalog did not agree — `declined(verify)` and nothing is left
+        /// under `snapshots/`.
+        #[test]
+        fn an_install_whose_set_disagrees_with_the_catalog_declines_and_leaves_nothing() {
+            let mut fx = set_fx(false);
+            fx.entry.rows[2].version = VERSION + 1;
+            let (mut h, leader, _) = rig(&fx, Some(8000));
+            let before = files_under(&h.cons.snap_root);
+            ask(&mut h, &leader, 0, 8000);
+            finish(&mut h);
+            assert_eq!(
+                statuses(&leader),
+                vec![
+                    status(TierInstallState::Installing, P, 0),
+                    declined(TierInstallReason::Verify)
+                ]
+            );
+            assert_eq!(files_under(&h.cons.snap_root), before, "nothing written");
+            assert_eq!(
+                h.cons.tier_install_stats.declined.load(Ordering::Relaxed),
+                1
+            );
+            assert_eq!(
+                h.cons.tier_install_stats.installed.load(Ordering::Relaxed),
+                0
+            );
+            assert_eq!(h.cons.incoming_snapshot.load(Ordering::Acquire), 0);
+            assert_eq!(h.cons.pending_install_lineage, None);
+        }
+
+        /// Review focus 1, the follower half: a second `TIER_INSTALL` while
+        /// one copy runs answers `installing` — never a second thread — and a
+        /// NEW leader asking takes over the progress reports.
+        #[test]
+        fn a_second_tier_install_while_one_runs_answers_installing_not_a_second_thread() {
+            let fx = set_fx(false);
+            fx.src.set_fetch_delay_for_test(Duration::from_millis(500));
+            let (mut h, leader, other) = rig(&fx, Some(8000));
+            ask(&mut h, &leader, 0, 8000);
+            ask(&mut h, &leader, 0, 8000);
+            assert_eq!(fx.src.fetches_spawned(), 1, "one uc2-tier-fetch thread");
+            let got = statuses(&leader);
+            assert_eq!(got.len(), 2, "{got:?}");
+            assert!(
+                got.iter()
+                    .all(|s| s.state == TierInstallState::Installing && s.position == P),
+                "{got:?}"
+            );
+            // Within the second: no cadence report yet.
+            h.cons.pass_now_ns += 999_999_999;
+            h.cons.poll_tier_install();
+            assert!(statuses(&leader).is_empty());
+            // Leadership moves to node 2, which asks again: same copy, and
+            // the reports now go to it.
+            h.cons.cnc.status().leader_hint.store_release(2);
+            ask(&mut h, &other, 0, 8000);
+            assert_eq!(fx.src.fetches_spawned(), 1);
+            assert_eq!(statuses(&other).len(), 1);
+            // The old leader is no leader now: its request is dropped.
+            ask(&mut h, &leader, 0, 8000);
+            assert!(statuses(&leader).is_empty());
+            assert_eq!(h.cons.tier_install_not_leader, 1);
+            h.cons.pass_now_ns += TIER_INSTALL_STATUS_EVERY_NS;
+            h.cons.poll_tier_install();
+            assert!(
+                h.cons.tier_install.is_some(),
+                "still copying (1.5 s of delay)"
+            );
+            let got = statuses(&other);
+            assert_eq!(got.len(), 1, "the 1 s report, to the new leader: {got:?}");
+            assert_eq!(got[0].state, TierInstallState::Installing);
+            assert!(statuses(&leader).is_empty());
+            finish(&mut h);
+            let got = statuses(&other);
+            assert_eq!(got.last(), Some(&status(TierInstallState::Installed, P, 0)));
+            assert!(statuses(&leader).is_empty());
+            assert_eq!(fx.src.fetches_spawned(), 1);
+        }
+
+        /// Spec §8 ("the leader opens the session after 10 s"): the leader
+        /// gave up, and this node is durable past S by the time the tier copy
+        /// finishes. The handler's `durable < pos` guard adopts nothing —
+        /// no lineage, no config, no floor — the held lineage is cleared,
+        /// and `installed` is still answered.
+        #[test]
+        fn a_late_tier_install_below_durable_adopts_nothing() {
+            let fx = set_fx(false);
+            let (mut h, leader, _) = rig(&fx, Some(8000));
+            assert!(h.cons.cnc.counters().durable.load_acquire() > P);
+            while h._trunc_rx.try_recv().is_ok() {}
+            let map_before = h.cons.sm.term_map().to_vec();
+            ask(&mut h, &leader, 0, 8000);
+            finish(&mut h);
+            assert_eq!(
+                statuses(&leader),
+                vec![
+                    status(TierInstallState::Installing, P, 0),
+                    status(TierInstallState::Installed, P, 0)
+                ]
+            );
+            assert_eq!(
+                h.cons.pending_install_lineage.as_ref().map(|p| p.0),
+                Some(P)
+            );
+            h.cons.cluster_installed.store(P, Ordering::Release);
+            assert!(h.cons.maybe_adopt_incoming_snapshot());
+            assert_eq!(h.cons.adopted_incoming, P);
+            assert_eq!(h.cons.pending_install_lineage, None, "cleared");
+            assert_eq!(h.cons.sm.term_map(), &map_before[..], "no lineage adopted");
+            while let Ok(cmd) = h._trunc_rx.try_recv() {
+                assert!(
+                    !matches!(cmd, ArchiveCmd::AdoptFloor { .. }),
+                    "no floor adopted"
+                );
+            }
+        }
+
+        /// Spec §6.3 step 3 (A): a below-floor node installing from its tier
+        /// adopts the `SET`'s lineage, not the leader's last map, and S as its
+        /// floor.
+        #[test]
+        fn a_tier_install_adopts_the_sets_lineage_not_the_leaders_map() {
+            let fx = set_fx(false);
+            let (mut h, leader, _) = rig(&fx, Some(8000));
+            h.cons.cnc.counters().durable.store_release(1024);
+            h.cons.last_leader_map = vec![(9, 0)];
+            while h._trunc_rx.try_recv().is_ok() {}
+            ask(&mut h, &leader, 0, 8000);
+            finish(&mut h);
+            assert_eq!(statuses(&leader).len(), 2);
+            h.cons.cluster_installed.store(P, Ordering::Release);
+            assert!(h.cons.maybe_adopt_incoming_snapshot());
+            assert_eq!(h.cons.sm.term_map(), &fx.label.lineage[..]);
+            assert_eq!(h.cons.pending_install_lineage, None);
+            let mut floor = None;
+            while let Ok(cmd) = h._trunc_rx.try_recv() {
+                if let ArchiveCmd::AdoptFloor { pos } = cmd {
+                    floor = Some(pos);
+                }
+            }
+            assert_eq!(floor, Some(P));
+        }
+
+        /// The copy's thread raises the install signals BEFORE it reports
+        /// `done`: a pass that sees the set land in between still adopts the
+        /// `SET`'s lineage (captured at spawn), never the leader's map.
+        #[test]
+        fn a_set_landing_before_its_copy_reports_still_adopts_the_sets_lineage() {
+            let mut h = harness_with_rows(&["a"]);
+            h.cons.cnc.counters().durable.store_release(1024);
+            h.cons.last_leader_map = vec![(9, 0)];
+            h.cons.tier_install = Some(crate::tier::source::TierFetch::never_finishing_for_test(P));
+            h.cons.tier_install_lineage = vec![(1, 0), (3, 2048)];
+            h.cons.incoming_cluster_pos.store(P, Ordering::Release);
+            h.cons.incoming_snapshot.store(P, Ordering::Release);
+            h.cons.cluster_installed.store(P, Ordering::Release);
+            assert!(h.cons.maybe_adopt_incoming_snapshot());
+            assert_eq!(h.cons.sm.term_map(), &[(1, 0), (3, 2048)][..]);
+            // Its `done` then arrives: already adopted, nothing is held.
+            *h.cons.tier_install.as_ref().unwrap().done.lock().unwrap() =
+                Some(Ok(vec![(1, 0), (3, 2048)]));
+            h.cons.poll_tier_install();
+            assert!(h.cons.tier_install.is_none());
+            assert_eq!(h.cons.pending_install_lineage, None);
+        }
+
+        /// No source: `declined(no_source)` at once, counted, nothing spawned.
+        #[test]
+        fn a_tier_install_without_a_source_declines_at_once() {
+            let fx = set_fx(false);
+            let (mut h, leader, _) = rig(&fx, Some(8000));
+            h.cons.tier_source = None;
+            ask(&mut h, &leader, 0, 8000);
+            assert_eq!(
+                statuses(&leader),
+                vec![declined(TierInstallReason::NoSource)]
+            );
+            assert!(h.cons.tier_install.is_none());
+            assert_eq!(
+                h.cons.tier_install_stats.declined.load(Ordering::Relaxed),
+                1
+            );
+            // Out of range: no set.
+            h.cons.tier_source = Some(Arc::clone(&fx.src));
+            ask(&mut h, &leader, P + 1, 8000);
+            assert_eq!(statuses(&leader), vec![declined(TierInstallReason::NoSet)]);
+            assert_eq!(fx.src.fetches_spawned(), 0);
+        }
     }
 
     #[test]

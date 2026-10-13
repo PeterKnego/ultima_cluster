@@ -116,6 +116,7 @@ fn synthetic_server() -> (ObsServer, ObsSources) {
         snapshot_fetched_position: Arc::new(AtomicU64::new(0)),
         snapshot_auto_fetch: Arc::new(Default::default()),
         snapshot_fetch_source: Arc::new(Default::default()),
+        tier_install: Arc::new(Default::default()),
         snapshot_holdings: Arc::new(std::sync::Mutex::new(Default::default())),
         snapshot_freeze: Arc::new(uc_node::obs::SnapshotFreezeStats::default()),
         crypto_enabled: false,

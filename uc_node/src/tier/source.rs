@@ -15,6 +15,7 @@ use std::time::Duration;
 use uc_net::receiver::{SnapIntakeSignals, write_foreign_marker};
 use uc_protocol::v2::backup::BackupTierEntry;
 use uc_protocol::v2::catalog::{RowVerdict, SetEntry};
+use uc_protocol::v2::datagram::TierInstallReason;
 
 pub struct TierSource {
     target: Arc<FsTarget>,
@@ -437,8 +438,52 @@ pub fn spawn_fetch(
     }
 }
 
+/// `uc2_tier_install_total{outcome}` (3b spec §6.6), the FOLLOWER's half:
+/// `installed` (a `TIER_INSTALL` this node served from its tier) and
+/// `declined` (one it answered `declined`, at the door or after a failed
+/// copy). The leader's `timeout` is the sender's own stat.
+#[derive(Debug, Default)]
+pub struct TierInstallStats {
+    pub installed: AtomicU64,
+    pub declined: AtomicU64,
+}
+
+/// Backup-tier 3b spec §6.3 step 1 (ruling PF6): the newest tier set S with
+/// `floor <= S <= min(commit, through)` that is AGREED in the catalog.
+/// `through` is the registered watermark, captured once at the
+/// `TIER_INSTALL` event; `None` (no `TIER`, a foreign one, or a tier id the
+/// cluster has not registered) is `Err(NotRegistered)` whatever the listing
+/// holds; no candidate is `Err(NoSet)`. `floor <= S` is what makes the
+/// leader's log cover everything after S; `S <= commit` keeps the install
+/// committed; `S <= through` never reads past what the cluster registered.
+/// Pure: the caller does the listing and reads the catalog.
+pub fn choose_install_set(
+    floor: u64,
+    commit: u64,
+    through: Option<u64>,
+    sets: &[SetLabel],
+    catalog: &[SetEntry],
+) -> Result<(SetLabel, SetEntry), TierInstallReason> {
+    let Some(through) = through else {
+        return Err(TierInstallReason::NotRegistered);
+    };
+    let top = commit.min(through);
+    sets.iter()
+        .filter(|l| floor <= l.position && l.position <= top)
+        .filter_map(|l| {
+            catalog
+                .iter()
+                .find(|e| e.position == l.position)
+                .filter(|e| e.is_agreed())
+                .map(|e| (l, e))
+        })
+        .max_by_key(|(l, _)| l.position)
+        .map(|(l, e)| (l.clone(), e.clone()))
+        .ok_or(TierInstallReason::NoSet)
+}
+
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::tier::layout::{TIER_FILE, TierInfo};
 
@@ -455,7 +500,7 @@ mod tests {
             .unwrap()
     }
 
-    fn put_tier(dir: &Path, app: &str, id: u64) {
+    pub(crate) fn put_tier(dir: &Path, app: &str, id: u64) {
         let t = TierInfo {
             app_id: app.into(),
             tier_id: id,
@@ -503,8 +548,8 @@ mod tests {
     use uc_protocol::v2::catalog::{RowEntry, SetKind, SetState};
     use uc_service::snapshots::{artifact_hash_of, write_snapshot_envelope};
 
-    const P: u64 = 4096;
-    const VERSION: u32 = 0x0001_0000;
+    pub(crate) const P: u64 = 4096;
+    pub(crate) const VERSION: u32 = 0x0001_0000;
 
     fn put(t: &dyn BackupTarget, path: &str, raw: &[u8]) {
         let n = raw.len() as u64;
@@ -525,20 +570,20 @@ mod tests {
         assert!(matches!(r, Put::Written(_)));
     }
 
-    struct SetFx {
-        _d: tempfile::TempDir,
-        src: Arc<TierSource>,
-        root: PathBuf,
-        label: SetLabel,
-        entry: SetEntry,
-        row: Vec<u8>,
-        cluster: Vec<u8>,
+    pub(crate) struct SetFx {
+        pub(crate) _d: tempfile::TempDir,
+        pub(crate) src: Arc<TierSource>,
+        pub(crate) root: PathBuf,
+        pub(crate) label: SetLabel,
+        pub(crate) entry: SetEntry,
+        pub(crate) row: Vec<u8>,
+        pub(crate) cluster: Vec<u8>,
     }
 
     /// A two-row set at `P` in a tier, its `SET`, and the catalog entry
     /// that agrees it. `bad_cluster`: the tier's cluster object holds other
     /// bytes than the catalog agreed (a mismatching artifact).
-    fn set_fx(bad_cluster: bool) -> SetFx {
+    pub(crate) fn set_fx(bad_cluster: bool) -> SetFx {
         let d = tmp();
         let tier = d.path().join("tier");
         let root = d.path().join("snapshots");
@@ -768,5 +813,101 @@ mod tests {
         assert_eq!(s.registered_through(&[]), None);
         assert_eq!(s.registered_through(&[entry(9, 5)]), None);
         assert_eq!(s.registered_through(&[entry(9, 5), entry(7, 42)]), Some(42));
+    }
+
+    // ------------------------------------------------ choose_install_set
+
+    fn label_at(p: u64) -> SetLabel {
+        SetLabel {
+            position: p,
+            kind: SetKind::Full,
+            time_ns: 0,
+            rows: Vec::new(),
+            cluster_hash: 0,
+            cluster_size: 0,
+            lineage: Vec::new(),
+        }
+    }
+
+    fn catalog_at(p: u64, agreed: bool) -> SetEntry {
+        let mut e = SetEntry::commanded(p, SetKind::Full, 0);
+        if agreed {
+            e.state = SetState::Complete;
+            e.cluster.verdict = RowVerdict::Agreed;
+            e.rows[0].verdict = RowVerdict::Agreed;
+        }
+        e
+    }
+
+    /// Ruling PF6, exhaustively over a small space: every Ok lands inside
+    /// `[floor, min(commit, through)]`, on an AGREED set, and is the newest
+    /// such; every Err is `NotRegistered` exactly when `through` is None and
+    /// otherwise `NoSet` exactly when no set qualifies.
+    #[test]
+    fn choose_install_set_never_lands_below_the_floor_or_above_commit() {
+        const AT: [u64; 4] = [2, 5, 8, 11];
+        let sets: Vec<SetLabel> = AT.iter().map(|&p| label_at(p)).collect();
+        let mut cases = 0u64;
+        let mut oks = 0u64;
+        for mask in 0u32..16 {
+            let agreed = |i: usize| mask & (1 << i) != 0;
+            let catalog: Vec<SetEntry> = AT
+                .iter()
+                .enumerate()
+                .map(|(i, &p)| catalog_at(p, agreed(i)))
+                .collect();
+            for floor in 0..=12u64 {
+                for commit in floor..=12u64 {
+                    for through in std::iter::once(None).chain((0..=12u64).map(Some)) {
+                        cases += 1;
+                        let got = choose_install_set(floor, commit, through, &sets, &catalog);
+                        let ok = |i: usize, p: u64| {
+                            through.is_some_and(|t| floor <= p && p <= commit.min(t)) && agreed(i)
+                        };
+                        let newest = AT
+                            .iter()
+                            .enumerate()
+                            .filter(|&(i, &p)| ok(i, p))
+                            .map(|(_, &p)| p)
+                            .max();
+                        match got {
+                            Ok((l, e)) => {
+                                oks += 1;
+                                let t = through.expect("Ok only with a registered tier");
+                                assert!(floor <= l.position, "{floor} {commit} {through:?}");
+                                assert!(l.position <= commit.min(t));
+                                assert!(e.is_agreed() && e.position == l.position);
+                                assert_eq!(Some(l.position), newest, "the newest such");
+                            }
+                            Err(TierInstallReason::NotRegistered) => assert!(through.is_none()),
+                            Err(TierInstallReason::NoSet) => {
+                                assert!(through.is_some());
+                                assert_eq!(newest, None, "{floor} {commit} {through:?} {mask}");
+                            }
+                            Err(r) => panic!("unexpected reason {r:?}"),
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(cases, 16 * 91 * 14);
+        assert!(oks > 0, "the space is not vacuous");
+    }
+
+    #[test]
+    fn choose_install_set_refuses_an_unregistered_tier() {
+        let sets = [label_at(5)];
+        let catalog = [catalog_at(5, true)];
+        assert_eq!(
+            choose_install_set(0, 10, None, &sets, &catalog).err(),
+            Some(TierInstallReason::NotRegistered),
+            "a set in range does not make an unregistered tier servable"
+        );
+        assert_eq!(
+            choose_install_set(0, 10, Some(10), &sets, &catalog)
+                .map(|(l, _)| l.position)
+                .ok(),
+            Some(5)
+        );
     }
 }

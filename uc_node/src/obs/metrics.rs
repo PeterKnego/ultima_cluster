@@ -89,6 +89,8 @@ pub const CONTRACT_SERIES: &[&str] = &[
     "uc2_snapshot_auto_fetch_total",
     // Backup-tier 3b spec §6.6: landed store-only fetches by source.
     "uc2_snapshot_fetch_total",
+    // Backup-tier 3b spec §6.3/§6.6: TIER_INSTALL outcomes.
+    "uc2_tier_install_total",
     "uc2_snapshot_newest_agreed_bytes",
     "uc2_snapshot_wont_fit",
     // Snapshot-catalog spec §9: the replicated catalog's own gauges.
@@ -1107,6 +1109,22 @@ fn push_service_families(out: &mut String, s: &ObsSources, commit: u64, now: u64
             ),
         ],
     );
+    push_labeled(
+        out,
+        "uc2_tier_install_total",
+        "TIER_INSTALL requests (backup-tier 3b spec §6.3/§6.6) by outcome: installed (this below-floor node installed a set from its own tier) and declined (it answered declined — no source, no set in range, an unregistered tier, or a copy that failed verification), both counted by the follower.",
+        "counter",
+        &[
+            (
+                "outcome=\"installed\"".to_string(),
+                s.tier_install.installed.load(Ordering::Relaxed),
+            ),
+            (
+                "outcome=\"declined\"".to_string(),
+                s.tier_install.declined.load(Ordering::Relaxed),
+            ),
+        ],
+    );
     let newest_agreed_bytes = s
         .cluster_view
         .catalog_newest_agreed_bytes
@@ -2085,6 +2103,7 @@ mod tests {
             snapshot_fetched_position: Arc::new(AtomicU64::new(0)),
             snapshot_auto_fetch: Arc::new(Default::default()),
             snapshot_fetch_source: Arc::new(Default::default()),
+            tier_install: Arc::new(Default::default()),
             snapshot_holdings: Arc::new(std::sync::Mutex::new(Default::default())),
             snapshot_freeze: Arc::new(SnapshotFreezeStats::default()),
             crypto_enabled: false,
@@ -2350,7 +2369,7 @@ mod tests {
     fn the_contract_has_the_number_of_families_the_docs_state() {
         assert_eq!(
             CONTRACT_SERIES.len(),
-            146,
+            147,
             "if this is intentional, update the family count in \
              docs/how-to/monitor-a-cluster.md in the same commit"
         );
@@ -3034,6 +3053,7 @@ mod tests {
             snapshot_fetched_position: Arc::new(AtomicU64::new(0)),
             snapshot_auto_fetch: Arc::new(Default::default()),
             snapshot_fetch_source: Arc::new(Default::default()),
+            tier_install: Arc::new(Default::default()),
             snapshot_holdings: Arc::new(std::sync::Mutex::new(Default::default())),
             snapshot_freeze: Arc::new(SnapshotFreezeStats::default()),
             crypto_enabled: false,
@@ -3153,6 +3173,7 @@ mod tests {
             snapshot_fetched_position: Arc::new(AtomicU64::new(0)),
             snapshot_auto_fetch: Arc::new(Default::default()),
             snapshot_fetch_source: Arc::new(Default::default()),
+            tier_install: Arc::new(Default::default()),
             snapshot_holdings: Arc::new(std::sync::Mutex::new(Default::default())),
             snapshot_freeze: Arc::new(SnapshotFreezeStats::default()),
             crypto_enabled: false,
@@ -3265,6 +3286,7 @@ mod tests {
             snapshot_fetched_position: Arc::new(AtomicU64::new(0)),
             snapshot_auto_fetch: Arc::new(Default::default()),
             snapshot_fetch_source: Arc::new(Default::default()),
+            tier_install: Arc::new(Default::default()),
             snapshot_holdings: Arc::new(std::sync::Mutex::new(Default::default())),
             snapshot_freeze: Arc::new(SnapshotFreezeStats::default()),
             crypto_enabled: false,

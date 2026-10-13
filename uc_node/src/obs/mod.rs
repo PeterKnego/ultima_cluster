@@ -172,6 +172,10 @@ pub struct ObsSources {
     /// Backup-tier 3b spec §6.6: `uc2_snapshot_fetch_total{source}`, the
     /// SAME allocation the consensus agent bumps.
     pub snapshot_fetch_source: Arc<crate::tier::source::FetchSourceStats>,
+    /// Backup-tier 3b spec §6.6: `uc2_tier_install_total{outcome}`'s
+    /// follower half (`installed`, `declined`), the SAME allocation the
+    /// consensus agent bumps.
+    pub tier_install: Arc<crate::tier::source::TierInstallStats>,
     /// The `uc2-holdings` probe's cached reading — the free-bytes figure the
     /// auto-fetch space check uses. `uc2_snapshot_wont_fit` is computed from
     /// it with that check's own formula (plan ruling PF11: one sampler).
@@ -280,6 +284,7 @@ impl ObsSources {
             snapshot_fetched_position: Arc::new(AtomicU64::new(0)),
             snapshot_auto_fetch: Arc::new(Default::default()),
             snapshot_fetch_source: Arc::new(Default::default()),
+            tier_install: Arc::new(Default::default()),
             snapshot_holdings: Arc::new(std::sync::Mutex::new(Default::default())),
             snapshot_freeze: Arc::new(SnapshotFreezeStats::default()),
             crypto_enabled: false,
