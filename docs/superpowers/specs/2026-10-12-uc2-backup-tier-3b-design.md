@@ -394,3 +394,150 @@ and 29 `TIER_INSTALL_STATUS`. No cnc change. `node.toml` gains
    `through`.
 5. `auto_fetch = false` and no tier source on a voter: today's behaviour
    (peer session), not a stall.
+
+#### Errata (as built, 2026-10-13)
+
+Where the build differs from or refines this spec; numbered as in the plan
+(`docs/superpowers/plans/2026-10-12-uc2-backup-tier-3b.md`) and its execution
+ledger (PF = pre-flight, RA = review amendments, T = execution rulings by
+task). **RA1–RA7 are not repeated here:** the plan's "Review amendments"
+section records them, and the spec text for RA1 (§4.1, lineage `base < S`),
+RA2 (§5.3, read-back) and RA3 (§6.2, `.tier.part` temp names) was amended
+**before** execution, not after — read those sections as written.
+
+- **PF1 — lineage agreement between writers is suffix agreement (§4.1).** The
+  spec said two writers' lineages for one set must agree. `NodeState::
+  store_term_map` keeps only the newest 300 entries, so a restarted writer's
+  map can be shorter than a never-restarted one's. `place_set` on
+  `Put::Exists` compares every `SetLabel` field exactly except `lineage`,
+  which agrees iff the shorter is a suffix of the longer; any other
+  difference is still the `OverlapMismatch` stop. The line itself is uncapped.
+- **PF2 (as amended by RA2), T8 — read-back gates the report, and the creator
+  reads back its own objects (§5.3).** The watermark and `progress` are
+  computed over the listing filtered to confirmed ∪ verified objects; every
+  object this writer creates (`Put::Created`) is read back at once and enters
+  the verified cache only if it passes. A found object counts without a
+  re-read iff the committed watermark already covers it (its creator read it
+  back). Placement (`copy_one_set`, `cut_one_chunk`, retention deletions) keeps
+  the RAW listing, so a persistently bad object is never re-cut over — it is
+  the operator's, named by `tier verify`. Reason `readback`; event
+  `backup_readback_failed`.
+- **PF3, T7 — the gate's chunk size on a non-writer node (§5.4).**
+  `Consensus::backup_chunk_bytes` is 0 without a writer and `fits(free, 0)`
+  means "free ≥ 1 GiB". The low-space test uses `backup.chunk_bytes` on a
+  writer node and `tier::writer::DEFAULT_CHUNK_BYTES` (64 MiB) elsewhere.
+- **PF4, T12 — the tier copy is a thread: `uc2-tier-fetch` and
+  `SnapIntakeSignals` (§6.2, §6.3).** Copying a set is I/O the consensus
+  agent must not do. One thread per fetch serves both store-only and install;
+  on success it raises exactly the signals `Receiver::snap_complete` raises,
+  factored into one `SnapIntakeSignals` struct both own, so
+  `maybe_adopt_incoming_snapshot` and `check_set_completeness` serve a tier
+  copy unchanged.
+- **PF5, T13 — the install adopts the SET's lineage (§6.3).** The spec let the
+  install adopt the leader's term-map tail (`last_leader_map`, 64 entries).
+  A tier install sets `pending_install_lineage = Some(set.lineage)` first and
+  the handler prefers it, so the leader's later `TermMap` datagrams reconcile
+  against a map holding every committed entry ≤ S. The term-map line is
+  parsed and range-checked but not hash-covered; rows and the cluster
+  artifact are hash-verified against the leader's verdict.
+- **PF6, T5, T13 — no sim floor model; `check_install_set` exhaustive test
+  instead of the §6.7 sim inv.** `uc_sim` models no snapshot install and no
+  purge floor, so "a tier install never lands below the floor or above commit"
+  cannot be a sim invariant. It is pinned as an exhaustive test of the pure
+  choice function (`check_install_set`). §4.4's seeded-lineage inv14 stands on
+  a new seeding seam, `World::seed_from_set`. A floor model is not 3b's.
+- **PF7, T14 — the sender owns the wait (§6.3).** The below-floor decision is
+  `Sender::serve_nak` on the sender thread, timed with its own clock; kind 29
+  reaches it as a `CtrlMsg` (the `SNAP_DONE` route) and kind 28 reaches the
+  follower's node as a term-gated `NetEvent` (the `SNAP_REDIRECT` route). Floor
+  = the journal's first archived base; commit = the counter the sender reads.
+- **PF-R1 — the contract count moves with the task that adds a family.** The
+  metric-contract count test and `docs/how-to/monitor-a-cluster.md` move with
+  each task adding a family (T7 → 145, T12 → 146, T13 → 147); T16 asserts the
+  final 147. Otherwise the count test is red from T7 to T13.
+- **T8 — retention counts only verified sets (3a §7.2; this spec §5.3).**
+  "Newest" and the keep window are computed over the verified ∪ confirmed
+  listing; deletions still act on real names. Otherwise a corrupt newest set
+  with `keep_sets = 1` would leave the tier with no restorable set while the
+  gate holds nodes at the verified `through`. Cost: a persistently corrupt
+  newest set keeps one extra set until the operator acts.
+- **T11 — `NetEvent::TierInstall` is keyed by address (§6.3).** Shape
+  `{ from: SocketAddr, floor, commit }`. The receiver's `peer_ids` map is
+  populated only with wire crypto on (default off), so a NodeId would never be
+  emitted on a default cluster. The receiver keeps the term gate; the leader
+  identity check (`from == id_to_addr(leader_hint)`) moves to the node.
+- **T12 — explicit vs implied foreign source (§6.1).** An explicit
+  `[tier_source]` that is foreign refuses to start (`tier_source_foreign`). A
+  source implied from `[backup]` that is foreign does not refuse: it logs
+  `tier_source_unavailable{detail="foreign"}`, yields no handle, and the 3a
+  writer's `backup_target_foreign` stop applies unchanged.
+- **T12 — auto-fetch tries the tier first (§6.2).** `auto_fetch_step` issues a
+  tier fetch whenever a registered source holds `sets/<P>/SET`, even with no
+  peer holder; a tier fetch that times out falls back to the peer path like an
+  `Err`. The log/audit `from` names the tier when it served.
+- **T12 — the audit record's `fetch_source` (new, §8).** A tier-served
+  auto-fetch writes the `snapshot_fetch` audit record (the node served itself,
+  so the member field carries its own id); the record gains a 14th key,
+  `fetch_source` = `"tier"` | `"peer"` on auto-fetch/op-9 records, `null`
+  elsewhere.
+- **T12 — a timed-out fetch is CANCELLED and drained (§6.2, §8).** The spec
+  said a timed-out copy is abandoned. `TierFetch.cancelled` is set: the
+  thread renames and publishes nothing more and removes only its own
+  `.tier.part` files; the record stays in a draining slot until `done`, and no
+  second tier copy of the same P starts while one drains.
+- **T13, T14 — the leader-carried verdict: `TIER_INSTALL` is 200 B (§6.3,
+  §7).** The spec's body was `floor ‖ commit` (16 B) and had the follower
+  agree the set "in its catalog". A brand-new learner's catalog is EMPTY, so
+  that agreement never holds (`NoSet` forever) and trusting the tier's SET
+  alone breaks D8. The leader names S and carries its catalog verdict: floor
+  @0, commit @8, s @16, row_hash [u64;8] @24, row_version [u32;8] @88,
+  row_size [u64;8] @120, cluster_hash @184, cluster_size @192, LE, no padding
+  (200 B; an early draft said 224, corrected). The follower verifies every
+  object against the carried values; `choose_install_set` no longer reads the
+  follower's catalog. Reader refuses other lengths, `floor > commit` and
+  `s ∉ [floor, commit]`. Status reasons: `none=0 no_source=1 no_set=2
+  verify=3 not_registered=4`, declines carrying `position = s`.
+- **T14 — S is bounded by the tiers' max `newest_set` (§6.3).** The leader
+  picks its newest agreed set in `[floor, commit]` that is also ≤ the maximum
+  `newest_set` across registered tiers (it cannot tell which tier the follower
+  reads); only if none exists does it fall back to the newest agreed set in
+  range. `through` was the first candidate bound, rejected: it can reach P
+  before the set at P is copied (cut-to-set).
+- **T14 — `s <= durable` answers `Installed` (§6.3).** A `TIER_INSTALL` whose
+  `s` is at or below the follower's durable position answers `Installed{s}` at
+  once without copying, so a late publish cannot re-arm the receiver's
+  `adopt_pending` below the adopted position.
+- **T14 (F1) — installs need no registration (§6.1).** The follower does not
+  consult `registered_through` for `TIER_INSTALL`: a new learner's committed
+  view holds no registration, and the leader's verdict already proves the set.
+  It requires only `TIER.app_id` = its app id and hash-verifies every object.
+  `not_registered` therefore means "TIER unreadable or foreign". The
+  registration / `through` cap remains the rule for store-only fetches.
+- **T14 (F2) — a current-term kind 28 teaches the leader hint.** A restarted
+  follower with no known leader learns it from a current-term `TIER_INSTALL`
+  (the term gate admits only the current term; one leader exists per term).
+- **T14 (F3) — e2e session counts are `>= 1`.** Where a session is expected
+  the e2es assert `snap_sessions >= 1` (a joiner re-NAKs and several sessions
+  open); "asked exactly once" is `tier_install_sent == 1`; "no session" cases
+  keep `== 0`.
+- **T14 — the `Installed` settling grace and hold backstop (§6.3).**
+  `Installed{S}` from X gets a 10 s settling grace (`TIER_INSTALL_SETTLE_NS`)
+  during which a below-floor NAK from X opens nothing (the joiner NAKs until
+  its cluster-artifact install lands); from 10 s to 30 s such a NAK is held
+  like a decline (session); after 30 s X is asked again. A first draft held
+  from the first NAK and broke the healthy join.
+- **T5 — scenario budgets, and the inv14 mutation is caught by inv2 (§4.4).**
+  The plan's storm budgets (400/200) were below `STORM_INSTANT_STEPS` (500) and
+  ran zero iterations; built as a `storm_steps` helper without the closing run,
+  budgets 1000/500, `max_steps` 1M. The frames-only seed mutation is caught by
+  inv2 (term-map prefix consistency, seed 14, step 5184) before any truncate,
+  so inv14 never fires on that shape; it stays the truncate-time backstop for
+  a prefix-consistent but cut seed, and is unproven reachable by any shape.
+- **T3, RA6 — `tier_set_deferred` (detail).** After 10 consecutive passes
+  deferring one set for an empty lineage (e.g. a restarted writer whose
+  persisted map no longer reaches below an old S), `tier_set_deferred
+  {position}` (Warn) fires once per position.
+- **R10a stays open (3a §13).** 3b did not settle the origin-set edge.
+- **Task 15 (§9) — the lin capstone's tier-join test runs its body on a 16 MiB
+  thread.** A debug build overflowed the 2 MiB test-thread stack (nightly runs
+  the capstones in debug); the oversized frame was not isolated.
