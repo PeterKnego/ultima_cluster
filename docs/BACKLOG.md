@@ -426,7 +426,7 @@ reviewer wants a workload to attack.
     the tier inside that window. Narrow and unobserved — settle it (gate on a
     later position, or show the window empty) before nodes delete on the
     tier's word. **Still open:** 3b shipped with this edge unsettled: nodes
-    now delete on the tier's word; the window remains narrow and unobserved.
+    now hold purge on the tier's word; the window remains narrow and unobserved.
 - **Compressing the node's own journal (idea, unmeasured).** The backup tier
   compresses what it writes off-node (spec
   `superpowers/specs/2026-10-10-uc2-backup-tier-design.md` D11); the node's

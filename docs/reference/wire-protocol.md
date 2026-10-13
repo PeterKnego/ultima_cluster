@@ -317,7 +317,7 @@ position u64 @8 ‖ copied u64 @16`.
 | 0 | `none` | not a decline |
 | 1 | `no_source` | the follower has no readable tier source |
 | 2 | `no_set` | the tier holds no set it could install for this `floor`/`commit`/`s` |
-| 3 | `verify` | a copied object failed the leader's carried hash, version or size |
+| 3 | `verify` | the tier's `SET` or a copied object failed the leader's carried hash, version or size, or the `SET`'s lineage disagreed with the follower's copy of the leader's term map |
 | 4 | `not_registered` | the follower's tier is unreadable or belongs to another cluster |
 
 The leader falls back to a snapshot session on a decline, after 2 s with no

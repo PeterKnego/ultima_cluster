@@ -194,7 +194,9 @@ committed registration: the verdict is the proof.
 floor. With `purge_requires_tiers = K`, every node holds its floor at or below
 the K-th highest `through` the cluster has confirmed among its tiers. The gate
 is one more hold: the journal purge target is the minimum over the floor minus
-slack, the writer's own hold and the gate. For that
+slack, the writer's own hold and the gate. A node that has just booted holds
+everything until it has joined its cluster, because until its cluster-FSM walk
+reaches commit it may not yet see a K raise or a `tier forget`. For that
 to be safe the confirmation has to mean something, so the writer reads back
 each object it creates before it counts. The price is that older history then
 lives only in the tier, and its retention sets how far back a restore goes. A
@@ -213,6 +215,13 @@ already installed.
 **One thing to know about the lineage an install adopts.** It is the tier
 set's own line. The rows and the cluster artifact are hash-verified against
 the leader's verdict, but the term-map line is parsed and range-checked, not
-covered by a hash. That is acceptable because a wrong line cannot make the
-node serve wrong data: it can only make the next reconcile cut the node
-further back.
+covered by a hash. So before it copies anything, the follower checks the line
+against what it already knows: every term that also appears in the leader's
+last term map must start at the same position there, and the line may name no
+term newer than the follower's own. A line that fails either check (a flipped
+digit is enough) is declined as `verify`, nothing is copied, and the leader
+serves the node by a snapshot session instead. A wrong line that got through
+would not make the node serve wrong data, but it could make the next reconcile
+cut below the floor it just adopted, which stops the node
+(`PositionPurged`). Terms older than the leader's map reaches are not
+checked, because the leader has nothing to compare them with.

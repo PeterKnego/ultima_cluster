@@ -396,7 +396,8 @@ transport setting, both measured closed-loop at inflight 1 on 8-vCPU
   `reason` says why (`no_source`: no `[tier_source]`/`[backup]` on this node;
   `not_registered`: the tier is unreadable or another cluster's; `no_set`:
   the tier holds no usable set at or above the floor; `verify`: a copied
-  object disagreed with the leader's hash). The leader opens an ordinary
+  object disagreed with the leader's hash, or the set's term-map line
+  disagreed with the leader's, `detail="lineage_mismatch"`). The leader opens an ordinary
   snapshot session after it, so nothing is lost. A node that should have
   installed from the tier: check the mount and `tier verify`.
 - **`tier_set_deferred` appears** on a writer: it has put a set off ten

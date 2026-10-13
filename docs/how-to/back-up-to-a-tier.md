@@ -412,6 +412,13 @@ Two behaviours to expect:
   per episode (`backup_gate_rearmed` when it comes back). `Uc2BackupGateReleased`
   fires. The tier then has a gap, as it does for a writer's release.
 
+- **Until the node has joined.** A node with `[purge]` on purges nothing at
+  all until it has joined its cluster (leader known, commit learned, its
+  cluster-FSM walk caught up to commit — the same point at which a service
+  may attach), whatever K reads. Until then its view of K and of the tiers
+  may still be the snapshot it booted from, which can miss a K raise or a
+  `tier forget` committed since. The gauge reads `0` meanwhile.
+
 `uc2_purge_gate_position` shows the gate each node computes (it is exported
 with K = 0 too, header only).
 
@@ -448,10 +455,14 @@ What the node takes from it:
 - **A below-floor install.** When a follower's NAK falls below the leader's
   purge floor the leader asks its tier first (`TIER_INSTALL`) instead of
   opening a snapshot session. The leader names the set and carries its
-  catalog verdict; the follower copies, verifies, installs and adopts the
-  set's lineage, then answers. A follower with no source answers `declined`
-  at once. An install needs no committed registration of the follower's tier,
-  only that the tier belongs to this cluster. Events: `tier_install_started`,
+  catalog verdict. A follower with a source answers `installing` at once and
+  does all its tier reads on a fetch thread, never on the consensus agent:
+  it reads the set, checks it and its lineage (against the leader's term map
+  and its own term), copies, verifies, installs and adopts the set's lineage,
+  then answers `installed`; a check that fails is a `declined` after the
+  `installing`. A follower with no source answers `declined` at once. An
+  install needs no committed registration of the follower's tier, only that
+  the tier belongs to this cluster. Events: `tier_install_started`,
   `tier_install_done`, `tier_install_declined{reason}`. A request from an
   address that is not this node's leader is dropped and logged
   `tier_install_ignored`; a node already at or past S simply answers
