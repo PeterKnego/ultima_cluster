@@ -234,6 +234,9 @@ const PHASE_RUNNING: u8 = 0;
 const PHASE_PUBLISHING: u8 = 1;
 const PHASE_CANCELLED: u8 = 2;
 
+/// A `SET` lineage the fetch thread records once its plan passed.
+type SharedLineage = Arc<Mutex<Option<Vec<(u32, u64)>>>>;
+
 /// One running `uc2-tier-fetch` thread.
 pub struct TierFetch {
     pub position: u64,
@@ -253,7 +256,7 @@ pub struct TierFetch {
     /// The `SET`'s lineage, set by the thread once its plan passed and
     /// before it publishes — what `maybe_adopt_incoming_snapshot` adopts
     /// when it sees the set land before `done` arrives.
-    lineage: Arc<Mutex<Option<Vec<(u32, u64)>>>>,
+    lineage: SharedLineage,
     handle: Option<JoinHandle<()>>,
 }
 
@@ -678,7 +681,7 @@ pub fn spawn_fetch(
     let copied = Arc::new(AtomicU64::new(0));
     let done: Arc<Mutex<Option<FetchResult>>> = Arc::new(Mutex::new(None));
     let phase = Arc::new(AtomicU8::new(PHASE_RUNNING));
-    let lineage: Arc<Mutex<Option<Vec<(u32, u64)>>>> = Arc::new(Mutex::new(None));
+    let lineage: SharedLineage = Arc::new(Mutex::new(None));
     let (c2, d2, x2, l2) = (
         Arc::clone(&copied),
         Arc::clone(&done),
