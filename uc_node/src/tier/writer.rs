@@ -392,6 +392,35 @@ impl Verifier {
         }
     }
 
+    /// Final review I6d (T8): drop every remembered name the RAW listing no
+    /// longer holds (retention deleted it, an operator removed it), so
+    /// `verified` and `suspect` track the tier rather than grow for the
+    /// writer's whole life. A name under an incomplete or corrupt set's
+    /// directory is kept: its rows are not named by a parsed `SET`, yet a
+    /// suspect one there must stay suspect until it passes.
+    fn forget_absent(&mut self, raw: &TierListing) {
+        let mut names: HashSet<String> = HashSet::new();
+        for s in &raw.sets {
+            for r in &s.rows {
+                names.insert(row_object(s.position, r.row));
+            }
+            names.insert(cluster_object(s.position));
+            names.insert(set_label(s.position));
+        }
+        for &(from, to) in &raw.chunks {
+            names.insert(chunk_object(from, to));
+        }
+        let open_dirs: Vec<String> = raw
+            .incomplete_sets
+            .iter()
+            .chain(&raw.corrupt_sets)
+            .map(|&p| format!("{}/", super::layout::set_dir(p)))
+            .collect();
+        let keep = |k: &String| names.contains(k) || open_dirs.iter().any(|d| k.starts_with(d));
+        self.verified.retain(keep);
+        self.suspect.retain(keep);
+    }
+
     fn covered(&self, key: &str, by_watermark: bool) -> bool {
         by_watermark && !self.suspect.contains(key)
     }
@@ -408,6 +437,7 @@ impl Verifier {
         raw: &TierListing,
         confirmed: Option<&BackupTierEntry>,
     ) -> TierListing {
+        self.forget_absent(raw);
         let mut out = TierListing {
             sets: Vec::new(),
             incomplete_sets: raw.incomplete_sets.clone(),
@@ -2702,6 +2732,34 @@ mod tests {
         *spy.corrupt.lock().unwrap() = None;
         let ver = v.verified_listing(&spy, &stats, 1, &raw, Some(&confirmed));
         assert_eq!(ver.sets.len(), 1, "a retry re-reads it and it passes");
+    }
+
+    /// Final review I6d (T8): a name the tier no longer lists leaves the
+    /// verifier's sets on the next refresh — they track the tier, they do
+    /// not grow forever.
+    #[test]
+    fn a_deleted_name_is_forgotten_by_the_next_refresh() {
+        let d = tempdir();
+        let (spy, _) = tier_fixture(d.path());
+        let stats = WriterStats::default();
+        let mut v = Verifier::default();
+        let raw = list_tier(&spy).unwrap();
+        v.verified_listing(&spy, &stats, 1, &raw, None);
+        let gone = chunk_object(192, 256);
+        assert!(v.verified.contains(&gone), "re-read and verified");
+        assert!(v.verified.contains(&row_object(128, 0)));
+        v.suspect.insert(gone.clone());
+        spy.delete(&gone).unwrap();
+        let raw = list_tier(&spy).unwrap();
+        assert!(!raw.chunks.contains(&(192, 256)));
+        v.verified_listing(&spy, &stats, 1, &raw, None);
+        assert!(!v.verified.contains(&gone), "a deleted name is forgotten");
+        assert!(!v.suspect.contains(&gone));
+        assert!(
+            v.verified.contains(&chunk_object(128, 192)),
+            "a listed one stays"
+        );
+        assert!(v.verified.contains(&row_object(128, 0)));
     }
 
     #[test]

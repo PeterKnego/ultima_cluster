@@ -567,6 +567,12 @@ pub struct FollowerStats {
     /// timeout, reports/gossip on their floors. Surfaced so a wedged consensus
     /// agent is diagnosable rather than silent.
     pub net_drops: [AtomicU64; NET_EVENT_KINDS],
+    /// Backup-tier 3b, final review I6e: a well-formed `TIER_INSTALL_STATUS`
+    /// (kind 29) this receiver could not hand to a sender — none is
+    /// installed (this node is not in the leader role, so it asked nobody),
+    /// or the sender's control channel was full. Dropped, never acted on;
+    /// counted so a stray or late answer is visible rather than silent.
+    pub tier_install_status_dropped: AtomicU64,
     pub naks_sent: AtomicU64,
     pub statuses_sent: AtomicU64,
     pub append_positions_sent: AtomicU64,
@@ -2549,11 +2555,20 @@ impl FollowerReceiver {
                 }
             }
             // The follower's answer, demuxed to our sender (leader role).
-            DGRAM_KIND_TIER_INSTALL_STATUS if self.sender_route.is_some() => {
-                if let Some(b) = read_tier_install_status_body(&d[DATAGRAM_HEADER_LEN..])
-                    && let Some(route) = &self.sender_route
-                {
-                    let _ = route.try_send(CtrlMsg::TierInstallStatus { from, body: b });
+            // With no sender installed (not the leader role) it is dropped
+            // and counted (final review I6e).
+            DGRAM_KIND_TIER_INSTALL_STATUS => {
+                if let Some(b) = read_tier_install_status_body(&d[DATAGRAM_HEADER_LEN..]) {
+                    let routed = self.sender_route.as_ref().is_some_and(|route| {
+                        route
+                            .try_send(CtrlMsg::TierInstallStatus { from, body: b })
+                            .is_ok()
+                    });
+                    if !routed {
+                        self.stats
+                            .tier_install_status_dropped
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
                 }
             }
             _ => {} // NAK/STATUS with no sender_route installed (follower role)
@@ -5274,6 +5289,46 @@ mod tests {
         assert!(
             rx.try_recv().is_err(),
             "a refused TIER_INSTALL must not route"
+        );
+    }
+
+    /// Final review I6e: kind 29 at a node with no sender route (not the
+    /// leader role) is dropped and counted.
+    #[test]
+    fn a_tier_install_status_with_no_sender_route_is_counted() {
+        use uc_protocol::v2::datagram::{
+            TIER_INSTALL_STATUS_BODY_LEN, TierInstallReason, TierInstallState,
+            TierInstallStatusBody, write_tier_install_status_body,
+        };
+        let b = buffer();
+        let mut leader = FakeLeader::new();
+        let mut r = follower(&b, leader.addr());
+        let mut sb = [0u8; TIER_INSTALL_STATUS_BODY_LEN];
+        write_tier_install_status_body(
+            &mut sb,
+            &TierInstallStatusBody {
+                state: TierInstallState::Installed,
+                reason: TierInstallReason::None,
+                position: 4096,
+                copied: 0,
+            },
+        );
+        leader.send(r.local_addr(), DGRAM_KIND_TIER_INSTALL_STATUS, 0, TERM, &sb);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while r
+            .stats()
+            .tier_install_status_dropped
+            .load(Ordering::Relaxed)
+            == 0
+        {
+            assert!(Instant::now() < deadline, "kind 29 never counted");
+            r.do_work();
+        }
+        assert_eq!(
+            r.stats()
+                .tier_install_status_dropped
+                .load(Ordering::Relaxed),
+            1
         );
     }
 

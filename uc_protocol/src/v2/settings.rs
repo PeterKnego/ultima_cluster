@@ -25,7 +25,6 @@ pub const SETTINGS_VERSION: u32 = 6;
 pub const SETTINGS_LEN: usize = 4 + 8 + 8 + 8 + 1 + 4 + 2 + 1 + 2 + 8 + 1; // 47
 /// The exact length of a version-5 record, accepted on decode only.
 /// Version 5 (backup-tier spec) appends `backup_retain_sets u16 @36` and
-/// Version 5 (backup-tier spec) appends `backup_retain_sets u16 @36` and
 /// `backup_retain_age_secs u64 @38`; `1`–`4` decode both as `0` (no tier
 /// retention).
 pub const SETTINGS_LEN_V5: usize = 4 + 8 + 8 + 8 + 1 + 4 + 2 + 1 + 2 + 8; // 46
