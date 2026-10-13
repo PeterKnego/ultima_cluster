@@ -139,6 +139,12 @@ of a set. The writer used to write `SET` over files retention had just removed.
 Now it re-lists the set's directory and confirms each file is present, at the
 right size, immediately before it writes `SET`.
 
+**Count only what was checked.** Retention decides which set is the newest,
+and the keep window by count and age, over the sets the writer has verified:
+read back, or confirmed by the committed watermark. An unverified newest set
+never causes an older verified set to be deleted, and is never deleted itself.
+It is the operator's, and `tier verify` names it.
+
 **Do not trust a lagging view.** Retention protects the rollback point of an
 unfinished upgrade pin. A node whose view had not yet seen the pin would not
 protect it. So retention runs only once the writer's view has consumed past the
@@ -186,7 +192,9 @@ committed registration: the verdict is the proof.
 
 **The gate.** Purge deletes the only local copy of the log below a node's
 floor. With `purge_requires_tiers = K`, every node holds its floor at or below
-the K-th highest `through` the cluster has confirmed among its tiers. For that
+the K-th highest `through` the cluster has confirmed among its tiers. The gate
+is one more hold: the journal purge target is the minimum over the floor minus
+slack, the writer's own hold and the gate. For that
 to be safe the confirmation has to mean something, so the writer reads back
 each object it creates before it counts. The price is that older history then
 lives only in the tier, and its retention sets how far back a restore goes. A

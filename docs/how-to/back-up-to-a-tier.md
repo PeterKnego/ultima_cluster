@@ -122,6 +122,12 @@ Retention runs on the writer, and only once its view of the cluster has
 caught up. Deleting is idempotent: any writer may do it. The set's marker
 file is removed first, so a reader never sees a half-deleted set as whole.
 
+Retention counts only **verified** sets. The writer decides which set is the
+newest, and the keep window (count and age), over the sets it has verified:
+read back clean, or confirmed by the committed watermark. An unverified newest
+set is neither the reason an older verified set is deleted nor deleted itself.
+It is yours to deal with, and `uc2ctl tier verify` names it.
+
 ## 4. Read the tier
 
 `uc2ctl tier show` reads the tier's files directly. It needs no running
@@ -430,7 +436,9 @@ An unreachable tier is the same: the node starts and falls back to peers.
 What the node takes from it:
 
 - **A store-only fetch** (auto-fetch, `uc2ctl snapshot fetch`) tries the tier
-  first, then peers. The set must be one the tier's registered entry covers
+  first, then peers, even when no peer holds the set. After a `verify` failure
+  auto-fetch skips the tier for that position; `uc2ctl snapshot fetch` still
+  tries it. The set must be one the tier's registered entry covers
   (never beyond its `through`). Each artifact is copied to a temp name
   (`incoming-<P>.tier.part`), renamed into place and checked against the
   cluster's agreed hash and version, so the cluster's catalog, not the tier,
@@ -444,8 +452,10 @@ What the node takes from it:
   set's lineage, then answers. A follower with no source answers `declined`
   at once. An install needs no committed registration of the follower's tier,
   only that the tier belongs to this cluster. Events: `tier_install_started`,
-  `tier_install_done`, `tier_install_declined{reason}`; a node that is asked
-  but is not below the floor logs `tier_install_ignored`.
+  `tier_install_done`, `tier_install_declined{reason}`. A request from an
+  address that is not this node's leader is dropped and logged
+  `tier_install_ignored`; a node already at or past S simply answers
+  `installed`.
   `uc2_tier_install_total{outcome}` counts them.
 
 Timings, per peer: the leader falls back to a snapshot session if the follower
