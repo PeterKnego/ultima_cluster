@@ -14,8 +14,8 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 use uc_net::receiver::{SnapIntakeSignals, write_foreign_marker};
 use uc_protocol::v2::backup::BackupTierEntry;
-use uc_protocol::v2::catalog::{RowVerdict, SetEntry};
-use uc_protocol::v2::datagram::TierInstallReason;
+use uc_protocol::v2::catalog::{RowEntry, RowVerdict, SetEntry, SetState};
+use uc_protocol::v2::datagram::{TierInstallBody, TierInstallReason};
 
 pub struct TierSource {
     target: Arc<FsTarget>,
@@ -448,38 +448,68 @@ pub struct TierInstallStats {
     pub declined: AtomicU64,
 }
 
-/// Backup-tier 3b spec §6.3 step 1 (ruling PF6): the newest tier set S with
-/// `floor <= S <= min(commit, through)` that is AGREED in the catalog.
-/// `through` is the registered watermark, captured once at the
-/// `TIER_INSTALL` event; `None` (no `TIER`, a foreign one, or a tier id the
-/// cluster has not registered) is `Err(NotRegistered)` whatever the listing
-/// holds; no candidate is `Err(NoSet)`. `floor <= S` is what makes the
-/// leader's log cover everything after S; `S <= commit` keeps the install
-/// committed; `S <= through` never reads past what the cluster registered.
-/// Pure: the caller does the listing and reads the catalog.
-pub fn choose_install_set(
-    floor: u64,
-    commit: u64,
+/// The catalog entry a `TIER_INSTALL` body stands for: the LEADER's verdict
+/// on the set at `body.s` (controller ruling on Task 13 concern 5). Every
+/// row with a nonzero hash is `Agreed` with the carried hash, version and
+/// size; the cluster artifact likewise; state `Complete`. `kind`/`time_ns`
+/// are the `SET`'s (nothing verifies them). This is what ruling D8 checks
+/// the tier's copy against on a node with no catalog of its own.
+pub fn install_expect(body: &TierInstallBody, label: &SetLabel) -> SetEntry {
+    let mut e = SetEntry::commanded(body.s, label.kind, label.time_ns);
+    e.state = SetState::Complete;
+    for (i, r) in e.rows.iter_mut().enumerate() {
+        if body.row_hash[i] != 0 {
+            *r = RowEntry {
+                version: body.row_version[i],
+                hash: body.row_hash[i],
+                verdict: RowVerdict::Agreed,
+                size: body.row_size[i],
+            };
+        }
+    }
+    e.cluster = RowEntry {
+        version: 0,
+        hash: body.cluster_hash,
+        verdict: RowVerdict::Agreed,
+        size: body.cluster_size,
+    };
+    e
+}
+
+/// Backup-tier 3b spec §6.3 step 1 (ruling PF6, as amended): may this node
+/// install the set the leader NAMED (`body.s`) from its tier? The leader
+/// chose S (the newest agreed set in `[floor, commit]`, Task 14) and
+/// carries its catalog verdict; the follower checks only what the leader
+/// cannot know:
+/// - `through` None (no `TIER`, a foreign one, or an id the cluster has not
+///   registered) → `NotRegistered`;
+/// - `body.s` outside `[floor, min(commit, through)]` → `NoSet` (the reader
+///   already refuses `s` outside `[floor, commit]`; re-checked here);
+/// - no `SET` at exactly `body.s` among `sets` → `NoSet`;
+/// - a `SET` whose rows / versions / hashes / sizes disagree with the
+///   carried verdict → `Verify`, before any copy (ruling D8).
+///
+/// `Ok` = the tier's `SET` and the catalog entry built FROM THE BODY that
+/// the copy is verified against. Pure.
+pub fn check_install_set(
+    body: &TierInstallBody,
     through: Option<u64>,
     sets: &[SetLabel],
-    catalog: &[SetEntry],
 ) -> Result<(SetLabel, SetEntry), TierInstallReason> {
     let Some(through) = through else {
         return Err(TierInstallReason::NotRegistered);
     };
-    let top = commit.min(through);
-    sets.iter()
-        .filter(|l| floor <= l.position && l.position <= top)
-        .filter_map(|l| {
-            catalog
-                .iter()
-                .find(|e| e.position == l.position)
-                .filter(|e| e.is_agreed())
-                .map(|e| (l, e))
-        })
-        .max_by_key(|(l, _)| l.position)
-        .map(|(l, e)| (l.clone(), e.clone()))
-        .ok_or(TierInstallReason::NoSet)
+    if body.s < body.floor || body.s > body.commit.min(through) {
+        return Err(TierInstallReason::NoSet);
+    }
+    let Some(label) = sets.iter().find(|l| l.position == body.s) else {
+        return Err(TierInstallReason::NoSet);
+    };
+    let expect = install_expect(body, label);
+    if !label_matches_catalog(label, &expect) {
+        return Err(TierInstallReason::Verify);
+    }
+    Ok((label.clone(), expect))
 }
 
 #[cfg(test)]
@@ -815,7 +845,7 @@ pub(crate) mod tests {
         assert_eq!(s.registered_through(&[entry(9, 5), entry(7, 42)]), Some(42));
     }
 
-    // ------------------------------------------------ choose_install_set
+    // ------------------------------------------------ check_install_set
 
     fn label_at(p: u64) -> SetLabel {
         SetLabel {
@@ -829,60 +859,77 @@ pub(crate) mod tests {
         }
     }
 
-    fn catalog_at(p: u64, agreed: bool) -> SetEntry {
-        let mut e = SetEntry::commanded(p, SetKind::Full, 0);
-        if agreed {
-            e.state = SetState::Complete;
-            e.cluster.verdict = RowVerdict::Agreed;
-            e.rows[0].verdict = RowVerdict::Agreed;
+    pub(crate) fn body_at(floor: u64, commit: u64, s: u64) -> TierInstallBody {
+        TierInstallBody {
+            floor,
+            commit,
+            s,
+            row_hash: [0; 8],
+            row_version: [0; 8],
+            row_size: [0; 8],
+            cluster_hash: 0,
+            cluster_size: 0,
         }
-        e
     }
 
-    /// Ruling PF6, exhaustively over a small space: every Ok lands inside
-    /// `[floor, min(commit, through)]`, on an AGREED set, and is the newest
-    /// such; every Err is `NotRegistered` exactly when `through` is None and
-    /// otherwise `NoSet` exactly when no set qualifies.
+    /// The body the leader would send for `fx`'s set: its catalog verdict.
+    pub(crate) fn body_for(fx: &SetFx, floor: u64, commit: u64) -> TierInstallBody {
+        let e = &fx.entry;
+        let mut b = body_at(floor, commit, e.position);
+        for (i, r) in e.rows.iter().enumerate() {
+            if r.verdict == RowVerdict::Agreed {
+                b.row_hash[i] = r.hash;
+                b.row_version[i] = r.version;
+                b.row_size[i] = r.size;
+            }
+        }
+        b.cluster_hash = e.cluster.hash;
+        b.cluster_size = e.cluster.size;
+        b
+    }
+
+    /// Ruling PF6 as amended, exhaustively over a small space: a body that
+    /// survives the reader is accepted iff its `s` is at most `through` and
+    /// the tier holds a `SET` at exactly `s` — never below the floor, never
+    /// above commit or `through`; `NotRegistered` exactly when `through` is
+    /// None; `NoSet` otherwise. Which S to name is the leader's (Task 14).
     #[test]
-    fn choose_install_set_never_lands_below_the_floor_or_above_commit() {
+    fn check_install_set_never_lands_below_the_floor_or_above_commit() {
+        use uc_protocol::v2::datagram::{
+            TIER_INSTALL_BODY_LEN, read_tier_install_body, write_tier_install_body,
+        };
         const AT: [u64; 4] = [2, 5, 8, 11];
         let sets: Vec<SetLabel> = AT.iter().map(|&p| label_at(p)).collect();
-        let mut cases = 0u64;
-        let mut oks = 0u64;
-        for mask in 0u32..16 {
-            let agreed = |i: usize| mask & (1 << i) != 0;
-            let catalog: Vec<SetEntry> = AT
-                .iter()
-                .enumerate()
-                .map(|(i, &p)| catalog_at(p, agreed(i)))
-                .collect();
-            for floor in 0..=12u64 {
-                for commit in floor..=12u64 {
+        let (mut cases, mut oks, mut refused_by_reader) = (0u64, 0u64, 0u64);
+        for floor in 0..=12u64 {
+            for commit in 0..=12u64 {
+                for s in 0..=12u64 {
+                    let mut wire = [0u8; TIER_INSTALL_BODY_LEN];
+                    write_tier_install_body(&mut wire, &body_at(floor, commit, s));
+                    let Some(body) = read_tier_install_body(&wire) else {
+                        refused_by_reader += 1;
+                        assert!(floor > commit || s < floor || s > commit);
+                        continue;
+                    };
                     for through in std::iter::once(None).chain((0..=12u64).map(Some)) {
                         cases += 1;
-                        let got = choose_install_set(floor, commit, through, &sets, &catalog);
-                        let ok = |i: usize, p: u64| {
-                            through.is_some_and(|t| floor <= p && p <= commit.min(t)) && agreed(i)
-                        };
-                        let newest = AT
-                            .iter()
-                            .enumerate()
-                            .filter(|&(i, &p)| ok(i, p))
-                            .map(|(_, &p)| p)
-                            .max();
-                        match got {
+                        let want = through.is_some_and(|t| s <= t) && AT.contains(&s);
+                        match check_install_set(&body, through, &sets) {
                             Ok((l, e)) => {
                                 oks += 1;
-                                let t = through.expect("Ok only with a registered tier");
-                                assert!(floor <= l.position, "{floor} {commit} {through:?}");
-                                assert!(l.position <= commit.min(t));
-                                assert!(e.is_agreed() && e.position == l.position);
-                                assert_eq!(Some(l.position), newest, "the newest such");
+                                assert!(want, "{floor} {commit} {s} {through:?}");
+                                let t = through.unwrap();
+                                assert_eq!(l.position, s);
+                                assert!(floor <= s && s <= commit.min(t));
+                                assert_eq!(e.position, s);
+                                assert!(e.is_agreed(), "the body's verdict is agreed");
                             }
                             Err(TierInstallReason::NotRegistered) => assert!(through.is_none()),
                             Err(TierInstallReason::NoSet) => {
-                                assert!(through.is_some());
-                                assert_eq!(newest, None, "{floor} {commit} {through:?} {mask}");
+                                assert!(
+                                    through.is_some() && !want,
+                                    "{floor} {commit} {s} {through:?}"
+                                );
                             }
                             Err(r) => panic!("unexpected reason {r:?}"),
                         }
@@ -890,24 +937,53 @@ pub(crate) mod tests {
                 }
             }
         }
-        assert_eq!(cases, 16 * 91 * 14);
-        assert!(oks > 0, "the space is not vacuous");
+        assert!(oks > 0 && refused_by_reader > 0 && cases > 0, "non-vacuous");
     }
 
     #[test]
-    fn choose_install_set_refuses_an_unregistered_tier() {
+    fn check_install_set_refuses_an_unregistered_tier() {
         let sets = [label_at(5)];
-        let catalog = [catalog_at(5, true)];
+        let body = body_at(0, 10, 5);
         assert_eq!(
-            choose_install_set(0, 10, None, &sets, &catalog).err(),
+            check_install_set(&body, None, &sets).err(),
             Some(TierInstallReason::NotRegistered),
-            "a set in range does not make an unregistered tier servable"
+            "the named set in the tier does not make an unregistered tier servable"
         );
         assert_eq!(
-            choose_install_set(0, 10, Some(10), &sets, &catalog)
+            check_install_set(&body, Some(10), &sets)
                 .map(|(l, _)| l.position)
                 .ok(),
             Some(5)
+        );
+        assert_eq!(
+            check_install_set(&body, Some(4), &sets).err(),
+            Some(TierInstallReason::NoSet),
+            "never past the registered through"
+        );
+    }
+
+    /// Ruling D8 with the leader as the authority: a body built from the
+    /// catalog verdict accepts the matching `SET`; one whose carried version
+    /// (or hash) disagrees with the tier's `SET` is `Verify` before any copy.
+    #[test]
+    fn check_install_set_verifies_the_set_against_the_carried_verdict() {
+        let fx = set_fx(false);
+        let body = body_for(&fx, 0, 8000);
+        let (l, e) =
+            check_install_set(&body, Some(8000), std::slice::from_ref(&fx.label)).expect("matches");
+        assert_eq!(l, fx.label);
+        assert!(label_matches_catalog(&l, &e));
+        let mut v = body;
+        v.row_version[2] += 1;
+        assert_eq!(
+            check_install_set(&v, Some(8000), std::slice::from_ref(&fx.label)).err(),
+            Some(TierInstallReason::Verify)
+        );
+        let mut h = body;
+        h.cluster_hash ^= 1;
+        assert_eq!(
+            check_install_set(&h, Some(8000), std::slice::from_ref(&fx.label)).err(),
+            Some(TierInstallReason::Verify)
         );
     }
 }

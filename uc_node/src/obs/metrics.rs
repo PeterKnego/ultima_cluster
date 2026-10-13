@@ -1112,7 +1112,7 @@ fn push_service_families(out: &mut String, s: &ObsSources, commit: u64, now: u64
     push_labeled(
         out,
         "uc2_tier_install_total",
-        "TIER_INSTALL requests (backup-tier 3b spec §6.3/§6.6) by outcome: installed (this below-floor node installed a set from its own tier) and declined (it answered declined — no source, no set in range, an unregistered tier, or a copy that failed verification), both counted by the follower.",
+        "TIER_INSTALL requests (backup-tier 3b spec §6.3/§6.6) by outcome: installed (this below-floor node installed a set from its own tier) and declined (it answered declined — no source, the named set absent from its tier, an unregistered tier, or a set that failed verification against the leader's carried verdict), both counted by the follower.",
         "counter",
         &[
             (

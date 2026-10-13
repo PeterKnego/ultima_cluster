@@ -268,7 +268,7 @@ pub fn uc_protocol_datagram() -> Vec<Seed> {
         seeds.push(Seed::fixed("23-backup-report", datagram(DGRAM_KIND_BACKUP_REPORT, 0, 3, &b)));
     }
 
-    // Backup tier 3b spec §6.3: TIER_INSTALL (16 B) and TIER_INSTALL_STATUS (24 B).
+    // Backup tier 3b spec §6.3: TIER_INSTALL (200 B) and TIER_INSTALL_STATUS (24 B).
     {
         use uc_protocol::v2::datagram::{
             DGRAM_KIND_TIER_INSTALL, DGRAM_KIND_TIER_INSTALL_STATUS, TIER_INSTALL_BODY_LEN,
@@ -276,7 +276,19 @@ pub fn uc_protocol_datagram() -> Vec<Seed> {
             TierInstallStatusBody, write_tier_install_body, write_tier_install_status_body,
         };
         let mut b = [0u8; TIER_INSTALL_BODY_LEN];
-        write_tier_install_body(&mut b, &TierInstallBody { floor: 65536, commit: 131072 });
+        write_tier_install_body(
+            &mut b,
+            &TierInstallBody {
+                floor: 65536,
+                commit: 131072,
+                s: 98304,
+                row_hash: [0x5eed_0001, 0, 0x5eed_0002, 0, 0, 0, 0, 0],
+                row_version: [0x0001_0000, 0, 0x0001_0000, 0, 0, 0, 0, 0],
+                row_size: [4096, 0, 8192, 0, 0, 0, 0, 0],
+                cluster_hash: 0x5eed_00c1,
+                cluster_size: 512,
+            },
+        );
         seeds.push(Seed::fixed("24-tier-install", datagram(DGRAM_KIND_TIER_INSTALL, 0, 3, &b)));
         let mut s = [0u8; TIER_INSTALL_STATUS_BODY_LEN];
         write_tier_install_status_body(

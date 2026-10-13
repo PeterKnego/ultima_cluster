@@ -278,11 +278,12 @@ pub enum NetEvent {
     /// Backup-tier 3b spec §6.3 (kind 28): the leader asks this below-floor
     /// follower to install from its own tier. Term-gated like `SnapRedirect`.
     /// `from` is the datagram's source address (present with crypto on or
-    /// off); the node checks it is the leader.
+    /// off); the node checks it is the leader. The body (200 B: the set S
+    /// and the leader's catalog verdict for it) is boxed so this rare event
+    /// does not widen every `NetEvent` on the route.
     TierInstall {
         from: SocketAddr,
-        floor: u64,
-        commit: u64,
+        body: Box<uc_protocol::v2::datagram::TierInstallBody>,
     },
 }
 
@@ -2534,8 +2535,7 @@ impl FollowerReceiver {
                 if let Some(b) = read_tier_install_body(&d[DATAGRAM_HEADER_LEN..]) {
                     let ev = NetEvent::TierInstall {
                         from,
-                        floor: b.floor,
-                        commit: b.commit,
+                        body: Box::new(b),
                     };
                     let idx = ev.kind_idx();
                     if self.route.try_send(ev).is_err() {
@@ -5206,34 +5206,38 @@ mod tests {
         r.set_sender_route(ctx);
         let to = r.local_addr();
 
+        let sent = TierInstallBody {
+            floor: 4096,
+            commit: 8192,
+            s: 6144,
+            row_hash: [0x51, 0, 0, 0, 0, 0, 0, 0],
+            row_version: [7, 0, 0, 0, 0, 0, 0, 0],
+            row_size: [100, 0, 0, 0, 0, 0, 0, 0],
+            cluster_hash: 0xC1,
+            cluster_size: 50,
+        };
         let mut body = [0u8; TIER_INSTALL_BODY_LEN];
-        write_tier_install_body(
-            &mut body,
-            &TierInstallBody {
-                floor: 4096,
-                commit: 8192,
-            },
-        );
+        write_tier_install_body(&mut body, &sent);
         leader.send(to, DGRAM_KIND_TIER_INSTALL, 0, TERM, &body);
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             assert!(Instant::now() < deadline, "TIER_INSTALL never routed");
             r.do_work();
-            if let Ok(NetEvent::TierInstall {
-                from,
-                floor,
-                commit,
-            }) = rx.try_recv()
-            {
-                assert_eq!((from, floor, commit), (leader.addr(), 4096, 8192));
+            if let Ok(NetEvent::TierInstall { from, body }) = rx.try_recv() {
+                assert_eq!((from, *body), (leader.addr(), sent));
                 break;
             }
         }
         // Stale term, floor > commit, and a short body all yield nothing.
         leader.send(to, DGRAM_KIND_TIER_INSTALL, 0, TERM + 1, &body);
         let mut bad = [0u8; TIER_INSTALL_BODY_LEN];
-        bad[0..8].copy_from_slice(&9000u64.to_le_bytes());
-        bad[8..16].copy_from_slice(&8192u64.to_le_bytes());
+        write_tier_install_body(
+            &mut bad,
+            &TierInstallBody {
+                floor: 9000,
+                ..sent
+            },
+        );
         leader.send(to, DGRAM_KIND_TIER_INSTALL, 0, TERM, &bad);
         leader.send(to, DGRAM_KIND_TIER_INSTALL, 0, TERM, &body[..15]);
 
