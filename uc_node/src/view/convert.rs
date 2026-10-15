@@ -67,6 +67,11 @@ pub type UpgradeParts = (
     [Option<RowRunning>; CNC_MAX_SERVICES],
 );
 
+/// The pins, reports and running records the document carries, back in the
+/// domain types. They round-trip PER ROW only: the document is grouped by
+/// row, while `ClusterState::pins`/`reports` are commit-ordered across rows,
+/// so the cross-row order is not recovered — which is all `upgrade show`
+/// (a per-row renderer) needs.
 pub fn upgrade(rows: &[UpgradeRowView]) -> UpgradeParts {
     let mut pins = Vec::new();
     let mut reports = Vec::new();

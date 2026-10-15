@@ -180,11 +180,10 @@ transport setting, both measured closed-loop at inflight 1 on 8-vCPU
   remedy is unchanged: re-run `uc2ctl schedule apply`.
 - **What settings is this cluster running?** `uc2ctl settings show` prints the
   committed `admission_bytes`, `fsm_lag`, `snapshot_interval_bytes` and
-  `snapshot_target` out of the newest cluster artifact; change them with
+  `snapshot_target` out of the running node's live cluster view (the newest
+  cluster artifact when the node is stopped); change them with
   `uc2ctl settings apply <file.toml>` (admin op 7, refusals 44–47, audited as
-  `settings_apply`). `[settings]` in `node.toml` seeds genesis only. Both
-  `show` commands read a **file**, so they lag the live view and say
-  `no cluster artifact yet` until the first snapshot instant completes.
+  `settings_apply`). `[settings]` in `node.toml` seeds genesis only.
 - **What command size can this cluster carry?** `uc2ctl status` prints one
   `ceiling:` line — `ceiling: 8864 B (rung 8960, discovered)` or
   `ceiling: 1344 B (rung 1408, baseline)`. The ceiling is the live cnc word at
@@ -225,19 +224,29 @@ transport setting, both measured closed-loop at inflight 1 on 8-vCPU
   every install source. A node's own effective floor is the newest agreed
   set it actually holds, which can sit below the cluster-wide one — the
   normal state of a voter on a learner-only cluster (`snapshot_target =
-  "learners"`), not a stall. Today there is no live read of the catalog
-  itself (that is project 4 — the live-read mechanism and an AI-friendly
-  JSON shape are both open); what exists now is five gauges on `/metrics`:
-  `uc2_catalog_sets` (how many sets are listed), `uc2_catalog_agreed_position`
-  (the cluster floor), `uc2_catalog_empty` (`1` while no set has ever
-  completed — the flag-day/genesis fallback window, during which the floor and
-  retention both run on today's pre-catalog rule instead),
-  `uc2_catalog_stalled` and `uc2_catalog_diverged` (how many commanded or
-  disagreeing sets are visible). `Uc2SnapshotSetDiverged` now keys on
-  `uc2_catalog_diverged` rather than comparing per-node gauges directly.
-  `read_committed_catalog` (`uc_node::cluster_agent`) reads the same catalog
-  out of the newest cluster artifact, offline, for a future `uc2ctl catalog`
-  (also project 4; not shipped yet).
+  "learners"`), not a stall. **Read it live with `uc2ctl catalog`** (or `GET
+  /cluster` on `[metrics]`): every set with its state, `agreed`, per-row
+  verdicts and hashes, who holds it complete (on the leader), the backup
+  tiers, the purge gate, and this node's own holdings. When the node is
+  stopped the same command reads the newest cluster artifact and says so.
+  Fields and conventions: [The cluster view](../reference/cluster-view.md);
+  what each `attention` entry means and what to do: [Cluster view attention
+  codes](#cluster-view-attention-codes) below. The five gauges stay the
+  **alerting** surface: `uc2_catalog_sets` (how many sets are listed),
+  `uc2_catalog_agreed_position` (the cluster floor), `uc2_catalog_empty`
+  (`1` while no set has ever completed — the flag-day/genesis fallback
+  window, during which the floor and retention both run on today's
+  pre-catalog rule instead), `uc2_catalog_stalled` and `uc2_catalog_diverged`
+  (how many commanded or disagreeing sets are visible).
+  `Uc2SnapshotSetDiverged` keys on `uc2_catalog_diverged` rather than
+  comparing per-node gauges directly.
+- **What does the whole cluster look like right now?** `uc2ctl cluster
+  --instance-dir D --app-id A` prints membership, settings, the schedule
+  table, per-row upgrade state, the catalog, tiers, the purge gate, this
+  node's services and holdings, and an `attention` list; `--json` prints the
+  `uc2.cluster-view/1` document. Ask the **leader** for the per-member
+  holdings (`nodes`). Offline (node stopped) it reads the newest cluster
+  artifact and prints `offline: newest artifact at P`.
 
 ## Changing a running cluster
 
@@ -266,12 +275,12 @@ transport setting, both measured closed-loop at inflight 1 on 8-vCPU
   append. Every outcome is audited as `schedule_apply` (its `id`/`addr` fields
   render the digest, not an address). Applying **replaces the whole table** —
   to drop one entry, apply a file without it. Read the committed table back with
-  `uc2ctl schedule show`, which reads this node's newest cluster artifact under
-  `<instance_dir>/snapshots/cluster/`, and see the position on `uc2ctl
-  status`'s `config:` line as `schedule_position=`. Both lag the live view —
-  an artifact appears at a snapshot **instant** — so on a cluster that is not
-  snapshotting yet they say `no cluster artifact yet` and
-  `uc2_schedule_table_position` from `/metrics` is the live reading.
+  `uc2ctl schedule show`, which reads the running node's live cluster view
+  (this node's newest cluster artifact under
+  `<instance_dir>/snapshots/cluster/` when it is stopped), and see the
+  position on `uc2ctl status`'s `config:` line as `schedule_position=`, which
+  still reads the artifact and so lags until a snapshot **instant**;
+  `uc2_schedule_table_position` from `/metrics` is the live gauge.
 - **Take a snapshot** (2.11.0): `uc2ctl snapshot --instance-dir D
   --app-id A [--admin-key K] [--standby]` (admin op `8`, audited as
   `snapshot`). **Run it against the leader** — a follower answers `retry` (status `2`);
@@ -532,6 +541,42 @@ transport setting, both measured closed-loop at inflight 1 on 8-vCPU
   changing a proved kernel. *Was §9, §10.*
 - [Reproduce a published result](../how-to/reproduce-a-result.md) — gate
   binaries, fleet runs, and comparing honestly. *Was §8.*
+
+### Cluster view attention codes
+
+The `attention` list of `uc2ctl cluster` / `uc2ctl catalog` / `GET /cluster`
+names only conditions the node already detects. Each code, and what to do:
+
+- **`catalog_empty`.** No snapshot set has ever completed, so the purge floor
+  and retention run on the pre-catalog rule. Normal on a new cluster; take a
+  first instant with `uc2ctl snapshot` (or set `snapshot_interval_bytes`).
+  Same source as `uc2_catalog_empty`. Never raised from an offline read.
+- **`set_stalled`** (context `set`). A set was commanded and a newer one has
+  been commanded since, yet it never completed: some row or the cluster FSM
+  did not freeze it. Run `uc2ctl snapshot show` on each node and find the
+  row whose `newest=` trails; check that its service is attached
+  (`uc2ctl status`). The newest commanded set is "in progress", not
+  stalled, so this differs from `uc2_catalog_stalled`, which counts every
+  commanded entry. Alert: `Uc2SnapshotStalled`.
+- **`set_diverged`** (context `set`, `row`). Replicas reported different
+  artifact hashes for that row (`"cluster"` is the cluster artifact). The set
+  is not `agreed`, so it cannot become the floor or an install source. Treat
+  the minority replica as divergent; run `uc2ctl upgrade show` and compare
+  `artifact_hash=` per node in `uc2ctl status`. Alert:
+  `Uc2SnapshotSetDiverged`.
+- **`purge_gate_released`.** This node ran low on disk and let go of the
+  backup-gated purge hold, so it purged journal that fewer than K tiers
+  confirm. See `Uc2BackupGateReleased` under [When something is
+  wrong](#when-something-is-wrong).
+- **`tier_behind`** (context `tier`, `lag_bytes`). That tier's confirmed
+  `through` trails this node's commit by more than 256 MiB. See
+  `Uc2BackupBehind` under [When something is wrong](#when-something-is-wrong);
+  unlike the alert there is no 15-minute hold, so a brief spike shows here
+  first.
+- **`node_stale`** (context `node`; leader's document only). The leader has
+  not heard that member's holdings for more than three maximum election
+  timeouts (or never). Check the member's reachability and that it is running
+  (`uc2ctl status` on it); `nodes[].holdings` for it is old or `null`.
 
 ## Look-up
 

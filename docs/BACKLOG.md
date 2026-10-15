@@ -153,11 +153,11 @@ to point at "§ 2a" for these residuals now point here.*
   Deliberately not the primary form — it turns a schedule edit into a rolling
   edit plus a leader change.
 - **New in the cluster-FSM shape, and worth a line each.**
-  `uc2ctl schedule show` / `settings show` / `status`'s `schedule_position=`
-  read the newest **cluster artifact**, a file beside the running node, so
-  they lag the live view and say "no cluster artifact yet" until the first
-  snapshot instant completes; a live reading needs the
-  response-on-the-egress-broadcast path the design left to a phase 2. (Three
+  `uc2ctl status`'s `schedule_position=` still reads the newest **cluster
+  artifact**, a file beside the running node, so it lags the live view and
+  reads `none` until the first snapshot instant completes (`schedule show`,
+  `settings show` and `upgrade show` read the live cluster view since
+  project 4). (Three
   other residuals listed here were closed by plan 1's pre-final pass:
   `uc2ctl backup` now carries `snapshots/cluster/`;
   `uc2_cluster_fsm_position` and `uc2_settings_position` are exported; and
@@ -435,12 +435,21 @@ reviewer wants a workload to attack.
   measure the archive hop alone with and without per-block zstd before
   deciding — it would also change the on-disk block format (a flag day).
   Recorded 2026-10-10.
-- **Project 4 (not this spec): the operator / AI surface.** A live read of
-  the catalog that does not wait for the first cluster artifact (today only
-  `read_committed_catalog`'s offline read and five `/metrics` gauges exist),
-  `uc2ctl catalog`, and a JSON shape meant for an AI to read —
-  [spec §2 "Out"](superpowers/specs/2026-10-01-uc2-snapshot-catalog-design.md#2-scope),
-  §6.3 and §12.
+- **Project 4 — the operator / AI surface: SHIPPED** (unreleased; `2.14.0`).
+  The live cluster view (`GET /cluster`, `<instance_dir>/obs.sock`, `uc2ctl
+  cluster`/`catalog`, live `settings`/`schedule`/`upgrade show`) is documented
+  in [The cluster view](reference/cluster-view.md); spec
+  [`2026-10-14-uc2-cluster-view-design.md`](superpowers/specs/2026-10-14-uc2-cluster-view-design.md).
+- **Admin writes over HTTP (for a GUI).** The cluster view is read-only; a GUI
+  that also changes the cluster needs a write path that does not exist.
+  Open questions: how a remote request is authenticated (the admin band's
+  HMAC signature is bound to a local `cnc2.dat` and its `instance_id`, so a
+  remote signed request needs its own canonical form); replay protection
+  across a network hop (`seq` monotonicity is per node); TLS (the metrics
+  listener is cleartext and unauthenticated by design); and CORS — whether a
+  browser GUI talks to the nodes directly or a GUI backend polls them, which
+  is the shape the read surface already assumes. Taken from the cluster-view
+  spec §9.
 - **FIXED (#95, 2026-10-10): a whole-cluster cold restart never committed.**
   Reproduced on `main` with explicit AND default `fsm_lag` (`uc_node/tests/cold_restart.rs`):
   - At boot every row's `applied` reads `0`, so each node capped its durable reports at `0 + fsm_lag`.

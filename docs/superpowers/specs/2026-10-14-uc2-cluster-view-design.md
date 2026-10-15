@@ -288,3 +288,90 @@ attack-surface.md`, `threat-model.md` get the entry):
 - Release (`2.14.0`): one `RELEASES.md` bullet linking the reference page;
   the `docs/releases.md` entry notes the always-on obs thread and the new
   instance-dir file.
+
+#### Errata (planning, 2026-10-14)
+
+Planning rulings (the plan's PR1–PR13) and execution rulings that amend the
+text above.
+
+- **PR1** — the soft table reaches the obs thread through two new `ObsSources`
+  fields, `soft_wire: Arc<Mutex<uc_net::SoftTableWire>>` and `soft_stale_ns:
+  u64`; `soft_table_from_wire` and `addr_of` in `node.rs` become
+  `pub(crate)`; every struct-literal `ObsSources { .. }` site is updated.
+- **PR2** — `stalled` on a set means "commanded and superseded": `state ==
+  Commanded` and a NEWER entry exists. That is the condition
+  `Uc2SnapshotStalled` keys on; `CatalogQuery::stalled(timeout)` has no
+  production caller and no timeout constant exists, so the view invents none.
+  The newest commanded set is in progress, not stalled.
+- **PR3** — `tier_behind` uses a new Rust constant `TIER_BEHIND_BYTES = 256
+  MiB`, pinned to the alert file's `uc2_backup_lag_bytes > 268435456` by a
+  test. Tier `lag_bytes` is `commit - through` against THIS node's commit, on
+  every node (the metric stays leader-only; the header's `commit` says whose
+  commit was used); `null` offline.
+- **PR4** — schedule entries name their row by matching `identity_hash`
+  against the row names (live: `cnc.service_names()`; offline: a readable
+  stale `cnc2.dat`), `null` when no name matches.
+- **PR5** — `view_position` is `ClusterView::consumed`, read separately from
+  `to_state()` (whose `applied` is the view tag `position`). Offline: the
+  artifact's position.
+- **PR6** — `purge_gate.position` is `null` when K = 0; otherwise
+  `tier::gate_position(k, tiers)` verbatim, which is `0` ("holds every
+  purge") when fewer than K tiers report. A `tiers_reporting` count is added
+  so `0` is self-explaining.
+- **PR7** — `joined` mirrors `uc_service::attach::node_booting`: `joined =
+  !(services_declared == 0 && any row name is Some)`.
+- **PR8** — `uc2ctl cluster`/`catalog` take the existing `CommonArgs`, so
+  `--app-id` is required as for every other subcommand; it names the
+  `cnc2.dat` used for liveness and offline row names.
+- **PR9** — the show commands render through the view: `settings show`,
+  `schedule show` and `upgrade show` fetch the document (live, else offline),
+  convert its sub-objects back to the domain types with
+  `uc_node::view::convert`, and print through their EXISTING renderers, so
+  the text is identical by construction. The model is therefore lossless for
+  those three sub-objects (packed versions, exact ns as strings).
+- **PR10** — when the live read is unavailable but the instance lock is held,
+  `cluster`/`catalog` print `node running but its obs socket is not bound
+  (starting, or not run by uc2-node)` (spec §6.3 said `node starting, obs
+  socket not yet bound`) and exit non-zero; the three show commands fall back
+  to the offline document silently.
+- **PR11** — end-to-end content tests run in-process `Node`s (the
+  `uc_node/tests/catalog.rs` harness) and call
+  `view::render_live(&node.observability())`; the socket is tested against
+  one real daemon (`lifecycle.rs`) and in `uc_ctl` tests that bind an
+  `ObsServer` themselves. No 3-daemon harness is built. The registered-tier
+  end-to-end test (spec §8) likewise runs in-process via
+  `Node::offer_backup_claim_for_test`, not through daemons.
+- **PR12** — RFC 3339 rendering is a new public `uc_obs::time::rfc3339_ns`
+  (`uc_obs` is the dependency-free leaf both daemons share).
+  `uc_obs::time::civil_from_days` is public too and shared with `uc_ctl`.
+  `uc_ctl`'s private second-precision helper stays as is.
+- **PR13** — offline row names come from a stale `cnc2.dat` when it opens;
+  otherwise names are `null`. Offline membership comes from the artifact.
+- **P7** — `settings.admission_bytes`, `snapshot_interval_bytes`,
+  `backup_retain_age_secs` and `fsm_lag.bytes` are decimal strings
+  (`DecU64`), because the admin door accepts values up to `u64::MAX - 1` and
+  no JSON number may exceed 2^53.
+- **P8** — the leader's `nodes` lists every committed member; one it has
+  never heard from has `holdings: null`, `age_ms: null`, `stale: true`.
+- **P13** — the three show commands print `offline: newest artifact at P` on
+  STDERR when they used the offline document; stdout is unchanged.
+- **P14** — `set_stalled` (commanded and superseded by a newer entry, PR2)
+  differs from the `uc2_catalog_stalled` gauge, which counts every commanded
+  entry including the in-progress newest one.
+- **P15** — the embedder entry point is `uc_node::view::render_live(&ObsSources)`
+  (§6.1 said `render`).
+- **P16** — `cluster --json` prints the node's body verbatim (§6.3 holds);
+  `catalog --json` filters the parsed JSON value, so unknown fields survive,
+  and prints the storage sub-object under the same `schema`.
+- **P19** — `self.services` is empty until the node has joined.
+- **P28** — the offline document is cut from the newest artifact at P, which
+  records its own set P as `commanded` (P's completion commits after P). So
+  offline `empty`, `floor` and the newest set's `state` trail by one set; the
+  offline document never raises `catalog_empty`; offline text marks that set
+  "(cut at this artifact; its completion is not visible offline)".
+- Release entries (`RELEASES.md`, `docs/releases.md`, §9's last bullet) are
+  written at the `2.14.0` cut, not on this branch.
+
+#### Errata (as built)
+
+(added by the final review)
