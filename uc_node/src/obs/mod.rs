@@ -15,6 +15,7 @@ use uc_protocol::v2::cnc::CNC_MAX_SERVICES;
 
 pub mod http;
 pub mod metrics;
+pub mod socket;
 
 pub use metrics::SnapshotFreezeStats;
 

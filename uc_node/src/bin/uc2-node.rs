@@ -150,25 +150,34 @@ fn main() -> ExitCode {
     );
 
     let obs = node.observability();
-    let mut srv: Option<ObsServer> = None;
-    if let Some(addr) = opts.obs.metrics_bind {
-        match ObsServer::serve(obs.clone(), addr) {
-            Ok(s) => {
-                let url = format!("http://{}/metrics", s.local_addr());
-                uc_node::obs_event!(
-                    Info,
-                    "metrics_listening",
-                    node = id as u64,
-                    url = url.as_str()
-                );
-                srv = Some(s);
-            }
-            Err(e) => {
-                eprintln!("uc2-node: failed to bind observability endpoint {addr}: {e}");
-                node.stop();
-                return ExitCode::from(1);
-            }
+    // Cluster view (project 4): the obs server always runs — the unix socket
+    // in the instance dir (bound after `Node::start_with` took
+    // `instance.lock`, so replacing a stale socket file is safe) and the TCP
+    // listener when `[metrics]` is configured.
+    let srv = match ObsServer::serve_on(obs.clone(), opts.obs.metrics_bind, Some(&instance_dir)) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("uc2-node: failed to start the observability endpoint: {e}");
+            node.stop();
+            return ExitCode::from(1);
         }
+    };
+    let sock = instance_dir.join(uc_node::obs::socket::OBS_SOCKET_FILE);
+    let sock_str = sock.display().to_string();
+    uc_node::obs_event!(
+        Info,
+        "obs_socket_listening",
+        node = id as u64,
+        path = sock_str.as_str()
+    );
+    if let Some(addr) = srv.tcp_addr() {
+        let url = format!("http://{addr}/metrics");
+        uc_node::obs_event!(
+            Info,
+            "metrics_listening",
+            node = id as u64,
+            url = url.as_str()
+        );
     }
 
     // Derived-events pass: how often (every 10th 100ms tick, ~1s) and how
@@ -296,11 +305,9 @@ fn main() -> ExitCode {
     }
 
     uc_node::obs_event!(Info, "draining", node = id as u64);
-    if let Some(srv) = srv {
-        // Scrapes must not race teardown: stop the HTTP thread before the
-        // agents it reads through start winding down.
-        srv.stop();
-    }
+    // Scrapes must not race teardown: stop the HTTP thread before the
+    // agents it reads through start winding down. This also unlinks obs.sock.
+    srv.stop();
     match node.stop_draining(Duration::from_secs(args.drain_timeout_secs)) {
         DrainOutcome::Drained => {
             uc_node::obs_event!(Info, "stopped", node = id as u64, outcome = "drained");

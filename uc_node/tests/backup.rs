@@ -368,6 +368,40 @@ fn backup_of_a_stopped_node_verifies_and_reports_positions() {
     );
 }
 
+/// Cluster view: `obs.sock` is a live node's door, not state — a backup
+/// (here of a dir a killed node left one in) never copies it.
+#[test]
+fn backup_never_copies_the_obs_socket() {
+    let _serialize_guard = serialize();
+    let root = scratch();
+    let dir = root.path().join("n0");
+    let node = start_node(&dir, "backup-obs", PurgePolicy::Disabled);
+    drive_and_quiesce(&node, 200);
+    match node.stop_draining(Duration::from_secs(10)) {
+        uc_node::DrainOutcome::Drained => {}
+        other => panic!("expected Drained, got {other:?}"),
+    }
+    drop(uc_node::obs::socket::bind(&dir).unwrap()); // leaves obs.sock behind
+    assert!(dir.join("obs.sock").exists());
+    let out = root.path().join("backup-obs-out");
+    backup_instance(&dir, &out).expect("backup_instance");
+    let mut stack = vec![out.clone()];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).unwrap() {
+            let p = e.unwrap().path();
+            assert_ne!(
+                p.file_name().unwrap(),
+                "obs.sock",
+                "{} was copied",
+                p.display()
+            );
+            if p.is_dir() {
+                stack.push(p);
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------- Test 2
 
 #[test]

@@ -7,9 +7,13 @@
 //! `CAN_SERVE`) is NOT ready, even though the naive probe ("is this node the
 //! leader?") would say yes.
 //!
-//! `std`-only: no tokio, no HTTP crate. One thread ("uc2-obs"), a
-//! `TcpListener` polled non-blocking on a 100 ms cadence so [`ObsServer::stop`]
-//! is prompt, GET-only, `Connection: close` (no keep-alive). The handler only
+//! `std`-only: no tokio, no HTTP crate. One thread ("uc2-obs") polling up to
+//! two non-blocking listeners on a 100 ms cadence so [`ObsServer::stop`] is
+//! prompt: the `[metrics]` `TcpListener` when one is configured, and (cluster
+//! view, project 4) the always-on unix socket `<instance_dir>/obs.sock`
+//! ([`super::socket`]). Both doors serve the same router — `/metrics`,
+//! `/healthz`, `/readyz` and `/cluster` — GET-only, `Connection: close` (no
+//! keep-alive). The handler only
 //! reads through [`ObsSources`]'s `Arc`s and atomics — it shares no lock with
 //! the hot-path agents and cannot perturb them.
 //!
@@ -19,10 +23,14 @@
 //! not just a per-`read()`-call timeout: a client that trickles bytes just
 //! often enough to keep dodging each individual read's timeout would
 //! otherwise stall every other client (and [`ObsServer::stop`]) for as long
-//! as it kept trickling.
+//! as it kept trickling. Both doors get the same deadlines: `/cluster` can
+//! outgrow a unix socket's send buffer, so a unix client that never reads is
+//! the same write-side stall risk a TCP one is.
 
 use std::io::{self, ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -67,23 +75,72 @@ const READ_TIMEOUT: Duration = Duration::from_secs(1);
 /// that never reads its response is the same stall risk on the write side.
 const CONN_DEADLINE: Duration = Duration::from_secs(2);
 
-/// A running observability HTTP server: one thread, one `TcpListener`, no
-/// other state shared with the node's hot path beyond the read-only
-/// [`ObsSources`] bundle handed to [`ObsServer::serve`].
+/// A stream one connection is served over: the TCP door or the unix door.
+/// Exists so [`handle_conn`]/[`write_response`] — and with them the read and
+/// write deadlines — are ONE code path for both.
+trait Conn: Read + Write {
+    fn set_read_timeout(&self, d: Option<Duration>) -> io::Result<()>;
+    fn set_write_timeout(&self, d: Option<Duration>) -> io::Result<()>;
+}
+
+impl Conn for TcpStream {
+    fn set_read_timeout(&self, d: Option<Duration>) -> io::Result<()> {
+        TcpStream::set_read_timeout(self, d)
+    }
+    fn set_write_timeout(&self, d: Option<Duration>) -> io::Result<()> {
+        TcpStream::set_write_timeout(self, d)
+    }
+}
+
+impl Conn for UnixStream {
+    fn set_read_timeout(&self, d: Option<Duration>) -> io::Result<()> {
+        UnixStream::set_read_timeout(self, d)
+    }
+    fn set_write_timeout(&self, d: Option<Duration>) -> io::Result<()> {
+        UnixStream::set_write_timeout(self, d)
+    }
+}
+
+/// A running observability HTTP server: one thread, up to two listeners
+/// (TCP and the unix socket), no other state shared with the node's hot path
+/// beyond the read-only [`ObsSources`] bundle handed to
+/// [`ObsServer::serve_on`].
 pub struct ObsServer {
     thread: Option<JoinHandle<()>>,
     stop: Arc<AtomicBool>,
-    local_addr: SocketAddr,
+    local_addr: Option<SocketAddr>,
+    unix_path: Option<PathBuf>,
 }
 
 impl ObsServer {
-    /// Bind `bind` and start serving `/metrics`, `/healthz`, `/readyz` on a
-    /// dedicated "uc2-obs" thread. Binds NOW — a port conflict or permission
-    /// error surfaces here, at startup, not silently on the first scrape.
+    /// Bind `bind` and start serving on TCP only — [`ObsServer::serve_on`]
+    /// with no unix socket. Binds NOW — a port conflict or permission error
+    /// surfaces here, at startup, not silently on the first scrape.
     pub fn serve(sources: ObsSources, bind: SocketAddr) -> io::Result<ObsServer> {
-        let listener = TcpListener::bind(bind)?;
-        listener.set_nonblocking(true)?;
-        let local_addr = listener.local_addr()?;
+        ObsServer::serve_on(sources, Some(bind), None)
+    }
+
+    /// Bind the TCP listener at `tcp` (if any) and the unix socket
+    /// `<unix_dir>/obs.sock` (if any — the caller must hold that dir's
+    /// `instance.lock`, since a stale socket file is replaced), then serve
+    /// both from one "uc2-obs" thread. Both binds happen NOW, so either
+    /// failure surfaces at startup.
+    pub fn serve_on(
+        sources: ObsSources,
+        tcp: Option<SocketAddr>,
+        unix_dir: Option<&Path>,
+    ) -> io::Result<ObsServer> {
+        let tcp = match tcp {
+            Some(bind) => {
+                let l = TcpListener::bind(bind)?;
+                l.set_nonblocking(true)?;
+                Some(l)
+            }
+            None => None,
+        };
+        let local_addr = tcp.as_ref().map(|l| l.local_addr()).transpose()?;
+        let unix = unix_dir.map(super::socket::bind).transpose()?;
+        let unix_path = unix_dir.map(|d| d.join(super::socket::OBS_SOCKET_FILE));
 
         let stop = Arc::new(AtomicBool::new(false));
         let stop_thread = Arc::clone(&stop);
@@ -93,36 +150,70 @@ impl ObsServer {
             .spawn(move || {
                 let sources = sources;
                 while !stop_thread.load(Ordering::Acquire) {
-                    match listener.accept() {
-                        Ok((stream, _peer)) => handle_conn(stream, &sources),
-                        Err(e) if e.kind() == ErrorKind::WouldBlock => thread::sleep(ACCEPT_POLL),
-                        // Any other accept error (e.g. a transient EMFILE) is not
-                        // fatal to the server loop — back off the same as an
-                        // empty poll and try again.
-                        Err(_) => thread::sleep(ACCEPT_POLL),
+                    let mut served = false;
+                    // Any accept error — WouldBlock (nothing pending) or a
+                    // transient one such as EMFILE — is an empty poll: not
+                    // fatal to the loop, back off and try again.
+                    if let Some(l) = &tcp
+                        && let Ok((s, _)) = l.accept()
+                    {
+                        let _ = s.set_nonblocking(false);
+                        handle_conn(s, &sources);
+                        served = true;
+                    }
+                    if let Some(l) = &unix
+                        && let Ok((s, _)) = l.accept()
+                    {
+                        let _ = s.set_nonblocking(false);
+                        handle_conn(s, &sources);
+                        served = true;
+                    }
+                    if !served {
+                        thread::sleep(ACCEPT_POLL);
                     }
                 }
-            })?;
+            });
+        let thread = match thread {
+            Ok(t) => t,
+            Err(e) => {
+                if let Some(p) = &unix_path {
+                    let _ = std::fs::remove_file(p);
+                }
+                return Err(e);
+            }
+        };
 
         Ok(ObsServer {
             thread: Some(thread),
             stop,
             local_addr,
+            unix_path,
         })
     }
 
-    /// The bound address — meaningful when `serve` was called with port 0.
-    pub fn local_addr(&self) -> SocketAddr {
+    /// The TCP listener's bound address, when one was served (meaningful
+    /// when bound with port 0).
+    pub fn tcp_addr(&self) -> Option<SocketAddr> {
         self.local_addr
     }
 
-    /// Signal the accept loop to stop and join its thread. Returns once the
-    /// thread has actually exited (bounded by the 100 ms accept-poll
-    /// cadence plus at most one in-flight connection's handling time).
+    /// The TCP listener's bound address. Panics on a server started without
+    /// TCP — use [`ObsServer::tcp_addr`] there.
+    pub fn local_addr(&self) -> SocketAddr {
+        self.tcp_addr().expect("served without TCP")
+    }
+
+    /// Signal the accept loop to stop and join its thread, then unlink the
+    /// socket file this server bound. Returns once the thread has actually
+    /// exited (bounded by the 100 ms accept-poll cadence plus at most one
+    /// in-flight connection's handling time).
     pub fn stop(mut self) {
         self.stop.store(true, Ordering::Release);
         if let Some(handle) = self.thread.take() {
             let _ = handle.join();
+        }
+        if let Some(p) = &self.unix_path {
+            let _ = std::fs::remove_file(p);
         }
     }
 }
@@ -135,7 +226,7 @@ impl ObsServer {
 /// A connection that never completes a request within [`CONN_DEADLINE`] is
 /// dropped outright (no response written) rather than routed on a partial
 /// buffer — the client got no bytes, same as if it had never connected.
-fn handle_conn(mut stream: TcpStream, sources: &ObsSources) {
+fn handle_conn<C: Conn>(mut stream: C, sources: &ObsSources) {
     let deadline = Instant::now() + CONN_DEADLINE;
 
     let mut buf = Vec::with_capacity(512);
@@ -310,7 +401,7 @@ fn first_dead_agent(sources: &ObsSources) -> Option<&'static str> {
         .map(|(name, _)| *name)
 }
 
-fn write_response(stream: &mut TcpStream, status: u16, content_type: &str, body: &str) {
+fn write_response<C: Conn>(stream: &mut C, status: u16, content_type: &str, body: &str) {
     let reason = match status {
         200 => "OK",
         404 => "Not Found",
@@ -390,5 +481,29 @@ mod tests {
              response — past its wall-clock write-timeout budget (CONN_DEADLINE={CONN_DEADLINE:?})"
         );
         drop(client);
+    }
+
+    /// Review focus 3 (cluster view): `/cluster` is the first route whose
+    /// body can outgrow a unix socket's send buffer (~411 KB worst case
+    /// against a ~208 KB default), and the unix door is served by the same
+    /// single-threaded loop as `/metrics`. A same-host client that asks for
+    /// it and never reads must cost at most the write deadline, not the
+    /// server. Driven over a real `UnixStream::pair()` with a multi-MiB body
+    /// so the write genuinely blocks: without a write timeout on the unix
+    /// stream this call never returns.
+    #[test]
+    fn a_client_that_never_reads_a_cluster_body_does_not_wedge_metrics() {
+        let (mut server_side, lazy) = std::os::unix::net::UnixStream::pair().expect("pair");
+        // `lazy` is held open and never read.
+        let body = "x".repeat(8 * 1024 * 1024);
+        let start = Instant::now();
+        write_response(&mut server_side, 200, "application/json", &body);
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < CONN_DEADLINE * 3,
+            "write_response held the obs thread {elapsed:?} against a unix client that never \
+             reads (CONN_DEADLINE={CONN_DEADLINE:?})"
+        );
+        drop(lazy);
     }
 }
