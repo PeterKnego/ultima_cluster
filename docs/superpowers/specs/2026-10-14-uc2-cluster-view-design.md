@@ -369,9 +369,31 @@ text above.
   offline `empty`, `floor` and the newest set's `state` trail by one set; the
   offline document never raises `catalog_empty`; offline text marks that set
   "(cut at this artifact; its completion is not visible offline)".
+- **P29** — amends the plan's Global Constraint "tier ids as 16 lowercase
+  hex digits with no prefix (`format!("{:016x}")`, as `uc2ctl tier show`
+  prints them)": `uc2ctl tier show` actually prints `0x` + 16 hex digits
+  (`{:#018x}`), and `tier forget --tier-id` parses an unprefixed string as
+  DECIMAL. The constraint's intent (match `tier show`) wins over its literal
+  format: tier ids are `"0x"` + 16 lowercase hex digits, like hashes.
 - Release entries (`RELEASES.md`, `docs/releases.md`, §9's last bullet) are
   written at the `2.14.0` cut, not on this branch.
 
 #### Errata (as built)
 
-(added by the final review)
+- **P29 (tier id format)** — `cluster.tiers[].id` and the `tier_behind`
+  attention's `tier` render `"0x"` + 16 lowercase hex digits, the form
+  `uc2ctl tier show` prints and `tier forget --tier-id` parses (the planning
+  bullet above records the amended Global Constraint).
+- **P30 (unknown is null)** — `self.holdings.free_bytes` (and every
+  `nodes[].holdings.free_bytes`) is `null` while it is
+  `auto_fetch::FREE_BYTES_UNKNOWN` (`0`, never a measurement), and a report
+  node's `size` is `null` when the report carries `0` ("unknown"), per §5's
+  "null, never a sentinel 0". `view::convert::upgrade` maps `null` back to
+  `0`, so `upgrade show` stays lossless (PR9). `journal_bytes` and
+  `snapshots_bytes` keep `0`: it is a real reading there (an empty journal,
+  an empty `snapshots/`), stated on the reference page.
+- **M1 (`view_position` is a lower bound)** — `gather` reads
+  `ClusterView::consumed` BEFORE `to_state()`. The cluster agent publishes
+  the view first and stores `consumed` last, so `view_position` is a lower
+  bound of the walk the rendered state reflects; it never claims more than
+  the document shows.

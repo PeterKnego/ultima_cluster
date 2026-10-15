@@ -652,7 +652,7 @@ catalog retain_sets=1 empty=false floor=1024
     kv verdict=agreed hash=0x00000000000000aa
     cluster verdict=agreed hash=0x00000000000000bb
 purge_gate requires_tiers=0 position=off tiers_reporting=0 released=false
-self journal_first=0 durable=0 free_bytes=0 journal_bytes=0 snapshots_bytes=0 sets_held=[1024]
+self journal_first=0 durable=0 free_bytes=unknown journal_bytes=0 snapshots_bytes=0 sets_held=[1024]
 node id=1 addr=127.0.0.1:7001 role=voter age_ms=0 stale=false durable=0
 node id=2 addr=127.0.0.1:7002 role=voter age_ms=100 stale=false durable=0
 node id=3 addr=127.0.0.1:7003 role=voter age_ms=5000 stale=true durable=0
@@ -660,6 +660,7 @@ membership config_version=3
   id=1 addr=127.0.0.1:7001 role=voter
   id=2 addr=127.0.0.1:7002 role=voter
   id=3 addr=127.0.0.1:7003 role=voter
+settings position=0 admission_bytes=0 fsm_lag=default snapshot_interval_bytes=0 snapshot_target=all retain_sets=1 auto_fetch=true backup_retain_sets=0 backup_retain_age_secs=0 purge_requires_tiers=0 datagram_mtu=0 (baseline)
 schedule entries=0 position=0
 upgrade row=kv running=unversioned pins=0
 service kv attached=true version=unversioned lag_bytes=0 pinned=false
@@ -667,7 +668,9 @@ attention {"code":"node_stale","node":3}
 ```
 
 The text uses the same words the JSON does (this sample is the leader's
-[example document](cluster-view.md#example)). `--json` prints the node's `/cluster` body **verbatim**, with only its
+[example document](cluster-view.md#example)); the `settings` line is exactly
+what [`settings show`](#settings-show) prints, at the settings record's own
+position, and a `null` in the document prints as `unknown` or `-`. `--json` prints the node's `/cluster` body **verbatim**, with only its
 `schema` checked; a node serving a different schema is refused by name (`the
 node serves cluster view schema … ; this uc2ctl reads uc2.cluster-view/1`).
 

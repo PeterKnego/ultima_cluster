@@ -26,8 +26,9 @@ the string however it likes.
 
 ## Conventions
 
-- **Hashes** are `"0x"` plus 16 lowercase hex digits. **Tier ids** are 16
-  lowercase hex digits with no prefix, as `uc2ctl tier show` prints them.
+- **Hashes** are `"0x"` plus 16 lowercase hex digits. **Tier ids** are the
+  same shape (`"0x"` plus 16 lowercase hex digits), as `uc2ctl tier show`
+  prints them and `uc2ctl tier forget --tier-id` takes them.
 - **`DecU64`**: a `u64` that can exceed 2^53 is a decimal **string**
   (`"18446744073709551615"`): `settings.admission_bytes`,
   `snapshot_interval_bytes`, `backup_retain_age_secs`, `fsm_lag.bytes`, a
@@ -114,7 +115,7 @@ One element per declared row.
 | `row`, `name` | The row id and its name (`null` when unknown). |
 | `pins[]` | Every pin on the row, oldest first: `{ from, to, origin }`. `from`/`to` are versions; `origin` is the pin's ORIGIN position. |
 | `running` | `{ version, record_pos }`: the row's committed running version and the position of the record that set it; `null` before any record. |
-| `report` | The row's live snapshot-hash verdict, or `null`: `{ position, verdict, majority_hash, minority, nodes[] }`. `verdict` is `"agreed"`, `"diverged"` or `"no_majority"`; `minority` lists node ids off the majority; `nodes[]` is `{ node, hash, size }`. |
+| `report` | The row's live snapshot-hash verdict, or `null`: `{ position, verdict, majority_hash, minority, nodes[] }`. `verdict` is `"agreed"`, `"diverged"` or `"no_majority"`; `minority` lists node ids off the majority; `nodes[]` is `{ node, hash, size }`, `size` `null` when the report carries none (a pre-lifecycle record). |
 
 A **version** is `{ text, packed }`: the text an operator reads
 (`unversioned`, or a `major.minor` form) and the packed word tools compare.
@@ -150,7 +151,7 @@ One element per registered backup tier (at most 4).
 
 | Field | Meaning |
 |---|---|
-| `id` | The tier id, 16 hex digits. |
+| `id` | The tier id, `"0x"` plus 16 lowercase hex digits. |
 | `oldest_set`, `newest_set` | The tier's watermark range of sets. |
 | `through` | The log position the tier confirms. |
 | `reporter` | The node that last reported the watermark. |
@@ -175,7 +176,13 @@ One element per registered backup tier (at most 4).
 
 **Holdings**: `journal_first`, `durable`, `commit`, `applied[]`
 (`{ row, name, applied }`), `free_bytes`, `journal_bytes`,
-`snapshots_bytes`, and `sets_held` — the set positions this node holds
+`snapshots_bytes`, and `sets_held`. `free_bytes` is `null` until the node's
+first successful free-space reading (a reading is never `0`).
+`journal_bytes` (an estimate from the archive's positions, rounded to whole
+segments) and `snapshots_bytes` are byte counts in which `0` is a real
+reading — an empty journal, an empty `snapshots/` — so they are never
+`null`; they also read `0` in the moment before the node's first disk
+probe, which runs as the node starts. `sets_held` — the set positions this node holds
 complete on disk. `sets_held` is `null` when the holdings were computed
 against a different catalog than the one rendered; such a node also appears
 in no `held_by`, rather than being mislabelled.
@@ -376,7 +383,7 @@ pins):
           "applied": 0
         }
       ],
-      "free_bytes": 0,
+      "free_bytes": null,
       "journal_bytes": 0,
       "snapshots_bytes": 0,
       "sets_held": [
@@ -416,7 +423,7 @@ pins):
             "applied": 0
           }
         ],
-        "free_bytes": 0,
+        "free_bytes": null,
         "journal_bytes": 0,
         "snapshots_bytes": 0,
         "sets_held": [
@@ -441,7 +448,7 @@ pins):
             "applied": 0
           }
         ],
-        "free_bytes": 0,
+        "free_bytes": null,
         "journal_bytes": 0,
         "snapshots_bytes": 0,
         "sets_held": [
@@ -466,7 +473,7 @@ pins):
             "applied": 0
           }
         ],
-        "free_bytes": 0,
+        "free_bytes": null,
         "journal_bytes": 0,
         "snapshots_bytes": 0,
         "sets_held": []
@@ -506,6 +513,14 @@ so find it from any node's `leader.addr`. A GUI should expect the leader to
 change, and treat a node's absence as a data point. The document discloses
 the same class of information as `/metrics` in more detail (member addresses,
 settings, hashes, disk figures); keep `[metrics]` on the ops network.
+
+The node serves both doors from **one thread**, one connection at a time. A
+connection's read phase is bounded by a 2 s wall-clock deadline, but the
+write phase is bounded per write call: a peer that reads a large `/cluster`
+body a little at a time, just often enough, can hold that thread — and with
+it every `/metrics`, `/healthz` and `/readyz` request — for several of those
+2 s periods. That is one more reason to keep `[metrics]` on the ops network
+and to poll the view at a scrape's pace, not in a tight loop.
 
 There are **no writes over HTTP**: changes still go through `uc2ctl` and the
 signed admin band. The open questions for an HTTP write path (authentication,

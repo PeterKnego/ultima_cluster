@@ -440,6 +440,15 @@ reviewer wants a workload to attack.
   cluster`/`catalog`, live `settings`/`schedule`/`upgrade show`) is documented
   in [The cluster view](reference/cluster-view.md); spec
   [`2026-10-14-uc2-cluster-view-design.md`](superpowers/specs/2026-10-14-uc2-cluster-view-design.md).
+- **`auto_fetch_candidates` pairs a catalog with a separately-read version.**
+  `uc_node/src/node.rs`'s `auto_fetch_candidates` takes the catalog from the
+  `ClusterViewInner` it is handed but loads `ClusterView::catalog_version`
+  from its own atomic, which `ClusterView::publish` stores after the catalog.
+  A read between the two pairs holders' `sets_held` bit indices with the
+  wrong set list — the same two-read race the cluster view fixed by deriving
+  the version from the catalog it renders. Candidate fix:
+  `catalog_version_of(&inner.catalog)`. Found in the cluster-view final
+  review, 2026-10-15; not reproduced.
 - **Admin writes over HTTP (for a GUI).** The cluster view is read-only; a GUI
   that also changes the cluster needs a write path that does not exist.
   Open questions: how a remote request is authenticated (the admin band's
