@@ -191,7 +191,7 @@ fn storage_text(doc: &ClusterViewDoc) -> String {
     for set in &c.sets {
         let _ = writeln!(
             s,
-            "  set={} kind={} state={} agreed={} stalled={} size={} held_by={}",
+            "  set={} kind={} state={} agreed={} stalled={} size={} held_by={}{}",
             set.position,
             word(&set.kind),
             word(&set.state),
@@ -201,6 +201,13 @@ fn storage_text(doc: &ClusterViewDoc) -> String {
             set.held_by
                 .as_ref()
                 .map_or("(leader only)".into(), |h| format!("{h:?}")),
+            // Ruling P28: the artifact at P is cut AT the instant, so it can
+            // never record its own set's completion.
+            if doc.source == Source::Artifact && set.position == doc.view_position {
+                " (cut at this artifact; its completion is not visible offline)"
+            } else {
+                ""
+            },
         );
         for r in set.rows.iter().chain(std::iter::once(&set.cluster)) {
             let _ = writeln!(
@@ -324,23 +331,33 @@ pub fn cluster_text(doc: &ClusterViewDoc) -> String {
 
 const NO_ARTIFACT: &str = "no cluster artifact yet (node not running; nothing to read offline)";
 
+/// What `--json` prints for a fetched body: `None` when there is no
+/// artifact (the caller says so on stderr, keeping stdout JSON-only).
+fn json_output(body: Body, catalog_only: bool) -> anyhow::Result<Option<String>> {
+    Ok(Some(match body {
+        Body::NoArtifact => return Ok(None),
+        // Verbatim (spec §6.3, ruling P16): the node's own bytes, with only
+        // the schema checked.
+        Body::Live(raw) if !catalog_only => {
+            parse_value(&raw)?;
+            raw
+        }
+        Body::Live(raw) => {
+            serde_json::to_string_pretty(&catalog_value(&parse_value(&raw)?))? + "\n"
+        }
+        Body::Offline(doc) if !catalog_only => serde_json::to_string_pretty(&doc)? + "\n",
+        Body::Offline(doc) => {
+            serde_json::to_string_pretty(&catalog_value(&serde_json::to_value(&doc)?))? + "\n"
+        }
+    }))
+}
+
 pub fn run(common: &CommonArgs, json: bool, catalog_only: bool) -> anyhow::Result<()> {
     if json {
-        let text = match fetch_body(common, true)? {
-            Body::NoArtifact => NO_ARTIFACT.to_string(),
-            // Verbatim (spec §6.3, ruling P16): the node's own bytes, with
-            // only the schema checked.
-            Body::Live(raw) if !catalog_only => {
-                parse_value(&raw)?;
-                raw.trim_end().to_string()
-            }
-            Body::Live(raw) => serde_json::to_string_pretty(&catalog_value(&parse_value(&raw)?))?,
-            Body::Offline(doc) if !catalog_only => serde_json::to_string_pretty(&doc)?,
-            Body::Offline(doc) => {
-                serde_json::to_string_pretty(&catalog_value(&serde_json::to_value(&doc)?))?
-            }
-        };
-        println!("{text}");
+        match json_output(fetch_body(common, true)?, catalog_only)? {
+            Some(text) => print!("{text}"),
+            None => eprintln!("{NO_ARTIFACT}"),
+        }
         return Ok(());
     }
     let doc = match fetch(common, true)? {
@@ -441,5 +458,23 @@ mod tests {
             .collect();
         assert_eq!(codes, ["catalog_empty", "node_stale"]);
         assert!(c["holdings"].is_null());
+    }
+
+    /// P16: `cluster --json` on a live node prints the node's bytes exactly —
+    /// odd whitespace, field order and an unknown field included.
+    #[test]
+    fn live_cluster_json_is_the_body_verbatim() {
+        let raw = format!(
+            "{{ \"zz_newer_field\" : [1, 2],\n\t\"schema\":\"{}\" ,\"source\":\"live\"}}\n\n",
+            uc_node::view::SCHEMA
+        );
+        let out = json_output(Body::Live(raw.clone()), false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(out.as_bytes(), raw.as_bytes());
+        // A foreign schema is still refused on the verbatim path.
+        let foreign = raw.replace(uc_node::view::SCHEMA, "uc2.cluster-view/2");
+        assert!(json_output(Body::Live(foreign), false).is_err());
+        assert!(json_output(Body::NoArtifact, false).unwrap().is_none());
     }
 }

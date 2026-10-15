@@ -127,6 +127,16 @@ fn a_stopped_node_reads_offline_and_a_leftover_socket_is_ignored() {
     let v: serde_json::Value = serde_json::from_str(&r.stdout).unwrap();
     assert_eq!(v["source"], "artifact");
     assert!(v["holdings"].is_null());
+    // P28: the artifact cannot show its own set's completion, so offline
+    // never raises catalog_empty (the committed fields stay as at P).
+    assert!(
+        v["attention"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|a| a["code"] != "catalog_empty"),
+        "{v}"
+    );
     assert_eq!(
         v["catalog"]["sets"][0]["rows"][0]["name"], "sum",
         "names come from the stale cnc2.dat"
@@ -147,6 +157,12 @@ fn a_stopped_node_reads_offline_and_a_leftover_socket_is_ignored() {
         "{}",
         r.stdout
     );
+    assert!(
+        r.stdout
+            .contains("(cut at this artifact; its completion is not visible offline)"),
+        "{}",
+        r.stdout
+    );
     let r = run_ctl(&["cluster", "--json", "--instance-dir", &d, "--app-id", APP]);
     assert_eq!(r.status, 0, "{r:?}");
     let v: serde_json::Value = serde_json::from_str(&r.stdout).unwrap();
@@ -164,4 +180,9 @@ fn a_stopped_node_with_no_artifact_says_so() {
     let r = run_ctl(&["cluster", "--instance-dir", d, "--app-id", APP]);
     assert_eq!(r.status, 0, "{r:?}");
     assert!(r.stdout.contains("no cluster artifact yet"), "{}", r.stdout);
+    // Under --json stdout stays JSON-only: the message goes to stderr.
+    let r = run_ctl(&["cluster", "--json", "--instance-dir", d, "--app-id", APP]);
+    assert_eq!(r.status, 0, "{r:?}");
+    assert!(r.stdout.is_empty(), "{}", r.stdout);
+    assert!(r.stderr.contains("no cluster artifact yet"), "{}", r.stderr);
 }
