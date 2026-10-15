@@ -29,3 +29,4 @@
 //! render through so their JSON escaping and key order cannot drift.
 
 pub mod log;
+pub mod time;
