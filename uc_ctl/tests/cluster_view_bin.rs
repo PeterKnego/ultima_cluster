@@ -250,6 +250,41 @@ fn a_stopped_node_with_no_artifact_says_so() {
     assert!(r.stderr.contains("no cluster artifact yet"), "{}", r.stderr);
 }
 
+/// A mistyped `--instance-dir` must not read as a fresh node ("no cluster
+/// artifact yet", exit 0): a missing path and an existing directory no node
+/// ever ran in are both refused by name, by every command that reads the view.
+#[test]
+fn a_path_that_is_not_an_instance_dir_is_refused_by_name() {
+    let root = scratch("uc2ctl-view-notdir-");
+    let missing = root.path().join("no-such-dir");
+    let empty = root.path().join("empty");
+    std::fs::create_dir(&empty).unwrap();
+    for (dir, want) in [
+        (&missing, "no such instance directory"),
+        (&empty, "not an instance directory"),
+    ] {
+        let d = dir.to_str().unwrap();
+        for args in [
+            &["cluster"][..],
+            &["catalog", "--json"][..],
+            &["settings", "show"][..],
+            &["schedule", "show"][..],
+            &["upgrade", "show"][..],
+        ] {
+            let mut argv = args.to_vec();
+            argv.extend(["--instance-dir", d, "--app-id", APP]);
+            let r = run_ctl(&argv);
+            assert_ne!(r.status, 0, "{argv:?} must fail: {r:?}");
+            assert!(r.stderr.contains(want), "{argv:?}: {}", r.stderr);
+            assert!(
+                !r.stdout.contains("no cluster artifact yet"),
+                "{argv:?}: {}",
+                r.stdout
+            );
+        }
+    }
+}
+
 #[test]
 fn settings_show_reads_the_live_genesis_before_any_instant() {
     let root = scratch("uc2ctl-view-settings-");

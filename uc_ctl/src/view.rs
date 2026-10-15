@@ -70,9 +70,28 @@ fn offline_names(common: &CommonArgs) -> RowNames {
     }
 }
 
+/// Refuse a path no node has ever run in, by name. Without this a mistyped
+/// `--instance-dir` reads exactly like a fresh node — "no cluster artifact
+/// yet", exit 0. A node creates `instance.lock` at its first boot and keeps
+/// it, and an artifact lives under `snapshots/cluster/`; a directory with
+/// neither is not an instance directory.
+fn ensure_instance_dir(dir: &std::path::Path) -> anyhow::Result<()> {
+    if !dir.is_dir() {
+        anyhow::bail!("{}: no such instance directory", dir.display());
+    }
+    if !dir.join("instance.lock").exists() && !dir.join("snapshots/cluster").is_dir() {
+        anyhow::bail!(
+            "{}: not an instance directory (no instance.lock, no snapshots/cluster/ — has a node ever run here?)",
+            dir.display()
+        );
+    }
+    Ok(())
+}
+
 fn fetch_body(common: &CommonArgs, require_live_when_held: bool) -> anyhow::Result<Body> {
     use uc_node::ipc::{InstanceLock, probe_instance_lock};
     let dir = &common.instance_dir;
+    ensure_instance_dir(dir)?;
     // Only a held lock means a live node: a socket file a killed node left
     // behind is never dialled (it would refuse anyway).
     if matches!(probe_instance_lock(dir)?, InstanceLock::Held) {
