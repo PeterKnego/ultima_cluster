@@ -11,6 +11,8 @@
 //! The serde types in [`model`] ARE the schema: adding a field keeps
 //! [`SCHEMA`]; renaming, removing or changing a field's meaning bumps it.
 
+pub mod build;
+pub mod convert;
 pub mod model;
 
 pub use model::ClusterViewDoc;

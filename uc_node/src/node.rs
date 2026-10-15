@@ -14635,7 +14635,7 @@ fn soft_table_from_wire(
 /// u16)`) as a real `SocketAddr` (IPv4-only — `uc_consensus` stays dep-free,
 /// so this conversion lives here). Inverse of `stored_member`'s ip/port
 /// extraction below.
-fn addr_of((ip, port): Addr) -> SocketAddr {
+pub(crate) fn addr_of((ip, port): Addr) -> SocketAddr {
     SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::from(ip.to_be_bytes()), port))
 }
 
