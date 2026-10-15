@@ -668,11 +668,14 @@ attention {"code":"node_stale","node":3}
 ```
 
 The text uses the same words the JSON does (this sample is the leader's
-[example document](cluster-view.md#example)); the `settings` line is exactly
-what [`settings show`](#settings-show) prints, at the settings record's own
-position, and a `null` in the document prints as `unknown` or `-`. `--json` prints the node's `/cluster` body **verbatim**, with only its
-`schema` checked; a node serving a different schema is refused by name (`the
-node serves cluster view schema … ; this uc2ctl reads uc2.cluster-view/1`).
+[example document](cluster-view.md#example)); the `settings` line shows the
+same settings fields [`settings show`](#settings-show) prints, but its
+`position=` is the settings record's own position, while `settings show`
+prints the view's position (`view_position`). A `null` in the document prints
+as `unknown` or `-`. `--json` prints the node's `/cluster` body **verbatim**,
+with only its `schema` checked; a node serving a different schema is refused
+by name (`the node serves cluster view schema … ; this uc2ctl reads
+uc2.cluster-view/1`).
 
 `uc2ctl` dials `<instance_dir>/obs.sock` only while `instance.lock` is held. A
 stopped node is read **offline** from the newest cluster artifact: the header

@@ -320,8 +320,9 @@ pub fn cluster_text(doc: &ClusterViewDoc) -> String {
     for x in &m.members {
         let _ = writeln!(s, "  id={} addr={} role={}", x.id, x.addr, word(&x.role));
     }
-    // The `settings show` line, through its own renderer, at the settings
-    // record's own position (as the schedule line uses the table's).
+    // The same fields as `settings show`, through its renderer, but at the
+    // settings record's own position (as the schedule line uses the table's);
+    // `settings show` prints the view's position.
     let st = &doc.cluster.settings;
     let _ = writeln!(
         s,
@@ -491,8 +492,8 @@ mod tests {
     }
 
     /// Spec §6.3 "the whole view": the cluster text carries the settings,
-    /// as the `settings show` line, and the reference page's sample is this
-    /// document's text.
+    /// the same settings fields `settings show` prints, and the reference
+    /// page's sample is this document's text.
     #[test]
     fn cluster_text_prints_the_settings_line() {
         let doc = parse(include_str!("../../uc_node/src/view/example.json")).unwrap();
