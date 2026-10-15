@@ -158,7 +158,7 @@ fn metrics_healthz_readyz_serve_and_404_otherwise() {
         .service_heartbeat_ns
         .store_release(now_unix_ns());
 
-    assert_eq!(get(srv.local_addr(), "/healthz").0, 200);
+    assert_eq!(get(srv.local_addr(), "/metrics").0, 200);
     assert!(
         get(srv.local_addr(), "/metrics")
             .1

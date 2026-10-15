@@ -239,7 +239,7 @@ fn render_fsm_lag(bytes: u64) -> String {
 /// and scripts may split on. A new field goes BEFORE `datagram_mtu`'s
 /// parenthesised suffix (as `retain_sets`, `auto_fetch` and the backup keys did) or after it; existing keys
 /// are never reordered or renamed.
-fn render_settings_line(position: u64, settings: &Settings) -> String {
+pub(crate) fn render_settings_line(position: u64, settings: &Settings) -> String {
     let fsm_lag = render_fsm_lag(settings.fsm_lag_bytes);
     let target = match settings.snapshot_target {
         Target::All => "all",

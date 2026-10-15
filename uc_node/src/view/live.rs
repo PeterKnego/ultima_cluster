@@ -63,7 +63,7 @@ pub fn holdings_view(
                 applied: h.applied[r as usize],
             })
             .collect(),
-        free_bytes: h.free_bytes,
+        free_bytes: (h.free_bytes != crate::auto_fetch::FREE_BYTES_UNKNOWN).then_some(h.free_bytes),
         journal_bytes: h.journal_bytes,
         snapshots_bytes: h.snapshots_bytes,
         sets_held: (h.catalog_position == catalog_version).then(|| {
@@ -183,8 +183,13 @@ pub fn build_live_doc(i: &LiveInputs, now_ns: u64) -> ClusterViewDoc {
 pub fn gather(s: &ObsSources, now_ns: u64) -> LiveInputs {
     use std::sync::atomic::Ordering;
     // Best effort across sources: `state` is one consistent snapshot, but the
-    // cnc words (flags, commit, consumed, ...) are read beside it, not with it.
+    // cnc words (flags, commit, ...) are read beside it, not with it. The one
+    // ordering kept: `consumed` is read BEFORE `to_state()`. The cluster agent
+    // publishes the view first and stores `consumed` last, so a cursor read
+    // first is a LOWER bound of the walk the rendered state reflects
+    // (`view_position` never claims more than the document shows).
     let status = s.cnc.status();
+    let consumed = s.cluster_view.consumed.load(Ordering::Acquire);
     let state = s.cluster_view.to_state();
     let names: RowNames = s
         .cnc
@@ -208,7 +213,7 @@ pub fn gather(s: &ObsSources, now_ns: u64) -> LiveInputs {
         flags: status.flags.load_acquire(),
         leader_hint: status.leader_hint.load_acquire(),
         commit,
-        consumed: s.cluster_view.consumed.load(Ordering::Acquire),
+        consumed,
         declared,
         services: services(s, &names, declared, commit),
         names,
@@ -453,6 +458,26 @@ mod tests {
         let doc = build_live_doc(&i, NOW);
         assert_eq!(doc.role, Some(Role::Learner));
         assert_eq!(doc.joined, Some(false));
+    }
+
+    /// Ruling P30: `free_bytes` 0 is `auto_fetch::FREE_BYTES_UNKNOWN` (the
+    /// probe stores a real reading as at least 1), so it renders `null`.
+    #[test]
+    fn an_unknown_free_bytes_renders_null_and_a_reading_renders_a_number() {
+        let mut i = inputs(NODE_FLAG_LEADER);
+        i.own.free_bytes = crate::auto_fetch::FREE_BYTES_UNKNOWN;
+        i.soft.record(
+            2,
+            Holdings {
+                free_bytes: 1,
+                ..i.own
+            },
+            NOW,
+        );
+        let v = serde_json::to_value(build_live_doc(&i, NOW)).unwrap();
+        assert!(v["self"]["holdings"]["free_bytes"].is_null(), "{v}");
+        assert_eq!(v["self"]["holdings"]["journal_bytes"], 0);
+        assert_eq!(v["nodes"][1]["holdings"]["free_bytes"], 1);
     }
 
     /// Review focus 2.

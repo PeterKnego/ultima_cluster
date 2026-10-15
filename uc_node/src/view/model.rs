@@ -241,7 +241,9 @@ pub struct ReportView {
 pub struct ReportNodeView {
     pub node: u32,
     pub hash: Hex64,
-    pub size: u64,
+    /// `null` when the report carries size `0` (unknown — a pre-lifecycle
+    /// record), never a sentinel `0` (ruling P30).
+    pub size: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -317,7 +319,8 @@ pub enum VerdictView {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TierView {
-    /// 16 lowercase hex digits, as `uc2ctl tier show` prints it.
+    /// `0x` + 16 lowercase hex digits, as `uc2ctl tier show` prints it and
+    /// `tier forget --tier-id` parses it (ruling P29).
     pub id: String,
     pub oldest_set: u64,
     pub newest_set: u64,
@@ -351,8 +354,12 @@ pub struct HoldingsView {
     pub durable: u64,
     pub commit: u64,
     pub applied: Vec<RowAppliedView>,
-    pub free_bytes: u64,
+    /// `null` until the `uc2-holdings` probe's first successful `statvfs`
+    /// (`auto_fetch::FREE_BYTES_UNKNOWN`), never a sentinel `0` (ruling P30).
+    pub free_bytes: Option<u64>,
+    /// An estimate; `0` is a real reading (an empty journal), not "unknown".
     pub journal_bytes: u64,
+    /// `0` is a real reading (no `snapshots/` bytes), not "unknown".
     pub snapshots_bytes: u64,
     /// Set positions held complete on disk; `null` when the holdings were
     /// computed against a different catalog than the one rendered.

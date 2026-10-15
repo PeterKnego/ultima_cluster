@@ -110,7 +110,7 @@ mod tests {
         );
         assert!(
             json.contains(&format!(
-                r#"{{"code":"tier_behind","tier":"0000000000000001","lag_bytes":{commit}}}"#
+                r#"{{"code":"tier_behind","tier":"0x0000000000000001","lag_bytes":{commit}}}"#
             )),
             "{json}"
         );

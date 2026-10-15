@@ -13,9 +13,20 @@
 //! view, project 4) the always-on unix socket `<instance_dir>/obs.sock`
 //! ([`super::socket`]). Both doors serve the same router — `/metrics`,
 //! `/healthz`, `/readyz` and `/cluster` — GET-only, `Connection: close` (no
-//! keep-alive). The handler only
-//! reads through [`ObsSources`]'s `Arc`s and atomics — it shares no lock with
-//! the hot-path agents and cannot perturb them.
+//! keep-alive). The handler reads through [`ObsSources`]'s `Arc`s and
+//! atomics and takes two short locks, each held only for a copy: the
+//! holdings cache (one `Holdings` copy — the consensus agent takes the same
+//! lock at most every 10 ms to refresh it, the `uc2-holdings` thread once
+//! per probe) and, for `/cluster`, the soft table wire (an at most 8-entry
+//! clone — the sender agent takes the same lock once per `STATUS` it
+//! handles). No hot-path agent does work for the handler; at worst an agent
+//! waits out one such copy.
+//!
+//! The write phase's bound is per write call (`SO_SNDTIMEO`), not a
+//! wall-clock deadline: a peer that reads a large `/cluster` body a little
+//! at a time, just often enough, can hold this one thread — and every other
+//! request — for several [`CONN_DEADLINE`] periods. `[metrics]` belongs on
+//! the ops network.
 //!
 //! The accept loop is single-threaded and synchronous — `handle_conn` runs
 //! to completion before the next connection is even accepted — so every

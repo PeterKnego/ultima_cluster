@@ -261,7 +261,7 @@ fn storage_text(doc: &ClusterViewDoc) -> String {
             "self journal_first={} durable={} free_bytes={} journal_bytes={} snapshots_bytes={} sets_held={}",
             h.journal_first,
             h.durable,
-            h.free_bytes,
+            h.free_bytes.map_or("unknown".into(), |b| b.to_string()),
             h.journal_bytes,
             h.snapshots_bytes,
             h.sets_held
@@ -311,6 +311,14 @@ pub fn cluster_text(doc: &ClusterViewDoc) -> String {
     for x in &m.members {
         let _ = writeln!(s, "  id={} addr={} role={}", x.id, x.addr, word(&x.role));
     }
+    // The `settings show` line, through its own renderer, at the settings
+    // record's own position (as the schedule line uses the table's).
+    let st = &doc.cluster.settings;
+    let _ = writeln!(
+        s,
+        "settings {}",
+        crate::settings::render_settings_line(st.position, &uc_node::view::convert::settings(st))
+    );
     let _ = writeln!(
         s,
         "schedule entries={} position={}",
@@ -443,6 +451,25 @@ mod tests {
             !text.contains("Full") && !text.contains("Diverged"),
             "{text}"
         );
+    }
+
+    /// Spec §6.3 "the whole view": the cluster text carries the settings,
+    /// as the `settings show` line, and the reference page's sample is this
+    /// document's text.
+    #[test]
+    fn cluster_text_prints_the_settings_line() {
+        let doc = parse(include_str!("../../uc_node/src/view/example.json")).unwrap();
+        let text = cluster_text(&doc);
+        eprintln!("{text}");
+        let want = format!(
+            "settings {}\n",
+            crate::settings::render_settings_line(
+                doc.cluster.settings.position,
+                &uc_node::view::convert::settings(&doc.cluster.settings)
+            )
+        );
+        assert!(text.contains(&want), "{text}");
+        assert!(text.contains("free_bytes=unknown"), "{text}");
     }
 
     /// P16/P17: the catalog filter keeps unknown fields of the parts it

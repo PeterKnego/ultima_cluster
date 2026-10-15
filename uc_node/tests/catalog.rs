@@ -2611,7 +2611,7 @@ fn the_view_of_a_reported_tier_shows_its_watermark_lag_and_purge_gate() {
         through: p,
         reporter: leader as u64,
     };
-    let id = format!("{TIER:016x}");
+    let id = format!("0x{TIER:016x}");
     let committed_everywhere = |c: &Cluster| {
         voters.iter().all(|&i| {
             view_of(c.node(i))["cluster"]["tiers"]
@@ -2642,7 +2642,11 @@ fn the_view_of_a_reported_tier_shows_its_watermark_lag_and_purge_gate() {
         let tiers = v["cluster"]["tiers"].as_array().unwrap();
         assert_eq!(tiers.len(), 1, "node {i}: one tier: {tiers:?}");
         let t = &tiers[0];
-        assert_eq!(t["id"], id.as_str(), "node {i}: 16 hex digits, no prefix");
+        assert_eq!(
+            t["id"],
+            id.as_str(),
+            "node {i}: 0x + 16 hex digits, as `uc2ctl tier show` prints it"
+        );
         assert_eq!(t["oldest_set"], p, "node {i}");
         assert_eq!(t["newest_set"], p, "node {i}");
         assert_eq!(t["through"], p, "node {i}");

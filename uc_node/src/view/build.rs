@@ -141,7 +141,7 @@ pub fn cluster_part(
 
 fn tier(t: &BackupTierEntry, commit: Option<u64>) -> TierView {
     TierView {
-        id: format!("{:016x}", t.tier_id),
+        id: format!("0x{:016x}", t.tier_id),
         oldest_set: t.oldest_set,
         newest_set: t.newest_set,
         through: t.through,
@@ -269,7 +269,7 @@ fn upgrades(st: &ClusterState, names: &RowNames) -> Vec<UpgradeRowView> {
                         .map(|(n, h, s)| ReportNodeView {
                             node: *n,
                             hash: Hex64(*h),
-                            size: *s,
+                            size: some_nonzero(*s),
                         })
                         .collect(),
                 }
@@ -401,7 +401,7 @@ mod tests {
             updated_pos: 2500,
         }];
         let p = cluster_part(&st, &Default::default(), Some(5000), Some(true));
-        assert_eq!(p.tiers[0].id, "000000000000feed");
+        assert_eq!(p.tiers[0].id, "0x000000000000feed");
         assert_eq!(p.tiers[0].lag_bytes, Some(2000));
         assert_eq!(p.purge_gate.requires_tiers, 2);
         assert_eq!(
@@ -497,7 +497,11 @@ mod tests {
 
     /// Task 9 / Task 3 review: the JSON leg (what `uc2ctl` actually reads)
     /// loses nothing — u64 extremes and ns above 2^53 survive serialize,
-    /// parse and convert.
+    /// parse and convert. This exercises serde losslessness ONLY: its
+    /// positions above 2^53 (a report position, a pin origin, a record
+    /// position) are byte offsets no log reaches in practice, so they are
+    /// not a claim that such a document honours the 2^53 rule — that is
+    /// `no_number_in_a_rendered_document_exceeds_2_pow_53`'s job.
     #[test]
     fn the_converters_round_trip_through_json_text() {
         use uc_protocol::v2::schedule::{ScheduleEntry, ScheduleRule};
@@ -538,7 +542,8 @@ mod tests {
         st.reports = vec![SnapshotReport {
             row: 0,
             position: (1u64 << 53) + 7,
-            hashes: vec![(1, u64::MAX, u64::MAX - 1), (2, 1, 2)],
+            // `(3, 5, 0)`: an unknown size renders null and converts back to 0.
+            hashes: vec![(1, u64::MAX, u64::MAX - 1), (2, 1, 2), (3, 5, 0)],
         }];
         st.running[0] = Some(RowRunning {
             row: 0,
@@ -557,10 +562,19 @@ mod tests {
     }
 
     /// Review focus 1: no JSON number above 2^53 anywhere, even with every
-    /// u64 field at its extreme.
+    /// SENTINEL-bearing u64 at its extreme: replicated settings, schedule
+    /// ids and times, hashes, tier ids, set times, packed versions, a
+    /// report's unknown (`0`) size. Positions, sizes and byte counts
+    /// (catalog, pins' `origin`, reports' `position`, `running.record_pos`,
+    /// tiers' `oldest_set`/`newest_set`/`through`, every holdings word) are
+    /// byte offsets or measured byte counts, which cannot exceed 2^53
+    /// (8 PiB) in practice, so they stay at realistic values here; `reporter`
+    /// is a node id.
     #[test]
     fn no_number_in_a_rendered_document_exceeds_2_pow_53() {
+        use uc_protocol::v2::backup::BackupTierEntry;
         use uc_protocol::v2::schedule::{ScheduleEntry, ScheduleRule};
+        use uc_protocol::v2::upgrade::{RowRunning, SnapshotReport, UpgradePin};
         let mut st = state_with_one_agreed_and_one_commanded();
         st.settings.fsm_lag_bytes = u64::MAX - 1;
         st.table.entries = vec![ScheduleEntry {
@@ -572,7 +586,36 @@ mod tests {
         st.settings.admission_bytes = u64::MAX - 1;
         st.settings.snapshot_interval_bytes = u64::MAX - 1;
         st.settings.backup_retain_age_secs = u64::MAX - 1;
+        st.pins = vec![UpgradePin {
+            row: 0,
+            from: u32::MAX - 1,
+            to: u32::MAX,
+            origin: 1 << 40,
+        }];
+        st.reports = vec![SnapshotReport {
+            row: 0,
+            position: 1 << 40,
+            hashes: vec![(1, u64::MAX, 0), (2, u64::MAX, 1 << 40)],
+        }];
+        st.running[0] = Some(RowRunning {
+            row: 0,
+            version: u32::MAX,
+            record_pos: 1 << 40,
+        });
+        st.backups = vec![BackupTierEntry {
+            tier_id: u64::MAX,
+            oldest_set: 1 << 40,
+            newest_set: 1 << 40,
+            through: 1 << 40,
+            reporter: 3,
+            updated_pos: 1 << 40,
+        }];
         let part = cluster_part(&st, &names(), Some(1 << 40), Some(false));
+        assert_eq!(part.tiers[0].id, "0xffffffffffffffff");
+        assert_eq!(
+            part.upgrades[0].report.as_ref().unwrap().nodes[0].size,
+            None
+        );
         let v = serde_json::to_value(&part).unwrap();
         fn walk(v: &serde_json::Value, path: &str) {
             match v {

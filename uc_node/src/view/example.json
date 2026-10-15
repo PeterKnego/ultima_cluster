@@ -132,7 +132,7 @@
           "applied": 0
         }
       ],
-      "free_bytes": 0,
+      "free_bytes": null,
       "journal_bytes": 0,
       "snapshots_bytes": 0,
       "sets_held": [
@@ -172,7 +172,7 @@
             "applied": 0
           }
         ],
-        "free_bytes": 0,
+        "free_bytes": null,
         "journal_bytes": 0,
         "snapshots_bytes": 0,
         "sets_held": [
@@ -197,7 +197,7 @@
             "applied": 0
           }
         ],
-        "free_bytes": 0,
+        "free_bytes": null,
         "journal_bytes": 0,
         "snapshots_bytes": 0,
         "sets_held": [
@@ -222,7 +222,7 @@
             "applied": 0
           }
         ],
-        "free_bytes": 0,
+        "free_bytes": null,
         "journal_bytes": 0,
         "snapshots_bytes": 0,
         "sets_held": []

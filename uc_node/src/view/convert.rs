@@ -90,7 +90,7 @@ pub fn upgrade(rows: &[UpgradeRowView]) -> UpgradeParts {
                 hashes: rep
                     .nodes
                     .iter()
-                    .map(|n| (n.node, n.hash.0, n.size))
+                    .map(|n| (n.node, n.hash.0, n.size.unwrap_or(0)))
                     .collect(),
             });
         }
