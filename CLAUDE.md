@@ -86,7 +86,7 @@ the rig's variance — the driver now judges paired deltas). The known issue
 shipped as recorded — `CncPage::meta()` can panic on a page a restarting node
 rewrites — and is **fixed for `2.12.0`** (`meta()` replaced by a
 fallible `try_meta()`, plus the boot-gap attach refusal found reviewing it;
-`docs/BACKLOG.md` § Shipped). `2.10.0` was one log stream, `UC2_*` env
+`docs/releases.md` § `2.12.0`). `2.10.0` was one log stream, `UC2_*` env
 overrides, `uc_obs`, the `ultima_db` removal and the Broadcast-ring
 memory-ordering fix; `2.9.0` the `uc_*` crate rename.
 
@@ -192,7 +192,7 @@ pinned by `uc_node/tests/retired.rs`) all shipped in `2.11.0`; explainer
 `docs/notes/uc2-cluster-fsm-explained.md`.
 
 Already on `main` and in the same flag day: **FSM identity**
-(`docs/BACKLOG.md` § Shipped, taken up 2026-09-01;
+(`docs/releases.md` § `2.11.0`, taken up 2026-09-01;
 spec `docs/superpowers/specs/2026-09-02-uc2-fsm-identity-design.md`, plan
 `docs/superpowers/plans/2026-09-02-uc2-fsm-identity.md`) —
 **shipped in `2.11.0`.** All ten
