@@ -225,9 +225,11 @@ pub struct NodeConfig {
     /// Ring capacity in bytes; power of two.
     pub buffer_bytes: usize,
     /// The payload BOUND this node's log buffer is sized for (jumbo spec
-    /// §7.2) — `payload_ceiling(MTU_BOUND, crypto)` from `node.toml`; tests
+    /// §7.2) — [`NodeConfig::full_max_payload`] from `node.toml`; tests
     /// pass small values with small buffers. The live door is
-    /// `min(this, payload_ceiling(committed rung, crypto))`.
+    /// `min(this, payload_ceiling(committed rung, crypto))`, so this is NOT
+    /// retired with the `node.toml` key: a value below the full bound caps
+    /// every command this node accepts. Must be at most `buffer_bytes / 4`.
     pub max_payload: usize,
     /// Ingress admission budget in bytes (`append - commit` backpressure gate,
     /// wired in Task 7). Default `256 * 1024`.
@@ -287,6 +289,21 @@ pub struct NodeConfig {
     /// install it as the cluster FSM's genesis image and read the live
     /// value it evolves into.
     pub settings_genesis: Settings,
+}
+
+impl NodeConfig {
+    /// The [`max_payload`](Self::max_payload) a production node uses: the
+    /// payload ceiling at the top of the jumbo ladder for this crypto mode
+    /// (8896 B cleartext, 8864 B sealed) — what `uc2-node` derives from
+    /// `node.toml`. A smaller value caps every command this node accepts at
+    /// that size, whatever rung the cluster discovers; only tests running
+    /// with tiny buffers want that.
+    pub fn full_max_payload(crypto_enabled: bool) -> usize {
+        uc_protocol::v2::datagram::payload_ceiling(
+            uc_protocol::v2::datagram::MTU_BOUND,
+            crypto_enabled,
+        )
+    }
 }
 
 /// What a drain achieved before the node stopped.

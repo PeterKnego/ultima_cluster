@@ -43,7 +43,9 @@ fn main() -> anyhow::Result<()> {
         instance_dir: instance_dir.clone(),
         app_id: APP_ID.to_string(),
         buffer_bytes: 1 << 22, // 4 MiB log ring
-        max_payload: 256,
+        // The full bound: the cluster discovers the live ceiling (up to
+        // 8896 B); a smaller value here would cap every command at it.
+        max_payload: NodeConfig::full_max_payload(false),
         admission_bytes_default: 256 * 1024,
         settings_genesis: uc_node::Settings::genesis_default(),
         force_jumbo_frames: false,
