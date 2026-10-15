@@ -796,15 +796,19 @@ impl Drop for KillOnDrop {
 }
 
 /// Cluster view: `uc2-node` always serves the obs router on
-/// `<instance_dir>/obs.sock` — no `[metrics]` section here — mode `0600`,
-/// and a clean (SIGTERM) shutdown removes the file.
+/// `<instance_dir>/obs.sock`, mode `0600`, beside the `[metrics]` TCP
+/// listener when one is configured (both doors answer, from one loop), and a
+/// clean (SIGTERM) shutdown removes the file. The no-`[metrics]` daemon is
+/// `a_sigkilled_daemon_leaves_a_socket_that_refuses` below.
 #[test]
 fn the_daemon_serves_the_cluster_view_on_its_obs_socket_and_removes_it_on_sigterm() {
     use std::os::unix::fs::PermissionsExt;
     use std::process::Command;
 
     let root = scratch();
-    let (cfg, inst) = daemon_config(root.path(), 19731, "127.0.0.1", "");
+    let metrics_port = free_port();
+    let (cfg, inst) = daemon_config_with_metrics(root.path(), 19731, metrics_port);
+    let metrics_addr: SocketAddr = format!("127.0.0.1:{metrics_port}").parse().unwrap();
     let mut child = KillOnDrop(
         Command::new(env!("CARGO_BIN_EXE_uc2-node"))
             .arg("--config")
@@ -842,6 +846,12 @@ fn the_daemon_serves_the_cluster_view_on_its_obs_socket_and_removes_it_on_sigter
             .any(|a| a["code"] == "catalog_empty"),
         "{v}"
     );
+    // Both doors, same router.
+    assert_eq!(uc_node::obs::socket::get(&inst, "/metrics").unwrap().0, 200);
+    assert_eq!(http_get(metrics_addr, "/metrics").0, 200);
+    let (code, tcp_body) = http_get(metrics_addr, "/cluster");
+    assert_eq!(code, 200);
+    assert!(tcp_body.contains("uc2.cluster-view/1"), "{tcp_body}");
     unsafe { libc::kill(child.0.id() as i32, libc::SIGTERM) };
     assert!(child.0.wait().unwrap().success());
     assert!(!sock.exists(), "a clean shutdown removes obs.sock");

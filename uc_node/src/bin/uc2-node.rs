@@ -215,6 +215,8 @@ fn main() -> ExitCode {
             // would re-raise it.
             if let Some((name, _)) = obs.agents.iter().find(|(_, f)| f.load(Ordering::Acquire)) {
                 uc_node::obs_event!(Error, "agent_failstopped", agent = *name);
+                // An orderly exit: unlink obs.sock like the drain path does.
+                srv.stop();
                 return ExitCode::FAILURE;
             }
 
