@@ -132,6 +132,73 @@ fn write_cas_read_round_trip_through_the_edge() {
     svc.stop();
 }
 
+/// #34: a second process reusing a persisted `client_id` must resume above the
+/// first one's seqs. Resumed with `first_seq = next_seq()` its write is FRESH
+/// and applied; restarted at the default seq 1 (the pre-#34 behaviour, still
+/// what an unset `first_seq` means) its different write is answered with the
+/// first process's cached reply and silently NOT applied — the hazard this
+/// field exists to close.
+#[test]
+fn a_persisted_client_id_resumes_at_first_seq() {
+    let root = common::tempdir();
+    let (node, dir) = common::start_single_node(root.path());
+    let svc = ServiceBuilder::new(
+        ServiceConfig::new(&dir, common::APP),
+        Sessioned::new(RegisterSm::default(), SessionConfig::default()),
+    )
+    .start()
+    .unwrap();
+    common::await_serving(&node, 10);
+    let edge = Edge::start(edge_config(&dir, true)).unwrap();
+    let as_client = |first_seq| RemoteConfig {
+        client_id: Some(4242),
+        first_seq,
+        ..remote_config(&edge)
+    };
+    let read = |c: &RemoteClient| -> Option<u64> {
+        let r = c
+            .query(&read_query(), Consistency::Linearizable)
+            .unwrap()
+            .wait()
+            .unwrap();
+        bincode::serde::decode_from_slice(&r.bytes, bincode::config::standard())
+            .unwrap()
+            .0
+    };
+
+    // Process 1: two writes, then it "exits" having persisted next_seq.
+    let c1 = RemoteClient::connect(as_client(1)).unwrap();
+    for v in [1, 2] {
+        let r = c1.submit(&enc(&Cmd::Write(v))).unwrap().wait().unwrap();
+        assert!(!r.replayed);
+    }
+    let persisted = c1.next_seq();
+    assert_eq!(persisted, 3, "two writes consumed seqs 1 and 2");
+    c1.shutdown();
+
+    // Process 2 resumes: its write is new to the session and applies.
+    let c2 = RemoteClient::connect(as_client(persisted)).unwrap();
+    let r = c2.submit(&enc(&Cmd::Write(3))).unwrap().wait().unwrap();
+    assert!(
+        !r.replayed,
+        "a resumed seq is above the high-water mark: FRESH"
+    );
+    assert_eq!(read(&c2), Some(3), "the resumed write applied");
+    c2.shutdown();
+
+    // Process 3 forgets to resume: seq 1 again, a DIFFERENT command, and
+    // the cluster answers it from the cache without applying it.
+    let c3 = RemoteClient::connect(as_client(1)).unwrap();
+    let r = c3.submit(&enc(&Cmd::Write(99))).unwrap().wait().unwrap();
+    assert!(r.replayed, "seq 1 is below the high-water mark: REPLAYED");
+    assert_eq!(read(&c3), Some(3), "the replayed write was not applied");
+    c3.shutdown();
+
+    edge.stop();
+    node.stop();
+    svc.stop();
+}
+
 #[test]
 fn raw_pass_through_round_trips_with_the_envelope_off() {
     let root = common::tempdir();

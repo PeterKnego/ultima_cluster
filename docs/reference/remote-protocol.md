@@ -32,7 +32,12 @@ below).
 lifetime (or persisted, if you want the edge's session dedup to survive a
 restart). `seq` starts at `1` and is monotonic per client; `0` is a legal
 first `seq` (see `Sessioned`'s "gap = fresh" rule in
-[the state-machine contract](state-machine-contract.md)).
+[the state-machine contract](state-machine-contract.md)). A client that
+persists its `client_id` must also resume **above** every `seq` it used
+before: a reused `seq` is answered from the session cache and not applied.
+The Rust client takes the start as `RemoteConfig::first_seq` (default `1`)
+and reports the next one as `next_seq()` — persist it before submitting,
+not after the reply.
 
 ## Frame types
 

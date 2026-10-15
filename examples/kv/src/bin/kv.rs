@@ -32,11 +32,12 @@ struct Args {
     timeout_secs: u64,
     /// Session identity (u64). Default: a fresh random one per process.
     ///
-    /// Reusing an id across processes RE-SENDS: the new process starts at
-    /// seq 1 again, so its first command is answered with the cached reply
-    /// of the previous process's first command (`replayed=true`) and is NOT
-    /// applied. Use it only to retry exactly one command whose answer was
-    /// lost. See README § Retries.
+    /// Reusing an id across processes RE-SENDS: this CLI does not persist
+    /// `next_seq` (an application would, as `RemoteConfig::first_seq`), so
+    /// the new process starts at seq 1 again and its first command is
+    /// answered with the cached reply of the previous process's first command
+    /// (`replayed=true`) and is NOT applied. Use it only to retry exactly one
+    /// command whose answer was lost. See README § Retries.
     #[arg(long)]
     client_id: Option<u64>,
     /// Read KEY and VALUE arguments as hex, and print values as hex.

@@ -713,6 +713,65 @@ fn a_config_that_cannot_work_is_refused_by_name() {
         },
         "dead_after",
     );
+    bad(
+        RemoteConfig {
+            client_id: Some(7),
+            first_seq: 0,
+            ..cfg(vec!["127.0.0.1:1".into()])
+        },
+        "first_seq",
+    );
+    bad(
+        RemoteConfig {
+            client_id: Some(7),
+            first_seq: uc_remote::MAX_FIRST_SEQ + 1,
+            ..cfg(vec!["127.0.0.1:1".into()])
+        },
+        "first_seq",
+    );
+    bad(
+        RemoteConfig {
+            first_seq: 5,
+            ..cfg(vec!["127.0.0.1:1".into()])
+        },
+        "client_id",
+    );
+}
+
+/// #34: a client resuming a persisted identity starts its seqs where it is
+/// told, and every path that walks seqs — the writer's cursor, the re-send
+/// scan after a dropped connection, reclaim — starts there too. The start is
+/// deliberately huge: a walk still starting at 1 is not wrong at a small
+/// first_seq, only slow, but from 2^40 it never reaches the first frame.
+const FAR: u64 = 1 << 40;
+#[test]
+fn first_seq_starts_the_wire_seqs_and_survives_a_redial() {
+    let edge = FakeEdge::spawn(Behaviour {
+        credits: 2,
+        drop_after_first_request: true,
+        ..Default::default()
+    });
+    let (send, mut poll) = RemoteEngine::connect(RemoteConfig {
+        client_id: Some(7),
+        first_seq: FAR,
+        ..cfg(vec![edge.addr.clone()])
+    })
+    .unwrap();
+    assert_eq!(send.next_seq(), FAR);
+    let got = run_submits(&send, &mut poll, 4, |i| vec![i as u8]);
+    assert_eq!(got.len(), 4, "every request completes exactly once");
+    assert_eq!(send.next_seq(), FAR + 4, "four seqs consumed, gap-free");
+    assert!(send.stats().resends >= 1, "{:?}", send.stats());
+
+    let mut seen = edge.observed.seqs.lock().unwrap().clone();
+    assert!(
+        seen.iter().all(|&s| (FAR..FAR + 4).contains(&s)),
+        "no seq below first_seq ever reaches the wire: {seen:?}"
+    );
+    seen.sort_unstable();
+    seen.dedup();
+    assert_eq!(seen, vec![FAR, FAR + 1, FAR + 2, FAR + 3], "each seq sent");
+    send.shutdown();
 }
 
 #[test]

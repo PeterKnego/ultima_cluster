@@ -163,9 +163,14 @@ Inside one `kv` process, retries are automatic and safe: the service runs
 UC's `Sessioned` wrapper and the gateway's session envelope is on, so a
 re-sent write is answered `replayed=true` and never applied twice.
 
-Across processes there is no safe automatic retry, because UC's client
-restarts its sequence counter at 1 in every process. `--client-id N` exists
-for one purpose: **re-sending the single command whose answer you lost**:
+Across processes there is no safe automatic retry, because this CLI does
+not persist its sequence counter: every `kv` process starts at seq 1. (An
+application that persists its `client_id` resumes the session by persisting
+`RemoteClient::next_seq()` too and passing it back as
+`RemoteConfig::first_seq`; see
+[the remote protocol](../../docs/reference/remote-protocol.md).) So
+`--client-id N` exists for one purpose: **re-sending the single command whose
+answer you lost**:
 
 ```bash
 kv --gateways $G --client-id 4242 put order-17 paid    # (connection dropped, no output)

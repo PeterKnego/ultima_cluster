@@ -121,6 +121,11 @@ const JUMBO_REMEDY: &str = "every deployment will need jumbo-frame support on al
 
 // ---------------------------------------------------------------- config
 
+/// The largest [`RemoteConfig::first_seq`] accepted: half the `u64` range, so a
+/// client can issue 2^63 more requests before the slot table's `seq + 1`
+/// generation tag could wrap.
+pub const MAX_FIRST_SEQ: u64 = u64::MAX / 2;
+
 /// How to reach a cluster's edges, and how hard to try.
 #[derive(Clone, Debug)]
 pub struct RemoteConfig {
@@ -133,6 +138,24 @@ pub struct RemoteConfig {
     /// (persisted) id if you want the edge's session dedup to survive a client
     /// restart.
     pub client_id: Option<u64>,
+    /// The sequence number this client's first request carries (default `1`).
+    ///
+    /// The edge's session dedup is keyed on `client_id ++ seq`: a request
+    /// whose seq is at or below the highest one `Sessioned` has seen for that
+    /// client is answered from its cache (`replayed = true`) and **not
+    /// applied**. So a process that reuses a persisted `client_id` must also
+    /// resume above every seq a previous process used, or each new command up
+    /// to the old high-water mark gets an old command's reply back. Read
+    /// [`RemoteSendHalf::next_seq`] (or [`crate::RemoteClient::next_seq`])
+    /// and persist it **before** submitting, not after the reply: a seq that
+    /// reached the cluster but was never persisted would be reused. Reserving
+    /// a block (persist `next_seq + N`, use up to N seqs, persist again) keeps
+    /// that write off the per-command path. Gaps are harmless — a seq above
+    /// the high-water mark is FRESH however far above it is.
+    ///
+    /// Must be in `1..=MAX_FIRST_SEQ`, and a value other than `1` needs an
+    /// explicit `client_id`: a fresh random id has no history to resume.
+    pub first_seq: u64,
     /// A local cap on unanswered requests, applied on top of the edge's credits.
     pub max_inflight: u32,
     /// End-to-end budget for one request, across re-sends and reconnects.
@@ -224,6 +247,7 @@ impl Default for RemoteConfig {
             app_id: String::new(),
             members: Vec::new(),
             client_id: None,
+            first_seq: 1,
             max_inflight: 1024,
             request_timeout: Duration::from_secs(10),
             connect_timeout: Duration::from_secs(2),
@@ -254,6 +278,12 @@ impl RemoteConfig {
     /// - **`max_inflight == 0`** — no request could ever be admitted; `submit`
     ///   would block until `request_timeout` and then report `TimedOut`,
     ///   forever.
+    /// - **`first_seq` outside `1..=MAX_FIRST_SEQ`** — `0` is the link's own
+    ///   "no request" sentinel (`probe_seq`, a slot's `sent_seq`), and the cap
+    ///   leaves the `seq + 1` generation tag headroom that can never wrap.
+    /// - **`first_seq != 1` with no `client_id`** — a random id is new to the
+    ///   cluster, so a starting seq means the caller meant to resume an
+    ///   identity and forgot to name it.
     /// - **`dead_after <= ping_interval`** — the liveness pair is then
     ///   self-defeating: the connection is declared dead at or before the first
     ///   `PING` could have been answered, so a perfectly healthy edge is
@@ -273,6 +303,19 @@ impl RemoteConfig {
             return Err(RemoteError::Config(
                 "max_inflight must be greater than zero: no request could ever be admitted".into(),
             ));
+        }
+        if self.first_seq == 0 || self.first_seq > MAX_FIRST_SEQ {
+            return Err(RemoteError::Config(format!(
+                "first_seq ({}) must be in 1..={MAX_FIRST_SEQ}",
+                self.first_seq
+            )));
+        }
+        if self.first_seq != 1 && self.client_id.is_none() {
+            return Err(RemoteError::Config(format!(
+                "first_seq ({}) is set but client_id is not: a starting seq resumes a \
+                 persisted identity, so supply the client_id it belongs to",
+                self.first_seq
+            )));
         }
         if self.dead_after <= self.ping_interval {
             return Err(RemoteError::Config(format!(
@@ -490,8 +533,8 @@ impl RemoteEngine {
         Ok((
             RemoteSendHalf {
                 link: Arc::clone(&link),
-                next_seq: Cell::new(1),
-                reclaim_seq: Cell::new(1),
+                next_seq: Cell::new(link.cfg.first_seq),
+                reclaim_seq: Cell::new(link.cfg.first_seq),
                 reclaim_pos: Cell::new(0),
                 _not_sync: PhantomData,
             },
@@ -506,7 +549,8 @@ impl RemoteEngine {
 /// producer).
 pub struct RemoteSendHalf {
     pub(crate) link: Arc<Link>,
-    /// The next seq to issue. Submitter-local: gap-free, from 1.
+    /// The next seq to issue. Submitter-local: gap-free, from
+    /// [`RemoteConfig::first_seq`].
     pub(crate) next_seq: Cell<u64>,
     /// The lowest seq whose ring bytes have not been reclaimed yet.
     pub(crate) reclaim_seq: Cell<u64>,
@@ -815,6 +859,13 @@ impl RemoteSendHalf {
     /// what the edge's grant bounds; see [`RemoteSendHalf::try_submit`].
     pub fn inflight(&self) -> u64 {
         self.link.inflight()
+    }
+
+    /// The seq the next request will carry. Persist it with the `client_id`
+    /// (before submitting — see [`RemoteConfig::first_seq`]) and a later
+    /// process can resume the same session without replaying old replies.
+    pub fn next_seq(&self) -> u64 {
+        self.next_seq.get()
     }
 
     /// The highest sequence number the edge has acknowledged. **A statistic

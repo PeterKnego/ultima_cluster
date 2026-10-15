@@ -332,7 +332,7 @@ impl Link {
             .store(info.credits, Ordering::Relaxed);
 
         let link = Arc::new(Link {
-            slots: SlotTable::new(cfg.max_inflight),
+            slots: SlotTable::new(cfg.max_inflight, cfg.first_seq),
             out: OutRing::new(cfg.out_ring_bytes_resolved()),
             completions: CompletionQueue::new(
                 cfg.max_inflight as usize,
@@ -344,7 +344,7 @@ impl Link {
             proven: AtomicBool::new(false),
             warned_over_standard: AtomicBool::new(false),
             probe_seq: AtomicU64::new(0),
-            oldest_unreclaimed: AtomicU64::new(1),
+            oldest_unreclaimed: AtomicU64::new(cfg.first_seq),
             polled_token: TokenCell::default(),
             observed_token: TokenCell::default(),
             stats,
@@ -799,11 +799,12 @@ struct Writer {
 
 impl Writer {
     fn new(link: Arc<Link>, conn: FramedConn) -> Writer {
+        let cursor = link.cfg.first_seq;
         Writer {
             link,
             conn,
             generation: 0,
-            cursor: 1,
+            cursor,
             scratch: Vec::with_capacity(64 * 1024),
             last_write: Instant::now(),
             _not_sync: PhantomData,
