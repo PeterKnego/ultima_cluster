@@ -10,7 +10,8 @@ use super::model::{Attention, ClusterPart, NodeEntry, SetStateView};
 
 pub fn from_cluster(part: &ClusterPart) -> Vec<Attention> {
     let mut out = Vec::new();
-    if part.catalog.empty {
+    // Live only: offline `empty` is never `Some(true)` (ruling P32).
+    if part.catalog.empty == Some(true) {
         out.push(Attention::code("catalog_empty"));
     }
     for s in &part.catalog.sets {

@@ -257,7 +257,11 @@ pub enum HashVerdictView {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CatalogView {
     pub retain_sets: u16,
-    pub empty: bool,
+    /// Live: always `true`/`false` (`ClusterState::catalog_empty`). Offline:
+    /// `false` when the artifact records a set before its own position as
+    /// `Complete`, else `null` — never `true`, because the artifact at P is
+    /// cut AT the instant and cannot record P's own completion (ruling P32).
+    pub empty: Option<bool>,
     pub floor: Option<u64>,
     /// Oldest first.
     pub sets: Vec<SetView>,

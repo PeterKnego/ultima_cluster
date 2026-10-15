@@ -11,6 +11,7 @@
 mod common;
 
 use std::path::Path;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use common::{
@@ -68,6 +69,7 @@ fn catalog_text_on_a_live_node_prints_the_source_and_attention() {
     assert!(r.stdout.contains("source=live"), "{}", r.stdout);
     assert!(r.stdout.contains("role=leader"), "{}", r.stdout);
     assert!(r.stdout.contains("catalog_empty"), "{}", r.stdout);
+    assert!(r.stdout.contains(" empty=true "), "{}", r.stdout);
     let r = run_ctl(&["catalog", "--json", "--instance-dir", d, "--app-id", APP]);
     assert_eq!(r.status, 0, "{r:?}");
     let v: serde_json::Value = serde_json::from_str(&r.stdout).expect("stdout is JSON");
@@ -127,8 +129,17 @@ fn a_stopped_node_reads_offline_and_a_leftover_socket_is_ignored() {
     let v: serde_json::Value = serde_json::from_str(&r.stdout).unwrap();
     assert_eq!(v["source"], "artifact");
     assert!(v["holdings"].is_null());
-    // P28: the artifact cannot show its own set's completion, so offline
-    // never raises catalog_empty (the committed fields stay as at P).
+    // P32: the artifact cannot show its own set's completion, so with no
+    // earlier complete set emptiness is unknown (null, not skipped) and
+    // offline never raises catalog_empty.
+    assert!(
+        v["catalog"]
+            .as_object()
+            .unwrap()
+            .get("empty")
+            .is_some_and(|e| e.is_null()),
+        "{v}"
+    );
     assert!(
         v["attention"]
             .as_array()
@@ -163,11 +174,63 @@ fn a_stopped_node_reads_offline_and_a_leftover_socket_is_ignored() {
         "{}",
         r.stdout
     );
+    assert!(
+        r.stdout.contains(" empty=unknown (offline) "),
+        "{}",
+        r.stdout
+    );
     let r = run_ctl(&["cluster", "--json", "--instance-dir", &d, "--app-id", APP]);
     assert_eq!(r.status, 0, "{r:?}");
     let v: serde_json::Value = serde_json::from_str(&r.stdout).unwrap();
     assert_eq!(v["source"], "artifact");
     assert!(v["self"].is_null() && v["nodes"].is_null(), "{v}");
+}
+
+/// P32: once an EARLIER set completed, the newest artifact proves the
+/// catalog is not empty, so offline `empty` reads `false`.
+#[test]
+fn a_stopped_node_after_two_instants_reads_empty_false_offline() {
+    let root = scratch("uc2ctl-view-offline2-");
+    let (node, dir) = start_node(root.path(), "n0", APP);
+    await_leader(&node, 20);
+    let svc = start_capable_service(&dir, APP);
+    await_row0_capable(&dir, APP, 20);
+    let d = dir.to_str().unwrap().to_string();
+    let mut p = 0;
+    for i in 0..2 {
+        let r = run_ctl(&["snapshot", "--instance-dir", &d, "--app-id", APP]);
+        assert_eq!(r.status, 0, "{r:?}");
+        p = parse_instant(&r.stdout);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while node.snapshot_set_position() != p {
+            assert!(Instant::now() < deadline, "set {p} never completed");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // The node holding its set is not the catalog recording it: wait
+        // until the first set's completion has COMMITTED, so the second
+        // instant's artifact (cut after it) records it as complete.
+        if i == 0 {
+            let view = node.observability().cluster_view;
+            while !view.catalog_has_complete.load(Ordering::Acquire) {
+                assert!(
+                    Instant::now() < deadline,
+                    "set {p} never completed in the catalog"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
+    svc.stop();
+    node.stop();
+    let r = run_ctl(&["catalog", "--json", "--instance-dir", &d, "--app-id", APP]);
+    assert_eq!(r.status, 0, "{r:?}");
+    let v: serde_json::Value = serde_json::from_str(&r.stdout).unwrap();
+    assert_eq!(v["source"], "artifact");
+    assert_eq!(v["view_position"], p, "{v}");
+    assert_eq!(v["catalog"]["empty"], false, "{v}");
+    let r = run_ctl(&["catalog", "--instance-dir", &d, "--app-id", APP]);
+    assert_eq!(r.status, 0, "{r:?}");
+    assert!(r.stdout.contains(" empty=false "), "{}", r.stdout);
 }
 
 #[test]

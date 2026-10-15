@@ -200,7 +200,16 @@ fn storage_text(doc: &ClusterViewDoc) -> String {
         s,
         "catalog retain_sets={} empty={} floor={}",
         c.retain_sets,
-        c.empty,
+        // Ruling P32: `null` only offline — the artifact cannot show its own
+        // set's completion, so emptiness is unknown unless an earlier set
+        // completed.
+        c.empty.map_or_else(
+            || match doc.source {
+                Source::Artifact => "unknown (offline)".into(),
+                Source::Live => "unknown".into(),
+            },
+            |e| e.to_string()
+        ),
         c.floor.map_or("none".into(), |f| f.to_string())
     );
     for set in &c.sets {
@@ -417,6 +426,34 @@ mod tests {
         assert!(
             e.contains("uc2.cluster-view/2") && e.contains("uc2.cluster-view/1"),
             "{e}"
+        );
+    }
+
+    /// P32: offline `empty` prints `unknown (offline)` when null, `false`
+    /// when an earlier set completed; live prints the boolean.
+    #[test]
+    fn catalog_text_prints_offline_empty_as_unknown_or_false() {
+        use uc_protocol::v2::catalog::{SetEntry, SetKind, SetState};
+        let mut st = uc_node::ClusterState::genesis_empty();
+        st.catalog = vec![SetEntry::commanded(1024, SetKind::Full, 0)];
+        let doc = uc_node::view::offline::build_offline_doc(&st, &Default::default(), 1024, 0);
+        let text = catalog_text(&doc);
+        assert!(text.contains(" empty=unknown (offline) "), "{text}");
+        let mut a = SetEntry::commanded(512, SetKind::Full, 0);
+        a.state = SetState::Complete;
+        st.catalog.insert(0, a);
+        let doc = uc_node::view::offline::build_offline_doc(&st, &Default::default(), 1024, 0);
+        assert!(
+            catalog_text(&doc).contains(" empty=false "),
+            "{}",
+            catalog_text(&doc)
+        );
+        let live = parse(include_str!("../../uc_node/src/view/example.json")).unwrap();
+        let want = format!(" empty={} ", live.cluster.catalog.empty.unwrap());
+        assert!(
+            catalog_text(&live).contains(&want),
+            "{}",
+            catalog_text(&live)
         );
     }
 

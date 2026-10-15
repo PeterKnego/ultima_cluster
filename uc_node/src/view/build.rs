@@ -125,7 +125,7 @@ pub fn cluster_part(
         upgrades: upgrades(st, names),
         catalog: CatalogView {
             retain_sets: st.retain_sets(),
-            empty: st.catalog_empty(),
+            empty: Some(st.catalog_empty()),
             floor: q.newest_agreed(u64::MAX),
             sets,
         },
@@ -327,7 +327,7 @@ mod tests {
         let st = state_with_one_agreed_and_one_commanded();
         let p = cluster_part(&st, &names(), Some(4096), Some(false));
         assert_eq!(p.catalog.floor, Some(1024));
-        assert!(!p.catalog.empty);
+        assert_eq!(p.catalog.empty, Some(false));
         assert_eq!(p.catalog.sets.len(), 2);
         let s0 = &p.catalog.sets[0];
         assert!(s0.agreed);

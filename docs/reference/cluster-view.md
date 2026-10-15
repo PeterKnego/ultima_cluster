@@ -125,7 +125,7 @@ A **version** is `{ text, packed }`: the text an operator reads
 | Field | Meaning |
 |---|---|
 | `retain_sets` | The retention setting. |
-| `empty` | `true` while no set has ever completed. |
+| `empty` | Live: `true` while no set has ever completed, else `false`. Offline: `false` when the artifact records an earlier set as complete, else `null` — **never `true`**, because the artifact cannot record its own set's completion ([Offline](#offline)). |
 | `floor` | The newest agreed set (the cluster purge floor); `null` when none. |
 | `sets[]` | Oldest first; at most `retain_sets` plus the commanded ones. |
 
@@ -539,10 +539,14 @@ artifact (`snapshots/cluster/snap-<pos>.ultcluster`) through the same builder:
 - Row names come from a stale `cnc2.dat` when it opens; otherwise names are
   `null` and the text says `row<N>`.
 - The artifact at P is cut **at** the instant, so it records its own set P as
-  `commanded` — that set's completion commits after P. Offline `empty`,
-  `floor` and the newest set's `state` therefore trail by one set, the
-  offline document never raises `catalog_empty`, and the text marks that set
-  `(cut at this artifact; its completion is not visible offline)`.
+  `commanded` — that set's completion commits after P. Offline `floor` and
+  the newest set's `state` therefore trail by one set, and the text marks
+  that set `(cut at this artifact; its completion is not visible offline)`.
+- For the same reason offline `empty` is `false` when the artifact records a
+  set before P as complete, and `null` (unknown) otherwise — never `true`,
+  since P itself may well have completed. The text prints
+  `empty=unknown (offline)`, and the offline document never raises
+  `catalog_empty`.
 - `attention` is limited to what the artifact alone shows.
 - With neither a node nor an artifact, `uc2ctl` says `no cluster artifact
   yet`.

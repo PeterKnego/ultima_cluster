@@ -702,7 +702,9 @@ sets with per-row verdicts, tiers, purge gate, self, nodes, attention).
 the node's response as JSON so a field a newer node adds still passes through.
 Online, offline and error behavior are those of [`cluster`](#cluster). Offline,
 the newest set is marked `(cut at this artifact; its completion is not visible
-offline)` and `catalog_empty` is never raised.
+offline)`, `empty` is `false` only when an earlier set completed and otherwise
+prints `empty=unknown (offline)` (JSON `null`), and `catalog_empty` is never
+raised.
 
 ### `status`
 

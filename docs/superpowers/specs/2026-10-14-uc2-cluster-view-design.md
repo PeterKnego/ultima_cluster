@@ -366,9 +366,10 @@ text above.
 - **P19** — `self.services` is empty until the node has joined.
 - **P28** — the offline document is cut from the newest artifact at P, which
   records its own set P as `commanded` (P's completion commits after P). So
-  offline `empty`, `floor` and the newest set's `state` trail by one set; the
-  offline document never raises `catalog_empty`; offline text marks that set
-  "(cut at this artifact; its completion is not visible offline)".
+  offline `floor` and the newest set's `state` trail by one set; the offline
+  document never raises `catalog_empty`; offline text marks that set
+  "(cut at this artifact; its completion is not visible offline)". Offline
+  `empty` is the maintainer's ruling P32 (as-built errata below).
 - **P29** — amends the plan's Global Constraint "tier ids as 16 lowercase
   hex digits with no prefix (`format!("{:016x}")`, as `uc2ctl tier show`
   prints them)": `uc2ctl tier show` actually prints `0x` + 16 hex digits
@@ -392,6 +393,14 @@ text above.
   `0`, so `upgrade show` stays lossless (PR9). `journal_bytes` and
   `snapshots_bytes` keep `0`: it is a real reading there (an empty journal,
   an empty `snapshots/`), stated on the reference page.
+- **P32 (nullable `empty`, maintainer ruling)** — supersedes the JSON half
+  of P28, which kept offline `empty` as committed at P (so `true` whenever
+  P's own set was the only one). `cluster.catalog.empty` is `bool | null`:
+  live it is always `true`/`false` (`ClusterState::catalog_empty`); offline
+  it is `false` when the artifact records a set before P as `Complete` and
+  `null` otherwise — never `true`, since P's completion is invisible to the
+  artifact cut at P. `catalog_empty` fires on `true` only, so it stays
+  live-only; offline text prints `empty=unknown (offline)`.
 - **M1 (`view_position` is a lower bound)** — `gather` reads
   `ClusterView::consumed` BEFORE `to_state()`. The cluster agent publishes
   the view first and stores `consumed` last, so `view_position` is a lower
