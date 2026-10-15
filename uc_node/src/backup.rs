@@ -101,7 +101,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use uc_journal::{StableValue, StableValueConfig};
+use uc_journal::{StableValue, StableValueConfig, is_preallocation_temp};
 use uc_log::archive::{Archive, ArchiveConfig};
 use uc_log::state::{ConfigRecord, TermMap, VoteRecord};
 use uc_protocol::v2::cnc::CNC_MAX_SERVICES;
@@ -551,7 +551,12 @@ pub fn backup_instance(instance_dir: &Path, out: &Path) -> Result<BackupReport, 
     }
 
     // The ordering rule: journal/ fully, THEN state/, THEN snapshots/*/.
-    copy_dir_sorted(&journal_dir(instance_dir), &journal_dir(out), |_| true)?;
+    // A preallocation temp is a zero-filled future segment, not log: it would
+    // add `segment_size_bytes` of zeros to every artifact (#42), and the
+    // restored node discards it at boot anyway.
+    copy_dir_sorted(&journal_dir(instance_dir), &journal_dir(out), |n| {
+        !is_preallocation_temp(n)
+    })?;
     copy_dir_sorted(&state_dir(instance_dir), &state_dir(out), |_| true)?;
     copy_snapshot_tree(instance_dir, out)?;
 
@@ -818,7 +823,11 @@ pub fn restore_artifact(artifact: &Path, instance_dir: &Path) -> Result<BackupRe
         }
     }
 
-    copy_dir_sorted(&journal_dir(artifact), &journal_dir(instance_dir), |_| true)?;
+    // Same filter as `backup_instance`: an artifact taken before #42 still
+    // carries a preallocation temp, and copying it in is pure waste.
+    copy_dir_sorted(&journal_dir(artifact), &journal_dir(instance_dir), |n| {
+        !is_preallocation_temp(n)
+    })?;
     copy_dir_sorted(&state_dir(artifact), &state_dir(instance_dir), |_| true)?;
     copy_snapshot_tree(artifact, instance_dir)?;
 

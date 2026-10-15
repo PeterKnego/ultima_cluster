@@ -402,6 +402,50 @@ fn backup_never_copies_the_obs_socket() {
     }
 }
 
+/// #42 (L44): a segment preallocation temp is a zero-filled future segment,
+/// not log, so neither a backup nor a restore copies it. Planted by hand
+/// because a draining stop cleans its own (a live or `SIGKILL`ed node is what
+/// leaves one), and planted in the artifact too, the way a pre-#42 backup
+/// carries one.
+#[test]
+fn backup_and_restore_skip_the_preallocation_temp() {
+    let _serialize_guard = serialize();
+    let root = scratch();
+    let dir = root.path().join("n0");
+    let node = start_node(&dir, "backup-prealloc", PurgePolicy::Disabled);
+    drive_and_quiesce(&node, 200);
+    match node.stop_draining(Duration::from_secs(10)) {
+        uc_node::DrainOutcome::Drained => {}
+        other => panic!("expected Drained, got {other:?}"),
+    }
+    let temp = "seg-prealloc.3.tmp";
+    std::fs::write(dir.join("journal").join(temp), vec![0u8; 1 << 20]).unwrap();
+    let files_in = |d: &Path| std::fs::read_dir(d).unwrap().count();
+    let journal_files = files_in(&dir.join("journal")) - 1;
+
+    let out = root.path().join("backup-prealloc-out");
+    backup_instance(&dir, &out).expect("backup_instance");
+    assert!(
+        !out.join("journal").join(temp).exists(),
+        "the preallocation temp was backed up"
+    );
+    assert_eq!(
+        files_in(&out.join("journal")),
+        journal_files,
+        "every other journal file is still copied"
+    );
+    verify_artifact(&out).expect("the artifact verifies without it");
+
+    std::fs::write(out.join("journal").join(temp), vec![0u8; 1 << 20]).unwrap();
+    let fresh = root.path().join("n0-restored");
+    restore_artifact(&out, &fresh).expect("restore_artifact");
+    assert!(
+        !fresh.join("journal").join(temp).exists(),
+        "the preallocation temp was restored"
+    );
+    assert_eq!(files_in(&fresh.join("journal")), journal_files);
+}
+
 // ---------------------------------------------------------------------- Test 2
 
 #[test]

@@ -92,6 +92,17 @@ pub struct Journal {
     healed_torn_tail: bool,
 }
 
+/// Whether `name` is a segment preallocation temp (`seg-prealloc.<n>.tmp`).
+///
+/// Such a file holds no records: it is a zero-filled segment staged ahead of
+/// need and renamed to `seg-{seq}.log` when it is activated, and an orphan
+/// one (a crash between create and rename) is deleted by [`Journal::open`].
+/// So a copy of a journal directory — a backup — can skip it: it is not part
+/// of the log, and a node regrows its own on first boot.
+pub fn is_preallocation_temp(name: &str) -> bool {
+    name.starts_with("seg-prealloc.") && name.ends_with(".tmp")
+}
+
 impl Journal {
     pub fn open(config: JournalConfig) -> Result<Self, JournalError> {
         std::fs::create_dir_all(&config.dir)?;
@@ -103,8 +114,7 @@ impl Journal {
         {
             for ent in rd.filter_map(|e| e.ok()) {
                 let n = ent.file_name();
-                let s = n.to_string_lossy();
-                if s.starts_with("seg-prealloc.") && s.ends_with(".tmp") {
+                if is_preallocation_temp(&n.to_string_lossy()) {
                     let _ = std::fs::remove_file(ent.path());
                 }
             }
