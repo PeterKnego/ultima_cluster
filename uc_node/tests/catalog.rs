@@ -26,6 +26,9 @@
 //!    a fetch routed by `holders()` lands from the surviving holder;
 //! 6. on a learner-only cluster the voters know the cluster floor yet purge
 //!    nothing until a fetch lands the set on them.
+//! 7. the cluster view (project 4) renders all of the above as one document
+//!    — genesis and roles, an agreed set and its holders, a diverged row as
+//!    an attention code, and a reported backup tier with its purge gate.
 //!
 //! The harness is copied from `learner.rs` (each integration test file is its
 //! own binary; `uc_node/tests/` has no shared module), trimmed and widened to
@@ -1164,6 +1167,16 @@ fn a_diverged_row_completes_the_set_but_never_moves_the_floor() {
             "node {v} holds p1 complete — the set is complete, it is just not agreed"
         );
     }
+    // Cluster view (project 4): the same verdict, as an attention code that
+    // names the set and the row — read while the cluster is still running.
+    let v = view_of(c.node(leader));
+    assert!(
+        attention(&v)
+            .iter()
+            .any(|a| a["code"] == "set_diverged" && a["set"] == p1 && a["row"] == "sum"),
+        "the view names the diverged row: {}",
+        v["attention"]
+    );
 
     // The floor rule. A NEGATIVE, so it is held for a span (well past the
     // 100 ms persist throttle and many purge ticks) rather than read once.
@@ -2427,5 +2440,241 @@ fn submit_frames_fails_by_name_on_a_node_that_does_not_serve() {
         elapsed < Duration::from_secs(1),
         "it must fail at once, not after a deadline: {elapsed:?}"
     );
+    c.stop();
+}
+
+// ================================================================ cluster view (project 4)
+//
+// Cluster-view spec §8 / planning ruling PR11: the document's CONTENT on a
+// live 3-node cluster, read the way `/cluster` renders it
+// (`view::render_live(&node.observability())`). The socket itself is tested
+// against one real daemon in `lifecycle.rs`.
+
+fn view_of(node: &Node) -> serde_json::Value {
+    serde_json::from_str(&uc_node::view::render_live(&node.observability())).expect("view is JSON")
+}
+
+fn attention(v: &serde_json::Value) -> &Vec<serde_json::Value> {
+    v["attention"].as_array().expect("attention is an array")
+}
+
+/// Before any instant: the catalog is empty (and says so in `attention`),
+/// the genesis settings and membership are the same on every node, the
+/// leader names itself `leader`, and a follower points at it for `nodes`.
+#[test]
+fn the_view_before_the_first_instant_shows_genesis_settings_and_catalog_empty() {
+    let _g = serialize();
+    let mut c = spawn(3, 0, opts("view-genesis", false), |_| true);
+    start_sums(&mut c);
+    let leader = await_single_leader(&c, 30);
+    await_capable(&c, &[0]);
+    let v = view_of(c.node(leader));
+    assert_eq!(v["schema"], uc_node::view::SCHEMA);
+    assert_eq!(v["source"], "live");
+    assert_eq!(v["role"], "leader");
+    assert_eq!(v["joined"], true);
+    assert_eq!(v["cluster"]["catalog"]["empty"], true);
+    assert!(v["cluster"]["catalog"]["floor"].is_null());
+    assert_eq!(
+        v["cluster"]["membership"]["members"]
+            .as_array()
+            .unwrap()
+            .len(),
+        3
+    );
+    assert!(
+        attention(&v).iter().any(|a| a["code"] == "catalog_empty"),
+        "{}",
+        v["attention"]
+    );
+    assert_eq!(v["self"]["services"][0]["name"], "sum");
+    assert_eq!(v["self"]["services"][0]["attached"], true);
+    assert_eq!(
+        v["nodes"].as_array().expect("the leader lists nodes").len(),
+        3
+    );
+    assert!(v["nodes_from"].is_null());
+
+    let follower = c.voters().into_iter().find(|&i| i != leader).unwrap();
+    let f = view_of(c.node(follower));
+    assert_eq!(f["role"], "follower");
+    assert_eq!(f["joined"], true);
+    assert!(f["nodes"].is_null(), "only the leader lists nodes");
+    assert_eq!(f["nodes_from"], "leader");
+    assert_eq!(f["leader"]["id"], v["node_id"]);
+    assert_eq!(
+        f["cluster"]["settings"], v["cluster"]["settings"],
+        "the cluster part is the same on every node"
+    );
+    assert_eq!(
+        f["cluster"]["membership"], v["cluster"]["membership"],
+        "the committed membership is the same on every node"
+    );
+    c.stop();
+}
+
+/// After one full instant: the set is agreed with row `sum` agreed, it is
+/// the floor, `catalog_empty` is gone, and the leader's `held_by` names all
+/// three holders once their holdings arrive on STATUS.
+#[test]
+fn the_view_after_an_instant_shows_the_set_agreed_and_held_by_every_holder() {
+    let _g = serialize();
+    let mut c = spawn(3, 0, opts("view-agreed", false), |_| true);
+    start_sums(&mut c);
+    let leader = await_single_leader(&c, 30);
+    let voters = c.voters();
+    await_capable(&c, &[0]);
+    submit_frames(c.node(leader), 2000);
+    let p = instant_until_complete(&c, leader, &voters);
+    await_agreed(&c, &voters, p);
+    // Holdings travel on STATUS; wait until the leader lists all three holders.
+    await_until(30, "the leader's view lists every holder of p", || {
+        let v = view_of(c.node(leader));
+        v["cluster"]["catalog"]["sets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["position"] == p && s["held_by"].as_array().is_some_and(|h| h.len() == 3))
+    });
+    let v = view_of(c.node(leader));
+    let set = v["cluster"]["catalog"]["sets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["position"] == p)
+        .unwrap()
+        .clone();
+    assert_eq!(set["state"], "complete");
+    assert_eq!(set["agreed"], true);
+    assert_eq!(set["stalled"], false);
+    assert_eq!(set["rows"][0]["name"], "sum");
+    assert_eq!(set["rows"][0]["verdict"], "agreed");
+    assert_eq!(set["cluster"]["verdict"], "agreed");
+    assert_eq!(v["cluster"]["catalog"]["empty"], false);
+    assert_eq!(v["cluster"]["catalog"]["floor"], p);
+    assert!(
+        attention(&v).iter().all(|a| a["code"] != "catalog_empty"),
+        "{}",
+        v["attention"]
+    );
+    let nodes = v["nodes"].as_array().unwrap();
+    assert_eq!(nodes.len(), 3);
+    assert!(nodes.iter().all(|n| n["stale"] == false), "{nodes:?}");
+    // The leader's own holdings list the set it holds.
+    assert!(
+        v["self"]["holdings"]["sets_held"]
+            .as_array()
+            .is_some_and(|s| s.iter().any(|x| *x == p)),
+        "{}",
+        v["self"]["holdings"]
+    );
+    // A follower carries the same set but no `held_by` (leader-only).
+    let follower = voters.into_iter().find(|&i| i != leader).unwrap();
+    let f = view_of(c.node(follower));
+    let fset = f["cluster"]["catalog"]["sets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["position"] == p)
+        .expect("the follower's catalog lists p")
+        .clone();
+    assert_eq!(fset["agreed"], true);
+    assert!(fset["held_by"].is_null());
+    c.stop();
+}
+
+/// Cluster-view spec §8, ruling P12: a registered backup tier — its committed
+/// watermark, its `lag_bytes` against this node's commit, and the purge gate
+/// at K = 1 — on every node. The writer's claim is put in place through the
+/// same test seam `backup_tier.rs` uses (`offer_backup_claim_for_test`).
+#[test]
+fn the_view_of_a_reported_tier_shows_its_watermark_lag_and_purge_gate() {
+    use uc_protocol::v2::backup::{BackupWatermark, WatermarkOp};
+    let _g = serialize();
+    let mut o = opts("view-tier", false);
+    o.settings.purge_requires_tiers = 1;
+    let mut c = spawn(3, 0, o, |_| true);
+    start_sums(&mut c);
+    let leader = await_single_leader(&c, 30);
+    let voters = c.voters();
+    await_capable(&c, &[0]);
+    submit_frames(c.node(leader), 2000);
+    let p = instant_until_complete(&c, leader, &voters);
+    await_agreed(&c, &voters, p);
+
+    const TIER: u64 = 0x7E57_0000_0000_00C7;
+    let w = BackupWatermark {
+        op: WatermarkOp::Report,
+        tier_id: TIER,
+        oldest_set: p,
+        newest_set: p,
+        through: p,
+        reporter: leader as u64,
+    };
+    let id = format!("{TIER:016x}");
+    let committed_everywhere = |c: &Cluster| {
+        voters.iter().all(|&i| {
+            view_of(c.node(i))["cluster"]["tiers"]
+                .as_array()
+                .is_some_and(|t| t.iter().any(|t| t["id"] == id.as_str()))
+        })
+    };
+    // Re-offer every 500 ms: one delivery can be lost to an election
+    // (`backup_tier.rs`'s `offer_until`).
+    let deadline = deadline_secs(30);
+    'offer: loop {
+        c.node(leader).offer_backup_claim_for_test(w);
+        let next = Instant::now() + Duration::from_millis(500);
+        while Instant::now() < next {
+            if committed_everywhere(&c) {
+                break 'offer;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the tier's watermark never committed"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    for &i in &voters {
+        let v = view_of(c.node(i));
+        let tiers = v["cluster"]["tiers"].as_array().unwrap();
+        assert_eq!(tiers.len(), 1, "node {i}: one tier: {tiers:?}");
+        let t = &tiers[0];
+        assert_eq!(t["id"], id.as_str(), "node {i}: 16 hex digits, no prefix");
+        assert_eq!(t["oldest_set"], p, "node {i}");
+        assert_eq!(t["newest_set"], p, "node {i}");
+        assert_eq!(t["through"], p, "node {i}");
+        assert_eq!(t["reporter"], leader as u64, "node {i}");
+        let commit = v["commit"].as_u64().expect("a live view has a commit");
+        assert!(
+            commit >= p,
+            "node {i}: commit {commit} below the watermark {p}"
+        );
+        assert_eq!(
+            t["lag_bytes"],
+            commit - p,
+            "node {i}: lag is THIS node's commit less the tier's through"
+        );
+        let g = &v["cluster"]["purge_gate"];
+        assert_eq!(g["requires_tiers"], 1, "node {i}");
+        assert_eq!(g["tiers_reporting"], 1, "node {i}");
+        assert_eq!(
+            g["position"], p,
+            "node {i}: K = 1 gates purge at the one tier's through"
+        );
+        assert_eq!(
+            g["released"], false,
+            "node {i}: plenty of space, no release"
+        );
+        assert!(
+            attention(&v)
+                .iter()
+                .all(|a| a["code"] != "tier_behind" && a["code"] != "purge_gate_released"),
+            "node {i}: a current tier and a held gate raise nothing: {}",
+            v["attention"]
+        );
+    }
     c.stop();
 }
