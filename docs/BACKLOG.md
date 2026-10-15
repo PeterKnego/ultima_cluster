@@ -1,51 +1,21 @@
 # Backlog — candidate directions after M14
 
-## Bound the three unbounded waits in `remote_lin.rs` — DONE for `2.12.0`
-
-**Added 2026-09-08**, from the fleet-gate follow-up (see `docs/releases.md`,
-"Known issue at release"); **taken up and bounded 2026-09-12.** The worker
-`join()`, the chaos `join()` and `Reap::drop`'s `kill(); wait()` in
-`testing/uc_crashtest/tests/remote_lin.rs` were the only waits in that test
-body without a deadline, and so the only places a 60-minute stall could live.
-They are why the 2026-09-08 nightly spent its whole budget and was cancelled
-instead of failing fast — that run took every other nightly job's evidence
-down with it. Bounding them is a **diagnosability** fix: the next occurrence
-fails with a location instead of a cancellation.
-
-As built: `common::join_within(handle, label, timeout)` polls
-`JoinHandle::is_finished` and panics naming the label at the deadline (the
-thread is abandoned; the panic ends the test and the process exit ends the
-thread) — workers get 90 s and the chaos thread 150 s after `stop`, each
-several times its longest single blocking step, derived at the constants
-`WORKER_JOIN_BUDGET` / `CHAOS_JOIN_BUDGET` (the chaos budget composes with
-two bounded reaps plus the restart wait). The hard-crash and survival suites'
-own worker joins take the same helper at 60 s. `Reap::drop` now uses the
-`poll_exit` idiom that `enospc.rs` already had (moved to `common`) with a
-30 s `REAP_TIMEOUT`, then reports the pid and abandons the child rather than
-blocking in `wait()`. Every crashtest suite shares `Reap`, so all of them get
-the bounded reap. Five tests in `common` pin the helpers.
-
-This was the second half of the `CncPage::meta()` item; the first half is
-fixed — see the [Shipped](#shipped-since-this-list-was-written) section's
-first entry. **Neither half explains the hang**, and neither claims to: this
-one makes the next occurrence fail with a name and a location, which is what
-it takes to find the cause.
-
 *Written 2026-09-01 against `v2.10.0`. Status: a ranked list of options, not
 a plan. Nothing here is scheduled; the maintainer picks. Every item cites the
 document that first recorded it, so the reasoning can be re-checked rather
 than re-derived. When an item is taken up it gets a spec under
 `docs/superpowers/specs/` and a gate doc under `docs/benchmarks/`, and its
-line here is updated to point at them. When an item is dropped, say why
-here rather than deleting it — the "Deprioritized" section of
-`docs/superpowers/specs/2026-08-01-uc2-formal-roadmap.md` is the model.*
+line here is updated to point at them. An item that ships, or stops
+being relevant, is removed (last purge 2026-10-15): `RELEASES.md`,
+`docs/releases.md` and git keep the record.*
 
 ## Where this list comes from
 
 M8–M14 turned the v2 engine into a deployable product (`RELEASES.md`). What
-the record does not contain is a user: the only in-tree service is the
-`examples/counter` crate, `docs/reference/remote-protocol.md` still describes
-itself as "the page a non-Rust port implements from", and no port exists.
+the record does not contain is an outside user: the in-tree services are the
+`examples/counter` teaching crate and the `examples/kv` dogfood store,
+`docs/reference/remote-protocol.md` still describes itself as "the page a
+non-Rust port implements from", and no port exists.
 Every remaining gap the docs record is either an accepted residual
 (`docs/reference/limits.md`, `docs/security/self-assessment.md`) or a
 deferral waiting for a reason to matter. The ranking below follows from
@@ -55,49 +25,23 @@ that: the first direction is the one that supplies the reason.
 
 ### 1. Dogfood — a real service plus a second-language client
 
-Build one non-trivial reference service in-tree (a sessioned key-value
-store or an order book), and a remote client in a second language (Go or
-Python) written from `docs/reference/remote-protocol.md` alone, as that page
-invites. Run both through the gate discipline.
+The in-tree reference service and the two-track experience assessment are
+done (`examples/kv`, the wayfinder map
+[#16](https://github.com/PeterKnego/ultima_cluster/issues/16), closed
+2026-09-18), and jumbo-frame discovery (`2.12.0`) answered the payload-ceiling
+question. What remains open:
 
-- **Why first:** it exercises the whole M8–M14 surface the way a user would,
-  and it settles two questions the docs cannot settle on their own:
-  - ~~whether the **command payload ceiling** is a real adoption blocker~~ —
-    **ANSWERED by jumbo-frame MTU discovery (`2.12.0`)**, without waiting for
-    a workload. The ceiling is no longer one number: it is discovered per
-    cluster from the path MTU between members (`RUNGS = [1408, 8832, 8960]`)
-    and committed through the replicated `Settings` record, so a cluster on a
-    jumbo fabric carries ≤ 8896 B crypto-off / ≤ 8864 B crypto-on, and one on
-    an ordinary 1500 B path keeps the old ≤ 1344 B / ≤ 1312 B. Of the three
-    ways of moving it this item named, the jumbo one is taken; **fragmenting a
-    command across datagrams stays out of scope** (a command above the
-    discovered ceiling is refused, never split), and an OS-bypass fabric is
-    still a hypothesis. What a workload could still settle is whether ~8.8 KB
-    is enough — see [the
-    explainer](notes/uc2-jumbo-frame-discovery-explained.md) and [the
-    how-to](how-to/jumbo-frames.md).
-  - whether the **remote protocol needs a v2**: `SUBMIT`/`QUERY` carry no
-    FSM selector, so a remote client reaches only FSM 0
-    (`docs/superpowers/specs/2026-08-21-uc2-multi-service-design.md` §11 "Out
-    of scope"; `docs/releases.md` 2.8.0 entry). **This half stands**, and
-    `2.12.0` added a second thing a v2 would carry: protocol v1 advertises no
-    payload ceiling, so a `uc_remote` client cannot know the cluster's
-    discovered one — it warns on the standard 1312 B threshold alone, and
-    measures the bare command while the node's door sees the session
-    envelope's extra 16 B.
-- **Cost:** moderate. **Output:** a backlog grounded in use, plus the two
-  decisions above.
-- **Status 2026-09-13: TAKEN UP as a wayfinder map** (issue tracker,
-  label `wayfinder:map`), rescoped as a two-track experience assessment —
-  a clean-room builder and a clean-room operator on a real fleet, UC
-  frozen at 2.12.0. Charter with all eighteen charting decisions:
-  `docs/superpowers/specs/2026-09-13-uc2-dogfood-kv-charter.md`; the Go
-  client is **out of scope** for this map. The 2026-09-01 brief's
-  decisions stand except its wire format, withdrawn.
+- **A remote client in a second language** (Go or Python), written from
+  `docs/reference/remote-protocol.md` alone, as that page invites — the
+  wayfinder map scoped it out.
+- **The remote protocol's FSM selector and ceiling.** `SUBMIT`/`QUERY` still
+  carry no FSM selector, so a remote client reaches only FSM 0
+  (`docs/superpowers/specs/2026-08-21-uc2-multi-service-design.md` §11 "Out
+  of scope"), and the protocol advertises no payload ceiling, so a `uc_remote`
+  client warns on the standard 1312 B threshold alone; the read-your-writes
+  protocol v2 added neither.
 
 ### 2. Schedule-table and timer follow-ons
-
-See [Shipped](#shipped-since-this-list-was-written) below.
 
 *What is left of items 2 and 2a after both shipped in `2.11.0`. Every bullet
 is a KNOWN, documented residual, not a defect: each is stated in
@@ -106,29 +50,6 @@ reason it is deliberate. Kept as a numbered item so it stays a candidate
 direction rather than a footnote to a finished one. The references that used
 to point at "§ 2a" for these residuals now point here.*
 
-- ~~**A restarted node under-ships the table for one window**~~ (plan 3
-  residual a) — **CLOSED by the cluster FSM (2.11.0), plan 1.** The
-  cause was structural: the table was shipped by a **live read** of the
-  shipping node's memory, gated on the cnc commit counter, which is
-  deliberately not primed at boot. Both the read and the gate are gone. The
-  table is a record inside the internal cluster FSM, and the snapshot session
-  carries that FSM's own **artifact** (`service_id = 255`), which is committed
-  by construction and durable across a restart. Pinned by
-  `uc_node/tests/learner.rs::a_joiner_served_by_a_leader_restarted_before_its_first_commit_advance_still_installs_the_table`.
-  → [The cluster FSM, explained](notes/uc2-cluster-fsm-explained.md)
-- ~~**A wiped node's kept table does not propagate by snapshot**~~ (plan 3
-  residual b, post-R7) — **CLOSED by the same change.** There is no wipe
-  keep-alive to propagate: `ScheduleRecord` (retired) and
-  `shippable_schedule` (retired) are gone — as is `revert_schedule_below` —
-  and the position-0 encoding rule they needed went with them. The table is FSM state applied at **commit**, so an
-  uncommitted frame is never applied and a truncated one never existed as far
-  as the FSM is concerned — there is nothing to revert and nothing to keep
-  alive at an unanchored position.
-  → [The cluster FSM, explained](notes/uc2-cluster-fsm-explained.md)
-- ~~**One crash window loses one adoption**~~ — **CLOSED by the same change.**
-  There is no `state/schedules.state` to crash between recording and
-  persisting; the `uc2-cluster` agent recovers by replaying the journal above
-  its artifact, exactly as every other FSM does.
 - **A promotion may re-append one tick per entry.** Still open, in a slightly
   different shape: the timer heap is leader-only since plan 1, so a newly
   promoted leader arms the table from the cluster FSM's view and has no
@@ -140,14 +61,6 @@ to point at "§ 2a" for these residuals now point here.*
   is not expressible — a timezone database is replicated state that must agree
   on every node and across every upgrade. Cron-style rules are a possible
   fourth `kind` byte; the codec has room.
-- ~~**`append_schedule_table` (retired) duplicated `append_config`'s body**~~ (ruling
-  R8) — **moot**: the cluster FSM collapsed both into one `append_cluster`
-  with a kind byte, because there is one frame type now. The underlying rule
-  stands for any future append body: extract **with an A/B** against
-  `apply_bench` and the client hop, on rebuilt-same-source controls, never by
-  inspection — M14a's inline-ladder lesson is that code added to a hot loop's
-  body costs even on the arms that never execute (9 % at N=1, from codegen
-  alone).
 - **`node.toml [schedules]` as a boot-time convenience** stays the door spec
   §10 left open: a per-host section that simply calls the admin op at startup.
   Deliberately not the primary form — it turns a schedule edit into a rolling
@@ -157,31 +70,21 @@ to point at "§ 2a" for these residuals now point here.*
   artifact**, a file beside the running node, so it lags the live view and
   reads `none` until the first snapshot instant completes (`schedule show`,
   `settings show` and `upgrade show` read the live cluster view since
-  project 4). (Three
-  other residuals listed here were closed by plan 1's pre-final pass:
-  `uc2ctl backup` now carries `snapshots/cluster/`;
-  `uc2_cluster_fsm_position` and `uc2_settings_position` are exported; and
-  `uc2_agent_alive` carries the fifth agent.)
+  project 4).
 - **New with coordinated snapshots (plan 2), and deliberate.**
   A voter's purge floor waits for an operator after a `--standby` instant:
   **automatic standby replication** — a voter pulling a learner's set without
   `uc2ctl snapshot fetch` — needs the learner's "complete at P" to be visible
   cluster-wide, which is a fourth cluster-FSM command and a design of its own.
-  Aeron's open-source half defers it the same way. Two smaller ones beside it:
+  Aeron's open-source half defers it the same way. One smaller one beside it:
   the redirect's **sending** side emits no log record (it leaves `uc_net`,
   which carries no logging dependency by design — its witness is the leader's
-  `snap_redirects` counter), and the two new session-refusal counters
-  (`uc2_snapshot_refused_position_total`,
-  `uc2_snapshot_refused_fetch_expired_total`) are rendered but not yet listed
-  in `CONTRACT_SERIES`.
+  `snap_redirects` counter).
 - **Why:** none of these blocks anyone today, which is exactly why the list is
-  worth keeping — a residual nobody wrote down becomes a surprise. The three
-  struck-through entries above are the ones a user actually met by accident,
-  and they are closed; what is left is conveniences and observability.
-- **Cost:** low, and what remains is two items: a live reading for
-  `schedule show` / `settings show` / `status`, which needs the
-  response-on-the-egress-broadcast path (spec §13 phase 2), and automatic
-  standby replication, which needs a fourth `CLUSTER` kind (spec §13).
+  worth keeping — a residual nobody wrote down becomes a surprise.
+- **Cost:** low, and what remains is two items: a live reading for `uc2ctl
+  status`'s `schedule_position=`, and automatic standby replication, which
+  needs a fourth `CLUSTER` kind (spec §13).
 
 ### 3. Rolling upgrades and leadership transfer
 
@@ -199,18 +102,13 @@ deferred by name:
   spec or none at all."
 - **Crypto-on-by-default** was parked "revisit at M12, not before" in the
   same spec and never revisited; it belongs in this milestone.
-- **FSM version — the static half shipped with FSM identity (implemented on
-  `uc2/fsm-identity`, release on hold); see spec §7**
-  (`docs/superpowers/specs/2026-09-02-uc2-fsm-identity-design.md` §7):
-  `const VERSION` per FSM in Aeron's packed-semver layout, attach-written to
-  the cnc slot, exported, carried per row on `SNAP_BEGIN` and
-  equality-checked. What is left for THIS item, with Aeron as the
-  comparator (read from source): the log-stamped half — the leader writes
-  the version into a term-boundary log event and snapshot markers, every
-  module and service validates its static value against it through a
-  pluggable validator (Aeron's default: major-equality), fail-stop — and
-  the rolling-upgrade semantics that follow. The carrier is a term-boundary
-  log event, not `SNAP_BEGIN`.
+- **FSM version** — the static half shipped with FSM identity (`2.11.0`,
+  `docs/superpowers/specs/2026-09-02-uc2-fsm-identity-design.md` §7), and the
+  committed per-row running version with the pin (`2.13.0` and
+  [#33](https://github.com/PeterKnego/ultima_cluster/issues/33)). What is left
+  is the rolling-upgrade semantics: a committed per-row level, so two versions
+  of one row can apply side by side on purpose —
+  [#66](https://github.com/PeterKnego/ultima_cluster/issues/66).
 - **Why:** the flag-day rule is the limit an operator hits first. This is
   the gap between "deployable" and "operable at scale".
 - **Cost:** high — both items touch consensus and are a wire flag day
@@ -294,9 +192,7 @@ All framed by the docs as characterisation, not defects:
   c6id.2xlarge, of which the apply agent's 50 µs idle sleep is a bimodal
   second mode (77 µs at p90, removed by `UC2_APPLY_IDLE=spin`), thread
   placement 41 µs of mean, fsync 27 µs, and the wire at most 33.5 µs.
-  **Candidate that follows from it:** make the apply agent's default idle a
-  spin → yield → sleep ladder (the `uc_client` wait shape), gated by an
-  `apply_bench` A/B plus a re-run of that record's arms A and C; and a
+  **Candidate that follows from it:** a
   paced open-loop mode for `m12_gate client-direct` so "p99 at N msg/s
   offered" can be stated in the same terms Adaptive's cluster benchmarks
   use. Kernel bypass and the net-decomp brief's WIRE(P) instrument are
@@ -350,8 +246,6 @@ reviewer wants a workload to attack.
   check.
 - **`nightly.yml` has never run on the `v2.10.0` tag commit**
   (`docs/releases.md`, release-evidence table).
-- **`uc2-gateway --version`** — fixed on `main` after the tag, lands in the
-  next release (`docs/releases.md`).
 - **Snapshot-session probe counters are sender-local** — `snap_redirects`
   and `snap_request_unknown_peer` (the member gate on `SNAP_REQUEST`, plan 2)
   live in `SenderStats` with no `/metrics` family, `Node::` accessor or obs
@@ -366,25 +260,6 @@ reviewer wants a workload to attack.
 - **Alert on `uc2_log_clock_smear_ns`** (a smear above N seconds for M
   minutes), with its `scripts/m10_alert_fire.sh` builder and scenario —
   recorded 2026-09-08 by the log-clock spec's errata bullet 9.
-- ~~**The cluster FSM's own artifact is not hash-reported.**~~ — **CLOSED by
-  the snapshot catalog (`0.11.0`, unreleased).** `SnapshotReport` now admits
-  row `255` (`CLUSTER_ROW`): a node that completes a set reports the cluster
-  artifact's hash beside its declared rows', and the catalog's `cluster`
-  field carries that row's verdict exactly as every other row's. Recorded
-  2026-09-21 as erratum 6 of the FSM upgrade lifecycle spec's "Errata (plan
-  B3, as built)"; closed by
-  [the snapshot catalog design](superpowers/specs/2026-10-01-uc2-snapshot-catalog-design.md).
-- **Project 2: the lifecycle rule that USES the catalog — TAKEN UP 2026-10-09**, designed in
-  [the lifecycle spec](superpowers/specs/2026-10-09-uc2-snapshot-lifecycle-design.md), plan
-  `docs/superpowers/plans/2026-10-09-uc2-snapshot-lifecycle.md`; #48 (holder preference) closes with this work. Original entry:
-  "Load the newest agreed set ahead of me, replay from there" at restart,
-  catch-up, join and upgrade; when a short catch-up should replay instead of
-  installing; holder preference among `holders()` (locality, learner-first).
-  The catalog spec provides the queries (`newest_agreed`, `agreed_for`,
-  `holders`) and deliberately does not change `replay_into` or `attach`
-  itself —
-  [spec §2 "Out"](superpowers/specs/2026-10-01-uc2-snapshot-catalog-design.md#2-scope)
-  and §12.
 - **Auto-fetch can re-download an agreed set that is never noted held.** An
   operator `uc2ctl snapshot fetch` with no position can store a newer,
   not-yet-agreed set; a later auto-fetch of the newest agreed set below it
@@ -393,28 +268,11 @@ reviewer wants a workload to attack.
   (normally within ~5 s) and persists only if that set diverged, which
   `Uc2SnapshotSetDiverged` already alerts. Snapshot lifecycle final review
   M3, 2026-10-10 (the Task 9 ledger had called it unreachable).
-- **Project 3: the backup tier.** **3a implemented on `design/backup-tier`
-  (merged as PR #100, not yet released); 3b implemented on
-  `design/backup-tier-3b` (not yet released):** the writer, the watermark
-  (`CLUSTER` kind `7`), in-tier retention, `uc2ctl tier
-  show/verify/restore/fork/export-corpus/forget`
-  ([how-to](how-to/back-up-to-a-tier.md),
+- **Project 3: the backup tier — one edge left open.** 3a and 3b are merged
+  (PRs #100 and #107, not yet released;
+  [how-to](how-to/back-up-to-a-tier.md),
   [3a spec](superpowers/specs/2026-10-10-uc2-backup-tier-design.md),
-  [3b spec](superpowers/specs/2026-10-12-uc2-backup-tier-3b-design.md)). 3b
-  adds the lineage in the tier (a tier-seeded `--new-node` joins a live
-  cluster), backup-gated purge (`purge_requires_tiers`, with the writer's
-  read-back) and the tier as a source (`[tier_source]`: store-only fetches and
-  below-floor installs). Lifecycle spec D3 (`auto_fetch` on by default) was
-  **revisited and kept**; `auto_fetch = false` with a tier source on every
-  voter is now a supported configuration. Origin:
-  [snapshot catalog spec §2 "Out"](superpowers/specs/2026-10-01-uc2-snapshot-catalog-design.md#2-scope)
-  and §12. (A set frozen before a row applied anything could not start a
-  service, [#98](https://github.com/PeterKnego/ultima_cluster/issues/98) —
-  fixed 2026-10-11.)
-  - **3b: tier-seeded replacement node** (ruling R12a, 2026-10-11) —
-    **resolved by 3b.** Each backed-up set records the cluster's term map
-    below it; restore writes that as the node's map, so reconcile aligns with
-    a live leader.
+  [3b spec](superpowers/specs/2026-10-12-uc2-backup-tier-3b-design.md)).
   - **3b: retention's view gate, the origin-set edge** (ruling R10a, deferred
     by the 3a final review, 2026-10-11). Retention runs only once the
     writer's view has consumed past the tier's newest complete set, on the
@@ -435,11 +293,6 @@ reviewer wants a workload to attack.
   measure the archive hop alone with and without per-block zstd before
   deciding — it would also change the on-disk block format (a flag day).
   Recorded 2026-10-10.
-- **Project 4 — the operator / AI surface: SHIPPED** (unreleased; `2.14.0`).
-  The live cluster view (`GET /cluster`, `<instance_dir>/obs.sock`, `uc2ctl
-  cluster`/`catalog`, live `settings`/`schedule`/`upgrade show`) is documented
-  in [The cluster view](reference/cluster-view.md); spec
-  [`2026-10-14-uc2-cluster-view-design.md`](superpowers/specs/2026-10-14-uc2-cluster-view-design.md).
 - **`auto_fetch_candidates` pairs a catalog with a separately-read version.**
   `uc_node/src/node.rs`'s `auto_fetch_candidates` takes the catalog from the
   `ClusterViewInner` it is handed but loads `ClusterView::catalog_version`
@@ -459,13 +312,6 @@ reviewer wants a workload to attack.
   browser GUI talks to the nodes directly or a GUI backend polls them, which
   is the shape the read surface already assumes. Taken from the cluster-view
   spec §9.
-- **FIXED (#95, 2026-10-10): a whole-cluster cold restart never committed.**
-  Reproduced on `main` with explicit AND default `fsm_lag` (`uc_node/tests/cold_restart.rs`):
-  - At boot every row's `applied` reads `0`, so each node capped its durable reports at `0 + fsm_lag`.
-  - The new leader's `NewTerm` frame at the old log end could therefore never commit.
-  - A service cannot attach until its node has learned a commit (plan B3), so nothing could move `applied`. Every door answered `NodeBooting` forever.
-
-  The fix: until the node has joined (`declared_published`), pacing is measured from the log end the node booted with instead of `applied = 0`. The existing log can then commit, plus `fsm_lag` of new frames (always room for the `NewTerm` frame). A follower rejoining a live cluster stays paced. `learner.rs`'s restarted-shipper test had staged its scenario on this deadlock; it is restaged on a joined, unserviced peer's ordinary pacing. The catalog test-4 "applied mirror" workaround is removed. First recorded 2026-10-04 (catalog ruling R20).
 - **The `uc_service::apply` replay forward-progress guard has no counter.**
   Plan B3 T5 added a guard that hands the cycle back when a replay pass
   fails to advance the cursor (it used to spin forever, which also hung
@@ -477,7 +323,7 @@ reviewer wants a workload to attack.
   status word for it. A row that waits there legitimately (its covering
   artifact is above the apply target) is visible only in the service's own
   stderr. Recorded 2026-09-21.
-- **Widen `replay_into`'s gap test — before the `2.13.0` release.**
+- **Widen `replay_into`'s gap test.**
   `uc_service/src/replay.rs`'s gap guard is `first > start_pos` with `first
   = reader.first_meta().unwrap_or(0)`, which cannot detect the shape a
   below-floor joiner presents: cursor 0, a stale journal segment based at 0
@@ -521,23 +367,6 @@ reviewer wants a workload to attack.
   an enum with a `Display` would make a typo a compile error and let the
   stale-value class of bug (a documented value that no longer exists) be
   caught by the match. Ledgered by plan B3's T5 review, recorded 2026-09-21.
-- ~~**Plan D carries: `uc2_cluster_fsm_position` was REPOINTED in
-  `2.13.0`.**~~ — **DONE 2026-09-22 (plan D, T4).** Written up as a
-  **changed reading** — not a fix — in both release documents: a
-  "Changed reading" bullet in `RELEASES.md`'s `v2.13.0` entry, and the last
-  bullet of `docs/releases.md` § "Fixed on the way", each saying that the name
-  is unchanged so a `2.11.0` dashboard keeps working and silently reads a
-  different quantity. The original entry, for the record:
-  The gauge shipped in `2.11.0` reading `ClusterView::position` (the
-  published view's tag, which only moves on a pass that applied a `CLUSTER`
-  frame) and now reads `consumed`, the `uc2-cluster` agent's walk cursor —
-  which is what its help text always described, and the only reading the
-  readiness gate can be asked about. The NAME is unchanged, so a dashboard
-  keeps working and silently reads a different quantity: that is a change to
-  a **shipped reading** and needs a release-note line in `RELEASES.md` and
-  `docs/releases.md`, which plan D owns. Recorded here 2026-09-21 because the
-  SDD ledger and the task report that carry it today are working artifacts
-  that get archived.
 - **`pin-verify` against a real cluster, and against a learner.**
   `uc2-diffreplay pin-verify` (plan C) proves S4's refusal and the pinned
   install's artifact path on **one** node — a single voter in a scratch
@@ -548,7 +377,7 @@ reviewer wants a workload to attack.
   row shape that declares but never serves. Recorded 2026-09-21 in
   `docs/VERIFICATION.md` § "What `pin_verify.rs` does NOT verify".
 - **A spurious `service_detached` record right after every attach.**
-  `uc_node::node`'s `note_service_transitions` (~`uc_node/src/node.rs:4738`)
+  `uc_node::node`'s `note_service_transitions` (~`uc_node/src/node.rs:5708`)
   decides whether a row is `live` from its `heartbeat_ns` word, and the
   sample after an attach can still read `0` there — so `live` is false, the
   `service_was_live` latch set at the attach edge clears, and that sample
@@ -571,21 +400,6 @@ reviewer wants a workload to attack.
   Only the `--lib --bins` form of that run is in the proof stack today.
   Found by plan C T2, cause and fix corrected by plan C's final review,
   recorded 2026-09-21.
-- ~~**Plan D carries: `docs/how-to/upgrade-an-application.md` still describes
-  the 2.12.0 flag day, with no step structure.**~~ — **DONE 2026-09-22 (plan
-  D, T2).** The page an operator lands
-  on from `RELEASES.md` still walked a stop-everything flag day; the pinned
-  upgrade the 2.13.0 lifecycle work ships needed it rewritten around the S4
-  sequence — the `uc2-diffreplay pin-verify` rehearsal (already linked from
-  its preamble), the live `/metrics` check, and `uc2ctl upgrade show`
-  landing one instant behind the artifact it reads. Rewritten as the seven
-  numbered steps the standard's S6 points at (back up → instant → pin →
-  confirm on every node → stop → swap → verify), plus a rollback section
-  around the pin as a one-way door and an axis-H closing section; the three
-  reviewed passages (the `pin-verify` rehearsal, the `/metrics`-vs-`upgrade
-  show` body, "Why a flag day") were kept. Recorded here 2026-09-21
-  because the SDD ledger and the task report that carry it today are working
-  artifacts that get archived.
 - **Build `uc_starter` against the in-tree crates in `ci.yml`** (`[patch.crates-io]`), so an SDK break is caught on the PR that makes it — deferred until `uc_starter` is public (a private checkout needs a secret). Spec `docs/superpowers/specs/2026-09-24-uc-starter-design.md` §8. On publication: link it from README.md, docs/QUICKSTART.md §7 and docs/tutorials/build-an-application.md.
 - **A backward wall-clock step on the leader stalls the heartbeat-staleness
   predicate for as long as the smear takes to retire it, not for the step's
@@ -635,122 +449,3 @@ without a new argument:
   fact, not a defect
   (`docs/benchmarks/uc2-m14c2-lockstep-oversubscription-2026-08-30.md`,
   `docs/reference/limits.md`).
-
-
-## Shipped since this list was written
-
-Kept per this page's preamble — an item that is taken up gets its line updated
-rather than deleted, so the reasoning stays re-checkable. The last two are in
-`2.11.0` and the first in `2.12.0`; what remains open from them is item 2
-above. The `remote_lin.rs` waits at the top of this page are bounded as of
-2026-09-12 (the hang itself remains unexplained).
-
-### `CncPage::meta()` must not panic on a page a live writer re-initialised — FIXED for `2.12.0`
-
-Taken up and fixed 2026-09-09, after `2.11.0` shipped it as a recorded known
-issue. `meta()` `.expect()`ed a valid header on an mmap another process owns
-and re-initialises on restart, so `uc2ctl`, a client attach, a service attach
-or the gateway could PANIC instead of erroring. `open_file` validates at open
-and documents the right posture ("a typed error, never a panic"), but a shared
-mapping changes under the reader afterwards, so open-time validation cannot
-close it.
-
-Fixed by **replacing** `meta()` with `try_meta() -> Option<CncMeta>` rather
-than adding a twin beside it — permitted in a minor because
-[the semver policy](reference/semver-policy.md) lists `uc_log`'s `cnc` module
-as not promised, and preferred because a surviving `meta()` is a loaded call
-the next production caller can reach for. Six call sites, not the five this
-list named: `uc_gateway/src/edge.rs` reads `max_payload` the same way and was
-missed. The three attach doors answer `None` with `CncError::BadHeader`;
-`uc2ctl` refuses admin signing by name and skips its leftover-page
-cross-check. Pinned by two tests that force the torn window deterministically
-instead of waiting on the ~1-in-6 crashtest race — one per half of the window
-(magic zeroed; magic present, crc not yet written). The second half was missed
-by the first version of the fix and caught in review; `try_meta` checks the
-crc32 like `validate` does.
-
-Record: `docs/releases.md`, "Known issue at release" → its **FIXED after the
-tag** paragraph.
-
-**Same family, found by the review of that fix (2026-09-10), also fixed for
-`2.12.0`:** the boot gap. `create_file` publishes a complete, crc-valid header
-(names on line 7); `store_services_declared` and `store_fsm_lag_bytes` land
-three statements later, outside the crc. A service attaching in between read
-names-present with `services_declared == 0` — the harness signature — and
-`lag_mode_for`'s `(0, _) => Off` arm fixed `LagMode::Off` for its life, on a
-lockstep cluster, with the correct `instance_id` so no fail-stop ever fired;
-a client folded the same page to "FSM 0 only". Names with no declared set is
-unambiguous (a configured node always declares a nonzero set; a harness page
-has no names), so both doors refuse it as `NodeBooting`; and the node now
-stores lag BEFORE declared, so a published set implies a published policy —
-without that, the sub-window between the two stores reads as a legitimate
-lockstep config and cannot be told apart. Pinned at both doors by tests that
-build the mid-boot page (names, no declared word) and assert the named
-refusal, plus a control that a published set and a harness page are not
-refused. The store-order half is a memory-ordering argument (Release stores,
-Acquire loads), not a test: two adjacent stores cannot be raced
-deterministically.
-
-### FSM identity — name the state machine, not the slot (was item 2)
-
-Taken up 2026-09-01, IMPLEMENTED 2026-09-02, merged to `main` 2026-09-04.
-Identity lives **in code** — a required `const NAME` plus an optional
-`const VERSION` on the state-machine trait — and the row keeps its
-cluster-wide meaning while a service finds it by name. `SNAP_BEGIN` 0.7.0
-carries hashes and versions per row, compared positionally and refused by
-name; cnc 3.1; `ApplyCtx` replaced the bare `position` apply parameter;
-`IdGen` gives deterministic ids. The placement-independent variant was cut by
-the spec's §2.1 comparison table.
-
-Spec `docs/superpowers/specs/2026-09-02-uc2-fsm-identity-design.md` · plan
-`docs/superpowers/plans/2026-09-02-uc2-fsm-identity.md` (T0–T10) · explainer
-[`docs/notes/uc2-fsm-identity-and-deterministic-ids-explained.md`](notes/uc2-fsm-identity-and-deterministic-ids-explained.md)
-· how-to [Schedule work inside a state machine](how-to/schedule-work-in-a-service.md)
-· gate `docs/benchmarks/uc2-fsm-identity-gate-2026-09-02.md` (bars committed,
-**rows not yet run**).
-
-### Time and timers, and the replicated schedule table (was item 2a)
-
-Requested by the maintainer directly on 2026-09-02 — never a ranked item on
-the 2026-09-01 list — and specced beside FSM identity, which is why it sat
-under item 2. **All three plans are implemented** and merged to `main`:
-leader-stamped log time plus a deterministic scheduler (plan 1); the
-replicated schedule table, the since-retired `FRAME_TYPE_SCHEDULE_TABLE = 6` and
-`uc2ctl schedule apply/show` (plan 2); and that table on the snapshot session,
-`SNAP_TABLE` datagram kind 21, so a below-floor joiner installs it before it
-can serve or lead (plan 3).
-
-**And superseded again by coordinated snapshot instants** (the same spec's
-plan 2, done on the `uc2+coordinated-snapshot-plan2` branch): the cluster
-artifact plan 1 wrote on a bridging trigger is now written at a commanded
-instant, so a "set" is one log position rather than a lowest-common-floor, and
-the now-retired `SnapshotPolicy`'s per-service byte interval is deleted with it. Standby
-instants (`uc2ctl snapshot --standby`) and the `uc2ctl snapshot fetch` return
-path come with it —
-[`docs/notes/uc2-cluster-fsm-explained.md` § Instants](notes/uc2-cluster-fsm-explained.md#instants-one-position-one-set).
-
-**Superseded before shipping, inside the same `2.11.0` release**: the cluster
-FSM took over both carries; the retired `FRAME_TYPE_SCHEDULE_TABLE = 6` and
-`SNAP_TABLE` kind 21 are both **retired** here. The frame becomes
-`CLUSTER kind = 2` and the table rides
-the cluster FSM's own snapshot artifact under `service_id = 255` instead, which
-is what actually closed the limitation plan 2 shipped with (plan 3's own two
-ship-side residuals went with it; see the struck bullets under item 2 above).
-Both numbers are reserved so they are never reassigned. Read plans 2 and 3 as
-the reasoning that motivated the cluster FSM, not as what ships:
-[`docs/notes/uc2-cluster-fsm-explained.md`](notes/uc2-cluster-fsm-explained.md).
-
-One item recorded here as open has since **closed**: `Uc2LogTimeFrozen` and
-`Uc2ScheduleTableDiverged` gained `m10_alert_fire.sh` builders in the final
-fix wave (2026-09-03), backed by the `log_time_frozen` and `schedule_diverged`
-scenarios, so the M10 gate's row 4 can be re-run as written.
-
-Specs `docs/superpowers/specs/2026-09-02-uc2-time-and-timers-design.md` ·
-plans `2026-09-03-uc2-time-and-timers-plan{1,2}.md` and
-`2026-09-03-uc2-schedule-table-in-snapshot.md` · explainer
-[`docs/notes/uc2-log-time-and-timers-explained.md`](notes/uc2-log-time-and-timers-explained.md)
-· how-tos [Schedule work inside a state machine](how-to/schedule-work-in-a-service.md)
-and [Run work on a schedule](how-to/run-work-on-a-schedule.md) · gate
-`docs/benchmarks/uc2-time-and-timers-gate-2026-09-03.md` (bars committed,
-**rows not yet run**; row d has no runner).
-
