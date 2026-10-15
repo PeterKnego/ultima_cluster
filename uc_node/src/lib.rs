@@ -70,6 +70,7 @@ pub mod recovery;
 pub mod services;
 pub mod tier;
 pub(crate) mod timers;
+pub mod view;
 
 /// Catalog spec §4.4: the soft per-node holdings table, re-exported so the
 /// node/service code that fills and queries it doesn't need
