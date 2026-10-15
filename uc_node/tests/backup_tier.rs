@@ -3471,6 +3471,10 @@ mod writer_e2e {
         bytes[last] ^= 0x5A;
         std::fs::write(&obj, &bytes).unwrap();
         let l = await_single_leader(&c, 30);
+        let stats = c.node(l).observability().sender.clone();
+        // Only the learner's asks: the setup's churn may have asked a voter.
+        let before = stats.tier_install_sent.load(Ordering::Relaxed);
+        let (term0, since) = (c.node(l).current_term(), Instant::now());
         let n = start_learner(&mut c, l, 3, Some(tier.path().to_path_buf()), true);
         await_caught_up(&c, l, n);
         assert_eq!(tier_install(c.node(n), "declined"), 1);
@@ -3482,16 +3486,40 @@ mod writer_e2e {
         );
         // `>= 1`, not `== 1`: see the no-source test's note.
         assert!(snap_sessions(c.node(l)) >= 1, "the session installed it");
-        assert_eq!(
-            c.node(l)
-                .observability()
-                .sender
-                .tier_install_sent
-                .load(Ordering::Relaxed),
-            1,
-            "asked once; the decline's hold covers the re-NAKs"
+        assert_asked_once(
+            &c,
+            l,
+            stats.tier_install_sent.load(Ordering::Relaxed) - before,
+            term0,
+            since,
         );
         let _keep = c.stop();
+    }
+
+    /// Spec §6.3 (RA5): a decline holds the follower for
+    /// `TIER_INSTALL_DECLINE_HOLD_NS` (30 s, private to `uc_net`) — WITHIN
+    /// one leader term, since a fresh term asks afresh. So "asked once" is
+    /// exact only while that hold provably stood: the same term on `l`, and
+    /// under 30 s since the test began counting. Issue #111: on a loaded CI
+    /// runner either can lapse, and a second ask is then the specified
+    /// behaviour, not a regression — asserted as `>= 1` and reported.
+    fn assert_asked_once(c: &Cluster, l: usize, asked: u64, term0: u32, since: Instant) -> bool {
+        const HOLD: Duration = Duration::from_secs(30);
+        let (term1, elapsed) = (c.node(l).current_term(), since.elapsed());
+        if term1 == term0 && elapsed < HOLD {
+            assert_eq!(
+                asked, 1,
+                "asked once; the decline's hold covers the re-NAKs \
+                 (term {term0} throughout, {elapsed:?} elapsed)"
+            );
+        } else {
+            assert!(asked >= 1, "asked at least once");
+            eprintln!(
+                "asked {asked}x: the hold did not stand the whole test \
+                 (term {term0} -> {term1}, {elapsed:?} elapsed)"
+            );
+        }
+        term1 == term0 && elapsed < HOLD
     }
 
     /// Review focus 5: a voter with NO tier source, restarted after its
@@ -3523,6 +3551,7 @@ mod writer_e2e {
         assert_eq!(stats.tier_install_sent.load(Ordering::Relaxed), 0);
         assert_eq!(stats.snap_sessions.load(Ordering::Relaxed), 0);
         let app = c.app;
+        let term0 = c.node(l).current_term();
         c.nodes[down].start();
         // Time the leader's two edges: the request, then the session.
         let deadline = Instant::now() + Duration::from_secs(60);
@@ -3552,9 +3581,17 @@ mod writer_e2e {
         // sticks, so the session path opens more than once (learner.rs's
         // M14c2 note measured 3). The hold is what this pins: asked ONCE.
         assert!(stats.snap_sessions.load(Ordering::Relaxed) >= 1);
-        assert_eq!(stats.tier_install_sent.load(Ordering::Relaxed), 1);
+        let held = assert_asked_once(
+            &c,
+            l,
+            stats.tier_install_sent.load(Ordering::Relaxed),
+            term0,
+            asked,
+        );
         let declined = obs_lines(&buf, "tier_install_declined");
-        assert_eq!(declined.len(), 1, "logged once: {declined:?}");
+        if held {
+            assert_eq!(declined.len(), 1, "logged once: {declined:?}");
+        }
         assert!(
             declined[0].contains("\"reason\":\"no_source\""),
             "{}",
