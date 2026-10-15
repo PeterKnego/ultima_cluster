@@ -205,6 +205,20 @@ pub fn read_committed_backups(
     )))
 }
 
+/// The whole committed `ClusterState` out of the newest cluster artifact,
+/// `None` when there is none yet. The cluster view's offline source.
+pub fn read_committed_state(instance_dir: &Path) -> io::Result<Option<ClusterState>> {
+    let (fsm, start) = recover(
+        &snapshot_dir_of(instance_dir),
+        ClusterState::genesis_empty(),
+        Vec::new(),
+    )?;
+    if start == 0 {
+        return Ok(None);
+    }
+    Ok(Some(fsm.state().clone()))
+}
+
 /// Recovery (spec §4.7): the newest `snap-*.ultcluster` under `dir`, or
 /// genesis; returns `(fsm, start position)`.
 pub fn recover(
@@ -1572,6 +1586,7 @@ mod tests {
         };
         let (buffer, cnc, dir) = world();
         assert!(read_committed_backups(dir.path()).unwrap().is_none());
+        assert!(read_committed_state(dir.path()).unwrap().is_none());
         let mut app = buffer.appender_for_test(0);
         app.set_now(1);
         let e1 = app
@@ -1596,6 +1611,8 @@ mod tests {
             (7, 4096, e1)
         );
         assert_eq!(tiers, view.backups());
+        let whole = read_committed_state(dir.path()).unwrap().unwrap();
+        assert_eq!((whole.applied, whole.backups), (p, tiers));
         // The stale report was counted where it was logged; the full-table
         // counter stayed put (one tier registered of four).
         assert_eq!(view.backup_reports_stale.load(Ordering::Relaxed), 1);

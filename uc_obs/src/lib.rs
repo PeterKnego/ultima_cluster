@@ -27,5 +27,10 @@
 //! [`log::LogLevel`] filter, and [`log::format_line_at`], the single
 //! formatter that both the log stream and `uc_node`'s admin audit file
 //! render through so their JSON escaping and key order cannot drift.
+//!
+//! [`time`] — [`time::rfc3339_ns`] (a nanosecond Unix time as RFC 3339 UTC
+//! with nine fraction digits) and [`time::civil_from_days`], the calendar
+//! arithmetic both it and `uc2ctl`'s second-precision formatter share.
 
 pub mod log;
+pub mod time;

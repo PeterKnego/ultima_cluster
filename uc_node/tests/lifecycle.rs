@@ -780,3 +780,113 @@ fn the_daemon_without_a_metrics_section_opens_no_port() {
         "no [metrics] section must mean no metrics_listening record, got: {captured:?}"
     );
 }
+
+/// Kills (and reaps) a spawned daemon if the test panics before it stops it
+/// itself, so a failing obs-socket test does not leak a running `uc2-node`
+/// (which also holds the test's captured pipes open).
+struct KillOnDrop(std::process::Child);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        if let Ok(None) = self.0.try_wait() {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+}
+
+/// Cluster view: `uc2-node` always serves the obs router on
+/// `<instance_dir>/obs.sock`, mode `0600`, beside the `[metrics]` TCP
+/// listener when one is configured (both doors answer, from one loop), and a
+/// clean (SIGTERM) shutdown removes the file. The no-`[metrics]` daemon is
+/// `a_sigkilled_daemon_leaves_a_socket_that_refuses` below.
+#[test]
+fn the_daemon_serves_the_cluster_view_on_its_obs_socket_and_removes_it_on_sigterm() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+
+    let root = scratch();
+    let metrics_port = free_port();
+    let (cfg, inst) = daemon_config_with_metrics(root.path(), 19731, metrics_port);
+    let metrics_addr: SocketAddr = format!("127.0.0.1:{metrics_port}").parse().unwrap();
+    let mut child = KillOnDrop(
+        Command::new(env!("CARGO_BIN_EXE_uc2-node"))
+            .arg("--config")
+            .arg(&cfg)
+            .spawn()
+            .unwrap(),
+    );
+    let sock = inst.join("obs.sock");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let v: serde_json::Value = loop {
+        if let Ok((200, b)) = uc_node::obs::socket::get(&inst, "/cluster") {
+            let v: serde_json::Value = serde_json::from_str(&b).unwrap();
+            if v["joined"] == true && v["role"] == "leader" {
+                break v;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no joined leader view on {}",
+            sock.display()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert_eq!(
+        std::fs::metadata(&sock).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert_eq!(v["schema"], "uc2.cluster-view/1");
+    assert_eq!(v["cluster"]["catalog"]["empty"], true);
+    assert!(
+        v["attention"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|a| a["code"] == "catalog_empty"),
+        "{v}"
+    );
+    // Both doors, same router.
+    assert_eq!(uc_node::obs::socket::get(&inst, "/metrics").unwrap().0, 200);
+    assert_eq!(http_get(metrics_addr, "/metrics").0, 200);
+    let (code, tcp_body) = http_get(metrics_addr, "/cluster");
+    assert_eq!(code, 200);
+    assert!(tcp_body.contains("uc2.cluster-view/1"), "{tcp_body}");
+    unsafe { libc::kill(child.0.id() as i32, libc::SIGTERM) };
+    assert!(child.0.wait().unwrap().success());
+    assert!(!sock.exists(), "a clean shutdown removes obs.sock");
+}
+
+/// A SIGKILLed daemon cannot unlink its socket: the file stays, a connect
+/// to it is refused (no listener), and the instance lock reads free — which
+/// is what lets the next boot replace the file.
+#[test]
+fn a_sigkilled_daemon_leaves_a_socket_that_refuses() {
+    use std::process::Command;
+
+    let root = scratch();
+    let (cfg, inst) = daemon_config(root.path(), 19732, "127.0.0.1", "");
+    let mut child = KillOnDrop(
+        Command::new(env!("CARGO_BIN_EXE_uc2-node"))
+            .arg("--config")
+            .arg(&cfg)
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while uc_node::obs::socket::get(&inst, "/healthz").is_err() {
+        assert!(Instant::now() < deadline, "obs.sock never answered");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    child.0.kill().unwrap();
+    child.0.wait().unwrap();
+    assert!(inst.join("obs.sock").exists());
+    assert_eq!(
+        uc_node::obs::socket::connect(&inst).unwrap_err().kind(),
+        std::io::ErrorKind::ConnectionRefused
+    );
+    assert!(matches!(
+        uc_node::ipc::probe_instance_lock(&inst).unwrap(),
+        uc_node::ipc::InstanceLock::Free
+    ));
+}

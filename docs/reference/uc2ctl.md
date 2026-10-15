@@ -13,7 +13,8 @@ To perform a membership change, see
 ## Admin-band commands vs. offline commands
 
 Every command in [Sub-commands](#sub-commands) below (`add-learner` through
-`status`) is an **admin-band** command: it needs a running node, reaches it
+`status`, except the read-only `cluster` and `catalog`, which dial the node's
+`obs.sock` or read the newest cluster artifact) is an **admin-band** command: it needs a running node, reaches it
 purely through the cnc page's admin request/response slots, and both
 `--instance-dir` and `--app-id` are checked against that live node.
 
@@ -90,7 +91,9 @@ window.
 Sub-commands are: `add-learner`, `promote`, `demote`, `remove-learner`,
 `remove-voter`, `schedule apply`, `schedule show`, `settings apply`,
 `settings show`, `snapshot`, `snapshot fetch`, `snapshot show`,
-`upgrade pin`, `upgrade show`, `tier forget`, `status`.
+`upgrade pin`, `upgrade show`, `tier forget`, `status`, plus the read-only
+`cluster` and `catalog` (which read the node's observability socket, not the
+admin band).
 
 Every mutating one is a **cluster-FSM command** since 2.11.0: the
 reconfiguration ops append `CLUSTER kind = 1` (Membership), `schedule apply`
@@ -210,19 +213,16 @@ refused, is recorded in `audit.jsonl` as `schedule_apply`; in that record the
 
 ### `schedule show`
 
-Print the newest **committed** schedule table from this node's newest cluster
-artifact (`<instance_dir>/snapshots/cluster/snap-<pos>.ultcluster`) — not the
-staged file, which a successful apply consumes. Read-only: it writes no admin
-request.
-
-It reads a **file**, beside the running node, taking no lock — so it lags the
-node's live view. The artifact is written once every declared row has
-snapshotted, so on a cluster whose rows have not snapshotted yet this prints
-`no cluster artifact yet (the table is committed on the log; an artifact
-appears once every declared row has snapshotted)` rather than implying an empty
-table was adopted. There is no live, in-process reading in 2.11: one process
-cannot read another's memory, and the honest offline answer was preferred to a
-misleading one.
+Print the **committed** schedule table — not the staged file, which a
+successful apply consumes. Read-only: it writes no admin request. It reads the
+running node's live [cluster view](cluster-view.md) over
+`<instance_dir>/obs.sock`; when no node runs it reads the newest cluster
+artifact (`<instance_dir>/snapshots/cluster/snap-<pos>.ultcluster`) and says
+`offline: newest artifact at <P>` on **stderr**, leaving stdout unchanged. With
+neither a node nor an artifact it prints `no cluster artifact yet (the table is
+committed on the log; an artifact appears once every declared row has
+snapshotted)`, rather than implying an empty table was adopted. The text is
+rendered from the view's `cluster.schedule`, so it is the same live or offline.
 
 ```
 uc2ctl schedule show --instance-dir <DIR> --app-id <ID>
@@ -284,9 +284,10 @@ settings record**. Every outcome is recorded in `audit.jsonl` as
 
 ### `settings show`
 
-Print the **committed** settings record from this node's newest cluster
-artifact. Read-only: it writes no admin request, and it carries the same
-artifact-lag caveat as [`schedule show`](#schedule-show).
+Print the **committed** settings record. Read-only: it writes no admin request,
+and it reads the live [cluster view](cluster-view.md) when a node runs and the
+newest cluster artifact (with `offline: newest artifact at <P>` on stderr)
+when it does not, exactly as [`schedule show`](#schedule-show) does.
 
 ```
 uc2ctl settings show --instance-dir <DIR> --app-id <ID>
@@ -312,8 +313,8 @@ is the committed datagram rung: `0 (baseline)` is the `MTU_DEFAULT` every
 cluster starts from, and a rung the leader's path-MTU discovery committed
 prints as `(discovered)`. It is **leader-owned** — naming it in a `settings
 apply` file is refused as an unknown key, and the cluster FSM keeps the
-committed rung monotone, so an ordinary apply can never lower it. A node with
-no cluster artifact yet prints `no cluster artifact yet`.
+committed rung monotone, so an ordinary apply can never lower it. With no
+node running and no cluster artifact it prints `no cluster artifact yet`.
 
 ### `snapshot`
 
@@ -440,12 +441,11 @@ as the purge floor: the cluster's own view is the replicated catalog, whose
 sets are tagged AGREED or not (every row's reported hash matches) and whose
 newest agreed position is the floor every node is bounded by. `set=<P>` can
 list a position no quorum agrees on, and the catalog can agree on a position
-this node does not hold. A live read of the catalog itself — rather than the
-newest cluster artifact, which lags — is project 4 of the [snapshot catalog
-design](../superpowers/specs/2026-10-01-uc2-snapshot-catalog-design.md#6-the-query-interface);
-today the five `uc2_catalog_*` gauges on `/metrics` are the only live
-surface (`uc2_catalog_sets`, `uc2_catalog_agreed_position`,
-`uc2_catalog_empty`, `uc2_catalog_stalled`, `uc2_catalog_diverged`).
+this node does not hold. The live read of the catalog — rather than this directory
+listing — is [`uc2ctl catalog`](#catalog); the five `uc2_catalog_*` gauges on
+`/metrics` (`uc2_catalog_sets`, `uc2_catalog_agreed_position`,
+`uc2_catalog_empty`, `uc2_catalog_stalled`, `uc2_catalog_diverged`) remain the
+alerting surface.
 
 ### `upgrade pin`
 
@@ -524,13 +524,13 @@ rendered in the `id`/`addr` fields.
 
 ### `upgrade show`
 
-Print the **committed** pin history and hash verdicts, per row, from this
-node's newest cluster artifact. Read-only: it writes no admin request, and it
-carries the same artifact-lag caveat as
-[`schedule show`](#schedule-show)/[`settings show`](#settings-show) — a node
-whose declared rows have not all snapshotted yet has no cluster artifact, and
-`upgrade show` says so honestly (`no cluster artifact yet`) rather than
-printing a value nothing committed.
+Print the **committed** pin history and hash verdicts, per row. Read-only: it
+writes no admin request. It reads the live [cluster view](cluster-view.md)
+when a node runs and the newest cluster artifact (`offline: newest artifact at
+<P>` on stderr) when it does not, as
+[`schedule show`](#schedule-show)/[`settings show`](#settings-show) do; with
+neither it says `no cluster artifact yet` rather than printing a value
+nothing committed.
 
 ```
 uc2ctl upgrade show --instance-dir <DIR> --app-id <ID>
@@ -633,6 +633,81 @@ Forgetting touches **only the cluster's record**: the tier's files are
 untouched, and a writer still pointed at the tier re-registers it on its next
 report. To retire a tier for good, remove its `[backup]` section from every
 node first, then forget it.
+
+### `cluster`
+
+Print the whole [cluster view](cluster-view.md): membership, settings, the
+schedule table, per-row upgrade state, the catalog, backup tiers, the purge
+gate, this node's services and holdings, and the `attention` list. Read-only,
+and it needs no admin key: it never touches the admin band.
+
+```
+uc2ctl cluster --instance-dir <DIR> --app-id <ID> [--json]
+```
+
+```
+source=live node=1 role=leader joined=true view_position=4000 commit=4096
+catalog retain_sets=1 empty=false floor=1024
+  set=1024 kind=full state=complete agreed=true stalled=false size=15 held_by=[1, 2]
+    kv verdict=agreed hash=0x00000000000000aa
+    cluster verdict=agreed hash=0x00000000000000bb
+purge_gate requires_tiers=0 position=off tiers_reporting=0 released=false
+self journal_first=0 durable=0 free_bytes=unknown journal_bytes=0 snapshots_bytes=0 sets_held=[1024]
+node id=1 addr=127.0.0.1:7001 role=voter age_ms=0 stale=false durable=0
+node id=2 addr=127.0.0.1:7002 role=voter age_ms=100 stale=false durable=0
+node id=3 addr=127.0.0.1:7003 role=voter age_ms=5000 stale=true durable=0
+membership config_version=3
+  id=1 addr=127.0.0.1:7001 role=voter
+  id=2 addr=127.0.0.1:7002 role=voter
+  id=3 addr=127.0.0.1:7003 role=voter
+settings position=0 admission_bytes=0 fsm_lag=default snapshot_interval_bytes=0 snapshot_target=all retain_sets=1 auto_fetch=true backup_retain_sets=0 backup_retain_age_secs=0 purge_requires_tiers=0 datagram_mtu=0 (baseline)
+schedule entries=0 position=0
+upgrade row=kv running=unversioned pins=0
+service kv attached=true version=unversioned lag_bytes=0 pinned=false
+attention {"code":"node_stale","node":3}
+```
+
+The text uses the same words the JSON does (this sample is the leader's
+[example document](cluster-view.md#example)); the `settings` line shows the
+same settings fields [`settings show`](#settings-show) prints, but its
+`position=` is the settings record's own position, while `settings show`
+prints the view's position (`view_position`). A `null` in the document prints
+as `unknown` or `-`. `--json` prints the node's `/cluster` body **verbatim**,
+with only its `schema` checked; a node serving a different schema is refused
+by name (`the node serves cluster view schema … ; this uc2ctl reads
+uc2.cluster-view/1`).
+
+`uc2ctl` dials `<instance_dir>/obs.sock` only while `instance.lock` is held. A
+stopped node is read **offline** from the newest cluster artifact: the header
+reads `source=artifact (offline: newest artifact at <P>)`, `--json` has
+`"source": "artifact"` with the live-only fields `null`, and the offline
+limits are in [the reference page](cluster-view.md#offline). A held lock with
+no bound socket — a node that is still starting, or an embedded `Node` not run
+by `uc2-node` — exits non-zero with `node running but its obs socket is not
+bound (starting, or not run by uc2-node)`; it is not reported as offline. With
+neither node nor artifact it prints `no cluster artifact yet (node not running;
+nothing to read offline)` (on stderr under `--json`, so stdout stays JSON-only).
+
+### `catalog`
+
+The storage part of the same document: the catalog sets and floor, the backup
+tiers, the purge gate, this node's holdings, the leader's per-member `nodes`,
+and the storage `attention` codes (`catalog_empty`, `set_stalled`,
+`set_diverged`, `purge_gate_released`, `tier_behind`, `node_stale`).
+
+```
+uc2ctl catalog --instance-dir <DIR> --app-id <ID> [--json]
+```
+
+The text is the first part of `uc2ctl cluster`'s output (header, catalog,
+sets with per-row verdicts, tiers, purge gate, self, nodes, attention).
+`--json` prints that storage sub-object under the **same `schema`**, cut from
+the node's response as JSON so a field a newer node adds still passes through.
+Online, offline and error behavior are those of [`cluster`](#cluster). Offline,
+the newest set is marked `(cut at this artifact; its completion is not visible
+offline)`, `empty` is `false` only when an earlier set completed and otherwise
+prints `empty=unknown (offline)` (JSON `null`), and `catalog_empty` is never
+raised.
 
 ### `status`
 
@@ -849,7 +924,8 @@ fence (see [`tier restore`](#tier-restore)), and one `restorable: (a, b]` line p
 restore can be built in — a restore point `Q` is a frame end with
 `a < Q <= b`, never a set position itself. With `--instance-dir`, it also prints the committed backup
 watermarks that node's newest cluster artifact holds, marking the one that
-is this tier (`no cluster artifact yet` until that node's first instant), the
+is this tier (`no cluster artifact yet` until that node's first instant — this
+list is read from the artifact only, not the live view), the
 setting `purge_requires_tiers=<K>`, and a `(counts toward K=<k>)` marker on
 the K entries with the highest `through` (when K is above the number of
 entries the gate is `0` and nothing counts: purge waits).

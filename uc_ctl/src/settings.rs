@@ -19,13 +19,12 @@
 //! node recomputes the identical digest over the file IT reads back, so the
 //! file an operator signed is the file the cluster adopts.
 //!
-//! `show` reads back the COMMITTED settings from this instance directory's
-//! newest cluster artifact (`uc_node::cluster_agent::read_committed_settings`,
-//! NOT the staged file — that one is consumed by a successful apply). There
-//! is no live, in-process reading in this plan (spec §13 phase 2 is what
-//! would add one) — a node whose declared rows have not all snapshotted yet
-//! has no cluster artifact, so `show` says so honestly rather than printing
-//! a value nothing committed.
+//! `show` prints the COMMITTED settings out of the cluster view
+//! ([`crate::view::show_doc`]): the running node's live document over
+//! `obs.sock`, else the document built from this instance directory's
+//! newest cluster artifact (announced once on stderr), else — with neither a
+//! node nor an artifact — `no cluster artifact yet`. It is never the staged
+//! file, which a successful apply consumes.
 //!
 //! A refused or timed-out `apply` deliberately leaves the staged file in
 //! place: the node only deletes `settings.pending` on a successful append
@@ -240,7 +239,7 @@ fn render_fsm_lag(bytes: u64) -> String {
 /// and scripts may split on. A new field goes BEFORE `datagram_mtu`'s
 /// parenthesised suffix (as `retain_sets`, `auto_fetch` and the backup keys did) or after it; existing keys
 /// are never reordered or renamed.
-fn render_settings_line(position: u64, settings: &Settings) -> String {
+pub(crate) fn render_settings_line(position: u64, settings: &Settings) -> String {
     let fsm_lag = render_fsm_lag(settings.fsm_lag_bytes);
     let target = match settings.snapshot_target {
         Target::All => "all",
@@ -270,19 +269,17 @@ fn render_settings_line(position: u64, settings: &Settings) -> String {
     )
 }
 
-/// `uc2ctl settings show`: the COMMITTED settings, read out of this instance
-/// directory's newest cluster artifact
-/// (`uc_node::cluster_agent::read_committed_settings`). `None` (no artifact
-/// yet) prints the honest line rather than a value nothing committed.
+/// `uc2ctl settings show`: the COMMITTED settings, read from the live
+/// cluster view when a node runs and from the newest cluster artifact when
+/// it does not. `None` (neither) prints the honest line rather than a value
+/// nothing committed.
 pub fn show(common: &CommonArgs) -> anyhow::Result<()> {
-    let Some((position, settings)) =
-        uc_node::cluster_agent::read_committed_settings(&common.instance_dir)
-            .map_err(|e| anyhow::anyhow!("reading the cluster artifact: {e}"))?
-    else {
+    let Some(doc) = crate::view::show_doc(common)? else {
         println!("no cluster artifact yet");
         return Ok(());
     };
-
+    let settings = uc_node::view::convert::settings(&doc.cluster.settings);
+    let position = doc.view_position;
     println!("{}", render_settings_line(position, &settings));
     Ok(())
 }

@@ -66,6 +66,15 @@ fn get(addr: SocketAddr, path: &str) -> (u16, String) {
 /// `ObsSources` by value) and keep a second copy — over the SAME underlying
 /// `Arc` allocations — to mutate flags/heartbeats the running server reads.
 fn synthetic_server() -> (ObsServer, ObsSources) {
+    let sources = synthetic_sources();
+    let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let srv = ObsServer::serve(sources.clone(), bind).expect("obs server binds");
+    (srv, sources)
+}
+
+/// The `ObsSources` [`synthetic_server`] serves, for a test that binds its
+/// own server (`ObsSources::for_tests` is `cfg(test)`, invisible here).
+fn synthetic_sources() -> ObsSources {
     let meta = CncMeta {
         node_id: 7,
         instance_id: 0x1122_3344_5566_7788,
@@ -76,7 +85,7 @@ fn synthetic_server() -> (ObsServer, ObsSources) {
     };
     let cnc = CncPage::heap(&meta);
 
-    let sources = ObsSources {
+    ObsSources {
         node_id: 7,
         cnc,
         sender: Arc::new(SenderStats::default()),
@@ -130,11 +139,9 @@ fn synthetic_server() -> (ObsServer, ObsSources) {
             ("cluster", Arc::new(AtomicBool::new(false))),
         ],
         jumbo_gate_pending: Arc::new(AtomicBool::new(false)),
-    };
-
-    let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
-    let srv = ObsServer::serve(sources.clone(), bind).expect("obs server binds");
-    (srv, sources)
+        soft_wire: Arc::new(std::sync::Mutex::new(uc_net::SoftTableWire::new())),
+        soft_stale_ns: 900_000_000,
+    }
 }
 
 #[test]
@@ -160,6 +167,17 @@ fn metrics_healthz_readyz_serve_and_404_otherwise() {
     assert_eq!(get(srv.local_addr(), "/healthz").0, 200);
     assert_eq!(get(srv.local_addr(), "/readyz").0, 200);
     assert_eq!(get(srv.local_addr(), "/nope").0, 404);
+    srv.stop();
+}
+
+#[test]
+fn the_cluster_route_serves_the_view() {
+    let (srv, _sources) = synthetic_server();
+    let (code, body) = get(srv.local_addr(), "/cluster");
+    assert_eq!(code, 200);
+    let v: serde_json::Value = serde_json::from_str(&body).expect("/cluster is JSON");
+    assert_eq!(v["schema"], "uc2.cluster-view/1");
+    assert_eq!(v["source"], "live");
     srv.stop();
 }
 
@@ -550,4 +568,47 @@ fn a_scrape_carries_every_backup_tier_family() {
     }
     assert!(body.contains("\nuc2_backup_chain_gaps_total 0\n"), "{body}");
     srv.stop();
+}
+
+/// Cluster view: the unix door (`<instance_dir>/obs.sock`) serves the same
+/// router as the TCP one, with no TCP listener at all, and `stop` unlinks
+/// the socket file it bound.
+#[test]
+fn the_unix_socket_serves_the_same_routes_and_is_removed_on_stop() {
+    let root = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let srv = ObsServer::serve_on(synthetic_sources(), None, Some(root.path())).unwrap();
+    assert_eq!(srv.tcp_addr(), None);
+    let (code, body) = uc_node::obs::socket::get(root.path(), "/cluster").unwrap();
+    assert_eq!(code, 200);
+    assert!(body.contains("uc2.cluster-view/1"), "{body}");
+    assert_eq!(
+        uc_node::obs::socket::get(root.path(), "/metrics")
+            .unwrap()
+            .0,
+        200
+    );
+    assert_eq!(
+        uc_node::obs::socket::get(root.path(), "/nope").unwrap().0,
+        404
+    );
+    srv.stop();
+    assert!(!root.path().join("obs.sock").exists());
+}
+
+/// Both doors at once, from the one accept loop.
+#[test]
+fn tcp_and_unix_are_served_together() {
+    let root = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let srv = ObsServer::serve_on(synthetic_sources(), Some(bind), Some(root.path())).unwrap();
+    assert_eq!(get(srv.local_addr(), "/metrics").0, 200);
+    assert_eq!(
+        uc_node::obs::socket::get(root.path(), "/metrics")
+            .unwrap()
+            .0,
+        200
+    );
+    assert_eq!(get(srv.local_addr(), "/cluster").0, 200);
+    srv.stop();
+    assert!(!root.path().join("obs.sock").exists());
 }

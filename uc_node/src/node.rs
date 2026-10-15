@@ -3022,12 +3022,8 @@ impl Node {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
-        let mut t = soft_table_from_wire(&wire, &membership);
-        // This node's own cache, stamped now: a node never sends itself a
-        // `STATUS`, but it is as much a holder as any follower.
         let own = *self.holdings.lock().unwrap_or_else(|e| e.into_inner());
-        t.record(self.node_id, own, unix_now_ns());
-        t
+        soft_table_with_self(&wire, &membership, self.node_id, own, unix_now_ns())
     }
 
     /// Catalog spec §5.3: how old a soft-table entry may be and still count
@@ -3513,6 +3509,8 @@ impl Node {
             snapshot_fetch_source: Arc::clone(&self.fetch_source_stats),
             tier_install: Arc::clone(&self.tier_install_stats),
             snapshot_holdings: Arc::clone(&self.holdings),
+            soft_wire: Arc::clone(&self.soft_wire),
+            soft_stale_ns: self.soft_stale_ns(),
             snapshot_freeze: Arc::clone(&self.snapshot_freeze),
             crypto_enabled: self.crypto.is_some(),
             purge_enabled: self.purge_enabled,
@@ -14618,7 +14616,7 @@ fn dir_bytes(dir: &Path) -> u64 {
 /// leader), so on a follower this is empty — plan ruling P1's reason for the
 /// builders tier. Shared by `Node::soft_table` and the auto-fetch holder
 /// choice.
-fn soft_table_from_wire(
+pub(crate) fn soft_table_from_wire(
     wire: &SoftTableWire,
     membership: &ClusterConfig,
 ) -> crate::catalog::SoftTable {
@@ -14631,11 +14629,27 @@ fn soft_table_from_wire(
     t
 }
 
+/// The soft table the catalog queries read: every member's newest `STATUS`
+/// holdings plus this node's own cache stamped `now_ns` (a node never sends
+/// itself a `STATUS`, but it is as much a holder as any follower). Shared by
+/// [`Node::soft_table`] and the cluster view so both read one table.
+pub(crate) fn soft_table_with_self(
+    wire: &SoftTableWire,
+    membership: &ClusterConfig,
+    self_id: NodeId,
+    own: Holdings,
+    now_ns: u64,
+) -> crate::catalog::SoftTable {
+    let mut t = soft_table_from_wire(wire, membership);
+    t.record(self_id, own, now_ns);
+    t
+}
+
 /// The wire `Addr` tuple (`uc_consensus::config::Addr = (ip: u32, port:
 /// u16)`) as a real `SocketAddr` (IPv4-only — `uc_consensus` stays dep-free,
 /// so this conversion lives here). Inverse of `stored_member`'s ip/port
 /// extraction below.
-fn addr_of((ip, port): Addr) -> SocketAddr {
+pub(crate) fn addr_of((ip, port): Addr) -> SocketAddr {
     SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::from(ip.to_be_bytes()), port))
 }
 

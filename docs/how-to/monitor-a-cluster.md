@@ -33,6 +33,14 @@ not the config-refusal exit 2. See
 [Run a cluster on real hosts](run-a-cluster.md#supervise-the-processes) for
 what the two exit codes mean to the packaged unit.
 
+### The cluster view
+
+`GET /cluster` on the same listener (and on `<instance_dir>/obs.sock`) serves
+the `uc2.cluster-view/1` JSON document: committed cluster state, this node's
+holdings and an `attention` list. It is read-only and unauthenticated like the
+rest of the endpoint. See [The cluster view](../reference/cluster-view.md);
+`uc2ctl cluster` and `uc2ctl catalog` print it.
+
 ### Security note
 
 `/metrics`, `/healthz`, and `/readyz` are **unauthenticated, read-only,

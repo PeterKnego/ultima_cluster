@@ -15,6 +15,7 @@ use uc_protocol::v2::cnc::CNC_MAX_SERVICES;
 
 pub mod http;
 pub mod metrics;
+pub mod socket;
 
 pub use metrics::SnapshotFreezeStats;
 
@@ -180,6 +181,13 @@ pub struct ObsSources {
     /// auto-fetch space check uses. `uc2_snapshot_wont_fit` is computed from
     /// it with that check's own formula (plan ruling PF11: one sampler).
     pub snapshot_holdings: Arc<std::sync::Mutex<uc_protocol::v2::datagram::Holdings>>,
+    /// Cluster view (project 4): the leader's per-peer `STATUS` holdings —
+    /// the SAME map the sender fills — and the staleness bar
+    /// (`SOFT_STALE_FACTOR × election_timeout_max_ns`) a view entry is
+    /// judged against. Filled only on a node that has led; the view prints
+    /// it only while the leader flag is set.
+    pub soft_wire: Arc<std::sync::Mutex<uc_net::SoftTableWire>>,
+    pub soft_stale_ns: u64,
     /// Spec §9: process-local per-row freeze-duration bookkeeping the
     /// exporter derives from the row's cnc slot word each scrape — see
     /// [`metrics::SnapshotFreezeStats`].
@@ -286,6 +294,8 @@ impl ObsSources {
             snapshot_fetch_source: Arc::new(Default::default()),
             tier_install: Arc::new(Default::default()),
             snapshot_holdings: Arc::new(std::sync::Mutex::new(Default::default())),
+            soft_wire: Arc::new(std::sync::Mutex::new(uc_net::SoftTableWire::new())),
+            soft_stale_ns: 900_000_000,
             snapshot_freeze: Arc::new(SnapshotFreezeStats::default()),
             crypto_enabled: false,
             purge_enabled: false,

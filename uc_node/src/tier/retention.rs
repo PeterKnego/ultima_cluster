@@ -400,8 +400,14 @@ mod tests {
             deletable_sets(&five(), &pol(2, 0), &none()),
             vec![100, 200, 300]
         );
-        assert_eq!(deletable_sets(&five(), &pol(5, 0), &none()), vec![]);
-        assert_eq!(deletable_sets(&five(), &pol(9, 0), &none()), vec![]);
+        assert_eq!(
+            deletable_sets(&five(), &pol(5, 0), &none()),
+            Vec::<u64>::new()
+        );
+        assert_eq!(
+            deletable_sets(&five(), &pol(9, 0), &none()),
+            Vec::<u64>::new()
+        );
     }
 
     #[test]

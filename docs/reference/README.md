@@ -22,6 +22,9 @@ What an operator touches directly.
   lint, proof and benchmark commands for work on UC itself.
 - [`uc2ctl`](uc2ctl.md) — the admin CLI: every sub-command, its arguments, the
   three response statuses, and all twelve refusal reasons.
+- [The cluster view](cluster-view.md) — the `uc2.cluster-view/1` JSON document
+  (`GET /cluster`, `obs.sock`, `uc2ctl cluster`/`catalog`): every field, the
+  `attention` codes, the size bound and the stability rules.
 - [Instance directory](instance-directory.md) — every file a node owns, which
   process writes it, and which must survive a power cut.
 - [Configuration](configuration.md) — `NodeConfig` field by field, the

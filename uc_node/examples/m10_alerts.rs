@@ -466,6 +466,8 @@ fn synthetic_sources_named(node_id: u32, name: Option<FsmName>) -> ObsSources {
             ("cluster", Arc::new(AtomicBool::new(false))),
         ],
         jumbo_gate_pending: Arc::new(AtomicBool::new(false)),
+        soft_wire: Arc::new(std::sync::Mutex::new(uc_net::SoftTableWire::new())),
+        soft_stale_ns: 900_000_000,
     }
 }
 

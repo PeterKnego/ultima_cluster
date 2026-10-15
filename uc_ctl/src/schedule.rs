@@ -406,7 +406,7 @@ fn render_rfc3339(ns: u64) -> String {
     let secs = ns / NS_PER_SEC;
     let days = (secs / 86_400) as i64;
     let rem = secs % 86_400;
-    let (y, m, d) = civil_from_days(days);
+    let (y, m, d) = uc_obs::time::civil_from_days(days);
     format!(
         "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z",
         rem / 3600,
@@ -450,20 +450,6 @@ fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
     let doy = (153 * mp + 2) / 5 + d as i64 - 1; // [0, 365]
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
     era * 146_097 + doe - 719_468
-}
-
-/// The inverse of [`days_from_civil`] (same source).
-fn civil_from_days(z: i64) -> (i64, u32, u32) {
-    let z = z + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097; // [0, 146096]
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
-    let mp = (5 * doy + 2) / 153; // [0, 11]
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
-    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // [1, 12]
-    (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
 // ---------------------------------------------------------------- apply
@@ -547,49 +533,37 @@ pub fn apply(common: &CommonArgs, file: &Path) -> anyhow::Result<()> {
 
 // ---------------------------------------------------------------- show
 
-/// `uc2ctl schedule show`: the COMMITTED table, read out of this instance
-/// directory's newest cluster artifact
-/// (`uc_node::cluster_agent::read_committed_table`), with each entry's
-/// `identity_hash` resolved back to a name through the cnc page's declared
-/// rows.
-///
-/// The artifact lags the live view (it is written by the `uc2-cluster`
-/// agent's bridging trigger, once every declared row has snapshotted), so a
-/// table applied on a cluster whose rows have not snapshotted yet reads as
-/// "no cluster artifact yet" here. Task 8 (spec §13 phase 2 is what would
-/// close this) does NOT give this command a live, in-process reading — there
-/// is no way to read another process's in-memory view, so this stays the
-/// honest offline one, and the message says so instead of implying an empty
-/// table was adopted.
+/// `uc2ctl schedule show`: the COMMITTED table. It reads the node's live
+/// cluster view over `obs.sock`, falling back to the newest artifact when the
+/// node is stopped (announced once on stderr); each entry's name comes from
+/// the view's `row_name`, else the hash in hex.
 pub fn show(common: &CommonArgs) -> anyhow::Result<()> {
-    let (position, table) = uc_node::cluster_agent::read_committed_table(&common.instance_dir)
-        .map_err(|e| anyhow::anyhow!("reading the cluster artifact: {e}"))?;
-    if position == 0 && table.entries.is_empty() {
-        // Task 8's deferred finding from task 5: this reads `(0, [])` both
-        // when nothing has ever been applied AND right after a successful
-        // `schedule apply` on a fresh cluster (no cluster artifact exists
-        // yet — one appears only once every declared row has snapshotted).
-        // Say so honestly rather than implying an empty table was adopted.
+    let Some(doc) = crate::view::show_doc(common)? else {
         println!(
             "no cluster artifact yet (the table is committed on the log; an artifact appears \
              once every declared row has snapshotted)"
         );
         return Ok(());
+    };
+    let sched = &doc.cluster.schedule;
+    let position = sched.position;
+    let table = uc_node::view::convert::table(sched);
+    if position == 0 && table.entries.is_empty() {
+        if matches!(doc.source, uc_node::view::model::Source::Live) {
+            println!("no schedule table committed");
+        } else {
+            // The offline reader's pre-existing wording: an artifact whose
+            // table was never written reads `(0, [])`.
+            println!(
+                "no cluster artifact yet (the table is committed on the log; an artifact \
+                 appears once every declared row has snapshotted)"
+            );
+        }
+        return Ok(());
     }
 
-    let cnc = crate::open(common)?;
-    let names = cnc.service_names();
-    let name_of = |hash: u64| -> String {
-        names
-            .iter()
-            .flatten()
-            .find(|n| n.hash() == hash)
-            .map(|n| n.as_str().to_string())
-            .unwrap_or_else(|| format!("0x{hash:016x}"))
-    };
-
     println!("position={position}");
-    for e in &table.entries {
+    for (e, v) in table.entries.iter().zip(&sched.entries) {
         let rule = match e.rule {
             ScheduleRule::Every {
                 period_ns,
@@ -606,7 +580,9 @@ pub fn show(common: &CommonArgs) -> anyhow::Result<()> {
         };
         println!(
             "fsm={} id={} rule={rule}",
-            name_of(e.identity_hash),
+            v.row_name
+                .clone()
+                .unwrap_or_else(|| format!("0x{:016x}", e.identity_hash)),
             e.timer_id
         );
     }

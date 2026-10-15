@@ -10,6 +10,7 @@ The directory path is passed to `Node::start` and to every `uc2ctl` invocation.
 | Path | Owner | Contents |
 |---|---|---|
 | `instance.lock` | node | Exclusive `flock`. A second node on the same directory is refused with `AlreadyRunning`. Service and clients take a shared lock as a liveness probe. |
+| `obs.sock` | node | The observability unix socket (mode `0600`), bound by the `uc2-node` daemon at boot after it holds `instance.lock` (any stale file is unlinked first) and removed on clean shutdown. `GET /cluster` over it serves the [cluster view](cluster-view.md); `uc2ctl cluster`/`catalog` dial it. A path too long for `sun_path` is reached through `/proc/self/fd`. Never copied by `backup`. |
 | `cnc2.dat` | node | The 8 KiB control page (page 1: the M1–M13 layout; page 2: the per-FSM service-slot band since M14). See [The cnc control page](cnc-page.md). |
 | `log.buf` | node | The log ring buffer, `buffer_bytes` long. Recreated on each boot. |
 | `journal/` | node | Segmented durable log (`uc_journal`). Survives restarts; the source for replay and purge. |
