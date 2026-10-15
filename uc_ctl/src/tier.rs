@@ -37,7 +37,7 @@ pub fn forget(common: &CommonArgs, tier_id: u64) -> anyhow::Result<()> {
         crate::signed_admin_request(common, ADMIN_OP_TIER_FORGET, lo, hi, 0, "cluster position")?;
     match resp.status {
         0 => {
-            println!("forgotten: tier {tier_id:016x} position={}", resp.version);
+            println!("forgotten: tier {tier_id:#018x} position={}", resp.version);
             Ok(())
         }
         1 => {
