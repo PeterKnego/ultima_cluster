@@ -625,7 +625,7 @@ request field, so it travels split: its low 32 bits in `id`, its high 32 in
 Leader-only and single-in-flight like every `CLUSTER` command: a follower,
 or a leader with a previous `CLUSTER` command still above commit, answers
 `retry` — re-run it, against the node the leader hint names. On success it
-prints `forgotten: tier <hex> position=<P>`, where `P` is the `Forget`
+prints `forgotten: tier 0x<16 hex digits> position=<P>`, where `P` is the `Forget`
 record's frame-END position. An id no tier is registered under is refused
 **62 `tier_unknown`**.
 
@@ -687,6 +687,12 @@ by `uc2-node` — exits non-zero with `node running but its obs socket is not
 bound (starting, or not run by uc2-node)`; it is not reported as offline. With
 neither node nor artifact it prints `no cluster artifact yet (node not running;
 nothing to read offline)` (on stderr under `--json`, so stdout stays JSON-only).
+A path that is not an instance directory is refused by name and exits
+non-zero — `no such instance directory` when it does not exist, `not an
+instance directory` when it exists but holds neither `instance.lock` nor
+`snapshots/cluster/` — so a mistyped `--instance-dir` never reads as a fresh
+node. The same check guards `settings show`, `schedule show` and `upgrade
+show`.
 
 ### `catalog`
 

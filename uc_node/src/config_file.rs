@@ -1074,10 +1074,10 @@ pub fn parse_str_with_env(
             // The BOUND (jumbo spec §7.2): what the buffer is sized for; the
             // live door is the committed rung's ceiling. `f.max_payload` is
             // refused above whenever present.
-            max_payload: uc_protocol::v2::datagram::payload_ceiling(
-                uc_protocol::v2::datagram::MTU_BOUND,
-                matches!(crypto, CryptoConfig::Enabled { .. }),
-            ),
+            max_payload: NodeConfig::full_max_payload(matches!(
+                crypto,
+                CryptoConfig::Enabled { .. }
+            )),
             // `f.admission_bytes` is refused above whenever present — the
             // file no longer supplies this value, only the code default
             // (task 5 reads the replicated `settings_genesis`/live setting

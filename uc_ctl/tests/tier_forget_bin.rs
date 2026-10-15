@@ -126,7 +126,13 @@ fn tier_forget_removes_a_tier_and_refuses_62_for_an_unknown_one() {
         APP,
     ]);
     assert_eq!(r.status, 0, "tier forget must succeed: {r:?}");
-    assert!(r.stdout.contains("forgotten"), "{r:?}");
+    // The id prints the way `tier show` prints it and `--tier-id` reads it
+    // back: `0x` + 16 hex digits.
+    assert!(
+        r.stdout
+            .contains("forgotten: tier 0x0123456789abcdef position="),
+        "{r:?}"
+    );
     await_until(20, "the forget never committed", || {
         !node
             .cluster_view()
