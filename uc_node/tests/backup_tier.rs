@@ -2178,10 +2178,21 @@ mod writer_e2e {
 
     /// `rounds` × (6000 frames, an instant on every node in `idxs`, agreed).
     /// Returns the last instant.
+    ///
+    /// Issue #111: every node in `idxs` has the leader's commit durable
+    /// before the instant is commanded. A commit needs only a quorum, and
+    /// with `slack_bytes: 0` the leader purges below the set the moment it
+    /// completes, so a voter still behind it is caught up by a snapshot
+    /// SESSION whose floor adoption moves its archive base — which a test
+    /// pinning that base reads as a purge (CI saw a writer node at durable
+    /// 484352 under a set at 768160).
     fn churn(c: &Cluster, idxs: &[usize], rounds: usize) -> u64 {
         let mut p = 0;
         for _ in 0..rounds {
             let l = submit_settled(c, 6000);
+            for &i in idxs {
+                await_caught_up(c, l, i);
+            }
             p = instant_until_complete(c, l, idxs);
             await_agreed(c, idxs, p);
         }
