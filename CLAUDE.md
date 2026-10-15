@@ -608,8 +608,9 @@ one log stream (#11); the release-ledger line (#5) is process, not code
   proofs + conformance, loom (log-buffer frame visibility, the MPSC ring's
   per-record commit, and the Broadcast ring's seqlock read barrier — the last
   found and fixed a real weak-memory defect when it was written, 2026-08-31),
-  **24** fuzz targets (15 before `2.11.0`, which added eight; `uc_protocol_probe`
-  is the pending `2.12.0`'s), Miri (pure decoders + `uc_remote`'s
+  **26** fuzz targets (15 before `2.11.0`, which added eight; `2.12.0` added
+  `uc_protocol_probe`, and the unreleased catalog and backup tier added
+  `uc_protocol_status_body` and `uc_node_tier_object`), Miri (pure decoders + `uc_remote`'s
   Vec-backed SPSC internals; the mmap'd IPC rings are out of Miri's reach).
 - **`cargo fmt` is ENFORCED** since 2026-08-31: `cargo fmt --all -- --check`
   is the first step of `ci.yml`'s `test` job, so workspace drift is zero and
