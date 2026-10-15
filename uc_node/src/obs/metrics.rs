@@ -2121,6 +2121,8 @@ mod tests {
                 ("cluster", Arc::new(AtomicBool::new(false))),
             ],
             jumbo_gate_pending: Arc::new(AtomicBool::new(false)),
+            soft_wire: Arc::new(std::sync::Mutex::new(uc_net::SoftTableWire::new())),
+            soft_stale_ns: 900_000_000,
         }
     }
 
@@ -3071,6 +3073,8 @@ mod tests {
                 ("cluster", Arc::new(AtomicBool::new(false))),
             ],
             jumbo_gate_pending: Arc::new(AtomicBool::new(false)),
+            soft_wire: Arc::new(std::sync::Mutex::new(uc_net::SoftTableWire::new())),
+            soft_stale_ns: 900_000_000,
         };
 
         let text = render_prometheus(&s);
@@ -3191,6 +3195,8 @@ mod tests {
                 ("cluster", Arc::new(AtomicBool::new(false))),
             ],
             jumbo_gate_pending: Arc::new(AtomicBool::new(false)),
+            soft_wire: Arc::new(std::sync::Mutex::new(uc_net::SoftTableWire::new())),
+            soft_stale_ns: 900_000_000,
         };
 
         sources
@@ -3304,6 +3310,8 @@ mod tests {
                 ("cluster", Arc::new(AtomicBool::new(false))),
             ],
             jumbo_gate_pending: Arc::new(AtomicBool::new(false)),
+            soft_wire: Arc::new(std::sync::Mutex::new(uc_net::SoftTableWire::new())),
+            soft_stale_ns: 900_000_000,
         };
 
         let text = render_prometheus(&s);

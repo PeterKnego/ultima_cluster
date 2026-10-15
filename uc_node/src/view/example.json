@@ -1,0 +1,241 @@
+{
+  "schema": "uc2.cluster-view/1",
+  "source": "live",
+  "node_id": 1,
+  "role": "leader",
+  "joined": true,
+  "leader": {
+    "id": 1,
+    "addr": "127.0.0.1:7001"
+  },
+  "view_position": 4000,
+  "commit": 4096,
+  "read_at": "2023-11-14T22:15:00.000000000Z",
+  "cluster": {
+    "membership": {
+      "config_version": 3,
+      "members": [
+        {
+          "id": 1,
+          "addr": "127.0.0.1:7001",
+          "role": "voter"
+        },
+        {
+          "id": 2,
+          "addr": "127.0.0.1:7002",
+          "role": "voter"
+        },
+        {
+          "id": 3,
+          "addr": "127.0.0.1:7003",
+          "role": "voter"
+        }
+      ]
+    },
+    "settings": {
+      "position": 0,
+      "fsm_lag": {
+        "mode": "derived"
+      },
+      "admission_bytes": "0",
+      "snapshot_interval_bytes": "0",
+      "snapshot_target": "all",
+      "datagram_mtu": 0,
+      "datagram_mtu_rung": "baseline",
+      "retain_sets": 1,
+      "auto_fetch": true,
+      "backup_retain_sets": 0,
+      "backup_retain_age_secs": "0",
+      "purge_requires_tiers": 0
+    },
+    "schedule": {
+      "position": 0,
+      "entries": []
+    },
+    "upgrades": [
+      {
+        "row": 0,
+        "name": "kv",
+        "pins": [],
+        "running": {
+          "version": {
+            "text": "unversioned",
+            "packed": 0
+          },
+          "record_pos": 64
+        },
+        "report": null
+      }
+    ],
+    "catalog": {
+      "retain_sets": 1,
+      "empty": false,
+      "floor": 1024,
+      "sets": [
+        {
+          "position": 1024,
+          "kind": "full",
+          "commanded_at": "2023-11-14T22:14:55.000000000Z",
+          "state": "complete",
+          "agreed": true,
+          "stalled": false,
+          "diverged_rows": [],
+          "size": 15,
+          "rows": [
+            {
+              "row": 0,
+              "name": "kv",
+              "version": {
+                "text": "unversioned",
+                "packed": 0
+              },
+              "hash": "0x00000000000000aa",
+              "verdict": "agreed",
+              "size": 10
+            }
+          ],
+          "cluster": {
+            "row": 255,
+            "name": "cluster",
+            "version": {
+              "text": "unversioned",
+              "packed": 0
+            },
+            "hash": "0x00000000000000bb",
+            "verdict": "agreed",
+            "size": 5
+          },
+          "held_by": [
+            1,
+            2
+          ]
+        }
+      ]
+    },
+    "tiers": [],
+    "purge_gate": {
+      "requires_tiers": 0,
+      "position": null,
+      "tiers_reporting": 0,
+      "released": false
+    }
+  },
+  "self": {
+    "holdings": {
+      "journal_first": 0,
+      "durable": 0,
+      "commit": 4096,
+      "applied": [
+        {
+          "row": 0,
+          "name": "kv",
+          "applied": 0
+        }
+      ],
+      "free_bytes": 0,
+      "journal_bytes": 0,
+      "snapshots_bytes": 0,
+      "sets_held": [
+        1024
+      ]
+    },
+    "services": [
+      {
+        "row": 0,
+        "name": "kv",
+        "attached": true,
+        "version": {
+          "text": "unversioned",
+          "packed": 0
+        },
+        "applied": 4096,
+        "lag_bytes": 0,
+        "timers_pending": 0,
+        "pinned": false,
+        "pinned_version": null
+      }
+    ]
+  },
+  "nodes": [
+    {
+      "id": 1,
+      "addr": "127.0.0.1:7001",
+      "role": "voter",
+      "holdings": {
+        "journal_first": 0,
+        "durable": 0,
+        "commit": 4096,
+        "applied": [
+          {
+            "row": 0,
+            "name": "kv",
+            "applied": 0
+          }
+        ],
+        "free_bytes": 0,
+        "journal_bytes": 0,
+        "snapshots_bytes": 0,
+        "sets_held": [
+          1024
+        ]
+      },
+      "age_ms": 0,
+      "stale": false
+    },
+    {
+      "id": 2,
+      "addr": "127.0.0.1:7002",
+      "role": "voter",
+      "holdings": {
+        "journal_first": 0,
+        "durable": 0,
+        "commit": 4096,
+        "applied": [
+          {
+            "row": 0,
+            "name": "kv",
+            "applied": 0
+          }
+        ],
+        "free_bytes": 0,
+        "journal_bytes": 0,
+        "snapshots_bytes": 0,
+        "sets_held": [
+          1024
+        ]
+      },
+      "age_ms": 100,
+      "stale": false
+    },
+    {
+      "id": 3,
+      "addr": "127.0.0.1:7003",
+      "role": "voter",
+      "holdings": {
+        "journal_first": 0,
+        "durable": 0,
+        "commit": 0,
+        "applied": [
+          {
+            "row": 0,
+            "name": "kv",
+            "applied": 0
+          }
+        ],
+        "free_bytes": 0,
+        "journal_bytes": 0,
+        "snapshots_bytes": 0,
+        "sets_held": []
+      },
+      "age_ms": 5000,
+      "stale": true
+    }
+  ],
+  "nodes_from": null,
+  "attention": [
+    {
+      "code": "node_stale",
+      "node": 3
+    }
+  ]
+}

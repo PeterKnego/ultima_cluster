@@ -182,7 +182,8 @@ fn handle_conn(mut stream: TcpStream, sources: &ObsSources) {
 }
 
 /// Parse only the request line (`METHOD SPACE PATH ...`) and dispatch.
-/// Anything that isn't `GET /metrics`, `GET /healthz`, or `GET /readyz` —
+/// Anything that isn't `GET /metrics`, `GET /healthz`, `GET /readyz` or
+/// `GET /cluster` (the cluster view, `uc2.cluster-view/1` JSON) —
 /// including a non-GET method, an unparseable line, or an unknown path —
 /// is a 404 (chosen over 405 for a single-purpose scrape/probe endpoint
 /// with no other verbs to advertise).
@@ -203,6 +204,7 @@ fn route(buf: &[u8], sources: &ObsSources) -> (u16, &'static str, String) {
         "/metrics" => (200, "text/plain; version=0.0.4", render_prometheus(sources)),
         "/healthz" => healthz(sources),
         "/readyz" => readyz(sources),
+        "/cluster" => (200, "application/json", crate::view::render_live(sources)),
         _ => not_found(),
     }
 }

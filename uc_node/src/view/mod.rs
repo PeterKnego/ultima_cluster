@@ -14,8 +14,10 @@
 pub mod attention;
 pub mod build;
 pub mod convert;
+pub mod live;
 pub mod model;
 
+pub use live::render_live;
 pub use model::ClusterViewDoc;
 
 /// The document's schema tag.

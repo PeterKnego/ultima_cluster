@@ -130,6 +130,8 @@ fn synthetic_server() -> (ObsServer, ObsSources) {
             ("cluster", Arc::new(AtomicBool::new(false))),
         ],
         jumbo_gate_pending: Arc::new(AtomicBool::new(false)),
+        soft_wire: Arc::new(std::sync::Mutex::new(uc_net::SoftTableWire::new())),
+        soft_stale_ns: 900_000_000,
     };
 
     let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -160,6 +162,17 @@ fn metrics_healthz_readyz_serve_and_404_otherwise() {
     assert_eq!(get(srv.local_addr(), "/healthz").0, 200);
     assert_eq!(get(srv.local_addr(), "/readyz").0, 200);
     assert_eq!(get(srv.local_addr(), "/nope").0, 404);
+    srv.stop();
+}
+
+#[test]
+fn the_cluster_route_serves_the_view() {
+    let (srv, _sources) = synthetic_server();
+    let (code, body) = get(srv.local_addr(), "/cluster");
+    assert_eq!(code, 200);
+    let v: serde_json::Value = serde_json::from_str(&body).expect("/cluster is JSON");
+    assert_eq!(v["schema"], "uc2.cluster-view/1");
+    assert_eq!(v["source"], "live");
     srv.stop();
 }
 

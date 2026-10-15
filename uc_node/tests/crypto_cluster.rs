@@ -556,3 +556,94 @@ fn a_cluster_forms_even_when_one_member_never_comes_up() {
         n.stop();
     }
 }
+
+/// Cluster view (spec §7, ruling P10): the live document is rendered from a
+/// node that genuinely holds key material — wire crypto ON with a node key
+/// whose bytes this test chose, and an HMAC admin key whose secret it chose
+/// — and none of it, in any encoding the config uses, reaches the body.
+#[test]
+fn a_rendered_cluster_view_carries_no_key_material() {
+    use uc_node::{AdminKey, AdminPolicy, StartOpts};
+    let _g = serialize();
+    let dir = tempfile::Builder::new()
+        .prefix("uc2-crypto-view-")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("tempdir");
+    let material = write_crypto_material(dir.path(), 1);
+    let sock = UdpSocket::bind("127.0.0.1:0").expect("bind");
+    let addr = sock.local_addr().unwrap();
+    let (key_path, allowlist_path) = material[0].clone();
+    let cfg = make_config(
+        0,
+        vec![(0, addr)],
+        dir.path().join("n0"),
+        0x5EED,
+        addr,
+        CryptoConfig::Enabled {
+            key_path,
+            allowlist_path,
+            rotation: uc_crypto::rotation::RotationPolicy::default(),
+        },
+    );
+    let admin_secret: [u8; 32] = std::array::from_fn(|i| 0xC0 ^ (i as u8 * 7));
+    let node = Node::start_with(
+        cfg,
+        StartOpts {
+            socket: Some(sock),
+            admin: AdminPolicy::Hmac {
+                keys: std::sync::Arc::new(vec![AdminKey::new("view-ops", admin_secret)]),
+                ttl: Duration::from_secs(30),
+            },
+            ..Default::default()
+        },
+    )
+    .expect("start");
+    // Lead first, so the document carries the leader-only parts too.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !node.can_serve() {
+        assert!(
+            Instant::now() < deadline,
+            "the one-node sealed cluster never served"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let obs = node.observability();
+    assert!(
+        obs.crypto_enabled,
+        "the node under test must have crypto on"
+    );
+    let body = uc_node::view::render_live(&obs);
+    node.stop();
+
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["role"], "leader", "{body}");
+    assert!(v["nodes"].is_array(), "{body}");
+
+    let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+    let private = private_key(0);
+    let forbidden = [
+        hex(&private),
+        hex(&private).to_uppercase(),
+        b64_32(&private),
+        hex(&admin_secret),
+        hex(&admin_secret).to_uppercase(),
+        b64_32(&admin_secret),
+    ];
+    for f in &forbidden {
+        assert!(!body.contains(f.as_str()), "the view carries key bytes {f}");
+    }
+    for marker in [
+        "admin_key",
+        "group_key",
+        "psk",
+        "private",
+        "secret",
+        "hmac",
+        "view-ops",
+    ] {
+        assert!(
+            !body.to_lowercase().contains(marker),
+            "the view mentions {marker}"
+        );
+    }
+}
