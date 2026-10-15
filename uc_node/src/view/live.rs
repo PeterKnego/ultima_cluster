@@ -182,6 +182,8 @@ pub fn build_live_doc(i: &LiveInputs, now_ns: u64) -> ClusterViewDoc {
 /// Read the obs sources once. Called on the obs thread only.
 pub fn gather(s: &ObsSources, now_ns: u64) -> LiveInputs {
     use std::sync::atomic::Ordering;
+    // Best effort across sources: `state` is one consistent snapshot, but the
+    // cnc words (flags, commit, consumed, ...) are read beside it, not with it.
     let status = s.cnc.status();
     let state = s.cluster_view.to_state();
     let names: RowNames = s
@@ -199,16 +201,22 @@ pub fn gather(s: &ObsSources, now_ns: u64) -> LiveInputs {
         .clone();
     let soft = crate::node::soft_table_with_self(&wire, &state.membership, s.node_id, own, now_ns);
     let commit = s.cnc.counters().commit.load_acquire();
+    // One read of the declared mask, so `joined` and the services list agree.
+    let declared = s.cnc.services_declared();
     LiveInputs {
         node_id: s.node_id,
         flags: status.flags.load_acquire(),
         leader_hint: status.leader_hint.load_acquire(),
         commit,
         consumed: s.cluster_view.consumed.load(Ordering::Acquire),
-        declared: s.cnc.services_declared(),
-        services: services(s, &names, commit),
+        declared,
+        services: services(s, &names, declared, commit),
         names,
-        catalog_version: s.cluster_view.catalog_version.load(Ordering::Acquire),
+        // Derived from the catalog actually rendered, never the separate
+        // `catalog_version` atomic: `ClusterView::publish` stores that word
+        // after the catalog, so a render between the two would pair holders'
+        // bit indices with the wrong set list (review focus 2).
+        catalog_version: crate::cluster_fsm::catalog_version_of(&state.catalog),
         own,
         soft,
         soft_stale_ns: s.soft_stale_ns,
@@ -218,9 +226,8 @@ pub fn gather(s: &ObsSources, now_ns: u64) -> LiveInputs {
 }
 
 /// Per declared row, read exactly as `/metrics`' `service_rows` reads it.
-fn services(s: &ObsSources, names: &RowNames, commit: u64) -> Vec<ServiceView> {
+fn services(s: &ObsSources, names: &RowNames, declared: u64, commit: u64) -> Vec<ServiceView> {
     use uc_log::cnc::{PinRead, unpack_service_status};
-    let declared = s.cnc.services_declared();
     (0..CNC_MAX_SERVICES)
         .filter(|id| declared & (1 << id) != 0)
         .map(|id| {
@@ -507,6 +514,23 @@ mod tests {
         assert_eq!(v["role"], "follower");
         assert_eq!(v["nodes_from"], "leader");
         assert!(v["self"]["holdings"].is_object());
+    }
+
+    /// Review fix: the version a holder must match is computed from the
+    /// catalog `gather` rendered, not loaded from the separately-published
+    /// atomic (which can lag or lead it).
+    #[test]
+    fn gather_derives_the_catalog_version_from_the_rendered_catalog() {
+        let s = crate::obs::ObsSources::for_tests();
+        s.cluster_view
+            .catalog_version
+            .store(0xbad, std::sync::atomic::Ordering::Release);
+        let i = gather(&s, NOW);
+        assert_eq!(
+            i.catalog_version,
+            crate::cluster_fsm::catalog_version_of(&i.state.catalog)
+        );
+        assert_ne!(i.catalog_version, 0xbad);
     }
 
     /// Ruling P9: every bound the document can grow along, filled at once.
