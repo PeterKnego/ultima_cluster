@@ -1,0 +1,167 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Peter Knego
+
+//! Cluster view (storage-service project 4, spec §6.3) — end-to-end bin
+//! tests for `uc2ctl cluster` / `uc2ctl catalog`: the live read over
+//! `<instance_dir>/obs.sock` (an `ObsServer` this test binds for its
+//! in-process node, planning ruling PR11), the named refusal when the lock is
+//! held but no socket answers (PR10), and the offline document built from the
+//! newest cluster artifact once the node stops.
+
+mod common;
+
+use std::path::Path;
+use std::time::{Duration, Instant};
+
+use common::{
+    await_leader, await_row0_capable, parse_instant, run_ctl, start_capable_service, start_node,
+};
+use uc_node::Node;
+
+const APP: &str = "ctlview";
+
+fn scratch(prefix: &str) -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix(prefix)
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("tempdir")
+}
+
+fn serve(node: &Node, dir: &Path) -> uc_node::obs::http::ObsServer {
+    uc_node::obs::http::ObsServer::serve_on(node.observability(), None, Some(dir))
+        .expect("obs socket")
+}
+
+#[test]
+fn cluster_json_reads_the_live_view_over_the_socket() {
+    let root = scratch("uc2ctl-view-live-");
+    let (node, dir) = start_node(root.path(), "n0", APP);
+    await_leader(&node, 20);
+    let srv = serve(&node, &dir);
+    let d = dir.to_str().unwrap();
+    let r = run_ctl(&["cluster", "--json", "--instance-dir", d, "--app-id", APP]);
+    assert_eq!(r.status, 0, "{r:?}");
+    let v: serde_json::Value = serde_json::from_str(&r.stdout).expect("stdout is JSON");
+    assert_eq!(v["schema"], "uc2.cluster-view/1");
+    assert_eq!(v["source"], "live");
+    assert_eq!(v["role"], "leader");
+    // Verbatim (spec §6.3, ruling P16): the node's pretty-printed body, line
+    // for line — a second read of the same idle node has the same shape.
+    let (code, body) = uc_node::obs::socket::get(&dir, "/cluster").unwrap();
+    assert_eq!(code, 200);
+    assert!(body.starts_with("{\n  \"schema\""), "{body}");
+    assert!(r.stdout.starts_with("{\n  \"schema\""), "{}", r.stdout);
+    assert_eq!(r.stdout.lines().count(), body.lines().count());
+    srv.stop();
+    node.stop();
+}
+
+#[test]
+fn catalog_text_on_a_live_node_prints_the_source_and_attention() {
+    let root = scratch("uc2ctl-view-catalog-");
+    let (node, dir) = start_node(root.path(), "n0", APP);
+    await_leader(&node, 20);
+    let srv = serve(&node, &dir);
+    let d = dir.to_str().unwrap();
+    let r = run_ctl(&["catalog", "--instance-dir", d, "--app-id", APP]);
+    assert_eq!(r.status, 0, "{r:?}");
+    assert!(r.stdout.contains("source=live"), "{}", r.stdout);
+    assert!(r.stdout.contains("role=leader"), "{}", r.stdout);
+    assert!(r.stdout.contains("catalog_empty"), "{}", r.stdout);
+    let r = run_ctl(&["catalog", "--json", "--instance-dir", d, "--app-id", APP]);
+    assert_eq!(r.status, 0, "{r:?}");
+    let v: serde_json::Value = serde_json::from_str(&r.stdout).expect("stdout is JSON");
+    assert_eq!(v["schema"], "uc2.cluster-view/1");
+    assert_eq!(v["source"], "live");
+    assert!(v["holdings"].is_object(), "{v}");
+    assert!(v["catalog"]["empty"].as_bool().unwrap(), "{v}");
+    assert!(
+        v.get("cluster").is_none(),
+        "catalog is the filtered sub-object"
+    );
+    srv.stop();
+    node.stop();
+}
+
+#[test]
+fn a_held_lock_without_a_socket_is_reported_by_name() {
+    let root = scratch("uc2ctl-view-nosock-");
+    let (node, dir) = start_node(root.path(), "n0", APP);
+    await_leader(&node, 20);
+    let d = dir.to_str().unwrap();
+    for verb in ["cluster", "catalog"] {
+        let r = run_ctl(&[verb, "--instance-dir", d, "--app-id", APP]);
+        assert_ne!(r.status, 0, "{r:?}");
+        assert!(
+            r.stderr.contains(
+                "node running but its obs socket is not bound (starting, or not run by uc2-node)"
+            ),
+            "{}",
+            r.stderr
+        );
+    }
+    node.stop();
+}
+
+#[test]
+fn a_stopped_node_reads_offline_and_a_leftover_socket_is_ignored() {
+    let root = scratch("uc2ctl-view-offline-");
+    let (node, dir) = start_node(root.path(), "n0", APP);
+    await_leader(&node, 20);
+    let svc = start_capable_service(&dir, APP);
+    await_row0_capable(&dir, APP, 20);
+    let d = dir.to_str().unwrap().to_string();
+    let r = run_ctl(&["snapshot", "--instance-dir", &d, "--app-id", APP]);
+    assert_eq!(r.status, 0, "{r:?}");
+    let p = parse_instant(&r.stdout);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while node.snapshot_set_position() != p {
+        assert!(Instant::now() < deadline, "set {p} never completed");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    svc.stop();
+    node.stop();
+    drop(uc_node::obs::socket::bind(&dir).unwrap()); // a dead obs.sock
+    let r = run_ctl(&["catalog", "--json", "--instance-dir", &d, "--app-id", APP]);
+    assert_eq!(r.status, 0, "{r:?}");
+    let v: serde_json::Value = serde_json::from_str(&r.stdout).unwrap();
+    assert_eq!(v["source"], "artifact");
+    assert!(v["holdings"].is_null());
+    assert_eq!(
+        v["catalog"]["sets"][0]["rows"][0]["name"], "sum",
+        "names come from the stale cnc2.dat"
+    );
+    let r = run_ctl(&["catalog", "--instance-dir", &d, "--app-id", APP]);
+    assert_eq!(r.status, 0, "{r:?}");
+    assert!(
+        r.stdout
+            .contains(&format!("offline: newest artifact at {p}")),
+        "{}",
+        r.stdout
+    );
+    // The artifact at P was cut AT the instant, so it records its own set
+    // as still commanded; the words are the JSON words (ruling P18).
+    assert!(
+        r.stdout
+            .contains(&format!("set={p} kind=full state=commanded")),
+        "{}",
+        r.stdout
+    );
+    let r = run_ctl(&["cluster", "--json", "--instance-dir", &d, "--app-id", APP]);
+    assert_eq!(r.status, 0, "{r:?}");
+    let v: serde_json::Value = serde_json::from_str(&r.stdout).unwrap();
+    assert_eq!(v["source"], "artifact");
+    assert!(v["self"].is_null() && v["nodes"].is_null(), "{v}");
+}
+
+#[test]
+fn a_stopped_node_with_no_artifact_says_so() {
+    let root = scratch("uc2ctl-view-none-");
+    let (node, dir) = start_node(root.path(), "n0", APP);
+    await_leader(&node, 20);
+    node.stop();
+    let d = dir.to_str().unwrap();
+    let r = run_ctl(&["cluster", "--instance-dir", d, "--app-id", APP]);
+    assert_eq!(r.status, 0, "{r:?}");
+    assert!(r.stdout.contains("no cluster artifact yet"), "{}", r.stdout);
+}

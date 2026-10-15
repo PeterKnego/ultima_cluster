@@ -89,6 +89,7 @@ mod settings;
 mod snapshot;
 mod tier;
 mod upgrade;
+mod view;
 
 use uc_crypto::admin::{AdminKey, AdminMessage, generate_key_file, sign};
 use uc_log::cnc::{AdminAuth, AdminReq, CncPage, PinRead, RowRead, unpack_service_status};
@@ -713,6 +714,23 @@ enum Cmd {
     /// watermark (`ADMIN_OP_TIER_FORGET`, wire op 11); `show`, `verify` and
     /// `restore` work offline on the tier's files.
     Tier(TierArgs),
+    /// The live cluster view (project 4): membership, settings, schedule,
+    /// upgrades, catalog, tiers, holdings. Offline from the newest artifact
+    /// when the node is stopped.
+    Cluster(ViewArgs),
+    /// The storage part of the cluster view: catalog sets, floor, tiers,
+    /// purge gate, holdings.
+    Catalog(ViewArgs),
+}
+
+#[derive(clap::Args)]
+struct ViewArgs {
+    #[command(flatten)]
+    common: CommonArgs,
+    /// Print the `uc2.cluster-view/1` JSON document (the node's response
+    /// verbatim; `catalog` prints its storage sub-object).
+    #[arg(long)]
+    json: bool,
 }
 
 fn main() {
@@ -782,6 +800,8 @@ fn main() {
                 tier::export_corpus(&args.target, args.row, args.from, args.to, &args.out)
             }
         },
+        Cmd::Cluster(a) => view::run(&a.common, a.json, false),
+        Cmd::Catalog(a) => view::run(&a.common, a.json, true),
     };
     if let Err(e) = r {
         eprintln!("uc2ctl error: {e}");

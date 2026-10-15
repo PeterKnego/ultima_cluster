@@ -16,6 +16,7 @@ pub mod build;
 pub mod convert;
 pub mod live;
 pub mod model;
+pub mod offline;
 
 pub use live::render_live;
 pub use model::ClusterViewDoc;
