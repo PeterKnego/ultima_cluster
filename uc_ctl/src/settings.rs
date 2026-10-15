@@ -275,14 +275,12 @@ fn render_settings_line(position: u64, settings: &Settings) -> String {
 /// (`uc_node::cluster_agent::read_committed_settings`). `None` (no artifact
 /// yet) prints the honest line rather than a value nothing committed.
 pub fn show(common: &CommonArgs) -> anyhow::Result<()> {
-    let Some((position, settings)) =
-        uc_node::cluster_agent::read_committed_settings(&common.instance_dir)
-            .map_err(|e| anyhow::anyhow!("reading the cluster artifact: {e}"))?
-    else {
+    let Some(doc) = crate::view::show_doc(common)? else {
         println!("no cluster artifact yet");
         return Ok(());
     };
-
+    let settings = uc_node::view::convert::settings(&doc.cluster.settings);
+    let position = doc.view_position;
     println!("{}", render_settings_line(position, &settings));
     Ok(())
 }

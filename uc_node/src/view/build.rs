@@ -495,6 +495,67 @@ mod tests {
         );
     }
 
+    /// Task 9 / Task 3 review: the JSON leg (what `uc2ctl` actually reads)
+    /// loses nothing — u64 extremes and ns above 2^53 survive serialize,
+    /// parse and convert.
+    #[test]
+    fn the_converters_round_trip_through_json_text() {
+        use uc_protocol::v2::schedule::{ScheduleEntry, ScheduleRule};
+        use uc_protocol::v2::upgrade::{RowRunning, SnapshotReport, UpgradePin};
+        let mut st = ClusterState::genesis_empty();
+        st.settings.fsm_lag_bytes = u64::MAX - 1;
+        st.settings.admission_bytes = u64::MAX - 1;
+        st.settings.snapshot_interval_bytes = u64::MAX - 1;
+        st.settings.backup_retain_age_secs = u64::MAX - 1;
+        st.table.entries = vec![
+            ScheduleEntry {
+                identity_hash: u64::MAX,
+                timer_id: u64::MAX - 2,
+                rule: ScheduleRule::Every {
+                    period_ns: (1u64 << 53) + 1,
+                    anchor_ns: 1_700_000_000_123_456_789,
+                },
+            },
+            ScheduleEntry {
+                identity_hash: 0xabc,
+                timer_id: (1u64 << 53) + 3,
+                rule: ScheduleRule::Once {
+                    at_ns: 1_800_000_000_987_654_321,
+                },
+            },
+            ScheduleEntry {
+                identity_hash: 0xabc,
+                timer_id: 5,
+                rule: ScheduleRule::DailyAt { secs_of_day: 7 },
+            },
+        ];
+        st.pins = vec![UpgradePin {
+            row: 0,
+            from: u32::MAX - 1,
+            to: u32::MAX,
+            origin: u64::MAX - 1,
+        }];
+        st.reports = vec![SnapshotReport {
+            row: 0,
+            position: (1u64 << 53) + 7,
+            hashes: vec![(1, u64::MAX, u64::MAX - 1), (2, 1, 2)],
+        }];
+        st.running[0] = Some(RowRunning {
+            row: 0,
+            version: u32::MAX,
+            record_pos: u64::MAX - 5,
+        });
+        let part = cluster_part(&st, &names(), None, None);
+        let text = serde_json::to_string(&part).unwrap();
+        let back: super::super::model::ClusterPart = serde_json::from_str(&text).unwrap();
+        assert_eq!(super::super::convert::settings(&back.settings), st.settings);
+        assert_eq!(super::super::convert::table(&back.schedule), st.table);
+        let (pins, reports, running) = super::super::convert::upgrade(&back.upgrades);
+        assert_eq!(pins, st.pins);
+        assert_eq!(reports, st.reports);
+        assert_eq!(running, st.running);
+    }
+
     /// Review focus 1: no JSON number above 2^53 anywhere, even with every
     /// u64 field at its extreme.
     #[test]

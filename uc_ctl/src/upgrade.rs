@@ -193,12 +193,12 @@ pub fn pin(
 }
 
 pub fn show(common: &CommonArgs) -> anyhow::Result<()> {
-    let Some((position, pins, reports, running)) =
-        uc_node::cluster_agent::read_committed_upgrade(&common.instance_dir)?
-    else {
+    let Some(doc) = crate::view::show_doc(common)? else {
         println!("no cluster artifact yet");
         return Ok(());
     };
+    let (pins, reports, running) = uc_node::view::convert::upgrade(&doc.cluster.upgrades);
+    let position = doc.view_position;
     println!("position={position}");
     for row in 0..uc_protocol::v2::cnc::CNC_MAX_SERVICES as u8 {
         let history: Vec<&UpgradePin> = pins.iter().filter(|p| p.row == row).collect();

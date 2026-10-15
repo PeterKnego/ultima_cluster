@@ -103,6 +103,21 @@ pub fn fetch(common: &CommonArgs, require_live_when_held: bool) -> anyhow::Resul
     })
 }
 
+/// The document a `show` command renders (PR9/PR10): live, else the offline
+/// one with the silent fallback; `None` when there is neither. An offline
+/// document announces itself once on STDERR (P13) so stdout stays exactly
+/// what the renderer prints.
+pub fn show_doc(common: &CommonArgs) -> anyhow::Result<Option<ClusterViewDoc>> {
+    Ok(match fetch(common, false)? {
+        Fetched::Live(d) => Some(d),
+        Fetched::Offline(d) => {
+            eprintln!("offline: newest artifact at {}", d.view_position);
+            Some(d)
+        }
+        Fetched::NoArtifact => None,
+    })
+}
+
 /// An enum's JSON word (`full`, `no_majority`, `leader`, …) — text output
 /// uses the same words the document does (ruling P18), never `Debug`.
 fn word<T: Serialize>(v: &T) -> String {

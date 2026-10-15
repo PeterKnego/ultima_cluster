@@ -186,3 +186,91 @@ fn a_stopped_node_with_no_artifact_says_so() {
     assert!(r.stdout.is_empty(), "{}", r.stdout);
     assert!(r.stderr.contains("no cluster artifact yet"), "{}", r.stderr);
 }
+
+#[test]
+fn settings_show_reads_the_live_genesis_before_any_instant() {
+    let root = scratch("uc2ctl-view-settings-");
+    let (node, dir) = start_node(root.path(), "n0", APP);
+    await_leader(&node, 20);
+    let srv = serve(&node, &dir);
+    let d = dir.to_str().unwrap();
+    let r = run_ctl(&["settings", "show", "--instance-dir", d, "--app-id", APP]);
+    assert_eq!(r.status, 0, "{r:?}");
+    assert!(
+        !r.stdout.contains("no cluster artifact yet"),
+        "{}",
+        r.stdout
+    );
+    assert!(r.stdout.contains("retain_sets=1"), "{}", r.stdout);
+    assert!(r.stdout.contains("snapshot_target=all"), "{}", r.stdout);
+    assert!(!r.stderr.contains("offline:"), "live prints no marker");
+    // The other two read the live view as well, without erroring.
+    for cmd in ["schedule", "upgrade"] {
+        let r = run_ctl(&[cmd, "show", "--instance-dir", d, "--app-id", APP]);
+        assert_eq!(r.status, 0, "{cmd}: {r:?}");
+        assert!(!r.stderr.contains("offline:"), "{cmd}: {}", r.stderr);
+    }
+    srv.stop();
+    node.stop();
+}
+
+/// P13/P21: a stopped node reads the artifact; stderr carries the marker,
+/// stdout is what the renderer prints for that artifact.
+#[test]
+fn show_commands_on_a_stopped_node_mark_stderr_and_keep_stdout() {
+    let root = scratch("uc2ctl-view-showoff-");
+    let (node, dir) = start_node(root.path(), "n0", APP);
+    await_leader(&node, 20);
+    let svc = start_capable_service(&dir, APP);
+    await_row0_capable(&dir, APP, 20);
+    let d = dir.to_str().unwrap().to_string();
+    let r = run_ctl(&["snapshot", "--instance-dir", &d, "--app-id", APP]);
+    assert_eq!(r.status, 0, "{r:?}");
+    let p = parse_instant(&r.stdout);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while node.snapshot_set_position() != p {
+        assert!(Instant::now() < deadline, "set {p} never completed");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    svc.stop();
+    node.stop();
+    let (pos, settings) = uc_node::cluster_agent::read_committed_settings(dir.as_path())
+        .unwrap()
+        .expect("artifact");
+    let r = run_ctl(&["settings", "show", "--instance-dir", &d, "--app-id", APP]);
+    assert_eq!(r.status, 0, "{r:?}");
+    // The renderer is private to the binary: pin the line's head and the
+    // settings it must carry from the old artifact reader.
+    assert_eq!(r.stdout.lines().count(), 1, "{}", r.stdout);
+    assert!(
+        r.stdout.starts_with(&format!(
+            "position={pos} admission_bytes={} ",
+            settings.admission_bytes
+        )),
+        "{}",
+        r.stdout
+    );
+    assert!(
+        r.stdout
+            .contains(&format!("retain_sets={}", settings.retain_sets)),
+        "{}",
+        r.stdout
+    );
+    assert_eq!(r.stderr.matches("offline: newest artifact at").count(), 1);
+    assert!(
+        r.stderr
+            .contains(&format!("offline: newest artifact at {pos}")),
+        "{}",
+        r.stderr
+    );
+    for cmd in ["schedule", "upgrade"] {
+        let r = run_ctl(&[cmd, "show", "--instance-dir", &d, "--app-id", APP]);
+        assert_eq!(r.status, 0, "{cmd}: {r:?}");
+        assert!(
+            r.stderr.contains("offline: newest artifact at"),
+            "{}",
+            r.stderr
+        );
+        assert!(!r.stdout.contains("offline:"), "{}", r.stdout);
+    }
+}
