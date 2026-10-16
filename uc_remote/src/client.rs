@@ -245,6 +245,14 @@ impl RemoteClient {
         self.send.lock().unwrap().client_id()
     }
 
+    /// The seq the next request will carry; see [`RemoteSendHalf::next_seq`]
+    /// and [`crate::RemoteConfig::first_seq`] for how to resume a session.
+    ///
+    /// [`RemoteSendHalf::next_seq`]: crate::RemoteSendHalf::next_seq
+    pub fn next_seq(&self) -> u64 {
+        self.send.lock().unwrap().next_seq()
+    }
+
     /// Close the connection and fail every outstanding request with
     /// [`RemoteError::Closed`]. Idempotent; dropping the client does the same.
     pub fn shutdown(&self) {

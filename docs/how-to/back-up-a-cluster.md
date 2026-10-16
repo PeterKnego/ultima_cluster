@@ -19,7 +19,10 @@ before you decide which one you need.
 ## What gets copied
 
 `uc2ctl backup` copies exactly the node's **durable** subdirectories —
-`journal/`, `state/`, `snapshots/<id>/` for every FSM id present — one
+`journal/` (less any segment preallocation temp, `seg-prealloc.<n>.tmp` — a
+zero-filled future segment, not log, which a node regrows at boot; restore
+skips one in an older artifact too), `state/`, `snapshots/<id>/` for every
+FSM id present — one
 directory per declared service since M14 — filtered to complete
 `snap-<pos>.ultsnap` files — plus `snapshots/cluster/`, the **cluster FSM's**
 own family (`snap-<pos>.ultcluster`: membership, the schedule table and the

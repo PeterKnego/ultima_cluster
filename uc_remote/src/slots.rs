@@ -16,7 +16,8 @@
 //! 3. Exactly-once resolution: whoever CASes `owner: seq+1 -> FREE` (AcqRel)
 //!    owns the completion. `resolve`, `abort`, `sweep` and `drain_abort` all
 //!    race through that one CAS.
-//! 4. The seq is assigned by the submitter (gap-free, from 1) and is a full
+//! 4. The seq is assigned by the submitter (gap-free, from
+//!    `RemoteConfig::first_seq`, default 1) and is a full
 //!    `u64` on this wire, so a stale generation is caught by the exact
 //!    `owner == seq + 1` test — no truncation argument needed.
 //! 5. `off`/`len`, `kind`, `sent_seq`, `not_before_ns` and `attempts` are
@@ -88,7 +89,7 @@ pub(crate) struct SlotTable {
 }
 
 impl SlotTable {
-    pub(crate) fn new(max_inflight: u32) -> SlotTable {
+    pub(crate) fn new(max_inflight: u32, first_seq: u64) -> SlotTable {
         assert!(max_inflight >= 1);
         // 2x headroom over the window, 64 floor — same sizing rule as
         // `uc_client`: it keeps a stuck (deadline-pending) occupant off the
@@ -114,7 +115,7 @@ impl SlotTable {
             mask: n - 1,
             inflight: AtomicU64::new(0),
             max_inflight: max_inflight as u64,
-            next_seq: AtomicU64::new(1),
+            next_seq: AtomicU64::new(first_seq),
         }
     }
 
@@ -451,7 +452,7 @@ mod tests {
     use super::*;
 
     fn table() -> SlotTable {
-        SlotTable::new(8)
+        SlotTable::new(8, 1)
     }
 
     #[test]
@@ -672,7 +673,7 @@ mod tests {
         // the 64-slot floor is already three laps of generation reuse — every
         // index is re-claimed under a later seq while the resolver races it.
         const N: u64 = 200;
-        let t = Arc::new(SlotTable::new(8));
+        let t = Arc::new(SlotTable::new(8, 1));
         assert_eq!(
             t.slot_count(),
             64,

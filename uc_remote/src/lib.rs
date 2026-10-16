@@ -28,8 +28,8 @@ pub(crate) mod slots;
 pub use client::{RemoteClient, Ticket};
 pub use conn::FramedConn;
 pub use engine::{
-    Consistency, RemoteCompletion, RemoteConfig, RemoteEngine, RemoteOutcome, RemotePollHalf,
-    RemoteResponse, RemoteSendHalf, RemoteStats, RemoteWaitHandle, SubmitError,
+    Consistency, MAX_FIRST_SEQ, RemoteCompletion, RemoteConfig, RemoteEngine, RemoteOutcome,
+    RemotePollHalf, RemoteResponse, RemoteSendHalf, RemoteStats, RemoteWaitHandle, SubmitError,
 };
 pub use error::{FrameError, RemoteError};
 pub use token::ReadToken;

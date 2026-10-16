@@ -586,6 +586,14 @@ literal of the stats, stops compiling downstream: the same documented
 minor-version hazard `Outcome` and `SubmitError` carried in M14b. Adding a
 variant or field is additive under this policy.
 
+### A remote client's starting seq (#34, unreleased, next cut)
+
+`uc_remote::RemoteConfig` gains a public field `first_seq` (default `1`), and
+`RemoteSendHalf`/`RemoteClient` gain `next_seq()`, plus the constant
+`MAX_FIRST_SEQ`. No wire change: the seq was always a client-chosen `u64`.
+The field is the `boot_wait` case above: additive for a caller that builds
+`RemoteConfig` from `Default`, breaking for an exhaustive struct literal.
+
 ## Related
 
 - [Cut a release](../how-to/cut-a-release.md) — the lockstep bump, the tag,

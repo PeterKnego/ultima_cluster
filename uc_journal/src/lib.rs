@@ -21,7 +21,7 @@ pub use durability::Durability;
 pub use error::JournalError;
 #[cfg(feature = "stable_value")]
 pub use error::StableValueError;
-pub use journal::{Journal, JournalConfig, PreallocFill, TailReader};
+pub use journal::{Journal, JournalConfig, PreallocFill, TailReader, is_preallocation_temp};
 pub use notifier::Notifier;
 #[cfg(feature = "stable_value")]
 pub use stable_value::{StableValue, StableValueConfig};
