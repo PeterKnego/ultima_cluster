@@ -1157,9 +1157,11 @@ struct PendingFetch {
     /// completion test below is `stored_set_pos` MOVING rather than reaching
     /// a particular value.
     position: u64,
-    /// `stored_set_pos` as it was when the fetch was issued — a store-only
-    /// completion moves it, and that move is what "the fetch landed" means.
-    stored_before: u64,
+    /// `SnapIntakeSignals::landed` as it was when the fetch was issued — a
+    /// store-only completion bumps it, and that bump is what "the fetch
+    /// landed" means. #125: a COUNT, not the `stored_set_pos` mark, so a set
+    /// landing below the mark completes its fetch too.
+    landed_before: u64,
     /// Pass-clock nanoseconds after which this record is dropped.
     deadline_ns: u64,
     /// Snapshot-lifecycle spec §6: issued by auto-fetch (its outcome feeds
@@ -1237,8 +1239,9 @@ pub struct Node {
     snapshot_instants_abandoned: Arc<AtomicU64>,
     /// Spec §5.7 item 4 (Ruling P4'): the position of the newest set this
     /// node FETCHED whole from a learner — the SAME allocation the receiver
-    /// agent publishes into (`receiver.stored_set_pos()`) and `Consensus`
-    /// reads as `stored_set_pos`. Exposed via
+    /// agent publishes into (`receiver.stored_set_pos()`), its high-water
+    /// mark; the consensus agent reads the LANDINGS themselves (#125,
+    /// `SnapIntakeSignals::take_landings`). Exposed via
     /// [`Node::snapshot_fetched_position`] / [`Node::observability`].
     snapshot_fetched_position: Arc<AtomicU64>,
     /// Spec §9: process-local per-row freeze-duration bookkeeping the
@@ -2843,9 +2846,9 @@ impl Node {
             cluster_snapshot_dir: instance.cluster_snapshot_dir(),
             pending_fetch: None,
             fetch_tx,
-            stored_set_pos: Arc::clone(&stored_set_pos),
-            stored_above_durable: 0,
-            stored_set_noted: 0,
+            landings_seen: 0,
+            stored_pending: Vec::new(),
+            last_landed: 0,
             snapshot_floor_hold: 0,
             snapshot_standby_learner,
             snapshot_standby_position,
@@ -4687,21 +4690,18 @@ struct Consensus {
     /// and owns the intake; this agent only decides who to ask and what a
     /// completed transfer will mean.
     fetch_tx: mpsc::SyncSender<SnapFetch>,
-    /// Coordinated-snapshot spec §5.7 item 4 (Ruling P4'): the receiver
-    /// agent's store-only completion signal — the position of the newest set
-    /// this node FETCHED whole from a learner. Read by
-    /// [`Consensus::check_set_completeness`], which treats it exactly like a
-    /// locally produced set.
-    stored_set_pos: Arc<AtomicU64>,
-    /// Controller ruling R7: the newest `stored_set_pos` value already noted
-    /// held by [`Self::check_set_completeness`] — the fetch edge's own
-    /// high-water mark, separate from the (monotone) set position.
-    stored_set_noted: u64,
-    /// The `stored_set_pos` value this node has already named as being ABOVE
-    /// its durable frontier (`0` = none outstanding). A latch, so a voter that
-    /// stays behind the learner it fetched from logs the condition once rather
-    /// than every pass; cleared the moment such a set is adopted.
-    stored_above_durable: u64,
+    /// #125: `SnapIntakeSignals::landed` as last drained by
+    /// [`Self::check_set_completeness`] — its edge detector. The receiver's
+    /// store-only completion signal (spec §5.7 item 4, Ruling P4') is the
+    /// landings behind it, each treated exactly like a locally produced set.
+    landings_seen: u64,
+    /// Landed sets ABOVE this node's durable frontier, held back (named once,
+    /// when they landed) until the log catches up — fix round 1, Important
+    /// 3. Empty on the steady path.
+    stored_pending: Vec<u64>,
+    /// The newest landing drained, for the pending-fetch record to name when
+    /// the fetch asked for "the learner's newest" (`position == 0`).
+    last_landed: u64,
     /// The pinned origin this node's snapshot floor is currently HELD at
     /// (`0` = no hold outstanding) — see
     /// [`Consensus::hold_floor_for_pins`]. A latch on the same pattern as
@@ -6194,7 +6194,7 @@ impl Consensus {
         // below delivers. Without this a voter that rejoined by session held
         // a complete set yet reported none until its own rows froze at a
         // LATER instant.
-        self.stored_set_pos.fetch_max(pos, Ordering::AcqRel);
+        self.intake_signals.publish_stored(pos);
         self.cnc
             .snapshots()
             .incoming_snapshot_pos
@@ -7738,49 +7738,54 @@ impl Consensus {
         // pass once the log catches up — named ONCE, on the edge, because a
         // node that stays behind would otherwise log every pass.
         //
-        // The `durable` load sits UNDER the `stored > stored_set_noted` guard: on the
+        // The `durable` load sits UNDER the landing-count guard: on the
         // steady path (no fetch outstanding, or one already adopted) this
-        // whole branch is the one `Acquire` load of `stored_set_pos` and a
-        // compare.
+        // whole branch is the one `Acquire` load of the landing count, a
+        // compare, and an `is_empty` on the held-back list.
         //
-        // Controller ruling R7: the edge is `stored` passing the last FETCHED
-        // set noted (`stored_set_noted`), not the set position. A fetched set
-        // at or below a newer set this node already holds (a voter that
-        // missed a standby N and built a full N2 > N) is still complete on
-        // disk: it is noted HELD (and foreign, ruling R42) — otherwise
-        // auto-fetch never sees N held and fetches it again. The set
-        // position itself only moves UP, as before.
-        let stored = self.stored_set_pos.load(Ordering::Acquire);
-        if stored > self.stored_set_noted {
+        // Controller ruling R7: a fetched set at or below a newer set this
+        // node already holds (a voter that missed a standby N and built a
+        // full N2 > N) is still complete on disk: it is noted HELD (and
+        // foreign, ruling R42) — otherwise auto-fetch never sees N held and
+        // fetches it again. The set position itself only moves UP, as before.
+        //
+        // #125: and the edge is the LANDING, not the fetch cursor. The cursor
+        // (`stored_set_pos`, a `fetch_max`) is a high-water mark, so a set
+        // landing BELOW it — an operator `snapshot fetch` stored a newer,
+        // not-yet-agreed set first — left it where it was and had no edge:
+        // never noted held, its fetch timed out, and auto-fetch re-fetched
+        // it on the backoff ladder until the newer set agreed. The receiver
+        // records every landing; this drains them.
+        let landed = self.intake_signals.landed();
+        if landed != self.landings_seen {
+            self.landings_seen = landed;
             let durable = self.cnc.counters().durable.load_acquire();
-            if stored > durable {
-                if self.stored_above_durable != stored {
-                    self.stored_above_durable = stored;
+            for pos in self.intake_signals.take_landings() {
+                self.last_landed = pos;
+                if pos > durable {
                     crate::obs_event!(
                         Warn,
                         "snapshot_set_held_above_durable",
                         node = self.id as u64,
-                        position = stored,
+                        position = pos,
                         durable = durable
                     );
+                    self.stored_pending.push(pos);
+                } else {
+                    seen = self.adopt_landed_set(pos, seen);
                 }
-            } else {
-                self.stored_above_durable = 0;
-                self.stored_set_noted = stored;
-                self.note_set_held(stored);
-                // Ruling R42: another node's freeze — never reported as ours.
-                self.note_foreign_set(stored);
-                if stored > seen {
-                    self.snapshot_set_position.store(stored, Ordering::Release);
-                    seen = stored;
+            }
+        }
+        if !self.stored_pending.is_empty() {
+            let durable = self.cnc.counters().durable.load_acquire();
+            let mut i = 0;
+            while i < self.stored_pending.len() {
+                if self.stored_pending[i] <= durable {
+                    let pos = self.stored_pending.swap_remove(i);
+                    seen = self.adopt_landed_set(pos, seen);
+                } else {
+                    i += 1;
                 }
-                crate::obs_event!(
-                    Info,
-                    "snapshot_set_complete",
-                    node = self.id as u64,
-                    position = stored,
-                    source = "fetch"
-                );
             }
         }
         let p = self.cluster_snapshot_pos.load(Ordering::Acquire);
@@ -7817,6 +7822,29 @@ impl Consensus {
         // only, and (because that edge is a high-water mark) exactly once per
         // instant.
         self.send_snapshot_reports(p);
+    }
+
+    /// A landed (store-only fetched) set at `pos`, at or below this node's
+    /// durable frontier: noted held and foreign, and adopted as the set
+    /// position if it is the newest. Returns the set position as now seen.
+    fn adopt_landed_set(&mut self, pos: u64, seen: u64) -> u64 {
+        self.note_set_held(pos);
+        // Ruling R42: another node's freeze — never reported as ours.
+        self.note_foreign_set(pos);
+        let seen = if pos > seen {
+            self.snapshot_set_position.store(pos, Ordering::Release);
+            pos
+        } else {
+            seen
+        };
+        crate::obs_event!(
+            Info,
+            "snapshot_set_complete",
+            node = self.id as u64,
+            position = pos,
+            source = "fetch"
+        );
+        seen
     }
 
     /// Plan B3 (spec §6.5.2): on the edge where this node's own snapshot set
@@ -12151,7 +12179,7 @@ impl Consensus {
         self.pending_fetch = Some(PendingFetch {
             learner: from,
             position,
-            stored_before: self.stored_set_pos.load(Ordering::Acquire),
+            landed_before: self.intake_signals.landed(),
             deadline_ns: self.pass_now_ns.saturating_add(FETCH_TIMEOUT_NS),
             auto,
             source: FetchSource::Tier(fetch),
@@ -12512,7 +12540,7 @@ impl Consensus {
         self.pending_fetch = Some(PendingFetch {
             learner: from,
             position,
-            stored_before: self.stored_set_pos.load(Ordering::Acquire),
+            landed_before: self.intake_signals.landed(),
             deadline_ns: self.pass_now_ns.saturating_add(FETCH_TIMEOUT_NS),
             auto,
             source: FetchSource::Peer,
@@ -12793,10 +12821,17 @@ impl Consensus {
             }
             return;
         }
-        let stored = self.stored_set_pos.load(Ordering::Acquire);
-        if stored > p.stored_before {
+        if self.intake_signals.landed() > p.landed_before {
             let p = self.pending_fetch.take().expect("matched above");
-            self.fetch_stored(&p, stored, "peer");
+            // `check_set_completeness` (earlier in the pass) drained the
+            // landing; a fetch of "the learner's newest" (`position == 0`)
+            // names what landed.
+            let landed = if p.position != 0 {
+                p.position
+            } else {
+                self.last_landed
+            };
+            self.fetch_stored(&p, landed, "peer");
         } else if self.pass_now_ns > p.deadline_ns {
             let p = self.pending_fetch.take().expect("matched above");
             self.fetch_timed_out(&p);
@@ -16381,9 +16416,9 @@ mod tests {
             tier_install_stale_term: 0,
             fetch_source_stats: Arc::new(Default::default()),
             tier_install_stats: Arc::new(Default::default()),
-            stored_set_pos,
-            stored_above_durable: 0,
-            stored_set_noted: 0,
+            landings_seen: 0,
+            stored_pending: Vec::new(),
+            last_landed: 0,
             snapshot_floor_hold: 0,
             snapshot_standby_learner: Arc::new(AtomicU32::new(0)),
             snapshot_standby_position: Arc::new(AtomicU64::new(0)),
@@ -18437,7 +18472,7 @@ mod tests {
         h.row_published_at(0, p, 0xDEAD_BEEF_DEAD_BEEF);
         h.cluster_snapshot_pos.store(p, Ordering::Release);
         h.cons.cnc.counters().durable.store_release(p);
-        h.cons.stored_set_pos.store(p, Ordering::Release);
+        h.cons.intake_signals.publish_stored(p);
 
         h.cons.check_set_completeness();
         assert_eq!(
@@ -20050,7 +20085,7 @@ mod tests {
         write_held_set(&h, fetched, b"fetched from a learner");
         h.cons.holdings_held.push(built);
         // The receiver finished the store-only intake at `fetched`.
-        h.cons.stored_set_pos.store(fetched, Ordering::Release);
+        h.cons.intake_signals.publish_stored(fetched);
         h.cons.check_set_completeness();
         assert_eq!(
             h.cons.snapshot_set_position.load(Ordering::Relaxed),
@@ -20235,7 +20270,7 @@ mod tests {
         h.cons
             .cache_report_set(p, &[(0, 0x01, 0), (CLUSTER_ROW, 0x02, 0)]);
         assert!(h.cons.reported_sets.iter().any(|s| s.position == p));
-        h.cons.stored_set_pos.store(p, Ordering::Release);
+        h.cons.intake_signals.publish_stored(p);
         h.cons.check_set_completeness(); // the fetch edge
         assert!(
             !h.cons.reported_sets.iter().any(|s| s.position == p),
@@ -20619,7 +20654,7 @@ mod tests {
         );
 
         // The receiver agent finished a store-only intake at p.
-        h.cons.stored_set_pos.store(p, Ordering::Release);
+        h.cons.intake_signals.publish_stored(p);
         h.cons.check_set_completeness();
         assert_eq!(
             h.cons.snapshot_set_position.load(Ordering::Relaxed),
@@ -20632,7 +20667,7 @@ mod tests {
         // and the floor stays where it was — a floor above the log would have
         // `recover` install an artifact ahead of the bytes it summarises.
         let above = h.cons.cnc.counters().durable.load_acquire() + 4096;
-        h.cons.stored_set_pos.store(above, Ordering::Release);
+        h.cons.intake_signals.publish_stored(above);
         h.cons.check_set_completeness();
         assert_eq!(
             h.cons.snapshot_set_position.load(Ordering::Relaxed),
@@ -20644,11 +20679,12 @@ mod tests {
         h.cons.check_set_completeness();
         assert_eq!(h.cons.snapshot_set_position.load(Ordering::Relaxed), above);
 
-        // ...and it is a high-water mark like every other completion: a stale
-        // (or repeated) stored value never moves it back.
-        h.cons.stored_set_pos.store(2048, Ordering::Release);
+        // ...and it is a high-water mark like every other completion: a set
+        // landing below it never moves it back — but IS noted held (#125).
+        h.cons.intake_signals.publish_stored(2048);
         h.cons.check_set_completeness();
         assert_eq!(h.cons.snapshot_set_position.load(Ordering::Relaxed), above);
+        assert!(h.cons.holdings_held.contains(&2048));
     }
 
     /// Spec §5.7 item 5: admin op 9 validates the target against the COMMITTED
@@ -20702,7 +20738,7 @@ mod tests {
         // It is retired once the receiver publishes a stored set — so the
         // operator's verb is re-runnable rather than the node looking busy
         // forever.
-        h.cons.stored_set_pos.store(4096, Ordering::Release);
+        h.cons.intake_signals.publish_stored(4096);
         h.cons.poll_pending_fetch();
         assert!(h.cons.pending_fetch.is_none());
 
@@ -28299,18 +28335,18 @@ mod tests {
         h.cons.pending_fetch = Some(PendingFetch {
             learner: 1,
             position: 1000,
-            stored_before: 0,
+            landed_before: 0,
             deadline_ns: 1_000_000,
             auto: true,
             source: FetchSource::Peer,
         });
-        h.cons.stored_set_pos.store(1000, Ordering::Release);
+        h.cons.intake_signals.publish_stored(1000);
         h.cons.poll_pending_fetch();
         assert_eq!(h.cons.auto_fetch_stats.get(Outcome::Ok), 1);
         h.cons.pending_fetch = Some(PendingFetch {
             learner: 1,
             position: 2000,
-            stored_before: 1000,
+            landed_before: 1,
             deadline_ns: 2_000,
             auto: true,
             source: FetchSource::Peer,
@@ -28321,7 +28357,7 @@ mod tests {
         h.cons.pending_fetch = Some(PendingFetch {
             learner: 1,
             position: 3000,
-            stored_before: 1000,
+            landed_before: 1,
             deadline_ns: 2_000,
             auto: false,
             source: FetchSource::Peer,
@@ -28447,7 +28483,7 @@ mod tests {
         assert!(h.cons.pending_fetch.is_some(), "the first fetch was issued");
         while h.fetch_rx.try_recv().is_ok() {}
         // The receiver lands it.
-        h.cons.stored_set_pos.store(1000, Ordering::Release);
+        h.cons.intake_signals.publish_stored(1000);
         h.cons.poll_pending_fetch();
         assert_eq!(h.cons.auto_fetch_stats.get(Outcome::Ok), 1);
         h.cons.maybe_auto_fetch();
@@ -28660,8 +28696,8 @@ mod tests {
             while let Ok(f) = h.fetch_rx.try_recv() {
                 assert_eq!(f.position, 1000);
                 fetches += 1;
-                // The receiver lands it (store-only): `stored_set_pos` moves.
-                h.cons.stored_set_pos.fetch_max(1000, Ordering::AcqRel);
+                // The receiver lands it (store-only).
+                h.cons.intake_signals.publish_stored(1000);
             }
             t += 500_000_000;
         }
@@ -28676,6 +28712,71 @@ mod tests {
             h.cons.snapshot_set_position.load(Ordering::Acquire),
             2000,
             "the set position stays monotone"
+        );
+    }
+
+    /// #125: an operator `uc2ctl snapshot fetch` with no position stored a
+    /// NEWER, not-yet-agreed set N2, so the fetch cursor (`stored_set_pos`,
+    /// a `fetch_max`) already sits above the newest agreed set N. Auto-fetch's
+    /// fetch of N then lands BELOW the cursor: the word does not move, the
+    /// landing has no edge, the fetch times out after 60 s and auto-fetch
+    /// retries it on the backoff ladder until N2 agrees. A landing is a
+    /// set-level fact and the cursor only a high-water mark: N is noted held
+    /// and its fetch completes, wherever the cursor is.
+    #[test]
+    fn a_fetched_set_below_the_fetch_cursor_is_held_and_its_fetch_completes() {
+        use crate::auto_fetch::Outcome;
+        let mut h = harness_with_rows(&["a"]);
+        let mut n = agreed_entry(1000);
+        n.kind = uc_protocol::v2::catalog::SetKind::Standby;
+        let n2 = SetEntry::commanded(2000, uc_protocol::v2::catalog::SetKind::Full, 0);
+        auto_fetch_on(&mut h, vec![n, n2]);
+        // The operator's fetch of N2 landed first (store-only) and was noted.
+        h.cons.intake_signals.publish_stored(2000);
+        h.cons.check_set_completeness();
+        assert!(h.cons.holdings_held.contains(&2000));
+        assert_eq!(
+            h.cons
+                .intake_signals
+                .stored_set_pos()
+                .load(Ordering::Acquire),
+            2000
+        );
+        let mut t = 10_000_000_000u64;
+        let mut fetches = 0;
+        // 150 passes 500 ms apart: 75 s, past one fetch timeout.
+        for _ in 0..150 {
+            h.cons.pass_now_ns = t;
+            h.cons.check_set_completeness();
+            h.cons.poll_pending_fetch();
+            h.cons.maybe_auto_fetch();
+            while let Ok(f) = h.fetch_rx.try_recv() {
+                assert_eq!(f.position, 1000);
+                fetches += 1;
+                // The receiver lands it (store-only), BELOW the cursor.
+                h.cons.intake_signals.publish_stored(1000);
+            }
+            t += 500_000_000;
+        }
+        assert_eq!(fetches, 1, "N fetched exactly once");
+        assert_eq!(
+            h.cons.auto_fetch_stats.get(Outcome::Ok),
+            1,
+            "the fetch landed"
+        );
+        assert_eq!(h.cons.auto_fetch_stats.get(Outcome::Timeout), 0);
+        assert!(
+            h.cons.holdings_held.contains(&1000),
+            "the landed set is held: {:?}",
+            h.cons.holdings_held
+        );
+        assert_eq!(
+            h.cons
+                .intake_signals
+                .stored_set_pos()
+                .load(Ordering::Acquire),
+            2000,
+            "the cursor is a high-water mark"
         );
     }
 
@@ -28694,7 +28795,7 @@ mod tests {
         h.cons.pending_fetch = Some(PendingFetch {
             learner: 2,
             position: 4096,
-            stored_before: 0,
+            landed_before: 0,
             deadline_ns: t,
             auto: false,
             source: FetchSource::Tier(crate::tier::source::TierFetch::never_finishing_for_test(
@@ -28770,7 +28871,7 @@ mod tests {
             h.cons.tier_source = Some(Arc::clone(&fx.src));
             publish(&mut h, fx, through);
             h.cons.intake_signals = uc_net::receiver::SnapIntakeSignals::new(
-                Arc::clone(&h.cons.stored_set_pos),
+                h.cons.intake_signals.stored_set_pos(),
                 Some((
                     Arc::clone(&h.cons.incoming_snapshot),
                     Arc::clone(&h.cons.incoming_cluster_pos),
@@ -29356,7 +29457,7 @@ mod tests {
         h.cons.pending_fetch = Some(PendingFetch {
             learner: 0,
             position: 0,
-            stored_before: 0,
+            landed_before: 0,
             deadline_ns: t - 1,
             auto: false,
             source: FetchSource::Peer,

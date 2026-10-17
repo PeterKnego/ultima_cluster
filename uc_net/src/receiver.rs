@@ -853,6 +853,17 @@ pub type IncomingSnapshotSignal = (
 pub struct SnapIntakeSignals {
     /// See [`FollowerReceiver::stored_set_pos`].
     stored_set_pos: Arc<AtomicU64>,
+    /// #125: every store-only landing, in landing order, for the consensus
+    /// agent to drain. A landing is a set-level fact — "the set at P is on
+    /// disk" — while `stored_set_pos` is a high-water mark: a set landing
+    /// BELOW the mark (an operator fetched a newer, not-yet-agreed set
+    /// first) left the mark where it was and so had no edge — never noted
+    /// held, its fetch timed out, and auto-fetch re-fetched it on the
+    /// backoff ladder until the newer set agreed.
+    landings: Arc<Mutex<Vec<u64>>>,
+    /// The landing count: the one `Acquire` load the consensus agent's
+    /// steady path makes. It drains `landings` only when this moved.
+    landed: Arc<AtomicU64>,
     /// The install route ([`IncomingSnapshotSignal`]); `None` until
     /// `set_snapshot_intake` wires one (unit tests, non-node embeddings).
     incoming: Option<IncomingSnapshotSignal>,
@@ -870,6 +881,8 @@ impl SnapIntakeSignals {
     pub fn new(stored_set_pos: Arc<AtomicU64>, incoming: Option<IncomingSnapshotSignal>) -> Self {
         SnapIntakeSignals {
             stored_set_pos,
+            landings: Arc::new(Mutex::new(Vec::new())),
+            landed: Arc::new(AtomicU64::new(0)),
             incoming,
             adopt_pending: Arc::new(AtomicU64::new(0)),
         }
@@ -883,9 +896,33 @@ impl SnapIntakeSignals {
     /// `cluster_snapshot_pos` to the `uc2-cluster` agent). Its floor moves
     /// through the consensus agent's ordinary completeness poll, from this
     /// one word. `fetch_max`: two writers (a peer session and the tier
-    /// thread) may complete sets out of order, and the word never goes back.
+    /// thread) may complete sets out of order, and the word never goes back
+    /// — which is why the landing itself is ALSO recorded (#125): the
+    /// consensus agent notes every landed set held, wherever the mark is.
     pub fn publish_stored(&self, pos: u64) {
         self.stored_set_pos.fetch_max(pos, Ordering::AcqRel);
+        self.landings
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(pos);
+        self.landed.fetch_add(1, Ordering::Release);
+    }
+
+    /// #125: how many store-only landings [`Self::publish_stored`] has
+    /// recorded — the consensus agent's edge detector, one `Acquire` load
+    /// per pass.
+    pub fn landed(&self) -> u64 {
+        self.landed.load(Ordering::Acquire)
+    }
+
+    /// #125: the landings recorded since the last call, in landing order.
+    pub fn take_landings(&self) -> Vec<u64> {
+        std::mem::take(&mut *self.landings.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    /// The high-water mark of landed sets — `uc2_snapshot_fetched_position`.
+    pub fn stored_set_pos(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.stored_set_pos)
     }
 
     /// An INSTALL intake's tail: hand the cluster artifact at
@@ -1666,7 +1703,7 @@ impl FollowerReceiver {
     /// at construction and its consensus agent polls it — see
     /// [`FollowerStats`]' sibling doc and `Consensus::check_set_completeness`.
     pub fn stored_set_pos(&self) -> Arc<AtomicU64> {
-        Arc::clone(&self.signals.stored_set_pos)
+        self.signals.stored_set_pos()
     }
 
     /// Backup-tier 3b ruling PF4: a handle on this receiver's completion
