@@ -1424,6 +1424,8 @@ pub fn uc_node_http() -> Vec<Seed> {
     big.extend(std::iter::repeat_n(b'a', 5 * 1024));
     big.extend_from_slice(b" HTTP/1.1\r\n\r\n");
     seeds.push(Seed::fixed("13-oversized-request-line", big));
+    // The cluster view's live document (2.14.0).
+    seeds.push(Seed::fixed("14-get-cluster", b"GET /cluster HTTP/1.1\r\nHost: x\r\n\r\n".to_vec()));
     seeds
 }
 
