@@ -562,6 +562,15 @@ fn write_alerts_node_toml(
          buffer_bytes = {}\n\
          journal_segment_bytes = {}\n\
          \n\
+         [crypto]\n\
+         enabled = false\n\
+         \n\
+         [admin]\n\
+         auth = \"none\"\n\
+         \n\
+         [services]\n\
+         names = [\"reg\"]\n\
+         \n\
          [[members]]\n\
          id = 0\n\
          addr = \"{bind}\"\n\
@@ -784,6 +793,11 @@ fn run_alerts_row(root: &Path) -> Verdict {
 
 // =========================================================== row 5: flag-day smoke
 
+/// #69: `[crypto]`, `[admin]` (2.6.0) and `[services]` (2.11.0) are explicit
+/// choices `uc2-node` refuses to start without, by name; both writers below
+/// carry the cleartext / filesystem / one-row shape the shipped
+/// `packaging/node.example.toml` documents. Neither row attaches a service,
+/// so the declared name is a placeholder the daemon only needs to be told.
 fn write_flagday_node_toml(
     cfg_path: &Path,
     id: u32,
@@ -803,6 +817,15 @@ fn write_flagday_node_toml(
          app_id = \"{app}\"\n\
          buffer_bytes = {}\n\
          journal_segment_bytes = {}\n\
+         \n\
+         [crypto]\n\
+         enabled = false\n\
+         \n\
+         [admin]\n\
+         auth = \"none\"\n\
+         \n\
+         [services]\n\
+         names = [\"reg\"]\n\
          \n\
          {members_toml}",
         instance_dir.display(),

@@ -484,13 +484,20 @@ fn write_config(
     dir: &Path,
     members: &[(NodeId, SocketAddr)],
 ) {
+    // #69: `[crypto]`, `[admin]` (2.6.0) and `[services]` (2.11.0) are
+    // explicit choices a node refuses to start without, by name. The row
+    // name is `RegSm::NAME`, the one service this gate attaches.
     let mut s = format!(
         "id = {id}\nbind = \"{addr}\"\ninstance_dir = \"{}\"\napp_id = \"{APP}\"\n\
          buffer_bytes = {BUFFER_BYTES}\n\
          journal_segment_bytes = {SEGMENT_BYTES}\n\n\
+         [crypto]\nenabled = false\n\n\
+         [admin]\nauth = \"none\"\n\n\
+         [services]\nnames = [\"{}\"]\n\n\
          [purge]\nbelow_snapshot_slack_bytes = {PURGE_SLACK_BYTES}\n\n\
          [settings]\nsnapshot_interval_bytes = {SNAPSHOT_INTERVAL_BYTES}\n\n",
-        dir.display()
+        dir.display(),
+        <RegSm as uc_service::StateMachine>::NAME,
     );
     for (mid, maddr) in members {
         s.push_str(&format!("[[members]]\nid = {mid}\naddr = \"{maddr}\"\n\n"));
@@ -797,9 +804,17 @@ fn check_refusals(bin: &Path, root: &Path, members: &[(NodeId, SocketAddr)]) -> 
         m0.1,
         good_dir.display()
     );
+    // #69: every case carries the three explicit-choice sections, so the
+    // refusal each one provokes is the field it names — not the
+    // `[crypto] section is required` door every config without them hits
+    // first (which is what made this row read 4/6 failed through 2.13.0).
     let member_block: String = members
         .iter()
         .map(|(id, addr)| format!("\n[[members]]\nid = {id}\naddr = \"{addr}\"\n"))
+        .chain(std::iter::once(
+            "\n[crypto]\nenabled = false\n\n[admin]\nauth = \"none\"\n\n[services]\nnames = [\"reg\"]\n"
+                .to_string(),
+        ))
         .collect();
 
     // (name, config body, substring the refusal must contain)

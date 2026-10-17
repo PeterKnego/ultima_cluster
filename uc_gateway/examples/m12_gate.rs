@@ -510,6 +510,21 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// #69: the `Engine` window an edge needs so that ONE connection may hold
+/// `inflight` requests. M13's grant budget keeps `BUDGET_HEADROOM_DIV`'s
+/// share (1/8) of the window back, and `EdgeConfig` refuses a per-connection
+/// cap above that budget — so `per_conn == max` (what this harness set
+/// through 2.13.0) is refused by name at `Edge::start`. The smallest window
+/// whose budget covers `inflight` is `inflight + ceil(inflight / 7)`:
+/// `budget_for(n + ceil(n/7)) >= n` for every `n >= 1`. The client-visible
+/// inflight stays `inflight`, which is what the ratio compares.
+fn engine_window_for(inflight: u64) -> u32 {
+    let n = u32::try_from(inflight).expect("--inflight fits u32");
+    let window = n + n.div_ceil(7);
+    debug_assert!(uc_gateway::budget_for(window) >= n, "{window} covers {n}");
+    window
+}
+
 fn default_root() -> PathBuf {
     let home = std::env::var("HOME").expect("HOME not set");
     PathBuf::from(home).join(".cache/cargo-target/m12_gate")
@@ -1659,7 +1674,7 @@ where
             listen: listen[i],
             members: members.clone(),
             session_envelope: envelope_on,
-            max_inflight: inflight as u32,
+            max_inflight: engine_window_for(inflight),
             per_conn_inflight: inflight as u32,
             status_interval: Duration::from_millis(200),
             request_timeout: Duration::from_secs(30),
@@ -2348,10 +2363,11 @@ fn run_edge_role(a: EdgeArgs) -> anyhow::Result<()> {
         listen: a.listen,
         members,
         session_envelope: a.envelope == Envelope::On,
-        // Kept equal to each other and to the client's `--inflight`, exactly
-        // as the in-process gateway arm does: the whole point of row 2 is a
-        // ratio "at equal inflight".
-        max_inflight: a.inflight as u32,
+        // The connection's cap is the client's `--inflight`, exactly as the
+        // in-process gateway arm does: the whole point of row 2 is a ratio
+        // "at equal inflight". The window is sized so the edge's grant
+        // budget can hand that whole cap to one connection (#69).
+        max_inflight: engine_window_for(a.inflight),
         per_conn_inflight: a.inflight as u32,
         status_interval: Duration::from_millis(200),
         request_timeout: Duration::from_secs(30),
