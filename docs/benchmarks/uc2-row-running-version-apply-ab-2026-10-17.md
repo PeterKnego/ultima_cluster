@@ -150,7 +150,8 @@ faster.
 ### What the instrument is measuring (investigation, not a verdict)
 
 Two more runs on the same host, with `apply_bench` binaries built on the
-maintainer's dev box (same `rustc` 1.96, a newer system linker), six or eight
+maintainer's dev box (same `rustc` 1.96 and the same bundled `rust-lld` 22.1.2;
+the C runtime objects differ, GCC 15 against the host's GCC 13), six or eight
 interleaved reps per binary at N=1, deltas against `a409b3ae`:
 
 | commit | dev-box build, default layout | dev-box build, every function and loop aligned to 64 B |
@@ -175,8 +176,9 @@ Three readings follow, and the third decides what rows a–c can claim:
    commit ran 13.46 M on the same host type, 7 % slower. Within the dev-box
    set the fix is worth +7.5 % over `main`; within the host-built set it
    costs 0.8 %. Forced 64-byte alignment does not remove this, so what
-   matters on this CPU is not (only) a loop's alignment but the relative
-   placement of the hot code, which the linker decides.
+   matters on this CPU is not (only) a loop's alignment. §6 shows it is not
+   function order either (a shuffle moves a source by 1–2 % at most), so the
+   cause of this 7 % is still open.
 
 `apply_ab.sh`'s B′ control cannot see this: two builds of one source by one
 builder get one layout, so the "resolution" it reports is build
@@ -242,6 +244,84 @@ host shape and runner. A step is **attributed** when its adjacent-point
 delta's Welch 95 % interval lies wholly below zero; a step whose interval
 spans zero is not attributed, however large its point estimate.
 
+### 6.2 Results (§6, 2026-10-17)
+
+One c6id.2xlarge, 240 runs (40 binaries × 3 reps × N=1, 2), all complete.
+Means of seed-means, M frames/s, with between-seed sd:
+
+| arm | N=1 | N=2 |
+|---|---:|---:|
+| `a409b3ae` | 15.076 (2.24 %) | 14.676 (0.68 %) |
+| `a70539a1` | 14.702 (0.41 %) | 14.638 (0.32 %) |
+| `main` | 14.083 (0.59 %) | 14.021 (0.53 %) |
+| `main` + fix | 13.690 (2.15 %) | 13.905 (0.68 %) |
+
+| reading | N=1, 95 % interval | N=2, 95 % interval |
+|---|---:|---:|
+| 1. #33's cost | **−2.48 %** [−4.09, −0.88] | −0.26 % [−0.77, +0.25] |
+| 2. what `main` adds | **−4.21 %** [−4.68, −3.75] | **−4.22 %** [−4.62, −3.82] |
+| 3. the fix vs `main` | **−2.79 %** [−4.31, −1.26] | −0.83 % [−1.40, −0.26] |
+
+1. **#33 costs the apply hop 2.5 % at N=1**, outside layout luck; at N=2
+   this rig cannot separate it from zero. Row a's FAIL stands, at about half
+   the size row a read.
+2. **`main` adds a further 4.2 % at both N**, with intervals far from zero.
+3. **The fix is dropped from 2.14.0**: its N=1 interval lies wholly below
+   zero, the rule's drop condition. It stays on `bench/33-apply-ab`.
+4. **Layout spread:** a source's ten layouts span 1.0–1.8 % (sd 0.3–0.6 %).
+   Two arms read wider (`a409b3ae` and the fix at N=1, max − min 7.4 % and
+   7.3 %), each from one slow run (`a409b3ae.s5` at 11.96 M against a
+   15.25 M median, `fix.s3` at 11.02 M against 13.78 M), kept as the method
+   requires.
+
+### 6.3 Results (§6.1, 2026-10-17)
+
+One c6id.2xlarge, 180 runs (60 binaries × 3 reps, N=1), all complete. A
+first attempt was aborted after 12 runs: 48 binaries had reached the host
+truncated (an interrupted copy), which surfaced as an exec-format error.
+Every binary was then checked by SHA-256 against its local copy and the run
+restarted from zero; the aborted rows are not used.
+
+| point | M frames/s (sd) | vs `a70539a1` | step vs previous, 95 % interval |
+|---|---:|---:|---|
+| `a70539a1` | 14.981 (0.26 %) | — | — |
+| `baae5ae0` #70 | 14.967 (0.24 %) | −0.09 % | −0.09 % [−0.45, +0.26] |
+| `e4bb9f65` #71 | 14.853 (0.60 %) | −0.86 % | **−0.76 % [−1.49, −0.03]** |
+| `d7ab8d1a` #75 | 14.838 (0.50 %) | −0.95 % | −0.10 % [−0.90, +0.71] |
+| `19b5788d` #80 | 14.913 (0.23 %) | −0.46 % | +0.50 % [−0.10, +1.11] |
+| `0d773273` #81 | 14.400 (0.86 %) | −3.88 % | **−3.44 % [−4.43, −2.45]** |
+| `b7ebcc55` #83 | 14.721 (0.75 %) | −1.73 % | +2.23 % [+1.04, +3.42] |
+| `5d8cdbc1` #87 | 14.357 (1.93 %) | −4.17 % | **−2.48 % [−4.81, −0.15]** |
+| `dffe5f43` #88 | 14.503 (0.80 %) | −3.19 % | +1.02 % [−1.39, +3.43] |
+| `9044e522` #90 | 14.497 (0.34 %) | −3.23 % | −0.04 % [−1.04, +0.96] |
+| `c240a896` #97 | 14.240 (0.37 %) | −4.95 % | **−1.77 % [−2.29, −1.26]** |
+| `0a9bed82` `main` | 14.212 (0.54 %) | −5.14 % | −0.20 % [−0.89, +0.49] |
+
+Four steps are attributed by the rule: #81 (−3.4 %), #87 (−2.5 %), #97
+(−1.8 %) and, at the margin, #71 (−0.8 %). #87's point carries one slow run
+(`5d8cdbc1.s3`, 12.50 M against a 14.58 M median). The two PRs cleared on
+reading before the run are cleared by it too: #75 changes only `apply_bench`'s
+post-window frame count, and #80's step (+0.5 %, interval spans zero) shows
+its write-reserve load costs nothing measurable, although that load does sit
+on the apply loop's own read (`LogBuffer::read_run_validated`, §6.5).
+
+**The step that decides how to read the others is #83: +2.2 %, outside its
+interval, from a change to one `eprintln!` format string on `apply_cycle`'s
+cold replay-stall path.** That cannot be per-frame work, so a step here can
+come from how a change alters the compiled hot loop as well as from what it
+makes the loop do. A section shuffle moves whole functions; it does not vary
+how LLVM lays out the blocks and registers inside `apply_cycle`, which holds
+the per-frame loop beside every cold path (attach, replay, rewind,
+start-set).
+
+**The −5 % is located, not explained.** The 2.11.0 mechanism is ruled out:
+at every point the per-frame callees (`FrameIter::next`, `read_header`, the
+publish path) are still inlined, and `apply_cycle`'s only calls out are the
+cold snapshot and timer handlers. Its bulk shape does not track the rate
+either: #81 (−3.4 %) changed the function by −19 bytes, while #83 (+2.2 %)
+grew it by 1 258 bytes and 47 more stack stores. §6.4 reads the CPU's
+counters across #81's step to find where the cycles went.
+
 ### 6.4 Counter readout across #81's step (method fixed before the run)
 
 #81's step (`19b5788d` → `0d773273`, −3.4 %) is the largest and changes
@@ -289,3 +369,50 @@ quota. So §6.4 cannot run as written, and two substitutes replace it:
   load, a store forward, a branch, a spill reload) on the slow side. Timer
   samples skid, so a group is read as a cluster of adjacent instructions,
   never a single one.
+
+### 6.5 Results (§6.4 as amended, 2026-10-17)
+
+**Reading 1, dev box, AMD PMU** (`uc2-apply` thread, five seeds × two runs
+per side, per applied frame):
+
+| per frame | `19b5788d` | `0d773273` (#81) | difference, 95 % interval |
+|---|---:|---:|---|
+| instructions | 520.1 | 518.5 | **−1.6 [−2.5, −0.8]** |
+| branches | 74.16 | 74.07 | −0.09 [−0.21, +0.03] |
+| branch misses | 0.0037 | 0.0034 | −0.0003 [−0.0008, +0.0002] |
+| cycles | 237.7 | 233.2 | −4.6 [−5.8, −3.3] |
+| rate, M frames/s | 21.52 | 21.94 | **+0.42 [+0.31, +0.53]** |
+
+**#81 is not more work per frame**: it retires 0.3 % fewer instructions and
+the same branches, with almost no mispredictions on either side. The same
+binaries are 2.0 % *faster* on Zen 5 and 3.4 % slower on Ice Lake, so the
+step is the same work executed worse on one microarchitecture.
+
+**Where the time goes, Intel host, `cpu-clock` samples** (three seeds per
+side, 4 s each), share of the `uc2-apply` thread:
+
+| function | `19b5788d` s1 / s2 / s3 | `0d773273` s1 / s2 / s3 |
+|---|---|---|
+| `crc32fast::baseline::update_fast_16` | 61.6 / 61.9 / 62.1 % | 61.1 / 61.0 / 61.4 % |
+| `uc_service::apply::apply_cycle` | 8.7 / 9.0 / 8.6 % | 8.2 / 8.7 / 8.4 % |
+| `uc_log::buffer::LogBuffer::read_run_validated` | 7.9 / 7.3 / 7.2 % | 7.9 / 8.0 / 8.0 % |
+| unresolved (outside the binary) | 6.9 / 6.9 / 6.8 % | 7.2 / 6.6 / 6.8 % |
+| `uc_protocol::ring::common::write_record_at` | 3.7 / 3.1 / 3.7 % | 3.5 / 3.5 / 3.4 % |
+
+Only one function's share moves the same way on every seed:
+`read_run_validated`, whose time per frame (share ÷ rate) rises about 10 %
+on the slow side. Its code is byte-identical on both sides (#81 changes
+only a cold replay arm in `apply.rs` and `replay.rs`). The amended rule
+asks for samples moving to one instruction group, and timer samples at
+this share do not resolve one, so **the mechanism is not identified**: the
+cost is located (#81's step), characterised (no extra work, Ice
+Lake-specific, concentrated in an unchanged read path), and not explained.
+Explaining it needs Ice Lake's own counters (front-end and memory-ordering
+stalls), which need a full-socket instance this account cannot launch.
+
+**A larger finding than the step.** 61 % of the apply hop's time is the
+CRC-32 that `write_record_at` computes over every response record it
+publishes to the egress ring. `crc32fast` serves inputs this short from its
+table-driven fallback, not its carry-less-multiply path. The CRC has been
+in the ring format since `v2.0.0` (the ring trailer), so it is in every arm
+and none of the regression, but it is most of what the apply hop costs.
