@@ -2796,6 +2796,7 @@ impl Node {
             last_flags: 0,
             service_last_epoch: [0; CNC_MAX_SERVICES],
             service_was_live: [false; CNC_MAX_SERVICES],
+            service_attach_seen_ns: [0; CNC_MAX_SERVICES],
             last_wall_ns: 0,
             admin,
             // C1: the SAME values written into `CncMeta` above — the tag is
@@ -4410,6 +4411,17 @@ struct Consensus {
     /// densely — declared sets are sparse (`{0, 3}` is legal).
     service_last_epoch: [u64; CNC_MAX_SERVICES],
     service_was_live: [bool; CNC_MAX_SERVICES],
+    /// #133: the pass clock (`last_wall_ns`) at which id `i`'s newest epoch
+    /// was first SEEN. `uc_service::attach` sets the ATTACHED bit and bumps
+    /// the epoch; the heartbeat word is stamped later, by the apply loop's
+    /// first pass, so for a cycle or more after the attach edge it still
+    /// reads `0` — three seconds "stale" by the bare subtraction, and the
+    /// very next cycle emitted `service_detached` for a service that never
+    /// left. A zero heartbeat is judged from this instant instead: fresh
+    /// until `SERVICE_STALE_NS` after the node saw the attach, stale after
+    /// (a service that attaches and never stamps IS gone, and is reported
+    /// on the same 3 s bar a stalled stamp would be).
+    service_attach_seen_ns: [u64; CNC_MAX_SERVICES],
     /// M14c: the wall-clock ns `publish_status` last stamped into
     /// `node_heartbeat_ns`, reused by `note_service_transitions` so the
     /// transition check costs no second clock read per duty cycle. Since the
@@ -5732,11 +5744,19 @@ impl Consensus {
             let w = words[i];
             let epoch = w.epoch;
             let (_, attached, _) = unpack_service_status(w.status);
-            let live = attached
-                && now_ns.saturating_sub(w.heartbeat_ns) < crate::services::SERVICE_STALE_NS;
+            // #133: a heartbeat the service has not stamped yet (`0`) is
+            // aged from the attach edge the node observed, not from the
+            // epoch — see `service_attach_seen_ns`.
+            let hb = if w.heartbeat_ns == 0 {
+                self.service_attach_seen_ns[i]
+            } else {
+                w.heartbeat_ns
+            };
+            let live = attached && now_ns.saturating_sub(hb) < crate::services::SERVICE_STALE_NS;
             if epoch > self.service_last_epoch[i] {
                 self.service_last_epoch[i] = epoch;
                 self.service_was_live[i] = true;
+                self.service_attach_seen_ns[i] = now_ns;
                 crate::obs_event!(
                     Info,
                     "service_attached",
@@ -16258,6 +16278,7 @@ mod tests {
             last_flags: 0,
             service_last_epoch: [0; CNC_MAX_SERVICES],
             service_was_live: [false; CNC_MAX_SERVICES],
+            service_attach_seen_ns: [0; CNC_MAX_SERVICES],
             last_wall_ns: 0,
             admin: AdminPolicy::Filesystem,
             // Inert under `Filesystem` (verify_admin returns before reading
