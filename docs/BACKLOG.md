@@ -240,13 +240,13 @@ reviewer wants a workload to attack.
 
 ## Small items, worth doing regardless of direction
 
-*A finding with a file, a mechanism and a fix shape is a GitHub issue, not a
+A finding with a file, a mechanism and a fix shape is a GitHub issue, not a
 line here (`docs/agents/issue-tracker.md`): this section is for ideas whose
 open questions come before any code. On 2026-10-17 the seventeen specified
 items it had accumulated moved to issues
 [#119](https://github.com/PeterKnego/ultima_cluster/issues/119) through
 [#135](https://github.com/PeterKnego/ultima_cluster/issues/135), each with
-its full text; what stays is the three that are still ideas.*
+its full text; what stays is the three that are still ideas.
 
 - **Compressing the node's own journal (idea, unmeasured).** The backup tier
   compresses what it writes off-node (spec
