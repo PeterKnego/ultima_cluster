@@ -656,6 +656,13 @@ pub struct FollowerStats {
     /// `SNAP_DONE` costs only the leader's session slot, which times out —
     /// the local artifact is already renamed and installed by then.
     pub seal_failures: AtomicU64,
+    /// #122: control datagrams addressed to this node's own socket under
+    /// wire crypto, skipped before any seal attempt — the leader's (and a
+    /// not-yet-informed follower's) reports to `cfg.leader == self`. Before
+    /// this counter existed each one was a `seal_failures` bump on every
+    /// healthy encrypted leader, which blunted the counter's one meaning
+    /// (a peer we cannot seal to). Diagnostic; nothing alerts on it.
+    pub self_sends_skipped: AtomicU64,
     /// A `SNAP_BEGIN` arrived whose `layout` byte is not
     /// [`SNAP_BEGIN_LAYOUT_V4`] — the named refusal **`peer speaks a
     /// SNAP_BEGIN shape we do not`**. The session is dropped. Two shapes reach
@@ -1087,6 +1094,13 @@ pub struct FollowerReceiver {
     buffer: Arc<LogBuffer>,
     writer: PositionedWriter,
     sock: FaultSocket,
+    /// #122: this socket's own address, read once at construction. The
+    /// node seeds `cfg.leader` with it ("auto-learns the real leader from
+    /// DATA"), so until DATA arrives — forever, on the leader — every
+    /// control report is addressed here, and under wire crypto there is no
+    /// pairwise session with oneself to seal it. `seal_and_send` recognises
+    /// the address and skips the attempt instead of counting a failure.
+    self_addr: SocketAddr,
     cfg: FollowerConfig,
     status_bytes: u64,
     rebuilt: Rebuilt,
@@ -1459,6 +1473,7 @@ impl FollowerReceiver {
             }) => (Some(half), Some(peer_ids), Some(handshake), Some(transport)),
             None => (None, None, None, None),
         };
+        let self_addr = sock.local_addr().expect("bound socket");
         let start = buffer.counters().append.load_acquire();
         let (snap_nak, snap_seed) = (cfg.nak, cfg.seed);
         let status_bytes = if cfg.status_bytes == 0 {
@@ -1487,6 +1502,7 @@ impl FollowerReceiver {
             last_ap_ns: 0,
             recv_buf: vec![0u8; 65_536],
             stats: Arc::new(FollowerStats::default()),
+            self_addr,
             term,
             route,
             sender_route: None,
@@ -2096,6 +2112,18 @@ impl FollowerReceiver {
     /// `sock.send_to` the pre-M8 code made, on the same bytes.
     fn seal_and_send(&mut self, to: SocketAddr, kind: u8, d: &mut Vec<u8>) -> bool {
         if let Some(transport) = self.crypto_seal.as_ref() {
+            // #122: a report to oneself has no session to seal under and
+            // never had a reader — the leader's own position reaches commit
+            // ranking in memory. Skip it here, counted on its own, so
+            // `seal_failures` keeps meaning "a peer we could not seal to".
+            // Cleartext is untouched: there the self-send still goes out
+            // byte-for-byte as it always has.
+            if to == self.self_addr {
+                self.stats
+                    .self_sends_skipped
+                    .fetch_add(1, Ordering::Relaxed);
+                return false;
+            }
             let Some(&peer_id) = self.peer_ids.get(&to) else {
                 self.stats.seal_failures.fetch_add(1, Ordering::Relaxed);
                 return false;
@@ -6487,6 +6515,37 @@ mod tests {
                 .exists(),
             "...and its cluster artifact landed where the uc2-cluster agent recovers from"
         );
+    }
+
+    /// #122: the node seeds `cfg.leader` with the receiver's own address and
+    /// lets DATA correct it — so the leader, which never receives DATA,
+    /// addresses every control report to itself. Under crypto there is no
+    /// self-session: each one used to fail to seal and count, so a healthy
+    /// encrypted leader read `seal_failures` climbing forever. Now it is
+    /// skipped before the seal and counted on its own.
+    #[test]
+    fn a_report_addressed_to_oneself_is_skipped_not_counted_as_a_seal_failure() {
+        use Ordering::Relaxed;
+        let (mut r, _peer, _b, _ids) = receiver_with_crypto_ids(true);
+        let st = r.stats();
+        r.cfg.leader = r.local_addr();
+        // Force a gap so the NAK timer arms, and let the status/AP floors fire.
+        r.leader_append = 4096;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline && st.self_sends_skipped.load(Relaxed) == 0 {
+            r.do_work();
+            std::thread::yield_now();
+        }
+        assert!(
+            st.self_sends_skipped.load(Relaxed) > 0,
+            "a self-addressed control datagram is counted as skipped"
+        );
+        assert_eq!(
+            st.seal_failures.load(Relaxed),
+            0,
+            "...and never as a seal failure"
+        );
+        assert_eq!(st.naks_sent.load(Relaxed), 0, "nothing reached the wire");
     }
 
     /// Fail-closed: with no `SocketAddr -> NodeId` entry for the leader there

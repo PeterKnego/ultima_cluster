@@ -379,6 +379,15 @@ Defects that shipped in `2.13.0` or earlier:
 - **`uc2ctl backup` copied the 64 MiB segment preallocation file**
   (#42 L44, [#114](https://github.com/PeterKnego/ultima_cluster/pull/114));
   backup and restore now skip `seg-prealloc.*.tmp`.
+- **An encrypted leader's `seal_failures` climbed forever**
+  ([#122](https://github.com/PeterKnego/ultima_cluster/issues/122)). The
+  node seeds the receiver's leader address with its own socket and lets
+  DATA correct it, so the leader addressed every position report to itself,
+  and with no self-session each one failed to seal and counted. Documented
+  as benign since `2.3.0`; the receiver now recognises its own address
+  under crypto, skips the attempt, and counts it as `self_sends_skipped`,
+  so `seal_failures` reads 0 on a healthy encrypted cluster. Cleartext is
+  unchanged.
 - **Small, from #37** ([#109](https://github.com/PeterKnego/ultima_cluster/pull/109)):
   `uc2ctl` refuses a mistyped `--instance-dir` by name instead of printing
   "no cluster artifact yet" and exiting 0; `tier forget` prints `0x` ids;
