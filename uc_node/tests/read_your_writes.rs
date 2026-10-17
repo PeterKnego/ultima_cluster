@@ -73,6 +73,7 @@ impl uc_service::WholeStateSnapshot for CountSm {
 fn make_config(
     id: u32,
     members: Vec<(u32, SocketAddr)>,
+    learners: Vec<(u32, SocketAddr)>,
     instance_dir: PathBuf,
     seed: u64,
     addr: SocketAddr,
@@ -93,7 +94,7 @@ fn make_config(
         seed,
         faults: FaultConfig::default(),
         purge: uc_node::PurgePolicy::Disabled,
-        learners: Vec::new(),
+        learners,
         journal_segment_bytes: uc_node::DEFAULT_JOURNAL_SEGMENT_BYTES,
         crypto: uc_node::CryptoConfig::Disabled,
         services: uc_node::ServicesConfig::single(CountSm::NAME),
@@ -109,27 +110,43 @@ struct Cluster {
 }
 
 fn spawn_cluster(n: usize) -> Cluster {
+    spawn_cluster_with_learners(n, 0)
+}
+
+/// `n_voters` voters then `n_learners` learners, ids in that order (the
+/// learner suite's shape): `dirs[i]` / `nodes[i]` cover both.
+fn spawn_cluster_with_learners(n_voters: usize, n_learners: usize) -> Cluster {
     let dir = tempfile::Builder::new()
         .prefix("uc2-ryw-")
         .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
         .expect("tempdir");
+    let total = n_voters + n_learners;
     // Bind every socket first so the full member map is known before any agent.
-    let socks: Vec<UdpSocket> = (0..n)
+    let socks: Vec<UdpSocket> = (0..total)
         .map(|_| UdpSocket::bind("127.0.0.1:0").expect("bind"))
         .collect();
-    let members: Vec<(u32, SocketAddr)> = socks
+    let all: Vec<(u32, SocketAddr)> = socks
         .iter()
         .enumerate()
         .map(|(i, s)| (i as u32, s.local_addr().unwrap()))
         .collect();
-    let mut dirs = Vec::with_capacity(n);
-    let mut nodes = Vec::with_capacity(n);
+    let members: Vec<(u32, SocketAddr)> = all[..n_voters].to_vec();
+    let learners: Vec<(u32, SocketAddr)> = all[n_voters..].to_vec();
+    let mut dirs = Vec::with_capacity(total);
+    let mut nodes = Vec::with_capacity(total);
     for (i, sock) in socks.into_iter().enumerate() {
-        let addr = members[i].1;
+        let addr = all[i].1;
         let instance_dir = dir.path().join(format!("n{i}"));
         dirs.push(instance_dir.clone());
         let seed = 0xA1B2_C3D4_5566_7788 ^ (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        let cfg = make_config(i as u32, members.clone(), instance_dir, seed, addr);
+        let cfg = make_config(
+            i as u32,
+            members.clone(),
+            learners.clone(),
+            instance_dir,
+            seed,
+            addr,
+        );
         nodes.push(Node::start_with_socket(cfg, sock).expect("start"));
     }
     Cluster {
@@ -218,6 +235,58 @@ fn a_follower_read_sees_the_writers_acknowledged_writes() {
         }
     };
     assert!(seen >= last, "explicit-token read {seen} < {last}");
+    writer.shutdown();
+    reader.shutdown();
+    for s in svcs {
+        s.stop();
+    }
+    for n in c.nodes.drain(..) {
+        n.stop();
+    }
+}
+
+/// Read-your-writes spec §"Learners": a learner serves min-position reads
+/// like any node — lag shows as RETRY while it lacks the bytes, and a short
+/// wait once it has them. The node is replicated to and never counted, so
+/// the token path here is the one the geo direction (BACKLOG §4) rests on;
+/// until this test the claim was unexercised.
+#[test]
+fn a_learner_read_sees_the_writers_acknowledged_writes() {
+    const LEARNER: usize = 3;
+    let mut c = spawn_cluster_with_learners(3, 1);
+    let leader = await_single_leader(&c.nodes, 30);
+    assert_ne!(leader, LEARNER, "a learner never leads");
+    let svcs = start_services(&c);
+    let writer = Client::connect(&c.dirs[leader], APP).unwrap();
+    let reader = Client::connect(&c.dirs[LEARNER], APP).unwrap();
+    let mut last = 0;
+    for i in 1..=50u64 {
+        let total: u64 = writer.submit(&Cmd::Add(1)).unwrap();
+        assert_eq!(total, i);
+        last = total;
+        reader.observe(writer.read_token());
+        let seen = ryw_read(&reader, Duration::from_secs(5)).unwrap();
+        assert!(
+            seen >= total,
+            "learner read {seen} after write acknowledged at {total}"
+        );
+    }
+    // Explicit-token API (ruling R3), same bounded RETRY retry.
+    let token = writer.read_token();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let seen: u64 = loop {
+        match reader.query_at_least_on::<(), u64>(0, &(), token) {
+            Err(ClientError::Retry) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(2))
+            }
+            other => break other.unwrap(),
+        }
+    };
+    assert!(seen >= last, "explicit-token read {seen} < {last}");
+    assert!(
+        !c.nodes[LEARNER].is_leader() && !c.nodes[LEARNER].can_serve(),
+        "the learner answered every read without ever serving or leading"
+    );
     writer.shutdown();
     reader.shutdown();
     for s in svcs {
