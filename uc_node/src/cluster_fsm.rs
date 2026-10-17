@@ -1344,6 +1344,14 @@ pub struct ClusterViewInner {
     /// under the same lock — the `Forget` door validates against
     /// [`ClusterView::to_state`], which must carry them.
     pub backups: Vec<BackupTierEntry>,
+    /// #127: the content hash of `catalog` ([`catalog_version_of`]), under
+    /// the same lock as the list it hashes. The lock-free twin
+    /// (`ClusterView::catalog_version`) is stored AFTER the inner is
+    /// published, so a reader that holds this inner and loads the atomic
+    /// can pair a new list with the old hash — which pairs holders'
+    /// `sets_held` bit indices with the wrong set list. A reader that
+    /// already has the inner reads the hash from here.
+    pub catalog_version: u64,
 }
 
 impl ClusterViewInner {
@@ -1426,6 +1434,7 @@ impl ClusterView {
                 running: genesis.running,
                 catalog: genesis.catalog.clone(),
                 backups: genesis.backups.clone(),
+                catalog_version: catalog_version_of(&genesis.catalog),
             }),
         };
         v.publish(genesis);
@@ -1436,6 +1445,9 @@ impl ClusterView {
     /// Release, so a reader that sees the new position (or a `versioned`
     /// bit) and then locks sees the new inner.
     pub fn publish(&self, st: &ClusterState) {
+        // Hashed once, on this (cluster) agent, and stored twice: under the
+        // lock beside the list (#127) and as the lock-free twin below.
+        let catalog_version = catalog_version_of(&st.catalog);
         {
             let mut g = self.inner.lock().unwrap();
             g.membership = st.membership.clone();
@@ -1446,6 +1458,7 @@ impl ClusterView {
             g.running = st.running;
             g.catalog.clone_from(&st.catalog);
             g.backups.clone_from(&st.backups);
+            g.catalog_version = catalog_version;
         }
         // `CNC_MAX_SERVICES == 8` rows, so the mask fits a byte.
         self.versioned
@@ -1509,7 +1522,7 @@ impl ClusterView {
             Ordering::Release,
         );
         self.catalog_version
-            .store(catalog_version_of(&st.catalog), Ordering::Release);
+            .store(catalog_version, Ordering::Release);
         self.position.store(st.applied, Ordering::Release);
     }
 
@@ -2210,6 +2223,32 @@ mod tests {
             va,
             "the empty catalog has its own version"
         );
+    }
+
+    /// #127: the hash travels WITH the list it hashes. A reader holding the
+    /// inner must never pair that list with a stale or newer atomic — so the
+    /// inner carries its own copy, equal to the lock-free twin after every
+    /// publish, and to the hash of exactly the list beside it.
+    #[test]
+    fn the_inner_carries_the_hash_of_the_catalog_beside_it() {
+        let v = ClusterView::new(&ClusterState::genesis_empty());
+        let genesis = v.snapshot_inner();
+        assert_eq!(
+            genesis.catalog_version,
+            catalog_version_of(&genesis.catalog)
+        );
+        let mut st = ClusterState::genesis_empty();
+        st.on_snapshot_frame(1000, false, 5);
+        st.applied = 1100;
+        v.publish(&st);
+        let inner = v.snapshot_inner();
+        assert_eq!(inner.catalog_version, catalog_version_of(&inner.catalog));
+        assert_eq!(
+            inner.catalog_version,
+            v.catalog_version.load(Ordering::Acquire),
+            "the lock-free twin agrees once publish has returned"
+        );
+        assert_ne!(inner.catalog_version, genesis.catalog_version);
     }
 
     // ------------------------------------------------------ FSM upgrade lifecycle

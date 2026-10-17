@@ -12636,7 +12636,10 @@ impl Consensus {
         let soft = soft_table_from_wire(&wire, &inner.membership);
         let q = crate::catalog::CatalogQuery {
             sets: &inner.catalog,
-            catalog_position: self.cluster_view.catalog_version.load(Ordering::Acquire),
+            // #127: the hash of THIS inner's list, not the atomic twin — a
+            // publish between the two reads would pair the list with the
+            // wrong hash and mis-index every holder's `sets_held`.
+            catalog_position: inner.catalog_version,
             soft: &soft,
             now_ns: unix_now_ns(),
             stale_ns: self.soft_stale_ns,
