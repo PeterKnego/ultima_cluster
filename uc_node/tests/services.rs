@@ -1188,6 +1188,59 @@ fn an_ageing_heartbeat_alone_emits_service_detached() {
     uc_node::obs::log::stderr_for_tests();
 }
 
+/// #133: the real attach order is status bit + epoch bump FIRST, heartbeat
+/// LATER (the apply loop's first pass stamps it). The cycle after the attach
+/// edge therefore reads a heartbeat of `0` — three seconds "stale" by the
+/// bare subtraction — and used to emit `service_detached` for a service that
+/// never left, microseconds after its `service_attached`. A zero heartbeat
+/// is now aged from the attach the node observed: no detach inside the bar,
+/// and still a detach once the bar passes with no stamp ever written (a
+/// service that attaches and hangs before its first pass IS gone).
+#[test]
+fn an_attach_whose_heartbeat_is_not_yet_stamped_is_not_reported_detached() {
+    let _g = serialize();
+    let buf = uc_node::obs::log::capture_for_tests();
+    let dir = tempdir();
+    let node = Node::start(config(dir.path(), names(&["count", "fsm1"], None))).unwrap();
+    wait_until("serving", || node.can_serve());
+
+    let cnc = open_cnc(dir.path());
+    let s1 = cnc.service_slot(1);
+    // Arrive exactly as `uc_service::attach` does: bit, then epoch, and NO
+    // heartbeat — the word stays 0 until the apply loop's first pass.
+    s1.status
+        .store_release(uc_log::cnc::pack_service_status(1, true, 1));
+    s1.epoch.store_release(1);
+    wait_until("service_attached record for FSM 1", || {
+        let t = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+        t.lines().any(|l| {
+            l.contains(r#""event":"service_attached""#)
+                && l.contains(r#""service":1"#)
+                && l.contains(r#""epoch":1"#)
+        })
+    });
+    let detached = || {
+        let t = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+        t.lines()
+            .any(|l| l.contains(r#""event":"service_detached""#) && l.contains(r#""service":1"#))
+    };
+    // Well inside the bar, across many duty cycles: no detach.
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        !detached(),
+        "a service whose first heartbeat is still pending must not read as detached"
+    );
+    // Past the bar with the word STILL 0 — the service never stamped — the
+    // staleness arm reports it, on the same bar a stalled stamp would be.
+    wait_until(
+        "service_detached record for FSM 1 once the unstamped heartbeat ages out",
+        detached,
+    );
+
+    node.stop();
+    uc_node::obs::log::stderr_for_tests();
+}
+
 /// Read-your-writes (spec 2026-10-08 §4.3): a query answer's position prefix
 /// is the service's applied frontier when it answered, not 0.
 #[test]
