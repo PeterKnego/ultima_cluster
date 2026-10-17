@@ -395,10 +395,24 @@ mod writer_e2e {
     const FRAME_BYTES: u64 = 32 + PAYLOAD as u64;
     const SEG: u64 = 64 * 1024;
 
-    fn await_until(secs: u64, msg: &str, mut f: impl FnMut() -> bool) {
+    fn await_until(secs: u64, msg: &str, f: impl FnMut() -> bool) {
+        await_until_diag(secs, msg, f, String::new);
+    }
+
+    /// `await_until`, plus `diag` evaluated once at the deadline and appended
+    /// to the panic message: a wait that only fails on CI should say what it
+    /// saw (#155).
+    fn await_until_diag(
+        secs: u64,
+        msg: &str,
+        mut f: impl FnMut() -> bool,
+        diag: impl FnOnce() -> String,
+    ) {
         let deadline = Instant::now() + Duration::from_secs(secs);
         while !f() {
-            assert!(Instant::now() < deadline, "{msg}");
+            if Instant::now() >= deadline {
+                panic!("{msg}{}", diag());
+            }
             std::thread::sleep(Duration::from_millis(2));
         }
     }
@@ -3245,12 +3259,48 @@ mod writer_e2e {
         let total = query_total(&c, l3);
         // Node 9 is a follower (a linearizable read is leader-only), so read
         // its applied state and wait for it to reach the leader's total.
-        await_until(30, "node 9 serves the same state", || {
-            let client = uc_client::Client::connect(&c.nodes[n9].dir, c.app).expect("client");
-            let raw: Result<[u8; 8], _> = client.query_snapshot(&());
-            client.shutdown();
-            raw.is_ok_and(|r| u64::from_le_bytes(r) == total)
-        });
+        // #155: this wait has timed out with the one above already met, so
+        // on timeout it prints what decides between a commit counter that
+        // lags `durable`, a service that is behind, and a moving total.
+        let last_answer = std::cell::RefCell::new(String::from("none"));
+        await_until_diag(
+            30,
+            "node 9 serves the same state",
+            || {
+                let client = uc_client::Client::connect(&c.nodes[n9].dir, c.app).expect("client");
+                let raw: Result<[u8; 8], _> = client.query_snapshot(&());
+                client.shutdown();
+                *last_answer.borrow_mut() = match &raw {
+                    Ok(r) => u64::from_le_bytes(*r).to_string(),
+                    Err(e) => format!("{e:?}"),
+                };
+                raw.is_ok_and(|r| u64::from_le_bytes(r) == total)
+            },
+            || {
+                let n = c.node(n9).counters();
+                let p = c.cnc(n9);
+                let s = p.service_slot(0);
+                format!(
+                    "\n  wanted total {total} (read from node {l3} at its commit {commit}); \
+                     node 9's last answer {}\
+                     \n  node 9: commit {} durable {} append {}; \
+                     node {l3} now: commit {} total {}\
+                     \n  node 9 service slot 0: applied {} status {:#x} epoch {} \
+                     heartbeat_ns {} lag_waits {}",
+                    last_answer.borrow(),
+                    n.commit.load_acquire(),
+                    n.durable.load_acquire(),
+                    n.append.load_acquire(),
+                    c.node(l3).counters().commit.load_acquire(),
+                    query_total(&c, l3),
+                    s.applied.load_acquire(),
+                    s.status.load_acquire(),
+                    s.epoch.load_acquire(),
+                    s.heartbeat_ns.load_acquire(),
+                    s.lag_waits.load_acquire(),
+                )
+            },
+        );
 
         assert_eq!(
             c.node(n9).archive_first_base(),
