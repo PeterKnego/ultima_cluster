@@ -65,3 +65,36 @@ uc_net = { path = "../uc_net", version = "2.13.0" }
 uc_log = { path = "../uc_log", version = "2.13.0" }
 bincode = { workspace = true }
 tempfile = { workspace = true }
+
+# #134: every target below compiles `tests/common/mod.rs`, which `pub use`s
+# `live::*` and starts a real in-process node — so each one needs the
+# `pin-verify` feature set (which implies `export`), whatever the test itself
+# calls. Without these lines `cargo check --no-default-features --all-targets`
+# (the build `examples/kv` embeds against) fails on every target that pulls
+# `common` in. `diff_attribute_confirm` does not use `common` and keeps
+# compiling feature-off on purpose: it is the one test the embedding build
+# can run.
+
+[[test]]
+name = "corpus"
+required-features = ["pin-verify"]
+
+[[test]]
+name = "drive"
+required-features = ["pin-verify"]
+
+[[test]]
+name = "live"
+required-features = ["pin-verify"]
+
+[[test]]
+name = "pin_verify"
+required-features = ["pin-verify"]
+
+[[test]]
+name = "reconstruction"
+required-features = ["pin-verify"]
+
+[[test]]
+name = "upgrade_e2e"
+required-features = ["pin-verify"]
