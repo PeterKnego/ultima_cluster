@@ -96,3 +96,34 @@ candidate on the same rig.
 
 Raw logs, `runs.tsv` and the three binaries for each N are kept off-tree at
 `$HOME/scratch/ab33-fleet/` on the maintainer's box.
+
+## 5. The fix, and its re-run
+
+**Cause (dev box, idle, `apply_bench` N=1, six interleaved reps per commit
+over nine commits of #68).** Against `a409b3ae`: every commit up to
+`a8de0e25` reads +0.8 to +1.0 %; `54caa65b`, the commit that adds the
+`CLUSTER` arm to the per-frame loop, reads −2.0 %, and the later #33 commits
+stay between −2.7 % and −3.7 %. `apply_bench` appends only `MESSAGE` frames,
+so the arm never runs: the MESSAGE path pays for the arm's inline code (the
+verdict match, the guard-consuming `stop_at_record` call and the `Pending`
+break), the M14a codegen effect.
+
+**Fix (`ddf5b470` on `main`; the same change on `a70539a1` is `ecd560a0`).**
+The arm is the type test and one `#[cold] #[inline(never)]` call,
+`version_gate::ends_batch`, which leaves the record's start and verdict in a
+local and returns whether the batch ends; the loop's exit acts on it.
+Behaviour is unchanged. Dev-box smoke, N=1, eight interleaved reps against
+`a409b3ae`: `main` −1.44 %, the fix on `main` +0.63 %.
+
+**Rows, pre-committed before the re-run** (same rig shape, same script, same
+verdict rule as §2):
+
+- **Row b — #33 as fixed.** `scripts/apply_ab.sh a409b3ae ecd560a0 --pairs 12`
+  at `--fsms 1` and `--fsms 2`. Bar: §2's — not `outside resolution` with a
+  negative delta. This is the row #68 owed, re-asked of the fixed change.
+- **Row c — what ships.** `scripts/apply_ab.sh 0a9bed82 ddf5b470 --pairs 12`
+  (`main` against `main` plus the fix) at `--fsms 1` and `--fsms 2`. Bar: the
+  fix is not `outside resolution` with a negative delta (it must not make
+  `main` slower). Its size is reported.
+
+Row a's FAIL stands as recorded; rows b and c do not replace it.
