@@ -75,7 +75,7 @@ scrape_configs:
 ```
 
 `/metrics` serves `text/plain; version=0.0.4` — standard Prometheus text
-exposition. The full series contract — 147 families — is the
+exposition. The full series contract — 149 families — is the
 `CONTRACT_SERIES` array in
 [`uc_node/src/obs/metrics.rs`](../../uc_node/src/obs/metrics.rs); a test
 pins every family in that array against what the renderer actually emits, so
@@ -470,6 +470,8 @@ view of that same set list:
 | `uc2_snapshot_fetched_position` | gauge | none | the position of the newest set this node fetched whole from another holder — a voter's automatic fetch or a manual `uc2ctl snapshot fetch` — `0` if it never has |
 | `uc2_snapshot_auto_fetch_total` | counter | `outcome` | background fetches of the newest agreed set: `ok`, `refused`, `timeout`, `no_space`, `no_holder` (snapshot lifecycle). A rising `no_space` means this node cannot hold the newest set — see `Uc2SnapshotWontFit`. Flat at 0 with `[settings] auto_fetch = false`. A node logs `snapshot_fetch_single_reporter` (warn) once for a set that only one node reported |
 | `uc2_snapshot_fetch_total` | counter | `source` | store-only fetches (automatic or `uc2ctl snapshot fetch`) that landed, by where the set came from: `tier` (copied from this node's `[tier_source]` or `[backup]` target, verified against the catalog) or `peer` (a snapshot session, including the fallback after the tier declined — `tier_fetch_declined`) (backup tier 3b) |
+| `uc2_snap_redirects_total` | counter | none | below-floor NAKs this node could not serve and answered with a `SNAP_REDIRECT` to a learner. Rare by construction (node-owned retention keeps the leader's own set at its floor unless it was restored from an old backup or had its artifacts removed); a rising count means the voters are relying on the standby return path |
+| `uc2_snap_request_unknown_peer_total` | counter | none | `SNAP_REQUEST`s dropped because the source address is not in the current membership. Non-zero **crypto-off** means someone is probing this node for sets, or a stale member is still asking; crypto-on it should be impossible (both snapshot-return kinds are pairwise, so an unsealed datagram never reaches the gate) |
 | `uc2_tier_install_total` | counter | `outcome` | `TIER_INSTALL` requests a below-floor node answered: `installed` (it installed a set from its own tier, so the leader shipped it nothing) or `declined` (no source, the named set not in the tier, an unreadable or foreign `TIER`, or a copy that failed verification — the leader then opens a snapshot session; `tier_install_declined` names why), both counted on the follower; and `timeout`, counted on the LEADER (an installing follower's copy made no progress for 10 s, so the leader served it by a snapshot session instead) (backup tier 3b) |
 | `uc2_snapshot_newest_agreed_bytes` | gauge | none | the newest agreed set's total size; 0 when none is agreed or its size is unknown (a set catalogued before sizes) |
 | `uc2_snapshot_wont_fit` | gauge | none | `1` when the newest agreed set fails the auto-fetch space check on this node (probe free bytes < size + `max(size / 4, 1 GiB)`), else `0`; `0` while the size, or this node's free bytes (before the probe's first successful `statvfs`), is unknown. Read on every node regardless of `auto_fetch`. Alert: `Uc2SnapshotWontFit` |
