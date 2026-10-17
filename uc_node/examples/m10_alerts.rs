@@ -71,6 +71,7 @@ const ALL_SCENARIOS: &[&str] = &[
     "row_version_mismatch",
     "row_version_mismatch_stale_heartbeat",
     "log_time_frozen",
+    "log_clock_smear",
     "schedule_diverged",
     "snapshot_stalled",
     "standby_snapshot_stalled",
@@ -215,6 +216,7 @@ fn run_scenario(name: &str, scratch_root: &Path) -> (SeriesFile, Disclosure) {
         "row_version_mismatch" => scenario_row_version_mismatch(),
         "row_version_mismatch_stale_heartbeat" => scenario_row_version_mismatch_stale_heartbeat(),
         "log_time_frozen" => scenario_log_time_frozen(),
+        "log_clock_smear" => scenario_log_clock_smear(),
         "schedule_diverged" => scenario_schedule_diverged(),
         "snapshot_stalled" => scenario_snapshot_stalled(),
         "standby_snapshot_stalled" => scenario_standby_snapshot_stalled(),
@@ -1710,6 +1712,44 @@ fn scenario_log_time_frozen() -> (SeriesFile, Disclosure) {
                      exporter computes uc2_log_time_lag_seconds itself (leader-gated, wall \
                      minus log clock), so the ~60 that lands in the series is the REAL \
                      encoder's arithmetic over a planted pair of readings, not a planted lag."
+                .into(),
+        },
+    )
+}
+
+// ---------------------------------------------------------- scenario 16b
+
+/// Uc2LogClockSmearing (#124) — **synthetic, disclosed**: one synthetic
+/// `ObsSources` whose `log_clock_smear_ns` source word holds 60 s of
+/// remaining smear, rendered through the real exporter. The REAL state — a
+/// node whose wall clock stepped backwards by a minute and whose log clock
+/// is retiring it at 500 ppm over the next ~33 hours — needs a system-clock
+/// manipulation, out of this harness's budget for the reason
+/// `log_time_frozen` gives. The gauge is per node in every role (a
+/// follower's clock is the clock it would lead with), so no leader flag is
+/// planted here.
+fn scenario_log_clock_smear() -> (SeriesFile, Disclosure) {
+    let sources = synthetic_sources(0);
+    sources
+        .log_clock_smear_ns
+        .store(60 * 1_000_000_000, Ordering::Relaxed);
+
+    let srv = ObsServer::serve(sources.clone(), "127.0.0.1:0".parse().unwrap()).expect("bind");
+    let addr = srv.local_addr();
+    let mut sf = SeriesFile::new();
+    for _ in 0..3 {
+        sf.record_round("n0", &scrape(addr), &["uc2_log_clock_smear_ns"]);
+        thread::sleep(Duration::from_millis(200));
+    }
+    srv.stop();
+
+    (
+        sf,
+        Disclosure {
+            scenario: "log_clock_smear",
+            rules: &["Uc2LogClockSmearing"],
+            state: "synthetic",
+            method: "synthetic ObsSources with its log_clock_smear_ns source word stored at                      60 s — the remaining smear of a backward wall-clock step the log clock                      is retiring at 500 ppm. The exporter renders the gauge from that word,                      the way the node's clock core publishes it; Uc2LogClockSmearing's                      uc2_log_clock_smear_ns > 5e9 predicate for 10 m."
                 .into(),
         },
     )

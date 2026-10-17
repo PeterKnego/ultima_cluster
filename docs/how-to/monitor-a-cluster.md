@@ -345,6 +345,19 @@ It has no gauge of its own beyond `uc2_log_clock_smear_ns`, which only shows
 a backward smear in progress, not a forward step (there is nothing left to
 show once one is adopted).
 
+**A second rule on the smear itself**, `Uc2LogClockSmearing` (warning,
+`for: 10m`): `uc2_log_clock_smear_ns > 5e9`. While a smear is in progress
+the lag series reads 0 — the log clock is *ahead* of wall time — so the
+frozen rule stays quiet by design and this gauge is the only sign. The rate
+is fixed at 500 ppm, so the remaining smear is also a clock: a 5 s step takes
+about 2.8 h to retire, an hour-long step about 83 days, and every `at
+{secs_of_day}` schedule rule fires late by the remaining amount meanwhile.
+Ten minutes above five seconds is a step worth a human's eyes (time sync
+broken, a VM resumed from a snapshot); a sub-second smear retires in minutes
+and never fires it. Per node, in every role, since a follower's clock is the
+one it would lead with after a failover. The step itself is in the
+`log_clock_step` record above.
+
 There is **no per-fire log record**. `timer_late` is emitted only when a fire
 is late, because a `stderr` write per timer would sit on the consensus agent's
 hot path; the on-time signal is `rate(uc2_timers_fired_total[..])`. There is no

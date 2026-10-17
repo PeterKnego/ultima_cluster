@@ -415,6 +415,14 @@ Defects that shipped in `2.13.0` or earlier:
   100 minutes. Row genesis waited that long and the transition log reported
   the service detached. Both readers now compare against the pass clock
   less the remaining smear, with no second clock read.
+- **A rule on the log clock's smear**
+  ([#124](https://github.com/PeterKnego/ultima_cluster/issues/124)):
+  `Uc2LogClockSmearing`, warning, `uc2_log_clock_smear_ns > 5e9` for 10 m.
+  A backward wall-clock step is retired at 500 ppm, so the log's time runs
+  ahead of UTC until it is gone and the lag series reads 0 throughout; the
+  gauge was the only sign and nothing paged on it. Owed since the
+  log-clock spec's errata (`2.12.0`); builder and synthetic scenario in
+  `scripts/m10_alert_fire.sh` / `m10_alerts`.
 - **Small, from #37** ([#109](https://github.com/PeterKnego/ultima_cluster/pull/109)):
   `uc2ctl` refuses a mistyped `--instance-dir` by name instead of printing
   "no cluster artifact yet" and exiting 0; `tier forget` prints `0x` ids;
@@ -476,7 +484,7 @@ its run:
 | the local proof stack: `cargo fmt --all -- --check`, every `clippy` line in `ci.yml` **including the MSRV gate**, the fixture builds, `cargo test --workspace`, `pin_verify`, `lin_v2`, `lin_partition_v2`, `lin_backup_tier`, the hard-crash suite, `cargo +nightly fuzz build`, `scripts/check_doc_links.py` | on the release-prep head | pending |
 | the rest of the proof surface (`docs/VERIFICATION.md`): Elle, loom, Lean + conformance, fuzz smoke (26 targets) | the release procedure's own step | pending |
 | fleet apply-hop A/B for #33 (`a409b3ae` vs `a70539a1`, `scripts/apply_ab.sh`), then a layout-randomised re-measurement and bisect | [gate doc](benchmarks/uc2-row-running-version-apply-ab-2026-10-17.md), 2026-10-17, one c6id.2xlarge | **FAIL**, bar kept: #33 −2.5 % at N=1 (within layout noise at N=2); post-#33 merges −4.2 % more, Ice Lake only ([#149](https://github.com/PeterKnego/ultima_cluster/issues/149)) |
-| the M10 alert tier, with the seven new rules | `scripts/m10_alert_fire.sh` | pending on the release-prep head (33 rules passed at #100's head) |
+| the M10 alert tier, with the eight new rules (`Uc2LogClockSmearing`, #124, the eighth) | `scripts/m10_alert_fire.sh` | pending on the release-prep head (33 rules passed at #100's head) |
 | artifact integrity (`sha256sum -c`) and provenance (`cosign verify-blob`, `cosign verify`) | `cut-a-release.md` §5 from a clean directory | pending — filled at tag time |
 | release quickstart, from the unpacked tarball | `cut-a-release.md` §5: `packaging/quickstart-local.sh` | pending — filled at tag time |
 | crates.io (14 crates, `uc_service` before `uc_node`, `uc_diffreplay` after it) | `cut-a-release.md` §6, in dependency order | pending — filled at tag time; no new crate name |

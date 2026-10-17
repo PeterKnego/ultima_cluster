@@ -273,6 +273,7 @@ RULE_META = {
     "Uc2ServiceVersionDrift": {"severity": "warning", "real": False, "scenario": "version_drift"},
     "Uc2RowVersionMismatch": {"severity": "critical", "real": False, "scenario": "row_version_mismatch"},
     "Uc2LogTimeFrozen": {"severity": "warning", "real": False, "scenario": "log_time_frozen"},
+    "Uc2LogClockSmearing": {"severity": "warning", "real": False, "scenario": "log_clock_smear"},
     "Uc2ScheduleTableDiverged": {"severity": "warning", "real": False, "scenario": "schedule_diverged"},
     "Uc2SnapshotStalled": {"severity": "warning", "real": False, "scenario": "snapshot_stalled"},
     "Uc2StandbySnapshotStalled": {"severity": "warning", "real": False, "scenario": "standby_snapshot_stalled"},
@@ -596,6 +597,19 @@ def build_Uc2LogTimeFrozen():
     return r
 
 
+def build_Uc2LogClockSmearing():
+    # #124: ONE unlabeled per-node gauge (uc2_log_clock_smear_ns) above a
+    # level for 10 m — the build_Uc2SnapshotWontFit shape. The scenario
+    # stores the remaining smear into the exporter's own source word and the
+    # REAL exporter renders it.
+    rows = load_scenario("log_clock_smear")
+    row = select(rows, "uc2_log_clock_smear_ns", {})
+    r = new_rule("warning", labels_from=row)
+    add_hold_last(r, row, "uc2_log_clock_smear_ns", 600)
+    r["eval_time"] = total_for(600)[0]
+    return r
+
+
 def build_Uc2ScheduleTableDiverged():
     # Time-and-timers plan 2 (spec §5): the same two-instance `count_values`
     # shape as build_Uc2ServiceIdentityDrift — the rule only fires when two
@@ -876,6 +890,7 @@ RULE_BUILDERS = {
     "Uc2ServiceVersionDrift": build_Uc2ServiceVersionDrift,
     "Uc2RowVersionMismatch": build_Uc2RowVersionMismatch,
     "Uc2LogTimeFrozen": build_Uc2LogTimeFrozen,
+    "Uc2LogClockSmearing": build_Uc2LogClockSmearing,
     "Uc2ScheduleTableDiverged": build_Uc2ScheduleTableDiverged,
     "Uc2SnapshotStalled": build_Uc2SnapshotStalled,
     "Uc2StandbySnapshotStalled": build_Uc2StandbySnapshotStalled,

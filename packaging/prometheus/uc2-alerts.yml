@@ -157,6 +157,21 @@ groups:
     for: 30s
     labels: { severity: warning }
     annotations: { summary: "log time on the leader is {{ $value }}s behind wall time — the appender is stalled" }
+  - alert: Uc2LogClockSmearing
+    # #124 (the log-clock spec's errata, bullets 7 and 9): a backward step of
+    # THIS node's wall clock is retired by running its log clock 500 ppm slow,
+    # so the log's time runs ahead of true UTC by the remaining smear until
+    # it is gone — a 5 s step takes ~2.8 h, an hour takes ~83 days — and
+    # every `at {secs_of_day}` schedule rule fires late meanwhile. The lag
+    # series reads 0 throughout (the log clock is AHEAD of wall), so this
+    # gauge is the only sign. Per node, every role: a follower's clock is the
+    # clock it would lead with. Ten minutes above five seconds is a step
+    # worth a human's eyes (NTP, a VM resume); a sub-second smear that the
+    # rate retires in minutes never gets there.
+    expr: uc2_log_clock_smear_ns > 5e9
+    for: 10m
+    labels: { severity: warning }
+    annotations: { summary: "{{ $labels.instance }} is still retiring a {{ $value | humanize }}ns backward wall-clock step at 500 ppm — its log clock runs ahead of UTC until it is gone; check the host's time sync" }
   - alert: Uc2ServiceIdentityDrift
     # Task 7 (spec §4.5): a row's declared NAME must be identical on every
     # node — it is written once at boot (cnc 3.1 line 7) from each node's own
