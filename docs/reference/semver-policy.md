@@ -178,7 +178,7 @@ API for downstream code. They may change in any release:
 | `uc_node` | `audit`, `backup`, `ipc`, `obs`, `preflight`, `recovery`, and everything in `node` except `NodeConfig`/`Node::start*` |
 | `uc_service` | `snapshots` |
 | `uc_gateway` | `config_file`; `Edge`/`EdgeStats` beyond what `gateway.toml` implies |
-| `uc_remote` | `conn`, `frame` as *Rust items* — the wire format they encode is promised (protocol v1), the Rust names are not |
+| `uc_remote` | `conn`, `frame` as *Rust items* — the wire format they encode is promised (the remote protocol version, v2 since read-your-writes), the Rust names are not |
 | `uc_journal` | `bench_support` (already `#[doc(hidden)]`), and the crate generally: it is the node's storage primitive, published so the workspace can be, not offered as a general-purpose journal |
 
 `uc_net`'s snapshot-session seam is the worked example of what "not

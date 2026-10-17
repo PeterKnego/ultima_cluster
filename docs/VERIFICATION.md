@@ -28,7 +28,7 @@ record it summarizes; where the two disagree, the dated record wins.
 | **WGL lincheck capstones** | Checked on real processes | Linearizability of a register under leader kills, crashes, partitions, purge — single- and two-FSM |
 | **Elle** | Checked on real processes | Transactional safety (serializable and strict), single- and two-FSM — plus a mutation tier proving the harness has teeth |
 | **Multi-process crashtest** | Checked on real processes | Recovery correctness under `SIGKILL` mid-load — single- and two-FSM |
-| **loom** | Exhaustive over interleavings | The frame-visibility memory protocol, the MPSC ring's per-record commit protocol, **and the Broadcast ring's seqlock read barrier** |
+| **loom** | Exhaustive over interleavings | The frame-visibility memory protocol, the MPSC ring's per-record commit protocol, the Broadcast ring's seqlock read barrier, **and the follower write-reserve seqlock (#78)** |
 | **Fuzzing (libFuzzer)** | Checked under coverage-guided input search | Totality of the twenty-six decoders that see bytes the process did not write |
 | **Miri** | Checked under a symbolic interpreter | Undefined behaviour in the pure wire/journal decoders and `uc_remote`'s Vec-backed SPSC internals (**not** the file-backed rings) |
 | **Veil** | Bug-hunting only — **never the record** | Bounded model checking of the election and reconfiguration planes |
@@ -965,7 +965,7 @@ handshake by which a reader observes a fully-written frame and never a torn one.
 RUSTFLAGS="--cfg loom" cargo test -p uc_log --test loom_frame --release
 RUSTFLAGS="--cfg loom" cargo test -p uc_protocol --test loom_mpsc --release
 RUSTFLAGS="--cfg loom" cargo test -p uc_protocol --test loom_broadcast --release
-RUSTFLAGS="--cfg loom" cargo test -p uc_protocol --test loom_broadcast --release
+RUSTFLAGS="--cfg loom" cargo test -p uc_log --test loom_reserve --release
 ```
 
 The second model is the MPSC ring's per-record commit protocol (M13a):
@@ -999,7 +999,13 @@ anyway. The model remains the coverage; the hardware run is a smoke check.) Two 
 means the model has teeth rather than that it explored nothing. Plain-language
 writeup: [`docs/notes/uc2-broadcast-seqlock-explained.md`](/docs/notes/uc2-broadcast-seqlock-explained.md).
 
-All three models are of protocols, not of mappings — loom cannot see an mmap,
+The fourth is the **follower write-reserve seqlock** (#78,
+`uc_log/tests/loom_reserve.rs`): the receiver raises `reserve` and fences
+before it overwrites a lap, and a validated reader re-checks `reserve` after
+its copy, so a reader whose copy saw any byte of the next lap refuses it. Its
+mutation, `without_the_writer_fence_the_model_fails`, is `#[should_panic]`.
+
+All four models are of protocols, not of mappings — loom cannot see an mmap,
 so the ring's *layout* stays frozen by offset-pin tests.
 
 Offset-pin tests additionally freeze the wire and `cnc` page layouts, so a

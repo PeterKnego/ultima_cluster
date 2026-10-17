@@ -71,20 +71,17 @@ to point at "§ 2a" for these residuals now point here.*
   reads `none` until the first snapshot instant completes (`schedule show`,
   `settings show` and `upgrade show` read the live cluster view since
   project 4).
-- **New with coordinated snapshots (plan 2), and deliberate.**
-  A voter's purge floor waits for an operator after a `--standby` instant:
-  **automatic standby replication** — a voter pulling a learner's set without
-  `uc2ctl snapshot fetch` — needs the learner's "complete at P" to be visible
-  cluster-wide, which is a fourth cluster-FSM command and a design of its own.
-  Aeron's open-source half defers it the same way. One smaller one beside it:
-  the redirect's **sending** side emits no log record (it leaves `uc_net`,
+- **New with coordinated snapshots (plan 2), and deliberate.** The
+  redirect's **sending** side emits no log record (it leaves `uc_net`,
   which carries no logging dependency by design — its witness is the leader's
   `snap_redirects` counter).
 - **Why:** none of these blocks anyone today, which is exactly why the list is
   worth keeping — a residual nobody wrote down becomes a surprise.
-- **Cost:** low, and what remains is two items: a live reading for `uc2ctl
-  status`'s `schedule_position=`, and automatic standby replication, which
-  needs a fourth `CLUSTER` kind (spec §13).
+- **Cost:** low, and what remains is one item: a live reading for `uc2ctl
+  status`'s `schedule_position=`. (Automatic standby replication shipped with
+  the snapshot lifecycle's `auto_fetch`: every node fetches each new agreed
+  set in the background — [Learner-only
+  clusters](how-to/bound-journal-growth.md#learner-only-clusters-voters-fetch-and-purge-by-default).)
 
 ### 3. Rolling upgrades and leadership transfer
 
@@ -134,10 +131,15 @@ scoped* consistency weakening.
 
 - **Status of the prerequisite:** met — wire crypto shipped in M8
   (`v2.3.0`).
-- **Why:** the largest capability gap against the stated comparator; Phase A
-  is mostly additive and low-risk per the note.
-- **Cost:** moderate for Phase A; Phase C is a product decision before it
-  is code.
+- **Status of Phase A:** mostly done. A learner answers snapshot reads (the
+  query path never checked the node's role) and, since `2.14.0`,
+  read-your-writes reads. What remains of Phase A is a staleness bound on a
+  learner's answer; Phases B and C are untouched
+  ([UC against Aeron Premium](notes/uc2-vs-aeron-premium-2026-09-19.md) §1).
+- **Why:** Standby is the comparator's one architectural premium component;
+  relay and warm DR are what is left of the gap.
+- **Cost:** low for the staleness bound, moderate for Phase B; Phase C is a
+  product decision before it is code.
 
 ### 5. Verification debt
 

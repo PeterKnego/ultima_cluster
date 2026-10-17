@@ -16,7 +16,7 @@ To read a live page while diagnosing a node, see
 | Offset | Size | Field | Notes |
 |---|---|---|---|
 | 0 | 8 B | magic | `UC2CNC\0\0` |
-| 8 | u32 LE | version | `CNC_V2_VERSION` = `(3 << 24) \| (1 << 16)` (cnc 3.1, FSM identity + log time, 2.11.0); `(3 << 24) \| (2 << 16)` (cnc 3.2, `payload_ceiling`, `2.12.0`); `(3 << 24) \| (3 << 16)` (cnc 3.3, `upgrade_origin`/`pinned_version`, FSM upgrade lifecycle); `(3 << 24) \| (4 << 16)` (cnc 3.4, `running_version`/`running_record_pos`/`cluster_applied`, the row running version, #33) |
+| 8 | u32 LE | version | `CNC_V2_VERSION` = `(3 << 24) \| (1 << 16)` (cnc 3.1, FSM identity + log time, 2.11.0); `(3 << 24) \| (2 << 16)` (cnc 3.2, `payload_ceiling`, `2.12.0`); `(3 << 24) \| (3 << 16)` (cnc 3.3, `upgrade_origin`/`pinned_version`, FSM upgrade lifecycle); `(3 << 24) \| (4 << 16)` (cnc 3.4, `running_version`/`running_record_pos`/`cluster_applied`, the row running version, #33; the same unreleased 3.4 also carries `write_reserve` (#78), the start-set pair (snapshot lifecycle) and the read-your-writes query flag) |
 | 12 | u32 LE | node id | |
 | 16 | u64 LE | instance id, low | changes on every node restart |
 | 24 | u64 LE | instance id, high | |

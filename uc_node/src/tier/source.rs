@@ -1407,8 +1407,9 @@ pub(crate) mod tests {
         );
     }
 
-    /// Task 14 ruling: the newest agreed set in `[floor, commit]` bounded by
-    /// the best-covered tier's `through`; else the newest agreed in range;
+    /// Task 14 ruling, as amended by F4: the newest agreed set in
+    /// `[floor, commit]` bounded by the tiers' highest `newest_set`; else the
+    /// newest agreed in range;
     /// none in range → `None`. Never a non-agreed set, never outside range.
     #[test]
     fn leader_install_body_names_the_newest_agreed_set_the_tiers_hold() {
