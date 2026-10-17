@@ -564,9 +564,9 @@ pub(crate) fn apply_cycle<S: RawStateMachine>(st: &mut ApplyState<S>) -> bool {
                 // `ApplyCtx::rebind`): the per-frame construction was ~10
                 // stores plus a drop on the hot path.
                 let mut ctx = ApplyCtx::new(0, S::IDENTITY);
-                // R13: the start of a version record the agent has not
-                // applied yet — the batch ends there, see below.
-                let mut pending_at: Option<u64> = None;
+                // #33: a version record that ends the batch — its start and
+                // the verdict — acted on below, after the loop.
+                let mut version_end: Option<(u64, crate::version_gate::Gate)> = None;
                 for (pos, hdr, payload) in frames {
                     // PADDING, NEW_TERM, CONFIG (and any future type that is
                     // neither MESSAGE nor a TIMER for THIS row), and anything
@@ -646,14 +646,18 @@ pub(crate) fn apply_cycle<S: RawStateMachine>(st: &mut ApplyState<S>) -> bool {
                             &st.cnc,
                             st.service_id,
                         );
-                    } else if hdr.frame_type == FRAME_TYPE_CLUSTER {
-                        // #33 spec §7.2: the type test and one out-of-line
-                        // call (M14a). A version record that superseded this
-                        // binary's line stops the service at EXACTLY `pos`:
-                        // every earlier frame applied, nothing after. One the
-                        // agent has not applied yet ends the batch AT it
-                        // (R13), handled below, off the per-frame path.
-                        match crate::version_gate::on_cluster_frame(
+                    } else if hdr.frame_type == FRAME_TYPE_CLUSTER
+                        // #33 spec §7.2, as amended by the 2026-10-17 fleet
+                        // A/B: the arm is the type test and ONE cold call,
+                        // nothing else (M14a). A version record that
+                        // superseded this binary's line, or one the agent has
+                        // not applied yet (R13), ends the batch AT it; what
+                        // to do about it is decided after the loop. With the
+                        // verdict match, the stop call and the guard hand-off
+                        // inline here, the arm cost 4.5 % at N=1 on a stream
+                        // with no CLUSTER frame in it.
+                        && crate::version_gate::ends_batch(
+                            &mut version_end,
                             &st.cnc,
                             st.service_id,
                             S::VERSION,
@@ -661,30 +665,34 @@ pub(crate) fn apply_cycle<S: RawStateMachine>(st: &mut ApplyState<S>) -> bool {
                             pos,
                             &hdr,
                             payload,
-                        ) {
-                            crate::version_gate::Gate::Pass => {}
-                            crate::version_gate::Gate::Stop {
-                                running,
-                                superseded_later,
-                            } => {
-                                crate::version_gate::stop_at_record(
-                                    sm,
-                                    &st.cnc,
-                                    st.service_id,
-                                    running,
-                                    pos,
-                                    superseded_later,
-                                );
-                            }
-                            crate::version_gate::Gate::Pending => {
-                                pending_at = Some(pos);
-                                break;
-                            }
-                        }
+                        )
+                    {
+                        break;
                     }
                     if one_frame {
                         break; // lockstep: exactly one frame past the floor
                     }
+                }
+                // A superseding record stops the service at EXACTLY its
+                // start: every earlier frame applied, nothing after. The
+                // guard goes to the stop so it is released before the
+                // fail-stop and never poisons the SM mutex (R18).
+                if let Some((
+                    pos,
+                    crate::version_gate::Gate::Stop {
+                        running,
+                        superseded_later,
+                    },
+                )) = version_end
+                {
+                    crate::version_gate::stop_at_record(
+                        sm,
+                        &st.cnc,
+                        st.service_id,
+                        running,
+                        pos,
+                        superseded_later,
+                    );
                 }
                 drop(sm);
                 #[cfg(feature = "apply-profile")]
@@ -695,7 +703,7 @@ pub(crate) fn apply_cycle<S: RawStateMachine>(st: &mut ApplyState<S>) -> bool {
                     );
                     profile::add(pf_frames, pf_sm, pf_pub, pf_bytes);
                 }
-                if let Some(pos) = pending_at {
+                if let Some((pos, crate::version_gate::Gate::Pending)) = version_end {
                     // R13: rewind to the record (`applied = pos`) and hand the
                     // cycle back — the SM guard is already released, the
                     // runner checks its stop flag, and the next cycle

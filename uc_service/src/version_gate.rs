@@ -88,7 +88,35 @@ pub(crate) enum Gate {
     Pending,
 }
 
-/// The apply loop's arm (out of line — M14a). `pos` is the frame START.
+/// The apply loop's whole `CLUSTER` arm, out of line and cold (M14a): `true`
+/// ends the batch, with the record's start and its verdict left in `out` for
+/// the loop's exit to act on. Keeping the verdict, the stop call and the
+/// guard hand-off out of the loop body is the point: inline, they cost the
+/// apply hop 4.5 % at N=1 on a frame stream that carries no `CLUSTER` frame
+/// at all (`docs/benchmarks/uc2-row-running-version-apply-ab-2026-10-17.md`).
+#[cold]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn ends_batch(
+    out: &mut Option<(u64, Gate)>,
+    cnc: &CncPage,
+    row: u8,
+    mine: u32,
+    decided_to: u64,
+    pos: u64,
+    hdr: &FrameHeader,
+    payload: &[u8],
+) -> bool {
+    match on_cluster_frame(cnc, row, mine, decided_to, pos, hdr, payload) {
+        Gate::Pass => false,
+        gate => {
+            *out = Some((pos, gate));
+            true
+        }
+    }
+}
+
+/// The verdict on one `CLUSTER` frame. `pos` is the frame START.
 #[inline(never)]
 pub(crate) fn on_cluster_frame(
     cnc: &CncPage,
