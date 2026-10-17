@@ -224,3 +224,20 @@ and run noise, so it is the honest error for a claim about source).
 4. **The layout spread** (each arm's between-seed max − min, and its
    standard deviation) is reported as the rig's layout sensitivity, the
    number a future `apply_ab.sh` layout arm would be sized from.
+
+### 6.1 Bisect of what `main` adds (method fixed before the run)
+
+The §6 run found −4.2 % between `a70539a1` and `main` at both N. The
+first-parent range holds 90 merges; ten touch the apply path. The bisect
+measures the tree at each of those ten merges plus the two endpoints, so the
+twelve points partition the whole range: a cost anywhere in it, including in
+merges that touch no apply file, lands in exactly one step.
+
+Points, in order: `a70539a1`, `baae5ae0` (#70), `e4bb9f65` (#71), `d7ab8d1a`
+(#75, changes `apply_bench` itself), `19b5788d` (#80), `0d773273` (#81),
+`b7ebcc55` (#83), `5d8cdbc1` (#87), `dffe5f43` (#88), `9044e522` (#90),
+`c240a896` (#97), `0a9bed82` (`main`). Five shuffle seeds each (1–5; the two
+endpoints reuse their §6 binaries), N=1 only, three interleaved reps, same
+host shape and runner. A step is **attributed** when its adjacent-point
+delta's Welch 95 % interval lies wholly below zero; a step whose interval
+spans zero is not attributed, however large its point estimate.
