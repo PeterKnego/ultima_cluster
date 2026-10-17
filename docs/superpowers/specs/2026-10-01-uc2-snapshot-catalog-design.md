@@ -715,6 +715,28 @@ procedure forbids it.)
   lost. Requiring `is_agreed()` at the door is a project-2 question (the
   chooser decides what a pinned attach may install from), not built here.
 
+#### Erratum (2026-10-17): `retain_sets > 1` holds the journal
+
+§4.4 rule 3 and §11 contradicted each other. Rule 3 purged below the
+EFFECTIVE floor (the newest agreed set held) whatever `retain_sets` said;
+§11 costed `retain_sets > 1` as "the journal is kept down to the oldest kept
+set". Until this erratum the code followed rule 3, so a
+retained set older than the floor was a file nothing could roll forward: not
+a start point, not a diff-replay origin with its span, only a point-in-time
+rollback the backup tier already does better. Now §11 is the rule: with
+`[purge]` on and `retain_sets > 1`, the purge target is clamped to the
+OLDEST agreed listed set this node holds complete with `p >= first_base`
+(`Consensus::retain_hold`). The snapshot floor is unchanged (still the newest
+agreed set held), so the ship gate, start set and pin hold read what they
+did. A retained set already below `first_base` is skipped, not waited on —
+its journal is gone either way, so raising `retain_sets` on a running cluster
+never stalls purge until that set retires. The hold has no low-space release,
+unlike the tier gate: it is bounded by `retain_sets` instants of journal, an
+operator choice. `retain_sets = 1`, the default, never reads the view on this
+path. Tests: `node::tests::retain_sets_holds_the_purge_at_the_oldest_retained_set_held`
+and `tests/catalog.rs::retain_sets_2_keeps_a_pinned_origin_only_until_the_pin_completes`
+(now asserting the journal held at the oldest retained set).
+
 #### Addendum (2026-10-05): lock discipline of the published view — RETRACTED
 
 **Retracted the same day (ruling R37).** The addendum's finding rested on

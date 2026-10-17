@@ -300,7 +300,8 @@ position=8192 admission_bytes=262144 fsm_lag=16MiB snapshot_interval_bytes=0 sna
 `fsm_lag` renders as `default` (the record's `0`), `lockstep`, a whole-MiB
 count, or a raw byte count when it is neither. `auto_fetch` (bool, absent = `true`) is whether every node fetches the newest agreed set in the background. `retain_sets` (`0.11.0`, the
 snapshot catalog, unreleased) is how many agreed snapshot sets the cluster
-keeps; `1` is the default and matches today's newest-only retention.
+keeps, with the journal from the oldest of them, so each is a start point;
+`1` is the default and matches today's newest-only retention.
 `backup_retain_sets` and `backup_retain_age_secs` (backup tier, `0.11.0`,
 unreleased) bound how long a backup tier keeps its sets (`0` = no rule); the
 file spells the age as `backup_retain_age = "30d"`.

@@ -111,12 +111,17 @@ the floor falls back to today's behaviour: the newest complete set this
 node holds, file presence alone. On a learner-only cluster (`snapshot_target
 = "learners"`) a voter's effective floor does not move until it fetches
 (below) — that is the normal state of such a voter, not a stall. The node
-prunes the journal below its effective floor. Retention is the node's too,
+prunes the journal below its effective floor, or, when `retain_sets` is above
+`1`, below the **oldest** retained agreed set it holds, so every retained set
+can still be rolled forward (sets whose journal was already purged before
+they were retained are not waited on). Retention is the node's too,
 and it only deletes: it keeps the set at the persisted floor plus
 everything newer. `retain_sets` (default `1`) is how many agreed sets the
 replicated catalog keeps at all, plus every pinned origin (a row's newest
 upgrade pin keeps its origin's set in addition, never counted toward
-`retain_sets`, until an agreed instant after the upgrade completes the pin) — see [Configuration §
+`retain_sets`, until an agreed instant after the upgrade completes the pin).
+Each set above `1` therefore costs one snapshot interval of journal as well
+as the set itself — see [Configuration §
 `[settings]`](../reference/configuration.md#settings).
 
 `slack_bytes` retains a tail below the snapshot floor so that a
