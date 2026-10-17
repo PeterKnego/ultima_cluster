@@ -16,10 +16,11 @@ name: nightly
 #                  fault loop) — likewise no matrix change.
 #   * sim-heavy  — uc_sim's 1000-seed election/truncation fuzz tier.
 #   * loom       — the uc_log frame-visibility memory model, the broadcast
-#                  ring's seqlock read barrier, AND the
+#                  ring's seqlock read barrier, the
 #                  uc_protocol MPSC ring commit protocol (M13a: claim/commit
-#                  CAS, skip-marker race, head-of-line at a hole; exhaustive
-#                  interleaving exploration; needs `--cfg loom` + release).
+#                  CAS, skip-marker race, head-of-line at a hole), AND the
+#                  uc_log follower write-reserve seqlock (#78); exhaustive
+#                  interleaving exploration; needs `--cfg loom` + release.
 #   * crashtest  — multi-process SIGKILL-mid-load linearizability
 #                  (uc_crashtest bins spawned via CARGO_BIN_EXE_*), including
 #                  the 2.8.1 two-FSM scenarios (two_fsm_service_sigkill,
@@ -119,6 +120,10 @@ jobs:
           RUSTFLAGS: --cfg loom
       - name: Broadcast ring seqlock loom model
         run: cargo test -p uc_protocol --test loom_broadcast --release
+        env:
+          RUSTFLAGS: --cfg loom
+      - name: Follower write-reserve seqlock loom model
+        run: cargo test -p uc_log --test loom_reserve --release
         env:
           RUSTFLAGS: --cfg loom
 
