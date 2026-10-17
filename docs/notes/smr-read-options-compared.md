@@ -140,7 +140,7 @@ Checked against the code on 2026-10-07:
   round trip, and only as its own project. Keeping it out preserves a UC-wide
   property: **clocks drive liveness, never safety.**
 - **Session tokens (I) are implemented** as read-your-writes reads (PR #88,
-  on `main`, unreleased until the next cut): the token is the byte position the
+  since `2.14.0`): the token is the byte position the
   client learns from its write's response, and any node answers once it has
   applied that far. See
   [`uc2-read-your-writes-explained.md`](uc2-read-your-writes-explained.md); the

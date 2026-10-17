@@ -434,7 +434,7 @@ the FSM only ever needs to hold the latest. An FSM upgrade needs the opposite
 — what happened, in what order — which is why it gets two new `CLUSTER`
 kinds instead of a fourth field on Settings.
 
-**The snapshot catalog (`0.11.0`, unreleased) builds directly on
+**The snapshot catalog (`0.11.0`, since `2.14.0`) builds directly on
 `SnapshotReport`.** Every `(row, position)` hash this feature collects feeds
 a replicated catalog of snapshot **sets**, keyed by position rather than by
 row, that remembers more than one set at a time and names each one's
@@ -697,8 +697,7 @@ increments `uc2_snapshot_reports_timed_out_total`.
 **The cluster FSM's own artifact IS reported, since `0.11.0`.** This used to
 be a real gap: `SnapshotReport.row` covered only declared rows, `0..8`, and
 `service_id = 255` — the cluster artifact — was outside it, with no live
-determinism check at all. The snapshot catalog (unreleased as this is
-written) closes it by admitting row `255` (`CLUSTER_ROW`) to the same
+determinism check at all. The snapshot catalog (`2.14.0`) closes it by admitting row `255` (`CLUSTER_ROW`) to the same
 report: a node that completes a set reports the cluster artifact's hash
 beside its declared rows', and the catalog's `cluster` field carries that
 row's verdict exactly as every other row's does. The cluster image is still

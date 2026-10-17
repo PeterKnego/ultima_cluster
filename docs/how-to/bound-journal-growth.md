@@ -99,7 +99,7 @@ journal grows until you run `uc2ctl snapshot fetch` on each voter.
 Set `purge: PurgePolicy::BelowSnapshot { slack_bytes }` in `NodeConfig`.
 
 Purge follows the **set** — but, since `0.11.0` (the snapshot catalog,
-unreleased), not file presence alone. A node's floor moves to P only once P
+`2.14.0`), not file presence alone. A node's floor moves to P only once P
 is the newest set the cluster's replicated catalog **agrees** on (every
 declared row's and the cluster artifact's reported hash match, spec §4.4)
 *and* this node holds that set complete on disk. A set every row built but

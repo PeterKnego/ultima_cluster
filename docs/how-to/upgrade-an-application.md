@@ -24,9 +24,9 @@ procedures; they may share an origin, and nothing requires them to.
 
 ## The version rules
 
-Since wire `0.10.0` / cnc `3.4` (issue
-[#33](https://github.com/PeterKnego/ultima_cluster/issues/33); unreleased as
-this is written) every declared row has one **running version**, committed
+Since `2.14.0` (wire `0.11.0`, cnc `3.4`; issue
+[#33](https://github.com/PeterKnego/ultima_cluster/issues/33)) every
+declared row has one **running version**, committed
 in the cluster FSM, and the platform enforces it: a row is never applied by
 two versions of its state machine at once. The reasoning is [The row running
 version, explained](../notes/uc2-row-running-version-explained.md); the rules

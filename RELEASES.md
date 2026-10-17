@@ -6,14 +6,12 @@ release (mechanics, rulings, evidence tables) is
 [`docs/releases.md`](docs/releases.md); the per-milestone proof records are in
 [`docs/benchmarks/`](docs/benchmarks).
 
-## v2.14.0 — <tag date> — snapshot sets the cluster agrees on, an off-node backup tier, and read-your-writes reads
-
-<!-- tag date: fill at tag time, and update the "Full record" link below to the dated heading's anchor -->
+## v2.14.0 — 2026-10-17 — snapshot sets the cluster agrees on, an off-node backup tier, and read-your-writes reads
 
 The cluster keeps a replicated catalog of the snapshot sets it agrees on and
 builds a storage service on it, and clients can read their own writes from any
 node.
-[Full record](docs/releases.md#v2140--tag-date--snapshot-sets-the-cluster-agrees-on-an-off-node-backup-tier-and-read-your-writes-reads).
+[Full record](docs/releases.md#v2140--2026-10-17--snapshot-sets-the-cluster-agrees-on-an-off-node-backup-tier-and-read-your-writes-reads).
 
 - **Upgrade flag day:** wire `0.9.0` → `0.11.0`, cnc `3.3` → `3.4` and the
   remote protocol v1 → v2. Rebuild every service against the new SDK

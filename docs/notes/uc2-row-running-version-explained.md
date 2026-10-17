@@ -1,7 +1,7 @@
 # The row running version, explained
 
-*Written 2026-09-27 for issue #33, which ships as wire `0.10.0` / cnc
-`3.4` — unreleased as this is written. Spec:
+*Written 2026-09-27 for issue #33, which was built as wire `0.10.0` / cnc
+`3.4` and shipped in `2.14.0`, where `0.10.0` folded into wire `0.11.0`. Spec:
 `docs/superpowers/specs/2026-09-27-uc2-row-running-version-design.md`; read
 its "Errata (as built)" block before the body, because several of the
 behaviours below are errata rather than spec text. This note carries the

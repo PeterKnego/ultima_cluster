@@ -128,6 +128,27 @@ documentation for what it changes, because the tag is what people read.
       [#49](https://github.com/PeterKnego/ultima_cluster/issues/49), the typed
       tier's `bytes_read` length check, is claimed nowhere (as of `2.13.0`;
       fixed afterwards, in its own PR off `0b73c32`) — do not quietly close either.
+      For **`v2.14.0`** the greppable scaffolding is `v2.13.0`'s shape again:
+      the two `<tag date>` headings with their `<!-- tag date … -->` comments,
+      and the `<!-- PENDING: tag-time evidence rows above -->` block with the
+      rows it flags. What no grep for those finds is the **"unreleased"
+      sweep**. This release's eight features merged one at a time
+      after `2.13.0`, and 42 statements in `docs/how-to/`, `docs/reference/`,
+      `docs/notes/` and `docs/ops/` called its content "unreleased",
+      "next cut" or "on `main`"; each was reworded to name `2.14.0` (two
+      more such hits were not about releases at all). Two of them were
+      headings in `semver-policy.md`, so their anchors moved; nothing
+      linked to either. Two notes still called `2.12.0` unreleased. Find
+      them with
+      `grep -rniE "unreleased|next cut" docs/ README.md`, excluding the
+      engineering record and the gate docs, which narrate history. Confirm
+      `SECURITY.md` names `2.14.x`. Three things this release leaves
+      deliberately open, recorded rather than closed: the #33 apply-hop gate
+      is an honest **FAIL** with its bar kept;
+      [#149](https://github.com/PeterKnego/ultima_cluster/issues/149), the
+      Ice Lake-only apply-hop cost after #33, has no identified mechanism;
+      and [#150](https://github.com/PeterKnego/ultima_cluster/issues/150),
+      the egress ring's CRC-32, is most of the apply hop and unchanged.
 
 ## 2. Check the version the way the workflow will
 

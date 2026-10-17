@@ -108,7 +108,7 @@ Consistency, SubmitError}`) are in the same position and are covered too.
   line formats, additively.** `audit.jsonl` gains a **13th key**, `source`
   (`"operator"` on every admin request, `"discovery"` on the `settings_apply`
   a node writes itself when the committed rung rises), appended LAST so every
-  byte before it is unchanged. Backup tier 3b (unreleased) appends a **14th**,
+  byte before it is unchanged. Backup tier 3b (`2.14.0`) appends a **14th**,
   `fetch_source` (`"tier"` or `"peer"` on a snapshot-fetch record, `null`
   elsewhere), on the same rule. The audit line's key ORDER is a contract
   (`uc_node::audit`, which shares one formatter with `uc_node::obs::log`), and
@@ -219,11 +219,12 @@ Two version numbers are deliberately *outside* this policy, because semver's
 
 - **The node-to-node wire protocol** (`uc_protocol::version::CURRENT`,
   currently `0.11.0` (the snapshot catalog's `STATUS` body, `SNAP_REPORT`
-  row 255 and `Settings` v3, then the snapshot lifecycle's 32 B `SNAP_REPORT`, 20-byte `SnapshotReport` entries and `Settings` v4; unreleased as this is written — `0.10.0`
-  shipped #33's row running version, also unreleased; `0.9.0` shipped in
+  row 255 and `Settings` v3, then the snapshot lifecycle's 32 B `SNAP_REPORT`, 20-byte `SnapshotReport` entries and `Settings` v4; since `2.14.0` — `0.10.0`
+  (#33's row running version) was never released on its own and folded into
+  `0.11.0`; `0.9.0` shipped in
   `2.13.0`) — see [wire protocol](wire-protocol.md)).
 - **The `cnc.dat` page layout** (`CNC_V2_VERSION`, currently cnc `3.4`
-  (#33, unreleased; the snapshot catalog leaves cnc untouched — the
+  (#33, since `2.14.0`; the snapshot catalog leaves cnc untouched — the
   catalog is not on the shmem page; cnc `3.3` shipped in `2.13.0`) — see
   [the cnc control page](cnc-page.md)).
 
@@ -236,8 +237,8 @@ cluster stalls commits rather than making unsound ones. The procedure is
 [Upgrade a cluster](../how-to/upgrade-a-cluster.md); it applies whether or
 not the crate version's major digit moved.
 
-**`2.13.0` shipped the most recent RELEASED flag day on both lines**; the
-row running version's (`0.10.0` / cnc `3.4`, below) is not yet released.
+**`2.14.0` shipped the most recent flag day on both lines** (wire `0.11.0`,
+cnc `3.4`; `0.10.0` folded into it); `2.13.0` shipped the one before.
 `2.11.0` carried **two**
 wire-and-page features at once: wire `0.6.0` → `0.7.0` and cnc `3.0` → `3.1`,
 bundled as one combined flag day per the standing rule that a cnc layout
@@ -368,7 +369,7 @@ carried in M14b. Adding a variant is additive under this policy.
 
 ### The snapshot catalog flag day (`0.11.0`)
 
-Unreleased as this is written, and a further flag day on the same terms:
+Shipped in `2.14.0`, and a further flag day on the same terms:
 wire `0.10.0` → `0.11.0`, cnc **unchanged** at `3.4` — the catalog is not on
 the shmem page, only on the cluster artifact and `/metrics`.
 
@@ -556,7 +557,7 @@ for the same one-maintainer-decision reason as every prior carve-out on this
 line. The new `WholeStateSnapshot` helper trait (`uc_service::snapshots`) is
 additive — see [the state-machine contract § Snapshots](state-machine-contract.md#snapshots-required-the-instant-the-envelope-and-the-exclusive-frontier).
 
-### Read-your-writes reads (unreleased, next cut)
+### Read-your-writes reads (`2.14.0`)
 
 Spec `docs/superpowers/specs/2026-10-08-uc2-read-your-writes-design.md`,
 explainer `docs/notes/uc2-read-your-writes-explained.md`. Two items, neither
@@ -564,7 +565,7 @@ touches the node-to-node wire:
 
 - **`FLAG_V2_MIN_POSITION`, folded into cnc `3.4`.** A new query flag whose
   record carries an 8-byte `min_position` prefix, with no layout change. It is
-  folded into the unreleased cnc 3.4 rather than bumping it (released `2.13.0`
+  folded into cnc 3.4 (`2.14.0`) rather than bumping it (released `2.13.0`
   shipped 3.3). Additive API (a minor): new `query_read_your_writes*`,
   `query_at_least_on`, `read_token`, `observe` and `ReadToken`. Because a 3.4
   client attaches to a 3.3 page (`version_compatible` accepts an older
@@ -586,7 +587,7 @@ literal of the stats, stops compiling downstream: the same documented
 minor-version hazard `Outcome` and `SubmitError` carried in M14b. Adding a
 variant or field is additive under this policy.
 
-### A remote client's starting seq (#34, unreleased, next cut)
+### A remote client's starting seq (#34, `2.14.0`)
 
 `uc_remote::RemoteConfig` gains a public field `first_seq` (default `1`), and
 `RemoteSendHalf`/`RemoteClient` gain `next_seq()`, plus the constant

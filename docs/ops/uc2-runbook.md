@@ -137,7 +137,7 @@ transport setting, both measured closed-loop at inflight 1 on 8-vCPU
 - **Is the log's clock moving?** `uc2_log_time_ns` on every node is the highest
   leader stamp the archive has recorded; `uc2_log_time_lag_seconds` on the
   **leader only** (rendered `0` elsewhere) is wall clock minus that. Since
-  `2.12.0` (unreleased) a backward wall-clock step no longer holds this lag
+  `2.12.0` a backward wall-clock step no longer holds this lag
   open: the log clock smears the step instead of freezing, so
   `Uc2LogTimeFrozen`'s meaning has narrowed to "the appender is stalled" — a
   grown lag now means nothing is being appended, not a clock step. The
@@ -213,11 +213,11 @@ transport setting, both measured closed-loop at inflight 1 on 8-vCPU
   (a directory listing) and never opens an artifact. A row whose `newest=`
   sits below the others is the row holding the floor back, and
   `uc2_snapshot_row_incomplete_total{row}` will be climbing for it. Since
-  `0.11.0` (the snapshot catalog, unreleased) `set=` is the node-local,
+  `0.11.0` (the snapshot catalog, `2.14.0`) `set=` is the node-local,
   on-disk reading only — see the next bullet for the cluster's own view,
   which is what actually bounds the purge floor.
 - **What does the cluster agree it can rebuild from?** The snapshot catalog
-  (`0.11.0`, unreleased,
+  (`0.11.0`, since `2.14.0`,
   [design spec](../superpowers/specs/2026-10-01-uc2-snapshot-catalog-design.md))
   replaces "the newest set that exists on disk" with "the newest set every
   declared row and the cluster artifact **agree** on" as the purge floor and
