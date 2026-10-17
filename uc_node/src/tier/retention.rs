@@ -24,6 +24,7 @@ use super::target::BackupTarget;
 use crate::cluster_fsm::{ClusterView, ClusterViewInner};
 use std::collections::BTreeSet;
 use std::sync::atomic::Ordering;
+use uc_protocol::v2::catalog::SetEntry;
 
 /// The replicated retention policy; `0` = no limit on that axis, both `0`
 /// = keep everything.
@@ -199,13 +200,49 @@ pub fn apply(t: &dyn BackupTarget, sets: &[u64], chunks: &[(u64, u64)]) -> Resul
     apply_counted(t, sets, chunks, &mut Deleted::default())
 }
 
-/// Ruling R10a: plan retention only once this node's committed cluster view
-/// has walked (`ClusterView::consumed`) at least to the newest COMPLETE set
-/// in the tier. A lagging view may not yet hold the pin (or the settings)
-/// that protects a set another writer already copied; skip the pass until
-/// it catches up. An empty tier is trivially caught up.
-pub fn view_caught_up(consumed: u64, tier_sets: &[SetLabel]) -> bool {
-    tier_sets.iter().all(|s| s.position <= consumed)
+/// Ruling R10a, settled (#126): plan retention only once this node's
+/// committed cluster view is far enough along that every pin which could
+/// protect a tier set is in it. A lagging view may not yet hold the pin (or
+/// the settings) that protects a set another writer already copied; skip
+/// the pass until it catches up. Three clauses, each a different way the
+/// view can be short:
+///
+/// 1. `consumed` (`ClusterView::consumed`, the agent's walk) has reached
+///    every complete tier set — R10a as first built. An empty tier is
+///    trivially caught up.
+/// 2. `consumed` has passed `committed`, this node's commit position read
+///    BEFORE the listing: every pin this node knows to be committed is
+///    applied, not a duty cycle behind.
+/// 3. Every tier set the catalog still lists is AGREED in it. The pin door
+///    accepts an origin only while it is the leader's newest complete set
+///    (refusal 54), and a newer set's agreement is a `CLUSTER` frame, so
+///    with the leader's single-in-flight rule it commits after the pin: a
+///    view that has agreed the newer set has applied the pin. A tier set
+///    the catalog no longer lists retired as old, agreed long since.
+///
+/// The open edge was the gap between clauses 1 and 3: a pin protecting the
+/// set at P can commit between a newer set's instant and that set's
+/// agreement, and a view that had walked to the newer set's position but
+/// not to the pin planned a pass that deleted P. What remains is the pin
+/// door's own window (its refusal-54 comment): a pin that commits after
+/// this node read `committed`, while the leader's newest complete set is
+/// not the tier's newest agreed one (a standby set, or a full set the
+/// leader's rows are still building) — one append-to-commit round trip,
+/// the same window the node-local pruner has.
+pub fn view_caught_up(
+    consumed: u64,
+    committed: u64,
+    catalog: &[SetEntry],
+    tier_sets: &[SetLabel],
+) -> bool {
+    consumed >= committed
+        && tier_sets.iter().all(|s| {
+            s.position <= consumed
+                && catalog
+                    .iter()
+                    .find(|e| e.position == s.position)
+                    .is_none_or(SetEntry::is_agreed)
+        })
 }
 
 /// Spec §7: would retention delete `cand` again the moment it landed in
@@ -243,7 +280,9 @@ pub fn stale_incomplete(incomplete: &[u64], oldest_kept: Option<u64>) -> Vec<u64
 }
 
 /// One retention pass over the tier (spec §7.2): list it, skip unless the
-/// view has caught up (R10a), then delete the policy's sets (`SET` first),
+/// view has caught up ([`view_caught_up`]: R10a, with `committed` this
+/// node's commit position read before the call), then delete the policy's
+/// sets (`SET` first),
 /// the aged incomplete set directories below the oldest kept set (older
 /// than `incomplete_max_age` by [`BackupTarget::newest_entry_age`], so a
 /// lagging writer's in-flight copy is never raced) and the chunks wholly
@@ -251,14 +290,19 @@ pub fn stale_incomplete(incomplete: &[u64], oldest_kept: Option<u64>) -> Vec<u64
 pub fn run_pass(
     t: &dyn BackupTarget,
     p: &RetentionPolicy,
-    inner: &ClusterViewInner,
-    consumed: u64,
+    view: &ClusterView,
+    committed: u64,
     incomplete_max_age: std::time::Duration,
     verified: Option<&BTreeSet<u64>>,
     done: &mut Deleted,
 ) -> Result<bool, TierError> {
     let l = super::chain::list_tier(t)?;
-    if !view_caught_up(consumed, &l.sets) {
+    // The walk AFTER the listing, and the inner after the walk: the agent
+    // stores `consumed` last, so an inner snapshotted after it carries every
+    // record the walk promises.
+    let consumed = view.consumed.load(Ordering::Acquire);
+    let inner = &view.snapshot_inner();
+    if !view_caught_up(consumed, committed, &inner.catalog, &l.sets) {
         return Ok(false);
     }
     // `verified`: only sets the writer confirmed or re-read count (PF2 as
@@ -582,15 +626,26 @@ mod tests {
         assert_eq!(deletable_sets(&sets, &pol(0, 5), &none()), vec![100]);
     }
 
-    /// Ruling R10a: plan only once the view has walked to the tier's
-    /// newest complete set.
+    /// Ruling R10a, settled (#126): plan only once the view has (1) walked
+    /// to every tier set, (2) walked past everything this node had
+    /// committed before the listing, and (3) agreed every tier set it still
+    /// lists — so a pin committed before the listing, or before the newest
+    /// tier set's agreement, is in the view the pass plans from.
     #[test]
     fn retention_waits_for_the_view_to_reach_the_newest_tier_set() {
-        assert!(view_caught_up(0, &[]), "an empty tier is caught up");
+        assert!(view_caught_up(0, 0, &[], &[]), "an empty tier is caught up");
         let sets = [label(100, 1), label(500, 2)];
-        assert!(!view_caught_up(499, &sets));
-        assert!(view_caught_up(500, &sets));
-        assert!(view_caught_up(9_000, &sets));
+        assert!(!view_caught_up(499, 0, &[], &sets));
+        assert!(view_caught_up(500, 0, &[], &sets));
+        assert!(view_caught_up(9_000, 0, &[], &sets));
+        // (2) the walk is short of what was committed before the listing
+        assert!(!view_caught_up(500, 501, &[], &sets), "#126: commit");
+        assert!(view_caught_up(501, 501, &[], &sets));
+        // (3) a tier set the catalog lists but has not agreed yet
+        let pending = SetEntry::commanded(500, SetKind::Full, 0);
+        assert!(!view_caught_up(9_000, 0, &[pending], &sets), "#126: agreed");
+        let agreed = agreed_on(500, pack_version(1, 0, 0));
+        assert!(view_caught_up(9_000, 0, &[agreed], &sets));
     }
 
     /// Fix round 1 / IMPORTANT 1: the copy filter blocks a set retention
@@ -809,10 +864,11 @@ mod tests {
         }
         age_dir(&dir.path().join(set_dir(100)), hour * 2);
         age_dir(&dir.path().join(set_dir(500)), hour * 2);
-        let inner = ClusterView::new(&ClusterState::genesis_empty()).snapshot_inner();
+        let view = ClusterView::new(&ClusterState::genesis_empty());
+        view.note_consumed(u64::MAX);
         let mut done = Deleted::default();
         // keep-everything still clears residue
-        assert!(run_pass(&t, &pol(0, 0), &inner, u64::MAX, hour, None, &mut done).unwrap());
+        assert!(run_pass(&t, &pol(0, 0), &view, 0, hour, None, &mut done).unwrap());
         assert_eq!(done.incomplete, 1);
         assert_eq!((done.sets, done.chunks), (0, 0));
         assert!(
@@ -828,7 +884,11 @@ mod tests {
         assert_eq!(l.incomplete_sets, vec![200, 500]);
     }
 
-    /// R10a through the pass: a view short of the newest tier set skips.
+    /// R10a through the pass: a view short of the newest tier set skips; so
+    /// does one short of the commit read before the listing, and one that
+    /// lists the newest tier set but has not agreed it yet (#126) — the pin
+    /// that protects an older set can commit between that set's instant
+    /// and its agreement.
     #[test]
     fn a_pass_is_skipped_while_the_view_lags_the_tier() {
         let dir = scratch();
@@ -838,12 +898,32 @@ mod tests {
             std::fs::create_dir_all(&sd).unwrap();
             std::fs::write(sd.join("SET"), label(p, p).render()).unwrap();
         }
-        let inner = ClusterView::new(&ClusterState::genesis_empty()).snapshot_inner();
+        let mut st = ClusterState::genesis_empty();
+        let view = ClusterView::new(&st);
         let mut done = Deleted::default();
         let hour = std::time::Duration::from_secs(3600);
-        assert!(!run_pass(&t, &pol(1, 0), &inner, 199, hour, None, &mut done).unwrap());
+        view.note_consumed(199);
+        assert!(!run_pass(&t, &pol(1, 0), &view, 0, hour, None, &mut done).unwrap());
         assert!(!done.any());
-        assert!(run_pass(&t, &pol(1, 0), &inner, 200, hour, None, &mut done).unwrap());
+        // #126: short of the commit read before the listing
+        view.note_consumed(200);
+        assert!(
+            !run_pass(&t, &pol(1, 0), &view, 250, hour, None, &mut done).unwrap(),
+            "the walk is short of the commit"
+        );
+        assert!(!done.any());
+        // #126: the newest tier set is listed, not yet agreed
+        st.catalog = vec![SetEntry::commanded(200, SetKind::Full, 0)];
+        view.publish(&st);
+        view.note_consumed(250);
+        assert!(
+            !run_pass(&t, &pol(1, 0), &view, 250, hour, None, &mut done).unwrap(),
+            "the newest tier set is not agreed in the view"
+        );
+        assert!(!done.any());
+        st.catalog = vec![agreed_on(200, pack_version(1, 0, 0))];
+        view.publish(&st);
+        assert!(run_pass(&t, &pol(1, 0), &view, 250, hour, None, &mut done).unwrap());
         assert_eq!(done.sets, 1);
         assert!(!dir.path().join(set_dir(100)).exists());
     }

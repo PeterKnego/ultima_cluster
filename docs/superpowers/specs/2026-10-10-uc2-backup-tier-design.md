@@ -607,6 +607,21 @@ ledger (PF = pre-flight, R = execution rulings, by task).
   set in the tier. Any pin whose rollback set is in the tier has its record
   below that set, so a view past it has applied the pin; a lagging view would
   not yet hold the pin that protects a set another writer copied.
+  **Settled 2026-10-17 ([#126](https://github.com/PeterKnego/ultima_cluster/issues/126)).**
+  The argument above covered the rollback set, not the ORIGIN set: a pin's
+  record can commit between a newer set's instant and that set's agreement,
+  so a view that had walked to the newer set's position but not to the pin
+  planned a pass that deleted the origin. The gate (`retention::view_caught_up`)
+  now has three clauses: the walk has reached every tier set (as before);
+  the walk has passed this node's commit position as read BEFORE the
+  listing; and every tier set the catalog still lists is AGREED in the view
+  — the pin door accepts an origin only while it is the leader's newest
+  complete set (refusal 54), and a newer set's agreement is a `CLUSTER`
+  frame, single-in-flight with the pin's, so it commits after the pin.
+  What remains is the door's own window (its refusal-54 comment): a pin
+  committing after this node read its commit position, while the leader's
+  newest complete set is not the tier's newest agreed one — one
+  append-to-commit round trip, the window the node-local pruner has too.
 - **The copy filter never re-copies a set retention would delete (§5.2/§7).**
   A catalog set the policy (with pin protection) would delete the moment it
   landed is not copied — whether it lies below the oldest set or above a

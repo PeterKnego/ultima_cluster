@@ -1328,18 +1328,19 @@ impl Writer {
     /// oldest kept set to `through` (module docs of [`retention`]), so the
     /// `progress` the next refresh stores cannot move back.
     fn retain(&mut self) -> Result<bool, TierError> {
-        // `consumed` FIRST: the policy and the view read after it are at
-        // least as new as the walk the R10a gate checks.
-        let consumed = self.view.consumed.load(Ordering::Acquire);
+        // #126 (R10a settled): `commit` FIRST, then the listing, then the
+        // walk and the view (inside `run_pass`) — a pin this node had
+        // committed before it listed the tier is in the view the pass plans
+        // from, or the pass is skipped.
+        let committed = self.cnc.counters().commit.load_acquire();
         let policy = RetentionPolicy::from_view(&self.view);
-        let inner = self.view.snapshot_inner();
         let mut done = retention::Deleted::default();
         // Deletions already made count even when a later one fails.
         let res = retention::run_pass(
             &*self.target,
             &policy,
-            &inner,
-            consumed,
+            &self.view,
+            committed,
             TMP_MAX_AGE,
             Some(&self.verified_sets),
             &mut done,

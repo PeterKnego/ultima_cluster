@@ -538,6 +538,8 @@ RA2 (§5.3, read-back) and RA3 (§6.2, `.tier.part` temp names) was amended
   persisted map no longer reaches below an old S), `tier_set_deferred
   {position}` (Warn) fires once per position.
 - **R10a stays open (3a §13).** 3b did not settle the origin-set edge.
+  Settled after 3b, 2026-10-17: see the 3a errata's R10a entry
+  ([#126](https://github.com/PeterKnego/ultima_cluster/issues/126)).
 - **Task 15 (§9) — the lin capstone's tier-join test runs its body on a 16 MiB
   thread.** A debug build overflowed the 2 MiB test-thread stack (nightly runs
   the capstones in debug); the oversized frame was not isolated.
