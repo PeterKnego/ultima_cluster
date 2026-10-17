@@ -3070,12 +3070,25 @@ impl FollowerReceiver {
     /// M14c2 (T10a) fix round 1: this walk returns at the FIRST blocked part,
     /// so on a multi-artifact set it re-attempts (and re-fails) that one part
     /// for every later chunk that lands. It therefore owns
-    /// [`SnapIntake::last_publish_try_ns`]: a FAILED attempt stamps `now`
-    /// (arming [`SNAP_REDRIVE_INTERVAL_NS`] for both callers), a pass that
+    /// [`SnapIntake::last_publish_try_ns`]: a FAILED attempt stamps the later
+    /// of `now` and the clock at the failure (#118: the interval runs from
+    /// the attempt's END; arming [`SNAP_REDRIVE_INTERVAL_NS`] for both
+    /// callers), a pass that
     /// blocks on nothing clears it back to `None`. A first attempt, and every
     /// attempt after a clean pass, is therefore immediate — the normal
     /// completion path is never delayed by the pacing.
     fn snap_publish_complete_parts(&mut self, now: u64) {
+        // #118 (second cause): a failed attempt is stamped at its END, never
+        // earlier than the caller's clock. The chunk path reads `now` at
+        // acceptance, BEFORE the attempt's fsync, marker write and rename;
+        // when those outran the interval, the same pass's second `upkeep`
+        // call (a fresh clock) was already due and failed again at once —
+        // the pacing gone for as long as the obstacle kept attempts slow. A
+        // caller on a virtual clock ahead of the process clock (the unit
+        // tests) keeps its own reading. `self.base` is disjoint from
+        // `self.snap_intake`, which the walk below holds mutably.
+        let base = &self.base;
+        let failed_at = |now: u64| now.max(base.elapsed().as_nanos() as u64);
         let Some(intake) = self.snap_intake.as_mut() else {
             return;
         };
@@ -3099,7 +3112,7 @@ impl FollowerReceiver {
             if let Some(file) = intake.parts[k].file.take() {
                 if file.sync_all().is_err() {
                     intake.parts[k].file = Some(file);
-                    intake.last_publish_try_ns = Some(now);
+                    intake.last_publish_try_ns = Some(failed_at(now));
                     self.stats
                         .snap_intake_io_failures
                         .fetch_add(1, Ordering::Relaxed);
@@ -3116,14 +3129,14 @@ impl FollowerReceiver {
             if write_foreign_marker(&intake.parts[k].final_path, intake.parts[k].snapshot_pos)
                 .is_err()
             {
-                intake.last_publish_try_ns = Some(now);
+                intake.last_publish_try_ns = Some(failed_at(now));
                 self.stats
                     .snap_intake_io_failures
                     .fetch_add(1, Ordering::Relaxed);
                 return;
             }
             if std::fs::rename(&intake.parts[k].part_path, &intake.parts[k].final_path).is_err() {
-                intake.last_publish_try_ns = Some(now);
+                intake.last_publish_try_ns = Some(failed_at(now));
                 self.stats
                     .snap_intake_io_failures
                     .fetch_add(1, Ordering::Relaxed);
@@ -7778,6 +7791,86 @@ mod tests {
         assert!(
             r.snap_intake.is_some(),
             "the intake is still waiting on the obstacle"
+        );
+    }
+
+    /// #118, the second cause (the first was the test's own guard, PR #137):
+    /// the stamp a FAILED attempt left was the CALLER's clock — on the chunk
+    /// path, the acceptance reading taken BEFORE the attempt's fsync, marker
+    /// write and rename. When those outran the interval (a loaded runner's
+    /// disk), the same pass's second `upkeep` call, with a fresh clock, was
+    /// already due and failed again at once: two counted failures back to
+    /// back, before any chunk of the burst, and the pacing gone for exactly
+    /// as long as the obstacle kept attempts slow. The interval runs from
+    /// the END of the failed attempt, whatever clock the caller passed.
+    #[test]
+    fn a_failed_attempt_arms_the_interval_from_its_end_not_the_callers_clock() {
+        use Ordering::Relaxed;
+        let b = buffer();
+        let mut leader = FakeLeader::new();
+        let mut r = follower(&b, leader.addr());
+        let dir = snap_scratch_dir();
+        r.set_snapshot_intake(
+            dir.path().to_path_buf(),
+            ident(0b1),
+            Arc::new(|| [0u32; 8]),
+            None,
+        );
+        let st = r.stats();
+        let to = r.local_addr();
+        std::fs::create_dir_all(dir.path().join("0")).unwrap();
+        std::fs::create_dir(dir.path().join("0").join("snap-4096.ultsnap")).unwrap();
+        leader.send(
+            to,
+            DGRAM_KIND_SNAP_BEGIN,
+            0,
+            TERM,
+            &snap_begin_wire(14, 0, 4096, 64, 0b1),
+        );
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while r.snap_intake.is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "the BEGIN never opened an intake"
+            );
+            r.do_work();
+        }
+        // The chunk lands and its own attempt fails: one failure.
+        leader.send(to, DGRAM_KIND_SNAP_CHUNK, 0, TERM, &[0xABu8; 64]);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while st.snap_intake_io_failures.load(Relaxed) < 1 {
+            assert!(
+                Instant::now() < deadline,
+                "the blocked publish was never counted"
+            );
+            r.do_work();
+        }
+        // A caller whose clock reads long before the attempt ends — the shape
+        // of a pass whose failed attempt outran the interval before the
+        // pass's second upkeep call read a fresh clock.
+        let before = r.now_ns();
+        r.snap_publish_complete_parts(0);
+        assert_eq!(
+            st.snap_intake_io_failures.load(Relaxed),
+            2,
+            "the direct attempt fails exactly once"
+        );
+        let stamp = r
+            .snap_intake
+            .as_ref()
+            .and_then(|i| i.last_publish_try_ns)
+            .expect("the failed attempt is stamped");
+        assert!(
+            stamp >= before,
+            "stamped at the attempt's end ({before}+), not the caller's clock: {stamp}"
+        );
+        // So an upkeep right after it, on the real clock, is inside the
+        // interval and attempts nothing.
+        r.snap_upkeep(r.now_ns());
+        assert_eq!(
+            st.snap_intake_io_failures.load(Relaxed),
+            2,
+            "no second attempt inside the interval, whatever the caller's clock said"
         );
     }
 

@@ -449,6 +449,15 @@ Defects that shipped in `2.13.0` or earlier:
   since the coordinated-snapshot work, with no family, accessor or record —
   `uc_net` carries no logging dependency — so a peer probing a node for sets
   was invisible. 149 families now.
+- **A blocked snapshot publish is re-tried once per interval, measured from
+  the attempt's end** ([#118](https://github.com/PeterKnego/ultima_cluster/issues/118),
+  second cause). The pacing stamped a failed attempt with the caller's
+  clock — on the chunk path the acceptance reading, taken before the
+  attempt's fsync, marker write and rename — so when those outran the
+  250 ms interval the same pass's second upkeep call was already due and
+  failed again at once, and `snap_intake_io_failures` climbed two per
+  pass for as long as the obstacle kept attempts slow. Stamped at the
+  failure now.
 
 Defects found in this release's own unreleased work, fixed before it shipped:
 a set installed by snapshot session was never reported as held
