@@ -127,3 +127,63 @@ verdict rule as §2):
   `main` slower). Its size is reported.
 
 Row a's FAIL stands as recorded; rows b and c do not replace it.
+
+### Re-run results (rows b and c)
+
+**Run 2026-10-17, 10:59–11:28 UTC, a fresh `c6id.2xlarge`** (same shape,
+same procedure as §4, destroyed afterwards with state empty and no live
+instance or `uc-bench` VPC). Tree: a bundle of `d82fa6df` plus
+`bench/33-fix-on-a70539a1`. `--selftest` passed.
+
+| row | N | A | B | head vs base | resolution | worst sem | signal bar | verdict |
+|---|---|---:|---:|---:|---:|---:|---:|---|
+| b | 1 | `a409b3ae` 15,142,330 | `ecd560a0` 14,821,026 | **−2.122 %** | 0.443 % | 0.649 % | 1.298 % | `outside resolution` |
+| b | 2 | 14,768,737 | 14,378,754 | **−2.641 %** | 0.286 % | 0.221 % | 0.442 % | `outside resolution` |
+| c | 1 | `0a9bed82` 14,486,119 | `ddf5b470` 14,373,209 | **−0.779 %** | 0.091 % | 0.127 % | 0.253 % | `outside resolution` |
+| c | 2 | 14,526,323 | 14,335,019 | **−1.317 %** | 0.149 % | 0.170 % | 0.341 % | `outside resolution` |
+
+`pace_stalls` was 3.5–3.8 × 10⁹ on every arm; no run is driver-bound.
+**Row b FAILS at both N** (half row a's loss). **Row c FAILS at both N**: on
+this CPU the fix makes `main` slower, where the dev box read it +2.1 %
+faster.
+
+### What the instrument is measuring (investigation, not a verdict)
+
+Two more runs on the same host, with `apply_bench` binaries built on the
+maintainer's dev box (same `rustc` 1.96, a newer system linker), six or eight
+interleaved reps per binary at N=1, deltas against `a409b3ae`:
+
+| commit | dev-box build, default layout | dev-box build, every function and loop aligned to 64 B |
+|---|---:|---:|
+| `69fb38ab` (cnc words only) | −0.04 % | — |
+| `855a0aa6` (attach only) | −2.33 % | — |
+| `a8de0e25` (attach only) | −3.13 % | **+0.50 %** |
+| `54caa65b` (adds the arm) | −5.70 % | — |
+| `a70539a1` (#68 merged) | −3.58 % | **−2.63 %** |
+| `0a9bed82` (`main`) | −9.60 % | **−8.52 %** |
+| `main` + fix | −2.76 % | **−1.65 %** |
+
+Three readings follow, and the third decides what rows a–c can claim:
+
+1. **Commits that never touch the apply loop move it by 2–3 %** under the
+   default layout (`855a0aa6`, `a8de0e25` change attach, which runs once),
+   and the move disappears under forced alignment. Part of every delta in
+   this doc is where the hot loop happens to land.
+2. **Some of #33's cost survives forced alignment:** `a70539a1` at −2.6 %.
+3. **The same source reads differently from different builders.** Host-built
+   `main` ran 14.49 M frames/s in row c; the dev-box build of the same
+   commit ran 13.46 M on the same host type, 7 % slower. Within the dev-box
+   set the fix is worth +7.5 % over `main`; within the host-built set it
+   costs 0.8 %. Forced 64-byte alignment does not remove this, so what
+   matters on this CPU is not (only) a loop's alignment but the relative
+   placement of the hot code, which the linker decides.
+
+`apply_ab.sh`'s B′ control cannot see this: two builds of one source by one
+builder get one layout, so the "resolution" it reports is build
+non-determinism, not layout sensitivity. On this rig a few-percent apply-hop
+delta between two sources is not attributable to the source change until
+layout is varied. The method that answers it is to measure each source under
+several randomised layouts (for example the linker's section shuffle with
+different seeds) and compare the distributions.
+
+Logs: `$HOME/scratch/ab33-fleet2/` on the maintainer's box.
