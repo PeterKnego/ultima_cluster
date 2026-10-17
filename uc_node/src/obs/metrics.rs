@@ -89,6 +89,12 @@ pub const CONTRACT_SERIES: &[&str] = &[
     "uc2_snapshot_auto_fetch_total",
     // Backup-tier 3b spec §6.6: landed store-only fetches by source.
     "uc2_snapshot_fetch_total",
+    // #121: the sender's two snapshot-session probe counters, read at
+    // scrape. Sender-local until now — no family, no accessor, no obs
+    // record (`uc_net` carries no logging dependency) — so an operator
+    // could not see a peer probing this node for sets.
+    "uc2_snap_redirects_total",
+    "uc2_snap_request_unknown_peer_total",
     // Backup-tier 3b spec §6.3/§6.6: TIER_INSTALL outcomes.
     "uc2_tier_install_total",
     "uc2_snapshot_newest_agreed_bytes",
@@ -1092,6 +1098,18 @@ fn push_service_families(out: &mut String, s: &ObsSources, commit: u64, now: u64
         "Background fetches of the newest agreed snapshot set, by outcome (snapshot-lifecycle spec §6): ok (landed), refused (could not be issued), timeout (no answer in 60 s), no_space (skipped: the set would not fit with headroom — free < size + max(size/4, 1 GiB)), no_holder (every candidate tried; retried after 30 s).",
         "counter",
         &auto_fetch_samples,
+    );
+    push_counter(
+        out,
+        "uc2_snap_redirects_total",
+        "Below-floor NAKs this node could not serve and answered with a SNAP_REDIRECT to a learner (coordinated-snapshot spec §5.7). Rare by construction; a rising count means this cluster's voters are relying on the standby return path.",
+        s.sender.snap_redirects.load(Ordering::Relaxed),
+    );
+    push_counter(
+        out,
+        "uc2_snap_request_unknown_peer_total",
+        "SNAP_REQUESTs dropped because the source address is not in the current membership (ruling P14). Non-zero crypto-off means someone is probing this node for sets, or a stale member is still asking; crypto-on it should be impossible.",
+        s.sender.snap_request_unknown_peer.load(Ordering::Relaxed),
     );
     push_labeled(
         out,
@@ -2375,7 +2393,7 @@ mod tests {
     fn the_contract_has_the_number_of_families_the_docs_state() {
         assert_eq!(
             CONTRACT_SERIES.len(),
-            147,
+            149,
             "if this is intentional, update the family count in \
              docs/how-to/monitor-a-cluster.md in the same commit"
         );

@@ -402,6 +402,14 @@ Defects that shipped in `2.13.0` or earlier:
 - `counter-service` and `kv-service` registered their SIGTERM handler after
   the boot wait, so a stop during it killed them (#60); the
   `services_declared_withheld` warning is timed on the pass clock (#61).
+- **The sender's two snapshot-probe counters are on `/metrics`**
+  ([#121](https://github.com/PeterKnego/ultima_cluster/issues/121)):
+  `uc2_snap_redirects_total` (below-floor NAKs answered with a
+  `SNAP_REDIRECT` to a learner) and `uc2_snap_request_unknown_peer_total`
+  (`SNAP_REQUEST`s dropped at the membership gate). Both were sender-local
+  since the coordinated-snapshot work, with no family, accessor or record —
+  `uc_net` carries no logging dependency — so a peer probing a node for sets
+  was invisible. 149 families now.
 
 Defects found in this release's own unreleased work, fixed before it shipped:
 a set installed by snapshot session was never reported as held
