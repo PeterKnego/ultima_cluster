@@ -147,20 +147,29 @@ scoped* consistency weakening.
 `docs/VERIFICATION.md` §11 and `docs/superpowers/specs/2026-08-01-uc2-formal-roadmap.md`
 record what is not proved:
 
-- **`leader_completeness`** — the roadmap's HIGHEST-priority task (F-UC-1,
-  ≈ 7–12 S2-equivalents), not started. The joint-induction blueprint is in
-  the phase-2 memo; the sole named open theorem in the corpus.
+- **`leader_completeness`** — the roadmap's HIGHEST-priority task (F-UC-1)
+  and the sole named open theorem in the corpus. Not untouched: the closure
+  arc banked 2026-07-19 reduced it to one named obligation, the `canon`
+  invariant, with its assembly, crux, consumer interface, antitonicity and a
+  machine-checked satisfiability witness all landed, and the hypothesis that
+  had made it conditional discharged since. What remains is the joint /
+  well-founded induction the corpus's standard shape does not give
+  (`docs/VERIFICATION.md` § "What is not proved", estimated 3–4 tasks) — and
+  the next bullet, which has to land first for the result to mean what it
+  says.
 - **The Lean model collapses the durable counter's two readers into one**
   (issue #7). A real acked-write-loss bug lived in exactly that gap and was
   found from the Rust side. Proofs composed over that lemma are weaker than
   they look until the split lands.
-- **SPSC and the futex layer have no loom model**; MPSC and Broadcast do,
-  and the Broadcast model found a real weak-memory defect the day it was
-  written (2026-08-31). The mmap itself is outside loom and Miri; a
-  Vec-backed variant for Miri "has not been built, and that trade-off is
-  recorded rather than resolved".
-- **aarch64 tests in CI.** Binaries are built, tests never run; the full
-  stack has passed on Graviton exactly once
+- **SPSC and the futex layer have no loom model**; MPSC, Broadcast, the log
+  buffer's frame visibility and its write-reserve seqlock (`loom_reserve`,
+  from the #78 fix, in `nightly.yml` since #116) do, and the Broadcast model
+  found a real weak-memory defect the day it was written (2026-08-31). The
+  mmap itself is outside loom and Miri; a Vec-backed variant for Miri "has
+  not been built, and that trade-off is recorded rather than resolved".
+- **aarch64 tests in CI.** The release binaries are built on a native
+  aarch64 runner (`release.yml`'s `ubuntu-24.04-arm` leg), but no workflow
+  runs a test there; the full stack has passed on Graviton exactly once
   (`docs/benchmarks/uc2-arch-sweep-c8id-vs-c9gd-2026-08-31.md`). A one-time
   pass is a data point, not a regression gate.
 - **Term-map follow-ons** from
@@ -182,6 +191,17 @@ All framed by the docs as characterisation, not defects:
   residual 14.3 % spread is undiagnosed
   (`docs/benchmarks/uc2-m14c2-fleet-pinning-2026-08-30.md`,
   `docs/VERIFICATION.md` §11).
+- **The apply hop lost ground on Ice Lake, and the ring CRC is most of
+  it.** The #33 apply-hop A/B
+  (`docs/benchmarks/uc2-row-running-version-apply-ab-2026-10-17.md`) is an
+  honest FAIL with the bar kept: #33 itself costs 2.5 % at N=1 under
+  layout-randomised linking, and the merges after it a further 4.2 % at
+  both N — Ice Lake only, the same binaries 2 % faster on Zen 5, mechanism
+  unidentified ([#149](https://github.com/PeterKnego/ultima_cluster/issues/149)).
+  The profile behind it put 61 % of the hop in the egress ring's per-record
+  CRC-32, in the ring format since `v2.0.0`
+  ([#150](https://github.com/PeterKnego/ultima_cluster/issues/150)). Both
+  are issues; the line is here so this direction's ranking can weigh them.
 - Recorded follow-ons: sharded per-client ingress and demand-weighted
   credits (`docs/superpowers/specs/2026-08-24-uc2-m13-remote-path-design.md`
   §8 "Follow-ons (not M13)"), service-side raw passthrough and per-slot response-buffer
@@ -246,7 +266,11 @@ open questions come before any code. On 2026-10-17 the seventeen specified
 items it had accumulated moved to issues
 [#119](https://github.com/PeterKnego/ultima_cluster/issues/119) through
 [#135](https://github.com/PeterKnego/ultima_cluster/issues/135), each with
-its full text; what stays is the three that are still ideas.
+its full text, and the same day's re-check found the condition the third
+had been waiting on already met (`uc_starter` has been public since
+2026-09-24), so it is
+[#153](https://github.com/PeterKnego/ultima_cluster/issues/153); what stays
+is the two that are still ideas.
 
 - **Compressing the node's own journal (idea, unmeasured).** The backup tier
   compresses what it writes off-node (spec
@@ -267,8 +291,6 @@ its full text; what stays is the three that are still ideas.
   browser GUI talks to the nodes directly or a GUI backend polls them, which
   is the shape the read surface already assumes. Taken from the cluster-view
   spec §9.
-
-- **Build `uc_starter` against the in-tree crates in `ci.yml`** (`[patch.crates-io]`), so an SDK break is caught on the PR that makes it — deferred until `uc_starter` is public (a private checkout needs a secret). Spec `docs/superpowers/specs/2026-09-24-uc-starter-design.md` §8. On publication: link it from README.md, docs/QUICKSTART.md §7 and docs/tutorials/build-an-application.md.
 
 ## Accepted residuals — listed so they are not re-proposed
 
