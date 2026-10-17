@@ -57,6 +57,13 @@ jobs:
         run: cargo clippy -p uc_gateway --features test-util --all-targets -- -D warnings
       - name: Clippy (uc_lincheck + replay-bin)
         run: cargo clippy -p uc_lincheck --features replay-bin --all-targets -- -D warnings
+      # `examples/kv` embeds the replay driver with `default-features = false`
+      # (no node linked). Every test target in `uc_diffreplay/tests/` compiles
+      # `tests/common`, which drives a real node, so each carries
+      # `required-features` and this is what keeps the feature-off build
+      # honest (#134).
+      - name: Clippy (uc_diffreplay, no default features)
+        run: cargo clippy -p uc_diffreplay --no-default-features --all-targets -- -D warnings
       # `uc_diffreplay`'s e2e tests and `kv_store`'s `regression_corpora` shell
       # out to these two binaries and hard-assert they exist. Neither is built
       # by `cargo test --workspace`: `register-replay` sits behind
