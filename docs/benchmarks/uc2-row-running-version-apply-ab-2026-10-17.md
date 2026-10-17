@@ -241,3 +241,30 @@ endpoints reuse their §6 binaries), N=1 only, three interleaved reps, same
 host shape and runner. A step is **attributed** when its adjacent-point
 delta's Welch 95 % interval lies wholly below zero; a step whose interval
 spans zero is not attributed, however large its point estimate.
+
+### 6.4 Counter readout across #81's step (method fixed before the run)
+
+#81's step (`19b5788d` → `0d773273`, −3.4 %) is the largest and changes
+`apply_cycle` by 19 bytes, so its cost is in how the same work executes, or
+in work the size does not show. This session reads hardware counters on the
+`uc2-apply` thread alone (`perf stat -t`, a 4 s window inside the measured
+window, after warmup), for the five shuffle seeds of each side, two runs per
+binary, interleaved. Every count is divided by the frames the run applied
+in that window (its reported rate × the window), giving per-frame:
+instructions, cycles, branch misses, and whichever front-end, back-end and
+memory-ordering counters the instance's PMU exposes (the list is recorded
+with the results). The difference of the two sides' means gets a Welch
+95 % interval over the ten runs each.
+
+Readings, decided now:
+
+1. **Instructions per frame differ outside the interval:** the step is
+   more work per frame, and `perf annotate` of one seed per side names
+   the instructions.
+2. **Instructions per frame do not differ, cycles do:** the step is the
+   same work executed worse. The counter whose per-frame difference covers
+   the largest share of the cycle difference is named the leading
+   candidate. It is called the cause only if the annotation shows the hot
+   cycles moving to instructions of that kind.
+3. **Neither reading holds:** the step is recorded as unexplained by the
+   counters this PMU exposes.
