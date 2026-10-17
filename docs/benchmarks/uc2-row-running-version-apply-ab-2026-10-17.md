@@ -408,11 +408,11 @@ this share do not resolve one, so **the mechanism is not identified**: the
 cost is located (#81's step), characterised (no extra work, Ice
 Lake-specific, concentrated in an unchanged read path), and not explained.
 Explaining it needs Ice Lake's own counters (front-end and memory-ordering
-stalls), which need a full-socket instance this account cannot launch.
+stalls), which need a full-socket instance this account cannot launch. Tracked as #149.
 
 **A larger finding than the step.** 61 % of the apply hop's time is the
 CRC-32 that `write_record_at` computes over every response record it
 publishes to the egress ring. `crc32fast` serves inputs this short from its
 table-driven fallback, not its carry-less-multiply path. The CRC has been
 in the ring format since `v2.0.0` (the ring trailer), so it is in every arm
-and none of the regression, but it is most of what the apply hop costs.
+and none of the regression, but it is most of what the apply hop costs. Tracked as #150.
