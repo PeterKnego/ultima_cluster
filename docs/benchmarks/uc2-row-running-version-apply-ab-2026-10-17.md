@@ -187,3 +187,40 @@ several randomised layouts (for example the linker's section shuffle with
 different seeds) and compare the distributions.
 
 Logs: `$HOME/scratch/ab33-fleet2/` on the maintainer's box.
+
+## 6. Layout-randomised re-measurement (method fixed before the run)
+
+Written before any number exists. Rows a–c keep their bars and their FAIL
+verdicts; this section measures what those rows could not separate, the
+source's cost from the layout's luck.
+
+**Arms.** Four sources: `a409b3ae` (base), `a70539a1` (#68 merged),
+`0a9bed82` (`main`), and `main` + fix (`ddf5b470`, the `bench/33-apply-ab`
+head). Each is linked under **ten layouts**: the same object code, with
+`rust-lld`'s `--shuffle-sections='.text*=<seed>'` for seeds 1–10 (a linker
+wrapper adds the flag, so one source's ten binaries differ only in where
+the linker placed each function). All forty binaries are built on one
+machine with the pinned `rustc` 1.96.
+
+**Run.** One c6id.2xlarge, the interleaved runner (every rep runs all forty
+binaries once, in a rotated and alternately reversed order), `--mode bounded
+--secs 6 --warmup-secs 1`, three reps per binary, at N=1 and at N=2. The
+unit is one binary's mean over its three reps; each arm is ten such units.
+
+**Statistic.** For a pair of arms, the delta is the difference of the two
+arms' means of seed-means, as a percentage of the first. Its 95 % interval
+is Welch's, from the between-seed spread (which contains both layout luck
+and run noise, so it is the honest error for a claim about source).
+
+**Readings, decided now:**
+
+1. **#33's cost** is `a70539a1` vs `a409b3ae`. An interval wholly below zero
+   says #33 costs the apply hop; one that spans zero says this rig cannot
+   distinguish its cost from layout, at this sample size.
+2. **What `main` adds** is `main` vs `a70539a1`, read the same way.
+3. **The fix** is `main` + fix vs `main`. It ships only if the interval lies
+   wholly above zero at N=1 and does not lie wholly below zero at N=2.
+   Otherwise it is dropped from 2.14.0 and stays on its branch.
+4. **The layout spread** (each arm's between-seed max − min, and its
+   standard deviation) is reported as the rig's layout sensitivity, the
+   number a future `apply_ab.sh` layout arm would be sized from.
