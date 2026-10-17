@@ -18,7 +18,9 @@ use std::time::Duration;
 use std::time::Instant;
 
 use uc_consensus::config::{Addr, ClusterConfig, ConfigOp};
-use uc_consensus::election::{Action, ElectionConfig, ElectionSm, Event, NodeId, Role};
+use uc_consensus::election::{
+    Action, CommitSource, ElectionConfig, ElectionSm, Event, NodeId, Role,
+};
 use uc_crypto::admin::{AdminMessage, AdminPolicy};
 use uc_crypto::{CryptoConfig, HandshakeAction, Scope, SharedTransport, Transport};
 use uc_log::agent::{AgentRunner, IdleStrategy};
@@ -2238,7 +2240,8 @@ impl Node {
         // Diagnostic only: the consensus thread publishes its commit
         // provenance here each duty cycle so the archive thread's cut trace
         // can name where the commit it is cutting below came from.
-        let trace_prov: Arc<Mutex<(&'static str, u32, u64)>> = Arc::new(Mutex::new(("none", 0, 0)));
+        let trace_prov: Arc<Mutex<(CommitSource, u32, u64)>> =
+            Arc::new(Mutex::new((CommitSource::None, 0, 0)));
         // Term-observation frontier: the archive agent publishes it after
         // handing observations to the consensus agent (see `refresh_durable`).
         // Seeded at the recovered position: at boot the map was recovered (and
@@ -2310,7 +2313,7 @@ impl Node {
                                 trace_id,
                                 archive.recovered_position(),
                                 arc_cnc.counters().commit.load_acquire(),
-                                trace_prov.lock().map(|p| *p).unwrap_or(("lock", 0, 0)),
+                                trace_prov.lock().map(|p| *p).ok(),
                             );
                         }
                         // First-block cuts (a contested first election, `to`
@@ -3792,7 +3795,7 @@ struct Consensus {
     /// Diagnostic (UC2_TRUNC_TRACE): last commit provenance, published for
     /// the archive thread's cut trace. Both fields are inert unless the env
     /// var is set.
-    trace_prov: Arc<Mutex<(&'static str, u32, u64)>>,
+    trace_prov: Arc<Mutex<(CommitSource, u32, u64)>>,
     trunc_trace: bool,
     sm: ElectionSm,
     state: NodeState,
@@ -16105,7 +16108,7 @@ mod tests {
             obs_frontier: Arc::new(AtomicU64::new(u64::MAX)),
             pending_obs: Vec::new(),
             pending_cfg_obs: Vec::new(),
-            trace_prov: Arc::new(Mutex::new(("none", 0, 0))),
+            trace_prov: Arc::new(Mutex::new((CommitSource::None, 0, 0))),
             trunc_trace: false,
             id: 1,
             sm,

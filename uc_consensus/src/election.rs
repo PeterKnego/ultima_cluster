@@ -247,6 +247,38 @@ pub enum Role {
     Leader,
 }
 
+/// How a node's `commit_seen` last moved — the diagnostic provenance behind
+/// [`ElectionSm::commit_provenance`] and the one semantic question asked of
+/// it, [`ElectionSm::commit_learned`]. Three values are the whole set (#131:
+/// an enum, so a fourth cannot appear as a typo and a retired one cannot
+/// linger in a comparison). `Display` renders the lowercase word the
+/// `UC2_TRUNC_TRACE` line and the hunt notes have always used.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitSource {
+    /// This incarnation has not learned a commit position yet.
+    None,
+    /// Our own quorum ranking as leader ([`ElectionSm::rank_leader`]).
+    Rank,
+    /// A leader's gossip position, post-validation
+    /// ([`ElectionSm::advance_gossip_commit`]).
+    Gossip,
+}
+
+impl CommitSource {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            CommitSource::None => "none",
+            CommitSource::Rank => "rank",
+            CommitSource::Gossip => "gossip",
+        }
+    }
+}
+
+impl core::fmt::Display for CommitSource {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
 pub struct ElectionSm {
     id: NodeId,
     /// The adopted `ClusterConfig` (M7). `members`/`can_vote` below are
@@ -361,7 +393,7 @@ pub struct ElectionSm {
     /// Reports declined for a failed content attestation (protocol 0.5.0).
     reports_unattested: u64,
     /// Diagnostic provenance of the last `commit_seen` move (hunt 2026-08-16).
-    commit_source: &'static str,
+    commit_source: CommitSource,
     commit_source_term: u32,
     /// **Validated frontier**: the highest byte position whose CONTENT this
     /// node has confirmed against the current leader's history. A gossiped
@@ -557,7 +589,7 @@ impl ElectionSm {
             validated_up_to: durable,
             unconfirmed_boundary: false,
             reports_unattested: 0,
-            commit_source: "none",
+            commit_source: CommitSource::None,
             commit_source_term: 0,
             wipe_on_no_common_prefix: true,
             stepped_down: false,
@@ -973,16 +1005,18 @@ impl ElectionSm {
     }
 
     /// Diagnostic (2026-08-16 hunt): how this node's `commit_seen` last moved
-    /// — `"rank"` (our own quorum ranking as leader, [`Self::rank_leader`]),
-    /// `"gossip"` (a leader's commit position, post-validation,
-    /// [`Self::advance_gossip_commit`]), or `"none"` (this incarnation has
-    /// not learned one yet). Those THREE are the whole set: a gossip position
-    /// held through validation and released later comes back through
-    /// `advance_gossip_commit` and is labelled `"gossip"` like any other, so
-    /// there is no separate `"replay"` value. Read by the node's
-    /// `UC2_TRUNC_TRACE` output so a cut below commit names its own provenance
-    /// instead of leaving us to guess.
-    pub fn commit_provenance(&self) -> (&'static str, u32, u64) {
+    /// — [`CommitSource::Rank`] (our own quorum ranking as leader,
+    /// [`Self::rank_leader`]), [`CommitSource::Gossip`] (a leader's commit
+    /// position, post-validation, [`Self::advance_gossip_commit`]), or
+    /// [`CommitSource::None`] (this incarnation has not learned one yet).
+    /// Those THREE are the whole set: a gossip position held through
+    /// validation and released later comes back through
+    /// `advance_gossip_commit` and is labelled `Gossip` like any other, so
+    /// there is no separate `Replay` value — and the enum is what makes that
+    /// a compile-time fact rather than a string nobody compares against
+    /// (#131). Read by the node's `UC2_TRUNC_TRACE` output so a cut below
+    /// commit names its own provenance instead of leaving us to guess.
+    pub fn commit_provenance(&self) -> (CommitSource, u32, u64) {
         (
             self.commit_source,
             self.commit_source_term,
@@ -995,12 +1029,13 @@ impl ElectionSm {
     }
 
     /// Plan B3 T5: has this incarnation learned a commit position AT ALL —
-    /// from its own quorum ranking as leader (`"rank"`, [`Self::rank_leader`])
-    /// or from a leader's gossip (`"gossip"`, [`Self::advance_gossip_commit`])?
-    /// Those are the only two values [`Self::commit_provenance`] ever
-    /// reports besides the initial `"none"`; a deferred gossip position
-    /// released by validation comes back through the second of them and is
-    /// labelled `"gossip"` like any other.
+    /// from its own quorum ranking as leader ([`CommitSource::Rank`],
+    /// [`Self::rank_leader`]) or from a leader's gossip
+    /// ([`CommitSource::Gossip`], [`Self::advance_gossip_commit`])? Those
+    /// are the only two values [`Self::commit_provenance`] ever reports
+    /// besides the initial [`CommitSource::None`]; a deferred gossip
+    /// position released by validation comes back through the second of
+    /// them and is labelled `Gossip` like any other.
     ///
     /// A node that has not is still at its boot default of `0`, which is
     /// indistinguishable from "this cluster has committed nothing" — and a
@@ -1009,11 +1044,11 @@ impl ElectionSm {
     /// that reader: `cluster_fsm_position >= commit` says nothing until
     /// `commit` is the cluster's answer rather than this node's default.
     ///
-    /// The provenance string behind it is a diagnostic
+    /// The provenance behind it is a diagnostic
     /// ([`Self::commit_provenance`]); this is the one SEMANTIC question asked
-    /// of it, named so no caller has to compare strings.
+    /// of it, named so no caller has to match on the variant.
     pub fn commit_learned(&self) -> bool {
-        self.commit_source != "none"
+        self.commit_source != CommitSource::None
     }
 
     pub fn current_term(&self) -> u32 {
@@ -1452,7 +1487,7 @@ impl ElectionSm {
         let target = self.deferred_commit.min(self.validated_up_to);
         if target > self.commit_seen {
             self.commit_seen = target;
-            self.commit_source = "gossip";
+            self.commit_source = CommitSource::Gossip;
             out.push(Action::AdvanceCommit { commit: target });
         }
     }
@@ -1920,7 +1955,7 @@ impl ElectionSm {
                 );
             }
             self.commit_seen = c;
-            self.commit_source = "rank";
+            self.commit_source = CommitSource::Rank;
             self.commit_source_term = self.current_term;
             // This advance carries the gossip; reset the idle floor so it does
             // not double-fire right after (spec §6 re-gossip cadence).
