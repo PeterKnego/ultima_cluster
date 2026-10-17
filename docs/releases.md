@@ -132,9 +132,21 @@ every 5 s). Refusal `60 version_already_set` (never returned to `uc2ctl`).
 **Scope.** The safety floor only: rolling application upgrades are
 [#66](https://github.com/PeterKnego/ultima_cluster/issues/66), rolling UC
 upgrades [#31](https://github.com/PeterKnego/ultima_cluster/issues/31).
-**Owed:** a fleet apply-hop A/B of `a409b3ae` (before) against `a70539a1`
-(after); the dev-box smoke read −2.8 % against a 4.2 % rebuild-control
-resolution, which decides nothing.
+**Apply-hop cost: FAIL, bar kept.** The fleet A/B of `a409b3ae` (before)
+against `a70539a1` (after) read −4.5 % at N=1 and −7.1 % at N=2 against a
+bar of "not slower outside resolution". On Ice Lake that instrument cannot
+tell code from layout, so the cost was re-measured with each source linked
+under ten shuffled layouts: **#33 costs 2.5 % at N=1** (95 % interval −4.1 to
+−0.9) and is indistinguishable from zero at N=2. The merges after #33 cost
+a further 4.2 % at both N (#81, #87, #97, and marginally #71), with no extra
+instructions per frame and only on Ice Lake: the same binaries are 2 % faster
+on Zen 5. That mechanism is unidentified
+([#149](https://github.com/PeterKnego/ultima_cluster/issues/149)). A
+cold-call restructure of the `CLUSTER` arm was tried and measured slower, so
+it does not ship. The profile behind it found that 61 % of the apply hop is
+the egress ring's per-record CRC-32, in the ring format since `v2.0.0`
+([#150](https://github.com/PeterKnego/ultima_cluster/issues/150)). Gate doc
+[`uc2-row-running-version-apply-ab-2026-10-17`](benchmarks/uc2-row-running-version-apply-ab-2026-10-17.md).
 
 ### #67 — snapshots are mandatory (#71)
 
@@ -454,7 +466,7 @@ its run:
 | `nightly.yml` on the tag (capstones, sim-heavy, loom, crashtest, quickstart, fuzz, elle) | run on tag `v2.14.0` — the first tag the suite runs on, since the `push: tags` trigger ([#120](https://github.com/PeterKnego/ultima_cluster/issues/120)) | pending — filled at tag time |
 | the local proof stack: `cargo fmt --all -- --check`, every `clippy` line in `ci.yml` **including the MSRV gate**, the fixture builds, `cargo test --workspace`, `pin_verify`, `lin_v2`, `lin_partition_v2`, `lin_backup_tier`, the hard-crash suite, `cargo +nightly fuzz build`, `scripts/check_doc_links.py` | on the release-prep head | pending |
 | the rest of the proof surface (`docs/VERIFICATION.md`): Elle, loom, Lean + conformance, fuzz smoke (26 targets) | the release procedure's own step | pending |
-| fleet apply-hop A/B for #33 (`a409b3ae` vs `a70539a1`, `scripts/apply_ab.sh`) | owed by #68 before the cut; the dev-box smoke (−2.8 % within a 4.2 % resolution) decides nothing | **pending** |
+| fleet apply-hop A/B for #33 (`a409b3ae` vs `a70539a1`, `scripts/apply_ab.sh`), then a layout-randomised re-measurement and bisect | [gate doc](benchmarks/uc2-row-running-version-apply-ab-2026-10-17.md), 2026-10-17, one c6id.2xlarge | **FAIL**, bar kept: #33 −2.5 % at N=1 (within layout noise at N=2); post-#33 merges −4.2 % more, Ice Lake only ([#149](https://github.com/PeterKnego/ultima_cluster/issues/149)) |
 | the M10 alert tier, with the seven new rules | `scripts/m10_alert_fire.sh` | pending on the release-prep head (33 rules passed at #100's head) |
 | artifact integrity (`sha256sum -c`) and provenance (`cosign verify-blob`, `cosign verify`) | `cut-a-release.md` §5 from a clean directory | pending — filled at tag time |
 | release quickstart, from the unpacked tarball | `cut-a-release.md` §5: `packaging/quickstart-local.sh` | pending — filled at tag time |
