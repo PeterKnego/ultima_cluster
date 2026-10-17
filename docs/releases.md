@@ -379,6 +379,21 @@ Defects that shipped in `2.13.0` or earlier:
 - **`uc2ctl backup` copied the 64 MiB segment preallocation file**
   (#42 L44, [#114](https://github.com/PeterKnego/ultima_cluster/pull/114));
   backup and restore now skip `seg-prealloc.*.tmp`.
+- **A node sent itself control reports: an encrypted leader's
+  `seal_failures` climbed forever, and a cleartext leader filed its own
+  `STATUS` as a peer's**
+  ([#122](https://github.com/PeterKnego/ultima_cluster/issues/122),
+  [#85](https://github.com/PeterKnego/ultima_cluster/issues/85)). The node
+  seeds the receiver's leader address with its own socket and lets DATA
+  correct it, so the leader addressed every position report to itself.
+  Under crypto, with no self-session, each one failed to seal and counted
+  — documented as benign since `2.3.0`; in cleartext it went out and came
+  back, and the sender's soft table held the leader's own address, which
+  is the second entry #85's CI-only flake saw. The receiver now recognises
+  its own address and sends nothing, in every mode, counted as
+  `self_sends_skipped`. The leader's own position was never carried by
+  that report (it ranks its in-memory `durable`) and its own holdings
+  enter the soft table directly, so nothing else moves.
 - **Small, from #37** ([#109](https://github.com/PeterKnego/ultima_cluster/pull/109)):
   `uc2ctl` refuses a mistyped `--instance-dir` by name instead of printing
   "no cluster artifact yet" and exiting 0; `tier forget` prints `0x` ids;

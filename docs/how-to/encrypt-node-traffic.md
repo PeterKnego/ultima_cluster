@@ -80,7 +80,7 @@ Judge health by the **followers'** counters, not the leader's.
 | `unknown_peer` | 0. Otherwise a missing allowlist entry or a stale peer set. |
 | `unknown_epoch` | briefly non-zero after a rotation, then self-heals |
 | `cleartext_peer` | 0. Non-zero means a peer is very likely still running cleartext — this is the mixed-cluster diagnostic. |
-| `seal_failures` | **0 on followers.** On the leader it climbs continuously and is benign. |
+| `seal_failures` | **0, on every node.** (Before `2.14.0` it climbed continuously on the leader: its own position reports, addressed to itself, failed to seal. They are skipped now and counted as `self_sends_skipped` instead.) |
 | `hs_failures` | 0. Otherwise an unknown id, bad static key, or revoked peer. |
 
 The leader's `seal_failures` climbing is expected and is not a fault: a node

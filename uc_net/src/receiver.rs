@@ -656,6 +656,14 @@ pub struct FollowerStats {
     /// `SNAP_DONE` costs only the leader's session slot, which times out —
     /// the local artifact is already renamed and installed by then.
     pub seal_failures: AtomicU64,
+    /// #122 / #85: control datagrams addressed to this node's own socket,
+    /// skipped before any seal or send — the leader's (and a
+    /// not-yet-informed follower's) reports to `cfg.leader == self`. Before
+    /// this counter existed each one was a `seal_failures` bump on every
+    /// healthy encrypted leader (blunting that counter's one meaning, a
+    /// peer we cannot seal to), and in cleartext a datagram the node sent
+    /// itself and then filed as a peer's. Diagnostic; nothing alerts on it.
+    pub self_sends_skipped: AtomicU64,
     /// A `SNAP_BEGIN` arrived whose `layout` byte is not
     /// [`SNAP_BEGIN_LAYOUT_V4`] — the named refusal **`peer speaks a
     /// SNAP_BEGIN shape we do not`**. The session is dropped. Two shapes reach
@@ -1087,6 +1095,16 @@ pub struct FollowerReceiver {
     buffer: Arc<LogBuffer>,
     writer: PositionedWriter,
     sock: FaultSocket,
+    /// #122 / #85: this socket's own address, read once at construction.
+    /// The node seeds `cfg.leader` with it ("auto-learns the real leader
+    /// from DATA"), so until DATA arrives — forever, on the leader — every
+    /// control report is addressed here. Under wire crypto there is no
+    /// pairwise session with oneself, so each one failed to seal and
+    /// counted (#122); in cleartext it went out and came back, and the
+    /// sender filed the leader's own `STATUS` in its soft table as if a
+    /// peer had sent it (#85). `seal_and_send` recognises the address and
+    /// sends nothing, in every mode.
+    self_addr: SocketAddr,
     cfg: FollowerConfig,
     status_bytes: u64,
     rebuilt: Rebuilt,
@@ -1459,6 +1477,7 @@ impl FollowerReceiver {
             }) => (Some(half), Some(peer_ids), Some(handshake), Some(transport)),
             None => (None, None, None, None),
         };
+        let self_addr = sock.local_addr().expect("bound socket");
         let start = buffer.counters().append.load_acquire();
         let (snap_nak, snap_seed) = (cfg.nak, cfg.seed);
         let status_bytes = if cfg.status_bytes == 0 {
@@ -1487,6 +1506,7 @@ impl FollowerReceiver {
             last_ap_ns: 0,
             recv_buf: vec![0u8; 65_536],
             stats: Arc::new(FollowerStats::default()),
+            self_addr,
             term,
             route,
             sender_route: None,
@@ -2095,6 +2115,19 @@ impl FollowerReceiver {
     /// self-healing). With crypto off this is a pass-through: the same
     /// `sock.send_to` the pre-M8 code made, on the same bytes.
     fn seal_and_send(&mut self, to: SocketAddr, kind: u8, d: &mut Vec<u8>) -> bool {
+        // #122 / #85: a report to oneself never had a reader — the leader
+        // ranks its own `durable` in memory (`ElectionSm::rank_leader`), and
+        // `Node::soft_table` injects its own holdings itself. Under crypto
+        // it had no session to seal under and counted as a seal failure; in
+        // cleartext it went out and the sender filed the leader's own
+        // `STATUS` under its own address as a peer's (#85's second entry).
+        // Skip it in every mode, counted on its own.
+        if to == self.self_addr {
+            self.stats
+                .self_sends_skipped
+                .fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
         if let Some(transport) = self.crypto_seal.as_ref() {
             let Some(&peer_id) = self.peer_ids.get(&to) else {
                 self.stats.seal_failures.fetch_add(1, Ordering::Relaxed);
@@ -6486,6 +6519,75 @@ mod tests {
                 .join("snap-4096.ultcluster")
                 .exists(),
             "...and its cluster artifact landed where the uc2-cluster agent recovers from"
+        );
+    }
+
+    /// #122: the node seeds `cfg.leader` with the receiver's own address and
+    /// lets DATA correct it — so the leader, which never receives DATA,
+    /// addresses every control report to itself. Under crypto there is no
+    /// self-session: each one used to fail to seal and count, so a healthy
+    /// encrypted leader read `seal_failures` climbing forever. Now it is
+    /// skipped before the seal and counted on its own.
+    #[test]
+    fn a_report_addressed_to_oneself_is_skipped_not_counted_as_a_seal_failure() {
+        use Ordering::Relaxed;
+        let (mut r, _peer, _b, _ids) = receiver_with_crypto_ids(true);
+        let st = r.stats();
+        r.cfg.leader = r.local_addr();
+        // Force a gap so the NAK timer arms, and let the status/AP floors fire.
+        r.leader_append = 4096;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline && st.self_sends_skipped.load(Relaxed) == 0 {
+            r.do_work();
+            std::thread::yield_now();
+        }
+        assert!(
+            st.self_sends_skipped.load(Relaxed) > 0,
+            "a self-addressed control datagram is counted as skipped"
+        );
+        assert_eq!(
+            st.seal_failures.load(Relaxed),
+            0,
+            "...and never as a seal failure"
+        );
+        assert_eq!(st.naks_sent.load(Relaxed), 0, "nothing reached the wire");
+    }
+
+    /// #85: the cleartext twin. The same self-addressed report used to go
+    /// out and come straight back, and the leader's sender filed its own
+    /// `STATUS` in the soft table as a peer's — the second address the
+    /// `soft_holdings` test saw on CI. Now nothing is sent: the receiver's
+    /// own socket sees no datagram from itself.
+    #[test]
+    fn a_cleartext_report_addressed_to_oneself_is_not_sent_at_all() {
+        use Ordering::Relaxed;
+        let b = buffer();
+        let leader = FakeLeader::new();
+        let mut r = follower(&b, leader.addr());
+        let st = r.stats();
+        r.cfg.leader = r.local_addr();
+        r.leader_append = 4096;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline && st.self_sends_skipped.load(Relaxed) == 0 {
+            r.do_work();
+            std::thread::yield_now();
+        }
+        assert!(
+            st.self_sends_skipped.load(Relaxed) > 0,
+            "a cleartext self-addressed control datagram is counted as skipped"
+        );
+        assert_eq!(st.naks_sent.load(Relaxed), 0, "nothing reached the wire");
+        assert_eq!(
+            st.statuses_sent.load(Relaxed),
+            0,
+            "no STATUS to oneself either"
+        );
+        // And the socket never heard from itself (`FaultSocket::recv_from`
+        // is non-blocking: `Ok(None)` is an empty socket).
+        let mut buf = [0u8; 64];
+        assert!(
+            matches!(r.sock.recv_from(&mut buf), Ok(None)),
+            "no datagram arrived at the receiver's own socket"
         );
     }
 
