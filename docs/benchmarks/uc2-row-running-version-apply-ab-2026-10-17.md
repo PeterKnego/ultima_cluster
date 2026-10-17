@@ -49,3 +49,50 @@ its own worktree and private target dir (`apply_ab.sh` does this).
 
 Dev box, 2026-09-28 (PR #68): −2.8 % head vs base against a 4.2 %
 rebuild-control resolution. Decides nothing.
+
+## 4. Results
+
+**Run 2026-10-17, 10:05–10:18 UTC, one `c6id.2xlarge`** (Intel Xeon Platinum
+8375C, 8 vCPU, kernel 7.0.0-1014-aws), us-east-1, provisioned for this run
+alone and destroyed after it: terraform state empty and an EC2
+`describe_instances` showing no live instance before the apply and after the
+destroy. The tree arrived as a git bundle of this branch at `a10334ae` (the
+bar commit). `--selftest` passed first. Both N ran with `--reuse-targets`, so
+N=2 reused N=1's three arm builds; that changes nothing measured.
+`min_rate` applied frames/s, 12 runs per arm:
+
+| N | A `a409b3ae` | B `a70539a1` | B′ head again | head vs base | resolution | worst sem | signal bar | verdict |
+|---|---:|---:|---:|---:|---:|---:|---:|---|
+| 1 | 15,201,992 | 14,512,841 | 14,536,213 | **−4.533 %** | 0.161 % | 0.167 % | 0.333 % | `outside resolution` |
+| 2 | 15,123,163 | 14,053,522 | 14,057,853 | **−7.073 %** | 0.031 % | 0.573 % | 1.147 % | `outside resolution` |
+
+`pace_stalls` summed to 3.6–3.8 × 10⁹ on every arm, so neither run is
+driver-bound and both verdicts stand. Load average was 2.2 during both runs:
+that is `apply_bench`'s own busy threads, and no other cargo or rustc process
+ran.
+
+### Verdict
+
+| row | measured | bar | verdict |
+|---|---|---|---|
+| a, N=1 | −4.53 %, outside a 0.333 % signal bar | not `outside resolution` with a negative delta | **FAIL** |
+| a, N=2 | −7.07 %, outside a 1.147 % signal bar | same | **FAIL** |
+
+The bar is missed at both N and is kept. #33 costs the apply hop 4.5 % at one
+FSM and 7.1 % at two on this rig. The dev-box smoke's −2.8 % (§3) was the
+same sign, inside a 4.2 % resolution that could not see it.
+
+### First look at the cause (not a diagnosis)
+
+`apply_cycle` is slightly smaller at head (0x537a bytes against 0x5408 at
+base, in the binaries `apply_ab.sh` kept). `version_gate::on_cluster_frame`
+is a separate out-of-line function, and `stop_at_record` is a new call site
+in the loop. A normalised diff of the loop's direct call targets shows no new
+per-frame callee, but the count of GOT-indirect calls moves from 101 to 103,
+and those have not yet been resolved with `readelf -rW`. Where the cost
+comes from is open. The method is CLAUDE.md's 2.11.0 apply-hop lesson: compare
+the per-frame path's call list and layout arm against arm, and A/B a fix
+candidate on the same rig.
+
+Raw logs, `runs.tsv` and the three binaries for each N are kept off-tree at
+`$HOME/scratch/ab33-fleet/` on the maintainer's box.
