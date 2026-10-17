@@ -4414,26 +4414,32 @@ struct Consensus {
     /// densely — declared sets are sparse (`{0, 3}` is legal).
     service_last_epoch: [u64; CNC_MAX_SERVICES],
     service_was_live: [bool; CNC_MAX_SERVICES],
-    /// #133: the pass clock (`last_wall_ns`) at which id `i`'s newest epoch
-    /// was first SEEN. `uc_service::attach` sets the ATTACHED bit and bumps
-    /// the epoch; the heartbeat word is stamped later, by the apply loop's
-    /// first pass, so for a cycle or more after the attach edge it still
-    /// reads `0` — three seconds "stale" by the bare subtraction, and the
-    /// very next cycle emitted `service_detached` for a service that never
-    /// left. A zero heartbeat is judged from this instant instead: fresh
-    /// until `SERVICE_STALE_NS` after the node saw the attach, stale after
-    /// (a service that attaches and never stamps IS gone, and is reported
-    /// on the same 3 s bar a stalled stamp would be).
+    /// #133: the node's wall estimate (`last_wall_ns`) at which id `i`'s newest
+    /// epoch was first SEEN. `uc_service::attach` sets the ATTACHED bit and
+    /// bumps the epoch; the heartbeat word is stamped later, by the apply
+    /// loop's first pass, so for a cycle or more after the attach edge it still
+    /// reads `0` — three seconds "stale" by the bare subtraction, and the very
+    /// next cycle emitted `service_detached` for a service that never left. A
+    /// zero heartbeat is judged from this instant instead: fresh until
+    /// `SERVICE_STALE_NS` after the node saw the attach, stale after (a service
+    /// that attaches and never stamps IS gone, and is reported on the same 3 s
+    /// bar a stalled stamp would be).
     service_attach_seen_ns: [u64; CNC_MAX_SERVICES],
-    /// M14c: the wall-clock ns `publish_status` last stamped into
-    /// `node_heartbeat_ns`, reused by `note_service_transitions` so the
-    /// transition check costs no second clock read per duty cycle. Since the
-    /// final-review M5 fix this is [`Consensus::pass_now_ns`], the pass's one
-    /// reading, so `publish_status` reads no clock of its own. One cycle
-    /// stale for `note_service_transitions` (which runs before the pass's
-    /// read), which is immaterial against a 3 s bar; `0` until the first
-    /// `publish_status`, which reads as "everything fresh" and therefore can
-    /// never emit a spurious detach at boot.
+    /// M14c: the wall-clock ns `publish_status` last derived, reused by
+    /// `note_service_transitions` so the transition check costs no second
+    /// clock read per duty cycle. Since the final-review M5 fix this comes
+    /// from [`Consensus::pass_now_ns`], the pass's one reading, so
+    /// `publish_status` reads no clock of its own — and since #135 it is
+    /// that reading LESS the log clock's remaining smear
+    /// ([`Consensus::heartbeat_now_ns`]): a service stamps its heartbeat
+    /// from the real wall clock, while `pass_now_ns` is the smeared log
+    /// clock, which runs AHEAD of the wall by the remaining smear for as
+    /// long as a backward step takes to retire at 500 ppm (a 3 s step: ~100
+    /// minutes). Compared raw, every fresh heartbeat read stale for that
+    /// whole time. One cycle stale for `note_service_transitions` (which
+    /// runs before the pass's read), which is immaterial against a 3 s bar;
+    /// `0` until the first `publish_status`, which reads as "everything
+    /// fresh" and therefore can never emit a spurious detach at boot.
     last_wall_ns: u64,
     /// M12b: how this node authenticates admin requests off the cnc admin
     /// band — `Filesystem` (the default: the instance dir's permissions are
@@ -4787,6 +4793,18 @@ impl Consensus {
     #[inline(always)]
     fn pass_clock(&mut self, mono_ns: u64) -> u64 {
         self.clock.wall_at(mono_ns)
+    }
+
+    /// #135: this pass's estimate of the REAL wall clock, for comparing
+    /// against a heartbeat a service stamped with `SystemTime::now()`.
+    /// `pass_now_ns` is the log clock, which during a backward wall step is
+    /// deliberately ahead of the wall by the remaining smear (spec
+    /// 2026-09-08 §5.3); subtracting it recovers the wall without a second
+    /// clock read. Zero cost when no smear is in flight: the subtraction
+    /// is of a `0`.
+    fn heartbeat_now_ns(&self) -> u64 {
+        self.pass_now_ns
+            .saturating_sub(self.clock.remaining_smear_ns(self.pass_mono_ns))
     }
 
     /// Test build: honour `test_now_ns` when the test has placed the pass at a
@@ -7076,11 +7094,13 @@ impl Consensus {
         // rather than reading any clock here.
         let now_ns = self.pass_now_ns;
         status.node_heartbeat_ns.store_release(now_ns);
-        self.last_wall_ns = now_ns;
         // Spec 2026-09-08 §7: the smear gauge and the step event. Both are
         // off the hot top of the pass — this runs once per pass in step 6,
         // beside the other status stores — and the event body is out of line.
         let smear = self.clock.remaining_smear_ns(self.pass_mono_ns);
+        // #135: the heartbeat comparand is the WALL estimate, not the smeared
+        // log clock — see `last_wall_ns` and `heartbeat_now_ns`.
+        self.last_wall_ns = now_ns.saturating_sub(smear);
         if smear != 0 || self.log_clock_smear_pub.load(Ordering::Relaxed) != 0 {
             self.log_clock_smear_pub.store(smear, Ordering::Relaxed);
         }
@@ -9298,8 +9318,9 @@ impl Consensus {
         if self.last_cluster_append > view_position {
             return false; // single-in-flight: a CLUSTER command is above commit
         }
-        // This pass's one wall reading — the clock service heartbeats use.
-        let now = self.pass_now_ns;
+        // This pass's one wall reading, less the log clock's smear (#135) —
+        // the clock service heartbeats use.
+        let now = self.heartbeat_now_ns();
         for row in 0..CNC_MAX_SERVICES as u8 {
             if missing & (1 << row) == 0 {
                 continue;
@@ -23688,6 +23709,66 @@ mod tests {
         h.cons.do_work(); // step 6 of the pass republishes
         let g2 = h.cons.log_clock_smear_pub.load(Ordering::Relaxed);
         assert!(g2 < g1, "gauge counts down: {g1} -> {g2}");
+    }
+
+    /// #135: a service stamps its heartbeat from the real wall clock; the
+    /// pass clock is the smeared log clock, AHEAD of the wall by the
+    /// remaining smear while a backward step retires at 500 ppm. Compared
+    /// raw, a 4 s step made every fresh heartbeat read 4 s stale — past the
+    /// 3 s bar — for the ~2.2 h the smear took to retire, so row genesis
+    /// waited that long and `note_service_transitions` reported the service
+    /// detached. Both readers now compare against the wall estimate (the
+    /// pass clock less the smear) and a heartbeat stamped 100 ms ago reads
+    /// 100 ms old.
+    #[test]
+    fn a_fresh_heartbeat_stays_fresh_while_the_log_clock_smears_a_backward_step() {
+        let mut h = harness_with_rows(&["a"]);
+        drive_to_serving_leader(&mut h);
+        h.cons.do_work();
+        let m = h.cons.pass_mono_ns;
+        let before = h.cons.clock.wall_at(m);
+        // The wall steps back 4 s: the log clock holds at `before` and
+        // smears; the REAL wall, which the service stamps from, is now 4 s
+        // behind it.
+        let step = 4_000_000_000u64;
+        h.cons.clock.inject_sample(m, (m, before - step, 100));
+        h.cons.pass_now_ns = before; // what the pass's own read now derives
+        let smear = h.cons.clock.remaining_smear_ns(m);
+        assert!(
+            smear > crate::services::SERVICE_STALE_NS,
+            "the step outlasts the staleness bar: {smear}"
+        );
+        assert_eq!(h.cons.heartbeat_now_ns(), before - smear);
+
+        // A service that stamped 100 ms ago, on the real wall.
+        let hb = before - step + 100_000_000;
+        let cnc = h.cons.cnc.clone();
+        let slot = cnc.service_slot(0);
+        slot.status.store_version(pack_version(2, 0, 0));
+        slot.status
+            .store_release(uc_log::cnc::pack_service_status(0, true, 1));
+        slot.heartbeat_ns.store_release(hb);
+        // Raw against the log clock it is 3.9 s old — stale; against the
+        // wall estimate it is 0.1 s old — live, so genesis is appended.
+        assert!(
+            h.cons.pass_now_ns.saturating_sub(hb) >= crate::services::SERVICE_STALE_NS,
+            "the raw comparison is the bug being fixed"
+        );
+        assert!(
+            h.cons.maybe_append_row_genesis(),
+            "a 100 ms-old heartbeat is live during a 4 s smear"
+        );
+
+        // And the transition reader's comparand follows the same estimate.
+        h.cons.publish_status();
+        assert_eq!(
+            h.cons.last_wall_ns,
+            h.cons
+                .pass_now_ns
+                .saturating_sub(h.cons.clock.remaining_smear_ns(h.cons.pass_mono_ns)),
+            "last_wall_ns is the wall estimate, not the smeared log clock"
+        );
+        assert!(h.cons.last_wall_ns.saturating_sub(hb) < crate::services::SERVICE_STALE_NS);
     }
 
     /// The test seam overrides the WALL value only; the Tick still gets a
