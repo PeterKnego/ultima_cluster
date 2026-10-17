@@ -700,25 +700,65 @@ mod writer_e2e {
     }
 
     /// Submit `n` frames to whichever running node serves, following
-    /// leadership while it settles, and wait for them to commit; returns the
-    /// node that took the last of them.
+    /// leadership while it settles, and wait until the node that took the
+    /// last of them has APPLIED every frame it took; returns that node.
+    ///
+    /// #155: `Node::submit` only queues a payload for the consensus agent, so
+    /// the leader's `append` read right after submitting can sit below frames
+    /// it has accepted and not yet appended. Waiting for commit to reach that
+    /// sample returned early, and a total read next was stale (by a whole
+    /// 500-frame batch on CI). No position target is exact here (padding and
+    /// cluster frames share the log), but `SumSm`'s total is: it is the
+    /// leader's total when this node started taking frames plus every tag it
+    /// accepted, and frames still in flight from an earlier leader are inside
+    /// that starting total, since a linearizable read commits them first.
     fn submit_following(c: &Cluster, n: u64) -> usize {
         let deadline = Instant::now() + Duration::from_secs(60);
         let mut left = n;
-        let mut at = 0;
+        let mut at: Option<usize> = None;
+        let mut expected = 0u64;
         while left > 0 {
             assert!(Instant::now() < deadline, "no leader took the writes");
             let Some(i) = c.running().into_iter().find(|&i| c.node(i).can_serve()) else {
                 std::thread::yield_now();
                 continue;
             };
-            at = i;
-            left -= submit_some(c.node(i), left, 3_000_000 + left);
+            if at != Some(i) {
+                at = Some(i);
+                expected = query_total(c, i);
+            }
+            let tag = 3_000_000 + left;
+            let took = submit_some(c.node(i), left, tag);
+            for k in 0..took {
+                expected = expected.wrapping_add(tag + k);
+            }
+            left -= took;
         }
-        let target = c.node(at).counters().append.load_acquire();
-        await_until(60, "submitted frames committed", || {
-            c.node(at).counters().commit.load_acquire() >= target
-        });
+        let at = at.expect("n > 0 frames were submitted");
+        let last_total = std::cell::Cell::new(0u64);
+        await_until_diag(
+            60,
+            "the leader applied every frame it took",
+            || {
+                // A linearizable read is leader-only, and the state is the
+                // cluster's: if an election lands meanwhile, ask whoever
+                // serves now rather than the deposed node.
+                let Some(i) = c.running().into_iter().find(|&i| c.node(i).can_serve()) else {
+                    return false;
+                };
+                last_total.set(query_total(c, i));
+                last_total.get() == expected
+            },
+            || {
+                let k = c.node(at).counters();
+                format!(
+                    "\n  node {at}: total {} expected {expected}; commit {} append {}",
+                    last_total.get(),
+                    k.commit.load_acquire(),
+                    k.append.load_acquire(),
+                )
+            },
+        );
         at
     }
 
