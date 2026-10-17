@@ -7715,7 +7715,20 @@ mod tests {
         // at which point a SECOND failing attempt is correct behaviour, not a
         // regression. So the exact-count assertion is gated on having actually
         // stayed inside the interval, with margin.
-        let burst_start = Instant::now();
+        //
+        // #118: the interval is measured by the receiver, from the instant the
+        // rename FAILED (`last_publish_try_ns`, stamped inside `do_work`) on
+        // its own clock (`now_ns`). A guard timed from here with `Instant`
+        // has a different origin: everything between the failed attempt and
+        // this line — the rest of that `do_work` pass, the loop's re-check —
+        // is interval time the guard never saw, so on a loaded runner a second
+        // attempt could land with the burst still reading under 200 ms. Read
+        // the stamp and judge the burst on the receiver's clock instead.
+        let first_failure_ns = r
+            .snap_intake
+            .as_ref()
+            .and_then(|i| i.last_publish_try_ns)
+            .expect("the counted failure stamped last_publish_try_ns");
         for k in 0..9u64 {
             leader.send(to, DGRAM_KIND_SNAP_CHUNK, 64 + k * 64, TERM, &[0xB1u8; 64]);
         }
@@ -7731,7 +7744,9 @@ mod tests {
             );
             r.do_work();
         }
-        let burst_elapsed = burst_start.elapsed();
+        // `now_ns()` here is LATER than every chunk's acceptance, so a reading
+        // under the margin proves every chunk was judged inside the interval.
+        let burst_elapsed = Duration::from_nanos(r.now_ns().saturating_sub(first_failure_ns));
         if burst_elapsed < Duration::from_millis(200) {
             assert_eq!(
                 st.snap_intake_io_failures.load(Relaxed),
@@ -7740,9 +7755,9 @@ mod tests {
             );
         } else {
             eprintln!(
-                "a_blocked_publish_does_not_re_fail_on_every_incoming_chunk: burst took {burst_elapsed:?} \
-                 (>= 200 ms of the {} ms interval) on a loaded runner — skipping the exact in-interval count; \
-                 the one-per-interval check below still runs",
+                "a_blocked_publish_does_not_re_fail_on_every_incoming_chunk: {burst_elapsed:?} elapsed \
+                 since the failed attempt (>= 200 ms of the {} ms interval) on a loaded runner — skipping \
+                 the exact in-interval count; the one-per-interval check below still runs",
                 SNAP_REDRIVE_INTERVAL_NS / 1_000_000
             );
         }
