@@ -268,3 +268,24 @@ Readings, decided now:
    cycles moving to instructions of that kind.
 3. **Neither reading holds:** the step is recorded as unexplained by the
    counters this PMU exposes.
+
+**Amendment (before any §6.4 number exists).** The c6id.2xlarge exposes no
+hardware PMU (`dmesg`: "unsupported CPU family 6 model 106 no PMU driver,
+software events only"); AWS passes the counters through only on
+full-socket sizes, which for this CPU exceed the bench account's vCPU
+quota. So §6.4 cannot run as written, and two substitutes replace it:
+
+- **Reading 1 (more work?) on the dev box.** Instructions and branches
+  retired per applied frame, from the AMD PMU on the `uc2-apply` thread,
+  same ten binaries, same window, same statistic. Instruction count is a
+  property of the binary and the path taken, not of the core, so it
+  transfers to the Intel host (glibc's CPU-dispatched routines aside, which
+  the apply loop does not call per frame). Cycles there do not transfer and
+  are not read.
+- **Where the time goes, on the Intel host.** A `cpu-clock` timer-sampled
+  profile (a software event) of the `uc2-apply` thread, three seeds per
+  side, 4 s each, attributed by instruction inside `apply_cycle`. A step is
+  explained only if the samples move to a specific instruction group (a
+  load, a store forward, a branch, a spill reload) on the slow side. Timer
+  samples skid, so a group is read as a cluster of adjacent instructions,
+  never a single one.
