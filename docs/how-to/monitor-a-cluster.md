@@ -98,7 +98,7 @@ joiner not converging?", and they split it cleanly between the two ends:
 | `uc2_snapshot_refused_legacy_peer_total` | joiner | every such datagram, not every session — the leader re-sends a `SNAP_BEGIN` every 20 ms, so this one measures the resend cadence. Read the row above it for "how many sessions". |
 
 One more mixed-version witness, outside the snapshot session:
-`uc2_status_refused_total` (the snapshot catalog, `0.11.0`, unreleased)
+`uc2_status_refused_total` (the snapshot catalog, `0.11.0`, since `2.14.0`)
 counts `STATUS` datagrams a leader could not read — in practice a
 wire-`0.10.0` follower's 16-byte body under a `0.11.0` leader. They are
 dropped, so that follower's flow-control window never opens and replication

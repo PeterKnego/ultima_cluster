@@ -1,7 +1,7 @@
 # Jumbo frames and path-MTU discovery, explained
 
-*Written 2026-09-12 for the jumbo-frame work (plans 1 and 2), which ships in
-`2.12.0` — unreleased as this is written. Spec:
+*Written 2026-09-12 for the jumbo-frame work (plans 1 and 2), which shipped in
+`2.12.0`. Spec:
 `docs/superpowers/specs/2026-09-10-uc2-jumbo-frame-discovery-design.md`; read
 its two "Errata … as built" sections alongside the body, because several of
 the behaviours below are errata rather than spec text. This note carries the

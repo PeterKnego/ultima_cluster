@@ -1,6 +1,6 @@
 # Read-your-writes reads, explained
 
-**Status:** unreleased, lands with the next cut. Spec:
+**Status:** shipped in `2.14.0`. Spec:
 [`2026-10-08-uc2-read-your-writes-design.md`](../superpowers/specs/2026-10-08-uc2-read-your-writes-design.md)
 (read its Errata and As built blocks first).
 

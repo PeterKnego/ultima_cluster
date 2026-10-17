@@ -19,7 +19,7 @@ Every frame starts with a fixed 24-byte header:
 | 0 | u32 | `len` | total frame length in bytes, header included (`HEADER_LEN + payload.len()`) |
 | 4 | u8 | `type` | frame type, see below |
 | 5 | u8 | `flags` | bitmask, see below |
-| 6 | u16 | `version` | protocol version; currently `2` (`PROTOCOL_VERSION`; v2 adds `FLAG_MIN_POSITION`, unreleased until the next cut) |
+| 6 | u16 | `version` | protocol version; currently `2` (`PROTOCOL_VERSION`; v2 adds `FLAG_MIN_POSITION`, since `2.14.0`) |
 | 8 | u64 | `client_id` | the client's self-asserted, stable identity |
 | 16 | u64 | `seq` | per-client monotonic sequence number |
 

@@ -1,8 +1,6 @@
 # ultima_cluster releases
 
-## v2.14.0 — <tag date> — snapshot sets the cluster agrees on, an off-node backup tier, and read-your-writes reads
-
-<!-- tag date: fill at tag time (and RELEASES.md's "Full record" link, whose anchor carries this heading) -->
+## v2.14.0 — 2026-10-17 — snapshot sets the cluster agrees on, an off-node backup tier, and read-your-writes reads
 
 **One flag day: wire `0.9.0` → `0.11.0` (through `0.10.0`, which was never
 released), cnc `3.3` → `3.4`, and the client↔gateway remote protocol v1 → v2.**

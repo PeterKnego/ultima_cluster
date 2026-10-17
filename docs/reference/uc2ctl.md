@@ -28,7 +28,7 @@ directly and **refuses if a node is running**; `gen-admin-key` and `audit`
 even works against an instance directory that has never had a node in it
 yet, and `gen-admin-key` doesn't take `--instance-dir` at all, only a
 destination path. The backup tier's `tier show`, `tier verify`, `tier
-restore`, `tier fork` and `tier export-corpus` (`0.11.0`, unreleased) read a
+restore`, `tier fork` and `tier export-corpus` (`0.11.0`, since `2.14.0`) read a
 tier's files directly and never a node's admin band; `tier restore` and `tier
 fork` refuse an instance directory a running node holds. None of these accept `--app-id` in the same sense as the
 admin-band commands — most don't take it at all (there is nothing on disk to
@@ -299,13 +299,13 @@ position=8192 admission_bytes=262144 fsm_lag=16MiB snapshot_interval_bytes=0 sna
 
 `fsm_lag` renders as `default` (the record's `0`), `lockstep`, a whole-MiB
 count, or a raw byte count when it is neither. `auto_fetch` (bool, absent = `true`) is whether every node fetches the newest agreed set in the background. `retain_sets` (`0.11.0`, the
-snapshot catalog, unreleased) is how many agreed snapshot sets the cluster
+snapshot catalog, since `2.14.0`) is how many agreed snapshot sets the cluster
 keeps, with the journal from the oldest of them, so each is a start point;
 `1` is the default and matches today's newest-only retention.
 `backup_retain_sets` and `backup_retain_age_secs` (backup tier, `0.11.0`,
-unreleased) bound how long a backup tier keeps its sets (`0` = no rule); the
+since `2.14.0`) bound how long a backup tier keeps its sets (`0` = no rule); the
 file spells the age as `backup_retain_age = "30d"`.
-`purge_requires_tiers` (backup tier 3b, unreleased) is K, the number of
+`purge_requires_tiers` (backup tier 3b, since `2.14.0`) is K, the number of
 backup tiers whose confirmed `through` every node's purge waits for (`0` =
 off, the default; `1..=4`); `settings show` prints it before `datagram_mtu`.
 See [Back up to a tier § Backup-gated purge](../how-to/back-up-to-a-tier.md#backup-gated-purge).
@@ -437,7 +437,7 @@ such position exists, including "nothing has ever snapshotted". A row whose
 pointing at.
 
 This is the **node-local, on-disk** reading — a file listing, nothing more.
-Since `0.11.0` (the snapshot catalog, unreleased) this is NOT the same thing
+Since `0.11.0` (the snapshot catalog, `2.14.0`) this is NOT the same thing
 as the purge floor: the cluster's own view is the replicated catalog, whose
 sets are tagged AGREED or not (every row's reported hash matches) and whose
 newest agreed position is the floor every node is bounded by. `set=<P>` can
@@ -754,7 +754,7 @@ Output fields:
 `backup`, `verify-backup`, `restore` (M11 Task 2), `force-single-member`
 (M11 Task 4), `gen-admin-key`/`audit` (M12b, `v2.6.0`), and the backup tier's
 `tier show`/`tier verify`/`tier restore`/`tier fork`/`tier export-corpus`
-(`0.11.0`, unreleased). See
+(`0.11.0`, since `2.14.0`). See
 [the offline-vs-admin-band distinction](#admin-band-commands-vs-offline-commands)
 above. Task walkthroughs: [Back up a cluster](../how-to/back-up-a-cluster.md),
 [Recover from quorum loss](../how-to/recover-from-quorum-loss.md),
