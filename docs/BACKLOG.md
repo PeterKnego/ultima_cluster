@@ -6,8 +6,9 @@ document that first recorded it, so the reasoning can be re-checked rather
 than re-derived. When an item is taken up it gets a spec under
 `docs/superpowers/specs/` and a gate doc under `docs/benchmarks/`, and its
 line here is updated to point at them. An item that ships, or stops
-being relevant, is removed (last purge 2026-10-15): `RELEASES.md`,
-`docs/releases.md` and git keep the record.*
+being relevant, is removed (last purge 2026-10-17): `RELEASES.md`,
+`docs/releases.md` and git keep the record. A finding with a file and a
+fix shape is a GitHub issue, not a small item here.*
 
 ## Where this list comes from
 
@@ -239,54 +240,14 @@ reviewer wants a workload to attack.
 
 ## Small items, worth doing regardless of direction
 
-- **Release-mode bounds guard in `read_frame_validated`**
-  (`uc_log/src/buffer.rs`): the check ahead of the `unsafe` slice read is
-  `debug_assert!` only. Deferred in the M8 release notes as pre-existing
-  code (`docs/releases.md`, v2.3.0 "Deferred / follow-up"). The code's own
-  safety analysis says it is reachable only via a corrupted commit word or a
-  mid-frame position, so this is hygiene, not a live defect — and a one-line
-  check.
-- **`nightly.yml` has never run on the `v2.10.0` tag commit**
-  (`docs/releases.md`, release-evidence table).
-- **Snapshot-session probe counters are sender-local** — `snap_redirects`
-  and `snap_request_unknown_peer` (the member gate on `SNAP_REQUEST`, plan 2)
-  live in `SenderStats` with no `/metrics` family, `Node::` accessor or obs
-  record, so an operator cannot see a peer probing for sets. One gauge each,
-  read at scrape; found by plan 2's final re-review.
-- **Leader self-send `seal_failures` wart** — the encrypted leader's
-  self-addressed position report fails to seal and counts; harmless,
-  suppression deferred since M8 (`docs/releases.md`, v2.3.0).
-- **Minter-local epoch collision** after leader change — transient DATA
-  loss, NAK-repaired, "a nice-to-have, not a safety break"
-  (`docs/notes/uc2-m8-formal-methods-followups.md`).
-- **Alert on `uc2_log_clock_smear_ns`** (a smear above N seconds for M
-  minutes), with its `scripts/m10_alert_fire.sh` builder and scenario —
-  recorded 2026-09-08 by the log-clock spec's errata bullet 9.
-- **Auto-fetch can re-download an agreed set that is never noted held.** An
-  operator `uc2ctl snapshot fetch` with no position can store a newer,
-  not-yet-agreed set; a later auto-fetch of the newest agreed set below it
-  then lands without moving `stored_set_pos` (`fetch_max`), times out after
-  60 s and retries on the backoff ladder. It stops once the newer set agrees
-  (normally within ~5 s) and persists only if that set diverged, which
-  `Uc2SnapshotSetDiverged` already alerts. Snapshot lifecycle final review
-  M3, 2026-10-10 (the Task 9 ledger had called it unreachable).
-- **Project 3: the backup tier — one edge left open.** 3a and 3b are merged
-  (PRs #100 and #107, not yet released;
-  [how-to](how-to/back-up-to-a-tier.md),
-  [3a spec](superpowers/specs/2026-10-10-uc2-backup-tier-design.md),
-  [3b spec](superpowers/specs/2026-10-12-uc2-backup-tier-3b-design.md)).
-  - **3b: retention's view gate, the origin-set edge** (ruling R10a, deferred
-    by the 3a final review, 2026-10-11). Retention runs only once the
-    writer's view has consumed past the tier's newest complete set, on the
-    reasoning that a pin whose rollback set is in the tier has its record
-    below that set. A pin whose record lies ABOVE the newest tier set is not
-    covered by that argument: in the narrow window before the view applies
-    the record, a pass does not see the pin. Today that pin can protect only
-    the newest set, which is never deleted; the edge is a set that lands in
-    the tier inside that window. Narrow and unobserved — settle it (gate on a
-    later position, or show the window empty) before nodes delete on the
-    tier's word. **Still open:** 3b shipped with this edge unsettled: nodes
-    now hold purge on the tier's word; the window remains narrow and unobserved.
+*A finding with a file, a mechanism and a fix shape is a GitHub issue, not a
+line here (`docs/agents/issue-tracker.md`): this section is for ideas whose
+open questions come before any code. On 2026-10-17 the seventeen specified
+items it had accumulated moved to issues
+[#119](https://github.com/PeterKnego/ultima_cluster/issues/119) through
+[#135](https://github.com/PeterKnego/ultima_cluster/issues/135), each with
+its full text; what stays is the three that are still ideas.*
+
 - **Compressing the node's own journal (idea, unmeasured).** The backup tier
   compresses what it writes off-node (spec
   `superpowers/specs/2026-10-10-uc2-backup-tier-design.md` D11); the node's
@@ -295,15 +256,7 @@ reviewer wants a workload to attack.
   measure the archive hop alone with and without per-block zstd before
   deciding — it would also change the on-disk block format (a flag day).
   Recorded 2026-10-10.
-- **`auto_fetch_candidates` pairs a catalog with a separately-read version.**
-  `uc_node/src/node.rs`'s `auto_fetch_candidates` takes the catalog from the
-  `ClusterViewInner` it is handed but loads `ClusterView::catalog_version`
-  from its own atomic, which `ClusterView::publish` stores after the catalog.
-  A read between the two pairs holders' `sets_held` bit indices with the
-  wrong set list — the same two-read race the cluster view fixed by deriving
-  the version from the catalog it renders. Candidate fix:
-  `catalog_version_of(&inner.catalog)`. Found in the cluster-view final
-  review, 2026-10-15; not reproduced.
+
 - **Admin writes over HTTP (for a GUI).** The cluster view is read-only; a GUI
   that also changes the cluster needs a write path that does not exist.
   Open questions: how a remote request is authenticated (the admin band's
@@ -314,115 +267,8 @@ reviewer wants a workload to attack.
   browser GUI talks to the nodes directly or a GUI backend polls them, which
   is the shape the read surface already assumes. Taken from the cluster-view
   spec §9.
-- **The `uc_service::apply` replay forward-progress guard has no counter.**
-  Plan B3 T5 added a guard that hands the cycle back when a replay pass
-  fails to advance the cursor (it used to spin forever, which also hung
-  `Service::stop`'s join). Since the plan's final review that episode is no
-  longer silent — it re-enters the replay with the gap forced, so the row
-  either installs a covering artifact or fail-stops by name — but the
-  episode itself is still reported only by an `eprintln!`: no metric family,
-  no obs record, because `uc_service` has no `uc_obs` dependency and no
-  status word for it. A row that waits there legitimately (its covering
-  artifact is above the apply target) is visible only in the service's own
-  stderr. Recorded 2026-09-21.
-- **Widen `replay_into`'s gap test.**
-  `uc_service/src/replay.rs`'s gap guard is `first > start_pos` with `first
-  = reader.first_meta().unwrap_or(0)`, which cannot detect the shape a
-  below-floor joiner presents: cursor 0, a stale journal segment based at 0
-  (so `first = 0`), and a live buffer base above it. The plan B3 final review
-  (F1) routed around it — a replay pass that cannot advance re-enters with
-  the gap forced — but the root cause is that `first` is read from the
-  journal's own first block rather than from something that knows the
-  frontier (the log buffer's base, or the node's archive floor). Note what
-  the detour rests on: with the TRUE `first`, the covering-artifact test
-  `s_pos >= first` proves the artifact meets the journal's retained tail;
-  with the forced (synthetic) `first` it proves only "above the cursor", so
-  no-hole-between-artifact-and-tail is currently an ARCHIVE invariant
-  (`purge_before`, `truncate_to` and `adopt_floor` all keep the journal
-  contiguous or wipe it) rather than a local check. Deriving `first` from
-  the frontier restores the local check, makes the detour unnecessary and
-  removes a whole class of
-  "the journal answers a question it cannot answer". Not changed in the fix
-  wave because it is a change to the guard every reconstruction path runs
-  through. Recorded 2026-09-21 (`.superpowers/sdd/2026-09-21-uc2-live-snapshot-reports/final-review.md`,
-  Important 1).
-  **Still open after #77 (2026-10-07):** the detour also fired on a healthy
-  row whose next frame straddled `min(commit, durable)` — commit can sit
-  mid-frame — and fail-stopped it at the first ring lap. #77 fixed that one
-  misfire (`Replay::AwaitCommit`: a stop at a frame the journal holds is
-  never a gap); the widening itself is unchanged.
-- **`uc_gateway/tests/credits_wire.rs`'s latch test no longer exercises a
-  declared node.**
-  `a_connection_told_not_serving_is_never_served_later_on_the_same_socket`
-  pins that an edge which answered "not serving" never serves that socket
-  afterwards. Plan B3's readiness gate collapses the "the node exists but
-  cannot serve" window on a single-voter cluster, so the test was re-shaped
-  onto an UNDECLARED harness node (`common::start_single_node_full(…,
-  declared = false)`) — a page with no names on line 7, the one shape the
-  gate does not apply to. The latch is still pinned, but no longer against a
-  node a client could really attach to: re-shape it around a **learner** (which
-  declares, and never serves), so the window is real again. A
-  branch-introduced coverage loss, recorded 2026-09-21.
-- **`commit_source` as an enum.** `uc_consensus/src/election.rs` carries the
-  provenance of the current commit position as a `&'static str` compared by
-  value (`"gossip"`, `"leader"`, …). It is read in obs records and in tests;
-  an enum with a `Display` would make a typo a compile error and let the
-  stale-value class of bug (a documented value that no longer exists) be
-  caught by the match. Ledgered by plan B3's T5 review, recorded 2026-09-21.
-- **`pin-verify` against a real cluster, and against a learner.**
-  `uc2-diffreplay pin-verify` (plan C) proves S4's refusal and the pinned
-  install's artifact path on **one** node — a single voter in a scratch
-  instance dir — so it says nothing about the step the upgrade how-to leans
-  on hardest: "confirm the pin is visible on EVERY node before you stop
-  anything". A multi-node rig would let the mode judge a pin that has
-  committed on some nodes and not others, and a learner arm would cover the
-  row shape that declares but never serves. Recorded 2026-09-21 in
-  `docs/VERIFICATION.md` § "What `pin_verify.rs` does NOT verify".
-- **A spurious `service_detached` record right after every attach.**
-  `uc_node::node`'s `note_service_transitions` (~`uc_node/src/node.rs:5708`)
-  decides whether a row is `live` from its `heartbeat_ns` word, and the
-  sample after an attach can still read `0` there — so `live` is false, the
-  `service_was_live` latch set at the attach edge clears, and that sample
-  emits a `service_detached` record about a service that never detached,
-  microseconds after its `service_attached`. Harmless to the node, but it
-  makes the obs stream lie about the one transition an operator watches
-  during an upgrade window.
-  Found by plan C T2 (the `pin-verify` rig watches exactly these
-  transitions); ticket-worthy. Recorded 2026-09-21.
-- **`uc_diffreplay` has never compiled with `--no-default-features
-  --all-targets`.** Pre-existing — its test targets call `Corpus::export`,
-  gated behind the `export` feature, with no `required-features` line — but
-  **plan C widened it**, and the widened form is what a fixer will meet.
-  Measured on this HEAD the first errors are `unresolved import
-  uc_diffreplay::live` ×2 and `cannot find live in uc_diffreplay` ×8:
-  `tests/common/mod.rs` now `pub use`s `live::*`, and `common` is compiled
-  into **every** test target in the directory, so the fix is
-  `required-features = ["export", "pin-verify"]` on *every* target, not one
-  key on the two that call `export` — plus the wider clippy run added to CI.
-  Only the `--lib --bins` form of that run is in the proof stack today.
-  Found by plan C T2, cause and fix corrected by plan C's final review,
-  recorded 2026-09-21.
+
 - **Build `uc_starter` against the in-tree crates in `ci.yml`** (`[patch.crates-io]`), so an SDK break is caught on the PR that makes it — deferred until `uc_starter` is public (a private checkout needs a secret). Spec `docs/superpowers/specs/2026-09-24-uc-starter-design.md` §8. On publication: link it from README.md, docs/QUICKSTART.md §7 and docs/tutorials/build-an-application.md.
-- **A backward wall-clock step on the leader stalls the heartbeat-staleness
-  predicate for as long as the smear takes to retire it, not for the step's
-  own size.** `maybe_append_row_genesis` (`uc_node/src/node.rs`) — and the
-  existing service-liveness predicate it shares the comparison with — judge
-  freshness as `pass_now_ns.saturating_sub(heartbeat_ns) <
-  SERVICE_STALE_NS` (3 s, `uc_node/src/services.rs`). `heartbeat_ns` is
-  stamped from the real wall clock (`unix_ns()`, `uc_service/src/apply.rs`),
-  but `pass_now_ns` is the leader's smeared, monotonic LOG clock
-  (`uc_node::log_clock`, `2.12.0`): a backward step is never frozen but
-  retired at `SMEAR_PPM = 500` parts per million of monotonic time, so a
-  step bigger than `SERVICE_STALE_NS` leaves `pass_now_ns` reading ahead of
-  every fresh heartbeat for `step_ns / 0.0005` of real time — around 100
-  minutes to retire a 3 s step, not 3 s. Every reader of this predicate
-  (row genesis, and whatever else keys "is this row's service alive" off
-  the same comparison) waits that long. Candidate fix: read the wall clock
-  for the staleness test only when a row is unversioned (row genesis is a
-  one-time bring-up cost, not a steady-state one, so paying a real
-  `SystemTime::now()` read there does not reintroduce the ambient-clock
-  problem the log clock exists to avoid on the steady apply path). Recorded
-  2026-09-28.
 
 ## Accepted residuals — listed so they are not re-proposed
 
