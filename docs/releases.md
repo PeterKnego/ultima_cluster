@@ -394,6 +394,15 @@ Defects that shipped in `2.13.0` or earlier:
   `self_sends_skipped`. The leader's own position was never carried by
   that report (it ranks its in-memory `durable`) and its own holdings
   enter the soft table directly, so nothing else moves.
+- **A backward wall-clock step on the leader read every fresh service
+  heartbeat as stale for as long as the smear took to retire**
+  ([#135](https://github.com/PeterKnego/ultima_cluster/issues/135)). A
+  service stamps its heartbeat from the real wall clock; the node compared
+  it against the smeared log clock, which runs ahead of the wall by the
+  remaining smear while a step retires at 500 ppm — a 3 s step for about
+  100 minutes. Row genesis waited that long and the transition log reported
+  the service detached. Both readers now compare against the pass clock
+  less the remaining smear, with no second clock read.
 - **Small, from #37** ([#109](https://github.com/PeterKnego/ultima_cluster/pull/109)):
   `uc2ctl` refuses a mistyped `--instance-dir` by name instead of printing
   "no cluster artifact yet" and exiting 0; `tier forget` prints `0x` ids;
