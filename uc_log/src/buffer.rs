@@ -492,9 +492,21 @@ impl LogBuffer {
             // (LogCounters::prime contract). Same remedy as a lap overrun.
             return FrameRead::Overrun;
         }
-        debug_assert!(len >= 4 && align_frame_len(len) as u64 <= self.capacity - off as u64);
+        // #119: the bound the `unsafe` slice below rests on, checked in every
+        // build. A nonzero word below `HEADER_LEN` or a span past the wrap
+        // cannot be a committed frame (`recordable_slice` refuses the same
+        // two shapes): it is a torn or corrupt length word, or a mid-frame
+        // `pos` reading a payload byte as the length. Either way the bytes
+        // here are not the frame the caller asked for, so answer as the
+        // run read does for a torn word — `Overrun`, and the caller falls
+        // back to the journal, which holds the recorded truth — rather than
+        // form a slice the mapping may not cover.
+        if len < HEADER_LEN || align_frame_len(len) as u64 > self.capacity - off as u64 {
+            return FrameRead::Overrun;
+        }
         out.clear();
-        // SAFETY: [off, off+len) within capacity (frames never span the wrap).
+        // SAFETY: [off, off+len) within capacity (frames never span the wrap),
+        // checked just above in every build.
         out.extend_from_slice(unsafe { std::slice::from_raw_parts(self.region.ptr_at(off), len) });
         // Seqlock discipline: an acquire fence orders the preceding
         // non-atomic copy before the re-check below. Without it the check is
@@ -1459,6 +1471,41 @@ mod tests {
         assert!(matches!(
             b.read_frame_validated(64, &mut out),
             FrameRead::NotCommitted
+        ));
+    }
+
+    /// #119: a committed position whose length word is corrupt — below the
+    /// header, or spanning past the wrap — reads `Overrun` in a release
+    /// build, never a slice the mapping may not cover. The two shapes are
+    /// the ones `recordable_slice` refuses; the answer is the one
+    /// `read_run_validated` gives a torn word.
+    #[test]
+    fn corrupt_length_word_reads_overrun_not_a_slice() {
+        let (b, _c) = buf();
+        let mut a = Appender::new(Arc::clone(&b), 2, 0);
+        a.append(9, 77, b"abc").unwrap();
+        let mut out = Vec::new();
+        let good = b.commit_word(0).load(Ordering::Acquire);
+        // A torn `1`: nonzero, below HEADER_LEN.
+        b.commit_word(0).store(1, Ordering::Release);
+        assert!(matches!(
+            b.read_frame_validated(0, &mut out),
+            FrameRead::Overrun
+        ));
+        // A span past the wrap: aligned length beyond capacity - off.
+        b.commit_word(0).store(
+            u32::try_from(b.capacity).unwrap() + HEADER_LEN as u32,
+            Ordering::Release,
+        );
+        assert!(matches!(
+            b.read_frame_validated(0, &mut out),
+            FrameRead::Overrun
+        ));
+        // Restored, the frame reads again — the guard answered on the word.
+        b.commit_word(0).store(good, Ordering::Release);
+        assert!(matches!(
+            b.read_frame_validated(0, &mut out),
+            FrameRead::Frame(h) if h.seq == 77
         ));
     }
 
