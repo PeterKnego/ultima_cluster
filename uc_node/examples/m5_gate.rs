@@ -942,9 +942,9 @@ fn crypto_snapshot(nodes: &[Node]) -> Vec<CryptoSnapshot> {
 /// `NoSession` and was counted. That was a pre-existing v2 self-send that
 /// wire crypto merely made visible, harmless (the leader's own position
 /// reaches its commit ranking in memory) and symmetric across the two arms.
-/// The receiver now recognises its own address under crypto and skips the
-/// attempt, counted as `self_sends_skipped` instead; cleartext still sends
-/// the datagram byte-for-byte, so the arms stay symmetric.
+/// The receiver now recognises its own address and sends nothing, in every
+/// mode, counted as `self_sends_skipped` instead (#85 was the cleartext
+/// face of the same self-send), so the arms stay symmetric.
 ///
 /// So the fail-closed check the gate reads is: **zero in-window
 /// `auth_failed` / `replay` / `unknown_epoch` / `seal_failures` on EVERY
