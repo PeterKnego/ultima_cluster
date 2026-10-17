@@ -81,6 +81,12 @@ node.
   → [Query drain A/B](docs/benchmarks/uc2-query-drain-progress-2026-10-10.md) ·
   [read spread](docs/benchmarks/uc2-read-spread-2026-10-07.md) ·
   [read types under writes, c9gd](docs/benchmarks/uc2-read-types-under-writes-c9gd-2026-10-11.md)
+- **Known regression:** the apply hop is 2.5 % slower at N=1 on Intel Ice
+  Lake from #33's version gate, plus about 4 % from later changes that are
+  Ice Lake-specific and still being investigated; it is not the end-to-end
+  bottleneck.
+  → [Gate doc](docs/benchmarks/uc2-row-running-version-apply-ab-2026-10-17.md) ·
+  [#149](https://github.com/PeterKnego/ultima_cluster/issues/149)
 
 ## v2.13.0 — 2026-09-22 — the FSM upgrade lifecycle
 
