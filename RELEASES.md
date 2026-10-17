@@ -6,6 +6,82 @@ release (mechanics, rulings, evidence tables) is
 [`docs/releases.md`](docs/releases.md); the per-milestone proof records are in
 [`docs/benchmarks/`](docs/benchmarks).
 
+## v2.14.0 — <tag date> — snapshot sets the cluster agrees on, an off-node backup tier, and read-your-writes reads
+
+<!-- tag date: fill at tag time, and update the "Full record" link below to the dated heading's anchor -->
+
+The cluster keeps a replicated catalog of the snapshot sets it agrees on and
+builds a storage service on it, and clients can read their own writes from any
+node.
+[Full record](docs/releases.md#v2140--tag-date--snapshot-sets-the-cluster-agrees-on-an-off-node-backup-tier-and-read-your-writes-reads).
+
+- **Upgrade flag day:** wire `0.9.0` → `0.11.0`, cnc `3.3` → `3.4` and the
+  remote protocol v1 → v2. Rebuild every service against the new SDK
+  (`start_with_snapshots()` is gone), take one full instant first, stop every
+  node before starting any, and upgrade gateways and remote clients together;
+  no snapshot directory needs clearing.
+  → [Upgrade a cluster § 2.13.0 to 2.14.0](docs/how-to/upgrade-a-cluster.md#upgrading-from-2130-to-2140) ·
+  [Semver policy](docs/reference/semver-policy.md#snapshots-become-mandatory-67)
+- **A row never runs two versions.** Every row has a committed running
+  version, a service off that line is refused at attach, and an old service
+  stops at exactly the record that supersedes it (#33).
+  → [Explainer](docs/notes/uc2-row-running-version-explained.md) ·
+  [Upgrade an application § The version rules](docs/how-to/upgrade-an-application.md#the-version-rules)
+- **Snapshots are mandatory.** `ServiceBuilder::start()` requires
+  `SnapshotStateMachine` and `start_with_snapshots()` is gone; the new
+  `WholeStateSnapshot` helper needs only an encode and a decode (#67).
+  → [State-machine contract § Snapshots](docs/reference/state-machine-contract.md#snapshots-required-the-instant-the-envelope-and-the-exclusive-frontier) ·
+  [Semver policy § #67](docs/reference/semver-policy.md#snapshots-become-mandatory-67)
+- **The snapshot catalog.** The cluster keeps a replicated list of its
+  snapshot sets with every node's hash per row, and the purge floor follows the
+  newest set every reporter agrees on.
+  → [Explainer](docs/notes/uc2-snapshot-catalog-explained.md) ·
+  [`uc2ctl catalog`](docs/reference/uc2ctl.md#catalog) ·
+  [Keep the journal from growing without bound](docs/how-to/bound-journal-growth.md)
+- **The snapshot lifecycle.** A restarting service starts from the newest
+  agreed set on its node, every node fetches each new agreed set in the
+  background after a free-space check, and an upgrade pin completes once the
+  new version has built an agreed set above it.
+  → [Explainer](docs/notes/uc2-snapshot-lifecycle-explained.md) ·
+  [Learner-only clusters](docs/how-to/bound-journal-growth.md#learner-only-clusters-voters-fetch-and-purge-by-default)
+- **Read-your-writes reads.** A client's reads carry a position token, so any
+  node, follower or learner can answer once it has applied that client's own
+  writes, at close to snapshot-read cost.
+  → [Explainer](docs/notes/uc2-read-your-writes-explained.md) ·
+  [Reading data: the options compared](docs/notes/smr-read-options-compared.md)
+- **An off-node backup tier.** A writer node copies agreed sets and the
+  committed journal to a directory, and `uc2ctl tier` restores the whole
+  cluster as of any position the tier reaches, forks a copy, replaces a node,
+  or exports a diff-replay corpus.
+  → [Back up to a tier](docs/how-to/back-up-to-a-tier.md) ·
+  [Explainer](docs/notes/uc2-backup-tier-explained.md)
+- **Backup-gated purge, and the tier as a source.** Purge can wait until K
+  tiers hold the bytes, and a node below the floor can install from a tier
+  instead of a peer.
+  → [Back up to a tier § Backup-gated purge](docs/how-to/back-up-to-a-tier.md#backup-gated-purge) ·
+  [§ The tier as a source](docs/how-to/back-up-to-a-tier.md#the-tier-as-a-source)
+- **The cluster view.** `GET /cluster`, an always-on `obs.sock`, and
+  `uc2ctl cluster` print the whole committed cluster state as one JSON
+  document for operators, scripts and AI readers, and `settings`/`schedule`/
+  `upgrade show` no longer wait for the first cluster artifact.
+  → [The cluster view](docs/reference/cluster-view.md) ·
+  [`uc2ctl cluster`](docs/reference/uc2ctl.md#cluster)
+- **Fixed:** a follower could apply bytes from the next lap of its log buffer
+  in silence, or fail-stop at the first lap; the ingress ring could misread a
+  stale payload; a cluster could stop committing after a cold restart or an
+  election; plus `uc2ctl status` on a dead node, typed-tier trailing bytes,
+  and a remote client that could not resume a saved `client_id`.
+  → [Full record § Fixed since 2.13.0](docs/releases.md#fixed-since-2130)
+- **Performance:** answered reads now count as apply progress, which took
+  read-only reads 3.8–5.6× higher on the fleet. Snapshot-read capacity scales
+  with the nodes answering, and a 3-node Graviton cluster served 15.1 M
+  read-your-writes reads/s beside 2 M committed writes/s (one bar, the
+  leader's read-your-writes against snapshot reads, missed at 0.83 and was
+  kept).
+  → [Query drain A/B](docs/benchmarks/uc2-query-drain-progress-2026-10-10.md) ·
+  [read spread](docs/benchmarks/uc2-read-spread-2026-10-07.md) ·
+  [read types under writes, c9gd](docs/benchmarks/uc2-read-types-under-writes-c9gd-2026-10-11.md)
+
 ## v2.13.0 — 2026-09-22 — the FSM upgrade lifecycle
 
 Upgrading a state machine becomes a pinned, per-row procedure the platform

@@ -930,10 +930,178 @@ to matter when you upgrade an FSM's `VERSION` — see [The cluster
 FSM](../notes/uc2-cluster-fsm-explained.md) § Pins and reports for what a
 pin then does at the service's next attach.
 
+## Upgrading from 2.13.0 to 2.14.0
+
+`2.14.0` is **one flag day** that carries several changes: node↔node wire
+`0.9.0` → `0.11.0` (`0.10.0` was never released, so skip straight past it),
+cnc `3.3` → `3.4`, and the client↔gateway remote protocol v1 → v2. The two
+sections after this one explain the node↔node and cnc changes, and why each
+is unsound to mix: [the row running version
+(`0.10.0`)](#wire--cnc-change-after-2130-the-row-running-version-0100-cnc-34)
+and [the snapshot catalog (`0.11.0`)](#wire-change-after-0100-the-snapshot-catalog-0110),
+which also covers the snapshot lifecycle and the backup tier. This section is
+the order to do it in. The full list of what changed is [`docs/releases.md` §
+The flag day, in one
+place](../releases.md#the-flag-day-in-one-place).
+
+Unlike `2.13.0`, **nothing on disk is cleared**. The row artifacts keep the
+`ULTSNAP2` envelope `2.13.0` wrote, so `snapshots/<row>/` stays as it is. The
+cluster artifact moves from image version 2 to 6 and the replicated `Settings`
+record from version 2 to 6. Every older version of both is still read: blobs
+an older image does not have read as empty, and fields an older record does
+not have read as today's defaults. No `node.toml` key is added as required
+or refused. `[backup]` and `[tier_source]` are new and optional.
+
+1. **Rebuild every service against the `2.14.0` SDK, keeping its `VERSION`
+   (#67).** `ServiceBuilder::start_with_snapshots()` is gone, and `start()`
+   now requires `S: SnapshotStateMachine` at compile time. A service that
+   called `start_with_snapshots()` changes the call to `start()`. A service
+   that called `start()` without snapshot support no longer compiles. Give its
+   state machine one of the two implementations in [State-machine contract §
+   Snapshots](../reference/state-machine-contract.md#snapshots-required-the-instant-the-envelope-and-the-exclusive-frontier):
+   `WholeStateSnapshot`, where you write only an encode and a decode, or
+   `SnapshotStateMachine` directly. Two rules for this window:
+   - **Do not change `VERSION`.** Snapshot support is not an `apply` change.
+     A row with no pin gets its running version from the leader's own service
+     the first time the upgraded cluster sees it attached (step 7). Upgrade
+     the application's version as a separate [pinned
+     upgrade](upgrade-an-application.md) afterwards.
+   - **Do not change the payload format of a row that already snapshots.** A
+     row whose `2.13.0` service had its own `SnapshotStateMachine` keeps that
+     implementation. Switching it to `WholeStateSnapshot` changes the bytes
+     inside the envelope (the helper writes its own `cursor_present ‖ cursor`
+     prefix), and the artifacts on disk, including the one step 4 takes, were
+     written in the old format.
+
+   Rebuild clients and gateways too. `uc_client` and `uc_remote` gain enum
+   variants and public struct fields, which break an exhaustive `match` or a
+   struct literal; see [the semver
+   policy](../reference/semver-policy.md#snapshots-become-mandatory-67) and
+   the read-your-writes note after it. A remote client written in another
+   language must speak [remote protocol v2](../reference/remote-protocol.md)
+   before the window.
+2. **Check that no application's `VERSION` is a bare integer.** From `0.10.0`
+   a bare `1`, `2`, `3` … packs as `0.0.x`, so all such builds are on one
+   line. Fix that before the window, in the binaries step 1 builds. See [the
+   `0.10.0` section](#wire--cnc-change-after-2130-the-row-running-version-0100-cnc-34)
+   and [Upgrade an application § The version
+   rules](upgrade-an-application.md#the-version-rules). Also finish any
+   `uc2ctl upgrade pin` that is in flight: every instance of a pinned row runs
+   the pin's `to` before the window, because that is the row's running
+   version afterwards.
+3. **Stop all traffic.** That includes the remote clients, because a v1
+   client cannot talk to a v2 gateway (step 8).
+4. **Take one full coordinated instant, still on `2.13.0`, and line the
+   artifacts up.** Run `uc2ctl snapshot` (not `--standby`) once, on the
+   leader. On **every** node, wait until `uc2ctl snapshot show` prints the same
+   `set=<P>`, with `cluster newest=<P>`. The `uc2_snapshot_set_position`
+   gauge shows the same thing. The point is that every node restarts from a
+   cluster artifact at the same P. Two changes in this flag day make a node
+   that restarts from an *older* artifact replay old frames under new rules:
+   - Refusal `53` now compares lines, not exact versions. A node replaying
+     an old pin frame could accept a pin that `2.13.0` refused ([`0.10.0`,
+     Before you stop the
+     nodes](#wire--cnc-change-after-2130-the-row-running-version-0100-cnc-34)).
+   - The catalog lists every replayed `SNAPSHOT` frame as a commanded
+     instant. The other nodes never see those entries, so their catalogs
+     differ, and the cluster row reads diverged until the next set completes
+     ([`0.11.0`](#wire-change-after-0100-the-snapshot-catalog-0110)).
+
+   A `--standby` instant freezes only the learners, so the voters' cluster
+   artifacts would not move, and it does not do the job here.
+
+   If the instant is refused with **`48 snapshot_unsupported`**, the named
+   row's `2.13.0` service was started without `start_with_snapshots()`, and
+   no instant can complete while that service is attached. You have two
+   options:
+   - Restart that row's service on `2.13.0` with `start_with_snapshots()`
+     and a `SnapshotStateMachine`, then take the instant.
+   - Go on without the instant, but only if **no** node holds any
+     `snapshots/cluster/snap-*.ultcluster`. Every node then rebuilds its
+     cluster FSM from the same place, its journal.
+
+   **Never clear `snapshots/cluster/` on some nodes and not others.** A node
+   that installs a `2.13.0` (v2) image and a node that walks the same span
+   from genesis can disagree about a pinned origin ([`0.11.0`, A pinned
+   row](#wire-change-after-0100-the-snapshot-catalog-0110)).
+5. **Stop every node before starting any node.** Use
+   [`scripts/uc2_flag_day.sh`](#run-it) or do it by hand. On each host, stop
+   clients → gateway → services → node. Nothing refuses a mixed cluster by
+   name. A `0.11.0` leader drops a `0.9.0` follower's 16-byte `STATUS`, so
+   replication to that follower stalls. A `0.9.0` node applies the new
+   `CLUSTER` kinds (6 `RowGenesis`, 7 `BackupWatermark`) as undecodable, and
+   its cluster FSM diverges in silence.
+6. **Swap every binary on every host: node, `uc2ctl`, gateway and the
+   services from step 1.** `snapshots/<row>/` and `snapshots/cluster/` stay
+   as they are. A `3.3` service or client refuses a `3.4` page by version. A
+   `3.4` client attaches to a `3.3` page but refuses a read-your-writes read
+   on it (`ReadYourWritesUnsupported`). So each host's clients, services and
+   gateway restart with its node, as at every page bump.
+7. **Start every node, wait for one leader, then start every declared row's
+   service on every node.** Client writes wait until every declared row has a
+   running version. A row with a `2.13.0` pin carries the pin's `to` across.
+   For a row with no pin, the leader records the version of **its own**
+   attached service for that row (`row_genesis` in the audit log). Until then
+   the leader drains nothing from the ingress ring and logs
+   `version_gate_waiting` every 5 s, naming the row. A follower whose service
+   is on another line is refused at attach with `VersionMismatch`.
+8. **Start the gateways, then the remote clients, all on `2.14.0`.** Remote
+   protocol v2 adds the read-your-writes query flag `FLAG_MIN_POSITION`
+   (`0x20`). A v1 edge would read its 8-byte token as query bytes, so v1 and
+   v2 refuse each other at `HELLO` with `HELLO_REFUSED_VERSION`, which is
+   terminal: the client does not try the other members. Any v1 client still
+   running after the window is refused on every connect until it is rebuilt.
+   A remote client that saves its `client_id` across restarts can now resume
+   its session with `RemoteConfig::first_seq` (#34). See [the read-your-writes
+   explainer](../notes/uc2-read-your-writes-explained.md#version-requirements).
+9. **Commit one `uc2ctl settings apply`, on the leader.** That way every node
+   takes its replicated settings from the log, as a v6 record, rather than
+   from whatever image it started on. `[settings]` in `node.toml` seeds
+   genesis only, and an upgraded cluster's genesis is long past. The file
+   replaces the whole record, and a key you leave out takes its **default**,
+   not the value the cluster runs now. So write out every value you run today
+   (`uc2ctl settings show` prints them). The new keys (`retain_sets`,
+   `auto_fetch`, `backup_retain_sets`, `backup_retain_age`,
+   `purge_requires_tiers`) may be left out. Each one then behaves as
+   `2.13.0` did, apart from `auto_fetch`, which is on by default.
+10. **Take one more instant, then check.** Run `uc2ctl snapshot` again. The
+    catalog starts **empty** (no `2.13.0` image has one), and until a set
+    completes every reader uses the pre-catalog behaviour. Then, on every
+    node:
+    - `uc2ctl status`. The first line reads `node: running=true`, exactly
+      one node is `leader=true can_serve=true`, and every row's line ends
+      `running=<ver> running_pos=<pos>`, never `running=none`, with
+      `version=` on the same major.minor.
+    - `uc2ctl catalog`. The new set is listed **agreed**, and the
+      `catalog_empty` attention code is gone. The gauges agree:
+      `uc2_catalog_empty` is `0` and `uc2_catalog_agreed_position` is the
+      same on every node.
+    - `uc2_status_refused_total` stays at `0`. A count there is a peer
+      sending the old 16-byte `STATUS`, which means a node still on an old
+      binary.
+    - `uc2ctl settings show` / `schedule show` / `upgrade show` now read the
+      live [cluster view](../reference/cluster-view.md), so they answer
+      before the first artifact. `uc2ctl status`'s `schedule_position=` and
+      ceiling rung still come from the newest cluster artifact.
+
+    That instant also completes a pin carried over from `2.13.0`: the pin
+    is complete once an agreed set built on its `to` line exists above the pin
+    record. Until then every node holds its journal at the pin's origin.
+
+**What else is new on the node.** Every node now serves the cluster view as
+`GET /cluster` on an always-on `<instance_dir>/obs.sock` (mode `0600`). When
+`[metrics]` is configured, it also serves it on the metrics listener, with no
+authentication, so check who can reach that port. Each node also runs a
+`uc2-holdings` thread. A node with `[backup]` runs a `uc2-backup` writer, and
+one with `[tier_source]` runs a `uc2-tier-fetch` thread. None of these needs
+configuring for the upgrade. See [Back up to a tier](back-up-to-a-tier.md)
+for when you want them.
+
 ## Wire + cnc change after 2.13.0: the row running version (`0.10.0`, cnc `3.4`)
 
-Issue [#33](https://github.com/PeterKnego/ultima_cluster/issues/33),
-unreleased as this is written. Every declared row gets a committed **running
+Issue [#33](https://github.com/PeterKnego/ultima_cluster/issues/33), shipped
+in `2.14.0` inside the one flag day [above](#upgrading-from-2130-to-2140).
+Every declared row gets a committed **running
 version**, and the platform enforces that a row is never applied by two
 versions of its state machine at once. The reasoning is [The row running
 version, explained](../notes/uc2-row-running-version-explained.md); the rules
@@ -950,12 +1118,17 @@ silence. **Stop every node before starting any node.**
 `+48`; bit 32 = present, low 32 bits = the packed version) and
 `running_record_pos` (slot `+56`) on the service status line, under the same
 `pin_seq` seqlock as the pin words; and `cluster_applied` at page-1 offset
-`4056`. See [the cnc control page](../reference/cnc-page.md#service-slots). As
-with every page bump, each host's clients, services and gateway restart with
-its node.
+`4056`. The other `2.14.0` changes fold into the same `3.4` rather than
+bumping it again: `write_reserve` (page `264`, #78), the snapshot lifecycle's
+start-set pair (slot `+264` position, `+272` version), and the
+read-your-writes query flag `FLAG_V2_MIN_POSITION`. See [the cnc control
+page](../reference/cnc-page.md#service-slots). As with every page bump, each
+host's clients, services and gateway restart with its node.
 
-**No wipe.** The cluster artifact moves from image version 2 to 3 (a
-per-row running-version blob), and versions 1 and 2 are still read: a row
+**No wipe.** The cluster artifact gains a per-row running-version blob
+(image version 3; `2.14.0` writes version 6, see
+[`0.11.0`](#wire-change-after-0100-the-snapshot-catalog-0110)), and the
+version 1 and 2 images `2.11.0`–`2.13.0` wrote are still read: a row
 with pin history takes its newest pin's `to` as its running version, and a
 row without pins gets one the first time the leader sees its own service for
 that row attached. The row artifacts' envelope (`ULTSNAP2`) is unchanged, so
@@ -1017,7 +1190,8 @@ neither `snapshots/<row>/` nor `snapshots/cluster/` needs clearing.
 
 ## Wire change after 0.10.0: the snapshot catalog (0.11.0)
 
-The snapshot catalog, unreleased as this is written. It is project 1 of a
+The snapshot catalog, shipped in `2.14.0` inside the one flag day
+[above](#upgrading-from-2130-to-2140). It is project 1 of a
 four-project storage-service direction; the reasoning is
 [the design spec](../superpowers/specs/2026-10-01-uc2-snapshot-catalog-design.md).
 The cluster now keeps a replicated list of the snapshot **sets** it has
@@ -1040,10 +1214,10 @@ ignores the tail. Mixing is unsound in both directions, and this procedure
 forbids it. `SNAP_REPORT`/`SnapshotReport` (`CLUSTER` kind 5)
 admits row `255`: the cluster artifact's own hash now joins the per-row
 completeness report, closing the "the cluster FSM's own artifact has no
-determinism check" gap. The replicated `Settings` record grows one field,
-`retain_sets: u16` (version 3, 35 B; a version-1 (`2.11.0`) or version-2
-(`2.12.0`) record is still accepted on read and reads `retain_sets` as `1`,
-today's newest-only retention). No existing
+determinism check" gap. The replicated `Settings` record gains
+`retain_sets: u16` (record version 3). A version-1 (`2.11.0`) or version-2
+(`2.12.0`/`2.13.0`) record is still accepted on read and reads `retain_sets`
+as `1`, the newest-only retention. No existing
 layout changes anywhere, which is exactly why mixing is unsound rather than
 merely unsupported: a `0.10.0` peer applies the row-255 report and the wider
 `Settings` record as undecodable and silently diverges — its catalog never
@@ -1052,12 +1226,25 @@ completes a set. **Stop every node before starting any node.**
 The same flag day also carries the **snapshot lifecycle**: the `SNAP_REPORT`
 datagram's body grows from 24 B to 32 B (the artifact's size), the
 `SnapshotReport` record's entries become `(node, hash, size)`, the
-replicated `Settings` record moves to v4 (`auto_fetch`, default on), and the
-cluster image to v5 (catalog row entries carry sizes). A v1–v4 cluster image
-still loads — its sets read with size 0 ("unknown"), which nothing refuses —
-and a v1–v3 settings record reads `auto_fetch = true`. Nothing on disk is
-cleared. A dev cluster built from `main` between the catalog merge and this
-change must also stop every node: a 24-byte report is refused by length.
+replicated `Settings` record gains `auto_fetch` (v4, default on), and catalog
+row entries carry sizes (image v5). A cluster image from before v5 still
+loads — its sets read with size 0 ("unknown"), which nothing refuses — and a
+v1–v3 settings record reads `auto_fetch = true`. A dev cluster built from
+`main` between the catalog merge and this change must also stop every node: a
+24-byte report is refused by length.
+
+It also carries the **backup tier** ([Back up to a
+tier](back-up-to-a-tier.md)): `CLUSTER` kind 7 `BackupWatermark`, the
+pairwise datagram kinds 27 `BACKUP_REPORT`, 28 `TIER_INSTALL` (200 B) and 29
+`TIER_INSTALL_STATUS` (24 B), the `Settings` fields `backup_retain_sets` /
+`backup_retain_age` (v5) and `purge_requires_tiers` (v6, 47 B), and a backup
+watermark blob in the cluster image (v6). The `Settings` record `2.14.0`
+writes is therefore version 6, and the cluster image version 6. Every older
+record and image is still read: an absent backup field means keep every
+backup and no purge gate, and an absent watermark blob reads as no tiers.
+A `0.10.0` peer applies kind 7 as undecodable and drops the three pairwise
+kinds, so this changes nothing about the rule: stop every node before
+starting any. Nothing on disk is cleared.
 
 **A pinned row in a pre-#33 (v1/v2) cluster image.** Such an image has no
 running-version blob, so installing it restores a pin's record position as
@@ -1094,19 +1281,22 @@ this change carry no markers, so a set this node fetched or was installed
 with before the upgrade is treated as its own; to exclude one, create that
 empty file for its position by hand while the node is stopped.
 
-**cnc unchanged.** The catalog is not on the shmem page; it rides inside
-the cluster artifact and `/metrics` only. No cnc version bump, no node-local
-process restart beyond the ordinary flag-day one.
+**cnc `3.4`, no further bump.** The catalog is not on the shmem page; it
+rides inside the cluster artifact, `/metrics` and the cluster view. The
+lifecycle's start-set words (slot `+264`/`+272`) fold into the `3.4` that
+[`0.10.0`](#wire--cnc-change-after-2130-the-row-running-version-0100-cnc-34)
+opened, with no node-local process restart beyond the ordinary flag-day
+one.
 
-**Nothing on disk is cleared.** The cluster artifact's image layout moves
-from version 3 to 4 (a trailing length-prefixed catalog blob); a v1–v3
-artifact is still **read**, with the new blob empty — the same "accept every
-older version with its missing trailing blobs read as empty" rule every
-prior image bump used. `snapshots/<row>/` and `snapshots/cluster/` are both
+**Nothing on disk is cleared.** The catalog is a trailing length-prefixed
+blob in the cluster image (version 4; `2.14.0` writes version 6). A v1–v3
+artifact, which includes every one `2.13.0` wrote, is still **read**, with the
+newer blobs empty — the same "accept every older version with its missing
+trailing blobs read as empty" rule every prior image bump used. `snapshots/<row>/` and `snapshots/cluster/` are both
 untouched; there is no wipe for this flag day.
 
-**The `Empty` window.** A v1–v3 artifact — or a fresh genesis — starts with
-an empty catalog: no set has ever completed. Every reader takes a named
+**The `Empty` window.** A v1–v3 artifact (every `2.13.0` one) — or a fresh
+genesis — starts with an empty catalog: no set has ever completed. Every reader takes a named
 fallback in that state: the purge floor and every install source read as
 today's pre-catalog behaviour (the node's own newest complete set on disk),
 and the pruner keeps deleting on that same old rule rather than refusing to

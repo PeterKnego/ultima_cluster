@@ -1,5 +1,443 @@
 # ultima_cluster releases
 
+## v2.14.0 — <tag date> — snapshot sets the cluster agrees on, an off-node backup tier, and read-your-writes reads
+
+<!-- tag date: fill at tag time (and RELEASES.md's "Full record" link, whose anchor carries this heading) -->
+
+**One flag day: wire `0.9.0` → `0.11.0` (through `0.10.0`, which was never
+released), cnc `3.3` → `3.4`, and the client↔gateway remote protocol v1 → v2.**
+Baseline: the tagged `v2.13.0` (wire `0.9.0`, cnc `3.3`, remote protocol v1).
+Inside the flag day the replicated `Settings` record moves from version 2 to
+6 and the cluster image from 2 to 6; every older version of both is still
+read, and **nothing on disk is cleared** — unlike `2.13.0`, no
+`snapshots/<row>/` wipe. The row artifact envelope (`ULTSNAP2`) is unchanged.
+
+The release is two threads. The first is the **storage service**, four
+projects the maintainer laid out on 2026-09-30, each on top of the one
+before: (1) a replicated **catalog** of snapshot sets and whether every node
+agrees on each one; (2) a **lifecycle** that starts a restarting service from
+the newest agreed set and spreads that set to every node; (3) an **off-node
+backup tier** (3a, then 3b: lineage, backup-gated purge, the tier as a
+source); and (4) a **cluster view** that prints all of it as one JSON
+document. The second thread is **correctness and the read path**: the row
+running version (#33), mandatory snapshots (#67), read-your-writes reads, and
+a run of defects found while building and fleet-testing the rest — two of
+them follower defects the catalog's hash agreement exposed (#77, #78).
+
+What landed, in merge order: #49's fix
+[#59](https://github.com/PeterKnego/ultima_cluster/pull/59) (`4d957d2a`) →
+#33 [#68](https://github.com/PeterKnego/ultima_cluster/pull/68) (`a70539a1`)
+and its follow-ups [#70](https://github.com/PeterKnego/ultima_cluster/pull/70)
+→ #67 [#71](https://github.com/PeterKnego/ultima_cluster/pull/71)
+(`e4bb9f65`) → the **snapshot catalog**, fast-forwarded onto `main` without a
+PR merge commit (54 commits, `ff210a72..dfd719b4`, 2026-10-05) → the
+**snapshot lifecycle** [#87](https://github.com/PeterKnego/ultima_cluster/pull/87)
+(`5d8cdbc1`) → **read-your-writes**
+[#88](https://github.com/PeterKnego/ultima_cluster/pull/88) (`dffe5f43`) →
+**backup tier 3a** [#100](https://github.com/PeterKnego/ultima_cluster/pull/100)
+(`c77cdf0d`) → **3b** [#107](https://github.com/PeterKnego/ultima_cluster/pull/107)
+(`ce5d1a0f`) → the **cluster view**
+[#108](https://github.com/PeterKnego/ultima_cluster/pull/108) (`cd387396`),
+with the fixes listed under [Fixed since `2.13.0`](#fixed-since-2130) in
+between, and two small pre-cut PRs,
+[#109](https://github.com/PeterKnego/ultima_cluster/pull/109) and
+[#114](https://github.com/PeterKnego/ultima_cluster/pull/114).
+
+| | #33 running version | #67 mandatory snapshots | catalog | lifecycle | read-your-writes | backup tier 3a | backup tier 3b | cluster view |
+|---|---|---|---|---|---|---|---|---|
+| spec (read its errata first) | [row running version](superpowers/specs/2026-09-27-uc2-row-running-version-design.md) | [mandatory snapshots](superpowers/specs/2026-09-28-uc2-mandatory-snapshots-design.md) | [snapshot catalog](superpowers/specs/2026-10-01-uc2-snapshot-catalog-design.md) | [snapshot lifecycle](superpowers/specs/2026-10-09-uc2-snapshot-lifecycle-design.md) | [read-your-writes](superpowers/specs/2026-10-08-uc2-read-your-writes-design.md) | [backup tier](superpowers/specs/2026-10-10-uc2-backup-tier-design.md) | [backup tier 3b](superpowers/specs/2026-10-12-uc2-backup-tier-3b-design.md) | [cluster view](superpowers/specs/2026-10-14-uc2-cluster-view-design.md) |
+| errata | "Errata (as built)" | "Errata (as built)" | two blocks (plan review; as built) + erratum R37 with its R38–R42 amendments; the 2026-10-05 lock-discipline addendum is RETRACTED | "Errata (as built, 2026-10-10)" | "Errata (planning)" + "As built" | "Errata (as built, 2026-10-11)" | "Errata (as built, 2026-10-13)" | "Errata (planning)" + "Errata (as built)" |
+| plan | [plan](superpowers/plans/2026-09-27-uc2-row-running-version.md) | [plan](superpowers/plans/2026-09-28-uc2-mandatory-snapshots.md) | [plan](superpowers/plans/2026-10-04-uc2-snapshot-catalog.md) | [plan](superpowers/plans/2026-10-09-uc2-snapshot-lifecycle.md) | [plan](superpowers/plans/2026-10-09-uc2-read-your-writes.md) | [plan](superpowers/plans/2026-10-10-uc2-backup-tier.md) | [plan](superpowers/plans/2026-10-12-uc2-backup-tier-3b.md) | [plan](superpowers/plans/2026-10-14-uc2-cluster-view.md) |
+| explainer / how-to / reference | [explainer](notes/uc2-row-running-version-explained.md) | [state-machine contract](reference/state-machine-contract.md#snapshots-required-the-instant-the-envelope-and-the-exclusive-frontier) | [explainer](notes/uc2-snapshot-catalog-explained.md), [`uc2ctl catalog`](reference/uc2ctl.md#catalog), [bound journal growth](how-to/bound-journal-growth.md) | [explainer](notes/uc2-snapshot-lifecycle-explained.md) | [explainer](notes/uc2-read-your-writes-explained.md) | [how-to](how-to/back-up-to-a-tier.md), [explainer](notes/uc2-backup-tier-explained.md) | same | [reference](reference/cluster-view.md) |
+| gate doc | none; a fleet apply-hop A/B is owed, see [Release evidence](#release-evidence-2140) | none — no hot-path change (spec) | none — "no performance bar" (spec D8) | none | none (spec: "not a throughput feature"); the read records under [Performance records](#performance-records-2140) | none | none | none |
+| flag-day surface | wire `0.10.0` (`CLUSTER` 6), cnc `3.4` (slot `+48`/`+56`, page `4056`), image 3 | none | wire `0.11.0` (`STATUS` 144 B, report row 255), Settings 3, image 4 | `SNAP_REPORT` 32 B, Settings 4, image 5, cnc slot `+264`/`+272` | remote protocol v2, cnc `3.4` query flag | `CLUSTER` 7, pairwise 27, Settings 5, image 6 | pairwise 28/29, Settings 6, `SET` `lineage=` | none |
+
+### The flag day, in one place
+
+Every item below is inside the one stop-every-node window; the per-feature
+sections say why each is unsound to mix.
+[Upgrade a cluster § Upgrading from 2.13.0 to 2.14.0](how-to/upgrade-a-cluster.md#upgrading-from-2130-to-2140)
+is the procedure; its per-change sections,
+[`0.10.0`](how-to/upgrade-a-cluster.md#wire--cnc-change-after-2130-the-row-running-version-0100-cnc-34)
+and [`0.11.0`](how-to/upgrade-a-cluster.md#wire-change-after-0100-the-snapshot-catalog-0110),
+say why each step is there.
+
+- **Node↔node wire `0.11.0`.** `CLUSTER` kinds 6 `RowGenesis` and 7
+  `BackupWatermark`; `STATUS` body 16 B → 144 B (`Holdings`);
+  `SNAP_REPORT` (26) body 24 B → 32 B and `SnapshotReport` (kind 5) entries
+  12 B → 20 B, both carrying the artifact size, and report row `255` (the
+  cluster artifact); pairwise kinds 27 `BACKUP_REPORT`, 28 `TIER_INSTALL`
+  (200 B) and 29 `TIER_INSTALL_STATUS` (24 B). There is no version word on
+  node↔node datagrams, so nothing refuses a `0.9.0` or `0.10.0` peer by name:
+  a `0.11.0` leader drops a `0.10.0` follower's 16 B `STATUS` (counted,
+  `uc2_status_refused_total`) and replication to it stalls, and an older peer
+  applies the new `CLUSTER` kinds as undecodable and its cluster FSM diverges
+  in silence.
+- **Replicated `Settings` v2 → v6**: `retain_sets` (v3), `auto_fetch` (v4),
+  `backup_retain_sets` / `backup_retain_age` (v5), `purge_requires_tiers`
+  (v6, 47 B). Older records decode with today's defaults (`retain_sets = 1`,
+  `auto_fetch = true`, keep every backup, no purge gate).
+- **Cluster image 2 → 6**: running versions (3), the catalog (4), artifact
+  sizes (5), backup watermarks (6). Every older image installs; its missing
+  blobs read as empty, and sizes read `0` = unknown.
+- **cnc `3.3` → `3.4`**, folded into one bump although four features add to
+  it: `running_version` (slot `+48`) and `running_record_pos` (`+56`) and
+  `cluster_applied` (page `4056`) for #33; `write_reserve` (page `264`, the
+  `append` line's second word) for #78; the start-set pair (slot `+264`
+  position, `+272` version) for the lifecycle; and the query flag
+  `FLAG_V2_MIN_POSITION` (an 8-byte `min_position` prefix on a `query.ring`
+  record) for read-your-writes. A `3.4` client attaches to a released `3.3`
+  page (`version_compatible` accepts an older minor) and refuses a
+  read-your-writes read with a non-zero token on it by name
+  (`ReadYourWritesUnsupported`). As with every page bump, each host's
+  clients, services and gateway restart with its node.
+- **Remote protocol v1 → v2** (`PROTOCOL_VERSION = 2`, query flag
+  `FLAG_MIN_POSITION = 0x20`). A v1 client and a v2 edge refuse each other at
+  `HELLO` (`HELLO_REFUSED_VERSION`), so gateways and remote clients upgrade
+  together.
+- **SDK, not wire**: `ServiceBuilder::start_with_snapshots()` is removed and
+  `start()` requires `SnapshotStateMachine` (#67); a service that did not
+  snapshot must gain an implementation before it builds.
+- **Operator steps**: take one full instant (`uc2ctl snapshot`, not
+  `--standby`) right before the window and confirm every node's newest
+  `snapshots/cluster/snap-*.ultcluster` is at the same P; check no
+  application's `VERSION` is a bare integer; after the cluster serves, commit
+  one `uc2ctl settings apply` so every node takes its replicated settings
+  from the log. Client writes wait until every declared row has a running
+  version, so start every declared row's service on every node.
+
+### #33 — a row never runs two versions (#68)
+
+**The bug.** Two builds of one row could apply the same log differently: a v2
+leader acknowledged a v2-only command, v1 followers applied it as a no-op,
+and after a leader change the acknowledged write was gone. The repro test
+read 10 where 15 had been acknowledged.
+
+**The fix.** Every row has a committed **running version** in the cluster
+FSM, set by a `RowGenesis` record (`CLUSTER` kind 6, 8 B, appended by the
+leader from its own attached service) or by a pin (kind 4), and only a pin
+changes it after genesis. A service off the row's line (major.minor; patch is
+free everywhere) is refused at attach with `VersionMismatch`; one already
+attached when a superseding record commits stops at exactly that record's
+position, in live apply and in journal replay, waiting on the cluster FSM's
+verdict (published through `cluster_applied`) rather than deciding from the
+record bytes, so a refused record changes nothing. The leader admits no
+client frame until every declared row has a version (`version_gate_waiting`
+every 5 s). Refusal `60 version_already_set` (never returned to `uc2ctl`).
+`uc2ctl upgrade pin` refuses a same-line pin unless `--patch`, a bare-integer
+`VERSION` logs `version_is_patch_only` at attach, and `status` prints
+`running=` / `running_pos=`. Metric `uc2_row_running_version`, alert
+`Uc2RowVersionMismatch`; `Uc2ServiceVersionDrift` now compares lines.
+
+**Scope.** The safety floor only: rolling application upgrades are
+[#66](https://github.com/PeterKnego/ultima_cluster/issues/66), rolling UC
+upgrades [#31](https://github.com/PeterKnego/ultima_cluster/issues/31).
+**Owed:** a fleet apply-hop A/B of `a409b3ae` (before) against `a70539a1`
+(after); the dev-box smoke read −2.8 % against a 4.2 % rebuild-control
+resolution, which decides nothing.
+
+### #67 — snapshots are mandatory (#71)
+
+One `ServiceBuilder::start()`, requiring `S: SnapshotStateMachine`, enforced
+at compile time (the error names `WholeStateSnapshot` through
+`#[diagnostic::on_unimplemented]`); `start_with_snapshots()` is removed and
+the capability bit is always set. `WholeStateSnapshot` is a codec-neutral
+helper: the application supplies `encode_state`/`decode_state` (and
+optionally `project_state` for diff replay), and the SDK owns the frame
+(`cursor_present u8 ‖ cursor u64 LE ‖ app bytes` inside the unchanged
+`ULTSNAP2` envelope), the exclusive-frontier check — which refuses a cursor
+**equal** to the tag since [#73](https://github.com/PeterKnego/ultima_cluster/issues/73)
+([#76](https://github.com/PeterKnego/ultima_cluster/pull/76)) — and a check
+that decode restored `last_applied`. The idle snapshot-builder thread now
+sleeps 1 ms, not 50 µs. Refusals `48 snapshot_unsupported` and
+`PinRequiresSnapshots` stay as the backstop for a service attached without
+the current Rust SDK. **Migration:** `start_with_snapshots()` → `start()`;
+an FSM without snapshot support implements `WholeStateSnapshot` (whole state,
+including its `last_applied`) or `SnapshotStateMachine` directly.
+
+### The snapshot catalog (storage project 1)
+
+The cluster FSM keeps a replicated catalog of the snapshot **sets** it has
+coordinated — position, kind, state, and per row the building version, the
+hash and the agreement verdict — instead of forgetting a set when a newer
+one lands, and the purge floor follows the newest set the cluster **agrees**
+on. Agreement is frozen when a set completes (ruling R9); a set is agreed when
+every reporting node's hash matches, with a 5 s timeout on the instant's own
+log time after which a two-of-three record whose hashes match is agreed (R37/R38, R41). The cluster
+artifact's own hash joins the reports as row `255`, closing "the cluster FSM's
+artifact has no determinism check". `STATUS` advertises each node's
+`Holdings` (journal span, complete sets, applied per row, free/journal/snapshot
+bytes), probed on its own `uc2-holdings` thread. A node never reports a set it
+did not build: a set that arrives by snapshot session is marked
+`snapshots/cluster/snap-<P>.foreign` (R42). `retain_sets` (default `1`, at
+most `48`, refused with `47 settings_bounds`) keeps more than one agreed set,
+with pinned origins kept beside it, and holds the journal from the oldest
+retained set a node holds, so each one is a start point (catalog spec erratum
+2026-10-17). Until the first set completes the catalog
+is **Empty** and every reader takes the pre-catalog fallback;
+`uc2_catalog_empty` reads `1` for that window. Metrics
+`uc2_catalog_{sets,agreed_position,diverged,stalled,empty}`; `uc2ctl
+catalog`. The catalog's hash agreement is what detected the two follower
+defects #77 and #78 (below). New fuzz target `uc_protocol_status_body`.
+
+### The snapshot lifecycle (storage project 2, #87)
+
+- **Start rule.** A restarting unpinned row starts from the newest agreed
+  set its node holds at or below `min(commit, durable)` when that moves it
+  forward, then replays only the tail. The node publishes that start set in
+  cnc slot `+264`/`+272`; the service prints `uc_service: row N started from
+  snap-P`. An empty catalog behaves as before.
+- **Auto-fetch** (`[settings] auto_fetch`, default on): every node pulls each
+  new agreed set from a holder in the background. A service start never
+  waits on the network, and the purge rule is unchanged. On a learner-only
+  cluster this is what lets voters purge without `uc2ctl snapshot fetch`; one
+  learner proves little, and a node logs `snapshot_fetch_single_reporter`.
+- **Sizes and a space check.** Reports and the catalog carry sizes; a node
+  fetches only when `free ≥ total + max(total/4, 1 GiB)`. Metrics
+  `uc2_snapshot_newest_agreed_bytes`, `uc2_snapshot_wont_fit`,
+  `uc2_snapshot_auto_fetch_total{outcome}`; alert `Uc2SnapshotWontFit`. An
+  unknown free-space reading is warned once, not alerted.
+- **Pins need an agreed origin** — refusal `61 pin_origin_not_agreed` at the
+  admin door (an empty catalog allows the pin unchecked and logs
+  `upgrade_pin_agreement_unchecked`).
+- **Pin completion** (rulings C1–C3, C6–C8): a pin is complete once an agreed set
+  the pin's `to` line built exists above the pin record. Until then every
+  node keeps the origin and holds the journal there; after it, a node
+  releases once it holds a completion set and its `to` instance has caught
+  up, and normal start and retention resume. The operator step is one
+  `uc2ctl snapshot` after upgrading every instance. This also turns a pinned
+  restart after purge from two installs into one.
+- `actor=auto` audit records are written off the consensus agent through a
+  bounded queue that counts drops and drains on shutdown.
+
+### Read-your-writes reads (#88)
+
+A third read mode, `Consistency::ReadYourWrites`: any node — leader,
+follower or learner — answers once its service has applied at least the
+client's **token**, the highest log position that client has seen. That
+gives read-your-writes and monotonic reads off the leader at close to
+snapshot-read cost. It is not linearizable: another client's recent write may
+be missing. A write's token is its frame start + 1, and a query answer
+carries the row's applied frontier; the token only grows, and `0` is a plain
+snapshot read. The node answers a token above its durable position with
+RETRY at once (a forged token costs one comparison) and parks the rest in
+per-row min-heaps (cap 4096, 1 s deadline). A client never returns an answer
+below the token it sent: the local SDK returns `ClientError::Retry`, the
+remote client re-sends in place, and both count it in a new `stale_answers`
+stat. API: `read_token()` / `observe()` carry a token across processes;
+`try_query_at_least` / `query_at_least_on` take an explicit one. The gateway
+relays each remote query's own token. Evidence: a 3-node capstone with the
+leader isolated every 1.5 s (0 violations over ~358 k cross-node monotonic
+reads); mutation teeth in `scripts/ryw_mutation.sh`; a client-hop A/B on AWS
+whose first −5.8 % was an inlining regression, fixed in `d20278b9` and re-run
+at −0.69 % against a −0.92 % rebuild control. **Known gaps**, in the spec's
+As-built block: no snapshot/purge churn in the capstone, no Elle
+session-guarantee pass, and no per-client fairness on the parked-read cap.
+
+### The backup tier, 3a (storage project 3, #100)
+
+An off-node copy of agreed snapshot sets and the committed journal, with a
+replicated watermark recording how far it reaches.
+
+- **Format** (`uc_node::tier`): write-once objects (tmp file, fsync, hard
+  link, directory fsync); zstd per 1 MiB block with a CRC-32 per block and
+  per object; `sets/<P>/` with its `SET` label written last;
+  `journal/<from>-<to>.ultj` holding committed bytes with padding bodies
+  zeroed. `zstd` is a new workspace dependency (it links the C library).
+- **Writer**: a `uc2-backup` thread on a node with `[backup] target = …` (a
+  learner is the natural writer) copies agreed, hash-checked sets and cuts
+  journal chunks at `min(commit, durable)` and at each set; it holds its own
+  node's purge until the tier has the bytes and lets go when disk runs low.
+- **Watermark**: `CLUSTER` kind 7 `BackupWatermark`, reported over pairwise
+  datagram 27 and appended by the leader under the single-in-flight rule;
+  monotone. `uc2ctl tier forget` is admin op 11 (refusal `62 tier_unknown`).
+- **Retention**: Settings v5 `backup_retain_sets` / `backup_retain_age`,
+  default keep everything; pin origins and rollback points are protected
+  until the pin completes.
+- **Restore** (`uc2ctl tier show | verify [--deep] | restore | fork |
+  export-corpus`) builds an instance dir as of any frame end Q with `S < Q ≤
+  reach`, atomically under the instance lock. A restore below the reach
+  writes a fence so writers refuse that tier afterwards; a fork commits its
+  single-voter membership at its first leadership (which also heals
+  `force-single-member`).
+- 11 `uc2_backup_*` metric families; alerts `Uc2BackupBehind`,
+  `Uc2BackupHoldReleased`, `Uc2BackupWriterError`, `Uc2BackupWriterStopped`.
+  New fuzz target `uc_node_tier_object`. The capstone `lin_backup_tier`
+  restores a 3-voter cluster plus a learner writer at Q, with a leader kill
+  during load: linearizable up to Q, nothing after Q visible, a new write
+  commits.
+
+### The backup tier, 3b (#107)
+
+- **Lineage.** Every `sets/<P>/SET` gains `lineage=t:b,…`, the term map at P;
+  `uc2ctl tier restore` writes it into the restored instance dir, so a
+  tier-restored node joins a live cluster without a truncation or a wipe, and
+  `--new-node --node-id <N>` (refused in 3a) replaces a node from the tier.
+- **Backup-gated purge.** Settings v6 `purge_requires_tiers` (`0` = off,
+  `1..=4`): the purge floor is the minimum of the local floor and the K-th
+  highest **verified** tier watermark (the writer reads every chunk and set
+  back before reporting). A node that can no longer fit one backup chunk
+  (`[backup] chunk_bytes`, default 64 MiB) under the auto-fetch space rule
+  releases the hold, latched and counted. Metrics `uc2_purge_gate_position`,
+  `uc2_backup_gate_released_total`; alert `Uc2BackupGateReleased`.
+- **The tier as a source.** `[tier_source]` names a tier a node may read; a
+  `uc2-tier-fetch` thread does every byte of tier I/O, never the consensus
+  agent. Store-only fetches (`uc2ctl snapshot fetch`, auto-fetch) try the
+  tier before a peer (audit key `fetch_source`, the 14th). A leader whose
+  follower is below the floor sends `TIER_INSTALL` (kind 28, 200 B) naming
+  the set S and carrying its own catalog verdict for it, because a brand-new
+  learner's catalog is empty; the follower answers `TIER_INSTALL_STATUS`
+  (kind 29) `Installing` / `Installed` / `Declined { reason }`, and the
+  leader falls back to a snapshot session after 2 s / 10 s / 30 s (10 s
+  settling grace after `Installed`). S is the newest agreed set in
+  `[floor, commit]` that is also at most the highest `newest_set` the tiers
+  hold (not their `through`, which can pass P before the set at P is
+  copied). Metrics `uc2_snapshot_fetch_total{source}`,
+  `uc2_tier_install_total{installed|declined|timeout}`. An explicit
+  `[tier_source]` naming a foreign tier refuses to start
+  (`tier_source_foreign`).
+- **Open:** ruling R10a (retention's view gate at the origin-set edge) is not
+  settled by 3b.
+
+### The cluster view (storage project 4, #108)
+
+`GET /cluster` serves one JSON document, schema `uc2.cluster-view/1`: the
+reading node's role, `view_position` and `commit`; the committed cluster
+state (membership, settings, schedule, upgrades, catalog, tiers, purge gate);
+this node's holdings and services; every member (on the leader only); and
+`attention` codes for conditions the node already detects. It is served on an
+always-on `<instance_dir>/obs.sock` (mode `0600`) and on the `[metrics]`
+listener when one is configured. `uc2ctl cluster` and `uc2ctl catalog` print
+it as text or `--json`, and from the newest cluster artifact when the node is
+stopped. `settings` / `schedule` / `upgrade show` read the live view, which
+closes the `2.11.0` gap "no cluster artifact yet" until the first instant;
+stopped, they fall back to the artifact with an `offline:` note on stderr.
+Conventions: hashes are hex strings, times RFC 3339 with nanoseconds, `null`
+means unknown (never `0`), no number above 2^53 (four u64 settings are
+decimal strings); offline, the catalog's `empty` is `false` or `null`, never
+`true`. The worst-case document is 411,342 B against a 512 KiB bound. No
+writes, no forwarding, no TLS, auth or CORS. `serde_json` is a new workspace
+dependency. `uc2ctl backup` never copies `obs.sock`.
+
+### Fixed since `2.13.0`
+
+Defects that shipped in `2.13.0` or earlier:
+
+- **A follower could apply bytes from the next lap of its log buffer, in
+  silence** ([#78](https://github.com/PeterKnego/ultima_cluster/issues/78),
+  [#80](https://github.com/PeterKnego/ultima_cluster/pull/80)). The validated
+  reader bounded its copy by the **leader's** appender reserve, but a
+  follower's writer is the receiver, which writes runs up to
+  `durable + capacity` ahead. The receiver now publishes a `write_reserve`
+  (cnc `264`) before copying, and every validated reader bounds itself by it.
+- **A follower service fail-stopped at the first log-buffer lap**
+  ([#77](https://github.com/PeterKnego/ultima_cluster/issues/77),
+  [#81](https://github.com/PeterKnego/ultima_cluster/pull/81)): commit is a
+  byte position, so the apply target can sit inside a frame, and replay
+  misread that as a journal gap (`SnapshotRequired`). It now waits
+  (`Replay::AwaitCommit`).
+- **The ingress ring could read a stale payload as a commit word**
+  ([#32](https://github.com/PeterKnego/ultima_cluster/issues/32),
+  [#63](https://github.com/PeterKnego/ultima_cluster/pull/63)): the lap tag
+  rejects an older lap's commit word but not its data, and a variable-length
+  record boundary can fall inside it — `IngressRingCorrupt` on the first wrap.
+  The consumer now zeroes every range it passes. Neither instants nor jumbo
+  frames were involved, as the issue first thought.
+- **A whole-cluster cold restart past `fsm_lag` never committed**
+  ([#95](https://github.com/PeterKnego/ultima_cluster/issues/95),
+  [#96](https://github.com/PeterKnego/ultima_cluster/pull/96)), and its
+  sibling, **a live cluster could stop committing for good after an election**
+  ([#99](https://github.com/PeterKnego/ultima_cluster/issues/99),
+  [#102](https://github.com/PeterKnego/ultima_cluster/pull/102)): durable
+  reports capped at `applied + fsm_lag` could never reach a new leader's
+  `NewTerm` frame when the uncommitted tail ran more than `fsm_lag` past the
+  rows' `applied` — at a cold restart because every slot reads `applied = 0`
+  and, since `2.13.0`'s boot gate, no service can attach to move it.
+- **`uc2ctl status` read a dead node as the leader**
+  ([#35](https://github.com/PeterKnego/ultima_cluster/issues/35),
+  [#64](https://github.com/PeterKnego/ultima_cluster/pull/64)): it now probes
+  `instance.lock` and prints `node: running=… heartbeat_age=…` first, and
+  the role line fails closed.
+- **The typed tier applied commands nobody sent**
+  ([#49](https://github.com/PeterKnego/ultima_cluster/issues/49),
+  [#59](https://github.com/PeterKnego/ultima_cluster/pull/59)): decode
+  discarded `bytes_read`. `decode_exact` now fail-stops on a payload it does
+  not consume whole. A length-identical field reorder still needs the version
+  tag.
+- **A read-only service capped its own read rate**
+  ([#97](https://github.com/PeterKnego/ultima_cluster/pull/97)): answered
+  queries did not count as apply progress, so the apply agent settled on its
+  50 µs sleep rung. See [Performance records](#performance-records-2140).
+- **A replay pass that moved nothing rewound the follower cursor and the
+  published `applied`** ([#90](https://github.com/PeterKnego/ultima_cluster/pull/90)),
+  which is meant to be increase-only and which linearizable reads read.
+- **A remote client could not resume a saved `client_id`**
+  ([#34](https://github.com/PeterKnego/ultima_cluster/issues/34),
+  [#114](https://github.com/PeterKnego/ultima_cluster/pull/114)): it restarted
+  at seq 1, so `Sessioned` answered new commands with old cached replies.
+  `RemoteConfig::first_seq` and `next_seq()` resume a session.
+- **`uc2ctl backup` copied the 64 MiB segment preallocation file**
+  (#42 L44, [#114](https://github.com/PeterKnego/ultima_cluster/pull/114));
+  backup and restore now skip `seg-prealloc.*.tmp`.
+- **Small, from #37** ([#109](https://github.com/PeterKnego/ultima_cluster/pull/109)):
+  `uc2ctl` refuses a mistyped `--instance-dir` by name instead of printing
+  "no cluster artifact yet" and exiting 0; `tier forget` prints `0x` ids;
+  `NodeConfig::full_max_payload(crypto)` replaces the examples' hard-coded
+  256 B command cap.
+- `counter-service` and `kv-service` registered their SIGTERM handler after
+  the boot wait, so a stop during it killed them (#60); the
+  `services_declared_withheld` warning is timed on the pass clock (#61).
+
+Defects found in this release's own unreleased work, fixed before it shipped:
+a set installed by snapshot session was never reported as held
+([#82](https://github.com/PeterKnego/ultima_cluster/issues/82),
+[#83](https://github.com/PeterKnego/ultima_cluster/pull/83)); a start set
+frozen before its row applied anything could not start a service
+([#98](https://github.com/PeterKnego/ultima_cluster/issues/98),
+[#106](https://github.com/PeterKnego/ultima_cluster/pull/106)); the
+catalog's report aggregation starved under a lagging voter (erratum R37); and
+a fresh leader answered membership changes with retry after #100 (#101,
+#103). Test-only fixes: #62, #72 (#75), #79, #84 (#86), #74, #91, #92 (a
+diagnostic for the still-open #85), #111 (#112).
+
+### Performance records (`2.14.0`)
+
+No feature in this release carried a fleet rate bar (see the table above).
+Four read-path records ran on the fleet, each with bars pre-committed before
+its run:
+
+- [Read spread, 2026-10-07](benchmarks/uc2-read-spread-2026-10-07.md):
+  snapshot-read capacity scales with the nodes answering — S = 2.74
+  read-only, 3.65 under 20 k writes/s, on 3 nodes, against a 2.4 bar.
+- [Read types under writes, 2026-10-10](benchmarks/uc2-read-types-under-writes-2026-10-10.md)
+  (c6id): Q1 and Q2 PASS; its 0-writes column is the idle cap #97 removed.
+- [Query drain A/B, 2026-10-10](benchmarks/uc2-query-drain-progress-2026-10-10.md):
+  read-only reads 3.81–5.62× on every arm (PASS); the write-path rows are
+  inconclusive (noisy runs), reported as such.
+- [Read types under writes on c9gd, 2026-10-11](benchmarks/uc2-read-types-under-writes-c9gd-2026-10-11.md)
+  (3 × Graviton c9gd.4xlarge): 15.1 M read-your-writes spread reads/s beside
+  2 M committed writes/s; a 4.6–5.3 M committed-writes/s ceiling with reads;
+  Q2 PASS (4.35); **Q3 FAIL** (leader read-your-writes ÷ snapshot 0.83
+  against 0.90), bar kept, follow-up open.
+
+### Release evidence (`2.14.0`)
+
+| what | evidence | result |
+|---|---|---|
+| `ci.yml` (fmt gate, clippy, workspace tests, MSRV 1.89, deny, publish-check) | on the release-prep head | pending — filled at tag time |
+| `docs.yml` (rustdoc, link check) | on the release-prep head | pending — filled at tag time |
+| `release.yml` dry run (build ×2, SBOM, `release-smoke`; no signing, no publish) | `workflow_dispatch` with `dry_run: true`, `cut-a-release.md` §2 | pending — filled at tag time |
+| `release.yml` on the tag (release, image, cosign) | run on tag `v2.14.0` | pending — filled at tag time |
+| the local proof stack: `cargo fmt --all -- --check`, every `clippy` line in `ci.yml` **including the MSRV gate**, the fixture builds, `cargo test --workspace`, `pin_verify`, `lin_v2`, `lin_partition_v2`, `lin_backup_tier`, the hard-crash suite, `cargo +nightly fuzz build`, `scripts/check_doc_links.py` | on the release-prep head | pending |
+| the rest of the proof surface (`docs/VERIFICATION.md`): Elle, loom, Lean + conformance, fuzz smoke (26 targets) | the release procedure's own step | pending |
+| fleet apply-hop A/B for #33 (`a409b3ae` vs `a70539a1`, `scripts/apply_ab.sh`) | owed by #68 before the cut; the dev-box smoke (−2.8 % within a 4.2 % resolution) decides nothing | **pending** |
+| the M10 alert tier, with the seven new rules | `scripts/m10_alert_fire.sh` | pending on the release-prep head (33 rules passed at #100's head) |
+| artifact integrity (`sha256sum -c`) and provenance (`cosign verify-blob`, `cosign verify`) | `cut-a-release.md` §5 from a clean directory | pending — filled at tag time |
+| release quickstart, from the unpacked tarball | `cut-a-release.md` §5: `packaging/quickstart-local.sh` | pending — filled at tag time |
+| crates.io (14 crates, `uc_service` before `uc_node`, `uc_diffreplay` after it) | `cut-a-release.md` §6, in dependency order | pending — filled at tag time; no new crate name |
+
+<!-- PENDING: tag-time evidence rows above -->
+
 ## v2.13.0 — 2026-09-22 — the FSM upgrade lifecycle
 
 **One flag day: wire `0.8.0` → `0.9.0` and cnc `3.2` → `3.3`, plus a row

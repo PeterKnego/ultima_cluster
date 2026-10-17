@@ -330,7 +330,8 @@ standard 1312 B ceiling, it emits one warn-level record, once per client:
 ```
 
 (One line in the real file; wrapped here. The `ceiling` field is the shmem
-tier's only — `uc_remote` omits it, because protocol v1 advertises none.)
+tier's only — `uc_remote` omits it, because the remote protocol (v1 and v2)
+advertises none.)
 
 Grep your logs for `command_over_standard_ceiling` in CI. Two things to know
 when you do:
@@ -342,8 +343,8 @@ when you do:
 - `uc_remote` measures the **bare** command, while the node's door sees the
   command plus the 16-byte session envelope when the edge has sessions on. A
   command within 16 B of the threshold can therefore cross it at the node
-  without warning at the remote client. Protocol v1 gives the client no way to
-  know whether the envelope is on.
+  without warning at the remote client. The remote protocol gives the client
+  no way to know whether the envelope is on.
 
 **The hard pin.** On the `Engine` tier, set the client door to the standard
 ceiling so an oversize command is an error rather than a warning:
