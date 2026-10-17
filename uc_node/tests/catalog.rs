@@ -1371,9 +1371,11 @@ fn a_stalled_set_stays_commanded_and_the_next_instant_completes() {
 /// pinned origin is kept beside them only while its pin is INCOMPLETE, and
 /// once an agreed set above the pin record completes the pin, the origin is
 /// an ordinary set — retired from the catalog and from every node's disk by
-/// normal retention — while the journal floor follows the newest agreed set.
+/// normal retention. The snapshot floor follows the newest agreed set, and
+/// the journal is held at the OLDEST retained one, so that set is still a
+/// start point (`retain_sets > 1` keeps journal, not just files).
 ///
-/// Instants `p1`, `p2` (catalog `[p1, p2]`, journal purged past `p1`); a
+/// Instants `p1`, `p2` (catalog `[p1, p2]`, journal held at `p1`); a
 /// same-line pin naming `p2` as row 0's origin, with every node's row already
 /// attached on that line; `p3` — above the pin record, so it COMPLETES the
 /// pin: the unpinned agreed sets are `[p1, p2, p3]`, so `p1` retires and the
@@ -1416,15 +1418,30 @@ fn retain_sets_2_keeps_a_pinned_origin_only_until_the_pin_completes() {
             "node {i}: a retained set stays on disk"
         );
     }
-    // The journal follows the NEWEST agreed set held (p2), not the oldest
-    // retained one (p1): retention keeps artifacts, not journal.
+    // The snapshot floor follows the NEWEST agreed set held (p2), but the
+    // journal is held at the oldest retained one (p1): purged up to p1's
+    // segment and no further, so p1 can still be rolled forward to p2.
+    assert!(p1 > 2 * SEG, "need segments below p1");
     assert!(p2 - p1 > 2 * SEG, "need segments between p1 and p2");
-    await_until(30, "every node purged its journal past p1", || {
+    await_until(30, "every node's floor reached p2", || {
+        all.iter().all(|&i| floor(&c, i) == p2)
+    });
+    await_until(30, "every node purged its journal up to p1", || {
         all.iter().all(|&i| {
             let b = c.node(i).archive_first_base();
-            b > p1 && b <= p2
+            b + 2 * SEG > p1 && b <= p1
         })
     });
+    // Ten floor-persist throttles later, still held at p1.
+    std::thread::sleep(std::time::Duration::from_secs(1));
+    for &i in &all {
+        let b = c.node(i).archive_first_base();
+        assert!(
+            b <= p1,
+            "node {i}: the journal is held at the oldest retained set \
+             (first_base={b}, p1={p1})"
+        );
+    }
 
     // A same-line pin naming p2 as row 0's origin.
     let version = c.cnc(leader).service_slot(0).status.version();
@@ -1440,9 +1457,10 @@ fn retain_sets_2_keeps_a_pinned_origin_only_until_the_pin_completes() {
         })
     });
 
-    submit_frames(c.node(leader), 4000);
+    submit_frames(c.node(leader), 8000);
     let p3 = instant_until_complete(&c, leader, &all);
     assert!(p3 > record, "p3={p3} sits above the pin record {record}");
+    assert!(p3 - p2 > 2 * SEG, "need segments between p2 and p3");
     await_agreed(&c, &all, p3);
     // Ruling C3: p3 completes the pin, so p2 is an ordinary agreed set and
     // the unpinned agreed sets are [p1, p2, p3] — one over retain_sets.
@@ -1477,14 +1495,14 @@ fn retain_sets_2_keeps_a_pinned_origin_only_until_the_pin_completes() {
             holds_on_disk(c.dir(i), &[0], p4),
             "node {i}: the newest agreed set is on disk"
         );
-        await_until(30, "the purge followed the floor", || {
-            c.node(i).archive_first_base() > p3
+        await_until(30, "the purge passed the completed pin's origin", || {
+            c.node(i).archive_first_base() > p2
         });
         let b = c.node(i).archive_first_base();
         assert!(
-            b > p3 && b <= p4,
-            "node {i}: the journal follows the newest agreed set p4 (first_base={b}, \
-             p3={p3}, p4={p4}) — the floor passed the completed pin's origin"
+            b > p2 && b <= p3,
+            "node {i}: the journal is held at the oldest retained set p3 \
+             (first_base={b}, p2={p2}, p3={p3}) — past the completed pin's origin"
         );
     }
 

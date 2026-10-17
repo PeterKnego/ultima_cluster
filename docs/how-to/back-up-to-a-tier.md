@@ -491,8 +491,8 @@ voter on the peer session, as before.
 ## What the tier does not do yet
 
 - **Local snapshot retention ignores the tier.** Sets are kept per
-  `retain_sets` as before. Journal purge follows the tier only when
-  `purge_requires_tiers` is on.
+  `retain_sets` as before, with the journal held from the oldest of them.
+  Journal purge follows the tier only when `purge_requires_tiers` is on.
 - **The tier is not a live log.** A node reads sets from it, never its
   journal; the log above a peer's purge floor always comes from peers.
 - **Offline commands only.** `show`, `verify` and the restores read files.

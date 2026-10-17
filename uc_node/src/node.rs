@@ -6408,6 +6408,18 @@ impl Consensus {
         if let PurgePolicy::BelowSnapshot { slack_bytes } = self.purge_policy {
             let mut target = self.snapshot_persisted_floor.saturating_sub(slack_bytes);
             let first_base = self.archive_first_base.load(Ordering::Acquire);
+            // `retain_sets > 1`: an older retained set is a start point only
+            // with the journal from it to the floor, so hold the purge at the
+            // oldest one this node can still replay from. Read only when a
+            // purge is due; `retain_sets = 1` (the default) never reaches it.
+            if target > first_base
+                && self.cluster_view.retain_sets.load(Ordering::Acquire) > 1
+                && let Some(hold) = self.retain_hold(first_base)
+                && hold < target
+            {
+                target = hold;
+                held = true;
+            }
             // Backup-tier spec §5.4: on a writer's node, never purge journal
             // the tier lacks. Read only when a purge is due, so an idle node
             // never reaches it; a clamp that leaves nothing to do counts as
@@ -6594,6 +6606,39 @@ impl Consensus {
             }
         }
         shared.purge_cap()
+    }
+
+    /// The journal hold `retain_sets > 1` puts on the purge: the OLDEST agreed
+    /// set the catalog lists that this node holds complete AND can still
+    /// replay forward from (`p >= first_base`) — or `None` while the catalog
+    /// is `Empty` (R26) or no such set exists. Spec §4.4 rule 3 purged below
+    /// the effective floor whatever `retain_sets` said, which left an older
+    /// retained set as a file nothing could roll forward; this is what makes
+    /// it a start point.
+    ///
+    /// A retained set already below `first_base` (its journal was purged
+    /// before it was retained, or before an upgrade) is skipped rather than
+    /// holding every purge until it retires: the journal it lacks is gone
+    /// either way. So raising `retain_sets` never holds journal for a set
+    /// whose span is already purged, and lowering it releases at the next
+    /// retention. No low-space release: the hold is bounded by `retain_sets`
+    /// instants' worth of journal, which is the operator's choice.
+    #[inline(never)]
+    fn retain_hold(&self, first_base: u64) -> Option<u64> {
+        let inner = self.cluster_view.snapshot_inner();
+        let catalog = &inner.catalog;
+        if !catalog.iter().any(|e| e.state == SetState::Complete) {
+            return None;
+        }
+        // The catalog is oldest first, so the first match is the oldest.
+        catalog
+            .iter()
+            .find(|e| {
+                e.position >= first_base
+                    && e.is_agreed()
+                    && self.holdings_held.contains(&e.position)
+            })
+            .map(|e| e.position)
     }
 
     /// Catalog spec §4.4: this node's EFFECTIVE floor candidate — the newest
@@ -17034,6 +17079,73 @@ mod tests {
             matches!(h._trunc_rx.try_recv(), Ok(ArchiveCmd::Purge { below }) if below == agreed),
             "the purge target is the agreed set held, not own"
         );
+    }
+
+    /// `retain_sets > 1` holds the journal at the oldest retained agreed set
+    /// this node holds and can replay from, so that set is a start point and
+    /// not just a file. The floor itself still moves to the newest. Not held:
+    /// at `retain_sets = 1`, for a set this node does not hold, for a
+    /// diverged set, or for a set already below the journal's first base.
+    #[test]
+    fn retain_sets_holds_the_purge_at_the_oldest_retained_set_held() {
+        use uc_protocol::v2::catalog::RowVerdict;
+        use uc_protocol::v2::upgrade::RowRunning;
+        let mut h = harness_with_rows(&["a"]);
+        h.cons.declared_published = true;
+        h.cons.purge_policy = PurgePolicy::BelowSnapshot { slack_bytes: 0 };
+        let (old, mid, new) = (2048u64, 4096u64, 6016u64);
+        assert!(new <= h.cons.cnc.counters().durable.load_acquire());
+        let publish = |h: &mut Harness, retain: u16, mid_agreed: bool| {
+            let mut st = h.cons.cluster_view.to_state();
+            let mut m = agreed_entry(mid);
+            if !mid_agreed {
+                m.rows[0].verdict = RowVerdict::Diverged;
+            }
+            st.catalog = vec![agreed_entry(old), m, agreed_entry(new)];
+            st.settings.retain_sets = retain;
+            st.running[0] = Some(RowRunning {
+                row: 0,
+                version: 1,
+                record_pos: 1,
+            });
+            h.cons.cluster_view.publish(&st);
+        };
+        let purge = |h: &mut Harness| -> Option<u64> {
+            h.advance_floor_timer();
+            h.cons.maybe_persist_snapshot_floor();
+            let mut last = None;
+            while let Ok(cmd) = h._trunc_rx.try_recv() {
+                if let ArchiveCmd::Purge { below } = cmd {
+                    last = Some(below);
+                }
+            }
+            last
+        };
+        h.cons.snapshot_set_position.store(new, Ordering::Release);
+        h.cons.note_set_held(mid);
+        h.cons.note_set_held(new);
+
+        // `old` is not held here, `mid` is: the hold is at `mid`.
+        publish(&mut h, 3, true);
+        assert_eq!(purge(&mut h), Some(mid), "held at the oldest set held");
+        assert_eq!(h.cons.snapshot_persisted_floor, new, "the floor moves");
+
+        // Holding `old` too moves the hold down to it.
+        h.cons.note_set_held(old);
+        assert_eq!(purge(&mut h), Some(old));
+
+        // A diverged set is never a start point; `old` still holds.
+        publish(&mut h, 3, false);
+        assert_eq!(purge(&mut h), Some(old));
+
+        // A set below the journal's first base is skipped, not waited on.
+        h.cons.archive_first_base.store(old + 1, Ordering::Release);
+        publish(&mut h, 3, true);
+        assert_eq!(purge(&mut h), Some(mid));
+
+        // `retain_sets = 1`: no hold, the purge goes to the floor.
+        publish(&mut h, 1, true);
+        assert_eq!(purge(&mut h), Some(new));
     }
 
     /// `effective_floor_in`'s two remaining branches: `own` LISTED but not
