@@ -204,6 +204,11 @@ defects #77 and #78 (below). New fuzz target `uc_protocol_status_body`.
   waits on the network, and the purge rule is unchanged. On a learner-only
   cluster this is what lets voters purge without `uc2ctl snapshot fetch`; one
   learner proves little, and a node logs `snapshot_fetch_single_reporter`.
+  A set that lands below the node's fetch high-water mark — an operator
+  fetched a newer, not-yet-agreed set first — is noted held and completes
+  its fetch all the same; through the lifecycle's review it was never noted,
+  timed out and was re-fetched on the backoff ladder
+  ([#125](https://github.com/PeterKnego/ultima_cluster/issues/125)).
 - **Sizes and a space check.** Reports and the catalog carry sizes; a node
   fetches only when `free ≥ total + max(total/4, 1 GiB)`. Metrics
   `uc2_snapshot_newest_agreed_bytes`, `uc2_snapshot_wont_fit`,
