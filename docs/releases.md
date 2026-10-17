@@ -428,6 +428,7 @@ its run:
 | `docs.yml` (rustdoc, link check) | on the release-prep head | pending — filled at tag time |
 | `release.yml` dry run (build ×2, SBOM, `release-smoke`; no signing, no publish) | `workflow_dispatch` with `dry_run: true`, `cut-a-release.md` §2 | pending — filled at tag time |
 | `release.yml` on the tag (release, image, cosign) | run on tag `v2.14.0` | pending — filled at tag time |
+| `nightly.yml` on the tag (capstones, sim-heavy, loom, crashtest, quickstart, fuzz, elle) | run on tag `v2.14.0` — the first tag the suite runs on, since the `push: tags` trigger ([#120](https://github.com/PeterKnego/ultima_cluster/issues/120)) | pending — filled at tag time |
 | the local proof stack: `cargo fmt --all -- --check`, every `clippy` line in `ci.yml` **including the MSRV gate**, the fixture builds, `cargo test --workspace`, `pin_verify`, `lin_v2`, `lin_partition_v2`, `lin_backup_tier`, the hard-crash suite, `cargo +nightly fuzz build`, `scripts/check_doc_links.py` | on the release-prep head | pending |
 | the rest of the proof surface (`docs/VERIFICATION.md`): Elle, loom, Lean + conformance, fuzz smoke (26 targets) | the release procedure's own step | pending |
 | fleet apply-hop A/B for #33 (`a409b3ae` vs `a70539a1`, `scripts/apply_ab.sh`) | owed by #68 before the cut; the dev-box smoke (−2.8 % within a 4.2 % resolution) decides nothing | **pending** |

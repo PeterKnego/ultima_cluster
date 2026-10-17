@@ -364,6 +364,12 @@ a half-published version is recoverable; a wrong published version is not.
       --jq '.[].metadata.container.tags'`.
 - [ ] The gate doc for the milestone records the release, per the honest-failure
       protocol every milestone has used.
+- [ ] **`nightly.yml` ran on the tag.** Since #120 a `v*` push triggers the
+      full proof suite on the tagged commit (`gh run list --workflow
+      nightly.yml --branch v<version>`); wait for it and fill its run id into
+      the release-evidence table's nightly row. A red leg there is a release
+      fact to record, not a reason to delete the tag — the tag's own
+      `release.yml` run and §5 have already judged the artifacts.
 - [ ] **Bump `uc_starter`.** In a checkout of `PeterKnego/uc_starter`: `make uc-upgrade VERSION=<new>`, commit, push, wait for `template-ci` green, then `git tag v<new> && git push origin v<new>`. A release is not done until the starter generates, builds and passes its cluster smoke against it (spec `docs/superpowers/specs/2026-09-24-uc-starter-design.md` §8).
 
 ## Related
