@@ -183,7 +183,8 @@ of row c under its restated bar; (5) **B-lite's disposition**, still
 undetermined. Two carried-over unknowns, neither blocking: the 58-minute
 `remote_lin` hang of 2026-09-08 is still unexplained (it fails with a name now,
 since `common::join_within` and the 30 s `Reap::drop` landed 2026-09-12), and
-`nightly.yml` has still never run on a tag commit. The cluster FSM / coordinated snapshots spec is
+`nightly.yml` has never run on a tag commit through `v2.13.0` — a `push: tags`
+trigger landed with #120, so `v2.14.0` is the first tag it runs on. The cluster FSM / coordinated snapshots spec is
 `docs/superpowers/specs/2026-09-05-uc2-cluster-fsm-and-coordinated-snapshot-design.md`
 (read its two "Errata … as built" sections before the body); its three plans
 (`docs/superpowers/plans/2026-09-06-uc2-cluster-fsm-plan1.md`,
@@ -243,7 +244,8 @@ top of `docs/releases.md`). It left two items open, neither a blocker.
 `uc2ctl` had one is **CLOSED**: clap emits `--version` only under
 `#[command(version)]`, a unit test guards it, and the `2.12.0` release
 tarball's own §5 run has all three binaries printing `2.12.0`.
-`nightly.yml` having never run on a tag commit is still open. M14c2 is done — the two-FSM capstones
+`nightly.yml` having never run on a tag commit is CLOSED by #120's `push: tags`
+trigger, pending its first tag run at `v2.14.0`. M14c2 is done — the two-FSM capstones
 (`lin_v2 two_fsm*`, `lin_partition_v2`, the two hard-crash scenarios, the
 Elle `quiet_two_fsm` pass), the lockstep verdict (an operating-envelope
 fact, not a defect) and the `--pin` fleet rig shipped as `2.8.1`. The rig's
