@@ -308,8 +308,13 @@ replicated watermark recording how far it reaches.
   `uc2_tier_install_total{installed|declined|timeout}`. An explicit
   `[tier_source]` naming a foreign tier refuses to start
   (`tier_source_foreign`).
-- **Open:** ruling R10a (retention's view gate at the origin-set edge) is not
-  settled by 3b.
+- **Retention's view gate, settled** (ruling R10a's origin-set edge,
+  [#126](https://github.com/PeterKnego/ultima_cluster/issues/126)): a writer
+  plans a deletion pass only once its view has walked past this node's
+  commit position as read before the listing and has agreed every tier set
+  it still lists, so a pin protecting an older set is in the view the pass
+  plans from. Through 3b a pin committing between a newer set's instant and
+  its agreement could be missed and its origin set deleted from the tier.
 
 ### The cluster view (storage project 4, #108)
 
