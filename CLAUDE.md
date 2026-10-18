@@ -14,11 +14,54 @@ took those names in the `uc2_*` → `uc_*` rename (see `RELEASES.md`), so a
 pre-rename commit or doc naming them means the deleted v1 crate, not this
 code.
 
-**Current version: `2.13.0`** — tagged 2026-09-22 at `0909cf6` (the plan-D
-merge). `docs/how-to/cut-a-release.md` §2–§7 are done: the dry run and the tag
-run both green first time, §5 verified from a clean directory, and **all 14
-crates live on crates.io** (the new name `uc_diffreplay` drew no rate limit).
-The evidence table at the top of `docs/releases.md` has every row filled.
+**Current version: `2.14.0`** — tagged 2026-10-17 at `467ef0e4` (the merge
+of #164, the fuzz-corpus fix the release-prep prune check found).
+`docs/how-to/cut-a-release.md` §2–§6 are done: the dry run and the tag run both
+green first time, `nightly.yml` green on the tag (the first tag it ran on,
+#120), §5 verified from a clean directory, and **all 14 crates live on
+crates.io** in 101 s with zero retries. The evidence table at the top of
+`docs/releases.md` has every row filled.
+
+**`2.14.0` — RELEASED 2026-10-17: snapshot sets the cluster agrees on, an
+off-node backup tier, and read-your-writes reads.** One flag day: wire `0.9.0`
+→ `0.11.0` (`0.10.0` was never released on its own), cnc `3.3` → `3.4`, and the
+client↔gateway remote protocol v1 → v2. Eight features merged one at a time
+after `2.13.0`: #33 the row running version, #67 mandatory snapshots, the
+snapshot catalog, the snapshot lifecycle, read-your-writes reads, the backup
+tier (3a writer and `uc2ctl tier`; 3b backup-gated purge and the tier as a
+source), and the cluster view; #49's `decode_exact` fix ships here too. The
+writeup is in `RELEASES.md` and `docs/releases.md`; the operator steps are
+`docs/how-to/upgrade-a-cluster.md` § "Upgrading from 2.13.0 to 2.14.0".
+What a new task must know:
+  - **Stop every node before starting any node**, and upgrade gateways and
+    remote clients together: v1 and v2 remote peers refuse each other at
+    `HELLO`. Every service is rebuilt against the new SDK
+    (`start_with_snapshots()` is gone).
+  - **`retain_sets > 1` holds the journal** at the oldest retained agreed set
+    (#115), so an older set is a place to replay from, not just a file.
+  - **The #33 apply-hop gate is an honest FAIL, bar kept**: #33 costs 2.5 % at
+    N=1, and later merges a further 4.2 %, Ice Lake only and with no extra
+    instructions per frame
+    ([#149](https://github.com/PeterKnego/ultima_cluster/issues/149)). 61 % of
+    the apply hop is the egress ring's per-record CRC-32
+    ([#150](https://github.com/PeterKnego/ultima_cluster/issues/150)).
+  - **An apply-hop A/B must vary layout.** `scripts/apply_ab.sh`'s same-source
+    rebuild control cannot see code layout, which moves this hop by 2–3 % on
+    Ice Lake. Link each source under several
+    `rust-lld --shuffle-sections='.text*=<seed>'` seeds and compare the
+    distributions (`docs/benchmarks/uc2-row-running-version-apply-ab-2026-10-17.md`
+    §6). The c6id.2xlarge exposes no hardware PMU.
+  - **`Node::submit` returning `Ok` means queued, not appended** (#155). A
+    test that samples `append` right after submitting reads below frames the
+    leader has accepted.
+  - **The committed fuzz corpus is exactly `seed-corpus`'s output.** A seed
+    added by hand is pruned at the next regeneration, and a wire change that
+    alters a seed's bytes needs a regeneration in the same PR (#164 fixed
+    both drifts at the cut).
+
+**Previous tagged version: `2.13.0`** — tagged 2026-09-22 at `0909cf6` (the
+plan-D merge); all 14 crates published the same day. Its block below still
+binds work on pins and on attach.
 
 **`2.13.0` — RELEASED 2026-09-22: the FSM upgrade lifecycle.** Upgrading a
 state machine becomes a **pinned, per-row** procedure the platform enforces:
@@ -68,7 +111,7 @@ What a new task must know:
     1.89's clippy fires lints the pinned 1.96 does not, which is how PR #56
     went red on a branch whose whole local proof stack was green.
 
-**Previous tagged version: `2.12.0`** — tagged 2026-09-13 at `a5c42a8`: jumbo-frame
+`2.12.0` — tagged 2026-09-13 at `a5c42a8`: jumbo-frame
 discovery and the monotonic log clock, one flag day (wire `0.7.0` → `0.8.0`,
 cnc `3.1` → `3.2`); the next block is what it shipped and how it was gated.
 All 13 crates published to crates.io the same day in 68 s, zero retries, so
@@ -164,13 +207,13 @@ names** hard and new *versions* barely at all, so `2.9.0`'s twelve new
 names took 62 minutes and `2.10.0`'s one took 59 seconds.)
 
 Deliverable 3, [#49](https://github.com/PeterKnego/ultima_cluster/issues/49),
-is **fixed 2026-09-22 (its own PR off `0b73c32`), unreleased**: `decode_exact` in
+is **fixed 2026-09-22 (its own PR off `0b73c32`), shipped in `2.14.0`**: `decode_exact` in
 `uc_service/src/traits.rs` makes the typed tier fail-stop on a payload it does
 not consume whole (four of the five measured silent misparses; the
 length-identical reorder still needs the version tag), with no wire, cnc or
-API change — its release bullet lands with the next cut.
+API change.
 
-Next up, now that `2.13.0` is tagged and published: (1) **the standing bar
+Next up, now that `2.14.0` is tagged and published (its #33 gate left #149 and #150 open): (1) **the standing bar
 question** — the `2.12.0` gates added two more rate bars an order of magnitude
 below the rig's variance, so four bars across two releases are now unadjudicable
 as written; how to construct a rate bar this rig can actually rule on is a
@@ -279,19 +322,20 @@ one log stream (#11); the release-ledger line (#5) is process, not code
 
 ### Standing facts that bind new work
 
-- **Read-your-writes is folded into the unreleased cnc 3.4, and the remote
-  protocol is v2 (both unreleased until the next cut).** `FLAG_V2_MIN_POSITION`
+- **Read-your-writes is in cnc 3.4, and the remote protocol is v2 (both
+  shipped in `2.14.0`).** `FLAG_V2_MIN_POSITION`
   on `query.ring` carries an 8-byte `min_position` prefix; the remote query
   flag is `FLAG_MIN_POSITION = 0x20`, and v1 and v2 remote peers refuse each
   other at `HELLO` (`HELLO_REFUSED_VERSION`). A 3.4 client refuses a
   read-your-writes read with a non-zero token on a released 3.3 page by name
-  (`ReadYourWritesUnsupported`). Unreleased cnc additions fold into 3.4
-  rather than bumping it (the snapshot-lifecycle start-set words did too).
+  (`ReadYourWritesUnsupported`). The snapshot-lifecycle start-set words
+  folded into 3.4 before the cut; a new cnc addition now bumps it.
   The node↔node wire is unchanged. `uc_remote` has its own `ReadToken` type
   (`uc_protocol` stays a dev-only dependency). Explainer
   `docs/notes/uc2-read-your-writes-explained.md`.
-- **The wire protocol SHIPPED is 0.9.0** (`2.13.0`, cnc `3.3`, tagged
-  2026-09-22); `0.8.0` + cnc `3.2` was `2.12.0`. `0.9.0` adds `CLUSTER`
+- **The wire protocol SHIPPED is 0.11.0** (`2.14.0`, cnc `3.4`, tagged
+  2026-10-17; `0.10.0` folded into it unreleased); `0.9.0` + cnc `3.3` was
+  `2.13.0`, and `0.8.0` + cnc `3.2` was `2.12.0`. `0.9.0` adds `CLUSTER`
   kinds 4 `UpgradePin` and 5 `SnapshotReport` plus pairwise `SNAP_REPORT` 26,
   with no layout change either side — which is exactly why it is unsound to
   mix: a `0.8.0` peer parses those frames and drops them as an unknown kind,
@@ -308,8 +352,8 @@ one log stream (#11); the release-ledger line (#5) is process, not code
   mixed-version** — a 0.4.0 peer's durable report reads as unattested and is
   not counted, so a mixed cluster stalls commits rather than making unsound
   ones; upgrade all nodes together. The client↔gateway remote protocol is
-  separate: v1 through `2.13.0`, **v2 on `main` as of read-your-writes**
-  (unreleased until the next cut; see the cnc bullet above). What is API vs.
+  separate: v1 through `2.13.0`, **v2 since `2.14.0`** (read-your-writes;
+  see the cnc bullet above). What is API vs.
   what is flag-day: `docs/reference/semver-policy.md`.
 - **`2.11.0` (tagged 2026-09-08, `ff0f5b6`) is five features on one flag
   day** (FSM identity, log time and timers plan 1, the replicated schedule
@@ -611,7 +655,7 @@ one log stream (#11); the release-ledger line (#5) is process, not code
   per-record commit, and the Broadcast ring's seqlock read barrier — the last
   found and fixed a real weak-memory defect when it was written, 2026-08-31),
   **26** fuzz targets (15 before `2.11.0`, which added eight; `2.12.0` added
-  `uc_protocol_probe`, and the unreleased catalog and backup tier added
+  `uc_protocol_probe`, and `2.14.0`'s catalog and backup tier added
   `uc_protocol_status_body` and `uc_node_tier_object`), Miri (pure decoders + `uc_remote`'s
   Vec-backed SPSC internals; the mmap'd IPC rings are out of Miri's reach).
 - **`cargo fmt` is ENFORCED** since 2026-08-31: `cargo fmt --all -- --check`
@@ -767,7 +811,7 @@ Workspace crates:
 - `uc_client` — sync local-shmem input-client SDK. Small dep set (no transport,
   no consensus); matcher over the broadcast response ring.
 - `uc_remote` — **M12a**: the remote wire protocol (protocol v2 since
-  read-your-writes, unreleased until the next cut; v1 before: framed TCP,
+  `2.14.0`, for read-your-writes; v1 before: framed TCP,
   credit-gated flow control, `REDIRECT`/`LEADER_CHANGED`/`RETRY`) and
   `RemoteClient`, the pipelined, redirect-following, re-sending Rust
   implementation of it — for clients that cannot attach to shmem directly.
