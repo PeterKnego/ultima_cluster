@@ -220,6 +220,28 @@ All framed by the docs as characterisation, not defects:
   offered" can be stated in the same terms Adaptive's cluster benchmarks
   use. Kernel bypass and the net-decomp brief's WIRE(P) instrument are
   declined by the same record (the whole round trip is 33.5 µs).
+- **Time-based hot-path latency, as an option (recorded 2026-10-18).**
+  Every hot-path reading on `/metrics` is a position or a counter — the two
+  lag gauges are `append − commit` and `commit − applied` in bytes — and the
+  only duration histograms are timer lateness and the snapshot freeze. No
+  node measures submit→commit, commit→apply or a single frame's apply in
+  time, and the gateway measures no remote round trip. The frame header's
+  leader stamp (`time_ns`, 2.11.0) is the natural source: the apply loop
+  could record `now − hdr.time_ns` per frame, and the archive agent a
+  per-fsync duration, into a fixed-bucket histogram. **The cost is the
+  decision**: a clock read and a bucket increment in the apply body is
+  exactly the shape the 2.11.0 regression taught us to A/B on `apply_bench`
+  before trusting (`CLAUDE.md` § Finding a performance bottleneck), and
+  sampling (every Nth frame, or once per pass on the pass's last frame)
+  is the likely compromise. The cheap, counter-only parts are filed
+  separately and do not depend on this decision: a frame count
+  ([#171](https://github.com/PeterKnego/ultima_cluster/issues/171)), archive
+  counters plus an `append − durable` gauge
+  ([#172](https://github.com/PeterKnego/ultima_cluster/issues/172)), and a
+  `/metrics` on `uc2-gateway`
+  ([#173](https://github.com/PeterKnego/ultima_cluster/issues/173)). A
+  service that wants per-command latency today can compute it in its own
+  `apply` from `ctx.time_ns` and its own clock, at its own cost.
 - **Why not first:** no user is asking for more than the current ceiling;
   every number here is a fleet characterisation with its caveats disclosed.
 - **Inspect `ABTRDA3` (recorded 2026-09-16)** —
