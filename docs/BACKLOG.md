@@ -104,16 +104,35 @@ deferred by name:
   `docs/superpowers/specs/2026-09-02-uc2-fsm-identity-design.md` §7), and the
   committed per-row running version with the pin (`2.13.0` and
   [#33](https://github.com/PeterKnego/ultima_cluster/issues/33)). What is left
-  is the rolling-upgrade semantics: a committed per-row level, so two versions
-  of one row can apply side by side on purpose —
-  [#66](https://github.com/PeterKnego/ultima_cluster/issues/66).
+  is the rolling-upgrade semantics: a committed per-row **level**, so two
+  versions of one row can apply side by side on purpose and an app upgrade
+  restarts nodes one at a time under load. The shape, from closed issue
+  [#66](https://github.com/PeterKnego/ultima_cluster/issues/66) (moved here
+  2026-10-18; full text there):
+  - #33's committed per-row running version becomes a committed per-row
+    level. Attach relaxes from "major.minor must equal" (today,
+    `version_is_patch_only`) to "at or above the level, within a supported
+    window".
+  - New code gates new commands on the level through `ApplyCtx` (e.g.
+    `ctx.level() >= 1.5`), so old and new binaries decide the same way at the
+    same position.
+  - A committed record raises the level once every member's attached service
+    reports a version at or above it. No binary below the level may be
+    attached when the raise is appended.
+  - Proof: a `uc2-diffreplay` check that an app gates its new commands, and a
+    two-binary crashtest under load with a linearizable history.
+  The dependency (#33) is met; nothing of this shape exists on `main`. Spec
+  context: `docs/superpowers/specs/2026-09-19-uc2-fsm-upgrade-lifecycle-design.md`
+  §9.2, "Track 2".
 - **Why:** the flag-day rule is the limit an operator hits first. This is
   the gap between "deployable" and "operable at scale".
 - **Cost:** high — both items touch consensus and are a wire flag day
   themselves.
-- **Researched 2026-09-13/14, tracked as
-  [#31](https://github.com/PeterKnego/ultima_cluster/issues/31)** — the
-  version-negotiation item only. `docs/notes/uc2-rolling-upgrade-compatibility-assessment.md`
+- **Researched 2026-09-13/14** — the version-negotiation item only; the
+  proposal was carried as issue
+  [#31](https://github.com/PeterKnego/ultima_cluster/issues/31), closed and
+  moved here 2026-10-18 (its seven-step proposal is in full there).
+  `docs/notes/uc2-rolling-upgrade-compatibility-assessment.md`
   inventories every compatibility surface and recommends a committed,
   monotone cluster **wire level** in the Settings record (the jumbo-rung
   shape; the kernel and Lean model untouched), with the next flag day
@@ -121,6 +140,16 @@ deferred by name:
   changes. `docs/notes/uc2-aeron-cluster-upgrade-model.md` is the
   comparator: Aeron Cluster has no supported rolling upgrade and no
   committed level. Leadership transfer is not covered by either note.
+  - **Why a mixed cluster is worse than unsupported:** `CURRENT` is
+    documentary, so no receive path checks it; an undecodable `CLUSTER`
+    record is refused with 42 while `applied` still advances, so a mixed
+    cluster silently diverges rather than stalling; and a same-length header
+    relayout (2.11.0) parses on the other version with a different meaning.
+  - **Status 2026-10-18:** the wire is at `0.11.0`. #31's "use the next flag
+    day, `0.9.0`" has passed three times over (`0.9.0`, `0.10.0` and
+    `0.11.0` each shipped or landed as a plain flag day), so the steps would
+    ride whatever the next bump is. Still absent: any `wire_level`, and a
+    `dropped_unknown_kind` counter.
 
 ### 4. Geo — async cross-region learner with a stale-read mode
 
