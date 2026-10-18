@@ -1581,6 +1581,17 @@ impl Sender {
                 }
                 SliceRead::NotCommitted => break,
                 SliceRead::Overrun => {
+                    // #166: the lap check is conservative by `max_claim`, so it
+                    // also answers `Overrun` at or just above our own `durable`
+                    // while the appender sits at its gate (`durable +
+                    // capacity`). Those bytes are not archived yet, but the gate
+                    // keeps them intact in the ring and no floor lies above
+                    // `durable`: not an overrun, and never a reason for a tier
+                    // install or a session. The follower re-NAKs, and once the
+                    // archive passes `p` the journal (or the ring) serves it.
+                    if p >= self.buffer.counters().durable.load_acquire() {
+                        break;
+                    }
                     // Requested bytes have scrolled out of the ring. Serve the
                     // gap from the durable journal (M4 replay sessions); only
                     // when that is impossible (no source wired, or the position
@@ -5712,6 +5723,34 @@ mod tests {
             );
             assert_eq!(sessions(&x.s), 0, "a stranger's decline opens nothing");
             assert!(x.s.tier_waits.contains_key(&a));
+        }
+
+        /// #166: the ring's lap check is conservative by `max_claim`, so it
+        /// can answer `Overrun` for a NAK at or just above this node's own
+        /// `durable` while the appender sits at its gate (`durable +
+        /// capacity`). Those bytes are not in the journal yet, but they are
+        /// not below any floor either: the gate keeps them intact in the
+        /// ring. That is a NAK to serve on the re-NAK, never a reason to ask
+        /// a (live, caught-up) follower to install a set or open a session.
+        #[test]
+        fn a_nak_at_or_above_durable_is_never_below_the_floor() {
+            let mut x = fx(1);
+            let a = x.f[0].addr();
+            let b = Arc::clone(&x.s.buffer);
+            let (d, cap) = (b.counters().durable.load_acquire(), b.capacity());
+            // The appender at its gate: a full ring of unarchived bytes.
+            b.counters().append.store_release(d + cap - 64);
+            let overruns = x.s.stats().overruns.load(Ordering::Relaxed);
+            x.s.on_nak(a, d + 32, 96);
+            x.s.do_work();
+            assert!(kinds(&x.f[0]).is_empty(), "nothing sent for it yet");
+            assert_eq!((sent(&x.s), sessions(&x.s)), (0, 0));
+            assert_eq!(
+                x.s.stats().overruns.load(Ordering::Relaxed),
+                overruns,
+                "not an unservable NAK"
+            );
+            assert!(x.s.tier_waits.is_empty());
         }
 
         #[test]
