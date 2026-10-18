@@ -416,3 +416,9 @@ publishes to the egress ring. `crc32fast` serves inputs this short from its
 table-driven fallback, not its carry-less-multiply path. The CRC has been
 in the ring format since `v2.0.0` (the ring trailer), so it is in every arm
 and none of the regression, but it is most of what the apply hop costs. Tracked as #150.
+
+## 7. Release
+
+`v2.14.0` was tagged 2026-10-17 at `467ef0e4` with this gate recorded as it
+stands: row a **FAIL**, bar kept, the post-#33 cost open as #149 and the
+egress-ring CRC as #150. Nothing in §1–§6 was edited for the tag.
