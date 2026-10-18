@@ -1056,9 +1056,26 @@ mod writer_e2e {
     /// A linearizable read of the SumSm total through node `i`. SumSm
     /// answers its raw 8-byte LE total; bincode decodes `[u8; 8]` as exactly
     /// those 8 bytes.
+    ///
+    /// #168: RETRY is the documented answer of a node that is briefly unable
+    /// to serve the read (side-effect-free, so a caller retries). A node can
+    /// read `can_serve()` while its read barrier still answers it — right
+    /// after a partition heals, say — so it is retried, bounded so a node
+    /// that never answers still fails, by name.
     fn query_total(c: &Cluster, i: usize) -> u64 {
         let client = uc_client::Client::connect(&c.nodes[i].dir, c.app).expect("client");
-        let raw: [u8; 8] = client.query_linearizable(&()).expect("linearizable query");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let raw: [u8; 8] = loop {
+            match client.query_linearizable(&()) {
+                Err(uc_client::ClientError::Retry) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(2))
+                }
+                other => {
+                    break other
+                        .unwrap_or_else(|e| panic!("linearizable query on node {i}: {e:?}"));
+                }
+            }
+        };
         client.shutdown();
         u64::from_le_bytes(raw)
     }
