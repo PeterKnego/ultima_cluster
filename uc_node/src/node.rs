@@ -9153,6 +9153,7 @@ impl Consensus {
         match self.append_wire_level(target) {
             Some(position) => {
                 self.announce_wire_level(target, position, "auto");
+                self.audit_wire_level(target, position);
                 true
             }
             None => false,
@@ -9160,11 +9161,13 @@ impl Consensus {
     }
 
     /// Wire-level spec §4.3: the manual raise (`uc2ctl wire raise`, admin
-    /// op handled by Task 8). No mode check and no throttle. Returns the
-    /// admin `(status, reason, position)` triple: `(2, 0, view)` = retry (a
-    /// CLUSTER command is in flight, or the append would overrun), `(1,
-    /// REASON_WIRE_HOLDOUT, view)` = nothing raisable, `(0, 0, position)` =
-    /// appended.
+    /// op 12). No mode check and no throttle. Returns the admin `(status,
+    /// reason, position)` triple: `(2, 0, view)` = retry (a CLUSTER command
+    /// is in flight, or the append would overrun), `(1,
+    /// REASON_WIRE_HOLDOUT, view)` = a member has no report or is below the
+    /// target, `(0, 0, view)` = already at level (a no-op success, nothing
+    /// appended), `(0, 0, position)` = appended. Writes NO audit record: the
+    /// admin handler writes the one record for every manual outcome.
     // used by Task 8's admin handler
     #[allow(dead_code)]
     pub(crate) fn apply_wire_raise(&mut self) -> (u32, u32, u64) {
@@ -9174,13 +9177,23 @@ impl Consensus {
         }
         let target = match self.wire_raise_target() {
             Ok(target) => target,
+            Err(WireHoldout::AtLevel) => {
+                let level = self.cluster_view.wire_level.load(Ordering::Acquire);
+                crate::obs_event!(
+                    Info,
+                    "wire_raise_noop",
+                    node = self.id as u64,
+                    wire_level = level as u64
+                );
+                return (0, 0, view_position);
+            }
             Err(holdout) => {
                 let holdout = match holdout {
                     WireHoldout::Below { id, reported } => {
                         format!("id:{id} reported {reported}")
                     }
                     WireHoldout::NoReport(id) => format!("id:{id} no report"),
-                    WireHoldout::AtLevel => "at level".to_string(),
+                    WireHoldout::AtLevel => unreachable!("answered above"),
                 };
                 crate::obs_event!(
                     Info,
@@ -9242,7 +9255,6 @@ impl Consensus {
             position = position,
             origin = origin
         );
-        self.audit_wire_level(target, position, origin);
     }
 
     /// Backup-tier spec §6.2: take the backup writer's claim, if one is
@@ -9678,9 +9690,10 @@ impl Consensus {
     /// Wire-level spec §4.2/§4.3: the audit record for a proposed raise,
     /// mirroring [`Self::audit_datagram_mtu`] (same failure posture: the
     /// frame is already placed, so a failed write is a loud event, never a
-    /// refusal). `origin` is `auto` or `manual`.
-    fn audit_wire_level(&mut self, level: u8, position: u64, origin: &str) {
-        let detail = format!("level={level} origin={origin}");
+    /// refusal). AUTO raise only: a manual raise's one record is the admin
+    /// handler's, which holds the requester's actor, seq and nonce.
+    fn audit_wire_level(&mut self, level: u8, position: u64) {
+        let detail = format!("level={level} origin=auto");
         let rec = AuditRecord {
             ts_ns: crate::obs::metrics::now_unix_ns(),
             actor: "node",
@@ -9695,11 +9708,7 @@ impl Consensus {
             reason: 0,
             config_version: position,
             detail: Some(detail.as_str()),
-            source: if origin == "auto" {
-                crate::audit::SOURCE_AUTO
-            } else {
-                crate::audit::SOURCE_OPERATOR
-            },
+            source: crate::audit::SOURCE_AUTO,
             fetch_source: None,
         };
         if let Err(e) = self.audit.record(&rec) {
@@ -11398,7 +11407,10 @@ impl Consensus {
                 // Wire-level spec §4.1: the member's binary max, latest wins
                 // (no max — a member that restarts on an older binary must
                 // pull its entry down, or the leader would raise past it).
-                self.peer_wire.insert(id, wire);
+                // Erratum 4: only a report made in THIS term counts.
+                if term == self.sm.current_term() {
+                    self.peer_wire.insert(id, wire);
+                }
                 Event::Report {
                     from: id,
                     term,
@@ -21476,6 +21488,19 @@ mod tests {
             Some(&(uc_protocol::WIRE_MAX - 1)),
             "latest wins, not max"
         );
+        // A report from an older term does not touch the table.
+        h.cons.feed_net(NetEvent::Report {
+            from: addr0,
+            term: 2,
+            durable: append,
+            durable_term: dt,
+            wire: uc_protocol::WIRE_MAX,
+        });
+        assert_eq!(
+            h.cons.peer_wire.get(&0),
+            Some(&(uc_protocol::WIRE_MAX - 1)),
+            "a stale-term report is not this term's"
+        );
     }
 
     #[test]
@@ -21556,6 +21581,8 @@ mod tests {
             !h.cons.maybe_commit_wire_level(),
             "manual mode: the door only"
         );
+        let text = std::fs::read_to_string(h.cons.audit.path()).unwrap_or_default();
+        assert!(text.is_empty(), "no raise, no record: {text}");
     }
 
     #[test]
@@ -21563,20 +21590,30 @@ mod tests {
         let mut h = harness();
         drive_to_serving_leader(&mut h);
         let view = h.cons.cluster_view.position.load(Ordering::Acquire);
-        // Nothing above the committed level: refused, naming the holdout.
         let committed = h.cons.cluster_view.wire_level.load(Ordering::Acquire);
+        // Every member at the committed level: a no-op SUCCESS, nothing
+        // appended (spec §4.3, ruling 9).
         h.cons.wire.max = committed;
+        h.cons.peer_wire.insert(0, committed);
+        h.cons.peer_wire.insert(2, committed);
+        let before = h.cons.last_cluster_append;
+        assert_eq!(h.cons.apply_wire_raise(), (0, 0, view));
+        assert_eq!(h.cons.last_cluster_append, before, "nothing appended");
+        // A member without a report: refused, 63.
+        wire_raise_due(&mut h);
+        h.cons.peer_wire.remove(&2);
         assert_eq!(h.cons.apply_wire_raise(), (1, REASON_WIRE_HOLDOUT, view));
         // A due raise appends.
         wire_raise_due(&mut h);
         let (status, reason, position) = h.cons.apply_wire_raise();
         assert_eq!((status, reason), (0, 0));
+        assert_ne!(position, view);
         assert_eq!(position, h.cons.last_cluster_append);
-        let text = std::fs::read_to_string(h.cons.audit.path()).unwrap();
-        assert!(text.contains(r#""source":"operator""#), "{text}");
-        assert!(text.contains("origin=manual"), "{text}");
         // Now in flight: retry.
         assert_eq!(h.cons.apply_wire_raise(), (2, 0, view));
+        // The admin handler writes the manual path's one audit record.
+        let text = std::fs::read_to_string(h.cons.audit.path()).unwrap_or_default();
+        assert!(text.is_empty(), "the manual path audits nothing: {text}");
     }
 
     /// Spec §9: a DISCOVERY commit is AUDITED, as `settings_apply` with

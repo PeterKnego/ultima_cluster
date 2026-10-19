@@ -46,6 +46,9 @@ details of the chat design. The plan implements these, not the body.
    `id_and_role`.
 4. **§4.1, nothing resets the band on a leadership change today.** "Reported
    in this term" is implemented as one map clear in `Action::BecomeLeader`.
+   Implemented at the collapse ack (`on_collapsed`), the deferred completion
+   of `BecomeLeader`, beside the leader flag's store; reports between the
+   action and the ack are dropped and refilled by the term's first exchanges.
 5. **§4.3, `tier forget` is not forwarded.** A follower answers status 2 and
    `uc2ctl` re-sends to the leader hint. `wire raise` does the same.
 6. **§2.2 / §5.2, the settings file is flat** (`uc_ctl/src/settings.rs`,
