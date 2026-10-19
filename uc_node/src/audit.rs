@@ -177,6 +177,7 @@ pub fn op_name(op: u32) -> &'static str {
         9 => "snapshot_fetch",
         10 => "upgrade_pin",
         11 => "tier_forget",
+        12 => "wire_raise",
         AUDIT_OP_ROW_GENESIS => "row_genesis",
         _ => "unknown",
     }
@@ -737,7 +738,8 @@ mod tests {
         assert_eq!(op_name(9), "snapshot_fetch");
         assert_eq!(op_name(10), "upgrade_pin");
         assert_eq!(op_name(11), "tier_forget");
-        assert_eq!(op_name(12), "unknown");
+        assert_eq!(op_name(12), "wire_raise");
+        assert_eq!(op_name(13), "unknown");
         assert_eq!(op_name(AUDIT_OP_ROW_GENESIS), "row_genesis");
         assert_eq!(op_name(99), "unknown");
         assert_eq!(op_name(2), "promote");

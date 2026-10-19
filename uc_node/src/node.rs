@@ -77,6 +77,7 @@ use crate::cluster_fsm::{
 use crate::ipc::InstanceDir;
 use crate::read_round::ProbeRound;
 use crate::services::ServicesConfig;
+use crate::wire_raise::WireHoldout;
 use uc_log::buffer::FrameRead;
 use uc_protocol::WireRange;
 use uc_protocol::v2::catalog::{FOREIGN_SET_SUFFIX, MAX_CATALOG_SETS, SetEntry, SetKind, SetState};
@@ -99,7 +100,7 @@ use uc_protocol::v2::schedule::{
     MAX_SCHEDULE_ENTRIES, SCHEDULE_ENTRY_LEN, SCHEDULE_HEADER_LEN, ScheduleRule,
     decode_schedule_table,
 };
-use uc_protocol::v2::settings::{Settings, Target, decode_settings};
+use uc_protocol::v2::settings::{Settings, Target, WIRE_RAISE_AUTO, decode_settings};
 use uc_protocol::v2::upgrade::{
     CLUSTER_ROW, RowGenesis, SnapshotReport, UPGRADE_PIN_LEN, decode_upgrade_pin, is_report_row,
 };
@@ -714,6 +715,15 @@ pub const REASON_PIN_ORIGIN_NOT_AGREED: u32 = 61;
 /// `uc2ctl tier forget`) naming no registered tier. The FSM's own
 /// (`ClusterRefusal::TierUnknown`), so the door and the apply loop agree.
 pub const REASON_TIER_UNKNOWN: u32 = 62;
+/// Wire-level spec §4.3: `uc2ctl wire raise` found nothing raisable — a
+/// member without a report this term, a member below the target, or the
+/// cluster already at every member's level. DOOR-ONLY; the holdout is named
+/// by `uc2ctl wire show` on the leader and in the audit detail.
+pub const REASON_WIRE_HOLDOUT: u32 = 63;
+/// Wire-level spec §4.3: `uc2ctl wire raise` is admin op 12, audited as
+/// `wire_raise`; the leader's auto raise writes its audit record under the
+/// same op with `source = "auto"`.
+const OP_WIRE_RAISE: u32 = 12;
 
 /// Jumbo spec §7.1: the datagram rung a committed `Settings::datagram_mtu`
 /// word means, and whether it had to be clamped to get there.
@@ -2646,6 +2656,7 @@ impl Node {
             live_mtu: Arc::clone(&live_mtu),
             crypto_on: crypto.is_some(),
             next_mtu_check_ns: 0,
+            next_wire_check_ns: 0,
             // Jumbo spec §6. Armed here and not from the recovered view: a
             // node whose instance dir already holds a jumbo rung arms
             // `Joining` instead, on its first `refresh_from_view` (the live
@@ -2716,6 +2727,7 @@ impl Node {
             learner_ids,
             peer_band,
             peer_reported: HashMap::new(),
+            peer_wire: HashMap::new(),
             peer_band_published: false,
             net_rx,
             obs_rx,
@@ -3992,6 +4004,9 @@ struct Consensus {
     /// the commit rule. `0` = never evaluated. Compared against
     /// `pass_mono_ns`, so an idle pass costs one `u64` compare.
     next_mtu_check_ns: u64,
+    /// Wire-level spec §4.2: the monotonic instant the leader may next
+    /// evaluate the auto raise. Same shape as `next_mtu_check_ns`.
+    next_wire_check_ns: u64,
     /// Jumbo spec §6/§5.4: the startup gate, or `None` when this node holds
     /// neither (the default: no `force_jumbo_frames`, no committed rung above
     /// the baseline). See [`JumboGate`].
@@ -4053,6 +4068,13 @@ struct Consensus {
     /// updated per Report; flushed to the cnc band once per duty cycle — the cnc
     /// store is bounded, not per-datagram).
     peer_reported: HashMap<NodeId, u64>,
+    /// Wire-level spec §4.1 (erratum 4): each member's binary wire max as
+    /// REPORTED IN THIS TERM — the byte at header offset 13 of its newest
+    /// `Report`. Latest wins (a downgraded binary must lower its entry);
+    /// cleared when this node opens a leadership term, pruned with
+    /// `peer_reported` on a config adoption, and mirrored into the cnc peer
+    /// band's `wire_max` word by `publish_peer_band`.
+    peer_wire: HashMap<NodeId, u8>,
     /// Latch: publish the static `id_and_role` cells once (first duty cycle).
     peer_band_published: bool,
     net_rx: mpsc::Receiver<NetEvent>,
@@ -5098,6 +5120,11 @@ impl Consensus {
         if serving && !hold_clients {
             did |= self.maybe_commit_datagram_mtu();
         }
+        // 3a''+. Wire-level spec §4.2: the auto raise — another leader-issued
+        // `CLUSTER` append, under the same gate for the same reason.
+        if serving && !hold_clients {
+            did |= self.maybe_commit_wire_level();
+        }
         // 3a'''. Plan B3 (spec §6.5.2): the leader's snapshot-hash record —
         // the third leader-issued `CLUSTER` append of the pass, under the same
         // gate as the two above it and for the same reason. One `is_empty`
@@ -6016,6 +6043,14 @@ impl Consensus {
             if let Some(d) = self.peer_reported.get(id) {
                 self.cnc.peer_slot(i).reported_durable.store_release(*d);
             }
+            // Wire-level spec §4.1: the member's reported wire max (0 = none
+            // this term). Written on change only, so the steady state is one
+            // load per slot.
+            let wire = self.peer_wire.get(id).copied().unwrap_or(0) as u64;
+            let cell = &self.cnc.peer_slot(i).head.wire_max;
+            if cell.load(Ordering::Acquire) != wire {
+                cell.store(wire, Ordering::Release);
+            }
         }
         // Mirror the archive's first-retained base (the purge floor). Comparing it
         // against `node_snapshot_floor` is the "purge caught up to snapshot" check.
@@ -6050,6 +6085,7 @@ impl Consensus {
         self.peer_band_published = false;
         let live: Vec<NodeId> = self.peer_band.iter().map(|(id, _)| *id).collect();
         self.peer_reported.retain(|id, _| live.contains(id));
+        self.peer_wire.retain(|id, _| live.contains(id));
         // M8 (Task 12): republish the receive seam's sender-identity map
         // SYNCHRONOUSLY, here — not on the next maintenance pass. M7 adds
         // nodes at runtime, and the joiner's first datagrams can arrive
@@ -9096,6 +9132,119 @@ impl Consensus {
         }
     }
 
+    /// Wire-level spec §4.2: the auto raise. Same throttle, single-in-flight
+    /// and append path as `maybe_commit_datagram_mtu`; acts only while the
+    /// committed `wire_raise` mode is `auto`.
+    fn maybe_commit_wire_level(&mut self) -> bool {
+        if self.pass_mono_ns < self.next_wire_check_ns {
+            return false;
+        }
+        self.next_wire_check_ns = self.pass_mono_ns + 100_000_000;
+        if self.cluster_view.wire_raise.load(Ordering::Acquire) != WIRE_RAISE_AUTO {
+            return false;
+        }
+        let view_position = self.cluster_view.position.load(Ordering::Acquire);
+        if self.last_cluster_append > view_position {
+            return false; // single-in-flight: a CLUSTER command is above commit
+        }
+        let Ok(target) = self.wire_raise_target() else {
+            return false;
+        };
+        match self.append_wire_level(target) {
+            Some(position) => {
+                self.announce_wire_level(target, position, "auto");
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Wire-level spec §4.3: the manual raise (`uc2ctl wire raise`, admin
+    /// op handled by Task 8). No mode check and no throttle. Returns the
+    /// admin `(status, reason, position)` triple: `(2, 0, view)` = retry (a
+    /// CLUSTER command is in flight, or the append would overrun), `(1,
+    /// REASON_WIRE_HOLDOUT, view)` = nothing raisable, `(0, 0, position)` =
+    /// appended.
+    // used by Task 8's admin handler
+    #[allow(dead_code)]
+    pub(crate) fn apply_wire_raise(&mut self) -> (u32, u32, u64) {
+        let view_position = self.cluster_view.position.load(Ordering::Acquire);
+        if self.last_cluster_append > view_position {
+            return (2, 0, view_position);
+        }
+        let target = match self.wire_raise_target() {
+            Ok(target) => target,
+            Err(holdout) => {
+                let holdout = match holdout {
+                    WireHoldout::Below { id, reported } => {
+                        format!("id:{id} reported {reported}")
+                    }
+                    WireHoldout::NoReport(id) => format!("id:{id} no report"),
+                    WireHoldout::AtLevel => "at level".to_string(),
+                };
+                crate::obs_event!(
+                    Info,
+                    "wire_raise_refused",
+                    node = self.id as u64,
+                    holdout = holdout.as_str()
+                );
+                return (1, REASON_WIRE_HOLDOUT, view_position);
+            }
+        };
+        match self.append_wire_level(target) {
+            Some(position) => {
+                self.announce_wire_level(target, position, "manual");
+                (0, 0, position)
+            }
+            None => (2, 0, view_position),
+        }
+    }
+
+    /// Wire-level spec §4.1 over the committed membership (voters, then
+    /// learners), this binary's max and the reports of this term.
+    fn wire_raise_target(&self) -> Result<u8, WireHoldout> {
+        let committed = self.cluster_view.wire_level.load(Ordering::Acquire);
+        let membership = self.cluster_view.membership();
+        let members: Vec<NodeId> = membership
+            .voters
+            .iter()
+            .chain(membership.learners.iter())
+            .map(|(id, _)| *id)
+            .collect();
+        crate::wire_raise::wire_raise_target(
+            self.wire.max,
+            committed,
+            &members,
+            self.id,
+            &self.peer_wire,
+        )
+    }
+
+    /// Validate and append the `Settings` command carrying `wire_level =
+    /// target`; `None` when the FSM's rules refuse it or the append would
+    /// overrun (the caller retries on its next check).
+    fn append_wire_level(&mut self, target: u8) -> Option<u64> {
+        let mut settings = self.cluster_view.to_state().settings;
+        settings.wire_level = target;
+        let cmd = ClusterCommand::Settings(settings);
+        if self.validate_cluster_command(&cmd).is_err() {
+            return None;
+        }
+        self.append_cluster_frame(&cmd).ok()
+    }
+
+    fn announce_wire_level(&mut self, target: u8, position: u64, origin: &str) {
+        crate::obs_event!(
+            Info,
+            "wire_level_proposed",
+            node = self.id as u64,
+            wire_level = target as u64,
+            position = position,
+            origin = origin
+        );
+        self.audit_wire_level(target, position, origin);
+    }
+
     /// Backup-tier spec §6.2: take the backup writer's claim, if one is
     /// waiting, and deliver it. Called every [`BACKUP_CLAIM_POLL_NS`] of
     /// pass clock; out of line so the pass body does not grow (M14a).
@@ -9520,6 +9669,48 @@ impl Consensus {
                 seq = 0u64,
                 nonce = 0u64,
                 op = 7u64,
+                status = 0u64,
+                err = err.as_str(),
+            );
+        }
+    }
+
+    /// Wire-level spec §4.2/§4.3: the audit record for a proposed raise,
+    /// mirroring [`Self::audit_datagram_mtu`] (same failure posture: the
+    /// frame is already placed, so a failed write is a loud event, never a
+    /// refusal). `origin` is `auto` or `manual`.
+    fn audit_wire_level(&mut self, level: u8, position: u64, origin: &str) {
+        let detail = format!("level={level} origin={origin}");
+        let rec = AuditRecord {
+            ts_ns: crate::obs::metrics::now_unix_ns(),
+            actor: "node",
+            origin: AuditOrigin::Local,
+            op: OP_WIRE_RAISE,
+            op_name: op_name(OP_WIRE_RAISE),
+            id: level as u32,
+            addr: None,
+            seq: 0,
+            nonce: 0,
+            outcome: AuditOutcome::Accepted,
+            reason: 0,
+            config_version: position,
+            detail: Some(detail.as_str()),
+            source: if origin == "auto" {
+                crate::audit::SOURCE_AUTO
+            } else {
+                crate::audit::SOURCE_OPERATOR
+            },
+            fetch_source: None,
+        };
+        if let Err(e) = self.audit.record(&rec) {
+            let err = e.to_string();
+            crate::obs_event!(
+                Error,
+                "admin_audit_failed",
+                node = self.id as u64,
+                seq = 0u64,
+                nonce = 0u64,
+                op = OP_WIRE_RAISE as u64,
                 status = 0u64,
                 err = err.as_str(),
             );
@@ -11169,8 +11360,6 @@ impl Consensus {
                 durable_term,
                 wire,
             } => {
-                // Task 7 keeps the per-member table from this byte
-                let _ = wire;
                 let Some(id) = self.addr_to_id.get(&from).copied() else {
                     return;
                 };
@@ -11206,6 +11395,10 @@ impl Consensus {
                     .entry(id)
                     .and_modify(|d| *d = (*d).max(durable))
                     .or_insert(durable);
+                // Wire-level spec §4.1: the member's binary max, latest wins
+                // (no max — a member that restarts on an older binary must
+                // pull its entry down, or the leader would raise past it).
+                self.peer_wire.insert(id, wire);
                 Event::Report {
                     from: id,
                     term,
@@ -13978,6 +14171,9 @@ impl Consensus {
         self.appender = Some(appender);
         self.feed(Event::NewTermAppended { position: end });
         self.open_gate();
+        // Wire-level spec erratum 4: the raise reads only reports made in
+        // THIS term, so the table starts empty with the leadership.
+        self.peer_wire.clear();
         self.leader_flag.store(true, Ordering::Release);
         // Cluster-FSM spec §4.9 Ruling R15: force the next `refresh_from_view`
         // to re-read the view even if its position has not moved since our
@@ -16251,6 +16447,7 @@ mod tests {
             live_mtu: Arc::new(AtomicUsize::new(MTU_DEFAULT)),
             crypto_on: false,
             next_mtu_check_ns: 0,
+            next_wire_check_ns: 0,
             jumbo_gate: None,
             jumbo_check_ns: 0,
             jumbo_hold_log_ns: 0,
@@ -16308,6 +16505,7 @@ mod tests {
             learner_ids: Vec::new(),
             peer_band: Vec::new(),
             peer_reported: HashMap::new(),
+            peer_wire: HashMap::new(),
             peer_band_published: false,
             net_rx,
             obs_rx,
@@ -21233,6 +21431,152 @@ mod tests {
             h.cons.next_mtu_check_ns, deadline,
             "the throttle returned before touching the deadline"
         );
+    }
+
+    // ---- wire level (spec §4.1/§4.2/§4.3): the leader's table and the raise ----
+
+    /// Set the harness up so a raise is due: this binary speaks one level
+    /// above the committed one, and members 0 and 2 report it this term.
+    fn wire_raise_due(h: &mut Harness) -> u8 {
+        let committed = h.cons.cluster_view.wire_level.load(Ordering::Acquire);
+        let target = committed + 1;
+        h.cons.wire.max = target;
+        h.cons.peer_wire.insert(0, target);
+        h.cons.peer_wire.insert(2, target);
+        target
+    }
+
+    #[test]
+    fn a_report_fills_the_wire_table_latest_wins_and_leadership_clears_it() {
+        let mut h = harness();
+        h.cons.peer_wire.insert(2, 99);
+        drive_to_serving_leader(&mut h);
+        assert_eq!(
+            h.cons.peer_wire.get(&2),
+            None,
+            "a new leadership term starts from an empty table"
+        );
+        assert_eq!(
+            h.cons.peer_wire.get(&0),
+            Some(&uc_protocol::WIRE_MAX),
+            "the Report the drive fed this term"
+        );
+        let addr0 = h.cons.id_to_addr[&0];
+        let append = h.cons.cnc.counters().append.load_acquire();
+        let dt = h.cons.sm.term_at(append);
+        h.cons.feed_net(NetEvent::Report {
+            from: addr0,
+            term: 3,
+            durable: append,
+            durable_term: dt,
+            wire: uc_protocol::WIRE_MAX - 1,
+        });
+        assert_eq!(
+            h.cons.peer_wire.get(&0),
+            Some(&(uc_protocol::WIRE_MAX - 1)),
+            "latest wins, not max"
+        );
+    }
+
+    #[test]
+    fn the_peer_band_mirrors_the_wire_table() {
+        let mut h = harness();
+        drive_to_serving_leader(&mut h);
+        // The bare harness has no band; give it the voters' (slot = index).
+        h.cons.peer_band = vec![(0, 0), (2, 0)];
+        h.cons.publish_peer_band();
+        let (s0, s2) = (0, 1);
+        let word = |h: &Harness, i: usize| {
+            h.cons
+                .cnc
+                .peer_slot(i)
+                .head
+                .wire_max
+                .load(Ordering::Acquire)
+        };
+        assert_eq!(word(&h, s0), uc_protocol::WIRE_MAX as u64);
+        assert_eq!(word(&h, s2), 0, "no report this term");
+        h.cons.peer_wire.insert(2, 7);
+        h.cons.publish_peer_band();
+        assert_eq!(word(&h, s2), 7);
+    }
+
+    #[test]
+    fn the_auto_raise_appends_once_throttled_and_audits_it() {
+        let mut h = harness();
+        drive_to_serving_leader(&mut h);
+        let target = wire_raise_due(&mut h);
+        h.cons.next_wire_check_ns = 0;
+        h.cons.pass_mono_ns = 1_000;
+        assert!(h.cons.maybe_commit_wire_level(), "the raise proposes");
+        assert_eq!(h.cons.next_wire_check_ns, 1_000 + 100_000_000);
+        let position = h.cons.last_cluster_append;
+        // Throttled, and single-in-flight behind it.
+        assert!(!h.cons.maybe_commit_wire_level());
+        h.cons.next_wire_check_ns = 0;
+        assert!(
+            !h.cons.maybe_commit_wire_level(),
+            "one CLUSTER command in flight"
+        );
+        assert_eq!(h.cons.last_cluster_append, position);
+
+        let text = std::fs::read_to_string(h.cons.audit.path()).unwrap();
+        assert_eq!(text.lines().count(), 1, "exactly one record: {text}");
+        assert!(text.contains(r#""op":12,"op_name":"wire_raise""#), "{text}");
+        assert!(text.contains(r#""source":"auto""#), "{text}");
+        assert!(
+            text.contains(&format!(r#""detail":"level={target} origin=auto""#)),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!(r#""config_version":{position}"#)),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn the_auto_raise_waits_on_a_silent_member_and_on_manual_mode() {
+        let mut h = harness();
+        drive_to_serving_leader(&mut h);
+        wire_raise_due(&mut h);
+        h.cons.peer_wire.remove(&2);
+        h.cons.next_wire_check_ns = 0;
+        assert!(
+            !h.cons.maybe_commit_wire_level(),
+            "member 2 has not reported"
+        );
+
+        h.cons.peer_wire.insert(2, h.cons.wire.max);
+        h.cons.cluster_view.wire_raise.store(
+            uc_protocol::v2::settings::WIRE_RAISE_MANUAL,
+            Ordering::Release,
+        );
+        h.cons.next_wire_check_ns = 0;
+        assert!(
+            !h.cons.maybe_commit_wire_level(),
+            "manual mode: the door only"
+        );
+    }
+
+    #[test]
+    fn the_manual_raise_answers_its_four_shapes() {
+        let mut h = harness();
+        drive_to_serving_leader(&mut h);
+        let view = h.cons.cluster_view.position.load(Ordering::Acquire);
+        // Nothing above the committed level: refused, naming the holdout.
+        let committed = h.cons.cluster_view.wire_level.load(Ordering::Acquire);
+        h.cons.wire.max = committed;
+        assert_eq!(h.cons.apply_wire_raise(), (1, REASON_WIRE_HOLDOUT, view));
+        // A due raise appends.
+        wire_raise_due(&mut h);
+        let (status, reason, position) = h.cons.apply_wire_raise();
+        assert_eq!((status, reason), (0, 0));
+        assert_eq!(position, h.cons.last_cluster_append);
+        let text = std::fs::read_to_string(h.cons.audit.path()).unwrap();
+        assert!(text.contains(r#""source":"operator""#), "{text}");
+        assert!(text.contains("origin=manual"), "{text}");
+        // Now in flight: retry.
+        assert_eq!(h.cons.apply_wire_raise(), (2, 0, view));
     }
 
     /// Spec §9: a DISCOVERY commit is AUDITED, as `settings_apply` with
