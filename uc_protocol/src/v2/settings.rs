@@ -6,23 +6,24 @@
 //! as a `CLUSTER kind=Settings` payload and inside the cluster FSM's image.
 //! `core` + `alloc` (the encoder appends into a `Vec<u8>`), like `v2::schedule`.
 
-/// Encoding version, first word of the payload. `4` since the snapshot-lifecycle
-/// spec (`auto_fetch`); `1`–`3` decode with `auto_fetch = true`, the default.
-/// `3` was the catalog spec
-/// (`retain_sets`); a reader ACCEPTS `2` (the jumbo-flag-day shape, mapped to
-/// `retain_sets = 1`) and `1` (the `2.11.0` shape, mapped to `datagram_mtu =
-/// 0` and `retain_sets = 1`) because cluster artifacts and committed frames
-/// written by earlier releases persist across the upgrade — catalog spec §7,
-/// jumbo spec §5.5. `1` is the retention a pre-catalog cluster actually ran
-/// (newest-only), and it is a function of the record alone, so a node that
-/// installed an old image and a node that started from genesis read the
-/// same value (ruling R24; a `0` here made their images diverge forever).
-pub const SETTINGS_VERSION: u32 = 6;
-/// The exact encoded length of a version-6 record — no trailing bytes.
-/// Version 6 (backup-tier 3b) appends `purge_requires_tiers u8 @46`: how
-/// many backup tiers must confirm a position before any node may purge
-/// below it (`0` = off); `1`–`5` decode it as `0`.
-pub const SETTINGS_LEN: usize = 4 + 8 + 8 + 8 + 1 + 4 + 2 + 1 + 2 + 8 + 1; // 47
+use crate::version::{WIRE_LEVEL_FIRST, WIRE_MAX};
+
+/// Encoding version, first word of the payload. `7` since the wire-level
+/// spec (`wire_level`/`wire_raise`, 2.15.0). `6` was backup-tier 3b, `5`
+/// backup-tier 3a, `4` the snapshot lifecycle (`auto_fetch`), `3` the
+/// catalog (`retain_sets`), `2` jumbo (`datagram_mtu`), `1` the 2.11.0
+/// shape. Every earlier version is still ACCEPTED on decode, because cluster
+/// artifacts and committed frames written by earlier releases persist across
+/// the upgrade; the fields it lacks decode from the record ALONE (ruling
+/// R24): `datagram_mtu = 0`, `retain_sets = 1`, `auto_fetch = true`, backup
+/// retention `0`, `purge_requires_tiers = 0`, and since v7
+/// `wire_level = WIRE_LEVEL_FIRST`, `wire_raise = WIRE_RAISE_AUTO`.
+pub const SETTINGS_VERSION: u32 = 7;
+/// The exact encoded length of a version-7 record — no trailing bytes.
+/// Version 7 appends `wire_level u8 @47` and `wire_raise u8 @48`.
+pub const SETTINGS_LEN: usize = 4 + 8 + 8 + 8 + 1 + 4 + 2 + 1 + 2 + 8 + 1 + 1 + 1; // 49
+/// The exact length of a version-6 record, accepted on decode only.
+pub const SETTINGS_LEN_V6: usize = 4 + 8 + 8 + 8 + 1 + 4 + 2 + 1 + 2 + 8 + 1; // 47
 /// The exact length of a version-5 record, accepted on decode only.
 /// Version 5 (backup-tier spec) appends `backup_retain_sets u16 @36` and
 /// `backup_retain_age_secs u64 @38`; `1`–`4` decode both as `0` (no tier
@@ -47,6 +48,21 @@ pub const SETTINGS_LEN_V1: usize = 4 + 8 + 8 + 8 + 1; // 29
 /// so the two readings stay disjoint. `uc_node::services::page_lag_from_setting`
 /// is the one place that maps it back onto the page's `0`.
 pub const FSM_LAG_LOCKSTEP: u64 = u64::MAX;
+
+/// `wire_raise` values (spec §2.2). `0` keeps the committed mode — the
+/// "0 = keep" idiom, so a settings file written before the roll cannot
+/// flip it; genesis seeds `WIRE_RAISE_AUTO`.
+pub const WIRE_RAISE_KEEP: u8 = 0;
+pub const WIRE_RAISE_AUTO: u8 = 1;
+pub const WIRE_RAISE_MANUAL: u8 = 2;
+
+/// Spec §3.3: the Settings encoding version a leader writes at a committed
+/// wire level — the encode-at-the-committed-level table. One row today; a
+/// release that adds a Settings field adds a row and bumps the wire minor.
+pub const fn settings_version_for(level: u8) -> u32 {
+    let _ = level; // every level since WIRE_LEVEL_FIRST writes v7
+    7
+}
 
 /// The smallest byte bound `fsm_lag_bytes` may name: **one max-size frame**,
 /// as the transport bounds it.
@@ -124,6 +140,16 @@ pub struct Settings {
     /// any node may purge below it; `0` = off, `1..=MAX_BACKUP_TIERS` = on.
     /// `0` for every v1–v5 record.
     pub purge_requires_tiers: u8,
+    /// Wire-level spec §2.2: the committed cluster wire level (the wire
+    /// minor every member must speak). `0` = keep; the FSM keeps
+    /// `max(committed, incoming)` like `datagram_mtu`. Leader-owned: never
+    /// in an operator file. A v1–v6 record decodes as `WIRE_LEVEL_FIRST`.
+    pub wire_level: u8,
+    /// Wire-level spec §2.2: who raises — `WIRE_RAISE_AUTO` (the leader, as
+    /// soon as every member reports the next level) or
+    /// `WIRE_RAISE_MANUAL` (`uc2ctl wire raise`). `WIRE_RAISE_KEEP` (0)
+    /// keeps the committed mode. A v1–v6 record decodes as auto.
+    pub wire_raise: u8,
 }
 
 impl Settings {
@@ -142,6 +168,8 @@ impl Settings {
             backup_retain_sets: 0,
             backup_retain_age_secs: 0,
             purge_requires_tiers: 0,
+            wire_level: WIRE_MAX,
+            wire_raise: WIRE_RAISE_AUTO,
         }
     }
 }
@@ -158,11 +186,13 @@ pub fn encode_settings(s: &Settings, out: &mut Vec<u8>) {
     out.extend_from_slice(&s.backup_retain_sets.to_le_bytes());
     out.extend_from_slice(&s.backup_retain_age_secs.to_le_bytes());
     out.push(s.purge_requires_tiers);
+    out.push(s.wire_level);
+    out.push(s.wire_raise);
 }
 
-/// Total: `None` on any (version, length) pair other than the six this
+/// Total: `None` on any (version, length) pair other than the seven this
 /// reader knows — `(1, SETTINGS_LEN_V1)`, `(2, SETTINGS_LEN_V2)`,
-/// `(3, SETTINGS_LEN_V3)`, `(4, SETTINGS_LEN_V4)`, `(5, SETTINGS_LEN_V5)` and `(6, SETTINGS_LEN)` — an unknown target byte,
+/// `(3, SETTINGS_LEN_V3)`, `(4, SETTINGS_LEN_V4)`, `(5, SETTINGS_LEN_V5)`, `(6, SETTINGS_LEN_V6)` and `(7, SETTINGS_LEN)` — an unknown target byte,
 /// or an `auto_fetch` byte other than 0/1. The length is EXACT PER
 /// VERSION, so a header with another version's length (or the reverse) is
 /// refused rather than read as a prefix; the pair check up front makes every
@@ -172,42 +202,57 @@ pub fn decode_settings(buf: &[u8]) -> Option<Settings> {
         return None;
     }
     let version = u32::from_le_bytes(buf[0..4].try_into().unwrap());
-    let (datagram_mtu, retain_sets, auto_fetch, backup, purge_tiers) = match (version, buf.len()) {
-        (1, SETTINGS_LEN_V1) => (0, 1, true, (0, 0), 0),
-        (2, SETTINGS_LEN_V2) => (
-            u32::from_le_bytes(buf[29..33].try_into().unwrap()),
-            1,
-            true,
-            (0, 0),
-            0,
-        ),
-        (3, SETTINGS_LEN_V3) => (
-            u32::from_le_bytes(buf[29..33].try_into().unwrap()),
-            u16::from_le_bytes(buf[33..35].try_into().unwrap()),
-            true,
-            (0, 0),
-            0,
-        ),
-        (4, SETTINGS_LEN_V4) | (5, SETTINGS_LEN_V5) | (6, SETTINGS_LEN) => (
-            u32::from_le_bytes(buf[29..33].try_into().unwrap()),
-            u16::from_le_bytes(buf[33..35].try_into().unwrap()),
-            match buf[35] {
-                0 => false,
-                1 => true,
-                _ => return None,
-            },
-            if version >= 5 {
-                (
-                    u16::from_le_bytes(buf[36..38].try_into().unwrap()),
-                    u64::from_le_bytes(buf[38..46].try_into().unwrap()),
-                )
-            } else {
-                (0, 0)
-            },
-            if version == 6 { buf[46] } else { 0 },
-        ),
-        _ => return None,
-    };
+    let (datagram_mtu, retain_sets, auto_fetch, backup, purge_tiers, wire) =
+        match (version, buf.len()) {
+            (1, SETTINGS_LEN_V1) => (0, 1, true, (0, 0), 0, (WIRE_LEVEL_FIRST, WIRE_RAISE_AUTO)),
+            (2, SETTINGS_LEN_V2) => (
+                u32::from_le_bytes(buf[29..33].try_into().unwrap()),
+                1,
+                true,
+                (0, 0),
+                0,
+                (WIRE_LEVEL_FIRST, WIRE_RAISE_AUTO),
+            ),
+            (3, SETTINGS_LEN_V3) => (
+                u32::from_le_bytes(buf[29..33].try_into().unwrap()),
+                u16::from_le_bytes(buf[33..35].try_into().unwrap()),
+                true,
+                (0, 0),
+                0,
+                (WIRE_LEVEL_FIRST, WIRE_RAISE_AUTO),
+            ),
+            (4, SETTINGS_LEN_V4)
+            | (5, SETTINGS_LEN_V5)
+            | (6, SETTINGS_LEN_V6)
+            | (7, SETTINGS_LEN) => (
+                u32::from_le_bytes(buf[29..33].try_into().unwrap()),
+                u16::from_le_bytes(buf[33..35].try_into().unwrap()),
+                match buf[35] {
+                    0 => false,
+                    1 => true,
+                    _ => return None,
+                },
+                if version >= 5 {
+                    (
+                        u16::from_le_bytes(buf[36..38].try_into().unwrap()),
+                        u64::from_le_bytes(buf[38..46].try_into().unwrap()),
+                    )
+                } else {
+                    (0, 0)
+                },
+                if version == 6 || version == 7 {
+                    buf[46]
+                } else {
+                    0
+                },
+                if version == 7 {
+                    (buf[47], buf[48])
+                } else {
+                    (WIRE_LEVEL_FIRST, WIRE_RAISE_AUTO)
+                },
+            ),
+            _ => return None,
+        };
     let fsm_lag_bytes = u64::from_le_bytes(buf[4..12].try_into().unwrap());
     let admission_bytes = u64::from_le_bytes(buf[12..20].try_into().unwrap());
     let snapshot_interval_bytes = u64::from_le_bytes(buf[20..28].try_into().unwrap());
@@ -227,7 +272,24 @@ pub fn decode_settings(buf: &[u8]) -> Option<Settings> {
         backup_retain_sets: backup.0,
         backup_retain_age_secs: backup.1,
         purge_requires_tiers: purge_tiers,
+        wire_level: wire.0,
+        wire_raise: wire.1,
     })
+}
+
+/// Spec §3.3/§3.4: decode a record as a node at committed `level` must —
+/// refusing any version above `settings_version_for(level)`. A correct peer
+/// never sends one; an arrival is corruption, and the cluster agent
+/// fail-stops on it (`ClusterRecordUndecodable`).
+pub fn decode_settings_at(level: u8, buf: &[u8]) -> Option<Settings> {
+    if buf.len() < 4 {
+        return None;
+    }
+    let version = u32::from_le_bytes(buf[0..4].try_into().unwrap());
+    if version > settings_version_for(level) {
+        return None;
+    }
+    decode_settings(buf)
 }
 
 const _: () = assert!(SETTINGS_LEN + crate::v2::frame::CLUSTER_BODY_PREFIX_LEN <= 1344);
@@ -247,8 +309,9 @@ mod tests {
         // u8 @28, datagram_mtu u32 @29, retain_sets u16 @33, auto_fetch u8 @35,
         // backup_retain_sets u16 @36, backup_retain_age_secs u64 @38,
         // purge_requires_tiers u8 @46.
-        assert_eq!(SETTINGS_VERSION, 6);
-        assert_eq!(SETTINGS_LEN, 47);
+        assert_eq!(SETTINGS_VERSION, 7);
+        assert_eq!(SETTINGS_LEN, 49);
+        assert_eq!(SETTINGS_LEN_V6, 47);
         assert_eq!(SETTINGS_LEN_V5, 46);
         assert_eq!(SETTINGS_LEN_V4, 36);
         assert_eq!(SETTINGS_LEN_V3, 35);
@@ -274,11 +337,13 @@ mod tests {
             backup_retain_sets: 0,
             backup_retain_age_secs: 0,
             purge_requires_tiers: 0,
+            wire_level: WIRE_LEVEL_FIRST,
+            wire_raise: WIRE_RAISE_AUTO,
         };
         let mut out = Vec::new();
         encode_settings(&s, &mut out);
         assert_eq!(out.len(), SETTINGS_LEN);
-        assert_eq!(&out[0..4], &6u32.to_le_bytes());
+        assert_eq!(&out[0..4], &7u32.to_le_bytes());
         assert_eq!(out[28], 1);
         assert_eq!(&out[29..33], &8960u32.to_le_bytes());
         assert_eq!(&out[33..35], &3u16.to_le_bytes());
@@ -304,11 +369,13 @@ mod tests {
             backup_retain_sets: 0,
             backup_retain_age_secs: 0,
             purge_requires_tiers: 0,
+            wire_level: WIRE_LEVEL_FIRST,
+            wire_raise: WIRE_RAISE_AUTO,
         };
         let mut b = Vec::new();
         encode_settings(&s, &mut b);
         assert_eq!(b.len(), SETTINGS_LEN);
-        assert_eq!(&b[0..4], &6u32.to_le_bytes(), "version 6");
+        assert_eq!(&b[0..4], &7u32.to_le_bytes(), "version 7");
         assert_eq!(&b[33..35], &3u16.to_le_bytes(), "retain_sets @33");
         assert_eq!(decode_settings(&b), Some(s));
         // the same fields as a v3 record (35 B, version 3) round-trip
@@ -358,7 +425,7 @@ mod tests {
     fn settings_v4_round_trips_auto_fetch_and_v1_to_v3_read_true() {
         assert_eq!(
             (SETTINGS_VERSION, SETTINGS_LEN, SETTINGS_LEN_V3),
-            (6, 47, 35)
+            (7, 49, 35)
         );
         assert!(Settings::genesis_default().auto_fetch, "default on");
         let s = Settings {
@@ -368,7 +435,7 @@ mod tests {
         let mut b = Vec::new();
         encode_settings(&s, &mut b);
         assert_eq!(b.len(), SETTINGS_LEN);
-        assert_eq!(&b[0..4], &6u32.to_le_bytes());
+        assert_eq!(&b[0..4], &7u32.to_le_bytes());
         assert_eq!(b[35], 0, "auto_fetch @35");
         assert_eq!(decode_settings(&b), Some(s));
         let mut v3 = b[..SETTINGS_LEN_V3].to_vec();
@@ -398,7 +465,7 @@ mod tests {
     fn settings_v5_round_trips_backup_retention_and_v1_to_v4_read_zero() {
         assert_eq!(
             (SETTINGS_VERSION, SETTINGS_LEN, SETTINGS_LEN_V4),
-            (6, 47, 36)
+            (7, 49, 36)
         );
         let g = Settings::genesis_default();
         assert_eq!((g.backup_retain_sets, g.backup_retain_age_secs), (0, 0));
@@ -410,7 +477,7 @@ mod tests {
         let mut b = Vec::new();
         encode_settings(&s, &mut b);
         assert_eq!(b.len(), SETTINGS_LEN);
-        assert_eq!(&b[0..4], &6u32.to_le_bytes());
+        assert_eq!(&b[0..4], &7u32.to_le_bytes());
         assert_eq!(&b[36..38], &7u16.to_le_bytes());
         assert_eq!(&b[38..46], &2_592_000u64.to_le_bytes());
         assert_eq!(decode_settings(&b), Some(s));
@@ -436,7 +503,7 @@ mod tests {
     fn settings_v6_round_trips_purge_requires_tiers_and_v1_to_v5_read_zero() {
         assert_eq!(
             (SETTINGS_VERSION, SETTINGS_LEN, SETTINGS_LEN_V5),
-            (6, 47, 46)
+            (7, 49, 46)
         );
         let g = Settings::genesis_default();
         assert_eq!(g.purge_requires_tiers, 0);
@@ -447,7 +514,7 @@ mod tests {
         let mut b = Vec::new();
         encode_settings(&s, &mut b);
         assert_eq!(b.len(), SETTINGS_LEN);
-        assert_eq!(&b[0..4], &6u32.to_le_bytes());
+        assert_eq!(&b[0..4], &7u32.to_le_bytes());
         assert_eq!(b[46], 3);
         assert_eq!(decode_settings(&b), Some(s));
         for (ver, len) in [
@@ -462,6 +529,12 @@ mod tests {
             let d = decode_settings(&old).unwrap();
             assert_eq!(d.purge_requires_tiers, 0);
         }
+        let mut v6 = b[..SETTINGS_LEN_V6].to_vec();
+        v6[0..4].copy_from_slice(&6u32.to_le_bytes());
+        assert_eq!(
+            decode_settings(&v6).map(|d| d.purge_requires_tiers),
+            Some(3)
+        );
         let mut short = b[..SETTINGS_LEN_V5].to_vec();
         short[0..4].copy_from_slice(&6u32.to_le_bytes());
         assert_eq!(decode_settings(&short), None, "a v6 header on a v5 length");
@@ -472,11 +545,11 @@ mod tests {
         assert!(decode_settings(&[]).is_none());
         let mut out = Vec::new();
         encode_settings(&Settings::genesis_default(), &mut out);
-        // `1`..=`6` are all REAL versions now, so the unknown-version
-        // case is `7`.
-        let mut v7 = out.clone();
-        v7[0] = 7;
-        assert!(decode_settings(&v7).is_none());
+        // `1`..=`7` are all REAL versions now, so the unknown-version
+        // case is `8`.
+        let mut v8 = out.clone();
+        v8[0] = 8;
+        assert!(decode_settings(&v8).is_none());
         let mut t9 = out.clone();
         t9[28] = 9;
         assert!(decode_settings(&t9).is_none());
@@ -493,5 +566,61 @@ mod tests {
         assert_eq!(d.snapshot_target, Target::All);
         assert_eq!(d.retain_sets, 1, "genesis seeds newest-only retention");
         assert_eq!(d.datagram_mtu, 0);
+    }
+
+    #[test]
+    fn settings_v7_round_trips_the_wire_fields_and_v1_to_v6_read_first_level_auto() {
+        assert_eq!(
+            (SETTINGS_VERSION, SETTINGS_LEN, SETTINGS_LEN_V6),
+            (7, 49, 47)
+        );
+        let mut s = Settings::genesis_default();
+        s.wire_level = 13;
+        s.wire_raise = WIRE_RAISE_MANUAL;
+        let mut b = Vec::new();
+        encode_settings(&s, &mut b);
+        assert_eq!(b.len(), SETTINGS_LEN);
+        assert_eq!((b[47], b[48]), (13, 2));
+        assert_eq!(decode_settings(&b), Some(s));
+        // every earlier version decodes as level 12, auto — from the record
+        // alone (ruling R24), so an old image and a genesis walk agree.
+        for (ver, len) in [
+            (1, SETTINGS_LEN_V1),
+            (2, SETTINGS_LEN_V2),
+            (3, SETTINGS_LEN_V3),
+            (4, SETTINGS_LEN_V4),
+            (5, SETTINGS_LEN_V5),
+            (6, SETTINGS_LEN_V6),
+        ] {
+            let mut old = b[..len].to_vec();
+            old[0..4].copy_from_slice(&(ver as u32).to_le_bytes());
+            let d = decode_settings(&old).unwrap_or_else(|| panic!("v{ver} must decode"));
+            assert_eq!(
+                (d.wire_level, d.wire_raise),
+                (WIRE_LEVEL_FIRST, WIRE_RAISE_AUTO),
+                "v{ver}"
+            );
+        }
+    }
+
+    #[test]
+    fn genesis_seeds_this_binarys_max_and_auto() {
+        let g = Settings::genesis_default();
+        assert_eq!((g.wire_level, g.wire_raise), (WIRE_MAX, WIRE_RAISE_AUTO));
+    }
+
+    #[test]
+    fn decode_at_level_refuses_a_record_above_the_level() {
+        assert_eq!(settings_version_for(12), 7);
+        let mut b = Vec::new();
+        encode_settings(&Settings::genesis_default(), &mut b);
+        assert!(decode_settings_at(12, &b).is_some());
+        // a v8 record (one byte longer, version 8) is above what level 12
+        // knows: refused by the level-aware decoder, like any unknown version.
+        let mut v8 = b.clone();
+        v8.push(0);
+        v8[0..4].copy_from_slice(&8u32.to_le_bytes());
+        assert!(decode_settings_at(12, &v8).is_none());
+        assert!(decode_settings(&v8).is_none());
     }
 }

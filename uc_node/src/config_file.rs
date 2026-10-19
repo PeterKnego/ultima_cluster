@@ -1058,6 +1058,9 @@ pub fn parse_str_with_env(
                 backup_retain_sets: s.backup_retain_sets.unwrap_or(0),
                 backup_retain_age_secs,
                 purge_requires_tiers: s.purge_requires_tiers.unwrap_or(0),
+                // Genesis seed: this binary's max level, auto raise.
+                wire_level: uc_protocol::version::WIRE_MAX,
+                wire_raise: uc_protocol::v2::settings::WIRE_RAISE_AUTO,
             }
         }
     };

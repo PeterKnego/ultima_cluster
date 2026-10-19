@@ -136,6 +136,8 @@ pub fn parse_settings(toml_text: &str) -> Result<Settings, String> {
         backup_retain_sets: file.backup_retain_sets.unwrap_or(0),
         backup_retain_age_secs,
         purge_requires_tiers: file.purge_requires_tiers.unwrap_or(0),
+        wire_level: 0, // Task 8 maps the file key; 0 = keep
+        wire_raise: 0,
     })
 }
 
@@ -308,9 +310,18 @@ mod tests {
                 backup_retain_sets: 0,
                 backup_retain_age_secs: 0,
                 purge_requires_tiers: 0,
+                wire_level: 0,
+                wire_raise: 0,
             }
         );
-        assert_eq!(parse_settings("").unwrap(), Settings::genesis_default());
+        assert_eq!(
+            parse_settings("").unwrap(),
+            Settings {
+                wire_level: 0,
+                wire_raise: 0,
+                ..Settings::genesis_default()
+            }
+        );
         assert!(parse_settings("bogus = 1").unwrap_err().contains("bogus"));
         assert!(
             parse_settings("snapshot_target = \"voters\"")

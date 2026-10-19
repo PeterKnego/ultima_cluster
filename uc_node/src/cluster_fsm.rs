@@ -1638,6 +1638,9 @@ impl ClusterView {
                 backup_retain_sets: self.backup_retain_sets.load(Ordering::Acquire),
                 backup_retain_age_secs: self.backup_retain_age_secs.load(Ordering::Acquire),
                 purge_requires_tiers: self.purge_requires_tiers.load(Ordering::Acquire),
+                // Task 3 publishes these through the view
+                wire_level: uc_protocol::version::WIRE_LEVEL_FIRST,
+                wire_raise: uc_protocol::v2::settings::WIRE_RAISE_AUTO,
             },
             settings_position: self.settings_position.load(Ordering::Acquire),
             applied: self.position.load(Ordering::Acquire),
@@ -2169,6 +2172,8 @@ mod tests {
             backup_retain_sets: 0,
             backup_retain_age_secs: 0,
             purge_requires_tiers: 0,
+            wire_level: uc_protocol::version::WIRE_LEVEL_FIRST,
+            wire_raise: uc_protocol::v2::settings::WIRE_RAISE_AUTO,
         };
         let v = ClusterView::new(&st);
         assert_eq!(v.to_state(), st);

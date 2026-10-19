@@ -1991,6 +1991,8 @@ pub fn uc_protocol_settings() -> Vec<Seed> {
         backup_retain_sets: 4,
         backup_retain_age_secs: 2_592_000,
         purge_requires_tiers: 2,
+        wire_level: 13,
+        wire_raise: WIRE_RAISE_MANUAL,
     });
     // The version-1 shape `2.11.0` wrote — a live corpus value, not a
     // refusal: it decodes with `datagram_mtu = 0` (jumbo spec §5.5).
