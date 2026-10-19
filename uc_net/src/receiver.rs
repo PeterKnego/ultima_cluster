@@ -812,10 +812,16 @@ pub struct FollowerStats {
     /// Wire-level spec §3.2: inbound datagrams whose header byte @13 is `0`
     /// (a pre-level peer — a `0.11.0` node on the first flag day's old side).
     /// Refused whole, before anything else is read; counted per datagram.
+    /// On a crypto cluster this is counted BEFORE authentication (so a
+    /// pre-level handshake is refused too), which means unauthenticated
+    /// traffic from any source can drive it: do not page on it alone. Pair
+    /// it with a membership signal, or with the `wire_refused` stderr line,
+    /// which under crypto is only written for a configured member.
     pub wire_refused_prelevel: AtomicU64,
     /// Wire-level spec §3.2: inbound datagrams whose header byte @13 is
     /// non-zero and outside `[WIRE_MIN, WIRE_MAX + 1]` — a peer more than one
-    /// level above this binary, or below its `WIRE_MIN`. Refused the same way.
+    /// level above this binary, or below its `WIRE_MIN`. Refused the same way,
+    /// with the same crypto caveat as [`Self::wire_refused_prelevel`].
     pub wire_refused_out_of_range: AtomicU64,
     /// Coordinated-snapshot spec §5.7 item 5: a node-requested fetch dropped
     /// because a snapshot transfer was already in flight here. Not an error —
@@ -2002,7 +2008,20 @@ impl FollowerReceiver {
         // this check can only cause a drop: a forged byte that passes the
         // range check still has to survive the AEAD open, where the header is
         // AAD. `on_datagram` repeats the check on the authenticated header.
-        if !self.wire_admit(&h, from) {
+        //
+        // The refusal is ALWAYS counted (spec §3.2), but the stderr line is
+        // written only when the source resolves to a configured member. Here
+        // the source is unauthenticated: logging every spoofed address would
+        // let a sender rotating through more than
+        // `STATUS_REFUSED_LOG_MAX_PEERS` addresses buy one blocking stderr
+        // write per datagram on this busy-spin agent. That is the same reason
+        // `note_cleartext_peer` only runs after `peer_id_of` resolves. An
+        // unknown source is counted only, with no log line (not even a global
+        // throttle): a stranger's pre-level byte is not an operator's mixed
+        // cluster, and the counter already witnesses it.
+        if !self.cfg.wire.accepts_peer(h.wire) {
+            let member = self.peer_id_of(from).is_some();
+            self.note_wire_refused(from, h.wire, member);
             return None;
         }
 
@@ -2163,7 +2182,7 @@ impl FollowerReceiver {
         if self.cfg.wire.accepts_peer(h.wire) {
             return true;
         }
-        self.note_wire_refused(from, h.wire);
+        self.note_wire_refused(from, h.wire, true);
         false
     }
 
@@ -2171,9 +2190,11 @@ impl FollowerReceiver {
     /// [`FollowerStats::wire_refused_prelevel`], anything else as
     /// [`FollowerStats::wire_refused_out_of_range`] — on every occurrence, and
     /// names it on stderr with the same per-source throttle
-    /// `note_status_refused` uses.
+    /// `note_status_refused` uses — but only when `log` is set. `crypto_admit`
+    /// clears it for a source that is not a configured member (an
+    /// unauthenticated, possibly spoofed address), so that path counts only.
     #[cold]
-    fn note_wire_refused(&mut self, from: SocketAddr, byte: u8) {
+    fn note_wire_refused(&mut self, from: SocketAddr, byte: u8, log: bool) {
         if byte == 0 {
             self.stats
                 .wire_refused_prelevel
@@ -2182,6 +2203,9 @@ impl FollowerReceiver {
             self.stats
                 .wire_refused_out_of_range
                 .fetch_add(1, Ordering::Relaxed);
+        }
+        if !log {
+            return;
         }
         let now = self.now_ns();
         let due = self
@@ -2201,7 +2225,7 @@ impl FollowerReceiver {
                  pre-level peer); this node accepts {}..={} -- every node must be within one \
                  wire level of the cluster",
                 r.min,
-                r.max + 1
+                r.max.saturating_add(1)
             );
         }
     }
@@ -2342,10 +2366,14 @@ impl FollowerReceiver {
             return;
         };
         // Wire-level spec §3.2: decided before anything else in the datagram
-        // is read — before probes, consensus kinds and the term filter. With
-        // crypto on, `d` has been opened and the header was AAD, so this runs
-        // on authenticated bytes (and `crypto_admit` already ran the same
-        // check on the cleartext header; repeating it is one compare).
+        // is read — before probes, consensus kinds and the term filter.
+        // BOTH sites are needed; do not remove either. With crypto OFF this is
+        // the only site that runs (`crypto_admit` returns early), so it is the
+        // meaningful one. With crypto ON, `crypto_admit` has ALREADY refused
+        // any out-of-range byte on the cleartext header (and it alone sees the
+        // handshake kinds), so here it is defence in depth: `d` has been
+        // opened, the header was AAD, and this re-check runs on authenticated
+        // bytes for one compare.
         if !self.wire_admit(&h, from) {
             return;
         }
@@ -5472,6 +5500,11 @@ mod tests {
             0,
             "refused before open"
         );
+        let peer_addr = peer.sock.local_addr().unwrap();
+        assert!(
+            r.wire_refused_log.contains_key(&peer_addr),
+            "a configured member's refusal is named on stderr (throttle entry written)"
+        );
         // At this binary's level the same sealed HEARTBEAT is admitted.
         peer.send_sealed_with_wire(to, DGRAM_KIND_HEARTBEAT, WIRE_MAX);
         drive_until(&mut r, || st.datagrams.load(Relaxed) == 1);
@@ -5484,6 +5517,10 @@ mod tests {
     fn wire_prelevel_handshake_is_refused_before_it_is_routed() {
         use Ordering::Relaxed;
         let (mut r, mut peer, _b) = receiver_with_crypto();
+        // A live handshake route whose receiving end the test holds, so
+        // "never routed" is asserted on the channel itself.
+        let (hs_tx, hs_rx) = mpsc::sync_channel::<HandshakeDatagram>(16);
+        r.hs_route = Some(hs_tx);
         let to = r.local_addr();
         let st = r.stats();
         let mut d = vec![0u8; DATAGRAM_HEADER_LEN + 8];
@@ -5492,7 +5529,55 @@ mod tests {
         write_datagram_header(&mut d, &h);
         peer.send_raw(to, &d);
         drive_until(&mut r, || st.wire_refused_prelevel.load(Relaxed) == 1);
-        assert_eq!(st.dropped_handshake.load(Relaxed), 0, "never routed");
+        assert!(
+            hs_rx.try_recv().is_err(),
+            "a pre-level handshake is never routed"
+        );
+        assert_eq!(st.dropped_handshake.load(Relaxed), 0);
+        // Control: the same handshake at this binary's level IS routed.
+        h.wire = WIRE_MAX;
+        write_datagram_header(&mut d, &h);
+        peer.send_raw(to, &d);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            assert!(
+                Instant::now() < deadline,
+                "the at-level handshake was never routed"
+            );
+            r.do_work();
+            if hs_rx.try_recv().is_ok() {
+                break;
+            }
+        }
+    }
+
+    /// Review finding (Important): under crypto the byte check runs before
+    /// the source is authenticated, so a refusal from an address that is NOT
+    /// a configured member is counted but writes NO log line — otherwise a
+    /// sender rotating spoofed source addresses past the throttle table's
+    /// bound buys one stderr write per datagram on the receiver agent.
+    #[test]
+    fn wire_refusal_from_an_unknown_source_under_crypto_is_counted_not_logged() {
+        use Ordering::Relaxed;
+        let (mut r, mut peer, _b, _ids) = receiver_with_crypto_ids(false);
+        let to = r.local_addr();
+        let st = r.stats();
+        peer.send_sealed_with_wire(to, DGRAM_KIND_HEARTBEAT, 0);
+        peer.send_sealed_with_wire(to, DGRAM_KIND_HEARTBEAT, WIRE_MAX + 2);
+        drive_until(&mut r, || {
+            st.wire_refused_prelevel.load(Relaxed) == 1
+                && st.wire_refused_out_of_range.load(Relaxed) == 1
+        });
+        assert!(
+            r.wire_refused_log.is_empty(),
+            "an unauthenticated source must not reach the stderr throttle"
+        );
+        assert_eq!(st.datagrams.load(Relaxed), 0);
+        assert_eq!(
+            st.dropped_unknown_peer.load(Relaxed),
+            0,
+            "refused by the byte before the peer lookup's own drop"
+        );
     }
 
     /// Erratum 2: the byte rides on the durable report to the consensus
