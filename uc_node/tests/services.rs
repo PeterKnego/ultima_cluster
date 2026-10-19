@@ -890,7 +890,11 @@ fn q_a_follower_quorum_with_absent_fsms_stalls_commit_at_the_bound() {
     let lcnc = open_cnc(&dirs[leader]);
     for i in 0..8 {
         let s = lcnc.peer_slot(i);
-        if s.id_and_role.load_acquire() == 0 {
+        if s.head
+            .id_and_role
+            .load(std::sync::atomic::Ordering::Acquire)
+            == 0
+        {
             continue;
         }
         let rd = s.reported_durable.load_acquire();

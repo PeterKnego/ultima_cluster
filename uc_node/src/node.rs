@@ -5953,10 +5953,10 @@ impl Consensus {
     fn publish_peer_band(&mut self) {
         if !self.peer_band_published {
             for (i, (id, role)) in self.peer_band.iter().enumerate() {
-                self.cnc
-                    .peer_slot(i)
-                    .id_and_role
-                    .store_release(uc_log::cnc::pack_id_and_role(*id, *role));
+                self.cnc.peer_slot(i).head.id_and_role.store(
+                    uc_log::cnc::pack_id_and_role(*id, *role),
+                    std::sync::atomic::Ordering::Release,
+                );
             }
             // M7 review finding (Task 11 gate authoring): a rebuild that
             // SHRINKS the peer band (a demote/remove-voter/remove-learner
@@ -5972,7 +5972,11 @@ impl Consensus {
             // staleness warning read exactly this band, so a stale ghost
             // slot is a real, user-visible bug.
             for i in self.peer_band.len()..CNC_MAX_PEER_SLOTS {
-                self.cnc.peer_slot(i).id_and_role.store_release(0);
+                self.cnc
+                    .peer_slot(i)
+                    .head
+                    .id_and_role
+                    .store(0, std::sync::atomic::Ordering::Release);
             }
             self.peer_band_published = true;
         }

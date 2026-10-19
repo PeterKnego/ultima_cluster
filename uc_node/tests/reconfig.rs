@@ -239,7 +239,11 @@ fn await_config_converged(
         let cnc = open_cnc(&h.instance_dir);
         let mut found = false;
         for i in 0..CNC_MAX_PEER_SLOTS {
-            let raw = cnc.peer_slot(i).id_and_role.load_acquire();
+            let raw = cnc
+                .peer_slot(i)
+                .head
+                .id_and_role
+                .load(std::sync::atomic::Ordering::Acquire);
             if raw == 0 {
                 continue;
             }
@@ -798,7 +802,11 @@ fn joining_node_boots_from_stale_seed() {
         let cnc = open_cnc(&h.instance_dir);
         let mut found = false;
         for i in 0..CNC_MAX_PEER_SLOTS {
-            let raw = cnc.peer_slot(i).id_and_role.load_acquire();
+            let raw = cnc
+                .peer_slot(i)
+                .head
+                .id_and_role
+                .load(std::sync::atomic::Ordering::Acquire);
             if raw == 0 {
                 continue;
             }
@@ -1132,7 +1140,11 @@ fn add_learner_and_boot(c: &mut Cluster, leader_cnc: &CncPage, id: NodeId, expec
 fn voter_ids_via_cnc(cnc: &CncPage) -> Vec<NodeId> {
     let mut ids = Vec::new();
     for i in 0..CNC_MAX_PEER_SLOTS {
-        let raw = cnc.peer_slot(i).id_and_role.load_acquire();
+        let raw = cnc
+            .peer_slot(i)
+            .head
+            .id_and_role
+            .load(std::sync::atomic::Ordering::Acquire);
         if raw == 0 {
             continue;
         }
@@ -1152,7 +1164,11 @@ fn voter_ids_via_cnc(cnc: &CncPage) -> Vec<NodeId> {
 fn peer_band_is_clean(cnc: &CncPage, expected_ids: &[NodeId]) -> bool {
     let mut seen: Vec<NodeId> = Vec::new();
     for i in 0..CNC_MAX_PEER_SLOTS {
-        let raw = cnc.peer_slot(i).id_and_role.load_acquire();
+        let raw = cnc
+            .peer_slot(i)
+            .head
+            .id_and_role
+            .load(std::sync::atomic::Ordering::Acquire);
         if raw == 0 {
             continue;
         }
@@ -1183,7 +1199,11 @@ fn peer_band_is_clean(cnc: &CncPage, expected_ids: &[NodeId]) -> bool {
 fn assert_peer_band_clean(cnc: &CncPage, expected_ids: &[NodeId]) {
     let mut seen: Vec<NodeId> = Vec::new();
     for i in 0..CNC_MAX_PEER_SLOTS {
-        let raw = cnc.peer_slot(i).id_and_role.load_acquire();
+        let raw = cnc
+            .peer_slot(i)
+            .head
+            .id_and_role
+            .load(std::sync::atomic::Ordering::Acquire);
         if raw == 0 {
             continue;
         }
@@ -1245,7 +1265,11 @@ fn full_replace_a_box_recipe() {
     loop {
         let mut caught_up = false;
         for i in 0..CNC_MAX_PEER_SLOTS {
-            let raw = leader_cnc.peer_slot(i).id_and_role.load_acquire();
+            let raw = leader_cnc
+                .peer_slot(i)
+                .head
+                .id_and_role
+                .load(std::sync::atomic::Ordering::Acquire);
             if raw == 0 {
                 continue;
             }
@@ -1296,7 +1320,11 @@ fn full_replace_a_box_recipe() {
     for h in &c.nodes {
         let cnc = open_cnc(&h.instance_dir);
         for i in 0..CNC_MAX_PEER_SLOTS {
-            let raw = cnc.peer_slot(i).id_and_role.load_acquire();
+            let raw = cnc
+                .peer_slot(i)
+                .head
+                .id_and_role
+                .load(std::sync::atomic::Ordering::Acquire);
             if raw == 0 {
                 continue;
             }
@@ -1959,7 +1987,11 @@ fn truncation_revert_e2e() {
         );
         let cnc = open_cnc(&h.instance_dir);
         for i in 0..CNC_MAX_PEER_SLOTS {
-            let raw = cnc.peer_slot(i).id_and_role.load_acquire();
+            let raw = cnc
+                .peer_slot(i)
+                .head
+                .id_and_role
+                .load(std::sync::atomic::Ordering::Acquire);
             if raw == 0 {
                 continue;
             }

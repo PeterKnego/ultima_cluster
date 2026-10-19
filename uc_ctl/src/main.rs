@@ -1445,7 +1445,10 @@ fn run_status(a: &StatusArgs) -> anyhow::Result<()> {
     println!("members:");
     for i in 0..CNC_MAX_PEER_SLOTS {
         let slot = cnc.peer_slot(i);
-        let raw = slot.id_and_role.load_acquire();
+        let raw = slot
+            .head
+            .id_and_role
+            .load(std::sync::atomic::Ordering::Acquire);
         if raw == 0 {
             continue; // dormant slot
         }

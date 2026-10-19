@@ -77,7 +77,13 @@ pub const CNC_PAGE_LEN: usize = 8192;
 /// instead of 0. `version_compatible` accepts an OLDER peer minor, so a 3.4
 /// attacher on a released 3.3 page is not refused by the version check; the
 /// client checks [`CNC_MIN_POSITION_MINOR`] itself before sending the flag.
-pub const CNC_V2_VERSION: u32 = (3 << 24) | (4 << 16);
+///
+/// 3.5 (wire level): `wire_level` at 3992 (cluster-agent-written at apply),
+/// `wire_binary` at 4000 (node-written at boot, `(min << 8) | max`), and
+/// `wire_max` at peer slot `+8` (consensus-written on change). A 3.4 attacher
+/// refuses a 3.5 page — restart a host's processes together, as for every cnc
+/// minor.
+pub const CNC_V2_VERSION: u32 = (3 << 24) | (5 << 16);
 
 /// The first cnc minor whose node parses `FLAG_V2_MIN_POSITION` (folded into
 /// 3.4, which no release has shipped without it).
@@ -132,6 +138,7 @@ pub const CNC_OFF_ARCHIVE_FIRST_BASE: usize = 1344; // writer: consensus (mirror
 // (all-zero) on a follower and for unused peer indices. Layout per slot (each
 // field its own 64-byte cache line to keep single-writer stores contention-free):
 //   +0   peer_id_and_role  u64 = (peer_id << 8) | role_bits   writer: consensus (boot-once)
+//   +8   wire_max          u64 = the peer's reported WIRE_MAX (0 = no report this term)  writer: consensus, on change
 //   +64  reported_durable  u64                                writer: consensus (Report intake)
 //   +128 advertised_limit  u64                                writer: sender    (STATUS intake)
 //   +192 naks_plus_replay  u64 = (naks_served << 32) | replay writer: sender
@@ -140,6 +147,7 @@ pub const CNC_PEER_SLOT_STRIDE: usize = 256;
 pub const CNC_MAX_PEER_SLOTS: usize = 8;
 // Per-slot field offsets (relative to the slot base).
 pub const CNC_PEER_OFF_ID_AND_ROLE: usize = 0;
+pub const CNC_PEER_OFF_WIRE_MAX: usize = 8;
 pub const CNC_PEER_OFF_REPORTED_DURABLE: usize = 64;
 pub const CNC_PEER_OFF_ADVERTISED_LIMIT: usize = 128;
 pub const CNC_PEER_OFF_NAKS_PLUS_REPLAY: usize = 192;
@@ -315,6 +323,18 @@ const _: () = assert!(CNC_OFF_QUERY_HOLES_SKIPPED == CNC_OFF_INGRESS_HOLES_SKIPP
 pub const CNC_OFF_PAYLOAD_CEILING: usize = 3984;
 const _: () = assert!(CNC_OFF_PAYLOAD_CEILING == CNC_OFF_QUERY_HOLES_SKIPPED + 8);
 const _: () = assert!(CNC_OFF_PAYLOAD_CEILING + 8 <= CNC_OFF_INGRESS_HOLES_SKIPPED + 64);
+
+/// Wire-level spec §5.1: the committed cluster wire level. Fourth `u64` of
+/// the 3968 line. Writer: the `uc2-cluster` agent, when it applies a
+/// Settings record (and at install); readers: the sender (encode at the
+/// committed level), `uc2ctl status`/`wire show`, `/metrics`.
+pub const CNC_OFF_WIRE_LEVEL: usize = 3992;
+const _: () = assert!(CNC_OFF_WIRE_LEVEL == CNC_OFF_PAYLOAD_CEILING + 8);
+/// Wire-level spec §5.1: this node's binary range, `(WIRE_MIN << 8) |
+/// WIRE_MAX`. Writer: the node, once at boot. Lets `uc2ctl` print the
+/// NODE's range rather than its own.
+pub const CNC_OFF_WIRE_BINARY: usize = 4000;
+const _: () = assert!(CNC_OFF_WIRE_BINARY + 8 <= CNC_OFF_INGRESS_HOLES_SKIPPED + 64);
 
 // M14a: the boot-once pair on page 1's last line. Both are written ONCE by
 // the node at startup (`Node::start_with`, before any agent runs) and read
@@ -645,7 +665,7 @@ mod tests {
         assert_eq!(CNC_SVC_OFF_START_SET_VERSION, 272);
         assert_eq!(CNC_SVC_OFF_START_SET_POS, CNC_SVC_OFF_SNAPSHOT_POS + 8);
         const { assert!(CNC_SVC_OFF_START_SET_VERSION + 8 <= CNC_SVC_OFF_HEARTBEAT_NS) };
-        assert_eq!(CNC_V2_VERSION, (3 << 24) | (4 << 16), "still cnc 3.4");
+        assert_eq!(CNC_V2_VERSION, (3 << 24) | (5 << 16), "still cnc 3.5");
     }
 
     /// M12d: `read_cnc_app_id` is total on `&[u8]` — a page too short for the
@@ -697,8 +717,8 @@ mod tests {
         write_cnc_header(&mut page, &h, "kv");
         // magic
         assert_eq!(&page[0..8], b"UC2CNC\0\0");
-        // version = (3<<24)|(4<<16) = 0x0304_0000 -> LE [0,0,4,3]
-        assert_eq!(&page[8..12], &[0x00, 0x00, 0x04, 0x03]);
+        // version = (3<<24)|(5<<16) = 0x0305_0000 -> LE [0,0,5,3]
+        assert_eq!(&page[8..12], &[0x00, 0x00, 0x05, 0x03]);
         // node_id = 7 -> LE [7,0,0,0]
         assert_eq!(&page[12..16], &[7, 0, 0, 0]);
     }
@@ -905,6 +925,12 @@ mod tests {
         assert_eq!(CNC_OFF_PAYLOAD_CEILING, 3984);
         assert_eq!(CNC_OFF_PAYLOAD_CEILING, CNC_OFF_QUERY_HOLES_SKIPPED + 8);
         const { assert!(CNC_OFF_PAYLOAD_CEILING + 8 <= CNC_OFF_INGRESS_HOLES_SKIPPED + 64) };
+        assert_eq!(CNC_V2_VERSION, (3 << 24) | (5 << 16));
+        assert_eq!(CNC_OFF_WIRE_LEVEL, 3992);
+        assert_eq!(CNC_OFF_WIRE_LEVEL, CNC_OFF_PAYLOAD_CEILING + 8);
+        assert_eq!(CNC_OFF_WIRE_BINARY, 4000);
+        const { assert!(CNC_OFF_WIRE_BINARY + 8 <= CNC_OFF_INGRESS_HOLES_SKIPPED + 64) };
+        assert_eq!(CNC_PEER_OFF_WIRE_MAX, 8);
         // M14a: the last page-1 line is the boot-once pair the node writes at
         // startup — services_declared and fsm_lag_bytes share it exactly as the
         // M13 holes pair shares 3968 (one writer, two plain AtomicU64s).
@@ -965,7 +991,7 @@ mod tests {
         // cnc 3.3 (plan B1): the row's pin words on the STATUS line, node-written.
         // cnc 3.4 (#33): the row's running-version words on the same line.
         // cnc 3.4 also carries read-your-writes (folded in), no layout change.
-        assert_eq!(CNC_V2_VERSION, (3 << 24) | (4 << 16));
+        assert_eq!(CNC_V2_VERSION, (3 << 24) | (5 << 16));
         assert_eq!(CNC_SVC_OFF_UPGRADE_ORIGIN, 16);
         assert_eq!(CNC_SVC_OFF_PINNED_VERSION, 24);
         assert_eq!(CNC_SVC_OFF_PIN_SEQ, 32);
@@ -1030,13 +1056,13 @@ mod tests {
         assert_eq!(CNC_SVC_OFF_RUNNING_VERSION, 48);
         assert_eq!(CNC_SVC_OFF_RUNNING_RECORD_POS, 56);
         assert_eq!(CNC_OFF_CLUSTER_APPLIED, 4056);
-        assert_eq!(CNC_V2_VERSION, (3 << 24) | (4 << 16));
+        assert_eq!(CNC_V2_VERSION, (3 << 24) | (5 << 16));
     }
 
     #[test]
     fn cnc_3_4_carries_the_min_position_flag() {
-        assert_eq!(CNC_V2_VERSION, (3 << 24) | (4 << 16));
+        assert_eq!(CNC_V2_VERSION, (3 << 24) | (5 << 16));
         assert_eq!(CNC_MIN_POSITION_MINOR, 4);
-        assert_eq!((CNC_V2_VERSION >> 16) & 0xFF, CNC_MIN_POSITION_MINOR);
+        assert!(((CNC_V2_VERSION >> 16) & 0xFF) >= CNC_MIN_POSITION_MINOR);
     }
 }

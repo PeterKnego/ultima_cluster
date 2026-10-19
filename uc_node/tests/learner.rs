@@ -900,7 +900,11 @@ fn fresh_learner_joins_a_purged_leader_via_snapshot_session() {
     let learner_cnc = CncPage::open_file(&l_dir.join("cnc2.dat"), app).expect("open learner cnc");
     let mut found_extra_learner = false;
     for i in 0..CNC_MAX_PEER_SLOTS {
-        let raw = learner_cnc.peer_slot(i).id_and_role.load_acquire();
+        let raw = learner_cnc
+            .peer_slot(i)
+            .head
+            .id_and_role
+            .load(std::sync::atomic::Ordering::Acquire);
         if raw == 0 {
             continue;
         }

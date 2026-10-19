@@ -1668,7 +1668,10 @@ pub fn render_prometheus(s: &ObsSources) -> String {
     let mut limit_samples = Vec::new();
     for i in 0..CNC_MAX_PEER_SLOTS {
         let slot = s.cnc.peer_slot(i);
-        let id_and_role = slot.id_and_role.load_acquire();
+        let id_and_role = slot
+            .head
+            .id_and_role
+            .load(std::sync::atomic::Ordering::Acquire);
         if id_and_role == 0 {
             continue; // unoccupied slot
         }
@@ -2062,9 +2065,10 @@ mod tests {
         // family (both `uc2_leader_hint` and the three `uc2_peer_*`
         // families are conditionally emitted).
         cnc.status().leader_hint.store_release(0);
-        cnc.peer_slot(0)
-            .id_and_role
-            .store_release(pack_id_and_role(9, CNC_PEER_ROLE_VOTER));
+        cnc.peer_slot(0).head.id_and_role.store(
+            pack_id_and_role(9, CNC_PEER_ROLE_VOTER),
+            std::sync::atomic::Ordering::Release,
+        );
         // M11 (Task 5): non-zero so `every_contract_series_is_present` sees
         // `uc2_free_disk_bytes` — it's conditionally emitted, same as
         // `uc2_leader_hint` above.
@@ -2855,10 +2859,10 @@ mod tests {
     #[test]
     fn peer_slots_export_only_occupied_with_labels() {
         let s = synthetic_sources();
-        s.cnc
-            .peer_slot(0)
-            .id_and_role
-            .store_release(pack_id_and_role(2, CNC_PEER_ROLE_VOTER));
+        s.cnc.peer_slot(0).head.id_and_role.store(
+            pack_id_and_role(2, CNC_PEER_ROLE_VOTER),
+            std::sync::atomic::Ordering::Release,
+        );
         s.cnc.peer_slot(0).reported_durable.store_release(1234);
         let text = render_prometheus(&s);
         assert!(
