@@ -25,7 +25,7 @@ FSM upgrade lifecycle spec's §9.2 Track 2.
 
 #### Errata (plan, as discovered 2026-10-19) — read before the body
 
-Exploration of `b361eb29` for the implementation plan corrected seven
+Exploration of `b361eb29` for the implementation plan corrected eight
 details of the chat design. The plan implements these, not the body.
 
 1. **§3.4, the unknown-kind drop is not in the receiver.** Replication stores
@@ -56,6 +56,13 @@ details of the chat design. The plan implements these, not the body.
    attacher refuses a 3.5 page. That is the standing "restart a host's
    processes together" rule for a cnc minor bump; it is per host, so it does
    not break a roll, and the how-to says so.
+8. **§2.3, Below is judged caught-up, not per record.** `WireLevelAboveBinary`
+   is immediate; `WireLevelBelowBinary` is judged only when the cluster
+   agent's walk has reached commit, because a walk from 0 or from a
+   pre-raise artifact replays Settings records that decode as level 12,
+   which from the release where `WIRE_MIN = 13` would stop a healthy node on
+   history. The refusal is the same; only its moment moves to "once the node
+   knows the cluster's current level".
 
 Also: `PathBelowCommittedMtu` is a fail-stop panic string in the consensus
 agent, not an enum; the two level refusals use the same idiom in the cluster

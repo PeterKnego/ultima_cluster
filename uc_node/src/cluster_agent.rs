@@ -369,6 +369,11 @@ pub struct ClusterAgent {
     /// stay inside it, or the node fail-stops by name
     /// (`WireLevelAboveBinary` / `WireLevelBelowBinary`).
     wire: WireRange,
+    /// Wire-level ruling 7: the recovered artifact's level is checked on the
+    /// agent's own thread, at the top of its first `do_work`, so a fault is
+    /// the ordinary agent fail-stop (daemon exit 1), never a panic inside
+    /// `Node::start_with`.
+    boot_check_pending: bool,
 }
 
 impl ClusterAgent {
@@ -429,6 +434,7 @@ impl ClusterAgent {
             install,
             installed,
             wire,
+            boot_check_pending: start > 0,
         };
         // Spec §2.5 / §3 S4 step 3: a recovered agent republishes the pin
         // words from the artifact BEFORE any service attaches — the same
@@ -440,11 +446,13 @@ impl ClusterAgent {
         // record at or below the recovered `applied`, which this agent will
         // never re-apply, so nothing would ever move the word otherwise.
         agent.cnc.store_cluster_applied(agent.fsm.state().applied);
-        // Wire-level spec §2.3: the recovered artifact's committed level
-        // meets this binary before anything else runs.
-        if start > 0 {
-            agent.enforce_wire_level(agent.fsm.settings(), agent.fsm.state().applied);
-        }
+        // Wire-level spec §5.1: the page carries the FSM's level from boot —
+        // the genesis level on a fresh node, the artifact's on a recovered
+        // one. The CHECK against this binary waits for the agent's thread
+        // (`boot_check_pending`, ruling 7).
+        agent
+            .cnc
+            .store_wire_level(agent.fsm.settings().wire_level as u64);
         agent
     }
 
@@ -454,9 +462,15 @@ impl ClusterAgent {
         &self.cnc
     }
 
-    /// Wire-level spec §2.3: the one place the committed level meets the
-    /// binary. Publishes the cnc word first so an operator reading the page
-    /// after the fail-stop sees the level that stopped the node.
+    /// Wire-level spec §2.3: the one place a level the FSM just took on
+    /// meets the binary. Publishes the cnc word first so an operator reading
+    /// the page after the fail-stop sees the level that stopped the node.
+    ///
+    /// Ruling 5 (erratum 8): only `WireLevelAboveBinary` is immediate — this
+    /// binary cannot decode what follows such a record. `BelowBinary` is
+    /// ignored here: a walk from 0 or from a pre-raise artifact replays
+    /// Settings records at an older level, so Below is judged only once the
+    /// walk is caught up ([`Self::check_caught_up_level`]).
     fn enforce_wire_level(&self, settings: &Settings, position: u64) {
         Self::enforce_wire_level_on(&self.cnc, self.wire, settings, position);
     }
@@ -465,17 +479,42 @@ impl ClusterAgent {
     /// where the follower's batch iterator already borrows `self`.
     fn enforce_wire_level_on(cnc: &CncPage, wire: WireRange, settings: &Settings, position: u64) {
         cnc.store_wire_level(settings.wire_level as u64);
-        if let Err(fault) = crate::wire::check_level(settings.wire_level, wire) {
-            crate::obs_event!(
-                Error,
-                "wire_level_fault",
-                position = position,
-                level = settings.wire_level as u64,
-                binary_min = wire.min as u64,
-                binary_max = wire.max as u64
-            );
-            panic!("cluster fatal (fail-stop): {fault} position={position}");
+        if let Err(fault @ crate::wire::WireFault::AboveBinary { .. }) =
+            crate::wire::check_level(settings.wire_level, wire)
+        {
+            Self::wire_fail_stop(fault, wire, position);
         }
+    }
+
+    /// Ruling 5: at the end of a pass whose walk reached the commit it
+    /// walked towards, the FSM's level IS the cluster's current level — the
+    /// one moment `WireLevelBelowBinary` may be judged. A `head` of 0 is a
+    /// node that has learned no commit yet, which knows no level to judge.
+    fn check_caught_up_level(&self, head: u64) {
+        if head == 0 || self.follower.cursor < head {
+            return;
+        }
+        let level = self.fsm.settings().wire_level;
+        if let Err(fault) = crate::wire::check_level(level, self.wire) {
+            self.cnc.store_wire_level(level as u64);
+            Self::wire_fail_stop(fault, self.wire, self.follower.cursor);
+        }
+    }
+
+    fn wire_fail_stop(fault: crate::wire::WireFault, wire: WireRange, position: u64) -> ! {
+        let level = match fault {
+            crate::wire::WireFault::AboveBinary { level, .. }
+            | crate::wire::WireFault::BelowBinary { level, .. } => level,
+        };
+        crate::obs_event!(
+            Error,
+            "wire_level_fault",
+            position = position,
+            wire_level = level as u64,
+            binary_min = wire.min as u64,
+            binary_max = wire.max as u64
+        );
+        panic!("cluster fatal (fail-stop): {fault} position={position}");
     }
 
     /// Wire-level spec §3.4: a CLUSTER record a correct peer could not have
@@ -489,7 +528,7 @@ impl ClusterAgent {
                 Error,
                 "cluster_record_undecodable",
                 position = position,
-                level = level as u64
+                wire_level = level as u64
             );
             panic!(
                 "cluster fatal (fail-stop): ClusterRecordUndecodable position={position} \
@@ -682,6 +721,12 @@ impl ClusterAgent {
     /// (spec §5.2/§5.7); publish the view if anything applied. Returns
     /// whether it did work.
     pub fn do_work(&mut self) -> bool {
+        // Wire-level ruling 7: the recovered artifact's level, once, on this
+        // agent's thread — Above only (ruling 5); Below waits for caught-up.
+        if self.boot_check_pending {
+            self.boot_check_pending = false;
+            self.enforce_wire_level(self.fsm.settings(), self.fsm.state().applied);
+        }
         // Spec §5.6: the snapshot session's cluster artifact, FIRST. A
         // below-floor joiner's log has nothing this agent can apply — the
         // CLUSTER frames that built the image are below the leader's purge
@@ -880,6 +925,10 @@ impl ClusterAgent {
             // already see every row word as of p.
             self.cnc.store_cluster_applied(self.fsm.state().applied);
         }
+        // Wire-level ruling 5: Below is judged here, caught up, and only here.
+        // Before `note_consumed`, so a node stopping on it never reads as
+        // having joined.
+        self.check_caught_up_level(head);
         // Plan B3 T5: …but the WALK is published, every pass, through the
         // view's `consumed` word — one `fetch_max`, no mutex, nothing on the
         // consensus hot path reading it in steady state. That is what lets
@@ -2705,10 +2754,23 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "WireLevelBelowBinary")]
-    fn a_committed_level_below_the_binary_fail_stops_at_apply() {
+    fn a_committed_level_below_the_binary_fail_stops_once_caught_up() {
         let mut agent = agent_fixture(WireRange { min: 13, max: 14 });
         append_committed_settings(&agent, &Settings::genesis_default()); // level 12
+        agent.do_work(); // walks to commit, so Below is judged at the pass end
+    }
+
+    /// Ruling 5 (spec erratum 8): a pre-raise Settings record in HISTORY is
+    /// not a fault — Below is judged only once the walk reaches commit.
+    #[test]
+    fn a_historical_below_level_record_does_not_stop_a_walk_that_ends_in_range() {
+        let mut agent = agent_fixture(WireRange { min: 13, max: 14 });
+        append_committed_settings(&agent, &Settings::genesis_default()); // level 12
+        let mut s = Settings::genesis_default();
+        s.wire_level = 13;
+        append_committed_settings(&agent, &s);
         agent.do_work();
+        assert_eq!(agent.cnc().wire_level(), 13);
     }
 
     #[test]

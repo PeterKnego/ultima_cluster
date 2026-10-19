@@ -116,5 +116,6 @@ mod tests {
         assert_eq!(parse_range("12,13"), Some(WireRange { min: 12, max: 13 }));
         assert_eq!(parse_range("13,12"), None); // min above max
         assert_eq!(parse_range("x"), None);
+        assert_eq!(parse_range("0,12"), None); // level 0 is a pre-level peer
     }
 }
