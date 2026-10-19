@@ -204,10 +204,13 @@ pub const ADMIN_OP_UPGRADE_PIN: u32 = 10;
 /// single-in-flight; refused `62 tier_unknown` when no entry has that id.
 pub const ADMIN_OP_TIER_FORGET: u32 = 11;
 /// Wire-level spec §4.3: `uc2ctl wire raise`. Appends the Settings record
-/// that raises the committed wire level to the next one, iff every member
-/// in the committed membership reports at or above it. `id`/`ip`/`port`
-/// unused (0). Leader-only (a follower answers `retry`), single-in-flight;
-/// refused `63 wire_holdout` otherwise. Works, idempotently, in auto mode.
+/// that raises the committed wire level to the target — the minimum of every
+/// committed member's reported wire max — when that is above the committed
+/// level. A cluster already at that level answers success with nothing
+/// appended. Refused `63 wire_holdout` only when a member has no report this
+/// term or reports below the target. `id`/`ip`/`port` unused (0).
+/// Leader-only (a follower answers `retry`), single-in-flight. Works,
+/// idempotently, in auto mode.
 pub const ADMIN_OP_WIRE_RAISE: u32 = 12;
 /// M7 — admin RESPONSE line (writer: consensus agent). seq u64 @+0 echoes the
 /// request seq (written LAST, release); status u32 @+8, reason u32 @+12,

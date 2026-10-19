@@ -971,9 +971,10 @@ fn reason_str(reason: u32) -> &'static str {
         62 => {
             "tier_unknown (no registered backup tier has that id — check it against the tier's TIER label)"
         }
-        // Wire-level spec §4.3: a member is holding the level, or nothing is above it.
+        // Wire-level spec §4.3: a member is holding the level. An at-level
+        // cluster is a no-op success (ruling 9), never 63.
         63 => {
-            "wire_holdout (a member in the committed membership reports below the next level, has not reported this term, or the cluster is already at every member's level — `uc2ctl wire show` on the leader names it)"
+            "wire_holdout (a member in the committed membership reports below the raise target or has not reported this term — `uc2ctl wire show` on the leader names it)"
         }
         _ => "unknown/malformed",
     }

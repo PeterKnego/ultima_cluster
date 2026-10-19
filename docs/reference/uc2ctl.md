@@ -671,7 +671,10 @@ this term, or `no report`) and a `verdict:` — `raisable to N`, `at level
 reported M`, computed by the same predicate the leader's auto raise and the
 `wire raise` door use, with this node's own max taken from its binary. Any
 other node, or a node that is not running, prints a one-line `members:` note
-pointing at the leader instead.
+pointing at the leader instead. The verdict names ONE holdout, checking this
+node first and then the peer slots in order; when several members hold the
+level back, the node's own refusal detail (the `wire raise` audit record) may
+name a different one — both are real holdouts.
 
 ### `wire raise`
 

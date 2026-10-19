@@ -21661,6 +21661,65 @@ mod tests {
         assert!(text.is_empty(), "the manual path audits nothing: {text}");
     }
 
+    fn wire_raise_req(seq: u64) -> AdminReq {
+        AdminReq {
+            seq,
+            nonce: 0xABC0 + seq,
+            op: ADMIN_OP_WIRE_RAISE,
+            id: 0,
+            ip: 0,
+            port: 0,
+        }
+    }
+
+    /// The one `wire_raise` record in the audit file.
+    fn the_wire_raise_record(h: &Harness) -> String {
+        let text = std::fs::read_to_string(h.cons.audit.path()).unwrap_or_default();
+        let recs: Vec<&str> = text
+            .lines()
+            .filter(|l| l.contains("\"op_name\":\"wire_raise\""))
+            .collect();
+        assert_eq!(
+            recs.len(),
+            1,
+            "exactly one record per manual outcome: {text}"
+        );
+        recs[0].to_string()
+    }
+
+    /// Wire-level spec §4.3, end to end through the admin door: a leader
+    /// missing one member's report answers 63, and the handler's ONE audit
+    /// record names the holdout in its detail (via `last_wire_holdout`).
+    #[test]
+    fn the_wire_raise_door_audits_the_holdout_on_a_refusal() {
+        let mut h = harness();
+        drive_to_serving_leader(&mut h);
+        wire_raise_due(&mut h);
+        h.cons.peer_wire.remove(&2);
+        h.cons.handle_admin(wire_raise_req(1));
+        let resp = h.cons.cnc.read_admin_resp(1).expect("a reply");
+        assert_eq!((resp.status, resp.reason), (1, REASON_WIRE_HOLDOUT));
+        let rec = the_wire_raise_record(&h);
+        assert!(rec.contains("\"reason\":63"), "{rec}");
+        assert!(rec.contains("holdout=id:2 no report"), "{rec}");
+        assert!(rec.contains("level="), "{rec}");
+        assert_eq!(h.cons.last_wire_holdout, None, "taken by the handler");
+    }
+
+    /// A follower answers retry through the same door, and its record names
+    /// the level with no holdout.
+    #[test]
+    fn the_wire_raise_door_answers_retry_on_a_follower() {
+        let mut h = harness();
+        assert!(!matches!(h.cons.sm.role(), Role::Leader));
+        h.cons.handle_admin(wire_raise_req(1));
+        let resp = h.cons.cnc.read_admin_resp(1).expect("a reply");
+        assert_eq!((resp.status, resp.reason), (2, 0));
+        let rec = the_wire_raise_record(&h);
+        assert!(rec.contains("level="), "{rec}");
+        assert!(!rec.contains("holdout="), "{rec}");
+    }
+
     /// Spec §9: a DISCOVERY commit is AUDITED, as `settings_apply` with
     /// `source = "discovery"`. It changes the replicated settings record just
     /// as `uc2ctl settings apply` does, but no operator asked for it — so the
