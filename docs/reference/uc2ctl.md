@@ -263,6 +263,7 @@ auto_fetch              = true         # bool; absent = true (every node fetches
 backup_retain_sets      = 0            # u16; absent/0 = a backup tier keeps every set
 backup_retain_age       = "30d"        # "<n>(s|m|h|d)"; absent/0 = no age rule
 purge_requires_tiers    = 0            # 0..=4 (3b); absent/0 = off; K = purge waits for K tiers' through
+wire_raise              = "auto"       # "auto" or "manual" (2.15.0); absent = keep the committed mode
 ```
 
 An unknown key is refused locally by name, before anything is staged. The same
@@ -294,7 +295,7 @@ uc2ctl settings show --instance-dir <DIR> --app-id <ID>
 ```
 
 ```
-position=8192 admission_bytes=262144 fsm_lag=16MiB snapshot_interval_bytes=0 snapshot_target=all retain_sets=1 auto_fetch=true backup_retain_sets=0 backup_retain_age_secs=0 purge_requires_tiers=0 datagram_mtu=0 (baseline)
+position=8192 admission_bytes=262144 fsm_lag=16MiB snapshot_interval_bytes=0 snapshot_target=all retain_sets=1 auto_fetch=true backup_retain_sets=0 backup_retain_age_secs=0 purge_requires_tiers=0 wire_level=12 wire_raise=auto datagram_mtu=0 (baseline)
 ```
 
 `fsm_lag` renders as `default` (the record's `0`), `lockstep`, a whole-MiB
@@ -309,6 +310,13 @@ file spells the age as `backup_retain_age = "30d"`.
 backup tiers whose confirmed `through` every node's purge waits for (`0` =
 off, the default; `1..=4`); `settings show` prints it before `datagram_mtu`.
 See [Back up to a tier § Backup-gated purge](../how-to/back-up-to-a-tier.md#backup-gated-purge).
+`wire_level` and `wire_raise` (since `2.15.0`) are the committed cluster wire
+level and who raises it: `auto` (the leader, once every member reports the
+next level) or `manual` ([`uc2ctl wire raise`](#wire-raise)); `keep` appears
+only for a record that leaves the committed mode alone. `wire_raise` is a
+file key (absent = keep); `wire_level` is **leader-owned** like
+`datagram_mtu` — naming it in a `settings apply` file is refused as an
+unknown key. `uc2ctl settings show` prints both after `purge_requires_tiers`.
 `datagram_mtu` (2.12 pending)
 is the committed datagram rung: `0 (baseline)` is the `MTU_DEFAULT` every
 cluster starts from, and a rung the leader's path-MTU discovery committed
@@ -635,6 +643,63 @@ untouched, and a writer still pointed at the tier re-registers it on its next
 report. To retire a tier for good, remove its `[backup]` section from every
 node first, then forget it.
 
+### `wire show`
+
+```
+uc2ctl wire show --instance-dir <DIR> --app-id <ID>
+```
+
+Prints the committed cluster wire level and what this node could run, read
+off the cnc page (wire-level spec §5.2). Read-only: it writes no admin
+request.
+
+```
+wire: level=12 binary=12..13 raise=auto
+  member id=2 role=voter wire_max=13
+  member id=3 role=learner wire_max=no report
+verdict: holdout id=3 (no report this term)
+```
+
+`level` is the committed level (cnc `wire_level`), `binary` this binary's
+supported range (cnc `wire_binary`), and `raise` the committed raise mode from
+the [cluster view](cluster-view.md) — `auto`, `manual`, or `unknown (no
+cluster view yet)` when the node runs no view and has no cluster artifact. The
+member table is **leader-authoritative**: only the live leader prints one
+`member` line per other member (its id, role, and the wire max it reported
+this term, or `no report`) and a `verdict:` — `raisable to N`, `at level
+(nothing above L)`, `holdout id=I (no report this term)` or `holdout id=I
+reported M`, computed by the same predicate the leader's auto raise and the
+`wire raise` door use, with this node's own max taken from its binary. Any
+other node, or a node that is not running, prints a one-line `members:` note
+pointing at the leader instead.
+
+### `wire raise`
+
+```
+uc2ctl wire raise --instance-dir <DIR> --app-id <ID> [--admin-key <FILE>]
+```
+
+Asks the leader to raise the committed wire level to the highest level every
+member reports (the minimum of the members' wire maxima) — admin op **12**, audited `wire_raise`. `id`/`ip`/`port` are
+zero. It works in either raise mode (in `auto` it only does sooner what the
+leader would do anyway) and appends a `Settings` record carrying the new
+level.
+
+Leader-only and single-in-flight like every `CLUSTER` command: a follower, or
+a leader with a previous `CLUSTER` command still above commit, answers `retry`
+— re-run it against the node the leader hint names. On success it prints
+
+```
+ok (cluster position P) — run `uc2ctl wire show` for the committed level
+```
+
+A cluster already at every member's level is also a success and appends
+nothing, which the reply cannot tell apart from a raise — hence the pointer at `wire
+show`. A member in the committed membership with no report this term, or
+reporting below the next level, is refused **63 `wire_holdout`**; `wire show`
+on the leader names it, and so does the audit record's `detail`
+(`level=<L> holdout=id:<n> reported <m>` or `holdout=id:<n> no report`).
+
 ### `cluster`
 
 Print the whole [cluster view](cluster-view.md): membership, settings, the
@@ -661,7 +726,7 @@ membership config_version=3
   id=1 addr=127.0.0.1:7001 role=voter
   id=2 addr=127.0.0.1:7002 role=voter
   id=3 addr=127.0.0.1:7003 role=voter
-settings position=0 admission_bytes=0 fsm_lag=default snapshot_interval_bytes=0 snapshot_target=all retain_sets=1 auto_fetch=true backup_retain_sets=0 backup_retain_age_secs=0 purge_requires_tiers=0 datagram_mtu=0 (baseline)
+settings position=0 admission_bytes=0 fsm_lag=default snapshot_interval_bytes=0 snapshot_target=all retain_sets=1 auto_fetch=true backup_retain_sets=0 backup_retain_age_secs=0 purge_requires_tiers=0 wire_level=12 wire_raise=auto datagram_mtu=0 (baseline)
 schedule entries=0 position=0
 upgrade row=kv running=unversioned pins=0
 service kv attached=true version=unversioned lag_bytes=0 pinned=false
@@ -738,6 +803,7 @@ Output fields:
 |---|---|
 | `config` | the adopted config version, whether a change is pending, and — since the schedule table (2.11.0) — `schedule_position=<n>`, the frame-end position of the committed schedule table, read from this node's newest **cluster artifact** (`snapshots/cluster/`) since the cluster FSM. `none` = no artifact yet, or an artifact holding no table; `?` = the artifact could not be read — a read error, not "no table", and it degrades to `?` rather than aborting so one unreadable file never takes the role/log/service lines down with it. It is the same number `uc2_schedule_table_position` exports and must be identical on every node once caught up |
 | `ceiling` | jumbo frames (`2.12.0`): the live command payload ceiling in bytes, from the cnc word at offset 3984, plus the datagram rung it came from and whether that rung is `baseline` (1408) or `discovered`. The rung is read from this node's newest **cluster artifact**; with the default snapshot cadence (`0`) there may be none yet, so a ceiling the baseline rung cannot produce prints as `rung >1408, discovered — inferred from the ceiling`, saying plainly that the rung was inferred rather than read. A trailing `— capped by this node's own max_payload, not by the rung` means the binding half is this host's buffer bound, not the cluster's rung. `uc2_commands_over_standard_total` is deliberately **not** here: it is an in-process counter, not a cnc word, and lives in `/metrics` alone |
+| `wire` | wire level (`2.15.0`): `level=<L> binary=<MIN>..<MAX>` — the committed cluster wire level (cnc `wire_level`, written by the cluster agent at apply) and this binary's supported range (cnc `wire_binary`). Printed after `ceiling`. The per-member reports and the raise verdict are [`wire show`](#wire-show)'s |
 | `node` | printed first: whether a node is behind this page right now. `running=` is a non-blocking probe of `instance.lock` — `true` if a process holds it, `false` if the file is free or absent (the OS drops the flock on any exit, `SIGKILL` included), `?` if the probe itself failed (the reason follows in parentheses). `heartbeat_age=` is the age of the node's own heartbeat (cnc 896), `never` if unstamped. A node that is not running gets a trailing `-- NOT RUNNING`; a failed probe gets `-- UNVERIFIED`; one that holds its lock but has not stamped for 3 s (the `/readyz` bar) gets `-- STALE` (as does one whose age cannot be computed because this host's clock reads before the epoch, printed `heartbeat_age=?`). In every one of those cases the role below is reported as none: `status` believes the page's role only when a held lock and a fresh heartbeat are both proven. The node stamps its heartbeat from the log clock (monotonic plus a sampled wall offset) and `status` compares it with the wall clock, exactly as `/readyz` does — so a wall-clock step can skew the age for a moment (a forward step ≥ 3 s can mark a live node `STALE` for up to a second); the lock probe is unaffected. Since #35; before it, a killed node's frozen page read as whatever role it last held |
 | `leader` | `NODE_FLAG_LEADER` is set **and** the `node` line says the node is live; always `false` for a node that is not running or is stale, whatever its page says |
 | `can_serve` | `NODE_FLAG_CAN_SERVE` is set, under the same liveness condition as `leader` |
@@ -1200,7 +1266,7 @@ cluster FSM's refusal of a `RowGenesis` record, 61 (the snapshot catalog) is
 | 44 | `settings_digest` — the staged settings file's digest is not the one the request signed: a different file was staged than was signed, or it changed in between. Re-run `settings apply` |
 | 45 | `settings_missing` — no staged settings file on this node. Either `settings apply` was run against a different instance directory, or a successful apply already consumed it |
 | 46 | `settings_decode` — the staged file is not a decodable settings record (wrong length, unknown encoding version, or an unknown `snapshot_target` byte) |
-| 47 | `settings_bounds` — a field is out of range; the node's refusal detail and the audit record name which field. Seven fields are checked: `datagram_mtu` other than `0` or a ladder rung; `admission_bytes`, `snapshot_interval_bytes` or `backup_retain_age_secs` equal to `u64::MAX` (the reserved sentinel); an `fsm_lag` byte bound **below 1376 B** — one max-size frame; since `0.11.0` (the snapshot catalog), `retain_sets` above `48` (`uc_protocol::v2::catalog::MAX_RETAIN_SETS`), or equal to `0` from an operator's own `settings apply`; and `purge_requires_tiers` above `4` (`MAX_BACKUP_TIERS`; backup tier 3b, `0` is off). A REPLAYED older (version 1 or 2) record carries no `retain_sets` and reads it as `1`; it is never refused here. A sub-frame lag pins the report ceiling (`min_applied + fsm_lag`) inside the next frame and stops commit cluster-wide **permanently**, since changing a replicated setting needs a command that commits; `"lockstep"` is how you ask for the tightest pacing. `fsm_lag = "0"` (derive) and `"lockstep"` are sentinels, not bounds, and are never refused here |
+| 47 | `settings_bounds` — a field is out of range; the node's refusal detail and the audit record name which field. Eight fields are checked: `datagram_mtu` other than `0` or a ladder rung; `admission_bytes`, `snapshot_interval_bytes` or `backup_retain_age_secs` equal to `u64::MAX` (the reserved sentinel); an `fsm_lag` byte bound **below 1376 B** — one max-size frame; since `0.11.0` (the snapshot catalog), `retain_sets` above `48` (`uc_protocol::v2::catalog::MAX_RETAIN_SETS`), or equal to `0` from an operator's own `settings apply`; `purge_requires_tiers` above `4` (`MAX_BACKUP_TIERS`; backup tier 3b, `0` is off); and `wire_raise` other than `0` (keep), `1` (auto) or `2` (manual) (`2.15.0`). A REPLAYED older (version 1 or 2) record carries no `retain_sets` and reads it as `1`; it is never refused here. A sub-frame lag pins the report ceiling (`min_applied + fsm_lag`) inside the next frame and stops commit cluster-wide **permanently**, since changing a replicated setting needs a command that commits; `"lockstep"` is how you ask for the tightest pacing. `fsm_lag = "0"` (derive) and `"lockstep"` are sentinels, not bounds, and are never refused here |
 | 48 | `snapshot_unsupported` — a declared row lacks the snapshot capability bit, so it would ignore the `SNAPSHOT` frame and the set at P could never complete. Since #67 every Rust SDK service sets this bit unconditionally (`ServiceBuilder::start()` requires `S: SnapshotStateMachine`), so this is now the backstop for a service attached without the current Rust SDK (a non-Rust attacher, or a binary built before #67). The audit record's `detail` field names the row; it is refused by name rather than left with a floor that never moves |
 | 49 | `snapshot_no_learner` — `uc2ctl snapshot --standby` with no learner in the committed membership. Only a learner freezes for a standby instant, so with none there nothing anywhere would build the set |
 | 50 | `snapshot_above_durable` — `uc2ctl snapshot fetch --position P` names a P above this node's own durable frontier. A voter must not adopt a floor above what it has made durable. Usually an operator typo, or a learner transiently ahead of this voter; legitimate again once this node's log catches up |
@@ -1216,6 +1282,7 @@ cluster FSM's refusal of a `RowGenesis` record, 61 (the snapshot catalog) is
 | 60 | `version_already_set` — a `RowGenesis` record (`CLUSTER` kind 6) for a row that already has a running version: genesis records a row's first version once and never changes one (#33). Never returned to `uc2ctl` — genesis is the leader's own append, with no admin request behind it — and listed here because it shares the band. A refused genesis changes nothing: like every refused `CLUSTER` record it advances the cluster FSM's `applied` and the row keeps the version it already had |
 | 61 | `pin_origin_not_agreed` — `--origin` is a complete set on this node but the snapshot catalog has not AGREED it (every reporting node's hash must match; reports take up to ~5 s after the instant). Wait for that set to agree (`uc2_catalog_agreed_position` reaches it), or take a new instant (`uc2ctl snapshot`) and pin that; a set that diverged never agrees. (54 accepts only this node's newest complete set, so an older agreed origin is not a way out.) On a cluster whose catalog is still empty (no complete set yet), the pin is allowed unchecked and the node logs `upgrade_pin_agreement_unchecked` |
 | 62 | `tier_unknown` — `uc2ctl tier forget --tier-id T` names a tier the committed cluster state does not hold: no backup writer has reported it, or it was already forgotten. Check the id against the tier's `TIER` label. Refused by the cluster FSM's own acceptance check (`BackupWatermark` `Forget`, `CLUSTER` kind 7), so nothing is appended |
+| 63 | `wire_holdout` — `uc2ctl wire raise` found nothing to raise: a member in the committed membership has not reported its wire max this term, or reports below the next level. Run [`wire show`](#wire-show) on the leader, which names the holdout; the audit record's `detail` names it too. Door-only, so nothing is appended. A cluster already at every member's level is NOT refused: `wire raise` answers ok and appends nothing |
 
 Code `0` is not a `ProposeError`. It is the CLI's own malformed-op sentinel.
 

@@ -5,8 +5,8 @@
 //! snapshot-capable service: an in-process 1-node cluster
 //! (`uc_node::Node::start_with`), a trivial snapshot-capable row 0 named
 //! `"sum"`, and a runner for the compiled `uc2ctl`
-//! (`env!("CARGO_BIN_EXE_uc2ctl")`). Used by `snapshot_bin.rs` and
-//! `cluster_view_bin.rs`; each passes its own `app_id`.
+//! (`env!("CARGO_BIN_EXE_uc2ctl")`). Used by `snapshot_bin.rs`,
+//! `cluster_view_bin.rs` and `wire_bin.rs`; each passes its own `app_id`.
 
 use std::net::{SocketAddr, UdpSocket};
 use std::path::{Path, PathBuf};

@@ -39,7 +39,10 @@ use serde::Deserialize;
 use uc_node::config_file::parse_duration_secs;
 use uc_node::services::{FsmLag, parse_fsm_lag};
 use uc_protocol::v2::cnc::ADMIN_OP_SETTINGS_APPLY;
-use uc_protocol::v2::settings::{FSM_LAG_LOCKSTEP, Settings, Target, encode_settings};
+use uc_protocol::v2::settings::{
+    FSM_LAG_LOCKSTEP, Settings, Target, WIRE_RAISE_AUTO, WIRE_RAISE_KEEP, WIRE_RAISE_MANUAL,
+    encode_settings,
+};
 
 use crate::CommonArgs;
 
@@ -57,6 +60,7 @@ struct SettingsFile {
     backup_retain_sets: Option<u16>,
     backup_retain_age: Option<String>,
     purge_requires_tiers: Option<u8>,
+    wire_raise: Option<String>,
 }
 
 /// TOML text -> a validated [`Settings`]. Every key is optional; an absent
@@ -95,6 +99,18 @@ pub fn parse_settings(toml_text: &str) -> Result<Settings, String> {
             Ok(FsmLag::Bounded(b)) => b,
             Err(e) => return Err(e),
         },
+    };
+    // Wire-level spec §2.2/§4.3: absent means KEEP (0) — the committed mode
+    // stands, so a 2.14.0-era file never flips it.
+    let wire_raise = match file.wire_raise.as_deref() {
+        None => WIRE_RAISE_KEEP,
+        Some("auto") => WIRE_RAISE_AUTO,
+        Some("manual") => WIRE_RAISE_MANUAL,
+        Some(other) => {
+            return Err(format!(
+                "wire_raise: unknown value {other:?} (want \"auto\" or \"manual\")"
+            ));
+        }
     };
     let snapshot_target = match file.snapshot_target.as_deref() {
         None => Target::All,
@@ -136,8 +152,13 @@ pub fn parse_settings(toml_text: &str) -> Result<Settings, String> {
         backup_retain_sets: file.backup_retain_sets.unwrap_or(0),
         backup_retain_age_secs,
         purge_requires_tiers: file.purge_requires_tiers.unwrap_or(0),
-        wire_level: 0, // Task 8 maps the file key; 0 = keep
-        wire_raise: 0,
+        // Wire-level spec §2.2: the committed level is LEADER-owned — raised by
+        // the leader (auto) or `uc2ctl wire raise`, never by an operator file,
+        // and `deny_unknown_fields` refuses a `wire_level` key outright.
+        // Staging `0` (keep) is what makes an ordinary `settings apply` a
+        // no-op for it: the cluster FSM keeps the committed level monotone.
+        wire_level: 0,
+        wire_raise,
     })
 }
 
@@ -236,10 +257,12 @@ fn render_fsm_lag(bytes: u64) -> String {
 /// order — `position`, `admission_bytes`, `fsm_lag`,
 /// `snapshot_interval_bytes`, `snapshot_target`, `retain_sets`,
 /// `auto_fetch`, `backup_retain_sets`, `backup_retain_age_secs`, `purge_requires_tiers`,
+/// `wire_level`, `wire_raise` (`auto`/`manual`/`keep`),
 /// `datagram_mtu` (with its `(baseline|discovered)` suffix last) — and that
 /// order is part of the output contract `docs/reference/uc2ctl.md` prints
 /// and scripts may split on. A new field goes BEFORE `datagram_mtu`'s
-/// parenthesised suffix (as `retain_sets`, `auto_fetch` and the backup keys did) or after it; existing keys
+/// parenthesised suffix (as `retain_sets`, `auto_fetch`, the backup keys and
+/// the wire keys did) or after it; existing keys
 /// are never reordered or renamed.
 pub(crate) fn render_settings_line(position: u64, settings: &Settings) -> String {
     let fsm_lag = render_fsm_lag(settings.fsm_lag_bytes);
@@ -250,6 +273,11 @@ pub(crate) fn render_settings_line(position: u64, settings: &Settings) -> String
     // Jumbo spec §5.5: `0` is not "unset", it is the BASELINE `MTU_DEFAULT`
     // every cluster starts from — printed by name so an operator reading the
     // line never has to know that.
+    let wire_raise = match settings.wire_raise {
+        WIRE_RAISE_AUTO => "auto",
+        WIRE_RAISE_MANUAL => "manual",
+        _ => "keep",
+    };
     let rung = if settings.datagram_mtu == 0 {
         "baseline"
     } else {
@@ -259,7 +287,7 @@ pub(crate) fn render_settings_line(position: u64, settings: &Settings) -> String
         "position={position} admission_bytes={} fsm_lag={fsm_lag} \
          snapshot_interval_bytes={} snapshot_target={target} retain_sets={} \
          auto_fetch={} backup_retain_sets={} backup_retain_age_secs={} purge_requires_tiers={} \
-         datagram_mtu={} ({rung})",
+         wire_level={} wire_raise={wire_raise} datagram_mtu={} ({rung})",
         settings.admission_bytes,
         settings.snapshot_interval_bytes,
         settings.retain_sets,
@@ -267,6 +295,7 @@ pub(crate) fn render_settings_line(position: u64, settings: &Settings) -> String
         settings.backup_retain_sets,
         settings.backup_retain_age_secs,
         settings.purge_requires_tiers,
+        settings.wire_level,
         settings.datagram_mtu,
     )
 }
@@ -289,6 +318,51 @@ pub fn show(common: &CommonArgs) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_file_without_wire_raise_keeps_the_mode() {
+        // Review Focus 2: a 2.14.0 file has no wire_raise → KEEP (0), and the
+        // level is never a file key → always 0 (keep).
+        let s = parse_settings("retain_sets = 2\n").unwrap();
+        assert_eq!((s.wire_level, s.wire_raise), (0, WIRE_RAISE_KEEP));
+        assert_eq!(
+            parse_settings("wire_raise = \"manual\"\n")
+                .unwrap()
+                .wire_raise,
+            WIRE_RAISE_MANUAL
+        );
+        assert_eq!(
+            parse_settings("wire_raise = \"auto\"\n")
+                .unwrap()
+                .wire_raise,
+            WIRE_RAISE_AUTO
+        );
+        assert!(
+            parse_settings("wire_raise = \"later\"\n")
+                .unwrap_err()
+                .contains("wire_raise")
+        );
+        assert!(
+            parse_settings("wire_level = 13\n").is_err(),
+            "leader-owned, refused as an unknown key"
+        );
+    }
+
+    #[test]
+    fn settings_show_prints_the_wire_fields_after_purge_requires_tiers() {
+        let mut s = Settings::genesis_default();
+        s.wire_level = 13;
+        s.wire_raise = WIRE_RAISE_MANUAL;
+        let line = render_settings_line(4096, &s);
+        assert!(
+            line.contains("purge_requires_tiers=0 wire_level=13 wire_raise=manual datagram_mtu="),
+            "{line}"
+        );
+        s.wire_raise = WIRE_RAISE_KEEP;
+        assert!(render_settings_line(4096, &s).contains(" wire_raise=keep "));
+        s.wire_raise = WIRE_RAISE_AUTO;
+        assert!(render_settings_line(4096, &s).contains(" wire_raise=auto "));
+    }
 
     #[test]
     fn parse_settings_accepts_the_five_keys_and_refuses_unknowns() {
@@ -462,14 +536,15 @@ mod tests {
         let line = render_settings_line(3, &s);
         assert!(
             line.contains(
-                "auto_fetch=true backup_retain_sets=6 backup_retain_age_secs=2592000 purge_requires_tiers=0 datagram_mtu="
+                "auto_fetch=true backup_retain_sets=6 backup_retain_age_secs=2592000 purge_requires_tiers=0 wire_level=0 wire_raise=keep datagram_mtu="
             ),
             "{line}"
         );
     }
 
     /// Backup-tier 3b: `purge_requires_tiers` is an operator key; absent
-    /// means `0`; `settings show` prints it right BEFORE `datagram_mtu`.
+    /// means `0`; `settings show` prints it before `datagram_mtu` (the wire
+    /// keys sit between them since 2.15.0).
     /// Bounds are the FSM door's business, not the CLI's.
     #[test]
     fn purge_requires_tiers_parses_and_shows() {
@@ -487,7 +562,7 @@ mod tests {
         );
         let line = render_settings_line(3, &s);
         assert!(
-            line.contains("backup_retain_age_secs=2592000 purge_requires_tiers=2 datagram_mtu="),
+            line.contains("backup_retain_age_secs=2592000 purge_requires_tiers=2 wire_level=0 wire_raise=keep datagram_mtu="),
             "{line}"
         );
     }

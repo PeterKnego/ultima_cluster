@@ -129,9 +129,9 @@ impl AuditOrigin {
 /// table), `7 = settings_apply` (cluster-FSM spec §6 — the replicated
 /// settings record), `8 = snapshot` and `9 = snapshot_fetch`
 /// (coordinated-snapshot spec §5.5/§5.7), `10 = upgrade_pin` and
-/// `11 = tier_forget` (backup-tier spec §6.3). None of 6–11 is a
-/// configuration change and none reaches `wire_to_config_op`. An op outside
-/// 1..=11 is recorded as `"unknown"` rather than dropped — a malformed request
+/// `11 = tier_forget` (backup-tier spec §6.3), and `12 = wire_raise`
+/// (wire-level spec §4.3). None of 6–12 is a configuration change and none
+/// reaches `wire_to_config_op`. An op outside 1..=12 is recorded as `"unknown"` rather than dropped — a malformed request
 /// is exactly the kind of thing an audit log exists to keep.
 ///
 /// For both STAGED-FILE ops the record's `id`/`addr` fields carry the staged
@@ -154,6 +154,15 @@ impl AuditOrigin {
 /// digits>`), `port` is `0`, and `config_version`
 /// is the `Forget` frame's END position (or the committed cluster position
 /// on a refusal or a retry).
+///
+/// For `wire_raise` (wire-level spec §4.3) `id`/`ip`/`port` are zero;
+/// `detail` carries `level=` (the committed wire level when the record is
+/// written) and, on refusal, the holdout (`holdout=id:<n> reported <m>` or
+/// `holdout=id:<n> no report`); `config_version` is the raising frame's END
+/// position, or the committed cluster position otherwise. The leader's AUTO
+/// raise writes its own record under the same op with `source = "auto"`,
+/// `actor = "node"`, `id` = the level proposed and `detail = "level=<n>
+/// origin=auto"`.
 ///
 /// For the DISCOVERY `settings_apply` (`source = "discovery"`, jumbo spec §9)
 /// there is no signed staged file and no operator: `id` carries the datagram

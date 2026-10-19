@@ -51,8 +51,8 @@ use uc_protocol::v2::backup::{
 };
 use uc_protocol::v2::cnc::{
     ADMIN_OP_SCHEDULE_APPLY, ADMIN_OP_SETTINGS_APPLY, ADMIN_OP_SNAPSHOT, ADMIN_OP_SNAPSHOT_FETCH,
-    ADMIN_OP_TIER_FORGET, ADMIN_OP_UPGRADE_PIN, CNC_MAX_PEER_SLOTS, CNC_MAX_SERVICES,
-    CNC_PEER_ROLE_LEARNER, CNC_PEER_ROLE_VOTER, CNC_SVC_STATUS_ATTACHED,
+    ADMIN_OP_TIER_FORGET, ADMIN_OP_UPGRADE_PIN, ADMIN_OP_WIRE_RAISE, CNC_MAX_PEER_SLOTS,
+    CNC_MAX_SERVICES, CNC_PEER_ROLE_LEARNER, CNC_PEER_ROLE_VOTER, CNC_SVC_STATUS_ATTACHED,
     CNC_SVC_STATUS_SNAPSHOT_CAPABLE, NODE_FLAG_CAN_SERVE, NODE_FLAG_LEADER, NODE_FLAG_LEARNER,
 };
 use uc_protocol::v2::config::{WireConfig, WireMember, decode_config, encode_config};
@@ -715,15 +715,16 @@ pub const REASON_PIN_ORIGIN_NOT_AGREED: u32 = 61;
 /// `uc2ctl tier forget`) naming no registered tier. The FSM's own
 /// (`ClusterRefusal::TierUnknown`), so the door and the apply loop agree.
 pub const REASON_TIER_UNKNOWN: u32 = 62;
-/// Wire-level spec §4.3: `uc2ctl wire raise` found nothing raisable — a
-/// member without a report this term, a member below the target, or the
-/// cluster already at every member's level. DOOR-ONLY; the holdout is named
-/// by `uc2ctl wire show` on the leader and in the audit detail.
+/// Wire-level spec §4.3: `uc2ctl wire raise` found a holdout — a member
+/// without a report this term, or a member below the target. A cluster
+/// already at every member's level is NOT refused (ruling 9: a no-op
+/// success). DOOR-ONLY; the holdout is named by `uc2ctl wire show` on the
+/// leader and in the audit detail.
 pub const REASON_WIRE_HOLDOUT: u32 = 63;
 /// Wire-level spec §4.3: `uc2ctl wire raise` is admin op 12, audited as
 /// `wire_raise`; the leader's auto raise writes its audit record under the
 /// same op with `source = "auto"`.
-const OP_WIRE_RAISE: u32 = 12;
+const OP_WIRE_RAISE: u32 = ADMIN_OP_WIRE_RAISE;
 
 /// Jumbo spec §7.1: the datagram rung a committed `Settings::datagram_mtu`
 /// word means, and whether it had to be clamped to get there.
@@ -2728,6 +2729,7 @@ impl Node {
             peer_band,
             peer_reported: HashMap::new(),
             peer_wire: HashMap::new(),
+            last_wire_holdout: None,
             peer_band_published: false,
             net_rx,
             obs_rx,
@@ -4075,6 +4077,11 @@ struct Consensus {
     /// `peer_reported` on a config adoption, and mirrored into the cnc peer
     /// band's `wire_max` word by `publish_peer_band`.
     peer_wire: HashMap<NodeId, u8>,
+    /// Wire-level spec §4.3: the holdout the newest [`Self::apply_wire_raise`]
+    /// refused on (`id:<n> reported <m>` / `id:<n> no report`), `None` on
+    /// any other outcome. The admin handler reads it right after the call
+    /// to name the holdout in the one audit record's `detail`.
+    last_wire_holdout: Option<String>,
     /// Latch: publish the static `id_and_role` cells once (first duty cycle).
     peer_band_published: bool,
     net_rx: mpsc::Receiver<NetEvent>,
@@ -9167,10 +9174,10 @@ impl Consensus {
     /// REASON_WIRE_HOLDOUT, view)` = a member has no report or is below the
     /// target, `(0, 0, view)` = already at level (a no-op success, nothing
     /// appended), `(0, 0, position)` = appended. Writes NO audit record: the
-    /// admin handler writes the one record for every manual outcome.
-    // used by Task 8's admin handler
-    #[allow(dead_code)]
+    /// admin handler writes the one record for every manual outcome, naming
+    /// a refusal's holdout from [`Self::last_wire_holdout`].
     pub(crate) fn apply_wire_raise(&mut self) -> (u32, u32, u64) {
+        self.last_wire_holdout = None;
         let view_position = self.cluster_view.position.load(Ordering::Acquire);
         if self.last_cluster_append > view_position {
             return (2, 0, view_position);
@@ -9201,6 +9208,7 @@ impl Consensus {
                     node = self.id as u64,
                     holdout = holdout.as_str()
                 );
+                self.last_wire_holdout = Some(holdout);
                 return (1, REASON_WIRE_HOLDOUT, view_position);
             }
         };
@@ -11723,6 +11731,36 @@ impl Consensus {
                 (2, 0, self.cluster_view.position.load(Ordering::Acquire))
             };
             let detail = format!("tier {tier_id:016x}");
+            let (status, reason) = self.audit_admin_detailed(
+                actor.as_deref(),
+                AuditOrigin::Local,
+                audited,
+                status,
+                reason,
+                version,
+                Some(detail.as_str()),
+            );
+            self.write_admin_reply(req.seq, status, reason, version);
+            return;
+        }
+        // Wire-level spec §4.3: `wire raise` (op 12). Same shape as op 11: a
+        // `CLUSTER` Settings command, never forwarded — a follower answers
+        // retry. The handler writes THE one audit record for every manual
+        // outcome (`apply_wire_raise` writes none): `detail` names the
+        // committed level and, on a refusal, the holdout.
+        if req.op == ADMIN_OP_WIRE_RAISE {
+            let leader = matches!(self.sm.role(), Role::Leader) && self.appender.is_some();
+            let (status, reason, version) = if leader {
+                self.apply_wire_raise()
+            } else {
+                self.last_wire_holdout = None;
+                (2, 0, self.cluster_view.position.load(Ordering::Acquire))
+            };
+            let level = self.cluster_view.wire_level.load(Ordering::Acquire);
+            let detail = match self.last_wire_holdout.take() {
+                Some(holdout) => format!("level={level} holdout={holdout}"),
+                None => format!("level={level}"),
+            };
             let (status, reason) = self.audit_admin_detailed(
                 actor.as_deref(),
                 AuditOrigin::Local,
@@ -16518,6 +16556,7 @@ mod tests {
             peer_band: Vec::new(),
             peer_reported: HashMap::new(),
             peer_wire: HashMap::new(),
+            last_wire_holdout: None,
             peer_band_published: false,
             net_rx,
             obs_rx,
@@ -21603,10 +21642,16 @@ mod tests {
         wire_raise_due(&mut h);
         h.cons.peer_wire.remove(&2);
         assert_eq!(h.cons.apply_wire_raise(), (1, REASON_WIRE_HOLDOUT, view));
+        // ... and leaves the holdout for the handler's audit detail.
+        assert_eq!(h.cons.last_wire_holdout.as_deref(), Some("id:2 no report"));
         // A due raise appends.
         wire_raise_due(&mut h);
         let (status, reason, position) = h.cons.apply_wire_raise();
         assert_eq!((status, reason), (0, 0));
+        assert_eq!(
+            h.cons.last_wire_holdout, None,
+            "cleared on any other outcome"
+        );
         assert_ne!(position, view);
         assert_eq!(position, h.cons.last_cluster_append);
         // Now in flight: retry.
