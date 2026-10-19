@@ -701,7 +701,8 @@ nothing, which the reply cannot tell apart from a raise — hence the pointer at
 show`. A member in the committed membership with no report this term, or
 reporting below the next level, is refused **63 `wire_holdout`**; `wire show`
 on the leader names it, and so does the audit record's `detail`
-(`level=<L> holdout=id:<n> reported <m>` or `holdout=id:<n> no report`).
+(`level=<L> holdout=id:<n> reported <m>` or `holdout=id:<n> no report`). An
+accepted raise's record reads `level=<L> target=<L+1>`.
 
 ### `cluster`
 

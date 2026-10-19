@@ -127,8 +127,9 @@ const _: () = assert!(std::mem::offset_of!(SnapshotSlots, node_snapshot_floor) =
 const _: () = assert!(std::mem::offset_of!(SnapshotSlots, incoming_snapshot_pos) == 128);
 
 /// The first line of a peer slot: `id_and_role` (boot-once) and, since cnc
-/// 3.5, `wire_max` (on change). Both consensus-written, both rarely, so
-/// sharing the line costs nothing.
+/// 3.5, `wire_max` (on change; cleared at the leader's collapse ack, when a
+/// new term opens and the table of this term's reports starts empty). Both
+/// consensus-written, both rarely, so sharing the line costs nothing.
 #[repr(C, align(64))]
 pub struct PeerHeadLine {
     /// `(peer_id as u64) << 8 | role_bits`. Slot offset +0.

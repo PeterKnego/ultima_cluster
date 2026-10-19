@@ -1701,10 +1701,9 @@ fn run_gen_admin_key(a: &GenAdminKeyArgs) -> anyhow::Result<()> {
 
 /// Wire-level spec §5.2: `status`'s wire line — the committed level (cnc
 /// `wire_level`) and this binary's range (cnc `wire_binary`, `(min << 8) |
-/// max`).
+/// max`; `pre-level page` when the word is 0).
 fn wire_line(level: u64, binary: u64) -> String {
-    let b = uc_protocol::WireRange::unpack(binary);
-    format!("wire: level={level} binary={}..{}", b.min, b.max)
+    format!("wire: level={level} binary={}", wire::binary_word(binary))
 }
 
 /// Jumbo spec §9: `status`'s ceiling line — the live command payload ceiling
@@ -2104,6 +2103,13 @@ mod tests {
             wire_line(12, (12 << 8) | 13),
             "wire: level=12 binary=12..13"
         );
+    }
+
+    /// Review M4: a `wire_binary` word of 0 is a page from before the level
+    /// (cnc 3.4) or before the node's boot wrote it, not a `0..0` binary.
+    #[test]
+    fn the_wire_line_names_a_pre_level_page() {
+        assert_eq!(wire_line(0, 0), "wire: level=0 binary=pre-level page");
     }
 
     /// Wire-level spec §4.3: 63 names the holdout refusal of `wire raise`.

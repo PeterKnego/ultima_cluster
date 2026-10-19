@@ -172,6 +172,7 @@ pub fn apply(common: &CommonArgs, file: &Path) -> anyhow::Result<()> {
     let settings = parse_settings(&text).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let mut bytes = Vec::new();
+    // 0.13.0: level gate goes here (encode at the committed level)
     encode_settings(&settings, &mut bytes);
 
     let pending_path = common.instance_dir.join(uc_node::SETTINGS_PENDING_FILE);

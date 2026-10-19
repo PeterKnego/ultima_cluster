@@ -940,9 +940,10 @@ impl ClusterAgent {
             // already see every row word as of p.
             self.cnc.store_cluster_applied(self.fsm.state().applied);
         }
-        // Wire-level ruling 5: Below is judged here, caught up, and only here.
-        // Before `note_consumed`, so a node stopping on it never reads as
-        // having joined.
+        // Wire-level ruling 5: Below is judged here, caught up, and only here,
+        // before `note_consumed`. It keys on the `joined` flag the attach gate
+        // sets, so on a node's FIRST join Below is judged one pass after the
+        // attach gate opens — not before it.
         self.check_caught_up_level(head);
         // Plan B3 T5: …but the WALK is published, every pass, through the
         // view's `consumed` word — one `fetch_max`, no mutex, nothing on the

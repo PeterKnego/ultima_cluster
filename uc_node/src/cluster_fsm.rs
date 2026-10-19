@@ -1069,6 +1069,7 @@ impl SnapshotStateMachine for ClusterFsm {
         let mut t = Vec::new();
         encode_schedule_table(&self.state.table, &mut t);
         let mut s = Vec::new();
+        // 0.13.0: level gate goes here (encode at the committed level)
         encode_settings(&self.state.settings, &mut s);
         let mut pins = Vec::new();
         encode_pin_list(&self.state.pins, &mut pins);

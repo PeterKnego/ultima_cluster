@@ -22,7 +22,7 @@
 //!                      output_progress, next_client_id)     7 × 64 B lines
 //! 1152  SnapshotSlots (service_snapshot_pos, node_snapshot_floor, incoming_snapshot_pos) 3 × 64 B lines
 //! 1344  archive_first_base                                  1 × 64 B line
-//! 1408  PeerSlots[8]   (per peer: id_and_role, reported_durable,
+//! 1408  PeerSlots[8]   (per peer: id_and_role, wire_max, reported_durable,
 //!                       advertised_limit, naks_served_plus_replay) 8 × 256 B
 //! 3456  config/admin/observability band: config_version, config_pending,
 //!       admin_req, admin_resp, admission_bytes, seal_failures,
@@ -335,8 +335,8 @@ const _: () = assert!(CNC_OFF_PAYLOAD_CEILING + 8 <= CNC_OFF_INGRESS_HOLES_SKIPP
 
 /// Wire-level spec §5.1: the committed cluster wire level. Fourth `u64` of
 /// the 3968 line. Writer: the `uc2-cluster` agent, when it applies a
-/// Settings record (and at install); readers: the sender (encode at the
-/// committed level), `uc2ctl status`/`wire show`, `/metrics`.
+/// Settings record (and at install); readers: `uc2ctl status`/`wire show`
+/// and `/metrics`. In-node consumers read the cluster view, not this word.
 pub const CNC_OFF_WIRE_LEVEL: usize = 3992;
 const _: () = assert!(CNC_OFF_WIRE_LEVEL == CNC_OFF_PAYLOAD_CEILING + 8);
 /// Wire-level spec §5.1: this node's binary range, `(WIRE_MIN << 8) |

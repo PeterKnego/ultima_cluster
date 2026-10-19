@@ -2746,6 +2746,7 @@ impl Node {
             peer_reported: HashMap::new(),
             peer_wire: HashMap::new(),
             last_wire_holdout: None,
+            last_wire_target: None,
             peer_band_published: false,
             net_rx,
             obs_rx,
@@ -4098,6 +4099,10 @@ struct Consensus {
     /// any other outcome. The admin handler reads it right after the call
     /// to name the holdout in the one audit record's `detail`.
     last_wire_holdout: Option<String>,
+    /// Review M2: the level the newest [`Self::apply_wire_raise`] APPENDED a
+    /// raise to, for the admin handler's audit detail (`target=`); `None`
+    /// on every other outcome.
+    last_wire_target: Option<u8>,
     /// Latch: publish the static `id_and_role` cells once (first duty cycle).
     peer_band_published: bool,
     net_rx: mpsc::Receiver<NetEvent>,
@@ -9197,6 +9202,7 @@ impl Consensus {
     /// a refusal's holdout from [`Self::last_wire_holdout`].
     pub(crate) fn apply_wire_raise(&mut self) -> (u32, u32, u64) {
         self.last_wire_holdout = None;
+        self.last_wire_target = None;
         let view_position = self.cluster_view.position.load(Ordering::Acquire);
         if self.last_cluster_append > view_position {
             return (2, 0, view_position);
@@ -9238,6 +9244,7 @@ impl Consensus {
         match self.append_wire_level(target) {
             Some(position) => {
                 self.announce_wire_level(target, position, "manual");
+                self.last_wire_target = Some(target);
                 (0, 0, position)
             }
             None => (2, 0, view_position),
@@ -11804,19 +11811,24 @@ impl Consensus {
         // `CLUSTER` Settings command, never forwarded — a follower answers
         // retry. The handler writes THE one audit record for every manual
         // outcome (`apply_wire_raise` writes none): `detail` names the
-        // committed level and, on a refusal, the holdout.
+        // committed level and, on a refusal, the holdout; on an accepted
+        // raise, the target.
         if req.op == ADMIN_OP_WIRE_RAISE {
             let leader = matches!(self.sm.role(), Role::Leader) && self.appender.is_some();
             let (status, reason, version) = if leader {
                 self.apply_wire_raise()
             } else {
                 self.last_wire_holdout = None;
+                self.last_wire_target = None;
                 (2, 0, self.cluster_view.position.load(Ordering::Acquire))
             };
+            // `level` is the committed level at the time; an accepted raise
+            // also names the level it appended (review M2).
             let level = self.cluster_view.wire_level.load(Ordering::Acquire);
-            let detail = match self.last_wire_holdout.take() {
-                Some(holdout) => format!("level={level} holdout={holdout}"),
-                None => format!("level={level}"),
+            let detail = match (self.last_wire_holdout.take(), self.last_wire_target.take()) {
+                (Some(holdout), _) => format!("level={level} holdout={holdout}"),
+                (None, Some(target)) => format!("level={level} target={target}"),
+                (None, None) => format!("level={level}"),
             };
             let (status, reason) = self.audit_admin_detailed(
                 actor.as_deref(),
@@ -12145,6 +12157,18 @@ impl Consensus {
         let Some(settings) = decode_settings(&bytes) else {
             return self.refuse_settings(REASON_SETTINGS_DECODE);
         };
+        // Review M1: a 2.15.0 `uc2ctl` always writes a v7 record. An older
+        // one would decode as level 12 with auto raise (the pre-level
+        // reading) and re-assert auto over an operator's manual mode.
+        let version = u32::from_le_bytes(bytes[0..4].try_into().expect("decoded: >= 4 bytes"));
+        if version < 7 {
+            return self.refuse_settings(REASON_SETTINGS_DECODE);
+        }
+        // Review M1: `wire_level` is leader-owned (the raise path), never a
+        // file key — `uc2ctl` writes 0. Refused as 47 (`wire_level`).
+        if settings.wire_level != 0 {
+            return self.refuse_settings(REASON_SETTINGS_BOUNDS);
+        }
         let cmd = ClusterCommand::Settings(settings);
         if let Err(reason) = self.validate_cluster_command(&cmd) {
             return self.refuse_settings(reason);
@@ -16612,6 +16636,7 @@ mod tests {
             peer_reported: HashMap::new(),
             peer_wire: HashMap::new(),
             last_wire_holdout: None,
+            last_wire_target: None,
             peer_band_published: false,
             net_rx,
             obs_rx,
@@ -21249,10 +21274,62 @@ mod tests {
 
     /// Stage `settings` as `<instance_dir>/settings.pending` — what `uc2ctl
     /// settings apply` writes before it signs the digest.
+    /// Stage `settings` as `uc2ctl settings apply` would: `wire_level` is
+    /// leader-owned and never a file key, so the tool always writes 0 —
+    /// review M1's door refuses anything else.
     fn stage_settings_for_test(h: &Harness, settings: &Settings) {
+        let mut settings = *settings;
+        settings.wire_level = 0;
+        stage_settings_raw_for_test(h, &settings);
+    }
+
+    /// [`stage_settings_for_test`] without the `wire_level` clear.
+    fn stage_settings_raw_for_test(h: &Harness, settings: &Settings) {
         let mut bytes = Vec::new();
         encode_settings(settings, &mut bytes);
         std::fs::write(&h.cons.settings_pending, &bytes).expect("stage the settings");
+    }
+
+    /// Review M1: the settings door refuses a staged record that names a
+    /// wire level — the level is leader-owned (the raise), never a file key.
+    #[test]
+    fn the_settings_door_refuses_a_staged_wire_level_47() {
+        let mut h = harness();
+        drive_to_serving_leader(&mut h);
+        stage_settings_raw_for_test(
+            &h,
+            &Settings {
+                wire_level: 13,
+                ..Settings::genesis_default()
+            },
+        );
+        let before = h.cons.last_cluster_append;
+        let (status, reason, _) = h.cons.apply_settings_staged();
+        assert_eq!((status, reason), (1, REASON_SETTINGS_BOUNDS));
+        assert_eq!(h.cons.last_cluster_append, before, "nothing appended");
+    }
+
+    /// Review M1: a 2.15.0 `uc2ctl` always writes a v7 record; an older
+    /// version staged at the door is a decode refusal (46), not a record
+    /// that silently decodes as level 12 with auto raise.
+    #[test]
+    fn the_settings_door_refuses_a_staged_record_below_v7_46() {
+        let mut h = harness();
+        drive_to_serving_leader(&mut h);
+        let mut bytes = Vec::new();
+        encode_settings(&Settings::genesis_default(), &mut bytes);
+        // Rewrite as a v6 record: the v7 layout less its two wire bytes.
+        bytes.truncate(bytes.len() - 2);
+        bytes[0..4].copy_from_slice(&6u32.to_le_bytes());
+        assert!(
+            uc_protocol::v2::settings::decode_settings(&bytes).is_some(),
+            "precondition: a well-formed v6 record"
+        );
+        std::fs::write(&h.cons.settings_pending, &bytes).unwrap();
+        let before = h.cons.last_cluster_append;
+        let (status, reason, _) = h.cons.apply_settings_staged();
+        assert_eq!((status, reason), (1, REASON_SETTINGS_DECODE));
+        assert_eq!(h.cons.last_cluster_append, before, "nothing appended");
     }
 
     /// Spec §4.3/§4.5: a `Settings` command travels as a `CLUSTER` frame, and
@@ -21872,6 +21949,25 @@ mod tests {
 
     /// A follower answers retry through the same door, and its record names
     /// the level with no holdout.
+    /// Review M2: an accepted manual raise names the level it raises TO, as
+    /// well as the committed level it raised from.
+    #[test]
+    fn the_wire_raise_door_audits_the_target_on_accept() {
+        let mut h = harness();
+        drive_to_serving_leader(&mut h);
+        walk_at_commit(&mut h);
+        let level = h.cons.cluster_view.wire_level.load(Ordering::Acquire);
+        let target = wire_raise_due(&mut h);
+        h.cons.handle_admin(wire_raise_req(1));
+        let resp = h.cons.cnc.read_admin_resp(1).expect("a reply");
+        assert_eq!((resp.status, resp.reason), (0, 0));
+        let rec = the_wire_raise_record(&h);
+        assert!(
+            rec.contains(&format!("\"detail\":\"level={level} target={target}\"")),
+            "{rec}"
+        );
+    }
+
     #[test]
     fn the_wire_raise_door_answers_retry_on_a_follower() {
         let mut h = harness();

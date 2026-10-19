@@ -33,7 +33,7 @@ use uc_lincheck::history::History;
 mod common;
 use common::*;
 
-/// The previous release's range: what every `2.14.0` binary speaks.
+/// The previous release's range: the synthetic old side of this tree.
 const OLD: &str = "12,12";
 /// This release's range: speaks 12, accepts a raise to 13.
 const NEW: &str = "12,13";

@@ -83,20 +83,31 @@ fn verdict_line(level: u8, verdict: Result<u8, WireHoldout>) -> String {
     }
 }
 
+/// The cnc `wire_binary` word as `status` and `wire show` print it:
+/// `min..max`, or `pre-level page` for a zero word — a cnc 3.4 page, or a
+/// page the node has not yet written at boot (review M4).
+pub fn binary_word(word: u64) -> String {
+    if word == 0 {
+        return "pre-level page".to_string();
+    }
+    let b = WireRange::unpack(word);
+    format!("{}..{}", b.min, b.max)
+}
+
 /// `uc2ctl wire show`: the committed level, this binary's range, the raise
 /// mode, and (on the leader) the per-member table and the raise verdict.
 pub fn show(common: &CommonArgs) -> anyhow::Result<()> {
     let cnc = crate::open(common)?;
     let level = cnc.wire_level() as u8;
-    let binary = WireRange::unpack(cnc.wire_binary());
+    let word = cnc.wire_binary();
+    let binary = WireRange::unpack(word);
     let mode = crate::view::show_doc(common)
         .ok()
         .flatten()
         .map(|d| d.cluster.settings.wire_raise);
     println!(
-        "wire: level={level} binary={}..{} raise={}",
-        binary.min,
-        binary.max,
+        "wire: level={level} binary={} raise={}",
+        binary_word(word),
         mode_word(mode)
     );
     // #35: a dead node's page still says whatever it last wrote, so the

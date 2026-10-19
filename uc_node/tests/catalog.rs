@@ -841,6 +841,7 @@ fn admin_staged(
 fn apply_retain_sets(c: &Cluster, leader: usize, n: u16) -> u64 {
     let mut s = c.node(leader).cluster_view().to_state().settings;
     s.retain_sets = n;
+    s.wire_level = 0; // leader-owned: `uc2ctl` never writes it
     let mut bytes = Vec::new();
     uc_protocol::v2::settings::encode_settings(&s, &mut bytes);
     let (status, reason, pos) = admin_staged(

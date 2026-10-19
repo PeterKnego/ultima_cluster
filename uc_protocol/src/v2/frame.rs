@@ -28,8 +28,8 @@ pub const FRAME_TYPE_MESSAGE: u8 = 1;
 /// header is actually written — the rest of the padded region is stale bytes.
 /// Readers and the archive skip it by `length`; replay drops it.
 pub const FRAME_TYPE_PADDING: u8 = 2;
-/// New-term no-op (spec §6, Raft §5.4.2): a zero-payload frame the new
-/// leader appends immediately on opening a term and must see COMMIT before
+/// New-term no-op (spec §6, Raft §5.4.2): a frame that carries only the
+/// reserved zero body (below), which the new leader appends immediately on opening a term and must see COMMIT before
 /// serving. Replicated/archived/replayed like any message frame; the apply
 /// layer (M5) applies only MESSAGE frames and TIMER frames addressed to the
 /// row.

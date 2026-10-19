@@ -2169,7 +2169,8 @@ impl FollowerReceiver {
                 "uc_net: status_refused: STATUS from {from} has a {len}-byte body this node cannot \
                  read (wire 0.11.0 expects {STATUS_BODY_LEN}) -- almost certainly a wire 0.10.0 \
                  follower; its flow-control window never opens and replication to it stalls. \
-                 Upgrade every node together (the node<->node wire is a flag day)"
+                 Upgrade every node together (a node must be within one wire level of the \
+                 cluster — see docs/how-to/upgrade-a-cluster.md § Rolling)"
             );
         }
     }
@@ -2665,8 +2666,9 @@ impl FollowerReceiver {
                         eprintln!(
                             "uc_net: SNAP_BEGIN from {from} could not be decoded ({} body \
                              bytes) -- almost certainly a wire <= 0.6.0 peer; this node cannot \
-                             install its snapshot set. Upgrade every node together (the \
-                             node<->node wire is a flag day)",
+                             install its snapshot set. Upgrade every node together (a node \
+                             must be within one wire level of the cluster — see \
+                             docs/how-to/upgrade-a-cluster.md § Rolling)",
                             d.len().saturating_sub(DATAGRAM_HEADER_LEN)
                         );
                     }

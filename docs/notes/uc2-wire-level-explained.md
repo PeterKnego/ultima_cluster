@@ -194,7 +194,8 @@ no step at all.
   level answers success and appends nothing, so a script that always runs it
   is harmless. It refuses `63 wire_holdout` only for a member with no report
   this term or one below the target, and writes one `wire_raise` audit
-  record with `level=` and, on refusal, `holdout=`.
+  record with `level=` and, on refusal, `holdout=` (on an accepted raise,
+  `target=`).
   ([reference](../reference/uc2ctl.md#wire-raise))
 - **`wire_raise = "auto" | "manual"`** is a key in the flat settings file
   for `uc2ctl settings apply`; absent means keep the committed mode. Put it

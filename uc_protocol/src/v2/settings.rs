@@ -308,7 +308,7 @@ mod tests {
         // admission_bytes u64 @12, snapshot_interval_bytes u64 @20, target
         // u8 @28, datagram_mtu u32 @29, retain_sets u16 @33, auto_fetch u8 @35,
         // backup_retain_sets u16 @36, backup_retain_age_secs u64 @38,
-        // purge_requires_tiers u8 @46.
+        // purge_requires_tiers u8 @46, wire_level u8 @47, wire_raise u8 @48.
         assert_eq!(SETTINGS_VERSION, 7);
         assert_eq!(SETTINGS_LEN, 49);
         assert_eq!(SETTINGS_LEN_V6, 47);

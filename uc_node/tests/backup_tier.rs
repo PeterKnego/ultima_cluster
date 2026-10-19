@@ -2413,6 +2413,7 @@ mod writer_e2e {
         use std::os::unix::fs::OpenOptionsExt as _;
         let mut s = c.node(leader).cluster_view().to_state().settings;
         edit(&mut s);
+        s.wire_level = 0; // leader-owned: `uc2ctl` never writes it
         let mut bytes = Vec::new();
         uc_protocol::v2::settings::encode_settings(&s, &mut bytes);
         let (id, ip, port) = uc_node::staged_digest(&bytes);
