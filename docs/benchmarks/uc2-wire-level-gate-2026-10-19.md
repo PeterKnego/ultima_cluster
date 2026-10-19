@@ -1,0 +1,46 @@
+# uc2 wire-level rolling-upgrade gate — 2026-10-19
+
+**Status: NOT RUN.** This document is a PRE-COMMITMENT, not a record. The
+driver is `bench-infra/scripts/wire_roll_gate.py`; the maintainer runs it on
+the fleet. Spec: `docs/superpowers/specs/2026-10-19-uc2-wire-level-design.md`
+§6.4. Functional clauses only: there is **no rate bar**.
+
+The honest-failure protocol, carried forward from
+M7/M9/M10/M11/M12/M13/M14/M14c2 and every gate skeleton since: nothing in the
+bar table may be edited to match a result. A run that misses a bar is recorded
+as a **FAIL** and the bar is **kept, unmoved**.
+
+## Command
+
+```
+python3 bench-infra/scripts/wire_roll_gate.py --selftest   # verdict arithmetic, no ssh
+python3 bench-infra/scripts/wire_roll_gate.py --run [--hosts pub/priv,...] [--tree <checkout>]
+```
+
+Exit 0 = PASS, 1 = FAIL.
+
+## Procedure
+
+Three real `uc2-node` daemons, built with `--features wire-level-override`,
+start with `UC2_WIRE_RANGE=12,12` (the old side). A fourth host drives load
+(`client-remote` through each node's edge, `count` FSM) for the whole roll.
+Each node in turn is killed and restarted with `UC2_WIRE_RANGE=12,13`; the
+driver waits for its `uc2_agent_alive{agent="cluster"}` to read 1 and samples
+`uc2_commit_position` on a surviving node, recording the longest interval
+without movement as that restart's gap. Then every node's `uc2_wire_level`
+must read 13 within 60 s. Finally the load stops and `m12_gate check-fsms
+--mode linearizable` is the linearizability verdict.
+
+For `2.15.0` the old side is **the same tree** with `UC2_WIRE_RANGE=12,12`.
+From `2.16.0` the old side is the **previous release**; parameterize the
+levels then.
+
+## Clauses and pre-committed bars
+
+| clause | bar | result |
+|---|---|---|
+| level | `uc2_wire_level == 13` on every node within 60 s of the last restart | NOT RUN |
+| gaps | longest commit stall per node restart `<= 5.0 s` (`ROW_COMMIT_GAP_BAR_SECS`) | NOT RUN |
+| linearizable | the load's history passes `check-fsms --mode linearizable` | NOT RUN |
+
+Row verdict: PASS only if all three clauses hold.
