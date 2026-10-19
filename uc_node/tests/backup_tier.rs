@@ -2413,6 +2413,7 @@ mod writer_e2e {
         use std::os::unix::fs::OpenOptionsExt as _;
         let mut s = c.node(leader).cluster_view().to_state().settings;
         edit(&mut s);
+        let want = s;
         s.wire_level = 0; // leader-owned: `uc2ctl` never writes it
         let mut bytes = Vec::new();
         uc_protocol::v2::settings::encode_settings(&s, &mut bytes);
@@ -2439,7 +2440,7 @@ mod writer_e2e {
         await_until(30, "the new settings committed on every node", || {
             c.running()
                 .into_iter()
-                .all(|i| c.node(i).cluster_view().to_state().settings == s)
+                .all(|i| c.node(i).cluster_view().to_state().settings == want)
         });
     }
 
