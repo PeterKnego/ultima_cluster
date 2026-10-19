@@ -27,6 +27,7 @@ use std::time::Instant;
 use uc_crypto::{CryptoError, NodeId, ReceiveHalf};
 use uc_log::buffer::LogBuffer;
 use uc_log::writer::PositionedWriter;
+use uc_protocol::WireRange;
 use uc_protocol::v2::backup::read_backup_report_body;
 use uc_protocol::v2::crypto::{
     CRYPTO_OVERHEAD, DGRAM_KIND_HS_INIT, DGRAM_KIND_HS_KEY, DGRAM_KIND_HS_RESP,
@@ -187,6 +188,10 @@ pub enum NetEvent {
         term: u32,
         durable: u64,
         durable_term: u32,
+        /// Wire-level spec §3.1 (erratum 2): the sender's header byte 13, its
+        /// `WIRE_MAX`. Already admitted by the receiver's range check, so
+        /// never `0`; the consensus agent keeps the per-member table from it.
+        wire: u8,
     },
     CommitGossip {
         from: SocketAddr,
@@ -334,6 +339,7 @@ fn consensus_event(h: &DatagramHeader, d: &[u8], from: SocketAddr) -> Option<Net
                 durable: h.position,
                 // Absent body (pre-0.5.0 peer) decodes as unattested.
                 durable_term: read_append_position_body(body).map_or(0, |b| b.durable_term),
+                wire: h.wire,
             })
         }
         DGRAM_KIND_COMMIT_POSITION => Some(NetEvent::CommitGossip {
@@ -453,6 +459,13 @@ pub struct FollowerConfig {
     /// the node's writers keep it current off the consensus pass. `None`
     /// sends `Holdings::default()` — harnesses that do not advertise.
     pub holdings: Option<Arc<Mutex<Holdings>>>,
+    /// Wire-level spec §3.1–§3.2: the range this node speaks. Every datagram
+    /// this receiver sends stamps `wire.max` into header byte 13, and an
+    /// inbound byte outside `wire.accepts_peer` is refused before anything
+    /// else in the datagram is read. A field rather than the bare constants
+    /// so a test (or the two-binary crashtest) can give one tree another
+    /// range.
+    pub wire: WireRange,
 }
 
 impl FollowerConfig {
@@ -468,6 +481,7 @@ impl FollowerConfig {
             status_bytes: 0,
             append_pos_floor_ns: 100_000_000,
             holdings: None,
+            wire: WireRange::BINARY,
         }
     }
 }
@@ -787,12 +801,22 @@ pub struct FollowerStats {
     pub snap_begin_undecodable: AtomicU64,
     /// Catalog ruling R30: inbound `STATUS` datagrams (leader role) whose
     /// body `read_status_body` refused — in practice a `0.10.0` follower's
-    /// 16-byte body, which a `0.11.0` leader cannot read. There is no
-    /// wire-version word on node↔node datagrams, so this counter (and the
-    /// rate-limited `status_refused` stderr line beside it) is the only
-    /// witness: the follower's flow-control window never opens and
-    /// replication to it stalls. Counted per datagram, not per peer.
+    /// 16-byte body, which a `0.11.0` leader cannot read. Before `0.12.0`
+    /// there was no wire-version word on node↔node datagrams, so this counter
+    /// (and the rate-limited `status_refused` stderr line beside it) was the
+    /// only witness (since `0.12.0` a pre-level peer is refused earlier, by
+    /// header byte 13 — [`Self::wire_refused_prelevel`]): the follower's
+    /// flow-control window never opens and replication to it stalls. Counted
+    /// per datagram, not per peer.
     pub statuses_refused: AtomicU64,
+    /// Wire-level spec §3.2: inbound datagrams whose header byte @13 is `0`
+    /// (a pre-level peer — a `0.11.0` node on the first flag day's old side).
+    /// Refused whole, before anything else is read; counted per datagram.
+    pub wire_refused_prelevel: AtomicU64,
+    /// Wire-level spec §3.2: inbound datagrams whose header byte @13 is
+    /// non-zero and outside `[WIRE_MIN, WIRE_MAX + 1]` — a peer more than one
+    /// level above this binary, or below its `WIRE_MIN`. Refused the same way.
+    pub wire_refused_out_of_range: AtomicU64,
     /// Coordinated-snapshot spec §5.7 item 5: a node-requested fetch dropped
     /// because a snapshot transfer was already in flight here. Not an error —
     /// the operator's verb is re-runnable — but it is why an accepted
@@ -1330,6 +1354,9 @@ pub struct FollowerReceiver {
     /// Catalog ruling R30: per-source last `status_refused` line, for the
     /// throttle in `note_status_refused`.
     status_refused_log: HashMap<SocketAddr, u64>,
+    /// Per-source throttle for `note_wire_refused`'s line (same interval and
+    /// bound as `status_refused_log`).
+    wire_refused_log: HashMap<SocketAddr, u64>,
     /// Jumbo spec §5.1: the discovery ledger (acks land here; probes are
     /// answered with `own_min_rung` from here). `None` = harness receiver.
     probe: Option<Arc<ProbeTable>>,
@@ -1576,6 +1603,7 @@ impl FollowerReceiver {
             hs_route,
             cleartext_peer_log: HashMap::new(),
             status_refused_log: HashMap::new(),
+            wire_refused_log: HashMap::new(),
             probe: None,
             last_wire_len: 0,
         }
@@ -1967,6 +1995,16 @@ impl FollowerReceiver {
         let Some(h) = read_datagram_header(&buf[..n]) else {
             return Some(n);
         };
+        // Wire-level spec §3.2: the header byte is decided before anything
+        // else — before the handshake route below, which is the only place a
+        // pre-level HS_INIT/HS_RESP is ever seen (those never reach
+        // `on_datagram`). These are CLEARTEXT bytes (the open has not run), so
+        // this check can only cause a drop: a forged byte that passes the
+        // range check still has to survive the AEAD open, where the header is
+        // AAD. `on_datagram` repeats the check on the authenticated header.
+        if !self.wire_admit(&h, from) {
+            return None;
+        }
 
         // T11's temporary cleartext-SNAP allowance USED TO SIT HERE and was
         // DELETED by T17 (2026-07-29), which is what makes this comment worth
@@ -2087,8 +2125,9 @@ impl FollowerReceiver {
     }
 
     /// Catalog ruling R30: a `STATUS` body this leader cannot read — in
-    /// practice a `0.10.0` follower's 16-byte body. Dropped (there is no
-    /// wire-version word on node↔node datagrams to refuse it by), counted in
+    /// practice a `0.10.0` follower's 16-byte body. Dropped (before `0.12.0`
+    /// there was no wire-version word to refuse it by; since then a pre-level
+    /// peer is refused earlier, in `wire_admit`), counted in
     /// [`FollowerStats::statuses_refused`] on every occurrence, and named on
     /// stderr at most once per [`STATUS_REFUSED_LOG_INTERVAL_NS`] per source
     /// — the same per-peer throttle `note_cleartext_peer` uses.
@@ -2112,6 +2151,57 @@ impl FollowerReceiver {
                  read (wire 0.11.0 expects {STATUS_BODY_LEN}) -- almost certainly a wire 0.10.0 \
                  follower; its flow-control window never opens and replication to it stalls. \
                  Upgrade every node together (the node<->node wire is a flag day)"
+            );
+        }
+    }
+
+    /// Wire-level spec §3.2: the first thing decided about a datagram. True =
+    /// carry on. False = refused and counted; the throttled line names the
+    /// peer and the byte, once per [`STATUS_REFUSED_LOG_INTERVAL_NS`] per peer.
+    #[inline]
+    fn wire_admit(&mut self, h: &DatagramHeader, from: SocketAddr) -> bool {
+        if self.cfg.wire.accepts_peer(h.wire) {
+            return true;
+        }
+        self.note_wire_refused(from, h.wire);
+        false
+    }
+
+    /// Counts a refused header byte — `0` as
+    /// [`FollowerStats::wire_refused_prelevel`], anything else as
+    /// [`FollowerStats::wire_refused_out_of_range`] — on every occurrence, and
+    /// names it on stderr with the same per-source throttle
+    /// `note_status_refused` uses.
+    #[cold]
+    fn note_wire_refused(&mut self, from: SocketAddr, byte: u8) {
+        if byte == 0 {
+            self.stats
+                .wire_refused_prelevel
+                .fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.stats
+                .wire_refused_out_of_range
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        let now = self.now_ns();
+        let due = self
+            .wire_refused_log
+            .get(&from)
+            .is_none_or(|&last| now.saturating_sub(last) >= STATUS_REFUSED_LOG_INTERVAL_NS);
+        if due {
+            // Bounded: a cleartext cluster admits any source address, so the
+            // map is reset rather than allowed to grow without limit.
+            if self.wire_refused_log.len() >= STATUS_REFUSED_LOG_MAX_PEERS {
+                self.wire_refused_log.clear();
+            }
+            self.wire_refused_log.insert(from, now);
+            let r = self.cfg.wire;
+            eprintln!(
+                "uc_net: wire_refused: datagram from {from} carries wire level {byte} (0 = a \
+                 pre-level peer); this node accepts {}..={} -- every node must be within one \
+                 wire level of the cluster",
+                r.min,
+                r.max + 1
             );
         }
     }
@@ -2221,7 +2311,7 @@ impl FollowerReceiver {
                     position: 0,
                     leadership_term_id: self.term.load(Ordering::Relaxed),
                     kind: DGRAM_KIND_PROBE_ACK,
-                    flags: 0,
+                    wire: self.cfg.wire.max,
                     key_epoch: 0,
                 },
             );
@@ -2251,6 +2341,14 @@ impl FollowerReceiver {
             self.stats.dropped_malformed.fetch_add(1, Relaxed);
             return;
         };
+        // Wire-level spec §3.2: decided before anything else in the datagram
+        // is read — before probes, consensus kinds and the term filter. With
+        // crypto on, `d` has been opened and the header was AAD, so this runs
+        // on authenticated bytes (and `crypto_admit` already ran the same
+        // check on the cleartext header; repeating it is one compare).
+        if !self.wire_admit(&h, from) {
+            return;
+        }
         // Jumbo spec §4.2: probes are term-independent (a path is a path
         // whoever leads) and never touch the data plane, so they are handled
         // before the term filter below.
@@ -3285,7 +3383,7 @@ impl FollowerReceiver {
                 position: 0,
                 leadership_term_id: self.term.load(Ordering::Relaxed),
                 kind: DGRAM_KIND_SNAP_DONE,
-                flags: 0,
+                wire: self.cfg.wire.max,
                 key_epoch: 0,
             },
         );
@@ -3349,7 +3447,7 @@ impl FollowerReceiver {
                 position: 0,
                 leadership_term_id: self.term.load(Ordering::Relaxed),
                 kind: DGRAM_KIND_SNAP_REQUEST,
-                flags: 0,
+                wire: self.cfg.wire.max,
                 key_epoch: 0,
             },
         );
@@ -3415,7 +3513,7 @@ impl FollowerReceiver {
                 position: 0,
                 leadership_term_id: term,
                 kind: DGRAM_KIND_SNAP_NAK,
-                flags: 0,
+                wire: self.cfg.wire.max,
                 key_epoch: 0,
             },
         );
@@ -3604,7 +3702,7 @@ impl FollowerReceiver {
                     position: 0,
                     leadership_term_id: term,
                     kind: DGRAM_KIND_NAK,
-                    flags: 0,
+                    wire: self.cfg.wire.max,
                     key_epoch: 0,
                 },
             );
@@ -3651,7 +3749,7 @@ impl FollowerReceiver {
                     position: durable,
                     leadership_term_id: term,
                     kind: DGRAM_KIND_APPEND_POSITION,
-                    flags: 0,
+                    wire: self.cfg.wire.max,
                     key_epoch: 0,
                 },
             );
@@ -3705,7 +3803,7 @@ impl FollowerReceiver {
                     position: 0,
                     leadership_term_id: term,
                     kind: DGRAM_KIND_STATUS,
-                    flags: 0,
+                    wire: self.cfg.wire.max,
                     key_epoch: 0,
                 },
             );
@@ -3764,6 +3862,7 @@ mod tests {
         read_status_body, write_datagram_header, write_nak_body, write_snap_redirect_body,
         write_status_body,
     };
+    use uc_protocol::{WIRE_MAX, WIRE_MIN};
 
     const TERM: u32 = 9;
 
@@ -3805,6 +3904,19 @@ mod tests {
             self.sock.local_addr().unwrap()
         }
         fn send(&mut self, to: SocketAddr, kind: u8, position: u64, term: u32, body: &[u8]) {
+            self.send_with_wire(to, kind, position, term, body, WIRE_MAX);
+        }
+        /// As `send`, with header byte 13 chosen by the test (wire-level
+        /// spec §3.1: `0` = a pre-level peer).
+        fn send_with_wire(
+            &mut self,
+            to: SocketAddr,
+            kind: u8,
+            position: u64,
+            term: u32,
+            body: &[u8],
+            wire: u8,
+        ) {
             let mut d = vec![0u8; DATAGRAM_HEADER_LEN];
             write_datagram_header(
                 &mut d,
@@ -3812,7 +3924,7 @@ mod tests {
                     position,
                     leadership_term_id: term,
                     kind,
-                    flags: 0,
+                    wire,
                     key_epoch: 0,
                 },
             );
@@ -5290,6 +5402,118 @@ mod tests {
         assert_eq!(st.statuses_refused.load(Relaxed), 2);
     }
 
+    // ======================================================================
+    // Wire-level spec §3.1–§3.2: header byte 13 is the sender's WIRE_MAX,
+    // and the receiver decides it before anything else in the datagram.
+    // `datagrams` is the "got past the check" witness: `on_datagram` bumps it
+    // only after the header byte, the consensus/probe short-circuits and the
+    // term filter, so a current-term HEARTBEAT that is admitted counts 1 and a
+    // refused one counts 0.
+    // ======================================================================
+
+    /// Byte `0` is a pre-level (`0.11.0`) peer: refused whole, counted as
+    /// `wire_refused_prelevel`, and nothing past the check sees it.
+    #[test]
+    fn wire_prelevel_byte_is_refused_and_counted() {
+        use Ordering::Relaxed;
+        let b = buffer();
+        let mut peer = FakeLeader::new();
+        let mut r = follower(&b, peer.addr());
+        let to = r.local_addr();
+        let st = r.stats();
+        peer.send_with_wire(to, DGRAM_KIND_HEARTBEAT, 0, TERM, &[], 0);
+        drive_until(&mut r, || st.wire_refused_prelevel.load(Relaxed) == 1);
+        assert_eq!(st.datagrams.load(Relaxed), 0, "nothing past the byte check");
+        assert_eq!(st.wire_refused_out_of_range.load(Relaxed), 0);
+        // The same datagram at this binary's level is admitted.
+        peer.send(to, DGRAM_KIND_HEARTBEAT, 0, TERM, &[]);
+        drive_until(&mut r, || st.datagrams.load(Relaxed) == 1);
+        assert_eq!(st.wire_refused_prelevel.load(Relaxed), 1);
+    }
+
+    /// The one-level-back promise: a peer one above `WIRE_MAX` is accepted;
+    /// two above is `out_of_range`, never `prelevel`.
+    #[test]
+    fn wire_one_above_is_accepted_two_above_is_out_of_range() {
+        use Ordering::Relaxed;
+        let b = buffer();
+        let mut peer = FakeLeader::new();
+        let mut r = follower(&b, peer.addr());
+        let to = r.local_addr();
+        let st = r.stats();
+        peer.send_with_wire(to, DGRAM_KIND_HEARTBEAT, 0, TERM, &[], WIRE_MAX + 1);
+        peer.send_with_wire(to, DGRAM_KIND_HEARTBEAT, 0, TERM, &[], WIRE_MAX + 2);
+        drive_until(&mut r, || {
+            st.wire_refused_out_of_range.load(Relaxed) == 1 && st.datagrams.load(Relaxed) == 1
+        });
+        assert_eq!(st.wire_refused_prelevel.load(Relaxed), 0);
+        // Below WIRE_MIN (and not 0) is out of range too.
+        if WIRE_MIN > 1 {
+            peer.send_with_wire(to, DGRAM_KIND_HEARTBEAT, 0, TERM, &[], WIRE_MIN - 1);
+            drive_until(&mut r, || st.wire_refused_out_of_range.load(Relaxed) == 2);
+        }
+        assert_eq!(st.datagrams.load(Relaxed), 1);
+    }
+
+    /// Under crypto the byte is AAD. A correctly SEALED datagram whose byte
+    /// is `0` is still refused as prelevel — it is decided on the cleartext
+    /// header before any open, and never reaches `on_datagram`.
+    #[test]
+    fn wire_prelevel_byte_is_refused_under_crypto_too() {
+        use Ordering::Relaxed;
+        let (mut r, mut peer, _b) = receiver_with_crypto();
+        let to = r.local_addr();
+        let st = r.stats();
+        peer.send_sealed_with_wire(to, DGRAM_KIND_HEARTBEAT, 0);
+        drive_until(&mut r, || st.wire_refused_prelevel.load(Relaxed) == 1);
+        assert_eq!(st.datagrams.load(Relaxed), 0, "nothing past the byte check");
+        assert_eq!(
+            st.dropped_auth_failed.load(Relaxed),
+            0,
+            "refused before open"
+        );
+        // At this binary's level the same sealed HEARTBEAT is admitted.
+        peer.send_sealed_with_wire(to, DGRAM_KIND_HEARTBEAT, WIRE_MAX);
+        drive_until(&mut r, || st.datagrams.load(Relaxed) == 1);
+    }
+
+    /// A pre-level HANDSHAKE (kinds 18/19) never reaches `on_datagram` — it
+    /// is routed from `crypto_admit` — so the check there is what refuses
+    /// and counts it rather than letting a 0.11.0 peer start a session.
+    #[test]
+    fn wire_prelevel_handshake_is_refused_before_it_is_routed() {
+        use Ordering::Relaxed;
+        let (mut r, mut peer, _b) = receiver_with_crypto();
+        let to = r.local_addr();
+        let st = r.stats();
+        let mut d = vec![0u8; DATAGRAM_HEADER_LEN + 8];
+        let mut h = CryptoPeer::header(0, DGRAM_KIND_HS_INIT, 0);
+        h.wire = 0;
+        write_datagram_header(&mut d, &h);
+        peer.send_raw(to, &d);
+        drive_until(&mut r, || st.wire_refused_prelevel.load(Relaxed) == 1);
+        assert_eq!(st.dropped_handshake.load(Relaxed), 0, "never routed");
+    }
+
+    /// Erratum 2: the byte rides on the durable report to the consensus
+    /// agent, which keeps the per-member table (Task 7).
+    #[test]
+    fn wire_report_event_carries_the_senders_byte() {
+        let h = DatagramHeader {
+            position: 64,
+            leadership_term_id: 3,
+            kind: DGRAM_KIND_APPEND_POSITION,
+            wire: 13,
+            key_epoch: 0,
+        };
+        let mut d = vec![0u8; DATAGRAM_HEADER_LEN + APPEND_POSITION_BODY_LEN];
+        write_datagram_header(&mut d, &h);
+        match consensus_event(&h, &d, "127.0.0.1:1".parse().unwrap()) {
+            Some(NetEvent::Report { wire, durable, .. }) => assert_eq!((wire, durable), (13, 64)),
+            other => panic!("{other:?}"),
+        }
+    }
+
     /// Backup-tier 3b (kinds 28/29): `TIER_INSTALL` routes as
     /// `NetEvent::TierInstall` (by source address, crypto off) only at the
     /// current term with a well-formed body, a stale term being counted; `TIER_INSTALL_STATUS` demuxes to the sender route.
@@ -5784,9 +6008,22 @@ mod tests {
                 position,
                 leadership_term_id: TERM,
                 kind,
-                flags: 0,
+                wire: WIRE_MAX,
                 key_epoch,
             }
+        }
+
+        /// A real, correctly-sealed GROUP datagram of `kind` (header-only)
+        /// whose header byte 13 is `wire` — sealed AFTER the byte is set, so
+        /// the byte is authenticated AAD exactly as a real peer's would be.
+        fn send_sealed_with_wire(&mut self, to: SocketAddr, kind: u8, wire: u8) {
+            let mut d = vec![0u8; DATAGRAM_HEADER_LEN];
+            let mut h = Self::header(0, kind, 0);
+            h.wire = wire;
+            write_datagram_header(&mut d, &h);
+            let now = self.send.now_ns();
+            self.send.seal(kind, None, &mut d, now).unwrap();
+            self.sock.send_to(&d, to).unwrap();
         }
 
         /// A real, correctly-sealed DATA datagram — exactly what a peer with
@@ -5968,7 +6205,7 @@ mod tests {
                 position: *pos,
                 leadership_term_id: TERM,
                 kind: DGRAM_KIND_DATA,
-                flags: 0,
+                wire: WIRE_MAX,
                 key_epoch: 0,
             },
         );
@@ -6010,7 +6247,7 @@ mod tests {
                 position: 0,
                 leadership_term_id: TERM,
                 kind: DGRAM_KIND_HEARTBEAT,
-                flags: 0,
+                wire: WIRE_MAX,
                 key_epoch: 0,
             },
         );

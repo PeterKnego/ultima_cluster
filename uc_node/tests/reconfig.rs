@@ -679,7 +679,7 @@ fn removed_follower_halts_and_zombie_once() -> bool {
             position: 0,
             leadership_term_id: huge_term,
             kind: DGRAM_KIND_REQUEST_VOTE,
-            flags: 0,
+            wire: uc_protocol::WIRE_MAX,
             key_epoch: 0,
         },
     );
@@ -698,7 +698,7 @@ fn removed_follower_halts_and_zombie_once() -> bool {
             position: u64::MAX / 2,
             leadership_term_id: huge_term,
             kind: DGRAM_KIND_APPEND_POSITION,
-            flags: 0,
+            wire: uc_protocol::WIRE_MAX,
             key_epoch: 0,
         },
     );

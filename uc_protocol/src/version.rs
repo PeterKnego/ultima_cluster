@@ -29,21 +29,21 @@ impl ProtocolVersion {
 // old service/client binaries at local IPC attach over a change that cannot
 // affect them.
 //
-// NB (post-M7 loose-end): these two constants and `ProtocolVersion::
-// compatible_with` are NOT on any live enforcement path — grep the workspace
-// and `CURRENT` has no caller outside this file, `MIN_COMPATIBLE` is only
-// re-exported (never read), and `compatible_with` is referenced only by this
-// module's own tests and a doc-comment. The version actually gated at every
-// IPC / peer handshake is the cnc-page field, checked by
+// NB (updated 0.12.0, wire-level spec §3.2): the datagram receiver enforces
+// `WIRE_MIN` since 0.12.0 — `uc_net::receiver`'s `wire_admit` refuses (and
+// counts) any datagram whose header byte @13 is outside
+// `[WIRE_MIN, WIRE_MAX + 1]`, before anything else in it is read. `WIRE_MAX`
+// and `WIRE_MIN` derive from `CURRENT` below, but `CURRENT` itself — like
+// `ProtocolVersion::compatible_with` — is still not compared anywhere; only
+// the derived byte is. The version gated at every local IPC attach is the
+// separate cnc-page field, checked by
 // `uc_protocol::v2::cnc::version_compatible(local, peer)` over the packed
 // `CNC_V2_VERSION` u32 (that module is `core`-only, so it re-spells the
 // same-major / peer-minor-not-newer rule directly rather than depend on this
-// type). The two version lines are INDEPENDENT, not lockstep: `CNC_V2_VERSION`
-// gates the cnc shmem page format at local IPC attach. `CNC_V2_VERSION` moved
-// 2.0 → 3.0 in M14a (page grew to 8 KiB); the two version lines remain
-// independent — that bump did not touch this constant. `CURRENT` documents
-// the semver of the wire *datagram* protocol but does not itself enforce
-// anything.
+// type). The two version lines are INDEPENDENT, not lockstep:
+// `CNC_V2_VERSION` gates the cnc shmem page format at local IPC attach and
+// moved 2.0 → 3.0 in M14a (page grew to 8 KiB) without touching this
+// constant.
 // 0.5.0: content-attested durable reports — `DGRAM_KIND_APPEND_POSITION`
 // gains an 8-byte body carrying the term the sender attributes to the byte
 // below its reported position (`AppendPositionBody`, datagram.rs). The 16-byte

@@ -50,7 +50,7 @@ fn datagram(kind: u8, position: u64, term: u32, body: &[u8]) -> Vec<u8> {
             position,
             leadership_term_id: term,
             kind,
-            flags: 0,
+            wire: uc_protocol::WIRE_MAX,
             key_epoch: 0,
         },
     );
@@ -458,7 +458,7 @@ pub fn uc_crypto_open() -> Vec<Seed> {
                 position: 4096,
                 leadership_term_id: 3,
                 kind: DGRAM_KIND_DATA,
-                flags: 0,
+                wire: uc_protocol::WIRE_MAX,
                 key_epoch: 1,
             },
         );

@@ -299,7 +299,7 @@ impl FakePeer {
                 position: 0,
                 leadership_term_id: 0,
                 kind,
-                flags: 0,
+                wire: uc_protocol::WIRE_MAX,
                 key_epoch: 0,
             },
         );
@@ -403,7 +403,7 @@ impl FakePeer {
                 position: 0,
                 leadership_term_id: term,
                 kind: DGRAM_KIND_VOTE,
-                flags: 0,
+                wire: uc_protocol::WIRE_MAX,
                 key_epoch: 0,
             },
         );
@@ -966,7 +966,7 @@ fn a_downgrade_to_cleartext_is_refused() {
             position: append_before,
             leadership_term_id: 0,
             kind: DGRAM_KIND_DATA,
-            flags: 0,
+            wire: uc_protocol::WIRE_MAX,
             key_epoch: 0,
         },
     );
@@ -987,7 +987,7 @@ fn a_downgrade_to_cleartext_is_refused() {
             position: append_before,
             leadership_term_id: 0,
             kind: DGRAM_KIND_DATA,
-            flags: 0,
+            wire: uc_protocol::WIRE_MAX,
             key_epoch: 0,
         },
     );
@@ -1049,7 +1049,7 @@ fn a_downgrade_to_cleartext_is_refused() {
             position: 0,
             leadership_term_id: injected_term,
             kind: DGRAM_KIND_REQUEST_VOTE,
-            flags: 0,
+            wire: uc_protocol::WIRE_MAX,
             key_epoch: 0,
         },
     );

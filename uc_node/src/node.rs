@@ -5591,7 +5591,8 @@ impl Consensus {
                 position: 0,
                 leadership_term_id: self.sm.current_term(),
                 kind,
-                flags: 0,
+                // Task 6: self.wire.max
+                wire: uc_protocol::WIRE_MAX,
                 key_epoch: 0,
             },
         );
@@ -11129,7 +11130,10 @@ impl Consensus {
                 term,
                 durable,
                 durable_term,
+                wire,
             } => {
+                // Task 7 keeps the per-member table from this byte
+                let _ = wire;
                 let Some(id) = self.addr_to_id.get(&from).copied() else {
                     return;
                 };
@@ -14058,8 +14062,9 @@ impl Consensus {
     /// Stage one consensus datagram: cleartext header + body, `key_epoch`
     /// left at 0 (a group-scope seal stamps the real epoch itself, as the
     /// last write before the AEAD call, since the header is AAD; a
-    /// pairwise-scope seal never uses the field at all).
-    fn stage(kind: u8, position: u64, term: u32, body: &[u8]) -> Vec<u8> {
+    /// pairwise-scope seal never uses the field at all). `wire` is header
+    /// byte 13, this node's `WIRE_MAX` (wire-level spec §3.1).
+    fn stage(kind: u8, position: u64, term: u32, body: &[u8], wire: u8) -> Vec<u8> {
         let mut d = vec![0u8; DATAGRAM_HEADER_LEN + body.len()];
         write_datagram_header(
             &mut d,
@@ -14067,7 +14072,7 @@ impl Consensus {
                 position,
                 leadership_term_id: term,
                 kind,
-                flags: 0,
+                wire,
                 key_epoch: 0,
             },
         );
@@ -14094,7 +14099,8 @@ impl Consensus {
             "Consensus::send seals with one destination's pairwise key; kind {kind} is not \
              Scope::Pairwise — a fan-out kind belongs in `fan_out_group`, which seals ONCE"
         );
-        let mut d = Self::stage(kind, position, term, body);
+        // Task 6: self.wire.max
+        let mut d = Self::stage(kind, position, term, body, uc_protocol::WIRE_MAX);
         if self.crypto.is_some() {
             let Some(&peer) = self.addr_to_id.get(&to) else {
                 self.crypto_unresolved_peer.fetch_add(1, Ordering::Relaxed);
@@ -14146,7 +14152,8 @@ impl Consensus {
             "fan_out_group seals once for every destination, which is only correct for \
              Scope::Group kinds; kind {kind} is not one"
         );
-        let mut d = Self::stage(kind, position, term, body);
+        // Task 6: self.wire.max
+        let mut d = Self::stage(kind, position, term, body, uc_protocol::WIRE_MAX);
         if self.crypto.is_some() {
             // `now_ns` from the crypto plane's own clock, never
             // `Consensus::base` — `GroupPlane::sealing_epoch` compares it
@@ -23480,6 +23487,7 @@ mod tests {
             term: 3,
             durable: append,
             durable_term: dt,
+            wire: uc_protocol::WIRE_MAX,
         });
         assert!(
             h.cons.sm.can_serve(),
@@ -24390,6 +24398,7 @@ mod tests {
                 term: 3,
                 durable: 1 << 40,
                 durable_term: dt,
+                wire: uc_protocol::WIRE_MAX,
             });
         }
         assert_eq!(
@@ -24413,6 +24422,7 @@ mod tests {
                 term: 3,
                 durable: append,
                 durable_term: dt,
+                wire: uc_protocol::WIRE_MAX,
             });
         }
         assert_eq!(
@@ -24433,6 +24443,7 @@ mod tests {
                 term: 7,
                 durable: 1 << 40,
                 durable_term: dt,
+                wire: uc_protocol::WIRE_MAX,
             });
         }
         assert_eq!(
@@ -24797,6 +24808,7 @@ mod tests {
                 term: 3,
                 durable: append,
                 durable_term: dt,
+                wire: uc_protocol::WIRE_MAX,
             });
         }
         assert!(
