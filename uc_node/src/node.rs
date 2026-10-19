@@ -2584,6 +2584,9 @@ impl Node {
         )?;
         let cluster_view = Arc::new(ClusterView::new(cluster_fsm.state()));
         let _ = tier_install_view.set(Arc::clone(&cluster_view));
+        // Wire-level ruling 8: the consensus agent's JOINED edge, shared
+        // with the cluster agent (raised in `maybe_publish_declared`).
+        let joined = Arc::new(AtomicBool::new(false));
         let mut cluster_agent = crate::cluster_agent::ClusterAgent::new(
             Arc::clone(&buffer),
             Arc::clone(&cnc),
@@ -2597,6 +2600,7 @@ impl Node {
             Arc::clone(&cluster_installed),
             Arc::clone(&snapshot_standby_instant_pub),
             wire,
+            Arc::clone(&joined),
         );
         let cluster_artifact_hash = cluster_agent.artifact_hash_cell();
         // M14a + plan B2 (final review C1) + plan B3 T5: the declared set is
@@ -2683,6 +2687,7 @@ impl Node {
             test_now_ns: None,
             services: cfg.services,
             declared_published: false,
+            joined: Arc::clone(&joined),
             boot_durable: durable,
             declared_withheld_since_ns: None,
             declared_withheld_warned: false,
@@ -3909,6 +3914,10 @@ struct Consensus {
     /// branch on a field that is already hot, not an atomic load (M14a: code
     /// in a hot loop's body costs even on paths that never run).
     declared_published: bool,
+    /// Wire-level ruling 8: `declared_published`, mirrored for the cluster
+    /// agent — the JOINED edge after which it may judge
+    /// `WireLevelBelowBinary`. Raised once, never lowered.
+    joined: Arc<AtomicBool>,
     /// #95: the durable position this incarnation recovered at boot. Until
     /// the node joins ([`Self::declared_published`]), FSM pacing measures
     /// `fsm_lag` from here rather than from the fresh page's `applied = 0`
@@ -7009,6 +7018,7 @@ impl Consensus {
         }
         self.cnc.store_services_declared(self.services.declared());
         self.declared_published = true;
+        self.joined.store(true, Ordering::Release);
         crate::obs_event!(
             Info,
             "services_declared_published",
@@ -16188,6 +16198,7 @@ mod tests {
         let (fetch_tx, fetch_rx) = mpsc::sync_channel::<SnapFetch>(1);
         let (fetch_cmd_tx, fetch_cmd_rx) = mpsc::sync_channel::<FetchCmd>(1);
         let stored_set_pos = Arc::new(AtomicU64::new(0));
+        let joined = Arc::new(AtomicBool::new(false));
         let cluster = ClusterAgent::new(
             Arc::clone(&buffer),
             Arc::clone(&cnc),
@@ -16206,6 +16217,7 @@ mod tests {
             Arc::clone(&cluster_installed),
             Arc::new(AtomicU64::new(0)),
             WireRange::BINARY,
+            Arc::clone(&joined),
         );
 
         let (auto_fetch_audit, auto_fetch_audit_writer) =
@@ -16268,6 +16280,7 @@ mod tests {
             fsm_lag_eff: crate::services::fsm_lag_eff(&services, 1 << 16, 4096),
             services,
             declared_published: false,
+            joined: Arc::clone(&joined),
             boot_durable: 0,
             declared_withheld_since_ns: None,
             declared_withheld_warned: false,
@@ -23366,6 +23379,7 @@ mod tests {
             Arc::clone(&h.cons.cluster_installed),
             Arc::new(AtomicU64::new(0)),
             WireRange::BINARY,
+            Arc::clone(&h.cons.joined),
         );
         drive_to_serving_leader(&mut h);
 
@@ -23467,6 +23481,7 @@ mod tests {
             Arc::clone(&h.cons.cluster_installed),
             Arc::new(AtomicU64::new(0)),
             WireRange::BINARY,
+            Arc::clone(&h.cons.joined),
         );
         (h, hash)
     }

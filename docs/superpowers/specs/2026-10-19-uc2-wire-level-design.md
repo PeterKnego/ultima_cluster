@@ -62,7 +62,10 @@ details of the chat design. The plan implements these, not the body.
    pre-raise artifact replays Settings records that decode as level 12,
    which from the release where `WIRE_MIN = 13` would stop a healthy node on
    history. The refusal is the same; only its moment moves to "once the node
-   knows the cluster's current level".
+   knows the cluster's current level". "Caught up" means JOINED (leader
+   known, commit learned, walk at that commit) — the attach gate's
+   condition — not the local commit counter, which a node down during the
+   raise still holds pre-raise.
 
 Also: `PathBelowCommittedMtu` is a fail-stop panic string in the consensus
 agent, not an enum; the two level refusals use the same idiom in the cluster

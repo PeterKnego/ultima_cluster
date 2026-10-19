@@ -33,7 +33,7 @@
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering, fence};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering, fence};
 use std::sync::{Arc, mpsc};
 
 use uc_journal::Journal;
@@ -374,6 +374,11 @@ pub struct ClusterAgent {
     /// the ordinary agent fail-stop (daemon exit 1), never a panic inside
     /// `Node::start_with`.
     boot_check_pending: bool,
+    /// Wire-level ruling 8: the consensus agent's JOINED edge — the attach
+    /// gate's own condition (`Consensus::maybe_publish_declared`: leader
+    /// known ∧ commit learned ∧ cluster walk consumed to commit), raised
+    /// once per incarnation. `WireLevelBelowBinary` is judged only after it.
+    joined: Arc<AtomicBool>,
 }
 
 impl ClusterAgent {
@@ -402,6 +407,7 @@ impl ClusterAgent {
         installed: Arc<AtomicU64>,
         standby_instant_pos: Arc<AtomicU64>,
         wire: WireRange,
+        joined: Arc<AtomicBool>,
     ) -> ClusterAgent {
         let snapshot_pos = fsm.last_applied().filter(|_| start > 0).unwrap_or(0);
         // Catalog ruling R28: seed the hash word from the recovered artifact
@@ -435,6 +441,7 @@ impl ClusterAgent {
             installed,
             wire,
             boot_check_pending: start > 0,
+            joined,
         };
         // Spec §2.5 / §3 S4 step 3: a recovered agent republishes the pin
         // words from the artifact BEFORE any service attaches — the same
@@ -486,12 +493,14 @@ impl ClusterAgent {
         }
     }
 
-    /// Ruling 5: at the end of a pass whose walk reached the commit it
-    /// walked towards, the FSM's level IS the cluster's current level — the
-    /// one moment `WireLevelBelowBinary` may be judged. A `head` of 0 is a
-    /// node that has learned no commit yet, which knows no level to judge.
+    /// Rulings 5 and 8: at the end of a pass on a JOINED node whose walk
+    /// reached the commit it walked towards, the FSM's level IS the
+    /// cluster's current level — the one moment `WireLevelBelowBinary` may
+    /// be judged. Before JOINED the local commit can be pre-raise (a node
+    /// that was down during the raise), so a stale level there is history,
+    /// not a fault. A `head` of 0 is a node that knows no commit at all.
     fn check_caught_up_level(&self, head: u64) {
-        if head == 0 || self.follower.cursor < head {
+        if head == 0 || self.follower.cursor < head || !self.joined.load(Ordering::Acquire) {
             return;
         }
         let level = self.fsm.settings().wire_level;
@@ -1506,6 +1515,7 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
             WireRange::BINARY,
+            Arc::new(AtomicBool::new(false)),
         );
         (agent, view)
     }
@@ -1779,6 +1789,7 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
             WireRange::BINARY,
+            Arc::new(AtomicBool::new(false)),
         );
         cnc.counters().durable.store_release(e3);
         cnc.counters().commit.store_release(e1); // only the first command is committed
@@ -1836,6 +1847,7 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
             WireRange::BINARY,
+            Arc::new(AtomicBool::new(false)),
         );
         // Strictly inside the only frame: not 0 (genesis), not 96 (its end).
         cnc.counters().durable.store_release(48);
@@ -1910,6 +1922,7 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
             WireRange::BINARY,
+            Arc::new(AtomicBool::new(false)),
         );
         cnc.counters().durable.store_release(e_msg);
         cnc.counters().commit.store_release(e_msg);
@@ -1968,6 +1981,7 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
             WireRange::BINARY,
+            Arc::new(AtomicBool::new(false)),
         );
         cnc.counters().durable.store_release(e1);
         cnc.counters().commit.store_release(e1);
@@ -2017,6 +2031,7 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
             WireRange::BINARY,
+            Arc::new(AtomicBool::new(false)),
         );
         assert!(agent.do_work());
         assert_eq!(
@@ -2067,6 +2082,7 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
             WireRange::BINARY,
+            Arc::new(AtomicBool::new(false)),
         );
 
         // Flags word 0 = a voter: the standby instant is ignored.
@@ -2122,6 +2138,7 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
             WireRange::BINARY,
+            Arc::new(AtomicBool::new(false)),
         );
 
         // Flags word 0 = a voter throughout: never takes NODE_FLAG_LEARNER.
@@ -2171,6 +2188,7 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
             WireRange::BINARY,
+            Arc::new(AtomicBool::new(false)),
         );
 
         let (end, stamp) = app.append_snapshot(1, 0).unwrap();
@@ -2250,6 +2268,7 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
             WireRange::BINARY,
+            Arc::new(AtomicBool::new(false)),
         );
         let head = stage_overrun(&buffer, &cnc);
         assert!(head > e3, "the prime moves the head well past the frames");
@@ -2327,6 +2346,7 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
             WireRange::BINARY,
+            Arc::new(AtomicBool::new(false)),
         );
         let head = stage_overrun(&buffer, &cnc);
         assert!(head > e_last);
@@ -2410,6 +2430,7 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
             WireRange::BINARY,
+            Arc::new(AtomicBool::new(false)),
         );
         // Stand in for "this agent already holds the artifact at p1".
         agent.snapshot_pos = p1;
@@ -2469,6 +2490,7 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
             WireRange::BINARY,
+            Arc::new(AtomicBool::new(false)),
         );
 
         // Stage a LIVE overrun exactly like `stage_overrun` does — the ring
@@ -2540,6 +2562,7 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
             WireRange::BINARY,
+            Arc::new(AtomicBool::new(false)),
         );
         // Flags word 0 = a voter throughout: never takes NODE_FLAG_LEARNER.
         let head = stage_overrun(&buffer, &cnc);
@@ -2614,6 +2637,7 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
             WireRange::BINARY,
+            Arc::new(AtomicBool::new(false)),
         );
         agent2.do_work();
         assert_eq!(
@@ -2635,6 +2659,8 @@ mod tests {
         /// through it. The allocation never moves (Region owns it).
         base: *mut u8,
         dir: tempfile::TempDir,
+        /// The consensus agent's JOINED edge, raised by hand (ruling 8).
+        joined: Arc<AtomicBool>,
     }
 
     impl std::ops::Deref for AgentFixture {
@@ -2673,6 +2699,7 @@ mod tests {
         )
         .unwrap();
         let view = Arc::new(ClusterView::new(fsm.state()));
+        let joined = Arc::new(AtomicBool::new(false));
         let agent = ClusterAgent::new(
             Arc::clone(&buffer),
             Arc::clone(&cnc),
@@ -2686,6 +2713,7 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
             wire,
+            Arc::clone(&joined),
         );
         AgentFixture {
             agent,
@@ -2693,6 +2721,7 @@ mod tests {
             cnc,
             base,
             dir,
+            joined,
         }
     }
 
@@ -2756,8 +2785,31 @@ mod tests {
     #[should_panic(expected = "WireLevelBelowBinary")]
     fn a_committed_level_below_the_binary_fail_stops_once_caught_up() {
         let mut agent = agent_fixture(WireRange { min: 13, max: 14 });
+        agent.joined.store(true, Ordering::Release);
         append_committed_settings(&agent, &Settings::genesis_default()); // level 12
-        agent.do_work(); // walks to commit, so Below is judged at the pass end
+        agent.do_work(); // joined and walked to commit: Below is judged at the pass end
+    }
+
+    /// Ruling 8: a node that was down during the raise holds a pre-raise
+    /// journal and commit. Before it has JOINED, its stale level is history;
+    /// once joined at that level, Below is a real fault.
+    #[test]
+    fn a_pre_raise_follower_does_not_stop_before_it_has_joined() {
+        let mut agent = agent_fixture(WireRange { min: 13, max: 14 });
+        append_committed_settings(&agent, &Settings::genesis_default()); // level 12
+        agent.do_work();
+        assert_eq!(agent.cnc().wire_level(), 12, "walked, not stopped");
+        agent.joined.store(true, Ordering::Release);
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            agent.do_work();
+        }));
+        let msg = r.expect_err("joined at level 12 on a [13,14] binary must stop");
+        let msg = msg
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| msg.downcast_ref::<&str>().map(|s| s.to_string()))
+            .unwrap_or_default();
+        assert!(msg.contains("WireLevelBelowBinary"), "{msg}");
     }
 
     /// Ruling 5 (spec erratum 8): a pre-raise Settings record in HISTORY is
