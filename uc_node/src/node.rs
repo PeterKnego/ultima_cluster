@@ -9154,6 +9154,9 @@ impl Consensus {
         if self.last_cluster_append > view_position {
             return false; // single-in-flight: a CLUSTER command is above commit
         }
+        if self.wire_raise_held().is_some() {
+            return false; // ruling 16: next check
+        }
         let Ok(target) = self.wire_raise_target() else {
             return false;
         };
@@ -9180,6 +9183,10 @@ impl Consensus {
         self.last_wire_holdout = None;
         let view_position = self.cluster_view.position.load(Ordering::Acquire);
         if self.last_cluster_append > view_position {
+            return (2, 0, view_position);
+        }
+        if let Some(why) = self.wire_raise_held() {
+            crate::obs_event!(Info, "wire_raise_held", node = self.id as u64, reason = why);
             return (2, 0, view_position);
         }
         let target = match self.wire_raise_target() {
@@ -9221,6 +9228,29 @@ impl Consensus {
         }
     }
 
+    /// Ruling 16: why neither raise path may act on this pass, or `None`.
+    /// (a) This binary's own range must contain the committed level — a
+    /// leader outside it is about to be stopped by its own cluster agent
+    /// (spec §2.4) and must not raise first. (b) The node must have JOINED
+    /// and its cluster agent's walk must be at commit, so the view the raise
+    /// reads (the committed level, the mode) is the committed one and not a
+    /// stale one a new leader inherited. `commit` is read BEFORE `consumed`,
+    /// as in [`Self::maybe_publish_declared`].
+    fn wire_raise_held(&self) -> Option<&'static str> {
+        let committed = self.cluster_view.wire_level.load(Ordering::Acquire);
+        if !self.wire.contains(committed) {
+            return Some("range_excludes_committed");
+        }
+        if !self.joined.load(Ordering::Acquire) {
+            return Some("not_joined");
+        }
+        let commit = self.cnc.counters().commit.load_acquire();
+        if self.cluster_view.consumed.load(Ordering::Acquire) < commit {
+            return Some("walk_behind");
+        }
+        None
+    }
+
     /// Wire-level spec §4.1 over the committed membership (voters, then
     /// learners), this binary's max and the reports of this term.
     fn wire_raise_target(&self) -> Result<u8, WireHoldout> {
@@ -9245,13 +9275,24 @@ impl Consensus {
     /// target`; `None` when the FSM's rules refuse it or the append would
     /// overrun (the caller retries on its next check).
     fn append_wire_level(&mut self, target: u8) -> Option<u64> {
-        let mut settings = self.cluster_view.to_state().settings;
-        settings.wire_level = target;
-        let cmd = ClusterCommand::Settings(settings);
+        let cmd = self.wire_raise_command(target);
         if self.validate_cluster_command(&cmd).is_err() {
             return None;
         }
         self.append_cluster_frame(&cmd).ok()
+    }
+
+    /// The raise record: the view's settings with `wire_level = target`,
+    /// and the two fields the FSM has keep idioms for set to keep —
+    /// `wire_raise = WIRE_RAISE_KEEP` and `datagram_mtu = 0` (the max rule)
+    /// — so a view one command stale cannot revert an operator's mode change
+    /// or a raised rung (ruling 16).
+    fn wire_raise_command(&self, target: u8) -> ClusterCommand {
+        let mut settings = self.cluster_view.to_state().settings;
+        settings.wire_level = target;
+        settings.wire_raise = uc_protocol::v2::settings::WIRE_RAISE_KEEP;
+        settings.datagram_mtu = 0;
+        ClusterCommand::Settings(settings)
     }
 
     fn announce_wire_level(&mut self, target: u8, position: u64, origin: &str) {
@@ -21565,10 +21606,98 @@ mod tests {
         assert_eq!(word(&h, s2), 7);
     }
 
+    /// Ruling 16: both raise paths hold until this node has joined and its
+    /// cluster agent's walk is at commit. The bare harness runs no cluster
+    /// agent, so the tests that expect a raise put the walk there by hand.
+    fn walk_at_commit(h: &mut Harness) {
+        h.cons.joined.store(true, Ordering::Release);
+        let commit = h.cons.cnc.counters().commit.load_acquire();
+        h.cons
+            .cluster_view
+            .consumed
+            .store(commit, Ordering::Release);
+    }
+
+    #[test]
+    fn a_leader_whose_range_excludes_the_committed_level_does_not_raise() {
+        let mut h = harness();
+        drive_to_serving_leader(&mut h);
+        walk_at_commit(&mut h);
+        let committed = h.cons.cluster_view.wire_level.load(Ordering::Acquire);
+        // A `[committed+1, committed+2]` binary leading a cluster at
+        // `committed`: every member reports `committed+2`, but this leader
+        // must not raise (spec §2.4 — its own agent stops it instead).
+        h.cons.wire = WireRange {
+            min: committed + 1,
+            max: committed + 2,
+        };
+        h.cons.peer_wire.insert(0, committed + 2);
+        h.cons.peer_wire.insert(2, committed + 2);
+        let before = h.cons.last_cluster_append;
+        h.cons.next_wire_check_ns = 0;
+        assert!(!h.cons.maybe_commit_wire_level(), "auto: held");
+        let view = h.cons.cluster_view.position.load(Ordering::Acquire);
+        assert_eq!(h.cons.apply_wire_raise(), (2, 0, view), "manual: retry");
+        assert_eq!(h.cons.last_cluster_append, before, "nothing appended");
+    }
+
+    #[test]
+    fn the_raise_waits_for_the_join_and_for_the_walk_at_commit() {
+        let mut h = harness();
+        drive_to_serving_leader(&mut h);
+        wire_raise_due(&mut h);
+        let view = h.cons.cluster_view.position.load(Ordering::Acquire);
+        let before = h.cons.last_cluster_append;
+        // Not joined.
+        h.cons.joined.store(false, Ordering::Release);
+        h.cons.next_wire_check_ns = 0;
+        assert!(!h.cons.maybe_commit_wire_level(), "auto: not joined");
+        assert_eq!(h.cons.apply_wire_raise(), (2, 0, view));
+        // Joined, but the walk is below commit.
+        walk_at_commit(&mut h);
+        let commit = h.cons.cnc.counters().commit.load_acquire();
+        assert!(commit > 0, "precondition: something committed");
+        h.cons
+            .cluster_view
+            .consumed
+            .store(commit - 1, Ordering::Release);
+        h.cons.next_wire_check_ns = 0;
+        assert!(!h.cons.maybe_commit_wire_level(), "auto: walk behind");
+        assert_eq!(h.cons.apply_wire_raise(), (2, 0, view));
+        assert_eq!(h.cons.last_cluster_append, before, "nothing appended");
+        // At commit: the raise proposes.
+        walk_at_commit(&mut h);
+        h.cons.next_wire_check_ns = 0;
+        assert!(h.cons.maybe_commit_wire_level());
+    }
+
+    #[test]
+    fn the_raise_record_keeps_the_mode_and_the_rung() {
+        let mut h = harness();
+        drive_to_serving_leader(&mut h);
+        // A view that still carries an explicit mode and a raised rung (a
+        // stale view must not re-append either).
+        h.cons.cluster_view.wire_raise.store(
+            uc_protocol::v2::settings::WIRE_RAISE_MANUAL,
+            Ordering::Release,
+        );
+        h.cons
+            .cluster_view
+            .datagram_mtu
+            .store(8960, Ordering::Release);
+        let ClusterCommand::Settings(s) = h.cons.wire_raise_command(13) else {
+            panic!("a Settings command");
+        };
+        assert_eq!(s.wire_level, 13);
+        assert_eq!(s.wire_raise, uc_protocol::v2::settings::WIRE_RAISE_KEEP);
+        assert_eq!(s.datagram_mtu, 0, "the FSM's max rule keeps the rung");
+    }
+
     #[test]
     fn the_auto_raise_appends_once_throttled_and_audits_it() {
         let mut h = harness();
         drive_to_serving_leader(&mut h);
+        walk_at_commit(&mut h);
         let target = wire_raise_due(&mut h);
         h.cons.next_wire_check_ns = 0;
         h.cons.pass_mono_ns = 1_000;
@@ -21628,6 +21757,7 @@ mod tests {
     fn the_manual_raise_answers_its_four_shapes() {
         let mut h = harness();
         drive_to_serving_leader(&mut h);
+        walk_at_commit(&mut h);
         let view = h.cons.cluster_view.position.load(Ordering::Acquire);
         let committed = h.cons.cluster_view.wire_level.load(Ordering::Acquire);
         // Every member at the committed level: a no-op SUCCESS, nothing
@@ -21694,6 +21824,7 @@ mod tests {
     fn the_wire_raise_door_audits_the_holdout_on_a_refusal() {
         let mut h = harness();
         drive_to_serving_leader(&mut h);
+        walk_at_commit(&mut h);
         wire_raise_due(&mut h);
         h.cons.peer_wire.remove(&2);
         h.cons.handle_admin(wire_raise_req(1));

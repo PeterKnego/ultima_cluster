@@ -22,8 +22,9 @@ pub enum WireHoldout {
     Below { id: NodeId, reported: u8 },
 }
 
-/// `Ok(target)` iff every member has a non-zero report and `target =
-/// min(own_max, reported…) > committed`. Members are checked in `members`
+/// `Ok(target)` iff every member has a non-zero report and `min(own_max,
+/// reported…) > committed`; the target is then `committed + 1` (a raise is by
+/// exactly one level, ruling 16). Members are checked in `members`
 /// order with `self_id` read from `own_max`, so the holdout named is
 /// deterministic. When the minimum is not above `committed` but some member's
 /// max is, the first member at or below `committed` is named (`Below`);
@@ -53,7 +54,10 @@ pub fn wire_raise_target(
         highest = highest.max(max);
     }
     if target > committed {
-        return Ok(target);
+        // Ruling 16: a raise is always by exactly one level. A cluster whose
+        // members all speak two levels up still steps through the middle
+        // one, so no committed level is ever skipped.
+        return Ok(target.min(committed.saturating_add(1)));
     }
     if highest > committed
         && let Some(&id) = members.iter().find(|&&id| max_of(id) <= committed)
@@ -116,6 +120,13 @@ mod tests {
         // self at 14 (impossible under one-level-back, but the function must
         // still answer min): members at 13 → target 13.
         let r = reported(&[(2, 13), (3, 14)]);
+        assert_eq!(wire_raise_target(14, 12, &[1, 2, 3], 1, &r), Ok(13));
+    }
+
+    #[test]
+    fn a_raise_is_always_by_exactly_one_level() {
+        // Ruling 16: own 14, every report 14, committed 12 -> 13, never 14.
+        let r = reported(&[(2, 14), (3, 14)]);
         assert_eq!(wire_raise_target(14, 12, &[1, 2, 3], 1, &r), Ok(13));
     }
 
