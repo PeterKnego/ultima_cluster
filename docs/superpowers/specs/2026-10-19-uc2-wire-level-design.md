@@ -27,7 +27,7 @@ FSM upgrade lifecycle spec's §9.2 Track 2.
 
 Exploration of `b361eb29` for the implementation plan corrected eight
 details of the chat design. The plan implements these, not the body.
-Items 9–12 are controller rulings made during implementation; they record
+Items 9–14 are controller rulings made during implementation; they record
 what shipped where the body is silent or loose.
 
 1. **§3.4, the unknown-kind drop is not in the receiver.** Replication stores
@@ -101,6 +101,18 @@ what shipped where the body is silent or loose.
     `wire_raise` to the cluster's full settings file, not by applying a
     one-key file — `uc2ctl settings apply` replaces the record
     (`docs/reference/uc2ctl.md` § settings apply).
+13. **§3.4, the undecodable gate is level-specific.** It stops on an unknown
+    kind or a Settings version above the level; a known kind with a
+    malformed payload keeps refusal 42 as before 2.15.0, because journals
+    reaching back before 2.11.0 hold pre-cluster-FSM `CONFIG` frames (type 4)
+    that parse as kinds 1–3 with a payload no decoder accepts. Residual: such
+    a frame whose config version is ≥ 8 reads as an unknown kind and still
+    stops the node; so does one whose config version is 3, when the low 32
+    bits of its `prev_position` (which sit where a Settings version word
+    would) are above 7 — which any third configuration's are. A cluster
+    artifact (`uc2ctl snapshot`) before the upgrade avoids the walk from 0.
+14. **§2.2, the cluster image version stays 6.** The embedded Settings record
+    is self-sized by its own version word, so v7 needed no image bump.
 
 Also: `PathBelowCommittedMtu` is a fail-stop panic string in the consensus
 agent, not an enum; the two level refusals use the same idiom in the cluster

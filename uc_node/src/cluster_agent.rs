@@ -526,24 +526,30 @@ impl ClusterAgent {
         panic!("cluster fatal (fail-stop): {fault} position={position}");
     }
 
-    /// Wire-level spec §3.4: a CLUSTER record a correct peer could not have
-    /// sent at the committed level is corruption, not a refusal — the FSM's
-    /// own `42` (refused, `applied` advances) would let replicas diverge in
-    /// silence, so the agent stops before handing it over.
+    /// Wire-level spec §3.4 (narrowed by ruling 18, erratum 13): a CLUSTER
+    /// record a correct peer could not have sent at the committed LEVEL — an
+    /// unknown kind, or a Settings version above the level's — is corruption,
+    /// not a refusal: the FSM's own `42` (refused, `applied` advances) would
+    /// let replicas diverge in silence, so the agent stops before handing it
+    /// over. A known kind with a malformed payload is not level-specific and
+    /// keeps the FSM's refusal 42 ([`ClusterFsm::level_violation_at`]).
     fn gate_decodable(fsm: &ClusterFsm, body: &[u8], position: u64) {
         let level = fsm.settings().wire_level;
-        if !ClusterFsm::decodable_at(level, body) {
+        if let Some(why) = ClusterFsm::level_violation_at(level, body) {
             crate::obs_event!(
                 Error,
                 "cluster_record_undecodable",
                 position = position,
-                wire_level = level as u64
+                wire_level = level as u64,
+                reason = why
             );
             panic!(
                 "cluster fatal (fail-stop): ClusterRecordUndecodable position={position} \
-                 level={level} — a CLUSTER record in the committed log does not decode at \
-                 the committed wire level; the journal is corrupt or a peer violated the \
-                 level; restore from backup"
+                 level={level} reason={why} — a CLUSTER record in the committed log cannot \
+                 have been written at the committed wire level; the journal is corrupt or a \
+                 peer violated the level. A journal that reaches back before 2.11.0 needs a \
+                 cluster artifact first (`uc2ctl snapshot` on a node that has one), \
+                 otherwise restore from backup"
             );
         }
     }
@@ -2840,6 +2846,36 @@ mod tests {
     fn an_undecodable_cluster_record_fail_stops() {
         let mut agent = agent_fixture(WireRange::BINARY);
         append_committed_cluster_body(&agent, &[8, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3]); // kind 8 does not exist
+        agent.do_work();
+    }
+
+    /// Ruling 18: a KNOWN kind whose payload no decoder accepts is the
+    /// FSM's refusal 42 as before 2.15.0 — a journal reaching back before
+    /// 2.11.0 holds pre-cluster-FSM `CONFIG` frames (type 4) that parse as
+    /// kinds 1–3 with exactly such a payload.
+    #[test]
+    fn a_known_kind_with_a_bad_payload_is_refused_42_not_stopped() {
+        let mut agent = agent_fixture(WireRange::BINARY);
+        let before = agent.applied();
+        // kind 3 (Settings) with a 5-byte payload: version word 1, but no
+        // Settings layout is 5 bytes long.
+        append_committed_cluster_body(&agent, &[3, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 9]);
+        agent.do_work();
+        assert!(agent.applied() > before, "applied advances");
+        assert_eq!(agent.out, vec![42u8], "refused 42");
+    }
+
+    #[test]
+    #[should_panic(expected = "ClusterRecordUndecodable")]
+    fn a_settings_record_above_the_levels_version_fail_stops() {
+        let mut agent = agent_fixture(WireRange::BINARY);
+        // A v8 Settings record (50 bytes, version 8): no binary at a level
+        // whose `settings_version_for` is 7 can have written it.
+        let mut payload = vec![0u8; 50];
+        payload[0..4].copy_from_slice(&8u32.to_le_bytes());
+        let mut body = vec![ClusterKind::Settings as u8, 0, 0, 0, 0, 0, 0, 0];
+        body.extend_from_slice(&payload);
+        append_committed_cluster_body(&agent, &body);
         agent.do_work();
     }
 

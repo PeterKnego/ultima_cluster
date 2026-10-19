@@ -1463,6 +1463,15 @@ restart with its node — which the flag day does anyway.
 **Nothing on disk is cleared.** No `snapshots/` wipe and no artifact envelope
 change: every older `Settings` record and cluster image is read as before.
 
+**Precondition: a journal that reaches back before `2.11.0` needs a cluster
+artifact first.** Before the cluster FSM, frame type 4 was `CONFIG`, and a
+`2.15.0` node walking such a journal from position 0 can read one of those
+frames as a `CLUSTER` record no level allows and fail-stop with
+`ClusterRecordUndecodable`. If any node's journal still starts before
+`2.11.0` (purge off, never snapshotted since), run `uc2ctl snapshot` on the
+cluster BEFORE the flag day, so every node boots from a cluster artifact
+instead of walking from 0.
+
 **After the flag day** every node runs at level 12 with `wire_raise = auto`,
 and `uc2ctl status` prints `wire: level=12 binary=12..12`. There is nothing
 to raise until a release ships level 13. If you want your first roll to keep
@@ -1476,8 +1485,12 @@ with the name on stderr): `WireLevelAboveBinary` (the committed level is
 above this binary's max — upgrade the node), `WireLevelBelowBinary` (below
 its min, judged only once the node has joined — install the release the
 message names first) and `ClusterRecordUndecodable` (a committed `CLUSTER`
-record does not decode at the committed level — the journal is corrupt or a
-peer broke the level; restore from backup). With every node on the same
+record no correct peer could have written at the committed level — an
+unknown kind, or a `Settings` version above the level's; the journal is
+corrupt or a peer broke the level. A journal that reaches back before
+`2.11.0` needs a cluster artifact first — see the precondition above —
+otherwise restore from backup). A known kind with a malformed payload is
+still the cluster FSM's ordinary refusal 42, as before `2.15.0`. With every node on the same
 `2.15.0` binary none of them can fire on a healthy cluster.
 
 ## Where to go next

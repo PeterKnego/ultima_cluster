@@ -26,13 +26,13 @@ use uc_protocol::v2::cluster_image::{
 };
 use uc_protocol::v2::cnc::CNC_MAX_SERVICES;
 use uc_protocol::v2::config::{decode_config, encode_config};
-use uc_protocol::v2::frame::{ClusterKind, read_cluster_prefix};
+use uc_protocol::v2::frame::{CLUSTER_BODY_PREFIX_LEN, ClusterKind, read_cluster_prefix};
 use uc_protocol::v2::schedule::{
     MAX_SCHEDULE_ENTRIES, ScheduleTable, decode_schedule_table, encode_schedule_table,
 };
 use uc_protocol::v2::settings::{
     FSM_LAG_LOCKSTEP, MIN_FSM_LAG_BYTES, Settings, WIRE_RAISE_KEEP, WIRE_RAISE_MANUAL,
-    decode_settings, decode_settings_at, encode_settings,
+    decode_settings, encode_settings, settings_version_for,
 };
 use uc_protocol::v2::upgrade::{
     RowGenesis, RowRunning, SnapshotReport, UpgradePin, decode_pin_list, decode_report_list,
@@ -839,14 +839,26 @@ impl ClusterFsm {
         }
     }
 
-    /// True iff `body` is a CLUSTER record this level knows how to decode:
-    /// a known kind, a clean prefix, and a payload `decode_command` accepts —
-    /// Settings through `decode_settings_at(level, ..)`.
-    pub fn decodable_at(level: u8, body: &[u8]) -> bool {
+    /// Wire-level spec §3.4 as narrowed by ruling 18 (erratum 13): why
+    /// `body` is a CLUSTER record no correct peer could have committed at
+    /// `level`, or `None`. Only the LEVEL-SPECIFIC conditions count: a prefix
+    /// [`read_cluster_prefix`] rejects (a short body, an unknown kind byte or
+    /// a non-zero reserved byte), or a Settings record whose version word is
+    /// above `settings_version_for(level)`. A known kind whose payload no
+    /// decoder accepts is NOT a violation: it keeps the FSM's refusal 42, as
+    /// before 2.15.0, because a journal reaching back before 2.11.0 holds
+    /// pre-cluster-FSM `CONFIG` frames (type 4) that parse as kinds 1–3 with
+    /// exactly such a payload.
+    pub fn level_violation_at(level: u8, body: &[u8]) -> Option<&'static str> {
         match read_cluster_prefix(body) {
-            None => false,
-            Some((ClusterKind::Settings, p)) => decode_settings_at(level, p).is_some(),
-            Some((k, p)) => ClusterFsm::decode_command(k, p).is_some(),
+            None if body.len() < CLUSTER_BODY_PREFIX_LEN => Some("short_prefix"),
+            None if ClusterKind::from_u8(body[0]).is_none() => Some("unknown_kind"),
+            None => Some("reserved_nonzero"),
+            Some((ClusterKind::Settings, p)) => {
+                let version = u32::from_le_bytes(p.get(0..4)?.try_into().ok()?);
+                (version > settings_version_for(level)).then_some("settings_version_above_level")
+            }
+            Some(_) => None,
         }
     }
 
