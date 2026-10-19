@@ -1081,6 +1081,22 @@ struct PendingRead {
 /// transient `commit > append` snapshot (a stale/racy read across the two
 /// independent atomics) open rather than panic.
 #[inline]
+/// #99's report-ceiling floor for a term opened at `base` (the term map's
+/// entry for the current term): at or above the end of that term's NewTerm
+/// frame in both cases `append_new_term` produces. The frame is
+/// `NEW_TERM_FRAME_LEN` (64 B since wire level 13: a 32 B header plus the
+/// reserved zero body, aligned). (a) With room before the buffer's wrap it
+/// starts AT `base` and ends at `base + 64`. (b) When the term opens with
+/// fewer than 64 B left before the wrap — at a frame-aligned offset that is
+/// exactly 32 B — the appender writes those 32 B as padding first, so the
+/// frame ends at `base + 32 + 64` while the leader's term map still says
+/// `base` (its collapse base). The floor is the worst case, (b); in case (a)
+/// it is 32 B of margin, the safe direction (ruling 17).
+fn term_open_end(base: u64) -> u64 {
+    use uc_protocol::v2::frame::{FRAME_ALIGNMENT, NEW_TERM_FRAME_LEN};
+    base.saturating_add((FRAME_ALIGNMENT + NEW_TERM_FRAME_LEN) as u64)
+}
+
 fn admission_open(append: u64, commit: u64, budget: u64) -> bool {
     append.saturating_sub(commit) <= budget
 }
@@ -14193,15 +14209,13 @@ impl Consensus {
             self.min_applied.max(self.boot_durable)
         };
         // #99: never pace below the current term's opening frame. The term
-        // map's entry for `current_term` is the NewTerm frame's position (the
+        // map's entry for `current_term` is where the term opens (the
         // archive's term walk stamps `(term, base)` there, and the leader's
-        // own map opens the term at it); the frame is header-only, 32 bytes,
-        // and never preceded by padding at frame-aligned offsets — the second
-        // 32 bytes are margin. 0 until this node has seen the term open.
+        // own map opens the term at its collapse base); see
+        // [`term_open_end`] for how far past it the frame can end. 0 until
+        // this node has seen the term open.
         let term_open_end = match self.sm.term_map().last() {
-            Some(&(t, base)) if t == self.sm.current_term() => {
-                base.saturating_add(2 * uc_protocol::v2::frame::FRAME_ALIGNMENT as u64)
-            }
+            Some(&(t, base)) if t == self.sm.current_term() => term_open_end(base),
             _ => 0,
         };
         let ceiling = crate::services::report_ceiling(
@@ -21609,6 +21623,25 @@ mod tests {
     /// Ruling 16: both raise paths hold until this node has joined and its
     /// cluster agent's walk is at commit. The bare harness runs no cluster
     /// agent, so the tests that expect a raise put the walk there by hand.
+    /// Ruling 17 (#99 under the 64 B NEW_TERM): a term opened 32 B before
+    /// the buffer's wrap pads those 32 B first, so the frame ends at
+    /// `base + 32 + NEW_TERM_FRAME_LEN`; the floor must reach it.
+    #[test]
+    fn the_term_open_floor_covers_a_new_term_frame_padded_at_the_wrap() {
+        use uc_protocol::v2::frame::{FRAME_ALIGNMENT, NEW_TERM_FRAME_LEN};
+        let capacity: u64 = 1 << 20;
+        let base = capacity - FRAME_ALIGNMENT as u64;
+        let frame_end = base + FRAME_ALIGNMENT as u64 + NEW_TERM_FRAME_LEN as u64;
+        assert!(
+            term_open_end(base) >= frame_end,
+            "floor {} below the NewTerm frame's end {frame_end}",
+            term_open_end(base)
+        );
+        // At a frame-aligned offset with room, the frame starts at `base`.
+        let base = 4096;
+        assert!(term_open_end(base) >= base + NEW_TERM_FRAME_LEN as u64);
+    }
+
     fn walk_at_commit(h: &mut Harness) {
         h.cons.joined.store(true, Ordering::Release);
         let commit = h.cons.cnc.counters().commit.load_acquire();
