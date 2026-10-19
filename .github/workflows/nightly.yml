@@ -141,8 +141,11 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: Swatinem/rust-cache@v2
-      - name: Multi-process SIGKILL linearizability
-        run: cargo test -p uc_crashtest --features hard-crash-tests
+      # `wire-level-override` adds `tests/rolling_upgrade.rs` (wire-level spec
+      # §6.3, the two-binary roll); the node bin ignores `UC2_WIRE_RANGE`
+      # without it, and with the env unset nothing else changes.
+      - name: Multi-process SIGKILL linearizability + rolling wire-level upgrade
+        run: cargo test -p uc_crashtest --features hard-crash-tests,wire-level-override
 
   # M12c: the binary quickstart. Feature-gated out of the default `cargo test`
   # because it starts eleven processes and waits on an election; fixed ports

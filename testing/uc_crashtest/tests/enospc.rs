@@ -19,12 +19,11 @@
 //!
 //! # Why this spawns the REAL `uc2-node` daemon, not `uc_crashtest-node`
 //!
-//! This crate's own reference bin (`uc_crashtest-node.rs`) has no
-//! fail-stop/exit-1 loop at all — it just sleep-polls forever regardless of
-//! agent health (see its own doc comment), because the hard-crash suite it
-//! serves kills processes from the OUTSIDE. The `agent_failstopped` ->
-//! exit-1 chain this task must prove lives ONLY in the production daemon
-//! binary (`uc_node/src/bin/uc2-node.rs`), driven by a TOML config file
+//! This crate's own reference bin (`uc_crashtest-node.rs`) exits 1 on an
+//! agent fail-stop too since Ruling 13 (wire-level Task 13), but the chain
+//! this task must prove is the PRODUCTION one — the `agent_failstopped` ->
+//! exit-1 loop in the daemon binary
+//! (`uc_node/src/bin/uc2-node.rs`), driven by a TOML config file
 //! (`--config`), not `uc_crashtest-node`'s CLI flags. Node 0 in both tests
 //! below is therefore the real `uc2-node` daemon; nodes 1/2 (the
 //! survivors, never under test) stay on the lighter-weight

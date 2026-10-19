@@ -950,8 +950,27 @@ histories are still `Linearizable` with `equiv == 0`. The slow-freeze wrapper
 lives in the crashtest crate only and is opt-in (`--snapshots`), so all six
 pre-existing hard-crash tests attach byte-for-byte as before.
 
+**Rolling wire-level upgrade (`2.15.0`).** Wire-level spec §6.3 as real
+processes: three node processes boot on the old side (`UC2_WIRE_RANGE=12,12`)
+under a three-worker CAS-register load and are rolled to the new side
+(`12,13`) one at a time — nodes 0 and 1 by a restart, node 2 by a `SIGKILL`
+mid-roll. Every node's cnc `wire_level` word must still read 12 while a
+`[12,12]` member remains, and all three must read 13 within 30 s of the last
+roll (the leader raises on its own); the history across the whole roll is
+`Linearizable`. The old binary, started afterwards on node 2's directory, must
+be refused by name — `WireLevelAboveBinary` on its stderr and a non-zero exit
+within 20 s. The node bin honours `UC2_WIRE_RANGE` only when the crate is built
+with `wire-level-override`, so the test is gated on both features. From
+`2.16.0` on, `UC2_BASE_NODE_BIN` points the old side at the previous release's
+`uc_crashtest-node`.
+
+| test | file | what it drives |
+|---|---|---|
+| `rolling_upgrade_one_node_at_a_time_under_load_is_linearizable_and_raises` | `testing/uc_crashtest/tests/rolling_upgrade.rs` | `2.15.0` — a `12,12` → `12,13` roll of a 3-process cluster under load, one node `SIGKILL`ed mid-roll; level held at 12, raised to 13 on every node, WGL-linearizable, the old binary refused by name |
+
 ```bash
 cargo test -p uc_crashtest --features hard-crash-tests
+cargo test -p uc_crashtest --features hard-crash-tests,wire-level-override --test rolling_upgrade
 ```
 
 ---
@@ -1260,7 +1279,7 @@ whose apply loop is slow enough that the node's own report ceiling pins
 | Workflow | Contents |
 |---|---|
 | `ci.yml` | Fast gate on every PR: workspace build, tests, clippy `-D warnings` |
-| `nightly.yml` | Full proof suite — lincheck capstones (single- and two-FSM), `sim-heavy`, loom, crashtest (single- and two-FSM), the Elle clean tier's **six** passes, `lean-proofs` conformance replay with a date-rotated seed, `fuzz` (six legs, 600 s per target, with an asserted run-count floor) and `miri` (pure decoders + `uc_remote` SPSC) |
+| `nightly.yml` | Full proof suite — lincheck capstones (single- and two-FSM), `sim-heavy`, loom, crashtest (single- and two-FSM, plus the two-binary rolling wire-level upgrade), the Elle clean tier's **six** passes, `lean-proofs` conformance replay with a date-rotated seed, `fuzz` (six legs, 600 s per target, with an asserted run-count floor) and `miri` (pure decoders + `uc_remote` SPSC) |
 | `elle-weekly.yml` | Elle mutation tier |
 
 ---
