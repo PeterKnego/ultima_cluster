@@ -155,7 +155,10 @@ pub struct SettingsView {
     pub backup_retain_sets: u16,
     pub backup_retain_age_secs: DecU64,
     pub purge_requires_tiers: u8,
+    /// The committed cluster wire level (wire-level spec §2.2).
     pub wire_level: u8,
+    /// Who raises the level: `1` = auto (the leader), `2` = manual
+    /// (`uc2ctl wire raise`); `0` (keep) never appears in the view.
     pub wire_raise: u8,
 }
 
