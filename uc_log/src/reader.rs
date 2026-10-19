@@ -234,7 +234,7 @@ mod tests {
                     it.map(|(pos, h, p)| (pos, h.frame_type, p.len())).collect();
                 assert_eq!(
                     v,
-                    vec![(0, FRAME_TYPE_NEW_TERM, 0), (32, FRAME_TYPE_MESSAGE, 4)],
+                    vec![(0, FRAME_TYPE_NEW_TERM, 8), (64, FRAME_TYPE_MESSAGE, 4)],
                     "NEW_TERM is delivered (apply skips it by type); payload lengths exact"
                 );
             }

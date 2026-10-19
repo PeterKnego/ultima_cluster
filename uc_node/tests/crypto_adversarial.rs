@@ -1335,7 +1335,7 @@ fn heavy_corruption_and_replay_injection_never_panics_and_never_diverges() {
     // ("pos must be a frame start"; a mid-frame `pos` "misreads a payload
     // byte as the length word ... garbage") and only accidentally landed on
     // real frame starts when every frame happened to be exactly 256/n
-    // bytes. Leader churn under the storm appends 32-byte `NEW_TERM`
+    // bytes. Leader churn under the storm appends 64-byte `NEW_TERM`
     // frames; an odd count of those shifts every later frame off any fixed
     // stride, and the resulting garbage read (`len_read=256, type_read=0`
     // in the diagnosed failure — neither a real length nor a valid

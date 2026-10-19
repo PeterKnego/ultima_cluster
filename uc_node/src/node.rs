@@ -16859,7 +16859,7 @@ mod tests {
         );
         assert_eq!(
             h.cons.cnc.counters().append.load_acquire(),
-            6048,
+            6080,
             "a refused command appends nothing"
         );
 
@@ -24911,14 +24911,14 @@ mod tests {
             "election did not complete"
         );
         let append = h.cons.cnc.counters().append.load_acquire();
-        assert_eq!(append, 6048, "NewTerm frame must sit at [6016, 6048)");
+        assert_eq!(append, 6080, "NewTerm frame must sit at [6016, 6080)");
         assert_eq!(h.cons.cnc.counters().commit.load_acquire(), 0);
         // Own archive covers the full append (feeds the tracker's own-durable).
         h.cons.feed(Event::DurableAdvanced { durable: append });
 
         // A forged/corrupt CURRENT-term report far beyond our append. Unguarded
-        // it would rank {own=6048, 2^40, 0} -> 2nd highest = 2^40 -> bounded by
-        // own = 6048 -> a PHANTOM commit of the whole log on leader-only
+        // it would rank {own=6080, 2^40, 0} -> 2nd highest = 2^40 -> bounded by
+        // own = 6080 -> a PHANTOM commit of the whole log on leader-only
         // durability. Guarded: dropped whole + counted, commit stays 0.
         {
             let dt = h.cons.sm.term_at(1 << 40);
@@ -25068,7 +25068,7 @@ mod tests {
         assert!(h.gate_open());
         assert_eq!(
             h.cons.cnc.counters().append.load_acquire(),
-            6048,
+            6080,
             "NewTerm frame appended only after the cut"
         );
         assert_eq!(h.cons.pending_leader_open, None);
@@ -25304,8 +25304,8 @@ mod tests {
 
     /// Drive the harness node (id 1, boot term 2) to a SERVING leader of term 3:
     /// election timeout → candidate; one peer grant → BecomeLeader (NewTerm frame
-    /// at [6016, 6048)); then advance commit past the frame via a follower's
-    /// durable Report, which opens `can_serve`. Returns the append frontier 6048.
+    /// at [6016, 6080)); then advance commit past the frame via a follower's
+    /// durable Report, which opens `can_serve`. Returns the append frontier 6080.
     fn drive_to_serving_leader(h: &mut Harness) -> u64 {
         h.cons.feed(Event::Tick { now_ns: 301 });
         h.cons.feed(Event::Vote {
@@ -25324,7 +25324,7 @@ mod tests {
             "election did not complete"
         );
         let append = h.cons.cnc.counters().append.load_acquire();
-        assert_eq!(append, 6048);
+        assert_eq!(append, 6080);
         h.cons.feed(Event::DurableAdvanced { durable: append });
         // Member 0's address as THIS harness knows it — `harness_with_crypto`
         // may have replaced it with a real bound socket, and a Report from an

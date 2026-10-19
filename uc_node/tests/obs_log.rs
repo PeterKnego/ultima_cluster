@@ -24,8 +24,9 @@ use uc_node::{Node, NodeConfig};
 
 /// On-wire size of a 96 B-payload message frame (32 B header + 96 B).
 const FRAME: u64 = 128;
-/// On-wire size of the header-only NewTerm frame that opens a leadership term.
-const NEW_TERM: u64 = 32;
+/// On-wire size of the NewTerm frame that opens a leadership term (32 B header
+/// + 8 B reserved body, aligned to 64).
+const NEW_TERM: u64 = 64;
 /// Payload every submit carries.
 const PAYLOAD: usize = 96;
 

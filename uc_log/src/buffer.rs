@@ -21,7 +21,8 @@ use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use uc_protocol::v2::frame::{
     self, CLUSTER_BODY_PREFIX_LEN, ClusterKind, FRAME_TYPE_CLUSTER, FRAME_TYPE_MESSAGE,
     FRAME_TYPE_NEW_TERM, FRAME_TYPE_PADDING, FRAME_TYPE_SNAPSHOT, FRAME_TYPE_TIMER, FrameHeader,
-    HEADER_LEN, TIMER_BODY_LEN, TimerBody, align_frame_len, write_cluster_prefix,
+    HEADER_LEN, NEW_TERM_BODY_LEN, TIMER_BODY_LEN, TimerBody, align_frame_len,
+    write_cluster_prefix, write_new_term_body,
 };
 
 use crate::cnc::CncPage;
@@ -719,15 +720,16 @@ impl Appender {
         Ok(frame_pos)
     }
 
-    /// Append the header-only `FRAME_TYPE_NEW_TERM` no-op frame that opens a
-    /// leadership term (spec §6, M4): 32 bytes, stamped with this appender's
-    /// leadership term, zero payload. The data plane streams it like any frame,
+    /// Append the `FRAME_TYPE_NEW_TERM` no-op frame that opens a leadership
+    /// term (spec §6, M4): a 32 B header plus the 8-byte reserved zero body
+    /// (wire-level spec §3.5), 64 B aligned, stamped with this appender's
+    /// leadership term. The data plane streams it like any frame,
     /// the archive's term-observation walk records `(term, base)` at its
     /// position, and its quorum commit is what gates the new leader's serving
     /// (Raft §5.4.2). Returns its position. Same wrap/overrun discipline as
     /// `append`.
     pub fn append_new_term(&mut self) -> Result<u64, AppendError> {
-        let total = HEADER_LEN; // header-only no-op frame
+        let total = HEADER_LEN + NEW_TERM_BODY_LEN; // header + reserved zero body
         let aligned = align_frame_len(total) as u64;
         let b = &self.buffer;
 
@@ -773,6 +775,11 @@ impl Appender {
                     time_ns,
                 },
             );
+            let body = std::slice::from_raw_parts_mut(
+                b.region.ptr_at(foff + HEADER_LEN),
+                NEW_TERM_BODY_LEN,
+            );
+            write_new_term_body(body);
         }
         b.commit_word(foff).store(total as u32, Ordering::Release);
 
@@ -1028,8 +1035,8 @@ mod tests {
     use uc_protocol::v2::frame::{
         CLUSTER_BODY_PREFIX_LEN, ClusterKind, FLAG_SNAPSHOT_STANDBY, FLAG_TIMER_TABLE,
         FRAME_TYPE_CLUSTER, FRAME_TYPE_MESSAGE, FRAME_TYPE_NEW_TERM, FRAME_TYPE_PADDING,
-        FRAME_TYPE_SNAPSHOT, FRAME_TYPE_TIMER, HEADER_LEN, TIMER_BODY_LEN, TimerBody,
-        read_cluster_prefix, read_header, read_timer_body,
+        FRAME_TYPE_SNAPSHOT, FRAME_TYPE_TIMER, HEADER_LEN, NEW_TERM_BODY_LEN, TIMER_BODY_LEN,
+        TimerBody, read_cluster_prefix, read_header, read_timer_body,
     };
 
     const CAP: u64 = 4096;
@@ -1121,22 +1128,24 @@ mod tests {
     }
 
     #[test]
-    fn append_new_term_is_header_only_32_bytes() {
+    fn append_new_term_carries_a_zero_reserved_body() {
         let (b, c) = buf();
         let mut a = Appender::new(Arc::clone(&b), 7, 0);
         let pos = a.append_new_term().unwrap();
         assert_eq!(pos, 0);
-        assert_eq!(a.position(), 32, "the NewTerm frame is header-only (32 B)");
-        assert_eq!(c.counters().append.load_acquire(), 32);
+        assert_eq!(a.position(), 64, "the NewTerm frame is 40 B, aligned to 64");
+        assert_eq!(c.counters().append.load_acquire(), 64);
         let s = b.recordable_slice(0, 1 << 20).unwrap();
-        assert_eq!(s.len(), 32);
+        assert_eq!(s.len(), 64);
         let h = read_header(s);
-        assert_eq!(h.length, HEADER_LEN as u32);
+        assert_eq!(h.length, (HEADER_LEN + NEW_TERM_BODY_LEN) as u32);
+        assert_eq!(h.length, 40);
         assert_eq!(h.frame_type, FRAME_TYPE_NEW_TERM);
         assert_eq!(h.leadership_term_id, 7);
-        // a data frame after it opens exactly at base + 32
+        assert_eq!(&s[HEADER_LEN..HEADER_LEN + NEW_TERM_BODY_LEN], &[0u8; 8]);
+        // a data frame after it opens exactly at base + 64
         let dpos = a.append(1, 0, &[0u8; 64]).unwrap();
-        assert_eq!(dpos, 32);
+        assert_eq!(dpos, 64);
     }
 
     #[test]
@@ -1305,11 +1314,11 @@ mod tests {
         let (b, _c) = buf();
         let mut a = Appender::new(Arc::clone(&b), 1, 0);
         a.append(1, 0, &[0u8; 64]).unwrap(); // frame 1: 96 B at offset 0
-        a.append_new_term().unwrap(); // frame 2: 32 B header-only at offset 96
-        assert_eq!(a.position(), 128, "committed region is exactly [0, 128)");
+        a.append_new_term().unwrap(); // frame 2: 64 B (40 B + align) at offset 96
+        assert_eq!(a.position(), 160, "committed region is exactly [0, 160)");
         // Poison frame 2's length word to a nonzero sub-HEADER_LEN value. It is
-        // the LAST word in [0, append), so end(96) + align(1)=32 == hard(128)
-        // does NOT trip the overrun disjunct.
+        // the LAST word in [0, append), so end(96) + align(1)=32 < hard(160)
+        // does NOT trip the overrun disjunct (96 + 32 <= 160).
         b.commit_word(96).store(1, Ordering::Release);
         let err = b.recordable_slice(0, 1 << 20).unwrap_err();
         assert_eq!(err.claimed_len, 1);
@@ -1318,7 +1327,7 @@ mod tests {
             "the first, intact frame was walked before the tear"
         );
         assert_eq!(err.from, 0);
-        assert_eq!(err.append, 128);
+        assert_eq!(err.append, 160);
     }
 
     #[test]

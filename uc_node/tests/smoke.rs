@@ -90,8 +90,8 @@ fn instance_dir_lock_and_cnc_publication() {
         uc_protocol::v2::cnc::NODE_FLAG_LEADER
     );
     assert_eq!(cnc.status().term.load_acquire(), 1);
-    // can_serve implies the 32-byte NewTerm frame committed (§5.4.2).
-    assert!(cnc.counters().commit.load_acquire() >= 32);
+    // can_serve implies the 64-byte NewTerm frame committed (§5.4.2).
+    assert!(cnc.counters().commit.load_acquire() >= 64);
 
     // The shared-memory ring files exist (created fresh at boot).
     assert!(dir.path().join("ingress.ring").exists());
@@ -147,7 +147,7 @@ fn single_node_cluster_elects_itself_and_serves() {
             std::thread::yield_now();
         }
     };
-    assert!(end > 32); // NewTerm frame (32 B) + data
+    assert!(end > 64); // NewTerm frame (64 B) + data
     node.stop();
 
     // Obligation 1 pin (persist ordering): the self-vote landed durably — a

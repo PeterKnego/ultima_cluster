@@ -903,7 +903,11 @@ pub fn uc_protocol_log_frame() -> Vec<Seed> {
     vec![
         Seed::fixed("01-message", header(FRAME_TYPE_MESSAGE, HEADER_LEN as u32 + 64)),
         Seed::fixed("02-padding", header(FRAME_TYPE_PADDING, HEADER_LEN as u32)),
-        Seed::fixed("03-new-term", header(FRAME_TYPE_NEW_TERM, HEADER_LEN as u32)),
+        Seed::fixed("03-new-term", {
+            let mut f = header(FRAME_TYPE_NEW_TERM, (HEADER_LEN + 8) as u32);
+            f.extend_from_slice(&[0u8; 8]);
+            f
+        }),
         Seed::fixed("04-cluster", header(FRAME_TYPE_CLUSTER, HEADER_LEN as u32 + 32)),
         Seed::fixed("05-length-max", header(FRAME_TYPE_MESSAGE, u32::MAX)),
         Seed::fixed("06-length-zero", header(FRAME_TYPE_MESSAGE, 0)),

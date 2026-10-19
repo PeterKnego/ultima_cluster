@@ -22,7 +22,7 @@
 //! * **4 MiB ring, no wrap.** The largest phase writes ~256 KiB of frames; a
 //!   4 MiB ring never wraps within a test, so positions are exactly
 //!   contiguous: every 96 B submit is one 128 B frame ([`FRAME`]) and the
-//!   NewTerm frame is 32 B ([`NEW_TERM`]). That makes commit/durable targets
+//!   NewTerm frame is 64 B ([`NEW_TERM`]). That makes commit/durable targets
 //!   exact arithmetic rather than guesswork.
 //! * **Election timeouts 150–300 ms**, per-node seeds derived from the node
 //!   index, so exactly one node times out first on a clean boot.
@@ -47,8 +47,9 @@ use uc_node::{Node, NodeConfig};
 /// 32 B-aligned). The harness submits exactly 96 B payloads so each commit step
 /// is this many bytes.
 const FRAME: u64 = 128;
-/// On-wire size of the header-only NewTerm frame that opens a leadership term.
-const NEW_TERM: u64 = 32;
+/// On-wire size of the NewTerm frame that opens a leadership term (32 B header
+/// + 8 B reserved body, aligned to 64).
+const NEW_TERM: u64 = 64;
 /// Payload every submit carries (96 B, see [`FRAME`]).
 const PAYLOAD: usize = 96;
 
@@ -485,7 +486,7 @@ fn partition(a: &NodeH, b: &NodeH) {
 
 /// Test 1 (+ review addition 6): three nodes from nothing elect exactly one
 /// leader in a low term, the serving gate only opens once the NewTerm frame is
-/// quorum-committed (commit ≥ base + 32), 1000 messages commit on ALL nodes,
+/// quorum-committed (commit ≥ base + 64), 1000 messages commit on ALL nodes,
 /// and every journal replays byte-identically.
 #[test]
 fn boot_elects_exactly_one_leader_and_commits() {
@@ -495,7 +496,7 @@ fn boot_elects_exactly_one_leader_and_commits() {
     let leader = await_single_leader(&c.nodes, 30);
     // Review addition 6 — serving gate requires quorum commit of the new term:
     // at the moment can_serve first turned true, commit already covers the
-    // NewTerm frame's END. Boot term base is 0, so commit ≥ 0 + 32. The quorum
+    // NewTerm frame's END. Boot term base is 0, so commit ≥ 0 + 64. The quorum
     // round-trip (unlike the single-node smoke) makes this a real 2-of-3 commit.
     assert!(
         c.nodes[leader].commit() >= NEW_TERM,
@@ -504,7 +505,7 @@ fn boot_elects_exactly_one_leader_and_commits() {
     let term = c.nodes[leader].term();
     assert!((1..=5).contains(&term), "unexpected boot term {term}");
 
-    // The NewTerm frame sits at [0, 32); 1000 data frames follow contiguously.
+    // The NewTerm frame sits at [0, 64); 1000 data frames follow contiguously.
     let target = NEW_TERM + 1000 * FRAME;
     submit_n(&c.nodes[leader], 1000);
     await_all(&c.nodes, target, 60, "commit", NodeH::commit);
@@ -696,7 +697,7 @@ fn drive_minority_partition(c: &mut Cluster, phantom: u64, fresh: u64) -> (usize
 
     // The majority (the two followers) elects a new leader and commits fresh
     // data. Its base is the committed frontier at partition time (`pre`); it
-    // opens term N+1 with a NewTerm frame there, so its serving commit ≥ pre+32.
+    // opens term N+1 with a NewTerm frame there, so its serving commit ≥ pre+64.
     let new = await_serving_among(&c.nodes, &followers, 30);
     let new_base = pre; // where the new leader's NewTerm frame sits
     submit_n(&c.nodes[new], fresh);
