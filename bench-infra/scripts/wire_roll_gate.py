@@ -4,7 +4,7 @@
 One row, FUNCTIONAL clauses only, NO rate bar:
   level         every node's `uc2_wire_level` ends at 13
   gaps          each node restart's longest commit stall <= ROW_COMMIT_GAP_BAR_SECS
-  linearizable  the load's history is linearizable (`m12_gate check-fsms`)
+  fsm_agreement FSM state agrees across nodes after the roll (`m12_gate check-fsms`)
 
 For 2.15.0 the "old" side is the SAME tree built with `--features
 wire-level-override` and run with UC2_WIRE_RANGE=12,12; the roll restarts one
@@ -18,7 +18,9 @@ Run by the maintainer on the fleet; nothing here runs against AWS on import.
 Exit codes: 0 PASS, 1 FAIL, 2 argparse usage.
 """
 import argparse
+import os
 import re
+import threading
 import shlex
 import subprocess
 import sys
@@ -38,14 +40,13 @@ APP_ID = "uc2-wire-roll"
 GATE_FLAGS = "wire-level-override"
 
 
-def verdict_row_roll(level_by_node_final, gaps_secs, linearizable):
+def verdict_row_roll(level_by_node_final, gaps_secs, fsm_agreement):
     """Functional clauses only (spec §6.4): every node ends at the target
-    level, no restart stalled commit past the bar, and the load's history is
-    linearizable. No rate bar."""
+    level, no restart stalled commit past the bar, and the FSMs agree after the roll. No rate bar."""
     clauses = {
         "level": all(v == 13 for v in level_by_node_final.values()),
         "gaps": max(gaps_secs, default=0.0) <= ROW_COMMIT_GAP_BAR_SECS,
-        "linearizable": bool(linearizable),
+        "fsm_agreement": bool(fsm_agreement),
     }
     return ("PASS" if all(clauses.values()) else "FAIL"), clauses
 
@@ -56,13 +57,18 @@ def selftest():
     check("pass", verdict_row_roll({0: 13, 1: 13, 2: 13}, [1.2, 0.8, 2.9], True)[0], "PASS")
     check("holdout", verdict_row_roll({0: 13, 1: 12, 2: 13}, [1.0], True)[0], "FAIL")
     check("gap", verdict_row_roll({0: 13, 1: 13, 2: 13}, [6.0], True)[0], "FAIL")
-    check("lin", verdict_row_roll({0: 13, 1: 13, 2: 13}, [], False)[0], "FAIL")
+    check("agreement", verdict_row_roll({0: 13, 1: 13, 2: 13}, [], False)[0], "FAIL")
+    check("stall monotone", longest_stall([(i * 1.0, i) for i in range(5)]), 0.0)
+    check("stall flat", longest_stall([(0.0, 1), (1.0, 2), (2.0, 2), (3.0, 2), (4.0, 2), (5.0, 3)]), 3.0)
+    check("stall empty", longest_stall([]), float("inf"))
     print("selftest OK")
 
 
 def longest_stall(samples):
     """Longest wall interval over which the commit position did not move.
     `samples` = [(t_seconds, position)] in time order."""
+    if not samples:
+        return float("inf")
     best, since, prev = 0.0, None, None
     for t, p in samples:
         if prev is None or p != prev:
@@ -136,18 +142,33 @@ def wait_cluster_agent(h, secs=60):
     return False
 
 
-def sample_commit(observer, secs):
-    """Sample `uc2_commit_position` on a surviving node for `secs`, as
-    fast as ssh scrapes allow (target 100 ms; a scrape's round trip bounds the
-    resolution, which is far below the 5 s bar)."""
-    jg, _, _, _ = _mods()
-    out, t0 = [], time.time()
-    while time.time() - t0 < secs:
-        v = jg.read_gauge(jg.scrape_prom(observer, label="gap"), "uc2_commit_position")
-        if v is not None:
-            out.append((time.time() - t0, int(v)))
-        time.sleep(SAMPLE_PERIOD_SECS)
-    return out
+class CommitSampler(threading.Thread):
+    """Scrapes `uc2_commit_position` on every surviving node each tick and
+    records the MAX, from construction-time start until `stop()`. Start it
+    BEFORE the kill so the whole stall window is observed. Resolution is one
+    ssh-scrape tick (~1 s for two sequential scrapes)."""
+
+    def __init__(self, observers):
+        super().__init__(daemon=True)
+        self.observers, self.samples, self._stop_ev = observers, [], threading.Event()
+        self.t0 = time.time()
+
+    def run(self):
+        jg, _, _, _ = _mods()
+        while not self._stop_ev.is_set():
+            vals = []
+            for o in self.observers:
+                v = jg.read_gauge(jg.scrape_prom(o, label="gap"), "uc2_commit_position")
+                if v is not None:
+                    vals.append(int(v))
+            if vals:
+                self.samples.append((time.time() - self.t0, max(vals)))
+            self._stop_ev.wait(SAMPLE_PERIOD_SECS)
+
+    def stop(self):
+        self._stop_ev.set()
+        self.join(timeout=30)
+        return self.samples
 
 
 def run_roll(hosts, args):
@@ -199,13 +220,14 @@ def run_roll(hosts, args):
     print(f"INFO [ssh {lg.public_ip}] {lcmd}   (load for the whole roll)", flush=True)
     load = subprocess.Popen(lg.ssh + [lg.target, lcmd], text=True,
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-    gaps = []
+    gaps, levels, load_died = [], {}, False
     try:
         time.sleep(m12.EDGE_SETTLE_SECS + m14.WARMUP_SECS)
         # 4. roll: kill, restart at 12,13, wait for the cluster agent, and
         #    sample commit on a node that is NOT the one restarting.
         for i, h in enumerate(nodes):
-            observer = nodes[(i + 1) % len(nodes)]
+            sampler = CommitSampler([n for j, n in enumerate(nodes) if j != i])
+            sampler.start()
             for u in (UNIT_EDGE, UNIT_SVC):
                 m12.kill_unit(gnodes[i], u)
             m12.kill_unit(h, UNIT_NODE)
@@ -213,7 +235,8 @@ def run_roll(hosts, args):
             ok = wait_cluster_agent(h)
             print(f"INFO roll n{i}: cluster agent {'alive' if ok else 'NOT alive'}", flush=True)
             start_load_side(gnodes[i], gnodes[i], edge_members)
-            samples = sample_commit(observer, args.per_node_secs)
+            time.sleep(SAMPLE_PERIOD_SECS)
+            samples = sampler.stop()
             gap = longest_stall(samples) if ok else float("inf")
             print(f"INFO roll n{i}: {len(samples)} commit samples, longest stall {gap:.2f}s", flush=True)
             gaps.append(gap)
@@ -230,7 +253,8 @@ def run_roll(hosts, args):
             time.sleep(1.0)
     finally:
         # 6. stop the load; read the linearizability verdict.
-        if load.poll() is None:
+        load_died = load.poll() is not None
+        if not load_died:
             load.terminate()
         try:
             load.communicate(timeout=30)
@@ -238,9 +262,13 @@ def run_roll(hosts, args):
             load.kill()
     leader_h = gnodes[0]
     rc, out = m12.run_foreground(leader_h, ["check-fsms", "--instance-dir", leader_h.dir,
-                                            "--app-id", APP_ID, "--mode", "linearizable"], timeout=90)
-    linearizable = rc == 0 and re.search(r"^FSMS-OK\s", out, re.M) is not None
-    verdict, clauses = verdict_row_roll(levels, gaps, linearizable)
+                                            "--app-id", APP_ID, "--mode", "linearizable"]  # per-node FSM agreement, not a history verdict
+    , timeout=90)
+    agreement = rc == 0 and re.search(r"^FSMS-OK\s", out, re.M) is not None
+    if load_died:
+        print("FAIL: client-remote exited before the roll ended; no load was applied", flush=True)
+        agreement = False
+    verdict, clauses = verdict_row_roll(levels, gaps, agreement)
     print_table(verdict, clauses, levels, gaps)
     for h in nodes:
         m12.kill_unit(h, UNIT_NODE)
@@ -257,7 +285,7 @@ def print_table(verdict, clauses, levels, gaps):
         ("level", f"all nodes == {TARGET_LEVEL}", str(levels)),
         ("gaps", f"max gap <= {ROW_COMMIT_GAP_BAR_SECS}s",
          f"{[round(g, 2) for g in gaps]}"),
-        ("linearizable", "check-fsms linearizable OK", str(clauses["linearizable"])),
+        ("fsm_agreement", "check-fsms OK after roll", str(clauses["fsm_agreement"])),
     ]
     for name, bar, obs in rows:
         print(f"{name:<14}{bar:<30}{obs:<28}{'ok' if clauses[name] else 'FAIL'}")
@@ -272,7 +300,7 @@ def main():
                     help="local checkout to sync and build (default: this repo)")
     ap.add_argument("--hosts", default="", help="pub/priv,... x4 (else terraform output)")
     ap.add_argument("--ssh-user", default="ubuntu")
-    ap.add_argument("--ssh-key", default="/home/claude/.ssh/id_ed25519")
+    ap.add_argument("--ssh-key", default=os.path.expanduser("~/.ssh/id_ed25519"))
     ap.add_argument("--uc-node-bin", default=None, help="uc2-node path on the hosts")
     ap.add_argument("--per-node-secs", type=int, default=30,
                     help="commit sampling window after each node restart")
