@@ -958,11 +958,14 @@ mid-roll. Every node's cnc `wire_level` word must still read 12 while a
 `[12,12]` member remains, and all three must read 13 within 30 s of the last
 roll (the leader raises on its own); the history across the whole roll is
 `Linearizable`. The old binary, started afterwards on node 2's directory, must
-be refused by name — `WireLevelAboveBinary` on its stderr and a non-zero exit
-within 20 s. The node bin honours `UC2_WIRE_RANGE` only when the crate is built
-with `wire-level-override`, so the test is gated on both features. From
-`2.16.0` on, `UC2_BASE_NODE_BIN` points the old side at the previous release's
-`uc_crashtest-node`.
+be refused by name — `WireLevelAboveBinary` on its stderr and exit status 1
+(the cluster agent's fail-stop exit) within 20 s. The node bin honours
+`UC2_WIRE_RANGE` only when the crate is built with `wire-level-override`, so
+the test is gated on both features. From `2.16.0` on, `UC2_BASE_NODE_BIN`
+points the old side at the previous release's `uc_crashtest-node` — but the
+test's `OLD`/`NEW` ranges are the literal `12,12`/`12,13` (and the raise it
+waits for is to 13), so it cannot pass against any real base binary until
+those are parameterized.
 
 | test | file | what it drives |
 |---|---|---|

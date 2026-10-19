@@ -5,19 +5,103 @@ stop every node, verify they agree on what they hold, swap the binary, start
 everyone back up, and confirm one leader is serving again before declaring
 success.
 
-## Why this is a flag day, not a rolling restart
+Since `2.15.0` a cluster can also be upgraded **one node at a time under
+load**, when the new release's wire minor is within one level of the
+cluster's: see [Rolling upgrades since 2.15.0](#rolling-upgrades-since-2150).
+The stop-all procedure below is still the one for `2.15.0` itself, for a wire
+major bump, and for any release whose notes call it a flag day.
 
-**Every node stops, upgrades, and restarts together. There is no rolling or
-partial mode.** This is not a conservative default — it follows directly from
-wire protocol 0.5.0's content-attested durable reports (see
-["Shipped in v2.3.0 — wire protocol 0.5.0"](../releases.md) in the release
-notes): a follower on an older wire version reports its durable position
-without the term it attributes to those bytes, the leader cannot count that
-report as attested, and a mixed-version cluster **stalls commits** rather
-than making an unsound one. Safe, but it means a cluster part-upgraded is a
-cluster not making progress, not a cluster running a mildly-degraded old
-version — so finish the upgrade, or fully undo it, and never leave it
-half-applied on purpose.
+## Why this was a flag day, until 2.15.0
+
+**Until `2.15.0`, every node stopped, upgraded, and restarted together.
+There was no rolling or partial mode.** That was not a conservative default —
+it followed directly from wire protocol 0.5.0's content-attested durable
+reports (see ["Shipped in v2.3.0 — wire protocol 0.5.0"](../releases.md) in
+the release notes): a follower on an older wire version reports its durable
+position without the term it attributes to those bytes, the leader cannot
+count that report as attested, and a mixed-version cluster **stalls
+commits** rather than making an unsound one. Later flag days were worse: a
+`0.8.0` through `0.10.0` peer meets the next release's new `CLUSTER` record,
+cannot decode it, drops it, and its cluster FSM **diverges in silence**. A cluster
+part-upgraded across one of those versions is a cluster not making progress,
+or one quietly disagreeing with itself — so finish such an upgrade, or fully
+undo it, and never leave it half-applied on purpose.
+
+`2.15.0` (wire `0.12.0`) gives the cluster a committed **wire level**: every
+node encodes at the level the cluster has committed, every datagram carries
+its sender's maximum level in header byte 13, and the leader raises the level
+only once every member can follow. A node one level ahead therefore runs
+beside the old ones and sends nothing they cannot parse. The argument is
+[The committed cluster wire level, explained](../notes/uc2-wire-level-explained.md).
+`2.15.0` itself is a flag day — the last one for an additive wire change —
+because a `0.11.0` node has no level to speak; see the `2.15.0` wire + cnc
+section near the end of this page.
+
+## Rolling upgrades since 2.15.0
+
+1. Check the pair is permitted: the new release's wire minor is the cluster's
+   level or one above it (`uc2ctl wire show` → `level=`; the release notes
+   name the minor). Two above: install the middle release first — this is
+   true for a stop-all upgrade too.
+2. Decide whether you want a rollback window. If yes, before the first
+   restart: `uc2ctl settings apply` a file containing `wire_raise = "manual"`.
+3. One host at a time: stop the node and every process attached to its
+   instance directory (services, clients, the gateway — a cnc minor bump means
+   they restart together, the standing per-host rule); install; start the
+   node; wait for `can_serve` (`uc2ctl status`, or `/readyz`); start the
+   services; move on. Under load, commit stalls only while a quorum re-forms.
+4. `uc2ctl wire show` on the leader after the last host: `verdict: raisable`.
+   Auto mode raises within a second; manual: `uc2ctl wire raise` — the
+   point of no return. Until then you may roll any host back.
+5. `uc2_wire_level` is the new level on every node. Done.
+
+What each step leans on:
+
+- **Step 1, the level rule.** A binary runs only while the committed level is
+  inside its range, `WIRE_MIN..WIRE_MAX`, and `WIRE_MIN` is one below
+  `WIRE_MAX` (`0.12.0`'s range is `12..12`, since nothing below it is
+  level-aware). A binary too old for the cluster stops with
+  `WireLevelAboveBinary`; one too new stops with `WireLevelBelowBinary` once
+  it has joined, and the message names the release to install first. Neither
+  needs a wipe: nothing in the instance directory is wrong. A release that
+  adds no wire feature keeps its wire minor and is always permitted.
+- **Step 2, the window.** `wire_raise = "manual"` keeps the level where it
+  is until you run `uc2ctl wire raise`; until then every node can go back to
+  the old binary, because nothing has been written that it cannot read. Set
+  it **before the first restart**: in auto mode (the default) the leader can
+  raise within a check interval of the last old node leaving, and a switch to
+  manual made after that can lose the race. The file key is flat
+  (`wire_raise = "manual"`, not a table); a file without it keeps the
+  committed mode, so the cluster's ordinary settings file needs no edit.
+  The mode persists after the raise: apply `wire_raise = "auto"` again if you
+  want the next roll to raise on its own.
+- **Step 3, the host.** A release that bumps the cnc minor (see its notes)
+  makes an older attacher refuse the newer page, so a host's node, services,
+  shmem clients and gateway restart together — the same per-host rule as
+  [2.7.0's ring change](#ring-format-change-in-270-restart-a-hosts-processes-together).
+  It is per host, so it fits inside a roll. Start the node before its
+  services: attach waits on `NodeBooting` until the node has joined.
+- **Step 4, the verdict.** `wire show` prints the verdict only on the live
+  leader, since the per-member table is the leader's. `raisable to N` is the
+  go-ahead; `holdout id=I (no report this term)` or `holdout id=I reported M`
+  names a member still on the old binary or not yet heard from — every
+  member counts, voters and learners alike, so a dead learner left in the
+  membership holds the level until `uc2ctl remove` takes it out. `uc2ctl wire
+  raise` refuses with `63 wire_holdout` in that state, and on a cluster
+  already at every member's level it answers `ok (cluster position P)` and
+  appends nothing, so it is safe to run twice. Like every `CLUSTER` command
+  it is leader-only: a follower answers `retry`.
+- **Step 5, done.** `uc2ctl status` prints `wire: level=L binary=MIN..MAX` on
+  every node, and `Uc2WireLevelBelowMembers` (30 m) has nothing left to fire
+  on.
+
+Rolling back **before** the raise is the same procedure in reverse, one host
+at a time. **After** the raise there is no rollback onto the old binary — it
+would stop with `WireLevelAboveBinary` — short of restoring a pre-upgrade
+backup on every node.
+
+The sections from here to the per-release notes are the **stop-all**
+procedure, `scripts/uc2_flag_day.sh`; a rolling upgrade needs none of them.
 
 ## Prerequisite: traffic is actually stopped
 
@@ -205,7 +289,7 @@ are added.** This is not a wire flag day — it changes nothing about the wire
 protocol, the cnc page, or what any *other* node sees — so it does not by
 itself need the whole cluster stopped together the way
 [wire crypto](encrypt-node-traffic.md) or a
-[binary upgrade past 0.5.0](#why-this-is-a-flag-day-not-a-rolling-restart)
+[binary upgrade past 0.5.0](#why-this-was-a-flag-day-until-2150)
 does. It is a **per-host config edit**, done once before that host's binary
 swap. In practice, run it during the same maintenance window as
 `scripts/uc2_flag_day.sh` anyway — you are already touching every
@@ -1315,6 +1399,73 @@ the door with `47 settings_bounds`. See
 [How to keep the journal from growing without bound § Choose a slack and
 turn purging on](bound-journal-growth.md#choose-a-slack-and-turn-purging-on).
 
+## Wire + cnc change in 2.15.0: the wire level (`0.12.0`, cnc `3.5`)
+
+The committed cluster wire level, shipped in `2.15.0`
+([#31](https://github.com/PeterKnego/ultima_cluster/issues/31)). It is what
+makes [rolling upgrades](#rolling-upgrades-since-2150) possible from here on,
+and getting onto it is **one more stop-all flag day** — the last one for an
+additive wire change. The reasoning is
+[the explainer](../notes/uc2-wire-level-explained.md); the design is
+[the spec](../superpowers/specs/2026-10-19-uc2-wire-level-design.md) (read its
+errata block first).
+
+**Wire `0.11.0` → `0.12.0`.** Three changes, none of them a length change on
+the replication path:
+
+- **Datagram header byte 13 is `wire`.** It was a `flags` byte, always `0`
+  and read by nobody; every datagram now carries its sender's `WIRE_MAX`
+  there (`12` for every `0.12.0` binary), inside the 16 bytes crypto
+  authenticates as AAD. A receiver checks it before reading anything else and
+  accepts `[WIRE_MIN, WIRE_MAX + 1]`, which for `0.12.0` is `12..=13`.
+- **`Settings` version 7** (`CLUSTER` kind 3, 49 B) appends `wire_level u8
+  @47` and `wire_raise u8 @48` (`0` keep, `1` auto, `2` manual). An encoder
+  writes version 7; versions 1–6 still decode, and decode as level 12 with
+  auto raise, so a `2.14.0` cluster artifact and a fresh genesis read the
+  same value. The cluster image version is unchanged (6): its settings blob
+  is sized by the record's own version.
+- **`NEW_TERM` gains an 8-byte body**, `wire_level u32 ‖ reserved u32`,
+  written as zeros and read by nobody — reserved for a future per-term frame
+  layout. The frame is 64 B instead of 32 B.
+
+**The first flag day a mixed cluster is REFUSED rather than misparsed.** A
+`0.11.0` node writes `0` in byte 13, so a `0.12.0` node refuses every one of
+its datagrams by name and counts it:
+`uc2_wire_datagrams_refused_total{reason="prelevel"}`, plus a `wire_refused`
+line on stderr, throttled per source. A `0.11.0` node therefore cannot
+replicate with, report to or vote for a `0.12.0` one; nothing diverges in
+silence. It is still a flag day, so **stop every node before starting any
+node**. On a crypto cluster the counter is bumped before authentication, so
+unauthenticated traffic can drive `prelevel` too; the stderr line is written
+only for a configured member.
+
+**cnc `3.4` → `3.5`, additive.** Three words: `wire_level` at page-1 offset
+`3992` (the `uc2-cluster` agent, at every `Settings` apply and install),
+`wire_binary` at `4000` (the node, once at boot, `(WIRE_MIN << 8) |
+WIRE_MAX`) and `wire_max` at peer slot `+8` (the consensus agent, on change;
+leader-authoritative, cleared when a new leader takes office). A `3.4`
+attacher refuses a `3.5` page, so a host's services, clients and gateway
+restart with its node — which the flag day does anyway.
+
+**Nothing on disk is cleared.** No `snapshots/` wipe and no artifact envelope
+change: every older `Settings` record and cluster image is read as before.
+
+**After the flag day** every node runs at level 12 with `wire_raise = auto`,
+and `uc2ctl status` prints `wire: level=12 binary=12..12`. There is nothing
+to raise until a release ships level 13. If you want your first roll to keep
+a rollback window, set `wire_raise = "manual"` with `uc2ctl settings apply`
+any time before that roll starts. `[settings]` in `node.toml` has no
+`wire_raise` key; genesis is always auto.
+
+**Three new fail-stops, all in the `uc2-cluster` agent** (the daemon exits 1
+with the name on stderr): `WireLevelAboveBinary` (the committed level is
+above this binary's max — upgrade the node), `WireLevelBelowBinary` (below
+its min, judged only once the node has joined — install the release the
+message names first) and `ClusterRecordUndecodable` (a committed `CLUSTER`
+record does not decode at the committed level — the journal is corrupt or a
+peer broke the level; restore from backup). With every node on the same
+`2.15.0` binary none of them can fire on a healthy cluster.
+
 ## Where to go next
 
 - [Configuration: Admin authentication](../reference/configuration.md#admin-authentication)
@@ -1323,7 +1474,11 @@ turn purging on](bound-journal-growth.md#choose-a-slack-and-turn-purging-on).
 - [Run a cluster on real hosts](run-a-cluster.md#what-a-planned-restart-costs)
   — what an ordinary single-node planned restart costs, for context against a
   whole-cluster flag day.
-- [Encrypt traffic between nodes](encrypt-node-traffic.md) — the other
+- [Encrypt traffic between nodes](encrypt-node-traffic.md) — another
   flag-day operation in this system, same "every node together" shape.
 - [`uc2ctl`](../reference/uc2ctl.md) — the `status` fields this script parses
   to drive its verification steps.
+- [The committed cluster wire level, explained](../notes/uc2-wire-level-explained.md)
+  — why a release within one wire level rolls, and what the raise waits for;
+  [`uc2ctl wire show` / `wire raise`](../reference/uc2ctl.md#wire-show) are
+  the two verbs a roll uses.

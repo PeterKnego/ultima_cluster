@@ -437,6 +437,13 @@ at scrape time:
 - `uc2_wire_binary_min` / `uc2_wire_binary_max` — the range this binary
   speaks (`WIRE_MIN`..`WIRE_MAX`), from the page word boot wrote. `min by ()
   (uc2_wire_binary_max)` over the fleet is the level a roll can raise to.
+  Two readings to know. A node scraped before boot wrote the word reports
+  `0`/`0`; it is transient, gone once boot has written the word, but while
+  it lasts it drags the fleet minimum to `0` and holds the alert off. And a pre-level (`0.11.0`)
+  node exports no `uc2_wire_binary_max` at all, so `min()` simply skips it:
+  `Uc2WireLevelBelowMembers` can fire as though every member could rise
+  while that node is the real holdout. `uc2ctl wire show` on the leader
+  names it either way.
 - `uc2_wire_member_max{peer}` — each member's reported `WIRE_MAX` as the
   **leader** sees it; `0` means no report this term, and a follower exports
   zeros. A peer sitting at `0` on the leader is the holdout `uc2ctl wire

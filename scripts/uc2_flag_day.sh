@@ -10,7 +10,9 @@
 # A cluster runs all-encrypted or all-cleartext, and (wire protocol 0.5.0) a
 # mixed-version cluster STALLS commits rather than making unsound ones — so
 # this is a flag day: every node stops, upgrades, and restarts together.
-# There is no rolling/partial mode.
+# This script has no rolling/partial mode. Stop-all; for a rolling upgrade
+# since 2.15.0 (a release within one wire level of the cluster's) see
+# docs/how-to/upgrade-a-cluster.md § Rolling upgrades since 2.15.0.
 #
 # The ABORT PATH IS LOAD-BEARING: once nodes are stopped, any failure this
 # script detects on the way back up (durable mismatch at step 3, a failed

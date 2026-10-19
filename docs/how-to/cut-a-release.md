@@ -26,6 +26,19 @@ documentation for what it changes, because the tag is what people read.
       fixed bugs; an optional bullet for performance, linking the gate doc.
       Detail goes in `docs/releases.md`, not here.
 - [ ] The matching per-release entry in `docs/releases.md`.
+- [ ] **A release that bumps the wire minor** (a new wire level, since
+      `2.15.0`): exactly one `if level >= N` gate per feature, the previous
+      level's gate deleted as always-true (its encoders go with it; every
+      decoder stays), a new golden corpus for level N beside the old one
+      (`uc_protocol/tests/golden_level12.rs` is the model — never edit an
+      older level's file), and the two-binary rolling crashtest run with
+      `UC2_BASE_NODE_BIN` naming the previous release's `uc_crashtest-node`
+      (`testing/uc_crashtest/tests/rolling_upgrade.rs`; its `OLD`/`NEW`
+      ranges are still the literal `12,12`/`12,13`, so parameterize them
+      first — until then it cannot pass against any real base binary). A
+      release that adds no wire feature keeps the wire minor and needs none
+      of this. The rule is
+      [the semver policy's level rule](../reference/semver-policy.md#the-wire-and-the-cnc-page-are-flag-day-not-semver).
 - [ ] A sweep of `QUICKSTART.md`, `docs/how-to/`, `docs/reference/` for
       statements this release invalidated. Upgrade consequences that refuse to
       start an old config (v2.6.0's `[crypto]`/`[admin]` sections, for

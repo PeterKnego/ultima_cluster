@@ -10,8 +10,8 @@ self-locating header is in [Architecture](../ARCHITECTURE.md).
 
 | Constant | Value |
 |---|---|
-| `version::CURRENT` | `0.7.0` (`0.8.0`, since `2.12.0`, two new pairwise kinds for jumbo-frame MTU discovery, `PROBE` (24) and `PROBE_ACK` (25); no existing layout changes) (`0.9.0`, since `2.13.0`, two `CLUSTER` kinds, 4 and 5, and one pairwise datagram kind, `SNAP_REPORT` (26), no layout change; a 0.8.0 peer applies either as undecodable and its cluster FSM silently diverges — stop every node before starting any) (`0.10.0`, #33, never released on its own — folded into `0.11.0`: one `CLUSTER` kind, 6 `RowGenesis`, no layout change; a 0.9.0 peer refuses it as undecodable and its cluster FSM silently diverges — never learns the row's running version — so again stop every node before starting any) (`0.11.0`, the snapshot catalog, since `2.14.0`: `STATUS`'s body 16 B → 144 B, `SNAP_REPORT`/`SnapshotReport` admits row 255, `Settings` grows to version 3 with `retain_sets`, no existing layout change; the snapshot lifecycle joins the same flag day: the `SNAP_REPORT` body grows 24 B → 32 B (`size u64 @24`), the `SnapshotReport` entries grow to 20 B (`node_id ‖ hash ‖ size`), and `Settings` grows to version 4 (36 B, `auto_fetch u8 @35`); there is no wire-version word on node↔node datagrams, so a 0.11.0 leader DROPS a 0.10.0 follower's 16 B `STATUS` (counted, `uc2_status_refused_total` / `status_refused`) and replication to that follower stalls, a 0.10.0 leader accepts a 144 B body and ignores the tail, and a 0.10.0 peer applies the row-255 report and the wider `Settings` record as undecodable, silently diverging — stop every node before starting any; the backup tier joins the same flag day too: `CLUSTER` kind 7 `BackupWatermark`, pairwise kinds 27 `BACKUP_REPORT`, 28 `TIER_INSTALL` and 29 `TIER_INSTALL_STATUS`, and `Settings` versions 5 and 6, which an older peer drops or applies as undecodable) |
-| cnc page version | 3.1 (FSM identity + log time, 2.11.0: the name + hash line at boot, the version word at attach, `log_time_ns`, per-row `timers_pending`) (3.2, since `2.12.0`, a live `payload_ceiling` word) (3.3, since `2.13.0`, five new words: four node-written on the service status line — `upgrade_origin` (`+16`), `pinned_version` (`+24`), the seqlock word `pin_seq` (`+32`) that publishes the first two as a pair, and `pinned_from` (`+40`) — plus one **service**-written word on slot line 7, `artifact_hash` (`+504`), which fills that line) (3.4, #33, three node-written words: `running_version` (`+48`) and `running_record_pos` (`+56`) on the service status line, under the same `pin_seq` seqlock, which fills that line; and `cluster_applied` at page-1 offset `4056`; later in the same 3.4 (`2.14.0`): `write_reserve` at page offset `264` (#78), the start-set pair at slot `+264`/`+272` (the snapshot lifecycle) and the `query.ring` flag `FLAG_V2_MIN_POSITION` (read-your-writes)) |
+| `version::CURRENT` | `0.7.0` (`0.8.0`, since `2.12.0`, two new pairwise kinds for jumbo-frame MTU discovery, `PROBE` (24) and `PROBE_ACK` (25); no existing layout changes) (`0.9.0`, since `2.13.0`, two `CLUSTER` kinds, 4 and 5, and one pairwise datagram kind, `SNAP_REPORT` (26), no layout change; a 0.8.0 peer applies either as undecodable and its cluster FSM silently diverges — stop every node before starting any) (`0.10.0`, #33, never released on its own — folded into `0.11.0`: one `CLUSTER` kind, 6 `RowGenesis`, no layout change; a 0.9.0 peer refuses it as undecodable and its cluster FSM silently diverges — never learns the row's running version — so again stop every node before starting any) (`0.11.0`, the snapshot catalog, since `2.14.0`: `STATUS`'s body 16 B → 144 B, `SNAP_REPORT`/`SnapshotReport` admits row 255, `Settings` grows to version 3 with `retain_sets`, no existing layout change; the snapshot lifecycle joins the same flag day: the `SNAP_REPORT` body grows 24 B → 32 B (`size u64 @24`), the `SnapshotReport` entries grow to 20 B (`node_id ‖ hash ‖ size`), and `Settings` grows to version 4 (36 B, `auto_fetch u8 @35`); there is no wire-version word on node↔node datagrams, so a 0.11.0 leader DROPS a 0.10.0 follower's 16 B `STATUS` (counted, `uc2_status_refused_total` / `status_refused`) and replication to that follower stalls, a 0.10.0 leader accepts a 144 B body and ignores the tail, and a 0.10.0 peer applies the row-255 report and the wider `Settings` record as undecodable, silently diverging — stop every node before starting any; the backup tier joins the same flag day too: `CLUSTER` kind 7 `BackupWatermark`, pairwise kinds 27 `BACKUP_REPORT`, 28 `TIER_INSTALL` and 29 `TIER_INSTALL_STATUS`, and `Settings` versions 5 and 6, which an older peer drops or applies as undecodable) (`0.12.0`, the wire level, since `2.15.0`: datagram header byte 13 becomes `wire`, the sender's `WIRE_MAX`, checked on every receive path below; `Settings` grows to version 7 (49 B, `wire_level`/`wire_raise`); `NEW_TERM` gains an 8-byte zero body; a `0.11.0` peer writes `0` there and is **refused by name and counted** (`prelevel`) — the last flag day for an additive change, after which a wire **minor** is a level that rolls and a **major** is a flag day) |
+| cnc page version | 3.1 (FSM identity + log time, 2.11.0: the name + hash line at boot, the version word at attach, `log_time_ns`, per-row `timers_pending`) (3.2, since `2.12.0`, a live `payload_ceiling` word) (3.3, since `2.13.0`, five new words: four node-written on the service status line — `upgrade_origin` (`+16`), `pinned_version` (`+24`), the seqlock word `pin_seq` (`+32`) that publishes the first two as a pair, and `pinned_from` (`+40`) — plus one **service**-written word on slot line 7, `artifact_hash` (`+504`), which fills that line) (3.4, #33, three node-written words: `running_version` (`+48`) and `running_record_pos` (`+56`) on the service status line, under the same `pin_seq` seqlock, which fills that line; and `cluster_applied` at page-1 offset `4056`; later in the same 3.4 (`2.14.0`): `write_reserve` at page offset `264` (#78), the start-set pair at slot `+264`/`+272` (the snapshot lifecycle) and the `query.ring` flag `FLAG_V2_MIN_POSITION` (read-your-writes)) (3.5, the wire level, `2.15.0`: `wire_level` at page-1 offset `3992` (the `uc2-cluster` agent), `wire_binary` at `4000` (the node, at boot, `(WIRE_MIN << 8) \| WIRE_MAX`) and `wire_max` at peer slot `+8` (the consensus agent, leader-authoritative)) |
 
 The cnc page carries its own version gate, `CNC_V2_VERSION`, which is
 independent of this one. cnc 3.1 changed the same-host shmem layout only
@@ -29,9 +29,21 @@ command carrying membership, the schedule table or the settings record;
 `SNAP_BEGIN` loses its trailing `config` tail and becomes fixed-length
 (layout **V4**), because the snapshot session now carries the cluster FSM's
 own artifact under the reserved `service_id = 255`. Every other datagram is
-byte-identical to 0.6.0. `CURRENT` is
-documentary and is not itself checked on any receive path (see
-`version.rs`); the two version lines remain independent of each other.
+byte-identical to 0.6.0. `CURRENT` itself is still not compared on any
+receive path (see `version.rs`), but since `0.12.0` the two constants derived
+from it are: `WIRE_MAX` (`CURRENT`'s minor) and `WIRE_MIN` (one below it,
+by const arithmetic; `0.12.0` alone has `WIRE_MIN = WIRE_MAX = 12`, with
+`WIRE_LEVEL_FIRST = 12`) bound the datagram header's `wire` byte below and
+the committed level a node will run at, and `MIN_COMPATIBLE` is
+`0.WIRE_MIN.0`. The two version lines remain independent of each other.
+
+**The level rule (`0.12.0`, `2.15.0`).** A wire minor is a **level**: the
+cluster commits one in its replicated `Settings` record, every node encodes
+at it, and the leader raises it only once every member has reported it can
+follow. A binary one level ahead therefore runs beside the old ones, so a
+release whose minor is the cluster's level or one above it rolls one node
+at a time; a wire major stays a flag day. See
+[The committed cluster wire level, explained](../notes/uc2-wire-level-explained.md).
 
 None of `0.7.0`'s intermediate shapes ever shipped — the whole of `2.11.0` was
 one flag day — but every retired number is **reserved, never
@@ -52,6 +64,28 @@ a protocol mismatch is refused.
 
 The header is authenticated as AAD when wire crypto is enabled, and carries a
 `key_epoch` field for the group key.
+
+| Offset | Field | Width | Notes |
+|---|---|---|---|
+| 0 | `position` | u64 LE | meaning depends on the kind |
+| 8 | `leadership_term_id` | u32 LE | |
+| 12 | `kind` | u8 | the tables below |
+| 13 | `wire` | u8 | **since `0.12.0`**: the sender's `WIRE_MAX`, on every datagram of every kind. Was `flags`, always `0` and read by nobody. `0` = a pre-level (`0.11.0`) peer |
+| 14 | `key_epoch` | u16 LE | M8 group-key epoch; `0` = cleartext |
+
+**The `wire` rule.** A receiver checks byte 13 before it reads anything else
+in the datagram. It accepts `[WIRE_MIN, WIRE_MAX + 1]` — one level above its
+own max is a peer rolling ahead, which is allowed — and refuses the whole
+datagram otherwise, counting it in `uc2_wire_datagrams_refused_total`:
+`reason = "prelevel"` for `0`, `reason = "out_of_range"` for anything else.
+A refusal is also named on stderr as `wire_refused`, throttled per source. On
+a crypto cluster the check runs, and the counter is bumped, before
+authentication — so a pre-level handshake is refused too, and unauthenticated
+traffic can drive `prelevel` — but the stderr line is written only for a
+source that resolves to a configured member. On the leader, the byte a
+member's durable report (`APPEND_POSITION`) carries is that member's report
+for the raise; the consensus agent keeps it in the member's peer slot
+(`wire_max`, cnc `+8`).
 
 ## Datagram kinds
 
@@ -379,8 +413,11 @@ through `0.6.0` the two id fields were `session_id: u64` and
 `correlation_id: u64`, of which the client only ever filled 32 bits each, so
 narrowing them to `client_id: u32` + `seq: u32` freed exactly the 8 bytes
 `time_ns` needed. A `0.6.0` peer's frames therefore *parse* on a `0.7.0` node
-and mean something different, which is why the wire is a flag day: upgrade
-every node together ([Upgrade a cluster](../how-to/upgrade-a-cluster.md)).
+and mean something different, which is why that change was a flag day:
+upgrade every node together ([Upgrade a cluster](../how-to/upgrade-a-cluster.md)).
+A header length change still is one. A same-length relayout could become a
+level instead, stamped per term in the body `NEW_TERM` reserves since
+`0.12.0`; nothing reads that body yet.
 
 **The stamp rule.** The leader reads its wall clock **once per consensus
 pass** and writes `max(now, last_stamp)` into every frame it appends, whatever
@@ -398,7 +435,7 @@ seeds its clamp from.
 |---|---|---|
 | 1 | `MESSAGE` | an application command |
 | 2 | `PADDING` | wrap padding; header-only on the wire, and its declared length is the full span it covers |
-| 3 | `NEW_TERM` | written by a leader when it opens a term; header-only, 32 B |
+| 3 | `NEW_TERM` | written by a leader when it opens a term. Since `0.12.0` it carries an 8-byte body (`NEW_TERM_BODY_LEN`), `wire_level u32 LE @0 ‖ reserved u32 @4`, written as **zeros** and read by nobody — the carrier a future per-term frame layout will stamp, reserved now so that relayout can be a level rather than a flag day. 64 B aligned (`NEW_TERM_FRAME_LEN`); header-only, 32 B, through `0.11.0` |
 | 4 | `CLUSTER` | **relabelled in 0.7.0** (was `CONFIG`): a cluster-FSM command. Kind-dispatched body, below |
 | 5 | `TIMER` | **new in 0.7.0**: a scheduled timer the leader fired. 24-byte body, below |
 | 6 | — | `SCHEDULE_TABLE` in an intermediate 0.7.0 shape; **retired before shipping** (`FRAME_TYPE_SCHEDULE_TABLE_RETIRED`) and reserved so the number is never reassigned |
@@ -423,13 +460,19 @@ so the frame type is the only router there is. One type, one kind byte:
 
 `CLUSTER_BODY_PREFIX_LEN = 8`, and `read_cluster_prefix` is total: it returns
 `None` on a short body, an unknown kind, or a non-zero reserved byte, and
-otherwise the kind plus the payload slice. Per kind:
+otherwise the kind plus the payload slice. **Since `0.12.0` an undecodable
+committed record is a fail-stop**, not a refusal: the `uc2-cluster` agent
+checks each record decodes at the committed wire level before the cluster FSM
+sees it, and stops the node by name (`ClusterRecordUndecodable`) if it does
+not — under the level a correct peer cannot have written one, and the FSM's
+own refuse-and-advance (reason 42) would let replicas diverge in silence.
+Per kind:
 
 | kind | payload | codec |
 |---|---|---|
 | `1` Membership | the `ClusterConfig` encoding `CONFIG` carried through `0.6.0`, unchanged | `uc_protocol::v2::config` |
 | `2` ScheduleTable | the whole table — an 8-byte header plus `count × 33` bytes, at most `MAX_SCHEDULE_ENTRIES = 32`, so **≤ 1064 B**. Layout below | `uc_protocol::v2::schedule` |
-| `3` Settings | `SETTINGS_LEN = 47` bytes exactly (**`0.11.0`**, backup tier 3b; was 46 at version 5 in the backup tier, 36 at version 4 in the snapshot lifecycle, 35 at version 3 in the snapshot catalog, 33 through `2.12.0`, 29 through `2.11.0`): `version u32 = 6 ‖ fsm_lag_bytes u64 @4 ‖ admission_bytes u64 @12 ‖ snapshot_interval_bytes u64 @20 ‖ snapshot_target u8 @28 ‖ datagram_mtu u32 @29 ‖ retain_sets u16 @33 ‖ auto_fetch u8 @35 ‖ backup_retain_sets u16 @36 ‖ backup_retain_age_secs u64 @38 ‖ purge_requires_tiers u8 @46` (`auto_fetch` nonzero = on; `u64::MAX` age refused 47; `purge_requires_tiers` is `0` = off or `1..=4`, above 4 refused 47). Versions 1–5 still decode; `auto_fetch` then reads true (v1–v3), both backup fields read `0` (v1–v4) and `purge_requires_tiers` reads `0` (v1–v5). `0` in any u64 means "derive at use"; `fsm_lag_bytes = u64::MAX` (`FSM_LAG_LOCKSTEP`) means lockstep; `snapshot_target` is `0` = all, `1` = learners; `datagram_mtu` is `0` (= the `MTU_DEFAULT` baseline) or a member of `RUNGS`, discovered and monotone, never operator-written; `retain_sets` is how many AGREED catalog sets the cluster keeps — `1..=48` (`MAX_RETAIN_SETS`), refused above that, and at `0` from an operator, by the leader's door (`47 settings_bounds`); a `0` that still reaches `apply` reads as `1`. A **version `3`** record (35 B) is still ACCEPTED and reads `auto_fetch = true`. A **version `2`** record — 33 B, `SETTINGS_LEN_V2`, the `2.12.0` shape — is still ACCEPTED on read and maps `retain_sets` to `1` (the newest-only retention such a cluster ran); a **version `1`** record — 29 B, `SETTINGS_LEN_V1`, the `2.11.0` shape — is still ACCEPTED and maps `datagram_mtu` to `0` and `retain_sets` to `1`, because the cluster artifact and committed `CLUSTER` frames survive the upgrade; an encoder always writes version 6. No trailing bytes are tolerated, and no other `(version, len)` pair decodes | `uc_protocol::v2::settings` |
+| `3` Settings | `SETTINGS_LEN = 49` bytes exactly (**`0.12.0`**, the wire level: version 7 appends `wire_level u8 @47` — the committed cluster wire level, monotone (`max`), `0` = keep — and `wire_raise u8 @48` — `0` = keep, `1` = auto, `2` = manual, any other value refused 47; versions 1–6 decode as `wire_level = 12` (`WIRE_LEVEL_FIRST`) and `wire_raise = 1` (auto). Was 47 at version 6 in backup tier 3b (**`0.11.0`**), 46 at version 5 in the backup tier, 36 at version 4 in the snapshot lifecycle, 35 at version 3 in the snapshot catalog, 33 through `2.12.0`, 29 through `2.11.0`): `version u32 = 7 ‖ fsm_lag_bytes u64 @4 ‖ admission_bytes u64 @12 ‖ snapshot_interval_bytes u64 @20 ‖ snapshot_target u8 @28 ‖ datagram_mtu u32 @29 ‖ retain_sets u16 @33 ‖ auto_fetch u8 @35 ‖ backup_retain_sets u16 @36 ‖ backup_retain_age_secs u64 @38 ‖ purge_requires_tiers u8 @46 ‖ wire_level u8 @47 ‖ wire_raise u8 @48` (`auto_fetch` nonzero = on; `u64::MAX` age refused 47; `purge_requires_tiers` is `0` = off or `1..=4`, above 4 refused 47). Versions 1–6 still decode; `auto_fetch` then reads true (v1–v3), both backup fields read `0` (v1–v4), `purge_requires_tiers` reads `0` (v1–v5) and the two wire fields read `12`/auto (v1–v6). A node decodes a record **at its committed level**: a version above `settings_version_for(wire_level)` is undecodable there, and the cluster agent fail-stops on it (`ClusterRecordUndecodable`) rather than letting the FSM refuse it and advance. `0` in any u64 means "derive at use"; `fsm_lag_bytes = u64::MAX` (`FSM_LAG_LOCKSTEP`) means lockstep; `snapshot_target` is `0` = all, `1` = learners; `datagram_mtu` is `0` (= the `MTU_DEFAULT` baseline) or a member of `RUNGS`, discovered and monotone, never operator-written; `retain_sets` is how many AGREED catalog sets the cluster keeps — `1..=48` (`MAX_RETAIN_SETS`), refused above that, and at `0` from an operator, by the leader's door (`47 settings_bounds`); a `0` that still reaches `apply` reads as `1`. A **version `3`** record (35 B) is still ACCEPTED and reads `auto_fetch = true`. A **version `2`** record — 33 B, `SETTINGS_LEN_V2`, the `2.12.0` shape — is still ACCEPTED on read and maps `retain_sets` to `1` (the newest-only retention such a cluster ran); a **version `1`** record — 29 B, `SETTINGS_LEN_V1`, the `2.11.0` shape — is still ACCEPTED and maps `datagram_mtu` to `0` and `retain_sets` to `1`, because the cluster artifact and committed `CLUSTER` frames survive the upgrade; an encoder writes the version `settings_version_for` names for the committed level, which is version 7 at level 12. `wire_level` is never written by an operator: the settings file has no such key, and `uc2ctl settings apply` stages `0` (keep). No trailing bytes are tolerated, and no other `(version, len)` pair decodes | `uc_protocol::v2::settings` |
 | `4` UpgradePin | **20 B** exactly: `row u8 @0 ‖ reserved [u8; 3] @1 ‖ from u32 @4 ‖ to u32 @8 ‖ origin u64 @12`. `row < 8`, `origin > 0`, reserved zero. An EVENT ("at `origin`, `row` went `from` → `to`"), kept as a per-row history of at most 4 in the cluster FSM and republished into the row's cnc status line (`+16`/`+24`) | `uc_protocol::v2::upgrade` |
 | `5` SnapshotReport | `row u8 @0 ‖ count u8 @1 ‖ reserved [u8; 6] @2 ‖ position u64 @8 ‖ count × (node_id u32 ‖ hash u64 ‖ size u64)`, `1 ≤ count ≤ 8` → **36–176 B** (`0.11.0`, the snapshot lifecycle: 20-byte entries; a pre-lifecycle record has 12-byte entries, 28–112 B, and is still decoded, every size `0` — the decoder infers the width from the length), node ids strictly increasing. The leader's collected per-node artifact hashes for `(row, position)`; the verdict (all equal / majority names minority / no majority) is recomputed by every reader, never carried | `uc_protocol::v2::upgrade` |
 | `6` RowGenesis (0.10.0, #33) | **8 B** exactly (`ROW_GENESIS_LEN`): `row u8 @0 ‖ reserved [u8; 3] @1 ‖ version u32 @4`. `row < 8`, reserved zero; `version` is a packed version and `0` is a legal value (an unversioned FSM). A recorded FACT, not an operator's change: the leader appends it on its own, once per row, naming the version of its own attached service when the row has no running version yet. Applied at commit, it sets the row's running version; refused `60 version_already_set` if the row already has one. An accepted `UpgradePin` (kind 4) sets the running version too, to its `to`, and is refused `53` when its `from` is not on the running line (same major.minor) | `uc_protocol::v2::upgrade` (`encode_row_genesis`/`decode_row_genesis`) |

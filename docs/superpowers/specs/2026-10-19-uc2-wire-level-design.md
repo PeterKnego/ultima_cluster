@@ -27,6 +27,8 @@ FSM upgrade lifecycle spec's §9.2 Track 2.
 
 Exploration of `b361eb29` for the implementation plan corrected eight
 details of the chat design. The plan implements these, not the body.
+Items 9–11 are controller rulings made during implementation; they record
+what shipped where the body is silent or loose.
 
 1. **§3.4, the unknown-kind drop is not in the receiver.** Replication stores
    frames as bytes; the silent `42 … applied advances` lives in
@@ -69,6 +71,32 @@ details of the chat design. The plan implements these, not the body.
    known, commit learned, walk at that commit) — the attach gate's
    condition — not the local commit counter, which a node down during the
    raise still holds pre-raise.
+9. **§2.3 / §6.2, the auto-mode newcomer race.** A `[13,14]` node joining an
+   auto-mode level-12 cluster of `[12,13]` members has two outcomes: the
+   leader raises to 13 first (the newcomer's report of 14 makes the target
+   `min = 13`) and the newcomer then runs in range, or the newcomer reaches
+   JOINED first and fail-stops `WireLevelBelowBinary`. Both satisfy the
+   invariant: before JOINED a node neither serves nor appends
+   level-dependent records, and the end state is every member in range. No
+   test pins the race (it is non-deterministic by design); the in-process
+   scenario `a_two_above_binary_refuses_to_start` seeds **manual** mode at
+   genesis so the newcomer's report cannot pull the level up, which pins the
+   refusal path.
+10. **§6.4, the fleet row's clauses.** The driver is
+    `bench-infra/scripts/wire_roll_gate.py`, not `m14_fleet_gate.py
+    --base-tree`, and the row has three clauses: the level reached on every
+    node, the commit gap per restart ≤ 5.0 s, and FSM state agreement after
+    the roll (`m12_gate check-fsms`). Linearizability under the roll is the
+    two-binary crashtest's clause (§6.3, WGL on a real history), not the
+    fleet row's. The pre-committed bars are
+    `docs/benchmarks/uc2-wire-level-gate-2026-10-19.md`.
+11. **§2.3 / §7.5, the lone too-new joiner.** A lone joiner two or more
+    levels above a live cluster (e.g. `[14,15]` on a level-12 cluster of
+    `[12,13]` members) refuses every datagram it receives (byte 13 is below
+    its min) and is refused by every peer (byte 15 is above their max + 1),
+    so it never JOINs and never reaches the Below judgement. It sits in
+    `NodeBooting`, printing throttled `wire_refused` lines that name its
+    range: named and visible, not a fail-stop. §7.5 lists it as a residual.
 
 Also: `PathBelowCommittedMtu` is a fail-stop panic string in the consensus
 agent, not an enum; the two level refusals use the same idiom in the cluster
@@ -526,6 +554,10 @@ or off per cluster. cnc page growth beyond the reserved bands.
   (§2.4).
 - The first roll's gate (§6.3) proves the mechanism against a synthetic
   old build, not a shipped one; the real-pair gate starts at `2.16.0`.
+- A lone joiner two or more levels above the cluster never JOINs and so
+  never fail-stops: it waits in `NodeBooting`, refused both ways on the
+  datagram byte, naming its range in throttled `wire_refused` lines
+  (erratum 11).
 
 ## 8. Approaches considered
 
