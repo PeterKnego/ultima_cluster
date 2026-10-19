@@ -46,7 +46,9 @@
       "auto_fetch": true,
       "backup_retain_sets": 0,
       "backup_retain_age_secs": "0",
-      "purge_requires_tiers": 0
+      "purge_requires_tiers": 0,
+      "wire_level": 12,
+      "wire_raise": 1
     },
     "schedule": {
       "position": 0,

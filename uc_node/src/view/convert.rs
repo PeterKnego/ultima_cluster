@@ -31,9 +31,8 @@ pub fn settings(v: &SettingsView) -> Settings {
         backup_retain_sets: v.backup_retain_sets,
         backup_retain_age_secs: v.backup_retain_age_secs.0,
         purge_requires_tiers: v.purge_requires_tiers,
-        // Task 3 publishes these through the view
-        wire_level: uc_protocol::version::WIRE_LEVEL_FIRST,
-        wire_raise: uc_protocol::v2::settings::WIRE_RAISE_AUTO,
+        wire_level: v.wire_level,
+        wire_raise: v.wire_raise,
     }
 }
 

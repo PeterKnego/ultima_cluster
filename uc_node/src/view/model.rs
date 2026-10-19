@@ -155,6 +155,8 @@ pub struct SettingsView {
     pub backup_retain_sets: u16,
     pub backup_retain_age_secs: DecU64,
     pub purge_requires_tiers: u8,
+    pub wire_level: u8,
+    pub wire_raise: u8,
 }
 
 /// `Settings::fsm_lag_bytes`: `0` derived, `u64::MAX` lockstep, else bytes.

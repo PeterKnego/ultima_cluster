@@ -201,6 +201,8 @@ fn settings(st: &ClusterState) -> SettingsView {
         backup_retain_sets: s.backup_retain_sets,
         backup_retain_age_secs: DecU64(s.backup_retain_age_secs),
         purge_requires_tiers: s.purge_requires_tiers,
+        wire_level: s.wire_level,
+        wire_raise: s.wire_raise,
     }
 }
 

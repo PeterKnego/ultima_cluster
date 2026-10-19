@@ -31,7 +31,8 @@ use uc_protocol::v2::schedule::{
     MAX_SCHEDULE_ENTRIES, ScheduleTable, decode_schedule_table, encode_schedule_table,
 };
 use uc_protocol::v2::settings::{
-    FSM_LAG_LOCKSTEP, MIN_FSM_LAG_BYTES, Settings, decode_settings, encode_settings,
+    FSM_LAG_LOCKSTEP, MIN_FSM_LAG_BYTES, Settings, WIRE_RAISE_KEEP, WIRE_RAISE_MANUAL,
+    decode_settings, encode_settings,
 };
 use uc_protocol::v2::upgrade::{
     RowGenesis, RowRunning, SnapshotReport, UpgradePin, decode_pin_list, decode_report_list,
@@ -630,6 +631,10 @@ impl ClusterFsm {
         }
     }
 
+    pub fn settings(&self) -> &Settings {
+        &self.state.settings
+    }
+
     pub fn state(&self) -> &ClusterState {
         &self.state
     }
@@ -742,6 +747,9 @@ impl ClusterFsm {
                 // `MAX_BACKUP_TIERS` of them.
                 if s.purge_requires_tiers > MAX_BACKUP_TIERS as u8 {
                     return Err(ClusterRefusal::SettingsBounds("purge_requires_tiers"));
+                }
+                if s.wire_raise > WIRE_RAISE_MANUAL {
+                    return Err(ClusterRefusal::SettingsBounds("wire_raise"));
                 }
                 // I1: the one settings value whose too-SMALL side is
                 // unrecoverable. `report_ceiling` caps an attested frontier
@@ -925,6 +933,14 @@ impl RawStateMachine for ClusterFsm {
                 // an operator record (absent keys = 0) cannot lower it, and
                 // every replica computes the same value.
                 let keep = self.state.settings.datagram_mtu.max(s.datagram_mtu);
+                // Wire-level spec §2.2: the level is monotone like the rung,
+                // and `wire_raise = 0` keeps the committed mode.
+                let keep_level = self.state.settings.wire_level.max(s.wire_level);
+                let keep_raise = if s.wire_raise == WIRE_RAISE_KEEP {
+                    self.state.settings.wire_raise
+                } else {
+                    s.wire_raise
+                };
                 // Catalog ruling R24 (supersedes R10's "keep current"): a replayed
                 // pre-catalog record decodes with `retain_sets = 1` and wins
                 // like every other replayed field. A `0` can only arrive on
@@ -938,6 +954,8 @@ impl RawStateMachine for ClusterFsm {
                 }
                 self.state.settings = s;
                 self.state.settings.datagram_mtu = keep;
+                self.state.settings.wire_level = keep_level;
+                self.state.settings.wire_raise = keep_raise;
                 self.state.settings_position = ctx.position;
                 // §4.2: a new `retain_sets` runs retention (lowering it
                 // retires at this apply; raising it retires nothing).
@@ -1251,6 +1269,9 @@ pub struct ClusterView {
     pub fsm_lag_bytes: AtomicU64,
     pub snapshot_interval_bytes: AtomicU64,
     pub snapshot_target: AtomicU8,
+    /// Wire-level spec: the committed cluster wire level and raise mode.
+    pub wire_level: AtomicU8,
+    pub wire_raise: AtomicU8,
     /// Jumbo spec §5.5: the committed datagram rung (`0` = baseline). Beside
     /// the other settings scalars for the same reason — the sender agent
     /// reads it per pass with one load and no lock.
@@ -1409,6 +1430,8 @@ impl ClusterView {
             fsm_lag_bytes: AtomicU64::new(0),
             snapshot_interval_bytes: AtomicU64::new(0),
             snapshot_target: AtomicU8::new(0),
+            wire_level: AtomicU8::new(0),
+            wire_raise: AtomicU8::new(0),
             datagram_mtu: AtomicU32::new(0),
             versioned: AtomicU8::new(0),
             retain_sets: AtomicU16::new(0),
@@ -1484,6 +1507,10 @@ impl ClusterView {
             .store(st.settings.backup_retain_age_secs, Ordering::Release);
         self.purge_requires_tiers
             .store(st.settings.purge_requires_tiers, Ordering::Release);
+        self.wire_level
+            .store(st.settings.wire_level, Ordering::Release);
+        self.wire_raise
+            .store(st.settings.wire_raise, Ordering::Release);
         // Catalog gauges — like everything above, BEFORE `position`.
         let stalled = st
             .catalog
@@ -1638,9 +1665,8 @@ impl ClusterView {
                 backup_retain_sets: self.backup_retain_sets.load(Ordering::Acquire),
                 backup_retain_age_secs: self.backup_retain_age_secs.load(Ordering::Acquire),
                 purge_requires_tiers: self.purge_requires_tiers.load(Ordering::Acquire),
-                // Task 3 publishes these through the view
-                wire_level: uc_protocol::version::WIRE_LEVEL_FIRST,
-                wire_raise: uc_protocol::v2::settings::WIRE_RAISE_AUTO,
+                wire_level: self.wire_level.load(Ordering::Acquire),
+                wire_raise: self.wire_raise.load(Ordering::Acquire),
             },
             settings_position: self.settings_position.load(Ordering::Acquire),
             applied: self.position.load(Ordering::Acquire),
@@ -2172,8 +2198,8 @@ mod tests {
             backup_retain_sets: 0,
             backup_retain_age_secs: 0,
             purge_requires_tiers: 0,
-            wire_level: uc_protocol::version::WIRE_LEVEL_FIRST,
-            wire_raise: uc_protocol::v2::settings::WIRE_RAISE_AUTO,
+            wire_level: 13,
+            wire_raise: WIRE_RAISE_MANUAL,
         };
         let v = ClusterView::new(&st);
         assert_eq!(v.to_state(), st);
@@ -2711,6 +2737,81 @@ mod tests {
         let mut s = f.state().settings;
         s.retain_sets = retain_sets;
         ClusterCommand::Settings(s)
+    }
+
+    #[test]
+    fn the_level_is_monotone_and_zero_keeps_both_wire_fields() {
+        let mut f = fsm();
+        let mut s = f.state().settings;
+        s.wire_level = 13;
+        s.wire_raise = WIRE_RAISE_MANUAL;
+        assert_eq!(apply_at(&mut f, 1024, &ClusterCommand::Settings(s)), 0);
+        assert_eq!(
+            (f.settings().wire_level, f.settings().wire_raise),
+            (13, WIRE_RAISE_MANUAL)
+        );
+        // an operator record (absent keys = 0) cannot lower the level nor flip the mode
+        let mut keep = s;
+        keep.wire_level = 0;
+        keep.wire_raise = WIRE_RAISE_KEEP;
+        assert_eq!(apply_at(&mut f, 2048, &ClusterCommand::Settings(keep)), 0);
+        assert_eq!(
+            (f.settings().wire_level, f.settings().wire_raise),
+            (13, WIRE_RAISE_MANUAL)
+        );
+        // a lower explicit level is also kept at 13 (max), like datagram_mtu
+        let mut lower = keep;
+        lower.wire_level = 12;
+        lower.wire_raise = uc_protocol::v2::settings::WIRE_RAISE_AUTO;
+        assert_eq!(apply_at(&mut f, 3072, &ClusterCommand::Settings(lower)), 0);
+        assert_eq!(
+            (f.settings().wire_level, f.settings().wire_raise),
+            (13, uc_protocol::v2::settings::WIRE_RAISE_AUTO)
+        );
+    }
+
+    #[test]
+    fn a_replayed_pre_wire_settings_record_does_not_lower_the_level() {
+        // A 2.14.0-shaped file (v6, no wire bytes) replayed after the roll
+        // decodes as (WIRE_LEVEL_FIRST, auto); the max rule keeps the level.
+        let mut f = fsm();
+        let mut s = f.state().settings;
+        s.wire_level = 13;
+        assert_eq!(apply_at(&mut f, 1024, &ClusterCommand::Settings(s)), 0);
+        let mut b = body(&ClusterCommand::Settings(s));
+        b.truncate(CLUSTER_BODY_PREFIX_LEN + uc_protocol::v2::settings::SETTINGS_LEN_V6);
+        b[CLUSTER_BODY_PREFIX_LEN..CLUSTER_BODY_PREFIX_LEN + 4]
+            .copy_from_slice(&6u32.to_le_bytes());
+        let mut out = Vec::new();
+        let mut ctx = ApplyCtx::new(2048, ClusterFsm::IDENTITY);
+        f.apply(&mut ctx, &b, &mut out);
+        assert_eq!(out, vec![0]);
+        assert_eq!(f.settings().wire_level, 13);
+    }
+
+    #[test]
+    fn a_bad_wire_raise_is_refused_47() {
+        let f = fsm();
+        let mut s = f.state().settings;
+        s.wire_raise = 3;
+        assert_eq!(
+            f.validate(&ClusterCommand::Settings(s))
+                .unwrap_err()
+                .reason_code(),
+            47
+        );
+    }
+
+    #[test]
+    fn the_view_publishes_the_wire_fields_and_to_state_round_trips_them() {
+        let mut st = fsm().state().clone();
+        st.settings.wire_level = 13;
+        st.settings.wire_raise = WIRE_RAISE_MANUAL;
+        let view = ClusterView::new(&st);
+        view.publish(&st);
+        assert_eq!(view.wire_level.load(Ordering::Acquire), 13);
+        assert_eq!(view.wire_raise.load(Ordering::Acquire), WIRE_RAISE_MANUAL);
+        assert_eq!(view.to_state().settings, st.settings);
     }
 
     #[test]
