@@ -5202,9 +5202,11 @@ mod tests {
 
     /// A term boundary RE-FRAMES the stream above the commit point, so every
     /// out-of-order run recorded under the old term is unreliable: the same
-    /// position can carry a 96 B data frame in term T and the next term's 32 B
-    /// NewTerm frame in T+1. Both sit ABOVE the contiguous frontier, so the
-    /// accept rule (`position < contiguous`) rejects neither, and [`Rebuilt`]
+    /// position can carry a 96 B data frame in term T and the next term's
+    /// NewTerm frame in T+1 (32 B when this was found; `NEW_TERM_FRAME_LEN`,
+    /// 64 B, since wire level 13 — the test below uses the constant). Both
+    /// sit ABOVE the contiguous frontier, so the accept rule (`position <
+    /// contiguous`) rejects neither, and [`Rebuilt`]
     /// UNIONS their spans because it tracks positions only ("no reliance on
     /// buffer contents", its module doc). The later `write_run` overwrites the
     /// first 32 B and the dead frame's trailing 32 B stay behind as orphaned
@@ -5243,7 +5245,9 @@ mod tests {
         drive_until(&mut r, || st.bytes.load(Relaxed) == 192);
 
         // The consensus agent adopts term T+1, and its leader re-frames that
-        // same position with a 32 B NewTerm frame.
+        // same position with a NewTerm frame (`NEW_TERM_FRAME_LEN`, 64 B):
+        // shorter than the dead 96 B frame, so 32 B of it are orphaned.
+        let nt_len = uc_protocol::v2::frame::NEW_TERM_FRAME_LEN;
         let new_term = TERM + 1;
         term.store(new_term, Relaxed);
         let nt = {
@@ -5254,25 +5258,29 @@ mod tests {
             let SliceRead::Run(rr) = nb.read_run_validated(0, 96, &mut out) else {
                 panic!("new-term run")
             };
-            assert_eq!(rr.bytes, 32, "a NewTerm frame is header-only");
+            assert_eq!(
+                rr.bytes, nt_len,
+                "a NewTerm frame is its header plus the reserved zero body"
+            );
             out[..rr.bytes].to_vec()
         };
         leader.send(to, DGRAM_KIND_DATA, 192, new_term, &nt);
-        // Wait on the WIRE bytes landing (96 + 96 + 32), never on the fix's own
-        // counter — this test must fail on the safety assertion below when the
-        // discard is absent, not stall waiting for it.
-        drive_until(&mut r, || st.bytes.load(Relaxed) == 224);
+        // Wait on the WIRE bytes landing (96 + 96 + NewTerm), never on the
+        // fix's own counter — this test must fail on the safety assertion
+        // below when the discard is absent, not stall waiting for it.
+        let end = 192 + nt_len as u64;
+        drive_until(&mut r, || st.bytes.load(Relaxed) == end);
 
         // Fill the gap under the new term; the frontier advances and absorbs
         // whatever out-of-order state survived.
         leader.send(to, DGRAM_KIND_DATA, 96, new_term, &runs[1].1);
-        drive_until(&mut r, || b.counters().append.load_acquire() >= 224);
+        drive_until(&mut r, || b.counters().append.load_acquire() >= end);
 
         // The archive's OWN predicate: everything below `append` must walk as
-        // whole frames. Pre-fix this is Err(RecordableCorrupt) at 224 with
+        // whole frames. Pre-fix this is Err(RecordableCorrupt) at `end` with
         // append==288 — the union of the two framings.
         let append = b.counters().append.load_acquire();
-        assert_eq!(append, 224, "the old term's 96 B span must not be counted");
+        assert_eq!(append, end, "the old term's 96 B span must not be counted");
         let slice = b.recordable_slice(0, 1 << 20).unwrap_or_else(|c| {
             panic!(
                 "archive cannot walk [0, {append}): {}",

@@ -511,13 +511,14 @@ impl ClusterAgent {
     }
 
     fn wire_fail_stop(fault: crate::wire::WireFault, wire: WireRange, position: u64) -> ! {
-        let level = match fault {
-            crate::wire::WireFault::AboveBinary { level, .. }
-            | crate::wire::WireFault::BelowBinary { level, .. } => level,
+        let (level, name) = match fault {
+            crate::wire::WireFault::AboveBinary { level, .. } => (level, "WireLevelAboveBinary"),
+            crate::wire::WireFault::BelowBinary { level, .. } => (level, "WireLevelBelowBinary"),
         };
         crate::obs_event!(
             Error,
             "wire_level_fault",
+            fault = name,
             position = position,
             wire_level = level as u64,
             binary_min = wire.min as u64,

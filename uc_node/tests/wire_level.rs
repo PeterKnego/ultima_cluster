@@ -346,6 +346,7 @@ fn apply_settings(f: &Fleet, leader: usize, edit: impl FnOnce(&mut Settings)) {
     use std::os::unix::fs::OpenOptionsExt as _;
     let mut s = f.node(leader).cluster_view().to_state().settings;
     edit(&mut s);
+    let want = s;
     s.wire_level = 0; // leader-owned: `uc2ctl` never writes it
     let mut bytes = Vec::new();
     uc_protocol::v2::settings::encode_settings(&s, &mut bytes);
@@ -367,7 +368,7 @@ fn apply_settings(f: &Fleet, leader: usize, edit: impl FnOnce(&mut Settings)) {
     await_until(30, "the new settings committed on every node", || {
         f.running()
             .into_iter()
-            .all(|i| f.node(i).cluster_view().to_state().settings == s)
+            .all(|i| f.node(i).cluster_view().to_state().settings == want)
     });
 }
 
@@ -572,4 +573,57 @@ fn a_two_above_binary_refuses_to_start() {
         "the leader serves on"
     );
     assert_eq!(levels(&f, &[0, 1]), vec![12; 2]);
+}
+
+/// Spec §2.4 + ruling 16: a stop-all straight to a binary TWO levels ahead
+/// (`[13,14]` over a level-12 cluster) stops every node — the middle binary
+/// must be installed first. Every member reports 14, but the leader's own
+/// range excludes the committed 12, so it must not raise (not even by one);
+/// each node's cluster agent then judges Below once JOINED.
+#[test]
+fn a_stop_all_two_levels_behind_stops_every_node() {
+    let g = serialize();
+
+    let mut f = fleet(3, 0);
+    for i in 0..3 {
+        f.start(i, OLD);
+    }
+    await_leader(&f, 30);
+    assert_eq!(levels(&f, &[0, 1, 2]), vec![WIRE_LEVEL_FIRST; 3]);
+
+    // Stop every node, then start every node on the two-ahead binary.
+    for i in 0..3 {
+        f.stop(i);
+    }
+    let ahead = WireRange {
+        min: WIRE_LEVEL_FIRST + 1,
+        max: WIRE_LEVEL_FIRST + 2,
+    };
+    for i in 0..3 {
+        f.start(i, ahead);
+    }
+
+    await_until(20, "every node's cluster agent fail-stopped", || {
+        (0..3).all(|i| agent_finished(f.node(i), "cluster"))
+    });
+    let mut faults = Vec::new();
+    await_until(5, "three WireLevelBelowBinary records", || {
+        let text = String::from_utf8_lossy(&g.buf.lock().unwrap()).into_owned();
+        faults = text
+            .lines()
+            .filter(|l| l.contains(r#""event":"wire_level_fault""#))
+            .map(str::to_owned)
+            .collect();
+        faults.len() >= 3
+    });
+    assert_eq!(faults.len(), 3, "one per node: {faults:#?}");
+    for line in &faults {
+        assert!(
+            line.contains(r#""fault":"WireLevelBelowBinary""#)
+                && line.contains(&format!(r#""wire_level":{WIRE_LEVEL_FIRST}"#)),
+            "{line}"
+        );
+    }
+    // No raise was ever appended: the committed level is still the first.
+    assert_eq!(levels(&f, &[0, 1, 2]), vec![WIRE_LEVEL_FIRST; 3]);
 }
