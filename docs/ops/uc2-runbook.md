@@ -367,8 +367,11 @@ transport setting, both measured closed-loop at inflight 1 on 8-vCPU
   `v2.6.0`+.
 - **Roll an upgrade one node at a time** (since `2.15.0`). Permitted when the
   new release's wire minor is the cluster's level (`uc2ctl wire show` →
-  `level=`) or one above it. Want a rollback window? `uc2ctl settings apply`
-  a file with `wire_raise = "manual"` **before the first restart**. Then, per
+  `level=`) or one above it. Want a rollback window? Add `wire_raise =
+  "manual"` to the cluster's **full** settings file (the one last applied, or
+  what `uc2ctl settings show` prints) and `uc2ctl settings apply` it **before
+  the first restart** — the apply replaces the whole record, and every absent
+  key except `wire_raise` reverts to its default. Then, per
   host: stop the node and everything attached to it, install, start the
   node, wait for `can_serve`, start its services. After the last host,
   `uc2ctl wire show` on the leader should say `verdict: raisable to N`; auto

@@ -27,7 +27,7 @@ FSM upgrade lifecycle spec's §9.2 Track 2.
 
 Exploration of `b361eb29` for the implementation plan corrected eight
 details of the chat design. The plan implements these, not the body.
-Items 9–11 are controller rulings made during implementation; they record
+Items 9–12 are controller rulings made during implementation; they record
 what shipped where the body is silent or loose.
 
 1. **§3.4, the unknown-kind drop is not in the receiver.** Replication stores
@@ -97,6 +97,10 @@ what shipped where the body is silent or loose.
     so it never JOINs and never reaches the Below judgement. It sits in
     `NodeBooting`, printing throttled `wire_refused` lines that name its
     range: named and visible, not a fail-stop. §7.5 lists it as a residual.
+12. **§4.3 / §5.5, setting the mode.** The mode is set by adding
+    `wire_raise` to the cluster's full settings file, not by applying a
+    one-key file — `uc2ctl settings apply` replaces the record
+    (`docs/reference/uc2ctl.md` § settings apply).
 
 Also: `PathBelowCommittedMtu` is a fail-stop panic string in the consensus
 agent, not an enum; the two level refusals use the same idiom in the cluster

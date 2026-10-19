@@ -44,7 +44,10 @@ section near the end of this page.
    name the minor). Two above: install the middle release first — this is
    true for a stop-all upgrade too.
 2. Decide whether you want a rollback window. If yes, before the first
-   restart: `uc2ctl settings apply` a file containing `wire_raise = "manual"`.
+   restart: add `wire_raise = "manual"` to the cluster's **full** settings
+   file — the one last applied, or the record `uc2ctl settings show` prints
+   — and `uc2ctl settings apply` it. Never apply a one-line file: `settings
+   apply` replaces the whole record.
 3. One host at a time: stop the node and every process attached to its
    instance directory (services, clients, the gateway — a cnc minor bump means
    they restart together, the standing per-host rule); install; start the
@@ -70,11 +73,18 @@ What each step leans on:
   the old binary, because nothing has been written that it cannot read. Set
   it **before the first restart**: in auto mode (the default) the leader can
   raise within a check interval of the last old node leaving, and a switch to
-  manual made after that can lose the race. The file key is flat
-  (`wire_raise = "manual"`, not a table); a file without it keeps the
-  committed mode, so the cluster's ordinary settings file needs no edit.
-  The mode persists after the raise: apply `wire_raise = "auto"` again if you
-  want the next roll to raise on its own.
+  manual made after that can lose the race. The key is flat
+  (`wire_raise = "manual"`, not a table) and goes into the cluster's full
+  settings file, because
+  [`settings apply`](../reference/uc2ctl.md#settings-apply) replaces the
+  record: every absent key reverts to its **default**, not to the committed
+  value, so a one-line file would reset snapshot cadence, retention,
+  `fsm_lag` and `purge_requires_tiers`. Only `wire_raise` keeps the committed
+  value when absent (and `wire_level`, which is leader-owned and never a file
+  key) — which is why the cluster's existing file, applied again without the
+  key, does not touch the mode. The mode persists after the raise: apply the
+  full file with `wire_raise = "auto"` if you want the next roll to raise on
+  its own.
 - **Step 3, the host.** A release that bumps the cnc minor (see its notes)
   makes an older attacher refuse the newer page, so a host's node, services,
   shmem clients and gateway restart together — the same per-host rule as
@@ -90,7 +100,10 @@ What each step leans on:
   raise` refuses with `63 wire_holdout` in that state, and on a cluster
   already at every member's level it answers `ok (cluster position P)` and
   appends nothing, so it is safe to run twice. Like every `CLUSTER` command
-  it is leader-only: a follower answers `retry`.
+  it is leader-only: a follower answers `retry`. In auto mode the leader
+  checks every 100 ms and raises as soon as the last report arrives, so by
+  the time you run `wire show` it will usually already print `level=` the new
+  level and `verdict: at level` — that is the success case, not a stall.
 - **Step 5, done.** `uc2ctl status` prints `wire: level=L binary=MIN..MAX` on
   every node, and `Uc2WireLevelBelowMembers` (30 m) has nothing left to fire
   on.
@@ -1453,8 +1466,9 @@ change: every older `Settings` record and cluster image is read as before.
 **After the flag day** every node runs at level 12 with `wire_raise = auto`,
 and `uc2ctl status` prints `wire: level=12 binary=12..12`. There is nothing
 to raise until a release ships level 13. If you want your first roll to keep
-a rollback window, set `wire_raise = "manual"` with `uc2ctl settings apply`
-any time before that roll starts. `[settings]` in `node.toml` has no
+a rollback window, add `wire_raise = "manual"` to the cluster's full
+settings file and `uc2ctl settings apply` it any time before that roll
+starts (the apply replaces the whole record, so never a one-line file). `[settings]` in `node.toml` has no
 `wire_raise` key; genesis is always auto.
 
 **Three new fail-stops, all in the `uc2-cluster` agent** (the daemon exits 1

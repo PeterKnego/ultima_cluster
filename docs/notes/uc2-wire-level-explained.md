@@ -3,7 +3,7 @@
 *Written 2026-10-19 for the wire level (issue #31), which ships in
 `2.15.0` with wire `0.12.0` and cnc `3.5`. Spec:
 `docs/superpowers/specs/2026-10-19-uc2-wire-level-design.md`; read its
-errata block (items 1–11) before the body, because several behaviours below
+errata block (items 1–12) before the body, because several behaviours below
 are errata rather than body text. This note carries the argument in plain
 language.*
 
@@ -43,10 +43,12 @@ From `2.15.0` on, a wire **minor** bump is a level and rolls; a wire
 
 Every encoder writes at the committed level. A `0.13.0` leader on a level-12
 cluster writes level-12 `Settings` records and no level-13 kinds; a
-`0.13.0` follower sends level-12 reports. The committed level is published
-on the cnc page (`wire_level` at offset 3992, written by the `uc2-cluster`
-agent when it applies a `Settings` record), so the sender, the consensus
-agent and `uc2ctl` read it without touching the FSM.
+`0.13.0` follower sends level-12 reports. The `uc2-cluster` agent publishes
+the committed level when it applies a `Settings` record: in-node consumers
+(the leader's raise logic in the consensus agent) read it from the cluster
+agent's published view, and outside the node `uc2ctl` and `/metrics` read
+the cnc word (`wire_level` at offset 3992). The datagram byte is a different
+thing: every sender writes its own `WIRE_MAX` there, not the level.
 
 Each feature that changes the wire gets exactly one gate at its point of use
 (`if level >= N`), deleted as always-true when the next level lands. The
@@ -195,7 +197,9 @@ no step at all.
   record with `level=` and, on refusal, `holdout=`.
   ([reference](../reference/uc2ctl.md#wire-raise))
 - **`wire_raise = "auto" | "manual"`** is a key in the flat settings file
-  for `uc2ctl settings apply`; absent means keep the committed mode.
+  for `uc2ctl settings apply`; absent means keep the committed mode. Put it
+  in the cluster's full settings file: the apply replaces the whole record,
+  and every other absent key reverts to its default.
   `wire_level` is leader-owned and never a file key. `settings show` prints
   both, and `uc2ctl status` prints a `wire:` line.
 - **Metrics:** `uc2_wire_level`, `uc2_wire_binary_min`,
