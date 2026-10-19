@@ -41,6 +41,7 @@ use uc_log::archive::replay_journal_from;
 use uc_log::buffer::LogBuffer;
 use uc_log::cnc::CncPage;
 use uc_log::reader::{Batch, LogFollower};
+use uc_protocol::WireRange;
 use uc_protocol::v2::backup::{BackupTierEntry, WatermarkOp, decode_backup_watermark};
 use uc_protocol::v2::catalog::SetEntry;
 use uc_protocol::v2::cnc::NODE_FLAG_LEARNER;
@@ -49,6 +50,7 @@ use uc_protocol::v2::frame::{
     FRAME_TYPE_SNAPSHOT, align_frame_len,
 };
 use uc_protocol::v2::schedule::ScheduleTable;
+use uc_protocol::v2::settings::Settings;
 use uc_protocol::v2::upgrade::{RowRunning, SnapshotReport, UpgradePin, verdict};
 use uc_service::{ApplyCtx, RawStateMachine, SnapshotStateMachine};
 
@@ -363,6 +365,10 @@ pub struct ClusterAgent {
     /// before it adopts the floor, so a joiner never serves or leads off a
     /// floor whose cluster row it has not installed.
     installed: Arc<AtomicU64>,
+    /// Wire-level spec §2.3: this binary's range. The committed level must
+    /// stay inside it, or the node fail-stops by name
+    /// (`WireLevelAboveBinary` / `WireLevelBelowBinary`).
+    wire: WireRange,
 }
 
 impl ClusterAgent {
@@ -390,6 +396,7 @@ impl ClusterAgent {
         install: mpsc::Receiver<(u64, PathBuf)>,
         installed: Arc<AtomicU64>,
         standby_instant_pos: Arc<AtomicU64>,
+        wire: WireRange,
     ) -> ClusterAgent {
         let snapshot_pos = fsm.last_applied().filter(|_| start > 0).unwrap_or(0);
         // Catalog ruling R28: seed the hash word from the recovered artifact
@@ -421,6 +428,7 @@ impl ClusterAgent {
             replay_gap_logged: false,
             install,
             installed,
+            wire,
         };
         // Spec §2.5 / §3 S4 step 3: a recovered agent republishes the pin
         // words from the artifact BEFORE any service attaches — the same
@@ -432,7 +440,64 @@ impl ClusterAgent {
         // record at or below the recovered `applied`, which this agent will
         // never re-apply, so nothing would ever move the word otherwise.
         agent.cnc.store_cluster_applied(agent.fsm.state().applied);
+        // Wire-level spec §2.3: the recovered artifact's committed level
+        // meets this binary before anything else runs.
+        if start > 0 {
+            agent.enforce_wire_level(agent.fsm.settings(), agent.fsm.state().applied);
+        }
         agent
+    }
+
+    /// The cnc page this agent publishes to.
+    #[cfg(test)]
+    pub(crate) fn cnc(&self) -> &CncPage {
+        &self.cnc
+    }
+
+    /// Wire-level spec §2.3: the one place the committed level meets the
+    /// binary. Publishes the cnc word first so an operator reading the page
+    /// after the fail-stop sees the level that stopped the node.
+    fn enforce_wire_level(&self, settings: &Settings, position: u64) {
+        Self::enforce_wire_level_on(&self.cnc, self.wire, settings, position);
+    }
+
+    /// [`Self::enforce_wire_level`] on disjoint fields, for the apply loops
+    /// where the follower's batch iterator already borrows `self`.
+    fn enforce_wire_level_on(cnc: &CncPage, wire: WireRange, settings: &Settings, position: u64) {
+        cnc.store_wire_level(settings.wire_level as u64);
+        if let Err(fault) = crate::wire::check_level(settings.wire_level, wire) {
+            crate::obs_event!(
+                Error,
+                "wire_level_fault",
+                position = position,
+                level = settings.wire_level as u64,
+                binary_min = wire.min as u64,
+                binary_max = wire.max as u64
+            );
+            panic!("cluster fatal (fail-stop): {fault} position={position}");
+        }
+    }
+
+    /// Wire-level spec §3.4: a CLUSTER record a correct peer could not have
+    /// sent at the committed level is corruption, not a refusal — the FSM's
+    /// own `42` (refused, `applied` advances) would let replicas diverge in
+    /// silence, so the agent stops before handing it over.
+    fn gate_decodable(fsm: &ClusterFsm, body: &[u8], position: u64) {
+        let level = fsm.settings().wire_level;
+        if !ClusterFsm::decodable_at(level, body) {
+            crate::obs_event!(
+                Error,
+                "cluster_record_undecodable",
+                position = position,
+                level = level as u64
+            );
+            panic!(
+                "cluster fatal (fail-stop): ClusterRecordUndecodable position={position} \
+                 level={level} — a CLUSTER record in the committed log does not decode at \
+                 the committed wire level; the journal is corrupt or a peer violated the \
+                 level; restore from backup"
+            );
+        }
     }
 
     pub fn applied(&self) -> u64 {
@@ -756,8 +821,17 @@ impl ClusterAgent {
                         let mut ctx = ApplyCtx::new(end, ClusterFsm::IDENTITY)
                             .with_time(hdr.time_ns)
                             .with_term(hdr.leadership_term_id);
+                        Self::gate_decodable(&self.fsm, payload, end);
                         self.fsm.apply(&mut ctx, payload, &mut self.out);
                         let accepted = self.out.first() == Some(&0);
+                        if accepted && payload.first() == Some(&(ClusterKind::Settings as u8)) {
+                            Self::enforce_wire_level_on(
+                                &self.cnc,
+                                self.wire,
+                                self.fsm.settings(),
+                                end,
+                            );
+                        }
                         crate::obs_event!(
                             Info,
                             "cluster_command_applied",
@@ -861,6 +935,10 @@ impl ClusterAgent {
             .fsm
             .install_snapshot(position, &mut &img[..])
             .map_err(|e| io::Error::other(e.to_string()))?;
+        // Wire-level spec §2.3: an installed image carries a committed level
+        // too; one outside this binary stops the node here, before the view
+        // or the floor ack publishes anything from it.
+        self.enforce_wire_level(self.fsm.settings(), got);
         self.artifact_hash.publish(
             got,
             uc_service::snapshots::artifact_hash_of(&img),
@@ -1025,8 +1103,12 @@ impl ClusterAgent {
                         let mut ctx = ApplyCtx::new(end, ClusterFsm::IDENTITY)
                             .with_time(rf.header.time_ns)
                             .with_term(rf.header.leadership_term_id);
+                        Self::gate_decodable(&self.fsm, &rf.payload, end);
                         self.fsm.apply(&mut ctx, &rf.payload, &mut self.out);
                         let accepted = self.out.first() == Some(&0);
+                        if accepted && rf.payload.first() == Some(&(ClusterKind::Settings as u8)) {
+                            self.enforce_wire_level(self.fsm.settings(), end);
+                        }
                         Self::note_applied(&self.fsm, &self.view, &rf.payload, accepted, end);
                         applied_any = true;
                         frames += 1;
@@ -1185,6 +1267,7 @@ mod tests {
     use uc_log::buffer::LogBuffer;
     use uc_log::cnc::{CncMeta, CncPage, PinRead, RowRead};
     use uc_log::region::Region;
+    use uc_protocol::WireRange;
     use uc_protocol::identity::pack_version;
     use uc_protocol::v2::catalog::{SetKind, SetState};
     use uc_protocol::v2::cnc::CNC_MAX_SERVICES;
@@ -1373,6 +1456,7 @@ mod tests {
             no_install_route(),
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
+            WireRange::BINARY,
         );
         (agent, view)
     }
@@ -1645,6 +1729,7 @@ mod tests {
             no_install_route(),
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
+            WireRange::BINARY,
         );
         cnc.counters().durable.store_release(e3);
         cnc.counters().commit.store_release(e1); // only the first command is committed
@@ -1701,6 +1786,7 @@ mod tests {
             no_install_route(),
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
+            WireRange::BINARY,
         );
         // Strictly inside the only frame: not 0 (genesis), not 96 (its end).
         cnc.counters().durable.store_release(48);
@@ -1774,6 +1860,7 @@ mod tests {
             no_install_route(),
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
+            WireRange::BINARY,
         );
         cnc.counters().durable.store_release(e_msg);
         cnc.counters().commit.store_release(e_msg);
@@ -1831,6 +1918,7 @@ mod tests {
             no_install_route(),
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
+            WireRange::BINARY,
         );
         cnc.counters().durable.store_release(e1);
         cnc.counters().commit.store_release(e1);
@@ -1879,6 +1967,7 @@ mod tests {
             no_install_route(),
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
+            WireRange::BINARY,
         );
         assert!(agent.do_work());
         assert_eq!(
@@ -1928,6 +2017,7 @@ mod tests {
             no_install_route(),
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
+            WireRange::BINARY,
         );
 
         // Flags word 0 = a voter: the standby instant is ignored.
@@ -1982,6 +2072,7 @@ mod tests {
             no_install_route(),
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
+            WireRange::BINARY,
         );
 
         // Flags word 0 = a voter throughout: never takes NODE_FLAG_LEARNER.
@@ -2030,6 +2121,7 @@ mod tests {
             no_install_route(),
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
+            WireRange::BINARY,
         );
 
         let (end, stamp) = app.append_snapshot(1, 0).unwrap();
@@ -2108,6 +2200,7 @@ mod tests {
             no_install_route(),
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
+            WireRange::BINARY,
         );
         let head = stage_overrun(&buffer, &cnc);
         assert!(head > e3, "the prime moves the head well past the frames");
@@ -2184,6 +2277,7 @@ mod tests {
             no_install_route(),
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
+            WireRange::BINARY,
         );
         let head = stage_overrun(&buffer, &cnc);
         assert!(head > e_last);
@@ -2266,6 +2360,7 @@ mod tests {
             no_install_route(),
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
+            WireRange::BINARY,
         );
         // Stand in for "this agent already holds the artifact at p1".
         agent.snapshot_pos = p1;
@@ -2324,6 +2419,7 @@ mod tests {
             no_install_route(),
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
+            WireRange::BINARY,
         );
 
         // Stage a LIVE overrun exactly like `stage_overrun` does — the ring
@@ -2394,6 +2490,7 @@ mod tests {
             no_install_route(),
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
+            WireRange::BINARY,
         );
         // Flags word 0 = a voter throughout: never takes NODE_FLAG_LEARNER.
         let head = stage_overrun(&buffer, &cnc);
@@ -2467,6 +2564,7 @@ mod tests {
             no_install_route(),
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
+            WireRange::BINARY,
         );
         agent2.do_work();
         assert_eq!(
@@ -2474,6 +2572,171 @@ mod tests {
             catalog,
             "live walk and journal catch-up agree on the catalog byte-for-byte"
         );
+    }
+
+    /// Wire-level spec §2.3 / §3.4 fixture: a fresh-genesis agent at `wire`
+    /// over its own `(buffer, cnc, dir)` world, kept alive beside it. Derefs
+    /// to the agent so a test reads as `agent.do_work()`.
+    struct AgentFixture {
+        agent: ClusterAgent,
+        buffer: Arc<LogBuffer>,
+        cnc: Arc<CncPage>,
+        /// The heap region's base, captured before the region moved into
+        /// the buffer — `append_committed_cluster_body` patches a kind byte
+        /// through it. The allocation never moves (Region owns it).
+        base: *mut u8,
+        dir: tempfile::TempDir,
+    }
+
+    impl std::ops::Deref for AgentFixture {
+        type Target = ClusterAgent;
+        fn deref(&self) -> &ClusterAgent {
+            &self.agent
+        }
+    }
+
+    impl std::ops::DerefMut for AgentFixture {
+        fn deref_mut(&mut self) -> &mut ClusterAgent {
+            &mut self.agent
+        }
+    }
+
+    fn agent_fixture(wire: WireRange) -> AgentFixture {
+        let dir = tempdir();
+        let cnc = CncPage::heap(&CncMeta {
+            node_id: 1,
+            instance_id: 0,
+            app_id: "t".into(),
+            buffer_bytes: 1 << 16,
+            max_payload: 4096,
+            services: [None; CNC_MAX_SERVICES],
+        });
+        let region = Region::heap_zeroed(1 << 16);
+        // SAFETY: offset 0 < len; the pointer is only written by this
+        // single-threaded test, at a frame the agent has not yet read.
+        let base = unsafe { region.ptr_at(0) };
+        let buffer = Arc::new(LogBuffer::new(region, Arc::clone(&cnc), 4096));
+        cnc.counters().prime(0);
+        let (fsm, start) = recover(
+            &dir.path().join("snapshots/cluster"),
+            genesis_state(),
+            vec![],
+        )
+        .unwrap();
+        let view = Arc::new(ClusterView::new(fsm.state()));
+        let agent = ClusterAgent::new(
+            Arc::clone(&buffer),
+            Arc::clone(&cnc),
+            fsm,
+            view,
+            dir.path().join("snapshots/cluster"),
+            start,
+            Arc::new(AtomicU64::new(0)),
+            empty_journal(dir.path()),
+            no_install_route(),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            wire,
+        );
+        AgentFixture {
+            agent,
+            buffer,
+            cnc,
+            base,
+            dir,
+        }
+    }
+
+    /// Append one CLUSTER frame at the fixture's append frontier and commit
+    /// it; returns `(frame_start, frame_end)`.
+    fn append_committed(fx: &AgentFixture, kind: ClusterKind, payload: &[u8]) -> (u64, u64) {
+        let at = fx.cnc.counters().append.load_acquire();
+        let mut app = fx.buffer.appender_for_test(at);
+        app.set_now(1);
+        let start = app.position();
+        let end = app.append_cluster(1, kind, payload).unwrap();
+        fx.cnc.counters().durable.store_release(end);
+        fx.cnc.counters().commit.store_release(end);
+        (start, end)
+    }
+
+    fn append_committed_settings(fx: &AgentFixture, s: &Settings) {
+        let mut p = Vec::new();
+        encode_settings(s, &mut p);
+        append_committed(fx, ClusterKind::Settings, &p);
+    }
+
+    /// A whole CLUSTER body (`kind ‖ reserved ‖ payload`), kind byte
+    /// included — so a test can commit a kind `ClusterKind` cannot name.
+    fn append_committed_cluster_body(fx: &AgentFixture, body: &[u8]) {
+        let (start, _) = append_committed(
+            fx,
+            ClusterKind::Membership,
+            &body[CLUSTER_BODY_PREFIX_LEN..],
+        );
+        let off = (start % (1 << 16)) as usize + uc_protocol::v2::frame::HEADER_LEN;
+        // SAFETY: inside the region (one small frame from 0); nothing reads
+        // the frame until the test's next `do_work`.
+        unsafe { *fx.base.add(off) = body[0] };
+    }
+
+    /// A cluster artifact at 2048 whose Settings carry `level`, written
+    /// beside the fixture's own snapshot dir.
+    fn write_cluster_artifact_with_level(fx: &AgentFixture, level: u8) -> PathBuf {
+        let mut st = genesis_state();
+        st.settings.wire_level = level;
+        st.applied = 2048;
+        let (img, at) = ClusterFsm::new(st, vec![]).freeze().unwrap();
+        assert_eq!(at, 2048);
+        let path = fx.dir.path().join("incoming.ultcluster");
+        fs::write(&path, &img[..]).unwrap();
+        path
+    }
+
+    #[test]
+    #[should_panic(expected = "WireLevelAboveBinary")]
+    fn a_committed_level_above_the_binary_fail_stops_at_apply() {
+        let mut agent = agent_fixture(WireRange { min: 12, max: 12 });
+        let mut s = Settings::genesis_default();
+        s.wire_level = 13;
+        append_committed_settings(&agent, &s); // encode + append a CLUSTER kind=3 frame and advance commit
+        agent.do_work();
+    }
+
+    #[test]
+    #[should_panic(expected = "WireLevelBelowBinary")]
+    fn a_committed_level_below_the_binary_fail_stops_at_apply() {
+        let mut agent = agent_fixture(WireRange { min: 13, max: 14 });
+        append_committed_settings(&agent, &Settings::genesis_default()); // level 12
+        agent.do_work();
+    }
+
+    #[test]
+    #[should_panic(expected = "WireLevelAboveBinary")]
+    fn install_from_enforces_the_level() {
+        // Review Focus 4: an artifact whose Settings carry level 13 installed
+        // on a [12,12] binary must stop the node at install.
+        let mut agent = agent_fixture(WireRange { min: 12, max: 12 });
+        let path = write_cluster_artifact_with_level(&agent, 13); // freeze a ClusterFsm whose settings.wire_level = 13
+        let _ = agent.install_from(2048, &path);
+    }
+
+    #[test]
+    #[should_panic(expected = "ClusterRecordUndecodable")]
+    fn an_undecodable_cluster_record_fail_stops() {
+        let mut agent = agent_fixture(WireRange::BINARY);
+        append_committed_cluster_body(&agent, &[8, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3]); // kind 8 does not exist
+        agent.do_work();
+    }
+
+    #[test]
+    fn an_accepted_settings_record_publishes_the_cnc_level_word() {
+        let mut agent = agent_fixture(WireRange { min: 12, max: 13 });
+        let mut s = Settings::genesis_default();
+        s.wire_level = 13;
+        append_committed_settings(&agent, &s);
+        agent.do_work();
+        assert_eq!(agent.cnc().wire_level(), 13);
     }
 
     // A `should_panic` test for the journal-error fail-stop path (a

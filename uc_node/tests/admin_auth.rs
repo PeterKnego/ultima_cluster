@@ -144,6 +144,7 @@ impl NodeH {
             admin: policy,
             backup: None,
             tier_source: None,
+            wire: None,
         };
         self.node = Some(Node::start_with(cfg, opts).expect("restart"));
     }
@@ -235,6 +236,7 @@ fn spawn_cluster_with(n: usize, policy: AdminPolicy, services: uc_node::Services
             admin: policy.clone(),
             backup: None,
             tier_source: None,
+            wire: None,
         };
         let node = Node::start_with(cfg, opts).expect("start");
         nodes.push(NodeH {

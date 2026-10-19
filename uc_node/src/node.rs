@@ -78,6 +78,7 @@ use crate::ipc::InstanceDir;
 use crate::read_round::ProbeRound;
 use crate::services::ServicesConfig;
 use uc_log::buffer::FrameRead;
+use uc_protocol::WireRange;
 use uc_protocol::v2::catalog::{FOREIGN_SET_SUFFIX, MAX_CATALOG_SETS, SetEntry, SetKind, SetState};
 use uc_protocol::v2::datagram::{
     CONFIG_PROPOSAL_BODY_LEN, CONFIG_REPLY_BODY_LEN, ConfigProposalBody, ConfigReplyBody,
@@ -362,6 +363,9 @@ pub struct StartOpts {
     /// snapshot sets from. Resolved with `backup` by
     /// [`resolve_tier_source`]. Here for the reason `backup` is.
     pub tier_source: Option<std::path::PathBuf>,
+    /// Wire-level spec §6.2: this node's range; `None` = `WireRange::BINARY`.
+    /// The daemon fills it from `uc_node::wire::range_from_env()`.
+    pub wire: Option<WireRange>,
 }
 
 /// Where a resolved tier source's path came from — which decides what a
@@ -1206,6 +1210,8 @@ pub struct Node {
     /// else on `Node` retains it (the consensus SM has its own copy). Exposed
     /// via [`Node::observability`].
     node_id: NodeId,
+    /// Wire-level spec §2.3: this binary's range (`StartOpts.wire`).
+    wire: WireRange,
     cnc: Arc<CncPage>,
     term_handle: TermHandle,
     leader_flag: Arc<AtomicBool>,
@@ -1426,7 +1432,9 @@ impl Node {
             admin,
             backup,
             tier_source,
+            wire,
         } = opts;
+        let wire = wire.unwrap_or(WireRange::BINARY);
         let sock = match socket {
             Some(sock) => sock,
             None => UdpSocket::bind(cfg.bind)?,
@@ -1677,6 +1685,9 @@ impl Node {
                 .min(payload_ceiling(MTU_DEFAULT, crypto.is_some())),
         );
         cnc.store_payload_ceiling(buffer.payload_ceiling() as u64);
+        // Wire-level spec §5.1: this binary's range, beside the ceiling —
+        // written once at boot, before any agent or attacher reads the page.
+        cnc.store_wire_binary(wire.pack());
 
         // 5. Durable output-progress marker (Task 12) → mirror onto the page for
         // attaching parties. `state.output_progress()` is whatever the output
@@ -1890,6 +1901,7 @@ impl Node {
         let mut sender_cfg = SenderConfig::new(boot_term);
         sender_cfg.crypto_enabled = crypto_send.is_some();
         sender_cfg.heartbeat_ns = 20_000_000; // 20 ms: brisk tail-loss detection
+        sender_cfg.wire = wire;
         let journal = archive.journal_arc();
         // Ruling R12: the `uc2-cluster` agent's fallback source for a live
         // overrun with no explaining prime — a separate clone taken here
@@ -2127,6 +2139,7 @@ impl Node {
         rcfg.seed = cfg.seed ^ 0x5DEE_CE66_1D0C_2A11;
         rcfg.status_floor_ns = 20_000_000;
         rcfg.append_pos_floor_ns = 20_000_000;
+        rcfg.wire = wire;
         // Catalog spec §5.2: the cached soft advertisement every `STATUS`
         // carries; the consensus agent's writers keep it current.
         let holdings = Arc::new(Mutex::new(Holdings::default()));
@@ -2583,6 +2596,7 @@ impl Node {
             cluster_install_rx,
             Arc::clone(&cluster_installed),
             Arc::clone(&snapshot_standby_instant_pub),
+            wire,
         );
         let cluster_artifact_hash = cluster_agent.artifact_hash_cell();
         // M14a + plan B2 (final review C1) + plan B3 T5: the declared set is
@@ -2610,6 +2624,7 @@ impl Node {
 
         // Consensus agent (the single writer of the term handle + commit counter).
         let mut consensus = Consensus {
+            wire,
             reports_unattested: Arc::clone(&reports_unattested),
             validated_frontier: cons_validated,
             validated_term: cons_validated_term,
@@ -2921,6 +2936,7 @@ impl Node {
 
         Ok(Node {
             node_id: cfg.id,
+            wire,
             cnc,
             term_handle,
             leader_flag,
@@ -3139,6 +3155,11 @@ impl Node {
     /// submit right now — as published on the cnc page (offset 3984).
     pub fn payload_ceiling(&self) -> usize {
         self.cnc.payload_ceiling() as usize
+    }
+
+    /// Wire-level spec §2.3: the wire-level range this node runs with.
+    pub fn wire_range(&self) -> WireRange {
+        self.wire
     }
 
     /// Jumbo spec §5.1: the path-MTU discovery ledger this node's sender,
@@ -3773,6 +3794,9 @@ struct PendingSnapshotReport {
 
 struct Consensus {
     id: NodeId,
+    /// Wire-level spec §3.1: this binary's range; `wire.max` is the byte
+    /// every consensus datagram carries at header offset 13.
+    wire: WireRange,
     /// Mirror of `ElectionSm::reports_unattested` for `Node::reports_unattested`.
     reports_unattested: Arc<AtomicU64>,
     /// Mirror of `ElectionSm::validated_up_to` for the receiver's reports.
@@ -5591,8 +5615,7 @@ impl Consensus {
                 position: 0,
                 leadership_term_id: self.sm.current_term(),
                 kind,
-                // Task 6: self.wire.max
-                wire: uc_protocol::WIRE_MAX,
+                wire: self.wire.max,
                 key_epoch: 0,
             },
         );
@@ -14103,8 +14126,7 @@ impl Consensus {
             "Consensus::send seals with one destination's pairwise key; kind {kind} is not \
              Scope::Pairwise — a fan-out kind belongs in `fan_out_group`, which seals ONCE"
         );
-        // Task 6: self.wire.max
-        let mut d = Self::stage(kind, position, term, body, uc_protocol::WIRE_MAX);
+        let mut d = Self::stage(kind, position, term, body, self.wire.max);
         if self.crypto.is_some() {
             let Some(&peer) = self.addr_to_id.get(&to) else {
                 self.crypto_unresolved_peer.fetch_add(1, Ordering::Relaxed);
@@ -14156,8 +14178,7 @@ impl Consensus {
             "fan_out_group seals once for every destination, which is only correct for \
              Scope::Group kinds; kind {kind} is not one"
         );
-        // Task 6: self.wire.max
-        let mut d = Self::stage(kind, position, term, body, uc_protocol::WIRE_MAX);
+        let mut d = Self::stage(kind, position, term, body, self.wire.max);
         if self.crypto.is_some() {
             // `now_ns` from the crypto plane's own clock, never
             // `Consensus::base` — `GroupPlane::sealing_epoch` compares it
@@ -16184,11 +16205,13 @@ mod tests {
             cluster_install_rx,
             Arc::clone(&cluster_installed),
             Arc::new(AtomicU64::new(0)),
+            WireRange::BINARY,
         );
 
         let (auto_fetch_audit, auto_fetch_audit_writer) =
             crate::audit::auto_fetch_audit_channel(AuditLog::open(dir.path()).unwrap(), 1);
         let mut cons = Consensus {
+            wire: WireRange::BINARY,
             reports_unattested: Arc::new(AtomicU64::new(0)),
             validated_frontier: Arc::new(AtomicU64::new(u64::MAX)),
             validated_term: Arc::new(std::sync::atomic::AtomicU32::new(0)),
@@ -23342,6 +23365,7 @@ mod tests {
             },
             Arc::clone(&h.cons.cluster_installed),
             Arc::new(AtomicU64::new(0)),
+            WireRange::BINARY,
         );
         drive_to_serving_leader(&mut h);
 
@@ -23442,6 +23466,7 @@ mod tests {
             },
             Arc::clone(&h.cons.cluster_installed),
             Arc::new(AtomicU64::new(0)),
+            WireRange::BINARY,
         );
         (h, hash)
     }

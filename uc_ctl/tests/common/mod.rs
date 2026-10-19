@@ -68,6 +68,7 @@ pub fn start_node(root: &Path, name: &str, app: &str) -> (Node, PathBuf) {
         admin: AdminPolicy::Filesystem,
         backup: None,
         tier_source: None,
+        wire: None,
     };
     let node = Node::start_with(cfg, opts).expect("start");
     (node, instance_dir)

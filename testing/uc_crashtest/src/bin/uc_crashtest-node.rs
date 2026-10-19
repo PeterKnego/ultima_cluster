@@ -18,7 +18,7 @@ use std::time::Duration;
 use clap::Parser;
 use uc_consensus::election::NodeId;
 use uc_net::fault::FaultConfig;
-use uc_node::{CryptoConfig, Node, NodeConfig};
+use uc_node::{CryptoConfig, Node, NodeConfig, StartOpts};
 
 #[derive(Parser)]
 struct Args {
@@ -162,7 +162,15 @@ fn main() -> anyhow::Result<()> {
         }),
     };
 
-    let node = Node::start(cfg)?;
+    // Wire-level spec §6.2: `UC2_WIRE_RANGE=min,max`, honoured only when
+    // `uc_node/wire-level-override` is compiled in.
+    let node = Node::start_with(
+        cfg,
+        StartOpts {
+            wire: uc_node::wire::range_from_env(),
+            ..Default::default()
+        },
+    )?;
     // Anti-vacuity signal (M8 Task 15): a real crypto epoch is a LEADER-ONLY
     // mint (`Node::crypto_epoch`'s doc), so this only fires once this process
     // actually wins an election under crypto — proof wire crypto genuinely

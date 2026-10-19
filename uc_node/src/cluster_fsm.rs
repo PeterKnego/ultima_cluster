@@ -32,7 +32,7 @@ use uc_protocol::v2::schedule::{
 };
 use uc_protocol::v2::settings::{
     FSM_LAG_LOCKSTEP, MIN_FSM_LAG_BYTES, Settings, WIRE_RAISE_KEEP, WIRE_RAISE_MANUAL,
-    decode_settings, encode_settings,
+    decode_settings, decode_settings_at, encode_settings,
 };
 use uc_protocol::v2::upgrade::{
     RowGenesis, RowRunning, SnapshotReport, UpgradePin, decode_pin_list, decode_report_list,
@@ -836,6 +836,17 @@ impl ClusterFsm {
                 }
                 Ok(())
             }
+        }
+    }
+
+    /// True iff `body` is a CLUSTER record this level knows how to decode:
+    /// a known kind, a clean prefix, and a payload `decode_command` accepts —
+    /// Settings through `decode_settings_at(level, ..)`.
+    pub fn decodable_at(level: u8, body: &[u8]) -> bool {
+        match read_cluster_prefix(body) {
+            None => false,
+            Some((ClusterKind::Settings, p)) => decode_settings_at(level, p).is_some(),
+            Some((k, p)) => ClusterFsm::decode_command(k, p).is_some(),
         }
     }
 

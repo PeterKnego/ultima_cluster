@@ -133,6 +133,7 @@ fn main() -> ExitCode {
             admin,
             backup: opts.backup.clone(),
             tier_source: opts.tier_source.clone(),
+            wire: uc_node::wire::range_from_env(),
         },
     ) {
         Ok(n) => n,

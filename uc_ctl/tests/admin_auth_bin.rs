@@ -68,6 +68,7 @@ fn start_node(root: &Path, name: &str, policy: AdminPolicy) -> (Node, PathBuf) {
         admin: policy,
         backup: None,
         tier_source: None,
+        wire: None,
     };
     let node = Node::start_with(cfg, opts).expect("start");
     (node, instance_dir)
