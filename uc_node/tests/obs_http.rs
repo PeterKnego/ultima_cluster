@@ -570,6 +570,29 @@ fn a_scrape_carries_every_backup_tier_family() {
     srv.stop();
 }
 
+/// Wire level (spec §5.3): the five `uc2_wire_*` families are on every scrape,
+/// including the labeled ones (header at least, never absent).
+#[test]
+fn a_scrape_carries_every_wire_level_family() {
+    let (srv, _sources) = synthetic_server();
+    let (status, body) = get(srv.local_addr(), "/metrics");
+    assert_eq!(status, 200);
+    for name in [
+        "uc2_wire_level",
+        "uc2_wire_binary_min",
+        "uc2_wire_binary_max",
+        "uc2_wire_member_max",
+        "uc2_wire_datagrams_refused_total",
+    ] {
+        assert!(body.contains(&format!("# TYPE {name} ")), "{name}: {body}");
+        assert!(
+            uc_node::obs::metrics::CONTRACT_SERIES.contains(&name),
+            "{name}"
+        );
+    }
+    srv.stop();
+}
+
 /// Cluster view: the unix door (`<instance_dir>/obs.sock`) serves the same
 /// router as the TCP one, with no TCP listener at all, and `stop` unlinks
 /// the socket file it bound.
