@@ -121,6 +121,11 @@ deferred by name:
   changes. `docs/notes/uc2-aeron-cluster-upgrade-model.md` is the
   comparator: Aeron Cluster has no supported rolling upgrade and no
   committed level. Leadership transfer is not covered by either note.
+- **Taken up 2026-10-19** — the wire level is specified in
+  `docs/superpowers/specs/2026-10-19-uc2-wire-level-design.md` (#31, for
+  `2.15.0`: Settings v7 `wire_level`/`wire_raise`, the datagram header byte
+  as the report, encode-at-the-committed-level, one level back, auto or
+  operator raise); the per-row level (#66) follows it with its own spec.
 
 ### 4. Geo — async cross-region learner with a stale-read mode
 
