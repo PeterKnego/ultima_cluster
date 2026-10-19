@@ -1063,6 +1063,6 @@ mod tests {
     fn cnc_3_4_carries_the_min_position_flag() {
         assert_eq!(CNC_V2_VERSION, (3 << 24) | (5 << 16));
         assert_eq!(CNC_MIN_POSITION_MINOR, 4);
-        assert!(((CNC_V2_VERSION >> 16) & 0xFF) >= CNC_MIN_POSITION_MINOR);
+        const { assert!(((CNC_V2_VERSION >> 16) & 0xFF) >= CNC_MIN_POSITION_MINOR) };
     }
 }
