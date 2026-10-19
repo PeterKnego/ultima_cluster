@@ -23,6 +23,46 @@ against today's tree in §1.2),
 FSM upgrade lifecycle spec's §9.2 Track 2.
 **Release:** `2.15.0`. Wire `0.11.0` → `0.12.0`, cnc `3.4` → `3.5`.
 
+#### Errata (plan, as discovered 2026-10-19) — read before the body
+
+Exploration of `b361eb29` for the implementation plan corrected seven
+details of the chat design. The plan implements these, not the body.
+
+1. **§3.4, the unknown-kind drop is not in the receiver.** Replication stores
+   frames as bytes; the silent `42 … applied advances` lives in
+   `ClusterFsm::apply` (`uc_node/src/cluster_fsm.rs`). The fail-stop
+   `ClusterRecordUndecodable` therefore sits in the **cluster agent**, which
+   checks a `CLUSTER` record decodes at the committed level before handing
+   it to the pure FSM. The FSM's own `42` path is untouched.
+2. **§3.2 / §5.1, the receiver writes no peer slot.** The receiver knows a
+   sender only by socket address when crypto is off, and `NetEvent` carries
+   no header byte. The byte rides on `NetEvent::Report` (the
+   `APPEND_POSITION` durable report every follower and learner already
+   sends the leader), and the **consensus agent** keeps the table and writes
+   the slot word, exactly as it does `reported_durable`.
+3. **§5.1, the peer slot has no free word.** It is four 64-byte padded cells.
+   `wire_max` goes at `+8` by widening the first cell's struct in
+   `uc_log::cnc::PeerSlot`; same 256-byte stride, same writer as
+   `id_and_role`.
+4. **§4.1, nothing resets the band on a leadership change today.** "Reported
+   in this term" is implemented as one map clear in `Action::BecomeLeader`.
+5. **§4.3, `tier forget` is not forwarded.** A follower answers status 2 and
+   `uc2ctl` re-sends to the leader hint. `wire raise` does the same.
+6. **§2.2 / §5.2, the settings file is flat** (`uc_ctl/src/settings.rs`,
+   `deny_unknown_fields`). The key is `wire_raise = "auto" | "manual"`, not
+   a `[wire]` table.
+7. **§5.1, the cnc compatibility sentence is backwards.** `version_compatible`
+   accepts an OLDER page, so a 3.5 attacher reads a 3.4 page and a 3.4
+   attacher refuses a 3.5 page. That is the standing "restart a host's
+   processes together" rule for a cnc minor bump; it is per host, so it does
+   not break a roll, and the how-to says so.
+
+Also: `PathBelowCommittedMtu` is a fail-stop panic string in the consensus
+agent, not an enum; the two level refusals use the same idiom in the cluster
+agent (daemon exit 1, name on stderr), and the test-only range override
+lives on `StartOpts` (which has `Default`), not `NodeConfig` (which has ~150
+literal call sites).
+
 ## 1. Goal and locked decisions
 
 ### 1.1 Goal
