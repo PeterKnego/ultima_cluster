@@ -108,7 +108,8 @@ non-zero entry means "reported in this term".
   would stop a healthy node.
 
 Both are process exits (the daemon exits 1 with the name on stderr) and both
-write a `wire_level_fault` record with the level and the binary's range.
+write a `wire_level_fault` record naming the fault, the level and the
+binary's range.
 Neither is a wipe: nothing in the instance directory is wrong, only the
 binary.
 

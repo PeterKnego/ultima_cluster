@@ -575,9 +575,14 @@ transport setting, both measured closed-loop at inflight 1 on 8-vCPU
   history never trips it. The binary is too new: install the release the
   message names (level + 1) first, stop-all upgrades included. Neither needs
   a wipe; nothing in the instance directory is wrong. `ClusterRecordUndecodable`
-  — a committed `CLUSTER` record does not decode at the committed level,
-  which a correct peer cannot produce: the journal is corrupt or a peer
-  broke the level. Restore from backup. **A node that never joins and prints
+  — a committed `CLUSTER` record no correct peer could have written at the
+  committed level (an unknown kind, or a `Settings` version above the
+  level's; the record's `reason` says which): the journal is corrupt or a
+  peer broke the level. A journal that reaches back before `2.11.0` holds
+  pre-cluster-FSM `CONFIG` frames that can read this way — give it a cluster
+  artifact first (`uc2ctl snapshot` on a node that has one); otherwise
+  restore from backup. A known kind with a malformed payload is not this
+  stop: it is the cluster FSM's ordinary refusal 42. **A node that never joins and prints
   `wire_refused` lines instead** is two or more levels away from its peers
   (refused both ways on header byte 13): it waits in `NodeBooting` and does
   not fail-stop. Install a binary within one level of the cluster's.
