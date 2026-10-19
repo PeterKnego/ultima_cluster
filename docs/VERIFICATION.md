@@ -29,7 +29,7 @@ record it summarizes; where the two disagree, the dated record wins.
 | **Elle** | Checked on real processes | Transactional safety (serializable and strict), single- and two-FSM — plus a mutation tier proving the harness has teeth |
 | **Multi-process crashtest** | Checked on real processes | Recovery correctness under `SIGKILL` mid-load — single- and two-FSM |
 | **loom** | Exhaustive over interleavings | The frame-visibility memory protocol, the MPSC ring's per-record commit protocol, the Broadcast ring's seqlock read barrier, **and the follower write-reserve seqlock (#78)** |
-| **Fuzzing (libFuzzer)** | Checked under coverage-guided input search | Totality of the twenty-six decoders that see bytes the process did not write |
+| **Fuzzing (libFuzzer)** | Checked under coverage-guided input search | Totality of the twenty-seven decoders that see bytes the process did not write |
 | **Miri** | Checked under a symbolic interpreter | Undefined behaviour in the pure wire/journal decoders and `uc_remote`'s Vec-backed SPSC internals (**not** the file-backed rings) |
 | **Veil** | Bug-hunting only — **never the record** | Bounded model checking of the election and reconfiguration planes |
 | **`log_clock` unit suite** | Ordinary unit tests | The monotonic log clock's pure arithmetic (`uc_node::log_clock`): steady state, forward-step adoption, backward-step smear and full retirement, tolerance, multiple resamples against a smear in flight (`a_smear_in_flight_is_not_re_reported_and_the_gauge_counts_down`: one step reported, the remaining-smear gauge strictly falling, no undershoot, over 3 000 resamples), a seeded-random step sequence, and `bracket_sample`/`resample_slow` against the real clock — 17 tests, `cargo test -p uc_node --lib log_clock` |
@@ -1027,7 +1027,7 @@ failure in Rust, but on a node it is a fail-stop: the datagram path runs on the
 receiver agent and `apply` runs on the service's apply thread, so a panic there
 takes the process down. Availability is the thing being defended here.
 
-### The twenty-six targets
+### The twenty-seven targets
 
 | Target | Seam, and why its input is untrusted |
 |---|---|
@@ -1057,6 +1057,7 @@ takes the process down. Availability is the thing being defended here.
 | `uc_protocol_probe` | jumbo spec §4.2 — `uc_protocol::v2::datagram`'s path-MTU probe codecs, `read_probe_rung` and `read_probe_ack_body`/`write_probe_ack_body`. `Scope::Pairwise`: reached by any peer that can put a UDP datagram on the wire, ahead of the commit rule that consumes the result. |
 | `uc_protocol_status_body` | `uc_protocol::v2::datagram::{read_status_body, write_status_body}` — the fixed-length status body. A PROPERTY target: anything the reader accepts must re-encode and read back equal. |
 | `uc_node_tier_object` | backup-tier spec §4 — `uc_node::tier::object::ObjectReader` over an arbitrary object stream (48-byte header, 1 MiB blocks with length and CRC, both codecs, read bounded to 64 MiB) plus `layout::SetLabel::parse` and `TierInfo::parse` on lossy UTF-8. The tier is a directory on a mount an operator points at, so a restore, `verify` or fork meets whatever bytes that mount holds. |
+| `uc_protocol_compat` | wire-level spec §6.1 — `decode_settings_at` and the datagram `wire` byte under a fuzz-chosen committed level: level-aware Settings decode + datagram byte, nothing above the level is accepted. A PROPERTY target alongside the no-panic one. |
 
 ### Method
 

@@ -2030,6 +2030,14 @@ pub fn uc_protocol_settings() -> Vec<Seed> {
         v[0] = 5;
         v
     };
+    // Wire-level spec: the v6 shape (47 B, no wire_raise) is a live corpus
+    // value - it decodes with wire_raise = WIRE_RAISE_AUTO.
+    let v6 = {
+        let mut v = genesis.clone();
+        v.truncate(SETTINGS_LEN_V6);
+        v[0] = 6;
+        v
+    };
     let mut bad_version = genesis.clone();
     bad_version[0] = 3;
     let mut bad_target = genesis.clone();
@@ -2048,6 +2056,7 @@ pub fn uc_protocol_settings() -> Vec<Seed> {
         Seed::fixed("08-version-3", v3),
         Seed::fixed("09-version-4", v4),
         Seed::fixed("10-version-5", v5),
+        Seed::fixed("11-version-6", v6),
     ]
 }
 
@@ -2149,5 +2158,21 @@ pub fn uc_protocol_status_body() -> Vec<Seed> {
         Seed::fixed("03-v1-16-byte", v1),
         Seed::fixed("04-wrong-layout", wrong_layout),
         Seed::fixed("05-one-short", short),
+    ]
+}
+
+/// `uc_protocol_compat` - the wire-level spec §6.1 level-aware decode. Byte 0
+/// is the committed level, the rest an untrusted record: a v7 genesis Settings
+/// record at level 12, and a `DATA` datagram header stamped with wire 12.
+pub fn uc_protocol_compat() -> Vec<Seed> {
+    use uc_protocol::v2::settings::{Settings, encode_settings};
+
+    let mut record = vec![12u8];
+    encode_settings(&Settings::genesis_default(), &mut record);
+    let mut header = vec![12u8];
+    header.extend_from_slice(&datagram(DGRAM_KIND_DATA, 0x40, 1, &[]));
+    vec![
+        Seed::fixed("01-level-12-settings-v7", record),
+        Seed::fixed("02-level-12-data-header", header),
     ]
 }
