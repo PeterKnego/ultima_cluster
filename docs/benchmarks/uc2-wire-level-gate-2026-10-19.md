@@ -30,12 +30,23 @@ start with `UC2_WIRE_RANGE=12,12` (the old side). A fourth host drives load
 (`client-remote` through each node's edge, `count` FSM) for the whole roll.
 Each node in turn is killed and restarted with `UC2_WIRE_RANGE=12,13`; the
 driver waits for its `uc2_agent_alive{agent="cluster"}` to read 1 and samples
-`uc2_commit_position` on a surviving node, recording the longest interval
-without movement as that restart's gap. Then every node's `uc2_wire_level`
-must read 13 within 60 s. Commit sampling starts before each kill and runs through the cluster-agent
-wait, scraping both surviving nodes and taking the max; its resolution is one
-ssh scrape tick (~1 s). Finally the load stops and `m12_gate check-fsms`
-checks FSM state agreement across nodes. Linearizability under the roll is
+`uc2_commit_position` on the surviving nodes, recording the longest interval
+over which the sampled position did not rise above its high-water mark as
+that restart's gap. Only a rise ends a stall: a dip in the sampled max (one
+survivor silent for a tick, or a failover stepping the exported position
+back before it climbs again) is not movement, so it cannot split one stall
+into two short ones ([#183](https://github.com/PeterKnego/ultima_cluster/issues/183)).
+Then every node's `uc2_wire_level` must read 13 within 60 s. Commit sampling
+starts before each kill and runs through the cluster-agent wait, scraping
+both surviving nodes and taking the max; a tick on which neither answers is
+skipped, and the per-roll log line counts skipped and partial ticks so a
+sampler that lost its observers is visible. A stall is measured from its
+first sample at the mark to the first sample above it, the upper bound: it
+over-reads by at most one ssh scrape tick (~1 s, the resolution), a blind
+stretch of skipped ticks counts as stall because nothing proves commit moved
+while no observer answered, and a stall shorter than a tick is invisible.
+Finally the load stops and `m12_gate check-fsms` checks FSM state agreement
+across nodes. Linearizability under the roll is
 proven by the two-binary crashtest
 (`testing/uc_crashtest/tests/rolling_upgrade.rs`, WGL on a real history); this
 row proves the cross-host roll, the commit gap and the level.
