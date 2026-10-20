@@ -94,7 +94,7 @@ joiner not converging?", and they split it cleanly between the two ends:
 | `uc2_snapshot_intake_io_failures_total` | joiner | this node's disk: a `.part` that could not be created or written, or a completed artifact whose fsync/rename failed. Retried, so a *rising* count — not a nonzero one — is the signal. Since 2.8.1 a failed publish is retried at most once per 250 ms per transfer, on the duty cycle **and** on the chunk path, so a standing obstacle makes this climb at about four per second — not at the poll rate, and not once per arriving chunk. A transfer whose later artifacts are still streaming past a blocked earlier one is the case that used to make it climb per chunk. |
 | `uc2_snapshot_intake_abandoned_total` | joiner | a transfer saw no chunk for 60 s and was dropped: its **unfinished** `.part` files are removed, while an artifact it had already published stays on disk to be adopted or superseded by the next session. On its own this says the leader (or the link) went away mid-transfer, and this node keeps NAKing for a fresh session. **But if `uc2_snapshot_intake_io_failures_total` is rising at the same time the cause is local** — this node's snapshot directory — and the set is being re-downloaded on a ~60 s loop until it is cleared: the bytes land, the install blocks, no further chunk arrives, the sender times out at 30 s, this timer fires at 60 s, and a fresh session starts the whole set again. |
 | `uc2_snapshot_open_failed_total` | leader | this node could not open an artifact its own snapshot store had just listed, so it refused to ship the set. A one-off is a purge racing a session; a persistent count means look at *this* node's snapshot directory while a peer is trying to join. |
-| `uc2_snapshot_begin_undecodable_total` | joiner | one refused session per count, because the sender's `SNAP_BEGIN` could not be decoded at all — the realistic wire-0.5.0 flag-day shape. Nonzero means the fleet is mixed-version; upgrade every node together. |
+| `uc2_snapshot_begin_undecodable_total` | joiner | one refused session per count, because the sender's `SNAP_BEGIN` could not be decoded at all — the realistic wire-0.5.0 flag-day shape. A rolling upgrade within one wire level is mixed-version by design and does not move it; nonzero means a node is outside the level rule (a pre-`2.15.0` binary, or a broken peer) — finish the flag day, or replace that node. |
 | `uc2_snapshot_refused_legacy_peer_total` | joiner | every such datagram, not every session — the leader re-sends a `SNAP_BEGIN` every 20 ms, so this one measures the resend cadence. Read the row above it for "how many sessions". |
 
 One more mixed-version witness, outside the snapshot session:
@@ -103,8 +103,12 @@ counts `STATUS` datagrams a leader could not read — in practice a
 wire-`0.10.0` follower's 16-byte body under a `0.11.0` leader. They are
 dropped, so that follower's flow-control window never opens and replication
 to it stalls; each source is also named on stderr as `status_refused`, at
-most once a minute. Nonzero means the fleet is mixed-version: upgrade every
-node together.
+most once a minute. A rolling upgrade within one wire level is mixed-version
+by design and does not move it. Nor does a pre-`2.15.0` peer: since `0.12.0`
+its datagrams are refused whole at the header's wire byte, before any
+`STATUS` body is read (`uc2_wire_datagrams_refused_total{reason="prelevel"}`
+counts those). Nonzero here means a peer at an accepted level whose `STATUS`
+body still could not be decoded — a broken or foreign binary; replace it.
 
 Two families worth calling out because their shape is easy to misread:
 `uc2_ingress_holes_skipped_total` and `uc2_query_holes_skipped_total`

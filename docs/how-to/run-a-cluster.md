@@ -341,8 +341,10 @@ your gateway wants to route proactively rather than on rejection.
 
 ## What a planned restart costs
 
-A `systemctl restart uc2-node` (or stop, upgrade binary, start) is cheap by
-design, and the [M9 gate](../benchmarks/uc2-m9-gate-2026-08-19.md) measured it
+A `systemctl restart uc2-node` (or stop, upgrade binary, start — an upgrade
+only for a release within one wire level of the cluster's, since `2.15.0`; see
+[Rolling upgrades since 2.15.0](upgrade-a-cluster.md#rolling-upgrades-since-2150))
+is cheap by design, and the [M9 gate](../benchmarks/uc2-m9-gate-2026-08-19.md) measured it
 on a real fleet under sustained load:
 
 - **Stop is sub-second.** `SIGTERM` to process exit measured 0.042–0.098 s
@@ -357,8 +359,9 @@ on a real fleet under sustained load:
   confirmed back at baseline within 10.5 s of the `SIGTERM` — an upper bound
   dominated by the measurement's own SSH round-trips, not the cluster.
 
-For a rolling restart (a binary upgrade, say), restart followers first and the
-leader last, so the cluster pays that election exactly once.
+For a rolling restart (a binary upgrade within one wire level, say — any other
+upgrade is a stop-all [flag day](upgrade-a-cluster.md)), restart followers
+first and the leader last, so the cluster pays that election exactly once.
 
 ## Confirm the cluster is actually serving
 

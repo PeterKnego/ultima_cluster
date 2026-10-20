@@ -213,7 +213,9 @@ not consume whole (four of the five measured silent misparses; the
 length-identical reorder still needs the version tag), with no wire, cnc or
 API change.
 
-Next up, now that `2.14.0` is tagged and published (its #33 gate left #149 and #150 open): (1) **the standing bar
+Next up, now that `2.14.0` is tagged and published (its #33 gate left #149 and #150 open): (0) **#31, the committed
+wire level (rolling node upgrades), is merged** (PR #177, ships in `2.15.0`, unreleased) and **#66, the per-row
+level (rolling application upgrades), is next**; (1) **the standing bar
 question** — the `2.12.0` gates added two more rate bars an order of magnitude
 below the rig's variance, so four bars across two releases are now unadjudicable
 as written; how to construct a rate bar this rig can actually rule on is a
@@ -334,7 +336,13 @@ one log stream (#11); the release-ledger line (#5) is process, not code
   (`uc_protocol` stays a dev-only dependency). Explainer
   `docs/notes/uc2-read-your-writes-explained.md`.
 - **The wire protocol SHIPPED is 0.11.0** (`2.14.0`, cnc `3.4`, tagged
-  2026-10-17; `0.10.0` folded into it unreleased); `0.9.0` + cnc `3.3` was
+  2026-10-17; `0.10.0` folded into it unreleased). `main` is at wire `0.12.0`
+  / cnc `3.5` (unreleased, the committed wire level, PR #177): spec
+  `docs/superpowers/specs/2026-10-19-uc2-wire-level-design.md` (read its
+  errata 1–14 before the body), explainer
+  `docs/notes/uc2-wire-level-explained.md`, operator procedure
+  `docs/how-to/upgrade-a-cluster.md` § Rolling upgrades since 2.15.0.
+  `0.9.0` + cnc `3.3` was
   `2.13.0`, and `0.8.0` + cnc `3.2` was `2.12.0`. `0.9.0` adds `CLUSTER`
   kinds 4 `UpgradePin` and 5 `SnapshotReport` plus pairwise `SNAP_REPORT` 26,
   with no layout change either side — which is exactly why it is unsound to
@@ -347,11 +355,15 @@ one log stream (#11); the release-ledger line (#5) is process, not code
   either side, so a `0.7.0` peer drops the probes and such a cluster simply
   never raises its ceiling. `0.7.0` + cnc `3.1` was `2.11.0`.
   Before 0.7.0, `0.6.0` changed `SNAP_BEGIN` only; a `0.5.0` sender's session is refused by name,
-  so a mixed cluster stalls a joiner rather than installing half a set); the
-  node↔node wire and the `cnc.dat` page layout are **flag days, never
-  mixed-version** — a 0.4.0 peer's durable report reads as unattested and is
-  not counted, so a mixed cluster stalls commits rather than making unsound
-  ones; upgrade all nodes together. The client↔gateway remote protocol is
+  so a mixed cluster stalls a joiner rather than installing half a set);
+  through `2.14.0` the node↔node wire and the `cnc.dat` page layout were
+  **flag days, never mixed-version** — a 0.4.0 peer's durable report reads
+  as unattested and is not counted, so a mixed cluster stalls commits rather
+  than making unsound ones. On `main` (`2.15.0`, unreleased) a wire **minor**
+  is a committed **level** and rolls one node at a time within one level
+  (`WIRE_MIN = WIRE_MAX - 1`); `2.14.0` → `2.15.0` is the last additive flag
+  day; wire and cnc **majors** stay flag days; a cnc minor restarts a host's
+  processes (node, services, clients, gateway) together. The client↔gateway remote protocol is
   separate: v1 through `2.13.0`, **v2 since `2.14.0`** (read-your-writes;
   see the cnc bullet above). What is API vs.
   what is flag-day: `docs/reference/semver-policy.md`.
@@ -713,6 +725,7 @@ cargo build -p uc_lincheck --features replay-bin --bin register-replay \
 cargo test -p uc_node --test lin_v2             # WGL linearizability capstone (failover + purge/snapshot churn)
 cargo test -p uc_node --test lin_partition_v2   # network-partition / quorum-loss linearizability
 cargo test -p uc_crashtest --features hard-crash-tests   # spawn real node+service procs; SIGKILL mid-load, assert linearizable
+cargo test -p uc_crashtest --features hard-crash-tests,wire-level-override --test rolling_upgrade   # two-binary roll; before EVERY tag set UC2_BASE_NODE_BIN=<previous release's uc_crashtest-node>
 cargo test -p uc_diffreplay --test pin_verify -- --test-threads=1   # pin-verify e2e: real node + two service procs per case
 cargo clippy --workspace --all-targets -- -D warnings     # lint (must pass with zero warnings)
 CARGO_TARGET_DIR=$HOME/.cache/cargo-target-msrv cargo +1.89.0 clippy --workspace --all-targets --locked -- -D warnings  # the MSRV gate — RUN IT BEFORE EVERY PUSH
@@ -1117,8 +1130,10 @@ most** — mechanics, refusal codes, metric lists, gate row-by-row results and
 caveats belong in `docs/releases.md` or the linked doc, never here. A section
 is a one-line summary plus a link to its `docs/releases.md` entry, then:
 
-0. an **upgrade** bullet when the release has a flag day or an operator step,
-   linking to `docs/how-to/upgrade-a-cluster.md`;
+0. an **upgrade** bullet on every release, stating its wire minor and whether
+   it rolls (within one wire level of the previous) or is a declared flag day
+   (a safety fix that must not run beside pre-fix binaries is declared one),
+   plus any operator step, linking to `docs/how-to/upgrade-a-cluster.md`;
 1. one bullet per **feature**, briefly explained, each linking to a separate
    detailed doc (how-to / reference / `docs/notes/` explainer) — **write the
    detailed doc if it does not exist yet**;

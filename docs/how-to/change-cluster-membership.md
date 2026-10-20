@@ -260,8 +260,13 @@ Reusing a directory across ids is undefined behaviour, not merely discouraged.
 
 ## Upgrading a mixed-version cluster
 
-Finish the rolling restart, then reconfigure. Reconfiguring during the upgrade
-window is not supported.
+A [rolling upgrade](upgrade-a-cluster.md#rolling-upgrades-since-2150) has no
+special case for membership: the raise reads the committed membership each
+time it is evaluated. A member added during a roll blocks the raise until it
+reports a level above the committed one, and a member removed stops counting,
+which is how you unblock a raise held by a dead member (`uc2ctl remove`).
+Nothing else is special; the argument is in
+[the wire level, explained](../notes/uc2-wire-level-explained.md#the-raise).
 
 ## If a change is refused
 

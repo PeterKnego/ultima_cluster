@@ -178,7 +178,8 @@ bytes it did not write is listed, guarded, and fuzzed.
 What is shipped, release by release — each feature with a link to its
 detailed doc — lives in **[RELEASES.md](/RELEASES.md)**. What it will not
 do, and what it does only under conditions — member and payload ceilings,
-flag-day upgrades, the crypto and admin residuals, what is not verified —
+upgrade rules (rolling within one wire level; flag days for majors), the
+crypto and admin residuals, what is not verified —
 is collected in **[Limits](/docs/reference/limits.md)**.
 
 ## License

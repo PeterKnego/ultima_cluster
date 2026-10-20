@@ -1,14 +1,14 @@
 # How to upgrade a cluster
 
-Run a scripted, whole-cluster upgrade with a measured downtime number:
-stop every node, verify they agree on what they hold, swap the binary, start
-everyone back up, and confirm one leader is serving again before declaring
-success.
+Upgrade a cluster one of two ways. From `2.15.0` on, the normal case is a
+**rolling upgrade, one node at a time under load**, for any release whose
+wire minor is within one level of the cluster's: see
+[Rolling upgrades since 2.15.0](#rolling-upgrades-since-2150).
 
-Since `2.15.0` a cluster can also be upgraded **one node at a time under
-load**, when the new release's wire minor is within one level of the
-cluster's: see [Rolling upgrades since 2.15.0](#rolling-upgrades-since-2150).
-The stop-all procedure below is still the one for `2.15.0` itself, for a wire
+The other is a scripted, whole-cluster **stop-all** upgrade with a measured
+downtime number: stop every node, verify they agree on what they hold, swap
+the binary, start everyone back up, and confirm one leader is serving again
+before declaring success. It is the procedure for `2.15.0` itself, for a wire
 major bump, and for any release whose notes call it a flag day.
 
 ## Why this was a flag day, until 2.15.0
@@ -39,6 +39,10 @@ section near the end of this page.
 
 ## Rolling upgrades since 2.15.0
 
+0. Take an off-node backup of every node before the first restart
+   ([Back up to a tier](back-up-to-a-tier.md), or
+   [`uc2ctl backup`](back-up-a-cluster.md)): after the raise it is the only
+   way back.
 1. Check the pair is permitted: the new release's wire minor is the cluster's
    level or one above it (`uc2ctl wire show` → `level=`; the release notes
    name the minor). Two above: install the middle release first — this is
@@ -52,7 +56,9 @@ section near the end of this page.
    instance directory (services, clients, the gateway — a cnc minor bump means
    they restart together, the standing per-host rule); install; start the
    node; wait for `can_serve` (`uc2ctl status`, or `/readyz`); start the
-   services; move on. Under load, commit stalls only while a quorum re-forms.
+   services; move on. Restart followers and learners first and the leader
+   last, so the roll costs one election. Under load, commit stalls only while
+   a quorum re-forms.
 4. `uc2ctl wire show` on the leader after the last host: `verdict: raisable`.
    Auto mode raises within a second; manual: `uc2ctl wire raise` — the
    point of no return. Until then you may roll any host back.
@@ -107,6 +113,13 @@ What each step leans on:
 - **Step 5, done.** `uc2ctl status` prints `wire: level=L binary=MIN..MAX` on
   every node, and `Uc2WireLevelBelowMembers` (30 m) has nothing left to fire
   on.
+- **Membership during a roll.** There is no special case: a member added
+  mid-roll blocks the raise until it reports a level above the committed one,
+  and a member removed stops counting
+  ([Change cluster membership](change-cluster-membership.md#upgrading-a-mixed-version-cluster)).
+  A lone node two levels ahead of the cluster never joins: it waits in
+  `NodeBooting`, printing throttled `wire_refused` lines that name its range —
+  install the middle release on it instead.
 
 Rolling back **before** the raise is the same procedure in reverse, one host
 at a time. **After** the raise there is no rollback onto the old binary — it
@@ -1499,10 +1512,10 @@ still the cluster FSM's ordinary refusal 42, as before `2.15.0`. With every node
   — the full `[admin]` key table and the `[crypto]` pairing this section's
   config choices depend on.
 - [Run a cluster on real hosts](run-a-cluster.md#what-a-planned-restart-costs)
-  — what an ordinary single-node planned restart costs, for context against a
-  whole-cluster flag day.
-- [Encrypt traffic between nodes](encrypt-node-traffic.md) — another
-  flag-day operation in this system, same "every node together" shape.
+  — what an ordinary single-node planned restart costs: each step of a
+  rolling upgrade, and the context against a whole-cluster flag day.
+- [Encrypt traffic between nodes](encrypt-node-traffic.md) — a flag-day
+  operation, unlike a rolling upgrade: every node together.
 - [`uc2ctl`](../reference/uc2ctl.md) — the `status` fields this script parses
   to drive its verification steps.
 - [The committed cluster wire level, explained](../notes/uc2-wire-level-explained.md)

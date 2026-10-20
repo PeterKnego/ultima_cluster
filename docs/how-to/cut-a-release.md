@@ -20,8 +20,11 @@ documentation for what it changes, because the tag is what people read.
 
 - [ ] A new section at the top of `RELEASES.md` (latest first) — a summary
       with links, **one or two sentences per bullet at most**: a one-line
-      summary linking the `docs/releases.md` entry; an upgrade bullet if there
-      is a flag day or operator step; one bullet per feature, each linking to
+      summary linking the `docs/releases.md` entry; an upgrade bullet that
+      states the wire minor and whether the release rolls (within one level
+      of the previous) or is a declared flag day — a safety fix that must not
+      run beside pre-fix binaries is declared a flag day here — plus any
+      operator step; one bullet per feature, each linking to
       a how-to/reference/explainer that **exists**; an optional bullet for
       fixed bugs; an optional bullet for performance, linking the gate doc.
       Detail goes in `docs/releases.md`, not here.
@@ -53,7 +56,7 @@ documentation for what it changes, because the tag is what people read.
       older level's file). A release that adds no wire feature keeps the
       wire minor and needs none of this — but still runs the rolling
       upgrade test above. The rule is
-      [the semver policy's level rule](../reference/semver-policy.md#the-wire-and-the-cnc-page-are-flag-day-not-semver).
+      [the semver policy's level rule](../reference/semver-policy.md#the-wire-and-the-cnc-page-levels-and-flag-days-not-semver).
 - [ ] A sweep of `QUICKSTART.md`, `docs/how-to/`, `docs/reference/` for
       statements this release invalidated. Upgrade consequences that refuse to
       start an old config (v2.6.0's `[crypto]`/`[admin]` sections, for

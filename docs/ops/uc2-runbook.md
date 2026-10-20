@@ -34,7 +34,7 @@ verify rather than a build:
   level of the cluster's.
 - **Which versions go together, and what may change under you:**
   [the semver policy](../reference/semver-policy.md). One version number
-  covers the tag, all twelve crates, the tarballs and the image.
+  covers the tag, all fourteen crates, the tarballs and the image.
 - Cutting one of these releases (maintainers): [Cut a release](../how-to/cut-a-release.md).
 
 ## Running a cluster
@@ -360,9 +360,10 @@ transport setting, both measured closed-loop at inflight 1 on 8-vCPU
   material, the flag-day rollout, health counters, and rotation; pair with
   `[admin] auth = "hmac"` — see its "Known interaction with admin
   authentication" section. *Was §11.*
-- [Upgrade a cluster](../how-to/upgrade-a-cluster.md) — a scripted flag-day
-  binary upgrade (`scripts/uc2_flag_day.sh`), the traffic-stop prerequisite,
-  a measured downtime number, and (M12b) the `[crypto].enabled`/`[admin]`
+- [Upgrade a cluster](../how-to/upgrade-a-cluster.md) — both procedures: the
+  rolling upgrade within one wire level (next bullet) and the scripted
+  stop-all flag day (`scripts/uc2_flag_day.sh`) with its traffic-stop
+  prerequisite and a measured downtime number, and (M12b) the `[crypto].enabled`/`[admin]`
   config-choice note every M9–M11 `node.toml` needs before it starts on
   `v2.6.0`+.
 - **Roll an upgrade one node at a time** (since `2.15.0`). Permitted when the

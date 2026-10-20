@@ -209,6 +209,16 @@ Also stated, in the documents that own them:
   every restart and there is no downgrade path. The remedy is the one this
   model already names — `[crypto].enabled = true` on any network where an
   attacker can inject datagrams.
+- **With crypto OFF, a spoofed datagram can misstate a member's `wire_max`**
+  (`2.15.0`, the committed wire level; stated here, not in the explainer).
+  A member's report is header byte 13 of every datagram it sends, attributed
+  by source address and authenticated as AAD only with crypto on
+  ([the explainer § Reports and refusals](/docs/notes/uc2-wire-level-explained.md#reports-and-refusals)).
+  With crypto off a forged datagram from an old member's address, claiming
+  the new max, can satisfy the leader's raise predicate early; the real
+  member then fail-stops with `WireLevelAboveBinary`, and the raise is
+  one-way (the level never lowers). Same threat class and same remedy as the
+  forged `PROBE_ACK` above.
 - **An unauthenticated remote client on a gateway can fail-stop a typed-tier
   service pre-commit with one malformed query frame** (the blanket impl's
   decode `.expect`); the raw tier is the workaround — [attack
