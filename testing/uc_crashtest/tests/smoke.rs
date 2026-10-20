@@ -19,7 +19,7 @@ use common::{connect_with_retry, spawn_node, spawn_service, submit_until_ok, wai
 
 #[test]
 fn write_then_read_across_processes() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::tempdir(); // the target volume, never tmpfs (#182)
     let inst = tmp.path().join("inst");
     std::fs::create_dir_all(&inst).unwrap();
 
@@ -48,4 +48,51 @@ fn write_then_read_across_processes() {
 
     client.shutdown();
     // _node / _svc dropped here → killed + reaped.
+}
+
+/// #182: a real `Violation` dumps its history on the target volume beside the
+/// instance dirs, never on `/tmp`, and the panic names the file. One client
+/// writes 1 and then reads 2 back: no linearization explains that.
+#[test]
+fn a_violation_dump_lands_under_the_target_tmpdir() {
+    use uc_lincheck::history::{Entry, Outcome};
+    use uc_lincheck::model::{Op, RegResp};
+    let entries = vec![
+        Entry {
+            client: 0,
+            op: Op::Write(1),
+            invoke: 0,
+            ret: 1,
+            outcome: Outcome::Ok(RegResp::Ack),
+        },
+        Entry {
+            client: 0,
+            op: Op::Read,
+            invoke: 2,
+            ret: 3,
+            outcome: Outcome::Ok(RegResp::Value(Some(2))),
+        },
+    ];
+    let path = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("uc2_pin182_history_t.txt");
+    let _ = std::fs::remove_file(&path);
+    let r = std::panic::catch_unwind(|| common::assert_linearizable(&entries, "pin182", "t"));
+    let msg = match r {
+        Ok(()) => panic!("a contradictory history was judged linearizable"),
+        Err(e) => e
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
+            .unwrap_or_default(),
+    };
+    assert!(path.is_file(), "dump missing at {}", path.display());
+    assert!(
+        !path.starts_with("/tmp"),
+        "dump on tmpfs: {}",
+        path.display()
+    );
+    assert!(
+        msg.contains(&path.display().to_string()),
+        "panic does not name the dump: {msg}"
+    );
+    let _ = std::fs::remove_file(&path);
 }

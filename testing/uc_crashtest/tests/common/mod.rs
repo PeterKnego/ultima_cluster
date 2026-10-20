@@ -645,8 +645,12 @@ pub fn join_workers(handles: Vec<std::thread::JoinHandle<()>>) {
 }
 
 /// Check the collected history and panic (dumping it) on a real Violation.
-/// `dump_prefix` names the per-test dump file
-/// (`/tmp/uc2_<dump_prefix>_<tag>.txt`).
+/// `dump_prefix` names the per-test dump file,
+/// `<CARGO_TARGET_TMPDIR>/uc2_<dump_prefix>_history_<tag>.txt` — the same
+/// real-disk root [`tempdir`] uses, never `/tmp` (tmpfs on a dev box, and the
+/// dump lands while three nodes and the workload are still alive). It is a
+/// sibling of the instance dirs, not inside one, so it survives their cleanup;
+/// the panic message carries the full path.
 pub fn assert_linearizable(entries: &[uc_lincheck::history::Entry], dump_prefix: &str, tag: &str) {
     match check_register(entries) {
         Verdict::Linearizable => {
@@ -661,17 +665,22 @@ pub fn assert_linearizable(entries: &[uc_lincheck::history::Entry], dump_prefix:
             // Dump the full history so a Violation is reproducible offline
             // (the checker is deterministic on a captured history even
             // though the crash interleaving is not).
-            let path = format!("/tmp/uc2_{dump_prefix}_history_{tag}.txt");
+            let path = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
+                .join(format!("uc2_{dump_prefix}_history_{tag}.txt"));
             let mut s = String::new();
             for e in entries {
                 s.push_str(&format!("{e:?}\n"));
             }
             let _ = std::fs::write(&path, s);
             eprintln!(
-                "[{dump_prefix}] history ({} entries) dumped to {path}",
-                entries.len()
+                "[{dump_prefix}] history ({} entries) dumped to {}",
+                entries.len(),
+                path.display()
             );
-            panic!("{dump_prefix} history NOT linearizable (tag {tag})");
+            panic!(
+                "{dump_prefix} history NOT linearizable (tag {tag}); history dumped to {}",
+                path.display()
+            );
         }
     }
 }

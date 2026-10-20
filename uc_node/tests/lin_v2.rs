@@ -49,15 +49,21 @@ fn tempdir() -> tempfile::TempDir {
 
 /// Dump the full history so a `Violation` reproduces offline (the checker is
 /// deterministic on a captured history even though the cluster interleaving is
-/// not).
+/// not). Written under `CARGO_TARGET_TMPDIR`, the real-disk root [`tempdir`]
+/// uses — never `/tmp`, which is tmpfs on a dev box (#182).
 fn dump_history(entries: &[Entry], seed: u64) {
-    let path = format!("/tmp/lin_v2_history_{seed}.txt");
+    let path = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("lin_v2_history_{seed}.txt"));
     let mut s = String::new();
     for e in entries {
         s.push_str(&format!("{e:?}\n"));
     }
     let _ = std::fs::write(&path, s);
-    eprintln!("history ({} entries) dumped to {path}", entries.len());
+    eprintln!(
+        "history ({} entries) dumped to {}",
+        entries.len(),
+        path.display()
+    );
 }
 
 // ------------------------------------------------------------------- smoke
@@ -1749,4 +1755,21 @@ fn two_fsm_timer_churn_under_failover() {
             )
         }
     }
+}
+
+/// #182: a violation's history dump lands on the target volume beside the
+/// instance dirs, never on `/tmp`.
+#[test]
+fn a_history_dump_lands_under_the_target_tmpdir() {
+    let seed = 0x1820_u64;
+    dump_history(&[], seed);
+    let path = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("lin_v2_history_{seed}.txt"));
+    assert!(path.is_file(), "dump missing at {}", path.display());
+    assert!(
+        !path.starts_with("/tmp"),
+        "dump on tmpfs: {}",
+        path.display()
+    );
+    let _ = std::fs::remove_file(&path);
 }
