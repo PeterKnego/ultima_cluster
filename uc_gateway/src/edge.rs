@@ -792,6 +792,61 @@ impl Shared {
     }
 }
 
+// ---------------------------------------------------------------- obs
+
+/// Read-only observability readings over a running [`Edge`] — see
+/// [`Edge::obs`]. Every read is a load or a table walk at the caller's
+/// cadence (a scrape); nothing here touches the per-frame path.
+#[derive(Clone)]
+pub struct EdgeObs {
+    shared: Arc<Shared>,
+}
+
+impl EdgeObs {
+    /// The same snapshot as [`Edge::stats`].
+    pub fn stats(&self) -> EdgeStats {
+        self.shared.stats.snapshot()
+    }
+
+    /// The edge's total grant budget — [`budget_for`] of the `Engine`
+    /// window. Fixed at start.
+    pub fn grant_budget(&self) -> u32 {
+        self.shared.budget
+    }
+
+    /// The live sum of every ready connection's outstanding credits — the
+    /// quantity [`EdgeObs::grant_budget`] bounds (and what
+    /// `grants_for_tests` samples per connection). Summed by walking the
+    /// connection table at read time rather than kept as a running total:
+    /// credits move per frame (a squeeze halves them, a completion relaxes
+    /// them back), so a running sum would cost an atomic on the hot path for
+    /// a number only a scrape reads. Can exceed the budget only in the one
+    /// documented case, `max_connections > budget` (the floor of 1 credit
+    /// per connection — see [`grant_for`]).
+    pub fn grant_outstanding(&self) -> u64 {
+        let mut sum = 0u64;
+        self.shared.table.for_each(|c| {
+            if c.is_ready() {
+                sum += u64::from(c.credits());
+            }
+        });
+        sum
+    }
+
+    /// The edge has taken itself out of service — see [`Edge::is_faulted`].
+    pub fn is_faulted(&self) -> bool {
+        self.shared.is_faulted()
+    }
+
+    /// The node's own heartbeat word off the cnc page this edge holds open
+    /// (Unix ns, stamped by the node's consensus agent). A node that died
+    /// without its supervisor noticing leaves this frozen — the one sign the
+    /// edge has of it, since the page's `CAN_SERVE` bit stays set.
+    pub fn node_heartbeat_ns(&self) -> u64 {
+        self.shared.cnc.status().node_heartbeat_ns.load_acquire()
+    }
+}
+
 // ---------------------------------------------------------------- edge
 
 /// A running gateway edge.
@@ -906,6 +961,16 @@ impl Edge {
 
     pub fn stats(&self) -> EdgeStats {
         self.shared.stats.snapshot()
+    }
+
+    /// A cloneable, read-only handle on this edge's observability readings,
+    /// for a thread that outlives a borrow of the [`Edge`] — the daemon's
+    /// `/metrics` listener (#173). Holding one does not keep the edge
+    /// serving: [`Edge::stop`] still stops it.
+    pub fn obs(&self) -> EdgeObs {
+        EdgeObs {
+            shared: Arc::clone(&self.shared),
+        }
     }
 
     /// The edge has taken itself out of service and will refuse every new

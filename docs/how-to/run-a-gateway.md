@@ -336,9 +336,10 @@ at the `max_connections` ceiling). `EdgeStats` also tracks
 differ from `leader_changes` — a transition to an unresolvable leader hint
 is observed but not announced) but the reference binary does not emit it;
 read it via `Edge::stats()` if you embed the library yourself. Use the
-stats record as a coarse eyes-on-the-box signal; for anything durable, scrape
-metrics off the co-located node (`../how-to/monitor-a-cluster.md`) — the
-gateway itself exposes no `/metrics` endpoint.
+stats record as a coarse eyes-on-the-box signal; for anything durable, set
+`[metrics] bind` and scrape the gateway's own `/metrics`, which carries every
+`EdgeStats` field (including `leader_changed_frames`) plus the grant-budget
+gauges — see [Monitor a cluster § The gateway](monitor-a-cluster.md#the-gateway).
 
 ## Related
 

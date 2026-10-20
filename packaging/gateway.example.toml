@@ -94,3 +94,11 @@ max_connections = 1024
 # is answered "replayed" instead of applied twice. false = raw pass-through
 # (Aeron parity; dedup becomes the application's problem).
 envelope = true
+
+# [metrics]
+# The /metrics, /healthz and /readyz listener — absent (as here) means none.
+# No default bind: pick a port other than the co-located node's [metrics]
+# (whose default is 127.0.0.1:9600). Unauthenticated and read-only; keep it on
+# loopback or the ops network. See docs/how-to/monitor-a-cluster.md,
+# "The gateway".
+# bind = "127.0.0.1:9610"

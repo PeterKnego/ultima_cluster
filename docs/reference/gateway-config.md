@@ -89,6 +89,22 @@ floors at `1` and the sum exceeds the budget again. `validate` **warns**
 
 `envelope` maps to `EdgeConfig::session_envelope`.
 
+## `[metrics]` — optional
+
+Absent section = no listener. Present, it must name `bind`.
+
+| Key | Type | Default | Meaning | Refusal |
+|---|---|---|---|---|
+| `bind` | socket addr | none — required inside the section | where the daemon serves `/metrics`, `/healthz` and `/readyz`, e.g. `"127.0.0.1:9610"`. Unlike `node.toml`'s `[metrics]`, there is no default: the gateway runs beside a node whose own default is `127.0.0.1:9600`, so any default here would collide with it | a bare `[metrics]` (no `bind`) or an unparsable address is a TOML deserialisation error naming the key; a bind failure at startup (port held) is exit `1`, logged `gateway_metrics_bind_failed` |
+
+`bind` maps to `EdgeConfig::metrics_bind`. It is read by the `uc2-gateway`
+daemon only — `Edge::start` never binds it, so a program embedding the
+library serves (or not) as it likes, e.g. through `uc_gateway::metrics::serve`.
+The families and the two probes are listed in
+[Monitor a cluster § The gateway](../how-to/monitor-a-cluster.md#the-gateway).
+Unauthenticated and read-only like the node's endpoint: bind it to loopback
+or the ops network.
+
 ## What `EdgeConfig::validate` does **not** check
 
 `listen`'s address is already a parsed `SocketAddr` by validation time — a
@@ -109,5 +125,5 @@ optional key shown at its default, ready to copy as
 | Code | Meaning |
 |---:|---|
 | `2` | the config file could not be read/parsed, or `EdgeConfig::validate` refused it by name. `packaging/systemd/uc2-gateway.service` sets `RestartPreventExitStatus=2`: a bad config is an operator problem a restart loop cannot fix. |
-| `1` | `Edge::start` failed (the node's instance directory doesn't exist yet, its listener couldn't bind, …), **or** the edge later latched `faulted` (its node's shmem instance restarted underneath it) and the main loop exits to let systemd bring up a fresh gateway against the new node instance. |
+| `1` | `Edge::start` failed (the node's instance directory doesn't exist yet, its listener couldn't bind, …), or the `[metrics] bind` listener couldn't bind, **or** the edge later latched `faulted` (its node's shmem instance restarted underneath it) and the main loop exits to let systemd bring up a fresh gateway against the new node instance. |
 | `0` | clean stop on `SIGTERM`/`SIGINT`. |

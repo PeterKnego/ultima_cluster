@@ -62,6 +62,7 @@ fn a_minimal_toml_parses_with_defaults_filled() {
     assert_eq!(cfg.status_interval, Duration::from_millis(200));
     assert_eq!(cfg.request_timeout, Duration::from_secs(10));
     assert_eq!(cfg.max_connections, 1024);
+    assert_eq!(cfg.metrics_bind, None, "no [metrics] = no listener");
 }
 
 /// The shipped example must parse and validate — a packaged example that
@@ -369,4 +370,38 @@ fn a_bad_env_value_is_refused_by_name() {
             "{var}={value} must be refused BY NAME, got: {err}"
         );
     }
+}
+
+/// #173: `[metrics] bind` names the daemon's `/metrics` listener.
+#[test]
+fn a_metrics_bind_parses() {
+    let cfg = parse_str(&format!(
+        "{MINIMAL}\n[metrics]\nbind = \"127.0.0.1:9610\"\n"
+    ))
+    .expect("[metrics] bind must parse");
+    assert_eq!(cfg.metrics_bind, Some("127.0.0.1:9610".parse().unwrap()));
+}
+
+/// #173: a malformed `bind` and a bare `[metrics]` are both refused, and the
+/// refusal names the key — the gateway runs beside a node whose own
+/// `[metrics]` default would collide with any default here.
+#[test]
+fn a_malformed_or_missing_metrics_bind_is_refused_by_name() {
+    let err = parse_str(&format!("{MINIMAL}\n[metrics]\nbind = \"nope\"\n")).unwrap_err();
+    assert!(
+        matches!(err, ConfigFileError::Parse { .. })
+            && err.to_string().contains("bind = \"nope\"")
+            && err.to_string().contains("invalid socket address"),
+        "expected a Parse error pointing at the bind line, got: {err}"
+    );
+    let err = parse_str(&format!("{MINIMAL}\n[metrics]\n")).unwrap_err();
+    assert!(
+        matches!(err, ConfigFileError::Parse { .. }) && err.to_string().contains("bind"),
+        "expected a Parse error naming bind, got: {err}"
+    );
+    let err = parse_str(&format!("{MINIMAL}\n[metrics]\nport = 9600\n")).unwrap_err();
+    assert!(
+        err.to_string().contains("port"),
+        "an unknown key inside [metrics] is refused by name, got: {err}"
+    );
 }

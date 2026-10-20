@@ -120,6 +120,11 @@ pub struct EdgeConfig {
     /// connection is a real resource, and a client that hears `BUSY` can try
     /// the next member instead of being silently starved here.
     pub max_connections: u32,
+    /// Where the `uc2-gateway` daemon serves `/metrics`, `/healthz` and
+    /// `/readyz` (`[metrics] bind` in `gateway.toml`, #173). `None` = no
+    /// listener. Read by the daemon only — [`crate::Edge`] itself never
+    /// binds it, so an embedder serves (or not) as it likes.
+    pub metrics_bind: Option<SocketAddr>,
 }
 
 impl EdgeConfig {
@@ -138,6 +143,7 @@ impl EdgeConfig {
             status_interval: Duration::from_millis(200),
             request_timeout: Duration::from_secs(10),
             max_connections: 1024,
+            metrics_bind: None,
         }
     }
 

@@ -45,7 +45,8 @@ mod config;
 pub mod config_file;
 mod conn;
 mod edge;
+pub mod metrics;
 mod watch;
 
 pub use config::{ConfigError, EdgeConfig, Member};
-pub use edge::{BUDGET_HEADROOM_DIV, Edge, EdgeError, EdgeStats, budget_for, grant_for};
+pub use edge::{BUDGET_HEADROOM_DIV, Edge, EdgeError, EdgeObs, EdgeStats, budget_for, grant_for};
