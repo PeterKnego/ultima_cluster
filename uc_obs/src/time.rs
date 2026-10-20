@@ -1,12 +1,24 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Peter Knego
 
-//! RFC 3339 rendering for machine-read output (the cluster view). UTC only,
+//! Wall-clock "now" ([`now_unix_ns`]) and RFC 3339 rendering for machine-read
+//! output (the cluster view). UTC only,
 //! always nine fraction digits, so every rendered time has one fixed width
 //! and sorts lexically. Dependency-free on purpose (this crate is the leaf
 //! every daemon shares).
 
 const NS_PER_SEC: u64 = 1_000_000_000;
+
+/// Unix nanoseconds now, from the wall clock; `0` if the clock reads
+/// before the epoch. The one "now" every daemon's `/healthz`/`/readyz` and
+/// `/metrics` compare heartbeats against (#173: shared by `uc_node` and
+/// `uc2-gateway`).
+pub fn now_unix_ns() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+}
 
 /// `ns` nanoseconds since the Unix epoch as `YYYY-MM-DDTHH:MM:SS.nnnnnnnnnZ`.
 pub fn rfc3339_ns(ns: u64) -> String {

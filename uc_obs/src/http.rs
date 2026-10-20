@@ -6,7 +6,7 @@
 //! `obs::http` (#173) so `uc2-gateway`, which must not depend on `uc_node`,
 //! serves the same listener rather than a copy of it. What moved is the
 //! transport only: the accept loop, the bounded request read and
-//! [`write_response`]. Each daemon keeps its own routes and hands them in as
+//! `write_response`. Each daemon keeps its own routes and hands them in as
 //! a [`Router`].
 //!
 //! `std`-only: no tokio, no HTTP crate. One thread polling up to two
@@ -16,7 +16,7 @@
 //!
 //! The accept loop is single-threaded and synchronous — a connection is
 //! handled to completion before the next one is accepted — so every
-//! connection is bound by a hard wall-clock deadline ([`CONN_DEADLINE`]),
+//! connection is bound by a hard wall-clock deadline (`CONN_DEADLINE`),
 //! not just a per-`read()`-call timeout: a client that trickles bytes just
 //! often enough to keep dodging each individual read's timeout would
 //! otherwise stall every other client (and [`HttpServer::stop`]) for as long
@@ -25,11 +25,15 @@
 //! The write phase's bound is per write call (`SO_SNDTIMEO`), not a
 //! wall-clock deadline: a peer that reads a large body a little at a time,
 //! just often enough, can hold this one thread — and every other request —
-//! for several [`CONN_DEADLINE`] periods. The listener belongs on the ops
+//! for several `CONN_DEADLINE` periods. The listener belongs on the ops
 //! network.
 
 use std::io::{self, ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+// The unix door is the one non-portable piece: `uc_obs` sits under
+// `uc_remote`, which a third-party client builds on Windows too, so
+// everything unix-only here is behind `cfg(unix)`.
+#[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -40,38 +44,41 @@ use std::time::{Duration, Instant};
 /// Cap on the bytes read while hunting for the end of the request headers —
 /// a router only ever parses a request LINE, so a well-formed request never
 /// gets close to this.
-pub const REQUEST_CAP: usize = 4096;
+pub(crate) const REQUEST_CAP: usize = 4096;
 
 /// The accept-loop poll cadence: how promptly [`HttpServer::stop`] returns.
-pub const ACCEPT_POLL: Duration = Duration::from_millis(100);
+pub(crate) const ACCEPT_POLL: Duration = Duration::from_millis(100);
 
 /// Per-`read()`-call timeout. On its own this does NOT bound a connection's
 /// total duration — `SO_RCVTIMEO` budgets each syscall independently, so a
 /// client that trickles a byte every ~900ms never trips any single call's
-/// timer and never reaches [`REQUEST_CAP`] either. [`CONN_DEADLINE`] is the
+/// timer and never reaches `REQUEST_CAP` either. `CONN_DEADLINE` is the
 /// wall-clock backstop that actually bounds the connection.
-pub const READ_TIMEOUT: Duration = Duration::from_secs(1);
+pub(crate) const READ_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Hard wall-clock cap on one connection's whole read phase, checked once
-/// per read-loop iteration alongside the per-call [`READ_TIMEOUT`] (which is
+/// per read-loop iteration alongside the per-call `READ_TIMEOUT` (which is
 /// also shrunk to whatever's left of this budget each iteration, so the
 /// last read can't itself overshoot it). Because the accept loop handles
 /// connections synchronously, one connection that never bounds itself
 /// stalls the WHOLE server. Also reused as the flat `SO_SNDTIMEO` budget for
-/// [`write_response`] — a client that never reads its response is the same
+/// `write_response` — a client that never reads its response is the same
 /// stall risk on the write side.
-pub const CONN_DEADLINE: Duration = Duration::from_secs(2);
+pub(crate) const CONN_DEADLINE: Duration = Duration::from_secs(2);
 
 /// One routed answer: `(status, content type, body)`.
 pub type Response = (u16, &'static str, String);
 
-/// A daemon's routes: the raw request bytes in (at most [`REQUEST_CAP`] plus
+/// A daemon's routes: the raw request bytes in (at most `REQUEST_CAP` plus
 /// one read chunk, possibly unterminated — a request is routed on whatever
 /// arrived before EOF or the read timeout), one [`Response`] out. Must be
 /// total on `&[u8]`: every byte an unauthenticated scraper sends lands here.
 ///
 /// Any `Fn(&[u8]) -> Response + Send + 'static` closure is a router.
 pub trait Router: Send + 'static {
+    /// Answer one request: `request` is the raw bytes read (the request
+    /// line plus whatever headers arrived), the return value is written
+    /// back verbatim as status, `Content-Type` and body.
     fn route(&self, request: &[u8]) -> Response;
 }
 
@@ -82,9 +89,9 @@ impl<F: Fn(&[u8]) -> Response + Send + 'static> Router for F {
 }
 
 /// A stream one connection is served over: the TCP door or the unix door.
-/// Exists so [`handle_conn`]/[`write_response`] — and with them the read and
+/// Exists so `handle_conn`/`write_response` — and with them the read and
 /// write deadlines — are ONE code path for both.
-pub trait Conn: Read + Write {
+pub(crate) trait Conn: Read + Write {
     fn set_read_timeout(&self, d: Option<Duration>) -> io::Result<()>;
     fn set_write_timeout(&self, d: Option<Duration>) -> io::Result<()>;
 }
@@ -98,6 +105,7 @@ impl Conn for TcpStream {
     }
 }
 
+#[cfg(unix)]
 impl Conn for UnixStream {
     fn set_read_timeout(&self, d: Option<Duration>) -> io::Result<()> {
         UnixStream::set_read_timeout(self, d)
@@ -108,6 +116,7 @@ impl Conn for UnixStream {
 }
 
 /// A running observability HTTP server: one thread, up to two listeners.
+#[must_use = "dropping an HttpServer without stop() leaves its thread running"]
 pub struct HttpServer {
     thread: Option<JoinHandle<()>>,
     stop: Arc<AtomicBool>,
@@ -120,24 +129,32 @@ impl HttpServer {
     /// surfaces here, at startup, not silently on the first scrape.
     pub fn serve<R: Router>(thread_name: &str, bind: SocketAddr, router: R) -> io::Result<Self> {
         let l = TcpListener::bind(bind)?;
-        HttpServer::serve_on(thread_name, Some(l), None, router)
+        HttpServer::start(thread_name, Some(l), Doors::none(), router)
     }
 
     /// Serve `router` on already-bound listeners (either may be absent),
     /// from one thread named `thread_name`. Both listeners are switched to
-    /// non-blocking here.
+    /// non-blocking here. Unix-only: the unix-socket door.
+    #[cfg(unix)]
     pub fn serve_on<R: Router>(
         thread_name: &str,
         tcp: Option<TcpListener>,
         unix: Option<UnixListener>,
         router: R,
     ) -> io::Result<Self> {
+        HttpServer::start(thread_name, tcp, Doors { unix }, router)
+    }
+
+    fn start<R: Router>(
+        thread_name: &str,
+        tcp: Option<TcpListener>,
+        doors: Doors,
+        router: R,
+    ) -> io::Result<Self> {
         if let Some(l) = &tcp {
             l.set_nonblocking(true)?;
         }
-        if let Some(l) = &unix {
-            l.set_nonblocking(true)?;
-        }
+        doors.set_nonblocking()?;
         let local_addr = tcp.as_ref().map(|l| l.local_addr()).transpose()?;
 
         let stop = Arc::new(AtomicBool::new(false));
@@ -159,13 +176,7 @@ impl HttpServer {
                         handle_conn(s, &router);
                         served = true;
                     }
-                    if let Some(l) = &unix
-                        && let Ok((s, _)) = l.accept()
-                    {
-                        let _ = s.set_nonblocking(false);
-                        handle_conn(s, &router);
-                        served = true;
-                    }
+                    served |= doors.serve_one(&router);
                     if !served {
                         thread::sleep(ACCEPT_POLL);
                     }
@@ -196,15 +207,53 @@ impl HttpServer {
     }
 }
 
+/// The non-TCP doors a server may also poll: the unix socket on unix, and
+/// nothing elsewhere.
+struct Doors {
+    #[cfg(unix)]
+    unix: Option<UnixListener>,
+}
+
+impl Doors {
+    fn none() -> Self {
+        Doors {
+            #[cfg(unix)]
+            unix: None,
+        }
+    }
+
+    fn set_nonblocking(&self) -> io::Result<()> {
+        #[cfg(unix)]
+        if let Some(l) = &self.unix {
+            l.set_nonblocking(true)?;
+        }
+        Ok(())
+    }
+
+    /// Accept and serve at most one connection; `true` if one was served.
+    fn serve_one<R: Router + ?Sized>(&self, router: &R) -> bool {
+        #[cfg(unix)]
+        if let Some(l) = &self.unix
+            && let Ok((s, _)) = l.accept()
+        {
+            let _ = s.set_nonblocking(false);
+            handle_conn(s, router);
+            return true;
+        }
+        let _ = router;
+        false
+    }
+}
+
 /// Handle one connection end to end: read the request (capped,
 /// per-call-timed-out, AND wall-clock-deadlined), route it, write the
 /// response, close. No keep-alive — every response carries
 /// `Connection: close`.
 ///
-/// A connection that never completes a request within [`CONN_DEADLINE`] is
+/// A connection that never completes a request within `CONN_DEADLINE` is
 /// dropped outright (no response written) rather than routed on a partial
 /// buffer — the client got no bytes, same as if it had never connected.
-pub fn handle_conn<C: Conn, R: Router + ?Sized>(mut stream: C, router: &R) {
+pub(crate) fn handle_conn<C: Conn, R: Router + ?Sized>(mut stream: C, router: &R) {
     let deadline = Instant::now() + CONN_DEADLINE;
 
     let mut buf = Vec::with_capacity(512);
@@ -281,14 +330,14 @@ pub fn not_found() -> Response {
 }
 
 /// The 400 [`get_router`] answers an unparseable request line with.
-pub fn bad_request() -> Response {
+pub(crate) fn bad_request() -> Response {
     (400, "text/plain", "bad request\n".to_string())
 }
 
 /// Write one `Connection: close` response. Best-effort: a client that hangs
 /// up (or stalls) mid-write is not retried — this is a scrape/probe
 /// endpoint, not a reliable transport.
-pub fn write_response<C: Conn + ?Sized>(
+pub(crate) fn write_response<C: Conn + ?Sized>(
     stream: &mut C,
     status: u16,
     content_type: &str,
@@ -409,6 +458,7 @@ mod tests {
     /// client that asks and never reads, must cost at most the write
     /// deadline, not the server (moved here from `uc_node::obs::http`,
     /// where `/cluster` is the route that can produce such a body).
+    #[cfg(unix)]
     #[test]
     fn a_unix_client_that_never_reads_costs_only_the_write_deadline() {
         let (mut server_side, lazy) = UnixStream::pair().expect("pair");

@@ -24,7 +24,6 @@ use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use uc_obs::http::{HttpServer, Response, get_router};
 use uc_obs::prom::{push_counter, push_gauge};
@@ -54,13 +53,8 @@ pub const GATEWAY_SERIES: &[&str] = &[
     "uc2_gateway_grant_budget",
 ];
 
-/// Unix nanoseconds now.
-pub fn now_unix_ns() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0)
-}
+/// Unix nanoseconds now — `uc_obs::time`'s, re-exported for the daemon.
+pub use uc_obs::time::now_unix_ns;
 
 /// The Prometheus text body: pure, no I/O.
 pub fn render(s: &EdgeStats, grant_outstanding: u64, grant_budget: u32) -> String {
@@ -185,7 +179,7 @@ fn readyz(tick_ns: u64, faulted: bool, node_hb_ns: u64, now: u64) -> Response {
 pub fn serve(bind: SocketAddr, edge: EdgeObs, tick: Arc<AtomicU64>) -> io::Result<HttpServer> {
     let router = get_router(move |path| {
         let now = now_unix_ns();
-        let tick_ns = tick.load(Ordering::Acquire);
+        let tick_ns = tick.load(Ordering::Relaxed);
         Some(match path {
             "/metrics" => (
                 200,

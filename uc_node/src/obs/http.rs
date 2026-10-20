@@ -29,12 +29,12 @@
 //! The write phase's bound is per write call (`SO_SNDTIMEO`), not a
 //! wall-clock deadline: a peer that reads a large `/cluster` body a little
 //! at a time, just often enough, can hold this one thread — and every other
-//! request — for several [`CONN_DEADLINE`](uc_obs::http::CONN_DEADLINE) periods. `[metrics]` belongs on
+//! request — for several of `uc_obs::http`'s 2 s `CONN_DEADLINE` periods. `[metrics]` belongs on
 //! the ops network.
 //!
 //! The accept loop is single-threaded and synchronous — `uc_obs::http::handle_conn` runs
 //! to completion before the next connection is even accepted — so every
-//! connection is bound by a hard wall-clock deadline ([`CONN_DEADLINE`](uc_obs::http::CONN_DEADLINE)),
+//! connection is bound by a hard wall-clock deadline (`uc_obs::http`'s 2 s `CONN_DEADLINE`),
 //! not just a per-`read()`-call timeout: a client that trickles bytes just
 //! often enough to keep dodging each individual read's timeout would
 //! otherwise stall every other client (and [`ObsServer::stop`]) for as long
@@ -157,9 +157,9 @@ fn route(buf: &[u8], sources: &ObsSources) -> Response {
 /// only, so it does not exist in a shipped build.
 ///
 /// `route` is where every byte an unauthenticated scrape client sends first
-/// lands (`uc_obs::http::handle_conn` reads into a [`REQUEST_CAP`](uc_obs::http::REQUEST_CAP)-bounded buffer and calls
+/// lands (`uc_obs::http::handle_conn` reads into a 4096-byte-capped buffer and calls
 /// straight through), so it must be total on `&[u8]`. The status set it can
-/// return is exactly `200 | 404 | 503` — see [`uc_obs::http::write_response`]'s reason
+/// return is exactly `200 | 404 | 503` — see `uc_obs::http`'s `write_response` reason
 /// table, which is the other half of the same contract.
 #[cfg(any(test, fuzzing))]
 pub fn route_raw(buf: &[u8], sources: &ObsSources) -> (u16, &'static str, String) {

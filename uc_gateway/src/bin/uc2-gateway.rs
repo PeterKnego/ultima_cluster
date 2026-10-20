@@ -129,7 +129,7 @@ fn main() -> ExitCode {
             return ExitCode::from(1);
         }
 
-        tick.store(metrics::now_unix_ns(), Ordering::Release);
+        tick.store(metrics::now_unix_ns(), Ordering::Relaxed);
         ticks += 1;
         if ticks.is_multiple_of(STATS_EVERY_N_TICKS) {
             let s = edge.stats();

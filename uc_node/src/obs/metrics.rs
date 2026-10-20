@@ -13,7 +13,6 @@
 //! positions — this system has no indices.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use uc_log::cnc::{PinRead, RowRead, unpack_service_status};
 use uc_protocol::v2::cnc::{
@@ -28,12 +27,9 @@ use crate::timers::{NS_BUCKET_SLOTS, NS_BUCKETS, NsHistogramSnapshot};
 use uc_obs::prom::{push_counter, push_family_header, push_gauge, push_gauge_f64};
 
 /// Unix nanoseconds "now" — shared with Task 6's `/healthz`/`/readyz` probes.
-pub fn now_unix_ns() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0)
-}
+/// Lives in `uc_obs::time` since #173 (shared with `uc2-gateway`); re-exported
+/// so `uc_node::obs::metrics::now_unix_ns` keeps naming it.
+pub use uc_obs::time::now_unix_ns;
 
 /// Every metric family name the encoder emits, in the order it renders
 /// them. Task 8's alert rules reference only names from this list; Task

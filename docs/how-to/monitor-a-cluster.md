@@ -720,9 +720,10 @@ families, all unlabeled:
 heartbeat every 100 ms; 503 once that is 3 s old). `/readyz` adds two
 clauses: the edge has not faulted (its node's instance has not restarted
 underneath it), and the node's own cnc heartbeat is fresh — the only sign
-the edge has of a node that died without its supervisor noticing. It does
-**not** key on `can_serve`: a gateway beside a follower is ready, because
-answering `REDIRECT` is its job.
+the edge has of a node that died without its supervisor noticing. It
+deliberately does **not** check the service heartbeat or `can_serve`: a
+gateway beside a follower is ready, because answering `REDIRECT` is the
+gateway doing its job.
 
 ## Install the alert rules
 
