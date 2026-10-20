@@ -55,6 +55,9 @@ preconditions worth reading before you start.
   for a release within one wire level (since `2.15.0`), or the scripted
   stop-all flag day with a measured downtime number for `2.15.0` itself and
   wire majors.
+- [Upgrade from a release before 2.15.0](upgrade-from-an-older-release.md) —
+  the per-release edits, wipes and checks for each stop-all step from
+  `2.6.0` to `2.14.0`.
 - [Record a release](record-a-release.md) — pinning what is actually running:
   the build's digest, the config file's SHA-256 as the node itself reports it,
   and the environment overrides in effect. Also why a ledger cannot make

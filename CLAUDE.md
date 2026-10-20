@@ -31,7 +31,7 @@ snapshot catalog, the snapshot lifecycle, read-your-writes reads, the backup
 tier (3a writer and `uc2ctl tier`; 3b backup-gated purge and the tier as a
 source), and the cluster view; #49's `decode_exact` fix ships here too. The
 writeup is in `RELEASES.md` and `docs/releases.md`; the operator steps are
-`docs/how-to/upgrade-a-cluster.md` § "Upgrading from 2.13.0 to 2.14.0".
+`docs/how-to/upgrade-from-an-older-release.md` § "Upgrading from 2.13.0 to 2.14.0".
 What a new task must know:
   - **Stop every node before starting any node**, and upgrade gateways and
     remote clients together: v1 and v2 remote peers refuse each other at

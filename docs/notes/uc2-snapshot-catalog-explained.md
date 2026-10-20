@@ -273,7 +273,7 @@ opposed to merely running the new binary.
 ## Upgrading: one flag day, nothing wiped
 
 The full procedure is
-[Upgrade a cluster § 0.11.0](../how-to/upgrade-a-cluster.md#wire-change-after-0100-the-snapshot-catalog-0110).
+[Upgrade a cluster § 0.11.0](../how-to/upgrade-from-an-older-release.md#wire-change-after-0100-the-snapshot-catalog-0110).
 In short:
 
 - **Stop every node before starting any.** Node↔node datagrams carry no
@@ -324,7 +324,7 @@ In short:
   [`uc2ctl cluster`](../reference/uc2ctl.md#cluster): the readouts.
 - [How to keep the journal from growing without bound](../how-to/bound-journal-growth.md):
   purge and retention in practice.
-- [Upgrade a cluster § 0.11.0](../how-to/upgrade-a-cluster.md#wire-change-after-0100-the-snapshot-catalog-0110):
+- [Upgrade a cluster § 0.11.0](../how-to/upgrade-from-an-older-release.md#wire-change-after-0100-the-snapshot-catalog-0110):
   the flag-day procedure.
 - [The wire protocol](../reference/wire-protocol.md): the `STATUS`,
   `SNAP_REPORT` and `Settings` layouts.

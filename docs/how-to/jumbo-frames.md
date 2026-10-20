@@ -373,7 +373,7 @@ this deployment now depends on jumbo-frame support.
 
 - [Jumbo frames and path-MTU discovery, explained](../notes/uc2-jumbo-frame-discovery-explained.md)
   — the design argument, the errata, and the security note.
-- [Upgrade a cluster](upgrade-a-cluster.md#wire--cnc-change-in-2120-jumbo-frames-080-cnc-32)
+- [Upgrade a cluster](upgrade-from-an-older-release.md#wire--cnc-change-in-2120-jumbo-frames-080-cnc-32)
   — the `2.12.0` flag day: no wipe, delete `max_payload`, the DF behaviour
   change.
 - [Monitor a cluster](monitor-a-cluster.md) — where the eight series and the

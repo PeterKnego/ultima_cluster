@@ -363,9 +363,9 @@ transport setting, both measured closed-loop at inflight 1 on 8-vCPU
 - [Upgrade a cluster](../how-to/upgrade-a-cluster.md) — both procedures: the
   rolling upgrade within one wire level (next bullet) and the scripted
   stop-all flag day (`scripts/uc2_flag_day.sh`) with its traffic-stop
-  prerequisite and a measured downtime number, and (M12b) the `[crypto].enabled`/`[admin]`
-  config-choice note every M9–M11 `node.toml` needs before it starts on
-  `v2.6.0`+.
+  prerequisite and a measured downtime number. The per-release edits, wipes
+  and checks a cluster on a release before `2.15.0` needs at each stop-all
+  step are [Upgrade from a release before 2.15.0](../how-to/upgrade-from-an-older-release.md).
 - **Roll an upgrade one node at a time** (since `2.15.0`). Permitted when the
   new release's wire minor is the cluster's level (`uc2ctl wire show` →
   `level=`) or one above it. Want a rollback window? Add `wire_raise =
