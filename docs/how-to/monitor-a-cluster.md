@@ -142,14 +142,17 @@ a commit stall can be traced to the local disk or to a peer:
   appended here but not yet recorded by this node's archive, shaped like
   `uc2_commit_lag_bytes`. A growing value while
   `uc2_peer_replication_lag_bytes` stays flat is the local journal write or
-  fdatasync, not a peer.
+  fdatasync, not a peer. Under Eventual durability `durable` advances at the
+  buffered write, so the fsync backlog shows in
+  `uc2_archive_pending_flush_bytes` instead.
 - `uc2_archive_blocks_recorded_total` and `uc2_archive_bytes_recorded_total`
   count what the archive has recorded since the process started; their rates
   are the local durability throughput.
-- `uc2_archive_fsyncs_total` is exactly one fdatasync per block under the
-  default Consistent durability. Under Eventual durability the journal fsyncs
-  asynchronously, so it counts each advance of the journal's durable watermark
-  the archive saw, a lower bound on the true count.
+- `uc2_archive_fsyncs_total` is one fdatasync per block (plus one per segment
+  roll, not counted) under the default Consistent durability. Under Eventual
+  durability the journal fsyncs asynchronously, so it counts each advance of
+  the journal's durable-block count the archive saw; two flushes between two
+  looks count once.
 - `uc2_archive_pending_flush_bytes` is Eventual durability only: bytes
   written to the journal but not yet fsynced, the loss window on power
   failure. It reads 0 under Consistent durability.

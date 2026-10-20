@@ -50,6 +50,10 @@ pub(crate) struct SeqWatermark {
     /// Highest seq known fsync-durable. Advances on publish; pulled back
     /// only by `reset_to` (truncate_after removing durable suffix entries).
     durable_seq: AtomicU64,
+    /// True once any fsync has published a watermark (and not since a
+    /// keep-none truncate): disambiguates `durable_seq == 0` between "nothing
+    /// durable" and "seq 0 durable".
+    any_published: AtomicBool,
     /// Truncation generation (mirrors `WriterState::truncate_gen`). A
     /// publish carries the generation captured when its bytes were written;
     /// a stale-generation publish is dropped — its bytes were truncated
@@ -76,6 +80,7 @@ impl SeqWatermark {
     pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self {
             durable_seq: AtomicU64::new(0),
+            any_published: AtomicBool::new(false),
             generation: AtomicU64::new(0),
             closed: AtomicBool::new(false),
             inner: Mutex::new(Waiters::default()),
@@ -86,6 +91,25 @@ impl SeqWatermark {
     /// Highest seq known to be fsync-durable.
     pub(crate) fn current(&self) -> u64 {
         self.durable_seq.load(Ordering::Acquire)
+    }
+
+    /// Number of blocks known fsync-durable: `durable_seq + 1` once anything
+    /// has been published, else 0.
+    pub(crate) fn durable_count(&self) -> u64 {
+        if self.any_published.load(Ordering::Acquire) {
+            self.durable_seq.load(Ordering::Acquire) + 1
+        } else {
+            0
+        }
+    }
+
+    /// Called by `truncate_all` (under the state lock): nothing survives, so
+    /// the watermark returns to "none" and the generation is adopted.
+    pub(crate) fn reset_all(&self, generation: u64) {
+        let _w = self.inner.lock().unwrap();
+        self.durable_seq.store(0, Ordering::Release);
+        self.any_published.store(false, Ordering::Release);
+        self.generation.store(generation, Ordering::Release);
     }
 
     /// Called by `truncate_after` (under the state lock): pull the watermark
@@ -114,6 +138,7 @@ impl SeqWatermark {
             // Store under the mutex so a concurrent wait/on_complete cannot read
             // the old value and then miss the notify (lost wakeup).
             self.durable_seq.store(new, Ordering::Release);
+            self.any_published.store(true, Ordering::Release);
             self.condvar.notify_all();
             drain_le(&mut w.callbacks, new)
         };
@@ -247,6 +272,9 @@ pub(crate) struct WriterState {
     /// for entries still queued and unwritten (publishing those would
     /// over-report durability). Pulled back by `truncate_after`.
     pub persisted_hwm: u64,
+    /// True once any record has been written since open / the last keep-none
+    /// truncate: tells `persisted_hwm == 0` "none" from "seq 0 written".
+    pub persisted_any: bool,
     /// True when the ACTIVE (last) segment has bytes written since it was
     /// last fsynced. Set by `flush_run` whenever it actually writes;
     /// cleared by any fsync that covers the active segment
@@ -316,13 +344,13 @@ fn writer_loop(
                     // advances to seqs whose bytes the fsync definitely
                     // flushed (task28), and never to seqs that `append()`
                     // claimed but the writer hasn't written yet.
-                    let (hwm, generation) = {
+                    let (hwm, any, generation) = {
                         let st = state.lock().unwrap();
-                        (st.persisted_hwm, st.truncate_gen)
+                        (st.persisted_hwm, st.persisted_any, st.truncate_gen)
                     };
                     match fsync_active_segment(&state) {
                         Ok(()) => {
-                            if hwm > 0 {
+                            if any {
                                 watermark.publish(hwm, generation);
                             }
                         }
@@ -330,7 +358,7 @@ fn writer_loop(
                             // Fail-stop (see halt_writer): a failed fsync may
                             // have dropped dirty pages; nothing after it may
                             // be reported durable.
-                            if hwm > 0 {
+                            if any {
                                 watermark.publish_error(hwm, generation, e);
                             }
                             halt_writer(&state, &rx);
@@ -661,6 +689,7 @@ fn flush_run(st: &mut WriterState, run: &mut Vec<(u64, u64, &[u8])>) -> Result<(
     }
     if let Some((seq, _, _)) = run.last() {
         st.persisted_hwm = st.persisted_hwm.max(*seq);
+        st.persisted_any = true;
     }
     run.clear();
     Ok(())
@@ -812,6 +841,7 @@ mod tests {
             pending: BTreeMap::new(),
             truncate_gen: 0,
             persisted_hwm: 0,
+            persisted_any: false,
             active_segment_dirty: false,
             poisoned: false,
             #[cfg(test)]

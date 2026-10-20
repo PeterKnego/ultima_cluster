@@ -1654,7 +1654,7 @@ pub fn render_prometheus(s: &ObsSources) -> String {
     push_counter(
         &mut out,
         "uc2_archive_fsyncs_total",
-        "Journal fsyncs behind the archive. Consistent durability (the default): exactly one fdatasync per recorded block. Eventual durability: the journal fsyncs asynchronously, so this counts each advance of its durable watermark the archive observed, a lower bound on the true count.",
+        "Journal fsyncs behind the archive. Consistent durability (the default): one fdatasync per recorded block (plus one per segment roll, not counted here). Eventual durability: the journal fsyncs asynchronously, so this counts each advance of its durable-block count the archive observed; two flushes between two looks count once.",
         s.archive.fsyncs.load(Ordering::Relaxed),
     );
     push_gauge(
