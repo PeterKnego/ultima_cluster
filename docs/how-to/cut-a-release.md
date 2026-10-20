@@ -26,18 +26,32 @@ documentation for what it changes, because the tag is what people read.
       fixed bugs; an optional bullet for performance, linking the gate doc.
       Detail goes in `docs/releases.md`, not here.
 - [ ] The matching per-release entry in `docs/releases.md`.
+- [ ] **The rolling upgrade test against the previous release — EVERY
+      release since `2.15.0`**, whether or not the wire minor moves. Build
+      the previous tag's `uc_crashtest-node` into its own target dir
+      (`CARGO_TARGET_DIR=$HOME/.cache/cargo-target-<tag>`), then run
+      `testing/uc_crashtest/tests/rolling_upgrade.rs` with
+      `UC2_BASE_NODE_BIN` naming that binary:
+      `cargo test -p uc_crashtest --features hard-crash-tests,wire-level-override`.
+      A release that keeps the level can still break a mixed cluster — a cnc
+      word, a settings field, a decoder — and the synthetic old side the
+      nightly runs (this tree pinned to `12,12`) cannot see that; only the
+      real previous binary can. The first real run is `2.16.0` against
+      `2.15.0`: `2.14.0` writes no level byte and is refused as pre-level by
+      design (the last flag day). Before that run the test's `OLD`/`NEW`
+      ranges, still the literal `12,12`/`12,13`, and the raise it waits for
+      (to 13) must be parameterized —
+      [#178](https://github.com/PeterKnego/ultima_cluster/issues/178); until
+      then it cannot pass against any real base binary. Record the run in
+      `docs/releases.md`'s entry.
 - [ ] **A release that bumps the wire minor** (a new wire level, since
       `2.15.0`): exactly one `if level >= N` gate per feature, the previous
       level's gate deleted as always-true (its encoders go with it; every
-      decoder stays), a new golden corpus for level N beside the old one
+      decoder stays), and a new golden corpus for level N beside the old one
       (`uc_protocol/tests/golden_level12.rs` is the model — never edit an
-      older level's file), and the two-binary rolling crashtest run with
-      `UC2_BASE_NODE_BIN` naming the previous release's `uc_crashtest-node`
-      (`testing/uc_crashtest/tests/rolling_upgrade.rs`; its `OLD`/`NEW`
-      ranges are still the literal `12,12`/`12,13`, so parameterize them
-      first — until then it cannot pass against any real base binary). A
-      release that adds no wire feature keeps the wire minor and needs none
-      of this. The rule is
+      older level's file). A release that adds no wire feature keeps the
+      wire minor and needs none of this — but still runs the rolling
+      upgrade test above. The rule is
       [the semver policy's level rule](../reference/semver-policy.md#the-wire-and-the-cnc-page-are-flag-day-not-semver).
 - [ ] A sweep of `QUICKSTART.md`, `docs/how-to/`, `docs/reference/` for
       statements this release invalidated. Upgrade consequences that refuse to
