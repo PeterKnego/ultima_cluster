@@ -410,9 +410,11 @@ impl Journal {
         self.durability.current()
     }
 
-    /// Number of blocks known fsync-durable: `durable_seq() + 1` once any fsync
-    /// has published a watermark, else 0 (so, unlike `durable_seq`, it tells
-    /// "nothing durable" from "seq 0 durable"). Reset to 0 by `truncate_all`.
+    /// Number of blocks known fsync-durable SINCE OPEN: `durable_seq() + 1`
+    /// once any fsync has published a watermark in this process, else 0 (so,
+    /// unlike `durable_seq`, it tells "nothing durable" from "seq 0 durable").
+    /// Blocks recovered at open read 0 until the next publish. Reset to 0 by
+    /// `truncate_all`.
     pub fn durable_count(&self) -> u64 {
         self.durability.durable_count()
     }

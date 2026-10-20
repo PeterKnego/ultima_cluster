@@ -1354,8 +1354,8 @@ mod tests {
         assert!(arch.do_work(&b).unwrap());
         assert_eq!(stats.blocks_recorded.load(Ordering::Relaxed), 1);
         assert_eq!(stats.bytes_recorded.load(Ordering::Relaxed), 4 * 96);
-        // Block seq 0 is not yet fsynced (watermark reads 0 = ambiguous, and
-        // the interval is an hour): the whole block is backlog.
+        // Block seq 0 is not yet fsynced (`durable_count()` reads 0, and the
+        // interval is an hour): the whole block is backlog.
         assert_eq!(stats.pending_flush_bytes.load(Ordering::Relaxed), 4 * 96);
         assert_eq!(stats.fsyncs.load(Ordering::Relaxed), 0);
     }
@@ -1395,7 +1395,8 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         assert_eq!(stats.pending_flush_bytes.load(Ordering::Relaxed), 0);
-        assert!(stats.fsyncs.load(Ordering::Relaxed) >= 1);
+        // Exact since `durable_count()`: one advance per fsynced block.
+        assert_eq!(stats.fsyncs.load(Ordering::Relaxed), 2);
     }
 
     #[test]
