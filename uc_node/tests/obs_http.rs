@@ -89,6 +89,7 @@ fn synthetic_sources() -> ObsSources {
         node_id: 7,
         cnc,
         sender: Arc::new(SenderStats::default()),
+        archive: Arc::new(uc_log::archive::ArchiveStats::default()),
         receiver: Arc::new(FollowerStats::default()),
         truncations: Arc::new(AtomicU64::new(0)),
         wipes: Arc::new(AtomicU64::new(0)),

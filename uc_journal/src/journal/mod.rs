@@ -364,6 +364,7 @@ impl Journal {
             pending: std::collections::BTreeMap::new(),
             truncate_gen: 0,
             persisted_hwm: 0,
+            persisted_any: false,
             // A freshly-recovered active segment is either empty or has
             // only durably-recovered bytes (Journal::open's own healing —
             // and any Phase-1 residue re-zero — already fsyncs what it
@@ -407,6 +408,15 @@ impl Journal {
     /// Returns 0 before anything is durable.
     pub fn durable_seq(&self) -> u64 {
         self.durability.current()
+    }
+
+    /// Number of blocks known fsync-durable SINCE OPEN: `durable_seq() + 1`
+    /// once any fsync has published a watermark in this process, else 0 (so,
+    /// unlike `durable_seq`, it tells "nothing durable" from "seq 0 durable").
+    /// Blocks recovered at open read 0 until the next publish. Reset to 0 by
+    /// `truncate_all`.
+    pub fn durable_count(&self) -> u64 {
+        self.durability.durable_count()
     }
 
     /// Block until `seq` is fsync-durable.
@@ -692,7 +702,8 @@ impl Journal {
         // and an in-flight publish for pre-truncate bytes must not re-advance it
         // (stale generation).
         st.persisted_hwm = 0;
-        self.durability.reset_to(0, st.truncate_gen);
+        st.persisted_any = false;
+        self.durability.reset_all(st.truncate_gen);
 
         // Intent → destructive phase → consume intent.
         let dir = st.dir.clone();
@@ -1231,6 +1242,21 @@ mod tests {
         // Re-append from new tail.
         j.append(6, 0, b"new").unwrap().wait().unwrap();
         assert_eq!(j.read(6).unwrap().unwrap().1, b"new".to_vec());
+    }
+
+    #[test]
+    fn durable_count_tells_nothing_durable_from_seq_zero_durable() {
+        let dir = tempfile::tempdir().unwrap();
+        let j = Journal::open(JournalConfig::new(dir.path())).unwrap();
+        assert_eq!(j.durable_count(), 0, "no blocks");
+        j.append(0, 0, b"a").unwrap().wait().unwrap();
+        j.wait_durable(0).unwrap();
+        assert_eq!(j.durable_count(), 1, "seq 0 durable");
+        j.append(1, 1, b"b").unwrap().wait().unwrap();
+        j.wait_durable(1).unwrap();
+        assert_eq!(j.durable_count(), 2);
+        j.truncate_all().unwrap().wait().unwrap();
+        assert_eq!(j.durable_count(), 0, "truncate_all forgets everything");
     }
 
     #[test]

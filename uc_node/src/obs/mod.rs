@@ -47,6 +47,9 @@ pub struct ObsSources {
     pub node_id: u32,
     pub cnc: Arc<CncPage>,
     pub sender: Arc<uc_net::sender::SenderStats>,
+    /// Issue #172: the archive agent's block/byte/fsync/backlog cells, the
+    /// SAME allocation `Archive::do_work` writes through.
+    pub archive: Arc<uc_log::archive::ArchiveStats>,
     pub receiver: Arc<uc_net::receiver::FollowerStats>,
     pub truncations: Arc<AtomicU64>,
     pub wipes: Arc<AtomicU64>,
@@ -256,6 +259,7 @@ impl ObsSources {
             node_id: 7,
             cnc: CncPage::heap(&meta),
             sender: Arc::new(uc_net::sender::SenderStats::default()),
+            archive: Arc::new(uc_log::archive::ArchiveStats::default()),
             receiver: Arc::new(uc_net::receiver::FollowerStats::default()),
             truncations: Arc::new(AtomicU64::new(0)),
             wipes: Arc::new(AtomicU64::new(0)),

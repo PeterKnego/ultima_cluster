@@ -420,6 +420,7 @@ fn synthetic_sources_named(node_id: u32, name: Option<FsmName>) -> ObsSources {
         node_id,
         cnc,
         sender: Arc::new(SenderStats::default()),
+        archive: Arc::new(uc_log::archive::ArchiveStats::default()),
         receiver: Arc::new(FollowerStats::default()),
         truncations: Arc::new(AtomicU64::new(0)),
         wipes: Arc::new(AtomicU64::new(0)),

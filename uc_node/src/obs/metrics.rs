@@ -177,6 +177,11 @@ pub const CONTRACT_SERIES: &[&str] = &[
     "uc_node_snapshot_floor_bytes",
     "uc2_incoming_snapshot_pos_bytes",
     "uc2_archive_first_base_bytes",
+    "uc2_archive_blocks_recorded_total",
+    "uc2_archive_bytes_recorded_total",
+    "uc2_archive_fsyncs_total",
+    "uc2_archive_pending_flush_bytes",
+    "uc2_durable_lag_bytes",
     "uc2_commit_lag_bytes",
     "uc2_apply_lag_bytes",
     "uc2_admission_saturation",
@@ -1596,8 +1601,39 @@ pub fn render_prometheus(s: &ObsSources) -> String {
         s.cnc.archive_first_base().load_acquire(),
     );
 
+    push_counter(
+        &mut out,
+        "uc2_archive_blocks_recorded_total",
+        "Blocks the archive agent has recorded into the journal since this process started (a journal block is up to 1 MiB of whole frames). Climbs with the commit rate; flat while append moves means the archive is not recording.",
+        s.archive.blocks_recorded.load(Ordering::Relaxed),
+    );
+    push_counter(
+        &mut out,
+        "uc2_archive_bytes_recorded_total",
+        "Log bytes the archive agent has recorded into the journal since this process started. Its rate is the local durability throughput; compare it with the append rate.",
+        s.archive.bytes_recorded.load(Ordering::Relaxed),
+    );
+    push_counter(
+        &mut out,
+        "uc2_archive_fsyncs_total",
+        "Journal fsyncs behind the archive. Consistent durability (the default): one fdatasync per recorded block (plus one per segment roll, not counted here). Eventual durability: the journal fsyncs asynchronously, so this counts each advance of its durable-block count the archive observed; two flushes between two looks count once.",
+        s.archive.fsyncs.load(Ordering::Relaxed),
+    );
+    push_gauge(
+        &mut out,
+        "uc2_archive_pending_flush_bytes",
+        "Eventual durability only: bytes the archive has written to the journal but the journal has not yet fsynced (the loss window on power failure). Always 0 under Consistent durability, where the durable counter moves only after the fsync.",
+        s.archive.pending_flush_bytes.load(Ordering::Relaxed),
+    );
+
     let commit_lag = append.saturating_sub(commit);
     let apply_lag = commit.saturating_sub(service_applied);
+    push_gauge(
+        &mut out,
+        "uc2_durable_lag_bytes",
+        "append - durable: bytes appended locally but not yet recorded by this node's archive. Growth here with a flat uc2_peer_replication_lag_bytes is the local journal write/fdatasync, not a peer.",
+        append.saturating_sub(durable),
+    );
     push_gauge(
         &mut out,
         "uc2_commit_lag_bytes",
@@ -2120,6 +2156,7 @@ mod tests {
             node_id: 7,
             cnc,
             sender: Arc::new(SenderStats::default()),
+            archive: Arc::new(uc_log::archive::ArchiveStats::default()),
             receiver: Arc::new(FollowerStats::default()),
             truncations: Arc::new(AtomicU64::new(0)),
             wipes: Arc::new(AtomicU64::new(0)),
@@ -2463,7 +2500,7 @@ mod tests {
     fn the_contract_has_the_number_of_families_the_docs_state() {
         assert_eq!(
             CONTRACT_SERIES.len(),
-            154,
+            159,
             "if this is intentional, update the family count in \
              docs/how-to/monitor-a-cluster.md in the same commit"
         );
@@ -3113,6 +3150,7 @@ mod tests {
             node_id: 7,
             cnc,
             sender: Arc::new(SenderStats::default()),
+            archive: Arc::new(uc_log::archive::ArchiveStats::default()),
             receiver: Arc::new(FollowerStats::default()),
             truncations: Arc::new(AtomicU64::new(0)),
             wipes: Arc::new(AtomicU64::new(0)),
@@ -3235,6 +3273,7 @@ mod tests {
             node_id: 7,
             cnc,
             sender: Arc::new(SenderStats::default()),
+            archive: Arc::new(uc_log::archive::ArchiveStats::default()),
             receiver: Arc::new(FollowerStats::default()),
             truncations: Arc::new(AtomicU64::new(0)),
             wipes: Arc::new(AtomicU64::new(0)),
@@ -3350,6 +3389,7 @@ mod tests {
             node_id: 7,
             cnc,
             sender: Arc::new(SenderStats::default()),
+            archive: Arc::new(uc_log::archive::ArchiveStats::default()),
             receiver: Arc::new(FollowerStats::default()),
             truncations: Arc::new(AtomicU64::new(0)),
             wipes: Arc::new(AtomicU64::new(0)),
@@ -3468,6 +3508,50 @@ mod tests {
         s.receiver.statuses_refused.fetch_add(9, Ordering::Relaxed);
         let text = render_prometheus(&s);
         assert!(text.contains("uc2_status_refused_total 9\n"), "{text}");
+    }
+
+    #[test]
+    fn the_archive_families_render_from_their_stats_cells() {
+        let s = synthetic_sources();
+        s.archive.blocks_recorded.fetch_add(3, Ordering::Relaxed);
+        s.archive.bytes_recorded.fetch_add(4096, Ordering::Relaxed);
+        s.archive.fsyncs.fetch_add(2, Ordering::Relaxed);
+        s.archive.pending_flush_bytes.store(512, Ordering::Relaxed);
+        let text = render_prometheus(&s);
+        assert!(
+            text.contains("uc2_archive_blocks_recorded_total 3\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("uc2_archive_bytes_recorded_total 4096\n"),
+            "{text}"
+        );
+        assert!(text.contains("uc2_archive_fsyncs_total 2\n"), "{text}");
+        assert!(
+            text.contains("uc2_archive_pending_flush_bytes 512\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("# TYPE uc2_archive_fsyncs_total counter"),
+            "{text}"
+        );
+        assert!(
+            text.contains("# TYPE uc2_archive_pending_flush_bytes gauge"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn the_durable_lag_gauge_is_append_minus_durable_and_saturates() {
+        let s = synthetic_sources();
+        let c = s.cnc.counters();
+        c.append.store_release(1000);
+        c.durable.store_release(400);
+        let text = render_prometheus(&s);
+        assert!(text.contains("uc2_durable_lag_bytes 600\n"), "{text}");
+        c.durable.store_release(1200);
+        let text = render_prometheus(&s);
+        assert!(text.contains("uc2_durable_lag_bytes 0\n"), "{text}");
     }
 
     #[test]
