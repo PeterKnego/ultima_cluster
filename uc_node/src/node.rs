@@ -9138,9 +9138,10 @@ impl Consensus {
         if min <= committed.max(MTU_DEFAULT as u32) {
             return false; // nothing to raise (a lower min is a degraded path — plan 2 reports it)
         }
-        let mut settings = self.cluster_view.to_state().settings;
-        settings.datagram_mtu = min;
-        let cmd = ClusterCommand::Settings(settings);
+        if self.cluster_walk_at_commit().is_some() {
+            return false; // #181: the view must be current before it is copied; next check
+        }
+        let cmd = self.datagram_mtu_command(min);
         if self.validate_cluster_command(&cmd).is_err() {
             return false;
         }
@@ -9264,6 +9265,18 @@ impl Consensus {
         if !self.wire.contains(committed) {
             return Some("range_excludes_committed");
         }
+        self.cluster_walk_at_commit()
+    }
+
+    /// Ruling 16, shared by every auto-writer of the replicated Settings
+    /// record (the wire raise and, since #181, the MTU raise): the view this
+    /// node copies into a record is current only once it has JOINED (the
+    /// attach gate's sense: leader known, commit learned, walk consumed to
+    /// commit) and its cluster agent's walk is at commit NOW. `commit` is
+    /// read before `consumed`, so `consumed >= commit` proves the walk has
+    /// consumed everything committed as of a moment no later than the commit
+    /// reading. `None` = current; else the reason the writer holds.
+    fn cluster_walk_at_commit(&self) -> Option<&'static str> {
         if !self.joined.load(Ordering::Acquire) {
             return Some("not_joined");
         }
@@ -9272,6 +9285,20 @@ impl Consensus {
             return Some("walk_behind");
         }
         None
+    }
+
+    /// #181: the MTU raise record — the view's settings with `datagram_mtu =
+    /// min`, and the two wire fields set to their keep idioms (`wire_raise =
+    /// WIRE_RAISE_KEEP`, `wire_level = 0`: the FSM keeps the committed mode
+    /// and the max level) — so a view one command stale cannot revert an
+    /// operator's mode change or re-send an older level. The mirror of
+    /// [`Self::wire_raise_command`], which keeps the rung the same way.
+    fn datagram_mtu_command(&self, min: u32) -> ClusterCommand {
+        let mut settings = self.cluster_view.to_state().settings;
+        settings.datagram_mtu = min;
+        settings.wire_raise = uc_protocol::v2::settings::WIRE_RAISE_KEEP;
+        settings.wire_level = 0;
+        ClusterCommand::Settings(settings)
     }
 
     /// Wire-level spec §4.1 over the committed membership (voters, then
@@ -21598,6 +21625,7 @@ mod tests {
     fn the_commit_rule_is_evaluated_at_most_every_100ms() {
         let mut h = harness();
         drive_to_serving_leader(&mut h);
+        walk_at_commit(&mut h);
         let peers = mtu_peers(&h);
         all_answer(&h, &peers, MTU_BOUND as u32, MTU_BOUND as u32);
 
@@ -21989,6 +22017,7 @@ mod tests {
     fn a_discovery_commit_is_audited_as_a_settings_apply_from_discovery() {
         let mut h = harness();
         drive_to_serving_leader(&mut h);
+        walk_at_commit(&mut h);
         let before = std::fs::read_to_string(h.cons.audit.path()).unwrap_or_default();
         assert!(before.is_empty(), "no admin op has run: {before}");
         let peers = mtu_peers(&h);
@@ -22034,6 +22063,7 @@ mod tests {
     fn the_commit_rule_holds_while_its_own_frame_is_above_commit() {
         let mut h = harness();
         drive_to_serving_leader(&mut h);
+        walk_at_commit(&mut h);
         let peers = mtu_peers(&h);
         all_answer(&h, &peers, MTU_BOUND as u32, MTU_BOUND as u32);
 
@@ -22058,6 +22088,7 @@ mod tests {
     fn the_commit_rule_counts_learners_not_just_voters() {
         let mut h = harness();
         drive_to_serving_leader(&mut h);
+        walk_at_commit(&mut h);
         // Put a learner in the COMMITTED membership (published by fiat — this
         // harness has no reconfiguration path).
         let learner: SocketAddr = "127.0.0.1:9199".parse().unwrap();
@@ -22088,6 +22119,7 @@ mod tests {
     fn the_commit_rule_never_lowers_and_never_re_proposes() {
         let mut h = harness();
         drive_to_serving_leader(&mut h);
+        walk_at_commit(&mut h);
         let peers = mtu_peers(&h);
 
         all_answer(&h, &peers, MTU_DEFAULT as u32, MTU_DEFAULT as u32);
@@ -22133,6 +22165,7 @@ mod tests {
             ..Settings::genesis_default()
         });
         drive_to_serving_leader(&mut h);
+        walk_at_commit(&mut h);
         let peers = mtu_peers(&h);
         // One peer's path is capped one rung down: 8832 is the minimum.
         h.cons.probe_table.set_peers(&peers);
@@ -22154,6 +22187,69 @@ mod tests {
         );
         assert_eq!(st.settings.admission_bytes, 4096, "untouched");
         assert_eq!(st.settings.snapshot_interval_bytes, 1 << 20, "untouched");
+        // #181: the two wire fields ride as keep idioms and land unchanged.
+        assert_eq!(st.settings.wire_level, uc_protocol::WIRE_MAX, "untouched");
+        assert_eq!(
+            st.settings.wire_raise,
+            uc_protocol::v2::settings::WIRE_RAISE_AUTO,
+            "untouched"
+        );
+    }
+
+    /// #181: the MTU record never claims the wire fields. A view that still
+    /// carries an explicit mode and a level (one command stale, say) must not
+    /// re-append either — the mirror of `the_raise_record_keeps_the_mode_and_
+    /// the_rung`.
+    #[test]
+    fn the_mtu_record_keeps_the_wire_mode_and_the_level() {
+        let mut h = harness();
+        drive_to_serving_leader(&mut h);
+        h.cons.cluster_view.wire_raise.store(
+            uc_protocol::v2::settings::WIRE_RAISE_MANUAL,
+            Ordering::Release,
+        );
+        h.cons
+            .cluster_view
+            .wire_level
+            .store(uc_protocol::WIRE_MAX + 1, Ordering::Release);
+        let ClusterCommand::Settings(s) = h.cons.datagram_mtu_command(8832) else {
+            panic!("a Settings command");
+        };
+        assert_eq!(s.datagram_mtu, 8832);
+        assert_eq!(s.wire_raise, uc_protocol::v2::settings::WIRE_RAISE_KEEP);
+        assert_eq!(s.wire_level, 0, "the FSM's max rule keeps the level");
+    }
+
+    /// #181, ruling 16 applied to the MTU raise: it holds until this node has
+    /// joined and its cluster agent's walk is at commit, because the record
+    /// copies the view and a view behind commit can carry a mode or a setting
+    /// an operator has since changed.
+    #[test]
+    fn the_mtu_raise_waits_for_the_join_and_for_the_walk_at_commit() {
+        let mut h = harness();
+        drive_to_serving_leader(&mut h);
+        let peers = mtu_peers(&h);
+        all_answer(&h, &peers, MTU_BOUND as u32, MTU_BOUND as u32);
+        let before = h.cons.last_cluster_append;
+        // Not joined.
+        h.cons.joined.store(false, Ordering::Release);
+        h.cons.next_mtu_check_ns = 0;
+        assert!(!h.cons.maybe_commit_datagram_mtu(), "not joined");
+        // Joined, but the walk is below commit.
+        walk_at_commit(&mut h);
+        let commit = h.cons.cnc.counters().commit.load_acquire();
+        assert!(commit > 0, "precondition: something committed");
+        h.cons
+            .cluster_view
+            .consumed
+            .store(commit - 1, Ordering::Release);
+        h.cons.next_mtu_check_ns = 0;
+        assert!(!h.cons.maybe_commit_datagram_mtu(), "walk behind");
+        assert_eq!(h.cons.last_cluster_append, before, "nothing appended");
+        // At commit: the raise proposes.
+        walk_at_commit(&mut h);
+        h.cons.next_mtu_check_ns = 0;
+        assert!(h.cons.maybe_commit_datagram_mtu());
     }
 
     /// Spec §7.1: the clamp, as arithmetic. `0` means the baseline; so does a
