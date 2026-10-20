@@ -118,7 +118,7 @@ fn stale_term_stream_is_ignored() {
                 position: end,
                 leadership_term_id: TERM - 1,
                 kind: DGRAM_KIND_DATA,
-                flags: 0,
+                wire: uc_protocol::WIRE_MAX,
                 key_epoch: 0,
             },
         );

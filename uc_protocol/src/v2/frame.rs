@@ -28,12 +28,25 @@ pub const FRAME_TYPE_MESSAGE: u8 = 1;
 /// header is actually written — the rest of the padded region is stale bytes.
 /// Readers and the archive skip it by `length`; replay drops it.
 pub const FRAME_TYPE_PADDING: u8 = 2;
-/// New-term no-op (spec §6, Raft §5.4.2): a zero-payload frame the new
-/// leader appends immediately on opening a term and must see COMMIT before
+/// New-term no-op (spec §6, Raft §5.4.2): a frame that carries only the
+/// reserved zero body (below), which the new leader appends immediately on opening a term and must see COMMIT before
 /// serving. Replicated/archived/replayed like any message frame; the apply
 /// layer (M5) applies only MESSAGE frames and TIMER frames addressed to the
 /// row.
 pub const FRAME_TYPE_NEW_TERM: u8 = 3;
+/// Wire-level spec §3.5 (0.12.0): `NEW_TERM` carries an 8-byte reserved
+/// body, `wire_level u32 LE @0 ‖ reserved u32 @4`, written as ZEROS and read
+/// by nobody. It is the carrier a future per-term frame relayout (the
+/// assessment's Level 3) stamps, reserved now so that relayout can be a
+/// level instead of a flag day. The frame is 64 B aligned instead of 32 B.
+pub const NEW_TERM_BODY_LEN: usize = 8;
+/// The aligned on-wire size of a `NEW_TERM` frame (header + body, 32 B slots).
+pub const NEW_TERM_FRAME_LEN: usize = align_frame_len(HEADER_LEN + NEW_TERM_BODY_LEN);
+
+/// Write the `NEW_TERM` reserved body (all zeros) into `buf[..NEW_TERM_BODY_LEN]`.
+pub fn write_new_term_body(buf: &mut [u8]) {
+    buf[..NEW_TERM_BODY_LEN].fill(0);
+}
 /// Cluster-FSM command (spec §4.3). The body is `kind: u8 ‖ reserved [u8; 7]
 /// ‖ payload`; the kind selects the payload codec. Reuses `CONFIG`'s number
 /// inside the unreleased 2.11.0 flag day — no shipped node ever emitted a
@@ -300,6 +313,7 @@ mod tests {
         assert_eq!(FRAME_TYPE_MESSAGE, 1);
         assert_eq!(FRAME_TYPE_PADDING, 2);
         assert_eq!(FRAME_TYPE_NEW_TERM, 3);
+        assert_eq!((NEW_TERM_BODY_LEN, NEW_TERM_FRAME_LEN), (8, 64));
         assert_eq!(FRAME_TYPE_CLUSTER, 4);
         assert_eq!(FRAME_TYPE_TIMER, 5);
         assert_eq!(FLAG_TIMER_TABLE, 0x01);

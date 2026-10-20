@@ -71,6 +71,9 @@ pub mod services;
 pub mod tier;
 pub(crate) mod timers;
 pub mod view;
+pub mod wire;
+pub mod wire_raise;
+pub use wire_raise::{WireHoldout, wire_raise_target};
 
 /// Catalog spec §4.4: the soft per-node holdings table, re-exported so the
 /// node/service code that fills and queries it doesn't need
@@ -96,8 +99,8 @@ pub use node::{
     REASON_SCHEDULE_TOO_LARGE, REASON_SCHEDULE_UNKNOWN_FSM, REASON_SETTINGS_BOUNDS,
     REASON_SETTINGS_DECODE, REASON_SETTINGS_DIGEST, REASON_SETTINGS_MISSING,
     REASON_SNAPSHOT_ABOVE_DURABLE, REASON_SNAPSHOT_NO_LEARNER, REASON_SNAPSHOT_UNSUPPORTED,
-    REASON_TIER_UNKNOWN, REASON_VERSION_ALREADY_SET, SnapshotRefusal, StartOpts, SubmitError,
-    fetch_position,
+    REASON_TIER_UNKNOWN, REASON_VERSION_ALREADY_SET, REASON_WIRE_HOLDOUT, SnapshotRefusal,
+    StartOpts, SubmitError, fetch_position,
 };
 pub use services::{FsmLag, ServicesConfig};
 /// Time-and-timers §6: the per-row timer counters carried by
@@ -126,3 +129,4 @@ pub use uc_protocol::v2::datagram::Holdings;
 /// [`Settings::genesis_default`] (every field zero / `Target::All`) is exactly
 /// the pre-cluster-FSM behavior — nothing reads this yet.
 pub use uc_protocol::v2::settings::{Settings, Target};
+pub use wire::{WireFault, check_level};

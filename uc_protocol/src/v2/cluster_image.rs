@@ -54,7 +54,7 @@
 
 use super::settings::{
     SETTINGS_LEN, SETTINGS_LEN_V1, SETTINGS_LEN_V2, SETTINGS_LEN_V3, SETTINGS_LEN_V4,
-    SETTINGS_LEN_V5,
+    SETTINGS_LEN_V5, SETTINGS_LEN_V6,
 };
 
 pub const CLUSTER_IMAGE_MAGIC: &[u8; 8] = b"UCCLUST1";
@@ -259,7 +259,8 @@ pub fn decode_cluster_image(buf: &[u8]) -> Option<ClusterImageParts<'_>> {
             3 => SETTINGS_LEN_V3,
             4 => SETTINGS_LEN_V4,
             5 => SETTINGS_LEN_V5,
-            6 => SETTINGS_LEN,
+            6 => SETTINGS_LEN_V6,
+            7 => SETTINGS_LEN,
             _ => return None,
         };
         let rest = body.len().checked_sub(o)?;
@@ -286,7 +287,8 @@ pub fn decode_cluster_image(buf: &[u8]) -> Option<ClusterImageParts<'_>> {
             3 => SETTINGS_LEN_V3,
             4 => SETTINGS_LEN_V4,
             5 => SETTINGS_LEN_V5,
-            6 => SETTINGS_LEN,
+            6 => SETTINGS_LEN_V6,
+            7 => SETTINGS_LEN,
             _ => return None,
         };
         let settings = o.checked_add(sl).and_then(|end| body.get(o..end))?;

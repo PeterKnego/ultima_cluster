@@ -16,7 +16,7 @@ To read a live page while diagnosing a node, see
 | Offset | Size | Field | Notes |
 |---|---|---|---|
 | 0 | 8 B | magic | `UC2CNC\0\0` |
-| 8 | u32 LE | version | `CNC_V2_VERSION` = `(3 << 24) \| (1 << 16)` (cnc 3.1, FSM identity + log time, 2.11.0); `(3 << 24) \| (2 << 16)` (cnc 3.2, `payload_ceiling`, `2.12.0`); `(3 << 24) \| (3 << 16)` (cnc 3.3, `upgrade_origin`/`pinned_version`, FSM upgrade lifecycle); `(3 << 24) \| (4 << 16)` (cnc 3.4, `running_version`/`running_record_pos`/`cluster_applied`, the row running version, #33; the same 3.4 (`2.14.0`) also carries `write_reserve` (#78), the start-set pair (snapshot lifecycle) and the read-your-writes query flag) |
+| 8 | u32 LE | version | `CNC_V2_VERSION` = `(3 << 24) \| (1 << 16)` (cnc 3.1, FSM identity + log time, 2.11.0); `(3 << 24) \| (2 << 16)` (cnc 3.2, `payload_ceiling`, `2.12.0`); `(3 << 24) \| (3 << 16)` (cnc 3.3, `upgrade_origin`/`pinned_version`, FSM upgrade lifecycle); `(3 << 24) \| (4 << 16)` (cnc 3.4, `running_version`/`running_record_pos`/`cluster_applied`, the row running version, #33; the same 3.4 (`2.14.0`) also carries `write_reserve` (#78), the start-set pair (snapshot lifecycle) and the read-your-writes query flag); `(3 << 24) \| (5 << 16)` (cnc 3.5, `wire_level`/`wire_binary`/peer-slot `wire_max`, the wire level, `2.15.0`) |
 | 12 | u32 LE | node id | |
 | 16 | u64 LE | instance id, low | changes on every node restart |
 | 24 | u64 LE | instance id, high | |
@@ -67,6 +67,8 @@ with the same writer.
 | 3968 | `ingress_holes_skipped` | M13: dead-producer holes skipped on the client **ingress** MPSC ring; writer: the consensus agent, published on change only |
 | 3976 | `query_holes_skipped` | M13: same counter for the **query** ring — deliberately the second u64 of the 3968 line (same writer, on-change only) |
 | 3984 | `payload_ceiling` | u64, **live** (cnc 3.2, jumbo-frame MTU discovery, `2.12.0`) — the third word of the 3968 line, same writer (consensus agent), published on change only: at boot, and whenever the committed rung moves. Readers: every client and the gateway edge, per submit. The header's `max_payload` (offset 112) stays the BOUND the buffer is sized for; this word is the door — see [Wire protocol § `PROBE` / `PROBE_ACK` bodies](wire-protocol.md#probe--probe_ack-bodies-wire-080-2120) |
+| 3992 | `wire_level` | u64, **live** (cnc 3.5, the wire level, `2.15.0`) — the committed cluster wire level. Writer: the **`uc2-cluster` agent**, when it applies a `Settings` record and at an artifact install (the fourth word of the 3968 line, a second slow writer beside the consensus agent's). Readers: `uc2ctl status`/`wire show` and `/metrics` (`uc2_wire_level`) only. In-node consumers (the leader's raise logic) read the cluster agent's published view, not this word, and the sender reads no level at all — it writes its own `WIRE_MAX` into datagram byte 13 |
+| 4000 | `wire_binary` | u64 (cnc 3.5) — this node's binary range, `(WIRE_MIN << 8) \| WIRE_MAX`. Writer: the node, once at boot, before any agent runs. Lets `uc2ctl` print the node's range rather than its own; `/metrics` exports it as `uc2_wire_binary_min`/`_max` |
 | 4032 | `services_declared` | node, once at boot (bit *i* ⇔ id *i* declared), stored AFTER `fsm_lag_bytes` (4040) since 2.12.0 — a reader that observes a nonzero set may rely on the lag word; names on line 7 with this word still 0 is a booting node and attachers refuse it. **Unchanged by cnc 3.1 / FSM identity**: this same-host bitmask is unrelated to the wire's per-row `SnapBeginBody.identity` array (`docs/reference/wire-protocol.md`) — the two are derived from the same `[services] names` config but serve different readers |
 | 4040 | `fsm_lag_bytes` | node (`0` ⇔ lockstep) — shares 4032's line. Since the cluster FSM (2.11.0) this is derived from the committed `Settings::fsm_lag_bytes` and **re-published when that setting moves**, not written once at boot. The record's own `0` means "derive at use" and lockstep is `u64::MAX` there, so `page_lag_from_setting` is the one place that maps the record's sentinels onto this word's |
 | 4048 | `log_time_ns` | **archive agent** (cnc 3.1, log time, 2.11.0) — the highest leader stamp the archive has recorded, ns since the Unix epoch. The third word of the `4032` line, and its only *live* writer until cnc 3.4: `4032`/`4040` are written once before publish and never again. **Never lowered.** A new leader seeds its stamp clamp from this word after the leader-open collapse; `/metrics` exports it as `uc2_log_time_ns` and `uc2ctl status` prints `log_time_ns=` (raw ns, not RFC 3339) |
@@ -107,6 +109,7 @@ Fields within a slot:
 | Slot offset | Field |
 |---|---|
 | 0 | `id_and_role` — id in bits 8 and above, role in the low byte |
+| 8 | `wire_max` (cnc 3.5) — the member's reported `WIRE_MAX`, from byte 13 of its durable reports; `0` = no report this term. Writer: the consensus agent, on change; leader-authoritative, cleared when a new leader takes office, zeros on a follower |
 | 64 | `reported_durable` |
 | 128 | `advertised_limit` |
 | 192 | `naks_plus_replay` |

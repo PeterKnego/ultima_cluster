@@ -299,7 +299,7 @@ impl FakePeer {
                 position: 0,
                 leadership_term_id: 0,
                 kind,
-                flags: 0,
+                wire: uc_protocol::WIRE_MAX,
                 key_epoch: 0,
             },
         );
@@ -403,7 +403,7 @@ impl FakePeer {
                 position: 0,
                 leadership_term_id: term,
                 kind: DGRAM_KIND_VOTE,
-                flags: 0,
+                wire: uc_protocol::WIRE_MAX,
                 key_epoch: 0,
             },
         );
@@ -966,7 +966,7 @@ fn a_downgrade_to_cleartext_is_refused() {
             position: append_before,
             leadership_term_id: 0,
             kind: DGRAM_KIND_DATA,
-            flags: 0,
+            wire: uc_protocol::WIRE_MAX,
             key_epoch: 0,
         },
     );
@@ -987,7 +987,7 @@ fn a_downgrade_to_cleartext_is_refused() {
             position: append_before,
             leadership_term_id: 0,
             kind: DGRAM_KIND_DATA,
-            flags: 0,
+            wire: uc_protocol::WIRE_MAX,
             key_epoch: 0,
         },
     );
@@ -1049,7 +1049,7 @@ fn a_downgrade_to_cleartext_is_refused() {
             position: 0,
             leadership_term_id: injected_term,
             kind: DGRAM_KIND_REQUEST_VOTE,
-            flags: 0,
+            wire: uc_protocol::WIRE_MAX,
             key_epoch: 0,
         },
     );
@@ -1335,7 +1335,7 @@ fn heavy_corruption_and_replay_injection_never_panics_and_never_diverges() {
     // ("pos must be a frame start"; a mid-frame `pos` "misreads a payload
     // byte as the length word ... garbage") and only accidentally landed on
     // real frame starts when every frame happened to be exactly 256/n
-    // bytes. Leader churn under the storm appends 32-byte `NEW_TERM`
+    // bytes. Leader churn under the storm appends 64-byte `NEW_TERM`
     // frames; an odd count of those shifts every later frame off any fixed
     // stride, and the resulting garbage read (`len_read=256, type_read=0`
     // in the diagnosed failure — neither a real length nor a valid

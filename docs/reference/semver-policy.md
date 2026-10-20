@@ -170,7 +170,7 @@ API for downstream code. They may change in any release:
 
 | Crate | Not promised |
 |---|---|
-| `uc_protocol` | all of it — `ring` (the lock-free ring buffers — not the `ring` crypto crate that `deny.toml` bans), `v2`, `magic`, `error_codes`, `version`, `identity` (FSM identity, 2.11.0 — `FsmName`, `FsmIdentity`, `fnv1a_64`, packed version). It is the wire spec, governed by the flag-day rule below, not by semver. `2.11.0` also **relays `FrameHeader`** (`session_id`/`correlation_id: u64` become `client_id`/`seq: u32` plus `time_ns: u64`) and adds `FRAME_TYPE_TIMER`, `TimerBody`, `MSG_V2_SCHED` and `SchedRecord` — a breaking Rust change on an unpromised item, and a flag day on the wire. |
+| `uc_protocol` | all of it — `ring` (the lock-free ring buffers — not the `ring` crypto crate that `deny.toml` bans), `v2`, `magic`, `error_codes`, `version`, `identity` (FSM identity, 2.11.0 — `FsmName`, `FsmIdentity`, `fnv1a_64`, packed version). It is the wire spec, governed by the level rule below, not by semver. `2.11.0` also **relays `FrameHeader`** (`session_id`/`correlation_id: u64` become `client_id`/`seq: u32` plus `time_ns: u64`) and adds `FRAME_TYPE_TIMER`, `TimerBody`, `MSG_V2_SCHED` and `SchedRecord` — a breaking Rust change on an unpromised item, and a flag day on the wire. |
 | `uc_log` | `agent`, `archive`, `buffer`, `cnc`, `counters`, `reader`, `region`, `state`, `writer` |
 | `uc_consensus` | `commit`, `config`, `election`, `reconcile` |
 | `uc_net` | `fault`, `flow`, `rebuild`, `receiver`, `sender`. **`2.8.0` changed these signatures, in a minor release** — see the note below. |
@@ -218,31 +218,57 @@ Two version numbers are deliberately *outside* this policy, because semver's
 "a minor bump is safe" contract is the wrong promise for them:
 
 - **The node-to-node wire protocol** (`uc_protocol::version::CURRENT`,
-  currently `0.11.0` (the snapshot catalog's `STATUS` body, `SNAP_REPORT`
-  row 255 and `Settings` v3, then the snapshot lifecycle's 32 B `SNAP_REPORT`, 20-byte `SnapshotReport` entries and `Settings` v4; since `2.14.0` — `0.10.0`
-  (#33's row running version) was never released on its own and folded into
-  `0.11.0`; `0.9.0` shipped in
-  `2.13.0`) — see [wire protocol](wire-protocol.md)).
-- **The `cnc.dat` page layout** (`CNC_V2_VERSION`, currently cnc `3.4`
-  (#33, since `2.14.0`; the snapshot catalog leaves cnc untouched — the
-  catalog is not on the shmem page; cnc `3.3` shipped in `2.13.0`) — see
-  [the cnc control page](cnc-page.md)).
+  currently `0.12.0` (the wire level, `2.15.0`); `0.11.0` (the snapshot
+  catalog, the snapshot lifecycle and the backup tier — `0.10.0`, #33's row
+  running version, was never released on its own and folded into it)
+  shipped in `2.14.0`, `0.9.0` in `2.13.0` — see
+  [wire protocol](wire-protocol.md)).
+- **The `cnc.dat` page layout** (`CNC_V2_VERSION`, currently cnc `3.5` (the
+  wire level's three words, `2.15.0`); cnc `3.4` shipped in `2.14.0`, `3.3`
+  in `2.13.0` — see [the cnc control page](cnc-page.md)).
 
-A change to either is a **flag day**: every node in a cluster is stopped and
-restarted on the new version together. Mixed-version operation is not
-supported and is not made safe by the version numbers agreeing on a major.
-`v2.5.0`'s content-attested durable reports are the worked example — a
-`0.4.0` peer's report reads as unattested and is not counted, so a mixed
-cluster stalls commits rather than making unsound ones. The procedure is
-[Upgrade a cluster](../how-to/upgrade-a-cluster.md); it applies whether or
+Neither follows the crate's semver, and since `2.15.0` neither is simply "a
+flag day" either. **The level rule:**
+
+- **A wire minor is a level.** `0.12.0` is level 12, and every binary runs
+  inside a range `WIRE_MIN..WIRE_MAX` one level wide (`WIRE_MIN = WIRE_MAX -
+  1`; `0.12.0` alone is `12..12`, since nothing below it is level-aware). A
+  cluster commits one level and raises it only once every member reports it
+  can follow, so a release whose wire minor is the cluster's level or one
+  above it **rolls**, one node at a time under load. One level back is the
+  whole promise: two levels need the middle release.
+- **A wire major is a flag day**: every node stopped and restarted on the new
+  version together. So is everything the wire level section below lists as
+  staying a flag day by choice (the header lengths, crypto on or off, cnc
+  growth beyond the reserved bands).
+- **Stop-all is not an escape from the level.** From `0.13.0` on, a cluster
+  two levels behind must step through the middle release even with every
+  node stopped, because the new binary has dropped the older level's
+  encoders; it stops with `WireLevelBelowBinary` and names the release.
+- **A cnc minor is a per-host restart.** An older attacher refuses a newer
+  page, so a host's node and every process attached to its instance
+  directory (services, shmem clients, the gateway) restart together. It is
+  per host, so it fits inside a roll; a cnc **major** stays a cluster flag
+  day.
+
+`2.15.0` (wire `0.12.0`, cnc `3.5`) is itself the last additive flag day:
+a `0.11.0` node carries no level, so it is refused by name rather than
+rolled. Every bump before it was a flag day in which mixed-version operation
+was unsupported and was not made safe by the version numbers agreeing on a
+major. `v2.5.0`'s content-attested durable reports are the worked example —
+a `0.4.0` peer's report reads as unattested and is not counted, so a mixed
+cluster stalls commits rather than making unsound ones. Both procedures, the
+rolling one and the stop-all one, are
+[Upgrade a cluster](../how-to/upgrade-a-cluster.md); they apply whether or
 not the crate version's major digit moved.
 
-**`2.14.0` shipped the most recent flag day on both lines** (wire `0.11.0`,
-cnc `3.4`; `0.10.0` folded into it); `2.13.0` shipped the one before.
+**`2.15.0` ships the most recent flag day on both lines** (wire `0.12.0`,
+cnc `3.5`); `2.14.0` shipped the one before (wire `0.11.0`, cnc `3.4`;
+`0.10.0` folded into it), and `2.13.0` the one before that.
 `2.11.0` carried **two**
 wire-and-page features at once: wire `0.6.0` → `0.7.0` and cnc `3.0` → `3.1`,
-bundled as one combined flag day per the standing rule that a cnc layout
-change is a flag day regardless of the digit.
+bundled as one combined flag day per the rule that stood until `2.15.0`, that
+a cnc layout change is a flag day regardless of the digit.
 
 - **FSM identity** — `SNAP_BEGIN`'s bitmask becomes a per-row identity-hash
   array plus a per-row version array (a 0.6.0 sender's shorter body is dropped
@@ -403,6 +429,63 @@ never installed. `retain_sets` (default `1`, the prior newest-only
 behaviour) is the first replicated retention policy; `0` and anything above
 `56` are refused with `47`. No API change: this flag day is entirely wire,
 cnc-page-adjacent (the artifact, not the live page) and operator-surface.
+
+### The wire level (0.12.0, cnc 3.5) — the last additive flag day
+
+`2.15.0`, issue [#31](https://github.com/PeterKnego/ultima_cluster/issues/31):
+wire `0.11.0` → `0.12.0` and cnc `3.4` → `3.5`. It is a flag day on the old
+terms — stop every node before starting any — and it is the release that
+ends them for additive wire changes (the level rule above). The argument is
+[the wire level explainer](../notes/uc2-wire-level-explained.md).
+
+**Wire `0.12.0`.** Datagram header byte 13, the always-zero `flags` byte,
+becomes `wire`: every datagram carries its sender's `WIRE_MAX`, and a
+receiver refuses any byte outside `[WIRE_MIN, WIRE_MAX + 1]` before reading
+anything else — `0` counted as `prelevel` (a `0.11.0` peer), anything else as
+`out_of_range` ([wire protocol](wire-protocol.md#datagram-header)). The
+replicated `Settings` record grows to version 7 (49 B) with `wire_level` and
+`wire_raise`; versions 1–6 still decode, as level 12 with auto raise.
+`NEW_TERM` gains an 8-byte body written as zeros (a 64 B frame). This is the
+**first flag day a mixed cluster is refused rather than misparsed**: a
+`0.11.0` node's datagrams carry `0` and are refused by name and counted
+(`uc2_wire_datagrams_refused_total{reason="prelevel"}`).
+
+**cnc `3.5`.** Three words, no layout move: `wire_level` at page-1 offset
+`3992` (the `uc2-cluster` agent), `wire_binary` at `4000` (the node, at boot,
+`(WIRE_MIN << 8) | WIRE_MAX`) and `wire_max` at peer slot `+8` (the consensus
+agent, leader-authoritative) ([cnc page](cnc-page.md)).
+
+**No wipe.** The cluster image version is unchanged; no `snapshots/`
+directory is cleared.
+
+**Constants.** `uc_protocol::version` gains `WIRE_LEVEL_FIRST = 12`,
+`WIRE_MAX` (`CURRENT`'s minor), `WIRE_MIN` (by const arithmetic, never
+hand-edited) and `WireRange`, and `MIN_COMPATIBLE` becomes `0.WIRE_MIN.0`
+rather than documentary. `uc_protocol` is not a promised crate, so none of
+this is API.
+
+**What stays a flag day, by choice.** The wire major and the cnc major; the
+16-byte datagram header's length and the `DATA` self-locating contract; the
+32-byte frame header's length; crypto on or off per cluster; cnc page growth
+beyond the reserved bands.
+
+**Release discipline from here.** A release that adds no gated wire feature
+keeps `CURRENT` and rolls with no step. A release that adds one bumps the
+wire minor, writes exactly one `if level >= N` gate, deletes the `N - 1`
+gate as always-true, adds the new level's golden corpus beside the old
+one (`uc_protocol/tests/golden_level12.rs` is the first; an existing
+level's file is never edited, since it pins what that level emits), keeps
+every older
+**decoder** and drops the `N - 1` **encoders**. A consensus safety fix ships
+as a gated level by default; the release notes may declare it a flag day
+instead when running pre-fix until the raise is unacceptable. The checklist
+line is in [Cut a release](../how-to/cut-a-release.md).
+
+**API notes.** None for an application: no trait, config struct or SDK type
+changed. Operator surface only — `uc2ctl wire show` / `wire raise` (admin op
+12, refusal `63 wire_holdout`), the `wire_raise` settings-file key, the
+`wire:` line in `uc2ctl status`, five metric families and the
+`Uc2WireLevelBelowMembers` alert.
 
 ### `2.13.0` API notes
 

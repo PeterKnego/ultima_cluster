@@ -95,5 +95,6 @@ fn main() -> std::io::Result<()> {
     write_target(root, "uc_node_http", seeds::uc_node_http())?;
     write_target(root, "uc_protocol_probe", seeds::uc_protocol_probe())?;
     write_target(root, "uc_protocol_status_body", seeds::uc_protocol_status_body())?;
+    write_target(root, "uc_protocol_compat", seeds::uc_protocol_compat())?;
     Ok(())
 }

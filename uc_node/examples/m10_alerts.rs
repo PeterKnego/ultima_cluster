@@ -86,6 +86,7 @@ const ALL_SCENARIOS: &[&str] = &[
     "mtu_discovery_stalled",
     "path_below_mtu",
     "jumbo_gate_held",
+    "wire_level_below_members",
 ];
 
 // ------------------------------------------------------------------ CLI
@@ -231,6 +232,7 @@ fn run_scenario(name: &str, scratch_root: &Path) -> (SeriesFile, Disclosure) {
         "mtu_discovery_stalled" => scenario_mtu_discovery_stalled(),
         "path_below_mtu" => scenario_path_below_mtu(),
         "jumbo_gate_held" => scenario_jumbo_gate_held(),
+        "wire_level_below_members" => scenario_wire_level_below_members(),
         other => panic!("unknown scenario {other:?} — one of {ALL_SCENARIOS:?}"),
     }
 }
@@ -2425,6 +2427,46 @@ fn scenario_jumbo_gate_held() -> (SeriesFile, Disclosure) {
                      committed rung to it — can't be honestly hosted in-process at the \
                      rule's 5m sustain), rendered through the real exporter as \
                      uc2_jumbo_gate_pending = 1 and held."
+                .into(),
+        },
+    )
+}
+
+/// Wire-level spec §5.4: the committed level sits at 12 while this binary
+/// (and, in a real fleet, every other) speaks up to 13. Set directly on the
+/// cnc page — the real trigger is a completed roll left unraised for 30m,
+/// outside this harness's per-rule budget — and rendered through the real
+/// exporter.
+fn scenario_wire_level_below_members() -> (SeriesFile, Disclosure) {
+    let sources = synthetic_sources(0);
+    sources.cnc.store_wire_level(12);
+    sources
+        .cnc
+        .store_wire_binary(uc_protocol::WireRange { min: 12, max: 13 }.pack());
+    let srv = ObsServer::serve(sources.clone(), "127.0.0.1:0".parse().unwrap()).expect("bind");
+    let addr = srv.local_addr();
+    let mut sf = SeriesFile::new();
+    for _ in 0..3 {
+        sf.record_round(
+            "n0",
+            &scrape(addr),
+            &["uc2_wire_level", "uc2_wire_binary_max"],
+        );
+        thread::sleep(Duration::from_millis(200));
+    }
+    srv.stop();
+
+    (
+        sf,
+        Disclosure {
+            scenario: "wire_level_below_members",
+            rules: &["Uc2WireLevelBelowMembers"],
+            state: "synthetic",
+            method: "synthetic ObsSources: the cnc page's committed wire level stored 12 and \
+                     the binary range 12..13 directly (the real trigger — a finished roll left \
+                     unraised for 30m — can't be hosted in-process at the rule's sustain), \
+                     rendered through the real exporter as uc2_wire_level = 12 against \
+                     uc2_wire_binary_max = 13 and held."
                 .into(),
         },
     )

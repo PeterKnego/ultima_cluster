@@ -8,6 +8,34 @@ Anything not checked is marked "not verified". Status: an assessment, not a
 spec — the recommendation at the end is a starting position for
 `docs/BACKLOG.md` item 3, which already names this gap.*
 
+> **Taken up 2026-10-19.** Level 2 below — the committed cluster wire level —
+> ships in `2.15.0` (wire `0.12.0`, cnc `3.5`, issue
+> [#31](https://github.com/PeterKnego/ultima_cluster/issues/31)). The design
+> is `docs/superpowers/specs/2026-10-19-uc2-wire-level-design.md` (read its
+> errata block before the body); the plain-language account is
+> [The committed cluster wire level, explained](uc2-wire-level-explained.md).
+> The spec's §1.2 re-checked this note against `b361eb29` (after `2.14.0`).
+> It **corrected two of its premises**:
+>
+> 1. **`CLUSTER` kind 4 is taken** (`UpgradePin`, `2.13.0`; kinds run 1–7),
+>    so the level is a field of the `Settings` record, version 7
+>    (`wire_level @47`, `wire_raise @48`), not the "Settings v3 field or
+>    `CLUSTER kind = 4`" of the Level 2 row.
+> 2. **`main` was not inside a flag day** — `2.14.0` had shipped — so
+>    `2.15.0` is made one, the last for an additive wire change.
+>
+> And the design **changed two of its proposals**:
+>
+> 3. **The receive window** is `[WIRE_MIN, WIRE_MAX + 1]`, one level above
+>    the receiver's own max, not `[wire_min, wire_max]`; the report still
+>    rides datagram byte 13, which §1.2 confirmed free and AAD-covered.
+> 4. **`MIN_COMPATIBLE` is enforced**, no longer documentary: it derives
+>    from `WIRE_MIN`, and the byte it bounds is checked on every receive
+>    path. (`NEW_TERM` also gains the 8-byte body Level 3 needs, reserved
+>    and zero.)
+>
+> The rest of this note is unchanged and reads as of `2.12.0`.
+
 ## The shape of the problem
 
 A rolling upgrade is not "the new binary tolerates the old datagrams". It

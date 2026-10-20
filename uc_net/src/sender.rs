@@ -24,6 +24,7 @@ use uc_journal::Journal;
 use uc_log::archive::find_block;
 use uc_log::buffer::{LogBuffer, SliceRead};
 use uc_log::cnc::CncPage;
+use uc_protocol::WireRange;
 use uc_protocol::v2::crypto::CRYPTO_OVERHEAD;
 #[cfg(test)]
 use uc_protocol::v2::datagram::read_snap_begin_body;
@@ -405,6 +406,11 @@ pub struct SenderConfig {
     /// `Sender::with_crypto` asserts this always agrees with whether a
     /// `Transport` was actually supplied, so the two can never drift.
     pub crypto_enabled: bool,
+    /// Wire-level spec §3.1: the range this node speaks. Every datagram this
+    /// sender builds stamps `wire.max` into header byte 13. A field rather
+    /// than the bare `WIRE_MAX` so a test (or the two-binary crashtest) can
+    /// give one sender another range.
+    pub wire: WireRange,
 }
 
 impl SenderConfig {
@@ -416,6 +422,7 @@ impl SenderConfig {
             initial_window: 65_536,
             dgrams_per_cycle: 8,
             crypto_enabled: false,
+            wire: WireRange::BINARY,
         }
     }
 
@@ -1120,7 +1127,7 @@ impl Sender {
                 position: 0,
                 leadership_term_id: self.term.load(Ordering::Relaxed),
                 kind: DGRAM_KIND_PROBE,
-                flags: 0,
+                wire: self.cfg.wire.max,
                 key_epoch: 0,
             },
         );
@@ -1475,7 +1482,7 @@ impl Sender {
                 position,
                 leadership_term_id: self.term.load(Ordering::Relaxed),
                 kind,
-                flags: 0,
+                wire: self.cfg.wire.max,
                 // M8: always written as 0 here — `Transport::seal`'s group
                 // branch stamps the REAL epoch into this field itself, as the
                 // last write before sealing (the header is AAD, so it must be
@@ -2312,7 +2319,7 @@ impl Sender {
                 position,
                 leadership_term_id: self.term.load(Ordering::Relaxed),
                 kind,
-                flags: 0,
+                wire: self.cfg.wire.max,
                 // Pairwise scope carries no epoch (the session key is per
                 // handshake, not per group epoch), so this stays 0 in both
                 // modes — see `crypto_admit`'s mixed-mode diagnostic, which
@@ -2370,7 +2377,7 @@ impl Sender {
                 position,
                 leadership_term_id: self.term.load(Ordering::Relaxed),
                 kind: DGRAM_KIND_DATA,
-                flags: 0,
+                wire: self.cfg.wire.max,
                 key_epoch: 0,
             },
         );

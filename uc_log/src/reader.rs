@@ -225,8 +225,8 @@ mod tests {
     fn new_term_frame_is_yielded_but_carries_no_payload() {
         let (b, _c) = buf();
         let mut a = Appender::new(Arc::clone(&b), 5, 0);
-        a.append_new_term().unwrap(); // 32 B header-only frame at 0
-        a.append(9, 1, b"data").unwrap(); // MESSAGE at 32
+        a.append_new_term().unwrap(); // 64 B frame (header + reserved zero body) at 0
+        a.append(9, 1, b"data").unwrap(); // MESSAGE at 64
         let mut f = LogFollower::new(Arc::clone(&b), 0);
         match f.next_batch(a.position()) {
             Batch::Frames(it) => {
@@ -234,7 +234,7 @@ mod tests {
                     it.map(|(pos, h, p)| (pos, h.frame_type, p.len())).collect();
                 assert_eq!(
                     v,
-                    vec![(0, FRAME_TYPE_NEW_TERM, 0), (32, FRAME_TYPE_MESSAGE, 4)],
+                    vec![(0, FRAME_TYPE_NEW_TERM, 8), (64, FRAME_TYPE_MESSAGE, 4)],
                     "NEW_TERM is delivered (apply skips it by type); payload lengths exact"
                 );
             }

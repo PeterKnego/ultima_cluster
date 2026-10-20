@@ -1004,7 +1004,7 @@ mod tests {
                 position: 4096,
                 leadership_term_id: 3,
                 kind: uc_protocol::v2::datagram::DGRAM_KIND_VOTE,
-                flags: 0,
+                wire: 0,
                 key_epoch: 0,
             },
         );

@@ -88,6 +88,12 @@ anyhow = { workspace = true }
 # build; even when compiled in, inert unless UC2_MUTATION is set.
 mutation-testing = ["uc_consensus/mutation-testing", "uc_client/mutation-testing"]
 
+# Wire-level spec §6.2: lets a test or the two-binary crashtest give one
+# tree a different wire range (`StartOpts.wire`, env `UC2_WIRE_RANGE=min,max`
+# in the daemon and the crashtest node bin). Off in every normal build; the
+# env var is ignored unless compiled in.
+wire-level-override = []
+
 # read_profile (leader-lease profile harness) carries unit tests for its
 # /proc occupancy parser; `test = true` makes `cargo test` run them.
 [[example]]

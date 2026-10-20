@@ -29,7 +29,7 @@ record it summarizes; where the two disagree, the dated record wins.
 | **Elle** | Checked on real processes | Transactional safety (serializable and strict), single- and two-FSM — plus a mutation tier proving the harness has teeth |
 | **Multi-process crashtest** | Checked on real processes | Recovery correctness under `SIGKILL` mid-load — single- and two-FSM |
 | **loom** | Exhaustive over interleavings | The frame-visibility memory protocol, the MPSC ring's per-record commit protocol, the Broadcast ring's seqlock read barrier, **and the follower write-reserve seqlock (#78)** |
-| **Fuzzing (libFuzzer)** | Checked under coverage-guided input search | Totality of the twenty-six decoders that see bytes the process did not write |
+| **Fuzzing (libFuzzer)** | Checked under coverage-guided input search | Totality of the twenty-seven decoders that see bytes the process did not write |
 | **Miri** | Checked under a symbolic interpreter | Undefined behaviour in the pure wire/journal decoders and `uc_remote`'s Vec-backed SPSC internals (**not** the file-backed rings) |
 | **Veil** | Bug-hunting only — **never the record** | Bounded model checking of the election and reconfiguration planes |
 | **`log_clock` unit suite** | Ordinary unit tests | The monotonic log clock's pure arithmetic (`uc_node::log_clock`): steady state, forward-step adoption, backward-step smear and full retirement, tolerance, multiple resamples against a smear in flight (`a_smear_in_flight_is_not_re_reported_and_the_gauge_counts_down`: one step reported, the remaining-smear gauge strictly falling, no undershoot, over 3 000 resamples), a seeded-random step sequence, and `bracket_sample`/`resample_slow` against the real clock — 17 tests, `cargo test -p uc_node --lib log_clock` |
@@ -950,8 +950,30 @@ histories are still `Linearizable` with `equiv == 0`. The slow-freeze wrapper
 lives in the crashtest crate only and is opt-in (`--snapshots`), so all six
 pre-existing hard-crash tests attach byte-for-byte as before.
 
+**Rolling wire-level upgrade (`2.15.0`).** Wire-level spec §6.3 as real
+processes: three node processes boot on the old side (`UC2_WIRE_RANGE=12,12`)
+under a three-worker CAS-register load and are rolled to the new side
+(`12,13`) one at a time — nodes 0 and 1 by a restart, node 2 by a `SIGKILL`
+mid-roll. Every node's cnc `wire_level` word must still read 12 while a
+`[12,12]` member remains, and all three must read 13 within 30 s of the last
+roll (the leader raises on its own); the history across the whole roll is
+`Linearizable`. The old binary, started afterwards on node 2's directory, must
+be refused by name — `WireLevelAboveBinary` on its stderr and exit status 1
+(the cluster agent's fail-stop exit) within 20 s. The node bin honours
+`UC2_WIRE_RANGE` only when the crate is built with `wire-level-override`, so
+the test is gated on both features. From `2.16.0` on, `UC2_BASE_NODE_BIN`
+points the old side at the previous release's `uc_crashtest-node` — but the
+test's `OLD`/`NEW` ranges are the literal `12,12`/`12,13` (and the raise it
+waits for is to 13), so it cannot pass against any real base binary until
+those are parameterized.
+
+| test | file | what it drives |
+|---|---|---|
+| `rolling_upgrade_one_node_at_a_time_under_load_is_linearizable_and_raises` | `testing/uc_crashtest/tests/rolling_upgrade.rs` | `2.15.0` — a `12,12` → `12,13` roll of a 3-process cluster under load, one node `SIGKILL`ed mid-roll; level held at 12, raised to 13 on every node, WGL-linearizable, the old binary refused by name |
+
 ```bash
 cargo test -p uc_crashtest --features hard-crash-tests
+cargo test -p uc_crashtest --features hard-crash-tests,wire-level-override --test rolling_upgrade
 ```
 
 ---
@@ -1027,7 +1049,7 @@ failure in Rust, but on a node it is a fail-stop: the datagram path runs on the
 receiver agent and `apply` runs on the service's apply thread, so a panic there
 takes the process down. Availability is the thing being defended here.
 
-### The twenty-six targets
+### The twenty-seven targets
 
 | Target | Seam, and why its input is untrusted |
 |---|---|
@@ -1057,6 +1079,7 @@ takes the process down. Availability is the thing being defended here.
 | `uc_protocol_probe` | jumbo spec §4.2 — `uc_protocol::v2::datagram`'s path-MTU probe codecs, `read_probe_rung` and `read_probe_ack_body`/`write_probe_ack_body`. `Scope::Pairwise`: reached by any peer that can put a UDP datagram on the wire, ahead of the commit rule that consumes the result. |
 | `uc_protocol_status_body` | `uc_protocol::v2::datagram::{read_status_body, write_status_body}` — the fixed-length status body. A PROPERTY target: anything the reader accepts must re-encode and read back equal. |
 | `uc_node_tier_object` | backup-tier spec §4 — `uc_node::tier::object::ObjectReader` over an arbitrary object stream (48-byte header, 1 MiB blocks with length and CRC, both codecs, read bounded to 64 MiB) plus `layout::SetLabel::parse` and `TierInfo::parse` on lossy UTF-8. The tier is a directory on a mount an operator points at, so a restore, `verify` or fork meets whatever bytes that mount holds. |
+| `uc_protocol_compat` | wire-level spec §6.1 — `decode_settings_at` and the datagram `wire` byte under a fuzz-chosen committed level: level-aware Settings decode + datagram byte, nothing above the level is accepted. A PROPERTY target alongside the no-panic one. |
 
 ### Method
 
@@ -1259,7 +1282,7 @@ whose apply loop is slow enough that the node's own report ceiling pins
 | Workflow | Contents |
 |---|---|
 | `ci.yml` | Fast gate on every PR: workspace build, tests, clippy `-D warnings` |
-| `nightly.yml` | Full proof suite — lincheck capstones (single- and two-FSM), `sim-heavy`, loom, crashtest (single- and two-FSM), the Elle clean tier's **six** passes, `lean-proofs` conformance replay with a date-rotated seed, `fuzz` (six legs, 600 s per target, with an asserted run-count floor) and `miri` (pure decoders + `uc_remote` SPSC) |
+| `nightly.yml` | Full proof suite — lincheck capstones (single- and two-FSM), `sim-heavy`, loom, crashtest (single- and two-FSM, plus the two-binary rolling wire-level upgrade), the Elle clean tier's **six** passes, `lean-proofs` conformance replay with a date-rotated seed, `fuzz` (six legs, 600 s per target, with an asserted run-count floor) and `miri` (pure decoders + `uc_remote` SPSC) |
 | `elle-weekly.yml` | Elle mutation tier |
 
 ---

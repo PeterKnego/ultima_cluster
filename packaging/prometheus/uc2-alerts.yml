@@ -506,3 +506,17 @@ groups:
     for: 1m
     labels: { severity: warning }
     annotations: { summary: "{{ $labels.instance }} backup writer has stopped for good", description: "The uc2-backup writer on this node refused its target and stopped (uc2_backup_errors_total{reason} says why: foreign, overlap_mismatch, fenced or no_hardlinks). It copies nothing and holds no purge, so the tier falls behind. Fix the [backup] target (for fenced: a new, empty directory) and restart the node. See the runbook's backup-tier alerts." }
+  - alert: Uc2WireLevelBelowMembers
+    # Wire-level spec §5.4: every binary in the fleet supports a higher
+    # wire level than the cluster has committed, and it has stayed that way
+    # for 30 minutes. In MANUAL mode this is the reminder that the roll is
+    # complete and `uc2ctl wire raise` is due (the rollback window is still
+    # open). In AUTO mode it can only mean a member is not reporting or the
+    # leader is not raising — `uc2ctl wire show` on the leader names which.
+    expr: uc2_wire_level < scalar(min(uc2_wire_binary_max))
+    for: 30m
+    labels:
+      severity: warning
+    annotations:
+      summary: "{{ $labels.instance }} runs at wire level {{ $value }} while every binary supports a higher one (30m)"
+      description: "Run `uc2ctl wire show` on the leader: in manual mode raise with `uc2ctl wire raise`; in auto mode the verdict names the holdout."

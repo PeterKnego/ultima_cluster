@@ -230,7 +230,7 @@ mod tests {
                 position: 4096,
                 leadership_term_id: 3,
                 kind: 1,
-                flags: 0,
+                wire: 0,
                 key_epoch: epoch,
             },
         );
@@ -421,7 +421,7 @@ mod tests {
                 position: 4096,
                 leadership_term_id: 3,
                 kind: 1,
-                flags: 0,
+                wire: 0,
                 key_epoch: 7,
             },
         );

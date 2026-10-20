@@ -29,9 +29,9 @@ use uc_protocol::v2::cnc::{
     CNC_OFF_INGRESS_HOLES_SKIPPED, CNC_OFF_LOG_TIME_NS, CNC_OFF_PAYLOAD_CEILING,
     CNC_OFF_PEER_SLOTS, CNC_OFF_QUERY_HOLES_SKIPPED, CNC_OFF_SEAL_FAILURES,
     CNC_OFF_SERVICE_APPLIED, CNC_OFF_SERVICE_SLOTS, CNC_OFF_SERVICE_SNAPSHOT_POS,
-    CNC_OFF_SERVICES_DECLARED, CNC_OFF_TERM, CNC_PAGE_LEN, CNC_PEER_SLOT_STRIDE,
-    CNC_SERVICE_SLOT_STRIDE, CNC_SVC_STATUS_ATTACHED, CNC_SVC_STATUS_INCARNATION_SHIFT,
-    CNC_V2_VERSION, CncHeader,
+    CNC_OFF_SERVICES_DECLARED, CNC_OFF_TERM, CNC_OFF_WIRE_BINARY, CNC_OFF_WIRE_LEVEL, CNC_PAGE_LEN,
+    CNC_PEER_SLOT_STRIDE, CNC_SERVICE_SLOT_STRIDE, CNC_SVC_STATUS_ATTACHED,
+    CNC_SVC_STATUS_INCARNATION_SHIFT, CNC_V2_VERSION, CncHeader,
 };
 
 use crate::counters::{LogCounters, PaddedAtomicU64};
@@ -126,6 +126,18 @@ const _: () = assert!(std::mem::offset_of!(SnapshotSlots, service_snapshot_pos) 
 const _: () = assert!(std::mem::offset_of!(SnapshotSlots, node_snapshot_floor) == 64);
 const _: () = assert!(std::mem::offset_of!(SnapshotSlots, incoming_snapshot_pos) == 128);
 
+/// The first line of a peer slot: `id_and_role` (boot-once) and, since cnc
+/// 3.5, `wire_max` (on change; cleared at the leader's collapse ack, when a
+/// new term opens and the table of this term's reports starts empty). Both
+/// consensus-written, both rarely, so sharing the line costs nothing.
+#[repr(C, align(64))]
+pub struct PeerHeadLine {
+    /// `(peer_id as u64) << 8 | role_bits`. Slot offset +0.
+    pub id_and_role: AtomicU64,
+    /// The peer's reported `WIRE_MAX` (0 = none this term). Slot offset +8.
+    pub wire_max: AtomicU64,
+}
+
 /// M6 Task 9: one per-peer observability record (leader-published), cast at
 /// `CNC_OFF_PEER_SLOTS + i * CNC_PEER_SLOT_STRIDE`. Each field is its own
 /// 64-byte cache line so the two distinct writers (consensus, sender) never
@@ -134,9 +146,9 @@ const _: () = assert!(std::mem::offset_of!(SnapshotSlots, incoming_snapshot_pos)
 /// cycle, never per datagram — this band is diagnostics, off the hot path.
 #[repr(C)]
 pub struct PeerSlot {
-    /// `(peer_id as u64) << 8 | role_bits`; role_bits ∈ {VOTER, LEARNER}.
-    /// Writer: consensus (boot-once). Zero = unused slot.
-    pub id_and_role: PaddedAtomicU64,
+    /// Line 0: `id_and_role` (`(peer_id as u64) << 8 | role_bits`, role_bits
+    /// in {VOTER, LEARNER}; zero = unused slot) and `wire_max`.
+    pub head: PeerHeadLine,
     /// Newest durable position this peer reported (writer: consensus, Report
     /// intake — includes a learner's cell, which never counts toward commit).
     pub reported_durable: PaddedAtomicU64,
@@ -153,7 +165,7 @@ pub struct PeerSlot {
 
 const _: () = assert!(std::mem::size_of::<PeerSlot>() == 256);
 const _: () = assert!(std::mem::size_of::<PeerSlot>() == CNC_PEER_SLOT_STRIDE);
-const _: () = assert!(std::mem::offset_of!(PeerSlot, id_and_role) == 0);
+const _: () = assert!(std::mem::offset_of!(PeerSlot, head) == 0);
 const _: () = assert!(std::mem::offset_of!(PeerSlot, reported_durable) == 64);
 const _: () = assert!(std::mem::offset_of!(PeerSlot, advertised_limit) == 128);
 const _: () = assert!(std::mem::offset_of!(PeerSlot, naks_plus_replay) == 192);
@@ -1155,6 +1167,36 @@ impl CncPage {
         unsafe { (*ptr).store(v, Ordering::Release) }
     }
 
+    /// Wire-level spec §5.1: the committed cluster wire level. Bare
+    /// `AtomicU64` at 3992 — fourth word of the 3968 line.
+    pub fn wire_level(&self) -> u64 {
+        // SAFETY: offset 3992, size 8, 8-byte aligned (3992 % 8 == 0).
+        let ptr = unsafe { self.region.ptr_at(CNC_OFF_WIRE_LEVEL) as *const AtomicU64 };
+        unsafe { (*ptr).load(Ordering::Acquire) }
+    }
+
+    /// Writer: the `uc2-cluster` agent, at apply.
+    pub fn store_wire_level(&self, v: u64) {
+        // SAFETY: offset 3992, size 8, 8-byte aligned. See the getter.
+        let ptr = unsafe { self.region.ptr_at(CNC_OFF_WIRE_LEVEL) as *const AtomicU64 };
+        unsafe { (*ptr).store(v, Ordering::Release) }
+    }
+
+    /// Wire-level spec §5.1: this node's binary range `(min << 8) | max`.
+    /// Bare `AtomicU64` at 4000.
+    pub fn wire_binary(&self) -> u64 {
+        // SAFETY: offset 4000, size 8, 8-byte aligned (4000 % 8 == 0).
+        let ptr = unsafe { self.region.ptr_at(CNC_OFF_WIRE_BINARY) as *const AtomicU64 };
+        unsafe { (*ptr).load(Ordering::Acquire) }
+    }
+
+    /// Writer: the node, once at boot.
+    pub fn store_wire_binary(&self, v: u64) {
+        // SAFETY: offset 4000, size 8, 8-byte aligned. See the getter.
+        let ptr = unsafe { self.region.ptr_at(CNC_OFF_WIRE_BINARY) as *const AtomicU64 };
+        unsafe { (*ptr).store(v, Ordering::Release) }
+    }
+
     /// M7: config pending (1 = uncommitted, 0 = stable).
     pub fn config_pending(&self) -> u64 {
         // SAFETY: offset 3520, size 8.
@@ -1564,7 +1606,7 @@ mod tests {
         // Sub-field offsets within a slot pin the packing the decoder relies on.
         let s0 = page.peer_slot(0) as *const _ as usize;
         assert_eq!(
-            &page.peer_slot(0).id_and_role as *const _ as usize - s0,
+            &page.peer_slot(0).head.id_and_role as *const _ as usize - s0,
             CNC_PEER_OFF_ID_AND_ROLE
         );
         assert_eq!(
@@ -1578,6 +1620,13 @@ mod tests {
         assert_eq!(
             &page.peer_slot(0).naks_plus_replay as *const _ as usize - s0,
             CNC_PEER_OFF_NAKS_PLUS_REPLAY
+        );
+        assert_eq!(CNC_OFF_WIRE_LEVEL, 3992);
+        assert_eq!(CNC_OFF_WIRE_BINARY, 4000);
+        assert_eq!(CNC_PEER_OFF_WIRE_MAX, 8);
+        assert_eq!(
+            &page.peer_slot(0).head.wire_max as *const _ as usize - s0,
+            CNC_PEER_OFF_WIRE_MAX
         );
         // M7: config band offsets.
         assert_eq!(CNC_OFF_CONFIG_VERSION, 3456);
@@ -1672,12 +1721,23 @@ mod tests {
         use uc_protocol::v2::cnc::CNC_PEER_ROLE_LEARNER;
         let page = CncPage::heap(&test_meta());
         // Dormant by default.
-        assert_eq!(page.peer_slot(3).id_and_role.load_acquire(), 0);
+        assert_eq!(
+            page.peer_slot(3)
+                .head
+                .id_and_role
+                .load(std::sync::atomic::Ordering::Acquire),
+            0
+        );
         // Pack round-trips.
-        page.peer_slot(3)
+        page.peer_slot(3).head.id_and_role.store(
+            pack_id_and_role(7, CNC_PEER_ROLE_LEARNER),
+            Ordering::Release,
+        );
+        let raw = page
+            .peer_slot(3)
+            .head
             .id_and_role
-            .store_release(pack_id_and_role(7, CNC_PEER_ROLE_LEARNER));
-        let raw = page.peer_slot(3).id_and_role.load_acquire();
+            .load(std::sync::atomic::Ordering::Acquire);
         assert_eq!(raw >> 8, 7);
         assert_eq!((raw & 0xff) as u8, CNC_PEER_ROLE_LEARNER);
         page.peer_slot(3)
@@ -1687,8 +1747,20 @@ mod tests {
         assert_eq!((np >> 32) as u32, 11);
         assert_eq!(np as u32, 42);
         // Other slots untouched.
-        assert_eq!(page.peer_slot(2).id_and_role.load_acquire(), 0);
-        assert_eq!(page.peer_slot(4).id_and_role.load_acquire(), 0);
+        assert_eq!(
+            page.peer_slot(2)
+                .head
+                .id_and_role
+                .load(std::sync::atomic::Ordering::Acquire),
+            0
+        );
+        assert_eq!(
+            page.peer_slot(4)
+                .head
+                .id_and_role
+                .load(std::sync::atomic::Ordering::Acquire),
+            0
+        );
     }
 
     #[test]
@@ -2155,6 +2227,31 @@ mod tests {
             8864,
             "offset pin: the value must live at 3984 exactly"
         );
+    }
+
+    #[test]
+    fn wire_words_roundtrip_and_offset_pin() {
+        let page = CncPage::heap(&test_meta());
+        assert_eq!((page.wire_level(), page.wire_binary()), (0, 0));
+        page.store_wire_level(13);
+        page.store_wire_binary((12u64 << 8) | 13);
+        page.peer_slot(2).head.wire_max.store(13, Ordering::Release);
+        let raw = page.page();
+        assert_eq!(u64::from_le_bytes(raw[3992..4000].try_into().unwrap()), 13);
+        assert_eq!(
+            u64::from_le_bytes(raw[4000..4008].try_into().unwrap()),
+            (12 << 8) | 13
+        );
+        assert_eq!(
+            (page.wire_level(), page.wire_binary()),
+            (13, (12 << 8) | 13)
+        );
+        let base = CNC_OFF_PEER_SLOTS + 2 * CNC_PEER_SLOT_STRIDE;
+        assert_eq!(
+            u64::from_le_bytes(raw[base + 8..base + 16].try_into().unwrap()),
+            13
+        );
+        assert_eq!(std::mem::size_of::<PeerSlot>(), 256);
     }
 
     #[test]

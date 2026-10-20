@@ -31,6 +31,8 @@ pub fn settings(v: &SettingsView) -> Settings {
         backup_retain_sets: v.backup_retain_sets,
         backup_retain_age_secs: v.backup_retain_age_secs.0,
         purge_requires_tiers: v.purge_requires_tiers,
+        wire_level: v.wire_level,
+        wire_raise: v.wire_raise,
     }
 }
 

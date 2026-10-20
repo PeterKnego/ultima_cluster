@@ -29,21 +29,21 @@ impl ProtocolVersion {
 // old service/client binaries at local IPC attach over a change that cannot
 // affect them.
 //
-// NB (post-M7 loose-end): these two constants and `ProtocolVersion::
-// compatible_with` are NOT on any live enforcement path — grep the workspace
-// and `CURRENT` has no caller outside this file, `MIN_COMPATIBLE` is only
-// re-exported (never read), and `compatible_with` is referenced only by this
-// module's own tests and a doc-comment. The version actually gated at every
-// IPC / peer handshake is the cnc-page field, checked by
+// NB (updated 0.12.0, wire-level spec §3.2): the datagram receiver enforces
+// `WIRE_MIN` since 0.12.0 — `uc_net::receiver`'s `wire_admit` refuses (and
+// counts) any datagram whose header byte @13 is outside
+// `[WIRE_MIN, WIRE_MAX + 1]`, before anything else in it is read. `WIRE_MAX`
+// and `WIRE_MIN` derive from `CURRENT` below, but `CURRENT` itself — like
+// `ProtocolVersion::compatible_with` — is still not compared anywhere; only
+// the derived byte is. The version gated at every local IPC attach is the
+// separate cnc-page field, checked by
 // `uc_protocol::v2::cnc::version_compatible(local, peer)` over the packed
 // `CNC_V2_VERSION` u32 (that module is `core`-only, so it re-spells the
 // same-major / peer-minor-not-newer rule directly rather than depend on this
-// type). The two version lines are INDEPENDENT, not lockstep: `CNC_V2_VERSION`
-// gates the cnc shmem page format at local IPC attach. `CNC_V2_VERSION` moved
-// 2.0 → 3.0 in M14a (page grew to 8 KiB); the two version lines remain
-// independent — that bump did not touch this constant. `CURRENT` documents
-// the semver of the wire *datagram* protocol but does not itself enforce
-// anything.
+// type). The two version lines are INDEPENDENT, not lockstep:
+// `CNC_V2_VERSION` gates the cnc shmem page format at local IPC attach and
+// moved 2.0 → 3.0 in M14a (page grew to 8 KiB) without touching this
+// constant.
 // 0.5.0: content-attested durable reports — `DGRAM_KIND_APPEND_POSITION`
 // gains an 8-byte body carrying the term the sender attributes to the byte
 // below its reported position (`AppendPositionBody`, datagram.rs). The 16-byte
@@ -98,8 +98,70 @@ impl ProtocolVersion {
 // and refuses kind 7 as undecodable; same flag day.
 // + backup tier 3b: pairwise 28 `TIER_INSTALL` / 29 `TIER_INSTALL_STATUS`,
 // Settings v6, `SET` lineage — a 0.10.0 peer drops both kinds; same flag day.
-pub const CURRENT: ProtocolVersion = ProtocolVersion::new(0, 11, 0);
-pub const MIN_COMPATIBLE: ProtocolVersion = ProtocolVersion::new(0, 1, 0);
+// 0.12.0 (wire level, spec docs/superpowers/specs/2026-10-19-uc2-wire-level-design.md):
+// the datagram header byte @13 carries the sender's WIRE_MAX (0 = a pre-level
+// peer, refused by name); Settings v7 adds `wire_level`/`wire_raise`; NEW_TERM
+// gains an 8-byte reserved body; cnc 3.5. A 0.11.0 peer's datagrams are
+// REFUSED and counted (`prelevel`) — the first flag day a mixed cluster
+// notices. From here a wire MINOR bump is a level (rolling), a MAJOR bump a
+// flag day.
+pub const CURRENT: ProtocolVersion = ProtocolVersion::new(0, 12, 0);
+
+/// The level at which levels began. A pre-level Settings record (v1–v6)
+/// decodes as this level, and `0.12.0` is the one release whose `WIRE_MIN`
+/// equals its `WIRE_MAX`.
+pub const WIRE_LEVEL_FIRST: u8 = 12;
+/// The highest wire level this binary speaks: `CURRENT`'s minor.
+pub const WIRE_MAX: u8 = CURRENT.minor();
+/// The lowest committed level this binary may run at — one level back
+/// (spec §1.3 item 4), by const arithmetic, never hand-edited.
+pub const WIRE_MIN: u8 = if WIRE_MAX == WIRE_LEVEL_FIRST {
+    WIRE_LEVEL_FIRST
+} else {
+    WIRE_MAX - 1
+};
+/// Enforced since 0.12.0: the receiver refuses a datagram whose wire byte
+/// is below `WIRE_MIN` (spec §3.2).
+pub const MIN_COMPATIBLE: ProtocolVersion = ProtocolVersion::new(0, WIRE_MIN, 0);
+
+/// A binary's wire-level range (spec §2.1). `BINARY` is this build's; a
+/// test-only override (`uc_node`'s `wire-level-override` feature) may
+/// substitute another so one tree can play both sides of a roll.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WireRange {
+    pub min: u8,
+    pub max: u8,
+}
+
+impl WireRange {
+    pub const BINARY: WireRange = WireRange {
+        min: WIRE_MIN,
+        max: WIRE_MAX,
+    };
+
+    /// Spec §2.3: a node runs only while the committed level is inside.
+    pub const fn contains(self, level: u8) -> bool {
+        self.min <= level && level <= self.max
+    }
+
+    /// Spec §3.2: a peer's header byte is accepted in `[min, max + 1]` — one
+    /// above is a peer rolling ahead; `0` is a pre-level peer.
+    pub const fn accepts_peer(self, byte: u8) -> bool {
+        byte != 0 && self.min <= byte && byte <= self.max.saturating_add(1)
+    }
+
+    /// The cnc `wire_binary` word: `(min << 8) | max`.
+    pub const fn pack(self) -> u64 {
+        ((self.min as u64) << 8) | self.max as u64
+    }
+
+    pub const fn unpack(word: u64) -> WireRange {
+        WireRange {
+            min: ((word >> 8) & 0xFF) as u8,
+            max: (word & 0xFF) as u8,
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -135,7 +197,39 @@ mod tests {
     }
 
     #[test]
-    fn current_is_the_snapshot_catalog_wire() {
-        assert_eq!(CURRENT, ProtocolVersion::new(0, 11, 0));
+    fn current_is_the_wire_level_flag_day() {
+        assert_eq!(CURRENT, ProtocolVersion::new(0, 12, 0));
+        assert_eq!(WIRE_LEVEL_FIRST, 12);
+        assert_eq!(WIRE_MAX, 12);
+        // 0.12.0 is the only release whose min equals its max: nothing
+        // below it is level-aware.
+        assert_eq!(WIRE_MIN, 12);
+        assert_eq!(MIN_COMPATIBLE, ProtocolVersion::new(0, WIRE_MIN, 0));
+    }
+
+    #[test]
+    fn wire_range_contains_and_accepts_one_above() {
+        let r = WireRange { min: 12, max: 13 };
+        assert!(r.contains(12) && r.contains(13));
+        assert!(!r.contains(11) && !r.contains(14));
+        // a peer may be ONE level above me (it is rolling ahead) …
+        assert!(r.accepts_peer(12) && r.accepts_peer(13) && r.accepts_peer(14));
+        // … never a pre-level peer (0), below my min, or two above.
+        assert!(!r.accepts_peer(0) && !r.accepts_peer(11) && !r.accepts_peer(15));
+        assert_eq!(
+            WireRange::BINARY,
+            WireRange {
+                min: WIRE_MIN,
+                max: WIRE_MAX
+            }
+        );
+    }
+
+    #[test]
+    fn wire_range_packs_min_high_max_low() {
+        let r = WireRange { min: 12, max: 13 };
+        assert_eq!(r.pack(), (12u64 << 8) | 13);
+        assert_eq!(WireRange::unpack(r.pack()), r);
+        assert_eq!(WireRange::unpack(0), WireRange { min: 0, max: 0 });
     }
 }

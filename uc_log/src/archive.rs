@@ -1018,13 +1018,13 @@ mod tests {
         c.counters().prime(base);
 
         // The new leader rewrites from `base` with a different layout: a
-        // 32-byte NewTerm frame, then a 96-byte frame that STRADDLES 480.
+        // 64-byte NewTerm frame, then a 96-byte frame that STRADDLES 480.
         let mut a2 = Appender::new(Arc::clone(&b), 2, 0);
         a2.append_new_term().unwrap();
         a2.append(1, 99, &[0xAB; 64]).unwrap();
-        assert_eq!(c.counters().append.load_acquire(), 512);
+        assert_eq!(c.counters().append.load_acquire(), 544);
 
-        // The archive resumes at its own 480 — now mid-payload of [416, 512).
+        // The archive resumes at its own 480 — now the first payload byte of [448, 544).
         let err = arch.do_work(&b).unwrap_err();
         let ArchiveError::RecorderCorrupt(c) = err else {
             panic!("expected RecorderCorrupt: {err:?}")

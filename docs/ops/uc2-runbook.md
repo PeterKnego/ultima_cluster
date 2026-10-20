@@ -29,8 +29,9 @@ verify rather than a build:
   [Install the binaries](../how-to/run-a-cluster.md#install-the-binaries-on-each-host)
   and in the tarball's own `README-release.md`.
 - **Upgrading** an existing cluster from one of these is
-  [Upgrade a cluster](../how-to/upgrade-a-cluster.md) — the binaries change,
-  the flag-day rule does not.
+  [Upgrade a cluster](../how-to/upgrade-a-cluster.md) — stop-all for a flag
+  day, or one node at a time since `2.15.0` for a release within one wire
+  level of the cluster's.
 - **Which versions go together, and what may change under you:**
   [the semver policy](../reference/semver-policy.md). One version number
   covers the tag, all twelve crates, the tarballs and the image.
@@ -41,9 +42,11 @@ verify rather than a build:
 - [Run a cluster on real hosts](../how-to/run-a-cluster.md) — durable instance
   directories, the bind-address rule, client placement, process supervision,
   and restart cost. *Was §2, §4.*
-- [Upgrade a cluster](../how-to/upgrade-a-cluster.md) — the flag day, and (as
-  of 2.7.0) the rule that a host's node, service, gateway and shmem clients
-  restart *together*, because the ring file format changed.
+- [Upgrade a cluster](../how-to/upgrade-a-cluster.md) — the flag day, the
+  rolling upgrade one node at a time under load (since `2.15.0`, for a
+  release within one wire level of the cluster's), and (as of 2.7.0) the
+  rule that a host's node, service, gateway and shmem clients restart *together*
+  whenever the ring format or the cnc minor changes.
 - [Keep the journal from growing without bound](../how-to/bound-journal-growth.md)
   — snapshots, then purging, and confirming it works. *Was §5.*
 - [Run a gateway](../how-to/run-a-gateway.md) — a TCP front door for clients
@@ -207,6 +210,17 @@ transport setting, both measured closed-loop at inflight 1 on 8-vCPU
   top rung is verified *and* its advertised minimum has caught up, so one
   permanently narrow path means 2–3 probe datagrams per 30 s per peer forever.
   See [Run a cluster on jumbo frames](../how-to/jumbo-frames.md).
+- **What wire level is this cluster at, and can it rise?** `uc2ctl status`
+  prints `wire: level=L binary=MIN..MAX` — the committed level (cnc
+  `wire_level`, offset 3992) and this node's binary range (cnc `wire_binary`,
+  4000). `uc2ctl wire show` adds the raise mode and, **on the live leader
+  only**, each member's reported wire max and the verdict (`raisable to N`,
+  `at level`, or the holdout). In `/metrics`: `uc2_wire_level`,
+  `uc2_wire_binary_min`/`_max`, `uc2_wire_member_max{peer}` (leader-only;
+  `0` = no report this term) and `uc2_wire_datagrams_refused_total{reason}`.
+  `Uc2WireLevelBelowMembers` fires after 30 min below every binary's max: in
+  manual mode the raise is due, in auto mode a member is not reporting. See
+  [The committed cluster wire level, explained](../notes/uc2-wire-level-explained.md).
 - **What snapshot set is this node holding?** `uc2ctl snapshot show` prints
   each declared row's newest artifact position, the cluster row's, and
   `set=<P>` — the newest position present in **all** of them. It is offline
@@ -351,6 +365,22 @@ transport setting, both measured closed-loop at inflight 1 on 8-vCPU
   a measured downtime number, and (M12b) the `[crypto].enabled`/`[admin]`
   config-choice note every M9–M11 `node.toml` needs before it starts on
   `v2.6.0`+.
+- **Roll an upgrade one node at a time** (since `2.15.0`). Permitted when the
+  new release's wire minor is the cluster's level (`uc2ctl wire show` →
+  `level=`) or one above it. Want a rollback window? Add `wire_raise =
+  "manual"` to the cluster's **full** settings file (the one last applied, or
+  what `uc2ctl settings show` prints) and `uc2ctl settings apply` it **before
+  the first restart** — the apply replaces the whole record, and every absent
+  key except `wire_raise` reverts to its default. Then, per
+  host: stop the node and everything attached to it, install, start the
+  node, wait for `can_serve`, start its services. After the last host,
+  `uc2ctl wire show` on the leader should say `verdict: raisable to N`; auto
+  mode raises within a second, manual waits for `uc2ctl wire raise` (admin
+  op 12, leader-only, audited `wire_raise`; a cluster already at level answers
+  `ok` and appends nothing; refused `63 wire_holdout` while a member has no
+  report this term or reports below the target). The raise is the point of
+  no return. Procedure:
+  [Upgrade a cluster § Rolling upgrades since 2.15.0](../how-to/upgrade-a-cluster.md#rolling-upgrades-since-2150).
 
 ## Surviving failures
 
@@ -529,6 +559,33 @@ transport setting, both measured closed-loop at inflight 1 on 8-vCPU
   cross: a silent leader is not tested by a learner's pass.
   Details and remedies:
   [Run a cluster on jumbo frames](../how-to/jumbo-frames.md#6-when-a-node-refuses-to-join).
+- **A node stops with `WireLevelAboveBinary`, `WireLevelBelowBinary` or
+  `ClusterRecordUndecodable`** (`2.15.0`). The three wire-level fail-stops,
+  siblings of `path_below_committed_mtu`'s `PathBelowCommittedMtu`: the
+  `uc2-cluster` agent stops, the daemon exits 1 and the name is on stderr
+  (`cluster fatal (fail-stop): …`, with a `wire_level_fault` or
+  `cluster_record_undecodable` record). `WireLevelAboveBinary` — the cluster
+  has committed a wire level above this binary's max; it is checked at every
+  `Settings` apply, artifact install and boot. The binary is too old:
+  install a release whose wire minor is at least the level, then start it.
+  A node rolled back to the old binary after the raise lands here, which is
+  the point. `WireLevelBelowBinary` — the committed level is below this
+  binary's min, judged only once the node has joined (leader known, commit
+  learned, the cluster agent's walk at that commit), so a replay through old
+  history never trips it. The binary is too new: install the release the
+  message names (level + 1) first, stop-all upgrades included. Neither needs
+  a wipe; nothing in the instance directory is wrong. `ClusterRecordUndecodable`
+  — a committed `CLUSTER` record no correct peer could have written at the
+  committed level (an unknown kind, or a `Settings` version above the
+  level's; the record's `reason` says which): the journal is corrupt or a
+  peer broke the level. A journal that reaches back before `2.11.0` holds
+  pre-cluster-FSM `CONFIG` frames that can read this way — give it a cluster
+  artifact first (`uc2ctl snapshot` on a node that has one); otherwise
+  restore from backup. A known kind with a malformed payload is not this
+  stop: it is the cluster FSM's ordinary refusal 42. **A node that never joins and prints
+  `wire_refused` lines instead** is two or more levels away from its peers
+  (refused both ways on header byte 13): it waits in `NodeBooting` and does
+  not fail-stop. Install a binary within one level of the cluster's.
 - [Diagnose a node that is not serving](../how-to/diagnose-a-node.md) — reading
   a live node's control page. *Was §3's procedural half.*
 - [Change cluster membership: read the audit log](../how-to/change-cluster-membership.md#read-the-audit-log)
@@ -618,8 +675,14 @@ names only conditions the node already detects. Each code, and what to do:
   (jumbo frames, `2.12.0`) adds one more live word in the same band:
   `payload_ceiling` at offset **3984** (consensus-agent-written, re-published
   when the committed datagram rung moves; `od -A d -t u8 -j 3984 -N 8`), which
-  is the door every client and the gateway edge reads per submit. *Was §3's
-  field tables.* Raw-offset walkthrough:
+  is the door every client and the gateway edge reads per submit. cnc
+  **3.5** (the wire level, `2.15.0`) adds three: `wire_level` at **3992**
+  (the committed cluster wire level, `uc2-cluster`-agent-written at every
+  `Settings` apply; `od -A d -t u8 -j 3992 -N 8`), `wire_binary` at
+  **4000** (node-written at boot, `(WIRE_MIN << 8) | WIRE_MAX` — `3084` is
+  `12..12`, `3085` is `12..13`) and, in each peer slot, `wire_max` at `+8`
+  (that member's reported wire max, consensus-agent-written on change,
+  leader-authoritative; `0` = no report this term). *Was §3's field tables.* Raw-offset walkthrough:
   [Diagnose a node → Which FSM is holding the cluster up?](../how-to/diagnose-a-node.md#which-fsm-is-holding-the-cluster-up)
 - [`uc2ctl`](../reference/uc2ctl.md) — sub-commands, arguments, response
   statuses, refusal reasons. `status`'s `services:` line gained
@@ -629,7 +692,9 @@ names only conditions the node already detects. Each code, and what to do:
   `config:` line gained `schedule_position=<n>` and the sub-command list gained
   `schedule apply` / `schedule show` with reason codes 40–43. Jumbo frames
   (`2.12.0`) add a `ceiling:` line — the live payload ceiling, its datagram
-  rung, and whether that rung is `baseline` or `discovered`.
+  rung, and whether that rung is `baseline` or `discovered`. The wire level
+  (`2.15.0`) adds a `wire:` line after it and the `wire show` / `wire raise`
+  sub-commands (admin op 12, refusal 63).
 - [Monitor a cluster → The per-FSM families](../how-to/monitor-a-cluster.md#the-per-fsm-families-m14)
   — which metric families carry a `service` label, what the unlabeled
   aggregate means now, and the declared-set drift query. `Uc2ServiceIdentityDrift`

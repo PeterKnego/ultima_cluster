@@ -90,6 +90,7 @@ mod snapshot;
 mod tier;
 mod upgrade;
 mod view;
+mod wire;
 
 use uc_crypto::admin::{AdminKey, AdminMessage, generate_key_file, sign};
 use uc_log::cnc::{AdminAuth, AdminReq, CncPage, PinRead, RowRead, unpack_service_status};
@@ -329,6 +330,32 @@ struct SettingsApplyArgs {
 
 #[derive(clap::Args)]
 struct SettingsShowArgs {
+    #[command(flatten)]
+    common: CommonArgs,
+}
+
+// ---------------------------------------------------------------- wire level: wire
+
+#[derive(clap::Args)]
+struct WireArgs {
+    #[command(subcommand)]
+    cmd: WireCmd,
+}
+
+#[derive(Subcommand)]
+enum WireCmd {
+    /// The committed wire level, this binary's range and the raise mode; on
+    /// the leader, each member's reported wire max and the raise verdict.
+    Show(WireVerbArgs),
+    /// Raise the committed wire level to the highest level every member
+    /// reports (`ADMIN_OP_WIRE_RAISE`, wire op 12). Leader-only; refused `63
+    /// wire_holdout` while a member holds it back. A cluster already at every
+    /// member's level answers ok, appending nothing.
+    Raise(WireVerbArgs),
+}
+
+#[derive(clap::Args)]
+struct WireVerbArgs {
     #[command(flatten)]
     common: CommonArgs,
 }
@@ -714,6 +741,11 @@ enum Cmd {
     /// watermark (`ADMIN_OP_TIER_FORGET`, wire op 11); `show`, `verify` and
     /// `restore` work offline on the tier's files.
     Tier(TierArgs),
+    /// Wire-level spec §4.3/§5.2: `show` the committed wire level, this
+    /// binary's range and (on the leader) each member's reported max;
+    /// `raise` asks the leader to raise the level (`ADMIN_OP_WIRE_RAISE`,
+    /// wire op 12).
+    Wire(WireArgs),
     /// The live cluster view (project 4): membership, settings, schedule,
     /// upgrades, catalog, tiers, holdings. Offline from the newest artifact
     /// when the node is stopped.
@@ -799,6 +831,10 @@ fn main() {
             TierCmd::ExportCorpus(args) => {
                 tier::export_corpus(&args.target, args.row, args.from, args.to, &args.out)
             }
+        },
+        Cmd::Wire(a) => match a.cmd {
+            WireCmd::Show(args) => wire::show(&args.common),
+            WireCmd::Raise(args) => wire::raise(&args.common),
         },
         Cmd::Cluster(a) => view::run(&a.common, a.json, false),
         Cmd::Catalog(a) => view::run(&a.common, a.json, true),
@@ -934,6 +970,11 @@ fn reason_str(reason: u32) -> &'static str {
         // cluster state does not hold.
         62 => {
             "tier_unknown (no registered backup tier has that id — check it against the tier's TIER label)"
+        }
+        // Wire-level spec §4.3: a member is holding the level. An at-level
+        // cluster is a no-op success (ruling 9), never 63.
+        63 => {
+            "wire_holdout (a member in the committed membership reports below the raise target or has not reported this term — `uc2ctl wire show` on the leader names it)"
         }
         _ => "unknown/malformed",
     }
@@ -1384,6 +1425,9 @@ fn run_status(a: &StatusArgs) -> anyhow::Result<()> {
                 .map(|(_, s)| s.datagram_mtu),
         )
     );
+    // Wire-level spec §5.2: the committed level and this binary's range,
+    // both off the live cnc page.
+    println!("{}", wire_line(cnc.wire_level(), cnc.wire_binary()));
     // A pre-epoch clock keeps the old reading (ages measured from 0).
     let now_ns = wall_now_ns().unwrap_or(0);
     for id in ids {
@@ -1445,7 +1489,10 @@ fn run_status(a: &StatusArgs) -> anyhow::Result<()> {
     println!("members:");
     for i in 0..CNC_MAX_PEER_SLOTS {
         let slot = cnc.peer_slot(i);
-        let raw = slot.id_and_role.load_acquire();
+        let raw = slot
+            .head
+            .id_and_role
+            .load(std::sync::atomic::Ordering::Acquire);
         if raw == 0 {
             continue; // dormant slot
         }
@@ -1650,6 +1697,13 @@ fn run_gen_admin_key(a: &GenAdminKeyArgs) -> anyhow::Result<()> {
         abs.display()
     );
     Ok(())
+}
+
+/// Wire-level spec §5.2: `status`'s wire line — the committed level (cnc
+/// `wire_level`) and this binary's range (cnc `wire_binary`, `(min << 8) |
+/// max`; `pre-level page` when the word is 0).
+fn wire_line(level: u64, binary: u64) -> String {
+    format!("wire: level={level} binary={}", wire::binary_word(binary))
 }
 
 /// Jumbo spec §9: `status`'s ceiling line — the live command payload ceiling
@@ -2039,6 +2093,32 @@ mod tests {
             reason_str(62).starts_with("tier_unknown"),
             "{}",
             reason_str(62)
+        );
+    }
+
+    /// Wire-level spec §5.2: `status`'s wire line unpacks the binary word.
+    #[test]
+    fn the_wire_line_unpacks_the_binary_range() {
+        assert_eq!(
+            wire_line(12, (12 << 8) | 13),
+            "wire: level=12 binary=12..13"
+        );
+    }
+
+    /// Review M4: a `wire_binary` word of 0 is a page from before the level
+    /// (cnc 3.4) or before the node's boot wrote it, not a `0..0` binary.
+    #[test]
+    fn the_wire_line_names_a_pre_level_page() {
+        assert_eq!(wire_line(0, 0), "wire: level=0 binary=pre-level page");
+    }
+
+    /// Wire-level spec §4.3: 63 names the holdout refusal of `wire raise`.
+    #[test]
+    fn reason_str_names_63() {
+        assert!(
+            reason_str(63).starts_with("wire_holdout"),
+            "{}",
+            reason_str(63)
         );
     }
 

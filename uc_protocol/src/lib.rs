@@ -23,4 +23,6 @@ pub mod version;
 
 pub use error_codes::ErrorCode;
 pub use identity::{FsmIdentity, FsmName};
-pub use version::{MIN_COMPATIBLE, ProtocolVersion};
+pub use version::{
+    MIN_COMPATIBLE, ProtocolVersion, WIRE_LEVEL_FIRST, WIRE_MAX, WIRE_MIN, WireRange,
+};

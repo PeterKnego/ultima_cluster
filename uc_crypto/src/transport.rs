@@ -1872,7 +1872,7 @@ mod tests {
                 position: 0,
                 leadership_term_id: 0,
                 kind: DGRAM_KIND_HS_INIT,
-                flags: 0,
+                wire: 0,
                 key_epoch: 0,
             },
         );
@@ -2007,7 +2007,7 @@ mod tests {
                 position: 4096,
                 leadership_term_id: 3,
                 kind: DGRAM_KIND_DATA,
-                flags: 0,
+                wire: 0,
                 key_epoch: 0,
             },
         );
@@ -2023,7 +2023,7 @@ mod tests {
                 position: 0,
                 leadership_term_id: 7,
                 kind: DGRAM_KIND_VOTE,
-                flags: 0,
+                wire: 0,
                 key_epoch: 0,
             },
         );
@@ -2221,7 +2221,7 @@ mod tests {
                 position: 0,
                 leadership_term_id: 0,
                 kind: DGRAM_KIND_DATA,
-                flags: 0,
+                wire: 0,
                 key_epoch: 0xBEEF,
             },
         );
@@ -3057,7 +3057,7 @@ mod tests {
                 position: 0,
                 leadership_term_id: 0,
                 kind: DGRAM_KIND_HS_INIT,
-                flags: 0,
+                wire: 0,
                 key_epoch: 0,
             },
         );
@@ -3159,7 +3159,7 @@ mod tests {
                 position: 4096,
                 leadership_term_id: 3,
                 kind,
-                flags: 0,
+                wire: 0,
                 key_epoch: 0,
             },
         );

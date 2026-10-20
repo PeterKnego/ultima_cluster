@@ -716,7 +716,11 @@ fn admin_request_ok(cnc: &CncPage, op: u32, id: u32, ip: u32, port: u16, secs: u
 /// if `id` has no published slot yet).
 fn peer_reported_durable(cnc: &CncPage, id: NodeId) -> Option<u64> {
     for i in 0..CNC_MAX_PEER_SLOTS {
-        let raw = cnc.peer_slot(i).id_and_role.load_acquire();
+        let raw = cnc
+            .peer_slot(i)
+            .head
+            .id_and_role
+            .load(std::sync::atomic::Ordering::Acquire);
         if raw == 0 {
             continue;
         }
@@ -731,7 +735,11 @@ fn peer_reported_durable(cnc: &CncPage, id: NodeId) -> Option<u64> {
 fn voter_ids_via_cnc(cnc: &CncPage) -> Vec<NodeId> {
     let mut ids = Vec::new();
     for i in 0..CNC_MAX_PEER_SLOTS {
-        let raw = cnc.peer_slot(i).id_and_role.load_acquire();
+        let raw = cnc
+            .peer_slot(i)
+            .head
+            .id_and_role
+            .load(std::sync::atomic::Ordering::Acquire);
         if raw == 0 {
             continue;
         }

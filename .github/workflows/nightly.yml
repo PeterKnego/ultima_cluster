@@ -35,7 +35,7 @@ name: nightly
 #                  tarball — this job keeps it honest between tags.
 #   * fuzz       — M12d: libFuzzer over every decoder that sees bytes it did
 #                  not write (fuzz/README.md's target table), 600 s per
-#                  target, six matrix legs gated by `fuzz-groups` so a new
+#                  target, seven matrix legs gated by `fuzz-groups` so a new
 #                  target can never be silently left unfuzzed. Nightly
 #                  toolchain; the fuzz crate is outside the workspace.
 #   * miri       — M12d: UB detection over the PURE decoders only
@@ -141,8 +141,11 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: Swatinem/rust-cache@v2
-      - name: Multi-process SIGKILL linearizability
-        run: cargo test -p uc_crashtest --features hard-crash-tests
+      # `wire-level-override` adds `tests/rolling_upgrade.rs` (wire-level spec
+      # §6.3, the two-binary roll); the node bin ignores `UC2_WIRE_RANGE`
+      # without it, and with the env unset nothing else changes.
+      - name: Multi-process SIGKILL linearizability + rolling wire-level upgrade
+        run: cargo test -p uc_crashtest --features hard-crash-tests,wire-level-override
 
   # M12c: the binary quickstart. Feature-gated out of the default `cargo test`
   # because it starts eleven processes and waits on an election; fixed ports
@@ -291,7 +294,7 @@ jobs:
             --out "$HOME/.cache/uc2-conform/vectors.jsonl" --count 100000 --seed "$(date +%Y%m%d)"
           cd proofs && lake exe conform "$HOME/.cache/uc2-conform/vectors.jsonl"
 
-  # M12d: the fuzz matrix legs (five since the time-and-timers targets) are
+  # M12d: the fuzz matrix legs (seven at present) are
   # declared HERE, once, and this job asserts their union is exactly the set
   # of fuzz targets declared in fuzz/Cargo.toml. Adding a target without
   # assigning it to a group fails the workflow here, in ~10 seconds, before
@@ -318,7 +321,7 @@ jobs:
             uc_node_toml uc_gateway_toml uc_node_http uc_protocol_settings
             uc_protocol_timer_frame uc_protocol_sched_record uc_protocol_schedule_table uc_protocol_cluster_frame
             uc_node_cluster_artifact uc_service_snapshot_envelope uc_protocol_cluster_image uc_protocol_probe
-            uc_protocol_status_body uc_node_tier_object
+            uc_protocol_status_body uc_node_tier_object uc_protocol_compat
         run: |
           set -euo pipefail
           python3 - <<'PY' >> "$GITHUB_OUTPUT"
@@ -378,9 +381,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: fuzz
-          # `shared-key`, not `key`: all six matrix legs build the SAME
+          # `shared-key`, not `key`: all seven matrix legs build the SAME
           # sanitizer artifacts, so they share one ~500 MB cache entry instead
-          # of writing five and LRU-evicting the other nightly jobs' caches.
+          # of writing seven and LRU-evicting the other nightly jobs' caches.
           shared-key: fuzz
       - name: Install cargo-fuzz
         # Explicit `+nightly`: rust-toolchain.toml pins stable 1.96.0 for this

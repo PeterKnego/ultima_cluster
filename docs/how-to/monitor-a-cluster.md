@@ -75,7 +75,7 @@ scrape_configs:
 ```
 
 `/metrics` serves `text/plain; version=0.0.4` — standard Prometheus text
-exposition. The full series contract — 149 families — is the
+exposition. The full series contract — 154 families — is the
 `CONTRACT_SERIES` array in
 [`uc_node/src/obs/metrics.rs`](../../uc_node/src/obs/metrics.rs); a test
 pins every family in that array against what the renderer actually emits, so
@@ -431,6 +431,28 @@ at scrape time:
   in `node.toml`, which never crossed the log. Fleet-wide identical once
   caught up, exactly like `uc2_schedule_table_position`. `uc2ctl settings
   show` still prints the settings themselves.
+- `uc2_wire_level` — the committed cluster wire level (wire-level spec
+  §5.3), read from the node's cnc page. A fleet-wide constant once settled;
+  `uc2ctl wire show` prints the same thing with the verdict.
+- `uc2_wire_binary_min` / `uc2_wire_binary_max` — the range this binary
+  speaks (`WIRE_MIN`..`WIRE_MAX`), from the page word boot wrote. `min by ()
+  (uc2_wire_binary_max)` over the fleet is the level a roll can raise to.
+  One reading to know: a pre-level (`0.11.0`) node exports no
+  `uc2_wire_binary_max` at all, so `min()` simply skips it:
+  `Uc2WireLevelBelowMembers` can fire as though every member could rise
+  while that node is the real holdout. `uc2ctl wire show` on the leader
+  names it either way.
+- `uc2_wire_member_max{peer}` — each member's reported `WIRE_MAX` as the
+  **leader** sees it; `0` means no report this term, and a follower exports
+  zeros. A peer sitting at `0` on the leader is the holdout `uc2ctl wire
+  show` names.
+- `uc2_wire_datagrams_refused_total{reason}` — inbound datagrams refused on
+  their wire byte: `prelevel` (byte 0, a pre-wire-level 0.11.0 peer) or
+  `out_of_range` (outside `[WIRE_MIN, WIRE_MAX+1]`). On a crypto cluster
+  `prelevel` can also be driven by unauthenticated traffic, so a nonzero
+  count there is not proof of a mixed-version fleet. `Uc2WireLevelBelowMembers`
+  (30 m) fires when the committed level is below every binary's maximum: the
+  raise reminder in manual mode, a non-reporting member in auto mode.
 
 The `uc2_agent_alive` family covers **five** agents — `consensus`, `sender`,
 `receiver`, `archive`, and `cluster` (the `uc2-cluster` agent, labelled like

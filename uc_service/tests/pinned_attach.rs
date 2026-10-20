@@ -591,6 +591,7 @@ fn append_a_settings_record(dir: &Path, cnc: &CncPage) {
     use std::os::unix::fs::OpenOptionsExt as _;
     let mut settings = uc_protocol::v2::settings::Settings::genesis_default();
     settings.retain_sets = 2;
+    settings.wire_level = 0; // leader-owned: `uc2ctl` never writes it
     let mut bytes = Vec::new();
     uc_protocol::v2::settings::encode_settings(&settings, &mut bytes);
     let (id, ip, port) = uc_node::staged_digest(&bytes);

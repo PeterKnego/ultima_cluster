@@ -1672,7 +1672,11 @@ fn a_promoted_below_floor_joiner_keeps_the_schedule_ticking_when_it_leads() {
         .load_acquire();
     wait_until("the leader saw the joiner catch up", || {
         (0..CNC_MAX_PEER_SLOTS).any(|i| {
-            let raw = leader_cnc.peer_slot(i).id_and_role.load_acquire();
+            let raw = leader_cnc
+                .peer_slot(i)
+                .head
+                .id_and_role
+                .load(std::sync::atomic::Ordering::Acquire);
             raw != 0
                 && (raw >> 8) as u32 == JOINER
                 && leader_cnc.peer_slot(i).reported_durable.load_acquire() >= target

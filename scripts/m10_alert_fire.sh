@@ -288,6 +288,7 @@ RULE_META = {
     "Uc2MtuDiscoveryStalled": {"severity": "warning", "real": False, "scenario": "mtu_discovery_stalled"},
     "Uc2PathBelowMtu": {"severity": "critical", "real": False, "scenario": "path_below_mtu"},
     "Uc2JumboGateHeld": {"severity": "warning", "real": False, "scenario": "jumbo_gate_held"},
+    "Uc2WireLevelBelowMembers": {"severity": "warning", "real": False, "scenario": "wire_level_below_members"},
 }
 
 
@@ -869,6 +870,18 @@ def build_Uc2JumboGateHeld():
     return r
 
 
+def build_Uc2WireLevelBelowMembers():
+    # Wire-level spec §5.4: `uc2_wire_level < scalar(min(uc2_wire_binary_max))`
+    # for 30m. Two level series, both held across the whole window.
+    rows = load_scenario("wire_level_below_members")
+    level = select(rows, "uc2_wire_level", {})
+    r = new_rule("warning", labels_from=level)
+    add_hold_last(r, level, "uc2_wire_level", 1800)
+    add_hold_last(r, select(rows, "uc2_wire_binary_max", {}), "uc2_wire_binary_max", 1800)
+    r["eval_time"] = total_for(1800)[0]
+    return r
+
+
 RULE_BUILDERS = {
     "Uc2AgentDead": build_Uc2AgentDead,
     "Uc2NoLeader": build_Uc2NoLeader,
@@ -905,6 +918,7 @@ RULE_BUILDERS = {
     "Uc2MtuDiscoveryStalled": build_Uc2MtuDiscoveryStalled,
     "Uc2PathBelowMtu": build_Uc2PathBelowMtu,
     "Uc2JumboGateHeld": build_Uc2JumboGateHeld,
+    "Uc2WireLevelBelowMembers": build_Uc2WireLevelBelowMembers,
 }
 
 # Task 5 completeness cross-check: parse every `alert:` name straight out of

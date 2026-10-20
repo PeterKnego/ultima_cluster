@@ -94,6 +94,8 @@ The committed settings record (`uc2ctl settings show`).
 | `backup_retain_sets` | Backup tier retention by count (`0` = no rule). |
 | `backup_retain_age_secs` | Backup tier retention by age (`DecU64`; `"0"` = no rule). |
 | `purge_requires_tiers` | K, the number of backup tiers a purge waits for (`0` = off). |
+| `wire_level` | The committed cluster wire level, the wire minor every member must speak; wire-level spec §2.2. |
+| `wire_raise` | Who raises the level: `1` = auto (the leader), `2` = manual (`uc2ctl wire raise`); `0` never appears in the view. |
 
 ### `cluster.schedule`
 
@@ -297,7 +299,9 @@ pins):
       "auto_fetch": true,
       "backup_retain_sets": 0,
       "backup_retain_age_secs": "0",
-      "purge_requires_tiers": 0
+      "purge_requires_tiers": 0,
+      "wire_level": 12,
+      "wire_raise": 1
     },
     "schedule": {
       "position": 0,

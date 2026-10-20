@@ -90,8 +90,8 @@ fn instance_dir_lock_and_cnc_publication() {
         uc_protocol::v2::cnc::NODE_FLAG_LEADER
     );
     assert_eq!(cnc.status().term.load_acquire(), 1);
-    // can_serve implies the 32-byte NewTerm frame committed (§5.4.2).
-    assert!(cnc.counters().commit.load_acquire() >= 32);
+    // can_serve implies the 64-byte NewTerm frame committed (§5.4.2).
+    assert!(cnc.counters().commit.load_acquire() >= 64);
 
     // The shared-memory ring files exist (created fresh at boot).
     assert!(dir.path().join("ingress.ring").exists());
@@ -123,11 +123,11 @@ fn single_node_cluster_elects_itself_and_serves() {
     assert!(node.is_leader());
     assert_eq!(node.current_term(), 1);
     // Raft §5.4.2 pin (one-sided): can_serve implies the NewTerm frame is
-    // COMMITTED — commit must already cover the 32-byte frame's END. Pre-fix
+    // COMMITTED — commit must already cover the 64-byte frame's END. Pre-fix
     // (NewTermAppended fed the frame START) can_serve flipped at commit >= 0,
     // i.e. instantly, typically observed here before the archive's fsync.
     assert!(
-        node.counters().commit.load_acquire() >= 32,
+        node.counters().commit.load_acquire() >= 64,
         "serving before the NewTerm frame committed (§5.4.2 gate defeated)"
     );
 
@@ -140,14 +140,14 @@ fn single_node_cluster_elects_itself_and_serves() {
         loop {
             let c = node.counters();
             let (a, k) = (c.append.load_acquire(), c.commit.load_acquire());
-            if k == a && k > 32 {
+            if k == a && k > 64 {
                 break k;
             }
             assert!(Instant::now() < deadline, "commit never caught append");
             std::thread::yield_now();
         }
     };
-    assert!(end > 32); // NewTerm frame (32 B) + data
+    assert!(end > 64); // NewTerm frame (64 B) + data
     node.stop();
 
     // Obligation 1 pin (persist ordering): the self-vote landed durably — a

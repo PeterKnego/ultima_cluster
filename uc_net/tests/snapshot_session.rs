@@ -338,7 +338,7 @@ impl Harness {
                 position: 0,
                 leadership_term_id: TERM,
                 kind: DGRAM_KIND_SNAP_BEGIN,
-                flags: 0,
+                wire: uc_protocol::WIRE_MAX,
                 key_epoch: 0,
             },
         );
@@ -375,7 +375,7 @@ impl Harness {
                 position: 0,
                 leadership_term_id: TERM,
                 kind: DGRAM_KIND_SNAP_BEGIN,
-                flags: 0,
+                wire: uc_protocol::WIRE_MAX,
                 key_epoch: 0,
             },
         );

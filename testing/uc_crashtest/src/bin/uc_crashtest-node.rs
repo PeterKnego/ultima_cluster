@@ -18,7 +18,7 @@ use std::time::Duration;
 use clap::Parser;
 use uc_consensus::election::NodeId;
 use uc_net::fault::FaultConfig;
-use uc_node::{CryptoConfig, Node, NodeConfig};
+use uc_node::{CryptoConfig, Node, NodeConfig, StartOpts};
 
 #[derive(Parser)]
 struct Args {
@@ -162,7 +162,15 @@ fn main() -> anyhow::Result<()> {
         }),
     };
 
-    let node = Node::start(cfg)?;
+    // Wire-level spec §6.2: `UC2_WIRE_RANGE=min,max`, honoured only when
+    // `uc_node/wire-level-override` is compiled in.
+    let node = Node::start_with(
+        cfg,
+        StartOpts {
+            wire: uc_node::wire::range_from_env(),
+            ..Default::default()
+        },
+    )?;
     // Anti-vacuity signal (M8 Task 15): a real crypto epoch is a LEADER-ONLY
     // mint (`Node::crypto_epoch`'s doc), so this only fires once this process
     // actually wins an election under crypto — proof wire crypto genuinely
@@ -172,7 +180,19 @@ fn main() -> anyhow::Result<()> {
     // Harmless overhead when crypto is disabled (`crypto_epoch()` always
     // `None` then, so the loop body below never writes).
     let mut last_epoch: Option<u16> = None;
+    // Ruling 13 (wire-level Task 13): the same supervisor contract `uc2-node`
+    // and `uc_crashtest-gateway` honour — a dead agent (a fail-stop panic,
+    // e.g. `WireLevelAboveBinary` in `uc2-cluster`) ends the process with
+    // exit 1 instead of leaving a dead member parked in this loop.
+    let agents = node.observability().agents;
     loop {
+        if let Some((name, _)) = agents
+            .iter()
+            .find(|(_, f)| f.load(std::sync::atomic::Ordering::Acquire))
+        {
+            eprintln!("uc_crashtest-node: agent_failstopped agent={name}");
+            std::process::exit(1);
+        }
         if crypto_enabled
             && let Some(e) = node.crypto_epoch()
             && last_epoch != Some(e)
@@ -182,8 +202,9 @@ fn main() -> anyhow::Result<()> {
         }
         publish_snapshot_state(&node, &instance_dir);
         // Not a park(): this process is torn down by a real SIGKILL from the
-        // test harness, but while alive it polls its own crypto epoch and
-        // mirrors its snapshot counters onto disk for the harness to read.
+        // test harness, but while alive it polls its agents' health and its
+        // own crypto epoch, and mirrors its snapshot counters onto disk for
+        // the harness to read.
         std::thread::sleep(Duration::from_millis(100));
     }
 }

@@ -167,6 +167,12 @@ pub const CONTRACT_SERIES: &[&str] = &[
     "uc2_send_emsgsize_total",
     "uc2_commands_over_standard_total",
     "uc2_jumbo_gate_pending",
+    // Wire level (spec §5.3).
+    "uc2_wire_level",
+    "uc2_wire_binary_min",
+    "uc2_wire_binary_max",
+    "uc2_wire_member_max",
+    "uc2_wire_datagrams_refused_total",
     "uc2_output_completed_bytes",
     "uc2_output_progress_bytes",
     "uc_node_snapshot_floor_bytes",
@@ -1668,7 +1674,10 @@ pub fn render_prometheus(s: &ObsSources) -> String {
     let mut limit_samples = Vec::new();
     for i in 0..CNC_MAX_PEER_SLOTS {
         let slot = s.cnc.peer_slot(i);
-        let id_and_role = slot.id_and_role.load_acquire();
+        let id_and_role = slot
+            .head
+            .id_and_role
+            .load(std::sync::atomic::Ordering::Acquire);
         if id_and_role == 0 {
             continue; // unoccupied slot
         }
@@ -1798,6 +1807,63 @@ pub fn render_prometheus(s: &ObsSources) -> String {
         "uc2_status_refused_total",
         "Inbound STATUS datagrams (leader role) whose body this node could not read — in practice a wire-0.10.0 follower's 16-byte body under a 0.11.0 leader (catalog ruling R30). Dropped, so that follower's flow-control window never opens and replication to it stalls. There is no wire-version word on node-to-node datagrams; this counter is the witness. Nonzero means the fleet is mixed-version; upgrade every node together.",
         s.receiver.statuses_refused.load(Ordering::Relaxed),
+    );
+    // Wire level (spec §5.3). The binary's range is read from the cnc page
+    // word boot wrote, not from a separate source: the page is what the
+    // operator's tooling reads too.
+    push_gauge(
+        &mut out,
+        "uc2_wire_level",
+        "The committed cluster wire level (wire-level spec §5.3) - a fleet-wide constant once settled; the wire minor every member must speak.",
+        s.cnc.wire_level(),
+    );
+    let wire_binary = uc_protocol::WireRange::unpack(s.cnc.wire_binary());
+    push_gauge(
+        &mut out,
+        "uc2_wire_binary_min",
+        "The lowest committed wire level this binary runs at (WIRE_MIN).",
+        wire_binary.min as u64,
+    );
+    push_gauge(
+        &mut out,
+        "uc2_wire_binary_max",
+        "The highest wire level this binary speaks (WIRE_MAX); `min by ()` over the fleet is the raise target.",
+        wire_binary.max as u64,
+    );
+    let wire_members: Vec<(String, u64)> = (0..CNC_MAX_PEER_SLOTS)
+        .filter_map(|i| {
+            let h = &s.cnc.peer_slot(i).head;
+            let idr = h.id_and_role.load(Ordering::Acquire);
+            (idr != 0).then(|| {
+                (
+                    format!("peer=\"{}\"", idr >> 8),
+                    h.wire_max.load(Ordering::Acquire),
+                )
+            })
+        })
+        .collect();
+    push_labeled(
+        &mut out,
+        "uc2_wire_member_max",
+        "Each member's reported WIRE_MAX as the LEADER sees it (0 = no report this term); zeros on a follower.",
+        "gauge",
+        &wire_members,
+    );
+    push_labeled(
+        &mut out,
+        "uc2_wire_datagrams_refused_total",
+        "Inbound datagrams refused on their wire byte: `prelevel` (byte 0, a 0.11.0 peer; on a crypto cluster this can also be driven by unauthenticated traffic) or `out_of_range` (outside [WIRE_MIN, WIRE_MAX+1]).",
+        "counter",
+        &[
+            (
+                "reason=\"prelevel\"".to_string(),
+                s.receiver.wire_refused_prelevel.load(Ordering::Relaxed),
+            ),
+            (
+                "reason=\"out_of_range\"".to_string(),
+                s.receiver.wire_refused_out_of_range.load(Ordering::Relaxed),
+            ),
+        ],
     );
     push_counter(
         &mut out,
@@ -2062,9 +2128,10 @@ mod tests {
         // family (both `uc2_leader_hint` and the three `uc2_peer_*`
         // families are conditionally emitted).
         cnc.status().leader_hint.store_release(0);
-        cnc.peer_slot(0)
-            .id_and_role
-            .store_release(pack_id_and_role(9, CNC_PEER_ROLE_VOTER));
+        cnc.peer_slot(0).head.id_and_role.store(
+            pack_id_and_role(9, CNC_PEER_ROLE_VOTER),
+            std::sync::atomic::Ordering::Release,
+        );
         // M11 (Task 5): non-zero so `every_contract_series_is_present` sees
         // `uc2_free_disk_bytes` — it's conditionally emitted, same as
         // `uc2_leader_hint` above.
@@ -2385,6 +2452,47 @@ mod tests {
         assert_eq!(st.observe_row(0, 300), (0, 900, 3), "max reset, word same");
     }
 
+    #[test]
+    fn the_wire_level_family_renders_from_the_page_and_the_binary() {
+        use std::sync::atomic::Ordering;
+        let s = synthetic_sources();
+        s.cnc.store_wire_level(12);
+        s.cnc
+            .store_wire_binary(uc_protocol::WireRange { min: 12, max: 13 }.pack());
+        s.cnc
+            .peer_slot(0)
+            .head
+            .id_and_role
+            .store((2 << 8) | 1, Ordering::Release);
+        s.cnc
+            .peer_slot(0)
+            .head
+            .wire_max
+            .store(13, Ordering::Release);
+        s.receiver
+            .wire_refused_prelevel
+            .fetch_add(2, Ordering::Relaxed);
+        let text = render_prometheus(&s);
+        assert!(text.contains("\nuc2_wire_level 12\n"), "{text}");
+        assert!(
+            text.contains("\nuc2_wire_binary_min 12\n")
+                && text.contains("\nuc2_wire_binary_max 13\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("\nuc2_wire_member_max{peer=\"2\"} 13\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("\nuc2_wire_datagrams_refused_total{reason=\"prelevel\"} 2\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("\nuc2_wire_datagrams_refused_total{reason=\"out_of_range\"} 0\n"),
+            "{text}"
+        );
+    }
+
     /// P5: `monitor-a-cluster.md` states the contract's SIZE — "89 families"
     /// — and nothing made that number a build-time fact, so adding a series
     /// silently made the doc wrong. This pins the count; a deliberate change
@@ -2393,7 +2501,7 @@ mod tests {
     fn the_contract_has_the_number_of_families_the_docs_state() {
         assert_eq!(
             CONTRACT_SERIES.len(),
-            149,
+            154,
             "if this is intentional, update the family count in \
              docs/how-to/monitor-a-cluster.md in the same commit"
         );
@@ -2855,10 +2963,10 @@ mod tests {
     #[test]
     fn peer_slots_export_only_occupied_with_labels() {
         let s = synthetic_sources();
-        s.cnc
-            .peer_slot(0)
-            .id_and_role
-            .store_release(pack_id_and_role(2, CNC_PEER_ROLE_VOTER));
+        s.cnc.peer_slot(0).head.id_and_role.store(
+            pack_id_and_role(2, CNC_PEER_ROLE_VOTER),
+            std::sync::atomic::Ordering::Release,
+        );
         s.cnc.peer_slot(0).reported_durable.store_release(1234);
         let text = render_prometheus(&s);
         assert!(
