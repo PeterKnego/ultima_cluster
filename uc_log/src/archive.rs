@@ -12,8 +12,10 @@
 //! batching IS the group commit: fsync frequency scales with block rate,
 //! not message rate, and there is no linger anywhere.
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use uc_journal::{Durability, Journal, JournalConfig, JournalError};
 use uc_protocol::v2::frame::{
@@ -103,6 +105,27 @@ impl ArchiveConfig {
     }
 }
 
+/// Counters the archive agent exports for `/metrics` (issue #172). Plain
+/// `AtomicU64` cells in the `uc_net::SenderStats` pattern: the archive agent is
+/// the only writer (`Relaxed` stores), the scrape reads `Relaxed`.
+#[derive(Default, Debug)]
+pub struct ArchiveStats {
+    /// Blocks this process has recorded (a counter; `Archive::blocks_recorded`
+    /// is the journal block index, which also counts blocks recovered at open).
+    pub blocks_recorded: AtomicU64,
+    /// Payload bytes of those blocks.
+    pub bytes_recorded: AtomicU64,
+    /// Journal fsyncs attributable to the archive. Consistent mode: one
+    /// fdatasync per recorded block, counted exactly. Eventual mode: the
+    /// journal fsyncs asynchronously, so this counts each ADVANCE of the
+    /// journal's durable watermark the archive observes, a lower bound on the
+    /// real fsync count (several flush ticks can land between two looks).
+    pub fsyncs: AtomicU64,
+    /// Eventual mode only: bytes recorded (buffered-written) but not yet
+    /// covered by a journal fsync. Always 0 in Consistent mode.
+    pub pending_flush_bytes: AtomicU64,
+}
+
 pub struct Archive {
     journal: Arc<Journal>,
     cfg: ArchiveConfig,
@@ -146,6 +169,13 @@ pub struct Archive {
     /// `truncate_to` (Task 0 step 2): a truncated tail's stamps were already
     /// published and a new leader's `seed_stamp` must still be `>=` them.
     last_time_ns: u64,
+    /// Exported counters (issue #172); see [`ArchiveStats`].
+    stats: Arc<ArchiveStats>,
+    /// Eventual mode only: `(journal seq, block bytes)` for blocks written
+    /// but not yet seen fsync-durable. Empty in Consistent mode.
+    unflushed: VecDeque<(u64, u64)>,
+    /// Eventual mode only: the last journal durable watermark observed.
+    last_durable_seq: u64,
 }
 
 /// How many recorded blocks `Archive::open` walks back looking for a
@@ -240,6 +270,9 @@ impl Archive {
             term_observations: Vec::new(),
             config_observations: Vec::new(),
             last_time_ns,
+            stats: Arc::new(ArchiveStats::default()),
+            unflushed: VecDeque::new(),
+            last_durable_seq: 0,
         })
     }
 
@@ -259,6 +292,43 @@ impl Archive {
     #[inline]
     pub fn recovered_position(&self) -> u64 {
         self.durable_pos
+    }
+
+    /// The exported counters, shared with the metrics scrape.
+    pub fn stats(&self) -> Arc<ArchiveStats> {
+        Arc::clone(&self.stats)
+    }
+
+    /// A truncation or wipe rewrote the journal tail: the unflushed ledger and
+    /// the watermark it was tracking describe seqs that no longer exist.
+    fn reset_flush_tracking(&mut self) {
+        self.unflushed.clear();
+        self.last_durable_seq = 0;
+        self.stats.pending_flush_bytes.store(0, Ordering::Relaxed);
+    }
+
+    /// Eventual mode: retire blocks the journal has since fsynced, count each
+    /// watermark advance as a flush, and publish the backlog. Not called in
+    /// Consistent mode, where `pending_flush_bytes` stays 0.
+    fn refresh_flush_backlog(&mut self) {
+        let d = self.journal.durable_seq();
+        if d > self.last_durable_seq {
+            self.last_durable_seq = d;
+            self.stats.fsyncs.fetch_add(1, Ordering::Relaxed);
+        }
+        // `durable_seq` reads 0 both "nothing durable" and "seq 0 durable";
+        // seq 0 therefore retires one flush late, never early.
+        while let Some(&(seq, _)) = self.unflushed.front() {
+            if seq <= d && (seq != 0 || d != 0) {
+                self.unflushed.pop_front();
+            } else {
+                break;
+            }
+        }
+        let pending: u64 = self.unflushed.iter().map(|&(_, n)| n).sum();
+        self.stats
+            .pending_flush_bytes
+            .store(pending, Ordering::Relaxed);
     }
 
     #[inline]
@@ -354,6 +424,7 @@ impl Archive {
             self.last_observed_term = 0;
             self.term_observations.clear();
             self.config_observations.clear();
+            self.reset_flush_tracking();
         }
         self.durable_pos = pos;
         self.first_base = pos;
@@ -391,6 +462,9 @@ impl Archive {
                 ArchiveError::RecorderCorrupt(c)
             })?;
         if slice.is_empty() {
+            if self.cfg.durability == Durability::Eventual && !self.unflushed.is_empty() {
+                self.refresh_flush_backlog();
+            }
             return Ok(false);
         }
         let base = self.durable_pos;
@@ -421,9 +495,19 @@ impl Archive {
         if self.next_block_seq == 0 {
             self.first_base = base;
         }
+        let seq = self.next_block_seq;
         self.durable_pos += len;
         self.next_block_seq += 1;
         buffer.counters().durable.store_release(self.durable_pos);
+        self.stats.blocks_recorded.fetch_add(1, Ordering::Relaxed);
+        self.stats.bytes_recorded.fetch_add(len, Ordering::Relaxed);
+        if self.cfg.durability == Durability::Eventual {
+            self.unflushed.push_back((seq, len));
+            self.refresh_flush_backlog();
+        } else {
+            // Consistent: `notifier.wait()` above returned post-fdatasync.
+            self.stats.fsyncs.fetch_add(1, Ordering::Relaxed);
+        }
         Ok(true)
     }
 
@@ -599,6 +683,7 @@ impl Archive {
             self.last_observed_term = 0;
             self.term_observations.clear();
             self.config_observations.clear();
+            self.reset_flush_tracking();
             return Ok(());
         }
         if base == pos {
@@ -625,6 +710,7 @@ impl Archive {
         self.last_observed_term = 0;
         self.term_observations.clear();
         self.config_observations.clear();
+        self.reset_flush_tracking();
         Ok(())
     }
 }
@@ -1221,6 +1307,82 @@ mod tests {
         // Recorded block is immediately readable back (page-cache read).
         let (meta, blk) = arch.journal().read(0).unwrap().unwrap();
         assert_eq!((meta, blk.len()), (0, 960));
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)] // real journal files + fsync
+    fn stats_count_blocks_bytes_and_fsyncs_in_consistent_mode() {
+        // Issue #172: 4 frames of 96 B at a 200 B cap record as 2 blocks.
+        let (b, _c, dir) = setup(1 << 16);
+        let cfg = ArchiveConfig {
+            max_block_bytes: 200,
+            ..test_cfg(dir.path())
+        };
+        let mut arch = Archive::open(cfg).unwrap();
+        let stats = arch.stats();
+        let mut a = Appender::new(Arc::clone(&b), 1, 0);
+        for i in 0..4 {
+            a.append(1, i, &[0u8; 64]).unwrap();
+        }
+        while arch.do_work(&b).unwrap() {}
+        assert_eq!(stats.blocks_recorded.load(Ordering::Relaxed), 2);
+        assert_eq!(stats.bytes_recorded.load(Ordering::Relaxed), 4 * 96);
+        assert!(stats.fsyncs.load(Ordering::Relaxed) >= 1);
+        assert_eq!(stats.pending_flush_bytes.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)] // real journal files
+    fn stats_track_the_flush_backlog_in_eventual_mode() {
+        let (b, _c, dir) = setup(1 << 16);
+        let cfg = ArchiveConfig {
+            durability: Durability::Eventual,
+            // Absurdly long so the async fsync does not race the assertions
+            // until we wait for it explicitly below.
+            eventual_fsync_interval: std::time::Duration::from_secs(3600),
+            ..test_cfg(dir.path())
+        };
+        let mut arch = Archive::open(cfg).unwrap();
+        let stats = arch.stats();
+        let mut a = Appender::new(Arc::clone(&b), 1, 0);
+        for i in 0..4 {
+            a.append(1, i, &[0u8; 64]).unwrap();
+        }
+        assert!(arch.do_work(&b).unwrap());
+        assert_eq!(stats.blocks_recorded.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.bytes_recorded.load(Ordering::Relaxed), 4 * 96);
+        // Block seq 0 is not yet fsynced (watermark reads 0 = ambiguous, and
+        // the interval is an hour): the whole block is backlog.
+        assert_eq!(stats.pending_flush_bytes.load(Ordering::Relaxed), 4 * 96);
+        assert_eq!(stats.fsyncs.load(Ordering::Relaxed), 0);
+        std::mem::forget(arch); // the hour-long flush timer must not block drop
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)] // real journal files
+    fn stats_drain_the_flush_backlog_once_the_journal_fsyncs() {
+        let (b, _c, dir) = setup(1 << 16);
+        let cfg = ArchiveConfig {
+            durability: Durability::Eventual,
+            ..test_cfg(dir.path())
+        };
+        let mut arch = Archive::open(cfg).unwrap();
+        let stats = arch.stats();
+        let mut a = Appender::new(Arc::clone(&b), 1, 0);
+        a.append(1, 0, &[0u8; 64]).unwrap();
+        assert!(arch.do_work(&b).unwrap());
+        a.append(1, 1, &[0u8; 64]).unwrap();
+        assert!(arch.do_work(&b).unwrap());
+        arch.journal().wait_durable(1).unwrap();
+        for _ in 0..200 {
+            arch.do_work(&b).unwrap();
+            if stats.pending_flush_bytes.load(Ordering::Relaxed) == 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(stats.pending_flush_bytes.load(Ordering::Relaxed), 0);
+        assert!(stats.fsyncs.load(Ordering::Relaxed) >= 1);
     }
 
     #[test]

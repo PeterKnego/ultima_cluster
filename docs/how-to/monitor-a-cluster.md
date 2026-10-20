@@ -75,7 +75,7 @@ scrape_configs:
 ```
 
 `/metrics` serves `text/plain; version=0.0.4` — standard Prometheus text
-exposition. The full series contract — 154 families — is the
+exposition. The full series contract — 159 families — is the
 `CONTRACT_SERIES` array in
 [`uc_node/src/obs/metrics.rs`](../../uc_node/src/obs/metrics.rs); a test
 pins every family in that array against what the renderer actually emits, so
@@ -131,6 +131,30 @@ producer that dies in the few instructions between claiming a slot and
 stamping its claim word (`IngressRingWedged`), and a record at the
 consumer position that does not decode (`IngressRingCorrupt`). See
 [Diagnose a node: my node just fail-stopped with `IngressRingWedged`](diagnose-a-node.md#my-node-just-fail-stopped-with-ingressringwedged).
+
+### The archive families (durability hop)
+
+The archive agent records the log into the journal, and `uc2_durable_bytes`
+is how far it has got. Five series say how fast and how far behind it is, so
+a commit stall can be traced to the local disk or to a peer:
+
+- `uc2_durable_lag_bytes` is `uc2_append_bytes - uc2_durable_bytes`, the bytes
+  appended here but not yet recorded by this node's archive, shaped like
+  `uc2_commit_lag_bytes`. A growing value while
+  `uc2_peer_replication_lag_bytes` stays flat is the local journal write or
+  fdatasync, not a peer.
+- `uc2_archive_blocks_recorded_total` and `uc2_archive_bytes_recorded_total`
+  count what the archive has recorded since the process started; their rates
+  are the local durability throughput.
+- `uc2_archive_fsyncs_total` is exactly one fdatasync per block under the
+  default Consistent durability. Under Eventual durability the journal fsyncs
+  asynchronously, so it counts each advance of the journal's durable watermark
+  the archive saw, a lower bound on the true count.
+- `uc2_archive_pending_flush_bytes` is Eventual durability only: bytes
+  written to the journal but not yet fsynced, the loss window on power
+  failure. It reads 0 under Consistent durability.
+
+No alert rule keys on these yet.
 
 ### The per-FSM families (M14)
 

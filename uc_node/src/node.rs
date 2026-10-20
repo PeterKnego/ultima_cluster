@@ -1360,6 +1360,7 @@ pub struct Node {
     /// leader serves a below-ring NAK from the journal, `replay_datagrams > 0`,
     /// rather than prefilling its ring).
     sender_stats: Arc<uc_net::sender::SenderStats>,
+    archive_stats: Arc<uc_log::archive::ArchiveStats>,
     partition_handles: Vec<PartitionHandle>,
     /// M8 (Task 12): the newest group-key epoch this node has minted (0 =
     /// never). Written by the consensus agent; read by [`Node::crypto_epoch`].
@@ -1605,6 +1606,7 @@ impl Node {
             archive_cfg.preallocate_segments,
         );
         let mut archive = Archive::open(archive_cfg).map_err(to_io)?;
+        let archive_stats = archive.stats();
         let durable = archive.recovered_position();
         if std::env::var("UC2_TRUNC_TRACE").is_ok() {
             eprintln!("[trunc-trace n{}] BOOT recovered_durable={durable}", cfg.id);
@@ -3018,6 +3020,7 @@ impl Node {
             archive_first_base,
             route_drops,
             sender_stats,
+            archive_stats,
             partition_handles,
             crypto_epoch,
             crypto,
@@ -3554,6 +3557,7 @@ impl Node {
             node_id: self.node_id,
             cnc: Arc::clone(&self.cnc),
             sender: Arc::clone(&self.sender_stats),
+            archive: Arc::clone(&self.archive_stats),
             receiver: Arc::clone(&self.route_drops),
             truncations: Arc::clone(&self.truncations),
             wipes: Arc::clone(&self.wipes),
