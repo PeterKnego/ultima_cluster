@@ -170,8 +170,8 @@ existing dashboards' grouping keys by row still work):
 `uc_service_applied_bytes`, `uc_service_frames_applied_total`,
 `uc_service_epoch`, `uc_service_snapshot_pos_bytes`,
 `uc_service_heartbeat_age_seconds`, `uc_service_attached`,
-`uc_service_lag_bytes` (= `commit − applied`), `uc_service_lag_waits_total`. Two node-scalar gauges describe the set
-itself: `uc_services_declared` (the bitmask — bit *k* = row *k*) and
+`uc_service_lag_bytes` (= `commit − applied`),
+`uc_service_lag_waits_total`. Two node-scalar gauges describe the set itself: `uc_services_declared` (the bitmask — bit *k* = row *k*) and
 `uc2_fsm_lag_bytes` (the lag bound; **0 means lockstep**).
 
 **Commands per second, at both ends.** Every other hot-path reading is a byte
@@ -181,6 +181,8 @@ fleet. `uc_service_frames_applied_total{service,row}` counts the commands each
 row applied, and its unlabeled sample is row 0's. `rate()` of the first is
 commands/s entering the log and `rate()` of the second is commands/s leaving
 it, per row. Journal replay after a service restart is not counted as
+applied. After a failover the pair differs briefly: frames a deposed leader
+appended and then truncated count in `uc2_frames_appended_total` but are never
 applied.
 
 **Two new gauges per row (FSM identity, 2.11.0), exported from the cnc

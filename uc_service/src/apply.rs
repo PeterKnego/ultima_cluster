@@ -568,7 +568,11 @@ pub(crate) fn apply_cycle<S: RawStateMachine>(st: &mut ApplyState<S>) -> bool {
                 // applied yet — the batch ends there, see below.
                 let mut pending_at: Option<u64> = None;
                 // #171: MESSAGE frames this batch applied — a local, stored
-                // to the slot ONCE after the batch (never a per-frame atomic).
+                // to the slot once per batch (one frame in lockstep, where
+                // `one_frame` ends every batch after one frame). The local
+                // spills across `sm.apply`, so it costs a stack add per
+                // applied frame; no already-held count could replace it (the
+                // egress record count is leader-only and best-effort).
                 let mut batch_applied: u64 = 0;
                 for (pos, hdr, payload) in frames {
                     // PADDING, NEW_TERM, CONFIG (and any future type that is
@@ -691,7 +695,8 @@ pub(crate) fn apply_cycle<S: RawStateMachine>(st: &mut ApplyState<S>) -> bool {
                     }
                 }
                 drop(sm);
-                // #171: one store per batch, ahead of the R13 early exit below
+                // #171: one store per batch (one frame in lockstep), a plain
+                // load + store, no atomic RMW — ahead of the R13 early exit below
                 // so frames applied before a pending version record count.
                 if batch_applied != 0 {
                     crate::attach::slot(&st.cnc, st.service_id)

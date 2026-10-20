@@ -581,7 +581,7 @@ const _: () = assert!(
 /// wait-episode count, then (#171, cnc 3.5) the row's applied-frame count.
 /// ONE writer for the whole line — the service apply agent — so the frame
 /// count needs no read-modify-write: the agent loads its own last store and
-/// stores the sum, once per batch. `load_acquire`/`store_release`/`fetch_add`
+/// stores the sum, once per batch (one frame in lockstep). `load_acquire`/`store_release`/`fetch_add`
 /// keep their `PaddedAtomicU64` meaning for `lag_waits`, so every existing
 /// call site is unchanged.
 #[repr(C, align(64))]
@@ -612,8 +612,9 @@ impl LagWaitsLine {
     }
     /// #171, service apply agent only (the line's one writer): add a batch's
     /// applied-frame count. A plain load of the agent's own last store plus
-    /// one `Release` store — no locked RMW — called once per batch, never
-    /// per frame. A second writer would lose counts; there is none.
+    /// one `Release` store — no locked RMW — called once per batch (one
+    /// frame in lockstep, where every batch is one frame). A second writer
+    /// would lose counts; there is none.
     #[inline]
     pub fn add_frames_applied(&self, n: u64) {
         let v = self.frames_applied.load(Ordering::Relaxed);

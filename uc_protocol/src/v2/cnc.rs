@@ -420,7 +420,7 @@ pub const CNC_SVC_OFF_RESERVED: usize = 448;
 /// #171 (cnc 3.5, folded in before release): `MESSAGE` frames this row's
 /// apply loop has applied on the live path — the word after `lag_waits` on
 /// line 6, same writer (the service apply agent). Stored ONCE per batch
-/// from a count the batch keeps in a local, never per frame; journal replay
+/// from a count the batch keeps in a local (one frame per batch in lockstep); journal replay
 /// is not counted. Reader: `/metrics` (`uc_service_frames_applied_total`).
 pub const CNC_SVC_OFF_FRAMES_APPLIED: usize = 392;
 const _: () = assert!(CNC_SVC_OFF_FRAMES_APPLIED == CNC_SVC_OFF_LAG_WAITS + 8);
