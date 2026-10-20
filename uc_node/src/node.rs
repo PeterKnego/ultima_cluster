@@ -1301,6 +1301,10 @@ pub struct Node {
     /// and handed on by `observability()` as
     /// `uc2_commands_over_standard_total`.
     commands_over_standard: Arc<AtomicU64>,
+    /// #171: client command frames this node has appended as leader, shared
+    /// with the consensus agent (one add per pass) and handed on by
+    /// `observability()` as `uc2_frames_appended_total`.
+    frames_appended: Arc<AtomicU64>,
     truncations: Arc<AtomicU64>,
     /// M6 Task 8: count of wipe-and-rejoins (NoCommonPrefix → truncate-to-0). A
     /// subset of `truncations` (a wipe is also a truncate), tracked separately for
@@ -1855,6 +1859,8 @@ impl Node {
         let wipes = Arc::new(AtomicU64::new(0));
         // Jumbo spec §9: the ops-side view of the §8 developer warning.
         let commands_over_standard = Arc::new(AtomicU64::new(0));
+        // #171: the leader's appended-command count.
+        let frames_appended = Arc::new(AtomicU64::new(0));
         let reports_implausible = Arc::new(AtomicU64::new(0));
         let reports_unattested = Arc::new(AtomicU64::new(0));
         // M8 (Task 12): the newest group epoch this node has minted, mirrored
@@ -2830,6 +2836,8 @@ impl Node {
             truncations: Arc::clone(&truncations),
             wipes: Arc::clone(&wipes),
             commands_over_standard: Arc::clone(&commands_over_standard),
+            frames_appended: Arc::clone(&frames_appended),
+            pass_frames_appended: 0,
             reports_implausible: Arc::clone(&reports_implausible),
             clock: crate::log_clock::LogClock::new(),
             durable_seen: durable,
@@ -2995,6 +3003,7 @@ impl Node {
             fsm_door: fsm_lag_eff,
             buffer,
             commands_over_standard,
+            frames_appended,
             truncations,
             wipes,
             timer_stats,
@@ -3582,6 +3591,7 @@ impl Node {
             cluster_view: Arc::clone(&self.cluster_view),
             probe: Arc::clone(&self.probe_table),
             commands_over_standard: Arc::clone(&self.commands_over_standard),
+            frames_appended: Arc::clone(&self.frames_appended),
             reports_unattested: Arc::clone(&self.reports_unattested),
             reports_implausible: Arc::clone(&self.reports_implausible),
             crypto_handshake_failures: Arc::clone(&self.crypto_handshake_failures),
@@ -4421,6 +4431,14 @@ struct Consensus {
     /// on the two leader append paths. Shared with the `Node` handle for
     /// observability.
     commands_over_standard: Arc<AtomicU64>,
+    /// #171: client command (`MESSAGE`) frames appended on the two leader
+    /// append paths, flushed from `pass_frames_appended` ONCE per pass (one
+    /// add, never one per frame). Shared with the `Node` handle for
+    /// observability (`uc2_frames_appended_total`).
+    frames_appended: Arc<AtomicU64>,
+    /// #171: this pass's appended-command count — a plain field the two
+    /// append paths bump, flushed into `frames_appended` after the drains.
+    pass_frames_appended: u64,
     truncations: Arc<AtomicU64>,
     /// M6 Task 8: wipe-and-rejoin count (NoCommonPrefix → truncate-to-0), bumped
     /// on `Action::CountWipe`. Shared with the `Node` handle for observability.
@@ -5207,6 +5225,13 @@ impl Consensus {
         }
         if !(serving && hold_clients) {
             did |= self.drain_ingress_ring(serving);
+        }
+        // #171: one add for the whole pass's client appends, never one per
+        // frame (the drains above bump a plain field).
+        if self.pass_frames_appended != 0 {
+            self.frames_appended
+                .fetch_add(self.pass_frames_appended, Ordering::Relaxed);
+            self.pass_frames_appended = 0;
         }
 
         // 3c. Drain the client query ring (Task 11): snapshot reads forward to
@@ -7556,6 +7581,7 @@ impl Consensus {
             Ok(_) => {
                 self.next_corr = self.next_corr.wrapping_add(1);
                 self.count_over_standard(payload.len());
+                self.pass_frames_appended += 1;
                 true
             }
             Err(AppendError::WouldOverrun) => false,
@@ -10864,6 +10890,7 @@ impl Consensus {
         match app.append(client_id, local_seq, payload) {
             Ok(_) => {
                 self.count_over_standard(payload.len());
+                self.pass_frames_appended += 1;
                 true
             }
             Err(AppendError::WouldOverrun) => false,
@@ -16724,6 +16751,8 @@ mod tests {
             can_serve_flag: Arc::new(AtomicBool::new(false)),
             intake_gate,
             commands_over_standard: Arc::new(AtomicU64::new(0)),
+            frames_appended: Arc::new(AtomicU64::new(0)),
+            pass_frames_appended: 0,
             truncations: Arc::new(AtomicU64::new(0)),
             wipes: Arc::new(AtomicU64::new(0)),
             reports_implausible: Arc::new(AtomicU64::new(0)),
@@ -23635,6 +23664,41 @@ mod tests {
             "consumed (dropped), not held"
         );
         assert_eq!(c(), 3, "PayloadTooLarge appended nothing");
+    }
+
+    /// #171: both leader append paths count an appended client frame into
+    /// the pass-local field, a refused payload counts nothing, and the shared
+    /// `uc2_frames_appended_total` cell moves only when the pass flushes —
+    /// one add per pass, never one per frame.
+    #[test]
+    fn appended_client_frames_are_counted_once_per_pass() {
+        let mut h = harness();
+        drive_to_serving_leader(&mut h);
+        h.cons.do_work();
+        let counter = Arc::clone(&h.cons.frames_appended);
+        let before = counter.load(Ordering::Relaxed);
+        assert_eq!(h.cons.pass_frames_appended, 0, "a pass leaves it flushed");
+
+        assert!(h.cons.try_append(&[0u8; 64]));
+        assert!(h.cons.try_append_client(7, 1, &[0u8; 64]));
+        assert!(h.cons.try_append_client(7, 2, &[0u8; 64]));
+        assert!(
+            h.cons.try_append(&[0u8; 4097]),
+            "consumed (dropped), not held"
+        );
+        assert_eq!(
+            h.cons.pass_frames_appended, 3,
+            "the refused one is not counted"
+        );
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            before,
+            "nothing reaches the shared cell before the pass flushes"
+        );
+
+        h.cons.do_work();
+        assert_eq!(counter.load(Ordering::Relaxed), before + 3);
+        assert_eq!(h.cons.pass_frames_appended, 0);
     }
 
     /// Spec §4.4: SINGLE IN FLIGHT. A second staged apply while the previous

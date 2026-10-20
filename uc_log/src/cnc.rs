@@ -577,6 +577,61 @@ const _: () = assert!(
         == cnc::CNC_SVC_OFF_START_SET_VERSION - cnc::CNC_SVC_OFF_SNAPSHOT_POS
 );
 
+/// The slot's `lag_waits` line (`+384..+448`, line 6): the barrier's
+/// wait-episode count, then (#171, cnc 3.5) the row's applied-frame count.
+/// ONE writer for the whole line — the service apply agent — so the frame
+/// count needs no read-modify-write: the agent loads its own last store and
+/// stores the sum, once per batch. `load_acquire`/`store_release`/`fetch_add`
+/// keep their `PaddedAtomicU64` meaning for `lag_waits`, so every existing
+/// call site is unchanged.
+#[repr(C, align(64))]
+pub struct LagWaitsLine {
+    lag_waits: AtomicU64,
+    frames_applied: AtomicU64,
+    _pad: [u8; 48],
+}
+
+impl LagWaitsLine {
+    #[inline]
+    pub fn load_acquire(&self) -> u64 {
+        self.lag_waits.load(Ordering::Acquire)
+    }
+    #[inline]
+    pub fn store_release(&self, v: u64) {
+        self.lag_waits.store(v, Ordering::Release)
+    }
+    /// `AcqRel` fetch-add on `lag_waits`, as on [`PaddedAtomicU64`].
+    #[inline]
+    pub fn fetch_add(&self, v: u64) -> u64 {
+        self.lag_waits.fetch_add(v, Ordering::AcqRel)
+    }
+    /// #171: `MESSAGE` frames this row has applied on the live path.
+    #[inline]
+    pub fn frames_applied(&self) -> u64 {
+        self.frames_applied.load(Ordering::Acquire)
+    }
+    /// #171, service apply agent only (the line's one writer): add a batch's
+    /// applied-frame count. A plain load of the agent's own last store plus
+    /// one `Release` store — no locked RMW — called once per batch, never
+    /// per frame. A second writer would lose counts; there is none.
+    #[inline]
+    pub fn add_frames_applied(&self, n: u64) {
+        let v = self.frames_applied.load(Ordering::Relaxed);
+        self.frames_applied
+            .store(v.wrapping_add(n), Ordering::Release);
+    }
+    /// Offset pin for `cnc_offsets_match_protocol_constants`.
+    #[doc(hidden)]
+    pub fn frames_applied_ptr(&self) -> usize {
+        &self.frames_applied as *const _ as usize
+    }
+}
+const _: () = assert!(std::mem::size_of::<LagWaitsLine>() == 64);
+const _: () = assert!(
+    std::mem::offset_of!(LagWaitsLine, frames_applied)
+        == cnc::CNC_SVC_OFF_FRAMES_APPLIED - cnc::CNC_SVC_OFF_LAG_WAITS
+);
+
 /// M14a: one per-service slot on page 2 — see `uc_protocol::v2::cnc`'s
 /// `CNC_OFF_SERVICE_SLOTS` doc for the writer-per-line table. Same shape as
 /// [`PeerSlot`]: every field its own cache line, `#[repr(C)]`, stride pinned.
@@ -588,7 +643,7 @@ pub struct ServiceSlot {
     pub output_completed: PaddedAtomicU64,
     pub snapshot_pos: SnapshotPosLine,
     pub heartbeat_ns: PaddedAtomicU64,
-    pub lag_waits: PaddedAtomicU64,
+    pub lag_waits: LagWaitsLine,
     pub identity: ServiceIdentityLine,
 }
 
@@ -1708,6 +1763,10 @@ mod tests {
         assert_eq!(
             &s0.lag_waits as *const _ as usize - s0_base,
             cnc::CNC_SVC_OFF_LAG_WAITS
+        );
+        assert_eq!(
+            s0.lag_waits.frames_applied_ptr() - s0_base,
+            cnc::CNC_SVC_OFF_FRAMES_APPLIED
         );
         assert_eq!(
             &s0.identity as *const _ as usize - s0_base,

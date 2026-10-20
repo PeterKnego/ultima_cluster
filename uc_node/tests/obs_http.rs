@@ -116,6 +116,7 @@ fn synthetic_sources() -> ObsSources {
         )),
         probe: uc_net::probe::ProbeTable::new(uc_net::probe::ProbeCadence::default()),
         commands_over_standard: Arc::new(AtomicU64::new(0)),
+        frames_appended: Arc::new(AtomicU64::new(0)),
         reports_unattested: Arc::new(AtomicU64::new(0)),
         reports_implausible: Arc::new(AtomicU64::new(0)),
         crypto_handshake_failures: Arc::new(AtomicU64::new(0)),

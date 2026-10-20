@@ -444,6 +444,7 @@ fn synthetic_sources_named(node_id: u32, name: Option<FsmName>) -> ObsSources {
         backup_writer: None,
         probe: uc_net::probe::ProbeTable::new(uc_net::probe::ProbeCadence::default()),
         commands_over_standard: Arc::new(AtomicU64::new(0)),
+        frames_appended: Arc::new(AtomicU64::new(0)),
         cluster_view: Arc::new(uc_node::ClusterView::new(
             &uc_node::ClusterState::genesis_empty(),
         )),
