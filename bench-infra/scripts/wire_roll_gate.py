@@ -58,23 +58,54 @@ def selftest():
     check("holdout", verdict_row_roll({0: 13, 1: 12, 2: 13}, [1.0], True)[0], "FAIL")
     check("gap", verdict_row_roll({0: 13, 1: 13, 2: 13}, [6.0], True)[0], "FAIL")
     check("agreement", verdict_row_roll({0: 13, 1: 13, 2: 13}, [], False)[0], "FAIL")
-    check("stall monotone", longest_stall([(i * 1.0, i) for i in range(5)]), 0.0)
-    check("stall flat", longest_stall([(0.0, 1), (1.0, 2), (2.0, 2), (3.0, 2), (4.0, 2), (5.0, 3)]), 3.0)
+    # A stall is measured to the first sample ABOVE the mark (the upper bound,
+    # at most one tick over), so a monotone run reads as one tick: the
+    # documented resolution, not a stall.
+    check("stall monotone = one tick", longest_stall([(i * 1.0, i) for i in range(5)]), 1.0)
+    check("stall flat", longest_stall([(0.0, 1), (1.0, 2), (2.0, 2), (3.0, 2), (4.0, 2), (5.0, 3)]), 4.0)
     check("stall empty", longest_stall([]), float("inf"))
+    # #183: a dip is not movement. One observer lost for a tick inside a
+    # stall (5,5,3,5,5 then 6) is ONE 5 s stall from t=0 to the rise at t=5,
+    # not two 1 s stalls split by the dip.
+    check("stall dip inside",
+          longest_stall([(0.0, 5), (1.0, 5), (2.0, 3), (3.0, 5), (4.0, 5), (5.0, 6)]), 5.0)
+    # A failover steps the position back and climbs again: the stall runs
+    # until the climb passes the mark (t=4, p=6 > 5), not when it first rises.
+    check("stall dip then climb",
+          longest_stall([(0.0, 5), (1.0, 5), (2.0, 3), (3.0, 4), (4.0, 6), (5.0, 7)]), 4.0)
+    # A stretch with no sample at all (every observer silent) is stall, not a
+    # gap the verdict skips over: 1 s at the mark, 8 s blind, then a rise.
+    check("stall blind stretch", longest_stall([(0.0, 5), (1.0, 5), (10.0, 6)]), 10.0)
+    # Stepped back and never regained the mark: the stall runs to the end.
+    check("stall never regains", longest_stall([(0.0, 5), (1.0, 3), (2.0, 4), (3.0, 4)]), 3.0)
+    check("sampler skipped ticks", CommitSampler.fold_tick(0.5, [None, None]), None)
+    check("sampler partial tick", CommitSampler.fold_tick(0.5, [None, 7]), (0.5, 7))
+    check("sampler full tick", CommitSampler.fold_tick(0.5, [9, 7]), (0.5, 9))
     print("selftest OK")
 
 
 def longest_stall(samples):
-    """Longest wall interval over which the commit position did not move.
-    `samples` = [(t_seconds, position)] in time order."""
+    """Longest wall interval over which the commit position did not ADVANCE
+    past its high-water mark. `samples` = [(t_seconds, position)] in time
+    order. Only a rise above the mark ends a stall (#183): a dip — the max
+    taken over fewer surviving observers for a tick, or a failover stepping
+    the exported position back before it climbs again — is not movement, so
+    the stall keeps running from the mark's first sample. A stall is measured
+    from the first sample at the mark TO THE FIRST SAMPLE ABOVE IT (or the last
+    sample, if none is): the upper bound, which over-reads by at most one
+    scrape tick — the conservative direction for a FAIL bar — and counts a
+    blind stretch (skipped ticks) as stall, since nothing proves commit moved
+    while no observer answered. A monotone run therefore reads as one tick,
+    the documented resolution."""
     if not samples:
         return float("inf")
-    best, since, prev = 0.0, None, None
+    best, since, high = 0.0, None, None
     for t, p in samples:
-        if prev is None or p != prev:
-            since = t
+        if high is None:
+            since, high = t, p
         best = max(best, t - since)
-        prev = p
+        if p > high:
+            since, high = t, p
     return best
 
 
@@ -146,23 +177,40 @@ class CommitSampler(threading.Thread):
     """Scrapes `uc2_commit_position` on every surviving node each tick and
     records the MAX, from construction-time start until `stop()`. Start it
     BEFORE the kill so the whole stall window is observed. Resolution is one
-    ssh-scrape tick (~1 s for two sequential scrapes)."""
+    ssh-scrape tick (~1 s for two sequential scrapes).
+
+    A tick on which NO observer answered is a missing sample, not a max over
+    nothing: it is skipped and counted in `skipped`, so a sampler that lost
+    its observers shows in the per-roll INFO line instead of as a shorter
+    stall. A tick on which SOME observer failed is kept (the max over the
+    rest) and counted in `partial`; `longest_stall` treats the dip that can
+    produce as no movement (#183)."""
 
     def __init__(self, observers):
         super().__init__(daemon=True)
         self.observers, self.samples, self._stop_ev = observers, [], threading.Event()
+        self.skipped, self.partial = 0, 0
         self.t0 = time.time()
+
+    @staticmethod
+    def fold_tick(t, vals):
+        """One tick's scrape results (`None` = that observer did not answer)
+        folded to a sample, or `None` when no observer answered."""
+        got = [int(v) for v in vals if v is not None]
+        return (t, max(got)) if got else None
 
     def run(self):
         jg, _, _, _ = _mods()
         while not self._stop_ev.is_set():
-            vals = []
-            for o in self.observers:
-                v = jg.read_gauge(jg.scrape_prom(o, label="gap"), "uc2_commit_position")
-                if v is not None:
-                    vals.append(int(v))
-            if vals:
-                self.samples.append((time.time() - self.t0, max(vals)))
+            vals = [jg.read_gauge(jg.scrape_prom(o, label="gap"), "uc2_commit_position")
+                    for o in self.observers]
+            sample = self.fold_tick(time.time() - self.t0, vals)
+            if sample is None:
+                self.skipped += 1
+            else:
+                if any(v is None for v in vals):
+                    self.partial += 1
+                self.samples.append(sample)
             self._stop_ev.wait(SAMPLE_PERIOD_SECS)
 
     def stop(self):
@@ -238,7 +286,10 @@ def run_roll(hosts, args):
             time.sleep(SAMPLE_PERIOD_SECS)
             samples = sampler.stop()
             gap = longest_stall(samples) if ok else float("inf")
-            print(f"INFO roll n{i}: {len(samples)} commit samples, longest stall {gap:.2f}s", flush=True)
+            print(f"INFO roll n{i}: {len(samples)} commit samples "
+                  f"({sampler.skipped} ticks skipped: no observer answered; "
+                  f"{sampler.partial} partial: some observer silent), "
+                  f"longest stall {gap:.2f}s", flush=True)
             gaps.append(gap)
 
         # 5. every node at level 13 within the budget.
