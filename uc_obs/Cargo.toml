@@ -1,6 +1,6 @@
 [package]
 name = "uc_obs"
-description = "UC v2 observability core: the structured JSON-lines log record format shared by every UC daemon (uc2-node, uc2-gateway)"
+description = "UC v2 observability core: the structured JSON-lines log record format, Prometheus text encoder and /metrics HTTP listener shared by every UC daemon (uc2-node, uc2-gateway)"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
@@ -13,5 +13,5 @@ categories.workspace = true
 
 # Deliberately empty, and worth keeping that way: this crate sits UNDER every
 # daemon in the dependency graph, so anything it pulls in, they all pull in.
-# The log core is std-only by construction.
+# The log core, the encoder and the listener are std-only by construction.
 [dependencies]

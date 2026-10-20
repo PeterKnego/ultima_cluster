@@ -694,6 +694,37 @@ the three fail-stop refusals
 process submitted it — including `uc2-gateway`, whose edge submits through the
 same local client.
 
+### The gateway
+
+`uc2-gateway` serves its own `/metrics`, `/healthz` and `/readyz` when its
+`gateway.toml` has a [`[metrics] bind`](../reference/gateway-config.md#metrics--optional)
+— on the same single-threaded, GET-only, `Connection: close` listener the
+node uses, and under the same security note. Give it a different port from
+the co-located node's (`bind` has no default for that reason). Fifteen
+families, all unlabeled:
+
+| family | type | meaning |
+|---|---|---|
+| `uc2_gateway_connections_total` | counter | client connections accepted, including ones since closed |
+| `uc2_gateway_submits_total`, `uc2_gateway_queries_total` | counter | `SUBMIT`/`QUERY` frames the node's `Engine` accepted |
+| `uc2_gateway_responses_total`, `uc2_gateway_redirects_total`, `uc2_gateway_retries_total`, `uc2_gateway_unknown_total` | counter | `RESPONSE`/`REDIRECT`/`RETRY`/`UNKNOWN` frames written back; a climbing `unknown` is requests the `Engine` timed out |
+| `uc2_gateway_backpressure_events_total` | counter | times the `Engine` refused for backpressure and a connection's credits were halved |
+| `uc2_gateway_leader_changes_total`, `uc2_gateway_leader_changed_frames_total` | counter | leader transitions the edge observed, and `LEADER_CHANGED` frames actually written (a transition to an unresolvable hint is observed but not announced) |
+| `uc2_gateway_status_frames_total` | counter | standalone `STATUS` frames written (the idle-liveness tick and credit announcements) |
+| `uc2_gateway_refused_busy_total` | counter | dials turned away `BUSY` at `max_connections` |
+| `uc2_gateway_grant_changes_total` | counter | per-connection grant redivisions as connections come and go |
+| `uc2_gateway_grant_outstanding` | gauge | the live sum of every ready connection's credits — what the edge has promised its clients right now |
+| `uc2_gateway_grant_budget` | gauge | the ceiling that sum is held under: `max_inflight` less its 1/8 headroom ([the grant budget](../reference/gateway-config.md#the-grant-budget-270)). Outstanding above budget means `max_connections` exceeds the budget and connections have floored at 1 credit |
+
+`/healthz` is 200 while the daemon's main loop is still ticking (it stamps a
+heartbeat every 100 ms; 503 once that is 3 s old). `/readyz` adds two
+clauses: the edge has not faulted (its node's instance has not restarted
+underneath it), and the node's own cnc heartbeat is fresh — the only sign
+the edge has of a node that died without its supervisor noticing. It
+deliberately does **not** check the service heartbeat or `can_serve`: a
+gateway beside a follower is ready, because answering `REDIRECT` is the
+gateway doing its job.
+
 ## Install the alert rules
 
 [`packaging/prometheus/uc2-alerts.yml`](../../packaging/prometheus/uc2-alerts.yml)
@@ -911,6 +942,8 @@ event names so a merged journal stays unambiguous:
 | Event | Fields | Means |
 |---|---|---|
 | `gateway_listening` | `bind` | the edge's TCP front door is bound |
+| `gateway_metrics_listening` | `bind` | the `[metrics]` listener is bound (absent when no `[metrics]` section is configured) |
+| `gateway_metrics_bind_failed` | `err` | the `[metrics]` listener could not bind; the daemon stops the edge and exits 1 |
 | `gateway_stats` | `conns`, `submits`, `queries`, `responses`, `redirects`, `retries`, `unknown`, `backpressure`, `grant_changes`, `leader_changes`, `status`, `refused_busy` | the 10 s counter sample — see [Run a gateway § Stats record](run-a-gateway.md#stats-record) for what each one means |
 | `gateway_edge_faulted` | `reason` | the node's instance restarted underneath the gateway, so its attach is void; the daemon exits 1 for the supervisor to restart it against the new instance |
 | `gateway_signal_handler_failed` | `err` | the signal handler could not be installed at startup; the daemon stops rather than run unstoppable |

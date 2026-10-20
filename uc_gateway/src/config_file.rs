@@ -9,6 +9,9 @@
 //! `uc_node`'s `config_file` module. This module does deserialisation and
 //! defaulting ONLY; every semantic rule lives in [`EdgeConfig::validate`].
 //!
+//! `[metrics]` is optional too: absent means no `/metrics` listener; present,
+//! it must name `bind`.
+//!
 //! `[limits]` and `[session]` are both optional sections, and every field
 //! inside them is independently optional too — an absent section is
 //! identical to a present-but-empty one, and both mean "take
@@ -102,6 +105,17 @@ impl Default for SessionSection {
     }
 }
 
+/// `[metrics]`: the daemon's `/metrics` + `/healthz` + `/readyz` listener
+/// (#173). Unlike `uc_node`'s `[metrics]`, `bind` has no default and a bare
+/// section is refused: the gateway runs beside a node whose own default is
+/// `127.0.0.1:9600`, so any default here would be a port one of the two
+/// daemons had to lose.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MetricsSection {
+    bind: SocketAddr,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct EdgeConfigFile {
@@ -112,6 +126,8 @@ struct EdgeConfigFile {
     limits: Option<LimitsSection>,
     #[serde(default)]
     session: Option<SessionSection>,
+    #[serde(default)]
+    metrics: Option<MetricsSection>,
 }
 
 // These mirror EdgeConfig::defaults() exactly (uc_gateway/src/config.rs) —
@@ -271,6 +287,7 @@ pub fn parse_str_with_env(
         status_interval: Duration::from_millis(limits.status_interval_ms),
         request_timeout: Duration::from_millis(limits.request_timeout_ms),
         max_connections: limits.max_connections,
+        metrics_bind: f.metrics.map(|m| m.bind),
     };
     cfg.validate()?;
     Ok(cfg)

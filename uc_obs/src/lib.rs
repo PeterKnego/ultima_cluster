@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Peter Knego
 
-//! UC's observability core: the structured log record format, and nothing
-//! else.
+//! UC's observability core: the structured log record format, the
+//! Prometheus text encoder, and the HTTP listener `/metrics` is served on —
+//! the pieces every UC daemon shares.
 //!
 //! # Why this is its own crate
 //!
@@ -28,9 +29,19 @@
 //! formatter that both the log stream and `uc_node`'s admin audit file
 //! render through so their JSON escaping and key order cannot drift.
 //!
+//! [`http`] — the single-threaded, deadline-bounded observability HTTP
+//! listener ([`http::HttpServer`]), generic over each daemon's own routes
+//! ([`http::Router`]). `uc_node` serves `/metrics`, `/healthz`, `/readyz` and
+//! `/cluster` on it; `uc2-gateway` serves its own three (#173).
+//!
+//! [`prom`] — the Prometheus text-format helpers (`push_counter`,
+//! `push_gauge`, …) both daemons render `/metrics` with.
+//!
 //! [`time`] — [`time::rfc3339_ns`] (a nanosecond Unix time as RFC 3339 UTC
 //! with nine fraction digits) and [`time::civil_from_days`], the calendar
 //! arithmetic both it and `uc2ctl`'s second-precision formatter share.
 
+pub mod http;
 pub mod log;
+pub mod prom;
 pub mod time;

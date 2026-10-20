@@ -13,7 +13,6 @@
 //! positions — this system has no indices.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use uc_log::cnc::{PinRead, RowRead, unpack_service_status};
 use uc_protocol::v2::cnc::{
@@ -22,15 +21,15 @@ use uc_protocol::v2::cnc::{
 };
 
 use super::ObsSources;
+// The unlabeled encoder helpers live in `uc_obs::prom` (#173), shared with
+// `uc2-gateway`; the labeled and per-service ones below stay here.
 use crate::timers::{NS_BUCKET_SLOTS, NS_BUCKETS, NsHistogramSnapshot};
+use uc_obs::prom::{push_counter, push_family_header, push_gauge, push_gauge_f64};
 
 /// Unix nanoseconds "now" — shared with Task 6's `/healthz`/`/readyz` probes.
-pub fn now_unix_ns() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0)
-}
+/// Lives in `uc_obs::time` since #173 (shared with `uc2-gateway`); re-exported
+/// so `uc_node::obs::metrics::now_unix_ns` keeps naming it.
+pub use uc_obs::time::now_unix_ns;
 
 /// Every metric family name the encoder emits, in the order it renders
 /// them. Task 8's alert rules reference only names from this list; Task
@@ -306,43 +305,6 @@ impl SnapshotFreezeStats {
             self.count[row].load(Ordering::Relaxed),
         )
     }
-}
-
-fn push_family_header(out: &mut String, name: &str, help: &str, ty: &str) {
-    out.push_str("# HELP ");
-    out.push_str(name);
-    out.push(' ');
-    out.push_str(help);
-    out.push('\n');
-    out.push_str("# TYPE ");
-    out.push_str(name);
-    out.push(' ');
-    out.push_str(ty);
-    out.push('\n');
-}
-
-fn push_gauge(out: &mut String, name: &str, help: &str, value: u64) {
-    push_family_header(out, name, help, "gauge");
-    out.push_str(name);
-    out.push(' ');
-    out.push_str(&value.to_string());
-    out.push('\n');
-}
-
-fn push_gauge_f64(out: &mut String, name: &str, help: &str, value: f64) {
-    push_family_header(out, name, help, "gauge");
-    out.push_str(name);
-    out.push(' ');
-    out.push_str(&value.to_string());
-    out.push('\n');
-}
-
-fn push_counter(out: &mut String, name: &str, help: &str, value: u64) {
-    push_family_header(out, name, help, "counter");
-    out.push_str(name);
-    out.push(' ');
-    out.push_str(&value.to_string());
-    out.push('\n');
 }
 
 /// Emit a labeled family: one `# HELP`/`# TYPE` pair followed by one sample

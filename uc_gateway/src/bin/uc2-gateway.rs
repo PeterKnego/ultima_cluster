@@ -15,7 +15,8 @@
 //!   `RestartPreventExitStatus=2`: a bad config is an operator problem, not
 //!   something a restart loop fixes.
 //! - `1` — [`Edge::start`] failed (e.g. the node's instance directory does not
-//!   exist yet, or its listener could not bind). ALSO: once running, the main
+//!   exist yet, or its listener could not bind), or the `[metrics] bind`
+//!   listener could not bind. ALSO: once running, the main
 //!   loop polls [`Edge::is_faulted`] every tick; when the underlying node's
 //!   shmem instance restarts under it, the edge latches faulted and refuses
 //!   new connections forever, so this binary exits 1 to let systemd's
@@ -26,11 +27,11 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use clap::Parser;
-use uc_gateway::{Edge, config_file};
+use uc_gateway::{Edge, config_file, metrics};
 
 /// `version` is not decoration: clap's derive only generates `--version` when
 /// this flag is present, and it was missing here while `uc2-node` and `uc2ctl`
@@ -68,6 +69,7 @@ fn main() -> ExitCode {
         eprintln!("uc2-gateway: warning: {w}");
     }
 
+    let metrics_bind = cfg.metrics_bind;
     let edge = match Edge::start(cfg) {
         Ok(e) => e,
         Err(e) => {
@@ -78,17 +80,41 @@ fn main() -> ExitCode {
     let bind_str = edge.local_addr().to_string();
     uc_obs::obs_event!(Info, "gateway_listening", bind = bind_str.as_str());
 
+    // #173: `/metrics`, `/healthz`, `/readyz` on `[metrics] bind`. `tick` is
+    // the tick loop's heartbeat — `/healthz` answers 200 only while the loop
+    // below keeps stamping it.
+    let tick = Arc::new(AtomicU64::new(metrics::now_unix_ns()));
+    let obs = match metrics_bind {
+        None => None,
+        Some(bind) => match metrics::serve(bind, edge.obs(), Arc::clone(&tick)) {
+            Ok(srv) => {
+                let addr = srv.tcp_addr().map(|a| a.to_string()).unwrap_or_default();
+                uc_obs::obs_event!(Info, "gateway_metrics_listening", bind = addr.as_str());
+                Some(srv)
+            }
+            Err(e) => {
+                let err = e.to_string();
+                uc_obs::obs_event!(Error, "gateway_metrics_bind_failed", err = err.as_str());
+                edge.stop();
+                return ExitCode::from(1);
+            }
+        },
+    };
+
     let stop = Arc::new(AtomicBool::new(false));
     for sig in [signal_hook::consts::SIGTERM, signal_hook::consts::SIGINT] {
         if let Err(e) = signal_hook::flag::register(sig, Arc::clone(&stop)) {
             let err = e.to_string();
             uc_obs::obs_event!(Error, "gateway_signal_handler_failed", err = err.as_str());
+            if let Some(o) = obs {
+                o.stop();
+            }
             edge.stop();
             return ExitCode::from(1);
         }
     }
 
-    let mut tick: u64 = 0;
+    let mut ticks: u64 = 0;
     while !stop.load(Ordering::Relaxed) {
         // A faulted edge is permanently done: the node's instance restarted
         // underneath it, so the attach it is running on is void. Exit rather
@@ -103,8 +129,9 @@ fn main() -> ExitCode {
             return ExitCode::from(1);
         }
 
-        tick += 1;
-        if tick.is_multiple_of(STATS_EVERY_N_TICKS) {
+        tick.store(metrics::now_unix_ns(), Ordering::Relaxed);
+        ticks += 1;
+        if ticks.is_multiple_of(STATS_EVERY_N_TICKS) {
             let s = edge.stats();
             uc_obs::obs_event!(
                 Info,
@@ -128,6 +155,9 @@ fn main() -> ExitCode {
     }
 
     uc_obs::obs_event!(Info, "gateway_stopped");
+    if let Some(o) = obs {
+        o.stop();
+    }
     edge.stop();
     ExitCode::SUCCESS
 }
