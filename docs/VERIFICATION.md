@@ -951,25 +951,32 @@ lives in the crashtest crate only and is opt-in (`--snapshots`), so all six
 pre-existing hard-crash tests attach byte-for-byte as before.
 
 **Rolling wire-level upgrade (`2.15.0`).** Wire-level spec §6.3 as real
-processes: three node processes boot on the old side (`UC2_WIRE_RANGE=12,12`)
-under a three-worker CAS-register load and are rolled to the new side
-(`12,13`) one at a time — nodes 0 and 1 by a restart, node 2 by a `SIGKILL`
-mid-roll. Every node's cnc `wire_level` word must still read 12 while a
-`[12,12]` member remains, and all three must read 13 within 30 s of the last
-roll (the leader raises on its own); the history across the whole roll is
-`Linearizable`. The old binary, started afterwards on node 2's directory, must
-be refused by name — `WireLevelAboveBinary` on its stderr and exit status 1
-(the cluster agent's fail-stop exit) within 20 s. The node bin honours
-`UC2_WIRE_RANGE` only when the crate is built with `wire-level-override`, so
-the test is gated on both features. From `2.16.0` on, `UC2_BASE_NODE_BIN`
-points the old side at the previous release's `uc_crashtest-node` — but the
-test's `OLD`/`NEW` ranges are the literal `12,12`/`12,13` (and the raise it
-waits for is to 13), so it cannot pass against any real base binary until
-those are parameterized.
+processes: three node processes boot on the old side under a three-worker
+CAS-register load and are rolled to the new side (this tree's bin) one at a
+time — nodes 0 and 1 by a restart, node 2 by a `SIGKILL` mid-roll. The test
+writes no level down: it encodes the level rule for ANY adjacent pair. `L` is
+read from the old cluster's cnc `wire_level` word after it boots, and the new
+side's top is this tree's `WIRE_MAX`. On a **step** (`WIRE_MAX == L + 1`)
+every node's word must still read `L` while an old member remains, all three
+must read `L + 1` within 30 s of the last roll (the leader raises on its own),
+and the old binary, started afterwards on node 2's directory, must be refused
+by name — `WireLevelAboveBinary` on its stderr and exit status 1 (the cluster
+agent's fail-stop exit) within 20 s. At the **same level** (`WIRE_MAX == L`,
+a release that kept the wire minor) the roll completes, the level never
+moves (checked again at the end of the run), and the refusal clause is
+skipped with a stated reason. Two or more apart, or an old side above the
+new, fails at once, naming both tops (the rule admits adjacent levels only).
+The history across the whole roll is `Linearizable` in both shapes. The old
+side is `UC2_BASE_NODE_BIN`, the previous release's `uc_crashtest-node` (no
+override env; the release checklist runs this for every release), or, unset,
+this tree's bin pinned to `UC2_WIRE_RANGE=WIRE_MAX,WIRE_MAX` against the new
+side pinned to `WIRE_MAX,WIRE_MAX+1` — the nightly's one-level step on every
+tree. The node bin honours `UC2_WIRE_RANGE` only when built with
+`wire-level-override`, so the test is gated on both features.
 
 | test | file | what it drives |
 |---|---|---|
-| `rolling_upgrade_one_node_at_a_time_under_load_is_linearizable_and_raises` | `testing/uc_crashtest/tests/rolling_upgrade.rs` | `2.15.0` — a `12,12` → `12,13` roll of a 3-process cluster under load, one node `SIGKILL`ed mid-roll; level held at 12, raised to 13 on every node, WGL-linearizable, the old binary refused by name |
+| `rolling_upgrade_one_node_at_a_time_under_load_is_linearizable_and_raises` | `testing/uc_crashtest/tests/rolling_upgrade.rs` | `2.15.0` — a one-level roll (`L` → `L + 1`, read from the binaries) of a 3-process cluster under load, one node `SIGKILL`ed mid-roll; level held at `L`, raised to `L + 1` on every node, WGL-linearizable, the old binary refused by name; at the same level the roll completes with no raise and the refusal clause skipped |
 
 ```bash
 cargo test -p uc_crashtest --features hard-crash-tests

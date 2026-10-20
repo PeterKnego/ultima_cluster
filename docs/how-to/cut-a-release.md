@@ -35,14 +35,15 @@ documentation for what it changes, because the tag is what people read.
       `cargo test -p uc_crashtest --features hard-crash-tests,wire-level-override`.
       A release that keeps the level can still break a mixed cluster — a cnc
       word, a settings field, a decoder — and the synthetic old side the
-      nightly runs (this tree pinned to `12,12`) cannot see that; only the
-      real previous binary can. The first real run is `2.16.0` against
-      `2.15.0`: `2.14.0` writes no level byte and is refused as pre-level by
-      design (the last flag day). Before that run the test's `OLD`/`NEW`
-      ranges, still the literal `12,12`/`12,13`, and the raise it waits for
-      (to 13) must be parameterized —
-      [#178](https://github.com/PeterKnego/ultima_cluster/issues/178); until
-      then it cannot pass against any real base binary. Record the run in
+      nightly runs (this tree pinned one level below itself) cannot see
+      that; only the real previous binary can. The test reads the old
+      cluster's level from its cnc word and this tree's top from `WIRE_MAX`,
+      so it passes for any adjacent pair: a one-level step asserts the hold,
+      the raise and the old binary's refusal; the same level asserts the
+      roll completes with the level unmoved and skips the refusal clause
+      (`docs/VERIFICATION.md` § Rolling wire-level upgrade). The first real
+      run is `2.16.0` against `2.15.0`: `2.14.0` writes no level byte and is
+      refused as pre-level by design (the last flag day). Record the run in
       `docs/releases.md`'s entry.
 - [ ] **A release that bumps the wire minor** (a new wire level, since
       `2.15.0`): exactly one `if level >= N` gate per feature, the previous
