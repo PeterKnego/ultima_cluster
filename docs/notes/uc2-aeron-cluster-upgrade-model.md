@@ -8,6 +8,12 @@ together, with the rules on each). Companion to
 `uc2-rolling-upgrade-compatibility-assessment.md`, whose Aeron row and
 "FSM `const VERSION`" paragraph this extends (and corrects in one place, §C).
 
+> **Taken up 2026-10-19.** UC's Level 2, the committed wire level, ships in
+> `2.15.0` — see
+> [The committed cluster wire level, explained](uc2-wire-level-explained.md).
+> The rest of this note reads as of 2026-09-19, so where §F and §G call the
+> level "proposed", read "built".
+
 **Source read:** the local checkout `/home/claude/ultima/aeron` at
 `f0366beca8 2026-08-27 (HEAD -> master, origin/master)`, `git describe` =
 `1.53.0-5-gf0366beca8` — i.e. five commits past the 1.53.0 release of
@@ -428,7 +434,7 @@ For the reader coming from `docs/how-to/upgrade-a-cluster.md`:
 
 | Aeron axis | UC surface |
 |---|---|
-| G.1 cluster: undetected mixed versions, per-release judgement, stop-the-world when semantic | the node↔node wire + cnc **flag day**; the committed wire level of issue #31 is the proposed replacement, the piece Aeron never built (§F) |
+| G.1 cluster: undetected mixed versions, per-release judgement, stop-the-world when semantic | the node↔node wire + cnc **flag day** through `2.14.0`; the committed wire level (#31, `2.15.0`) replaces it for wire minors — the piece Aeron never built (§F) |
 | G.2 payload as bytes, SBE recommended | `AppCommand = Bytes` end-to-end; the typed tier is a serde adapter, the encoding is the service's |
 | G.2 replay the old log through new code | `install_snapshot(P)` + journal tail-replay through the new apply loop; Level 1's tail-growth and unknown-kind discipline |
 | G.2 snapshot envelope check, major-only, pluggable | `ULTSNAP1 ‖ P` + the `SNAP_BEGIN` per-row `VERSION` refusal — **exact** today; the `const VERSION` validator in the FSM-identity spec is the reserved slot for Aeron's looser, pluggable rule |

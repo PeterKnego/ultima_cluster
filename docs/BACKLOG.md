@@ -89,10 +89,11 @@ to point at "§ 2a" for these residuals now point here.*
 The two operations items `docs/superpowers/specs/2026-08-19-uc2-production-readiness-design.md`
 deferred by name:
 
-- **Version negotiation / upgrade window.** Today every node↔node wire or
-  `cnc.dat` change is a cluster-wide flag day
-  (`docs/how-to/upgrade-a-cluster.md`, `docs/reference/semver-policy.md`).
-  The spec's reason for deferring: a negotiated floor becomes
+- **Version negotiation / upgrade window.** Implemented on `main` (PR #177,
+  ships in `2.15.0`): a wire minor is now a committed level that rolls one
+  node at a time; through `2.14.0` every node↔node wire or `cnc.dat` change
+  was a cluster-wide flag day (`docs/how-to/upgrade-a-cluster.md`,
+  `docs/reference/semver-policy.md`). The spec's reason for deferring: a negotiated floor becomes
   consensus-relevant state, which is real design work, not a script.
 - **Leadership transfer.** A planned leader stop costs one election
   timeout. Needs a new protocol message (a Raft `TimeoutNow` analog); the
@@ -109,8 +110,8 @@ deferred by name:
   [#66](https://github.com/PeterKnego/ultima_cluster/issues/66).
 - **Why:** the flag-day rule is the limit an operator hits first. This is
   the gap between "deployable" and "operable at scale".
-- **Cost:** high — both items touch consensus and are a wire flag day
-  themselves.
+- **Cost:** high — both items touch consensus. The version-negotiation half
+  is done (below); leadership transfer and #66 remain.
 - **Researched 2026-09-13/14, tracked as
   [#31](https://github.com/PeterKnego/ultima_cluster/issues/31)** — the
   version-negotiation item only. `docs/notes/uc2-rolling-upgrade-compatibility-assessment.md`
@@ -125,7 +126,9 @@ deferred by name:
   `docs/superpowers/specs/2026-10-19-uc2-wire-level-design.md` (#31, for
   `2.15.0`: Settings v7 `wire_level`/`wire_raise`, the datagram header byte
   as the report, encode-at-the-committed-level, one level back, auto or
-  operator raise); the per-row level (#66) follows it with its own spec.
+  operator raise). **Implemented and merged 2026-10-20** (PR #177, #31
+  closed); ships in `2.15.0`. Leadership transfer and the per-row level (#66,
+  its own spec) remain.
 
 ### 4. Geo — async cross-region learner with a stale-read mode
 

@@ -42,8 +42,11 @@ pre-batching form. A follower cannot distinguish a shared round from a
 per-read probe. The read path is therefore safe across a version-mixed rolling
 upgrade.
 
-Configuration changes are governed separately: complete a rolling upgrade
-before reconfiguring.
+Configuration changes need no special case during a
+[rolling upgrade](../how-to/upgrade-a-cluster.md#rolling-upgrades-since-2150):
+a member added mid-roll blocks the wire-level raise until it reports, and a
+removed one stops counting
+([Change cluster membership](../how-to/change-cluster-membership.md#upgrading-a-mixed-version-cluster)).
 
 ## Interaction with reconfiguration
 

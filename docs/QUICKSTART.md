@@ -489,5 +489,6 @@ it, and refuses to publish anything if it does not print `PASS`.
 - **[The operations runbook](/docs/ops/uc2-runbook.md)** — instance directory
   layout, backups, membership changes, quorum-loss recovery, upgrades.
 - **[Versioning and the semver promise](/docs/reference/semver-policy.md)** —
-  what is API, what is not, and what a flag day means.
+  what is API, what is not, and which upgrades roll one node at a time and
+  which are flag days.
 - **[`examples/counter/`](/examples/counter)** — everything you just ran.

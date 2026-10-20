@@ -6,7 +6,9 @@ The **latest minor release** is the only supported line. Today that is
 **`2.14.x`**: fixes land on the newest patch of the newest minor, and there
 are no backports to earlier minors. Versions move in lockstep across every
 crate, the tag, the tarballs and the image — see
-[the semver policy](docs/reference/semver-policy.md).
+[the semver policy](docs/reference/semver-policy.md). Reaching the supported
+line may require stepping through intermediate releases (one wire level at a
+time); see [Upgrade a cluster](docs/how-to/upgrade-a-cluster.md).
 
 | Version | Supported |
 |---|---|

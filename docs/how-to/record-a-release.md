@@ -95,25 +95,31 @@ failure a ledger exists to catch.
 
 ## What this does not buy you
 
-**Rollback is still a cluster-wide event, not a release switch.** The
-node↔node wire and the `cnc.dat` page layout are
-[flag days](../reference/semver-policy.md): all nodes run the same version or
-the cluster stalls rather than making unsound decisions. So "roll back to the
-previous release" means stopping every node and starting the previous
-binaries together, exactly as
-[Upgrade a cluster](upgrade-a-cluster.md) describes — there is no per-node
-release pointer to flip, and a ledger does not create one. The ledger tells
-you *what* to go back to; it does not make going back cheaper.
+**Rollback is still a cluster event, not a release switch.** Since `2.15.0`
+a release within one wire level of the cluster's rolls, and rolls back, one
+host at a time until the level is raised (manual mode,
+`wire_raise = "manual"`, keeps that window open); after the raise, going back
+means restoring a pre-upgrade backup on every node, as
+[Upgrade a cluster](upgrade-a-cluster.md#rolling-upgrades-since-2150)
+describes. A release that is a [flag day](../reference/semver-policy.md) goes
+back the way it went forward: every node stopped, the previous binaries
+started together. There is no per-node release pointer to flip, and a ledger does not
+create one. The ledger tells you *what* to go back to; it does not make going
+back cheaper.
 
-This constraint is structural and was chosen deliberately: a rolling deploy
-that tolerated mixed versions would have to accept a `0.4.0` peer's
-unattested durable report, and that trade was refused on safety grounds. See
+Through `2.14.0` this constraint was absolute and chosen deliberately: a
+rolling deploy that tolerated mixed versions would have had to accept a
+`0.4.0` peer's unattested durable report, and that trade was refused on
+safety grounds. The committed wire level is how mixed versions became safe:
+every node encodes at the committed level and refuses an out-of-range peer by
+name ([the wire level, explained](../notes/uc2-wire-level-explained.md)). See
 [the twelve-factor assessment](../notes/uc2-twelve-factor-assessment.md) for
 the full reasoning on factors 5 and 10.
 
 ## Related
 
-- [Upgrade a cluster](upgrade-a-cluster.md) — the flag-day procedure itself.
+- [Upgrade a cluster](upgrade-a-cluster.md) — the rolling procedure and the
+  stop-all (flag-day) procedure.
 - [Cut a release](cut-a-release.md) — the maintainer side: tagging, signing,
   the ordered crates.io publish.
 - [Configuration § Environment overrides](../reference/configuration.md#environment-overrides)

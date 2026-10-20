@@ -173,8 +173,8 @@ check (a set difference is a positional difference). `version` is compared
 per row only when **both** sides are non-zero; a mismatch refuses by name
 with both versions and counts the new `uc2_snapshot_refused_version_total`.
 A 0.6.0 sender's body (34 B fixed) is shorter than 120 B, so the receiver
-drops it by the same length check that drops a 0.5.0 body today — the
-standing flag-day rule: a mixed cluster stalls a joiner rather than
+drops it by the same length check that drops a 0.5.0 body — the
+pre-`2.15.0` flag-day rule: a mixed cluster stalls a joiner rather than
 installing a wrong or half-checked artifact. Artifacts still route by row,
 unchanged.
 

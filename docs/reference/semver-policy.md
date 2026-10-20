@@ -212,7 +212,7 @@ Also outside the promise:
   crates.io. (`uc_diffreplay` is **not** in this list — it is the fourteenth
   published crate, because an application's own CI runs its driver.)
 
-## The wire and the cnc page are flag-day, not semver
+## The wire and the cnc page: levels and flag days, not semver
 
 Two version numbers are deliberately *outside* this policy, because semver's
 "a minor bump is safe" contract is the wrong promise for them:

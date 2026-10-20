@@ -675,6 +675,9 @@ rolling path. Rolling application upgrades — two versions of one row running
 on purpose, gated by a committed feature level — are
 [#66](https://github.com/PeterKnego/ultima_cluster/issues/66), which builds on
 this floor by relaxing "must be the same line" to "at or above the level".
+The node binary already rolls since `2.15.0`
+([the committed wire level](../notes/uc2-wire-level-explained.md), #31), and
+#66 reuses that committed-level shape per row.
 
 The mixed-version hazard was not hypothetical — the builder dogfood reproduced
 it in `examples/kv/tests/cluster.rs` (`upgrade_v1_to_v2_flag_day` shows the

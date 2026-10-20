@@ -51,9 +51,10 @@ preconditions worth reading before you start.
   grow, shrink, replace a machine, or retire the current leader.
 - [Encrypt traffic between nodes](encrypt-node-traffic.md) — a flag day, not a
   rolling change: the whole cluster flips together.
-- [Upgrade a cluster](upgrade-a-cluster.md) — a scripted flag-day binary
-  upgrade with a measured downtime number; a different flag day from
-  encryption's, driven by wire protocol 0.5.0's flag-day posture.
+- [Upgrade a cluster](upgrade-a-cluster.md) — one node at a time under load
+  for a release within one wire level (since `2.15.0`), or the scripted
+  stop-all flag day with a measured downtime number for `2.15.0` itself and
+  wire majors.
 - [Record a release](record-a-release.md) — pinning what is actually running:
   the build's digest, the config file's SHA-256 as the node itself reports it,
   and the environment overrides in effect. Also why a ledger cannot make

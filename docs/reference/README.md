@@ -48,8 +48,9 @@ What a service binary is written against.
 ## Compatibility
 
 - [Versioning and the semver promise](semver-policy.md) — the lockstep version
-  number, exactly which items are covered by semver and which are not, why the
-  wire protocol and the cnc page are flag-day instead, the MSRV rule, and the
+  number, exactly which items are covered by semver and which are not, how the
+  wire protocol and the cnc page version instead (a wire minor is a level that
+  rolls; majors are flag days), the MSRV rule, and the
   one-way door in the two-tier state-machine contract.
 
 ## Internal surfaces

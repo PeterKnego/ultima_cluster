@@ -100,7 +100,9 @@ tells you how to use snapshots with purge.
 
 | Command | What it does | Why you use it |
 |---|---|---|
-| `scripts/uc2_flag_day.sh --hosts … --upgrade-cmd '…' --yes-traffic-stopped` | Stops all nodes, runs your upgrade command on each host, starts all nodes and prints the downtime. If a step fails, it starts all nodes again. | Upgrade UC across a change of wire or cnc version. [Upgrade a cluster](../how-to/upgrade-a-cluster.md) |
+| `scripts/uc2_flag_day.sh --hosts … --upgrade-cmd '…' --yes-traffic-stopped` | Stops all nodes, runs your upgrade command on each host, starts all nodes and prints the downtime. If a step fails, it starts all nodes again. | Upgrade UC across a wire major, a cnc major, or a release whose notes call it a flag day (including `2.14.0` → `2.15.0`); a wire minor within one level rolls instead. [Upgrade a cluster](../how-to/upgrade-a-cluster.md) |
+| [`uc2ctl wire show …`](uc2ctl.md#wire-show) | Prints the committed wire level, this binary's range and the raise mode; on the leader, each member's report and the raise verdict. | Check that a rolling upgrade is permitted, and see what holds the raise. [Rolling upgrades since 2.15.0](../how-to/upgrade-a-cluster.md#rolling-upgrades-since-2150) |
+| [`uc2ctl wire raise …`](uc2ctl.md#wire-raise) | Raises the committed wire level by one, once every member reports it can follow (admin op 12, leader-only). | End a rolling upgrade in manual mode (`wire_raise = "manual"` in the settings file). It is the point of no return. |
 | [`uc2ctl upgrade pin … --row <R> --to <VER> --origin <P>`](uc2ctl.md#upgrade-pin) | Records on the log that row R changes to version VER from the snapshot at P. | Make each instance of the new FSM version start from the same state. [Upgrade an application](../how-to/upgrade-an-application.md) |
 
 ### 2.7 Back up and recover

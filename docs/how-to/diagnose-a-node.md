@@ -349,6 +349,16 @@ rejoins from the snapshot floor. Its `wipes()` counter increments.
 This is automatic and safe. It is not a fault to investigate, though a node
 doing it repeatedly is worth understanding.
 
+## My node just fail-stopped with a `WireLevel*` fault
+
+A node that exits 1 naming `WireLevelAboveBinary` or `WireLevelBelowBinary`
+(since `2.15.0`) is on the wrong binary for the cluster's committed wire
+level: no wipe — install the release the message names, then start it. A
+node that never joins, waits in `NodeBooting` and prints `wire_refused` lines
+is two or more levels away from its peers. Both, and the sibling
+`ClusterRecordUndecodable`, are in
+[the runbook's "When something is wrong"](../ops/uc2-runbook.md#when-something-is-wrong).
+
 ## If crypto is enabled
 
 Check the drop counters, and judge by the followers rather than the leader —
