@@ -18,7 +18,7 @@ node.
   (`start_with_snapshots()` is gone), take one full instant first, stop every
   node before starting any, and upgrade gateways and remote clients together;
   no snapshot directory needs clearing.
-  → [Upgrade a cluster § 2.13.0 to 2.14.0](docs/how-to/upgrade-a-cluster.md#upgrading-from-2130-to-2140) ·
+  → [Upgrade a cluster § 2.13.0 to 2.14.0](docs/how-to/upgrade-from-an-older-release.md#upgrading-from-2130-to-2140) ·
   [Semver policy](docs/reference/semver-policy.md#snapshots-become-mandatory-67)
 - **A row never runs two versions.** Every row has a committed running
   version, a service off that line is refused at attach, and an old service
@@ -95,7 +95,7 @@ enforces instead of a flag day run from memory.
 - **Upgrade flag day:** wire `0.8.0` → `0.9.0` and cnc `3.2` → `3.3` — stop
   every node before starting any, and clear `snapshots/<row>/` once per node
   (a purge-on cluster with an in-memory state machine cannot yet).
-  → [Upgrade a cluster § 2.13.0](docs/how-to/upgrade-a-cluster.md#wire--cnc-change-in-2130-upgrade-pins-and-snapshot-reports-090-cnc-33)
+  → [Upgrade a cluster § 2.13.0](docs/how-to/upgrade-from-an-older-release.md#wire--cnc-change-in-2130-upgrade-pins-and-snapshot-reports-090-cnc-33)
 - **Upgrade pins.** `uc2ctl upgrade pin` commits a row's upgrade origin to the
   log, so every instance of the new version starts from the same snapshot.
   → [`uc2ctl` § `upgrade pin`](docs/reference/uc2ctl.md#upgrade-pin) ·
@@ -152,7 +152,7 @@ no longer freezes on a backward wall-clock step.
 - **Upgrade flag day:** wire `0.7.0` → `0.8.0`, cnc `3.1` → `3.2` — stop every
   node before starting any, and delete `max_payload` from every `node.toml`
   first.
-  → [Upgrade a cluster § 2.12.0](docs/how-to/upgrade-a-cluster.md#wire--cnc-change-in-2120-jumbo-frames-080-cnc-32)
+  → [Upgrade a cluster § 2.12.0](docs/how-to/upgrade-from-an-older-release.md#wire--cnc-change-in-2120-jumbo-frames-080-cnc-32)
 - **Jumbo frames.** Nodes probe their paths and commit the largest datagram
   every member carries, so a 9001 B path carries 8896 B commands instead of
   1344 B; the raise is one-way, and a node host must now run Linux.
@@ -182,7 +182,7 @@ become coordinated instants.
 - **Upgrade flag day:** wire `0.6.0` → `0.7.0`, cnc `3.0` → `3.1`, with a
   same-length header relayout — stop every node before starting any, and make
   three `node.toml` edits on every host.
-  → [Upgrade a cluster § 2.11](docs/how-to/upgrade-a-cluster.md#wire--cnc-change-in-2110-fsm-identity-log-time-and-the-cluster-fsm-070-cnc-31)
+  → [Upgrade a cluster § 2.11](docs/how-to/upgrade-from-an-older-release.md#wire--cnc-change-in-2110-fsm-identity-log-time-and-the-cluster-fsm-070-cnc-31)
 - **FSM identity.** A state machine declares `const NAME` and `VERSION` in
   code, and a mismatched cluster is refused by name; `ApplyCtx` replaces the
   bare `position` argument and `IdGen` derives deterministic ids.
@@ -220,7 +220,7 @@ Operator-facing hygiene plus a memory-ordering fix a loom model found.
 [Full record](docs/releases.md#v2100--2026-08-31--one-log-stream-config-from-the-environment-and-a-weak-memory-fix).
 
 - **Upgrade:** a plain binary swap, but the daemons no longer write to stdout.
-  → [Upgrade a cluster § 2.10.0](docs/how-to/upgrade-a-cluster.md#stdout-is-now-empty-2100)
+  → [Upgrade a cluster § 2.10.0](docs/how-to/upgrade-from-an-older-release.md#stdout-is-now-empty-2100)
 - **One log stream.** Every daemon record is a JSON line on stderr, and stdout
   is empty.
   → [Monitor a cluster § Structured records](docs/how-to/monitor-a-cluster.md#structured-records)
@@ -293,7 +293,7 @@ Up to eight state machines per node, fed by one replicated log.
 
 - **Upgrade flag day:** wire `0.6.0`, cnc `3.0`; a single-service config needs
   no change.
-  → [Upgrade a cluster](docs/how-to/upgrade-a-cluster.md#wire-change-in-280-snap_begin-carries-every-fsms-snapshot-060)
+  → [Upgrade a cluster](docs/how-to/upgrade-from-an-older-release.md#wire-change-in-280-snap_begin-carries-every-fsms-snapshot-060)
 - **`[services]`.** Declare N FSMs, kept within a byte bound of each other or
   in lockstep.
   → [Configuration § `[services]`](docs/reference/configuration.md#services)
@@ -318,7 +318,7 @@ under oversubscription.
 
 - **Upgrade:** a same-host restart (node, service, gateway and local clients
   together), not a cluster flag day.
-  → [Upgrade a cluster](docs/how-to/upgrade-a-cluster.md)
+  → [Upgrade from a release before 2.15.0 § 2.7.0](docs/how-to/upgrade-from-an-older-release.md#ring-format-change-in-270-restart-a-hosts-processes-together)
 - **A rebuilt remote client.** The same blocking API over an `Engine`-shaped
   split, removing a 7× bottleneck.
   → [Remote protocol](docs/reference/remote-protocol.md)
@@ -341,7 +341,7 @@ The cluster becomes adoptable by someone who is not its author.
 
 - **Upgrade:** add `[crypto]` and `[admin]` sections to every `node.toml`, or
   the node refuses to start by name.
-  → [Upgrade a cluster](docs/how-to/upgrade-a-cluster.md)
+  → [Upgrade from a release before 2.15.0 § v2.6.0](docs/how-to/upgrade-from-an-older-release.md#config-choices-added-in-v260-cryptoenabled-and-admin)
 - **Two-tier state-machine contract.** A raw bytes-in/bytes-out tier under the
   typed one, for services that want to skip the codec.
   → [State-machine contract](docs/reference/state-machine-contract.md) ·
@@ -385,7 +385,7 @@ Back up, restore, recover from quorum loss and upgrade on a measured schedule.
   cannot persist.
   → [Monitor a cluster](docs/how-to/monitor-a-cluster.md)
 - **Measured flag-day upgrades** with `scripts/uc2_flag_day.sh`.
-  → [Upgrade a cluster](docs/how-to/upgrade-a-cluster.md)
+  → [Upgrade a cluster § Stop-all upgrades](docs/how-to/upgrade-a-cluster.md#stop-all-upgrades-the-flag-day)
 - **Fixed:** four pre-existing journal-layer defects.
   → [M11 explained § 5](docs/notes/uc2-m11-survivable-cluster-explained.md)
 - **Performance:** fleet flag-day downtime 14.0 s and 14.7 s against a 60 s bar.
@@ -415,7 +415,7 @@ The first tag since `v2.1.0`, shipping everything landed in between.
 [Full record](docs/releases.md#v230--2026-08-19--m9-deployable-node).
 
 - **Upgrade flag day:** wire `0.5.0` — upgrade all nodes together.
-  → [Upgrade a cluster](docs/how-to/upgrade-a-cluster.md)
+  → [Upgrade from a release before 2.15.0](docs/how-to/upgrade-from-an-older-release.md)
 - **A `uc2-node` daemon** with a TOML config, named startup refusals and
   systemd units.
   → [Run a cluster](docs/how-to/run-a-cluster.md) ·

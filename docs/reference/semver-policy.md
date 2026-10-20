@@ -337,7 +337,7 @@ reads. `ULTSNAP1` (16 bytes, no version field) is refused **by name**, never
 decoded as version 0, so **`snapshots/<row>/` is cleared once per node** during
 the upgrade window. `snapshots/cluster/` is untouched. The precondition is
 stated in [Upgrade a
-cluster](../how-to/upgrade-a-cluster.md#wire--cnc-change-in-2130-upgrade-pins-and-snapshot-reports-090-cnc-33):
+cluster](../how-to/upgrade-from-an-older-release.md#wire--cnc-change-in-2130-upgrade-pins-and-snapshot-reports-090-cnc-33):
 the row must be able to rebuild what was deleted, which means a durable state
 machine or a journal that still holds genesis. A cluster running purge with an
 in-memory state machine can do neither.
@@ -418,7 +418,7 @@ node.
 **Cluster image 3 → 4, no wipe.** The artifact gains a trailing
 length-prefixed catalog blob; a v1–v3 image is still **read**, with the
 blob empty (the `Empty` state, [Upgrade a
-cluster](../how-to/upgrade-a-cluster.md#wire-change-after-0100-the-snapshot-catalog-0110)).
+cluster](../how-to/upgrade-from-an-older-release.md#wire-change-after-0100-the-snapshot-catalog-0110)).
 `snapshots/<row>/` and `snapshots/cluster/` are both untouched.
 
 **What changes for an operator.** The purge floor and every install source

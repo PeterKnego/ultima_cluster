@@ -318,7 +318,7 @@ documentary. A mixed 0.5.0/0.6.0 cluster therefore replicates and elects
 normally — which is exactly what makes it dangerous, because the damage is
 confined to snapshot sessions and surfaces later, when a learner joins or a
 node falls below the purge floor. Stop every node, swap, start every node:
-[Upgrade a cluster § Wire change in 2.8.0](../how-to/upgrade-a-cluster.md#wire-change-in-280-snap_begin-carries-every-fsms-snapshot-060).
+[Upgrade a cluster § Wire change in 2.8.0](../how-to/upgrade-from-an-older-release.md#wire-change-in-280-snap_begin-carries-every-fsms-snapshot-060).
 
 ## Observing it
 

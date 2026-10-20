@@ -54,10 +54,10 @@ between, and two small pre-cut PRs,
 
 Every item below is inside the one stop-every-node window; the per-feature
 sections say why each is unsound to mix.
-[Upgrade a cluster § Upgrading from 2.13.0 to 2.14.0](how-to/upgrade-a-cluster.md#upgrading-from-2130-to-2140)
+[Upgrade a cluster § Upgrading from 2.13.0 to 2.14.0](how-to/upgrade-from-an-older-release.md#upgrading-from-2130-to-2140)
 is the procedure; its per-change sections,
-[`0.10.0`](how-to/upgrade-a-cluster.md#wire--cnc-change-after-2130-the-row-running-version-0100-cnc-34)
-and [`0.11.0`](how-to/upgrade-a-cluster.md#wire-change-after-0100-the-snapshot-catalog-0110),
+[`0.10.0`](how-to/upgrade-from-an-older-release.md#wire--cnc-change-after-2130-the-row-running-version-0100-cnc-34)
+and [`0.11.0`](how-to/upgrade-from-an-older-release.md#wire-change-after-0100-the-snapshot-catalog-0110),
 say why each step is there.
 
 - **Node↔node wire `0.11.0`.** `CLUSTER` kinds 6 `RowGenesis` and 7
@@ -1159,7 +1159,7 @@ without them would over-report a path — `set_dont_fragment` returns
 `io::ErrorKind::Unsupported` elsewhere and `Node::start_with` propagates it, so a
 macOS or BSD box can no longer run a `uc2-node` (the client and service crates
 are unaffected). Both are written up in
-[Upgrade a cluster § 2.12.0](how-to/upgrade-a-cluster.md#wire--cnc-change-in-2120-jumbo-frames-080-cnc-32).
+[Upgrade a cluster § 2.12.0](how-to/upgrade-from-an-older-release.md#wire--cnc-change-in-2120-jumbo-frames-080-cnc-32).
 
 **Seven spec errata, all recorded in the spec's two "as built" sections**, and
 three of them are the kind of thing an operator will otherwise read as a defect:

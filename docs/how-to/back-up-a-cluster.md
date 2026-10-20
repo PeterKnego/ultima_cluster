@@ -176,7 +176,7 @@ Verify:
    surface through this same `corrupt snapshot artifact` refusal path, named
    by their own error text. Moving a backup archive to `2.13.0` needs the
    same `snapshots/<row>/` wipe a live node needs
-   ([Upgrade a cluster § 2.13.0](upgrade-a-cluster.md#wire--cnc-change-in-2130-upgrade-pins-and-snapshot-reports-090-cnc-33)).
+   ([Upgrade a cluster § 2.13.0](upgrade-from-an-older-release.md#wire--cnc-change-in-2130-upgrade-pins-and-snapshot-reports-090-cnc-33)).
 6. Decodes the newest `snapshots/cluster/snap-<pos>.ultcluster` through the
    **same** image decoder a joiner installs it with — magic, image version,
    CRC32, every bounds check — so a verified artifact is one whose cluster

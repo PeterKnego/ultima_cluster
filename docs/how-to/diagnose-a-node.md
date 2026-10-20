@@ -299,7 +299,7 @@ it. The rings are volatile, so the restarted node starts clean — but
 because the ring file format changed in 2.7.0 too, every process
 attached to this host's instance directory (service, gateway, any shmem
 client) needs the node to be back up before it can reattach; see
-[the same-host restart rule](upgrade-a-cluster.md#ring-format-change-in-270-restart-a-hosts-processes-together).
+[the same-host restart rule](upgrade-a-cluster.md#the-per-host-rule-restart-a-hosts-processes-together).
 
 ## My node just fail-stopped with `IngressRingCorrupt`
 

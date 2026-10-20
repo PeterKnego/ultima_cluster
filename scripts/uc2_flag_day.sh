@@ -7,11 +7,13 @@
 # upgrade hook on every host -> start ALL nodes -> wait for one serving
 # leader -> print measured downtime.
 #
-# A cluster runs all-encrypted or all-cleartext, and (wire protocol 0.5.0) a
-# mixed-version cluster STALLS commits rather than making unsound ones — so
-# this is a flag day: every node stops, upgrades, and restarts together.
-# This script has no rolling/partial mode. Stop-all; for a rolling upgrade
-# since 2.15.0 (a release within one wire level of the cluster's) see
+# This is the STOP-ALL procedure: every node stops, upgrades, and restarts
+# together. It is what a wire major, a release whose notes call it a flag
+# day, and the 2.14.0 -> 2.15.0 step need; before 2.15.0 it was the only
+# procedure, because a mixed-version cluster stalled commits (wire 0.5.0) or
+# let its cluster FSM diverge in silence (0.8.0 on). This script has no
+# rolling/partial mode. For a rolling upgrade since 2.15.0 (a release within
+# one wire level of the cluster's) see
 # docs/how-to/upgrade-a-cluster.md § Rolling upgrades since 2.15.0.
 #
 # The ABORT PATH IS LOAD-BEARING: once nodes are stopped, any failure this
