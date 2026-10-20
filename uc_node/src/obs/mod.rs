@@ -142,6 +142,12 @@ pub struct ObsSources {
     /// cumulative per TERM-run on this node, not cluster-wide: a reader sums
     /// across the fleet. The ops-side view of the spec §8 developer warning.
     pub commands_over_standard: Arc<AtomicU64>,
+    /// #171: client command (`MESSAGE`) frames this node has APPENDED as
+    /// leader (`uc2_frames_appended_total`), added once per consensus pass.
+    /// Leader-only by construction, like `commands_over_standard`: a reader
+    /// sums across the fleet. `rate()` of it is commands/s at the head of the
+    /// pipeline; `uc_service_frames_applied_total` is the tail.
+    pub frames_appended: Arc<AtomicU64>,
     pub reports_unattested: Arc<AtomicU64>,
     pub reports_implausible: Arc<AtomicU64>,
     pub crypto_handshake_failures: Arc<AtomicU64>,
@@ -286,6 +292,7 @@ impl ObsSources {
             )),
             probe: uc_net::probe::ProbeTable::new(uc_net::probe::ProbeCadence::default()),
             commands_over_standard: Arc::new(AtomicU64::new(0)),
+            frames_appended: Arc::new(AtomicU64::new(0)),
             reports_unattested: Arc::new(AtomicU64::new(0)),
             reports_implausible: Arc::new(AtomicU64::new(0)),
             crypto_handshake_failures: Arc::new(AtomicU64::new(0)),

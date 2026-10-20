@@ -567,6 +567,13 @@ pub(crate) fn apply_cycle<S: RawStateMachine>(st: &mut ApplyState<S>) -> bool {
                 // R13: the start of a version record the agent has not
                 // applied yet — the batch ends there, see below.
                 let mut pending_at: Option<u64> = None;
+                // #171: MESSAGE frames this batch applied — a local, stored
+                // to the slot once per batch (one frame in lockstep, where
+                // `one_frame` ends every batch after one frame). The local
+                // spills across `sm.apply`, so it costs a stack add per
+                // applied frame; no already-held count could replace it (the
+                // egress record count is leader-only and best-effort).
+                let mut batch_applied: u64 = 0;
                 for (pos, hdr, payload) in frames {
                     // PADDING, NEW_TERM, CONFIG (and any future type that is
                     // neither MESSAGE nor a TIMER for THIS row), and anything
@@ -591,6 +598,7 @@ pub(crate) fn apply_cycle<S: RawStateMachine>(st: &mut ApplyState<S>) -> bool {
                         st.resp_buf.clear();
                         ctx.rebind(pos, hdr.time_ns, hdr.leadership_term_id);
                         sm.apply(&mut ctx, payload, &mut st.resp_buf);
+                        batch_applied += 1;
                         #[cfg(feature = "apply-profile")]
                         let t1 = profile::now();
                         if is_leader {
@@ -687,6 +695,14 @@ pub(crate) fn apply_cycle<S: RawStateMachine>(st: &mut ApplyState<S>) -> bool {
                     }
                 }
                 drop(sm);
+                // #171: one store per batch (one frame in lockstep), a plain
+                // load + store, no atomic RMW — ahead of the R13 early exit below
+                // so frames applied before a pending version record count.
+                if batch_applied != 0 {
+                    crate::attach::slot(&st.cnc, st.service_id)
+                        .lag_waits
+                        .add_frames_applied(batch_applied);
+                }
                 #[cfg(feature = "apply-profile")]
                 {
                     profile::BATCH.fetch_add(
@@ -3064,6 +3080,92 @@ mod tests {
         // ... and that second episode, too, counts once however long it lasts.
         assert!(!super::apply_cycle(&mut st));
         assert_eq!(waits(&cnc), 2, "still one episode");
+    }
+
+    /// #171: the slot's `frames_applied` word advances by exactly the number
+    /// of `MESSAGE` frames a pass applied — stored once per batch, carried
+    /// across passes, and not moved by a pass that applies nothing.
+    #[test]
+    fn an_apply_pass_advances_frames_applied_by_the_frames_it_applied() {
+        let dir = scratch();
+        let cnc = page(0x1234);
+        let buffer = std::sync::Arc::new(uc_log::buffer::LogBuffer::new(
+            uc_log::region::Region::heap_zeroed(CAP as usize),
+            std::sync::Arc::clone(&cnc),
+            256,
+        ));
+        let mut appender = uc_log::buffer::Appender::new(std::sync::Arc::clone(&buffer), 1, 0);
+        for i in 0..5u32 {
+            appender.append(1, i, &[i as u8; 64]).unwrap();
+        }
+        cnc.counters().durable.store_release(5 * FRAME);
+        cnc.counters().commit.store_release(5 * FRAME);
+
+        let egress_ring =
+            uc_protocol::ring::BroadcastRing::create(&dir.path().join("egress.bc"), 1 << 16, 1024)
+                .unwrap();
+        let (_qp, svc_query) =
+            uc_protocol::ring::SpscRing::create(&dir.path().join("svc_query.ring"), 1 << 16, 1024)
+                .unwrap()
+                .into_split();
+        let (svc_sched, _sp) =
+            uc_protocol::ring::SpscRing::create(&dir.path().join("svc_sched.ring"), 1 << 16, 1024)
+                .unwrap()
+                .into_split();
+        let mut st = super::ApplyState {
+            poisoned: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            follower: uc_log::reader::LogFollower::new(std::sync::Arc::clone(&buffer), 0),
+            sm: Arc::new(std::sync::Mutex::new(CountSm::default())),
+            cnc: Arc::clone(&cnc),
+            egress: crate::egress::Egress::new(egress_ring.producer()),
+            resp_buf: Vec::new(),
+            journal_dir: dir.path().join("journal"),
+            svc_query,
+            svc_sched,
+            announce_pending: false,
+            was_leader: false,
+            pending: std::collections::HashMap::new(),
+            table_last: std::collections::HashMap::new(),
+            needs_replay: false,
+            replay_wait: None,
+            replay_stalled: None,
+            instance_id: 0x1234,
+            instance_mismatch_streak: 0,
+            my_epoch: 1,
+            service_id: 0,
+            pin: None,
+            attach_record_pos: 0,
+            lag_mode: crate::lag::LagMode::Off,
+            declared: 0,
+            lag_waiting: false,
+            snapshot_trigger: None,
+            snapshot_restore: None,
+        };
+        let frames = |c: &CncPage| c.service_slot(0).lag_waits.frames_applied();
+
+        assert_eq!(frames(&cnc), 0, "nothing counted before the first pass");
+        assert!(super::apply_cycle(&mut st));
+        assert_eq!(st.sm.lock().unwrap().applies, 5);
+        assert_eq!(frames(&cnc), 5, "one pass, five MESSAGE frames");
+        assert_eq!(
+            cnc.service_slot(0).lag_waits.load_acquire(),
+            0,
+            "the line's other word, lag_waits, is untouched"
+        );
+
+        // An idle pass applies nothing and moves nothing.
+        assert!(!super::apply_cycle(&mut st));
+        assert_eq!(frames(&cnc), 5);
+
+        // The next pass adds to the word, never overwrites it.
+        for i in 5..8u32 {
+            appender.append(1, i, &[i as u8; 64]).unwrap();
+        }
+        cnc.counters().durable.store_release(8 * FRAME);
+        cnc.counters().commit.store_release(8 * FRAME);
+        assert!(super::apply_cycle(&mut st));
+        assert_eq!(st.sm.lock().unwrap().applies, 8);
+        assert_eq!(frames(&cnc), 8, "5 + 3 across two passes");
     }
 
     // ------------------- coordinated snapshot instants (spec §5.2, §5.7)

@@ -32,7 +32,7 @@
 //!       fields land)
 //! 4032  services_declared / fsm_lag_bytes (node, boot-once)
 //! 4096  ServiceSlot[8] (per service: status, applied, epoch, output_completed,
-//!       snapshot_pos, heartbeat_ns, lag_waits, reserved) 8 × 512 B
+//!       snapshot_pos, heartbeat_ns, lag_waits + frames_applied, reserved) 8 × 512 B
 //! ```
 //!
 //! **crc split (deliberate):** this module is `core`-only (no_std-friendly —
@@ -400,6 +400,7 @@ const _: () = assert!(
 //   +272 start_set_version u64 (low 32 = packed version that built the artifact)  writer: node (consensus agent)
 //   +320 heartbeat_ns    u64 unix ns                           writer: service apply agent
 //   +384 lag_waits       u64 count                             writer: service apply agent
+//   +392 frames_applied  u64 count (cnc 3.5, #171)            writer: service apply agent
 //   +448 name            [u8; 32] NUL-padded FSM name          writer: node (init, boot-once)
 //   +480 identity_hash   u64 FNV-1a 64 of the name             writer: node (init, boot-once)
 //   +488 timers_pending  u64 pending-timer count for this row  writer: node (consensus agent)
@@ -416,6 +417,14 @@ pub const CNC_SVC_OFF_SNAPSHOT_POS: usize = 256;
 pub const CNC_SVC_OFF_HEARTBEAT_NS: usize = 320;
 pub const CNC_SVC_OFF_LAG_WAITS: usize = 384;
 pub const CNC_SVC_OFF_RESERVED: usize = 448;
+/// #171 (cnc 3.5, folded in before release): `MESSAGE` frames this row's
+/// apply loop has applied on the live path — the word after `lag_waits` on
+/// line 6, same writer (the service apply agent). Stored ONCE per batch
+/// from a count the batch keeps in a local (one frame per batch in lockstep); journal replay
+/// is not counted. Reader: `/metrics` (`uc_service_frames_applied_total`).
+pub const CNC_SVC_OFF_FRAMES_APPLIED: usize = 392;
+const _: () = assert!(CNC_SVC_OFF_FRAMES_APPLIED == CNC_SVC_OFF_LAG_WAITS + 8);
+const _: () = assert!(CNC_SVC_OFF_FRAMES_APPLIED + 8 <= CNC_SVC_OFF_RESERVED);
 /// `status` bit 8: the owning service process is attached (cleared on a clean
 /// detach; a crashed service leaves it set and its heartbeat ages instead).
 pub const CNC_SVC_STATUS_ATTACHED: u64 = 1 << 8;
@@ -987,6 +996,8 @@ mod tests {
         assert_eq!(CNC_SVC_OFF_SNAPSHOT_POS, 256);
         assert_eq!(CNC_SVC_OFF_HEARTBEAT_NS, 320);
         assert_eq!(CNC_SVC_OFF_LAG_WAITS, 384);
+        assert_eq!(CNC_SVC_OFF_FRAMES_APPLIED, 392);
+        assert_eq!(CNC_SVC_OFF_FRAMES_APPLIED, CNC_SVC_OFF_LAG_WAITS + 8);
         assert_eq!(CNC_SVC_OFF_RESERVED, 448);
         assert_eq!(
             CNC_OFF_SERVICE_SLOTS + CNC_MAX_SERVICES * CNC_SERVICE_SLOT_STRIDE,

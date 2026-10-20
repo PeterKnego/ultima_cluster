@@ -51,6 +51,8 @@ pub const CONTRACT_SERIES: &[&str] = &[
     "uc2_free_disk_bytes",
     "uc2_agent_alive",
     "uc2_append_bytes",
+    // #171: the frame (command) count beside the byte position.
+    "uc2_frames_appended_total",
     "uc2_durable_bytes",
     "uc2_sent_bytes",
     "uc2_commit_bytes",
@@ -59,6 +61,8 @@ pub const CONTRACT_SERIES: &[&str] = &[
     // sample per declared row in the SAME family block. Task 7 (spec §4.5)
     // added the identity-hash and version gauges.
     "uc_service_applied_bytes",
+    // #171: frames applied per row, beside the applied byte position.
+    "uc_service_frames_applied_total",
     "uc_service_epoch",
     "uc_service_snapshot_pos_bytes",
     "uc_service_heartbeat_age_seconds",
@@ -359,6 +363,9 @@ struct ServiceRow {
     /// racy snapshot, not an error.
     lag_bytes: u64,
     lag_waits: u64,
+    /// #171: `MESSAGE` frames this row applied on the live path (line 6's
+    /// second word, service-written once per batch).
+    frames_applied: u64,
     heartbeat_age: f64,
     /// FNV-1a 64 of the row's declared name (line 7, written once at boot).
     identity_hash: u64,
@@ -475,6 +482,7 @@ fn service_rows(s: &ObsSources, commit: u64, now: u64) -> Vec<ServiceRow> {
             snapshot_pos: slot.snapshot_pos.load_acquire(),
             lag_bytes: commit.saturating_sub(applied),
             lag_waits: slot.lag_waits.load_acquire(),
+            frames_applied: slot.lag_waits.frames_applied(),
             heartbeat_age: now.saturating_sub(hb) as f64 / 1e9,
             identity_hash: slot.identity.hash(),
             version: slot.status.version() as u64,
@@ -509,7 +517,33 @@ fn push_gauge_with_services(
     rows: &[ServiceRow],
     pick: impl Fn(&ServiceRow) -> u64,
 ) {
-    push_family_header(out, name, help, "gauge");
+    push_with_services(out, name, help, "gauge", aggregate, rows, pick);
+}
+
+/// [`push_gauge_with_services`] for a counter family (#171,
+/// `uc_service_frames_applied_total`): the same bare aggregate plus one
+/// labeled sample per declared FSM, typed `counter`.
+fn push_counter_with_services(
+    out: &mut String,
+    name: &str,
+    help: &str,
+    aggregate: u64,
+    rows: &[ServiceRow],
+    pick: impl Fn(&ServiceRow) -> u64,
+) {
+    push_with_services(out, name, help, "counter", aggregate, rows, pick);
+}
+
+fn push_with_services(
+    out: &mut String,
+    name: &str,
+    help: &str,
+    ty: &str,
+    aggregate: u64,
+    rows: &[ServiceRow],
+    pick: impl Fn(&ServiceRow) -> u64,
+) {
+    push_family_header(out, name, help, ty);
     out.push_str(name);
     out.push(' ');
     out.push_str(&aggregate.to_string());
@@ -840,6 +874,14 @@ fn push_service_families(out: &mut String, s: &ObsSources, commit: u64, now: u64
         service.service_applied.load_acquire(),
         &rows,
         |r| r.applied,
+    );
+    push_counter_with_services(
+        out,
+        "uc_service_frames_applied_total",
+        "MESSAGE frames this FSM's apply loop applied on the live path, stored once per batch (journal replay after a restart or overrun is not counted). rate() is commands/s at the tail of the pipeline; uc2_frames_appended_total is the head. Unlabeled = FSM 0's — every row of a broadcast log applies every command, so the aggregate is this node's command count, not a sum.",
+        s.cnc.service_slot(0).lag_waits.frames_applied(),
+        &rows,
+        |r| r.frames_applied,
     );
     push_gauge_with_services(
         out,
@@ -1539,6 +1581,12 @@ pub fn render_prometheus(s: &ObsSources) -> String {
         "Local append counter.",
         append,
     );
+    push_counter(
+        &mut out,
+        "uc2_frames_appended_total",
+        "Client command (MESSAGE) frames this node appended as leader, added once per consensus pass. rate() is commands/s at the head of the pipeline; uc_service_frames_applied_total is the tail. Leader-only by construction, so read it summed across the fleet.",
+        s.frames_appended.load(Ordering::Relaxed),
+    );
     push_gauge(
         &mut out,
         "uc2_durable_bytes",
@@ -2181,6 +2229,7 @@ mod tests {
             cluster_view: test_cluster_view(),
             probe: uc_net::probe::ProbeTable::new(uc_net::probe::ProbeCadence::default()),
             commands_over_standard: Arc::new(AtomicU64::new(0)),
+            frames_appended: Arc::new(AtomicU64::new(0)),
             reports_unattested: Arc::new(AtomicU64::new(0)),
             reports_implausible: Arc::new(AtomicU64::new(0)),
             crypto_handshake_failures: Arc::new(AtomicU64::new(0)),
@@ -2500,7 +2549,7 @@ mod tests {
     fn the_contract_has_the_number_of_families_the_docs_state() {
         assert_eq!(
             CONTRACT_SERIES.len(),
-            159,
+            161,
             "if this is intentional, update the family count in \
              docs/how-to/monitor-a-cluster.md in the same commit"
         );
@@ -3175,6 +3224,7 @@ mod tests {
             cluster_view: test_cluster_view(),
             probe: uc_net::probe::ProbeTable::new(uc_net::probe::ProbeCadence::default()),
             commands_over_standard: Arc::new(AtomicU64::new(0)),
+            frames_appended: Arc::new(AtomicU64::new(0)),
             reports_unattested: Arc::new(AtomicU64::new(0)),
             reports_implausible: Arc::new(AtomicU64::new(0)),
             crypto_handshake_failures: Arc::new(AtomicU64::new(0)),
@@ -3298,6 +3348,7 @@ mod tests {
             cluster_view: test_cluster_view(),
             probe: uc_net::probe::ProbeTable::new(uc_net::probe::ProbeCadence::default()),
             commands_over_standard: Arc::new(AtomicU64::new(0)),
+            frames_appended: Arc::new(AtomicU64::new(0)),
             reports_unattested: Arc::new(AtomicU64::new(0)),
             reports_implausible: Arc::new(AtomicU64::new(0)),
             crypto_handshake_failures: Arc::new(AtomicU64::new(0)),
@@ -3414,6 +3465,7 @@ mod tests {
             cluster_view: test_cluster_view(),
             probe: uc_net::probe::ProbeTable::new(uc_net::probe::ProbeCadence::default()),
             commands_over_standard: Arc::new(AtomicU64::new(0)),
+            frames_appended: Arc::new(AtomicU64::new(0)),
             reports_unattested: Arc::new(AtomicU64::new(0)),
             reports_implausible: Arc::new(AtomicU64::new(0)),
             crypto_handshake_failures: Arc::new(AtomicU64::new(0)),
@@ -3508,6 +3560,52 @@ mod tests {
         s.receiver.statuses_refused.fetch_add(9, Ordering::Relaxed);
         let text = render_prometheus(&s);
         assert!(text.contains("uc2_status_refused_total 9\n"), "{text}");
+    }
+
+    /// #171: the leader's appended-command count renders from its stats
+    /// cell as a bare counter.
+    #[test]
+    fn the_frames_appended_counter_renders_from_its_stats_cell() {
+        let s = synthetic_sources();
+        s.frames_appended.fetch_add(41, Ordering::Relaxed);
+        let text = render_prometheus(&s);
+        assert!(
+            text.contains("# TYPE uc2_frames_appended_total counter\n"),
+            "{text}"
+        );
+        assert!(text.contains("\nuc2_frames_appended_total 41\n"), "{text}");
+    }
+
+    /// #171: one labeled sample per declared row from the slot's
+    /// `frames_applied` word, plus the bare aggregate = FSM 0's.
+    #[test]
+    fn the_frames_applied_counter_renders_one_sample_per_declared_row() {
+        let s = synthetic_sources();
+        s.cnc.store_services_declared(0b101); // rows 0 and 2
+        s.cnc.service_slot(0).lag_waits.add_frames_applied(30);
+        s.cnc.service_slot(0).lag_waits.add_frames_applied(7);
+        s.cnc.service_slot(2).lag_waits.add_frames_applied(5);
+        let text = render_prometheus(&s);
+        assert!(
+            text.contains("# TYPE uc_service_frames_applied_total counter\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("\nuc_service_frames_applied_total 37\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains(r#"uc_service_frames_applied_total{service="",row="0"} 37"#),
+            "{text}"
+        );
+        assert!(
+            text.contains(r#"uc_service_frames_applied_total{service="",row="2"} 5"#),
+            "{text}"
+        );
+        assert!(
+            !text.contains(r#"uc_service_frames_applied_total{service="",row="1"}"#),
+            "an undeclared row has no sample: {text}"
+        );
     }
 
     #[test]

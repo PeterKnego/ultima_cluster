@@ -16,7 +16,7 @@ To read a live page while diagnosing a node, see
 | Offset | Size | Field | Notes |
 |---|---|---|---|
 | 0 | 8 B | magic | `UC2CNC\0\0` |
-| 8 | u32 LE | version | `CNC_V2_VERSION` = `(3 << 24) \| (1 << 16)` (cnc 3.1, FSM identity + log time, 2.11.0); `(3 << 24) \| (2 << 16)` (cnc 3.2, `payload_ceiling`, `2.12.0`); `(3 << 24) \| (3 << 16)` (cnc 3.3, `upgrade_origin`/`pinned_version`, FSM upgrade lifecycle); `(3 << 24) \| (4 << 16)` (cnc 3.4, `running_version`/`running_record_pos`/`cluster_applied`, the row running version, #33; the same 3.4 (`2.14.0`) also carries `write_reserve` (#78), the start-set pair (snapshot lifecycle) and the read-your-writes query flag); `(3 << 24) \| (5 << 16)` (cnc 3.5, `wire_level`/`wire_binary`/peer-slot `wire_max`, the wire level, `2.15.0`) |
+| 8 | u32 LE | version | `CNC_V2_VERSION` = `(3 << 24) \| (1 << 16)` (cnc 3.1, FSM identity + log time, 2.11.0); `(3 << 24) \| (2 << 16)` (cnc 3.2, `payload_ceiling`, `2.12.0`); `(3 << 24) \| (3 << 16)` (cnc 3.3, `upgrade_origin`/`pinned_version`, FSM upgrade lifecycle); `(3 << 24) \| (4 << 16)` (cnc 3.4, `running_version`/`running_record_pos`/`cluster_applied`, the row running version, #33; the same 3.4 (`2.14.0`) also carries `write_reserve` (#78), the start-set pair (snapshot lifecycle) and the read-your-writes query flag); `(3 << 24) \| (5 << 16)` (cnc 3.5, `wire_level`/`wire_binary`/peer-slot `wire_max`, the wire level, `2.15.0`; the same 3.5 also carries the service slot's `frames_applied`, #171) |
 | 12 | u32 LE | node id | |
 | 16 | u64 LE | instance id, low | changes on every node restart |
 | 24 | u64 LE | instance id, high | |
@@ -149,6 +149,7 @@ Fields within a slot (each its own 64 B line; most lines have one writer):
 | 272 | `start_set_version` — low 32: packed version that built it | node (consensus agent) |
 | 320 | `heartbeat_ns` | service apply agent |
 | 384 | `lag_waits` | service apply agent (one per wait episode at the lag barrier) |
+| 392 | `frames_applied` (line 6, word 1) — u64 count of `MESSAGE` frames this row applied on the live path (journal replay is not counted) | service apply agent, once per batch (one frame in lockstep) from a local count; the line's one writer, so a load of its own last store plus a `Release` store, no locked RMW — cnc 3.5, #171. **Not** zeroed at service attach: a restarted service continues the count (and under-counts by the frames its journal replay applied). A node restart recreates the page zeroed, so the word resets together with the `/metrics` process — an ordinary counter reset for `rate()`. `/metrics` exports it as `uc_service_frames_applied_total` |
 | 448 | `name` (line 7) — `[u8; 32]`, NUL-padded FSM name | **node**, at `CncPage::init` (boot, once) — cnc 3.1, FSM identity |
 | 480 | `identity_hash` (line 7) — u64, FNV-1a 64 of `name` | **node**, at `CncPage::init` (boot, once) — cnc 3.1, FSM identity |
 | 488 | `timers_pending` (line 7) — u64 count of this row's pending scheduled timers | **node** (consensus agent), republished every pass — cnc 3.1, log time. Since the cluster FSM (2.11.0) the timer heap is **leader-only**, so this is the leader's count and a follower always publishes `0` |
