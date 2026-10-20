@@ -1073,22 +1073,14 @@ struct PendingRead {
     phase: ReadPhase,
 }
 
-/// The ingress admission door (Task 7, spec §7): open while the unconfirmed
-/// backlog `append - commit` is within `budget`. A closed door leaves records
-/// in the client ring for a later cycle (backpressuring the client's
-/// `try_write` into `RingError::Full` once the ring itself fills) rather than
-/// appending unboundedly ahead of quorum commit. `saturating_sub` makes the
-/// transient `commit > append` snapshot (a stale/racy read across the two
-/// independent atomics) open rather than panic.
-#[inline]
 /// #99's report-ceiling floor for a term opened at `base` (the term map's
 /// entry for the current term): at or above the end of that term's NewTerm
 /// frame in both cases `append_new_term` produces. The frame is
-/// `NEW_TERM_FRAME_LEN` (64 B since wire level 13: a 32 B header plus the
-/// reserved zero body, aligned). (a) With room before the buffer's wrap it
-/// starts AT `base` and ends at `base + 64`. (b) When the term opens with
-/// fewer than 64 B left before the wrap — at a frame-aligned offset that is
-/// exactly 32 B — the appender writes those 32 B as padding first, so the
+/// `NEW_TERM_FRAME_LEN` (64 B since wire 0.12.0, level 12: a 32 B header
+/// plus the reserved zero body, aligned). (a) With room before the buffer's
+/// wrap it starts AT `base` and ends at `base + 64`. (b) When the term opens
+/// with fewer than 64 B left before the wrap — at a frame-aligned offset that
+/// is exactly 32 B — the appender writes those 32 B as padding first, so the
 /// frame ends at `base + 32 + 64` while the leader's term map still says
 /// `base` (its collapse base). The floor is the worst case, (b); in case (a)
 /// it is 32 B of margin, the safe direction (ruling 17).
@@ -1097,6 +1089,14 @@ fn term_open_end(base: u64) -> u64 {
     base.saturating_add((FRAME_ALIGNMENT + NEW_TERM_FRAME_LEN) as u64)
 }
 
+/// The ingress admission door (Task 7, spec §7): open while the unconfirmed
+/// backlog `append - commit` is within `budget`. A closed door leaves records
+/// in the client ring for a later cycle (backpressuring the client's
+/// `try_write` into `RingError::Full` once the ring itself fills) rather than
+/// appending unboundedly ahead of quorum commit. `saturating_sub` makes the
+/// transient `commit > append` snapshot (a stale/racy read across the two
+/// independent atomics) open rather than panic.
+#[inline]
 fn admission_open(append: u64, commit: u64, budget: u64) -> bool {
     append.saturating_sub(commit) <= budget
 }
