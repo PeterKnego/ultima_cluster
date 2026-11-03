@@ -266,6 +266,13 @@ fn nak_loss_on_one_link() {
 /// else does, and votes ARRIVING at F1 are untouched. Then L is SIGKILLed.
 /// F2 as candidate needs F1's vote, which cannot arrive; F1 as candidate
 /// needs F2's, which can — so the cluster must elect, and must elect F1.
+///
+/// Whether the block is EXERCISED is a race between the two followers'
+/// election timers: F1 casts a vote toward F2 only if F2 campaigns. So a
+/// 1 ms delay rule counts F2's REQUEST_VOTEs toward F1, and the exact claim
+/// is: every one of them was answered (a grant or a rejection, both VOTE
+/// datagrams — `uc_consensus::election::handle_request_vote`) and every
+/// answer was dropped. When F2 never asked, the scenario says so.
 #[test]
 fn votes_silenced() {
     let _g = NETFAULT_LOCK.lock().unwrap();
@@ -275,6 +282,7 @@ fn votes_silenced() {
     let w = c.workload(0x564F_5445);
     let (l, f1, f2) = (c.roles.leader, c.roles.f1, c.roles.f2);
     let vote_f2 = format!("{} vote peer={} out", c.port(f1), c.ip(f2));
+    let asks = format!("{} request-vote peer={} out", c.port(f2), c.ip(f1));
     nf.run(&[
         "block",
         "--out",
@@ -293,19 +301,42 @@ fn votes_silenced() {
         &c.ip(l),
         &c.port(f1),
     ]);
+    nf.run(&[
+        "rule",
+        "--out",
+        "--kind",
+        "request-vote",
+        "--delay",
+        "1",
+        "--peer",
+        &c.ip(f1),
+        &c.port(f2),
+    ]);
     // Longer than the 150-300 ms election timeout, so the first vote of the
     // new term is the one the rule sees.
     std::thread::sleep(Duration::from_millis(300));
     let ok_before_kill = w.ok();
     c.kill_node_and_service(l);
     let winner = await_single_leader_among(&c.dirs, &[f1, f2], 10);
-    let vote_dropped = nf.counter(&vote_f2, "dropped");
+    let (vote_dropped, f2_asked) = (
+        nf.counter(&vote_f2, "dropped"),
+        nf.counter(&asks, "delayed"),
+    );
     eprintln!(
-        "[votes_silenced] killed=n{l} winner=n{winner} (f1=n{f1} f2=n{f2}) vote_dropped={vote_dropped} \
-         ok_before_kill={ok_before_kill}"
+        "[votes_silenced] killed=n{l} winner=n{winner} (f1=n{f1} f2=n{f2}) f2_asked={f2_asked} \
+         vote_dropped={vote_dropped} ok_before_kill={ok_before_kill}"
     );
     assert_ne!(winner, l, "the killed leader cannot be the leader");
-    assert!(vote_dropped > 0, "the vote rule counted nothing: {vote_f2}");
+    if f2_asked > 0 {
+        assert!(
+            vote_dropped > 0,
+            "F2 asked F1 for its vote {f2_asked} time(s) and no answer was dropped: {vote_f2}"
+        );
+    } else {
+        eprintln!(
+            "[votes_silenced] F2 never campaigned (F1's timer fired first): the block had nothing to drop"
+        );
+    }
     assert_eq!(
         winner, f1,
         "F2 won although F1's votes were blocked — a vote reached F2 by a path the rule does not cover"

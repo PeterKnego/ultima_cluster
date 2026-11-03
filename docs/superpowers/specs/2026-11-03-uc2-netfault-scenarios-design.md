@@ -175,8 +175,14 @@ F1, F2), never by index.
   arrive; F1 as candidate needs F2's vote, which can. So the cluster must
   elect, and the member it elects is the one nobody can hear voting. That is
   a liveness claim the protocol makes and nothing has tested.
-- **Fired.** The vote rule's `dropped` > 0 (at least F1's vote for F2's
-  first term).
+- **Fired.** Whether the block is exercised is a race between the two
+  followers' election timers: F1 casts a vote toward F2 only if F2
+  campaigns (as built: in four runs F2 campaigned three times). So a 1 ms
+  delay rule counts F2's REQUEST_VOTEs toward F1, and the claim is exact: if
+  F2 asked at all, at least one answer — a grant or a rejection, both VOTE
+  datagrams — was dropped. When F2 never asked, the scenario reports that
+  F1's timer fired first and the block had nothing to drop; the winner
+  check below still holds either way.
 - **Safety.** Linearizable across the failover.
 - **Liveness (nightly).** A single serving leader within 10 s of the kill
   (`await_single_leader_multi` with its never-two-leaders assertion), and the
