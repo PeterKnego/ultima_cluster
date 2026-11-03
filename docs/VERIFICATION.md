@@ -719,6 +719,38 @@ future "make proofs expire", not a defect in this branch.
 cargo test -p uc_node --test jumbo
 ```
 
+### The kernel-level fault layer — `testing/netfault` (unreleased)
+
+Everything above impairs the network from **inside** the process:
+`FaultSocket` is a shim the test builds the node with, and the sim's world is
+virtual. Neither can touch a shipped binary on a real kernel, and neither
+can single out one message kind on one link. [`testing/netfault`](/testing/netfault)
+can: a pair of `tc` eBPF programs, forked from Fredrik Dahlberg's
+[faulteron](https://github.com/FredrikJDahlberg/faulteron) for Aeron, that
+drop, duplicate and delay UDP by peer, port and **UC datagram kind** — the
+16-byte header is cleartext even under wire crypto, so `--kind nak` works
+with `[crypto] enabled`. It is what "drop only NAKs between node 2 and node 3"
+or "delay every `SNAP_CHUNK` by 50 ms" means on a fleet.
+
+What is proved about the tool itself, today:
+
+| test | what it proves |
+|---|---|
+| `testing/netfault/test/netfault-rules.sh` (rootful docker, ~10 s) | every rule kind against hand-made datagrams between two containers: which rule each packet went to, what each counted, what the receiver saw (delay, duplicates both ways, reordering); that a term bump is a new frontier and not a repair; that a sealed flow's `retransmit` frontier counts log bytes, not wire bytes; that bad input changes no rule; that `remove` and `detach` undo exactly what they should |
+| `uc_crashtest/tests/netfault_pins.rs` (plain `cargo test`) | the C header layout, the crypto overhead and the CLI's whole kind table against the `uc_protocol` constants — both ways, so an added kind without a name and a renumbered kind both fail. Watched red against a renumbered `nak` and a moved `kind` offset before it was trusted |
+
+What is **not** done: no cluster-level scenario uses it yet. Partitioning,
+slowing and silencing a real cluster while the WGL checker watches is a
+fleet-gate direction in `docs/BACKLOG.md` §5, and until that gate exists this
+tool adds an instrument, not a proof. Two open items it can reach for the
+first time: jumbo row c's soak (NOT RUN for want of exactly this), and the
+unexplained 58-minute `remote_lin` hang of 2026-09-08.
+
+```bash
+(cd testing/netfault && test/netfault-rules.sh)   # DOCKER_CONTEXT=default where the default is rootless
+cargo test -p uc_crashtest --test netfault_pins
+```
+
 ---
 
 ## 3. Linearizability: WGL capstones
