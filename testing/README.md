@@ -6,7 +6,7 @@ meant to be read as a worked example.
 
 | crate | what it is |
 |---|---|
-| [`netfault`](netfault) | Not a crate: an eBPF network fault injector (`tc` programs plus a bash CLI) that drops, duplicates and delays UDP by peer, port and UC datagram kind on a real interface — the kernel-level counterpart of `uc_net::fault::FaultSocket`. Forked from faulteron; `uc_crashtest/tests/netfault_pins.rs` pins its kind table to the wire. |
+| [`netfault`](netfault) | Not a crate: an eBPF network fault injector (`tc` programs plus a bash CLI) that drops, duplicates and delays UDP by peer, port and UC datagram kind on a real interface — the kernel-level counterpart of `uc_net::fault::FaultSocket`. Forked from faulteron; `uc_crashtest/tests/netfault_pins.rs` pins its kind table to the wire, and `uc_crashtest/tests/netfault.rs` (feature `netfault-tests`, nightly) runs four one-link, one-kind, one-direction scenarios against three real node processes under the WGL checker. |
 | [`uc_crashtest`](uc_crashtest) | Multi-process crash-recovery harness: reference node / service / gateway binaries over a shared instance dir, plus the hard-crash, survival, ENOSPC and remote-linearizability suites. The real `kill -9` path for reconstruction validation. |
 
 ## Why this is not `examples/`

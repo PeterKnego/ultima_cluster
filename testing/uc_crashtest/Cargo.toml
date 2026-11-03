@@ -46,6 +46,13 @@ survival-tests = []
 # (elle-style: unset = skip cleanly); the sudo-free EACCES sibling in the
 # same file runs unconditionally once this feature is on.
 enospc-tests = []
+# netfault scenarios (testing/uc_crashtest/tests/netfault.rs; design
+# docs/superpowers/specs/2026-11-03-uc2-netfault-scenarios-design.md): three
+# real node processes on 127.0.0.2/3/4 under tc/eBPF faults from
+# testing/netfault, attached on `lo` as root (`sudo -n` when not). Implies
+# hard-crash-tests for the shared multi-process helpers. Run with
+# `--test-threads=1`: the scenarios share one attachment.
+netfault-tests = ["hard-crash-tests"]
 
 [dependencies]
 uc_node      = { path = "../../uc_node", version = "2.14.0" }

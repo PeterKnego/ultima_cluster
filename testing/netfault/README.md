@@ -100,5 +100,10 @@ on what leaves. On a box whose default docker context is rootless, run it with `
 
 `cargo test -p uc_crashtest --test netfault_pins` is the wire pin, and runs in the ordinary workspace test job.
 
-Cluster-level scenarios that use this tool — partition, slow and silence a real cluster while the linearizability
-checker watches — are not written yet; they are a fleet-gate direction in `docs/BACKLOG.md`.
+The **scenarios** — `testing/uc_crashtest/tests/netfault.rs`, feature `netfault-tests` — put three real node
+processes on `127.0.0.2/3/4`, attach this tool on `lo` (as root, or through `sudo -n`), and run four faults under
+the WGL linearizability checker: NAK loss on one link, one member's votes silenced, one direction slow and
+reordering, repairs dropped. Every rule is `--out` and names a `--peer`, because on `lo` a datagram passes both
+hooks. `nightly.yml` runs them cleartext and with wire crypto on. Without host root, `scripts/run-suite-in-container.sh
+[--crypto]` runs them inside a privileged container on a rootful docker, where the test process is root. The fleet
+measurement is plan 2 of the design (`docs/superpowers/specs/2026-11-03-uc2-netfault-scenarios-design.md` §6).
