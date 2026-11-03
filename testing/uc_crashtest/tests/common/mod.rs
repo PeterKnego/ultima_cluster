@@ -1114,6 +1114,169 @@ pub fn node_stderr_log(instance_dir: &Path) -> PathBuf {
     instance_dir.with_extension("stderr")
 }
 
+// ---------------------------------------------------- netfault (spec 2026-11-03)
+//
+// Helpers for `tests/netfault.rs`: nodes on distinct loopback addresses, roles
+// by name, the cnc positions the liveness checks read, and a guard around the
+// `testing/netfault` CLI that detaches on drop so a panicking scenario leaves
+// the interface clean for the next one.
+
+/// Binds `ip:0`, returns the address, drops the socket — `free_addr` on a
+/// chosen loopback address, so `--peer` can single out one node.
+pub fn free_addr_on(ip: std::net::Ipv4Addr) -> SocketAddr {
+    let s = UdpSocket::bind((ip, 0)).expect("bind loopback alias (127.0.0.0/8 is local)");
+    s.local_addr().unwrap()
+}
+
+/// The cluster by role: the serving leader and the two followers in index
+/// order. Scenarios name nodes by role, never by index.
+pub struct Roles {
+    pub leader: usize,
+    pub f1: usize,
+    pub f2: usize,
+}
+
+pub fn roles(dirs: &[PathBuf], secs: u64) -> Roles {
+    let leader = await_single_leader_multi(dirs, secs);
+    let others: Vec<usize> = (0..dirs.len()).filter(|i| *i != leader).collect();
+    Roles {
+        leader,
+        f1: others[0],
+        f2: others[1],
+    }
+}
+
+/// `(commit, durable)` from the node's cnc page.
+pub fn cnc_positions(dir: &Path) -> (u64, u64) {
+    let cnc =
+        open_cnc(dir).unwrap_or_else(|| panic!("cnc page at {} cannot be opened", dir.display()));
+    let c = cnc.counters();
+    (c.commit.load_acquire(), c.durable.load_acquire())
+}
+
+/// Scenarios share one attachment per interface: never two at once.
+pub static NETFAULT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// The `testing/netfault` CLI, attached on `dev` for the guard's lifetime.
+/// Runs as root directly, or through `sudo -n` otherwise. Every failure is
+/// by name: there is no silent skip.
+pub struct Netfault {
+    dev: String,
+    obj: PathBuf,
+    cli: PathBuf,
+    sudo: bool,
+}
+
+impl Netfault {
+    pub fn attach(dev: &str) -> Netfault {
+        let netfault_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../netfault");
+        let obj = std::env::var_os("NETFAULT_OBJ")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| netfault_dir.join("build/netfault.bpf.o"));
+        assert!(
+            obj.is_file(),
+            "netfault: no BPF object at {}; run `make -C testing/netfault` or set NETFAULT_OBJ",
+            obj.display()
+        );
+        let uid = Command::new("id").arg("-u").output().expect("run id -u");
+        let sudo = String::from_utf8_lossy(&uid.stdout).trim() != "0";
+        let nf = Netfault {
+            dev: dev.to_owned(),
+            obj,
+            cli: netfault_dir.join("bin/netfault"),
+            sudo,
+        };
+        let out = nf.command(&["attach"]);
+        assert!(
+            out.status.success(),
+            "netfault: attach on {dev} failed{}: {}",
+            if nf.sudo { " (through sudo -n)" } else { "" },
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+        nf
+    }
+
+    fn command(&self, args: &[&str]) -> std::process::Output {
+        let mut cmd = if self.sudo {
+            let mut c = Command::new("sudo");
+            c.arg("-n").arg("env");
+            c
+        } else {
+            Command::new("env")
+        };
+        cmd.arg(format!("NETFAULT_DEV={}", self.dev))
+            .arg(format!("NETFAULT_OBJ={}", self.obj.display()))
+            .arg(&self.cli)
+            .args(args);
+        cmd.output()
+            .unwrap_or_else(|e| panic!("netfault: cannot run {}: {e}", self.cli.display()))
+    }
+
+    /// Runs one CLI command (`rule`, `block`, `remove`); panics with the
+    /// CLI's stderr on failure.
+    pub fn run(&self, args: &[&str]) {
+        let out = self.command(args);
+        assert!(
+            out.status.success(),
+            "netfault {}: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+
+    /// `stats`, parsed: the selector prefix of each line (everything before
+    /// ` loss=`, e.g. `9201 nak peer=127.0.0.2 out`) maps to its
+    /// `name=value` counters with the `%`/`ms` suffixes stripped.
+    pub fn stats(
+        &self,
+    ) -> std::collections::BTreeMap<String, std::collections::BTreeMap<String, u64>> {
+        let out = self.command(&["stats"]);
+        assert!(
+            out.status.success(),
+            "netfault stats: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+        let mut map = std::collections::BTreeMap::new();
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            let Some((selector, _)) = line.split_once(" loss=") else {
+                continue;
+            };
+            let counters = line[selector.len() + 1..]
+                .split_whitespace()
+                .filter_map(|pair| pair.split_once('='))
+                .map(|(k, v)| {
+                    let v = v.trim_end_matches('%').trim_end_matches("ms");
+                    (
+                        k.to_owned(),
+                        v.parse::<u64>()
+                            .unwrap_or_else(|e| panic!("stats {k}={v}: {e}")),
+                    )
+                })
+                .collect();
+            map.insert(selector.to_owned(), counters);
+        }
+        map
+    }
+
+    /// One counter of one rule; panics by name if the rule is not installed.
+    pub fn counter(&self, selector: &str, name: &str) -> u64 {
+        let stats = self.stats();
+        let rule = stats.get(selector).unwrap_or_else(|| {
+            panic!(
+                "netfault: no rule `{selector}` in stats; have: {:?}",
+                stats.keys().collect::<Vec<_>>()
+            )
+        });
+        rule[name]
+    }
+}
+
+impl Drop for Netfault {
+    fn drop(&mut self) {
+        let _ = self.command(&["detach"]);
+    }
+}
+
 /// The bounded waits (backlog item "Bound the three unbounded waits in
 /// `remote_lin.rs`", 2026-09-08): every one of these must FAIL WITH A
 /// LOCATION rather than hold a nightly job to its 60-minute cancellation.
