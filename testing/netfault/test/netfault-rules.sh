@@ -1,17 +1,18 @@
 #!/usr/bin/env bash
 # Checks every kind of rule against hand-made traffic between two throwaway containers, with no cluster: which rule
-# each packet goes to, what the rules count, and what the receiver gets. Needs docker and nothing else.
+# each packet goes to, what the rules count, and what the receiver gets. Needs a ROOTFUL docker and nothing else
+# (under rootless docker nothing can load BPF; on a box whose default context is rootless, DOCKER_CONTEXT=default).
 #
-# The sender carries one rule of each kind, each on a port of its own, and sends Aeron-shaped datagrams to addresses
+# The sender carries one rule of each kind, each on a port of its own, and sends UC-shaped datagrams to addresses
 # nobody answers (the egress hook sees them on the way out) and plain timestamped lines to the receiver. Delay,
 # duplication and jitter are judged on arrival as well as by count; duplication of what arrives is judged on a rule
 # attached to the receiver. Both containers read one kernel's /proc/uptime, so a latency is a difference of two.
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-LOG_DIR="${ROOT}/logs/faulteron-rules"
-SENDER=faulteron-sender
-RECEIVER=faulteron-receiver
+LOG_DIR="${ROOT}/logs/netfault-rules"
+SENDER=netfault-sender
+RECEIVER=netfault-receiver
 FAILURES=0
 
 rm -rf "${LOG_DIR}"
@@ -24,7 +25,7 @@ trap cleanup EXIT
 
 # fault <container> <command>... — the CLI in that container's network namespace.
 fault() {
-    docker run --rm --privileged --network "container:$1" faulteron:local faulteron "${@:2}"
+    docker run --rm --privileged --network "container:$1" netfault:local netfault "${@:2}"
 }
 
 pass() { echo "ok   $*"; }
@@ -47,23 +48,19 @@ expect() {
     fi
 }
 
-# Sent ahead of each batch of sender commands: short and frame write one datagram to the descriptor they are
-# redirected to.
+# Sent ahead of each batch of sender commands: dgram writes one datagram to the descriptor it is redirected to.
 FRAME_LIB="$(
     cat << 'EOF'
 le16() { printf '\\x%02x\\x%02x' $(($1 & 255)) $(($1 >> 8 & 255)); }
 le32() { printf '%s%s' "$(le16 $(($1 & 65535)))" "$(le16 $(($1 >> 16 & 65535)))"; }
-# short <type> — the eight bytes every Aeron frame starts with, alone.
-short() { printf '%b' "$(le32 8)\\x00\\x00$(le16 "$1")"; }
-# frame <frame_length> <flags> <term_offset> <session> <template> <schema> — a 64-byte datagram holding one DATA
-# frame on stream 1001, term 7, its payload an SBE header and zeros.
-frame() {
-    local f
-    f="$(le32 "$1")\\x00$(printf '\\x%02x' "$2")$(le16 1)$(le32 "$3")$(le32 "$4")$(le32 1001)$(le32 7)"
-    f+='\x00\x00\x00\x00\x00\x00\x00\x00'
-    f+="$(le16 8)$(le16 "$5")$(le16 "$6")$(le16 1)"
-    f+="$(printf '\\x00%.0s' {1..24})"
-    printf '%b' "${f}"
+le64() { printf '%s%s' "$(le32 $(($1 & 4294967295)))" "$(le32 $(($1 >> 32)))"; }
+# dgram <position> <term> <kind> <key_epoch> <payload bytes> — UC's 16-byte header (uc_protocol::v2::datagram:
+# position u64, leadership_term_id u32, kind u8, wire u8, key_epoch u16, little-endian) and a zero payload.
+dgram() {
+    local d
+    d="$(le64 "$1")$(le32 "$2")$(printf '\\x%02x' "$3")\\x0c$(le16 "$4")"
+    ((${5} > 0)) && d+="$(printf '\\x00%.0s' $(seq 1 "$5"))"
+    printf '%b' "${d}"
 }
 EOF
 )"
@@ -74,8 +71,8 @@ send() {
 }
 
 # ── containers ─────────────────────────────────────────────────────────────────────────────────────
-if ! docker build -q -t faulteron:local "${ROOT}" > "${LOG_DIR}/build.log" 2>&1; then
-    echo "faulteron image did not build; see ${LOG_DIR}/build.log"
+if ! docker build -q -t netfault:local "${ROOT}" > "${LOG_DIR}/build.log" 2>&1; then
+    echo "netfault image did not build; see ${LOG_DIR}/build.log"
     exit 1
 fi
 cleanup
@@ -91,19 +88,14 @@ RX="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}
 # ── rules ──────────────────────────────────────────────────────────────────────────────────────────
 {
     fault "${SENDER}" attach
-    # Frame type, loss, and a type before the port's any rule.
-    fault "${SENDER}" block --type nak 9101
-    fault "${SENDER}" rule --type data --loss 50 9102
+    # Kind, loss, and a kind before the port's any rule.
+    fault "${SENDER}" block --kind nak 9101
+    fault "${SENDER}" rule --kind data --loss 50 9102
     fault "${SENDER}" block 9103
-    fault "${SENDER}" block --type sm 9103
-    # Retransmission, per destination.
-    fault "${SENDER}" block --type retransmit 9110 9111
-    fault "${SENDER}" rule --type data --delay 1 9110 9111 9112 9113
-    # Aeron Cluster templates, and templates and schemas of another schema.
-    fault "${SENDER}" block --template request-vote 9112
-    fault "${SENDER}" rule --template vote --delay 2 9112
-    fault "${SENDER}" block --schema 101 --template 5 9113
-    fault "${SENDER}" rule --schema 101 --delay 3 9113
+    fault "${SENDER}" block --kind status 9103
+    # Retransmission, per flow, per term, and under wire crypto.
+    fault "${SENDER}" block --kind retransmit 9110 9111 9112
+    fault "${SENDER}" rule --kind data --delay 1 9110 9111 9112
     # A peer before a port, and a peer on any port.
     fault "${SENDER}" rule --delay 1 9120
     fault "${SENDER}" block --peer 10.99.0.2 9120
@@ -122,31 +114,29 @@ RX="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}
 # ── traffic ────────────────────────────────────────────────────────────────────────────────────────
 send '
 exec 3> /dev/udp/10.99.0.1/9101 4> /dev/udp/10.99.0.1/9102 5> /dev/udp/10.99.0.1/9103
-for i in {1..5}; do short 2 >&3; short 1 >&3; echo x >&3; done
-for i in {1..400}; do short 1 >&4; done
-for i in {1..3}; do short 3 >&5; short 1 >&5; done
+for i in {1..5}; do dgram 0 1 3 0 8 >&3; dgram 0 1 1 0 32 >&3; echo x >&3; done   # nak, data, not UC
+for i in {1..400}; do dgram 0 1 1 0 32 >&4; done
+for i in {1..3}; do dgram 0 1 4 0 8 >&5; dgram 0 1 1 0 32 >&5; done               # status, data
 
-exec 3> /dev/udp/10.99.0.1/9110 4> /dev/udp/10.99.0.1/9111 5> /dev/udp/10.99.0.1/9112 6> /dev/udp/10.99.0.1/9113
-frame 64 192 0 1 1 111 >&3      # one flow: offsets 0, 64, 0 again, 128, then a heartbeat
-frame 64 192 64 1 1 111 >&3
-frame 64 192 0 1 1 111 >&3
-frame 64 192 128 1 1 111 >&3
-frame 0 192 192 1 1 111 >&3
-frame 64 192 0 1 1 111 >&4      # the same flow to another port: new, then a retransmission
-frame 64 192 0 1 1 111 >&4
-frame 64 192 0 2 51 111 >&5     # request-vote
-frame 64 192 64 2 52 111 >&5    # vote
-frame 64 192 128 2 51 101 >&5   # its template id in another schema
-frame 64 64 192 2 51 111 >&5    # request-vote, but not a first fragment
-frame 64 192 0 2 51 111 >&5     # request-vote again, retransmitted, with no retransmit rule on the port
-frame 64 192 0 3 5 101 >&6      # schema 101 template 5
-frame 64 192 64 3 6 101 >&6     # schema 101 template 6
-frame 64 192 128 3 5 111 >&6    # template 5 in schema 111
+exec 3> /dev/udp/10.99.0.1/9110 4> /dev/udp/10.99.0.1/9111 5> /dev/udp/10.99.0.1/9112
+dgram 0 7 1 0 64 >&3        # one flow in term 7: positions 0, 64, 0 again, 128
+dgram 64 7 1 0 64 >&3
+dgram 0 7 1 0 64 >&3        #   retransmitted
+dgram 128 7 1 0 64 >&3
+dgram 192 7 2 0 0 >&3       #   a heartbeat is not DATA and moves nothing
+dgram 32 8 1 0 64 >&3       #   term 8 starts a new frontier: 32 is below 192 but not a retransmission
+dgram 32 8 1 0 64 >&3       #   retransmitted in term 8
+dgram 0 7 1 0 64 >&3        #   a stale term is neither a repair nor a frontier
+dgram 0 7 1 0 64 >&4        # the same flow to another port: new, then a retransmission
+dgram 0 7 1 0 64 >&4
+dgram 0 7 1 1 64 >&5        # sealed (key_epoch 1): 64 wire bytes carry 40 of log, so the frontier is 40
+dgram 40 7 1 1 64 >&5       #   the next datagram starts at 40: not a retransmission
+dgram 39 7 1 1 64 >&5       #   one byte below it is
 
 exec 3> /dev/udp/10.99.0.1/9120 4> /dev/udp/10.99.0.2/9120 5> /dev/udp/10.99.0.2/9121
-frame 64 192 0 4 1 111 >&3      # no peer rule: the port rule
-frame 64 192 0 5 1 111 >&4      # the peer rule on its port
-frame 64 192 0 6 1 111 >&5      # the peer rule on any port
+dgram 0 1 1 0 32 >&3        # no peer rule: the port rule
+dgram 0 1 1 0 32 >&4        # the peer rule on its port
+dgram 0 1 1 0 32 >&5        # the peer rule on any port
 
 exec 3> /dev/udp/$RX/9130 4> /dev/udp/$RX/9131 5> /dev/udp/$RX/9132 6> /dev/udp/$RX/9133
 for i in {1..10}; do echo "$i $(cut -d" " -f1 /proc/uptime)" >&3; echo "$i x" >&4; echo "$i x" >&6; sleep 0.05; done
@@ -162,25 +152,19 @@ for p in 9130 9131 9132 9133; do docker exec "${RECEIVER}" cat "/tmp/rx-${p}" > 
 
 # ── checks ─────────────────────────────────────────────────────────────────────────────────────────
 S="${LOG_DIR}/sender.txt"
-echo "-- frame types and loss"
+echo "-- kinds and loss"
 expect "${S}" "9101 nak" dropped 5
 expect "${S}" "9102 data" dropped 150 250
-expect "${S}" "9103 sm" dropped 3
+expect "${S}" "9103 status" dropped 3
 expect "${S}" "9103 any" dropped 3
 
 echo "-- retransmission"
-expect "${S}" "9110 retransmit" dropped 1
-expect "${S}" "9110 data" delayed 4
+expect "${S}" "9110 retransmit" dropped 2
+expect "${S}" "9110 data" delayed 5
 expect "${S}" "9111 data" delayed 1
 expect "${S}" "9111 retransmit" dropped 1
-
-echo "-- schemas and templates"
-expect "${S}" "9112 data schema=111 template=request-vote" dropped 2
-expect "${S}" "9112 data schema=111 template=vote" delayed 1
 expect "${S}" "9112 data" delayed 2
-expect "${S}" "9113 data schema=101 template=5" dropped 1
-expect "${S}" "9113 data schema=101" delayed 1
-expect "${S}" "9113 data" delayed 1
+expect "${S}" "9112 retransmit" dropped 1
 
 echo "-- peers"
 expect "${S}" "9120 any" delayed 1
@@ -218,25 +202,25 @@ else
 fi
 
 echo "-- the CLI refuses what it cannot do"
-for args in "block --type bogus 1" "rule 1" "rule --loss 0 1" "rule --delay 9000 --jitter 2000 1" "block --loss 5 1" \
-    "block 0" "block 65536" "block 9199 0" "remove x" "block --schema 70000 1" "block --peer no-such-host 1" \
-    "block --template 5 --type nak 1" "stats 1" "bogus"; do
+for args in "block --kind bogus 1" "block --kind 65534 1" "block --type data 1" "rule 1" "rule --loss 0 1" \
+    "rule --delay 9000 --jitter 2000 1" "block --loss 5 1" "block 0" "block 65536" "block 9199 0" "remove x" \
+    "block --peer no-such-host 1" "stats 1" "bogus"; do
     # shellcheck disable=SC2086
     if fault "${SENDER}" ${args} > /dev/null 2>&1; then fail "accepted: ${args}"; else pass "refused: ${args}"; fi
 done
 
 echo "-- remove and detach"
-fault "${SENDER}" remove --type sm 9103
+fault "${SENDER}" remove --kind status 9103
 fault "${SENDER}" stats > "${LOG_DIR}/after-remove.txt"
 if grep -q '^9199 ' "${LOG_DIR}/after-remove.txt"; then
     fail "block 9199 0 installed 9199 before refusing 0"
 else
     pass "block 9199 0 installed nothing"
 fi
-if ! grep -q '^9103 sm ' "${LOG_DIR}/after-remove.txt" && grep -q '^9103 any ' "${LOG_DIR}/after-remove.txt"; then
-    pass "remove --type sm 9103 removed that rule and no other"
+if ! grep -q '^9103 status ' "${LOG_DIR}/after-remove.txt" && grep -q '^9103 any ' "${LOG_DIR}/after-remove.txt"; then
+    pass "remove --kind status 9103 removed that rule and no other"
 else
-    fail "remove --type sm 9103: $(grep '^9103 ' "${LOG_DIR}/after-remove.txt" | cut -d' ' -f1-2 | tr '\n' ',')"
+    fail "remove --kind status 9103: $(grep '^9103 ' "${LOG_DIR}/after-remove.txt" | cut -d' ' -f1-2 | tr '\n' ',')"
 fi
 fault "${SENDER}" detach
 if fault "${SENDER}" stats > /dev/null 2>&1; then
@@ -247,8 +231,8 @@ fi
 
 echo ""
 if ((FAILURES == 0)); then
-    echo "FAULTERON RULES TEST: PASS"
+    echo "NETFAULT RULES TEST: PASS"
     exit 0
 fi
-echo "FAULTERON RULES TEST: FAIL (${FAILURES})"
+echo "NETFAULT RULES TEST: FAIL (${FAILURES})"
 exit 1

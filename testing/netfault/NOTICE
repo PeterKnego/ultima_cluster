@@ -1,4 +1,7 @@
-faulteron
+netfault, ultima_cluster's network fault injector
+Copyright 2026 Peter Knego
+
+Derived from faulteron (https://github.com/FredrikJDahlberg/faulteron)
 Copyright 2026 Fredrik Dahlberg
 
-Licensed under the Apache License, Version 2.0 (see LICENSE).
+Licensed under the Apache License, Version 2.0 (see the repository's LICENSE).

@@ -129,6 +129,24 @@ jobs:
         # checked-out rust-toolchain.toml's directory override.
         run: cargo +${{ steps.msrv.outputs.version }} clippy --workspace --all-targets --locked -- -D warnings
 
+  # testing/netfault — the eBPF fault injector — is C and bash outside the
+  # workspace, so nothing above compiles or runs it. This builds the program
+  # on the host toolchain and runs its self-test, which loads it through the
+  # kernel's verifier and attaches it at tc on two containers (GitHub's
+  # runners have a rootful docker and a kernel past the 5.18 floor). The
+  # Rust-side pin (uc_crashtest/tests/netfault_pins.rs) runs in `test`.
+  netfault:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install clang + libbpf headers
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends clang libbpf-dev linux-libc-dev
+      - name: make (compiles the BPF program on the host)
+        run: make -C testing/netfault
+      - name: netfault-rules.sh (verifier load, tc attach, every rule kind)
+        run: testing/netfault/test/netfault-rules.sh
+
   deny:
     runs-on: ubuntu-latest
     timeout-minutes: 15
