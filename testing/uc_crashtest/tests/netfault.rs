@@ -6,10 +6,12 @@
 //!
 //! Every scenario: boot, attach on `lo`, warm up, workers on, install the
 //! rules (always `--out` and `--peer`: on `lo` a datagram passes both hooks),
-//! a 5 s fault window, read `stats` and assert the rule FIRED, detach (which
-//! heals everything), a 5 s heal window, then safety (linearizable) and the
-//! scenario's liveness. The scenarios share one attachment, so they take
-//! `NETFAULT_LOCK` and the nightly command runs them with `--test-threads=1`.
+//! a 5 s fault window, read `stats` and record whether the rule FIRED, detach
+//! (which heals everything), a 5 s heal window, then — in this order — the
+//! history is checked (a `Violation` is always the first line read, spec §7)
+//! and only then the recorded fired/liveness checks are asserted. The
+//! scenarios share one attachment, so they take the netfault lock and the
+//! nightly command runs them with `--test-threads=1`.
 #![cfg(feature = "netfault-tests")]
 
 use std::net::{Ipv4Addr, SocketAddr};
@@ -54,6 +56,17 @@ impl Cluster {
     fn boot() -> Cluster {
         let tmp = tempdir();
         let addrs: Vec<SocketAddr> = IPS.iter().map(|ip| free_addr_on(*ip)).collect();
+        // A rule's key is (peer, port): two nodes on one port number would
+        // over-match each other's rules.
+        for i in 0..N {
+            for j in (i + 1)..N {
+                assert_ne!(
+                    addrs[i].port(),
+                    addrs[j].port(),
+                    "nodes {i} and {j} share a port; re-run"
+                );
+            }
+        }
         let members: Vec<(u32, SocketAddr)> =
             (0..N as u32).map(|i| (i, addrs[i as usize])).collect();
         let members_str = members_arg(&members);
@@ -150,7 +163,9 @@ fn crypto_args(crypto: &Option<CrashtestCrypto>, id: u32) -> Option<(&Path, &Pat
         .map(|m| (m.key_paths[&id].as_path(), m.allowlist_path.as_path()))
 }
 
-/// The shmem workers of `hard_crash.rs`, recording one history.
+/// The shmem workers of `hard_crash.rs`, recording one history. Dropping it
+/// stops the workers, so a panicking scenario does not leave them running
+/// into the next one.
 struct Workload {
     history: Arc<History>,
     stop: Arc<AtomicBool>,
@@ -171,23 +186,71 @@ impl Workload {
             .count()
     }
 
-    fn finish(self) -> Vec<Entry> {
+    fn finish(mut self) -> Vec<Entry> {
         self.stop.store(true, Ordering::Relaxed);
-        join_workers(self.handles);
-        Arc::try_unwrap(self.history)
+        join_workers(std::mem::take(&mut self.handles));
+        let history = Arc::clone(&self.history);
+        drop(self);
+        Arc::try_unwrap(history)
             .ok()
             .expect("sole history owner")
             .into_entries()
     }
 }
 
-/// Polls `pred` every 50 ms; panics with `msg` once `timeout` has passed.
-fn wait_until(timeout: Duration, mut pred: impl FnMut() -> bool, msg: &str) {
+impl Drop for Workload {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+/// The fired and liveness checks of a scenario, recorded as they happen and
+/// asserted only AFTER the history has been checked, so a checker
+/// `Violation` is never hidden behind a missed counter or a timeout.
+#[derive(Default)]
+struct Checks(Vec<String>);
+
+impl Checks {
+    fn that(&mut self, ok: bool, msg: impl Into<String>) {
+        if !ok {
+            self.0.push(msg.into());
+        }
+    }
+
+    fn assert_all(self, scenario: &str) {
+        assert!(
+            self.0.is_empty(),
+            "[{scenario}] {} check(s) failed (history was linearizable):\n  {}",
+            self.0.len(),
+            self.0.join("\n  ")
+        );
+    }
+}
+
+/// Polls `pred` every 50 ms until it holds or `timeout` passes.
+fn wait_until(timeout: Duration, mut pred: impl FnMut() -> bool) -> bool {
     let deadline = Instant::now() + timeout;
     while !pred() {
-        assert!(Instant::now() < deadline, "{msg}");
+        if Instant::now() >= deadline {
+            return false;
+        }
         std::thread::sleep(Duration::from_millis(50));
     }
+    true
+}
+
+/// The scenario's tail, in the order spec §7 ranks a red: detach already
+/// done, heal window, history checked, then the recorded checks.
+fn conclude(w: Workload, ck: Checks, scenario: &str) {
+    std::thread::sleep(HEAL_WINDOW);
+    let entries = w.finish();
+    eprintln!(
+        "[{scenario}] ops={} ok={}",
+        entries.len(),
+        History::ok_count(&entries)
+    );
+    assert_linearizable(&entries, &format!("netfault_{scenario}"), "run0");
+    ck.assert_all(scenario);
 }
 
 // ----------------------------------------------------------------- Scenario A
@@ -198,7 +261,7 @@ fn wait_until(timeout: Duration, mut pred: impl FnMut() -> bool, msg: &str) {
 /// durable position must reach L's commit-at-heal within 10 s.
 #[test]
 fn nak_loss_on_one_link() {
-    let _g = NETFAULT_LOCK.lock().unwrap();
+    let _g = netfault_lock();
     shorten_client_timeout();
     let c = Cluster::boot();
     let nf = Netfault::attach("lo");
@@ -235,29 +298,29 @@ fn nak_loss_on_one_link() {
         "[nak_loss_on_one_link] nak_dropped={nak_dropped} data_dropped={data_dropped} \
          ok_at_fault={ok_at_fault} ok_in_fault={ok_in_fault} commit_at_heal={commit_at_heal}"
     );
-    assert!(nak_dropped > 0, "the NAK rule counted nothing: {nak}");
-    assert!(
+    let mut ck = Checks::default();
+    ck.that(
+        nak_dropped > 0,
+        format!("the NAK rule counted nothing: {nak}"),
+    );
+    ck.that(
         data_dropped > 0,
-        "the DATA loss rule counted nothing: {data}"
+        format!("the DATA loss rule counted nothing: {data}"),
+    );
+    ck.that(
+        c.roles.leader == roles(&c.dirs, 5).leader,
+        "the leader changed during the fault window: the rules named a stale topology",
     );
     drop(nf); // detach = heal
-    assert!(
+    ck.that(
         ok_in_fault > ok_at_fault,
-        "commit did not advance during the fault (L+F2 are a quorum)"
+        "commit did not advance during the fault (L+F2 are a quorum)",
     );
-    wait_until(
-        CATCH_UP,
-        || cnc_positions(&c.dirs[f1]).1 >= commit_at_heal,
+    ck.that(
+        wait_until(CATCH_UP, || cnc_positions(&c.dirs[f1]).1 >= commit_at_heal),
         "F1's durable position did not reach L's commit-at-heal within 10 s of heal",
     );
-    std::thread::sleep(HEAL_WINDOW);
-    let entries = w.finish();
-    eprintln!(
-        "[nak_loss_on_one_link] ops={} ok={}",
-        entries.len(),
-        History::ok_count(&entries)
-    );
-    assert_linearizable(&entries, "netfault_nak_loss", "run0");
+    conclude(w, ck, "nak_loss_on_one_link");
 }
 
 // ----------------------------------------------------------------- Scenario B
@@ -273,9 +336,15 @@ fn nak_loss_on_one_link() {
 /// is: every one of them was answered (a grant or a rejection, both VOTE
 /// datagrams — `uc_consensus::election::handle_request_vote`) and every
 /// answer was dropped. When F2 never asked, the scenario says so.
+///
+/// One precondition the kill cannot guarantee: if it lands between L's
+/// sends to the two followers and F2 holds more bytes than F1, F2 refuses
+/// F1's request (votes rank on `(last_term, last_durable)`) and F1's grants
+/// are blocked, so no election can complete until heal. That is the
+/// protocol behaving, not a defect, and a timeout names it.
 #[test]
 fn votes_silenced() {
-    let _g = NETFAULT_LOCK.lock().unwrap();
+    let _g = netfault_lock();
     shorten_client_timeout();
     let mut c = Cluster::boot();
     let nf = Netfault::attach("lo");
@@ -312,52 +381,69 @@ fn votes_silenced() {
         &c.ip(f1),
         &c.port(f2),
     ]);
-    // Longer than the 150-300 ms election timeout, so the first vote of the
-    // new term is the one the rule sees.
+    // The rules are live when bpftool returns; a beat of load under them
+    // before the kill.
     std::thread::sleep(Duration::from_millis(300));
-    let ok_before_kill = w.ok();
     c.kill_node_and_service(l);
-    let winner = await_single_leader_among(&c.dirs, &[f1, f2], 10);
+    let election = try_await_single_leader_among(&c.dirs, &[f1, f2], 10);
     let (vote_dropped, f2_asked) = (
         nf.counter(&vote_f2, "dropped"),
         nf.counter(&asks, "delayed"),
     );
+    let (_, f1_durable) = cnc_positions(&c.dirs[f1]);
+    let (_, f2_durable) = cnc_positions(&c.dirs[f2]);
     eprintln!(
-        "[votes_silenced] killed=n{l} winner=n{winner} (f1=n{f1} f2=n{f2}) f2_asked={f2_asked} \
-         vote_dropped={vote_dropped} ok_before_kill={ok_before_kill}"
+        "[votes_silenced] killed=n{l} election={election:?} (f1=n{f1} f2=n{f2}) f2_asked={f2_asked} \
+         vote_dropped={vote_dropped} durable f1={f1_durable} f2={f2_durable}"
     );
-    assert_ne!(winner, l, "the killed leader cannot be the leader");
+    let mut ck = Checks::default();
     if f2_asked > 0 {
-        assert!(
+        ck.that(
             vote_dropped > 0,
-            "F2 asked F1 for its vote {f2_asked} time(s) and no answer was dropped: {vote_f2}"
+            format!(
+                "F2 asked F1 for its vote {f2_asked} time(s) and no answer was dropped: {vote_f2}"
+            ),
         );
     } else {
         eprintln!(
             "[votes_silenced] F2 never campaigned (F1's timer fired first): the block had nothing to drop"
         );
     }
-    assert_eq!(
-        winner, f1,
-        "F2 won although F1's votes were blocked — a vote reached F2 by a path the rule does not cover"
-    );
-    c.restart(l);
-    await_single_leader_multi(&c.dirs, 20);
-    std::thread::sleep(Duration::from_secs(2));
-    let ok_after_recovery = w.ok();
-    assert!(
-        ok_after_recovery > ok_before_kill,
-        "ok count did not grow after the kill (stuck at {ok_before_kill})"
-    );
+    match election {
+        Ok(winner) => {
+            ck.that(
+                winner == f1,
+                format!(
+                    "n{winner} won although F1 (n{f1}) is the only node that can collect a second \
+                     vote — a vote reached F2 by a path the rule does not cover"
+                ),
+            );
+            let ok_at_election = w.ok();
+            c.restart(l);
+            let rejoined = try_await_single_leader_among(&c.dirs, &[l, f1, f2], 20);
+            ck.that(rejoined.is_ok(), format!("after L's restart: {rejoined:?}"));
+            std::thread::sleep(Duration::from_secs(2));
+            let ok_after = w.ok();
+            ck.that(
+                ok_after > ok_at_election,
+                format!("ok count did not grow after the election (stuck at {ok_at_election})"),
+            );
+        }
+        Err(e) if f2_durable > f1_durable => ck.that(
+            false,
+            format!(
+                "{e}; F2 held more bytes than F1 at the kill (durable f1={f1_durable} \
+                 f2={f2_durable}), so F2 refuses F1's request and F1's grants are blocked: no \
+                 election can complete until heal — a PRECONDITION miss, not a UC defect; re-run"
+            ),
+        ),
+        Err(e) => ck.that(
+            false,
+            format!("{e} with F1 not behind F2 (durable f1={f1_durable} f2={f2_durable}): a liveness finding"),
+        ),
+    }
     drop(nf);
-    std::thread::sleep(HEAL_WINDOW);
-    let entries = w.finish();
-    eprintln!(
-        "[votes_silenced] ops={} ok={}",
-        entries.len(),
-        History::ok_count(&entries)
-    );
-    assert_linearizable(&entries, "netfault_votes_silenced", "run0");
+    conclude(w, ck, "votes_silenced");
 }
 
 // ----------------------------------------------------------------- Scenario C
@@ -368,7 +454,7 @@ fn votes_silenced() {
 /// completing.
 #[test]
 fn one_direction_slow() {
-    let _g = NETFAULT_LOCK.lock().unwrap();
+    let _g = netfault_lock();
     shorten_client_timeout();
     let c = Cluster::boot();
     let nf = Netfault::attach("lo");
@@ -394,24 +480,25 @@ fn one_direction_slow() {
         "[one_direction_slow] delayed={delayed} ok={ok_at_fault}->{ok_in_fault} \
          ok_reads={reads_at_fault}->{reads_in_fault}"
     );
-    assert!(delayed > 0, "the delay rule counted nothing: {slow}");
+    let mut ck = Checks::default();
+    ck.that(
+        delayed > 0,
+        format!("the delay rule counted nothing: {slow}"),
+    );
+    ck.that(
+        c.roles.leader == roles(&c.dirs, 5).leader,
+        "the leader changed during the fault window: the rules named a stale topology",
+    );
     drop(nf);
-    assert!(
+    ck.that(
         ok_in_fault > ok_at_fault,
-        "commit did not advance while F1's reports were slow"
+        "commit did not advance while F1's reports were slow",
     );
-    assert!(
+    ck.that(
         reads_in_fault > reads_at_fault,
-        "no linearizable read completed while F1's reports were slow (F2's acks are prompt)"
+        "no linearizable read completed while F1's reports were slow (F2's acks are prompt)",
     );
-    std::thread::sleep(HEAL_WINDOW);
-    let entries = w.finish();
-    eprintln!(
-        "[one_direction_slow] ops={} ok={}",
-        entries.len(),
-        History::ok_count(&entries)
-    );
-    assert_linearizable(&entries, "netfault_one_direction_slow", "run0");
+    conclude(w, ck, "one_direction_slow");
 }
 
 // ----------------------------------------------------------------- Scenario D
@@ -423,7 +510,7 @@ fn one_direction_slow() {
 /// `retransmit` classification sees UC's repairs as repairs.
 #[test]
 fn repairs_dropped() {
-    let _g = NETFAULT_LOCK.lock().unwrap();
+    let _g = netfault_lock();
     shorten_client_timeout();
     let c = Cluster::boot();
     let nf = Netfault::attach("lo");
@@ -460,32 +547,37 @@ fn repairs_dropped() {
         (nf.counter(&data, "dropped"), nf.counter(&repair, "dropped"));
     eprintln!(
         "[repairs_dropped] data_dropped={data_dropped} repair_dropped={repair_dropped} \
-         ok={ok_at_fault}->{ok_in_fault} commit_at_heal={commit_at_heal} f1_durable_at_heal={f1_durable_at_heal}"
+         ok={ok_at_fault}->{ok_in_fault} commit_at_heal={commit_at_heal} \
+         f1_durable_at_heal={f1_durable_at_heal}"
     );
-    assert!(
+    let mut ck = Checks::default();
+    ck.that(
         data_dropped > 0,
-        "the DATA loss rule counted nothing: {data}"
+        format!("the DATA loss rule counted nothing: {data}"),
     );
-    assert!(
+    ck.that(
         repair_dropped > 0,
-        "the retransmit rule counted nothing: {repair}"
+        format!("the retransmit rule counted nothing: {repair}"),
+    );
+    ck.that(
+        f1_durable_at_heal < commit_at_heal,
+        format!(
+            "F1 did not fall behind during the fault (durable {f1_durable_at_heal} vs commit \
+             {commit_at_heal}): the repairs reached it"
+        ),
+    );
+    ck.that(
+        c.roles.leader == roles(&c.dirs, 5).leader,
+        "the leader changed during the fault window: the rules named a stale topology",
     );
     drop(nf);
-    assert!(
+    ck.that(
         ok_in_fault > ok_at_fault,
-        "commit did not advance during the fault (L+F2 are a quorum)"
+        "commit did not advance during the fault (L+F2 are a quorum)",
     );
-    wait_until(
-        CATCH_UP,
-        || cnc_positions(&c.dirs[f1]).1 >= commit_at_heal,
+    ck.that(
+        wait_until(CATCH_UP, || cnc_positions(&c.dirs[f1]).1 >= commit_at_heal),
         "F1's durable position did not reach L's commit-at-heal within 10 s of heal",
     );
-    std::thread::sleep(HEAL_WINDOW);
-    let entries = w.finish();
-    eprintln!(
-        "[repairs_dropped] ops={} ok={}",
-        entries.len(),
-        History::ok_count(&entries)
-    );
-    assert_linearizable(&entries, "netfault_repairs_dropped", "run0");
+    conclude(w, ck, "repairs_dropped");
 }
