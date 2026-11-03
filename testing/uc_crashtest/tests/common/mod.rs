@@ -757,11 +757,23 @@ pub fn open_cnc(dir: &Path) -> Option<Arc<CncPage>> {
 /// (both `NODE_FLAG_LEADER` and `NODE_FLAG_CAN_SERVE` set), reading every
 /// node's cnc directly. Returns its index.
 pub fn await_single_leader_multi(dirs: &[PathBuf], secs: u64) -> usize {
+    let all: Vec<usize> = (0..dirs.len()).collect();
+    await_single_leader_among(dirs, &all, secs)
+}
+
+/// [`await_single_leader_multi`] over only the `live` indices. A SIGKILLed
+/// node's cnc page is FROZEN with whatever flags it last wrote — a dead
+/// leader keeps reading as a serving leader (#35: only `instance.lock` tells
+/// a dead page from a live one) — so a wait that spans a kill must name the
+/// nodes still running.
+pub fn await_single_leader_among(dirs: &[PathBuf], live: &[usize], secs: u64) -> usize {
     use uc_protocol::v2::cnc::{NODE_FLAG_CAN_SERVE, NODE_FLAG_LEADER};
     let want = NODE_FLAG_LEADER | NODE_FLAG_CAN_SERVE;
     let deadline = Instant::now() + Duration::from_secs(secs);
     loop {
-        let serving: Vec<usize> = (0..dirs.len())
+        let serving: Vec<usize> = live
+            .iter()
+            .copied()
             .filter(|&i| {
                 open_cnc(&dirs[i]).is_some_and(|c| c.status().flags.load_acquire() & want == want)
             })
