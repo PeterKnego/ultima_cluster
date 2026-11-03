@@ -79,7 +79,7 @@ cleanup
 docker run -d --name "${SENDER}" debian:bookworm-slim sleep 3600 > /dev/null
 # One listener a port, each line stamped on arrival. busybox nc keeps to its first peer, so each port gets one socket.
 docker run -d --name "${RECEIVER}" alpine sh -c '
-    for p in 9130 9131 9132 9133; do
+    for p in 9130 9131 9132 9133 9134; do
         (nc -u -l -p $p | while read i t; do echo "$i $t $(cut -d" " -f1 /proc/uptime)"; done > /tmp/rx-$p) &
     done
     sleep 3600' > /dev/null
@@ -104,8 +104,12 @@ RX="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}
     fault "${SENDER}" rule --delay 200 9130
     fault "${SENDER}" rule --duplicate 100 9131
     fault "${SENDER}" rule --jitter 300 9132
+    # Direction: an --out rule leaves what comes back alone, an --in rule what goes out.
+    fault "${SENDER}" block --out --kind data 9140
+    fault "${SENDER}" block --in --kind data 9141
     fault "${RECEIVER}" attach
     fault "${RECEIVER}" rule --duplicate 100 9133
+    fault "${RECEIVER}" rule --out --duplicate 100 9134     # the receiver's replies, of which there are none
 } > "${LOG_DIR}/rules.log" 2>&1 || {
     echo "could not install the rules; see ${LOG_DIR}/rules.log"
     exit 1
@@ -138,8 +142,11 @@ dgram 0 1 1 0 32 >&3        # no peer rule: the port rule
 dgram 0 1 1 0 32 >&4        # the peer rule on its port
 dgram 0 1 1 0 32 >&5        # the peer rule on any port
 
-exec 3> /dev/udp/$RX/9130 4> /dev/udp/$RX/9131 5> /dev/udp/$RX/9132 6> /dev/udp/$RX/9133
-for i in {1..10}; do echo "$i $(cut -d" " -f1 /proc/uptime)" >&3; echo "$i x" >&4; echo "$i x" >&6; sleep 0.05; done
+exec 3> /dev/udp/10.99.0.1/9140 4> /dev/udp/10.99.0.1/9141
+for i in {1..5}; do dgram 0 1 1 0 32 >&3; dgram 0 1 1 0 32 >&4; done   # both only ever leave the sender
+
+exec 3> /dev/udp/$RX/9130 4> /dev/udp/$RX/9131 5> /dev/udp/$RX/9132 6> /dev/udp/$RX/9133 7> /dev/udp/$RX/9134
+for i in {1..10}; do echo "$i $(cut -d" " -f1 /proc/uptime)" >&3; echo "$i x" >&4; echo "$i x" >&6; echo "$i x" >&7; sleep 0.05; done
 for i in {1..20}; do echo "$i x" >&5; sleep 0.01; done
 ' 2> "${LOG_DIR}/send.log" || {
     echo "the sender failed; see ${LOG_DIR}/send.log"
@@ -148,7 +155,7 @@ for i in {1..20}; do echo "$i x" >&5; sleep 0.01; done
 sleep 1
 fault "${SENDER}" stats > "${LOG_DIR}/sender.txt"
 fault "${RECEIVER}" stats > "${LOG_DIR}/receiver.txt"
-for p in 9130 9131 9132 9133; do docker exec "${RECEIVER}" cat "/tmp/rx-${p}" > "${LOG_DIR}/rx-${p}.txt"; done
+for p in 9130 9131 9132 9133 9134; do docker exec "${RECEIVER}" cat "/tmp/rx-${p}" > "${LOG_DIR}/rx-${p}.txt"; done
 
 # ── checks ─────────────────────────────────────────────────────────────────────────────────────────
 S="${LOG_DIR}/sender.txt"
@@ -165,6 +172,11 @@ expect "${S}" "9111 data" delayed 1
 expect "${S}" "9111 retransmit" dropped 1
 expect "${S}" "9112 data" delayed 2
 expect "${S}" "9112 retransmit" dropped 1
+
+echo "-- direction"
+expect "${S}" "9140 data out" dropped 5
+expect "${S}" "9141 data in" dropped 0
+expect "${LOG_DIR}/receiver.txt" "9134 any out" duplicated 0
 
 echo "-- peers"
 expect "${S}" "9120 any" delayed 1
@@ -202,7 +214,7 @@ else
 fi
 
 echo "-- the CLI refuses what it cannot do"
-for args in "block --kind bogus 1" "block --kind 65534 1" "block --type data 1" "rule 1" "rule --loss 0 1" \
+for args in "block --kind bogus 1" "block --kind 65534 1" "block --type data 1" "block --out --in 1" "rule 1" "rule --loss 0 1" \
     "rule --delay 9000 --jitter 2000 1" "block --loss 5 1" "block 0" "block 65536" "block 9199 0" "remove x" \
     "block --peer no-such-host 1" "stats 1" "bogus"; do
     # shellcheck disable=SC2086
