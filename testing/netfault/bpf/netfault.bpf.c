@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Fredrik Dahlberg (faulteron, the Aeron original); Copyright 2026 Peter Knego (the UC variant)
 //
-// Impairs IPv4 UDP packets by rule: a peer address, a port matched as source or destination, and a UC datagram kind;
-// each may be any. A rule drops a percentage of what it matches, duplicates a percentage of the rest and delays it,
+// Impairs IPv4 UDP packets by rule: a peer address, a port matched as source or destination, a UC datagram kind, and
+// a direction (out of the interface, into it, or either); each may be any. A rule drops a percentage of what it matches, duplicates a percentage of the rest and delays it,
 // counting each. One program per direction, sharing the rules: delay needs the fq qdisc on the way out, so it applies
 // to egress only.
 //
@@ -25,6 +25,9 @@
 #define ANY_PORT 0
 #define ANY_PEER 0
 #define RETRANSMIT 0xfffe // a pseudo kind: DATA starting below what its flow already sent
+#define DIR_ANY 0
+#define DIR_OUT 1 // egress: leaving the interface
+#define DIR_IN 2  // ingress: arriving at it
 #define CLONE_MARK 0xfa017e40 // a duplicate this program made, passed through as it re-enters
 
 // uc_protocol::v2::datagram — the numbers a rule is keyed on. Pinned against the Rust constants by netfault_pins.rs.
@@ -50,9 +53,11 @@ _Static_assert(__builtin_offsetof(struct uc_header, key_epoch) == 14, "key_epoch
 
 struct rule_key
 {
-    __u16 port; // network byte order, or ANY_PORT
-    __u16 kind; // a UC datagram kind, RETRANSMIT or ANY
-    __u32 peer; // the far end's IPv4 address, network byte order, or ANY_PEER
+    __u16 port;    // network byte order, or ANY_PORT
+    __u16 kind;    // a UC datagram kind, RETRANSMIT or ANY
+    __u32 peer;    // the far end's IPv4 address, network byte order, or ANY_PEER
+    __u8 dir;      // DIR_OUT, DIR_IN or DIR_ANY
+    __u8 pad[3];
 };
 
 struct rule
@@ -141,36 +146,49 @@ struct selector
     int retransmit;
 };
 
-static __always_inline struct rule* lookup(__u32 peer, __u16 port, __u16 kind)
+static __always_inline struct rule* lookup(__u32 peer, __u16 port, __u8 dir, __u16 kind)
 {
-    struct rule_key key = {.port = port, .kind = kind, .peer = peer};
+    struct rule_key key = {.port = port, .kind = kind, .peer = peer, .dir = dir, .pad = {0, 0, 0}};
     return bpf_map_lookup_elem(&rules, &key);
 }
 
-// The most specific selector first: retransmit, then the kind, then any.
-static __always_inline struct rule* find(__u32 peer, __u16 port, struct selector* what)
+// The most specific selector first: retransmit, then the kind, then any; within each the packet's own direction
+// before either.
+static __always_inline struct rule* find(__u32 peer, __u16 port, __u8 dir, struct selector* what)
 {
     struct rule* rule = 0;
     if (what->retransmit)
     {
-        rule = lookup(peer, port, RETRANSMIT);
+        rule = lookup(peer, port, dir, RETRANSMIT);
+        if (!rule)
+        {
+            rule = lookup(peer, port, DIR_ANY, RETRANSMIT);
+        }
     }
     if (!rule && what->kind != ANY)
     {
-        rule = lookup(peer, port, what->kind);
+        rule = lookup(peer, port, dir, what->kind);
+        if (!rule)
+        {
+            rule = lookup(peer, port, DIR_ANY, what->kind);
+        }
     }
-    return rule ? rule : lookup(peer, port, ANY);
+    if (!rule)
+    {
+        rule = lookup(peer, port, dir, ANY);
+    }
+    return rule ? rule : lookup(peer, port, DIR_ANY, ANY);
 }
 
 // The most specific address first: the peer, then any; within each, destination port, source port, any.
-static __always_inline struct rule* find_any(__u32 peer, __u16 dport, __u16 sport, struct selector* what)
+static __always_inline struct rule* find_any(__u32 peer, __u16 dport, __u16 sport, __u8 dir, struct selector* what)
 {
-    struct rule* rule = find(peer, dport, what);
+    struct rule* rule = find(peer, dport, dir, what);
     if (!rule)
     {
-        rule = find(peer, sport, what);
+        rule = find(peer, sport, dir, what);
     }
-    return rule ? rule : find(peer, ANY_PORT, what);
+    return rule ? rule : find(peer, ANY_PORT, dir, what);
 }
 
 static __always_inline struct rule* match(struct __sk_buff* skb, int egress)
@@ -210,8 +228,9 @@ static __always_inline struct rule* match(struct __sk_buff* skb, int egress)
     }
 
     __u32 peer = egress ? ip->daddr : ip->saddr;
-    struct rule* rule = find_any(peer, udp->dest, udp->source, &what);
-    return rule ? rule : find_any(ANY_PEER, udp->dest, udp->source, &what);
+    __u8 dir = egress ? DIR_OUT : DIR_IN;
+    struct rule* rule = find_any(peer, udp->dest, udp->source, dir, &what);
+    return rule ? rule : find_any(ANY_PEER, udp->dest, udp->source, dir, &what);
 }
 
 static __always_inline int impair(struct __sk_buff* skb, int egress)

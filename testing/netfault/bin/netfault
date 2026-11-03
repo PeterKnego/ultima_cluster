@@ -4,7 +4,7 @@
 #   netfault attach                   load the programs and attach them at tc ingress and egress, with fq as the root
 #                                     qdisc (replaces a previous attach, and with it every rule)
 #   netfault detach                   remove them and fq, which heals every rule at once
-#   netfault rule [selector] [--loss PCT] [--duplicate PCT] [--delay MS] [--jitter MS] [<port>...]
+#   netfault rule [selector] [--out|--in] [--loss PCT] [--duplicate PCT] [--delay MS] [--jitter MS] [<port>...]
 #                                     drop PCT% of matching UDP, send PCT% of the rest twice, and hold what leaves the
 #                                     interface MS plus up to jitter MS (replaces that rule)
 #   netfault block [selector] [<port>...]     rule --loss 100
@@ -16,8 +16,10 @@
 #   --peer ADDR     the far end — the destination going out, the source coming in — by IPv4 address or host name
 #   --kind K        a UC datagram kind by name (below) or number, or retransmit — DATA starting below what its flow
 #                   already sent in the same term — or any (the default), which also matches what is not UC
+#   --out | --in    only packets leaving the interface, or only packets arriving at it; neither means both
 # A packet goes to the most specific rule that matches it: a rule naming its peer before one that does not, then its
-# destination port, its source port, any port, and within each retransmit, then kind, then any. Delay applies only to
+# destination port, its source port, any port, within each retransmit, then kind, then any, and within each of those
+# a rule naming the packet's direction before one that does not. Delay applies only to
 # packets leaving the interface: to delay what reaches a node, impair the sender's interface. Jitter beyond the gap
 # between packets reorders them.
 #
@@ -141,18 +143,22 @@ peer_bytes() {
     printf '%02x %02x %02x %02x' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}" "${BASH_REMATCH[4]}"
 }
 
-# Resolves the selector into KIND and PEER, the last as key bytes.
+# Resolves the selector into KIND, PEER (as key bytes) and DIR.
 selector() {
     KIND="${ANY}"
     PEER="00 00 00 00"
+    DIR=0
     [[ -n "${kind}" ]] && KIND="$(kind_number "${kind}")"
     [[ -n "${peer}" ]] && PEER="$(peer_bytes "${peer}")"
+    [[ -n "${out}" && -n "${in}" ]] && die "--out and --in exclude each other"
+    [[ -n "${out}" ]] && DIR=1
+    [[ -n "${in}" ]] && DIR=2
     return 0
 }
 
-# The port in network order, then the kind as a little-endian u16, then the peer.
+# The port in network order, the kind as a little-endian u16, the peer, then the direction and three zero bytes.
 rule_key() {
-    printf 'hex %02x %02x %s %s' $(($1 >> 8)) $(($1 & 255)) "$(le16 "${KIND}")" "${PEER}"
+    printf 'hex %02x %02x %s %s %02x 00 00 00' $(($1 >> 8)) $(($1 & 255)) "$(le16 "${KIND}")" "${PEER}" "${DIR}"
 }
 
 # Sets RULE_PORTS to the ports given, or to 0 — any port — if none were. Run in this shell, not a substitution, so a
@@ -221,7 +227,8 @@ le_at() {
     echo $((16#${hex}))
 }
 
-# The key is 8 bytes (port 0..2, kind 2..4, peer 4..8) and the value 48 (four u32s, three u64s).
+# The key is 12 bytes (port 0..2, kind 2..4, peer 4..8, direction 8, padding) and the value 48 (four u32s, three
+# u64s).
 stats() {
     local map port line
     map="$(map_id)"
@@ -233,9 +240,13 @@ stats() {
             line="${port} $(kind_name "$(le_at b 2 2)")"
             [[ "${b[4]}${b[5]}${b[6]}${b[7]}" == 00000000 ]] \
                 || line+=" peer=$((16#${b[4]})).$((16#${b[5]})).$((16#${b[6]})).$((16#${b[7]}))"
-            echo "${line} loss=$(le_at b 8 4)% duplicate=$(le_at b 12 4)%" \
-                "delay=$(($(le_at b 16 4) / 1000))ms jitter=$(($(le_at b 20 4) / 1000))ms" \
-                "dropped=$(le_at b 24 8) duplicated=$(le_at b 32 8) delayed=$(le_at b 40 8)"
+            case "${b[8]}" in
+                01) line+=" out" ;;
+                02) line+=" in" ;;
+            esac
+            echo "${line} loss=$(le_at b 12 4)% duplicate=$(le_at b 16 4)%" \
+                "delay=$(($(le_at b 20 4) / 1000))ms jitter=$(($(le_at b 24 4) / 1000))ms" \
+                "dropped=$(le_at b 28 8) duplicated=$(le_at b 36 8) delayed=$(le_at b 44 8)"
         done
 }
 
@@ -243,13 +254,17 @@ usage="usage: netfault attach|detach|stats|rule [options] [<port>...]|block [sel
 usage+="|remove [selector] [<port>...]"
 cmd="${1:-}"
 shift || true
-peer="" kind="" loss="" duplicate="" delay="" jitter=""
+peer="" kind="" out="" in="" loss="" duplicate="" delay="" jitter=""
 ports=()
 while (($# > 0)); do
     case "$1" in
         --peer | --kind | --loss | --duplicate | --delay | --jitter)
             printf -v "${1#--}" '%s' "${2:?$1 needs a value}"
             shift 2
+            ;;
+        --out | --in)
+            printf -v "${1#--}" '%s' 1
+            shift
             ;;
         --*) die "unknown option: $1" ;;
         *)
@@ -260,7 +275,7 @@ while (($# > 0)); do
 done
 case "${cmd}" in
     attach | detach | stats)
-        [[ -z "${peer}${kind}${loss}${duplicate}${delay}${jitter}" ]] && ((${#ports[@]} == 0)) \
+        [[ -z "${peer}${kind}${out}${in}${loss}${duplicate}${delay}${jitter}" ]] && ((${#ports[@]} == 0)) \
             || die "${cmd} takes no arguments"
         "${cmd}"
         ;;

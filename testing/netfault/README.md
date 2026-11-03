@@ -1,7 +1,7 @@
 # netfault — network fault injection for UC nodes, in eBPF
 
-A pair of `tc` programs that drop, duplicate and delay UDP on one interface by peer address, port and **UC datagram
-kind**. A test can cut one link between two nodes and leave every other, cut a node off from its peers while its
+A pair of `tc` programs that drop, duplicate and delay UDP on one interface by peer address, port, direction and
+**UC datagram kind**. A test can cut one link between two nodes and leave every other, cut a node off from its peers while its
 clients stay attached, take away one half of loss repair (NAKs one way), make a link slow, reordering and
 duplicating, or silence one node's votes and nothing else. Process kills and pauses cannot produce any of these,
 and neither can the in-process `uc_net::fault::FaultSocket`, which never touches a kernel socket.
@@ -46,7 +46,7 @@ F node-1 block --kind nak 9001                    # drop only NAKs: no loss repa
 F node-1 rule --kind data --loss 5 9001           # drop 5% of DATA
 F node-1 rule --delay 20 --jitter 30 --duplicate 10 9001
 F node-1 block --kind retransmit 9001             # drop only repairs: the repair-of-a-repair path
-F node-1 block --kind vote 9001                   # node-1 is never heard in an election
+F node-1 block --out --kind vote 9001             # node-1's votes never leave; votes reaching it are untouched
 F node-1 block --kind probe 9001                  # the cluster never raises its jumbo rung
 F node-1 block --peer node-2                      # cut the node-1 ↔ node-2 link, on any port
 F node-1 rule --kind snap-chunk --delay 50 9001   # a slow snapshot session
@@ -70,10 +70,15 @@ A rule matches UDP to or from each port given, or any port if none is, narrowed 
   not UC. `retransmit` is DATA whose position starts below the furthest its flow has already sent in the same
   leadership term; a flow is one sender's DATA to one destination address and port. A later term starts a new
   frontier, since a new leader may truncate, and a stale term's DATA is neither a repair nor a frontier.
+- `--out` or `--in`: only packets leaving the interface, or only packets arriving at it. Neither means both, so a
+  rule on a link acts on both directions of it unless told otherwise — `--peer node-2` cuts the link, `--out --peer
+  node-2` cuts only what this node sends on it. (Roles make some kinds one-directional anyway: a leader sends DATA,
+  a follower NAKs.)
 
 A packet goes to the most specific rule that matches it: one naming its peer before one that does not, then its
-destination port, its source port, any port, and within each `retransmit`, then kind, then `any`. A packet no rule
-matches costs up to 18 hash lookups. A rule drops `--loss` percent of what it matches, sends `--duplicate` percent
+destination port, its source port, any port, within each `retransmit`, then kind, then `any`, and within each of
+those one naming the packet's direction before one that does not. A packet no rule matches costs up to 36 hash
+lookups. A rule drops `--loss` percent of what it matches, sends `--duplicate` percent
 of the rest twice, and holds it `--delay` plus up to `--jitter` milliseconds. Jitter longer than the gap between
 packets reorders them.
 
@@ -90,7 +95,8 @@ and timestamped lines between two throwaway containers, with one rule of every k
 rule each packet went to, what the rules counted, what the receiver got (delay, duplicates both ways, reordering),
 that the CLI refuses bad input without changing any rule, and that `remove` and `detach` undo exactly what they
 should. Its retransmission cases cover a term bump (not a repair) and a sealed flow (the frontier is the log bytes,
-not the wire bytes). On a box whose default docker context is rootless, run it with `DOCKER_CONTEXT=default`.
+not the wire bytes), and its direction cases that an `--out` rule never acts on what arrives and an `--in` rule never
+on what leaves. On a box whose default docker context is rootless, run it with `DOCKER_CONTEXT=default`.
 
 `cargo test -p uc_crashtest --test netfault_pins` is the wire pin, and runs in the ordinary workspace test job.
 
