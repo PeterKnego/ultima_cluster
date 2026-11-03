@@ -185,18 +185,22 @@ record what is not proved:
   of the wire window, election credential floors for wiped nodes, a
   persisted commit watermark (the truncation-below-commit defence forgets
   state across reboot).
-- **A network-fault gate on the fleet.** `testing/netfault` (2026-11-03, a
-  fork of faulteron keyed on UC's datagram kind) can drop, duplicate and delay
-  one kind on one link of a real cluster, which no in-process layer can; the
-  tool is proved, the scenarios are not written. The gate: a three-node fleet
-  under the WGL checker while one link loses NAKs, one node's votes are
-  silenced, one direction is delayed and jittered, and the `retransmit`
-  pseudo-kind is dropped — safety PASS under each, and a pre-committed bound
-  on commit resuming after heal. It replaces `bench-infra`'s uniform netem
-  knob, and it is the instrument jumbo row c's soak and the 2026-09-08
-  `remote_lin` hang have been waiting for (`docs/VERIFICATION.md` §2, "The
-  kernel-level fault layer"). A failure it finds is root-caused only once
-  `uc_sim` reproduces it from a seed.
+- **The network-fault measurement on the fleet.** `testing/netfault` (a fork
+  of faulteron keyed on UC's datagram kind and direction) drops, duplicates
+  and delays one kind on one link of a real cluster, and since 2026-11-03 the
+  four scenarios — one link loses NAKs, one node's votes are silenced, one
+  direction is delayed and jittered, repairs are dropped — run **nightly on
+  three real node processes under the WGL checker**
+  (`testing/uc_crashtest/tests/netfault.rs`; `docs/VERIFICATION.md` §2, "The
+  kernel-level fault layer"). What is left is the fleet: the same scenarios
+  on `bench-infra`'s hosts under load, a history client beside the nodes,
+  recorded as a gate doc whose **first run is a measurement with no bar**
+  (the maintainer's decision, 2026-11-03; safety stays a hard check) — plan 2
+  of `docs/superpowers/specs/2026-11-03-uc2-netfault-scenarios-design.md`
+  §6. It retires `bench-infra`'s never-applied netem knob, and it is the
+  instrument jumbo row c's soak and the 2026-09-08 `remote_lin` hang have
+  been waiting for. A failure it finds is root-caused only once `uc_sim`
+  reproduces it from a seed.
 - **Why:** every proof gate so far found exactly one real bug; this is the
   direction most likely to find the next one.
 

@@ -176,6 +176,53 @@ jobs:
       - name: Multi-process SIGKILL linearizability (crypto ON)
         run: cargo test -p uc_crashtest --features hard-crash-tests
 
+  # netfault scenarios (design docs/superpowers/specs/2026-11-03-uc2-netfault-
+  # scenarios-design.md §4): three real node processes on 127.0.0.2/3/4 under
+  # one-kind, one-link, one-direction tc/eBPF faults from testing/netfault,
+  # attached on `lo` through `sudo -n` (the runner's passwordless sudo), under
+  # the WGL checker. Four scenarios: NAK loss on one link, one member's votes
+  # silenced, one direction slow and reordering, repairs dropped. Every
+  # scenario asserts its rule FIRED, so a red here is never a vacuous fault.
+  # `--test-threads=1`: the scenarios share one attachment. The host needs
+  # bpftool, jq and tc for the CLI; Ubuntu packages bpftool per kernel
+  # (linux-tools-<release> / linux-tools-azure), which scripts/
+  # ci_install_bpftool.sh installs or fails by name — no unverified download.
+  netfault-scenarios:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: Swatinem/rust-cache@v2
+      - name: Install clang, libbpf headers, jq, iproute2
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends clang libbpf-dev linux-libc-dev jq iproute2
+      - name: Install bpftool (distro package, or fail by name)
+        run: scripts/ci_install_bpftool.sh
+      - name: Build the BPF program
+        run: make -C testing/netfault
+      - name: netfault scenarios (cleartext)
+        run: cargo test -p uc_crashtest --features netfault-tests --test netfault -- --test-threads=1 --nocapture
+
+  # The same four scenarios with wire crypto ON: the kind rules are claimed to
+  # work under crypto (the header is cleartext AAD), and Scenario D's
+  # `retransmit` frontier depends on the sealed-payload arithmetic. A separate
+  # job, as every crypto leg in this file is.
+  netfault-scenarios-crypto:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      UC2_CRYPTO: '1'
+    steps:
+      - uses: actions/checkout@v5
+      - uses: Swatinem/rust-cache@v2
+      - name: Install clang, libbpf headers, jq, iproute2
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends clang libbpf-dev linux-libc-dev jq iproute2
+      - name: Install bpftool (distro package, or fail by name)
+        run: scripts/ci_install_bpftool.sh
+      - name: Build the BPF program
+        run: make -C testing/netfault
+      - name: netfault scenarios (crypto ON)
+        run: cargo test -p uc_crashtest --features netfault-tests --test netfault -- --test-threads=1 --nocapture
+
   # M11 Task 3: the spec's acceptance sentence as a CI test — a node is
   # backed up under load, its host destroyed, a new host restored from the
   # backup alone, and it rejoins and converges. Real multi-process (3 node +
