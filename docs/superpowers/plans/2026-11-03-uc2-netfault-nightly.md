@@ -75,7 +75,14 @@
 
 - [ ] **Step 1: Write `spike.sh`**: inside `docker run --rm --privileged -v <checkout>/testing/netfault:/nf:ro netfault:local bash`, with `NETFAULT_DEV=lo`: start `nc -u -l 127.0.0.3 <B>` and `nc -u -l 127.0.0.2 <A>` writers to files, send 5 datagrams A→B and 5 B→A with `/dev/udp/`, install the block, send 5 more each way, read `stats`, detach; then the delay check with `/proc/uptime` stamps as the self-test does; then the retransmit check with the self-test's `dgram` helper (copy the function).
 - [ ] **Step 2: Run it** via `sg docker -c 'DOCKER_CONTEXT=default bash $HOME/scratch/netfault-spike/spike.sh'`. Expected: block `dropped=5`, B→A file has 10 lines, A→B file has 5; delay ≈ 0.2 s; retransmit `dropped=0`.
-- [ ] **Step 3: Record** the three observations in this task; if any fails, stop and amend the spec §3 before Task 3.
+- [x] **Step 3: Record** the three observations in this task; if any fails, stop and amend the spec §3 before Task 3.
+
+  **Observed 2026-11-03** (privileged `netfault:local` container, own `lo`, two Python peers on `127.0.0.2:9201`
+  and `127.0.0.3:9301`, 5 datagrams each way per run): (a) `block --out --peer 127.0.0.3 9201` → `dropped=5`,
+  B received 0 of A's 5, A still received all 5 of B's. (b) `rule --out --delay 200 --peer 127.0.0.3 9201` →
+  `delayed=5`, A→B late by 0.200–0.201 s, B→A by 0.000 s. (c) `block --out --kind retransmit --peer 127.0.0.3
+  9201` with DATA at positions 0, 32, 64, 96 then 0 again → `dropped=1`, B received the four ascending ones: the
+  ingress pass's classification never touched the egress rule. Spec §3's loopback paragraph is observation now.
 
 ### Task 3: Suite scaffolding + Scenario A (NAK loss on one link)
 
