@@ -767,6 +767,17 @@ pub fn await_single_leader_multi(dirs: &[PathBuf], secs: u64) -> usize {
 /// a dead page from a live one) — so a wait that spans a kill must name the
 /// nodes still running.
 pub fn await_single_leader_among(dirs: &[PathBuf], live: &[usize], secs: u64) -> usize {
+    try_await_single_leader_among(dirs, live, secs).unwrap_or_else(|e| panic!("{e}"))
+}
+
+/// [`await_single_leader_among`] that returns the timeout as an `Err` instead
+/// of panicking, for a scenario that must still check its history after a
+/// missed election. A split brain still panics: that is a safety finding.
+pub fn try_await_single_leader_among(
+    dirs: &[PathBuf],
+    live: &[usize],
+    secs: u64,
+) -> Result<usize, String> {
     use uc_protocol::v2::cnc::{NODE_FLAG_CAN_SERVE, NODE_FLAG_LEADER};
     let want = NODE_FLAG_LEADER | NODE_FLAG_CAN_SERVE;
     let deadline = Instant::now() + Duration::from_secs(secs);
@@ -783,13 +794,13 @@ pub fn await_single_leader_among(dirs: &[PathBuf], live: &[usize], secs: u64) ->
             "split-brain: dirs {serving:?} all serve"
         );
         if serving.len() == 1 {
-            return serving[0];
+            return Ok(serving[0]);
         }
-        assert!(
-            Instant::now() < deadline,
-            "no single leader among {} dirs within {secs}s",
-            dirs.len()
-        );
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "no single leader among nodes {live:?} within {secs}s"
+            ));
+        }
         std::thread::sleep(Duration::from_millis(20));
     }
 }
@@ -1169,6 +1180,16 @@ pub fn cnc_positions(dir: &Path) -> (u64, u64) {
 /// Scenarios share one attachment per interface: never two at once.
 pub static NETFAULT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Takes [`NETFAULT_LOCK`]. A scenario that panics while holding it poisons
+/// the mutex; the next scenario must still run (one red must not become
+/// four), so poisoning is ignored — the guard protects an attachment that
+/// the panicking scenario's `Netfault` drop has already detached.
+pub fn netfault_lock() -> std::sync::MutexGuard<'static, ()> {
+    NETFAULT_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// The `testing/netfault` CLI, attached on `dev` for the guard's lifetime.
 /// Runs as root directly, or through `sudo -n` otherwise. Every failure is
 /// by name: there is no silent skip.
@@ -1294,6 +1315,20 @@ impl Drop for Netfault {
 /// LOCATION rather than hold a nightly job to its 60-minute cancellation.
 #[cfg(test)]
 mod bounded_wait_tests {
+    #[test]
+    fn a_scenario_that_panicked_under_the_netfault_lock_does_not_block_the_next() {
+        let poisoner = std::thread::spawn(|| {
+            let _g = super::netfault_lock();
+            panic!("a scenario failed while holding the lock");
+        });
+        assert!(
+            poisoner.join().is_err(),
+            "the poisoner must panic while holding the lock"
+        );
+        // The next scenario takes the lock on the same static.
+        let _g = super::netfault_lock();
+    }
+
     use super::*;
 
     #[test]

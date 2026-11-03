@@ -752,14 +752,16 @@ pass), then that the history is linearizable, then its liveness claim:
 | scenario | fault | what it proves (first run, 2026-11-03) |
 |---|---|---|
 | `nak_loss_on_one_link` | every NAK F1 sends toward L dropped; 1 DATA in 10 from L to F1 lost | L+F2 commit on (ok 29→882 in 5 s); F1's durable reached L's commit within 10 s of heal; 1 774 ops linearizable (946 NAKs dropped) |
-| `votes_silenced` | F1's VOTE datagrams never leave; L SIGKILLed | the cluster elects **F1**, the member nobody can hear voting — F2 cannot collect a second vote, F1 can (4 votes dropped when F2 campaigned; whether it campaigns is a timer race, which a counting rule on F2's REQUEST_VOTEs makes the assertion exact about); L rejoins as follower; linearizable across the failover |
+| `votes_silenced` | F1's VOTE datagrams never leave; L SIGKILLed | the cluster elects **F1**, the member nobody can hear voting — F2 cannot collect a second vote, F1 can (4 votes dropped when F2 campaigned; whether it campaigns is a timer race, which a counting rule on F2's REQUEST_VOTEs makes the assertion exact about); L restarts and the cluster re-converges on one leader; linearizable across the failover |
 | `one_direction_slow` | everything F1 sends toward L held 20–50 ms, reordered | commit and linearizable reads keep completing on F2's prompt reports (ok 13→818, ok reads 5→279; 1 108 datagrams delayed) |
 | `repairs_dropped` | 1 DATA in 10 from L to F1 lost AND every repair (`retransmit`) to F1 dropped | F1 froze at durable 1 728 while commit reached 37 728 (1 029 repairs dropped) and caught up within 10 s of heal — netfault's `retransmit` classification seen live against UC's own repairs |
 
-The harness lesson that run taught: a SIGKILLed node's cnc page is frozen
+Two harness lessons that run taught: a SIGKILLed node's cnc page is frozen
 with `LEADER|CAN_SERVE` still set (#35), so a leader wait that spans a kill
-must name the live nodes (`await_single_leader_among`); the all-dirs wait
-returned the dead leader at once.
+must name the live nodes (`await_single_leader_among`) — the all-dirs wait
+returned the dead leader at once; and the checks are asserted only AFTER the
+history is checked, so a missed counter or a timeout never hides a
+`Violation`, which spec §7 ranks first.
 
 What is **not** done: the fleet. The same four scenarios on `bench-infra`'s
 hosts under load, recorded as a gate doc — the first run a measurement with
