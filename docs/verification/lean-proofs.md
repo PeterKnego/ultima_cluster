@@ -145,7 +145,13 @@ The rig covers the three consensus kernels. It does not cover the whole node. Th
 
 The way to close that gap for good is to translate the real Rust into Lean mechanically and prove theorems about the translation. [Aeneas](https://github.com/AeneasVerif/aeneas) does this, and the approach worked in [`ultima_db`](https://github.com/PeterKnego/ultima_db), where the proofs run against mechanically translated code. It was tried here and **stopped at a toolchain wall**. At the time, Aeneas's Lean support library pinned Lean v4.31.0, and it did not build under this repo's v4.32.0. Charon, the front end that reads the Rust, processed `uc_consensus` cleanly. So the approach was feasible, and only the version timing blocked it. Downgrading the repo's Lean to chase a research tool was rejected. The retry condition was Aeneas moving to v4.32.0 or later.
 
-**That condition has been met, but the retry has not been run.** Aeneas moved to Lean v4.35.0 on 2026-10-15, in commit `1238879f`. On 2026-11-10 this repo moved to v4.35.0 too, so the two now share a toolchain. A retry should pin that Aeneas commit rather than Aeneas's `main`, which has since moved on to a release candidate.
+**The retry was run on 2026-11-10, and it worked.** Aeneas moved to Lean v4.35.0 on 2026-10-15, and this repo followed on 2026-11-10. With both on one toolchain, three things were shown:
+
+- The commit tracker and the vote rule translate exactly as they ship.
+- One theorem is proved about translated code. `log_ok_order_eq_model` says the translation of the shipped `log_ok_order` equals the model's `logOk` on every input, over the standard three axioms.
+- `reconcile` does not translate as it ships, because of three spots in the alignment code. A rewrite of those three spots as plain loops translates completely, and the conformance rig cannot tell it from the shipped code.
+
+None of this is committed to `proofs/` or to the Rust. The record, with the exact versions, commands and the rewrite, is [`uc2-aeneas-retry-2026-11-10.md`](/docs/benchmarks/uc2-aeneas-retry-2026-11-10.md).
 
 ## The trusted base
 
