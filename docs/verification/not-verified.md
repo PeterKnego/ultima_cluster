@@ -28,7 +28,7 @@ A real acked-write-loss bug lived in exactly that gap. It is Finding #12. It was
 
 ### There is no Rust-to-Lean extraction
 
-**This repo has no Rust-to-Lean extraction.** Extraction would turn the Rust code itself into Lean terms. The standing link between model and code is the conformance rig plus `#guard` pins. Aeneas extraction was blocked on toolchain versions, not on feasibility. Aeneas and this repo now share Lean v4.35.0, so the block is gone, but the retry has not been run. See [Lean proofs](lean-proofs.md).
+**This repo has no Rust-to-Lean extraction.** Extraction would turn the Rust code itself into Lean terms. The standing link between model and code is the conformance rig plus `#guard` pins. Aeneas extraction was blocked on toolchain versions until 2026-11-10. A retry on that date showed it works here, and proved one theorem about translated code, but nothing from it is in the repo's proofs yet. See [Lean proofs](lean-proofs.md).
 
 ## Your state machine
 
