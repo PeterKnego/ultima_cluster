@@ -463,17 +463,124 @@ fn replayed(dir: &Path) -> Vec<ReplayFrame> {
 
 /// Assert the replayed frame streams of the given journal dirs are byte-equal.
 /// Every node must already be STOPPED (archives dropped) before calling.
+///
+/// On a mismatch this panics with a bounded report of the first differing
+/// frame and its neighbours, instead of `assert_eq!`'s Debug dump of both
+/// whole streams. That dump is one line per side, thousands of frames long,
+/// and GitHub's log drops it: #161's CI sightings carried only the message.
 fn assert_replay_equal(dirs: &[&PathBuf]) {
     let golden = replayed(dirs[0]);
     assert!(!golden.is_empty(), "golden journal empty");
     for d in &dirs[1..] {
-        assert_eq!(
-            replayed(d),
-            golden,
-            "journal {d:?} diverged from {:?}",
-            dirs[0]
-        );
+        let other = replayed(d);
+        if other != golden {
+            panic!(
+                "journal {d:?} diverged from {:?}\n{}",
+                dirs[0],
+                replay_divergence(&golden, &other)
+            );
+        }
     }
+}
+
+/// Frames of shared context printed before the first difference.
+const DIVERGENCE_CONTEXT: usize = 2;
+
+/// One frame, short: position, full header, payload length and its first
+/// 16 bytes. A whole payload adds nothing the header and the prefix do not
+/// already say about which frame this is.
+fn frame_line(f: &ReplayFrame) -> String {
+    let head: String = f
+        .payload
+        .iter()
+        .take(16)
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    format!(
+        "pos={} {:?} payload_len={} payload[..16]={head}",
+        f.position,
+        f.header,
+        f.payload.len()
+    )
+}
+
+/// A bounded description of where two replayed streams first differ: both
+/// lengths, the first differing index with a little shared context before
+/// it, the frame each side holds there, and each side's last frame.
+fn replay_divergence(golden: &[ReplayFrame], other: &[ReplayFrame]) -> String {
+    let mut out = format!(
+        "golden: {} frames, other: {} frames\n",
+        golden.len(),
+        other.len()
+    );
+    let first = golden
+        .iter()
+        .zip(other)
+        .position(|(g, o)| g != o)
+        .unwrap_or(golden.len().min(other.len()));
+    out += &format!("first difference at frame index {first}\n");
+    let from = first.saturating_sub(DIVERGENCE_CONTEXT);
+    for (i, f) in golden.iter().enumerate().take(first).skip(from) {
+        out += &format!("  [{i}] both:   {}\n", frame_line(f));
+    }
+    for (name, s) in [("golden", golden), ("other ", other)] {
+        match s.get(first) {
+            Some(f) => out += &format!("  [{first}] {name}: {}\n", frame_line(f)),
+            None => out += &format!("  [{first}] {name}: <stream ended>\n"),
+        }
+    }
+    for (name, s) in [("golden", golden), ("other ", other)] {
+        if let Some(f) = s.last() {
+            out += &format!("  last {name}: [{}] {}\n", s.len() - 1, frame_line(f));
+        }
+    }
+    out
+}
+
+#[test]
+fn replay_divergence_names_the_first_differing_frame() {
+    let frame = |position: u64, byte: u8| ReplayFrame {
+        position,
+        header: uc_protocol::v2::frame::FrameHeader {
+            length: 128,
+            frame_type: 1,
+            flags: 0,
+            leadership_term_id: 3,
+            client_id: 0,
+            seq: 0,
+            time_ns: 0,
+        },
+        payload: vec![byte; PAYLOAD],
+    };
+    let golden = vec![frame(0, 1), frame(128, 2), frame(256, 3), frame(384, 4)];
+
+    // A changed frame in the middle: index 2, with frames 0 and 1 as context.
+    let mut changed = golden.clone();
+    changed[2].payload[0] = 9;
+    let report = replay_divergence(&golden, &changed);
+    assert!(
+        report.contains("first difference at frame index 2"),
+        "{report}"
+    );
+    assert!(
+        report.contains("[0] both:") && report.contains("[1] both:"),
+        "{report}"
+    );
+    assert!(report.contains("payload[..16]=0903"), "{report}");
+
+    // A shorter stream: the difference is where it ends.
+    let report = replay_divergence(&golden, &golden[..3]);
+    assert!(
+        report.contains("first difference at frame index 3"),
+        "{report}"
+    );
+    assert!(report.contains("[3] other : <stream ended>"), "{report}");
+
+    // The report stays bounded however long the streams are.
+    let long: Vec<_> = (0..5000).map(|i| frame(i * 128, 1)).collect();
+    let mut long_other = long.clone();
+    long_other[4000].payload[0] = 2;
+    assert!(replay_divergence(&long, &long_other).lines().count() <= 8);
 }
 
 /// Cut every link between `a` and `b` (both send directions).
