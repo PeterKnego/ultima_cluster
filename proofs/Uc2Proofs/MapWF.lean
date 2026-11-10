@@ -690,7 +690,7 @@ private theorem minv_step {n : Nat} {w w' : World n} (hw : Reachable w)
             (if (w.nodes k).pn.currentTerm < nt then nt
               else (w.nodes k).dataTerm)
               < ((w.nodes k).pn.recvRequestVote c nt clt cd).1.currentTerm
-          rw [hfr.1, hfr.2, if_neg hadopt]
+          rw [hfr.1, hfr.2, ite_eq_right hadopt]
           exact hn.cand_dt_lt
         · show ((w.nodes k).pn.recvRequestVote c nt clt cd).1.role
               = .candidate →
@@ -883,8 +883,8 @@ private theorem minv_step {n : Nat} {w w' : World n} (hw : Reachable w)
         · intro hr
           rw [hro] at hr
           by_cases hadopt : (w.nodes k).pn.currentTerm < t
-          · rw [if_pos hadopt] at hr; cases hr
-          · rw [if_neg hadopt] at hr
+          · rw [ite_eq_left hadopt] at hr; cases hr
+          · rw [ite_eq_right hadopt] at hr
             have hteq : t = (w.nodes k).pn.currentTerm := by omega
             have hgp := (reachable_dinv hw).gossip_pinned k hr entries
               (hteq ▸ hmsg)
@@ -894,18 +894,18 @@ private theorem minv_step {n : Nat} {w w' : World n} (hw : Reachable w)
           rw [hro] at hr
           rw [hct]
           by_cases hadopt : (w.nodes k).pn.currentTerm < t
-          · rw [if_pos hadopt] at hr; exact absurd rfl hr
-          · rw [if_neg hadopt] at hr
-            rw [if_neg hadopt]
+          · rw [ite_eq_left hadopt] at hr; exact absurd rfl hr
+          · rw [ite_eq_right hadopt] at hr
+            rw [ite_eq_right hadopt]
             exact hn.role_term_pos hr
         · intro e he; rw [hm] at he; cases he
         · intro hr
           rw [hro] at hr
           rw [hct, hdt]
           by_cases hadopt : (w.nodes k).pn.currentTerm < t
-          · rw [if_pos hadopt] at hr; cases hr
-          · rw [if_neg hadopt] at hr
-            rw [if_neg hadopt, if_neg hadopt]
+          · rw [ite_eq_left hadopt] at hr; cases hr
+          · rw [ite_eq_right hadopt] at hr
+            rw [ite_eq_right hadopt, ite_eq_right hadopt]
             exact hn.cand_dt_lt hr
         · intro hr e he; rw [hm] at he; cases he
         · intro p t' v' hh
@@ -931,41 +931,41 @@ private theorem minv_step {n : Nat} {w w' : World n} (hw : Reachable w)
             rw [hro] at hr
             rw [hm]
             by_cases hadopt : (w.nodes k).pn.currentTerm < t
-            · rw [if_pos hadopt] at hr; cases hr
-            · rw [if_neg hadopt] at hr
+            · rw [ite_eq_left hadopt] at hr; cases hr
+            · rw [ite_eq_right hadopt] at hr
               exact hn.leader_map hr
           · intro hr
             rw [hro] at hr
             rw [hct]
             by_cases hadopt : (w.nodes k).pn.currentTerm < t
-            · rw [if_pos hadopt] at hr; exact absurd rfl hr
-            · rw [if_neg hadopt] at hr
-              rw [if_neg hadopt]
+            · rw [ite_eq_left hadopt] at hr; exact absurd rfl hr
+            · rw [ite_eq_right hadopt] at hr
+              rw [ite_eq_right hadopt]
               exact hn.role_term_pos hr
           · intro e he
             rw [hm] at he
             rw [hct]
             by_cases hadopt : (w.nodes k).pn.currentTerm < t
-            · rw [if_pos hadopt]
+            · rw [ite_eq_left hadopt]
               exact Nat.le_trans (hn.map_le e he) hterm
-            · rw [if_neg hadopt]
+            · rw [ite_eq_right hadopt]
               exact hn.map_le e he
           · intro hr
             rw [hro] at hr
             rw [hct, hdt]
             by_cases hadopt : (w.nodes k).pn.currentTerm < t
-            · rw [if_pos hadopt] at hr; cases hr
-            · rw [if_neg hadopt] at hr
-              rw [if_neg hadopt, if_neg hadopt]
+            · rw [ite_eq_left hadopt] at hr; cases hr
+            · rw [ite_eq_right hadopt] at hr
+              rw [ite_eq_right hadopt, ite_eq_right hadopt]
               exact hn.cand_dt_lt hr
           · intro hr e he
             rw [hro] at hr
             rw [hm] at he
             rw [hct]
             by_cases hadopt : (w.nodes k).pn.currentTerm < t
-            · rw [if_pos hadopt] at hr; cases hr
-            · rw [if_neg hadopt] at hr
-              rw [if_neg hadopt]
+            · rw [ite_eq_left hadopt] at hr; cases hr
+            · rw [ite_eq_right hadopt] at hr
+              rw [ite_eq_right hadopt]
               exact hn.cand_map_lt hr e he
           · intro p t' v' hh
             rw [hhst] at hh
@@ -1028,8 +1028,8 @@ private theorem minv_step {n : Nat} {w w' : World n} (hw : Reachable w)
           · intro hr
             rw [hro] at hr
             by_cases hadopt : (w.nodes k).pn.currentTerm < t
-            · rw [if_pos hadopt] at hr; cases hr
-            · rw [if_neg hadopt] at hr
+            · rw [ite_eq_left hadopt] at hr; cases hr
+            · rw [ite_eq_right hadopt] at hr
               have hteq : t = (w.nodes k).pn.currentTerm := by omega
               have hgp := (reachable_dinv hw).gossip_pinned k hr (l0 :: ls)
                 (hteq ▸ hmsg)
@@ -1041,26 +1041,26 @@ private theorem minv_step {n : Nat} {w w' : World n} (hw : Reachable w)
             rw [hro] at hr
             rw [hct]
             by_cases hadopt : (w.nodes k).pn.currentTerm < t
-            · rw [if_pos hadopt] at hr; exact absurd rfl hr
-            · rw [if_neg hadopt] at hr
-              rw [if_neg hadopt]
+            · rw [ite_eq_left hadopt] at hr; exact absurd rfl hr
+            · rw [ite_eq_right hadopt] at hr
+              rw [ite_eq_right hadopt]
               exact hn.role_term_pos hr
           · intro e he
             rw [hm, hmap] at he
             have hem := List.mem_of_mem_take he
             rw [hct]
             by_cases hadopt : (w.nodes k).pn.currentTerm < t
-            · rw [if_pos hadopt]
+            · rw [ite_eq_left hadopt]
               exact Nat.le_trans (hn.map_le e hem) hterm
-            · rw [if_neg hadopt]
+            · rw [ite_eq_right hadopt]
               exact hn.map_le e hem
           · intro hr
             rw [hro] at hr
             rw [hct, hdt]
             by_cases hadopt : (w.nodes k).pn.currentTerm < t
-            · rw [if_pos hadopt] at hr; cases hr
-            · rw [if_neg hadopt] at hr
-              rw [if_neg hadopt, if_neg hadopt]
+            · rw [ite_eq_left hadopt] at hr; cases hr
+            · rw [ite_eq_right hadopt] at hr
+              rw [ite_eq_right hadopt, ite_eq_right hadopt]
               exact hn.cand_dt_lt hr
           · intro hr e he
             rw [hro] at hr
@@ -1068,9 +1068,9 @@ private theorem minv_step {n : Nat} {w w' : World n} (hw : Reachable w)
             have hem := List.mem_of_mem_take he
             rw [hct]
             by_cases hadopt : (w.nodes k).pn.currentTerm < t
-            · rw [if_pos hadopt] at hr; cases hr
-            · rw [if_neg hadopt] at hr
-              rw [if_neg hadopt]
+            · rw [ite_eq_left hadopt] at hr; cases hr
+            · rw [ite_eq_right hadopt] at hr
+              rw [ite_eq_right hadopt]
               exact hn.cand_map_lt hr e hem
           · intro p t' v' hh
             rw [hhst] at hh
@@ -1138,7 +1138,7 @@ private theorem ldt_step {n : Nat} {w w' : World n} (h : LeaderDataTerm w)
       by_cases hadopt : (w.nodes k).pn.currentTerm < nt
       · rw [recv_adopt_role _ _ _ _ _ hadopt] at hr; cases hr
       · have hfr := recv_frame (w.nodes k).pn c nt clt cd hadopt
-        rw [if_neg hadopt, hfr.2]
+        rw [ite_eq_right hadopt, hfr.2]
         exact h k (hfr.1 ▸ hr)
     · simp only [Function.update_of_ne hne] at hr ⊢; exact h k hr
   | rejectStaleRequestVote j c nt clt cd hmsg hstale => intro k hr; exact h k hr
@@ -1192,15 +1192,15 @@ private theorem ldt_step {n : Nat} {w w' : World n} (h : LeaderDataTerm w)
       | noCommonPrefix =>
         obtain ⟨_, _, _, hro, hct, hdt⟩ := applyGossip_ncp (w.nodes k) t hrec
         by_cases hadopt : (w.nodes k).pn.currentTerm < t
-        · rw [hro, if_pos hadopt] at hr; cases hr
-        · rw [hdt, hct, if_neg hadopt, if_neg hadopt]
-          rw [hro, if_neg hadopt] at hr; exact h k hr
+        · rw [hro, ite_eq_left hadopt] at hr; cases hr
+        · rw [hdt, hct, ite_eq_right hadopt, ite_eq_right hadopt]
+          rw [hro, ite_eq_right hadopt] at hr; exact h k hr
       | ok o =>
         obtain ⟨_, _, _, hro, hct, hdt⟩ := applyGossip_ok (w.nodes k) t hrec
         by_cases hadopt : (w.nodes k).pn.currentTerm < t
-        · rw [hro, if_pos hadopt] at hr; cases hr
-        · rw [hdt, hct, if_neg hadopt, if_neg hadopt]
-          rw [hro, if_neg hadopt] at hr; exact h k hr
+        · rw [hro, ite_eq_left hadopt] at hr; cases hr
+        · rw [hdt, hct, ite_eq_right hadopt, ite_eq_right hadopt]
+          rw [hro, ite_eq_right hadopt] at hr; exact h k hr
     · simp only [Function.update_of_ne hne] at hr ⊢; exact h k hr
 
 /-- **`leader ⇒ dataTerm = currentTerm`** in every reachable world
@@ -1268,10 +1268,10 @@ theorem lastTermOf_observeTerm (m : TermMap) (t pos : Nat) :
     lastTermOf (observeTerm m t pos) = max (lastTermOf m) t := by
   unfold observeTerm
   by_cases h : lastTermOf m < t
-  · rw [if_pos h, lastTermOf, List.getLast?_concat]
+  · rw [ite_eq_left h, lastTermOf, List.getLast?_concat]
     simp only [Option.map_some, Option.getD_some]
     omega
-  · rw [if_neg h]; omega
+  · rw [ite_eq_right h]; omega
 
 private theorem mldt_step {n : Nat} {w w' : World n} (hw : Reachable w)
     (h : MapLeDataTerm w) (hs : Step w w') : MapLeDataTerm w' := by
@@ -1286,9 +1286,9 @@ private theorem mldt_step {n : Nat} {w w' : World n} (hw : Reachable w)
     intro k; rcases eq_or_ne k j with rfl | hne
     · simp only [Function.update_self]
       by_cases hadopt : (w.nodes k).pn.currentTerm < nt
-      · rw [if_pos hadopt]
+      · rw [ite_eq_left hadopt]
         have := h k; have := hstamp.data_le k; omega
-      · rw [if_neg hadopt]; exact h k
+      · rw [ite_eq_right hadopt]; exact h k
     · simp only [Function.update_of_ne hne]; exact h k
   | rejectStaleRequestVote j c nt clt cd hmsg hstale => intro k; exact h k
   | deliverVote i v t hmsg hrole hterm =>
@@ -1352,10 +1352,10 @@ private theorem mldt_step {n : Nat} {w w' : World n} (hw : Reachable w)
                 (w.nodes k).termMap⟩ from rfl] at hrec
           injection hrec with hrec'; subst hrec'
           by_cases hadopt : (w.nodes k).pn.currentTerm < t
-          · rw [if_pos hadopt]
+          · rw [ite_eq_left hadopt]
             exact Nat.le_trans (h k) (Nat.le_trans (hstamp.data_le k)
               (Nat.le_of_lt hadopt))
-          · rw [if_neg hadopt]; exact h k
+          · rw [ite_eq_right hadopt]; exact h k
         | cons l0 ls =>
           have hmap : o.newMap = (w.nodes k).termMap.take
               (commonPrefixLen (w.nodes k).termMap (l0 :: ls)) :=
@@ -1364,10 +1364,10 @@ private theorem mldt_step {n : Nat} {w w' : World n} (hw : Reachable w)
           have hshrink := lastTermOf_take_le (hwf k)
             (commonPrefixLen (w.nodes k).termMap (l0 :: ls))
           by_cases hadopt : (w.nodes k).pn.currentTerm < t
-          · rw [if_pos hadopt]
+          · rw [ite_eq_left hadopt]
             exact Nat.le_trans hshrink (Nat.le_trans (h k)
               (Nat.le_trans (hstamp.data_le k) (Nat.le_of_lt hadopt)))
-          · rw [if_neg hadopt]; exact Nat.le_trans hshrink (h k)
+          · rw [ite_eq_right hadopt]; exact Nat.le_trans hshrink (h k)
     · simp only [Function.update_of_ne hne]; exact h k
 
 /-- **`lastTermOf (map j) ≤ dataTerm j`** in every reachable world (LC2b) —

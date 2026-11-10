@@ -500,7 +500,7 @@ theorem reachable_smLeDurable {n : Nat} {w : World n} (hw : Reachable w) :
       rcases eq_or_ne k j with rfl | hne
       · have := ih k
         simp only [Function.update_self, Node.applyGossip]
-        split <;> simp <;> omega
+        split <;> simp
       · simpa [Function.update_of_ne hne] using ih k
 
 /-! ## Projection onto the election model
@@ -601,7 +601,7 @@ theorem step_project {n : Nat} {w w' : World n} (h : Step w w') :
   | deliverTermMap j t entries hmsg hterm =>
     rw [project_mk, applyGossip_pn]
     by_cases hadopt : (w.nodes j).pn.currentTerm < t
-    · rw [if_pos hadopt]
+    · rw [ite_eq_left hadopt]
       refine .head (Uc2.Step.adoptHigherTerm w.project j t hadopt) (.single ?_)
       have h2 := Uc2.Step.havocData
         ({ nodes := Function.update w.project.nodes j
@@ -612,7 +612,7 @@ theorem step_project {n : Nat} {w w' : World n} (h : Step w w') :
         ((w.nodes j).applyGossip t entries).pn.smDurable
       simp only [Function.update_idem, Function.update_self] at h2
       exact h2
-    · rw [if_neg hadopt]
+    · rw [ite_eq_right hadopt]
       exact .single (Uc2.Step.havocData w.project j
         ((w.nodes j).applyGossip t entries).pn.lastTerm
         ((w.nodes j).applyGossip t entries).pn.durable

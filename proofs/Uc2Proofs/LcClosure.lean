@@ -161,7 +161,7 @@ private theorem hd_step {n : Nat} {w w' : World n} (h : HistDefined w)
       | ok o =>
         rw [hrec] at hp
         dsimp only at hp ⊢
-        rw [if_pos hp]
+        rw [ite_eq_left hp]
         have hle : o.validUpTo ≤ (w.nodes k).dn.pn.durable :=
           Uc2.reconcile_validUpTo_le _ _ _ _ hrec
         have hp' : p < (w.nodes k).dn.pn.durable := by omega
@@ -473,13 +473,13 @@ private theorem rgw_step {n : Nat} {w w' : World n} (hw : Reachable w)
       rcases eq_or_ne k j with rfl | hne
       · by_cases hadopt : (w.nodes k).pn.currentTerm < nt
         · simp only [Function.update_self] at hr
-          rw [if_pos hadopt] at hr
+          rw [ite_eq_left hadopt] at hr
           cases hr
         · refine .inl ⟨?_, ?_⟩
           · simp only [Node.dataTerm, Function.update_self]
-            rw [if_neg hadopt]
+            rw [ite_eq_right hadopt]
           · simp only [Function.update_self] at hr
-            rwa [if_neg hadopt] at hr
+            rwa [ite_eq_right hadopt] at hr
       · exact .inl ⟨by simp [Node.dataTerm, Function.update_of_ne hne],
           by simpa [Function.update_of_ne hne] using hr⟩
     | rejectStaleRequestVote j c nt clt cd hmsg hstale =>
@@ -548,11 +548,11 @@ private theorem rgw_step {n : Nat} {w w' : World n} (hw : Reachable w)
       · simp only [Node.dataTerm, Function.update_self] at hr hpos ⊢
         rw [Data.applyGossip_dataTerm] at hpos ⊢
         by_cases hadopt : (w.nodes k).dn.pn.currentTerm < t
-        · rw [if_pos hadopt]
+        · rw [ite_eq_left hadopt]
           exact .inr (.inl ⟨entries, hmsg⟩)
-        · rw [if_neg hadopt]
+        · rw [ite_eq_right hadopt]
           have hadopt' : ¬ (w.nodes k).pn.currentTerm < t := hadopt
-          rw [if_neg hadopt'] at hr
+          rw [ite_eq_right hadopt'] at hr
           simp only [Bool.or_eq_true] at hr
           rcases hr with hr | hdec
           · exact .inl ⟨rfl, hr⟩
@@ -955,7 +955,7 @@ theorem advance_report_quorum {n : Nat} {w : World n} (hw : Reachable w)
   have hkpos : 0 < k := by
     have := advance_commit_lt' _ _ _ hadv
     omega
-  rw [hq, List.filter_cons, if_pos (by simpa using hown)] at hcert
+  rw [hq, List.filter_cons, ite_eq_left (by simpa using hown)] at hcert
   obtain ⟨Q, hQlen, hiQ, hQP⟩ := slots_to_finset i
     (fun src => ∃ d, k ≤ d ∧
       CMsg.report src ((w.nodes i).pn.currentTerm) d ∈ w.csent) k

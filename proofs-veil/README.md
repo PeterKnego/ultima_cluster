@@ -8,13 +8,13 @@ checker for bug-finding and design assurance** — never as a proof of record.
 ## Hard guardrails (from the brief — preserve the repo's trust story)
 
 1. **Veil is never the record.** Permanent proofs live in `proofs/` (Lean
-   v4.32.0, standard axiom trio, no SMT in the trusted base). Veil's only
+   v4.35.0, standard axiom trio, no SMT in the trusted base). Veil's only
    deliverables are **countermodel traces** (→ directed `uc_sim` regressions +
    Rust fixes) and, secondarily, candidate invariant text. A Veil model has **no
    conformance rig**; it is scratchpad-only. A bug it finds is reconfirmed
    independently in Rust before any fix.
 2. **Toolchain isolation.** These models target Veil's `veil-2.0-preview`
-   branch on **Lean v4.28.0** — incompatible with `proofs/`'s v4.32.0. They are
+   branch on **Lean v4.28.0** — incompatible with `proofs/`'s v4.35.0. They are
    **never** on any `proofs/` `lake build` path, CI gate, or "proved" claim.
    They do not build in this repo; they are run inside a separate
    `veil-2.0-preview` checkout (where cvc5/z3 FFI links). These files are kept

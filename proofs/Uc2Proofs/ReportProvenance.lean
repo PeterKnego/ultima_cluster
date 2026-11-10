@@ -52,13 +52,13 @@ theorem le_foldl_termAt {p : Nat} :
   | b :: s, init, hwf, h => by
     rw [List.foldl_cons]
     by_cases hb : b.2 ≤ p
-    · rw [if_pos hb]
+    · rw [ite_eq_left hb]
       refine Nat.le_trans (h b List.mem_cons_self)
         (le_foldl_termAt s b.1 hwf.tail ?_)
       intro x hx
       obtain ⟨j, hj⟩ := List.mem_iff_getElem?.mp hx
       exact Nat.le_of_lt (hwf.head_term_lt hj)
-    · rw [if_neg hb]
+    · rw [ite_eq_right hb]
       exact le_foldl_termAt s init hwf.tail
         fun x hx => h x (List.mem_cons_of_mem b hx)
 
@@ -70,7 +70,7 @@ theorem mem_le_foldl_termAt {p : Nat} :
   | b :: s, init, hwf, e, he, hep => by
     rw [List.foldl_cons]
     rcases List.mem_cons.mp he with rfl | hes
-    · rw [if_pos hep]
+    · rw [ite_eq_left hep]
       refine le_foldl_termAt s e.1 hwf.tail ?_
       intro x hx
       obtain ⟨j, hj⟩ := List.mem_iff_getElem?.mp hx
@@ -142,15 +142,15 @@ theorem foldl_termAt_mono {p q : Nat} (hpq : p ≤ q) :
       obtain ⟨j, hj⟩ := List.mem_iff_getElem?.mp hx
       exact Nat.le_of_lt (hwf.head_term_lt hj)
     by_cases hbp : b.2 ≤ p
-    · rw [if_pos hbp, if_pos (Nat.le_trans hbp hpq)]
+    · rw [ite_eq_left hbp, ite_eq_left (Nat.le_trans hbp hpq)]
       exact foldl_termAt_mono hpq s b.1 b.1 hwf.tail (Nat.le_refl _) hs
-    · rw [if_neg hbp]
+    · rw [ite_eq_right hbp]
       by_cases hbq : b.2 ≤ q
-      · rw [if_pos hbq]
+      · rw [ite_eq_left hbq]
         exact foldl_termAt_mono hpq s ip b.1 hwf.tail
           (h b List.mem_cons_self)
           fun x hx => h x (List.mem_cons_of_mem b hx)
-      · rw [if_neg hbq]
+      · rw [ite_eq_right hbq]
         exact foldl_termAt_mono hpq s ip iq hwf.tail hle
           fun x hx => h x (List.mem_cons_of_mem b hx)
 
@@ -367,13 +367,13 @@ theorem termAt_observeTerm_self {m : TermMap} {t pos : Nat}
     TermMap.termAt (observeTerm m t pos) pos = t := by
   unfold observeTerm
   by_cases hgrow : lastTermOf m < t
-  · rw [if_pos hgrow]
+  · rw [ite_eq_left hgrow]
     have hasc2 : TermMap.Ascending (m ++ [(t, pos)]) := by
       have h0 := hasc'
-      rwa [observeTerm, if_pos hgrow] at h0
+      rwa [observeTerm, ite_eq_left hgrow] at h0
     rw [TermMap.termAt_of_last_base_le hasc2
       (getLast?_append_singleton _ _) (Nat.le_refl pos)]
-  · rw [if_neg hgrow]
+  · rw [ite_eq_right hgrow]
     have hle : t ≤ lastTermOf m := Nat.not_lt.mp hgrow
     have hne : m ≠ [] := by
       intro hemp
@@ -396,13 +396,13 @@ theorem termAt_observeTerm_below {m : TermMap} {t pos : Nat} :
   intro p' hp'
   unfold observeTerm
   by_cases hgrow : lastTermOf m < t
-  · rw [if_pos hgrow]
+  · rw [ite_eq_left hgrow]
     refine TermMap.termAt_append_high ?_
     intro e he
     rw [List.mem_singleton] at he
     subst he
     exact hp'
-  · rw [if_neg hgrow]
+  · rw [ite_eq_right hgrow]
 
 end Data
 
@@ -741,15 +741,15 @@ private theorem provinv_election {n : Nat} {w w' : World n} (hs : Step w w')
     intro k
     rw [hn]
     rcases eq_or_ne k i with rfl | hk
-    · rw [Function.update_self, if_pos rfl]
-    · rw [Function.update_of_ne hk, if_neg hk]
+    · rw [Function.update_self, ite_eq_left rfl]
+    · rw [Function.update_of_ne hk, ite_eq_right hk]
   have hrc : ∀ k, (w'.nodes k).reconciled
       = if k = i then C.reconciled else (w.nodes k).reconciled := by
     intro k
     rw [hn]
     rcases eq_or_ne k i with rfl | hk
-    · rw [Function.update_self, if_pos rfl]
-    · rw [Function.update_of_ne hk, if_neg hk]
+    · rw [Function.update_self, ite_eq_left rfl]
+    · rw [Function.update_of_ne hk, ite_eq_right hk]
   refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_,
     ?_, ?_, ?_, ?_, ?_⟩
   · intro p hdr t v es hf hg
@@ -770,41 +770,41 @@ private theorem provinv_election {n : Nat} {w w' : World n} (hs : Step w w')
     show (w'.nodes k).dn.dataTerm = (w'.nodes k).dn.pn.currentTerm
     rw [hpn] at hnc' ⊢
     rcases eq_or_ne k i with rfl | hk
-    · rw [if_pos rfl] at hnc' ⊢
+    · rw [ite_eq_left rfl] at hnc' ⊢
       exact hrdt hnc'
-    · rw [if_neg hk] at hnc' ⊢
+    · rw [ite_eq_right hk] at hnc' ⊢
       exact h.role_dt k hnc'
   · intro k p tv hh
     show p < (w'.nodes k).dn.pn.durable
     have hh' : (w'.nodes k).dn.hist p = some tv := hh
     rw [hpn] at hh' ⊢
     rcases eq_or_ne k i with rfl | hk
-    · rw [if_pos rfl] at hh' ⊢
+    · rw [ite_eq_left rfl] at hh' ⊢
       rw [hhist] at hh'
       rw [hdur]
       exact h.hist_bound k p tv hh'
-    · rw [if_neg hk] at hh' ⊢
+    · rw [ite_eq_right hk] at hh' ⊢
       exact h.hist_bound k p tv hh'
   · intro k hr
     show Data.lastTermOf (w'.nodes k).dn.termMap < (w'.nodes k).dn.dataTerm
     rw [hrc] at hr
     rw [hpn]
     rcases eq_or_ne k i with rfl | hk
-    · rw [if_pos rfl] at hr ⊢
+    · rw [ite_eq_left rfl] at hr ⊢
       rw [hmap]
       exact hclosed hr
-    · rw [if_neg hk] at hr ⊢
+    · rw [ite_eq_right hk] at hr ⊢
       exact h.closed_lag k hr
   · intro k p t v hh
     show TermMap.termAt (w'.nodes k).dn.termMap p = t
     have hh' : (w'.nodes k).dn.hist p = some (t, v) := hh
     rw [hpn] at hh' ⊢
     rcases eq_or_ne k i with rfl | hk
-    · rw [if_pos rfl] at hh' ⊢
+    · rw [ite_eq_left rfl] at hh' ⊢
       rw [hhist] at hh'
       rw [hmap]
       exact h.fca k p t v hh'
-    · rw [if_neg hk] at hh' ⊢
+    · rw [ite_eq_right hk] at hh' ⊢
       exact h.fca k p t v hh'
   · intro ℓ hrl p t v hf
     have hrl' : (w'.nodes ℓ).dn.pn.role = .leader := hrl
@@ -813,11 +813,11 @@ private theorem provinv_election {n : Nat} {w w' : World n} (hs : Step w w')
     show p < (w'.nodes ℓ).dn.pn.durable
     rw [hpn] at hrl' hf' ⊢
     rcases eq_or_ne ℓ i with rfl | hk
-    · rw [if_pos rfl] at hrl' hf' ⊢
+    · rw [ite_eq_left rfl] at hrl' hf' ⊢
       obtain ⟨hdn, -, hprl⟩ := hldr hrl'
       rw [hdn] at hf' ⊢
       exact h.leader_frontier ℓ hprl p t v hf'
-    · rw [if_neg hk] at hrl' hf' ⊢
+    · rw [ite_eq_right hk] at hrl' hf' ⊢
       exact h.leader_frontier ℓ hrl' p t v hf'
   · intro p hdr t v hf i' hrl hcti
     rw [hds] at hf
@@ -826,11 +826,11 @@ private theorem provinv_election {n : Nat} {w w' : World n} (hs : Step w w')
     show TermMap.termAt (w'.nodes i').dn.termMap p = t
     rw [hpn] at hrl' hcti' ⊢
     rcases eq_or_ne i' i with rfl | hk
-    · rw [if_pos rfl] at hrl' hcti' ⊢
+    · rw [ite_eq_left rfl] at hrl' hcti' ⊢
       obtain ⟨hdn, -, hprl⟩ := hldr hrl'
       rw [hdn] at hcti' ⊢
       exact h.frame_leader p hdr t v hf i' hprl hcti'
-    · rw [if_neg hk] at hrl' hcti' ⊢
+    · rw [ite_eq_right hk] at hrl' hcti' ⊢
       exact h.frame_leader p hdr t v hf i' hrl' hcti'
   · intro k hr h1
     rw [hrc] at hr
@@ -838,11 +838,11 @@ private theorem provinv_election {n : Nat} {w w' : World n} (hs : Step w w')
     have hgoal : ∃ ℓ, Data.Cert w.project ((w'.nodes k).dn.dataTerm) ℓ := by
       rw [hpn] at h1' ⊢
       rcases eq_or_ne k i with rfl | hk
-      · rw [if_pos rfl] at h1' hr ⊢
+      · rw [ite_eq_left rfl] at h1' hr ⊢
         obtain ⟨hdt, hpre⟩ := hgate hr
         rw [hdt] at h1' ⊢
         exact h.gate_cert k hpre h1'
-      · rw [if_neg hk] at h1' hr ⊢
+      · rw [ite_eq_right hk] at h1' hr ⊢
         exact h.gate_cert k hr h1'
     obtain ⟨ℓ, hc⟩ := hgoal
     exact ⟨ℓ, cert_carry hs hc⟩
@@ -853,12 +853,12 @@ private theorem provinv_election {n : Nat} {w w' : World n} (hs : Step w w')
         ∈ w.dsent := by rw [← hds]; exact hf
     rw [hpn] at he' hf'
     rcases eq_or_ne k i with rfl | hk
-    · rw [if_pos rfl] at he' hf' hr
+    · rw [ite_eq_left rfl] at he' hf' hr
       obtain ⟨hdt, hpre⟩ := hgate hr
       rw [hmap] at he'
       rw [hdt] at hf'
       exact h.gate_map_frame k hpre e he' p t v hf' hep
-    · rw [if_neg hk] at he' hf' hr
+    · rw [ite_eq_right hk] at he' hf' hr
       exact h.gate_map_frame k hr e he' p t v hf' hep
   · intro k ℓ hr hrl hctl e he
     rw [hrc] at hr
@@ -872,24 +872,24 @@ private theorem provinv_election {n : Nat} {w w' : World n} (hs : Step w w')
     rw [hpn k] at he'
     rw [hpn ℓ]
     rcases eq_or_ne k i with rfl | hk
-    · rw [if_pos rfl] at hr he' hctl'
+    · rw [ite_eq_left rfl] at hr he' hctl'
       obtain ⟨hdt, hpre⟩ := hgate hr
       rw [hmap] at he'
       rw [hdt] at hctl'
       rcases eq_or_ne ℓ k with rfl | hkl
-      · rw [if_pos rfl] at hrl' hctl' ⊢
+      · rw [ite_eq_left rfl] at hrl' hctl' ⊢
         obtain ⟨hdn, -, hprl⟩ := hldr hrl'
         rw [hdn] at hctl' ⊢
         exact h.gate_leader ℓ ℓ hpre hprl hctl' e he'
-      · rw [if_neg hkl] at hrl' hctl' ⊢
+      · rw [ite_eq_right hkl] at hrl' hctl' ⊢
         exact h.gate_leader k ℓ hpre hrl' hctl' e he'
-    · rw [if_neg hk] at hr he' hctl'
+    · rw [ite_eq_right hk] at hr he' hctl'
       rcases eq_or_ne ℓ i with rfl | hkl
-      · rw [if_pos rfl] at hrl' hctl' ⊢
+      · rw [ite_eq_left rfl] at hrl' hctl' ⊢
         obtain ⟨hdn, -, hprl⟩ := hldr hrl'
         rw [hdn] at hctl' ⊢
         exact h.gate_leader k ℓ hr hprl hctl' e he'
-      · rw [if_neg hkl] at hrl' hctl' ⊢
+      · rw [ite_eq_right hkl] at hrl' hctl' ⊢
         exact h.gate_leader k ℓ hr hrl' hctl' e he'
   · intro k ℓ hr hrl hctl p hp'
     rw [hrc] at hr
@@ -904,24 +904,24 @@ private theorem provinv_election {n : Nat} {w w' : World n} (hs : Step w w')
     rw [hpn k] at hp''
     rw [hpn k, hpn ℓ]
     rcases eq_or_ne k i with rfl | hk
-    · rw [if_pos rfl] at hr hctl' hp'' ⊢
+    · rw [ite_eq_left rfl] at hr hctl' hp'' ⊢
       obtain ⟨hdt, hpre⟩ := hgate hr
       rw [hdur] at hp''
       rw [hdt] at hctl'
       rw [hmap]
       rcases eq_or_ne ℓ k with rfl | hkl
-      · rw [if_pos rfl] at hrl' ⊢
+      · rw [ite_eq_left rfl] at hrl' ⊢
         obtain ⟨hdn, -, -⟩ := hldr hrl'
         rw [hdn]
-      · rw [if_neg hkl] at hrl' hctl' ⊢
+      · rw [ite_eq_right hkl] at hrl' hctl' ⊢
         exact h.gate_leader_eq k ℓ hpre hrl' hctl' p hp''
-    · rw [if_neg hk] at hr hctl' hp'' ⊢
+    · rw [ite_eq_right hk] at hr hctl' hp'' ⊢
       rcases eq_or_ne ℓ i with rfl | hkl
-      · rw [if_pos rfl] at hrl' hctl' ⊢
+      · rw [ite_eq_left rfl] at hrl' hctl' ⊢
         obtain ⟨hdn, -, hprl⟩ := hldr hrl'
         rw [hdn] at hctl' ⊢
         exact h.gate_leader_eq k ℓ hr hprl hctl' p hp''
-      · rw [if_neg hkl] at hrl' hctl' ⊢
+      · rw [ite_eq_right hkl] at hrl' hctl' ⊢
         exact h.gate_leader_eq k ℓ hr hrl' hctl' p hp''
   · intro k hr p t v hf hp'
     rw [hrc] at hr
@@ -931,13 +931,13 @@ private theorem provinv_election {n : Nat} {w w' : World n} (hs : Step w w')
     show TermMap.termAt (w'.nodes k).dn.termMap p = t
     rw [hpn] at hf' hp'' ⊢
     rcases eq_or_ne k i with rfl | hk
-    · rw [if_pos rfl] at hr hf' hp'' ⊢
+    · rw [ite_eq_left rfl] at hr hf' hp'' ⊢
       obtain ⟨hdt, hpre⟩ := hgate hr
       rw [hdur] at hp''
       rw [hdt] at hf'
       rw [hmap]
       exact h.gate_frames_eq k hpre p t v hf' hp''
-    · rw [if_neg hk] at hr hf' hp'' ⊢
+    · rw [ite_eq_right hk] at hr hf' hp'' ⊢
       exact h.gate_frames_eq k hr p t v hf' hp''
   · intro k ℓ hr hrl hctl
     rw [hrc] at hr
@@ -949,33 +949,33 @@ private theorem provinv_election {n : Nat} {w w' : World n} (hs : Step w w')
     rw [hpn ℓ, hpn k] at hctl'
     rw [hpn k, hpn ℓ]
     rcases eq_or_ne k i with rfl | hk
-    · rw [if_pos rfl] at hr hctl' ⊢
+    · rw [ite_eq_left rfl] at hr hctl' ⊢
       obtain ⟨hdt, hpre⟩ := hgate hr
       rw [hdt] at hctl'
       rw [hdur]
       rcases eq_or_ne ℓ k with rfl | hkl
-      · rw [if_pos rfl] at hrl' hctl' ⊢
+      · rw [ite_eq_left rfl] at hrl' hctl' ⊢
         obtain ⟨hdn, -, hprl⟩ := hldr hrl'
         rw [hdn] at hctl' ⊢
         exact h.gate_durable ℓ ℓ hpre hprl hctl'
-      · rw [if_neg hkl] at hrl' hctl' ⊢
+      · rw [ite_eq_right hkl] at hrl' hctl' ⊢
         exact h.gate_durable k ℓ hpre hrl' hctl'
-    · rw [if_neg hk] at hr hctl' ⊢
+    · rw [ite_eq_right hk] at hr hctl' ⊢
       rcases eq_or_ne ℓ i with rfl | hkl
-      · rw [if_pos rfl] at hrl' hctl' ⊢
+      · rw [ite_eq_left rfl] at hrl' hctl' ⊢
         obtain ⟨hdn, -, hprl⟩ := hldr hrl'
         rw [hdn] at hctl' ⊢
         exact h.gate_durable k ℓ hr hprl hctl'
-      · rw [if_neg hkl] at hrl' hctl' ⊢
+      · rw [ite_eq_right hkl] at hrl' hctl' ⊢
         exact h.gate_durable k ℓ hr hrl' hctl'
   · intro u T d hrp
     rw [hcs] at hrp
     show T ≤ (w'.nodes u).dn.dataTerm
     rw [hpn]
     rcases eq_or_ne u i with rfl | hk
-    · rw [if_pos rfl]
+    · rw [ite_eq_left rfl]
       exact Nat.le_trans (h.report_dt u T d hrp) hdtge
-    · rw [if_neg hk]
+    · rw [ite_eq_right hk]
       exact h.report_dt u T d hrp
   · intro u T d hrp hT
     rw [hcs] at hrp
@@ -989,13 +989,13 @@ private theorem provinv_election {n : Nat} {w w' : World n} (hs : Step w w')
     show TermMap.termAt (w'.nodes u).dn.termMap p = t
     rw [hpn] at hdtu' hp'' ⊢
     rcases eq_or_ne u i with rfl | hk
-    · rw [if_pos rfl] at hdtu' hp'' ⊢
+    · rw [ite_eq_left rfl] at hdtu' hp'' ⊢
       have hold : (w.nodes u).dataTerm = T :=
         Nat.le_antisymm (hdtu' ▸ hdtge) (h.report_dt u T d hrp)
       rw [hdur] at hp''
       rw [hmap]
       exact h.report_frames u T d hrp hold p t v hf hp''
-    · rw [if_neg hk] at hdtu' hp'' ⊢
+    · rw [ite_eq_right hk] at hdtu' hp'' ⊢
       exact h.report_frames u T d hrp hdtu' p t v hf hp''
   · intro u T d hrp hdtu ℓ hrl hctl p hp'
     rw [hcs] at hrp
@@ -1010,24 +1010,24 @@ private theorem provinv_election {n : Nat} {w w' : World n} (hs : Step w w')
     rw [hpn u] at hp''
     rw [hpn u, hpn ℓ]
     rcases eq_or_ne u i with rfl | hk
-    · rw [if_pos rfl] at hdtu' hp'' ⊢
+    · rw [ite_eq_left rfl] at hdtu' hp'' ⊢
       have hold : (w.nodes u).dataTerm = T :=
         Nat.le_antisymm (hdtu' ▸ hdtge) (h.report_dt u T d hrp)
       rw [hdur] at hp''
       rw [hmap]
       rcases eq_or_ne ℓ u with rfl | hkl
-      · rw [if_pos rfl] at hrl' ⊢
+      · rw [ite_eq_left rfl] at hrl' ⊢
         obtain ⟨hdn, -, -⟩ := hldr hrl'
         rw [hdn]
-      · rw [if_neg hkl] at hrl' hctl' ⊢
+      · rw [ite_eq_right hkl] at hrl' hctl' ⊢
         exact h.report_leader_eq u T d hrp hold ℓ hrl' hctl' p hp''
-    · rw [if_neg hk] at hdtu' hp'' ⊢
+    · rw [ite_eq_right hk] at hdtu' hp'' ⊢
       rcases eq_or_ne ℓ i with rfl | hkl
-      · rw [if_pos rfl] at hrl' hctl' ⊢
+      · rw [ite_eq_left rfl] at hrl' hctl' ⊢
         obtain ⟨hdn, -, hprl⟩ := hldr hrl'
         rw [hdn] at hctl' ⊢
         exact h.report_leader_eq u T d hrp hdtu' ℓ hprl hctl' p hp''
-      · rw [if_neg hkl] at hrl' hctl' ⊢
+      · rw [ite_eq_right hkl] at hrl' hctl' ⊢
         exact h.report_leader_eq u T d hrp hdtu' ℓ hrl' hctl' p hp''
   · intro u T d hrp hdtu ℓ hrl hctl
     rw [hcs] at hrp
@@ -1039,24 +1039,24 @@ private theorem provinv_election {n : Nat} {w w' : World n} (hs : Step w w')
     rw [hpn ℓ] at hrl' hctl'
     rw [hpn u, hpn ℓ]
     rcases eq_or_ne u i with rfl | hk
-    · rw [if_pos rfl] at hdtu' ⊢
+    · rw [ite_eq_left rfl] at hdtu' ⊢
       have hold : (w.nodes u).dataTerm = T :=
         Nat.le_antisymm (hdtu' ▸ hdtge) (h.report_dt u T d hrp)
       rw [hdur]
       rcases eq_or_ne ℓ u with rfl | hkl
-      · rw [if_pos rfl] at hrl' ⊢
+      · rw [ite_eq_left rfl] at hrl' ⊢
         obtain ⟨hdn, -, -⟩ := hldr hrl'
         rw [hdn]
         exact Nat.le_refl _
-      · rw [if_neg hkl] at hrl' hctl' ⊢
+      · rw [ite_eq_right hkl] at hrl' hctl' ⊢
         exact h.report_durable u T d hrp hold ℓ hrl' hctl'
-    · rw [if_neg hk] at hdtu' ⊢
+    · rw [ite_eq_right hk] at hdtu' ⊢
       rcases eq_or_ne ℓ i with rfl | hkl
-      · rw [if_pos rfl] at hrl' hctl' ⊢
+      · rw [ite_eq_left rfl] at hrl' hctl' ⊢
         obtain ⟨hdn, -, hprl⟩ := hldr hrl'
         rw [hdn] at hctl' ⊢
         exact h.report_durable u T d hrp hdtu' ℓ hprl hctl'
-      · rw [if_neg hkl] at hrl' hctl' ⊢
+      · rw [ite_eq_right hkl] at hrl' hctl' ⊢
         exact h.report_durable u T d hrp hdtu' ℓ hrl' hctl'
 
 /-- **Preservation**: every commit-layer step preserves the bundle. -/
@@ -1088,22 +1088,22 @@ private theorem provinv_step {n : Nat} {w w' : World n} (hw : Reachable w)
           else (w.nodes j).dataTerm)
         = ((w.nodes j).pn.recvRequestVote c nt clt cd).1.currentTerm
       by_cases hadopt : (w.nodes j).pn.currentTerm < nt
-      · rw [if_pos hadopt, Data.recv_term _ _ _ _ _ hterm]
+      · rw [ite_eq_left hadopt, Data.recv_term _ _ _ _ _ hterm]
       · have hold : (w.nodes j).dataTerm = (w.nodes j).pn.currentTerm :=
           h.role_dt j (by
             have hnc' : ((w.nodes j).pn.recvRequestVote c nt clt cd).1.role
                 ≠ .candidate := hnc
             rwa [(Data.recv_frame (w.nodes j).pn c nt clt cd hadopt).1]
               at hnc')
-        rw [if_neg hadopt,
+        rw [ite_eq_right hadopt,
           (Data.recv_frame (w.nodes j).pn c nt clt cd hadopt).2]
         exact hold
     · show (w.nodes j).dataTerm ≤ (if (w.nodes j).pn.currentTerm < nt
         then nt else (w.nodes j).dn.dataTerm)
       by_cases hadopt : (w.nodes j).pn.currentTerm < nt
-      · rw [if_pos hadopt]
+      · rw [ite_eq_left hadopt]
         exact Nat.le_trans hdle (Nat.le_of_lt hadopt)
-      · rw [if_neg hadopt]
+      · rw [ite_eq_right hadopt]
         exact Nat.le_refl _
     · intro hcl
       show Data.lastTermOf (w.nodes j).dn.termMap
@@ -1112,25 +1112,25 @@ private theorem provinv_step {n : Nat} {w w' : World n} (hw : Reachable w)
       have hcl' : (if (w.nodes j).pn.currentTerm < nt then false
           else (w.nodes j).reconciled) = false := hcl
       by_cases hadopt : (w.nodes j).pn.currentTerm < nt
-      · rw [if_pos hadopt]
+      · rw [ite_eq_left hadopt]
         have h1 : Data.lastTermOf (w.nodes j).dn.termMap
             ≤ (w.nodes j).dataTerm := hmldt
         have h2 : (w.nodes j).dataTerm ≤ (w.nodes j).pn.currentTerm := hdle
         omega
-      · rw [if_neg hadopt]
-        rw [if_neg hadopt] at hcl'
+      · rw [ite_eq_right hadopt]
+        rw [ite_eq_right hadopt] at hcl'
         exact h.closed_lag j hcl'
     · intro hg
       have hg' : (if (w.nodes j).pn.currentTerm < nt then false
           else (w.nodes j).reconciled) = true := hg
       by_cases hadopt : (w.nodes j).pn.currentTerm < nt
-      · rw [if_pos hadopt] at hg'
+      · rw [ite_eq_left hadopt] at hg'
         cases hg'
-      · rw [if_neg hadopt] at hg'
+      · rw [ite_eq_right hadopt] at hg'
         refine ⟨?_, hg'⟩
         show (if (w.nodes j).pn.currentTerm < nt then nt
           else (w.nodes j).dn.dataTerm) = (w.nodes j).dataTerm
-        rw [if_neg hadopt]
+        rw [ite_eq_right hadopt]
         rfl
     · intro hl
       have hl' : ((w.nodes j).pn.recvRequestVote c nt clt cd).1.role
@@ -1147,11 +1147,11 @@ private theorem provinv_step {n : Nat} {w w' : World n} (hw : Reachable w)
         have hunch := (Data.recv_voted_current (w.nodes j).pn c j nt clt cd
           heq hsv).1
         refine ⟨?_, ?_, hrl⟩
-        · simp only [hunch, if_neg hadopt]
+        · simp only [hunch, ite_eq_right hadopt]
           rfl
         · show (if (w.nodes j).pn.currentTerm < nt then false
             else (w.nodes j).reconciled) = (w.nodes j).reconciled
-          rw [if_neg hadopt]
+          rw [ite_eq_right hadopt]
   | rejectStaleRequestVote j c nt clt cd hmsg hstale =>
     exact provinv_transport
       (Step.rejectStaleRequestVote w j c nt clt cd hmsg hstale) h
@@ -1936,14 +1936,14 @@ private theorem provinv_step {n : Nat} {w w' : World n} (hw : Reachable w)
         revert he'
         unfold Data.observeTerm
         by_cases hgrow : Data.lastTermOf (w.nodes k).dn.termMap < t
-        · rw [if_pos hgrow]
+        · rw [ite_eq_left hgrow]
           intro he'
           rcases List.mem_append.mp he' with he2 | he2
           · exact h.gate_map_frame k hr e he2 p' t' v' hf' hep
           · rw [List.mem_singleton] at he2
             subst he2
             exact h.frame_mono pos p' _ t t' v v' hmsg' hf' hep
-        · rw [if_neg hgrow]
+        · rw [ite_eq_right hgrow]
           intro he'
           exact h.gate_map_frame k hr e he' p' t' v' hf' hep
       · simp only [Function.update_of_ne hk] at hr he hf ⊢
@@ -1965,7 +1965,7 @@ private theorem provinv_step {n : Nat} {w w' : World n} (hw : Reachable w)
           revert he'
           unfold Data.observeTerm
           by_cases hgrow : Data.lastTermOf (w.nodes k).dn.termMap < t
-          · rw [if_pos hgrow]
+          · rw [ite_eq_left hgrow]
             intro he'
             rcases List.mem_append.mp he' with he2 | he2
             · exact h.gate_leader k ℓ hr hrl' hctl' e he2
@@ -1973,7 +1973,7 @@ private theorem provinv_step {n : Nat} {w w' : World n} (hw : Reachable w)
               subst he2
               exact Nat.le_of_eq
                 (h.frame_leader pos _ t v hmsg' ℓ hrl' hctl').symm
-          · rw [if_neg hgrow]
+          · rw [ite_eq_right hgrow]
             intro he'
             exact h.gate_leader k ℓ hr hrl' hctl' e he'
       · rcases eq_or_ne ℓ j with rfl | hkl
@@ -2365,9 +2365,9 @@ private theorem provinv_step {n : Nat} {w w' : World n} (hw : Reachable w)
         intro hl
         rw [hFr] at hl
         by_cases hadopt : (w.nodes j).dn.pn.currentTerm < t
-        · rw [if_pos hadopt] at hl
+        · rw [ite_eq_left hadopt] at hl
           cases hl
-        · rw [if_neg hadopt] at hl
+        · rw [ite_eq_right hadopt] at hl
           have hterm' : (w.nodes j).dn.pn.currentTerm ≤ t := hterm
           have hteq : (w.nodes j).pn.currentTerm = t := by
             show (w.nodes j).dn.pn.currentTerm = t
@@ -2385,10 +2385,10 @@ private theorem provinv_step {n : Nat} {w w' : World n} (hw : Reachable w)
         intro hr
         rw [hFdt]
         by_cases hadopt : (w.nodes j).dn.pn.currentTerm < t
-        · rw [if_pos hadopt]
+        · rw [ite_eq_left hadopt]
           exact .inl rfl
-        · rw [if_neg (show ¬ (w.nodes j).pn.currentTerm < t from hadopt)] at hr
-          rw [if_neg hadopt]
+        · rw [ite_eq_right (show ¬ (w.nodes j).pn.currentTerm < t from hadopt)] at hr
+          rw [ite_eq_right hadopt]
           rw [Bool.or_eq_true] at hr
           rcases hr with hr | hr
           · exact .inr ⟨rfl, hr⟩
@@ -2414,12 +2414,12 @@ private theorem provinv_step {n : Nat} {w w' : World n} (hw : Reachable w)
             = ((w.nodes k).dn.applyGossip t entries).pn.currentTerm
           rw [hFdt, hFc]
           by_cases hadopt : (w.nodes k).dn.pn.currentTerm < t
-          · rw [if_pos hadopt, if_pos hadopt]
-          · rw [if_neg hadopt, if_neg hadopt]
+          · rw [ite_eq_left hadopt, ite_eq_left hadopt]
+          · rw [ite_eq_right hadopt, ite_eq_right hadopt]
             refine h.role_dt k ?_
             have hnc' : ((w.nodes k).dn.applyGossip t entries).pn.role
                 ≠ .candidate := hnc
-            rw [hFr, if_neg hadopt] at hnc'
+            rw [hFr, ite_eq_right hadopt] at hnc'
             exact hnc'
         · simp only [Function.update_of_ne hk] at hnc ⊢
           exact h.role_dt k hnc
@@ -2444,12 +2444,12 @@ private theorem provinv_step {n : Nat} {w w' : World n} (hw : Reachable w)
                 decide ((w.nodes k).dn.dataTerm
                   = (w.nodes k).pn.currentTerm)) = false := hr
           by_cases hadopt : (w.nodes k).dn.pn.currentTerm < t
-          · rw [if_pos (show (w.nodes k).pn.currentTerm < t from hadopt)]
+          · rw [ite_eq_left (show (w.nodes k).pn.currentTerm < t from hadopt)]
               at hr'
             cases hr'
-          · rw [if_neg (show ¬ (w.nodes k).pn.currentTerm < t from hadopt)]
+          · rw [ite_eq_right (show ¬ (w.nodes k).pn.currentTerm < t from hadopt)]
               at hr'
-            rw [if_neg hadopt]
+            rw [ite_eq_right hadopt]
             have hcl : Data.lastTermOf (w.nodes k).dn.termMap
                 < (w.nodes k).dn.dataTerm := h.closed_lag k (by
               rcases Bool.or_eq_false_iff.mp hr' with ⟨h1, -⟩
@@ -2561,9 +2561,9 @@ private theorem provinv_step {n : Nat} {w w' : World n} (hw : Reachable w)
           have h2 : (w.nodes u).dn.dataTerm ≤ (w.nodes u).dn.pn.currentTerm :=
             hdle
           by_cases hadopt : (w.nodes u).dn.pn.currentTerm < t
-          · rw [if_pos hadopt]
+          · rw [ite_eq_left hadopt]
             omega
-          · rw [if_neg hadopt]
+          · rw [ite_eq_right hadopt]
             exact h1
         · simp only [Function.update_of_ne hk]
           exact h.report_dt u T d hrp
@@ -2580,7 +2580,7 @@ private theorem provinv_step {n : Nat} {w w' : World n} (hw : Reachable w)
           rw [hFdt] at hdtu'
           rw [hFd] at hp''
           by_cases hadopt : (w.nodes u).dn.pn.currentTerm < t
-          · rw [if_pos hadopt] at hdtu'
+          · rw [ite_eq_left hadopt] at hdtu'
             have h1 : T ≤ (w.nodes u).dn.dataTerm := h.report_dt u T d hrp
             have h2 : (w.nodes u).dn.dataTerm
                 ≤ (w.nodes u).dn.pn.currentTerm := hdle
@@ -2598,7 +2598,7 @@ private theorem provinv_step {n : Nat} {w w' : World n} (hw : Reachable w)
           rw [hFdt] at hdtu'
           rw [hFd] at hp''
           by_cases hadopt : (w.nodes u).dn.pn.currentTerm < t
-          · rw [if_pos hadopt] at hdtu'
+          · rw [ite_eq_left hadopt] at hdtu'
             have h1 : T ≤ (w.nodes u).dn.dataTerm := h.report_dt u T d hrp
             have h2 : (w.nodes u).dn.dataTerm
                 ≤ (w.nodes u).dn.pn.currentTerm := hdle
@@ -2617,7 +2617,7 @@ private theorem provinv_step {n : Nat} {w w' : World n} (hw : Reachable w)
             hdtu
           rw [hFdt] at hdtu'
           by_cases hadopt : (w.nodes u).dn.pn.currentTerm < t
-          · rw [if_pos hadopt] at hdtu'
+          · rw [ite_eq_left hadopt] at hdtu'
             have h1 : T ≤ (w.nodes u).dn.dataTerm := h.report_dt u T d hrp
             have h2 : (w.nodes u).dn.dataTerm
                 ≤ (w.nodes u).dn.pn.currentTerm := hdle
@@ -2828,10 +2828,10 @@ private theorem provinv_step {n : Nat} {w w' : World n} (hw : Reachable w)
         intro hr
         rw [hFdt]
         by_cases hadopt : (w.nodes j).dn.pn.currentTerm < t
-        · rw [if_pos hadopt]
+        · rw [ite_eq_left hadopt]
           exact .inl rfl
-        · rw [if_neg (show ¬ (w.nodes j).pn.currentTerm < t from hadopt)] at hr
-          rw [if_neg hadopt]
+        · rw [ite_eq_right (show ¬ (w.nodes j).pn.currentTerm < t from hadopt)] at hr
+          rw [ite_eq_right hadopt]
           rw [Bool.or_eq_true] at hr
           rcases hr with hr | hr
           · exact .inr ⟨rfl, hr⟩
@@ -2847,9 +2847,9 @@ private theorem provinv_step {n : Nat} {w w' : World n} (hw : Reachable w)
         intro hl
         rw [hFr] at hl
         by_cases hadopt : (w.nodes j).dn.pn.currentTerm < t
-        · rw [if_pos hadopt] at hl
+        · rw [ite_eq_left hadopt] at hl
           cases hl
-        · rw [if_neg hadopt] at hl
+        · rw [ite_eq_right hadopt] at hl
           have hterm' : (w.nodes j).dn.pn.currentTerm ≤ t := hterm
           have hteq : (w.nodes j).pn.currentTerm = t := by
             show (w.nodes j).dn.pn.currentTerm = t
@@ -2876,12 +2876,12 @@ private theorem provinv_step {n : Nat} {w w' : World n} (hw : Reachable w)
             = ((w.nodes k).dn.applyGossip t entries).pn.currentTerm
           rw [hFdt, hFc]
           by_cases hadopt : (w.nodes k).dn.pn.currentTerm < t
-          · rw [if_pos hadopt, if_pos hadopt]
-          · rw [if_neg hadopt, if_neg hadopt]
+          · rw [ite_eq_left hadopt, ite_eq_left hadopt]
+          · rw [ite_eq_right hadopt, ite_eq_right hadopt]
             refine h.role_dt k ?_
             have hnc' : ((w.nodes k).dn.applyGossip t entries).pn.role
                 ≠ .candidate := hnc
-            rw [hFr, if_neg hadopt] at hnc'
+            rw [hFr, ite_eq_right hadopt] at hnc'
             exact hnc'
         · simp only [Function.update_of_ne hk] at hnc ⊢
           exact h.role_dt k hnc
@@ -2897,7 +2897,7 @@ private theorem provinv_step {n : Nat} {w w' : World n} (hw : Reachable w)
           rw [hFd]
           by_cases hpv : p < o.validUpTo
           · exact hpv
-          · rw [if_neg hpv] at hh2
+          · rw [ite_eq_right hpv] at hh2
             cases hh2
         · simp only [Function.update_of_ne hk] at hh ⊢
           exact h.hist_bound k p tv hh
@@ -2913,12 +2913,12 @@ private theorem provinv_step {n : Nat} {w w' : World n} (hw : Reachable w)
                 decide ((w.nodes k).dn.dataTerm
                   = (w.nodes k).pn.currentTerm)) = false := hr
           by_cases hadopt : (w.nodes k).dn.pn.currentTerm < t
-          · rw [if_pos (show (w.nodes k).pn.currentTerm < t from hadopt)]
+          · rw [ite_eq_left (show (w.nodes k).pn.currentTerm < t from hadopt)]
               at hr'
             cases hr'
-          · rw [if_neg (show ¬ (w.nodes k).pn.currentTerm < t from hadopt)]
+          · rw [ite_eq_right (show ¬ (w.nodes k).pn.currentTerm < t from hadopt)]
               at hr'
-            rw [if_neg hadopt]
+            rw [ite_eq_right hadopt]
             have hcl : Data.lastTermOf (w.nodes k).dn.termMap
                 < (w.nodes k).dn.dataTerm := h.closed_lag k (by
               rcases Bool.or_eq_false_iff.mp hr' with ⟨h1, -⟩
@@ -2938,10 +2938,10 @@ private theorem provinv_step {n : Nat} {w w' : World n} (hw : Reachable w)
             ((w.nodes k).dn.applyGossip t entries).termMap p = t'
           rw [hFm]
           by_cases hpv : p < o.validUpTo
-          · rw [if_pos hpv] at hh2
+          · rw [ite_eq_left hpv] at hh2
             rw [hpres p hpv]
             exact h.fca k p t' v' hh2
-          · rw [if_neg hpv] at hh2
+          · rw [ite_eq_right hpv] at hh2
             cases hh2
         · simp only [Function.update_of_ne hk] at hh ⊢
           exact h.fca k p t' v' hh
@@ -2952,7 +2952,7 @@ private theorem provinv_step {n : Nat} {w w' : World n} (hw : Reachable w)
           have hf' : Data.Frame.replicate p'
               (((w.nodes ℓ).dn.applyGossip t entries).pn.currentTerm) t' v'
               ∈ w.dsent := hf
-          rw [hFc, if_neg hnadopt] at hf'
+          rw [hFc, ite_eq_right hnadopt] at hf'
           show p' < ((w.nodes ℓ).dn.applyGossip t entries).pn.durable
           rw [hFd, hd0]
           exact h.leader_frontier ℓ hprl p' t' v' hf'
@@ -2964,7 +2964,7 @@ private theorem provinv_step {n : Nat} {w w' : World n} (hw : Reachable w)
           obtain ⟨hm0, hd0, hprl, hnadopt⟩ := hjld hrl
           have hcti' : ((w.nodes i').dn.applyGossip t entries).pn.currentTerm
               = hdr' := hcti
-          rw [hFc, if_neg hnadopt] at hcti'
+          rw [hFc, ite_eq_right hnadopt] at hcti'
           show TermMap.termAt
             ((w.nodes i').dn.applyGossip t entries).termMap p' = t'
           rw [hFm, hm0]
@@ -3036,7 +3036,7 @@ private theorem provinv_step {n : Nat} {w w' : World n} (hw : Reachable w)
             obtain ⟨hm0, hd0, hprl, hnadopt⟩ := hjld hrl
             have hctl' : ((w.nodes ℓ).dn.applyGossip t entries).pn.currentTerm
                 = (w.nodes k).dataTerm := hctl
-            rw [hFc, if_neg hnadopt] at hctl'
+            rw [hFc, ite_eq_right hnadopt] at hctl'
             show e.1 ≤ TermMap.termAt
               ((w.nodes ℓ).dn.applyGossip t entries).termMap e.2
             rw [hFm, hm0]
@@ -3073,7 +3073,7 @@ private theorem provinv_step {n : Nat} {w w' : World n} (hw : Reachable w)
             obtain ⟨hm0, hd0, hprl, hnadopt⟩ := hjld hrl
             have hctl' : ((w.nodes ℓ).dn.applyGossip t entries).pn.currentTerm
                 = (w.nodes k).dataTerm := hctl
-            rw [hFc, if_neg hnadopt] at hctl'
+            rw [hFc, ite_eq_right hnadopt] at hctl'
             show TermMap.termAt (w.nodes k).dn.termMap p
               = TermMap.termAt
                 ((w.nodes ℓ).dn.applyGossip t entries).termMap p
@@ -3128,7 +3128,7 @@ private theorem provinv_step {n : Nat} {w w' : World n} (hw : Reachable w)
             obtain ⟨hm0, hd0, hprl, hnadopt⟩ := hjld hrl
             have hctl' : ((w.nodes ℓ).dn.applyGossip t entries).pn.currentTerm
                 = (w.nodes k).dataTerm := hctl
-            rw [hFc, if_neg hnadopt] at hctl'
+            rw [hFc, ite_eq_right hnadopt] at hctl'
             show (w.nodes k).pn.durable
               ≤ ((w.nodes ℓ).dn.applyGossip t entries).pn.durable
             rw [hFd, hd0]
@@ -3145,9 +3145,9 @@ private theorem provinv_step {n : Nat} {w w' : World n} (hw : Reachable w)
           have h2 : (w.nodes u).dn.dataTerm ≤ (w.nodes u).dn.pn.currentTerm :=
             hdle
           by_cases hadopt : (w.nodes u).dn.pn.currentTerm < t
-          · rw [if_pos hadopt]
+          · rw [ite_eq_left hadopt]
             omega
-          · rw [if_neg hadopt]
+          · rw [ite_eq_right hadopt]
             exact h1
         · simp only [Function.update_of_ne hk]
           exact h.report_dt u T d hrp
@@ -3167,12 +3167,12 @@ private theorem provinv_step {n : Nat} {w w' : World n} (hw : Reachable w)
             ((w.nodes u).dn.applyGossip t entries).termMap p' = t'
           rw [hFm]
           by_cases hadopt : (w.nodes u).dn.pn.currentTerm < t
-          · rw [if_pos hadopt] at hdtu'
+          · rw [ite_eq_left hadopt] at hdtu'
             have h1 : T ≤ (w.nodes u).dn.dataTerm := h.report_dt u T d hrp
             have h2 : (w.nodes u).dn.dataTerm
                 ≤ (w.nodes u).dn.pn.currentTerm := hdle
             omega
-          · rw [if_neg hadopt] at hdtu'
+          · rw [ite_eq_right hadopt] at hdtu'
             rw [hpres p' hp'']
             have hval' : o.validUpTo ≤ (w.nodes u).pn.durable := hval_le
             exact h.report_frames u T d hrp
@@ -3197,12 +3197,12 @@ private theorem provinv_step {n : Nat} {w w' : World n} (hw : Reachable w)
               = TermMap.termAt (w.nodes ℓ).dn.termMap p'
             rw [hFm]
             by_cases hadopt : (w.nodes u).dn.pn.currentTerm < t
-            · rw [if_pos hadopt] at hdtu'
+            · rw [ite_eq_left hadopt] at hdtu'
               have h1 : T ≤ (w.nodes u).dn.dataTerm := h.report_dt u T d hrp
               have h2 : (w.nodes u).dn.dataTerm
                   ≤ (w.nodes u).dn.pn.currentTerm := hdle
               omega
-            · rw [if_neg hadopt] at hdtu'
+            · rw [ite_eq_right hadopt] at hdtu'
               rw [hpres p' hp'']
               have hval' : o.validUpTo ≤ (w.nodes u).pn.durable := hval_le
               exact h.report_leader_eq u T d hrp
@@ -3214,7 +3214,7 @@ private theorem provinv_step {n : Nat} {w w' : World n} (hw : Reachable w)
             obtain ⟨hm0, hd0, hprl, hnadopt⟩ := hjld hrl
             have hctl' : ((w.nodes ℓ).dn.applyGossip t entries).pn.currentTerm
                 = T := hctl
-            rw [hFc, if_neg hnadopt] at hctl'
+            rw [hFc, ite_eq_right hnadopt] at hctl'
             show TermMap.termAt (w.nodes u).dn.termMap p'
               = TermMap.termAt
                 ((w.nodes ℓ).dn.applyGossip t entries).termMap p'
@@ -3236,12 +3236,12 @@ private theorem provinv_step {n : Nat} {w w' : World n} (hw : Reachable w)
               ≤ (w.nodes ℓ).pn.durable
             rw [hFd]
             by_cases hadopt : (w.nodes u).dn.pn.currentTerm < t
-            · rw [if_pos hadopt] at hdtu'
+            · rw [ite_eq_left hadopt] at hdtu'
               have h1 : T ≤ (w.nodes u).dn.dataTerm := h.report_dt u T d hrp
               have h2 : (w.nodes u).dn.dataTerm
                   ≤ (w.nodes u).dn.pn.currentTerm := hdle
               omega
-            · rw [if_neg hadopt] at hdtu'
+            · rw [ite_eq_right hadopt] at hdtu'
               have h2 := h.report_durable u T d hrp
                 (show (w.nodes u).dataTerm = T from hdtu') ℓ hrl hctl
               have hval' : o.validUpTo ≤ (w.nodes u).pn.durable := hval_le
@@ -3252,7 +3252,7 @@ private theorem provinv_step {n : Nat} {w w' : World n} (hw : Reachable w)
             obtain ⟨hm0, hd0, hprl, hnadopt⟩ := hjld hrl
             have hctl' : ((w.nodes ℓ).dn.applyGossip t entries).pn.currentTerm
                 = T := hctl
-            rw [hFc, if_neg hnadopt] at hctl'
+            rw [hFc, ite_eq_right hnadopt] at hctl'
             show (w.nodes u).pn.durable
               ≤ ((w.nodes ℓ).dn.applyGossip t entries).pn.durable
             rw [hFd, hd0]
@@ -3378,7 +3378,7 @@ theorem observeTerm_of_held_is_noop {n : Nat} {w : World n} (hw : Reachable w)
   have hle : t ≤ Data.lastTermOf (w.nodes j).dn.termMap := by
     have := TermMap.termAt_le_lastTermOf hasc pos
     omega
-  simp only [Data.observeTerm, if_neg (by omega :
+  simp only [Data.observeTerm, ite_eq_right (by omega :
     ¬ Data.lastTermOf (w.nodes j).dn.termMap < t)]
 
 #print axioms observeTerm_of_held_is_noop

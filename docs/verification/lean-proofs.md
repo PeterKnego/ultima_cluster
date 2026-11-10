@@ -143,7 +143,9 @@ Random sampling gives no guarantee of hitting an edge case a human thought of. S
 
 The rig covers the three consensus kernels. It does not cover the whole node. The durable-counter caveat above is the concrete example: the hazard was in how two threads read one value, and the model could not express that at all. No amount of replaying vectors against such a model would have surfaced it.
 
-The way to close that gap for good is to translate the real Rust into Lean mechanically and prove theorems about the translation. [Aeneas](https://github.com/AeneasVerif/aeneas) does this, and the approach worked in [`ultima_db`](https://github.com/PeterKnego/ultima_db), where the proofs run against mechanically translated code. It was tried here and **stopped at a toolchain wall**: Aeneas's Lean support library pins Lean v4.31.0 and does not build under this repo's v4.32.0. Charon, the front end that reads the Rust, processed `uc_consensus` cleanly, so the approach is feasible and only the version timing blocks it. Downgrading the repo's Lean to chase a research tool was rejected. The retry condition is Aeneas moving to v4.32.0 or later.
+The way to close that gap for good is to translate the real Rust into Lean mechanically and prove theorems about the translation. [Aeneas](https://github.com/AeneasVerif/aeneas) does this, and the approach worked in [`ultima_db`](https://github.com/PeterKnego/ultima_db), where the proofs run against mechanically translated code. It was tried here and **stopped at a toolchain wall**. At the time, Aeneas's Lean support library pinned Lean v4.31.0, and it did not build under this repo's v4.32.0. Charon, the front end that reads the Rust, processed `uc_consensus` cleanly. So the approach was feasible, and only the version timing blocked it. Downgrading the repo's Lean to chase a research tool was rejected. The retry condition was Aeneas moving to v4.32.0 or later.
+
+**That condition has been met, but the retry has not been run.** Aeneas moved to Lean v4.35.0 on 2026-10-15, in commit `1238879f`. On 2026-11-10 this repo moved to v4.35.0 too, so the two now share a toolchain. A retry should pin that Aeneas commit rather than Aeneas's `main`, which has since moved on to a release candidate.
 
 ## The trusted base
 
@@ -156,4 +158,14 @@ The trusted base is everything you must take on faith for the proofs to mean any
 
 ## Toolchain and build
 
-The proofs use Lean 4 v4.32.0 with mathlib pinned at v4.32.0. `lake build` completes about 3,027 jobs with zero warnings and zero `sorry`.
+The proofs use Lean 4 v4.35.0 with mathlib pinned at v4.35.0. `lake build` completes about 3,177 jobs with zero warnings and zero `sorry`.
+
+The move from v4.32.0 to v4.35.0 was made on 2026-11-10. It changed no theorem statement. It made three kinds of edit to proof scripts:
+
+- Renamed lemmas: `if_pos`, `if_neg`, `if_true` and `if_false` became `ite_eq_left`, `ite_eq_right`, `ite_true` and `ite_false`, which have identical types.
+- Three `rw` steps in `TakeDiscipline.lean` stopped matching their hypothesis, and became `simp only` steps.
+- New linters flagged unused `simp` arguments and redundant tactics, which were removed.
+
+mathlib v4.35.0 is built for Lean's module system, and these files do not use it yet. `allowNonModules = true` in `lakefile.toml` declares that mix instead of carrying one warning per import.
+
+The axiom check moved in one way. Four results now also list `Classical.choice`: `canon_sat_witness`, `Cert.transport`, `cert_of_leader` and `nonvacuity_commit_completeness_trace`. The cause is upstream. Under v4.35.0, `simp` and `omega` reach core lemmas such as `List.perm_iff_count` that already rested on `Classical.choice` in v4.32.0. `CanonWitness.lean` was not edited, and it moved too. Every result still rests only on the standard three axioms. Two conformance replays of 100,000 vectors each, seed 1 and seed 20261110, showed zero divergence after the move.

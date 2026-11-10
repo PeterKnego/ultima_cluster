@@ -13,8 +13,8 @@ Veil is a bounded model checker. It explores every state of a small model up to 
 
 ## The three guardrails
 
-1. **Veil is never the record.** Permanent proofs live in `proofs/`. Those are Lean v4.32.0, with the standard axiom trio and no SMT solver in the trusted base. A Veil model has no conformance rig against the real Rust. It is scratchpad-only. Any bug it finds is reconfirmed in Rust on its own before a fix is made.
-2. **Toolchain isolation.** The models target Veil's `veil-2.0-preview` on Lean v4.28.0. That is incompatible with the v4.32.0 that `proofs/` uses. The models are never on any `proofs/` build path, never in a CI gate, and never behind a "proved" claim. They do not build in this repo. There is deliberately no CI job.
+1. **Veil is never the record.** Permanent proofs live in `proofs/`. Those are Lean v4.35.0, with the standard axiom trio and no SMT solver in the trusted base. A Veil model has no conformance rig against the real Rust. It is scratchpad-only. Any bug it finds is reconfirmed in Rust on its own before a fix is made.
+2. **Toolchain isolation.** The models target Veil's `veil-2.0-preview` on Lean v4.28.0. That is incompatible with the v4.35.0 that `proofs/` uses. Veil itself has since released v4.35.0, but porting the models to it is a separate piece of work. Veil has since dropped mathlib and moved to the module system, so the port is more than a version bump. The models are never on any `proofs/` build path, never in a CI gate, and never behind a "proved" claim. They do not build in this repo. There is deliberately no CI job.
 3. **No migration of anything proved.** Election safety, log matching, and the leader-completeness support stack are done in `proofs/`. Veil touches none of them.
 
 ## Why say this out loud
