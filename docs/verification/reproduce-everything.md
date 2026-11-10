@@ -6,8 +6,11 @@ Each tier's page ends with its own "How to run it" block. This page collects the
 
 ```bash
 # Proofs — from proofs/
-lake build                                                  # 3027 jobs, zero sorry
-lake exe conform --seed 20260716 --count 100000             # model vs. real Rust
+lake build                                                  # 3177 jobs, zero sorry
+# model vs. real Rust: generate vectors from the Rust, then replay them in Lean
+cargo run -p uc_consensus --release --example conform_gen -- \
+  --out $HOME/.cache/uc2-conform/vectors.jsonl --count 100000 --seed 1
+lake exe conform $HOME/.cache/uc2-conform/vectors.jsonl
 
 # Simulation
 cargo test -p uc_sim --features sim-heavy                  # 1000-seed fuzz

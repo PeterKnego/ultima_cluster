@@ -137,7 +137,7 @@ This was verified on three seeds and 300,000 vectors with zero divergence. The c
 
 ### Build-time pins for the hand-written edge cases
 
-Random sampling gives no guarantee of hitting an edge case a human thought of. So every unit test in `reconcile.rs`, all 10 of them, and every unit test in `commit.rs` is also ported into Lean as a `#guard` assertion. Each sits next to the model definition it exercises and is evaluated on every `lake build`. If the model ever disagrees with a unit test, the build fails.
+Random sampling gives no guarantee of hitting an edge case a human thought of. So every unit test in `reconcile.rs` and `commit.rs` is also ported into Lean as a `#guard` assertion. `reconcile.rs` has 13 unit tests. Ten are pinned against the core `reconcile`, and the three window tests are pinned against `reconcileAligned`. Its two lineage-property tests are not ported. Each sits next to the model definition it exercises and is evaluated on every `lake build`. If the model ever disagrees with a unit test, the build fails.
 
 ### What the rig cannot see
 
