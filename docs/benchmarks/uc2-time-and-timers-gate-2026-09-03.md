@@ -103,7 +103,7 @@ the `RowTimers` unit tests in `uc_node/src/timers.rs`, the oracle's clause (7)
 exercised by the capstone, and the `uc_protocol_schedule_table` fuzz target.
 See
 [VERIFICATION §2, §3, §4](../VERIFICATION.md) for those rows and
-[VERIFICATION §11](../VERIFICATION.md#11-what-is-not-verified) for what none
+[What is not verified](../verification/not-verified.md) for what none
 of it covers.
 
 ## The bar

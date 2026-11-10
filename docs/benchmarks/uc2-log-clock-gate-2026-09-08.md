@@ -59,7 +59,7 @@ the node-level test above uses `inject_sample` instead, which goes through
 the real `LogClock`; (2) no `m10_alerts.rs` scenario for the smear was ever
 built, and none exists in this release — see spec errata bullet 8. The
 alert-tier gap is tracked as a `docs/BACKLOG.md` item, not covered here. See
-[VERIFICATION §11](../VERIFICATION.md#11-what-is-not-verified) for what
+[What is not verified](../verification/not-verified.md) for what
 neither tier covers.
 
 Two claims need a fleet to test, and row a exists for exactly those — spec

@@ -44,7 +44,7 @@ documentation for what it changes, because the tag is what people read.
       so it passes for any adjacent pair: a one-level step asserts the hold,
       the raise and the old binary's refusal; the same level asserts the
       roll completes with the level unmoved and skips the refusal clause
-      (`docs/VERIFICATION.md` § Rolling wire-level upgrade). The first real
+      (`docs/verification/hard-crash.md` § Rolling wire-level upgrade). The first real
       run is `2.16.0` against `2.15.0`: `2.14.0` writes no level byte and is
       refused as pre-level by design (the last flag day). Record the run in
       `docs/releases.md`'s entry.

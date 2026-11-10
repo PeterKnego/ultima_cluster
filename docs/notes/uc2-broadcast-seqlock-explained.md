@@ -189,4 +189,4 @@ exactly-one-winner guarantee, in the same way.
 
 Still uncovered, and stated rather than implied: **SPSC, the futex layer, and
 the mapping itself** have no loom model.
-See [`docs/VERIFICATION.md`](../VERIFICATION.md) §6 and §11.
+See [loom](../verification/loom.md) and [What is not verified](../verification/not-verified.md).

@@ -162,7 +162,7 @@ record what is not proved:
   machine-checked satisfiability witness all landed, and the hypothesis that
   had made it conditional discharged since. What remains is the joint /
   well-founded induction the corpus's standard shape does not give
-  (`docs/VERIFICATION.md` § "What is not proved", estimated 3–4 tasks) — and
+  (`docs/verification/lean-proofs.md` § "What is not proved", estimated 3–4 tasks) — and
   the next bullet, which has to land first for the result to mean what it
   says.
 - **The Lean model collapses the durable counter's two readers into one**
@@ -191,7 +191,7 @@ record what is not proved:
   four scenarios — one link loses NAKs, one node's votes are silenced, one
   direction is delayed and jittered, repairs are dropped — run **nightly on
   three real node processes under the WGL checker**
-  (`testing/uc_crashtest/tests/netfault.rs`; `docs/VERIFICATION.md` §2, "The
+  (`testing/uc_crashtest/tests/netfault.rs`; `docs/verification/fault-layers.md` § "The
   kernel-level fault layer"). What is left is the fleet: the same scenarios
   on `bench-infra`'s hosts under load, a history client beside the nodes,
   recorded as a gate doc whose **first run is a measurement with no bar**
@@ -214,7 +214,7 @@ All framed by the docs as characterisation, not defects:
 - **M14 gate row e has never been re-measured**, and the pinned rig's
   residual 14.3 % spread is undiagnosed
   (`docs/benchmarks/uc2-m14c2-fleet-pinning-2026-08-30.md`,
-  `docs/VERIFICATION.md` §11).
+  `docs/verification/not-verified.md`).
 - **The apply hop lost ground on Ice Lake, and the ring CRC is most of
   it.** The #33 apply-hop A/B
   (`docs/benchmarks/uc2-row-running-version-apply-ab-2026-10-17.md`) is an

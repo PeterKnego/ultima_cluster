@@ -201,6 +201,6 @@ without promoting the seam to a Cargo feature (which would make it API).
    `src/bin/seed_corpus.rs`; run the generator and commit the corpus.
 4. **Assign it to a matrix group** in `nightly.yml`'s `fuzz-groups` job. The
    workflow fails until you do — deliberately.
-5. Add a row to the target table above and a line to `docs/VERIFICATION.md`'s
-   fuzzing section.
+5. Add a row to the target table above and a row to
+   `docs/verification/fuzzing.md`'s target table.
 6. Shared helpers (`uc_fuzz::split`, `uc_fuzz::NoopSm`) live in `src/lib.rs`.

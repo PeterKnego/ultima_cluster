@@ -273,7 +273,7 @@ Proof-only: no feature, config, wire or cnc change.
 - **Two-FSM capstones.** Linearizability, partition, `SIGKILL` and Elle tiers
   now run with two state machines per node, plus a replication-equivalence
   oracle shown to catch a divergent FSM.
-  → [VERIFICATION § 11](docs/VERIFICATION.md#11-what-is-not-verified) ·
+  → [What is not verified](docs/verification/not-verified.md) ·
   [How multi-service works](docs/notes/uc2-m14-multi-service-explained.md)
 - **Lockstep under oversubscription is an operating envelope.** No candidate
   fix cleared the bar, so lockstep needs a free CPU per declared FSM.

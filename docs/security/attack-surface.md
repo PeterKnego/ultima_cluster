@@ -14,7 +14,7 @@ discovery, `2.12.0`; the **eight** before it — `uc_protocol_timer_frame`,
 `uc_service_snapshot_envelope` — with `2.11.0`, which took the tier from 15 to
 23),
 each run for 600 s per night with an asserted execution floor
-([VERIFICATION §7](/docs/VERIFICATION.md#7-fuzzing-decoders-total-on-untrusted-bytes),
+([Fuzzing and Miri](/docs/verification/fuzzing.md),
 [`fuzz/README.md`](/fuzz/README.md)).
 
 ---
@@ -102,7 +102,7 @@ commit (the sender's budget, the appender's door, and the live cnc
 - **Stateful sequences.** Every fuzz target is one decoder on one input.
   Sequences that drive the receiver's dispatch across terms, epochs and
   sessions belong to the simulation and the linearizability capstones
-  ([VERIFICATION §2, §3](/docs/VERIFICATION.md)).
+  ([the simulation and linearizability tiers](/docs/VERIFICATION.md)).
 - **The IPC ring buffers' `unsafe` code** (`uc_protocol/src/ring/{spsc,mpsc,
   broadcast,common,futex}.rs`). Their **layout** is frozen by offset-pin tests.
   Since 2.7.0 the **MPSC claim-then-commit sequence is no longer unchecked**:
@@ -120,6 +120,6 @@ commit (the sender's budget, the appender's door, and the live cnc
   (`uc_log/tests/loom_frame.rs`'s header), so its absence is a design
   statement, not an oversight. SPSC's interleavings are likewise unmodelled.
   All of that is an open, stated residue
-  ([VERIFICATION §11](/docs/VERIFICATION.md#11-what-is-not-verified)) and a
+  ([What is not verified](/docs/verification/not-verified.md)) and a
   named item in
   [the self-assessment's "focus here" list](self-assessment.md#4-what-an-external-review-should-focus-on).

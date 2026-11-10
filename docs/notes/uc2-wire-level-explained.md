@@ -262,5 +262,6 @@ assessment's
   level rule as policy.
 - [Wire protocol](../reference/wire-protocol.md): the header byte, `Settings`
   v7 and the `NEW_TERM` body.
-- [`docs/VERIFICATION.md`](../VERIFICATION.md): the two-binary rolling
-  crashtest and the `uc_protocol_compat` fuzz target.
+- [Multi-process hard crash](../verification/hard-crash.md): the two-binary
+  rolling crashtest. [Fuzzing and Miri](../verification/fuzzing.md): the
+  `uc_protocol_compat` fuzz target.

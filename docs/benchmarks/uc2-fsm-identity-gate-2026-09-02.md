@@ -37,7 +37,7 @@ whether attaching, running and joining **by name** costs anything against
 the identical scenario run **by number** on the pre-identity binary. It is
 not a substitute for the unit tier, the two negative snapshot-session
 scenarios (`uc_node/tests/learner.rs`), or the capstones — see
-[VERIFICATION §11](../VERIFICATION.md#11-what-is-not-verified) for those
+[What is not verified](../verification/not-verified.md) for those
 (all dev-box smoke as of this skeleton's commit, per the standing
 dev-box-is-not-a-bench rule; not a substitute for a fleet run either).
 

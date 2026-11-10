@@ -14,7 +14,7 @@ default**. With `[crypto].enabled = false` the posture is a trusted private
 network — the same posture stock Aeron takes — and the decoders in
 `uc_protocol::v2` are the *only* thing standing between an unauthenticated UDP
 packet and the node's state. That is why they are fuzzed
-([VERIFICATION §7](/docs/VERIFICATION.md#7-fuzzing-decoders-total-on-untrusted-bytes)).
+([Fuzzing and Miri](/docs/verification/fuzzing.md)).
 
 ---
 
@@ -157,7 +157,7 @@ Each of these is a deliberate boundary, not an oversight.
 - **Your state machine.** `apply` is your code. Nondeterminism in it diverges
   replicas, and a panic in it fail-stops every replica identically. Neither is
   something this layer can catch — see
-  [VERIFICATION §11](/docs/VERIFICATION.md#11-what-is-not-verified).
+  [What is not verified](/docs/verification/not-verified.md).
 
 ## 6. Residuals stated elsewhere, and where
 
@@ -225,7 +225,7 @@ Also stated, in the documents that own them:
   surface](attack-surface.md#1-the-inventory) (typed-tier row) and
   [self-assessment §3](self-assessment.md#3-known-weaknesses-not-fixed).
 - **What is not verified at all** —
-  [VERIFICATION §11](/docs/VERIFICATION.md#11-what-is-not-verified): the open
+  [What is not verified](/docs/verification/not-verified.md): the open
   `leader_completeness` theorem, the durable dual-reader model gap, and the IPC
   rings that Miri cannot check.
 
