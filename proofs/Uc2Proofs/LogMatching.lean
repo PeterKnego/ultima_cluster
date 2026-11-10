@@ -167,7 +167,7 @@ theorem reconcile_self (m : TermMap) (d : Nat) :
     have hnone : (e :: es)[(e :: es).length]? = none :=
       List.getElem?_eq_none (Nat.le_refl _)
     simp only [reconcile, commonPrefixLen_self]
-    rw [if_neg (by simp)]
+    rw [ite_eq_right (by simp)]
     simp only [reconcile.reconcileClamped, hnone,
       List.take_of_length_le (Nat.le_refl _),
       List.drop_of_length_le (Nat.le_refl _), List.filter_nil,
@@ -244,12 +244,12 @@ theorem recv_term {n : Nat} (s : PNode n) (c : Fin n) (nt lt d : Nat)
     (hle : s.currentTerm ≤ nt) :
     ((s.recvRequestVote c nt lt d).1).currentTerm = nt := by
   by_cases hadopt : s.currentTerm < nt
-  · simp only [PNode.recvRequestVote, if_pos hadopt, PNode.adoptTerm,
+  · simp only [PNode.recvRequestVote, ite_eq_left hadopt, PNode.adoptTerm,
       PNode.recvRequestVote.grantIfFresh]
     split_ifs <;> rfl
   · have heq : s.currentTerm = nt := by omega
     rcases hvf : s.votedFor with _ | ⟨vt, vid⟩ <;>
-      simp only [PNode.recvRequestVote, if_neg hadopt, hvf,
+      simp only [PNode.recvRequestVote, ite_eq_right hadopt, hvf,
         PNode.recvRequestVote.grantIfFresh] <;>
       split_ifs <;> simp [heq]
 
@@ -260,21 +260,21 @@ theorem recv_voted_current {n : Nat} (s : PNode n) (c x : Fin n)
       ((s.recvRequestVote c nt lt d).2 = true → x = c) := by
   have hnadopt : ¬ s.currentTerm < nt := by omega
   by_cases hx : x = c <;>
-    simp [PNode.recvRequestVote, if_neg hnadopt, hvf, hx]
+    simp [PNode.recvRequestVote, ite_eq_right hnadopt, hvf, hx]
 
 theorem recv_frame {n : Nat} (s : PNode n) (c : Fin n) (nt lt d : Nat)
     (hnadopt : ¬ s.currentTerm < nt) :
     ((s.recvRequestVote c nt lt d).1).role = s.role ∧
     ((s.recvRequestVote c nt lt d).1).currentTerm = s.currentTerm := by
   rcases hvf : s.votedFor with _ | ⟨vt, vid⟩ <;>
-    simp only [PNode.recvRequestVote, if_neg hnadopt, hvf,
+    simp only [PNode.recvRequestVote, ite_eq_right hnadopt, hvf,
       PNode.recvRequestVote.grantIfFresh] <;>
     split_ifs <;> simp
 
 theorem recv_adopt_role {n : Nat} (s : PNode n) (c : Fin n)
     (nt lt d : Nat) (hadopt : s.currentTerm < nt) :
     ((s.recvRequestVote c nt lt d).1).role = .follower := by
-  simp only [PNode.recvRequestVote, if_pos hadopt, PNode.adoptTerm,
+  simp only [PNode.recvRequestVote, ite_eq_left hadopt, PNode.adoptTerm,
     PNode.recvRequestVote.grantIfFresh]
   split_ifs <;> rfl
 
@@ -283,11 +283,11 @@ theorem recv_durable {n : Nat} (s : PNode n) (c : Fin n)
     (nt lt d : Nat) :
     ((s.recvRequestVote c nt lt d).1).durable = s.durable := by
   by_cases hadopt : s.currentTerm < nt
-  · simp only [PNode.recvRequestVote, if_pos hadopt, PNode.adoptTerm,
+  · simp only [PNode.recvRequestVote, ite_eq_left hadopt, PNode.adoptTerm,
       PNode.recvRequestVote.grantIfFresh]
     split_ifs <;> rfl
   · rcases hvf : s.votedFor with _ | ⟨vt, vid⟩ <;>
-      simp only [PNode.recvRequestVote, if_neg hadopt, hvf,
+      simp only [PNode.recvRequestVote, ite_eq_right hadopt, hvf,
         PNode.recvRequestVote.grantIfFresh] <;>
       split_ifs <;> rfl
 
@@ -512,8 +512,8 @@ private theorem stamp_step {n : Nat} {w w' : World n} (h : StampInv w)
       rcases eq_or_ne k j with rfl | hne
       · simp only [Function.update_self, applyGossip_dataTerm]
         by_cases hadopt : (w.nodes k).pn.currentTerm < t
-        · rw [if_pos hadopt, (applyGossip_adopt _ entries hadopt).2]
-        · rw [if_neg hadopt, (applyGossip_no_adopt _ entries hadopt).2.1]
+        · rw [ite_eq_left hadopt, (applyGossip_adopt _ entries hadopt).2]
+        · rw [ite_eq_right hadopt, (applyGossip_no_adopt _ entries hadopt).2.1]
           exact h.data_le k
       · simp only [Function.update_of_ne hne]
         exact h.data_le k

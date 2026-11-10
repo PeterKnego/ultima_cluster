@@ -223,11 +223,11 @@ via `with`-updates). -/
 private theorem ccr_recv_lastTerm {n : Nat} (s : PNode n) (c : Fin n)
     (nt lt d : Nat) : ((s.recvRequestVote c nt lt d).1).lastTerm = s.lastTerm := by
   by_cases hadopt : s.currentTerm < nt
-  · simp only [PNode.recvRequestVote, if_pos hadopt, PNode.adoptTerm,
+  · simp only [PNode.recvRequestVote, ite_eq_left hadopt, PNode.adoptTerm,
       PNode.recvRequestVote.grantIfFresh]
     split_ifs <;> rfl
   · rcases hvf : s.votedFor with _ | ⟨vt, vid⟩ <;>
-      simp only [PNode.recvRequestVote, if_neg hadopt, hvf,
+      simp only [PNode.recvRequestVote, ite_eq_right hadopt, hvf,
         PNode.recvRequestVote.grantIfFresh] <;>
       split_ifs <;> rfl
 
@@ -895,11 +895,11 @@ private theorem recvRequestVote_currentTerm_le {n : Nat} (s : PNode n)
   unfold PNode.recvRequestVote
   by_cases h : s.currentTerm < nt
   · -- adopted strictly upward: `votedFor` is cleared, so the fresh-grant arm
-    simp only [h, if_true, PNode.adoptTerm]
+    simp only [h, ite_true, PNode.adoptTerm]
     unfold PNode.recvRequestVote.grantIfFresh
     split <;> simp <;> omega
   · -- no adoption: every arm returns `s` up to `votedFor`
-    simp only [h, if_false]
+    simp only [h, ite_false]
     split
     · split
       · split <;> simp
@@ -916,7 +916,7 @@ private theorem applyGossip_currentTerm_le {n : Nat} (d : Data.Node n)
   unfold Data.Node.applyGossip
   split <;>
   · dsimp only
-    split <;> simp [PNode.adoptTerm] <;> omega
+    split <;> simp [PNode.adoptTerm]; omega
 
 /-- **`currentTerm` is monotone across every step.** The term handle rises at
 `startElection` (self-bump), at `deliverRequestVote`/`deliverTermMap` (adopt

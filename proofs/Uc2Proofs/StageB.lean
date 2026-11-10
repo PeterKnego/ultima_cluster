@@ -45,11 +45,11 @@ private theorem recv_lastTerm {n : Nat} (s : PNode n) (c : Fin n)
     (nt lt d : Nat) :
     ((s.recvRequestVote c nt lt d).1).lastTerm = s.lastTerm := by
   by_cases hadopt : s.currentTerm < nt
-  · simp only [PNode.recvRequestVote, if_pos hadopt, PNode.adoptTerm,
+  · simp only [PNode.recvRequestVote, ite_eq_left hadopt, PNode.adoptTerm,
       PNode.recvRequestVote.grantIfFresh]
     split_ifs <;> rfl
   · rcases hvf : s.votedFor with _ | ⟨vt, vid⟩ <;>
-      simp only [PNode.recvRequestVote, if_neg hadopt, hvf,
+      simp only [PNode.recvRequestVote, ite_eq_right hadopt, hvf,
         PNode.recvRequestVote.grantIfFresh] <;>
       split_ifs <;> rfl
 
@@ -516,9 +516,9 @@ private theorem ofe_step {n : Nat} {w w' : World n} (hw : Reachable w)
     rcases eq_or_ne k j with rfl | hne
     · simp only [Node.dataTerm, Function.update_self] at hr hdt ⊢
       by_cases hadopt : (w.nodes k).pn.currentTerm < nt
-      · rw [if_pos hadopt] at hr
+      · rw [ite_eq_left hadopt] at hr
         cases hr
-      · rw [if_neg hadopt] at hr hdt ⊢
+      · rw [ite_eq_right hadopt] at hr hdt ⊢
         exact h T hera k hr hdt
     · simp only [Node.dataTerm, Function.update_of_ne hne] at hr hdt ⊢
       exact h T hera k (by simpa [Function.update_of_ne hne] using hr) hdt
@@ -613,9 +613,9 @@ private theorem ofe_step {n : Nat} {w w' : World n} (hw : Reachable w)
       rw [Data.applyGossip_dataTerm] at hdt
       have hct : (w.nodes k).dn.pn.currentTerm ≤ t := hterm
       by_cases hadopt : (w.nodes k).dn.pn.currentTerm < t
-      · rw [if_pos hadopt] at hdt
+      · rw [ite_eq_left hadopt] at hdt
         omega
-      · rw [if_neg hadopt] at hdt
+      · rw [ite_eq_right hadopt] at hdt
         have hdle : (w.nodes k).dn.dataTerm
             ≤ (w.nodes k).dn.pn.currentTerm :=
           (Data.reachable_stamp (reachable_project hw)).data_le k
@@ -980,7 +980,7 @@ private theorem ref_step {n : Nat} {w w' : World n} (hw : Reachable w)
             Uc2.Data.Node.recvReplicate]
           have hfl' : d ≤ (w.nodes y).dn.pn.durable := hfl
           omega
-        · simp only [Node.pn, Function.update_self,
+        · simp only [Function.update_self,
             Uc2.Data.Node.recvReplicate]
           by_cases hgrow : Data.lastTermOf (w.nodes y).dn.termMap < t
           · rw [show Data.observeTerm (w.nodes y).dn.termMap t pos
@@ -1205,7 +1205,7 @@ private theorem ref_step {n : Nat} {w w' : World n} (hw : Reachable w)
           · exfalso
             simp only [Node.pn, Function.update_self] at hrl
             rw [(Data.applyGossip_ok (w.nodes ℓ).dn t hrec).2.2.2.1] at hrl
-            rw [if_neg (by omega)] at hrl
+            rw [ite_eq_right (by omega)] at hrl
             exact reachable_no_self_report hw ℓ
               (by rw [show (w.nodes ℓ).pn.role = Role.leader from hrl]
                   decide) d
@@ -1220,7 +1220,7 @@ private theorem ref_step {n : Nat} {w w' : World n} (hw : Reachable w)
           · exfalso
             simp only [Node.pn, Function.update_self] at hrl
             rw [(Data.applyGossip_ok (w.nodes ℓ).dn t hrec).2.2.2.1] at hrl
-            rw [if_neg (by omega)] at hrl
+            rw [ite_eq_right (by omega)] at hrl
             exact reachable_no_self_report hw ℓ
               (by rw [show (w.nodes ℓ).pn.role = Role.leader from hrl]
                   decide) d
@@ -1589,14 +1589,14 @@ private theorem recv_grant_cases {n : Nat} (s : PNode n) (c : Fin n)
     (s.votedFor = some (nt, c) ∧ s.currentTerm = nt) := by
   by_cases hadopt : s.currentTerm < nt
   · left
-    simp only [PNode.recvRequestVote, if_pos hadopt, PNode.adoptTerm,
+    simp only [PNode.recvRequestVote, ite_eq_left hadopt, PNode.adoptTerm,
       PNode.recvRequestVote.grantIfFresh] at hflag
     split_ifs at hflag with hlog
     · exact hlog
   · have hct : s.currentTerm = nt := by omega
     rcases hvf : s.votedFor with _ | ⟨vt, vid⟩
     · left
-      simp only [PNode.recvRequestVote, if_neg hadopt, hvf,
+      simp only [PNode.recvRequestVote, ite_eq_right hadopt, hvf,
         PNode.recvRequestVote.grantIfFresh] at hflag
       split_ifs at hflag with hlog
       · exact hlog
@@ -1606,16 +1606,16 @@ private theorem recv_grant_cases {n : Nat} (s : PNode n) (c : Fin n)
           refine ⟨?_, hct⟩
           rw [hvt, hvid, hct]
         · exfalso
-          simp only [PNode.recvRequestVote, if_neg hadopt, hvf, if_pos hvt,
-            if_neg hvid] at hflag
+          simp only [PNode.recvRequestVote, ite_eq_right hadopt, hvf, ite_eq_left hvt,
+            ite_eq_right hvid] at hflag
           cases hflag
       · left
-        simp only [PNode.recvRequestVote, if_neg hadopt, hvf, if_neg hvt,
+        simp only [PNode.recvRequestVote, ite_eq_right hadopt, hvf, ite_eq_right hvt,
           PNode.recvRequestVote.grantIfFresh] at hflag
         split_ifs at hflag with hlog
         · exact hlog
 
-private theorem vm_step {n : Nat} {w w' : World n} (hw : Reachable w)
+private theorem vm_step {n : Nat} {w w' : World n} (_hw : Reachable w)
     (h : VotedMsg w) (hs : Step w w') : VotedMsg w' := by
   cases hs with
   | startElection i hrole =>
@@ -1638,7 +1638,7 @@ private theorem vm_step {n : Nat} {w w' : World n} (hw : Reachable w)
             = nt := Data.recv_term _ _ _ _ _ (by omega)
         have htnt : t = nt := by omega
         subst htnt
-        simp only [PNode.recvRequestVote, if_pos hadopt, PNode.adoptTerm,
+        simp only [PNode.recvRequestVote, ite_eq_left hadopt, PNode.adoptTerm,
           PNode.recvRequestVote.grantIfFresh] at hvf
         split_ifs at hvf with hlog
         · simp only [Option.some.injEq, Prod.mk.injEq] at hvf
@@ -1648,9 +1648,9 @@ private theorem vm_step {n : Nat} {w w' : World n} (hw : Reachable w)
             have hadopt2 : (w.nodes j).pn.currentTerm < t := hadopt
             have hlog2 : logOk (w.nodes j).pn.lastTerm
                 (w.nodes j).pn.durable clt cd = true := hlog
-            simp only [PNode.recvRequestVote, if_pos hadopt2, PNode.adoptTerm,
+            simp only [PNode.recvRequestVote, ite_eq_left hadopt2, PNode.adoptTerm,
               PNode.recvRequestVote.grantIfFresh]
-            rw [if_pos hlog2]
+            rw [ite_eq_left hlog2]
           refine List.mem_append_right _ ?_
           rw [hflag]
           exact List.mem_singleton.mpr rfl
@@ -1659,7 +1659,7 @@ private theorem vm_step {n : Nat} {w w' : World n} (hw : Reachable w)
           omega
         rcases hvfpre : (w.nodes j).dn.pn.votedFor with _ | ⟨vt, vid⟩
         · -- fresh grant from a clean record
-          simp only [PNode.recvRequestVote, if_neg hadopt, hvfpre,
+          simp only [PNode.recvRequestVote, ite_eq_right hadopt, hvfpre,
             PNode.recvRequestVote.grantIfFresh] at hvf hct
           split_ifs at hvf with hlog
           · simp only [Option.some.injEq, Prod.mk.injEq] at hvf
@@ -1670,9 +1670,9 @@ private theorem vm_step {n : Nat} {w w' : World n} (hw : Reachable w)
               have hvfpre2 : (w.nodes j).pn.votedFor = none := hvfpre
               have hlog2 : logOk (w.nodes j).pn.lastTerm
                   (w.nodes j).pn.durable clt cd = true := hlog
-              simp only [PNode.recvRequestVote, if_neg hadopt2, hvfpre2,
+              simp only [PNode.recvRequestVote, ite_eq_right hadopt2, hvfpre2,
                 PNode.recvRequestVote.grantIfFresh]
-              rw [if_pos hlog2]
+              rw [ite_eq_left hlog2]
             have htnt : t = nt := by omega
             subst htnt
             refine List.mem_append_right _ ?_
@@ -1688,8 +1688,8 @@ private theorem vm_step {n : Nat} {w w' : World n} (hw : Reachable w)
             rw [hstate] at hvf hct
             exact List.mem_append_left _ (h j c t hvf hct hcj)
           · -- stale record falls through to a fresh grant
-            simp only [PNode.recvRequestVote, if_neg hadopt, hvfpre,
-              if_neg hvt, PNode.recvRequestVote.grantIfFresh] at hvf hct
+            simp only [PNode.recvRequestVote, ite_eq_right hadopt, hvfpre,
+              ite_eq_right hvt, PNode.recvRequestVote.grantIfFresh] at hvf hct
             split_ifs at hvf hct with hlog
             · simp only [Option.some.injEq, Prod.mk.injEq] at hvf
               obtain ⟨hteq, rfl⟩ := hvf
@@ -1701,9 +1701,9 @@ private theorem vm_step {n : Nat} {w w' : World n} (hw : Reachable w)
                 have hvt2 : ¬ vt = (w.nodes j).pn.currentTerm := hvt
                 have hlog2 : logOk (w.nodes j).pn.lastTerm
                     (w.nodes j).pn.durable clt cd = true := hlog
-                simp only [PNode.recvRequestVote, if_neg hadopt2, hvfpre2,
-                  if_neg hvt2, PNode.recvRequestVote.grantIfFresh]
-                rw [if_pos hlog2]
+                simp only [PNode.recvRequestVote, ite_eq_right hadopt2, hvfpre2,
+                  ite_eq_right hvt2, PNode.recvRequestVote.grantIfFresh]
+                rw [ite_eq_left hlog2]
               have htnt : t = nt := by omega
               subst htnt
               refine List.mem_append_right _ ?_
@@ -1780,7 +1780,7 @@ private theorem vm_step {n : Nat} {w w' : World n} (hw : Reachable w)
             = none := by
           cases hrec : Uc2.reconcile (w.nodes j).dn.termMap
               (w.nodes j).dn.pn.durable entries <;>
-            simp [Uc2.Data.Node.applyGossip, hrec, if_pos hadopt,
+            simp [Uc2.Data.Node.applyGossip, hrec, ite_eq_left hadopt,
               PNode.adoptTerm]
         rw [hvf2] at hvf
         cases hvf

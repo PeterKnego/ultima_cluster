@@ -39,9 +39,9 @@ theorem take_commonPrefixLen_eq : ∀ (a b : TermMap),
   | a :: as, b :: bs => by
     by_cases hab : a = b
     · subst hab
-      simp only [commonPrefixLen, if_true, List.take_succ_cons]
+      simp only [commonPrefixLen, ite_true, List.take_succ_cons]
       rw [take_commonPrefixLen_eq as bs]
-    · simp only [commonPrefixLen, if_neg hab, List.take_zero]
+    · simp only [commonPrefixLen, ite_eq_right hab, List.take_zero]
 
 /-- Truncating to the common prefix recomputes the same common prefix:
 `commonPrefixLen (a.take k) b = k` for `k = commonPrefixLen a b`. -/
@@ -52,9 +52,9 @@ theorem commonPrefixLen_take : ∀ (a b : TermMap),
   | a :: as, b :: bs => by
     by_cases hab : a = b
     · subst hab
-      simp only [commonPrefixLen, if_true, List.take_succ_cons]
+      simp only [commonPrefixLen, ite_true, List.take_succ_cons]
       rw [commonPrefixLen_take as bs]
-    · simp only [commonPrefixLen, if_neg hab, List.take_zero]
+    · simp only [commonPrefixLen, ite_eq_right hab, List.take_zero]
 
 /-! ### `Ascending` toolkit -/
 
@@ -174,7 +174,7 @@ theorem reconcileClamped_fixpoint {own leader : TermMap} {v k : Nat}
   · simp only [reconcile.reconcileClamped, ho, hl, List.take_of_length_le hlen,
       List.drop_of_length_le hlen, List.filter_nil, List.append_nil]
   · have hnf : ¬f.2 < v := Nat.not_lt.mpr (hlead f hl)
-    simp only [reconcile.reconcileClamped, ho, hl, if_neg hnf,
+    simp only [reconcile.reconcileClamped, ho, hl, ite_eq_right hnf,
       List.take_of_length_le hlen, List.drop_of_length_le hlen,
       List.filter_nil, List.append_nil]
 
@@ -210,7 +210,7 @@ theorem reconcile_eq_clamped (own : TermMap) (d : Nat) (l0 : Nat × Nat)
       · cases h
       · exact h
     simp only [reconcile]
-    exact if_neg fun hc => hk hc.1
+    exact ite_eq_right fun hc => hk hc.1
 
 /-- With an ascending own map, a clean reconcile's surviving map is exactly
 the common prefix — the whole beyond-prefix suffix is dropped (public: the
@@ -295,7 +295,7 @@ theorem noCommonPrefix_iff (own : TermMap) (d : Nat) (leader : TermMap) :
           cases h
   · rintro ⟨hk, ⟨o0, os, rfl⟩, ⟨l0, ls, rfl, hlt⟩⟩
     simp only [reconcile]
-    exact if_pos ⟨hk, hlt o0 os rfl⟩
+    exact ite_eq_left ⟨hk, hlt o0 os rfl⟩
 
 /-! ### R2 / R3 -/
 
@@ -387,7 +387,7 @@ theorem foldl_termAt_high {p : Nat} :
       l.foldl (fun acc e => if e.2 ≤ p then e.1 else acc) init = init
   | [], _, _ => rfl
   | a :: t, init, h => by
-    rw [List.foldl_cons, if_neg (Nat.not_le.mpr (h a List.mem_cons_self))]
+    rw [List.foldl_cons, ite_eq_right (Nat.not_le.mpr (h a List.mem_cons_self))]
     exact foldl_termAt_high t init fun e he => h e (List.mem_cons_of_mem a he)
 
 /-- Appending entries that all begin strictly above `p` does not change
@@ -507,9 +507,9 @@ theorem commonPrefixLen_getElem_ne :
   | a :: as, b :: bs, e, f, he, hf => by
     by_cases hab : a = b
     · subst hab
-      simp only [commonPrefixLen, if_true, List.getElem?_cons_succ] at he hf
+      simp only [commonPrefixLen, ite_true, List.getElem?_cons_succ] at he hf
       exact commonPrefixLen_getElem_ne as bs e f he hf
-    · simp only [commonPrefixLen, if_neg hab, List.getElem?_cons_zero,
+    · simp only [commonPrefixLen, ite_eq_right hab, List.getElem?_cons_zero,
         Option.some.injEq] at he hf
       subst he; subst hf
       exact hab

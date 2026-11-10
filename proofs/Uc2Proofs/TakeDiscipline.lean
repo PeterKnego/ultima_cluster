@@ -487,9 +487,9 @@ private theorem tk_step {n : Nat} {w w' : World n} (hw : Reachable w)
     · rcases eq_or_ne k j with rfl | hne
       · simp only [Node.dataTerm, Function.update_self] at hr ⊢
         by_cases hadopt : (w.nodes k).pn.currentTerm < nt
-        · rw [if_pos hadopt] at hr
+        · rw [ite_eq_left hadopt] at hr
           cases hr
-        · rw [if_neg hadopt] at hr ⊢
+        · rw [ite_eq_right hadopt] at hr ⊢
           exact ⟨hr, rfl⟩
       · refine ⟨by simpa [Function.update_of_ne hne] using hr, ?_⟩
         simp [Node.dataTerm, Function.update_of_ne hne]
@@ -505,7 +505,7 @@ private theorem tk_step {n : Nat} {w w' : World n} (hw : Reachable w)
     · rcases eq_or_ne u j with rfl | hne
       · simp only [Node.dataTerm, Function.update_self] at hdt ⊢
         by_cases hadopt : (w.nodes u).pn.currentTerm < nt
-        · rw [if_pos hadopt] at hdt
+        · rw [ite_eq_left hadopt] at hdt
           exfalso
           have h1 : T ≤ (w.nodes u).dn.dataTerm :=
             (reachable_provInv hw).report_dt u T d hm
@@ -513,7 +513,7 @@ private theorem tk_step {n : Nat} {w w' : World n} (hw : Reachable w)
             (Data.reachable_stamp (reachable_project hw)).data_le u
           have h3 : (w.nodes u).dn.pn.currentTerm < nt := hadopt
           omega
-        · rwa [if_neg hadopt] at hdt
+        · rwa [ite_eq_right hadopt] at hdt
       · simpa [Node.dataTerm, Function.update_of_ne hne] using hdt
   | rejectStaleRequestVote j c nt clt cd hmsg hstale =>
     exact tk_transport h (fun k => rfl) (fun k => rfl)
@@ -718,7 +718,7 @@ private theorem tk_step {n : Nat} {w w' : World n} (hw : Reachable w)
       rcases eq_or_ne ℓ i with rfl | hneℓ
       · -- the NEW leader: any open regime at its term was already certified
         rcases eq_or_ne j ℓ with rfl | hnej
-        · simp only [Node.pn, Node.dataTerm, Function.update_self]
+        · simp only [Node.pn, Function.update_self]
           refine ⟨by rw [List.take_length], ?_⟩
           intro f hf
           rw [List.getElem?_eq_none (Nat.le_refl _)] at hf
@@ -759,7 +759,7 @@ private theorem tk_step {n : Nat} {w w' : World n} (hw : Reachable w)
         obtain ⟨hg, hl⟩ := h.report_take u T d hrp hdtu
         constructor
         · intro es hges
-          simp only [Node.dataTerm, Function.update_of_ne hne]
+          simp only [Function.update_of_ne hne]
           exact hg es hges
         · intro ℓ hrl hct
           rcases eq_or_ne ℓ i with rfl | hneℓ
@@ -770,7 +770,7 @@ private theorem tk_step {n : Nat} {w w' : World n} (hw : Reachable w)
             obtain ⟨ℓ', hc⟩ := (reachable_provInv hw).report_cert u T d hrp h1T
             rw [← hct'] at hc
             exact hblock ⟨ℓ', hc⟩
-          · simp only [Node.pn, Node.dataTerm, Function.update_of_ne hne,
+          · simp only [Node.pn, Function.update_of_ne hne,
               Function.update_of_ne hneℓ] at hrl hct ⊢
             exact hl ℓ hrl hct
     · intro j hr tf bf hlast hbf t' v' hf
@@ -1197,12 +1197,12 @@ private theorem tk_step {n : Nat} {w w' : World n} (hw : Reachable w)
           exact h.open_leader k ℓ hr hrl hct
     · intro u T d hrp hdtu
       rcases eq_or_ne u j with rfl | hne
-      · simp only [Node.pn, Node.dataTerm, Function.update_self,
+      · simp only [Node.dataTerm, Function.update_self,
           Uc2.Data.Node.recvReplicate] at hdtu
         obtain ⟨hgarm, hlarm⟩ := h.report_take u T d hrp hdtu
         constructor
         · intro es hges
-          simp only [Node.pn, Node.dataTerm, Function.update_self,
+          simp only [Node.pn, Function.update_self,
             Uc2.Data.Node.recvReplicate]
           have hattr : TermMap.termAt es pos = t :=
             (reachable_provInv hw).frame_gossip pos ((w.nodes u).dataTerm) t
@@ -1219,7 +1219,7 @@ private theorem tk_step {n : Nat} {w w' : World n} (hw : Reachable w)
             simp only [Node.pn, Function.update_self,
               Uc2.Data.Node.recvReplicate] at hrl
             exact hnotldr hrl
-          · simp only [Node.pn, Node.dataTerm, Function.update_self,
+          · simp only [Node.pn, Function.update_self,
               Function.update_of_ne hneℓ, Uc2.Data.Node.recvReplicate]
               at hrl hct ⊢
             have hattr : TermMap.termAt (w.nodes ℓ).dn.termMap pos = t := by
@@ -1235,11 +1235,11 @@ private theorem tk_step {n : Nat} {w w' : World n} (hw : Reachable w)
             exact hcore (w.nodes ℓ).dn.termMap
               ((Data.reachable_mapsWF (reachable_project hw)) ℓ).1
               (h.strict_node ℓ) htake hbound hattr
-      · simp only [Node.pn, Node.dataTerm, Function.update_of_ne hne] at hdtu
+      · simp only [Node.dataTerm, Function.update_of_ne hne] at hdtu
         obtain ⟨hgarm, hlarm⟩ := h.report_take u T d hrp hdtu
         constructor
         · intro es hges
-          simp only [Node.pn, Node.dataTerm, Function.update_of_ne hne]
+          simp only [Node.pn, Function.update_of_ne hne]
           exact hgarm es hges
         · intro ℓ hrl hct
           rcases eq_or_ne ℓ j with rfl | hneℓ
@@ -1247,7 +1247,7 @@ private theorem tk_step {n : Nat} {w w' : World n} (hw : Reachable w)
             simp only [Node.pn, Function.update_self,
               Uc2.Data.Node.recvReplicate] at hrl
             exact hnotldr hrl
-          · simp only [Node.pn, Node.dataTerm, Function.update_of_ne hne,
+          · simp only [Node.pn, Function.update_of_ne hne,
               Function.update_of_ne hneℓ] at hrl hct ⊢
             exact hlarm ℓ hrl hct
     · intro k hr tf bf hlast hbf t' v' hf
@@ -1423,10 +1423,10 @@ private theorem tk_step {n : Nat} {w w' : World n} (hw : Reachable w)
           rw [hmapE, hdurE]
           rw [hdtE] at hg
           by_cases hadopt : (w.nodes k).dn.pn.currentTerm < t
-          · rw [if_pos hadopt] at hg
+          · rw [ite_eq_left hadopt] at hg
             exact hfreshu es hg
-          · rw [if_neg hadopt] at hg
-            rw [if_neg hadopt] at hr
+          · rw [ite_eq_right hadopt] at hg
+            simp only [hadopt, ↓reduceIte] at hr
             simp only [Bool.or_eq_true] at hr
             have hteq : t = (w.nodes k).dn.pn.currentTerm := by omega
             by_cases hdteq : (w.nodes k).dn.dataTerm
@@ -1449,9 +1449,9 @@ private theorem tk_step {n : Nat} {w w' : World n} (hw : Reachable w)
               at hrl hct ⊢
             rw [hroleE] at hrl
             by_cases hadopt : (w.nodes k).dn.pn.currentTerm < t
-            · rw [if_pos hadopt] at hrl
+            · rw [ite_eq_left hadopt] at hrl
               exact absurd hrl (by decide)
-            · rw [if_neg hadopt] at hrl
+            · rw [ite_eq_right hadopt] at hrl
               rw [hmapE, hdurE]
               obtain ⟨hmeq, hveq⟩ := hlidok hrl hadopt
               refine ⟨by rw [List.take_length], ?_⟩
@@ -1463,9 +1463,9 @@ private theorem tk_step {n : Nat} {w w' : World n} (hw : Reachable w)
             rw [hroleE] at hrl
             rw [hctE] at hct
             by_cases hadopt : (w.nodes ℓ).dn.pn.currentTerm < t
-            · rw [if_pos hadopt] at hrl
+            · rw [ite_eq_left hadopt] at hrl
               exact absurd hrl (by decide)
-            · rw [if_neg hadopt] at hrl hct
+            · rw [ite_eq_right hadopt] at hrl hct
               obtain ⟨hmeq, hveq⟩ := hlidok hrl hadopt
               rw [hmapE, hmeq]
               exact h.open_leader k ℓ hr hrl hct
@@ -1475,12 +1475,12 @@ private theorem tk_step {n : Nat} {w w' : World n} (hw : Reachable w)
             rw [hmapE, hdurE]
             rw [hdtE] at hct
             by_cases hadopt : (w.nodes k).dn.pn.currentTerm < t
-            · rw [if_pos hadopt] at hct
+            · rw [ite_eq_left hadopt] at hct
               have hme := hlid ℓ hrl hct
               rw [← hme]
               exact hfresh
-            · rw [if_neg hadopt] at hct
-              rw [if_neg hadopt] at hr
+            · rw [ite_eq_right hadopt] at hct
+              simp only [hadopt, ↓reduceIte] at hr
               simp only [Bool.or_eq_true] at hr
               have hteq : t = (w.nodes k).dn.pn.currentTerm := by omega
               by_cases hdteq : (w.nodes k).dn.dataTerm
@@ -1503,7 +1503,7 @@ private theorem tk_step {n : Nat} {w w' : World n} (hw : Reachable w)
         · simp only [Node.pn, Node.dataTerm, Function.update_self] at hdtu
           rw [hdtE] at hdtu
           by_cases hadopt : (w.nodes u).dn.pn.currentTerm < t
-          · rw [if_pos hadopt] at hdtu
+          · rw [ite_eq_left hadopt] at hdtu
             exfalso
             have h1 : T ≤ (w.nodes u).dn.dataTerm :=
               (reachable_provInv hw).report_dt u T d hrp
@@ -1511,12 +1511,12 @@ private theorem tk_step {n : Nat} {w w' : World n} (hw : Reachable w)
                 ≤ (w.nodes u).dn.pn.currentTerm :=
               (Data.reachable_stamp (reachable_project hw)).data_le u
             omega
-          · rw [if_neg hadopt] at hdtu
+          · rw [ite_eq_right hadopt] at hdtu
             have hteq : t = (w.nodes u).dn.pn.currentTerm := by omega
             obtain ⟨hgarm, hlarm⟩ := h.report_take u T d hrp hdtu
             constructor
             · intro es hges
-              simp only [Node.pn, Node.dataTerm, Function.update_self]
+              simp only [Node.pn, Function.update_self]
               rw [hmapE, hdurE]
               by_cases hdteq : (w.nodes u).dn.dataTerm
                   = (w.nodes u).dn.pn.currentTerm
@@ -1532,7 +1532,7 @@ private theorem tk_step {n : Nat} {w w' : World n} (hw : Reachable w)
               · exfalso
                 simp only [Node.pn, Function.update_self] at hrl
                 rw [hroleE] at hrl
-                rw [if_neg hadopt] at hrl
+                rw [ite_eq_right hadopt] at hrl
                 have hdtl : (w.nodes ℓ).dn.dataTerm
                     = (w.nodes ℓ).dn.pn.currentTerm :=
                   Data.reachable_leader_dataTerm (reachable_project hw) ℓ hrl
@@ -1544,7 +1544,7 @@ private theorem tk_step {n : Nat} {w w' : World n} (hw : Reachable w)
                   (by rw [show (w.nodes ℓ).pn.role = Role.leader from hrl]
                       decide) d
                   (by rw [hTct]; exact hrp)
-              · simp only [Node.pn, Node.dataTerm, Function.update_self,
+              · simp only [Node.pn, Function.update_self,
                   Function.update_of_ne hneℓ] at hrl hct ⊢
                 rw [hmapE, hdurE]
                 by_cases hdteq : (w.nodes u).dn.dataTerm
@@ -1563,23 +1563,23 @@ private theorem tk_step {n : Nat} {w w' : World n} (hw : Reachable w)
           obtain ⟨hgarm, hlarm⟩ := h.report_take u T d hrp hdtu
           constructor
           · intro es hges
-            simp only [Node.pn, Node.dataTerm, Function.update_of_ne hne]
+            simp only [Node.pn, Function.update_of_ne hne]
             exact hgarm es hges
           · intro ℓ hrl hct
             rcases eq_or_ne ℓ j with rfl | hneℓ
-            · simp only [Node.pn, Node.dataTerm, Function.update_self,
+            · simp only [Node.pn, Function.update_self,
                 Function.update_of_ne hne] at hrl hct ⊢
               rw [hroleE] at hrl
               by_cases hadopt : (w.nodes ℓ).dn.pn.currentTerm < t
-              · rw [if_pos hadopt] at hrl
+              · rw [ite_eq_left hadopt] at hrl
                 exact absurd hrl (by decide)
-              · rw [if_neg hadopt] at hrl
+              · rw [ite_eq_right hadopt] at hrl
                 rw [hctE] at hct
-                rw [if_neg hadopt] at hct
+                rw [ite_eq_right hadopt] at hct
                 obtain ⟨hmeq, hveq⟩ := hlidok hrl hadopt
                 rw [hmapE, hmeq]
                 exact hlarm ℓ hrl hct
-            · simp only [Node.pn, Node.dataTerm, Function.update_of_ne hne,
+            · simp only [Node.pn, Function.update_of_ne hne,
                 Function.update_of_ne hneℓ] at hrl hct ⊢
               exact hlarm ℓ hrl hct
       · intro k hr tf bf hlast hbf t' v' hf
@@ -1620,7 +1620,7 @@ private theorem tk_step {n : Nat} {w w' : World n} (hw : Reachable w)
           have hvle : o.validUpTo ≤ (w.nodes k).dn.pn.durable :=
             Uc2.reconcile_validUpTo_le _ _ _ _ hrec
           by_cases hadopt : (w.nodes k).dn.pn.currentTerm < t
-          · rw [if_pos hadopt] at hf
+          · rw [ite_eq_left hadopt] at hf
             have hattr : TermMap.termAt (l0 :: ls) bf = t' :=
               (reachable_provInv hw).frame_gossip bf t t' v' (l0 :: ls) hf hmsg
             have hidx2 : (l0 :: ls)[o.newMap.length - 1]? = some (tf, bf) := by
@@ -1634,8 +1634,8 @@ private theorem tk_step {n : Nat} {w w' : World n} (hw : Reachable w)
             rw [hattr] at hpin
             exact hpin
           · -- non-adopt: same-regime frames pin against the OLD state
-            rw [if_neg hadopt] at hf
-            rw [if_neg hadopt] at hr
+            rw [ite_eq_right hadopt] at hf
+            simp only [hadopt, ↓reduceIte] at hr
             simp only [Bool.or_eq_true] at hr
             have hteq : t = (w.nodes k).dn.pn.currentTerm := by omega
             by_cases hdteq : (w.nodes k).dn.dataTerm
@@ -1741,17 +1741,16 @@ private theorem tk_step {n : Nat} {w w' : World n} (hw : Reachable w)
           · simp only [Node.pn, Function.update_self] at hrl
             rw [hroleE] at hrl
             by_cases hadopt : (w.nodes k).dn.pn.currentTerm < t
-            · rw [if_pos hadopt] at hrl
+            · rw [ite_eq_left hadopt] at hrl
               exact absurd hrl (by decide)
-            · rw [if_neg hadopt] at hrl
+            · rw [ite_eq_right hadopt] at hrl
               exact hlidn hrl hadopt
-          · simp only [Node.pn, Function.update_self,
-              Function.update_of_ne hnek] at hrl
+          · simp only [Node.pn, Function.update_self] at hrl
             rw [hroleE] at hrl
             by_cases hadopt : (w.nodes ℓ).dn.pn.currentTerm < t
-            · rw [if_pos hadopt] at hrl
+            · rw [ite_eq_left hadopt] at hrl
               exact absurd hrl (by decide)
-            · rw [if_neg hadopt] at hrl
+            · rw [ite_eq_right hadopt] at hrl
               exact hlidn hrl hadopt
         · rcases eq_or_ne k j with rfl | hnek
           · simp only [Node.pn, Node.dataTerm, Function.update_self,
@@ -1766,7 +1765,7 @@ private theorem tk_step {n : Nat} {w w' : World n} (hw : Reachable w)
         · simp only [Node.pn, Node.dataTerm, Function.update_self] at hdtu
           rw [hdtE] at hdtu
           by_cases hadopt : (w.nodes u).dn.pn.currentTerm < t
-          · rw [if_pos hadopt] at hdtu
+          · rw [ite_eq_left hadopt] at hdtu
             exfalso
             have h1 : T ≤ (w.nodes u).dn.dataTerm :=
               (reachable_provInv hw).report_dt u T d hrp
@@ -1776,7 +1775,7 @@ private theorem tk_step {n : Nat} {w w' : World n} (hw : Reachable w)
             omega
           · constructor
             · intro es hges
-              simp only [Node.pn, Node.dataTerm, Function.update_self]
+              simp only [Node.pn, Function.update_self]
               rw [hmapE, hdurE]
               exact ⟨by simp, fun f hf => Nat.zero_le _⟩
             · intro ℓ hrl hct
@@ -1784,9 +1783,9 @@ private theorem tk_step {n : Nat} {w w' : World n} (hw : Reachable w)
               · exfalso
                 simp only [Node.pn, Function.update_self] at hrl
                 rw [hroleE] at hrl
-                rw [if_neg hadopt] at hrl
+                rw [ite_eq_right hadopt] at hrl
                 exact hlidn hrl hadopt
-              · simp only [Node.pn, Node.dataTerm, Function.update_self,
+              · simp only [Node.pn, Function.update_self,
                   Function.update_of_ne hneℓ] at hrl hct ⊢
                 rw [hmapE, hdurE]
                 exact ⟨by simp, fun f hf => Nat.zero_le _⟩
@@ -1795,7 +1794,7 @@ private theorem tk_step {n : Nat} {w w' : World n} (hw : Reachable w)
           obtain ⟨hgarm, hlarm⟩ := h.report_take u T d hrp hdtu
           constructor
           · intro es hges
-            simp only [Node.pn, Node.dataTerm, Function.update_of_ne hne]
+            simp only [Node.pn, Function.update_of_ne hne]
             exact hgarm es hges
           · intro ℓ hrl hct
             rcases eq_or_ne ℓ j with rfl | hneℓ
@@ -1803,11 +1802,11 @@ private theorem tk_step {n : Nat} {w w' : World n} (hw : Reachable w)
               simp only [Node.pn, Function.update_self] at hrl
               rw [hroleE] at hrl
               by_cases hadopt : (w.nodes ℓ).dn.pn.currentTerm < t
-              · rw [if_pos hadopt] at hrl
+              · rw [ite_eq_left hadopt] at hrl
                 exact absurd hrl (by decide)
-              · rw [if_neg hadopt] at hrl
+              · rw [ite_eq_right hadopt] at hrl
                 exact hlidn hrl hadopt
-            · simp only [Node.pn, Node.dataTerm, Function.update_of_ne hne,
+            · simp only [Node.pn, Function.update_of_ne hne,
                 Function.update_of_ne hneℓ] at hrl hct ⊢
               exact hlarm ℓ hrl hct
       · intro k hr tf bf hlast hbf t' v' hf
@@ -1860,7 +1859,7 @@ private theorem commonPrefixLen_take_self : ∀ (es : TermMap) (m : Nat),
   | [], m => by simp [commonPrefixLen]
   | e :: es, 0 => by simp [commonPrefixLen]
   | e :: es, m + 1 => by
-    simp only [List.take_succ_cons, commonPrefixLen, if_true]
+    simp only [List.take_succ_cons, commonPrefixLen, ite_true]
     rw [commonPrefixLen_take_self es m]
     simp only [List.length_cons]
     omega

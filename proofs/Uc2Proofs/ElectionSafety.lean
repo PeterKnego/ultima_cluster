@@ -37,12 +37,12 @@ private theorem recv_term {n : Nat} (s : PNode n) (c : Fin n) (nt lt d : Nat)
     (hle : s.currentTerm ≤ nt) :
     ((s.recvRequestVote c nt lt d).1).currentTerm = nt := by
   by_cases hadopt : s.currentTerm < nt
-  · simp only [PNode.recvRequestVote, if_pos hadopt, PNode.adoptTerm,
+  · simp only [PNode.recvRequestVote, ite_eq_left hadopt, PNode.adoptTerm,
       PNode.recvRequestVote.grantIfFresh]
     split_ifs <;> rfl
   · have heq : s.currentTerm = nt := by omega
     rcases hvf : s.votedFor with _ | ⟨vt, vid⟩ <;>
-      simp only [PNode.recvRequestVote, if_neg hadopt, hvf,
+      simp only [PNode.recvRequestVote, ite_eq_right hadopt, hvf,
         PNode.recvRequestVote.grantIfFresh] <;>
       split_ifs <;> simp [heq]
 
@@ -52,13 +52,13 @@ private theorem recv_granted {n : Nat} (s : PNode n) (c : Fin n) (nt lt d : Nat)
     (hg : (s.recvRequestVote c nt lt d).2 = true) :
     ((s.recvRequestVote c nt lt d).1).votedFor = some (nt, c) := by
   by_cases hadopt : s.currentTerm < nt
-  · simp only [PNode.recvRequestVote, if_pos hadopt, PNode.adoptTerm,
+  · simp only [PNode.recvRequestVote, ite_eq_left hadopt, PNode.adoptTerm,
       PNode.recvRequestVote.grantIfFresh] at hg ⊢
     split_ifs at hg ⊢
     simp_all
   · have heq : s.currentTerm = nt := by omega
     rcases hvf : s.votedFor with _ | ⟨vt, vid⟩ <;>
-      simp only [PNode.recvRequestVote, if_neg hadopt, hvf,
+      simp only [PNode.recvRequestVote, ite_eq_right hadopt, hvf,
         PNode.recvRequestVote.grantIfFresh] at hg ⊢ <;>
       split_ifs at hg ⊢ <;> simp_all
 
@@ -73,7 +73,7 @@ private theorem recv_voted_current {n : Nat} (s : PNode n) (c x : Fin n)
       ((s.recvRequestVote c nt lt d).2 = true → x = c) := by
   have hnadopt : ¬ s.currentTerm < nt := by omega
   by_cases hx : x = c <;>
-    simp [PNode.recvRequestVote, if_neg hnadopt, hvf, hx]
+    simp [PNode.recvRequestVote, ite_eq_right hnadopt, hvf, hx]
 
 /-- Without adoption, a receive frames `role`, `currentTerm`, and
 `votesReceived` (only `votedFor` may change, by a fresh grant). -/
@@ -83,7 +83,7 @@ private theorem recv_frame {n : Nat} (s : PNode n) (c : Fin n) (nt lt d : Nat)
     ((s.recvRequestVote c nt lt d).1).currentTerm = s.currentTerm ∧
     ((s.recvRequestVote c nt lt d).1).votesReceived = s.votesReceived := by
   rcases hvf : s.votedFor with _ | ⟨vt, vid⟩ <;>
-    simp only [PNode.recvRequestVote, if_neg hnadopt, hvf,
+    simp only [PNode.recvRequestVote, ite_eq_right hnadopt, hvf,
       PNode.recvRequestVote.grantIfFresh] <;>
     split_ifs <;> simp
 
@@ -91,7 +91,7 @@ private theorem recv_frame {n : Nat} (s : PNode n) (c : Fin n) (nt lt d : Nat)
 private theorem recv_adopt_role {n : Nat} (s : PNode n) (c : Fin n)
     (nt lt d : Nat) (hadopt : s.currentTerm < nt) :
     ((s.recvRequestVote c nt lt d).1).role = .follower := by
-  simp only [PNode.recvRequestVote, if_pos hadopt, PNode.adoptTerm,
+  simp only [PNode.recvRequestVote, ite_eq_left hadopt, PNode.adoptTerm,
     PNode.recvRequestVote.grantIfFresh]
   split_ifs <;> rfl
 
