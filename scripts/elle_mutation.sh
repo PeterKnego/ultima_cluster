@@ -89,7 +89,7 @@ hist() { echo "$MUT_DIR/$1/${2#elle_}/history.edn"; }
 valid_under() {
     [ -f "$2" ] || { echo missing; return; }
     local out v
-    out="$("$JAVA" "-Xmx$JAVA_XMX" -jar "$JAR" --model list-append \
+    out="$("$JAVA" -XX:+ExitOnOutOfMemoryError "-Xmx$JAVA_XMX" -jar "$JAR" --model list-append \
         --consistency-models "$1" "$2" 2>"$2.$1.elle.err")" || true
     v="$(printf '%s\n' "$out" | awk 'END { print $NF }')"
     case "$v" in
