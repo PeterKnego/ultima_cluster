@@ -499,8 +499,11 @@ impl ClusterAgent {
     /// be judged. Before JOINED the local commit can be pre-raise (a node
     /// that was down during the raise), so a stale level there is history,
     /// not a fault. A `head` of 0 is a node that knows no commit at all.
-    fn check_caught_up_level(&self, head: u64) {
-        if head == 0 || self.follower.cursor < head || !self.joined.load(Ordering::Acquire) {
+    fn check_caught_up_level(&self, head: u64, walked: u64) {
+        // `walked`, not the cursor: with `head` mid-frame the cursor never
+        // reaches it, and this check would never run while the FSM-lag
+        // ceiling held commit there.
+        if head == 0 || walked < head || !self.joined.load(Ordering::Acquire) {
             return;
         }
         let level = self.fsm.settings().wire_level;
@@ -941,11 +944,15 @@ impl ClusterAgent {
             // already see every row word as of p.
             self.cnc.store_cluster_applied(self.fsm.state().applied);
         }
+        // The walk's frontier (`ClusterView::walked`): `head` itself when the
+        // only thing between the cursor and `head` is a frame that straddles
+        // `head`, else the cursor.
+        let walked = self.walked_frontier(head);
         // Wire-level ruling 5: Below is judged here, caught up, and only here,
         // before `note_consumed`. It keys on the `joined` flag the attach gate
         // sets, so on a node's FIRST join Below is judged one pass after the
         // attach gate opens — not before it.
-        self.check_caught_up_level(head);
+        self.check_caught_up_level(head, walked);
         // Plan B3 T5: …but the WALK is published, every pass, through the
         // view's `consumed` word — one `fetch_max`, no mutex, nothing on the
         // consensus hot path reading it in steady state. That is what lets
@@ -961,7 +968,34 @@ impl ClusterAgent {
         // while the pin it just applied is not yet visible, which is the
         // whole bug the gate exists to close.
         self.view.note_consumed(self.fsm.state().applied);
+        // After `consumed`, for the same reason `consumed` is after the view:
+        // the readers that open on this word are promised everything below it.
+        self.view.note_walked(walked);
         applied_any || installed_any
+    }
+
+    /// The walk's frontier after a duty cycle: every frame whose END is at or
+    /// below the returned byte has been consumed. See `ClusterView::walked`.
+    ///
+    /// The cursor is always a frame end. When it stops short of `head`, the
+    /// walk is either genuinely behind (bytes not yet visible, or an overrun
+    /// being replayed) or stopped by `FrameIter`'s target guard at a frame
+    /// that ends past `head`. Only the second case owes nothing more, and the
+    /// way to tell them apart is to read that frame's length, not to infer it
+    /// from why the loop ended: `CaughtUp` also covers bytes not yet visible.
+    ///
+    /// A frame below `head` cannot change under this read. `head` is at most
+    /// commit, and a truncation cuts only above commit at a frame boundary, so
+    /// a frame that starts below commit survives whole.
+    fn walked_frontier(&mut self, head: u64) -> u64 {
+        let cursor = self.follower.cursor;
+        if cursor >= head {
+            return cursor;
+        }
+        match self.follower.next_frame_end() {
+            Some(end) if end > head => head,
+            _ => cursor,
+        }
     }
 
     /// Spec §5.6: install the cluster artifact a snapshot session carried, by
@@ -1890,6 +1924,70 @@ mod tests {
                  .superpowers/sdd/2026-09-06-uc2-cluster-fsm-plan1/services-hang-investigation.md"
             ),
         }
+    }
+
+    /// The walk's frontier (`ClusterView::walked`) against the two ways a
+    /// cursor stops short of `head`. A frame that straddles `head` owes
+    /// nothing, so the frontier is `head`. Bytes the buffer cannot show yet
+    /// are genuinely behind, so the frontier stays at the cursor. Readers
+    /// compare the frontier with commit: the first case is what deadlocked
+    /// the attach gate (nightly 2026-11-14), and the second is what the fix
+    /// must not wave through.
+    #[test]
+    fn the_walked_frontier_is_head_only_past_a_straddling_frame() {
+        let (buffer, cnc, dir) = world();
+        let mut app = buffer.appender_for_test(0);
+        app.set_now(1);
+        let end = app
+            .append_cluster(1, ClusterKind::Settings, &[0u8; 56])
+            .unwrap();
+        assert_eq!(end, 96, "sanity: one 96-byte frame at [0, 96)");
+
+        let (fsm, start) = recover(dir.path(), genesis_state(), vec![]).unwrap();
+        let view = Arc::new(ClusterView::new(fsm.state()));
+        let mut agent = ClusterAgent::new(
+            Arc::clone(&buffer),
+            Arc::clone(&cnc),
+            fsm,
+            Arc::clone(&view),
+            dir.path().join("snapshots/cluster"),
+            start,
+            Arc::new(AtomicU64::new(0)),
+            empty_journal(dir.path()),
+            no_install_route(),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            WireRange::BINARY,
+            Arc::new(AtomicBool::new(false)),
+        );
+        let walked = || view.walked.load(Ordering::Acquire);
+        let consumed = || view.consumed.load(Ordering::Acquire);
+
+        // Straddling: head 48 is inside [0, 96). Nothing is consumed, and
+        // nothing ending at or below 48 is owed.
+        cnc.counters().durable.store_release(48);
+        cnc.counters().commit.store_release(48);
+        agent.do_work();
+        assert_eq!(consumed(), 0);
+        assert_eq!(walked(), 48, "a straddling frame is not owed");
+
+        // Head on the frame's end: the walk consumes it, cursor and frontier
+        // agree.
+        cnc.counters().durable.store_release(96);
+        cnc.counters().commit.store_release(96);
+        agent.do_work();
+        assert_eq!(consumed(), 96);
+        assert_eq!(walked(), 96);
+
+        // Genuinely behind: head 200 is past everything appended (append is
+        // 96), so the bytes after the cursor are not visible. The frontier
+        // must stay at the cursor, or a reader would treat unapplied commands
+        // as applied.
+        cnc.counters().durable.store_release(200);
+        cnc.counters().commit.store_release(200);
+        agent.do_work();
+        assert_eq!(consumed(), 96);
+        assert_eq!(walked(), 96, "bytes not yet visible are owed");
     }
 
     /// Ruling R17: the position the view and the artifact carry is the apply

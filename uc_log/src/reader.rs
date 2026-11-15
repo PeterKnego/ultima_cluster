@@ -26,7 +26,7 @@ use std::sync::Arc;
 
 use uc_protocol::v2::frame::{self, FRAME_TYPE_PADDING, FrameHeader, HEADER_LEN, align_frame_len};
 
-use crate::buffer::{LogBuffer, SliceRead};
+use crate::buffer::{FrameRead, LogBuffer, SliceRead};
 
 /// Largest run copied per `next_batch` call (the apply-boundary copy is
 /// bounded so a duty cycle stays a duty cycle).
@@ -61,6 +61,24 @@ impl LogFollower {
             buffer,
             cursor,
             buf: Vec::new(),
+        }
+    }
+
+    /// Where the frame that starts at the cursor ends, if the buffer can show
+    /// it: the cursor plus that frame's aligned length, padding included.
+    /// `None` when the frame is not yet appended, or when its bytes may have
+    /// been overwritten or exist only in the journal. A caller must treat
+    /// `None` as "unknown", never as "no frame".
+    ///
+    /// This is what lets an owner whose cursor stopped short of a target say
+    /// whether the walk is genuinely behind or is waiting on a frame that
+    /// straddles the target. [`FrameIter`]'s target guard leaves the cursor
+    /// at that frame's start, and a target can sit strictly inside a frame:
+    /// the FSM-lag report ceiling is a raw byte cap.
+    pub fn next_frame_end(&mut self) -> Option<u64> {
+        match self.buffer.read_frame_validated(self.cursor, &mut self.buf) {
+            FrameRead::Frame(h) => Some(self.cursor + align_frame_len(h.length as usize) as u64),
+            FrameRead::NotCommitted | FrameRead::Overrun => None,
         }
     }
 
@@ -180,6 +198,36 @@ mod tests {
             256,
         ));
         (b, cnc)
+    }
+
+    #[test]
+    fn next_frame_end_names_the_end_of_the_frame_at_the_cursor() {
+        let (b, _c) = buf();
+        let mut a = Appender::new(Arc::clone(&b), 1, 0);
+        // Two 96-byte frames at 0 and 96 (append = 192).
+        for i in 0..2u32 {
+            a.append(1, i, &[i as u8; 64]).unwrap();
+        }
+        let mut f = LogFollower::new(Arc::clone(&b), 0);
+        assert_eq!(f.next_frame_end(), Some(96));
+
+        // A target strictly inside the first frame: the batch consumes
+        // nothing and leaves the cursor at 0, and the frame there ends at 96,
+        // past the target. That is "waiting on a straddling frame", not
+        // "behind".
+        match f.next_batch(48) {
+            Batch::Frames(mut it) => assert!(it.next().is_none()),
+            _ => panic!("a mid-frame target with bytes available is an empty Frames batch"),
+        }
+        assert_eq!(f.cursor, 0);
+        assert_eq!(f.next_frame_end(), Some(96));
+
+        f.cursor = 96;
+        assert_eq!(f.next_frame_end(), Some(192));
+
+        // At append there is no frame yet: unknown, not "ends here".
+        f.cursor = 192;
+        assert_eq!(f.next_frame_end(), None);
     }
 
     #[test]
