@@ -275,6 +275,12 @@ jobs:
     env:
       ELLE_TARGET_OPS: 8000
       ELLE_BUDGET_SECS: 300
+      # The reconfig pass runs until 3 config changes land (~15.6 s), so its
+      # history grows with runner speed: 66k-131k events in Nov 2026. 131k
+      # exhausted the script's 2g default under strong-serializable (run
+      # 43585065155); 133k measured needs 2-3g and passes in 3g. The 2g default
+      # stays for swapless dev boxes; a hosted runner has 16 GB.
+      ELLE_JAVA_XMX: 4g
     steps:
       - uses: actions/checkout@v5
       - uses: Swatinem/rust-cache@v2
@@ -298,6 +304,12 @@ jobs:
     env:
       ELLE_TARGET_OPS: 8000
       ELLE_BUDGET_SECS: 300
+      # The reconfig pass runs until 3 config changes land (~15.6 s), so its
+      # history grows with runner speed: 66k-131k events in Nov 2026. 131k
+      # exhausted the script's 2g default under strong-serializable (run
+      # 43585065155); 133k measured needs 2-3g and passes in 3g. The 2g default
+      # stays for swapless dev boxes; a hosted runner has 16 GB.
+      ELLE_JAVA_XMX: 4g
       ELLE_DIR: /home/runner/.cache/uc2-elle-crypto
       UC2_CRYPTO: '1'
     steps:
