@@ -7058,7 +7058,14 @@ impl Consensus {
     /// (a') **its commit counter is the CLUSTER's answer and not this
     ///      incarnation's default** (`ElectionSm::commit_learned`), and
     /// (b) **its cluster FSM has consumed the log up to commit**
-    ///     (`cluster_view.consumed >= commit`).
+    ///     (`cluster_view.walked >= commit`: every frame whose END is at or
+    ///     below commit has been applied).
+    ///
+    /// (b) reads `walked`, not the walk's cursor `consumed`. The cursor is
+    /// always a frame end, and commit can sit strictly inside a frame under
+    /// FSM-lag pacing. The straddling frame is not committed, yet
+    /// `consumed >= commit` could never hold, and the commit could not move
+    /// until this node's services attached: a deadlock (nightly 2026-11-14).
     ///
     /// Why all three. (b) alone is vacuous at boot: the commit counter starts
     /// at 0 — `LogCounters::prime` seeds `append`/`durable` from the archive
@@ -7104,11 +7111,12 @@ impl Consensus {
             return;
         }
         let commit = self.cnc.counters().commit.load_acquire();
-        let consumed = self.cluster_view.consumed.load(Ordering::Acquire);
-        if consumed < commit {
+        let walked = self.cluster_view.walked.load(Ordering::Acquire);
+        if walked < commit {
             self.note_declared_withheld("walk_behind");
             return;
         }
+        let consumed = self.cluster_view.consumed.load(Ordering::Acquire);
         self.cnc.store_services_declared(self.services.declared());
         self.declared_published = true;
         self.joined.store(true, Ordering::Release);
@@ -7117,7 +7125,8 @@ impl Consensus {
             "services_declared_published",
             node = self.id as u64,
             commit = commit,
-            cluster_position = consumed
+            cluster_position = consumed,
+            walked = walked
         );
     }
 
@@ -7153,6 +7162,7 @@ impl Consensus {
         self.declared_withheld_warned = true;
         let commit = self.cnc.counters().commit.load_acquire();
         let consumed = self.cluster_view.consumed.load(Ordering::Acquire);
+        let walked = self.cluster_view.walked.load(Ordering::Acquire);
         crate::obs_event!(
             Warn,
             "services_declared_withheld",
@@ -7160,6 +7170,7 @@ impl Consensus {
             clause = clause,
             commit = commit,
             cluster_position = consumed,
+            walked = walked,
             held_ms = held_ns / 1_000_000
         );
     }
@@ -9303,15 +9314,16 @@ impl Consensus {
     /// node copies into a record is current only once it has JOINED (the
     /// attach gate's sense: leader known, commit learned, walk consumed to
     /// commit) and its cluster agent's walk is at commit NOW. `commit` is
-    /// read before `consumed`, so `consumed >= commit` proves the walk has
+    /// read before `walked`, so `walked >= commit` proves the walk has
     /// consumed everything committed as of a moment no later than the commit
-    /// reading. `None` = current; else the reason the writer holds.
+    /// reading. `walked`, not `consumed`, for the attach gate's reason: commit
+    /// can sit mid-frame. `None` = current; else the reason the writer holds.
     fn cluster_walk_at_commit(&self) -> Option<&'static str> {
         if !self.joined.load(Ordering::Acquire) {
             return Some("not_joined");
         }
         let commit = self.cnc.counters().commit.load_acquire();
-        if self.cluster_view.consumed.load(Ordering::Acquire) < commit {
+        if self.cluster_view.walked.load(Ordering::Acquire) < commit {
             return Some("walk_behind");
         }
         None
@@ -19352,6 +19364,70 @@ mod tests {
         );
     }
 
+    /// Condition (b) when commit sits STRICTLY INSIDE a frame. Under FSM-lag
+    /// pacing that is normal, because `services::report_ceiling` is a raw
+    /// byte cap. The cluster walk consumes whole frames only, so its cursor
+    /// stops at the start of the frame that straddles commit and can never
+    /// equal commit.
+    ///
+    /// That frame is not committed (its END is above commit), so the walk
+    /// owes it nothing, and the gate must open. Before the fix the gate
+    /// compared the cursor with commit and held at `walk_behind` for good: the
+    /// commit could not move until this node's services attached, and they
+    /// could not attach until the gate opened. Nightly 2026-11-14,
+    /// `services::q_a_follower_quorum_with_absent_fsms_stalls_commit_at_the_bound`,
+    /// node 1: commit 65600 inside the frame at [65536, 65632), walk at 65536.
+    ///
+    /// The same check guards the Settings auto-writers through
+    /// `cluster_walk_at_commit`, so that is asserted here too.
+    #[test]
+    fn the_declared_set_opens_when_commit_sits_inside_a_frame() {
+        let mut h = harness_with_rows(&["count"]);
+        h.cons.cnc.status().leader_hint.store_release(0); // (a) holds
+        // One 96-byte frame at [6016, 6112) (32 B header + 64 B payload).
+        let mut app = h.cons.buffer.appender_for_test(6016);
+        let start = app.append(2, 0, &[0u8; 64]).unwrap();
+        assert_eq!(start, 6016, "`append` returns the frame's start");
+        let end = h.cons.cnc.counters().append.load_acquire();
+        assert_eq!(end, 6112, "sanity: one 96-byte frame at [6016, 6112)");
+        // This follower holds the whole frame durably, so its validated
+        // frontier covers it and a gossiped commit can land inside it.
+        h.cons.cnc.counters().durable.store_release(end);
+        h.cons.feed(Event::DurableAdvanced { durable: end });
+        // (a') holds, with commit 48 bytes into that frame.
+        h.cons.feed(Event::CommitGossip {
+            term: 2,
+            commit: 6064,
+        });
+        assert_eq!(h.cons.cnc.counters().commit.load_acquire(), 6064);
+
+        h.cluster.do_work();
+        assert_eq!(
+            h.cons.cluster_view.consumed.load(Ordering::Acquire),
+            6016,
+            "precondition: the walk stops at the straddling frame's start"
+        );
+        assert_eq!(
+            h.cons.cluster_view.walked.load(Ordering::Acquire),
+            6064,
+            "…and its frontier is commit itself: nothing below commit is owed"
+        );
+
+        h.cons.do_work();
+        assert_eq!(
+            h.cons.cnc.services_declared(),
+            0b1,
+            "every frame that ends at or below commit has been applied: \
+             the node has joined"
+        );
+        assert!(h.cons.declared_published);
+        assert_eq!(
+            h.cons.cluster_walk_at_commit(),
+            None,
+            "the Settings auto-writers read the same frontier"
+        );
+    }
+
     /// Final review F3: a node the gate holds used to say NOTHING — it logs
     /// only on success, so "my service will not start" was diagnosed by the
     /// absence of `services_declared_published` while the attaching side
@@ -21783,10 +21859,15 @@ mod tests {
     fn walk_at_commit(h: &mut Harness) {
         h.cons.joined.store(true, Ordering::Release);
         let commit = h.cons.cnc.counters().commit.load_acquire();
-        h.cons
-            .cluster_view
-            .consumed
-            .store(commit, Ordering::Release);
+        set_walk(h, commit);
+    }
+
+    /// Stand in for the `uc2-cluster` agent's per-pass publish: the walk's
+    /// cursor and its frontier both at `at`, as after a pass whose `head`
+    /// landed on a frame end.
+    fn set_walk(h: &mut Harness, at: u64) {
+        h.cons.cluster_view.consumed.store(at, Ordering::Release);
+        h.cons.cluster_view.walked.store(at, Ordering::Release);
     }
 
     #[test]
@@ -21828,10 +21909,7 @@ mod tests {
         walk_at_commit(&mut h);
         let commit = h.cons.cnc.counters().commit.load_acquire();
         assert!(commit > 0, "precondition: something committed");
-        h.cons
-            .cluster_view
-            .consumed
-            .store(commit - 1, Ordering::Release);
+        set_walk(&mut h, commit - 1);
         h.cons.next_wire_check_ns = 0;
         assert!(!h.cons.maybe_commit_wire_level(), "auto: walk behind");
         assert_eq!(h.cons.apply_wire_raise(), (2, 0, view));
@@ -22272,10 +22350,7 @@ mod tests {
         walk_at_commit(&mut h);
         let commit = h.cons.cnc.counters().commit.load_acquire();
         assert!(commit > 0, "precondition: something committed");
-        h.cons
-            .cluster_view
-            .consumed
-            .store(commit - 1, Ordering::Release);
+        set_walk(&mut h, commit - 1);
         h.cons.next_mtu_check_ns = 0;
         assert!(!h.cons.maybe_commit_datagram_mtu(), "walk behind");
         assert_eq!(h.cons.last_cluster_append, before, "nothing appended");

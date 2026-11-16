@@ -1283,6 +1283,23 @@ pub struct ClusterView {
     /// reads it only while it is still closed, once per incarnation), so it
     /// costs neither loop the mutex `position` would have cost them.
     pub consumed: AtomicU64,
+    /// The walk's FRONTIER: every frame whose END is at or below this byte has
+    /// been consumed and its effects published. It is [`Self::consumed`]
+    /// rounded up to the agent's `head` when the frame starting at
+    /// `consumed` ends past `head`, so it can sit strictly inside a frame.
+    ///
+    /// This is the word to compare with `commit`, not `consumed`. The walk
+    /// consumes whole frames, so `consumed` is always a frame end, while
+    /// commit is a byte position the FSM-lag report ceiling can leave
+    /// mid-frame. A frame straddling commit is not committed, so nothing is
+    /// owed for it, yet `consumed >= commit` can then never hold. The attach
+    /// gate held a node at `walk_behind` forever that way, with commit unable
+    /// to advance until that node's services attached (nightly 2026-11-14).
+    ///
+    /// Written by the agent with one `fetch_max` per duty cycle, after
+    /// `consumed` and so after the view and pin words, for the same reason
+    /// `consumed` is.
+    pub walked: AtomicU64,
     /// Spec §9: `uc2_settings_position`, the frame-END of the last Settings
     /// command applied (0 = the genesis record). An atomic beside the five
     /// settings scalars, for the same reason they are: `/metrics` reads it
@@ -1449,6 +1466,8 @@ impl ClusterView {
             // `uc2-cluster` agent has not run a cycle yet still reports the
             // walk it inherited rather than 0.
             consumed: AtomicU64::new(genesis.applied),
+            // Same seed, same reason: `walked >= consumed` always holds.
+            walked: AtomicU64::new(genesis.applied),
             settings_position: AtomicU64::new(0),
             admission_bytes: AtomicU64::new(0),
             fsm_lag_bytes: AtomicU64::new(0),
@@ -1589,6 +1608,13 @@ impl ClusterView {
     /// the caller having checked that first.
     pub fn note_consumed(&self, applied: u64) {
         self.consumed.fetch_max(applied, Ordering::Release);
+    }
+
+    /// Publish the walk's frontier (see [`Self::walked`]). Called by the
+    /// agent after [`Self::note_consumed`], with the same monotone
+    /// `fetch_max`.
+    pub fn note_walked(&self, frontier: u64) {
+        self.walked.fetch_max(frontier, Ordering::Release);
     }
 
     /// #33: one row's running version, under the inner lock (pin door,
