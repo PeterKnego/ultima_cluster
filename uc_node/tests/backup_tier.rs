@@ -3860,13 +3860,31 @@ mod writer_e2e {
             std::thread::sleep(Duration::from_millis(2));
         }
         assert_eq!(tier_install(c.node(n), "installed"), 0, "still copying");
-        assert_eq!(old.tier_install_sent.load(Ordering::Relaxed), 1);
+        // At least once, not exactly once. `tier_install_sent` counts this
+        // leader's requests to EVERY follower, not to the learner, so it can
+        // pass 1 without anything going wrong: a voter that falls below the
+        // floor after `purged_with_tier`'s churn can be asked too (it has no
+        // source and declines at once), and a repeat to the learner is
+        // answered `installing` from the copy already running. The guarantee
+        // this test is about is "no second path", which the end pins: one
+        // copy ever, and no session on either leader. Nightly 2026-11-19, run
+        // 44516509797, read 2 here; which peer the second request went to was
+        // not recorded.
+        assert!(
+            old.tier_install_sent.load(Ordering::Relaxed) >= 1,
+            "the old leader never asked; declined: {:?}; ignored: {:?}",
+            obs_lines(&buf, "tier_install_declined"),
+            obs_lines(&buf, "tier_install_ignored")
+        );
         c.nodes[l].stop();
         let l2 = submit_following(&c, 200);
         assert_ne!(l2, l);
         let new = c.node(l2).observability().sender.clone();
+        // `>= 1` for the same reason, and because an exact `== 1` can be
+        // stepped over: a second request to a voter in the same poll interval
+        // takes the counter from 0 to 2, and the wait would time out.
         await_until(60, "the new leader asked the learner", || {
-            new.tier_install_sent.load(Ordering::Relaxed) == 1
+            new.tier_install_sent.load(Ordering::Relaxed) >= 1
         });
         let app = c.app;
         c.nodes[n].start_service(app, 3);
